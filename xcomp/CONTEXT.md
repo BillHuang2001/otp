@@ -55,7 +55,7 @@ Recurring `erl_xcomp_configure_flags` patterns: iOS targets use `--without-{term
 - Do not add variables that are not in `erl_xcomp_vars`/`erl_build_tool_vars` and expect them to reach sub-configures.
 
 ## Known Issues
-- The NOTE in `erl-xcomp-vars.sh` (and in root `erl-build-tool-vars.sh`) says to also update `$ERL_TOP/erts/aclocal.m4`; that file no longer exists — the autoconf helpers live in `make/autoconf/otp.m4`, which holds the `AC_ARG_VAR` declarations for 16 of the 19 vars.
+- The NOTE in `erl-xcomp-vars.sh` (and in root `erl-build-tool-vars.sh`), and the patch checklist in `HOWTO/INSTALL-CROSS.md`, say to also update `$ERL_TOP/erts/aclocal.m4`; that file no longer exists — the autoconf helpers live in `make/autoconf/otp.m4`, which holds the `AC_ARG_VAR` declarations for 16 of the 19 vars. The checklist's recommendation is otherwise authoritative: a new variable touches `erl-xcomp.conf.template`, `erl-xcomp-vars.sh`, `erl-build-tool-vars.sh`, `xcomp/README.md` (if it grows a list), `HOWTO/INSTALL-CROSS.md` and the `erl-xcomp-*.conf` samples.
 - `erl_xcomp_code_model_small` and `erl_xcomp_linux_clock_gettime_correction` are listed in `erl-xcomp-vars.sh` and documented in the template/HOWTO but are currently read by **no** configure script — setting them has no effect.
 - `erl_xcomp_posix_memalign` is listed but is not an `AC_ARG_VAR`; it is read directly in `erts/configure.ac` (search `AS_CASE([X$erl_xcomp_posix_memalign]`).
 - The template spells the middle-endian variable `erl_xcomp_double_middle_endian` while its prose (and `HOWTO/INSTALL-CROSS.md`) calls it `erl_xcomp_double_middle`; the `_endian` spelling is the real one. The template's line for it also lacks a trailing `=`, unlike its siblings.
