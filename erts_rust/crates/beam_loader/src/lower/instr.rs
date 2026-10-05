@@ -20,7 +20,7 @@ use crate::decode::RawInstr;
 use crate::error::bad_file;
 use crate::ir::{ImportRef, Instr, TestKind};
 use crate::opcode::Opcode;
-use crate::operand::{Label, Operand};
+use crate::operand::{HeapNeed, Label, Operand};
 
 /// Lowers one decoded [`RawInstr`] into the IR [`Instr`].
 ///
@@ -104,17 +104,22 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             target: ImportRef(as_u32(operand(ops, 1)?)?),
             deallocate: as_u32(operand(ops, 2)?)?,
         }),
+        // `allocate Ns Live`, `allocate_heap Ns Nh Live`, `test_heap Nh Live` —
+        // the need operands accept **either** a plain word count (`u`) or a `z,3`
+        // allocation list (`{alloc,[{words,N},{floats,N},{funs,N}]}`), so they are
+        // lowered through `HeapNeed` (which keeps the breakdown and recovers the
+        // word total). `erts/emulator/beam/emu/ops.tab` declares both forms.
         Opcode::allocate => Ok(Instr::Allocate {
-            stack_need: as_u32(operand(ops, 0)?)?,
+            stack_need: HeapNeed::from_operand(operand(ops, 0)?)?,
             live: as_u32(operand(ops, 1)?)?,
         }),
         Opcode::allocate_heap => Ok(Instr::AllocateHeap {
-            stack_need: as_u32(operand(ops, 0)?)?,
-            heap_need: as_u32(operand(ops, 1)?)?,
+            stack_need: HeapNeed::from_operand(operand(ops, 0)?)?,
+            heap_need: HeapNeed::from_operand(operand(ops, 1)?)?,
             live: as_u32(operand(ops, 2)?)?,
         }),
         Opcode::test_heap => Ok(Instr::TestHeap {
-            heap_need: as_u32(operand(ops, 0)?)?,
+            heap_need: HeapNeed::from_operand(operand(ops, 0)?)?,
             live: as_u32(operand(ops, 1)?)?,
         }),
         Opcode::deallocate => Ok(Instr::Deallocate(as_u32(operand(ops, 0)?)?)),
@@ -645,4 +650,238 @@ fn key_value_pairs(operand: &Operand) -> Result<Vec<(Operand, Operand)>> {
         pairs.push((pair[0].clone(), pair[1].clone()));
     }
     Ok(pairs)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Heap/stack-need lowering tests.
+    //!
+    //! The frame opcodes (`test_heap`, `allocate`, `allocate_heap`) accept the need
+    //! operand in *either* the plain-count or the `z,3` allocation-list encoding
+    //! (`erts/emulator/beam/emu/ops.tab`); these tests pin both, that the
+    //! allocation breakdown survives, and that a real module using the
+    //! allocation-list form now loads end to end.
+
+    use super::*;
+    use crate::load::load;
+    use crate::operand::AllocKind;
+
+    /// One decoded instruction with the given opcode and operands.
+    fn raw(opcode: Opcode, operands: Vec<Operand>) -> RawInstr {
+        RawInstr {
+            opcode,
+            operands,
+            offset: 0,
+        }
+    }
+
+    /// A decoded `z,3` allocation entry (`kind`, `number`, `words`), matching what
+    /// [`crate::decode`] produces.
+    fn entry(kind: u32, number: u32, words: u32) -> AllocKind {
+        AllocKind {
+            kind,
+            number,
+            words,
+        }
+    }
+
+    #[test]
+    fn a_plain_integer_need_lowers_to_words() {
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::test_heap,
+                vec![Operand::Integer(5), Operand::Integer(4)],
+            ))
+            .unwrap(),
+            Instr::TestHeap {
+                heap_need: HeapNeed::Words(5),
+                live: 4,
+            }
+        );
+    }
+
+    #[test]
+    fn an_allocation_list_need_lowers_to_alloc_preserving_entries() {
+        // `{test_heap,{alloc,[{words,1},{floats,0},{funs,1}]},1}` (the fixture form).
+        let entries = vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)];
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::test_heap,
+                vec![Operand::Allocation(entries.clone()), Operand::Integer(1)],
+            ))
+            .unwrap(),
+            Instr::TestHeap {
+                heap_need: HeapNeed::Alloc(entries),
+                live: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn allocate_and_allocate_heap_accept_both_need_forms() {
+        // `allocate Ns Live` — plain count.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::allocate,
+                vec![Operand::Integer(1), Operand::Integer(2)],
+            ))
+            .unwrap(),
+            Instr::Allocate {
+                stack_need: HeapNeed::Words(1),
+                live: 2,
+            }
+        );
+        // `allocate Ns Live` — allocation list.
+        let ns = vec![entry(0, 3, 3)];
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::allocate,
+                vec![Operand::Allocation(ns.clone()), Operand::Integer(2)],
+            ))
+            .unwrap(),
+            Instr::Allocate {
+                stack_need: HeapNeed::Alloc(ns),
+                live: 2,
+            }
+        );
+        // `allocate_heap Ns Nh Live` — both plain.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::allocate_heap,
+                vec![
+                    Operand::Integer(4),
+                    Operand::Integer(6),
+                    Operand::Integer(3),
+                ],
+            ))
+            .unwrap(),
+            Instr::AllocateHeap {
+                stack_need: HeapNeed::Words(4),
+                heap_need: HeapNeed::Words(6),
+                live: 3,
+            }
+        );
+        // `allocate_heap Ns Nh Live` — mixed: an allocation-list stack need and a
+        // plain heap need.
+        let ns = vec![entry(0, 1, 1), entry(1, 2, 4)];
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::allocate_heap,
+                vec![
+                    Operand::Allocation(ns.clone()),
+                    Operand::Integer(6),
+                    Operand::Integer(3),
+                ],
+            ))
+            .unwrap(),
+            Instr::AllocateHeap {
+                stack_need: HeapNeed::Alloc(ns),
+                heap_need: HeapNeed::Words(6),
+                live: 3,
+            }
+        );
+    }
+
+    #[test]
+    fn heap_need_words_recovers_the_total() {
+        assert_eq!(HeapNeed::Words(7).words(), 7);
+        assert_eq!(HeapNeed::Alloc(vec![]).words(), 0);
+        // `{alloc,[{words,1},{floats,0},{funs,1}]}` → 1 + 0 + 1 = 2.
+        assert_eq!(
+            HeapNeed::Alloc(vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)]).words(),
+            2
+        );
+        // `{alloc,[{words,3},{floats,1},{funs,0}]}` → 3 + 2 + 0 = 5.
+        assert_eq!(
+            HeapNeed::Alloc(vec![entry(0, 3, 3), entry(1, 1, 2), entry(2, 0, 0)]).words(),
+            5
+        );
+    }
+
+    #[test]
+    fn a_structurally_wrong_need_operand_is_rejected() {
+        // A register is not a need operand.
+        assert!(matches!(
+            HeapNeed::from_operand(&Operand::X(0)),
+            Err(BeamError::BadArg)
+        ));
+        // An argument list (`z,1`) is not an allocation list (`z,3`).
+        assert!(matches!(
+            HeapNeed::from_operand(&Operand::List(vec![Operand::Integer(1)])),
+            Err(BeamError::BadArg)
+        ));
+        // A negative integer is not a word count.
+        assert!(matches!(
+            HeapNeed::from_operand(&Operand::Integer(-1)),
+            Err(BeamError::BadArg)
+        ));
+        // A short instruction (no `live`) is rejected, like any other arity mismatch.
+        assert!(matches!(
+            lower_instr(&raw(Opcode::test_heap, vec![Operand::Integer(5)])),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// The committed `coverage.beam` fixture (`tests/fixtures/coverage.beam`),
+    /// compiled with the system `erlc`; `tests/fixtures/README.md` documents its
+    /// regeneration. It exercises the `z,3` allocation-list form of `test_heap`
+    /// that plain-integer lowering used to reject.
+    const COVERAGE_BEAM: &[u8] = include_bytes!("../../tests/fixtures/coverage.beam");
+    /// The committed `slice.beam` fixture (the vertical-slice module).
+    const SLICE_BEAM: &[u8] = include_bytes!("../../tests/fixtures/slice.beam");
+
+    #[test]
+    fn the_committed_fixtures_load_end_to_end() {
+        assert!(
+            load(COVERAGE_BEAM).is_ok(),
+            "coverage.beam must load end to end"
+        );
+        assert!(load(SLICE_BEAM).is_ok(), "slice.beam must load end to end");
+    }
+
+    #[test]
+    fn the_coverage_fixture_reports_both_test_heap_forms() {
+        let module = load(COVERAGE_BEAM).unwrap();
+
+        // Every alloc-form `test_heap` in the module, as `(entries, word total)`.
+        let mut alloc_forms: Vec<(Vec<AllocKind>, u32)> = Vec::new();
+        let mut plain_count = 0usize;
+        for function in &module.functions {
+            for instr in &function.code {
+                if let Instr::TestHeap { heap_need, .. } = instr {
+                    match heap_need {
+                        HeapNeed::Words(_) => plain_count += 1,
+                        HeapNeed::Alloc(entries) => {
+                            alloc_forms.push((entries.clone(), heap_need.words()));
+                        }
+                    }
+                }
+            }
+        }
+
+        // The fixture has three plain-integer `test_heap`s and exactly two
+        // allocation-list ones (see `beam_disasm` in `tests/fixtures/README.md`).
+        assert_eq!(plain_count, 3, "plain-integer test_heap count");
+        assert_eq!(alloc_forms.len(), 2, "allocation-list test_heap count");
+
+        let mut saw_funs = false;
+        let mut saw_floats = false;
+        for (entries, total) in &alloc_forms {
+            match total {
+                2 => {
+                    // `{alloc,[{words,1},{floats,0},{funs,1}]}`.
+                    assert_eq!(*entries, vec![entry(0, 1, 1), entry(1, 0, 0), entry(2, 1, 1)]);
+                    saw_funs = true;
+                }
+                5 => {
+                    // `{alloc,[{words,3},{floats,1},{funs,0}]}`.
+                    assert_eq!(*entries, vec![entry(0, 3, 3), entry(1, 1, 2), entry(2, 0, 0)]);
+                    saw_floats = true;
+                }
+                other => panic!("unexpected allocation-list word total {other}"),
+            }
+        }
+        assert!(saw_funs, "the funs-capturing allocation form is missing");
+        assert!(saw_floats, "the floats-capturing allocation form is missing");
+    }
 }

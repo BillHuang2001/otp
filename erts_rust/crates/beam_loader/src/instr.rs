@@ -28,7 +28,7 @@
 //! the *variants* would destroy the one-name surface downstream matches on.
 use crate::ir::{Atom, ImportRef, LineRef};
 use crate::opcode::Opcode;
-use crate::operand::{Label, Operand};
+use crate::operand::{HeapNeed, Label, Operand};
 
 /// The `is_*` family of test instructions.
 ///
@@ -268,7 +268,8 @@ pub enum Instr {
     ///
     /// `tag` is the compiler's knowledge hint: an atom (`safe`/`unsafe`) or, when
     /// the compiler knows the fun statically, the file's fun-table index (an
-    /// integer operand naming a `FunT` entry).
+    /// integer operand naming a `FunT` entry, resolvable through
+    /// [`Module::fun`](crate::ir::Module::fun)).
     CallFun2 {
         /// The fun tag: an atom (`safe`/`unsafe`) or a fun-table index.
         tag: Operand,
@@ -293,9 +294,10 @@ pub enum Instr {
     // ---- funs --------------------------------------------------------------
     /// `make_fun3 Index Dst Env` — build a closure from the `FunT` entry `Index`.
     ///
-    /// `index` is the file's fun-table index (the compiler's "old index"); the
-    /// loader does not yet model the `FunT` descriptors, so it is carried as a
-    /// plain `u32` (see `../CONTEXT.md`, Known Issues).
+    /// `index` is the file's fun-table *index* (the compiler's "old index");
+    /// resolve it to the lambda's descriptor with
+    /// [`Module::fun`](crate::ir::Module::fun) (or the whole table with
+    /// [`Module::funs`](crate::ir::Module::funs)).
     MakeFun3 {
         /// The fun-table (`FunT`) index of the closure being built.
         index: u32,
@@ -341,25 +343,34 @@ pub enum Instr {
 
     // ---- stack frames ------------------------------------------------------
     /// `allocate StackNeed Live` — allocate a stack frame.
+    ///
+    /// `stack_need` is the frame's stack-word need in either encoding (a plain
+    /// count or a `z,3` allocation list) — see [`HeapNeed`].
     Allocate {
-        /// The number of Y registers (stack slots) needed.
-        stack_need: u32,
+        /// The frame's stack-word need.
+        stack_need: HeapNeed,
         /// The number of live X registers.
         live: u32,
     },
     /// `allocate_heap StackNeed HeapNeed Live` — allocate frame + heap.
+    ///
+    /// Both needs accept either encoding (a plain count or a `z,3` allocation
+    /// list) — see [`HeapNeed`].
     AllocateHeap {
-        /// The number of Y registers (stack slots) needed.
-        stack_need: u32,
-        /// The number of heap words needed.
-        heap_need: u32,
+        /// The frame's stack-word need.
+        stack_need: HeapNeed,
+        /// The heap-word need.
+        heap_need: HeapNeed,
         /// The number of live X registers.
         live: u32,
     },
     /// `test_heap HeapNeed Live` — ensure heap headroom.
+    ///
+    /// `heap_need` accepts either encoding (a plain count or a `z,3` allocation
+    /// list) — see [`HeapNeed`].
     TestHeap {
-        /// The number of heap words needed.
-        heap_need: u32,
+        /// The heap-word need.
+        heap_need: HeapNeed,
         /// The number of live X registers.
         live: u32,
     },

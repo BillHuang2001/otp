@@ -12,6 +12,7 @@
 //! code address; `Typed` is the normalized `z,5` `tr` annotated register (the
 //! type index is kept separate so the interpreter may ignore it and a JIT may
 //! consume it).
+use beam_common::{BeamError, Result};
 use beam_term::Atom;
 
 /// A load-time register operand.
@@ -91,4 +92,62 @@ pub enum Operand {
     List(Vec<Operand>),
     /// An allocation list (`z,3`): the decoded `{kind, number}` entries.
     Allocation(Vec<AllocKind>),
+}
+
+/// The heap/stack-need operand of `test_heap`/`allocate`/`allocate_heap`.
+///
+/// The compiler writes a frame/test need *either* as a bare word count (a `u`
+/// integer operand, e.g. `{test_heap,5,4}`) *or*, when the instruction also
+/// allocates floats or funs, as a `z,3` allocation list (e.g.
+/// `{test_heap,{alloc,[{words,1},{floats,0},{funs,1}]},1}`). Both encodings denote
+/// a heap/stack-word total; `erts/emulator/beam/emu/ops.tab` declares the
+/// allocation-list capability for `allocate Ns Live`, `allocate_heap Ns Nh Live`
+/// and `test_heap Nh Live`.
+///
+/// The IR keeps both forms (see the `test_heap`/`allocate*` variants of
+/// [`Instr`](crate::ir::Instr)): [`HeapNeed::words`] recovers the total the engine
+/// needs for its heap-overflow check, while [`HeapNeed::Alloc`] preserves the
+/// per-kind breakdown (a JIT or a precise allocator may want the floats/funs
+/// split). Decode an operand with [`HeapNeed::from_operand`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub enum HeapNeed {
+    /// A plain heap/stack-word count (the `u` integer form).
+    Words(u32),
+    /// A decoded `z,3` allocation list.
+    ///
+    /// The word total is the sum of the entries' [`AllocKind::words`].
+    Alloc(Vec<AllocKind>),
+}
+
+impl HeapNeed {
+    /// The total number of heap/stack words the operand reserves.
+    ///
+    /// The sum saturates: each entry's word count is already bounded by the
+    /// decoder, so an overflow is unreachable for a well-formed image; saturation
+    /// keeps this infallible rather than panicking on a crafted one.
+    pub fn words(&self) -> u32 {
+        match self {
+            HeapNeed::Words(n) => *n,
+            HeapNeed::Alloc(entries) => entries
+                .iter()
+                .fold(0u32, |total, entry| total.saturating_add(entry.words)),
+        }
+    }
+
+    /// Decodes a heap/stack-need operand in either encoding.
+    ///
+    /// `Operand::Integer(n)` (`n >= 0`) ⇒ [`HeapNeed::Words`];
+    /// `Operand::Allocation(entries)` ⇒ [`HeapNeed::Alloc`]. Any other operand is a
+    /// structural mismatch (a non-integer where a `u` operand is required, or an
+    /// operand list where an allocation list is required) and yields
+    /// [`BeamError::BadArg`].
+    pub fn from_operand(operand: &Operand) -> Result<HeapNeed> {
+        match operand {
+            Operand::Integer(value) if *value >= 0 && *value <= i64::from(u32::MAX) => {
+                Ok(HeapNeed::Words(*value as u32))
+            }
+            Operand::Allocation(entries) => Ok(HeapNeed::Alloc(entries.clone())),
+            _ => Err(BeamError::BadArg),
+        }
+    }
 }
