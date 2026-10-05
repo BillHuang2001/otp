@@ -2,7 +2,7 @@
 
 ## Intent
 Implements SSH-2 (RFC 4251-4256) as both client and daemon, plus an SFTP client (`ssh_sftp`) and SFTP subsystem server (`ssh_sftpd`).
-Versioned by `vsn.mk` (`SSH_VSN = 6.0.6`); it is the app that `ssl`-unrelated remote access / file transfer / port forwarding builds on.
+Provides remote login (shell/CLI), remote exec, SFTP file transfer and TCP/IP port forwarding over an encrypted, authenticated transport.
 Strictly layered implementation: transport (RFC 4253) → authentication (RFC 4252) → connection protocol (RFC 4254), one module per layer, all driven by a single connection process.
 Client and server share nearly all code — the role is a state in `#ssh{}` and in the FSM state name, not a separate implementation.
 
