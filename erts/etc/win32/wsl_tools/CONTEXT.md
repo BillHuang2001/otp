@@ -19,7 +19,7 @@ The user-facing description of this build mode is `../../../../HOWTO/INSTALL-WIN
 ## Constraints
 - Requires bash/sh plus WSL interop executables on `PATH`: `wslpath`, `wsl.exe`, `cmd.exe`, `reg.exe`; and `w32_path.sh` (this dir) on `PATH`.
 - Callers must have `ERL_TOP` and `CONFIG_SUBTYPE` (`win64`/`arm64`/`x64_arm64`, otherwise 32-bit x86) exported; `otp_build env_win32` does this.
-- Path handling contracts: Windows tools need drive-letter paths — use `-m` (forward slashes, accepted by cl.exe) or `-w`/`-d` (backslashes); relative Unix paths are passed through unreliably, hence absolute paths are forced when the build tree lives under `/mnt/*` (Windows disk, expected by the docs).
+- Path handling contracts: Windows tools need drive-letter paths — use `-m` (forward slashes, accepted by cl.exe) or `-w`/`-d` (backslashes); absolute paths are forced whenever the build tree is reached through the `//wsl$/…` UNC form, i.e. when it sits on the Linux filesystem rather than `C:\` (documented builds put the source on the Windows disk, `/mnt/c`).
 - `erl.ini` backslashes must be doubled: the INI reader (`../init_file.c`) treats `\\` as one `\` and `\;` as a non-comment semicolon — this is why `-d` exists.
 - Files the Windows tools create on `/mnt/c` are invisible to WSL for a moment and carry no Unix executable bit (see Known Issues).
 
