@@ -241,6 +241,13 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
 - **Atom-cache emission is deferred.** `beam_codec` M1 never emits `ATOM_CACHE_REF`/`NEW_CACHE`, so
   control messages encode atoms inline; the *decoder* still resolves `ATOM_CACHE_REF` through a
   supplied `AtomCache`, and `dist_header` carries the `'D'` envelope + `'R'` refs.
+- **The OTP-23 `Complement` message is 9 bytes** (`'c' + flags_high(4) + creation(4)`). Do not be
+  misled by `ei_connect.c:2535`, which guards `recv_complement` with `rlen != 21` — that is an
+  erl_interface quirk (Erlang nodes never send a complement, so the branch is dead there); the
+  authoritative Erlang receiver `lib/kernel/src/dist_util.erl:973` matches exactly the 9-byte form.
+- **`Status` text excludes the leading tag.** The body is `'s'` + text where the text is `"ok"` /
+  `"ok_simultaneous"` / `"named:" + namelen(2) + name + creation(4)` (i.e. the on-wire bytes are
+  `"snamed:…"`); the raw `Error` text is carried verbatim (`"nok"` ⇒ `"snok"`).
 
 ## Known Issues / Intentional Gaps (M1)
 - **Live authentication is not possible end-to-end**: the challenge digest has no in-tree MD5, so the
