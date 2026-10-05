@@ -64,16 +64,22 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   +20%, capped at `2^53 / word`), `LazyLock`-built from `erts_init_gc` (`erl_gc.c:240-303`).
 - `pub fn next_heap_size(size, offset) -> usize` — `erts_next_heap_size` over that table.
 
-### `mso.rs` — off-heap refcounted large objects
-- `pub struct RefCount` — atomic refcount with `erts_refc_*` semantics: `new(initial)`, `count()`,
-  `inc()`, `dec()`, `dec_and_test(min) -> bool`.
+### `mso.rs` — off-heap refcounted large objects & refc binaries
+- `RefCount` — **re-exported** from `beam_alloc` (`pub use beam_alloc::RefCount;`); the workspace's single
+  `erts_refc_*` primitive (`new`, `count`, `inc`, `dec`, `dec_and_test(min)`). This crate defines no count
+  of its own; both `beam_gc::RefCount` and `beam_gc::mso::RefCount` resolve.
 - `pub struct Mso` — an off-heap, immutable, refcounted shared object: `new(payload, apparent_size)`,
   `downcast_ref::<T>()`, `apparent_size()`, `refcount()`.
 - `pub struct MsoHandle` — clonable owning handle to an `Mso` (the on-heap `BinRef` analogue):
   `Clone` bumps the refcount; the last `Drop` runs the destructor (the payload's `Drop`) and frees it.
-- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(MsoHandle)`, `len()`, `is_empty()`,
-  `overhead_bytes()`, `sweep(is_live) -> usize` (retains the handles a collection found live, releasing
-  the rest).
+- `pub enum OffHeapEntry { Mso(MsoHandle), Binary(beam_alloc::RefcBinary) }` — an entry of the per-process
+  off-heap list: `overhead_bytes()`/`apparent_size()` (Mso → the MSO's apparent size; Binary → `len()`),
+  `as_mso() -> Option<&MsoHandle>`, `as_binary() -> Option<&RefcBinary>`; `From<MsoHandle>`/`From<RefcBinary>`.
+- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)`, `len()`,
+  `is_empty()`, `overhead_bytes()` (the summed off-heap payload bytes, not the `Vec` capacity), and
+  `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` (retains the entries a collection found live,
+  releasing the rest — dropping a `Binary` decrements its refcount and frees the payload at zero; dropping
+  an `Mso` runs the MSO destructor at zero). The caller supplies the liveness predicate (see Known Gaps).
 
 ### `stats.rs` — `GcStats`
 `words_copied`, `words_reclaimed`, `objects_copied`, `minor_collections`, `major_collections`
