@@ -108,13 +108,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
   test and is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
-- **Local object-size traversal; `beam_term` is not modified.** A shared `beam_term::size_object` is
-  an *upstream, parallel* addition and **is not present in this crate's build**. Rather than duplicate a
-  generic term-size function, `copy.rs` computes only what the copier needs — `move_size(header, ptr)`
-  (the `nelts` of `move_boxed`: `header_arity` plus the flatmap/HAMT/fun extras) — reading the boxed
-  layout through `beam_term`'s public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`,
-  `map_header_val`, `is_fun_header`, …). If `beam_term::size_object` lands, this can be reconciled
-  then; the decision and the exact formula live here so no agent re-derives them.
+- **Local object-size traversal; `beam_term` is not modified.** `copy.rs` computes only what the copier
+  needs — an *incremental, per-object* `move_size(header, ptr)`: the `nelts` of the C `move_boxed`
+  (`header_arity` plus the flatmap/HAMT/fun extras), read through `beam_term`'s public accessors
+  (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`, `is_fun_header`, …), which
+  the scan then walks word by word. It does **not** call `beam_term::size::size_object`: that is a
+  whole-graph size (it cannot size the single object the copier is looking at), and it under-reports
+  HAMT maps (see Known Gaps). The decision and the exact formula live here so no agent re-derives them.
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
@@ -166,6 +166,14 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - **`tests/generations.rs`.** Drive a `Collector` through several minors and a forced major; assert
   `CollectionKind`, that live data survives across generations, that the nursery is empty after a minor,
   and that a too-small mature escalates to a major.
+- **`tests/map_copy.rs` / `tests/refc_binary_copy.rs` — the new-shape evidence.** Prove the copier
+  preserves the *recently added* interiors: a flat map, a 500-key HAMT (head + inner nodes + collision
+  nodes) and the 8-word `[BinRef][ErlSubBits]` refc-binary pair. Each is built in a `HeapSpace` with the
+  public `beam_term` writers (`write_map`/`write_refc_binary`), collected as the sole root, and then
+  checked *from the updated root* for root relocation, full key/pair (or `orig`) round-trip, and exact
+  size accounting. The expected size is measured **independently** of any size heuristic: a `MARKER`
+  is pre-written over the reservation and the map's contiguous footprint is recovered by scanning back
+  (the copier's `to.used_words()` must equal it), while the pair's size is the frozen `ERL_REFC_BITS_SIZE`.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
@@ -187,6 +195,14 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - **`OffHeap` automatic integration with the collector's reachability** — the sweep is exposed as
   `OffHeap::sweep(is_live)`; the caller supplies the liveness test (the on-heap handle kind is the
   binary/ABI layer's concern).
+- **Sizing oracle gap (upstream, `beam_term::size::size_object`).** It gates its hashmap branch on
+  `is_hashmap_header`, which only matches the two *head* node types, so an inner `HAMT_NODE_BITMAP`
+  node (and everything under it) is not counted — `size_object` of a 500-key map reports `4`. It also
+  reports a refc binary's `ErlSubBits` alone (5) rather than the C's `ERL_REFC_BITS_SIZE` (8). The real
+  C `size_object_x` (`copy.c:192-214,219-231`) handles all three node types and the BinRef case. This
+  crate's copier is unaffected (`move_size` uses `map_header_val`/`header_arity` and is exact — see
+  `tests/map_copy.rs`), which is why the tests measure a map's footprint directly rather than via
+  `size_object`. Fixing `size_object` is `beam_term`'s job.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -199,6 +215,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
 - `tests/generations.rs` → `Collector` minor/major/tenure/escalation integration
+- `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
+- `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
