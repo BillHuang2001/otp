@@ -17,7 +17,7 @@ Built by ExDoc into HTML pages plus man pages; `make docs` here delegates entire
 - Published page set = `docs.exs` `extras` ∪ `make/ex_doc.exs` auto-globs `doc/*.md` and `doc/{guides,references,internal_docs}/*.md`.
 - `notes.md` is picked up by that auto-glob (it is NOT listed in `docs.exs`); `docs.exs` order wins for items listed there.
 - Module docs come from the compiled `../ebin/*.beam`s (i.e. `-moduledoc` in `../src/*.erl`); only modules with a *real* `-moduledoc` are published: `systools`, `alarm_handler`, `release_handler`, `rb`. Modules marked `-moduledoc false.` are excluded.
-- `references/rel.md`, `script.md`, `appup.md`, `relup.md` are MAN4 (section 4); `sasl_app.md` is MAN6; documented modules are MAN3 (see `MAN4_DEPS`/`MAN6_DEPS` in `../make/doc.mk`… actually `$(ERL_TOP)/make/doc.mk`).
+- Man-page sections (from `$(ERL_TOP)/make/doc.mk`): `references/rel.md`, `script.md`, `appup.md`, `relup.md` are MAN4 (section 4); `sasl_app.md` is MAN6; documented modules are MAN3.
 - HTML built via `make/ex_doc_wrapper` (needs ex_doc, see `make/check_ex_doc`); man pages via `make/markdown_to_man.escript`.
 
 ## Constraints
