@@ -88,7 +88,8 @@ There are currently **no `.cpp` files directly in `beam/`** (the `BEAM_CPP_SRC` 
 - Vendored 3PP reached from here: zlib (`erl_zlib.c`), PCRE (`erl_bif_re.c`), zstd, ryu (via `../utils`/`../zstd`).
 
 ## Test Strategy
-- No tests in this directory. VM tests are `../test/*_SUITE.erl` run through `make test` from `erts/`: e.g. `beam_SUITE`, `dirty_bif_SUITE`, `erl_bif_*`/`bif_SUITE`, `gc_SUITE`, `ets_SUITE`, `dist_*_SUITE`, `tracing`/`trace_*_SUITE`, `nif_SUITE`, `process_SUITE`, `alloc_SUITE`.
+- No tests in this directory. VM tests are the ~150 `../test/*_SUITE.erl` suites run via `make test` from `erts/` (or from `../`): `beam_SUITE`, `bif_SUITE`, `gc_SUITE`, `alloc_SUITE`, `dirty_bif_SUITE`, `dirty_nif_SUITE`, `nif_SUITE`, `big_SUITE`, `binary_SUITE`, `bs_*_SUITE`, `map_SUITE`, `process_SUITE`, `signal_SUITE`, `register_SUITE`, `node_container_SUITE`, `ref_SUITE`, `native_record_SUITE`, `distribution_SUITE`, `port_SUITE`, `driver_SUITE`, `trace_SUITE`/`tracer_SUITE`/`emulator_trace.spec`, `lcnt_SUITE`, `jit_SUITE`, `system_info_SUITE`, `dump_SUITE`.
+- ETS behavior is tested at the stdlib level (`../../../../lib/stdlib/test/ets_SUITE.erl`), not from `../test/`.
 - C-level bugs are usually reproduced under `TYPE=debug`, `asan`, `valgrind` or `lcnt` flavors; suppression/helper files live in `../asan/` and `../valgrind/`, lock-count tests use `lcnt`.
 
 ## Routing Table
