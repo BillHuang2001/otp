@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -123,6 +123,31 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - `THE_NON_VALUE: Eterm` (= `0` in release, `make_header(0, Float)` in debug); `is_non_value`,
   `is_value`, `is_zero_sized`.
 
+### `compare.rs` — Erlang term ordering (`erts_cmp`)
+The lowest-common-ancestor ordering shared by `beam_ets` (ordered_set), `beam_bifs` (comparison
+operators) and `<`/`>` between same-typed terms.
+- `pub fn cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the exact (`=:=`)
+  order, reproducing `erts_cmp(a, b, exact=1, eq_only=0)` / `erts_cmp_compound` (`utils.c`).
+  Ascending order `number < atom < ref < fun < port < pid < tuple < record < map < nil < list <
+  bitstring` (plus external variants), derived from the `_DEF` virtual tags in `erl_term.h`.
+- `pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool` — `cmp(a,b).is_eq()` (`=:=`).
+- `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
+  arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
+  only for floats and mixed integer/float pairs).
+- `pub(crate) float_bits`/`float_value`/`bitstring_parts`/`bit_at` — helpers shared with
+  `hashing.rs` (not re-exported).
+
+### `hashing.rs` — structural term hashing
+- `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash
+  reproducing the *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
+  **The exact hash values are internal and NOT part of any compatibility contract** (nothing
+  outside the Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+
+### `size.rs` — object word size
+- `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
+  occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
+  cell, `arity + 1` per boxed object (header + payload), plus the sizes of nested terms.
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
@@ -175,6 +200,11 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
+- `src/compare.rs`, `src/hashing.rs`, `src/size.rs` carry their own in-module `#[cfg(test)]` suites:
+  ordering across every class pair (number < atom < ref < port < pid < tuple < map < nil < list <
+  binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
+  structural-hash equality for equal terms (and inequality for different terms), and `size_object`
+  for immediates / cons / tuple / boxed. Prefer property-style boundary loops.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
   compatibility gate), not to this crate's unit tests.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
@@ -191,9 +221,30 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
+- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
+- `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
+- `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
+
+## Known Issues
+- **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
+  `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings and
+  internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
+  a structural comparison and must be extended if exact ordering is needed: big integers, external
+  pid/port/ref, funs, non-flat maps, records and on-heap bin refs (ordered by class rank, then object
+  arity, then raw term word); internal references (compared by raw payload words, not the decoded
+  `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
+- **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
+  the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
+  exact bit values are not part of any contract. Classes lacking a layout-aware representation (funs,
+  maps, records, external pid/port/ref, bin refs) use an opaque raw-word fallback, so their hash is
+  not stable across processes/images.
+- **Object-size approximations (`src/size.rs`).** Hashmaps are approximated by the head node's
+  `arity + 1` (deep HAMT nodes uncounted); sub-bitstrings report the on-heap thing size rather than
+  the copied representation; native records are treated like tuples.
+
 ## Notes for Agents
 - **Read `../../erts/emulator/beam/erl_term.h` before changing any constant** — it is the ground truth;
   cite it in comments where a value is non-obvious.

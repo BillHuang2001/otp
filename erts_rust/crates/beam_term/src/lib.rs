@@ -17,26 +17,32 @@
 
 pub mod atom;
 pub mod boxed;
+pub mod compare;
 pub mod error;
 pub mod eterm;
+pub mod hashing;
 pub mod heap;
 pub mod immediate;
 pub mod list;
 pub mod literal;
 pub mod ops;
+pub mod size;
 pub mod tag;
 pub mod tuple;
 
 /// Flat re-exports of every public item in this crate.
 pub use crate::atom::*;
 pub use crate::boxed::*;
+pub use crate::compare::*;
 pub use crate::error::*;
 pub use crate::eterm::*;
+pub use crate::hashing::*;
 pub use crate::heap::*;
 pub use crate::immediate::*;
 pub use crate::list::*;
 pub use crate::literal::*;
 pub use crate::ops::*;
+pub use crate::size::*;
 pub use crate::tag::*;
 pub use crate::tuple::*;
 
@@ -44,13 +50,16 @@ pub use crate::tuple::*;
 pub mod prelude {
     pub use crate::atom::*;
     pub use crate::boxed::*;
+    pub use crate::compare::*;
     pub use crate::error::*;
     pub use crate::eterm::*;
+    pub use crate::hashing::*;
     pub use crate::heap::*;
     pub use crate::immediate::*;
     pub use crate::list::*;
     pub use crate::literal::*;
     pub use crate::ops::*;
+    pub use crate::size::*;
     pub use crate::tag::*;
     pub use crate::tuple::*;
 }
