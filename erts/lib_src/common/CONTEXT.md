@@ -22,7 +22,7 @@ The directory has no subdirectories, no `Makefile` and no build outputs of its o
 - `ethr_aux.c` (763) — the non-lock core of ethread: the global ethread state (`ethr_mem__`, `ethr_pagesize__`, `ethr_min_stack_size__`/`ethr_max_stack_size__`, `ethr_not_inited__`/`ethr_not_completely_inited__`, `ethr_thr_prepare|parent|child_func__`, `ethr_runtime__`), `ethr_init_common__` / `ethr_late_init_common__` (which also calls `ethr_init_atomics`), exit handlers, the thread-specific-event pool, stack-limit handling, the `ethr_spinlock_*` / `ethr_rwlock_*` wrappers, and `ethr_fatal_error__` / `ethr_assert_failed`.
 - `ethr_mutex.c` (3350) — the `ethr_mutex`, `ethr_cond` and reader-group-aware `ethr_rwmutex` implementations, plus `ethr_mutex_lib_init` / `ethr_mutex_lib_late_init` and `ethr_rwmutex_set_reader_group`.
   It contains several mutually exclusive implementations selected by platform macros set up in `ethread.h` (own spin lock implementation, `pthread_mutex`-based, win32 `CRITICAL_SECTION`-based, and a forced pure-pthread variant used under VALGRIND).
-  Spin counts and `ethernet_mutex_opt` / `ethernet_cond_opt` / `ethernet_rwmutex_opt` tuning knobs live in `ethr_mutex.h`.
+  Spin counts and the `ethr_mutex_opt` / `ethr_cond_opt` / `ethr_rwmutex_opt` tuning knobs live in `ethr_mutex.h`.
 - `ethr_cbf.c` (39) — one function, `ethr_compiler_barrier_fallback()`; deliberately kept alone so the compiler cannot optimise the (intentionally empty) barrier away.
   `ETHR_COMPILER_BARRIER` maps to it in the generated `ethr_atomics.h` when no native barrier is available.
 - `ethr_atomics.c` (4707) — **GENERATED, do not edit**. The native/fallback atomic + double-word-atomic implementation for the ethread API.
