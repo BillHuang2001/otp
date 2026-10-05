@@ -1,9 +1,11 @@
-//! Baseline-JIT **tier equivalence** over the broad loader fixture
+//! Native-JIT **tier equivalence** over the broad loader fixture
 //! `beam_loader/tests/fixtures/coverage.beam`.
 //!
 //! Where `tests/jit.rs` proves the vertical slice's `add`/`fib`/`pick` run on the
-//! native baseline tier, this test drives an *idiomatic* module through **both**
-//! tiers and requires them to agree. It is the direct evidence for the baseline
+//! native baseline tier, this test drives an *idiomatic* module through the
+//! interpreter and **every native tier this build has** ([`NATIVE_TIERS`]: the
+//! baseline tier always, plus the Cranelift hot tier with the `jit-cranelift`
+//! feature) and requires them to agree. It is the direct evidence for the native
 //! mechanism's most important claim — the per-instruction deopt — because
 //! `coverage.beam` reaches opcodes whose helper result is a `Step::Goto` to a
 //! **different address** (a lowered `jump`, a cross-function call, and the
@@ -115,6 +117,19 @@ fn apply_hook(fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
     small_arith(&[args[0], free[0]], '+')
 }
 
+/// The native tiers this build has to check the interpreter against.
+///
+/// The baseline tier is in every build; the Cranelift hot tier joins the roster
+/// with the `jit-cranelift` Cargo feature. Both run the *same* shared per-instruction
+/// helper through [`run_native`](beam_engine::jit), so the equivalence claim is
+/// asserted for whichever tiers are compiled in.
+#[cfg(feature = "jit-cranelift")]
+const NATIVE_TIERS: [Tier; 2] = [Tier::BaselineJit, Tier::Cranelift];
+
+/// The native tiers this build has to check the interpreter against.
+#[cfg(not(feature = "jit-cranelift"))]
+const NATIVE_TIERS: [Tier; 1] = [Tier::BaselineJit];
+
 /// A context with the fixture's BIF floor and apply hook installed.
 fn context() -> MinimalContext {
     let mut ctx = MinimalContext::with_bif_hook(Box::new(bif_hook));
@@ -145,25 +160,28 @@ fn run_on_tier(
     )
 }
 
-/// Assert the two tiers return structurally-equal results and return the shared
-/// value.
+/// Assert every native tier returns a result structurally equal to the
+/// interpreter's, and return the shared value.
 ///
 /// `beam_term::cmp` is the module's exact `=:=` ordering, so boxed tuples/floats
 /// (whose raw `Eterm` words differ by allocation address) compare by value.
 fn agree(ctx: &mut MinimalContext, module: &Module, name: &str, args: &[Eterm]) -> Eterm {
     let interpreted = run_on_tier(ctx, module, Tier::Interpreter, name, args)
         .unwrap_or_else(|err| panic!("interpreter {name}/{} failed: {err:?}", args.len()));
-    let jitted = run_on_tier(ctx, module, Tier::BaselineJit, name, args)
-        .unwrap_or_else(|err| panic!("baseline-jit {name}/{} failed: {err:?}", args.len()));
-    assert!(
-        beam_term::cmp(jitted, interpreted, &module.atom_table).is_eq(),
-        "{name}/{} differs between tiers: {jitted:?} vs {interpreted:?}",
-        args.len()
-    );
-    jitted
+    for tier in NATIVE_TIERS {
+        let got = run_on_tier(ctx, module, tier, name, args)
+            .unwrap_or_else(|err| panic!("{} {name}/{} failed: {err:?}", tier.name(), args.len()));
+        assert!(
+            beam_term::cmp(got, interpreted, &module.atom_table).is_eq(),
+            "{name}/{} differs on {}: {got:?} vs {interpreted:?}",
+            args.len(),
+            tier.name()
+        );
+    }
+    interpreted
 }
 
-/// Assert both tiers fail with the **same** typed error and return it.
+/// Assert every native tier fails with the **same** typed error and return it.
 fn agree_error(
     ctx: &mut MinimalContext,
     module: &Module,
@@ -172,15 +190,24 @@ fn agree_error(
 ) -> BeamError {
     let interpreted = run_on_tier(ctx, module, Tier::Interpreter, name, args)
         .expect_err("the interpreter must fail");
-    let jitted = run_on_tier(ctx, module, Tier::BaselineJit, name, args)
-        .expect_err("the native tier must fail");
-    assert_eq!(
-        format!("{jitted:?}"),
-        format!("{interpreted:?}"),
-        "{name}/{}: the tiers disagree on the typed error",
-        args.len()
-    );
-    jitted
+    for tier in NATIVE_TIERS {
+        let got = match run_on_tier(ctx, module, tier, name, args) {
+            Ok(value) => panic!(
+                "{} {name}/{} unexpectedly produced {value:?}",
+                tier.name(),
+                args.len()
+            ),
+            Err(err) => err,
+        };
+        assert_eq!(
+            format!("{got:?}"),
+            format!("{interpreted:?}"),
+            "{name}/{}: {} disagrees on the typed error",
+            args.len(),
+            tier.name()
+        );
+    }
+    interpreted
 }
 
 /// Assert `term` is a tuple of exactly `expected` (compared structurally).
@@ -204,9 +231,16 @@ fn assert_tuple(module: &Module, term: Eterm, expected: &[Eterm]) {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn the_baseline_tier_is_in_the_roster() {
+fn the_native_tiers_are_in_the_roster() {
     assert!(available_tiers().contains(&"baseline-jit"));
     assert!(Tier::BaselineJit.is_available());
+    // The Cranelift hot tier joins the roster exactly with the `jit-cranelift`
+    // feature, which is what `NATIVE_TIERS` tracks.
+    assert_eq!(
+        available_tiers().contains(&"jit-cranelift"),
+        cfg!(feature = "jit-cranelift")
+    );
+    assert_eq!(NATIVE_TIERS.contains(&Tier::Cranelift), cfg!(feature = "jit-cranelift"));
 }
 
 // ---------------------------------------------------------------------------
@@ -268,7 +302,7 @@ fn the_closure_path_agrees_across_tiers() {
 
     // `beam_term::cmp` orders funs by their raw word (a documented fallback), so
     // the closure is checked structurally on each tier rather than cross-compared.
-    for tier in [Tier::Interpreter, Tier::BaselineJit] {
+    for tier in std::iter::once(Tier::Interpreter).chain(NATIVE_TIERS) {
         let fun = run_on_tier(&mut ctx, &module, tier, "make_adder", &[make_small(10)])
             .unwrap_or_else(|err| panic!("{tier:?} make_adder/1 failed: {err:?}"));
         assert!(terms::is_fun(fun), "{tier:?}: make_adder/1 returns a fun");

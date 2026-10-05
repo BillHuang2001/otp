@@ -17,10 +17,11 @@
 //! * [`Tier::Cranelift`] — the optional hot tier (Cranelift codegen), gated behind
 //!   the **`jit-cranelift`** Cargo feature (default **OFF**). Deliberately off the
 //!   critical path: with the feature disabled the crate carries no Cranelift
-//!   dependency at all and the build never depends on Cranelift codegen. JIT
-//!   compilation is *measurement-gated* (Part II §F) with a bounded-latency,
-//!   cheap-deopt design, and the backend is not built yet either — selecting the
-//!   tier without a compiled-in backend is a typed error, never a panic.
+//!   dependency at all and the build never depends on Cranelift codegen. When the
+//!   feature is on, [`cranelift::CraneliftJit`] lowers each IR function into a real
+//!   Cranelift function that loops natively over the function's control flow while
+//!   delegating per-instruction semantics to the shared interpreter-backed helper;
+//!   without the feature selecting the tier is a typed error, never a panic.
 //!
 //! [`available_tiers`] reports the tier **names** compiled into this build, and
 //! [`Tier::from_name`] maps a name back to a [`Tier`]; the two are kept consistent
@@ -43,7 +44,8 @@
 //! interpreter is *not* a [`JitBackend`] (it has nothing to compile — it is
 //! reached through [`Tier::Interpreter`] and
 //! [`Machine::run_export`](crate::Machine::run_export)). [`baseline::BaselineJit`]
-//! is the one backend built today.
+//! and — with the `jit-cranelift` feature — [`cranelift::CraneliftJit`] are the
+//! backends built today.
 
 use beam_common::Result;
 use beam_loader::{Atom, Module};
@@ -53,6 +55,8 @@ use crate::context::ExecutionContext;
 use crate::Machine;
 
 pub mod baseline;
+#[cfg(feature = "jit-cranelift")]
+pub mod cranelift;
 pub mod emitter;
 
 /// An execution tier of the typed IR.
@@ -75,8 +79,11 @@ pub enum Tier {
     /// The optional Cranelift hot tier.
     ///
     /// Named `"jit-cranelift"` and compiled in only when the **`jit-cranelift`**
-    /// Cargo feature is enabled (default OFF). It is the *unavailable* tier until a
-    /// backend is wired in: selecting it returns a typed
+    /// Cargo feature is enabled (default OFF). With the feature on the backend is
+    /// [`cranelift::CraneliftJit`]: it lowers each IR function to a native Cranelift
+    /// function that loops over the function's control flow and delegates
+    /// per-instruction semantics to the shared interpreter-backed helper. With the
+    /// feature off the tier has no backend, so selecting it returns a typed
     /// [`unsupported`](crate::error::unsupported) error rather than falling back
     /// silently.
     Cranelift,
@@ -188,6 +195,50 @@ const TIERS: &[&str] = &["interpreter", "baseline-jit", "jit-cranelift"];
 /// The roster of tiers compiled into this build (interpreter first).
 #[cfg(not(feature = "jit-cranelift"))]
 const TIERS: &[&str] = &["interpreter", "baseline-jit"];
+
+/// Execute `function/arity` on the Cranelift hot tier.
+///
+/// With the **`jit-cranelift`** feature enabled this builds
+/// [`cranelift::CraneliftJit`] and runs the export through it (the module is
+/// compiled to native code and the export runs on the shared driver loop, with the
+/// per-instruction interpreter helper for everything the tier does not inline).
+/// Without the feature the backend is not compiled in at all, so this is a typed
+/// [`unsupported`](crate::error::unsupported) error — never a panic and never a
+/// silent fallback to another tier.
+///
+/// This is the body of [`Machine::run_with_tier`](crate::Machine::run_with_tier)
+/// for [`Tier::Cranelift`]; the two definitions are the feature-on and feature-off
+/// halves of the same entry point.
+#[cfg(feature = "jit-cranelift")]
+pub(crate) fn run_cranelift(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Eterm> {
+    let mut backend = cranelift::CraneliftJit::new();
+    backend.run_export(machine, module, function, arity, args, ctx)
+}
+
+/// Execute `function/arity` on the Cranelift hot tier (backend not compiled in).
+///
+/// The feature-off half of the [`Tier::Cranelift`] entry point; see the
+/// feature-on definition for the contract. Without the **`jit-cranelift`**
+/// feature the tier has no backend, so this is always a typed
+/// [`unsupported`](crate::error::unsupported) error.
+#[cfg(not(feature = "jit-cranelift"))]
+pub(crate) fn run_cranelift(
+    _machine: &mut Machine,
+    _module: &Module,
+    _function: Atom,
+    _arity: u32,
+    _args: &[Eterm],
+    _ctx: &mut dyn ExecutionContext,
+) -> Result<Eterm> {
+    Err(crate::error::unsupported("jit-cranelift tier not built"))
+}
 
 #[cfg(test)]
 mod tests {
@@ -319,8 +370,17 @@ mod tests {
     }
 
     #[test]
+    #[cfg(not(feature = "jit-cranelift"))]
     fn cranelift_tier_is_a_typed_error_not_a_silent_fallback() {
         let err = run_add(Tier::Cranelift).expect_err("no Cranelift backend is built");
         assert!(matches!(err, BeamError::Raise(_)));
+    }
+
+    #[test]
+    #[cfg(feature = "jit-cranelift")]
+    fn cranelift_tier_runs_the_module_on_its_native_backend() {
+        // With the feature on the tier compiles the module with Cranelift and runs
+        // it; its observable result must be the interpreter's.
+        assert_eq!(run_add(Tier::Cranelift).expect("add(2, 3)"), make_small(5));
     }
 }

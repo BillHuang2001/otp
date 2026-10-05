@@ -169,22 +169,22 @@ pub const fn decode_target(word: i64) -> Option<(u32, u32)> {
 /// invariant, so the object's own lifetime must be named); it does not affect the
 /// `#[repr(C)]` layout.
 #[repr(C)]
-struct JitRuntime<'a> {
+pub(crate) struct JitRuntime<'a> {
     /// The process state a block reads and writes through (`stack`, frames, …).
-    machine: *mut Machine,
+    pub(crate) machine: *mut Machine,
     /// The base of the x-register array (`machine.x`) a block loads from / spills to.
-    x_regs: *mut Eterm,
+    pub(crate) x_regs: *mut Eterm,
     /// The module being executed (its `code`, labels, imports, literals).
-    module: *const Module,
+    pub(crate) module: *const Module,
     /// The module-wide `Label -> (func, pc)` map the helper resolves fail/target
     /// labels through (built once per driver call by
     /// [`interpreter::build_label_map`](crate::interpreter)).
-    labels: *const BTreeMap<Label, (u32, u32)>,
+    pub(crate) labels: *const BTreeMap<Label, (u32, u32)>,
     /// The [`ExecutionContext`] seam, handed back as `&mut dyn` to the helper.
-    ctx: *mut (dyn ExecutionContext + 'a),
+    pub(crate) ctx: *mut (dyn ExecutionContext + 'a),
     /// Set by a helper that hit a propagating `Err`; the `ERROR` word tells the
     /// driver to take it.
-    error: Option<BeamError>,
+    pub(crate) error: Option<BeamError>,
 }
 
 /// A compiled block's native signature.
@@ -193,6 +193,21 @@ type NativeBlock = for<'a> extern "C" fn(*mut JitRuntime<'a>) -> i64;
 /// The `jit_step_one` helper's native signature (the block ABI plus the
 /// instruction address).
 type StepHelper = for<'a> extern "C" fn(*mut JitRuntime<'a>, u32, u32) -> i64;
+
+/// A native tier's compiled-code lookup, consulted once per driver iteration by
+/// [`run_native`].
+///
+/// A tier implements this for whatever it compiled: [`run_native`] hands it the
+/// current `(func, pc)` and the live [`JitRuntime`], and the tier either runs that
+/// address natively — returning the block-ABI word the code produced — or returns
+/// `None`, which makes the driver take exactly one interpreter step. Returning
+/// `None` must not touch the runtime: it is the "this tier has no code here"
+/// answer, and it is what keeps an uncovered address on the interpreter's exact
+/// semantics.
+pub(crate) trait NativeCode {
+    /// Run `(func, pc)` natively if this tier compiled it for that address.
+    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64>;
+}
 
 // ---------------------------------------------------------------------------
 // The backend
@@ -313,7 +328,7 @@ impl CompiledModule {
 /// * [`Step::Goto { func, pc }`] → `encode_target(func, pc)`,
 /// * [`Step::Done`] → [`HALT`],
 /// * `Err(error)` → the error is stored in `rt.error` and [`ERROR`] is returned.
-extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
+pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
     // SAFETY: the driver passes `rt` as the address of a live, exclusively borrowed
     // `JitRuntime` and never aliases it for the duration of the call; every pointer
     // it holds points at an object the driver owns and keeps alive for the whole
@@ -694,22 +709,9 @@ fn constant_word(operand: &Operand) -> Option<i64> {
 
 /// Run exported `function/arity` through the compiled blocks.
 ///
-/// Mirrors [`Machine::run_label`](crate::Machine)'s setup (reset, seed `x[0..arity)`
-/// from `args`, push the bottom frame, bind the module's literal area, resolve the
-/// export label and build the module-wide label map), then loops:
-///
-/// * if a block was compiled for `(func, pc)`, call it and decode its return word —
-///   [`HALT`] finishes the run, [`ERROR`] propagates `rt.error`, a `(func, pc)`
-///   pair continues there;
-/// * otherwise take exactly one interpreter step
-///   ([`Machine::step_instruction`](crate::Machine)), identically to the
-///   interpreter's own loop.
-///
-/// The second path is not an emergency fallback: it is the tier's documented
-/// per-instruction deopt, and it is also what happens when the running machine's
-/// register file is smaller than the highest x-register a block caches (native
-/// execution would read outside `machine.x`), and for every address no block starts
-/// at.
+/// The native lookup is the compiled block table: any compiled `(func, pc)` is
+/// entered, and every other address stays on the interpreter step. See
+/// [`run_native`] for the shared driver the two native tiers run on.
 fn run_compiled(
     compiled: &CompiledModule,
     machine: &mut Machine,
@@ -719,9 +721,76 @@ fn run_compiled(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
+    // A block loads its cached x-registers out of `machine.x` without a bounds
+    // check, so a machine whose register file is shorter than the highest cached
+    // index cannot enter native code; such a run stays on the interpreter step.
+    let native_ok = match compiled.highest_cached_register {
+        Some(highest) => machine.x.len() > highest as usize,
+        None => true,
+    };
+    let code = BlockEntries {
+        compiled,
+        native_ok,
+    };
+    run_native(machine, module, function, arity, args, ctx, &code)
+}
+
+/// The baseline tier's [`NativeCode`]: any compiled basic block may be entered.
+struct BlockEntries<'a> {
+    /// The compiled block table the addresses are looked up in.
+    compiled: &'a CompiledModule,
+    /// Whether the running machine's register file covers every cached slot; when
+    /// it does not, no block may be entered (see [`run_compiled`]).
+    native_ok: bool,
+}
+
+impl NativeCode for BlockEntries<'_> {
+    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64> {
+        if !self.native_ok {
+            return None;
+        }
+        let block_entry = self.compiled.entry(func, pc)?;
+        // SAFETY: `block_entry` points just past the start of a complete native
+        // function emitted by `emit_block` with exactly the `NativeBlock` signature
+        // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
+        // read+execute by `compile_module`; `rt` is the live driver-owned runtime
+        // block the driver does not otherwise borrow during the call.
+        let block: NativeBlock = unsafe { mem::transmute(block_entry) };
+        Some(block(rt))
+    }
+}
+
+/// The driver loop both native tiers run on.
+///
+/// Mirrors [`Machine::run_label`](crate::Machine)'s setup (reset, seed
+/// `x[0..arity)` from `args`, push the bottom frame, bind the module's literal
+/// area, resolve the export label and build the module-wide label map), then
+/// loops:
+///
+/// * ask `code` (the tier's [`NativeCode`] lookup) whether `(func, pc)` can run
+///   natively; when it can, the returned block-ABI word is folded exactly like a
+///   block's return value — [`HALT`] finishes the run, [`ERROR`] propagates
+///   `rt.error`, a `(func, pc)` pair continues there;
+/// * otherwise take exactly one interpreter step
+///   ([`Machine::step_instruction`](crate::Machine)), identically to the
+///   interpreter's own loop.
+///
+/// The second path is not an emergency fallback: it is each tier's documented
+/// per-instruction deopt, and it is also what happens for every address the tier
+/// compiled no entry point for (and, for the baseline tier, when the running
+/// machine's register file is too small — see [`run_compiled`]).
+pub(crate) fn run_native(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<Eterm> {
     let entry = module
         .export(function, arity)
-        .ok_or_else(|| error::unsupported("baseline jit: export not found"))?;
+        .ok_or_else(|| error::unsupported("jit: export not found"))?;
 
     machine.reset();
     let n = arity.min(args.len() as u32);
@@ -735,7 +804,7 @@ fn run_compiled(
 
     // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
     // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
-    // no `&mut` of the driver's aliases them while a block call is in flight.
+    // no `&mut` of the driver's aliases them while a native call is in flight.
     let x_regs: *mut Eterm = machine.x.as_mut_ptr();
     let machine_ptr: *mut Machine = &mut *machine;
     let ctx_ptr = &mut *ctx as *mut dyn ExecutionContext;
@@ -748,47 +817,30 @@ fn run_compiled(
         error: None,
     };
 
-    // A block loads its cached x-registers out of `machine.x` without a bounds
-    // check, so a machine whose register file is shorter than the highest cached
-    // index cannot enter native code; such a run stays on the interpreter step.
-    let native_ok = match compiled.highest_cached_register {
-        Some(highest) => machine.x.len() > highest as usize,
-        None => true,
-    };
-
     loop {
-        if native_ok {
-            if let Some(block_entry) = compiled.entry(func, pc) {
-                // SAFETY: `block_entry` points just past the start of a complete
-                // native function emitted by `emit_block` with exactly the
-                // `NativeBlock` signature (`extern "C" fn(*mut JitRuntime) -> i64`),
-                // inside a buffer sealed read+execute by `compile_module`; `rt` is a
-                // live local the driver does not otherwise borrow during the call.
-                let block: NativeBlock = unsafe { mem::transmute(block_entry) };
-                let word = block(&mut rt);
-                if word == HALT {
-                    // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
-                    // no block is running here.
-                    return unsafe { (*machine_ptr).finish() };
+        if let Some(word) = code.enter(&mut rt, func, pc) {
+            if word == HALT {
+                // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
+                // no native code is running here.
+                return unsafe { (*machine_ptr).finish() };
+            }
+            if word == ERROR {
+                return Err(rt
+                    .error
+                    .take()
+                    .unwrap_or_else(|| error::unsupported("jit: helper error")));
+            }
+            match decode_target(word) {
+                Some((next_func, next_pc)) => {
+                    func = next_func;
+                    pc = next_pc;
+                    continue;
                 }
-                if word == ERROR {
-                    return Err(rt
-                        .error
-                        .take()
-                        .unwrap_or_else(|| error::unsupported("baseline jit: helper error")));
-                }
-                match decode_target(word) {
-                    Some((next_func, next_pc)) => {
-                        func = next_func;
-                        pc = next_pc;
-                        continue;
-                    }
-                    None => return Err(error::unsupported("baseline jit: bad block target")),
-                }
+                None => return Err(error::unsupported("jit: bad block target")),
             }
         }
 
-        // SAFETY: the block call returned, so no `&mut` derived from `rt` is alive;
+        // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;
         // `machine_ptr`/`ctx_ptr` point at the driver's live, distinct objects
         // (`Machine` and the `ExecutionContext`), never at each other.
         let step = unsafe { (*machine_ptr).step_instruction(module, &labels, func, pc, &mut *ctx_ptr)? };

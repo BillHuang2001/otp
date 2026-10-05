@@ -216,11 +216,13 @@ impl Machine {
     ///   ([`crate::jit::baseline::BaselineJit`]): it compiles the module's basic
     ///   blocks to x86-64 and runs the export through a driver loop that falls back
     ///   to one interpreter step per un-lowered instruction.
-    /// * [`Tier::Cranelift`] — no Cranelift backend is built yet (the tier is
-    ///   compiled in only with the `jit-cranelift` feature, and even then the
-    ///   backend is a follow-up task), so this is a typed
-    ///   [`unsupported`](crate::error::unsupported) error, never a panic and never
-    ///   a fallback to the interpreter.
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier
+    ///   (`crate::jit::cranelift::CraneliftJit`), compiled in only with the
+    ///   `jit-cranelift` Cargo feature: it lowers each IR function into a native
+    ///   Cranelift function that loops over the function's control flow and delegates
+    ///   per-instruction semantics to the same interpreter-backed helper. With the
+    ///   feature off this is a typed [`unsupported`](crate::error::unsupported)
+    ///   error, never a panic and never a fallback to the interpreter.
     pub fn run_with_tier(
         &mut self,
         module: &Module,
@@ -237,7 +239,7 @@ impl Machine {
                 let mut backend = crate::jit::baseline::BaselineJit::new();
                 backend.run_export(self, module, function, arity, args, ctx)
             }
-            Tier::Cranelift => Err(error::unsupported("jit-cranelift tier not built")),
+            Tier::Cranelift => crate::jit::run_cranelift(self, module, function, arity, args, ctx),
         }
     }
 
