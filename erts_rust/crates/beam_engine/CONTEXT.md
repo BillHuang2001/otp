@@ -253,9 +253,10 @@ stable raw pointers; **only this module dereferences them**.
   pattern as the external-pid `node` slot (`erl_term.h` `MAKE_FUN_HEADER` + `erl_fun.h` `ErlFunThing`).
 
 ## Known Issues / Intentional M1 gaps
-- **No garbage collection.** `MinimalContext` has an unbounded heap; `test_heap`/`allocate_heap` call
-  `ensure_heap` (a no-op there). The real collector + heap sizing is Stage 4 (`beam_gc`); the engine
-  never allocates heap terms itself (only BIFs do, through the context).
+- **No garbage collection.** `MinimalContext` has an unbounded, never-freed arena; `test_heap`/
+  `allocate_heap` call `ensure_heap` (a no-op there). The real collector + heap sizing is Stage 4
+  (`beam_gc`); the engine now allocates boxed terms only through `terms`/`alloc_words` (BIFs allocate
+  through the context), and `MinimalContext` frees nothing.
 - **No in-VM exceptions/catch.** A `GcBif` error with a live fail label branches (guard failure); an
   error with `NO_FAIL` propagates out of `run_export` as `Err(BeamError)`. `try`/`catch`/`raise`/
   `try_case`/stacktrace opcodes are `Generic` ⇒ unsupported.
