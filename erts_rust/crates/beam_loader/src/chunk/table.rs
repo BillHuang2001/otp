@@ -105,7 +105,9 @@ pub fn parse_imports(data: &[u8]) -> Result<Vec<RawImport>> {
 
 /// Parses a `FunT` chunk payload into its raw lambda descriptors.
 ///
-/// M1 validates the framing only; the descriptors are not surfaced in the IR.
+/// The descriptors are lowered onto [`crate::ir::Module::funs`] by
+/// [`crate::lower::build_module`]; their position in the returned vector *is* the
+/// fun-table index `make_fun3` carries as its first operand.
 pub fn parse_funs(data: &[u8]) -> Result<Vec<RawFun>> {
     let mut reader = beam_codec::Reader::new(data);
     let count = read_count(&mut reader)?;

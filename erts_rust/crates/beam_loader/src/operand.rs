@@ -75,7 +75,9 @@ pub enum Operand {
     Character(u32),
     /// A float register operand (`z,2`).
     FloatReg(u32),
-    /// A static-literal operand (`z,4`) — an index into [`crate::ir::Module::literals`].
+    /// A static-literal operand (`z,4`) — an index into the module's
+    /// [`LiteralArea`](crate::literal::LiteralArea). Resolve it with
+    /// [`Module::literal`](crate::ir::Module::literal).
     Literal(u32),
     /// A `z,5` `tr` typed register: the register plus its `Type` chunk index.
     Typed {

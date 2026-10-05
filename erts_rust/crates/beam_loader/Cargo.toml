@@ -9,6 +9,7 @@ description = ".beam file parsing and lowering into the typed block-structured I
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_codec = { path = "../beam_codec" }
+beam_alloc = { path = "../beam_alloc" }
 libc.workspace = true
 
 [lints]

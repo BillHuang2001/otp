@@ -37,7 +37,7 @@ pub struct Chunks<'a> {
     pub exports: Vec<table::RawExport>,
     /// The `ImpT` import table.
     pub imports: Vec<table::RawImport>,
-    /// The `FunT` lambda descriptors (framing only; not modeled in M1).
+    /// The `FunT` lambda descriptors, in file (fun-table index) order.
     pub funs: Vec<table::RawFun>,
     /// The decoded `Line` table, if a usable `Line` chunk was present.
     pub line: Option<LineTable>,

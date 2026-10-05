@@ -13,10 +13,19 @@
 //! [`crate::instr`] and is re-exported here, so `crate::ir::Instr` is this module's
 //! canonical path for the engine while the enum itself stays in one flat module.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
+use crate::literal::LiteralArea;
 use crate::operand::Label;
 
 pub use crate::instr::*;
+
+/// One machine word of the frozen term representation
+/// ([`beam_term::Eterm`](beam_term::prelude::Eterm)).
+///
+/// Re-exported here because it is the type of a resolved static literal
+/// ([`Module::literal`]).
+pub use beam_term::Eterm;
 
 /// A module-local atom: an index into the crate-owned [`beam_term::AtomTable`].
 ///
@@ -188,7 +197,35 @@ impl Default for LineTable {
     }
 }
 
+/// One `FunT` chunk entry: the descriptor of a lambda (`fun … end` / a local fun).
+///
+/// The descriptor is what `make_fun3` (and, with a statically known target,
+/// `call_fun2`) refers to: the instruction carries the **fun-table index**, which
+/// resolves through [`Module::fun`] — the index of the entry in
+/// [`Module::funs`], i.e. its position in the file's `FunT` chunk
+/// (`beam_asm.erl`'s `beam_dict:lambda/3` hands out exactly that number).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FunDescriptor {
+    /// The name of the lambda's anonymous function.
+    pub function: Atom,
+    /// The lambda's arity (the number of *non-captured* arguments).
+    pub arity: u32,
+    /// The code label of the lambda body.
+    pub label: Label,
+    /// The index within the enclosing function's fun list.
+    pub index: u32,
+    /// The number of free variables the lambda captures.
+    pub num_free: u32,
+    /// The unique identifier of the lambda (the file's `old_uniq` field).
+    pub uniq: u32,
+}
+
 /// A fully loaded and lowered module — the loader's output and the engine's input.
+///
+/// A `Module` is `Clone` (cheap: the literal area is shared behind an [`Arc`]) and
+/// `Debug`, but it is **neither `Send` nor `Sync`**: [`LiteralArea`] owns a
+/// [`beam_alloc::Heap`] holding raw term pointers, so a loaded module is confined
+/// to the thread that loaded it (see [`crate::literal`]).
 #[derive(Clone, Debug)]
 pub struct Module {
     /// The module name (the atom at `AtU8` wire index 1).
@@ -203,14 +240,16 @@ pub struct Module {
     pub imports: Vec<Import>,
     /// The module's functions.
     pub functions: Vec<Function>,
+    /// The `FunT` lambda descriptors; `make_fun3`'s index addresses this vector.
+    pub funs: Vec<FunDescriptor>,
     /// The `Code` chunk header.
     pub code_version: CodeVersion,
     /// The decoded `Type` chunk (or its fallback).
     pub types: TypeTable,
     /// The decoded `Line` chunk.
     pub line: LineTable,
-    /// The `LitT` literal payloads (raw external-term bytes, not decoded).
-    pub literals: Vec<Vec<u8>>,
+    /// The `LitT` literals, decoded into terms once at load time.
+    pub literals: Arc<LiteralArea>,
     /// The `StrT` string table bytes.
     pub strings: Vec<u8>,
     /// The raw `Attr` chunk bytes, if present.
@@ -229,10 +268,11 @@ impl Default for Module {
             exports: Vec::new(),
             imports: Vec::new(),
             functions: Vec::new(),
+            funs: Vec::new(),
             code_version: CodeVersion::default(),
             types: TypeTable::default(),
             line: LineTable::default(),
-            literals: Vec::new(),
+            literals: Arc::new(LiteralArea::default()),
             strings: Vec::new(),
             attributes: None,
             compile_info: None,
@@ -259,5 +299,30 @@ impl Module {
         self.functions
             .iter()
             .find(|f| f.name == function && f.arity == arity)
+    }
+
+    /// The static literal at `index` (an `Operand::Literal(index)` reference).
+    ///
+    /// This is how the interpreter resolves the `z,4` literal operand of e.g.
+    /// `move`/`put_literal`. Returns `None` for an index outside the `LitT` table.
+    pub fn literal(&self, index: u32) -> Option<Eterm> {
+        self.literals.get(index)
+    }
+
+    /// The module's decoded static-literal area.
+    pub fn literals(&self) -> &LiteralArea {
+        &self.literals
+    }
+
+    /// The lambda descriptor at `index` (a `make_fun3`/`call_fun2` fun-table index).
+    ///
+    /// Returns `None` for an index outside the `FunT` table.
+    pub fn fun(&self, index: u32) -> Option<&FunDescriptor> {
+        self.funs.get(index as usize)
+    }
+
+    /// The module's lambda descriptors, in `FunT` (fun-table index) order.
+    pub fn funs(&self) -> &[FunDescriptor] {
+        &self.funs
     }
 }
