@@ -13,15 +13,27 @@ test; re-derive them with `beam_disasm:file/1` plus the oracle, do **not** guess
 
 ## Regeneration
 
-Build from a *neutral* directory so no worktree path is baked into the committed
-binary (the `CInf`/`Dbgi` chunks record the source path):
+Build from a *neutral* directory with `erlc +deterministic` so no worktree path
+is baked into the committed binary (the `CInf`/`Dbgi` chunks record the source
+path; `+deterministic` strips it, so a plain `erlc` would leak an absolute path):
 
 ```sh
 mkdir -p "$TMPDIR/fixgen"
 cp erts_rust/crates/beam_engine/tests/fixtures/<name>.erl "$TMPDIR/fixgen/"
-env -C "$TMPDIR/fixgen" erlc <name>.erl
+env -C "$TMPDIR/fixgen" erlc +deterministic <name>.erl
 cp "$TMPDIR/fixgen/<name>.beam" erts_rust/crates/beam_engine/tests/fixtures/<name>.beam
 ```
+
+Verify no path leaked before committing (must print nothing):
+
+```sh
+strings erts_rust/crates/beam_engine/tests/fixtures/*.beam | grep -a -e /home -e /tmp -e genesis -e worker_
+```
+
+`+deterministic` changes only the `CInf`/`Dbgi` chunks relative to a plain
+`erlc`; every other chunk (`Code`, `Line`, `Type`, `AtU8`, `ExpT`, `ImpT`,
+`StrT`, `LocT`, `Attr`, `Meta`) stays byte-identical, so the expected values
+below remain valid.
 
 ## `tuples.beam` (`tuples.erl`) — `tests/tuples_lists.rs`
 
