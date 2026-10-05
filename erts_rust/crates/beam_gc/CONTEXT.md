@@ -162,7 +162,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   round-trip), `copy` (forward of immediates/cons/boxed/nested tuples/lists; forwarding markers;
   out-of-from-space left verbatim), `policy` (table shape: 12, 38, … 233; `next_heap_size` offset 0/1;
   growth/shrink decisions), `mso` (refcount `inc`/`dec`/`dec_and_test`; `MsoHandle` clone/drop runs the
-  destructor exactly once; `OffHeap::sweep` releases dead handles).
+  destructor exactly once; `OffHeapEntry` accessor dispatch; `OffHeap::sweep` releases dead handles, frees
+  a swept `RefcBinary`'s payload exactly once, and sweeps a mixed Mso+Binary list selectively).
 - **`tests/copy_correctness.rs` — the required copy-correctness evidence.** Build a real term graph in
   a `HeapSpace` (nested tuples + cons lists + boxed leaves, plus deliberate garbage), place tagged
   pointers to live objects into a root slice, run `collect`/`Copier`, then assert: (1) **structural
