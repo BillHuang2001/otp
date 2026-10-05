@@ -131,11 +131,12 @@ pub trait ExecutionContext {
 
 ### Operand subset — **supported**
 `X(n)`, `Y(n)`, `Integer(i)` (`make_small`), `Atom(a)` (`make_atom`), `Nil` (`NIL`),
-`Character(c)` (`make_small(c)`), `Typed{reg, ty}` (read `reg`, ignore the type annotation).
+`Character(c)` (`make_small(c)`), `Typed{reg, ty}` (read `reg`, ignore the type annotation),
+`FloatReg(n)` (read/write the [`Machine`] FR file; out-of-range → `bad_register`).
 
 ### Operand subset — **NOT supported (documented error, never a wrong result/panic)**
-`FloatReg` (no float-register file in M1), `Literal` (loader does not decode literals — a
-`beam_loader` gap), `List`/`Allocation` (only inside `Generic`).
+`Literal` (loader does not decode literals — a `beam_loader` gap), `Label`, `List`/`Allocation`
+(only inside `Generic`).
 
 ### Instruction subset — **NOT executed (documented error `unsupported_opcode`)**
 `Instr::Generic` (every opcode outside the named set: `put_tuple2`, `get_tuple_element`, `get_list`,
