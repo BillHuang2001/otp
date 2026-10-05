@@ -92,6 +92,37 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_io` | `mio` poller/reactor + `Port` + one built-in driver |
 | `beam_rt` | boot/CLI/`system_info` + end-to-end vertical-slice integration test |
 
+## Term/heap foundation: maps · bitstrings · refc binaries (current state)
+The shared blockers that capped maps, bitstrings and large-binary memory efficiency are implemented.
+Frozen inter-crate contract — all term-layout writers are **heap-agnostic** (`beam_term` cannot allocate;
+the caller reserves the words and passes `hp: *mut Eterm`):
+- **Maps** (`beam_term::map`) — flat map ↔ HAMT/CHAMP at the ERTS threshold `MAP_SMALL_MAP_LIMIT = 32`
+  (`erl_map.c`). `write_map` (dedup last-wins, canonical order, flat map ≤32 else hash map),
+  `map_words_capacity(n)` for sizing, `map_size`/`map_get`/`map_pairs`(key-ordered)/`map_put`/`map_remove`.
+  Node interiors are the **ERTS layout** — head-array `[hdr][size][16 slots]`, head-bitmap `2+n`, inner
+  node-bitmap `1+n`, one term per slot, flat-map/collision leaves — chosen so `beam_gc::copy::move_size`
+  and its Cheney scan already size and walk it (proven by `beam_gc/tests/map_copy.rs`). `compare`/`hashing`/
+  `size` are structural over maps.
+- **Bitstrings** (`beam_term::bitstring`) — `heap_bits_size_words`, `bit_count_to_bytes`, `write_heap_bits`,
+  `write_binary`, `write_sub_bits`/`sub_bits_parts`, public `bitstring_parts`/`bit_at`/`float_bits`/
+  `float_value`; non-byte-aligned supported. (Replaces `beam_codec`'s private `binary.rs` shims.)
+- **Refc binaries** — bit-exact on-heap layout in `beam_term::refc`: `BinRef` (3 words) + `ErlSubBits`
+  (5 words), the 8-word `[BinRef][ErlSubBits]` pair with the root at the SubBits; `ERL_ONHEAP_BINARY_LIMIT
+  = 64` bytes / `ERL_ONHEAP_BITS_LIMIT = 512` bits. Off-heap payload = `beam_alloc::RefcBinary` (refcounted,
+  `AllocType::Binary`); **`BinRef.val` == `RefcBinary::data_ptr()` — the pointer to the first payload byte**
+  (the internal header is `beam_alloc`'s concern). Reclamation: hold a `RefcBinary` handle in
+  `beam_gc::OffHeap` and release it when the on-heap reference dies. Small binaries stay on-heap
+  (`ErlHeapBits`).
+
+## Handoffs (owned by other nodes — NOT yet adopted)
+- `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
+  `beam_term::{map,bitstring}`; it currently decodes >32-key maps as oversized flat maps — switch to
+  `map::write_map` (builder) + `map::map_pairs` (encode).
+- `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
+- `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
+  liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
+  off-heap payloads).
+
 ## Constraints
 - **Keep the workspace green**: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`
   must pass after every wave. Per-crate gate:
