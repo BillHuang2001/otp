@@ -193,7 +193,6 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 | Key | Value |
 |---|---|
 | `version` | `Str(beam_common::version::ERTS_VERSION)` → `"17.1"` |
-| `erts_version` | alias of `version` (**non-standard** — real ERTS raises `badarg`; see Known Issues) |
 | `otp_release` | `Str` major of `OTP_VERSION` → `"30"` |
 | `system_architecture` | `Str` target triple, best-effort from `std::env::consts` (`"x86_64-pc-linux-gnu"`) |
 | `system_version` | `Str"Erlang/OTP {major} [erts-{erts}] [source] [{bits}-bit]"` |
