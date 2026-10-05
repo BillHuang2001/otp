@@ -838,7 +838,11 @@ impl Table {
         }
     }
 
-    /// The number of objects in the table (`ets:size/1`).
+    /// The number of objects in the table.
+    ///
+    /// The `ets` accessor is `ets:info(T, size)`; `ets:size/1` does not exist in
+    /// this OTP (OTP 29 / erts-17.1), so the differential battery reads it through
+    /// `ets:info/2`.
     pub fn size(&self) -> usize {
         self.interior.size()
     }

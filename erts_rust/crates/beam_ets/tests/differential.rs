@@ -460,14 +460,10 @@ fn expected_map() -> BTreeMap<String, String> {
 /// telling you to delete the entry — the moment `beam_ets` is fixed. Keeping them
 /// in the battery (rather than dropping them) keeps the oracle's real behaviour in
 /// `EXPECTED` and the gap actionable.
-const KNOWN_DIVERGENCES: &[(&str, &str)] = &[(
-    "match_family",
-    "`Table::match_delete` builds its spec with the `'$_'` body and then calls \
-     `select_delete`, which only deletes objects whose body evaluates to `true`; real \
-     `ets:match_delete/2` is `select_delete(T, [{P, [], [true]}])`. Observed: `erl` deletes \
-     the matching object (size 3 -> 2, remaining `[2,3]`) while `beam_ets` deletes nothing \
-     (size stays 3, remaining `[1,2,3]`).",
-)];
+///
+/// **Currently empty**: every case in the battery agrees with the live oracle, so
+/// the suite runs with no exclusions.
+const KNOWN_DIVERGENCES: &[(&str, &str)] = &[];
 
 /// `true` when `name` is a recorded divergence.
 fn is_known_divergence(name: &str) -> bool {

@@ -92,9 +92,11 @@ fn whole_object_body_selects_every_object_in_every_kind() {
 }
 
 #[test]
-fn nested_list_head_binds_and_body_returns_in_body_order() {
+fn nested_list_head_binds_and_the_body_value_is_the_last_expression() {
     // erl: `ets:select(T,[{ {['$1','$2'],'_'}, [], ['$2','$1'] }])` on
-    //     `{[1,2],5}` and `{[3,4],6}` -> `[2,1,4,3]`.
+    //     `{[1,2],5}` and `{[3,4],6}` -> `[1,3]`: a body is a *sequence* whose
+    //     value is the value of the LAST expression (`'$1'`), so a two-element body
+    //     yields one result per matched object, not two.
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let mut table = new_table(TableKind::OrderedSet);
@@ -121,10 +123,7 @@ fn nested_list_head_binds_and_body_returns_in_body_order() {
     .unwrap();
 
     let got = table.select(&spec, &atoms, &mut heap).unwrap();
-    assert_eq!(
-        got,
-        vec![make_small(2), make_small(1), make_small(4), make_small(3)]
-    );
+    assert_eq!(got, vec![make_small(1), make_small(3)]);
 }
 
 #[test]
@@ -405,6 +404,8 @@ fn construct_body_result_values() {
 #[test]
 fn constant_and_variable_bodies_alias_instead_of_copying() {
     // erl: `['$_']` returns the object; `['$1']` the key; `[ok]` the atom `ok`.
+    // Each is a *single-element* body (a body's value is its last expression), so
+    // the three cases are separate specs on the one matched object.
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
     let mut table = new_table(TableKind::Set);
@@ -413,16 +414,22 @@ fn constant_and_variable_bodies_alias_instead_of_copying() {
         .unwrap();
 
     let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")]);
-    let spec = compile(
-        spec1(&mut heap, head, &[], &[at(&atoms, "$_"), at(&atoms, "$1"), at(&atoms, "ok")]),
-        &atoms,
-    )
-    .unwrap();
-    let got = table.select(&spec, &atoms, &mut heap).unwrap();
-    assert_eq!(got.len(), 3);
+
+    let whole = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$_")]), &atoms).unwrap();
+    let got = table.select(&whole, &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1);
     assert!(eq(got[0], object(&mut heap, 1, at(&atoms, "a"), 10), &atoms));
-    assert_eq!(got[1], make_small(1));
-    assert!(eq(got[2], at(&atoms, "ok"), &atoms));
+
+    let key = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$1")]), &atoms).unwrap();
+    assert_eq!(
+        table.select(&key, &atoms, &mut heap).unwrap(),
+        vec![make_small(1)]
+    );
+
+    let constant = compile(spec1(&mut heap, head, &[], &[at(&atoms, "ok")]), &atoms).unwrap();
+    let got = table.select(&constant, &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1);
+    assert!(eq(got[0], at(&atoms, "ok"), &atoms));
 }
 
 // ---------------------------------------------------------------------------

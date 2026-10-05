@@ -19,9 +19,13 @@
 //!   `'$x'`, `'$1x'` or `'$01'` is an ordinary **literal atom** (not an error),
 //!   matching `db_is_variable` returning `-1`.
 //! * **Guards**: a flat list of expressions, **all** of which must evaluate to
-//!   the atom `true`. A nested list element builds a list value (which is never
-//!   `true`), so a list-of-lists guard never matches — this is exactly what the C
-//!   `compile_guard_expr` emits. Supported guard constructs: `andalso`,
+//!   `true`. Guard truth is an internal boolean produced by the comparisons, type
+//!   tests and connectives, so it never depends on the caller's `AtomTable`
+//!   having interned `true`/`false`; only a literal `true`/`false` guard *term* is
+//!   resolved by name. `andalso`/`orelse` short-circuit, `and`/`or` are strict
+//!   (verified against `erl`). A nested list element builds a list value (which
+//!   is never `true`), so a list-of-lists guard never matches — this is exactly
+//!   what the C `compile_guard_expr` emits. Supported guard constructs: `andalso`,
 //!   `orelse`, `and`, `or`, `not`, `const/1`, the comparison operators
 //!   (`== /= < =< > >= =:= =/=`), the type tests (`is_atom is_integer is_float
 //!   is_number is_tuple is_list is_binary is_bitstring is_map is_pid is_port
@@ -31,24 +35,26 @@
 //!   ignored). Comparison uses `beam_term::compare` (`cmp` for the exact
 //!   operators, `cmp_arith` for `==`/`/=`/`<`/`=<`/`>`/`>=`), never a local
 //!   re-implementation of term order.
-//! * **Bodies**: a non-empty list of expressions. Each element is evaluated and
-//!   the resulting values form the clause's result (so a two-element body yields
-//!   two results per matched object). A body element may be `'$_'` (whole
-//!   object), `'$$'` (every bound head variable, ascending), `'$N'`, any constant
-//!   literal, a list template, or a tuple template written `{{ … }}` (the C's
-//!   tuple-construct form). Fresh tuples/lists are built on the caller's
-//!   [`beam_alloc::Heap`]; a body element that is `'$_'`/a variable/a constant
-//!   yields a term that **aliases** the table or the caller's spec storage (it is
-//!   not copied).
+//! * **Bodies**: a non-empty list of expressions evaluated in order; the clause's
+//!   value is the value of the **last** expression, so a clause yields exactly one
+//!   result per matched object (the C `compile_guard_expr` discards every
+//!   intermediate value). A body element may be `'$_'` (whole object), `'$$'`
+//!   (every bound head variable, ascending), `'$N'`, any constant literal, a list
+//!   template, or a tuple template written `{{ … }}` (the C's tuple-construct
+//!   form). Fresh tuples/lists are built on the caller's [`beam_alloc::Heap`]; a
+//!   body element that is `'$_'`/a variable/a constant yields a term that
+//!   **aliases** the table or the caller's spec storage (it is not copied).
 //!
 //! # Verified against the system `erl`
 //!
 //! Every semantic above (head `'$_'`/`'$0'`/`'$x'`, repeated `'$N'`, the flat
 //! all-must-be-`true` guard list, guard runtime errors skipping the clause while
-//! body runtime errors are `badarg`, the `{{ … }}` construct form, multi-element
-//! bodies, and the `match`/`match_object` relationship) was probed against OTP 29
+//! body runtime errors are `badarg`, the `{{ … }}` construct form, the
+//! last-expression body value, `andalso`/`orelse` short-circuiting, and the
+//! `match`/`match_object`/`match_delete` relationship) was probed against OTP 29
 //! (`ets:match(T,P)` ≡ `ets:select(T,[{P,[],['$$']}])`, `ets:match_object(T,P)` ≡
-//! `ets:select(T,[{P,[],['$_']}])`). See `tests/select.rs`.
+//! `ets:select(T,[{P,[],['$_']}])`, `ets:match_delete(T,P)` ≡
+//! `ets:select_delete(T,[{P,[],[true]}])`). See `tests/select.rs`.
 //!
 //! # Known gaps
 //!
@@ -58,6 +64,9 @@
 //! * `self/0` has no process identity at the ETS layer and raises, so a guard
 //!   using it never matches (the clause is skipped).
 //! * `abs/1` accepts small integers only (bignums/floats raise).
+//! * A **body** whose value is a boolean (e.g. `[{'is_integer','$1'}]`) is rendered
+//!   as the atom `true`/`false`, so the caller's `AtomTable` must have interned
+//!   them; guard *truth* is unaffected, since it is computed internally.
 //!
 //! # Why this module reads term words
 //!

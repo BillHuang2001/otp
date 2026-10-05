@@ -1169,11 +1169,12 @@ impl Battery {
             .match_delete(delete_pattern, &self.atoms, &mut self.out)
             .expect("match_delete");
         let after = table.size();
-        // `ets:match_delete/2` answers `true` (not the number deleted): our
-        // `Table::match_delete` returns the deletion count, so a successful call
-        // is rendered as `true` — the observable ETS result. That the right
-        // objects went away is separately visible in `size`/`remaining` below.
-        let _ = deleted;
+        // `ets:match_delete/2` answers `true` (the atom), while `Table::match_delete`
+        // returns the deletion count. Both observe the *same* deletion, so we render
+        // the ETS-visible result (`true`) and separately check the count against the
+        // size drop; `before`/`after`/`remaining` below pin exactly what was deleted.
+        assert_eq!(deleted, before - after, "match_delete count == size drop");
+        assert_eq!(deleted, 1, "the `{{1,'_','_'}}` pattern matches exactly one object");
         let remaining: Vec<Eterm> = table
             .tab2list()
             .into_iter()
