@@ -70,7 +70,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `pub struct OffHeapTable` — a **slot-indexed** table of `MsoHandle`s (slot = the on-heap
   off-heap-reference's `val` word). `new()`/`Default`, `push(MsoHandle) -> usize` (returns the slot),
   `get(slot) -> Option<&MsoHandle>`, `clone_slot(slot) -> Option<MsoHandle>` (**bumps the refcount**),
-  `len()`, `is_empty()`, `iter()`, `overhead_bytes()`, `into_handles() -> Vec<MsoHandle>`.
+  `len()`, `is_empty()`, `iter()`, `overhead_bytes()`, `into_handles() -> Vec<MsoHandle>`,
+  `drain_handles() -> Vec<MsoHandle>` (returns and empties the handles — `send`'s per-message list).
 
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only.** Heap exhaustion mid-copy ⇒
