@@ -399,9 +399,9 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   cons cell (LIST-tagged word). `List` terms are single words (must stay so for the NIF/ETF/msg ABI).
 - `make_arityval` encodes `size << 6` with subtag `0x00`, so an arity of 0 encodes to the raw word
   `0`; table cells/`[Eterm; N]` register files must therefore not treat `0` as "empty" without care.
-- Interior layouts that are NOT externally pinned (list chunking, map flatmap/HAMT thresholds, ETS
-  tree shape) are open and documented at their own nodes — this crate only owns what the frozen
-  layout requires.
+- Interior layouts that are NOT externally pinned (list chunking, ETS tree shape) are open and
+  documented at their own nodes. The map (flat-map + HAMT node) layout *is* owned here (`src/map.rs`)
+  because `beam_gc` sizes it — keep it byte-compatible with the copier.
 
 ## See Also
 - `../../CONTEXT.md` — workspace contracts (§2 frozen term layout, §3 error strategy).
