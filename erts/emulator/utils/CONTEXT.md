@@ -52,7 +52,7 @@ Key command-line details:
 ## Known Issues / Gotchas
 - A "missing" C file in a clean checkout is usually generated: read the table above before hunting for it.
 - `beam_makeops` runs once per flavor with a different `-jit` value *and* a different `.tab` input set; jit and emu outputs for the same target live in sibling directories (`$(TARGET)/$(TYPE)/jit` vs `.../emu`) and must not be mixed.
-- `$INTENTIONALLY_UNUSED`-style diagnostics: unused macros/predicates/generators are reported as warnings; errors are printed with `file(line)` context and abort the build.
+- `beam_makeops` diagnostics: syntax/semantic errors are printed with `file(line)` context and abort the build; unused macros, predicates and generators are warned about unless declared with `%unused` in the `.tab` file.
 - `make_compiler_flags` and `gen_git_version` are evaluated at make-parse time on **every** invocation (they are `$(shell …)` in the top of `Makefile.in`), so a broken Perl or a slow filesystem slows every `make` in `erts/emulator`.
 - `erl_git_version.h` is deliberately used as a trigger for rebuilds: `$(ASMJIT_PCH_OBJ)` (the asmjit precompiled header) depends on `beam/erl_bif_info.c`, which includes both `erl_git_version.h` and `erl_compile_flags.h`.
 - `erl_alloc_types.h` embeds the copyright year; without `SOURCE_DATE_EPOCH` it changes once a year and forces a rebuild.
