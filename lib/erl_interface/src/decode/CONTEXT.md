@@ -56,7 +56,7 @@ Nothing else in this directory handles the magic; every other decoder expects `*
 Include `"eidef.h"` first — it pulls in the generated `config.h` (and `ei.h`); use the fixed-width `uint8/uint16/uint32` typedefs from `eidef.h` rather than `int`/`long` when width matters.
 Use `putget.h` (`../misc/`) getters; the external format is big-endian, so decoders use `get8`/`get16be`/`get32be`/`get64be` (the `le` variants exist for the encoder).
 No global state and no locking: every function must be reentrant/async-safe (`../src/README.internal`).
-`decode_long.c`/`decode_ulong.c` are compiled only `#ifndef EI_64BIT` and `decode_longlong.c`/`decode_ulonglong.c` only have their `ei_decode_long` alias under `#ifdef EI_64BIT` — `EI_64BIT` is set by `configure` when `sizeof(long)==8`, so those two `.c` files are never dead code but also never both reference `ei_decode_long`.
+`decode_long.c`/`decode_ulong.c` are compiled only `#ifndef EI_64BIT` and the `ei_decode_long`/`ei_decode_ulong` aliases in `decode_longlong.c`/`decode_ulonglong.c` only exist `#ifdef EI_64BIT`; `EI_64BIT` is set by `configure` when `sizeof(long)==8`, so exactly one definition of `ei_decode_long` is compiled in any build.
 Files are registered in `DECODESRC` / `DECODESRC_LONGLONG` in `../Makefile.in` and compiled through `vpath %.c connect:encode:decode:misc:epmd:global:erts`; the include path adds `-Idecode` for `decode_skip.h`.
 Do not add a decoder file without adding it to `DECODESRC`, and keep one tag family per translation unit (see Design Decisions).
 
