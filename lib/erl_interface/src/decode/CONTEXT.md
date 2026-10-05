@@ -67,7 +67,7 @@ Decoders accept `NULL` output pointers instead of having separate "skip" variant
 `ei_decode_trace` runs all sub-decodes on a temporary index and commits only at the end, making it atomic on failure; the other decoders are not transactional.
 
 ## Known Issues / Gotchas
-No decoder here validates that the buffer is long enough: a truncated or corrupt buffer makes them read past the end (`ei_decode_double` `sscanf`s up to 31 bytes for `ERL_FLOAT_EXT`, `ei_decode_binary` `memmove`s the advertised length). The caller is responsible for having a complete term.
+No decoder here validates that the buffer is long enough: a truncated or corrupt buffer makes them read past the end (`ei_decode_double` `sscanf`s up to 31 bytes for `ERL_FLOAT_EXT`; `ei_decode_binary`/`ei_decode_bitstring` `memmove`/advance by the advertised length). The caller is responsible for supplying a complete term.
 `ei_decode_boolean` compares `memcmp(tbuf, "true", 5)`, i.e. a 5-byte prefix, so any atom of length ≤ 5 starting with `true` (e.g. `'trueX'`) decodes as `true`.
 `ei_decode_bignum` decodes `ERL_INTEGER_EXT` with `mpz_set_ui()` on the raw 32-bit value, so negative integers in that tag (`-1` .. `-2^31`) come out as large positive GMP numbers.
 `ei_decode_char` accepts `ERL_SMALL_BIG_EXT`/`ERL_LARGE_BIG_EXT` but does not check `arity >= 1` before reading the leading digit byte, so an arity-0 bignum consumes one byte of the following term; the value is also stored through a `char*`, whose signedness is platform-defined.
