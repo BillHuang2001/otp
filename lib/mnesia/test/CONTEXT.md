@@ -42,8 +42,7 @@ Network blocking: with `-proto_dist gen_tcp_blocking` (`?NETWORK_BLOCKER_DIST_OP
 - `mt:alias(recover)` points at `mnesia_recover_test`, which does not exist here; the working alias is `recovery`.
 - `mnesia_trans_access_test`/`mnesia_dirty_access_test`/`mnesia_evil_backup` are only reached via `mnesia_evil_coverage_test:all/0` (hence via `light`) or the `trans`/`dirty`/`backup` aliases, and `mnesia_schema_recovery_test` only via `mnesia_recovery_test`; `mnesia_frag_hash_test:test/0` is never invoked by any suite.
 - `mnesia_external_backend_test` carries its own `suite/0` (`ts_install_cth`, `nodenames=1`) that is ignored while it runs as a sub-suite of `mnesia_SUITE` (2 node names).
-- Cases are skipped by design in several places: `mnesia.spec` skips most of `mnesia_measure_test` ("Takes to long time") and many "Not yet implemented" cases, and `mnesia_external_backend_test:init_per_testcase/2` skips `backup_and_restore_should_work_with_external_backend`.
-- A "Watchdog in test case timed out" log entry means the 5-minute limit hit, not necessarily a Mnesia defect.
+- Cases are skipped by design in several places: `mnesia.spec` skips most of `mnesia_measure_test` ("Takes to long time") and many "Not yet implemented" cases, and `mnesia_external_backend_test:init_per_testcase/2` skips `backup_and_restore_should_work_with_external_backend`. Long-running work is `heavy` → `mnesia_measure_test` and `mnesia_bench_SUITE` (TPC-B ×2).
 
 ## Notes for Agents
 - Read `README` first; it documents the harness, node setup, timeout flag and the `-Ddebug` rebuild recipe.
