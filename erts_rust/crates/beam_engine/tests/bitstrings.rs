@@ -192,3 +192,5 @@ fn first8_on_a_non_binary_raises() {
     let result = run(&module, "first8", 1, &[make_small(1)], &mut ctx);
     assert!(result.is_err(), "expected a typed error, got {result:?}");
 }
+
+
