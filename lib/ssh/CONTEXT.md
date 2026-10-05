@@ -70,7 +70,7 @@ Client and server share nearly all code — the role is a state in `#ssh{}` and 
 
 ## Test Strategy
 - `make tests` / `make test` run the Common Test suites in `test/`; see `test/CONTEXT.md` for suites, spec/cover files, helper libraries and external requirements (openssh, docker, QuickCheck).
-- Cross-application behaviour (TLS-independent): dist/OS interop is covered by `ssh_to_openssh_SUITE` and `ssh_compat_SUITE` (docker-based OpenSSH matrix).
+- Interoperability with OpenSSH is covered by `ssh_to_openssh_SUITE` (local openssh binaries) and `ssh_compat_SUITE` (docker-based OpenSSH version matrix).
 - Property-based models live in `test/property_test/` and are driven by `ssh_property_test_SUITE` (QuickCheck license required).
 
 ## Notes for Agents
