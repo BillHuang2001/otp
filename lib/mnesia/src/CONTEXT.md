@@ -83,5 +83,6 @@ Supervision / application layer:
 
 ## See Also
 - `../CONTEXT.md` — the mnesia application node (layout, `vsn.mk`, tests, docs).
-- `../test/` — Common Test suites (`mnesia_*_SUITE.erl`) that rely on the debug hooks.
-- `../include/` — public `mnesia.hrl`/`mnesia_exports.hrl` headers exported to users.
+- `../test/` — Common Test suites (`mnesia_*_SUITE.erl`) that rely on the debug hooks and `-include("mnesia.hrl")`.
+- `../examples/`, `../doc/` — sample record definitions (`company.hrl`) and reference-manual sources.
+- `../include/` — placeholder only (empty `INCLUDE_FILES`); `mnesia.hrl` here is **internal**, not a user-exported header.
