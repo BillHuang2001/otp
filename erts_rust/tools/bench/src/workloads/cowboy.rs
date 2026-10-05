@@ -1,80 +1,53 @@
 //! `cowboy` — the HTTP I/O-bound workload (the Cowboy `hello_world` example).
 //!
-//! Starts `make run` in `examples/hello_world` (which boots a Cowboy server on port
-//! 8080), waits for the port to accept connections, drives it with the first available
-//! load generator (`wrk` → `h2load` → `bombardier`), records latency/throughput, then
-//! stops the server.
+//! The Cowboy checkout is a **read-only** foreign repository, so the workload never
+//! builds it in place: it stages a copy into a private
+//! [`ScratchDir`](crate::scratch::ScratchDir) under `$TMPDIR`, builds the
+//! `examples/hello_world` relx release *there*, starts it on port 8080, and drives it
+//! with the crate's own dependency-free HTTP/1.1 load generator ([`crate::http_load`]).
+//! No external `wrk`/`h2load`/`bombardier` is needed — the in-process client is the
+//! generator. The workload records throughput (req/s), the p50/p99 latency
+//! distribution, the server process's peak RSS and the build time; the scratch tree
+//! (and the untouched Cowboy source) is left clean afterwards.
 //!
-//! Repo: `$BENCH_COWBOY_REPO`, else `/home/bill/Source/cowboy`. When **no** load
-//! generator is installed the workload is `skipped` (`no-http-load-generator`) rather
-//! than reporting a bogus number.
+//! Repo: `$BENCH_COWBOY_REPO`, else `/home/bill/Source/cowboy`.
 
-use std::net::TcpStream;
-use std::path::PathBuf;
+use std::net::{SocketAddr, TcpStream};
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Arc;
+use std::thread;
 use std::time::{Duration, Instant};
 
+use crate::http_load::{self, LoadConfig};
 use crate::metrics::{Category, Metric, Probe, Runtimes};
 use crate::proc;
-use crate::report::WorkloadResult;
+use crate::report::{Profile, WorkloadResult};
+use crate::scratch::{self, ScratchDir};
 use crate::workload::{RunContext, Workload};
 use crate::workloads::resolve_repo;
 
 /// The documented default checkout path.
 const DEFAULT_REPO: &str = "/home/bill/Source/cowboy";
-/// The example URL driven by the load generator.
-const URL: &str = "http://localhost:8080/";
+/// The port the `hello_world` example listens on.
+const PORT: u16 = 8080;
 /// How long to wait for the server to start accepting connections.
 const READY_TIMEOUT: Duration = Duration::from_secs(60);
-
-/// A discovered HTTP load generator.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Generator {
-    Wrk,
-    H2load,
-    Bombardier,
-}
-
-impl Generator {
-    fn name(&self) -> &'static str {
-        match self {
-            Generator::Wrk => "wrk",
-            Generator::H2load => "h2load",
-            Generator::Bombardier => "bombardier",
-        }
-    }
-
-    /// Builds the timed-load command line for each generator.
-    fn command(&self, program: &PathBuf) -> Command {
-        let mut cmd = Command::new(program);
-        match self {
-            Generator::Wrk => {
-                cmd.args(["-t", "2", "-c", "10", "-d", "5s", URL]);
-            }
-            Generator::H2load => {
-                cmd.args(["-n", "10000", "-c", "10", URL]);
-            }
-            Generator::Bombardier => {
-                cmd.args(["-c", "10", "-n", "10000", URL]);
-            }
-        }
-        cmd
-    }
-}
-
-/// The first available load generator, with its resolved path.
-fn find_generator() -> Option<(Generator, PathBuf)> {
-    for (gen, prog) in [
-        (Generator::Wrk, "wrk"),
-        (Generator::H2load, "h2load"),
-        (Generator::Bombardier, "bombardier"),
-    ] {
-        if let Some(path) = proc::which(prog) {
-            return Some((gen, path));
-        }
-    }
-    None
-}
+/// Concurrency (connections) and duration of the `--quick` load run.
+const QUICK_CONNECTIONS: usize = 8;
+const QUICK_DURATION: Duration = Duration::from_secs(2);
+/// Concurrency (connections) and duration of the `--full` load run.
+const FULL_CONNECTIONS: usize = 16;
+const FULL_DURATION: Duration = Duration::from_secs(5);
+/// Upper bound on stored latency samples (keeps the report bounded).
+const MAX_LATENCY_SAMPLES: usize = 20_000;
+/// How much of the `make` output to embed in a failure/skip note.
+const OUTPUT_TAIL_CHARS: usize = 400;
+/// How often the peak-RSS poller samples the server process.
+const PEAK_POLL_INTERVAL: Duration = Duration::from_millis(5);
+/// The documented relx release start script, relative to `examples/hello_world`.
+const RELEASE_SCRIPT: &str = "_rel/hello_world_example/bin/hello_world_example";
 
 /// The Cowboy HTTP workload.
 pub struct Cowboy;
@@ -89,7 +62,7 @@ impl Workload for Cowboy {
     }
 
     fn description(&self) -> &'static str {
-        "Cowboy hello_world HTTP server driven by an external load generator"
+        "Cowboy hello_world HTTP server driven by the in-process HTTP/1.1 load generator"
     }
 
     fn category(&self) -> Category {
@@ -110,9 +83,6 @@ impl Workload for Cowboy {
         }
         if proc::which("make").is_none() {
             return Probe::skipped("make-absent");
-        }
-        if find_generator().is_none() {
-            return Probe::skipped("no-http-load-generator");
         }
         Probe::Ready
     }
@@ -138,16 +108,31 @@ impl Workload for Cowboy {
                 "make-absent",
             );
         };
-        let Some((generator, generator_path)) = find_generator() else {
-            return WorkloadResult::skipped(
+
+        // Stage the read-only checkout into a scratch dir; the build runs only there.
+        let scratch = match ScratchDir::new("cowboy") {
+            Ok(s) => s,
+            Err(e) => {
+                return WorkloadResult::failed(
+                    self.id(),
+                    kind,
+                    self.category(),
+                    self.description(),
+                    format!("scratch-failed: {e}"),
+                )
+            }
+        };
+        let staged = scratch.path().join("cowboy");
+        if let Err(e) = scratch::copy_tree(&r, &staged, &[".git", "_rel"]) {
+            return WorkloadResult::failed(
                 self.id(),
                 kind,
                 self.category(),
                 self.description(),
-                "no-http-load-generator",
+                format!("copy-failed: {e}"),
             );
-        };
-        let example = r.join("examples/hello_world");
+        }
+        let example = staged.join("examples/hello_world");
         if !example.is_dir() {
             return WorkloadResult::failed(
                 self.id(),
@@ -158,9 +143,60 @@ impl Workload for Cowboy {
             );
         }
 
-        let mut server_cmd = Command::new(&make);
-        server_cmd.current_dir(&example).arg("run");
-        let mut server: Child = match proc::spawn(&mut server_cmd) {
+        // Build the relx release (this also git-fetches the Cowboy/cowlib/ranch deps).
+        let mut build_cmd = Command::new(&make);
+        build_cmd.current_dir(&example);
+        let build = match proc::run(&mut build_cmd) {
+            Ok(o) => o,
+            Err(e) => {
+                return WorkloadResult::failed(
+                    self.id(),
+                    kind,
+                    self.category(),
+                    self.description(),
+                    format!("make-spawn-failed: {e}"),
+                )
+            }
+        };
+        if !build.success {
+            let output = format!("{}\n{}", build.stdout, build.stderr);
+            let tail = tail(&output, OUTPUT_TAIL_CHARS);
+            if looks_like_deps_failure(&output) {
+                let mut result = WorkloadResult::skipped(
+                    self.id(),
+                    kind,
+                    self.category(),
+                    self.description(),
+                    "deps-unavailable",
+                );
+                result
+                    .metrics
+                    .push(Metric::scalar("build_ms", "ms", build.wall_ms));
+                result.notes.push(format!("make output tail: {tail}"));
+                return result;
+            }
+            return WorkloadResult::failed(
+                self.id(),
+                kind,
+                self.category(),
+                self.description(),
+                format!("build-failed: {tail}"),
+            );
+        }
+
+        // Locate and start the release.
+        let Some(script) = find_release_script(&example) else {
+            return WorkloadResult::failed(
+                self.id(),
+                kind,
+                self.category(),
+                self.description(),
+                "release-missing-after-build",
+            );
+        };
+        let mut server_cmd = Command::new(&script);
+        server_cmd.current_dir(&example).arg("foreground");
+        let mut server = match proc::spawn(&mut server_cmd) {
             Ok(c) => c,
             Err(e) => {
                 return WorkloadResult::failed(
@@ -172,26 +208,72 @@ impl Workload for Cowboy {
                 )
             }
         };
+        let server_pid = server.id();
+        // The server can log to stdout/stderr; drain those pipes so a full buffer can
+        // never block the VM mid-run.
+        drain_child(&mut server);
 
-        if !wait_for_port(8080, READY_TIMEOUT) {
-            let _ = server.kill();
-            let _ = server.wait();
-            return WorkloadResult::failed(
-                self.id(),
-                kind,
-                self.category(),
-                self.description(),
-                "server-not-ready",
-            );
+        match wait_for_server(&mut server, PORT, READY_TIMEOUT) {
+            ServerWait::Ready => {}
+            ServerWait::Exited => {
+                stop_child(&mut server);
+                return WorkloadResult::failed(
+                    self.id(),
+                    kind,
+                    self.category(),
+                    self.description(),
+                    "server-exited-early",
+                );
+            }
+            ServerWait::Timeout => {
+                stop_child(&mut server);
+                return WorkloadResult::failed(
+                    self.id(),
+                    kind,
+                    self.category(),
+                    self.description(),
+                    "server-not-ready",
+                );
+            }
         }
 
-        let mut load_cmd = generator.command(&generator_path);
-        let load = proc::run(&mut load_cmd);
+        // Poll the server's peak RSS while it serves.
+        let stop = Arc::new(AtomicBool::new(false));
+        let peak = Arc::new(AtomicU64::new(0));
+        let poller = {
+            let stop = Arc::clone(&stop);
+            let peak = Arc::clone(&peak);
+            thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    if let Some(bytes) = proc::read_vmhwm(server_pid) {
+                        peak.fetch_max(bytes, Ordering::Relaxed);
+                    }
+                    thread::sleep(PEAK_POLL_INTERVAL);
+                }
+            })
+        };
 
-        let _ = server.kill();
-        let _ = server.wait();
+        // Drive the server with the in-process load generator.
+        let (connections, duration) = match ctx.profile {
+            Profile::Quick => (QUICK_CONNECTIONS, QUICK_DURATION),
+            Profile::Full => (FULL_CONNECTIONS, FULL_DURATION),
+        };
+        let mut cfg = LoadConfig::new(SocketAddr::from(([127, 0, 0, 1], PORT)), "/");
+        cfg.connections = connections;
+        cfg.duration = duration;
+        cfg.max_latency_samples = MAX_LATENCY_SAMPLES;
+        let load = http_load::drive(&cfg);
 
-        let out = match load {
+        // Stop the server and finish the peak poller.
+        stop_child(&mut server);
+        stop.store(true, Ordering::Relaxed);
+        let _ = poller.join();
+        let peak_bytes = match peak.load(Ordering::Relaxed) {
+            0 => None,
+            bytes => Some(bytes),
+        };
+
+        let outcome = match load {
             Ok(o) => o,
             Err(e) => {
                 return WorkloadResult::failed(
@@ -199,69 +281,156 @@ impl Workload for Cowboy {
                     kind,
                     self.category(),
                     self.description(),
-                    format!("generator-spawn-failed: {e}"),
+                    format!("load-failed: {e}"),
                 )
             }
         };
 
+        if outcome.requests == 0 {
+            let mut result = WorkloadResult::failed(
+                self.id(),
+                kind,
+                self.category(),
+                self.description(),
+                "load-no-responses",
+            );
+            result
+                .metrics
+                .push(Metric::scalar("build_ms", "ms", build.wall_ms));
+            result
+                .metrics
+                .push(Metric::scalar("errors", "count", outcome.errors as f64));
+            result.notes.push(format!(
+                "0 responses in {:.0} ms of load ({} transport errors)",
+                outcome.wall_ms, outcome.errors
+            ));
+            result.peak_memory_bytes = peak_bytes;
+            return result;
+        }
+
+        let seconds = (outcome.wall_ms / 1000.0).max(f64::MIN_POSITIVE);
+        let requests_per_sec = outcome.requests as f64 / seconds;
+
         let mut result = WorkloadResult::new(self.id(), kind, self.category(), self.description());
         result
             .metrics
-            .push(Metric::scalar("wall_ms", "ms", out.wall_ms));
+            .push(Metric::scalar("build_ms", "ms", build.wall_ms));
         result
             .metrics
-            .push(Metric::scalar("generator_exit", "code", out.exit_code.unwrap_or(-1) as f64));
-        if let Some(rps) = parse_requests_per_sec(generator, &out.stdout) {
-            result
-                .metrics
-                .push(Metric::scalar("requests_per_sec", "req/s", rps));
-        } else {
+            .push(Metric::scalar("requests", "count", outcome.requests as f64));
+        result
+            .metrics
+            .push(Metric::scalar("errors", "count", outcome.errors as f64));
+        result.metrics.push(Metric::scalar(
+            "requests_per_sec",
+            "req/s",
+            requests_per_sec,
+        ));
+        result
+            .metrics
+            .push(Metric::samples("latency_ms", "ms", &outcome.latencies_ms));
+        result.peak_memory_bytes = peak_bytes;
+        if outcome.latencies_ms.is_empty() {
             result
                 .notes
-                .push(format!("could not parse throughput from {} output", generator.name()));
+                .push("no latency samples recorded".to_string());
         }
         result
     }
 }
 
-/// Polls `127.0.0.1:<port>` until it accepts a connection or the timeout elapses.
-fn wait_for_port(port: u16, timeout: Duration) -> bool {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
-            return true;
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    false
+/// How the server behaved while we waited for its port to open.
+enum ServerWait {
+    /// The port accepts connections.
+    Ready,
+    /// The server process exited before the port opened.
+    Exited,
+    /// Neither happened within the timeout.
+    Timeout,
 }
 
-/// Best-effort throughput extraction from the generator's output.
-fn parse_requests_per_sec(generator: Generator, stdout: &str) -> Option<f64> {
-    match generator {
-        Generator::Wrk => {
-            // wrk prints e.g. "Requests/sec:   123456.78".
-            let line = stdout
-                .lines()
-                .find(|l| l.trim_start().starts_with("Requests/sec:"))?;
-            line.split_whitespace().last()?.parse().ok()
+/// Polls the server until its port accepts a connection, it exits, or `timeout` elapses.
+fn wait_for_server(server: &mut Child, port: u16, timeout: Duration) -> ServerWait {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(Some(_status)) = server.try_wait() {
+            return ServerWait::Exited;
         }
-        Generator::H2load => {
-            // h2load prints "finished in 5.00s, 2000.00 req/s, 1.00MB/s".
-            let idx = stdout.find(" req/s")?;
-            let head = &stdout[..idx];
-            let start = head.rfind(|c: char| c == ',' || c.is_whitespace()).map(|i| i + 1).unwrap_or(0);
-            head[start..].parse().ok()
+        if TcpStream::connect(("127.0.0.1", port)).is_ok() {
+            return ServerWait::Ready;
         }
-        Generator::Bombardier => {
-            // bombardier prints e.g. "  Reqs/sec     12345.67    100.0    20000.0"
-            // (Avg, Stdev, Max); the average is the first number after the label.
-            let line = stdout
-                .lines()
-                .find(|l| l.trim_start().starts_with("Reqs/sec"))?;
-            line.split_whitespace().nth(1)?.parse().ok()
+        thread::sleep(Duration::from_millis(100));
+    }
+    ServerWait::Timeout
+}
+
+/// Kills and reaps the server child (best-effort; a failure here is not a benchmark
+/// error — the process is gone either way once we move on).
+fn stop_child(child: &mut Child) {
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
+/// Drains the child's stdout/stderr on background threads so a full pipe buffer can
+/// never block the server. The threads end when the child (and its pipes) close.
+fn drain_child(child: &mut Child) {
+    if let Some(mut out) = child.stdout.take() {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut out, &mut std::io::sink());
+        });
+    }
+    if let Some(mut err) = child.stderr.take() {
+        thread::spawn(move || {
+            let _ = std::io::copy(&mut err, &mut std::io::sink());
+        });
+    }
+}
+
+/// Finds the relx release start script: the documented path first, else the first
+/// `<name>/bin/<name>` under `_rel` (relx releases are named after `relx.config`).
+fn find_release_script(example: &Path) -> Option<PathBuf> {
+    let documented = example.join(RELEASE_SCRIPT);
+    if documented.is_file() {
+        return Some(documented);
+    }
+    for entry in std::fs::read_dir(example.join("_rel")).ok()?.flatten() {
+        let candidate = entry.path().join("bin").join(entry.file_name());
+        if candidate.is_file() {
+            return Some(candidate);
         }
     }
+    None
+}
+
+/// The last `max_chars` characters of `text` (trimmed), for a bounded failure note.
+fn tail(text: &str, max_chars: usize) -> String {
+    let trimmed = text.trim();
+    let count = trimmed.chars().count();
+    if count <= max_chars {
+        return trimmed.to_string();
+    }
+    trimmed.chars().skip(count - max_chars).collect()
+}
+
+/// Whether `make`'s output looks like a dependency/network fetch failure (as opposed
+/// to a genuine compile error), so the workload can be `skipped` rather than `failed`.
+fn looks_like_deps_failure(output: &str) -> bool {
+    let lowered = output.to_ascii_lowercase();
+    const SIGNS: &[&str] = &[
+        "could not resolve host",
+        "could not resolve hostname",
+        "temporary failure in name resolution",
+        "network is unreachable",
+        "no route to host",
+        "connection refused",
+        "connection timed out",
+        "unable to access",
+        "failed to fetch",
+        "could not fetch",
+        "could not read from remote repository",
+        "rpc failed",
+    ];
+    SIGNS.iter().any(|sign| lowered.contains(sign))
 }
 
 #[cfg(test)]
@@ -273,48 +442,63 @@ mod tests {
         let w = Cowboy;
         assert_eq!(w.id(), "cowboy");
         assert_eq!(w.category(), Category::Io);
+        assert_eq!(w.contracts(), &["A.1", "A.6"]);
         assert!(matches!(w.runtimes(), Runtimes::SysOnly));
     }
 
     #[test]
-    fn probe_reports_missing_generator() {
+    fn probe_is_honest_about_a_missing_repo() {
         let p = Cowboy.probe();
-        if repo().is_dir() && proc::which("make").is_some() && find_generator().is_none() {
-            assert_eq!(p.reason(), Some("no-http-load-generator"));
+        if p.reason() == Some("repo-missing") {
+            assert!(!repo().is_dir());
         }
     }
 
     #[test]
-    fn parses_wrk_throughput() {
-        let sample = "Running 5s test @ http://localhost:8080/\n  2 threads and 10 connections\nRequests/sec:  98765.43\nTransfer/sec: 12.34MB\n";
-        assert_eq!(
-            parse_requests_per_sec(Generator::Wrk, sample),
-            Some(98765.43)
-        );
-        assert_eq!(parse_requests_per_sec(Generator::Wrk, "no data"), None);
+    fn probe_no_longer_requires_a_load_generator() {
+        // With the repo and `make` present the probe must be ready: there is no
+        // external load-generator prerequisite any more.
+        if repo().is_dir() && proc::which("make").is_some() {
+            assert!(Cowboy.probe().is_ready());
+        }
     }
 
     #[test]
-    fn parses_bombardier_throughput() {
-        let sample = "Statistics        Avg      Stdev        Max\n  Reqs/sec     12345.67    100.0    20000.0\n";
-        assert_eq!(
-            parse_requests_per_sec(Generator::Bombardier, sample),
-            Some(12345.67)
-        );
+    fn tail_truncates_and_keeps_the_end() {
+        assert_eq!(tail("  hello  ", 10), "hello");
+        assert_eq!(tail("abcdef", 3), "def");
+        assert_eq!(tail("abc", 3), "abc");
+        // Multi-byte safety: never split a char.
+        assert_eq!(tail("aé€x", 2), "€x");
     }
 
     #[test]
-    fn parses_h2load_throughput() {
-        let sample = "finished in 5.00s, 2000.00 req/s, 1.00MB/s\n";
-        assert_eq!(
-            parse_requests_per_sec(Generator::H2load, sample),
-            Some(2000.00)
-        );
+    fn deps_failure_detection_matches_network_signs_not_compile_errors() {
+        assert!(looks_like_deps_failure(
+            "fatal: unable to access 'https://github.com/x/y': Could not resolve host: github.com"
+        ));
+        assert!(looks_like_deps_failure("curl: (7) Failed to fetch repo"));
+        assert!(!looks_like_deps_failure(
+            "src/hello_world_handler.erl:12: syntax error before: '->'"
+        ));
     }
 
     #[test]
-    fn wait_for_port_times_out_on_a_closed_port() {
-        // Port 1 is essentially never open; a 200ms timeout keeps the test fast.
-        assert!(!wait_for_port(1, Duration::from_millis(200)));
+    fn find_release_script_returns_none_without_a_release() {
+        let dir = std::env::temp_dir().join(format!("bench-cowboy-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        assert_eq!(find_release_script(&dir), None);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn find_release_script_prefers_the_documented_path() {
+        let dir = std::env::temp_dir().join(format!("bench-cowboy-rel-{}", std::process::id()));
+        let bin = dir.join("_rel/hello_world_example/bin");
+        std::fs::create_dir_all(&bin).expect("create bin dir");
+        let script = bin.join("hello_world_example");
+        std::fs::write(&script, "#!/bin/sh\n").expect("write script");
+        assert_eq!(find_release_script(&dir), Some(script));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
