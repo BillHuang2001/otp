@@ -50,7 +50,8 @@ pub trait ExecutionContext {
     /// Default: forwards to `call_bif`.
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>
         { self.call_bif(module, function, arity, args) }
-}```
+}
+```
 - `MinimalContext` — a concrete context for tests/embeddings: an unbounded heap (`ensure_heap` is a
   no-op) plus a **pluggable BIF hook**
   (`with_bif_hook(f)`, `f: FnMut(&str,&str,u32,&[Eterm]) -> Result<Eterm>`). `MinimalContext::new()`
