@@ -425,3 +425,156 @@ fn put_utf32(value: i64) -> Option<Vec<u8>> {
     }
     Some(v.to_be_bytes().to_vec())
 }
+
+// ---------------------------------------------------------------------------
+// Unit tests for the segment encoders
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // --- `put_float` -------------------------------------------------------
+
+    #[test]
+    fn put_float_is_big_endian_for_every_width() {
+        assert_eq!(put_float(0.0, 16, false), vec![0x00, 0x00]);
+        assert_eq!(put_float(-0.0, 16, false), vec![0x80, 0x00]);
+        assert_eq!(put_float(1.0, 16, false), vec![0x3C, 0x00]);
+        assert_eq!(put_float(1.5, 16, false), vec![0x3E, 0x00]);
+        assert_eq!(put_float(-1.5, 16, false), vec![0xBE, 0x00]);
+        assert_eq!(put_float(1.0, 32, false), vec![0x3F, 0x80, 0x00, 0x00]);
+        assert_eq!(put_float(1.5, 32, false), vec![0x3F, 0xC0, 0x00, 0x00]);
+        assert_eq!(
+            put_float(1.5, 64, false),
+            vec![0x3F, 0xF8, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+        assert_eq!(
+            put_float(-1.0, 64, false),
+            vec![0xBF, 0xF0, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00]
+        );
+    }
+
+    #[test]
+    fn put_float_little_endian_reverses_the_bytes() {
+        assert_eq!(put_float(-0.0, 16, true), vec![0x00, 0x80]);
+        assert_eq!(put_float(1.5, 16, true), vec![0x00, 0x3E]);
+        assert_eq!(put_float(1.5, 32, true), vec![0x00, 0x00, 0xC0, 0x3F]);
+        assert_eq!(
+            put_float(1.5, 64, true),
+            vec![0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xF8, 0x3F]
+        );
+    }
+
+    // --- `f64_to_f16` (`erl_bits.c:431`) -----------------------------------
+
+    #[test]
+    fn f64_to_f16_exact_values() {
+        assert_eq!(f64_to_f16(0.0), 0x0000);
+        assert_eq!(f64_to_f16(-0.0), 0x8000);
+        assert_eq!(f64_to_f16(1.0), 0x3C00);
+        assert_eq!(f64_to_f16(-1.0), 0xBC00);
+        assert_eq!(f64_to_f16(1.5), 0x3E00);
+        assert_eq!(f64_to_f16(-1.5), 0xBE00);
+        assert_eq!(f64_to_f16(0.1), 0x2E66);
+        assert_eq!(f64_to_f16(6.103515625e-5), 0x0400); // 2^-14, smallest normal
+        assert_eq!(f64_to_f16(5.960464477539063e-8), 0x0001); // 2^-24, smallest subnormal
+        assert_eq!(f64_to_f16(65504.0), 0x7BFF); // largest finite binary16
+    }
+
+    #[test]
+    fn f64_to_f16_overflow_becomes_infinity() {
+        // Beyond the binary16 range the exponent field saturates.
+        assert_eq!(f64_to_f16(65520.0), 0x7C00);
+        assert_eq!(f64_to_f16(100000.0), 0x7C00);
+        assert_eq!(f64_to_f16(-100000.0), 0xFC00);
+        // The C body's overflow branch also catches a non-finite input; Erlang
+        // floats are always finite, so this only documents port fidelity.
+        assert_eq!(f64_to_f16(f64::INFINITY), 0x7C00);
+        assert_eq!(f64_to_f16(f64::NEG_INFINITY), 0xFC00);
+    }
+
+    #[test]
+    fn f64_to_f16_rounds_to_nearest_even() {
+        // 2^-25 is exactly between 0 and 2^-24; ties go to the even significand.
+        assert_eq!(f64_to_f16(2.9802322387695312e-8), 0x0000);
+        assert_eq!(f64_to_f16(-2.9802322387695312e-8), 0x8000);
+        // 3*2^-25 is exactly between 2^-24 and 2^-23; ties go to 2^-23 (even).
+        assert_eq!(f64_to_f16(8.940696716308594e-8), 0x0002);
+        // Ties in the normal range: 1 + 2^-11 rounds down to 1.0 (even), while
+        // 1 + 3*2^-11 rounds up to 1.0009765625 = 0x3C02 (even).
+        assert_eq!(f64_to_f16(1.00048828125), 0x3C00);
+        assert_eq!(f64_to_f16(1.00146484375), 0x3C02);
+        // A subnormal double is far below the binary16 subnormal range.
+        assert_eq!(f64_to_f16(5.0e-324), 0x0000);
+        assert_eq!(f64_to_f16(-5.0e-324), 0x8000);
+    }
+
+    // --- `put_utf8` --------------------------------------------------------
+
+    #[test]
+    fn put_utf8_encodes_each_length() {
+        assert_eq!(put_utf8(0), Some(vec![0x00]));
+        assert_eq!(put_utf8(0x7F), Some(vec![0x7F]));
+        assert_eq!(put_utf8(0x80), Some(vec![0xC2, 0x80]));
+        assert_eq!(put_utf8(0x7FF), Some(vec![0xDF, 0xBF]));
+        assert_eq!(put_utf8(0x800), Some(vec![0xE0, 0xA0, 0x80]));
+        assert_eq!(put_utf8(0xFFFF), Some(vec![0xEF, 0xBF, 0xBF]));
+        assert_eq!(put_utf8(0x10000), Some(vec![0xF0, 0x90, 0x80, 0x80]));
+        assert_eq!(put_utf8(0x10FFFF), Some(vec![0xF4, 0x8F, 0xBF, 0xBF]));
+    }
+
+    #[test]
+    fn put_utf8_rejects_non_scalars() {
+        assert_eq!(put_utf8(-1), None);
+        assert_eq!(put_utf8(0xD7FF + 1), None); // first surrogate
+        assert_eq!(put_utf8(0xDFFF), None); // last surrogate
+        assert_eq!(put_utf8(0x110000), None);
+    }
+
+    // --- `put_utf16` -------------------------------------------------------
+
+    #[test]
+    fn put_utf16_encodes_bmp_and_surrogate_pairs() {
+        assert_eq!(put_utf16(0, false), Some(vec![0x00, 0x00]));
+        assert_eq!(put_utf16(0x7F, false), Some(vec![0x00, 0x7F]));
+        assert_eq!(put_utf16(0xFFFF, false), Some(vec![0xFF, 0xFF]));
+        assert_eq!(put_utf16(0x10000, false), Some(vec![0xD8, 0x00, 0xDC, 0x00]));
+        assert_eq!(put_utf16(0x10FFFF, false), Some(vec![0xDB, 0xFF, 0xDF, 0xFF]));
+    }
+
+    #[test]
+    fn put_utf16_little_endian_swaps_each_code_unit() {
+        assert_eq!(put_utf16(0, true), Some(vec![0x00, 0x00]));
+        assert_eq!(put_utf16(0x7F, true), Some(vec![0x7F, 0x00]));
+        assert_eq!(put_utf16(0x1234, true), Some(vec![0x34, 0x12]));
+        assert_eq!(put_utf16(0x10000, true), Some(vec![0x00, 0xD8, 0x00, 0xDC]));
+        assert_eq!(put_utf16(0x10FFFF, true), Some(vec![0xFF, 0xDB, 0xFF, 0xDF]));
+    }
+
+    #[test]
+    fn put_utf16_rejects_non_scalars() {
+        assert_eq!(put_utf16(-1, false), None);
+        assert_eq!(put_utf16(0xD800, false), None);
+        assert_eq!(put_utf16(0xDFFF, false), None);
+        assert_eq!(put_utf16(0x110000, false), None);
+    }
+
+    // --- `put_utf32` -------------------------------------------------------
+
+    #[test]
+    fn put_utf32_encodes_big_endian_fixed_width() {
+        assert_eq!(put_utf32(0), Some(vec![0x00, 0x00, 0x00, 0x00]));
+        assert_eq!(put_utf32(1), Some(vec![0x00, 0x00, 0x00, 0x01]));
+        assert_eq!(put_utf32(0x10000), Some(vec![0x00, 0x01, 0x00, 0x00]));
+        assert_eq!(put_utf32(0x10FFFF), Some(vec![0x00, 0x10, 0xFF, 0xFF]));
+    }
+
+    #[test]
+    fn put_utf32_rejects_non_scalars() {
+        assert_eq!(put_utf32(-1), None);
+        assert_eq!(put_utf32(0xD800), None);
+        assert_eq!(put_utf32(0xDFFF), None);
+        assert_eq!(put_utf32(0x110000), None);
+    }
+}
