@@ -53,7 +53,7 @@ The build is driven by `Makefile.in` (the sibling `Makefile` is a generated 4-li
 - `escript`/any Erlang for `utils/make_atomics_api` (no configured ERTS needed); clang for `yielding_c_fun`'s test suite; a C99 compiler and GNU make for the standalone YCF build.
 
 ## Test Strategy
-- No test suite lives here. `libethread` and `liberts_internal` are covered by `../test/ethread_SUITE.erl` + `../test/etheread_SUITE_data/` and `../test/erl_print_SUITE.erl` + `../test/erl_print_SUITE_data/`, which compile standalone C programs against the built libraries using substitutions provided by `lib/common_test/test_server/ts_erl_config.erl` (`@erts_lib_internal_path@`, `@type_marker@`, the generated `ethread.mk`/`erts_internal.mk`) — so a configured *and* built tree is mandatory and they must run through `make test` in `erts/` (`TEST_NEEDS_RELEASE=true`).
+- No test suite lives here. `libethread` and `liberts_internal` are covered by `../test/ethread_SUITE.erl` + `../test/ethread_SUITE_data/` and `../test/erl_print_SUITE.erl` + `../test/erl_print_SUITE_data/`, which compile standalone C programs against the built libraries using substitutions provided by `lib/common_test/test_server/ts_erl_config.erl` (`@erts_lib_internal_path@`, `@type_marker@`, the generated `ethread.mk`/`erts_internal.mk`) — so a configured *and* built tree is mandatory and they must run through `make test` in `erts/` (`TEST_NEEDS_RELEASE=true`).
 - `yielding_c_fun` has its own standalone `test/test.sh` (golden-output comparison), runnable only via its `make test`; it is not wired into the OTP build or CI.
 - Practical way to exercise this C code: build with `TYPE=debug` (assertions, `ETHR_XCHK`) or `TYPE=valgrind`/`TYPE=asan` and run the emulator suites in `../emulator/test`.
 
