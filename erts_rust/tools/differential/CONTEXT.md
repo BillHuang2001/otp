@@ -124,6 +124,10 @@ Invocation argv is built once and used for **both** runtimes (drop-in `erl`, A.6
   (`ok <<131,104,2,119,2,111,107,97,42>>`); oracle-vs-oracle on the same case ⇒ `Verdict::Agree`;
   a Rust runtime forced to a nonexistent path ⇒ `unsupported` (never `pass`). These **skip with a loud
   note** (not a silent pass) when `erl` is unavailable, so `cargo test` stays honest everywhere.
+- `tests/cli.rs` drives the **binary** as a child process (so `$ERTS_ORACLE`/`$BEAM_RT` can be
+  injected without touching the test process environment) and locks in the exit-code contract
+  (`0`/`1`/`2`), the `--help` surface, the `--out` report file and the `list` path that needs no
+  runtime. Oracle-dependent cases skip loudly when `erl` is unavailable.
 - Gate: `cargo test -p differential` GREEN and `differential suite --json` runs end-to-end (Rust side
   `unsupported`, oracle vs golden agreement).
 
