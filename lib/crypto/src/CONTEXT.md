@@ -50,5 +50,4 @@ Contains exactly two modules plus build/release metadata — all actual cryptogr
 ## See Also
 - `../c_src/` — NIF C implementation the modules load (owns the other half of the NIF contract).
 - `../test/` — Common Test suites.
-- `../include/` — public headers (`crypto.hrl` etc.) shared with other apps.
 - `../doc/` — user guide / prose documentation.
