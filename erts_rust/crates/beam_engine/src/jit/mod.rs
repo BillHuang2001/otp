@@ -8,12 +8,12 @@
 //!   runs on it. [`Machine::run_export`](crate::Machine::run_export) is and stays
 //!   the default interpreter entry point.
 //! * [`Tier::BaselineJit`] — the native baseline tier (a Rust port of BeamAsm with
-//!   block register allocation; its instruction encoder and executable code
-//!   buffer already exist in the [`emitter`] submodule, while the backend that
-//!   lowers IR onto them lands in a follow-up task). The tier name is part of the
-//!   roster today; the backend itself is **not built yet**, so
-//!   [`Machine::run_with_tier`](crate::Machine::run_with_tier) routes it to the
-//!   interpreter (correct results, no codegen).
+//!   block register allocation). It is **built**: [`baseline::BaselineJit`] lowers
+//!   the typed IR's basic blocks to x86-64 (via the encoder and executable code
+//!   buffer in the [`emitter`] submodule) and runs a function through a driver loop
+//!   that falls back to the interpreter's per-instruction step for anything it does
+//!   not lower. See [`baseline`] for the block ABI, the register-allocation scheme
+//!   and the inline/helper split.
 //! * [`Tier::Cranelift`] — the optional hot tier (Cranelift codegen), gated behind
 //!   the **`jit-cranelift`** Cargo feature (default **OFF**). Deliberately off the
 //!   critical path: with the feature disabled the crate carries no Cranelift
@@ -31,9 +31,7 @@
 //! The historical `jit-beamasm` feature is retained as a **documented alias for
 //! the baseline tier**, not as a separate tier: the baseline tier is part of every
 //! build's roster (`"baseline-jit"` is always present after `"interpreter"`), so
-//! enabling the feature changes nothing. A later task replaces this alias with the
-//! real baseline backend; until then the feature exists only so `--features
-//! jit-beamasm` keeps working.
+//! enabling the feature changes nothing.
 //!
 //! # Backends
 //!
@@ -44,7 +42,8 @@
 //! [`Machine`]. The trait is the seam the runtime selects a tier through; the
 //! interpreter is *not* a [`JitBackend`] (it has nothing to compile — it is
 //! reached through [`Tier::Interpreter`] and
-//! [`Machine::run_export`](crate::Machine::run_export)).
+//! [`Machine::run_export`](crate::Machine::run_export)). [`baseline::BaselineJit`]
+//! is the one backend built today.
 
 use beam_common::Result;
 use beam_loader::{Atom, Module};
@@ -53,6 +52,7 @@ use beam_term::Eterm;
 use crate::context::ExecutionContext;
 use crate::Machine;
 
+pub mod baseline;
 pub mod emitter;
 
 /// An execution tier of the typed IR.
@@ -68,10 +68,9 @@ pub enum Tier {
     /// The native baseline JIT (a Rust port of BeamAsm with block register
     /// allocation).
     ///
-    /// Named `"baseline-jit"`; the roster entry exists in every build, while the
-    /// backend that consumes it lands in a follow-up task — until then
-    /// [`Machine::run_with_tier`](crate::Machine::run_with_tier) routes this tier
-    /// to the interpreter.
+    /// Named `"baseline-jit"`. The backend is [`baseline::BaselineJit`]: it compiles
+    /// the typed IR's basic blocks to x86-64 and runs the export through a driver
+    /// loop with a per-instruction interpreter deopt.
     BaselineJit,
     /// The optional Cranelift hot tier.
     ///
@@ -313,9 +312,9 @@ mod tests {
     }
 
     #[test]
-    fn baseline_tier_routes_to_the_interpreter_until_the_backend_lands() {
-        // Documented interim behavior: the baseline tier produces the interpreter's
-        // result (correct, no codegen) until the native backend is wired in.
+    fn baseline_tier_runs_the_module_on_the_native_backend() {
+        // The baseline tier now compiles and runs native code; its observable result
+        // must be the interpreter's.
         assert_eq!(run_add(Tier::BaselineJit).expect("add(2, 3)"), make_small(5));
     }
 

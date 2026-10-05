@@ -212,9 +212,10 @@ impl Machine {
     /// * [`Tier::Interpreter`] — delegates to [`Machine::run_export`], which
     ///   remains the **default interpreter entry** (unchanged; this method is a
     ///   dispatcher, not a replacement).
-    /// * [`Tier::BaselineJit`] — currently routes to the interpreter until the
-    ///   native baseline backend lands, so the tier is already selectable with
-    ///   correct results.
+    /// * [`Tier::BaselineJit`] — the native baseline backend
+    ///   ([`crate::jit::baseline::BaselineJit`]): it compiles the module's basic
+    ///   blocks to x86-64 and runs the export through a driver loop that falls back
+    ///   to one interpreter step per un-lowered instruction.
     /// * [`Tier::Cranelift`] — no Cranelift backend is built yet (the tier is
     ///   compiled in only with the `jit-cranelift` feature, and even then the
     ///   backend is a follow-up task), so this is a typed
@@ -231,9 +232,11 @@ impl Machine {
     ) -> Result<Eterm> {
         match tier {
             Tier::Interpreter => self.run_export(module, function, arity, args, ctx),
-            // The baseline backend is not built yet; the interpreter is the
-            // documented interim implementation (same observable result).
-            Tier::BaselineJit => self.run_export(module, function, arity, args, ctx),
+            Tier::BaselineJit => {
+                use crate::jit::JitBackend;
+                let mut backend = crate::jit::baseline::BaselineJit::new();
+                backend.run_export(self, module, function, arity, args, ctx)
+            }
             Tier::Cranelift => Err(error::unsupported("jit-cranelift tier not built")),
         }
     }
