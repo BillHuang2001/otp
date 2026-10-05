@@ -53,7 +53,7 @@ Public headers in `include/`: `httpd.hrl` (records `init_data`, `mod` — the da
 
 ## Notes for Agents
 - Deprecated but still shipped current functionality: `http_uri` (use `uri_string`), `httpd:parse_query/1`, and the server modules `mod_cgi`/`mod_actions` (with helper `httpd_cgi`) — `mod_cgi`/`mod_actions` are still listed in `inets.app.src` and covered by `httpd_SUITE`/`httpc_SUITE`.
-- `test/inets.config` and `test/inets.spec` are the harness entry points; the `inets.config` inside `src/inets_app/` is a stale example, and `test/httpd_test_data/` plus `test/property_test/` are unreferenced legacy dirs.
+- `test/inets.spec` is the `make test` entry point and `test/inets_bench.spec` the benchmark one; `test/inets.config` is installed by `test/Makefile` but contains only a dead legacy path, and the `inets.config` inside `src/inets_app/` is an equivalent stale example — no suite reads either.
 - Sample data (not secrets): `examples/server_root/auth/passwd` has plaintext demo credentials and `examples/server_root/ssl/*.pem` embed a sample certificate+key — keep them as-is.
 - `examples/server_root/conf/*` reference absolute `/var/tmp/server_root` paths, so the sample tree must be copied/run from its own root; ports 8888/8080/8088 are hard-coded.
 
