@@ -7,8 +7,9 @@ landscape, and recommended a seam-first, incremental strategy.*
 *Part II answers the follow-up questions in depth — (1) can we rewrite only the **core VM** and keep the loadable
 NIFs, the OTP modules, and the existing C; (2) are **data structures** really the bottleneck; (3) what **GC** should
 a Rust VM use; (4) how far can the **compiler**, the **JIT** and the **interpreter** be pushed; (5) how the
-**process memory model** (per-process heaps, message copying, ETS) constrains shared data, and whether messaging /
-ETS can be made cheaper — and, given the user's stance that *development cost is acceptable as long as the path is
+**process memory model** (per-process heaps, message copying, ETS) constrains shared data, and how far messaging /
+ETS can be made cheaper — opportunistic common-case messaging wins on the current VM, and, in a rewrite, a
+shared-object ETS redesign — and, given the user's stance that *development cost is acceptable as long as the path is
 straightforward and achievable*, turns the picture into a **staged plan with explicit seams and break-points**.*
 
 *Method: parallel read-only investigations grounded in this tree (ERTS `30.0-rc0` / `erts-17.1`) — the
@@ -62,8 +63,12 @@ and one is **inverted**:
    (`copy.c:647`) and every ETS put/read deep-copies in and out; in exchange process death is **O(1)** and there is
    **no write barrier**. Only objects that are **pointer-free, immutable and refcounted-or-permanent** — refc
    binaries, literal areas, `persistent_term` — cross the boundary cheaply today. *General* zero-copy messaging
-   needs a new shared-heap term class plus write barriers (a fundamental redesign); the reachable direction is to
-   **widen the existing sharing template** and tune the queue, while ETS whole-object reads keep copying. (§D)
+   still needs a new shared-heap term class plus write barriers (a fundamental redesign), but there are concrete
+   **opportunistic common-case messaging wins** (bounded single-pass small copy; static → auto-tuned message queue;
+   fragment ownership transfer), and in a rewrite **ETS whole-object reads need not keep copying**: a
+   shared-object model (immutable refcounted objects + COW writes + lock-free reads) is on the table, gated on a
+   shared-term enabler whose real cost is **refcount/lifetime**, not the access path — literals already prove a
+   zero-indirection off-heap compound representation. (§D)
 
 Given the user's explicit acceptance of a large development effort, §H lays out the full staged plan with the
 break-points at which each stage is independently valuable and abandonable.
@@ -192,7 +197,8 @@ cases; `++`/`=` semantics). Three things need a *decision* at implementation tim
 **ETS `ordered_set`** is an **AVL tree, one separately-allocated node per key** (`erl_db_tree.c:25`,
 `erl_db_tree.h:28-32`) — a pointer chase per level. A K-ary B-tree (K ≈ 16–32) / cache-oblivious layout collapses
 the height and packs keys per cache line; only *total key order* is observable, so it is fully observation-preserving
-and self-contained (~2 kLOC), deliverable inside the current VM.
+and self-contained (~2 kLOC), deliverable inside the current VM. A rewrite can go further — a B+-tree with in-node
+range scans, on top of the §D shared-object/COW redesign.
 
 **Unchanged representation facts:** a cons cell is a header-less 2-word `[CAR,CDR]` tagged `TAG_PRIMARY_LIST`
 (`erl_term.h:71,219-244`); `++`/`lists:append` copies its LHS and `member`/`keyfind` are O(n) C BIFs
@@ -332,21 +338,68 @@ binaries** are shared by reference on both put and read. **Precedent:** **Pony/O
 heaps *plus* zero-copy messaging only via a co-designed **data-race-free type system** (`iso`/`val`/`tag`);
 **JVM/.NET** expose one shared heap to all threads (no copies, but a global/STW collector) — the opposite trade-off.
 
+**What is actually sent, and what it costs.** The dominant traffic is a small atom-tagged 2–3 element envelope —
+`{'$gen_call',{Pid,Ref},Req}` (~8 words), `{Ref,Reply}` (~5), `{'$gen_cast',Req}` (~4),
+`{system,{Pid,Tag},Req}` (~8), `{notify,Event}` (~4), `{'EXIT',…}`, `{'DOWN',…}` (~7)
+(`lib/stdlib/src/{gen.erl,gen_server.erl,gen_statem.erl,erpc.erl}`). Only immediates are genuinely free
+(`IS_CONST`, `copy.c:677`; a self-send skips the copy, `erl_message.c:824-833`) — and a *local* `reference()` is
+**boxed** (3 words, `ERTS_REF_THING_SIZE`, `erl_term.h:873-877,990`), so the ubiquitous gen-server request id forces
+a real `copy_struct` pass on every call and every reply, not an immediate-only fast path. A non-immediate message
+pays **two full passes** — `size_object_litopt` (`erl_message.c:839`) then `copy_struct_litopt`→`copy_struct_x`
+(`copy.c:647`, call site `erl_message.c:860`) — with **no word-threshold size specialization**: a 5-word
+`{Ref,Reply}` is walked and copied exactly like a 5 000-word term.
+
 ### Cheaper messaging and ETS — what is reachable
-**General zero-copy messaging is not reachable** without a fundamental redesign: a new refcounted shared-heap term
-class understood by every consumer (BIFs, guards/PAM, ETF, GC, introspection) *plus* **write barriers** to track
-mutation of shared state — the cost immutability lets BEAM avoid. What *is* reachable is to **widen BEAM's existing
-sharing template** — the "pointer-free, immutable, refcounted-or-permanent payload + small handle" pattern already
-used for refc binaries, literal areas and `persistent_term` — e.g. refcounted immutable compound terms or a
-register-once-read-many registry, plus per-workload tuning of the on-/off-heap message queue (`+hmqd`). For ETS,
-**whole-object reads will keep copying** (value semantics + GC + invalidation safety), so the wins are incremental:
-`lookup_element` is already element-only and `first`/`next` key-only, so trim redundant copies when building match
-results, chunk `select` streams, keep same-size `update_element` in place, and adopt the `ordered_set` K-ary node
-layout (§B.3) — these cut constant factors, not the per-visit whole-object copy. A *narrow* read-only borrowed
-**binary/snapshot** is the only zero-copy ETS read worth considering; a general borrowed off-heap **tuple view** is
-not realistic (it needs a new first-class boxed term type, invalidation-safety against insert/update/delete, and GC
-pinning of the borrowed object). **The concrete mechanism is left to implementation** — directions and trade-offs,
-not commitments.
+**General zero-copy messaging is not reachable** without a fundamental redesign — a new shared term class understood
+by every consumer (BIFs, guards/PAM, ETF, GC, introspection) *plus* **write barriers** for shared mutation, the cost
+immutability lets BEAM avoid. Within that frame the work sorts into three tiers.
+
+**(a) Opportunistic messaging wins (in the current VM).** A bounded **single-pass small copy**: today even a 5-word
+envelope is walked twice (size at `erl_message.c:839`, copy at `copy.c:647`/`erl_message.c:860`) with no
+size specialization, so a `size_object_bounded(msg, N)` probe that reserves exactly and falls back to re-size/copy on
+overflow removes the first pass for the dominant shape. **Message-queue auto-tuning**: the on-/off-heap choice is
+**static** — default `SPO_ON_HEAP_MSGQ` (`erl_process.c:132`), changed only at spawn, by `+hmqd`
+(`erl_init.c:1580-1585`) or `process_flag` (`erl_process.c:12305-12315`) — although it is purely a GC trade-off (an
+on-heap queue joins the **rootset on every GC**, `erl_gc.c:2709-2777`; an off-heap one does not), so a queue-length
+threshold can flip it through the existing thread-progress transition `erts_change_message_queue_management`
+(`erl_message.c:1022`). **Fragment ownership transfer** (rewrite-only): `enif_send` already builds a term in a
+private fragment chain and hands it over **with no copy** (`erl_nif.c:815-841,860-994`), and receive already adopts
+fragments (`save_heap_frag_eterm` `erl_proc_sig_queue.c:3924`; `erts_link_mbuf_to_proc` `erl_message.c:563`); letting
+`!` do the same means building into a detached fragment — a representation/semantics change. All three must respect
+the accounting invariant: copy cost is charged only above 64 words (`ERTS_MSG_COPY_WORDS_PER_REDUCTION`,
+`erl_message.h:33-35`; `erl_message.c:881-886`) and the copy is synchronous and non-yielding, so any sharing must keep
+charging on **logical term size** or scheduling de-fairs.
+
+**(b) ETS in a rewrite — the shared-object redesign.** ETS is already an off-heap shared store, but per-object
+`DbTerm` allocations (`erl_db_util.h:68`) make every whole-object read a copy (`db_copy_object_from_ets`
+`erl_db_util.h:425`; `erl_db_hash.c:3614`; `erl_db_tree.c:1038`; PAM `ERTS_PAM_COPY_RESULT`, `erl_db_util.c:2639`),
+and even a fine-locked table takes a per-slot rlock per read (`erl_db_hash.c:404-413`). The redesign **stores each
+object as an immutable refcounted shared off-heap object** (its top level is already a `tpl[]` tuple array — a
+literal-style direct-pointer candidate), returns it **by reference** from lookup/match/select, **COW**s every
+insert/update/delete, and reclaims by refcount and/or RCU/epoch (`ErtsThrPrgrLaterOp`, already used for CATree node
+free, `erl_db_catree.h:50,59`) — giving **lock-free reads** and deleting `{compressed}` re-decode
+(`erl_db_util.c:3726`) and per-match temp allocation (`erl_db_hash.c:1903`). Independent **in-place** ETS wins need no
+enabler: keep the already-narrow reads narrow (`lookup_element` element-only, `erl_db_util.c:3763`; `first`/`next`
+key-only), trim match-result copies, chunk `select`, keep same-size `update_element` in place — plus an `ordered_set`
+**B+-tree** (§B.3), **opt-in secondary indexes** for match/select (only the key is indexed today,
+`erl_db_hash.c:3194,3250-3276`; everything else full-scans, `:1835-1951`) and **open addressing**
+(SwissTable/CHAMP) for the non-fine-locked hash tables.
+
+**(c) The enabler: a refcounted shared off-heap compound term.** The *representation* is precedented: literals are
+off-heap compound term graphs laid out **identically** to heap terms, with a `TAG_LITERAL_PTR` bit the accessors mask
+off (`erts_set_literal_tag` `erl_term.c:36-69`; `erl_term.h:210-216,232-238,247`), so `is_tuple`/`element`/`CAR`/
+`is_map` read them at **zero extra indirection or branch** (`erl_term.h:530,1311-1317`) — the access path is **not**
+the obstacle; per-reference **lifetime** is (literals are permanent, `erl_gc.c:2379`, `copy.c:1118-1535`). **Route A**
+wraps the block in a heap-resident handle, reusing the `BinRef`/MSO lifetime model verbatim (`erl_bits.h:60,135`;
+sweep `sweep_off_heap` `erl_gc.c:2995-3110`) at the cost of a wrapper term ⇒ real accessor indirection plus a new case
+at every boxed-subtag switch site (size/copy, GC, eq/hash, ETF, NIF, PAM, printing); **Route B**, a literal-style
+direct pointer, costs nothing on access but needs new GC-traced lifetime (a per-process registration marked during the
+heap scan, or a heap-tracked handle) and a *detectable* block space (`TAG_LITERAL_PTR` exists only on ARCH_64 without
+reserved memory/DEBUG). Both require the block to stay **immutable for life** and **free of pointers into process
+heaps**, to own its inner refc binaries, and to keep `=:=`/`==`/term **order**/hashing **structural**
+(`utils.c:1125,1169,1658`) — otherwise sharing flips `=:=` true → false; sharing is observable
+(`erts_debug:same/2`, `size/1`, `flat_size/1`, `process_info(memory)`), a product decision rather than a free win.
+**The concrete mechanism is left to implementation** — directions and trade-offs, not commitments.
 
 ---
 
@@ -559,9 +612,12 @@ layout, cons-cell allocation batching (these land in `erts`, not the compiler); 
 interior** — chunked/unrolled lists with opportunistic chunking + plain-cons fallback, RRB/finger-tree interiors
 for sequence loads — which is a **compiler+VM co-design** that rides on Stage 2's FBIP and so is sequenced *with*,
 not before, it. Target bulk producer/consumer patterns; keep the cons interface bit-identical.
-Also in `erts`: the **incremental, semantics-preserving ETS copy wins** from §D (element/key reads, match-copy
-trimming, `ordered_set` node layout) and — as a research item — **widening the off-heap shared-term template**
-(refcounted immutable terms / literal-area registry), plus on-/off-heap message-queue tuning (`+hmqd`).
+Also in `erts`: the **incremental, semantics-preserving ETS wins** from §D (element/key reads, match-copy trimming,
+`ordered_set` node layout, opt-in secondary indexes, open addressing); the **opportunistic messaging wins** from §D
+(bounded single-pass small copy, message-queue auto-tuning replacing the static `+hmqd` choice, and — as a rewrite
+item — fragment ownership transfer); and, as the single **enabler** shared by message sharing and the ETS
+shared-object/COW redesign, a **refcounted immutable off-heap compound term** — budgeted as a research item because
+its cost is lifetime/refcount plus `copy.c`/`erl_gc.c` integration, not the access path.
 
 **Stage 4 — GC modernization.**
 Port the per-process generational copying collector to unsafe Rust (preserving the barrier-free invariant and the
@@ -596,9 +652,11 @@ is back-loaded (Stage 5). That is the straightforward, achievable path.
 | **Stage 3** ETS `ordered_set` → K-ary B-tree | Medium | High (ordered-set lookups) | Low | Low | Any time |
 | **Stage 3** Map flatmap/CHAMP, cons batching | Low–medium | Low–medium | Low | Low | Any time |
 | **Stage 3** Cache-friendly list interior (chunked/unrolled + opportunistic chunking; RRB/finger-tree) | High (VM+compiler co-design) | Medium–high (bulk list/`Enum` workloads) | Low | Medium–high (partial-chunk tail view; introspection APIs) | With Stage 2 FBIP |
-| **Stage 3** ETS cheaper put/read (element/key reads, match-copy trimming, `ordered_set` node layout) | Low–medium | Low–medium | Low | Low | Any time |
-| **Stage 3** Widen off-heap shared-term sharing template (refcounted immutable terms / literal-area registry) | High | Low–medium | Low | High | Research; after Stage 3 |
-| **Stage 3** Zero-copy ETS reads (borrowed off-heap view) | High | Low (repeated large-object reads only) | Low | High | No — narrow binary view only |
+| **Stage 3** ETS in-place wins (element/key reads, match-copy trimming, `ordered_set` node layout, opt-in secondary indexes, open addressing) | Low–medium | Low–medium | Low | Low | Any time |
+| **Stage 3** Opportunistic messaging (bounded single-pass small copy; message-queue auto-tune) | Low | Low–medium | Low | Low (must keep logical-size reduction accounting) | Any time |
+| **Stage 3** Shared refcounted immutable off-heap term — **enabler** for message sharing *and* the ETS shared-object redesign | High | Medium | Low | High (refcount/lifetime + `copy.c`/`erl_gc.c` integration; every boxed-subtag consumer; `=:=`/order/hash must stay structural) | Research; after Stage 3 |
+| **Stage 3** Zero-copy ETS reads (immutable shared objects + COW writes + lock-free reads) | High | Medium (read-heavy tables: no whole-object copy, no read lock) | Low | High | Rewrite only; gated on the enabler above |
+| **Stage 3** Fragment ownership transfer for `!` (zero-copy send of a detached fragment) | High | Medium–high (large/structured messages) | Low | High (representation/semantics change) | Rewrite only |
 | **Stage 4** Port per-process copying GC to Rust | High | Neutral (preserves behavior) | Medium | High (correctness) | After Stage 1 |
 | **Stage 4** GenImmix mature generation | High | Uncertain (measure) | Medium | High | Measurement-gated |
 | **Stage 5** Rust core behind frozen C ABI (link boundary) | Very high (134 kLOC core) | Low–modest | Medium (periphery) | Very high | Only if 1–4 insufficient |
@@ -612,10 +670,10 @@ is back-loaded (Stage 5). That is the straightforward, achievable path.
 `erts/emulator/beam/emu/{beam_emu.c,ops.tab,instrs.tab,macros.tab,select_instrs.tab,arith_instrs.tab,msg_instrs.tab,bif_instrs.tab}`;
 `erts/emulator/beam/jit/{beam_asm.h,asm_load.c,beam_jit_register_cache.hpp,beam_jit_common.{hpp,cpp},x86/*,arm/*}`;
 `erts/emulator/beam/{erl_db_tree.c,erl_db_tree.h,erl_db_util.c,erl_nif.c}`; `erts/emulator/utils/beam_makeops`;
-`erts/emulator/beam/{erl_message.c,copy.c,erl_proc_sig_queue.c,erl_db_hash.c,erl_binary.c,erl_bif_persistent.c}` (messaging / ETS / shared off-heap);
+`erts/emulator/beam/{erl_message.c,erl_message.h,copy.c,erl_proc_sig_queue.c,erl_db_hash.c,erl_db_util.{c,h},erl_db_catree.h,erl_binary.c,erl_bits.h,erl_term.c,utils.c,erl_bif_persistent.c}` (messaging / ETS / shared off-heap, shared-term enabler);
 `erts/emulator/internal_doc/{GarbageCollection.md,BeamAsm.md,ThreadProgress.md,CodeLoading.md,beam_makeops.md}`;
 `erts/emulator/Makefile.in`; `lib/compiler/src/{compile.erl,beam_ssa_opt.erl,beam_ssa_alias.erl,beam_ssa_destructive_update.erl,sys_core_fold.erl,sys_core_fold_lists.erl,beam_types.erl,beam_bounds.erl,beam_ssa.erl,beam_ssa_type.erl}`;
-`lib/compiler/test/Makefile`; `lib/stdlib/src/{lists.erl,proplists.erl,string.erl,unicode.erl}`.
+`lib/compiler/test/Makefile`; `lib/stdlib/src/{lists.erl,proplists.erl,string.erl,unicode.erl}`; `lib/stdlib/src/{gen.erl,gen_server.erl,gen_statem.erl,gen_event.erl,erpc.erl}` (common message shapes).
 
 **External.**
 - Erlang/OTP blog — *The Road to the JIT* (HiPE removal; abandoned LLVM tracing JITs): https://www.erlang.org/blog/the-road-to-the-jit
@@ -625,7 +683,9 @@ is back-loaded (Stage 5). That is the straightforward, achievable path.
 - Immix (PLDI 2008): https://www.steveblackburn.org/pubs/papers/immix-pldi-2008.pdf ; LXR (PLDI 2022): https://www.steveblackburn.org/pubs/papers/lxr-pldi-2022.pdf ; RCImmix (OOPSLA 2013): https://www.cs.utexas.edu/users/mckinley/papers/rcix-oopsla-2013.pdf
 - Perceus (Koka/Lean 4 RC-with-reuse): https://www.microsoft.com/en-us/research/wp-content/uploads/2020/11/perceus-tr-v1.pdf
 - Pony/ORCA (per-actor GC, no STW/barriers): https://janvitek.org/pubs/oopsla17a.pdf ; Go GC guide: https://go.dev/doc/gc-guide
-- Process memory model: Pony **ORCA** (OOPSLA 2017 — per-actor GC + type-system co-design ⇒ zero-copy messaging): https://www.ponylang.io/media/papers/orca_gc_and_type_system_co-design_for_actor_languages.pdf ; Erlang binary handling (refc binaries / large-binary sharing): https://www.erlang.org/doc/system/binaryhandling.html
+- Process memory model: Pony **ORCA** (OOPSLA 2017 — per-actor GC + type-system co-design ⇒ zero-copy messaging): https://www.ponylang.io/media/papers/orca_gc_and_type_system_co-design_for_actor_languages.pdf ; Erlang binary handling (refc binaries / large-binary sharing): https://www.erlang.org/doc/system/binaryhandling.html ; Erlang `persistent_term` (off-heap term, returned by reference): https://www.erlang.org/doc/apps/erts/persistent_term.html
+- Off-heap read-mostly reclamation: **read-copy update** (McKenney & Slingwine): https://www.kernel.org/doc/html/latest/RCU/whatisRCU.html ; epoch-based reclamation (Crossbeam `epoch`): https://docs.rs/crossbeam-epoch
+- Cache-friendly lookup geometry: **SwissTable** (Abseil flat hash map/set): https://abseil.io/docs/cpp/guides/container ; **CHAMP** (Steindorfer & Vinju, OOPSLA 2015): https://doi.org/10.1145/2814270.2814312 ; B+-tree (Comer, "The Ubiquitous B-Tree"): https://doi.org/10.1145/356770.356776
 - Cranelift (fast, secure, regalloc2): https://cranelift.dev ; regalloc2: https://cfallin.org/blog/2022/06/09/cranelift-regalloc2 ; Copy-and-Patch (OOPSLA 2021) + CPython 3.13 (PEP 744); V8 Maglev: https://v8.dev/blog/maglev
 - PEP 659 (specializing adaptive interpreter): https://peps.python.org/pep-0659 ; CPython tail-call interpreter — careful re-analysis (~1–5%): https://blog.nelhage.com/post/cpython-tail-call ; Rust tail calls (`become`, nightly; ~2027 target): https://trifectatech.org/blog/tail-calls-project-goal
 - Elixir lowers via Erlang abstract forms → Core → SSA (Dashbit, "How to debug Elixir/Erlang compiler performance"): https://dashbit.co/blog/how-to-debug-elixir-erlang-compiler-performance ; The BEAM Book §2.4: https://stenmans.org/theBeamBook/
