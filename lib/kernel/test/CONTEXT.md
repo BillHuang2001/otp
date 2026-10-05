@@ -93,7 +93,7 @@ Suites run against an INSTALLED OTP release (`TEST_NEEDS_RELEASE=true` in `../Ma
 
 ## See Also
 - `../src/` → the kernel implementation under test (read-only from here; escalate source changes to `lib/kernel`).
-- `../Makefile` → sets `TEST_NEEDS_RELEASE=true` and `TEST_SCOPE`-style test wiring.
+- `../Makefile` → the owning app Makefile; sets `TEST_NEEDS_RELEASE=true`.
 - `../../make/test_target_script.sh` → the `make test` driver (release build + `ct_run`).
 - `../../common_test/test_server/ts_install_cth.erl` → the hook every suite declares via `{ct_hooks,[ts_install_cth]}`.
 - `../../examples/gen_tcp_dist/`, `../../examples/erl_uds_dist/` → sources copied in as `gen_tcp_dist.erl`/`erl_uds_dist.erl`.
