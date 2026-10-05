@@ -83,4 +83,4 @@ The public API is the single module `mnesia` (see `src/CONTEXT.md` for the modul
 ## See Also
 - `../CONTEXT.md` — OTP application conventions (app layout, `vsn.mk`, release targets).
 - `../../make/app_targets.mk`, `../../make/doc.mk`, `../../make/test_target_script.sh` — shared build/test rules used here.
-- `../stdlib/` (`qlc` is the Mnesia query language), `../kernel/` (distribution, `disk_log`/`dets` are in stdlib), `../snmp/` (SNMP table integration), `../sasl/` (release handling of the app).
+- `../stdlib/` (`qlc` is the Mnesia query language, `dets` is the `disc_only_copies` store), `../kernel/` (distribution, `disk_log` for the transaction log, `file`), `../snmp/` (SNMP table integration), `../sasl/` (release handling of the app).
