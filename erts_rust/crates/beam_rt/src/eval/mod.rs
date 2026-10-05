@@ -231,6 +231,7 @@ impl Evaluator<'_, '_> {
 
             Expr::Call(name, args) => self.local_call(name, args, env),
             Expr::Remote(module, function, args) => self.remote_call(module, function, args, env),
+            Expr::Apply(callee, args) => self.apply_expr(callee, args, env),
 
             Expr::Case(subject, clauses) => self.case(subject, clauses, env),
             Expr::If(clauses) => self.if_expr(clauses, env),
@@ -417,9 +418,9 @@ impl Evaluator<'_, '_> {
             return Err(self.raise(ExceptionClass::Error, "badarg"));
         }
         let code = u32::try_from(signed_value(value))
-            .map_err(|_| Flow::Fatal(self.raise(ExceptionClass::Error, "badarg")))?;
+            .map_err(|_| self.raise(ExceptionClass::Error, "badarg"))?;
         let character = char::from_u32(code)
-            .ok_or_else(|| Flow::Fatal(self.raise(ExceptionClass::Error, "badarg")))?;
+            .ok_or_else(|| self.raise(ExceptionClass::Error, "badarg"))?;
         let mut buffer = [0u8; 4];
         out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
         Ok(())
@@ -431,7 +432,7 @@ impl Evaluator<'_, '_> {
             return Err(self.raise(ExceptionClass::Error, "badarg"));
         }
         u8::try_from(signed_value(value))
-            .map_err(|_| Flow::Fatal(self.raise(ExceptionClass::Error, "badarg")))
+            .map_err(|_| self.raise(ExceptionClass::Error, "badarg"))
     }
 
     /// A prefix operator.
@@ -472,8 +473,10 @@ impl Evaluator<'_, '_> {
                 }
             }
             BinOp::And | BinOp::Or | BinOp::Xor => {
-                let left = self.boolean(self.expr(lhs, env)?)?;
-                let right = self.boolean(self.expr(rhs, env)?)?;
+                let left_value = self.expr(lhs, env)?;
+                let left = self.boolean(left_value)?;
+                let right_value = self.expr(rhs, env)?;
+                let right = self.boolean(right_value)?;
                 let result = match op {
                     BinOp::And => left && right,
                     BinOp::Or => left || right,
@@ -484,8 +487,10 @@ impl Evaluator<'_, '_> {
             BinOp::ListConcat => self.list_concat(lhs, rhs, env),
             BinOp::ListSubtract => self.list_subtract(lhs, rhs, env),
             BinOp::Band | BinOp::Bor | BinOp::Bxor | BinOp::Bsl | BinOp::Bsr => {
-                let left = self.integer(self.expr(lhs, env)?)?;
-                let right = self.integer(self.expr(rhs, env)?)?;
+                let left_value = self.expr(lhs, env)?;
+                let left = self.integer(left_value)?;
+                let right_value = self.expr(rhs, env)?;
+                let right = self.integer(right_value)?;
                 let result = match op {
                     BinOp::Band => left & right,
                     BinOp::Bor => left | right,
@@ -587,6 +592,13 @@ impl Evaluator<'_, '_> {
         env: &mut Env,
     ) -> EResult<Eterm> {
         self.call_function(module, function, args, env)
+    }
+
+    /// Applies the value of `callee` (a fun term) to the evaluated `args`.
+    fn apply_expr(&mut self, callee: &Expr, args: &[Expr], env: &mut Env) -> EResult<Eterm> {
+        let function = self.expr(callee, env)?;
+        let values = self.terms(args, env)?;
+        self.apply_value(function, &values)
     }
 
     /// Dispatches `module:function(Args)`.
@@ -1371,7 +1383,6 @@ fn operator_bif(op: BinOp) -> Option<&'static str> {
 
 #[cfg(test)]
 mod tests {
-    use beam_bifs::BytesSink;
     use beam_term::{atom_val, is_small, signed_value};
 
     use super::*;
@@ -1379,6 +1390,11 @@ mod tests {
     use crate::runtime::Runtime;
 
     /// Evaluates `expr` (with no program output) and returns the term.
+    ///
+    /// The runtime (and its heap) is dropped when this returns, so the result is
+    /// only usable while it is a **fixed immediate** (a small integer or an atom).
+    /// A heap-allocated result (a float, list, tuple, binary, …) would dangle;
+    /// such tests drive `RuntimeContext` directly so the runtime outlives the term.
     fn run(expr: &str) -> Result<Eterm> {
         let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
         let mut sink = beam_bifs::NullSink;
@@ -1416,8 +1432,12 @@ mod tests {
 
     #[test]
     fn integer_division_is_a_float_but_the_probe_only_needs_the_bif() {
-        // `2/3` is `0.666…` — a float, exactly as `erl` returns it.
-        let value = run("2/3").expect("2/3");
+        // `2/3` is `0.666…` — a float, exactly as `erl` returns it. The result is
+        // heap-allocated, so the runtime must outlive it (see `run`).
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let value = eval(&mut ctx, "2/3").expect("2/3");
         assert!(!is_small(value));
         assert!((terms::float_value(value).expect("a float") - 2.0 / 3.0).abs() < 1e-12);
     }
@@ -1432,8 +1452,11 @@ mod tests {
         atom("false orelse true", "true");
         atom("not false", "true");
         atom("true xor true", "false");
-        int("[1,2] ++ [3]", 3);
-        assert_eq!(run("[1,2] ++ [3]").map(|v| terms::list_elements(v).unwrap().len()), Ok(4));
+        // `++` builds a list (`[1,2] ++ [3]` is `[1,2,3]`), so assert the list, not a scalar.
+        let concatenated = run("[1,2] ++ [3]").expect("[1,2] ++ [3]");
+        let elements = terms::list_elements(concatenated).expect("a list");
+        assert_eq!(elements.len(), 3);
+        assert_eq!(elements[2], make_small(3));
     }
 
     #[test]
@@ -1494,7 +1517,6 @@ mod tests {
     fn funs_are_created_applied_and_captured() {
         int("(fun(X) -> X + 1 end)(41)", 42);
         int("F = fun(X) -> X * 2 end, F(21)", 42);
-        int("fun(F, A) -> F(A) end", 3); // placeholder replaced below
         int("Apply = fun(F, A) -> F(A) end, Apply(fun(X) -> X + 1 end, 41)", 42);
         int("Add = fun F(0, Acc) -> Acc; F(N, Acc) -> F(N - 1, Acc + N) end, Add(4, 0)", 10);
     }

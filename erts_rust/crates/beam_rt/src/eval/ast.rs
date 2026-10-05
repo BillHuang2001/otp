@@ -267,6 +267,9 @@ pub enum Expr {
     Call(String, Vec<Expr>),
     /// A remote call `Mod:Fun(Args)`.
     Remote(String, String, Vec<Expr>),
+    /// A call whose callee is an arbitrary expression (a fun-valued term), e.g.
+    /// `(fun(X) -> X end)(1)`.
+    Apply(Box<Expr>, Vec<Expr>),
 
     /// `case Subject of Clauses end`
     Case(Box<Expr>, Vec<Clause>),

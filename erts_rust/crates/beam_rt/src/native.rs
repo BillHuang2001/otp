@@ -11,6 +11,7 @@
 //! | `erlang:display/1` | writes to the *process's* output sink |
 //! | `io:put_chars/1,2` | writes to the process's output sink (the device argument is accepted and ignored) |
 //! | `erlang:apply/2,3` | re-enters the host's own dispatch (BIF **or** load-on-demand module call) |
+//! | `erlang:system_info/1` | reads/renders the runtime introspection surface (contract A.8) on the runtime's own scratch heap |
 //! | `init:get_argument/1` | reads the parsed command line (contract A.6, `RuntimeConfig::init_args`) |
 //!
 //! Every entry returns `Option<Result<Eterm>>`: `None` means "not a native BIF, fall
@@ -54,6 +55,7 @@ impl RuntimeContext<'_> {
             ("io", "put_chars", 2) => Some(self.put_chars(args, 2)),
             ("erlang", "apply", 2) => Some(self.apply_dynamic(args, false)),
             ("erlang", "apply", 3) => Some(self.apply_dynamic(args, true)),
+            ("erlang", "system_info", 1) => Some(self.system_info_1(args)),
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             _ => None,
         }
@@ -134,6 +136,23 @@ impl RuntimeContext<'_> {
         };
         let arity = call_args.len() as u32;
         self.call_bif(&module, &function, arity, &call_args)
+    }
+
+    // -- erlang:system_info/1 -------------------------------------------------
+
+    /// `erlang:system_info(Key)`: materialize the runtime introspection key (contract
+    /// A.8) on the runtime's scratch info heap.
+    ///
+    /// The key is read as an atom from the shared atom table; the value comes from
+    /// [`Runtime::system_info`](crate::Runtime::system_info), the single source of
+    /// truth for the supported keys. An unknown key yields
+    /// [`BeamError::BadArg`] — the bare `badarg` the oracle raises — so `-eval`'s
+    /// `catch`/`try` sees exactly what loaded code would.
+    fn system_info_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let key = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        self.runtime.system_info(&key)
     }
 
     // -- init:get_argument/1 --------------------------------------------------

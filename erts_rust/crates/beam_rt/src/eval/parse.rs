@@ -376,6 +376,9 @@ struct Parser<'a> {
     pos: usize,
     /// Whether `/` must be read as a binary segment specifier, not division.
     in_segment: bool,
+    /// Whether `Atom:Function` must NOT be read as a remote call — set while
+    /// parsing a `catch` clause head, where `Class:Reason` is a pattern pair.
+    no_remote: bool,
 }
 
 /// Parses an `-eval` expression.
@@ -391,15 +394,23 @@ pub fn parse(src: &str) -> Result<Expr> {
         toks,
         pos: 0,
         in_segment: false,
+        no_remote: false,
     };
-    let expr = parser.parse_expr(0)?;
+    let expr = parser.parse_body()?;
     // Tolerate one trailing `.` even if the CLI did not strip it.
     let _ = parser.eat_punct(".");
     if !parser.at_end() {
         let found = parser.peek().cloned();
         return Err(error::bad_eval(src, &format!("unexpected {found:?}")));
     }
-    Ok(expr)
+    // `-eval` takes a comma sequence (`X = 7, X + 1`); a single expression stays bare
+    // so its tree is exactly what a caller expects.
+    let mut exprs = expr;
+    if exprs.len() == 1 {
+        Ok(exprs.pop().unwrap_or(Expr::Nil))
+    } else {
+        Ok(Expr::Block(exprs))
+    }
 }
 
 impl<'a> Parser<'a> {
@@ -511,6 +522,13 @@ impl<'a> Parser<'a> {
     /// binding looser than `min_bp`.
     fn parse_expr(&mut self, min_bp: u8) -> Result<Expr> {
         let mut lhs = self.parse_prefix()?;
+        // Postfix call application: `(fun … end)(Args)`, i.e. calling a fun-valued
+        // expression. A *named* call was already consumed in `parse_primary`.
+        while self.is_punct("(") {
+            self.pos += 1;
+            let args = self.parse_call_args()?;
+            lhs = Expr::Apply(Box::new(lhs), args);
+        }
         loop {
             let Some((op, lbp, rbp)) = self.peek().and_then(|t| binop_of(t, self.in_segment)) else {
                 break;
@@ -591,7 +609,7 @@ impl<'a> Parser<'a> {
 
     /// Continues after a bare atom: a local call, a remote call, or the atom.
     fn after_atom(&mut self, name: String) -> Result<Expr> {
-        if self.eat_punct(":") {
+        if !self.no_remote && self.eat_punct(":") {
             let function = self.expect_atom_name()?;
             self.expect_punct("(")?;
             let args = self.parse_call_args()?;
@@ -922,7 +940,13 @@ impl<'a> Parser<'a> {
     fn parse_catch_clauses(&mut self) -> Result<Vec<CatchClause>> {
         let mut clauses = Vec::new();
         loop {
-            let first = self.with_seg_off(|p| p.parse_expr(0))?;
+            // The class pattern of `Class:Reason` is a plain atom/variable, never a
+            // remote call, so suppress `Atom:Function` parsing while reading it.
+            let saved_no_remote = self.no_remote;
+            self.no_remote = true;
+            let first = self.with_seg_off(|p| p.parse_expr(0));
+            self.no_remote = saved_no_remote;
+            let first = first?;
             let (class, reason, stacktrace) = if self.eat_punct(":") {
                 let second = self.with_seg_off(|p| p.parse_expr(0))?;
                 if self.eat_punct(":") {
@@ -1047,8 +1071,13 @@ impl<'a> Parser<'a> {
             if !self.eat_punct(";") {
                 break;
             }
-            // Subsequent clauses repeat the `(Params)` shape.
-            self.expect_punct("(")?;
+            // Subsequent clauses repeat the `(Params)` shape; a NAMED fun also
+            // repeats its name (`fun F(1) -> a; F(N) -> b end`).
+            if matches!(self.peek(), Some(Tok::Var(_))) && self.is_punct_at(1, "(") {
+                self.pos += 2;
+            } else {
+                self.expect_punct("(")?;
+            }
         }
         self.expect_atom("end")?;
         Ok(clauses)
