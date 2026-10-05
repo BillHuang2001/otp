@@ -358,6 +358,7 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
 - `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
+- `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
