@@ -81,9 +81,13 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - Licensing: Apache-2.0 (matches OTP); deps Apache-2.0/MIT only.
 
 ## Notes for Agents
-- `cargo build --workspace` / `cargo test --workspace` are the iteration commands (mold linker,
-  `opt-level=1` dev, deps at `opt-level=2`). Do **not** run full external suites on every change —
-  reserve them for milestones.
+- `cargo build --workspace` / `cargo test --workspace` are the iteration commands (lld linker in a bare
+  container, mold in the Nix devShell; `opt-level=1` dev, deps at `opt-level=2`).
+- **Read-only `$HOME` in this sandbox:** cargo's default `CARGO_HOME` (`$HOME/.cargo`) is unwritable, so
+  builds MUST set a writable one. Use the committed wrapper: `scripts/cargo.sh build --workspace`
+  (it selects `$HOME/.cache/cargo-home`, falling back to `$TMPDIR/cargo-home`), or export
+  `CARGO_HOME=/home/bill/.cache/cargo-home` before invoking `cargo`. The cache is shared across worktrees.
+- Do **not** run full external suites on every change — reserve them for milestones.
 - The oracle runtime is the system Erlang (`ERTS_ORACLE` in the flake; `erl` on `PATH`, OTP 29/erts-17.1).
 - Benchmark/test targets are the configured foreign repos: Cowboy, Khepri, EMQX, Elixir,
   Programming-Language-Benchmarks. Investigate them read-only; write through the task's tracked worktrees.
