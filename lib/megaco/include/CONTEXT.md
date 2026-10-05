@@ -27,7 +27,7 @@ The exact exported set is `EXTERNAL_HRL_FILES` in `../src/app/modules.mk` (all 5
 
 ## Notes for Agents
 - Do not enumerate/edit fields in the `megaco_message_v*.hrl` files by hand — treat them as generated and adjust `../src/binary/MEDIA-GATEWAY-CONTROL-v*.asn` instead.
-- `megaco_sdp.hrl` is consumed only by `../src/engine/megaco_sdp.erl`; the ASN.1 message headers are consumed per-version by the matching transformer/encoder/parser modules and the test suites.
+- `megaco_sdp.hrl` has exactly two in-tree consumers: `../src/engine/megaco_sdp.erl` and `../test/megaco_sdp_SUITE.erl` (`test/` is a sibling directory — read-only from this node).
 - Cross-reference `../src/binary/` (read-only sibling): it holds the `.asn` specs and the generated codec modules these headers mirror; escalate any needed change there to the parent node.
 
 ## Routing Table
