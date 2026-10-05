@@ -30,23 +30,28 @@
 //! * A **non-float operand** or a **non-finite result** (including division by
 //!   zero — `x/0.0` is `inf` or, for `0.0/0.0`, `NaN`) is the instruction's
 //!   *arithmetic failure*: with a live `fail` label it becomes a guard branch
-//!   ([`Step::Goto`]), otherwise it propagates [`BeamError::BadArith`] — the typed
-//!   `badarith` the C `$BADARITH0` raise produces. The compiler only ever emits
-//!   `NO_FAIL` for these opcodes (verified with `beam_disasm` against the oracle),
-//!   so the live-label branch is engine-side robustness, exactly like `GcBif`.
+//!   ([`Step::Goto`]); with `NO_FAIL` it is the `badarith` **raise**. C's
+//!   `$BADARITH0` (`emu/macros.tab:285-288`) sets `c_p->freason = BADARITH` and
+//!   goes `goto find_func_info` → `handle_error` → `next_catch`
+//!   (`../../erts/emulator/beam/beam_common.c`), so a live `try`/`catch`
+//!   **catches it**. The engine routes it through [`Machine::throw_error`] (see
+//!   [`raise_badarith`]), landing in a live catch frame or propagating a typed
+//!   [`BeamError::BadArith`]. The compiler only ever emits `NO_FAIL` for these
+//!   opcodes (verified with `beam_disasm` against the oracle), so the live-label
+//!   branch is engine-side robustness, exactly like `GcBif`.
 //! * `Fconv` carries **no** fail label: a non-numeric source always raises
-//!   [`BeamError::BadArith`]. A *bignum* source is a documented M1 coverage gap (no
-//!   safe wide-integer → `f64` conversion exists yet) and yields a typed
-//!   [`crate::error::unsupported`].
+//!   `badarith` through the same catch machinery. A *bignum* source is a documented
+//!   M1 coverage gap (no safe wide-integer → `f64` conversion exists yet) and
+//!   yields a typed [`crate::error::unsupported`].
 //! * An operand the shared seam cannot evaluate (out-of-range register, unsupported
 //!   operand kind) propagates unchanged — that is a malformed/unsupported program,
 //!   not a value error, and must not be masked as `badarith`.
 
 use std::collections::BTreeMap;
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
-use beam_term::{is_small, signed_value, Eterm};
+use beam_term::{is_small, make_atom, signed_value, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -85,7 +90,15 @@ pub(crate) fn exec(
         // `fconv Src Dst` — integer/float → float register. No fail label.
         Instr::Fconv { src, dst } => {
             let source = read_value(machine, module, src)?;
-            let value = conv_to_float(ctx, source)?;
+            let value = match conv_to_float(ctx, source) {
+                Ok(value) => value,
+                // A non-numeric source is the `$BADARITH0` raise; `fconv` has no
+                // fail label, so it goes through the catch machinery.
+                Err(BeamError::BadArith) => return raise_badarith(machine, module).map(Some),
+                // Everything else (the bignum coverage gap, a structural operand
+                // error) is not a `badarith` value error and propagates unchanged.
+                Err(other) => return Err(other),
+            };
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
@@ -160,7 +173,7 @@ pub(crate) fn exec(
             let source = read_value(machine, module, src)?;
             let value = match float_value(source) {
                 Ok(x) => x,
-                Err(_) => return arithmetic_failure(labels, *fail),
+                Err(_) => return arithmetic_failure(machine, module, labels, *fail),
             };
             let negated = make_float(ctx, -value)?;
             write_operand(machine, dst, negated)?;
@@ -193,31 +206,70 @@ fn binary(
         // A non-float FR slot is the documented arithmetic failure. A structurally
         // malformed program is a different error and was already propagated by the
         // `?` above.
-        _ => return arithmetic_failure(labels, fail),
+        _ => return arithmetic_failure(machine, module, labels, fail),
     };
     let result = op(x, y);
     if !result.is_finite() {
-        return arithmetic_failure(labels, fail);
+        return arithmetic_failure(machine, module, labels, fail);
     }
     let value = make_float(ctx, result)?;
     write_operand(machine, dst, value)?;
     Ok(Some(Step::Next))
 }
 
-/// The arithmetic-failure outcome: the `fail`-label branch, or the `badarith` raise.
+/// The arithmetic-failure outcome: the `fail`-label branch, or the `badarith`
+/// raise.
 ///
 /// Mirrors `FAIL_HEAD_OR_BODY`/`$BADARITH0` (`emu/macros.tab:266-288`): a live label
 /// makes the failure a guard failure (`Step::Goto`); `NO_FAIL` makes it the
-/// `badarith` raise.
-fn arithmetic_failure(labels: &BTreeMap<Label, (u32, u32)>, fail: Label) -> Result<Option<Step>> {
+/// `badarith` **raise**, which C reaches through `goto find_func_info` →
+/// `handle_error` → `next_catch` and so a live `try`/`catch` catches. The engine's
+/// equivalent entry point is [`raise_badarith`].
+fn arithmetic_failure(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    fail: Label,
+) -> Result<Option<Step>> {
     if fail == NO_FAIL {
-        return Err(BeamError::BadArith);
+        return raise_badarith(machine, module).map(Some);
     }
     let (func, pc) = labels
         .get(&fail)
         .copied()
         .ok_or_else(|| error::unknown_label(fail))?;
     Ok(Some(Step::Goto { func, pc }))
+}
+
+/// Raise the `badarith` semantic error through the machine, landing it in a live
+/// catch frame (or a typed [`BeamError::BadArith`] when there is none).
+///
+/// C's `$BADARITH0()` (`emu/macros.tab:285-288`) sets `c_p->freason = BADARITH`
+/// and goes `goto find_func_info`, i.e. through `handle_error` → `next_catch`
+/// (`../../erts/emulator/beam/beam_common.c:580-679`), so the raise **is
+/// catchable** by an enclosing `try`/`catch`. The engine's raise/unwind entry
+/// point is [`Machine::throw_error`], with the reason atom `badarith` resolved
+/// from the running module's atom table (the engine never invents an atom the
+/// module cannot name).
+///
+/// A module whose atom table lacks `badarith` cannot name the reason, so the typed
+/// [`BeamError::BadArith`] is returned instead — never a substituted, wrong atom.
+/// With **no live catch frame** the raise cannot land, so it likewise propagates
+/// unchanged as the typed [`BeamError::BadArith`] (the same uncaught-error contract
+/// the interpreter's `raise_bif_error` follows). The `error` class atom is installed
+/// when the module has it, which is what a landing places in `x(3)`.
+fn raise_badarith(machine: &mut Machine, module: &Module) -> Result<Step> {
+    if machine.catch_frame_depth() == 0 {
+        return Err(BeamError::BadArith);
+    }
+    let atom = module
+        .atom_table
+        .lookup("badarith")
+        .ok_or(BeamError::BadArith)?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(make_atom(atom))
 }
 
 /// `fconv`: a small integer or a float → the boxed float for `Dst`.
@@ -265,10 +317,21 @@ mod tests {
     use beam_term::{make_atom, make_small, Atom, NIL};
 
     use crate::context::MinimalContext;
+    use crate::machine::CatchFrame;
 
     /// An empty label map (only the tests that exercise a `fail` target build one).
     fn no_labels() -> BTreeMap<Label, (u32, u32)> {
         BTreeMap::new()
+    }
+
+    /// A module whose atom table holds the two atoms a `badarith` landing needs
+    /// (`badarith` and the `error` class), so `raise_badarith` can name the raise.
+    fn module_with_raise_atoms() -> Module {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern("m");
+        module.atom_table.intern("error");
+        module.atom_table.intern("badarith");
+        module
     }
 
     /// Dispatch one instruction through the family with an empty module.
@@ -607,6 +670,115 @@ mod tests {
         );
     }
 
+    // -- catchability of the `badarith` raise ---------------------------------
+
+    #[test]
+    fn a_fconv_badarith_with_no_fail_label_lands_in_a_live_catch_frame() {
+        // `fconv` has no fail label; a non-numeric source is the `$BADARITH0` raise
+        // (`emu/float_instrs.tab:38-52`), which C takes through `next_catch`. With a
+        // live `try` frame the engine must land it in the handler, not propagate.
+        let module = module_with_raise_atoms();
+        let badarith = module.atom_table.lookup("badarith").expect("interned");
+        let error = module.atom_table.lookup("error").expect("interned");
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        // Frame 0 (the bottom frame) "owns" the handler at (func 4, pc 6).
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+
+        // `fconv` on an atom (a non-number) raises `badarith`.
+        machine.set_x(0, make_atom(Atom::from_raw(1))).unwrap();
+        let instr = Instr::Fconv {
+            src: Operand::X(0),
+            dst: Operand::FloatReg(0),
+        };
+        let step = exec(&mut machine, &module, &no_labels(), &instr, 0, 0, &mut ctx).unwrap();
+        assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+
+        // The C landing convention (beam_common.c:535-544): x0 = THE_NON_VALUE,
+        // x1 = the reason (`badarith`), x3 = the exception class (`error`).
+        assert_eq!(machine.x(0), Some(Eterm::non_value()));
+        assert_eq!(machine.x(1), Some(make_atom(badarith)));
+        assert_eq!(machine.x(3), Some(make_atom(error)));
+        // The raise consults the innermost entry but does not pop it.
+        assert_eq!(machine.catch_frame_depth(), 1);
+    }
+
+    #[test]
+    fn a_non_finite_binary_result_lands_in_a_live_catch_frame() {
+        // The other half of the family: a *non-finite* `f*` result
+        // (`$FLOAT_OP`'s finiteness check, no fail label) is the same catchable
+        // `badarith` raise.
+        let module = module_with_raise_atoms();
+        let badarith = module.atom_table.lookup("badarith").expect("interned");
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(2, 1, 0));
+
+        // `f64::MAX * f64::MAX` overflows to `+inf`.
+        machine.set_fr(0, float(&mut ctx, f64::MAX)).unwrap();
+        machine.set_fr(1, float(&mut ctx, f64::MAX)).unwrap();
+        let instr = fmul(
+            NO_FAIL,
+            Operand::FloatReg(0),
+            Operand::FloatReg(1),
+            Operand::FloatReg(2),
+        );
+        let step = exec(&mut machine, &module, &no_labels(), &instr, 0, 0, &mut ctx).unwrap();
+        assert_eq!(step, Some(Step::Goto { func: 2, pc: 1 }));
+        assert_eq!(machine.x(1), Some(make_atom(badarith)));
+    }
+
+    #[test]
+    fn a_badarith_without_a_catch_frame_is_the_typed_error() {
+        // No live frame: the raise cannot land, so it propagates unchanged as the
+        // typed `BeamError::BadArith` (the uncaught-error contract).
+        let module = module_with_raise_atoms();
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.set_x(0, make_atom(Atom::from_raw(1))).unwrap();
+        let instr = Instr::Fconv {
+            src: Operand::X(0),
+            dst: Operand::FloatReg(0),
+        };
+        assert!(matches!(
+            exec(&mut machine, &module, &no_labels(), &instr, 0, 0, &mut ctx),
+            Err(BeamError::BadArith)
+        ));
+        assert_eq!(machine.catch_frame_depth(), 0);
+    }
+
+    #[test]
+    fn a_live_fail_label_still_branches_instead_of_raising() {
+        // The guard/`FAIL` path is unchanged: with a live label the arithmetic
+        // failure is a branch (`Step::Goto`), even where a catch frame is live and
+        // the atoms for a landing exist — no exception is raised or made pending.
+        let module = module_with_raise_atoms();
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+        machine.set_fr(0, float(&mut ctx, 1.0)).unwrap();
+        machine.set_fr(1, float(&mut ctx, 0.0)).unwrap();
+
+        let mut labels = BTreeMap::new();
+        labels.insert(Label(7), (2u32, 9u32));
+        let instr = fdiv(
+            Label(7),
+            Operand::FloatReg(0),
+            Operand::FloatReg(1),
+            Operand::FloatReg(0),
+        );
+        assert_eq!(
+            exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap(),
+            Some(Step::Goto { func: 2, pc: 9 })
+        );
+        assert_eq!(machine.catch_frame_depth(), 1);
+        assert_eq!(machine.pending_exception(), None);
+    }
     // -- fnegate --------------------------------------------------------------
 
     #[test]

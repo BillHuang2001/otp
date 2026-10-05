@@ -54,10 +54,12 @@
 //! `<<>>` input takes the no-match clause (`bs_set_position`/`bs_get_tail`) and is
 //! fully supported.
 //!
-//! `safe_div([], B)` documents a third behaviour: an error raised by an instruction
-//! *family* (`fconv`'s `badarith`) propagates straight out as the typed `BadArith`
-//! rather than landing in the live `try` frame (only the core BIF/`call_ext` error
-//! path goes through the catch-frame landing).
+//! `safe_div([], B)` documents the family-raise path: `fconv`'s non-numeric source
+//! raises `badarith` **through the catch machinery** (`$BADARITH0` → `next_catch`,
+//! the engine's [`Machine::throw_error`](beam_engine::Machine)), so it lands in the
+//! live `try` frame and the catch clause yields `{error, badarith}` — exactly the
+//! oracle value. `safe_div(1, 0.0)` exercises the same path from `fdiv` (a
+//! non-finite quotient, again with no fail label).
 //!
 //! The module has no `receive`, no records and no message opcodes, so those families
 //! are simply absent from its IR (not "unsupported").
@@ -616,22 +618,52 @@ fn safe_div_zero_divisor_returns_the_literal_error_tuple() {
 }
 
 #[test]
-fn safe_div_badarith_from_fconv_propagates_as_a_typed_error() {
-    // coverage:safe_div([], 2) = {error,badarith} in the oracle: `fconv` on a
-    // non-number raises `badarith`, which the oracle's `try` handler catches.
-    //
-    // The M1 interpreter routes only the *core* BIF/`call_ext` error paths through
-    // `raise_bif_error` into the live catch frame; an error raised by an
-    // instruction family (`conv_to_float`'s `Err(BeamError::BadArith)`) propagates
-    // straight out of the run via the family-dispatch `?`. So the catch clause — and
-    // its `Move { src: Operand::Literal({error,badarith}) }` — is never reached, and
-    // the observable result is the typed `badarith` error.
+fn safe_div_badarith_from_fconv_lands_in_the_catch_clause() {
+    // coverage:safe_div([], 2) = {error,badarith} (system ERTS, OTP 29.1.1 /
+    // erts-17.1). `is_eq_exact x1 = 0` fails (2 =/= 0), so the `try` body runs:
+    // `fconv x0 -> fr0` on the non-number `[]` raises `badarith` with no fail label
+    // (`$BADARITH0` → `find_func_info` → `next_catch`), landing in the live catch
+    // frame at label 21. The handler matches `error:badarith` and yields the literal
+    // `{error,badarith}`.
     let module = load();
     let mut ctx = CoverageCtx::new();
-    let result = run(&mut ctx, &module, "safe_div", &[beam_term::NIL, make_small(2)]);
-    assert!(
-        matches!(result, Err(BeamError::BadArith)),
-        "expected the typed BadArith, got {result:?}"
+    let result = run(
+        &mut ctx,
+        &module,
+        "safe_div",
+        &[beam_term::NIL, make_small(2)],
+    );
+    assert_tuple(
+        &mut ctx,
+        &module,
+        result,
+        &[
+            make_atom(atom(&module, "error")),
+            make_atom(atom(&module, "badarith")),
+        ],
+    );
+}
+
+#[test]
+fn safe_div_badarith_from_a_non_finite_fdiv_lands_in_the_catch_clause() {
+    // coverage:safe_div(1, 0.0) = {error,badarith} (system ERTS). A *float* divisor
+    // is not `=:= 0`, so the `try` body runs: both `fconv`s succeed, then
+    // `fdiv 1.0/0.0` overflows to `+inf`, the `$FLOAT_OP` finiteness check fails with
+    // no fail label, and the `badarith` raise lands in the catch clause — the float
+    // family's non-finite path, catchable exactly as C's `$BADARITH0` is.
+    let module = load();
+    let mut ctx = CoverageCtx::new();
+    let one = terms::make_float(&mut ctx, 1.0).expect("a float");
+    let zero = terms::make_float(&mut ctx, 0.0).expect("a float");
+    let result = run(&mut ctx, &module, "safe_div", &[one, zero]);
+    assert_tuple(
+        &mut ctx,
+        &module,
+        result,
+        &[
+            make_atom(atom(&module, "error")),
+            make_atom(atom(&module, "badarith")),
+        ],
     );
 }
 
