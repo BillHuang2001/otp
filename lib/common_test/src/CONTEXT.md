@@ -101,8 +101,8 @@ The `test_server*` modules are the historical core of the framework and keep the
 
 ### (i) Optional feature integrations
 - `ct_cover.erl` — integration with the `cover` tool: `get_spec/1, add_nodes/1, remove_nodes/1, cross_cover_analyse/2`; driven from `ct_run`/`test_server_ctrl:cover*`.
-- `ct_property_test.erl` — support for QuickCheck-style property tests in suites (`init_per_suite/1, quickcheck/2,3,4, init_tool/1, present_result/4, title/1, print_frequency...`); requires a property-testing tool (Quviq QuickCheck or `proper`), so it is opt-in.
-- `ct_doctest.erl` — runs doctests (shell-style `N>` blocks) found in module documentation or in files; `module/1,2,3, file/1,2,3, ...`.
+- `ct_property_test.erl` — support for QuickCheck-style property tests in suites (`init_per_suite/1, init_tool/1, quickcheck/2` plus result helpers `present_result/4,5, title/2,3, sequential_parallel/1, cmnd_names/1, num_calls/1`); requires a property-testing tool (Quviq QuickCheck or `proper`), so it is opt-in.
+- `ct_doctest.erl` — runs doctests (shell-style `N>` blocks) found in module documentation or in files: `module/1,2,3`, `file/1,2,3`.
 - `ct_release_test.erl` — framework for testing release upgrade/downgrade of a real OTP release: starts an old OTP under a separate node (`ct_release_test-otp-<vsn>`) and drives `upgrade_init/2, upgrade_upgraded/2, upgrade_downgraded/2` callbacks; exports type `ct_data/0`.
 - `cte_track.erl` — `gen_event` handler tracking CT execution progress (prints/writes a progress log); added via the `{event_handler, {cte_track, []}}` test-spec option.
 
