@@ -82,11 +82,12 @@ Client and server share nearly all code — the role is a state in `#ssh{}` and 
 | `test/` | Common Test suites, support modules, fixtures and spec/cover files (see its CONTEXT.md) |
 | `doc/` | Published documentation sources: app overview, release notes, six guides (see its CONTEXT.md) |
 | `internal_doc/` | Non-published notes — `ssh_notes.md`: mermaid supervision-tree diagrams and the suite-coverage overview |
-| `examples/` | Example code: `ssh_sample_cli.erl` (custom CLI/shell on a daemon) and `ssh_device.erl` (SSH as a device/transport); installed to `<release>/lib/ssh-<vsn>/examples` |
+| `examples/` | Example code: `ssh_sample_cli.erl` (custom CLI/shell on a daemon) and `ssh_device.erl` (SSH as a device/transport); the local `Makefile` has release targets but the directory is not in `SUB_DIRECTORIES`, so it is not built or installed by the app build |
 | `priv/` | Empty (`.gitignore` only) — no runtime data files |
 | `vsn.mk` | `SSH_VSN` — the single source of the app version |
-| `Makefile` | App build driver (`SUB_DIRECTORIES = src doc`, `DIA_PLT_APPS=crypto runtime_tools public_key`) |
-| `subdirs.mk` | Lists nested build subdirs (`src c_src`) consumed by the shared build infrastructure |
+| `Makefile` | App build driver (`SUB_DIRECTORIES = src doc`, `DIA_PLT_APPS=crypto runtime_tools public_key`, `SPECIAL_TARGETS` empty) |
+| `subdirs.mk` | Vestigial: `SUB_DIRS = src c_src`, but nothing includes it (`SUB_DIRECTORIES` is set directly in `Makefile`) and no `c_src` exists |
+| `prebuild.skip` | Lists `src/deps/ssh.d` — generated dependency file excluded from source tarballs by `scripts/build-otp-tar` |
 
 ## See Also
 - `../public_key/`, `../crypto/` — key handling and cryptographic primitives used by the transport layer.
