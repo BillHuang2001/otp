@@ -21,7 +21,7 @@ Part of the release-wide doc build driven from `../../system/doc/`.
 - Only the paths listed in `docs.exs` `extras` get a deterministic position/order; other discovered markdown files still appear (appended), so a new guide should be added to `docs.exs` to keep the reading order right.
 - Module reference pages (`snmp`, `snmpa`, `snmpm`, `snmpc`, …) are generated from `-moduledoc`/`-doc` in `../src/**.erl` — never duplicate API reference text here.
 - Every image (`assets/*.gif`, `src/*.fig`, `src/*.gif`) has a matching `<file>.license` sidecar (SPDX `Apache-2.0`) — a new binary asset must ship one or the license scanner fails.
-- Markdown files carry a `<!-- %CopyrightBegin% ... SPX-License-Identifier: Apache-2.0 ... %CopyrightEnd% -->` header; `Makefile`/`docs.exs` use the `#`-comment form.
+- Markdown files carry a `<!-- %CopyrightBegin% ... SPDX-License-Identifier: Apache-2.0 ... %CopyrightEnd% -->` header; `Makefile`/`docs.exs` use the `#`-comment form.
 - Never hand-edit anything under `specs/` or the generated `html/`, `man*/` output.
 
 ## Design Decisions
