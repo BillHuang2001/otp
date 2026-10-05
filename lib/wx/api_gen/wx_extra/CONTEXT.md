@@ -26,7 +26,7 @@ Erlang side `wx_extra/<Module>.erl`, C side `wx_extra/<Class>.c_src`; `<Module>`
 
 ### 3. `.license` sidecars
 `<file>.license` siblings exist only for files that carry no in-file `%CopyrightBegin%` header: `wxEvtHandler.erl`, `wxEvtHandler.c_src`, `wx_misc.erl`, `wxPrintout.c_src`, `wxXmlResource.c_src`.
-They are read by `../../../scripts/license-header.es` (`scripts/license-header.es` from the repo root) as the header source for that file, only when the file itself has no header.
+They are read by `scripts/license-header.es` (repo root) as the header source for that file, only when the file itself has no header.
 Editing a `.license` file affects the license check only, never code generation.
 
 ## Marker Contract (how the generator consumes these files)
