@@ -328,21 +328,26 @@ module_passes(Opts) ->
 %% These passes all benefit from each other (in roughly this order), so they
 %% are repeated as required.
 repeated_passes(Opts) ->
-    Ps = [?PASS(ssa_opt_live),
-          ?PASS(ssa_opt_sw),
-          ?PASS(ssa_opt_is_between),
-          ?PASS(ssa_opt_ne),
-          ?PASS(ssa_opt_bs_create_bin),
-          ?PASS(ssa_opt_dead),
-          ?PASS(ssa_opt_cse),
-          ?PASS(ssa_opt_tail_phis),
-          ?PASS(ssa_opt_sink),
-          ?PASS(ssa_opt_tuple_size),
-          ?PASS(ssa_opt_merge_updates),
-          ?PASS(ssa_opt_record),
-          ?PASS(ssa_opt_try),
-          ?PASS(ssa_opt_type_continue)],        %Must run after ssa_opt_dead to
+    Ps0 = [?PASS(ssa_opt_live),
+           ?PASS(ssa_opt_sw),
+           ?PASS(ssa_opt_is_between),
+           ?PASS(ssa_opt_ne),
+           ?PASS(ssa_opt_bs_create_bin),
+           ?PASS(ssa_opt_dead),
+           ?PASS(ssa_opt_cse),
+           ?PASS(ssa_opt_tail_phis),
+           ?PASS(ssa_opt_sink),
+           ?PASS(ssa_opt_tuple_size),
+           ?PASS(ssa_opt_merge_updates),
+           ?PASS(ssa_opt_record),
+           ?PASS(ssa_opt_try),
+           ?PASS(ssa_opt_type_continue)],       %Must run after ssa_opt_dead to
                                                 %clean up phi nodes.
+    Ps = case lists:member(fusion_opt, Opts) of
+             true ->
+                 Ps0 ++ [{ssa_opt_fus, fun beam_ssa_fus:ssa_opt_fus/1}];
+             false -> Ps0
+         end,
     passes_1(Ps, Opts).
 
 epilogue_module_passes(Opts) ->
