@@ -109,8 +109,10 @@ Consumers: `erts/lib_src/`, `erts/emulator/` (incl. `beam/sys.h`, `erl_utils.h`,
 
 ## Design Decisions
 - **Why a separate non-public layer at all.** These headers leak implementation detail (raw asm,
-  platform `#defines`, internal struct layouts, `ethr_*` internals). The public surface is
-  `erts/include/` (`erl_driver.h`, `erl_nif.h`) plus the semi-public `erl_int_sizes_config.h` /
+  platform `#defines`, internal struct layouts, `ethr_*` internals). The user-facing public surface is
+  `../../emulator/beam/` (`erl_driver.h`, `erl_nif.h`, `erl_drv_nif.h`, `erl_nif_api_funcs.h`) —
+  those are **not** in this header tree; `../` contributes only the semi-public
+  `erl_int_sizes_config.h` /
   `erl_fixed_size_int_types.h`. This directory makes the "internal only, may change without notice"
   boundary explicit and machine-enforced by directory, not by convention.
 - **Implementation selected by macro-conditional `#include`, not by `-I` order.** `ethread.h:373-410`
