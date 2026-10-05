@@ -42,5 +42,6 @@ The exact exported set is `EXTERNAL_HRL_FILES` in `../src/app/modules.mk` (all 5
 ## See Also
 - `../src/binary/` — ASN.1 specs (`MEDIA-GATEWAY-CONTROL-v*.asn`) and per-encoding codec modules these headers mirror (read-only sibling).
 - `../src/text/` — text encoders/parsers that include the matching `megaco_message_v*.hrl` and `megaco.hrl`.
-- `../src/engine/` — engine, `megaco_sdp.erl` (only consumer of `megaco_sdp.hrl`), `megaco_user.erl`.
+- `../src/engine/` — engine, `megaco_sdp.erl` (one of the two consumers of `megaco_sdp.hrl`), `megaco_user.erl`.
+- `../test/` — `megaco_sdp_SUITE.erl` is the other consumer of `megaco_sdp.hrl` (sibling directory — read-only).
 - `../CONTEXT.md` — megaco application overview.
