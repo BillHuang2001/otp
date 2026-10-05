@@ -1,113 +1,102 @@
-//! Term inspection and boxed sub-term materialization over [`beam_alloc::Heap`].
+//! Thin forwarding layer over [`beam_term::thing`], [`beam_term::tuple`] and
+//! [`beam_term::list`].
 //!
-//! This is the **only** module in the crate allowed to touch raw heap words: the
-//! crate-wide `#![deny(unsafe_code)]` is lifted for it alone (`#[allow(unsafe_code)]`
-//! on the `mod term;` declaration in `lib.rs`), so the crate's entire `unsafe`
-//! surface is one auditable file. `beam_term` marks its accessors
-//! (`is_tuple`, `tuple_element`, `float_val`, `big_val`, …) as `unsafe fn` because
-//! the validity of an `Eterm` is a caller invariant and there is no safe way to
-//! read or write a heap word; the functions here wrap those accessors and turn a
-//! violated invariant into `BeamError::BadArg` instead of undefined behaviour.
+//! The frozen interior layout of a float, a bignum, a flat map and the external
+//! pid/port/ref blocks is owned by [`beam_term`] (the lowest common ancestor for
+//! term operations — workspace `CONTEXT.md` §2, "No duplication across crates").
+//! Every constructor and accessor here therefore only:
 //!
-//! Every layout below is pinned line-by-line to the legacy C ground truth
-//! `erts/emulator/beam/erl_term.h` and `erts/emulator/beam/erl_map.h` (the C is
-//! read, never modified).
+//! 1. checks the documented bounds/type/validity preconditions, mapping a failure
+//!    to a [`beam_common::BeamError`], and
+//! 2. either allocates the block from [`beam_alloc::Heap`] (the `make_*` family) or
+//!    forwards straight to the matching [`beam_term::thing`] accessor (the
+//!    `*_parts` family and the tuple/cons accessors).
 //!
-//! This module is **public but not part of the cross-crate contract**: the
-//! `beam_term` API exposes the layout *predicates* but not the *constructors* for
-//! floats, bignums, flatmaps and the external identifiers. Those belong in
-//! `beam_term` (the lowest common ancestor for term operations, and the crate
-//! that owns the frozen layout); when they land there this module collapses into
-//! thin forwarders — see the crate `CONTEXT.md`, "Known Issues".
+//! All layout arithmetic — header construction, word offsets, digit/slice math —
+//! lives in [`beam_term::thing`]; this module retains only the small guard
+//! constants declared below.
+//!
+//! [`beam_term`]'s accessors are `unsafe fn` because the validity of an `Eterm` is
+//! a caller invariant and there is no safe way to read or write a heap word, so the
+//! crate-wide `#![deny(unsafe_code)]` is lifted for this module alone
+//! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`). The
+//! crate's entire `unsafe` surface is one auditable file: the `beam_alloc`
+//! allocation calls, the `beam_term` forwarders and the minimal type/validity
+//! guards — each carrying a `// SAFETY:` rationale. No `unsafe` here performs
+//! layout work of its own.
+//!
+//! Every error stays [`beam_common::Result`] (via [`crate::error`]); an accessor
+//! never panics and never exhibits undefined behaviour on a mismatched term.
 
 use core::mem::size_of;
 
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    arityval, boxed_val, is_bignum_header, is_boxed, is_external_pid_header,
-    is_external_port_header, is_external_ref_header, is_flatmap_header, is_float, is_list,
-    is_tuple, list_val, make_arityval, make_boxed, make_header, make_tuple, tuple0, tuple_val,
-    Eterm, BIG_SIGN_BIT, CAR_OFFSET, CDR_OFFSET, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG,
-    EXTERNAL_REF_SUBTAG, HEADER_FLONUM, MAP_SUBTAG, NEG_BIG_SUBTAG, POS_BIG_SUBTAG,
+    arityval, boxed_val, is_big, is_external_pid, is_external_port, is_external_ref, is_flatmap,
+    is_float, is_list, is_tuple, Eterm,
 };
+use beam_term::thing;
 
 use crate::error;
 use crate::tag::Tag;
 
-/// Number of bytes in one term word (`size_of::<Eterm>()`).
-const WORD_BYTES: usize = size_of::<Eterm>();
-/// Number of `u32`s that fit in one term word (two on 64-bit).
-const U32_PER_WORD: usize = WORD_BYTES / size_of::<u32>();
 /// `BIG_ARITY_MAX` (`erl_term.h:465-469`, 64-bit `ARCH_64`): the largest bignum
-/// digit count.
+/// digit count [`make_big`] accepts. The bignum layout itself is owned by
+/// [`beam_term::thing`].
 const BIG_ARITY_MAX: usize = (1 << 16) - 1;
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
-/// hashmap above it).
+/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count [`make_flatmap`] and
+/// [`flatmap_parts`] accept (ERTS switches to a hashmap above it). The flat-map
+/// layout itself is owned by [`beam_term::thing`].
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 /// `EXTERNAL_THING_HEAD_SIZE` (`erl_term.h:1161`):
 /// `offsetof(ExternalThing, data) / sizeof(Uint)` — the `[header, node, next]`
-/// head, three words on `ARCH_64`.
+/// head, three words on `ARCH_64`. Only the external-reference validity guard needs
+/// this offset; the identifier layout itself is owned by [`beam_term::thing`].
 const EXTERNAL_THING_HEAD_SIZE: usize = 3;
-/// `EXTERNAL_PORT_HEAP_SIZE` (`erl_term.h:1177`) = the head + one 64-bit data word.
-const EXTERNAL_PORT_HEAP_SIZE: usize = EXTERNAL_THING_HEAD_SIZE + 1;
-/// `EXTERNAL_PID_HEAP_SIZE` (`erl_term.h:1166`) = the head + one 64-bit data word.
-const EXTERNAL_PID_HEAP_SIZE: usize = EXTERNAL_THING_HEAD_SIZE + 1;
+/// Number of `u32`s that fit in one term word (two on 64-bit). Only the
+/// external-reference validity guard needs it; the identifier layout itself is
+/// owned by [`beam_term::thing`].
+const U32_PER_WORD: usize = size_of::<Eterm>() / size_of::<u32>();
+
 /// `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`): the largest external-reference id
 /// count [`make_external_ref`] accepts (and therefore the largest
-/// [`external_ref_parts`] reports).
-pub const MAX_REF_IDS: usize = 5;
-
-// The frozen term layout is the 64-bit `ARCH_64` ABI of the C ground truth:
-// `ErtsDigit` is `Uint` = one `Eterm` word (`big.h:29`) and the
-// external-identifier data union packs two `Uint32`s per word
-// (`erl_term.h:1156`).
-const _: () = assert!(WORD_BYTES == 8, "the frozen term layout assumes ARCH_64");
+/// [`external_ref_parts`] reports). Re-exported from its owner [`beam_term::thing`].
+pub use beam_term::thing::MAX_REF_IDS;
 
 /// Materializes a float term on `heap`.
 ///
-/// Layout pinned to `erl_term.h:479` (`HEADER_FLONUM = make_header(1, FLOAT_SUBTAG)`)
-/// and `erl_term.h:506` (`PUT_DOUBLE`): the two words `[HEADER_FLONUM, f64 bits]`,
-/// with the root word `make_boxed(hp)` pointing at the first of them.
+/// The `[HEADER_FLONUM, f64 bits]` layout and the root word are written by
+/// [`beam_term::thing::write_float`].
 pub fn make_float(heap: &mut Heap, value: f64) -> Result<Eterm> {
-    // SAFETY: `alloc_words(2)` returned two exclusively-owned, writable words.
-    let hp = unsafe { heap.alloc_words(2)? };
-    // SAFETY: `hp` owns exactly those two words; both are written before use.
-    unsafe {
-        *hp = HEADER_FLONUM;
-        *hp.add(1) = Eterm::from_raw(value.to_bits() as usize);
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `alloc_words` returned `thing::FLOAT_SIZE_WORDS` exclusively-owned,
+    // writable words.
+    let hp = unsafe { heap.alloc_words(thing::FLOAT_SIZE_WORDS)? };
+    // SAFETY: `hp` owns exactly those words, which `write_float` fully initialises.
+    Ok(unsafe { thing::write_float(hp, value) })
 }
 
 /// Reads the value of a float term.
 ///
-/// Inverse of [`make_float`]: yields the `f64` stored in the word following the
-/// float header (`erl_term.h:479`, `erl_term.h:506`). A term that is not a float
+/// Delegates to [`beam_term::thing::float_value`]. A term that is not a float
 /// yields `BeamError::BadArg`.
 pub fn float_value(term: Eterm) -> Result<f64> {
-    // `is_float(x)` is `is_boxed(x) && *boxed_val(x) == HEADER_FLONUM`
-    // (`erl_term.h:484`); it reads only the header word.
-    // SAFETY: `is_float` dereferences the header word of a boxed term, which is the
-    // caller invariant for any `Eterm` (a term is always a valid value).
+    // SAFETY: `is_float` reads only the header word of a boxed term, which is the
+    // caller invariant for any `Eterm`.
     if !unsafe { is_float(term) } {
         return Err(error::bad_arg());
     }
-    // SAFETY: `is_float` established that `term` is boxed with header
-    // `HEADER_FLONUM`, i.e. the `[HEADER_FLONUM, bits]` block, so word `1` is a
-    // live, initialised word.
-    let bits = unsafe { (*boxed_val(term).add(1)).raw() as u64 };
-    Ok(f64::from_bits(bits))
+    // SAFETY: `is_float` established that `term` is a live boxed float, the exact
+    // invariant `thing::float_value` documents.
+    Ok(unsafe { thing::float_value(term) })
 }
 
 /// Materializes a bignum term on `heap`.
 ///
-/// `digits` are `ErtsDigit`s (`big.h:29`: `typedef Uint ErtsDigit`, i.e. exactly one
+/// `digits` are `ErtsDigit`s (`big.h:29`: `typedef Uint ErtsDigit`, exactly one
 /// machine word — `u64` on `ARCH_64`), **least significant first**; `negative` sets
-/// the header's `_BIG_SIGN_BIT`. Layout pinned to `erl_term.h:452-471` and
-/// `big.h:68-73,96-97`: one digit per word and `BIG_NEED_SIZE(n) = n + 1` words, i.e.
-/// `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1), d0 … d(n-1)]`, with
-/// the root word `make_boxed(hp)`.
+/// the header's `_BIG_SIGN_BIT`. The `[header, d0 … d(n-1)]` layout is written by
+/// [`beam_term::thing::write_big`].
 ///
 /// An empty `digits` is an illegal zero-width bignum (`external.c:4474-4486` strips
 /// the leading zeroes precisely to avoid building one) and yields
@@ -121,64 +110,35 @@ pub fn make_big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Result<Eterm
     if n > BIG_ARITY_MAX {
         return Err(error::system_limit());
     }
-    // `BIG_NEED_SIZE(n) = n + 1` (`big.h:97`): the header word plus one word per
-    // `ErtsDigit`.
-    let words = 1 + n;
-    // SAFETY: `alloc_words(words)` returned `words` exclusively-owned, writable words.
-    let hp = unsafe { heap.alloc_words(words)? };
-    let subtag = if negative {
-        NEG_BIG_SUBTAG
-    } else {
-        POS_BIG_SUBTAG
-    };
-    // SAFETY: `hp` owns `words = 1 + n` words; word `0` receives the bignum header
-    // (arity `n - 1`) and words `1..=n` receive the digits in least-significant-first
-    // order (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`, `big.h:68`).
-    unsafe {
-        *hp = make_header(n - 1, subtag);
-        for (i, &digit) in digits.iter().enumerate() {
-            *hp.add(1 + i) = Eterm::from_raw(digit as usize);
-        }
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `alloc_words` returned `thing::big_size_words(n)` exclusively-owned,
+    // writable words.
+    let hp = unsafe { heap.alloc_words(thing::big_size_words(n))? };
+    // SAFETY: `hp` owns `big_size_words(n)` words and `digits` is non-empty, the
+    // preconditions `write_big` documents.
+    Ok(unsafe { thing::write_big(hp, negative, digits) })
 }
 
 /// Splits a bignum term into `(negative, digits)`.
 ///
 /// `digits` are `ErtsDigit`s (`u64`), least significant first, borrowed from the
-/// term's storage (the caller must keep the owning heap alive) — the exact inverse of
-/// [`make_big`] (`big.h:59-73`: `BIG_V(xp) = (ErtsDigit *)((xp) + 1)`,
-/// `BIG_ARITY(xp) = bignum_header_arity(*xp)`; the sign lives in the header's
-/// `_BIG_SIGN_BIT`). A term that is not a bignum yields `BeamError::BadArg`.
+/// term's storage (the caller must keep the owning heap alive). Delegates to
+/// [`beam_term::thing::big_parts`]. A term that is not a bignum yields
+/// `BeamError::BadArg`.
 pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u64])> {
-    if !is_boxed(term) {
+    // SAFETY: `is_big` reads only the header word of a boxed term (the caller
+    // invariant for any `Eterm`).
+    if !unsafe { is_big(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
-    // SAFETY: `is_boxed(term)` means `p` is a live header-word pointer (the caller
-    // invariant for any `Eterm`); the predicate reads that one word only.
-    let hdr = unsafe { *p };
-    if !is_bignum_header(hdr) {
-        return Err(error::bad_arg());
-    }
-    // The header arity is `n - 1` (`make_bignum_header(n-1)`, `erl_term.h:452-453`).
-    let n = arityval(hdr) + 1;
-    // SAFETY: the header encodes the digit count `n` and `make_big` stored the `n`
-    // one-word `ErtsDigit`s starting at word one of the block, so the slice is live and
-    // in bounds; the caller keeps the owning heap alive for `'a`.
-    let digits = unsafe { core::slice::from_raw_parts(p.add(1).cast::<u64>(), n) };
-    Ok(((hdr.raw() & BIG_SIGN_BIT) != 0, digits))
+    // SAFETY: `is_big` established that `term` is a live bignum; the caller keeps the
+    // owning heap alive for `'a`.
+    Ok(unsafe { thing::big_parts(term) })
 }
 
 /// Materializes a small flat map on `heap`.
 ///
-/// Layout pinned to `erl_map.h:181-199` (`MAP_HEADER_FLATMAP = 0x12C`, i.e.
-/// `_make_header(4, MAP_SUBTAG)`) and `erl_map.c:673-700`: the word block
-/// `[arityval(n), k0 … k(n-1), MAP_HEADER_FLATMAP, n, keys, v0 … v(n-1)]`, where
-/// `keys = make_tuple(hp)` is emitted **before** the head, the flatmap head sits
-/// at word `1 + n`, the `size` field is the raw integer `n`, and the root is
-/// `make_boxed(hp + 1 + n)`. `n == 0` is the 3-word block
-/// `[MAP_HEADER_FLATMAP, 0, tuple0()]`.
+/// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout (and the
+/// 3-word empty block) is written by [`beam_term::thing::write_flatmap`].
 ///
 /// More than `MAP_SMALL_MAP_LIMIT` (32) pairs needs the HAMT builder and yields
 /// [`crate::error::unsupported`].
@@ -190,101 +150,51 @@ pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> 
     // NOTE: duplicate keys are **not** detected in Milestone 1 — that needs term
     // comparison (owned by `beam_term`/`beam_ets`), so the wire order is preserved
     // as-is (see the crate `CONTEXT.md`, "Known Issues").
-    if n == 0 {
-        // SAFETY: `alloc_words(3)` returned three exclusively-owned, writable words.
-        let hp = unsafe { heap.alloc_words(3)? };
-        // SAFETY: `hp` owns exactly those three words; all are written before use.
-        unsafe {
-            *hp = make_header(4, MAP_SUBTAG);
-            *hp.add(1) = Eterm::from_raw(0);
-            *hp.add(2) = tuple0();
-        }
-        return Ok(make_boxed(hp));
-    }
-    // SAFETY: `alloc_words(4 + 2n)` returned `4 + 2n` exclusively-owned, writable
-    // words.
-    let hp = unsafe { heap.alloc_words(4 + 2 * n)? };
-    // SAFETY: `hp` owns `4 + 2n` words. The keys tuple occupies `hp[0..=n]`, the
-    // flatmap head prefix `[head, size, keys]` occupies `hp[1+n..=3+n]`, and the
-    // values occupy `hp[4+n..4+2n]` — every write below is in bounds.
-    let root = unsafe {
-        *hp = make_arityval(n);
-        for i in 0..n {
-            *hp.add(1 + i) = pairs[i].0;
-        }
-        *hp.add(1 + n) = make_header(4, MAP_SUBTAG);
-        *hp.add(2 + n) = Eterm::from_raw(n);
-        *hp.add(3 + n) = make_tuple(hp);
-        for j in 0..n {
-            *hp.add(4 + n + j) = pairs[j].1;
-        }
-        hp.add(1 + n)
-    };
-    Ok(make_boxed(root))
+    // SAFETY: `alloc_words` returned `thing::flatmap_size_words(n)` exclusively-owned,
+    // writable words.
+    let hp = unsafe { heap.alloc_words(thing::flatmap_size_words(n))? };
+    // SAFETY: `hp` owns `flatmap_size_words(n)` words and `n <= MAP_SMALL_MAP_LIMIT`,
+    // the preconditions `write_flatmap` documents.
+    Ok(unsafe { thing::write_flatmap(hp, pairs) })
 }
 
 /// Splits a flat map into its `(keys, values)`.
 ///
 /// Both slices are borrowed from the term's storage (the caller must keep the
-/// owning heap alive) and have the same length, in wire order — the exact inverse
-/// of [`make_flatmap`] (`erl_map.h:181-199`). A term that is not a *flat* map (or
-/// is a hashmap) yields `BeamError::BadArg`.
+/// owning heap alive), have the same length and are in wire order. Delegates to
+/// [`beam_term::thing::flatmap_parts`]. A term that is not a *flat* map (or is a
+/// hashmap) yields `BeamError::BadArg`.
 pub fn flatmap_parts<'a>(term: Eterm) -> Result<(&'a [Eterm], &'a [Eterm])> {
-    if !is_boxed(term) {
+    // SAFETY: `is_flatmap` reads only the header word of a boxed term (the caller
+    // invariant for any `Eterm`).
+    if !unsafe { is_flatmap(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
-    // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
-    // the predicate reads that one word only.
-    let hdr = unsafe { *p };
-    // The flatmap head is `MAP_HEADER_FLATMAP`; a hashmap head (or any other header)
-    // is rejected.
-    if !is_flatmap_header(hdr) {
-        return Err(error::bad_arg());
-    }
-    // The root points at the flatmap head (`flatmap_t`): `[head, size, keys]`,
-    // followed by the values (`erl_map.h:57-61`, `flatmap_get_*`). Word `1` is the
-    // raw pair count `n`.
-    // SAFETY: the head prefix `[head, size, keys]` is live and initialised by
-    // `make_flatmap`, so word `1` is a valid readable word.
-    let n = unsafe { (*p.add(1)).raw() };
-    // A well-formed flatmap never exceeds `MAP_SMALL_MAP_LIMIT` pairs; a larger `n`
-    // means a corrupt/mismatched block, so reject it before building any slice.
+    // A well-formed flatmap never exceeds `MAP_SMALL_MAP_LIMIT` pairs. The root
+    // points at the `[head, size, keys]` prefix, so word `1` is the raw pair count; a
+    // larger value means a corrupt/mismatched block and is rejected before any slice
+    // is built.
+    // SAFETY: `is_flatmap` established that `term` is a live flat map, so word `1` of
+    // its head prefix is a live, initialised word.
+    let n = unsafe { (*boxed_val(term).add(1)).raw() };
     if n > MAP_SMALL_MAP_LIMIT {
         return Err(error::bad_arg());
     }
-    if n == 0 {
-        return Ok((&[], &[]));
-    }
-    // SAFETY: a well-formed flatmap block owns `4 + 2n` words and the caller keeps
-    // the owning heap alive for `'a`. Relative to the head pointer `p`, the
-    // `flatmap_t` prefix is `[head, size, keys]`, so word `2` is the keys tuple term
-    // and words `3..3+n` are the values — both slices are live and in bounds.
-    let (keys, values) = unsafe {
-        let values = core::slice::from_raw_parts(p.add(3).cast::<Eterm>(), n);
-        let keys_tup = *p.add(2);
-        let keys = core::slice::from_raw_parts(boxed_val(keys_tup).add(1), n);
-        (keys, values)
-    };
-    Ok((keys, values))
+    // SAFETY: `is_flatmap` established that `term` is a live flat map; the caller
+    // keeps the owning heap alive for `'a`.
+    Ok(unsafe { thing::flatmap_parts(term) })
 }
 
 /// Materializes an external pid on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1137-1172` (`ExternalThing`): the three-word head
-/// `[header, node, next]` (`EXTERNAL_THING_HEAD_SIZE`) followed by the 64-bit
-/// `data.pid` union, so `EXTERNAL_PID_HEAP_SIZE = 4` words and the header is
-/// `make_external_pid_header() = make_header(EXTERNAL_PID_HEAP_SIZE - 1, …)`.
-/// `number` and `serial` are the two `Uint32`s of `data.pid` packed into the single
-/// data word (`num` first, then `ser`), exactly as C lays the struct out.
+/// The `[header, node, next, data.pid]` layout is written by
+/// [`beam_term::thing::write_external_pid`]; `number` and `serial` are the two
+/// `Uint32`s of `data.pid` (`num` first, then `ser`).
 ///
-/// **M1 substitution:** in C, `node` is a pointer to a registered node (which carries
-/// the sysname *and* the creation) and `next` is the off-heap link
-/// (`etp->node = erts_find_or_insert_node(sysname, cre, …)`). This crate has no node
-/// registry yet, so word `1` holds the sysname atom term and word `2` — the unused
-/// off-heap-link slot — holds `creation`. The word positions and arity are exactly
-/// C's; only the `node`/`next` pointer semantics are deferred until a node-identity
-/// type exists (see the crate `CONTEXT.md`, "Known Issues").
+/// **M1 substitution:** there is no node registry yet, so the `node` slot holds the
+/// sysname atom term and the unused off-heap-link (`next`) slot holds `creation`;
+/// the word positions and arity are exactly C's (see the crate `CONTEXT.md`,
+/// "Known Issues").
 pub fn make_external_pid(
     heap: &mut Heap,
     node: Eterm,
@@ -292,123 +202,88 @@ pub fn make_external_pid(
     serial: u32,
     creation: u32,
 ) -> Result<Eterm> {
-    // SAFETY: `alloc_words(EXTERNAL_PID_HEAP_SIZE)` returned four exclusively-owned,
-    // writable words.
-    let hp = unsafe { heap.alloc_words(EXTERNAL_PID_HEAP_SIZE)? };
-    // SAFETY: `hp` owns exactly those four words; all are written before use. Word `3`
-    // is the `data.pid = { Uint32 num; Uint32 ser; }` union, so it carries two
-    // native-endian `u32`s and the full 32-bit range of both fields survives.
-    unsafe {
-        *hp = make_header(EXTERNAL_PID_HEAP_SIZE - 1, EXTERNAL_PID_SUBTAG);
-        *hp.add(1) = node;
-        *hp.add(2) = Eterm::from_raw(creation as usize);
-        let data = hp.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
-        *data = number;
-        *data.add(1) = serial;
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `alloc_words` returned `thing::external_pid_size_words()`
+    // exclusively-owned, writable words.
+    let hp = unsafe { heap.alloc_words(thing::external_pid_size_words())? };
+    // SAFETY: `hp` owns exactly those words, which `write_external_pid` fully
+    // initialises.
+    Ok(unsafe { thing::write_external_pid(hp, node, number, serial, creation) })
 }
 
 /// Splits an external pid term into `(node, number, serial, creation)`.
 ///
-/// The exact inverse of [`make_external_pid`] (`erl_term.h:1137-1172`): the data word
-/// is `data.pid = { num, ser }` and `creation` comes from the `next` slot (the M1
-/// substitution described on [`make_external_pid`]). A term that is not an external
-/// pid, or whose header arity is not `EXTERNAL_PID_HEAP_SIZE - 1`, yields
+/// Delegates to [`beam_term::thing::external_pid_parts`]. A term that is not an
+/// external pid, or whose header arity is not `EXTERNAL_PID_HEAP_SIZE - 1`, yields
 /// `BeamError::BadArg`.
 pub fn external_pid_parts(term: Eterm) -> Result<(Eterm, u32, u32, u32)> {
-    if !is_boxed(term) {
+    // SAFETY: `is_external_pid` reads only the header word of a boxed term (the
+    // caller invariant for any `Eterm`).
+    if !unsafe { is_external_pid(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
-    // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
-    // the predicate reads that one word only.
-    let hdr = unsafe { *p };
-    if !is_external_pid_header(hdr) || arityval(hdr) + 1 != EXTERNAL_PID_HEAP_SIZE {
+    // The header arity fixes the block size; a mismatch is a corrupt/mismatched block,
+    // not a valid pid.
+    // SAFETY: `is_external_pid` established that `term` is boxed, so its header word is
+    // a live, initialised term word.
+    if arityval(unsafe { *boxed_val(term) }) + 1 != thing::external_pid_size_words() {
         return Err(error::bad_arg());
     }
-    // SAFETY: the header arity confirms the 4-word `[header, node, creation, data]`
-    // block (`make_external_pid`), so words `1..=3` are live and initialised. The data
-    // word holds two native-endian `u32`s.
-    let (node, number, serial, creation) = unsafe {
-        let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
-        (*p.add(1), *data, *data.add(1), (*p.add(2)).raw() as u32)
-    };
-    Ok((node, number, serial, creation))
+    // SAFETY: the guards established that `term` is a live external pid of the fixed
+    // `external_pid_size_words()` block.
+    Ok(unsafe { thing::external_pid_parts(term) })
 }
 
 /// Materializes an external port on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1137-1183` (`ExternalThing`): the three-word head
-/// `[header, node, next]` followed by the `data.port` union, whose `id` is a `Uint64`
-/// on `ARCH_64` (`erl_term.h:1148-1155`) — so `EXTERNAL_PORT_HEAP_SIZE = 4` words and
-/// the header is
-/// `make_external_port_header() = make_header(EXTERNAL_PORT_HEAP_SIZE - 1, …)`.
-/// The `node`/`next` slots carry the sysname atom and `creation` (the M1 substitution
-/// described on [`make_external_pid`]); `number` is the 64-bit `V4_PORT_EXT` id.
+/// The `[header, node, next, data.port.id]` layout is written by
+/// [`beam_term::thing::write_external_port`]; `number` is the 64-bit `V4_PORT_EXT`
+/// id and the `node`/`next` slots carry the sysname atom and `creation` (the M1
+/// substitution described on [`make_external_pid`]).
 pub fn make_external_port(
     heap: &mut Heap,
     node: Eterm,
     number: u64,
     creation: u32,
 ) -> Result<Eterm> {
-    // SAFETY: `alloc_words(EXTERNAL_PORT_HEAP_SIZE)` returned four exclusively-owned,
-    // writable words.
-    let hp = unsafe { heap.alloc_words(EXTERNAL_PORT_HEAP_SIZE)? };
-    // SAFETY: `hp` owns exactly those four words; all are written before use. Word `3`
-    // is `data.port.id` (`Uint64` on `ARCH_64`), so the full 64-bit id survives.
-    unsafe {
-        *hp = make_header(EXTERNAL_PORT_HEAP_SIZE - 1, EXTERNAL_PORT_SUBTAG);
-        *hp.add(1) = node;
-        *hp.add(2) = Eterm::from_raw(creation as usize);
-        *hp.add(EXTERNAL_THING_HEAD_SIZE) = Eterm::from_raw(number as usize);
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `alloc_words` returned `thing::external_port_size_words()`
+    // exclusively-owned, writable words.
+    let hp = unsafe { heap.alloc_words(thing::external_port_size_words())? };
+    // SAFETY: `hp` owns exactly those words, which `write_external_port` fully
+    // initialises.
+    Ok(unsafe { thing::write_external_port(hp, node, number, creation) })
 }
 
 /// Splits an external port term into `(node, number, creation)`.
 ///
-/// The exact inverse of [`make_external_port`] (`erl_term.h:1137-1183`): the data word
-/// is the 64-bit `data.port.id` and `creation` comes from the `next` slot (the M1
-/// substitution described on [`make_external_pid`]). A term that is not an external
-/// port, or whose header arity is not `EXTERNAL_PORT_HEAP_SIZE - 1`, yields
+/// Delegates to [`beam_term::thing::external_port_parts`]. A term that is not an
+/// external port, or whose header arity is not `EXTERNAL_PORT_HEAP_SIZE - 1`, yields
 /// `BeamError::BadArg`.
 pub fn external_port_parts(term: Eterm) -> Result<(Eterm, u64, u32)> {
-    if !is_boxed(term) {
+    // SAFETY: `is_external_port` reads only the header word of a boxed term (the
+    // caller invariant for any `Eterm`).
+    if !unsafe { is_external_port(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
-    // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
-    // the predicate reads that one word only.
-    let hdr = unsafe { *p };
-    if !is_external_port_header(hdr) || arityval(hdr) + 1 != EXTERNAL_PORT_HEAP_SIZE {
+    // The header arity fixes the block size; a mismatch is a corrupt/mismatched block,
+    // not a valid port.
+    // SAFETY: `is_external_port` established that `term` is boxed, so its header word
+    // is a live, initialised term word.
+    if arityval(unsafe { *boxed_val(term) }) + 1 != thing::external_port_size_words() {
         return Err(error::bad_arg());
     }
-    // SAFETY: the header arity confirms the 4-word `[header, node, creation, id]` block
-    // (`make_external_port`), so words `1..=3` are live and initialised.
-    let (node, number, creation) = unsafe {
-        (
-            *p.add(1),
-            (*p.add(EXTERNAL_THING_HEAD_SIZE)).raw() as u64,
-            (*p.add(2)).raw() as u32,
-        )
-    };
-    Ok((node, number, creation))
+    // SAFETY: the guards established that `term` is a live external port of the fixed
+    // `external_port_size_words()` block.
+    Ok(unsafe { thing::external_port_parts(term) })
 }
 
 /// Materializes an external reference on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1137-1188` (`ExternalThing`,
-/// `make_external_ref_header`) and `bif.c:4810-4848`: the three-word head
-/// `[header, node, next]`, then the `data.ui32` array holding the id **count** first
-/// (`etp->data.ui32[0] = n`, `bif.c:4840`) followed by the `n` ids. With
-/// `DW = n / 2 + 1` (`bif.c:4820`) the data section is `DW` words and
-/// `make_external_ref_header(DW) = make_header(DW + EXTERNAL_THING_HEAD_SIZE - 1, …)`,
-/// i.e. arity `n / 2 + 3` on `ARCH_64` — exactly the C word shape.
-/// `node`/`next` carry the sysname atom and `creation` (the M1 substitution described
-/// on [`make_external_pid`]); `ids` are the 32-bit `NEWER_REFERENCE_EXT` identifier
-/// words (three on a 64-bit node). An empty or over-long `ids` slice (more than
-/// `MAX_REF_IDS`) yields `BeamError::SystemLimit`.
+/// The `[header, node, next, data.ui32]` layout (id **count** first, then the ids) is
+/// written by [`beam_term::thing::write_external_ref`]; the `node`/`next` slots carry
+/// the sysname atom and `creation` (the M1 substitution described on
+/// [`make_external_pid`]) and `ids` are the 32-bit `NEWER_REFERENCE_EXT` identifier
+/// words. An empty or over-long `ids` slice (more than `MAX_REF_IDS`) yields
+/// `BeamError::SystemLimit`.
 pub fn make_external_ref(
     heap: &mut Heap,
     node: Eterm,
@@ -419,130 +294,106 @@ pub fn make_external_ref(
     if n == 0 || n > MAX_REF_IDS {
         return Err(error::system_limit());
     }
-    // `DW = n / sizeof(ErtsDigit) + 1` ref "words" (`bif.c:4818-4835`), i.e. one
-    // word per two `u32`s plus the word that holds the id count.
-    let data_words = n / U32_PER_WORD + 1;
-    let words = EXTERNAL_THING_HEAD_SIZE + data_words;
-    // SAFETY: `alloc_words(words)` returned `words` exclusively-owned, writable words.
-    let hp = unsafe { heap.alloc_words(words)? };
-    // SAFETY: `hp` owns `words = 3 + data_words` words: word `0` is the header (arity
-    // `words - 1`), word `1` is the node, word `2` is the creation, and the `data.ui32`
-    // array starts at word `EXTERNAL_THING_HEAD_SIZE` with `data_words * 2` slots. The
-    // zeroing initialises the whole data section (including the trailing padding slot
-    // of an even id count); the id count and the ids are then written into its front.
-    unsafe {
-        *hp = make_header(words - 1, EXTERNAL_REF_SUBTAG);
-        *hp.add(1) = node;
-        *hp.add(2) = Eterm::from_raw(creation as usize);
-        let data = hp.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
-        core::ptr::write_bytes(data, 0, data_words * U32_PER_WORD);
-        *data = n as u32;
-        core::ptr::copy_nonoverlapping(ids.as_ptr(), data.add(1), n);
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `alloc_words` returned `thing::external_ref_size_words(n)`
+    // exclusively-owned, writable words.
+    let hp = unsafe { heap.alloc_words(thing::external_ref_size_words(n))? };
+    // SAFETY: `hp` owns `external_ref_size_words(n)` words and `1 <= n <= MAX_REF_IDS`,
+    // the preconditions `write_external_ref` documents.
+    Ok(unsafe { thing::write_external_ref(hp, node, ids, creation) })
 }
 
 /// Splits an external reference term into `(node, ids, creation)`.
 ///
 /// `ids` is borrowed from the term's storage (the caller must keep the owning heap
-/// alive) — the exact inverse of [`make_external_ref`] (`erl_term.h:1137-1188`): the
-/// data section starts at word `EXTERNAL_THING_HEAD_SIZE` with the id count as the
-/// first `u32` (`external_ref_no_numbers(x) = external_ref_data(x)[0]`, `ARCH_64`) and
-/// the ids after it, while `creation` comes from the `next` slot (the M1 substitution
-/// described on [`make_external_pid`]). A term that is not an external reference, or
-/// whose id count does not fit its data section, yields `BeamError::BadArg`.
+/// alive). Delegates to [`beam_term::thing::external_ref_parts`]. A term that is not
+/// an external reference, or whose id count does not fit its data section, yields
+/// `BeamError::BadArg`.
 pub fn external_ref_parts<'a>(term: Eterm) -> Result<(Eterm, &'a [u32], u32)> {
-    if !is_boxed(term) {
+    // SAFETY: `is_external_ref` reads only the header word of a boxed term (the
+    // caller invariant for any `Eterm`).
+    if !unsafe { is_external_ref(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
-    // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
-    // the predicate reads that one word only.
-    let hdr = unsafe { *p };
-    if !is_external_ref_header(hdr) {
+    // `data_words` = `arityval(header) + 1 - EXTERNAL_THING_HEAD_SIZE`; a header too
+    // small for the `[header, node, next]` head is corrupt.
+    // SAFETY: `is_external_ref` established that `term` is boxed, so its header word is
+    // a live, initialised term word.
+    let Some(data_words) = arityval(unsafe { *boxed_val(term) })
+        .checked_sub(EXTERNAL_THING_HEAD_SIZE - 1)
+    else {
+        return Err(error::bad_arg());
+    };
+    // The count is self-describing (`external_ref_no_numbers(x) = external_ref_data(x)[0]`),
+    // so it must fit the data section it was read from before any slice is built.
+    // SAFETY: the header arity fixed the block at `EXTERNAL_THING_HEAD_SIZE +
+    // data_words` words, so the `data.ui32` section at word `EXTERNAL_THING_HEAD_SIZE`
+    // is live and its first `u32` is initialised.
+    let n = unsafe { *boxed_val(term).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>() as usize };
+    if n == 0 || n > MAX_REF_IDS || n + 1 > data_words * U32_PER_WORD {
         return Err(error::bad_arg());
     }
-    // `external_thing_data_words`: `arityval(header) + 1 - EXTERNAL_THING_HEAD_SIZE`.
-    let Some(data_words) = arityval(hdr).checked_sub(EXTERNAL_THING_HEAD_SIZE - 1) else {
-        return Err(error::bad_arg());
-    };
-    // SAFETY: the header arity fixes the block size at `EXTERNAL_THING_HEAD_SIZE +
-    // data_words` words, so the data section is live and initialised; word `1` is the
-    // node and word `2` the creation.
-    let (node, ids, creation) = unsafe {
-        let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
-        let n = *data as usize;
-        // The count is self-describing, so it must fit the data section it was read
-        // from before any slice is built.
-        if n == 0 || n > MAX_REF_IDS || n + 1 > data_words * U32_PER_WORD {
-            return Err(error::bad_arg());
-        }
-        (
-            *p.add(1),
-            core::slice::from_raw_parts(data.add(1), n),
-            (*p.add(2)).raw() as u32,
-        )
-    };
-    Ok((node, ids, creation))
+    // SAFETY: the guards established that `term` is a live external reference whose id
+    // count fits its data section; the caller keeps the owning heap alive for `'a`.
+    Ok(unsafe { thing::external_ref_parts(term) })
 }
 
 /// The arity of a tuple term.
 ///
-/// Reads the tuple's arity word — `arityval(hdr)` / `thing_arityval(hdr)`
-/// (`erl_term.h`, the `TAG_PRIMARY_HEADER` arity in the header's high bits). A
-/// term that is not a tuple yields `BeamError::BadArg`.
+/// Delegates to [`beam_term::tuple_size`]. A term that is not a tuple yields
+/// `BeamError::BadArg`.
 pub fn tuple_arity(term: Eterm) -> Result<usize> {
     // SAFETY: `is_tuple` reads only the header word of a boxed term (the caller
     // invariant for any `Eterm`).
     if !unsafe { is_tuple(term) } {
         return Err(error::bad_arg());
     }
-    // SAFETY: `is_tuple` established that `term` is a live tuple whose header is an
-    // arityval, so the arity field is meaningful.
-    Ok(arityval(unsafe { *boxed_val(term) }))
+    // SAFETY: `is_tuple` established that `term` is a live tuple whose header carries
+    // the arity, the precondition `tuple_size` documents.
+    Ok(unsafe { beam_term::tuple_size(term) })
 }
 
 /// The element at `index` of a tuple term, zero-based.
 ///
-/// Index `i` is the heap word `1 + i` after the tuple's arity header
-/// (`erl_term.h`, the tuple `thing` layout). An out-of-range index or a term that
-/// is not a tuple yields `BeamError::BadArg`.
+/// Delegates to [`beam_term::tuple_element`]. An out-of-range index or a term that is
+/// not a tuple yields `BeamError::BadArg`.
 pub fn tuple_element(term: Eterm, index: usize) -> Result<Eterm> {
     let arity = tuple_arity(term)?;
     if index >= arity {
         return Err(error::bad_arg());
     }
     // SAFETY: `tuple_arity` established that `term` is a live tuple of `arity`
-    // elements, so word `1 + index` is a live, initialised element word.
-    Ok(unsafe { *tuple_val(term).add(1 + index) })
+    // elements and `index < arity`, the bounds `tuple_element` requires.
+    Ok(unsafe { beam_term::tuple_element(term, index) })
 }
 
 /// The head (`CAR`) of a cons cell.
 ///
-/// The head is the word at `CAR_OFFSET` (0) of the header-less 2-word cons cell
-/// tagged `TAG_PRIMARY_LIST` (`erl_term.h`; `NIL` is an immediate, not a cons
+/// Delegates to [`beam_term::car`] (`erl_term.h`; `NIL` is an immediate, not a cons
 /// cell, and yields `BeamError::BadArg`).
 pub fn cons_head(term: Eterm) -> Result<Eterm> {
+    // `is_list` reads only the primary tag of the word, never dereferences, so it is
+    // safe for any `Eterm`.
     if !is_list(term) {
         return Err(error::bad_arg());
     }
-    // SAFETY: `is_list` established that `term` is a cons cell (a header-less
-    // 2-word `[CAR, CDR]` block), so the CAR word is live and initialised.
-    Ok(unsafe { *list_val(term).add(CAR_OFFSET) })
+    // SAFETY: `is_list` established that `term` is a header-less 2-word `[CAR, CDR]`
+    // cons cell, the precondition `car` documents.
+    Ok(unsafe { beam_term::car(term) })
 }
 
 /// The tail (`CDR`) of a cons cell.
 ///
-/// The tail is the word at `CDR_OFFSET` (1) of the header-less 2-word cons cell
-/// tagged `TAG_PRIMARY_LIST` (`erl_term.h`; `NIL` is an immediate, not a cons
+/// Delegates to [`beam_term::cdr`] (`erl_term.h`; `NIL` is an immediate, not a cons
 /// cell, and yields `BeamError::BadArg`).
 pub fn cons_tail(term: Eterm) -> Result<Eterm> {
+    // `is_list` reads only the primary tag of the word, never dereferences, so it is
+    // safe for any `Eterm`.
     if !is_list(term) {
         return Err(error::bad_arg());
     }
-    // SAFETY: `is_list` established that `term` is a cons cell (a header-less
-    // 2-word `[CAR, CDR]` block), so the CDR word is live and initialised.
-    Ok(unsafe { *list_val(term).add(CDR_OFFSET) })
+    // SAFETY: `is_list` established that `term` is a header-less 2-word `[CAR, CDR]`
+    // cons cell, the precondition `cdr` documents.
+    Ok(unsafe { beam_term::cdr(term) })
 }
 
 #[cfg(test)]
@@ -557,7 +408,12 @@ mod tests {
 
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
-    use beam_term::prelude::{is_map_header, make_small, NIL};
+    use beam_term::prelude::{
+        is_bignum_header, is_external_pid_header, is_external_port_header,
+        is_external_ref_header, is_flatmap_header, is_map_header, make_arityval, make_header,
+        make_small, make_tuple, tuple0, BIG_SIGN_BIT, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG,
+        EXTERNAL_REF_SUBTAG, HEADER_FLONUM, MAP_SUBTAG, NEG_BIG_SUBTAG, NIL, POS_BIG_SUBTAG,
+    };
 
     use super::*;
     use crate::error::is_unsupported;
@@ -773,13 +629,16 @@ mod tests {
         let node = make_small(7);
         let pid =
             make_external_pid(&mut heap, node, 0xAAAA_BBBB, 0xCCCC_DDDD, 0x1234_5678).expect("fits");
-        assert_eq!(heap.used(), EXTERNAL_PID_HEAP_SIZE);
+        assert_eq!(heap.used(), thing::external_pid_size_words());
 
         // SAFETY: `pid` is the 4-word block this test just wrote; word `3` is the
         // `data.pid = { Uint32 num; Uint32 ser; }` union.
         unsafe {
             let p = boxed_val(pid);
-            assert_eq!(*p, make_header(EXTERNAL_PID_HEAP_SIZE - 1, EXTERNAL_PID_SUBTAG));
+            assert_eq!(
+                *p,
+                make_header(thing::external_pid_size_words() - 1, EXTERNAL_PID_SUBTAG)
+            );
             assert!(is_external_pid_header(*p));
             assert_eq!(*p.add(1), node);
             assert_eq!(
@@ -810,13 +669,16 @@ mod tests {
         let node = make_small(9);
         let port = make_external_port(&mut heap, node, 0x1122_3344_5566_7788, 0x99AA_BBCC)
             .expect("fits");
-        assert_eq!(heap.used(), EXTERNAL_PORT_HEAP_SIZE);
+        assert_eq!(heap.used(), thing::external_port_size_words());
 
         // SAFETY: `port` is the 4-word block this test just wrote; word `3` is the
         // 64-bit `data.port.id` (`ARCH_64`).
         unsafe {
             let p = boxed_val(port);
-            assert_eq!(*p, make_header(EXTERNAL_PORT_HEAP_SIZE - 1, EXTERNAL_PORT_SUBTAG));
+            assert_eq!(
+                *p,
+                make_header(thing::external_port_size_words() - 1, EXTERNAL_PORT_SUBTAG)
+            );
             assert!(is_external_port_header(*p));
             assert_eq!(*p.add(1), node);
             assert_eq!((*p.add(2)).raw() as u32, 0x99AA_BBCC);
