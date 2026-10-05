@@ -62,19 +62,13 @@ fn run(
     ctx: &mut dyn ExecutionContext,
 ) -> (Result<Eterm, BeamError>, Machine) {
     let mut machine = Machine::new();
-    let result =
-        machine.run_export(module, atom(module, name), args.len() as u32, args, ctx);
+    let result = machine.run_export(module, atom(module, name), args.len() as u32, args, ctx);
     (result, machine)
 }
 
 /// Run `name/arity` and expect the oracle's value (the context stays alive for
 /// the caller, so a boxed result remains valid).
-fn expect(
-    module: &Module,
-    name: &str,
-    args: &[Eterm],
-    ctx: &mut dyn ExecutionContext,
-) -> Eterm {
+fn expect(module: &Module, name: &str, args: &[Eterm], ctx: &mut dyn ExecutionContext) -> Eterm {
     run(module, name, args, ctx)
         .0
         .unwrap_or_else(|err| panic!("{name} raised {err:?}"))
@@ -172,7 +166,10 @@ fn a_failing_guard_bif_fails_the_guard_and_yields_the_case_clause() {
     let module = module();
     let mut ctx = MinimalContext::with_bif_hook(Box::new(div_hook));
     let result = run(&module, "guard_badarith", &[make_small(1)], &mut ctx).0;
-    assert_eq!(result.expect("guard_badarith(1)"), atom_term(&module, "caught_case_clause"));
+    assert_eq!(
+        result.expect("guard_badarith(1)"),
+        atom_term(&module, "caught_case_clause")
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -195,8 +192,11 @@ fn oldcatch_escapes_the_raw_caught_value() {
     let actual = run(&module, "oldcatch", &[make_small(2)], &mut ctx)
         .0
         .expect("oldcatch(2) yields the EXIT tuple");
-    let inner =
-        terms::make_tuple(&mut ctx, &[atom_term(&module, "case_clause"), make_small(2)]).unwrap();
+    let inner = terms::make_tuple(
+        &mut ctx,
+        &[atom_term(&module, "case_clause"), make_small(2)],
+    )
+    .unwrap();
     let expected = terms::make_tuple(&mut ctx, &[atom_term(&module, "EXIT"), inner]).unwrap();
     assert!(
         cmp(actual, expected, &module.atom_table).is_eq(),
@@ -233,7 +233,12 @@ fn raw_functions_return_their_normal_values() {
         atom_term(&module, "one")
     );
     assert_eq!(
-        expect(&module, "badmatch_raw", &[atom_term(&module, "ok")], &mut ctx),
+        expect(
+            &module,
+            "badmatch_raw",
+            &[atom_term(&module, "ok")],
+            &mut ctx
+        ),
         atom_term(&module, "ok")
     );
     assert_eq!(

@@ -65,7 +65,13 @@ fn entry(map: Eterm, module: &Module, key: &str) -> Option<Eterm> {
 fn fixture_exports_and_atoms_are_as_expected() {
     let module = load();
     assert_eq!(module.atom_name(module.name), Some("mapfx"));
-    for (name, arity) in [("get", 1), ("has", 1), ("assoc", 1), ("exact", 1), ("assoc_exact", 1)] {
+    for (name, arity) in [
+        ("get", 1),
+        ("has", 1),
+        ("assoc", 1),
+        ("exact", 1),
+        ("assoc_exact", 1),
+    ] {
         assert!(
             module.export(atom(&module, name), arity).is_some(),
             "{name}/{arity} must be exported"

@@ -63,7 +63,14 @@ fn mk_builds_an_integer_and_a_binary_segment() {
     // mk(A, B) -> <<A:8, B:16>>
     let module = load(BITSTRINGS_BEAM);
     let mut ctx = MinimalContext::new();
-    let result = run(&module, "mk", 2, &[make_small(1), make_small(258)], &mut ctx).expect("mk");
+    let result = run(
+        &module,
+        "mk",
+        2,
+        &[make_small(1), make_small(258)],
+        &mut ctx,
+    )
+    .expect("mk");
     assert_eq!(bytes(result), vec![1, 1, 2]);
 }
 
@@ -72,7 +79,14 @@ fn pair_builds_two_integer_segments() {
     // pair(A, B) -> <<A:8, B:8>>
     let module = load(BITSTRINGS_BEAM);
     let mut ctx = MinimalContext::new();
-    let result = run(&module, "pair", 2, &[make_small(1), make_small(2)], &mut ctx).expect("pair");
+    let result = run(
+        &module,
+        "pair",
+        2,
+        &[make_small(1), make_small(2)],
+        &mut ctx,
+    )
+    .expect("pair");
     assert_eq!(bytes(result), vec![1, 2]);
 }
 

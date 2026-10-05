@@ -282,7 +282,9 @@ fn resolve_match4_fail(module: &Module, fail: &Operand) -> Result<(Label, bool)>
             ))),
             None => Err(error::unsupported("bs_start_match4: unknown fail atom")),
         },
-        _ => Err(error::unsupported("bs_start_match4: unsupported fail operand")),
+        _ => Err(error::unsupported(
+            "bs_start_match4: unsupported fail operand",
+        )),
     }
 }
 
@@ -293,9 +295,8 @@ fn read_ctx(
     what: &str,
 ) -> Result<(Eterm, Eterm, usize, usize)> {
     let term = read_operand(machine, operand)?;
-    let (orig, start, end) = raw::ctx_parts(term).ok_or_else(|| {
-        error::unsupported(&format!("{what}: operand is not a match context"))
-    })?;
+    let (orig, start, end) = raw::ctx_parts(term)
+        .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
     Ok((term, orig, start, end))
 }
 
@@ -461,9 +462,7 @@ fn run_commands(
             }
 
             other => {
-                return Err(error::unsupported(&format!(
-                    "bs_match: command {other}"
-                )));
+                return Err(error::unsupported(&format!("bs_match: command {other}")));
             }
         }
     }

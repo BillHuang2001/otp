@@ -106,8 +106,7 @@ pub(crate) fn exec(
         } => {
             let map = read_operand(machine, source)?;
             if !predicates::is_map(map) {
-                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map)
-                    .map(Some);
+                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let entries = terms::map_entries(map)?;
             for (key_operand, dst_operand) in pairs {
@@ -127,15 +126,10 @@ pub(crate) fn exec(
             Ok(Some(Step::Next))
         }
 
-        Instr::HasMapFields {
-            fail,
-            source,
-            keys,
-        } => {
+        Instr::HasMapFields { fail, source, keys } => {
             let map = read_operand(machine, source)?;
             if !predicates::is_map(map) {
-                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map)
-                    .map(Some);
+                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let entries = terms::map_entries(map)?;
             for key_operand in keys {
@@ -164,8 +158,7 @@ pub(crate) fn exec(
             let _ = live;
             let map = read_operand(machine, source)?;
             if !predicates::is_map(map) {
-                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map)
-                    .map(Some);
+                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {
@@ -195,8 +188,7 @@ pub(crate) fn exec(
             let _ = live;
             let map = read_operand(machine, source)?;
             if !predicates::is_map(map) {
-                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map)
-                    .map(Some);
+                return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {
@@ -447,7 +439,10 @@ mod tests {
             vec![Instr::GetMapElements {
                 fail: Label(2),
                 source: Operand::X(0),
-                pairs: vec![(Operand::Atom(a), Operand::X(1)), (Operand::Atom(b), Operand::X(2))],
+                pairs: vec![
+                    (Operand::Atom(a), Operand::X(1)),
+                    (Operand::Atom(b), Operand::X(2)),
+                ],
             }],
             Label(2),
         );
@@ -457,13 +452,20 @@ mod tests {
         let mut ctx = MinimalContext::new();
         let map = terms::make_flatmap(
             &mut ctx,
-            &[(make_atom(a), make_small(10)), (make_atom(b), make_small(20))],
+            &[
+                (make_atom(a), make_small(10)),
+                (make_atom(b), make_small(20)),
+            ],
         )
         .unwrap();
 
         // x(1) holds the value fetched for key `a`.
         let (result, machine) = run(&mut ctx, &module, entry, &[map]);
-        assert_eq!(result.unwrap(), map, "the happy path returns the input register");
+        assert_eq!(
+            result.unwrap(),
+            map,
+            "the happy path returns the input register"
+        );
         let _ = machine;
     }
 
@@ -494,12 +496,19 @@ mod tests {
         let mut ctx = MinimalContext::new();
         let map = terms::make_flatmap(
             &mut ctx,
-            &[(make_atom(b), make_small(20)), (make_atom(a), make_small(10))],
+            &[
+                (make_atom(b), make_small(20)),
+                (make_atom(a), make_small(10)),
+            ],
         )
         .unwrap();
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
-        assert_eq!(result.unwrap(), make_small(20), "key `b` maps to x(2) then x(0)");
+        assert_eq!(
+            result.unwrap(),
+            make_small(20),
+            "key `b` maps to x(2) then x(0)"
+        );
     }
 
     #[test]
@@ -521,7 +530,11 @@ mod tests {
         let map = terms::make_flatmap(&mut ctx, &[(make_atom(b), make_small(1))]).unwrap();
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
-        assert_eq!(result.unwrap(), make_small(99), "key `a` is absent ⇒ fail label");
+        assert_eq!(
+            result.unwrap(),
+            make_small(99),
+            "key `a` is absent ⇒ fail label"
+        );
     }
 
     #[test]
@@ -563,7 +576,11 @@ mod tests {
 
         let mut ctx = MinimalContext::new();
         let (result, _machine) = run(&mut ctx, &module, entry, &[make_small(7)]);
-        assert_eq!(result.unwrap(), make_small(99), "a non-map source jumps to fail");
+        assert_eq!(
+            result.unwrap(),
+            make_small(99),
+            "a non-map source jumps to fail"
+        );
     }
 
     #[test]
@@ -663,7 +680,11 @@ mod tests {
         let map = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[map]);
-        assert_eq!(result.unwrap(), make_small(99), "key `b` is absent ⇒ fail label");
+        assert_eq!(
+            result.unwrap(),
+            make_small(99),
+            "key `b` is absent ⇒ fail label"
+        );
     }
 
     #[test]
@@ -689,10 +710,7 @@ mod tests {
     // -- put_map_assoc -------------------------------------------------------
 
     /// `f/1` that runs `PutMapAssoc` with `pairs`, leaving the new map in `x(0)`.
-    fn assoc_function(
-        fixture: &mut Fixture,
-        pairs: Vec<(Operand, Operand)>,
-    ) -> (Label, Atom) {
+    fn assoc_function(fixture: &mut Fixture, pairs: Vec<(Operand, Operand)>) -> (Label, Atom) {
         let code = vec![
             Instr::Label(Label(1)),
             Instr::PutMapAssoc {
@@ -722,15 +740,20 @@ mod tests {
         let module = fixture.finish();
 
         let mut ctx = MinimalContext::new();
-        let source =
-            terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
+        let source = terms::make_flatmap(&mut ctx, &[(make_atom(a), make_small(1))]).unwrap();
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
         let result = result.unwrap();
         assert_ne!(result, source, "an immutable update builds a fresh map");
         let entries = terms::map_entries(result).unwrap();
-        assert_eq!(lookup(&entries, make_atom(a), &module.atom_table), Some(make_small(9)));
-        assert_eq!(lookup(&entries, make_atom(b), &module.atom_table), Some(make_small(2)));
+        assert_eq!(
+            lookup(&entries, make_atom(a), &module.atom_table),
+            Some(make_small(9))
+        );
+        assert_eq!(
+            lookup(&entries, make_atom(b), &module.atom_table),
+            Some(make_small(2))
+        );
         assert_eq!(entries.len(), 2);
     }
 
@@ -738,10 +761,8 @@ mod tests {
     fn put_map_assoc_on_an_empty_map_builds_a_new_map() {
         let mut fixture = Fixture::new(&["a"]);
         let a = fixture.atom("a");
-        let (entry, _name) = assoc_function(
-            &mut fixture,
-            vec![(Operand::Atom(a), Operand::Integer(7))],
-        );
+        let (entry, _name) =
+            assoc_function(&mut fixture, vec![(Operand::Atom(a), Operand::Integer(7))]);
         let module = fixture.finish();
 
         let mut ctx = MinimalContext::new();
@@ -785,9 +806,7 @@ mod tests {
         let module = fixture.finish();
 
         let mut ctx = MinimalContext::new();
-        let full: Vec<(Eterm, Eterm)> = (0..32)
-            .map(|i| (make_small(i), make_small(i)))
-            .collect();
+        let full: Vec<(Eterm, Eterm)> = (0..32).map(|i| (make_small(i), make_small(i))).collect();
         let source = terms::make_flatmap(&mut ctx, &full).unwrap();
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
@@ -823,8 +842,14 @@ mod tests {
 
         let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
         let entries = terms::map_entries(result.unwrap()).unwrap();
-        assert_eq!(lookup(&entries, make_atom(a), &module.atom_table), Some(make_small(42)));
-        assert_eq!(lookup(&entries, make_atom(b), &module.atom_table), Some(make_small(2)));
+        assert_eq!(
+            lookup(&entries, make_atom(a), &module.atom_table),
+            Some(make_small(42))
+        );
+        assert_eq!(
+            lookup(&entries, make_atom(b), &module.atom_table),
+            Some(make_small(2))
+        );
     }
 
     #[test]

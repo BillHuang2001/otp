@@ -81,9 +81,9 @@ pub(crate) fn exec(
     match instr {
         // `make_fun3 Index Dst Env` — build a closure from the `FunT` entry.
         Instr::MakeFun3 { index, dst, env } => {
-            let descriptor = module.fun(*index).ok_or_else(|| {
-                error::unsupported("make_fun3: fun-table index out of range")
-            })?;
+            let descriptor = module
+                .fun(*index)
+                .ok_or_else(|| error::unsupported("make_fun3: fun-table index out of range"))?;
             // The `Env` operand list must carry exactly the lambda's free
             // variables; a mismatch is a malformed module, not a runtime value.
             if descriptor.num_free as usize != env.len() {
@@ -101,20 +101,16 @@ pub(crate) fn exec(
                 .arity
                 .checked_sub(descriptor.num_free)
                 .ok_or_else(|| error::unsupported("make_fun3: num_free exceeds arity"))?;
-            let fun = terms::make_fun(
-                ctx,
-                arity,
-                descriptor.uniq as u64,
-                descriptor.index,
-                &free,
-            )?;
+            let fun = terms::make_fun(ctx, arity, descriptor.uniq as u64, descriptor.index, &free)?;
             write_operand(machine, dst, fun)?;
             Ok(Some(Step::Next))
         }
 
         // `call_fun Arity` — the fun is in `x(arity)`, arguments in `x(0..arity)`.
         Instr::CallFun { arity } => {
-            let fun = machine.x(*arity).ok_or_else(|| error::bad_register(*arity))?;
+            let fun = machine
+                .x(*arity)
+                .ok_or_else(|| error::bad_register(*arity))?;
             let args = register_args(machine, *arity)?;
             let result = ctx.apply_fun(fun, &args)?;
             machine.set_x(0, result)?;
@@ -180,9 +176,7 @@ fn apply_target(
     arity: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
-    let module_term = machine
-        .x(arity)
-        .ok_or_else(|| error::bad_register(arity))?;
+    let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
     let function_term = machine
         .x(arity + 1)
         .ok_or_else(|| error::bad_register(arity + 1))?;
@@ -212,7 +206,7 @@ mod tests {
 
     use super::*;
     use beam_common::BeamError;
-    use beam_loader::{Function, FunDescriptor};
+    use beam_loader::{FunDescriptor, Function};
     use beam_term::{make_small, signed_value, Atom};
 
     use crate::context::MinimalContext;
@@ -278,12 +272,7 @@ mod tests {
     }
 
     /// The `arith_hook` of the other tests: `erlang:'+'/2` over small ints.
-    fn plus_hook(
-        module: &str,
-        function: &str,
-        arity: u32,
-        args: &[Eterm],
-    ) -> Result<Eterm> {
+    fn plus_hook(module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
         if module != "erlang" || function != "+" || arity != 2 || args.len() != 2 {
             return Err(BeamError::BadArg);
         }
@@ -695,7 +684,10 @@ mod tests {
                 &module,
                 entry,
                 2,
-                &[beam_term::make_atom(erlang), beam_term::make_atom(self_atom)],
+                &[
+                    beam_term::make_atom(erlang),
+                    beam_term::make_atom(self_atom),
+                ],
                 &mut ctx,
             )
             .expect("apply_last 0");

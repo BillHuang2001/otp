@@ -24,10 +24,7 @@ use beam_loader::{load_file, Function, Instr, Label, Module, Operand, NO_FAIL};
 use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 /// The committed tuple fixture (`erlc tuples.erl`).
-const TUPLES_BEAM: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/tests/fixtures/tuples.beam"
-);
+const TUPLES_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/tuples.beam");
 /// The committed list fixture (`erlc lists.erl`).
 const LISTS_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/lists.beam");
 
@@ -100,15 +97,10 @@ fn fixture_classify_dispatches_on_tuple_arity() {
     let a = make_atom(export_atom(&module, "a"));
     let b = make_atom(export_atom(&module, "b"));
     let c = make_atom(export_atom(&module, "c"));
-    for (elems, expected) in [
-        (vec![a], 1_i64),
-        (vec![a, b], 2),
-        (vec![a, b, c], 3),
-    ] {
+    for (elems, expected) in [(vec![a], 1_i64), (vec![a, b], 2), (vec![a, b, c], 3)] {
         let mut ctx = MinimalContext::new();
         let arg = terms::make_tuple(&mut ctx, &elems).unwrap();
-        let result =
-            run_export_with(&module, "classify", 1, &[arg], &mut ctx).expect("classify/1");
+        let result = run_export_with(&module, "classify", 1, &[arg], &mut ctx).expect("classify/1");
         // Give the arity context in the message when the switch picks the wrong arm.
         assert_eq!(result, make_small(expected), "arity {}", elems.len());
     }
@@ -133,8 +125,14 @@ fn fixture_build_allows_an_improper_tail() {
     // `[H | T]` with a non-list `T` is a legal term.
     let module = load(LISTS_BEAM);
     let mut ctx = MinimalContext::new();
-    let result = run_export_with(&module, "build", 2, &[make_small(1), make_small(2)], &mut ctx)
-        .expect("build(1, 2)");
+    let result = run_export_with(
+        &module,
+        "build",
+        2,
+        &[make_small(1), make_small(2)],
+        &mut ctx,
+    )
+    .expect("build(1, 2)");
     assert_eq!(terms::cons_head(result).unwrap(), make_small(1));
     assert_eq!(terms::cons_tail(result).unwrap(), make_small(2));
 }
@@ -263,7 +261,12 @@ fn run(
 ///
 /// The recorded reason term lives in the caller's `ctx` arena, which must still be
 /// alive here.
-fn assert_badmatch(result: Result<Eterm, BeamError>, machine: &Machine, badmatch: Atom, value: Eterm) {
+fn assert_badmatch(
+    result: Result<Eterm, BeamError>,
+    machine: &Machine,
+    badmatch: Atom,
+    value: Eterm,
+) {
     assert!(
         matches!(result, Err(BeamError::Raise(_))),
         "expected a raise, got {result:?}"
@@ -271,7 +274,10 @@ fn assert_badmatch(result: Result<Eterm, BeamError>, machine: &Machine, badmatch
     let (class, reason) = machine.pending_exception().expect("a recorded exception");
     assert_eq!(class, ExceptionClass::Error);
     assert_eq!(terms::tuple_arity(reason).unwrap(), 2);
-    assert_eq!(terms::tuple_element(reason, 0).unwrap(), make_atom(badmatch));
+    assert_eq!(
+        terms::tuple_element(reason, 0).unwrap(),
+        make_atom(badmatch)
+    );
     assert_eq!(terms::tuple_element(reason, 1).unwrap(), value);
 }
 
@@ -285,7 +291,11 @@ fn put_tuple2_builds_a_tuple_from_operands() {
         Instr::Label(Label(1)),
         Instr::PutTuple2 {
             dst: Operand::X(0),
-            elements: vec![Operand::Integer(7), Operand::X(1), Operand::Atom(Atom::from_raw(0))],
+            elements: vec![
+                Operand::Integer(7),
+                Operand::X(1),
+                Operand::Atom(Atom::from_raw(0)),
+            ],
         },
         Instr::Return,
     ];
@@ -297,7 +307,10 @@ fn put_tuple2_builds_a_tuple_from_operands() {
     assert_eq!(terms::tuple_arity(result).unwrap(), 3);
     assert_eq!(terms::tuple_element(result, 0).unwrap(), make_small(7));
     assert_eq!(terms::tuple_element(result, 1).unwrap(), make_small(9));
-    assert_eq!(terms::tuple_element(result, 2).unwrap(), make_atom(Atom::from_raw(0)));
+    assert_eq!(
+        terms::tuple_element(result, 2).unwrap(),
+        make_atom(Atom::from_raw(0))
+    );
 }
 
 #[test]
@@ -340,7 +353,10 @@ fn get_tuple_element_reads_the_indexed_element() {
 
     let mut ctx = MinimalContext::new();
     let tuple = terms::make_tuple(&mut ctx, &[make_small(10), make_small(20)]).unwrap();
-    assert_eq!(run(&module, entry, &[tuple], &mut ctx).unwrap(), make_small(20));
+    assert_eq!(
+        run(&module, entry, &[tuple], &mut ctx).unwrap(),
+        make_small(20)
+    );
 }
 
 #[test]
@@ -453,9 +469,15 @@ fn select_tuple_arity_dispatches_on_the_arity() {
 
     let mut ctx = MinimalContext::new();
     let t1 = terms::make_tuple(&mut ctx, &[make_small(0)]).unwrap();
-    assert_eq!(run(&module, entry, &[t1], &mut ctx).unwrap(), make_small(100));
+    assert_eq!(
+        run(&module, entry, &[t1], &mut ctx).unwrap(),
+        make_small(100)
+    );
     let t2 = terms::make_tuple(&mut ctx, &[make_small(0), make_small(0)]).unwrap();
-    assert_eq!(run(&module, entry, &[t2], &mut ctx).unwrap(), make_small(200));
+    assert_eq!(
+        run(&module, entry, &[t2], &mut ctx).unwrap(),
+        make_small(200)
+    );
 }
 
 #[test]
@@ -486,12 +508,11 @@ fn select_tuple_arity_falls_through_to_the_fail_label() {
 
     let mut ctx = MinimalContext::new();
     // A 3-tuple has no `1` dest, so the switch falls to the fail label.
-    let arg = terms::make_tuple(
-        &mut ctx,
-        &[make_small(0), make_small(0), make_small(0)],
-    )
-    .unwrap();
-    assert_eq!(run(&module, entry, &[arg], &mut ctx).unwrap(), make_small(0));
+    let arg = terms::make_tuple(&mut ctx, &[make_small(0), make_small(0), make_small(0)]).unwrap();
+    assert_eq!(
+        run(&module, entry, &[arg], &mut ctx).unwrap(),
+        make_small(0)
+    );
 }
 
 #[test]
@@ -512,11 +533,7 @@ fn select_tuple_arity_without_a_fail_label_raises_badmatch() {
     let module = fixture.finish();
 
     let mut ctx = MinimalContext::new();
-    let arg = terms::make_tuple(
-        &mut ctx,
-        &[make_small(0), make_small(0), make_small(0)],
-    )
-    .unwrap();
+    let arg = terms::make_tuple(&mut ctx, &[make_small(0), make_small(0), make_small(0)]).unwrap();
     let (result, machine) = run_inspected(&module, entry, &[arg], &mut ctx);
     assert_badmatch(result, &machine, badmatch, arg);
 }
@@ -661,7 +678,10 @@ fn get_hd_reads_the_head() {
 
     let mut ctx = MinimalContext::new();
     let arg = terms::make_list(&mut ctx, &[make_small(8), make_small(9)]).unwrap();
-    assert_eq!(run(&module, entry, &[arg], &mut ctx).unwrap(), make_small(8));
+    assert_eq!(
+        run(&module, entry, &[arg], &mut ctx).unwrap(),
+        make_small(8)
+    );
 }
 
 #[test]

@@ -101,9 +101,7 @@ pub(crate) fn exec(
         }
 
         // `badmatch Src` ⇒ `{badmatch,Src}` (class error).
-        Instr::Badmatch { value } => {
-            raise_error_tuple(machine, module, ctx, "badmatch", value)
-        }
+        Instr::Badmatch { value } => raise_error_tuple(machine, module, ctx, "badmatch", value),
         // `case_end Src` ⇒ `{case_clause,Src}` (class error).
         Instr::CaseEnd { value } => raise_error_tuple(machine, module, ctx, "case_clause", value),
         // `try_case_end Src` ⇒ `{try_clause,Src}` (class error).
@@ -172,9 +170,7 @@ pub(crate) fn exec(
                     // Classes `error`/`exit` ⇒ `{'EXIT',Reason}`. M1 appends no
                     // stacktrace (C's `add_stacktrace`).
                     let exit_atom = module.atom_table.lookup("EXIT").ok_or_else(|| {
-                        error::unsupported(
-                            "catch_end: module atom table lacks the 'EXIT' atom",
-                        )
+                        error::unsupported("catch_end: module atom table lacks the 'EXIT' atom")
                     })?;
                     let tuple = terms::make_tuple(ctx, &[make_atom(exit_atom), reason])?;
                     machine.set_x(0, tuple)?;
@@ -315,13 +311,28 @@ mod tests {
     }
 
     /// Run one instruction body with a machine that has a bottom frame.
-    fn exec_one(module: &Module, instr: &Instr, machine: &mut Machine, ctx: &mut MinimalContext) -> Result<Option<Step>> {
+    fn exec_one(
+        module: &Module,
+        instr: &Instr,
+        machine: &mut Machine,
+        ctx: &mut MinimalContext,
+    ) -> Result<Option<Step>> {
         exec(machine, module, &no_labels(), instr, 0, 0, ctx)
     }
 
     /// Assert that `reason` (an `Eterm`) equals the tuple `[tag, elem]`.
-    fn assert_reason_tuple(cmp_ctx: &mut MinimalContext, module: &Module, reason: Eterm, tag: &str, elem: Eterm) {
-        let expected = terms::make_tuple(cmp_ctx, &[make_atom(module.atom_table.lookup(tag).unwrap()), elem]).unwrap();
+    fn assert_reason_tuple(
+        cmp_ctx: &mut MinimalContext,
+        module: &Module,
+        reason: Eterm,
+        tag: &str,
+        elem: Eterm,
+    ) {
+        let expected = terms::make_tuple(
+            cmp_ctx,
+            &[make_atom(module.atom_table.lookup(tag).unwrap()), elem],
+        )
+        .unwrap();
         assert!(
             cmp(reason, expected, &module.atom_table).is_eq(),
             "reason does not equal {{{tag}, ..}}"
@@ -456,7 +467,10 @@ mod tests {
         machine.push_frame(0).unwrap();
         let _ = exec_one(&module, &Instr::IfEnd, &mut machine, &mut ctx);
         let (_, reason) = machine.pending_exception().unwrap();
-        assert_eq!(reason, make_atom(module.atom_table.lookup("if_clause").unwrap()));
+        assert_eq!(
+            reason,
+            make_atom(module.atom_table.lookup("if_clause").unwrap())
+        );
 
         // badrecord ⇒ {badrecord,V}
         let module = Fixture::new(&["badrecord"]).finish();
@@ -932,9 +946,7 @@ mod tests {
 
         let mut machine = Machine::new();
         let mut ctx = MinimalContext::new();
-        let result = machine
-            .run_label(&module, entry, 0, &[], &mut ctx)
-            .unwrap();
+        let result = machine.run_label(&module, entry, 0, &[], &mut ctx).unwrap();
         let expected = terms::make_tuple(
             &mut ctx,
             &[
@@ -944,6 +956,10 @@ mod tests {
         )
         .unwrap();
         assert!(cmp(result, expected, &module.atom_table).is_eq());
-        assert_eq!(machine.frame_depth(), 1, "the run is back at the bottom frame");
+        assert_eq!(
+            machine.frame_depth(),
+            1,
+            "the run is back at the bottom frame"
+        );
     }
 }

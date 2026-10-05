@@ -36,9 +36,7 @@ use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
-use super::{
-    decode_flags, fail_step, is_all, raw, read_size, small_value, BitWriter, BSF_LITTLE,
-};
+use super::{decode_flags, fail_step, is_all, raw, read_size, small_value, BitWriter, BSF_LITTLE};
 
 /// Execute a bitstring **construction** instruction.
 pub(super) fn exec(
@@ -110,7 +108,9 @@ fn assemble(
         match kind {
             "integer" => {
                 if is_all(module, size_op) {
-                    return Err(error::unsupported("bs_create_bin: integer segment size `all`"));
+                    return Err(error::unsupported(
+                        "bs_create_bin: integer segment size `all`",
+                    ));
                 }
                 let size = read_size(machine, size_op)?;
                 let Some(nbits) = size.checked_mul(unit) else {

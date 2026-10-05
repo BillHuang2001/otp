@@ -492,7 +492,9 @@ impl Machine {
         self.frames.truncate(frame_index + 1);
         let keep = frame.y_base + frame.y_count as usize;
         if keep > self.stack.len() {
-            return Err(error::unsupported("exceptions: catch frame stack underflow"));
+            return Err(error::unsupported(
+                "exceptions: catch frame stack underflow",
+            ));
         }
         self.stack.truncate(keep);
         Ok(())

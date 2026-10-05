@@ -113,10 +113,7 @@ pub(super) fn fail_step(
 }
 
 /// Resolve a module-local label to its `(function, code)` jump target.
-pub(super) fn goto_label(
-    labels: &BTreeMap<Label, (u32, u32)>,
-    label: Label,
-) -> Result<Step> {
+pub(super) fn goto_label(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<Step> {
     let (func, pc) = labels
         .get(&label)
         .copied()
@@ -141,7 +138,9 @@ pub(super) fn read_size(machine: &Machine, operand: &Operand) -> Result<usize> {
             return Ok(n as usize);
         }
     }
-    Err(error::unsupported("bitstring: size is not a non-negative small integer"))
+    Err(error::unsupported(
+        "bitstring: size is not a non-negative small integer",
+    ))
 }
 
 /// True when `operand` is the atom `all` (a whole-tail segment size).
@@ -162,9 +161,9 @@ pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
     match operand {
         Operand::Nil => Ok(0),
         Operand::Literal(index) => {
-            let term = module.literal(*index).ok_or_else(|| {
-                error::unsupported("bitstring: flags literal index out of range")
-            })?;
+            let term = module
+                .literal(*index)
+                .ok_or_else(|| error::unsupported("bitstring: flags literal index out of range"))?;
             let mut flags = 0;
             for elem in crate::terms::list_elements(term)? {
                 flags |= flag_bit(module, elem)?;
@@ -205,13 +204,17 @@ fn flag_bit(module: &Module, elem: Eterm) -> Result<u32> {
 /// a typed error rather than an out-of-bounds panic.
 pub(super) fn read_uint_be(bytes: &[u8], start: usize, nbits: usize) -> Result<u64> {
     if nbits > 64 {
-        return Err(error::unsupported("bitstring: integer segment wider than 64 bits"));
+        return Err(error::unsupported(
+            "bitstring: integer segment wider than 64 bits",
+        ));
     }
     let end = start
         .checked_add(nbits)
         .ok_or_else(|| error::unsupported("bitstring: integer segment out of range"))?;
     if end > bytes.len() * 8 {
-        return Err(error::unsupported("bitstring: integer segment out of range"));
+        return Err(error::unsupported(
+            "bitstring: integer segment out of range",
+        ));
     }
     let mut value = 0u64;
     for i in 0..nbits {
@@ -232,7 +235,9 @@ pub(super) fn read_uint_le(bytes: &[u8], start: usize, nbits: usize) -> Result<u
     }
     let nbytes = nbits / 8;
     if start / 8 + nbytes > bytes.len() {
-        return Err(error::unsupported("bitstring: integer segment out of range"));
+        return Err(error::unsupported(
+            "bitstring: integer segment out of range",
+        ));
     }
     let base = start / 8;
     let mut value = 0u64;

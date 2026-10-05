@@ -144,7 +144,10 @@ fn adder_builds_a_closure_capturing_one_free_variable() {
 fn capture_applies_a_captured_variable_closure() {
     // capture() -> (funs:adder(10))(5)  ==  15
     let mut ctx = context();
-    assert_eq!(run(&mut ctx, "capture", &[]).expect("capture/0"), make_small(15));
+    assert_eq!(
+        run(&mut ctx, "capture", &[]).expect("capture/0"),
+        make_small(15)
+    );
 }
 
 #[test]
