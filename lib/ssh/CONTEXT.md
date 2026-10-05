@@ -40,7 +40,9 @@ Client and server share nearly all code — the role is a state in `#ssh{}` and 
 - Sensitive material (keys, password args) must not leak into reports: the logger filter installed by `ssh_app` relies on the `filter_modules` env and `ssh_options:no_sensitive/2`.
 
 ## Design Decisions
-- One `gen_statem` process per SSH connection: `src/ssh_connection_handler.erl` (`callback_mode` = `[handle_event_function, state_enter]`), with the per-phase states/event handlers factored into separate modules: `ssh_fsm_kexinit` (version exchange, kex, rekey), `ssh_fsm_userauth_client`/`ssh_fsm_userauth_server` (authentication), and the connection-protocol states in `ssh_connection`.
+- One `gen_statem` process per SSH connection: `src/ssh_connection_handler.erl` (`callback_mode` = `[handle_event_function, state_enter]`).
+  Its own states are `{hello,Role}` (version exchange) and `{connected,Role}`, where `connected` delegates channel messages to `ssh_connection:handle_msg/4`.
+  The kex/rekey and authentication phases live in separate callback modules reached via `{change_callback_module, ...}`: `ssh_fsm_kexinit`, `ssh_fsm_userauth_client`, `ssh_fsm_userauth_server`.
   Shared FSM state is the single `#data{}` record in `ssh_fsm.hrl`; negotiated connection state is the single `#ssh{}` record in `ssh.hrl`.
 - All wire messages are records per RFC (`ssh_msg_*` in `ssh_transport.hrl`, `ssh_auth.hrl`, `ssh_connect.hrl`) and are encoded/decoded centrally in `src/ssh_message.erl`; `src/ssh_bits.erl` provides SSH primitive encodings (`mpint/1`, `name_list/1`, `random/1`).
 - Supervision tree (diagram in `internal_doc/ssh_notes.md`): `ssh_sup` → `sshd_sup` (daemon side) and `sshc_sup` (client side).
