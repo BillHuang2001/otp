@@ -1,32 +1,64 @@
 # `beam_engine` test fixtures
 
-`floats.beam` is the committed oracle fixture for the floating-point instruction
-family (`src/families/floats.rs`), used by `tests/floats.rs`. Like the
-`beam_loader` fixtures it is a **real `.beam`** produced by the system Erlang
+Committed oracle `.beam` fixtures driven by the engine's per-family integration
+tests. Every fixture is a **real `.beam`** produced by the **system Erlang**
 toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+
+The repo-root `.gitignore` has a global `*.beam` rule, so fixtures are committed
+with `git add -f`; `erts_rust/crates/beam_engine/.gitignore` re-includes
+`tests/fixtures/*.beam`.
+
+Any byte change in a fixture invalidates the expected values in the matching
+test; re-derive them with `beam_disasm:file/1` plus the oracle, do **not** guess.
 
 ## Regeneration
 
-Build it from a *neutral* directory so no worktree path is baked into the
-committed binary (the `CInf`/`Dbgi` chunks record the source path):
+Build from a *neutral* directory so no worktree path is baked into the committed
+binary (the `CInf`/`Dbgi` chunks record the source path):
 
 ```sh
-mkdir -p "$TMPDIR/floatsgen"
-cp erts_rust/crates/beam_engine/tests/fixtures/floats.erl "$TMPDIR/floatsgen/"
-env -C "$TMPDIR/floatsgen" erlc floats.erl
-cp "$TMPDIR/floatsgen/floats.beam" erts_rust/crates/beam_engine/tests/fixtures/floats.beam
+mkdir -p "$TMPDIR/fixgen"
+cp erts_rust/crates/beam_engine/tests/fixtures/<name>.erl "$TMPDIR/fixgen/"
+env -C "$TMPDIR/fixgen" erlc <name>.erl
+cp "$TMPDIR/fixgen/<name>.beam" erts_rust/crates/beam_engine/tests/fixtures/<name>.beam
 ```
 
-Any byte change in the fixture invalidates the expected values in `tests/floats.rs`;
-re-derive them with `beam_disasm:file("floats.beam")` plus the oracle, do **not**
-guess.
+## `tuples.beam` (`tuples.erl`) — `tests/tuples_lists.rs`
 
-## `floats.erl` — what it covers
+| export | Erlang | opcodes |
+|---|---|---|
+| `mk/2` | `mk(A,B) -> {A,B}.` | `put_tuple2` |
+| `first/1` | `case T of {A,_B} -> A end.` | `get_tuple_element` |
+| `swap/1` | `case T of {A,B} -> {B,A} end.` | `get_tuple_element` ×2 + `put_tuple2` |
+| `classify/1` | `case T of {a}->1; {a,b}->2; {a,b,c}->3 end.` | `select_tuple_arity` |
 
-Ordinary Erlang whose compiled output exercises every opcode the family owns. The
-`is_float/1` guards are what make the compiler emit the *dedicated* float opcodes
-(`add(A, B) -> A + B.` without them compiles to `gc_bif '+'` and never reaches the
-family).
+## `lists.beam` (`lists.erl`) — `tests/tuples_lists.rs`
+
+| export | Erlang | opcodes |
+|---|---|---|
+| `build/2` | `build(H,T) -> [H|T].` | `put_list` |
+| `head/1` | `case L of [H|_T] -> H end.` | `get_hd` |
+| `tail/1` | `case L of [_H|T] -> T end.` | `get_tl` |
+| `split/1` | `case L of [H|T] -> {H,T} end.` | `get_list` + `put_tuple2` |
+
+`case` (rather than function-head clauses) keeps a bad argument on the `case_end`
+path instead of a `func_info` clause failure, so the fixtures exercise only the
+families the engine implements.
+
+## `exceptions.beam` (`exceptions.erl`) — `tests/exceptions.rs`
+
+Idiomatic `try ... catch ... end`, old-style `catch Expr`, a `case` with no
+matching clause, a `badmatch`, an `if` with no true branch, nested `try`, and a
+cross-frame unwind (`deep/1`), plus several uncaught-raise entry points. Drives
+`try`/`catch`/`try_case`/`try_end`/`catch_end`/`badmatch`/`case_end`/`try_case_end`/`if_end`
+and the catch-frame unwinding model.
+
+## `floats.beam` (`floats.erl`) — `tests/floats.rs`
+
+Ordinary Erlang whose compiled output exercises every opcode the float family
+owns. The `is_float/1` guards are what make the compiler emit the *dedicated*
+float opcodes (`add(A, B) -> A + B.` without them compiles to `gc_bif '+'` and
+never reaches the family).
 
 | function | opcodes exercised |
 |---|---|
@@ -39,14 +71,7 @@ family).
 
 `divide/2` with a zero divisor is a **non-finite** result, so it is the fixture's
 `badarith` case (`fdiv` carries no fail label); `conv([])` is the `fconv`
-non-numeric case. Both were checked against the oracle:
-
-```
-1> floats:divide(1.0, 0.0).
-** exception error: an error occurred when evaluating an arithmetic expression
-2> floats:conv([]).
-** exception error: an error occurred when evaluating an arithmetic expression
-```
+non-numeric case.
 
 Note `add(1, 2)` (an integer argument) hits the failed `is_float` guard, which jumps
 to the function's `func_info` label — the oracle raises `function_clause` there, but
