@@ -27,7 +27,7 @@ The guide is a flat set of ex_doc "extras" chapters of the `system` app document
 ## Known Issues
 - **Anchor spelling is mixed** (underscore vs hyphen): `#version_scheme`, `#BOOTSCRIPT` (upper case), `#releases_and_patches`, `#creating-upgrading-target-system`. Outside consumers link to exact spellings — `lib/runtime_tools/src/system_information.erl` → `system_principles.md#BOOTSCRIPT`; `system/doc/reference_manual/code_loading.md` and `lib/crypto/doc/crypto_app.md` → `system_principles.md#code_loading`; `lib/runtime_tools/src/versions.erl` and `lib/runtime_tools/doc/notes.md` → `versions.md#version-scheme` (hyphen) and `versions.md#order-of-versions` (hyphen, no explicit anchor — relies on the heading's auto slug). Do not rename anchors without grepping the whole tree.
 - **Stale inline listing:** the `target_system.erl` listing in `create_target.md` has drifted from `lib/sasl/examples/src/target_system.erl` (see External file dependencies).
-- **mermaid hidden in epub:** `make/ex_doc.exs` sets `display:none` for `pre code.mermaid` in the `:epub` output, so the version-tree;diagrams in `versions.md` do not appear in the epub build.
+- **mermaid hidden in epub:** `make/ex_doc.exs` sets `display:none` for `pre code.mermaid` in the `:epub` output, so the version-tree diagrams in `versions.md` do not appear in the epub build.
 
 ## Notes for Agents
 - Leaf node: 6 flat Markdown files, no subdirectories — do not try to delegate further.
