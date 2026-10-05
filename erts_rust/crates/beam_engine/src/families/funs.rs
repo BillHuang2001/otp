@@ -48,14 +48,17 @@
 //! Every failure is a typed [`beam_common::BeamError`]: `read_operand`/
 //! `write_operand` propagate, an out-of-range register is
 //! [`crate::error::bad_register`], a `make_fun3` with no matching descriptor is
-//! [`crate::error::unsupported`], and a non-atom `apply` target is
-//! [`BeamError::BadArg`] — never a panic and never a wrong result.
+//! [`crate::error::unsupported`], and a non-atom `apply` target is the C's
+//! `badarg` **raise** — catchable through [`raise_badarg`] (landing in a live
+//! `try`/`catch`), or the typed [`BeamError::BadArg`] when there is no catch
+//! frame to land in (or the module cannot name `badarg`). Never a panic and never
+//! a wrong result.
 
 use std::collections::BTreeMap;
 
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module};
-use beam_term::{atom_val, is_atom, Eterm};
+use beam_term::{atom_val, is_atom, make_atom, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -129,21 +132,29 @@ pub(crate) fn exec(
 
         // `apply Arity` — module = `x(arity)`, function = `x(arity+1)`, arguments
         // in `x(0..arity)` (`fixed_apply`).
-        Instr::Apply { arity } => {
-            let result = apply_target(machine, module, *arity, ctx)?;
-            machine.set_x(0, result)?;
-            Ok(Some(Step::Next))
-        }
+        Instr::Apply { arity } => match apply_target(machine, module, *arity, ctx)? {
+            ApplyTarget::Called(result) => {
+                machine.set_x(0, result)?;
+                Ok(Some(Step::Next))
+            }
+            // A non-atom target is the catchable `badarg` raise: the landing
+            // already wrote x(0..=3), so x(0) must not be overwritten here.
+            ApplyTarget::Raised(step) => Ok(Some(step)),
+        },
 
         // `apply_last Arity Deallocate` — pop the frame, then apply and continue
         // through the machine's continuation (a tail call).
         Instr::ApplyLast { arity, deallocate } => {
             machine.pop_frame_checked(*deallocate)?;
-            let result = apply_target(machine, module, *arity, ctx)?;
-            machine.set_x(0, result)?;
-            match machine.continuation()? {
-                Continuation::Halt => Ok(Some(Step::Done)),
-                Continuation::Address { func, pc } => Ok(Some(Step::Goto { func, pc })),
+            match apply_target(machine, module, *arity, ctx)? {
+                ApplyTarget::Called(result) => {
+                    machine.set_x(0, result)?;
+                    match machine.continuation()? {
+                        Continuation::Halt => Ok(Some(Step::Done)),
+                        Continuation::Address { func, pc } => Ok(Some(Step::Goto { func, pc })),
+                    }
+                }
+                ApplyTarget::Raised(step) => Ok(Some(step)),
             }
         }
 
@@ -161,29 +172,83 @@ fn register_args(machine: &Machine, arity: u32) -> Result<Vec<Eterm>> {
     Ok(args)
 }
 
+/// The outcome of an `apply`/`apply_last` target dispatch ([`apply_target`]).
+enum ApplyTarget {
+    /// The target was resolved to a `module:function` and dispatched; the applied
+    /// result value is in hand (the caller stores it in `x(0)`).
+    Called(Eterm),
+    /// The target shape was invalid — a non-atom module/function — and the C's
+    /// `badarg` raise was routed through the machine (see [`raise_badarg`]). The
+    /// `Step` is the handler landing the raise produced (a live catch frame); the
+    /// landed registers (`x(0) = THE_NON_VALUE`, `x(1..=3)`) must not be clobbered.
+    Raised(Step),
+}
+
 /// Dispatch the `fixed_apply` shape: `module = x(arity)`, `function = x(arity+1)`,
 /// arguments `x(0)..x(arity-1)`.
 ///
 /// Both the module and the function must be atoms (the C raises `badarg` with the
-/// argument list otherwise); the target is then applied through
-/// [`ExecutionContext::call_bif`]. This also covers the C's `apply of apply/3`
-/// special case (`beam_common.c:1554-1557`): `x(0)`/`x(1)`/`x(2)` are then handed
-/// straight to `erlang:apply/3` as its `M,F,Args` arguments, which is exactly what
-/// the recursion into `apply()` computes.
+/// argument list otherwise — see [`raise_badarg`]); the target is then applied
+/// through [`ExecutionContext::call_bif`]. This also covers the C's `apply of
+/// apply/3` special case (`beam_common.c:1554-1557`): `x(0)`/`x(1)`/`x(2)` are then
+/// handed straight to `erlang:apply/3` as its `M,F,Args` arguments, which is
+/// exactly what the recursion into `apply()` computes.
 fn apply_target(
-    machine: &Machine,
+    machine: &mut Machine,
     module: &Module,
     arity: u32,
     ctx: &mut dyn ExecutionContext,
-) -> Result<Eterm> {
+) -> Result<ApplyTarget> {
     let module_term = machine.x(arity).ok_or_else(|| error::bad_register(arity))?;
     let function_term = machine
         .x(arity + 1)
         .ok_or_else(|| error::bad_register(arity + 1))?;
-    let module_name = atom_name(module, module_term)?;
-    let function_name = atom_name(module, function_term)?;
+    // `fixed_apply` (`beam_common.c:1539-1552`) checks the *function* first, then
+    // the *module*; both a non-atom `module` and a non-atom `function` set
+    // `p->freason = BADARG` and return NULL into `handle_error` → `next_catch`, so
+    // the `badarg` is a **catchable raise**, not a bare return.
+    let (module_name, function_name) = match (
+        atom_name(module, module_term),
+        atom_name(module, function_term),
+    ) {
+        (Ok(module_name), Ok(function_name)) => (module_name, function_name),
+        _ => return raise_badarg(machine, module).map(ApplyTarget::Raised),
+    };
     let args = register_args(machine, arity)?;
     ctx.call_bif(module_name, function_name, arity, &args)
+        .map(ApplyTarget::Called)
+}
+
+/// Raise the `badarg` semantic error through the machine, landing it in a live
+/// catch frame (or a typed [`BeamError::BadArg`] when there is none).
+///
+/// C's `fixed_apply` (`beam_common.c:1539-1552`) sets `p->freason = BADARG` and
+/// returns NULL into `handle_error` → `next_catch`
+/// (`../../erts/emulator/beam/beam_common.c:580-679`), so the raise **is
+/// catchable** by an enclosing `try`/`catch` (verified against the oracle: `try
+/// apply(1, f, []) catch C:R -> {C,R} end` yields `{badarg,...}` with class
+/// `error`). The engine's raise/unwind entry point is [`Machine::throw_error`],
+/// with the reason atom `badarg` resolved from the running module's atom table
+/// (the engine never invents an atom the module cannot name).
+///
+/// A module whose atom table lacks `badarg` cannot name the reason, so the typed
+/// [`BeamError::BadArg`] is returned instead — never a substituted, wrong atom.
+/// With **no live catch frame** the raise cannot land, so it likewise propagates
+/// unchanged as the typed [`BeamError::BadArg`] (the same uncaught-error contract
+/// the interpreter's `raise_bif_error` follows). The `error` class atom is
+/// installed when the module has it, which is what a landing places in `x(3)`.
+fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Step> {
+    if machine.catch_frame_depth() == 0 {
+        return Err(BeamError::BadArg);
+    }
+    let atom = module
+        .atom_table
+        .lookup("badarg")
+        .ok_or(BeamError::BadArg)?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(make_atom(atom))
 }
 
 /// The name of an atom term, resolved through the running module's atom table.
@@ -210,6 +275,7 @@ mod tests {
     use beam_term::{make_small, signed_value, Atom};
 
     use crate::context::MinimalContext;
+    use crate::machine::CatchFrame;
 
     /// A one-function synthetic module with an owned atom table.
     struct Fixture {
@@ -579,6 +645,127 @@ mod tests {
             )
             .expect_err("a non-atom module must fail");
         assert!(matches!(err, BeamError::BadArg));
+    }
+
+    // -- catchability of the `badarg` raise (non-atom `apply` target) ---------
+
+    #[test]
+    fn apply_badarg_lands_in_a_live_catch_frame() {
+        // `fixed_apply` (`beam_common.c:1539-1552`) sets `p->freason = BADARG` and
+        // returns NULL into `handle_error` → `next_catch`, so an enclosing
+        // `try`/`catch` catches it. Oracle cross-check: `try apply(1, f, [])
+        // catch C:R -> {C,R} end` yields class `error`, reason `badarg`.
+        let mut fixture = Fixture::new();
+        fixture.atom("badarg");
+        fixture.atom("error");
+        let plus = fixture.atom("+");
+        let module = fixture.finish();
+        let badarg = module.atom_table.lookup("badarg").expect("interned");
+        let error = module.atom_table.lookup("error").expect("interned");
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        // The bottom frame "owns" the handler at (func 4, pc 6).
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+        machine.set_x(0, make_small(2)).unwrap();
+        machine.set_x(1, make_small(3)).unwrap();
+        machine.set_x(2, make_small(0)).unwrap(); // a non-atom module
+        machine.set_x(3, make_atom(plus)).unwrap(); // a valid atom function
+
+        let instr = Instr::Apply { arity: 2 };
+        let labels = BTreeMap::new();
+        let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
+        assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+
+        // The C landing convention (beam_common.c:535-544): x0 = THE_NON_VALUE,
+        // x1 = the reason (`badarg`), x3 = the exception class (`error`).
+        assert_eq!(machine.x(0), Some(Eterm::non_value()));
+        assert_eq!(machine.x(1), Some(make_atom(badarg)));
+        assert_eq!(machine.x(3), Some(make_atom(error)));
+        // The raise consults the innermost entry but does not pop it.
+        assert_eq!(machine.catch_frame_depth(), 1);
+    }
+
+    #[test]
+    fn apply_last_badarg_lands_in_a_live_catch_frame() {
+        // The `apply_last` variant routes the same `badarg` raise, after popping its
+        // own frame (`i_apply_last`'s `$deallocate` precedes `fixed_apply`).
+        let mut fixture = Fixture::new();
+        fixture.atom("badarg");
+        fixture.atom("error");
+        let plus = fixture.atom("+");
+        let module = fixture.finish();
+        let badarg = module.atom_table.lookup("badarg").expect("interned");
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.push_frame(0).unwrap(); // the frame owning the handler
+        machine.push_frame(0).unwrap(); // the frame `apply_last` pops
+        machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+        machine.set_x(2, make_small(0)).unwrap(); // a non-atom module
+        machine.set_x(3, make_atom(plus)).unwrap(); // a valid atom function
+
+        let instr = Instr::ApplyLast {
+            arity: 2,
+            deallocate: 0,
+        };
+        let labels = BTreeMap::new();
+        let step = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx).unwrap();
+        assert_eq!(step, Some(Step::Goto { func: 4, pc: 6 }));
+        assert_eq!(machine.x(1), Some(make_atom(badarg)));
+        assert_eq!(machine.frame_depth(), 1, "the `apply_last` frame is popped");
+    }
+
+    #[test]
+    fn apply_badarg_without_a_catch_frame_is_the_typed_error() {
+        // The same module (the `badarg`/`error` atoms exist) but with no live `try`
+        // frame: the raise cannot land, so the typed `BeamError::BadArg` propagates
+        // unchanged (the uncaught-error contract).
+        let mut fixture = Fixture::new();
+        fixture.atom("badarg");
+        fixture.atom("error");
+        let plus = fixture.atom("+");
+        let module = fixture.finish();
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.push_frame(0).unwrap();
+        machine.set_x(2, make_small(0)).unwrap();
+        machine.set_x(3, make_atom(plus)).unwrap();
+
+        let instr = Instr::Apply { arity: 2 };
+        let labels = BTreeMap::new();
+        let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
+            .expect_err("a non-atom module must fail");
+        assert!(matches!(err, BeamError::BadArg));
+        assert_eq!(machine.catch_frame_depth(), 0);
+    }
+
+    #[test]
+    fn apply_badarg_without_the_badarg_atom_falls_back_to_the_typed_error() {
+        // A live catch frame, but the module cannot name `badarg` (the atom is
+        // absent from its table): rather than substitute a *different, wrong* atom
+        // the typed `BeamError::BadArg` is returned.
+        let mut fixture = Fixture::new();
+        let plus = fixture.atom("+");
+        let module = fixture.finish();
+
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(4, 6, 0));
+        machine.set_x(2, make_small(0)).unwrap();
+        machine.set_x(3, make_atom(plus)).unwrap();
+
+        let instr = Instr::Apply { arity: 2 };
+        let labels = BTreeMap::new();
+        let err = exec(&mut machine, &module, &labels, &instr, 0, 0, &mut ctx)
+            .expect_err("no `badarg` atom must fall back to the typed error");
+        assert!(matches!(err, BeamError::BadArg));
+        // The raise never started: the catch frame is untouched and nothing pending.
+        assert_eq!(machine.catch_frame_depth(), 1);
+        assert_eq!(machine.pending_exception(), None);
     }
 
     #[test]
