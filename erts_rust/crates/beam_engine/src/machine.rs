@@ -479,6 +479,35 @@ impl Machine {
     // Exception scaffolding (the shared state the `families::exceptions` bodies use)
     // -----------------------------------------------------------------------
 
+    /// The `(function index, code offset)` of every live call frame that is
+    /// currently **suspended in a call**, innermost frame first.
+    ///
+    /// A frame's continuation-pointer slot holds the address its function resumes
+    /// at once the call it is waiting for returns ([`Instr::Call`](beam_loader::Instr)
+    /// writes it through [`Machine::set_continuation`]), so this sequence is the
+    /// engine's replacement for the C runtime's **saved raw stacktrace**: the chain
+    /// of callers, innermost first — the same order C's `build_stacktrace` emits
+    /// (`../../erts/emulator/beam/beam_common.c:1274-1288`).
+    ///
+    /// A frame sitting at [`Continuation::Halt`] contributes nothing: that is the
+    /// bottom frame (pushed by [`Machine::run_label`]) and any frame whose function
+    /// has **not** yet made a call — in particular the frame of the function that
+    /// is executing right now, whose own location the dispatch loop already knows
+    /// and supplies itself (see `crate::families::exceptions`).
+    ///
+    /// Read-only introspection (no state is changed); the caller is the
+    /// Milestone-1 stacktrace builder.
+    pub fn resumption_addresses(&self) -> Vec<(u32, u32)> {
+        self.frames
+            .iter()
+            .rev()
+            .filter_map(|frame| match frame.continuation {
+                Continuation::Address { func, pc } => Some((func, pc)),
+                Continuation::Halt => None,
+            })
+            .collect()
+    }
+
     /// Push a catch frame (the `try`/`catch` handler target).
     pub fn push_catch_frame(&mut self, frame: CatchFrame) {
         self.catch_frames.push(frame);
@@ -971,5 +1000,39 @@ mod tests {
         assert_eq!(machine.y(0), Some(Eterm::from_raw(0xAA)));
         // A stale index (no such frame) is a typed error, never a panic.
         assert!(machine.unwind_to_frame(9).is_err());
+    }
+
+    #[test]
+    fn resumption_addresses_walk_the_callers_innermost_first() {
+        let mut machine = Machine::new();
+        // A frame-less machine has nothing suspended in a call.
+        assert!(machine.resumption_addresses().is_empty());
+
+        // The bottom frame halts, so it contributes nothing.
+        machine.push_frame(0).unwrap();
+        assert!(machine.resumption_addresses().is_empty());
+
+        // F (frame 1) called G: F resumes at (7, 3) once G returns.
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(Continuation::Address { func: 7, pc: 3 })
+            .unwrap();
+        assert_eq!(machine.resumption_addresses(), vec![(7, 3)]);
+
+        // G (frame 2) — the frame of the function executing right now — has not
+        // made a call yet, so it contributes nothing and the caller stays first.
+        machine.push_frame(1).unwrap();
+        assert_eq!(machine.resumption_addresses(), vec![(7, 3)]);
+
+        // G then called H: the caller chain is now H's caller (G at (9, 1)) then
+        // G's caller (F at (7, 3)) — innermost first.
+        machine
+            .set_continuation(Continuation::Address { func: 9, pc: 1 })
+            .unwrap();
+        assert_eq!(machine.resumption_addresses(), vec![(9, 1), (7, 3)]);
+
+        // Popping the innermost frame drops its entry.
+        machine.pop_frame().unwrap();
+        assert_eq!(machine.resumption_addresses(), vec![(7, 3)]);
     }
 }

@@ -23,10 +23,11 @@
 //! - [`exceptions`] — `Badmatch`/`CaseEnd`/`IfEnd`/`Raise`/`Try`/`Catch`/`TryCase`/`TryEnd`/`TryCaseEnd`/`CatchEnd`/`Badrecord`/`BuildStacktrace`/`RawRaise`
 //! - [`floats`] — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`
 //! - [`maps`] — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`
+//! - [`records`] — `UpdateRecord`
 //! - [`bitstrings`] — the `Bs*` family
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
-//! `UpdateRecord`, the receive/message opcodes, the debug-line opcodes,
+//! the receive/message opcodes, the debug-line opcodes,
 //! `NifStart`/`OnLoad`) are not claimed by any submodule, so [`dispatch`] reports
 //! them as unsupported exactly as before.
 
@@ -46,6 +47,7 @@ mod floats;
 mod funs;
 mod lists;
 mod maps;
+mod records;
 mod tuples;
 
 /// Dispatch `instr` to the first instruction family that claims it.
@@ -65,6 +67,9 @@ pub(crate) fn dispatch(
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
     if let Some(step) = tuples::exec(machine, module, labels, instr, func, pc, ctx)? {
+        return Ok(step);
+    }
+    if let Some(step) = records::exec(machine, module, labels, instr, func, pc, ctx)? {
         return Ok(step);
     }
     if let Some(step) = lists::exec(machine, module, labels, instr, func, pc, ctx)? {
