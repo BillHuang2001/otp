@@ -144,7 +144,8 @@ OS / terminal / processes:
 - Application control, boot, kernel supervision → `application*.erl`, `kernel.erl`, `kernel_config.erl`, `kernel_refc.erl`, `erl_reply.erl`, `erl_signal_handler.erl`, `error_handler.erl`, `error_logger.erl`, `heart.erl`
 - Code loading / module management → `code.erl`, `code_server.erl`, `erl_boot_server.erl`, `erl_compile_server.erl`, `erl_ddll.erl`, `erl_debugger.erl`
 - File I/O and disk logs → `file.erl`, `file_server.erl`, `file_io_server.erl`, `raw_file_io*.erl`, `ram_file.erl`, `disk_log*.erl`, `wrap_log_reader.erl`
-- Logging (`logger` framework and handlers) → `logger*.erl`, `data_publisher.erl`
+- Logging (`logger` framework and handlers) → `logger*.erl`
+- Distributed replicated data (peer discovery, versioned updates) → `data_publisher.erl` (used by `pg.erl`)
 - Distribution, node connectivity, name registration → `net_kernel.erl`, `net.erl`, `net_adm.erl`, `auth.erl`, `erl_epmd.erl`, `erl_distribution.erl`, `dist_util.erl`, `dist_ac.erl`, `*_dist.erl`, `*_epmd_socket.erl`, `global*.erl`, `pg.erl`, `pg2.erl`, `rpc.erl`, `erpc.erl`
 - Sockets, addresses and DNS → `socket.erl`, `gen_tcp*.erl`, `gen_udp*.erl`, `gen_sctp.erl`, `inet*.erl`, `local_*.erl`, `inet_dns*.erl`, `inet_res.erl`, `inet_hosts.erl`, `inet_parse.erl`, `inet_gethost_native.erl`
 - OS, terminal/shell I/O, group leaders → `os.erl`, `user_drv.erl`, `user_sup.erl`, `group.erl`, `prim_tty*.erl`, `standard_error.erl`, `group_history.erl`
