@@ -146,6 +146,34 @@ impl Interior for OrderedSetInterior {
     fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
         Box::new(self.tree.iter().map(|entry| entry.obj))
     }
+
+    fn keys(&self) -> Vec<Eterm> {
+        // Ascending `cmp` order: the leaf chain of the B+-tree *is* the sorted key
+        // run, so this is the interior's own iteration order.
+        self.tree.iter().map(|entry| entry.key).collect()
+    }
+
+    fn first_key(&self, atoms: &AtomTable) -> Option<Eterm> {
+        // O(log n) leftmost descent rather than the default's `keys()` scan.
+        OrderedSetInterior::first_key(self, atoms)
+    }
+
+    fn last_key(&self, atoms: &AtomTable) -> Option<Eterm> {
+        // O(log n) rightmost descent rather than the default's `keys()` scan.
+        OrderedSetInterior::last_key(self, atoms)
+    }
+
+    fn next_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        // The smallest stored key strictly greater than `key`, present or not — the
+        // B+-tree's exact successor search, which is also `ets:next/2`'s
+        // range-bound behaviour for `ordered_set`.
+        OrderedSetInterior::next(self, key, atoms)
+    }
+
+    fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        // The largest stored key strictly less than `key` (the mirror of `next_key`).
+        OrderedSetInterior::prev(self, key, atoms)
+    }
 }
 
 #[cfg(test)]
@@ -700,5 +728,57 @@ mod tests {
         assert_eq!(t.first(&atoms), None);
         assert_eq!(t.last(&atoms), None);
         t.tree.check_invariants(&atoms);
+    }
+
+    /// The `Interior` navigation seam: `keys` is the ascending key run and the four
+    /// overrides answer straight from the B+-tree (including for an absent bound).
+    #[test]
+    fn the_navigation_seam_reports_keys_in_ascending_order() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut t = OrderedSetInterior::new();
+        for v in [3i64, 1, 2] {
+            t.insert(make_small(v), object(&mut heap, v, v * 10), &atoms)
+                .unwrap();
+        }
+
+        assert_eq!(
+            Interior::keys(&t),
+            vec![make_small(1), make_small(2), make_small(3)],
+            "`keys` is the ascending key run"
+        );
+        assert_eq!(Interior::first_key(&t, &atoms), Some(make_small(1)));
+        assert_eq!(Interior::last_key(&t, &atoms), Some(make_small(3)));
+        assert_eq!(
+            Interior::next_key(&t, make_small(1), &atoms),
+            Some(make_small(2))
+        );
+        assert_eq!(Interior::next_key(&t, make_small(3), &atoms), None);
+        assert_eq!(
+            Interior::prev_key(&t, make_small(3), &atoms),
+            Some(make_small(2))
+        );
+        assert_eq!(Interior::prev_key(&t, make_small(1), &atoms), None);
+
+        // An absent key is a bound, so its neighbours are still found.
+        assert_eq!(
+            Interior::next_key(&t, make_small(0), &atoms),
+            Some(make_small(1))
+        );
+        assert_eq!(
+            Interior::prev_key(&t, make_small(9), &atoms),
+            Some(make_small(3))
+        );
+
+        // The B+-tree does not account for its node storage yet (documented gap).
+        assert_eq!(Interior::memory(&t), 0);
+
+        // Draining the tree empties both `keys` and the extremes.
+        for v in [1i64, 2, 3] {
+            t.delete(make_small(v), &atoms).unwrap();
+        }
+        assert!(Interior::keys(&t).is_empty());
+        assert_eq!(Interior::first_key(&t, &atoms), None);
+        assert_eq!(Interior::last_key(&t, &atoms), None);
     }
 }

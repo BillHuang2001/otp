@@ -242,6 +242,13 @@ impl HashInterior {
     /// operations: atom storage is global (the runtime's `AtomTable`), not owned by
     /// the interior, so it contributes no words here.
     pub fn memory(&self, _atoms: &AtomTable) -> usize {
+        self.memory_words()
+    }
+
+    /// The interior's word count, shared by the inherent
+    /// [`memory`](HashInterior::memory) and the [`Interior::memory`] seam (which
+    /// has no `AtomTable` parameter).
+    fn memory_words(&self) -> usize {
         let mut words = self.buckets.capacity() * words_of::<Vec<Entry>>();
         for bucket in &self.buckets {
             words += bucket.capacity() * words_of::<Entry>();
@@ -373,6 +380,27 @@ impl Interior for HashInterior {
                 .flat_map(|bucket| bucket.iter())
                 .flat_map(|entry| entry.objs.iter().copied()),
         )
+    }
+
+    fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        // The inherent operation removes the entry in one pass and hands back its
+        // objects, which is exactly the `ets:take/2` result.
+        Ok(HashInterior::take(self, key, atoms))
+    }
+
+    fn keys(&self) -> Vec<Eterm> {
+        // The interior's own iteration order: the bucket scan `iter_objects` walks,
+        // with each entry's key reported once (the multi kinds store several
+        // objects per key).
+        self.buckets
+            .iter()
+            .flat_map(|bucket| bucket.iter())
+            .map(|entry| entry.key)
+            .collect()
+    }
+
+    fn memory(&self) -> usize {
+        self.memory_words()
     }
 }
 

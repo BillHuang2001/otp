@@ -19,7 +19,7 @@ use crate::error::badarg;
 use crate::hash_interior::HashInterior;
 use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
-use crate::kind::{Access, TableKind, TableOptions};
+use crate::kind::{can_read, can_write, Access, TableKind, TableOptions};
 use crate::ordered_interior::OrderedSetInterior;
 use crate::select::{
     MatchBody, MatchBodyElement, MatchElement, MatchGuard, MatchPattern, MatchSpec, SelectPredicate,
@@ -114,6 +114,77 @@ pub(crate) trait Interior {
 
     /// Every stored object, ordered for `ordered_set`.
     fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_>;
+
+    // ------------------------------------- removal, navigation and storage
+
+    /// Remove `key`'s entry and return **every** object stored under it (an empty
+    /// vector when `key` is absent), mirroring `ets:take/2`.
+    ///
+    /// The drop-in default locates the objects and then deletes the entry; the
+    /// hash interior overrides it with its one-pass removal.
+    fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        let objects = self.lookup(key, atoms);
+        if !objects.is_empty() {
+            self.delete(key, atoms)?;
+        }
+        Ok(objects)
+    }
+
+    /// Every stored key, in this interior's own iteration order (ascending
+    /// `beam_term` order for `ordered_set`, bucket-scan order for the hash kinds).
+    fn keys(&self) -> Vec<Eterm>;
+
+    /// The first key in this interior's iteration order (`ets:first/1`); `None`
+    /// when the table is empty (`'$end_of_table'`).
+    fn first_key(&self, _atoms: &AtomTable) -> Option<Eterm> {
+        self.keys().first().copied()
+    }
+
+    /// The last key in this interior's iteration order (`ets:last/1`); `None`
+    /// when the table is empty.
+    fn last_key(&self, _atoms: &AtomTable) -> Option<Eterm> {
+        self.keys().last().copied()
+    }
+
+    /// The key following `key` in this interior's iteration order, or `None` at
+    /// the end of that order.
+    ///
+    /// An **absent** `key` has no position in the iteration order, so the answer
+    /// falls back to the nearest key in `beam_term` term order (the first key
+    /// strictly greater than `key`); that is exactly the `ordered_set` range
+    /// semantics, and it gives the hash default a well-defined answer too.
+    fn next_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        let keys = self.keys();
+        match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {
+            Some(position) => keys.get(position + 1).copied(),
+            None => keys
+                .into_iter()
+                .find(|&candidate| cmp(candidate, key, atoms).is_gt()),
+        }
+    }
+
+    /// The key preceding `key` in this interior's iteration order, or `None` at
+    /// the start of that order (the mirror of [`Interior::next_key`]).
+    fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+        let keys = self.keys();
+        match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {
+            Some(position) => position.checked_sub(1).map(|before| keys[before]),
+            None => keys
+                .into_iter()
+                .rev()
+                .find(|&candidate| cmp(candidate, key, atoms).is_lt()),
+        }
+    }
+
+    /// The number of `Eterm`-sized words this interior has allocated for its own
+    /// index (`ets:info(Tab, memory)`'s interior contribution).
+    ///
+    /// The default is `0` — an interior that does not account for its index
+    /// storage contributes nothing; the hash interior reports its honest
+    /// bucket/entry allocation.
+    fn memory(&self) -> usize {
+        0
+    }
 }
 
 /// Build the interior matching `kind`: the hash index for `set`/`bag`/
@@ -210,7 +281,9 @@ impl Table {
             keypos: self.opts.keypos(),
             access: self.opts.access(),
             size: self.interior.size(),
+            memory: self.memory(),
             owner: self.owner,
+            named_table: self.opts.is_named(),
             compressed: self.opts.is_compressed(),
             write_concurrency: self.opts.write_concurrency(),
             read_concurrency: self.opts.read_concurrency(),
@@ -228,7 +301,20 @@ impl Table {
         // heap.
         let stored = self.store.copy(object)?;
         let stored_key = key_of(stored, keypos)?;
-        self.interior.insert(stored_key, stored, atoms)
+        // A single-object kind (`set`/`ordered_set`) *replaces* the object stored
+        // under an existing key. Look the replaced root up **before** the insert so
+        // its storage can be reclaimed afterwards (the multi kinds only ever add,
+        // so there is nothing to reclaim).
+        let replaced = if self.opts.kind().is_multi() {
+            Vec::new()
+        } else {
+            self.interior.lookup(stored_key, atoms)
+        };
+        self.interior.insert(stored_key, stored, atoms)?;
+        for old in replaced {
+            self.store.free(old);
+        }
+        Ok(())
     }
 
     /// Insert `object` only if its key is absent; returns whether it was
@@ -251,21 +337,42 @@ impl Table {
 
     /// Delete every object stored under `key` (`ets:delete/2`).
     pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()> {
-        self.interior.delete(key, atoms)
+        // Capture the objects about to be removed so their table-owned storage is
+        // reclaimed (a `set`/`ordered_set` entry holds one object, a `bag`/
+        // `duplicate_bag` entry may hold many).
+        let removed = self.interior.lookup(key, atoms);
+        self.interior.delete(key, atoms)?;
+        for object in removed {
+            self.store.free(object);
+        }
+        Ok(())
     }
 
     /// Delete the single object matching `object` (`ets:delete_object/2`).
     pub fn delete_object(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()> {
         // The key is only used to locate the entry; the object itself is compared.
         let key = key_of(object, self.opts.keypos())?;
-        self.interior.delete_object(key, object, atoms)
+        // Capture exactly the objects the interior will remove — the stored objects
+        // under `key` that equal `object` — so their storage is reclaimed afterwards.
+        let removed: Vec<Eterm> = self
+            .interior
+            .lookup(key, atoms)
+            .into_iter()
+            .filter(|&stored| eq(stored, object, atoms))
+            .collect();
+        self.interior.delete_object(key, object, atoms)?;
+        for stored in removed {
+            self.store.free(stored);
+        }
+        Ok(())
     }
 
     /// Delete every object in the table (`ets:delete_all_objects/1`).
     pub fn delete_all_objects(&mut self) {
-        // A fresh interior of the same kind is empty; the `TermStore` keeps its
-        // blocks (M1 does not reclaim term storage — see the crate `CONTEXT.md`,
-        // Known Issues).
+        // `reset` releases every block the store owns (so the per-object runs of
+        // the deleted objects go with them) and leaves the store immediately
+        // usable again; a fresh interior of the same kind is then empty.
+        self.store.reset();
         self.interior = build_interior(self.opts.kind());
     }
 
@@ -285,6 +392,128 @@ impl Table {
         // The public position is 1-based; `0` is `badarg` (mirroring `ets`).
         let pos = pos.checked_sub(1).ok_or_else(badarg)?;
         self.interior.lookup_element(key, pos, atoms)
+    }
+
+    /// `ets:lookup_element/4`: exactly [`lookup_element`](Table::lookup_element),
+    /// except that an absent `key` yields `default` instead of `badarg`.
+    ///
+    /// Verified against the system `erl` (OTP 29 / erts-17.1): `pos` is 1-based and
+    /// `pos == 0` is `badarg` whatever the key; an **absent** key returns `default`
+    /// even when `pos` is beyond the object's arity; a **present** key with a `pos`
+    /// outside the object's arity is `badarg`.
+    pub fn lookup_element_or(
+        &self,
+        key: Eterm,
+        pos: usize,
+        default: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<Eterm> {
+        // `pos` is validated before the key is consulted (mirroring `ets`).
+        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
+        if !self.interior.member(key, atoms) {
+            return Ok(default);
+        }
+        self.interior.lookup_element(key, pos, atoms)
+    }
+
+    /// The number of words allocated to the table (`ets:info(Tab, memory)`): the
+    /// table-owned term storage plus the interior's own index storage.
+    pub fn memory(&self) -> usize {
+        self.store.words() + self.interior.memory()
+    }
+
+    // --------------------------------------------------------------- navigation
+
+    /// The first key in the table's iteration order (`ets:first/1`); `None` is the
+    /// `'$end_of_table'` result and an empty table always yields it.
+    pub fn first(&self, atoms: &AtomTable) -> Option<Eterm> {
+        self.interior.first_key(atoms)
+    }
+
+    /// The last key in the table's iteration order (`ets:last/1`); `None` is the
+    /// `'$end_of_table'` result and an empty table always yields it.
+    pub fn last(&self, atoms: &AtomTable) -> Option<Eterm> {
+        self.interior.last_key(atoms)
+    }
+
+    /// The key following `key` (`ets:next/2`); `Ok(None)` is the
+    /// `'$end_of_table'` result.
+    ///
+    /// Mirrors the verified `erl` (OTP 29 / erts-17.1) behaviour: an `ordered_set`
+    /// reads `key` as a **range bound** — an absent key is fine and the answer is
+    /// the nearest stored key above it (so an empty table yields `'$end_of_table'`)
+    /// — whereas the hash kinds (`set`/`bag`/`duplicate_bag`) walk an internal
+    /// order anchored at a *present* entry and raise `badarg` for an unknown key,
+    /// which includes every key of an empty table.
+    pub fn next(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
+        self.check_navigable(key, atoms)?;
+        Ok(self.interior.next_key(key, atoms))
+    }
+
+    /// The key preceding `key` (`ets:prev/2`); `Ok(None)` is the
+    /// `'$end_of_table'` result. Mirrors [`next`](Table::next) (verified against the
+    /// system `erl`): a range bound for `ordered_set`, a present-key requirement
+    /// (`badarg` otherwise) for the hash kinds.
+    pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
+        self.check_navigable(key, atoms)?;
+        Ok(self.interior.prev_key(key, atoms))
+    }
+
+    /// The guard shared by [`next`](Table::next)/[`prev`](Table::prev): only the
+    /// hash kinds need the anchor key to be present.
+    fn check_navigable(&self, key: Eterm, atoms: &AtomTable) -> Result<()> {
+        if self.opts.kind().is_ordered() || self.interior.member(key, atoms) {
+            Ok(())
+        } else {
+            Err(badarg())
+        }
+    }
+
+    /// Remove `key`'s entry and return every object stored under it
+    /// (`ets:take/2`); an absent key yields an empty vector.
+    ///
+    /// The returned objects **alias table storage** and stay valid for the table's
+    /// lifetime: this call deliberately does **not** reclaim them
+    /// ([`TermStore::free`](crate::store::TermStore::free) would return their runs
+    /// to the store's free lists, where a later `copy` could hand the same words
+    /// out again). Their storage is released by
+    /// [`delete_all_objects`](Table::delete_all_objects)/table drop.
+    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        self.interior.take(key, atoms)
+    }
+
+    /// Whether `requester` may **read** the table; an access violation is
+    /// `BeamError::BadArg`, matching how `ets` reports it.
+    pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()> {
+        if can_read(self.opts.access(), self.owner, requester) {
+            Ok(())
+        } else {
+            Err(badarg())
+        }
+    }
+
+    /// Whether `requester` may **write** the table; an access violation is
+    /// `BeamError::BadArg`, matching how `ets` reports it.
+    pub fn check_write(&self, requester: Option<OwnerId>) -> Result<()> {
+        if can_write(self.opts.access(), self.owner, requester) {
+            Ok(())
+        } else {
+            Err(badarg())
+        }
+    }
+
+    /// An access-enforcing view of this table for the process `requester`.
+    ///
+    /// The [`Table`] methods are owner-level primitives — the operations the
+    /// table's own runtime performs — and do not consult the access mode. A BIF
+    /// acting for a specific process wraps the table in a [`TableAccess`], which
+    /// rechecks `kind::can_read`/`can_write` before every operation and raises
+    /// `BeamError::BadArg` on a violation, exactly like `ets`.
+    pub fn as_requester(&mut self, requester: Option<OwnerId>) -> TableAccess<'_> {
+        TableAccess {
+            table: self,
+            requester,
+        }
     }
 
     /// The number of objects in the table (`ets:size/1`).
@@ -339,6 +568,68 @@ impl Table {
             }
         }
         Ok(selected)
+    }
+}
+
+/// An access-enforcing view over a [`Table`] for a specific requester process.
+///
+/// Obtained from [`Table::as_requester`]. Every operation first rechecks the
+/// table's `protection` against the requester (`kind::can_read`/`can_write`) and
+/// raises `BeamError::BadArg` on a violation, exactly like `ets`. The
+/// underlying [`Table`] methods remain the owner-level, non-checking primitives.
+pub struct TableAccess<'a> {
+    /// The table being accessed.
+    table: &'a mut Table,
+    /// The process on whose behalf the operations run.
+    requester: Option<OwnerId>,
+}
+
+impl TableAccess<'_> {
+    /// The requester this view authenticates as.
+    pub fn requester(&self) -> Option<OwnerId> {
+        self.requester
+    }
+
+    /// `ets:insert/2`, requiring write access.
+    pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()> {
+        self.table.check_write(self.requester)?;
+        self.table.insert(object, atoms)
+    }
+
+    /// `ets:insert_new/2`, requiring write access.
+    pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool> {
+        self.table.check_write(self.requester)?;
+        self.table.insert_new(object, atoms)
+    }
+
+    /// `ets:lookup/2`, requiring read access.
+    pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        self.table.check_read(self.requester)?;
+        Ok(self.table.lookup(key, atoms))
+    }
+
+    /// `ets:member/2`, requiring read access.
+    pub fn member(&self, key: Eterm, atoms: &AtomTable) -> Result<bool> {
+        self.table.check_read(self.requester)?;
+        Ok(self.table.member(key, atoms))
+    }
+
+    /// `ets:lookup_element/3`, requiring read access.
+    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm> {
+        self.table.check_read(self.requester)?;
+        self.table.lookup_element(key, pos, atoms)
+    }
+
+    /// `ets:delete/2`, requiring write access.
+    pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()> {
+        self.table.check_write(self.requester)?;
+        self.table.delete(key, atoms)
+    }
+
+    /// `ets:take/2`, requiring write access (it removes the entry).
+    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        self.table.check_write(self.requester)?;
+        self.table.take(key, atoms)
     }
 }
 
