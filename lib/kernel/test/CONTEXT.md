@@ -65,7 +65,7 @@ Suites run against an INSTALLED OTP release (`TEST_NEEDS_RELEASE=true` in `../Ma
 - `socket_*` suites are also reachable individually through the `socket_suites` wrapper, which runs them as groups (`main`, `api`, `traffic`, `ttest`, `gen_tcp*`, `gen_udp`) and forces the socket inet-backend for the `gen_*` groups.
 - Several suites are >300 KB and `socket_api_SUITE.erl` exceeds 1 MB — read with offset/limit or grep for `all()`/`groups()` instead of reading in full.
 - Keep `zzz_SUITE` last alphabetically (its comment states it must run after everything else) and keep suite names ending in `_SUITE`.
-- `kernel_TEST` hosts analysis keys (`kernel_factor`, host labels) come from `kernel_test_lib` and appear in the suite config.
+- `kernel_test_lib`'s host analysis adds `kernel_factor` and a host label to the suite config, and can skip the whole suite on a known-unstable host.
 
 ## Routing Table
 - `esock_misc/` → manual, non-installed esocket/iow test clients and servers (developer tools)
