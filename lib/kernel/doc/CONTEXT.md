@@ -1,0 +1,55 @@
+# kernel — Documentation
+
+## Intent
+Documentation source and ExDoc build configuration for the `kernel` OTP application.
+Holds only hand-written guides, reference/format documents and the application overview page.
+The per-module reference manual for every `kernel` module is generated from the `-moduledoc`/`@doc` attributes in `../src/*.erl` — there are no per-module markdown files here.
+Build outputs (HTML/EPUB/man) are not stored in this directory.
+
+## API Surface
+- `docs.exs` — ExDoc local configuration sourced by `$(ERL_TOP)/make/ex_doc.exs`; the only hand-maintained doc-build file here.
+  - `groups_for_modules` — sidebar grouping: NETWORKING (`gen_tcp`, `gen_udp`, `gen_sctp`, `socket`, `inet`, `inet_res`, `net`), LOGGING (`logger`, `disk_log`, `error_logger`, `logger_disk_log_h`, `logger_filters`, `logger_formatter`, `logger_handler`, `logger_std_h`, `wrap_log_reader`), DISTRIBUTION (`net_adm`, `net_kernel`, `auth`, `erl_boot_server`, `erl_epmd`, `erpc`, `global`, `global_group`, `pg`, `rpc`), CODE (`code`, `erl_ddll`, `erl_debugger`), TRACING (`seq_trace`, `trace`).
+  - `skip_code_autolink_to: ["t:file_descriptor/0"]` — suppresses ExDoc autolink attempts for that type.
+  - `extras` — explicit ordered list of non-module pages; the order defines the order printed in the docs.
+- `kernel_app.md` — the "Kernel Application" overview page: description, logger handlers, OS signal event handler, the full application-env `Configuration` reference and deprecated parameters.
+- `notes.md` — "Kernel Release Notes", per-version Fixed Bugs/Improvements/Changes entries (largest file here, ~290 KB); picked up automatically as an extra.
+- `guides/introduction_chapter.md` — Kernel scope and prerequisites.
+- `guides/socket_usage.md` — socket API chapter (async calls, socket registry, examples, options, configure flags).
+- `guides/logger_chapter.md` — the main logging chapter (API, filters, handlers, formatters, configuration, error_logger backwards compatibility, built-in handlers, overload protection).
+- `guides/logger_cookbook.md` — task-oriented logger recipes (get info, configure logger/formatter/handlers, logging, filters).
+- `guides/eep48_chapter.md` — EEP-48 "Docs" storage and format chapters used by `code:get_doc/1`.
+- `references/app.md` — the `app(4)` application resource file format reference.
+- `references/config.md` — the `config(4)` sys.config / configuration file format reference.
+- `Makefile` — 36-line stub: includes `../vsn.mk` (sets `VSN=$(KERNEL_VSN)`, `APPLICATION=kernel`) then `$(ERL_TOP)/make/doc.mk`.
+- `src/logger_arch.dia` — Dia diagram source for the logger architecture, no longer referenced by any build step or chapter (leftover; `src/.gitignore` ignores `*.eps`).
+
+## Constraints
+- Do NOT add per-module reference documentation here; module docs belong in `../src/*.erl` as `@doc`/`-moduledoc` attributes.
+- A new guide/reference page must be added to the `extras` list in `docs.exs` to control its position; unlisted `*.md` files in the doc root, `guides/` or `references/` are auto-appended by `make/ex_doc.exs` (so ordering is only guaranteed for listed files).
+- Keep `kernel_app.md` in sync with what `docs.exs` promises as the application overview; it is the `kernel_app(6)` man page source.
+- `references/app.md` and `references/config.md` are man-section 4 sources (`app(4)`, `config(4)`); `*_app.md` maps to man section 6.
+- Head documents with the SPDX `%CopyrightBegin%` HTML comment block (see any existing file).
+- Never edit generated HTML/EPUB output; only sources in this directory.
+
+## Design Decisions
+- `docs.exs` only overrides grouping and extras ordering; everything else (branding, mermaid rendering, cross-app `deps` links to `erts`/`system`/`general_info`) comes from `make/ex_doc.exs`, keeping per-app config minimal.
+- Guides are grouped into the "User's Guides" section of the sidebar by regex (`guides/`), references into "References" — from `make/ex_doc.exs`, not from this directory.
+
+## Dependencies
+- ExDoc (Elixir) plus the `EX_DOC_VERSION` env var required by `make/ex_doc.exs`; `make/doc.mk` provides the `check_ex_doc` guard.
+- Cross-app doc links rely on sibling doc dirs (`../*/doc/html`, `../../erts/doc/html`, `../../system/doc/html`) having been built.
+
+## Notes for Agents
+- Build with `make docs` (or `make release_docs`) inside this directory; the repo-root `Makefile.in` `docs`/`release_docs` targets recurse through `lib/`, `erts/`, `system/doc` with `BUILD_ALL=1`.
+- Man pages (`app(4)`, `config(4)`, `kernel_app(6)`) are derived from `references/*.md` and `*_app.md` by `$(ERL_TOP)/make/doc.mk`; module man pages derive from `../src/*.erl` (files without `moduledoc false.`).
+- `notes.md` is not in `extras` but is included automatically, and is whitelisted in `skip_undefined_reference_warnings_on` because it may reference versions/PRs that do not resolve.
+- Release notes are edited by hand when preparing releases (see "Prepare release" commits) — they are not generated by a script in this repo.
+
+## Routing Table
+- `guides/` → user-guide chapters: introduction, socket usage, logger chapter, logger cookbook, EEP-48.
+- `references/` → format references: `app.md` (`app(4)`), `config.md` (`config(4)`).
+- `src/` → only the unused `logger_arch.dia` diagram source plus `.gitignore`; no buildable sources.
+- `docs.exs` → ExDoc config (module grouping + extras order) for this app.
+- `kernel_app.md` / `notes.md` → application overview page and release notes.
+- `../src/` → the actual module reference documentation (read-only from here; escalate edits to `../src`).
+- `../../../make/doc.mk` and `../../../make/ex_doc.exs` → shared doc build machinery (read-only; escalate to `make/`).
