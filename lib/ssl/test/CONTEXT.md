@@ -40,7 +40,7 @@ Sources live in `../src/` and are handled elsewhere — this node only documents
 - `ssl.cover` — coverage config (`{incl_app,ssl,details}`, excludes `ssl_debug`), fed to `ct_run -cover`.
 
 ## Constraints & Dependencies
-- `../../Makefile` sets `TEST_NEEDS_RELEASE=true`: the suites always run against an *installed release*, so ssl source changes must be built and released before testing.
+- `../Makefile` sets `TEST_NEEDS_RELEASE=true`: the suites always run against an *installed release*, so ssl source changes must be built and released before testing.
 - External OpenSSL CLI on `$PATH` is required by every suite doing real interop and by `make_certs.erl`; the version is probed once via `ssl_test_lib:portable_cmd("openssl", ["version"])` and cached in the process dictionary (`put(openssl_version, …)`).
 - OpenSSL version gates live in `ssl_test_lib` (`check_sane_openssl_version/2`, `openssl_sane_dtls/0`, `openssl_maxfraglen_support/0`, `openssl_ocsp_support/1`, `enough_openssl_crl_support/1`, `check_openssl_npn_support/1`, `is_sane_openssl_pss/1`, `working_openssl_client/1`) — these exist because the `openssl_*` suites must skip on broken/old OpenSSL builds (LibreSSL is tolerated). `ssl_test_lib:init_per_suite/2` throws `{skip, "Unknown openssl version: …"}` for anything not starting with `OpenSSL`/`LibreSSL`.
 - On Windows the suites run the *Linux* `openssl` through `wsl` when `WSLENV` is set (`portable_open_port/2`, `kill_openssl/0` uses `wsl pkill` vs `taskkill openssl.exe`).
