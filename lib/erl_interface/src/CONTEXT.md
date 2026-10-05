@@ -49,7 +49,7 @@ The application is mandatory: the top-level `configure` refuses `--without-erl_i
 
 ## Known Issues
 - `HEADERS` omits `../include/ei_global.h`, so that header is not installed to `…/include` or `usr/include`; the `ei_global_*` functions stay reachable only because `../include/ei.h` duplicates their prototypes (see `global/CONTEXT.md`).
-- `check`/`FAKE_TARGETS` still reference `prog/erl_fake_prog.c` and `-lerl_interface[_st|_r]`, none of which exist any more, so those targets cannot be satisfied; `NEVERUSED` also lists non-existent `whereis.c`, `ei_send.c`, `ei_send_reg.c`, `send_link.c`, and `release` creates an unused `src/auxdir`. `check` is not invoked by the OTP build or CI.
+- `check`/`FAKE_TARGETS` still reference `prog/erl_fake_prog.c` and `-lerl_interface[_st|_r]`, none of which exist any more, so those targets cannot be satisfied; `NEVERUSED` also lists non-existent `whereis.c`, `ei_send.c`, `ei_send_reg.c`, `send_link.c`, and `release` creates an unused `src/auxdir`. `src/Makefile`'s `check` is not invoked by the OTP build or CI (it is unrelated to `otp_build check` / `../../../scripts/otp_build_check`).
 - `misc/ei_compat.c`'s `ei_set_compat_rel()` only assigns a static that nothing reads — the public call is a no-op.
 - Directory-specific gotchas (no input bounds checking in the decoders, `ms == 0` meaning "block forever" for every `_tmo` variant, bignum encode/decode sign+endianness mismatches, fd-table dereference before `ei_*init*()` crashing instead of returning `EBADF`) are recorded in the child `CONTEXT.md` files below.
 
