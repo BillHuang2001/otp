@@ -252,6 +252,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **`executable_line`/`debug_line` opcodes (183/184) are `Generic`**; only `line/1` (via the `Line`
   chunk) drives `Instr::Line`. Column info is not surfaced.
 - **`LocT` (jit-only local table) is not parsed** (irrelevant to interpretation).
+- **`Type` chunk version 3 (OTP 27/28) is parsed with version-4 bit positions** — the OTP 27/28 layout
+  shifts the metadata bits (`beam_file.c:654-687`) and is not re-mapped, so such a chunk yields plausible
+  but possibly wrong bounds. Version 4 (OTP 29+) is correct.
+- **`ChunkId::DBGB` names `"DbgB"`**, but the real debug-info chunk id is `"Dbgi"` (present in the
+  fixture); `Dbgi` is therefore treated as an unknown chunk and skipped — the desired behavior.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
