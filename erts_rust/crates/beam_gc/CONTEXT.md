@@ -130,13 +130,15 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   production bump heap (its `AllocKind::Heap` exhaustion means "collect", per that crate's
   Design Decisions). `HeapSpace` adds only space semantics (`contains`, `reset`, `base`/`top`/`limit`),
   so the collector and the mutator share one allocation implementation (Prevent-Duplication).
-- **MSO is modelled as `RefCount` + `Mso`/`MsoHandle` + `OffHeap`, not bolted onto the heap.** The
-  payload lives **outside** every process heap; the collector **copies only the small heap-resident
-  handle's scalar words** and leaves every off-heap pointer verbatim (the C `sweep_off_heap` rule,
-  `erl_gc.c:2995-3110`). Refcount changes are the **MSO API's** responsibility (`inc` on a new handle,
-  `dec`/destructor when the sweep drops a dead one), so the collector never has to walk off-heap
-  payloads. The on-heap `BinRef`/magic-ref *handle term* itself is the binary/ABI layer's job; this
-  crate owns the refcounted off-heap object and its list.
+- **The off-heap list is `Mso`/`MsoHandle` + `beam_alloc::RefcBinary` + `OffHeap`, not bolted onto the
+  heap.** Both payload kinds live **outside** every process heap; the collector **copies only the small
+  heap-resident handle's scalar words** and leaves every off-heap pointer verbatim (the C
+  `sweep_off_heap` rule, `erl_gc.c:2995-3110`). Refcount changes are the **off-heap API's** responsibility
+  (`inc` on a new handle, `dec`/destructor when the sweep drops a dead one), so the collector never has to
+  walk off-heap payloads. The count is `beam_alloc::RefCount` — the workspace's single `erts_refc_*`
+  primitive, **re-exported** here (no duplicate) — so a refc binary and an MSO share one implementation.
+  The on-heap `BinRef`/`ErlSubBits` *handle term* itself is `beam_term`'s job; this crate owns the
+  refcounted off-heap objects, the shared count, and the per-process list.
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
