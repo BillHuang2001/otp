@@ -62,12 +62,17 @@ Consumers: `erts/lib_src/`, `erts/emulator/` (incl. `beam/sys.h`, `erl_utils.h`,
 ### 4. `<host>/` generated artefacts (absent in a clean checkout)
 `<host>` is the configure host triple, e.g. `x86_64-pc-linux-gnu`, `i686-pc-linux-gnu`, `win32`.
 - `ethread_header_config.h` ← `ethread_header_config.h.in`
-  (`AC_CONFIG_HEADERS`, `../../configure.ac:122`, together with `erts/<host>/config.h`).
-  Defines `ETHR_SIZEOF_{PTR,INT,LONG,LONG_LONG,__INT64,__INT128_T,AO_T}`, `ETHR_BIGENDIAN`,
+  (`AC_CONFIG_HEADERS`, `../../configure.ac:122`, alongside `erts/<host>/config.h`).
+  ~88 `ETHR_*` macros: `ETHR_SIZEOF_{PTR,INT,LONG,LONG_LONG,__INT64,__INT128_T,AO_T}`, `ETHR_BIGENDIAN`,
   `ETHR_PTHREADS` / `ETHR_WIN32_THREADS`, `ETHR_HAVE_*`, `ETHR_FORCE_PTHREAD_RWLOCK`,
-  `ETHR_DISABLE_NATIVE_IMPLS`, `ETHR_SMP_REQUIRE_NATIVE_IMPLS`, the `ETHR_PREFER_*_NATIVE_IMPLS`
-  and `ETHR_TRUST_GCC_ATOMIC_BUILTINS_MEMORY_BARRIERS` knobs.
-  This is the file `ethread.h:32-34` includes first (unless `ETHR_HAVE_ETHREAD_DEFINES` is preset).
+  `ETHR_DISABLE_NATIVE_IMPLS`, the `ETHR_PREFER_*_NATIVE_IMPLS` knobs and
+  `ETHR_TRUST_GCC_ATOMIC_BUILTINS_MEMORY_BARRIERS`.
+  This is the file `ethread.h:32-34` includes first, *unless* `ETHR_HAVE_ETHREAD_DEFINES` is already
+  defined. Note the same `ETHR_*` set (plus extras such as `ETHR_HAVE_ETHREAD_DEFINES` and
+  `ETHR_SMP_REQUIRE_NATIVE_IMPLS`) is also emitted by autoheader into `erts/<host>/config.h`
+  (`../../config.h.in` has ~98 `ETHR*` `#undef`s vs ~88 here) — so grepping only this directory for an
+  `ETHR_*` definition can miss it, and `../../lib_src/` sources that `#include "config.h"` first never
+  reach this header.
 - `ethread.mk`, `erts_internal.mk` (AC_CONFIG_FILES, `../../configure.ac:3946-3947`).
 
 ### 5. Install/export (from `../../lib_src/Makefile.in` `release_spec`, ~lines 432-481)
