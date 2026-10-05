@@ -92,8 +92,8 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `ct_telnet.erl` — telnet client API over `ct_gen_conn`/`ct_telnet_client`; `open/1..4, close/1, cmd/2,3, cmdf/3,4, get_data/1, send/2,3, sendf/3,4, expect/2,3`; types `connection/0, connection_type/0, handle/0, prompt_regexp/0`.
 - `ct_telnet_client.erl` — low-level telnet protocol client (option negotiation, `open/2..6, send_data/2,3, get_data/1`).
 - `unix_telnet.erl` — callback module implementing the `unix_telnet` connection for `ct_telnet` (login/prompt/`?CONN_KEY` handling); the documented example of `ct_gen_conn` usage.
-- `ct_ftp.erl` — FTP client helper (`open/1..4, close/1, cd/2, lcd/2, get/2,3, put/2,3, delete/2, ls/1,2, recv/1,2, send/2,3`); types `connection/0, handle/0`.
-- `ct_ssh.erl` — SSH/SFTP helper wrapping the `ssh` application (`connect/1..4`, `sftp_connect/2`, `ssh_exec/4,5`, `sftp_*/...`, `receive_data/2,3, disconnect/1`).
+- `ct_ftp.erl` — FTP client helper, deprecated as a whole (the `ftp` application is going away): `open/1, close/1, cd/2, ls/2, type/2, get/3, put/3, delete/2, recv/2,3, send/2,3`; types `connection/0, handle/0`; compiled with `nowarn_deprecated_function`.
+- `ct_ssh.erl` — SSH/SFTP helper wrapping the `ssh` application: connection API `connect/1,2,3, disconnect/1, session_open/1,2, shell/2,3, exec/2,3,4, subsystem/3,4, send/3,4,5, receive_response/2,3,4, send_and_receive/3..6`, plus `sftp_connect/1` and the full SFTP file-op set (`read_file/2,3, write_file/3,4, list_dir/2,3, open/3,4, close/2,3, read/3,4, write/3,4, rename/3,4, delete/2,3, make_dir/2,3, read_file_info/2,3, ...`).
 - `ct_snmp.erl` — SNMP helper for suites (start/stop agent+manager, `get_next_values`, MIB loading); exports agent/manager config types; calls `application:load(snmp)` lazily.
 - `ct_netconfc.erl` — RFC 6241/6242 NETCONF client (SSH or plain socket transport); the largest helper (~2.8k lines), with its own `ct_netconfc.hrl` and types (`client/0`, `session/0`, `netconf_db/0`, ...).
 - `ct_gen_conn.erl` — see (b); the generic connection-handler machinery these helpers build on.
