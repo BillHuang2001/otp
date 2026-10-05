@@ -186,11 +186,18 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 
 ## Known Structural Debt (candidates for the next pass)
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
-  `beam_gc::OffHeap` is push-only; the view should be absorbed into `beam_gc` (Prevent-Duplication).
-- `beam_codec::decode.rs` keeps a private `MAP_SMALL_MAP_LIMIT` decode-policy constant (not a layout
-  duplicate) — fine, but a future home for map-policy constants may be `beam_term`.
+  `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
+  (Prevent-Duplication).
+- The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
+  `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
+  oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
+- Pre-existing test failure OUTSIDE this node (fails identically at the pre-work baseline):
+  `beam_bifs::binconv::tests::binary_terms_are_the_documented_codec_gap` — belongs to the
+  `beam_bifs`/`beam_codec` nodes.
 - Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
-  entries for the `beam_term` extensions and the `beam_abi` frozen-header seam work.
+  entries for the `beam_term` foundation extensions (`map`/`bitstring`/`refc`), the `RefCount` move into
+  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, and the
+  `beam_abi` frozen-header seam work.
 
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
