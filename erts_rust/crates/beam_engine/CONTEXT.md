@@ -96,10 +96,24 @@ Readers (no `ctx`; wrong type / out-of-range → `BeamError::BadArg`):
 `tuple_arity`, `tuple_element`, `cons_head`, `cons_tail`, `list_elements`, `float_value`, `map_entries` (flatmap **and** hashmap/HAMT — walks the frozen `erl_map.h` node tree), `binary_bytes`, `is_fun`, `fun_arity`, `fun_num_free`, `fun_uniq`, `fun_index`, `fun_free`.
 Ownership model (documented at the module top): the context owns the heap, `alloc_words` hands out stable raw pointers, and **only this module dereferences them**.
 
-### The JIT tiers (`src/jit.rs`, feature-gated)
-- `pub trait JitBackend { fn compile(...) -> Result<...>; fn available(&self) -> bool; }` (design placeholder) and `pub fn available_tiers() -> &'static [&'static str]` (returns `["interpreter"]` unless a JIT feature is enabled).
-- Cargo features: **`jit-cranelift` (default OFF)** gates the optional Cranelift deps; `jit-beamasm` is a documented stub.
-- With no JIT feature the crate builds and tests with **no Cranelift dependency at all** — the build and the vertical slice never depend on Cranelift codegen.
+### The JIT tier seam (`src/jit/mod.rs`)
+- `pub enum Tier { Interpreter, BaselineJit, Cranelift }` (`Clone, Copy, Debug, PartialEq, Eq`; `Tier::ALL` is the roster order, interpreter first): `Tier::name() -> &'static str` (`"interpreter"` / `"baseline-jit"` / `"jit-cranelift"`), `Tier::from_name(&str) -> Option<Tier>` (unknown name ⇒ `None`, never a default tier) and `Tier::is_available() -> bool` (the tier is in this build's roster).
+- `pub trait JitBackend` — the seam a **native** tier implements:
+  ```rust
+  pub trait JitBackend {
+      type Compiled;
+      fn name(&self) -> &'static str;
+      fn available(&self) -> bool;
+      fn compile(&mut self, module: &Module) -> Result<Self::Compiled>;
+      fn run_export(&mut self, machine: &mut Machine, module: &Module, function: Atom,
+                    arity: u32, args: &[Eterm], ctx: &mut dyn ExecutionContext) -> Result<Eterm>;
+  }
+  ```
+  `&mut self` because a backend owns its code buffer/caches; `Compiled` is the backend's opaque per-module artifact. The interpreter is deliberately **not** a `JitBackend` (nothing to compile).
+- `pub fn available_tiers() -> &'static [&'static str]` — the tiers compiled into this build: exactly `["interpreter", "baseline-jit"]`, plus `"jit-cranelift"` when the **`jit-cranelift`** feature is enabled. Interpreter always first; the roster is a prefix of `Tier::ALL` mapped to `Tier::name`.
+- `Machine::run_with_tier(..., tier: Tier) -> Result<Eterm>` (`src/machine.rs`) is the tier-selecting entry: `Interpreter` delegates to `run_export` (which stays the default interpreter entry), `BaselineJit` **also** delegates to it until the native backend lands, `Cranelift` is `error::unsupported("jit-cranelift tier not built")` — a typed error, never a panic and never a silent fallback.
+- Cargo features: **`jit-cranelift` (default OFF)** gates the optional Cranelift deps. With it off the crate builds and tests with **no Cranelift dependency at all** — the build and the vertical slice never depend on Cranelift codegen. `jit-beamasm` is a **documented alias for the baseline tier** (the baseline tier is in every build's roster, so the feature adds nothing; it is kept so `--features jit-beamasm` keeps working).
+- The native backends are not implemented: a follow-up task adds `src/jit/baseline.rs` (+ `emitter.rs`) and `src/jit/cranelift.rs` as submodules of this one, each implementing `JitBackend`.
 
 ### Error interop (`src/error.rs`)
 - Engine error constructors over `beam_common::BeamError` (never a crate-local enum): `unsupported(what: &str)` (a `Raise` with reason atom `unsupported_opcode: <what>`), `bad_register(n: u32)` (`BadArg`), `unknown_label(Label)` (`BadArg`).
