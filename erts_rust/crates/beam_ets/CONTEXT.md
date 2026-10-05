@@ -290,8 +290,9 @@ impl Table {
   only by `delete_all_objects`/drop.
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
-- **Named-table lookup-by-name is the runtime's job.** `Table` exposes `name()`/`is_named()`; the
-  global name→table registry lives in `beam_rt`/`beam_bifs`.
+- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
+  `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
+  crate holds no global state, so it must not duplicate that registry).
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
   refs/sub-bitstrings cannot be copied into table storage (`insert` ⇒ `BadArg`).
 - **The match-spec compiler covers the common guard set**, not the full Erlang guard language
