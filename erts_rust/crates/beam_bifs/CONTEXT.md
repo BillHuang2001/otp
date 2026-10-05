@@ -319,7 +319,9 @@ caller's heap (they alias table storage in `beam_ets`). Small and documented; se
 - `src/io.rs` → `io:format/1,2` + the directive engine
 - `src/print.rs` → the `~w`/`~p` term printer
 - `src/ets.rs` → `TableRegistry` + the `ets:new/insert/lookup/delete` bridge over `beam_ets::Table`
-- `tests/` → crate-level integration tests (registry + a representative BIF sweep over a real context)
+- `tests/registry.rs` → the `BifRegistry` seam (54-key roster, unknown/bad-arity contract)
+- `tests/erlang_bifs.rs` → the `erlang`/`erts_internal` BIF sweep + `SendHook` + reason mapping
+- `tests/io_ets.rs` → `io:format` exact bytes + the `ets` bridge round-trip
 - `../beam_engine/CONTEXT.md` → the `ExecutionContext::call_bif` seam this registry plugs into (read-only)
 - `../beam_process/CONTEXT.md` → `ProcessId`, `SignalAtoms`, the exit-reason handoff (read-only)
 - `../beam_ets/CONTEXT.md` → `Table`/`TableOptions` the `ets` bridge drives (read-only)
