@@ -239,14 +239,34 @@ pub enum TestKind {
 impl TestKind {
     /// Classifies a test opcode into its [`TestKind`], or `None` if the opcode is
     /// not one of the `is_*`/`test_arity` family.
-    // TODO(beam_loader-impl): map each test opcode (is_lt, is_ge, is_eq, is_ne,
-    // TODO(beam_loader-impl): is_eq_exact, is_ne_exact, is_integer, is_float,
-    // TODO(beam_loader-impl): is_number, is_atom, is_pid, is_reference, is_port,
-    // TODO(beam_loader-impl): is_nil, is_binary, is_bitstr, is_list,
-    // TODO(beam_loader-impl): is_nonempty_list, is_tuple, is_map, test_arity) to
-    // TODO(beam_loader-impl): its TestKind; every other opcode yields None.
-    pub fn from_opcode(_op: Opcode) -> Option<TestKind> {
-        None
+    pub fn from_opcode(op: Opcode) -> Option<TestKind> {
+        Some(match op {
+            Opcode::is_lt => TestKind::IsLt,
+            Opcode::is_ge => TestKind::IsGe,
+            Opcode::is_eq => TestKind::IsEq,
+            Opcode::is_ne => TestKind::IsNe,
+            Opcode::is_eq_exact => TestKind::IsEqExact,
+            Opcode::is_ne_exact => TestKind::IsNeExact,
+            Opcode::is_integer => TestKind::IsInteger,
+            Opcode::is_float => TestKind::IsFloat,
+            Opcode::is_number => TestKind::IsNumber,
+            Opcode::is_atom => TestKind::IsAtom,
+            Opcode::is_pid => TestKind::IsPid,
+            Opcode::is_reference => TestKind::IsReference,
+            Opcode::is_port => TestKind::IsPort,
+            Opcode::is_nil => TestKind::IsNil,
+            Opcode::is_binary => TestKind::IsBinary,
+            Opcode::is_bitstr => TestKind::IsBitstr,
+            Opcode::is_list => TestKind::IsList,
+            Opcode::is_nonempty_list => TestKind::IsNonemptyList,
+            Opcode::is_tuple => TestKind::IsTuple,
+            Opcode::is_map => TestKind::IsMap,
+            Opcode::test_arity => TestKind::TestArity,
+            // Every other opcode (including the `is_*`-named but non-test
+            // `is_constant`/`is_boolean`/`is_function*`/`is_*_record` family) is not
+            // a test instruction the engine matches on.
+            _ => return None,
+        })
     }
 }
 
