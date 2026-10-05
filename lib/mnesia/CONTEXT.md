@@ -40,7 +40,7 @@ The public API is the single module `mnesia` (see `src/CONTEXT.md` for the modul
 - The schema is itself a Mnesia table (`schema`), so schema changes are ordinary transactions ordered by `mnesia_schema`.
 - Three built-in storage types are implemented inline as `mnesia_lib:db_*` clauses: `ram_copies` (ets), `disc_copies` (ets + transaction log, dumped by `mnesia_dumper`) and `disc_only_copies` (dets).
 - External storage backends are pluggable per table via the `mnesia_backend_type` behaviour (`storage_properties` table option / `add_backend_type/2`); `mnesia_lib:db_*` dispatches on the storage type, so a backend is reached through the same access path.
-- Fragmentation (`mnesia_frag` + `mnesia_frag_hash`) horizontally partitions a table into `frag`-suffixed tables, hiding it behind a wrapper table name; the hash can be swapped via `change_table_frag/2`.
+- Fragmentation (`mnesia_frag` + `mnesia_frag_hash`) horizontally partitions a table into `frag`-suffixed tables; `mnesia_frag` is an alternative `access_module` (`-mnesia access_module mnesia_frag`) whose callbacks resolve the wrapper table name to a fragment and then re-enter `mnesia` with the fragment's name. The hash can be swapped via `change_table_frag/2`.
 - Backups use a versioned, self-describing format (`#log_header{}` in `src/mnesia.hrl` may never change) so they are usable as an interchange format across releases and by external tools; `mnesia_text` adds a human-readable variant.
 - `mnesia_rpc` is a dedicated RPC server so floods of dirty operations cannot overload the standard `rpc` server.
 - Fallback files (`install_fallback`) are an offline repair mechanism, handled by `mnesia_bup` with the `mnesia_fallback` process.
