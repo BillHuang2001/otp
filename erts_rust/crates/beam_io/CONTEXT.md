@@ -132,8 +132,8 @@ unit tests + 12 integration tests):
 - `tests/poller.rs` (integration, real OS fds): a **socketpair** registered `READABLE` reports a
   readiness event with the right `key` after a write to the peer; **poll-with-no-events** returns empty
   after ≈ the timeout; `poll(Some(2s))` is interrupted by `Waker::wake` from another thread; **two
-  wakers obtained from the same `Poller`** both fire (and one may be dropped mid-test) — the shared
-  single wakeup handle no longer panics on a second `waker()` call; a waker clone moved to another
+  wakers obtained from the same `Poller`** both fire (and one may be dropped mid-test), which is safe
+  because the poller owns a single shared wakeup handle; a waker clone moved to another
   thread wakes a later blocking poll; reregister switches readability → writability; deregister stops
   events; a double-register of the same fd errors (`AlreadyExists` → `Io`).
 - `tests/port.rs` (integration, end-to-end): `PortRegistry::open` a `FdDriver::pipe()` port →
