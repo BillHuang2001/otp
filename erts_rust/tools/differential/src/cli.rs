@@ -98,8 +98,9 @@ pub fn usage(topic: Option<&str>) -> String {
         None | Some("help") => ROOT_USAGE.to_string(),
         Some("run") => format!(
             "differential run <case-id> [--json] [--out <dir>]\n\n\
-             Run one built-in corpus case under the oracle and the Rust runtime with\n\
-             identical argv, then compare stdout/exit-status/stderr and the case golden.\n\
+             Run one built-in corpus case under the oracle and the Rust runtime, then\n\
+             compare the observations (an expression case with one shared argv; a\n\
+             module-run case with per-side argv) plus the case golden.\n\
              An unknown <case-id> is a usage error (exit 2).\n\n\
              OPTIONS:\n  \
              --json        print the JSON report to stdout\n  \
@@ -168,7 +169,8 @@ ENVIRONMENT:
   ERTS_ORACLE     oracle runtime; defaults to `erl` resolved on $PATH
   BEAM_RT         Rust runtime; defaults to the workspace-relative
                   erts_rust/target/{release,debug}/beam_rt
-
+  ERLC            module compiler for the module-run cases; defaults to `erlc`
+                  resolved on $PATH (a missing `erlc` skips those cases)
 EXIT CODES:
   0  every executed case agreed (unsupported/skipped are reported, not fatal)
   1  at least one mismatch (including oracle-vs-its-own-golden corpus drift)

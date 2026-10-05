@@ -1,23 +1,36 @@
 //! Orchestration: run a case under both runtimes and turn the observations into a verdict.
 //!
-//! The runner is deliberately dumb and symmetrical: it resolves the two runtimes once,
-//! builds **one** argv (the same for both — `beam_rt` is a drop-in `erl`, contract A.6),
-//! observes the oracle, checks the oracle against the case golden, observes the Rust side
-//! if it exists, and derives the verdict.
+//! The runner is deliberate and symmetrical. Per case it builds a *plan* — the argv each
+//! runtime receives and which observables are compared — then observes the oracle, checks
+//! the oracle against the case golden, observes the Rust side if it exists, and derives
+//! the verdict.
+//!
+//! * Expression cases ([`CaseKind::Eval`]) hand **one** argv to both runtimes (`beam_rt` is
+//!   a drop-in `erl` for them, contract A.6) and compare stdout + exit status + stderr.
+//! * Module-run cases ([`CaseKind::Module`]) hand **different** argv to the two runtimes
+//!   (the oracle's `-pa` + `-eval` vs. the Rust `run` action) and compare stdout + exit
+//!   status only (the Rust runtime's stderr boot banner is not a semantic difference).
 //!
 //! * The **oracle** is mandatory: without it there is nothing to compare against, so a
 //!   missing oracle is a loud [`Error::Env`] (exit 2) — never a fabricated result.
-//! * The **Rust runtime** may legitimately be absent (`beam_rt` does not exist yet): the
-//!   Rust side is then [`SideResult::Unsupported`] and the case can only ever be
-//!   `unsupported`, never `agree`.
+//! * The **Rust runtime** may legitimately be absent (`beam_rt` not built): the Rust side
+//!   is then [`SideResult::Unsupported`] and the case can only ever be `unsupported`,
+//!   never `agree`.
+//! * A Rust runtime that *runs* but exits with [`UNSUPPORTED_EXIT_CODE`] (`3`) has hit a
+//!   documented **capability gap**; that side is classified `unsupported` (carrying its
+//!   `beam_rt: unsupported: …` stderr line), **not** a differing observable result.
 //! * A case whose *oracle* disagrees with its own golden is **corpus drift** and is a
 //!   mismatch even when no Rust runtime exists — the corpus is self-testing.
+//!
+//! [`UNSUPPORTED_EXIT_CODE`]: crate::runtime::UNSUPPORTED_EXIT_CODE
 
 use crate::compare::{
-    check_golden, compare_observations, verdict, FieldDiff, GoldenCheck, SideResult, Verdict,
+    check_golden, compare_observations_with, verdict_with, FieldDiff, GoldenCheck, Observables,
+    SideResult, Verdict,
 };
-use crate::corpus::{self, Case, Contract, Golden, Probe};
+use crate::corpus::{self, Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 use crate::error::Result;
+use crate::module_build;
 use crate::runtime::{self, RuntimeSpec};
 
 /// The two resolved runtimes a run observes (resolved once per invocation).
@@ -38,17 +51,23 @@ pub struct CaseOutcome {
     pub description: String,
     /// The contracts the case covers.
     pub contracts: Vec<Contract>,
-    /// The probe expression that was handed to both runtimes.
+    /// The oracle's `-eval` expression (for a module case, the `io:format` that applies
+    /// the function — the Rust side is driven through its `run` action instead).
     pub eval: String,
-    /// The argv both runtimes were spawned with.
-    pub argv: Vec<String>,
+    /// The argv handed to the oracle.
+    pub oracle_argv: Vec<String>,
+    /// The argv handed to the Rust runtime (equal to [`Self::oracle_argv`] for expression
+    /// cases; different for module-run cases). Empty when the case was skipped before it
+    /// could run.
+    pub rust_argv: Vec<String>,
     /// The oracle side.
     pub oracle: SideResult,
     /// The Rust side.
     pub rust: SideResult,
     /// The oracle's check against the case golden (not asserted for ad-hoc comparisons).
     pub golden: GoldenCheck,
-    /// Whether a golden was asserted at all (`false` for [`compare_expr`]).
+    /// Whether a golden was actually checked (`false` for [`compare_expr`], and for a case
+    /// that was skipped before it could run).
     pub golden_asserted: bool,
     /// The derived verdict.
     pub verdict: Verdict,
@@ -97,37 +116,46 @@ pub fn run_case(case: &Case) -> Result<CaseOutcome> {
 
 /// [`run_case`] with an already resolved [`RuntimeContext`].
 pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome> {
-    run_probe(
-        context,
-        ProbeRequest {
-            case_id: case.id.to_string(),
-            description: case.description.to_string(),
-            contracts: case.contracts.to_vec(),
-            expr: case.expr,
-            extra_argv: case.extra_argv,
-            pa: &[],
-            probe: case.probe,
-            golden: Some(case.golden),
-        },
-    )
+    match &case.kind {
+        CaseKind::Eval {
+            expr,
+            extra_argv,
+            probe,
+        } => {
+            let eval = corpus::probe_expr(expr, *probe);
+            let argv = argv_for(&eval, extra_argv, &[]);
+            let plan = RunPlan {
+                case_id: case.id.to_string(),
+                description: case.description.to_string(),
+                contracts: case.contracts.to_vec(),
+                eval,
+                oracle_argv: argv.clone(),
+                rust_argv: argv,
+                observables: Observables::All,
+                golden: Some(case.golden),
+            };
+            execute(context, plan, None)
+        }
+        CaseKind::Module(run) => run_module_case(context, case, run),
+    }
 }
 
 /// Evaluate an ad-hoc expression under both runtimes and compare (no golden is asserted).
 pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
     let context = resolve_context()?;
-    run_probe(
-        &context,
-        ProbeRequest {
-            case_id: "ad-hoc".to_string(),
-            description: format!("ad-hoc comparison of `{expr}`"),
-            contracts: Vec::new(),
-            expr,
-            extra_argv: &[],
-            pa,
-            probe: Probe::TermToBinary,
-            golden: None,
-        },
-    )
+    let eval = corpus::probe_expr(expr, Probe::TermToBinary);
+    let argv = argv_for(&eval, &[], pa);
+    let plan = RunPlan {
+        case_id: "ad-hoc".to_string(),
+        description: format!("ad-hoc comparison of `{expr}`"),
+        contracts: Vec::new(),
+        eval,
+        oracle_argv: argv.clone(),
+        rust_argv: argv,
+        observables: Observables::All,
+        golden: None,
+    };
+    execute(&context, plan, None)
 }
 
 /// Run the whole built-in corpus.
@@ -152,59 +180,52 @@ pub fn run_suite(strict: bool) -> Result<SuiteOutcome> {
 
 /// The reason recorded for the Rust side when no `beam_rt` binary could be found.
 pub fn rust_unsupported_reason() -> String {
-    "no Rust runtime found: $BEAM_RT is unset and no built beam_rt exists under the workspace \
-     target/{release,debug} directory (crates/beam_rt is a stub that cannot execute cases)"
+    "no Rust runtime found: $BEAM_RT is unset and no built beam_rt exists under the \
+     workspace target/{release,debug} directory"
         .to_string()
 }
 
-/// Everything one probe run needs (kept in a struct so the runner's signature stays readable).
-struct ProbeRequest<'a> {
-    case_id: String,
-    description: String,
-    contracts: Vec<Contract>,
-    expr: &'a str,
-    extra_argv: &'a [&'a str],
-    pa: &'a [String],
-    probe: Probe,
-    golden: Option<Golden>,
-}
-
-/// The symmetrical runner: one argv, two observations, one verdict.
-fn run_probe(context: &RuntimeContext, request: ProbeRequest<'_>) -> Result<CaseOutcome> {
-    let eval = corpus::probe_expr(request.expr, request.probe);
-    let argv = argv_for(&eval, request.extra_argv, request.pa);
-
-    // The oracle comes first: it defines the reference observation and the golden check.
-    let oracle_observation = runtime::run(&context.oracle, &argv)?;
-    let golden_check = match &request.golden {
+/// Run one planned case and derive its outcome.
+///
+/// `_module_guard` (a [`module_build::CompiledModule`]) owns the compiled module's
+/// temporary directory and must stay alive for the whole call, so it is dropped only
+/// after both runtimes have been observed.
+fn execute(
+    context: &RuntimeContext,
+    plan: RunPlan,
+    _module_guard: Option<module_build::CompiledModule>,
+) -> Result<CaseOutcome> {
+    let oracle_observation = runtime::run(&context.oracle, &plan.oracle_argv)?;
+    let golden_check = match &plan.golden {
         Some(golden) => check_golden(&oracle_observation, golden),
         None => GoldenCheck::not_asserted(),
     };
     let oracle = SideResult::observed(oracle_observation);
 
     let rust = match &context.rust {
-        Some(spec) => SideResult::observed(runtime::run(spec, &argv)?),
+        Some(spec) => classify_rust(runtime::run(spec, &plan.rust_argv)?),
         None => SideResult::unsupported(rust_unsupported_reason()),
     };
 
     let diffs = match (&oracle, &rust) {
         (SideResult::Observed(oracle), SideResult::Observed(rust)) => {
-            compare_observations(oracle, rust)
+            compare_observations_with(oracle, rust, plan.observables)
         }
         _ => Vec::new(),
     };
-    let derived_verdict = verdict(&oracle, &rust, &golden_check);
+    let derived_verdict = verdict_with(&oracle, &rust, &golden_check, plan.observables);
 
     Ok(CaseOutcome {
-        case_id: request.case_id,
-        description: request.description,
-        contracts: request.contracts,
-        eval,
-        argv,
+        case_id: plan.case_id,
+        description: plan.description,
+        contracts: plan.contracts,
+        eval: plan.eval,
+        oracle_argv: plan.oracle_argv,
+        rust_argv: plan.rust_argv,
         oracle,
         rust,
         golden: golden_check,
-        golden_asserted: request.golden.is_some(),
+        golden_asserted: plan.golden.is_some(),
         verdict: derived_verdict,
         diffs,
         oracle_spec: context.oracle.clone(),
@@ -212,7 +233,92 @@ fn run_probe(context: &RuntimeContext, request: ProbeRequest<'_>) -> Result<Case
     })
 }
 
-/// Build the argv both runtimes get: any `-pa <dir>` for module cases, the case's own
+/// Run a module-run case: compile the embedded module, then compare the two runtimes.
+fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Result<CaseOutcome> {
+    let Some(erlc) = module_build::resolve_erlc()? else {
+        return Ok(skipped_module_outcome(context, case, run));
+    };
+    let compiled = module_build::compile(&erlc, run.source, run.module)?;
+    let plan = RunPlan {
+        case_id: case.id.to_string(),
+        description: case.description.to_string(),
+        contracts: case.contracts.to_vec(),
+        eval: run.oracle_eval(),
+        oracle_argv: run.oracle_argv(compiled.dir()),
+        rust_argv: run.rust_argv(compiled.dir()),
+        observables: Observables::StdoutAndExit,
+        golden: Some(case.golden),
+    };
+    execute(context, plan, Some(compiled))
+}
+
+/// The outcome of a module-run case that could not be compiled (no `erlc` on the machine).
+///
+/// Nothing was observed, so this is a loud [`Verdict::Skipped`] — never a pass and never
+/// agreement. It is non-fatal by default and fatal under `--strict`.
+fn skipped_module_outcome(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> CaseOutcome {
+    let side = SideResult::unsupported(module_build::MISSING_ERLC_REASON);
+    CaseOutcome {
+        case_id: case.id.to_string(),
+        description: case.description.to_string(),
+        contracts: case.contracts.to_vec(),
+        eval: run.oracle_eval(),
+        oracle_argv: Vec::new(),
+        rust_argv: Vec::new(),
+        oracle: side.clone(),
+        rust: side,
+        golden: GoldenCheck::not_asserted(),
+        golden_asserted: false,
+        verdict: Verdict::Skipped,
+        diffs: Vec::new(),
+        oracle_spec: context.oracle.clone(),
+        rust_spec: context.rust.clone(),
+    }
+}
+
+/// Classify a Rust-runtime observation.
+///
+/// The documented exit-3 signal ([`runtime::UNSUPPORTED_EXIT_CODE`]) means the runtime hit
+/// a **capability gap**, so the side is recorded as [`SideResult::Unsupported`] carrying its
+/// stderr diagnostic — **not** as an observation that would diff against the oracle (which
+/// would wrongly be a `mismatch`). Every other exit status is a genuine observation.
+fn classify_rust(observation: runtime::Observation) -> SideResult {
+    if observation.exit_code == Some(runtime::UNSUPPORTED_EXIT_CODE) {
+        SideResult::unsupported(unsupported_reason(&observation))
+    } else {
+        SideResult::observed(observation)
+    }
+}
+
+/// The reason recorded for an exit-3 observation: its first non-empty stderr line, with
+/// trailing whitespace trimmed (the runtime prints `beam_rt: unsupported: <reason>`).
+fn unsupported_reason(observation: &runtime::Observation) -> String {
+    let stderr = String::from_utf8_lossy(&observation.stderr);
+    for line in stderr.lines() {
+        if !line.trim().is_empty() {
+            return line.trim_end().to_string();
+        }
+    }
+    format!(
+        "the Rust runtime exited {} (unsupported) with no diagnostic on stderr",
+        runtime::UNSUPPORTED_EXIT_CODE
+    )
+}
+
+/// Everything one planned run needs (kept in a struct so the runner's signature stays
+/// readable).
+struct RunPlan {
+    case_id: String,
+    description: String,
+    contracts: Vec<Contract>,
+    eval: String,
+    oracle_argv: Vec<String>,
+    rust_argv: Vec<String>,
+    observables: Observables,
+    golden: Option<Golden>,
+}
+
+/// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own
 /// extra argv, then the standard `["-noshell", … , "-eval", <probe>]` shape.
 fn argv_for(eval: &str, extra_argv: &[&str], pa: &[String]) -> Vec<String> {
     let mut extra: Vec<String> = Vec::with_capacity(extra_argv.len() + pa.len() * 2);
@@ -226,17 +332,37 @@ fn argv_for(eval: &str, extra_argv: &[&str], pa: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{argv_for, rust_unsupported_reason};
-    use crate::corpus::{cases, find_case, probe_expr, Probe};
-    use crate::runtime::{RuntimeId, RuntimeSource, RuntimeSpec};
+    use super::{argv_for, classify_rust, rust_unsupported_reason, unsupported_reason};
+    use crate::compare::SideResult;
+    use crate::corpus::{cases, find_case, probe_expr, CaseKind, Probe};
+    use crate::runtime::{Observation, RuntimeId, RuntimeSource, RuntimeSpec, UNSUPPORTED_EXIT_CODE};
     use std::path::PathBuf;
+
+    fn observation(exit_code: i32, stdout: &[u8], stderr: &[u8]) -> Observation {
+        Observation {
+            runtime: RuntimeId::Rust,
+            program: PathBuf::from("/opt/beam_rt"),
+            argv: vec!["run".to_string()],
+            stdout: stdout.to_vec(),
+            stderr: stderr.to_vec(),
+            exit_code: Some(exit_code),
+        }
+    }
 
     #[test]
     fn argv_is_identical_for_both_runtimes_and_carries_pa_and_flags() {
         let case = find_case("flags/custom_argument").expect("case");
-        let eval = probe_expr(case.expr, case.probe);
+        let CaseKind::Eval {
+            expr,
+            extra_argv,
+            probe,
+        } = case.kind
+        else {
+            panic!("flags/custom_argument must be an eval case");
+        };
+        let eval = probe_expr(expr, probe);
         let pa = vec!["ebin".to_string(), "/other".to_string()];
-        let argv = argv_for(&eval, case.extra_argv, &pa);
+        let argv = argv_for(&eval, extra_argv, &pa);
         assert_eq!(argv[0], "-noshell");
         assert_eq!(
             &argv[1..5],
@@ -264,11 +390,22 @@ mod tests {
         };
         assert_eq!(oracle.id, RuntimeId::Oracle);
         assert_ne!(render(&oracle), render(&rust));
+    }
+
+    #[test]
+    fn every_eval_case_probe_is_self_terminating() {
         for case in cases() {
-            let eval = probe_expr(case.expr, case.probe);
-            assert!(eval.ends_with("end."), "{}: probe not self-terminating", case.id);
+            let CaseKind::Eval { expr, probe, .. } = case.kind else {
+                continue;
+            };
+            let eval = probe_expr(expr, probe);
             assert!(
-                matches!(case.probe, Probe::TermToBinary | Probe::Value),
+                eval.ends_with("end."),
+                "{}: probe not self-terminating",
+                case.id
+            );
+            assert!(
+                matches!(probe, Probe::TermToBinary | Probe::Value),
                 "{}",
                 case.id
             );
@@ -284,6 +421,55 @@ mod tests {
         let reason = rust_unsupported_reason();
         assert!(reason.contains("$BEAM_RT"));
         assert!(reason.contains("beam_rt"));
-        assert!(reason.contains("stub"));
+        assert!(reason.contains("no Rust runtime found"));
+    }
+
+    #[test]
+    fn the_capability_gap_signal_is_classified_unsupported_not_observed() {
+        let exit_three = observation(
+            UNSUPPORTED_EXIT_CODE,
+            b"",
+            b"beam_rt: unsupported: cannot evaluate \"length([a,b,c])\"\n",
+        );
+        let side = classify_rust(exit_three);
+        assert!(!side.is_observed(), "an exit-3 observation is not observed");
+        assert_eq!(
+            side.unsupported_reason(),
+            Some("beam_rt: unsupported: cannot evaluate \"length([a,b,c])\""),
+            "the reason carries the runtime's stderr line"
+        );
+    }
+
+    #[test]
+    fn any_other_exit_status_is_a_genuine_observation() {
+        for (exit_code, stdout) in [(0, b"5\n".as_slice()), (1, b"".as_slice())] {
+            let side = classify_rust(observation(exit_code, stdout, b""));
+            assert!(side.is_observed(), "exit {exit_code} is a real observation");
+            assert_eq!(side.observation().expect("observed").exit_code, Some(exit_code));
+        }
+    }
+
+    #[test]
+    fn the_unsupported_reason_uses_the_first_non_empty_stderr_line() {
+        // A leading blank line is skipped; trailing whitespace and later lines are dropped.
+        let padded = observation(
+            UNSUPPORTED_EXIT_CODE,
+            b"",
+            b"\nbeam_rt: unsupported: unsupported_bif   \nsecond line\n",
+        );
+        assert_eq!(
+            unsupported_reason(&padded),
+            "beam_rt: unsupported: unsupported_bif"
+        );
+        let silent = observation(UNSUPPORTED_EXIT_CODE, b"", b"");
+        assert!(unsupported_reason(&silent).contains("no diagnostic on stderr"));
+    }
+
+    #[test]
+    fn an_unsupported_classification_is_never_agreement() {
+        // The unit-level guarantee behind the harness fix: an exit-3 side can only be
+        // `Unsupported` in the comparison, never `Agree`.
+        let side = classify_rust(observation(UNSUPPORTED_EXIT_CODE, b"", b"x\n"));
+        assert!(matches!(side, SideResult::Unsupported { .. }));
     }
 }

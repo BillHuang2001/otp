@@ -1,7 +1,7 @@
 //! Runtime resolution and process observation.
 //!
-//! Two runtimes are observed with **identical argv** — the only difference is the
-//! program path (contract A.6: `beam_rt` is a drop-in `erl`):
+//! Two runtimes are observed and compared (contract A.6: `beam_rt` is a drop-in `erl`
+//! for the expression cases — the *only* difference there is the program path):
 //!
 //! * the **oracle** — `$ERTS_ORACLE` if set (the path must exist), otherwise `erl`
 //!   resolved by scanning `$PATH`. Nothing found ⇒ [`Error::Env`] (exit 2).
@@ -11,13 +11,27 @@
 //!   inventing a result.
 //!
 //! The harness never inspects runtime internals: it only spawns the program, feeds it
-//! argv with `stdin` closed, and records the observed stdout/stderr/exit status.
+//! argv with `stdin` closed, and records the observed stdout/stderr/exit status. The two
+//! runtimes receive **identical** argv for the expression corpus cases but **different**
+//! argv for the module-run cases (the oracle's `-eval` versus the Rust `run` action), so
+//! each [`Observation`] records the argv it was actually spawned with.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
+
+/// The exit code the Rust runtime uses to report a **capability gap** (an operation
+/// Milestone-1 does not implement) — distinct from `1` (a genuine runtime error) and `2`
+/// (a usage error).
+///
+/// This is the documented external signal the harness keys off: an exit-`3` observation is
+/// classified as [`SideResult::Unsupported`](crate::compare::SideResult), never as a
+/// differing observable result, so an unimplemented feature is `unsupported`, not a
+/// `mismatch`. The signal accompanies exactly one `beam_rt: unsupported: <reason>` stderr
+/// line (see `../../crates/beam_rt/src/cli.rs`).
+pub const UNSUPPORTED_EXIT_CODE: i32 = 3;
 
 /// Which of the two runtimes an observation came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +92,8 @@ pub struct Observation {
     pub runtime: RuntimeId,
     /// The program that was spawned.
     pub program: PathBuf,
-    /// The argv the program was spawned with (identical for both runtimes).
+    /// The argv the program was spawned with (per runtime — the expression cases share
+    /// one argv, the module-run cases differ).
     pub argv: Vec<String>,
     /// Captured standard output (raw bytes — never re-encoded).
     pub stdout: Vec<u8>,
@@ -203,7 +218,8 @@ pub fn resolve_rust_from(
 
 /// Build the argv for an evaluation: `["-noshell", <extra…>, "-eval", <expr>]`.
 ///
-/// The same argv is used for both runtimes; only the program path differs.
+/// The expression corpus cases hand this same argv to both runtimes; module-run cases
+/// build their argv per side (see [`crate::corpus::ModuleRun`]).
 pub fn eval_argv(expr: &str, extra: &[&str]) -> Vec<String> {
     let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_string()).collect();
     eval_argv_owned(expr, &extra)
@@ -274,7 +290,7 @@ fn rust_program_name() -> &'static str {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     match std::fs::metadata(path) {
@@ -284,7 +300,7 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
@@ -349,7 +365,7 @@ mod tests {
         assert_eq!(
             eval_argv("EXPR", &[]),
             vec!["-noshell", "-eval", "EXPR"],
-            "the probe argv must be the same for both runtimes"
+            "the expression-case probe argv is the drop-in erl shape"
         );
         assert_eq!(
             eval_argv("EXPR", &["-differential_test_flag", "hello"]),

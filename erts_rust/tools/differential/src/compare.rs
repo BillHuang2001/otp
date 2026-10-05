@@ -1,10 +1,15 @@
 //! Comparing observable results: byte-level diffs, golden checks and the verdict.
 //!
 //! The harness compares only what a black-box observer can see (contract A.2/A.8):
-//! the **exact stdout bytes**, the **exit status** and the **stderr bytes** of the two
-//! runtimes, plus the case's own **golden** (an independent expectation that makes the
-//! corpus self-testing — a golden miss by the *oracle* is corpus drift, i.e. a real
-//! failure, never a skip).
+//! the **exact stdout bytes** and the **exit status** of the two runtimes, plus the case's
+//! own **golden** (an independent expectation that makes the corpus self-testing — a
+//! golden miss by the *oracle* is corpus drift, i.e. a real failure, never a skip).
+//!
+//! Stderr is compared too for the expression cases ([`Observables::All`]), where both
+//! runtimes are expected to be silent. It is deliberately **not** compared for the
+//! module-run cases ([`Observables::StdoutAndExit`]): the Rust runtime prints a boot
+//! banner to stderr while `erl` prints nothing, and that is not a semantic difference —
+//! only stdout and the exit status are.
 
 use crate::corpus::Golden;
 use crate::runtime::Observation;
@@ -133,8 +138,8 @@ impl Verdict {
     /// This verdict's contribution to the process exit code.
     ///
     /// A [`Verdict::Mismatch`] always contributes `1`; [`Verdict::Unsupported`] and
-    /// [`Verdict::Skipped`] contribute `1` only under `--strict` (so the stub-driven
-    /// Rust side does not fail CI before `beam_rt` can execute cases).
+    /// [`Verdict::Skipped`] contribute `1` only under `--strict` (so a capability gap in
+    /// the Rust runtime does not fail CI before the feature lands).
     pub fn exit_contribution(&self, strict: bool) -> i32 {
         match self {
             Verdict::Agree => 0,
@@ -153,10 +158,35 @@ impl serde::Serialize for Verdict {
     }
 }
 
-/// Compare two observations field by field (byte-exact stdout and stderr, exact exit status).
+/// Which observables a comparison inspects.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Observables {
+    /// stdout, exit status **and** stderr — the expression cases, where both runtimes are
+    /// driven by the identical `-eval` argv.
+    All,
+    /// stdout and exit status only — the module-run cases, where the Rust runtime's boot
+    /// banner on stderr is not a semantic difference.
+    StdoutAndExit,
+}
+
+/// Compare two observations field by field (byte-exact, exact exit status).
 ///
-/// Only the observables are compared — never internals, never the program path.
+/// Equal to [`compare_observations_with`]`(…, `[`Observables::All`]`)` — the full
+/// comparison used by the expression corpus cases. Only the observables are compared —
+/// never internals, never the program path.
 pub fn compare_observations(oracle: &Observation, rust: &Observation) -> Vec<FieldDiff> {
+    compare_observations_with(oracle, rust, Observables::All)
+}
+
+/// [`compare_observations`] restricted to the observables selected by `observables`.
+///
+/// A [`FieldDiff`] is pushed for stdout, then the exit status, then (for
+/// [`Observables::All`]) stderr, so a report is stable and readable.
+pub fn compare_observations_with(
+    oracle: &Observation,
+    rust: &Observation,
+    observables: Observables,
+) -> Vec<FieldDiff> {
     let mut diffs = Vec::new();
     if oracle.stdout != rust.stdout {
         diffs.push(FieldDiff::new(
@@ -172,7 +202,7 @@ pub fn compare_observations(oracle: &Observation, rust: &Observation) -> Vec<Fie
             render_exit_code(rust.exit_code),
         ));
     }
-    if oracle.stderr != rust.stderr {
+    if observables == Observables::All && oracle.stderr != rust.stderr {
         diffs.push(FieldDiff::new(
             "stderr",
             render_bytes(&oracle.stderr),
@@ -226,14 +256,31 @@ pub fn normalize_probe_stdout(bytes: &[u8]) -> &[u8] {
 }
 
 /// Derive the [`Verdict`] of one case from its two sides and the oracle's golden check.
+///
+/// Equal to [`verdict_with`]`(…, `[`Observables::All`]`)` — the full comparison used by the
+/// expression corpus cases.
 pub fn verdict(oracle: &SideResult, rust: &SideResult, golden: &GoldenCheck) -> Verdict {
+    verdict_with(oracle, rust, golden, Observables::All)
+}
+
+/// [`verdict`] restricted to the observables selected by `observables`.
+///
+/// The comparison used to decide agreement MUST match the comparison whose
+/// [`FieldDiff`]s are reported, otherwise a case could show an empty diff list yet be a
+/// `Mismatch` (or vice versa).
+pub fn verdict_with(
+    oracle: &SideResult,
+    rust: &SideResult,
+    golden: &GoldenCheck,
+    observables: Observables,
+) -> Verdict {
     if !golden.matched {
         // The oracle itself did not reproduce the expectation: the corpus has drifted.
         return Verdict::Mismatch;
     }
     match (oracle, rust) {
         (SideResult::Observed(oracle), SideResult::Observed(rust)) => {
-            if compare_observations(oracle, rust).is_empty() {
+            if compare_observations_with(oracle, rust, observables).is_empty() {
                 Verdict::Agree
             } else {
                 Verdict::Mismatch
@@ -277,8 +324,9 @@ pub fn hex_string(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        check_golden, compare_observations, hex_string, normalize_probe_stdout, render_bytes,
-        render_exit_code, verdict, FieldDiff, GoldenCheck, SideResult, Verdict,
+        check_golden, compare_observations, compare_observations_with, hex_string,
+        normalize_probe_stdout, render_bytes, render_exit_code, verdict, verdict_with, FieldDiff,
+        GoldenCheck, Observables, SideResult, Verdict,
     };
     use crate::corpus::Golden;
     use crate::runtime::{Observation, RuntimeId};
@@ -345,6 +393,23 @@ mod tests {
         let diffs = compare_observations(&oracle, &rust);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].field, "stderr");
+    }
+
+    #[test]
+    fn stdout_and_exit_only_ignores_stderr_but_still_flags_stdout() {
+        let oracle = observation(RuntimeId::Oracle, b"5\n", Some(0));
+        let mut rust = observation(RuntimeId::Rust, b"5\n", Some(0));
+        // The Rust runtime's boot banner on stderr must not turn agreement into a diff.
+        rust.stderr = b"beam_rt erts-17.1 booted: 22 preloaded modules\n".to_vec();
+        assert!(
+            compare_observations_with(&oracle, &rust, Observables::StdoutAndExit).is_empty(),
+            "stderr is not compared for module-run cases"
+        );
+        // But a differing stdout is still a diff.
+        rust.stdout = b"6\n".to_vec();
+        let diffs = compare_observations_with(&oracle, &rust, Observables::StdoutAndExit);
+        assert_eq!(diffs.len(), 1);
+        assert_eq!(diffs[0].field, "stdout");
     }
 
     #[test]
@@ -429,6 +494,30 @@ mod tests {
                 &GoldenCheck::not_asserted()
             ),
             Verdict::Unsupported
+        );
+    }
+
+    #[test]
+    fn a_stdout_and_exit_verdict_ignores_a_stderr_only_difference() {
+        // The module-run case: identical stdout + exit status but a differing stderr (the
+        // Rust runtime's boot banner) must AGREE, not mismatch.
+        let oracle = observation(RuntimeId::Oracle, b"5\n", Some(0));
+        let mut rust = observation(RuntimeId::Rust, b"5\n", Some(0));
+        rust.stderr = b"beam_rt erts-17.1 booted\n".to_vec();
+        let golden = GoldenCheck::not_asserted();
+        assert_eq!(
+            verdict(&SideResult::observed(oracle.clone()), &SideResult::observed(rust.clone()), &golden),
+            Verdict::Mismatch,
+            "the full comparison still flags the stderr difference"
+        );
+        assert_eq!(
+            verdict_with(
+                &SideResult::observed(oracle),
+                &SideResult::observed(rust),
+                &golden,
+                Observables::StdoutAndExit
+            ),
+            Verdict::Agree
         );
     }
 

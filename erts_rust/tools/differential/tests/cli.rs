@@ -68,6 +68,30 @@ fn oracle_available() -> bool {
     differential::runtime::resolve_oracle().is_ok()
 }
 
+/// Whether a Rust runtime is resolvable from the test process (the child binary resolves
+/// the same one, since both embed the same `CARGO_MANIFEST_DIR`).
+fn rust_runtime_available() -> bool {
+    matches!(differential::runtime::resolve_rust(), Ok(Some(_)))
+}
+
+/// Whether the module-run cases can be exercised (they need the system `erlc`).
+fn erlc_available() -> bool {
+    matches!(differential::module_build::resolve_erlc(), Ok(Some(_)))
+}
+
+/// Write an executable shell script into `scratch` (a fake `$BEAM_RT`) and return its path.
+#[cfg(unix)]
+fn fake_runtime(scratch: &Scratch, name: &str, body: &str) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+
+    let path = scratch.0.join(name);
+    std::fs::create_dir_all(&scratch.0).expect("create scratch dir");
+    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake runtime");
+    let mut perms = std::fs::metadata(&path).expect("stat").permissions();
+    perms.set_mode(0o755);
+    std::fs::set_permissions(&path, perms).expect("chmod");
+    path
+}
 #[test]
 fn help_is_usable_on_every_subcommand_and_exits_0() {
     for args in [
@@ -187,10 +211,16 @@ fn a_bad_oracle_or_rust_runtime_is_a_loud_env_error() {
 }
 
 #[test]
-fn suite_reports_the_stub_side_unsupported_and_strict_escalates_it() {
+fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     if !oracle_available() {
         eprintln!("SKIP: oracle erl not available");
         return;
+    }
+    // Agreement is only observable when both a Rust runtime and `erlc` exist. When they do
+    // not, the module-run cases degrade to `unsupported`/`skipped` (never a fabricated pass).
+    let agreement_possible = rust_runtime_available() && erlc_available();
+    if !agreement_possible {
+        eprintln!("NOTE: no usable ($BEAM_RT + erlc) pair — module agreement not exercised");
     }
     let scratch = Scratch::new("suite");
 
@@ -201,16 +231,42 @@ fn suite_reports_the_stub_side_unsupported_and_strict_escalates_it() {
     assert_eq!(json["schema"], "differential/1");
     assert_eq!(json["mode"], "suite");
     assert_eq!(json["oracle"]["available"], true);
+
+    let mut agree = 0;
+    let mut unsupported = 0;
+    let mut skipped = 0;
     for case in json["cases"].as_array().expect("cases") {
         assert_eq!(
             case["oracle"]["matched_golden"], true,
             "the oracle drifted from a golden: {case}"
         );
         assert_ne!(
-            case["verdict"], "agree",
-            "a stub Rust runtime must never agree: {case}"
+            case["verdict"], "mismatch",
+            "the corpus must never mismatch here: {case}"
         );
+        match case["verdict"].as_str().expect("verdict string") {
+            "agree" => agree += 1,
+            "unsupported" => unsupported += 1,
+            "skipped" => skipped += 1,
+            other => panic!("unexpected verdict {other}: {case}"),
+        }
     }
+    assert_eq!(json["summary"]["mismatch"], 0);
+    assert_eq!(json["summary"]["agree"], agree);
+    if agreement_possible {
+        assert!(
+            agree >= 1,
+            "the freshly-compiled module-run cases must agree: {}",
+            lenient.stdout
+        );
+    } else {
+        assert_eq!(agree, 0, "nothing may agree without a usable Rust runtime");
+    }
+    assert!(
+        unsupported + skipped >= 1,
+        "the expression corpus is a capability gap: {}",
+        lenient.stdout
+    );
 
     let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &[]);
     assert_eq!(strict.code, Some(1), "{}", strict.describe());
@@ -247,4 +303,73 @@ fn compare_evaluates_an_ad_hoc_expression_without_a_golden() {
         serde_json::Value::Null,
         "an ad-hoc comparison asserts no golden"
     );
+    // `length/1` is outside the Rust runtime's current subset: it signals a capability gap
+    // (exit 3), which is an honest `unsupported` — never a `mismatch`.
+    assert_eq!(
+        json["cases"][0]["verdict"], "unsupported",
+        "{}",
+        invocation.describe()
+    );
+    assert_eq!(json["cases"][0]["rust"]["available"], false);
+}
+
+/// A fake `$BEAM_RT` that prints a *different* stdout must still be a hard `[MISMATCH]`.
+#[cfg(unix)]
+#[test]
+fn a_rust_runtime_with_differing_output_is_still_a_mismatch() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    let scratch = Scratch::new("fake-mismatch");
+    let fake = fake_runtime(&scratch, "beam_rt-fake", "echo 'ok bogus'\nexit 0");
+    let fake = fake.to_str().expect("utf-8 path");
+
+    let invocation = invoke(
+        &["run", "etf/term_to_binary_tuple", "--json", "--out", &scratch.arg()],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(invocation.code, Some(1), "{}", invocation.describe());
+    let json: serde_json::Value = serde_json::from_str(&invocation.stdout).expect("parses");
+    assert_eq!(json["cases"][0]["verdict"], "mismatch");
+    assert_eq!(json["cases"][0]["rust"]["available"], true);
+    assert_eq!(json["cases"][0]["rust"]["stdout"], "ok bogus\n");
+}
+
+/// A fake `$BEAM_RT` that signals `unsupported` (exit 3) is honest: `unsupported` lenient,
+/// a failure under `--strict` — and never a `mismatch`.
+#[cfg(unix)]
+#[test]
+fn a_rust_runtime_signalling_unsupported_is_honest_not_a_mismatch() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    let scratch = Scratch::new("fake-unsupported");
+    let fake = fake_runtime(
+        &scratch,
+        "beam_rt-fake",
+        "echo 'beam_rt: unsupported: bogus feature' 1>&2\nexit 3",
+    );
+    let fake = fake.to_str().expect("utf-8 path");
+
+    let lenient = invoke(
+        &["run", "etf/term_to_binary_tuple", "--json", "--out", &scratch.arg()],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(lenient.code, Some(0), "{}", lenient.describe());
+    let json: serde_json::Value = serde_json::from_str(&lenient.stdout).expect("parses");
+    assert_eq!(json["cases"][0]["verdict"], "unsupported");
+    assert_eq!(json["cases"][0]["rust"]["available"], false);
+    let reason = json["cases"][0]["rust"]["reason"]
+        .as_str()
+        .expect("an unsupported side carries a reason");
+    assert!(
+        reason.contains("beam_rt: unsupported: bogus feature"),
+        "the reason carries the runtime's stderr line: {reason}"
+    );
+
+    // `--strict` escalates the capability gap to a non-zero exit.
+    let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &[("BEAM_RT", fake)]);
+    assert_eq!(strict.code, Some(1), "{}", strict.describe());
 }

@@ -9,8 +9,9 @@
 //! Erlang. Nothing here requires a functional `beam_rt`.
 
 use differential::compare::{check_golden, compare_observations, SideResult, Verdict};
-use differential::corpus::find_case;
+use differential::corpus::{find_case, CaseKind};
 use differential::harness::{run_case, run_case_in, RuntimeContext};
+use differential::module_build;
 use differential::runtime::{
     eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, RuntimeSpec,
 };
@@ -35,7 +36,7 @@ fn oracle_reproduces_the_ok_42_golden() {
         return;
     };
     let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
-    let argv = eval_argv(&case.eval(), case.extra_argv);
+    let argv = eval_argv(&case.eval(), case.extra_argv());
     let observation = run(&oracle, &argv).expect("spawn the oracle");
 
     assert_eq!(observation.exit_code, Some(0), "the probe halts with 0");
@@ -64,7 +65,7 @@ fn oracle_against_itself_agrees() {
         return;
     };
     let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
-    let argv = eval_argv(&case.eval(), case.extra_argv);
+    let argv = eval_argv(&case.eval(), case.extra_argv());
     let first = run(&oracle, &argv).expect("first run");
     let second = run(&oracle, &argv).expect("second run");
 
@@ -152,12 +153,18 @@ fn an_absent_rust_runtime_reports_unsupported_never_agreement() {
 }
 
 #[test]
-fn every_corpus_case_matches_its_oracle_golden() {
+fn every_eval_corpus_case_matches_its_oracle_golden() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
+    let mut checked = 0;
     for case in differential::corpus::cases() {
-        let argv = eval_argv(&case.eval(), case.extra_argv);
+        // Module-run cases are compiled and checked separately (see below).
+        let CaseKind::Eval { .. } = case.kind else {
+            continue;
+        };
+        checked += 1;
+        let argv = eval_argv(&case.eval(), case.extra_argv());
         let observation = run(&oracle, &argv).unwrap_or_else(|error| {
             panic!("case {}: failed to run the oracle: {error}", case.id)
         });
@@ -176,6 +183,52 @@ fn every_corpus_case_matches_its_oracle_golden() {
             case.id
         );
     }
+    assert!(checked > 0, "the corpus must contain expression cases");
+}
+
+/// Every module-run case must reproduce its golden under the oracle too: the embedded
+/// module is compiled with the system `erlc` and applied through `-pa <dir> -eval …`.
+/// Skips loudly (never a silent pass) when `erlc` is unavailable.
+#[test]
+fn module_run_cases_reproduce_their_golden_under_the_oracle() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    let erlc = match module_build::resolve_erlc() {
+        Ok(Some(erlc)) => erlc,
+        Ok(None) => {
+            eprintln!("SKIP: erlc not available — cannot compile the module-run cases");
+            return;
+        }
+        Err(error) => panic!("$ERLC is set but unusable: {error}"),
+    };
+
+    let mut checked = 0;
+    for case in differential::corpus::cases() {
+        let CaseKind::Module(module_run) = &case.kind else {
+            continue;
+        };
+        checked += 1;
+        let compiled = module_build::compile(&erlc, module_run.source, module_run.module)
+            .unwrap_or_else(|error| panic!("case {}: erlc failed: {error}", case.id));
+        let argv = module_run.oracle_argv(compiled.dir());
+        let observation = run(&oracle, &argv).unwrap_or_else(|error| {
+            panic!("case {}: failed to run the oracle: {error}", case.id)
+        });
+        let golden = check_golden(&observation, &case.golden);
+        assert!(
+            golden.matched,
+            "case {} drifted from its golden: {:?} (stdout={:?})",
+            case.id,
+            golden.diffs,
+            String::from_utf8_lossy(&observation.stdout)
+        );
+        assert_eq!(observation.exit_code, Some(0), "case {}", case.id);
+    }
+    assert!(
+        checked >= 2,
+        "the corpus must carry at least two module-run cases"
+    );
 }
 
 #[test]
@@ -188,7 +241,7 @@ fn exception_cases_are_observable_through_the_probe() {
         ("errors/badarith", "exception error badarith"),
     ] {
         let case = find_case(id).expect("built-in case");
-        let argv = eval_argv(&case.eval(), case.extra_argv);
+        let argv = eval_argv(&case.eval(), case.extra_argv());
         let observation = run(&oracle, &argv).expect("spawn the oracle");
         assert_eq!(
             differential::compare::normalize_probe_stdout(&observation.stdout),
@@ -201,9 +254,9 @@ fn exception_cases_are_observable_through_the_probe() {
 }
 
 #[test]
-fn module_less_argv_is_the_same_shape_for_both_runtimes() {
+fn an_eval_case_shares_one_argv_shape_for_both_runtimes() {
     let case = find_case("flags/custom_argument").expect("built-in case");
-    let argv = eval_argv(&case.eval(), case.extra_argv);
+    let argv = eval_argv(&case.eval(), case.extra_argv());
     assert_eq!(
         argv,
         vec![
@@ -213,6 +266,15 @@ fn module_less_argv_is_the_same_shape_for_both_runtimes() {
             "-eval".to_string(),
             case.eval(),
         ],
-        "the argv is built once and handed to both runtimes"
+        "the expression-case argv is built once and handed to both runtimes"
     );
+
+    // A module-run case, by contrast, drives the two runtimes with different argv.
+    let module_case = find_case("modules/add").expect("built-in case");
+    let CaseKind::Module(module_run) = &module_case.kind else {
+        panic!("modules/add must be a module-run case");
+    };
+    let dir = std::path::Path::new("/code");
+    assert_eq!(module_run.oracle_argv(dir)[1..3], ["-pa", "/code"]);
+    assert_eq!(module_run.rust_argv(dir)[0], "run");
 }

@@ -1,10 +1,19 @@
 //! The built-in conformance corpus: one small, fast case group per compatibility contract.
 //!
-//! Every case is a plain Erlang **expression** plus a [`Probe`] and, crucially, a
-//! [`Golden`] expectation of the probe's output line. The golden makes the corpus
-//! self-testing: today the oracle reproduces it while the Rust side (`beam_rt` is a
-//! version-banner stub) is reported `unsupported`; if the oracle ever stops matching its
-//! own golden, that is corpus drift — a real failure, not a skip.
+//! A case carries a [`Golden`] expectation of the oracle's observable output, plus a
+//! [`CaseKind`] that says how the two runtimes are driven. The golden makes the corpus
+//! self-testing: the oracle must reproduce it (if it stops, that is corpus drift — a real
+//! failure, not a skip). There are two kinds of case:
+//!
+//! * [`CaseKind::Eval`] — a plain Erlang **expression** plus a [`Probe`]; both runtimes get
+//!   the *same* `-eval` argv. These exercise the compatibility surface an expression can
+//!   reach (ETF, semantics, BIFs, `system_info`, CLI flags).
+//! * [`CaseKind::Module`] — a tiny embedded Erlang module is compiled with the system
+//!   `erlc` and one exported function is applied. The two runtimes get *different* argv
+//!   (the oracle's `-pa` + `-eval` versus the Rust runtime's `run` action), and only
+//!   stdout + exit status are compared (a runtime's boot banner on stderr is not a
+//!   semantic difference). This is the *agreement* evidence: a compiled `.beam` executed
+//!   by the Rust runtime reproduces the oracle's value.
 //!
 //! Keep the default corpus **small and fast** (smoke level, Part I §C): heavy suites are
 //! milestone-only. Cases are grouped by the contract they exercise:
@@ -16,14 +25,19 @@
 //! | [`bifs`] | A.7 — BIF / OTP app surface |
 //! | [`system_info`] | A.8 — introspection |
 //! | [`flags`] | A.6 — CLI / configuration |
+//! | [`modules`] | A.2 — a freshly `erlc`-compiled module run under both runtimes |
 
 mod bifs;
 mod etf;
 mod flags;
+mod modules;
 mod system_info;
 mod terms;
 
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
+
+use crate::runtime::eval_argv_owned;
 
 /// One of the nine ERTS compatibility contracts that the rewrite must reproduce exactly
 /// (`ERTS_RUST_REWRITE_EVALUATION.md` §A).
@@ -109,17 +123,95 @@ impl Probe {
     }
 }
 
-/// The independent expectation a case holds about the oracle's probe output.
+/// The independent expectation a case holds about the oracle's output.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Golden {
-    /// The expected probe stdout **line**, without the trailing newline that the probe's
-    /// `~n` emits (`None` asserts nothing about stdout).
+    /// The expected stdout **line**, without the trailing newline that a runtime's
+    /// `~n` (or the `run` action's printer) emits (`None` asserts nothing about stdout).
     pub stdout: Option<&'static str>,
     /// The expected process exit code (`0` for a value, `1` for a BEAM exception).
     pub exit_code: i32,
 }
 
-/// One conformance case: an expression, how to probe it, and what the oracle must print.
+/// How a case drives the two runtimes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CaseKind {
+    /// An expression case: both runtimes evaluate the same self-terminating probe via
+    /// `-eval`, so they receive **identical** argv (only the program path differs).
+    Eval {
+        /// The plain Erlang expression to evaluate.
+        expr: &'static str,
+        /// Extra argv inserted before `-eval` (e.g. `-<flag> <value>` for A.6 cases).
+        extra_argv: &'static [&'static str],
+        /// How the expression is wrapped into a self-terminating probe.
+        probe: Probe,
+    },
+    /// A module-run case: `erlc` compiles an embedded module and one exported function is
+    /// applied. The two runtimes receive **different** argv — the oracle's
+    /// `-noshell -pa <dir> -eval …` versus the Rust runtime's
+    /// `run <dir>/<module>.beam <module>:<fun>/<arity> <args…>`.
+    Module(ModuleRun),
+}
+
+/// One embedded-module function invocation (the data of a [`CaseKind::Module`] case).
+///
+/// The source is compiled at run time by [`crate::module_build`] with the system `erlc`;
+/// string and slice fields are `'static` so a [`Case`] stays `Copy`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModuleRun {
+    /// The embedded Erlang source, compiled at run time with the system `erlc`.
+    pub source: &'static str,
+    /// The module name (must match the `-module` attribute in `source`).
+    pub module: &'static str,
+    /// The exported function applied by both runtimes.
+    pub function: &'static str,
+    /// The function arity (equal to `args.len()`).
+    pub arity: u32,
+    /// The integer arguments passed to the function.
+    pub args: &'static [i64],
+}
+
+impl ModuleRun {
+    /// The `<dir>/<module>.beam` path inside a compiled module's temporary directory.
+    pub fn beam_path(&self, dir: &Path) -> PathBuf {
+        dir.join(format!("{}.beam", self.module))
+    }
+
+    /// The oracle's `-eval` expression: apply the function and print the result with `~w`.
+    ///
+    /// `beam_rt run` prints the value the same way (with its own trailing newline), so
+    /// this single line is the observable both runtimes must reproduce.
+    pub fn oracle_eval(&self) -> String {
+        let args: Vec<String> = self.args.iter().map(i64::to_string).collect();
+        format!(
+            "io:format(\"~w~n\",[{0}:{1}({2})]), halt(0).",
+            self.module,
+            self.function,
+            args.join(",")
+        )
+    }
+
+    /// The oracle argv: `-noshell -pa <dir> -eval <oracle_eval>`.
+    pub fn oracle_argv(&self, dir: &Path) -> Vec<String> {
+        eval_argv_owned(
+            &self.oracle_eval(),
+            &["-pa".to_string(), dir.display().to_string()],
+        )
+    }
+
+    /// The Rust runtime argv: `run <dir>/<module>.beam <module>:<fun>/<arity> <args…>`.
+    pub fn rust_argv(&self, dir: &Path) -> Vec<String> {
+        let mut argv = vec![
+            "run".to_string(),
+            self.beam_path(dir).display().to_string(),
+            format!("{}:{}/{}", self.module, self.function, self.arity),
+        ];
+        argv.extend(self.args.iter().map(i64::to_string));
+        argv
+    }
+}
+
+/// One conformance case: how to drive the runtimes and what the oracle must print.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Case {
     /// Stable case id, `<group>/<name>` (unique across the corpus).
@@ -128,20 +220,48 @@ pub struct Case {
     pub description: &'static str,
     /// The compatibility contracts this case covers (at least one).
     pub contracts: &'static [Contract],
-    /// The plain Erlang expression to evaluate.
-    pub expr: &'static str,
-    /// Extra argv inserted before `-eval` (e.g. `-<flag> <value>` for A.6 cases).
-    pub extra_argv: &'static [&'static str],
-    /// How the expression is wrapped into a self-terminating probe.
-    pub probe: Probe,
+    /// How the two runtimes are driven (see [`CaseKind`]).
+    pub kind: CaseKind,
     /// What the oracle must print for this case.
     pub golden: Golden,
 }
 
 impl Case {
     /// The full probe expression handed to both runtimes for this case.
+    ///
+    /// For a [`CaseKind::Eval`] case this is the self-terminating probe wrapper; for a
+    /// [`CaseKind::Module`] case it is the oracle's `io:format` expression (the Rust
+    /// runtime is invoked through its `run` action instead — see [`CaseKind::Module`]).
     pub fn eval(&self) -> String {
-        probe_expr(self.expr, self.probe)
+        match &self.kind {
+            CaseKind::Eval { expr, probe, .. } => probe_expr(expr, *probe),
+            CaseKind::Module(run) => run.oracle_eval(),
+        }
+    }
+
+    /// The stable kind label used in listings: the probe name for eval cases, and
+    /// `"module-run"` for module cases.
+    pub fn kind_label(&self) -> &'static str {
+        match &self.kind {
+            CaseKind::Eval { probe, .. } => probe.as_str(),
+            CaseKind::Module(_) => "module-run",
+        }
+    }
+
+    /// The plain Erlang expression (`None` for a module-run case).
+    pub fn expr(&self) -> Option<&'static str> {
+        match &self.kind {
+            CaseKind::Eval { expr, .. } => Some(expr),
+            CaseKind::Module(_) => None,
+        }
+    }
+
+    /// The extra eval argv (`&[]` for a module-run case).
+    pub fn extra_argv(&self) -> &'static [&'static str] {
+        match &self.kind {
+            CaseKind::Eval { extra_argv, .. } => extra_argv,
+            CaseKind::Module(_) => &[],
+        }
     }
 
     /// The contract ids of this case, in declaration order.
@@ -159,6 +279,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(bifs::group());
     cases.extend(system_info::group());
     cases.extend(flags::group());
+    cases.extend(modules::group());
     cases
 }
 
@@ -193,7 +314,7 @@ pub fn probe_expr(expr: &str, probe: Probe) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{cases, find_case, probe_expr, Contract, Probe};
+    use super::{cases, find_case, probe_expr, CaseKind, Contract, Probe};
     use std::collections::HashSet;
 
     #[test]
@@ -250,31 +371,58 @@ mod tests {
             assert!(!golden.is_empty(), "case {} has an empty golden", case.id);
             assert!(
                 !golden.ends_with('\n'),
-                "case {}: the golden is a line, without the probe's newline",
+                "case {}: the golden is a line, without the trailing newline",
                 case.id
             );
-            assert!(
-                golden.starts_with("ok ") || golden.starts_with("exception "),
-                "case {}: unexpected golden shape {golden:?}",
-                case.id
-            );
-            assert!(
-                !case.expr.is_empty() && !case.expr.contains('\n'),
-                "case {} has a suspicious expression",
-                case.id
-            );
-            if golden.starts_with("exception ") {
-                assert_ne!(
-                    case.golden.exit_code, 0,
-                    "case {}: an exception must not exit 0",
-                    case.id
-                );
-            } else {
-                assert_eq!(
-                    case.golden.exit_code, 0,
-                    "case {}: a successful probe exits 0",
-                    case.id
-                );
+            match &case.kind {
+                CaseKind::Eval { expr, .. } => {
+                    assert!(
+                        golden.starts_with("ok ") || golden.starts_with("exception "),
+                        "case {}: unexpected golden shape {golden:?}",
+                        case.id
+                    );
+                    assert!(
+                        !expr.is_empty() && !expr.contains('\n'),
+                        "case {} has a suspicious expression",
+                        case.id
+                    );
+                    if golden.starts_with("exception ") {
+                        assert_ne!(
+                            case.golden.exit_code, 0,
+                            "case {}: an exception must not exit 0",
+                            case.id
+                        );
+                    } else {
+                        assert_eq!(
+                            case.golden.exit_code, 0,
+                            "case {}: a successful probe exits 0",
+                            case.id
+                        );
+                    }
+                }
+                CaseKind::Module(run) => {
+                    assert!(
+                        !run.source.is_empty() && run.source.contains("-module("),
+                        "case {}: suspicious module source",
+                        case.id
+                    );
+                    assert!(
+                        golden.trim_start_matches('-').chars().all(|c| c.is_ascii_digit()),
+                        "case {}: a module-run golden is a plain integer line, got {golden:?}",
+                        case.id
+                    );
+                    assert_eq!(
+                        case.golden.exit_code, 0,
+                        "case {}: a successful module run exits 0",
+                        case.id
+                    );
+                    assert_eq!(
+                        run.arity as usize,
+                        run.args.len(),
+                        "case {}: arity must match the argument count",
+                        case.id
+                    );
+                }
             }
         }
     }
@@ -283,9 +431,74 @@ mod tests {
     fn find_case_looks_cases_up_by_id() {
         let case = find_case("etf/term_to_binary_tuple").expect("case present");
         assert_eq!(case.contracts, &[Contract::BeamAsm]);
-        assert_eq!(case.probe, Probe::TermToBinary);
+        assert!(matches!(
+            case.kind,
+            CaseKind::Eval {
+                probe: Probe::TermToBinary,
+                ..
+            }
+        ));
         assert_eq!(case.golden.exit_code, 0);
+        assert_eq!(case.kind_label(), "term_to_binary");
+        assert_eq!(case.expr(), Some("{ok,42}"));
         assert!(find_case("nope/nope").is_none());
+    }
+
+    #[test]
+    fn module_run_cases_are_registered_and_well_formed() {
+        let mut module_cases = 0;
+        for case in cases() {
+            let CaseKind::Module(run) = &case.kind else {
+                continue;
+            };
+            module_cases += 1;
+            assert_eq!(case.kind_label(), "module-run");
+            assert_eq!(case.expr(), None);
+            assert!(case.extra_argv().is_empty());
+            assert_eq!(case.contracts, &[Contract::BeamAsm]);
+            assert!(
+                run.oracle_eval().contains(&format!("{}:{}(", run.module, run.function)),
+                "case {}: the oracle eval must apply the function",
+                case.id
+            );
+            assert_eq!(
+                run.oracle_argv(std::path::Path::new("/code")),
+                vec![
+                    "-noshell".to_string(),
+                    "-pa".to_string(),
+                    "/code".to_string(),
+                    "-eval".to_string(),
+                    run.oracle_eval(),
+                ],
+                "case {}: the oracle argv is the drop-in erl shape",
+                case.id
+            );
+            let rust_argv = run.rust_argv(std::path::Path::new("/code"));
+            assert_eq!(
+                rust_argv[..3],
+                [
+                    "run".to_string(),
+                    format!("/code/{}.beam", run.module),
+                    format!("{}:{}/{}", run.module, run.function, run.arity),
+                ],
+                "case {}: the Rust argv uses the run action",
+                case.id
+            );
+            assert_eq!(
+                &rust_argv[3..],
+                run.args
+                    .iter()
+                    .map(i64::to_string)
+                    .collect::<Vec<_>>()
+                    .as_slice(),
+                "case {}: the integer arguments follow the spec",
+                case.id
+            );
+        }
+        assert!(
+            module_cases >= 2,
+            "the corpus must carry at least two module-run agreement cases"
+        );
     }
 
     #[test]

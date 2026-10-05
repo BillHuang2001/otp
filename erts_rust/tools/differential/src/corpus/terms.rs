@@ -5,7 +5,7 @@
 //! failure — which is exactly why the probe wraps the expression in `try … catch`
 //! (`erl -noshell -eval` prints nothing for an uncaught error).
 
-use super::{Case, Contract, Golden, Probe};
+use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.1 cases: ordering/equality semantics and the exception protocol.
 pub(crate) fn group() -> Vec<Case> {
@@ -14,9 +14,11 @@ pub(crate) fn group() -> Vec<Case> {
             id: "terms/compare_int_lists",
             description: "list comparison is lexicographic on the elements",
             contracts: &[Contract::LanguageSemantics],
-            expr: "[1,2,3] < [1,2,4]",
-            extra_argv: &[],
-            probe: Probe::TermToBinary,
+            kind: CaseKind::Eval {
+                expr: "[1,2,3] < [1,2,4]",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
             golden: Golden {
                 stdout: Some("ok <<131,119,4,116,114,117,101>>"),
                 exit_code: 0,
@@ -26,9 +28,11 @@ pub(crate) fn group() -> Vec<Case> {
             id: "terms/eq_vs_exact_eq",
             description: "== compares numerically while =:= compares term identity",
             contracts: &[Contract::LanguageSemantics],
-            expr: "{1 == 1.0, 1 =:= 1.0}",
-            extra_argv: &[],
-            probe: Probe::TermToBinary,
+            kind: CaseKind::Eval {
+                expr: "{1 == 1.0, 1 =:= 1.0}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
             golden: Golden {
                 stdout: Some("ok <<131,104,2,119,4,116,114,117,101,119,5,102,97,108,115,101>>"),
                 exit_code: 0,
@@ -38,9 +42,11 @@ pub(crate) fn group() -> Vec<Case> {
             id: "terms/atom_order",
             description: "atoms compare by their code points (hello < world)",
             contracts: &[Contract::LanguageSemantics],
-            expr: "hello < world",
-            extra_argv: &[],
-            probe: Probe::TermToBinary,
+            kind: CaseKind::Eval {
+                expr: "hello < world",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
             golden: Golden {
                 stdout: Some("ok <<131,119,4,116,114,117,101>>"),
                 exit_code: 0,
@@ -50,9 +56,11 @@ pub(crate) fn group() -> Vec<Case> {
             id: "errors/error_boom",
             description: "erlang:error/1 surfaces as class error with the given reason",
             contracts: &[Contract::LanguageSemantics],
-            expr: "erlang:error(boom)",
-            extra_argv: &[],
-            probe: Probe::Value,
+            kind: CaseKind::Eval {
+                expr: "erlang:error(boom)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
             golden: Golden {
                 stdout: Some("exception error boom"),
                 exit_code: 1,
@@ -62,9 +70,11 @@ pub(crate) fn group() -> Vec<Case> {
             id: "errors/badarith",
             description: "integer division by zero raises error:badarith",
             contracts: &[Contract::LanguageSemantics],
-            expr: "1/0",
-            extra_argv: &[],
-            probe: Probe::Value,
+            kind: CaseKind::Eval {
+                expr: "1/0",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
             golden: Golden {
                 stdout: Some("exception error badarith"),
                 exit_code: 1,
