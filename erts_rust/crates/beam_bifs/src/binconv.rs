@@ -259,8 +259,15 @@ fn flatten_iolist(root: Eterm, out: &mut Vec<u8>) -> Result<()> {
             continue;
         }
         if access::is_list(term) {
+            // The tail of a list is a *tail* position: for `list_to_binary/1` (as in
+            // C's `erts_iolist_to_buf`) it may only be another list, `[]` or a binary
+            // — `list_to_binary([1|2])` is `badarg`, `list_to_binary([1|<<2>>])` is not.
+            let tail = access::cdr(term);
+            if !access::is_list(tail) && !access::is_nil(tail) && !bits::is_binary(tail) {
+                return Err(badarg());
+            }
             // Push the tail first so the head is popped (and appended) first.
-            stack.push(access::cdr(term));
+            stack.push(tail);
             stack.push(access::car(term));
             continue;
         }
@@ -1085,7 +1092,7 @@ mod tests {
     use beam_codec::error::is_unsupported;
     use beam_codec::term::external_pid_parts;
     use beam_process::ProcessId;
-    use beam_term::{compare::eq, AtomTable};
+    use beam_term::AtomTable;
     use std::cell::RefCell;
     use std::rc::Rc;
 
@@ -1264,7 +1271,7 @@ mod tests {
             assert!(text(list_to_binary_1(ctx, &[empty]).unwrap()).is_empty());
 
             // A bare binary is *not* an iolist for `list_to_binary/1`.
-            for bad in [
+            for (i, bad) in [
                 bin(&[1, 2]),
                 ctx.int(1).expect("fits"),
                 ctx.atom("a").expect("seeded"),
@@ -1277,8 +1284,17 @@ mod tests {
                 // A non-byte-aligned bitstring element.
                 ctx.list(&[bitstring(&[0x80], 1)])
                     .expect("fits"),
-            ] {
-                assert_badarg(list_to_binary_1(ctx, &[bad]));
+            ]
+            .into_iter()
+            .enumerate()
+            {
+                assert!(
+                    matches!(
+                        list_to_binary_1(ctx, &[bad]),
+                        Err(beam_common::BeamError::BadArg)
+                    ),
+                    "case {i} should be badarg"
+                );
             }
         });
     }
@@ -1946,7 +1962,7 @@ mod tests {
                 (&[131, 70, 63, 240, 0, 0, 0, 0, 0, 0], 10),
                 (&[131, 106], 2),
                 (&[131, 116, 0, 0, 0, 0], 6),
-                (&[131, 104, 2, 119, 1, 97, 97, 1], 7),
+                (&[131, 104, 2, 119, 1, 97, 97, 1], 8),
             ];
             for (image, used) in images {
                 let term = binary_to_term_1(ctx, &[bin(image)]).unwrap();
@@ -1955,7 +1971,14 @@ mod tests {
                 let wrapped = binary_to_term_2(ctx, &[bin(image), options]).unwrap();
                 assert!(access::is_tuple(wrapped));
                 assert_eq!(access::tuple_size(wrapped), 2);
-                assert!(eq(access::tuple_element(wrapped, 0), term, ctx.atoms()));
+                // The two decodes allocate *separate* terms, so compare by
+                // re-encoding: `compare::eq` deep-compares every M1 term class but a
+                // map (see the module notes), and one of the images is a map.
+                assert_eq!(
+                    text(term_to_binary_1(ctx, &[access::tuple_element(wrapped, 0)]).unwrap()),
+                    text(term_to_binary_1(ctx, &[term]).unwrap()),
+                    "image {image:?}"
+                );
                 assert_eq!(int_of(access::tuple_element(wrapped, 1)), *used as i64);
             }
 
@@ -2054,7 +2077,10 @@ mod tests {
             let map = access::make_flatmap(ctx.heap(), &[(one, two)]).expect("fits");
             let image = term_to_binary_1(ctx, &[map]).unwrap();
             let back = binary_to_term_1(ctx, &[image]).unwrap();
-            assert!(eq(map, back, ctx.atoms()));
+            assert!(access::is_map(back));
+            // A structural `compare::eq` on maps is not available in M1, so the
+            // round-trip is pinned byte-exactly instead.
+            assert_eq!(text(term_to_binary_1(ctx, &[back]).unwrap()), text(image.clone()));
         });
     }
 
