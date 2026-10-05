@@ -2,7 +2,8 @@
 //!
 //! Each workload lives in its own module; this file wires them into the [`registry`]
 //! and hosts the small, dependency-free helpers (repo resolution, recursive file
-//! collection, line counting) that several workloads share.
+//! collection, line counting, external-tool resolution via [`tool`]) that several
+//! workloads share.
 
 use std::path::{Path, PathBuf};
 
@@ -15,7 +16,7 @@ pub mod emqx;
 pub mod erlc_compiler;
 pub mod khepri;
 pub mod plb;
-
+pub mod tool;
 /// The workload ids that accept a `--repo <id>=<path>` override.
 pub const REPO_WORKLOADS: [&str; 5] = ["elixir_compiler", "plb", "cowboy", "khepri", "emqx"];
 
