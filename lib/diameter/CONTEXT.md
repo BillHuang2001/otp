@@ -14,7 +14,7 @@ One OTP application only — `subdirs.mk` is `SUB_DIRS = src doc`; the subdirect
 - Dictionary DSL and its compiler: `.dia` sources in `src/dict/`, the `diameter_make` module (`src/compiler/`, `codec/1,2`, `flatten/1`, `format/1`, `format_error/1`) and the `diameterc` escript front-end in `bin/`.
   Compiling a dictionary yields `diameter_gen_<dict>.erl`/`.hrl` encode-decode + record-schema modules (generated into `src/gen/`, not checked in); runtime dictionaries shipped by the app are `diameter_gen_base_rfc3588`, `diameter_gen_base_rfc6733`, `diameter_gen_base_accounting`, `diameter_gen_acct_rfc6733`, `diameter_gen_doic_rfc7683`, `diameter_gen_relay`.
 - `include/diameter.hrl` — public records (`#diameter_packet{}`, `#diameter_header{}`, `#diameter_avp{}`, `#diameter_service{}`, `#diameter_app{}`, `#diameter_caps{}`, `#diameter_event{}`, …) and app-id macros; `include/diameter_gen.hrl` — the fragment every generated dictionary module includes.
-- `src/base/diameter_info.erl` / `src/base`… `src/info/diameter_dbg.erl` — debug/introspection helpers (`diameter_dbg` exposes table dumps, `dbg` tracing and a raw AVP decoder); excluded from the `.app` `modules` list.
+- `src/info/diameter_dbg.erl` and `src/info/diameter_info.erl` — debug/introspection helpers (`diameter_dbg` exposes ETS table dumps, `dbg` tracing and a raw AVP decoder; `diameter_info` is its formatting toolkit); both are excluded from the `.app` `modules` list.
 - Reference manual pages: `diameter(3)`, `diameter_app(3)`, `diameter_codec(3)`, `diameter_make(3)`, `diameter_transport(3)`, `diameter_tcp(3)`, `diameter_sctp(3)`, `diameter_dict(4)`, `diameterc(1)`.
 
 ## Constraints
