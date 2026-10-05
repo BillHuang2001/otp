@@ -6,24 +6,24 @@ Used for manual experimentation with Mnesia APIs and exercised by the test suite
 
 ## API Surface (programs and what each demonstrates)
 Top level (`lib/mnesia/examples/`):
-- `company.erl` + `company.hrl` — the classic Mnesia "company" tutorial: `employee`, `dept`, `project`, `manager` (bag), `at_dep`, `in_proj` (bag) tables. Demonstrates transactions, bag tables, `qlc` queries, `raise/2` vs `bad_raise/2` (aborted-and-retried vs crashed transactions), `over_write/2`, `filter/2`, `dotimes/2`, `bench1/0`, `dist_init/0`.
-- `company_o.erl` + `company_o.hrl` — `ordered_set`/collapsed-schema variant: employee record embeds dept and projects, adds `sinit/0` (`mnesia:create_schema/1`).
-- `bup.erl` — backup/restore demos built on `mnesia:traverse_backup/6`: `view/2` (dump a backup), `change_node_name/5` (rewrite schema node names in a backup), `test/1` (run against a node list), plus `count/1`, `display/1`.
-- `mnesia_meter.erl` — metering helper: `go/0`, `go/1` (replica type), `go/2` (replica type + node list), `repeat_meter/2`; timestamps transaction cost per `people`/`meter` records on distributed nodes.
-- `mnesia_tpcb.erl` — full TPC-B implementation for Mnesia: `init/1`, `start/0,1,2`, `run/1`, `stop/0`, `verify_tabs/0`, `config/2`, driver/reporter internals, and the fragment/conflict/dist/replica helpers (`conflict_test/1`, `dist_test/1`, `replica_test/1`, `sticky_replica_test/1`, `remote_test/1`, `remote_frag2_test/1`) that the test suite calls directly.
-- `DATA` — sample table data in Mnesia external text format (loaded through `mnesia:load_textfile/1`) for the company demo.
+- `company.erl` + `company.hrl` — the classic Mnesia "company" tutorial: `employee`, `dept`, `project`, `manager` (bag), `at_dep`, `in_proj` (bag) tables. Demonstrates transactions, bag tables, `qlc` queries, `raise/2` vs `bad_raise/2` (retried vs aborted transactions), `over_write/2`, `filter/2`, `dotimes/2`, `bench1/0`, `dist_init/0`.
+- `company_o.erl` + `company_o.hrl` — `ordered_set`/collapsed-schema variant: the employee record embeds dept and projects; adds `sinit/0` (`mnesia:create_schema/1`).
+- `bup.erl` — backup/restore demos on `mnesia:traverse_backup/6`: `view/2` (dump a backup), `change_node_name/5` (rewrite schema node names), `test/1`, plus `count/1`, `display/1`.
+- `mnesia_meter.erl` — metering helper: `go/0`, `go/1` (replica type), `go/2` (replica type + nodes), `repeat_meter/2`; times transactions on distributed nodes.
+- `mnesia_tpcb.erl` — full TPC-B implementation for Mnesia: `init/1`, `start/0,1,2`, `run/1`, `stop/0`, `verify_tabs/0`, `config/2`, driver/reporter internals, and the fragment/conflict/dist/replica helpers (`conflict_test/1`, `dist_test/1`, `replica_test/1`, `sticky_replica_test/1`, `remote_test/1`, `remote_frag2_test/1`) the test suite calls directly.
+- `DATA` — sample table data in Mnesia external text format (for `mnesia:load_textfile/1`) used by the company demo.
 - `Makefile` — install-only; see Notes for Agents.
 
 `bench/` — Canadian real-time DB benchmark (LMC/UU-01:025, by Håkan Mattsson):
 - `bench.erl` — main API/config entry: `run/0,1`, `start_all/0,1`, `populate/0,1`, `generate/0,1`, `args_to_config/1`, `verify_config/2`, `stop_peer_nodes/1`, `bind_schedulers/0`.
-- `bench_populate.erl` — creates and populates the fragmented `subscriber`/`group`/`server`/`session`/`suffix` tables (`mnesia:activity(sync_dirty, _, _, mnesia_frag)`).
-- `bench_trans.erl` — the T1..T5 benchmark transactions (`update_current_location/5`, `read_current_location/2`, `read_session_details/4`, `create_session_to_server/6`, `delete_session_from_server/5`) plus key helpers.
-- `bench_generate.erl` — spawns request generators, runs warmup/measure/cooldown and aggregates statistics.
+- `bench_populate.erl` — creates and populates the fragmented `subscriber`/`group`/`server`/`session`/`suffix` tables.
+- `bench_trans.erl` — the T1..T5 benchmark transactions (`update_current_location/5`, `read_current_location/2`, `read_session_details/4`, `create_session_to_server/6`, `delete_session_from_server/5`).
+- `bench_generate.erl` — spawns the request generators, runs warmup/measure/cooldown and aggregates statistics.
 - `bench.hrl` — `#config{}` (defaults) plus `#subscriber{}`, `#session{}`, `#server{}`, `#group{}` records and debug macros.
-- `bench.sh` — starts `erl -pa .. -boot start_sasl -sasl errlog_type error -sname bench`; with args runs `bench:run(ConfigFile)` once per config file, with no args drops into an interactive shell.
+- `bench.sh` — starts `erl -pa .. -boot start_sasl -sasl errlog_type error -sname bench`; with args runs `bench:run(ConfigFile)` once per config file, with none drops into a shell.
 - `bench.config1`..`bench.config7` — 7 preconfigured scenarios: 1/2 = single `bench@wppgpbN` node, 3/4 = 2 nodes, 5/6 = 4 nodes, 7 = 8 nodes; `n_replicas` 1 (configs 1–2) or 2 (3–7); all `ram_copies`, `sticky_write`, `n_fragments` 100, `n_subscribers` 500000, `n_groups` 100, `n_servers` 20, 15 min duration.
 - `bench/Makefile` — `make all` = `erl -make`; `make test` = `./bench.sh bench.config*`; `make clean` removes `*.beam`.
-- `bench/README` — authoritative parameter reference (`generator_profile` t1..t5/ping/random, warmup/duration/cooldown, `storage_type`, `n_fragments`, `n_replicas`, `write_lock_type`, `use_binary_subscriber_key`, `always_try_nearest_node`, `cookie`, node start requirements).
+- `bench/README` — authoritative parameter reference (`generator_profile` t1..t5/ping/random, warmup/duration/cooldown, `storage_type`, `n_fragments`, `n_replicas`, `write_lock_type`, `use_binary_subscriber_key`, `always_try_nearest_node`, `cookie`, node-start requirements).
 
 ## Constraints
 - `company.erl`, `company.hrl`, `company_o.erl`, `company_o.hrl`, `bup.erl` and `DATA` are **git symlinks** to `../doc/src/<same name>` — they are the same file, not copies, so an edit through either path changes both and no sync step exists. `../doc/src/` additionally holds `company.fig`, `DATA2`, `FRUITS`, which are not exposed here.
