@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -123,13 +123,68 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - `THE_NON_VALUE: Eterm` (= `0` in release, `make_header(0, Float)` in debug); `is_non_value`,
   `is_value`, `is_zero_sized`.
 
+### `compare.rs` — Erlang term ordering (`erts_cmp`)
+The lowest-common-ancestor ordering shared by `beam_ets` (ordered_set), `beam_bifs` (comparison
+operators) and `<`/`>` between same-typed terms.
+- `pub fn cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the exact (`=:=`)
+  order, reproducing `erts_cmp(a, b, exact=1, eq_only=0)` / `erts_cmp_compound` (`utils.c`).
+  Ascending order `number < atom < ref < fun < port < pid < tuple < record < map < nil < list <
+  bitstring` (plus external variants), derived from the `_DEF` virtual tags in `erl_term.h`.
+- `pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool` — `cmp(a,b).is_eq()` (`=:=`).
+- `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
+  arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
+  only for floats and mixed integer/float pairs).
+- `pub(crate) float_bits`/`float_value`/`bitstring_parts`/`bit_at` — helpers shared with
+  `hashing.rs` (not re-exported).
+
+### `hashing.rs` — structural term hashing
+- `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash
+  reproducing the *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
+  **The exact hash values are internal and NOT part of any compatibility contract** (nothing
+  outside the Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+
+### `size.rs` — object word size
+- `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
+  occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
+  cell, `arity + 1` per boxed object (header + payload), plus the sizes of nested terms.
+
+### `thing.rs` — off-heap term materialization (heap-agnostic)
+Frozen-layout **writers and readers for the boxed "thing" families whose interior layout this
+crate owns** — float, bignum, flat map, and the external pid/port/ref (`ExternalThing`) blocks.
+Every writer is **heap-agnostic**: the caller allocates the words (via `beam_alloc` in production,
+`heap::Heap` in tests) and passes `hp: *mut Eterm`; the writer fills the block and returns the
+tagged root `Eterm`. All word counts and bit patterns are **byte-identical** to the
+oracle-verified `beam_codec::term` (`make_float`/`make_big`/`make_flatmap`/`make_external_*`),
+which forwards here (see Design Decisions). Readers are `unsafe` with a caller invariant
+("`t` is a live thing of this kind") and return borrowed slices.
+- Float: `pub const FLOAT_SIZE_WORDS: usize = 2`; `unsafe write_float(hp, value: f64) -> Eterm`
+  (`[HEADER_FLONUM, bits]`, root `make_boxed(hp)`); `unsafe float_value(t) -> f64`;
+  `unsafe float_bits(t) -> u64` (delegate to the existing `pub(crate)` helpers in `compare.rs`).
+- Bignum: `pub const fn big_size_words(n_digits) -> usize` (`n_digits + 1`, `BIG_NEED_SIZE`);
+  `unsafe write_big(hp, negative: bool, digits: &[u64]) -> Eterm` (header arity `n - 1`, one
+  `ErtsDigit` = `u64` per word, least-significant-first, sign in `_BIG_SIGN_BIT`; `digits` must be
+  non-empty); `unsafe big_parts<'a>(t) -> (bool, &'a [u64])`.
+- Flat map: `pub const fn flatmap_size_words(n_pairs) -> usize` (`3` for the empty map, else
+  `4 + 2n`); `unsafe write_flatmap(hp, pairs: &[(Eterm, Eterm)]) -> Eterm` (the C block
+  `[arityval(n), k0..k(n-1), MAP_HEADER_FLATMAP, n, keys-tuple, v0..v(n-1)]`, root
+  `make_boxed(hp + 1 + n)`; `n_pairs ≤ MAP_SMALL_MAP_LIMIT`); `unsafe flatmap_parts<'a>(t) ->
+  (&'a [Eterm], &'a [Eterm])`.
+- External things (C `ExternalThing`, incl. the M1 "`next` slot holds `creation`" substitution):
+  `pub const MAX_REF_IDS: usize = 5` (`ERTS_MAX_REF_NUMBERS`); the size fns
+  `external_pid_size_words()` (`4`), `external_port_size_words()` (`4`),
+  `external_ref_size_words(n_ids)` (`3 + n_ids/2 + 1` on `ARCH_64`); the writers
+  `unsafe write_external_pid(hp, node, number: u32, serial: u32, creation: u32)`,
+  `unsafe write_external_port(hp, node, number: u64, creation: u32)`,
+  `unsafe write_external_ref(hp, node, ids: &[u32], creation: u32)` and their `unsafe *_parts`
+  inverses (`external_pid_parts`/`external_port_parts`/`external_ref_parts`).
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
 - **Dependencies:** `beam_common` + `libc` only (this crate is a foundation dependency sink). Nothing
-  else. `beam_common` is currently a placeholder; **do not import its not-yet-existing symbols** —
-  use the local `TermError`/`TermResult` (`error.rs`) until `beam_common::BeamError` lands, then
-  reconcile (a documented decision + `CHANGE.md` entry).
+  else. `beam_common` is used for exactly one thing: the `From<TermError> for beam_common::BeamError`
+  impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
+  `TermResult` remain this crate's error types and must not be redefined per dependent.
 - **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple` (raw pointer
   deref). Every `unsafe fn` documents a `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
@@ -163,6 +218,16 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
   static block — and Rust rejects pointer→integer casts during const evaluation. It is therefore
   exposed as `tuple0()`. Same root cause (no const pointer arithmetic): `make_boxed`/`make_list`/
   `make_tuple` are plain `fn`, not `const fn`.
+- **Off-heap term materialization lives here (`thing.rs`), heap-agnostic over a caller `*mut Eterm`.**
+  The interior layout of a float/bignum/flatmap/external thing is owned by this crate (the
+  frozen-layout lowest common ancestor of every term-producing crate — workspace §2), so its
+  constructors/accessors belong here rather than duplicated in `beam_codec`. This crate **cannot
+  depend on `beam_alloc`** (it is a dependency sink; `beam_alloc` already depends on `beam_term`, so
+  the reverse would cycle), which is exactly why every writer takes a caller-allocated
+  `hp: *mut Eterm` and returns the tagged root instead of allocating. The codec keeps only its
+  error-wrapping + allocation and forwards the word layout here (removing the duplication);
+  `float_bits`/`float_value` delegate to the existing `pub(crate)` helpers in `compare.rs` so the
+  float-layout knowledge has a single definition.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` unit tests.
@@ -175,6 +240,16 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
+- `src/compare.rs`, `src/hashing.rs`, `src/size.rs` carry their own in-module `#[cfg(test)]` suites:
+  ordering across every class pair (number < atom < ref < port < pid < tuple < map < nil < list <
+  binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
+  structural-hash equality for equal terms (and inequality for different terms), and `size_object`
+  for immediates / cons / tuple / boxed. Prefer property-style boundary loops.
+- `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
+  legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n-1` + LS-first `u64` digits
+  and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
+  the 3-word empty block; the external pid/port/ref head + data words), plus write→read round-trips
+  and boundaries (min/max `MAX_REF_IDS`, single-digit bignum, empty flatmap, negative bignum).
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
   compatibility gate), not to this crate's unit tests.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
@@ -191,8 +266,30 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
-- `src/error.rs` → local `TermError`/`TermResult` (to be reconciled with `beam_common`)
+- `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
+- `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
+- `src/size.rs` → object word size (`size_object`), the `size_object_x` port
+- `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
+- `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
+  interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
+
+## Known Issues
+- **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
+  `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings and
+  internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
+  a structural comparison and must be extended if exact ordering is needed: big integers, external
+  pid/port/ref, funs, non-flat maps, records and on-heap bin refs (ordered by class rank, then object
+  arity, then raw term word); internal references (compared by raw payload words, not the decoded
+  `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
+- **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
+  the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
+  exact bit values are not part of any contract. Classes lacking a layout-aware representation (funs,
+  maps, records, external pid/port/ref, bin refs) use an opaque raw-word fallback, so their hash is
+  not stable across processes/images.
+- **Object-size approximations (`src/size.rs`).** Hashmaps are approximated by the head node's
+  `arity + 1` (deep HAMT nodes uncounted); sub-bitstrings report the on-heap thing size rather than
+  the copied representation; native records are treated like tuples.
 
 ## Notes for Agents
 - **Read `../../erts/emulator/beam/erl_term.h` before changing any constant** — it is the ground truth;

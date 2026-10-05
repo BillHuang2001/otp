@@ -10,6 +10,7 @@ beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_alloc = { path = "../beam_alloc" }
 beam_codec = { path = "../beam_codec" }
+beam_gc = { path = "../beam_gc" }
 libc.workspace = true
 
 [lints]

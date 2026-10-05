@@ -1,0 +1,362 @@
+//! The BIF execution context: a heap, the atom table, the calling process and the
+//! optional runtime seams.
+//!
+//! A `BifFn` (see [`crate::registry`]) receives a [`BifContext`] and its argument
+//! slice. The context carries exactly what a BIF may touch:
+//!
+//! * the destination [`beam_alloc::Heap`] (all BIF allocation goes through it —
+//!   `beam_term::heap::Heap` is a test arena only, see `../beam_alloc/CONTEXT.md`);
+//! * the [`AtomTable`] (atom construction never invents an index);
+//! * the calling process's [`ProcessId`] — there is no ambient "current process"
+//!   in the Rust core, so identity is injected here;
+//! * three **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//!   (`send/2`) and a [`TableRegistry`] (`ets:*`). `beam_engine` depends only on
+//!   `beam_loader`, so `beam_rt` supplies the concrete implementations; an unset
+//!   seam means `io:format` writes to stdout and the `send`/`ets` BIFs report
+//!   `unsupported_bif`.
+
+use beam_alloc::Heap;
+use beam_common::{BeamError, Result};
+use beam_process::ProcessId;
+use beam_term::prelude::{make_atom, try_make_small};
+use beam_term::{AtomTable, Eterm, NIL};
+
+use crate::access;
+use crate::ets::TableRegistry;
+
+/// A destination for `io:format` output.
+pub trait OutputSink {
+    /// Writes `s` to the sink.
+    ///
+    /// # Errors
+    ///
+    /// A sink that fails (e.g. a broken stdout pipe) reports [`BeamError::Io`].
+    fn write_str(&mut self, s: &str) -> Result<()>;
+}
+
+/// The default sink: the process's standard output.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct StdoutSink;
+
+impl OutputSink for StdoutSink {
+    fn write_str(&mut self, s: &str) -> Result<()> {
+        use std::io::Write;
+        let mut out = std::io::stdout();
+        out.write_all(s.as_bytes()).map_err(BeamError::Io)
+    }
+}
+
+/// A sink that discards everything.
+#[derive(Debug, Default, Clone, Copy)]
+pub struct NullSink;
+
+impl OutputSink for NullSink {
+    fn write_str(&mut self, _s: &str) -> Result<()> {
+        Ok(())
+    }
+}
+
+/// An in-memory capture sink (tests and embedding).
+#[derive(Debug, Default, Clone)]
+pub struct BytesSink {
+    buf: Vec<u8>,
+}
+
+impl BytesSink {
+    /// An empty capture buffer.
+    pub fn new() -> BytesSink {
+        BytesSink { buf: Vec::new() }
+    }
+
+    /// The captured bytes.
+    pub fn contents(&self) -> &[u8] {
+        &self.buf
+    }
+
+    /// The captured bytes as a `String` (lossily decoded).
+    pub fn as_str(&self) -> String {
+        String::from_utf8_lossy(&self.buf).into_owned()
+    }
+
+    /// Discards the captured bytes.
+    pub fn clear(&mut self) {
+        self.buf.clear();
+    }
+}
+
+impl OutputSink for BytesSink {
+    fn write_str(&mut self, s: &str) -> Result<()> {
+        self.buf.extend_from_slice(s.as_bytes());
+        Ok(())
+    }
+}
+
+/// Delivers `term` to the process `to` (an internal pid).
+///
+/// The runtime supplies this over `beam_process`/`beam_message`; Milestone-1 has no
+/// in-crate delivery, so the `send/2` and `"!"/2` BIFs raise `unsupported_bif`
+/// when no hook is installed.
+pub trait SendHook {
+    /// Sends `term` to `to`.
+    ///
+    /// # Errors
+    ///
+    /// Reports a delivery failure as a [`BeamError`].
+    fn send(&mut self, to: Eterm, term: Eterm) -> Result<()>;
+}
+
+/// What a BIF may read and write during one call.
+pub struct BifContext<'a> {
+    heap: &'a mut Heap,
+    atoms: &'a AtomTable,
+    self_pid: ProcessId,
+    output: Option<&'a mut dyn OutputSink>,
+    sender: Option<&'a mut dyn SendHook>,
+    tables: Option<&'a mut TableRegistry>,
+}
+
+impl<'a> BifContext<'a> {
+    /// A context over `heap`, `atoms` and the calling process `self_pid`, with no
+    /// optional seams installed.
+    pub fn new(heap: &'a mut Heap, atoms: &'a AtomTable, self_pid: ProcessId) -> Self {
+        BifContext {
+            heap,
+            atoms,
+            self_pid,
+            output: None,
+            sender: None,
+            tables: None,
+        }
+    }
+
+    /// Installs the `io:format` output sink.
+    pub fn with_output(mut self, sink: &'a mut dyn OutputSink) -> Self {
+        self.output = Some(sink);
+        self
+    }
+
+    /// Installs the `send/2` delivery hook.
+    pub fn with_sender(mut self, hook: &'a mut dyn SendHook) -> Self {
+        self.sender = Some(hook);
+        self
+    }
+
+    /// Installs the `ets:*` table registry.
+    pub fn with_tables(mut self, reg: &'a mut TableRegistry) -> Self {
+        self.tables = Some(reg);
+        self
+    }
+
+    /// The destination heap.
+    pub fn heap(&mut self) -> &mut Heap {
+        &mut *self.heap
+    }
+
+    /// The atom table.
+    pub fn atoms(&self) -> &AtomTable {
+        self.atoms
+    }
+
+    /// The calling process's pid.
+    pub fn self_pid(&self) -> ProcessId {
+        self.self_pid
+    }
+
+    /// Writes `s` to the configured sink, or to stdout when none is installed.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the sink's failure.
+    pub fn write_output(&mut self, s: &str) -> Result<()> {
+        match self.output.as_deref_mut() {
+            Some(sink) => sink.write_str(s),
+            None => {
+                let mut sink = StdoutSink;
+                sink.write_str(s)
+            }
+        }
+    }
+
+    /// The installed delivery hook, if any.
+    ///
+    /// The trait-object lifetime is spelled out (`dyn SendHook + 'a`) because a
+    /// `&mut` reference is invariant over its referent: the hook handed back must
+    /// stay valid for the context's own lifetime, not merely the accessor's borrow.
+    pub fn sender(&mut self) -> Option<&mut (dyn SendHook + 'a)> {
+        self.sender.as_deref_mut()
+    }
+
+    /// The installed table registry, if any.
+    pub fn tables(&mut self) -> Option<&mut TableRegistry> {
+        self.tables.as_deref_mut()
+    }
+
+    /// A 60-bit small integer.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::SystemLimit`] when `v` does not fit a small integer (the
+    /// rewrite has no `f64`-free bignum arithmetic in Milestone-1; real Erlang
+    /// promotes to a bignum).
+    pub fn int(&self, v: i64) -> Result<Eterm> {
+        try_make_small(v).map_err(|_| BeamError::SystemLimit)
+    }
+
+    /// The atom `name`.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::TermNotFound`] when `name` is not interned in the atom table.
+    pub fn atom(&self, name: &str) -> Result<Eterm> {
+        self.atoms
+            .lookup(name)
+            .map(make_atom)
+            .ok_or(BeamError::TermNotFound)
+    }
+
+    /// The atom `true` or `false`.
+    pub fn boolean(&self, b: bool) -> Result<Eterm> {
+        self.atom(if b { "true" } else { "false" })
+    }
+
+    /// The atom `ok`.
+    pub fn ok(&self) -> Result<Eterm> {
+        self.atom("ok")
+    }
+
+    /// A boxed float built on the context heap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's allocation failure.
+    pub fn make_float(&mut self, v: f64) -> Result<Eterm> {
+        access::make_float(self.heap, v)
+    }
+
+    /// A tuple of `elems` built on the context heap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's allocation failure.
+    pub fn tuple(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        self.heap.tuple(elems)
+    }
+
+    /// A cons cell `[car | cdr]` built on the context heap.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's allocation failure.
+    pub fn cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm> {
+        self.heap.cons(car, cdr)
+    }
+
+    /// A proper list of `elems` built on the context heap (`NIL` when empty).
+    ///
+    /// # Errors
+    ///
+    /// Propagates the heap's allocation failure.
+    pub fn list(&mut self, elems: &[Eterm]) -> Result<Eterm> {
+        let mut acc = NIL;
+        for &elem in elems.iter().rev() {
+            acc = self.heap.cons(elem, acc)?;
+        }
+        Ok(acc)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_alloc::Heap;
+    use beam_term::{atom_val, is_list, make_small};
+
+    fn seeded_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed(["true", "false", "ok"]);
+        atoms
+    }
+
+    #[test]
+    fn writes_to_the_configured_sink() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut sink = BytesSink::new();
+        {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+            ctx.write_output("hello ").expect("captured");
+            ctx.write_output("world").expect("captured");
+        }
+        assert_eq!(sink.contents(), b"hello world");
+        assert_eq!(sink.as_str(), "hello world");
+        sink.clear();
+        assert!(sink.contents().is_empty());
+    }
+
+    #[test]
+    fn null_sink_and_default_stdout_sink_discard_and_write() {
+        let mut sink = NullSink;
+        assert!(sink.write_str("dropped").is_ok());
+        // `StdoutSink` writes to the process stdout; a fresh handle is enough to
+        // exercise the code path without asserting on the terminal.
+        let mut stdout = StdoutSink;
+        assert!(stdout.write_str("").is_ok());
+    }
+
+    #[test]
+    fn identity_and_atoms_accessors() {
+        let mut heap = Heap::new(8).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(7, 3));
+        assert_eq!(ctx.self_pid(), ProcessId::new(7, 3));
+        assert!(ctx.atoms().lookup("ok").is_some());
+        assert!(ctx.heap().available() > 0);
+    }
+
+    #[test]
+    fn writers_build_the_expected_terms() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        assert_eq!(ctx.int(7).expect("a small int"), make_small(7));
+        let ok = ctx.ok().expect("ok is seeded");
+        assert_eq!(ctx.atoms().name(atom_val(ok)), Some("ok"));
+        assert_eq!(
+            ctx.atoms()
+                .name(atom_val(ctx.boolean(true).expect("seeded"))),
+            Some("true")
+        );
+        assert_eq!(
+            ctx.atoms()
+                .name(atom_val(ctx.boolean(false).expect("seeded"))),
+            Some("false")
+        );
+
+        assert!(matches!(ctx.atom("nope"), Err(BeamError::TermNotFound)));
+        assert!(matches!(
+            ctx.int(beam_term::MAX_SMALL + 1),
+            Err(BeamError::SystemLimit)
+        ));
+    }
+
+    #[test]
+    fn structural_writers_build_terms() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        let tuple = ctx.tuple(&[make_small(1), make_small(2)]).expect("fits");
+        assert!(crate::access::is_tuple(tuple));
+
+        let list = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
+        assert!(is_list(list));
+        assert_eq!(ctx.list(&[]).expect("empty is NIL"), NIL);
+        assert!(is_list(ctx.cons(make_small(1), NIL).expect("fits")));
+
+        let float = ctx.make_float(1.5).expect("fits");
+        assert!(crate::access::is_float(float));
+        assert_eq!(crate::access::float_value(float), 1.5);
+    }
+}

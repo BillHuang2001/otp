@@ -9,6 +9,9 @@ description = "Erlang distribution protocol v6: handshake, DFLAG_*/DOP_* control
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_codec = { path = "../beam_codec" }
+# The `control` module's `decode_control` names `beam_alloc::Heap` in its public
+# signature (see CONTEXT.md, Design Decisions): a downward, wave-2 → wave-0 edge.
+beam_alloc = { path = "../beam_alloc" }
 libc.workspace = true
 
 [lints]

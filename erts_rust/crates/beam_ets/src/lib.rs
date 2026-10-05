@@ -2,13 +2,61 @@
 
 //! ETS tables and their interior data structures.
 //!
-//! Implements the observable table semantics of Part I §A.1/§A.8 (`ets:*` behaviour
-//! and introspection) plus the Stage-3 row of Part II §H: `set`, `ordered_set`,
-//! `bag`, `duplicate_bag` and the `new`/`select` implementations over B-tree and
-//! CHAMP interiors. Per workspace `CONTEXT.md` §2 the interior shapes (tree
-//! fan-out, CHAMP thresholds) are *not* externally pinned; only the semantics are.
+//! `beam_ets` owns the **observable semantics of `ets:*`** (Erlang Term Storage)
+//! over flat, table-owned term storage — the A.1 copy boundary. It implements
+//! Part I §A.1 (term/key/value semantics) and §A.8 (`ets:info/1` introspection),
+//! plus the Stage-3 row of Part II §H: `set`, `ordered_set`, `bag` and
+//! `duplicate_bag` over hash-indexed and ordered interiors.
+//!
+//! Per workspace `CONTEXT.md` §2 the interior shapes (bucket layout, hash-map
+//! thresholds, tree fan-out, load factors) are *not* externally pinned; only the
+//! **semantics** are contract — which object wins on a duplicate key, key
+//! equality/ordering, `size`, and what `lookup`/`select`/`tab2list` return. Term
+//! **ordering** and **hashing** are owned by [`beam_term`] (`compare::cmp`/`eq`,
+//! `hashing::term_hash`) and MUST NOT be re-implemented here.
+//!
+//! Legacy ground truth (read-only): `../../erts/emulator/beam/erl_db.c` (API),
+//! `erl_db_hash.c` (`set`/`bag`), `erl_db_tree.c` (`ordered_set`) and
+//! `erl_db_util.c` (key/term handling, the match compiler). Mirror the
+//! **semantics**, not the layouts.
+//!
+//! # Scope (M1)
+//!
+//! All module bodies are implemented: [`Table`] wire the metadata, the
+//! table-owned [`TermStore`] and one interior behind the private `Interior`
+//! trait. The authoritative API surface is `CONTEXT.md` at the crate root, which
+//! also documents the honest M1 gaps (a `select`/deep-copy subset, no concurrency
+//! or owner enforcement) under *Known Issues*.
 
-/// Returns this crate's name; placeholder until the real API lands.
-pub fn beam_ets() -> &'static str {
-    "beam_ets"
+pub mod error;
+pub mod hash_interior;
+pub mod info;
+pub mod key;
+pub mod kind;
+pub mod ordered_interior;
+pub mod select;
+pub mod store;
+pub mod table;
+
+// Flat re-exports of every public item in this crate. (`crate::error` exposes
+// only `pub(crate)` helpers, so it is intentionally not re-exported here.)
+pub use crate::hash_interior::*;
+pub use crate::info::*;
+pub use crate::key::*;
+pub use crate::kind::*;
+pub use crate::ordered_interior::*;
+pub use crate::select::*;
+pub use crate::store::*;
+pub use crate::table::*;
+
+/// The conventional glob-import surface for downstream crates.
+pub mod prelude {
+    pub use crate::hash_interior::*;
+    pub use crate::info::*;
+    pub use crate::key::*;
+    pub use crate::kind::*;
+    pub use crate::ordered_interior::*;
+    pub use crate::select::*;
+    pub use crate::store::*;
+    pub use crate::table::*;
 }

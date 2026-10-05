@@ -1,15 +1,18 @@
 //! Crate-local error type for the frozen term representation.
 //!
-//! `beam_common` (the workspace-wide `BeamError`) is still a placeholder, so this
-//! crate keeps its own minimal `TermError`/`TermResult` pair. It is used by the
-//! `try_*` constructors and accessors at trusted boundaries (arithmetic BIFs, the
-//! loader, `beam_alloc`) so that range violations and arena exhaustion surface as
-//! errors rather than silent corruption (workspace `CONTEXT.md` §3). Reconcile
-//! with `beam_common::BeamError` once that crate lands.
+//! `beam_common` provides the workspace-wide [`BeamError`], but term-construction
+//! failures are most precisely described by this crate, so `TermError`/`TermResult`
+//! stay the error type of the `try_*` constructors and accessors at trusted
+//! boundaries (arithmetic BIFs, the loader, `beam_alloc`): range violations and arena
+//! exhaustion surface as errors rather than silent corruption (workspace
+//! `CONTEXT.md` §3).
 //!
-//! This module deliberately does **not** import anything from `beam_common`; the
-//! declared dependency stays unused until the real error types land.
+//! This module uses the declared `beam_common` dependency for exactly one thing: the
+//! `From<TermError> for beam_common::BeamError` impl below, so downstream crates can
+//! use `?` across the `TermError -> BeamError` boundary instead of each writing its
+//! own mapping (Prevent-Duplication — the conversion is owned upstream, here).
 
+use beam_common::{AllocFailure, AllocKind, BeamError};
 use core::fmt;
 
 /// Failure of a checked term constructor or accessor.
@@ -42,6 +45,37 @@ impl fmt::Display for TermError {
 
 impl core::error::Error for TermError {}
 
+/// Reconciles this crate's [`TermError`] with the workspace error type so dependents
+/// can `?` across the boundary (workspace `CONTEXT.md` §3: one error type upstream).
+///
+/// The mapping is lossy by design — `BeamError` carries only the BEAM error atom the
+/// engine raises:
+///
+/// | `TermError` | `BeamError` | BEAM reason |
+/// |---|---|---|
+/// | `SmallIntOutOfRange` | `BadArith` | `badarith` |
+/// | `ArityOutOfRange` | `SystemLimit` | `system_limit` |
+/// | `HeapExhausted` | `Alloc(..)` | `out_of_memory` |
+/// | `InvalidAtomName` | `BadArg` | `badarg` |
+/// | `AtomIndexOutOfRange` | `SystemLimit` | `system_limit` |
+impl From<TermError> for BeamError {
+    fn from(error: TermError) -> Self {
+        match error {
+            // A 60-bit small-integer overflow is an arithmetic-range failure.
+            TermError::SmallIntOutOfRange => BeamError::BadArith,
+            // Exceeding `MAX_ARITYVAL` is a hard runtime limit.
+            TermError::ArityOutOfRange => BeamError::SystemLimit,
+            // Arena exhaustion is an allocation failure. `TermError::HeapExhausted`
+            // does not carry a byte count, so `requested` is reported as 0 (unknown).
+            TermError::HeapExhausted => BeamError::Alloc(AllocFailure::new(AllocKind::Heap, 0)),
+            // A malformed `atom.names` line is an argument/format failure.
+            TermError::InvalidAtomName => BeamError::BadArg,
+            // Running past `Atom::MAX` is a hard runtime limit.
+            TermError::AtomIndexOutOfRange => BeamError::SystemLimit,
+        }
+    }
+}
+
 /// Result alias used throughout this crate.
 pub type TermResult<T> = core::result::Result<T, TermError>;
 
@@ -69,5 +103,41 @@ mod tests {
         let a = TermError::HeapExhausted;
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn converts_into_workspace_beam_error() {
+        assert!(matches!(
+            BeamError::from(TermError::SmallIntOutOfRange),
+            BeamError::BadArith
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::ArityOutOfRange),
+            BeamError::SystemLimit
+        ));
+        match BeamError::from(TermError::HeapExhausted) {
+            BeamError::Alloc(failure) => {
+                assert_eq!(failure.kind, AllocKind::Heap);
+                assert_eq!(failure.requested, 0);
+            }
+            other => panic!("expected BeamError::Alloc, got {other:?}"),
+        }
+        assert!(matches!(
+            BeamError::from(TermError::InvalidAtomName),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            BeamError::from(TermError::AtomIndexOutOfRange),
+            BeamError::SystemLimit
+        ));
+    }
+
+    #[test]
+    fn conversion_works_with_try() {
+        fn fallible() -> beam_common::Result<u8> {
+            let _ = Err::<u8, _>(TermError::SmallIntOutOfRange)?;
+            Ok(0)
+        }
+        assert!(matches!(fallible(), Err(BeamError::BadArith)));
     }
 }
