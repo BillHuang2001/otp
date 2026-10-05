@@ -14,10 +14,12 @@
 //! * **Client.** `Name` → `Status` (`"ok"` proceeds, `"nok…"` is refused) →
 //!   `Challenge` → `ChallengeReply { challenge: ours, digest:
 //!   md5(cookie ++ decimal(peer_challenge)) }` → `ChallengeAck` (verified against
-//!   *our* challenge) → `Complement` when `DFLAG_HANDSHAKE_23` was negotiated.
+//!   *our* challenge). That completes the OTP-23+ `'N'` handshake — no `Complement`
+//!   is exchanged.
 //! * **Server.** `Name` → `Status::Ok` → `Challenge` → `ChallengeReply`
-//!   (verified) → `ChallengeAck` → `Complement` when `DFLAG_HANDSHAKE_23` was
-//!   negotiated.
+//!   (verified) → `ChallengeAck`. Again no `Complement`: the `'c'` message exists
+//!   only for the legacy `'n'` name (`dist_util.erl:recv_complement`,
+//!   `ei_connect.c:1629`), which [`crate::handshake::Name`] does not decode.
 //! * The digest is `md5(cookie ++ decimal(challenge))` — cookie first — computed
 //!   by [`crate::auth`]. The nonce comes from [`gen_challenge`].
 //! * **Established packets** are a distribution header followed by the control
@@ -67,16 +69,13 @@ use crate::atom_cache::ReceiveAtomCache;
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::control::{decode_control, encode_control, ControlMessage};
 use crate::dist_header::{DistHeader, DIST_HEADER};
-use crate::flags::{
-    DistFlags, Dop, COMPLEMENT_TAG, DFLAG_FRAGMENTS, DFLAG_HANDSHAKE_23, DFLAG_SEND_SENDER,
-};
+use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
 use crate::framing::{
     is_tick, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
 use crate::handshake::{
-    check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Complement, Name,
-    Status,
+    check_mandatory, preferred_flags, Challenge, ChallengeAck, ChallengeReply, Name, Status,
 };
 use crate::transport::{Read, Transport, Write};
 
@@ -208,9 +207,9 @@ pub struct Handshake {
     pub peer_name: Vec<u8>,
     /// A post-handshake packet body read while draining the handshake, if any.
     ///
-    /// The OTP-23+ handshake reads one frame after the `ChallengeAck`: normally
-    /// that is the peer's `Complement` (`'c'`), but a peer that pipelines its
-    /// first real packet leaves it here for [`Connection`] to deliver.
+    /// Always `None` for the OTP-23 `'N'` handshake (no `Complement` is
+    /// exchanged), retained for a peer that pipelines a real packet right after
+    /// the ack.
     pub buffered: Option<Vec<u8>>,
 }
 
@@ -307,26 +306,20 @@ fn connect_client_with<T: Transport>(
         return Err(BeamError::BadArg);
     }
 
-    // 6. OTP 23+ complement. The peer sends it after the ack; a pipelined data
-    //    packet instead is buffered for the connection.
-    let mut buffered = None;
-    if negotiated.contains(DistFlags::from_bits(DFLAG_HANDSHAKE_23)) {
-        let frame = read_packet(t, HANDSHAKE_FRAMING)?;
-        if frame.first().copied() == Some(COMPLEMENT_TAG) {
-            // Validate the shape; the high flag word is not otherwise needed here.
-            let _complement = Complement::decode(&frame)?;
-        } else {
-            buffered = Some(frame);
-        }
-    }
-
+    // No complement is exchanged after the ack. The `'c'` complement exists only
+    // for the legacy `'n'` name (which carries 32-bit flags and no creation): an
+    // acceptor that received `'n'` then reads the initiator's complement
+    // (`dist_util.erl:recv_complement`, `ei_connect.c:1629`). This crate speaks the
+    // OTP-23+ `'N'` name, whose 64-bit flags and creation already carry everything,
+    // so a real `erl` node sends *nothing* here — reading a frame would block
+    // (verified against a live node, `tests/live_interop.rs`).
     Ok(Handshake {
         client_flags: our_flags,
         server_flags: challenge.flags,
         negotiated,
         peer_creation: challenge.creation,
         peer_name: challenge.name,
-        buffered,
+        buffered: None,
     })
 }
 
@@ -386,14 +379,8 @@ fn accept_server_with<T: Transport>(
     })?;
     send_handshake(t, &body)?;
 
-    // 6. OTP 23+ complement.
-    if negotiated.contains(DistFlags::from_bits(DFLAG_HANDSHAKE_23)) {
-        let body = encode_handshake(|w| {
-            Complement { flags_high: (our_flags.bits() >> 32) as u32, creation }.encode(w)
-        })?;
-        send_handshake(t, &body)?;
-    }
-
+    // No complement is sent: it is only used to answer the legacy `'n'` name (see
+    // `connect_client_with`), and `crate::handshake::Name` only decodes `'N'`.
     Ok(Handshake {
         client_flags: name.flags,
         server_flags: our_flags,
@@ -747,12 +734,6 @@ mod tests {
             &encoded(|w| ChallengeAck { digest: gen_digest(COOKIE, our_challenge) }.encode(w)),
             HANDSHAKE_FRAMING,
         ));
-        input.extend(framed(
-            &encoded(|w| {
-                Complement { flags_high: (server_flags.bits() >> 32) as u32, creation }.encode(w)
-            }),
-            HANDSHAKE_FRAMING,
-        ));
         input
     }
 
@@ -786,17 +767,22 @@ mod tests {
     }
 
     #[test]
-    fn client_buffers_a_post_handshake_packet() {
+    fn client_leaves_a_pipelined_packet_for_the_connection() {
         let our_challenge = 0x0abc_def0;
         let mut input = client_script(our_challenge, 7, 3);
-        // Replace the complement with a real (opaque) packet body.
-        input.truncate(input.len() - (framed(&encoded(|w| Complement { flags_high: 0, creation: 3 }.encode(w)), HANDSHAKE_FRAMING)).len());
+        // A peer that pipelines its first real packet right after the ack: the
+        // handshake reads no complement, so the frame must stay in the transport
+        // for the established `Connection` to consume.
         input.extend(framed(&[1, 2, 3], HANDSHAKE_FRAMING));
 
         let mut transport = MemoryTransport::with_input(input);
         let hs = connect_client_with(&mut transport, CLIENT, COOKIE, our_challenge)
             .expect("handshake");
-        assert_eq!(hs.buffered, Some(vec![1, 2, 3]));
+        assert_eq!(hs.buffered, None);
+        assert!(
+            transport.input_remaining() > 0,
+            "the handshake must not consume the pipelined packet"
+        );
     }
 
     #[test]
@@ -903,7 +889,8 @@ mod tests {
         assert_eq!(hs.peer_name, CLIENT);
         assert_eq!(hs.buffered, None);
 
-        // The server sent Status::Ok, Challenge, ChallengeAck and the Complement.
+        // The server sent Status::Ok, Challenge and ChallengeAck — and nothing
+        // else (no complement on the `'N'` handshake).
         let mut output = MemoryTransport::with_input(transport.into_written());
         assert_eq!(Status::decode(&read_handshake_frame(&mut output)).unwrap(), Status::Ok);
         assert_eq!(
@@ -918,10 +905,6 @@ mod tests {
         assert_eq!(
             ChallengeAck::decode(&read_handshake_frame(&mut output)).unwrap().digest,
             gen_digest(COOKIE, peer_challenge)
-        );
-        assert_eq!(
-            Complement::decode(&read_handshake_frame(&mut output)).unwrap(),
-            Complement { flags_high: (preferred_flags().bits() >> 32) as u32, creation: 77 }
         );
         assert_eq!(output.input_remaining(), 0);
     }
