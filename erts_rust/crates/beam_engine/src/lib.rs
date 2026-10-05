@@ -45,11 +45,15 @@
 //! decoded literal area is bound to the [`Machine`] for a run and read through
 //! [`operand::read_operand`].
 //!
-//! The crate is `#![deny(unsafe_code)]`; the **only** exceptions are two
-//! SAFETY-annotated modules: the private `predicates` module, which wraps the
-//! `beam_term` boxed-term predicates (`unsafe fn` because they dereference a
-//! header word), and the `terms` module, which is the crate's single point of
-//! raw-heap construction/reading behind the [`ExecutionContext::alloc_words`] seam.
+//! The crate is `#![deny(unsafe_code)]`. Every exception is SAFETY-annotated and
+//! confined to a single responsibility: `predicates` wraps the `beam_term`
+//! boxed-term predicates (`unsafe fn` because they dereference a header word) and
+//! `terms` is the crate's single point of raw-heap term construction/reading
+//! behind the [`ExecutionContext::alloc_words`] seam — both allowed where they are
+//! declared below. Two more modules carry a module-local `#![allow(unsafe_code)]`:
+//! `families::bitstrings::raw` (the frozen bitstring layouts) and [`jit::emitter`]
+//! (the baseline JIT's x86-64 encoder and the crate's only executable-memory
+//! mapping — see that module for its W^X policy).
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 

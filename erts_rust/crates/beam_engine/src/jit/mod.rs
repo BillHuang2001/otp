@@ -8,9 +8,10 @@
 //!   runs on it. [`Machine::run_export`](crate::Machine::run_export) is and stays
 //!   the default interpreter entry point.
 //! * [`Tier::BaselineJit`] — the native baseline tier (a Rust port of BeamAsm with
-//!   block register allocation; the emitter lives in a `baseline`/`emitter`
-//!   submodule added by a follow-up task). The tier name is part of the roster
-//!   today; the backend itself is **not built yet**, so
+//!   block register allocation; its instruction encoder and executable code
+//!   buffer already exist in the [`emitter`] submodule, while the backend that
+//!   lowers IR onto them lands in a follow-up task). The tier name is part of the
+//!   roster today; the backend itself is **not built yet**, so
 //!   [`Machine::run_with_tier`](crate::Machine::run_with_tier) routes it to the
 //!   interpreter (correct results, no codegen).
 //! * [`Tier::Cranelift`] — the optional hot tier (Cranelift codegen), gated behind
@@ -51,6 +52,8 @@ use beam_term::Eterm;
 
 use crate::context::ExecutionContext;
 use crate::Machine;
+
+pub mod emitter;
 
 /// An execution tier of the typed IR.
 ///
