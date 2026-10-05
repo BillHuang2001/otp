@@ -18,7 +18,7 @@ Built as one of the `SUB_DIRECTORIES = compile app misc agent manager` of `src/M
 - Exported headers: `snmp_usm.hrl` (RFC 7860 secret-key/MAC lengths for HMAC-SHA-2 auth protocols), `snmp_verbosity.hrl` (`?vinfo`/`?vlog`/`?vdebug`/`?vtrace`/`?vvalidate` macros; no-ops when `dont_use_verbosity` is defined), `snmp_debug.hrl` (`?d`/`?d_b`/`?d_e` debug macros; no-ops unless `snmp_debug` is defined — internal debug only).
 
 ## Constraints
-- `snmp_pdus_basic.erl` and `snmp_pdus_basic.asn1db` are GENERATED and git-ignored (`src/.gitignore`) — never edit them; edit `snmp_pdus_basic.asn` (the ASN.1 spec) or `.set.asn` (the file list) instead. `make clean` removes the generated `.erl`/`.asn1db`.
+- `snmp_pdus_basic.erl` and `snmp_pdus_basic.asn1db` are GENERATED and git-ignored (`../.gitignore`) — never edit them; edit `snmp_pdus_basic.asn` (the ASN.1 spec) or `.set.asn` (the file list) instead. `make clean` removes the generated `.erl`/`.asn1db`.
 - Compiled with `-Werror` (unless `SNMP_WARNING_AS_ERROR=false`) and `+warn_unused_vars` (unless `WARN_UNUSED_VARS=false`).
 - Headers are exported for other dirs: `agent/`/`manager/`/`app/` add `-I../misc` (and `manager/` uses `-include_lib("snmp/src/misc/snmp_debug.hrl")`) to consume `snmp_verbosity.hrl`, `snmp_usm.hrl`, `snmp_debug.hrl`; `snmp_misc.erl` also includes `../compile/snmpc_misc.hrl`.
 - Verbosity is compiled in via `-Ddefault_verbosity=<level>` (`SNMP_DEFAULT_VERBOSITY`, default `silence`); debug macros require `SNMP_DEBUG=d` (`-Dsnmp_debug`).
