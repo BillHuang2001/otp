@@ -33,7 +33,7 @@ Everything published for this app comes from the extras in this directory (no mo
 - To document a newly exported `ei` function, touch three places: the header in `../include/`, a call in `../src/prog/ei_fake_prog.c`, and a `## <name>()` section in the matching page of `references/`.
 - `notes.md` uses link-reference definitions (`[PR-11492]: https://…`) and link targets that ExDoc cannot resolve; `make/ex_doc.exs` therefore sets `skip_undefined_reference_warnings_on: ["notes.md"]`.
 - Legacy release-note sections use the spelling `## Erl_interface <vsn>` while recent ones use `## Erl_Interface <vsn>`; a new section follows the newer spelling.
-- `../../../system/doc/tutorial/erl_interface.md` and the `cnode*.c` examples are the separate release-wide port/C-node tutorial (legacy `erl_interface.h`-based) — not part of this app's doc build, do not merge with it.
+- `../../../system/doc/tutorial/erl_interface.md` (an `ei.h`-based example) and that directory's `cnode*.c` examples (which still `#include` the no-longer-shipped `erl_interface.h`) belong to the separate release-wide port/C-node tutorial — not part of this app's doc build, do not merge with it.
 
 ## Test Strategy
 - No tests here: correctness is enforced at doc-build time (ExDoc unresolved-reference/link warnings, `make docs` / `make html` in this directory).
