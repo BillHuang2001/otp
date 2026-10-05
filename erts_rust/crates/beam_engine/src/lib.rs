@@ -22,9 +22,12 @@
 //! The crate is **implemented** for its Milestone-1 scope: the interpreter
 //! dispatch loop and the operand read/write bodies are filled in, [`Machine`]
 //! runs a real `.beam` (via `beam_loader`) end to end, and the vertical-slice
-//! integration test exercises it. The documented coverage gaps (floats, literals,
-//! funs, maps, bitstrings, in-VM exceptions, GC) are unchanged from the design in
+//! integration test exercises it. The documented coverage gaps (floats, funs,
+//! maps, bitstrings, in-VM exceptions, GC) are unchanged from the design in
 //! this crate's `CONTEXT.md` and each returns a typed [`beam_common::BeamError`].
+//! Static literals (`Operand::Literal`) are **supported**: the running module's
+//! decoded literal area is bound to the [`Machine`] for a run and read through
+//! [`operand::read_operand`].
 //!
 //! The crate is `#![deny(unsafe_code)]`; the **only** exceptions are two
 //! SAFETY-annotated modules: the private `predicates` module, which wraps the
