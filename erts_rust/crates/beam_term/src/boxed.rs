@@ -1,0 +1,566 @@
+//! Boxed terms: tagged pointers, header words, arityvals and the boxed sub-type
+//! predicates.
+//!
+//! Ground truth: `erts/emulator/beam/erl_term.h` (boxed/list access methods, the
+//! header layout and `*_SUBTAG` group) plus `erl_map.h`, `erl_bits.h` and
+//! `erl_fun.h` for the thing layouts used by the sub-type tests.
+
+use crate::error::{TermError, TermResult};
+use crate::eterm::Eterm;
+use crate::tag::{
+    ARITYVAL_SUBTAG, BIG_TAG_MASK, BIN_REF_SUBTAG, BITSTRING_TAG_MASK, EXTERNAL_TAG_MASK,
+    EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG, EXTERNAL_REF_SUBTAG, FLOAT_SUBTAG, FUN_SUBTAG,
+    HAMT_SUBTAG_HEAD_ARRAY, HAMT_SUBTAG_HEAD_FLATMAP, HEADER_ARITY_OFFS,
+    HEADER_MAP_HASHMAP_HEAD_MASK, HEADER_MAP_SUBTAG_MASK, HEADER_SUBTAG_MASK, HEAP_BITS_SUBTAG,
+    MAP_HEADER_ARITY_SZ, MAP_HEADER_TAG_SZ, MAP_SUBTAG, MAX_ARITYVAL, POS_BIG_SUBTAG,
+    RECORD_SUBTAG, REF_SUBTAG, SUB_BITS_SUBTAG, TAG_HEADER_MASK, TAG_PRIMARY_BOXED,
+    TAG_PRIMARY_MASK, TAG_PTR_MASK, TRANSPARENT_TAG_MASK,
+};
+
+// ---------------------------------------------------------------------------
+// Boxed pointers
+// ---------------------------------------------------------------------------
+
+/// `make_boxed(x)` — tag a header-word pointer as a boxed term.
+///
+/// Not `const`: pointer-to-integer casts are rejected during const evaluation.
+#[inline]
+pub fn make_boxed(ptr: *const Eterm) -> Eterm {
+    Eterm::from_raw((ptr as usize) + TAG_PRIMARY_BOXED)
+}
+
+/// `boxed_val(x)` — the header-word pointer with the pointer tag (incl. the
+/// literal bit) removed.
+#[inline]
+pub const fn boxed_val(x: Eterm) -> *mut Eterm {
+    (x.raw() & !TAG_PTR_MASK) as *mut Eterm
+}
+
+/// `is_boxed(x)`.
+///
+/// The C bit trick `!((x) & (_TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED))` — that is
+/// `(x & 0x1) == 0`, true for the `BOXED` tag (and the value-invalid `HEADER`
+/// pattern). Mirrored verbatim for bit-exactness.
+#[inline]
+pub const fn is_boxed(x: Eterm) -> bool {
+    (x.raw() & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0
+}
+
+/// `is_not_boxed(x)`.
+#[inline]
+pub const fn is_not_boxed(x: Eterm) -> bool {
+    !is_boxed(x)
+}
+
+// ---------------------------------------------------------------------------
+// Header words
+// ---------------------------------------------------------------------------
+
+/// `_make_header(sz, tag)`.
+#[inline]
+pub const fn make_header(size: usize, subtag: usize) -> Eterm {
+    Eterm::from_raw((size << HEADER_ARITY_OFFS) + subtag)
+}
+
+/// `thing_subtag(x)` — the 4-bit header subtag.
+#[inline]
+pub const fn header_subtag(x: Eterm) -> u32 {
+    (x.raw() & HEADER_SUBTAG_MASK) as u32
+}
+
+/// `MAP_HEADER_TYPE(Hdr)` — the 2-bit map tag.
+#[inline]
+pub const fn map_header_type(hdr: Eterm) -> u32 {
+    ((hdr.raw() >> HEADER_ARITY_OFFS) & 0x3) as u32
+}
+
+/// `MAP_HEADER_ARITY(Hdr)`.
+#[inline]
+pub const fn map_header_arity(hdr: Eterm) -> u32 {
+    ((hdr.raw() >> (HEADER_ARITY_OFFS + MAP_HEADER_TAG_SZ)) & 0xFF) as u32
+}
+
+/// `MAP_HEADER_VAL(Hdr)`.
+#[inline]
+pub const fn map_header_val(hdr: Eterm) -> u32 {
+    ((hdr.raw() >> (HEADER_ARITY_OFFS + MAP_HEADER_TAG_SZ + MAP_HEADER_ARITY_SZ)) & 0xFFFF) as u32
+}
+
+/// `header_arity(x)` — the arity field of a header, with the map and fun
+/// special cases of `_unchecked_header_arity` applied.
+#[inline]
+pub const fn header_arity(x: Eterm) -> usize {
+    if is_map_header(x) {
+        map_header_arity(x) as usize
+    } else if is_fun_header(x) {
+        ERL_FUN_SIZE - 1
+    } else {
+        x.raw() >> HEADER_ARITY_OFFS
+    }
+}
+
+/// `thing_arityval(x)` — the arity of a thing header.
+#[inline]
+pub const fn thing_arityval(x: Eterm) -> usize {
+    header_arity(x)
+}
+
+/// `header_is_transparent(x)` — true for arityvals and records, i.e. headers that
+/// are not wrapped in a thing structure.
+#[inline]
+pub const fn header_is_transparent(x: Eterm) -> bool {
+    ((x.raw() & TRANSPARENT_TAG_MASK) == ARITYVAL_SUBTAG)
+        || ((x.raw() & TAG_HEADER_MASK) == RECORD_SUBTAG)
+}
+
+/// `header_is_thing(x)`.
+#[inline]
+pub const fn header_is_thing(x: Eterm) -> bool {
+    !header_is_transparent(x)
+}
+
+// ---------------------------------------------------------------------------
+// Arityvals (tuple headers)
+// ---------------------------------------------------------------------------
+
+/// `make_arityval_zero()` — the zero-arity tuple header word (`0`).
+#[inline]
+pub const fn make_arityval_zero() -> Eterm {
+    make_header(0, ARITYVAL_SUBTAG)
+}
+
+/// `make_arityval_unchecked(sz)`.
+#[inline]
+pub const fn make_arityval_unchecked(size: usize) -> Eterm {
+    debug_assert!(size <= MAX_ARITYVAL, "arityval out of range");
+    make_header(size, ARITYVAL_SUBTAG)
+}
+
+/// `make_arityval(sz)` — unchecked (engine hot path); the `sz > 0` precondition
+/// is only `debug_assert`ed, mirroring the C macro.
+#[inline]
+pub const fn make_arityval(size: usize) -> Eterm {
+    debug_assert!(size > 0 && size <= MAX_ARITYVAL, "arityval out of range");
+    make_header(size, ARITYVAL_SUBTAG)
+}
+
+/// Range-checked arityval construction.
+#[inline]
+pub fn try_make_arityval(size: usize) -> TermResult<Eterm> {
+    if size > MAX_ARITYVAL {
+        Err(TermError::ArityOutOfRange)
+    } else {
+        Ok(make_arityval_unchecked(size))
+    }
+}
+
+/// `arityval(x)`.
+#[inline]
+pub const fn arityval(x: Eterm) -> usize {
+    x.raw() >> HEADER_ARITY_OFFS
+}
+
+/// `is_arity_value(x)`.
+#[inline]
+pub const fn is_arity_value(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == ARITYVAL_SUBTAG
+}
+
+/// `is_sane_arity_value(x)`.
+#[inline]
+pub const fn is_sane_arity_value(x: Eterm) -> bool {
+    is_arity_value(x) && (x.raw() >> HEADER_ARITY_OFFS) <= MAX_ARITYVAL
+}
+
+// ---------------------------------------------------------------------------
+// Thing layouts (only the sizes the sub-type tests need)
+// ---------------------------------------------------------------------------
+
+/// `ERL_SUB_BITS_SIZE` (`erl_bits.h`: `ErlSubBits` = thing_word, base_flags, start, end, orig).
+pub const ERL_SUB_BITS_SIZE: usize = 5;
+/// `ERL_HEAP_BITS_SIZE` (`erl_bits.h`: `ErlHeapBits` = thing_word, size, data[]).
+pub const ERL_HEAP_BITS_SIZE: usize = 2;
+/// `ERL_BIN_REF_SIZE` (`erl_bits.h`: `BinRef` = thing_word, val, next).
+pub const ERL_BIN_REF_SIZE: usize = 3;
+/// `ERL_FUN_SIZE` on 64-bit (`erl_fun.h`: `ErlFunThing` = thing_word, entry, env[]).
+pub const ERL_FUN_SIZE: usize = 2;
+
+/// `HEADER_FLONUM` (64-bit: a 1-word thing).
+pub const HEADER_FLONUM: Eterm = make_header(1, FLOAT_SUBTAG);
+/// `HEADER_SUB_BITS`.
+pub const HEADER_SUB_BITS: Eterm = make_header(ERL_SUB_BITS_SIZE - 1, SUB_BITS_SUBTAG);
+/// `HEADER_BIN_REF`.
+pub const HEADER_BIN_REF: Eterm = make_header(ERL_BIN_REF_SIZE - 1, BIN_REF_SUBTAG);
+
+// ---------------------------------------------------------------------------
+// Header-only predicates
+// ---------------------------------------------------------------------------
+
+/// `is_map_header(x)`.
+#[inline]
+pub const fn is_map_header(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == MAP_SUBTAG
+}
+
+/// `is_flatmap_header(x)`.
+#[inline]
+pub const fn is_flatmap_header(x: Eterm) -> bool {
+    (x.raw() & HEADER_MAP_SUBTAG_MASK) == HAMT_SUBTAG_HEAD_FLATMAP
+}
+
+/// `is_hashmap_header(x)`.
+#[inline]
+pub const fn is_hashmap_header(x: Eterm) -> bool {
+    (x.raw() & HEADER_MAP_HASHMAP_HEAD_MASK) == HAMT_SUBTAG_HEAD_ARRAY
+}
+
+/// `is_fun_header(x)`.
+#[inline]
+pub const fn is_fun_header(x: Eterm) -> bool {
+    (x.raw() & HEADER_SUBTAG_MASK) == FUN_SUBTAG
+}
+
+/// `is_record_header(x)`.
+#[inline]
+pub const fn is_record_header(x: Eterm) -> bool {
+    (x.raw() & HEADER_SUBTAG_MASK) == RECORD_SUBTAG
+}
+
+/// `_is_bignum_header(x)` — true for both positive and negative bignums.
+#[inline]
+pub const fn is_bignum_header(x: Eterm) -> bool {
+    (x.raw() & BIG_TAG_MASK) == POS_BIG_SUBTAG
+}
+
+/// `is_ref_thing_header(x)`.
+#[inline]
+pub const fn is_ref_thing_header(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == REF_SUBTAG
+}
+
+/// `is_bitstring_header(x)` — true for both heap and sub bitstrings.
+#[inline]
+pub const fn is_bitstring_header(x: Eterm) -> bool {
+    (x.raw() & BITSTRING_TAG_MASK) == HEAP_BITS_SUBTAG
+}
+
+/// `is_external_pid_header(x)`.
+#[inline]
+pub const fn is_external_pid_header(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == EXTERNAL_PID_SUBTAG
+}
+
+/// `is_external_port_header(x)`.
+#[inline]
+pub const fn is_external_port_header(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == EXTERNAL_PORT_SUBTAG
+}
+
+/// `is_external_ref_header(x)`.
+#[inline]
+pub const fn is_external_ref_header(x: Eterm) -> bool {
+    (x.raw() & TAG_HEADER_MASK) == EXTERNAL_REF_SUBTAG
+}
+
+/// `is_external_header(x)` — true for external pids, ports and refs.
+#[inline]
+pub const fn is_external_header(x: Eterm) -> bool {
+    (x.raw() & EXTERNAL_TAG_MASK) == EXTERNAL_PID_SUBTAG
+}
+
+// ---------------------------------------------------------------------------
+// Term predicates (these dereference the boxed pointer)
+// ---------------------------------------------------------------------------
+
+macro_rules! boxed_predicate {
+    ($name:ident, $header_test:ident, $doc:literal) => {
+        #[doc = $doc]
+        ///
+        /// # Safety
+        ///
+        /// If `x` is boxed, its header word must be a live, aligned term word.
+        #[inline]
+        pub unsafe fn $name(x: Eterm) -> bool {
+            if !is_boxed(x) {
+                return false;
+            }
+            unsafe { $header_test(*boxed_val(x)) }
+        }
+    };
+}
+
+boxed_predicate!(is_map, is_map_header, "`is_map(x)`");
+boxed_predicate!(is_flatmap, is_flatmap_header, "`is_flatmap(x)`");
+boxed_predicate!(is_hashmap, is_hashmap_header, "`is_hashmap(x)`");
+boxed_predicate!(is_any_fun, is_fun_header, "`is_any_fun(x)`");
+boxed_predicate!(is_record, is_record_header, "`is_record(x)`");
+boxed_predicate!(is_big, is_bignum_header, "`is_big(x)`");
+boxed_predicate!(
+    is_internal_ref,
+    is_ref_thing_header,
+    "`is_internal_ref(x)`"
+);
+boxed_predicate!(
+    is_external_pid,
+    is_external_pid_header,
+    "`is_external_pid(x)`"
+);
+boxed_predicate!(
+    is_external_port,
+    is_external_port_header,
+    "`is_external_port(x)`"
+);
+boxed_predicate!(
+    is_external_ref,
+    is_external_ref_header,
+    "`is_external_ref(x)`"
+);
+
+/// `is_float(x)` — a boxed term whose header is exactly `HEADER_FLONUM`.
+///
+/// # Safety
+///
+/// If `x` is boxed, its header word must be a live, aligned term word.
+#[inline]
+pub unsafe fn is_float(x: Eterm) -> bool {
+    if !is_boxed(x) {
+        return false;
+    }
+    unsafe { *boxed_val(x) == HEADER_FLONUM }
+}
+
+/// `is_bitstring(x)`.
+///
+/// # Safety
+///
+/// If `x` is boxed, its header word must be a live, aligned term word.
+#[inline]
+pub unsafe fn is_bitstring(x: Eterm) -> bool {
+    if !is_boxed(x) {
+        return false;
+    }
+    unsafe { is_bitstring_header(*boxed_val(x)) }
+}
+
+/// `is_not_bitstring(x)`.
+///
+/// # Safety
+///
+/// As [`is_bitstring`].
+#[inline]
+pub unsafe fn is_not_bitstring(x: Eterm) -> bool {
+    let bitstring = unsafe { is_bitstring(x) };
+    !bitstring
+}
+
+/// `is_bin_ref(x)` — an off-heap binary reference (`HEADER_BIN_REF`).
+///
+/// # Safety
+///
+/// If `x` is boxed, its header word must be a live, aligned term word.
+#[inline]
+pub unsafe fn is_bin_ref(x: Eterm) -> bool {
+    if !is_boxed(x) {
+        return false;
+    }
+    unsafe { *boxed_val(x) == HEADER_BIN_REF }
+}
+
+/// `bitstring_size(Bin)` — the bit size of a heap or sub bitstring.
+///
+/// `erl_bits.h`: for a `SUB_BITS` thing the size is `end - start`; for a
+/// `HEAP_BITS` thing it is the `size` word.
+///
+/// # Safety
+///
+/// `bin` must be a live bitstring (heap or sub bits) whose backing thing is
+/// valid for `ERL_SUB_BITS_SIZE` / `ERL_HEAP_BITS_SIZE` words.
+pub unsafe fn bitstring_size(bin: Eterm) -> usize {
+    let p = boxed_val(bin);
+    let hdr = unsafe { *p };
+    if hdr == HEADER_SUB_BITS {
+        // ErlSubBits: [thing_word, base_flags, start, end, orig]
+        let start = unsafe { *p.add(2) }.raw();
+        let end = unsafe { *p.add(3) }.raw();
+        end - start
+    } else {
+        // ErlHeapBits: [thing_word, size, data...]
+        unsafe { *p.add(1) }.raw()
+    }
+}
+
+/// `is_binary(x)` — a bitstring whose size is a whole number of bytes.
+///
+/// # Safety
+///
+/// As [`bitstring_size`].
+pub unsafe fn is_binary(x: Eterm) -> bool {
+    unsafe { is_bitstring(x) && (bitstring_size(x) & 7) == 0 }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::immediate::{make_small, NIL};
+    use crate::tag::{HEADER_MAP_SUBTAG_MASK, NEG_BIG_SUBTAG};
+
+    #[test]
+    fn boxed_pointer_tagging_and_masking() {
+        let mut words = [make_arityval(1), make_small(9)];
+        let base = words.as_mut_ptr() as usize;
+        let t = make_boxed(words.as_ptr());
+        assert!(is_boxed(t));
+        assert!(!is_not_boxed(t));
+        assert_eq!(boxed_val(t) as usize, base);
+        let literal = Eterm::from_raw(t.raw() | crate::tag::TAG_LITERAL_PTR);
+        assert_eq!(boxed_val(literal) as usize, base);
+    }
+
+    #[test]
+    fn arityval_encoding_is_pinned() {
+        assert_eq!(make_arityval_zero().raw(), 0);
+        assert_eq!(make_arityval_unchecked(0).raw(), 0);
+        assert_eq!(make_arityval(1).raw(), 0x40);
+        assert_eq!(make_arityval(2).raw(), 0x80);
+        assert_eq!(make_arityval_unchecked(MAX_ARITYVAL).raw(), MAX_ARITYVAL << 6);
+        assert!(is_arity_value(make_arityval(3)));
+        assert!(is_sane_arity_value(make_arityval(3)));
+        assert_eq!(arityval(make_arityval(7)), 7);
+        assert_eq!(arityval(make_arityval_zero()), 0);
+    }
+
+    #[test]
+    fn try_make_arityval_range() {
+        assert_eq!(
+            try_make_arityval(0).unwrap().raw(),
+            make_arityval_zero().raw()
+        );
+        assert_eq!(
+            try_make_arityval(MAX_ARITYVAL).unwrap().raw(),
+            make_arityval_unchecked(MAX_ARITYVAL).raw()
+        );
+        assert_eq!(
+            try_make_arityval(MAX_ARITYVAL + 1),
+            Err(TermError::ArityOutOfRange)
+        );
+    }
+
+    #[test]
+    fn header_helpers() {
+        let tup = make_arityval(5);
+        assert_eq!(header_subtag(tup), 0x00);
+        assert_eq!(header_arity(tup), 5);
+        assert_eq!(thing_arityval(tup), 5);
+        assert!(header_is_transparent(tup));
+        assert!(!header_is_thing(tup));
+
+        let float = make_header(1, FLOAT_SUBTAG);
+        assert_eq!(header_subtag(float), 0x18);
+        assert!(!header_is_transparent(float));
+        assert!(header_is_thing(float));
+
+        let rec = make_header(3, RECORD_SUBTAG);
+        assert_eq!(header_arity(rec), 3);
+        assert!(header_is_transparent(rec));
+    }
+
+    #[test]
+    fn map_header_fields() {
+        // MAP_HEADER_HAMT_HEAD_ARRAY = MAKE_MAP_HEADER(tag=2, arity=1, val=0xffff)
+        let hdr = make_header(((0xffffusize << 8) | 1) << 2 | 0x2, MAP_SUBTAG);
+        assert!(is_map_header(hdr));
+        assert!(is_hashmap_header(hdr));
+        assert!(!is_flatmap_header(hdr));
+        assert_eq!(map_header_type(hdr), 2);
+        assert_eq!(map_header_arity(hdr), 1);
+        assert_eq!(map_header_val(hdr), 0xffff);
+        assert_eq!(header_arity(hdr), 1);
+    }
+
+    #[test]
+    fn flatmap_header_fields() {
+        // MAP_HEADER_FLATMAP = MAKE_MAP_HEADER(tag=0, arity=1, val=0)
+        let hdr = make_header((1usize << 2) | 0x0, MAP_SUBTAG);
+        assert!(is_map_header(hdr));
+        assert!(is_flatmap_header(hdr));
+        assert!(!is_hashmap_header(hdr));
+        assert_eq!(map_header_type(hdr), 0);
+        assert_eq!(map_header_arity(hdr), 1);
+        assert_eq!(hdr.raw() & HEADER_MAP_SUBTAG_MASK, HAMT_SUBTAG_HEAD_FLATMAP);
+    }
+
+    #[test]
+    fn boxed_subtype_predicates() {
+        let float_words = [HEADER_FLONUM, make_small(0)];
+        let float = make_boxed(float_words.as_ptr());
+        let big_words = [make_header(1, POS_BIG_SUBTAG), make_small(0)];
+        let big = make_boxed(big_words.as_ptr());
+        let nbig_words = [make_header(1, NEG_BIG_SUBTAG), make_small(0)];
+        let nbig = make_boxed(nbig_words.as_ptr());
+        let ref_words = [make_header(2, REF_SUBTAG), make_small(0), make_small(0)];
+        let ref_t = make_boxed(ref_words.as_ptr());
+        let rec_words = [make_header(2, RECORD_SUBTAG), make_small(0), make_small(0)];
+        let rec = make_boxed(rec_words.as_ptr());
+        // MAKE_FUN_HEADER(arity=2, numfree=1, external=0)
+        let fun_hdr = Eterm::from_raw(FUN_SUBTAG | (2usize << 8) | (1usize << 16));
+        let fun_words = [fun_hdr, make_small(0)];
+        let fun = make_boxed(fun_words.as_ptr());
+
+        unsafe {
+            assert!(is_float(float));
+            assert!(!is_big(float));
+            assert!(is_big(big));
+            assert!(is_big(nbig));
+            assert!(!is_float(big));
+            assert!(is_internal_ref(ref_t));
+            assert!(is_record(rec));
+            assert!(is_any_fun(fun));
+            assert_eq!(header_arity(fun_hdr), ERL_FUN_SIZE - 1);
+            assert!(!is_map(rec));
+            assert!(!is_bitstring(rec));
+        }
+        assert!(!unsafe { is_float(make_small(1)) });
+        assert!(!unsafe { is_float(NIL) });
+    }
+
+    #[test]
+    fn external_headers() {
+        assert!(is_external_pid_header(make_header(4, EXTERNAL_PID_SUBTAG)));
+        assert!(is_external_port_header(make_header(4, EXTERNAL_PORT_SUBTAG)));
+        assert!(is_external_ref_header(make_header(5, EXTERNAL_REF_SUBTAG)));
+        assert!(is_external_header(make_header(4, EXTERNAL_PID_SUBTAG)));
+        assert!(is_external_header(make_header(4, EXTERNAL_PORT_SUBTAG)));
+        assert!(is_external_header(make_header(5, EXTERNAL_REF_SUBTAG)));
+        assert!(!is_external_header(make_arityval(1)));
+    }
+
+    #[test]
+    fn bitstring_and_binary() {
+        // heap bitstring of 16 bits => 2 bytes => a binary (size word = 16)
+        let heap_words = [
+            make_header(2, HEAP_BITS_SUBTAG),
+            Eterm::from_raw(16),
+            make_small(0),
+        ];
+        let heap = make_boxed(heap_words.as_ptr());
+        // sub-bits: [thing_word, base_flags, start, end, orig], end-start = 12 bits
+        let sub_words = [
+            HEADER_SUB_BITS,
+            Eterm::from_raw(0),
+            Eterm::from_raw(4),
+            Eterm::from_raw(16),
+            make_small(0),
+        ];
+        let sub = make_boxed(sub_words.as_ptr());
+        unsafe {
+            assert!(is_bitstring(heap));
+            assert!(!is_not_bitstring(heap));
+            assert_eq!(bitstring_size(heap), 16);
+            assert!(is_binary(heap));
+            assert!(is_bitstring(sub));
+            assert_eq!(bitstring_size(sub), 12);
+            assert!(!is_binary(sub)); // 12 bits is not byte aligned
+        }
+        assert!(!unsafe { is_bitstring(NIL) });
+    }
+}

@@ -8,8 +8,74 @@
 //! (literal-area bit), 60-bit small integers, 6-bit-shifted atom immediates and
 //! header-less 2-word cons cells tagged `TAG_PRIMARY_LIST`. Every other crate
 //! depends downward on it for term operations.
+//!
+//! Ground truth for every constant and bit pattern is
+//! `erts/emulator/beam/erl_term.h` (plus `erl_map.h`, `erl_bits.h`, `erl_fun.h`
+//! for thing layouts and `erts/emulator/utils/make_tables` for atom ordering).
+//!
+//! Downstream code can `use beam_term::prelude::*;`.
 
-/// Returns this crate's name; placeholder until the real API lands.
-pub fn beam_term() -> &'static str {
-    "beam_term"
+pub mod atom;
+pub mod boxed;
+pub mod error;
+pub mod eterm;
+pub mod heap;
+pub mod immediate;
+pub mod list;
+pub mod literal;
+pub mod ops;
+pub mod tag;
+pub mod tuple;
+
+/// Flat re-exports of every public item in this crate.
+pub use crate::atom::*;
+pub use crate::boxed::*;
+pub use crate::error::*;
+pub use crate::eterm::*;
+pub use crate::heap::*;
+pub use crate::immediate::*;
+pub use crate::list::*;
+pub use crate::literal::*;
+pub use crate::ops::*;
+pub use crate::tag::*;
+pub use crate::tuple::*;
+
+/// The conventional glob-import surface for downstream crates.
+pub mod prelude {
+    pub use crate::atom::*;
+    pub use crate::boxed::*;
+    pub use crate::error::*;
+    pub use crate::eterm::*;
+    pub use crate::heap::*;
+    pub use crate::immediate::*;
+    pub use crate::list::*;
+    pub use crate::literal::*;
+    pub use crate::ops::*;
+    pub use crate::tag::*;
+    pub use crate::tuple::*;
+}
+
+#[cfg(test)]
+mod tests {
+    //! Smoke tests that the flat re-exports and the prelude resolve.
+
+    #[test]
+    fn flat_reexports_are_reachable() {
+        use super::{is_boxed, is_list, is_small, make_small, Eterm, NIL};
+        assert!(is_small(make_small(1)));
+        assert!(!is_boxed(NIL));
+        assert!(!is_list(NIL));
+        assert_eq!(Eterm::default(), NIL);
+    }
+
+    #[test]
+    fn prelude_resolves() {
+        use crate::prelude::*;
+        let t = make_small(42);
+        assert_eq!(signed_value(t), 42);
+        assert!(is_immediate(t));
+        assert_eq!(AtomTable::new().len(), 0);
+        let mut heap = Heap::new(4);
+        assert!(heap.cons(t, NIL).is_ok());
+    }
 }
