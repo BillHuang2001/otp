@@ -137,10 +137,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   `BeamError::Alloc(AllocFailure::new(AllocKind::Heap, bytes))` (never panic, never a crate-local error
   enum, never `unwrap()` on runtime data). `beam_term::TermError` is reconciled to `BeamError` upstream,
   so `?` crosses the boundary.
-- **`unsafe` is confined to `copy.rs`** (the word-level copier) and the raw-pointer parts of `space.rs`
-  (range tests only); every `unsafe fn` carries a `# Safety` section and every `unsafe` block a
-  preceding `// SAFETY:` rationale (`beam_common::safety`). `unsafe_op_in_unsafe_fn` stays clean.
-  `policy.rs`, `stats.rs`, `mso.rs` and the `Collector` driving logic are safe Rust.
+- **`unsafe` is confined to `copy.rs`** (the word-level copier), the raw-pointer parts of `space.rs`
+  (range tests only) and the two narrow `NonNull`-deref / `Box::from_raw` blocks in `mso.rs`; every
+  `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding `// SAFETY:` rationale
+  (`beam_common::safety`). `unsafe_op_in_unsafe_fn` stays clean. `policy.rs`, `stats.rs` and the
+  `Collector` driving logic are safe Rust.
 - **Do NOT modify `beam_term` or `beam_alloc`** — build on their public APIs only. Do not touch
   `../../../erts/` (read-only ground truth) or `../../tools/`.
 - **Never break the frozen term layout or the barrier-free invariant** (a minor must not leave a
