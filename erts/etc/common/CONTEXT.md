@@ -111,7 +111,7 @@ Android (`*-android*`) additionally rewrites `/bin/sh` → `/system/bin/sh` in t
 
 ## See Also
 - `../Makefile` (`erts/Makefile`) → `local_setup` (copies these artifacts into `$(ERL_TOP)/bin`), `$(TYPES)` and `release` targets that drive this directory.
-- `../CONTEXT.md` → `erts` application layout, `ERTX`/`VSN`, preloaded modules, `bin/` build tree.
+- `../CONTEXT.md` → `erts` application layout, `VSN`, preloaded modules, `bin/` build tree.
 - `../lib_src/CONTEXT.md` → `erts_internal`, `erl_printf`, `erl_misc_utils`, `yielding_c_fun`.
 - `../emulator/beam/bif.tab`, `../preloaded/` → where `erlexec`'s output ends up being interpreted (the emulator side of `-root`/`-bindir`/`-progname`).
 - `../../lib/kernel/` → Erlang-side counterparts: `heart.erl`, `inet_gethost_native.erl`, `erl_epmd`, `code`.
