@@ -67,6 +67,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 
 ## Known Issues / Notes for Agents
 - `Makefile.src` in this directory (`lib/erl_interface/test/Makefile.src`) is dead legacy: its rules reference `eterm_test.c`, `ext_test.c`, `format_test.c`, `print_term.c`, `match_test.c`, which do not exist, and this directory is never processed as a `*_data` dir.
+- `ei_global_SUITE_data/Makefile.src` still carries a leftover `LIBERL = @erl_interface_lib@`, but nothing consumes it: `@erl_interface_lib@` resolves via `ts_erl_config` to a `liberl_interface.a` path that the application no longer builds, and the only real prerequisites/link inputs are `$(LIBEI)` (`libei.a`), `ei_runner.o` and `my_ussi.o`.
 - `README` describes the ClearCase-era workflow and is obsolete — do not follow it. To add a suite, copy a similar suite plus its `*_SUITE_data/` and rename the C file.
 - `Makefile`'s `tests`/`clean`/`docs` targets are empty on purpose: tests are driven by `make test` → `make/test_target_script.sh`, not by this Makefile.
 - Tests are installed to `$(RELEASE_PATH)/erl_interface_test` (not `lib/<app>-<vsn>/test`), which is why the specs use `{suites,"../erl_interface_test",all}`.
