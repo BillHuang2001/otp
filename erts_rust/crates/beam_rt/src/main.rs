@@ -1,13 +1,10 @@
-//! Rust ERTS runtime binary: boot sequence, preloaded modules, CLI flags and `system_info`.
+//! The `beam_rt` executable: a thin shim over [`beam_rt::cli::run`].
 //!
-//! Implements compatibility contracts Part I §A.6 (CLI/configuration) and §A.7
-//! (preloaded modules, boot scripts, `erts_internal`/`prim_*`), and owns the
-//! runtime glue described in `../../CONTEXT.md`. Placeholder entry point until the
-//! child architects land the real boot sequence.
-
+//! Every piece of logic lives in the library so it is unit- and integration-testable;
+//! this file only forwards the command line (minus `argv[0]`) and turns the returned
+//! exit code into the process status. See `beam_rt::cli` for the supported switch
+//! subset (contract A.6) and `../CONTEXT.md` for the frozen surface.
 fn main() {
-    println!(
-        "beam_rt {} — Rust ERTS rewrite (target: OTP 30.0-rc0 / erts-17.1)",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    std::process::exit(beam_rt::cli::run(args));
 }
