@@ -158,6 +158,11 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
   exists (per the node objective) only so the representation has a concrete, testable backing store
   for constructing boxed/list terms; `beam_alloc`/`beam_gc` build the real thing on top. It never
   reallocates (fixed capacity) so interior pointers never dangle.
+- **`TUPLE0` is `tuple0()`, a function, not a `const`.** The spec asked for `pub const TUPLE0: Eterm`,
+  but a shared empty-tuple literal must carry `TAG_LITERAL_PTR`, which requires forming a pointer to a
+  static block — and Rust rejects pointer→integer casts during const evaluation. It is therefore
+  exposed as `tuple0()`. Same root cause (no const pointer arithmetic): `make_boxed`/`make_list`/
+  `make_tuple` are plain `fn`, not `const fn`.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` unit tests.
