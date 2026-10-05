@@ -879,8 +879,8 @@ mod tests {
 
     use crate::context::BytesSink;
 
-    const SEED: [&str; 12] = [
-        "true", "false", "ok", "hello", "a", "b", "abc", "hi", "foo", "abcdefgh", "", "e",
+    const SEED: [&str; 13] = [
+        "true", "false", "ok", "hello", "a", "b", "c", "abc", "hi", "foo", "abcdefgh", "", "e",
     ];
 
     /// Runs `io:format` over a fresh context, returning the captured output and the
@@ -1108,13 +1108,20 @@ mod tests {
 
     #[test]
     fn bad_base_and_precision_are_badarg() {
-        for format in ["~.0b", "~.1b", "~.37b", "~.b"] {
+        for format in ["~.0b", "~.1b", "~.37b"] {
             let (_, result) = run_io(format, |ctx| ints(ctx, &[5]));
             assert!(
                 matches!(result, Err(BeamError::BadArg)),
                 "format {format} should be badarg"
             );
         }
+        // A `.` that is not followed by a digit or `*` is **not** a precision; the
+        // oracle reads it as "no precision" and renders the directive normally
+        // (verified against erts-17.1: `io_lib:format("~.b",[5])` => "5"). Only the
+        // *second* `.` (the pad modifier) is malformed in that position.
+        let (output, result) = run_io("~.b", |ctx| ints(ctx, &[5]));
+        assert!(result.is_ok(), "~.b is not badarg in the oracle");
+        assert_eq!(output, "5");
         for format in ["~.1e", "~.0f", "~.0g"] {
             let (_, result) = run_io(format, |ctx| {
                 let f = ctx.make_float(1.5).expect("fits");
@@ -1166,7 +1173,9 @@ mod tests {
             let prefix = byte_list(ctx, b"0x");
             Some(ctx.list(&[n, prefix]).expect("fits"))
         });
-        assert_eq!(output, "0x-255");
+        // The sign precedes the prefix (verified against erts-17.1:
+        // `io_lib:format("~x",[-255,"0x"])` => "-0x255").
+        assert_eq!(output, "-0x255");
 
         // A single-argument `~x` is badarg (it needs two arguments) — this is the
         // shape the crate's integration test asserts.
