@@ -3,7 +3,7 @@
 ## Intent
 The POSIX half of the *ethread* abstraction (Erlang's portable thread/mutex/event library).
 Supplies the OS-dependent primitives — thread creation + thread-specific-event (TSE) plumbing, event (wait/wake) primitives, monotonic time, thread names, signal helpers, arch runtime probes — on top of the portable half in `../common/`.
-Together they are archived into the single static lib `erts/lib/internal/$(TARGET)/libethread$(TYPE_SUFFIX).a`, which is the only synchronization layer used by the BEAM emulator and by other OTP-internal programs linking `-lethread`.
+Together they are archived into the single static lib `erts/lib/internal/$(TARGET)/libethread$(TYPE_SUFFIX).a` (`.lib` with no `lib` prefix on Windows; see `LIB_PREFIX`/`LIB_SUFFIX` in `erts/lib_src/Makefile.in`), which is the only synchronization layer used by the BEAM emulator and by other OTP-internal programs linking `-lethread`.
 This is an OTP-internal library (no public API stability promise); its headers are installed into `erts-$(VSN)/include/internal/`.
 
 ## Layout / Boundary
