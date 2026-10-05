@@ -238,6 +238,19 @@ stable raw pointers; **only this module dereferences them**.
 - **Unsupported ⇒ `Raise` with reason atom `unsupported_opcode`.** `beam_common::BeamError` has no
   dedicated variant and must not gain one from here; the engine's `error::unsupported` raise is the
   documented sentinel, consistent with "no silent swallowing, no panic".
+- **The FR file stores `Eterm` term slots at M1.** The C float-register file is raw doubles
+  (`FloatDef`), but the engine's operand seam is `Eterm`-typed, so a term-slot FR file lets
+  `read_operand`/`write_operand` support `FloatReg` uniformly (the raw-double model is a deferred
+  refinement). Float arithmetic still boxes/unboxes via the `terms` float helpers.
+- **Term construction lives behind `alloc_words` + `terms`.** The engine previously never allocated
+  heap terms itself (only BIFs, via the context); the widened interpreter needs to build boxed terms
+  (tuples/lists/floats/maps/funs), so the seam grew `alloc_words` (default unsupported) and the
+  SAFETY-annotated `terms` module is the sole dereferencer of that raw storage. `apply` (default →
+  `call_bif`) is added so the future `call_ext`/`apply` path has a hook without a trait break.
+- **M1 fun layout inlines the descriptor.** C's boxed fun points out-of-line at an `ErlFunEntry`/
+  `Export` (code address + `uniq`/`index`); M1 has no code pointers, so `make_fun` inlines the
+  descriptor as two words (`uniq`, `index`) after the header — the same documented "M1 substitution"
+  pattern as the external-pid `node` slot (`erl_term.h` `MAKE_FUN_HEADER` + `erl_fun.h` `ErlFunThing`).
 
 ## Known Issues / Intentional M1 gaps
 - **No garbage collection.** `MinimalContext` has an unbounded heap; `test_heap`/`allocate_heap` call
