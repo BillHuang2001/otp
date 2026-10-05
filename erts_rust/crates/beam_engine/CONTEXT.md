@@ -81,6 +81,23 @@ pub trait ExecutionContext {
 - `pub enum StepOutcome { ... }` / the interpreter loop entry `pub fn run_loop(...)` — the dispatch
   loop lives in `src/interpreter.rs` (`impl Machine`).
 
+### Term helpers (`src/terms.rs`) — the SAFETY-annotated builder/reader
+Constructors take the seam (`ctx: &mut dyn ExecutionContext`, allocating via `alloc_words`):
+- `make_tuple(ctx, &[Eterm]) -> Result<Eterm>` (arityval header + elements)
+- `make_list(ctx, &[Eterm]) -> Result<Eterm>` (cons cells; empty → `NIL`)
+- `make_float(ctx, f64) -> Result<Eterm>`
+- `make_flatmap(ctx, &[(Eterm, Eterm)]) -> Result<Eterm>` (>32 pairs → `unsupported`)
+- `make_fun(ctx, arity: u32, uniq: u64, index: u32, free: &[Eterm]) -> Result<Eterm>` (minimal local
+  closure; M1 inlines the out-of-line fun-entry descriptor — see Design Decisions)
+- `make_heap_binary(ctx, &[u8]) -> Result<Eterm>` (heap binary/bitstring, ≤64 bytes)
+
+Readers (no ctx; wrong type / out-of-range → `BeamError::BadArg`, a hash-map is `unsupported`):
+`tuple_arity`, `tuple_element`, `cons_head`, `cons_tail`, `list_elements`, `float_value`,
+`map_entries` (flatmap only), `binary_bytes`, `is_fun`, `fun_arity`, `fun_num_free`, `fun_uniq`,
+`fun_index`, `fun_free`.
+Ownership model (documented at the module top): the context owns the heap; `alloc_words` hands out
+stable raw pointers; **only this module dereferences them**.
+
 ### The JIT tiers (`src/jit.rs`, feature-gated)
 - `pub trait JitBackend { fn compile(...) -> Result<...>; fn available(&self) -> bool; }` (design
   placeholder) and `pub fn available_tiers() -> &'static [&'static str]` (returns `["interpreter"]`
