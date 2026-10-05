@@ -1,14 +1,45 @@
 #![doc = "Per-process generational semi-space copying GC, MSO sweep and heap sizing."]
 
-//! Per-process garbage collector (Stage 4).
+//! Per-process garbage collector of the Rust ERTS rewrite (Stage 4).
 //!
-//! Implements the GC half of Part II §D and the Stage-4 row of Part II §H:
-//! generational semi-space Cheney copying, barrier-free by construction
-//! (immutability ⇒ no write barrier), off-heap refcounted large objects (MSO) and
-//! heap sizing. MMTk/Boehm are rejected; GenImmix is a measurement-gated
-//! mature-generation option only.
+//! Owns the collector that the runtime drives at safepoints: a **generational
+//! semi-space Cheney copying** collector over the per-process heap, **barrier-free
+//! by construction** (Erlang terms are immutable, so a mature object can never refer
+//! to a later-allocated young object and the mutator pays no per-store overhead),
+//! the off-heap **refcounted large-object (MSO)** interface, and the process
+//! **heap-size policy**. The root set is the flat contract of the crate layer:
+//! `x_reg_array[0..Live)` plus the whole stack, with **no frame liveness maps**.
+//! MMTk and Boehm are rejected; GenImmix is a measurement-gated mature-generation
+//! option only.
+//!
+//! Implements the GC half of Part II §D and the Stage-4 row of Part II §H; the
+//! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
+//!
+//! `unsafe` is confined to `copy.rs` (the word-level copier) and the raw-pointer
+//! range tests in `space.rs`; `policy.rs`, `stats.rs`, `mso.rs` and the `Collector`
+//! driving logic are safe Rust.
 
-/// Returns this crate's name; placeholder until the real API lands.
-pub fn beam_gc() -> &'static str {
-    "beam_gc"
+pub mod collector;
+pub mod copy;
+mod error; // pub(crate) helpers only — NOT public
+pub mod mso;
+pub mod policy;
+pub mod space;
+pub mod stats;
+
+pub use crate::collector::*;
+pub use crate::copy::*;
+pub use crate::mso::*;
+pub use crate::policy::*;
+pub use crate::space::*;
+pub use crate::stats::*;
+
+/// The conventional glob-import surface for downstream crates.
+pub mod prelude {
+    pub use crate::collector::*;
+    pub use crate::copy::*;
+    pub use crate::mso::*;
+    pub use crate::policy::*;
+    pub use crate::space::*;
+    pub use crate::stats::*;
 }
