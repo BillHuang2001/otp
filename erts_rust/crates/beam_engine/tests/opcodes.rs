@@ -6,12 +6,13 @@
 //! failure), `SelectVal`, the frame instructions (`Allocate`/`AllocateHeap`/
 //! `TestHeap`/`Deallocate`/`Trim`) and the call family (`Call`/`CallLast`/
 //! `CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`), the `GcBif` guard-fail/raise
-//! paths and the documented error paths. Every error is a typed
-//! [`beam_common::BeamError`] — no test panics.
+//! paths, the catch-frame landing of a raising BIF (`gc_bif`/`bif`/`bif0`/
+//! `call_ext*` with no fail label inside a live `try`) and the documented error
+//! paths. Every error is a typed [`beam_common::BeamError`] — no test panics.
 
 use std::collections::BTreeMap;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{Machine, MinimalContext};
 use beam_loader::{
     Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Opcode, Operand, TestKind,
@@ -1487,4 +1488,426 @@ fn run_export_of_unknown_export_is_a_typed_error() {
         Ok(NIL)
     );
     assert!(machine.run_export(&module, name, 1, &[], &mut ctx).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// A raising BIF with no fail label lands in a live catch frame
+//
+// Ground truth: with no fail label `gc_bif`/`bif` fall through to
+// `find_func_info` (`erts/emulator/beam/emu/macros.tab:266-278`) and
+// `call_light_bif*` runs `handle_error` (`emu/bif_instrs.tab:308-314`, `:409-415`);
+// both end in `next_catch` (`erts/emulator/beam/beam_common.c:580-679`), which
+// jumps to the innermost live `try`/`catch` handler. The oracle therefore
+// *catches* `try 1/0 catch error:badarith -> caught end`.
+// ---------------------------------------------------------------------------
+
+/// Build a one-function `f/0` module from `code`.
+///
+/// `imports` are registered (in order, so the *i*-th entry is `ImportRef(i)`) and
+/// `atoms` interned **before** `code` is added — the body refers to the imports'
+/// `ImportRef`s, and the module must be able to *name* the reason a BIF failure
+/// raises (`badarith`, …) plus the `error` class atom a landing installs in `x(3)`.
+fn module_with(imports: &[(&str, &str, u32)], atoms: &[&str], code: Vec<Instr>) -> (Module, Label) {
+    let mut fixture = Fixture::new();
+    for (module, function, arity) in imports {
+        fixture.import(module, function, *arity);
+    }
+    for name in atoms {
+        fixture.atom(name);
+    }
+    let entry = fixture.add_function("f", 0, code);
+    (fixture.finish(), entry)
+}
+
+/// Run `entry` with `hook` as the BIF implementation, returning the result **and**
+/// the machine (so the pending exception / catch-frame state can be inspected).
+fn run_hooked(
+    module: &Module,
+    entry: Label,
+    args: &[Eterm],
+    hook: impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static,
+) -> (Result<Eterm, BeamError>, Machine) {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(hook));
+    let result = machine.run_label(module, entry, args.len() as u32, args, &mut ctx);
+    (result, machine)
+}
+
+/// `erlang:boom/N` always raises `badarith`; every other call raises `badarg`.
+fn boom_hook(
+    _module: &str,
+    function: &str,
+    _arity: u32,
+    _args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if function == "boom" {
+        Err(BeamError::BadArith)
+    } else {
+        Err(BeamError::BadArg)
+    }
+}
+
+/// `f() -> try <body> catch _ -> Reason end`: `Label(1)` enters the `try`,
+/// `Label(3)` is the handler, which returns the landed reason from `x(1)` (a
+/// catch-all clause needs no class atom in its code, but a landing needs the
+/// `error` class atom, so it must be interned).
+fn try_wrapped(body: Vec<Instr>) -> Vec<Instr> {
+    let mut code = vec![
+        Instr::Label(Label(1)),
+        Instr::Try {
+            frame: Operand::X(9),
+            fail: Label(3),
+        },
+    ];
+    code.extend(body);
+    code.extend([
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    code
+}
+
+/// The interned `badarith` term of `module`.
+fn badarith(module: &Module) -> Eterm {
+    beam_term::make_atom(
+        module
+            .atom_table
+            .lookup("badarith")
+            .expect("badarith interned"),
+    )
+}
+
+#[test]
+fn a_raising_gc_bif_without_a_fail_label_lands_in_a_live_catch_frame() {
+    // f() -> try erlang:boom() catch _ -> Reason end.
+    // `gc_bif0 erlang:boom` with NO fail label: `badarith` must land at `Label(3)`.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(badarith(&module)),
+        "the raise must land in the handler and yield the reason"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module))),
+        "the landed exception is class `error` with the BIF's error atom"
+    );
+}
+
+#[test]
+fn a_raising_gc_bif_without_a_catch_frame_propagates_the_typed_error() {
+    // The same failing `gc_bif0`, but with no live `try`: the error still
+    // propagates as the caller's typed error (never a panic, never a wrong value).
+    // The module *can* name `badarith`, so the fallback is purely the missing
+    // catch frame.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GcBif {
+                arity: 0,
+                bif: ImportRef(0),
+                fail: NO_FAIL,
+                live: 0,
+                args: Vec::new(),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert!(
+        matches!(result, Err(BeamError::BadArith)),
+        "an uncaught raise propagates the typed error, got {result:?}"
+    );
+    assert_eq!(machine.catch_frame_depth(), 0);
+}
+
+#[test]
+fn a_raising_bif_without_a_fail_label_lands_in_a_live_catch_frame() {
+    // The non-garbage-collecting `bif1` opcode behaves identically.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::Bif {
+            arity: 1,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            args: vec![Operand::X(0)],
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_bif0_lands_in_a_live_catch_frame() {
+    // `bif0` has no fail label at all (C routes it through `call_light_bif`).
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::Bif0 {
+            bif: ImportRef(0),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_guard_bif_failure_still_jumps_to_the_fail_label_with_a_live_catch_frame() {
+    // f() -> try (case boom() of _ -> ok end) catch _ -> Reason end.
+    // The guard `gc_bif0` HAS a fail label, so a failure must jump to `Label(4)`
+    // — a guard failure is not a raise, even with a live catch frame: no
+    // exception is recorded and the catch frame is left untouched.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Try {
+                frame: Operand::X(9),
+                fail: Label(3),
+            },
+            Instr::GcBif {
+                arity: 0,
+                bif: ImportRef(0),
+                fail: Label(4),
+                live: 0,
+                args: Vec::new(),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Integer(100),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(4)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(3)),
+            Instr::Move {
+                src: Operand::Integer(-1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(make_small(0)),
+        "the guard failure jumps to its fail label"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        None,
+        "a guard failure is not a raise"
+    );
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "the catch frame is left in place (no unwind)"
+    );
+}
+
+#[test]
+fn a_raising_call_ext_lands_in_a_live_catch_frame() {
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::CallExt {
+            arity: 1,
+            target: ImportRef(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_call_ext_only_lands_in_a_live_catch_frame() {
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::CallExtOnly {
+            arity: 1,
+            target: ImportRef(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_call_ext_last_lands_in_the_outer_catch_frame() {
+    // outer() -> try inner() catch _ -> Reason end.
+    // inner() -> allocate 0, then `call_ext_last erlang:boom/1 D=0`.
+    //
+    // `call_ext_last` pops *its own* (inner) frame before the call, while the
+    // catch frame lives in `outer`'s frame, so the raise must still unwind to
+    // `outer`'s handler — the frame the catch tag belongs to.
+    let mut fixture = Fixture::new();
+    let boom = fixture.import("erlang", "boom", 1);
+    fixture.atom("badarith");
+    fixture.atom("error");
+
+    let outer = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Try {
+            frame: Operand::Y(0),
+            fail: Label(3),
+        },
+        Instr::Call {
+            arity: 0,
+            target: Label(20),
+        },
+        Instr::TryEnd {
+            frame: Operand::Y(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::TryCase {
+            frame: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    let inner = vec![
+        Instr::Label(Label(20)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::CallExtLast {
+            arity: 1,
+            target: boom,
+            deallocate: 0,
+        },
+    ];
+    let entry = fixture.add_function("outer", 0, outer);
+    fixture.add_function("inner", 0, inner);
+    let module = fixture.finish();
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.catch_frame_depth(),
+        0,
+        "the handler consumed the frame"
+    );
+    assert_eq!(
+        machine.frame_depth(),
+        1,
+        "the run is back at the bottom frame"
+    );
+}
+
+#[test]
+fn a_bif_error_the_module_cannot_name_propagates_unchanged() {
+    // A live catch frame but no `badarith` atom in the module: the engine refuses
+    // to substitute a *different* atom (that would be a wrong result), so the
+    // typed error propagates — a documented Milestone-1 limit.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, _machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert!(
+        matches!(result, Err(BeamError::BadArith)),
+        "an unnameable error atom propagates, got {result:?}"
+    );
+}
+
+#[test]
+fn an_explicit_raise_error_is_not_folded_into_a_catch_frame() {
+    // A `BeamError::Raise` carries its own class/reason term-independently (the
+    // reason may be `ExitReason::Structured`), so it is not converted here: it
+    // propagates unchanged even with a live catch frame.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, _machine) = run_hooked(&module, entry, &[], |_m, _f, _a, _args| {
+        Err(BeamError::Raise(beam_common::Raise::error(
+            beam_common::ExitReason::atom("badarith"),
+        )))
+    });
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "an explicit raise propagates, got {result:?}"
+    );
 }

@@ -7,14 +7,18 @@
 //! conventions of `../../erts/emulator/beam/emu/macros.tab` and the
 //! `gc_bif`/common-BIF semantics of `../../erts/emulator/beam/emu/beam_emu.c`.
 //!
-//! Failure is return-based: a `GcBif` error with a live fail label branches
-//! (guard failure), an error without one propagates out of the run as
-//! `Err(BeamError)` (a raise). Every unsupported opcode/operand is a documented
-//! typed error, never a panic.
+//! Failure is return-based: a `gc_bif`/`bif`/`call_ext` error with a live fail
+//! label branches (guard failure); without one it **raises** — landing in a live
+//! `try`/`catch` frame when there is one (C's `handle_error`/`next_catch`,
+//! `../../erts/emulator/beam/beam_common.c:580-679`, reached from `gc_bif`/
+//! `bif`/`call_light_bif` in `emu/macros.tab:266-278` and
+//! `emu/bif_instrs.tab:308-314`) and otherwise propagating out of the run as
+//! `Err(BeamError)`. Every unsupported opcode/operand is a documented typed error,
+//! never a panic.
 
 use std::collections::BTreeMap;
 
-use beam_common::Result;
+use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{ImportRef, Instr, Label, Module, Operand, TestKind, NO_FAIL};
 use beam_term::{
     cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list, make_atom,
@@ -28,6 +32,25 @@ use crate::machine::{Continuation, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::Step;
+
+/// Fold a helper-produced [`Step`] back into the dispatch loop's `func`/`pc`.
+///
+/// The direct arms mutate the loop's `func`/`pc` in place rather than returning a
+/// [`Step`], so a raise that *lands* in a catch frame — [`Machine::raise_bif_error`]
+/// and the `families::dispatch` seam — has to be mapped back here. `Step::Done`
+/// finishes the run with `x(0)`.
+macro_rules! apply_step {
+    ($machine:ident, $step:expr, $func:ident, $pc:ident) => {
+        match $step {
+            Step::Next => $pc += 1,
+            Step::Goto { func, pc } => {
+                $func = func;
+                $pc = pc;
+            }
+            Step::Done => return $machine.finish(),
+        }
+    };
+}
 
 /// Build the module-wide `Label -> (function index, code index)` map.
 ///
@@ -193,7 +216,14 @@ impl Machine {
                             write_operand(self, dst, value)?;
                             pc += 1;
                         }
-                        Err(e) if *fail == NO_FAIL => return Err(e),
+                        // No fail label ⇒ a *raise*: land in a live catch frame
+                        // (C falls through to `find_func_info`/`handle_error`) or
+                        // propagate the typed error.
+                        Err(e) if *fail == NO_FAIL => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
+                        }
+                        // Guard failure: jump to the fail label. Unchanged.
                         Err(_) => {
                             let (next_func, next_pc) = resolve(labels, *fail)?;
                             func = next_func;
@@ -204,11 +234,19 @@ impl Machine {
                 Instr::Bif0 { bif, dst } => {
                     // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
                     // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
-                    // is no fail label: an error propagates (`?`).
+                    // is no fail label, so any error is a raise; C routes the call
+                    // through `call_light_bif`, whose error path is catch-aware.
                     let (module_name, function_name, arity) = import_target(module, *bif)?;
-                    let value = ctx.call_bif(module_name, function_name, arity, &[])?;
-                    write_operand(self, dst, value)?;
-                    pc += 1;
+                    match ctx.call_bif(module_name, function_name, arity, &[]) {
+                        Ok(value) => {
+                            write_operand(self, dst, value)?;
+                            pc += 1;
+                        }
+                        Err(e) => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
+                        }
+                    }
                 }
                 Instr::Bif {
                     bif,
@@ -219,8 +257,8 @@ impl Machine {
                 } => {
                     // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
                     // Like the `GcBif` arm minus the heap/live check: on failure,
-                    // jump to `fail` if it is live (guard failure), else propagate
-                    // the error (a raise).
+                    // jump to `fail` if it is live (guard failure), else raise
+                    // (landing in a live catch frame when there is one).
                     let (module_name, function_name, arity) = import_target(module, *bif)?;
                     let mut arg_terms = Vec::with_capacity(args.len());
                     for arg in args {
@@ -231,7 +269,11 @@ impl Machine {
                             write_operand(self, dst, value)?;
                             pc += 1;
                         }
-                        Err(e) if *fail == NO_FAIL => return Err(e),
+                        Err(e) if *fail == NO_FAIL => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
+                        }
+                        // Guard failure: jump to the fail label. Unchanged.
                         Err(_) => {
                             let (next_func, next_pc) = resolve(labels, *fail)?;
                             func = next_func;
@@ -260,21 +302,38 @@ impl Machine {
                     pc = next_pc;
                 }
                 Instr::CallExt { target, arity } => {
-                    let value = self.call_import(module, *target, *arity, ctx)?;
-                    self.set_x(0, value)?;
-                    pc += 1;
+                    // An ext call carries no fail label: a failure is a raise (C's
+                    // `i_call_ext`/`call_light_bif` end in `handle_error`, so a live
+                    // catch frame catches it).
+                    match self.call_import(module, *target, *arity, ctx) {
+                        Ok(value) => {
+                            self.set_x(0, value)?;
+                            pc += 1;
+                        }
+                        Err(e) => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
+                        }
+                    }
                 }
                 Instr::CallExtOnly { target, arity } => {
-                    let value = self.call_import(module, *target, *arity, ctx)?;
-                    self.set_x(0, value)?;
-                    match self.continuation()? {
-                        Continuation::Halt => return self.finish(),
-                        Continuation::Address {
-                            func: next_func,
-                            pc: next_pc,
-                        } => {
-                            func = next_func;
-                            pc = next_pc;
+                    match self.call_import(module, *target, *arity, ctx) {
+                        Ok(value) => {
+                            self.set_x(0, value)?;
+                            match self.continuation()? {
+                                Continuation::Halt => return self.finish(),
+                                Continuation::Address {
+                                    func: next_func,
+                                    pc: next_pc,
+                                } => {
+                                    func = next_func;
+                                    pc = next_pc;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
                         }
                     }
                 }
@@ -284,16 +343,23 @@ impl Machine {
                     deallocate,
                 } => {
                     self.pop_frame_checked(*deallocate)?;
-                    let value = self.call_import(module, *target, *arity, ctx)?;
-                    self.set_x(0, value)?;
-                    match self.continuation()? {
-                        Continuation::Halt => return self.finish(),
-                        Continuation::Address {
-                            func: next_func,
-                            pc: next_pc,
-                        } => {
-                            func = next_func;
-                            pc = next_pc;
+                    match self.call_import(module, *target, *arity, ctx) {
+                        Ok(value) => {
+                            self.set_x(0, value)?;
+                            match self.continuation()? {
+                                Continuation::Halt => return self.finish(),
+                                Continuation::Address {
+                                    func: next_func,
+                                    pc: next_pc,
+                                } => {
+                                    func = next_func;
+                                    pc = next_pc;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            let step = self.raise_bif_error(module, e)?;
+                            apply_step!(self, step, func, pc);
                         }
                     }
                 }
@@ -379,6 +445,53 @@ impl Machine {
             args.push(self.x(i).ok_or_else(|| error::bad_register(i))?);
         }
         ctx.call_bif(module_name, function_name, bif_arity, &args)
+    }
+
+    /// Raise a BIF/`call_ext` error on the **no-fail-label** path, landing it in a
+    /// live catch frame when there is one.
+    ///
+    /// Reproduces the C interpreter's error path for a BIF call without a fail
+    /// label: `gc_bif`/`bif` fall through to `find_func_info`
+    /// (`../../erts/emulator/beam/emu/macros.tab:266-278`) and `call_light_bif*`
+    /// runs `handle_error` (`emu/bif_instrs.tab:308-314`, `:409-415`); both end in
+    /// `next_catch` (`../../erts/emulator/beam/beam_common.c:580-679`), which finds
+    /// the innermost live `try`/`catch` handler and continues there. The engine's
+    /// single equivalent entry point is [`Machine::throw_error`].
+    ///
+    /// * **No live catch frame** ([`Machine::catch_frame_depth`] `== 0`) ⇒ the error
+    ///   propagates unchanged.
+    /// * **A live catch frame** ⇒ the error's BEAM atom name
+    ///   ([`BeamError::as_atom`]: `badarg`/`badarith`/`badarity`/`badmatch`/
+    ///   `system_limit`/`out_of_memory`) is resolved in the running module's atom
+    ///   table, turned into a reason term and raised with class `error` — the class
+    ///   every BIF failure carries (`BADARG`/`BADARITH`/… are `EXTAG_ERROR`
+    ///   reasons), which is what the handler's `catch error:Reason` clause sees.
+    /// * An error the engine cannot name as a term propagates unchanged instead: a
+    ///   [`BeamError::Raise`] (its class/reason are carried term-independently and
+    ///   the reason may be [`beam_common::ExitReason::Structured`]), a variant with
+    ///   no BEAM atom ([`BeamError::TermNotFound`], [`BeamError::Io`]), or an atom
+    ///   the running module's atom table does not hold. Substituting a *different*
+    ///   atom would be a wrong result, so the caller's typed error is preferred —
+    ///   a documented Milestone-1 limit (the [`Module`] reaches the interpreter
+    ///   read-only, so a name the compiler never emitted cannot be interned here,
+    ///   unlike the C runtime's global atom table).
+    fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
+        if self.catch_frame_depth() == 0 || matches!(&error, BeamError::Raise(_)) {
+            return Err(error);
+        }
+        let Some(name) = error.as_atom() else {
+            return Err(error);
+        };
+        let Some(atom) = module.atom_table.lookup(name) else {
+            return Err(error);
+        };
+        // The class atom a landing installs in `x(3)`; a module that cannot name
+        // `error` leaves it unset and `throw_error` reports its own typed error
+        // rather than substituting a wrong atom.
+        if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+            self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+        }
+        self.throw_error(make_atom(atom))
     }
 
     /// Evaluate one `is_*`/`test_arity` test; `true` means the test *succeeds*.
