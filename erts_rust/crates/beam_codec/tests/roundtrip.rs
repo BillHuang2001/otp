@@ -45,7 +45,7 @@ use beam_codec::term::{
 };
 use beam_codec::{
     decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
+    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
     INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
     NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
     SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
