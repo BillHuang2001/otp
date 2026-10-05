@@ -1139,7 +1139,8 @@ fn ml_map(
             if bytes.len() > 8192 {
                 let new_part = bits::make_binary(ctx.heap(), &bytes[..8192])?;
                 let trailing = bits::make_binary(ctx.heap(), &bytes[8192..])?;
-                cur = ctx.cons(new_part, ctx.cons(trailing, NIL)?)?;
+                let trailing_tail = ctx.cons(trailing, NIL)?;
+                cur = ctx.cons(new_part, trailing_tail)?;
                 continue;
             }
             return Ok(match map_fun(ctx, env, Part::Bin(&bytes), acc)? {
@@ -1410,7 +1411,7 @@ mod tests {
         with_ctx(|ctx| {
             // 2-byte (`U+0440`), 3-byte (`U+03C0`, `U+20AC`), 4-byte (`U+1F600`).
             for (cp, bytes) in [
-                (0x440i64, vec![0xD0, 0xB0]),
+                (0x440i64, vec![0xD1, 0x80]),
                 (0x3C0, vec![0xCF, 0x80]),
                 (0x20AC, vec![0xE2, 0x82, 0xAC]),
                 (0x1F600, vec![0xF0, 0x9F, 0x98, 0x80]),
@@ -1526,7 +1527,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 show(ctx, "characters_to_list", &[list, enc(ctx, "utf8")]),
-                "{error,[97],[#{208},98]}"
+                "{error,[97],[#{208},[98]]}"
             );
             // Engine 2: a code point above the latin1 limit nests the Rest.
             let big = ctx.list(&[ctx.int(256).unwrap()]).unwrap();
@@ -1619,7 +1620,8 @@ mod tests {
             assert_eq!(show(ctx, "characters_to_binary", &[bitstring(&[0x80], 1), utf8]), "badarg");
             assert_eq!(show(ctx, "characters_to_list", &[bitstring(&[0x80], 1), utf8]), "badarg");
             // A bad element.
-            let floats = ctx.list(&[ctx.make_float(1.0).unwrap()]).unwrap();
+            let f = ctx.make_float(1.0).unwrap();
+            let floats = ctx.list(&[f]).unwrap();
             assert_eq!(show(ctx, "characters_to_binary", &[floats]), "badarg");
             let atoms = ctx.list(&[enc(ctx, "ok")]).unwrap();
             assert_eq!(show(ctx, "characters_to_binary", &[atoms]), "badarg");
