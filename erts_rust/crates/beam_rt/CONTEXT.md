@@ -288,18 +288,21 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 
 ## Routing Table
 * `src/lib.rs` → crate docs, `#![deny(unsafe_code)]`, module wiring, root re-exports, `prelude`
-* `src/error.rs` → `pub(crate)` `BeamError` constructors (unknown switch, unknown info key, unknown function, unsupported op) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
-* `src/config.rs` → `RuntimeConfig`, `Action`, `EmulatorConfig` alias, defaults/setters
-* `src/cli.rs` → `USAGE`, `parse` (the A.6 parser), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
+* `src/error.rs` → `pub(crate)` `BeamError` constructors (missing value, unexpected argument, bad spec, arity mismatch, bad run argument, unknown module/function/info key/bif, unsupported, bad eval) + the halt helpers (`HALT_PREFIX`, `halt`/`halt_status`) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
+* `src/config.rs` → `RuntimeConfig`, `Action`, `ArgTerm`, `InitArgs`, `EmulatorConfig` alias, defaults/setters
+* `src/cli.rs` → `USAGE`, `parse` (the A.6 parser + the `run` argument grammar), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed + the boot banner
 * `src/info.rs` → `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (BIF dispatch + heap check)
+* `src/codeserver.rs` → `CodeServer`: the shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file` (the load-on-demand host)
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun`; heap check)
+* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `init:get_argument/1` — always consulted before the registry)
 * `src/eval.rs` → the `-eval` integer-expression parser/evaluator (dispatches through `beam_bifs`)
-* `src/format.rs` → `term_to_string` — drives the registered `io:format/2` `~p` printer
-* `src/runtime.rs` → `Runtime`: boot-wiring, module cache, `run_function`/`run_module` (the slice), `system_info`, `eval`, `format_term`
+* `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
+* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
+* `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
 * `../beam_loader/tests/fixtures/slice.beam` → the shared oracle fixture reused by the slice tests (read-only)
