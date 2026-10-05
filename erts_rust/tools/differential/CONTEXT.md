@@ -146,6 +146,8 @@ Invocation argv is built once and used for **both** runtimes (drop-in `erl`, A.6
 - `src/harness.rs` → orchestration: `run_case`/`compare_expr`/`run_suite`, exit-code derivation
 - `src/report.rs` → JSON report schema (serde) + writer + human rendering
 - `src/main.rs` → thin binary: parse args → dispatch → `process::exit(code)`
+- `tests/oracle.rs` → oracle-backed integration tests (golden reproduction, oracle-vs-oracle, missing Rust runtime)
+- `tests/cli.rs` → end-to-end binary tests (exit codes, `--help`, `--out` report, `list`)
 - `out/` → gitignored JSON report output (default `--out`)
 
 ## See Also
