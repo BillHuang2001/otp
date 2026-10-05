@@ -38,4 +38,4 @@ Nothing in the repo invokes this directory: it is a manual utility, run by hand 
 - `agent/` → agent-side config templates (`*.conf.src`): engine/address, community, context, notify, standard (sysContact/sysLocation/sysName), target_addr, target_params, usm, vacm.
 - `manager/` → manager-side config templates (`*.conf.src`): `manager.conf` (port/address/engine_id) and `usm.conf`.
 - `../test_config/Makefile` / `modules.mk` (this dir) → build & variable-substitution rules.
-- `../` (snmp `test/`) → the Common Test suites and Makefile that consume these configs (see `../CONTEXT.md`).
+- `../` (snmp `test/`) → the snmp Common Test suites; they generate their own run-time configs (into the CT `priv_dir`) and do NOT consume this directory's output (see `../CONTEXT.md`).
