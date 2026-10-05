@@ -218,6 +218,16 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   static block — and Rust rejects pointer→integer casts during const evaluation. It is therefore
   exposed as `tuple0()`. Same root cause (no const pointer arithmetic): `make_boxed`/`make_list`/
   `make_tuple` are plain `fn`, not `const fn`.
+- **Off-heap term materialization lives here (`thing.rs`), heap-agnostic over a caller `*mut Eterm`.**
+  The interior layout of a float/bignum/flatmap/external thing is owned by this crate (the
+  frozen-layout lowest common ancestor of every term-producing crate — workspace §2), so its
+  constructors/accessors belong here rather than duplicated in `beam_codec`. This crate **cannot
+  depend on `beam_alloc`** (it is a dependency sink; `beam_alloc` already depends on `beam_term`, so
+  the reverse would cycle), which is exactly why every writer takes a caller-allocated
+  `hp: *mut Eterm` and returns the tagged root instead of allocating. The codec keeps only its
+  error-wrapping + allocation and forwards the word layout here (removing the duplication);
+  `float_bits`/`float_value` delegate to the existing `pub(crate)` helpers in `compare.rs` so the
+  float-layout knowledge has a single definition.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` unit tests.
