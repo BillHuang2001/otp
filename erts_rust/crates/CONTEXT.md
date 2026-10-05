@@ -18,8 +18,9 @@ Inherited and refined from `../CONTEXT.md` — do not restate, obey:
   Design Decisions) so `?` works across the boundary.
 - **`unsafe` confinement.** `unsafe` only in explicitly-marked modules; every `unsafe fn` has a
   `# Safety` section and every `unsafe` block a preceding `// SAFETY:` rationale (convention:
-  `beam_common::safety`). The *safe periphery* (ETF codec, loaders, decoders, table logic, allocator
-  bookkeeping, scheduler) must be safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
+  `beam_common::safety`). The *wire/serialization and decode* paths (ETF wire layer, `.beam`
+  container parsing/decoding, table logic, allocator bookkeeping, scheduler) must be safe Rust;
+  term materialization that writes raw heap words is confined to explicitly-marked modules. `unsafe_op_in_unsafe_fn` stays clean.
 - **No duplication across crates.** A type/utility needed by ≥2 crates goes to the **lowest common
   ancestor** crate, never copy-pasted. Adding a new *dependency edge* changes the layer DAG — report
   it to this node; do not add `*_dev`-only cycles.
