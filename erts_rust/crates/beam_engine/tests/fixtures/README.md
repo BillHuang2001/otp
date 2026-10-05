@@ -77,3 +77,21 @@ Note `add(1, 2)` (an integer argument) hits the failed `is_float` guard, which j
 to the function's `func_info` label — the oracle raises `function_clause` there, but
 the M1 interpreter treats `func_info` as a no-op, so that path is deliberately *not*
 exercised by `tests/floats.rs`.
+
+## `mapfx.beam` (`mapfx.erl`) — `tests/maps.rs`
+
+| export | Erlang | opcodes |
+|---|---|---|
+| `get/1` | `case M of #{a := A, b := B} -> {A,B} end.` | `get_map_elements` (+ `put_tuple2`) |
+| `has/1` | `case M of #{a := _, b := _} -> yes; _ -> no end.` | `has_map_fields` |
+| `assoc/1` | `M#{c => 3}.` | `put_map_assoc` |
+| `exact/1` | `M#{a := 9}.` | `put_map_exact` |
+| `assoc_exact/1` | `M#{a := 9, c => 3}.` | `put_map_assoc` + `put_map_exact` |
+
+Each update is preceded by the compiler's `test,is_map` guard, whose fail branch
+builds `{badmap, M}` and calls `erlang:error/1` (never reached for a map argument).
+`exact/1` on a map without key `a` is the fixture's `{badkey, a}` case: the
+`put_map_exact` opcode carries `no_fail`, so the interpreter raises the reason
+itself. `get/1` on a map without both keys falls to its `case_end` fail label
+(`{case_clause, M}`). The map arguments are built by the engine's flat-map builder
+and keyed by the module's atom table, so the fixtures' key operands compare equal.
