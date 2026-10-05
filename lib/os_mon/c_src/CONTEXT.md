@@ -21,7 +21,7 @@ Programs are arch/OS-specific: only the ones relevant to the current host are bu
   Utilization reply: header `[no_of_cpus, values_per_cpu]` followed by `(id, value)` pairs (value ids `CU_*`, mirrored by the `?cu_*` macros in `cpu_sup.erl`).
 - `memsup.c` ↔ `memsup.erl`: port opened with `[{packet,1}]`; Erlang sends `[SHOW_MEM]` or `[SHOW_SYSTEM_MEM]`, C replies with `{packet,1}`-framed hex strings.
   `SHOW_MEM`: two packets, used then total (hex). `SHOW_SYSTEM_MEM`: alternating one-byte tag packet + value packet, terminated by tag `SHOW_SYSTEM_MEM_END`; unknown tags are ignored by the C side and rejected by the Erlang side.
-- `win32sysinfo.c` ↔ `os_mon_sysinfo.erl`: port opened with `[{packet,1}]`; Exxx sends `'m'` (memory) or `'d'` (all drives) or `'d'+DriveRoot+0`, C answers line-oriented text terminated by tag `"o"` (`?OK`). Startup sends an initial `"o"` ACK.
+- `win32sysinfo.c` ↔ `os_mon_sysinfo.erl`: port opened with `[{packet,1}]`; Erlang sends `'m'` (memory) or `'d'` (all drives) or `'d'+DriveRoot+0`, C answers line-oriented text terminated by tag `"o"` (`?OK`). Startup sends an initial `"o"` ACK.
 - `ferrule.c`: no command input — it streams FIFO lines to Erlang; accepts `die` and `only_stdin` commands on stdin (2-byte length-prefixed).
 - `mod_syslog.c`: no port; run synchronously by `os_sup.erl`, exit status printed to stdout as a decimal code.
 
