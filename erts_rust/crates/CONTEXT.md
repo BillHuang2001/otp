@@ -172,13 +172,17 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
   supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
   fallback returns a typed error, never a wrong result).
+- **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
+  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
+  `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
+  copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
-  changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
-  (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
-  materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
-  to (de-duplication). Rationale: `beam_term` is a dependency sink, so writers take a caller-provided
-  `*mut Eterm`; allocation stays in `beam_alloc`.
-- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`.
+  changed): `From<TermError> for BeamError`; `compare`/`hashing`/`size` utilities (term ordering,
+  structural hash, `size_object`); `thing` — heap-agnostic off-heap term materialization
+  (float/big/flatmap/external pid/port/ref). Writers take a caller-provided `*mut Eterm`;
+  allocation stays in `beam_alloc`.
+- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`;
+  `RefCount` moved down into `beam_alloc` (the LCA) and re-exported by `beam_gc`.
 
 ## Known Structural Debt (candidates for the next pass)
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
