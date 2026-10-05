@@ -178,6 +178,10 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   permanents.
 - Runtime option parsing (`+MMscs`, `+Mea`, …) — M1 exposes `AllocatorConfig`, not the A.6 CLI
   surface (owned by `beam_rt`).
+- Allocation alignment is capped at the OS page size: a request with `align > os_page_size()`
+  (typically 4096) is rejected with `BeamError::BadArg`; super-aligned mappings are not implemented.
+- The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`) and the class
+  count (`block::MAX_CLASS_COUNT`); a request beyond the encodable bound is rejected, never truncated.
 - The `erts_alloc`/`enif_alloc` C ABI shims (owned by `beam_abi`) and MSO/binary ref-counted
   off-heap objects (owned by `beam_gc`).
 
