@@ -25,7 +25,7 @@ Shared with sibling subdirs (this is the node's cross-cutting API):
 - `inets_internal.hrl` — `?report/4` + `?report_important|verbose|debug|trace` severity macros, and HTTP character macros (`?CR`, `?LF`, `?CRLF`, `?SP`, `?TAB`, paren/quote macros).
 - `inets.mk` — `INETS_ERL_COMPILE_FLAGS` with `-pa $(ERL_TOP)/lib/inets/ebin`, the `sys_pre_attributes` parse transform inserting `{attribute,insert,app_vsn,$(APP_VSN)}`, `+warn_obsolete_bool_op +nowarn_deprecated_catch`; included by `../http_lib/Makefile`, `../http_client/Makefile`, `../http_server/Makefile`.
 - `inets.app.src` / `inets.appup.src` — the `inets` application resource and upgrade specs (both use `%VSN%`).
-- `inets.config` — example `services` app-env configuration (not installed by the Makefile, not referenced by the build).
+- `inets.config` — stale, unused example `services` app-env configuration (not installed by the Makefile and not referenced by the build).
 - `Makefile` — compiles the five `MODULES` (inets, inets_service, inets_app, inets_sup, inets_trace, inets_lib) into `../../ebin`, generates `ebin/inets.app`/`ebin/inets.appup` by sed-substituting `%VSN%`, and installs sources + `inets_internal.hrl` into `$(RELEASE_PATH)/lib/inets-$(VSN)/src/inets_app`.
 
 ## Behaviour contract (`inets_service`)
