@@ -27,7 +27,7 @@ Referenced by the prose (listed inline in the pages below):
 
 Orphaned (no page in this guide or elsewhere in the repo references them):
 - `cnode_c.c`, `cnode_s.c`, `cnode_s2.c`, `complex3.erl`, `complex4.erl` — leftovers of the removed C-node example (`complex3.erl`/`complex4.erl` still hardcode stale hostnames `c1@idril` / `cnode@idril.du.uab.ericsson.se`). C-node documentation now lives in `lib/erl_interface/doc/guides/ei_users_guide.md`.
-- The four `erl_comm.c`/`port.c`/`port_driver.c`/`ei.c` sources carry trailing whitespace that the corresponding markdown listings no longer have; `complex6_nif.c` indents two `return enif_make_badarg(env);` lines with a TAB where `nif.md` now uses spaces.
+- `erl_comm.c` (1 line), `port.c` (2 lines) and `port_driver.c` (8 lines) still carry trailing whitespace that the corresponding markdown listings no longer have; `complex6_nif.c` indents two `return enif_make_badarg(env);` lines with a TAB where `nif.md` now uses spaces; `ei.c` differs from its listing only by a trailing blank line.
 
 ## Code-Listing Mechanism (most important fact)
 ex_doc **never reads** the `.c`/`.erl` files. Every listing is a **verbatim copy** inside the markdown as a ```c / ```erlang fenced block, prefixed by a comment line naming the file (`/* erl_comm.c */`; the `.erl` blocks have no such marker).
