@@ -56,6 +56,8 @@ pub trait ExecutionContext {
   (`with_bif_hook(f)`, `f: FnMut(&str,&str,u32,&[Eterm]) -> Result<Eterm>`). `MinimalContext::new()`
   uses a default hook that returns `error::unsupported("bif")`. The vertical-slice test supplies a
   hook implementing `erlang:'+'/2` and `erlang:'-'/2` over small ints.
+  `alloc_words` hands out words from a pointer-stable arena (`Vec<Box<[Eterm]>>`, no new dependency);
+  `apply` forwards to `call_bif` (the hook).
 
 ### The machine (`src/machine.rs`)
 - `pub struct Machine` — the process-state core: the **x-register file**, the **Erlang stack**, and
