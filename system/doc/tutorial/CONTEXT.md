@@ -59,7 +59,7 @@ Built by ex_doc through `system/doc/Makefile` → `make/doc.mk` (`docs` → `htm
 - If code and prose disagree, the markdown is what users read and what is published; fix both, but treat the `.md` as the source of truth for wording/formatting and the `.c`/`.erl` files as the compilable copies.
 - Anchors are written as `[](){: #anchor }` (explicit) or derived from headings; link to a page as `[text](page.md)` (relative) or `[text](`e:app:page.md#anchor`)` (cross-app).
 - Admonitions use blockquote + attribute syntax: `> #### Note {: .info }`, `{: .warning }`.
-- Verified page/source parity (diff of the fenced block against the file): `complex.c`, `complex1.erl`, `complex2.erl`, `complex5.erl`, `complex6.erl` match byte-for-byte; `erl_comm.c`, `port.c`, `port_driver.c`, `ei.c`, `complex6_nif.c` differ only in trailing whitespace / tabs.
+- Verified page/source parity (diff of the fenced block against the file): `complex.c`, `complex1.erl`, `complex2.erl`, `complex5.erl`, `complex6.erl` match byte-for-byte; `erl_comm.c`, `port.c`, `port_driver.c`, `ei.c`, `complex6_nif.c` differ only in whitespace (trailing blanks / tabs / a trailing blank line).
 
 ## See Also
 - `../reference_manual/ports.md` — language-level ports and `open_port/2`.
