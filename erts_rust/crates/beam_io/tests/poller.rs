@@ -78,8 +78,8 @@ fn waker_interrupts_a_blocking_poll() {
 
     let started = Instant::now();
     std::thread::scope(|scope| {
-        // The child *borrows* the waker: it owns the poller's wakeup handle, so dropping
-        // it before the waiter observed the wakeup would lose it.
+        // The helper thread *borrows* the waker; the poller owns the wakeup handle, so the
+        // handle outlives this thread regardless.
         let waker = &waker;
         scope.spawn(move || {
             std::thread::sleep(Duration::from_millis(100));
@@ -102,6 +102,62 @@ fn waker_interrupts_a_blocking_poll() {
     );
 }
 
+#[test]
+fn waker_can_be_obtained_repeatedly_and_each_handle_fires() {
+    let mut poller = Poller::new().expect("a poll set");
+
+    // The poller owns a single wakeup handle; obtaining several handles to it must not
+    // panic (mio permits only one `Waker` per poll set) and they are freely droppable.
+    let first = poller.waker().expect("the first waker");
+    let second = poller.waker().expect("the second waker");
+
+    first.wake().expect("the first waker fires");
+    let events = poller
+        .poll(Some(Duration::from_secs(2)))
+        .expect("poll succeeds");
+    assert_eq!(events.len(), 1, "the waker is the only registration");
+    assert_eq!(events[0].key(), WAKER_KEY);
+
+    // Dropping one handle leaves the poller's wakeup functional for the others.
+    drop(first);
+
+    second.wake().expect("the second waker fires");
+    let events = poller
+        .poll(Some(Duration::from_secs(2)))
+        .expect("poll succeeds");
+    assert_eq!(events.len(), 1, "the waker is the only registration");
+    assert_eq!(events[0].key(), WAKER_KEY);
+}
+
+#[test]
+fn a_waker_clone_from_another_thread_wakes_a_later_poll() {
+    let mut poller = Poller::new().expect("a poll set");
+    let waker = poller.waker().expect("a waker");
+
+    // A woken poll collects its readiness.
+    waker.wake().expect("the waker fires");
+    assert_eq!(
+        poller
+            .poll(Some(Duration::from_secs(1)))
+            .expect("poll succeeds")[0]
+            .key(),
+        WAKER_KEY
+    );
+
+    // A clone moved into another thread wakes a *subsequent* blocking poll.
+    let clone = poller.waker().expect("another waker");
+    std::thread::scope(|scope| {
+        scope.spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            clone.wake().expect("the cloned waker fires");
+        });
+        let events = poller
+            .poll(Some(Duration::from_secs(2)))
+            .expect("poll succeeds");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].key(), WAKER_KEY);
+    });
+}
 #[test]
 fn reregister_switches_the_interest_mask() {
     let mut poller = Poller::new().expect("a poll set");

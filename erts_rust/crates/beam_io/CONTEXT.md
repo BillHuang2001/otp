@@ -52,17 +52,19 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `readable()/writable()/is_error()/is_read_closed()/is_write_closed() -> bool`.
 - `pub struct Event` — `token() -> Token`, `key() -> u64` (the caller key it was registered with),
   `ready() -> Ready`.
-- `pub struct Poller` (owns `mio::Poll`):
+- `pub struct Poller` (owns `mio::Poll` **and the single `mio::Waker`** created in `new()`):
   - `pub fn new() -> Result<Poller>`
   - `pub fn register(&mut self, fd: RawFd, interest: Interest, key: u64) -> Result<Token>`
   - `pub fn reregister(&mut self, fd: RawFd, token: Token, interest: Interest) -> Result<()>`
   - `pub fn deregister(&mut self, fd: RawFd, token: Token) -> Result<()>`
   - `pub fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<Event>>` (owned — a caller can
     then take `&mut Poller` again to re-register; `None` blocks)
-  - `pub fn waker(&self) -> Result<Waker>`; `pub fn registration(&self, token: Token) -> Option<u64>`
+  - `pub fn waker(&self) -> Result<Waker>` (an infallible clone of the poller's wakeup handle — safe
+    to call any number of times); `pub fn registration(&self, token: Token) -> Option<u64>`
   - `pub fn len(&self) -> usize`, `pub fn is_empty(&self) -> bool`
-- `pub struct Waker` — `pub fn wake(&self) -> Result<()>` (thread-safe async notification; the woken
-  event carries `key() == WAKER_KEY`).
+- `pub struct Waker` — an `Arc`-backed, cloneable handle to the poller's single wakeup handle:
+  `pub fn wake(&self) -> Result<()>` (thread-safe async notification, safe to call repeatedly and
+  from any thread; the woken event carries `key() == WAKER_KEY`).
 - `pub const WAKER_KEY: u64` — the key of a waker event.
 ### `timer.rs`
 - `pub struct Timeout` (`Copy`) — a single deadline: `infinite()` (no deadline), `after(Duration)`,
@@ -125,24 +127,26 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN**. All of the following exist and pass (42 in-module
-unit tests + 10 integration tests):
+**GREEN**, and `... build --workspace` **GREEN**. All of the following exist and pass (43 in-module
+unit tests + 12 integration tests):
 - `tests/poller.rs` (integration, real OS fds): a **socketpair** registered `READABLE` reports a
   readiness event with the right `key` after a write to the peer; **poll-with-no-events** returns empty
-  after ≈ the timeout; `poll(Some(2s))` is interrupted by `Waker::wake` from another thread; reregister
-  switches readability → writability; deregister stops events; a double-register of the same fd errors
-  (`AlreadyExists` → `Io`).
+  after ≈ the timeout; `poll(Some(2s))` is interrupted by `Waker::wake` from another thread; **two
+  wakers obtained from the same `Poller`** both fire (and one may be dropped mid-test) — the shared
+  single wakeup handle no longer panics on a second `waker()` call; a waker clone moved to another
+  thread wakes a later blocking poll; reregister switches readability → writability; deregister stops
+  events; a double-register of the same fd errors (`AlreadyExists` → `Io`).
 - `tests/port.rs` (integration, end-to-end): `PortRegistry::open` a `FdDriver::pipe()` port →
   `port.output(b"hello")` → `poller.poll` → `registry.handle_events` → `port.read_input` returns
   `"hello"`; `close` releases the id (a later alloc reuses it) and leaves the poller empty; `open_named`
   uses the built-in registry and an unknown name is `BadArg`; `handle_events` skips unknown keys.
 - In-module `#[cfg(test)]` unit tests: `ByteQueue` (push/front/consume/read_into/clear + wrap-around
   compaction), `Interest`/`to_mio_interest`, `Ready`/`Event` accessors, `Poller` register/deregister +
-  `WAKER_KEY`, `Timeout` (infinite/remaining/expired/saturating), `Timer` (ordering, `pop_expired`,
-  `cancel`, duplicate-key reschedule), `DriverRegistry` (`with_builtins`/`create`/missing name ⇒
-  `BadArg`/`names`), `PortState` transitions, `PortRegistry` alloc/close/reuse, and `FdDriver`
-  (pipe round-trip, EOF, write-only/read-only/inert error paths, `stop` deregistration, fd closing on
-  `Drop` + `stop`).
+  `WAKER_KEY` + repeated shareable `waker()` handles, `Timeout` (infinite/remaining/expired/saturating),
+  `Timer` (ordering, `pop_expired`, `cancel`, duplicate-key reschedule), `DriverRegistry`
+  (`with_builtins`/`create`/missing name ⇒ `BadArg`/`names`), `PortState` transitions, `PortRegistry`
+  alloc/close/reuse, and `FdDriver` (pipe round-trip, EOF, write-only/read-only/inert error paths,
+  `stop` deregistration, fd closing on `Drop` + `stop`).
 
 ## Design Decisions
 - **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker`
@@ -151,10 +155,13 @@ unit tests + 10 integration tests):
   **raw `RawFd`** through `Interest`/`Token`/`Ready` newtypes, so a future io_uring or `/dev/poll`
   backend can be swapped without touching callers. `io_uring` (Part II §A) is a documented
   alternative backend, not M1.
-- **Async notification = `mio::Waker`, not a hand-rolled self-pipe.** The C uses a non-blocking
+- **Async notification = one `mio::Waker` per `Poller`, shared via `Arc`.** The C uses a non-blocking
   `pipe()` (`ps->wake_fds[2]`) because its pollsets are its own; `mio` already provides a portable,
   internally-correct wakeup (eventfd/pipe). Reuse it (Prevent-Duplication); `Waker` token `0`/key
-  `WAKER_KEY` identify it.
+  `WAKER_KEY` identify it. `mio` permits **exactly one** `Waker` per `Poll` (a debug-build assertion),
+  so the `Poller` creates the wakeup handle once in `new()` and owns it; `Poller::waker` returns a
+  cheap `Arc` clone (a `pub struct Waker(Arc<mio::Waker>)`), making `waker()` idempotent, callable from
+  any number of places, and safe to drop — the handle lives as long as the `Poller`.
 - **Who owns the output queue.** The `Port` (not the driver) owns both `ByteQueue`s, mirroring the C
   `ioq` (Erlang→driver) being the single source of truth. `Port::output` appends to the output queue
   and calls `Driver::output`, which **pulls** from `ctx.output()` and returns bytes written; `EAGAIN`
@@ -183,11 +190,9 @@ unit tests + 10 integration tests):
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
   `ERTS_POLL_USE_WAKEUP` semantics beyond `Waker`; concurrent registration races are not guarded.
-- **One `Waker` per `Poller`, and it must stay alive.** `mio` allows a single `Waker` per poll set
-  (a debug-build assertion), so `Poller::waker` may be called only once; a second call panics in a
-  debug build. The `Waker` *owns* the poller's wakeup handle (mio's eventfd), so dropping it while a
-  wakeup is still uncollected loses that event — keep it alive for as long as the wake must be
-  observable (see `tests/poller.rs::waker_interrupts_a_blocking_poll`).
+- **The `Poller` owns the single mio wakeup handle** (created in `Poller::new`); `Waker` is a
+  cloneable `Arc`-backed handle to it, safe to obtain and call repeatedly and from any thread, and
+  safe to drop — the wakeup handle stays alive for as long as the `Poller` does.
 - **Readiness is edge-triggered** (`mio` registers with `EPOLLET`), so a driver *must* drain to
   `EAGAIN` on every callback — `FdDriver` reads/writes in a `EAGAIN`-terminated loop for exactly
   this reason. `handle_events` dispatches on `Ready::readable()`/`Ready::writable()` only, so a

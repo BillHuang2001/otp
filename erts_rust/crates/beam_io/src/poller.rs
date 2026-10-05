@@ -16,6 +16,7 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
+use std::sync::Arc;
 use std::time::Duration;
 
 use beam_common::Result;
@@ -162,13 +163,15 @@ impl Event {
 ///
 /// Register descriptors with [`Poller::register`] (giving each an [`Interest`] and a `u64`
 /// key), drain readiness with [`Poller::poll`] and hand the returned [`Event`]s to the
-/// port registry. Token `0` is reserved for the [`Waker`]s created on demand by
-/// [`Poller::waker`]; user tokens start at `1`.
+/// port registry. Token `0` is reserved for the poller's own [`Waker`], which it creates
+/// once and hands out shared handles to via [`Poller::waker`]; user tokens start at `1`.
 pub struct Poller {
     /// The underlying portable poll set.
     poll: mio::Poll,
     /// The reusable event buffer drained by [`Poller::poll`].
     events: mio::Events,
+    /// The single wakeup handle for this poll set, shared with every [`Waker`] handed out.
+    waker: Arc<mio::Waker>,
     /// Token index → the caller key it was registered with.
     registrations: HashMap<usize, u64>,
     /// The next token index to hand out (starts after the waker's token `0`).
@@ -201,17 +204,20 @@ fn to_ready(event: &mio::event::Event) -> Ready {
 impl Poller {
     /// Creates an empty poller.
     ///
-    /// No [`Waker`] is created here; [`Poller::waker`] builds one on demand under the
-    /// reserved token `0`.
+    /// The poller's single wakeup handle is created here, under the reserved token `0`;
+    /// [`Poller::waker`] hands out cheap shared handles to it.
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` if the operating system refuses to create the poll set.
+    /// Returns `BeamError::Io` if the operating system refuses to create the poll set or
+    /// its wakeup handle.
     pub fn new() -> Result<Poller> {
         let poll = mio::Poll::new().map_err(crate::error::io)?;
+        let waker = mio::Waker::new(poll.registry(), mio::Token(0)).map_err(crate::error::io)?;
         Ok(Poller {
             poll,
             events: mio::Events::with_capacity(1024),
+            waker: Arc::new(waker),
             registrations: HashMap::new(),
             next_token: 1,
         })
@@ -309,27 +315,21 @@ impl Poller {
         Ok(events)
     }
 
-    /// Creates a thread-safe [`Waker`] that unblocks a concurrent [`Poller::poll`].
+    /// Returns a thread-safe [`Waker`] that unblocks a concurrent [`Poller::poll`].
+    ///
+    /// The poller owns a **single** wakeup handle (created in [`Poller::new`]); this returns
+    /// a cheap cloneable handle to it. Call it as many times as needed, from any thread — the
+    /// wakeup handle stays alive for as long as the [`Poller`] does.
     ///
     /// The woken event carries the poller's reserved token `0` and [`WAKER_KEY`] as its
     /// key.
     ///
-    /// The returned [`Waker`] **owns** the poller's wakeup handle, so it must stay alive
-    /// for as long as a wakeup has to be observable: dropping it closes that handle and a
-    /// wakeup that has not been collected by [`Poller::poll`] yet is lost.
-    ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the operating system cannot create the wakeup handle.
-    ///
-    /// # Panics
-    ///
-    /// `mio` permits **one** `Waker` per poll set (a debug assertion), so a second call
-    /// on the same [`Poller`] panics in a debug build. Create the waker once and share it.
+    /// This call cannot fail; it returns `Result` for API symmetry with the other poller
+    /// methods.
     pub fn waker(&self) -> Result<Waker> {
-        mio::Waker::new(self.poll.registry(), mio::Token(0))
-            .map(Waker)
-            .map_err(crate::error::io)
+        Ok(Waker(Arc::clone(&self.waker)))
     }
     /// The caller key a token was registered with, if the token is still live.
     pub fn registration(&self, token: Token) -> Option<u64> {
@@ -349,13 +349,11 @@ impl Poller {
 
 /// An asynchronous notification handle that unblocks a [`Poller::poll`].
 ///
-/// It is `mio`'s portable wakeup (eventfd/pipe); the woken event carries [`WAKER_KEY`].
+/// It is a cheap [`Arc`]-backed handle to `mio`'s portable wakeup (eventfd/pipe), created
+/// by (and owned by) the [`Poller`]; the woken event carries [`WAKER_KEY`]. Obtained from
+/// [`Poller::waker`], it may be cloned and used any number of times from any thread;
 /// `Waker::wake` is safe to call from any thread.
-///
-/// It owns the wakeup handle and there is only one per [`Poller`], so keep it alive while
-/// a wakeup must remain observable (`wake` followed by dropping the handle can lose the
-/// pending event).
-pub struct Waker(mio::Waker);
+pub struct Waker(Arc<mio::Waker>);
 
 impl Waker {
     /// Wakes the associated [`Poller`], interrupting a blocking [`Poller::poll`].
@@ -447,6 +445,18 @@ mod tests {
         assert_eq!(WAKER_KEY, u64::MAX);
     }
 
+    #[test]
+    fn waker_handles_are_cheap_repeatable_clones() {
+        let poller = Poller::new().expect("a poll set");
+        // The poller owns the single wakeup handle; obtaining several handles to it must
+        // not panic (mio permits only one `Waker` per poll set).
+        let first = poller.waker().expect("a waker");
+        let second = poller.waker().expect("a second waker");
+        first.wake().expect("the first handle fires");
+        second.wake().expect("the second handle fires");
+        drop(first);
+        second.wake().expect("the surviving handle still fires");
+    }
     #[test]
     fn register_assigns_tokens_from_one_and_records_the_key() {
         let mut poller = Poller::new().expect("a poll set");
