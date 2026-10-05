@@ -205,18 +205,128 @@ pub enum Tag {
 impl Tag {
     /// Decodes a wire byte into a [`Tag`], or `None` if it is not a known tag.
     pub fn from_byte(byte: u8) -> Option<Tag> {
-        unimplemented!()
+        let tag = match byte {
+            SMALL_INTEGER_EXT => Tag::SmallInteger,
+            INTEGER_EXT => Tag::Integer,
+            FLOAT_EXT => Tag::Float,
+            ATOM_EXT => Tag::Atom,
+            REFERENCE_EXT => Tag::Reference,
+            PORT_EXT => Tag::Port,
+            PID_EXT => Tag::Pid,
+            SMALL_TUPLE_EXT => Tag::SmallTuple,
+            LARGE_TUPLE_EXT => Tag::LargeTuple,
+            NIL_EXT => Tag::Nil,
+            STRING_EXT => Tag::String,
+            LIST_EXT => Tag::List,
+            BINARY_EXT => Tag::Binary,
+            SMALL_BIG_EXT => Tag::SmallBig,
+            LARGE_BIG_EXT => Tag::LargeBig,
+            NEW_FLOAT_EXT => Tag::NewFloat,
+            NEW_REFERENCE_EXT => Tag::NewReference,
+            SMALL_ATOM_EXT => Tag::SmallAtom,
+            MAP_EXT => Tag::Map,
+            NEW_PID_EXT => Tag::NewPid,
+            NEW_PORT_EXT => Tag::NewPort,
+            NEWER_REFERENCE_EXT => Tag::NewerReference,
+            ATOM_UTF8_EXT => Tag::AtomUtf8,
+            SMALL_ATOM_UTF8_EXT => Tag::SmallAtomUtf8,
+            COMPRESSED_EXT => Tag::Compressed,
+            BIT_BINARY_EXT => Tag::BitBinary,
+            NEW_FUN_EXT => Tag::NewFun,
+            EXPORT_EXT => Tag::Export,
+            FUN_EXT => Tag::Fun,
+            V4_PORT_EXT => Tag::V4Port,
+            LOCAL_EXT => Tag::Local,
+            ATOM_CACHE_REF_EXT => Tag::AtomCacheRef,
+            DIST_HEADER_EXT => Tag::DistHeader,
+            NEW_CACHE_EXT => Tag::NewCache,
+            RECORD_EXT => Tag::Record,
+            _ => return None,
+        };
+        Some(tag)
     }
 
     /// The wire byte for this tag.
     pub fn as_byte(self) -> u8 {
-        unimplemented!()
+        match self {
+            Tag::SmallInteger => SMALL_INTEGER_EXT,
+            Tag::Integer => INTEGER_EXT,
+            Tag::Float => FLOAT_EXT,
+            Tag::Atom => ATOM_EXT,
+            Tag::Reference => REFERENCE_EXT,
+            Tag::Port => PORT_EXT,
+            Tag::Pid => PID_EXT,
+            Tag::SmallTuple => SMALL_TUPLE_EXT,
+            Tag::LargeTuple => LARGE_TUPLE_EXT,
+            Tag::Nil => NIL_EXT,
+            Tag::String => STRING_EXT,
+            Tag::List => LIST_EXT,
+            Tag::Binary => BINARY_EXT,
+            Tag::SmallBig => SMALL_BIG_EXT,
+            Tag::LargeBig => LARGE_BIG_EXT,
+            Tag::NewFloat => NEW_FLOAT_EXT,
+            Tag::NewReference => NEW_REFERENCE_EXT,
+            Tag::SmallAtom => SMALL_ATOM_EXT,
+            Tag::Map => MAP_EXT,
+            Tag::NewPid => NEW_PID_EXT,
+            Tag::NewPort => NEW_PORT_EXT,
+            Tag::NewerReference => NEWER_REFERENCE_EXT,
+            Tag::AtomUtf8 => ATOM_UTF8_EXT,
+            Tag::SmallAtomUtf8 => SMALL_ATOM_UTF8_EXT,
+            Tag::Compressed => COMPRESSED_EXT,
+            Tag::BitBinary => BIT_BINARY_EXT,
+            Tag::NewFun => NEW_FUN_EXT,
+            Tag::Export => EXPORT_EXT,
+            Tag::Fun => FUN_EXT,
+            Tag::V4Port => V4_PORT_EXT,
+            Tag::Local => LOCAL_EXT,
+            Tag::AtomCacheRef => ATOM_CACHE_REF_EXT,
+            Tag::DistHeader => DIST_HEADER_EXT,
+            Tag::NewCache => NEW_CACHE_EXT,
+            Tag::Record => RECORD_EXT,
+        }
     }
 
     /// The canonical name of this tag: the C macro spelling from `external.h`
     /// (e.g. `"SMALL_INTEGER_EXT"`, `"COMPRESSED"`, `"ATOM_CACHE_REF"`).
     pub fn name(self) -> &'static str {
-        unimplemented!()
+        match self {
+            Tag::SmallInteger => "SMALL_INTEGER_EXT",
+            Tag::Integer => "INTEGER_EXT",
+            Tag::Float => "FLOAT_EXT",
+            Tag::Atom => "ATOM_EXT",
+            Tag::Reference => "REFERENCE_EXT",
+            Tag::Port => "PORT_EXT",
+            Tag::Pid => "PID_EXT",
+            Tag::SmallTuple => "SMALL_TUPLE_EXT",
+            Tag::LargeTuple => "LARGE_TUPLE_EXT",
+            Tag::Nil => "NIL_EXT",
+            Tag::String => "STRING_EXT",
+            Tag::List => "LIST_EXT",
+            Tag::Binary => "BINARY_EXT",
+            Tag::SmallBig => "SMALL_BIG_EXT",
+            Tag::LargeBig => "LARGE_BIG_EXT",
+            Tag::NewFloat => "NEW_FLOAT_EXT",
+            Tag::NewReference => "NEW_REFERENCE_EXT",
+            Tag::SmallAtom => "SMALL_ATOM_EXT",
+            Tag::Map => "MAP_EXT",
+            Tag::NewPid => "NEW_PID_EXT",
+            Tag::NewPort => "NEW_PORT_EXT",
+            Tag::NewerReference => "NEWER_REFERENCE_EXT",
+            Tag::AtomUtf8 => "ATOM_UTF8_EXT",
+            Tag::SmallAtomUtf8 => "SMALL_ATOM_UTF8_EXT",
+            Tag::Compressed => "COMPRESSED",
+            Tag::BitBinary => "BIT_BINARY_EXT",
+            Tag::NewFun => "NEW_FUN_EXT",
+            Tag::Export => "EXPORT_EXT",
+            Tag::Fun => "FUN_EXT",
+            Tag::V4Port => "V4_PORT_EXT",
+            Tag::Local => "LOCAL_EXT",
+            Tag::AtomCacheRef => "ATOM_CACHE_REF",
+            Tag::DistHeader => "DIST_HEADER",
+            Tag::NewCache => "NEW_CACHE",
+            Tag::Record => "RECORD_EXT",
+        }
     }
 
     /// Whether the Milestone-1 term layer supports this tag.
@@ -228,6 +338,184 @@ impl Tag {
     /// binaries, funs, records, `V4_PORT_EXT`, `LOCAL_EXT` and the distribution
     /// header).
     pub fn covered(self) -> bool {
-        unimplemented!()
+        matches!(
+            self,
+            Tag::SmallInteger
+                | Tag::Integer
+                | Tag::Float
+                | Tag::NewFloat
+                | Tag::Atom
+                | Tag::SmallAtom
+                | Tag::AtomUtf8
+                | Tag::SmallAtomUtf8
+                | Tag::Reference
+                | Tag::NewReference
+                | Tag::NewerReference
+                | Tag::Port
+                | Tag::NewPort
+                | Tag::Pid
+                | Tag::NewPid
+                | Tag::SmallTuple
+                | Tag::LargeTuple
+                | Tag::Nil
+                | Tag::String
+                | Tag::List
+                | Tag::SmallBig
+                | Tag::LargeBig
+                | Tag::Map
+                | Tag::AtomCacheRef
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Every [`Tag`] variant with its wire byte, C macro name and M1 coverage.
+    ///
+    /// Ordering is the declaration order of [`Tag`]; `ALL.len()` is asserted
+    /// against the variant count so a new variant forces this table to be updated.
+    const ALL: [(Tag, u8, &str, bool); 35] = [
+        (Tag::SmallInteger, 97, "SMALL_INTEGER_EXT", true),
+        (Tag::Integer, 98, "INTEGER_EXT", true),
+        (Tag::Float, 99, "FLOAT_EXT", true),
+        (Tag::Atom, 100, "ATOM_EXT", true),
+        (Tag::Reference, 101, "REFERENCE_EXT", true),
+        (Tag::Port, 102, "PORT_EXT", true),
+        (Tag::Pid, 103, "PID_EXT", true),
+        (Tag::SmallTuple, 104, "SMALL_TUPLE_EXT", true),
+        (Tag::LargeTuple, 105, "LARGE_TUPLE_EXT", true),
+        (Tag::Nil, 106, "NIL_EXT", true),
+        (Tag::String, 107, "STRING_EXT", true),
+        (Tag::List, 108, "LIST_EXT", true),
+        (Tag::Binary, 109, "BINARY_EXT", false),
+        (Tag::SmallBig, 110, "SMALL_BIG_EXT", true),
+        (Tag::LargeBig, 111, "LARGE_BIG_EXT", true),
+        (Tag::NewFloat, 70, "NEW_FLOAT_EXT", true),
+        (Tag::NewReference, 114, "NEW_REFERENCE_EXT", true),
+        (Tag::SmallAtom, 115, "SMALL_ATOM_EXT", true),
+        (Tag::Map, 116, "MAP_EXT", true),
+        (Tag::NewPid, 88, "NEW_PID_EXT", true),
+        (Tag::NewPort, 89, "NEW_PORT_EXT", true),
+        (Tag::NewerReference, 90, "NEWER_REFERENCE_EXT", true),
+        (Tag::AtomUtf8, 118, "ATOM_UTF8_EXT", true),
+        (Tag::SmallAtomUtf8, 119, "SMALL_ATOM_UTF8_EXT", true),
+        (Tag::Compressed, 80, "COMPRESSED", false),
+        (Tag::BitBinary, 77, "BIT_BINARY_EXT", false),
+        (Tag::NewFun, 112, "NEW_FUN_EXT", false),
+        (Tag::Export, 113, "EXPORT_EXT", false),
+        (Tag::Fun, 117, "FUN_EXT", false),
+        (Tag::V4Port, 120, "V4_PORT_EXT", false),
+        (Tag::Local, 121, "LOCAL_EXT", false),
+        (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
+        (Tag::DistHeader, 68, "DIST_HEADER", false),
+        (Tag::NewCache, 78, "NEW_CACHE", false),
+        (Tag::Record, 67, "RECORD_EXT", false),
+    ];
+
+    #[test]
+    fn version_magic_is_131() {
+        assert_eq!(VERSION_MAGIC, 131);
+        // `VERSION_MAGIC` is not a term tag: it never starts a term payload.
+        assert_eq!(Tag::from_byte(VERSION_MAGIC), None);
+    }
+
+    #[test]
+    fn constants_have_documented_byte_values() {
+        assert_eq!(SMALL_INTEGER_EXT, 97);
+        assert_eq!(INTEGER_EXT, 98);
+        assert_eq!(FLOAT_EXT, 99);
+        assert_eq!(ATOM_EXT, 100);
+        assert_eq!(REFERENCE_EXT, 101);
+        assert_eq!(PORT_EXT, 102);
+        assert_eq!(PID_EXT, 103);
+        assert_eq!(SMALL_TUPLE_EXT, 104);
+        assert_eq!(LARGE_TUPLE_EXT, 105);
+        assert_eq!(NIL_EXT, 106);
+        assert_eq!(STRING_EXT, 107);
+        assert_eq!(LIST_EXT, 108);
+        assert_eq!(BINARY_EXT, 109);
+        assert_eq!(SMALL_BIG_EXT, 110);
+        assert_eq!(LARGE_BIG_EXT, 111);
+        assert_eq!(NEW_FLOAT_EXT, 70);
+        assert_eq!(NEW_REFERENCE_EXT, 114);
+        assert_eq!(SMALL_ATOM_EXT, 115);
+        assert_eq!(MAP_EXT, 116);
+        assert_eq!(NEW_PID_EXT, 88);
+        assert_eq!(NEW_PORT_EXT, 89);
+        assert_eq!(NEWER_REFERENCE_EXT, 90);
+        assert_eq!(ATOM_UTF8_EXT, 118);
+        assert_eq!(SMALL_ATOM_UTF8_EXT, 119);
+        assert_eq!(COMPRESSED_EXT, 80);
+        assert_eq!(BIT_BINARY_EXT, 77);
+        assert_eq!(NEW_FUN_EXT, 112);
+        assert_eq!(EXPORT_EXT, 113);
+        assert_eq!(FUN_EXT, 117);
+        assert_eq!(V4_PORT_EXT, 120);
+        assert_eq!(LOCAL_EXT, 121);
+        assert_eq!(ATOM_CACHE_REF_EXT, 82);
+        assert_eq!(DIST_HEADER_EXT, 68);
+        assert_eq!(NEW_CACHE_EXT, 78);
+        assert_eq!(RECORD_EXT, 67);
+    }
+
+    #[test]
+    fn as_byte_matches_the_wire_byte() {
+        for (tag, byte, _, _) in ALL {
+            assert_eq!(tag.as_byte(), byte, "as_byte mismatch for {tag:?}");
+        }
+    }
+
+    #[test]
+    fn from_byte_inverts_as_byte() {
+        for (tag, byte, _, _) in ALL {
+            assert_eq!(Tag::from_byte(byte), Some(tag), "from_byte mismatch for {byte}");
+            assert_eq!(
+                Tag::from_byte(tag.as_byte()),
+                Some(tag),
+                "from_byte/as_byte round-trip mismatch for {tag:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn as_byte_is_injective() {
+        for (i, (tag_a, byte_a, _, _)) in ALL.iter().enumerate() {
+            for (tag_b, byte_b, _, _) in ALL.iter().skip(i + 1) {
+                assert_ne!(
+                    byte_a, byte_b,
+                    "{tag_a:?} and {tag_b:?} share the wire byte {byte_a}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn names_are_the_c_macro_spellings() {
+        for (tag, _, name, _) in ALL {
+            assert_eq!(tag.name(), name, "name mismatch for {tag:?}");
+        }
+    }
+
+    #[test]
+    fn covered_matches_the_m1_tag_set() {
+        for (tag, _, name, covered) in ALL {
+            assert_eq!(
+                tag.covered(),
+                covered,
+                "covered mismatch for {name} ({tag:?})"
+            );
+        }
+    }
+
+    #[test]
+    fn unknown_bytes_are_rejected() {
+        assert_eq!(Tag::from_byte(0x00), None);
+        assert_eq!(Tag::from_byte(200), None);
+        assert_eq!(Tag::from_byte(0xFF), None);
+        // Bytes adjacent to real tags stay unknown.
+        assert_eq!(Tag::from_byte(65), None);
+        assert_eq!(Tag::from_byte(126), None);
     }
 }
