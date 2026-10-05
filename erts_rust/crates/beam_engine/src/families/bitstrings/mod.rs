@@ -1,0 +1,350 @@
+//! Bitstring / binary-syntax instruction family.
+//!
+//! Owns the whole `Bs*` instruction family (per `../beam_loader/CONTEXT.md`, "The
+//! instruction vocabulary"):
+//! - match entry: [`Instr::BsStartMatch3`], [`Instr::BsStartMatch4`]
+//! - matching: [`Instr::BsMatch`], [`Instr::BsMatchString`], [`Instr::BsGetTail`],
+//!   [`Instr::BsGetPosition`], [`Instr::BsSetPosition`], [`Instr::BsGetInteger2`],
+//!   [`Instr::BsGetFloat2`], [`Instr::BsGetBinary2`], [`Instr::BsSkipBits2`],
+//!   [`Instr::BsTestTail2`]
+//! - UTF: [`Instr::BsGetUtf8`], [`Instr::BsGetUtf16`], [`Instr::BsGetUtf32`],
+//!   [`Instr::BsSkipUtf8`], [`Instr::BsSkipUtf16`], [`Instr::BsSkipUtf32`]
+//! - construction: [`Instr::BsInitWritable`], [`Instr::BsCreateBin`]
+//!
+//! The work is split by responsibility: this file holds [`exec`] (the dispatch) and
+//! the helpers shared by both halves; [`matching`] holds the match side
+//! (`bs_start_match*`, `bs_match`, the reads); [`create`] holds construction
+//! (`bs_create_bin`); [`raw`] is the family's single `#[allow(unsafe_code)]` module
+//! for the `ErlSubBits`/`ErlHeapBits` raw layouts.
+//!
+//! # Match-context model
+//!
+//! A match context is an on-heap boxed term in the exact C `ErlSubBits` shape
+//! `[HEADER_SUB_BITS, 0, start_bit, end_bit, orig]` where `orig` is the subject
+//! heap binary ([`raw::make_ctx`]). All state is re-derived from the term at every
+//! opcode, so matching survives calls and branches without any side table — the
+//! interpreter's answer to C's native `ErlSubBits` reuse (`bs_instrs.tab:1085-1118`).
+//!
+//! Bit extraction/insertion is plain **safe** `&[u8]` arithmetic in MSB-first
+//! order; only the frozen-header dereferences live in [`raw`].
+//!
+//! # Error strategy
+//!
+//! Every failure is a typed [`beam_common::BeamError`] — never a panic and never a
+//! wrong result:
+//! * a *match* failure branches to the instruction's fail label, or raises
+//!   `{badmatch, Value}` when the label is [`NO_FAIL`] ([`fail_step`]);
+//! * a genuine M1 coverage edge is [`crate::error::unsupported`] with a precise
+//!   reason (see the `Known Issues` in the crate `CONTEXT.md`).
+
+mod create;
+mod matching;
+#[allow(unsafe_code)]
+mod raw;
+
+use std::collections::BTreeMap;
+
+use beam_common::Result;
+use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+use beam_term::{make_atom, Eterm};
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::operand::read_operand;
+use crate::Step;
+
+/// `BSF_ALIGNED` (`erl_bits.h:461`): the field is guaranteed byte-aligned.
+pub(super) const BSF_ALIGNED: u32 = 1;
+/// `BSF_LITTLE` (`erl_bits.h:462`): the field is little-endian.
+pub(super) const BSF_LITTLE: u32 = 2;
+/// `BSF_SIGNED` (`erl_bits.h:463`): the field is signed.
+pub(super) const BSF_SIGNED: u32 = 4;
+/// `BSF_NATIVE` (`erl_bits.h:465`): the field is in native endianness.
+pub(super) const BSF_NATIVE: u32 = 16;
+
+/// Execute a bitstring-family instruction.
+///
+/// Returns `Ok(Some(step))` when `instr` is a `Bs*` opcode this family executes,
+/// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
+pub(crate) fn exec(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    if let Some(step) = matching::exec(machine, module, labels, instr, func, pc, ctx)? {
+        return Ok(Some(step));
+    }
+    if let Some(step) = create::exec(machine, module, labels, instr, func, pc, ctx)? {
+        return Ok(Some(step));
+    }
+    Ok(None)
+}
+
+// ---------------------------------------------------------------------------
+// Shared failure / label helpers
+// ---------------------------------------------------------------------------
+
+/// Dispatch a `bs_*` match failure: branch to `fail`, or raise `{badmatch, V}`
+/// when `fail` is [`NO_FAIL`].
+///
+/// Reproduces the C `$FAIL`/`$FAIL_HEAD_OR_BODY` split (`emu/macros.tab:266`): the
+/// compiler emits a live fail label for an ordinary clause mismatch, while `f,0`
+/// means "there is no handler — this is a hard match failure" and becomes a
+/// `badmatch` raise with `subject` as the value.
+pub(super) fn fail_step(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    fail: Label,
+    subject: Eterm,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    if fail == NO_FAIL {
+        return machine
+            .throw_error(crate::terms::badmatch_reason(ctx, module, subject)?)
+            .map(Some);
+    }
+    Ok(Some(goto_label(labels, fail)?))
+}
+
+/// Resolve a module-local label to its `(function, code)` jump target.
+pub(super) fn goto_label(
+    labels: &BTreeMap<Label, (u32, u32)>,
+    label: Label,
+) -> Result<Step> {
+    let (func, pc) = labels
+        .get(&label)
+        .copied()
+        .ok_or_else(|| error::unknown_label(label))?;
+    Ok(Step::Goto { func, pc })
+}
+
+// ---------------------------------------------------------------------------
+// Operand helpers
+// ---------------------------------------------------------------------------
+
+/// Read a segment *size* operand: a non-negative small integer.
+///
+/// A register or a negative/oversized value cannot size a segment; the C
+/// `BS_GET_FIELD_SIZE` macro fails the match there, and this engine reports the
+/// same case as a typed [`crate::error::unsupported`] rather than guessing.
+pub(super) fn read_size(machine: &Machine, operand: &Operand) -> Result<usize> {
+    let value = read_operand(machine, operand)?;
+    if beam_term::is_small(value) {
+        let n = beam_term::signed_value(value);
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+    }
+    Err(error::unsupported("bitstring: size is not a non-negative small integer"))
+}
+
+/// True when `operand` is the atom `all` (a whole-tail segment size).
+pub(super) fn is_all(module: &Module, operand: &Operand) -> bool {
+    match operand {
+        Operand::Atom(atom) => module.atom_name(*atom) == Some("all"),
+        _ => false,
+    }
+}
+
+/// Decode a segment *flags* operand into the `BSF_*` bits.
+///
+/// The operand is `Nil` (no flags — `encode_arg` maps the empty list to `a,0`) or a
+/// `Literal` holding a flag-atom list (`little`/`signed`/`native`; `big`/`unsigned`
+/// are the defaults and contribute nothing). The comparison is by `make_atom` on
+/// this module's atom table, so it needs no index arithmetic.
+pub(super) fn decode_flags(module: &Module, operand: &Operand) -> Result<u32> {
+    match operand {
+        Operand::Nil => Ok(0),
+        Operand::Literal(index) => {
+            let term = module.literal(*index).ok_or_else(|| {
+                error::unsupported("bitstring: flags literal index out of range")
+            })?;
+            let mut flags = 0;
+            for elem in crate::terms::list_elements(term)? {
+                flags |= flag_bit(module, elem)?;
+            }
+            Ok(flags)
+        }
+        _ => Err(error::unsupported("bitstring: unsupported flags operand")),
+    }
+}
+
+/// The `BSF_*` bit a single flag atom contributes (`big`/`unsigned` are the
+/// defaults, i.e. zero).
+fn flag_bit(module: &Module, elem: Eterm) -> Result<u32> {
+    let named = |name: &str| module.atom_table.lookup(name).map(make_atom) == Some(elem);
+    if named("little") {
+        return Ok(BSF_LITTLE);
+    }
+    if named("signed") {
+        return Ok(BSF_SIGNED);
+    }
+    if named("native") {
+        return Ok(BSF_NATIVE);
+    }
+    if named("big") || named("unsigned") {
+        return Ok(0);
+    }
+    Err(error::unsupported("bitstring: unknown segment flag"))
+}
+
+// ---------------------------------------------------------------------------
+// Safe bit arithmetic (MSB-first within the byte stream)
+// ---------------------------------------------------------------------------
+
+/// Read `nbits` (≤ 64) bits starting at bit `start`, MSB-first, as an integer.
+///
+/// The caller guarantees `bytes` covers `start + nbits` bits (the `bs_*` matching
+/// ops only reach here after a range check); a violated precondition is reported as
+/// a typed error rather than an out-of-bounds panic.
+pub(super) fn read_uint_be(bytes: &[u8], start: usize, nbits: usize) -> Result<u64> {
+    if nbits > 64 {
+        return Err(error::unsupported("bitstring: integer segment wider than 64 bits"));
+    }
+    let end = start
+        .checked_add(nbits)
+        .ok_or_else(|| error::unsupported("bitstring: integer segment out of range"))?;
+    if end > bytes.len() * 8 {
+        return Err(error::unsupported("bitstring: integer segment out of range"));
+    }
+    let mut value = 0u64;
+    for i in 0..nbits {
+        let bit_index = start + i;
+        let bit = (bytes[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+        value = (value << 1) | u64::from(bit);
+    }
+    Ok(value)
+}
+
+/// Read a little-endian integer field of `nbits` bits (a whole number of bytes)
+/// starting at byte-aligned bit `start`.
+pub(super) fn read_uint_le(bytes: &[u8], start: usize, nbits: usize) -> Result<u64> {
+    if nbits % 8 != 0 || start % 8 != 0 {
+        return Err(error::unsupported(
+            "bitstring: little-endian integer segment is not byte-aligned",
+        ));
+    }
+    let nbytes = nbits / 8;
+    if start / 8 + nbytes > bytes.len() {
+        return Err(error::unsupported("bitstring: integer segment out of range"));
+    }
+    let base = start / 8;
+    let mut value = 0u64;
+    for i in 0..nbytes {
+        // Little-endian: the least-significant byte is first in the stream.
+        value |= u64::from(bytes[base + i]) << (8 * i);
+    }
+    Ok(value)
+}
+
+/// Sign-extend the low `nbits` bits of `raw` to 64 bits.
+pub(super) fn sign_extend(raw: u64, nbits: usize) -> u64 {
+    if nbits == 0 || nbits >= 64 {
+        return raw;
+    }
+    let sign = 1u64 << (nbits - 1);
+    if raw & sign != 0 {
+        raw | (!0u64 << nbits)
+    } else {
+        raw
+    }
+}
+
+/// Turn an `i64` into a small-integer term, or report the bignum gap.
+pub(super) fn make_small_checked(value: i64) -> Result<Eterm> {
+    beam_term::try_make_small(value)
+        .map_err(|_| error::unsupported("bitstring: value needs a bignum"))
+}
+
+/// Encode a small integer as a term, or report the bignum gap (used by the
+/// integer *builders*, where C masks the value into the segment width).
+pub(super) fn small_value(t: Eterm) -> Option<i64> {
+    if beam_term::is_small(t) {
+        Some(beam_term::signed_value(t))
+    } else {
+        None
+    }
+}
+
+/// Copy `nbits` bits starting at `start` (MSB-first) out of `bytes` into a fresh
+/// buffer of `ceil(nbits / 8)` bytes, zeroing the unused trailing bits.
+pub(super) fn extract_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<Vec<u8>> {
+    let end = start
+        .checked_add(nbits)
+        .ok_or_else(|| error::unsupported("bitstring: bit range out of range"))?;
+    if end > bytes.len() * 8 {
+        return Err(error::unsupported("bitstring: bit range out of range"));
+    }
+    let mut out = vec![0u8; nbits.div_ceil(8)];
+    for i in 0..nbits {
+        let bit_index = start + i;
+        let bit = (bytes[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+        if bit != 0 {
+            out[i / 8] |= 1 << (7 - (i % 8));
+        }
+    }
+    Ok(out)
+}
+
+/// A bit sink: append bits (MSB-first) to a growable byte buffer.
+///
+/// Used by the `bs_create_bin` builder, which assembles the result as a bit vector
+/// and materialises it once at the end ([`raw::make_bits`]).
+#[derive(Default)]
+pub(super) struct BitWriter {
+    bytes: Vec<u8>,
+    /// Bits written so far (≤ `bytes.len() * 8`).
+    nbits: usize,
+}
+
+impl BitWriter {
+    /// Append a single bit (`0` or `1`).
+    pub(super) fn push_bit(&mut self, bit: u8) {
+        let byte = self.nbits / 8;
+        if byte >= self.bytes.len() {
+            self.bytes.push(0);
+        }
+        if bit & 1 != 0 {
+            self.bytes[byte] |= 1 << (7 - (self.nbits % 8));
+        }
+        self.nbits += 1;
+    }
+
+    /// Append the low `width` bits of `value`, most-significant bit first.
+    pub(super) fn push_uint(&mut self, value: u64, width: usize) {
+        for k in (0..width).rev() {
+            self.push_bit(((value >> k) & 1) as u8);
+        }
+    }
+
+    /// Append the low `width` bits of `value` in little-endian **byte** order
+    /// (`width` must be a multiple of 8): the least-significant byte goes first.
+    pub(super) fn push_uint_le(&mut self, value: u64, width: usize) {
+        for byte in 0..width / 8 {
+            let b = ((value >> (8 * byte)) & 0xFF) as u8;
+            for k in (0..8).rev() {
+                self.push_bit((b >> k) & 1);
+            }
+        }
+    }
+
+    /// Append `count` bits from `src` (MSB-first) starting at bit `start`.
+    pub(super) fn push_bits_from(&mut self, src: &[u8], start: usize, count: usize) {
+        for i in 0..count {
+            let bit_index = start + i;
+            let bit = (src[bit_index / 8] >> (7 - (bit_index % 8))) & 1;
+            self.push_bit(bit);
+        }
+    }
+
+    /// The assembled bytes and the exact bit count.
+    pub(super) fn finish(self) -> (Vec<u8>, usize) {
+        (self.bytes, self.nbits)
+    }
+}

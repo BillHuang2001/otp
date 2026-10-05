@@ -94,6 +94,15 @@ pub trait ExecutionContext {
 /// A BIF hook: maps `(module, function, arity, args)` to a result.
 pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 
+/// An apply hook: computes the result of applying a fun/closure value to `args`.
+///
+/// This is the pluggable body of [`ExecutionContext::apply_fun`]: the `call_fun`/
+/// `call_fun2` opcodes reach the host through it. A host that keeps a closure
+/// registry (or, as in the tests, knows the closures a module builds) overrides it;
+/// [`MinimalContext::new`] leaves it unset, so `apply_fun` stays a typed
+/// `unsupported`.
+pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
+
 /// Minimal context: an unbounded heap plus a pluggable BIF hook.
 ///
 /// Used by tests and embeddings. [`MinimalContext::ensure_heap`] is a no-op (the
@@ -101,8 +110,15 @@ pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 /// that rejects every BIF with [`crate::error::unsupported`], and
 /// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words) hands out words
 /// from a pointer-stable arena (see the field docs).
+///
+/// An **apply hook** ([`with_apply_hook`](MinimalContext::with_apply_hook) /
+/// [`set_apply_hook`](MinimalContext::set_apply_hook)) may additionally be installed
+/// to serve [`apply_fun`](ExecutionContext::apply_fun); without one it is a typed
+/// `unsupported`.
 pub struct MinimalContext {
     hook: BifHook,
+    /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
+    apply_hook: Option<ApplyHook>,
     /// A pointer-stable arena backing [`ExecutionContext::alloc_words`].
     ///
     /// Each allocation is its own `Box<[Eterm]>`: growing the outer `Vec` moves
@@ -128,13 +144,29 @@ impl MinimalContext {
     pub fn with_bif_hook(hook: BifHook) -> MinimalContext {
         MinimalContext {
             hook,
+            apply_hook: None,
             arena: Vec::new(),
         }
+    }
+
+    /// A context with the given fun-application hook and the default (rejecting)
+    /// BIF hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_apply_hook(hook: ApplyHook) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.apply_hook = Some(hook);
+        ctx
     }
 
     /// Replace the BIF hook.
     pub fn set_bif_hook(&mut self, hook: BifHook) {
         self.hook = hook;
+    }
+
+    /// Install (or replace) the fun-application hook.
+    pub fn set_apply_hook(&mut self, hook: ApplyHook) {
+        self.apply_hook = Some(hook);
     }
 }
 
@@ -186,6 +218,18 @@ impl ExecutionContext for MinimalContext {
         // No separate external-call machinery in the minimal context: the BIF hook
         // is the dispatch path.
         self.call_bif(module, function, arity, args)
+    }
+
+    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        // Without an installed apply hook there is no closure registry to consult,
+        // so fun application stays the trait's documented typed `unsupported`.
+        match self.apply_hook.as_mut() {
+            Some(hook) => hook(fun, args),
+            None => {
+                let _ = (fun, args);
+                Err(crate::error::unsupported("apply_fun"))
+            }
+        }
     }
 }
 
