@@ -10,10 +10,15 @@ beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_loader = { path = "../beam_loader" }
 libc.workspace = true
-cranelift-codegen.workspace = true
-cranelift-module.workspace = true
-cranelift-jit.workspace = true
-cranelift-frontend.workspace = true
+cranelift-codegen = { workspace = true, optional = true }
+cranelift-module = { workspace = true, optional = true }
+cranelift-jit = { workspace = true, optional = true }
+cranelift-frontend = { workspace = true, optional = true }
+
+[features]
+default = []
+jit-beamasm = []
+jit-cranelift = ["dep:cranelift-codegen", "dep:cranelift-module", "dep:cranelift-jit", "dep:cranelift-frontend"]
 
 [lints]
 workspace = true
