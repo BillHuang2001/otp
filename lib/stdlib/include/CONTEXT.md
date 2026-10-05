@@ -36,7 +36,7 @@ Nothing here is generated and nothing here is build output — files are install
 - Consumers: only `../src/erl_bits.erl` and `../src/erl_lint.erl` (both `-include_lib`); referenced in a comment from `../src/erl_parse.yrl`.
 
 ## Constraints
-- Everything here is public API installed into `$(RELSYSDIR)/include`: macros and record fields cannot be retracted or renamed — third-party code and other OTP apps compile against them (removing a macro is caught early, see Known Issues in `../CONTEXT.md` history).
+- Everything here is public API installed into `$(RELSYSDIR)/include`: macros and record fields cannot be retracted or renamed — third-party code and other OTP apps compile against them.
 - Only files listed in `HRL_FILES` in `../src/Makefile` are installed; a new public header must be added to that variable.
 - Internal-only headers do **not** belong here: `dets.hrl`, `erl_tar.hrl`, `otp_internal.hrl`, `json.hrl`, `swar_ascii.hrl` live in `../src/` and are installed into `$(RELSYSDIR)/src` (`INTERNAL_HRL_FILES`).
 - Headers must be usable both as `-include_lib("stdlib/include/X.hrl")` and as plain `-include("X.hrl")` with `-I$(ERL_TOP)/lib/stdlib/include` — the latter is how `../compiler/src`, `../sasl/src`, `../parsetools/src` and `../src` itself consume them (`ERL_COMPILE_FLAGS += -I../../stdlib/include`), so filenames are part of the interface.
