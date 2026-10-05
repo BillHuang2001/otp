@@ -5,6 +5,8 @@ Common Test directory of the `mnesia` OTP application (`MNESIA_VSN` 4.27).
 Not a flat set of CT suites: `mnesia_SUITE` is the root of a bespoke hierarchical harness in which every other `*_test`/`*_backup` module is a *sub-suite* reached through group entries `{Mod, all}`.
 The harness predates Common Test (author Hakan Mattsson) and is still driven through CT; `README` is its authoritative manual.
 Code under test is in `../src/`; `../examples/` and `../doc/src/` are compiled into this directory by the Makefile and used by the tests.
+
+## API Surface (entry points)
 - `mnesia_SUITE.erl` — the CT suite for the DBMS. `all/0` = `[app, appup, doctests, {group,light}, {group,medium}, {group,heavy}, {group,external}, clean_up_suite]`; `suite/0` installs `ts_install_cth` with `nodenames=2`. `mnesia_SUITE:silly/0` runs the install test directly, bypassing the harness.
 - `mnesia_SUITE:groups/0` — `light` = install/nice/evil/frag/qlc/index_plugins/config/examples; `medium` = install/atomicity/isolation/durability/recovery/consistency/majority; `heavy` = measure; plus `benchmarks`, `otp_r4b`, `otp_2363`, `external`.
 - `mnesia_bench_SUITE.erl` — second real CT suite: TPC-B conflict benchmark (`tpcb` group, `{repeat,2}`), described by `mnesia_bench.spec`.
