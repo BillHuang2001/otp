@@ -40,8 +40,17 @@ fn dispatch(command: Command) -> Result<i32> {
             print!("{}", cli::usage(topic.as_deref()));
             Ok(0)
         }
-        Command::List { json, out } => {
-            emit_list(&ListReport::from_corpus(), json, out)?;
+        Command::List {
+            by_contract,
+            json,
+            out,
+        } => {
+            let list = if by_contract {
+                ListReport::from_corpus_grouped()
+            } else {
+                ListReport::from_corpus()
+            };
+            emit_list(&list, json, out)?;
             Ok(0)
         }
         Command::Run { case_id, json, out } => {
@@ -95,12 +104,19 @@ fn emit_report(report: &RunReport, json: bool, out: Option<PathBuf>) -> Result<(
 }
 
 /// The `list` command: corpus ids, contracts and descriptions (no runtime involved).
+///
+/// The plain view prints one line per case. When the listing carries the per-contract
+/// grouping (`list --by-contract`) the human view is grouped by contract instead.
 fn emit_list(list: &ListReport, json: bool, out: Option<PathBuf>) -> Result<()> {
     let dir = out.unwrap_or_else(report::default_out_dir);
     let path = report::write_json_value(list, Some(&dir))?;
     eprintln!("differential: wrote {}", path.display());
     if json {
         println!("{}", report::to_json_string(list)?);
+    } else if list.by_contract.is_some() {
+        let mut stdout = std::io::stdout();
+        report::render_list_grouped(list, &mut stdout)
+            .map_err(|source| Error::io("failed to write the listing", source))?;
     } else {
         for entry in &list.cases {
             let contracts: Vec<&str> = entry.contracts.iter().map(|entry| entry.id).collect();

@@ -7,7 +7,7 @@
 //!   run     <case-id> [--json] [--out <dir>]
 //!   compare <expr> [--pa <dir>]… [--json] [--out <dir>]
 //!   suite   [--strict] [--json] [--out <dir>]
-//!   list    [--json] [--out <dir>]
+//!   list    [--by-contract] [--json] [--out <dir>]
 //!   help    [topic]
 //! ```
 //!
@@ -53,6 +53,8 @@ pub enum Command {
     },
     /// List the built-in corpus (needs no runtime at all).
     List {
+        /// Group the listing by compatibility contract (`A.1` … `A.9`).
+        by_contract: bool,
         /// Print the JSON listing to stdout.
         json: bool,
         /// Also write `<dir>/report.json`.
@@ -129,10 +131,11 @@ pub fn usage(topic: Option<&str>) -> String {
              -h, --help    show this help\n"
         ),
         Some("list") => format!(
-            "differential list [--json] [--out <dir>]\n\n\
+            "differential list [--by-contract] [--json] [--out <dir>]\n\n\
              List the built-in corpus (case id, contracts, description). Needs no runtime\n\
              and always exits 0.\n\n\
              OPTIONS:\n  \
+             --by-contract group the listing by compatibility contract (A.1...A.9)\n  \
              --json        print the JSON listing to stdout\n  \
              --out <dir>   also write <dir>/report.json\n  \
              -h, --help    show this help\n"
@@ -162,6 +165,7 @@ OPTIONS (per subcommand):
   --json          print the JSON report to stdout
   --out <dir>     also write <dir>/report.json
   --strict        (suite) treat unsupported/skipped cases as failures
+  --by-contract   (list) group the listing by compatibility contract
   --pa <dir>      (compare) add a code path for both runtimes, repeatable
   -h, --help      show help (valid at the root and after any subcommand)
 
@@ -347,7 +351,7 @@ fn parse_suite(args: &[String]) -> Result<Command> {
 }
 
 fn parse_list(args: &[String]) -> Result<Command> {
-    let (mut json, mut out) = (false, None);
+    let (mut json, mut out, mut by_contract) = (false, None, false);
     let mut index = 0;
     while index < args.len() {
         let arg = &args[index];
@@ -356,13 +360,22 @@ fn parse_list(args: &[String]) -> Result<Command> {
                 topic: Some("list".to_string()),
             });
         }
+        if arg == "--by-contract" {
+            by_contract = true;
+            index += 1;
+            continue;
+        }
         if consume_common(arg, args, &mut index, &mut json, &mut out, "list")? {
             index += 1;
             continue;
         }
         return Err(unknown_option(arg, "list"));
     }
-    Ok(Command::List { json, out })
+    Ok(Command::List {
+        by_contract,
+        json,
+        out,
+    })
 }
 
 #[cfg(test)]
@@ -530,6 +543,7 @@ mod tests {
         assert_eq!(
             parse(&argv(&["list", "--json"])).unwrap(),
             Command::List {
+                by_contract: false,
                 json: true,
                 out: None,
             }
@@ -537,10 +551,84 @@ mod tests {
         assert_eq!(
             parse(&argv(&["list", "--out", "reports"])).unwrap(),
             Command::List {
+                by_contract: false,
                 json: false,
                 out: Some(PathBuf::from("reports")),
             }
         );
+    }
+
+    #[test]
+    fn parse_list_handles_by_contract() {
+        assert_eq!(
+            parse(&argv(&["list", "--by-contract"])).unwrap(),
+            Command::List {
+                by_contract: true,
+                json: false,
+                out: None,
+            }
+        );
+        // The flag composes with the shared options, in any order, and is idempotent.
+        assert_eq!(
+            parse(&argv(&["list", "--json", "--by-contract", "--out", "reports"])).unwrap(),
+            Command::List {
+                by_contract: true,
+                json: true,
+                out: Some(PathBuf::from("reports")),
+            }
+        );
+        assert_eq!(
+            parse(&argv(&["list", "--by-contract", "--by-contract"])).unwrap(),
+            Command::List {
+                by_contract: true,
+                json: false,
+                out: None,
+            }
+        );
+    }
+
+    #[test]
+    fn by_contract_is_documented_in_list_help() {
+        assert!(usage(Some("list")).contains("--by-contract"));
+        assert!(ROOT_USAGE.contains("--by-contract"));
+    }
+
+    #[test]
+    fn strict_is_only_accepted_by_suite() {
+        // `--strict` is a suite option; the exit-code contract it drives (unsupported/
+        // skipped become failures) lives in the suite path only.
+        assert_eq!(
+            parse(&argv(&["suite", "--strict", "--strict"])).unwrap(),
+            Command::Suite {
+                strict: true,
+                json: false,
+                out: None,
+            }
+        );
+        assert!(matches!(
+            parse(&argv(&["run", "etf/term_to_binary_tuple", "--strict"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["list", "--strict"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["compare", "1+1", "--strict"])),
+            Err(Error::Usage(_))
+        ));
+    }
+
+    #[test]
+    fn by_contract_is_only_accepted_by_list() {
+        assert!(matches!(
+            parse(&argv(&["suite", "--by-contract"])),
+            Err(Error::Usage(_))
+        ));
+        assert!(matches!(
+            parse(&argv(&["run", "etf/term_to_binary_tuple", "--by-contract"])),
+            Err(Error::Usage(_))
+        ));
     }
 
     #[test]
