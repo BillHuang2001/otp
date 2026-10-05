@@ -50,7 +50,7 @@ What this directory produces and exposes:
 - `bind()` failing with `EADDRINUSE` is treated as success: a second `epmd` on the same port prints "there is already a epmd running" and exits 0. A stale `epmd` from another OTP installation therefore silently keeps serving requests.
 - `-d`/`-debug` reduces the remembered unregistered-name list to `DEBUG_MAX_UNREG_COUNT` (5), which changes `creation` behaviour between debug and normal runs.
 - Names are compared byte-wise with a hand-rolled `is_same_str` (no case folding); names containing an embedded NUL are rejected, and both `ALIVE2_REQ` and `PORT2_REQ` names must be valid UTF-8 of at most 255 characters (up to 255*4 bytes).
-- `NAMED`/`DUMP_RESP` includes `fd` numbers and the "old/unused name" list — diagnostic output, not part of the intended protocol surface, but still consumed as text by Erlang code.
+- `DUMP_RESP` includes `fd` numbers and the "old/unused name" list — diagnostic output, not part of the intended protocol surface, but still consumed as text by Erlang code.
 - Windows build: `max_conn` is bounded by `FD_SETSIZE` (1024) but `../doc/references/epmd_cmd.md` documents a lower practical limit of 60 nodes per epmd instance on Windows.
 - `erts/epmd/doc/` is intentionally empty (only a `.gitignore`); `erts/doc/man1/` is likewise a build-output directory, so the rendered `epmd(1)`/`epmd_cmd` documentation is generated elsewhere.
 
