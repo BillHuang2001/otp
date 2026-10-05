@@ -1,11 +1,27 @@
 //! # `beam_engine` — typed-IR execution engine (interpreter + JIT tiers)
 //!
 //! Executes the **frozen typed, block-structured IR** produced by `beam_loader`: a
-//! **direct-threaded interpreter** over the Milestone-1 opcode subset, plus the
-//! **optional JIT tiers** (`jit_beamasm`, `jit_cranelift`) that are
-//! *measurement-gated* and kept **off the critical path** (not implemented in M1).
+//! **direct-threaded interpreter** over the Milestone-1 opcode subset, behind a
+//! real **execution-tier seam** ([`jit`]) that the native JIT tiers plug into.
 //! Implements the Stage-1 engine half of Part II §H with the IR contract of §E and
 //! the interpreter/JIT trade-offs of §F (`../../CONTEXT.md` §4).
+//!
+//! ## Execution tiers
+//!
+//! [`jit::Tier`] enumerates the tiers (`Interpreter`, `BaselineJit`, `Cranelift`),
+//! [`jit::available_tiers`] reports the tier **names** compiled into this build
+//! (`"interpreter"` first, then `"baseline-jit"`, plus `"jit-cranelift"` with the
+//! `jit-cranelift` feature), and [`Machine::run_with_tier`] selects one. The
+//! interpreter is the reference tier and
+//! [`Machine::run_export`] remains its default entry point.
+//!
+//! The native backends are **not built yet**: `BaselineJit` currently routes to the
+//! interpreter (correct results, no codegen) and `Cranelift` is a typed
+//! `unsupported` error rather than a silent fallback. [`jit::JitBackend`] is the
+//! trait those backends implement (`compile` a [`beam_loader::Module`] into their
+//! own artifact, `run_export` it on a [`Machine`]); Cranelift stays off the
+//! critical path — with `jit-cranelift` disabled the crate carries no Cranelift
+//! dependency at all.
 //!
 //! This crate is on the **critical path of the vertical slice**: it loads a real
 //! `.beam` (via `beam_loader`) and runs it end to end.
@@ -51,15 +67,17 @@ mod step;
 pub mod terms;
 pub use context::{ExecutionContext, MinimalContext};
 pub use error::{bad_register, unknown_label, unsupported};
-pub use jit::{available_tiers, JitBackend};
+pub use jit::{available_tiers, JitBackend, Tier};
 pub use machine::{CatchFrame, Machine, MAX_REGISTER};
 pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
 ///
-/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam and the
-/// [`Machine`] core (with its register-file bound [`MAX_REGISTER`]) into scope.
+/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam, the
+/// [`Machine`] core (with its register-file bound [`MAX_REGISTER`]) and the
+/// execution-tier selector [`Tier`] (for [`Machine::run_with_tier`]) into scope.
 pub mod prelude {
     pub use crate::context::{ExecutionContext, MinimalContext};
+    pub use crate::jit::Tier;
     pub use crate::machine::{Machine, MAX_REGISTER};
 }

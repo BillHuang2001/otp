@@ -18,6 +18,7 @@ use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
+use crate::jit::Tier;
 use crate::Step;
 
 /// X-register file size (the `beam_emu.c` `MAX_REG` bound).
@@ -199,6 +200,41 @@ impl Machine {
         match module.export(function, arity) {
             Some(label) => self.run_label(module, label, arity, args, ctx),
             None => Err(error::unsupported("run_export: export not found")),
+        }
+    }
+
+    /// Run the exported `function/arity` on a selected execution tier; yields `x(0)`.
+    ///
+    /// The tier-selecting entry point of the engine ([`crate::jit::Tier`]): the
+    /// caller states which tier it wants and gets that tier's result or a typed
+    /// error — the engine never silently substitutes a different tier.
+    ///
+    /// * [`Tier::Interpreter`] — delegates to [`Machine::run_export`], which
+    ///   remains the **default interpreter entry** (unchanged; this method is a
+    ///   dispatcher, not a replacement).
+    /// * [`Tier::BaselineJit`] — currently routes to the interpreter until the
+    ///   native baseline backend lands, so the tier is already selectable with
+    ///   correct results.
+    /// * [`Tier::Cranelift`] — no Cranelift backend is built yet (the tier is
+    ///   compiled in only with the `jit-cranelift` feature, and even then the
+    ///   backend is a follow-up task), so this is a typed
+    ///   [`unsupported`](crate::error::unsupported) error, never a panic and never
+    ///   a fallback to the interpreter.
+    pub fn run_with_tier(
+        &mut self,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+        tier: Tier,
+    ) -> Result<Eterm> {
+        match tier {
+            Tier::Interpreter => self.run_export(module, function, arity, args, ctx),
+            // The baseline backend is not built yet; the interpreter is the
+            // documented interim implementation (same observable result).
+            Tier::BaselineJit => self.run_export(module, function, arity, args, ctx),
+            Tier::Cranelift => Err(error::unsupported("jit-cranelift tier not built")),
         }
     }
 
