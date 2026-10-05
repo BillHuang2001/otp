@@ -187,9 +187,14 @@ stable raw pointers; **only this module dereferences them**.
   stub / error). Licensing Apache-2.0.
 
 ## Test Strategy
-- Per-module `#[cfg(test)]` unit tests: `context` (hook dispatch, default-hook unsupported);
-  `machine` (x/stack accessors, frame push/pop/return, `MAX_REGISTER` bound); `operand` (read/write
-  each supported operand kind; `FloatReg`/`Literal` → unsupported); `interpreter` (per-opcode
+- Per-module `#[cfg(test)]` unit tests: `context` (hook dispatch, default-hook unsupported, the
+  `alloc_words` arena pointer stability/aliasing, `apply` forwarding, and the `alloc_words`/`apply`
+  defaults); `machine` (x/stack accessors, frame push/pop/return, `MAX_REGISTER` bound, and the FR
+  file: length/default fill, `get_fr`/`set_fr` round-trip + bounds, `reset` clears it); `terms` (every
+  constructor↔reader round-trip through `MinimalContext`, raw-word layout proofs against stack
+  buffers, and the error cases: flatmap >32 / fun field >255 / binary >64 → `unsupported`/`SystemLimit`,
+  wrong-type readers → `BadArg`); `operand` (read/write each supported operand kind incl. `FloatReg`↔FR
+  file + out-of-range; `Literal`/`Label`/`List`/`Allocation` → unsupported); `interpreter` (per-opcode
   semantics for `Move`, `Swap`, every `TestKind`, `SelectVal`, `Allocate`/`AllocateHeap`/`TestHeap`/
   `Deallocate`/`Trim`, `Call`/`CallLast`/`CallOnly`/`CallExt*`/`Return`, `GcBif` ok + guard-fail +
   raise, `Generic` → unsupported). Synthetic modules are built by hand for the ops the fixture does
