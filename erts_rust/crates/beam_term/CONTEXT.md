@@ -245,6 +245,11 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
   structural-hash equality for equal terms (and inequality for different terms), and `size_object`
   for immediates / cons / tuple / boxed. Prefer property-style boundary loops.
+- `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
+  legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n-1` + LS-first `u64` digits
+  and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
+  the 3-word empty block; the external pid/port/ref head + data words), plus write→read round-trips
+  and boundaries (min/max `MAX_REF_IDS`, single-digit bignum, empty flatmap, negative bignum).
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
   compatibility gate), not to this crate's unit tests.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
