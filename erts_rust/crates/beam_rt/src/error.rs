@@ -9,19 +9,79 @@
 //! The single exception is an unknown `system_info/1` key: the OTP oracle raises
 //! the bare atom `badarg` (verified against erts-17.1), so [`unknown_info_key`]
 //! returns [`BeamError::BadArg`] and nothing more.
+//!
+//! # Capability gaps (the "unsupported" convention)
+//!
+//! A *capability gap* — a feature Milestone-1 deliberately does not implement, as
+//! opposed to a genuine failure or a malformed invocation — is signalled by a raise
+//! whose **reason atom starts with `unsupported`**. The constructors here
+//! ([`unknown_switch`], [`bad_eval`], [`unsupported`]) follow the convention, and so
+//! do the sibling crates: `beam_engine` raises `unsupported_opcode: <what>` and
+//! `beam_bifs` raises `unsupported_bif`.
+//!
+//! [`unsupported_reason`] is the **single** place that convention is interpreted: it
+//! classifies any such raise and returns the human-readable reason. The CLI maps
+//! `Some(_)` from it onto the stable external signal — the single stderr line
+//! `beam_rt: unsupported: <reason>` and exit code
+//! [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED) — which the differential harness
+//! keys off. Classification must go through [`unsupported_reason`] rather than
+//! [`BeamError::as_atom`], because the latter returns `None` for an
+//! [`ExitReason::Atom`](beam_common::ExitReason::Atom) backed by an owned `String`
+//! (which every message here is).
 
 use std::path::PathBuf;
 
 use beam_common::{BeamError, ExitReason, Raise};
+
+/// The prefix every capability-gap reason atom starts with (see the module docs).
+pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
 
 /// A message-carrying `error`-class raise — the runtime's general diagnostic.
 pub(crate) fn message(text: impl Into<String>) -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom(text.into())))
 }
 
-/// An unrecognized command-line switch (contract A.6: never silently ignored).
+/// The reason of a [`BeamError::Raise`], as an atom name, when there is one.
+///
+/// Reads through [`ExitReason::as_atom`], which — unlike
+/// [`BeamError::as_atom`] — also sees atoms backed by an owned `String` (every
+/// message this module builds). Every other error is `None`.
+fn raise_reason(error: &BeamError) -> Option<&str> {
+    match error {
+        BeamError::Raise(raise) => raise.reason.as_atom(),
+        _ => None,
+    }
+}
+
+/// Classifies `error` as a **capability gap**, returning the human-readable reason.
+///
+/// Returns `Some(reason)` iff `error` is a raise whose reason atom starts with
+/// [`UNSUPPORTED_PREFIX`]; the reason is that atom with the leading `unsupported`
+/// token and any following `:`, `_` or whitespace stripped — so `unsupported: X`
+/// becomes `X`, `unsupported_opcode: Y` becomes `opcode: Y` and `unsupported_bif`
+/// becomes `bif`.
+///
+/// This is the single interpretation of the convention (see the module docs): the
+/// CLI turns `Some(_)` into the `beam_rt: unsupported: <reason>` stderr line and exit
+/// code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED). A `None` means the error
+/// is a genuine runtime error or a usage error, classified by the caller as usual.
+pub(crate) fn unsupported_reason(error: &BeamError) -> Option<String> {
+    let reason = raise_reason(error)?;
+    let rest = reason.strip_prefix(UNSUPPORTED_PREFIX)?;
+    Some(
+        rest.trim_start_matches(|c: char| c == ':' || c == '_' || c.is_whitespace())
+            .to_string(),
+    )
+}
+
+/// An unrecognized command-line switch.
+///
+/// A switch outside the documented A.6 surface is a **capability gap**, not a usage
+/// error: real `erl` treats an unmodeled switch as an init argument (verified:
+/// `erl -noshell --nope -eval 'halt(0).'` exits 0), so it is classified as
+/// *unsupported* and named in the message (contract A.6: never silently ignored).
 pub(crate) fn unknown_switch(switch: &str) -> BeamError {
-    message(format!("unknown switch {switch:?}"))
+    unsupported(&format!("unknown switch {switch:?}"))
 }
 
 /// A malformed value of a *recognized* switch (e.g. `+P x`).
@@ -85,14 +145,19 @@ pub(crate) fn unknown_function(module: &str, function: &str, arity: u32) -> Beam
     message(format!("{module}:{function}/{arity} is not exported"))
 }
 
-/// A malformed `-eval` expression.
+/// A `-eval` expression outside the supported integer-expression subset.
+///
+/// The grammar is a documented Milestone-1 capability-gap boundary, so a rejection
+/// here is classified as *unsupported* (exit code
+/// [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) — distinct from a genuine
+/// runtime error such as an arithmetic overflow, which comes from the BIF.
 pub(crate) fn bad_eval(expr: &str, detail: &str) -> BeamError {
-    message(format!("cannot evaluate {expr:?}: {detail}"))
+    unsupported(&format!("cannot evaluate {expr:?}: {detail}"))
 }
 
 /// An operation the Milestone-1 runtime does not implement.
 pub(crate) fn unsupported(what: &str) -> BeamError {
-    message(format!("unsupported: {what}"))
+    message(format!("{UNSUPPORTED_PREFIX}: {what}"))
 }
 
 #[cfg(test)]
@@ -102,10 +167,50 @@ mod tests {
     #[test]
     fn message_errors_render_their_text() {
         let error = unknown_switch("--nope");
-        assert_eq!(error.to_string(), "error unknown switch \"--nope\"");
+        assert_eq!(
+            error.to_string(),
+            "error unsupported: unknown switch \"--nope\""
+        );
         assert!(error.is_raise());
     }
 
+    #[test]
+    fn capability_gaps_are_classified_and_stripped() {
+        // The constructors here build owned atoms (`unsupported: …`).
+        assert_eq!(
+            unsupported_reason(&unknown_switch("--nope")).as_deref(),
+            Some("unknown switch \"--nope\"")
+        );
+        assert_eq!(
+            unsupported_reason(&bad_eval("1+", "unexpected end")).as_deref(),
+            Some("cannot evaluate \"1+\": unexpected end")
+        );
+        assert_eq!(
+            unsupported_reason(&unsupported("operator /")).as_deref(),
+            Some("operator /")
+        );
+        // The engine's `unsupported_opcode: <what>` raise — an OWNED atom, invisible
+        // to `BeamError::as_atom`, so this exercises the owned-atom path.
+        let engine = BeamError::Raise(Raise::error(ExitReason::atom(String::from(
+            "unsupported_opcode: x",
+        ))));
+        assert_eq!(engine.as_atom(), None);
+        assert_eq!(unsupported_reason(&engine).as_deref(), Some("opcode: x"));
+        // The BIF registry's bare `unsupported_bif` atom.
+        let bif = BeamError::Raise(Raise::error(ExitReason::atom(String::from(
+            "unsupported_bif",
+        ))));
+        assert_eq!(unsupported_reason(&bif).as_deref(), Some("bif"));
+    }
+
+    #[test]
+    fn genuine_errors_are_not_classified_as_capability_gaps() {
+        assert_eq!(unsupported_reason(&missing_value("-eval")), None);
+        assert_eq!(unsupported_reason(&module_not_found("slice", &[])), None);
+        assert_eq!(unsupported_reason(&unknown_info_key("nonsense")), None);
+        assert_eq!(unsupported_reason(&BeamError::BadArg), None);
+        assert_eq!(unsupported_reason(&BeamError::SystemLimit), None);
+    }
     #[test]
     fn unknown_info_key_is_bare_badarg() {
         assert!(matches!(unknown_info_key("nonsense"), BeamError::BadArg));

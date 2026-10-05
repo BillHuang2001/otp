@@ -40,7 +40,7 @@ pub mod info;
 pub mod runtime;
 
 pub use crate::boot::{boot_banner, PreloadedModules};
-pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_USAGE, USAGE};
+pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE};
 pub use crate::config::{Action, EmulatorConfig, RuntimeConfig, DEFAULT_HEAP_WORDS};
 pub use crate::context::RuntimeContext;
 pub use crate::eval::eval;

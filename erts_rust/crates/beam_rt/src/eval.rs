@@ -4,7 +4,10 @@
 //! integer literals, the binary operators `+`, `-` and `*` (`*` binds tighter than
 //! `+`/`-`) and parentheses, with ASCII whitespace allowed between tokens. Anything
 //! else — a float, a division, an atom, a trailing operator — is a typed
-//! [`BeamError`], never a panic.
+//! [`BeamError`], never a panic. Such a rejection is a **capability gap** (the
+//! documented subset boundary): [`crate::error::unsupported_reason`] classifies it,
+//! so the CLI reports it as *unsupported* (exit 3), distinct from a genuine BIF error
+//! (exit 1) such as an arithmetic `system_limit`.
 //!
 //! The arithmetic itself is **not** re-implemented here: every operator is dispatched
 //! through the [`beam_bifs`] `erlang` registry (`erlang:'+'/2`, `erlang:'-'/2`,
@@ -329,11 +332,25 @@ mod tests {
     }
 
     #[test]
+    fn grammar_errors_are_classified_as_capability_gaps() {
+        // A rejection by the documented subset is a capability gap (exit 3), not a
+        // genuine runtime error: `error::unsupported_reason` must classify it.
+        for expr in ["1.5", "2+", "abc", ""] {
+            let error = run(expr).expect_err("outside the subset");
+            assert!(
+                crate::error::unsupported_reason(&error).is_some(),
+                "{expr:?} must classify as unsupported: {error}"
+            );
+        }
+    }
+
+    #[test]
     fn arithmetic_errors_come_from_the_bif() {
         // `5 * 10^17` fits a small integer; doubling it does not, so the failure is
         // produced by the `erlang:'*'/2` BIF (`system_limit`) rather than by a check
         // re-implemented in this module.
         let error = run("0-(500000000000000000*2)").expect_err("out of range");
         assert_eq!(error.as_atom(), Some("system_limit"));
+        assert_eq!(crate::error::unsupported_reason(&error), None);
     }
 }

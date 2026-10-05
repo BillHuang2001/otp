@@ -1,6 +1,6 @@
 //! The command-line surface: the A.6 parser, the usage text and the driver.
 //!
-//! # The supported subset (the *complete* surface — anything else is an error)
+//! # The supported subset (the *complete* surface — anything else is unsupported)
 //!
 //! | Switch | Meaning |
 //! |---|---|
@@ -16,13 +16,24 @@
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `run File Mod:Func/Arity [Int…]` | load `File`, run the function and print the result |
 //!
-//! A switch that is not in this table is a **parse error naming it** — never silently
-//! ignored (contract A.6).
+//! A switch that is **not** in this table is a **capability gap**, not a usage error:
+//! real `erl` accepts unmodeled switches as init arguments (verified:
+//! `erl -noshell --nope -eval 'halt(0).'` exits 0), so it is reported as *unsupported*
+//! with the switch named and no usage text — never silently ignored (contract A.6).
 //!
-//! # Exit codes
+//! # Exit codes (the stable external contract)
 //!
-//! `0` success · `1` runtime error (a load/execute/BIF failure) · `2` usage or parse
-//! error.
+//! | Code | Meaning | stderr |
+//! |---|---|---|
+//! | `0` | success | — |
+//! | `1` | genuine runtime error (a load/execute/BIF failure) | `beam_rt: <error>` |
+//! | `2` | malformed invocation / usage error | `beam_rt: <error>` then [`USAGE`] |
+//! | `3` | unsupported (capability gap) | exactly one line, `beam_rt: unsupported: <reason>` |
+//!
+//! The `beam_rt: unsupported: ` prefix (with its trailing space) is the signal the
+//! differential harness keys off; it is emitted on **no** other path, and the
+//! unsupported path prints no usage text. See [`error::unsupported_reason`] for how a
+//! capability gap is classified.
 
 use std::path::{Path, PathBuf};
 
@@ -36,7 +47,7 @@ use crate::config::{Action, EmulatorConfig, RuntimeConfig, DEFAULT_HEAP_WORDS};
 use crate::error;
 use crate::runtime::Runtime;
 
-/// The usage text, printed on a parse error.
+/// The usage text, printed on a usage (exit 2) error.
 pub const USAGE: &str = "\
 Usage: beam_rt [switch...] [action]
 
@@ -54,21 +65,35 @@ Switches:
 
 Actions:
   run FILE MOD:FUNC/ARITY [INT...]
-                            load FILE, run MOD:FUNC/ARITY and print the result";
+                            load FILE, run MOD:FUNC/ARITY and print the result
+
+Exit codes:
+  0  success        1  runtime error        2  usage error        3  unsupported";
 
 /// The exit code of a successful run.
 pub const EXIT_OK: i32 = 0;
-/// The exit code of a runtime error (load/execute/BIF failure).
+/// The exit code of a genuine runtime error (a load/execute/BIF failure).
 pub const EXIT_RUNTIME: i32 = 1;
-/// The exit code of a usage or parse error.
+/// The exit code of a malformed invocation / usage error.
 pub const EXIT_USAGE: i32 = 2;
+/// The exit code of an **unsupported** operation (a Milestone-1 capability gap).
+///
+/// Printed to stderr as the single line `beam_rt: unsupported: <reason>`. Distinct
+/// from [`EXIT_RUNTIME`] (a genuine failure) and [`EXIT_USAGE`] (a malformed
+/// invocation) so the differential harness can tell "not implemented yet" apart from
+/// "broken" and "badly invoked".
+pub const EXIT_UNSUPPORTED: i32 = 3;
 
 /// Parses `args` (which **exclude** `argv[0]`) into a [`RuntimeConfig`].
 ///
 /// # Errors
 ///
 /// A message-carrying [`beam_common::BeamError`] naming the offending switch or
-/// argument; the caller prints it together with [`USAGE`] and exits
+/// argument. The caller distinguishes two classes via
+/// [`error::unsupported_reason`]: a **capability gap** (an unrecognized switch, or a
+/// malformed `-eval` expression) is reported as unsupported and exits
+/// [`EXIT_UNSUPPORTED`] with no usage text; a genuine usage error (a missing operand,
+/// a malformed value, a stray argument) printed together with [`USAGE`] exits
 /// [`EXIT_USAGE`].
 pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
     let mut builder = Builder {
@@ -282,10 +307,19 @@ fn split_spec(spec: &str) -> Result<(String, String, u32)> {
 ///
 /// `args` excludes `argv[0]`. Diagnostics go to stderr; program output (the `~p`
 /// printer, `io:format`) goes to stdout.
+///
+/// The exit code follows the documented contract (module docs): `0` success, `1` a
+/// genuine runtime error, `2` a usage error (with [`USAGE`]) and `3` an unsupported
+/// capability gap — on which a single `beam_rt: unsupported: <reason>` line is printed
+/// and no usage text. A capability gap is recognized with
+/// [`error::unsupported_reason`] on **both** the parse-error and the drive-error path.
 pub fn run(args: Vec<String>) -> i32 {
     let config = match parse(&args) {
         Ok(config) => config,
         Err(error) => {
+            if let Some(reason) = error::unsupported_reason(&error) {
+                return report_unsupported(&reason);
+            }
             eprintln!("beam_rt: {error}");
             eprintln!("{USAGE}");
             return EXIT_USAGE;
@@ -294,12 +328,23 @@ pub fn run(args: Vec<String>) -> i32 {
     match drive(config) {
         Ok(()) => EXIT_OK,
         Err(error) => {
+            if let Some(reason) = error::unsupported_reason(&error) {
+                return report_unsupported(&reason);
+            }
             eprintln!("beam_rt: {error}");
             EXIT_RUNTIME
         }
     }
 }
 
+/// Reports a capability gap on stderr and returns [`EXIT_UNSUPPORTED`].
+///
+/// Prints **exactly one** line — `beam_rt: unsupported: <reason>` — and no usage text;
+/// this stable signal is what the differential harness keys off.
+fn report_unsupported(reason: &str) -> i32 {
+    eprintln!("beam_rt: unsupported: {reason}");
+    EXIT_UNSUPPORTED
+}
 /// Dispatches the parsed action against a fresh runtime.
 fn drive(config: RuntimeConfig) -> Result<()> {
     let action = config.action.clone();
@@ -552,15 +597,21 @@ mod tests {
     }
 
     #[test]
-    fn unknown_switches_are_errors_naming_the_switch() {
-        let error = parse_args(&["--nope"]).expect_err("unknown switch");
-        assert!(error.to_string().contains("--nope"), "{error}");
-        let error = parse_args(&["+Weird"]).expect_err("unknown switch");
-        assert!(error.to_string().contains("+Weird"), "{error}");
-        let error = parse_args(&["-emu_flavor", "emu"]).expect_err("out of scope");
-        assert!(error.to_string().contains("-emu_flavor"), "{error}");
+    fn unknown_switches_are_unsupported_and_name_themselves() {
+        for args in [
+            &["--nope"][..],
+            &["+Weird"][..],
+            &["-emu_flavor", "emu"][..],
+        ] {
+            let error = parse_args(args).expect_err("an unmodeled switch is unsupported");
+            let reason = error::unsupported_reason(&error)
+                .unwrap_or_else(|| panic!("{args:?} must classify as unsupported: {error}"));
+            assert!(reason.contains(args[0]), "{reason}");
+        }
+        // A stray positional argument is a *usage* error, not a capability gap.
         let error = parse_args(&["junk"]).expect_err("stray argument");
         assert!(error.to_string().contains("junk"), "{error}");
+        assert_eq!(error::unsupported_reason(&error), None);
     }
 
     #[test]
@@ -587,6 +638,7 @@ mod tests {
         assert_eq!(EXIT_OK, 0);
         assert_eq!(EXIT_RUNTIME, 1);
         assert_eq!(EXIT_USAGE, 2);
+        assert_eq!(EXIT_UNSUPPORTED, 3);
     }
 
     #[test]
@@ -595,10 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn a_parse_error_exits_with_the_usage_code() {
-        assert_eq!(run(vec!["--nope".to_string()]), EXIT_USAGE);
+    fn a_usage_error_exits_with_the_usage_code() {
+        // A genuine usage error: a missing operand of a known switch and a stray
+        // positional argument.
+        assert_eq!(run(vec!["-eval".to_string()]), EXIT_USAGE);
+        assert_eq!(run(vec!["junk".to_string()]), EXIT_USAGE);
     }
 
+    #[test]
+    fn an_unsupported_operation_exits_with_the_unsupported_code() {
+        // An unmodeled switch (parse path) …
+        assert_eq!(run(vec!["--nope".to_string()]), EXIT_UNSUPPORTED);
+        // … and an `-eval` expression outside the supported grammar (drive path).
+        assert_eq!(
+            run(vec!["-eval".to_string(), "1+".to_string()]),
+            EXIT_UNSUPPORTED
+        );
+    }
     #[test]
     fn eval_action_dispatches_through_the_registry() {
         assert_eq!(run(vec!["-eval".to_string(), "2+3".to_string()]), EXIT_OK);
