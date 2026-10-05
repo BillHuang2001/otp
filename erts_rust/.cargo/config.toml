@@ -1,26 +1,23 @@
 # Cargo build configuration for the Rust ERTS rewrite.
 #
 # Goal: maximize DEVELOPER ITERATION SPEED (see objective) without compromising release quality.
-#  - `mold` is the fastest Linux linker; it dominates incremental link time for a workspace this size.
-#  - `lld` is the portable fallback if mold is unavailable.
-#  - RUSTFLAGS are intentionally minimal so per-crate overrides stay possible.
+# Link time dominates incremental builds for a workspace this size, so we route linking through a
+# fast linker. The `Nix` devShell (../flake.nix) provides `mold` + `clang` and overrides the env
+# vars below; in a bare container we fall back to the always-present `cc` driver with `lld`.
+#
+# Precedence note: `CARGO_TARGET_<triple>_LINKER` / `..._RUSTFLAGS` env vars (set by the devShell)
+# take precedence over these config values.
 
 [build]
-# Uncomment to default to the JIT-enabled runtime binary while iterating.
-# default-members = ["crates/beam_rt"]
+# Keep incremental + debug info settings in the workspace profile (see ../Cargo.toml).
 
 [target.x86_64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
-
-# Portable fallback on hosts without mold: use `--config` to override, or switch the linker here.
-# [target.x86_64-unknown-linux-gnu]
-# linker = "clang"
-# rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+linker = "cc"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [target.aarch64-unknown-linux-gnu]
-linker = "clang"
-rustflags = ["-C", "link-arg=-fuse-ld=mold"]
+linker = "cc"
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 
 [alias]
 # Convenience aliases for the common iteration loop.

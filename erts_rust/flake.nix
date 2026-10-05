@@ -57,10 +57,15 @@
           ERTS_ORACLE = "${pkgs.erlang}/bin/erl";
 
           shellHook = ''
+            # Prefer mold (fastest) in the devShell; overrides .cargo/config.toml's `cc`+lld fallback.
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_LINKER=clang
+            export CARGO_TARGET_X86_64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_LINKER=clang
+            export CARGO_TARGET_AARCH64_UNKNOWN_LINUX_GNU_RUSTFLAGS="-C link-arg=-fuse-ld=mold"
             echo "Rust ERTS rewrite dev shell"
             echo "  rustc:  $(rustc --version)"
             echo "  oracle: $(erl -noshell -eval 'io:format("~s~n",[erlang:system_info(otp_release)]),halt().' 2>/dev/null || echo 'erl n/a')"
-            echo "  linker: mold (configured in .cargo/config.toml)"
+            echo "  linker: clang + mold (devShell override)"
           '';
         };
       });
