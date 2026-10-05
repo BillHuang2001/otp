@@ -56,7 +56,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `ct_groups.erl` — parses/validates `groups/0` and `group/1` definitions and resolves group paths to testcase/repeat specs: `find_groups/4, make_all_conf/3,4, make_conf/5, delete_subs/2, expand_groups/3, search_and_override/3`.
 - `ct_repeat.erl` — implements the `repeat`/`duration`/`until`/`force_stop` options: `loop_test/2` reruns the whole run and `abort/0` stops it.
 - `ct_make.erl` — compiles suites/support modules and builds `-include` paths for a run (uses the `ct_make_ref` registered process for parallel compile scheduling).
-- `ct_rpc.erl` — convenience wrapper around `rpc` with timeouts/error mapping (`call/4,5`, `cast/4`, `app_node/2,3`, `get_node/0`).
+- `ct_rpc.erl` — convenience wrapper around `rpc` with timeouts/error mapping: `app_node/2,3,4`, `call/4,5,6`, `cast/4,5`.
 - `ct_default_gl.erl` — minimal group leader replacement (registered/conventional) so IO is never lost.
 - `ct_gen_conn.erl` — generic connection-handler framework: a `gen_server` behaviour implementation a connection module (e.g. `unix_telnet`) plugs into; `start/4, stop/1, get_conn_pid/1, call/2,3, return/2, log/3, start_log/1, cont_log/2, end_log/0, make_opts/1`.
 
