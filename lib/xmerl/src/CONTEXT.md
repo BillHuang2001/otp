@@ -58,7 +58,7 @@ Undocumented (`-moduledoc false`) support modules, grouped by role — see Modul
 ## Notes for Agents
 - `ebin/` and the generated `*.erl` are build output — never edit or commit them; the tracks-in-git sources are the 27 hand-written `.erl` files, 6 `.erlsrc`, 3 `.yrl`, 3 internal `.hrl`, `Makefile`, `xmerl.app.src`, `xmerl.appup.src`.
 - `xmerl.hrl` is found via `-I ../include`, so `-include("xmerl.hrl")` in a source here refers to the public header — do not "fix" those paths.
-- The `.erlsrc` files have no licence header of their own beyond the base; the generated `.erl` inherits the head's header, which is why encoding heads start with a full copyright block.
+- Both `.erlsrc` halves carry their own copyright block, so a concatenated `xmerl_sax_parser_<enc>.erl` starts with the encoding head's header and then contains the base's header inline at the "Start of common source" marker — edit the `.erlsrc` halves, not the concatenation.
 - `xmerl_ucs` predates the `unicode` module and is still the conversion layer used by `xmerl_scan`/`xmerl_lib`; do not assume `unicode` is used for all charset handling.
 
 ## Dependencies
