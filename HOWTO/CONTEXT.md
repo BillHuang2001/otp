@@ -54,6 +54,7 @@ Reference/manual documentation for the *product* lives in `../system/` and the p
 - `../TAR.include` lists `HOWTO/MARKDOWN.md`, which does not exist in the tree (it was removed when docs moved to ExDoc). No in-repo build script consumes `TAR.include` — only `../scripts/license-header.es`'s ignore list mentions it — so nothing breaks; flagged here because it is how an outsider notices the stale entry.
 - `DEVELOPMENT.md` explicitly warns that the non-`test`/non-`docs` make targets it showcases are *internal and unsupported* (no stability guarantee); treat only `INSTALL.md`/`TESTING.md` targets as the supported surface.
 - `INSTALL-WIN32-OLD.md` documents an environment the OTP team no longer tests; prefer `INSTALL-WIN32.md` and treat the OLD file as historical reference only.
+- Naming gotcha: this directory's file is `OTP-PATCH-APPLY.md`, but `../system/doc/docs.exs` still declares its published copy's `source:` as `../../HOWTO/INSTALL-PATCH-APPLY.md` (no such file). The Makefile pattern rule maps `installation_guide/OTP-PATCH-APPLY.md` from the correct path, so only that `source:` hint is stale.
 
 ## Dependencies
 - Documents describe external tooling rather than depending on it: GNU make/autoconf, gcc/clang, MSVC+WSL1 (Windows), Xcode (iOS), Android NDK, crosstool-ng (Raspberry Pi), OpenSSL, wxWidgets, JDK (`jinterface`), `ex_doc` (+ Elixir ≥ 1.16 for the link checker), valgrind, clang ASan, DTrace/SystemTap, Go + `vexctl` and Java/Gradle + ORT/scancode (SBOM/VEX).
