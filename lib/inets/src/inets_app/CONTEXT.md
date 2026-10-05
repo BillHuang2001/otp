@@ -64,7 +64,8 @@ The top supervisor restart strategy is `one_for_one` with intensity 10/3600 beca
 `inets:start/1` calls `application:ensure_all_started(ssl)` and discards the result while `inets:start/0` does not touch ssl at all — with `start/0` a later HTTPS request fails unless the caller started ssl.
 `inets.mk` still adds `-Dinets_trace_io` (when `INETS_TRACE=io`) and `-Dinets_debug` (when `INETS_DEBUG=true`), but no source under `lib/inets/src/` tests those macros any longer; `../test/Makefile` also adds `-Dinets_debug` — the flags are vestigial.
 `inets_internal.hrl`'s `?report*` macros are only reached through `../http_client/httpc_internal.hrl` (`hcri/hcrv/hcrd/hcrt`); the http_server/http_lib modules include the header only for the HTTP character macros, so httpd emits no inets trace events.
-`inets.config` in this directory is a stale example (`{httpd, "/var/tmp/server_root/conf/8888.conf"}` etc.), not installed and not used by any build or test; the config actually used by the test suites is `../test/inets.config`.
+`inets.config` in this directory (`{httpd, "/var/tmp/server_root/conf/8888.conf"}` etc.) and `../test/inets.config` (a single dead `/ldisk/tests/bmk/inets/priv_dir/8099.conf` path) are both stale, unused example app-env files — not installed/used by the build and read by no test suite.
+The suites start httpd/httpc directly with proplist configs (via `../test/inets_test_lib.erl`/`../test/httpd_test_lib.erl`) instead.
 `inets.erl` relies on targeted warning suppressions (`nowarn_deprecated_function` for `erlang:exit/2`, `nowarn_possibly_unsafe_function` for `file:consult/1`); do not drop them without changing the corresponding calls.
 `inets_sup:get_services/0` matches only `{httpc, Conf}`, `{httpd, Conf}` and `{httpd, Address, Port}` — a malformed or 3-tuple httpc entry is ignored without any error or log.
 
