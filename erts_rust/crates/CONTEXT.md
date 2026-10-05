@@ -86,10 +86,14 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_rt` | boot/CLI/`system_info` + end-to-end vertical-slice integration test |
 
 ## Constraints
-- **Keep the workspace green**: `../scripts/cargo.sh test --workspace` must pass after every wave.
-  Per-crate gate: `../scripts/cargo.sh test -p <crate>`.
-- **Build env:** sandbox `$HOME` is read-only — always run cargo via `../scripts/cargo.sh` (sets a
-  writable `CARGO_HOME`). Never `cd`; pass `--manifest-path`/`-p` instead. Never edit `../tools/`.
+- **Keep the workspace green**: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`
+  must pass after every wave. Per-crate gate:
+  `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p <crate>`.
+- **Build env:** sandbox `$HOME` is read-only — always run cargo via the wrapper
+  `erts_rust/scripts/cargo.sh` (sets a writable `CARGO_HOME`). The cargo workspace manifest is
+  `erts_rust/Cargo.toml`, NOT the repo root, so from the repo root ALWAYS pass
+  `--manifest-path erts_rust/Cargo.toml` (a bare `cargo -p <crate>` from the root fails: "could not
+  find Cargo.toml"). Never `cd`. Never edit `../tools/`.
 - Every crate ships a `CONTEXT.md` (Intent, API Surface, Constraints, Test Strategy, Routing Table)
   **before** dependents are designed against it.
 
