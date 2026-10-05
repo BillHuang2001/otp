@@ -58,7 +58,7 @@ Every `lib/<app>/` follows the same schema (some dirs optional per app):
 | `et/` | Event Tracer (GUI tracing tool) |
 | `eunit/` | EUnit lightweight unit-test framework |
 | `ftp/` | FTP client |
-| `inets/` | INET services: HTTP client/server, FTP, TFTP frontends (`inets_app/`) |
+| `inets/` | HTTP client (`httpc`) + HTTP server (`httpd`) and the `inets` service API (sources split across `src/{inets_app,http_lib,http_client,http_server}`) |
 | `jinterface/` | Java classes for Jinterface (Java↔Erlang `OtpNode`/`OtpMbox`) |
 | `kernel/` | Kernel — core OTP app (files, code loading, distribution, logger, inet) |
 | `megaco/` | Megaco/H.248 media gateway control protocol stack |
