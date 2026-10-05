@@ -92,5 +92,5 @@ Sources live in `../src/` and are handled elsewhere — this node only documents
 
 ## See Also
 - `../CONTEXT.md` — the ssl application node; `../src/CONTEXT.md` — implementation modules under test.
-- `../../make/test_target_script.sh` — the harness behind `make test` (`TEST_NEEDS_RELEASE`, `SPEC_POSTFIX`, `ARGS`).
+- `../../../make/test_target_script.sh` — the harness behind `make test` (`TEST_NEEDS_RELEASE`, `SPEC_POSTFIX`, `ARGS`).
 - `../../../HOWTO/TESTING.md` — general Erlang/OTP test instructions.
