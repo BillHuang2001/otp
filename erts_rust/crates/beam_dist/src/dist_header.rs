@@ -1,165 +1,364 @@
-//! The distribution-header envelope (`'D'`) plus the atom-cache refs and the
-//! fragment tags.
+//! The distribution header (`'D'`): its atom-cache refs and the fragment tags.
 //!
-//! Ground truth: `erts/emulator/beam/external.h` (the `'D'`/`'E'`/`'F'`/`'H'`/
-//! `'R'`/`'N'` tags) and `erts/emulator/beam/external.c` (the header layout:
-//! `'D' + len(4) + flags(1) + refs`).
+//! # The wire format (byte-exact, big-endian)
 //!
-//! Fidelity note (M1 model): the tag bytes are the frozen C ones, but this module
-//! models the envelope as `'D' + len(4) + flags(1) + refs` with a fixed 3-byte ref.
-//! The wire image produced by `erts_encode_ext_dist_header_finalize`
-//! (`external.c`) is in fact `VERSION_MAGIC + 'D' + NumberOfAtomCacheRefs(1) +
-//! half-byte flag field(s) + refs`, where a ref is a `CachedAtomRef` (one index
-//! byte) or a `NewAtomCacheRef` (index + length + atom text) and the segment lives
-//! in the flag half-bytes; the `'R'` + segment + index shape below is the *term*
-//! level `ATOM_CACHE_REF` tag (`external.c` `case ATOM_CACHE_REF:`). Byte-exact
-//! rendering of the real header is therefore deferred (see the crate
-//! `CONTEXT.md`, "Known Issues").
+//! A **normal** (non-fragmented) distribution header, exactly as documented in
+//! `erts/doc/guides/erl_ext_dist.md` §"Normal Distribution Header" and produced
+//! by `erts_encode_ext_dist_header_finalize` (`erts/emulator/beam/external.c`):
+//!
+//! ```text
+//! byte   131            VERSION_MAGIC
+//! byte   68 ('D')       DIST_HEADER
+//! byte   N              NumberOfAtomCacheRefs           (0 <= N <= 255)
+//! bytes  Flags          N/2 + 1 bytes when N > 0; OMITTED entirely when N == 0
+//! bytes  AtomCacheRefs  N refs, in AtomCacheReferenceIndex order 0 .. N-1
+//! ```
+//!
+//! ## Flags
+//!
+//! Flag byte `k` holds the half-byte flag of ref `2k` in its **low** nibble and of
+//! ref `2k+1` in its **high** nibble. Each ref half-byte is a 1-bit
+//! `NewCacheEntryFlag` in the MSB plus the 3-bit `SegmentIndex` in the low bits
+//! (`(segment & 0x7) | (new << 3)`).
+//!
+//! One extra half-byte carries `LongAtoms`: when `N` is **even** it is the low
+//! nibble of the byte that follows the ref-flag bytes (flag byte `N/2`, the extra
+//! byte); when `N` is **odd** it is the high nibble of the last ref-flag byte
+//! (flag byte `(N-1)/2`). `LongAtoms` is the LSB of that half-byte; the other
+//! three bits are `CurrentlyUnused` (zero).
+//!
+//! ## AtomCacheRefs
+//!
+//! Each ref is one of:
+//! * `CachedAtomRef` — `InternalSegmentIndex(1 byte)`.
+//! * `NewAtomCacheRef` — `InternalSegmentIndex(1 byte)` + `Length` +
+//!   `AtomText(Length bytes)`, where `Length` is 1 byte, or 2 bytes big-endian
+//!   when `LongAtoms` is set. `AtomText` is UTF-8 when [`DFLAG_UTF8_ATOMS`] was
+//!   negotiated in the handshake, otherwise Latin-1; this codec models that as a
+//!   caller-selected [`AtomEncoding`].
+//!
+//! The 3-bit `SegmentIndex` lives in the flag half-byte; only the
+//! `InternalSegmentIndex` byte is written alongside the ref. Together they
+//! identify a slot in the 8-segment × 256-entry distribution atom cache.
+//!
+//! [`DFLAG_UTF8_ATOMS`]: crate::flags::DFLAG_UTF8_ATOMS
+//!
+//! # Pass-through: when there is no header at all
+//!
+//! With neither an atom cache (`DFLAG_DIST_HDR_ATOM_CACHE`) nor fragmentation
+//! (`DFLAG_FRAGMENTS`) negotiated, ERTS writes a single `PASS_THROUGH` byte in
+//! place of the header (`external.c` `erts_encode_ext_dist_header_setup`), and the
+//! control term that follows carries its own `VERSION_MAGIC`. This codec models
+//! **only the header-when-present** case; the pass-through form is a wire-level
+//! decision made by the distribution sender/receiver, not a header codec.
+//!
+//! # Fragmented header (`'E'`/`'F'`)
+//!
+//! The fragment tags [`DIST_FRAG_HEADER`] (`'E'`, which extends the normal header
+//! with an 8-byte sequence id and an 8-byte fragment count before
+//! `NumberOfAtomCacheRefs`) and [`DIST_FRAG_CONT`] (`'F'` + sequence id + fragment
+//! index) are **recognised** through [`DistFragment`] but their assembly is out of
+//! scope for this milestone (see the crate `CONTEXT.md`, "Known Issues").
+//!
+//! Ground truth (read, never modified): `erts/emulator/beam/external.c`
+//! (`erts_encode_ext_dist_header_setup`/`_finalize`, `erts_prepare_dist_ext`),
+//! `erts/emulator/beam/external.h` and the
+//! `erts/doc/guides/erl_ext_dist.md` guide.
 
+use beam_codec::AtomEncoding;
 use beam_common::{BeamError, Result};
-use beam_term::Atom;
+use beam_term::{Atom, AtomTable};
 
 use crate::transport::Write;
 
-/// `DIST_HEADER` (`'D'`): the distribution-header tag.
-pub const DIST_HEADER: u8 = b'D';
-/// `DIST_FRAG_HEADER` (`'E'`): the first fragment of a fragmented message.
-pub const DIST_FRAG_HEADER: u8 = b'E';
-/// `DIST_FRAG_CONT` (`'F'`): a continuation fragment.
-pub const DIST_FRAG_CONT: u8 = b'F';
-/// `HOPEFUL_DATA` (`'H'`): a message sent optimistically before the handshake
-/// completed.
-pub const HOPEFUL_DATA: u8 = b'H';
-/// `ATOM_CACHE_REF` (`'R'`): a single atom-cache reference.
-pub const ATOM_CACHE_REF: u8 = b'R';
-/// `NEW_CACHE` (`'N'`): an atom-cache segment update.
-pub const NEW_CACHE: u8 = b'N';
-
-/// `DIST_HEADER_FLAG_ATOM_CACHE`: the distribution-header flag bit announcing
-/// that atom-cache references follow.
-pub const DIST_HEADER_FLAG_ATOM_CACHE: u8 = 0x01;
-
-/// A single atom-cache reference.
+/// `DIST_HEADER` (`'D'`, 68): the normal distribution-header tag.
 ///
-/// Layout: `'R' + (segment << 1 | internal) + atom_index`.
-#[derive(Clone, PartialEq, Eq, Hash, Debug)]
-pub struct AtomCacheRef {
-    /// The cache segment (0-7).
-    pub segment: u8,
-    /// Whether the reference is "internal" (bit 0 of the segment byte).
-    pub internal: bool,
-    /// The referenced atom.
-    pub atom: Atom,
+/// The value is re-exported from [`beam_codec::DIST_HEADER_EXT`] rather than
+/// redefined, so the byte is pinned in exactly one place.
+pub const DIST_HEADER: u8 = beam_codec::DIST_HEADER_EXT;
+/// `DIST_FRAG_HEADER` (`'E'`, 69): the first fragment of a fragmented message.
+///
+/// Recognised, but fragment assembly is not implemented in this milestone.
+pub const DIST_FRAG_HEADER: u8 = 69;
+/// `DIST_FRAG_CONT` (`'F'`, 70): a continuation fragment of a fragmented message.
+///
+/// Recognised, but fragment assembly is not implemented in this milestone.
+pub const DIST_FRAG_CONT: u8 = 70;
+
+/// `ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (`erts/emulator/beam/external.h:120`):
+/// the largest `NumberOfAtomCacheRefs` a single distribution header may carry.
+///
+/// The count field is one byte wide, so this is the natural ceiling (`255`); the
+/// decoder additionally rejects any count whose refs do not fit the body.
+pub const MAX_ATOM_CACHE_REFS: usize = 255;
+
+/// The number of distribution atom-cache segments: 8 segments × 256 entries =
+/// 2048 slots (`erl_ext_dist.md` §"Normal Distribution Header").
+pub const ATOM_CACHE_SEGMENTS: u8 = 8;
+
+/// One entry of a distribution header's `AtomCacheRefs` field.
+///
+/// The 3-bit [`segment`](AtomCacheRef::segment) is stored in the header's
+/// half-byte flag field; the 8-bit [`index`](AtomCacheRef::index) is the
+/// `InternalSegmentIndex` written next to the reference on the wire.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub enum AtomCacheRef {
+    /// A `CachedAtomRef`: a reference to an atom already present in the cache.
+    ///
+    /// Wire shape: `InternalSegmentIndex(1 byte)`.
+    Cached {
+        /// The 3-bit `SegmentIndex` (`0..=7`), carried in the flag half-byte.
+        segment: u8,
+        /// The 8-bit `InternalSegmentIndex`, carried next to the reference.
+        index: u8,
+    },
+    /// A `NewAtomCacheRef`: this header installs the atom into the cache.
+    ///
+    /// Wire shape: `InternalSegmentIndex(1 byte)` + `Length` + `AtomText`.
+    New {
+        /// The 3-bit `SegmentIndex` (`0..=7`), carried in the flag half-byte.
+        segment: u8,
+        /// The 8-bit `InternalSegmentIndex`, carried next to the reference.
+        index: u8,
+        /// The atom identity; its name (rendered from the [`AtomTable`]) is the
+        /// `AtomText`.
+        atom: Atom,
+    },
 }
 
 impl AtomCacheRef {
-    /// Encodes the reference (tag + fields).
-    ///
-    /// The atom index is written as a single byte (its low 8 bits), matching the
-    /// frozen 1-byte index field of the wire format.
-    pub fn encode<W: Write>(&self, w: &mut W) -> Result<()> {
-        w.write_u8(ATOM_CACHE_REF)?;
-        w.write_u8((self.segment << 1) | u8::from(self.internal))?;
-        w.write_u8(self.atom.raw() as u8)
+    /// The ref's 3-bit `SegmentIndex` (the high part of the cache slot address).
+    pub fn segment(&self) -> u8 {
+        match self {
+            AtomCacheRef::Cached { segment, .. } | AtomCacheRef::New { segment, .. } => *segment,
+        }
     }
 
-    /// Decodes a reference; a wrong/short tag is `BeamError::BadArg`.
-    pub fn decode(body: &[u8]) -> Result<Self> {
-        if body.len() < 3 || body[0] != ATOM_CACHE_REF {
-            return Err(BeamError::BadArg);
+    /// The ref's 8-bit `InternalSegmentIndex` (the low part of the cache slot
+    /// address).
+    pub fn index(&self) -> u8 {
+        match self {
+            AtomCacheRef::Cached { index, .. } | AtomCacheRef::New { index, .. } => *index,
         }
-        Ok(AtomCacheRef {
-            segment: body[1] >> 1,
-            internal: (body[1] & 1) != 0,
-            atom: Atom::from_raw(u32::from(body[2])),
-        })
+    }
+
+    /// Whether the half-byte's `NewCacheEntryFlag` is set (a
+    /// `NewAtomCacheRef` rather than a `CachedAtomRef`).
+    pub fn is_new(&self) -> bool {
+        matches!(self, AtomCacheRef::New { .. })
     }
 }
 
-/// The `'D'` distribution-header envelope.
-///
-/// Layout: `'D' + len(4) + flags(1) + refs`. The `flags` bit
-/// [`DIST_HEADER_FLAG_ATOM_CACHE`] announces that `cache_refs` follow.
+/// A decoded normal distribution header: `VERSION_MAGIC + 'D' + N + Flags + refs`.
 #[derive(Clone, PartialEq, Eq, Hash, Debug)]
 pub struct DistHeader {
-    /// The header flag byte.
-    pub flags: u8,
-    /// The atom-cache references that follow the flags.
-    pub cache_refs: Vec<AtomCacheRef>,
+    /// The `AtomCacheRefs`, in `AtomCacheReferenceIndex` order (`0 .. N-1`).
+    pub refs: Vec<AtomCacheRef>,
+    /// The `LongAtoms` flag: when set, every `NewAtomCacheRef` length field is a
+    /// 2-byte big-endian integer instead of 1 byte, and each ref-flag byte has
+    /// one fewer usable half-byte.
+    ///
+    /// The flag is only present on the wire when there is at least one ref; it is
+    /// reported as `false` for an empty header.
+    pub long_atoms: bool,
 }
 
 impl DistHeader {
-    /// Encodes the header (tag + fields, no length prefix).
-    ///
-    /// The 4-byte big-endian `len` field counts the bytes that *follow* it — the
-    /// `flags` byte plus every encoded ref (`1 + 3 * cache_refs.len()`). The
-    /// `cache_refs` are written exactly as held, so `flags` and `cache_refs` must
-    /// be consistent: [`DIST_HEADER_FLAG_ATOM_CACHE`] in `flags` whenever the vec
-    /// is non-empty (a header that violates this is rejected by [`Self::decode`]).
-    pub fn encode<W: Write>(&self, w: &mut W) -> Result<()> {
-        let len = self
-            .cache_refs
-            .len()
-            .checked_mul(3)
-            .and_then(|refs_bytes| refs_bytes.checked_add(1))
-            .ok_or(BeamError::SystemLimit)?;
-        let len = u32::try_from(len).map_err(|_| BeamError::SystemLimit)?;
+    /// An empty header (`N == 0`): exactly `[VERSION_MAGIC, 'D', 0]` on the wire.
+    pub fn empty() -> DistHeader {
+        DistHeader { refs: Vec::new(), long_atoms: false }
+    }
 
+    /// Encodes the header as `VERSION_MAGIC + 'D' + N + Flags + refs`.
+    ///
+    /// `atoms` renders each [`AtomCacheRef::New`]'s `AtomText`, encoded as UTF-8
+    /// or Latin-1 per `encoding` (the [`DFLAG_UTF8_ATOMS`] negotiation).
+    ///
+    /// Errors: more than [`MAX_ATOM_CACHE_REFS`] refs, or a `NewAtomCacheRef`
+    /// whose atom text overflows the selected length field (255 bytes, or 65535
+    /// with [`long_atoms`](DistHeader::long_atoms)), yield `BeamError::SystemLimit`;
+    /// an atom missing from `atoms`, or a name that cannot be represented in the
+    /// selected `encoding` (a Latin-1 code point above `U+00FF`), yields
+    /// `BeamError::BadArg`.
+    ///
+    /// [`DFLAG_UTF8_ATOMS`]: crate::flags::DFLAG_UTF8_ATOMS
+    pub fn encode<W: Write>(
+        &self,
+        w: &mut W,
+        atoms: &AtomTable,
+        encoding: AtomEncoding,
+    ) -> Result<()> {
+        let n = self.refs.len();
+        if n > MAX_ATOM_CACHE_REFS {
+            return Err(BeamError::SystemLimit);
+        }
+
+        w.write_u8(beam_codec::VERSION_MAGIC)?;
         w.write_u8(DIST_HEADER)?;
-        w.write_u32be(len)?;
-        w.write_u8(self.flags)?;
-        for cache_ref in &self.cache_refs {
-            cache_ref.encode(w)?;
+        w.write_u8(n as u8)?;
+
+        if n == 0 {
+            // No refs: `Flags` and `AtomCacheRefs` are omitted entirely.
+            return Ok(());
+        }
+
+        // Build the dynamic flag field: `N/2 + 1` bytes, the last half-byte of
+        // which is the extra `LongAtoms` half-byte.
+        let mut flags = vec![0u8; n / 2 + 1];
+        for (i, cache_ref) in self.refs.iter().enumerate() {
+            let half = (cache_ref.segment() & 0x7) | if cache_ref.is_new() { 0x8 } else { 0 };
+            if i % 2 == 0 {
+                flags[i / 2] |= half;
+            } else {
+                flags[i / 2] |= half << 4;
+            }
+        }
+        if self.long_atoms {
+            // N even: low nibble of the extra byte `N/2`.
+            // N odd:  high nibble of the last ref-flag byte `(N-1)/2 == N/2`.
+            let extra = flags[n / 2];
+            flags[n / 2] = if n % 2 == 0 { extra | 0x1 } else { extra | (0x1 << 4) };
+        }
+        w.write_all(&flags)?;
+
+        for cache_ref in &self.refs {
+            w.write_u8(cache_ref.index())?;
+            if let AtomCacheRef::New { atom, .. } = cache_ref {
+                let name = atoms.name(*atom).ok_or(BeamError::BadArg)?;
+                let text = encode_atom_text(name, encoding)?;
+                let len = text.len();
+                if self.long_atoms {
+                    // 2-byte big-endian length (`u16` field).
+                    let len = u16::try_from(len).map_err(|_| BeamError::SystemLimit)?;
+                    w.write_u16be(len)?;
+                } else {
+                    // 1-byte length (`u8` field).
+                    let len = u8::try_from(len).map_err(|_| BeamError::SystemLimit)?;
+                    w.write_u8(len)?;
+                }
+                w.write_all(&text)?;
+            }
         }
         Ok(())
     }
 
-    /// Decodes the header; a wrong/short tag is `BeamError::BadArg`.
+    /// Decodes a normal distribution header from the start of `body`.
     ///
-    /// The body must cover the declared `len` (which counts the `flags` byte plus
-    /// the refs); any further bytes — e.g. the control message that follows the
-    /// header in a distribution packet — are left to the caller. With
-    /// [`DIST_HEADER_FLAG_ATOM_CACHE`] set, `(len - 1) / 3` refs are read, so a
-    /// ref field whose size is not a multiple of 3 is `BeamError::BadArg`; without
-    /// the flag, trailing ref bytes are `BeamError::BadArg` (never dropped
-    /// silently).
-    pub fn decode(body: &[u8]) -> Result<Self> {
-        // `'D' + len(4) + flags(1) + refs`
-        if body.len() < 6 || body[0] != DIST_HEADER {
+    /// `atoms` interns the `AtomText` of every [`AtomCacheRef::New`]; `encoding`
+    /// selects how those bytes are rendered (UTF-8 or Latin-1).
+    ///
+    /// Bytes after the header — the control term / message that follows it in a
+    /// distribution packet — are left to the caller.
+    ///
+    /// Errors: a body that is too short, does not start with `VERSION_MAGIC` +
+    /// `'D'`, or whose UTF-8 atom text is malformed, yields `BeamError::BadArg`.
+    pub fn decode(
+        body: &[u8],
+        atoms: &mut AtomTable,
+        encoding: AtomEncoding,
+    ) -> Result<DistHeader> {
+        // `VERSION_MAGIC + 'D' + N`
+        if body.len() < 3 || body[0] != beam_codec::VERSION_MAGIC || body[1] != DIST_HEADER {
             return Err(BeamError::BadArg);
         }
-        let declared = u32::from_be_bytes([body[1], body[2], body[3], body[4]]) as usize;
-        // `declared` counts the flags byte plus the refs; the whole envelope
-        // (`tag + len + declared`) must fit in the body.
-        let end = declared.checked_add(5).filter(|end| *end <= body.len());
-        let end = match end {
-            Some(end) if declared >= 1 => end,
-            _ => return Err(BeamError::BadArg),
-        };
-        let flags = body[5];
-        let ref_bytes = &body[6..end];
-
-        let mut cache_refs = Vec::new();
-        if flags & DIST_HEADER_FLAG_ATOM_CACHE != 0 {
-            if ref_bytes.len() % 3 != 0 {
-                return Err(BeamError::BadArg);
-            }
-            cache_refs.reserve(ref_bytes.len() / 3);
-            for chunk in ref_bytes.chunks_exact(3) {
-                cache_refs.push(AtomCacheRef::decode(chunk)?);
-            }
-        } else if !ref_bytes.is_empty() {
-            return Err(BeamError::BadArg);
+        let n = usize::from(body[2]);
+        if n == 0 {
+            return Ok(DistHeader::empty());
         }
 
-        Ok(DistHeader { flags, cache_refs })
+        // The dynamic flag field: `N/2 + 1` bytes.
+        let flags_bytes = n / 2 + 1;
+        let flags_end = 3usize.checked_add(flags_bytes).ok_or(BeamError::BadArg)?;
+        if body.len() < flags_end {
+            return Err(BeamError::BadArg);
+        }
+        let flags = &body[3..flags_end];
+
+        // The extra `LongAtoms` half-byte: low nibble of byte `N/2` when N is
+        // even, high nibble of byte `N/2` when N is odd.
+        let long_half = if n % 2 == 0 { flags[n / 2] & 0x0F } else { flags[n / 2] >> 4 };
+        let long_atoms = long_half & 0x1 != 0;
+
+        let mut pos = flags_end;
+        let mut refs = Vec::with_capacity(n);
+        for i in 0..n {
+            let half = if i % 2 == 0 { flags[i / 2] & 0x0F } else { flags[i / 2] >> 4 };
+            let segment = half & 0x7;
+            let is_new = half & 0x8 != 0;
+
+            let index = *body.get(pos).ok_or(BeamError::BadArg)?;
+            pos += 1;
+
+            if !is_new {
+                refs.push(AtomCacheRef::Cached { segment, index });
+                continue;
+            }
+
+            let len = if long_atoms {
+                let hi = *body.get(pos).ok_or(BeamError::BadArg)?;
+                let lo = *body.get(pos + 1).ok_or(BeamError::BadArg)?;
+                pos += 2;
+                usize::from(u16::from_be_bytes([hi, lo]))
+            } else {
+                let len = usize::from(*body.get(pos).ok_or(BeamError::BadArg)?);
+                pos += 1;
+                len
+            };
+
+            let text_end = pos.checked_add(len).ok_or(BeamError::BadArg)?;
+            let text = body.get(pos..text_end).ok_or(BeamError::BadArg)?;
+            pos = text_end;
+
+            let name = decode_atom_text(text, encoding)?;
+            let atom = atoms.intern(&name);
+            refs.push(AtomCacheRef::New { segment, index, atom });
+        }
+
+        Ok(DistHeader { refs, long_atoms })
+    }
+}
+
+/// Renders an atom name as the `AtomText` for the selected [`AtomEncoding`].
+///
+/// UTF-8 is the raw name bytes; Latin-1 is one byte per code point and only covers
+/// `U+0000..=U+00FF`, so a wider character is reported as `BeamError::BadArg`
+/// rather than silently mis-encoded (the same rule as `beam_codec`'s encoder).
+fn encode_atom_text(name: &str, encoding: AtomEncoding) -> Result<Vec<u8>> {
+    match encoding {
+        AtomEncoding::Utf8 => Ok(name.as_bytes().to_vec()),
+        AtomEncoding::Latin1 => {
+            let mut bytes = Vec::with_capacity(name.len());
+            for ch in name.chars() {
+                let code = ch as u32;
+                if code > 0xFF {
+                    return Err(BeamError::BadArg);
+                }
+                bytes.push(code as u8);
+            }
+            Ok(bytes)
+        }
+    }
+}
+
+/// Renders `AtomText` back into an atom name for the selected [`AtomEncoding`].
+///
+/// Latin-1 maps each byte `b` to the code point `U+00b` (a total, infallible
+/// conversion); UTF-8 is validated, and malformed bytes are `BeamError::BadArg`.
+fn decode_atom_text(text: &[u8], encoding: AtomEncoding) -> Result<String> {
+    match encoding {
+        AtomEncoding::Utf8 => {
+            let name = std::str::from_utf8(text).map_err(|_| BeamError::BadArg)?;
+            Ok(name.to_string())
+        }
+        AtomEncoding::Latin1 => Ok(text.iter().map(|&b| char::from(b)).collect()),
     }
 }
 
 /// The kind of a distribution fragment, recognised from its tag byte (`'E'`/`'F'`).
 ///
-/// Reassembly of fragmented payloads is out of Milestone 1 (see the crate
-/// `CONTEXT.md`, "Known Issues").
+/// Fragment reassembly (the extended header on `'E'` and the continuation frames
+/// on `'F'`) is out of this milestone's scope (see the crate `CONTEXT.md`,
+/// "Known Issues"); this only recognises the tags.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DistFragment {
     /// `'E'` — the first fragment, carrying the fragment header.
@@ -199,166 +398,342 @@ mod tests {
         }
     }
 
-    fn encode_ref(r: &AtomCacheRef) -> Vec<u8> {
+    fn encode_result(h: &DistHeader, atoms: &AtomTable, encoding: AtomEncoding) -> Result<Vec<u8>> {
         let mut sink = Sink::default();
-        r.encode(&mut sink).expect("encoding into a Vec cannot fail");
-        sink.0
+        h.encode(&mut sink, atoms, encoding)?;
+        Ok(sink.0)
     }
 
-    fn encode_header(h: &DistHeader) -> Vec<u8> {
-        let mut sink = Sink::default();
-        h.encode(&mut sink).expect("encoding into a Vec cannot fail");
-        sink.0
+    fn encode(h: &DistHeader, atoms: &AtomTable, encoding: AtomEncoding) -> Vec<u8> {
+        encode_result(h, atoms, encoding).expect("encoding into a Vec cannot fail")
     }
 
     fn bad_arg<T: std::fmt::Debug>(res: Result<T>) -> bool {
         matches!(res, Err(BeamError::BadArg))
     }
 
-    fn cache_ref(segment: u8, internal: bool, atom: u32) -> AtomCacheRef {
-        AtomCacheRef { segment, internal, atom: Atom::from_raw(atom) }
+    /// An atom table with a few ASCII names, plus the `Atom` handles for them.
+    fn table_with(names: &[&str]) -> (AtomTable, Vec<Atom>) {
+        let mut atoms = AtomTable::new();
+        let handles = names.iter().map(|name| atoms.intern(name)).collect();
+        (atoms, handles)
     }
 
     #[test]
-    fn atom_cache_ref_round_trip() {
-        let r = cache_ref(2, true, 0x2A);
-        let bytes = encode_ref(&r);
-        assert_eq!(bytes, vec![ATOM_CACHE_REF, (2 << 1) | 1, 0x2A]);
-        assert_eq!(bytes, vec![82, 5, 42]);
-        assert_eq!(AtomCacheRef::decode(&bytes).expect("valid ref"), r);
+    fn empty_header_is_exactly_three_bytes() {
+        let atoms = AtomTable::new();
+        let h = DistHeader::empty();
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        assert_eq!(bytes, vec![131, 68, 0]);
+        assert_eq!(bytes, vec![beam_codec::VERSION_MAGIC, DIST_HEADER, 0]);
+
+        let mut decode_atoms = AtomTable::new();
+        let decoded =
+            DistHeader::decode(&bytes, &mut decode_atoms, AtomEncoding::Utf8).expect("valid header");
+        assert_eq!(decoded, h);
+        assert!(!decoded.long_atoms);
     }
 
     #[test]
-    fn atom_cache_ref_external_bit_is_bit_zero() {
-        let external = cache_ref(2, false, 0x2A);
-        assert_eq!(encode_ref(&external)[1], 4);
-        assert_eq!(AtomCacheRef::decode(&encode_ref(&external)).expect("valid ref"), external);
+    fn one_cached_ref_places_the_flag_in_the_low_nibble() {
+        // N = 1 (odd) => the LongAtoms half-byte is the HIGH nibble of the only
+        // flag byte; ref 0's flags are the LOW nibble. `long_atoms = false`.
+        let atoms = AtomTable::new();
+        let h = DistHeader { refs: vec![AtomCacheRef::Cached { segment: 1, index: 7 }], long_atoms: false };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        // flags = (segment 1 | not-new) => low nibble 0x1, high nibble LongAtoms=0.
+        assert_eq!(bytes, vec![131, 68, 1, 0x01, 7]);
 
-        // The bit is read back, not inferred: only bit 0 is "internal".
-        assert_eq!(AtomCacheRef::decode(&[ATOM_CACHE_REF, 0x05, 7]).expect("valid ref").segment, 2);
-        assert!(AtomCacheRef::decode(&[ATOM_CACHE_REF, 0x05, 7]).expect("valid ref").internal);
+        let mut decode_atoms = AtomTable::new();
+        let decoded =
+            DistHeader::decode(&bytes, &mut decode_atoms, AtomEncoding::Utf8).expect("valid header");
+        assert_eq!(decoded, h);
     }
 
     #[test]
-    fn atom_cache_ref_index_is_one_byte() {
-        // The wire index is 8 bits wide: a wider raw index is masked on the wire.
-        let bytes = encode_ref(&cache_ref(0, false, 0x1_2A));
-        assert_eq!(bytes, vec![ATOM_CACHE_REF, 0, 0x2A]);
-        assert_eq!(AtomCacheRef::decode(&bytes).expect("valid ref").atom, Atom::from_raw(0x2A));
+    fn one_new_ref_short_atom() {
+        // Ref 0: New, segment = 3, index = 0x2A, atom "ab".
+        let (atoms, handles) = table_with(&["ab"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 3, index: 0x2A, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        // flags low nibble = segment 3 | new 0x8 = 0x0B, high nibble = 0.
+        assert_eq!(bytes, vec![131, 68, 1, 0x0B, 0x2A, 2, b'a', b'b']);
+
+        let (mut round_atoms, _) = table_with(&["ab"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
     }
 
     #[test]
-    fn atom_cache_ref_negatives() {
-        assert!(bad_arg(AtomCacheRef::decode(&[])));
-        assert!(bad_arg(AtomCacheRef::decode(&[ATOM_CACHE_REF, 0x00])));
-        // Wrong tag (`'D'` is the header tag, not the ref tag).
-        assert!(bad_arg(AtomCacheRef::decode(&[DIST_HEADER, 0x00, 0x00])));
-        // Trailing bytes are tolerated: a ref may be decoded out of a larger body.
+    fn one_new_ref_long_atoms_uses_a_two_byte_length() {
+        let (atoms, handles) = table_with(&["ab"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 3, index: 0x2A, atom: handles[0] }],
+            long_atoms: true,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        // flags: low nibble = 0x0B, high nibble = LongAtoms 0x1 => 0x1B.
+        // length is a 2-byte big-endian 2.
+        assert_eq!(bytes, vec![131, 68, 1, 0x1B, 0x2A, 0x00, 0x02, b'a', b'b']);
+
+        let (mut round_atoms, _) = table_with(&["ab"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
+        assert!(decoded.long_atoms);
+    }
+
+    #[test]
+    fn two_refs_pack_into_one_flag_byte_and_have_a_separate_long_atoms_byte() {
+        // N = 2 (even): flag byte 0 holds ref 0 (low nibble) + ref 1 (high
+        // nibble); flag byte 1 is the extra LongAtoms byte (low nibble).
+        let (atoms, handles) = table_with(&["x"]);
+        let h = DistHeader {
+            refs: vec![
+                AtomCacheRef::Cached { segment: 0, index: 5 },
+                AtomCacheRef::New { segment: 1, index: 9, atom: handles[0] },
+            ],
+            long_atoms: false,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        // byte0 = ref0 (0x0) | ref1 (segment 1 | new 0x8 = 0x9) << 4 = 0x90
+        // byte1 = LongAtoms low nibble = 0x00
+        assert_eq!(bytes, vec![131, 68, 2, 0x90, 0x00, 5, 9, 1, b'x']);
+
+        let (mut round_atoms, _) = table_with(&["x"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn two_refs_long_atoms_is_the_low_nibble_of_the_following_byte() {
+        let (atoms, handles) = table_with(&["x"]);
+        let h = DistHeader {
+            refs: vec![
+                AtomCacheRef::Cached { segment: 0, index: 5 },
+                AtomCacheRef::New { segment: 1, index: 9, atom: handles[0] },
+            ],
+            long_atoms: true,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        // byte1 = 0x01: LongAtoms sits in the LOW nibble of the byte after the
+        // ref-flag bytes; the New ref's length is the 2-byte big-endian 1.
+        assert_eq!(bytes, vec![131, 68, 2, 0x90, 0x01, 5, 9, 0x00, 0x01, b'x']);
+
+        let (mut round_atoms, _) = table_with(&["x"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
+        assert!(decoded.long_atoms);
+    }
+
+    #[test]
+    fn odd_ref_count_puts_long_atoms_in_the_high_nibble_of_the_last_flag_byte() {
+        // N = 3 (odd): flag byte 1 holds ref 2 (low) + LongAtoms (high).
+        let (atoms, handles) = table_with(&["abcd"]);
+        let h = DistHeader {
+            refs: vec![
+                AtomCacheRef::Cached { segment: 0, index: 1 },
+                AtomCacheRef::Cached { segment: 2, index: 2 },
+                AtomCacheRef::New { segment: 3, index: 3, atom: handles[0] },
+            ],
+            long_atoms: true,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
         assert_eq!(
-            AtomCacheRef::decode(&[ATOM_CACHE_REF, (3 << 1), 9, 0xFF]).expect("valid ref"),
-            cache_ref(3, false, 9)
+            bytes,
+            vec![
+                131, 68, 3, // header
+                0x20, // ref0 low = 0x0, ref1 high = (2|0) << 4 = 0x20
+                0x1B, // ref2 low = 3|8 = 0x0B, LongAtoms high = 0x10
+                1, 2, 3, // the Index byte of each ref
+                0x00, 0x04, b'a', b'b', b'c', b'd', // ref2's 2-byte length + text
+            ]
+        );
+
+        let (mut round_atoms, _) = table_with(&["abcd"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
+        assert!(decoded.long_atoms);
+    }
+
+    #[test]
+    fn empty_atom_text_round_trips() {
+        let (atoms, handles) = table_with(&[""]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        assert_eq!(bytes, vec![131, 68, 1, 0x08, 0, 0]);
+
+        let mut round_atoms = AtomTable::new();
+        let decoded =
+            DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8).expect("valid header");
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn latin1_round_trips_a_non_ascii_name() {
+        // U+00E5 (å) is one byte 0xE5 in Latin-1 (and two bytes in UTF-8).
+        let (atoms, handles) = table_with(&["\u{00E5}"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Latin1);
+        assert_eq!(bytes, vec![131, 68, 1, 0x08, 0, 1, 0xE5]);
+
+        let mut round_atoms = AtomTable::new();
+        let decoded =
+            DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Latin1).expect("valid header");
+        assert_eq!(decoded, h);
+        assert_eq!(round_atoms.name(handles[0]), Some("\u{00E5}"));
+    }
+
+    #[test]
+    fn utf8_round_trips_the_same_non_ascii_name_with_two_bytes() {
+        let (atoms, handles) = table_with(&["\u{00E5}"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        assert_eq!(bytes, vec![131, 68, 1, 0x08, 0, 2, 0xC3, 0xA5]);
+
+        let mut round_atoms = AtomTable::new();
+        let decoded =
+            DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8).expect("valid header");
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn trailing_payload_bytes_are_left_to_the_caller() {
+        // The control term / message follows the header inside a dist packet.
+        let (atoms, handles) = table_with(&["x"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 1, index: 9, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let mut bytes = encode(&h, &atoms, AtomEncoding::Utf8);
+        bytes.extend_from_slice(&[0xAA, 0xBB, 0xCC]);
+
+        let (mut round_atoms, _) = table_with(&["x"]);
+        let decoded = DistHeader::decode(&bytes, &mut round_atoms, AtomEncoding::Utf8)
+            .expect("valid header");
+        assert_eq!(decoded, h);
+    }
+
+    #[test]
+    fn decode_rejects_short_and_wrong_prefix_bodies() {
+        let mut atoms = AtomTable::new();
+        // Empty / too short for `VERSION_MAGIC + 'D' + N`.
+        assert!(bad_arg(DistHeader::decode(&[], &mut atoms, AtomEncoding::Utf8)));
+        assert!(bad_arg(DistHeader::decode(&[131], &mut atoms, AtomEncoding::Utf8)));
+        assert!(bad_arg(DistHeader::decode(&[131, 68], &mut atoms, AtomEncoding::Utf8)));
+        // Not `VERSION_MAGIC`.
+        assert!(bad_arg(DistHeader::decode(&[130, 68, 0], &mut atoms, AtomEncoding::Utf8)));
+        // Not `'D'`.
+        assert!(bad_arg(DistHeader::decode(&[131, 69, 0], &mut atoms, AtomEncoding::Utf8)));
+        // A `'D'` term-level tag alone is not a header.
+        assert!(bad_arg(DistHeader::decode(&[68], &mut atoms, AtomEncoding::Utf8)));
+    }
+
+    #[test]
+    fn decode_rejects_truncated_flag_and_ref_fields() {
+        let mut atoms = AtomTable::new();
+        // N = 1 declares 1 flag byte; only N is present.
+        assert!(bad_arg(DistHeader::decode(&[131, 68, 1], &mut atoms, AtomEncoding::Utf8)));
+        // N = 2 declares 2 flag bytes; only 1 is present.
+        assert!(bad_arg(DistHeader::decode(&[131, 68, 2, 0x00], &mut atoms, AtomEncoding::Utf8)));
+        // Flags present but the CachedAtomRef index byte is missing.
+        assert!(bad_arg(DistHeader::decode(&[131, 68, 1, 0x01], &mut atoms, AtomEncoding::Utf8)));
+        // NewAtomCacheRef with a length field that runs past the body.
+        assert!(bad_arg(DistHeader::decode(
+            &[131, 68, 1, 0x0B, 0x2A, 5, b'a'],
+            &mut atoms,
+            AtomEncoding::Utf8
+        )));
+        // LongAtoms length field itself truncated.
+        assert!(bad_arg(DistHeader::decode(
+            &[131, 68, 1, 0x1B, 0x2A, 0x00],
+            &mut atoms,
+            AtomEncoding::Utf8
+        )));
+        // A second ref declared by N = 2 is missing (only one index byte present).
+        assert!(bad_arg(DistHeader::decode(
+            &[131, 68, 2, 0x00, 0x00, 5],
+            &mut atoms,
+            AtomEncoding::Utf8
+        )));
+    }
+
+    #[test]
+    fn decode_rejects_malformed_utf8_atom_text() {
+        let mut atoms = AtomTable::new();
+        // 0xFF is not valid UTF-8.
+        assert!(bad_arg(DistHeader::decode(
+            &[131, 68, 1, 0x08, 0, 1, 0xFF],
+            &mut atoms,
+            AtomEncoding::Utf8
+        )));
+        // The same bytes are a valid Latin-1 name (U+00FF).
+        let mut latin_atoms = AtomTable::new();
+        let decoded = DistHeader::decode(&[131, 68, 1, 0x08, 0, 1, 0xFF], &mut latin_atoms, AtomEncoding::Latin1)
+            .expect("valid latin-1 header");
+        assert_eq!(
+            decoded.refs,
+            vec![AtomCacheRef::New { segment: 0, index: 0, atom: latin_atoms.lookup("\u{00FF}").unwrap() }]
         );
     }
 
     #[test]
-    fn dist_header_without_refs_round_trip() {
-        let h = DistHeader { flags: 0, cache_refs: Vec::new() };
-        let bytes = encode_header(&h);
-        assert_eq!(bytes, vec![DIST_HEADER, 0, 0, 0, 1, 0]);
-        assert_eq!(DistHeader::decode(&bytes).expect("valid header"), h);
+    fn encode_rejects_unrepresentable_latin1_and_oversize_short_length() {
+        // U+0141 (Ł) is above U+00FF: not representable in Latin-1.
+        let (atoms, handles) = table_with(&["\u{0141}"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom: handles[0] }],
+            long_atoms: false,
+        };
+        assert!(bad_arg(encode_result(&h, &atoms, AtomEncoding::Latin1)));
+
+        // A 300-byte name cannot fit the 1-byte length field.
+        let long = "a".repeat(300);
+        let mut big_atoms = AtomTable::new();
+        let atom = big_atoms.intern(&long);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom }],
+            long_atoms: false,
+        };
+        assert!(matches!(
+            encode_result(&h, &big_atoms, AtomEncoding::Utf8),
+            Err(BeamError::SystemLimit)
+        ));
+        // ... but it fits a 2-byte (LongAtoms) length field.
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 0, index: 0, atom }],
+            long_atoms: true,
+        };
+        assert!(encode_result(&h, &big_atoms, AtomEncoding::Utf8).is_ok());
     }
 
     #[test]
-    fn dist_header_with_one_ref_round_trip() {
-        let r = cache_ref(5, false, 0x07);
-        let h = DistHeader { flags: DIST_HEADER_FLAG_ATOM_CACHE, cache_refs: vec![r.clone()] };
-        let bytes = encode_header(&h);
-
-        // `'D' + len(4) + flags(1) + refs`; len counts the flags byte + refs.
-        assert_eq!(bytes[0], DIST_HEADER);
-        let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        assert_eq!(len, 1 + 3 * h.cache_refs.len());
-        assert_eq!(&bytes[1..5], &[0, 0, 0, 4]);
-        assert_eq!(bytes[5], DIST_HEADER_FLAG_ATOM_CACHE);
-        assert_eq!(&bytes[6..], &[ATOM_CACHE_REF, (5 << 1) | 0, 0x07]);
-        assert_eq!(bytes.len(), 5 + len);
-
-        assert_eq!(DistHeader::decode(&bytes).expect("valid header"), h);
-
-        // Trailing bytes (the rest of the distribution packet) are ignored.
-        let mut padded = bytes.clone();
-        padded.extend_from_slice(&[0xAA, 0xBB]);
-        assert_eq!(DistHeader::decode(&padded).expect("valid header"), h);
-    }
-
-    #[test]
-    fn dist_header_with_many_refs_round_trip() {
-        let refs = vec![cache_ref(0, true, 1), cache_ref(1, false, 2), cache_ref(7, true, 0xFF)];
-        let h = DistHeader { flags: DIST_HEADER_FLAG_ATOM_CACHE, cache_refs: refs };
-        let bytes = encode_header(&h);
-        let len = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
-        assert_eq!(len, 1 + 3 * h.cache_refs.len());
-        assert_eq!(bytes.len(), 5 + len);
-        // `(len - 1) / 3` refs are read back, in order.
-        assert_eq!(DistHeader::decode(&bytes).expect("valid header"), h);
-    }
-
-    #[test]
-    fn dist_header_negatives() {
-        // Empty / too short to hold `tag + len + flags`.
-        assert!(bad_arg(DistHeader::decode(&[])));
-        assert!(bad_arg(DistHeader::decode(&[DIST_HEADER, 0, 0, 0])));
-        // Wrong tag.
-        assert!(bad_arg(DistHeader::decode(&[ATOM_CACHE_REF, 0, 0, 0, 1, 0])));
-        // Declared length zero: the flags byte itself is always counted.
-        assert!(bad_arg(DistHeader::decode(&[DIST_HEADER, 0, 0, 0, 0, 0])));
-        // Declared length runs past the end of the body (short ref field).
-        assert!(bad_arg(DistHeader::decode(&[DIST_HEADER, 0, 0, 0, 7, 0])));
-        assert!(bad_arg(DistHeader::decode(&[
-            DIST_HEADER,
-            0,
-            0,
-            0,
-            4,
-            DIST_HEADER_FLAG_ATOM_CACHE,
-            ATOM_CACHE_REF,
-            0x00,
-        ])));
-        // Ref field size not a multiple of the 3-byte ref shape.
-        assert!(bad_arg(DistHeader::decode(&[
-            DIST_HEADER,
-            0,
-            0,
-            0,
-            3,
-            DIST_HEADER_FLAG_ATOM_CACHE,
-            ATOM_CACHE_REF,
-            0x00,
-        ])));
-        // Atom-cache flag unset but ref bytes present: rejected, never dropped.
-        assert!(bad_arg(DistHeader::decode(&[
-            DIST_HEADER,
-            0,
-            0,
-            0,
-            4,
-            0,
-            ATOM_CACHE_REF,
-            0x00,
-            0x01,
-        ])));
-        // A ref inside the field must still carry the `'R'` tag.
-        assert!(bad_arg(DistHeader::decode(&[
-            DIST_HEADER,
-            0,
-            0,
-            0,
-            4,
-            DIST_HEADER_FLAG_ATOM_CACHE,
-            0x00,
-            0x00,
-            0x01,
-        ])));
+    fn encode_rejects_more_than_the_count_field_can_hold() {
+        let atoms = AtomTable::new();
+        let refs = (0..=MAX_ATOM_CACHE_REFS as u8)
+            .map(|i| AtomCacheRef::Cached { segment: i % 8, index: i })
+            .collect();
+        let h = DistHeader { refs, long_atoms: false };
+        assert!(matches!(
+            encode_result(&h, &atoms, AtomEncoding::Utf8),
+            Err(BeamError::SystemLimit)
+        ));
     }
 
     #[test]
@@ -369,19 +744,27 @@ mod tests {
         assert_eq!(DistFragment::from_tag(b'F'), Some(DistFragment::Continue));
         assert_eq!(DistFragment::from_tag(b'X'), None);
         assert_eq!(DistFragment::from_tag(DIST_HEADER), None);
-        assert_eq!(DistFragment::from_tag(HOPEFUL_DATA), None);
-        assert_eq!(DistFragment::from_tag(NEW_CACHE), None);
     }
 
     #[test]
     fn tag_constants_match_external_h() {
-        // `erts/emulator/beam/external.h:65-69,80`.
+        // `erts/emulator/beam/external.h`.
+        assert_eq!(beam_codec::VERSION_MAGIC, 131);
         assert_eq!(DIST_HEADER, 68);
         assert_eq!(DIST_FRAG_HEADER, 69);
         assert_eq!(DIST_FRAG_CONT, 70);
-        assert_eq!(HOPEFUL_DATA, 72);
-        assert_eq!(ATOM_CACHE_REF, 82);
-        assert_eq!(NEW_CACHE, 78);
-        assert_eq!(DIST_HEADER_FLAG_ATOM_CACHE, 0x01);
+    }
+
+    #[test]
+    fn ref_accessors_mirror_the_wire_fields() {
+        let cached = AtomCacheRef::Cached { segment: 5, index: 0x1F };
+        assert_eq!(cached.segment(), 5);
+        assert_eq!(cached.index(), 0x1F);
+        assert!(!cached.is_new());
+
+        let new = AtomCacheRef::New { segment: 6, index: 0x2A, atom: Atom::from_raw(1) };
+        assert_eq!(new.segment(), 6);
+        assert_eq!(new.index(), 0x2A);
+        assert!(new.is_new());
     }
 }

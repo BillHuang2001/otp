@@ -35,9 +35,9 @@ All byte values, tag bytes and field orders below are **wire-frozen** (A.5): rep
 in-memory test double, the 2-/4-byte packet framing (with tick = empty packet), the handshake
 message codecs (`Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`) with a
 pluggable digest hook, the `DOP_*` control-message codec (opcode + concatenated `beam_codec` term
-bodies), the distribution-header envelope, and the `epmd` request/response codecs + client driver.
-The crate is **safe Rust** (`#![deny(unsafe_code)]`). `cargo test -p beam_dist` is green
-(102 tests: 10 lib unit + 14 `constants` + 22 `control` + 24 `epmd` + 11 `framing` + 21 `handshake`).
+bodies), the byte-exact distribution-header codec, and the `epmd` request/response codecs + client
+driver. The crate is **safe Rust** (`#![deny(unsafe_code)]`). `cargo test -p beam_dist` is green
+(111 tests: 19 lib unit + 14 `constants` + 22 `control` + 24 `epmd` + 11 `framing` + 21 `handshake`).
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_dist::prelude::*`.
@@ -135,15 +135,33 @@ Each message is a **body codec** (tag + fields), big-endian, framed by the calle
   `pub trait ChallengeSource { fn next_challenge(&self) -> u32; }` (the challenge nonce generator).
   Message *shapes* are exact and complete; only the MD5 value is pluggable.
 
-### `src/dist_header.rs` — distribution-header envelope (safe)
-- Tags: `DIST_HEADER=b'D'(68)`, `DIST_FRAG_HEADER=b'E'(69)`, `DIST_FRAG_CONT=b'F'(70)`,
-  `HOPEFUL_DATA=b'H'(72)`, `ATOM_CACHE_REF=b'R'(82)`, `NEW_CACHE=b'N'(78)`;
-  header flag `DIST_HEADER_FLAG_ATOM_CACHE=0x01`.
-- `pub struct AtomCacheRef { segment: u8, internal: bool, atom: Atom }` —
-  `'R' + (segment<<1 | internal) + atom_index`.
-- `pub struct DistHeader { flags: u8, cache_refs: Vec<AtomCacheRef> }` — `'D' + len(4) + flags(1) +
-  refs`; `encode`/`decode`. (`flags` bit `0x01` = the atom cache is enabled and refs follow.)
-- `pub enum DistFragment { Header, Continue }` recognising `'E'`/`'F'` (assembly deferred — see gaps).
+### `src/dist_header.rs` — the normal distribution header (`'D'`) + atom-cache refs (safe)
+**Byte-exact** with the real ERTS wire (`erts/doc/guides/erl_ext_dist.md` §"Normal Distribution
+Header"; `external.c` `erts_encode_ext_dist_header_setup`/`_finalize`/`erts_prepare_dist_ext`). The
+normal (non-fragmented) header is `VERSION_MAGIC(131) + DIST_HEADER('D'=68) + NumberOfAtomCacheRefs(1)
++ Flags(N/2+1 bytes, omitted entirely when N==0) + AtomCacheRefs(N)`.
+- Tags: `DIST_HEADER=b'D'(68)` (re-exported from `beam_codec::DIST_HEADER_EXT`),
+  `DIST_FRAG_HEADER=b'E'(69)`, `DIST_FRAG_CONT=b'F'(70)`; bounds `MAX_ATOM_CACHE_REFS=255`,
+  `ATOM_CACHE_SEGMENTS=8`.
+- `Flags`: flag byte `k` holds ref `2k`'s half-byte in the **low** nibble and ref `2k+1`'s in the
+  **high** nibble; each ref half-byte = 1-bit `NewCacheEntryFlag` (MSB) + 3-bit `SegmentIndex` =
+  `(segment & 0x7) | (new << 3)`. The extra `LongAtoms` half-byte is the **low** nibble of the byte
+  after the ref-flag bytes when `N` is even, the **high** nibble of the last ref-flag byte when `N`
+  is odd (its LSB is `LongAtoms`; the other 3 bits are unused).
+- `pub enum AtomCacheRef { Cached { segment: u8, index: u8 }, New { segment: u8, index: u8, atom: Atom } }`
+  — `Cached` = `InternalSegmentIndex(1 byte)`; `New` = `InternalSegmentIndex(1) + Length(1 byte, or 2
+  bytes big-endian under `LongAtoms`) + AtomText`. `segment()`/`index()`/`is_new()` accessors.
+- `pub struct DistHeader { pub refs: Vec<AtomCacheRef>, pub long_atoms: bool }` with `empty()`,
+  `encode<W: Write>(&self, w, atoms: &AtomTable, encoding: AtomEncoding)` and
+  `decode(body, atoms: &mut AtomTable, encoding: AtomEncoding)`, producing/consuming exactly
+  `VERSION_MAGIC + 'D' + N + Flags + refs`. `AtomText` is rendered UTF-8 or Latin-1 per the
+  caller-selected `beam_codec::AtomEncoding` (the `DFLAG_UTF8_ATOMS` negotiation); trailing bytes (the
+  payload that follows the header in a packet) are left to the caller. Over-long refs ⇒
+  `SystemLimit`, short/malformed/wrong-prefix ⇒ `BadArg`.
+- `pub enum DistFragment { Header, Continue }` recognises `'E'`/`'F'` (assembly deferred — see gaps).
+- **Pass-through:** with neither an atom cache nor fragmentation negotiated there is **no** distribution
+  header on the wire (`external.c` writes a lone `PASS_THROUGH` byte) and the control term carries its
+  own `VERSION_MAGIC`; this codec models only the header-when-present case.
 
 ### `src/control.rs` — `DOP_*` control-message codec (safe)
 - `pub struct ControlMessage { dop: Dop, terms: Vec<Eterm> }` — the decoded form.
@@ -207,6 +225,12 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
 - **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_dist` green,
   plus `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Required test coverage (all hermetic — no sockets, no running `epmd`):
+  - `src/dist_header.rs` in-module tests — byte-exact vectors for the normal distribution header:
+    `N=0` ⇒ `[131, 68, 0]`; `N=1` `CachedAtomRef` (half-byte in the low nibble, `LongAtoms` in the
+    high); `N=1` `NewAtomCacheRef` short and `LongAtoms` (1- vs 2-byte length field); `N=2` (one
+    `Cached` + one `New`) incl. the `LongAtoms` low-nibble-of-the-following-byte placement; `N=3`
+    (`LongAtoms` high nibble of the last flag byte); UTF-8 vs Latin-1 `AtomText`; encode→decode
+    round-trips; and truncation / wrong-prefix ⇒ `BeamError::BadArg`.
   - `tests/constants.rs` — exact-value pins for a representative (and the derived) `DFLAG_*`/`DOP_*`
     constants, the mandatory/default/rejectable sets, and the handshake/epmd tag bytes.
   - `tests/handshake.rs` — `Name`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`/`Status`
@@ -238,9 +262,10 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
 - **Handshake message codecs are body-only; framing is a separate layer.** Every message type exposes
   `encode(w)`/`decode(body)` with no length prefix; the caller wraps `framing::write_packet`/
   `read_packet`. This keeps the codecs pure and lets the handshake driver choose 2- vs 4-byte framing.
-- **Atom-cache emission is deferred.** `beam_codec` M1 never emits `ATOM_CACHE_REF`/`NEW_CACHE`, so
-  control messages encode atoms inline; the *decoder* still resolves `ATOM_CACHE_REF` through a
-  supplied `AtomCache`, and `dist_header` carries the `'D'` envelope + `'R'` refs.
+- **Atom-cache emission is deferred in the payload codec.** `beam_codec` M1 never emits
+  `ATOM_CACHE_REF`/`NEW_CACHE`, so control messages encode atoms inline; the payload *decoder* still
+  resolves `ATOM_CACHE_REF` through a supplied `AtomCache`. `dist_header` encodes the header's own
+  `AtomCacheRef`s (the cache *updates*), which `beam_codec`'s payload decoder does not emit yet.
 - **The OTP-23 `Complement` message is 9 bytes** (`'c' + flags_high(4) + creation(4)`). Do not be
   misled by `ei_connect.c:2535`, which guards `recv_complement` with `rlen != 21` — that is an
   erl_interface quirk (Erlang nodes never send a complement, so the branch is dead there); the
@@ -253,22 +278,20 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
 - **Live authentication is not possible end-to-end**: the challenge digest has no in-tree MD5, so the
   handshake cannot authenticate against a real node until a `ChallengeDigest` provider is supplied.
   Message shape/parse/negotiation are exact and fully tested.
-- **Atom-cache (segment) encoding deferred**: the `NEW_CACHE` (`'N'`) segment emission and
-  `ATOM_CACHE_REF` emission are not implemented (upstream `beam_codec` M1 limitation); decoding refs
-  is supported when a cache is present. Documented, not silently wrong.
-- **Distribution fragments** (`DFLAG_FRAGMENTS`): the `'E'`/`'F'` tags are recognised; reassembly of
-  fragmented payloads is out of M1.
+- **Fragment header assembly is deferred.** The `'E'` (fragment header — an 8-byte sequence id + an
+  8-byte fragment count before `NumberOfAtomCacheRefs`) and `'F'` (`VERSION_MAGIC + 'F' + seq id +
+  fragment index`) tags are recognised through `DistFragment` only; reassembly of fragmented payloads
+  is out of Milestone 1.
+- **`dist_header` models only the header-when-present case.** When neither an atom cache nor fragments
+  are negotiated there is no distribution header at all (a lone `PASS_THROUGH` byte; the control term
+  carries its own `VERSION_MAGIC`). That wire decision belongs to the sender/receiver, not the codec.
+- **Atom-cache (segment) encoding deferred** in the *payload* codec: `beam_codec` M1 never emits
+  `NEW_CACHE`/`ATOM_CACHE_REF`, so control messages encode atoms inline. `dist_header` fully
+  encodes/decodes the header's own `AtomCacheRef`s; the payload refs are resolved by `beam_codec`.
 - **Spawn/payload/altact control opcodes** are recognised by value/name/arity but their end-to-end
   handling (and the `ERTS_DOP_ALTACT_SIG_FLG_*` / `ERTS_DIST_SPAWN_FLAG_*` bit vocabularies) is out of
   M1 scope.
 - **No socket/epmd-server code** — `beam_io` owns transports; this crate is transport-agnostic.
-- **The distribution header (`'D'`) envelope is an M1 simplification, not byte-exact ERTS.** The
-  real wire image (`erts/emulator/beam/external.c`, `erts_encode_ext_dist_header_finalize`;
-  `erts/doc/guides/erl_ext_dist.md`) is `VERSION_MAGIC(131) + 'D'(68) + NumAtomCacheRefs(1) +
-  variable-length half-byte Flags + rems` with **no** 4-byte length field, and each ref is a
-  `CachedAtomRef`(1 byte) / `NewAtomCacheRef`(segment+len+atom text). `dist_header` implements the
-  crate-frozen `'D' + len(4) + flags(1) + refs` model with `'R' + (segment<<1|internal) + index`
-  refs; making it byte-exact is a follow-up (see `CHANGE.md` when the seam changes).
 - **`NamesResp::encode` is lossy on ports** — the struct retains only `epmd_port` + node names, so
   the per-node port in each `name <name> at port <port>` line is not recoverable; `encode` uses
   `epmd_port` as the placeholder. Decoding (the direction the client uses) is exact.
@@ -281,7 +304,9 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
 - `src/framing.rs` → 2-/4-byte packet-length framing, tick (empty packet), `PacketHeaderSize`
 - `src/handshake.rs` → `Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement` codecs,
   `preferred_flags`/`check_mandatory`, the `ChallengeDigest`/`ChallengeSource` hooks
-- `src/dist_header.rs` → distribution-header (`'D'`) envelope, `AtomCacheRef`, fragment tags
+- `src/dist_header.rs` → the byte-exact normal distribution header (`'D'`): `NumberOfAtomCacheRefs`,
+  half-byte `Flags` + `LongAtoms`, `AtomCacheRef` (`Cached`/`New`), UTF-8/Latin-1 `AtomText`, and the
+  `'E'`/`'F'` fragment tags (`DistFragment`; assembly deferred)
 - `src/control.rs` → `DOP_*` control-message encode/decode (opcode + `beam_codec` term payloads)
 - `src/epmd.rs` → `epmd` request/response codecs + `EpmdClient` over `Transport`
 - `tests/constants.rs` → exact-value constant pins (oracle-derived)
