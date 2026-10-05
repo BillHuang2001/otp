@@ -80,7 +80,7 @@ Android (`*-android*`) additionally rewrites `/bin/sh` → `/system/bin/sh` in t
 ## Notes for Agents
 - To build/check these programs you need a configured tree: `./configure && make` from `ERL_TOP`, or `cd erts/etc/common && make TYPE=debug` (which goes through the `Makefile` wrapper).
 - Object output: `$(ERL_TOP)/erts/obj$(TYPEMARKER)/$(TARGET)` (`erts/obj/…` or `erts/obj.debug/…`); executable output: `$(ERL_TOP)/bin/$(TARGET)/` — both are git-ignored build trees, do not look for code there.
-- `erlexec.c` is a ~2.5 kloc monolith by design; navigate it by the static function list near the top (`get_parameters`, `initial_argv_massage`, `add_args`/`add_Eargs` (Eargs = emulator, args, in `argsp` = everything after `--`), `start_epmd_daemon`, `read_args_file`).
+- `erlexec.c` is a ~2.5 kloc monolith by design; navigate it by the static function list near the top (`get_parameters`, `initial_argv_massage`, `add_args`/`add_Eargs`/`add_arg`, `start_epmd_daemon`, `read_args_file`). Two argv buckets are kept: `Eargsp` = everything before the `--` separator (goes to the emulator) and `argsp` = everything after it.
 - `$(ERL_TOP)/make/$(TARGET)/otp.mk`, `otp_ded.mk` and `output.mk` are generated from `make/*.in` by `erts/configure`; they are absent in an unconfigured checkout, so the `include`s at the top of `Makefile.in` cannot be resolved without configuring.
 - `$(TARGET)/` subdirectories under `erts/etc/` are configure output and are ignored by the root `.gitignore` (host-triple pattern).
 
