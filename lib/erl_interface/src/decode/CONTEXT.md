@@ -85,7 +85,7 @@ This directory is pure C in the `pthreads`-free `ei` library; the legacy `erl_*`
 Adding a new external-format tag means touching the matching decoder, `ei_skip_term` (otherwise `ei_skip_term` returns `-1` for it) and `ei_get_type` in `../misc/get_type.c` for type normalisation.
 
 ## Test Strategy
-Exercised from `../../test/`: `ei_decode_SUITE` (driving the C program `../../test/ei_decode_SUITE_data/ei_decode_test.c`, with cases in `ei_decode_test_cases.hrl` generated from Erlang terms) covers long/ulong/longlong/ulonglong/char/utf8-atom/iodata/misc/`ei_cmp_parts`.
+Exercised from `../../test/`: `ei_decode_SUITE` (driving the C program `../../test/ei_decode_SUITE_data/ei_decode_test.c`, with cases in `ei_decode_test_cases.hrl` generated from Erlang terms) covers long/ulong/longlong/ulonglong/char/utf8-atom/iodata/misc/`ei_cmp_nc`.
 `ei_decode_encode_SUITE` (C program `ei_decode_encode_SUITE_data/ei_decode_encode_test.c`) round-trips terms Erlang→C→Erlang and separately checks that `ei_skip_term` advances exactly to the end of each encoded term.
 `ei_accept_SUITE_data/ei_accept_test.c` and `ei_print_SUITE_data` also call the decoders for real traffic/printing.
 Coverage gaps: negative-`ERL_INTEGER_EXT` bignum decoding, truncated-buffer behaviour and the `'trueX'` prefix case are not covered.
