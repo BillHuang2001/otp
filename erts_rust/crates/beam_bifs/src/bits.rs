@@ -22,10 +22,10 @@
 //!   here — and [`bytes`] therefore rejects a `SUB_BITS` term rather than following
 //!   its indirection. This is a documented deviation from C's placement policy, not
 //!   from its *layout*: the on-heap block is byte-for-byte the C one.
-//! * The API is written ahead of its consumers (the `binary`/`unicode`/`maps` BIFs,
-//!   which land later), so several items are only exercised by the tests below
-//!   today; `erlang:size/1` is the one wired-up user (`crate::term_ops`). Those
-//!   unused-tail items carry `#[allow(dead_code)]` until their BIFs land.
+//! * The consumers are the `binary`/`unicode` BIFs plus `erlang:size/1`
+//!   (`crate::term_ops`), which call [`make_binary`]/[`make_bitstring`]/
+//!   [`byte_size`]/[`bytes`]. A few helpers still carry `#[allow(dead_code)]` for
+//!   callers that are not wired up yet.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
