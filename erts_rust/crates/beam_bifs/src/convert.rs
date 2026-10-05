@@ -929,21 +929,27 @@ mod tests {
     use beam_common::BeamError;
     use beam_process::ProcessId;
     use beam_term::{Atom, AtomTable};
+    use std::cell::RefCell;
+    use std::rc::Rc;
 
     /// An [`AtomInterner`](crate::context::AtomInterner) over its own table; the
-    /// table *is* the shared atom table in a real runtime (see `context.rs`).
+    /// table *is* the shared atom table in a real runtime (see `context.rs`). The
+    /// `Rc<RefCell<..>>` lets the test inspect the interned names while the
+    /// context still holds the (mutable) interner hook.
     struct Interner {
-        table: AtomTable,
+        table: Rc<RefCell<AtomTable>>,
     }
 
     impl crate::context::AtomInterner for Interner {
         fn intern(&mut self, name: &str) -> Atom {
-            self.table.intern(name)
+            self.table.borrow_mut().intern(name)
         }
     }
 
     /// The names the tests build terms from; `nonode@nohost`, `error`, `exit`
-    /// and `throw` are the ones the BIFs look up themselves.
+    /// and `throw` are the ones the BIFs look up themselves, and
+    /// `decimals`/`scientific`/`compact`/`short` are the `float_to_list`
+    /// option tags.
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
         atoms.seed([
@@ -954,16 +960,23 @@ mod tests {
             "b",
             "x",
             "hello",
+            "foo",
             "nonode@nohost",
             "error",
             "exit",
             "throw",
+            "decimals",
+            "scientific",
+            "compact",
+            "short",
         ]);
         atoms
     }
 
     fn heap() -> Heap {
-        Heap::new(1024).expect("test heap")
+        // Big enough for the longest list a test builds (two 256-character
+        // byte lists plus their surroundings).
+        Heap::new(8192).expect("test heap")
     }
 
     /// Runs `f` over a fresh context.
@@ -1050,7 +1063,7 @@ mod tests {
                 ("ff", 16, 255),
                 ("FF", 16, 255),
                 ("zz", 36, 1295),
-                ("-73", 36, -73),
+                ("-73", 36, -255),
             ] {
                 let args = [bytes(ctx, text), ctx.int(base).expect("fits")];
                 let term = list_to_integer_2(ctx, &args).expect("parses");
@@ -1239,10 +1252,11 @@ mod tests {
                 float_to_list_2(ctx, &[value, bare_tuple]),
                 Err(BeamError::BadArg)
             ));
+            let two_f = ctx.make_float(2.0).expect("fits");
             let float_precision = ctx
                 .tuple(&[
                     beam_term::make_atom(atoms().lookup("decimals").expect("seeded")),
-                    ctx.make_float(2.0).expect("fits"),
+                    two_f,
                 ])
                 .expect("fits");
             let opts = options(ctx, &[float_precision]);
@@ -1250,28 +1264,33 @@ mod tests {
                 float_to_list_2(ctx, &[value, opts]),
                 Err(BeamError::BadArg)
             ));
-            let negative = options(ctx, &[decimals(ctx, -1)]);
+            let minus_one = decimals(ctx, -1);
+            let negative = options(ctx, &[minus_one]);
             assert!(matches!(
                 float_to_list_2(ctx, &[value, negative]),
                 Err(BeamError::BadArg)
             ));
             // The oracle's rendering buffer is 256 bytes: 255 characters fit.
-            let fits = options(ctx, &[decimals(ctx, 253)]);
+            let d253 = decimals(ctx, 253);
+            let fits = options(ctx, &[d253]);
             assert_eq!(
                 spell(float_to_list_2(ctx, &[value, fits]).expect("fits")).len(),
                 255
             );
-            let overflow = options(ctx, &[decimals(ctx, 254)]);
+            let d254 = decimals(ctx, 254);
+            let overflow = options(ctx, &[d254]);
             assert!(matches!(
                 float_to_list_2(ctx, &[value, overflow]),
                 Err(BeamError::BadArg)
             ));
-            let fits = options(ctx, &[scientific(ctx, 249)]);
+            let s249 = scientific(ctx, 249);
+            let fits = options(ctx, &[s249]);
             assert_eq!(
                 spell(float_to_list_2(ctx, &[value, fits]).expect("fits")).len(),
                 255
             );
-            let overflow = options(ctx, &[scientific(ctx, 250)]);
+            let s250 = scientific(ctx, 250);
+            let overflow = options(ctx, &[s250]);
             assert!(matches!(
                 float_to_list_2(ctx, &[value, overflow]),
                 Err(BeamError::BadArg)
@@ -1293,17 +1312,20 @@ mod tests {
                 ("1.5e+3", 1500.0),
                 ("0.0", 0.0),
             ] {
-                let term = list_to_float_1(ctx, &[bytes(ctx, text)]).expect("parses");
+                let list = bytes(ctx, text);
+                let term = list_to_float_1(ctx, &[list]).expect("parses");
                 assert!(access::is_float(term), "{text:?} is not a float");
                 assert_eq!(access::float_value(term), expected, "list_to_float({text:?})");
             }
             // Underflow to zero is accepted (the C `errno == ERANGE` special case).
-            let underflow = list_to_float_1(ctx, &[bytes(ctx, "1.0e-400")]).expect("parses");
+            let tiny = bytes(ctx, "1.0e-400");
+            let underflow = list_to_float_1(ctx, &[tiny]).expect("parses");
             assert_eq!(access::float_value(underflow), 0.0);
 
             for text in ["", "1", "1.", ".5", "1e3", "1.5e", "1.5.5", " 1.5", "abc", "1.5e309"] {
+                let list = bytes(ctx, text);
                 assert!(
-                    matches!(list_to_float_1(ctx, &[bytes(ctx, text)]), Err(BeamError::BadArg)),
+                    matches!(list_to_float_1(ctx, &[list]), Err(BeamError::BadArg)),
                     "list_to_float({text:?})"
                 );
             }
@@ -1345,8 +1367,9 @@ mod tests {
         // look up.
         atoms.seed(["decimals", "scientific", "compact", "short", "nonode@nohost"]);
         let mut interner = Interner {
-            table: AtomTable::new(),
+            table: Rc::new(RefCell::new(AtomTable::new())),
         };
+        let interned = Rc::clone(&interner.table);
         {
             let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
                 .with_atom_interner(&mut interner);
@@ -1359,17 +1382,17 @@ mod tests {
             // A new name goes through the `AtomInterner` hook.
             let fresh = bytes(&mut ctx, "brand_new");
             let term = list_to_atom_1(&mut ctx, &[fresh]).expect("interns");
-            assert_eq!(interner.table.name(atom_val(term)), Some("brand_new"));
+            assert_eq!(interned.borrow().name(atom_val(term)), Some("brand_new"));
 
             // The empty atom `''` is legal, and code points round-trip.
             let empty = ctx.list(&[]).expect("fits");
             let term = list_to_atom_1(&mut ctx, &[empty]).expect("interns");
-            assert_eq!(interner.table.name(atom_val(term)), Some(""));
+            assert_eq!(interned.borrow().name(atom_val(term)), Some(""));
             let points = ctx
                 .list(&[ctx.int(255).expect("fits"), ctx.int(300).expect("fits")])
                 .expect("fits");
             let term = list_to_atom_1(&mut ctx, &[points]).expect("interns");
-            let name = interner.table.name(atom_val(term)).expect("interned");
+            let name = interned.borrow().name(atom_val(term)).expect("interned").to_string();
             assert_eq!(name.chars().collect::<Vec<_>>(), vec!['\u{ff}', '\u{12c}']);
 
             // Invalid character lists.
@@ -1535,12 +1558,9 @@ mod tests {
             assert_eq!(access::tuple_size(empty), 0);
 
             // `make_tuple/3` takes `{Index, Value}` pairs.
-            let updates = ctx
-                .list(&[
-                    ctx.tuple(&[ctx.int(1).expect("fits"), a]).expect("fits"),
-                    ctx.tuple(&[three, ctx.atom("b").expect("seeded")]).expect("fits"),
-                ])
-                .expect("fits");
+            let first = ctx.tuple(&[ctx.int(1).expect("fits"), a]).expect("fits");
+            let second = ctx.tuple(&[three, ctx.atom("b").expect("seeded")]).expect("fits");
+            let updates = ctx.list(&[first, second]).expect("fits");
             let tuple = make_tuple_3(ctx, &[three, x, updates]).expect("ok");
             assert_eq!(access::tuple_element(tuple, 0), a);
             assert_eq!(access::tuple_element(tuple, 1), x);
@@ -1565,12 +1585,13 @@ mod tests {
             }
             // Bad update lists: an out-of-range index, a 0 index, a non-tuple
             // element, a wrong-arity tuple, a non-integer index, a non-list.
+            let one_f = ctx.make_float(1.0).expect("fits");
             for update in [
                 ctx.tuple(&[ctx.int(4).expect("fits"), a]).expect("fits"),
                 ctx.tuple(&[zero, a]).expect("fits"),
                 a,
                 ctx.tuple(&[ctx.int(1).expect("fits"), a, x]).expect("fits"),
-                ctx.tuple(&[ctx.make_float(1.0).expect("fits"), a]).expect("fits"),
+                ctx.tuple(&[one_f, a]).expect("fits"),
             ] {
                 let updates = ctx.list(&[update]).expect("fits");
                 assert!(
@@ -1582,12 +1603,8 @@ mod tests {
                 make_tuple_3(ctx, &[three, x, a]),
                 Err(BeamError::BadArg)
             ));
-            let improper = ctx
-                .cons(
-                    ctx.tuple(&[ctx.int(1).expect("fits"), a]).expect("fits"),
-                    x,
-                )
-                .expect("fits");
+            let pair = ctx.tuple(&[ctx.int(1).expect("fits"), a]).expect("fits");
+            let improper = ctx.cons(pair, x).expect("fits");
             assert!(matches!(
                 make_tuple_3(ctx, &[three, x, improper]),
                 Err(BeamError::BadArg)
@@ -1678,12 +1695,10 @@ mod tests {
                 Err(BeamError::BadArg)
             ));
             // The stacktrace must be a proper list of valid frames.
-            for bad in [
-                one,
-                ctx.list(&[one]).expect("fits"),
-                ctx.list(&[ctx.tuple(&[one, one]).expect("fits")]).expect("fits"),
-                ctx.cons(frame, reason),
-            ] {
+            let two_tuple = ctx.tuple(&[one, one]).expect("fits");
+            let nested = ctx.list(&[two_tuple]).expect("fits");
+            let improper_trace = ctx.cons(frame, reason).expect("fits");
+            for bad in [one, ctx.list(&[one]).expect("fits"), nested, improper_trace] {
                 assert!(
                     matches!(raise_3(ctx, &[error, reason, bad]), Err(BeamError::BadArg)),
                     "stacktrace {bad:?}"
