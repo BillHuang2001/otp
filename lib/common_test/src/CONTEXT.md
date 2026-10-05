@@ -118,7 +118,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 
 ## Known Issues / Gotchas
 - `test_server_ctrl` is the *legacy* name of the process that actually drives a run; `ct_run` is the modern entry point. Do not confuse `test_server_ctrl` (driver, local node) with `test_server` (per-testcase API, also on target nodes).
-- `ct_util_server`/`ct_util` is not a `gen_server`; it is a hand-rolled registered process with no supervisor, so a crash of `ct_util_server` takes the whole run down and `ct_util:stop/1` is the only orderly shutdown.
+- `ct_util_server`/`ct_util` is not a `gen_server`; it is a hand-rolled registered process with no supervisor (same for `ct_config_server` and `ct_logs`), so a crash of `ct_util_server` takes the whole run down and `ct_util:stop/1` is the only orderly shutdown.
 - `test_server_sup` is misnamed — it is a plain function library, not a supervisor.
 - Framework indirection: behaviour of a testcase depends on the `TEST_SERVER_FRAMEWORK` OS env var; when unset the `framework_call`s silently return defaults (no `init_tc`/`end_tc` hooks run). Code reading `test_server` alone will not find the CT implementation — that is `ct_framework`.
 - Several modules carry `nowarn_possibly_unsafe_function`/`nowarn_deprecated_function` compile options (e.g. `test_server_sup`, `ct_cover`, `ct_netconfc`, `ct`) — these are deliberate, not accidental.
