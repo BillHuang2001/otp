@@ -13,8 +13,6 @@
 //!
 //! [`SUPPORTED_KEYS`] is the complete list; **any other key is `badarg`**, which is
 //! what the oracle raises (`erlang:system_info(nonsense)` ⇒ `error:badarg`).
-//! `erts_version` is a **non-standard alias** of `version` kept for convenience
-//! (real ERTS raises `badarg` for it) — see the crate `CONTEXT.md`, Known Issues.
 
 use beam_abi::{ERL_NIF_MAJOR_VERSION, ERL_NIF_MINOR_VERSION};
 use beam_alloc::Heap;
@@ -28,7 +26,6 @@ use crate::runtime::Runtime;
 /// The keys [`system_info_value`] answers, in the order of the crate `CONTEXT.md`.
 pub const SUPPORTED_KEYS: &[&str] = &[
     "version",
-    "erts_version",
     "otp_release",
     "system_architecture",
     "system_version",
@@ -106,7 +103,7 @@ fn atom_term(atoms: &AtomTable, name: &str) -> Result<Eterm> {
 /// [`BeamError::BadArg`] for any key outside [`SUPPORTED_KEYS`] — the oracle's reason.
 pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
     match key {
-        "version" | "erts_version" => Ok(InfoValue::Str(ERTS_VERSION.to_string())),
+        "version" => Ok(InfoValue::Str(ERTS_VERSION.to_string())),
         "otp_release" => Ok(InfoValue::Str(beam_common::otp_version().major.to_string())),
         "system_architecture" => Ok(InfoValue::Str(system_architecture())),
         "system_version" => Ok(InfoValue::Str(format!(
@@ -203,7 +200,17 @@ mod tests {
             system_info_value(key, &rt)
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));
         }
-        assert_eq!(SUPPORTED_KEYS.len(), 11);
+        assert_eq!(SUPPORTED_KEYS.len(), 10);
+    }
+
+    #[test]
+    fn the_non_standard_erts_version_alias_is_gone() {
+        // Real ERTS raises `badarg` for `erts_version`; so does this runtime now.
+        let rt = runtime();
+        assert!(matches!(
+            system_info_value("erts_version", &rt),
+            Err(BeamError::BadArg)
+        ));
     }
 
     #[test]
@@ -211,10 +218,6 @@ mod tests {
         let rt = runtime();
         assert_eq!(
             system_info_value("version", &rt).expect("version"),
-            InfoValue::Str("17.1".to_string())
-        );
-        assert_eq!(
-            system_info_value("erts_version", &rt).expect("erts_version"),
             InfoValue::Str("17.1".to_string())
         );
         assert_eq!(

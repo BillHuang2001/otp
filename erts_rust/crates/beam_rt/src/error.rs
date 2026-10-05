@@ -29,8 +29,6 @@
 //! [`ExitReason::Atom`](beam_common::ExitReason::Atom) backed by an owned `String`
 //! (which every message here is).
 
-use std::path::PathBuf;
-
 use beam_common::{BeamError, ExitReason, Raise};
 
 /// The prefix every capability-gap reason atom starts with (see the module docs).
@@ -129,10 +127,6 @@ pub(crate) fn arity_mismatch(spec: &str, expected: u32, found: usize) -> BeamErr
     ))
 }
 
-/// An atom argument that is not interned in the target module's atom table.
-pub(crate) fn unknown_atom(module: &str, name: &str) -> BeamError {
-    message(format!("atom {name:?} is not interned in module {module:?}"))
-}
 /// An unknown `system_info/1` key — the bare `badarg` the oracle raises.
 ///
 /// The key is deliberately *not* carried: the oracle's exception reason is exactly
@@ -145,15 +139,6 @@ pub(crate) fn unknown_info_key(_key: &str) -> BeamError {
 /// A module that is not loaded and has no cached `.beam`.
 pub(crate) fn unknown_module(module: &str) -> BeamError {
     message(format!("module {module:?} is not loaded"))
-}
-
-/// A module whose `<module>.beam` is not in the configured code path.
-pub(crate) fn module_not_found(module: &str, paths: &[PathBuf]) -> BeamError {
-    let searched: Vec<String> = paths.iter().map(|p| p.display().to_string()).collect();
-    message(format!(
-        "cannot find {module}.beam in the code path [{}]",
-        searched.join(", ")
-    ))
 }
 
 /// A function/arity that the module does not export.
@@ -235,7 +220,8 @@ mod tests {
     #[test]
     fn genuine_errors_are_not_classified_as_capability_gaps() {
         assert_eq!(unsupported_reason(&missing_value("-eval")), None);
-        assert_eq!(unsupported_reason(&module_not_found("slice", &[])), None);
+        assert_eq!(unsupported_reason(&unexpected_argument("junk")), None);
+        assert_eq!(unsupported_reason(&bad_spec("slice-add-2")), None);
         assert_eq!(unsupported_reason(&unknown_info_key("nonsense")), None);
         assert_eq!(unsupported_reason(&BeamError::BadArg), None);
         assert_eq!(unsupported_reason(&BeamError::SystemLimit), None);
@@ -280,9 +266,5 @@ mod tests {
         assert!(arity_mismatch("slice:add/2", 2, 1)
             .to_string()
             .contains("slice:add/2"));
-        assert!(unknown_atom("slice", "z").to_string().contains("\"z\""));
-        let not_found = module_not_found("slice", &[PathBuf::from("/tmp/code")]);
-        assert!(not_found.to_string().contains("slice.beam"));
-        assert!(not_found.to_string().contains("/tmp/code"));
     }
 }

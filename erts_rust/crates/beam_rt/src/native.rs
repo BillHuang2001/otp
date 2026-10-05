@@ -140,17 +140,21 @@ impl RuntimeContext<'_> {
 
     /// `init:get_argument(Flag)`: `{ok, [[Value…]…]}` for a flag that was given (one
     /// inner list per occurrence, empty for a valueless flag), or the atom `error`.
+    ///
+    /// The occurrences are **snapshotted** out of the configuration before any term is
+    /// built: every occurrence is owned data by then, so no borrow of the runtime is
+    /// held across the mutable term construction below.
     fn get_argument(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let flag = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
-        let occurrences = match self.runtime.init_args.get(&flag) {
-            Some(occurrences) => occurrences,
+        let occurrences: Vec<Vec<String>> = match self.runtime.init_args().get(&flag) {
+            Some(list) => list.into_iter().map(<[String]>::to_vec).collect(),
             None => return self.atom("error"),
         };
 
         let mut occurrence_terms = Vec::with_capacity(occurrences.len());
-        for occurrence in occurrences {
+        for occurrence in &occurrences {
             let mut value_terms = Vec::with_capacity(occurrence.len());
             for value in occurrence {
                 value_terms.push(self.charlist(value)?);
@@ -251,8 +255,6 @@ impl RuntimeContext<'_> {
 
 #[cfg(test)]
 mod tests {
-    use beam_term::Atom;
-
     use super::*;
     use crate::runtime::Runtime;
 
@@ -326,7 +328,9 @@ mod tests {
         let mut sink = beam_bifs::BytesSink::new();
         {
             let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            let device = context.call_bif("erlang", "self", 0, &[]).unwrap_or(beam_term::NIL);
+            // Milestone-1 has one output stream, so the device is accepted and ignored:
+            // a plain small integer stands in for a device handle.
+            let device = make_small(1);
             let chars =
                 terms::make_list(&mut context, &[make_small(121)]).expect("a char list");
             context
@@ -396,9 +400,14 @@ mod tests {
         let values = terms::tuple_element(present, 1).unwrap();
         let occurrences = terms::list_elements(values).expect("the occurrence list");
         assert_eq!(occurrences.len(), 2);
+        // Each occurrence is a list of **strings** (the oracle's
+        // `{ok,[[[47,97]],[[47,98]]]}` for `-pa /a -pa /b`), so occurrence 0 is
+        // `["/a"]` and its single element is the char list `"/a"`.
+        let occurrence = terms::list_elements(occurrences[0]).expect("one value");
+        assert_eq!(occurrence.len(), 1, "one `-pa` value");
         assert_eq!(
-            terms::list_elements(occurrences[0]).expect("one value")[0],
-            make_small(i64::from(b'/'))
+            terms::list_elements(occurrence[0]).expect("the value as a string"),
+            vec![make_small(i64::from(b'/')), make_small(i64::from(b'a'))]
         );
 
         let absent = atom(&mut runtime, "absent");
@@ -412,8 +421,10 @@ mod tests {
         let mut runtime = runtime();
         let sum = call(&mut runtime, "erlang", "+", &[make_small(2), make_small(3)]).expect("+");
         assert_eq!(signed_value(sum), 5);
-        // And an unknown native-shaped call is not claimed either.
-        assert!(call(&mut runtime, "erlang", "display", &[make_small(1), make_small(2)]).is_ok());
-        let _ = Atom::MAX;
+        // A native-shaped call the floor does not own (here: the wrong arity) falls
+        // through to the registry and fails there — never silently accepted.
+        let error = call(&mut runtime, "erlang", "display", &[make_small(1), make_small(2)])
+            .expect_err("display/2 is no BIF");
+        assert!(error.to_string().contains("erlang:display/2"), "{error}");
     }
 }

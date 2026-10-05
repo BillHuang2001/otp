@@ -349,6 +349,10 @@ impl Runtime {
         args: &[Eterm],
     ) -> Result<Eterm> {
         self.boot_if_needed()?;
+        // `find_module_file` also seeds the system library directories (stdlib, kernel)
+        // on first use, so `-s lists …` reaches the real stdlib. A miss here is not
+        // fatal: `CodeServer::load` below reports it, naming every directory searched.
+        let _ = self.find_module_file(module);
         let loaded = self.code_server.load(module)?;
         let mut context = RuntimeContext::new(self);
         context.run_export(&loaded, function, arity, args)
@@ -656,9 +660,9 @@ mod tests {
         let terms = rt.materialize_args(&args).expect("materialize");
         assert_eq!(signed_value(terms[0]), -7);
         assert_eq!(rt.atom_name_of(terms[1]), Some("a"));
-        let chars = beam_term::list_elements(terms[2]).expect("a char list");
+        let chars = terms::list_elements(terms[2]).expect("a char list");
         assert_eq!(signed_value(chars[0]), i64::from(b'h'));
-        assert_eq!(beam_term::list_elements(terms[3]).expect("a list").len(), 2);
+        assert_eq!(terms::list_elements(terms[3]).expect("a list").len(), 2);
     }
 
     #[test]

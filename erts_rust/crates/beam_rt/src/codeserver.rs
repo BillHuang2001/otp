@@ -399,7 +399,7 @@ mod tests {
 
     #[test]
     fn an_empty_server_has_no_atoms_no_modules_and_no_path() {
-        let server = CodeServer::new();
+        let mut server = CodeServer::new();
         assert!(server.atoms().is_empty());
         assert!(server.paths().is_empty());
         assert!(server.loaded().is_empty());

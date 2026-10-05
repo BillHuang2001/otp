@@ -26,10 +26,13 @@ use beam_process::ProcessId;
 use beam_term::{make_small, AtomTable, Eterm, NIL};
 
 /// The format control [`term_to_string`] uses: `~p` (printable-string rule) + newline.
-const FORMAT: &[u8] = b"~p~n";
+///
+/// `pub(crate)` so [`crate::Runtime::format_term`]/[`crate::Runtime::format_term_w`] can
+/// name their control without a second printer being introduced.
+pub(crate) const FORMAT: &[u8] = b"~p~n";
 
 /// The format control [`term_to_string_w`] uses: `~w` (raw) + newline.
-const FORMAT_W: &[u8] = b"~w~n";
+pub(crate) const FORMAT_W: &[u8] = b"~w~n";
 
 /// Renders `term` with the registered `~p` printer.
 ///

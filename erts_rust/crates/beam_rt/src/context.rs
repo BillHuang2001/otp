@@ -45,7 +45,7 @@ use std::sync::Arc;
 
 use beam_bifs::{BifContext, OutputSink};
 use beam_common::{BeamError, Result};
-use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
+use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
 use beam_term::Eterm;
 
@@ -60,9 +60,12 @@ use crate::runtime::Runtime;
 /// redirects it — that is how [`Runtime::run_module`] captures output.
 pub struct RuntimeContext<'a> {
     /// The runtime: registry, shared atom table, heaps, pid, ETS tables.
-    runtime: &'a mut Runtime,
+    ///
+    /// `pub(crate)` for the runtime-native BIF floor ([`crate::native`]), which is a
+    /// sibling module of this one and therefore needs explicit visibility.
+    pub(crate) runtime: &'a mut Runtime,
     /// The `io:format`/`io:put_chars`/`display` destination; stdout when unset.
-    output: Option<&'a mut dyn OutputSink>,
+    pub(crate) output: Option<&'a mut dyn OutputSink>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -88,11 +91,6 @@ impl<'a> RuntimeContext<'a> {
     /// `usize::MAX` — see the module docs.
     pub fn heap_available(&self) -> usize {
         self.runtime.arena_available()
-    }
-
-    /// The runtime this context dispatches through.
-    pub(crate) fn runtime_mut(&mut self) -> &mut Runtime {
-        self.runtime
     }
 
     /// Runs `module`'s exported `function/arity` with `args`, on this context.
@@ -173,6 +171,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         if module == "erlang" {
             return Err(error::unknown_bif(module, function, arity));
         }
+        // The code server adds the system library directories (stdlib, kernel) the first
+        // time a module has to be resolved, so an external call reaches the real stdlib
+        // without an explicit `-pa`. A miss here is not fatal: `CodeServer::load` below
+        // reports it, naming every directory searched.
+        let _ = self.runtime.find_module_file(module);
         let loaded = self.runtime.code_server.load(module)?;
         self.run_export(&loaded, function, arity, args)
     }
@@ -246,15 +249,10 @@ fn descriptor_of(
         .copied()
 }
 
-/// A [`MinimalContext`] is the runtime's arena; this assertion-shaped helper documents
-/// the relationship and keeps the import meaningful if the type ever changes.
-#[allow(dead_code)]
-fn arena_type(_: &MinimalContext) {}
-
 #[cfg(test)]
 mod tests {
     use beam_bifs::{BifRegistry, BytesSink};
-    use beam_term::{atom_val, is_small, make_atom, make_small, signed_value};
+    use beam_term::{atom_val, is_small, make_small, signed_value};
 
     use super::*;
     use crate::config::RuntimeConfig;
@@ -340,11 +338,21 @@ mod tests {
     #[test]
     fn the_registry_is_the_core_bif_set() {
         let rt = runtime();
-        assert!(rt.registry.contains("erlang", "+", 2));
-        assert!(rt.registry.contains("lists", "reverse", 1));
+        let core = BifRegistry::with_core_bifs();
+        for (module, function, arity) in [
+            ("erlang", "+", 2),
+            ("lists", "reverse", 1),
+            ("io", "format", 2),
+        ] {
+            assert!(rt.registry.contains(module, function, arity));
+            // Value-for-value agreement with a freshly built core registry proves this
+            // is the real `beam_bifs` one, not a hand-rolled subset.
+            assert_eq!(
+                rt.registry.lookup(module, function, arity).is_some(),
+                core.lookup(module, function, arity).is_some()
+            );
+        }
         assert!(!rt.registry.contains("erlang", "nope", 0));
-        // A registry value proves the registry is the real `beam_bifs` one.
-        assert_eq!(rt.registry, BifRegistry::with_core_bifs());
-        let _ = make_atom;
+        assert!(!core.contains("erlang", "nope", 0));
     }
 }
