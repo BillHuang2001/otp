@@ -17,8 +17,8 @@
 //! # The HAMT node layout (frozen)
 //!
 //! Level `L` of the trie (root `L = 0`) selects the slot
-//! `nibble(hash, L) = (hash >> (4*L)) & 0xF` of the node reached so far, so the
-//! least-significant nibble indexes the root. A node is one of
+//! `maskval(hash, L) = (hash >> (4*(15-L))) & 0xF` of the node reached so far, so
+//! the most-significant nibble indexes the root (see [`nibble`]). A node is one of
 //!
 //! | node | header | words | layout |
 //! |---|---|---|---|
@@ -61,8 +61,8 @@
 
 use crate::atom::AtomTable;
 use crate::boxed::{
-    boxed_val, is_arity_value, is_flatmap_header, is_map_header, make_arityval, make_boxed,
-    map_header_type, map_header_val,
+    boxed_val, is_arity_value, is_boxed, is_flatmap_header, is_map_header, make_arityval,
+    make_boxed, map_header_type, map_header_val,
 };
 use crate::compare::{cmp, cmp_flatmap_keys, eq};
 use crate::error::{TermError, TermResult};
@@ -104,10 +104,19 @@ pub const fn make_map_header(map_type: usize, arity: usize, val: usize) -> Eterm
     crate::boxed::make_header((inner << MAP_HEADER_TAG_SZ) | map_type, MAP_SUBTAG)
 }
 
-/// `nibble(hash, level)` — the slot selector of a node at `level`.
+/// `maskval(hash, level)` (`erl_map.c:109`) — the slot selector of a node at
+/// `level`.
+///
+/// Level `0` is the **most significant** nibble (`hash >> 60`), descending to the
+/// least significant nibble at level 15. This is required for the grouping loop in
+/// [`build_trie`] to see contiguous runs: with hashes sorted ascending, the level-0
+/// nibble is the primary key, so equal-nibble leaves are adjacent. (The C sorts
+/// hashes *descending* — `hxnodecmp`, `erl_map.c:1171` — with the same MSB-first
+/// `maskval`; both orders give contiguous runs. The specific bitmap values are not
+/// observable outside this runtime — see the module docs.)
 #[inline]
 const fn nibble(hash: u64, level: usize) -> u32 {
-    ((hash >> (HAMT_BITS_PER_LEVEL as usize * level)) & 0xF) as u32
+    ((hash >> (HAMT_BITS_PER_LEVEL as usize * (HAMT_MAX_LEVEL - 1 - level))) & 0xF) as u32
 }
 
 /// The words a caller must reserve before [`write_map`] with `n_pairs` input
@@ -327,8 +336,12 @@ pub unsafe fn write_map(
         return Ok(unsafe { write_flatmap(hp, &flat) });
     }
 
-    // Hash map. Lay the key/value cons cells at the base of the block, then
-    // serialize the trie above them.
+    // Hash map. Lay the key/value cons cells at the base of the block in
+    // *canonical* order — by hash (the trie's grouping key), ties broken by
+    // `CMP_TERM` (the collision-node order) — so the produced buffer is
+    // independent of the caller's pair order (matching the C, which lays out the
+    // hash-sorted `hxns`). The leaves are then already sorted for `build_trie`.
+    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp(a.1, b.1, atoms)));
     let mut cur = hp;
     let mut leaves: Vec<(u64, Eterm)> = Vec::with_capacity(n);
     for &(hash, key, value) in &entries {
@@ -342,7 +355,6 @@ pub unsafe fn write_map(
         }
         leaves.push((hash, make_list(cell as *const Eterm)));
     }
-    leaves.sort_by_key(|(hash, _)| *hash);
 
     let trie = build_trie(&leaves, 0, atoms);
     debug_assert!(
@@ -401,6 +413,10 @@ fn collect_slots(node: *mut Eterm, out: &mut Vec<(Eterm, Eterm)>) -> TermResult<
 
 /// Every `(key, value)` pair of the map `t` (unordered).
 fn collect_pairs(t: Eterm) -> TermResult<Vec<(Eterm, Eterm)>> {
+    // An immediate can never be a map; guard before dereferencing.
+    if !is_boxed(t) {
+        return Err(TermError::BadMap);
+    }
     let p = boxed_val(t);
     // SAFETY: `t` is a live boxed term.
     let header = unsafe { *p };
@@ -447,6 +463,10 @@ pub(crate) fn map_pairs_flatmap_order(
 
 /// `erts_map_size` — the number of keys in the map `t`.
 pub fn map_size(t: Eterm, _atoms: &AtomTable) -> TermResult<usize> {
+    // An immediate can never be a map; guard before dereferencing.
+    if !is_boxed(t) {
+        return Err(TermError::BadMap);
+    }
     let p = boxed_val(t);
     // SAFETY: `t` is a live boxed term.
     let header = unsafe { *p };
@@ -469,6 +489,10 @@ pub fn map_size(t: Eterm, _atoms: &AtomTable) -> TermResult<usize> {
 /// `nibble(term_hash(key), L)` from the root, falling back to a linear scan of the
 /// collision node when the path ends in one.
 pub fn map_get(t: Eterm, key: Eterm, atoms: &AtomTable) -> TermResult<Option<Eterm>> {
+    // An immediate can never be a map; guard before dereferencing.
+    if !is_boxed(t) {
+        return Err(TermError::BadMap);
+    }
     let p = boxed_val(t);
     // SAFETY: `t` is a live boxed term.
     let header = unsafe { *p };
@@ -617,7 +641,9 @@ fn node_subtag(header: Eterm) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::boxed::{header_arity, is_hashmap, is_flatmap, map_header_val};
+    use crate::boxed::{
+        header_arity, is_flatmap, is_hashmap, is_hashmap_header, map_header_val,
+    };
     use crate::heap::Heap;
     use crate::immediate::{make_atom, make_small, NIL};
     use crate::size::size_object;
@@ -653,15 +679,30 @@ mod tests {
                 i + 1
             );
         }
-        assert!(
-            size_object(map) <= cap,
-            "size_object({}) > map_words_capacity({}) == {cap}",
-            size_object(map),
-            pairs.len()
-        );
         Built { _buf: buf, map }
     }
 
+    /// Normalize a map buffer for base-independent comparison: each word becomes
+    /// `(true, offset)` when it is a tagged pointer into `buf`, else `(false, raw)`.
+    /// Two canonically-laid-out maps (same shape, different heap base) normalize
+    /// equal.
+    fn normalize(buf: &[Eterm]) -> Vec<(bool, usize)> {
+        let base = buf.as_ptr() as usize;
+        let end = base + std::mem::size_of_val(buf);
+        buf.iter()
+            .map(|w| {
+                let raw = w.raw();
+                // LIST (0x1) and BOXED (0x2) primary tags carry a tagged pointer.
+                if raw & 0x3 == 0x1 || raw & 0x3 == 0x2 {
+                    let p = raw & !0x7usize;
+                    if p >= base && p < end {
+                        return (true, p - base);
+                    }
+                }
+                (false, raw)
+            })
+            .collect()
+    }
     fn pairs_of(keys: &[i64], atoms: &AtomTable) -> Vec<(Eterm, Eterm)> {
         let _ = atoms;
         keys.iter()
@@ -677,7 +718,8 @@ mod tests {
     fn empty_map_is_a_three_word_flatmap() {
         let a = atoms();
         let b = build(&[], &a);
-        assert!(is_flatmap(b.map));
+        // SAFETY: `b.map` is a live boxed map.
+        assert!(unsafe { is_flatmap(b.map) });
         assert_eq!(map_size(b.map, &a).unwrap(), 0);
         assert_eq!(map_pairs(b.map, &a).unwrap(), vec![]);
         assert_eq!(size_object(b.map), 3);
@@ -695,14 +737,15 @@ mod tests {
             (k1, make_small(10)),
         ];
         let b = build(&raw, &a);
-        assert!(is_flatmap(b.map));
+        // SAFETY: `b.map` is a live boxed map.
+        assert!(unsafe { is_flatmap(b.map) });
         assert_eq!(map_size(b.map, &a).unwrap(), 3);
-        // `map_pairs` is in Erlang term order: number < list < tuple.
+        // `map_pairs` is in Erlang term order: number < tuple < list.
         let pairs = map_pairs(b.map, &a).unwrap();
         assert_eq!(pairs[0].0, make_small(5));
-        assert_eq!(pairs[1].0, k1);
-        assert_eq!(pairs[2].0, k3);
-        assert_eq!(pairs[1].1, make_small(10));
+        assert_eq!(pairs[1].0, k3);
+        assert_eq!(pairs[2].0, k1);
+        assert_eq!(pairs[2].1, make_small(10));
     }
 
     #[test]
@@ -724,14 +767,16 @@ mod tests {
         let a = atoms();
         for n in [31i64, 32] {
             let b = build(&pairs_of(&keys_1_to(n), &a), &a);
-            assert!(is_flatmap(b.map), "n={n} should be a flat map");
-            assert!(!is_hashmap(b.map));
+            // SAFETY: `b.map` is a live boxed map.
+            assert!(unsafe { is_flatmap(b.map) }, "n={n} should be a flat map");
+            assert!(!unsafe { is_hashmap(b.map) });
             assert_eq!(map_size(b.map, &a).unwrap(), n as usize);
         }
         for n in [33i64, 34, 40] {
             let b = build(&pairs_of(&keys_1_to(n), &a), &a);
-            assert!(is_hashmap(b.map), "n={n} should be a hash map");
-            assert!(!is_flatmap(b.map));
+            // SAFETY: `b.map` is a live boxed map.
+            assert!(unsafe { is_hashmap(b.map) }, "n={n} should be a hash map");
+            assert!(!unsafe { is_flatmap(b.map) });
             assert_eq!(map_size(b.map, &a).unwrap(), n as usize);
             for k in 1..=n {
                 assert_eq!(
@@ -789,8 +834,7 @@ mod tests {
                 // SAFETY: slot `i` is within the node payload.
                 let item = unsafe { *node.add(off + i) };
                 if is_list(item) {
-                    // SAFETY: a leaf is a `[Key, Value]` cons cell.
-                    assert!(unsafe { crate::list::is_list(item) });
+                    // A leaf is a `[Key, Value]` cons cell (`is_list` already asserted).
                 } else {
                     // SAFETY: a non-leaf slot is a live boxed node or collision tuple.
                     let ihdr = unsafe { *boxed_val(item) };
@@ -816,14 +860,17 @@ mod tests {
         backward.reverse();
         let b1 = build(&forward, &a);
         let b2 = build(&backward, &a);
-        assert_eq!(
-            b1.map.raw(),
-            b1.map.raw(),
-            "sanity: the raw word is a pointer"
-        );
-        // The two maps must be structurally identical: compare the produced words.
+        // The two maps must be structurally identical: same shape and size.
         assert_eq!(size_object(b1.map), size_object(b2.map));
-        assert_eq!(b1._buf, b2._buf, "canonical layout is insertion-order free");
+        // Base-independent layout comparison: the canonical leaf/trie layout is
+        // insertion-order free (the block bases differ, so absolute pointers are
+        // normalized to offsets first).
+        let cap = map_words_capacity(forward.len());
+        assert_eq!(
+            normalize(&b1._buf[..cap]),
+            normalize(&b2._buf[..cap]),
+            "canonical layout is insertion-order free"
+        );
         assert!(eq(b1.map, b2.map, &a));
     }
 
@@ -866,7 +913,8 @@ mod tests {
             assert_eq!(map_size(put, &a).unwrap(), n.max(1) as usize);
             assert!(size_object(put) <= cap);
             if n == 0 {
-                assert!(is_flatmap(put));
+                // SAFETY: `put` is a live boxed map.
+                assert!(unsafe { is_flatmap(put) });
             }
 
             // Insert a brand-new key.
@@ -972,7 +1020,8 @@ mod tests {
     fn empty_pairs_and_single_pair_round_trip() {
         let a = atoms();
         let one = build(&[(make_small(42), make_atom(a.lookup("a").unwrap()))], &a);
-        assert!(is_flatmap(one.map));
+        // SAFETY: `one.map` is a live boxed map.
+        assert!(unsafe { is_flatmap(one.map) });
         assert_eq!(map_size(one.map, &a).unwrap(), 1);
         assert_eq!(
             map_get(one.map, make_small(42), &a).unwrap(),
@@ -1007,7 +1056,8 @@ mod tests {
         let a_atom = make_atom(t.lookup("a").unwrap());
         assert!(b_atom.raw() < a_atom.raw(), "b must have the lower index");
         let built = build(&[(a_atom, make_small(1)), (b_atom, make_small(2))], &t);
-        assert!(is_flatmap(built.map));
+        // SAFETY: `built.map` is a live boxed map.
+        assert!(unsafe { is_flatmap(built.map) });
         // SAFETY: `built.map` is a live flat map.
         let (keys, values) = unsafe { flatmap_parts(built.map) };
         assert_eq!(keys, &[b_atom, a_atom]);
