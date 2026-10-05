@@ -166,9 +166,11 @@ Consumers: `erts/lib_src/`, `erts/emulator/` (incl. `beam/sys.h`, `erl_utils.h`,
   TILE64/TILEPro (only reachable via `../../../xcomp/erl-xcomp-TileraMDE2.0-tilepro.conf`);
   `libatomic_ops/` is only selected with `--with-libatomic_ops`. Reading one of these dirs in
   isolation is misleading — the real definitions are in the dir it forwards to.
-- `erl_misc_utils.h`, `erl_printf*.h` and `ethr_internal.h` are installed into the release even though
-  `ethr_internal.h` is explicitly documented as internal-only. Presence in the installed tree is not a
-  stability promise.
+- Installed ≠ public, and the install set is *not* the directory contents: several headers here
+  (`ethr_internal.h`, `ethr_optimized_fallbacks.h`'s consumers aside, the whole `gcc/`…`win/` set) are
+  shipped in the release as internal includes, while `ethr_internal.h` — the most internal file of all —
+  is deliberately **not** in `INTERNAL_RELEASE_INCLUDES`. Do not treat presence in
+  `erts-<vsn>/include/internal` as an API commitment; `README` governs.
 
 ## Notes for Agents
 - To understand the ethread API, read `ethread.h` top-to-bottom first — it *is* the map: lines 120-223
