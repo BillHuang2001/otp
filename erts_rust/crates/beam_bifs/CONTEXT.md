@@ -232,6 +232,11 @@ rule (a non-empty proper list of small ints in `32..=126` ⇒ `"…"`, escaping 
 binaries ⇒ `<<"…">>`) only under `printable = true`. Maps render `#{k => v,…}` in the oracle's
 flatmap key order.
 
+## Notes for Agents
+- **`access.rs` and `bits.rs` are PRIVATE modules** (`mod access;`/`mod bits;` in `src/lib.rs:37,41`) — their `pub(crate)` safe wrappers are *not* reachable from other crates (e.g. `beam_rt`). The crate's cross-crate public surface is exactly the `pub use` list in `src/lib.rs:60-66` + `prelude` (`BifContext` and its seams, `BifRegistry`/`BifFn`/`default_registry`, the raise builders, `TableRegistry`, the reason mapping). There is **no public term construction/destruction helper module**.
+- **A dependent needing to destructure/construct boxed terms from safe Rust has two routes outside this crate:** (a) call the registered BIFs through `BifRegistry::call` (`hd`/`tl`/`element`/`map_get`/`binary:at`/`is_tuple`/`is_map`/`is_float`/`maps:from_list`/`list_to_binary`/`binary:copy`/`float`/`erlang:'/'` are all registered); or (b) use the sibling **safe** helper modules `beam_engine::terms::*` (`make_tuple`/`make_cons`/`make_list`/`make_float`/`make_flatmap`/`make_heap_binary`/`make_fun`, `tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/`list_elements`/`float_value`/`map_entries`/`binary_bytes`, fun readers `is_fun`/`fun_arity`/`fun_num_free`/`fun_uniq`/`fun_index`/`fun_free`; take `&mut dyn ExecutionContext`) and `beam_codec::term::*` (`make_float`/`make_big`/`make_flatmap`/`make_binary`/`make_bitstring`, `flatmap_parts`/`tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/`bitstring_bytes`/`float_value`; take `&mut Heap`). Both are `#[allow(unsafe_code)]` modules exposing safe `Result` APIs; `beam_term`'s own boxed accessors are all `unsafe fn` with no safe wrapper.
+- `BifContext` constructs **floats, lists, tuples, cons, small ints, atoms** safely (`make_float`/`list`/`tuple`/`cons`/`int`/`atom`/`intern_atom`) but has **no** binary/bitstring or map constructor — build those via the routes above.
+
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only — never a crate-local error enum, never
   `panic!`, never `unwrap()` on runtime data, never a wrong result. Argument violations ⇒ `BadArg`;
