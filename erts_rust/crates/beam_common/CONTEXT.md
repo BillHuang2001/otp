@@ -41,8 +41,9 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
 - **Stability:** public enums/structs are `#[non_exhaustive]`; construct via `Default`/`new` +
   builder setters. `BeamError` implements `Display` + `std::error::Error` (source = the inner
   `io::Error`); `From<std::io::Error>` is provided.
-- `LogLevel` ordering is `Debug < Info < Warning < Error < Silent`; `enabled(l)` is true when
-  `l <= level()`.
+- `LogLevel` ordering is `Debug < Info < Warning < Error < Silent`; the configured level is the
+  most verbose level emitted, so `enabled(l)` is true when `l >= level()` and `l != Silent`
+  (`Debug` enables everything; `Silent` enables nothing, so `enabled(Silent)` is always false).
 - Every public item (incl. fields and variants) is documented — `missing_docs` is denied.
 - **`unsafe` convention** (owned here, binding on all crates): `unsafe` is confined to explicitly
   marked modules; every `unsafe` block/`fn` carries a preceding `// SAFETY: <invariant/rationale>`
