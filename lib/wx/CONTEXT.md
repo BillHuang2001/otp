@@ -60,7 +60,7 @@ Built only when a system wxWidgets (with GL support) is available; the app is on
 | `c_src/` | Hand-written C/C++ NIF driver glue (`wxe_driver`, `erl_gl`); contains `c_src/gen/` (generated NIF glue) |
 | `include/` | Public installed Erlang headers `wx.hrl`, `gl.hrl`, `glu.hrl` (all generated) |
 | `test/` | Common Test suites, helper modules and the `wxt` standalone driver |
-| `doc/` | Documentation build (`docs.exs`, `Makefile`), guide sources (`guides/chapter.md`), release notes (`notes.md`), legacy `overview.edoc` |
+| `doc/` | Documentation build (`docs.exs`, `Makefile`), guide sources (`guides/chapter.md`), release notes (`notes.md`); `overview.edoc` is dead/unused |
 | `examples/` | Demo/sample apps (`demo/`, `simple/`, `sudoku/`) built as part of the normal (non-bootstrap) build |
 | `priv/` | Runtime assets — `erlang-logo{32,64,128}.png` (with `.license` sidecars) |
 
