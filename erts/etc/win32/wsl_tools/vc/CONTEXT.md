@@ -46,8 +46,8 @@ Unix flag in → MSVC flag out. Each script is a translator whose contract is "a
 - Observed divergence to keep in mind: `../../cygwin_tools/vc/` additionally ships `cc_wrap.c`/`ld_wrap.c` (unreferenced by the build) and a whole extra `../../cygwin_tools/mingw/` build tree with its own `emu_cc.sh`; `wsl_tools/vc/` and `msys_tools/vc/` have neither. Only `wsl_tools/vc/cc.sh` has the fast-dependency path.
 - Debug tracing: set `CC_SH_DEBUG_LOG`, `LD_SH_DEBUG_LOG`, `MC_SH_DEBUG_LOG`, `RC_SH_DEBUG_LOG`, `EMU_CC_SH_DEBUG_LOG` to a file path to append the expanded command lines (the first thing to do when a build fails inside a shim).
 - Which tree is selected is decided in `otp_build` (`env_win32`/`env_win64`/`echo_env_wsl`), not here.
-- Nothing in this directory is generated or auto-updated (unlike `../../../autoconf/`); every file here is hand-maintained. `coffix.exe` is the only build product.
-- Do not confuse this tree with the Unix launchers in `../../unix/` or the shared Windows sources in `../../`.
+- Nothing in this directory is generated or auto-updated (unlike `../../../../autoconf/`); every file here is hand-maintained. `coffix.exe` is the only build product.
+- Do not confuse this tree with the Unix launchers in `../../../unix/` or the shared Windows sources in `../../`.
 
 ## Dependencies
 - Microsoft Visual Studio (2019+) tools: `cl.exe`, `link.exe`, `lib.exe`, `rc.exe`, `mc.exe`, `mt.exe` (located by `SetupWSLcross.bat`/`vcvarsall` via `vswhere`).
