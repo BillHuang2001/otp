@@ -60,19 +60,32 @@ impl Runtime {
         self.program.as_deref()
     }
 
-    /// Runs the canonical probe and returns whether it printed `2`.
+    /// Runs the canonical probe, surfacing a genuine spawn error instead of hiding it.
     ///
-    /// Returns `false` (never panics) when the program is unresolved or fails to run.
-    pub fn self_check(&self) -> bool {
+    /// `Ok(false)` covers the non-error negative cases — the program is unresolved, the
+    /// program path is absent (`NotFound`), or the program ran but did not print `2`. A
+    /// genuine spawn failure (e.g. `PermissionDenied`, or an `ETXTBSY` that outlived all
+    /// retries) is returned as `Err` so it is not silently swallowed.
+    pub fn self_check_result(&self) -> std::io::Result<bool> {
         let Some(program) = &self.program else {
-            return false;
+            return Ok(false);
         };
         let mut cmd = Command::new(program);
         cmd.args(["-noshell", "-eval", PROBE_EVAL]);
         match proc::run(&mut cmd) {
-            Ok(out) => out.success && out.stdout_trim() == "2",
-            Err(_) => false,
+            Ok(out) => Ok(out.success && out.stdout_trim() == "2"),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(false), // genuine "missing program"
+            Err(e) => Err(e),                                                // surfaced loudly
         }
+    }
+
+    /// Runs the canonical probe and returns whether it printed `2`.
+    ///
+    /// Returns `false` (never panics) when the program is unresolved or fails to run. A
+    /// spawn error is treated as "not supported" here; callers that need to observe it
+    /// should use [`Runtime::self_check_result`] instead.
+    pub fn self_check(&self) -> bool {
+        self.self_check_result().unwrap_or(false)
     }
 
     /// Best-effort version string (the OTP release, e.g. `29`).
@@ -265,6 +278,69 @@ mod tests {
             program: Some(dir.join("does-not-exist")),
         }
         .self_check());
+    }
+
+    /// `self_check_result` keeps `self_check`'s `Ok(false)` semantics for the non-error
+    /// negative cases and the positive case, but surfaces a genuine spawn error as `Err`.
+    #[test]
+    fn self_check_result_distinguishes_negative_cases_from_a_genuine_spawn_error() {
+        let dir = tmpdir("result");
+        let good = script(&dir, "rl-ok", "echo 2");
+        let wrong = script(&dir, "rl-wrong", "echo 3");
+
+        // Positive: a program printing exactly `2`.
+        assert!(Runtime {
+            kind: RuntimeKind::Rust,
+            program: Some(good),
+        }
+        .self_check_result()
+        .expect("runs"));
+
+        // Negative, no error: unresolved, absent, and wrong-output.
+        assert!(!Runtime {
+            kind: RuntimeKind::Rust,
+            program: None,
+        }
+        .self_check_result()
+        .expect("none is not an error"));
+        assert!(!Runtime {
+            kind: RuntimeKind::Rust,
+            program: Some(dir.join("does-not-exist")),
+        }
+        .self_check_result()
+        .expect("NotFound is not surfaced"));
+        assert!(!Runtime {
+            kind: RuntimeKind::Rust,
+            program: Some(wrong),
+        }
+        .self_check_result()
+        .expect("wrong output is not an error"));
+
+        // Genuine error: a write-open-held script makes every `exec` fail with `ETXTBSY`,
+        // which outlives the bounded retries and must be surfaced (not swallowed).
+        #[cfg(unix)]
+        {
+            let held_path = script(&dir, "rl-held-open", "echo 2");
+            let held = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&held_path)
+                .expect("open the script for writing");
+            let rt = Runtime {
+                kind: RuntimeKind::Rust,
+                program: Some(held_path),
+            };
+            let err = rt
+                .self_check_result()
+                .expect_err("a write-open file cannot be exec'd");
+            assert_eq!(
+                err.kind(),
+                std::io::ErrorKind::ExecutableFileBusy,
+                "{err:?}"
+            );
+            // The `bool` wrapper still degrades this to `false`, never a panic.
+            assert!(!rt.self_check());
+            drop(held);
+        }
     }
 
     #[test]

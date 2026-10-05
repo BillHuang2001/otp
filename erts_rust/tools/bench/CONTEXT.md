@@ -165,6 +165,14 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - Files target ~1000 lines; split by responsibility before growing past it.
 
 ## Known Issues / Notes for Agents
+- **Spawn goes through a bounded `ETXTBSY` retry** (`proc::spawn_with_retry`, mirroring the
+  differential harness): both `proc::run` and `proc::spawn` retry ONLY the transient
+  `ExecutableFileBusy` / raw-errno-26 fork/exec race (≤5 attempts, ~10 ms backoff) and return every
+  other error kind unchanged. It is a bounded retry of a proven scheduling artifact (a concurrent
+  `fork()` while another thread holds a freshly written script open *for writing*), NOT error
+  swallowing — do not remove it. `Runtime::self_check_result` surfaces the errors that outlive it
+  (`Ok(false)` only for unresolved / `NotFound` / wrong-output; genuine spawn errors are `Err`), and
+  `Runtime::self_check() -> bool` stays a thin `unwrap_or(false)` wrapper for `info()`/`oracle_smoke`.
 - Build/test via the wrapper (read-only `$HOME`): from the repo root
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p bench`; a real run:
   `erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -p bench -- run --quick`.

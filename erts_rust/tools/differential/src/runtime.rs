@@ -1,7 +1,7 @@
 //! Runtime resolution and process observation.
 //!
-//! Two runtimes are observed with **identical argv** — the only difference is the
-//! program path (contract A.6: `beam_rt` is a drop-in `erl`):
+//! Two runtimes are observed and compared (contract A.6: `beam_rt` is a drop-in `erl`
+//! for the expression cases — the *only* difference there is the program path):
 //!
 //! * the **oracle** — `$ERTS_ORACLE` if set (the path must exist), otherwise `erl`
 //!   resolved by scanning `$PATH`. Nothing found ⇒ [`Error::Env`] (exit 2).
@@ -11,13 +11,27 @@
 //!   inventing a result.
 //!
 //! The harness never inspects runtime internals: it only spawns the program, feeds it
-//! argv with `stdin` closed, and records the observed stdout/stderr/exit status.
+//! argv with `stdin` closed, and records the observed stdout/stderr/exit status. The two
+//! runtimes receive **identical** argv for the expression corpus cases but **different**
+//! argv for the module-run cases (the oracle's `-eval` versus the Rust `run` action), so
+//! each [`Observation`] records the argv it was actually spawned with.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::error::{Error, Result};
+
+/// The exit code the Rust runtime uses to report a **capability gap** (an operation
+/// Milestone-1 does not implement) — distinct from `1` (a genuine runtime error) and `2`
+/// (a usage error).
+///
+/// This is the documented external signal the harness keys off: an exit-`3` observation is
+/// classified as [`SideResult::Unsupported`](crate::compare::SideResult), never as a
+/// differing observable result, so an unimplemented feature is `unsupported`, not a
+/// `mismatch`. The signal accompanies exactly one `beam_rt: unsupported: <reason>` stderr
+/// line (see `../../crates/beam_rt/src/cli.rs`).
+pub const UNSUPPORTED_EXIT_CODE: i32 = 3;
 
 /// Which of the two runtimes an observation came from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -78,7 +92,8 @@ pub struct Observation {
     pub runtime: RuntimeId,
     /// The program that was spawned.
     pub program: PathBuf,
-    /// The argv the program was spawned with (identical for both runtimes).
+    /// The argv the program was spawned with (per runtime — the expression cases share
+    /// one argv, the module-run cases differ).
     pub argv: Vec<String>,
     /// Captured standard output (raw bytes — never re-encoded).
     pub stdout: Vec<u8>,
@@ -203,7 +218,8 @@ pub fn resolve_rust_from(
 
 /// Build the argv for an evaluation: `["-noshell", <extra…>, "-eval", <expr>]`.
 ///
-/// The same argv is used for both runtimes; only the program path differs.
+/// The expression corpus cases hand this same argv to both runtimes; module-run cases
+/// build their argv per side (see [`crate::corpus::ModuleRun`]).
 pub fn eval_argv(expr: &str, extra: &[&str]) -> Vec<String> {
     let extra: Vec<String> = extra.iter().map(|arg| (*arg).to_string()).collect();
     eval_argv_owned(expr, &extra)
@@ -219,25 +235,78 @@ pub fn eval_argv_owned(expr: &str, extra: &[String]) -> Vec<String> {
     argv
 }
 
+/// How many times a child spawn is attempted before a transient `ETXTBSY` is surfaced.
+///
+/// The race is short-lived (it lasts only until the thread that is writing the script
+/// closes its descriptor), so a handful of attempts with a short backoff always suffices.
+const SPAWN_ATTEMPTS: u32 = 5;
+
+/// How long to wait between `ETXTBSY` spawn attempts.
+const SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+
+/// Spawn `cmd` and collect its output, retrying **only** the transient `ETXTBSY` race.
+///
+/// Both spawn sites in this crate legitimately execute a *freshly written* `#!/bin/sh`
+/// script: `$ERTS_ORACLE`/`$BEAM_RT` may name a wrapper script, and `module_build`-style
+/// stub compilers are scripts too. When one thread `fork()`s (via `Command::output`) while
+/// another thread still holds an open descriptor **for writing** that script, the child
+/// transiently inherits the descriptor; if the other thread then `exec`s the script the
+/// kernel refuses with `ETXTBSY` ("Text file busy", errno 26). This is a pure scheduling
+/// artifact — the file is fully written and executable — so retrying after a short pause
+/// yields exactly the result the first attempt would have produced had the other thread
+/// closed its descriptor first. It is therefore *not* error swallowing: every non-`ETXTBSY`
+/// error, and the `ETXTBSY` that survives all [`SPAWN_ATTEMPTS`] attempts, is returned
+/// unchanged for the caller to surface loudly.
+pub(crate) fn output_with_retry(cmd: &mut Command) -> std::io::Result<std::process::Output> {
+    let mut attempt = 1;
+    loop {
+        match cmd.output() {
+            Ok(output) => return Ok(output),
+            Err(err) if attempt < SPAWN_ATTEMPTS && is_transient_text_file_busy(&err) => {
+                std::thread::sleep(SPAWN_BACKOFF);
+                attempt += 1;
+            }
+            Err(err) => return Err(err),
+        }
+    }
+}
+
+/// Whether `err` is the transient `ETXTBSY` ("Text file busy") fork/exec race described on
+/// [`output_with_retry`].
+fn is_transient_text_file_busy(err: &std::io::Error) -> bool {
+    if err.kind() == std::io::ErrorKind::ExecutableFileBusy {
+        return true;
+    }
+    // Belt and suspenders: accept the raw errno too, in case a platform/libc mapping does
+    // not surface `ETXTBSY` as `ErrorKind::ExecutableFileBusy`.
+    #[cfg(unix)]
+    {
+        const ETXTBSY: i32 = 26;
+        if err.raw_os_error() == Some(ETXTBSY) {
+            return true;
+        }
+    }
+    false
+}
+
 /// Spawn `spec.program` with `argv`, with `stdin` closed, and capture its output.
 pub fn run(spec: &RuntimeSpec, argv: &[String]) -> Result<Observation> {
-    let output = Command::new(&spec.program)
-        .args(argv)
+    let mut cmd = Command::new(&spec.program);
+    cmd.args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|source| {
-            Error::io(
-                format!(
-                    "failed to execute the {} runtime '{}' with argv {:?}",
-                    spec.id.id(),
-                    spec.program.display(),
-                    argv
-                ),
-                source,
-            )
-        })?;
+        .stderr(Stdio::piped());
+    let output = output_with_retry(&mut cmd).map_err(|source| {
+        Error::io(
+            format!(
+                "failed to execute the {} runtime '{}' with argv {:?}",
+                spec.id.id(),
+                spec.program.display(),
+                argv
+            ),
+            source,
+        )
+    })?;
 
     Ok(Observation {
         runtime: spec.id,
@@ -274,7 +343,7 @@ fn rust_program_name() -> &'static str {
 }
 
 #[cfg(unix)]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     use std::os::unix::fs::PermissionsExt;
 
     match std::fs::metadata(path) {
@@ -284,19 +353,20 @@ fn is_executable(path: &Path) -> bool {
 }
 
 #[cfg(not(unix))]
-fn is_executable(path: &Path) -> bool {
+pub(crate) fn is_executable(path: &Path) -> bool {
     path.is_file()
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        eval_argv, eval_argv_owned, resolve_oracle_from, resolve_rust_from, run, RuntimeId,
-        RuntimeSource, RuntimeSpec,
+        eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry,
+        resolve_oracle_from, resolve_rust_from, run, RuntimeId, RuntimeSource, RuntimeSpec,
     };
     use crate::error::Error;
     use std::ffi::OsString;
     use std::path::{Path, PathBuf};
+    use std::process::Command;
 
     /// A scratch directory that removes itself when dropped.
     struct Scratch {
@@ -349,7 +419,7 @@ mod tests {
         assert_eq!(
             eval_argv("EXPR", &[]),
             vec!["-noshell", "-eval", "EXPR"],
-            "the probe argv must be the same for both runtimes"
+            "the expression-case probe argv is the drop-in erl shape"
         );
         assert_eq!(
             eval_argv("EXPR", &["-differential_test_flag", "hello"]),
@@ -486,6 +556,73 @@ mod tests {
         assert!(matches!(err, Error::Io { .. }), "{err:?}");
         assert_eq!(err.exit_code(), 2);
         assert!(err.to_string().contains("oracle"));
+    }
+
+    #[test]
+    fn output_with_retry_passes_a_successful_run_through_unchanged() {
+        let dir = Scratch::new("retry-ok");
+        let script = executable(&dir, "probe");
+        std::fs::write(&script, b"#!/bin/sh\necho out\nexit 0\n").expect("write script");
+        let mut cmd = Command::new(&script);
+        let output = output_with_retry(&mut cmd).expect("spawn");
+        assert!(output.status.success());
+        assert_eq!(output.stdout, b"out\n");
+    }
+
+    #[test]
+    fn output_with_retry_surfaces_a_non_transient_error_loudly() {
+        // A missing executable is not an ETXTBSY race: it must come straight back, so the
+        // bounded retry can never mask (or delay) a genuine spawn failure.
+        let mut cmd = Command::new("/nonexistent/erl-differential-retry-test");
+        let err = output_with_retry(&mut cmd).expect_err("must fail to spawn");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound, "{err:?}");
+    }
+
+    #[test]
+    fn is_transient_text_file_busy_matches_only_etxtbsy() {
+        assert!(is_transient_text_file_busy(&std::io::Error::from(
+            std::io::ErrorKind::ExecutableFileBusy
+        )));
+        assert!(is_transient_text_file_busy(
+            &std::io::Error::from_raw_os_error(26)
+        ));
+        assert!(!is_transient_text_file_busy(&std::io::Error::from(
+            std::io::ErrorKind::NotFound
+        )));
+        assert!(!is_transient_text_file_busy(
+            &std::io::Error::from_raw_os_error(13)
+        ));
+    }
+
+    /// Deterministically exercises the `ETXTBSY` path the retry exists for.
+    ///
+    /// Linux refuses to `exec` a file that **any** process (including this one) holds open
+    /// for writing, with `ETXTBSY` — exactly the transient error a concurrent `fork()` can
+    /// cause for a freshly written script. Holding the descriptor open therefore makes
+    /// *every* attempt fail, which pins down two behaviors a timing-dependent test could
+    /// not: the retry is **bounded** (it gives up and returns the error instead of spinning
+    /// or swallowing it), and once the writer is gone the very same command runs.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_retry_is_bounded_on_etxtbsy_and_surfaces_it() {
+        let dir = Scratch::new("retry-etxtbsy");
+        let script = executable(&dir, "held-open");
+        std::fs::write(&script, b"#!/bin/sh\necho out\nexit 0\n").expect("write script");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("open the script for writing");
+
+        let mut cmd = Command::new(&script);
+        let err = output_with_retry(&mut cmd).expect_err("a write-open file cannot be exec'd");
+        assert!(
+            is_transient_text_file_busy(&err),
+            "expected ETXTBSY, got {err:?}"
+        );
+
+        drop(held);
+        let output = output_with_retry(&mut cmd).expect("spawn once the writer closed");
+        assert_eq!(output.stdout, b"out\n");
     }
 
     #[test]

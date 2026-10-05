@@ -271,7 +271,8 @@ pub struct ListEntry {
     pub case_id: &'static str,
     /// The case description.
     pub description: &'static str,
-    /// The probe wrapper used.
+    /// The case kind: the probe wrapper for an expression case, `"module-run"` for a case
+    /// that compiles and runs an embedded module.
     pub probe: &'static str,
     /// The contracts covered, with their labels.
     pub contracts: Vec<ContractEntry>,
@@ -282,7 +283,7 @@ impl ListEntry {
         ListEntry {
             case_id: case.id,
             description: case.description,
-            probe: case.probe.as_str(),
+            probe: case.kind_label(),
             contracts: case
                 .contracts
                 .iter()
@@ -470,7 +471,8 @@ mod tests {
             description: "a case".to_string(),
             contracts: vec![Contract::BeamAsm],
             eval: "try ({ok,42}) of V -> ok end.".to_string(),
-            argv: vec!["-noshell".to_string()],
+            oracle_argv: vec!["-noshell".to_string()],
+            rust_argv: vec!["-noshell".to_string()],
             oracle: SideResult::observed(observation(b"ok <<131,97,42>>\n", Some(0))),
             rust,
             golden: GoldenCheck {
@@ -609,8 +611,8 @@ mod tests {
         assert!(text.contains("golden=ok"));
     }
 
-    /// The report of a real (oracle-backed) run must never claim agreement for the stub
-    /// side. Skipped loudly when the oracle is unavailable.
+    /// The report of a real (oracle-backed) run of an expression case must never claim
+    /// agreement for a capability-gap side. Skipped loudly when the oracle is unavailable.
     #[test]
     fn a_real_run_never_reports_fabricated_agreement() {
         let case = find_case("etf/term_to_binary_tuple").expect("case");

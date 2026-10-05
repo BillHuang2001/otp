@@ -99,6 +99,10 @@ pub struct RuntimeConfig { pub emulator: EmulatorConfig, pub code_paths: Vec<Pat
 ### `cli.rs` — the CLI parser + driver (contract A.6)
 ```rust
 pub const USAGE: &str;
+pub const EXIT_OK: i32 = 0;          // success
+pub const EXIT_RUNTIME: i32 = 1;     // genuine runtime error
+pub const EXIT_USAGE: i32 = 2;       // malformed invocation / usage error
+pub const EXIT_UNSUPPORTED: i32 = 3; // unsupported: a Milestone-1 capability gap
 pub fn parse(args: &[String]) -> Result<RuntimeConfig>;   // `args` excludes argv[0]
 pub fn run(args: Vec<String>) -> i32;                     // parse → Runtime → dispatch → exit code
 ```
@@ -120,7 +124,7 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
                       self_pid: ProcessId, term: Eterm) -> Result<String>;
 ```
 
-## CLI subset (contract A.6 — the *exact* supported surface; anything else is an ERROR)
+## CLI subset (contract A.6 — the *exact* supported surface; anything else is *unsupported*, exit 3)
 | Switch | Meaning in `beam_rt` |
 |---|---|
 | `-version`, `--version` | print the version banner (OTP `30.0-rc0` / erts `17.1`) and exit 0 |
@@ -137,10 +141,39 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
 
 * `-eval` subset: non-negative integer literals, binary `+`, `-`, `*` (with `*` binding tighter than
   `+`/`-`) and parentheses; evaluated by dispatching through the **`beam_bifs` `erlang` registry**
-  (arithmetic semantics are never re-implemented). Anything else → a clear error.
-* **An unknown switch is never silently ignored** — it is a parse error with a message naming it.
+  (arithmetic semantics are never re-implemented). Anything outside this grammar is a **capability
+  gap** (see exit code 3 below), not a genuine error.
+* **An unknown switch is never silently ignored** — it is a capability gap reported as *unsupported*,
+  naming the switch, with no usage text (exit 3). Real `erl` accepts unmodeled switches as init args
+  (`erl -noshell --nope -eval 'halt(0).'` exits 0), so this is a capability gap, not a usage error.
 * `run` and `-s` resolve modules through `code_paths` (`-pa`/`-pz`) + the file argument; M1 searches
   for `<Mod>.beam` in the code path.
+
+## Exit codes & the `unsupported` signal (the stable external contract)
+The CLI exposes **four** exit codes; the differential harness keys off this mapping.
+
+| Code | Meaning | stderr |
+|---|---|---|
+| `0` (`EXIT_OK`) | success | — |
+| `1` (`EXIT_RUNTIME`) | genuine runtime error (a load/execute/BIF failure, e.g. a missing `.beam`, module-not-found, unknown function, BIF `system_limit`) | `beam_rt: <error>` |
+| `2` (`EXIT_USAGE`) | malformed invocation / usage error (a missing operand of a *known* switch, a malformed `run` spec, a stray positional argument, a malformed numeric switch value) | `beam_rt: <error>` then [`USAGE`] |
+| `3` (`EXIT_UNSUPPORTED`) | **unsupported** — a Milestone-1 capability gap | exactly one line: `beam_rt: unsupported: <reason>` (no `USAGE`) |
+
+Unsupported is emitted for:
+1. a `-eval` expression outside the supported integer grammar (`src/eval.rs`);
+2. a BEAM-engine capability gap — a raise whose reason atom starts with `unsupported_opcode`;
+3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`;
+4. an **unrecognized command-line switch**.
+
+**Classification convention.** A capability gap is signalled by a raise whose **reason atom starts
+with `unsupported`**. `src/error.rs::unsupported_reason` is the **single** place that convention is
+interpreted: the constructors there (`unsupported`, `unknown_switch`, `bad_eval`) and the sibling
+crates (`beam_engine` `unsupported_opcode: <what>`, `beam_bifs` `unsupported_bif`) all follow it. It
+strips the leading `unsupported` token and any following `:`/`_`/space (`unsupported: X`→`X`,
+`unsupported_opcode: Y`→`opcode: Y`, `unsupported_bif`→`bif`) and returns `Some(reason)`; the CLI
+turns that into the `beam_rt: unsupported: <reason>` line and exit 3. Classification must go through
+`unsupported_reason` (which reads `ExitReason::as_atom`) rather than `BeamError::as_atom`, because the
+latter returns `None` for atoms backed by an **owned** `String` — which every message here is.
 
 ## `system_info/1` keys (contract A.8)
 `InfoValue` is the heap-free source of truth; `Runtime::system_info` materializes it on the scratch
@@ -197,8 +230,9 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   `heap_words` (64 Ki words) is ample for the slice. Growth-by-collection is Stage 4 (`beam_gc`).
 * **CLI is a documented subset, never a silent no-op.** Unmodeled emulator flags are **preserved
   verbatim** in `emulator.extra_emulator_flags` (the `beam_common` A.6 skeleton contract); a switch
-  that is *not* part of this crate's documented surface is a parse error. `-eval` and `run` reuse the
-  BIF registry rather than re-implementing arithmetic/printing.
+  that is *not* part of this crate's documented surface is a **capability gap** reported as
+  *unsupported* (exit 3) naming it, not a usage error. `-eval` and `run` reuse the BIF registry rather
+  than re-implementing arithmetic/printing.
 * **`system_info` returns `Eterm` via `InfoValue`.** The value is computed heap-independently
   (`InfoValue`) and materialized once (`InfoValue::to_eterm`); this makes the keys unit-testable
   without a heap and keeps the materialization in one place.
@@ -206,10 +240,13 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   integration-testable.
 
 ## Test Strategy
-* **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + the "unknown
-  switch errors" contract), `system_info_value` for every key + the unknown-key `badarg`, `InfoValue`
+* **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + the capability-gap
+  classification of unknown switches / bad `-eval` expressions), `system_info_value` for every key +
+  the unknown-key `badarg`, `InfoValue`
   → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, `eval`
-  subset (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, rejection of non-integers), CLI `+S/+P/-pa/-pz` mapping.
+  subset (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, rejection of non-integers), CLI `+S/+P/-pa/-pz` mapping,
+  `error::unsupported_reason` (`Some` for `unknown_switch`/`bad_eval`/`unsupported_opcode`/`unsupported_bif`,
+  `None` for `missing_value`/`module_not_found`/`BadArg`/`SystemLimit`).
 * **`tests/slice.rs` — the end-to-end library slice (the key evidence).** Loads the committed oracle
   fixture `../beam_loader/tests/fixtures/slice.beam` (reused by relative path via
   `concat!(env!("CARGO_MANIFEST_DIR"), …)` — a single source of truth, never copied) and asserts
@@ -220,7 +257,9 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   `run <slice.beam> slice:add/2 2 3` → stdout contains `5`;
   `run <slice.beam> slice:fib/1 10` → stdout contains `55`;
   `--version` → exit 0 + the version string; `-eval 2+3` → `5`;
-  an unknown switch → non-zero exit + a message naming it.
+  an unknown switch → exit 3 + a single `beam_rt: unsupported:` stderr line naming it and **no**
+  `Usage:`; `-eval` outside the grammar → exit 3; a missing `.beam` / module-not-found → exit 1;
+  a missing switch operand or a stray positional argument → exit 2 + `Usage:`.
 * **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` GREEN;
   the whole-workspace `build`/`test` must stay green.
 
@@ -235,14 +274,16 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * **`erts_version` is accepted as a non-standard alias** of `version`; real ERTS raises `badarg`. Remove
   it once the differential harness pins the authoritative key set.
 * **`-eval`/`-s` are documented subsets** (`-s` uses atoms + discards the result; `-eval` is integer
-  arithmetic only). Real `erl` start-script processing, `-run`, `-init_debug` and the rest are absent.
+  arithmetic only). An `-eval` expression outside the grammar is *unsupported* (exit 3). Real `erl`
+  start-script processing, `-run`, `-init_debug` and the rest are absent — and, like any unmodeled
+  switch, are reported as *unsupported* rather than silently ignored.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
 * `src/lib.rs` → crate docs, `#![deny(unsafe_code)]`, module wiring, root re-exports, `prelude`
-* `src/error.rs` → `pub(crate)` `BeamError` constructors (unknown switch/action, unknown info key, unknown function, unsupported op) — no crate-local error enum
+* `src/error.rs` → `pub(crate)` `BeamError` constructors (unknown switch, unknown info key, unknown function, unsupported op) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
 * `src/config.rs` → `RuntimeConfig`, `Action`, `EmulatorConfig` alias, defaults/setters
-* `src/cli.rs` → `USAGE`, `parse` (the A.6 parser), `run` (the CLI driver + exit codes)
+* `src/cli.rs` → `USAGE`, `parse` (the A.6 parser), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed + the boot banner
 * `src/info.rs` → `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
 * `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (BIF dispatch + heap check)

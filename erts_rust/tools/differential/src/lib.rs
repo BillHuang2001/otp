@@ -1,9 +1,16 @@
 //! The differential-test harness: the **compatibility gate** of the Rust ERTS rewrite.
 //!
-//! For a given Erlang expression (or corpus case) the harness runs the **real system
-//! ERTS** (the *oracle*) and the **Rust runtime** (`beam_rt`) with **identical argv** as a
-//! drop-in `erl` (compatibility contract A.6), then compares the **observable results**:
-//! exact stdout bytes, exit status, stderr, and the case's own golden expectation.
+//! For a given corpus case the harness runs the **real system ERTS** (the *oracle*) and
+//! the **Rust runtime** (`beam_rt`), then compares the **observable results**. There are
+//! two kinds of case ([`CaseKind`]):
+//!
+//! * expression cases evaluate the *same* self-terminating probe under both runtimes and
+//!   compare stdout + exit status + stderr, and the case's own golden (contracts A.2/A.8).
+//! * module-run cases compile a tiny embedded Erlang module with the system `erlc` and
+//!   compare the value the two runtimes produce from a real `.beam` (stdout + exit status).
+//!
+//! A Rust-side observation that exits with [`runtime::UNSUPPORTED_EXIT_CODE`] (`3`) is a
+//! documented **capability gap** and is reported `unsupported` — never a `mismatch`.
 //!
 //! This crate is a pure **driver/observer**: it never modifies a runtime and never
 //! inspects its internals — the only contract with `beam_rt` is its documented external
@@ -16,9 +23,9 @@
 //! use differential::corpus::{find_case, probe_expr};
 //! use differential::Probe;
 //!
-//! // A case is a plain Erlang expression plus how to probe it and what the oracle must print.
+//! // An expression case is a plain Erlang expression plus how to probe it.
 //! let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
-//! assert_eq!(case.expr, "{ok,42}");
+//! assert_eq!(case.expr(), Some("{ok,42}"));
 //!
 //! // The probe wrapper makes a BEAM exception observable (erl -noshell prints nothing).
 //! let probe = probe_expr("length([a,b,c])", Probe::Value);
@@ -34,7 +41,7 @@
 //!
 //! let case = corpus::find_case("etf/term_to_binary_tuple").expect("case");
 //! let outcome = harness::run_case(case).expect("oracle must be resolvable");
-//! // The Rust side is `unsupported` while `beam_rt` is a stub — never "agree".
+//! // An expression case the Rust runtime cannot evaluate is `unsupported` — never "agree".
 //! let json = report::RunReport::from_case("run", &outcome)
 //!     .to_json_string()
 //!     .unwrap();
@@ -55,16 +62,22 @@ pub mod compare;
 pub mod corpus;
 pub mod error;
 pub mod harness;
+pub mod module_build;
 pub mod report;
 pub mod runtime;
 
-pub use compare::{compare_observations, FieldDiff, GoldenCheck, SideResult, Verdict};
-pub use corpus::{find_case, probe_expr, Case, Contract, Golden, Probe};
+pub use compare::{
+    compare_observations, compare_observations_with, verdict, verdict_with, FieldDiff, GoldenCheck,
+    Observables, SideResult, Verdict,
+};
+pub use corpus::{find_case, probe_expr, Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 pub use error::{Error, Result};
 pub use harness::{
     compare_expr, run_case, run_suite, CaseOutcome, RuntimeContext, SuiteOutcome,
 };
+pub use module_build::CompiledModule;
 pub use report::{CaseReport, ListReport, RunReport, Summary};
 pub use runtime::{
     eval_argv, resolve_oracle, resolve_rust, Observation, RuntimeId, RuntimeSource, RuntimeSpec,
+    UNSUPPORTED_EXIT_CODE,
 };
