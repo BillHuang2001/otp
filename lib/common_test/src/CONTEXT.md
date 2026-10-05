@@ -89,7 +89,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `ct_slave.erl` — starts/stops support nodes (`start/1,2,3, stop/1,2, ...`), optionally via `ssh` (`application:ensure_all_started(ssh)`).
 
 ### (h) Connectivity / helper libraries for suites
-- `ct_telnet.erl` — telnet client API over `ct_gen_conn`/`ct_telnet_client`; `open/1..4, close/1, cmd/2,3,4, send/2,3, expect/2,3,4, cmdf/3,4, get_data/1,2`; types `connection/0, connection_type/0, handle/0, prompt_regexp/0`.
+- `ct_telnet.erl` — telnet client API over `ct_gen_conn`/`ct_telnet_client`; `open/1..4, close/1, cmd/2,3, cmdf/3,4, get_data/1, send/2,3, sendf/3,4, expect/2,3`; types `connection/0, connection_type/0, handle/0, prompt_regexp/0`.
 - `ct_telnet_client.erl` — low-level telnet protocol client (option negotiation, `open/2..6, send_data/2,3, get_data/1`).
 - `unix_telnet.erl` — callback module implementing the `unix_telnet` connection for `ct_telnet` (login/prompt/`?CONN_KEY` handling); the documented example of `ct_gen_conn` usage.
 - `ct_ftp.erl` — FTP client helper (`open/1..4, close/1, cd/2, lcd/2, get/2,3, put/2,3, delete/2, ls/1,2, recv/1,2, send/2,3`); types `connection/0, handle/0`.
