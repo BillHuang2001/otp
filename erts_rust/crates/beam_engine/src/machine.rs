@@ -13,7 +13,7 @@
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, Result};
 use beam_loader::{Atom, Label, Module};
-use beam_term::{is_non_value, make_atom, Eterm, NIL, THE_NON_VALUE};
+use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -608,6 +608,7 @@ mod tests {
     use super::*;
     use crate::context::MinimalContext;
     use beam_loader::Label;
+    use beam_term::make_atom;
 
     #[test]
     fn new_has_nil_filled_register_file() {
