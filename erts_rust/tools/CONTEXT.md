@@ -1,0 +1,55 @@
+# Tooling (`tools/`) — Differential Gate & Benchmark Driver
+
+## Intent
+The two in-repo tooling crates that make the Rust ERTS rewrite **verifiable** and **measurable**:
+- `differential/` — the **differential-test compatibility gate** (Stage 0, Part II §H; the safety net for everything else, per Part I §G.7 "no compatibility regressions"). For a case it runs the real system ERTS (the **oracle**) **and** the Rust runtime (`beam_rt`), then compares the observable results.
+- `bench/` — the **benchmark driver** (Part I §G.7/§I success metrics: startup latency, p99 tail latency, throughput on named benchmarks, memory footprint). It drives the external target projects named in `../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` and **always** records the system-ERTS baseline.
+
+Neither tool modifies the runtime or the external repos — both are pure drivers/observers.
+
+## API Surface (CLI)
+Both crates ship a **library + a binary**: the library exists so `cargo test` can assert the harness itself (against the oracle / against fixture binaries), and the binary is what a human or CI drives. `--help` must be usable on every subcommand.
+
+### `differential`
+- `differential run <case-id> [--json]` — run one built-in conformance case both ways; print the comparison.
+- `differential compare <module|expr> [--json]` — ad-hoc: evaluate an Erlang expression/module under both runtimes and compare.
+- `differential suite [--strict] [--json] [--out <dir>]` — run the built-in conformance corpus.
+- `differential list [--json]` — list corpus case ids + the compatibility contract each covers.
+- Exit codes: `0` all executed cases agreed (skips/unsupported reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to a failure exit.
+
+### `bench`
+- `bench list [--json]` — list workloads + their prerequisite-probe status.
+- `bench run [--quick|--full] [--workloads <ids>] [--runtime <sys|rust|all>] [--out <dir>] [--json]` — run workloads, write results JSON.
+- `bench baseline [--quick]` — measure the system-ERTS baseline only.
+- `bench compare <a.json> <b.json> [--json]` — diff two result sets.
+- Exit codes: `0` run completed (per-workload `skipped(reason)` is not fatal); `2` usage/env error. A workload that *errors* is recorded `failed` in JSON.
+
+## Shared Conventions (binding on both crates)
+- **Runtime resolution — documented, overridable, no baked absolute paths:**
+  - **Oracle** = `$ERTS_ORACLE` if set, else `erl` resolved on `PATH`. Missing ⇒ loud env error (exit 2).
+  - **Rust runtime** = `$BEAM_RT` if set, else the workspace-relative `target/{release,debug}/beam_rt` (relative to `../..`). If neither exists ⇒ cases report `unsupported`.
+  - Both runtimes are invoked with the **same argv** as `erl` — `beam_rt` is treated as a drop-in `erl` (contract A.6). The tool sets only the *program path*; it never assumes internals.
+- **Honest reporting:** a case/workload that cannot run is `unsupported` / `skipped(<reason>)` — **never** `pass`, and oracle output/metrics are never fabricated.
+- **Machine-readable results:** JSON with a stable schema, written under the crate's gitignored `out/` dir (`differential/out/`, `bench/out/`) unless `--out` overrides.
+- **No heavy new deps:** `serde`/`serde_json` (already workspace deps) for JSON; **hand-rolled `std`-only arg parsing** (no `clap`) to stay offline-safe. Failures are loud (nonzero exit / explicit status), never silently swallowed.
+- Files target ~1000 lines; split by responsibility. Apache-2.0.
+
+## Constraints
+- **Do not couple to `crates/*` internals.** The only contract with `beam_rt` is its documented external CLI (A.6). `beam_rt` is currently a stub — absence/non-support must degrade to `unsupported`, not crash.
+- `bench` investigates the external repos **read-only** (`/home/bill/Source/{elixir,cowboy,khepri,emqx,Programming-Language-Benchmarks}`): it may build/run them but must **not** commit into them.
+- Keep default runs fast (`--quick`); full suites are milestone-only (Part I §C; root §6).
+- `unsafe` is forbidden in both crates.
+
+## Routing Table
+- `differential/` → differential-test compatibility gate: oracle runner, Rust-runtime runner, observable-result comparison (stdout, `term_to_binary`, exception class+reason, `system_info`), built-in conformance corpus, JSON reports
+- `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
+
+## Notes for Agents
+- Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
+- Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
+
+## See Also
+- `../CONTEXT.md` §6 (test strategy) and §"Notes for Agents" — the differential gate and the external targets.
+- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §H (Stage 0 mandates the harness).
+- `../../ERTS_RUST_REWRITE_EVALUATION.md` §G.7 / §I (success metrics, differential suite gate).
+- `../../ERTS_RUST_REWRITE_TEST_PROJECTS.md` — the concrete benchmark targets + build/bench entry points.
