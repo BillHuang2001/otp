@@ -59,7 +59,7 @@ impl Runtime {
     /// `system_info/1` as a heap-independent value (the testable source of truth).
     pub fn system_info_value(&self, key: &str) -> Result<InfoValue>;
 
-    /// Evaluate the documented `-eval` integer-expression subset (A.6).
+    /// Evaluate an Erlang expression (`erl_eval`-style tree-walk; A.6).
     pub fn eval(&mut self, expr: &str) -> Result<Eterm>;
 
     /// Print a term via the registered `io:format` `~p` printer (no second printer).
@@ -78,7 +78,7 @@ impl<'a> RuntimeContext<'a> {
     pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
 }
 impl ExecutionContext for RuntimeContext<'_> {
-    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/init:get_argument)
+    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/init:get_argument/system_info)
     //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` over
     //             {heap, code_server atoms, self_pid, tables, output}); else if module == "erlang"
     //             → `error::unknown_bif`; else seed the system code path
@@ -138,7 +138,7 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
 |---|---|
 | `-version`, `--version` | print the version banner (OTP `30.0-rc0` / erts `17.1`) and exit 0 |
 | `-noshell` | run head-less (M1 default; accepted, no interactive shell exists) |
-| `-eval Expr` | evaluate the **documented integer subset** and print **nothing** (real `erl` semantics — `erl -eval '2+3'` prints nothing, exits 0); one trailing `.` is tolerated and stripped |
+| `-eval Expr` | evaluate a **general Erlang expression** (`erl_eval`-style) and print **nothing** — the result is discarded, exactly like real `erl` (`erl -eval '2+3'` prints nothing, exits 0); one trailing `.` is tolerated and stripped |
 | `-s Mod Func [Args...]` | apply `Mod:Func(a, b, …)` (Arguments are **atoms**); the result is **discarded** (real `erl` semantics); exit 0 on success |
 | `-run Mod Func [Args...]` | same, but Arguments are plain **strings**, materialized as Erlang char lists; the result is **discarded** |
 | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` dirs) |
@@ -149,9 +149,11 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
 | `-name N` / `-sname N` | node name → `emulator.node_name` (distribution M1 = skeleton) |
 | `run <file.beam> <mod>:<func>/<arity> [int-arg…]` | **the vertical slice**: load the file, run, **print** the result |
 
-* `-eval` subset: non-negative integer literals, binary `+`, `-`, `*` (with `*` binding tighter than
-  `+`/`-`) and parentheses; evaluated by dispatching through the **`beam_bifs` `erlang` registry**
-  (arithmetic semantics are never re-implemented). Anything outside this grammar is a **capability
+* `-eval` grammar: the Erlang **expression** subset (`src/eval/{parse,ast,mod}.rs`) — literals in every
+  base, lists/tuples/maps/binaries, the full operator set with Erlang precedence,
+  `case`/`if`/`begin`/`try`/`catch`/`receive`, `fun`s and comprehensions — evaluated by an
+  `erl_eval`-style tree-walk that dispatches arithmetic/comparison to the **`beam_bifs` `erlang`
+  registry** (semantics are never re-implemented). An expression outside the grammar is a **capability
   gap** (see exit code 3 below), not a genuine error.
 * **Every command-line flag is an init argument.** Each recognized switch *and* each unrecognized
   `-flag`/`+flag` (name = the flag with the leading `-`/`+` run removed; values = the following tokens
@@ -178,7 +180,7 @@ The CLI exposes **four** exit codes; the differential harness keys off this mapp
 | `3` (`EXIT_UNSUPPORTED`) | **unsupported** — a Milestone-1 capability gap | exactly one line: `beam_rt: unsupported: <reason>` (no `USAGE`) |
 
 Unsupported is emitted for:
-1. a `-eval` expression outside the supported integer grammar (`src/eval.rs`);
+1. a `-eval` expression outside the supported grammar (`src/eval/parse.rs`);
 2. a BEAM-engine capability gap — a raise whose reason atom starts with `unsupported_opcode`;
 3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`.
 
@@ -258,8 +260,9 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + `init_args`
   recording of recognized *and* unmodeled switches, the `run` argument grammar, the `-eval`
   trailing-dot, `-run`), `system_info_value` for every key + the unknown-key `badarg`, `InfoValue`
-  → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, `eval`
-  subset (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, rejection of non-integers), CLI `+S/+P/-pa/-pz` mapping,
+  → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, the
+  evaluator (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, `case`/`catch`/`fun`/comprehension cases, malformed
+  input → typed gap), CLI `+S/+P/-pa/-pz` mapping,
   the native floor (`erlang:halt/0,1` records `Runtime::halt`, `init:get_argument` occurrences/absent),
   `error::unsupported_reason` (`Some` for `bad_eval`/`unsupported_opcode`/`unsupported_bif`, `None` for
   `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`.
@@ -276,6 +279,14 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   an **unknown switch** → exit 0 (recorded as an init argument); `-eval` outside the grammar → exit 3
   + exactly one `beam_rt: unsupported:` stderr line and **no** `Usage:`; a missing `.beam` → exit 1;
   a missing switch operand or a stray positional argument → exit 2 + `Usage:`.
+* **`tests/eval.rs` — the `-eval` evaluator end-to-end (the differential corpus).** Reproduces all
+  **17** `Eval` probes of `tools/differential`'s corpus (`terms`/`etf`/`bifs`/`system_info`/`flags`) at
+  the CLI boundary, using the **same** self-terminating `try … catch` wrapper and argv the harness
+  builds (`-noshell [extra…] -eval <probe>`), and asserts the **exact** stdout + exit status of each.
+  This pins the corpus goldens without needing the oracle `erl` at run time, so a regression in the
+  parser/evaluator/printer/exit-code path is caught even where `erl` is absent. Adds a control-flow
+  extras test (`case`/comprehension/`fun`/`element`/`abs`, goldens verified against system `erl`) and
+  an unsupported-classification check.
 * **`tests/multimodule.rs` — the multi-module host.** Compiles a fixture with the system `erlc` into a
   scratch dir and runs it through `Runtime::run_function`: `lists:reverse/1` → `[3,2,1]`,
   `maps:get/2` on a map literal → `7`, and the on-demand stdlib module `ordsets`. It **skips loudly**
@@ -292,9 +303,11 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
-  strings; `-eval` is integer arithmetic only and prints nothing). An `-eval` expression outside the
-  grammar is *unsupported* (exit 3). Real `erl` start-script processing, `-init_debug` and the rest are
-  absent — and, like any unmodeled switch, are recorded as init arguments rather than acted on.
+  strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
+  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`, a closure
+  escaping into a higher-order stdlib call) are typed errors in `src/eval/mod.rs`. Real `erl`
+  start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
+  recorded as init arguments rather than acted on.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
@@ -306,13 +319,16 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * `src/info.rs` → `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
 * `src/codeserver.rs` → `CodeServer`: the shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file` (the load-on-demand host)
 * `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun`; heap check)
-* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `init:get_argument/1` — always consulted before the registry)
-* `src/eval.rs` → the `-eval` integer-expression parser/evaluator (dispatches through `beam_bifs`)
+* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1` — always consulted before the registry)
+* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` is uncatchable), dispatching calls through `RuntimeContext`
+* `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
+* `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
 * `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
+* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus control-flow extras and the unsupported-classification check
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
