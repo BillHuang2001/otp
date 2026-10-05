@@ -11,7 +11,9 @@
 //! - [`Instr::Try`] / [`Instr::Catch`] — push a catch frame
 //! - [`Instr::TryCase`] / [`Instr::TryEnd`] / [`Instr::CatchEnd`] — the handler
 //!   opcodes (each consumes exactly one catch frame)
-//! - [`Instr::BuildStacktrace`] / [`Instr::RawRaise`] — documented `unsupported`
+//! - [`Instr::BuildStacktrace`] — cook the raw stacktrace in `x(0)` into the
+//!   symbolic `[{M,F,A,Location}]` form
+//! - [`Instr::RawRaise`] — raise from `x(0)`=class, `x(1)`=value, `x(2)`=trace
 //!
 //! ## Semantics (C ground truth, `emu/instrs.tab:1137-1263`, `beam_common.c:735-778`)
 //!
@@ -48,8 +50,15 @@
 //! - `catch_end` cannot build `{'EXIT',V}` in a module whose atom table lacks
 //!   `'EXIT'` (the loader exposes only the module's atoms); it returns a typed
 //!   `unsupported` rather than substituting a wrong atom.
-//! - [`Instr::BuildStacktrace`] / [`Instr::RawRaise`] (the NIF error-return path)
-//!   are `unsupported`: the engine has no raw-stacktrace/class protocol yet.
+//! - [`Instr::BuildStacktrace`] cooks a **NIL** raw stacktrace to `NIL` exactly as
+//!   C does (a caught exception lands with `x(2) = NIL` because the machine
+//!   captures no stacktrace), and approximates a non-NIL one from the machine's
+//!   **live call frames** — the engine keeps no raw `StackTrace` object. See the
+//!   `symbolic_stacktrace` body for the precise residuals.
+//! - [`Instr::RawRaise`] reproduces C exactly for the three real classes and for
+//!   the "unknown class" fall-through; the fall-through needs the atom `badarg` in
+//!   the module's atom table (a module whose atom table lacks it is a typed
+//!   error, never a substituted atom).
 //! - The re-raise opcode [`Instr::Raise`] requires a class to be currently
 //!   handled ([`Machine::pending_class`]); the compiler emits it only as the
 //!   "no catch clause matched" tail of a handler, where that always holds
@@ -58,8 +67,8 @@
 use std::collections::BTreeMap;
 
 use beam_common::{ExceptionClass, Result};
-use beam_loader::{Instr, Label, Module, Operand};
-use beam_term::{is_nil, make_atom, Eterm, NIL};
+use beam_loader::{Instr, Label, LineEntry, Module, Operand};
+use beam_term::{is_nil, make_atom, make_small, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -78,8 +87,8 @@ pub(crate) fn exec(
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
     instr: &Instr,
-    _func: u32,
-    _pc: u32,
+    func: u32,
+    pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
     match instr {
@@ -179,10 +188,59 @@ pub(crate) fn exec(
             Ok(Some(Step::Next))
         }
 
-        // The NIF error-return protocol (cook a raw stacktrace / raise from
-        // `x(0..2)`), out of Milestone-1 scope.
-        Instr::BuildStacktrace => Err(error::unsupported("build_stacktrace")),
-        Instr::RawRaise => Err(error::unsupported("raw_raise")),
+        // `build_stacktrace` — cook the raw stacktrace in `x(0)` into the
+        // symbolic `[{M,F,A,Location}]` list (C:
+        // `x(0) = build_stacktrace(c_p, x(0))`, `emu/instrs.tab:1247-1251`).
+        Instr::BuildStacktrace => {
+            let raw = read_operand(machine, &Operand::X(0))?;
+            // C's `get_trace_from_exc/1` returns NULL for a NIL exception, and
+            // `build_stacktrace` then yields NIL (`beam_common.c:1219-1223`). The
+            // M1 machine captures no stacktrace, so every caught exception lands
+            // with `x(2) = NIL` (`Machine::land_exception`) and the compiler's
+            // handler moves that into `x(0)` — the engine therefore reproduces the
+            // oracle's `[]` exactly on the compiled path. A non-NIL raw stacktrace
+            // (which no compiler-emitted path produces at M1) is approximated from
+            // the machine's live call frames.
+            let cooked = if is_nil(raw) {
+                NIL
+            } else {
+                symbolic_stacktrace(machine, module, ctx, func, pc)?
+            };
+            machine.set_x(0, cooked)?;
+            Ok(Some(Step::Next))
+        }
+
+        // `raw_raise` — raise from the register protocol (`emu/instrs.tab:1253-1263`,
+        // `beam_common.c:1148-1179`): x(0) = the class atom, x(1) = the value,
+        // x(2) = the raw stacktrace. `raw_raise` is what `sys_core_fold` folds the
+        // `catch C:R:S -> erlang:raise(C, R, S)` shape into
+        // (`lib/compiler/src/sys_core_fold.erl:2441-2465`).
+        Instr::RawRaise => {
+            let class_term = read_operand(machine, &Operand::X(0))?;
+            let value = read_operand(machine, &Operand::X(1))?;
+            let trace = read_operand(machine, &Operand::X(2))?;
+            match classify_class(module, class_term) {
+                Some(class) => {
+                    // The class atom is exactly the one we matched, so it is
+                    // present in the module atom table and the landing can install
+                    // it in `x(3)` (C stores the class in the `StackTrace` struct
+                    // *and* in `c_p->freason`, `beam_common.c:1151-1175`).
+                    install_class_atom(machine, module, class)?;
+                    machine.throw_with_trace(class, value, trace).map(Some)
+                }
+                None => {
+                    // C: an unknown class is not an error — `raw_raise` returns 1,
+                    // the instruction stores `am_badarg` in `x(0)` and execution
+                    // continues with the next instruction (no raise,
+                    // `beam_common.c:1176-1178`).
+                    let badarg = module.atom_table.lookup("badarg").ok_or_else(|| {
+                        error::unsupported("raw_raise: module atom table lacks the 'badarg' atom")
+                    })?;
+                    machine.set_x(0, make_atom(badarg))?;
+                    Ok(Some(Step::Next))
+                }
+            }
+        }
 
         // Not this family's variant.
         _ => Ok(None),
@@ -249,6 +307,175 @@ fn install_class_atom(
             class.as_str()
         ))),
     }
+}
+
+// ---------------------------------------------------------------------------
+// `build_stacktrace` — the symbolic (cooked) stacktrace
+// ---------------------------------------------------------------------------
+
+/// The BEAM exception `class` the atom `class_term` names, if any.
+///
+/// C compares against its global `am_error`/`am_exit`/`am_throw`
+/// (`../../erts/emulator/beam/beam_common.c:1161-1176`); the engine's atoms are
+/// module-local, so the names are resolved through the running module's atom
+/// table. Any other term — including a non-atom — is *not* a class, which is
+/// exactly what makes `raw_raise` take its `badarg` fall-through.
+fn classify_class(module: &Module, class_term: Eterm) -> Option<ExceptionClass> {
+    [
+        ExceptionClass::Error,
+        ExceptionClass::Exit,
+        ExceptionClass::Throw,
+    ]
+    .into_iter()
+    .find(|class| module.atom_table.lookup(class.as_str()).map(make_atom) == Some(class_term))
+}
+
+/// The symbolic (cooked) stacktrace `[{Module,Function,Arity,Location}]` for a
+/// non-`NIL` raw stacktrace, innermost frame first.
+///
+/// **Milestone-1 approximation — the precise residuals.** C's `build_stacktrace`
+/// (`../../erts/emulator/beam/beam_common.c:1204-1292`) walks the *saved* raw
+/// `StackTrace` object carried by the exception (`s->trace[]`, a sequence of saved
+/// continuation pointers) and resolves each through `erts_lookup_function_info`,
+/// building `{M,F,A,Location}` items with `erts_build_mfa_item`
+/// (`../../erts/emulator/beam/utils.c:3430-3457`). The M1 machine keeps no such
+/// object — it captures no stacktrace at all — so the engine substitutes the
+/// equivalent information it *does* have: the **live call frames**. Every frame's
+/// continuation-pointer slot is a `(func, pc)` ([`Machine::resumption_addresses`]);
+/// `func` indexes the running [`Module`]'s functions, giving
+/// `{Module,Function,Arity}`, and the location is the `line` marker in effect at
+/// `pc` (C's line lookup, `../../erts/emulator/beam/beam_file.c`).
+///
+/// The residuals, all deliberate and all reported:
+/// 1. **Only interpreted frames appear.** The frame stack starts at the
+///    `run_export`/`run_label` entry, so a caller *outside* the run — the host's
+///    own chain, the oracle's trailing `erl_eval`/`init` entries — has no frame
+///    here and is absent from the result. A call that leaves the loop into the
+///    host context (a `call_ext` into another module, an `apply_fun`) likewise
+///    materialises no interpreted frame.
+/// 2. **The frames are the live ones, not the saved ones.** C reports the chain
+///    captured when the exception was raised; the engine reports the chain at
+///    `build_stacktrace` time. The compiler emits `build_stacktrace` immediately
+///    after `try_case`, which has already unwound to the frame owning the handler,
+///    so C's saved chain additionally holds the frames the raise unwound out of.
+/// 3. **The innermost item carries the arity, never an argument list.** C uses the
+///    exception's saved arguments where the raw trace holds them (`args` in
+///    `erts_build_mfa_item`); M1 keeps no such list, so the arity — C's own
+///    fallback for a frame without saved args — is always emitted.
+/// 4. **No `error_info` entries.** C's innermost item extends its `Location` with
+///    the raw trace's extra info (`get_error_info_from_exc`); M1 has none.
+///
+/// The *order* is C's: `build_stacktrace` prepends the current function last
+/// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
+fn symbolic_stacktrace(
+    machine: &Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    func: u32,
+    pc: u32,
+) -> Result<Eterm> {
+    // The function executing right now (the dispatch loop's current position),
+    // then every frame that is suspended in a call, innermost first.
+    let mut frames = Vec::new();
+    for (func, pc) in std::iter::once((func, pc)).chain(machine.resumption_addresses()) {
+        frames.push(stacktrace_item(module, ctx, func, pc)?);
+    }
+    terms::make_list(ctx, &frames)
+}
+
+/// One `{Module,Function,Arity,Location}` stacktrace item for the function at
+/// index `func`, located at code offset `pc` (C's `erts_build_mfa_item`,
+/// `../../erts/emulator/beam/utils.c:3430-3457`).
+fn stacktrace_item(
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    func: u32,
+    pc: u32,
+) -> Result<Eterm> {
+    let function = module
+        .functions
+        .get(func as usize)
+        .ok_or_else(|| error::unsupported("build_stacktrace: function index out of range"))?;
+    let location = location_term(module, ctx, func, pc)?;
+    terms::make_tuple(
+        ctx,
+        &[
+            make_atom(function.module),
+            make_atom(function.name),
+            make_small(function.arity as i64),
+            location,
+        ],
+    )
+}
+
+/// The `Location` element of a stacktrace item: `[{file,Name},{line,N}]` when the
+/// function has a source location in effect at `pc`, else [`NIL`].
+///
+/// C appends the pair only when the resolved location is not
+/// `LINE_INVALID_LOCATION`, in that `{file,..}`-then-`{line,..}` order
+/// (`../../erts/emulator/beam/utils.c:3432-3446`). The engine maps "invalid" to
+/// the loader's undefined location (item 0, whose line is 0 — real Erlang source
+/// lines are 1-based) and to a file-name index outside the module's `Line` chunk;
+/// both yield [`NIL`] rather than an invented name.
+///
+/// The `file`/`line` atoms are resolved from the **module** atom table (C reads
+/// its globals `am_file`/`am_line`); a module that cannot name them is a typed
+/// `unsupported`, never a substituted atom.
+fn location_term(
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    func: u32,
+    pc: u32,
+) -> Result<Eterm> {
+    let entry = match nearest_line(module, func, pc) {
+        Some(entry) => entry,
+        None => return Ok(NIL),
+    };
+    let name = match module.line.files.get(entry.file as usize) {
+        Some(name) => name,
+        None => return Ok(NIL),
+    };
+    let file_atom = module.atom_table.lookup("file").ok_or_else(|| {
+        error::unsupported("build_stacktrace: module atom table lacks the 'file' atom")
+    })?;
+    let line_atom = module.atom_table.lookup("line").ok_or_else(|| {
+        error::unsupported("build_stacktrace: module atom table lacks the 'line' atom")
+    })?;
+    // An Erlang file name term is a list of code points (the oracle prints
+    // `{file,"m.erl"}`); the `Line` chunk carries the name as UTF-8.
+    let chars: Vec<Eterm> = name.chars().map(|ch| make_small(ch as i64)).collect();
+    let file_name = terms::make_list(ctx, &chars)?;
+    let file_pair = terms::make_tuple(ctx, &[make_atom(file_atom), file_name])?;
+    let line_pair = terms::make_tuple(
+        ctx,
+        &[make_atom(line_atom), make_small(entry.line as i64)],
+    )?;
+    terms::make_list(ctx, &[file_pair, line_pair])
+}
+
+/// The source location in effect at code offset `pc` of the function at index
+/// `func`: the loader's entry for the **nearest preceding** `line` marker, or
+/// `None` when there is none.
+///
+/// The loader lowers every `line` opcode to [`Instr::Line`] carrying the index of
+/// its [`LineEntry`], and the entry a marker installs stays in effect until the
+/// next one — the mapping the C interpreter's `line` handling establishes
+/// (`../../erts/emulator/beam/beam_file.c`) and that `erts_lookup_function_info`
+/// reads back for a saved code pointer. An instruction before any marker has no
+/// location (C's `LINE_INVALID_LOCATION`).
+fn nearest_line(module: &Module, func: u32, pc: u32) -> Option<LineEntry> {
+    let function = module.functions.get(func as usize)?;
+    if function.code.is_empty() {
+        return None;
+    }
+    let end = (pc as usize).min(function.code.len() - 1);
+    for instr in function.code[..=end].iter().rev() {
+        if let Instr::Line(reference) = instr {
+            let entry = *module.line.items.get(*reference as usize)?;
+            return (entry.line != 0).then_some(entry);
+        }
+    }
+    None
 }
 
 #[cfg(test)]
@@ -798,14 +1025,300 @@ mod tests {
     // documented unsupported opcodes + the not-mine fallthrough
     // ------------------------------------------------------------------
 
+    // ------------------------------------------------------------------
+    // raw_raise (the x(0)/x(1)/x(2) class protocol)
+    // ------------------------------------------------------------------
+
     #[test]
-    fn build_stacktrace_and_raw_raise_are_unsupported() {
+    fn raw_raise_with_a_valid_class_raises_through_the_machine() {
+        // C: `raw_raise` sets the class in `c_p->freason` and the value/trace in
+        // `fvalue`/`ftrace`, then `goto find_func_info` — i.e. an ordinary raise.
+        for class in [
+            ExceptionClass::Error,
+            ExceptionClass::Exit,
+            ExceptionClass::Throw,
+        ] {
+            let module = Fixture::new(&[class.as_str()]).finish();
+            let mut machine = Machine::new();
+            machine.push_frame(0).unwrap();
+            machine.push_catch_frame(CatchFrame::new(4, 9, 0));
+            let class_atom = make_atom(module.atom_table.lookup(class.as_str()).unwrap());
+            machine.set_x(0, class_atom).unwrap();
+            machine.set_x(1, make_small(42)).unwrap();
+            machine.set_x(2, NIL).unwrap();
+
+            let mut ctx = MinimalContext::new();
+            let step = exec_one(&module, &Instr::RawRaise, &mut machine, &mut ctx).unwrap();
+            assert_eq!(
+                step,
+                Some(Step::Goto { func: 4, pc: 9 }),
+                "raw_raise with class {} lands in the live catch frame",
+                class.as_str()
+            );
+            assert_eq!(machine.pending_exception(), Some((class, make_small(42))));
+            // The landing convention: reason in x(1), the trace in x(2), the class
+            // atom in x(3).
+            assert_eq!(machine.x(0), Some(Eterm::non_value()));
+            assert_eq!(machine.x(1), Some(make_small(42)));
+            assert_eq!(machine.x(2), Some(NIL));
+            assert_eq!(machine.x(3), Some(class_atom));
+        }
+    }
+
+    #[test]
+    fn raw_raise_uncaught_propagates_a_typed_error() {
+        let module = Fixture::new(&["throw"]).finish();
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_x(0, make_atom(module.atom_table.lookup("throw").unwrap()))
+            .unwrap();
+        machine.set_x(1, make_small(7)).unwrap();
+        machine.set_x(2, NIL).unwrap();
+
+        let mut ctx = MinimalContext::new();
+        let err = exec_one(&module, &Instr::RawRaise, &mut machine, &mut ctx).unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)));
+        assert_eq!(
+            machine.pending_exception(),
+            Some((ExceptionClass::Throw, make_small(7)))
+        );
+    }
+
+    #[test]
+    fn raw_raise_with_an_unknown_class_sets_x0_to_badarg_and_continues() {
+        // C: an unknown class makes `raw_raise` return 1 and the instruction stores
+        // `am_badarg` in x(0) **without raising** (`beam_common.c:1176-1178`,
+        // `emu/instrs.tab:1258-1260`) — the oracle-witnessed `badclass/1` value.
+        // A non-class *atom*, then a term that is not an atom at all.
+        for unknown in [Some("nonsense"), None] {
+            let module = Fixture::new(&["badarg", "nonsense"]).finish();
+            let mut machine = Machine::new();
+            machine.push_frame(0).unwrap();
+            machine.push_catch_frame(CatchFrame::new(4, 9, 0));
+            machine.set_x(1, make_small(1)).unwrap();
+            machine.set_x(2, NIL).unwrap();
+            let unknown_term = match unknown {
+                Some(name) => make_atom(module.atom_table.lookup(name).unwrap()),
+                None => make_small(3),
+            };
+            machine.set_x(0, unknown_term).unwrap();
+
+            let mut ctx = MinimalContext::new();
+            let step = exec_one(&module, &Instr::RawRaise, &mut machine, &mut ctx).unwrap();
+            assert_eq!(step, Some(Step::Next), "an unknown class does not raise");
+            assert_eq!(
+                machine.x(0),
+                Some(make_atom(module.atom_table.lookup("badarg").unwrap()))
+            );
+            // Nothing was raised: no pending exception, and the catch frame is
+            // still live for the next instruction.
+            assert_eq!(machine.pending_exception(), None);
+            assert_eq!(machine.catch_frame_depth(), 1);
+        }
+    }
+
+    #[test]
+    fn raw_raise_without_the_badarg_atom_is_a_typed_error() {
+        // The engine may not substitute a different atom for `badarg`.
+        let module = Fixture::new(&["nonsense"]).finish();
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_x(0, make_atom(module.atom_table.lookup("nonsense").unwrap()))
+            .unwrap();
+        let mut ctx = MinimalContext::new();
+        let err = exec_one(&module, &Instr::RawRaise, &mut machine, &mut ctx).unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)));
+        assert_eq!(machine.pending_exception(), None);
+    }
+
+    // ------------------------------------------------------------------
+    // build_stacktrace (the symbolic stacktrace)
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn build_stacktrace_of_a_nil_raw_trace_is_nil() {
+        // C: `get_trace_from_exc(NIL)` is NULL, so `build_stacktrace` yields NIL
+        // (`beam_common.c:1219-1223`). This is the path every compiler-emitted
+        // handler takes at M1 (a caught exception lands with x(2) = NIL).
         let module = Fixture::new(&[]).finish();
         let mut machine = Machine::new();
         machine.push_frame(0).unwrap();
+        machine.set_x(0, NIL).unwrap();
         let mut ctx = MinimalContext::new();
-        assert!(exec_one(&module, &Instr::BuildStacktrace, &mut machine, &mut ctx).is_err());
-        assert!(exec_one(&module, &Instr::RawRaise, &mut machine, &mut ctx).is_err());
+        let step = exec_one(&module, &Instr::BuildStacktrace, &mut machine, &mut ctx).unwrap();
+        assert_eq!(step, Some(Step::Next));
+        assert_eq!(machine.x(0), Some(NIL));
+    }
+
+    #[test]
+    fn build_stacktrace_derives_the_live_callers_innermost_first() {
+        // A non-NIL raw trace (only a synthetic module produces one at M1) is
+        // approximated from the live frames: the current function first, then every
+        // frame suspended in a call, innermost first. No line marker is in effect,
+        // so each Location is NIL (C's LINE_INVALID_LOCATION).
+        let mut fixture = Fixture::new(&[]);
+        let entry = fixture.add_function(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::BuildStacktrace,
+                Instr::Return,
+            ],
+        );
+        let g_entry = fixture.add_function(
+            "g",
+            2,
+            vec![Instr::Label(Label(2)), Instr::Return],
+        );
+        let module = fixture.finish();
+        assert_eq!(entry, Label(1));
+        assert_eq!(g_entry, Label(2));
+
+        let mut machine = Machine::new();
+        // The bottom frame, then a frame that called into `f` — its continuation is
+        // `f` at code offset 2 (`g/2`'s own frame-less `return`).
+        machine.push_frame(0).unwrap();
+        machine.push_frame(0).unwrap();
+        machine
+            .set_continuation(crate::machine::Continuation::Address { func: 1, pc: 1 })
+            .unwrap();
+        // x(0) must hold a non-NIL raw stacktrace for the instruction to cook one.
+        machine.set_x(0, make_small(1)).unwrap();
+
+        let mut ctx = MinimalContext::new();
+        // Run the `build_stacktrace` at code offset 1 of function 0.
+        let step = exec(
+            &mut machine,
+            &module,
+            &no_labels(),
+            &Instr::BuildStacktrace,
+            0,
+            1,
+            &mut ctx,
+        )
+        .unwrap();
+        assert_eq!(step, Some(Step::Next));
+
+        let m = module.atom_table.lookup("m").unwrap();
+        let f = module.atom_table.lookup("f").unwrap();
+        let g = module.atom_table.lookup("g").unwrap();
+        let item_f = terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(f), make_small(0), NIL])
+            .unwrap();
+        let item_g = terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(g), make_small(2), NIL])
+            .unwrap();
+        let expected = terms::make_list(&mut ctx, &[item_f, item_g]).unwrap();
+        assert!(
+            cmp(machine.x(0).unwrap(), expected, &module.atom_table).is_eq(),
+            "the cooked trace must be [{{m,f,0,[]}}, {{m,g,2,[]}}]"
+        );
+    }
+
+    #[test]
+    fn build_stacktrace_item_carries_the_source_location() {
+        // The Location element is `[{file,Name},{line,N}]`, taken from the `line`
+        // marker in effect at the frame's code offset (C's `erts_build_mfa_item`).
+        let mut fixture = Fixture::new(&["file", "line"]);
+        fixture.module.line = beam_loader::LineTable {
+            flags: 0,
+            instruction_count: 0,
+            items: vec![
+                LineEntry::default(),
+                LineEntry { file: 0, line: 7 },
+            ],
+            files: vec!["m.erl".to_string()],
+        };
+        fixture.add_function(
+            "f",
+            0,
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Line(1),
+                Instr::BuildStacktrace,
+                Instr::Return,
+            ],
+        );
+        let module = fixture.finish();
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.set_x(0, make_small(1)).unwrap(); // a non-NIL raw trace
+        let mut ctx = MinimalContext::new();
+        let step = exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 2, &mut ctx)
+            .unwrap();
+        assert_eq!(step, Some(Step::Next));
+
+        let m = module.atom_table.lookup("m").unwrap();
+        let f = module.atom_table.lookup("f").unwrap();
+        let file = module.atom_table.lookup("file").unwrap();
+        let line = module.atom_table.lookup("line").unwrap();
+        let chars: Vec<Eterm> = "m.erl".chars().map(|c| make_small(c as i64)).collect();
+        let name = terms::make_list(&mut ctx, &chars).unwrap();
+        let file_pair = terms::make_tuple(&mut ctx, &[make_atom(file), name]).unwrap();
+        let line_pair = terms::make_tuple(&mut ctx, &[make_atom(line), make_small(7)]).unwrap();
+        let location = terms::make_list(&mut ctx, &[file_pair, line_pair]).unwrap();
+        let item =
+            terms::make_tuple(&mut ctx, &[make_atom(m), make_atom(f), make_small(0), location])
+                .unwrap();
+        let expected = terms::make_list(&mut ctx, &[item]).unwrap();
+        assert!(
+            cmp(machine.x(0).unwrap(), expected, &module.atom_table).is_eq(),
+            "the item must carry [{{file,\"m.erl\"}},{{line,7}}]"
+        );
+    }
+
+    #[test]
+    fn build_stacktrace_without_the_file_or_line_atom_is_a_typed_error() {
+        // The location can only be named if the module's atom table holds
+        // `file`/`line` (C reads its globals `am_file`/`am_line`).
+        for extra in [&["line"][..], &["file"][..]] {
+            let mut fixture = Fixture::new(extra);
+            fixture.module.line = beam_loader::LineTable {
+                flags: 0,
+                instruction_count: 0,
+                items: vec![LineEntry::default(), LineEntry { file: 0, line: 7 }],
+                files: vec!["m.erl".to_string()],
+            };
+            fixture.add_function(
+                "f",
+                0,
+                vec![Instr::Label(Label(1)), Instr::Line(1), Instr::BuildStacktrace],
+            );
+            let module = fixture.finish();
+            let mut machine = Machine::new();
+            machine.push_frame(0).unwrap();
+            machine.set_x(0, make_small(1)).unwrap();
+            let mut ctx = MinimalContext::new();
+            let err =
+                exec(&mut machine, &module, &no_labels(), &Instr::BuildStacktrace, 0, 2, &mut ctx)
+                    .unwrap_err();
+            assert!(
+                matches!(err, BeamError::Raise(_)),
+                "a module that cannot name file/line must fail typed"
+            );
+        }
+    }
+
+    #[test]
+    fn build_stacktrace_of_an_unknown_function_index_is_a_typed_error() {
+        let module = Fixture::new(&[]).finish();
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.set_x(0, make_small(1)).unwrap();
+        let mut ctx = MinimalContext::new();
+        // Function index 3 does not exist in the empty module.
+        let err = exec(
+            &mut machine,
+            &module,
+            &no_labels(),
+            &Instr::BuildStacktrace,
+            3,
+            0,
+            &mut ctx,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)));
     }
 
     #[test]
