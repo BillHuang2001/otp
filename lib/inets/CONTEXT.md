@@ -17,7 +17,7 @@ HTTP client (`httpc`, in `src/http_client/`):
 - `httpc` profiles/sessions: `default_profile/0`, `profile_name/1,2`, `which_sessions/0,1`, `info/0,1`, `ssl_verify_host_options/1`; cookies via `store_cookies/2,3`, `cookie_header/1,2,3`, `which_cookies/0,1`, `reset_cookies/0,1`.
 HTTP server (`httpd`, in `src/http_server/`):
 - `httpd:start/1`/`serve/1` (standalone; `erl -S httpd serve --directory --port --bind`), `inets:start(httpd, Config)` for managed startup, `stop/1`, `info/1..4`, `reload_config/2`, and deprecated `parse_query/1` (use `uri_string:dissect_query/1`).
-- Config is an Erlang proplist (or `{proplist_file, Path}`); Apache-style config file syntax is no longer supported.
+- Config is an Erlang proplist (or `{proplist_file, Path}`); Apache-style config file syntax is NOT supported.
 Extension points / behaviours:
 - `inets_service` (`src/inets_app/inets_service.erl`) — implemented by `httpc` and `httpd`: `start_standalone/1`, `start_service/1`, `stop_service/1`, `services/0`, `service_info/1`.
 - The `mod_*` request-handler behaviour is declared in `httpd.erl` itself via `-callback do/1`, `store/2`, `remove/1` — there is NO `httpd_mod` module (shipped `mod_*` modules do not even carry a `-behaviour` attribute).
