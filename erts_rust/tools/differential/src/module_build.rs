@@ -17,7 +17,7 @@ use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
-use crate::runtime::is_executable;
+use crate::runtime::{is_executable, output_with_retry};
 
 /// The reason recorded when no `erlc` could be found (the harness skips the case with it).
 pub const MISSING_ERLC_REASON: &str = "no erlc compiler found: $ERLC is unset and no 'erlc' \
@@ -116,20 +116,22 @@ pub fn compile(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule
         ));
     }
 
-    let output = Command::new(erlc)
-        .arg("-o")
+    // `output_with_retry` absorbs the transient `ETXTBSY` fork/exec race: `erlc` may be a
+    // freshly written wrapper script (e.g. a test stub), so a concurrent `fork()` in another
+    // test thread can transiently make `exec` fail with "Text file busy".
+    let mut cmd = Command::new(erlc);
+    cmd.arg("-o")
         .arg(&dir)
         .arg(&source_path)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .output()
-        .map_err(|source| {
-            Error::io(
-                format!("failed to execute erlc '{}'", erlc.display()),
-                source,
-            )
-        })?;
+        .stderr(Stdio::piped());
+    let output = output_with_retry(&mut cmd).map_err(|source| {
+        Error::io(
+            format!("failed to execute erlc '{}'", erlc.display()),
+            source,
+        )
+    })?;
 
     if !output.status.success() {
         let _ = std::fs::remove_dir_all(&dir);
@@ -282,6 +284,36 @@ mod tests {
         let err = compile(&erlc, "-module(x).\n", "x").expect_err("no .beam is an error");
         assert!(matches!(err, Error::Io { .. }), "{err:?}");
         assert!(err.to_string().contains("no"), "{err}");
+    }
+
+    /// The `erlc` spawn goes through the shared `ETXTBSY` retry, and that retry is bounded.
+    ///
+    /// Holding the stub compiler open for writing makes Linux refuse every `exec` with
+    /// `ETXTBSY`, so `compile` must return the **loud spawn error** once the attempts are
+    /// exhausted — not a bogus "no `.beam`" compile result, and not an endless retry.
+    #[cfg(unix)]
+    #[test]
+    fn a_compiler_that_cannot_be_exec_yet_is_a_loud_error_not_a_hang() {
+        let scratch = Scratch::new("etxtbsy");
+        let erlc = scratch.executable("erlc", "#!/bin/sh\nexit 0\n");
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&erlc)
+            .expect("open the stub compiler for writing");
+
+        // A permanently held writer must surface loudly, not hang or look like a compile
+        // failure — the retry is bounded.
+        let err = compile(&erlc, "-module(x).\n", "x")
+            .expect_err("a write-open file cannot be exec'd");
+        match err {
+            Error::Io { ref source, .. } => {
+                assert_eq!(source.raw_os_error(), Some(26), "{source:?}")
+            }
+            other => panic!("expected a loud spawn error, got {other:?}"),
+        }
+        assert!(err.to_string().contains("failed to execute erlc"), "{err}");
+
+        drop(held);
     }
 
     #[test]
