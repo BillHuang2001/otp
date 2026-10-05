@@ -35,6 +35,11 @@ benchmark** — a turnkey in-repo benchmark or a trivially runnable one, with lo
   - Benchmark: the parallel project **hanabi1224/Programming-Language-Benchmarks** wraps the same kernels with **CI-run correctness tests + benchmarks**.
   - Stresses: straight-line kernels — the cleanest source of JIT/loop-optimization workloads; compiling the kernels in-tree also exercises the "self-hosted build" contract.
 
+- **Cowboy** (Erlang HTTP/1.1 + HTTP/2 + WebSocket server; ninenines) — https://github.com/ninenines/cowboy
+  - Tests: `make test` (Common Test suites shipped in-repo); the `examples/` directory has ready-to-run hello-world / REST handlers.
+  - Benchmark: run an example handler and drive it with an off-the-shelf HTTP load generator (`wrk`, `h2load`, `bombardier`) — hello-world throughput and p50/p99 latency, clear-text vs TLS, HTTP/1.1 vs HTTP/2. No database or external stack.
+  - Stresses: the I/O-bound socket path (Ranch acceptor pool over `epoll`), `cowlib` HTTP parsing/serialization, per-request process spawn + messaging, and TLS via the `ssl`/`crypto` NIFs.
+
 ## 2. Compiler throughput (Erlang and Elixir compilers)
 
 A first-class, essentially free benchmark: compile a fixed corpus and time it.
@@ -67,6 +72,7 @@ Popular, but heavier to stand up. Keep them in reserve for deeper validation —
 | EMQX | ●● | ●● | ● | ○ | ●● | ○ | ●● (ssl/crypto) | ● | ✔ | ✔ (`emqtt-bench`) |
 | Khepri | ● | ●● | ●● | ●● | ●● | ○ | ○ | ○ | ✔ | ✔ (CI bench) |
 | Benchmarks Game kernels | ○ | ○ | ○ | ● | ○ | ●● | ○ | ○ | ✔ (hanabi1224) | ✔ |
+| Cowboy | ● | ○ | ○ | ● | ●● | ● | ● (ssl/crypto) | ○ | ✔ | ✔ (`wrk`/`h2load`) |
 | Compiler throughput (`erlc` / `mix compile`) | ○ | ○ | ○ | ● | ● (file I/O) | ●● | ○ | ○ | ✔ (`lib/compiler/test`) | ✔ |
 | OTP suites (`erts/emulator/test`, `lib/*/test`) | ● | ● | ● | ● | ● | ● | ● | ● | ✔ | ○ |
 
