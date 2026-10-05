@@ -10,7 +10,7 @@ Public API lives entirely in `compile.erl`; every other module is an internal pa
 - Legacy `erl_compile`/`erlc` interface: `compile/3`, `compile_asm/3`, `compile_core/3`, `compile_abstr/3` (take the `#options{}` record from `stdlib/include/erl_compile.hrl`).
 - Introspection/utility: `options/0` (prints `--help`), `env_compiler_options/0`, `run_sub_passes/2`.
 - Exported types: `option/0`, `forms/0` (abstract forms or `cerl:c_module()`), `comp_ret/0`.
-- `cerl`/`cerl_clauses`/`cerl_trees`/`cerl_inline` are the documented Core Erlang AST API (used by `lfe`, `dialyzer`-adjacent tools, etc.); `core_lib` is the (undocumented) Core AST helper library used externally too.
+- `cerl`/`cerl_clauses`/`cerl_trees` are the documented Core Erlang AST API (the only compiler modules with real `-moduledoc`, grouped as "Internal Modules" in `../doc/docs.exs`; used by `lfe`, `dialyzer`-adjacent tools, etc.); `cerl_inline` and `core_lib` are `-moduledoc false` but also used externally.
 
 ## The compilation pipeline (intermediate representations)
 Source → Erlang **abstract code** (AST) → **Core Erlang** → **BEAM SSA** → BEAM **assembly** → **BEAM binary**, driven by `compile.erl`.
