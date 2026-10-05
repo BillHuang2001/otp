@@ -56,7 +56,7 @@ Modules in this directory must stay protocol-agnostic; httpc/httpd specifics bel
 The service/behaviour split exists so one service implementation supports two lifecycles: supervised child of the inets tree (`start_service/1`, the default path) or process linked to the caller (`start_standalone/1`).
 Dynamic services are intentionally excluded from OTP application takeover/failover and from restart on application restart (documented in `inets:start/2,3`); `stand_alone` is documented as deprecated.
 `inets_service.erl` exports nothing — it exists purely as the `-callback` contract that gives both services the same dynamic call convention used by `inets.erl`.
-Trace events are emitted unconditionally as calls to `inets_trace:report_event/4` with a numeric Severity 0..100; the function body is only `hopefully_traced`, so the calls are cheap no-ops unless a dbg match spec is installed (No conditional compilation at call sites, by design.)
+Trace events are emitted unconditionally as calls to `inets_trace:report_event/4` with a numeric Severity 0..100; the function body is only `hopefully_traced`, so the calls are cheap no-ops unless a dbg match spec is installed — so there is deliberately no conditional compilation at call sites.
 `inets_sup` keeps the httpc/httpd supervisors as two fixed child specs rather than one per configured service, so the supervision tree shape is stable and services can be added at runtime.
 The top supervisor restart strategy is `one_for_one` with intensity 10/3600 because the two service trees are independent.
 
