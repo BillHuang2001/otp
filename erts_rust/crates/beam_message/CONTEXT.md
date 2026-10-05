@@ -29,6 +29,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   off-heap references) and the destination's (where referenced off-heap objects are re-registered).
   - `CopyContext::new(src: &'a OffHeapTable, dst: &'a mut OffHeapTable) -> CopyContext<'a>`
   - `src_off_heap(&self) -> &OffHeapTable`; `dst_off_heap(&self) -> &OffHeapTable`
+  - `dst_off_heap_mut(&mut self) -> &mut OffHeapTable` — the copier registers referenced off-heap
+    objects here and `send` drains it into the message's off-heap list.
 - `pub fn copy_struct(term: Eterm, to: &mut beam_alloc::Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm>`
   — copy `term`'s graph into `to`, returning the copied root. **Iterative** (an explicit worklist —
   deep lists never recurse on the native stack). Immediates and literal-area terms are **shared**
