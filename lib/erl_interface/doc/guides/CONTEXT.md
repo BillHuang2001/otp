@@ -37,7 +37,7 @@ Implementations of everything taught here live in `../../src/` (`encode/`, `deco
 ## Notes for Agents
 - Add new tutorial prose/examples here; add per-function signatures, argument and return-value detail to `../references/ei.md`, `ei_connect.md`, `ei_global.md`, `erl_call_cmd.md`.
 - Overlaps conceptually with `../../../../system/doc/tutorial/erl_interface.md` (the release-wide "port + Erl_Interface" walkthrough); that document is a task-level tutorial with example programs, this one is the app's `ei` API guide — do not merge the two.
-- The executable counterpart of the C samples is `../../src/prog/erl_call.c` (a real `ei` client) and the `../tutorial/` C sources (`../../src/prog` is not affected by edits here).
+- The executable counterpart of the C samples is `../../src/prog/erl_call.c` (a real `ei` client) and the `../../../../system/doc/tutorial/` C sources (`../../src/prog` is not affected by edits here).
 
 ## See Also
 - `../references/` — per-function reference pages (`ei.md`, `ei_connect.md`, `ei_global.md`, `erl_call_cmd.md`).
