@@ -60,7 +60,7 @@ Every `*_cb` exports the same callback set: `peer_up/3`, `peer_down/3`, `pick_pe
 - `server:message/3` counts concurrent requests by inspecting the command code bit of the raw binary and is capped at 32.
 
 ## Test Strategy
-- `../test/diameter_examples_SUITE.erl` testcase `code` is the enforcement point: it copies the example sources into a temp dir, synthesizes a diameter include dir, and compiles every `*.erl` with `warnings_as_errors` in a separate node.
+- `../../test/diameter_examples_SUITE.erl` testcase `code` is the enforcement point: it copies the example sources into a temp dir, synthesizes a diameter include dir, and compiles every `*.erl` with `warnings_as_errors` in a separate node.
 - It then starts the examples on a node pair — `server:start/0` + `server:listen({Prot, any, 3868})` and `client:start/0` + `client:connect({Prot, loopback, loopback, 3868})`, subscribing to `diameter_event` to wait for the transport to come up — and sends 100 `client:call/0` requests over each of `tcp` and (when the platform has SCTP) `sctp`.
 - `relay` and `redirect` are compiled but never executed by the suite: their behaviour is only checked for compilation correctness.
 - Tests need an alive/ distributed node; `?PROTS` is `[sctp || ?HAVE_SCTP()] ++ [tcp]`.
