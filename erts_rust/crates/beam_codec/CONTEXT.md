@@ -29,9 +29,9 @@ funs, records, `V4_PORT`, `LOCAL`, the distribution header, maps > 32 pairs) ret
 `error::unsupported` rather than a wrong term. `src/lib.rs` carries only the
 permanent lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]` and the single
 `#[allow(unsafe_code)] mod term;`. In-module `#[cfg(test)]` tests cover the wire,
-term and codec layers; `tests/roundtrip.rs` and `tests/ground_truth.rs` currently
-hold only their written plans (the exhaustive corpus and the oracle vectors) — no
-test functions yet.
+term and codec layers; `tests/roundtrip.rs` holds the exhaustive encode→decode
+corpus plus the negative/truncation cases, and `tests/ground_truth.rs` holds the
+byte-exact `term_to_binary` oracle vectors, each asserted in both directions.
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_codec::prelude::*`.
