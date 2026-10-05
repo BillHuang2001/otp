@@ -1,61 +1,56 @@
-# xmerl — XML Parser/Generator (OTP application)
+# xmerl — XML parser/generator (OTP application)
 
 ## Intent
-`xmerl` ("XML Erlang") is the OTP application providing an XML parser, generator and query toolbox: a DOM-style single-pass XML 1.0 scanner, a SAX2 callback parser, XPath 1.0 search, XSLT-like export templates, XML Schema (XSD) validation, and SGML/HTML/`otp_sgml` helpers.
-It is a pure-Erlang library application (no C code, no autoconf) that sits above `kernel`/`stdlib` only.
+`xmerl` ("XML Erlang") is the OTP application providing XML parsing, generation and query tooling: a DOM-style single-pass XML 1.0 scanner, a SAX2 callback parser, XPath 1.0 search, XSLT-like export rules, XML Schema (XSD) validation, and SGML/HTML/`otp_sgml` helpers.
+It is a pure-Erlang library application (no C code, no autoconf, no ports) depending only on `kernel` and `stdlib`.
+Build order: `lib/Makefile` lists `xmerl` under `ALL_ERLANG_APPLICATIONS`, so it is only built with `BUILD_ALL`; `lib/xmerl/Makefile` recurses into `SUB_DIRECTORIES = src doc`.
 
 ## API Surface
-- `src/xmerl_scan` — the documented public XML parser entry point: `string/1,2`, `file/1,2` return the DOM-tree of `#xmlElement{}`/`#xmlDocument{}` records defined in `include/xmerl.hrl`.
-  Customization hooks are passed as options and read back with `user_state/1,2`, `event_state/1,2`, `hook_state/1,2`, `rules_state/1,2`, `fetch_state/1,2`, `cont_state/1,2`.
-- `src/xmerl_sax_parser` — SAX2-style event parser: `file/2`, `stream/2` with an `event_fun`/`event_state` callback interface, continuations via `default_continuation_cb/1`.
-- `src/xmerl` — export engine: `export/2` plus record constructors/accessors (`#xmlElement{}`-family builders) used by all backends.
-- `src/xmerl_xpath` — XPath 1.0 search: `string/2,3,5`, helper `eval_path/3`, `axis/3,4`, debug `write_node/1`.
-- `src/xmerl_xs` — XSLT-like template/apply rules (`xslapply/2`, `value_of/1`, `select/2`, `built_in_rules/2`) layered on the DOM tree.
-- `src/xmerl_xsd` — XML Schema validation: `validate/2,3`, `process_validate/2,3`, `process_schema/2,3`, `print_table/1`.
-- `src/xmerl_validate` — DTD/`xmerl_sgml`-era validation (`validate/2`, internal, `-moduledoc false`).
-- `src/xmerl_eventp` — convenience "export as event" wrapper (`file_sax/3,4`, `string/2`, `stream/2`) around `xmerl_scan`/`xmerl_sax_parser`.
-- Export backends (used via `xmerl:export/2` or their `export/2`): `xmerl_xml` (plain XML), `xmerl_xml_indent` (pretty-printed XML), `xmerl_html`, `xmerl_otpsgml`, `xmerl_sgml`, `xmerl_text`, `xmerl_xlate`.
-- Internal support modules (`-moduledoc false`): `xmerl_lib` (record/accessor + DTD helpers), `xmerl_ucs` (Unicode/UCS code conversion), `xmerl_uri` (URI parsing, RFC 2396 style), `xmerl_simple`, `xmerl_b64Bin`/`xmerl_b64Bin_scan` (base64/binary to text conversion), `xmerl_xpath_lib`, `xmerl_xpath_pred`, `xmerl_xpath_scan`, `xmerl_sax_simple_dom`, `xmerl_sax_old_dom`, `xmerl_xsd_type`, `xmerl_xsd_re`.
-- `include/xmerl.hrl` — the public record contract: `#xmlElement{}`, `#xmlAttribute{}`, `#xmlText{}`, `#xmlComment{}`, `#xmlPI{}`, `#xmlDocument{}`, `#xmlNamespace{}`, `#xmlDecl{}`, `#xmlContext{}`, plus scanner/state records; also `include/xmerl_xpath.hrl` and `include/xmerl_xsd.hrl` (XSD schema records).
-- Public modules documented in `doc/` (per `src/Makefile` `EDOC_MODULES`): `xmerl_scan`, `xmerl`, `xmerl_xs`, `xmerl_eventp`, `xmerl_xpath`, `xmerl_xsd`; `xmerl_sax_parser` is documented via its `-moduledoc`.
-- Version: `vsn.mk` → `XMERL_VSN = 2.2`; app resource `src/xmerl.app.src` declares `{applications,[kernel,stdlib]}` and `{runtime_dependencies,["stdlib-2.5","kernel-8.4","erts-6.0"]}`.
+- `xmerl_scan` — the main XML parser: `string/1,2`, `file/1,2` return a DOM tree of `#xmlElement{}`/`#xmlDocument{}` (or `#xmerl_scanner{}` state in hook mode); customization state is read/written through `user_state/{1,2}`, `event_state/{1,2}`, `hook_state/{1,2}`, `rules_state/{1,2}`, `fetch_state/{1,2}`, `cont_state/{1,2}`.
+- `xmerl_sax_parser` — SAX2 API: `file/2`, `stream/2`, events delivered to `event_fun` with `event_state`, continuations via `continuation_fun`/`default_continuation_cb/1`.
+- `xmerl` — export engine: `export/2,3`, `export_content/2`, `export_element/2,3`, `export_simple/2,3`, `export_simple_element/2`, `export_simple_content/2`, `callbacks/1`.
+- `xmerl_xpath` — XPath 1.0: `string/2,3,5`, helpers `eval_path/3`, `axis/3,4`, debug `write_node/1`.
+- `xmerl_xs` — XSLT-like transforms over the DOM tree: `xslapply/2`, `value_of/1`, `select/2`, `built_in_rules/2`.
+- `xmerl_xsd` — XSD (2nd ed., 2004-10-28) validation: `validate/2,3`, `process_validate/2,3`, `process_schema/1,2`, `process_schemas/1,2`, `state2file/1,2`, `file2state/1`, `format_error/1`, `print_table/1`.
+- `xmerl_eventp` — event/stream front-ends to `xmerl_scan`: `stream/2` (DOM style), `stream_sax/4`, `file_sax/4`, `string_sax/4` (SAX style); it installs its own `continuation_fun`/`acc_fun`/`fetch_fun`/`rules`/`close_fun`, so those options cannot be overridden by the caller.
+- Export back ends (tag-callback modules): `xmerl_xml`, `xmerl_xml_indent`, `xmerl_html`, `xmerl_sgml`, `xmerl_otpsgml` (inherits `xmerl_sgml`), `xmerl_text`; plus the `xmerl_xlate` `file/3`,`string/3` front-end.
+- Undocumented support modules (`-moduledoc false`): `xmerl_lib`, `xmerl_validate` (DTD validation, invoked by `xmerl_scan` for `{validation,dtd}`), `xmerl_ucs`, `xmerl_uri`, `xmerl_simple`, `xmerl_b64Bin`+`xmerl_b64Bin_scan` (used only for XSD `base64Binary`), `xmerl_xpath_lib`, `xmerl_xpath_pred`, `xmerl_xpath_scan`, `xmerl_sax_old_dom`, `xmerl_sax_simple_dom`, `xmerl_xsd_type`, `xmerl_xsd_re`.
+- Version/quota: `vsn.mk` → `XMERL_VSN = 2.2`; `src/xmerl.app.src` declares `{applications,[kernel,stdlib]}` and `{runtime_dependencies,["stdlib-2.5","kernel-8.4","erts-6.0"]}`.
+- Public headers: `include/xmerl.hrl` (DOM + scanner/event records), `include/xmerl_xpath.hrl`, `include/xmerl_xsd.hrl` — see the `include/` node for the record contract.
 
 ## Constraints
-- Never hand-edit generated sources — they are produced at build time and removed by `make clean`:
-  - `xmerl_xpath_parse.erl` ← `xmerl_xpath_parse.yrl` (yecc),
-  - `xmerl_b64Bin.erl` ← `xmerl_b64Bin.yrl` (yecc),
-  - `xmerl_xsd_re_parse.erl` ← `xmerl_xsd_re_parse.yrl` (yecc),
-  - `xmerl_sax_parser_{list,latin1,utf8,utf16be,utf16le}.erl` ← the encoding-specific `*.erlsrc` concatenated with the shared `xmerl_sax_parser_base.erlsrc` (edit the `.erlsrc` halves, never the generated concatenation).
-- Any change to the record layouts in `include/xmerl.hrl` is a breaking API change for every consumer (notably `edoc`) — records are `-include`d directly by user code.
-- Strict compiles: `-I ../include +warn_unused_vars +warn_obsolete_bool_op`; `ERL_DETERMINISTIC=yes` adds `+deterministic` and lists generated files in `DEP_SKIP_FILES` (they are not reproducible-stable).
-- `xmerl_scan` and `xmerl_xpath` are annotated `-unsafe([{'_','_',possibly}])` and use `list_to_atom/1` with `nowarn_possibly_unsafe_function` — external input is not trusted to be atom-safe; keep that in mind when touching atom creation.
-- Export/validation must keep the `#xmlElement{}` shape stable; `xmerl_xsd` works off `include/xmerl_xsd.hrl` records.
+- Generated sources are never hand-edited and are deleted by `make clean`:
+  - `xmerl_xpath_parse.erl` ← `xmerl_xpath_parse.yrl`, `xmerl_b64Bin.erl` ← `xmerl_b64Bin.yrl`, `xmerl_xsd_re_parse.erl` ← `xmerl_xsd_re_parse.yrl` (yecc),
+  - `xmerl_sax_parser_{list,latin1,utf8,utf16be,utf16le}.erl` ← `cat <encoding>.erlsrc xmerl_sax_parser_base.erlsrc`.
+- A module addition/removal must be reflected in `MODULES` in `src/Makefile` **and** the hand-maintained `modules` list in `src/xmerl.app.src`.
+- `include/xmerl.hrl` and `include/xmerl_xsd.hrl` are the public API contract: record fields are matched/constructed directly by consumers, so layout changes are breaking; extend by appending fields with defaults.
+- `xmerl_scan`, `xmerl_xpath` and `xmerl_xsd_type` create atoms from document content via `list_to_atom/1` (annotated `-unsafe(...)` / `nowarn_possibly_unsafe_function`); untrusted XML can grow the atom table without bound.
+- Compile flags: `-I ../include +warn_unused_vars +warn_obsolete_bool_op`; `ERL_DETERMINISTIC=yes` adds `+deterministic` plus `DEP_SKIP_FILES` for the generated files.
 
 ## Design Decisions
-- Two independent XML front ends: the older single-pass scanner (`xmerl_scan`, event/hook/continuation customization functions) producing DOM records, and the newer SAX parser (`xmerl_sax_parser`, 2008) with a callback interface; both are kept, and `xmerl_eventp` bridges scanner-driven event streaming.
-- XPath is split lexer (`xmerl_xpath_scan`) / yecc grammar (`xmerl_xpath_parse.yrl`) / evaluator (`xmerl_xpath_pred`) so the grammar is regenerable and `xmerl_xpath` stays a thin API.
-- The SAX scanner is generated per input encoding by concatenating the shared state machine (`xmerl_sax_parser_base.erlsrc`) with a small per-encoding head, avoiding runtime encoding dispatch.
-- Documentation for the app is built from the `.erl` `-moduledoc`/`-doc` attributes plus `doc/*.md` and the guides, driven by `doc/docs.exs`, not from a separate doc source tree (`doc/` has no `src/`).
-
-## Known Issues
-- `xmerl.spec`/`xmerl.cover`/`testcases.dtd` in `test/` are stale legacy references from the pre-Common-Test test harness kept only because `test/Makefile` installs them.
+- Two XML front ends coexist deliberately: the older single-pass scanner (`xmerl_scan`, DOM records, pluggable `event_fun`/`hook_fun`/`acc_fun`/`fetch_fun`/`continuation_fun`/`rules_*_fun` held in the public `#xmerl_scanner{}` record) and the 2008 SAX2 parser (`xmerl_sax_parser`, callback events); `xmerl_eventp` bridges them and reuses `xmerl_scan` rather than duplicating a parser.
+- The SAX state machine is generated per input encoding (shared base + per-encoding head) so the hot loop needs no runtime encoding dispatch.
+- XPath is split into lexer (`xmerl_xpath_scan`) / regenerable yecc grammar (`xmerl_xpath_parse.yrl`) / predicate & core-function evaluator (`xmerl_xpath_pred`); `xmerl_xpath` is a thin driver.
+- Export is a tag-callback protocol (`'#root#'/4`, `'#element#'/5`, `'#text#'/1`, … plus `'#xml-inheritance#'/0`), resolved by `xmerl:callbacks/1`; `xmerl_scan` runs DTD validation (`xmerl_validate`) or schema validation (`xmerl_xsd:process_validate/3`) after scanning.
+- Documentation is attribute-driven: module pages come from `-moduledoc`/`-doc` in `src/*.erl` via the shared ExDoc build (`doc/docs.exs`); there is **no** `doc/src/` tree, and the legacy EDOC target in `src/Makefile` is inactive.
 
 ## Notes for Agents
-- `ebin/` is build output (only `.gitignore` tracked) — ignore it.
-- `src/Makefile` is the source of truth for the module list, `HRL_FILES`, generated-file rules and the `MODULES`/`EDOC_MODULES` split; when adding a module, update `src/Makefile` and `src/xmerl.app.src`.
-- The yecc grammars for XPath and XSD regular expressions are *grammar files*, not code to patch by hand; grammar changes are regenerated by `erlc`.
-- `doc/assets/*.txt|*.xml` are example inputs for the XML-extraction tutorial, not test fixtures; real fixtures live under `test/*_SUITE_data/`.
-- Three consumers matter for compatibility: `lib/edoc` (doclet/layout/wiki use `xmerl_scan` + `xmerl` export + `xmerl.hrl` records), `lib/common_test` (`ct_config_xml`, `ct_netconfc`), `lib/wx/api_gen` (doc scraping); `lib/stdlib/src/otp_internal.erl` also reads XML.
+- `ebin/` is build output (only `.gitignore` tracked).
+- Commercially load-bearing in-OTP consumers: `lib/edoc` (uses `xmerl_html` as `DEFAULT_XML_EXPORT` and matches `#xmlElement{}`/`#xmlAttribute{}` in its doclets/layout/wiki), `lib/common_test` (`ct_config_xml`, `ct_netconfc`), `lib/wx/api_gen`, `lib/stdlib/src/otp_internal.erl` — treat those record layouts and `xmerl_html`'s output shape as frozen.
+- `xmerl_xpath.hrl` is installed but effectively internal: its `#state{context,acc}` is included only by `xmerl_xpath_pred`, while `xmerl_xpath.erl` re-declares the same record privately; both copies must be kept identical by hand.
+- Several modules (`xmerl_simple`, `xmerl_text`, `xmerl_sgml`/`xmerl_otpsgml`, `xmerl_xlate`, `xmerl_sax_old_dom`, `xmerl_sax_simple_dom`) are referenced only by tests or by no OTP code — they are user-facing legacy surface, not dead code.
+- `doc/examples/xmerl_test.erl` is the master copy for the generated `test/xmerl_test.erl` — edit the doc example, never the generated copy.
+- See each child CONTEXT.md for per-directory detail; the app-level `Known Issues` (stale test artifacts, duplicate corpora, hardcoded ports) are owned by the `test/` node.
 
 ## Test Strategy
-- Common Test suites in `test/` run through `test/Makefile` (`MODULES` + `SUITE_FILES`), e.g. `xmerl_SUITE`, `xmerl_std_SUITE`, `xmerl_sax_SUITE`, `xmerl_sax_stream_SUITE`, `xmerl_xsd_SUITE`.
-- Large conformance corpora are vendored as tarballs in `test/*_SUITE_data/` (W3C XML conformance `xmlts20130923.tar.gz`, IBM/OASIS/Sun/Japanese `*.tgz`, MS 2002-01-16 and NIST 2002-01-16 XSD suites); these make `xmerl_std_SUITE`, `xmerl_sax_std_SUITE` and the MS/NIST suites very large files.
-- `xmerl_test.erl` is copied from `../doc/examples/xmerl_test.erl` by the `test/Makefile` (do not edit the generated copy).
-- `xmerl.cover` deletes/ignores coverage for helper modules; keep it in sync with `MODULES` changes.
+- Common Test suites live in `test/` (`xmerl_SUITE`, `xmerl_std_SUITE`, `xmerl_sax_SUITE`, `xmerl_sax_std_SUITE`, `xmerl_sax_stream_SUITE`, `xmerl_xsd_SUITE` + MS/NIST/Sun XSD suites, `xmerl_app_test`/`xmerl_appup_test`), run with `make test` in `lib/xmerl` or `ct_run -dir lib/xmerl/test -suite <suite>`; they install to `$(RELEASE_PATH)/xmerl_test`.
+- `xmerl_SUITE:doctests/1` executes the `erlang` code examples in the `-doc` blocks of `xmerl`, `xmerl_xpath` and `xmerl_xs`, so doc examples must stay runnable.
+- W3C/IBM/OASIS/Sun/Japanese XML and MS/NIST/Sun XSD conformance corpora are vendored as tarballs under `test/*_SUITE_data/`; XSD suites compare results against `*_failed_cases.log` baselines.
 
 ## Routing Table
-- `src/` → all Erlang sources, yecc grammars (`.yrl`), generated-source inputs (`.erlsrc`), `xmerl.app.src`/`xmerl.appup.src`, and `src/Makefile` (module + generated-file rules)
-- `include/` → public headers: `xmerl.hrl` (DOM/scanner records), `xmerl_xpath.hrl`, `xmerl_xsd.hrl` (XSD records)
-- `test/` → Common Test suites, `xmerl_test_lib`/`xmerl_xsd_lib` helpers, `xmerl.spec`/`xmerl.cover`, and `*_SUITE_data/` conformance corpora (W3C/IBM/OASIS/Sun/MS/NIST)
-- `doc/` → documentation config (`docs.exs`), `notes.md`, `guides/` (user guide + examples) and `assets/`/`examples/` sample XML and sample programs
-- See also: `../edoc/` (primary in-OTP consumer of the records and export API), `../parsetools/` (provides `yecc` used to generate the parsers)
+- `src/` → all Erlang sources, the three yecc `.yrl` grammars, the six `.erlsrc` SAX inputs, internal headers (`xmerl_internal.hrl`, `xmerl_sax_parser.hrl`, `xmerl_sax_old_dom.hrl`), `xmerl.app.src`/`xmerl.appup.src` and `src/Makefile` (module list + generated-file rules)
+- `include/` → the installed public headers: `xmerl.hrl` (DOM + scanner/event records), `xmerl_xpath.hrl`, `xmerl_xsd.hrl` (write changes only via `HRL_FILES` in `../src/Makefile`)
+- `test/` → Common Test suites, `xmerl_test_lib`/`xmerl_xsd_lib` helpers, `xmerl.spec`/`xmerl.cover`, and `*_SUITE_data/` conformance corpora
+- `doc/` → ExDoc config (`docs.exs`), `notes.md` release notes, `guides/` (user guide + two tutorials), tutorial `assets/`, legacy standalone `examples/`
+- `../edoc/` → primary in-OTP consumer of the record contract and of `xmerl_html` export (sibling — read-only, escalate writes to `lib/`)
+- `../parsetools/` → provides `yecc`, which generates `xmerl_xpath_parse.erl`, `xmerl_b64Bin.erl` and `xmerl_xsd_re_parse.erl` at build time
