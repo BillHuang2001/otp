@@ -116,7 +116,7 @@ Because `emulator.spec` (and the `gh` spec) say `{suites,"../emulator_test",all}
 - distribution → `distribution_SUITE`, `node_container_SUITE`
 - code loading → `code_SUITE`, `code_parallel_load_SUITE`, `multi_load_SUITE`
 - platform/legacy/special builds/bench/smoke → `os_signal_SUITE`, `dump_SUITE`, `lttng_SUITE`, `lcnt_SUITE`, `crypto_SUITE`, `estone_SUITE`, `smoke_test_SUITE`
-- helper modules (not suites) → `erts_test_utils.erl`, `erts_test_utils.hrl`, `tracer_test.erl`, `trace_sessions.erl`, `literal_area_collector_test.erl`, `long_timers_test.erl`, `ignore_cores.erl`, `erts_test_destructor.erl`, `erts_test_sync_tracer.erl`, `ext_records.erl`, `crypto_reference.erl`, `random_iolist.erl`, `dgawd_handler.erl`, `dummy.erl`, `property_test/phash2_practeristics.erl`
+- helper modules (not suites) → `erts_test_utils.erl`, `erts_test_utils.hrl`, `tracer_test.erl`, `trace_sessions.erl`, `literal_area_collector_test.erl`, `long_timers_test.erl`, `ignore_cores.erl`, `erts_test_destructor.erl`, `erts_test_sync_tracer.erl`, `ext_records.erl`, `crypto_reference.erl`, `random_iolist.erl`, `dgawd_handler.erl`, `dummy.erl`, `property_test/phash2_properties.erl`
 - per-suite fixtures and test data → `<SUITE>_data/` (45 dirs; 30 contain `Makefile.src` and are compiled at test time)
 - spec/CI entry points (not suites) → `emulator.spec`, `emulator_gh.spec`, `emulator_smoke.spec`, `emulator_bench.spec`, `emulator_trace.spec`, `emulator_node_container_SUITE.spec`, `emulator.spec.win`, `suite_release.exclude`
 - code under test → `../emulator/` (beam/drivers/nifs/sys, own node); shared build harness → `../../make/app_targets.mk`, `../../make/test_target_script.sh`; run instructions → `../../../HOWTO/TESTING.md`
