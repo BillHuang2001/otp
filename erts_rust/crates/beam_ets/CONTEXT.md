@@ -155,11 +155,15 @@ impl Table {
 - **Table-owned storage only (A.1 copy boundary).** An inserted object is **deep-copied** into the
   table's `TermStore`; the table never retains a pointer into a caller's/process heap. Objects/key
   returned from reads alias table storage and stay valid for the table's lifetime.
-- **`unsafe` confinement.** `unsafe` is allowed only in `store.rs` (raw term reads/writes) and the
-  tuple-element accessor in `key.rs`. Every `unsafe fn` carries a `# Safety` section and every
-  `unsafe` block a preceding `// SAFETY:` rationale (`beam_common::safety` convention);
-  `unsafe_op_in_unsafe_fn` stays clean (workspace lint). `kind`/`key` (validation)/`table`/`hash_
-  interior`/`ordered_interior`/`select`/`info`/`error` are **safe Rust**.
+- **`unsafe` confinement.** `unsafe` is confined to `store.rs` (raw term reads/writes), the
+  tuple-element accessor in `key.rs`, and the small term-reading blocks in `select.rs::compile` and
+  `table.rs::select_all`/`select` — `beam_term` exposes *every* tuple/list accessor (`is_tuple`,
+  `tuple_size`, `tuple_element`, `car`, `cdr`, …) as an `unsafe fn`, so reading a caller-owned spec
+  term or a stored tuple's element slice needs a confined block. Every `unsafe fn` carries a
+  `# Safety` section and every `unsafe` block a preceding `// SAFETY:` rationale
+  (`beam_common::safety` convention); `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
+  `kind`/`key` (validation)/`hash_interior`/`ordered_interior`/`info`/`error` and the rest of
+  `table.rs` are **safe Rust**.
 - **Files ~1000 lines**, one responsibility per file.
 - **Licensing** Apache-2.0; no new external deps (only `beam_common`/`beam_term`/`beam_alloc`/`libc`).
 
