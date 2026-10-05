@@ -22,7 +22,7 @@ Every `lib/<app>/` follows the same schema (some dirs optional per app):
 - `ebin/` — build output (only `.gitignore` tracked).
 - `test/` — test suites (`*_SUITE.erl`) run via Common Test; `test/Makefile` lists `MODULES` and `RELSYSDIR` (installed as `$(RELEASE_PATH)/<app>_test`).
 - `doc/` — documentation: `docs.exs` (ExDoc config), `src/` (markdown+`.erl` doc sources), `references/`, `guides/`.
-- `vsn.mk` — defines `<APP>_VSN` (the app's version); `Makefile` sets `VSN = $(<APP>_VSN)` and includes `make/app_targets.mk`. (35 of 36 apps have `vsn.mk`; `erl_interface` versions differently.)
+- `vsn.mk` — defines `<APP>_VSN` (the app's version); `Makefile` sets `VSN = $(<APP>_VSN)` and includes `make/app_targets.mk`. Every app has one.
 - `Makefile` — includes `../make/target.mk`, `../make/$(TARGET)/otp.mk`, `vsn.mk`, then `make/app_targets.mk`; sets `SUB_DIRECTORIES`.
 - `AUTHORS`, `priv/` (runtime data files), `examples/`, `c_src/` (NIF/linked-in-driver C code), `internal_doc/` (non-published docs) — present only where relevant.
 - C/OS-dependent apps carry their own autoconf: `configure`+`configure.ac` exist in `common_test`, `crypto`, `erl_interface`, `megaco`, `odbc`, `snmp`, `wx`; the top-level `configure` runs these.
