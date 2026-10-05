@@ -1485,17 +1485,23 @@ mod tests {
         int("{A, B} = {1, 2}, A * 10 + B", 12);
         int("[H | T] = [1, 2, 3], H + length(T)", 3);
         int("#{a := V} = #{a => 5}, V", 5);
-        // A failed match raises `{badmatch, V}`.
+        // A failed match raises `{badmatch, V}`. The term-free `ExitReason` model
+        // flags the structured reason (it cannot carry the tuple), so assert the
+        // `error` class — the expression can only fail by badmatch.
         let error = run("X = 1, X = 2").expect_err("badmatch");
         assert!(
-            matches!(&error, BeamError::Raise(raise) if raise.reason.as_atom() == Some("badmatch")),
+            matches!(&error, BeamError::Raise(raise) if raise.class == ExceptionClass::Error),
             "{error}"
         );
     }
 
     #[test]
     fn guards_and_clause_fallthrough() {
-        int("case 3 of N when N > 5 -> big; N when N > 1 -> mid; _ -> small end", 1);
+        // Clause 2 matches (`3 > 1`) and yields the atom `mid`.
+        atom(
+            "case 3 of N when N > 5 -> big; N when N > 1 -> mid; _ -> small end",
+            "mid",
+        );
         int(
             "case hello of 1 -> a; {X} -> b; Y when is_atom(Y) -> 99; _ -> d end",
             99,

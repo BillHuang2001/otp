@@ -111,9 +111,10 @@ fn an_unknown_switch_is_a_recorded_init_argument() {
 
 #[test]
 fn a_bad_eval_expression_is_unsupported() {
-    // An `-eval` expression outside the supported integer grammar is a capability
-    // gap (exit 3), not a genuine runtime error (exit 1) and not a usage error.
-    for expr in ["1+", "length([a,b,c])", "try(1)end.", "2/3"] {
+    // A genuinely unparseable `-eval` expression is a capability gap (exit 3), not a
+    // genuine runtime error (exit 1) and not a usage error. (`length([a,b,c])`,
+    // `2/3`, `try(1)end.` now *parse and evaluate*, so they are no longer gaps.)
+    for expr in ["1+", "(1", "foo("] {
         let output = beam_rt(&["-eval", expr]);
         assert_eq!(
             output.status.code(),
