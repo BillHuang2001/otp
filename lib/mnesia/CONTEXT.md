@@ -11,7 +11,7 @@ The public API is the single module `mnesia` (see `src/CONTEXT.md` for the modul
 - Start/stop & config: `start/0,1`, `stop/0`, `change_config/2`, `set_debug_level/1`, `info/0`, `system_info/0,1`, `error_description/1`.
 - Activities: `transaction/1..3`, `sync_transaction/1..3`, `async_dirty/1,2`, `sync_dirty/1,2`, `ets/1,2`, `activity/2..4`, `abort/1`, `is_transaction/0`.
 - Locks: `lock/2,4`, `lock_table/2`, `read_lock_table/1`, `write_lock_table/1`.
-- In-activity record access: `read`, `wread`, `write`, `s_write`, `delete`, `delete_object`, `match_object`, `select`, `select_reverse`, `index_read`, `index_match_object`, `all_keys`, `first`/`next`/`last`/`prev`, `foldl`/`foldr`, `slot`.
+- In-activity record access: `read`, `wread`, `write`, `s_write`, `delete`, `delete_object`, `match_object`, `select`, `select_reverse`, `index_read`, `index_match_object`, `all_keys`, `first`/`next`/`last`/`prev`, `foldl`/`foldr`.
 - Dirty (no-activity) access: `dirty_read`, `dirty_write`, `dirty_delete`, `dirty_update_counter`, `dirty_select`, `dirty_match_object`, `dirty_index_*`, `dirty_first`/`next`/`last`/`prev`, `dirty_slot`.
 - Schema/table management: `create_schema/1,2`, `delete_schema/1`, `create_table/1,2`, `delete_table/1`, `add_table_copy/3`, `del_table_copy/2`, `move_table_copy/3`, `change_table_copy_type/3`, `add_table_index/2`, `del_table_index/2`, `transform_table/3,4`, `change_table_access_mode/2`, `change_table_load_order/2`, `change_table_majority/2`, `change_table_frag/2`, `clear_table/1`, `read/write/delete_table_property/2,3`.
 - Load/repair: `wait_for_tables/2`, `force_load_table/1`, `dump_tables/1`, `dump_log/0`, `sync_log/0`, `set_master_nodes/1,2`, `table_info/2,4`, `schema/0,1`.
