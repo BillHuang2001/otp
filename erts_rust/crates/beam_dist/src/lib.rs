@@ -23,10 +23,14 @@
 //! `lib/erl_interface/src/connect/ei_connect.c` + `ei_connect_int.h`, and
 //! `lib/erl_interface/src/epmd/*.c` + `erts/epmd/src/epmd_srv.c`.
 
+pub mod atom_cache;
+pub mod auth;
+pub mod connection;
 pub mod control;
 pub mod dist_header;
 pub mod epmd;
 pub mod flags;
+pub mod fragment;
 pub mod framing;
 pub mod handshake;
 pub mod prelude;
