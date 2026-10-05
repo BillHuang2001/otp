@@ -2,8 +2,8 @@
 
 ## Intent
 Flat directory of shell-script fragments describing *how* to cross compile Erlang/OTP for a given target.
-Each fragment is sourced (dot-sourced) by the `configure` scripts, so its variables become build-tool/feature overrides.
-Nothing here is compiled or installed; the files are developer/CI-facing configuration samples.
+Each fragment is dot-sourced by `otp_build` and translated into `configure` arguments, so its variables become build-tool/feature overrides.
+Nothing here is compiled or installed; the files are developer/CI-facing configuration samples with no build product of their own.
 
 ## API Surface
 - `erl-xcomp.conf.template` — master template. Contains every supported variable, commented out, with per-variable semantics, defaults and warnings. It doubles as user documentation. Copy it, uncomment what you need, and pass the copy to `otp_build configure --xcomp-conf=<FILE>`. `--xcomp-conf` is an `otp_build`-only argument: plain `configure` rejects it, so a direct `./configure` run must instead be given each variable as a `VAR=VALUE` argument or environment variable.
