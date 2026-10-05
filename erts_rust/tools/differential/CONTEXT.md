@@ -43,7 +43,7 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `differential run <case-id> [--json] [--out <dir>]` — run one corpus case both ways; print the comparison.
 - `differential compare <expr> [--pa <dir>]… [--json] [--out <dir>]` — ad-hoc: evaluate an expression under both runtimes and compare.
 - `differential suite [--strict] [--json] [--out <dir>]` — run the whole built-in corpus.
-- `differential list [--json]` — list corpus case ids + the contract each covers.
+- `differential list [--by-contract] [--json] [--out <dir>]` — list corpus case ids + the contract each covers. `--by-contract` groups by contract id (A.1…A.9) with per-contract case counts and ids; without it the output is byte-for-byte the plain listing.
 - `differential --help` / `-h`; `differential <sub> --help`.
 - **Exit codes:** `0` all executed cases agreed (skips/`unsupported` reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to failure.
 
