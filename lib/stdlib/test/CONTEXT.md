@@ -42,7 +42,7 @@ All suites run against an **installed OTP release**, not against the build tree 
 
 ## Notable suites
 - `stdlib_SUITE` — app-level: `test_server:app_test(stdlib)`, `appup` up/down one-major-version consistency (uses `otp_versions.table` + `otp_vsns`), `assert.hrl` checks; skips `appup_test` on development versions.
-- `stdlib_bench_SUITE` (+ `stdlib_bench_SUITE_data/` generic server/statem/fib fixtures) — benchmarks for unicode/base64/binary/io/gen_server/gen_statem plus comparison groups; skipped by default specs.
+- `stdlib_bench_SUITE` (+ `stdlib_bench_SUITE_data/` generic server/statem/simple-server fixtures) — benchmarks for unicode/base64/binary/io/gen_server/gen_statem plus comparison groups; skipped by default specs.
 - `ets_SUITE` (10.4k lines, largest) — ETS semantics, `benchmark` and `error_info` groups; `ets_tough_SUITE` holds the heavy/slow cases.
 - `qlc_SUITE` (8.1k) — query-compiler semantics incl. `qlc_SUITE_data/join_info_compat.erl`; `dets_SUITE` (+ pre-OTP file-format fixtures) and `sofs_SUITE` cover the other "database-ish" stdlib modules.
 - `erl_lint_SUITE` (6.2k) + `erl_lint_SUITE_data/` (bad behaviours, callbacks, predef names) — the lint/error-diagnostic suite; siblings `erl_scan_SUITE`, `erl_parse`-touching `erl_pp_SUITE`, `erl_eval_SUITE`, `erl_expand_records_SUITE`, `epp_SUITE` (+ data), `erl_anno_SUITE`, `erl_error_SUITE`, `erl_internal_SUITE`.
