@@ -47,7 +47,7 @@ Declared in `erts/include/internal/ethread.h`, `erts/include/internal/ethr_inter
 - **Huge timeouts**: `select()` is clamped to `ETHR_SELECT_MAX_TV_SEC__` (31 days, the POSIX minimum guarantee) and `cond_timeout.tv_sec` to `INT_MAX`; on such a clamp the wait returns `EINTR` (spurious wakeup) instead of `ETIMEDOUT`, so the caller must restart the wait. With `ERTS_USE_PREMATURE_TIMEOUT` (from `erl_misc_utils.h`) the waits additionally subtract a bounded "premature" amount and re-verify the timeout.
 - **Stack sizing**: `suggested_stack_size` is in kilo words; it is converted with `ETHR_KW2B`, page-aligned, plus one page and (if `ETHR_HAVE_PTHREAD_ATTR_SETGUARDSIZE`) `ETHR_STACK_GUARD_SIZE`, clamped to `ethr_min_stack_size__`/`ethr_max_stack_size__`; in `ETHR_DEBUG` it is halved for margin; `ETHR_MODIFIED_DEFAULT_STACK_SIZE` overrides the system default.
 - **Thread scope**: `pthread_attr_setscope(PTHREAD_SCOPE_SYSTEM)` is attempted and `ENOTSUP` is tolerated.
-- **`ethr_event.c` includes `erl_misc_utils.h`** solely for the premature-timeout macros; `erls_...`/erts APIs are otherwise not used here.
+- **`ethr_event.c` includes `erl_misc_utils.h`** solely for the premature-timeout macros (`ERTS_USE_PREMATURE_TIMEOUT` / `ERTS_PREMATURE_TIMEOUT()`); the rest of this dir does not call erts-level APIs.
 - The emulator consumes this code indirectly: `erts/emulator/beam/erl_threads.h` wraps TSE/event calls as `erts_tse_*` (`erl_process.c`, `erl_async.c`, `erl_process_lock.c`, `erl_thr_progress.c`, `erl_nif.c`, `erl_proc_sig_queue.c`).
 
 ## Known Issues / Gotchas
