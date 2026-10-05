@@ -215,6 +215,9 @@ impl Table {
   forms (wildcard `'_'`, element binds `'$N'`, whole-object `'$_'`, **empty guards**) are implemented.
   The full Erlang match-spec compiler (guards `andalso`/`orelse`, `is_*` tests, `element/2`,
   `map_get`, arithmetic, list comprehensions in bodies) is NOT implemented; `compile` rejects it.
+  A *body* that builds a fresh tuple is also outside the subset: `select` has no target heap to
+  construct a tuple in, so a zero- or multi-element `MatchBody::Tuple` is `badarg`; only
+  `'$_'`/a **single-element** `MatchBody::Tuple` (a literal, a `'$N'` or `'$_'`) produces a result.
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
   refs/sub-bitstrings cannot be copied into table storage yet (`insert` ⇒ `BadArg`). Supported:
   immediates, lists, tuples, flat maps, float/bignum/internal-ref/on-heap-bitstring.
