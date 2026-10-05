@@ -18,6 +18,17 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 `../../erts/doc/guides/erl_ext_dist.md`. All tag values and encodings are **wire-frozen**. Read the C;
 never modify it.
 
+## Status
+**Scaffolded — declarations only.** Every module below exists with the frozen
+public API, doc comments and `unimplemented!()` bodies. The two exceptions are in
+`error.rs`, where `unsupported`/`is_unsupported` and the `BadArg`/`SystemLimit`
+constructor helpers are implemented because their behaviour is fully specified and
+`is_unsupported` must be meaningful. `src/lib.rs` carries a documented, temporary
+`#![allow(unused_variables)]` + `#![allow(dead_code)]` pair to keep the skeleton
+warning-free — remove both together with the stubs. The `tests/` files hold only
+their written plans (no test functions yet). `Tag::from_byte`/`as_byte`/`name`/
+`covered` and every wire/term body are still to be implemented.
+
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_codec::prelude::*`.
 
