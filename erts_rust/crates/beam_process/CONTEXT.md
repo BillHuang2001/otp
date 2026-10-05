@@ -245,6 +245,18 @@ holds `Process` values directly.
   touch two PCBs; holding two `&mut Process` from a `HashMap` is a borrow-checker impossibility, so all
   such operations live on `ProcessTable` and use a **collect-then-apply worklist** (gather the link
   targets / watchers, then mutate each target transiently). `Process` itself holds only its own sets.
+- **An exit reason delivered to a recipient is COPIED into that recipient's heap.** An exit/link/
+  monitor reason that lives in the source process's heap (e.g. a tuple like `{badmatch, X}`) must not
+  be embedded by reference into a recipient: the source heap is dropped when it terminates, which
+  would leave a dangling pointer in the recipient's mailbox (and a safepoint GC of the recipient
+  would then corrupt/crash). `enqueue_exit_message`/`enqueue_down_message` therefore `copy_struct` the
+  reason into the recipient's heap first (with the source `OffHeapTable` as the copy context, draining
+  the referenced MSO handles onto the `Message`), the cascade copies a peer-bound reason into the
+  peer's own heap before queueing its termination, and `apply_exit_signal` copies from the still-live
+  `signal.from` (self-signals embed directly, since the reason is already in the recipient's heap).
+  Immediates and literal-area terms are shared by `copy_struct`, so the common reasons pay nothing.
+  This mirrors `Process::deliver`'s copy-then-enqueue pattern and is what makes `{'EXIT', …}`/
+  `{'DOWN', …}` survive the recipient's next collection.
 - **GC root set = registers + mailbox payloads, gathered into a flat `&mut [Eterm]`.** `beam_gc`'s
   collector takes a flat root slice (`x_reg_array[0..Live)` + stack, no frame maps). The mailbox holds
   terms *in this process's heap*, so it is a sub-rootset (`beam_gc` explicitly delegates on-heap
