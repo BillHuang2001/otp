@@ -30,7 +30,7 @@ All suites run against an **installed OTP release**, not against the build tree 
 - All tool-driven properties live in `property_test/`: `array_prop`, `array_eqc`, `base64_prop`, `binary_prop`, `calendar_prop`, `ets_prop`, `gb_sets_prop`, `json_prop`, `lists_prop`, `queue_prop`, `sets_prop`, `shell_docs_prop`, `uri_string_recompose`.
 - Suites pick them up with `ct_property_test:init_per_suite/1`, which compiles the whole `test/property_test/` dir (sibling of the suite's data dir) and **skips the suite** when no QuickCheck/PropEr/Triq is installed — so these suites silently pass as "skipped" in a plain OTP checkout.
 - Direct callers: `array_SUITE` (`array_eqc`/`array_prop`), `calendar_prop_SUITE`, `json_SUITE` (`json_prop`), `shell_docs_SUITE` (`shell_docs_prop`, group `prop`).
-- Dedicated property suites: `array`(inline), `base64_property_test_SUITE`, `binary_property_test_SUITE`, `ets_property_test_SUITE`, `gb_sets_property_test_SUITE`, `lists_property_test_SUITE`, `queue_property_test_SUITE`, `sets_property_test_SUITE`, `uri_string_property_test_SUITE`.
+- Dedicated property suites: `base64_property_test_SUITE`, `binary_property_test_SUITE`, `ets_property_test_SUITE`, `gb_sets_property_test_SUITE`, `lists_property_test_SUITE`, `queue_property_test_SUITE`, `sets_property_test_SUITE`, `uri_string_property_test_SUITE`.
 - `property_test/README` marks the directory experimental and QuickCheck-licensed, intended to be run manually.
 
 ## Test specs (what each selects)
