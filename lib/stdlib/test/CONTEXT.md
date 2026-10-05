@@ -93,4 +93,4 @@ All suites run against an **installed OTP release**, not against the build tree 
 - `../Makefile` — sets `TEST_NEEDS_RELEASE=true` and injects `-enable-feature maybe_expr`; `../../make/app_targets.mk` + `../../make/test_target_script.sh` — the generic `make test` driver.
 - `../../common_test/` — Common Test framework, `ct_property_test`, and `test_server/ts*` that compiles data dirs.
 - `../../kernel/test/` (`rtnode`, `shell_test_lib`), `../../sasl/test/otp_vsns.erl`, `../../../erts/emulator/test/erts_test_utils.erl` — helpers pulled into the released test dir.
-- `../../uc_spec/`, `../../doc/guides/uri_string_usage.md`, `../../../system/doc/reference_manual/ref_man_native_records.md` — doctest/data inputs installed at release time.
+- `../../uc_spec/` , `../doc/guides/uri_string_usage.md`, `../../../system/doc/reference_manual/ref_man_native_records.md` — doctest/data inputs installed at release time.
