@@ -272,10 +272,14 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   `env!("CARGO_BIN_EXE_beam_rt")` with `std::process::Command`:
   `run <slice.beam> slice:add/2 2 3` → stdout contains `5`;
   `run <slice.beam> slice:fib/1 10` → stdout contains `55`;
-  `--version` → exit 0 + the version string; `-eval 2+3` → `5`;
-  an unknown switch → exit 3 + a single `beam_rt: unsupported:` stderr line naming it and **no**
-  `Usage:`; `-eval` outside the grammar → exit 3; a missing `.beam` / module-not-found → exit 1;
+  `--version` → exit 0 + the version string; `-eval 2+3` → exit 0 with **empty** stdout and stderr;
+  an **unknown switch** → exit 0 (recorded as an init argument); `-eval` outside the grammar → exit 3
+  + exactly one `beam_rt: unsupported:` stderr line and **no** `Usage:`; a missing `.beam` → exit 1;
   a missing switch operand or a stray positional argument → exit 2 + `Usage:`.
+* **`tests/multimodule.rs` — the multi-module host.** Compiles a fixture with the system `erlc` into a
+  scratch dir and runs it through `Runtime::run_function`: `lists:reverse/1` → `[3,2,1]`,
+  `maps:get/2` on a map literal → `7`, and the on-demand stdlib module `ordsets`. It **skips loudly**
+  (printing the reason) when the system toolchain/stdlib is unavailable, never silently passing.
 * **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` GREEN;
   the whole-workspace `build`/`test` must stay green.
 
