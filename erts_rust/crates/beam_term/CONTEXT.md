@@ -381,9 +381,8 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs). Classes
   lacking a layout-aware representation (funs, records, external pid/port/ref, bin refs) use an opaque
   raw-word fallback, so their hash is not stable across processes/images.
-- **Object-size approximations (`src/size.rs`).** Hash maps are walked node-by-node (head
-  array/bitmap, interior bitmaps, collision nodes, flat-map leaves). Sub-bitstrings report the on-heap
-  thing size rather than the copied representation; native records are treated like tuples.
+- **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
+  field-table layout is not modelled).
 - **Hash choices are internal (`src/map.rs`).** The HAMT trie is driven by `hashing::term_hash`, not
   `erts_map_hash`, so a node's *bitmap* for a given key set is not `erts_map_hash`-identical. The node
   *encodings* (headers, sizes, slot semantics, collision/flat-map formats, key order) are bit-exact to
