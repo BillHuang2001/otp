@@ -20,19 +20,13 @@
 //! `erl_db_util.c` (key/term handling, the match compiler). Mirror the
 //! **semantics**, not the layouts.
 //!
-//! # Status: frozen API skeleton
+//! # Scope (M1)
 //!
-//! This module tree is the **frozen API skeleton** of the crate: every public
-//! item is declared with its final signature and an `unimplemented!()` body so
-//! the API is compile-checked *before* the implementation phase lands. The
-//! authoritative API surface is `CONTEXT.md` at the crate root; the
-//! implementation phase fills the bodies in and adds the tests.
-
-// The skeleton declares signatures only: no body executes yet, so parameters go
-// unused and the placeholder fields/variants are never read. Both allows are
-// dropped as the implementation phase fills the bodies in.
-#![allow(unused_variables)]
-#![allow(dead_code)]
+//! All module bodies are implemented: [`Table`] wire the metadata, the
+//! table-owned [`TermStore`] and one interior behind the private `Interior`
+//! trait. The authoritative API surface is `CONTEXT.md` at the crate root, which
+//! also documents the honest M1 gaps (a `select`/deep-copy subset, no concurrency
+//! or owner enforcement) under *Known Issues*.
 
 pub mod error;
 pub mod hash_interior;

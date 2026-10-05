@@ -817,14 +817,7 @@ mod tests {
     }
 
     /// The `badarg` path for term kinds outside the copied subset.
-    ///
-    /// Ignored because `crate::error::badarg()` — the crate-level failure
-    /// constructor, implemented by the sibling `kind`/`key`/`error` module task — is
-    /// still the frozen-skeleton `unimplemented!()` body in this module's build, so
-    /// the failure would surface as a panic rather than `Err`. Un-ignore it once
-    /// that module lands.
     #[test]
-    #[ignore = "blocked on crate::error::badarg() (skeleton until the error module task lands)"]
     fn sub_bitstring_is_rejected_with_badarg() {
         let mut heap = Heap::new(16);
         // SAFETY: an `ErlSubBits` thing is 5 words; all of them are written here.

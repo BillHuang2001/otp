@@ -36,6 +36,21 @@ pub struct TableInfo {
     pub read_concurrency: bool,
 }
 
+/// A `(field-atom, value)` pair, with the field name interned in `atoms`.
+fn pair(atoms: &mut AtomTable, field: &str, value: Eterm) -> (Atom, Eterm) {
+    (atoms.intern(field), value)
+}
+
+/// The term of the atom `name` (interning it in `atoms`).
+fn atom_term(atoms: &mut AtomTable, name: &str) -> Eterm {
+    make_atom(atoms.intern(name))
+}
+
+/// The `true`/`false` atom term for `value`.
+fn bool_term(atoms: &mut AtomTable, value: bool) -> Eterm {
+    atom_term(atoms, if value { "true" } else { "false" })
+}
+
 impl TableInfo {
     /// The `{Key, Value}` proplist pairs of the table's `ets:info/1` fields
     /// (`id`/`name`/`type`/`keypos`/`protection`/`size`/`owner`/…).
@@ -43,6 +58,30 @@ impl TableInfo {
     /// Heap-free: [`atoms`](AtomTable) is used only to intern the field-name
     /// atoms; values are returned as `(Atom, Eterm)` pairs.
     pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)> {
-        unimplemented!("M1: implementation pending")
+        let name = match self.name {
+            Some(atom) => make_atom(atom),
+            // An unnamed table reports `undefined`.
+            None => atom_term(atoms, "undefined"),
+        };
+        let kind = atom_term(atoms, self.kind.as_atom_name());
+        let protection = atom_term(atoms, self.access.as_atom_name());
+        // M1 has no pid terms to report, so the owner is rendered as `undefined`.
+        let owner = atom_term(atoms, "undefined");
+        let compressed = bool_term(atoms, self.compressed);
+        let write_concurrency = bool_term(atoms, self.write_concurrency);
+        let read_concurrency = bool_term(atoms, self.read_concurrency);
+
+        vec![
+            pair(atoms, "id", make_small(self.id.raw() as i64)),
+            pair(atoms, "name", name),
+            pair(atoms, "type", kind),
+            pair(atoms, "keypos", make_small(self.keypos as i64)),
+            pair(atoms, "protection", protection),
+            pair(atoms, "size", make_small(self.size as i64)),
+            pair(atoms, "owner", owner),
+            pair(atoms, "compressed", compressed),
+            pair(atoms, "write_concurrency", write_concurrency),
+            pair(atoms, "read_concurrency", read_concurrency),
+        ]
     }
 }
