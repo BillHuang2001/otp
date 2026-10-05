@@ -12,7 +12,7 @@ Nothing here is compiled or installed; the files are developer/CI-facing configu
 - `erl-xcomp-<target>.conf` (17 files) — ready-made configs, each the template with a few lines uncommented. Naming is loose: some are `<cpu>-<os>` (e.g. `erl-xcomp-mips-linux.conf`), some add vendor/abi (e.g. `erl-xcomp-armv8-rpi3-linux-gnueabihf.conf`), some are tool-version-named (`erl-xcomp-TileraMDE2.0-tilepro.conf`), one is dynamic (`erl-xcomp-host-iossimulator.conf`, uses `` `arch` ``).
 
 ## How cross compilation is driven
-1. `otp_build configure --xcomp-conf=<FILE>` sources the conf file inside `try_cross_configure ()`.
+1. `otp_build configure --xcomp-conf=<FILE>` sources the conf file inside `try_cross_configure ()` (tilde expansion is done here, since `configure` cannot do it). Cross configure is triggered either by `--xcomp-conf` or by `--build`/`--host` canonicalizing to different systems.
 2. `erl_xcomp_build` / `erl_xcomp_host` become `--build=` / `--host=`; `erl_xcomp_configure_flags` is appended to `CONFIG_FLAGS`; the `erl_build_tool_vars` (`erl-build-tool-vars.sh`) and remaining `erl_xcomp_vars` are turned into `--VAR=value` configure args by `env_to_config_flags`.
 3. Autoconf then treats those as *precious variables*, so they override the results of run-time probe tests that cannot be executed on the target (which is why the file is described as overriding/backing configure's guesses).
 4. Only variables in the two `*-vars.sh` lists, plus `CC/CFLAGS/...` build-tool vars, are guaranteed visible to every sub-`configure`. Arbitrary variables need to be exported in the environment instead.
