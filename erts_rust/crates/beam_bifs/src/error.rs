@@ -9,7 +9,6 @@
 //! `../../erts/emulator/beam/bif.c` (`badarg`, `badarith`); the public
 //! `raise_*` builders construct the `error`/`exit`/`throw` BEAM exceptions the
 //! engine turns into an actual raise.
-#![allow(dead_code)] // consumed by the follow-up BIF implementations
 
 use beam_common::{BeamError, ExitReason, Raise};
 

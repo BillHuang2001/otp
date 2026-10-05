@@ -21,7 +21,10 @@
 //! mapping is therefore lossy in exactly that one direction:
 //! [`reason_term_from_exit_reason`] rejects `Structured` with `badarg`. This is
 //! the handoff `../beam_process/CONTEXT.md` documents.
-#![allow(dead_code)] // `reason_term_from_exit_reason` is the documented M1 handoff for `beam_rt`
+//!
+//! Both [`exit_reason_from_term`] and [`reason_term_from_exit_reason`] are part of
+//! the crate's public API (re-exported from the crate root) — the documented
+//! `beam_process`/`beam_rt` handoff, not crate-internal helpers.
 
 use beam_common::{BeamError, ExitReason, Result};
 use beam_term::{atom_val, make_atom, AtomTable, Eterm};
@@ -39,7 +42,7 @@ use crate::registry::BifRegistry;
 /// An atom whose name is absent from `atoms` (a mismatched table) also maps to
 /// `Structured`: `ExitReason::Atom` requires a name and there is none to attach
 /// (see the module docs).
-pub(crate) fn exit_reason_from_term(term: Eterm, atoms: &AtomTable) -> ExitReason {
+pub fn exit_reason_from_term(term: Eterm, atoms: &AtomTable) -> ExitReason {
     if !beam_term::is_atom(term) {
         return ExitReason::Structured;
     }
@@ -61,7 +64,7 @@ pub(crate) fn exit_reason_from_term(term: Eterm, atoms: &AtomTable) -> ExitReaso
 ///
 /// [`BeamError::BadArg`] for [`ExitReason::Structured`] (and any future
 /// non-exhaustive variant): it carries no term to reproduce (see the module docs).
-pub(crate) fn reason_term_from_exit_reason(
+pub fn reason_term_from_exit_reason(
     reason: &ExitReason,
     atoms: &mut AtomTable,
 ) -> Result<Eterm> {

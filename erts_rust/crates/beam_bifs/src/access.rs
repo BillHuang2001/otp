@@ -17,7 +17,6 @@
 //! ([`beam_term::is_small`], [`beam_term::is_atom`], …); the boxed wrappers only
 //! dereference a header after `beam_term` has confirmed the word is boxed.
 #![allow(unsafe_code)]
-#![allow(dead_code)] // consumed by the follow-up BIF implementations
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -91,6 +90,9 @@ pub(crate) fn is_map(x: Eterm) -> bool {
 }
 
 /// `is_big(x)` — a bignum.
+// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
+// bignums, so no BIF dispatches on it yet.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn is_big(x: Eterm) -> bool {
     // SAFETY: as [`is_tuple`].
@@ -119,6 +121,9 @@ pub(crate) fn is_function(x: Eterm) -> bool {
 }
 
 /// `is_record(x)` — a native record.
+// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
+// native records, so no BIF dispatches on it yet.
+#[allow(dead_code)]
 #[inline]
 pub(crate) fn is_record(x: Eterm) -> bool {
     // SAFETY: as [`is_tuple`].
