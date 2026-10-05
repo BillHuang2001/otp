@@ -21,7 +21,9 @@
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
-use beam_term::{Eterm, HEADER_FLONUM, REF_SUBTAG};
+use beam_term::{
+    Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_FLONUM, HEAP_BITS_SUBTAG, REF_SUBTAG,
+};
 
 // ---------------------------------------------------------------------------
 // Classification — safe pass-throughs of the `beam_term` immediate predicates
@@ -321,6 +323,186 @@ pub(crate) fn ref_thing_id(term: Eterm) -> Result<u64> {
     u64::try_from(id).map_err(|_| BeamError::BadArg)
 }
 
+// ---------------------------------------------------------------------------
+// Heap bitstrings (`ErlHeapBits`, `erl_bits.h`)
+//
+// The items below are a documented part of the `access.rs` surface reserved for
+// dependents: `crate::bits` is their only caller, and `erlang:size/1`
+// (`crate::term_ops`) is the only BIF wired to it in M1 — the `binary`/`unicode` BIFs
+// that read the bytes back land later, so the unused-tail items carry
+// `#[allow(dead_code)]` (the same convention as [`is_big`]/[`is_record`] above).
+// ---------------------------------------------------------------------------
+
+/// `ERL_HEAP_BITS_SIZE` — the number of words *before* the data area of an on-heap
+/// bitstring (`[thing_word, size, data…]`).
+const HEAP_BITS_PREFIX_WORDS: usize = ERL_HEAP_BITS_SIZE;
+
+/// The total words a heap bitstring of `bit_len` bits occupies.
+///
+/// `erl_bits.h:heap_bits_size(bits)` is `sizeof(ErlHeapBits)/sizeof(Eterm) - 1 +
+/// ceil(NBYTES(bits) / sizeof(Eterm))` = two prefix words plus `ceil(bits / 64)`
+/// data words.
+#[allow(dead_code)]
+fn heap_bits_words(bit_len: usize) -> usize {
+    HEAP_BITS_PREFIX_WORDS + bit_len.div_ceil(8 * size_of::<Eterm>())
+}
+
+/// Builds the on-heap bitstring `<<bytes:bit_len>>` on `heap`.
+///
+/// The block is the frozen `ErlHeapBits` of `erl_bits.h`:
+/// `[make_header(1 + data_words, HEAP_BITS_SUBTAG), bit_len, data…]`, where
+/// `data_words = ceil(bit_len / 64)`. The bits are the first `bit_len` bits of
+/// `bytes`, packed **MSB-first** in address order (`erl_bits.h` addresses the data
+/// area as a byte array: `Base = (byte*)&_hb->data[0]`, so a byte-aligned binary's
+/// bytes are stored in order). The unused bytes of the final data word are zeroed,
+/// so the layout is fully deterministic and endianness-agnostic.
+///
+/// Unlike C, no 64-byte on-heap limit is enforced: Milestone-1 keeps *every* binary
+/// on the process heap (see `crate::bits`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `bit_len > bytes.len() * 8`; otherwise propagates
+/// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
+/// block.
+#[allow(dead_code)]
+pub(crate) fn make_heap_bitstring(heap: &mut Heap, bytes: &[u8], bit_len: usize) -> Result<Eterm> {
+    // `saturating_mul` can only saturate for a slice no allocator could ever hand
+    // out (`len > usize::MAX / 8`), where every `bit_len` still fits — so the check
+    // below stays exact without a wrapping multiply.
+    if bit_len > bytes.len().saturating_mul(8) {
+        return Err(BeamError::BadArg);
+    }
+    let data_words = bit_len.div_ceil(8 * size_of::<Eterm>());
+    // SAFETY: `alloc_words` hands out `2 + data_words` exclusively-owned, writable
+    // words.
+    let p = unsafe { heap.alloc_words(heap_bits_words(bit_len))? };
+    // SAFETY: `p` addresses the `2 + data_words` words just handed out; the header
+    // word, the bit-size word and every data byte are written before the pointer
+    // escapes this block.
+    unsafe {
+        *p = make_header(1 + data_words, HEAP_BITS_SUBTAG);
+        *p.add(1) = Eterm::from_raw(bit_len);
+        let data = core::slice::from_raw_parts_mut(
+            p.add(HEAP_BITS_PREFIX_WORDS).cast::<u8>(),
+            data_words * size_of::<Eterm>(),
+        );
+        let nbytes = bit_len.div_ceil(8);
+        data[..nbytes].copy_from_slice(&bytes[..nbytes]);
+        data[nbytes..].fill(0);
+    }
+    Ok(make_boxed(p as *const Eterm))
+}
+
+/// The bit size of a bitstring (heap or sub bits).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a bitstring.
+pub(crate) fn bitstring_bit_size(term: Eterm) -> Result<usize> {
+    if !is_bitstring(term) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_bitstring`] confirmed `term` is a live heap- or sub-bitstring
+    // whose backing thing is valid for `ERL_SUB_BITS_SIZE`/`ERL_HEAP_BITS_SIZE`
+    // words — never unvalidated memory.
+    Ok(unsafe { beam_term::bitstring_size(term) })
+}
+
+/// Copies the bytes of a byte-aligned bitstring (a *binary*) out of the term.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a byte-aligned bitstring. An off-heap
+/// `SUB_BITS` thing is also rejected: Milestone-1 builds none (every binary this
+/// crate creates is on-heap), and its bytes live behind a `BinRef`/match-context
+/// indirection that no M1 producer creates.
+#[allow(dead_code)]
+pub(crate) fn binary_bytes(term: Eterm) -> Result<Vec<u8>> {
+    if !is_binary(term) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_binary`] confirmed `term` is a boxed, byte-aligned bitstring, so
+    // its header word is a live term word.
+    let header = unsafe { *boxed_val(term) };
+    if header.raw() & BITSTRING_TAG_MASK != HEAP_BITS_SUBTAG {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: a heap bitstring is `[header, size, data…]`, so word 2 begins the live
+    // data area, which holds `ceil(byte_len / 8)` words — i.e. at least `byte_len`
+    // initialised bytes (`erl_bits.h`: the data area is byte-addressed).
+    let data = unsafe { boxed_val(term).add(HEAP_BITS_PREFIX_WORDS).cast::<u8>() };
+    let nbytes = unsafe { beam_term::bitstring_size(term) } / 8;
+    // SAFETY: the `nbytes` bytes just described are initialised and in bounds; the
+    // copy goes out byte by byte, so it is endianness-agnostic.
+    Ok(unsafe { core::slice::from_raw_parts(data, nbytes) }.to_vec())
+}
+
+// ---------------------------------------------------------------------------
+// Flat maps (`beam_term::thing` owns the layout)
+//
+// Reserved for the `maps` module BIFs, which land later; every item is exercised by
+// the tests below until then (hence the `#[allow(dead_code)]`).
+// ---------------------------------------------------------------------------
+
+/// `is_flatmap(x)` — a flat map (a small map), as opposed to a hashmap.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn is_flatmap(x: Eterm) -> bool {
+    // SAFETY: `x` is a live machine word; `is_flatmap` checks `is_boxed` before
+    // dereferencing the header.
+    unsafe { beam_term::is_flatmap(x) }
+}
+
+/// `is_hashmap(x)`.
+// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
+// hashmaps (every M1 map is a flat map), so no BIF dispatches on it yet.
+#[allow(dead_code)]
+#[inline]
+pub(crate) fn is_hashmap(x: Eterm) -> bool {
+    // SAFETY: as [`is_flatmap`].
+    unsafe { beam_term::is_hashmap(x) }
+}
+
+/// Builds a flat map from `(key, value)` pairs on `heap`.
+///
+/// The layout is owned by `beam_term::thing` (`write_flatmap`); the pair order is
+/// preserved and duplicate keys are not detected (that needs term comparison, owned
+/// by `beam_term::compare`).
+///
+/// # Errors
+///
+/// Propagates [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot
+/// fit the block.
+#[allow(dead_code)]
+pub(crate) fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let words = beam_term::thing::flatmap_size_words(pairs.len());
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let p = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `p` is the base of those `words` words; `write_flatmap` writes all of
+    // them and returns a boxed pointer into the same block, which stays live (and
+    // unmoved) for as long as `heap` does, which the caller keeps alive.
+    Ok(unsafe { beam_term::thing::write_flatmap(p, pairs) })
+}
+
+/// Copies a flat map's keys and values out of the term (each in wire order).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a flat map.
+#[allow(dead_code)]
+pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
+    if !is_flatmap(term) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_flatmap`] confirmed `term` is a live flat map in the
+    // `write_flatmap` layout, so both borrowed slices are live and in bounds; they
+    // are copied below, so nothing borrows past this call (the caller's heap stays
+    // alive regardless).
+    let (keys, values) = unsafe { beam_term::thing::flatmap_parts(term) };
+    Ok((keys.to_vec(), values.to_vec()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -398,5 +580,89 @@ mod tests {
         assert!(is_number(make_small(1)));
         assert!(is_integer(make_small(1)));
         assert!(is_atom(beam_term::make_atom(beam_term::Atom::from_raw(0))));
+    }
+
+    #[test]
+    fn heap_bitstring_has_the_frozen_header_and_layout() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let bin = make_heap_bitstring(&mut heap, &[0xAB, 0xCD], 16).expect("the binary fits");
+        assert!(is_boxed(bin));
+        assert!(is_bitstring(bin));
+        assert!(is_binary(bin));
+        assert_eq!(bitstring_bit_size(bin).unwrap(), 16);
+        // SAFETY: `bin` is the live heap bitstring built above; word 0 is its header,
+        // word 1 the bit size and words 2.. its data (all written by
+        // `make_heap_bitstring`).
+        unsafe {
+            assert_eq!(*boxed_val(bin), make_header(2, HEAP_BITS_SUBTAG));
+            assert_eq!((*boxed_val(bin).add(1)).raw(), 16);
+            // The bytes are stored in address order (`erl_bits.h`: the data area is
+            // byte-addressed), so this is endianness-agnostic.
+            assert_eq!(*(boxed_val(bin).add(2).cast::<u8>()), 0xAB);
+            assert_eq!(*(boxed_val(bin).add(2).cast::<u8>().add(1)), 0xCD);
+            // The unused bytes of the final data word are zeroed.
+            assert_eq!(*(boxed_val(bin).add(2).cast::<u8>().add(2)), 0x00);
+            assert_eq!(*(boxed_val(bin).add(2).cast::<u8>().add(7)), 0x00);
+        }
+        assert_eq!(binary_bytes(bin).unwrap(), vec![0xAB, 0xCD]);
+    }
+
+    #[test]
+    fn heap_bitstring_sizes_follow_the_frozen_word_count() {
+        let mut heap = Heap::new(64).expect("test heap");
+        // `erl_bits.h:heap_bits_size`: 2 + ceil(bits / 64) words, header arity
+        // `1 + ceil(bits / 64)`.
+        for (nbytes, words, arity) in [(0usize, 2usize, 1usize), (2, 3, 2), (8, 3, 2), (64, 10, 9)] {
+            let before = heap.used();
+            let bin =
+                make_heap_bitstring(&mut heap, &vec![0u8; nbytes], nbytes * 8).expect("fits");
+            assert_eq!(heap.used() - before, words, "{nbytes}-byte binary word count");
+            // SAFETY: `bin` is a live heap bitstring; word 0 is its header.
+            let header = unsafe { *boxed_val(bin) };
+            assert_eq!(header, make_header(arity, HEAP_BITS_SUBTAG));
+        }
+    }
+
+    #[test]
+    fn empty_flatmap_round_trips() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let map = make_flatmap(&mut heap, &[]).expect("the empty map fits");
+        assert!(is_flatmap(map));
+        assert!(!is_hashmap(map));
+        let (keys, values) = flatmap_pairs(map).unwrap();
+        assert!(keys.is_empty());
+        assert!(values.is_empty());
+        // The empty block is the three-word `[head, 0, tuple0]` form.
+        assert_eq!(heap.used(), 3);
+    }
+
+    #[test]
+    fn flatmaps_round_trip_in_wire_order() {
+        let mut heap = Heap::new(256).expect("test heap");
+        for n in [1usize, 2, 32] {
+            let pairs: Vec<(Eterm, Eterm)> = (0..n)
+                .map(|i| (make_small(i as i64), make_small(-(i as i64))))
+                .collect();
+            let map = make_flatmap(&mut heap, &pairs).expect("the map fits");
+            assert!(is_flatmap(map));
+            let (keys, values) = flatmap_pairs(map).unwrap();
+            assert_eq!(keys.len(), n);
+            assert_eq!(values.len(), n);
+            for (i, (key, value)) in pairs.iter().enumerate() {
+                assert_eq!(keys[i], *key, "key {i}");
+                assert_eq!(values[i], *value, "value {i}");
+            }
+        }
+    }
+
+    #[test]
+    fn flatmap_accessors_reject_non_maps() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let tuple = heap.tuple(&[make_small(1)]).expect("the tuple fits");
+        for term in [make_small(1), NIL, tuple] {
+            assert!(!is_flatmap(term));
+            assert!(!is_hashmap(term));
+            assert!(matches!(flatmap_pairs(term), Err(BeamError::BadArg)));
+        }
     }
 }
