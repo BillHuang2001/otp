@@ -153,10 +153,11 @@ unreachable — "never a silently-wrong result"). Float rendering: Rust's shorte
 `.0` appended when integral; **documented deviation** from OTP's `%.*g` for large/small magnitudes.
 
 ### `reason.rs` — `beam_common::ExitReason` ↔ reason term
-The documented `beam_process` handoff (see `../beam_process/CONTEXT.md` Known Issues).
+The documented `beam_process`/`beam_rt` handoff (see `../beam_process/CONTEXT.md` Known Issues).
+Both functions are **public API**, re-exported from the crate root.
 ```rust
 pub fn exit_reason_from_term(term: Eterm, atoms: &AtomTable) -> ExitReason;  // atom→named/Atom, else Structured
-pub fn reason_term_from_exit_reason(reason: &ExitReason, atoms: &mut AtomTable) -> Result<Eterm>; // well-known atoms + Atom(name)
+pub fn reason_term_from_exit_reason(reason: &ExitReason, atoms: &mut AtomTable) -> Result<Eterm>; // well-known atoms + Atom(name); Structured ⇒ BadArg
 ```
 `erlang:error/1,2 exit/1 throw/1` map their live reason term via `exit_reason_from_term` and return
 `Err(raise_error/exit/throw(..))`. A structured (non-atom) reason is represented by
