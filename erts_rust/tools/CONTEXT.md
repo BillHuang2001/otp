@@ -11,8 +11,8 @@ Neither tool modifies the runtime or the external repos — both are pure driver
 Both crates ship a **library + a binary**: the library exists so `cargo test` can assert the harness itself (against the oracle / against fixture binaries), and the binary is what a human or CI drives. `--help` must be usable on every subcommand.
 
 ### `differential`
-- `differential run <case-id> [--json]` — run one built-in conformance case both ways; print the comparison.
-- `differential compare <module|expr> [--json]` — ad-hoc: evaluate an Erlang expression/module under both runtimes and compare.
+- `differential run <case-id> [--json] [--out <dir>]` — run one built-in conformance case both ways; print the comparison.
+- `differential compare <expr> [--pa <dir>] [--json] [--out <dir>]` — ad-hoc: evaluate an Erlang expression under both runtimes and compare.
 - `differential suite [--strict] [--json] [--out <dir>]` — run the built-in conformance corpus.
 - `differential list [--json]` — list corpus case ids + the compatibility contract each covers.
 - Exit codes: `0` all executed cases agreed (skips/unsupported reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to a failure exit.
@@ -28,20 +28,20 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - **Runtime resolution — documented, overridable, no baked absolute paths:**
   - **Oracle** = `$ERTS_ORACLE` if set, else `erl` resolved on `PATH`. Missing ⇒ loud env error (exit 2).
   - **Rust runtime** = `$BEAM_RT` if set, else the workspace-relative `target/{release,debug}/beam_rt` (relative to `../..`). If neither exists ⇒ cases report `unsupported`.
-  - Both runtimes are invoked with the **same argv** as `erl` — `beam_rt` is treated as a drop-in `erl` (contract A.6). The tool sets only the *program path*; it never assumes internals.
+  - **Case kind drives the argv.** *Eval* cases give both runtimes the **same argv** (`["-noshell", <extra…>, "-eval", <probe>]`); *Module* cases give them **per-side argv** — the Rust side runs `beam_rt run <file.beam> <mod>:<fun>/<arity> <ints…>` (`run` action), the oracle runs `erl -noshell -pa <dir> -eval …`. Either way `beam_rt` is a drop-in `erl` (contract A.6); only the *program path* is set, internals are never assumed.
 - **Honest reporting:** a case/workload that cannot run is `unsupported` / `skipped(<reason>)` — **never** `pass`, and oracle output/metrics are never fabricated.
 - **Machine-readable results:** JSON with a stable schema, written under the crate's gitignored `out/` dir (`differential/out/`, `bench/out/`) unless `--out` overrides.
 - **No heavy new deps:** `serde`/`serde_json` (already workspace deps) for JSON; **hand-rolled `std`-only arg parsing** (no `clap`) to stay offline-safe. Failures are loud (nonzero exit / explicit status), never silently swallowed.
 - Files target ~1000 lines; split by responsibility. Apache-2.0.
 
 ## Constraints
-- **Do not couple to `crates/*` internals.** The only contract with `beam_rt` is its documented external CLI (A.6). `beam_rt` is currently a stub — absence/non-support must degrade to `unsupported`, not crash.
+- **Do not couple to `crates/*` internals.** The only contract with `beam_rt` is its documented external CLI (A.6). `beam_rt` is a working runtime — its `run` action executes real `.beam`s — and it signals an unimplemented capability with exit code `3` plus a `beam_rt: unsupported: …` stderr line, which both tools must classify as `unsupported` — **never** `mismatch` — and must never crash on.
 - `bench` investigates the external repos **read-only** (`/home/bill/Source/{elixir,cowboy,khepri,emqx,Programming-Language-Benchmarks}`): it may build/run them but must **not** commit into them.
 - Keep default runs fast (`--quick`); full suites are milestone-only (Part I §C; root §6).
 - `unsafe` is forbidden in both crates.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: oracle runner, Rust-runtime runner, observable-result comparison (stdout, `term_to_binary`, exception class+reason, `system_info`), built-in conformance corpus, JSON reports
+- `differential/` → differential-test compatibility gate: `Eval` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (stdout, exit status, stderr, `term_to_binary`, exception class+reason, `system_info`), exit-`3` ⇒ `unsupported` classification, built-in conformance corpus, JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
 
 ## Notes for Agents
