@@ -162,8 +162,8 @@ impl Event {
 ///
 /// Register descriptors with [`Poller::register`] (giving each an [`Interest`] and a `u64`
 /// key), drain readiness with [`Poller::poll`] and hand the returned [`Event`]s to the
-/// port registry. Token `0` belongs to the poller's internal [`Waker`] (see
-/// [`Poller::waker`]); user tokens start at `1`.
+/// port registry. Token `0` is reserved for the [`Waker`]s created on demand by
+/// [`Poller::waker`]; user tokens start at `1`.
 pub struct Poller {
     /// The underlying portable poll set.
     poll: mio::Poll,
@@ -175,15 +175,46 @@ pub struct Poller {
     next_token: usize,
 }
 
+/// Translates this crate's [`Interest`] mask into `mio`'s.
+///
+/// `mio::Interest` is a non-zero bitset, so an empty mask (no readiness direction
+/// requested) falls back to readability, which is always a legal registration.
+fn to_mio_interest(interest: Interest) -> mio::Interest {
+    match (interest.is_readable(), interest.is_writable()) {
+        (true, true) => mio::Interest::READABLE.add(mio::Interest::WRITABLE),
+        (false, true) => mio::Interest::WRITABLE,
+        _ => mio::Interest::READABLE,
+    }
+}
+
+/// Maps a `mio` event's readiness onto this crate's [`Ready`].
+fn to_ready(event: &mio::event::Event) -> Ready {
+    Ready {
+        readable: event.is_readable(),
+        writable: event.is_writable(),
+        error: event.is_error(),
+        read_closed: event.is_read_closed(),
+        write_closed: event.is_write_closed(),
+    }
+}
+
 impl Poller {
-    /// Creates an empty poller (and its internal [`Waker`]).
+    /// Creates an empty poller.
+    ///
+    /// No [`Waker`] is created here; [`Poller::waker`] builds one on demand under the
+    /// reserved token `0`.
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` if the operating system refuses to create the poll set or
-    /// its wakeup mechanism.
+    /// Returns `BeamError::Io` if the operating system refuses to create the poll set.
     pub fn new() -> Result<Poller> {
-        todo!("build the mio::Poll, its Waker (token 0) and an empty registration map")
+        let poll = mio::Poll::new().map_err(crate::error::io)?;
+        Ok(Poller {
+            poll,
+            events: mio::Events::with_capacity(1024),
+            registrations: HashMap::new(),
+            next_token: 1,
+        })
     }
 
     /// Registers `fd` with the poller, requesting `interest` and tagging it with `key`.
@@ -193,10 +224,24 @@ impl Poller {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the operating system rejects the registration.
+    /// Returns `BeamError::Io` when the operating system rejects the registration, or
+    /// `BeamError::SystemLimit` when the token space is exhausted.
     pub fn register(&mut self, fd: RawFd, interest: Interest, key: u64) -> Result<Token> {
-        let _ = (fd, interest, key);
-        todo!("wrap fd in a mio::unix::SourceFd, registry.register it under a fresh token")
+        let index = self.next_token;
+        if index == usize::MAX {
+            return Err(crate::error::system_limit());
+        }
+        // `SourceFd` borrows the fd only for the duration of the syscall; the local
+        // binding gives it a place expression to borrow.
+        let mut fd = fd;
+        let mut source = mio::unix::SourceFd(&mut fd);
+        self.poll
+            .registry()
+            .register(&mut source, mio::Token(index), to_mio_interest(interest))
+            .map_err(crate::error::io)?;
+        self.registrations.insert(index, key);
+        self.next_token = index.saturating_add(1);
+        Ok(Token(index))
     }
 
     /// Changes the [`Interest`] mask of a previously registered descriptor.
@@ -206,8 +251,16 @@ impl Poller {
     /// Returns `BeamError::Io` when `token` is unknown or the operating system rejects the
     /// re-registration.
     pub fn reregister(&mut self, fd: RawFd, token: Token, interest: Interest) -> Result<()> {
-        let _ = (fd, token, interest);
-        todo!("registry.reregister the fd under its existing mio::Token with the new interest")
+        let mut fd = fd;
+        let mut source = mio::unix::SourceFd(&mut fd);
+        self.poll
+            .registry()
+            .reregister(
+                &mut source,
+                mio::Token(token.get()),
+                to_mio_interest(interest),
+            )
+            .map_err(crate::error::io)
     }
 
     /// Removes a registration, freeing its token.
@@ -217,8 +270,14 @@ impl Poller {
     /// Returns `BeamError::Io` when `token` is unknown or the operating system rejects the
     /// de-registration.
     pub fn deregister(&mut self, fd: RawFd, token: Token) -> Result<()> {
-        let _ = (fd, token);
-        todo!("registry.deregister the fd, then drop its token from the registration map")
+        let mut fd = fd;
+        let mut source = mio::unix::SourceFd(&mut fd);
+        self.poll
+            .registry()
+            .deregister(&mut source)
+            .map_err(crate::error::io)?;
+        self.registrations.remove(&token.get());
+        Ok(())
     }
 
     /// Waits for readiness and returns the observed events.
@@ -230,10 +289,24 @@ impl Poller {
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::Io` when the wait is interrupted by a signal or fails otherwise.
+    /// Returns `BeamError::Io` when the wait fails.
     pub fn poll(&mut self, timeout: Option<Duration>) -> Result<Vec<Event>> {
-        let _ = timeout;
-        todo!("poll the mio::Poll into self.events and translate each mio::Event into an Event")
+        self.poll
+            .poll(&mut self.events, timeout)
+            .map_err(crate::error::io)?;
+        let registrations = &self.registrations;
+        let events: Vec<Event> = self
+            .events
+            .iter()
+            .map(|event| {
+                let index = event.token().0;
+                // Token `0` is the waker (and any token the map no longer knows is
+                // reported as a waker key, so it can never be mistaken for a port).
+                let key = registrations.get(&index).copied().unwrap_or(WAKER_KEY);
+                Event::new(Token(index), key, to_ready(event))
+            })
+            .collect();
+        Ok(events)
     }
 
     /// Creates a thread-safe [`Waker`] that unblocks a concurrent [`Poller::poll`].
@@ -241,13 +314,23 @@ impl Poller {
     /// The woken event carries the poller's reserved token `0` and [`WAKER_KEY`] as its
     /// key.
     ///
+    /// The returned [`Waker`] **owns** the poller's wakeup handle, so it must stay alive
+    /// for as long as a wakeup has to be observable: dropping it closes that handle and a
+    /// wakeup that has not been collected by [`Poller::poll`] yet is lost.
+    ///
     /// # Errors
     ///
     /// Returns `BeamError::Io` when the operating system cannot create the wakeup handle.
+    ///
+    /// # Panics
+    ///
+    /// `mio` permits **one** `Waker` per poll set (a debug assertion), so a second call
+    /// on the same [`Poller`] panics in a debug build. Create the waker once and share it.
     pub fn waker(&self) -> Result<Waker> {
-        todo!("clone the poller's internal mio::Waker into a Waker wrapper")
+        mio::Waker::new(self.poll.registry(), mio::Token(0))
+            .map(Waker)
+            .map_err(crate::error::io)
     }
-
     /// The caller key a token was registered with, if the token is still live.
     pub fn registration(&self, token: Token) -> Option<u64> {
         self.registrations.get(&token.get()).copied()
@@ -268,6 +351,10 @@ impl Poller {
 ///
 /// It is `mio`'s portable wakeup (eventfd/pipe); the woken event carries [`WAKER_KEY`].
 /// `Waker::wake` is safe to call from any thread.
+///
+/// It owns the wakeup handle and there is only one per [`Poller`], so keep it alive while
+/// a wakeup must remain observable (`wake` followed by dropping the handle can lose the
+/// pending event).
 pub struct Waker(mio::Waker);
 
 impl Waker {
@@ -277,6 +364,129 @@ impl Waker {
     ///
     /// Returns `BeamError::Io` when the underlying wakeup fails.
     pub fn wake(&self) -> Result<()> {
-        todo!("call mio::Waker::wake and map its io::Error through crate::error::io")
+        self.0.wake().map_err(crate::error::io)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{to_mio_interest, Event, Interest, Poller, Ready, Token, WAKER_KEY};
+    use beam_common::BeamError;
+    use std::os::unix::io::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    #[test]
+    fn interest_constants_and_constructors_agree() {
+        assert_eq!(Interest::readable(), Interest::READABLE);
+        assert_eq!(Interest::writable(), Interest::WRITABLE);
+
+        assert!(Interest::READABLE.is_readable());
+        assert!(!Interest::READABLE.is_writable());
+
+        assert!(Interest::WRITABLE.is_writable());
+        assert!(!Interest::WRITABLE.is_readable());
+
+        assert!(Interest::BOTH.is_readable());
+        assert!(Interest::BOTH.is_writable());
+    }
+
+    #[test]
+    fn interest_maps_onto_mio() {
+        assert!(to_mio_interest(Interest::READABLE).is_readable());
+        assert!(!to_mio_interest(Interest::READABLE).is_writable());
+
+        assert!(to_mio_interest(Interest::WRITABLE).is_writable());
+        assert!(!to_mio_interest(Interest::WRITABLE).is_readable());
+
+        let both = to_mio_interest(Interest::BOTH);
+        assert!(both.is_readable() && both.is_writable());
+    }
+
+    #[test]
+    fn ready_and_event_accessors() {
+        let ready = Ready {
+            readable: true,
+            writable: false,
+            error: false,
+            read_closed: true,
+            write_closed: false,
+        };
+        assert!(ready.readable());
+        assert!(!ready.writable());
+        assert!(!ready.is_error());
+        assert!(ready.is_read_closed());
+        assert!(!ready.is_write_closed());
+        assert_eq!(
+            Ready::default(),
+            Ready {
+                readable: false,
+                writable: false,
+                error: false,
+                read_closed: false,
+                write_closed: false
+            }
+        );
+
+        let event = Event::new(Token(3), 42, ready);
+        assert_eq!(event.token(), Token(3));
+        assert_eq!(event.token().get(), 3);
+        assert_eq!(event.key(), 42);
+        assert_eq!(event.ready(), ready);
+    }
+
+    #[test]
+    fn a_fresh_poller_has_no_registrations() {
+        let poller = Poller::new().expect("a poll set");
+        assert!(poller.is_empty());
+        assert_eq!(poller.len(), 0);
+        assert_eq!(poller.registration(Token(1)), None);
+    }
+
+    #[test]
+    fn waker_key_cannot_collide_with_a_port_number() {
+        assert_eq!(WAKER_KEY, u64::MAX);
+    }
+
+    #[test]
+    fn register_assigns_tokens_from_one_and_records_the_key() {
+        let mut poller = Poller::new().expect("a poll set");
+        let (_peer, fd) = UnixStream::pair().expect("socketpair");
+
+        let first = poller
+            .register(fd.as_raw_fd(), Interest::READABLE, 7)
+            .expect("the fd registers");
+        assert_eq!(first, Token(1), "user tokens start after the waker's 0");
+        assert_eq!(poller.registration(first), Some(7));
+        assert_eq!(poller.len(), 1);
+        assert!(!poller.is_empty());
+
+        // Registering the very same descriptor twice is rejected by the OS.
+        let err = poller
+            .register(fd.as_raw_fd(), Interest::READABLE, 8)
+            .expect_err("a duplicate registration fails");
+        assert!(matches!(err, BeamError::Io(_)), "mapped to BeamError::Io");
+        assert_eq!(poller.len(), 1, "the failed registration recorded nothing");
+
+        poller
+            .deregister(fd.as_raw_fd(), first)
+            .expect("deregisters");
+        assert_eq!(poller.registration(first), None);
+        assert!(poller.is_empty());
+    }
+
+    #[test]
+    fn reregister_and_deregister_an_unknown_token_map_to_io() {
+        let mut poller = Poller::new().expect("a poll set");
+        let (_peer, fd) = UnixStream::pair().expect("socketpair");
+        // Token 1 was never registered with this poller.
+        let err = poller
+            .reregister(fd.as_raw_fd(), Token(1), Interest::WRITABLE)
+            .expect_err("an unknown token cannot be re-registered");
+        assert!(matches!(err, BeamError::Io(_)));
+
+        let err = poller
+            .deregister(fd.as_raw_fd(), Token(1))
+            .expect_err("an unknown token cannot be de-registered");
+        assert!(matches!(err, BeamError::Io(_)));
     }
 }

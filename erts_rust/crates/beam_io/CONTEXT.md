@@ -125,19 +125,24 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN**.
-- `tests/poller.rs` (integration, real OS fds): a **socketpair/pipe** registered `READABLE` reports a
+**GREEN**, and `... build --workspace` **GREEN**. All of the following exist and pass (42 in-module
+unit tests + 10 integration tests):
+- `tests/poller.rs` (integration, real OS fds): a **socketpair** registered `READABLE` reports a
   readiness event with the right `key` after a write to the peer; **poll-with-no-events** returns empty
-  after ≈ the timeout (and `poll(None)` is interrupted by `Waker::wake`); reregister + deregister
-  change readiness; a double-register of the same fd errors (`AlreadyExists` → `Io`).
+  after ≈ the timeout; `poll(Some(2s))` is interrupted by `Waker::wake` from another thread; reregister
+  switches readability → writability; deregister stops events; a double-register of the same fd errors
+  (`AlreadyExists` → `Io`).
 - `tests/port.rs` (integration, end-to-end): `PortRegistry::open` a `FdDriver::pipe()` port →
   `port.output(b"hello")` → `poller.poll` → `registry.handle_events` → `port.read_input` returns
-  `"hello"`; `close` releases the id (a later alloc reuses it) and stops the driver; `handle_events`
-  on an unknown key is a no-op.
-- In-module `#[cfg(test)]` unit tests: `ByteQueue` (push/front/consume/read_into/clear + empty),
-  `Interest` flags, `Timeout` (infinite/expired/remaining), `Timer` (ordering, `pop_expired`,
-  `cancel`), `DriverRegistry` (`with_builtins`/`create`/missing name ⇒ `BadArg`), `PortState`
-  transitions.
+  `"hello"`; `close` releases the id (a later alloc reuses it) and leaves the poller empty; `open_named`
+  uses the built-in registry and an unknown name is `BadArg`; `handle_events` skips unknown keys.
+- In-module `#[cfg(test)]` unit tests: `ByteQueue` (push/front/consume/read_into/clear + wrap-around
+  compaction), `Interest`/`to_mio_interest`, `Ready`/`Event` accessors, `Poller` register/deregister +
+  `WAKER_KEY`, `Timeout` (infinite/remaining/expired/saturating), `Timer` (ordering, `pop_expired`,
+  `cancel`, duplicate-key reschedule), `DriverRegistry` (`with_builtins`/`create`/missing name ⇒
+  `BadArg`/`names`), `PortState` transitions, `PortRegistry` alloc/close/reuse, and `FdDriver`
+  (pipe round-trip, EOF, write-only/read-only/inert error paths, `stop` deregistration, fd closing on
+  `Drop` + `stop`).
 
 ## Design Decisions
 - **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker`
@@ -178,14 +183,26 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
   `ERTS_POLL_USE_WAKEUP` semantics beyond `Waker`; concurrent registration races are not guarded.
+- **One `Waker` per `Poller`, and it must stay alive.** `mio` allows a single `Waker` per poll set
+  (a debug-build assertion), so `Poller::waker` may be called only once; a second call panics in a
+  debug build. The `Waker` *owns* the poller's wakeup handle (mio's eventfd), so dropping it while a
+  wakeup is still uncollected loses that event — keep it alive for as long as the wake must be
+  observable (see `tests/poller.rs::waker_interrupts_a_blocking_poll`).
+- **Readiness is edge-triggered** (`mio` registers with `EPOLLET`), so a driver *must* drain to
+  `EAGAIN` on every callback — `FdDriver` reads/writes in a `EAGAIN`-terminated loop for exactly
+  this reason. `handle_events` dispatches on `Ready::readable()`/`Ready::writable()` only, so a
+  pure EOF/`EPOLLHUP` event with neither bit set reaches the port only through the readable edge.
+- **A failed `Port::start` leaks the poller registration.** `PortRegistry::open` releases the port
+  id and drops the driver (closing its fds) when `start` fails, but a registration the driver made
+  before failing is only reclaimed when the OS closes the fd.
 - **Ports are not yet scheduled.** No port tasks (`INPUT`/`OUTPUT`/`TIMEOUT`), reductions, or
   `erts_port_task_execute`; `PortRegistry::handle_events` is a synchronous stand-in. `beam_rt` wires
   ports into the scheduler later.
 - **`FdDriver` is deliberately minimal.** Byte-stream only; no line buffering, no `binary_io`
   phase-change, no `control` protocol family (`inet`/`efile` are future drivers). `read_only`/
-  `write_only` variants exist but the tested path is `pipe()`.
+  `write_only` variants exist and are covered, but the primary tested path is `pipe()`.
 - **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of
-  scope (as in `beam_abi`). Registration is lazy-capable but M1 registers on `start`.
+  scope (as in `beam_abi`). Registration is lazy-capable but M1 registers in `start`.
 - **`port_control`/command atoms** are not decoded here (the C decodes Erlang tuples in `io.c`); M1
   `control(command, arg)` takes a `&str` command and raw bytes.
 

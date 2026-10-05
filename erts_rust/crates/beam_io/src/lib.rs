@@ -21,10 +21,11 @@
 //!
 //! # Status
 //!
-//! This crate is currently a **frozen public-API skeleton**: the public types and their
-//! signatures are fixed (the contract downstream crates design against), while the real
-//! logic is left as `todo!()` — an implementation pass fills the bodies and adds the
-//! `tests/` integration suites (see this crate's `CONTEXT.md`, Test Strategy).
+//! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
+//! poller/reactor, ports, the driver seam and the single built-in `"fd"` driver are real
+//! and covered by in-module unit tests plus the `tests/poller.rs` / `tests/port.rs`
+//! integration suites (real OS fds, end-to-end `pipe(2)` round-trip). The frozen C-ABI
+//! driver bridge and the scheduler wiring (port tasks, poll threads) remain follow-ups.
 //!
 //! # Contracts
 //!

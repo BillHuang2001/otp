@@ -95,8 +95,7 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the operating system rejects the registration.
     pub fn register(&mut self, fd: RawFd, interest: Interest) -> Result<Token> {
-        let _ = (fd, interest);
-        todo!("self.poller.register(fd, interest, self.port.number())")
+        self.poller.register(fd, interest, self.port.number())
     }
 
     /// Changes the interest mask of a registration made by this context.
@@ -105,8 +104,7 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the token is unknown or the re-registration fails.
     pub fn reregister(&mut self, fd: RawFd, token: Token, interest: Interest) -> Result<()> {
-        let _ = (fd, token, interest);
-        todo!("self.poller.reregister(fd, token, interest)")
+        self.poller.reregister(fd, token, interest)
     }
 
     /// Removes a registration made by this context.
@@ -115,8 +113,7 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the token is unknown or the de-registration fails.
     pub fn deregister(&mut self, fd: RawFd, token: Token) -> Result<()> {
-        let _ = (fd, token);
-        todo!("self.poller.deregister(fd, token)")
+        self.poller.deregister(fd, token)
     }
 
     /// The port's input queue, which the driver appends bytes it read to.
@@ -216,6 +213,14 @@ pub trait Driver {
 /// A driver constructor: the function a [`DriverRegistry`] stores under a name.
 pub type DriverFactory = fn() -> Result<Box<dyn Driver>>;
 
+/// The [`DriverFactory`] of the built-in `"fd"` driver.
+///
+/// A plain `fn` (not a closure) because [`DriverFactory`] is a function pointer: the
+/// factory captures nothing and builds a fresh [`crate::drivers::FdDriver::pipe`] each call.
+fn make_fd() -> Result<Box<dyn Driver>> {
+    Ok(Box::new(crate::drivers::FdDriver::pipe()?))
+}
+
 /// The name→factory table: the Rust analogue of the C `driver_tab.c` (`lib/driver_tab.c`).
 pub struct DriverRegistry {
     /// Registered driver factories, keyed by driver name.
@@ -235,15 +240,20 @@ impl DriverRegistry {
     /// Milestone-1 registers the single built-in `"fd"` driver
     /// ([`crate::drivers::FdDriver`]).
     pub fn with_builtins() -> DriverRegistry {
-        todo!("new() with the built-in `fd` factory registered")
+        let mut registry = DriverRegistry::new();
+        registry.register("fd", make_fd);
+        registry
     }
 
     /// Registers `factory` under `name`, reporting whether the name was free.
     ///
     /// A duplicate name is rejected (`false`) and leaves the existing factory in place.
     pub fn register(&mut self, name: &str, factory: DriverFactory) -> bool {
-        let _ = (name, factory);
-        todo!("insert into self.factories only if the name is not already present")
+        if self.factories.contains_key(name) {
+            return false;
+        }
+        self.factories.insert(name.to_string(), factory);
+        true
     }
 
     /// Instantiates the driver registered under `name`.
@@ -253,17 +263,66 @@ impl DriverRegistry {
     /// Returns `BeamError::BadArg` when no driver is registered under `name`, or whatever
     /// the factory itself returns.
     pub fn create(&self, name: &str) -> Result<Box<dyn Driver>> {
-        let _ = name;
-        todo!("look the factory up and call it, or error::badarg() when it is missing")
+        match self.factories.get(name) {
+            Some(factory) => (*factory)(),
+            None => Err(crate::error::badarg()),
+        }
     }
 
     /// Whether a driver is registered under `name`.
     pub fn contains(&self, name: &str) -> bool {
-        todo!("self.factories.contains_key(\"{name}\")")
+        self.factories.contains_key(name)
     }
 
-    /// The registered driver names, in an unspecified order.
+    /// The registered driver names, sorted so the order is deterministic.
     pub fn names(&self) -> Vec<&str> {
-        todo!("self.factories.keys().map(String::as_str).collect()")
+        let mut names: Vec<&str> = self.factories.keys().map(String::as_str).collect();
+        names.sort_unstable();
+        names
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DriverFlags, DriverRegistry};
+    use beam_common::BeamError;
+
+    #[test]
+    fn driver_flags_are_a_bitset() {
+        assert!(DriverFlags::empty().contains(DriverFlags::empty()));
+        assert!(!DriverFlags::empty().contains(DriverFlags::SOFT_BUSY));
+        assert!(DriverFlags::SOFT_BUSY.contains(DriverFlags::SOFT_BUSY));
+        assert!(DriverFlags::SOFT_BUSY.contains(DriverFlags::empty()));
+        assert!(DriverFlags::SOFT_BUSY != DriverFlags::empty());
+    }
+
+    #[test]
+    fn an_empty_registry_knows_no_drivers() {
+        let registry = DriverRegistry::new();
+        assert!(!registry.contains("fd"));
+        assert!(registry.names().is_empty());
+        assert!(matches!(registry.create("fd"), Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn with_builtins_registers_the_fd_driver() {
+        let registry = DriverRegistry::with_builtins();
+        assert!(registry.contains("fd"));
+        assert_eq!(registry.names(), vec!["fd"]);
+
+        let driver = registry.create("fd").expect("the fd driver exists");
+        assert_eq!(driver.name(), "fd");
+        assert!(driver.flags() == DriverFlags::empty());
+        assert!(matches!(registry.create("nope"), Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn register_rejects_a_duplicate_name() {
+        let mut registry = DriverRegistry::new();
+        assert!(registry.register("fd", super::make_fd));
+        assert!(!registry.register("fd", super::make_fd));
+        assert_eq!(registry.names(), vec!["fd"]);
+        assert!(registry.register("other", super::make_fd));
+        assert_eq!(registry.names(), vec!["fd", "other"]);
     }
 }

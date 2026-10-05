@@ -1,0 +1,148 @@
+//! Integration tests for [`PortRegistry`]: the poller → port → driver path end to end.
+//!
+//! These use the built-in [`FdDriver`] over a real `pipe(2)`, driving the reactor exactly
+//! as the runtime will: `Poller::poll` for readiness, then `PortRegistry::handle_events`
+//! to dispatch it, then the port's input queue.
+
+use std::os::unix::io::AsRawFd;
+use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
+
+use beam_io::prelude::*;
+
+fn poller() -> Poller {
+    Poller::new().expect("a poll set")
+}
+
+fn fd_port() -> Box<dyn Driver> {
+    Box::new(FdDriver::pipe().expect("a pipe"))
+}
+
+/// Polls and dispatches until `id` has buffered at least `want` bytes, returning them.
+fn pump_until_input(
+    poller: &mut Poller,
+    registry: &mut PortRegistry,
+    id: beam_process::PortId,
+    want: usize,
+) -> Vec<u8> {
+    let deadline = Instant::now() + Duration::from_secs(2);
+    let mut received = Vec::new();
+    while received.len() < want {
+        assert!(
+            Instant::now() < deadline,
+            "the reactor never delivered {want} bytes"
+        );
+        let events = poller
+            .poll(Some(Duration::from_millis(200)))
+            .expect("poll succeeds");
+        registry
+            .handle_events(poller, &events)
+            .expect("events dispatch");
+        received.extend(registry.get_mut(id).expect("live").drain_input());
+    }
+    received
+}
+
+#[test]
+fn output_and_input_round_trip_through_the_reactor() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let id = registry
+        .open(&mut poller, fd_port())
+        .expect("the port opens");
+    assert!(registry.contains(id));
+    assert_eq!(registry.len(), 1);
+    let port = registry.get(id).expect("the port is live");
+    assert_eq!(port.state(), PortState::Open);
+    assert_eq!(port.driver_name(), "fd");
+    assert_eq!(port.input_len(), 0);
+    assert_eq!(port.output_len(), 0);
+
+    let written = registry
+        .output(&mut poller, id, b"hello")
+        .expect("the driver accepts the output");
+    assert_eq!(written, 5, "the whole payload is written to the pipe");
+
+    assert_eq!(
+        pump_until_input(&mut poller, &mut registry, id, 5),
+        b"hello",
+        "the bytes come back through the poller"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+    assert!(registry.get(id).is_none());
+    assert!(registry.is_empty());
+    assert!(poller.is_empty(), "closing deregisters the port's fds");
+}
+
+#[test]
+fn close_releases_the_id_for_reuse() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let first = registry.open(&mut poller, fd_port()).expect("opens");
+    let second = registry.open(&mut poller, fd_port()).expect("opens");
+    assert_ne!(first, second, "each live port gets its own id");
+
+    registry.close(&mut poller, first).expect("closes");
+    assert!(!registry.contains(first));
+    assert!(registry.contains(second));
+    assert_eq!(registry.len(), 1);
+
+    let reused = registry.open(&mut poller, fd_port()).expect("opens");
+    assert_eq!(reused, first, "the released port number is reused");
+    assert_eq!(registry.len(), 2);
+
+    registry.close(&mut poller, second).expect("closes");
+    registry.close(&mut poller, reused).expect("closes");
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn open_named_uses_the_built_in_driver_registry() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let drivers = DriverRegistry::with_builtins();
+
+    let id = registry
+        .open_named(&mut poller, &drivers, "fd")
+        .expect("the fd driver is built in");
+    assert_eq!(registry.get(id).expect("live").driver_name(), "fd");
+    registry.close(&mut poller, id).expect("closes");
+
+    // An unknown driver name is an argument fault, not a panic.
+    assert!(matches!(
+        registry.open_named(&mut poller, &drivers, "no-such-driver"),
+        Err(beam_common::BeamError::BadArg)
+    ));
+    assert!(registry.is_empty());
+}
+
+#[test]
+fn unknown_event_keys_are_ignored() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+    let id = registry.open(&mut poller, fd_port()).expect("opens");
+
+    // Tokens are opaque; take one from a real registration. The *keys* are what the
+    // reactor looks ports up by, so the forged events below reach no live port.
+    let (_peer, probe) = UnixStream::pair().expect("socketpair");
+    let token = poller
+        .register(probe.as_raw_fd(), Interest::READABLE, WAKER_KEY)
+        .expect("the probe registers");
+
+    let forged = vec![
+        Event::new(token, 4242, Ready::default()),
+        Event::new(token, WAKER_KEY, Ready::default()),
+    ];
+    assert_eq!(
+        registry
+            .handle_events(&mut poller, &forged)
+            .expect("dispatching is a no-op"),
+        0,
+        "events for unknown keys are skipped"
+    );
+    assert!(registry.contains(id), "the live port is untouched");
+    assert_eq!(registry.len(), 1);
+}
