@@ -7,9 +7,9 @@ Reference/manual documentation for the *product* lives in `../system/` and the p
 
 ## Constraints
 - Pure Markdown, no code. Editing a HOWTO does not require a rebuild, but `./otp_build check` validates cross-links after a doc build.
-- Every file carries the standard SPDX Apache-2.0 `%CopyrightBegin%` header described in `FILE-HEADERS.md`; the `..` → `./scripts/license-header.es` scanner enforces the exact layout and auto-updates the copyright year, so never hand-edit the year.
+- Every file carries the standard SPDX Apache-2.0 `%CopyrightBegin%` header described in `FILE-HEADERS.md`; the scanner `../scripts/license-header.es` enforces the exact layout and auto-updates the copyright year, so never hand-edit the year.
 - Files contain release-time placeholders (`%OTP-REL%`, `%OTP-VSN%`, `%EX_DOC_VSN%`) that are intentionally *not* substituted in the git tree.
-- Links between the docs are relative (`TESTING.md`, `DEVELOPMENT.md`, `../CONTRIBUTING.md`) and are rewritten/normalized when the docs are published; keep them relative, not absolute GitHub URLs, except where the doc already uses absolute URLs.
+- Documents cross-link each other with relative paths (`TESTING.md`, `DEVELOPMENT.md`, `../CONTRIBUTING.md`); markdown links to product docs use the ExDoc `e:<app>:<file>.md` form.
 
 ## API Surface (documents, grouped by concern)
 
