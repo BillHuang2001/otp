@@ -251,6 +251,11 @@ caller's heap (they alias table storage in `beam_ets`). Small and documented; se
   small magnitudes (`1.0e10` prints as `10000000000`).
 - **`~p`/`~w` printer coverage**: no maps, binaries, funs, refs, records, bignums or latin1/
   control-char string escapes — such terms error (`BadArg`); the common M1 term set is covered.
+- **`io:format` output is a UTF-8 Rust `String`.** Non-`~` format bytes and `~s`/`~c` values
+  `>= 128`, and `~p` string escapes for such bytes, are emitted as UTF-8 rather than raw latin1
+  bytes; the ASCII subset is byte-exact. A `~n` with a width repeats the newline (oracle), a width
+  on `~i` is ignored, and a `.base` precision on any directive other than `~b`/`~B` (e.g. `~.10w`) is
+  `badarg`.
 - **No in-crate message delivery.** `send/2`/`!/2` require a `SendHook`; without one they raise
   `unsupported_bif`. Wiring to `beam_process::ProcessTable`/`beam_message` is `beam_rt`'s.
 - **`error/1,2`'s structured reason** is carried only as `ExitReason::Structured` (no term); the
