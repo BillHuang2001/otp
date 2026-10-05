@@ -22,8 +22,8 @@ never modify it.
 **Implemented (Milestone 1).** Every module carries real bodies: the wire-frozen
 `tag` constants and the `Tag` enum (`from_byte`/`as_byte`/`name`/`covered`), the
 `reader`/`writer` cursors, the distribution `atom_cache`, the `encode`/`decode`
-loops, the `term` boxed-sub-term layer (float/bignum/flatmap/external identifiers)
-and the `error` constructors. The required core tag set round-trips (see "Tag
+loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
+float/bignum/flatmap/external identifiers) and the `error` constructors. The required core tag set round-trips (see "Tag
 coverage" below); the documented unsupported set (binaries/bit-binary, `COMPRESSED`,
 funs, records, `V4_PORT`, `LOCAL`, the distribution header, maps > 32 pairs) returns
 `error::unsupported` rather than a wrong term. `src/lib.rs` carries only the
@@ -82,9 +82,13 @@ through it (an unset index ⇒ `BadArg`). M1 never *emits* `82`/`78`.
   `finish() -> Result<()>` (trailing bytes ⇒ `BadArg`).
 - Convenience: `pub fn decode_term(&[u8], &mut Heap, &mut AtomTable) -> Result<Eterm>`.
 
-### `src/term.rs` — the ONLY `unsafe` module (see Design Decisions)
-Term inspection and boxed sub-term materialization over `beam_alloc::Heap`, pinned to `erl_term.h` /
-`big.h` / `erl_map.h` / `bif.c`:
+### `src/term.rs` — thin forwarding layer (the ONLY `unsafe` module; see Design Decisions)
+Term inspection and boxed sub-term materialization over `beam_alloc::Heap` that **forwards to**
+`beam_term::thing` (float/bignum/flatmap/external-identifier constructors + readers) and
+`beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons accessors); the boxed interior layout
+is owned by `beam_term` (workspace `CONTEXT.md` §2). This module only allocates from
+`beam_alloc::Heap`, validates its type/bounds preconditions (mapping a violation to `BeamError`), and
+calls the `beam_term` accessor:
 - `make_float(&mut Heap, f64) -> Result<Eterm>` / `float_value(Eterm) -> Result<f64>`;
 - `make_big(&mut Heap, negative: bool, &[u64]) -> Result<Eterm>` /
   `big_parts(Eterm) -> Result<(bool, &[u64])>` — the slice elements are `ErtsDigit`s (`u64`, one per
@@ -96,11 +100,13 @@ Term inspection and boxed sub-term materialization over `beam_alloc::Heap`, pinn
   `external_port_parts -> (node, number, creation)`;
 - `make_external_ref(&mut Heap, node, ids: &[u32], creation: u32) -> Result<Eterm>` /
   `external_ref_parts -> (node, &[u32] ids, creation)`;
-- `pub const MAX_REF_IDS = 5` (`ERTS_MAX_REF_NUMBERS`), plus the tuple/tuple-element and list
-  accessors the encoder needs.
+- `pub use beam_term::thing::MAX_REF_IDS` (`ERTS_MAX_REF_NUMBERS`), plus the tuple/tuple-element and
+  list accessors the encoder needs.
 
-**Public but not part of the cross-crate contract** (`beam_ets`/`beam_bifs` must get their
-map/float/bignum constructors from `beam_term` — see Known Issues).
+**Public but not part of the cross-crate contract**: dependents (`beam_bifs`, `beam_ets`,
+`beam_message`, `beam_rt`) take their float/bignum/map/identifier constructors and accessors from
+`beam_term::thing` directly; this module keeps the codec-internal convenience seam and the guard
+constants only.
 
 ## Tag coverage (M1)
 **Encode + decode + byte-exact round-trip** (the required core set):
@@ -117,38 +123,14 @@ directions), `109 BINARY_EXT` / `77 BIT_BINARY_EXT`, `112 NEW_FUN` / `113 EXPORT
 > 32 pairs (needs the HAMT builder), and any atom name that is not representable in the emitted
 encoding.
 
-## Layout facts pinned to the legacy C (for the term layer)
-- Float (64-bit): 2 words `[HEADER_FLONUM, f64 bits]`; root = `make_boxed(hp)`
-  (`erl_term.h:479` `HEADER_FLONUM = make_header(1, FLOAT_SUBTAG)`, `PUT_DOUBLE` `erl_term.h:506`).
-- Bignum: **one `ErtsDigit` per word** — `[make_pos_bignum_header(n-1) |
-  make_neg_bignum_header(n-1), d0 … d(n-1)]` with `BIG_NEED_SIZE(n) = n + 1` words, digits
-  little-endian (`d0` least significant), the sign in the header's `_BIG_SIGN_BIT`; root =
-  `make_boxed(hp)` (`erl_term.h:452-471`, `big.h:29,68-73,96-97`; `ErtsDigit` is `Uint`, i.e. a
-  `u64` on `ARCH_64`; `BIG_ARITY_MAX = (1<<16)-1` digits). The **wire** magnitude is base-256 bytes
-  (`big_to_bytes`/`bytes_to_big`, `big.c:3405-3490`: full eight bytes per non-leading digit, the
-  leading digit's significant bytes only); `SMALL_BIG_EXT` carries the byte count while it is < 256,
-  `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
-  (`external.c:6146`).
-- Flatmap (≤ 32 pairs): the block is
-  `[arityval(n), k0…k(n-1), MAP_HEADER_FLATMAP, n, keys, v0…v(n-1)]`, where `keys = make_tuple(hp)`
-  is the keys tuple (emitted **before** the flatmap head), the flatmap head sits at word `1+n`, and
-  the root is `make_boxed(hp + 1 + n)`. Relative to the flatmap **head** pointer the fields are
-  `[head, size, keys, values…]` — keys at offset `+2` and values at `+3`, which is where
-  `flatmap_parts` reads them. `MAP_HEADER_FLATMAP = 0x12C` (`_make_header(4, MAP_SUBTAG)`), the
-  `size` field is the **raw** integer `n`; `n == 0` ⇒ 3 words
-  `[MAP_HEADER_FLATMAP, 0, tuple0()]` (`erl_map.h:181-199`, `erl_map.c:673-700`).
-- External identifiers (`ExternalThing`, `erl_term.h:1137-1188`): a three-word head
-  `[header, node, next]` (`EXTERNAL_THING_HEAD_SIZE = 3` on `ARCH_64`) followed by the data union,
-  so the header is always `make_header(total_words - 1, <subtuel>)`:
-  - pid — `EXTERNAL_PID_HEAP_SIZE = 4`: `[header, node, ?, { num: u32, ser: u32 }]`;
-  - port — `EXTERNAL_PORT_HEAP_SIZE = 4`: `[header, node, ?, id: u64]` (`ARCH_64`);
-  - ref — `DW = ref_words/2 + 1` data words and `make_external_ref_header(DW) =
-    make_header(DW + 2, EXTERNAL_REF_SUBTAG)`, i.e. arity `ref_words/2 + 3`: `[header, node, ?,
-    ref_words(u32) | id0(u32), id1 | id2, …]` — the data section is the `data.ui32` array with the
-    id **count** first (`bif.c:4818-4845`, `external_ref_no_numbers(x) = external_ref_data(x)[0]`).
-  The `?` slot is C's off-heap `next` link: this crate has no node registry, so it holds `creation`
-  while the `node` slot holds the sysname atom (the M1 substitution documented on
-  `make_external_pid` / in "Known Issues").
+## Term-layout ownership
+The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
+by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `term.rs` only
+forwards to it. The codec's own layout-relevant policy is the **wire** form of a bignum magnitude —
+base-256 bytes (`big_to_bytes`/`bytes_to_big`, `big.c:3405-3490`): full eight bytes per non-leading
+digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the byte count while it is
+< 256, `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
+(`external.c:6146`).
 - `VERSION_MAGIC` is **not** part of a distribution payload that follows a distribution header.
 
 ## Constraints
@@ -170,20 +152,22 @@ encoding.
 ## Design Decisions
 - **Two layers, one `unsafe` module.** The *wire layer* (`tag`, `reader`, `writer`, `atom_cache`,
   and every byte-level step of `encode`/`decode`) is safe Rust and is where the entire mandated tag
-  set is parsed and emitted. The *term layer* (`term.rs`) is the only module allowed to touch raw
-  heap words, and its `unsafe` is unavoidable: `beam_term` marks its accessors (`is_tuple`,
-  `tuple_element`, `float_val`, `big_val`, …) as `unsafe fn` because the validity of an `Eterm` is a
-  caller invariant, and there is no safe way to read/write a heap word. Enforcement is mechanical —
-  `#![deny(unsafe_code)]` plus the single `#[allow(unsafe_code)] mod term;` — so the deviation from
-  the crate-layer note "The *safe periphery* (ETF codec …) must be safe Rust" is auditable rather
-  than diffuse. That note is accurate for the wire layer only and should be narrowed upstream
-  (reported to the parent node).
+  set is parsed and emitted. The *term layer* (`term.rs`) is a thin forwarding layer whose `unsafe`
+  is limited to the `beam_alloc` allocation calls, the `beam_term` accessors (which `beam_term` marks
+  `unsafe fn` because the validity of an `Eterm` is a caller invariant and there is no safe way to
+  read/write a heap word) and the minimal type/size guards it needs to turn a wrong kind of term into
+  a `BeamError` instead of UB. Enforcement is mechanical — `#![deny(unsafe_code)]` plus the single
+  `#[allow(unsafe_code)] mod term;` — so the deviation from the crate-layer note "The *safe
+  periphery* (ETF codec …) must be safe Rust" is auditable rather than diffuse. That note is accurate
+  for the wire layer only and should be narrowed upstream (reported to the parent node).
 - **The decoder targets `beam_alloc::Heap` + `beam_term::AtomTable` directly** (no trait, no
   intermediate value tree): the objective fixes this seam and downstream crates need real `Eterm`s.
-- **Term-layout construction lives in `term.rs`, pinned line-by-line to the C**, because the frozen
-  `beam_term` API exposes the layout *predicates* but not the *constructors* for float/bignum/map
-  and the external identifiers. This is a deliberate, flagged stop-gap (see Known Issues) — the
-  encoding of each block is asserted against a raw-word test and against `term_to_binary` fixtures.
+- **This crate does not own the term layout — `beam_term` (`src/thing.rs`) does.** `term.rs` forwards
+  to the heap-agnostic `beam_term::thing` writers/readers and `beam_term::{tuple_size, tuple_element,
+  car, cdr}`; it keeps only what it needs for allocation sizing (`beam_term::thing::*_size_words`)
+  and the guard constants (`BIG_ARITY_MAX`, `MAP_SMALL_MAP_LIMIT`, `EXTERNAL_THING_HEAD_SIZE`,
+  `U32_PER_WORD`). The forwarded layout stays asserted against raw-word tests and the
+  `term_to_binary` fixtures.
 - **Integer width policy mirrors C** (`external.c:3542-3599`): `< 256 ⇒ 97`, then `98` when the value
   fits a signed 32-bit, else `110` when the magnitude's significant base-256 **byte** count is < 256,
   else `111` — the count is derived from the `ErtsDigit`s exactly as `big_to_bytes` does (full eight
@@ -206,8 +190,9 @@ encoding.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `tag` (values against `external.h`, `from_byte`/`as_byte`
   round-trip), `reader`/`writer` (BE round-trips, every truncation ⇒ `BadArg`, no panic),
-  `atom_cache`, `term` (raw-word assertions for each block layout: float, bignum sign/digits,
-  flatmap head/size/keys/vals, external id fields), `encode`/`decode` (per-tag round-trips + the
+  `atom_cache`, `term` (raw-word assertions that the forwarded `beam_term::thing` layout is
+  byte-exact — float, bignum sign/digits, flatmap head/size/keys/vals, external id fields — plus the
+  guard/error behaviour), `encode`/`decode` (per-tag round-trips + the
   error mapping table + unsupported tags).
 - `tests/roundtrip.rs` — exhaustive `encode → decode → compare` over a property-style corpus
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
@@ -243,11 +228,6 @@ encoding.
   foundation. The decoder returns `unsupported` rather than a wrong term. **This is the single
   biggest M1 gap and blocks binary payloads in `beam_dist`/`beam_message`/`term_to_binary`** —
   escalated to the parent node (needs a `beam_term`/`beam_gc` binary constructor).
-- **`term.rs` duplicates layout knowledge that belongs in `beam_term`.** `make_float`, `make_big`,
-  `make_flatmap` and the external-identifier constructors/accessors will be needed by `beam_bifs`
-  (arithmetic/comparison), `beam_message` (`copy_struct`), `beam_ets` and `beam_rt`. Per the
-  lowest-common-ancestor rule they belong in `beam_term`; when they land there, `term.rs` collapses
-  into thin forwarders. Reported to the parent node.
 - **Maps are flatmaps only, ≤ 32 pairs** (`MAP_SMALL_MAP_LIMIT`, exactly ERTS's own switchover):
   larger maps need the HAMT builder plus Erlang term hashing (owned by `beam_ets`/`beam_term`), so
   they return `unsupported`. Duplicate keys are **not** detected in M1 (that needs term comparison,
@@ -281,8 +261,9 @@ encoding.
 - `src/decode.rs` → `Decoder`, `decode_term`
 - `src/error.rs` → error constructors only (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`
-- `src/term.rs` → **the only `unsafe` module**: term inspection + boxed sub-term materialization
-  (float/bignum/flatmap/external identifiers) pinned to `erl_term.h`
+- `src/term.rs` → **thin forwarding layer (the only `unsafe` module)**: allocates from
+  `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::{tuple_size, tuple_element,
+  car, cdr}` for float/bignum/flatmap/external-identifier construction and inspection
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated)
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
 - `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values (read-only)
