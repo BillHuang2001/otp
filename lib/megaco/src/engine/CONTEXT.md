@@ -79,7 +79,7 @@ Contents: 21 Erlang modules (`modules.mk` splits 4 `BEHAVIOUR_MODULES` from 17 `
 ## Test Strategy
 - Engine suites live in `../test/` (other directory); this directory has no tests of its own.
 - The messenger's behaviour is exercised end-to-end through the codec and transport suites, since `megaco:call/cast/receive_message` are covered there.
-- Test-only hooks are compiled in with `USE_MEGACO_TEST_CODE=true` (defines `MEGACO_TEST_CODE`), which enables `ets:new(megaco_test_data, …)` and the `?SIM`/`?TC_AWAIT_SEND_EVENT` macrnos in `megaco_messenger_misc`.
+- Test-only hooks are compiled in with `USE_MEGACO_TEST_CODE=true` (defines `MEGACO_TEST_CODE`), which enables `ets:new(megaco_test_data, …)` and the `?SIM`/`?TC_AWAIT_SEND_EVENT` macros in `megaco_messenger_misc`.
 
 ## See Also
 - `../app/` — top-level `megaco` API module, `megaco.app.src`/`megaco.appup.src`, `megaco_internal.hrl` (logger macros, `?default_user_callback_extra`), build flags in `megaco.mk`.
