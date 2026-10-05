@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_gc::HeapPolicy;
-use beam_message::Message;
+use beam_message::{copy_struct, CopyContext, Message, MsoHandle, OffHeapTable};
 use beam_term::prelude::{Atom, Eterm, PORT_DATA_SIZE};
 
 use crate::error;
@@ -68,20 +68,84 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
     slot.process.as_mut()
 }
 
-/// Builds a signal term on `process`'s heap, collecting once and retrying when the heap is
-/// exhausted (a full heap is a normal condition, not fatal OOM).
-fn build_signal_term<F>(process: &mut Process, build: F) -> Result<Eterm>
+/// Builds a signal term — together with the handles of the off-heap objects it owns — on
+/// `process`'s heap, collecting once and retrying when the heap is exhausted (a full heap is a
+/// normal condition, not fatal OOM).
+///
+/// `build` produces *both* the term and the handles of the fresh off-heap table it copied into:
+/// it creates that table itself, so a retry always starts from a clean table and never reuses a
+/// stale handle.
+fn build_signal_term<F>(process: &mut Process, build: F) -> Result<(Eterm, Vec<MsoHandle>)>
 where
-    F: Fn(&mut Heap) -> Result<Eterm>,
+    F: Fn(&mut Heap) -> Result<(Eterm, Vec<MsoHandle>)>,
 {
     match build(process.heap_mut()) {
-        Ok(term) => Ok(term),
+        Ok(built) => Ok(built),
         Err(BeamError::Alloc(_)) => {
             process.collect()?;
             build(process.heap_mut())
         }
         Err(error) => Err(error),
     }
+}
+
+/// Copies `reason` — whose heap is described by `src_off_heap` — into `process`'s own heap,
+/// registering every referenced off-heap object in the process's own off-heap table, and
+/// returns the copied term. Collects once and retries on heap exhaustion.
+///
+/// `None` means the reason is already owned by `process` (a process signalling itself) and is
+/// returned unchanged.
+fn copy_reason_onto(
+    process: &mut Process,
+    reason: Eterm,
+    src_off_heap: Option<&OffHeapTable>,
+) -> Result<Eterm> {
+    let Some(src) = src_off_heap else {
+        return Ok(reason);
+    };
+    match process.copy_into_heap(reason, src) {
+        Ok(copied) => Ok(copied),
+        Err(BeamError::Alloc(_)) => {
+            process.collect()?;
+            process.copy_into_heap(reason, src)
+        }
+        Err(error) => Err(error),
+    }
+}
+
+/// Builds `{'EXIT', from, reason}` on `recipient`'s heap and enqueues it as a message.
+///
+/// `reason` is copied — from the heap described by `src_off_heap` — **before** the tuple is
+/// built, so the delivered reason always resides in the recipient's own heap (an immediate or
+/// literal-area term is shared verbatim by the copy, so this is a no-op for those). `None` means
+/// the reason is already owned by `recipient`.
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when the message still does not fit after a collection.
+fn enqueue_exit_on(
+    recipient: &mut Process,
+    atoms: &SignalAtoms,
+    from: ProcessId,
+    reason: Eterm,
+    src_off_heap: Option<&OffHeapTable>,
+) -> Result<()> {
+    let (term, off_heap) = match src_off_heap {
+        Some(src) => build_signal_term(recipient, |heap| {
+            let mut scratch = OffHeapTable::new();
+            let copied = copy_struct(reason, heap, &mut CopyContext::new(src, &mut scratch))?;
+            let term = build_exit_message(heap, atoms, from, copied)?;
+            Ok((term, scratch.drain_handles()))
+        })?,
+        // The reason already lives in `recipient`'s own heap: read it exactly once and build.
+        // A collect-and-retry would relocate `reason` (making the raw word stale), so this
+        // branch deliberately does not collect — a full heap surfaces as `BeamError::Alloc`.
+        None => (build_exit_message(recipient.heap_mut(), atoms, from, reason)?, Vec::new()),
+    };
+    recipient
+        .mailbox_mut()
+        .enqueue(Message::new(term, from.to_eterm()).with_off_heap(off_heap));
+    Ok(())
 }
 
 /// The process table, the local name registry and the signal/link/monitor hub.
@@ -257,11 +321,36 @@ impl ProcessTable {
         match exit_policy(signal.reason, trapping, &self.atoms) {
             ExitPolicy::Ignore => Ok(ExitEffect::Ignored),
             ExitPolicy::Trap => {
-                self.enqueue_exit_message(target, signal.from, signal.reason)?;
+                // The signalling process is still live, but its off-heap table (the copy
+                // source) can never be borrowed together with the recipient's heap through
+                // `&mut self`. Follow the crate's collect-then-apply discipline: take the
+                // recipient out of the table, build its message against the local, and put it
+                // back.
+                let Some(mut recipient) = self.take(target) else {
+                    return Err(error::unknown_process());
+                };
+                let fallback = OffHeapTable::new();
+                let outcome = {
+                    let src = self.source_off_heap(target, signal.from, &fallback);
+                    enqueue_exit_on(&mut recipient, &self.atoms, signal.from, signal.reason, src)
+                };
+                self.insert(recipient)?;
+                outcome?;
                 Ok(ExitEffect::Trapped)
             }
             ExitPolicy::Terminate(reason) => {
-                self.terminate(target, reason)?;
+                // `terminate` releases the dying heap, so the reason must already live in the
+                // target's own heap: copy it in before re-inserting and terminating.
+                let Some(mut recipient) = self.take(target) else {
+                    return Err(error::unknown_process());
+                };
+                let fallback = OffHeapTable::new();
+                let copied = {
+                    let src = self.source_off_heap(target, signal.from, &fallback);
+                    copy_reason_onto(&mut recipient, reason, src)
+                };
+                self.insert(recipient)?;
+                self.terminate(target, copied?)?;
                 Ok(ExitEffect::Terminated)
             }
         }
@@ -408,7 +497,9 @@ impl ProcessTable {
             let outgoing = process.monitors_mut().drain();
             process.set_exit_reason(reason);
             process.set_state(ProcessState::Terminated);
-            drop(process);
+            // `process` stays alive until the end of this iteration: `reason` lives in its
+            // heap, so every recipient must be handed a *copy* before the dying heap is
+            // released (the drop now sits after the link/monitor loops).
 
             // 1. Links: drop the back-link, then either trap the signal on the peer or
             //    queue the peer's termination.
@@ -423,16 +514,31 @@ impl ProcessTable {
                 let trapping = peer.is_trapping_exit();
                 match exit_policy(reason, trapping, &self.atoms) {
                     ExitPolicy::Ignore => {}
-                    ExitPolicy::Trap => self.enqueue_exit_message(target, pid, reason)?,
+                    ExitPolicy::Trap => {
+                        self.enqueue_exit_message(target, pid, reason, process.off_heap())?;
+                    }
                     ExitPolicy::Terminate(peer_reason) => {
-                        worklist.push((target, peer_reason));
+                        // Copy the reason into the peer's own heap so the queued entry never
+                        // points into the dying heap the moment `process` is dropped.
+                        let Some(peer) = self.get_mut(target) else {
+                            continue;
+                        };
+                        let copied =
+                            copy_reason_onto(peer, peer_reason, Some(process.off_heap()))?;
+                        worklist.push((target, copied));
                     }
                 }
             }
 
             // 2. Monitors: every watcher is told the target is down.
             for watcher in watchers {
-                self.enqueue_down_message(watcher.watcher, watcher.reference, pid, reason)?;
+                self.enqueue_down_message(
+                    watcher.watcher,
+                    watcher.reference,
+                    pid,
+                    reason,
+                    process.off_heap(),
+                )?;
             }
 
             // 3. The dying process's own outgoing monitors vanish with it.
@@ -443,6 +549,9 @@ impl ProcessTable {
                         .retain(|entry| entry.reference != monitor.reference);
                 }
             }
+
+            // Every copy that read `reason` from the dying heap is done — release it.
+            drop(process);
         }
 
         Ok(())
@@ -496,25 +605,44 @@ impl ProcessTable {
 
     // --- message builders ----------------------------------------------------
 
-    /// Enqueues `{'EXIT', from, reason}` into `to`'s mailbox, building it on `to`'s heap.
+    /// The off-heap table a signal's reason must be copied *from*: the source process's table,
+    /// `None` when the source and the recipient are the same process (the reason then already
+    /// lives in the recipient's own heap), or `fallback` when the source is not (or no longer)
+    /// a live process.
+    fn source_off_heap<'a>(
+        &'a self,
+        recipient: ProcessId,
+        source: ProcessId,
+        fallback: &'a OffHeapTable,
+    ) -> Option<&'a OffHeapTable> {
+        if source == recipient {
+            None
+        } else {
+            Some(self.get(source).map(Process::off_heap).unwrap_or(fallback))
+        }
+    }
+
+    /// Enqueues `{'EXIT', from, reason}` into `to`'s mailbox, building it on `to`'s heap with
+    /// `reason` copied out of the heap described by `src_off_heap`.
     ///
     /// An unknown `to` is skipped: the caller is propagating a signal through the table and
     /// the target may have died earlier in the same propagation.
-    fn enqueue_exit_message(&mut self, to: ProcessId, from: ProcessId, reason: Eterm) -> Result<()> {
+    fn enqueue_exit_message(
+        &mut self,
+        to: ProcessId,
+        from: ProcessId,
+        reason: Eterm,
+        src_off_heap: &OffHeapTable,
+    ) -> Result<()> {
         let atoms = &self.atoms;
-        let Some(process) = lookup_mut(&mut self.slots, to) else {
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        let term =
-            build_signal_term(process, |heap| build_exit_message(heap, atoms, from, reason))?;
-        process
-            .mailbox_mut()
-            .enqueue(Message::new(term, from.to_eterm()));
-        Ok(())
+        enqueue_exit_on(recipient, atoms, from, reason, Some(src_off_heap))
     }
 
-    /// Enqueues `{'DOWN', reference, process, pid, reason}` into `to`'s mailbox, building it
-    /// on `to`'s heap.
+    /// Enqueues `{'DOWN', reference, process, pid, reason}` into `to`'s mailbox, building it on
+    /// `to`'s heap with `reason` copied out of the heap described by `src_off_heap`.
     ///
     /// An unknown `to` is skipped (the watcher died earlier in the same propagation).
     fn enqueue_down_message(
@@ -523,18 +651,23 @@ impl ProcessTable {
         reference: MonitorRef,
         pid: ProcessId,
         reason: Eterm,
+        src_off_heap: &OffHeapTable,
     ) -> Result<()> {
         let atoms = &self.atoms;
-        let Some(process) = lookup_mut(&mut self.slots, to) else {
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
             return Ok(());
         };
-        let term = build_signal_term(process, |heap| {
+        let (term, off_heap) = build_signal_term(recipient, |heap| {
+            let mut scratch = OffHeapTable::new();
+            let copied =
+                copy_struct(reason, heap, &mut CopyContext::new(src_off_heap, &mut scratch))?;
             let reference_term = reference.to_eterm(heap)?;
-            build_down_message(heap, atoms, reference_term, pid, reason)
+            let term = build_down_message(heap, atoms, reference_term, pid, copied)?;
+            Ok((term, scratch.drain_handles()))
         })?;
-        process
+        recipient
             .mailbox_mut()
-            .enqueue(Message::new(term, pid.to_eterm()));
+            .enqueue(Message::new(term, pid.to_eterm()).with_off_heap(off_heap));
         Ok(())
     }
 }

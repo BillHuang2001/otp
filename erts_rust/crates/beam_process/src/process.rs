@@ -15,7 +15,7 @@
 use beam_alloc::Heap;
 use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{Collection, Collector, HeapPolicy};
-use beam_message::{CopyContext, Message, OffHeapTable, Queue};
+use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
 use crate::link::Links;
@@ -377,6 +377,29 @@ impl Process {
         // copies the rest verbatim.
         let no_off_heap = OffHeapTable::new();
         self.deliver(from, term, &no_off_heap)
+    }
+
+    /// Copies `term` — whose off-heap references are described by `src_off_heap` — into this
+    /// process's own young heap, registering every referenced off-heap object in *this*
+    /// process's off-heap table so it outlives the copy, and returns the copied term.
+    ///
+    /// Unlike [`Process::deliver`] this enqueues nothing: the caller adopts the copied term
+    /// itself (the exit-reason cascade does, so a propagated reason never points into a heap
+    /// that is about to be dropped). Destructures `self` so the young heap and the off-heap
+    /// table are borrowed disjointly.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the copy engine's `BeamError::Alloc` when the term does not fit.
+    pub(crate) fn copy_into_heap(&mut self, term: Eterm, src_off_heap: &OffHeapTable) -> Result<Eterm> {
+        let Process {
+            collector,
+            off_heap,
+            ..
+        } = self;
+        let to_heap = collector.young_mut().heap_mut();
+        let mut ctx = CopyContext::new(src_off_heap, off_heap);
+        copy_struct(term, to_heap, &mut ctx)
     }
 
     /// Removes and returns the first queued message whose payload satisfies `pred`.
