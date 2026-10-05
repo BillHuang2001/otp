@@ -46,6 +46,7 @@ Monorepo for Erlang/OTP (release `30.0-rc0` per `OTP_VERSION`; ERTS runtime vers
 - `.ort/` (with root `.ort.yml`) → OSS Review Toolkit (ORT) SBOM/license-scan configuration used by CI
 
 ## See Also
+- `CHANGE.md` → log of major modifications (data-structure refactorings, algorithmic changes) to the ERTS Rust rewrite.
 - Root dev-tool config: `.elp.toml` (Erlang Language Platform), `erlang_ls.config`, `renovate.json5`, `.editorconfig`, `.formatter.exs`, `.dir-locals.el`, `.gitpod.yml`.
 - `ERTS_RUST_REWRITE_EVALUATION.md` → engineering evaluation of a hypothetical Rust rewrite of ERTS/BEAM (Level 1: BEAM-asm drop-in vs Level 2: source/AST compat), incl. the ERTS compatibility surface, JIT/GC/data-structure/I-O technology survey, the process memory model (messaging/ETS copy boundary), and a recommended incremental strategy. Analytical document only — no code.
 - `ERTS_RUST_REWRITE_DEEPDIVE.md` → Part II of the above: deep dives on the core-only-rewrite seam (keep NIFs / reuse C / frozen internal ABI), data structures, GC options in Rust, the process memory model (messaging/ETS copy boundary, what may be shared), compiler optimization feasibility/universality, the JIT (register allocation, backends, tiering) and the interpreter, plus a staged plan. Analytical document only — no code.
