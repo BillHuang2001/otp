@@ -52,6 +52,7 @@ Built by ex_doc through `system/doc/Makefile` → `make/doc.mk` (`docs` → `htm
 - Two `.erl` orphans pin obsolete host names (`c1@idril`, `cnode@idril.du.uab.ericsson.se`) that no longer resolve anywhere.
 - Source/markdown whitespace drift already exists (see Companion Sources): the checked-in C files are the pre-clean-up versions.
 - Stale decorative versions: `erl_interface.md` shows `erl_interface-3.9.2` in the `gcc` example while the following paragraph says the version is `3.2.1`, and it still explains R4B/R5B layout; `nif.md`'s shell transcript is from `R13B04 (erts-5.7.5)` while `c_port.md`/`c_portdriver.md`/`erl_interface.md` use OTP 26/erts-14.2. `nif.md`'s transcript also has a typo `comlpex6:foo`.
+- `debugging.md` cross-links `` `e:system:install.md#advanced-configuration-...` ``, while the system app registers that page in `docs.exs` as `installation_guide/INSTALL.md`; double-check that target before relying on it.
 - `cnode.md` is a redirect stub but the sidebar shows it as a full page; its only content links to `e:erl_interface:ei_users_guide.md`.
 
 ## Notes for Agents
