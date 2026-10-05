@@ -5,11 +5,10 @@ edition.workspace = true
 license.workspace = true
 description = "Differential-test harness comparing Rust ERTS against the real system ERTS."
 
+# The harness is a pure driver/observer: its only contract with the runtime is the
+# documented external CLI (compat contract A.6), so it depends on NO workspace crate
+# internals — just JSON support. Known deps (`serde`, `serde_json`) resolve offline.
 [dependencies]
-beam_common = { path = "../../crates/beam_common" }
-beam_term = { path = "../../crates/beam_term" }
-beam_codec = { path = "../../crates/beam_codec" }
-libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 
