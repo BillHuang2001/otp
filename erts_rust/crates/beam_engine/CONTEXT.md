@@ -63,6 +63,12 @@ pub trait ExecutionContext {
 - `pub struct Machine` — the process-state core: the **x-register file**, the **Erlang stack**, and
   the **call-frame stack**.
 - `pub const MAX_REGISTER: u32 = 1024;` — the x-register file size (`beam_emu.c` `MAX_REG` bound).
+- `pub const MAX_FLOAT_REGISTER: u32 = 1024;` — the **float-register (FR) file** size, mirroring the
+  C `f_reg_array` (`FloatDef d[MAX_REG]`, `erl_process.h`; `MAX_REG = 1024`, `erl_vm.h:49`; JIT index
+  bound `0..=1023`). The FR file (`fr: Vec<Eterm>`, (re)filled by `reset`) holds **`Eterm` term
+  slots** at M1 (see Design Decisions).
+- `Machine::get_fr(&self, n: u32) -> Option<Eterm>` / `Machine::set_fr(&mut self, n: u32, Eterm) -> Result<()>`
+  — bounds-checked FR access (`bad_register` on overflow).
 - `Machine::new() -> Machine` / `Machine::default()`; `Machine::with_max_register(u32) -> Machine`.
 - `pub fn run_export(&mut self, module: &Module, function: Atom, arity: u32, args: &[Eterm],
   ctx: &mut dyn ExecutionContext) -> Result<Eterm>` — the primary entry: resolve `function/arity`'s
