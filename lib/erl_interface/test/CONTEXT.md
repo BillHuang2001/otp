@@ -51,7 +51,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 
 ## Test Strategy
 - Run from `lib/erl_interface`: `make test` (all suites via `erl_interface.spec`), `make test ARGS="-suite ei_decode_SUITE -case test_ei_decode_long"`, or `make test SPEC_POSTFIX=smoke`; also `make erl_interface_test` from `ERL_TOP`.
-- Prerequisites: the whole OTP tree built enough for `ct_run`, and the C library built — `lib/erl_interface/obj[.debug]/<target>/libei.a` (+ `liberl_interface.a`, needed by `ei_global_SUITE`) and `lib/erl_interface/src/<target>/eidefs.mk`; `erl_call_SUITE` additionally needs `lib/erl_interface/bin/<system_architecture>/erl_call`.
+- Prerequisites: the whole OTP tree built enough for `ct_run`, and `libei` built — `lib/erl_interface/obj[.debug]/<target>/libei.a` plus `lib/erl_interface/src/<target>/eidefs.mk`; `erl_call_SUITE` additionally needs `lib/erl_interface/bin/<system_architecture>/erl_call`.
 - Distribution is required for `ei_accept`, `ei_connect`, `ei_tmo`, `ei_global` and `ei_decode_encode`: they publish/connect C nodes, so a running `epmd` and a resolvable hostname are needed; ct_run is started with `-sname test_server`, and `ei_tmo_SUITE` registers fake node names with epmd itself over `127.0.0.1`.
 - `ei_decode`, `ei_encode`, `ei_print`, `ei_format` need no distribution — they only exchange terms over the port.
 - Slow areas: `ei_tmo_SUITE` (timetrap 1 minute; several 10–20 s waits on socket buffers), `ei_connect_SUITE` (timetrap 30 s; 32 MB term in `ei_reg_send_large`), the threaded cases (`einode`, `eiaccnode`).
