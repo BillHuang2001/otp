@@ -1,0 +1,218 @@
+//! Oracle-backed integration tests for the differential harness.
+//!
+//! These assert the harness's *contract with reality*: the system ERTS on this machine
+//! reproduces the corpus goldens, oracle-vs-oracle agrees, and a missing Rust runtime
+//! degrades to `unsupported` instead of a fabricated pass.
+//!
+//! Everything here **skips loudly** (`eprintln!("SKIP: …")`, never a silent pass) when
+//! the oracle cannot be resolved, so `cargo test` stays honest on a machine without
+//! Erlang. Nothing here requires a functional `beam_rt`.
+
+use differential::compare::{check_golden, compare_observations, SideResult, Verdict};
+use differential::corpus::find_case;
+use differential::harness::{run_case, run_case_in, RuntimeContext};
+use differential::runtime::{
+    eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, RuntimeSpec,
+};
+
+/// The canonical `{ok,42}` ETF probe line (the frozen A.2 golden).
+const OK_42_GOLDEN: &str = "ok <<131,104,2,119,2,111,107,97,42>>";
+
+/// Resolve the oracle, or print a loud skip notice and return `None`.
+fn oracle_or_skip() -> Option<RuntimeSpec> {
+    match resolve_oracle() {
+        Ok(spec) => Some(spec),
+        Err(error) => {
+            eprintln!("SKIP: oracle erl not available ({error})");
+            None
+        }
+    }
+}
+
+#[test]
+fn oracle_reproduces_the_ok_42_golden() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
+    let argv = eval_argv(&case.eval(), case.extra_argv);
+    let observation = run(&oracle, &argv).expect("spawn the oracle");
+
+    assert_eq!(observation.exit_code, Some(0), "the probe halts with 0");
+    assert_eq!(
+        differential::compare::normalize_probe_stdout(&observation.stdout),
+        OK_42_GOLDEN.as_bytes(),
+        "the oracle must print the canonical ETF bytes of {{ok,42}}"
+    );
+    assert!(
+        observation.stderr.is_empty(),
+        "the oracle must not write to stderr: {:?}",
+        String::from_utf8_lossy(&observation.stderr)
+    );
+
+    let golden = check_golden(&observation, &case.golden);
+    assert!(golden.matched, "golden drift: {:?}", golden.diffs);
+
+    let outcome = run_case(case).expect("harness run");
+    assert!(outcome.golden.matched, "{:?}", outcome.golden.diffs);
+    assert_eq!(outcome.eval, case.eval());
+}
+
+#[test]
+fn oracle_against_itself_agrees() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
+    let argv = eval_argv(&case.eval(), case.extra_argv);
+    let first = run(&oracle, &argv).expect("first run");
+    let second = run(&oracle, &argv).expect("second run");
+
+    assert!(
+        compare_observations(&first, &second).is_empty(),
+        "the oracle is deterministic: {:?}",
+        compare_observations(&first, &second)
+    );
+
+    // The same comparison through the real verdict path: oracle vs oracle ⇒ Agree.
+    let golden = check_golden(&first, &case.golden);
+    assert!(golden.matched, "{:?}", golden.diffs);
+    let verdict = differential::compare::verdict(
+        &SideResult::observed(first),
+        &SideResult::observed(second),
+        &golden,
+    );
+    assert_eq!(verdict, Verdict::Agree);
+}
+
+#[test]
+fn a_rust_runtime_forced_to_a_nonexistent_path_is_a_loud_env_error() {
+    // $BEAM_RT is an explicit override: if it is set but does not exist, the harness must
+    // fail loudly (exit 2) rather than silently fall back to a default or a skip.
+    let scratch = std::env::temp_dir();
+    let error = resolve_rust_from(
+        Some("/nonexistent/beam_rt-differential-test".into()),
+        &scratch,
+    )
+    .expect_err("a nonexistent $BEAM_RT must not resolve");
+    assert_eq!(error.exit_code(), 2);
+    let message = error.to_string();
+    assert!(message.contains("$BEAM_RT"), "{message}");
+    assert!(message.contains("not an existing file"), "{message}");
+}
+
+#[test]
+fn an_absent_rust_runtime_reports_unsupported_never_agreement() {
+    // There is no default beam_rt in a tree that has only built this crate.
+    let scratch = std::env::temp_dir()
+        .join("differential-absent")
+        .join("erts_rust/tools/differential");
+    let absent = resolve_rust_from(None, &scratch).expect("resolution must not fail");
+    assert!(
+        absent.is_none(),
+        "expected no workspace default under {}",
+        scratch.display()
+    );
+
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    let case = find_case("etf/term_to_binary_tuple").expect("built-in case");
+
+    // The Rust side is exercised with an explicitly absent runtime: never `agree`.
+    let context = RuntimeContext {
+        oracle: oracle.clone(),
+        rust: None,
+    };
+    let outcome = run_case_in(&context, case).expect("oracle-backed run");
+    assert!(
+        matches!(outcome.rust, SideResult::Unsupported { .. }),
+        "a missing runtime is unsupported, got {:?}",
+        outcome.rust
+    );
+    assert_ne!(outcome.verdict, Verdict::Agree);
+    assert_eq!(outcome.verdict, Verdict::Unsupported);
+    assert!(outcome.diffs.is_empty(), "nothing was observed to differ");
+    assert_eq!(outcome.exit_code(), 0, "unsupported is not fatal by default");
+    assert!(outcome.rust_spec.is_none());
+
+    // And the same through the real environment, when it really has no Rust runtime.
+    match resolve_rust() {
+        Ok(None) => {
+            let real = run_case(case).expect("harness run");
+            assert!(matches!(real.rust, SideResult::Unsupported { .. }));
+            assert_ne!(real.verdict, Verdict::Agree);
+        }
+        Ok(Some(spec)) => eprintln!(
+            "SKIP: a Rust runtime exists at {} — the real-environment assertion is skipped",
+            spec.program.display()
+        ),
+        Err(error) => panic!("$BEAM_RT is set but unusable: {error}"),
+    }
+}
+
+#[test]
+fn every_corpus_case_matches_its_oracle_golden() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    for case in differential::corpus::cases() {
+        let argv = eval_argv(&case.eval(), case.extra_argv);
+        let observation = run(&oracle, &argv).unwrap_or_else(|error| {
+            panic!("case {}: failed to run the oracle: {error}", case.id)
+        });
+        let golden = check_golden(&observation, &case.golden);
+        assert!(
+            golden.matched,
+            "case {} drifted from its golden: {:?} (stdout={:?})",
+            case.id,
+            golden.diffs,
+            String::from_utf8_lossy(&observation.stdout)
+        );
+        assert_eq!(
+            observation.exit_code,
+            Some(case.golden.exit_code),
+            "case {}: unexpected exit status",
+            case.id
+        );
+    }
+}
+
+#[test]
+fn exception_cases_are_observable_through_the_probe() {
+    let Some(oracle) = oracle_or_skip() else {
+        return;
+    };
+    for (id, expected) in [
+        ("errors/error_boom", "exception error boom"),
+        ("errors/badarith", "exception error badarith"),
+    ] {
+        let case = find_case(id).expect("built-in case");
+        let argv = eval_argv(&case.eval(), case.extra_argv);
+        let observation = run(&oracle, &argv).expect("spawn the oracle");
+        assert_eq!(
+            differential::compare::normalize_probe_stdout(&observation.stdout),
+            expected.as_bytes(),
+            "case {id}: the probe must make the exception observable"
+        );
+        assert_eq!(observation.exit_code, Some(1), "case {id}: probe exit status");
+        assert!(check_golden(&observation, &case.golden).matched);
+    }
+}
+
+#[test]
+fn module_less_argv_is_the_same_shape_for_both_runtimes() {
+    let case = find_case("flags/custom_argument").expect("built-in case");
+    let argv = eval_argv(&case.eval(), case.extra_argv);
+    assert_eq!(
+        argv,
+        vec![
+            "-noshell".to_string(),
+            "-differential_test_flag".to_string(),
+            "hello".to_string(),
+            "-eval".to_string(),
+            case.eval(),
+        ],
+        "the argv is built once and handed to both runtimes"
+    );
+}

@@ -372,10 +372,6 @@ dependencies = [
 name = "differential"
 version = "0.1.0"
 dependencies = [
- "beam_codec",
- "beam_common",
- "beam_term",
- "libc",
  "serde",
  "serde_json",
 ]

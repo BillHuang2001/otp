@@ -1,15 +1,29 @@
-//! Benchmark driver for the external target projects plus a system-ERTS baseline.
+//! The `bench` binary: a thin wrapper around the library.
 //!
-//! Drives the pure-Erlang/Elixir workloads named in Part I §C (Cowboy, Khepri, the
-//! Elixir compiler, Benchmarks-Game kernels, EMQX), grouped by the benchmark
-//! categories of Part I §C — compute/JIT-bound, messaging/copy-bound, GC-bound and
-//! I/O-bound — and measures startup latency, p99 tail latency, throughput and
-//! memory against the system Erlang baseline. Placeholder entry point until the
-//! harness child architect lands the runner.
+//! Parse the args, dispatch the command, and map the outcome onto the process exit
+//! code (`0` success; `2` usage/env/IO/schema error). All logic lives in the library so
+//! it is testable.
+
+#![forbid(unsafe_code)]
+
+use std::process::exit;
 
 fn main() {
-    println!(
-        "bench {} — Rust ERTS benchmark driver (placeholder)",
-        env!("CARGO_PKG_VERSION"),
-    );
+    let args: Vec<String> = std::env::args().collect();
+    let code = match bench::cli::parse(&args) {
+        Ok(command) => match bench::run::dispatch(&command) {
+            Ok(code) => code,
+            Err(err) => {
+                eprintln!("bench: {err}");
+                err.exit_code()
+            }
+        },
+        Err(err) => {
+            eprintln!("bench: {err}");
+            eprintln!();
+            eprintln!("{}", bench::cli::usage());
+            err.exit_code()
+        }
+    };
+    exit(code);
 }
