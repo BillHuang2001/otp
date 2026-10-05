@@ -8,7 +8,7 @@ Most modules are public, documented API; the `*_backend`/`*_info`/plumbing modul
 ## API Surface
 Build inputs/outputs:
 - `runtime_tools.app.src` → `../ebin/runtime_tools.app` (Makefile `sed`-substitutes `%VSN%`); declares 13 modules, `registered = [runtime_tools_sup]`, `applications = [kernel, stdlib]`, `mod = {runtime_tools, []}` and `runtime_dependencies = ["stdlib-6.0","mnesia-4.12","kernel-10.0","erts-16.0"]`.
-- `runtime_tools.appup.src` → `../ebin/runtime_tools.appup`; the whole app is restarted for any version (only `runtime_tools` itself would be, but see Known Issues).
+- `runtime_tools.appup.src` → `../ebin/runtime_tools.appup`; instructs `{restart_application, runtime_tools}` for every `<<".*">>` upgrade/downgrade, i.e. the app is always fully restarted.
 - `Makefile` — compiles `MODULES` into `$(EBIN)` (= `../ebin`) and generates the `.app`/`.appup`; installs `src/`, `../include/observer_backend.hrl` and `../examples/*` on release.
 
 User-facing tracing / measurement tools (public, documented):
