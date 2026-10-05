@@ -25,9 +25,10 @@ never modify it.
 plumbing, the `encode`/`decode`
 loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers) plus the local bitstring word-layout shim
-(`term/binary.rs`), and the `error` constructors. The required core tag set round-trips
-(see "Tag coverage" below); the documented unsupported set (funs, records, `V4_PORT`,
-`LOCAL`, the distribution header) returns `error::unsupported` rather than a wrong term.
+(`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
+(see "Tag coverage" below); the still-unsupported tags (funs, exports, records, `LOCAL`, the
+distribution header) return `error::unsupported`, and the obsolete `FUN` (`117`) / `NEW_CACHE`
+(`78`) tags return `BadArg`, rather than a wrong term.
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
 `#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
@@ -67,7 +68,8 @@ Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)]
 `pub struct AtomCache` — 8 segments × 256 = 2048 slots: `new()`, `set(index: u8, atom)`,
 `get(index: u8) -> Option<Atom>`, `clear()`. The *distribution header* itself (`68`/`78`) is
 `beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
-through it (an unset index ⇒ `BadArg`). M1 never *emits* `82`/`78`.
+through it (an unset index ⇒ `BadArg`). The encoder never *emits* `82` (as `term_to_binary` does
+not); byte `78` (`NEW_CACHE`) is dead in this OTP and is rejected as `BadArg`.
 
 ### `src/compress.rs` — zlib plumbing for `COMPRESSED` (`80`)
 Safe Rust (`flate2` zlib wrappers; no `unsafe`). Owns only the RFC-1950 stream — the wrapper bytes
@@ -117,24 +119,29 @@ is `decode`'s.
   unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
 
-### `src/term.rs` — thin forwarding layer (the ONLY `unsafe` module; see Design Decisions)
-Term inspection and boxed sub-term materialization over `beam_alloc::Heap` that **forwards to**
-`beam_term::thing` (float/bignum/flatmap/external-identifier constructors + readers) and
-`beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons accessors); the boxed interior layout
-is owned by `beam_term` (workspace `CONTEXT.md` §2). This module only allocates from
-`beam_alloc::Heap`, validates its type/bounds preconditions (mapping a violation to `BeamError`), and
-calls the `beam_term` accessor:
+### `src/term/` — materialization layer (the ONLY `unsafe` subtree; see Design Decisions)
+`src/term/mod.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term materialization over
+`beam_alloc::Heap` that **forwards to** `beam_term::thing` (float/bignum/flatmap/external-identifier
+constructors + readers) and `beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons
+accessors); the boxed interior layout is owned by `beam_term` (workspace `CONTEXT.md` §2). It only
+allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapping a violation to
+`BeamError`), and calls the `beam_term` accessor:
 - `make_float(&mut Heap, f64) -> Result<Eterm>` / `float_value(Eterm) -> Result<f64>`;
 - `make_big(&mut Heap, negative: bool, &[u64]) -> Result<Eterm>` /
   `big_parts(Eterm) -> Result<(bool, &[u64])>` — the slice elements are `ErtsDigit`s (`u64`, one per
   word), least significant first;
-- `make_flatmap` / `flatmap_parts`;
+- `make_flatmap` / `flatmap_parts` (any pair count);
 - `make_external_pid(&mut Heap, node, number: u32, serial: u32, creation: u32) -> Result<Eterm>` /
   `external_pid_parts -> (node, number, serial, creation)`;
 - `make_external_port(&mut Heap, node, number: u64, creation: u32) -> Result<Eterm>` /
   `external_port_parts -> (node, number, creation)`;
 - `make_external_ref(&mut Heap, node, ids: &[u32], creation: u32) -> Result<Eterm>` /
   `external_ref_parts -> (node, &[u32] ids, creation)`;
+- **bitstrings** (`src/term/binary.rs`, the local frozen-layout shim — see Known Issues):
+  `make_binary(&mut Heap, &[u8])`, `make_bitstring(&mut Heap, &[u8], n_bits: usize)`,
+  `bitstring_parts(Eterm) -> Result<(*const u8, usize /*offset_bits*/, usize /*size_bits*/)>`,
+  `bitstring_bytes(Eterm) -> Result<(&[u8], usize, usize)>`, `bitstring_size_bits`,
+  `heap_bits_size_words`, `bit_count_to_bytes`;
 - `pub use beam_term::thing::MAX_REF_IDS` (`ERTS_MAX_REF_NUMBERS`), plus the tuple/tuple-element and
   list accessors the encoder needs.
 
@@ -144,11 +151,13 @@ calls the `beam_term` accessor:
 constants only.
 
 ## Tag coverage (M1)
-**Encode + decode + byte-exact round-trip** (the required core set):
+**Encode + decode + byte-exact round-trip** (the full producible set):
 `97, 98, 110, 111` (integers; a big that fits a 60-bit small decodes to a small, as in C),
 `99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`**, matching `term_to_binary`),
 `100, 115, 118, 119` (all four atom tags decode; encode emits UTF-8 per §AtomEncoding),
-`101, 114, 90` (references), `102, 89` (ports), `103, 88` (pids), `104, 105` (tuples), `106` (NIL),
+`101, 114, 90` (references), `102, 89, 120` (ports: all three decode, **encode always emits `120
+V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are decode-only),
+`103, 88` (pids), `104, 105` (tuples), `106` (NIL),
 `107` (strings; decode ⇒ list of smalls, encode ⇒ `107` when the list is a byte list of length
 ≤ 65535, else `108`), `108` (lists, including improper tails),
 `109 BINARY_EXT` / `77 BIT_BINARY_EXT` (both decode into an on-heap bitstring block, see
@@ -159,15 +168,21 @@ flatmap/hashmap switchover is an *open* layout this crate deliberately collapses
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
 by default).
-**Explicit, documented `unsupported` error (never a wrong encoding):**
-`112 NEW_FUN` / `113 EXPORT` / `117 FUN`, `67 RECORD`, `120 V4_PORT`, `121 LOCAL`,
-`68`/`78` (distribution header — `beam_dist`'s), and any atom name that is not representable in the
+**Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
+result):** `112 NEW_FUN` / `113 EXPORT` (blocked on a fun/export registry owned by
+`beam_loader`/`beam_rt`), `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node
+identity), `68` (distribution header — `beam_dist`'s); plus any atom name not representable in the
 emitted encoding.
+**Obsolete tags rejected as `BadArg`** (as the C does): `117 FUN` (removed in OTP 23,
+`external.c:6399-6404`) and `78 NEW_CACHE` (dead `#if 0`, `external.h:77-81`).
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
-by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `term.rs` only
-forwards to it. The codec's own layout-relevant policy is the **wire** form of a bignum magnitude —
+by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `term/mod.rs`
+only forwards to it. The **one exception** is the bitstring block (`ErlHeapBits`/`ErlSubBits`), whose
+layout lives in the local shim `src/term/binary.rs` — built only from public `beam_term` primitives —
+because this node cannot write `beam_term`; it is **owed** to `beam_term::thing` (see Known Issues).
+The codec's own layout-relevant policy is the **wire** form of a bignum magnitude —
 base-256 bytes (`big_to_bytes`/`bytes_to_big`, `big.c:3405-3490`): full eight bytes per non-leading
 digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the byte count while it is
 < 256, `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
@@ -210,12 +225,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   for the wire layer only and should be narrowed upstream (reported to the parent node).
 - **The decoder targets `beam_alloc::Heap` + `beam_term::AtomTable` directly** (no trait, no
   intermediate value tree): the objective fixes this seam and downstream crates need real `Eterm`s.
-- **This crate does not own the term layout — `beam_term` (`src/thing.rs`) does.** `term.rs` forwards
-  to the heap-agnostic `beam_term::thing` writers/readers and `beam_term::{tuple_size, tuple_element,
-  car, cdr}`; it keeps only what it needs for allocation sizing (`beam_term::thing::*_size_words`)
-  and the guard constants (`BIG_ARITY_MAX`, `MAP_SMALL_MAP_LIMIT`, `EXTERNAL_THING_HEAD_SIZE`,
-  `U32_PER_WORD`). The forwarded layout stays asserted against raw-word tests and the
-  `term_to_binary` fixtures.
+- **This crate does not own the term layout — `beam_term` (`src/thing.rs`) does; the bitstring block
+  is a documented local exception.** `term/mod.rs` forwards to the heap-agnostic `beam_term::thing`
+  writers/readers and `beam_term::{tuple_size, tuple_element, car, cdr}`; it keeps only what it needs
+  for allocation sizing (`beam_term::thing::*_size_words`) and the guard constants (`BIG_ARITY_MAX`,
+  `EXTERNAL_THING_HEAD_SIZE`, `U32_PER_WORD`). The bitstring `ErlHeapBits`/`ErlSubBits` layout is the
+  one boxed layout `beam_term` does not yet expose, so it lives in `src/term/binary.rs` (public
+  constants/primitives only) and is owed to `beam_term::thing`. Forwarded and shimmed layout stays
+  asserted against raw-word tests and the `term_to_binary` fixtures.
 - **Integer width policy mirrors C** (`external.c:3542-3599`): `< 256 ⇒ 97`, then `98` when the value
   fits a signed 32-bit, else `110` when the magnitude's significant base-256 **byte** count is < 256,
   else `111` — the count is derived from the `ErtsDigit`s exactly as `big_to_bytes` does (full eight
@@ -228,9 +245,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - **Strings**: `decode` of `107` yields a list of smalls (byte-list semantics); `encode` re-emits
   `107` for a proper byte list of length ≤ 65535. `108` is used once an element is not a byte.
 - **Redundant identifier forms decode to one representation**: `101/114/90`, `102/89`, `103/88` all
-  decode to the *external* thing layouts; the encoder always emits the modern form
-  (`90`/`89`/`88`) with `Len`/`Creation` widths per spec. Mapping a same-node identifier to a local
-  internal pid/port is a `beam_dist`/`beam_rt` concern (they own node identity).
+  decode to the *external* thing layouts; the encoder always emits the modern form — `90`/`88` for
+  references/pids and `120 V4_PORT_EXT` for ports — with `Len`/`Creation` widths per spec. Mapping a
+  same-node identifier to a local internal pid/port is a `beam_dist`/`beam_rt` concern (they own node
+  identity).
 - **`VERSION_MAGIC` is handled by the constructor**, not the term loop: `Decoder::new` requires and
   consumes it, `new_body` does not; the same split exists on the `Encoder`. This is what lets the
   same code path serve `term_to_binary` and the distribution payload.
@@ -314,7 +332,7 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../tools/`.
 
-## Known Issues / Intentional M1 gaps
+## Known Issues / Remaining gaps
 - **Binaries/bitstrings are materialized as on-heap `ErlHeapBits` blocks only.** The
   `BINARY_EXT`/`BIT_BINARY_EXT` tag *is* decoded (and re-encoded byte-exactly), but ERTS keeps a
   binary larger than `ERL_ONHEAP_BINARY_LIMIT` (64 bytes) off-heap as a ref-counted `Binary`, while
@@ -326,8 +344,11 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   *open* layout, so there is no `MAP_SMALL_MAP_LIMIT` cutoff here — the decode policy constant in
   `decode.rs` is not a layout duplicate). Pair order is preserved as-is on the wire; duplicate keys
   are **not** detected (that needs term comparison) and the wire order is kept exactly.
-- Funs (`112`/`113`/`117`), records (`67`), `V4_PORT_EXT` (`120`), `LOCAL_EXT` (`121`) and the
-  distribution header (`68`/`78`) are out of M1 scope; `beam_dist` owns the distribution header.
+- Funs (`112`/`113`), records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain
+  unsupported: funs/exports are blocked on a fun/export registry that does not exist yet (owned by
+  `beam_loader`/`beam_rt`), records are a legacy native term (ordinary Erlang records encode as
+  tuples), `LOCAL_EXT` needs local-node identity, and the distribution header is `beam_dist`'s. The
+  obsolete `FUN` (`117`) and `NEW_CACHE` (`78`) tags are rejected as `BadArg`.
 - **`COMPRESSED` decompression is capped at `MAX_UNCOMPRESSED` (32 MiB)** (`compress.rs`), mirroring
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
@@ -363,9 +384,11 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `decompress_wrapper`/`is_compressed_image`
 - `src/error.rs` → error constructors only (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`
-- `src/term.rs` → **thin forwarding layer (the only `unsafe` module)**: allocates from
+- `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
   `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::{tuple_size, tuple_element,
   car, cdr}` for float/bignum/flatmap/external-identifier construction and inspection
+- `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
+  constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
   incl. the `COMPRESSED` seed
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
