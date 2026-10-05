@@ -19,7 +19,7 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
 use beam_term::prelude::{make_atom, try_make_small};
-use beam_term::{AtomTable, Eterm, NIL};
+use beam_term::{Atom, AtomTable, Eterm, NIL};
 
 use crate::access;
 use crate::ets::TableRegistry;
@@ -105,6 +105,20 @@ pub trait SendHook {
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()>;
 }
 
+/// Interns a new atom name into the runtime's *global* atom table.
+///
+/// The context only borrows the atom table immutably ([`BifContext::atoms`]),
+/// because atom indices are global and owned by the runtime (`beam_rt`), not by a
+/// BIF call. The `list_to_atom`/`binary_to_atom` BIFs must nonetheless be able to
+/// add a *new* atom; the runtime supplies this hook over the real, mutable
+/// `AtomTable`. With no hook installed those BIFs can still resolve an *existing*
+/// atom ([`BifContext::intern_atom`] looks it up first) and otherwise report
+/// [`BeamError::TermNotFound`] — never a fabricated index.
+pub trait AtomInterner {
+    /// Interns `name`, returning its [`Atom`] index (creating it if new).
+    fn intern(&mut self, name: &str) -> Atom;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -113,6 +127,7 @@ pub struct BifContext<'a> {
     output: Option<&'a mut dyn OutputSink>,
     sender: Option<&'a mut dyn SendHook>,
     tables: Option<&'a mut TableRegistry>,
+    interner: Option<&'a mut dyn AtomInterner>,
 }
 
 impl<'a> BifContext<'a> {
@@ -126,6 +141,7 @@ impl<'a> BifContext<'a> {
             output: None,
             sender: None,
             tables: None,
+            interner: None,
         }
     }
 
@@ -144,6 +160,12 @@ impl<'a> BifContext<'a> {
     /// Installs the `ets:*` table registry.
     pub fn with_tables(mut self, reg: &'a mut TableRegistry) -> Self {
         self.tables = Some(reg);
+        self
+    }
+
+    /// Installs the atom-interning hook used by `list_to_atom`/`binary_to_atom`.
+    pub fn with_atom_interner(mut self, interner: &'a mut dyn AtomInterner) -> Self {
+        self.interner = Some(interner);
         self
     }
 
@@ -212,6 +234,25 @@ impl<'a> BifContext<'a> {
             .lookup(name)
             .map(make_atom)
             .ok_or(BeamError::TermNotFound)
+    }
+
+    /// The atom `name`, interning it through the [`AtomInterner`] hook when it is
+    /// not already present.
+    ///
+    /// An already-interned name never needs the hook; a new name requires it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::TermNotFound`] when `name` is unknown and no interner is
+    /// installed (the runtime has not wired one up).
+    pub fn intern_atom(&mut self, name: &str) -> Result<Eterm> {
+        if let Some(atom) = self.atoms.lookup(name) {
+            return Ok(make_atom(atom));
+        }
+        match self.interner.as_deref_mut() {
+            Some(interner) => Ok(make_atom(interner.intern(name))),
+            None => Err(BeamError::TermNotFound),
+        }
     }
 
     /// The atom `true` or `false`.

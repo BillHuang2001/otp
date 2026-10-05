@@ -93,19 +93,26 @@ fn seeded_atoms() -> AtomTable {
 }
 
 #[test]
-fn default_registry_registers_exactly_the_core_bifs() {
+fn default_registry_contains_the_core_bifs() {
     let reg = default_registry();
 
-    assert_eq!(reg.len(), 54, "the Milestone-1 core BIF count");
+    // The registry is a *superset* of the Milestone-1 core roster (the
+    // conversion/lists/maps/binary/unicode/time modules extend it).
+    assert!(reg.len() >= 54, "the core roster is a subset of the registry");
     assert!(!reg.is_empty());
     assert_eq!(reg.len(), BifRegistry::with_core_bifs().len());
 
-    // `names()` must be *exactly* the roster (no extras, no omissions), sorted.
-    let expected: Vec<(String, String, u32)> = core_bif_names()
-        .into_iter()
-        .map(|(module, function, arity)| (module.to_string(), function.to_string(), arity))
-        .collect();
-    assert_eq!(reg.names(), expected);
+    // Every core key must be present, and `names()` must stay sorted.
+    let present: std::collections::HashSet<(String, String, u32)> =
+        reg.names().into_iter().collect();
+    for (module, function, arity) in core_bif_names() {
+        assert!(
+            present.contains(&(module.to_string(), function.to_string(), arity)),
+            "missing {module}:{function}/{arity}"
+        );
+    }
+    let names = reg.names();
+    assert!(names.windows(2).all(|w| w[0] <= w[1]), "names() is sorted");
 
     // Every key is individually resolvable, and `entries()` agrees with `len()`.
     for (module, function, arity) in core_bif_names() {

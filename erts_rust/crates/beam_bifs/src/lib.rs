@@ -36,19 +36,29 @@
 
 mod access;
 mod arith;
+mod binary;
+mod binconv;
+mod bits;
 mod compare;
 mod context;
+mod convert;
 mod error;
 mod ets;
 mod io;
+mod lists;
+mod maps;
 mod print;
 mod proc;
 mod reason;
 mod registry;
 mod term_ops;
+mod time;
 mod type_test;
+mod unicode;
 
-pub use crate::context::{BifContext, BytesSink, NullSink, OutputSink, SendHook, StdoutSink};
+pub use crate::context::{
+    AtomInterner, BifContext, BytesSink, NullSink, OutputSink, SendHook, StdoutSink,
+};
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
 pub use crate::reason::{exit_reason_from_term, reason_term_from_exit_reason};
@@ -62,7 +72,7 @@ pub use crate::registry::{default_registry, BifFn, BifRegistry};
 pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
-        reason_term_from_exit_reason, BifContext, BifFn, BifRegistry, BytesSink, NullSink,
-        OutputSink, SendHook, StdoutSink, TableRegistry,
+        reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
+        NullSink, OutputSink, SendHook, StdoutSink, TableRegistry,
     };
 }
