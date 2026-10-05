@@ -40,20 +40,7 @@
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.{c,h}`,
 //! `erl_proc_sig_queue.c`, `erl_monitor_link.c`, `erl_ptab.{c,h}`, `erl_process_dict.c`
 //! and `erl_vm.h`.
-//!
-//! # Status
-//!
-//! **STUB PASS.** Every public item below is declared exactly as the implementation pass
-//! will build it — names, signatures, derives and visibility match this directory's
-//! `CONTEXT.md` "API Surface (FROZEN)" section — but every function/method body is
-//! `unimplemented!("stub — to be implemented")` and every type carries a `// TODO(impl)`
-//! marker. The crate therefore defines the API surface without implementing any of it.
-//!
-//! Because the bodies are stubs, the usual "not yet used" lints fire on essentially every
-//! item, parameter and import in the crate. They are silenced here (and *only* here) for
-//! the duration of the stub pass and must be dropped when the implementations land.
 
-#![allow(dead_code, unused_variables, unused_imports)]
 #![warn(missing_docs)]
 
 pub mod link;
@@ -92,16 +79,4 @@ pub mod prelude {
     pub use crate::run_queue::*;
     pub use crate::scheduler::*;
     pub use crate::signal::*;
-}
-
-/// Panicking placeholder for the stub methods whose return type is `impl Iterator`.
-///
-/// The never type (`!`) does not yet implement `Iterator`, so an `unimplemented!()` body
-/// cannot serve as the hidden type of an `impl Iterator` return; naming a concrete
-/// (uninhabited in practice) iterator type keeps those signatures exactly as the
-/// implementation pass will publish them while still panicking on every call. Stub-pass
-/// scaffolding only — it disappears with the stubs.
-#[inline(never)]
-pub(crate) fn unimplemented_iter<T>() -> core::iter::Empty<T> {
-    unimplemented!("stub — to be implemented")
 }

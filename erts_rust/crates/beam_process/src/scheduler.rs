@@ -20,6 +20,7 @@ use beam_common::Result;
 use beam_term::prelude::Eterm;
 
 use crate::pid::ProcessId;
+use crate::process::ProcessState;
 use crate::progress::ThreadProgress;
 use crate::ptab::ProcessTable;
 use crate::run_queue::RunQueue;
@@ -56,8 +57,6 @@ pub trait ProcessRunner {
 }
 
 /// The single-scheduler run loop.
-//
-// TODO(impl): implement `Scheduler` (all bodies are stubs).
 pub struct Scheduler {
     run_queue: RunQueue,
     reductions_per_slice: u32,
@@ -68,42 +67,47 @@ pub struct Scheduler {
 impl Scheduler {
     /// A scheduler with [`DEFAULT_REDUCTIONS_PER_SLICE`] reductions per slice.
     pub fn new() -> Scheduler {
-        unimplemented!("stub — to be implemented")
+        Scheduler::with_slice(DEFAULT_REDUCTIONS_PER_SLICE)
     }
 
     /// A scheduler with an explicit per-slice reduction budget.
     pub fn with_slice(reductions_per_slice: u32) -> Scheduler {
-        unimplemented!("stub — to be implemented")
+        Scheduler {
+            run_queue: RunQueue::new(),
+            reductions_per_slice,
+            progress: ThreadProgress::new(),
+            slices: 0,
+        }
     }
 
     /// The per-slice reduction budget.
     pub fn reductions_per_slice(&self) -> u32 {
-        unimplemented!("stub — to be implemented")
+        self.reductions_per_slice
     }
 
     /// The run queue.
     pub fn run_queue(&self) -> &RunQueue {
-        unimplemented!("stub — to be implemented")
+        &self.run_queue
     }
 
     /// The run queue, mutably.
     pub fn run_queue_mut(&mut self) -> &mut RunQueue {
-        unimplemented!("stub — to be implemented")
+        &mut self.run_queue
     }
 
     /// Makes `pid` runnable by appending it to the run queue.
     pub fn enqueue(&mut self, pid: ProcessId) {
-        unimplemented!("stub — to be implemented")
+        self.run_queue.enqueue(pid);
     }
 
     /// The thread-progress tracker.
     pub fn progress(&self) -> &ThreadProgress {
-        unimplemented!("stub — to be implemented")
+        &self.progress
     }
 
     /// The thread-progress tracker, mutably.
     pub fn progress_mut(&mut self) -> &mut ThreadProgress {
-        unimplemented!("stub — to be implemented")
+        &mut self.progress
     }
 
     /// Runs at most one slice: pop one pid, run it, then requeue (`Yield`), drop
@@ -118,7 +122,38 @@ impl Scheduler {
         table: &mut ProcessTable,
         runner: &mut R,
     ) -> Result<Option<ProcessId>> {
-        unimplemented!("stub — to be implemented")
+        let Some(pid) = self.run_queue.dequeue() else {
+            return Ok(None);
+        };
+
+        // The process is off the queue and executing.
+        if let Some(process) = table.get_mut(pid) {
+            process.flags_mut().set_in_run_queue(false);
+            process.set_state(ProcessState::Running);
+        }
+
+        let outcome = runner.run(pid, table, self.reductions_per_slice)?;
+        self.slices = self.slices.wrapping_add(1);
+
+        match outcome {
+            RunOutcome::Yield => {
+                // Still runnable: back to the tail of the queue (round-robin fairness).
+                if let Some(process) = table.get_mut(pid) {
+                    process.flags_mut().set_in_run_queue(true);
+                    process.set_state(ProcessState::Runnable);
+                }
+                self.run_queue.enqueue(pid);
+            }
+            // The runner owns the state transition for a waiting/suspended process; the
+            // scheduler only takes it out of the ready queue.
+            RunOutcome::Wait | RunOutcome::Suspend => {}
+            RunOutcome::Exit(reason) => {
+                // Termination propagates to the process's links and monitors.
+                table.terminate(pid, reason)?;
+            }
+        }
+
+        Ok(Some(pid))
     }
 
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
@@ -133,6 +168,116 @@ impl Scheduler {
         runner: &mut R,
         max_slices: Option<u64>,
     ) -> Result<u64> {
-        unimplemented!("stub — to be implemented")
+        let mut executed: u64 = 0;
+        while !self.run_queue.is_empty() {
+            if let Some(max) = max_slices {
+                if executed >= max {
+                    break;
+                }
+            }
+            match self.run_slice(table, runner)? {
+                Some(_) => executed = executed.wrapping_add(1),
+                None => break,
+            }
+        }
+        Ok(executed)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the constructor defaults, the queue accessors and the
+    //! `max_slices`/empty-queue edge cases of [`Scheduler::run_ready`].
+
+    use super::*;
+
+    /// A runner that always yields, so a scheduler keeps cycling.
+    struct YieldRunner {
+        slices: u32,
+    }
+
+    impl ProcessRunner for YieldRunner {
+        fn run(
+            &mut self,
+            _pid: ProcessId,
+            _table: &mut ProcessTable,
+            budget: u32,
+        ) -> Result<RunOutcome> {
+            self.slices += 1;
+            assert_eq!(budget, DEFAULT_REDUCTIONS_PER_SLICE);
+            Ok(RunOutcome::Yield)
+        }
+    }
+
+    use crate::signal::SignalAtoms;
+    use beam_term::prelude::AtomTable;
+
+    fn table() -> ProcessTable {
+        ProcessTable::new(SignalAtoms::from_table(&mut AtomTable::new()))
+    }
+
+    #[test]
+    fn constructors_and_accessors() {
+        let scheduler = Scheduler::new();
+        assert_eq!(scheduler.reductions_per_slice(), DEFAULT_REDUCTIONS_PER_SLICE);
+        assert!(scheduler.run_queue().is_empty());
+        assert_eq!(scheduler.progress().generation(), 0);
+
+        let mut scheduler = Scheduler::with_slice(7);
+        assert_eq!(scheduler.reductions_per_slice(), 7);
+        scheduler.enqueue(ProcessId::new(1, 0));
+        assert_eq!(scheduler.run_queue().len(), 1);
+        assert!(scheduler.run_queue().contains(ProcessId::new(1, 0)));
+        assert_eq!(scheduler.progress_mut().bump(), 1);
+        assert_eq!(scheduler.progress().generation(), 1);
+        scheduler.run_queue_mut().clear();
+        assert!(scheduler.run_queue().is_empty());
+    }
+
+    #[test]
+    fn run_slice_on_an_empty_queue_does_nothing() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+        let mut runner = YieldRunner { slices: 0 };
+        assert_eq!(
+            scheduler
+                .run_slice(&mut table, &mut runner)
+                .expect("an empty queue cannot fail"),
+            None
+        );
+        assert_eq!(runner.slices, 0);
+    }
+
+    #[test]
+    fn run_ready_stops_at_max_slices() {
+        let mut scheduler = Scheduler::new();
+        let mut table = table();
+        let pid = table.spawn_default().expect("a fresh process");
+        scheduler.enqueue(pid);
+
+        let mut runner = YieldRunner { slices: 0 };
+        assert_eq!(
+            scheduler
+                .run_ready(&mut table, &mut runner, Some(2))
+                .expect("the runner never fails"),
+            2
+        );
+        assert_eq!(runner.slices, 2, "the runner ran exactly two slices");
+
+        // `Some(0)` runs nothing at all.
+        assert_eq!(
+            scheduler
+                .run_ready(&mut table, &mut runner, Some(0))
+                .expect("no slices cannot fail"),
+            0
+        );
+
+        // Without a bound the queue is drained (it never empties here, so bound it).
+        assert_eq!(
+            scheduler
+                .run_ready(&mut table, &mut runner, Some(3))
+                .expect("the runner never fails"),
+            3
+        );
     }
 }

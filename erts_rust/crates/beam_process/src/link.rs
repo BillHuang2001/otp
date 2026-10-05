@@ -14,8 +14,6 @@
 use crate::pid::ProcessId;
 
 /// The set of processes linked to one process.
-//
-// TODO(impl): implement `Links` (all bodies are stubs).
 pub struct Links {
     pids: Vec<ProcessId>,
 }
@@ -23,47 +21,101 @@ pub struct Links {
 impl Links {
     /// An empty link set.
     pub fn new() -> Links {
-        unimplemented!("stub — to be implemented")
+        Links { pids: Vec::new() }
     }
 
     /// The number of links.
     pub fn len(&self) -> usize {
-        unimplemented!("stub — to be implemented")
+        self.pids.len()
     }
 
     /// Whether the process has no links.
     pub fn is_empty(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.pids.is_empty()
     }
 
     /// Adds `pid`, returning `false` when it was already linked (the C refcount case that
     /// Milestone-1 collapses to a set).
     pub fn add(&mut self, pid: ProcessId) -> bool {
-        unimplemented!("stub — to be implemented")
+        if self.pids.contains(&pid) {
+            return false;
+        }
+        self.pids.push(pid);
+        true
     }
 
     /// Removes `pid`, reporting whether it was linked.
     pub fn remove(&mut self, pid: ProcessId) -> bool {
-        unimplemented!("stub — to be implemented")
+        match self.pids.iter().position(|&linked| linked == pid) {
+            Some(index) => {
+                self.pids.remove(index);
+                true
+            }
+            None => false,
+        }
     }
 
     /// Whether `pid` is linked.
     pub fn contains(&self, pid: ProcessId) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.pids.contains(&pid)
     }
 
     /// Iterates the linked pids.
     pub fn iter(&self) -> impl Iterator<Item = ProcessId> + '_ {
-        crate::unimplemented_iter()
+        self.pids.iter().copied()
     }
 
     /// Drops every link.
     pub fn clear(&mut self) {
-        unimplemented!("stub — to be implemented")
+        self.pids.clear();
     }
 
     /// Takes every linked pid, leaving the set empty.
     pub fn drain(&mut self) -> Vec<ProcessId> {
-        unimplemented!("stub — to be implemented")
+        core::mem::take(&mut self.pids)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `add` idempotence, `remove`, `contains`, iteration and `drain`.
+
+    use super::*;
+
+    fn pid(number: u64) -> ProcessId {
+        ProcessId::new(number, 0)
+    }
+
+    #[test]
+    fn add_is_idempotent_and_remove_reports_presence() {
+        let mut links = Links::new();
+        assert!(links.is_empty());
+        assert!(!links.contains(pid(1)));
+
+        assert!(links.add(pid(1)), "the first link is new");
+        assert!(!links.add(pid(1)), "re-linking is a no-op");
+        assert_eq!(links.len(), 1);
+        assert!(links.contains(pid(1)));
+
+        assert!(links.remove(pid(1)));
+        assert!(!links.remove(pid(1)));
+        assert!(links.is_empty());
+    }
+
+    #[test]
+    fn iter_and_drain_reflect_the_set() {
+        let mut links = Links::new();
+        links.add(pid(1));
+        links.add(pid(2));
+        assert_eq!(links.iter().collect::<Vec<_>>(), vec![pid(1), pid(2)]);
+
+        let drained = links.drain();
+        assert_eq!(drained, vec![pid(1), pid(2)]);
+        assert!(links.is_empty());
+
+        links.add(pid(3));
+        links.clear();
+        assert!(links.is_empty());
+        assert_eq!(links.iter().count(), 0);
     }
 }

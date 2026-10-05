@@ -8,6 +8,7 @@
 //!
 //! * an unknown pid/name/monitor reference ⇒ [`unknown_process`] (`TermNotFound`),
 //! * a malformed pid term or an out-of-range register index ⇒ [`bad_pid`] (`BadArg`),
+//! * an already-taken local name ⇒ [`name_taken`] (`BadArg`),
 //! * pid/port number-space exhaustion ⇒ [`system_limit`] (`SystemLimit`).
 //!
 //! Heap exhaustion during delivery is *not* modelled here: it is the underlying
@@ -23,6 +24,11 @@ pub(crate) fn unknown_process() -> BeamError {
 
 /// The error for a malformed pid/port term or an out-of-range register index (`badarg`).
 pub(crate) fn bad_pid() -> BeamError {
+    BeamError::BadArg
+}
+
+/// The error for a local name that is already registered (`badarg`).
+pub(crate) fn name_taken() -> BeamError {
     BeamError::BadArg
 }
 

@@ -13,9 +13,9 @@
 //! `erl_message.h` (`ERL_MESSAGE_*`) and `erl_gc.c` (`erts_garbage_collect`).
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{AllocKind, BeamError, Result};
 use beam_gc::{Collection, Collector, HeapPolicy};
-use beam_message::{Message, OffHeapTable, Queue};
+use beam_message::{CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
 use crate::link::Links;
@@ -45,8 +45,6 @@ pub enum ProcessState {
 /// These are the flags the Milestone-1 core reads directly: `trap_exit`, `system`,
 /// `in_run_queue`, `garbage_collecting` and `active`. The legacy C `F_*` word is far
 /// wider; the rest is a follow-up.
-//
-// TODO(impl): implement `ProcessFlags` (all bodies are stubs).
 pub struct ProcessFlags {
     bits: u32,
 }
@@ -65,67 +63,81 @@ const FLAG_ACTIVE: u32 = 1 << 4;
 impl ProcessFlags {
     /// No flags set.
     pub fn new() -> ProcessFlags {
-        unimplemented!("stub — to be implemented")
+        ProcessFlags { bits: 0 }
     }
 
     /// The raw bitset.
     pub fn bits(&self) -> u32 {
-        unimplemented!("stub — to be implemented")
+        self.bits
     }
 
     /// Rebuilds the flags from a raw bitset.
     pub fn from_bits(bits: u32) -> ProcessFlags {
-        unimplemented!("stub — to be implemented")
+        ProcessFlags { bits }
     }
 
     /// Whether the process traps exit signals (`process_flag(trap_exit, true)`).
     pub fn trap_exit(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.get(FLAG_TRAP_EXIT)
     }
 
     /// Sets the `trap_exit` flag.
     pub fn set_trap_exit(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.set(FLAG_TRAP_EXIT, value);
     }
 
     /// Whether the process belongs to a system/OS process (`system` flag).
     pub fn system(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.get(FLAG_SYSTEM)
     }
 
     /// Sets the `system` flag.
     pub fn set_system(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.set(FLAG_SYSTEM, value);
     }
 
     /// Whether the process is currently enqueued in a run queue.
     pub fn in_run_queue(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.get(FLAG_IN_RUN_QUEUE)
     }
 
     /// Sets the `in_run_queue` flag.
     pub fn set_in_run_queue(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.set(FLAG_IN_RUN_QUEUE, value);
     }
 
     /// Whether the process is currently being garbage collected.
     pub fn garbage_collecting(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.get(FLAG_GARBAGE_COLLECTING)
     }
 
     /// Sets the `garbage_collecting` flag.
     pub fn set_garbage_collecting(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.set(FLAG_GARBAGE_COLLECTING, value);
     }
 
     /// Whether the process is active (schedulable at all).
     pub fn active(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.get(FLAG_ACTIVE)
     }
 
     /// Sets the `active` flag.
     pub fn set_active(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.set(FLAG_ACTIVE, value);
+    }
+
+    /// Reads one flag bit.
+    fn get(&self, bit: u32) -> bool {
+        self.bits & bit != 0
+    }
+
+    /// Writes one flag bit.
+    fn set(&mut self, bit: u32, value: bool) {
+        if value {
+            self.bits |= bit;
+        } else {
+            self.bits &= !bit;
+        }
     }
 }
 
@@ -135,8 +147,6 @@ impl ProcessFlags {
 /// registers, reduction counter, links/monitors and exit reason. Signal delivery and GC
 /// entry also live here; everything that mutates **two** processes at once lives on
 /// [`crate::ptab::ProcessTable`] instead (see the crate `CONTEXT.md`, Design Decisions).
-//
-// TODO(impl): implement `Process` (all bodies are stubs).
 pub struct Process {
     /// This process's pid.
     pid: ProcessId,
@@ -171,7 +181,7 @@ impl Process {
     ///
     /// Propagates heap-allocation failure when the initial spaces cannot be allocated.
     pub fn new(pid: ProcessId) -> Result<Process> {
-        unimplemented!("stub — to be implemented")
+        Process::with_policy(pid, HeapPolicy::default())
     }
 
     /// A new process with pid `pid` and an explicit heap-size `policy`.
@@ -180,137 +190,154 @@ impl Process {
     ///
     /// Propagates heap-allocation failure when the initial spaces cannot be allocated.
     pub fn with_policy(pid: ProcessId, policy: HeapPolicy) -> Result<Process> {
-        unimplemented!("stub — to be implemented")
+        // A freshly spawned process is runnable and schedulable: mark the `active` flag so
+        // the rest of the runtime can tell a live PCB from a recycled slot.
+        let mut flags = ProcessFlags::new();
+        flags.set_active(true);
+        Ok(Process {
+            pid,
+            state: ProcessState::Runnable,
+            flags,
+            collector: Collector::new(policy)?,
+            off_heap: OffHeapTable::new(),
+            mailbox: Queue::new(),
+            regs: Registers::new(),
+            reductions: 0,
+            links: Links::new(),
+            monitors: Monitors::new(),
+            monitored_by: Vec::new(),
+            exit_reason: None,
+        })
     }
 
     /// This process's pid.
     pub fn pid(&self) -> ProcessId {
-        unimplemented!("stub — to be implemented")
+        self.pid
     }
 
     /// The scheduler-visible state.
     pub fn state(&self) -> ProcessState {
-        unimplemented!("stub — to be implemented")
+        self.state
     }
 
     /// Sets the scheduler-visible state.
     pub fn set_state(&mut self, state: ProcessState) {
-        unimplemented!("stub — to be implemented")
+        self.state = state;
     }
 
     /// The process's flags.
     pub fn flags(&self) -> &ProcessFlags {
-        unimplemented!("stub — to be implemented")
+        &self.flags
     }
 
     /// The process's flags, mutably.
     pub fn flags_mut(&mut self) -> &mut ProcessFlags {
-        unimplemented!("stub — to be implemented")
+        &mut self.flags
     }
 
     /// Whether the process traps exit signals (`trap_exit`).
     pub fn is_trapping_exit(&self) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.flags.trap_exit()
     }
 
     /// Sets the `trap_exit` flag.
     pub fn set_trap_exit(&mut self, value: bool) {
-        unimplemented!("stub — to be implemented")
+        self.flags.set_trap_exit(value);
     }
 
     /// Reductions consumed in the current time slice.
     pub fn reductions(&self) -> u64 {
-        unimplemented!("stub — to be implemented")
+        self.reductions
     }
 
     /// Adds `n` to the reduction counter.
     pub fn bump_reductions(&mut self, n: u64) {
-        unimplemented!("stub — to be implemented")
+        self.reductions = self.reductions.wrapping_add(n);
     }
 
     /// Resets the reduction counter to zero.
     pub fn reset_reductions(&mut self) {
-        unimplemented!("stub — to be implemented")
+        self.reductions = 0;
     }
 
     /// The young (mutator) heap — where this process allocates terms.
     pub fn heap(&self) -> &Heap {
-        unimplemented!("stub — to be implemented")
+        self.collector.young().heap()
     }
 
     /// The young (mutator) heap, mutably.
     pub fn heap_mut(&mut self) -> &mut Heap {
-        unimplemented!("stub — to be implemented")
+        self.collector.young_mut().heap_mut()
     }
 
     /// The mailbox.
     pub fn mailbox(&self) -> &Queue {
-        unimplemented!("stub — to be implemented")
+        &self.mailbox
     }
 
     /// The mailbox, mutably.
     pub fn mailbox_mut(&mut self) -> &mut Queue {
-        unimplemented!("stub — to be implemented")
+        &mut self.mailbox
     }
 
     /// The root-set containers.
     pub fn registers(&self) -> &Registers {
-        unimplemented!("stub — to be implemented")
+        &self.regs
     }
 
     /// The root-set containers, mutably.
     pub fn registers_mut(&mut self) -> &mut Registers {
-        unimplemented!("stub — to be implemented")
+        &mut self.regs
     }
 
     /// The process's off-heap (MSO) handles.
     pub fn off_heap(&self) -> &OffHeapTable {
-        unimplemented!("stub — to be implemented")
+        &self.off_heap
     }
 
     /// The process's off-heap (MSO) handles, mutably.
     pub fn off_heap_mut(&mut self) -> &mut OffHeapTable {
-        unimplemented!("stub — to be implemented")
+        &mut self.off_heap
     }
 
     /// The outgoing links.
     pub fn links(&self) -> &Links {
-        unimplemented!("stub — to be implemented")
+        &self.links
     }
 
     /// The outgoing links, mutably.
     pub fn links_mut(&mut self) -> &mut Links {
-        unimplemented!("stub — to be implemented")
+        &mut self.links
     }
 
     /// The outgoing monitors.
     pub fn monitors(&self) -> &Monitors {
-        unimplemented!("stub — to be implemented")
+        &self.monitors
     }
 
     /// The outgoing monitors, mutably.
     pub fn monitors_mut(&mut self) -> &mut Monitors {
-        unimplemented!("stub — to be implemented")
+        &mut self.monitors
     }
 
     /// The monitors watching this process.
     pub fn monitored_by(&self) -> &[MonitoredBy] {
-        unimplemented!("stub — to be implemented")
+        &self.monitored_by
     }
 
     /// The monitors watching this process, mutably.
     pub fn monitored_by_mut(&mut self) -> &mut Vec<MonitoredBy> {
-        unimplemented!("stub — to be implemented")
+        &mut self.monitored_by
     }
 
     /// The termination reason, once the process has exited.
     pub fn exit_reason(&self) -> Option<Eterm> {
-        unimplemented!("stub — to be implemented")
+        self.exit_reason
     }
 
     /// Sets the termination reason.
     pub fn set_exit_reason(&mut self, reason: Eterm) {
-        unimplemented!("stub — to be implemented")
+        self.exit_reason = Some(reason);
     }
 
     /// Copies `term` into this process's young heap — resolving off-heap references
@@ -325,7 +352,18 @@ impl Process {
     /// Propagates the underlying `BeamError::Alloc` if the copy still does not fit after a
     /// collection.
     pub fn deliver(&mut self, from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) -> Result<()> {
-        unimplemented!("stub — to be implemented")
+        match self.copy_message(from, term, src_off_heap) {
+            Ok(()) => Ok(()),
+            // A full young heap (or message table) is a normal condition: collect and
+            // retry exactly once. Any other failure is propagated untouched.
+            Err(BeamError::Alloc(failure))
+                if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
+            {
+                self.collect()?;
+                self.copy_message(from, term, src_off_heap)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// The no-off-heap convenience form of [`Process::deliver`].
@@ -335,7 +373,10 @@ impl Process {
     /// Propagates the underlying `BeamError::Alloc` if the copy still does not fit after a
     /// collection.
     pub fn deliver_simple(&mut self, from: Eterm, term: Eterm) -> Result<()> {
-        unimplemented!("stub — to be implemented")
+        // An empty source table: nothing to resolve, so the copy shares immediates and
+        // copies the rest verbatim.
+        let no_off_heap = OffHeapTable::new();
+        self.deliver(from, term, &no_off_heap)
     }
 
     /// Removes and returns the first queued message whose payload satisfies `pred`.
@@ -343,22 +384,22 @@ impl Process {
     /// Non-matching messages stay queued in FIFO order (selective receive). Returns `None`
     /// when nothing matches — actually *waiting* is the scheduler's job.
     pub fn receive<F: FnMut(&Message) -> bool>(&mut self, pred: F) -> Option<Message> {
-        unimplemented!("stub — to be implemented")
+        beam_message::receive(&mut self.mailbox, pred)
     }
 
     /// The process's garbage collector.
     pub fn collector(&self) -> &Collector {
-        unimplemented!("stub — to be implemented")
+        &self.collector
     }
 
     /// Whether the young heap can no longer satisfy `need_words` more words.
     pub fn should_collect(&self, need_words: usize) -> bool {
-        unimplemented!("stub — to be implemented")
+        self.collector.should_collect(need_words)
     }
 
     /// The number of words used in the young heap.
     pub fn heap_used_words(&self) -> usize {
-        unimplemented!("stub — to be implemented")
+        self.collector.young().used_words()
     }
 
     /// Runs a safepoint collection over the whole process root set.
@@ -372,7 +413,46 @@ impl Process {
     ///
     /// Propagates the collector's and the rebuilding allocations' `BeamError`s.
     pub fn collect(&mut self) -> Result<Collection> {
-        unimplemented!("stub — to be implemented")
+        // 1. The flat root slice: `x[0..live)`, then the whole stack, then one word per
+        //    queued mailbox payload. `reg_words` is where the mailbox roots start.
+        let mut roots: Vec<Eterm> = Vec::new();
+        let x_live = self.regs.gather_roots(&mut roots);
+        let reg_words = roots.len();
+
+        // 2. Drain the mailbox, appending each payload as a root. The messages themselves
+        //    are rebuilt below, because `Message` has no payload setter.
+        let mut drained: Vec<Message> = Vec::new();
+        while let Some(message) = self.mailbox.dequeue() {
+            roots.push(message.payload());
+            drained.push(message);
+        }
+
+        // 3. Collect. On failure the messages must not be silently lost, so put them back
+        //    before propagating (a collection of this heap cannot fail in practice: `collect`
+        //    escalates a would-not-fit minor to a major, which sizes its to-space up front).
+        let collection = match self.collector.collect(&mut roots) {
+            Ok(collection) => collection,
+            Err(error) => {
+                for message in drained {
+                    self.mailbox.enqueue(message);
+                }
+                return Err(error);
+            }
+        };
+
+        // 4. Write the (relocated) registers and stack words back.
+        self.regs.scatter_roots(&roots, x_live);
+
+        // 5. Rebuild every message around its relocated payload, preserving FIFO order.
+        let payloads = &roots[reg_words..];
+        for (index, message) in drained.into_iter().enumerate() {
+            let rebuilt = Message::new(payloads[index], message.from())
+                .with_token(message.token())
+                .with_off_heap(message.off_heap().to_vec());
+            self.mailbox.enqueue(rebuilt);
+        }
+
+        Ok(collection)
     }
 
     /// Collects first when `need` more words do not fit, then reports whether a collection
@@ -382,6 +462,198 @@ impl Process {
     ///
     /// Propagates the collector's errors.
     pub fn collect_if_needed(&mut self, need: usize) -> Result<bool> {
-        unimplemented!("stub — to be implemented")
+        if self.should_collect(need) {
+            self.collect()?;
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }
+
+    /// The copy half of [`Process::deliver`]: copies `term` into the young heap through the
+    /// shared copy engine and enqueues the resulting message.
+    ///
+    /// Destructures `self` so the young heap, the mailbox and the off-heap table can be
+    /// borrowed disjointly (a `&mut self` method cannot hold three simultaneous borrows).
+    fn copy_message(&mut self, from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) -> Result<()> {
+        let Process {
+            collector,
+            mailbox,
+            off_heap,
+            ..
+        } = self;
+        let to_heap = collector.young_mut().heap_mut();
+        // `send` drains `ctx`'s destination table into the message's off-heap list, so the
+        // process's own table is the per-message off-heap table here.
+        let mut ctx = CopyContext::new(src_off_heap, off_heap);
+        beam_message::send(from, term, to_heap, mailbox, &mut ctx)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the PCB: `ProcessFlags` bits, the state/flag/reduction accessors,
+    //! the link/monitor accessors and the collect policy. Message delivery and the full
+    //! safepoint collection are exercised by the `tests/` integration suite.
+
+    use beam_term::prelude::{make_small, AtomTable, NIL};
+
+    use super::*;
+    use crate::monitor::{Monitor, MonitorKind, RefAllocator};
+    use crate::signal::SignalAtoms;
+
+    fn pid(number: u64) -> ProcessId {
+        ProcessId::new(number, 0)
+    }
+
+    #[test]
+    fn flags_default_to_none_and_round_trip_through_bits() {
+        let mut flags = ProcessFlags::new();
+        assert_eq!(flags.bits(), 0);
+        assert!(!flags.trap_exit());
+        assert!(!flags.system());
+        assert!(!flags.in_run_queue());
+        assert!(!flags.garbage_collecting());
+        assert!(!flags.active());
+
+        flags.set_trap_exit(true);
+        flags.set_system(true);
+        flags.set_in_run_queue(true);
+        flags.set_garbage_collecting(true);
+        flags.set_active(true);
+        assert!(flags.trap_exit() && flags.system() && flags.in_run_queue());
+        assert!(flags.garbage_collecting() && flags.active());
+        assert_eq!(flags.bits(), 0b1_1111);
+
+        // Clearing one bit leaves the others alone (`system` is bit 1).
+        flags.set_system(false);
+        assert!(!flags.system());
+        assert!(flags.trap_exit());
+        assert_eq!(flags.bits(), 0b1_1101);
+
+        let rebuilt = ProcessFlags::from_bits(0b1_1101);
+        assert_eq!(rebuilt.bits(), flags.bits());
+        assert!(rebuilt.trap_exit());
+    }
+
+    #[test]
+    fn a_new_process_is_runnable_and_active() {
+        let process = Process::new(pid(1)).expect("the default heap allocates");
+        assert_eq!(process.pid(), pid(1));
+        assert_eq!(process.state(), ProcessState::Runnable);
+        assert!(process.flags().active());
+        assert!(!process.is_trapping_exit());
+        assert_eq!(process.reductions(), 0);
+        assert!(process.exit_reason().is_none());
+        assert!(process.mailbox().is_empty());
+        assert!(process.links().is_empty());
+        assert!(process.monitors().is_empty());
+        assert!(process.monitored_by().is_empty());
+        assert!(process.off_heap().is_empty());
+        assert_eq!(process.heap_used_words(), 0);
+    }
+
+    #[test]
+    fn state_flags_and_reductions_are_mutable() {
+        let mut process = Process::new(pid(2)).expect("the default heap allocates");
+        process.set_state(ProcessState::Waiting);
+        assert_eq!(process.state(), ProcessState::Waiting);
+
+        process.set_trap_exit(true);
+        assert!(process.is_trapping_exit());
+        process.flags_mut().set_system(true);
+        assert!(process.flags().system());
+
+        process.bump_reductions(5);
+        process.bump_reductions(7);
+        assert_eq!(process.reductions(), 12);
+        process.reset_reductions();
+        assert_eq!(process.reductions(), 0);
+
+        process.set_exit_reason(make_small(9));
+        assert_eq!(process.exit_reason(), Some(make_small(9)));
+    }
+
+    #[test]
+    fn link_and_monitor_sets_are_reachable_through_the_pcb() {
+        let mut process = Process::new(pid(3)).expect("the default heap allocates");
+        assert!(process.links_mut().add(pid(4)));
+        assert!(process.links().contains(pid(4)));
+
+        let reference = RefAllocator::new().next();
+        process.monitors_mut().push(Monitor {
+            reference,
+            target: pid(4),
+            kind: MonitorKind::Process,
+        });
+        assert_eq!(process.monitors().find(reference).map(|m| m.target), Some(pid(4)));
+
+        process.monitored_by_mut().push(MonitoredBy {
+            reference,
+            watcher: pid(5),
+            kind: MonitorKind::Process,
+        });
+        assert_eq!(process.monitored_by().len(), 1);
+        assert_eq!(process.monitored_by()[0].watcher, pid(5));
+    }
+
+    #[test]
+    fn collect_policy_tracks_the_young_heap_capacity() {
+        let process = Process::new(pid(6)).expect("the default heap allocates");
+        // A fresh nursery cannot satisfy an absurd request ...
+        assert!(process.should_collect(usize::MAX / 2));
+        // ... but a small one fits.
+        assert!(!process.should_collect(1));
+        assert_eq!(process.heap_used_words(), 0);
+    }
+
+    #[test]
+    fn collect_reclaims_with_an_empty_mailbox_and_no_roots() {
+        let mut process = Process::new(pid(7)).expect("the default heap allocates");
+        // Allocate an unreferenced term (garbage), then collect: it is not rooted, so the
+        // young heap comes back empty.
+        process
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("the tuple fits");
+        assert!(process.heap_used_words() > 0);
+
+        let collection = process.collect().expect("the collection succeeds");
+        assert!(collection.stats.words_reclaimed > 0);
+        assert_eq!(process.heap_used_words(), 0);
+        assert!(process.mailbox().is_empty());
+
+        // `collect_if_needed` only runs when the heap cannot satisfy the request.
+        assert!(!process
+            .collect_if_needed(1)
+            .expect("a tiny request needs no collection"));
+    }
+
+    #[test]
+    fn deliver_simple_enqueues_an_immediate_message() {
+        let mut process = Process::new(pid(8)).expect("the default heap allocates");
+        let from = pid(9).to_eterm();
+        process
+            .deliver_simple(from, make_small(41))
+            .expect("an immediate always fits");
+        assert_eq!(process.mailbox().len(), 1);
+
+        let message = process
+            .receive(|m| m.payload() == make_small(41))
+            .expect("the queued message matches");
+        assert_eq!(message.from(), from);
+        assert_eq!(message.token(), NIL);
+        assert!(process.mailbox().is_empty());
+        assert!(process.receive(|_| true).is_none(), "the mailbox is empty again");
+    }
+
+    #[test]
+    fn signal_atoms_are_usable_from_a_plain_table() {
+        // Guards the `SignalAtoms` seam the table depends on (the atom indices are stable
+        // for a freshly built table).
+        let mut table = AtomTable::new();
+        let atoms = SignalAtoms::from_table(&mut table);
+        assert_eq!(table.name(atoms.exit()), Some("EXIT"));
+        assert_eq!(table.name(atoms.kill()), Some("kill"));
     }
 }
