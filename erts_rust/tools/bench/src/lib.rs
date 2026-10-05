@@ -44,6 +44,7 @@ pub mod proc;
 pub mod report;
 pub mod run;
 pub mod runtime;
+pub mod scratch;
 pub mod stats;
 pub mod workload;
 pub mod workloads;
