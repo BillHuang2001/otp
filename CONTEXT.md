@@ -46,3 +46,4 @@ Monorepo for Erlang/OTP (release `30.0-rc0` per `OTP_VERSION`; ERTS runtime vers
 
 ## See Also
 - Root dev-tool config: `.elp.toml` (Erlang Language Platform), `erlang_ls.config`, `renovate.json5`, `.editorconfig`, `.formatter.exs`, `.dir-locals.el`, `.gitpod.yml`.
+- `ERTS_RUST_REWRITE_EVALUATION.md` → engineering evaluation of a hypothetical Rust rewrite of ERTS/BEAM (Level 1: BEAM-asm drop-in vs Level 2: source/AST compat), incl. the ERTS compatibility surface, JIT/GC/data-structure/I-O technology survey, and a recommended incremental strategy. Analytical document only — no code.
