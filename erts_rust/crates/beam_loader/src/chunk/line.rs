@@ -10,7 +10,13 @@
 //! chunk is usable.
 use beam_common::Result;
 
-use crate::ir::LineTable;
+use crate::error::bad_file;
+use crate::ir::{LineEntry, LineTable};
+
+/// The `TAG_i` line-item tag (`beam_file.c`): the item carries a line number.
+const TAG_I: u8 = 1;
+/// The `TAG_a` line-item tag (`beam_file.c`): the item carries a file-name index.
+const TAG_A: u8 = 2;
 
 /// Parses a `Line` chunk payload into the IR [`LineTable`].
 ///
@@ -18,10 +24,179 @@ use crate::ir::LineTable;
 /// other than 0 means the chunk is ignored and a default (empty) table is
 /// returned; a truncated or otherwise malformed chunk yields
 /// `BeamError::BadArg`.
-// TODO(beam_loader-impl): read the header, synthesize the undefined `items[0]` and
-// TODO(beam_loader-impl): `<module_name>.erl` as `files[0]`, then decode the tagged
-// TODO(beam_loader-impl): location items and the UTF-8 file-name table.
 pub fn parse(data: &[u8], module_name: &str) -> Result<LineTable> {
-    let _ = (data, module_name);
-    Err(beam_common::BeamError::BadArg)
+    let mut reader = beam_codec::Reader::new(data);
+
+    let version = reader.u32be()?;
+    if version != 0 {
+        // An unknown line-chunk version means "no line information".
+        return Ok(LineTable::default());
+    }
+
+    let flags = reader.u32be()?;
+    let instruction_count = reader.u32be()?;
+    let item_count = reader.u32be()?;
+    let name_count = reader.u32be()?;
+
+    // The zeroth item is always the implicit "undefined location"; the wire stream
+    // then carries `item_count` tagged items (a `TAG_a` sets the current file-name
+    // index, a `TAG_i` records the line of the next instruction).
+    let mut items = vec![LineEntry::default()];
+    let mut current_name: u32 = 0;
+    for _ in 0..item_count {
+        let (tag, magnitude, _) = crate::decode::read_tagged(&mut reader)?;
+        match tag {
+            TAG_A => {
+                // The name table is off by one (index 0 is the module name), so the
+                // bound is inclusive (`beam_file.c:517`).
+                if magnitude > name_count as u64 {
+                    return Err(bad_file("line name index out of range"));
+                }
+                current_name = magnitude as u32;
+            }
+            TAG_I => {
+                items.push(LineEntry {
+                    file: current_name,
+                    line: magnitude as u32,
+                });
+            }
+            _ => return Err(bad_file("illegal line item tag")),
+        }
+    }
+
+    // `files[0]` is the implicit `<module>.erl`; the chunk then carries `name_count`
+    // `{ u16be len, len bytes UTF-8 }` table entries.
+    let mut files = vec![format!("{module_name}.erl")];
+    for _ in 0..name_count {
+        let len = reader.u16be()? as usize;
+        let bytes = reader.bytes(len)?;
+        let name = std::str::from_utf8(bytes).map_err(|_| bad_file("line file name is not UTF-8"))?;
+        files.push(name.to_string());
+    }
+
+    Ok(LineTable {
+        flags,
+        instruction_count,
+        items,
+        files,
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_common::BeamError;
+
+    /// Builds a `Line` chunk from the header fields and a raw item stream.
+    fn line_bytes(
+        version: u32,
+        flags: u32,
+        instr_count: u32,
+        item_count: u32,
+        name_count: u32,
+        items: &[u8],
+        names: &[&str],
+    ) -> Vec<u8> {
+        let mut data = Vec::new();
+        for v in [version, flags, instr_count, item_count, name_count] {
+            data.extend_from_slice(&v.to_be_bytes());
+        }
+        data.extend_from_slice(items);
+        for name in names {
+            data.extend_from_slice(&(name.len() as u16).to_be_bytes());
+            data.extend_from_slice(name.as_bytes());
+        }
+        data
+    }
+
+    #[test]
+    fn parses_a_line_table_without_file_names() {
+        // Five `TAG_i` items with values 4, 6, 8, 9, 11 (nibble-packed: 0x?1).
+        let items = [0x41u8, 0x61, 0x81, 0x91, 0xb1];
+        let data = line_bytes(0, 0, 7, 5, 0, &items, &[]);
+        let table = parse(&data, "slice").unwrap();
+
+        assert_eq!(table.flags, 0);
+        assert_eq!(table.instruction_count, 7);
+        assert_eq!(table.items.len(), 6);
+        assert_eq!(table.items[0], LineEntry::default());
+        assert_eq!(
+            table.items[1..],
+            [
+                LineEntry { file: 0, line: 4 },
+                LineEntry { file: 0, line: 6 },
+                LineEntry { file: 0, line: 8 },
+                LineEntry { file: 0, line: 9 },
+                LineEntry { file: 0, line: 11 },
+            ]
+        );
+        assert_eq!(table.files, vec!["slice.erl".to_string()]);
+    }
+
+    #[test]
+    fn tag_a_sets_the_current_file_index() {
+        // 0x12 ⇒ TAG_a with magnitude 1 (file index 1); 0x41 ⇒ TAG_i line 4.
+        let items = [0x12u8, 0x41];
+        let data = line_bytes(0, 0, 1, 2, 1, &items, &["other.erl"]);
+        let table = parse(&data, "mod").unwrap();
+        assert_eq!(table.items.len(), 2);
+        assert_eq!(table.items[1], LineEntry { file: 1, line: 4 });
+        assert_eq!(
+            table.files,
+            vec!["mod.erl".to_string(), "other.erl".to_string()]
+        );
+    }
+
+    #[test]
+    fn zero_items_yields_only_the_undefined_location() {
+        let data = line_bytes(0, 0, 0, 0, 0, &[], &[]);
+        let table = parse(&data, "mod").unwrap();
+        assert_eq!(table.items, vec![LineEntry::default()]);
+    }
+
+    #[test]
+    fn nonzero_version_is_ignored() {
+        let data = line_bytes(1, 0, 7, 5, 0, &[0x41], &[]);
+        let table = parse(&data, "slice").unwrap();
+        assert_eq!(table, LineTable::default());
+    }
+
+    #[test]
+    fn illegal_item_tag_is_rejected() {
+        // 0x03 ⇒ tag 3, which is neither TAG_a nor TAG_i.
+        let data = line_bytes(0, 0, 1, 1, 0, &[0x03], &[]);
+        let err = parse(&data, "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn out_of_range_name_index_is_rejected() {
+        // TAG_a magnitude 1 with name_count 0.
+        let data = line_bytes(0, 0, 1, 1, 0, &[0x12], &[]);
+        let err = parse(&data, "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn truncated_item_stream_is_rejected() {
+        // item_count 5 but only two item bytes are present.
+        let data = line_bytes(0, 0, 7, 5, 0, &[0x41, 0x61], &[]);
+        let err = parse(&data, "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn truncated_header_is_rejected() {
+        let err = parse(&[0, 0, 0, 0], "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn non_utf8_file_name_is_rejected() {
+        let mut data = line_bytes(0, 0, 0, 0, 1, &[], &[]);
+        data.extend_from_slice(&1u16.to_be_bytes());
+        data.push(0xFF);
+        let err = parse(&data, "mod").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
 }
