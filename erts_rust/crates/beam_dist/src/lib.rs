@@ -6,12 +6,17 @@
 //! client — compatibility contract Part I §A.5 (the distribution wire) and the
 //! Stage-0 foundations of Part II §H.
 //!
-//! The crate is **pure protocol/value code over an abstract transport**: it never
-//! opens a socket (`beam_io` owns transports; `beam_rt` drives node startup). It
-//! owns the *distribution-specific* wire — the flag/opcode vocabulary
-//! ([`flags`]), the connect/challenge handshake ([`handshake`]), the
-//! packet-length framing ([`framing`]), the distribution-header envelope
-//! ([`dist_header`]) and the control-message codec ([`control`]). Term
+//! The core is **pure protocol/value code over the abstract
+//! [`transport`] seam** — the codecs never open a socket themselves. The
+//! [`connection`] module adds a concrete `std::net::TcpStream` adapter and
+//! drives a live distribution link end-to-end (handshake, `DOP_*` messages,
+//! fragmentation), so the runtime has a usable API; the production transport is
+//! still owned by `beam_io`. The crate owns the *distribution-specific* wire —
+//! the flag/opcode vocabulary ([`flags`]), the connect/challenge handshake
+//! ([`handshake`]) and its MD5 authentication ([`auth`]), the packet-length
+//! framing ([`framing`]), the distribution-header envelope ([`dist_header`]),
+//! message fragmentation ([`fragment`]), the atom-cache/segment machinery
+//! ([`atom_cache`]) and the control-message codec ([`control`]). Term
 //! encoding/decoding is **never re-implemented here**: every term crosses the
 //! wire through `beam_codec` (ETF).
 //!
@@ -48,6 +53,13 @@ pub use crate::handshake::{
     ChallengeReply, ChallengeSource, Complement, Name, Status,
 };
 pub use crate::transport::{MemoryTransport, Transport};
+
+pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache, SegmentCache};
+pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest, SystemChallengeSource};
+pub use crate::connection::{accept_server, connect_client, Connection, Handshake, TcpTransport};
+pub use crate::fragment::{
+    Assembly, FragmentAssembler, FragmentCont, FragmentHeader, DIST_FRAGMENT_SIZE,
+};
 
 /// The distribution protocol version implemented by this crate (the OTP 23+
 /// handshake, `EI_DIST_6`).

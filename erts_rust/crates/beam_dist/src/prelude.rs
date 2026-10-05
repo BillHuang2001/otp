@@ -15,4 +15,11 @@ pub use crate::framing::{is_tick, read_packet, write_packet, write_tick, PacketH
 pub use crate::handshake::*;
 pub use crate::transport::{MemoryTransport, Transport};
 
+pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
+pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest};
+pub use crate::connection::{accept_server, connect_client, Connection, TcpTransport};
+pub use crate::fragment::{
+    Assembly, FragmentAssembler, FragmentCont, FragmentHeader, DIST_FRAGMENT_SIZE,
+};
+
 pub use crate::flags::{DistFlags, Dop};
