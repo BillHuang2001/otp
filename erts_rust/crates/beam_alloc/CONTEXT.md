@@ -100,7 +100,7 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   `unsafe` block a preceding `// SAFETY:` rationale (`../beam_common/src/safety.rs` convention).
   `size_class`, `registry`, `stats`, `strategy`, `error` must be safe Rust. `unsafe_op_in_unsafe_fn`
   stays clean (workspace lint).
-- **Carriers come from the OS via `libc::mmap`** (anonymous, private) and are `munmap`'d when empty
+- **Carriers come from the OS via `libc::mmap`** (anonymous, private) and are `munmap`'d on free/drop
   — the carrier *is* the OS-level block (legacy `erts_mmap`/mseg). `mmap` failure ⇒
   `AllocFailure{kind: Carrier}`. Page-aligned carriers are relied on for block→carrier recovery.
 - **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — and
