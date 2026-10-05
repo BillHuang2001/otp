@@ -74,6 +74,7 @@ There are currently **no `.cpp` files directly in `beam/`** (the `BEAM_CPP_SRC` 
 - `beam_debug.c` is the byte-code disassembler, not the `-D` debug print facility (that is `erl_debug.c`).
 - Symbol names in `erl_etp.c`, `erl_debugger.c` and `erl_assert`-adjacent debug helpers are relied upon by debugger scripts and `erts_debug`; keep them stable.
 - Same-looking names exist in child dirs (`beam/emu/*.tab`, `beam/jit/*/ops.tab`) — the `beam/predicates.tab` and `beam/generators.tab` here are the shared ones.
+- `driver_select()` and `enif_select()`/`enif_select_x()` are NOT implemented here: the fd/pollset registration and the ready-event → `ERTS_PORT_TASK_INPUT`/`ERTS_PORT_TASK_OUTPUT` scheduling live in `../sys/common/erl_check_io.c` (see `../internal_doc/CheckIO.md`). This node owns the port-task queues (`erl_port_task.c`), the driver callback invocation (`ready_input`/`ready_output` in `erl_port_task_execute`), and the driver-API functions (mostly in `io.c`, but `driver_async` is in `erl_async.c`).
 
 ## Notes for Agents
 - Authoritative design docs, read before changing internals: `../internal_doc/GarbageCollection.md`, `DelayedDealloc.md`, `CarrierMigration.md`, `SuperCarrier.md`, `PTables.md`, `ThreadProgress.md`, `PortSignals.md`, `ProcessManagementOptimizations.md`, `CheckIO.md`, `Tracing.md`, `CodeLoading.md`, `CountingInstructions.md`, `AutomaticYieldingOfCCode.md`, `beam_makeops.md` (also `BeamAsm.md` for the JIT in `jit/`).
