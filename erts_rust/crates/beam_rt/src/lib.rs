@@ -17,10 +17,10 @@
 //! * [`cli`] — the A.6 parser ([`cli::parse`]), the usage text and the [`cli::run`] driver.
 //! * [`boot`] — the preloaded-module registry skeleton (A.7), the atom seed and the version banner.
 //! * [`info`] — `system_info/1` (A.8) as a heap-free [`InfoValue`] plus its materialization.
-//! * [`eval`] — the documented `-eval` integer subset, evaluated through the `erlang` BIFs.
+//! * [`eval`] — the `-eval` Erlang expression parser and `erl_eval`-style evaluator.
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
-//!   `erlang:apply`, `init:get_argument`) consulted before the registry.
+//!   `erlang:apply`, `erlang:system_info`, `init:get_argument`) consulted before the registry.
 //!
 //! # Contracts
 //!

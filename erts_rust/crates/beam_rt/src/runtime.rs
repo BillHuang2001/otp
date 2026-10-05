@@ -37,7 +37,6 @@ use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::error;
-use crate::eval;
 use crate::format;
 use crate::info::{self, InfoValue};
 
@@ -403,24 +402,23 @@ impl Runtime {
         info::system_info_value(key, self)
     }
 
-    /// Evaluates the documented `-eval` integer subset (contract A.6).
+    /// Evaluates a general Erlang expression (contract A.6).
     ///
-    /// The result is built on the process heap, so it stays valid for the runtime's
-    /// lifetime.
+    /// The expression is parsed and evaluated by the `erl_eval`-style tree-walker in
+    /// [`crate::eval`], dispatched through the same [`RuntimeContext`] the vertical slice
+    /// uses — so arithmetic, comparison and every call reach the `beam_bifs` registry
+    /// (or the load-on-demand stdlib) with their exact `erl` semantics. The result is
+    /// built on the process heap, so it stays valid for the runtime's lifetime.
     ///
     /// # Errors
     ///
-    /// A diagnostic for an expression outside the subset, plus the arithmetic errors of
-    /// the dispatched `erlang` BIFs.
+    /// A diagnostic for an expression outside the grammar ([`crate::error::bad_eval`],
+    /// a capability gap), whatever a called BIF/module raised, a raise of the evaluated
+    /// expression itself (including the uncatchable `erlang:halt/0,1`), or a documented
+    /// Milestone-1 gap.
     pub fn eval(&mut self, expr: &str) -> Result<Eterm> {
-        let Runtime {
-            registry,
-            heap,
-            code_server,
-            self_pid,
-            ..
-        } = self;
-        eval::eval(expr, registry, heap, code_server.atoms(), *self_pid)
+        let mut ctx = RuntimeContext::new(&mut *self);
+        crate::eval::eval(&mut ctx, expr)
     }
 
     /// Prints `term` through the registered `io:format/2` `~p` printer.
@@ -630,7 +628,10 @@ mod tests {
         assert_eq!(signed_value(rt.eval("2+3").expect("2+3")), 5);
         assert_eq!(signed_value(rt.eval("2*3+4").expect("2*3+4")), 10);
         assert_eq!(signed_value(rt.eval("(1+2)*3").expect("(1+2)*3")), 9);
-        assert!(rt.eval("nope").is_err());
+        // A bare atom is a value; only something outside the grammar is an error.
+        let atom = rt.eval("nope").expect("an atom evaluates to itself");
+        assert_eq!(rt.atom_name_of(atom), Some("nope"));
+        assert!(rt.eval("1 +").is_err());
     }
 
     #[test]
