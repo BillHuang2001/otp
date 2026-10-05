@@ -139,16 +139,27 @@ opt(StMap, FuncDb) ->
         [[io_lib:format("  ~p in ~s: ~p~n", [Var,ff(F),Info])
           || {F,Var,Info} <- ValuesToTrack]]),
 
-    try
-        %% Find initial values.
-        {InitialsToPatch,ForceCopy} = find_initial_values(ValuesToTrack, StMap, FuncDb),
-        %% Patch instructions and initial values.
-        patch_instructions(Applicable, InitialsToPatch,
-                           ForceCopy, StMap, FuncDb)
-    catch
-        throw:too_deep ->
-            %% Give up and leave the module unmodified.
-            {StMap,FuncDb}
+    Result =
+        try
+            %% Find initial values.
+            {InitialsToPatch,ForceCopy} = find_initial_values(ValuesToTrack, StMap, FuncDb),
+            %% Patch instructions and initial values.
+            patch_instructions(Applicable, InitialsToPatch,
+                               ForceCopy, StMap, FuncDb)
+        catch
+            throw:too_deep ->
+                %% Give up and leave the module unmodified.
+                {StMap,FuncDb}
+        end,
+    case get('$fbip_opt') of
+        true ->
+            %% Opt-in FBIP pass (enabled by the +fbip_opt option; flagged
+            %% by beam_ssa_opt:late_epilogue_passes/1). Runs after the
+            %% regular alias and destructive-update transforms.
+            {StMap1,FuncDb1} = Result,
+            beam_ssa_fbip:opt(StMap1, FuncDb1);
+        _ ->
+            Result
     end.
 
 find_applicable_instructions(Funs, StMap) ->

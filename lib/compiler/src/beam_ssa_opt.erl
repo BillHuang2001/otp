@@ -364,6 +364,11 @@ early_epilogue_passes(Opts) ->
     passes_1(Ps, Opts).
 
 late_epilogue_passes(Opts) ->
+    %% Record whether the opt-in FBIP pass should run. This function is
+    %% evaluated while the phase list is built (before any pass runs), so
+    %% the flag is available to beam_ssa_destructive_update:opt/2, which
+    %% invokes beam_ssa_fbip:opt/2.
+    put('$fbip_opt', member(fbip_opt, Opts)),
     Ps = [%% Run live one more time to clean up after the previous
           %% epilogue passes.
           ?PASS(ssa_opt_live),
