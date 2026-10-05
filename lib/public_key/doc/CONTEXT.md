@@ -32,6 +32,9 @@ Sources here are pure markdown — no XML/`doc/src` tree — and are consumed by
 - No tests here; doc correctness is enforced at build time by ExDoc link/reference warnings (`make docs`, `EX_DOC_WARNINGS_AS_ERRORS=default`).
 - The `documentation.md` section of `../../system/doc/reference_manual/` is the canonical guide for how these markdown/ExDoc sources must be written.
 
+## Routing Table
+- `guides/` → The two hand-written extras: the public-key records reference and the user's guide (with the externally linked anchor contract); see `guides/CONTEXT.md`.
+
 ## See Also
 - `../src/` — module and `-doc` sources that generate the API reference for this app.
 - `../CONTEXT.md` — the `public_key` application as a whole.
