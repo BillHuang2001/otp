@@ -141,6 +141,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
   materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
   to (de-duplication). Rationale: `beam_term` is a dependency sink, so writers take a caller-provided
   `*mut Eterm`; allocation stays in `beam_alloc`.
+- **Stage-1 baseline JIT mechanism shipped (`beam_engine`).** `src/jit/baseline.rs` implements the `JitBackend` seam: it lowers each typed-IR basic block to a real x86-64 `extern "C"` function (block ABI: return `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; ≤4 x-registers cached in `r12`–`r15` with an exit spill, `rbx` = x-register array base) and runs an export through a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. `Tier::BaselineJit` now routes natively; `Tier::Interpreter` is unchanged. Correctness is the deliverable (interpreter-identical results, `tests/jit.rs` + `tests/jit_coverage.rs`); inlining/performance and a cross-run code cache are later tasks.
 - **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`.
 
 ## Known Structural Debt (candidates for the next pass)
