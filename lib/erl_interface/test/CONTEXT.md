@@ -86,7 +86,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 - `ei_format_SUITE_data/` → `ei_format_test.c` (`erl_format()` cases)
 - `ei_print_SUITE_data/` → `ei_print_test.c` (`ei_print()`/`ei_s_print_term` cases)
 - `ei_tmo_SUITE_data/` → `ei_tmo_test.c` (timeout cases driven by Erlang handshakes)
-- `ei_global_SUITE_data/` → `ei_global_test.c` (global register/whereis/names cases; links `liberl_interface.a` and `my_ussi.o`)
+- `ei_global_SUITE_data/` → `ei_global_test.c` (global register/whereis/names cases; its `Makefile.src` links `$(LIBEI)` = `libei.a` plus `../all_SUITE_data/ei_runner.o` and `my_ussi.o`)
 - `port_call_SUITE_data/` → `port_call_drv.c`, a shared library (`@SHLIB_RULES@`) loaded with `erl_ddll` from the data dir
 - `Makefile` → suite list (`EI_MODULES`), `ERTS_MODULES`, `SPEC_FILES`, `COVER_FILE`, `RELSYSDIR` install target (no `Makefile.first`); `Makefile.src` → dead legacy template (see Known Issues)
 - `runner.erl` → Erlang-side driver for the C test programs
