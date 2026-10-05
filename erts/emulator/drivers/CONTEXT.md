@@ -13,7 +13,7 @@ Non-static (loadable) drivers can also be appended to the same table via `--enab
 
 Live drivers:
 - `common/inet_drv.c` → symbol `inet_driver_entry`, driver name `"inet"`.
-  Its `init` (run at emulator startup, thanks to `driver_tab`) registers `"tcp_inet"`, `"udp_inet"` and (when `HAVE_SCTP`) `"sctp_inet"`, then removes the placeholder `"inet"` entry; on win32 it also installs `dummy_*` entries so that opening an unsupported driver fails cleanly instead of with `badarg` from a missing name.
+  Its `init` (run at emulator startup, thanks to `driver_tab`) registers `"tcp_inet"`, `"udp_inet"` and (when `HAVE_SCTP`) `"sctp_inet"`, then removes the placeholder `"inet"` entry; the win32-only `dummy_tcp/udp/sctp_driver_entry` structs (`inet_drv.c:2196`, `:2212`, `:2229`) are **never** `add_driver_entry`-ed — dead code, so an absent driver still fails as a missing name.
   Consumed by the preloaded module `../../preloaded/src/prim_inet.erl` (`protocol2drv/1` maps `tcp|mptcp`→`tcp_inet`, `udp`→`udp_inet`, `sctp`→`sctp_inet`) and thereby by `lib/kernel`'s `gen_tcp`/`gen_udp`/`gen_sctp`, `inet_tcp`/`inet_udp`/`inet_sctp` and the `local_tcp`/`local_udp` (AF_LOCAL) backends; the newer `socket` API is *not* served here (it is `../nifs/common/prim_socket_nif.c`).
   The driver's control commands are the private `prim_inet` protocol (`ctl_cmd`), and it replies with `{inet_reply, ...}` / `{inet_async, ...}` terms rather than via NIF returns.
 - `common/ram_file_drv.c` → symbol `ram_file_driver_entry`, driver name `"ram_file_drv"`.
@@ -41,7 +41,8 @@ Live drivers:
 ## Known Issues / Gotchas
 - `unix/bin_drv.c`, `unix/multi_drv.c` and `unix/sig_drv.c` are dead legacy examples: they use K&R prototypes, `multi_drv.c` uses the pre-`ERL_DRV_EXTENDED_MARKER` entry layout, and `sig_drv.c` calls `driver_interrupt`/implicit-int `doio` — none of them would compile against the current `erl_driver.h`. Do not assume a `.c` file here is built just because it exists; the globs `DRV_COMMON_SRC`/`DRV_OSTYPE_SRC` feed only `.depend`/`compile_commands.json`, while `DRV_OBJS` decides what gets linked.
 - `vxworks/` is stale/unsupported: nothing in the emulator build or configure references vxworks any more, and the file targets a removed header.
-- `inet_drv.c` is ~15.9k lines and by far the largest source of port/driver behaviour in the VM; it is the file to read for socket semantics, but avoid wholesale reformatting (huge conflict surface).
+- `inet_drv.c` is 15879 lines and by far the largest source of port/driver behaviour in the VM; it is the file to read for socket semantics, but avoid wholesale reformatting (huge conflict surface).
+- `inet_drv.c` uses **no async threads**: the string `driver_async` occurs 0 times and every `ready_async` field is NULL. All I/O is non-blocking sockets driven by `driver_select` readiness plus an internal async-op queue (`INET_MAX_ASYNC = 1` ring at `inet_drv.c:1069`/`:1252` plus an unbounded multi-accept list). `driver_output_term` is also never used — all term replies go through `erl_drv_send_term`.
 - Both link-time state (`driver_tab`, `inet_driver_entry`'s init) and runtime dynamism (`add_driver_entry`/`remove_driver_entry`) are involved, so a driver's presence at runtime is not visible from the table alone.
 - Drivers are statically linked and therefore cannot be unloaded or reloaded at runtime; recompiling any of them requires exiting and restarting the emulator.
 - Driver naming is the ABI used by Erlang code (`"tcp_inet"`, `"ram_file_drv"`, `"registry__drv__"` with its double-underscore suffix); changing a `driver_name` breaks the matching Erlang module silently at runtime, not at build time.
@@ -75,9 +76,9 @@ Live drivers:
 - `../../test/` → erts-level port/launcher suites; `../../preloaded/src/prim_inet.erl` → the Erlang half of the inet driver
 
 ## Routing Table
-- `common/` → platform-independent drivers: `inet_drv.c` (`inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (`ram_file_drv`)
-- `unix/` → unix-specific driver sources: `bin_drv.c`, `multi_drv.c`, `sig_drv.c` — all legacy and not in `DRV_OBJS` (nothing to debug in the live VM here)
-- `win32/` → win32-specific driver: `registry_drv.c` (`registry__drv__`), used by `lib/stdlib` `win32reg`
+- `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (534 lines; `ram_file_drv`)
+- `unix/` → unix-specific driver sources: `bin_drv.c` (227), `multi_drv.c` (108), `sig_drv.c` (84) — all legacy and not in `DRV_OBJS` (nothing to debug in the live VM here)
+- `win32/` → win32-specific driver: `registry_drv.c` (~556 lines; `registry__drv__`), used by `lib/stdlib` `win32reg`
 - `vxworks/` → stale portability leftovers, never compiled; do not invest analysis here
 - `../nifs/` → NIF counterparts and the newer `socket`/`prim_file`/`zlib` implementations (sibling — read-only, escalate writes to `../`)
 - `../beam/` → driver/port core, `erl_driver.h` public API (sibling — read-only, escalate writes to `../`)
