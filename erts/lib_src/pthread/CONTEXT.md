@@ -88,7 +88,7 @@ Declared in `erts/include/internal/ethread.h`, `erts/include/internal/ethr_inter
 - `erts/include/internal/ethread.h`, `ethr_internal.h`, `ethread_inline.h`, `ethr_mutex.h`, `pthread/ethr_event.h` → the interface this backend satisfies (owned by the `erts/include/internal/` node).
 - `erts/emulator/beam/erl_threads.h` + `erts/emulator/beam/{erl_process.c,erl_async.c,erl_process_lock.c,erl_thr_progress.c,erl_nif.c,erl_proc_sig_queue.c}` → main in-tree consumers (`erts_tse_*`).
 - `erts/test/ethread_SUITE.erl`, `erts/test/ethread_SUITE_data/` → test suite for libethread (sibling — read-only, escalate writes to `erts/test`).
-- `make/autoconf/otp.m4` → `ERL_FIND_THR_LIB` / `ETHR_*` feature detection that configures this backend.
+- `make/autoconf/otp.m4` → `ERL_FIND_ETHR_LIB` (the `ETHR_*` feature detection that configures this backend; called from `erts/configure.ac`, uses the helper `LM_CHECK_THR_LIB`).
 
 ## Routing Table
 - No child directories — this node is a leaf. Work on the pthread backend is done by editing `ethread.c`, `ethr_event.c`, `ethr_x86_sse2_asm.c` here (the matching public half of any new symbol belongs to `erts/include/internal/pthread/ethr_event.h`).
