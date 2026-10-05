@@ -3,7 +3,7 @@
 ## Intent
 Bourne-shell wrappers that let a **WSL (Ubuntu) bash environment on a Windows host** drive the native Windows toolchain to build native win32 OTP. `otp_build env_win32` (auto-selected when `/bin/wslpath` exists) prepends this dir and `vc/` to `PATH`, exports `CONFIG_SUBTYPE` and `CC=cc.sh CXX=cc.sh AR=ar.sh RANLIB=true`, then configure/make run as on Unix; every tool call is translated to a Windows command.
 This is *not* cross-compilation in the usual sense: the Windows compiler/linker (via WSL interop) produces the native binaries; only the emulator core is compiled by the Linux-side mingw-w64 gcc (`vc/emu_cc.sh`).
-The user-facing description of this build mode is `../../../HOWTO/INSTALL-WIN32.md`; the CI that exercises it is `.github/workflows/reusable-build-windows.yaml` (job runs with `shell: wsl-bash {0}`, installs `gcc-mingw-w64`, then `eval `./otp_build env_win32 x64``).
+The user-facing description of this build mode is `../../../../HOWTO/INSTALL-WIN32.md`; the CI that exercises it is `.github/workflows/reusable-build-windows.yaml` (job runs with `shell: wsl-bash {0}`, installs `gcc-mingw-w64`, then `eval `./otp_build env_win32 x64``).
 
 ## API Surface
 - `erl` — POSIX-sh stand-in for `bin/erl.exe`: rewrites `-I/-o` and absolute paths with `wslpath -m`, exports a Windows-form `ERL_TOP` through `WSLENV` (`ERL_TOP/w:...`), then `eval erl.exe $CMD`.
@@ -50,7 +50,7 @@ The user-facing description of this build mode is `../../../HOWTO/INSTALL-WIN32.
 - `../cygwin_tools/` → near-duplicate shim tree for Cygwin (adds `mingw/`, `cc_wrap.c`/`ld_wrap.c`) — read-only, escalate writes to `../`
 - `../msys_tools/` → near-duplicate shim tree for MSYS2 (`msys2win_path.sh`, `win2msys_path.sh`) — read-only, escalate writes to `../`
 - `../../common/Makefile.in` → consumer of `cc.sh`/`ld.sh`/`ar.sh`/`rc.sh`/`mc.sh` (`USING_VC=@MIXED_VC@`) — read-only, escalate writes to `../../`
-- `../../../Makefile.in` → `bootstrap_setup` target calling `make_bootstrap_ini.sh`; `erts/Makefile` → `local_setup` calling `make_local_ini.sh`
+- `../../../../Makefile.in` → `bootstrap_setup` target calling `make_bootstrap_ini.sh`; `erts/Makefile` → `local_setup` calling `make_local_ini.sh`
 
 ## Dependencies
 - WSL 1 or 2 with Ubuntu (bash, sed, perl, `wslpath`).
@@ -64,6 +64,6 @@ The user-facing description of this build mode is `../../../HOWTO/INSTALL-WIN32.
 ## See Also
 - `../CONTEXT.md` — Windows-specific launchers/sources that these shims build (`erl.c`, `erlsrv/`, `nsis/`, `Install.c`)
 - `../../CONTEXT.md` — `erts/etc/` split into `common/`, `unix/`, `win32/`
-- `../../../HOWTO/INSTALL-WIN32.md` — the documented WSL build procedure and FAQ
-- `../../../otp_build` — `env_win32`/`env_win64` environment setup and tree selection
-- `../../../.github/workflows/reusable-build-windows.yaml` — CI usage of this build mode
+- `../../../../HOWTO/INSTALL-WIN32.md` — the documented WSL build procedure and FAQ
+- `../../../../otp_build` — `env_win32`/`env_win64` environment setup and tree selection
+- `../../../../.github/workflows/reusable-build-windows.yaml` — CI usage of this build mode
