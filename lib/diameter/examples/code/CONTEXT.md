@@ -38,7 +38,7 @@ Every `*_cb` exports the same callback set: `peer_up/3`, `peer_down/3`, `pick_pe
 ## Constraints
 - The public `diameter` API used here is the contract for the examples: they must keep calling `diameter:start/0`, `start_service/2`, `add_transport/2`, `stop_service/1`, `call/4`, `session_id/1`, `subscribe/1`.
 - Every `*.erl` in this directory is compiled by `diameter_examples_SUITE` with `warnings_as_errors` — `sctp.erl` included, even though it is not released — so all files must stay warning-clean on their own.
-- Adding or removing files here requires updating `EXAMPLES` in `../src/modules.mk` (released list) and possibly `test/Makefile` `release_tests_spec`.
+- Adding or removing files here requires updating `EXAMPLES` in `../../src/modules.mk` (released list) and possibly `../../test/Makefile` `release_tests_spec`.
 - Examples must link only against dictionaries shipped in the app (`diameter_gen_base_rfc6733`, `diameter_gen_relay`); they deliberately do NOT use `../dict/*.dia`, so no `.dia` compilation is needed to build or run them.
 - Header usage must stay `-include_lib("diameter/include/diameter.hrl")` / `-include_lib("kernel/include/inet_sctp.hrl")` — the test suite relies on `-include_lib` resolution against a synthesized include directory.
 - Never change the service names away from atoms: `Origin-Host` defaults derive from the service name.
