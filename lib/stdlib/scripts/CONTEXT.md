@@ -1,0 +1,60 @@
+# stdlib/scripts — Maintenance Scripts
+
+## Intent
+Developer/maintenance tooling for the `stdlib` application.
+Nothing here is compiled into the `stdlib` app or installed — these are manually run helper scripts that regenerate checked-in artefacts that are derived from source annotations.
+This directory has no `Makefile`, no `.gitignore` and no build/install integration of its own; the build reaches in from the outside (see "Invocation").
+
+## API Surface
+Single tracked file: `update_deprecations` (502 lines) — an `escript` (shebang `#!/usr/bin/env escript`, `%% -*- erlang -*-`, `-mode(compile).`, `-compile(warnings_as_errors).`), imported with `lists:foldl/3`/`sort/1` and using `beam_lib`, `re`, `string`, `sofs` (syntax_tools).
+It has exactly two invocation modes (`main/1`):
+
+1. `update_deprecations update <Top>` — the mode used by the OTP build.
+   Scans every `*.beam` in `<Top>/erts/ebin` and `<Top>/lib/*/ebin` with `beam_lib:chunks(File,[attributes])` and collects the compiler attributes `-deprecated`, `-removed`, `-unsafe`, `-deprecated_type`, `-removed_type`, `-deprecated_callback`, `-removed_callback` (bare `{F,A}`, `{F,A,Info}` and `[module]` forms are accepted; `Info` is a string or one of `eventually` / `next_major_release` / `next_version` / `possibly` / `undefined`).
+   Cross-checks every collected function entry against `system/doc/general_info/DEPRECATIONS` and **halts with exit 1** if any `-deprecated`/`-removed`/`-unsafe` function is missing there.
+   Rewrites `<Top>/lib/stdlib/src/otp_internal.erl` **in place and in full** (regenerated licence header with the current year, then `obsolete/3`, `obsolete_type/3`, `obsolete_callback/3` clauses, most-specific clauses first so wildcard `'_'` matches don't shadow descriptions).
+   For a deprecated function that `DEPRECATIONS` marks `remove=<Rel>`, it appends the removal release: `obsolete(M,F,A) -> {deprecated, Info, "OTP <Rel>"}`.
+   Each emitted function gets `-dialyzer({no_match, .../3}).`
+2. `update_deprecations make_markdown <Type> <Top> <Outfile>` — used by `system/doc/Makefile`.
+   Same `summarize/1` beam scan, then joins `DEPRECATIONS` (grouping by `since=` or `remove=`) with the deprecation texts from the attributes and writes `<Outfile>`.
+   `<Type>` is `deprecations` (group by `since`, texts from `-deprecated`), `scheduled_for_removal` (group by `remove`, texts from `-deprecated`) or `removed` (group by `remove`, texts from `-removed`).
+   Per-release prose comes from optional templates in the same directory as `DEPRECATIONS`: `<Type>_head.md` and `<Type>_<Rel>.md` (e.g. `deprecations_29.md`, `removed_30.md`); missing templates degrade to empty strings.
+   For `removed` it additionally fails if any entry claims removal in a release newer than `OTP_VERSION`.
+   This mode does **not** write `otp_internal.erl` — it only produces markdown.
+
+### Invocation (from outside this directory)
+- Top-level `Makefile.in` target `deprecations: all` → `$(ERL_TOP)/lib/stdlib/scripts/update_deprecations update $(ERL_TOP)` (script is exec'd directly, so `escript` must be on `PATH`).
+- `otp_build update_deprecations [--no-commit]` (`do_deprecations_git`) → `make deprecations` then `make primary_bootstrap`; unless `--no-commit` it does `git add -A` + `git commit` for `lib/stdlib/src/otp_internal.erl` and the primary-bootstrap beam `bootstrap/lib/stdlib/ebin/otp_internal.beam`.
+- `system/doc/Makefile` (`DEPRECATIONS_SCRIPT`) → `escript $(DEPRECATIONS_SCRIPT) make_markdown <Type> $(ERL_TOP) <target>` for `general_info/{deprecations,scheduled_for_removal,removed}.md` (those three outputs are git-ignored; the `*_<Rel>.md` templates and `DEPRECATIONS` are checked in).
+- Documented workflow for humans: `HOWTO/DEPRECATE.md` — add the attribute, update `DEPRECATIONS`, run `./otp_build update_deprecations`.
+
+## Constraints
+- The script mutates a checked-in source file (`lib/stdlib/src/otp_internal.erl`) — run it deliberately and review the diff; the whole file is rewritten (including the copyright year), so unrelated diff noise is possible.
+- It requires a **fully built tree**: `summarize_directory/2` aborts (`halt(1)`) the moment it finds an `ebin` directory without any `*.beam`, so `make all` must have succeeded (hence the `deprecations: all` dependency).
+- It needs `escript`/`erl` on `PATH`; `otp_build` sets this up by prepending the bootstrap `bin/`.
+- `<Top>` (`ERL_TOP`) is always passed explicitly by the callers, so the cwd is not used to locate the tree — but the output path `lib/stdlib/src/otp_internal.erl` is hard-coded relative to `<Top>`.
+- `erl_interface` and `jinterface` `ebin` dirs are deliberately excluded from the scan (no Erlang code to deprecate); the comment also names ODBC, but ODBC is not actually filtered out.
+- `-unsafe` attributes are treated like `-deprecated`/`-removed` for the `DEPRECATIONS` cross-check.
+
+## Notes for Agents
+- `lib/stdlib/src/otp_internal.erl` is **generated** — its header says `WARNING: DO NOT EDIT THIS FILE` and points at `./otp_build update_deprecations`. Never hand-edit it.
+- `lib/stdlib/src/otp_internal.hrl` is **hand-written** (not generated by this script) and is `-include`d by the generated `otp_internal.erl`; it exports/specs `obsolete/3`, `obsolete_type/3`, `obsolete_callback/3`.
+- `lib/stdlib/src/erl_internal.erl` is a separate, hand-maintained table (BIFs, guards, operators). This script does **not** touch it, even though both are compiled into the primary bootstrap (`primary_bootstrap_compiler` in `lib/stdlib/src/Makefile`).
+- Consumers of the generated table: `lib/stdlib/src/erl_lint.erl` (raises the deprecation/removal warnings the compiler shows).
+- `lib/compiler/src/beam_doc.erl` contains a copy of the attribute-summarising logic ("Copies from lib/stdlib/scripts/update_deprecations") — changes to the attribute formats here likely need to be mirrored there.
+- `system/doc/general_info/DEPRECATIONS` is the hand-edited master list (`foo:bar/1 since=23 remove=30`); it is the source of the release numbers, not the Erlang attributes.
+
+## Test Strategy
+- No tests live in this directory and there is no direct test target for it.
+- Drift between the source attributes and the generated table is caught in `erts/test/otp_SUITE.erl`: `deprecated_not_in_obsolete`, `obsolete_but_not_deprecated` and `call_to_deprecated` compare `otp_internal:obsolete/3` against xref's `DF`/`US` sets.
+- `lib/stdlib/test/error_info.spec` is a nearby suite-spec file but covers `erl_error` error-info messages, not deprecations — do not expect it to validate this script's output.
+
+## See Also
+- `../src/otp_internal.erl` — the generated file this script writes.
+- `../src/otp_internal.hrl` — hand-written exports/specs included by it.
+- `../src/erl_internal.erl` — unrelated hand-maintained BIF/guard table in the same primary bootstrap.
+- `../../../system/doc/general_info/DEPRECATIONS` — hand-maintained input for both modes.
+- `../../../system/doc/Makefile` — drives `make_markdown`.
+- `../../../Makefile.in` (`deprecations` target) and `../../../otp_build` (`update_deprecations`) — drive the `update` mode.
+- `../../../HOWTO/DEPRECATE.md` — the human-facing workflow.
+- `../../../erts/test/otp_SUITE.erl` — the drift checks.
