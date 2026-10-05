@@ -90,10 +90,13 @@ DAG acyclic (`../CONTEXT.md`).
 ### `config.rs` — parsed configuration
 ```rust
 pub type EmulatorConfig = beam_common::config::RuntimeConfig;   // the A.6 skeleton (flavor, +S, +P, …)
+pub struct InitArgs { /* ordered flag → occurrences; record/get/len/is_empty/occurrences */ }
+pub enum ArgTerm { Int(i64), Atom(String), Str(String), List(Vec<ArgTerm>) }
 pub enum Action { Boot, Version, Eval(String), Apply { module: String, function: String, args: Vec<String> },
-                  RunFile { file: PathBuf, module: String, function: String, arity: u32, args: Vec<Eterm> } }
+                  Run { module: String, function: String, args: Vec<String> },
+                  RunFile { file: PathBuf, module: String, function: String, arity: u32, args: Vec<ArgTerm> } }
 pub struct RuntimeConfig { pub emulator: EmulatorConfig, pub code_paths: Vec<PathBuf>,
-                           pub heap_words: usize, pub action: Action }   // Default + `with_*` setters
+                           pub heap_words: usize, pub action: Action, pub init_args: InitArgs }  // Default + `with_*` setters
 ```
 
 ### `cli.rs` — the CLI parser + driver (contract A.6)
