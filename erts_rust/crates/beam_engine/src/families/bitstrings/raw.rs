@@ -151,6 +151,48 @@ pub(super) fn set_ctx_start(t: Eterm, start: usize) {
     }
 }
 
+/// Build a bignum term from `digits` (least significant first) with the given sign.
+///
+/// `digits` must be non-empty and normalised (no leading zero digit) — exactly the
+/// shape [`beam_term::write_big`] requires (`big.h:96-97`,
+/// `BIG_NEED_SIZE(n) = n + 1`). The block is allocated through the
+/// [`ExecutionContext`] (`alloc_words`), so the term stays valid until the next
+/// `ensure_heap`/GC.
+pub(super) fn make_big(
+    ctx: &mut dyn ExecutionContext,
+    negative: bool,
+    digits: &[u64],
+) -> Result<Eterm> {
+    if digits.is_empty() {
+        // An internal invariant (the caller normalises zero to a small); a
+        // zero-width bignum would be a wrong result, so surface it.
+        return Err(error::unsupported("bitstring: zero-width bignum"));
+    }
+    let hp = ctx.alloc_words(beam_term::big_size_words(digits.len()))?;
+    // SAFETY: `alloc_words` returned exactly `big_size_words(n) = n + 1`
+    // exclusively-owned, writable words — the block `write_big` requires and fully
+    // writes (header + `n` `ErtsDigit`s, `big.h:68-73`). The context owns the arena
+    // and keeps it alive for as long as the term is used.
+    Ok(unsafe { beam_term::write_big(hp, negative, digits) })
+}
+
+/// The `(negative, digits)` of a bignum term **copied out** (digits are
+/// `ErtsDigit`s, least significant first).
+///
+/// `None` when `t` is not a bignum. This is the safe read side of the wide
+/// integer *build* path (`fmt_big_*`, `erl_bits.c:724`/`:811`); copying keeps the
+/// caller free of `unsafe` and of a borrow on the term's storage.
+pub(super) fn big_parts_safe(t: Eterm) -> Option<(bool, Vec<u64>)> {
+    // SAFETY: `is_big` checks `is_boxed` before it dereferences the header.
+    if !unsafe { beam_term::is_big(t) } {
+        return None;
+    }
+    // SAFETY: `is_big` established that `t` is a live bignum block written by
+    // `write_big`, which is exactly the precondition `big_parts` documents.
+    let (negative, digits) = unsafe { beam_term::big_parts(t) };
+    Some((negative, digits.to_vec()))
+}
+
 /// Build an on-heap bitstring of exactly `nbits` bits from the leading bits of
 /// `bytes` (MSB-first), zeroing the unused trailing bits of the final byte.
 ///

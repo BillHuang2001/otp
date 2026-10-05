@@ -277,6 +277,176 @@ pub(super) fn small_value(t: Eterm) -> Option<i64> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Wide (> 64 bit) integer segments
+//
+// Match-side `erts_bs_get_integer_2` (`erl_bits.c:170`) and build-side
+// `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`) both represent an integer as
+// a **little-endian byte array** (C's `bigbuf`, "stored in little-endian order,
+// since bignums are little-endian") that is then turned into, or read back from, a
+// bignum. These helpers are that byte-level model, in plain safe Rust — the
+// bignum build/read itself is owned by `beam_term` (through [`raw`]).
+// ---------------------------------------------------------------------------
+
+/// The bignum digits (`ErtsDigit`s, least significant first) of a little-endian
+/// byte array, with every leading zero digit stripped.
+///
+/// An all-zero input yields an **empty** list (the caller turns that into
+/// `SMALL_ZERO`, mirroring `erts_bs_get_integer_2`'s normalisation loop
+/// `while (*MSB == 0 && MSB > LSB)`).
+pub(super) fn le_bytes_to_digits(bytes: &[u8]) -> Vec<u64> {
+    let mut digits: Vec<u64> = bytes
+        .chunks(8)
+        .map(|chunk| {
+            let mut d = 0u64;
+            for (i, &b) in chunk.iter().enumerate() {
+                d |= u64::from(b) << (8 * i);
+            }
+            d
+        })
+        .collect();
+    while digits.last() == Some(&0) {
+        digits.pop();
+    }
+    digits
+}
+
+/// `bytes << shift` as a little-endian byte array of the **same** length (`shift`
+/// in `0..=7`); bits shifted past the top byte are dropped.
+pub(super) fn shl_le_bytes(bytes: &[u8], shift: u32) -> Vec<u8> {
+    if shift == 0 {
+        return bytes.to_vec();
+    }
+    let mut out = vec![0u8; bytes.len()];
+    let mut carry = 0u8;
+    for (i, &b) in bytes.iter().enumerate() {
+        out[i] = (b << shift) | carry;
+        carry = b >> (8 - shift);
+    }
+    out
+}
+
+/// Replace a little-endian byte array holding a value `< 2^nbits` with its
+/// two's complement **within `nbits` bits** — `(2^nbits - value) mod 2^nbits`.
+///
+/// This is C's sign handling (`erts_bs_get_integer_2`'s two's-complement loop and
+/// `MAYBE_SIGN_EXTEND`/`SUBc`): a negative value is turned into its *magnitude*.
+pub(super) fn twos_complement_bits(bytes: &mut [u8], nbits: usize) {
+    if bytes.is_empty() {
+        return;
+    }
+    let mut carry = 1u16;
+    for b in bytes.iter_mut() {
+        let v = u16::from(!*b) + carry;
+        *b = (v & 0xFF) as u8;
+        carry = v >> 8;
+    }
+    if nbits % 8 != 0 {
+        let top = bytes.len() - 1;
+        bytes[top] &= (1u8 << (nbits % 8)) - 1;
+    }
+}
+
+/// Build the term for a magnitude `digits` (least significant digit first) with
+/// the given sign.
+///
+/// The magnitude is taken to be normalised (no leading zero digit); an empty
+/// `digits` is the value zero. `IS_USMALL` (`big.h:76`) decides between a small
+/// (`w <= MAX_SMALL`, or `<= MAX_SMALL + 1` when negative — exactly the range
+/// [`beam_term::try_make_small`] accepts) and a **bignum**.
+pub(super) fn make_int(
+    ctx: &mut dyn ExecutionContext,
+    negative: bool,
+    digits: &[u64],
+) -> Result<Eterm> {
+    match digits {
+        [] => make_small_checked(0),
+        [d] if *d <= i64::MAX as u64 => {
+            let magnitude = *d as i64;
+            let signed = if negative { -magnitude } else { magnitude };
+            match beam_term::try_make_small(signed) {
+                Ok(t) => Ok(t),
+                Err(_) => raw::make_big(ctx, negative, digits),
+            }
+        }
+        _ => raw::make_big(ctx, negative, digits),
+    }
+}
+
+/// Append the `nbits`-bit field representation of an integer term to `writer`,
+/// mirroring `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`) — i.e. of a small
+/// *or* a bignum value.
+///
+/// The field holds `value mod 2^nbits` (C masks the value into the field width,
+/// which for a negative value is its `nbits`-bit two's complement — `SUBc` on the
+/// build side). A big-endian field is the natural MSB-first encoding; a
+/// little-endian field emits the least-significant 8-bit group first, leaving the
+/// final partial group (`nbits % 8` bits) left-aligned in its byte, exactly as
+/// `fmt_big_le` does with its trailing `*buf <<= 8 - offs`.
+pub(super) fn push_wide_int(
+    writer: &mut BitWriter,
+    value: Eterm,
+    nbits: usize,
+    little: bool,
+) -> Result<()> {
+    let num_bytes = nbits.div_ceil(8);
+    let (negative, mut bytes) = integer_magnitude_bytes(value, num_bytes)?;
+    if negative {
+        twos_complement_bits(&mut bytes, nbits);
+    }
+    if little {
+        let rem = nbits % 8;
+        for j in 0..num_bytes {
+            let width = if j + 1 == num_bytes && rem != 0 {
+                rem
+            } else {
+                8
+            };
+            for k in (0..width).rev() {
+                writer.push_bit((bytes[j] >> k) & 1);
+            }
+        }
+    } else {
+        for k in (0..nbits).rev() {
+            writer.push_bit((bytes[k / 8] >> (k % 8)) & 1);
+        }
+    }
+    Ok(())
+}
+
+/// The sign and the little-endian magnitude bytes (truncated to `num_bytes`) of an
+/// integer term.
+///
+/// A small integer contributes its `i64` magnitude; a bignum contributes its
+/// `ErtsDigit`s byte by byte. Anything else (a float, atom, …) cannot be an
+/// integer segment value and is a typed [`crate::error::unsupported`] — the C
+/// `erts_bs_put_integer_*` returns 0 there and the instruction fails the match.
+fn integer_magnitude_bytes(value: Eterm, num_bytes: usize) -> Result<(bool, Vec<u8>)> {
+    if let Some(v) = small_value(value) {
+        let magnitude = v.unsigned_abs();
+        let mut bytes = vec![0u8; num_bytes];
+        for (j, byte) in bytes.iter_mut().enumerate().take(8) {
+            *byte = ((magnitude >> (8 * j)) & 0xFF) as u8;
+        }
+        return Ok((v < 0, bytes));
+    }
+    if let Some((negative, digits)) = raw::big_parts_safe(value) {
+        let mut bytes = vec![0u8; num_bytes];
+        for (di, &digit) in digits.iter().enumerate() {
+            for k in 0..8 {
+                let index = di * 8 + k;
+                if index < num_bytes {
+                    bytes[index] = ((digit >> (8 * k)) & 0xFF) as u8;
+                }
+            }
+        }
+        return Ok((negative, bytes));
+    }
+    Err(error::unsupported(
+        "bs_create_bin: integer segment value is not an integer",
+    ))
+}
+
 /// Copy `nbits` bits starting at `start` (MSB-first) out of `bytes` into a fresh
 /// buffer of `ceil(nbits / 8)` bytes, zeroing the unused trailing bits.
 pub(super) fn extract_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<Vec<u8>> {

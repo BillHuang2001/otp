@@ -488,7 +488,20 @@ fn position_of(value: Eterm) -> Result<usize> {
 
 /// Extract an integer field of `nbits` bits at bit `start`, honouring the
 /// `BSF_LITTLE`/`BSF_SIGNED` flags, and build the resulting term.
-fn read_integer_field(bytes: &[u8], start: usize, nbits: usize, flags: u32) -> Result<Eterm> {
+///
+/// A field of at most 64 bits is collected into a machine word; a **wider** field
+/// is the `erts_bs_get_integer_2` big path (`erl_bits.c:170`) and may need a
+/// bignum, which is built through the [`ExecutionContext`].
+fn read_integer_field(
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    start: usize,
+    nbits: usize,
+    flags: u32,
+) -> Result<Eterm> {
+    if nbits > 64 {
+        return read_wide_integer_field(ctx, bytes, start, nbits, flags);
+    }
     let raw_value = if flags & BSF_LITTLE != 0 {
         read_uint_le(bytes, start, nbits)?
     } else {
@@ -500,6 +513,57 @@ fn read_integer_field(bytes: &[u8], start: usize, nbits: usize, flags: u32) -> R
         raw_value
     };
     make_small_checked(value as i64)
+}
+
+/// Read an integer field **wider than 64 bits** and build the (possibly bignum)
+/// term, reproducing `erts_bs_get_integer_2` beyond its small-integer special
+/// cases (`erl_bits.c:245-398`).
+///
+/// The field's `nbits` bits are first laid out MSB-first in `field` (exactly what
+/// C's `erts_copy_bits_rev`/`erts_copy_bits_fwd` produce); `field` is then turned
+/// into the value's little-endian byte array:
+/// * **big-endian** (the default): the natural big-endian integer, i.e. value bit
+///   `k` is field bit `nbits - 1 - k`;
+/// * **little-endian**: the first 8-bit group is the least-significant byte, with
+///   the final partial group (`nbits % 8` bits) read MSB-first — C's
+///   `*MSB >>= 8 - BIT_OFFSET(num_bits)` adjustment.
+///
+/// A signed field whose top bit is set is two's-complemented into its magnitude
+/// (`MAYBE_SIGN_EXTEND`); the leading-zero normalisation is
+/// [`le_bytes_to_digits`], and `IS_USMALL` is [`make_int`].
+fn read_wide_integer_field(
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    start: usize,
+    nbits: usize,
+    flags: u32,
+) -> Result<Eterm> {
+    let num_bytes = nbits.div_ceil(8);
+    // The field's bits, MSB-first, left-aligned in `num_bytes` bytes.
+    let field = extract_bits(bytes, start, nbits)?;
+    let mut value = vec![0u8; num_bytes];
+    if flags & BSF_LITTLE != 0 {
+        let rem = nbits % 8;
+        for (j, out) in value.iter_mut().enumerate() {
+            *out = if j + 1 == num_bytes && rem != 0 {
+                field[j] >> (8 - rem)
+            } else {
+                field[j]
+            };
+        }
+    } else {
+        for k in 0..nbits {
+            let i = nbits - 1 - k;
+            let bit = (field[i / 8] >> (7 - (i % 8))) & 1;
+            value[k / 8] |= bit << (k % 8);
+        }
+    }
+    let negative = flags & BSF_SIGNED != 0 && (value[(nbits - 1) / 8] >> ((nbits - 1) % 8)) & 1 == 1;
+    if negative {
+        twos_complement_bits(&mut value, nbits);
+    }
+    let digits = le_bytes_to_digits(&value);
+    make_int(ctx, negative, &digits)
 }
 
 // ---------------------------------------------------------------------------
