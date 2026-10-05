@@ -194,7 +194,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only** — no crate-local error enum (workspace §3); an unsupported opcode/operand is a documented `BeamError` (`error::unsupported`), and the engine **never panics, never `unwrap()`s loaded data, never produces a wrong result**.
 - **Frozen term layout**: term construction/inspection is **only** `beam_term` (`use beam_term::prelude::*;`); comparison uses `beam_term::{cmp, eq, cmp_arith}` — the engine never reimplements term ordering.
-- The crate is `#![deny(unsafe_code)]` (and `#![warn(missing_docs)]`) with exactly **four** `#[allow(unsafe_code)]` modules:
+- The crate is `#![deny(unsafe_code)]` (and `#![warn(missing_docs)]`) with exactly **five** `#[allow(unsafe_code)]` modules:
   - `src/predicates.rs` — wraps the `beam_term` boxed-term predicates the `Test`/`test_arity` opcodes need (`is_integer`, `is_number`, `is_float`, `is_tuple`, `is_tuple_arity`, `is_map`, `is_binary`, `is_bitstring`, `is_internal_ref`, `is_external_pid`/`_port`/`_ref`), which are `unsafe fn` because they dereference a term's header word — there is no safe classifier.
   - `src/terms.rs` — the crate's single point of **raw-heap boxed-term construction/reading** behind the `ExecutionContext::alloc_words` seam (incl. the HAMT reader for `map_entries`).
   - `src/families/bitstrings/raw.rs` — the `ErlSubBits`/`ErlHeapBits` raw-layout accessors for the `bs_*` opcodes (reading a heap bitstring's data words, reading/writing the match-context fields, materialising a result bitstring with an explicit bit count, and the `>64`-bit bignum build/read helpers).
