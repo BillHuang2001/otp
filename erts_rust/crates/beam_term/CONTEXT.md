@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
