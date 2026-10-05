@@ -148,6 +148,36 @@ operators) and `<`/`>` between same-typed terms.
   occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
   cell, `arity + 1` per boxed object (header + payload), plus the sizes of nested terms.
 
+### `thing.rs` — off-heap term materialization (heap-agnostic)
+Frozen-layout **writers and readers for the boxed "thing" families whose interior layout this
+crate owns** — float, bignum, flat map, and the external pid/port/ref (`ExternalThing`) blocks.
+Every writer is **heap-agnostic**: the caller allocates the words (via `beam_alloc` in production,
+`heap::Heap` in tests) and passes `hp: *mut Eterm`; the writer fills the block and returns the
+tagged root `Eterm`. All word counts and bit patterns are **byte-identical** to the
+oracle-verified `beam_codec::term` (`make_float`/`make_big`/`make_flatmap`/`make_external_*`),
+which forwards here (see Design Decisions). Readers are `unsafe` with a caller invariant
+("`t` is a live thing of this kind") and return borrowed slices.
+- Float: `pub const FLOAT_SIZE_WORDS: usize = 2`; `unsafe write_float(hp, value: f64) -> Eterm`
+  (`[HEADER_FLONUM, bits]`, root `make_boxed(hp)`); `unsafe float_value(t) -> f64`;
+  `unsafe float_bits(t) -> u64` (delegate to the existing `pub(crate)` helpers in `compare.rs`).
+- Bignum: `pub const fn big_size_words(n_digits) -> usize` (`n_digits + 1`, `BIG_NEED_SIZE`);
+  `unsafe write_big(hp, negative: bool, digits: &[u64]) -> Eterm` (header arity `n - 1`, one
+  `ErtsDigit` = `u64` per word, least-significant-first, sign in `_BIG_SIGN_BIT`; `digits` must be
+  non-empty); `unsafe big_parts<'a>(t) -> (bool, &'a [u64])`.
+- Flat map: `pub const fn flatmap_size_words(n_pairs) -> usize` (`3` for the empty map, else
+  `4 + 2n`); `unsafe write_flatmap(hp, pairs: &[(Eterm, Eterm)]) -> Eterm` (the C block
+  `[arityval(n), k0..k(n-1), MAP_HEADER_FLATMAP, n, keys-tuple, v0..v(n-1)]`, root
+  `make_boxed(hp + 1 + n)`; `n_pairs ≤ MAP_SMALL_MAP_LIMIT`); `unsafe flatmap_parts<'a>(t) ->
+  (&'a [Eterm], &'a [Eterm])`.
+- External things (C `ExternalThing`, incl. the M1 "`next` slot holds `creation`" substitution):
+  `pub const MAX_REF_IDS: usize = 5` (`ERTS_MAX_REF_NUMBERS`); the size fns
+  `external_pid_size_words()` (`4`), `external_port_size_words()` (`4`),
+  `external_ref_size_words(n_ids)` (`3 + n_ids/2 + 1` on `ARCH_64`); the writers
+  `unsafe write_external_pid(hp, node, number: u32, serial: u32, creation: u32)`,
+  `unsafe write_external_port(hp, node, number: u64, creation: u32)`,
+  `unsafe write_external_ref(hp, node, ids: &[u32], creation: u32)` and their `unsafe *_parts`
+  inverses (`external_pid_parts`/`external_port_parts`/`external_ref_parts`).
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
