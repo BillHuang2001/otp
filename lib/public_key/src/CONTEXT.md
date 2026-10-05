@@ -29,7 +29,7 @@ Internal modules (all `-moduledoc false`, called only by `public_key` and each o
 - `pubkey_ssh` (79 lines) — only `dh_gex_group/4` and `dh_gex_group_sizes/0` remain; the SSH key encode/decode parts were moved to the `ssh` application.
 
 ## Generated files (never hand-edit)
-- All ASN.1 modules/hrl (`OTP-PUB-KEY`, `PKCS-FRAME`, `PKCS-1/3/10`, `PKIX*`, `X509-ML-DSA-2025`, `X509-ML-KEM-2025`, `SLH-DSA-Module-2024`, `DSS`, `ECPrivateKey`, `RFC5639`, `Safecurves-pkix-18`, …) are emitted **into this directory** by `../asn1/Makefile` (`ESRC = ../src`, `erlc -bber +der +noobj -o ../src`), from the `.asn1` sources in `../asn1/`.
+- All ASN.1 modules/hrl (`OTP-PKIX`, `OTP-PKIX-Relaxed`, `PKCS-FRAME`, `PKCS-1/3/10`, `PKIX*`, `X509-ML-DSA-2025`, `X509-ML-KEM-2025`, `SLH-DSA-Module-2024`, `DSS`, `ECPrivateKey`, `RFC5639`, `Safecurves-pkix-18`, …) are emitted **into this directory** by `../asn1/Makefile` (`ESRC = ../src`, `erlc -bber +der +noobj -o ../src`), from the `.asn1` sources in `../asn1/`. (There is no generated `OTP-PUB-KEY` module — the `OTP-PUB-KEY.*` entries in `../.gitignore` are stale; `../include/OTP-PUB-KEY.hrl` is a hand-written shim.)
 - Those generated `*.erl`/`*.hrl` plus `src/*.asn1db` are all git-ignored (see `../.gitignore`) — they are absent from a fresh checkout and appear only after building.
 - `pubkey_moduli.hrl` (904 lines / ~700 KB) is generated from `../priv/moduli` by `../priv/convert.escript` (Makefile rule `pubkey_moduli.hrl: ../priv/moduli`) and, unlike the ASN.1 output, **is tracked in git** — regenerate it, never edit or reformat it.
 - `../include/PKCS-FRAME.hrl` is a copy of the generated `src/PKCS-FRAME.hrl`, produced by the `$(INCLUDE)/%.hrl: $(ESRC)/%.hrl` rule in `../asn1/Makefile`.
