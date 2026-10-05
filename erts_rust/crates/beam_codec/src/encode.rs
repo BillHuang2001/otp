@@ -13,13 +13,14 @@ use beam_term::{AtomTable, Eterm};
 
 use crate::error;
 use crate::tag::{
-    ATOM_EXT, ATOM_UTF8_EXT, COMPRESSED_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT,
-    MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT,
-    SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, Tag,
+    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, INTEGER_EXT,
+    LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT,
+    NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT,
+    SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, Tag,
 };
 use crate::term::{
-    big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
-    flatmap_parts, float_value, tuple_arity, tuple_element,
+    big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
 };
 use crate::writer::Writer;
 
@@ -132,9 +133,13 @@ impl<'a> Encoder<'a> {
         if let Ok((node, ids, creation)) = external_ref_parts(term) {
             return self.encode_ref(node, ids, creation);
         }
-        // Anything else (in practice a binary, which the Stage-0 foundations cannot
-        // build) is not representable by the M1 term layer: report it explicitly
-        // rather than emit a wrong encoding. Tests never reach this path.
+        if let Ok((bytes, offset_bits, size_bits)) = bitstring_bytes(term) {
+            return self.encode_bitstring(bytes, offset_bits, size_bits);
+        }
+        // Anything else is not representable by the M1 term layer (in practice an
+        // off-heap `BinRef`/`Fun`/`Record` block, which the Stage-0 foundations cannot
+        // build): report it explicitly rather than emit a wrong encoding. Tests never
+        // reach this path.
         Err(error::unsupported(Tag::Binary))
     }
 
@@ -364,6 +369,45 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
+    /// Encodes a bitstring: `BINARY_EXT` when its size is a whole number of bytes,
+    /// `BIT_BINARY_EXT` with a trailing-bit count otherwise
+    /// (`external.c:3855-3862`: `encoding = TAIL_BITS(size) ? BIT_BINARY_EXT :
+    /// BINARY_EXT`).
+    ///
+    /// `bytes` is the base byte view, `offset_bits` the bit offset of the first
+    /// significant bit inside it and `size_bits` the bit count (see
+    /// [`crate::term::bitstring_bytes`]). The payload is repacked so the significant
+    /// bits start at bit 0 of the output and the unused trailing bits of the last
+    /// byte are **zero** — a sub-bitstring source may carry non-zero bits there
+    /// (`external.c:3914-3922`).
+    ///
+    /// The wire length field is a 32-bit byte count, so a bitstring that cannot be
+    /// represented by these two tags is a `BeamError::SystemLimit` rather than a
+    /// truncated length (the C computes the size with a `Uint` and has no such
+    /// check; the bound is also what keeps the repack buffer finite).
+    fn encode_bitstring(
+        &mut self,
+        bytes: &[u8],
+        offset_bits: usize,
+        size_bits: usize,
+    ) -> Result<()> {
+        let n_bytes = bit_count_to_bytes(size_bits);
+        let tail = size_bits % 8;
+        let len_field = u32::try_from(n_bytes).map_err(|_| error::system_limit())?;
+        if tail == 0 {
+            self.buf.u8(BINARY_EXT);
+            self.buf.u32be(len_field);
+        } else {
+            self.buf.u8(BIT_BINARY_EXT);
+            self.buf.u32be(len_field);
+            // `bits` is the number of significant bits in the last byte (`1..=8`).
+            self.buf.u8(tail as u8);
+        }
+        let payload = repack_bits(bytes, offset_bits, size_bits, n_bytes)?;
+        self.buf.bytes(&payload);
+        Ok(())
+    }
+
     /// The bytes written so far.
     pub fn as_bytes(&self) -> &[u8] {
         self.buf.as_slice()
@@ -444,6 +488,57 @@ fn strip_high_zero_bytes(digits: &[u8]) -> &[u8] {
         end -= 1;
     }
     &digits[..end]
+}
+
+/// Repacks `size_bits` significant bits — MSB-first inside each byte — from bit
+/// `offset_bits` of `bytes` into exactly `n_bytes = ceil(size_bits / 8)` output
+/// bytes, with the significant bits starting at bit 0 and the unused trailing bits
+/// of the last byte zeroed.
+///
+/// This is C `copy_binary_to_buffer(dst, 0, base, offset, size)`
+/// (`erl_bits.h:541-556`) together with the `ep[wire_size - 1] = 0` pre-clear the
+/// `BIT_BINARY_EXT` encoder does (`external.c:3914-3922`): the destination is
+/// zeroed up front, then the `size_bits` bits are copied in.
+///
+/// `offset_bits` is `0` for a heap bitstring (and for the byte-aligned sub-bitstring
+/// case a plain `copy_from_slice` is used); a non-byte-aligned offset — only
+/// reachable from a sub-bitstring — falls back to a per-bit shift. A source range
+/// outside `bytes` yields `BeamError::BadArg` rather than a panic (a well-formed
+/// bitstring never triggers it).
+fn repack_bits(
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+    n_bytes: usize,
+) -> Result<Vec<u8>> {
+    debug_assert_eq!(
+        n_bytes,
+        bit_count_to_bytes(size_bits),
+        "the caller sized the buffer from the bit count"
+    );
+    let mut out = vec![0u8; n_bytes];
+    if size_bits == 0 {
+        return Ok(out);
+    }
+    if offset_bits % 8 == 0 {
+        let start = offset_bits / 8;
+        let end = start.checked_add(n_bytes).ok_or_else(error::bad_arg)?;
+        let src = bytes.get(start..end).ok_or_else(error::bad_arg)?;
+        out.copy_from_slice(src);
+    } else {
+        for i in 0..size_bits {
+            let bit = offset_bits + i;
+            let byte = *bytes.get(bit / 8).ok_or_else(error::bad_arg)?;
+            if byte & (0x80 >> (bit % 8)) != 0 {
+                out[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+    }
+    // The source's trailing bits are not significant: clear them.
+    if size_bits % 8 != 0 {
+        out[n_bytes - 1] &= 0xFFu8 << (8 - (size_bits % 8));
+    }
+    Ok(out)
 }
 
 /// Encodes `term` as a `term_to_binary` image: version byte plus term.

@@ -1,5 +1,6 @@
 //! Thin forwarding layer over [`beam_term::thing`], [`beam_term::tuple`] and
-//! [`beam_term::list`].
+//! [`beam_term::list`], plus the local **bitstring word-layout shim**
+//! ([`binary`]).
 //!
 //! The frozen interior layout of a float, a bignum, a flat map and the external
 //! pid/port/ref blocks is owned by [`beam_term`] (the lowest common ancestor for
@@ -16,17 +17,29 @@
 //! lives in [`beam_term::thing`]; this module retains only the small guard
 //! constants declared below.
 //!
+//! **Exception:** the bitstring (`ErlHeapBits` / `ErlSubBits`) block layout is
+//! implemented **locally** in [`binary`], because this node may not write
+//! [`beam_term`]. It is built only from public [`beam_term`] constants/primitives
+//! and is a deliberate, temporary deviation — see [`binary`]'s module docs.
+//!
 //! [`beam_term`]'s accessors are `unsafe fn` because the validity of an `Eterm` is
 //! a caller invariant and there is no safe way to read or write a heap word, so the
-//! crate-wide `#![deny(unsafe_code)]` is lifted for this module alone
-//! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`). The
-//! crate's entire `unsafe` surface is one auditable file: the `beam_alloc`
-//! allocation calls, the `beam_term` forwarders and the minimal type/validity
-//! guards — each carrying a `// SAFETY:` rationale. No `unsafe` here performs
-//! layout work of its own.
+//! crate-wide `#![deny(unsafe_code)]` is lifted for this module subtree alone
+//! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`, which
+//! covers [`binary`] too). The crate's entire `unsafe` surface is this single
+//! auditable subtree: the `beam_alloc` allocation calls, the `beam_term`
+//! forwarders, the bitstring shim and the minimal type/validity guards — each
+//! carrying a `// SAFETY:` rationale.
 //!
 //! Every error stays [`beam_common::Result`] (via [`crate::error`]); an accessor
 //! never panics and never exhibits undefined behaviour on a mismatched term.
+
+mod binary;
+
+pub use binary::{
+    bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
+    make_bitstring, BITSTRING_POINTER_FLAG_MASK,
+};
 
 use core::mem::size_of;
 

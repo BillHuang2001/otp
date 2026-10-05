@@ -339,11 +339,11 @@ impl Tag {
     /// Whether the Milestone-1 term layer supports this tag.
     ///
     /// `true` for the required core set (integers, floats, all four atom tags,
-    /// references, ports, pids, tuples, `NIL`, strings, lists, small maps, the
-    /// distribution atom-cache reference, and `COMPRESSED` as a top-level wrapper);
-    /// `false` for everything the codec deliberately reports as
-    /// [`crate::error::unsupported`] (binaries, funs, records, `V4_PORT_EXT`,
-    /// `LOCAL_EXT` and the distribution header).
+    /// references, ports, pids, tuples, `NIL`, strings, lists, binaries/bitstrings,
+    /// small maps, the distribution atom-cache reference, and `COMPRESSED` as a
+    /// top-level wrapper); `false` for everything the codec deliberately reports as
+    /// [`crate::error::unsupported`] (funs, records, `V4_PORT_EXT`, `LOCAL_EXT` and
+    /// the distribution header).
     ///
     /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
     /// but only as the outermost wrapper, immediately after the version byte
@@ -373,6 +373,8 @@ impl Tag {
                 | Tag::List
                 | Tag::SmallBig
                 | Tag::LargeBig
+                | Tag::Binary
+                | Tag::BitBinary
                 | Tag::Map
                 | Tag::AtomCacheRef
                 | Tag::Compressed
@@ -401,7 +403,7 @@ mod tests {
         (Tag::Nil, 106, "NIL_EXT", true),
         (Tag::String, 107, "STRING_EXT", true),
         (Tag::List, 108, "LIST_EXT", true),
-        (Tag::Binary, 109, "BINARY_EXT", false),
+        (Tag::Binary, 109, "BINARY_EXT", true),
         (Tag::SmallBig, 110, "SMALL_BIG_EXT", true),
         (Tag::LargeBig, 111, "LARGE_BIG_EXT", true),
         (Tag::NewFloat, 70, "NEW_FLOAT_EXT", true),
@@ -414,7 +416,7 @@ mod tests {
         (Tag::AtomUtf8, 118, "ATOM_UTF8_EXT", true),
         (Tag::SmallAtomUtf8, 119, "SMALL_ATOM_UTF8_EXT", true),
         (Tag::Compressed, 80, "COMPRESSED", true),
-        (Tag::BitBinary, 77, "BIT_BINARY_EXT", false),
+        (Tag::BitBinary, 77, "BIT_BINARY_EXT", true),
         (Tag::NewFun, 112, "NEW_FUN_EXT", false),
         (Tag::Export, 113, "EXPORT_EXT", false),
         (Tag::Fun, 117, "FUN_EXT", false),

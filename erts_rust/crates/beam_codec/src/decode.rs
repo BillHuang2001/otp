@@ -260,6 +260,11 @@ impl<'a> Decoder<'a> {
             }
 
             // ---------------------------------------------------------------
+            // Binaries / bitstrings
+            // ---------------------------------------------------------------
+            Tag::Binary | Tag::BitBinary => self.decode_bitstring(tag, heap),
+
+            // ---------------------------------------------------------------
             // `COMPRESSED` — top-level only
             // ---------------------------------------------------------------
             // The C accepts `COMPRESSED` (`80`) only as the outermost wrapper,
@@ -271,9 +276,7 @@ impl<'a> Decoder<'a> {
             // ---------------------------------------------------------------
             // Deliberately unsupported in M1 — never a wrong encoding
             // ---------------------------------------------------------------
-            Tag::Binary
-            | Tag::BitBinary
-            | Tag::NewFun
+            Tag::NewFun
             | Tag::Export
             | Tag::Fun
             | Tag::V4Port
@@ -383,6 +386,49 @@ impl<'a> Decoder<'a> {
         }
         crate::term::make_big(heap, negative, &bytes_to_digits(magnitude))
     }
+
+    /// Decodes `BINARY_EXT`/`BIT_BINARY_EXT` into an on-heap bitstring
+    /// (`external.c:4896-4923`).
+    ///
+    /// The wire is `[len:4 BE][data]` for a binary and `[len:4 BE][bits:1][data]`
+    /// for a bit binary — the length field comes **before** the trailing-bit count.
+    /// `len` is attacker-controlled, so it is checked against the bytes actually
+    /// left in the cursor *before* anything is allocated: a lying length is
+    /// `BeamError::BadArg`, never a blind allocation. For `BIT_BINARY_EXT` the
+    /// trailing-bit count must be `1..=8` and `len * 8` must be at least 8 (i.e.
+    /// `len != 0`), exactly as the C, and `size_in_bits = len * 8 - (8 - bits)`.
+    ///
+    /// The C clears the unused trailing bits of the last byte before copying; here
+    /// [`crate::term::make_bitstring`] zeroes them, so the term carries no garbage
+    /// from a hostile wire.
+    fn decode_bitstring(&mut self, tag: Tag, heap: &mut Heap) -> Result<Eterm> {
+        let len = self.reader.u32be()? as usize;
+        // `BIT_BINARY_EXT` carries the number of significant bits in the last byte
+        // right after the length; a plain binary is byte-aligned (a full 8).
+        let trailing_bits = if tag == Tag::BitBinary {
+            self.reader.u8()?
+        } else {
+            8
+        };
+        // A length past the end of the cursor is a lie: reject it rather than size an
+        // allocation from it.
+        if len > self.reader.remaining() {
+            return Err(bad_arg());
+        }
+        let data = self.reader.bytes(len)?;
+        // `len` is at most `u32::MAX`, so this cannot overflow on 64-bit; the guard
+        // keeps the arithmetic total on every target.
+        let size_in_bits = len.checked_mul(8).ok_or_else(system_limit)?;
+        if tag == Tag::BitBinary {
+            if !(1..=8).contains(&trailing_bits) || size_in_bits < 8 {
+                return Err(bad_arg());
+            }
+            let size_in_bits = size_in_bits - (8 - usize::from(trailing_bits));
+            crate::term::make_bitstring(heap, data, size_in_bits)
+        } else {
+            crate::term::make_binary(heap, data)
+        }
+    }
 }
 
 /// Decodes a `term_to_binary` image into `heap`, interning atoms into `atoms`.
@@ -476,8 +522,9 @@ mod tests {
 
     use crate::error::is_unsupported;
     use crate::term::{
-        big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts,
-        external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+        big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
+        external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
+        tuple_element,
     };
 
     /// `{ok,17}` (oracle: `term_to_binary({ok,17})`).
@@ -887,7 +934,15 @@ mod tests {
 
     #[test]
     fn truncation_at_every_offset_is_bad_arg() {
-        for image in [&OK_17[..], &LIST_123[..], &MAP_A_1[..]] {
+        // `<<"hi">>` and `<<1:3>>` exercise the binary / bit-binary length+payload
+        // headers as well.
+        for image in [
+            &OK_17[..],
+            &LIST_123[..],
+            &MAP_A_1[..],
+            &[131, 109, 0, 0, 0, 2, b'h', b'i'],
+            &[131, 77, 0, 0, 0, 1, 3, 0b0010_0000],
+        ] {
             for len in 0..image.len() {
                 let mut heap = Heap::new(256).unwrap();
                 let mut atoms = AtomTable::new();
@@ -900,6 +955,77 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Binaries and bitstrings
+    // -----------------------------------------------------------------------
+
+    /// The oracle images, captured from OTP 29.1.1 with
+    /// `io:format("~w~n", [term_to_binary(T)])`.
+    #[test]
+    fn binary_and_bit_binary_decode() {
+        // `<<"hi">>`: `[109][len:4 BE][data]`.
+        let (_h, _a, term) = decode(&[131, 109, 0, 0, 0, 2, 104, 105]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[104u8, 105][..], 0, 16));
+
+        // `<<>>`: a zero-length binary is legal (only `BIT_BINARY_EXT` rejects 0).
+        let (_h, _a, term) = decode(&[131, 109, 0, 0, 0, 0]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 0);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[][..], 0, 0));
+
+        // `<<1:3>>`: `[77][len:4 BE][bits:1][data]` — the length precedes the
+        // trailing-bit count, and the byte is `0b0010_0000` (MSB-first).
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 3, 0b0010_0000]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 3);
+        assert_eq!(
+            bitstring_bytes(term).unwrap(),
+            (&[0b0010_0000u8][..], 0, 3)
+        );
+
+        // `<<5:12>>`: 2 bytes, 4 significant bits in the last one.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 4, 0x00, 0x50]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 12);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[0x00u8, 0x50][..], 0, 12));
+
+        // `<<3:13>>`.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 5, 0x00, 0x18]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 13);
+
+        // `<<1:1>>`: `len = 1`, `bits = 1` ⇒ 1 bit (the C allows `size_in_bits < 8`
+        // after the trailing-bit adjustment, as long as `len != 0`).
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 1, 0b1000_0000]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 1);
+
+        // A trailing-bit count of 8 is accepted for backwards compatibility and is
+        // equivalent to the byte-aligned form.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 8, b'h', b'i']);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+
+        // The trailing (non-significant) bits of the last byte are normalised to zero.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 3, 0b0011_1111]);
+        assert_eq!(
+            bitstring_bytes(term).unwrap(),
+            (&[0b0010_0000u8][..], 0, 3)
+        );
+    }
+
+    #[test]
+    fn malformed_binaries_and_bit_strings_are_bad_arg() {
+        // A trailing-bit count outside `1..=8`.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 0, 0x00]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 9, 0x00]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 255, 0x00]);
+        // Zero bytes: `len * 8 < 8`.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 0, 8]);
+        // A length that lies past the end of the buffer (payload missing) — rejected
+        // *before* anything is allocated.
+        assert_bad_arg(&[131, 109, 0, 0, 0, 2, b'h']);
+        assert_bad_arg(&[131, 109, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 2, 3, b'h']);
+        // A bit-binary without even its trailing-bit byte.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1]);
+    }
+
     #[test]
     fn unknown_and_unsupported_tags() {
         // A byte that is not a tag at all.
@@ -910,8 +1036,6 @@ mod tests {
 
         // Every tag the M1 term layer does not support is reported, not guessed.
         for tag in [
-            Tag::Binary,
-            Tag::BitBinary,
             Tag::NewFun,
             Tag::Export,
             Tag::Fun,
@@ -929,9 +1053,6 @@ mod tests {
         // inside a term it is malformed too — never `unsupported`, never a term.
         assert_bad_arg(&[131, 80]);
         assert_bad_arg(&[131, 104, 1, 80]);
-
-        // The documented oracle vector for `<<"hi">>`.
-        assert_unsupported(&[131, 109, 0, 0, 0, 2, 104, 105]);
     }
 
     // -----------------------------------------------------------------------

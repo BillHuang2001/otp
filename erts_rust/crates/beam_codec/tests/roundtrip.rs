@@ -39,13 +39,13 @@ use beam_term::{
 use beam_codec::compress::{compress, decompress};
 use beam_codec::error::is_unsupported;
 use beam_codec::term::{
-    big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
+    big_parts, bitstring_bytes, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
     flatmap_parts, float_value, make_big, make_external_pid, make_external_port, make_external_ref,
     make_flatmap, make_float, tuple_arity, tuple_element,
 };
 use beam_codec::{
     decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
+    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
     INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
     NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
     SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, VERSION_MAGIC,
@@ -166,6 +166,17 @@ fn assert_term_eq(a: Eterm, ta: &AtomTable, b: Eterm, tb: &AtomTable) {
     if let Ok(fa) = float_value(a) {
         let fb = float_value(b).expect("expected a float");
         assert_eq!(fa.to_bits(), fb.to_bits(), "float bits differ");
+        return;
+    }
+    if let Ok((bytes_a, off_a, size_a)) = bitstring_bytes(a) {
+        let (bytes_b, off_b, size_b) = bitstring_bytes(b).expect("expected a bitstring");
+        assert_eq!(size_a, size_b, "bitstring size mismatch");
+        // Compare the significant bits (MSB-first inside each byte).
+        for i in 0..size_a {
+            let bit_a = (bytes_a[(off_a + i) / 8] >> (7 - ((off_a + i) % 8))) & 1;
+            let bit_b = (bytes_b[(off_b + i) / 8] >> (7 - ((off_b + i) % 8))) & 1;
+            assert_eq!(bit_a, bit_b, "bitstring bit {i} differs");
+        }
         return;
     }
     if let Ok(arity) = tuple_arity(a) {
@@ -1127,11 +1138,20 @@ fn unknown_tag_bytes_are_bad_arg() {
 }
 
 #[test]
-fn binary_ext_is_unsupported() {
-    // `<<"hi">>` — the documented unsupported case in Milestone 1.
-    assert_unsupported(&[131, 109, 0, 0, 0, 2, b'h', b'i']);
-    // The bare tag with no payload is still reported as unsupported, not as malformed.
-    assert_unsupported(&[VERSION_MAGIC, BINARY_EXT]);
+fn binaries_and_bitstrings_round_trip() {
+    // Byte-exact oracle images: `<<"hi">>` (BINARY_EXT) and `<<1:3>>` (BIT_BINARY_EXT).
+    let mut heap1 = heap(64);
+    let mut atoms1 = AtomTable::new();
+    let t = decode_term(&[131, 109, 0, 0, 0, 2, b'h', b'i'], &mut heap1, &mut atoms1).unwrap();
+    let (_b, _t2, _h, _a) = roundtrip(t, &atoms1, 64);
+
+    let mut heap2 = heap(64);
+    let mut atoms2 = AtomTable::new();
+    let t = decode_term(&[131, 77, 0, 0, 0, 1, 3, 0b0010_0000], &mut heap2, &mut atoms2).unwrap();
+    let (_b, _t2, _h, _a) = roundtrip(t, &atoms2, 64);
+
+    // The bare `BINARY_EXT` tag with a lying length is BadArg, not unsupported.
+    assert_bad_arg(&[VERSION_MAGIC, BINARY_EXT, 0, 0, 0, 5, b'h']);
 }
 
 #[test]

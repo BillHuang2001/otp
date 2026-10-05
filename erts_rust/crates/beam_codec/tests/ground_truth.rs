@@ -30,12 +30,19 @@
 //! map is likewise not canonicalised before encoding, so `MAP_A_1_B_2` pins one
 //! observed order; the decoder preserves the wire order and the encoder re-emits it.
 //!
-//! ## Deliberately unsupported
+//! ## Binaries and bitstrings
 //!
-//! `<<"hi">>` → `131,109,0,0,0,2,104,105` is kept as the documented *unsupported*
-//! case: `BINARY_EXT` terms have no constructor in the Stage-0 foundations yet, so
-//! the decoder reports the `unsupported` error rather than a wrong term (see the
-//! crate `CONTEXT.md`, "Known Issues").
+//! `BINARY_EXT` (`109`) and `BIT_BINARY_EXT` (`77`) are pinned below too, including
+//! the **byte-aligned** cases the oracle encodes as `BINARY_EXT` (`<<7:16>>`) versus
+//! the non-aligned ones it encodes as `BIT_BINARY_EXT` (`<<1:3>>`). The vectors were
+//! captured the same way as the rest; `oracle_term_to_binary_matches_when_erl_is_available`
+//! re-derives them from the system `erl` when one is on `PATH`.
+//!
+//! Note the ERTS storage divergence: ERTS keeps a binary larger than
+//! `ERL_ONHEAP_BINARY_LIMIT` (64 bytes) off-heap as a ref-counted `Binary`, while this
+//! crate materializes every binary as an on-heap `ErlHeapBits` block (see
+//! `beam_codec::term::make_binary`). The **wire** image is identical, which is what
+//! these vectors assert.
 //!
 //! These tests never use `unsafe`; the crate's only `unsafe` lives in
 //! `beam_codec::term`. Panicking on mismatch is intended (a failure is a test
@@ -43,10 +50,9 @@
 
 use beam_alloc::Heap;
 use beam_codec::compress::decompress;
-use beam_codec::error::is_unsupported;
 use beam_codec::term::{
-    big_parts, cons_head, cons_tail, external_pid_parts, external_ref_parts, flatmap_parts,
-    float_value, tuple_arity, tuple_element,
+    big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
+    external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
 };
 use beam_codec::{
     decode_term, encode_term, encode_term_body, encode_term_compressed, COMPRESSED_EXT,
@@ -495,17 +501,58 @@ fn compressed_option_falls_back_when_it_does_not_help() {
 }
 
 // ---------------------------------------------------------------------------
-// Documented unsupported case
+// Binaries and bitstrings — oracle vectors
 // ---------------------------------------------------------------------------
 
 #[test]
-fn binary_ext_is_unsupported() {
-    // `<<"hi">>` — the decoder must report the explicit "unsupported" error, never
-    // a wrong term (no binary constructor exists in the Stage-0 foundations yet).
+fn binary_hi_is_binary_ext() {
+    // `<<"hi">>` → `[109][len:4 BE][data]`.
     const BINARY_HI: &[u8] = &[131, 109, 0, 0, 0, 2, 104, 105];
-    let mut heap = Heap::new(64).expect("a 64-word heap is always available");
-    let mut atoms = AtomTable::new();
-    let err = decode_term(BINARY_HI, &mut heap, &mut atoms)
-        .expect_err("BINARY_EXT is unsupported in milestone 1");
-    assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+    let (_heap, _atoms, term) = round_trip(BINARY_HI);
+    assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+    assert_eq!(bitstring_bytes(term).unwrap(), (&[104u8, 105][..], 0, 16));
+}
+
+#[test]
+fn bit_aligned_bitstring_is_binary_ext() {
+    // `<<7:16>>` is byte-aligned, so the oracle still emits `BINARY_EXT` (`109`).
+    const BIT_7_16: &[u8] = &[131, 109, 0, 0, 0, 2, 0, 7];
+    let (_heap, _atoms, term) = round_trip(BIT_7_16);
+    assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+    assert_eq!(bitstring_bytes(term).unwrap(), (&[0u8, 7][..], 0, 16));
+}
+
+#[test]
+fn empty_binary_is_binary_ext() {
+    // `<<>>` → `[109][len:4 BE = 0]`.
+    const EMPTY_BINARY: &[u8] = &[131, 109, 0, 0, 0, 0];
+    let (_heap, _atoms, term) = round_trip(EMPTY_BINARY);
+    assert_eq!(bitstring_size_bits(term).unwrap(), 0);
+    assert_eq!(bitstring_bytes(term).unwrap(), (&[][..], 0, 0));
+}
+
+#[test]
+fn non_aligned_bitstrings_are_bit_binary_ext() {
+    // `[77][len:4 BE][bits:1][data]` — the length field precedes the trailing-bit
+    // count, and `data` is MSB-first inside each byte.
+    for &(image, n_bits) in &[
+        (&[131u8, 77, 0, 0, 0, 1, 1, 128][..], 1usize), // <<1:1>>
+        (&[131, 77, 0, 0, 0, 1, 3, 0b0010_0000], 3),    // <<1:3>>
+        (&[131, 77, 0, 0, 0, 2, 4, 0, 0x50], 12),       // <<5:12>>
+        (&[131, 77, 0, 0, 0, 2, 5, 0, 0x18], 13),       // <<3:13>>
+    ] {
+        let (_heap, _atoms, term) = round_trip(image);
+        assert_eq!(bitstring_size_bits(term).unwrap(), n_bits);
+    }
+}
+
+#[test]
+fn large_binary_round_trips_through_the_wire() {
+    // `list_to_binary(lists:seq(1,100))` — 100 bytes, past `ERL_ONHEAP_BINARY_LIMIT`
+    // (64): ERTS stores it off-heap as a ref-counted binary, but the wire image is the
+    // same `[109][len:4 BE][data]` and this crate materializes it on-heap.
+    let mut image = vec![131u8, 109, 0, 0, 0, 100];
+    image.extend(1u8..=100);
+    let (_heap, _atoms, term) = round_trip(&image);
+    assert_eq!(bitstring_size_bits(term).unwrap(), 800);
 }
