@@ -74,6 +74,13 @@ Key findings:
    compiler-level fusion/FBIP; and Rust replacements for isolated C components), rather than a
    from-scratch VM. Reserve the "clean-room Rust BEAM" as a research track, not a product plan.
 
+7. **Per-process isolation is the architecture; its copies are the price.** Every local send
+   deep-copies the whole term graph (`copy_struct_x` `copy.c:647`) and ETS copies on every put and
+   read, because per-process heaps with a moving GC forbid cross-heap pointers and BEAM has no write
+   barrier. Cheap sharing already exists (refc binaries, literal areas, `persistent_term`); the
+   reachable win is *widening that sharing template*, not general zero-copy messaging, which needs a
+   refcounted shared-heap term class plus write barriers. See §D, §E.5 and Part II §D.
+
 ---
 
 ## A. The compatibility map (what "full compatibility" actually requires)
@@ -235,6 +242,31 @@ The plan explicitly says: *use low-latency design over heavy JIT*. The history b
   copy cost; the `enigma` Rust-BEAM project listed "explore Immix" as a goal). Off-heap reference
   counting for large immutable objects (binaries, funs) should be kept — it is the right design.
 
+**Process isolation, messaging and shared data (ETS)**
+- *Copy-on-send is fundamental.* A local send of a non-immediate term deep-copies the whole graph into
+  the receiver's heap/queue (`erts_send_message` `erl_message.c:698` → `copy_struct_x` `copy.c:647`,
+  reductions ∝ size). Per-process heaps + a moving GC forbid cross-heap pointers; immutability gives a
+  barrier-free generation invariant; the copy buys O(1) process death and remote ETF encoding for free.
+- *Shared cheaply* (small heap handle + pointer-free, immutable, refcounted-or-permanent payload):
+  immediates, **refc binaries > 64 B** (`copy.c:812-848`), module **literals**, **`persistent_term`**,
+  external pid/port/ref. *Copied:* funs incl. environment, lists, maps, tuples, bignums, floats,
+  small (≤64 B) binaries.
+- *The direction is to widen that template* — more immutable term classes / a register-once-read-many
+  registry — not to make messaging generally zero-copy, which needs a new refcounted shared-heap term
+  class *plus* write barriers (any class whose payload holds tagged `Eterm` pointers would need them).
+- *ETS is already an off-heap shared store* (table-owned `DbTerm`, `DB_TERM`, unaccounted to any
+  process), yet **every put copies in and every read copies out**: `lookup` copies whole objects,
+  `lookup_element`/`first`/`next` element/key granularity, match/select each result; nested **refc
+  binaries are reference-shared on put and read** — the one exception, covering large payloads.
+- *Zero-copy ETS reads are not realistic*: they need a new first-class off-heap boxed term type
+  understood by *every* consumer (BIFs, guards/PAM, ETF, GC, introspection) plus invalidation safety and
+  GC pinning — only refc binaries meet the sharing conditions today. A *narrow* borrowed binary/snapshot
+  is conceivable; otherwise the wins are incremental.
+- *Precedent.* **Pony/ORCA** (OOPSLA'17) earns zero-copy message passing via a data-race-free type
+  system co-designed with per-actor RC; **JVM/.NET** instead share one heap (no message copies) behind a
+  global/STW-style collector. *Tunable, not removable:* on-/off-heap message queues (`+hmqd`); received
+  fragments are adopted, not re-copied. See Part II §D.
+
 **Persistent/functional data structures**
 - The interface is fixed: a list is a cons list (`[H|T]` O(1) and shareable, value semantics) and maps
   stay persistent. What is open is the **interior layout** — and OTP already ships *two* layouts behind
@@ -344,6 +376,20 @@ raise the ceiling **without** abandoning the latency principle:
   allows. Network-only workloads see marginal changes (epoll is already good) and can even regress —
   benchmark per workload, don't assume.
 - Keep the current model's virtues: ONESHOT + re-arm, scheduler pollset, backpressure accounting.
+
+### E.5 Process isolation, messaging and ETS
+- **Local sends deep-copy; that is the architecture, not a gap.** `!` reaches `erts_send_message`
+  (`erl_message.c:698`) → `copy_struct_x` (`copy.c:647`), copying the whole term graph into the
+  receiver's heap or fragment. Per-process heaps plus a moving GC make cross-heap pointers illegal, and
+  BEAM's barrier-free design (immutability ⇒ no remembered set) leaves no cheap way to share mutable terms.
+- **What is already shared** follows one template — a small heap handle plus a pointer-free, immutable,
+  refcounted-or-permanent payload outside every heap: refc binaries > 64 B, module literals,
+  `persistent_term`, immediates (everything else is copied). The reachable direction is widening that
+  template, *not* zero-copy messaging (which needs a shared-heap term class plus write barriers).
+- **ETS** keeps objects off-heap in table-owned memory (unaccounted to any process) but copies every put
+  in and read out; `lookup_element`/`first`/`next` already copy at element/key granularity, and nested
+  refc binaries are reference-shared. Whole-object zero-copy reads are unrealistic (a new boxed off-heap
+  term type plus invalidation and pinning), so the wins there are incremental. Detail: Part II §D.
 
 **Level 1 verdict:** achievable, but it is a *large compatibility re-implementation* with *modest
 net performance upside* and *targeted* robustness upside. The JIT-register-allocation and I/O items
@@ -486,7 +532,11 @@ delivers value and can be abandoned without loss:
    B-tree; and extend destructive update + reuse analysis (FBIP) to maps/lists/binaries. The **cache-friendly
    list interior** (chunked/unrolled lists with opportunistic chunking, RRB/finger-tree sequences) is a
    VM+compiler co-design that rides on this FBIP work. Measure allocation/GC-pressure reduction. These can
-   land in `lib/compiler` + `erts` **without changing the ISA**.
+   land in `lib/compiler` + `erts` **without changing the ISA**. Add **ETS copy-trimming** (element/key
+   reads — already present — plus avoiding redundant copies when building match results, and the
+   `ordered_set` node layout), tune the on/off-heap message-queue trade-off (`+hmqd`), and keep
+   **widening the off-heap shared-term template** (refcounted immutable terms / literal-area registry) as a
+   research sub-item.
 4. **Workstream 4 — targeted Rust adoption (robustness, low risk).**
    Rewrite isolated, high-CVE, self-contained components in Rust behind the existing C ABI — e.g.
    the ETF/distribution codec, term decoders, the poller, allocators, or a socket backend — and
@@ -513,6 +563,9 @@ ecosystem-recompile story exist.
 | `io_uring` backend behind reactor | Medium | Medium (file I/O), low (net) | Low | Low | **Yes** |
 | Compiler fusion + loop opts + FBIP | Medium–high | Medium | Low | Medium | **Yes** |
 | ETS `ordered_set` → K-ary B-tree; flatmap/CHAMP tweaks | Low–medium | Low–medium | Low | Low | **Yes** |
+| Cheaper ETS put/read (incremental: element/key reads, match-copy trimming, `ordered_set` node layout) | Low–medium | Low–medium | Low | Low | **Yes** |
+| Widen off-heap shared-term template (refcounted immutable terms / literal-area registry) | High | Low–medium | Low | High | Research / not now |
+| Zero-copy ETS reads (borrowed off-heap view) | High | Low (repeated large-object reads only) | Low | High | No (not realistic; narrow binary view only) |
 | Cache-friendly list interior (chunked lists + FBIP; RRB/finger-tree) | High (VM+compiler) | Medium (gated on §F.2) | Low | Medium–high | Explore with compiler work |
 | Rust for isolated high-CVE components | Medium | Low | **High** | Low | **Yes** |
 | GC redesign (mark-region/Immix) | High | Uncertain | Medium | High | Evaluate only |
@@ -530,6 +583,9 @@ ecosystem-recompile story exist.
 6. **Team & timeline**: is this a research project or a shipping replacement, and by when?
 7. **Relationship to upstream OTP**: fork, upstream contributions, or parallel track? (Affects
    whether Workstreams 1–4 can be upstreamed — which they mostly can.)
+8. **Is the copy actually the bottleneck?** How much real messaging/ETS traffic is large immutable
+   payloads already shared by reference (refc binaries) versus small, copy-bound terms? Measure this
+   before gating any sharing work on it.
 
 ---
 
@@ -542,6 +598,8 @@ ecosystem-recompile story exist.
 - `erts/emulator/beam/erl_term.h`, `erl_gc.c`, `copy.c`, `erl_map.c`, `erl_bits.c`, `erl_binary.h`,
   `erl_alloc*.c`; `beam/jit/` (x86/arm), `beam/emu/`; `sys/common/erl_poll.c`, `erl_check_io.c`;
   `nifs/{common,unix,win32}`; `beam/bif.tab`, `erl_dirty_bif.tab`, `erl_nif*.h`, `erl_driver.h`.
+- `erts/emulator/beam/{erl_message.c,copy.c,erl_proc_sig_queue.c,erl_db_util.c,erl_db_hash.c,erl_db_tree.c,erl_binary.c,erl_bits.c,erl_bif_persistent.c,erl_gc.c}`
+  (messaging and copy engine, ETS storage/copy semantics, shared reference-counted off-heap objects).
 - `lib/compiler/src/` (`compile.erl`, `beam_ssa*`, `beam_types`, `beam_ssa_opt`, `genop.tab`),
   `internal_doc/beam_ssa.md`.
 
@@ -558,4 +616,8 @@ ecosystem-recompile story exist.
 - `io_uring` evaluations (completion-based, zero-copy; ping-pong vs streaming):
   https://arxiv.org/html/2512.04859v1 ; https://github.com/axboe/liburing/issues/536
 - Cache-friendly persistent structures: unrolled/"colony" linked lists; **RRB-Trees** (Bagwell & Rompf, EPFL) — Clojure/Scala persistent vectors; Haskell `Data.Sequence` (finger trees); Clojure `PersistentArrayMap` (≤8) → `PersistentHashMap` (32-way) small-size switch (the analog of BEAM's flatmap → HAMT); CHAMP; FBIP (Perceus/Koka/Lean reuse analysis).
+- Pony **ORCA** — GC and type-system co-design for actor languages (OOPSLA 2017):
+  https://www.ponylang.io/media/papers/orca_gc_and_type_system_co_design_for_actor_languages.pdf
+- Erlang binary handling (refc binaries, off-heap sharing): https://www.erlang.org/doc/system/binaryhandling.html
+- Erlang garbage collection (per-process generational copying): https://www.erlang.org/doc/apps/erts/garbagecollection.html
 - Prior art: `archseer/enigma` (Erlang VM in Rust, stalled); *Tyn* (Rust microkernel hosting real ERTS).
