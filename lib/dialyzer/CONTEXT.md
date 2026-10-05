@@ -60,7 +60,7 @@ Default PLT locations come from `DIALYZER_PLT`/`DIALYZER_IPLT` or the OS user ca
 - `src/` → the application's Erlang sources (public API `dialyzer`, CLI, callgraph, code server, solvers, PLT cplt/iplt/plt, `erl_types`/`erl_bif_types`, `typer`); see `src/CONTEXT.md`
 - `test/` → Common Test suites + `*_SUITE_data` fixtures and the PLT-building helpers; see `test/CONTEXT.md`
 - `doc/` → ExDoc/man sources (guide chapter, typer CLI reference, release notes `notes.md`); see `doc/CONTEXT.md`
-- `plt/` → build output for the app's own Dialyzer PLT (git-ignored; only `.gitignore` tracked)
+- `plt/` → empty legacy placeholder dir (git-tracked only via an empty `.gitignore`); NOT where the app's PLT is built (that is `priv/plt/dialyzer.plt`, created at build time by `make dialyzer_plt`)
 - `ebin/` → build output (`dialyzer.app`/`dialyzer.appup`/`.beam`; git-ignored, only `.gitignore` tracked)
 - `Makefile`, `vsn.mk`, `AUTHORS`, `README`, `RELEASE_NOTES` → app build metadata and top-level docs at this node
 
