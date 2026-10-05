@@ -261,7 +261,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 - `src/operand.rs` → `Operand` read (→ `Eterm`) / write (register or Y slot) + unsupported-operand errors
 - `src/predicates.rs` → an `#[allow(unsafe_code)]` module: SAFETY-annotated wrappers over the `unsafe fn` `beam_term` boxed-term predicates (`is_integer`, `is_tuple`, `is_map`, …) used by the `Test` opcodes
 - `src/terms.rs` → the SAFETY-annotated boxed-term builder/reader (`make_tuple`/`make_cons`/`make_list`/`badmatch_reason`/`make_float`/`make_flatmap`/`make_fun`/`make_heap_binary` + `tuple_*`/`cons_*`/`list_elements`/`float_value`/`map_entries` (flatmap + HAMT)/`binary_bytes`/`fun_*` readers) over `ExecutionContext::alloc_words`
-- `src/jit.rs` → JIT tier stubs + tiering design (Cranelift behind `jit-cranelift`, default off)
+- `src/jit/mod.rs` → the execution-tier seam: `Tier`, the `JitBackend` trait, `available_tiers()`, the compiled-in roster (native backends `baseline.rs`/`emitter.rs`/`cranelift.rs` are future submodules here)
 - `src/error.rs` → engine error constructors over `beam_common::BeamError` (`unsupported`, `bad_register`, `unknown_label`)
 - `src/families/mod.rs` → the `dispatch` seam: tries the eight families in a fixed order (`tuples`, `records`, `lists`, `funs`, `exceptions`, `floats`, `maps`, `bitstrings`), else the documented `unsupported`
 - `src/families/tuples.rs` → `PutTuple2`/`GetTupleElement`/`SelectTupleArity`
