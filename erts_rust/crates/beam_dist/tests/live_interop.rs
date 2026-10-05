@@ -13,7 +13,8 @@
 //!
 //! 1. **Handshake interoperability.** A real `erl` node (`-sname`, OTP 29 /
 //!    erts-17.1) accepts this crate's `Name`/`ChallengeReply` messages and answers
-//!    with `Status`/`Challenge`/`ChallengeAck`/`Complement`; the cookie digest
+//!    with `Status`/`Challenge`/`ChallengeAck` (the OTP-23 `'N'` handshake
+//!    exchanges no `Complement`); the cookie digest
 //!    (`MD5(cookie ++ decimal(challenge))`, [`beam_dist::auth`]) is accepted by the
 //!    node and the node's own digest is accepted here, so both sides authenticate
 //!    each other. `peer_name()`/`peer_creation()` report the node that was started
@@ -24,7 +25,8 @@
 //!    is the empty atom and whose `ToName` is a registered process, is decoded and
 //!    delivered by the real node — proven by the message appearing on the node's
 //!    stdout (`GOT {hello,42}`). This exercises the distribution header envelope,
-//!    the `beam_codec` term payload and the external-pid block end to end.
+//!    the real `{DOP_*, …}` control tuple (the opcode is a `SMALL_INTEGER_EXT`
+//!    term), the `beam_codec` term payload and the external-pid block end to end.
 //! 3. **Message interoperability (inbound, best effort).** When the node replies
 //!    to the client pid (`From ! {echo, 42}`) the reply is routed back over the
 //!    *same* connection and decoded by [`Connection::recv`]. This depends on the
