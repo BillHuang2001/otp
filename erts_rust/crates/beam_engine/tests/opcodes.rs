@@ -960,7 +960,7 @@ fn generic_opcode_is_unsupported() {
 }
 
 #[test]
-fn float_register_operand_is_unsupported() {
+fn float_register_operand_is_read_from_the_fr_file() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Test {
@@ -975,7 +975,9 @@ fn float_register_operand_is_unsupported() {
     let mut fixture = Fixture::new();
     let entry = fixture.add_function("f", 0, code);
     let module = fixture.finish();
-    assert!(run(&module, entry, &[]).is_err());
+    // The FR file defaults to NIL, so `is_integer(FloatReg(0))` is readable and
+    // fails the test, branching to the fail label (which returns `x(0) == NIL`).
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(NIL));
 }
 
 #[test]

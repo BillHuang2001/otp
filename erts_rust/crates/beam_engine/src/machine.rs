@@ -22,6 +22,16 @@ use crate::interpreter;
 /// X-register file size (the `beam_emu.c` `MAX_REG` bound).
 pub const MAX_REGISTER: u32 = 1024;
 
+/// Float-register (FR) file size.
+///
+/// The C runtime's float-register file is
+/// `union { FloatDef d[MAX_REG]; ... } f_reg_array`
+/// (`../../erts/emulator/beam/erl_process.h`) with `#define MAX_REG 1024`
+/// (`../../erts/emulator/beam/erl_vm.h:49`), so the FR file mirrors the real FR
+/// count (1024) — the same bound as [`MAX_REGISTER`]. The C JIT bounds the index
+/// to `0..=1023` (`../../erts/emulator/beam/jit/x86/beam_asm.hpp`).
+pub const MAX_FLOAT_REGISTER: u32 = 1024;
+
 /// Where a frame returns to.
 ///
 /// The interpreter stores this in each frame's continuation-pointer slot instead
@@ -54,6 +64,14 @@ pub(crate) struct Frame {
 pub struct Machine {
     /// The X-register file (`x[0..max_register)`); the engine's argument/result file.
     pub(crate) x: Vec<Eterm>,
+    /// The float-register (FR) file (`fr[0..MAX_FLOAT_REGISTER)`).
+    ///
+    /// At Milestone 1 this stores `Eterm` term slots — float registers hold terms,
+    /// uniformly with the x-register file — so the existing [`crate::operand`]
+    /// read/write seam (which returns/takes `Eterm`) can service `Operand::FloatReg`.
+    /// The faithful raw-double `FloatDef` model (`f_reg_array`) is a **deferred
+    /// refinement**; the field deliberately does **not** store `f64`.
+    pub(crate) fr: Vec<Eterm>,
     /// The Erlang stack: the Y-slot words of every live frame, oldest first.
     pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
@@ -72,6 +90,7 @@ impl Machine {
     pub fn with_max_register(max_register: u32) -> Machine {
         let mut machine = Machine {
             x: Vec::new(),
+            fr: Vec::new(),
             stack: Vec::new(),
             frames: Vec::new(),
             max_register,
@@ -126,6 +145,27 @@ impl Machine {
         self.x.get(n as usize).copied()
     }
 
+    /// Read float register `n`, or `None` if it is outside the FR file.
+    ///
+    /// Mirrors [`Machine::x`]: a bounds-checked read of the FR file.
+    pub fn get_fr(&self, n: u32) -> Option<Eterm> {
+        self.fr.get(n as usize).copied()
+    }
+
+    /// Write `value` into float register `n`.
+    ///
+    /// Mirrors [`Machine::set_x`]: returns [`crate::error::bad_register`] if `n` is
+    /// outside the FR file.
+    pub fn set_fr(&mut self, n: u32, value: Eterm) -> Result<()> {
+        match self.fr.get_mut(n as usize) {
+            Some(slot) => {
+                *slot = value;
+                Ok(())
+            }
+            None => Err(error::bad_register(n)),
+        }
+    }
+
     /// Read Y slot `k` of the **current** frame, or `None` if there is no frame or
     /// `k` is outside the frame's Y slots.
     pub(crate) fn y(&self, k: u32) -> Option<Eterm> {
@@ -151,6 +191,9 @@ impl Machine {
     pub fn reset(&mut self) {
         self.x.clear();
         self.x.resize(self.max_register as usize, Eterm::default());
+        self.fr.clear();
+        self.fr
+            .resize(MAX_FLOAT_REGISTER as usize, Eterm::default());
         self.stack.clear();
         self.frames.clear();
     }
@@ -314,6 +357,50 @@ mod tests {
     fn with_max_register_bounds_the_file() {
         let machine = Machine::with_max_register(4);
         assert_eq!(machine.x, vec![Eterm::default(); 4]);
+    }
+
+    #[test]
+    fn new_has_nil_filled_float_register_file() {
+        let machine = Machine::new();
+        assert_eq!(machine.fr.len(), MAX_FLOAT_REGISTER as usize);
+        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+        assert_eq!(machine.get_fr(0), Some(Eterm::default()));
+        assert_eq!(
+            machine.get_fr(MAX_FLOAT_REGISTER - 1),
+            Some(Eterm::default())
+        );
+        assert_eq!(machine.get_fr(MAX_FLOAT_REGISTER), None);
+    }
+
+    #[test]
+    fn set_fr_get_fr_round_trip_in_range() {
+        let mut machine = Machine::new();
+        let v = Eterm::from_raw(0x5F5F);
+        assert!(machine.set_fr(10, v).is_ok());
+        assert_eq!(machine.get_fr(10), Some(v));
+        assert_eq!(machine.get_fr(11), Some(Eterm::default()));
+    }
+
+    #[test]
+    fn fr_access_is_bounds_checked() {
+        let mut machine = Machine::new();
+        assert_eq!(machine.get_fr(MAX_FLOAT_REGISTER), None);
+        let err = machine.set_fr(MAX_FLOAT_REGISTER, Eterm::from_raw(1));
+        assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
+    }
+
+    #[test]
+    fn reset_clears_a_dirty_float_register() {
+        let mut machine = Machine::new();
+        machine.set_fr(3, Eterm::from_raw(0x77)).unwrap();
+        machine.set_x(0, Eterm::from_raw(0x88)).unwrap();
+        machine.reset();
+        assert_eq!(machine.fr.len(), MAX_FLOAT_REGISTER as usize);
+        assert!(machine.fr.iter().all(|slot| *slot == Eterm::default()));
+        assert_eq!(machine.get_fr(3), Some(Eterm::default()));
+        // The x-register behavior is untouched by the FR reset.
+        assert_eq!(machine.x.len(), MAX_REGISTER as usize);
+        assert_eq!(machine.x(0), Some(Eterm::default()));
     }
 
     #[test]

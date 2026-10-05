@@ -17,14 +17,15 @@ use crate::machine::Machine;
 /// Evaluate a `.beam` operand to a term in the current machine state.
 ///
 /// Supported: `X(n)`/`Y(n)`/`Typed{reg,..}` (the register's term, bounds-checked
-/// to [`crate::error::bad_register`]), `Integer(i)`/`Character(c)` (`make_small`),
-/// `Atom(a)` (`make_atom`) and `Nil` (`NIL`). `FloatReg`/`Literal`/`Label`/
-/// `List`/`Allocation` are the documented Milestone-1 gaps and return a typed
-/// error.
+/// to [`crate::error::bad_register`]), `FloatReg(n)` (the FR-file term, likewise
+/// bounds-checked), `Integer(i)`/`Character(c)` (`make_small`), `Atom(a)`
+/// (`make_atom`) and `Nil` (`NIL`). `Literal`/`Label`/`List`/`Allocation` are the
+/// documented Milestone-1 gaps and return a typed error.
 pub(crate) fn read_operand(machine: &Machine, operand: &Operand) -> Result<Eterm> {
     match operand {
         Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Y(n) => machine.y(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::FloatReg(n) => machine.get_fr(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Typed { reg, .. } => read_register(machine, *reg),
         Operand::Integer(i) => Ok(make_small(*i)),
         Operand::Atom(a) => Ok(make_atom(*a)),
@@ -36,11 +37,13 @@ pub(crate) fn read_operand(machine: &Machine, operand: &Operand) -> Result<Eterm
 
 /// Write a term into the operand's destination register / Y slot.
 ///
-/// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`; anything else is a typed error.
+/// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`/`FloatReg(n)`; anything else is a
+/// typed error.
 pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Eterm) -> Result<()> {
     match operand {
         Operand::X(n) => machine.set_x(*n, value),
         Operand::Y(n) => machine.set_y(*n, value),
+        Operand::FloatReg(n) => machine.set_fr(*n, value),
         Operand::Typed { reg, .. } => write_register(machine, *reg, value),
         _ => Err(error::unsupported("dst operand")),
     }
@@ -65,7 +68,6 @@ fn write_register(machine: &mut Machine, reg: Reg, value: Eterm) -> Result<()> {
 /// A stable label for an unsupported operand kind (used in the error reason).
 fn operand_kind(operand: &Operand) -> &'static str {
     match operand {
-        Operand::FloatReg(_) => "operand: float register",
         Operand::Literal(_) => "operand: literal",
         Operand::Label(_) => "operand: label",
         Operand::List(_) => "operand: list",
@@ -129,11 +131,46 @@ mod tests {
     #[test]
     fn read_unsupported_operands_are_typed_errors() {
         let machine = Machine::new();
-        assert!(read_operand(&machine, &Operand::FloatReg(0)).is_err());
         assert!(read_operand(&machine, &Operand::Literal(0)).is_err());
         assert!(read_operand(&machine, &Operand::Label(Label(1))).is_err());
         assert!(read_operand(&machine, &Operand::List(vec![])).is_err());
         assert!(read_operand(&machine, &Operand::Allocation(vec![])).is_err());
+    }
+
+    #[test]
+    fn float_register_round_trips_through_the_fr_file() {
+        let mut machine = Machine::with_max_register(4);
+        // The FR file defaults to NIL.
+        assert_eq!(
+            read_operand(&machine, &Operand::FloatReg(0)).unwrap(),
+            Eterm::default()
+        );
+
+        // set_fr then read_operand(FloatReg(..)) returns the set term.
+        let v = make_small(1234);
+        machine.set_fr(0, v).unwrap();
+        assert_eq!(read_operand(&machine, &Operand::FloatReg(0)).unwrap(), v);
+
+        // write_operand(FloatReg(..), v) stores into the FR file.
+        let w = make_small(5678);
+        write_operand(&mut machine, &Operand::FloatReg(1), w).unwrap();
+        assert_eq!(machine.get_fr(1), Some(w));
+    }
+
+    #[test]
+    fn out_of_range_float_register_is_a_typed_error() {
+        let mut machine = Machine::new();
+        let err = read_operand(
+            &machine,
+            &Operand::FloatReg(crate::machine::MAX_FLOAT_REGISTER),
+        );
+        assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
+        let err = write_operand(
+            &mut machine,
+            &Operand::FloatReg(crate::machine::MAX_FLOAT_REGISTER),
+            NIL,
+        );
+        assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]
