@@ -13,5 +13,5 @@ use beam_common::BeamError;
 /// The `badarg` failure of a malformed table operation (bad object, bad
 /// `keypos`, missing element, unsupported match spec, …).
 pub(crate) fn badarg() -> BeamError {
-    unimplemented!("M1: implementation pending")
+    BeamError::BadArg
 }
