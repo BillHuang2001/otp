@@ -18,8 +18,8 @@ current public sources. In-tree claims cite `file:line`; external claims are ref
 
 ## 0. Headline revisions to Part I
 
-Part I's compatibility map, baseline numbers and history stand. Four conclusions are **sharpened**, and one is
-**inverted**:
+Part I's compatibility map, baseline numbers and history stand. Four conclusions are **sharpened or corrected**,
+and one is **inverted**:
 
 1. **A "core-only" rewrite does not shrink the compatibility burden — it relocates it.** Keeping the C periphery
    (NIF loader, ETS, distribution, drivers) forces the Rust core to reproduce the *internal* representation
@@ -27,12 +27,14 @@ Part I's compatibility map, baseline numbers and history stand. Four conclusions
    seam is the **execution engine** (`beam_asm.h` + register/offset/`ErtsCodeInfo` contract) — a Ruby-YJIT-shaped
    move. Everything else is a **link-time** boundary sharing frozen headers, not an API boundary. (§A)
 
-2. **Data-structure layout is *not* the dominant bottleneck — and the "naive structures" intuition is mostly wrong
-   for lists/maps.** Cons lists and the flatmap/HAMT are already close to optimal for BEAM's value semantics; fresh
-   lists are bump-allocated contiguously. The genuinely impactful, *observable-free* representation win is **ETS
-   `ordered_set` (an AVL tree → a K-ary B-tree)**. Everything else the user feels as "slow" is either inherent to
-   cons lists (`++` copies its LHS; O(n) `member`/`keyfind`) or a **per-element dispatch cost** that only a
-   **compiler** (fusion / reuse) can remove. (§B, §C)
+2. **Data structures: the abstract value is fixed, the interior is an open, cache-friendly design space.**
+   A list must stay a cons list (`[H|T]` O(1) and shareable) and the map stays persistent — but the *internal*
+   layout beneath that interface is legitimately open, and OTP already ships dual layouts behind one abstract
+   value (small map flatmap → HAMT; small on-heap binary → off-heap `BinRef`). The promising direction is a
+   **third hybrid**: cache-friendly interior representations — chunked/unrolled cons lists with opportunistic
+   chunking, and RRB/finger-tree interiors for sequence-like loads — paired with FBIP. Its payoff is gated on the
+   §E compiler work, and it is not on its own the dominant bottleneck (that is per-element dispatch + allocation);
+   **ETS `ordered_set` (AVL → K-ary B-tree)** is the one independent, low-risk, self-contained win. (§B, §C)
 
 3. **The Enum-vs-Stream paradox is real and explains itself.** Eager `Enum.map` allocates a cons cell per element,
    and BEAM's bump allocation makes that about as cheap as an allocation can be (~60 cells = 1 reduction); a *lazy*
@@ -130,47 +132,68 @@ the *last* stage, not the entry point.
 
 ---
 
-## B. Data structures — where the cost actually is
+## B. Data structures — the abstract value is fixed; the cache-friendly interior is open
 
-The user's pushback — "data-structure inefficiency is the dominant bottleneck; vectors beat linked lists; K-ary
-beats binary; `++` and search are painfully slow" — is **partly right and partly a misdiagnosis**. Grounding:
+Part I's blanket "changing the representation of lists is a trap" **overshot and misread the intent**. The intent is
+**not** to replace cons lists with vectors. At the interface a list **stays a cons list** — `[H|T]` O(1) and
+shareable, value semantics, persistent map — but the **interior layout** beneath that interface is a legitimate,
+cache-friendly design space. That is not foreign to OTP: it already ships **two physical layouts behind one abstract
+value**, switching on size, invisibly — small map = packed `flatmap_t` (sorted keys tuple + parallel values) →
+large map = HAMT at `MAP_SMALL_MAP_LIMIT` (`erl_map.h:57-97`); small binary = on-heap `ErlHeapBits` (≤64 B) →
+off-heap ref-counted `BinRef` (`erl_bits.h:135-172`). The question is whether a **third hybrid — for lists — is worth
+it**. Answer: *promising, and gated on compiler/FBIP work.*
 
-| Structure | Representation | The real cost |
-|---|---|---|
-| **List** | header-less 2-word `[CAR,CDR]`, tagged `TAG_PRIMARY_LIST` (`erl_term.h:71,219-244`) | **Already locality-optimal**: bump allocation (`HAllocX`, `erl_vm.h:148-156`) lays fresh lists out contiguously; the copying GC **compacts** survivors (`erl_gc.c:1385`). `++`/`lists:append` **copies its LHS** (`erl_bif_lists.c:142-153,196-205`); `member`/`keyfind` are O(n) C BIFs (`erl_bif_lists.c:1108-1142,1301-1381`). These are **inherent to cons cells**, not a representational defect. |
-| **Map ≤32 keys** | **flatmap** = sorted keys tuple + parallel values array, **linear scan** (`erts_maps_get`, `erl_map.c:204-217`); keys kept sorted (`erl_map.c:3187-3216`) | For n≤32 with immediate keys the loop is word comparisons over an L1-resident array (~16 words avg) — **deliberately** linear; a binary search via the type-branching `erts_cmp_flatmap_keys` would be *slower*. `MAP_SMALL_MAP_LIMIT = 32` (`erl_map.h:93-97`) sits at the crossover. `put`/`update` is a **persistent copy** but **shares the keys tuple** (`erl_map.c:2055-2092`) — cheap, and sharing is `erts_debug:same/2`-visible. |
-| **Map >32 keys** | HAMT, 4-bit/16-way, 16-bit bitmap/node (`erl_map.h:142-146,218`) | Standard; residual win is node density/iteration locality (CHAMP-style). |
-| **Tuple/record** | `[make_arityval(N), e1..eN]` | OTP-27 destructive update fires **only when the record is on the young heap above the high-watermark** (`emu/instrs.tab:804-834`); `setelement` always copies (`bif.c:2995-3001`). CoW still hurts for promoted/shared records. |
-| **Binary** | on-heap `ErlHeapBits` ≤64 B/≤512 bits, else off-heap ref-counted `BinRef` (`erl_bits.h:150-168`) | **Already good**: append is amortized O(1) via the writable/`private_append` path with doubling (`erl_bits.c:72-73,1816-1819`); iolist→binary is one two-pass alloc+copy (`erl_iolist.c:837-901`). |
-| **ETS `ordered_set`** | **AVL tree, one separately allocated node per key** (`erl_db_tree.c:25`; node `erl_db_tree.h:28-32`; alloc `erl_db_util.c:3370`) — pointer chase per level | **The one real representation win.** A K-ary B-tree (K≈16–32) / cache-oblivious layout collapses height and packs keys per cache line. Fully **observable-preserving** (only total key order is observable). |
+### B.1 The promising direction — cache-friendly hybrid lists
+Keep the cons-list *interface*; make the interior cache-friendly the way small maps already are:
+- **Chunked / unrolled cons list** — a node holds up to K elements (K ≈ 16–32) inline + a next pointer, turning
+  build / walk / `map` / `filter` / `foldl` / `++` into tight array loops with one allocation per K (the classic
+  unrolled-list technique; cf. "colony" lists).
+- **Opportunistic chunking, cons fallback** — emit chunks only where the producer/consumer pattern allows and fall
+  back to plain 2-word cells otherwise (the same "packed-small / structured-large" switch the map already does); a
+  list *could* be either representation, chosen by construction pattern rather than by type.
+- **RRB-trees / finger trees as internal sequences** — for `array`-/`queue`-like loads needing O(log n)
+  concat/split, a relaxed-radix or finger-tree interior beats a cons chain (they back Clojure/Scala persistent
+  vectors and Haskell `Data.Sequence`).
 
-**Mapping the user's specific examples:**
-- *"C++ `std::vector` beats linked lists"* — true in general, but an Erlang list **must** stay a cons cell: it
-  provides **O(1) tail sharing** and is baked into the NIF ABI (`enif_get_list_cell`), `erts_debug:same/2` and value
-  semantics. A "vector list" (RRB/relaxed-radix) is a *different type* — it would belong to `array`-like usage, not
-  replace `[]`. This is a **Level-2-only, observability-breaking** change.
-- *"K-ary beats binary"* — correct **for ordered sets** → the concrete `ordered_set` B-tree win above. (Note
-  `ordered_set` is far rarer than `set`/`bag`, which use a hash table.)
-- *"Concat two lists / find an element is painfully slow"* — inherent O(|LHS|) copy / O(n) scan. The fix is not a
-  new list representation but **(a) compiler reuse** (splice a uniquely-owned `++` LHS instead of copying; build
-  `map`/`reverse`/`foldl` accumulators in place) and **(b) user-level data-structure choice** (keyword-list lookups
-  are O(n) `proplists` scans — use a map/ETS).
-- *"Charlaist ops slow"* — the stdlib already uses **SWAR** ASCII fast paths (`swar_ascii.hrl`) and
-  `unicode:characters_to_binary/2` short-circuits already-UTF-8 binaries (`erl_unicode.c:966-970`); one self-marked
-  wart remains (`unicode.erl:848-857`, `%% XXX: Optimize me!` list→binary→list round trip).
+**Payoff, and its precondition.** Fresh lists are *already* bump-allocated contiguously today (`HAllocX`,
+`erl_vm.h:148-156`), so raw allocation locality is not the win. The win is deleting **per-element cons decode +
+allocation + dispatch** in the sequential/bulk patterns that dominate real code (`lists:map` & friends are one
+indirect fun call per element today — §E). That win is realized only **together with FBIP/reuse and a chunk-aware
+compiler**; otherwise every boundary to ordinary cons code pays a de-chunking cost. Bulk producer/consumer workloads
+(big-list building, `Enum`/`lists` pipelines, iolists/charlists, traversals) are the natural fit; `[H|T]`
+destructuring *at an unknown offset* is the awkward case — hence the plain-cell fallback.
 
-**Observability contracts** that forbid representation changes even at Level 1: `enif_get_tuple` `ptr+1`;
-`enif_get_list_cell` cons-walk; `erts_debug:same/2` = raw word/pointer equality (`beam_debug.c:64-68`);
-`erts_debug:size/1`/`flat_size`; `term_to_binary` map order follows internal layout (`external.c:3745-3809`).
+### B.2 What is fixed — design tensions to resolve, not prohibitions
+The fixed interface is small: a list term is a **single word** (`ERL_NIF_TERM == Eterm`); `[H|T]` is O(1) and
+shareable; `enif_get_list_cell`/`enif_make_list_cell` keep their "head+tail" / "build a pair" semantics
+(`erl_nif.c:1971,2183`); the **ETF/distribution** wire format is a canonical `LIST_EXT` cons chain (`external.c`);
+and the language algebra holds (`is_list([])` true but `is_nonempty_list([])` false; `hd`/`tl`/`length` `badarg`
+cases; `++`/`=` semantics). Three things need a *decision* at implementation time:
+1. **The partial-chunk "tail view"** — `[H|T]` on a chunk must yield a first-class `T`. The JIT reads CAR/CDR as
+   **raw fixed-offset loads** (`Mem(ptr,-1)` / `Mem(ptr,-1+8)`), which cannot express "next element, same chunk".
+   Several resolutions exist (keep a real cons cell for the live head window; a chunk+offset descriptor node;
+   normalise at the true boundaries); **which is best is left to the implementation**.
+2. **Introspection surfaces** — `erts_debug:same/2` (raw pointer identity), `erts_debug:size/1` / `flat_size/1`,
+   `process_info(_,memory)` report physical word counts (2 per cons). Chunking changes these; they are debug APIs
+   (not the language), so they can be defined or relaxed — a product decision.
+3. **Level** — these bite hardest for a **Level-1** VM that must run existing `.beam`/NIFs (the inline offset loads
+   especially); a **Level-2** VM owns every list opcode and has correspondingly more freedom.
 
-**Ranked representation changes by payoff/risk:** (1) **ETS `ordered_set` AVL → K-ary B-tree** (high payoff,
-low risk, ~2 kLOC); (2) **FBIP/reuse for maps/lists** (medium; unique-only ⇒ observable-free; see §E);
-(3) **CHAMP HAMT layout** (low–medium); (4) cons-cell allocation batching/arena (low–medium, medium GC risk);
-(5) flatmap binary/SIMD search for large/boxed-key flats (low).
+### B.3 The independent, low-risk win
+**ETS `ordered_set`** is an **AVL tree, one separately-allocated node per key** (`erl_db_tree.c:25`,
+`erl_db_tree.h:28-32`) — a pointer chase per level. A K-ary B-tree (K ≈ 16–32) / cache-oblivious layout collapses
+the height and packs keys per cache line; only *total key order* is observable, so it is fully observation-preserving
+and self-contained (~2 kLOC), deliverable inside the current VM.
 
-**Bottom line:** the representation is *not* naive, and the residual wins are modest and specific. The
-"object-manipulation" pain the user describes is overwhelmingly a **per-element dispatch + allocation** problem —
-i.e. a compiler-fusion/reuse problem (§C, §E), not a data-structure-layout problem.
+**Unchanged representation facts:** a cons cell is a header-less 2-word `[CAR,CDR]` tagged `TAG_PRIMARY_LIST`
+(`erl_term.h:71,219-244`); `++`/`lists:append` copies its LHS and `member`/`keyfind` are O(n) C BIFs
+(`erl_bif_lists.c`) — chunking + FBIP improve their *constant factor* and in-place-ness, not their asymptotic class.
+
+**Bottom line:** the abstract list/map stay exactly as they are; the interior is a legitimate, cache-friendly design
+space with in-tree precedents — chunked lists with opportunistic chunking + FBIP, and RRB/finger-tree interiors for
+sequence loads — but its payoff is gated on the §E compiler work, and it is not on its own the dominant bottleneck
+(that is per-element dispatch + allocation — §C, §E). ETS `ordered_set` → K-ary B-tree is the one independent,
+low-risk, self-contained win.
 
 ---
 
@@ -483,9 +506,12 @@ Loop opts → fusion → FBIP, on the existing BEAM-SSA IR, behind opt-in flags 
 per-pass budget and a bootstrap benchmark. *Delivers the user's "fuse map/update chains" and the Enum-vs-Stream fix
 without touching the VM.*
 
-**Stage 3 — Data structures (targeted, observable-free).**
-ETS `ordered_set` AVL → K-ary B-tree; flatmap search / CHAMP node layout; cons-cell allocation batching.
-*These land in `erts`, not the compiler.*
+**Stage 3 — Data structures (interface fixed, interior open).**
+Two tiers: **independent, low-risk wins now** — ETS `ordered_set` AVL → K-ary B-tree, flatmap search / CHAMP node
+layout, cons-cell allocation batching (these land in `erts`, not the compiler); and the **cache-friendly list
+interior** — chunked/unrolled lists with opportunistic chunking + plain-cons fallback, RRB/finger-tree interiors
+for sequence loads — which is a **compiler+VM co-design** that rides on Stage 2's FBIP and so is sequenced *with*,
+not before, it. Target bulk producer/consumer patterns; keep the cons interface bit-identical.
 
 **Stage 4 — GC modernization.**
 Port the per-process generational copying collector to unsafe Rust (preserving the barrier-free invariant and the
@@ -519,6 +545,7 @@ is back-loaded (Stage 5). That is the straightforward, achievable path.
 | **Stage 2** Compiler FBIP / reuse (maps/lists/binaries) | High | **High** (allocation/GC pressure) | Low | **Highest** (value semantics + GC barrier) | Last of Stage 2 |
 | **Stage 3** ETS `ordered_set` → K-ary B-tree | Medium | High (ordered-set lookups) | Low | Low | Any time |
 | **Stage 3** Map flatmap/CHAMP, cons batching | Low–medium | Low–medium | Low | Low | Any time |
+| **Stage 3** Cache-friendly list interior (chunked/unrolled + opportunistic chunking; RRB/finger-tree) | High (VM+compiler co-design) | Medium–high (bulk list/`Enum` workloads) | Low | Medium–high (partial-chunk tail view; introspection APIs) | With Stage 2 FBIP |
 | **Stage 4** Port per-process copying GC to Rust | High | Neutral (preserves behavior) | Medium | High (correctness) | After Stage 1 |
 | **Stage 4** GenImmix mature generation | High | Uncertain (measure) | Medium | High | Measurement-gated |
 | **Stage 5** Rust core behind frozen C ABI (link boundary) | Very high (134 kLOC core) | Low–modest | Medium (periphery) | Very high | Only if 1–4 insufficient |
@@ -547,4 +574,5 @@ is back-loaded (Stage 5). That is the straightforward, achievable path.
 - Cranelift (fast, secure, regalloc2): https://cranelift.dev ; regalloc2: https://cfallin.org/blog/2022/06/09/cranelift-regalloc2 ; Copy-and-Patch (OOPSLA 2021) + CPython 3.13 (PEP 744); V8 Maglev: https://v8.dev/blog/maglev
 - PEP 659 (specializing adaptive interpreter): https://peps.python.org/pep-0659 ; CPython tail-call interpreter — careful re-analysis (~1–5%): https://blog.nelhage.com/post/cpython-tail-call ; Rust tail calls (`become`, nightly; ~2027 target): https://trifectatech.org/blog/tail-calls-project-goal
 - Elixir lowers via Erlang abstract forms → Core → SSA (Dashbit, "How to debug Elixir/Erlang compiler performance"): https://dashbit.co/blog/how-to-debug-elixir-erlang-compiler-performance ; The BEAM Book §2.4: https://stenmans.org/theBeamBook/
+- Cache-friendly persistent structures: unrolled/"colony" linked lists; **RRB-Trees** (Bagwell & Rompf, EPFL — the basis of Clojure/Scala persistent vectors); Haskell `Data.Sequence` (finger trees); Clojure `PersistentArrayMap` (≤8, linear scan) → `PersistentHashMap` (32-way) — the small-size switch that mirrors BEAM's flatmap → HAMT.
 - Prior art: `archseer/enigma` (Rust BEAM; per-process arena GC; stalled): https://github.com/archseer/enigma ; *Tyn* (Rust microkernel hosting unmodified ERTS).

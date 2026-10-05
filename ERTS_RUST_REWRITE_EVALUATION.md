@@ -37,12 +37,16 @@ Key findings:
    **unchanged between Level 1 and Level 2**, so Level 2 does not reduce the hard part — it only
    removes the obligation to *read existing `.beam` files*.
 
-2. **The "naive data structures" premise is only partly true.** Lists are genuine cons cells, but on
-   BEAM a freshly built list is *already laid out contiguously* by the bump-allocating process heap.
-   Maps are HAMT (4-bit/16-way) with a flatmap fast path, not naive; binaries/funs/nodes are
-   off-heap reference-counted. OTP 27 already performs **in-place ("destructive") updates** for
-   uniquely-owned tuples/records, and the compiler already fuses some tuple/map updates. The
-   residual wins are real but smaller than assumed, and many are deliverable *inside* the current VM.
+2. **Data structures: the interface is fixed, the interior is open.** A list must stay a cons list
+   (`[H|T]` O(1) and shareable) and a map stays persistent; the *internal* layout beneath that
+   interface is a legitimate, cache-friendly design space. OTP already ships dual layouts behind one
+   abstract value (small flatmap → HAMT; small on-heap binary → off-heap `BinRef`), so a third hybrid
+   for lists — **chunked/unrolled lists** with opportunistic chunking + FBIP, and RRB/finger-tree
+   interiors for sequence loads — is a coherent direction (see the Part II deep dive). Its payoff is
+   gated on compiler work (§F.2); fresh lists are already bump-allocated contiguously, so the win is
+   removing per-element decode/allocation/dispatch, not raw locality. OTP 27 already does in-place
+   updates for uniquely-owned tuples/records. The one independent, low-risk win is **ETS `ordered_set`
+   AVL → K-ary B-tree**.
 
 3. **The JIT's biggest untapped win is register allocation, not backend choice.** BeamAsm keeps the
    `x`/`y` register arrays *in memory* and does "hardly any cross-instruction optimization" — that is
@@ -232,15 +236,23 @@ The plan explicitly says: *use low-latency design over heavy JIT*. The history b
   counting for large immutable objects (binaries, funs) should be kept — it is the right design.
 
 **Persistent/functional data structures**
-- Lists: singly-linked is *correct for value semantics* (O(1) tail sharing). Note **BEAM already
-  gives fresh lists spatial locality** via bump allocation, so "lists are cache-hostile" is mostly a
-  *post-GC* and *cross-generation* effect, not an intrinsic allocation effect.
-- Maps: BEAM's HAMT is a 4-bit/16-way bitmap trie. Modern alternatives include **CHAMP**
-  (Compressed Hash-Array Mapped Prefix-tree, used by Clojure/Immer) which improves iteration locality
-  and node density, and **binary search / SIMD scan for the flatmap fast path** (currently linear).
-  These are concrete, low-risk improvements — deliverable *inside* the existing VM.
-- Persistence/versioning structures (RRB-vectors) are attractive for `array`-like loads but are not
-  a drop-in replacement for cons lists without breaking tail sharing.
+- The interface is fixed: a list is a cons list (`[H|T]` O(1) and shareable, value semantics) and maps
+  stay persistent. What is open is the **interior layout** — and OTP already ships *two* layouts behind
+  one abstract value, switching on size (small map = packed flatmap → HAMT; small on-heap binary →
+  off-heap `BinRef`). The interesting question is a **third such hybrid, for lists**.
+- **Cache-friendly interior representations** worth exploring: **chunked / unrolled cons lists** (a node
+  holds K ≈ 16–32 elements inline + a next pointer, turning bulk build/walk/`map`/`++` into array loops
+  with one allocation per K) with **opportunistic chunking and a plain-cons fallback**; and **RRB-trees /
+  finger trees** as internal sequences for `array`-/`queue`-like loads. Prior art: unrolled/"colony"
+  lists; Clojure's `PersistentArrayMap`→`PersistentHashMap` small-size switch and 32-way
+  `PersistentVector`; Scala/RRB vectors (Bagwell–Rompf); Haskell `Data.Sequence`.
+- Payoff is real but **gated**: fresh lists are already bump-allocated contiguously, so the win is
+  removing per-element decode/allocation/dispatch in bulk patterns — which needs **FBIP + a chunk-aware
+  compiler** to avoid paying de-chunking at every boundary. The hard open problem is the partial-chunk
+  "tail view" (how `[H|T]` yields a first-class `T`); see Part II §B.
+- Maps: BEAM's HAMT is a 4-bit/16-way bitmap trie; **CHAMP** (Clojure/Immer) improves iteration
+  locality and node density, and the flatmap fast path is a linear scan — concrete, low-risk, and
+  deliverable *inside* the existing VM.
 
 **FBIP / in-place functional update**
 - The research frontier is **functional-but-in-place (FBIP)**: reference-counting with **reuse
@@ -286,20 +298,21 @@ Goal: identical `.beam` input, identical external behaviour, drop-in for `beam.s
 - **Bootstrap hazard:** OTP builds itself with itself; the new VM must run the existing compiler and
   the whole 35-app tree early. Plan a shadow-VM bootstrap with a stable fallback (`FLAVOR=emu`).
 
-### E.2 Data structures — what can actually improve
-- **Constrained at Level 1** by NIF expectations (contiguous tuple arrays; direct binary data
-  pointers) and by observable-identity APIs (`erts_debug:same/2`, `erts_debug:size/1`).
-- Concrete, low-risk wins:
-  - **Flatmap lookup**: replace the linear scan with binary search (and/or SIMD compare) — trivial,
-    measurable for small/medium maps.
-  - **HAMT → CHAMP-style node layout** to improve iteration locality and reduce branch-per-node.
-  - **Better allocation locality for cons cells** (e.g. batching/segregating list allocation, arena
-    reuse) to reduce post-GC pointer chasing.
-  - **Reduce copy pressure**: extend the existing destructive-update analysis; keep large immutable
-    data off-heap and refcounted (already true).
-- **Not recommended:** changing the *representation* of lists (breaks O(1) tail sharing and value
-  semantics) or big-int/atom encoding (observable). These are traps, not opportunities, at Level 1.
-- **Net:** modest, incremental, partially achievable in the *current* VM without any rewrite.
+### E.2 Data structures — the abstract value is fixed; the interior is open
+- **The interface is fixed** by the NIF ABI (single-word `ERL_NIF_TERM`; `enif_get_list_cell`/`make_list_cell`),
+  the ETF/distribution cons-chain wire format, and the language algebra (`[H|T]` O(1) and shareable; value
+  semantics). The **interior is not**: OTP already ships two layouts behind one abstract value (small flatmap →
+  HAMT; small on-heap binary → off-heap `BinRef`).
+- **The promising direction** is a third such hybrid for lists — **chunked/unrolled cons lists** with opportunistic
+  chunking + plain-cons fallback, and **RRB/finger-tree** interiors for sequence-like loads — but its payoff is
+  **gated on FBIP + a chunk-aware compiler** (§F.2), and it is not on its own the dominant bottleneck.
+- **Independent, low-risk wins now:** **ETS `ordered_set` AVL → K-ary B-tree** (the clear representation win);
+  **flatmap** lookup (binary/SIMD scan); **HAMT → CHAMP** node layout; **reduce copy pressure** by extending the
+  existing destructive-update analysis.
+- **Care needed (not forbidden):** `erts_debug:same/2` (raw pointer identity) and `erts_debug:size/1`/`flat_size/1`
+  report physical layout; big-int/atom encoding is observable. These are decisions, not hard walls.
+- **Net:** the residual wins are real but mostly **incremental**, and the biggest data-structure idea (chunked
+  lists + FBIP) is a *compiler*-side effort as much as a VM one.
 
 ### E.3 JIT — the strongest concrete opportunity
 The plan is right that BeamAsm is not the last word, but the *reason* matters: the ceiling comes from
@@ -431,10 +444,11 @@ features that can be prototyped on the **existing** SSA IR long before any VM re
 2. **It underweights the compatibility surface (§A).** The dominant cost (ABI, wire, CLI, boot,
    tooling) is shared by both levels and is not addressed.
 3. **The GC/memory model is unaddressed** — the single hardest and most constraining decision.
-4. **It assumes data structures are "naive"** — false in part; much of the low-hanging fruit is
-   already taken (HAMT, off-heap refc binaries, OTP-27 in-place updates, some fusion). The plan
-   should be re-based on the *actual* residual bottlenecks (post-GC locality, copying cost, absence
-   of loop opts, allocation pressure from copy-on-write updates).
+4. **Its data-structure premise is only half-right.** Much low-hanging fruit is already taken (HAMT,
+   off-heap refc binaries, OTP-27 in-place updates, some fusion) — but the *interior* is not fixed, and
+   cache-friendly hybrid representations for lists (chunked/unrolled lists + FBIP, RRB/finger-tree
+   sequences) are a coherent direction the plan should name explicitly. Re-base on the *actual* residual
+   bottlenecks (per-element dispatch + allocation, post-GC locality, copying cost, absence of loop opts).
 5. **No success metrics, no workload definition, no tail-latency budget.**
 6. **No incremental/migration or dual-run strategy**, no differential-testing plan, no fallback.
 7. **Level 2 is framed as "more freedom" but is actually "more coordination"** — it needs a fork/
@@ -468,9 +482,11 @@ delivers value and can be abandoned without loss:
    round-trips. Keep epoll/kqueue/IOCP defaults. Benchmark per workload (ping-pong vs streaming).
 3. **Workstream 3 — compiler/data-structure wins on the existing SSA IR (medium-high ROI).**
    Prototype: loop optimization (LICM/strength reduction/unrolling); generalized operation fusion
-   (lists/comprehension/map chains); flatmap binary search / CHAMP nodes; and extend destructive
-   update + reuse analysis (FBIP) to maps/lists/binaries. Measure allocation/GC-pressure reduction.
-   These can land in `lib/compiler` + `erts` **without changing the ISA**.
+   (lists/comprehension/map chains); flatmap binary search / CHAMP nodes; ETS `ordered_set` AVL → K-ary
+   B-tree; and extend destructive update + reuse analysis (FBIP) to maps/lists/binaries. The **cache-friendly
+   list interior** (chunked/unrolled lists with opportunistic chunking, RRB/finger-tree sequences) is a
+   VM+compiler co-design that rides on this FBIP work. Measure allocation/GC-pressure reduction. These can
+   land in `lib/compiler` + `erts` **without changing the ISA**.
 4. **Workstream 4 — targeted Rust adoption (robustness, low risk).**
    Rewrite isolated, high-CVE, self-contained components in Rust behind the existing C ABI — e.g.
    the ETF/distribution codec, term decoders, the poller, allocators, or a socket backend — and
@@ -496,7 +512,8 @@ ecosystem-recompile story exist.
 | Pluggable JIT + register alloc + tiering | High | **Medium–high** | Medium | Medium | **Yes** |
 | `io_uring` backend behind reactor | Medium | Medium (file I/O), low (net) | Low | Low | **Yes** |
 | Compiler fusion + loop opts + FBIP | Medium–high | Medium | Low | Medium | **Yes** |
-| Flatmap/CHAMP/RRB data-structure tweaks | Low–medium | Low–medium | Low | Low | **Yes** |
+| ETS `ordered_set` → K-ary B-tree; flatmap/CHAMP tweaks | Low–medium | Low–medium | Low | Low | **Yes** |
+| Cache-friendly list interior (chunked lists + FBIP; RRB/finger-tree) | High (VM+compiler) | Medium (gated on §F.2) | Low | Medium–high | Explore with compiler work |
 | Rust for isolated high-CVE components | Medium | Low | **High** | Low | **Yes** |
 | GC redesign (mark-region/Immix) | High | Uncertain | Medium | High | Evaluate only |
 
@@ -540,5 +557,5 @@ ecosystem-recompile story exist.
 - MMTk — Rust memory-management toolkit (per-process-heap caveat noted).
 - `io_uring` evaluations (completion-based, zero-copy; ping-pong vs streaming):
   https://arxiv.org/html/2512.04859v1 ; https://github.com/axboe/liburing/issues/536
-- CHAMP / RRB-trees / persistent data structures; FBIP (Perceus/Koka/Lean reuse analysis).
+- Cache-friendly persistent structures: unrolled/"colony" linked lists; **RRB-Trees** (Bagwell & Rompf, EPFL) — Clojure/Scala persistent vectors; Haskell `Data.Sequence` (finger trees); Clojure `PersistentArrayMap` (≤8) → `PersistentHashMap` (32-way) small-size switch (the analog of BEAM's flatmap → HAMT); CHAMP; FBIP (Perceus/Koka/Lean reuse analysis).
 - Prior art: `archseer/enigma` (Erlang VM in Rust, stalled); *Tyn* (Rust microkernel hosting real ERTS).
