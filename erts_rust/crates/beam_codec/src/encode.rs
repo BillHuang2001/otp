@@ -15,8 +15,8 @@ use crate::error;
 use crate::tag::{
     ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, INTEGER_EXT,
     LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT,
-    NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT,
-    SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, Tag,
+    NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT,
+    SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
 };
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
@@ -24,10 +24,9 @@ use crate::term::{
 };
 use crate::writer::Writer;
 
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count the encoder emits (ERTS
-/// switches to a hashmap above it, which the M1 term layer cannot build — see the
-/// crate `CONTEXT.md`, "Known Issues").
-const MAP_SMALL_MAP_LIMIT: usize = 32;
+/// `MAX_ARITYVAL` (`erl_term.h:322`): the largest flat-map pair count, bound by the
+/// `arityval` header's 24-bit size field.
+const MAX_ARITYVAL: usize = (1 << 24) - 1;
 
 /// `SMALL_BIG_EXT` carries an 8-bit **byte** count (the number of base-256 digits on
 /// the wire, `external.c:3587`); larger magnitudes use `LARGE_BIG_EXT`.
@@ -311,14 +310,18 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a flat map (≤ `MAP_SMALL_MAP_LIMIT` pairs) as `MAP_EXT`.
+    /// Encodes a flat map of **any** pair count as `MAP_EXT`.
     ///
-    /// A larger map needs the HAMT builder the M1 term layer does not have, so it
-    /// is reported as unsupported.
+    /// Every map is stored as a flatmap: the flatmap/hashmap switchover is an *open
+    /// interior* layout (workspace `CONTEXT.md` §2) and no HAMT builder exists in the
+    /// workspace yet, so there is no `MAP_SMALL_MAP_LIMIT` cutoff. The pair order is
+    /// emitted as-is (interleaved `K1,V1,…,Kn,Vn`) — deliberately **not** sorted or
+    /// deduped (`erl_map.h:181-199`); a future pass may sort via `beam_term::cmp`.
+    /// The pair count must fit the flatmap `arityval` (24-bit), else `SystemLimit`.
     fn encode_map(&mut self, keys: &[Eterm], values: &[Eterm]) -> Result<()> {
         let n = keys.len();
-        if n > MAP_SMALL_MAP_LIMIT {
-            return Err(error::unsupported(Tag::Map));
+        if n > MAX_ARITYVAL {
+            return Err(error::system_limit());
         }
         debug_assert_eq!(n, values.len(), "a flatmap's keys and values are paired");
         self.buf.u8(MAP_EXT);
@@ -340,16 +343,14 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes an external port as `NEW_PORT_EXT` (the modern form). A 64-bit port
-    /// id cannot be represented by that tag's 32-bit field; `V4_PORT_EXT` is out of
-    /// M1 scope, so a wider id is a `SystemLimit` rather than a truncation.
+    /// Encodes an external port as `V4_PORT_EXT` — the form the C encoder **always**
+    /// emits for a port (`external.c:3675`/`:3684`); `NEW_PORT_EXT` (`89`) is
+    /// decode-only. The 64-bit id is written in full, so no port id is ever a
+    /// `SystemLimit` and no id is ever truncated.
     fn encode_port(&mut self, node: Eterm, number: u64, creation: u32) -> Result<()> {
-        if number > u32::MAX as u64 {
-            return Err(error::system_limit());
-        }
-        self.buf.u8(NEW_PORT_EXT);
+        self.buf.u8(V4_PORT_EXT);
         self.encode(node)?;
-        self.buf.u32be(number as u32);
+        self.buf.u64be(number);
         self.buf.u32be(creation);
         Ok(())
     }
@@ -930,6 +931,29 @@ mod tests {
     }
 
     #[test]
+    fn maps_above_the_small_limit_encode_as_map_ext() {
+        // 40 pairs — past `MAP_SMALL_MAP_LIMIT` (32) — is still a `MAP_EXT` flatmap,
+        // never `unsupported` (the flatmap/hashmap switchover is an open interior
+        // layout; no HAMT builder exists).
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(4 + 2 * 40 + 64);
+        let mut pairs = Vec::new();
+        for i in 0..40i64 {
+            let key = make_atom(atoms.intern(&format!("k{i}")));
+            pairs.push((key, make_small(i)));
+        }
+        let map = make_flatmap(&mut heap, &pairs).unwrap();
+
+        let bytes = encode_term_body(map, &atoms).unwrap();
+        assert_eq!(bytes[0], 116); // MAP_EXT
+        assert_eq!(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]), 40);
+        // The wire order is the pair order: `K1,V1,…,Kn,Vn` (name then value).
+        assert_eq!(&bytes[5..9], &[119, 2, b'k', b'0']); // "k0"
+        assert_eq!(bytes[9], 97); // small integer
+        assert_eq!(bytes[10], 0);
+    }
+
+    #[test]
     fn external_pid_uses_new_pid_ext() {
         let mut atoms = AtomTable::new();
         let node = make_atom(atoms.intern("nonode@nohost"));
@@ -946,22 +970,36 @@ mod tests {
     }
 
     #[test]
-    fn external_port_uses_new_port_ext_and_checks_the_id_width() {
+    fn external_port_uses_v4_port_ext_with_the_full_id() {
         let mut atoms = AtomTable::new();
         let node = make_atom(atoms.intern("nonode@nohost"));
         let mut heap = new_heap(64);
 
-        let port = make_external_port(&mut heap, node, 0x1234, 5).unwrap();
-        let mut expected = vec![89u8];
-        expected.extend_from_slice(&[119, 13]);
-        expected.extend_from_slice(b"nonode@nohost");
-        expected.extend_from_slice(&0x1234u32.to_be_bytes());
-        expected.extend_from_slice(&5u32.to_be_bytes());
-        assert_eq!(encode_term_body(port, &atoms).unwrap(), expected);
+        let expected = |number: u64, creation: u32| {
+            let mut e = vec![120u8];
+            e.extend_from_slice(&[119, 13]);
+            e.extend_from_slice(b"nonode@nohost");
+            e.extend_from_slice(&number.to_be_bytes());
+            e.extend_from_slice(&creation.to_be_bytes());
+            e
+        };
 
-        // A 64-bit port id does not fit `NEW_PORT_EXT`'s 32-bit field: never truncate.
+        // A small id still uses the 64-bit `V4_PORT_EXT` form (never `NEW_PORT_EXT`).
+        let port = make_external_port(&mut heap, node, 0x1234, 5).unwrap();
+        assert_eq!(encode_term_body(port, &atoms).unwrap(), expected(0x1234, 5));
+
+        // A 64-bit port id is written in full — never truncated, never a limit.
         let wide = make_external_port(&mut heap, node, 0x1_0000_0000, 5).unwrap();
-        assert_system_limit(encode_term_body(wide, &atoms));
+        assert_eq!(
+            encode_term_body(wide, &atoms).unwrap(),
+            expected(0x1_0000_0000, 5)
+        );
+
+        let max = make_external_port(&mut heap, node, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(
+            encode_term_body(max, &atoms).unwrap(),
+            expected(u64::MAX, u32::MAX)
+        );
     }
 
     #[test]

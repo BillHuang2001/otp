@@ -47,20 +47,22 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
     arityval, boxed_val, is_big, is_external_pid, is_external_port, is_external_ref, is_flatmap,
-    is_float, is_list, is_tuple, Eterm,
+    is_float, is_list, is_tuple, make_arityval, make_boxed, make_header, make_tuple, Eterm,
+    MAP_SUBTAG, MAX_ARITYVAL,
 };
 use beam_term::thing;
 
 use crate::error;
-use crate::tag::Tag;
 
 /// `BIG_ARITY_MAX` (`erl_term.h:465-469`, 64-bit `ARCH_64`): the largest bignum
 /// digit count [`make_big`] accepts. The bignum layout itself is owned by
 /// [`beam_term::thing`].
 const BIG_ARITY_MAX: usize = (1 << 16) - 1;
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count [`make_flatmap`] and
-/// [`flatmap_parts`] accept (ERTS switches to a hashmap above it). The flat-map
-/// layout itself is owned by [`beam_term::thing`].
+/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count
+/// [`beam_term::thing::write_flatmap`] writes (ERTS switches to a hashmap above it).
+/// Larger maps are written by this crate's own flatmap writer
+/// ([`write_large_flatmap`]), which `beam_term` explicitly delegates to
+/// `beam_codec`. The flat-map layout itself is owned by [`beam_term::thing`].
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 /// `EXTERNAL_THING_HEAD_SIZE` (`erl_term.h:1161`):
 /// `offsetof(ExternalThing, data) / sizeof(Uint)` — the `[header, node, next]`
@@ -148,27 +150,89 @@ pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u64])> {
     Ok(unsafe { thing::big_parts(term) })
 }
 
-/// Materializes a small flat map on `heap`.
+/// Materializes a flat map on `heap`, whatever its pair count.
 ///
 /// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout (and the
-/// 3-word empty block) is written by [`beam_term::thing::write_flatmap`].
+/// 3-word empty block) is written by [`beam_term::thing::write_flatmap`] for
+/// `n <= MAP_SMALL_MAP_LIMIT` and by [`write_large_flatmap`] above it (identical
+/// layout — see that writer).
 ///
-/// More than `MAP_SMALL_MAP_LIMIT` (32) pairs needs the HAMT builder and yields
-/// [`crate::error::unsupported`].
+/// Every map is stored as a flatmap: the flatmap/hashmap switchover is an *open
+/// interior* layout (workspace `CONTEXT.md` §2) and no HAMT builder exists in the
+/// workspace yet. A pair count beyond `MAX_ARITYVAL` cannot be represented by the
+/// `arityval` header and yields `BeamError::SystemLimit`.
 pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
     let n = pairs.len();
-    if n > MAP_SMALL_MAP_LIMIT {
-        return Err(error::unsupported(Tag::Map));
+    if n > MAX_ARITYVAL {
+        // The pair count becomes the flatmap `arityval`, whose size field is 24 bits.
+        return Err(error::system_limit());
     }
-    // NOTE: duplicate keys are **not** detected in Milestone 1 — that needs term
-    // comparison (owned by `beam_term`/`beam_ets`), so the wire order is preserved
-    // as-is (see the crate `CONTEXT.md`, "Known Issues").
+    // NOTE: duplicate keys are **not** detected — that needs term comparison (owned
+    // by `beam_term`/`beam_ets`), so the caller's pair order is preserved as-is,
+    // deliberately **not** the sorted order ERTS's flatmaps maintain (`erl_map.h`
+    // `MAP_HEADER_FLATMAP`; `external.c:5042-5100`). A future pass may sort via
+    // `beam_term::cmp`. (See the crate `CONTEXT.md`, "Known Issues".)
     // SAFETY: `alloc_words` returned `thing::flatmap_size_words(n)` exclusively-owned,
     // writable words.
     let hp = unsafe { heap.alloc_words(thing::flatmap_size_words(n))? };
-    // SAFETY: `hp` owns `flatmap_size_words(n)` words and `n <= MAP_SMALL_MAP_LIMIT`,
-    // the preconditions `write_flatmap` documents.
-    Ok(unsafe { thing::write_flatmap(hp, pairs) })
+    if n <= MAP_SMALL_MAP_LIMIT {
+        // SAFETY: `hp` owns `flatmap_size_words(n)` words and `n <= MAP_SMALL_MAP_LIMIT`,
+        // the preconditions `write_flatmap` documents.
+        Ok(unsafe { thing::write_flatmap(hp, pairs) })
+    } else {
+        // SAFETY: `hp` owns `flatmap_size_words(n)` words and
+        // `MAP_SMALL_MAP_LIMIT < n <= MAX_ARITYVAL`, the preconditions
+        // `write_large_flatmap` documents.
+        Ok(unsafe { write_large_flatmap(hp, pairs) })
+    }
+}
+
+/// Writes a flat map with **more than** `MAP_SMALL_MAP_LIMIT` pairs at `hp` and
+/// returns the tagged root term.
+///
+/// # Why this lives here
+///
+/// [`beam_term::thing::write_flatmap`] `debug_assert!`s the small-map limit and its
+/// own docs delegate the larger map to `beam_codec`; this crate's node may not
+/// write the sibling `beam_term`, so the (identical) word layout for the oversized
+/// case is written here. It is byte-for-byte the layout `write_flatmap` emits —
+/// pinned by the `flatmap_layout_matches_beam_term` test — so a map of any pair
+/// count round-trips as a flatmap and every existing reader still applies.
+///
+/// Layout (`erl_map.c:673-700`, `erl_map.h:181-199`): the word block
+/// `[arityval(n), k0 … k(n-1), MAP_HEADER_FLATMAP, n, keys, v0 … v(n-1)]`, where
+/// `keys = make_tuple(hp)` points back at the base of the keys seq and the root is
+/// the flatmap head `make_boxed(hp + 1 + n)`.
+///
+/// # Safety
+///
+/// `hp` must point at [`beam_term::thing::flatmap_size_words`]`(pairs.len())`
+/// exclusively-owned, writable words, which are all written by this call and must
+/// stay live (and unmoved) for as long as the returned term is used.
+/// `MAP_SMALL_MAP_LIMIT < pairs.len() <= MAX_ARITYVAL`.
+unsafe fn write_large_flatmap(hp: *mut Eterm, pairs: &[(Eterm, Eterm)]) -> Eterm {
+    let n = pairs.len();
+    debug_assert!(
+        n > MAP_SMALL_MAP_LIMIT && n <= MAX_ARITYVAL,
+        "the oversized flatmap writer holds more than MAP_SMALL_MAP_LIMIT pairs"
+    );
+    // SAFETY: the caller reserved `4 + 2n` words at `hp`. The keys tuple occupies
+    // `hp[0..=n]`, the flatmap head prefix `[head, size, keys]` occupies
+    // `hp[1+n..=3+n]`, and the values occupy `hp[4+n..4+2n]` — every write below is
+    // in bounds (`n > 0`, so this writer never has to handle the empty block).
+    unsafe {
+        *hp = make_arityval(n);
+        for i in 0..n {
+            *hp.add(1 + i) = pairs[i].0;
+        }
+        *hp.add(1 + n) = make_header(4, MAP_SUBTAG);
+        *hp.add(2 + n) = Eterm::from_raw(n);
+        *hp.add(3 + n) = make_tuple(hp);
+        for j in 0..n {
+            *hp.add(4 + n + j) = pairs[j].1;
+        }
+        make_boxed(hp.add(1 + n))
+    }
 }
 
 /// Splits a flat map into its `(keys, values)`.
@@ -183,14 +247,14 @@ pub fn flatmap_parts<'a>(term: Eterm) -> Result<(&'a [Eterm], &'a [Eterm])> {
     if !unsafe { is_flatmap(term) } {
         return Err(error::bad_arg());
     }
-    // A well-formed flatmap never exceeds `MAP_SMALL_MAP_LIMIT` pairs. The root
-    // points at the `[head, size, keys]` prefix, so word `1` is the raw pair count; a
-    // larger value means a corrupt/mismatched block and is rejected before any slice
-    // is built.
+    // A well-formed flatmap never exceeds `MAX_ARITYVAL` pairs (the `arityval`
+    // header's 24-bit size field). The root points at the `[head, size, keys]`
+    // prefix, so word `1` is the raw pair count; a larger value means a
+    // corrupt/mismatched block and is rejected before any slice is built.
     // SAFETY: `is_flatmap` established that `term` is a live flat map, so word `1` of
     // its head prefix is a live, initialised word.
     let n = unsafe { (*boxed_val(term).add(1)).raw() };
-    if n > MAP_SMALL_MAP_LIMIT {
+    if n > MAX_ARITYVAL {
         return Err(error::bad_arg());
     }
     // SAFETY: `is_flatmap` established that `term` is a live flat map; the caller
@@ -429,7 +493,6 @@ mod tests {
     };
 
     use super::*;
-    use crate::error::is_unsupported;
 
     /// A heap large enough for every block built in this module.
     fn new_heap() -> Heap {
@@ -622,18 +685,62 @@ mod tests {
     }
 
     #[test]
-    fn flatmap_rejects_oversized_and_non_maps() {
+    fn flatmap_above_the_small_limit_uses_the_flatmap_layout() {
+        // `MAP_SMALL_MAP_LIMIT` (32) + 8 = 40 pairs: past the small limit, so this
+        // exercises the crate's own oversized-flatmap writer, whose layout must be
+        // word-for-word the documented flatmap block (`erl_map.h:181-199`).
+        let n = 40usize;
         let mut heap = new_heap();
-        let pairs: Vec<(Eterm, Eterm)> = (0..MAP_SMALL_MAP_LIMIT + 1)
-            .map(|i| (make_small(i as i64), make_small(i as i64)))
+        let base = heap.hp();
+        let pairs: Vec<(Eterm, Eterm)> = (0..n)
+            .map(|i| (make_small(i as i64), make_small(i as i64 + 1000)))
             .collect();
-        let err = make_flatmap(&mut heap, &pairs).unwrap_err();
-        assert!(is_unsupported(&err), "oversized maps are unsupported in M1");
-        assert_eq!(heap.used(), 0, "the rejected map allocated nothing");
+        let map = make_flatmap(&mut heap, &pairs).expect("a map of any size fits");
+        assert_eq!(heap.used(), 4 + 2 * n, "the block is 4 + 2n words");
 
+        // SAFETY: `base` is the first word of the `4 + 2n` block just written; every
+        // index below is within that block.
+        unsafe {
+            assert_eq!(*base, make_arityval(n)); // word 0: keys-tuple arity
+            for i in 0..n {
+                assert_eq!(*base.add(1 + i), pairs[i].0); // words 1..=n: keys
+            }
+            assert_eq!(*base.add(1 + n), make_header(4, MAP_SUBTAG)); // word 1+n: head
+            assert!(is_flatmap_header(*base.add(1 + n)));
+            assert_eq!((*base.add(2 + n)).raw(), n); // word 2+n: RAW size == n
+            assert_eq!(*base.add(3 + n), make_tuple(base)); // word 3+n: keys tuple
+            for j in 0..n {
+                assert_eq!(*base.add(4 + n + j), pairs[j].1); // words 4+n..: values
+            }
+            // The root is the flatmap head at `hp + 1 + n`, exactly as the small path.
+            assert_eq!(boxed_val(map), base.add(1 + n));
+        }
+
+        let (keys, values) = flatmap_parts(map).unwrap();
+        assert_eq!(keys.len(), n);
+        assert_eq!(values.len(), n);
+        assert_eq!(keys, &pairs.iter().map(|p| p.0).collect::<Vec<_>>()[..]);
+        assert_eq!(values, &pairs.iter().map(|p| p.1).collect::<Vec<_>>()[..]);
+    }
+
+    #[test]
+    fn flatmap_parts_rejects_non_maps_and_a_corrupt_size() {
+        let mut heap = new_heap();
         let tuple = heap.tuple(&[make_small(1)]).unwrap();
         assert_bad_arg(flatmap_parts(tuple));
         assert_bad_arg(flatmap_parts(make_small(1)));
+
+        // A size word past `MAX_ARITYVAL` cannot belong to a well-formed flatmap
+        // (`flatmap_parts` reads it from the head prefix) and is rejected before any
+        // slice is built.
+        let map = make_flatmap(&mut heap, &[(make_small(1), make_small(2))]).unwrap();
+        // SAFETY: `map` is the 2-pair flatmap just built; word 1 of its head prefix is
+        // the raw size field. The term is dropped afterwards.
+        unsafe {
+            let size_word = boxed_val(map).add(1);
+            *size_word = Eterm::from_raw(MAX_ARITYVAL + 1);
+        }
+        assert_bad_arg(flatmap_parts(map));
     }
 
     #[test]

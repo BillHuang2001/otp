@@ -104,10 +104,16 @@ pub const NEW_FUN_EXT: u8 = 112;
 /// `EXPORT_EXT` (`'q'`, `external.h:56`): an exported fun.
 pub const EXPORT_EXT: u8 = 113;
 
-/// `FUN_EXT` (`'u'`, `external.h:58`): the legacy fun form.
+/// `FUN_EXT` (`'u'`, `external.h:58`): the legacy (pre-OTP 23) fun form.
+///
+/// Removed in OTP 23; the C decoder rejects it (`goto error`, `external.c:6399-6404`),
+/// so byte `117` is **malformed**, never a term and never `unsupported`.
 pub const FUN_EXT: u8 = 117;
 
 /// `V4_PORT_EXT` (`'x'`, `external.h:61`): a port with a 64-bit id.
+///
+/// The C encoder **always** emits this form for a port (`external.c:3675`/`:3684`);
+/// `NEW_PORT_EXT` (`89`) is decode-only.
 pub const V4_PORT_EXT: u8 = 120;
 
 /// `LOCAL_EXT` (`'y'`, `external.h:62`): a local (node-less) pid/port/reference.
@@ -122,7 +128,11 @@ pub const ATOM_CACHE_REF_EXT: u8 = 82;
 pub const DIST_HEADER_EXT: u8 = 68;
 
 /// `NEW_CACHE` (`'N'`, `external.h:80`): the extended distribution atom-cache
-/// update. Owned by `beam_dist`; M1 never emits it.
+/// update.
+///
+/// **Dead in this OTP** (`#if 0`, `external.h:77-81`): byte `78` is
+/// `MAGIC_REF_INTERNAL_REF` (`external.h:74`), not a term tag. Reaching it in a term
+/// is **malformed**, never `unsupported`.
 pub const NEW_CACHE_EXT: u8 = 78;
 
 /// `RECORD_EXT` (`'C'`, `external.h:63`): a tuple tagged as a record.
@@ -339,11 +349,12 @@ impl Tag {
     /// Whether the Milestone-1 term layer supports this tag.
     ///
     /// `true` for the required core set (integers, floats, all four atom tags,
-    /// references, ports, pids, tuples, `NIL`, strings, lists, binaries/bitstrings,
-    /// small maps, the distribution atom-cache reference, and `COMPRESSED` as a
-    /// top-level wrapper); `false` for everything the codec deliberately reports as
-    /// [`crate::error::unsupported`] (funs, records, `V4_PORT_EXT`, `LOCAL_EXT` and
-    /// the distribution header).
+    /// references, ports — including the modern `V4_PORT_EXT` — pids, tuples, `NIL`,
+    /// strings, lists, binaries/bitstrings, maps of any pair count, the distribution
+    /// atom-cache reference, and `COMPRESSED` as a top-level wrapper); `false` for
+    /// everything the codec deliberately reports as [`crate::error::unsupported`]
+    /// (funs, records, `LOCAL_EXT` and the distribution header) **or** rejects as
+    /// malformed ([`Tag::Fun`], [`Tag::NewCache`]).
     ///
     /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
     /// but only as the outermost wrapper, immediately after the version byte
@@ -364,6 +375,7 @@ impl Tag {
                 | Tag::NewerReference
                 | Tag::Port
                 | Tag::NewPort
+                | Tag::V4Port
                 | Tag::Pid
                 | Tag::NewPid
                 | Tag::SmallTuple
@@ -420,7 +432,7 @@ mod tests {
         (Tag::NewFun, 112, "NEW_FUN_EXT", false),
         (Tag::Export, 113, "EXPORT_EXT", false),
         (Tag::Fun, 117, "FUN_EXT", false),
-        (Tag::V4Port, 120, "V4_PORT_EXT", false),
+        (Tag::V4Port, 120, "V4_PORT_EXT", true),
         (Tag::Local, 121, "LOCAL_EXT", false),
         (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
         (Tag::DistHeader, 68, "DIST_HEADER", false),

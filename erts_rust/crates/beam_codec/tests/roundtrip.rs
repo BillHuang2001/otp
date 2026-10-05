@@ -48,7 +48,7 @@ use beam_codec::{
     AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
     INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
     NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
-    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, VERSION_MAGIC,
+    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -773,7 +773,8 @@ fn proper_and_improper_lists_round_trip() {
 
 #[test]
 fn maps_round_trip_at_pair_boundaries() {
-    for &n in &[0usize, 1, 2, 32] {
+    // Includes counts past `MAP_SMALL_MAP_LIMIT` (32): every map is a flatmap now.
+    for &n in &[0usize, 1, 2, 32, 33, 40, 100] {
         let mut atoms = AtomTable::new();
         let cap = 4 + 2 * n + 64;
         let mut h1 = heap(cap);
@@ -830,30 +831,56 @@ fn external_pids_round_trip() {
 }
 
 #[test]
-fn external_ports_round_trip_and_reject_wide_ids() {
+fn external_ports_round_trip_with_the_full_64_bit_id() {
     let mut atoms = AtomTable::new();
     let node = make_atom(atoms.intern("nonode@nohost"));
 
-    for &(number, creation) in &[(0u64, 0u32), (0x1234, 5), (u64::from(u32::MAX), u32::MAX)] {
+    for &(number, creation) in &[
+        (0u64, 0u32),
+        (0x1234, 5),
+        (u64::from(u32::MAX), u32::MAX),
+        // Above `NEW_PORT_EXT`'s 32-bit field: the modern `V4_PORT_EXT` writes it in
+        // full — never truncated, never a `SystemLimit`.
+        (1u64 << 32, 0),
+        (1u64 << 40, 7),
+        (u64::MAX, u32::MAX),
+    ] {
         let mut h1 = heap(64);
         let p = make_external_port(&mut h1, node, number, creation).unwrap();
 
         let (b1, t2, _h2, a2) = roundtrip(p, &atoms, 64);
 
-        assert_eq!(b1[1], NEW_PORT_EXT);
+        // The encoder always emits `V4_PORT_EXT` (`120`), the form the C emits.
+        assert_eq!(b1[1], V4_PORT_EXT);
+        assert_eq!(b1[1], 120);
+        // Wire: `[120][node atom][id:8 BE][creation:4 BE]`; the node atom here is a
+        // `SMALL_ATOM_UTF8_EXT` (`119`) with a 1-byte length at `b1[3]`.
+        assert_eq!(b1[2], 119);
+        let id_off = 4 + b1[3] as usize; // version + tag + atom tag + len byte + name
+        assert_eq!(
+            u64::from_be_bytes(b1[id_off..id_off + 8].try_into().unwrap()),
+            number
+        );
+        assert_eq!(
+            u32::from_be_bytes(b1[id_off + 8..id_off + 12].try_into().unwrap()),
+            creation
+        );
+
         let (n2, num2, cre2) = external_port_parts(t2).unwrap();
         assert_eq!(a2.name(atom_val(n2)).unwrap(), "nonode@nohost");
         assert_eq!((num2, cre2), (number, creation));
     }
 
-    // A 64-bit port id does not fit `NEW_PORT_EXT`'s 32-bit field: `SystemLimit`, never
-    // a silent truncation.
-    let mut h1 = heap(64);
-    let wide = make_external_port(&mut h1, node, 1u64 << 32, 0).unwrap();
-    assert!(matches!(
-        encode_term(wide, &atoms),
-        Err(BeamError::SystemLimit)
-    ));
+    // `NEW_PORT_EXT` (`89`) stays decodable even though the encoder never emits it.
+    let mut image = vec![VERSION_MAGIC, NEW_PORT_EXT];
+    image.extend_from_slice(&[119, 2, b'n', b'1']);
+    image.extend_from_slice(&7u32.to_be_bytes());
+    image.extend_from_slice(&9u32.to_be_bytes());
+    let mut h = heap(64);
+    let mut a = AtomTable::new();
+    let t = decode_term(&image, &mut h, &mut a).expect("NEW_PORT_EXT decodes");
+    assert_eq!(external_port_parts(t).unwrap().1, 7);
+    assert_eq!(external_port_parts(t).unwrap().2, 9);
 }
 
 #[test]
@@ -1138,6 +1165,25 @@ fn unknown_tag_bytes_are_bad_arg() {
 }
 
 #[test]
+fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
+    // `FUN_EXT` (removed in OTP 23) and `NEW_CACHE` (dead, `#if 0`) are malformed: the
+    // C decoder also rejects them outright; they are never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 117]); // FUN_EXT
+    assert_bad_arg(&[VERSION_MAGIC, 78]); // NEW_CACHE
+
+    // Recognized-but-not-yet-implemented tags report `unsupported`, never a wrong term.
+    for &tag in &[
+        112u8, // NEW_FUN_EXT
+        113,   // EXPORT_EXT
+        67,    // RECORD_EXT
+        121,   // LOCAL_EXT
+        68,    // DIST_HEADER
+    ] {
+        assert_unsupported(&[VERSION_MAGIC, tag]);
+    }
+}
+
+#[test]
 fn binaries_and_bitstrings_round_trip() {
     // Byte-exact oracle images: `<<"hi">>` (BINARY_EXT) and `<<1:3>>` (BIT_BINARY_EXT).
     let mut heap1 = heap(64);
@@ -1198,9 +1244,32 @@ fn signed_bignum_with_bad_sign_byte_is_bad_arg() {
 }
 
 #[test]
-fn maps_with_more_than_32_pairs_are_unsupported() {
-    // 33 pairs needs the HAMT builder the M1 term layer does not have.
-    assert_unsupported(&[VERSION_MAGIC, MAP_EXT, 0, 0, 0, 33]);
+fn maps_with_more_than_32_pairs_round_trip() {
+    // 40 pairs is a flatmap now: encode → decode → encode must be byte-stable, with a
+    // 40-pair `MAP_EXT` count and the wire order preserved.
+    let n = 40usize;
+    let mut atoms = AtomTable::new();
+    let mut h1 = heap(4 + 2 * n + 64);
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        let key = make_atom(atoms.intern(&format!("key{i}")));
+        pairs.push((key, make_small(i as i64)));
+    }
+    let m = make_flatmap(&mut h1, &pairs).unwrap();
+
+    let (b1, t2, _h2, a2) = roundtrip(m, &atoms, 4 + 2 * n + 64);
+
+    assert_eq!(b1[1], MAP_EXT);
+    assert_eq!(u32::from_be_bytes([b1[2], b1[3], b1[4], b1[5]]), 40);
+    let (keys, values) = flatmap_parts(t2).unwrap();
+    assert_eq!(keys.len(), n);
+    for i in 0..n {
+        assert_eq!(a2.name(atom_val(keys[i])).unwrap(), format!("key{i}"));
+        assert_eq!(values[i], make_small(i as i64));
+    }
+
+    // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`.
+    assert_system_limit(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
 }
 
 #[test]

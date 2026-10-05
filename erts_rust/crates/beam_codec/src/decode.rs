@@ -36,9 +36,6 @@ const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 /// `external.c:6146`).
 const BIG_DIGIT_BYTES: usize = size_of::<u64>();
 
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
-/// hashmap above it).
-const MAP_SMALL_MAP_LIMIT: usize = 32;
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -76,11 +73,13 @@ impl<'a> Decoder<'a> {
 
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
     ///
-    /// Malformed/truncated input, a bad tag, invalid UTF-8 in an atom name or an
-    /// unset atom-cache slot yield `BeamError::BadArg`; a value beyond a wire
-    /// bound yields `BeamError::SystemLimit`; heap exhaustion propagates from the
-    /// heap as `BeamError::Alloc`; a tag the M1 term layer does not support yet
-    /// yields [`crate::error::unsupported`].
+    /// Malformed/truncated input, a bad tag, an obsolete tag the C also rejects
+    /// ([`Tag::Fun`], [`Tag::NewCache`]), invalid UTF-8 in an atom name or an unset
+    /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
+    /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
+    /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
+    /// ([`Tag::NewFun`], [`Tag::Export`], [`Tag::Record`], [`Tag::Local`],
+    /// [`Tag::DistHeader`]) yields [`crate::error::unsupported`].
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
@@ -182,6 +181,15 @@ impl<'a> Decoder<'a> {
                 let creation = self.reader.u32be()?;
                 crate::term::make_external_port(heap, node, number, creation)
             }
+            Tag::V4Port => {
+                // `[V4_PORT_EXT][node atom][id:8 BE u64][creation:4 BE u32]`
+                // (`external.c:4698-4716`). This is the form the C encoder *always*
+                // emits for a port (`external.c:3675`/`:3684`).
+                let node = self.decode_node_atom(heap, atoms)?;
+                let number = self.reader.u64be()?;
+                let creation = self.reader.u32be()?;
+                crate::term::make_external_port(heap, node, number, creation)
+            }
             Tag::Pid => {
                 let node = self.decode_node_atom(heap, atoms)?;
                 let number = self.reader.u32be()?;
@@ -246,10 +254,18 @@ impl<'a> Decoder<'a> {
             }
             Tag::Map => {
                 let count = self.reader.u32be()? as usize;
-                if count > MAP_SMALL_MAP_LIMIT {
-                    // Larger maps need the HAMT builder (see the crate CONTEXT.md).
-                    return Err(unsupported(Tag::Map));
+                // The pair count becomes a flatmap `arityval`, whose size field is
+                // `MAX_ARITYVAL` wide, so a larger map cannot be represented.
+                if count > MAX_ARITYVAL {
+                    return Err(system_limit());
                 }
+                // Every map is stored as a **flatmap**, whatever its pair count: the
+                // flatmap/hashmap switchover is an *open interior* layout (workspace
+                // `CONTEXT.md` §2) and no HAMT builder exists in the workspace yet.
+                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is preserved as-is —
+                // deliberately **not** sorted/deduped, unlike ERTS's sorted-flatmap
+                // invariant (`erl_map.h:181-199`, `external.c:5042-5100`); a future
+                // pass may sort via `beam_term::cmp`.
                 let mut pairs = Vec::new();
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;
@@ -274,16 +290,32 @@ impl<'a> Decoder<'a> {
             Tag::Compressed => Err(bad_arg()),
 
             // ---------------------------------------------------------------
-            // Deliberately unsupported in M1 — never a wrong encoding
+            // Obsolete / dead tags — malformed input, never a term
             // ---------------------------------------------------------------
-            Tag::NewFun
-            | Tag::Export
-            | Tag::Fun
-            | Tag::V4Port
-            | Tag::Local
-            | Tag::DistHeader
-            | Tag::NewCache
-            | Tag::Record => Err(unsupported(tag)),
+            // `FUN_EXT` (`117`) was removed in OTP 23: the C decoder rejects it
+            // outright (`goto error`, `external.c:6399-6404`), so it is malformed
+            // (`BadArg`), not a "recognized but unimplemented" tag.
+            Tag::Fun => Err(bad_arg()),
+            // `NEW_CACHE` (`78`) is dead in this OTP (`#if 0`, `external.h:77-81`);
+            // byte `78` is `MAGIC_REF_INTERNAL_REF`, which only ever appears inside a
+            // distribution payload's internal-tag stream, never as a term tag — so in
+            // a term it is malformed (`BadArg`), not `unsupported`.
+            Tag::NewCache => Err(bad_arg()),
+
+            // ---------------------------------------------------------------
+            // Deliberately unsupported in M1 — never a wrong term
+            // ---------------------------------------------------------------
+            // `NEW_FUN_EXT`/`EXPORT_EXT`: blocked on a fun/export registry that does
+            // not exist yet (owned by `beam_loader`/`beam_rt`).
+            Tag::NewFun | Tag::Export => Err(unsupported(tag)),
+            // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
+            // records encode as tuples).
+            Tag::Record => Err(unsupported(tag)),
+            // `LOCAL_EXT` (`121`): needs local-node identity, which the codec has none
+            // of (owned by `beam_dist`/`beam_rt`).
+            Tag::Local => Err(unsupported(tag)),
+            // `DIST_HEADER` (`68`): owned by `beam_dist`, which frames it itself.
+            Tag::DistHeader => Err(unsupported(tag)),
         }
     }
 
@@ -745,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_flatmap_and_limit() {
+    fn maps_flatmap_at_any_pair_count() {
         // `#{a=>1}`.
         let (_h, atoms, term) = decode(&MAP_A_1);
         let (keys, values) = flatmap_parts(term).unwrap();
@@ -760,8 +792,25 @@ mod tests {
         assert!(keys.is_empty());
         assert!(values.is_empty());
 
-        // 33 pairs needs the HAMT builder: reported, never mis-encoded.
-        assert_unsupported(&[131, 116, 0, 0, 0, 33]);
+        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) decodes as a flatmap of 40 pairs, in
+        // wire order — no HAMT builder is needed.
+        let mut image = vec![131, 116, 0, 0, 0, 40];
+        for i in 0..40u8 {
+            image.extend_from_slice(&[97, i]); // SMALL_INTEGER_EXT key
+            image.extend_from_slice(&[97, i + 100]); // SMALL_INTEGER_EXT value
+        }
+        let (_h, _a, term) = decode(&image);
+        let (keys, values) = flatmap_parts(term).unwrap();
+        assert_eq!(keys.len(), 40);
+        assert_eq!(values.len(), 40);
+        for i in 0..40i64 {
+            assert_eq!(keys[i as usize], make_small(i));
+            assert_eq!(values[i as usize], make_small(i + 100));
+        }
+
+        // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`: a
+        // `SystemLimit`, and nothing is read past the count.
+        assert_system_limit(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -847,7 +896,7 @@ mod tests {
         assert_eq!(atoms.name(atom_val(node)), Some("n1"));
         assert_eq!((number, serial, creation), (1, 2, 3));
 
-        // `NEW_PORT_EXT`.
+        // `NEW_PORT_EXT` (decode-only; the encoder never emits it).
         let mut image = vec![131, 89];
         image.extend_from_slice(&NODE_N1);
         image.extend_from_slice(&7u32.to_be_bytes());
@@ -856,6 +905,28 @@ mod tests {
         let (node, number, creation) = external_port_parts(term).unwrap();
         assert_eq!(atoms.name(atom_val(node)), Some("n1"));
         assert_eq!((number, creation), (7, 9));
+
+        // `V4_PORT_EXT`: an 8-byte id — the form the C encoder always emits.
+        let mut image = vec![131, 120];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&0x0000_0007_0000_0001u64.to_be_bytes());
+        image.extend_from_slice(&9u32.to_be_bytes());
+        let (_h, atoms, term) = decode(&image);
+        let (node, number, creation) = external_port_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((number, creation), (0x0000_0007_0000_0001, 9));
+
+        // `V4_PORT_EXT` with the maximum 64-bit id.
+        let mut image = vec![131, 120];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&u64::MAX.to_be_bytes());
+        image.extend_from_slice(&u32::MAX.to_be_bytes());
+        let (_h, _a, term) = decode(&image);
+        let (number, creation) = (external_port_parts(term).unwrap().1, external_port_parts(term).unwrap().2);
+        assert_eq!((number, creation), (u64::MAX, u32::MAX));
+
+        // A `V4_PORT_EXT` whose id field is truncated is malformed.
+        assert_bad_arg(&[131, 120, 119, 2, 110, 49, 0, 0, 0, 0]);
 
         // `PORT_EXT` (legacy): a 16-bit id, 8-bit creation.
         let mut image = vec![131, 102];
@@ -1034,16 +1105,18 @@ mod tests {
         // `VERSION_MAGIC` is not a term tag.
         assert_bad_arg(&[131, 131]);
 
-        // Every tag the M1 term layer does not support is reported, not guessed.
+        // Obsolete/dead tags are *malformed* (`BadArg`), exactly as the C rejects
+        // them: `FUN_EXT` (removed in OTP 23) and `NEW_CACHE` (dead, `#if 0`).
+        assert_bad_arg(&[131, Tag::Fun.as_byte()]);
+        assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
+
+        // Every recognized-but-not-yet-implemented tag is reported, not guessed.
         for tag in [
             Tag::NewFun,
             Tag::Export,
-            Tag::Fun,
-            Tag::V4Port,
+            Tag::Record,
             Tag::Local,
             Tag::DistHeader,
-            Tag::NewCache,
-            Tag::Record,
         ] {
             assert_unsupported(&[131, tag.as_byte()]);
         }
