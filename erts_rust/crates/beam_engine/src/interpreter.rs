@@ -18,7 +18,7 @@ use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Label, Module, Operand, TestKind, NO_FAIL};
 use beam_term::{
     cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list, make_atom,
-    Eterm, MAX_ARITYVAL,
+    Eterm, MAX_ARITYVAL, NIL,
 };
 
 use crate::context::ExecutionContext;
@@ -111,8 +111,15 @@ impl Machine {
             };
 
             match instr {
-                // Metadata / no-ops.
-                Instr::Label(_) | Instr::Line(_) | Instr::FuncInfo { .. } | Instr::IntCodeEnd => {
+                // Metadata / no-ops. `executable_line`/`debug_line` exist for
+                // instruction counting and breakpoints (they are `_` in
+                // `emu/ops.tab:103-108`), so they do not change control flow.
+                Instr::Label(_)
+                | Instr::Line(_)
+                | Instr::FuncInfo { .. }
+                | Instr::IntCodeEnd
+                | Instr::ExecutableLine { .. }
+                | Instr::DebugLine { .. } => {
                     pc += 1;
                 }
                 Instr::Move { src, dst } => {
@@ -164,6 +171,11 @@ impl Machine {
                         }
                     }
                 }
+                Instr::Jump { target } => {
+                    let (next_func, next_pc) = resolve(labels, *target)?;
+                    func = next_func;
+                    pc = next_pc;
+                }
                 Instr::GcBif {
                     bif,
                     fail,
@@ -171,6 +183,44 @@ impl Machine {
                     dst,
                     ..
                 } => {
+                    let (module_name, function_name, arity) = import_target(module, *bif)?;
+                    let mut arg_terms = Vec::with_capacity(args.len());
+                    for arg in args {
+                        arg_terms.push(read_operand(self, arg)?);
+                    }
+                    match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
+                        Ok(value) => {
+                            write_operand(self, dst, value)?;
+                            pc += 1;
+                        }
+                        Err(e) if *fail == NO_FAIL => return Err(e),
+                        Err(_) => {
+                            let (next_func, next_pc) = resolve(labels, *fail)?;
+                            func = next_func;
+                            pc = next_pc;
+                        }
+                    }
+                }
+                Instr::Bif0 { bif, dst } => {
+                    // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
+                    // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
+                    // is no fail label: an error propagates (`?`).
+                    let (module_name, function_name, arity) = import_target(module, *bif)?;
+                    let value = ctx.call_bif(module_name, function_name, arity, &[])?;
+                    write_operand(self, dst, value)?;
+                    pc += 1;
+                }
+                Instr::Bif {
+                    bif,
+                    fail,
+                    args,
+                    dst,
+                    ..
+                } => {
+                    // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
+                    // Like the `GcBif` arm minus the heap/live check: on failure,
+                    // jump to `fail` if it is live (guard failure), else propagate
+                    // the error (a raise).
                     let (module_name, function_name, arity) = import_target(module, *bif)?;
                     let mut arg_terms = Vec::with_capacity(args.len());
                     for arg in args {
@@ -273,6 +323,16 @@ impl Machine {
                 }
                 Instr::Trim { n, .. } => {
                     self.trim(*n)?;
+                    pc += 1;
+                }
+                Instr::InitYregs { registers } => {
+                    // `init_yregs {Yregs}` — initialize the listed (Y) registers to
+                    // `[]` (`emu/instrs.tab:506-508` `i_init`: `make_blank($Y)`, and
+                    // `make_blank` is `NIL`). Emitted right after `allocate`, so the
+                    // frame is live.
+                    for register in registers {
+                        write_operand(self, register, NIL)?;
+                    }
                     pc += 1;
                 }
                 Instr::Return => match self.continuation()? {

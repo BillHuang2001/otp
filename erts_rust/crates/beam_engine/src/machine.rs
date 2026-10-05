@@ -13,11 +13,12 @@
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, Result};
 use beam_loader::{Atom, Label, Module};
-use beam_term::Eterm;
+use beam_term::{Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
+use crate::Step;
 
 /// X-register file size (the `beam_emu.c` `MAX_REG` bound).
 pub const MAX_REGISTER: u32 = 1024;
@@ -106,7 +107,7 @@ pub struct Machine {
     /// Pushed by `try`/`catch`, popped by `try_end`/`catch_end` (see
     /// [`CatchFrame`]); empty until the exception family executes those opcodes.
     pub(crate) catch_frames: Vec<CatchFrame>,
-    /// The pending exception `(class, reason)` recorded by [`Machine::raise`],
+    /// The pending exception `(class, reason)` recorded by [`Machine::throw`],
     /// if any.
     pub(crate) pending_exception: Option<(ExceptionClass, Eterm)>,
     /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
@@ -231,7 +232,7 @@ impl Machine {
 
     /// The pending exception `(class, reason)`, if a raise has been recorded.
     ///
-    /// Set by [`Machine::raise`]; a host can inspect it after a run propagates a
+    /// Set by [`Machine::throw`]; a host can inspect it after a run propagates a
     /// raise. `None` when no raise has been recorded.
     pub fn pending_exception(&self) -> Option<(ExceptionClass, Eterm)> {
         self.pending_exception
@@ -395,28 +396,72 @@ impl Machine {
         self.catch_frames.pop()
     }
 
-    /// Raise a BEAM `error` exception with `reason`.
+    /// Raise a BEAM exception with `reason` of class `class`.
     ///
-    /// Records the pending exception (`class = Error`, `reason`) so the exception
-    /// layer can consult the catch-frame stack, and returns the typed
-    /// [`BeamError`] the caller propagates.
+    /// **This is the one uniform raise/unwind entry point** every instruction
+    /// family calls (the wave-2 contract); it replaces the earlier
+    /// `raise`/`raise_with -> BeamError` pair. A raise is *not* a bare `BeamError`
+    /// — it is a control-flow decision:
     ///
-    /// **Milestone-1 honesty:** `beam_common::BeamError` cannot carry a *compound*
-    /// (tuple) reason — its [`ExitReason::Structured`] variant deliberately holds
-    /// no term, because `beam_common` has no term dependency — so the returned
-    /// error carries `Raise(error, ExitReason::Structured)` and the live reason
-    /// term lives in [`Machine::pending_exception`]. No `try`/`catch` unwinding
-    /// exists yet, so `raise` always returns the error immediately; the exception
-    /// family will fold a caught raise into a `Step::Goto` to the handler.
-    pub fn raise(&mut self, reason: Eterm) -> BeamError {
-        self.raise_with(ExceptionClass::Error, reason)
+    /// 1. The pending exception `(class, reason)` is recorded on the machine
+    ///    ([`Machine::pending_exception`]). `beam_common::BeamError` cannot carry a
+    ///    *compound* (tuple) reason — its [`ExitReason::Structured`] variant holds no
+    ///    term — so this field is where the live reason survives.
+    /// 2. If a catch frame is live ([`Machine::catch_frame_depth`] `> 0`) the
+    ///    **innermost** one is *popped* and the exception is landed in the handler
+    ///    registers ([`Machine::land_exception`]); the result is
+    ///    `Ok(Step::Goto { func, pc })` for that handler.
+    /// 3. If no catch frame is live the result is the typed
+    ///    `Err(BeamError::Raise(..))` the run propagates — **never a panic**.
+    ///
+    /// A family body typically ends with `machine.throw(class, reason).map(Some)`
+    /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
+    #[allow(dead_code)] // the wave-2 exception family calls this; no in-crate caller yet
+    pub(crate) fn throw(&mut self, class: ExceptionClass, reason: Eterm) -> Result<Step> {
+        self.pending_exception = Some((class, reason));
+        match self.catch_frames.pop() {
+            Some(frame) => {
+                self.land_exception(reason)?;
+                Ok(Step::Goto {
+                    func: frame.func,
+                    pc: frame.pc,
+                })
+            }
+            None => Err(BeamError::Raise(Raise::new(class, ExitReason::Structured))),
+        }
     }
 
-    /// Like [`Machine::raise`], but with an explicit exception `class`
-    /// (`error`/`exit`/`throw`).
-    pub fn raise_with(&mut self, class: ExceptionClass, reason: Eterm) -> BeamError {
-        self.pending_exception = Some((class, reason));
-        BeamError::Raise(Raise::new(class, ExitReason::Structured))
+    /// [`Machine::throw`] with class [`ExceptionClass::Error`] — the convenience
+    /// for the `{badmatch,V}`/`{case_clause,V}`/`{badrecord,V}`-style raises the
+    /// exception family emits.
+    #[allow(dead_code)] // see `throw`: built for the wave-2 exception family
+    pub(crate) fn throw_error(&mut self, reason: Eterm) -> Result<Step> {
+        self.throw(ExceptionClass::Error, reason)
+    }
+
+    /// Land a *caught* exception in the handler registers.
+    ///
+    /// Reproduces the C convention established before `next_catch` jumps to the
+    /// handler (`../../erts/emulator/beam/beam_common.c:541-544`, `handle_error`):
+    ///
+    /// * `x(0) = THE_NON_VALUE` — the "the previous code completed abnormally"
+    ///   marker that `catch_end`/`try_case` test (`emu/instrs.tab:1175-1227`);
+    /// * `x(1) = reason`;
+    /// * `x(2) = stacktrace` — Milestone 1 captures no stacktrace, so `[]`;
+    /// * `x(3) = exception_tag[class]` — the class atom. **Milestone-1
+    ///   substitution:** C reads this from its global `am_error`/`am_exit`/
+    ///   `am_throw` constants, but [`Machine`] owns no atom table, so `x(3)` is
+    ///   filled with `[]` and the class is instead carried in
+    ///   [`Machine::pending_exception`]; the handler (`try_case`/`catch_end`, the
+    ///   exceptions family — which has the [`Module`]) resolves the class atom into
+    ///   `x(3)` from there. This mirrors the C behavior exactly, because `x(3)` is
+    ///   only ever read by that handler.
+    fn land_exception(&mut self, reason: Eterm) -> Result<()> {
+        self.set_x(0, Eterm::non_value())?;
+        self.set_x(1, reason)?;
+        self.set_x(2, NIL)?;
+        self.set_x(3, NIL)?;
+        Ok(())
     }
 }
 
@@ -632,5 +677,57 @@ mod tests {
         assert!(err.is_err());
         assert_eq!(machine.x(0), Some(Eterm::from_raw(1)));
         assert_eq!(machine.x(1), Some(Eterm::from_raw(2)));
+    }
+
+    #[test]
+    fn throw_without_a_catch_frame_is_a_typed_error() {
+        let mut machine = Machine::new();
+        let reason = Eterm::from_raw(0xBEEF);
+        let outcome = machine.throw(ExceptionClass::Throw, reason);
+        // No catch frame: the raise propagates as a typed error, never a panic.
+        assert!(matches!(outcome, Err(BeamError::Raise(_))));
+        assert_eq!(
+            machine.pending_exception(),
+            Some((ExceptionClass::Throw, reason))
+        );
+        assert_eq!(machine.catch_frame_depth(), 0);
+    }
+
+    #[test]
+    fn throw_to_a_catch_frame_lands_the_exception_and_pops_the_frame() {
+        let mut machine = Machine::new();
+        // Two live frames: only the innermost must be consumed.
+        machine.push_catch_frame(CatchFrame::new(3, 7, Eterm::from_raw(0x11)));
+        machine.push_catch_frame(CatchFrame::new(9, 9, Eterm::from_raw(0x22)));
+        let reason = Eterm::from_raw(0x1234);
+
+        let outcome = machine.throw_error(reason).expect("a live frame catches");
+        assert_eq!(outcome, Step::Goto { func: 9, pc: 9 });
+        assert_eq!(machine.catch_frame_depth(), 1);
+        assert_eq!(
+            machine.pending_exception(),
+            Some((ExceptionClass::Error, reason))
+        );
+
+        // The C handler convention (beam_common.c:541-544): x0 = THE_NON_VALUE,
+        // x1 = reason, x2 = [] stacktrace, x3 = [] class-atom placeholder.
+        assert_eq!(machine.x(0), Some(Eterm::non_value()));
+        assert_eq!(machine.x(1), Some(reason));
+        assert_eq!(machine.x(2), Some(NIL));
+        assert_eq!(machine.x(3), Some(NIL));
+    }
+
+    #[test]
+    fn throw_returns_the_outer_frame_on_a_second_raise() {
+        let mut machine = Machine::new();
+        machine.push_catch_frame(CatchFrame::new(3, 7, Eterm::from_raw(0x11)));
+        let _ = machine
+            .throw(ExceptionClass::Exit, Eterm::from_raw(1))
+            .unwrap();
+        // The single frame is gone: the next raise cannot be caught.
+        assert!(machine
+            .throw(ExceptionClass::Exit, Eterm::from_raw(2))
+            .is_err());
+        assert_eq!(machine.catch_frame_depth(), 0);
     }
 }

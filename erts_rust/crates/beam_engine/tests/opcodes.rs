@@ -738,6 +738,270 @@ fn gc_bif_failure_without_a_fail_label_raises() {
 }
 
 // ---------------------------------------------------------------------------
+// Core opcodes: Bif0 / Bif / Jump / InitYregs / debug-line no-ops
+// ---------------------------------------------------------------------------
+
+/// A hook implementing `erlang:self/0` (returns `7`) and `erlang:'+'/2`.
+fn self_and_arith_hook(
+    module: &str,
+    function: &str,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if module == "erlang" && function == "self" && arity == 0 && args.is_empty() {
+        return Ok(make_small(7));
+    }
+    arith_hook(module, function, arity, args)
+}
+
+#[test]
+fn bif0_calls_a_zero_arity_bif_and_writes_the_result() {
+    let mut fixture = Fixture::new();
+    let self_bif = fixture.import("erlang", "self", 0);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif0 {
+            bif: self_bif,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(self_and_arith_hook));
+    assert_eq!(
+        machine
+            .run_label(&module, entry, 0, &[], &mut ctx)
+            .map_err(|_| ()),
+        Ok(make_small(7))
+    );
+}
+
+#[test]
+fn bif0_failure_propagates_without_a_fail_label() {
+    let mut fixture = Fixture::new();
+    let self_bif = fixture.import("erlang", "self", 0);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif0 {
+            bif: self_bif,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    // The rejecting default hook makes the import fail; with no fail label the
+    // error propagates as a typed error.
+    assert!(run(&module, entry, &[]).is_err());
+}
+
+#[test]
+fn bif_calls_with_arguments_and_writes_the_result() {
+    let mut fixture = Fixture::new();
+    let plus = fixture.import("erlang", "+", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: plus,
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("add", 2, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run_with_hook(&module, entry, &[make_small(2), make_small(3)]).map_err(|_| ()),
+        Ok(make_small(5))
+    );
+}
+
+#[test]
+fn bif_failure_jumps_to_the_fail_label() {
+    let mut fixture = Fixture::new();
+    let bad = fixture.import("erlang", "bad", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: bad,
+            fail: Label(2),
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run_with_hook(&module, entry, &[make_small(2), make_small(3)]).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+}
+
+#[test]
+fn bif_failure_without_a_fail_label_raises() {
+    let mut fixture = Fixture::new();
+    let bad = fixture.import("erlang", "bad", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: bad,
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+    assert!(run_with_hook(&module, entry, &[make_small(2), make_small(3)]).is_err());
+}
+
+#[test]
+fn jump_transfers_control() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Jump { target: Label(2) },
+        // Skipped by the jump.
+        Instr::Move {
+            src: Operand::Integer(9),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(5)));
+}
+
+#[test]
+fn jump_to_an_unknown_label_is_a_typed_error() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Jump { target: Label(500) },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert!(run(&module, entry, &[]).is_err());
+}
+
+#[test]
+fn init_yregs_clears_the_listed_slots_to_nil() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(3),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(2),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Integer(3),
+            dst: Operand::Y(2),
+        },
+        // Only Y(0) and Y(2) are re-initialised; Y(1) keeps its value.
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0), Operand::Y(2)],
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(3),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(2)));
+}
+
+#[test]
+fn init_yregs_sets_every_listed_register_to_nil() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0), Operand::Y(1)],
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(NIL));
+}
+
+#[test]
+fn debug_line_instructions_are_no_ops() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::ExecutableLine {
+            location: 1,
+            index: 0,
+        },
+        Instr::DebugLine {
+            kind: Operand::Atom(Atom::from_raw(0)),
+            location: 1,
+            index: 1,
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(13),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(13)));
+}
+
+// ---------------------------------------------------------------------------
 // Frames and the call family
 // ---------------------------------------------------------------------------
 
