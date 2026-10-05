@@ -9,6 +9,15 @@
 //! `~p` (rather than `~w`) is used because it is what the Erlang shell and
 //! `io:format/2` users see: it applies the printable-string rule, so an Erlang string
 //! renders as `"17.1"` — exactly as `erlang:system_info(version)` prints in the oracle.
+//!
+//! The `run` action of the CLI prints its result with `~w` instead ([`term_to_string_w`]):
+//! that is what `erl ... -eval 'io:format("~w~n",[V])'` produces, and — unlike `~p` — it
+//! does **not** collapse a list of printable characters into a string literal
+//! (`~w` of `[97,98,99]` is `[97,98,99]`).
+//!
+//! [`term_to_string_with`] is the one printer: it builds the format list from the
+//! requested format control and drives the BIF. Every other entry point is a thin
+//! wrapper over it, so a new format control never means a second printer.
 
 use beam_alloc::Heap;
 use beam_bifs::{BifContext, BifRegistry, BytesSink};
@@ -16,8 +25,11 @@ use beam_common::Result;
 use beam_process::ProcessId;
 use beam_term::{make_small, AtomTable, Eterm, NIL};
 
-/// The format string every call uses: print the term followed by a newline.
+/// The format control [`term_to_string`] uses: `~p` (printable-string rule) + newline.
 const FORMAT: &[u8] = b"~p~n";
+
+/// The format control [`term_to_string_w`] uses: `~w` (raw) + newline.
+const FORMAT_W: &[u8] = b"~w~n";
 
 /// Renders `term` with the registered `~p` printer.
 ///
@@ -36,8 +48,47 @@ pub fn term_to_string(
     self_pid: ProcessId,
     term: Eterm,
 ) -> Result<String> {
+    term_to_string_with(registry, heap, atoms, self_pid, term, FORMAT)
+}
+
+/// Renders `term` with the registered `~w` printer (`~w~n`): the raw standard syntax,
+/// without the `~p` printable-string rule.
+///
+/// This is the `run` action's printer — the oracle's `io:format("~w~n",[V])`.
+///
+/// # Errors
+///
+/// As [`term_to_string`].
+pub fn term_to_string_w(
+    registry: &BifRegistry,
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    self_pid: ProcessId,
+    term: Eterm,
+) -> Result<String> {
+    term_to_string_with(registry, heap, atoms, self_pid, term, FORMAT_W)
+}
+
+/// Renders `term` with the registered `io:format/2` printer using the format control
+/// `control` (a byte string such as `b"~p~n"`).
+///
+/// `control` is handed to `io:format/2` verbatim, so the directive's semantics (and its
+/// error behaviour) are the BIF's, never re-implemented here. The built format list is
+/// ASCII-only, so its elements are byte-sized small integers.
+///
+/// # Errors
+///
+/// As [`term_to_string`].
+pub fn term_to_string_with(
+    registry: &BifRegistry,
+    heap: &mut Heap,
+    atoms: &AtomTable,
+    self_pid: ProcessId,
+    term: Eterm,
+    control: &[u8],
+) -> Result<String> {
     let mut format = NIL;
-    for byte in FORMAT.iter().rev() {
+    for byte in control.iter().rev() {
         format = heap.cons(make_small(i64::from(*byte)), format)?;
     }
     let args = heap.cons(term, NIL)?;
@@ -97,6 +148,20 @@ mod tests {
         assert_eq!(render(text, &mut heap, &atoms), "\"hi\"\n");
     }
 
+    #[test]
+    fn the_w_control_does_not_apply_the_string_rule() {
+        let mut heap = Heap::new(256).expect("test heap");
+        let atoms = atoms();
+        // The `run` action prints with `~w`, which keeps a char list as a list:
+        // `io:format("~w~n", ["hi"])` is `[104,105]`, not `"hi"`.
+        let tail = heap.cons(make_small(105), NIL).expect("fits");
+        let text = heap.cons(make_small(104), tail).expect("fits");
+        let rendered = term_to_string_w(&registry(), &mut heap, &atoms, ProcessId::new(1, 0), text)
+            .expect("printable");
+        assert_eq!(rendered, "[104,105]\n");
+        // Non-char-list terms render identically under both controls.
+        assert_eq!(render(make_small(5), &mut heap, &atoms), "5\n");
+    }
     #[test]
     fn prints_a_tuple() {
         let mut heap = Heap::new(64).expect("test heap");

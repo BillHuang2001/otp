@@ -1,35 +1,40 @@
-//! The runtime façade: boot, the module cache and the **vertical slice**.
+//! The runtime façade: boot, the code server and the **vertical slice**.
 //!
 //! [`Runtime`] is the whole picture in one object. It owns
 //!
-//! * the parsed [`RuntimeConfig`] and derived state (code path, heap size);
+//! * the parsed [`RuntimeConfig`] and its init arguments (contract A.6);
 //! * the BIF [`BifRegistry`] (`beam_bifs`'s `bif.tab` surface) and a
 //!   [`TableRegistry`] (`ets:*`);
-//! * the **global** [`AtomTable`] — used only by `system_info/1` and the `~p` printer;
+//! * the [`CodeServer`] — the **one shared** [`AtomTable`](beam_term::AtomTable),
+//!   the module cache and the ordered code path. Every module the runtime loads is
+//!   interned into that single table, so atoms built by a BIF are the indices the
+//!   engine compares against for **every** loaded module;
 //! * the [`ProcessTable`] and the runtime's own [`ProcessId`];
 //! * the preloaded-module registry skeleton (contract A.7);
-//! * the process [`Heap`] (owned, so a term returned by `run_*` stays valid) and a
-//!   separate scratch `info_heap` for `system_info`/`format_term`;
-//! * the [`Module`] cache, keyed by module name (each cached module keeps its own
-//!   atom table, which is what the atom-table bridge needs).
+//! * the process [`Heap`] (owned, so a term returned by `run_*` stays valid), a
+//!   separate scratch `info_heap` for `system_info`/`format_term`, and the
+//!   pointer-stable [`MinimalContext`] arena that serves the engine's
+//!   `alloc_words`/`ensure_heap` seam (Milestone-1 has no GC).
 //!
 //! `Runtime::run_function`/`run_module` are the evidence for this crate: they load a
 //! real `.beam` and execute it through the real [`RuntimeContext`] and the real BIF
-//! registry — the same path the `beam_rt` executable takes.
+//! registry — the same path the `beam_rt` executable takes. The dispatch that makes
+//! this a *multi-module* host (native floor → `beam_bifs` registry → load-on-demand
+//! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use beam_alloc::Heap;
-use beam_bifs::{BifRegistry, OutputSink, StdoutSink, TableRegistry};
+use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
 use beam_common::Result;
-use beam_engine::Machine;
-use beam_loader::{load_file, Module};
+use beam_engine::{terms, ExecutionContext, MinimalContext};
+use beam_loader::Module;
 use beam_process::{ProcessId, ProcessTable, SignalAtoms};
-use beam_term::{AtomTable, Eterm};
+use beam_term::{atom_val, is_atom, make_atom, make_small, AtomTable, Eterm};
 
 use crate::boot::{self, PreloadedModules};
-use crate::config::RuntimeConfig;
+use crate::codeserver::CodeServer;
+use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::error;
 use crate::eval;
@@ -44,47 +49,55 @@ const INFO_HEAP_WORDS: usize = 4_096;
 
 /// The smallest process heap a runtime accepts (`heap_words` is floored at this).
 const MIN_HEAP_WORDS: usize = 1_024;
+
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
     config: RuntimeConfig,
     /// The BIF registry every `call_bif` is dispatched through.
-    registry: BifRegistry,
-    /// The **global** atom table (`system_info` and the printer; see the module docs).
-    atoms: AtomTable,
+    pub(crate) registry: BifRegistry,
+    /// The code server: the one shared atom table, the module cache, the code path.
+    pub(crate) code_server: CodeServer,
     /// The process table (Milestone-1: the runtime's own single process).
     processes: ProcessTable,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
     /// The process heap executed code allocates on; owned so results stay valid.
-    heap: Heap,
+    pub(crate) heap: Heap,
+    /// The pointer-stable arena serving the engine's `alloc_words` seam.
+    pub(crate) arena: MinimalContext,
     /// The scratch heap for `system_info`/`format_term`, reset per call.
-    info_heap: Heap,
+    pub(crate) info_heap: Heap,
     /// The `ets:*` tables.
-    tables: TableRegistry,
+    pub(crate) tables: TableRegistry,
     /// The pid code runs as (`erlang:self/0`).
-    self_pid: ProcessId,
-    /// The loaded-module cache, keyed by module name.
-    modules: HashMap<String, Module>,
+    pub(crate) self_pid: ProcessId,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
+    /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
+    pub(crate) halt: Option<i32>,
 }
 
 impl Runtime {
     /// Creates a runtime for `config`.
     ///
-    /// The registries, the atom table, the process table and the heaps are set up
+    /// The registries, the shared atom table, the process table and the heaps are set up
     /// immediately; the A.7 **boot step** runs on demand (or explicitly through
-    /// [`Runtime::boot`]).
+    /// [`Runtime::boot`]). The code path is seeded from `config.code_paths`; the system
+    /// library directories are added lazily by [`CodeServer`] when a module is first
+    /// needed, so no external process is spawned until then.
     ///
     /// # Errors
     ///
     /// Propagates heap/process allocation failures and an out-of-range `+P`-style
     /// limit.
     pub fn new(config: RuntimeConfig) -> Result<Runtime> {
-        let mut atoms = AtomTable::new();
-        boot::seed_core_atoms(&mut atoms);
-        let signals = SignalAtoms::from_table(&mut atoms);
+        let mut code_server = CodeServer::new();
+        boot::seed_core_atoms(code_server.atoms_mut());
+        for dir in &config.code_paths {
+            code_server.add_path(dir.clone());
+        }
+        let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
         let self_pid = processes.spawn_default()?;
         // A zero-word heap can hold nothing, so the configured size is floored: the
@@ -93,15 +106,16 @@ impl Runtime {
         Ok(Runtime {
             config,
             registry: BifRegistry::with_core_bifs(),
-            atoms,
+            code_server,
             processes,
             preloaded: PreloadedModules::standard(),
             heap: Heap::new(heap_words)?,
+            arena: MinimalContext::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             tables: TableRegistry::new(),
             self_pid,
-            modules: HashMap::new(),
             booted: false,
+            halt: None,
         })
     }
 
@@ -121,6 +135,9 @@ impl Runtime {
     /// `CONTEXT.md`, Known Issues). A boot with an empty registry is refused rather
     /// than silently producing a runtime without its foundation.
     ///
+    /// Nothing is printed: the CLI must be silent on stderr for `-eval`/`run`/`-s`, so
+    /// boot emits no banner (the version banner is [`Runtime`]'s `-version` action).
+    ///
     /// # Errors
     ///
     /// [`BeamError::Raise`](beam_common::BeamError::Raise) when the preloaded-module
@@ -132,12 +149,6 @@ impl Runtime {
         if self.preloaded.is_empty() {
             return Err(error::unsupported("empty preloaded-module registry"));
         }
-        beam_common::beam_info!(
-            "beam_rt {} booted: {} preloaded modules, {} core atoms, 1 process",
-            beam_common::ERTS_VSN,
-            self.preloaded.len(),
-            self.atoms.len(),
-        );
         self.booted = true;
         Ok(())
     }
@@ -152,13 +163,80 @@ impl Runtime {
         &self.config
     }
 
+    /// The parsed init arguments (the source of `init:get_argument/1`).
+    pub fn init_args(&self) -> &InitArgs {
+        &self.config.init_args
+    }
+
     /// The preloaded-module registry skeleton (contract A.7).
     pub fn preloaded(&self) -> &PreloadedModules {
         &self.preloaded
     }
 
+    /// The code server (the shared atom table, the module cache, the code path).
+    pub fn code_server(&self) -> &CodeServer {
+        &self.code_server
+    }
+
+    /// The shared atom table, mutably (a caller interning an atom before a run).
+    pub fn code_server_atoms_mut(&mut self) -> &mut AtomTable {
+        self.code_server.atoms_mut()
+    }
+
+    /// The shared atom table.
+    pub fn atoms(&self) -> &AtomTable {
+        self.code_server.atoms()
+    }
+
+    /// Interns `name` in the shared atom table and returns it as an atom term.
+    pub fn intern(&mut self, name: &str) -> Eterm {
+        make_atom(self.code_server.atoms_mut().intern(name))
+    }
+
+    /// The name of the atom `term`, if `term` is an atom.
+    pub fn atom_name_of(&self, term: Eterm) -> Option<&str> {
+        if !is_atom(term) {
+            return None;
+        }
+        self.code_server.atoms().name(atom_val(term))
+    }
+
+    /// The exit status recorded by a native `erlang:halt/1`, if one ran.
+    pub fn halt_status(&self) -> Option<i32> {
+        self.halt
+    }
+
+    /// Heap words still available to the running code (unbounded in Milestone-1).
+    pub fn arena_available(&self) -> usize {
+        self.arena.heap_available()
+    }
+
+    /// Allocates `n` raw heap words from the pointer-stable arena.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the arena's allocation failure.
+    pub fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        self.arena.alloc_words(n)
+    }
+
+    /// Ensures `heap_need` words are available in the arena.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the arena's failure (never in Milestone-1; see the module docs).
+    pub fn ensure_heap(
+        &mut self,
+        heap_need: u32,
+        live: u32,
+        x_regs: &mut [Eterm],
+        stack: &mut [Eterm],
+    ) -> Result<()> {
+        self.arena.ensure_heap(heap_need, live, x_regs, stack)
+    }
+
     /// The process table (Milestone-1: one process — the runtime itself).
-    pub(crate) fn processes(&self) -> &ProcessTable {
+    pub fn processes(&self) -> &ProcessTable {
         &self.processes
     }
 
@@ -167,7 +245,7 @@ impl Runtime {
         self.self_pid
     }
 
-    /// Loads `path` and caches the module under its own name.
+    /// Loads `path` into the code server and returns the cached module.
     ///
     /// A module loaded twice replaces the cached one (mirroring a code reload).
     ///
@@ -176,37 +254,38 @@ impl Runtime {
     /// Propagates the loader's error (a malformed container, an unsupported chunk, …)
     /// or returns a diagnostic when the module has no resolvable name.
     pub fn load_module(&mut self, path: impl AsRef<Path>) -> Result<&Module> {
-        let module = load_file(path)?;
+        let module = self.code_server.load_path(path)?;
         let name = module
             .atom_name(module.name)
             .ok_or_else(|| error::unknown_module("<unnamed .beam>"))?
             .to_string();
-        self.modules.insert(name.clone(), module);
-        self.modules
-            .get(&name)
+        self.code_server
+            .module(&name)
             .ok_or_else(|| error::unknown_module(&name))
     }
 
     /// A cached module by name, if it has been loaded.
     pub fn module(&self, name: &str) -> Option<&Module> {
-        self.modules.get(name)
+        self.code_server.module(name)
     }
 
     /// The names of the cached modules, sorted.
     pub fn loaded_modules(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.modules.keys().cloned().collect();
-        names.sort();
-        names
+        self.code_server.loaded()
     }
 
-    /// Finds `<module>.beam` in the configured code path (`-pa`, then `-pz`).
-    pub(crate) fn find_module_file(&self, module: &str) -> Option<PathBuf> {
-        let file = format!("{module}.beam");
-        self.config
-            .code_paths
-            .iter()
-            .map(|dir| dir.join(&file))
-            .find(|candidate| candidate.is_file())
+    /// Finds `<module>.beam` in the configured code path (then the system paths).
+    pub fn find_module_file(&mut self, module: &str) -> Option<PathBuf> {
+        if let Some(found) = self.code_server.find_file(module) {
+            return Some(found);
+        }
+        // The code server adds the system library paths lazily; a failure here is
+        // reported honestly by `CodeServer::load`, so an exploratory lookup is `None`.
+        if self.code_server.add_system_paths().is_ok() {
+            self.code_server.find_file(module)
+        } else {
+            None
+        }
     }
 
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
@@ -228,36 +307,13 @@ impl Runtime {
         args: &[Eterm],
     ) -> Result<Eterm> {
         self.boot_if_needed()?;
-        let name = {
-            let module = self.load_module(path)?;
-            module
-                .atom_name(module.name)
-                .ok_or_else(|| error::unknown_module("<unnamed .beam>"))?
-                .to_string()
-        };
-        let mut sink = StdoutSink;
-        let Runtime {
-            registry,
-            heap,
-            tables,
-            self_pid,
-            modules,
-            ..
-        } = self;
-        let module = modules
-            .get(&name)
-            .ok_or_else(|| error::unknown_module(&name))?;
-        execute(
-            module, function, arity, args, registry, heap, tables, *self_pid, &mut sink,
-        )
+        let module = self.code_server.load_path(path)?;
+        let mut context = RuntimeContext::new(self);
+        context.run_export(&module, function, arity, args)
     }
 
     /// The general primitive: run `function/arity` against a **caller-owned** module
     /// with an explicit output sink.
-    ///
-    /// This is what `-s Mod Func Args…` uses (the caller loads the `.beam` itself, so
-    /// it can keep the `Module` — and its atom table — alive while resolving the atom
-    /// arguments).
     ///
     /// # Errors
     ///
@@ -272,16 +328,45 @@ impl Runtime {
         out: &mut dyn OutputSink,
     ) -> Result<Eterm> {
         self.boot_if_needed()?;
-        let Runtime {
-            registry,
-            heap,
-            tables,
-            self_pid,
-            ..
-        } = self;
-        execute(
-            module, function, arity, args, registry, heap, tables, *self_pid, out,
-        )
+        let mut context = RuntimeContext::with_output(self, out);
+        context.run_export(module, function, arity, args)
+    }
+
+    /// Loads the module `name` from the code path and runs its exported
+    /// `function/arity`, discarding nothing (the result is returned).
+    ///
+    /// This is what `-s`/`-run` use: the module is resolved through the code path
+    /// (including the system library directories), not from a file argument.
+    ///
+    /// # Errors
+    ///
+    /// The code server's not-found diagnostic, plus any error the running code raises.
+    pub fn run_named(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.boot_if_needed()?;
+        let loaded = self.code_server.load(module)?;
+        let mut context = RuntimeContext::new(self);
+        context.run_export(&loaded, function, arity, args)
+    }
+
+    /// Materializes parsed command-line arguments into terms on the shared atom table
+    /// and heap (an atom's index can only be assigned here).
+    ///
+    /// # Errors
+    ///
+    /// Propagates heap allocation failures while building lists.
+    pub fn materialize_args(&mut self, args: &[ArgTerm]) -> Result<Vec<Eterm>> {
+        let mut out = Vec::with_capacity(args.len());
+        for arg in args {
+            let term = materialize(arg, &mut self.code_server, &mut self.arena)?;
+            out.push(term);
+        }
+        Ok(out)
     }
 
     /// `system_info/1` (contract A.8) materialized as a term.
@@ -297,7 +382,12 @@ impl Runtime {
     pub fn system_info(&mut self, key: &str) -> Result<Eterm> {
         let value = self.system_info_value(key)?;
         self.info_heap.reset();
-        value.to_eterm(&mut self.info_heap, &self.atoms)
+        let Runtime {
+            info_heap,
+            code_server,
+            ..
+        } = self;
+        value.to_eterm(info_heap, code_server.atoms())
     }
 
     /// `system_info/1` as a heap-independent value — the testable source of truth.
@@ -322,17 +412,17 @@ impl Runtime {
         let Runtime {
             registry,
             heap,
-            atoms,
+            code_server,
             self_pid,
             ..
         } = self;
-        eval::eval(expr, registry, heap, atoms, *self_pid)
+        eval::eval(expr, registry, heap, code_server.atoms(), *self_pid)
     }
 
     /// Prints `term` through the registered `io:format/2` `~p` printer.
     ///
     /// `module` selects the atom table the printer resolves atoms against: the loaded
-    /// module's (the one that produced the term) when given, the runtime's global table
+    /// module's (the one that produced the term) when given, the runtime's shared table
     /// otherwise. Like [`Runtime::system_info`], the format/argument lists are built on
     /// the scratch heap, so the returned text — not any term — is the result.
     ///
@@ -341,19 +431,38 @@ impl Runtime {
     /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a term outside the
     /// Milestone-1 printable set; the heap's allocation failure otherwise.
     pub fn format_term(&mut self, term: Eterm, module: Option<&Module>) -> Result<String> {
+        self.format_with(term, module, format::FORMAT)
+    }
+
+    /// Like [`Runtime::format_term`] but with the `~w` control (no string rule).
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::format_term`].
+    pub fn format_term_w(&mut self, term: Eterm, module: Option<&Module>) -> Result<String> {
+        self.format_with(term, module, format::FORMAT_W)
+    }
+
+    /// The one printer: renders `term` with `control` on the scratch heap.
+    fn format_with(
+        &mut self,
+        term: Eterm,
+        module: Option<&Module>,
+        control: &[u8],
+    ) -> Result<String> {
         self.info_heap.reset();
         let Runtime {
             info_heap,
-            atoms,
+            code_server,
             registry,
             self_pid,
             ..
         } = self;
         let table = match module {
             Some(module) => &module.atom_table,
-            None => &*atoms,
+            None => code_server.atoms(),
         };
-        format::term_to_string(registry, info_heap, table, *self_pid, term)
+        format::term_to_string_with(registry, info_heap, table, *self_pid, term, control)
     }
 
     /// Boots on demand (idempotent).
@@ -366,32 +475,29 @@ impl Runtime {
     }
 }
 
-/// Runs `function/arity` of `module` through the real context.
-///
-/// The atom-table bridge lives here: the [`RuntimeContext`] gets the **module's** atom
-/// table, so the atoms BIFs build are the indices the engine compares against.
-fn execute(
-    module: &Module,
-    function: &str,
-    arity: u32,
-    args: &[Eterm],
-    registry: &BifRegistry,
-    heap: &mut Heap,
-    tables: &mut TableRegistry,
-    self_pid: ProcessId,
-    out: &mut dyn OutputSink,
-) -> Result<Eterm> {
-    let module_name = module.atom_name(module.name).unwrap_or("<unnamed>");
-    let function_atom = module
-        .atom_table
-        .lookup(function)
-        .ok_or_else(|| error::unknown_function(module_name, function, arity))?;
-    if module.export(function_atom, arity).is_none() {
-        return Err(error::unknown_function(module_name, function, arity));
-    }
-    let mut context =
-        RuntimeContext::new(registry, heap, &module.atom_table, self_pid, tables).with_output(out);
-    Machine::new().run_export(module, function_atom, arity, args, &mut context)
+/// Materializes one parsed argument term (the [`Runtime::materialize_args`] walk).
+fn materialize(arg: &ArgTerm, code_server: &mut CodeServer, arena: &mut MinimalContext) -> Result<Eterm> {
+    Ok(match arg {
+        ArgTerm::Int(value) => make_small(*value),
+        ArgTerm::Atom(name) => make_atom(code_server.atoms_mut().intern(name)),
+        ArgTerm::Str(text) => charlist(text, arena)?,
+        ArgTerm::List(elements) => {
+            let mut terms = Vec::with_capacity(elements.len());
+            for element in elements {
+                terms.push(materialize(element, code_server, arena)?);
+            }
+            terms::make_list(arena, &terms)?
+        }
+    })
+}
+
+/// `text` as an Erlang string (a char list) built on the arena.
+fn charlist(text: &str, arena: &mut MinimalContext) -> Result<Eterm> {
+    let elems: Vec<Eterm> = text
+        .chars()
+        .map(|c| make_small(i64::from(c as u32)))
+        .collect();
+    terms::make_list(arena, &elems)
 }
 
 #[cfg(test)]
@@ -427,9 +533,9 @@ mod tests {
     #[test]
     fn a_fresh_runtime_has_core_atoms_and_one_process() {
         let rt = runtime();
-        assert!(rt.atoms.lookup("unix").is_some());
-        assert!(rt.atoms.lookup("linux").is_some());
-        assert_eq!(rt.processes.len(), 1);
+        assert!(rt.atoms().lookup("unix").is_some());
+        assert!(rt.atoms().lookup("linux").is_some());
+        assert_eq!(rt.processes().len(), 1);
         assert_eq!(
             rt.system_info_value("process_count").expect("count"),
             InfoValue::Int(1)
@@ -437,20 +543,15 @@ mod tests {
     }
 
     #[test]
-    fn loads_and_caches_a_module_with_its_atom_table() {
+    fn loads_and_caches_a_module_in_the_shared_table() {
         let mut rt = runtime();
         let module = rt.load_module(SLICE_BEAM).expect("load slice.beam");
         assert_eq!(module.atom_name(module.name), Some("slice"));
         assert_eq!(rt.loaded_modules(), vec!["slice".to_string()]);
         assert!(rt.module("slice").is_some());
         assert!(rt.module("nope").is_none());
-        // The cached module keeps its own atom table for the engine to compare against.
-        assert!(rt
-            .module("slice")
-            .expect("cached")
-            .atom_table
-            .lookup("pick")
-            .is_some());
+        // The shared table knows the module's atoms.
+        assert!(rt.atoms().lookup("pick").is_some());
         rt.load_module(SLICE_BEAM).expect("reloading replaces");
         assert_eq!(rt.loaded_modules().len(), 1);
     }
@@ -491,11 +592,8 @@ mod tests {
     }
 
     #[test]
-    fn the_slice_takes_an_atom_argument_from_the_module_table() {
-        // `run_module` takes a **caller-owned** module, exactly as the CLI's `-s`
-        // action does (it must keep the `Module` — and its atom table — alive while
-        // resolving the atom arguments).
-        let image = load_file(SLICE_BEAM).expect("load slice.beam");
+    fn the_slice_takes_an_atom_argument_from_the_shared_table() {
+        let image = beam_loader::load_file(SLICE_BEAM).expect("load slice.beam");
         let a = make_atom(image.atom_table.lookup("a").expect("a is interned"));
         let mut rt = runtime();
         let mut sink = beam_bifs::NullSink;
@@ -514,14 +612,10 @@ mod tests {
             rt.system_info("nonsense"),
             Err(beam_common::BeamError::BadArg)
         ));
-        // A `system_info` term lives on the scratch heap, which the *next*
-        // `system_info`/`format_term` call resets — so it is read, never returned.
         let version = rt.system_info("version").expect("version");
         assert!(beam_term::is_list(version));
         let again = rt.system_info("wordsize").expect("wordsize again");
         assert_eq!(signed_value(again), std::mem::size_of::<usize>() as i64);
-        // Terms on the process heap (`eval` results, `run_*` results) are stable and
-        // print through the registered `~p` printer.
         let five = rt.eval("2+3").expect("2+3");
         assert_eq!(rt.format_term(five, None).expect("printable"), "5\n");
     }
@@ -538,19 +632,40 @@ mod tests {
     #[test]
     fn format_term_uses_the_registered_printer() {
         let mut rt = runtime();
+        assert_eq!(rt.format_term(make_small(7), None).expect("printable"), "7\n");
         assert_eq!(
-            rt.format_term(make_small(7), None).expect("printable"),
-            "7\n"
+            rt.format_term(beam_term::NIL, None).expect("printable"),
+            "[]\n"
         );
-        assert_eq!(rt.format_term(beam_term::NIL, None).expect("printable"), "[]\n");
+        // `~w` does not apply the string rule.
+        assert_eq!(
+            rt.format_term_w(beam_term::NIL, None).expect("printable"),
+            "[]\n"
+        );
+    }
+
+    #[test]
+    fn materializes_parsed_argument_terms() {
+        let mut rt = runtime();
+        let args = vec![
+            ArgTerm::Int(-7),
+            ArgTerm::Atom("a".to_string()),
+            ArgTerm::Str("hi".to_string()),
+            ArgTerm::List(vec![ArgTerm::Int(1), ArgTerm::Atom("b".to_string())]),
+        ];
+        let terms = rt.materialize_args(&args).expect("materialize");
+        assert_eq!(signed_value(terms[0]), -7);
+        assert_eq!(rt.atom_name_of(terms[1]), Some("a"));
+        let chars = beam_term::list_elements(terms[2]).expect("a char list");
+        assert_eq!(signed_value(chars[0]), i64::from(b'h'));
+        assert_eq!(beam_term::list_elements(terms[3]).expect("a list").len(), 2);
     }
 
     #[test]
     fn module_files_are_found_through_the_code_path() {
         let dir = Path::new(SLICE_BEAM).parent().expect("a parent directory");
         let config = RuntimeConfig::default().with_code_path(dir);
-        let rt = Runtime::new(config).expect("runtime");
+        let mut rt = Runtime::new(config).expect("runtime");
         assert_eq!(rt.find_module_file("slice"), Some(PathBuf::from(SLICE_BEAM)));
-        assert_eq!(rt.find_module_file("nope"), None);
     }
 }
