@@ -19,7 +19,7 @@ Built as part of the `ssl` app (`SUB_DIRECTORIES = src doc examples/certs exampl
 ## Notes for Agents
 - `mk_opts/1` resolves the certificates as `filename:join([code:lib_dir(ssl), "examples", "certs", "etc"])`, which is correct only in a source tree.
   In an installed release the examples live under `<lib_dir>/ssl-<vsn>/doc/examples/`, so the PEMs are actually at `<lib_dir>/ssl-<vsn>/doc/examples/certs/etc` and the hardcoded path misses them.
-- The committed example certs (`../certs/etc/{client,server,erlangCA,otpCA}/*.pem`) are valid 2010-09-01 .. 2025-08-28 and are therefore expired; with `{verify, 2}` the handshake now fails certificate verification unless the certs are regenerated (see `../certs/src/make_certs.erl`, which needs `erl_make_certs` from `lib/ssl/test`).
+- The committed example certs (`../certs/etc/{client,server,erlangCA,otpCA}/*.pem`) are valid 2010-09-01 .. 2025-08-28 and are therefore expired; with `{verify, 2}` the handshake now fails certificate verification unless the certs are regenerated (see `../certs/src/make_certs.erl`, which needs `erl_make_certs` — that module lives in `lib/public_key/test/`, not in `lib/ssl/test/`, and is not on the default code path).
 - The example is not referenced by any doc source or test suite in the repo; grep for `client_server` outside these two files finds only unrelated matches.
 - `../certs/` owns cert generation and the PEM tree; changes to cert paths or contents must be coordinated with it.
 
