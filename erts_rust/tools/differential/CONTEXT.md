@@ -99,8 +99,8 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `src/lib.rs` → crate docs, module wiring, public re-exports (the public API surface)
 - `src/error.rs` → `Error` (`Usage`/`Env`/`Io`) + `Result` + exit-code mapping
 - `src/cli.rs` → `Command`, hand-rolled `parse`, `--help`/usage text
-- `src/runtime.rs` → runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, process spawn
-- `src/module_build.rs` → `erlc` resolution (`$ERLC`/`$PATH`), embedded-module compilation into a temp dir (`CompiledModule`)
+- `src/runtime.rs` → runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, `output_with_retry` (bounded transient-`ETXTBSY` spawn retry) + process spawn
+- `src/module_build.rs` → `erlc` resolution (`$ERLC`/`$PATH`), embedded-module compilation into a temp dir (`CompiledModule`), spawning through `runtime::output_with_retry`
 - `src/compare.rs` → observable diff (`Observables`), golden check, `Verdict` (`verdict`/`verdict_with`)
 - `src/corpus/mod.rs` → `Case`/`CaseKind`/`ModuleRun`/`Contract`/`Probe`/`Golden` + registry (`cases`, `find_case`, `probe_expr`)
 - `src/corpus/etf.rs` → `.beam`/ETF cases (A.2): `term_to_binary` bytes, `binary_to_term` round-trip
