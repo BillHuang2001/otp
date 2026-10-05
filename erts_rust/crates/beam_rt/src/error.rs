@@ -15,7 +15,7 @@
 //! A *capability gap* — a feature Milestone-1 deliberately does not implement, as
 //! opposed to a genuine failure or a malformed invocation — is signalled by a raise
 //! whose **reason atom starts with `unsupported`**. The constructors here
-//! ([`unknown_switch`], [`bad_eval`], [`unsupported`]) follow the convention, and so
+//! ([`bad_eval`], [`unsupported`]) follow the convention, and so
 //! do the sibling crates: `beam_engine` raises `unsupported_opcode: <what>` and
 //! `beam_bifs` raises `unsupported_bif`.
 //!
@@ -35,6 +35,32 @@ use beam_common::{BeamError, ExitReason, Raise};
 
 /// The prefix every capability-gap reason atom starts with (see the module docs).
 pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
+
+/// The prefix of the reason atom a runtime **halt** raises (`beam_rt_halt:<status>`).
+///
+/// A halt is not a capability gap and not a genuine error: it is the runtime
+/// terminating with a chosen exit status. It travels out of the executing code as an
+/// [`ExceptionClass::Exit`](beam_common::ExceptionClass::Exit) raise carrying this
+/// prefix (plus the decimal status), and [`crate::cli::run`] turns
+/// [`halt_status`] into the process exit code.
+pub(crate) const HALT_PREFIX: &str = "beam_rt_halt";
+
+/// The `erlang:halt/0,1` raise: class `exit`, reason atom `beam_rt_halt:<status>`.
+pub(crate) fn halt(status: i32) -> BeamError {
+    BeamError::Raise(Raise::exit(ExitReason::atom(format!(
+        "{HALT_PREFIX}:{status}"
+    ))))
+}
+
+/// The exit status carried by a runtime **halt** raise, if `error` is one.
+///
+/// This is the classifier of the [`HALT_PREFIX`] convention, the counterpart of
+/// [`unsupported_reason`]: `Some(status)` for a raise whose reason atom is
+/// `beam_rt_halt:<status>`, `None` for anything else.
+pub(crate) fn halt_status(error: &BeamError) -> Option<i32> {
+    let reason = raise_reason(error)?;
+    reason.strip_prefix(HALT_PREFIX)?.strip_prefix(':')?.parse().ok()
+}
 
 /// A message-carrying `error`-class raise — the runtime's general diagnostic.
 pub(crate) fn message(text: impl Into<String>) -> BeamError {
@@ -74,16 +100,6 @@ pub(crate) fn unsupported_reason(error: &BeamError) -> Option<String> {
     )
 }
 
-/// An unrecognized command-line switch.
-///
-/// A switch outside the documented A.6 surface is a **capability gap**, not a usage
-/// error: real `erl` treats an unmodeled switch as an init argument (verified:
-/// `erl -noshell --nope -eval 'halt(0).'` exits 0), so it is classified as
-/// *unsupported* and named in the message (contract A.6: never silently ignored).
-pub(crate) fn unknown_switch(switch: &str) -> BeamError {
-    unsupported(&format!("unknown switch {switch:?}"))
-}
-
 /// A malformed value of a *recognized* switch (e.g. `+P x`).
 pub(crate) fn bad_switch_value(switch: &str, value: &str) -> BeamError {
     message(format!("bad value {value:?} for switch {switch}"))
@@ -106,10 +122,10 @@ pub(crate) fn bad_spec(spec: &str) -> BeamError {
     ))
 }
 
-/// A `run` action whose integer arguments do not match the declared arity.
+/// A `run` action whose arguments do not match the declared arity.
 pub(crate) fn arity_mismatch(spec: &str, expected: u32, found: usize) -> BeamError {
     message(format!(
-        "{spec} takes {expected} integer argument(s), {found} given"
+        "{spec} takes {expected} argument(s), {found} given"
     ))
 }
 
@@ -145,6 +161,19 @@ pub(crate) fn unknown_function(module: &str, function: &str, arity: u32) -> Beam
     message(format!("{module}:{function}/{arity} is not exported"))
 }
 
+/// A call into the `erlang` namespace that is not a registered BIF.
+///
+/// `erlang` is the BIF namespace and never a loadable module, so an unknown
+/// `erlang:*` call is a diagnostic rather than a spurious module load.
+pub(crate) fn unknown_bif(module: &str, function: &str, arity: u32) -> BeamError {
+    message(format!("{module}:{function}/{arity} is not a BIF"))
+}
+
+/// A `run` argument outside the documented term grammar.
+pub(crate) fn bad_run_argument(argument: &str) -> BeamError {
+    message(format!("{argument:?} is not a valid run argument"))
+}
+
 /// A `-eval` expression outside the supported integer-expression subset.
 ///
 /// The grammar is a documented Milestone-1 capability-gap boundary, so a rejection
@@ -166,10 +195,10 @@ mod tests {
 
     #[test]
     fn message_errors_render_their_text() {
-        let error = unknown_switch("--nope");
+        let error = unsupported("operator /");
         assert_eq!(
             error.to_string(),
-            "error unsupported: unknown switch \"--nope\""
+            "error unsupported: operator /"
         );
         assert!(error.is_raise());
     }
@@ -178,7 +207,7 @@ mod tests {
     fn capability_gaps_are_classified_and_stripped() {
         // The constructors here build owned atoms (`unsupported: …`).
         assert_eq!(
-            unsupported_reason(&unknown_switch("--nope")).as_deref(),
+            unsupported_reason(&unsupported("unknown switch \"--nope\"")).as_deref(),
             Some("unknown switch \"--nope\"")
         );
         assert_eq!(
@@ -218,10 +247,27 @@ mod tests {
     }
 
     #[test]
+    fn a_halt_raise_carries_its_status_and_is_not_a_capability_gap() {
+        for status in [0, 1, 42, 255] {
+            let error = halt(status);
+            assert_eq!(halt_status(&error), Some(status), "{error}");
+            assert_eq!(unsupported_reason(&error), None, "{error}");
+        }
+        // A non-halt raise (and a non-raise) is not a halt.
+        assert_eq!(halt_status(&unsupported("nope")), None);
+        assert_eq!(halt_status(&BeamError::BadArg), None);
+        assert_eq!(halt_status(&missing_value("-eval")), None);
+    }
+
+    #[test]
     fn diagnostics_name_the_offending_item() {
         assert!(unknown_function("slice", "add", 3)
             .to_string()
             .contains("slice:add/3"));
+        assert!(unknown_bif("erlang", "nope", 1)
+            .to_string()
+            .contains("erlang:nope/1"));
+        assert!(bad_run_argument("1+").to_string().contains("1+"));
         assert!(bad_switch_value("+P", "x").to_string().contains("\"x\""));
         assert!(unexpected_argument("junk").to_string().contains("junk"));
         assert!(unknown_module("slice").to_string().contains("slice"));
