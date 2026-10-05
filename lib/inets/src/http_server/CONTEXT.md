@@ -26,7 +26,7 @@ Public documentation for this area lives in `../../doc/` (`httpd`, `httpd_util`,
 - `httpd_example` is a sample ESI module used by examples/tests — not part of the supported API.
 
 ## Architecture (supervision & processes)
-- `httpd_sup` (registered `httpd_sup`, one per node/standalone VM) → one `httpd_instance_sup` per server instance, registered as `{httpd_instance_sup, Address, Port, Profile}`; children: `httpd_connection_sup`, `httpd_misc_sup`, `httpd_manager`, `httpd_acceptor_sup`.
+- `httpd_sup` (registered as `httpd_sup` when started under the `inets` application; the standalone variant from `start_link/2` is unregistered) → one `httpd_instance_sup` per server instance, registered as `{httpd_instance_sup, Address, Port, Profile}`; children: `httpd_connection_sup`, `httpd_misc_sup`, `httpd_manager`, `httpd_acceptor_sup`.
 - `httpd_acceptor_sup` → one `httpd_acceptor` per listener (`proc_lib` process that owns the listen socket and loops on `http_transport:accept/3`); on accept it calls `httpd_connection_sup:start_child/2`, transfers socket ownership (`http_transport:controlling_process/3`) and notifies the worker via `httpd_request_handler:socket_ownership_transfered/3`.
 - `httpd_connection_sup` is `simple_one_for_one` with `Temporary`/`brutal_kill` `httpd_request_handler` children — one short-lived process per connection.
 - `httpd_request_handler` is a `gen_server` that boots through `gen_server:enter_loop/3` (its `init/1` must first wait for the socket-ownership hand-off); it parses, dispatches and keeps the connection alive, supporting pipelining and keep-alive with `keep_alive_timeout` / `request_timeout` timers.
