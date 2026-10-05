@@ -64,7 +64,7 @@ Every `lib/<app>/` follows the same schema (some dirs optional per app):
 | `megaco/` | Megaco/H.248 media gateway control protocol stack |
 | `mnesia/` | Distributed, transactional, soft-realtime database |
 | `observer/` | GUI system observer (processes, memory, applications) |
-| `odbc/` | ODBC database access (Erlang ODBC interface) |
+| `odbc/` | ODBC database access via the `odbc` driver — **deprecated, slated for removal** (OTP-19980); needs system ODBC libs |
 | `os_mon/` | OS monitoring (cpu/mem/disk supervision, SNMP MIBs) |
 | `parsetools/` | Parser-generator tools (Yecc LALR, Leex lexer) |
 | `public_key/` | Public-key infrastructure API and cert handling (ASN.1-based) |
