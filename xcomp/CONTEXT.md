@@ -48,7 +48,8 @@ Nothing here is compiled or installed; the files are developer/CI-facing configu
 Recurring `erl_xcomp_configure_flags` patterns: iOS targets use `--without-{termcap,wx,javac,odbc,debugger,observer,cdv,et} --enable-{builtin-zlib,static-nifs,static-drivers}` and often `--disable-jit`; Android targets use `--without-{termcap,wx} --enable-{builtin-zlib,deterministic-build}` and `LDFLAGS="-static-libstdc++"`; 32-bit Linux targets add `--disable-year2038`.
 
 ## Constraints
-- The files are POSIX shell fragments evaluated by `configure`/`otp_build`, **not** a config format: backticks, `$VAR` expansion and `export` are all active. `--xcomp-conf=` performs tilde expansion, `configure` does not.
+- The files are POSIX shell fragments sourced by `otp_build`, **not** a config format: backticks, `$VAR` expansion and `export` are all active.
+- When a direct `./configure` run is given these variables via the environment, unset them again before `make`, or they leak into application make variables.
 - Keep `erl-xcomp-vars.sh` in sync with the template and with the `AC_ARG_VAR` declarations in `make/autoconf/otp.m4` (this directory's own NOTE comments still name the pre-move path `erts/aclocal.m4`).
 - Every per-target `.conf` is a copy of the template body with a handful of lines uncommented, so a template change normally implies touching all 17 target files.
 - Do not add variables that are not in `erl_xcomp_vars`/`erl_build_tool_vars` and expect them to reach sub-configures.
