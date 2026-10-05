@@ -255,13 +255,14 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   integration-testable.
 
 ## Test Strategy
-* **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + the capability-gap
-  classification of unknown switches / bad `-eval` expressions), `system_info_value` for every key +
-  the unknown-key `badarg`, `InfoValue`
+* **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + `init_args`
+  recording of recognized *and* unmodeled switches, the `run` argument grammar, the `-eval`
+  trailing-dot, `-run`), `system_info_value` for every key + the unknown-key `badarg`, `InfoValue`
   → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, `eval`
   subset (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, rejection of non-integers), CLI `+S/+P/-pa/-pz` mapping,
-  `error::unsupported_reason` (`Some` for `unknown_switch`/`bad_eval`/`unsupported_opcode`/`unsupported_bif`,
-  `None` for `missing_value`/`module_not_found`/`BadArg`/`SystemLimit`).
+  the native floor (`erlang:halt/0,1` records `Runtime::halt`, `init:get_argument` occurrences/absent),
+  `error::unsupported_reason` (`Some` for `bad_eval`/`unsupported_opcode`/`unsupported_bif`, `None` for
+  `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`.
 * **`tests/slice.rs` — the end-to-end library slice (the key evidence).** Loads the committed oracle
   fixture `../beam_loader/tests/fixtures/slice.beam` (reused by relative path via
   `concat!(env!("CARGO_MANIFEST_DIR"), …)` — a single source of truth, never copied) and asserts
