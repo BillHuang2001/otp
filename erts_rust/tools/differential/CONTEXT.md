@@ -98,6 +98,13 @@ Invocation argv is built once and used for **both** runtimes (drop-in `erl`, A.6
   so an exact string would be a guaranteed false mismatch once the Rust runtime lands.
 - **`--strict`** exists so CI can forbid `unsupported` once the Rust runtime is functional; the default
   keeps today's stub-driven `unsupported` non-fatal.
+- **A golden is the probe's stdout *line*, without the `~n` line break**: the probe always prints
+  exactly one line, so `compare::check_golden` normalizes the observation with
+  `normalize_probe_stdout` (strips one trailing `\n`, and a preceding `\r`) before comparing it to
+  `Golden::stdout`. This keeps a golden diff readable instead of hiding a newline inside it.
+- **Reports are always written** (`--out <dir>` sets the directory, default `out/`); `--json` only
+  decides what goes to stdout. An ad-hoc `compare` asserts no golden, so its report carries
+  `matched_golden: null` (the Rust side always does).
 
 ## Known Issues / Notes for Agents
 - **`beam_rt` is currently a stub** that only prints a version banner (see `../../crates/beam_rt`); it
