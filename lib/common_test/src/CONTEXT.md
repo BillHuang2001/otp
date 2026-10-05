@@ -55,7 +55,7 @@ The `test_server*` modules are the historical core of the framework and keep the
   API: testdata/suite-data get/set/update, connection registry (`register_connection`, `get_connection`, `silence_connections`, ...), verbosity, cwd control (`set_cwd/reset_cwd/get_start_dir`), process marking (`mark_process/is_marked/remaining_test_procs`), profile data, `get_mode/0`, `read_opts/0`, `parse_table/1`, `listenv/1`.
 - `ct_groups.erl` — parses/validates `groups/0` and `group/1` definitions and resolves group paths to testcase/repeat specs: `find_groups/4, make_all_conf/3,4, make_conf/5, delete_subs/2, expand_groups/3, search_and_override/3`.
 - `ct_repeat.erl` — implements the `repeat`/`duration`/`until`/`force_stop` options: `loop_test/2` reruns the whole run and `abort/0` stops it.
-- `ct_make.erl` — compiles suites/support modules and builds `-include` paths for a run (uses the `ct_make_ref` registered process for parallel compile scheduling).
+- `ct_make.erl` — Emakefile-based compiler helper (`all/0,1`, `files/1,2`) used by `ct_run:run_make/...` to auto-compile a test directory before a run; `test_server_ctrl` only loads the already-compiled suites (`code:load_file/1`).
 - `ct_rpc.erl` — convenience wrapper around `rpc` with timeouts/error mapping: `app_node/2,3,4`, `call/4,5,6`, `cast/4,5`.
 - `ct_default_gl.erl` — minimal group leader replacement (registered/conventional) so IO is never lost.
 - `ct_gen_conn.erl` — generic connection-handler framework: a `gen_server` behaviour implementation a connection module (e.g. `unix_telnet`) plugs into; `start/4, stop/1, get_conn_pid/1, call/2,3, return/2, log/3, start_log/1, cont_log/2, end_log/0, make_opts/1`.
