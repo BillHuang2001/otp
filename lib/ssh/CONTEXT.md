@@ -62,7 +62,7 @@ Client and server share nearly all code — the role is a state in `#ssh{}` and 
 ## Dependencies
 - Erlang apps: kernel, stdlib, crypto, public_key (runtime_tools only for debug/inspection helpers) — see `src/ssh.app.src` `applications`/`runtime_dependencies`.
 - External: no system libraries; key file formats and default paths mirror OpenSSH (`/etc/ssh`, `~/.ssh`), and agent support requires OpenSSH-compatible agent sockets.
-- Build: plain OTP make (`Makefile` → `src`, `doc`), no autoconf/`configure` in this app; `prebuild.skip` lists `src/deps/ssh.d` (generated dependency file).
+- Build: plain OTP make (`Makefile` → `src`, `doc`), no autoconf/`configure` in this app; `src/Makefile` depends on `make/dep.mk` and `make/app_targets.mk`.
 
 ## Test Strategy
 - `make tests` / `make test` run the Common Test suites in `test/`; see `test/CONTEXT.md` for suites, spec/cover files, helper libraries and external requirements (openssh, docker, QuickCheck).
