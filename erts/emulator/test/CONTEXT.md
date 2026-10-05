@@ -13,7 +13,7 @@ Total tracked files: 370.
 - From `ERL_TOP`: `make emulator_test ARGS="-suite gc_SUITE"` and `make emulator_test ARGS="-suite binary_SUITE -case deep_bitstr_lists"` (the `emulator_test` root target also builds the emulator first).
 - From `erts/emulator`: `make test` (all suites) or `make test ARGS="-suite gc_SUITE -case grow_heap"`.
 - `ARGS` is passed verbatim to `ct_run`; when it is empty the spec file is used instead (see below).
-- `TYPE=<debug|asan|valgrind|lcnt|gcout...>` is forwarded by `../../make/app_targets.mk` into `-emu_type`, and `FLAVOR=<emu|jit>` into `-emu_flavor`, so run e.g. `make test TYPE=debug` or `make emulator_test FLAVOR=jit ARGS="-suite jit_SUITE"`.
+- `TYPE=<debug|asan|valgrind|lcnt|gcov|...>` is forwarded by `../../make/app_targets.mk` into `-emu_type`, and `FLAVOR=<emu|jit>` into `-emu_flavor`, so run e.g. `make test TYPE=debug` or `make emulator_test FLAVOR=jit ARGS="-suite jit_SUITE"`.
 - `TEST_NEEDS_RELEASE` is **not** set at this level (only `erts/Makefile` sets it), so no full OTP release is required; `test_target_script.sh` still prepares `erts/emulator/make_test_dir/emulator_test` + `make_test_dir/ct_logs`.
 - Test logs: `erts/emulator/make_test_dir/ct_logs/index.html`. Compile/install logs: `make_test_dir/{compile,install,release}_tests*_log`.
 - `*_SUITE_data/Makefile.src` files are configured to `Makefile` and built by `ts:compile_datadirs` (`*_SUITE_data` glob) using the configured `make`; a suite reads its dir via `?config(data_dir, Config)`.
