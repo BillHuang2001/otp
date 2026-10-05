@@ -39,8 +39,9 @@ use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
 use super::{
-    decode_flags, extract_bits, fail_step, is_all, make_small_checked, raw, read_size,
-    read_uint_be, read_uint_le, sign_extend, small_value, BSF_ALIGNED, BSF_LITTLE, BSF_SIGNED,
+    decode_flags, extract_bits, fail_step, is_all, le_bytes_to_digits, make_int,
+    make_small_checked, raw, read_size, read_uint_be, read_uint_le, sign_extend, small_value,
+    twos_complement_bits, BSF_LITTLE, BSF_SIGNED,
 };
 
 /// Execute a bitstring **matching** instruction.
@@ -163,21 +164,12 @@ pub(super) fn exec(
             if nbits > end.saturating_sub(start) {
                 return fail_step(machine, module, labels, *fail, term, ctx);
             }
-            if flags & BSF_ALIGNED != 0 && start % 8 != 0 {
-                return fail_step(machine, module, labels, *fail, term, ctx);
-            }
-            if nbits > 64 {
-                return Err(error::unsupported(
-                    "bs_get_integer2: integer field wider than 64 bits",
-                ));
-            }
             let bytes = raw::subject_bytes(orig)?;
-            let value = read_integer_field(bytes, start, nbits, *flags)?;
+            let value = read_integer_field(ctx, bytes, start, nbits, *flags)?;
             write_operand(machine, dst, value)?;
             raw::set_ctx_start(term, start + nbits);
             Ok(Some(Step::Next))
         }
-
         Instr::BsGetBinary2 {
             fail,
             ctx: ctx_op,
@@ -850,14 +842,8 @@ fn run_commands(
                 if nbits > end.saturating_sub(pos) {
                     return fail_step(machine, module, labels, fail, term, ctx);
                 }
-                if nbits > 64 {
-                    return Err(error::unsupported(
-                        "bs_match integer: field wider than 64 bits",
-                    ));
-                }
-                let value = read_integer_field(bytes, pos, nbits, flags)?;
-                write_operand(machine, dst, value)?;
-                pos += nbits;
+                let value = read_integer_field(ctx, bytes, pos, nbits, flags)?;
+                write_operand(machine, dst, value)?;                pos += nbits;
                 i += 6;
             }
 

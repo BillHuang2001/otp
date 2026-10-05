@@ -16,15 +16,16 @@
 //!
 //! # Scope
 //!
-//! Implemented: `integer` (any width ≤ 64 bits, big- or little-endian, values masked
-//! into the field), `binary` and `string` segments (byte-aligned, `all` or an
-//! explicit bit count), `float` (16/32/64 bits, big- or little-endian), and
-//! `utf8`/`utf16`/`utf32`, combined into one result bitstring.
+//! Implemented: `integer` (any width, big- or little-endian, the value masked into
+//! the field — up to 64 bits through the machine-word path, wider fields through the
+//! bignum path [`super::push_wide_int`]), `binary` and `string` segments
+//! (byte-aligned, `all` or an explicit bit count), `float` (16/32/64 bits, big- or
+//! little-endian), and `utf8`/`utf16`/`utf32`, combined into one result bitstring.
 //!
 //! Not implemented (each a precise typed [`crate::error::unsupported`]): `append`,
 //! `private_append` and `bs_init_writable` (they need a mutable off-heap
 //! ref-counted binary the term layer does not provide), results larger than the
-//! on-heap binary limit, and non-small-integer segment values.
+//! on-heap binary limit, and an `integer` segment whose value is not an integer.
 
 use std::collections::BTreeMap;
 
@@ -38,7 +39,10 @@ use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
 use crate::Step;
 
-use super::{decode_flags, fail_step, is_all, raw, read_size, small_value, BitWriter, BSF_LITTLE};
+use super::{
+    decode_flags, fail_step, is_all, push_wide_int, raw, read_size, small_value, BitWriter,
+    BSF_LITTLE,
+};
 
 /// Execute a bitstring **construction** instruction.
 pub(super) fn exec(
@@ -127,25 +131,27 @@ fn assemble(
                 let Some(nbits) = size.checked_mul(unit) else {
                     return fail_seg(machine, module, labels, fail, value_op, ctx);
                 };
-                if nbits > 64 {
-                    return Err(error::unsupported(
-                        "bs_create_bin: integer segment wider than 64 bits",
-                    ));
-                }
                 let value = read_value(machine, module, value_op)?;
-                let Some(raw_value) = small_value(value) else {
-                    return Err(error::unsupported(
-                        "bs_create_bin: integer segment value is not a small integer",
-                    ));
-                };
-                if flags & BSF_LITTLE != 0 {
-                    writer.push_uint_le(raw_value as u64, nbits);
+                if nbits > 64 {
+                    // `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`): a wide
+                    // field of a small *or* a bignum value, both taken modulo
+                    // `2^nbits` (a negative value becomes its nbits-bit two's
+                    // complement, `SUBc` on the build side).
+                    push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
                 } else {
-                    // `erts_bs_put_integer_*` masks the value into the field width.
-                    writer.push_uint(raw_value as u64, nbits);
+                    let Some(raw_value) = small_value(value) else {
+                        return Err(error::unsupported(
+                            "bs_create_bin: integer segment value is not a small integer",
+                        ));
+                    };
+                    if flags & BSF_LITTLE != 0 {
+                        writer.push_uint_le(raw_value as u64, nbits);
+                    } else {
+                        // `erts_bs_put_integer_*` masks the value into the field width.
+                        writer.push_uint(raw_value as u64, nbits);
+                    }
                 }
             }
-
             "binary" | "string" => {
                 let (bytes, src_bits) = segment_source(machine, module, value_op, kind)?;
                 let nbits = if is_all(module, size_op) {

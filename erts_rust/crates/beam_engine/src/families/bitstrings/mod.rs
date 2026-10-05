@@ -55,8 +55,14 @@ use crate::operand::read_operand;
 use crate::Step;
 
 /// `BSF_ALIGNED` (`erl_bits.h:461`): the field is guaranteed byte-aligned.
-pub(super) const BSF_ALIGNED: u32 = 1;
-/// `BSF_LITTLE` (`erl_bits.h:462`): the field is little-endian.
+///
+/// Kept for completeness of the frozen `erl_bits.h` flag table (`:461-465`). No
+/// opcode consults it: the flags a segment operand decodes never include it
+/// ([`decode_flags`]), and C's `erts_bs_get_integer_2`/`erts_bs_put_integer_*` never
+/// branch on it either — the byte alignment a little-endian field needs is enforced
+/// structurally by the byte-wise read/write helpers instead.
+#[allow(dead_code)]
+pub(super) const BSF_ALIGNED: u32 = 1;/// `BSF_LITTLE` (`erl_bits.h:462`): the field is little-endian.
 pub(super) const BSF_LITTLE: u32 = 2;
 /// `BSF_SIGNED` (`erl_bits.h:463`): the field is signed.
 pub(super) const BSF_SIGNED: u32 = 4;
@@ -309,21 +315,6 @@ pub(super) fn le_bytes_to_digits(bytes: &[u8]) -> Vec<u64> {
         digits.pop();
     }
     digits
-}
-
-/// `bytes << shift` as a little-endian byte array of the **same** length (`shift`
-/// in `0..=7`); bits shifted past the top byte are dropped.
-pub(super) fn shl_le_bytes(bytes: &[u8], shift: u32) -> Vec<u8> {
-    if shift == 0 {
-        return bytes.to_vec();
-    }
-    let mut out = vec![0u8; bytes.len()];
-    let mut carry = 0u8;
-    for (i, &b) in bytes.iter().enumerate() {
-        out[i] = (b << shift) | carry;
-        carry = b >> (8 - shift);
-    }
-    out
 }
 
 /// Replace a little-endian byte array holding a value `< 2^nbits` with its
