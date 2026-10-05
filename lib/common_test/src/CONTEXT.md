@@ -86,7 +86,8 @@ The `test_server*` modules are the historical core of the framework and keep the
 ### (g) Distributed / ct_master
 - `ct_master.erl` — orchestration of multiple `ct_run` nodes: `run/2,3, run_testspec/1,2, run_testcase/4, run_make/...`; starts `ct_master_event`/`ct_master_logs`, splits a testspec across nodes and merges the results into a master HTML index.
   `ct_master` itself does not execute testcases.
-- `ct_slave.erl` — starts/stops support nodes (`start/1,2,3, stop/1,2, ...`), optionally via `ssh` (`application:ensure_all_started(ssh)`).
+- `ct_slave.erl` — starts/stops support nodes (`start/1,2,3, stop/1,2, slave_started/2, slave_ready/2, monitor_master/1`); optionally via `ssh` (`application:ensure_all_started(ssh)`).
+  Every function is deprecated in favour of `?CT_PEER()` / the `peer` module.
 
 ### (h) Connectivity / helper libraries for suites
 - `ct_telnet.erl` — telnet client API over `ct_gen_conn`/`ct_telnet_client`; `open/1..4, close/1, cmd/2,3, cmdf/3,4, get_data/1, send/2,3, sendf/3,4, expect/2,3`; types `connection/0, connection_type/0, handle/0, prompt_regexp/0`.
