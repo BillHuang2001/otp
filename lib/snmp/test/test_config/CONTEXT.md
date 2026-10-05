@@ -1,7 +1,7 @@
 # snmp — Test Configuration Source
 
 ## Intent
-Source of the agent / manager / system configuration used by the snmp application's Common Test suites.
+Source of standalone agent / manager / system configuration for manually set-up snmp test trees.
 Each config file has a hand-edited `*.src` template that the local `Makefile` expands (variable substitution only, no protocol semantics) into a real `.config` / `.conf` file.
 Nothing in the repo invokes this directory: it is a manual utility, run by hand (`make release_tests_spec TESTROOT=<dir>`) to prepare a test tree.
 
