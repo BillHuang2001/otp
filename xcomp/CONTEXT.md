@@ -63,7 +63,7 @@ Recurring `erl_xcomp_configure_flags` patterns: iOS targets use `--without-{term
 
 ## Notes for Agents
 - Do not delegate into subdirectories: this node is flat (no subdirectories, no tests, no build artifacts).
-- `HOWTO/INSTALL-CROSS.md` duplicates the template's variable list in prose (it is the generated/user-facing copy, carries `%OTP-REL%` and is referenced from `system/doc/docs.exs` and `TAR.include`) — a variable added to the template must also land there.
+- `HOWTO/INSTALL-CROSS.md` duplicates the template's variable list in prose; it is the source for the built installation guide (`system/doc/docs.exs` maps it to `system/doc/installation_guide/INSTALL-CROSS.md`) and carries a `%OTP-REL%` placeholder, so a variable added to the template must land there too.
 - Consumers of a conf file, besides `otp_build`/`configure`: `lib/common_test/test_server/ts_install.erl` (`parse_xcomp_file/1`) parses it for `erl_xcomp_host`, `erl_xcomp_build` and the environment exports to set up cross test runs; `.github/scripts/build-macos.sh` is driven with `--xcomp-conf=./xcomp/erl-xcomp-arm64-ios.conf` from `.github/workflows/reusable-build-ios.yaml`.
 - `erl-xcomp-aarch64-darwin.conf` and the ios/iossimulator configs require macOS + Xcode command-line tools (`xcrun`); they cannot be exercised on Linux.
 - Apple/Android confs `export` helper variables (`XCOMP_SDK`, `XCOMP_SDKROOT`, `XCOMP_ARCH`) that only exist inside the sourced file.
