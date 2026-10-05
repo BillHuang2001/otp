@@ -79,7 +79,7 @@ Grouped by module (exports listed by role; see inline `-moduledoc`/`-doc` for de
 
 ## Test Strategy
 - Common Test suites live in the sibling `../test/` (owner of `syntax_tools_SUITE.erl` and `merl_SUITE.erl`, plus `syntax_tools_SUITE_data/`); run with `make test` from `../` (test `Makefile` compiles suites with `+nowarn_missing_spec_documented`).
-- Unit tests for `merl`/`merl_transform` also live here (`merl_tests.erl`, EUnit) and are picked up by the CT suites via `merl.hrl`; the `../examples/merl` tree has its own small test programs.
+- Unit tests for `merl`/`merl_transform` also live here (`merl_tests.erl`, EUnit): it is not in the app `modules` list nor in `Makefile` `ERL_FILES`, so it is not built by `make` and not run by the CT suites — run it separately (e.g. `eunit:test(merl_tests)`) after compiling it; the `../examples/merl` tree has its own standalone EUnit programs.
 - When changing `merl_transform` or the tree contract, exercise both the strict and `quick_*` (`epp_dodger`/`erl_recomment`) paths.
 
 ## See Also
