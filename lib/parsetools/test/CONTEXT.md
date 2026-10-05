@@ -55,7 +55,7 @@ Table-driven helpers drive nearly every case:
 - `Test Strategy` above lists how each case names itself; ticket-numbered cases (`otp_NNNNN`) keep the historical ticket name for the behaviour they pin — the same ticket may appear in both suites.
 
 ## See Also
-- `../src/` — `yecc.erl`, `yeccparser.yrl`, `yeccgramm.yrl`, `leex.erl`, `leexinc.hrl` usage; the API and error terms asserted here.
+- `../src/` — `yecc.erl`, `yeccgramm.yrl` + generated `yeccparser.erl`, `leex.erl`; the API and error terms asserted here.
 - `../include/` — `yeccpre.hrl` (line-count-sensitive) and `leexinc.hrl` templates.
 - `../Makefile` — application build (`SUB_DIRECTORIES = src doc`; the `test` dir is driven by `../make/app_targets.mk`'s `test` target + `make/test_target_script.sh`, not by `SUB_DIRECTORIES`).
 - `../../HOWTO/TESTING.md` — how to run OTP test suites.
