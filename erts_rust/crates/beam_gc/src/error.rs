@@ -4,7 +4,8 @@
 //! ([`BeamError`](beam_common::BeamError)); this module only centralises the
 //! construction of the one GC-specific failure the collector can raise.
 
-use beam_common::BeamError;
+use beam_common::{AllocFailure, AllocKind, BeamError};
+use beam_term::prelude::Eterm;
 
 /// Builds the heap-exhaustion error raised while copying a term.
 ///
@@ -13,6 +14,8 @@ use beam_common::BeamError;
 /// so the caller can collect and retry — never a panic and never a crate-local
 /// error enum. `words` is the number of term words the copy wanted.
 pub(crate) fn heap_exhausted(words: usize) -> BeamError {
-    let _ = words;
-    unimplemented!("scaffold")
+    BeamError::Alloc(AllocFailure::new(
+        AllocKind::Heap,
+        words * core::mem::size_of::<Eterm>(),
+    ))
 }
