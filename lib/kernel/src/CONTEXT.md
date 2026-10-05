@@ -89,7 +89,7 @@ OS / terminal / processes:
 - `prim_tty` / `prim_tty_sighandler` — Erlang side of the `prim_tty` NIF plus its sigwinch/sigcont handler.
 - `standard_error` — the `standard_error` process (stderr group leader).
 - `user_sup` — supervisor bridge that starts `user_drv` with the right mode flags.
-- `erl_erts_errors` / `erl_kernel_errors` — `format_error/2` implementations used by `erl_error` to pretty-print erts/kernel errors.
+- `erl_erts_errors` / `erl_kernel_errors` — `format_error/2` implementations attached via `error_info` maps: the former is referenced by erts preloaded modules (`erlang`, `atomics`, `counters`, ...), the latter by kernel modules (`os`, `trace`, ...).
 - `erts_debug` — wrappers around experimental erts debug BIFs (disassembly, internal state, lock counters); used by tests/tools.
 - `pg2` — REMOVED-module stub only (`-removed`, "removed in OTP 24. Use pg instead"); no longer functional.
 
