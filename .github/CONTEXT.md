@@ -40,7 +40,7 @@ Changed-path detection is generated at run time: `scripts/path-filters.sh` and `
 - The Solaris job in `main.yaml` is permanently disabled (`if: ... && false`, broken VM image), so `reusable-solaris.yaml` is currently unreachable.
 - `osv-scanner-scheduled.yml` also triggers on `pull_request`, but every job is gated to `schedule`, so PR runs are no-ops.
 - `reusable-vex-attest.yml` has no in-repo caller (dispatch-only) and, like `reusable-vendor-vulnerability-scanner.yml`, depends on repo-scoped variables/secrets that do not exist in forks.
-- Workflow file extensions are inconsistent (mostly `.yaml`, seven files use `.yml`); ratchet/Renovate globs cover both.
+- Workflow file extensions are inconsistent (27 files use `.yaml`, 6 use `.yml`); ratchet/Renovate globs cover both.
 
 ## Notes for Agents
 - Read only the file you need: workflows are self-describing YAML with license headers; the per-directory CONTEXT.md files below carry the contracts, so avoid re-deriving them.
