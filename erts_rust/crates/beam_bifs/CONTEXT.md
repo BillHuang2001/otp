@@ -411,6 +411,7 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 - `src/io.rs` → `io:format/1,2` + `io_lib:format/1,2` + the directive engine
 - `src/print.rs` → the `~w`/`~p`/`~W`/`~P` term printer (registers no BIFs)
 - `src/bits.rs` → the safe on-heap bitstring/binary facade shared by `binary`/`unicode`/`term_ops`
+- `src/numeric.rs` → shared `pub(crate)` numeric helpers (int/float parse + render, base/digit handling, `FloatFormat`/`parse_float_options`) used by `convert.rs` and `binconv.rs`
 - `src/ets.rs` → `TableRegistry` + the `ets:new/insert/lookup/delete` bridge over `beam_ets::Table`
 - `tests/registry.rs` → the `BifRegistry` seam (core-roster superset, unknown/bad-arity contract)
 - `tests/erlang_bifs.rs` → the `erlang`/`erts_internal` BIF sweep + `SendHook` + reason mapping
