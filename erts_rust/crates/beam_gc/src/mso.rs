@@ -1,10 +1,18 @@
-//! Off-heap refcounted large objects (MSO): [`RefCount`], [`Mso`], [`MsoHandle`] and
-//! the per-process [`OffHeap`] list.
+//! Off-heap refcounted large objects (MSO) and off-heap refcounted binaries:
+//! [`Mso`], [`MsoHandle`], [`OffHeapEntry`] and the per-process [`OffHeap`] list.
 //!
 //! The payload lives outside every process heap; a collection copies only the small
 //! on-heap handle's scalar words and leaves every off-heap pointer verbatim, so
 //! refcount changes are this module's responsibility (`inc` on a new handle,
 //! destructor when the sweep drops a dead one).
+//!
+//! The atomic reference count is the workspace-wide primitive
+//! [`beam_alloc::RefCount`] — re-exported here as [`RefCount`]; this crate defines no
+//! count of its own (the crate-layer contract forbids duplicating a type across
+//! crates). `beam_alloc::RefcBinary` — an off-heap refcounted byte buffer — is
+//! refcounted by that same primitive, and the per-process [`OffHeap`] list holds both
+//! kinds of off-heap object, so a **refc binary** whose on-heap `BinRef` handle becomes
+//! garbage is reclaimed by the very same [`OffHeap::sweep`].
 //!
 //! This module is safe Rust apart from two narrow `unsafe` blocks — the `NonNull` deref in
 //! [`MsoHandle`] and the `Box::from_raw` free in its `Drop` — each of which carries a
@@ -12,51 +20,15 @@
 
 use core::any::Any;
 use core::ptr::NonNull;
-use core::sync::atomic::{AtomicUsize, Ordering};
+
+use beam_alloc::RefcBinary;
 
 /// An atomic reference count with `erts_refc_*` semantics.
 ///
-/// Mutations use `AcqRel` (an `Acquire` of the object's state plus a `Release` of the
-/// previous owner's work) and reads use `Acquire`: taking a reference must happen-before
-/// the object's payload is observed, and the final `dec_and_test(0)` must observe every
-/// write any earlier owner made before its own reference disappeared.
-#[repr(transparent)]
-pub struct RefCount {
-    count: AtomicUsize,
-}
-
-impl RefCount {
-    /// Creates a reference count with the initial value `initial`.
-    pub const fn new(initial: usize) -> RefCount {
-        RefCount {
-            count: AtomicUsize::new(initial),
-        }
-    }
-
-    /// The current count.
-    pub fn count(&self) -> usize {
-        self.count.load(Ordering::Acquire)
-    }
-
-    /// Atomically increments the count, returning the new value.
-    pub fn inc(&self) -> usize {
-        self.count.fetch_add(1, Ordering::AcqRel) + 1
-    }
-
-    /// Atomically decrements the count, returning the new value.
-    pub fn dec(&self) -> usize {
-        self.count.fetch_sub(1, Ordering::AcqRel) - 1
-    }
-
-    /// Atomically decrements the count and reports whether it fell below `min`.
-    ///
-    /// This is `erts_refc_dectest`: the caller that sees `true` is the one that must
-    /// destroy the object (with `min == 0`, exactly the last reference).
-    pub fn dec_and_test(&self, min: usize) -> bool {
-        let new = self.count.fetch_sub(1, Ordering::AcqRel) - 1;
-        new <= min
-    }
-}
+/// Re-exported from `beam_alloc`, the workspace's *single* refcount primitive (the
+/// lowest common ancestor of [`RefcBinary`] and the MSO container below) — see
+/// [`beam_alloc::RefCount`] for the `Acquire`/`AcqRel` ordering guarantees.
+pub use beam_alloc::RefCount;
 
 /// An off-heap, immutable, refcounted shared object (the MSO itself).
 pub struct Mso {
@@ -152,9 +124,89 @@ impl Drop for MsoHandle {
     }
 }
 
+/// One registered off-heap object of the per-process [`OffHeap`] list.
+///
+/// Two kinds of off-heap object are accounted for today:
+///
+/// - [`OffHeapEntry::Mso`] — a generic refcounted large object ([`MsoHandle`]).
+/// - [`OffHeapEntry::Binary`] — a refcounted large binary
+///   ([`beam_alloc::RefcBinary`]): the off-heap payload an on-heap `BinRef` word points
+///   at. Both kinds share the one [`RefCount`] protocol, so one list can own either.
+///
+/// The variant says *what* the off-heap object is; *which* on-heap reference keeps it
+/// alive is the caller's concern — see [`OffHeap::sweep`].
+pub enum OffHeapEntry {
+    /// A generic refcounted large object.
+    Mso(MsoHandle),
+    /// A refcounted large binary payload.
+    Binary(RefcBinary),
+}
+
+impl OffHeapEntry {
+    /// The bookkeeping overhead this entry contributes to [`OffHeap::overhead_bytes`],
+    /// in bytes: an [`Mso`]'s apparent (Erlang-visible) size, or a [`RefcBinary`]'s
+    /// payload length.
+    pub fn overhead_bytes(&self) -> usize {
+        match self {
+            OffHeapEntry::Mso(handle) => handle.apparent_size(),
+            OffHeapEntry::Binary(binary) => binary.len(),
+        }
+    }
+
+    /// Alias for [`overhead_bytes`](OffHeapEntry::overhead_bytes), matching the
+    /// [`MsoHandle::apparent_size`] naming.
+    pub fn apparent_size(&self) -> usize {
+        self.overhead_bytes()
+    }
+
+    /// The [`MsoHandle`], when this entry is an [`Mso`](OffHeapEntry::Mso).
+    pub fn as_mso(&self) -> Option<&MsoHandle> {
+        match self {
+            OffHeapEntry::Mso(handle) => Some(handle),
+            OffHeapEntry::Binary(_) => None,
+        }
+    }
+
+    /// The [`RefcBinary`], when this entry is a [`Binary`](OffHeapEntry::Binary).
+    pub fn as_binary(&self) -> Option<&RefcBinary> {
+        match self {
+            OffHeapEntry::Binary(binary) => Some(binary),
+            OffHeapEntry::Mso(_) => None,
+        }
+    }
+}
+
+impl From<MsoHandle> for OffHeapEntry {
+    fn from(handle: MsoHandle) -> Self {
+        OffHeapEntry::Mso(handle)
+    }
+}
+
+impl From<RefcBinary> for OffHeapEntry {
+    fn from(binary: RefcBinary) -> Self {
+        OffHeapEntry::Binary(binary)
+    }
+}
+
 /// The per-process list of off-heap large objects (`MSO(p)`).
+///
+/// The list owns a reference to each registered object, so a collection that fails to
+/// find an object reachable can drop its entry and let the refcount do the rest:
+/// [`sweep`](OffHeap::sweep) releases the entries the caller reports dead, and the
+/// off-heap payload is freed when the released handle held the last reference (an
+/// [`Mso`] payload at its zero refcount, a [`RefcBinary`]'s bytes at theirs).
+///
+/// # The liveness contract
+///
+/// *Which* on-heap reference keeps a registered off-heap object alive — the `BinRef`
+/// word of a binary, the magic reference of a fun, the pointer in a sub-binary, … — is
+/// **the caller's concern** (`beam_process`): a collection walks its rootset (and the
+/// message queue / saved arguments) and passes a predicate telling this list what it
+/// found live. `OffHeap` deliberately does not interpret on-heap terms itself; it only
+/// applies the caller's predicate and releases everything else. That keeps the "what is
+/// a root" policy in one place (the process) and this list a pure ownership container.
 pub struct OffHeap {
-    entries: Vec<MsoHandle>,
+    entries: Vec<OffHeapEntry>,
 }
 
 impl OffHeap {
@@ -165,9 +217,12 @@ impl OffHeap {
         }
     }
 
-    /// Adds `handle` to the list.
-    pub fn push(&mut self, handle: MsoHandle) {
-        self.entries.push(handle);
+    /// Adds an off-heap object to the list.
+    ///
+    /// Accepts anything convertible into an [`OffHeapEntry`]: a [`MsoHandle`] (e.g. the
+    /// result of [`Mso::new`]) or a [`RefcBinary`].
+    pub fn push(&mut self, entry: impl Into<OffHeapEntry>) {
+        self.entries.push(entry.into());
     }
 
     /// The number of off-heap objects held.
@@ -180,18 +235,26 @@ impl OffHeap {
         self.entries.is_empty()
     }
 
-    /// The bookkeeping overhead of the list, in bytes.
+    /// The bookkeeping overhead of the list, in bytes: the sum over its entries of each
+    /// object's apparent size ([`OffHeapEntry::overhead_bytes`]) — an MSO's
+    /// Erlang-visible size or a binary's payload length. This is the off-heap payload
+    /// the process is charged for, not the list's own `Vec` capacity.
     pub fn overhead_bytes(&self) -> usize {
-        self.entries.iter().map(MsoHandle::apparent_size).sum()
+        self.entries.iter().map(OffHeapEntry::overhead_bytes).sum()
     }
 
-    /// Retains the handles for which `is_live` returns `true`, releasing the rest, and
+    /// Retains the entries for which `is_live` returns `true`, releasing the rest, and
     /// returns how many were released.
-    pub fn sweep<F: FnMut(&MsoHandle) -> bool>(&mut self, mut is_live: F) -> usize {
+    ///
+    /// Dropping a rejected entry runs its refcount decrement, which frees the off-heap
+    /// payload when the list held the last reference (the MSO destructor at zero; a
+    /// `RefcBinary`'s buffer at zero). The caller decides liveness — see the type-level
+    /// *liveness contract*.
+    pub fn sweep<F: FnMut(&OffHeapEntry) -> bool>(&mut self, mut is_live: F) -> usize {
         let before = self.entries.len();
-        // Dropping the rejected handles runs their destructors (and frees the objects whose
+        // Dropping the rejected entries runs their destructors (and frees the objects whose
         // last reference this list held).
-        self.entries.retain(|handle| is_live(handle));
+        self.entries.retain(|entry| is_live(entry));
         before - self.entries.len()
     }
 }
@@ -199,7 +262,10 @@ impl OffHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use std::sync::Arc;
+
+    use beam_alloc::{AllocatorConfig, AllocRef, CarrierAllocator};
 
     /// A payload that counts how many times it has been dropped.
     struct DropCounter {
@@ -218,6 +284,14 @@ mod tests {
             drops: Arc::clone(drops),
             value,
         }
+    }
+
+    /// An isolated carrier allocator, so a test can observe a binary's payload being
+    /// freed through `AllocStats` without racing the process-wide registry allocator.
+    fn test_allocator(name: &str) -> AllocRef {
+        CarrierAllocator::new(AllocatorConfig::builder().name(name).build())
+            .expect("allocator construction maps nothing")
+            .share()
     }
 
     #[test]
@@ -293,6 +367,28 @@ mod tests {
     }
 
     #[test]
+    fn off_heap_entry_accessors_dispatch_on_the_variant() {
+        let alloc = test_allocator("gc-mso-entry-accessors");
+        let mso = OffHeapEntry::from(Mso::new(5u32, 24));
+        let binary =
+            OffHeapEntry::from(RefcBinary::with_allocator(alloc, b"abcde").expect("allocate"));
+
+        assert_eq!(mso.overhead_bytes(), 24);
+        assert_eq!(mso.apparent_size(), 24);
+        assert!(mso.as_mso().is_some());
+        assert!(mso.as_binary().is_none());
+
+        assert_eq!(binary.overhead_bytes(), 5);
+        assert_eq!(binary.apparent_size(), 5);
+        assert!(binary.as_binary().is_some());
+        assert!(binary.as_mso().is_none());
+        assert_eq!(
+            binary.as_binary().map(|b| b.as_bytes()),
+            Some(&b"abcde"[..])
+        );
+    }
+
+    #[test]
     fn off_heap_tracks_size_and_sweeps_only_the_dead() {
         let drops = Arc::new(AtomicUsize::new(0));
         let mut off_heap = OffHeap::new();
@@ -308,13 +404,15 @@ mod tests {
         assert_eq!(off_heap.overhead_bytes(), 60);
 
         // Keep only the 10-byte object.
-        let released = off_heap.sweep(|handle| handle.apparent_size() == 10);
+        let released = off_heap.sweep(|entry| entry.apparent_size() == 10);
         assert_eq!(released, 2);
         assert_eq!(off_heap.len(), 1);
         assert_eq!(off_heap.overhead_bytes(), 10);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
         assert_eq!(
             off_heap.entries[0]
+                .as_mso()
+                .expect("the survivor is an MSO entry")
                 .downcast_ref::<DropCounter>()
                 .map(|c| c.value),
             Some(0)
@@ -343,7 +441,10 @@ mod tests {
         // The list owns a reference of its own: dropping the local handle leaves the object
         // (and its payload) alive.
         drop(handle);
-        assert_eq!(off_heap.entries[0].refcount(), 1);
+        assert_eq!(
+            off_heap.entries[0].as_mso().expect("an MSO entry").refcount(),
+            1
+        );
         assert_eq!(drops.load(Ordering::SeqCst), 0);
 
         // Two entries for one object: releasing both runs the destructor exactly once.
@@ -351,11 +452,113 @@ mod tests {
         let mut two = OffHeap::new();
         two.push(shared.clone());
         two.push(shared);
-        assert_eq!(two.entries[0].refcount(), 2);
+        assert_eq!(
+            two.entries[0].as_mso().expect("an MSO entry").refcount(),
+            2
+        );
         assert_eq!(two.sweep(|_| false), 2);
         assert_eq!(drops.load(Ordering::SeqCst), 1); // only the 9-byte object's payload
 
         assert_eq!(off_heap.sweep(|_| false), 1);
         assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[test]
+    fn off_heap_reclaims_a_refc_binary_when_swept() {
+        let alloc = test_allocator("gc-mso-binary-sweep");
+
+        let binary =
+            RefcBinary::with_allocator(alloc.clone(), b"hello off-heap binary").expect("allocate");
+        // A handle kept *outside* the list observes the shared refcount and the payload.
+        let observer = binary.clone();
+        assert_eq!(observer.refcount(), 2);
+        assert_eq!(alloc.stats().live_blocks, 1, "one payload block is live");
+
+        let mut off_heap = OffHeap::new();
+        off_heap.push(binary); // via `From<RefcBinary>`
+        assert_eq!(off_heap.len(), 1);
+        assert!(!off_heap.is_empty());
+        assert_eq!(off_heap.overhead_bytes(), observer.len());
+        assert_eq!(observer.as_bytes(), b"hello off-heap binary");
+        assert_eq!(
+            off_heap.entries[0]
+                .as_binary()
+                .map(RefcBinary::as_bytes),
+            Some(&b"hello off-heap binary"[..])
+        );
+
+        // Nothing on the heap references the binary any more: the sweep releases the
+        // list's reference, leaving only the outside observer's.
+        assert_eq!(off_heap.sweep(|_| false), 1);
+        assert!(off_heap.is_empty());
+        assert_eq!(off_heap.len(), 0);
+        assert_eq!(off_heap.overhead_bytes(), 0);
+        assert_eq!(observer.refcount(), 1, "the list released its reference");
+        assert_eq!(
+            alloc.stats().live_blocks,
+            1,
+            "the payload survives while the outside handle lives"
+        );
+        assert_eq!(
+            observer.as_bytes(),
+            b"hello off-heap binary",
+            "the payload is still intact after the list released it"
+        );
+
+        // Dropping the last handle frees the payload exactly once (no leak, no double free):
+        // the allocator's live-block accounting returns to zero.
+        drop(observer);
+        assert_eq!(alloc.stats().live_blocks, 0, "the payload was freed");
+        assert_eq!(alloc.stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn off_heap_mixes_mso_and_binary_entries_and_sweeps_selectively() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let alloc = test_allocator("gc-mso-mixed");
+
+        let binary = RefcBinary::with_allocator(alloc.clone(), b"mixed entry").expect("allocate");
+        let binary_observer = binary.clone();
+        assert_eq!(binary_observer.refcount(), 2);
+
+        let mut off_heap = OffHeap::new();
+        // The list holds the MSO's only reference (the local handle is dropped here), so
+        // sweeping it must run its payload's destructor.
+        off_heap.push(Mso::new(counter(&drops, 3), 64));
+        off_heap.push(binary);
+        assert_eq!(off_heap.len(), 2);
+        assert_eq!(off_heap.overhead_bytes(), 64 + binary_observer.len());
+
+        // Keep the binary, release the MSO.
+        let released = off_heap.sweep(|entry| entry.as_binary().is_some());
+        assert_eq!(released, 1);
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "the MSO payload was destroyed");
+        assert_eq!(off_heap.len(), 1);
+        assert_eq!(off_heap.overhead_bytes(), binary_observer.len());
+        assert!(off_heap.entries[0].as_binary().is_some());
+        assert!(off_heap.entries[0].as_mso().is_none());
+        assert_eq!(
+            binary_observer.refcount(),
+            2,
+            "the surviving list entry plus the outside observer"
+        );
+
+        // Now release the binary too: the refcount falls to the outside observer's single
+        // reference, so the payload is *not* freed yet.
+        assert_eq!(off_heap.sweep(|entry| entry.as_mso().is_some()), 1);
+        assert!(off_heap.is_empty());
+        assert_eq!(off_heap.overhead_bytes(), 0);
+        assert_eq!(binary_observer.refcount(), 1, "the list released the binary");
+        assert_eq!(
+            alloc.stats().live_blocks,
+            1,
+            "the payload is still owned by the outside observer"
+        );
+        assert_eq!(binary_observer.as_bytes(), b"mixed entry");
+        assert_eq!(drops.load(Ordering::SeqCst), 1, "no further MSO destructor");
+
+        drop(binary_observer);
+        assert_eq!(alloc.stats().live_blocks, 0, "the last handle freed the payload");
+        assert_eq!(alloc.stats().live_bytes, 0);
     }
 }
