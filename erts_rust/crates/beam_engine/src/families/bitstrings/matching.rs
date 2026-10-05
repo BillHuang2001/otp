@@ -456,7 +456,7 @@ fn run_commands(
             }
 
             // `'=:=' Nil Bits Value` — compare the next bits with a constant.
-            "'=:=' " | "=:=" => {
+            "'=:='" => {
                 return Err(error::unsupported("bs_match: '=:=' command"));
             }
 
