@@ -69,17 +69,23 @@ impl Runtime {
 
 ### `context.rs` — the concrete `ExecutionContext` (the glue)
 ```rust
-pub struct RuntimeContext<'a> { /* registry, heap, atoms, self_pid, tables, output */ }
+pub struct RuntimeContext<'a> { /* runtime: &'a mut Runtime, output: Option<&'a mut dyn OutputSink> */ }
 
 impl<'a> RuntimeContext<'a> {
-    pub fn new(registry: &'a BifRegistry, heap: &'a mut Heap, atoms: &'a AtomTable,
-               self_pid: ProcessId, tables: &'a mut TableRegistry) -> Self;
-    pub fn with_output(mut self, sink: &'a mut dyn OutputSink) -> Self;
+    pub fn new(runtime: &'a mut Runtime) -> Self;
+    pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> Self;
     pub fn heap_available(&self) -> usize;
+    pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
 }
 impl ExecutionContext for RuntimeContext<'_> {
-    // call_bif  → builds a `BifContext` over {heap, atoms, self_pid, tables, output} and
-    //             delegates to `BifRegistry::call(module, function, arity, ctx, args)`.
+    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/init:get_argument)
+    //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` over
+    //             {heap, code_server atoms, self_pid, tables, output}); else if module == "erlang"
+    //             → `error::unknown_bif`; else seed the system code path
+    //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
+    // apply_fun → resolve the fun's module (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
+    //             `FunDescriptor { uniq, index }`) across `code_server.modules()`, then
+    //             `Machine::new().run_label(...)`.
     // ensure_heap → Ok when `heap_available() >= heap_need`, else `BeamError::SystemLimit`
     //             (M1 has no GC — see Known Issues).
 }
