@@ -83,7 +83,7 @@ Declared in `erts/include/internal/ethread.h`, `erts/include/internal/ethr_inter
 - Building/testing with `TYPE=debug` and `TYPE=valgrind` is the practical way to hit the assertions and races in this code (the emulator links the same library).
 
 ## See Also
-- `../common/` → portable half of libethread (`ethr_aux.c` owns `ethr_init_common__`, `ethr_event_...`? no: aux owns TSE lifecycle + `ethr_runtime__` probing; `ethr_mutex.c`, `ethr_atomics.c`, `ethr_cbf.c`) — read/write within `erts/lib_src`.
+- `../common/` → portable half of libethread: `ethr_aux.c` (TSE lifecycle, `ethr_init_common__`, `ethr_runtime__` CPU probing, allocator), `ethr_mutex.c`, `ethr_atomics.c`, `ethr_cbf.c` — same node tree, writable within `erts/lib_src`.
 - `../win/` → the win32 sibling backend implementing the same symbol set (read-only from here; escalate changes to `erts/lib_src`).
 - `erts/include/internal/ethread.h`, `ethr_internal.h`, `ethread_inline.h`, `ethr_mutex.h`, `pthread/ethr_event.h` → the interface this backend satisfies (owned by the `erts/include/internal/` node).
 - `erts/emulator/beam/erl_threads.h` + `erts/emulator/beam/{erl_process.c,erl_async.c,erl_process_lock.c,erl_thr_progress.c,erl_nif.c,erl_proc_sig_queue.c}` → main in-tree consumers (`erts_tse_*`).
