@@ -12,7 +12,7 @@ use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
 
 use beam_alloc::AllocRef;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::*;
 
 use crate::error::badarg;
@@ -184,6 +184,73 @@ pub(crate) trait Interior {
     /// bucket/entry allocation.
     fn memory(&self) -> usize {
         0
+    }
+
+    // ------------------------------------- element updates (`ets:update_*`)
+
+    /// `ets:update_counter/3,4` on a single position: add `incr` to element `pos`
+    /// (1-based) of the object stored under `key` and return the **new** counter
+    /// value.
+    ///
+    /// The drop-in default reads the element, adds through the shared
+    /// [`add_counters`] helper, rebuilds the object on `heap` and inserts it back
+    /// — which is exactly what the B+-tree interior (no writable index slot)
+    /// needs. The hash interior overrides it with a destructive element write.
+    ///
+    /// `badarg` when `key` is absent, `pos` is outside `1..=arity`, or the element
+    /// / `incr` is not an integer. The `pos == keypos` rule is the caller's: the
+    /// interior does not know `keypos`.
+    fn update_counter(
+        &mut self,
+        key: Eterm,
+        pos: usize,
+        incr: Eterm,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        let object = self.lookup(key, atoms).into_iter().next().ok_or_else(badarg)?;
+        let arity = object_arity(object)?;
+        let newcnt = add_counters(read_counter(object, pos)?, incr)?;
+        let updated = replace_elements(object, arity, &[(pos, newcnt)], heap)?;
+        self.insert(key, updated, atoms)?;
+        Ok(newcnt)
+    }
+
+    /// `ets:update_element/3`: replace element `pos` (1-based) of the object
+    /// stored under `key` with each `[pos, value]` of `updates` (later entries win
+    /// for a repeated position), building the replacement on `heap`. Returns
+    /// whether `key` existed.
+    ///
+    /// The drop-in default rebuilds the object on `heap` and inserts it back,
+    /// which is what the B+-tree interior needs; the hash interior overrides it.
+    ///
+    /// `Ok(false)` for an absent `key` (not an error), `badarg` for a `pos`
+    /// outside `1..=arity` — with **nothing** written, since every position is
+    /// validated before any is applied.
+    fn update_element(
+        &mut self,
+        key: Eterm,
+        updates: &[(usize, Eterm)],
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<bool> {
+        let object = match self.lookup(key, atoms).into_iter().next() {
+            Some(object) => object,
+            None => return Ok(false),
+        };
+        let arity = object_arity(object)?;
+        for &(pos, _) in updates {
+            if pos == 0 || pos > arity {
+                return Err(badarg());
+            }
+        }
+        if updates.is_empty() {
+            // Nothing to change; the key existed, so `ets` reports `true`.
+            return Ok(true);
+        }
+        let updated = replace_elements(object, arity, updates, heap)?;
+        self.insert(key, updated, atoms)?;
+        Ok(true)
     }
 }
 
@@ -422,6 +489,263 @@ impl Table {
         self.store.words() + self.interior.memory()
     }
 
+    // ----------------------------------------------------------- element updates
+
+    /// `ets:update_counter/3`: add `incr` to the element following the key
+    /// (`keypos + 1`) of the object stored under `key`, and return the new value.
+    ///
+    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
+    /// * only `set`/`ordered_set` hold counters — `bag`/`duplicate_bag` are
+    ///   `badarg`;
+    /// * an **absent** `key` is `badarg`: the `/3` form has no default object;
+    /// * a non-integer element or a non-integer increment is `badarg`.
+    ///
+    /// Despite the name, `update_op` may be any of the operands the BIF accepts
+    /// (`Incr`, `{Pos,Incr}`, `{Pos,Incr,Threshold,SetValue}` or a list of those);
+    /// a **list** operand yields a list result — exactly as `ets:update_counter/3`
+    /// is `ets:update_counter/4` without a default.
+    pub fn update_counter(
+        &mut self,
+        key: Eterm,
+        update_op: Eterm,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        self.do_update_counter(key, update_op, None, atoms, heap)
+    }
+
+    /// `ets:update_counter/4`: like [`update_counter`](Table::update_counter) but
+    /// with a `default` object used when `key` is absent.
+    ///
+    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
+    /// * `default` must be a tuple with an arity of at least `keypos`, and an
+    ///   invalid one is `badarg` even when `key` exists;
+    /// * `update_op` is an increment, a `{Pos,Incr}`, a
+    ///   `{Pos,Incr,Threshold,SetValue}`, or a list of those — only the list form
+    ///   returns a **list** of the new values, one per operation, in order;
+    /// * an absent `key` behaves as if the object `default` (with its key element
+    ///   replaced by `key`) were present, and it is deposited in the table — even
+    ///   when the operation list is empty;
+    /// * `pos == keypos`, an out-of-range `pos`, a non-integer element and a
+    ///   non-integer `Incr`/`Threshold`/`SetValue` are `badarg`;
+    /// * the threshold rule: an increment `>= 0` whose result would be `>` the
+    ///   threshold, or one `< 0` whose result would be `<` the threshold, makes
+    ///   the counter `SetValue`.
+    pub fn update_counter_with(
+        &mut self,
+        key: Eterm,
+        update_op: Eterm,
+        default: Eterm,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        self.do_update_counter(key, update_op, Some(default), atoms, heap)
+    }
+
+    /// `ets:update_element/3`: replace element `pos` (1-based) of the object
+    /// stored under `key` with each `Value` of `updates` (later entries win for a
+    /// repeated position), and return whether `key` was present.
+    ///
+    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
+    /// * an **absent** `key` is `Ok(false)`, never an error — and it is answered
+    ///   **before** the spec is inspected, so a malformed spec on an absent key is
+    ///   still `Ok(false)`;
+    /// * `bag`/`duplicate_bag` are `badarg`;
+    /// * `pos == keypos`, `pos == 0` and `pos` beyond the object's arity are
+    ///   `badarg`, with nothing written (every position is validated first);
+    /// * an **empty** `updates` on a present key is `Ok(true)` and changes
+    ///   nothing.
+    ///
+    /// The `pos == keypos` rule is enforced here (the interiors do not carry
+    /// `keypos`); the interior rebuilds the object.
+    pub fn update_element(
+        &mut self,
+        key: Eterm,
+        updates: &[(usize, Eterm)],
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<bool> {
+        self.check_counter_kind()?;
+        let keypos = self.opts.keypos();
+        // The key is looked up *before* the spec is validated: `erl` answers
+        // `false` for an absent key whatever the spec says.
+        let replaced = match self.interior.lookup(key, atoms).into_iter().next() {
+            Some(object) => object,
+            None => return Ok(false),
+        };
+        let arity = object_arity(replaced)?;
+        for &(pos, _) in updates {
+            if pos == keypos || pos == 0 || pos > arity {
+                return Err(badarg());
+            }
+        }
+        let updated = self.interior.update_element(key, updates, atoms, heap)?;
+        if updated {
+            // The interior rebuilt the object on the caller's `heap`; make it
+            // table-owned (the A.1 copy boundary).
+            self.relocate_rebuilt_object(key, replaced, atoms)?;
+        }
+        Ok(updated)
+    }
+
+    /// The shared `set`/`ordered_set` guard of the `ets:update_*` element
+    /// operations: `bag`/`duplicate_bag` have no counters (`erl` raises `badarg`).
+    fn check_counter_kind(&self) -> Result<()> {
+        match self.opts.kind() {
+            TableKind::Set | TableKind::OrderedSet => Ok(()),
+            TableKind::Bag | TableKind::DuplicateBag => Err(badarg()),
+        }
+    }
+
+    /// The common body of `ets:update_counter/3` (`default = None`) and `/4`
+    /// (`default = Some`).
+    ///
+    /// The `default` object, when given, is validated before the key is consulted
+    /// — `erl` fails on an invalid default even when the key exists. Every
+    /// operation is validated before the first write, so a bad operation leaves
+    /// the table (including a not-yet-deposited default object) untouched.
+    ///
+    /// Verified against the system `erl` (OTP 29 / erts-17.1):
+    /// * `update_op` is `Incr | {Pos,Incr} | {Pos,Incr,Threshold,SetValue} |` a
+    ///   list of those; only the **list** operand yields a list result;
+    /// * with `default`, an absent key behaves as if the object `default` (with
+    ///   its key element replaced by `key`) were present — it is deposited in the
+    ///   table, even when the operation list is empty;
+    /// * the threshold rule: an increment `>= 0` whose result would be `>` the
+    ///   threshold, or one `< 0` whose result would be `<` the threshold, makes
+    ///   the counter `SetValue`.
+    fn do_update_counter(
+        &mut self,
+        key: Eterm,
+        update_op: Eterm,
+        default: Option<Eterm>,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        self.check_counter_kind()?;
+        let keypos = self.opts.keypos();
+        // Validate the default object before consulting the key.
+        let default = match default {
+            Some(default) => {
+                let arity = object_arity(default)?;
+                if arity < keypos {
+                    return Err(badarg());
+                }
+                Some((default, arity))
+            }
+            None => None,
+        };
+        let (ops, list_result) = decode_counter_ops(update_op, keypos)?;
+
+        // The object to update: the stored one, or (the `/4` form only) the
+        // default with its key element replaced by `key`, built on `heap`.
+        let stored = self.interior.lookup(key, atoms).into_iter().next();
+        let (object, deposit) = match stored {
+            Some(object) => (object, false),
+            None => match default {
+                Some((default, arity)) => (
+                    replace_elements(default, arity, &[(keypos, key)], heap)?,
+                    true,
+                ),
+                // `/3` has no default object: an absent key is `badarg`.
+                None => return Err(badarg()),
+            },
+        };
+
+        // Validate every operation before the first write so the call is
+        // all-or-nothing on a bad operand.
+        let arity = object_arity(object)?;
+        for op in &ops {
+            if op.pos == keypos || op.pos == 0 || op.pos > arity {
+                return Err(badarg());
+            }
+            // The addressed element must be an integer (and small — the bignum
+            // element is the documented representation gap).
+            read_counter(object, op.pos)?;
+        }
+
+        // Past this point the operations are applied; deposit the default object
+        // first when the key was absent.
+        let mut replaced = object;
+        if deposit {
+            self.insert(object, atoms)?;
+            replaced = self
+                .interior
+                .lookup(key, atoms)
+                .into_iter()
+                .next()
+                .ok_or_else(badarg)?;
+        }
+
+        let mut results = Vec::with_capacity(ops.len());
+        for op in &ops {
+            let value = self
+                .interior
+                .update_counter(key, op.pos, op.incr, atoms, heap)?;
+            let value = match op.warp {
+                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold) => {
+                    // The threshold rule replaces the counter outright; the hash
+                    // override has no "write this value" entry point, so route it
+                    // through `update_element` (same observable result).
+                    self.interior
+                        .update_element(key, &[(op.pos, set_value)], atoms, heap)?;
+                    set_value
+                }
+                _ => value,
+            };
+            results.push(value);
+        }
+        // The last interior operation may have rebuilt the object on the caller's
+        // `heap`; reconcile the index with table-owned storage once.
+        self.relocate_rebuilt_object(key, replaced, atoms)?;
+
+        if list_result {
+            build_list(heap, &results)
+        } else {
+            // The scalar operands always decode to exactly one operation.
+            results.first().copied().ok_or_else(badarg)
+        }
+    }
+
+    /// Reconcile table-owned storage after an interior element update rebuilt the
+    /// object stored under `key` on the caller's `heap`.
+    ///
+    /// The A.1 copy boundary forbids the table from retaining a pointer into a
+    /// caller heap, so a rebuilt object is deep-copied into the table store, the
+    /// store copy replaces it in the index, and the table-owned object it replaced
+    /// is reclaimed. An **in-place** update (the hash index's `update_counter`)
+    /// leaves the stored root untouched, and then there is nothing to do.
+    fn relocate_rebuilt_object(
+        &mut self,
+        key: Eterm,
+        replaced: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        let current = match self.interior.lookup(key, atoms).into_iter().next() {
+            Some(current) => current,
+            // The `set`/`ordered_set` kinds this path serves always keep exactly
+            // one object per key.
+            None => return Err(badarg()),
+        };
+        if current == replaced {
+            return Ok(());
+        }
+        match self.store.copy(current) {
+            Ok(stored) => {
+                self.interior.insert(key, stored, atoms)?;
+                self.store.free(replaced);
+                Ok(())
+            }
+            Err(err) => {
+                // The rebuilt object is not expressible in table storage (a fun,
+                // an external pid, …): put the table-owned object back rather than
+                // retain a caller-heap pointer, and report the failure.
+                self.interior.insert(key, replaced, atoms)?;
+                Err(err)
+            }
+        }
+    }
+
     // --------------------------------------------------------------- navigation
 
     /// The first key in the table's iteration order (`ets:first/1`); `None` is the
@@ -631,6 +955,44 @@ impl TableAccess<'_> {
         self.table.check_write(self.requester)?;
         self.table.take(key, atoms)
     }
+
+    /// `ets:update_counter/3`, requiring write access.
+    pub fn update_counter(
+        &mut self,
+        key: Eterm,
+        update_op: Eterm,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        self.table.check_write(self.requester)?;
+        self.table.update_counter(key, update_op, atoms, heap)
+    }
+
+    /// `ets:update_counter/4`, requiring write access.
+    pub fn update_counter_with(
+        &mut self,
+        key: Eterm,
+        update_op: Eterm,
+        default: Eterm,
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        self.table.check_write(self.requester)?;
+        self.table
+            .update_counter_with(key, update_op, default, atoms, heap)
+    }
+
+    /// `ets:update_element/3`, requiring write access.
+    pub fn update_element(
+        &mut self,
+        key: Eterm,
+        updates: &[(usize, Eterm)],
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<bool> {
+        self.table.check_write(self.requester)?;
+        self.table.update_element(key, updates, atoms, heap)
+    }
 }
 
 /// Match one object (via its tuple element slice) against a clause head,
@@ -686,4 +1048,251 @@ fn resolve_body(body: &MatchBody, object: Eterm, binds: &[(u32, Eterm)]) -> Resu
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Element-update helpers (`ets:update_counter/3,4`, `ets:update_element/3`)
+//
+// The term-level helpers below are shared by the `Interior` trait defaults and
+// the hash interior's overriding inherent methods, so the counter arithmetic and
+// the tuple-rebuild logic exist in exactly one place.
+// ---------------------------------------------------------------------------
+
+/// One decoded `ets:update_counter` operation.
+struct CounterOp {
+    /// The 1-based element position (already checked to be `>= 1`; the
+    /// `keypos`/arity rules are checked against the object by the caller).
+    pos: usize,
+    /// The increment: a small integer (`erl` accepts a bignum too; that is the
+    /// documented representation gap).
+    incr: Eterm,
+    /// The `{Threshold, SetValue}` pair of the four-tuple form.
+    warp: Option<(Eterm, Eterm)>,
+}
+
+/// The arity of `object` when it is a tuple; `badarg` otherwise.
+fn object_arity(object: Eterm) -> Result<usize> {
+    // SAFETY: `is_tuple` classifies a live term through its tag/header word only.
+    if unsafe { is_tuple(object) } {
+        // SAFETY: `object` is a live tuple (checked above), so its header word
+        // holds a valid arity.
+        Ok(unsafe { tuple_size(object) })
+    } else {
+        Err(badarg())
+    }
+}
+
+/// Validate a 1-based element position against `object`'s arity and return a raw
+/// pointer to that element word (for a destructive write).
+///
+/// `badarg` when `object` is not a tuple, or `pos` is outside `1..=arity`.
+pub(crate) fn counter_slot(object: Eterm, pos: usize) -> Result<*mut Eterm> {
+    if pos == 0 {
+        return Err(badarg());
+    }
+    // SAFETY: `is_tuple` only reads the header word of a boxed term.
+    if !unsafe { is_tuple(object) } {
+        return Err(badarg());
+    }
+    // SAFETY: `object` is a live tuple (checked above).
+    let arity = unsafe { tuple_size(object) };
+    if pos > arity {
+        return Err(badarg());
+    }
+    // SAFETY: `tuple_val` is the header pointer of the live tuple, and element
+    // `pos` lives at `header + pos` (the header word occupies slot 0); `1 <= pos <=
+    // arity` keeps the displacement within the tuple's `arity` element words.
+    Ok(unsafe { tuple_val(object).add(pos) })
+}
+
+/// The integer element `pos` (1-based) of the tuple `object`.
+///
+/// `badarg` when `object` is not a tuple, `pos` is outside `1..=arity`, or the
+/// element is not an integer; a **bignum** element is a valid `ets` counter but is
+/// the documented representation gap ([`BeamError::SystemLimit`]).
+fn read_counter(object: Eterm, pos: usize) -> Result<Eterm> {
+    let slot = counter_slot(object, pos)?;
+    // SAFETY: `counter_slot` established that `slot` addresses element `pos` of
+    // the live tuple `object`, so the word is an initialised term.
+    let value = unsafe { *slot };
+    if is_small(value) {
+        Ok(value)
+    } else {
+        Err(counter_operand_error(value))
+    }
+}
+
+/// `old + incr` for two small-integer counter operands, or the closest
+/// representable failure.
+///
+/// `badarg` for a non-integer operand (matching `ets:update_counter`). A bignum
+/// operand is valid in real ETS but is not addable here, and a sum outside the
+/// 60-bit small range (which real ETS promotes to a bignum) is likewise
+/// unavailable: both report [`BeamError::SystemLimit`] rather than a wrong value.
+pub(crate) fn add_counters(old: Eterm, incr: Eterm) -> Result<Eterm> {
+    if !is_small(incr) {
+        return Err(counter_operand_error(incr));
+    }
+    if !is_small(old) {
+        return Err(counter_operand_error(old));
+    }
+    // Widen to `i128` so the 60-bit sum cannot wrap before it is range-checked.
+    let sum = signed_value(old) as i128 + signed_value(incr) as i128;
+    if sum < MIN_SMALL as i128 || sum > MAX_SMALL as i128 {
+        // Real ETS promotes the sum to a bignum; this crate has no bignum support.
+        return Err(BeamError::SystemLimit);
+    }
+    Ok(make_small(sum as i64))
+}
+
+/// A counter operand that must be an integer: a small integer is returned as-is,
+/// a bignum is the representation gap, anything else is `badarg`.
+fn counter_operand(operand: Eterm) -> Result<Eterm> {
+    if is_small(operand) {
+        Ok(operand)
+    } else {
+        Err(counter_operand_error(operand))
+    }
+}
+
+/// The error for a counter operand that is not a small integer: `badarg` unless it
+/// is a bignum (a valid ETS operand this crate cannot process), which is a
+/// representation-limit gap.
+pub(crate) fn counter_operand_error(x: Eterm) -> BeamError {
+    // SAFETY: `x` is a live term (a stored element or a caller-supplied operand),
+    // so classifying it through its header word is well defined.
+    if unsafe { is_integer(x) } {
+        BeamError::SystemLimit
+    } else {
+        badarg()
+    }
+}
+
+/// Whether the `{Pos, Incr, Threshold, SetValue}` threshold rule fires for
+/// `result = old + incr`: a non-negative increment that pushed the counter
+/// **above** `threshold`, or a negative one that dropped it **below**.
+///
+/// Every operand is a validated small integer, so the comparison is exact.
+fn warp_fires(incr: Eterm, result: Eterm, threshold: Eterm) -> bool {
+    if signed_value(incr) < 0 {
+        signed_value(result) < signed_value(threshold)
+    } else {
+        signed_value(result) > signed_value(threshold)
+    }
+}
+
+/// Build a copy of the `arity`-tuple `object` on `heap`, overwriting each `pos`
+/// (`1 <= pos <= arity`) with its `updates` value; later entries win.
+pub(crate) fn replace_elements(
+    object: Eterm,
+    arity: usize,
+    updates: &[(usize, Eterm)],
+    heap: &mut beam_alloc::Heap,
+) -> Result<Eterm> {
+    // SAFETY: `object` is a live tuple with `arity` element words (established by
+    // the caller) and stays valid for the duration of the copy below.
+    let elements = unsafe { object_elements(object) };
+    // SAFETY: `alloc_tuple` writes the arity header and hands back `arity`
+    // uninitialised element words; the `copy_nonoverlapping` plus the update loop
+    // write every one of them before `make_tuple` exposes the pointer as a term.
+    unsafe {
+        let hdr = heap.alloc_tuple(arity)?;
+        core::ptr::copy_nonoverlapping(elements.as_ptr(), hdr.add(1), arity);
+        for &(pos, value) in updates {
+            // `pos` is 1-based; the header occupies slot 0, so element `pos` lives
+            // at `hdr + pos` (in range, since the caller validated `pos <= arity`).
+            *hdr.add(pos) = value;
+        }
+        Ok(make_tuple(hdr))
+    }
+}
+
+/// Decode an `ets:update_counter` operand into its operations, reporting whether
+/// the *result* is a list.
+///
+/// Mirrors the BIF's operand dispatch (`../../erts/emulator/beam/erl_db.c`,
+/// `do_update_counter`), verified against the system `erl`:
+/// * an integer is a bare increment on `keypos + 1` (a scalar result);
+/// * a tuple is a single `{Pos,Incr}` / `{Pos,Incr,Threshold,SetValue}` (scalar);
+/// * **anything else** is read as a list of such tuples, and the result is a list
+///   — so a non-list operand (an atom, an improper list) is `badarg`.
+fn decode_counter_ops(update_op: Eterm, keypos: usize) -> Result<(Vec<CounterOp>, bool)> {
+    // SAFETY: `is_integer`/`is_tuple` classify a live term through its tag word.
+    if unsafe { is_integer(update_op) } {
+        let op = CounterOp {
+            pos: keypos + 1,
+            incr: counter_operand(update_op)?,
+            warp: None,
+        };
+        return Ok((vec![op], false));
+    }
+    // SAFETY: as above — a tag/header-word classification.
+    if unsafe { is_tuple(update_op) } {
+        return Ok((vec![decode_counter_tuple(update_op)?], false));
+    }
+    let mut ops = Vec::new();
+    let mut element = update_op;
+    while is_list(element) {
+        // SAFETY: `element` is a live non-`NIL` cons cell (checked above), so its
+        // two words are initialised.
+        let head = unsafe { car(element) };
+        // SAFETY: as above — the cell's tail word of the same live cell.
+        let tail = unsafe { cdr(element) };
+        ops.push(decode_counter_tuple(head)?);
+        element = tail;
+    }
+    if element != NIL {
+        // An improper list (or a non-list operand such as an atom).
+        return Err(badarg());
+    }
+    Ok((ops, true))
+}
+
+/// Decode one `{Pos, Incr}` / `{Pos, Incr, Threshold, SetValue}` operation.
+///
+/// `erl` requires `Pos` to be a **small** integer and `Incr` / `Threshold` /
+/// `SetValue` to be integers; anything else is `badarg` (a bignum is the
+/// representation gap, reported from [`counter_operand`]).
+fn decode_counter_tuple(upop: Eterm) -> Result<CounterOp> {
+    let arity = object_arity(upop)?;
+    if arity != 2 && arity != 4 {
+        return Err(badarg());
+    }
+    // SAFETY: `upop` is a live tuple with at least two elements (its arity was
+    // just checked), so elements 0 and 1 are initialised.
+    let (pos_term, incr_term) = unsafe { (tuple_element(upop, 0), tuple_element(upop, 1)) };
+    // The position must be a small integer (`erl` rejects a bignum position with
+    // `badarg`, not with a bignum failure).
+    if !is_small(pos_term) {
+        return Err(badarg());
+    }
+    let pos = signed_value(pos_term);
+    if pos < 1 {
+        return Err(badarg());
+    }
+    let incr = counter_operand(incr_term)?;
+    let warp = if arity == 4 {
+        // SAFETY: `upop` is a live 4-tuple (its arity was checked), so elements 2
+        // and 3 are initialised.
+        let (threshold, set_value) =
+            unsafe { (tuple_element(upop, 2), tuple_element(upop, 3)) };
+        Some((counter_operand(threshold)?, counter_operand(set_value)?))
+    } else {
+        None
+    };
+    Ok(CounterOp {
+        pos: pos as usize,
+        incr,
+        warp,
+    })
+}
+
+/// A proper list of `values` built on `heap` (the `ets:update_counter` list
+/// result).
+fn build_list(heap: &mut beam_alloc::Heap, values: &[Eterm]) -> Result<Eterm> {
+    let mut list = NIL;
+    for &value in values.iter().rev() {
+        list = heap.cons(value, list)?;
+    }
+    Ok(list)
 }

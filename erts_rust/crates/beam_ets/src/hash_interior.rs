@@ -13,18 +13,21 @@
 //! `take` / counter / element-update operations (`ets:take/2`,
 //! `ets:update_counter/3,4`, `ets:update_element/3`) for the hash kinds. Those
 //! mirror the real ETS semantics, checked against the system `erl`
-//! (OTP 29 / erts-17.1); the residual gaps (bignum counters, the `pos == keypos`
-//! check) are called out on each method.
+//! (OTP 29 / erts-17.1); they share the counter arithmetic (`add_counters`) and
+//! the tuple-rebuild helpers with the `Interior` trait defaults in
+//! [`crate::table`], and the residual gap (bignum counters) is called out on
+//! each method. The `pos == keypos` rule is enforced by [`crate::Table`], which
+//! owns `keypos`.
 
 use core::mem::size_of;
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_term::prelude::*;
 
 use crate::error::badarg;
-use crate::key::{key_of, object_elements};
+use crate::key::key_of;
 use crate::kind::TableKind;
-use crate::table::Interior;
+use crate::table::{add_counters, counter_slot, replace_elements, Interior};
 
 /// The starting bucket count of a fresh table (a power of two, so the modulo
 /// index distributes evenly).
@@ -136,13 +139,14 @@ impl HashInterior {
     /// * a non-integer element at `pos`, or a non-integer `incr` → `badarg`.
     ///
     /// Gaps (documented, never a silently-wrong value):
-    /// * `pos == keypos` should be `badarg`; the interior carries no `keypos`, so
-    ///   the caller (the `Table`/BIF layer, which owns `keypos`) must reject it;
+    /// * `pos == keypos` is `badarg`, but the interior carries no `keypos`, so the
+    ///   caller ([`crate::Table`], which owns `keypos`) rejects it — this method
+    ///   is the `Interior` override and is only reached through that caller;
     /// * a bignum counter/increment, or a sum that does not fit a 60-bit small
     ///   integer (a real-ETS *success*, since it promotes to a bignum), reports
     ///   [`BeamError::SystemLimit`] — this crate has no bignum arithmetic;
     /// * the `{Pos, Incr, Threshold, SetValue}` threshold form has no parameter
-    ///   here and is not applied.
+    ///   here and is not applied (the caller applies it).
     pub fn update_counter(
         &mut self,
         key: Eterm,
@@ -402,90 +406,28 @@ impl Interior for HashInterior {
     fn memory(&self) -> usize {
         self.memory_words()
     }
-}
 
-/// Validate a 1-based element position against `object`'s arity and return a raw
-/// pointer to that element word (for a destructive update).
-///
-/// `badarg` when `object` is not a tuple, or `pos` is outside `1..=arity`.
-fn counter_slot(object: Eterm, pos: usize) -> Result<*mut Eterm> {
-    if pos == 0 {
-        return Err(badarg());
+    fn update_counter(
+        &mut self,
+        key: Eterm,
+        pos: usize,
+        incr: Eterm,
+        atoms: &AtomTable,
+        _heap: &mut beam_alloc::Heap,
+    ) -> Result<Eterm> {
+        // The hash index owns the stored object, so the element is written
+        // destructively — no rebuild and hence no `heap` use.
+        HashInterior::update_counter(self, key, pos, incr, atoms)
     }
-    // SAFETY: `is_tuple` only reads the header word of a boxed term.
-    if !unsafe { is_tuple(object) } {
-        return Err(badarg());
-    }
-    // SAFETY: `object` is a live tuple (checked above).
-    let arity = unsafe { tuple_size(object) };
-    if pos > arity {
-        return Err(badarg());
-    }
-    // SAFETY: `tuple_val` is the header pointer of the live tuple, and element
-    // `pos` lives at `header + pos` (the header word occupies slot 0); `1 <= pos <=
-    // arity` keeps the displacement within the tuple's `arity` element words.
-    Ok(unsafe { tuple_val(object).add(pos) })
-}
 
-/// `old + incr` for two small-integer counter operands, or the closest
-/// representable failure.
-///
-/// `badarg` for a non-integer operand (matching `ets:update_counter`). A bignum
-/// operand is valid in real ETS but is not addable here, and a sum outside the
-/// 60-bit small range (which real ETS promotes to a bignum) is likewise
-/// unavailable: both report [`BeamError::SystemLimit`] rather than a wrong value.
-fn add_counters(old: Eterm, incr: Eterm) -> Result<Eterm> {
-    if !is_small(incr) {
-        return Err(counter_operand_error(incr));
-    }
-    if !is_small(old) {
-        return Err(counter_operand_error(old));
-    }
-    // Widen to `i128` so the 60-bit sum cannot wrap before it is range-checked.
-    let sum = signed_value(old) as i128 + signed_value(incr) as i128;
-    if sum < MIN_SMALL as i128 || sum > MAX_SMALL as i128 {
-        // Real ETS promotes the sum to a bignum; this crate has no bignum support.
-        return Err(BeamError::SystemLimit);
-    }
-    Ok(make_small(sum as i64))
-}
-
-/// The error for a counter operand that is not a small integer: `badarg` unless it
-/// is a bignum (a valid ETS operand this crate cannot process), which is a
-/// representation-limit gap.
-fn counter_operand_error(x: Eterm) -> BeamError {
-    // SAFETY: `x` is a live term (a stored element or a caller-supplied operand),
-    // so classifying it through its header word is well defined.
-    if unsafe { is_integer(x) } {
-        BeamError::SystemLimit
-    } else {
-        badarg()
-    }
-}
-
-/// Build a copy of the `arity`-tuple `object` on `heap`, overwriting position
-/// `pos` (`1 <= pos <= arity`) with its `updates` value; later entries win.
-fn replace_elements(
-    object: Eterm,
-    arity: usize,
-    updates: &[(usize, Eterm)],
-    heap: &mut beam_alloc::Heap,
-) -> Result<Eterm> {
-    // SAFETY: `object` is a live tuple with `arity` element words (established by
-    // the caller) and stays valid for the duration of the copy below.
-    let elements = unsafe { object_elements(object) };
-    // SAFETY: `alloc_tuple` writes the arity header and hands back `arity`
-    // uninitialised element words; the `copy_nonoverlapping` plus the update loop
-    // write every one of them before `make_tuple` exposes the pointer as a term.
-    unsafe {
-        let hdr = heap.alloc_tuple(arity)?;
-        core::ptr::copy_nonoverlapping(elements.as_ptr(), hdr.add(1), arity);
-        for &(pos, value) in updates {
-            // `pos` is 1-based; the header occupies slot 0, so element `pos` lives
-            // at `hdr + pos` (in range, since the caller validated `pos <= arity`).
-            *hdr.add(pos) = value;
-        }
-        Ok(make_tuple(hdr))
+    fn update_element(
+        &mut self,
+        key: Eterm,
+        updates: &[(usize, Eterm)],
+        atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
+    ) -> Result<bool> {
+        HashInterior::update_element(self, key, updates, heap, atoms)
     }
 }
 
