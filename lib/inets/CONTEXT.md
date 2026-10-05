@@ -3,7 +3,7 @@
 ## Intent
 The `inets` application provides the Internet protocol services that ship with Erlang/OTP: an HTTP/1.1 client (`httpc`), an HTTP/1.1 web server (`httpd`), and the app-level "service" concept that starts/stops them either standalone or under the app supervision tree.
 The description string is `"INETS  CXC 138 49"`; version is `INETS_VSN = 9.8` in `vsn.mk` (`APP_VSN = "inets-9.8"`).
-FTP and TFTP are no longer part of this application — they are the separate `lib/ftp` and `lib/tftp` apps, so `inets:service_names/0` returns only `[httpc, httpd]`.
+FTP and TFTP are NOT part of this application — they are the separate `lib/ftp` and `lib/tftp` apps, so `inets:service_names/0` returns only `[httpc, httpd]`.
 `examples/server_root/` ships a runnable sample server root demonstrating the server's features; documentation is ExDoc-generated from the guides here plus `-moduledoc`s in the sources.
 
 ## API Surface
