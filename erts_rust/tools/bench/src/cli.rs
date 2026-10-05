@@ -56,6 +56,8 @@ pub struct RunArgs {
     pub runtime: RuntimeSel,
     /// Output directory override.
     pub out: Option<PathBuf>,
+    /// Exact output file path override (the report is written here verbatim).
+    pub out_file: Option<PathBuf>,
     /// Emit the JSON report to stdout as well.
     pub json: bool,
     /// Extra progress output.
@@ -71,6 +73,7 @@ impl Default for RunArgs {
             workloads: None,
             runtime: RuntimeSel::Sys,
             out: None,
+            out_file: None,
             json: false,
             verbose: false,
             repos: Vec::new(),
@@ -88,7 +91,7 @@ pub enum Command {
     },
     /// `bench run [flags]`.
     Run(RunArgs),
-    /// `bench baseline [--quick|--full] [--json] [--out <dir>]`.
+    /// `bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]`.
     Baseline {
         /// The profile.
         profile: Profile,
@@ -96,6 +99,8 @@ pub enum Command {
         json: bool,
         /// Output directory override.
         out: Option<PathBuf>,
+        /// Exact output file path override.
+        out_file: Option<PathBuf>,
     },
     /// `bench compare <a.json> <b.json> [--json]`.
     Compare {
@@ -153,6 +158,7 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
     let mut profile = Profile::Quick;
     let mut json = false;
     let mut out = None;
+    let mut out_file = None;
     let mut i = 0;
     while i < args.len() {
         let arg = args[i].as_str();
@@ -163,6 +169,9 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
             "--out" => {
                 out = Some(PathBuf::from(take_value(args, &mut i, "--out")?));
             }
+            "--out-file" => {
+                out_file = Some(PathBuf::from(take_value(args, &mut i, "--out-file")?));
+            }
             other if is_help(other) => return Ok(Command::Help(Some("baseline".into()))),
             other => {
                 return Err(BenchError::usage(format!(
@@ -172,7 +181,7 @@ fn parse_baseline(args: &[String]) -> Result<Command> {
         }
         i += 1;
     }
-    Ok(Command::Baseline { profile, json, out })
+    Ok(Command::Baseline { profile, json, out, out_file })
 }
 
 fn parse_run(args: &[String]) -> Result<Command> {
@@ -204,6 +213,9 @@ fn parse_run(args: &[String]) -> Result<Command> {
             }
             "--out" => {
                 run.out = Some(PathBuf::from(take_value(args, &mut i, "--out")?));
+            }
+            "--out-file" => {
+                run.out_file = Some(PathBuf::from(take_value(args, &mut i, "--out-file")?));
             }
             "--repo" => {
                 let raw = take_value(args, &mut i, "--repo")?;
@@ -295,10 +307,14 @@ pub fn subcommand_help(name: &str) -> Option<String> {
     let text = match name {
         "list" => "bench list [--json]\n\n  List workload ids, category, contract coverage and probe status.",
         "run" => "bench run [--quick|--full] [--workloads <ids,csv>] [--runtime <sys|rust|all>]\n\
-                  \x20        [--out <dir>] [--repo <id>=<path>]... [--json] [--verbose]\n\
+                  \x20        [--out <dir>] [--out-file <path>] [--repo <id>=<path>]... [--json] [--verbose]\n\
                   \n  Defaults: --quick, --runtime sys, all workloads.\n\
+                  \x20 --out       Output directory for the timestamped report (default: out/).\n\
+                  \x20 --out-file  Exact output path for the report (overrides --out naming).\n\
                   \x20 --repo  Override an external workload's repo path (e.g. --repo cowboy=/src/cowboy).",
-        "baseline" => "bench baseline [--quick|--full] [--json] [--out <dir>]\n\n  System-ERTS baseline only.",
+        "baseline" => "bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]\n\
+                       \n  System-ERTS baseline only.\n\
+                       \x20 --out-file  Exact output path for the report (overrides --out naming).",
         "compare" => "bench compare <a.json> <b.json> [--json]\n\n  Diff two result sets, per (workload, runtime, metric).",
         "help" => "bench help [<subcommand>]\n\n  Show top-level help, or the help for <subcommand>.",
         _ => return None,
@@ -394,13 +410,28 @@ mod tests {
     }
 
     #[test]
+    fn run_out_file_parses() {
+        let cmd = parse(&args(&["run", "--out-file", "out/x.json"])).unwrap();
+        let Command::Run(run) = cmd else { panic!("expected run") };
+        assert_eq!(run.out_file, Some(PathBuf::from("out/x.json")));
+        assert_eq!(run.out, None);
+
+        // `--out` and `--out-file` are independent (dir vs exact file).
+        let cmd = parse(&args(&["run", "--out", "d", "--out-file", "d/x.json"])).unwrap();
+        let Command::Run(run) = cmd else { panic!("expected run") };
+        assert_eq!(run.out, Some(PathBuf::from("d")));
+        assert_eq!(run.out_file, Some(PathBuf::from("d/x.json")));
+    }
+
+    #[test]
     fn baseline_defaults_and_flags() {
         assert_eq!(
             parse(&args(&["baseline"])).unwrap(),
             Command::Baseline {
                 profile: Profile::Quick,
                 json: false,
-                out: None
+                out: None,
+                out_file: None
             }
         );
         assert_eq!(
@@ -408,7 +439,21 @@ mod tests {
             Command::Baseline {
                 profile: Profile::Full,
                 json: true,
-                out: Some(PathBuf::from("o"))
+                out: Some(PathBuf::from("o")),
+                out_file: None
+            }
+        );
+    }
+
+    #[test]
+    fn baseline_out_file_parses() {
+        assert_eq!(
+            parse(&args(&["baseline", "--out-file", "p"])).unwrap(),
+            Command::Baseline {
+                profile: Profile::Quick,
+                json: false,
+                out: None,
+                out_file: Some(PathBuf::from("p"))
             }
         );
     }
@@ -443,6 +488,7 @@ mod tests {
         assert!(parse(&args(&["run", "--runtime", "bogus"])).is_err());
         assert!(parse(&args(&["run", "--runtime"])).is_err());
         assert!(parse(&args(&["run", "--out"])).is_err());
+        assert!(parse(&args(&["run", "--out-file"])).is_err());
         assert!(parse(&args(&["run", "--workloads", ""])).is_err());
         assert!(parse(&args(&["run", "--repo", "no-equals"])).is_err());
         assert!(parse(&args(&["run", "--nope"])).is_err());
@@ -456,6 +502,8 @@ mod tests {
         assert!(t.contains("baseline"));
         let t = help_text(Some("run"));
         assert!(t.contains("--workloads"));
+        assert!(t.contains("--out"));
+        assert!(t.contains("--out-file"));
         assert!(help_text(Some("nope")).contains("USAGE"));
     }
 }

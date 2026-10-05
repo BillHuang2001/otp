@@ -31,12 +31,13 @@ pub fn dispatch(command: &Command) -> Result<i32> {
             run_all(args)?;
             Ok(0)
         }
-        Command::Baseline { profile, json, out } => {
+        Command::Baseline { profile, json, out, out_file } => {
             let args = RunArgs {
                 profile: *profile,
                 workloads: Some(vec!["baseline".to_string()]),
                 runtime: RuntimeSel::Sys,
                 out: out.clone(),
+                out_file: out_file.clone(),
                 json: *json,
                 verbose: false,
                 repos: Vec::new(),
@@ -160,7 +161,18 @@ fn run_all(args: &RunArgs) -> Result<Report> {
     }
 
     let report = Report::new(args.profile, infos, results);
-    let out_path = report.resolve_out_path(&out_dir);
+    let out_path = match &args.out_file {
+        Some(path) => {
+            // Write to the exact requested path; make sure its parent exists.
+            if let Some(parent) = path.parent() {
+                if !parent.as_os_str().is_empty() {
+                    std::fs::create_dir_all(parent)?;
+                }
+            }
+            path.clone()
+        }
+        None => report.resolve_out_path(&out_dir),
+    };
     report.save_to(&out_path)?;
 
     if args.json {
