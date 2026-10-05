@@ -6,7 +6,7 @@ They are *not* on the default `PATH`: `otp_build env_mingw32` (the "Cygwin build
 Because this directory comes before `../`, its `cc.sh`/`ld.sh`/`ar.sh`/`rc.sh`/`mc.sh` shadow the MSVC ones in that environment.
 
 ## API Surface
-- `cc.sh` — gcc driver: `COMMON_CFLAGS="-mwindows -D__WIN32__ -DWIN32 -DWINDOWS -D_WIN32 -DNT -DWIN32_MINGW"`; requires `MINGW_EXE_PATH`; `-MM|-M` → dependency generation with `LINKING=false`; sources are collected into `LINKSOURCES` and compiled/linked with minGW gcc.
+- `cc.sh` — gcc driver: `COMMON_CFLAGS="-mwindows -D__WIN32__ -DWIN32 -DWINDOWS -D_WIN32 -DNT -DWIN32_MINGW"`; aborts unless `MINGW_EXE_PATH` is set. Same GCC-ish parsing as `../vc/cc.sh` (`-c`, `-o*`, `-I/*`→`cygpath -m`, `-D*`, `-l*`/`*.o` deferred to `ld.sh`, `-g`→`-ggdb`, `-O*`→passed straight to gcc, `-M*` stdlib forcing), with `-MM|-M` meaning "generate dependencies and stop" (output has `c:/` rewritten to `/cygdrive/c/`). Compiles each `.c` with `$MINGW_EXE_PATH/gcc` into `/tmp/tmpobj$$` and, when linking, calls `ld.sh` with those objects plus the stdlib implied by the forced `-M*` flag. (`LINKSOURCES` is declared but unused.)
 - `ld.sh` — mingw linker driver: `-shared`/`-dll` for DLLs, `-Xlinker --out-implib`, `-Xlinker --entry`, `-l<name>` → `-l"<path>"`, default libraries `-lkernel32 -ladvapi32 -lgdi32 -luser32 -lcomctl32 -lcomdlg32 -lshell32`, `-lws2_32` for `-lsocket`; runs `$MINGW_EXE_PATH/gcc`; requires `MINGW_EXE_PATH`. `-def:` handling is deliberately disabled (commented out — it made `ld` core dump).
 - `ar.sh` — `$MINGW_EXE_PATH/ar.exe` with `rcv "<archive>"`, accepting both `-o` and `-out:`; requires `MINGW_EXE_PATH`.
 - `rc.sh` — `$MINGW_EXE_PATH/windres.exe`, output via `-o`; requires `MINGW_EXE_PATH`.
