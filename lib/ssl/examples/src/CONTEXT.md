@@ -26,4 +26,5 @@ Built as part of the `ssl` app (`SUB_DIRECTORIES = src doc examples/certs exampl
 ## See Also
 - `../CONTEXT.md` — the `examples/` tree (build output `../ebin/`, certs).
 - `../../CONTEXT.md` — the `ssl` application (API, tests, docs).
-- `../../test/` — where `erl_make_certs` lives, used by `../certs/src/make_certs.erl`.
+- `../../../public_key/test/erl_make_certs.erl` — generator library used by `../certs/src/make_certs.erl` (read-only sibling).
+- `/ssl/test/make_certs.erl` — the ssl app's separate, larger test-cert generator (read-only sibling), unrelated to the example certs.
