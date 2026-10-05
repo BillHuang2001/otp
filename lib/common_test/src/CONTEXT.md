@@ -53,7 +53,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `test_server_internal.hrl` — internal records `#target_info{}` and `#par{}`, `priv_dir`, `MAIN_PORT`.
 - `ct_util.erl` — the run-state server. `start/0,1,3,4` (registered `ct_util_server`) plus the ETS tables it owns: `ct_attributes` (`?attr_table`), `ct_connections`, `ct_boards`, `ct_suite_data`, `ct_verbosity_table` (all named public ETS).
   API: testdata/suite-data get/set/update, connection registry (`register_connection`, `get_connection`, `silence_connections`, ...), verbosity, cwd control (`set_cwd/reset_cwd/get_start_dir`), process marking (`mark_process/is_marked/remaining_test_procs`), profile data, `get_mode/0`, `read_opts/0`, `parse_table/1`, `listenv/1`.
-- `ct_groups.erl` — parses/validates `groups/0` and `group/1` definitions and resolves group paths to testcase/repeat specs (`find_groups` etc.).
+- `ct_groups.erl` — parses/validates `groups/0` and `group/1` definitions and resolves group paths to testcase/repeat specs: `find_groups/4, make_all_conf/3,4, make_conf/5, delete_subs/2, expand_groups/3, search_and_override/3`.
 - `ct_repeat.erl` — implements the `repeat`/`duration`/`until`/`force_stop` options: `loop_test/2` reruns the whole run and `abort/0` stops it.
 - `ct_make.erl` — compiles suites/support modules and builds `-include` paths for a run (uses the `ct_make_ref` registered process for parallel compile scheduling).
 - `ct_rpc.erl` — convenience wrapper around `rpc` with timeouts/error mapping (`call/4,5`, `cast/4`, `app_node/2,3`, `get_node/0`).
