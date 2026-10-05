@@ -174,14 +174,12 @@ The CLI exposes **four** exit codes; the differential harness keys off this mapp
 Unsupported is emitted for:
 1. a `-eval` expression outside the supported integer grammar (`src/eval.rs`);
 2. a BEAM-engine capability gap — a raise whose reason atom starts with `unsupported_opcode`;
-3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`;
-4. an **unrecognized command-line switch**.
+3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`.
 
 **Classification convention.** A capability gap is signalled by a raise whose **reason atom starts
 with `unsupported`**. `src/error.rs::unsupported_reason` is the **single** place that convention is
-interpreted: the constructors there (`unsupported`, `unknown_switch`, `bad_eval`) and the sibling
-crates (`beam_engine` `unsupported_opcode: <what>`, `beam_bifs` `unsupported_bif`) all follow it. It
-strips the leading `unsupported` token and any following `:`/`_`/space (`unsupported: X`→`X`,
+interpreted: the constructors there (`unsupported`, `bad_eval`) and the sibling crates (`beam_engine`
+`unsupported_opcode: <what>`, `beam_bifs` `unsupported_bif`) all follow it. It strips the leading `unsupported` token and any following `:`/`_`/space (`unsupported: X`→`X`,
 `unsupported_opcode: Y`→`opcode: Y`, `unsupported_bif`→`bif`) and returns `Some(reason)`; the CLI
 turns that into the `beam_rt: unsupported: <reason>` line and exit 3. Classification must go through
 `unsupported_reason` (which reads `ExitReason::as_atom`) rather than `BeamError::as_atom`, because the
