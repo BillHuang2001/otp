@@ -26,15 +26,15 @@ Top level (`lib/mnesia/examples/`):
 - `bench/README` — authoritative parameter reference (`generator_profile` t1..t5/ping/random, warmup/duration/cooldown, `storage_type`, `n_fragments`, `n_replicas`, `write_lock_type`, `use_binary_subscriber_key`, `always_try_nearest_node`, `cookie`, node-start requirements).
 
 ## Constraints
-- `company.erl`, `company.hrl`, `company_o.erl`, `company_o.hrl`, `bup.erl` and `DATA` are **git symlinks** to `../doc/src/<same name>` — they are the same file, not copies, so an edit through either path changes both and no sync step exists. `../doc/src/` additionally holds `company.fig`, `DATA2`, `FRUITS`, which are not exposed here.
+- `company.erl`, `company.hrl`, `company_o.erl`, `company_o.hrl`, `bup.erl` and `DATA` are **git symlinks** to `../doc/src/<same name>` — they are the same file, not copies, so editing through either path changes both and no sync step exists. `../doc/src/` additionally holds `company.fig`, `DATA2`, `FRUITS`, not exposed here.
 - `mnesia_meter.erl` and `mnesia_tpcb.erl` are regular files here and are also committed byte-identically in `../test/` (identical git blob SHAs). Editing one of the pair without the other silently diverges the copies.
-- The examples must stay compilable: `../test/Makefile` compiles `../examples/mnesia_meter.erl` and `../examples/mnesia_tpcb.erl` (and `../doc/src/{company,company_o,bup}.erl`) straight into the test ebin with `-Werror`-style flags.
-- File names/arity must stay stable because test modules call them directly (`bup:test/1`, `mnesia_meter` via `go/*`, `mnesia_tpcb:init/1`, `run/1`, `stop/0`, `verify_tabs/0`).
+- The examples must stay compilable: `../test/Makefile` compiles `../examples/{mnesia_meter,mnesia_tpcb}.erl` and `../doc/src/{company,company_o,bup}.erl` straight into the test ebin.
+- File names/arities must stay stable because test modules call them directly (`bup:test/1`, `mnesia_tpcb:init/1`, `run/1`, `stop/0`, `verify_tabs/0`).
 
 ## Notes for Agents
-- `examples/Makefile` compiles nothing: `TARGET_FILES = ` is empty (the real assignment is commented out) and `clean` therefore removes nothing. Only `release_docs_spec` does work, installing the `.erl`/`.hrl`/`DATA` files plus the whole `bench/` dir into `$(RELEASE_PATH)/lib/mnesia-$(VSN)/doc/examples` — the examples are deliberately *not* installed as `lib/mnesia-<VSN>/examples`.
+- `examples/Makefile` compiles nothing: `TARGET_FILES = ` is empty (the real assignment is commented out), so `clean` removes nothing. Only `release_docs_spec` does work, installing the `.erl`/`.hrl`/`DATA` files plus the whole `bench/` dir into `$(RELEASE_PATH)/lib/mnesia-$(VSN)/doc/examples` — examples are deliberately *not* installed as `lib/mnesia-<VSN>/examples`.
 - The example modules carry edoc doc chunks (`%0`, `%1`, `%% @doc` markers); the symlinked files under `../doc/src/` are simultaneously the documentation sources, which is why the sources live there and are only *referenced* from here.
-- `bench/` is manual-only: it is never built by the OTP build and has no Common Test coverage. It hardcodes node names `bench@wppgpb1`..`bench@wppgpb8`, needs `$ERL_TOP/bin` on `PATH` (or manually started nodes and ssh-free remote startup) and uses the `bench_cookie` cookie.
+- `bench/` is manual-only: never built by the OTP build, no Common Test coverage. It hardcodes node names `bench@wppgpb1`..`bench@wppgpb8`, needs `$ERL_TOP/bin` on `PATH` (or manually started nodes and ssh-free remote startup) and uses the `bench_cookie` cookie.
 - `mnesia_meter.erl`, `mnesia_tpcb.erl` and `DATA` are also reachable through the code path `mnesia/examples` that `../test/README` prescribes for running the suite.
 
 ## Routing Table
