@@ -1,7 +1,7 @@
 # erl_interface — Documentation
 
 ## Intent
-Documentation sources for the `erl_interface` application, which is a C/Java-facing library (`../src/` is C, the app declares `{modules, []}`) — the audience is C programmers writing `ei`-based C nodes and port programs, plus users of the `erl_call` tool.
+Documentation sources for the `erl_interface` application, which is a C library (`../src/` is C, the app declares `{modules, []}`) — the audience is C programmers writing `ei`-based C nodes and port programs, plus users of the `erl_call` tool.
 Content is one user's guide, four hand-written API reference pages and the app's release notes; there are no XML/DTD sources and no page generator — the `.md` files here are the single source of truth.
 Everything published for this app comes from the extras in this directory (no module/function API pages are generated because the app has no Erlang modules).
 
