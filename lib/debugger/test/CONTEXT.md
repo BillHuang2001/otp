@@ -27,7 +27,6 @@ The bulk of the directory covers *headless* interpreter behaviour (no display re
 ## Known Issues
 - `dbg_ui_SUITE:dbg_ui/1` returns `{skipped,"No display"}` when `DISPLAY` is unset and `{skipped,"Gunilla: Workaround"}` even when it is set — the actual GUI check is commented out, so no automated GUI coverage exists.
 - The `manual_tests` group of `dbg_ui_SUITE` (start/interpret/break/step/save/attach/dist cases) is human-driven: each case calls `check/2`, which consults `dbg_ui_SUITE_data/manual_results.erl` (an untracked file the tester creates by hand) and is skipped unless the case is marked `pass`/`fail`.
-- `dbg_ui_SUITE:check/2` uses the removed `lists:keysearch/3`, so the manual cases cannot currently produce a real result on modern OTP.
 - Consequently the only suites with automated, headless coverage are the interpreter and app-level ones; the GUI is effectively untested in CI.
 - `debugger_test.erl` is not referenced by any suite — it is a helper for the legacy FrameMaker test document `debugger_testdoc.fm5` (not installed into the test release) and is only kept because it is listed in `MODULES`.
 - Manual case descriptions still reference the obsolete path `/clearcase/otp/tools/debugger/test/...` (the app was formerly part of `tools`).
