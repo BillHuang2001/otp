@@ -28,6 +28,7 @@ pub mod literal;
 pub mod ops;
 pub mod size;
 pub mod tag;
+pub mod thing;
 pub mod tuple;
 
 /// Flat re-exports of every public item in this crate.
@@ -44,6 +45,7 @@ pub use crate::literal::*;
 pub use crate::ops::*;
 pub use crate::size::*;
 pub use crate::tag::*;
+pub use crate::thing::*;
 pub use crate::tuple::*;
 
 /// The conventional glob-import surface for downstream crates.
@@ -61,6 +63,7 @@ pub mod prelude {
     pub use crate::ops::*;
     pub use crate::size::*;
     pub use crate::tag::*;
+    pub use crate::thing::*;
     pub use crate::tuple::*;
 }
 
