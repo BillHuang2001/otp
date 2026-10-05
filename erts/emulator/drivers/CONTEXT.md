@@ -76,9 +76,9 @@ Live drivers:
 - `../../test/` → erts-level port/launcher suites; `../../preloaded/src/prim_inet.erl` → the Erlang half of the inet driver
 
 ## Routing Table
-- `common/` → platform-independent drivers: `inet_drv.c` (`inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (`ram_file_drv`)
-- `unix/` → unix-specific driver sources: `bin_drv.c`, `multi_drv.c`, `sig_drv.c` — all legacy and not in `DRV_OBJS` (nothing to debug in the live VM here)
-- `win32/` → win32-specific driver: `registry_drv.c` (`registry__drv__`), used by `lib/stdlib` `win32reg`
+- `common/` → platform-independent drivers: `inet_drv.c` (15879 lines; `inet`/`tcp_inet`/`udp_inet`/`sctp_inet`), `ram_file_drv.c` (534 lines; `ram_file_drv`)
+- `unix/` → unix-specific driver sources: `bin_drv.c` (227), `multi_drv.c` (108), `sig_drv.c` (84) — all legacy and not in `DRV_OBJS` (nothing to debug in the live VM here)
+- `win32/` → win32-specific driver: `registry_drv.c` (~556 lines; `registry__drv__`), used by `lib/stdlib` `win32reg`
 - `vxworks/` → stale portability leftovers, never compiled; do not invest analysis here
 - `../nifs/` → NIF counterparts and the newer `socket`/`prim_file`/`zlib` implementations (sibling — read-only, escalate writes to `../`)
 - `../beam/` → driver/port core, `erl_driver.h` public API (sibling — read-only, escalate writes to `../`)
