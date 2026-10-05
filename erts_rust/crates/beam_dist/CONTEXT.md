@@ -255,6 +255,16 @@ not glob-exported — to avoid shadowing `std::io::{Read, Write}`.)
   handling (and the `ERTS_DOP_ALTACT_SIG_FLG_*` / `ERTS_DIST_SPAWN_FLAG_*` bit vocabularies) is out of
   M1 scope.
 - **No socket/epmd-server code** — `beam_io` owns transports; this crate is transport-agnostic.
+- **The distribution header (`'D'`) envelope is an M1 simplification, not byte-exact ERTS.** The
+  real wire image (`erts/emulator/beam/external.c`, `erts_encode_ext_dist_header_finalize`;
+  `erts/doc/guides/erl_ext_dist.md`) is `VERSION_MAGIC(131) + 'D'(68) + NumAtomCacheRefs(1) +
+  variable-length half-byte Flags + rems` with **no** 4-byte length field, and each ref is a
+  `CachedAtomRef`(1 byte) / `NewAtomCacheRef`(segment+len+atom text). `dist_header` implements the
+  crate-frozen `'D' + len(4) + flags(1) + refs` model with `'R' + (segment<<1|internal) + index`
+  refs; making it byte-exact is a follow-up (see `CHANGE.md` when the seam changes).
+- **`NamesResp::encode` is lossy on ports** — the struct retains only `epmd_port` + node names, so
+  the per-node port in each `name <name> at port <port>` line is not recoverable; `encode` uses
+  `epmd_port` as the placeholder. Decoding (the direction the client uses) is exact.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `DIST_VERSION`/`EPMD_PORT`
