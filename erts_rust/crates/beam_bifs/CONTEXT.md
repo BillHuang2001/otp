@@ -21,7 +21,10 @@ roster), `bif.c`/`bif.h` (helpers, `badarg`/`badarith`, `erts_internal_cmp_term_
 (semantics), and — for the `io` subset — `../../lib/stdlib/src/io_lib_format.erl`.
 
 ## API Surface (FROZEN — `beam_rt` and tests design against this)
-Re-exported at the crate root and via `beam_bifs::prelude::*`.
+Re-exported at the crate root and via `beam_bifs::prelude::*`: [`BifRegistry`]/[`BifFn`]/
+`default_registry`, [`BifContext`] + its sinks (`OutputSink`/`SendHook`/`StdoutSink`/`NullSink`/
+`BytesSink`), the raise builders (`raise_error`/`raise_exit`/`raise_throw`), the reason-term mapping
+(`exit_reason_from_term`/`reason_term_from_exit_reason`) and `TableRegistry`.
 
 ### `registry.rs` — the seam
 ```rust
