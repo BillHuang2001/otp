@@ -3,7 +3,7 @@
 ## Intent
 Source of the published user documentation of the `ssl` application (HTTPS-style HTML + man pages are generated from here).
 Holds only *extra pages* (hand-written markdown) plus the ExDoc build config; the per-module API reference is authored elsewhere (see below).
-Built with ExDoc via `make/docs.mk`; output is installed under `$(RELEASE_PATH)/lib/ssl-<VSN>/doc/html` and `$(RELEASE_PATH)/man/`.
+Built with ExDoc via `$(ERL_TOP)/make/doc.mk`; output is installed under `$(RELEASE_PATH)/lib/ssl-<VSN>/doc/html` and `$(RELEASE_PATH)/man/`.
 
 ## Doc pipeline (what consumes what)
 - `Makefile` includes `$(ERL_TOP)/make/target.mk`, `$(ERL_TOP)/make/$(TARGET)/otp.mk`, `../vsn.mk` (`VSN=$(SSL_VSN)`), sets `APPLICATION=ssl`, then includes `$(ERL_TOP)/make/doc.mk` — all real logic lives in `make/doc.mk`.
