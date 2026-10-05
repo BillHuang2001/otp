@@ -1,43 +1,43 @@
-# erts/emulator/nifs/common/ — Cross-platform NIF modules
+# erts/emulator/nifs/common/ — Cross-platform built-in (static) NIF sources
 
 ## Intent
-The cross-platform (OS-independent) C sources of the emulator's static NIFs — all compiled into the BEAM binary by `../Makefile.in` (`NIF_OBJS`/`ESOCK_RUN_OBJS`). One `.c` per NIF module (`<module>_nif.c`, `#define STATIC_ERLANG_NIF 1`, `ERL_NIF_INIT(<module>, ...)`); OS-specific backends live in the sibling `../unix/` and `../win32/` directories, selected by `ERLANG_OSTYPE`.
+The cross-platform C sources of the NIFs compiled **into the BEAM emulator**: `prim_socket`, `prim_net`, `prim_file`, `prim_buffer`, `prim_tty`, `zlib`, `zstd`, `erl_tracer`, plus the shared socket/net headers and helpers.
+Everything here must compile on all targets (use `ESOCK_ENABLE`/`__WIN32__` guards); the OS-specific backends live in sibling `../unix/` and `../win32/`.
+Registration, `STATIC_ERLANG_NIF` semantics, preloaded membership and the `NIF_OBJS` list are documented in `../CONTEXT.md`.
 
-## API Surface (files)
-- NIF modules: `prim_socket_nif.c` (`prim_socket`, esock), `prim_net_nif.c`, `prim_file_nif.c`, `prim_buffer_nif.c`, `prim_tty_nif.c`, `zlib_nif.c`, `zstd_nif.c`, `erl_tracer_nif.c`.
-- Shared contracts (headers used by more than one module / by the backends):
-  - `socket_io.h` — `ESockIoBackend` vtable (the per-OS I/O backend interface).
-  - `socket_syncio.h` (`essio_*`, unix), `socket_asyncio.h` (`esaio_*`, win32).
-  - `socket_int.h`, `prim_socket_int.h` — `ESockData`, `ESockDescriptor`, term/conversion macros, `TCREATE`/`TJOIN` = `enif_thread_*` wrappers, `ESOCK_GET_RESOURCE`.
-  - `socket_util.{h,c}`, `socket_tarray.{h,c}`, `socket_dbg.{h,c}` — address/option conversion, term arrays, debug printing.
-  - `prim_file_nif.h` (`efile_*` contract + `efile_data_t`), `prim_file_nif_dyncall.h` (socket→prim_file resource dyncall ABI).
-
-## prim_socket_nif.c — architecture (see also `../CONTEXT.md`)
-- ~19.2k lines, wrapped in `#ifdef ESOCK_ENABLE`; when esock is disabled (`#ifndef ESOCK_ENABLE`) the whole file reduces to an empty `esock_funcs[]` stub and an `on_load` that returns `1` (module load fails), so `socket` falls back to `notsup`.
-- Module-level split: `nif_<op>` functions do argument validation and delegate to `io_backend.<op>` (a per-OS `ESockIoBackend`). `io_backend` is set in `on_load` under `#ifdef __WIN32__` (`esaio_*`) vs `#else` (`essio_*`).
-- **Exactly ONE NIF resource type** is opened: the socket resource `esocks` (Erlang name `"sockets"`), via `enif_open_resource_type_x` in `on_load`, with `ErlNifResourceTypeInit { esock_dtor, esock_stop, esock_down }`. Its payload is a single `ESockDescriptor` (`enif_alloc_resource(esocks, sizeof(ESockDescriptor))`). There is NO separate select- or completion-resource type: readiness/completion handles are ordinary Erlang references supplied by the caller as NIF arguments.
-- Erlang-visible socket value = `{'$socket', SockRef}`; delivered side-messages are `{'$socket', Socket, Tag, Info}` (`esock_mk_socket_msg`).
-- Readiness model: `enif_select`-based. Wrappers `esock_select_read`/`esock_select_write` (→ `enif_select_read`/`enif_select_write`) send `{'$socket', Socket, select, SelectRef}` when the fd is ready; `esock_select_stop` uses `ERL_NIF_SELECT_STOP`, `esock_select_cancel` uses `ERL_NIF_SELECT_CANCEL|mode`. `SelectRef` is the caller-supplied op reference (e.g. `nif_recv(Sock, Len, Flags, RecvRef)`).
-- Monitoring: `enif_monitor_process` per requestor/controlling process; the resource down-callback `esock_down` (→ `io_backend.down` / `ESOCK_IO_DOWN`) drives cancellation/abort; the down-monitor term is exposed via `enif_make_monitor_term`.
-- No NIF-level helper thread in this file and none in the unix backend: `essio_init` ignores its `numThreads` argument (`VOID(numThreads)`) and the unix backend arms `enif_select` instead of spawning threads. The win32 backend (`../win32/win_socket_asyncio.c`) DOES create a pool of `numThreads` `enif_thread_create` threads running `esaio_completion_main` (IOCP, `GetQueuedCompletionStatus`) and reports results with `{'$socket', Socket, completion, {Ref, CompletionStatus}}`. `numThreads` defaults to `2*scheduler_threads` in `on_load`.
-- Completion/notification messages sent to Erlang processes (all via `enif_send`): `select`, `abort` (per-request `{Ref,Reason}` or simple `Info`), `close`, `completion` (win32), counter-wrap, and socket-registry `add`/`del`.
-- Entry: `ERL_NIF_INIT(prim_socket, esock_funcs, on_load, NULL, NULL, NULL)`; a few entries are `ERL_NIF_DIRTY_JOB_IO_BOUND` (`nif_sendfile`, `nif_ioctl`, `nif_finalize_close`).
+## API Surface — file map (line anchors verified against source)
+- `prim_socket_nif.c` (19214 lines) — NIF module **`prim_socket`** (`ERL_NIF_INIT` at 19212; empty stub under `#ifndef ESOCK_ENABLE` at 50-66).
+  - NIF function table `esock_funcs[]` = **lines 18696-18748, 40 entries** (28 distinct `nif_*` names declared by the `ESOCK_NIF_FUNCS` macro at 1127-1155). Dirty-annotated: `nif_sendfile` (18720-18722), `nif_ioctl` (18736-18738), `nif_finalize_close` (18747).
+  - `on_load` declared 2170, defined **18785**; selects the backend and opens the resource.
+  - Backend vtable type `ESockIoBackend` is **defined here at lines 1177-1245** (NOT in `socket_io.h`); the single instance is `static ESockIoBackend io_backend = {0}` at **2972**, driven by the `ESOCK_IO_*` macros at 2976-3100+.
+  - Backend selection in `on_load`: `__WIN32__` → `esaio_*` (lines 19020-19076), else unix `essio_*` (19078-19156); `ESOCK_IO_INIT(ioNumThreads)` at 19161.
+  - Resource: `ErlNifResourceType* esocks` + `ErlNifResourceTypeInit esockInit` (dtor/stop/down) at **2961-2966**; opened via `enif_open_resource_type_x(env, "sockets", &esockInit, ERL_NIF_RT_CREATE, NULL)` at **19169**; descriptors allocated by `esock_alloc_descriptor()` with `enif_alloc_resource(esocks, sizeof(ESockDescriptor))` at **16982**.
+- `prim_net_nif.c` (5149 lines) — NIF module **`prim_net`** (`ERL_NIF_INIT` 5148; stub 42-55). Table `net_funcs[]` 4997-5022 (**15 entries**). Resource `net` opened at 5135. Does **not** use the socket `io_backend` (fully independent of prim_socket).
+- `prim_file_nif.c` (1404 lines) — NIF module **`prim_file`** (`ERL_NIF_INIT` 221). Defines the `dyncall` resource callback (see dyncall note below).
+- `prim_buffer_nif.c` (515 lines) — NIF module **`prim_buffer`** (`ERL_NIF_INIT` 98). Table `nif_funcs[]` 86-96 (**9 entries**). Resource `rtype_buffer` = `"gc_buffer"`, dtor `gc_buffer` (146), opened at 116. Payload `buffer_data_t` 58-70.
+- `prim_tty_nif.c` (1340), `zlib_nif.c` (996), `zstd_nif.c` (1118), `erl_tracer_nif.c` (260) — one NIF module each, no per-module tables documented here.
+- `socket_io.h` (283 lines) — the `ESockIO*` function-pointer typedefs (38-281) + `ESOCK_IO_OK`/`ESOCK_IO_ERR_UNSUPPORTED` (35-36). **The `ESockIoBackend` struct itself is NOT here** (see `prim_socket_nif.c`).
+- `socket_syncio.h` (230 lines) — `essio_*` declarations (unix sync backend). `socket_asyncio.h` (203 lines) — `esaio_*` declarations (win32 async backend). Both are exactly the vtable member signatures.
+- `prim_file_nif_dyncall.h` (48 lines) — the cross-NIF dup ABI (`enum` 29-31, `struct prim_file_nif_dyncall` 34-37, `struct prim_file_nif_dyncall_dup` 40-45).
+- `prim_file_nif.h` (266 lines) — the `efile_*` C interface + `efile_data_t` (114-121), implemented by `../unix/unix_prim_file.c` / `../win32/win_prim_file.c`.
+- `socket_int.h` (925 lines) — shared "utility" types usable by both socket and net: `ESockAddress` (closes at 156), `BOOLEAN_T` (160), `SOCKLEN_T`/`SOCKOPTLEN_T` (207-216).
+- `prim_socket_int.h` (877 lines) — socket-global types: `ESockData` (342-383), `ESockDescriptor` (392-551), `ESockAssocId` (327/333), `ESockCounter` (127-163), `ESockMonitor`/`ESockRequestor`/`ESockMeta`, plus `esock_alloc_descriptor` decl (568) and the `ESOCK_OPERATOR_FUNCS_*` macros (717-750). Includes `socket_int.h` (line 34).
+- Shared helpers: `socket_util.h`/`.c` (387/3751), `socket_tarray.h`/`.c` (49/149), `socket_dbg.h`/`.c` (55/186).
 
 ## Constraints
-- A NIF/backend `.c` must name-match its Erlang module and its `ERL_NIF_INIT` NAME; the static-init symbol (`<mod>_nif_init`) is derived from the object basename (see `../CONTEXT.md`).
-- `common/` code must compile on every target — use `__WIN32__`/`ESOCK_ENABLE`/feature-macro guards, never a new OS subdirectory.
-- Blocking work must be declared dirty (or shipped to the backend), never done on an ordinary scheduler.
-- Object lists are explicit in `../Makefile.in` (`NIF_OBJS`, `ESOCK_RUN_OBJS`, `OS_OBJS`); adding a file here requires editing that list.
+- File naming is load-bearing: `<module>_nif.c` + `ERL_NIF_INIT(<module>,...)`; the init symbol `<module>_nif_init` is derived from the object basename by `../utils/make_driver_tab`.
+- New NIF objects must be added to the explicit `NIF_OBJS`/`ESOCK_RUN_OBJS`/`OS_OBJS` lists in `../Makefile.in`; the wildcard `NIF_COMMON_SRC` drives only dependency scanning / `compile_commands.json`.
+- OS-specific code belongs in `../unix/` or `../win32/`, never here.
 
-## Notes for Agents
-- `prim_socket_nif.c` is by far the largest file here (~19k lines) and mixes NIF argument handling, the requestor/monitor bookkeeping, and the select wrappers. The per-OS "does the work" code is out of this directory — grep `essio_*` in `../unix/unix_socket_syncio.c` and `esaio_*` in `../win32/win_socket_asyncio.c`.
-- `ESOCK_DISPLAY_ON_LOAD_DETAILS` / `ESOCK_DISPLAY_SOCKADDR_SIZES` (commented out at the bottom of `prim_socket_nif.c`) and `socket_dbg.h`'s `ESOCK_PRINTF`/`esock_dbg_printf` are the in-tree debug switches.
+## Known Issues / Notes for Agents
+- **`ESockIoBackend` is defined in `prim_socket_nif.c` (1177-1245), not in `socket_io.h`**; `socket_io.h` only declares the member typedefs. `prim_socket_int.h` is the socket-global header; `socket_int.h` is the shared socket+net header.
+- **The `enif_dynamic_resource_call` that dups an efile handle is in `../unix/unix_socket_syncio.c:3594` (inside `essio_sendfile_start`), NOT in `prim_socket_nif.c`.** `prim_socket_nif.c` merely `#include`s `prim_file_nif_dyncall.h` at line 405 and never calls the dyncall API. The `prim_file` side registers the callback in `prim_file_nif.c`: `static ErlNifResourceDynCall dyncall` (227), `callbacks.dyncall = dyncall` (276), `dyncall_dup()` (426), dispatcher `dyncall()` (462).
+- The same source file appears twice: the `#ifndef ESOCK_ENABLE` stub and the real `#else` body (e.g. `prim_socket_nif.c`, `prim_net_nif.c`). When `--disable-esock` the stub arrays are empty and `on_load` returns failure.
+- `esock_funcs[]`/`net_funcs[]` are pop-in tables: several NIF names have multiple arities (e.g. `nif_open`/2 and /4; `nif_getopt`/3 and /5; three `nif_sendfile` arities).
 
 ## Routing Table
-- No own subdirectories; the OS backends are siblings: `../unix/` (`essio_*`, `efile_*`), `../win32/` (`esaio_*`, `efile_*`).
-
-## See Also
-- `../CONTEXT.md` → the NIF set as a whole, `NIF_OBJS`/`OS_OBJS`, `driver_tab.c` registration, boot order.
-- `../unix/unix_socket_syncio.c` → unix `essio_*` backend (select-based, no thread pool).
-- `../win32/win_socket_asyncio.c` → win32 `esaio_*` backend (IOCP + `esaio_completion_main` threads).
-- `../../beam/erl_nif.{c,h}` → NIF API (`enif_select`, monitors, resource types).
+- `../unix/` → unix backends: `unix_prim_file.c` (`efile_*`), `unix_socket_syncio.c` (`essio_*` + the efile dyncall site)
+- `../win32/` → win32 backends: `win_prim_file.c` (`efile_*`), `win_socket_asyncio.c` (`esaio_*`)
+- `../beam/` → `erl_nif.c`/`erl_nif.h` (NIF API, `static_nifs_init`, `enif_dynamic_resource_call` impl at 3297) — read-only, another owner
+- `../utils/make_driver_tab` → generates the NIF/driver registration table
+- `../CONTEXT.md` → static-NIF registration, `NIF_OBJS`, preloaded boot order
