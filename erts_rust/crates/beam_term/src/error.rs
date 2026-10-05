@@ -28,6 +28,10 @@ pub enum TermError {
     InvalidAtomName,
     /// An atom index cannot be represented by [`crate::Atom`].
     AtomIndexOutOfRange,
+    /// A map operation was applied to a term that is not a well-formed map, or a
+    /// map node held a slot that is neither a leaf, a sub-node nor a collision
+    /// tuple (see [`crate::map`]).
+    BadMap,
 }
 
 impl fmt::Display for TermError {
@@ -38,6 +42,7 @@ impl fmt::Display for TermError {
             TermError::HeapExhausted => "heap exhausted",
             TermError::InvalidAtomName => "invalid atom name",
             TermError::AtomIndexOutOfRange => "atom index out of range",
+            TermError::BadMap => "not a map",
         };
         f.write_str(msg)
     }
@@ -72,6 +77,8 @@ impl From<TermError> for BeamError {
             TermError::InvalidAtomName => BeamError::BadArg,
             // Running past `Atom::MAX` is a hard runtime limit.
             TermError::AtomIndexOutOfRange => BeamError::SystemLimit,
+            // A malformed map reached a map accessor: an argument failure.
+            TermError::BadMap => BeamError::BadArg,
         }
     }
 }
@@ -90,6 +97,7 @@ mod tests {
         assert_eq!(TermError::HeapExhausted.to_string(), "heap exhausted");
         assert_eq!(TermError::InvalidAtomName.to_string(), "invalid atom name");
         assert_eq!(TermError::AtomIndexOutOfRange.to_string(), "atom index out of range");
+        assert_eq!(TermError::BadMap.to_string(), "not a map");
     }
 
     #[test]
@@ -130,6 +138,7 @@ mod tests {
             BeamError::from(TermError::AtomIndexOutOfRange),
             BeamError::SystemLimit
         ));
+        assert!(matches!(BeamError::from(TermError::BadMap), BeamError::BadArg));
     }
 
     #[test]

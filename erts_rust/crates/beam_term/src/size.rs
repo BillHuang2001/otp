@@ -32,7 +32,10 @@
 //! * **Native records** (`RECORD_SUBTAG`) are treated like tuples (their
 //!   field-table layout is not yet modelled).
 
-use crate::boxed::{boxed_val, header_arity, is_flatmap_header, thing_arityval, ERL_FUN_SIZE};
+use crate::boxed::{
+    boxed_val, header_arity, is_flatmap_header, is_hashmap_header, map_header_val, thing_arityval,
+    ERL_FUN_SIZE,
+};
 use crate::eterm::Eterm;
 use crate::immediate::is_immediate;
 use crate::list::{car, cdr, is_list};
@@ -109,8 +112,25 @@ pub fn size_object(a: Eterm) -> usize {
                                 work.push(elem);
                             }
                         }
+                    } else if is_hashmap_header(header) {
+                        // Hash-map node: `[thing_word, size?, slots...]`.
+                        // `header_arity(header)` is `1` for the head nodes (their
+                        // extra `size` word) and `0` for inner node-bitmap nodes,
+                        // so the slots start at `1 + header_arity`. Mirrors
+                        // `size_object_x` (`copy.c:192-214`):
+                        // `sum += 1 + popcount(MAP_HEADER_VAL) + header_arity`.
+                        let arity = header_arity(header);
+                        let nslots = map_header_val(header).count_ones() as usize;
+                        total += 1 + nslots + arity;
+                        for i in 0..nslots {
+                            // SAFETY: slot `i` is within the node's payload.
+                            let slot = unsafe { *p.add(1 + arity + i) };
+                            if !is_immediate(slot) {
+                                work.push(slot);
+                            }
+                        }
                     } else {
-                        // Hashmap: approximate by the head node (documented gap).
+                        // Not a map at all (forged term): header + payload.
                         total += thing_arityval(header) + 1;
                     }
                 }

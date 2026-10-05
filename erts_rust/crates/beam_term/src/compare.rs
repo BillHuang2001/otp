@@ -160,9 +160,67 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         TermClass::Port => internal_port_data(a).cmp(&internal_port_data(b)),
         TermClass::Ref => unsafe { cmp_refs(a, b) },
         TermClass::Nil => Ordering::Equal,
+        // SAFETY: both operands are live maps.
+        TermClass::Map => cmp_maps(a, b, atoms, exact),
         // Documented deterministic fallback (see the module `Known Issues`).
         _ => fallback_cmp(a, b),
     }
+}
+
+/// The *internal* flat-map key order — `erts_cmp_flatmap_keys`
+/// (`erts/emulator/beam/erl_utils.h:267-272`).
+///
+/// Two atom keys are ordered by **atom index** (`key_a - key_b` in the C); any
+/// other pair is ordered by the exact term order ([`cmp`]). This is the order in
+/// which a flat map stores its keys (`erts_validate_and_sort_flatmap`) and the
+/// order the C uses to compare map keys, so it — not the plain term order — is
+/// what [`cmp_maps`] must use to be observable-compatible.
+pub fn cmp_flatmap_keys(key_a: Eterm, key_b: Eterm, atoms: &AtomTable) -> Ordering {
+    if is_atom(key_a) && is_atom(key_b) {
+        atom_val(key_a).raw().cmp(&atom_val(key_b).raw())
+    } else {
+        cmp(key_a, key_b, atoms)
+    }
+}
+
+/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1955-2118`).
+///
+/// Erlang map order is: **size first**, then the key/value pairs ordered by the
+/// *flat-map key order* ([`cmp_flatmap_keys`]). The C compares the whole key
+/// sequence before the value sequence (it pushes the value comparisons first and
+/// the key comparisons last on its work stack, so keys are popped — and
+/// therefore compared — first), which is exactly a lexicographic comparison of
+/// `(key-list, value-list)`; we reproduce that literally.
+///
+/// Both operands are, by the caller invariant, well-formed maps. A malformed
+/// map (only reachable if the term was forged outside this crate) falls back to
+/// the deterministic [`fallback_cmp`] rather than panicking.
+fn cmp_maps(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    let (pa, pb) = match (
+        crate::map::map_pairs_flatmap_order(a, atoms),
+        crate::map::map_pairs_flatmap_order(b, atoms),
+    ) {
+        (Ok(pa), Ok(pb)) => (pa, pb),
+        _ => return fallback_cmp(a, b),
+    };
+    if pa.len() != pb.len() {
+        return pa.len().cmp(&pb.len());
+    }
+    for i in 0..pa.len() {
+        let ord = cmp_flatmap_keys(pa[i].0, pb[i].0, atoms);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    for i in 0..pa.len() {
+        // SAFETY: the value sub-terms of two live, well-formed maps.
+        let ord = cmp_impl(pa[i].1, pb[i].1, atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// `erts_cmp_atoms` — lexicographic comparison of the atom *names*.

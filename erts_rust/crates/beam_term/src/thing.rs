@@ -50,9 +50,6 @@ const U32_PER_WORD: usize = WORD_BYTES / size_of::<u32>();
 /// `offsetof(ExternalThing, data) / sizeof(Uint)` — the `[header, node, next]`
 /// head, three words on `ARCH_64`.
 const EXTERNAL_THING_HEAD_SIZE: usize = 3;
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
-/// hashmap above it; a larger map is `beam_codec`'s HAMT builder).
-const MAP_SMALL_MAP_LIMIT: usize = 32;
 
 /// Number of words in a float block: `[HEADER_FLONUM, f64 bits]`
 /// (`erl_term.h:479`).
@@ -228,12 +225,13 @@ pub const fn flatmap_size_words(n_pairs: usize) -> usize {
 /// `hp` must point at [`flatmap_size_words`]`(pairs.len())` exclusively-owned,
 /// writable words, which are all written by this call and must stay live (and
 /// unmoved) for as long as the returned term is used. `pairs.len()` must be at
-/// most `MAP_SMALL_MAP_LIMIT` (32); a larger map must be a hashmap, which is
-/// built by `beam_codec`.
+/// most [`crate::map::MAP_SMALL_MAP_LIMIT`] (32): a larger map must be a
+/// hash map, which the caller builds with [`crate::map::write_map`] (the
+/// HAMT/CHAMP builder owned by this crate).
 pub unsafe fn write_flatmap(hp: *mut Eterm, pairs: &[(Eterm, Eterm)]) -> Eterm {
     let n = pairs.len();
     debug_assert!(
-        n <= MAP_SMALL_MAP_LIMIT,
+        n <= crate::map::MAP_SMALL_MAP_LIMIT,
         "a flat map holds at most MAP_SMALL_MAP_LIMIT pairs"
     );
     if n == 0 {

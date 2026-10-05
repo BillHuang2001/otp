@@ -59,6 +59,8 @@ const TAG_PORT: u64 = 0x0a;
 const TAG_OPAQUE: u64 = 0x0b;
 /// Marks the transition from the list cells to their (improper/`nil`) tail.
 const TAG_LIST_TAIL: u64 = 0x0c;
+/// Map discriminator (structural, over the canonical flat-map key order).
+const TAG_MAP: u64 = 0x0d;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
@@ -92,9 +94,30 @@ fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
         TermClass::Bitstring => unsafe { hash_bits(t, mix(h, TAG_BITS)) },
         TermClass::Pid => mix(mix(h, TAG_PID), internal_pid_data(t)),
         TermClass::Port => mix(mix(h, TAG_PORT), internal_port_data(t)),
+        // SAFETY: `t` is a live map.
+        TermClass::Map => hash_map(t, atoms, mix(h, TAG_MAP)),
         // Refs plus every opaque class.
         _ => unsafe { hash_words(t, mix(h, TAG_OPAQUE)) },
     }
+}
+
+/// Hash a map structurally, over its pairs in the canonical flat-map key order
+/// ([`crate::map::map_pairs_flatmap_order`]) — the same order [`crate::compare`]
+/// uses, so `eq` implies equal hashes.
+///
+/// A malformed map (only reachable if the term was forged outside this crate)
+/// falls back to the opaque raw-word hash rather than panicking.
+fn hash_map(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
+    let pairs = match crate::map::map_pairs_flatmap_order(t, atoms) {
+        Ok(pairs) => pairs,
+        Err(_) => return unsafe { hash_words(t, h) },
+    };
+    h = mix(h, pairs.len() as u64);
+    for (key, value) in pairs {
+        h = hash_term(key, atoms, h);
+        h = hash_term(value, atoms, h);
+    }
+    h
 }
 
 /// Hash an atom by its name bytes (falling back to the index when the name is
