@@ -308,7 +308,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   the system `erlc` (OTP 29 / `erts-17.1`, the differential oracle); `tests/fixtures/README.md` documents
   the exact regeneration command and the full wire summary (chunk order/sizes, atoms, exports/imports,
   and the `Code`/`Line`/`Type`/`FunT`/`LitT` details).
-  - `tests/fixtures/slice.beam` (828 bytes) from `slice.erl` — the vertical-slice module (`add/2`,
+  - `tests/fixtures/slice.beam` (712 bytes) from `slice.erl` — the vertical-slice module (`add/2`,
     `fib/1`, `pick/1`, plus `module_info/0,1`) covering the minimal generic opcode subset.
   - `tests/fixtures/coverage.beam` from `coverage.erl` — a broader idiomatic slice: tuples
     (`put_tuple2`/`get_tuple_element`/`select_tuple_arity`), lists (`put_list`/`get_list`), funs

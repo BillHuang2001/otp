@@ -6,9 +6,18 @@ integration tests. It is a real `.beam` produced by the **system Erlang** toolch
 
 ## Regeneration
 
+The fixtures are compiled with `+deterministic`, which strips the embedded source
+path from the `CInf` (compile info) and `Dbgi` (debug info) chunks — the committed
+`.beam` files are therefore **path-free** (no worktree/`$TMPDIR` path leaks). Compile
+from a neutral scratch dir under `$TMPDIR` so nothing about the local checkout is
+recorded:
+
 ```sh
-cd erts_rust/crates/beam_loader/tests/fixtures
-erlc slice.erl        # writes slice.beam (828 bytes)
+SCRATCH="$TMPDIR/neuter_fixtures"
+mkdir -p "$SCRATCH/slicegen"
+cp slice.erl "$SCRATCH/slicegen/"
+( cd "$SCRATCH/slicegen" && erlc +deterministic slice.erl )
+cp "$SCRATCH/slicegen/slice.beam" slice.beam   # writes slice.beam (712 bytes)
 ```
 
 `slice.erl` (the input, also committed):
@@ -34,7 +43,7 @@ guess.
 
 ## Wire summary (verified against the oracle, `beam_disasm` + byte decode)
 
-File size **828 bytes**; `FOR1` form length **820** (= file_size − 8); form type
+File size **712 bytes**; `FOR1` form length **704** (= file_size − 8); form type
 `BEAM`. Chunks in file order (id · payload size):
 
 | # | id | size | parsed |
@@ -47,8 +56,8 @@ File size **828 bytes**; `FOR1` form length **820** (= file_size − 8); form ty
 | 6 | `Meta` | 45 | skipped |
 | 7 | `LocT` | 16 | skipped (JIT-only) |
 | 8 | `Attr` | 39 | raw attributes |
-| 9 | `CInf` | 105 | raw compile info |
-| 10 | `Dbgi` | 104 | skipped (debug info) |
+| 9 | `CInf` | 27 | raw compile info (path-free) |
+| 10 | `Dbgi` | 66 | skipped (debug info) |
 | 11 | `Line` | 25 | line table |
 | 12 | `Type` | 30 | type table |
 
@@ -109,17 +118,21 @@ non-empty `LitT` literal pool. It is produced by the same **system Erlang** tool
 
 ### Regeneration
 
+Compile from a neutral scratch dir under `$TMPDIR` with `+deterministic`, exactly as for
+`slice.beam`, so the committed binary embeds **no** source path:
+
 ```sh
-cd erts_rust/crates/beam_loader/tests/fixtures
-erlc coverage.erl     # writes coverage.beam (1840 bytes)
+SCRATCH="$TMPDIR/neuter_fixtures"
+mkdir -p "$SCRATCH/coveragegen"
+cp coverage.erl "$SCRATCH/coveragegen/"
+( cd "$SCRATCH/coveragegen" && erlc +deterministic coverage.erl )
+cp "$SCRATCH/coveragegen/coverage.beam" coverage.beam   # writes coverage.beam (1716 bytes)
 ```
 
-The committed `coverage.beam` was produced by **copying `coverage.erl` into a scratch
-directory and running `erlc` there**, so its `CInf` source path is a temp path — the same
-convention as `slice.beam` (whose `CInf` records `/tmp/…/slicegen/slice.erl`). This keeps the
-worktree path out of the committed binary. Any byte change in the fixture invalidates the
-expected values; re-derive them with `beam_disasm:file("coverage.beam")` plus a byte decode,
-do **not** guess.
+With `+deterministic` there is **no** source path in `CInf` at all — the fixture is
+path-free (it no longer records a temp `/tmp/…` path). Any byte change in the fixture
+invalidates the expected values; re-derive them with `beam_disasm:file("coverage.beam")`
+plus a byte decode, do **not** guess.
 
 `coverage.erl` (the input, also committed):
 
@@ -190,7 +203,7 @@ bits(Bin) ->
 
 ### Wire summary (verified against the oracle, `beam_disasm` + byte decode)
 
-File size **1840 bytes**; `FOR1` form length **1832** (= file_size − 8); form type `BEAM`.
+File size **1716 bytes**; `FOR1` form length **1708** (= file_size − 8); form type `BEAM`.
 Chunks in file order (id · payload size):
 
 | # | id | size | parsed |
@@ -205,8 +218,8 @@ Chunks in file order (id · payload size):
 | 8 | `Meta` | 45 | skipped |
 | 9 | `LocT` | 16 | skipped (JIT-only) |
 | 10 | `Attr` | 39 | raw attributes |
-| 11 | `CInf` | 111 | raw compile info |
-| 12 | `Dbgi` | 107 | skipped (debug info) |
+| 11 | `CInf` | 27 | raw compile info (path-free) |
+| 12 | `Dbgi` | 66 | skipped (debug info) |
 | 13 | `Line` | 62 | line table |
 | 14 | `Type` | 43 | type table |
 

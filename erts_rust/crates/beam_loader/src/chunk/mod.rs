@@ -160,8 +160,8 @@ mod tests {
                 (*b"Meta", 45),
                 (*b"LocT", 16),
                 (*b"Attr", 39),
-                (*b"CInf", 105),
-                (*b"Dbgi", 104),
+                (*b"CInf", 27),
+                (*b"Dbgi", 66),
                 (*b"Line", 25),
                 (*b"Type", 30),
             ]
