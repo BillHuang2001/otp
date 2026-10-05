@@ -123,7 +123,7 @@ OS / terminal / processes:
 
 ## Notes for Agents
 - `prim_file`, `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `socket_registry`, `prim_buffer`, `prim_zip`, `zlib`, `init`, `erlang`, `erts_internal` are NOT here — they are preloaded modules in `erts/preloaded/src/`. `kernel` modules may assume they are available.
-- `pmap`/`init` boot the system via `application`; `application_controller` is already registered before `kernel:start/2` runs.
+- The preloaded `init` module boots the system and starts applications through `application`; `application_controller` is already registered before `kernel:start/2` runs.
 - The default distribution module is `inet_tcp_dist` (`net_kernel:proto_dist_argument/0` defaults to `"inet_tcp"`); `inet_epmd_dist` is opt-in.
 - `erts_debug` and `erl_compile_server` are internal-looking but intentionally in the app's module list; `erts_debug` is part of the supported surface for erts tests/tools.
 - Big files worth knowing before editing: `socket.erl` (8.1k lines), `inet.erl` (5k), `gen_tcp_socket.erl` (3.4k), `global.erl` (3.4k), `net_kernel.erl` (3.1k), `file.erl` (3.1k).
