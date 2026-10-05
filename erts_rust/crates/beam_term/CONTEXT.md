@@ -93,7 +93,8 @@ assume a different layout.**
 - `make_tuple(*mut Eterm) -> Eterm`; `tuple_val(Eterm) -> *mut Eterm`; `is_tuple`/`is_not_tuple`;
   `is_tuple_arity(Eterm, usize) -> bool`; `tuple_size(Eterm) -> usize`;
   `tuple_element(Eterm, usize) -> Eterm`; `try_tuple_element(Eterm, usize) -> TermResult<Eterm>`.
-- `pub const TUPLE0: Eterm` (empty tuple is a shared literal; zero-arity heap tuples are discouraged).
+- `pub fn tuple0() -> Eterm` — the shared, `TAG_LITERAL_PTR`-tagged empty-tuple literal (backed by a
+  `LazyLock` over one leaked literal word). Zero-arity heap tuples are discouraged.
 
 ### `heap.rs` — term backing store (bump arena)
 The allocation interface this representation is built on. **Minimal and `unsafe`-marked by design**;
