@@ -45,7 +45,7 @@ Exit code convention verified by the suites: any non-zero/non-`-1` return is con
 It dispatches on the *normalised* type from `ei_get_type()` (`SMALL_ATOM[_UTF8]`→`ERL_ATOM_EXT`, `NEW_PID`→`PID`, `V4_PORT`/`NEW_PORT`→`PORT`, `NEWER_REFERENCE`→`NEW_REFERENCE`, both floats→`ERL_FLOAT_EXT`), so the tag variants are covered by one case each.
 Handled tags: atom, pid, port, ref, nil, list (recursing per element and skipping a non-nil improper tail), string, small/large tuple, map (decodes `arity*2` items), binary, bitstring, small/large integer, small/large big, float, old/new fun, export.
 Any other tag falls into `default:` and returns `-1` — notably `ERL_COMPRESSED_EXT` and other tags `ei` does not understand.
-Because it recurses per element it is O(n) on deeply nested terms and can overflow the C stack on pathological input.
+It recurses once per list/tuple/map element, so the C stack it consumes grows with nesting depth of the term.
 `decode_skip.c` is the only in-directory user-facing caller outside `decode_fun.c` (which skips free variables); external users are `../misc/show_msg.c`, `../connect/eirecv.c` and `../prog/ei_fake_prog.c`.
 
 ## Version magic
