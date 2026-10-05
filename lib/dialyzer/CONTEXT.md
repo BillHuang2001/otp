@@ -65,5 +65,6 @@ Default PLT locations come from `DIALYZER_PLT`/`DIALYZER_IPLT` or the OS user ca
 - `Makefile`, `vsn.mk`, `AUTHORS`, `README`, `RELEASE_NOTES` → app build metadata and top-level docs at this node
 
 ## See Also
-- `../CONTEXT.md` — parent `lib/` (OTP applications) and `../dialyzer/CONTEXT.md` sibling apps.
-- `src/CONTEXT.md`, `test/CONTEXT.md`, `doc/CONTEXT.md` — child nodes.
+- `../CONTEXT.md` — parent `lib/` node (index of the 36 OTP applications).
+- `src/CONTEXT.md`, `test/CONTEXT.md`, `doc/CONTEXT.md` — child nodes of this app.
+- `../../erts/etc/common/{dialyzer,typer}.c` — the C front-end executables (`bin/dialyzer`/`bin/typer`) that call `dialyzer:plain_cl/0` and `typer`.
