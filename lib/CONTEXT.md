@@ -54,7 +54,7 @@ Every `lib/<app>/` follows the same schema (some dirs optional per app):
 | `diameter/` | Diameter authentication/authorization protocol stack |
 | `edoc/` | Erlang documentation engine (generates docs from source) |
 | `eldap/` | LDAP client (needs an ASN.1-generated encoder in `asn1/`) |
-| `erl_interface/` | C library for Erlang↔C communication (`ei`, `erl_*`); builds `erl_call` |
+| `erl_interface/` | `ei` C library for the external term format / distribution + the `erl_call` tool (C-only app, no Erlang modules) |
 | `et/` | Event Tracer (GUI tracing tool) |
 | `eunit/` | EUnit lightweight unit-test framework |
 | `ftp/` | FTP client |
