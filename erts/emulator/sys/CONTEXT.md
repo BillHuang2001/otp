@@ -63,6 +63,7 @@ This directory implements two contracts: (a) types/macros the whole emulator dep
 - `common/erl_check_io.c` and the pollsets depend on `../beam/erl_port_task.c`, thread progress and `ErtsAllocType` allocation types; it is compiled in a special mode (see `ERL_CHECK_IO_INTERNAL__` / `ERTS_ALLOC_C__` guards in `erl_check_io.h`) that changes what the header pulls in.
 - `ERTS_SYS_CONTINOUS_FD_NUMBERS` (unix, fds are small consecutive ints) makes the check I/O layer index an array by fd and grow it on demand; on Windows a "fd" is a `HANDLE`, so `/dev/poll`-style fd-indexed code paths do not apply (`NO_FSTAT_ON_SYS_FD_TYPE`).
 - `erl_mmap.c`, `erl_mseg.c` and `erl_mmap.h` are empty-ish no-ops on configurations without `HAVE_ERTS_MMAP`/`HAVE_ERTS_MSEG`; a "missing" function there is usually a compile-time switch, not a bug.
+- `../beam/sys.h` declares `erts_sys_get_page_size()`/`erts_sys_get_large_page_size()` but nothing in the tree defines them; the page size is actually read from the `sys_page_size`/`sys_large_page_size` globals. Treat those two declarations as stale.
 - `unix/sys.c`'s `erts_sys_pre_init` opens `/dev/null` up to fd 3 and keeps one spare fd for crash-dump creation — subtle but load-bearing for the old shell/fd-driver code paths.
 - The `TYPE` marker (`opt`/`debug`/`valgrind`/...) is duplicated in the Makefile (`TYPEMARKER`) and in `unix/sys_drivers.c` (`ERL_BUILD_TYPE_MARKER`); the two must agree or the VM cannot find `erl_child_setup<TYPEMARKER>`.
 
