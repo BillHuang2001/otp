@@ -49,7 +49,8 @@ use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{Atom, FunDescriptor, Module};
 use beam_term::{
-    cmp, cmp_arith, is_small, make_atom, make_small, signed_value, AtomTable, Eterm,
+    cmp, cmp_arith, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, MAX_SMALL,
+    MIN_SMALL,
 };
 
 // ---------------------------------------------------------------------------
@@ -411,10 +412,21 @@ impl ModuleHost {
             ("erlang", "tuple_size", 1) => Some(tuple_size(args)),
             ("erlang", "length", 1) => Some(length(args)),
             ("erlang", "++", 2) => Some(self.append(args)),
+            ("erlang", "--", 2) => Some(self.subtract(args)),
+            // Bit shifts: `gb_trees`/`gb_sets`/`array` size arithmetic uses them.
+            ("erlang", "bsl", 2) => Some(self.bit_shift(args, true)),
+            ("erlang", "bsr", 2) => Some(self.bit_shift(args, false)),
+            // Term-ordering `max`/`min`: `gb_trees` balancing picks the larger of
+            // two heights with `max/2`.
+            ("erlang", "max", 2) => Some(self.max_min(args, true)),
+            ("erlang", "min", 2) => Some(self.max_min(args, false)),
             // `lists:reverse/2` is a NIF in `lists.beam` (its `.beam` body is
             // `erlang:nif_error(undef)`), reached from `lists:reverse/1` for a
             // list of three or more elements.
             ("lists", "reverse", 2) => Some(self.reverse2(args)),
+            // `lists:member/2` is likewise a `lists` NIF (exact `=:=` membership);
+            // `queue:member/2` forwards to it.
+            ("lists", "member", 2) => Some(self.list_member(args)),
             // These raise on the invalid-argument paths the tests deliberately
             // avoid; a typed error is the correct outward behavior.
             ("erlang", "error", 1) | ("erlang", "error", 2) | ("erlang", "error", 3) => {
@@ -504,17 +516,97 @@ impl ModuleHost {
     }
 
     /// `lists:reverse(List, Tail)` (the `lists` NIF): `List` reversed with `Tail`
-    /// appended.
+    /// appended (`reverse(List) ++ Tail`), so the elements are consed back on in
+    /// their original order.
     fn reverse2(&mut self, args: &[Eterm]) -> Result<Eterm> {
         if args.len() != 2 {
             return Err(BeamError::BadArg);
         }
         let elements = terms::list_elements(args[0])?;
         let mut acc = args[1];
-        for element in elements.iter().rev() {
+        for element in elements.iter() {
             acc = terms::make_cons(self, *element, acc)?;
         }
         Ok(acc)
+    }
+
+    /// `A -- B` (the `erlang` list-subtraction BIF, reached via
+    /// `lists:subtract/2`): remove from `A` the first occurrence of each element
+    /// of `B`, compared with **exact** (`=:=`) equality — the real semantics
+    /// (`[1.0] -- [1]` is `[1.0]`, `[2] -- [2.0]` is `[2]`).
+    fn subtract(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let mut remaining = terms::list_elements(args[0])?;
+        for &remove in terms::list_elements(args[1])?.iter() {
+            if let Some(position) = remaining
+                .iter()
+                .position(|&element| cmp(element, remove, &self.atoms).is_eq())
+            {
+                remaining.remove(position);
+            }
+        }
+        terms::make_list(self, &remaining)
+    }
+
+    /// `X bsl N` (`left_named = true`) / `X bsr N` — an integer bit shift with
+    /// Erlang's negative-count semantics (a negative count shifts the other way).
+    ///
+    /// M1 has no bignums, so a shift whose result leaves the small-integer range
+    /// is a typed [`BeamError::SystemLimit`] rather than a silently-mis-computed
+    /// value; the module functions these tests run never reach that path.
+    fn bit_shift(&mut self, args: &[Eterm], left_named: bool) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let (value, count) = match (number(args[0]), number(args[1])) {
+            (Some(Number::Int(value)), Some(Number::Int(count))) => (value, count),
+            _ => return Err(BeamError::BadArith),
+        };
+        let shift_left = if left_named { count >= 0 } else { count < 0 };
+        // Clamp the shift count to the `i128` width; a genuinely larger left shift
+        // then overflows the range check below (and a huge right shift is still
+        // `0`/`-1`).
+        let amount = count.unsigned_abs().min(127);
+        let result = if shift_left {
+            i128::from(value) << amount
+        } else {
+            i128::from(value) >> amount
+        };
+        if result < i128::from(MIN_SMALL) || result > i128::from(MAX_SMALL) {
+            return Err(BeamError::SystemLimit);
+        }
+        Ok(make_small(result as i64))
+    }
+
+    /// `erlang:max/2` / `erlang:min/2` — the larger / smaller of two terms under
+    /// the **arithmetic** ordering, returning the first term when the two compare
+    /// equal (the real semantics: `max(1, 1.0)` is `1`).
+    fn max_min(&mut self, args: &[Eterm], want_max: bool) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let ordering = cmp_arith(args[0], args[1], &self.atoms);
+        let take_first = if want_max {
+            !ordering.is_lt()
+        } else {
+            !ordering.is_gt()
+        };
+        Ok(if take_first { args[0] } else { args[1] })
+    }
+
+    /// `lists:member(Elem, List)` (the `lists` NIF): `true` when `Elem` occurs in
+    /// `List` under **exact** (`=:=`) equality — `lists:member(1.0, [1])` is
+    /// `false`.
+    fn list_member(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let found = terms::list_elements(args[1])?
+            .iter()
+            .any(|&element| cmp(element, args[0], &self.atoms).is_eq());
+        Ok(self.boolean(found))
     }
 }
 
@@ -613,4 +705,64 @@ pub fn assert_keyed_list(host: &ModuleHost, got: Eterm, want: &[(&str, i64)]) {
             "element {index}: got {got_value:?}, want {value}"
         );
     }
+}
+
+/// Builds a tuple from the given terms (the test-side `put_tuple2`).
+pub fn term_tuple(host: &mut ModuleHost, elems: &[Eterm]) -> Eterm {
+    terms::make_tuple(host, elems).expect("build a tuple")
+}
+
+/// Builds a proper list from the given terms.
+pub fn term_list(host: &mut ModuleHost, elems: &[Eterm]) -> Eterm {
+    terms::make_list(host, elems).expect("build a list")
+}
+
+/// The shared atom `name` as a term (interning it if no module has yet).
+pub fn term_atom(host: &mut ModuleHost, name: &str) -> Eterm {
+    host.intern(name)
+}
+
+/// Asserts `got` and `want` are the same term under the module's exact (`=:=`)
+/// ordering.
+pub fn assert_term(host: &ModuleHost, got: Eterm, want: Eterm) {
+    assert!(
+        cmp(got, want, host.atom_table()).is_eq(),
+        "got {got:?}, want {want:?}"
+    );
+}
+
+/// Asserts `got` is the small integer `want`.
+pub fn assert_small(host: &ModuleHost, got: Eterm, want: i64) {
+    assert_term(host, got, make_small(want));
+}
+
+/// Asserts `got` is the proper list of `{integer, integer}` 2-tuples `want`.
+pub fn assert_int_pair_list(host: &ModuleHost, got: Eterm, want: &[(i64, i64)]) {
+    let elements = terms::list_elements(got).expect("a proper list result");
+    assert_eq!(
+        elements.len(),
+        want.len(),
+        "list length: got {elements:?}, want {want:?}"
+    );
+    for (index, (&got, &(first, second))) in elements.iter().zip(want.iter()).enumerate() {
+        assert_eq!(
+            terms::tuple_arity(got).ok(),
+            Some(2),
+            "element {index}: not a 2-tuple: {got:?}"
+        );
+        assert_small(host, terms::tuple_element(got, 0).expect("pair key"), first);
+        assert_small(host, terms::tuple_element(got, 1).expect("pair value"), second);
+    }
+}
+
+/// Asserts `got` is the 2-tuple `{Rear, Front}` of the two integer lists — the
+/// internal shape of a `queue:queue/0` as the real `queue` module represents it.
+pub fn assert_int_queue(host: &ModuleHost, got: Eterm, rear: &[i64], front: &[i64]) {
+    assert_eq!(
+        terms::tuple_arity(got).ok(),
+        Some(2),
+        "a queue is a 2-tuple: {got:?}"
+    );
+    assert_int_list(host, terms::tuple_element(got, 0).expect("rear"), rear);
+    assert_int_list(host, terms::tuple_element(got, 1).expect("front"), front);
 }
