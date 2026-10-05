@@ -25,7 +25,7 @@ This directory is where socket I/O is bound to the `ei_socket_callbacks` indirec
 - `eirecv.h` — only `ei_recv_internal`.
 - `eisend.h` — `ei_send_exit[_tmo]`; `ei_send_link`/`ei_send_unlink[_tmo]` are `#if 0`'d out and must not be re-enabled without protocol work.
 - `ei_resolve.h` — only `ei_init_resolve` (called from `../misc/ei_init.c`).
-None of these are installed; only `include/ei.h`, `ei_connect.h`, `eicode.h`, `ei_global.h` are public.
+None of these are installed; the installed public header set is only `../include/ei.h`, `../include/ei_connect.h` and `../include/eicode.h` (`../include/ei_global.h` is not in `HEADERS` and is not installed — see the Known Issue in `../global/CONTEXT.md`).
 
 ## Socket Callbacks / USSI Indirection
 `ei_cnode.cbs` + `setup_context` hold the socket implementation; the `_ussi` variants of init let a user supply their own `ei_socket_callbacks` (version 1 layout, `EI_SOCKET_CALLBACKS_SZ_V1` = up to `get_fd`, size-checked in `ei_connect_xinit_ussi`, too small ⇒ `ERL_ERROR`).
