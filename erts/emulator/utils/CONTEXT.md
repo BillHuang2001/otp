@@ -22,7 +22,7 @@ Command-line contract → outputs. `$(TTF_DIR) = $(TARGET)/$(TYPE)/$(FLAVOR)` (e
 | `beam_emu_vars` | Perl | `make check_emu_registers` (manual, unix only) | `$(OBJDIR)/beam_emu*.S` (clang or gcc `-fverbose-asm`) | stdout: which register each `process_main` variable got; exit 1 if one spilled to `%rsp` |
 | `beam_strip` | Perl | nothing (no Makefile references it) | `.beam` files named in argv, rewritten in place | removes the `LocT` and `CInf` IFF chunks |
 | `find_cross_ycf` | escript | `YCF_EXECUTABLE_PATH` when `CROSS_COMPILING=yes` | none | prints the path of a usable `yielding_c_fun` in the bootstrap system (`$ROOT/bin` or `$ROOT/erts-<vsn>/bin`); exit 1 if not found |
-| `count` | escript (no shebang) | manual (`escript erts/emulator/utils/count`) | `code:get_path()` `.beam` files | `./dis/*.dis` disassembly + `./dis/count` per-instruction frequency, sorted |
+| `count` | escript (no shebang) | manual (`escript erts/emulator/utils/count`) | `code:get_path()` `.beam` files | `./dis/*.dis` disassembly + `./dis/count` listing instruction frequencies sorted by count |
 | `loaded` | escript (no shebang) | manual (`escript erts/emulator/utils/loaded`) | `code:lib_dir()` | count/bytes of BEAM files and number of words used when all modules are loaded |
 
 Key command-line details:
