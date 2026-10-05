@@ -12,7 +12,7 @@ Nearly all non-inline implementations live in the sibling `../../lib_src/` tree
 `erl_printf.c`, `erl_printf_format.c`, `pthread/`, `win/`).
 Consumers: `erts/lib_src/`, `erts/emulator/` (incl. `beam/sys.h`, `erl_utils.h`, `erl_init.c`,
 `erl_threads.h`, `erl_internal_test.h`), `erts/epmd/src/`, `erts/etc/common/`, `erts/test/` C data.
-**No C source under `../lib/` includes these headers** (the only `lib/` reference is
+**No C source under `../../lib/` includes these headers** (the only `lib/` reference is
 `../../lib/common_test/test_server/ts_erl_config.erl`, which reads the installed `.mk` fragments as data).
 
 ## API Surface
