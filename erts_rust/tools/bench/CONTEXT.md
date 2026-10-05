@@ -151,6 +151,8 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `src/workloads/mod.rs` → submodule wiring; assembles the workload registry.
 - `src/workloads/baseline.rs` · `erlc_compiler.rs` · `elixir_compiler.rs` · `plb.rs` · `cowboy.rs` ·
   `khepri.rs` · `emqx.rs` → one file per workload (probe + run).
+- `tests/integration.rs` → hermetic synthetic-report round-trip + `compare` tests (no oracle needed).
+- `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 
 ## Constraints
 - `#![forbid(unsafe_code)]`; **no new crates** (deps resolve offline: `serde`, `serde_json`, `beam_common`).
