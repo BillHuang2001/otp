@@ -11,7 +11,7 @@ Application-level (the module `inets`, ExDoc group "Service API"):
 - `inets:start/0,1` start the `inets` application; `start/2,3 (Service, Config, How)` starts an individual service with `How :: inets | stand_alone`.
 - `inets:stop/0` and `stop(How, Pid)`; `services/0`, `services_info/0`, `service_names/0` for introspection; `versions/0` for component versions.
 - `inets:enable_trace/2,3`, `disable_trace/0`, `set_trace/1`, `report_event/4` are exported but `-doc false` — internal debug tooling built on `dbg`.
-- The app env key `services` (in `inets.app.src`/`sys.config`) accepts `{httpc,Conf}`, `{httpd,Conf}` or `{httpd,Address,Port}` entries consumed by `inets_sup`.
+- The app env key `services` — read by `inets_sup` via `application:get_env(inets, services)`, i.e. set by the user in `sys.config`, not declared in `inets.app.src` — accepts `{httpc,Conf}`, `{httpd,Conf}` or `{httpd,Address,Port}` entries.
 HTTP client (`httpc`, in `src/http_client/`):
 - `httpc:request/1,2,4,5` (there is no `request/3`), `cancel_request/1,2`, `stream_next/1`; options via `set_option(s)`/`get_option(s)` in four scopes (default | profile | session | request).
 - `httpc` profiles/sessions: `default_profile/0`, `profile_name/1,2`, `which_sessions/0,1`, `info/0,1`, `ssl_verify_host_options/1`; cookies via `store_cookies/2,3`, `cookie_header/1,2,3`, `which_cookies/0,1`, `reset_cookies/0,1`.
