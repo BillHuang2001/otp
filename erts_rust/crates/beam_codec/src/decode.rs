@@ -22,7 +22,7 @@ use beam_term::{AtomTable, Eterm};
 use crate::atom_cache::AtomCache;
 use crate::error::{bad_arg, system_limit, unsupported};
 use crate::reader::Reader;
-use crate::tag::{Tag, VERSION_MAGIC};
+use crate::tag::{Tag, COMPRESSED_EXT, VERSION_MAGIC};
 
 /// The OTP atom-length ceiling, in **characters** (`erts/emulator/beam/erl_term.h`):
 /// a longer name is a `SystemLimit`, never a truncated atom.
@@ -260,11 +260,19 @@ impl<'a> Decoder<'a> {
             }
 
             // ---------------------------------------------------------------
+            // `COMPRESSED` — top-level only
+            // ---------------------------------------------------------------
+            // The C accepts `COMPRESSED` (`80`) only as the outermost wrapper,
+            // immediately after the version byte (`external.c:1759`); `decode_term`
+            // unwraps it there. Reaching it here — nested inside a term, or as a
+            // bare tag — is malformed input, never a term.
+            Tag::Compressed => Err(bad_arg()),
+
+            // ---------------------------------------------------------------
             // Deliberately unsupported in M1 — never a wrong encoding
             // ---------------------------------------------------------------
             Tag::Binary
             | Tag::BitBinary
-            | Tag::Compressed
             | Tag::NewFun
             | Tag::Export
             | Tag::Fun
@@ -380,11 +388,56 @@ impl<'a> Decoder<'a> {
 /// Decodes a `term_to_binary` image into `heap`, interning atoms into `atoms`.
 ///
 /// Convenience over [`Decoder::new`] + [`Decoder::decode`] + [`Decoder::finish`].
+///
+/// A top-level `COMPRESSED` (`80`) wrapper is unwrapped here **before** the inner
+/// term is decoded: see [`decompress_wrapper`]. (It cannot be handled inside
+/// [`Decoder`] without changing its lifetimes, because the decompressed body is an
+/// owned buffer the borrowed `Decoder<'a>` cannot hold.)
 pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+    if let Some(body) = decompress_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body);
+        let term = decoder.decode(heap, atoms)?;
+        decoder.finish()?;
+        return Ok(term);
+    }
     let mut decoder = Decoder::new(bytes)?;
     let term = decoder.decode(heap, atoms)?;
     decoder.finish()?;
     Ok(term)
+}
+
+/// Whether `bytes` is a top-level `COMPRESSED` image:
+/// `[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE][zlib stream]`.
+///
+/// The 6-byte minimum mirrors the C check (`external.c:1754-1759`): once the version
+/// byte is consumed, the C requires at least the tag plus the 4-byte size before it
+/// takes the `COMPRESSED` branch, so a shorter image is treated as an ordinary (and
+/// therefore invalid) term starting at the `80` byte.
+fn is_compressed_image(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
+}
+
+/// Unwraps a top-level `COMPRESSED` image, returning the inner term body.
+///
+/// `Ok(None)` means the image is not compressed and the caller decodes it normally;
+/// `Ok(Some(body))` is the decompressed inner term — the bytes that follow the
+/// version byte of the *inner* `term_to_binary` image, so they start at the term tag
+/// and carry no version byte.
+///
+/// The 4-byte size field is the inner term's byte length **excluding** the version
+/// byte; a decompressed length that disagrees with it, or any zlib failure, yields
+/// `BeamError::BadArg` (`external.c:1807-1810`), never a partially decoded term.
+fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !is_compressed_image(bytes) {
+        return Ok(None);
+    }
+    // `is_compressed_image` guarantees `bytes[..6]` is present.
+    let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    let body = crate::compress::decompress(&bytes[6..])?;
+    if body.len() != size {
+        return Err(bad_arg());
+    }
+    Ok(Some(body))
 }
 
 /// Groups base-256 magnitude bytes (least significant first) into `ErtsDigit`s —
@@ -859,7 +912,6 @@ mod tests {
         for tag in [
             Tag::Binary,
             Tag::BitBinary,
-            Tag::Compressed,
             Tag::NewFun,
             Tag::Export,
             Tag::Fun,
@@ -872,10 +924,100 @@ mod tests {
             assert_unsupported(&[131, tag.as_byte()]);
         }
 
+        // `COMPRESSED` is *covered* now, but only as the top-level wrapper: as a bare
+        // tag (a 2-byte image, below the 6-byte minimum) it is malformed, and nested
+        // inside a term it is malformed too — never `unsupported`, never a term.
+        assert_bad_arg(&[131, 80]);
+        assert_bad_arg(&[131, 104, 1, 80]);
+
         // The documented oracle vector for `<<"hi">>`.
         assert_unsupported(&[131, 109, 0, 0, 0, 2, 104, 105]);
     }
 
+    // -----------------------------------------------------------------------
+    // `COMPRESSED` (`80`) — the top-level zlib wrapper
+    // -----------------------------------------------------------------------
+
+    /// `term_to_binary(lists:duplicate(500, hello), [compressed])` — an oracle image
+    /// captured from OTP 29.1.1. Layout: `131, 80, <inner size:4 BE>, <zlib stream>`;
+    /// the declared inner size is `3506`, the length of `term_to_binary(List)` minus
+    /// its version byte.
+    const COMPRESSED_DUP_500_HELLO: [u8; 50] = [
+        131, 80, 0, 0, 13, 178, 120, 156, 237, 197, 177, 9, 0, 32, 16, 4, 176, 183, 112, 84, 65,
+        228, 192, 210, 197, 29, 192, 53, 44, 146, 38, 169, 106, 247, 244, 57, 146, 45, 73, 146,
+        36, 73, 250, 168, 245, 0, 145, 146, 3, 87,
+    ];
+
+    #[test]
+    fn compressed_top_level_wrapper_is_unwrapped() {
+        // The inner body needs 500 cons cells: a heap of 256 words is too small.
+        let mut heap = Heap::new(4096).unwrap();
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&COMPRESSED_DUP_500_HELLO, &mut heap, &mut atoms).unwrap();
+
+        // The inner term is `[hello, hello, …]` — 500 atoms, proper tail.
+        let mut count = 0usize;
+        let mut cursor = term;
+        while is_list(cursor) {
+            let head = cons_head(cursor).unwrap();
+            assert!(is_atom(head), "expected an atom element, got {head:?}");
+            assert_eq!(atoms.name(atom_val(head)), Some("hello"));
+            cursor = cons_tail(cursor).unwrap();
+            count += 1;
+        }
+        assert!(is_nil(cursor), "the inner list must be proper");
+        assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn hand_built_compressed_image_decodes() {
+        // The inner body of `{ok,17}` — the `OK_17` image without its version byte.
+        let body: &[u8] = &[104, 2, 119, 2, 111, 107, 97, 17];
+        let zlib = crate::compress::compress(body, 6).unwrap();
+        let mut image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+        image.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        image.extend_from_slice(&zlib);
+
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&image, &mut heap, &mut atoms).unwrap();
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(term, 0).unwrap())),
+            Some("ok")
+        );
+        assert_eq!(tuple_element(term, 1).unwrap(), make_small(17));
+    }
+
+    #[test]
+    fn compressed_negative_cases_are_bad_arg() {
+        let image = COMPRESSED_DUP_500_HELLO;
+
+        // Fewer than 6 bytes: the C does not even take the `COMPRESSED` branch
+        // (it needs the tag plus the 4-byte size, `external.c:1759`), so the `80` is
+        // treated as an ordinary — and therefore invalid — term tag.
+        assert_bad_arg(&[131, 80]);
+        assert_bad_arg(&[131, 80, 0, 0, 13]);
+
+        // A declared size that disagrees with the actual decompressed length.
+        let mut wrong_size = image.to_vec();
+        wrong_size[2..6].copy_from_slice(&1u32.to_be_bytes());
+        assert_bad_arg(&wrong_size);
+
+        // A corrupt Adler-32 trailer: zlib rejects the stream.
+        let mut corrupt = image.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        assert_bad_arg(&corrupt);
+
+        // A payload that is not a zlib stream at all.
+        assert_bad_arg(&[131, 80, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6]);
+
+        // Every truncation past the 6-byte header must be rejected, never a panic.
+        for len in 6..image.len() {
+            assert_bad_arg(&image[..len]);
+        }
+    }
     #[test]
     fn version_byte_is_required_and_checked() {
         // Missing (empty input).

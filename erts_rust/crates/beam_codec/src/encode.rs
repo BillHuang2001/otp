@@ -13,8 +13,8 @@ use beam_term::{AtomTable, Eterm};
 
 use crate::error;
 use crate::tag::{
-    ATOM_EXT, ATOM_UTF8_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT,
-    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT,
+    ATOM_EXT, ATOM_UTF8_EXT, COMPRESSED_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT,
+    MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT,
     SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, Tag,
 };
 use crate::term::{
@@ -383,6 +383,35 @@ impl<'a> Encoder<'a> {
     pub fn finish(self) -> Vec<u8> {
         self.buf.into_vec()
     }
+
+    /// Consumes the encoder, compressing the written term into a `COMPRESSED`
+    /// (`80`) `term_to_binary` image at zlib `level` (`0..=9`).
+    ///
+    /// The written term is the *inner body*: the bytes the encoder produced, minus a
+    /// leading [`VERSION_MAGIC`](crate::VERSION_MAGIC) if [`Encoder::new`] wrote one
+    /// (a term body never starts with `131`, which is not a tag, so stripping it when
+    /// present is unambiguous). The result is
+    /// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]` — the wire layout
+    /// `erlang:term_to_binary(Term, [compressed])` produces (`external.c:2289-2297`).
+    /// (The deflate bytes themselves are implementation-defined: zlib and
+    /// `miniz_oxide` emit different, equally valid streams for the same body.)
+    ///
+    /// A `level` outside `0..=9` yields `BeamError::BadArg`; an inner body larger
+    /// than the 32-bit size field yields `BeamError::SystemLimit`; a zlib failure
+    /// would yield `BeamError::BadArg` (it cannot occur for a valid level here).
+    pub fn finish_compressed(self, level: u8) -> Result<Vec<u8>> {
+        crate::compress::reject_bad_level(level)?;
+        let buf = self.buf.into_vec();
+        let body: &[u8] = buf.strip_prefix(&[crate::VERSION_MAGIC]).unwrap_or(&buf);
+        let size = u32::try_from(body.len()).map_err(|_| error::system_limit())?;
+
+        let mut out = Writer::with_capacity(body.len() + 6);
+        out.u8(crate::VERSION_MAGIC);
+        out.u8(COMPRESSED_EXT);
+        out.u32be(size);
+        out.bytes(&crate::compress::compress(body, level)?);
+        Ok(out.into_vec())
+    }
 }
 
 /// Renders `ErtsDigit`s as base-256 magnitude bytes, least significant first —
@@ -434,6 +463,38 @@ pub fn encode_term_body(term: Eterm, atoms: &AtomTable) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_body(atoms);
     encoder.encode(term)?;
     Ok(encoder.finish())
+}
+
+/// Encodes `term` as a compressed `term_to_binary` image:
+/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`.
+///
+/// The term is encoded uncompressed first (the `zlib` stream is the *inner* body, so
+/// it never contains the version byte), then deflated at zlib `level`. This is the
+/// byte layout of `erlang:term_to_binary(Term, [{compressed, Level}])`
+/// (`external.c:2289-2297`), and it is exactly what [`encode_term`] would produce if
+/// compression had not helped — the C falls back to the uncompressed image in that
+/// case; this entry point always emits the compressed wrapper because compression was
+/// explicitly requested.
+///
+/// The default [`encode_term`] stays uncompressed: the wrapper is emitted only here.
+pub fn encode_term_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::new_body(atoms);
+    encoder.encode(term)?;
+    encoder.finish_compressed(level)
+}
+
+/// Encodes `term` as a compressed **body**: the same zlib wrapper as
+/// [`encode_term_compressed`] but with the leading version byte omitted, i.e.
+/// `[COMPRESSED_EXT][inner_size:4 BE][zlib body]` (the distribution-payload / ETS
+/// blob form, where the version byte is not part of the body).
+///
+/// The inner bytes are the term body (as [`encode_term_body`]); the 4-byte size is
+/// that body's length, version byte excluded.
+pub fn encode_term_body_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
+    let image = encode_term_compressed(term, atoms, level)?;
+    // Drop the leading `VERSION_MAGIC`; everything else (tag, size, zlib stream) is
+    // already the body form. `encode_term_compressed` guarantees the version byte.
+    Ok(image[1..].to_vec())
 }
 
 #[cfg(test)]

@@ -42,12 +42,16 @@
 //! failure).
 
 use beam_alloc::Heap;
+use beam_codec::compress::decompress;
 use beam_codec::error::is_unsupported;
 use beam_codec::term::{
     big_parts, cons_head, cons_tail, external_pid_parts, external_ref_parts, flatmap_parts,
     float_value, tuple_arity, tuple_element,
 };
-use beam_codec::{decode_term, encode_term};
+use beam_codec::{
+    decode_term, encode_term, encode_term_body, encode_term_compressed, COMPRESSED_EXT,
+    VERSION_MAGIC,
+};
 use beam_term::prelude::{
     atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, AtomTable, Eterm, NIL,
 };
@@ -142,6 +146,22 @@ const LARGE_TUPLE_256: &[u8] = &[131, 105, 0, 0, 1, 0, 97, 1, 97, 2, 97, 3, 97, 
     244, 97, 245, 97, 246, 97, 247, 97, 248, 97, 249, 97, 250, 97, 251, 97, 252, 97,
     253, 97, 254, 97, 255, 98, 0, 0, 1, 0];
 
+/// `term_to_binary(lists:duplicate(500, hello), [compressed])` — the oracle's
+/// **compressed** image (OTP 29.1.1). Layout: `131, 80, <inner size:4 BE>, <zlib>`.
+///
+/// The 4-byte size (`0x00000DB2` = 3506) is the length of the inner term body: the
+/// uncompressed `term_to_binary(lists:duplicate(500, hello))` image with its version
+/// byte removed (`zlib:uncompress/1` over the stream yields exactly `inner[1..]`).
+///
+/// The zlib bytes are **zlib's** output. `flate2`/`miniz_oxide` would produce a
+/// different — equally valid — deflate stream for the same input, so this vector
+/// pins the **decoder** and the inner body, not our compressor's byte output (that is
+/// covered by the round-trip tests in `roundtrip.rs`).
+const COMPRESSED_DUP_500_HELLO: &[u8] = &[
+    131, 80, 0, 0, 13, 178, 120, 156, 237, 197, 177, 9, 0, 32, 16, 4, 176, 183, 112, 84, 65, 228,
+    192, 210, 197, 29, 192, 53, 44, 146, 38, 169, 106, 247, 244, 57, 146, 45, 73, 146, 36, 73,
+    250, 168, 245, 0, 145, 146, 3, 87,
+];
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -421,6 +441,57 @@ fn large_tuple_arity_256_is_large_tuple_ext() {
             index as i64 + 1
         );
     }
+}
+
+// ---------------------------------------------------------------------------
+// COMPRESSED (`80`) — oracle vectors
+// ---------------------------------------------------------------------------
+
+#[test]
+fn seed_compressed_image_decodes_and_its_inner_body_matches() {
+    let mut heap = Heap::new(4096).expect("a 4096-word heap holds 500 cons cells");
+    let mut atoms = AtomTable::new();
+    let term = decode_term(COMPRESSED_DUP_500_HELLO, &mut heap, &mut atoms)
+        .expect("the oracle compressed image must decode");
+
+    // `[hello, hello, …]` — 500 atoms, proper tail.
+    let (heads, tail) = spine(term);
+    assert!(is_nil(tail), "the inner list must be proper");
+    assert_eq!(heads.len(), 500);
+    for head in heads {
+        assert!(is_atom(head), "expected an atom element, got {head:?}");
+        assert_eq!(atom_name(&atoms, head), "hello");
+    }
+
+    // The inner body — the zlib stream, decompressed — is byte-identical to our own
+    // uncompressed encoding of the same term. This pins the term layer even though
+    // the zlib bytes themselves are implementation-defined.
+    let inner = decompress(&COMPRESSED_DUP_500_HELLO[6..]).expect("the stream is valid zlib");
+    assert_eq!(inner.len(), 3506, "the declared inner size");
+    assert_eq!(encode_term_body(term, &atoms).unwrap(), inner);
+
+    // Re-compressing produces a well-formed wrapper whose inner body is the same.
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+    assert_eq!(image[0], VERSION_MAGIC);
+    assert_eq!(image[1], COMPRESSED_EXT);
+    let mut heap2 = Heap::new(4096).expect("a 4096-word heap holds 500 cons cells");
+    let mut atoms2 = AtomTable::new();
+    let term2 = decode_term(&image, &mut heap2, &mut atoms2).expect("our image must decode");
+    assert_eq!(encode_term_body(term2, &atoms2).unwrap(), inner);
+}
+
+#[test]
+fn compressed_option_falls_back_when_it_does_not_help() {
+    // The C only emits the `COMPRESSED` wrapper when zlib actually shrinks the term;
+    // otherwise it reverts to the plain image (`external.c:2284-2293`). `{ok,17}` is
+    // small enough that `term_to_binary({ok,17}, [compressed])` is byte-identical to
+    // the uncompressed `OK_17` vector (verified with the oracle).
+    //
+    // Our `encode_term_compressed` deliberately *always* writes the wrapper — the
+    // caller asked for compression — so it is not the same bytes for this term; the
+    // oracle's (uncompressed) image must nevertheless decode, which this asserts.
+    let (_heap, _atoms, term) = round_trip(OK_17);
+    assert_eq!(tuple_arity(term).unwrap(), 2);
 }
 
 // ---------------------------------------------------------------------------

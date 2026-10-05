@@ -21,10 +21,11 @@ never modify it.
 ## Status
 **Implemented (Milestone 1).** Every module carries real bodies: the wire-frozen
 `tag` constants and the `Tag` enum (`from_byte`/`as_byte`/`name`/`covered`), the
-`reader`/`writer` cursors, the distribution `atom_cache`, the `encode`/`decode`
+`reader`/`writer` cursors, the distribution `atom_cache`, the `compress` zlib
+plumbing, the `encode`/`decode`
 loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers) and the `error` constructors. The required core tag set round-trips (see "Tag
-coverage" below); the documented unsupported set (binaries/bit-binary, `COMPRESSED`,
+coverage" below); the documented unsupported set (binaries/bit-binary,
 funs, records, `V4_PORT`, `LOCAL`, the distribution header, maps > 32 pairs) returns
 `error::unsupported` rather than a wrong term. `src/lib.rs` carries only the
 permanent lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]` and the single
@@ -37,7 +38,7 @@ byte-exact `term_to_binary` oracle vectors, each asserted in both directions.
 Re-exported at the crate root and via `beam_codec::prelude::*`.
 
 ### `src/lib.rs`
-`pub mod {tag, reader, writer, atom_cache, encode, decode, error, term}` + `pub mod prelude`,
+`pub mod {tag, reader, writer, atom_cache, compress, encode, decode, error, term}` + `pub mod prelude`,
 `pub const VERSION_MAGIC: u8 = 131`.
 Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)] mod term;` (§ unsafe).
 
@@ -65,15 +66,39 @@ Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)]
 `beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
 through it (an unset index ⇒ `BadArg`). M1 never *emits* `82`/`78`.
 
+### `src/compress.rs` — zlib plumbing for `COMPRESSED` (`80`)
+Safe Rust (`flate2` zlib wrappers; no `unsafe`). Owns only the RFC-1950 stream — the wrapper bytes
+(`[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE]`) are `encode`'s and recognising the top-level wrapper
+is `decode`'s.
+- `pub fn compress(data: &[u8], level: u8) -> Result<Vec<u8>>` — zlib at `level` `0..=9` (the C
+  `{compressed, Level}` option); an out-of-range level ⇒ `BadArg`.
+- `pub fn decompress(data: &[u8]) -> Result<Vec<u8>>` — any zlib error (bad header, truncated
+  stream, corrupt deflate block, bad Adler-32 trailer) ⇒ `BeamError::BadArg`; output is capped at
+  `MAX_UNCOMPRESSED` (`32 MiB`, mirroring C `external.c:1768`) so a hostile stream cannot drive an
+  unbounded allocation.
+- `pub const MIN_LEVEL: u8 = 0`, `pub const MAX_LEVEL: u8 = 9`, `pub const MAX_UNCOMPRESSED: usize`.
+- `pub(crate) fn reject_bad_level(level: u8) -> Result<()>` — used by `encode` to fail fast.
+
 ### `src/encode.rs` — the `Encoder` seam
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
-  `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`.
+  `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
+  `finish_compressed(level: u8) -> Result<Vec<u8>>` (see below).
 - `pub enum AtomEncoding { Utf8, Latin1 }` — default `Utf8`: emit `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`
   (exactly what `term_to_binary` emits). `Latin1` emits `SMALL_ATOM_EXT`/`ATOM_EXT` for nodes that did
   not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`).
-- Convenience: `pub fn encode_term(Eterm, &AtomTable) -> Result<Vec<u8>>` (with `131`) and
-  `pub fn encode_term_body(Eterm, &AtomTable) -> Result<Vec<u8>>` (without).
+- Convenience (additive; the existing signatures are unchanged): `pub fn encode_term(Eterm, &AtomTable)`
+  (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
+  the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
+  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`.
+- **Compressed wrapper** — `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`, where
+  `inner_size` is the inner term *body* length (version byte excluded) and the deflated payload is the
+  body (never containing the version byte). `Encoder::finish_compressed` strips a leading version byte
+  written by `Encoder::new`; `encode_term_body_compressed` omits the wrapper's version byte for the
+  dist/ETS body form (`[COMPRESSED_EXT][inner_size:4 BE][zlib body]`). The wrapper is emitted **only**
+  when explicitly requested — `encode_term` stays uncompressed. (C additionally reverts to the plain
+  image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
+  when compression is requested.)
 
 ### `src/decode.rs` — the `Decoder` seam
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
@@ -81,6 +106,13 @@ through it (an unset index ⇒ `BadArg`). M1 never *emits* `82`/`78`.
   `decode(&mut self, &mut Heap, &mut AtomTable) -> Result<Eterm>`, `position()`, `remaining()`,
   `finish() -> Result<()>` (trailing bytes ⇒ `BadArg`).
 - Convenience: `pub fn decode_term(&[u8], &mut Heap, &mut AtomTable) -> Result<Eterm>`.
+- **`COMPRESSED` is a top-level-only wrapper.** `decode_term` detects `bytes.len() >= 6 &&
+  bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT`, reads the 4-byte inner size, inflates and
+  requires `decompressed.len() == size`, then decodes the inner body with `Decoder::new_body` +
+  `finish()`. It is handled at the entry point rather than inside `Decoder` because the decompressed
+  body is an owned buffer a borrowed `Decoder<'a>` cannot hold. `Decoder::new`/`new_body` are otherwise
+  unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
+  minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
 
 ### `src/term.rs` — thin forwarding layer (the ONLY `unsafe` module; see Design Decisions)
 Term inspection and boxed sub-term materialization over `beam_alloc::Heap` that **forwards to**
@@ -116,9 +148,12 @@ constants only.
 `101, 114, 90` (references), `102, 89` (ports), `103, 88` (pids), `104, 105` (tuples), `106` (NIL),
 `107` (strings; decode ⇒ list of smalls, encode ⇒ `107` when the list is a byte list of length
 ≤ 65535, else `108`), `108` (lists, including improper tails), `116` (maps, ≤ `MAP_SMALL_MAP_LIMIT`
-= 32 pairs ⇒ flatmap), `82` (atom cache refs, decode only).
-**Explicit, documented `unsupported` error (never a wrong encoding):** `80 COMPRESSED` (both
-directions), `109 BINARY_EXT` / `77 BIT_BINARY_EXT`, `112 NEW_FUN` / `113 EXPORT` / `117 FUN`,
+= 32 pairs ⇒ flatmap), `82` (atom cache refs, decode only), `80 COMPRESSED` (the top-level zlib
+wrapper — inflated in `decode_term`; encode emits it only through the explicit
+`encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
+by default).
+**Explicit, documented `unsupported` error (never a wrong encoding):**
+`109 BINARY_EXT` / `77 BIT_BINARY_EXT`, `112 NEW_FUN` / `113 EXPORT` / `117 FUN`,
 `67 RECORD`, `120 V4_PORT`, `121 LOCAL`, `68`/`78` (distribution header — `beam_dist`'s), maps with
 > 32 pairs (needs the HAMT builder), and any atom name that is not representable in the emitted
 encoding.
@@ -142,8 +177,15 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `BeamError::Raise(Raise::error(ExitReason::atom(error::UNSUPPORTED_REASON)))`
   (`UNSUPPORTED_REASON = "unsupported_external_term"`, detectable with `error::is_unsupported`).
   **Never panic, never `unwrap()` runtime data, never silently truncate or mis-encode.**
-- **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `libc` — nothing else.
-  Adding a dependency edge requires reporting to the crate-layer node (`../`).
+- **Deps:** `beam_common`, `beam_term`, `beam_alloc`, `libc` plus `flate2` (zlib for
+  `COMPRESSED`). `flate2` uses the pure-Rust `miniz_oxide` backend (`default-features = false,
+  features = ["rust_backend"]`, no C toolchain, no network at build time beyond the crates.io fetch);
+  `flate2`/`miniz_oxide` are `MIT OR Apache-2.0`, i.e. Apache-2.0-compatible (Part I §G.6). The
+  dependency is declared **in this crate's `Cargo.toml`**, not hoisted into
+  `[workspace.dependencies]` (`erts_rust/Cargo.toml`), because that manifest is outside this node —
+  centralising it (a `flate2 = { version = "1", … }` workspace entry plus `flate2.workspace = true`
+  here) is owed at the crate-layer node. Adding any *other* dependency edge requires reporting to
+  the crate-layer node (`../`).
 - **No wire-format duplication**: tag values and field widths come from `tag.rs` only; the term layer
   never re-derives a tag from a term layout.
 - Files target ~1000 lines; one responsibility per file.
@@ -186,19 +228,39 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - **`VERSION_MAGIC` is handled by the constructor**, not the term loop: `Decoder::new` requires and
   consumes it, `new_body` does not; the same split exists on the `Encoder`. This is what lets the
   same code path serve `term_to_binary` and the distribution payload.
+- **`COMPRESSED` (`80`) is a *top-level-only* wrapper** (`external.c:1754-1813`): the C accepts it
+  only immediately after the version byte, so `decode_term` unwraps it there and the term loop treats
+  a `80` it reaches as malformed (`BadArg`). The 4-byte size is the inner **body** length (version
+  byte excluded), and the payload is a **zlib-wrapped** (RFC 1950) stream — `flate2`'s
+  `ZlibEncoder`/`ZlibDecoder`, matching the C's `deflateInit`/`inflateInit`, never raw deflate.
+  `decode_term` requires `inflate` success **and** `decompressed.len() == size`, otherwise `BadArg`.
+  Trailing bytes after the zlib stream are ignored, exactly as the C's `uncompress` does (the deflate
+  stream is not self-delimiting). Encoding writes the wrapper **only** on the explicit
+  `*_compressed` entry points; it is never emitted by default.
+- **Compressed output is not byte-comparable with the oracle.** zlib (C) and `miniz_oxide` produce
+  different — equally valid — deflate byte streams for the same input, so the `COMPRESSED`
+  ground-truth vector pins the **decoder** and the **inner body** (which must equal our uncompressed
+  encoding), not our compressor's bytes. Round-trip byte-stability is asserted among *our own*
+  encode/decode, and interoperability (the system `erl`'s `binary_to_term/1` accepts our wrapper) was
+  verified manually.
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `tag` (values against `external.h`, `from_byte`/`as_byte`
-  round-trip), `reader`/`writer` (BE round-trips, every truncation ⇒ `BadArg`, no panic),
-  `atom_cache`, `term` (raw-word assertions that the forwarded `beam_term::thing` layout is
-  byte-exact — float, bignum sign/digits, flatmap head/size/keys/vals, external id fields — plus the
-  guard/error behaviour), `encode`/`decode` (per-tag round-trips + the
-  error mapping table + unsupported tags).
+  round-trip, `covered` table), `reader`/`writer` (BE round-trips, every truncation ⇒ `BadArg`, no
+  panic), `atom_cache`, `compress` (round-trip at every level 0..=9, empty/large inputs, out-of-range
+  level, bad header/truncation/corrupt-trailer), `term` (raw-word assertions that the forwarded
+  `beam_term::thing` layout is byte-exact — float, bignum sign/digits, flatmap head/size/keys/vals,
+  external id fields — plus the guard/error behaviour), `encode`/`decode` (per-tag round-trips + the
+  error mapping table + unsupported tags, plus the top-level `COMPRESSED` unwrap, a hand-built
+  compressed image and its negative cases).
 - `tests/roundtrip.rs` — exhaustive `encode → decode → compare` over a property-style corpus
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
   incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
   `ErtsDigit`s), plus negative cases (truncation at every offset, bad tag, over-long atom, `LARGE_BIG`
-  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes).
+  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes). The `COMPRESSED` section round-trips a small
+  and a large compressible term through `encode_term_compressed`/`encode_term_body_compressed` →
+  `decode_term` at every level, and covers the negative cases (short header, lying size, corrupt
+  trailer, non-zlib payload, non-term inner body, truncation at every offset).
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
@@ -215,6 +277,12 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `131,111,0,0,1,120,0,<375 zero bytes>,1` — a `LARGE_BIG` whose 4-byte count is 376 and whose
   magnitude is 375 zero bytes plus a leading `0x01`.
   (`<<"hi">>` → `131,109,0,0,0,2,104,105` is kept as the documented *unsupported* case.)
+  The **compressed** seed is `term_to_binary(lists:duplicate(500, hello), [compressed])` — a 50-byte
+  image `131,80,0,0,13,178,<zlib>`, whose declared inner size is `3506` (the inner body equals
+  `term_to_binary(lists:duplicate(500, hello))` minus its version byte); it is asserted by decoding
+  and by comparing the inflated stream to our own `encode_term_body`. `term_to_binary({ok,17},
+  [compressed])` is kept as the fallback case (the C emits the plain `OK_17` image when zlib cannot
+  shrink the term, `external.c:2284-2293`).
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../tools/`.
@@ -232,11 +300,16 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   larger maps need the HAMT builder plus Erlang term hashing (owned by `beam_ets`/`beam_term`), so
   they return `unsupported`. Duplicate keys are **not** detected in M1 (that needs term comparison,
   not available yet) — the wire order is preserved as-is.
-- **`COMPRESSED` (80) is unsupported in both directions** (no zlib dependency is available, and a
-  wrong encoding must never be emitted). A future `miniz_oxide`/`flate2` (Apache-2.0/MIT) behind a
-  feature can fill this in without an API change.
 - Funs (`112`/`113`/`117`), records (`67`), `V4_PORT_EXT` (`120`), `LOCAL_EXT` (`121`) and the
   distribution header (`68`/`78`) are out of M1 scope; `beam_dist` owns the distribution header.
+- **`COMPRESSED` decompression is capped at `MAX_UNCOMPRESSED` (32 MiB)** (`compress.rs`), mirroring
+  the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
+  to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
+  to keep a hostile stream from driving an unbounded allocation.
+- **The compressed wrapper is always emitted when compression is explicitly requested**, even when it
+  makes the image larger — the C reverts to the plain image in that case. This is a deliberate,
+  documented difference (`encode_term_compressed` obeys the caller; `encode_term` is the uncompressed
+  API).
 - Identifiers always decode as *external* things (no local-node identity in the codec yet).
 - **`node` occupies the sysname-atom slot; `creation` is carried in C's off-heap `next` link
   (a documented M1 substitution).** In C `ExternalThing`'s first data word is a pointer to a
@@ -257,16 +330,24 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/reader.rs` → `Reader<'a>`, the bounds-checked BE cursor (safe)
 - `src/writer.rs` → `Writer`, the growable byte sink (safe)
 - `src/atom_cache.rs` → `AtomCache` (2048-slot distribution atom cache)
-- `src/encode.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`
-- `src/decode.rs` → `Decoder`, `decode_term`
+- `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
+- `src/encode.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
+  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`
+- `src/decode.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
+  `decompress_wrapper`/`is_compressed_image`
 - `src/error.rs` → error constructors only (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`
 - `src/term.rs` → **thin forwarding layer (the only `unsafe` module)**: allocates from
   `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::{tuple_size, tuple_element,
   car, cdr}` for float/bignum/flatmap/external-identifier construction and inspection
-- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated)
-- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
-- `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values (read-only)
+- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
+  incl. the `COMPRESSED` seed
+- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
+  incl. the `COMPRESSED` wrapper round-trips and negatives
+- `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values
+  (read-only), incl. `binary2term_prepare` (`1744-1816`) for the `COMPRESSED` wrapper
+- `../../erts/emulator/beam/erl_zlib.c` / `erl_zlib.h` → the C zlib wrapper the stream form matches
+  (read-only)
 - `../../erts/emulator/beam/erl_term.h` / `erl_map.h` → term layouts for the boxed sub-terms (read-only)
 - `../../erts/doc/guides/erl_ext_dist.md` → the in-tree external term format specification (read-only)
 

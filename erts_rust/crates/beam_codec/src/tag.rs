@@ -89,6 +89,10 @@ pub const ATOM_UTF8_EXT: u8 = 118;
 pub const SMALL_ATOM_UTF8_EXT: u8 = 119;
 
 /// `COMPRESSED` (`'P'`, `external.h:75`): a zlib-compressed payload.
+///
+/// The wire form is `[VERSION_MAGIC][COMPRESSED_EXT][uncompressed_size:4 BE][zlib
+/// stream]`, valid only as the outermost wrapper (immediately after the version byte);
+/// [`crate::decode::decode_term`] unwraps it. See [`crate::compress`].
 pub const COMPRESSED_EXT: u8 = 80;
 
 /// `BIT_BINARY_EXT` (`'M'`, `external.h:52`): a non-byte-aligned bitstring.
@@ -179,6 +183,9 @@ pub enum Tag {
     /// `SMALL_ATOM_UTF8_EXT` (`119`).
     SmallAtomUtf8,
     /// `COMPRESSED` (`80`).
+    ///
+    /// Honoured only as the top-level wrapper (right after the version byte); nested
+    /// it is malformed input. See [`Tag::covered`].
     Compressed,
     /// `BIT_BINARY_EXT` (`77`).
     BitBinary,
@@ -332,11 +339,15 @@ impl Tag {
     /// Whether the Milestone-1 term layer supports this tag.
     ///
     /// `true` for the required core set (integers, floats, all four atom tags,
-    /// references, ports, pids, tuples, `NIL`, strings, lists, small maps and the
-    /// distribution atom-cache reference); `false` for everything the codec
-    /// deliberately reports as [`crate::error::unsupported`] (`COMPRESSED`,
-    /// binaries, funs, records, `V4_PORT_EXT`, `LOCAL_EXT` and the distribution
-    /// header).
+    /// references, ports, pids, tuples, `NIL`, strings, lists, small maps, the
+    /// distribution atom-cache reference, and `COMPRESSED` as a top-level wrapper);
+    /// `false` for everything the codec deliberately reports as
+    /// [`crate::error::unsupported`] (binaries, funs, records, `V4_PORT_EXT`,
+    /// `LOCAL_EXT` and the distribution header).
+    ///
+    /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
+    /// but only as the outermost wrapper, immediately after the version byte
+    /// (`crate::decode::decode_term`); nested it is malformed input.
     pub fn covered(self) -> bool {
         matches!(
             self,
@@ -364,6 +375,7 @@ impl Tag {
                 | Tag::LargeBig
                 | Tag::Map
                 | Tag::AtomCacheRef
+                | Tag::Compressed
         )
     }
 }
@@ -401,7 +413,7 @@ mod tests {
         (Tag::NewerReference, 90, "NEWER_REFERENCE_EXT", true),
         (Tag::AtomUtf8, 118, "ATOM_UTF8_EXT", true),
         (Tag::SmallAtomUtf8, 119, "SMALL_ATOM_UTF8_EXT", true),
-        (Tag::Compressed, 80, "COMPRESSED", false),
+        (Tag::Compressed, 80, "COMPRESSED", true),
         (Tag::BitBinary, 77, "BIT_BINARY_EXT", false),
         (Tag::NewFun, 112, "NEW_FUN_EXT", false),
         (Tag::Export, 113, "EXPORT_EXT", false),

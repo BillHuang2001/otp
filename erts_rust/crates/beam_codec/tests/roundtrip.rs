@@ -36,6 +36,7 @@ use beam_term::{
     Eterm, MAX_SMALL, MIN_SMALL, NIL,
 };
 
+use beam_codec::compress::{compress, decompress};
 use beam_codec::error::is_unsupported;
 use beam_codec::term::{
     big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
@@ -43,11 +44,11 @@ use beam_codec::term::{
     make_flatmap, make_float, tuple_arity, tuple_element,
 };
 use beam_codec::{
-    decode_term, encode_term, encode_term_body, AtomEncoding, Decoder, Encoder, ATOM_EXT,
-    ATOM_UTF8_EXT, BINARY_EXT, FLOAT_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT,
-    MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT,
-    NIL_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT,
-    VERSION_MAGIC,
+    decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
+    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
+    INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
+    NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
+    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, VERSION_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -894,6 +895,166 @@ fn body_form_round_trips_without_the_version_byte() {
 }
 
 // ---------------------------------------------------------------------------
+// COMPRESSED (`80`) — the zlib wrapper
+// ---------------------------------------------------------------------------
+
+/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE]` → the declared inner size.
+fn declared_inner_size(image: &[u8]) -> usize {
+    assert_eq!(image[0], VERSION_MAGIC, "a compressed image starts with 131");
+    assert_eq!(image[1], COMPRESSED_EXT, "then the COMPRESSED tag");
+    u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize
+}
+
+#[test]
+fn compressed_image_round_trips_a_small_term() {
+    let mut atoms = AtomTable::new();
+    let ok = make_atom(atoms.intern("ok"));
+    let mut h = heap(64);
+    let term = h.tuple(&[ok, make_small(17)]).unwrap();
+
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+    let body = encode_term_body(term, &atoms).unwrap();
+    assert_eq!(declared_inner_size(&image), body.len());
+    // The zlib stream carries exactly the term body (no version byte).
+    assert_eq!(decompress(&image[6..]).unwrap(), body);
+
+    let mut h2 = heap(64);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_image_round_trips_a_large_compressible_term() {
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 500], NIL);
+
+    let plain = encode_term(term, &atoms).unwrap();
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+    assert_eq!(declared_inner_size(&image), plain.len() - 1);
+    assert!(
+        image.len() * 10 < plain.len(),
+        "a 500-element list should shrink by more than 10x: {} vs {}",
+        image.len(),
+        plain.len()
+    );
+
+    let mut h2 = heap(4096);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_body_form_omits_the_version_byte() {
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 500], NIL);
+
+    let body = encode_term_body(term, &atoms).unwrap();
+    let image = encode_term_body_compressed(term, &atoms, 6).unwrap();
+
+    // `[COMPRESSED_EXT][inner_size:4 BE][zlib]` — no leading version byte.
+    assert_eq!(image[0], COMPRESSED_EXT);
+    assert_eq!(
+        u32::from_be_bytes([image[1], image[2], image[3], image[4]]) as usize,
+        body.len()
+    );
+    assert_eq!(decompress(&image[5..]).unwrap(), body);
+
+    // Prepending the version byte yields a valid versioned image for the same term.
+    let mut versioned = vec![VERSION_MAGIC];
+    versioned.extend_from_slice(&image);
+    let mut h2 = heap(4096);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&versioned, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_level_out_of_range_is_bad_arg() {
+    let atoms = AtomTable::new();
+    let term = make_small(7);
+    assert!(matches!(
+        encode_term_compressed(term, &atoms, 10),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        encode_term_body_compressed(term, &atoms, u8::MAX),
+        Err(BeamError::BadArg)
+    ));
+    // `0` and `9` are the inclusive bounds.
+    assert!(encode_term_compressed(term, &atoms, 0).is_ok());
+    assert!(encode_term_compressed(term, &atoms, 9).is_ok());
+}
+
+#[test]
+fn compressed_wrapper_bytes_are_well_formed_on_every_level() {
+    // A term where compression pays off at every level (0 stores, 9 best).
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 256], NIL);
+    let body = encode_term_body(term, &atoms).unwrap();
+
+    for level in 0..=9u8 {
+        let image = encode_term_compressed(term, &atoms, level).unwrap();
+        assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
+        assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+
+        let mut h2 = heap(4096);
+        let mut a2 = AtomTable::new();
+        let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+        assert_term_eq(term, &atoms, term2, &a2);
+    }
+}
+
+#[test]
+fn compressed_image_negative_cases_are_bad_arg() {
+    // A valid image to corrupt.
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 64], NIL);
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+
+    // A header shorter than 6 bytes (the C only takes the `COMPRESSED` branch once
+    // the tag plus the 4-byte size are present).
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT]);
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0]);
+
+    // A declared size that does not match the decompressed length.
+    let mut wrong_size = image.clone();
+    wrong_size[2..6].copy_from_slice(&0u32.to_be_bytes());
+    assert_bad_arg(&wrong_size);
+
+    // A corrupt Adler-32 trailer is rejected by zlib.
+    let mut corrupt = image.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xFF;
+    assert_bad_arg(&corrupt);
+
+    // A payload that is not a zlib stream at all.
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 4, 1, 2, 3, 4]);
+
+    // A well-formed wrapper whose inner body is not a valid term (200 is not a tag).
+    let bad_body = [200u8];
+    let zlib = compress(&bad_body, 6).unwrap();
+    let mut bad_image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+    bad_image.extend_from_slice(&(bad_body.len() as u32).to_be_bytes());
+    bad_image.extend_from_slice(&zlib);
+    assert_bad_arg(&bad_image);
+
+    // Every truncation past the 6-byte header is rejected — never a panic.
+    for len in 6..image.len() {
+        assert_bad_arg(&image[..len]);
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Negative cases
 // ---------------------------------------------------------------------------
 
@@ -1051,6 +1212,10 @@ fn malformed_inputs_never_panic() {
         vec![VERSION_MAGIC, SMALL_TUPLE_EXT, 4, 97],
         vec![VERSION_MAGIC, LARGE_BIG_EXT, 0, 0, 1, 0],
         vec![VERSION_MAGIC, SMALL_BIG_EXT, 5, 0, 1, 2],
+        // `COMPRESSED` wrappers with lying size fields / non-zlib payloads.
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 1, 0],
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 255, 255, 255, 255, 1, 2, 3, 4],
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 0],
     ]);
 
     for image in &corpus {
