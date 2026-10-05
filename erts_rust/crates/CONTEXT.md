@@ -56,7 +56,7 @@ Determined by the Cargo workspace DAG; a crate may only use crates in earlier wa
 |---|---|---|
 | 0 | `beam_alloc`, `beam_abi` | `beam_common`, `beam_term` |
 | 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 |
-| 2 | `beam_loader`, `beam_message`, `beam_dist` | wave 1 (`beam_codec`) |
+| 2 | `beam_loader`, `beam_message`, `beam_dist` | wave 1 (`beam_codec`; `beam_message` also `beam_gc`, `beam_dist` also `beam_alloc`) |
 | 3 | `beam_process` | `beam_gc`, `beam_message`, `beam_alloc` |
 | 4 | `beam_engine` | `beam_loader` |
 | 5 | `beam_bifs`, `beam_io` | `beam_process` (+ codec/ets/gc) |
