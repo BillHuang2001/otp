@@ -34,7 +34,7 @@ Everything the app ships is Erlang: 78 modules (~46k lines) under `src/`, intern
 - Only 4 `src/` modules carry a real `-moduledoc`; the rest are `-moduledoc false`, i.e. their docs are internal by design — do not "fix" that silently.
 - Deliberate `-compile([{nowarn_possibly_unsafe_function, ...}])` suppressions around `list_to_atom`/`binary_to_term` in option/name parsing are intentional; removing them fails the `-Werror` build.
 - Most shipped documentation is generated from the `-moduledoc`/`-doc` attributes inside `src/*.erl` (ExDoc reads the compiled `ebin` doc chunks), so API text changes usually belong in the `.erl` file, not in `doc/`.
-- The `examples/` tree is excluded from releases at the source location but its PEMs are stale/expired and its installed path differs — see `examples/CONTEXT.md` before touching or advertising the example.
+- The `examples/` tree is shipped as documentation only (copied to `doc/examples/` at release, not installed as a runtime dir); its committed PEMs are expired, so the demo no longer completes a handshake, and its cert-path lookup only matches the source tree — see `examples/CONTEXT.md` before touching or advertising it.
 
 ## Dependencies
 - Runtime: `crypto`, `public_key`, `kernel`, `stdlib` (declared in `src/ssl.app.src`); `runtime_dependencies` also lists `erts`, `inets`, `runtime_tools` for tooling/tests.
