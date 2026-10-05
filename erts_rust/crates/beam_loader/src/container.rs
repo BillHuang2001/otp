@@ -17,6 +17,15 @@
 //! big-endian reads) — there is no second cursor and no raw pointer in this crate.
 use beam_common::Result;
 
+use crate::error::{bad_file, truncated};
+
+/// The four-byte `FOR1` (IFF) magic that opens every `.beam` image.
+const FOR1_MAGIC: &[u8; 4] = b"FOR1";
+/// The four-byte BEAM form type that follows the `form_length`.
+const BEAM_FORM_TYPE: &[u8; 4] = b"BEAM";
+/// The size of the fixed `FOR1` + `form_length` + `BEAM` preamble, in bytes.
+const PREAMBLE_LEN: usize = 12;
+
 /// A four-byte chunk identifier (e.g. `b"AtU8"`).
 #[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
 pub struct ChunkId(pub [u8; 4]);
@@ -94,10 +103,182 @@ impl<'a> Container<'a> {
 ///
 /// A missing/bad `FOR1` magic, a bad form type, a chunk size that overruns the file
 /// or a truncated directory each yield `BeamError::BadArg` — never a panic.
-// TODO(beam_loader-impl): read the `FOR1` magic, `form_length` and the `BEAM` form
-// TODO(beam_loader-impl): type, then walk the chunk directory (id + size + payload +
-// TODO(beam_loader-impl): 4-byte alignment padding) until EOF, collecting `RawChunk`s.
 pub fn parse(bytes: &[u8]) -> Result<Container<'_>> {
-    let _ = bytes;
-    Err(beam_common::BeamError::BadArg)
+    // The fixed preamble is `FOR1` + `form_length` + `BEAM`; anything shorter is
+    // truncated before it can even be inspected.
+    if bytes.len() < PREAMBLE_LEN {
+        return Err(truncated("FOR1 preamble"));
+    }
+
+    let mut reader = beam_codec::Reader::new(bytes);
+
+    let magic = reader.bytes(4)?;
+    if magic != FOR1_MAGIC {
+        return Err(bad_file("missing FOR1 magic"));
+    }
+
+    // `form_length` is the whole form size minus the 8-byte `FOR1`+length prefix;
+    // it INCLUDES the 4-byte form type. It bounds the image, so a value that claims
+    // more bytes than the file holds is rejected up front.
+    let form_length = reader.u32be()?;
+    if (form_length as usize).saturating_add(8) > bytes.len() {
+        return Err(truncated("form length"));
+    }
+
+    let form_type = reader.bytes(4)?;
+    if form_type != BEAM_FORM_TYPE {
+        return Err(bad_file("bad BEAM form type"));
+    }
+
+    // Chunks start right after the 12-byte preamble and run to EOF; unknown ids are
+    // skipped (they simply become `RawChunk`s the caller ignores) and duplicate ids
+    // keep the first (`Container::find`).
+    let mut chunks = Vec::new();
+    loop {
+        let remaining = reader.remaining();
+        if remaining == 0 {
+            break;
+        }
+        // A chunk entry is at least an 8-byte `id`+`size` pair.
+        if remaining < 8 {
+            return Err(truncated("chunk header"));
+        }
+
+        let id_bytes = reader.bytes(4)?;
+        let id = ChunkId([id_bytes[0], id_bytes[1], id_bytes[2], id_bytes[3]]);
+        let size = reader.u32be()? as usize;
+
+        // The payload must fit in what is left after the header.
+        if size > reader.remaining() {
+            return Err(bad_file("chunk size overruns file"));
+        }
+        let data = reader.bytes(size)?;
+
+        // Payloads are padded to a 4-byte boundary with zero bytes.
+        let pad = (4 - (size % 4)) % 4;
+        if reader.remaining() < pad {
+            return Err(truncated("chunk padding"));
+        }
+        reader.bytes(pad)?;
+
+        chunks.push(RawChunk { id, data });
+    }
+
+    Ok(Container { chunks })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_common::BeamError;
+
+    /// Builds a `FOR1`/`BEAM` image from a sequence of `(id, payload)` chunks,
+    /// applying the 4-byte alignment padding the wire format requires.
+    fn build_image(chunks: &[(&[u8; 4], &[u8])]) -> Vec<u8> {
+        let mut body = Vec::new();
+        for (id, data) in chunks {
+            body.extend_from_slice(*id);
+            body.extend_from_slice(&(data.len() as u32).to_be_bytes());
+            body.extend_from_slice(data);
+            let pad = (4 - (data.len() % 4)) % 4;
+            body.extend(std::iter::repeat(0u8).take(pad));
+        }
+
+        let mut image = Vec::new();
+        image.extend_from_slice(b"FOR1");
+        // form_length = whole form minus the 8-byte `FOR1`+length prefix.
+        image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+        image.extend_from_slice(b"BEAM");
+        image.extend_from_slice(&body);
+        image
+    }
+
+    #[test]
+    fn parses_a_single_chunk() {
+        let image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        let container = parse(&image).unwrap();
+        assert_eq!(container.chunks.len(), 1);
+        assert_eq!(container.chunks[0].id, ChunkId(*b"Test"));
+        assert_eq!(container.chunks[0].data, &[1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn parses_multiple_chunks_and_skips_padding() {
+        // The first payload is 3 bytes, so one zero pad byte follows it.
+        let image = build_image(&[(b"Abcd", &[1, 2, 3]), (b"Efgh", &[])]);
+        let container = parse(&image).unwrap();
+        assert_eq!(container.chunks.len(), 2);
+        assert_eq!(container.chunks[0].id, ChunkId(*b"Abcd"));
+        assert_eq!(container.chunks[0].data, &[1, 2, 3]);
+        assert_eq!(container.chunks[1].id, ChunkId(*b"Efgh"));
+        assert_eq!(container.chunks[1].data, &[] as &[u8]);
+    }
+
+    #[test]
+    fn find_returns_the_first_duplicate() {
+        let image = build_image(&[(b"Test", &[1]), (b"Test", &[2, 2, 2, 2])]);
+        let container = parse(&image).unwrap();
+        assert_eq!(container.chunks.len(), 2);
+        let found = container.find(ChunkId(*b"Test")).unwrap();
+        assert_eq!(found.data, &[1]);
+    }
+
+    #[test]
+    fn empty_chunk_directory_is_valid() {
+        let image = build_image(&[]);
+        let container = parse(&image).unwrap();
+        assert!(container.chunks.is_empty());
+    }
+
+    #[test]
+    fn truncated_preamble_is_rejected() {
+        let image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        for len in 0..PREAMBLE_LEN {
+            let err = parse(&image[..len]).unwrap_err();
+            assert!(matches!(err, BeamError::BadArg), "len {len}");
+        }
+    }
+
+    #[test]
+    fn bad_magic_is_rejected() {
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        image[0] = b'X';
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn bad_form_type_is_rejected() {
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        image[8..12].copy_from_slice(b"NOPE");
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn chunk_size_overrunning_the_file_is_rejected() {
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        // Patch the chunk size to claim far more bytes than the file holds.
+        let size_off = PREAMBLE_LEN + 4;
+        image[size_off..size_off + 4].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn form_length_larger_than_file_is_rejected() {
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        image[4..8].copy_from_slice(&0xFFFF_FFFFu32.to_be_bytes());
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn incomplete_chunk_header_is_rejected() {
+        // A trailing 4 bytes that cannot form a full id+size pair.
+        let mut image = build_image(&[(b"Test", &[1, 2, 3, 4])]);
+        image.extend_from_slice(b"XXXX");
+        let err = parse(&image).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
 }
