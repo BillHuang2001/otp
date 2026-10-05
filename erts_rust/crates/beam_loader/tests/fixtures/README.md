@@ -324,64 +324,65 @@ uses `name_index 0`. The loader prepends the implicit "undefined location" entry
 `t_integer{0,255}`) and `apply_adder/2` (`t_fun`).
 
 ### Opcodes emitted (the exact set)
-`beam_disasm` reports **34** distinct top-level instruction names:
+The `Code` stream holds **177 instructions**. Decoding it instruction-by-instruction (using the
+`genop.tab` opcode/arity roster and the `beam_file.c` tagged-operand rules — the same rules the
+loader implements) consumes the stream **exactly** (0 leftover bytes) and lands on the
+`int_code_end` terminator, which cross-checks against the 176 instructions `beam_disasm`
+reports (it omits `int_code_end`). The stream emits **43 distinct opcodes** — these are the
+*generic-opcode roster* names of `lib/compiler/src/genop.tab`, i.e. exactly the variants of
+`beam_loader`'s `Opcode` enum (opcode number · name/arity):
 
 ```
-allocate
-bif
-bs_create_bin
-bs_get_position
-bs_get_tail
-bs_match
-bs_set_position
-call
-call_ext_only
-call_fun2
-deallocate
-fconv
-fmove
-func_info
-gc_bif
-get_list
-get_map_elements
-get_tuple_element
-init_yregs
-label
-line
-make_fun3
-move
-put_list
-put_map_assoc
-put_map_exact
-put_tuple2
-return
-select_tuple_arity
-test
-test_heap
-'try'
-try_case
-try_end
+  1  label/1               60  select_tuple_arity/3 154  put_map_assoc/5
+  2  func_info/3           64  move/2               155  put_map_exact/5
+  3  int_code_end/0        65  get_list/3           158  get_map_elements/3
+  4  call/2                66  get_tuple_element/3  164  put_tuple2/2
+ 11  bif2/5                69  put_list/3           165  bs_get_tail/3
+ 12  allocate/2            78  call_ext_only/2      166  bs_start_match3/4
+ 16  test_heap/2           96  fmove/2              167  bs_get_position/3
+ 18  deallocate/1          97  fconv/2              168  bs_set_position/2
+ 19  return/0             101  fdiv/4               171  make_fun3/3
+ 40  is_ge/3              104  try/2                172  init_yregs/1
+ 43  is_eq_exact/3        105  try_end/1            177  bs_create_bin/6
+ 45  is_integer/2         106  try_case/1           178  call_fun2/3
+ 52  is_nil/2             108  raise/2              182  bs_match/3
+ 56  is_nonempty_list/2   125  gc_bif2/6
+ 57  is_tuple/2           153  line/1
 ```
 
-Plus the stream terminator **`int_code_end`/0** (genop `3`), which `beam_disasm` does not
-surface — so the code stream contains **35 distinct opcodes**.
+**How `beam_disasm` renders these.** `beam_disasm` folds several *distinct wire opcodes* into a
+shared generic mnemonic, so its output shows only **34** top-level names (excluding
+`int_code_end`). The folds present in this module:
 
-Relative to `slice.beam`'s subset (`call_ext_only call_only func_info gc_bif label line move
-return swap test`), the unusual additions are:
+- `bif2/5`, `fdiv/4`, `raise/2` all print as `{bif, Name, …}` (e.g. `element/2`, `fdiv/2`,
+  `raise/2`) — 3 wire opcodes ⇒ 1 display name.
+- `gc_bif2/6` prints as `{gc_bif, Name, …}` — 1 ⇒ 1.
+- `is_eq_exact/3`, `is_ge/3`, `is_integer/2`, `is_nil/2`, `is_nonempty_list/2`, `is_tuple/2`
+  **and** `bs_start_match3/4` all print as `{test, Kind, …}` — 7 wire opcodes ⇒ 1 display name
+  (see `lib/compiler/src/beam_disasm.erl:1319`, where `bs_start_match3` is resolved to a `test`
+  form).
+- `try/2`, `try_end/1`, `try_case/1` print as `'try'`, `try_end`, `try_case`.
 
-- **funs/closures** — `make_fun3` (create) and `call_fun2` (invoke); note the fun is invoked
-  through `call_fun2`, not `call_fun`.
-- **exceptions** — `'try'`, `try_end`, `try_case`.
-- **floats** — `fconv` (X↔float-register conversion), `fmove`.
-- **maps** — `put_map_assoc`, `put_map_exact`, `get_map_elements`.
-- **bitstrings** — `bs_match` (this is what raises `max_opcode` to 182), `bs_start_match3`,
-  `bs_get_position`, `bs_set_position`, `bs_get_tail`, `bs_create_bin`.
-- **tuples** — `select_tuple_arity`, `put_tuple2`, `get_tuple_element`.
-- **lists** — `get_list`, `put_list`.
-- **frame/stack** — `allocate`, `deallocate`, `test_heap`, `init_yregs`.
-- the plain **`bif`** instruction (used for `element/2`, `raise/2`, `fdiv/2`) in addition to
-  `gc_bif`.
+So `beam_disasm`'s 34 display names under-represent the wire: the file really carries the 43
+opcodes listed above.
 
-The `test` instruction covers the `is_tuple`/`is_nonempty_list`/`is_nil`/`is_eq_exact`/
-`is_integer`/`is_ge` family, and the local `call` (not `call_ext`) is used for the module-local
-call to `make_adder/1`.
+Relative to `slice.beam`'s wire subset (`call_only, call_ext_only, func_info, gc_bif2,
+is_eq_exact, label, line, move, return, swap`, plus `int_code_end`), the unusual additions are:
+
+- **funs/closures** — `make_fun3/3` (create) and `call_fun2/3` (invoke). Note the closure is
+  invoked via `call_fun2`, not `call_fun` (this app's fun is a plain closure, not an
+  `erlang:apply/2` dispatch).
+- **exceptions** — `try/2`, `try_end/1`, `try_case/1` (plus the raising BIF `raise/2`).
+- **floats** — `fmove/2`, `fconv/2` (X-register ↔ float-register conversion) and the dedicated
+  `fdiv/4` (float division BIF).
+- **maps** — `put_map_assoc/5`, `put_map_exact/5`, `get_map_elements/3`.
+- **bitstrings** — `bs_match/3` (this is what raises `max_opcode` to 182), `bs_start_match3/4`,
+  `bs_get_position/3`, `bs_set_position/2`, `bs_get_tail/3`, `bs_create_bin/6`.
+- **tuples** — `select_tuple_arity/3`, `put_tuple2/2`, `get_tuple_element/3`.
+- **lists** — `get_list/3`, `put_list/3`.
+- **frame/stack** — `allocate/2`, `deallocate/1`, `test_heap/2`, `init_yregs/1`.
+- the plain BIF forms — `bif2/5` (for `element/2`) in addition to `gc_bif2/6` (for `+`, `-`,
+  `*`); and a module-local `call/2` (not `call_ext*`) for the call to `make_adder/1`.
+
+The six `is_*`/`bs_start_match3` opcodes are the type tests shown by `beam_disasm` as
+`{test, …}`.
