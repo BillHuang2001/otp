@@ -80,13 +80,32 @@ fn erlc_available() -> bool {
 }
 
 /// Write an executable shell script into `scratch` (a fake `$BEAM_RT`) and return its path.
+///
+/// The script is written through an explicit [`std::fs::File`] that is **flushed,
+/// `sync_all`'d and closed** (by falling out of scope) before this function returns —
+/// i.e. before anything can `exec` it. A descriptor left open *for writing* makes the
+/// kernel refuse to `exec` the file with `ETXTBSY` ("Text file busy", errno 26), which is
+/// exactly the transient failure the child binary's bounded [`differential::runtime`]
+/// retry exists for; closing it here, up front, removes the race at its source. (The
+/// bounded retry in the child remains the safety net for a sibling `fork()` inheriting a
+/// writer's descriptor.)
 #[cfg(unix)]
 fn fake_runtime(scratch: &Scratch, name: &str, body: &str) -> PathBuf {
+    use std::io::Write;
     use std::os::unix::fs::PermissionsExt;
 
     let path = scratch.0.join(name);
     std::fs::create_dir_all(&scratch.0).expect("create scratch dir");
-    std::fs::write(&path, format!("#!/bin/sh\n{body}\n")).expect("write fake runtime");
+
+    {
+        let mut file = std::fs::File::create(&path).expect("create fake runtime");
+        file.write_all(format!("#!/bin/sh\n{body}\n").as_bytes())
+            .expect("write fake runtime");
+        file.flush().expect("flush fake runtime");
+        file.sync_all().expect("sync fake runtime");
+        // `file` is dropped (closed) here, before the script can ever be executed.
+    }
+
     let mut perms = std::fs::metadata(&path).expect("stat").permissions();
     perms.set_mode(0o755);
     std::fs::set_permissions(&path, perms).expect("chmod");
@@ -334,6 +353,97 @@ fn a_rust_runtime_with_differing_output_is_still_a_mismatch() {
     assert_eq!(json["cases"][0]["verdict"], "mismatch");
     assert_eq!(json["cases"][0]["rust"]["available"], true);
     assert_eq!(json["cases"][0]["rust"]["stdout"], "ok bogus\n");
+}
+
+/// The stderr classifier: the runtime's documented boot banner is not an observable, but
+/// **any other** stderr line still is — the classification can never fabricate agreement.
+#[cfg(unix)]
+#[test]
+fn a_boot_banner_is_ignored_but_other_stderr_is_a_mismatch() {
+    if !oracle_available() {
+        eprintln!("SKIP: oracle erl not available");
+        return;
+    }
+    // `length([a,b,c])` → the probe prints `ok <term_to_binary(3)>` on stdout, which is
+    // exactly what the oracle produces; only the stderr differs below.
+    let expr = "length([a,b,c])";
+
+    // Identical stdout + exit status, plus the runtime's boot banner on stderr: AGREES.
+    let banner = Scratch::new("banner-only");
+    let fake = fake_runtime(
+        &banner,
+        "beam_rt-fake",
+        "echo 'ok <<131,97,3>>'\n\
+         echo 'beam_rt erts-17.1 booted: 22 preloaded modules, 21 core atoms, 1 process' 1>&2\n\
+         exit 0",
+    );
+    let fake = fake.to_str().expect("utf-8 path");
+    let invocation = invoke(
+        &["compare", expr, "--json", "--out", &banner.arg()],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(invocation.code, Some(0), "{}", invocation.describe());
+    let json: serde_json::Value = serde_json::from_str(&invocation.stdout).expect("parses");
+    assert_eq!(
+        json["cases"][0]["verdict"], "agree",
+        "a banner-only stderr difference must not turn agreement into a mismatch: {}",
+        invocation.describe()
+    );
+    assert_eq!(
+        json["cases"][0]["diffs"].as_array().map(Vec::len),
+        Some(0),
+        "{}",
+        invocation.describe()
+    );
+
+    // Banner *plus* a genuine diagnostic: a hard MISMATCH (exit 1), reported on stderr.
+    let noise = Scratch::new("banner-noise");
+    let fake = fake_runtime(
+        &noise,
+        "beam_rt-fake",
+        "echo 'ok <<131,97,3>>'\n\
+         echo 'beam_rt erts-17.1 booted: 22 preloaded modules' 1>&2\n\
+         echo 'warning: something changed' 1>&2\n\
+         exit 0",
+    );
+    let fake = fake.to_str().expect("utf-8 path");
+    let invocation = invoke(
+        &["compare", expr, "--json", "--out", &noise.arg()],
+        &[("BEAM_RT", fake)],
+    );
+    assert_eq!(invocation.code, Some(1), "{}", invocation.describe());
+    let json: serde_json::Value = serde_json::from_str(&invocation.stdout).expect("parses");
+    assert_eq!(
+        json["cases"][0]["verdict"], "mismatch",
+        "{}",
+        invocation.describe()
+    );
+    let diffs = json["cases"][0]["diffs"].as_array().expect("diffs array");
+    assert!(
+        diffs.iter().any(|d| d["field"] == "stderr"),
+        "the surviving non-banner line is reported as a stderr diff: {}",
+        invocation.describe()
+    );
+    let stderr_diff = diffs
+        .iter()
+        .find(|d| d["field"] == "stderr")
+        .expect("a stderr diff");
+    assert!(
+        stderr_diff["rust"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("warning: something changed"),
+        "the reported diff carries the significant line: {}",
+        invocation.describe()
+    );
+    assert!(
+        !stderr_diff["rust"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("booted"),
+        "the banner is not part of the reported diff: {}",
+        invocation.describe()
+    );
 }
 
 /// A fake `$BEAM_RT` that signals `unsupported` (exit 3) is honest: `unsupported` lenient,
