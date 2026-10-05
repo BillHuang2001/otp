@@ -63,6 +63,7 @@ The rest of the emulator interacts with BeamAsm through two contracts:
 - `ERTS_JIT_ABI_WIN32` can be defined on non-Windows to emit Windows-convention calls, which is the supported way to debug Windows-JIT-only bugs on Linux.
 - Breakpoint-trampoline patching does exact opcode asserts (e.g. x86 `0xEB 0x06 0x90 0xE8`); changing prologue emission without updating `beam_asm.h` breaks tracing/NIF loading.
 - The `x86/` and `arm/` opcode encodings differ for the same logical instruction, so pass/fail of one backend says nothing about the other — both must be tested.
+- The arm register-backed `x` registers (see the GC section) are a hidden-root hazard: any code path that clobbers `x25-x28`/`x15-x16` outside the `x`-register API must `flush_var(s)` them before a GC or C call. x86 has no such hazard (its `RegisterCache` is write-through).
 
 ## Dependencies
 - **asmjit**, vendored at `../../asmjit/` (built as a static lib); pinned commit in `../../asmjit.version` (`5fe1940275d04432da841896bac0a66cc2375551`). Built with `ASMJIT_EMBED=1 -DASMJIT_STATIC=1 -DASMJIT_NO_BUILDER -DASMJIT_NO_COMPILER -DASMJIT_NO_UJIT -DASMJIT_NO_DEPRECATED -DASMJIT_NO_FOREIGN`.
