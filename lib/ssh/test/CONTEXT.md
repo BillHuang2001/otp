@@ -57,7 +57,7 @@ Installed into the release as `$(RELEASE_PATH)/ssh_test` (`release_tests_spec` i
 | `ssh_agent_SUITE.erl`, `ssh_agent_mock_server.erl`, `ssh_engine_SUITE.erl`, `ssh_sup_SUITE.erl`, `ssh_dbg_SUITE.erl`, `ssh_chan_behaviours_SUITE.erl` | ssh-agent, key engines, supervisors, debug tracing, channel behaviours. |
 | `ssh_to_openssh_SUITE.erl`, `ssh_compat_SUITE.erl` | OpenSSH/docker interop (external deps). |
 | `ssh_bench_SUITE.erl`, `ssh_collect_labmachine_info_SUITE.erl`, `ssh_upgrade_SUITE.erl` | Benchmark / lab-only / release-upgrade suites. |
-| `property_test/` | QuickCheck (EQC/PropEr) property modules + their key dirs (see that dir's CONTEXT.md). |
+| `property_test/` | QuickCheck (EQC/PropEr) property modules + their key dirs (see `property_test/README`). |
 | `ssh_test_lib.erl`, `ssh_test_lib.hrl` | Main test helper: daemon/connect/exec/shell helpers, key-cb helpers, logging helpers, macros. |
 | `ssh_trpt_test_lib.erl`, `ssh_echo_server.erl`, `ssh_bench_dev_null.erl`, `ssh_peername_sockname_server.erl`, `ssh_test_cli.erl`, `ssh_relay.erl` | Support: transport-level test scripting, echo/null/peername channel servers, CLI-driven channel, TCP relay. |
 | `ssh_key_cb*.erl`, `ssh_algorithms_key_cb.erl` | In-memory client/server key callbacks used by various suites. |
