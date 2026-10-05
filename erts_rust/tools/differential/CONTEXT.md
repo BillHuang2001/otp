@@ -50,7 +50,7 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 ### Library (`src/lib.rs`) — the public API `cargo test` asserts against
 - `error` — `Error` (`Usage`/`Env`/`Io`, all → exit `2`), `Result<T>`.
   Tool-level errors are host-tool errors; BEAM exceptions are *observed **data*** (never the harness's own failure mode), so `beam_common::BeamError` does not model this crate's failures.
-- `cli` — `Command` enum (`Run{case_id,…}`, `Compare{expr,pa,…}`, `Suite{strict,…}`, `List{…}`, `Help{…}`), `parse(args)`, `usage(topic)`.
+- `cli` — `Command` enum (`Run{case_id,…}`, `Compare{expr,pa,…}`, `Suite{strict,…}`, `List{by_contract,json,out}`, `Help{…}`), `parse(args)`, `usage(topic)`.
 - `runtime` — `UNSUPPORTED_EXIT_CODE` (`3`), `RuntimeId::{Oracle,Rust}`, `RuntimeSource::{Env,Path,WorkspaceDefault}`, `RuntimeSpec{id,program,source}`, `Observation{runtime,program,argv,stdout,stderr,exit_code}`, `resolve_oracle()`, `resolve_rust() -> Ok(Option<RuntimeSpec>)`, `eval_argv(expr,extra)`, `run(spec,argv)`.
 - `module_build` — `MISSING_ERLC_REASON`, `resolve_erlc() -> Ok(Option<PathBuf>)`, `resolve_erlc_from(erlc,path)`, `CompiledModule{dir,beam}` (temp dir removed on drop), `compile(erlc,source,module)`.
 - `compare` — `Observables::{All,StdoutAndExit}`, `SideResult::{Observed(Observation),Unsupported{reason}}`, `FieldDiff{field,oracle,rust}`, `GoldenCheck{matched,diffs}`, `Verdict::{Agree,Mismatch,Unsupported,Skipped}`, `compare_observations`, `compare_observations_with(o,r,observables)`, `verdict`, `verdict_with(o,r,golden,observables)`, `check_golden(&Observation,&Golden) -> GoldenCheck`.
