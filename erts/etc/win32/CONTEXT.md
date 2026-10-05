@@ -63,7 +63,7 @@ Sibling top-level areas: `../../` (ERTS as a whole), `../../../lib/` (OTP applic
 - **`erlexec` is a DLL on Windows**: it lets one launcher implementation be shared by `erl.exe`/`werl.exe` and be invoked in-process; `win_erlexec.c` either loads the emulator DLL (`ERL_EMULATOR_DLL`, `load_win_beam_dll` → `erl_start`) or, when there is no console, re-spawns itself detached with `ERL_CONSOLE_MODE=detached`.
 - **`werl.exe` is not compiled**: `Install.c` creates it as a link to `erl.exe` (or copies it when the link cannot be created).
 - **`erl.ini` is not installed**: the installed tree is meant to be relocatable, so `erl.exe` deduces the erts directory when the INI file is missing.
-- **`verts/` resources are shared fragments**: `beam.rc` is `#include`d rather than duplicated so the emulator and the launcher share icons; icons for Explorer/installer use are also released under `usr/lib/icons`.
+- **Resources are shared fragments**: `beam.rc` is `#include`d rather than duplicated so the emulator and the launcher share icons; icons for Explorer/installer use are also released under `usr/lib/icons`.
 - **`port_entry.c` overrides the CRT entry point** (`-entry:erl_port_entry`) rather than wrapping `main`, so port programs survive logoff/shutdown when hosted by a service.
 - **Virtualisation is switched off centrally**: the `AsInvoker` trust info is injected by the linker shims (and provided as `manifest.xml`), so every OTP binary gets consistent UAC behaviour.
 
