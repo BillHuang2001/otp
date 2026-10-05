@@ -44,7 +44,7 @@ The mechanism is selected by `../wxapi.conf`, not by the file:
    - A chunk may be an empty/comment-only stub to suppress code (e.g. `wxListCtrl_new_2` in `wxListCtrl.c_src` emits only `// skipped ~s`).
    - Exports come from `<<EXPORT:ChunkName foo/1, bar/2 ChunkName:EXPORT>>` in the `.erl`; if the `.erl` file is absent the generator derives the export/deprecation list from the XML instead.
    - A `<Class>_class` chunk in the `.c_src` replaces the generated derived `E<Class>` C++ class (emitted into `../c_src/gen/wxe_derived_dest.h`); per-method chunks land in `../c_src/gen/wxe_wrapper_<N>.cpp`.
-   - `wx_misc.erl` is a special case: `../wx_gen_erl.erl` appends it verbatim to the generated static module (it is not chunked, because the static module has no class to key chunks by).
+   - `wx_misc.erl` is a special case: `../wx_gen_erl.erl` appends it verbatim to the generated static module — the functions it adds (`mSWSetEmulationLevel/1,2`) are listed neither in `../wxapi.conf` nor in the doxygen XML, so there is no method to key a chunk by.
 
 ## Constraints
 - These files are hand-maintained — never regenerate or overwrite them; the generated counterparts (`../src/gen/*.erl`, `../c_src/gen/*`, `../wx_xml/*`) are what get overwritten.
