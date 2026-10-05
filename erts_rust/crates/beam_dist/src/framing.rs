@@ -6,7 +6,7 @@
 //! length beyond the negotiated ceiling is a `BeamError::SystemLimit` (never a
 //! blind allocation).
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 use crate::transport::{Read, Write};
 
@@ -50,27 +50,57 @@ impl PacketHeaderSize {
 /// `BeamError::SystemLimit`.
 pub const MAX_PACKET_BODY: usize = u32::MAX as usize;
 
+/// The largest body a length prefix of `hdr` can describe.
+///
+/// For [`PacketHeaderSize::Two`] the branch is *defensive/symmetry only*: a
+/// `u16` length can never exceed `0xffff`, so it never fires. It is kept so the
+/// ceiling rule is stated uniformly for both header widths.
+fn ceiling(hdr: PacketHeaderSize) -> usize {
+    match hdr {
+        PacketHeaderSize::Two => 0xffff,
+        PacketHeaderSize::Four => MAX_PACKET_BODY,
+    }
+}
+
 /// Reads a length prefix, rejecting an advertised length beyond the ceiling of
 /// `hdr` with `BeamError::SystemLimit`.
 pub fn read_length<R: Read>(r: &mut R, hdr: PacketHeaderSize) -> Result<usize> {
-    todo!("M1")
+    let len = hdr.read(r)?;
+    if len > ceiling(hdr) {
+        return Err(BeamError::SystemLimit);
+    }
+    Ok(len)
 }
 
 /// Reads a length-framed packet body.
 ///
 /// A zero-length packet is a **tick** and yields an empty `Vec`.
 pub fn read_packet<R: Read>(r: &mut R, hdr: PacketHeaderSize) -> Result<Vec<u8>> {
-    todo!("M1")
+    let len = read_length(r, hdr)?;
+    if len == 0 {
+        // A zero-length packet is a tick: return an empty body, never allocate.
+        return Ok(Vec::new());
+    }
+    // `len` is validated against the ceiling above, so this allocation is bounded.
+    let mut body = vec![0u8; len];
+    r.read_exact(&mut body)?;
+    Ok(body)
 }
 
 /// Writes `body` with its length prefix.
 pub fn write_packet<W: Write>(w: &mut W, hdr: PacketHeaderSize, body: &[u8]) -> Result<()> {
-    todo!("M1")
+    // Reject an oversized body rather than silently truncating the length
+    // prefix (`len as u16` would wrap).
+    if body.len() > ceiling(hdr) {
+        return Err(BeamError::SystemLimit);
+    }
+    hdr.write(w, body.len())?;
+    w.write_all(body)
 }
 
 /// Writes a tick: a length prefix of `0` (a zero-length packet).
 pub fn write_tick<W: Write>(w: &mut W, hdr: PacketHeaderSize) -> Result<()> {
-    todo!("M1")
+    hdr.write(w, 0)
 }
 
 /// Whether `body` is a tick (an empty packet).
