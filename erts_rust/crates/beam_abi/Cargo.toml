@@ -1,0 +1,14 @@
+[package]
+name = "beam_abi"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Layout-frozen NIF (enif_*) and driver (driver_*/erl_drv_*) C ABI declarations."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+libc.workspace = true
+
+[lints]
+workspace = true

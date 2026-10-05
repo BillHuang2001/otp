@@ -1,0 +1,19 @@
+[package]
+name = "beam_engine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Typed block IR, direct-threaded interpreter and the BeamAsm/Cranelift JIT tiers."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_loader = { path = "../beam_loader" }
+libc.workspace = true
+cranelift-codegen.workspace = true
+cranelift-module.workspace = true
+cranelift-jit.workspace = true
+cranelift-frontend.workspace = true
+
+[lints]
+workspace = true

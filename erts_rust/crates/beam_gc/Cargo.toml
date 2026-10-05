@@ -1,0 +1,15 @@
+[package]
+name = "beam_gc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Per-process generational semi-space copying GC, MSO sweep and heap sizing."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_alloc = { path = "../beam_alloc" }
+libc.workspace = true
+
+[lints]
+workspace = true

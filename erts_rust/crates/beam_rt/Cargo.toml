@@ -1,0 +1,28 @@
+[package]
+name = "beam_rt"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Rust ERTS runtime binary: boot sequence, preloaded modules, CLI flags and system_info."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_alloc = { path = "../beam_alloc" }
+beam_codec = { path = "../beam_codec" }
+beam_dist = { path = "../beam_dist" }
+beam_abi = { path = "../beam_abi" }
+beam_loader = { path = "../beam_loader" }
+beam_engine = { path = "../beam_engine" }
+beam_gc = { path = "../beam_gc" }
+beam_message = { path = "../beam_message" }
+beam_process = { path = "../beam_process" }
+beam_bifs = { path = "../beam_bifs" }
+beam_ets = { path = "../beam_ets" }
+beam_io = { path = "../beam_io" }
+libc.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

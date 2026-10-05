@@ -1,0 +1,18 @@
+[package]
+name = "beam_process"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Processes, scheduler, run queues, thread progress and signal handling."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_alloc = { path = "../beam_alloc" }
+beam_gc = { path = "../beam_gc" }
+beam_message = { path = "../beam_message" }
+libc.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

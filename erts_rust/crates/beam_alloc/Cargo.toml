@@ -1,0 +1,15 @@
+[package]
+name = "beam_alloc"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Allocator layer (erts_alloc replacement): carriers, arenas and the per-process heap bump allocator."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+libc.workspace = true
+parking_lot.workspace = true
+
+[lints]
+workspace = true

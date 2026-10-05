@@ -37,6 +37,10 @@ license = "Apache-2.0"
 repository = "https://github.com/erlang/otp"
 authors = ["Erlang/OTP Rust rewrite"]
 
+[workspace.lints.rust]
+# Shared lint baseline for every workspace member (opt in via `[lints] workspace = true`).
+unsafe_op_in_unsafe_fn = "warn"
+
 [workspace.dependencies]
 # Intra-workspace crates (path deps are declared per-crate; these alias common ones).
 beam_common = { path = "crates/beam_common" }
@@ -58,7 +62,7 @@ beam_rt = { path = "crates/beam_rt" }
 # External (Apache-2.0 / MIT preferred; see Part I §G.6 licensing).
 libc = "0.2"
 mio = { version = "1", features = ["os-poll", "os-ext"] }
-cranelift-codegen = { version = "0.116", default-features = false, features = ["x86", "arm64", "x64", "arm64", "std"] }
+cranelift-codegen = { version = "0.116", default-features = false, features = ["x86", "arm64", "std"] }
 cranelift-module = "0.116"
 cranelift-jit = "0.116"
 cranelift-frontend = "0.116"

@@ -1,0 +1,17 @@
+[package]
+name = "differential"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Differential-test harness comparing Rust ERTS against the real system ERTS."
+
+[dependencies]
+beam_common = { path = "../../crates/beam_common" }
+beam_term = { path = "../../crates/beam_term" }
+beam_codec = { path = "../../crates/beam_codec" }
+libc.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true

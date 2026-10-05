@@ -1,0 +1,16 @@
+[package]
+name = "beam_io"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Poller/reactor (epoll/kqueue/io_uring), ports and built-in drivers."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_process = { path = "../beam_process" }
+libc.workspace = true
+mio.workspace = true
+
+[lints]
+workspace = true

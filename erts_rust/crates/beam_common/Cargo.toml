@@ -1,0 +1,12 @@
+[package]
+name = "beam_common"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Shared error/result types, configuration, logging and version constants for the Rust ERTS rewrite."
+
+[dependencies]
+libc.workspace = true
+
+[lints]
+workspace = true

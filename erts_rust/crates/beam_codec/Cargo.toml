@@ -1,0 +1,15 @@
+[package]
+name = "beam_codec"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "External Term Format (ETF) encode/decode for the Rust ERTS rewrite."
+
+[dependencies]
+beam_common = { path = "../beam_common" }
+beam_term = { path = "../beam_term" }
+beam_alloc = { path = "../beam_alloc" }
+libc.workspace = true
+
+[lints]
+workspace = true

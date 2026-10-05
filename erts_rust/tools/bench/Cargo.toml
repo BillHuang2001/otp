@@ -1,0 +1,14 @@
+[package]
+name = "bench"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+description = "Benchmark driver for the external target projects plus a system-ERTS baseline."
+
+[dependencies]
+beam_common = { path = "../../crates/beam_common" }
+serde.workspace = true
+serde_json.workspace = true
+
+[lints]
+workspace = true
