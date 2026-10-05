@@ -5,6 +5,15 @@
 //! `beam_loader` and never on the Stage-5 runtime core (`../CONTEXT.md`, "The seam
 //! types"). `beam_rt` supplies the concrete implementation; [`MinimalContext`] is
 //! the test/embedding implementation (unbounded heap plus a pluggable BIF hook).
+//!
+//! The same trait also exposes the two hooks the term-building layer
+//! ([`crate::terms`]) and the external-call path need: [`alloc_words`] hands out a
+//! stable pointer to raw heap words, and [`apply`] is the general
+//! external-function dispatch entry point. Both are added with default bodies, so
+//! an existing implementor keeps compiling unchanged.
+//!
+//! [`alloc_words`]: ExecutionContext::alloc_words
+//! [`apply`]: ExecutionContext::apply
 
 use beam_common::Result;
 use beam_term::Eterm;
@@ -41,6 +50,32 @@ pub trait ExecutionContext {
     fn heap_available(&self) -> usize {
         usize::MAX
     }
+
+    /// Allocate `n` **uninitialized** heap words and return a pointer to them.
+    ///
+    /// The caller (`crate::terms`) may write boxed terms into the returned block
+    /// and read them back. The pointer is valid **until the next
+    /// [`ensure_heap`](ExecutionContext::ensure_heap) call / GC**, which may move
+    /// or reclaim the block; it must never be retained across such a call. This
+    /// mirrors the C heap-pointer convention (`HAlloc`/`heap_top`): the heap is
+    /// owned by the context and the engine only borrows raw storage.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`]: a context with
+    /// no exposed heap (only `call_bif`/`ensure_heap`) cannot serve raw words.
+    /// [`MinimalContext`] and the production `beam_rt` context override it.
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        let _ = n;
+        Err(crate::error::unsupported("alloc_words"))
+    }
+
+    /// Dispatch the external-function / BIF application `module:function/arity`.
+    ///
+    /// This is the general `apply`/`call_ext` hook; the default delegates to
+    /// [`call_bif`](ExecutionContext::call_bif) (the BIF dispatch path), so a
+    /// context that only implements the BIF surface needs no extra work.
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+        self.call_bif(module, function, arity, args)
+    }
 }
 
 /// A BIF hook: maps `(module, function, arity, args)` to a result.
@@ -49,10 +84,21 @@ pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>;
 /// Minimal context: an unbounded heap plus a pluggable BIF hook.
 ///
 /// Used by tests and embeddings. [`MinimalContext::ensure_heap`] is a no-op (the
-/// heap is treated as unbounded), and [`MinimalContext::new`] installs a default
-/// hook that rejects every BIF with [`crate::error::unsupported`].
+/// heap is treated as unbounded), [`MinimalContext::new`] installs a default hook
+/// that rejects every BIF with [`crate::error::unsupported`], and
+/// [`MinimalContext::alloc_words`](ExecutionContext::alloc_words) hands out words
+/// from a pointer-stable arena (see the field docs).
 pub struct MinimalContext {
     hook: BifHook,
+    /// A pointer-stable arena backing [`ExecutionContext::alloc_words`].
+    ///
+    /// Each allocation is its own `Box<[Eterm]>`: growing the outer `Vec` moves
+    /// the *box handles*, never the boxes' buffers, so a pointer handed out by
+    /// `alloc_words` stays valid for the lifetime of the context (in this context
+    /// `ensure_heap` never moves anything). The boxes are never freed before the
+    /// context is dropped, which is exactly the "valid until the next
+    /// `ensure_heap`" stability contract the trait documents.
+    arena: Vec<Box<[Eterm]>>,
 }
 
 impl MinimalContext {
@@ -67,7 +113,10 @@ impl MinimalContext {
 
     /// A context with the given BIF hook.
     pub fn with_bif_hook(hook: BifHook) -> MinimalContext {
-        MinimalContext { hook }
+        MinimalContext {
+            hook,
+            arena: Vec::new(),
+        }
     }
 
     /// Replace the BIF hook.
@@ -108,6 +157,23 @@ impl ExecutionContext for MinimalContext {
     fn heap_available(&self) -> usize {
         usize::MAX
     }
+
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
+        // `vec![..; n]` initialises every word; a zero-length box still yields a
+        // dangling-but-non-null, well-aligned pointer (the documented result of a
+        // zero-word request). Taking `as_mut_ptr` after boxing is safe Rust.
+        let mut block = vec![Eterm::default(); n].into_boxed_slice();
+        let ptr = block.as_mut_ptr();
+        // Keep the buffer alive and immovable for the lifetime of the context.
+        self.arena.push(block);
+        Ok(ptr)
+    }
+
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
+        // No separate external-call machinery in the minimal context: the BIF hook
+        // is the dispatch path.
+        self.call_bif(module, function, arity, args)
+    }
 }
 
 #[cfg(test)]
@@ -145,5 +211,79 @@ mod tests {
             Err(beam_common::BeamError::BadArg)
         }));
         assert!(ctx.call_bif("x", "y", 0, &[]).is_err());
+    }
+
+    /// A context that implements only the two required trait methods, so the
+    /// defaulted `alloc_words`/`apply` bodies are exercised.
+    struct OnlyRequired;
+
+    impl ExecutionContext for OnlyRequired {
+        fn call_bif(
+            &mut self,
+            _module: &str,
+            _function: &str,
+            _arity: u32,
+            _args: &[Eterm],
+        ) -> Result<Eterm> {
+            Err(beam_common::BeamError::BadArg)
+        }
+
+        fn ensure_heap(
+            &mut self,
+            _heap_need: u32,
+            _live: u32,
+            _x_regs: &mut [Eterm],
+            _stack: &mut [Eterm],
+        ) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn default_alloc_words_is_a_typed_unsupported_error() {
+        // A context with no exposed heap cannot serve raw words.
+        assert!(OnlyRequired.alloc_words(8).is_err());
+    }
+
+    #[test]
+    fn default_apply_forwards_to_call_bif() {
+        // The default `apply` delegates to `call_bif`; here `call_bif` always
+        // fails, and the failure must surface identically through `apply`.
+        assert!(OnlyRequired.apply("erlang", "self", 0, &[]).is_err());
+    }
+
+    #[test]
+    fn minimal_context_alloc_words_is_ok_and_non_null() {
+        let mut ctx = MinimalContext::new();
+        let ptr = ctx.alloc_words(4).expect("arena allocates");
+        assert!(!ptr.is_null(), "a non-empty block has a non-null pointer");
+    }
+
+    #[test]
+    fn minimal_context_zero_word_allocation_is_non_null() {
+        // Documented: a zero-word request may return a dangling, but non-null,
+        // well-aligned pointer.
+        let mut ctx = MinimalContext::new();
+        let ptr = ctx.alloc_words(0).expect("arena allocates an empty block");
+        assert!(!ptr.is_null());
+        assert_eq!(ptr as usize % core::mem::align_of::<Eterm>(), 0);
+    }
+
+    #[test]
+    fn minimal_context_allocations_do_not_alias() {
+        let mut ctx = MinimalContext::new();
+        let a = ctx.alloc_words(4).expect("first alloc");
+        let b = ctx.alloc_words(4).expect("second alloc");
+        assert!(!a.is_null() && !b.is_null());
+        assert_ne!(a, b, "distinct allocations own distinct storage");
+    }
+
+    #[test]
+    fn minimal_context_apply_forwards_to_the_hook() {
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(|m, f, a, _args| {
+            assert_eq!((m, f, a), ("lists", "map", 2));
+            Ok(Eterm::nil())
+        }));
+        assert_eq!(ctx.apply("lists", "map", 2, &[]).unwrap(), Eterm::nil());
     }
 }

@@ -26,10 +26,11 @@
 //! funs, maps, bitstrings, in-VM exceptions, GC) are unchanged from the design in
 //! this crate's `CONTEXT.md` and each returns a typed [`beam_common::BeamError`].
 //!
-//! The crate is `#![deny(unsafe_code)]`; the **only** exception is the private
-//! `predicates` module, which wraps the `beam_term` boxed-term predicates
-//! (`unsafe fn` because they dereference a header word) behind SAFETY-annotated
-//! helpers.
+//! The crate is `#![deny(unsafe_code)]`; the **only** exceptions are two
+//! SAFETY-annotated modules: the private `predicates` module, which wraps the
+//! `beam_term` boxed-term predicates (`unsafe fn` because they dereference a
+//! header word), and the `terms` module, which is the crate's single point of
+//! raw-heap construction/reading behind the [`ExecutionContext::alloc_words`] seam.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -41,6 +42,8 @@ pub mod machine;
 pub mod operand;
 #[allow(unsafe_code)]
 mod predicates;
+#[allow(unsafe_code)]
+pub mod terms;
 pub use context::{ExecutionContext, MinimalContext};
 pub use error::{bad_register, unknown_label, unsupported};
 pub use jit::{available_tiers, JitBackend};
