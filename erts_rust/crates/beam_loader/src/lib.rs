@@ -18,12 +18,19 @@
 //!
 //! ## Status
 //!
-//! This is the **API skeleton**: every public item of the frozen surface is
-//! declared and documented, but the fallible functions that need real logic
-//! return `Err(BeamError::BadArg)` and are marked with
-//! `// TODO(beam_loader-impl):`. Search that marker for the implementation
-//! checklist. The container cursor is `beam_codec::Reader` (the ETF codec's
-//! bounds-checked big-endian reader) — do not write a second one.
+//! The crate is **implemented**: [`load`] / [`load_file`] run the whole pipeline —
+//! `container::parse` → `chunk::parse` → `decode::decode_stream` → `lower::build_module`
+//! — over the frozen IR of [`ir`]. The container/chunk layer ([`container`], [`chunk`])
+//! validates the `FOR1` framing and decodes every known chunk, [`decode`] turns the
+//! `Code` stream into typed [`decode::RawInstr`]s, and [`lower`] groups them into
+//! functions and basic blocks. Coverage is the Milestone-1 opcode subset (everything
+//! else round-trips losslessly as [`ir::Instr::Generic`]); the intentional
+//! Milestone-1 gaps (literal decoding, fun descriptors, preloaded/positional atoms)
+//! are listed under "Known Issues" in the crate `CONTEXT.md`, which is the
+//! authoritative description of this crate's behaviour and frozen public API.
+//!
+//! The container cursor is `beam_codec::Reader` (the ETF codec's bounds-checked
+//! big-endian reader) — there is no second cursor and no `unsafe` in this crate.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 

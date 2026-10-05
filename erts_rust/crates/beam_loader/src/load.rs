@@ -8,7 +8,8 @@ use std::path::Path;
 
 use beam_common::Result;
 
-use crate::ir::Module;
+use crate::error::bad_file;
+use crate::ir::{Atom, Module};
 
 /// Loads a `.beam` image from memory into the IR [`Module`].
 ///
@@ -17,12 +18,34 @@ use crate::ir::Module;
 ///
 /// A malformed or truncated image yields `BeamError::BadArg`; an over-large
 /// size/arity/count bound yields `BeamError::SystemLimit`. Never panics.
-// TODO(beam_loader-impl): wire the pipeline together — `container::parse` →
-// TODO(beam_loader-impl): `chunk::parse` → `decode::decode_stream` →
-// TODO(beam_loader-impl): `lower::build_module` — using the interning atom table.
 pub fn load(bytes: &[u8]) -> Result<Module> {
-    let _ = bytes;
-    Err(beam_common::BeamError::BadArg)
+    let container = crate::container::parse(bytes)?;
+    let chunks = crate::chunk::parse(&container)?;
+
+    // `atoms[0]` is the NIL placeholder and `atoms[1]` the module name; an image
+    // without a module name is not loadable.
+    if chunks.atoms.len() < 2 {
+        return Err(bad_file("atom table has no module name"));
+    }
+
+    // The atom map the decoder resolves `a` operands against. It is interned here
+    // (not in `build_module`) because the decoder needs it first; `build_module`
+    // re-interns the same names, which is idempotent and yields the same atoms.
+    let mut atom_table = beam_term::AtomTable::new();
+    let mut atoms: Vec<Atom> = Vec::with_capacity(chunks.atoms.len());
+    atoms.push(Atom::MAX);
+    for name in &chunks.atoms[1..] {
+        atoms.push(atom_table.intern(name));
+    }
+
+    let raw = crate::decode::decode_stream(
+        chunks.code_stream,
+        &atoms,
+        &chunks.code_version,
+        &chunks.types,
+    )?;
+
+    crate::lower::build_module(&chunks, &raw, atom_table)
 }
 
 /// Loads a `.beam` image from a file path into the IR [`Module`].
