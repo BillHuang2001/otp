@@ -352,3 +352,6 @@ JAVADOC-GENERATED
 /lib/xmerl/src/xmerl_xpath_parse.erl
 /lib/xmerl/test/xmerl_test.erl
 
+
+# Erlang crash dumps (written to the cwd of a crashing emulator, e.g. during oracle runs).
+erl_crash.dump
