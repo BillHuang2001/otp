@@ -48,7 +48,8 @@ This is the frozen public-API shape dependents design against; keep it stable.
   process/stack state, trap/signal handling) so the engine depends only on `beam_loader` and the
   concrete context is supplied by `beam_rt` (keeps the Stage-1/Stage-5 DAG acyclic).
 - `beam_ets` → `Table` handle + set/ordered_set/hash ops.
-- `beam_gc` → per-process copying collector entry (`gc`/`collect`) + MSO refcount interface.
+- `beam_gc` → per-process copying collector entry (`gc`/`collect`) + `OffHeap` refcount interface
+  (`OffHeapEntry::{Mso, Binary}`); re-exports `beam_alloc::RefCount`.
 - `beam_message` → `copy_struct` (term movement across heaps) + send/receive envelope.
 - `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue, signals/links/monitors.
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface.
