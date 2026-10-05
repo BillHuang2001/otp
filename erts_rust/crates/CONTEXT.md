@@ -33,7 +33,12 @@ Inherited and refined from `../CONTEXT.md` — do not restate, obey:
 
 ### The seam types (the inter-crate interface each crate MUST expose for its dependents)
 This is the frozen public-API shape dependents design against; keep it stable.
-- `beam_alloc` → `Allocator`/`AllocRef` (carrier-backed), `Heap`/bump process-heap, size classes.
+- `beam_term` → frozen term layout; `map` (flat-map ↔ HAMT/CHAMP builder: `write_map`/`map_words_capacity`/
+  `map_size`/`map_get`/`map_pairs`/`map_put`/`map_remove`), `bitstring` (`write_heap_bits`/`write_binary`/
+  `write_sub_bits`/public `bitstring_parts`/`bit_at`/`float_bits`/`float_value`), `refc` (`BinRef`/`ErlSubBits`
+  layout + accessors), plus `thing`/`compare`/`hashing`/`size`.
+- `beam_alloc` → `Allocator`/`AllocRef` (carrier-backed), `Heap`/bump process-heap, size classes; `RefCount`
+  (the single `erts_refc_*` primitive); `RefcBinary` (off-heap refcounted large-binary payload).
 - `beam_abi` → `#[repr(C)]` NIF (`ERL_NIF_TERM`, `ErlNifEnv`, `ErlNifEntry`, `enif_*` fn table) and
   driver (`ErlDrvEntry`, `ErlDrvBinary`, `erl_drv_*`) types + `Eterm ↔ ERL_NIF_TERM` transmute.
 - `beam_codec` → `Encoder`/`Decoder` (ETF), tag constants, `VERSION_MAGIC = 131`, compression.
