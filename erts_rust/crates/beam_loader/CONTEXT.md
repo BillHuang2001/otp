@@ -123,9 +123,12 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
   i32 num_free, i32 old_uniq }` (24-byte entries). Parsed into `Module`-level fun descriptors is M1-out;
   framing is validated and the raw entries retained (documented gap).
 - **`Line`** — `u32 version` (must be 0, else the chunk is ignored), `u32 flags`, `u32 instr_count`,
-  `u32 item_count`, `u32 name_count`; then `item_count-1` tagged items (`TAG_a <name_index>` /
-  `TAG_i <line>`); then `name_count` × `{ i16 len, len bytes UTF-8 }`. `items[0]` is the undefined
-  location `{0,0}`; `files[0]` is synthesized as `<module>.erl` (`beam_file.c:443-602`).
+  `u32 item_count`, `u32 name_count`; then a run of packed tagged items, then `name_count` ×
+  `{ i16 len, len bytes UTF-8 }`. `item_count` counts **only** the `TAG_i` ("line") items: the loop reads
+  tagged items until `item_count` of them have been `TAG_i`; a `TAG_a <name_index>` sets the current file
+  index and is consumed *in addition* (not counted), a `TAG_i <line>` emits a
+  `LineEntry { file, line }` (`beam_file.c:443-602`). `items[0]` is the undefined location `{0,0}`;
+  `files[0]` is synthesized as `<module>.erl`.
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
   `entries[0]` = "any"), then per entry `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
