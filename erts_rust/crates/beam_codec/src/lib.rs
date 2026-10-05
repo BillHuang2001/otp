@@ -22,19 +22,10 @@
 //! single deviation is mechanical and auditable: [`term`] is the one module
 //! carrying `#[allow(unsafe_code)]` under the crate-wide `#![deny(unsafe_code)]`.
 //!
-//! Every public item here is a **stub**: the declarations, doc comments and
-//! constant values are final, the bodies are not yet implemented.
-//!
 //! Downstream code can `use beam_codec::prelude::*;`.
 
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
-
-// Skeleton stage only: every public body below is `unimplemented!()`, so the
-// declared parameters and the internal struct fields are intentionally unused
-// until the codec logic lands. Remove these two allows together with the stubs.
-#![allow(unused_variables)]
-#![allow(dead_code)]
 
 pub mod atom_cache;
 pub mod decode;

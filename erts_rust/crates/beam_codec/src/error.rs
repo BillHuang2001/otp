@@ -45,13 +45,11 @@ pub fn is_unsupported(err: &BeamError) -> bool {
 }
 
 /// The error for malformed, truncated or otherwise invalid wire input.
-#[allow(dead_code)]
 pub(crate) fn bad_arg() -> BeamError {
     BeamError::BadArg
 }
 
 /// The error for input that exceeds a hard wire or runtime bound.
-#[allow(dead_code)]
 pub(crate) fn system_limit() -> BeamError {
     BeamError::SystemLimit
 }

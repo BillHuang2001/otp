@@ -19,15 +19,19 @@ Ground truth = legacy C `../../erts/emulator/beam/external.c` (`erts_encode_ext`
 never modify it.
 
 ## Status
-**Scaffolded — declarations only.** Every module below exists with the frozen
-public API, doc comments and `unimplemented!()` bodies. The two exceptions are in
-`error.rs`, where `unsupported`/`is_unsupported` and the `BadArg`/`SystemLimit`
-constructor helpers are implemented because their behaviour is fully specified and
-`is_unsupported` must be meaningful. `src/lib.rs` carries a documented, temporary
-`#![allow(unused_variables)]` + `#![allow(dead_code)]` pair to keep the skeleton
-warning-free — remove both together with the stubs. The `tests/` files hold only
-their written plans (no test functions yet). `Tag::from_byte`/`as_byte`/`name`/
-`covered` and every wire/term body are still to be implemented.
+**Implemented (Milestone 1).** Every module carries real bodies: the wire-frozen
+`tag` constants and the `Tag` enum (`from_byte`/`as_byte`/`name`/`covered`), the
+`reader`/`writer` cursors, the distribution `atom_cache`, the `encode`/`decode`
+loops, the `term` boxed-sub-term layer (float/bignum/flatmap/external identifiers)
+and the `error` constructors. The required core tag set round-trips (see "Tag
+coverage" below); the documented unsupported set (binaries/bit-binary, `COMPRESSED`,
+funs, records, `V4_PORT`, `LOCAL`, the distribution header, maps > 32 pairs) returns
+`error::unsupported` rather than a wrong term. `src/lib.rs` carries only the
+permanent lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]` and the single
+`#[allow(unsafe_code)] mod term;`. In-module `#[cfg(test)]` tests cover the wire,
+term and codec layers; `tests/roundtrip.rs` and `tests/ground_truth.rs` currently
+hold only their written plans (the exhaustive corpus and the oracle vectors) — no
+test functions yet.
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_codec::prelude::*`.
@@ -106,11 +110,15 @@ encoding.
   (`erl_term.h:479` `HEADER_FLONUM = make_header(1, FLOAT_SUBTAG)`, `PUT_DOUBLE` `erl_term.h:506`).
 - Bignum: `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1), d0 … d(n-1)]` (sign in the
   header's `_BIG_SIGN_BIT`), digits little-endian base-256; root = `make_boxed(hp)`
-  (`erl_term.h:452-471`; `BIG_ARITY_MAX = (1<<16)-1` on 64-bit).
-- Flatmap (≤ 32 pairs): `[arityval(n), k0…k(n-1), MAP_HEADER_FLATMAP, n, keys, v0…v(n-1)]`, where
-  `keys = make_tuple(hp)` (the *keys tuple* is emitted **before** the head), the flatmap head is at
-  word `1+n`, `MAP_HEADER_FLATMAP = 0x12C` (`_make_header(4, MAP_SUBTAG)`), the `size` field is the
-  **raw** integer `n`, and the root is `make_boxed(hp + 1 + n)`; `n == 0` ⇒ 3 words
+  (`erl_term.h:452-471`; `BIG_ARITY_MAX = (1<<16)-1` on 64-bit). The term layer packs the magnitude
+  bytes contiguously into words rather than one `ErtsDigit` per word — see "Known Issues".
+- Flatmap (≤ 32 pairs): the block is
+  `[arityval(n), k0…k(n-1), MAP_HEADER_FLATMAP, n, keys, v0…v(n-1)]`, where `keys = make_tuple(hp)`
+  is the keys tuple (emitted **before** the flatmap head), the flatmap head sits at word `1+n`, and
+  the root is `make_boxed(hp + 1 + n)`. Relative to the flatmap **head** pointer the fields are
+  `[head, size, keys, values…]` — keys at offset `+2` and values at `+3`, which is where
+  `flatmap_parts` reads them. `MAP_HEADER_FLATMAP = 0x12C` (`_make_header(4, MAP_SUBTAG)`), the
+  `size` field is the **raw** integer `n`; `n == 0` ⇒ 3 words
   `[MAP_HEADER_FLATMAP, 0, tuple0()]` (`erl_map.h:181-199`, `erl_map.c:673-700`).
 - Identifiers: `make_external_{pid,port,ref}_header()` = `make_header(size-1, <subtuel>)` +
   `[node atom, …]`; root = `make_boxed(hp)`. Read `erl_term.h:1160-1230` (`ExternalThing`) for the
@@ -215,7 +223,14 @@ encoding.
 - Funs (`112`/`113`/`117`), records (`67`), `V4_PORT_EXT` (`120`), `LOCAL_EXT` (`121`) and the
   distribution header (`68`/`78`) are out of M1 scope; `beam_dist` owns the distribution header.
 - Identifiers always decode as *external* things (no local-node identity in the codec yet).
-- `FLOAT_EXT` (99) is decoded via its `%.20e` string form; encode always emits `70` (as
+- **Internal storage of bignums and external-ref ids deviates from the C.** The frozen `term.rs`
+  API returns *borrowed* slices (`big_parts -> &[u8]`, `external_ref_parts -> &[u32]`), so
+  `make_big` stores the magnitude **byte-packed** (contiguous base-256 bytes packed into words, one
+  byte per position) and `make_external_ref` stores its ids as **packed native-endian `u32`**
+  (`ceil(n/2)` words) — unlike the legacy `ErtsDigit`-per-word C layout. Both are internal-only:
+  the header arity still counts the digits/ids (`n = arityval(header) + 1`) so the block is
+  self-describing, and neither affects the wire format.
+- **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode always emits `70` (as
   `term_to_binary` does), so a decode↔encode round-trip of an `99`-encoded float is
   representation-preserving, not byte-identical.
 
@@ -231,8 +246,9 @@ encoding.
   `is_unsupported`, `UNSUPPORTED_REASON`
 - `src/term.rs` → **the only `unsafe` module**: term inspection + boxed sub-term materialization
   (float/bignum/flatmap/external identifiers) pinned to `erl_term.h`
-- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated)
-- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
+- `tests/` → cross-module integration tests; currently plan-only. `tests/ground_truth.rs` =
+  byte-exact `term_to_binary` fixture vectors (oracle-regenerated); `tests/roundtrip.rs` =
+  exhaustive encode→decode round-trips + negative/truncation cases
 - `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values (read-only)
 - `../../erts/emulator/beam/erl_term.h` / `erl_map.h` → term layouts for the boxed sub-terms (read-only)
 - `../../erts/doc/guides/erl_ext_dist.md` → the in-tree external term format specification (read-only)
