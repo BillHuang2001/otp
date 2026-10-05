@@ -40,8 +40,17 @@ pub trait ExecutionContext {
 
     /// Heap words currently available (introspection). Default: unbounded.
     fn heap_available(&self) -> usize { usize::MAX }
-}
-```
+
+    /// Allocate `n` uninitialized heap words and return a stable pointer the caller
+    /// (`terms`) writes boxed terms into. Default: a typed `error::unsupported`.
+    /// Stability: valid only until the next `ensure_heap`/GC (mirrors `HAlloc`/`heap_top`).
+    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> { /* default: unsupported */ }
+
+    /// External-function / BIF application hook (the `apply`/`call_ext` path).
+    /// Default: forwards to `call_bif`.
+    fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>
+        { self.call_bif(module, function, arity, args) }
+}```
 - `MinimalContext` — a concrete context for tests/embeddings: an unbounded heap (`ensure_heap` is a
   no-op) plus a **pluggable BIF hook**
   (`with_bif_hook(f)`, `f: FnMut(&str,&str,u32,&[Eterm]) -> Result<Eterm>`). `MinimalContext::new()`
