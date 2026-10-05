@@ -14,7 +14,7 @@ Tracked files (10 total; `etc/**/*.pem` are committed data, not build output):
 - `Makefile` — trivial build wrapper (see below).
 - `src/make_certs.erl` — 48-line script, `-module(make_certs)`, exports `all/0`; its header states it only *logs* how the example certs were created and that it requires `erl_make_certs` from the test directory.
 
-Consumed by `../src/client_server.erl` line 76, which builds `filename:join([code:lib_dir(ssl), "examples", "certs", "etc"])` and passes `cacertfile`/`certfile`/`keyfile` from `etc/<Role>/` — i.e. the example resolves the released `doc/examples/certs/etc` location, not this source dir.
+Consumed by `../src/client_server.erl` line 76, which builds `filename:join([code:lib_dir(ssl), "examples", "certs", "etc"])` and passes `cacertfile`/`certfile`/`keyfile` from `etc/<Role>/` — that path matches this source-tree directory, but NOT the released location `doc/examples/certs/etc` (see Notes for Agents).
 
 ## Constraints
 - PEM files here are **generated artifacts of a third-party tool run once by hand**; do not hand-edit them, and do not add a build step that regenerates them (`certs/Makefile` deliberately has `TARGET_FILES=` empty and no `MODULES`).
