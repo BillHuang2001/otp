@@ -12,8 +12,9 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::Eterm;
 
+use crate::copy::Copier;
 use crate::policy::HeapPolicy;
-use crate::space::HeapSpace;
+use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
 
 /// Which collection a [`Collector`] ran.
@@ -46,14 +47,20 @@ pub struct Collector {
 impl Collector {
     /// Creates a collector with the given `policy`, using the default allocator.
     pub fn new(policy: HeapPolicy) -> Result<Collector> {
-        let _ = policy;
-        unimplemented!("scaffold")
+        Self::with_allocator(beam_alloc::registry::default_allocator().clone(), policy)
     }
 
     /// Creates a collector with the given `policy`, backed by `alloc`.
     pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<Collector> {
-        let _ = (alloc, policy);
-        unimplemented!("scaffold")
+        let young = HeapSpace::with_allocator(alloc.clone(), policy.initial_young_words)?;
+        let mature = HeapSpace::with_allocator(alloc, policy.initial_mature_words)?;
+        Ok(Collector {
+            policy,
+            young,
+            mature,
+            minor_since_major: 0,
+            stats: GcStats::default(),
+        })
     }
 
     /// The collector's heap-size policy.
@@ -83,26 +90,63 @@ impl Collector {
 
     /// Whether the nursery can no longer satisfy `need_words` more words.
     pub fn should_collect(&self, need_words: usize) -> bool {
-        let _ = need_words;
-        unimplemented!("scaffold")
+        self.young.available_words() < need_words
     }
 
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
-        let _ = roots;
-        unimplemented!("scaffold")
+        let kind = if self.minor_since_major >= self.policy.fullsweep_after
+            || self.mature.available_words() < self.young.used_words()
+        {
+            CollectionKind::Major
+        } else {
+            CollectionKind::Minor
+        };
+        let stats = match kind {
+            CollectionKind::Minor => self.collect_minor(roots)?,
+            CollectionKind::Major => self.collect_major(roots)?,
+        };
+        Ok(Collection { kind, stats })
     }
 
     /// Runs a minor collection: evacuate the nursery's live terms into the mature space.
     pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let _ = roots;
-        unimplemented!("scaffold")
+        let mut from = FromSet::new();
+        from.add(&self.young);
+        // The destination must fit the whole nursery up front (immediate promotion, no
+        // partial-copy rollback); `collect` escalates to a major when it would not.
+        let stats = Copier::new(&from, &mut self.mature).run(roots)?;
+        self.young.reset();
+        self.minor_since_major += 1;
+        self.stats.words_copied += stats.words_copied;
+        self.stats.words_reclaimed += stats.words_reclaimed;
+        self.stats.objects_copied += stats.objects_copied;
+        self.stats.minor_collections += 1;
+        Ok(stats)
     }
 
     /// Runs a major (fullsweep) collection: evacuate young and mature into a fresh space.
     pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
-        let _ = roots;
-        unimplemented!("scaffold")
+        let mut from = FromSet::new();
+        from.add(&self.young);
+        from.add(&self.mature);
+        let live = self.young.used_words() + self.mature.used_words();
+        let size = self
+            .policy
+            .size_after_fullsweep(live, self.policy.need_reserve_words);
+        let alloc = self.young.allocator().clone();
+        // Sized up front so the copy always fits — a collection never leaves the
+        // from-space half-forwarded.
+        let mut fresh = HeapSpace::with_allocator(alloc, size)?;
+        let stats = Copier::new(&from, &mut fresh).run(roots)?;
+        self.mature = fresh; // drops the old mature space
+        self.young.reset();
+        self.minor_since_major = 0;
+        self.stats.words_copied += stats.words_copied;
+        self.stats.words_reclaimed += stats.words_reclaimed;
+        self.stats.objects_copied += stats.objects_copied;
+        self.stats.major_collections += 1;
+        Ok(stats)
     }
 }
