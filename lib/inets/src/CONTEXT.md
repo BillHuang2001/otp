@@ -10,7 +10,7 @@ There is no FTP or TFTP code here — those are separate OTP applications (`lib/
 - All four subdirectories compile into the single shared `lib/inets/ebin/` (`EBIN = ../../ebin`); there is no per-subdirectory ebin.
 - Each subdirectory has a `Makefile` with an explicit `MODULES` list; a new module must be added there AND to the `modules` list of `../src/inets_app/inets.app.src`, or it will not be loaded/installed.
 - Compile flags come from `inets_app/inets.mk` (`INETS_ERL_COMPILE_FLAGS`, the `sys_pre_attributes` parse transform that injects `app_vsn`); include paths are `../../include`, `../inets_app`, `../http_lib`.
-- `src/.gitignore` ignores per-module generated `.depend`/`*_d` dependency files produced by `erlc -M` — build artifacts, never edited by hand.
+- `src/.gitignore` ignores `**/deps/`, the directory each subdirectory `Makefile` writes its generated `erlc -M` dependency file into (`DEPFILE = deps/<subdir>.d`, created by `mkdir -p`) — build artifacts, never edited by hand.
 - Header include-path convention: private headers live next to their modules (`httpc_internal.hrl`, `httpd_internal.hrl`, `http_internal.hrl`); only `httpd.hrl`/`mod_auth.hrl` are exported via `lib/inets/include/`.
 
 ## Notes for Agents
