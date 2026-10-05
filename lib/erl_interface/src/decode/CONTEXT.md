@@ -30,7 +30,7 @@ The inverse direction lives in `../encode/`; the authoritative format is ERTS' `
 | reference (old, `ERL_NEW_REFERENCE_EXT`, `ERL_NEWER_REFERENCE_EXT`) | `decode_ref.c` | `ei_decode_ref` |
 | fun: old closure, new closure, export | `decode_fun.c` | `ei_decode_fun`, `free_fun` |
 | trace token `{Flags,Label,Serial,FromPid,Prev}` | `decode_trace.c` | `ei_decode_trace` |
-| skip any term (uses the decoders above) | `decode_skip.c` | `ei_skip_term`, `ei_skip_term_at` |
+| skip any term (uses the decoders above) | `decode_skip.c` | `ei_skip_term` |
 
 ## Argument and return protocol (as implemented)
 `buf` is a caller-supplied, caller-owned buffer; `*index` is an in/out byte offset into it, normally 1 after `ei_decode_version` has consumed the magic byte.
