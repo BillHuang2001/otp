@@ -188,7 +188,9 @@ mod tests {
         let data = line_bytes(0, 0, 2, 2, 0, &items, &[]);
         let err = parse(&data, "m").unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
-    }    #[test]
+    }
+
+    #[test]
     fn zero_items_yields_only_the_undefined_location() {
         let data = line_bytes(0, 0, 0, 0, 0, &[], &[]);
         let table = parse(&data, "mod").unwrap();
