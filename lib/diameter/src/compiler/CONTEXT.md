@@ -29,7 +29,7 @@ DSL sections the pipeline understands (grammar/scanner are the authority): `@nam
 3. Scan: `diameter_dict_scanner:scan/1` → `{word,L,Name} | {number,L,N} | {Symbol,L} | '$end'`.
 4. Parse: the generated yecc parser produces a nested `[Section | Body]` term.
 5. Semantic model: `diameter_dict_util:make_dict/2` = `reset/2` (apply `name|prefix|inherits` options) → `pass1/1` (explode sections, semantic checks) → `pass2/1` (AVP uniqueness keyed on `{Code,VendorId}`) → `pass3/2` (`command_codes`, `import_inherits`, `import_avps`, `import_groups`, `import_enums`) → `examine/1` (referential sanity) → `make_orddict/1`, the orddict handed to codegen.
-6. Inheritance: `enter` of `pass3` loads each `@inherits` module and calls `Mod:dict()`; this is why `@inherits` creates a BEAM (not erl/hrl) dependency.
+6. Inheritance: `pass3` loads each `@inherits` module and calls `Mod:dict()`; this is why `@inherits` creates a BEAM (not erl/hrl) dependency.
 7. Codegen: `diameter_codegen:from_dict/4` generates per requested mode — `parse` (`.D`, the `[?VERSION|ParseD]` term), `forms` (`.F`, preprocessed abstract forms ready for `compile:forms/2`), `erl`, `hrl` — writing to `outdir` or returning the values when the `return` option is given.
 8. `.erl` is pretty-printed from abstract forms by `erl_prettypr`; `.hrl` contains message/grouped-AVP records plus enum/define macros.
 
