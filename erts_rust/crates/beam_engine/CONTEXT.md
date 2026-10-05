@@ -260,10 +260,12 @@ stable raw pointers; **only this module dereferences them**.
 - **No in-VM exceptions/catch.** A `GcBif` error with a live fail label branches (guard failure); an
   error with `NO_FAIL` propagates out of `run_export` as `Err(BeamError)`. `try`/`catch`/`raise`/
   `try_case`/stacktrace opcodes are `Generic` ⇒ unsupported.
-- **No floats** (`FloatReg` unsupported; `freg` file not modeled), **no literals**
-  (`Operand::Literal` unsupported — the loader also does not decode them), **no funs/lambdas**,
-  **no maps/bitstrings/records** (their opcodes are `Generic`). These are the documented M1 coverage
-  edges; each returns a typed error, never a wrong result.
+- **Float opcodes are not executed yet.** The FR file and `FloatReg` operand read/write now exist,
+  and `terms` can build/read boxed floats, but the float *instructions* (`fmove`/`fadd`/…) are still
+  `Generic` ⇒ unsupported. **No literals** (`Operand::Literal` unsupported — the loader also does not
+  decode them), **no fun/map/bitstring *opcodes*** (their opcodes are `Generic`) even though `terms`
+  can construct the corresponding boxed terms. These are the documented M1 coverage edges; each
+  returns a typed error, never a wrong result.
 - **No reductions / preemption / scheduler.** `run_*` executes to the function's `return`; process
   scheduling, reductions and trap handling are Stage 5 (`beam_process`).
 - **`ensure_heap` underflow/limits not enforced by the machine** — stack growth is an unbounded
