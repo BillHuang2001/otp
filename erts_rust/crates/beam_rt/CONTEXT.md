@@ -280,12 +280,10 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   atom indices for preloaded code are not yet reproduced. Boot order and the registry are in place.
 * **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
-* **`erts_version` is accepted as a non-standard alias** of `version`; real ERTS raises `badarg`. Remove
-  it once the differential harness pins the authoritative key set.
-* **`-eval`/`-s` are documented subsets** (`-s` uses atoms + discards the result; `-eval` is integer
-  arithmetic only). An `-eval` expression outside the grammar is *unsupported* (exit 3). Real `erl`
-  start-script processing, `-run`, `-init_debug` and the rest are absent — and, like any unmodeled
-  switch, are reported as *unsupported* rather than silently ignored.
+* **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
+  strings; `-eval` is integer arithmetic only and prints nothing). An `-eval` expression outside the
+  grammar is *unsupported* (exit 3). Real `erl` start-script processing, `-init_debug` and the rest are
+  absent — and, like any unmodeled switch, are recorded as init arguments rather than acted on.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
