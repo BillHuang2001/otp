@@ -3,7 +3,7 @@
 //!
 //! [`Table`] owns the table metadata (id, kind, keypos, access, owner), a
 //! table-owned [`TermStore`] (the copy boundary) and one interior behind the
-//! private [`Interior`] trait. The interior shape is *not* externally pinned
+//! private `Interior` trait. The interior shape is *not* externally pinned
 //! (workspace `CONTEXT.md` §2): a hash index and an ordered index implement the
 //! same trait, so a future CHAMP/HAMT/B-tree interior slots in without touching
 //! this dispatch or any dependent.

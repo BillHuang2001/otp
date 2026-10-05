@@ -3,7 +3,7 @@
 //! A **key-sorted `Vec`** of entries, binary-searched with `beam_term::compare::cmp`
 //! (the one authority on Erlang term order). Insert is `O(n)` (a `Vec` shift),
 //! which is correct and sufficient for M1; a B-tree / CA-tree is a documented
-//! future optimization and would slot in behind the same [`Interior`] trait.
+//! future optimization and would slot in behind the same `Interior` trait.
 //!
 //! Public for testing and reuse, but **not** the cross-crate seam: dependents go
 //! through [`crate::Table`].
