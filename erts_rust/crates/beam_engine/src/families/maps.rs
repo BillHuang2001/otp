@@ -7,11 +7,17 @@
 //! - [`Instr::PutMapAssoc`] — update/build a map (associating new keys)
 //! - [`Instr::PutMapExact`] — update a map (failing on an unknown key)
 //!
-//! Map terms are read/built with the `crate::terms` flatmap helpers
+//! Map terms are read/built with the `crate::terms` map helpers
 //! (`map_entries` / `make_flatmap`); key matching uses `beam_term::cmp` (the exact
 //! `=:=` ordering, i.e. `erts_cmp` with `exact=1`) so the engine never reimplements
 //! term ordering and maps keep their `=:=` key semantics (`1` and `1.0` are
 //! distinct keys).
+//!
+//! `map_entries` reads **both** frozen map layouts — a flat map and a hashmap
+//! (HAMT, walked node by node) — so the read instructions
+//! ([`Instr::GetMapElements`] / [`Instr::HasMapFields`]) handle a hashmap source
+//! with a plain `beam_term::cmp` scan and no hash function. *Building* a map is
+//! still flat-map-only (see the Milestone-1 limits below).
 //!
 //! # Ground truth (read-only)
 //!
@@ -53,9 +59,16 @@
 //!
 //! # Milestone-1 limits (all documented, never a wrong result)
 //!
-//! * **Flat maps only.** A source/destination beyond [`crate::terms`]'s flat-map
-//!   limit (32 pairs) needs the HAMT builder and yields a typed
-//!   [`crate::error::unsupported`] (`map_entries: hashmap` / `flatmap > 32 pairs`).
+//! * **Construction is flat-map only.** [`Instr::PutMapAssoc`] /
+//!   [`Instr::PutMapExact`] build the updated map with `crate::terms::make_flatmap`,
+//!   which caps at 32 pairs. A map that would exceed the limit needs the **HAMT
+//!   builder** that no crate in the rewrite implements yet (`beam_term` — the
+//!   frozen-layout LCA — owns no HAMT builder, and the engine may not depend on
+//!   `beam_codec`), so the update yields a typed [`crate::error::unsupported`]
+//!   (`map > 32 pairs (no HAMT builder)`). Reading such a map is fine — only
+//!   *building* one is blocked. A source that *is* a hashmap but enumerates to at
+//!   most 32 pairs is updated into an equivalent flat map (identical map
+//!   semantics; the representation is not part of the map contract).
 //! * **Key order is not canonicalized.** [`crate::terms::map_entries`] preserves the
 //!   source's stored order and new keys are appended. ERTS keeps a flat map's keys
 //!   sorted by `erts_cmp_flatmap_keys` (atoms by their *global* atom index,

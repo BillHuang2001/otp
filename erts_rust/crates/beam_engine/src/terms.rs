@@ -30,13 +30,30 @@
 //! binary** — hand-roll a layout here, each pinned line-by-line to the C ground
 //! truth in the function docs.
 //!
+//! The **hashmap (HAMT) read path** is hand-rolled here as well: `beam_term` owns
+//! the frozen map-header tag constants (`HAMT_SUBTAG_*`) and the `is_hashmap`
+//! classifier but no node reader, so [`map_entries`] walks the `erl_map.h` node
+//! tree itself. No hash function is needed — the walk descends every occupied slot
+//! and key matching stays with the caller's `beam_term::cmp` scan. No crate in the
+//! rewrite can yet *build* a HAMT, so map construction ([`make_flatmap`]) stays
+//! capped at the flat-map limit.
+//!
 //! # Error strategy
 //!
 //! Everything returns [`beam_common::Result`] (never a crate-local enum): a wrong
 //! term type or an out-of-range index is [`BeamError::BadArg`], an unimplemented
 //! case is [`crate::error::unsupported`], and a hard representation limit is
 //! [`BeamError::SystemLimit`]. No function panics on runtime data.
-
+//!
+//! # Why this file is long
+//!
+//! It is the crate's single raw-heap boxed-term builder/reader (the widening
+//! contract: one `#[allow(unsafe_code)]` home for every term layout), so tuples,
+//! cons cells, lists, floats, flat maps, the HAMT reader, funs and the heap binary
+//! all live here, each with the frozen-layout proof it needs — plus a comprehensive
+//! in-module test suite (raw-word layout assertions and the HAMT fixtures). Moving
+//! a family out would spread `unsafe` across modules and needs `lib.rs` wiring, so
+//! the responsibility deliberately stays in one file.
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
 use beam_term::{make_atom, thing, Eterm};
@@ -57,11 +74,25 @@ const FUN_DESCRIPTOR_WORDS: usize = 2;
 /// descriptor.
 const FUN_ENV_OFFSET: usize = 1 + FUN_DESCRIPTOR_WORDS;
 
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count. Above it ERTS uses a
-/// hashmap, which this module does not build (that is `beam_codec`'s HAMT
-/// builder); [`make_flatmap`] rejects it.
+/// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
+/// Above it ERTS uses a **hashmap** (HAMT). No crate in the rewrite can build one
+/// yet (it belongs to `beam_term`/`beam_codec`), so [`make_flatmap`] rejects a
+/// larger map — but [`map_entries`] can still *read* one.
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 
+/// The word offset of a HAMT node's first item when the node carries the
+/// `[header, size, items…]` prefix — `hashmap_head_t` (`erl_map.h:142-146`):
+/// the head array (`HAMT_HEAD_ARRAY_SZ = 18`) and the head bitmap
+/// (`HAMT_HEAD_BITMAP_SZ(n) = 2 + n`).
+const HAMT_HEAD_ITEM_OFFSET: usize = 2;
+/// The word offset of a HAMT node's first item when the node is header-only —
+/// `HAMT_NODE_BITMAP_SZ(n) = 1 + n` and `HAMT_COLLISION_NODE_SZ(n) = 1 + n`
+/// (`erl_map.h:203-205`).
+const HAMT_NODE_ITEM_OFFSET: usize = 1;
+/// A HAMT head **array** node always holds all 16 slots (`HAMT_NODE_ARRAY_SZ`,
+/// `erl_map.h:201`; ERTS only promotes a bitmap head to an array head once every
+/// slot is occupied, `erl_map.c:2755-2757`).
+const HAMT_ARRAY_SLOTS: usize = 16;
 /// `ERL_ONHEAP_BINARY_LIMIT` (`erl_bits.h:167`): the largest byte count a hardware
 /// *heap* binary holds; a larger binary must be off-heap (a ref-counted binary),
 /// which this module does not build.
@@ -178,12 +209,18 @@ pub fn make_float(ctx: &mut dyn ExecutionContext, value: f64) -> Result<Eterm> {
 ///
 /// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout is written
 /// by [`beam_term::thing::write_flatmap`]. Duplicate keys are not detected here
-/// (that needs term comparison). More than `MAP_SMALL_MAP_LIMIT` (32) pairs needs
-/// the HAMT builder and yields [`crate::error::unsupported`].
+/// (that needs term comparison).
+///
+/// More than `MAP_SMALL_MAP_LIMIT` (32) pairs requires a **hashmap** and a HAMT
+/// builder. No crate in the rewrite implements one (`beam_term` — the frozen-layout
+/// LCA — owns no HAMT builder, and `beam_codec` has neither a builder nor a HAMT
+/// decoder), so a larger map yields [`crate::error::unsupported`] rather than a
+/// wrong term. This is the documented construction-side gap; the read side
+/// ([`map_entries`]) *does* handle a HAMT.
 pub fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
     let n = pairs.len();
     if n > MAP_SMALL_MAP_LIMIT {
-        return Err(crate::error::unsupported("flatmap > 32 pairs"));
+        return Err(crate::error::unsupported("map > 32 pairs (no HAMT builder)"));
     }
     let hp = ctx.alloc_words(thing::flatmap_size_words(n))?;
     // SAFETY: `alloc_words` returned `flatmap_size_words(n)` writable words and
@@ -382,21 +419,37 @@ pub fn float_value(t: Eterm) -> Result<f64> {
     Ok(unsafe { thing::float_value(t) })
 }
 
-/// Splits a *flat* map term into its `(key, value)` entries (wire order).
+/// Splits a map term into its `(key, value)` entries, in storage order.
 ///
-/// A term that is not a map yields [`BeamError::BadArg`]; a hashmap (a map beyond
-/// the flat-map limit) yields [`crate::error::unsupported`] — this module only
-/// reads the [`make_flatmap`] layout.
+/// Both frozen map layouts are read: a *flat* map (at most `MAP_SMALL_MAP_LIMIT`
+/// pairs) through [`beam_term::thing::flatmap_parts`], and a **hashmap** (HAMT) by
+/// walking its node tree ([`hashmap_entries`]). A term that is not a map, or a map
+/// whose node words are not a well-shaped HAMT node, yields [`BeamError::BadArg`] —
+/// never a wrong pair set.
+///
+/// The order is the map's *stored* order (flat-map insertion order; HAMT node
+/// order). ERTS stores a flat map's keys in `erts_cmp_flatmap_keys` order, which
+/// the module-local atom model cannot reproduce, so callers must treat the order as
+/// implementation-defined and match keys with [`beam_term::cmp`].
 pub fn map_entries(t: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
     // SAFETY: `is_map`/`is_flatmap` check `is_boxed` before dereferencing.
     if !unsafe { beam_term::is_map(t) } {
         return Err(BeamError::BadArg);
     }
-    if !unsafe { beam_term::is_flatmap(t) } {
-        return Err(crate::error::unsupported("map_entries: hashmap"));
+    if unsafe { beam_term::is_flatmap(t) } {
+        return flatmap_entries(t);
     }
-    // A well-formed flatmap never exceeds `MAP_SMALL_MAP_LIMIT` pairs; the root
-    // points at the `[head, size, keys]` prefix, so word 1 is the raw pair count.
+    // SAFETY: `is_map` established that `t` is a live boxed map; a non-flat map is
+    // a HAMT whose root is a live head node.
+    unsafe { hashmap_entries(t) }
+}
+
+/// Splits a *flat* map term into its `(key, value)` entries (stored order).
+///
+/// The `[head, size, keys, v0 … v(n-1)]` layout written by [`make_flatmap`]; the
+/// root points at the `[head, size, keys]` prefix, so word 1 is the raw pair count.
+fn flatmap_entries(t: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
+    // A well-formed flatmap never exceeds `MAP_SMALL_MAP_LIMIT` pairs.
     // SAFETY: `is_flatmap` established that `t` is a live flatmap, so word 1 is a
     // live, initialised term word.
     let n = unsafe { (*beam_term::boxed_val(t).add(1)).raw() };
@@ -406,6 +459,113 @@ pub fn map_entries(t: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
     // SAFETY: the guards established that `t` is a live `n`-pair flat map.
     let (keys, values) = unsafe { thing::flatmap_parts(t) };
     Ok(keys.iter().copied().zip(values.iter().copied()).collect())
+}
+
+/// Walks a **hashmap** (HAMT) tree from its head node, collecting every leaf
+/// `(key, value)` pair.
+///
+/// This is the enumeration of C's `hashmap_iterator_next`
+/// (`erl_map.c:2346-2381`) and needs **no hash function**: the walk descends every
+/// occupied slot of every node and leaves are the `[K | V]` cons cells, so key
+/// matching stays with the caller's [`beam_term::cmp`] scan. (`erts_map_hash` is an
+/// internal detail of how a *writer* chooses slots, not part of the frozen term
+/// layout, and `beam_term::term_hash` is deliberately *not* it.)
+///
+/// The walk uses an explicit work stack rather than recursion, so a deeply nested
+/// tree (at most `HAMT_MAX_LEVEL` = 16 levels, `erl_map.h:220`) cannot overflow the
+/// native stack.
+///
+/// # Safety
+///
+/// `root` must be a live boxed HAMT head node (a live map term that is not a
+/// flatmap).
+unsafe fn hashmap_entries(root: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
+    let mut out = Vec::new();
+    let mut stack = vec![root];
+    while let Some(node) = stack.pop() {
+        // SAFETY: `root` is a live head node (caller contract) and every value
+        // pushed onto `stack` is a live sub-node read from a live node, so `node`
+        // is a live boxed HAMT node.
+        unsafe { collect_hashmap_node(node, &mut stack, &mut out)? };
+    }
+    Ok(out)
+}
+
+/// Reads one HAMT node: appends its leaf pairs and pushes its sub-nodes onto
+/// `stack`.
+///
+/// # Safety
+///
+/// `node` must be a live boxed HAMT node of a well-formed tree — its header word
+/// and every one of its item words must be live and in bounds.
+unsafe fn collect_hashmap_node(
+    node: Eterm,
+    stack: &mut Vec<Eterm>,
+    out: &mut Vec<(Eterm, Eterm)>,
+) -> Result<()> {
+    let base = beam_term::boxed_val(node);
+    // SAFETY: `node` is a live boxed node, so its header word is live.
+    let (first_item, count) = hashmap_node_shape(unsafe { *base })?;
+    for i in 0..count {
+        // SAFETY: a node of `count` items owns `first_item + count` words past its
+        // header, so every item word is live and in bounds.
+        let item = unsafe { *base.add(first_item + i) };
+        // `THE_NON_VALUE` (the array-head "unoccupied slot" marker, `erl_map.h:75`)
+        // is neither a leaf nor a sub-node, and `is_boxed` would *accept* it (its low
+        // bit is clear), so it must be rejected before any dereference. ERTS fills
+        // all 16 array-head slots before using an array head, but a hand-built or
+        // corrupt term need not.
+        if beam_term::is_non_value(item) {
+            return Err(BeamError::BadArg);
+        }
+        if beam_term::is_list(item) {
+            // A leaf: the `[K | V]` cons cell (`erl_map.c:2370-2372`).
+            // SAFETY: `is_list` established that `item` is a live cons cell, so both
+            // of its words are live.
+            out.push(unsafe { (beam_term::car(item), beam_term::cdr(item)) });
+        } else if beam_term::is_boxed(item) {
+            // A sub-node: a bitmap, array or collision node.
+            stack.push(item);
+        } else {
+            // An immediate in an item slot is not a HAMT node shape at all.
+            return Err(BeamError::BadArg);
+        }
+    }
+    Ok(())
+}
+
+/// The `(first-item word offset, item count)` of a HAMT node, from its header
+/// word — the C `hashmap_node_size(hdr, &ptr)` together with its `ptr` bump
+/// (`erl_map.c:2312-2335`).
+///
+/// The node layouts (`erl_map.h:142-205`):
+/// * head array — `[MAP_HEADER_HAMT_HEAD_ARRAY, size, item × 16]`;
+/// * head bitmap — `[header, size, item × popcount]` (`HAMT_HEAD_BITMAP_SZ(n) = 2 + n`);
+/// * node bitmap — `[header, item × popcount]` (`HAMT_NODE_BITMAP_SZ(n) = 1 + n`);
+/// * collision node — `[make_arityval(n), item × n]`.
+fn hashmap_node_shape(hdr: Eterm) -> Result<(usize, usize)> {
+    if beam_term::is_map_header(hdr) {
+        let count = |hdr: Eterm| beam_term::map_header_val(hdr) as usize;
+        match beam_term::map_header_type(hdr) as usize {
+            beam_term::MAP_HEADER_TAG_HAMT_HEAD_ARRAY => {
+                Ok((HAMT_HEAD_ITEM_OFFSET, HAMT_ARRAY_SLOTS))
+            }
+            beam_term::MAP_HEADER_TAG_HAMT_HEAD_BITMAP => {
+                Ok((HAMT_HEAD_ITEM_OFFSET, count(hdr).count_ones() as usize))
+            }
+            beam_term::MAP_HEADER_TAG_HAMT_NODE_BITMAP => {
+                Ok((HAMT_NODE_ITEM_OFFSET, count(hdr).count_ones() as usize))
+            }
+            // A flatmap head is read by [`flatmap_entries`], never as a HAMT node.
+            _ => Err(BeamError::BadArg),
+        }
+    } else if beam_term::is_arity_value(hdr) {
+        // A collision node: an untagged arityval header plus the leaves
+        // (`MAP_HEADER_HAMT_COLLISION_NODE`, `erl_map.h:197`).
+        Ok((HAMT_NODE_ITEM_OFFSET, beam_term::arityval(hdr)))
+    } else {
+        Err(BeamError::BadArg)
+    }
 }
 
 /// The byte payload of an on-heap binary term; a non-binary (or a non-byte-aligned
@@ -750,15 +910,199 @@ mod tests {
     }
 
     #[test]
-    fn map_entries_rejects_a_non_map_and_a_hashmap() {
+    fn map_entries_rejects_a_non_map() {
         assert_bad_arg(map_entries(make_small(1)));
         assert_bad_arg(map_entries(NIL));
-        // A HAMT head header is a map but not a *flat* map.
-        let mut words = [Eterm::from_raw(beam_term::HAMT_SUBTAG_HEAD_ARRAY)];
-        let hm = beam_term::make_boxed(words.as_mut_ptr());
-        assert!(map_entries(hm).is_err());
     }
 
+    // -- hashmaps (HAMT read path) --------------------------------------------
+
+    /// `MAP_HEADER_TAG_SZ` (`erl_map.h:181-183`) as a shift count.
+    const MAP_HEADER_TAG_SZ: usize = beam_term::MAP_HEADER_TAG_SZ as usize;
+    /// `MAP_HEADER_ARITY_SZ` (`erl_map.h:181-183`) as a shift count.
+    const MAP_HEADER_ARITY_SZ: usize = beam_term::MAP_HEADER_ARITY_SZ as usize;
+
+    /// `MAKE_MAP_HEADER(Type, Arity, Val)` (`erl_map.h:181-183`) — the frozen
+    /// map-node header. Test-only: the engine *reads* a HAMT but never builds one
+    /// (see [`map_entries`]).
+    fn map_header(mtype: usize, arity: usize, val: usize) -> Eterm {
+        let size = (((val << MAP_HEADER_ARITY_SZ) | arity) << MAP_HEADER_TAG_SZ) | mtype;
+        beam_term::make_header(size, beam_term::MAP_SUBTAG)
+    }
+
+    /// A tiny in-test HAMT fixture.
+    ///
+    /// The rewrite has no HAMT *builder*, so these read-path tests hand-write the
+    /// exact `erl_map.h` node blocks. Every block lives in a `Box<[Eterm]>` the
+    /// fixture keeps alive, so a sub-node pointer stored in a parent node stays
+    /// valid (moving the `Box` moves the pointer, never the pointed-to block).
+    struct Hamt {
+        blocks: Vec<Box<[Eterm]>>,
+    }
+
+    impl Hamt {
+        fn new() -> Hamt {
+            Hamt { blocks: Vec::new() }
+        }
+
+        /// Store `words` and tag the block as a **boxed** term (a map node).
+        fn node(&mut self, words: Vec<Eterm>) -> Eterm {
+            let block = words.into_boxed_slice();
+            let term = beam_term::make_boxed(block.as_ptr());
+            self.blocks.push(block);
+            term
+        }
+
+        /// Store `[K, V]` and tag the block as a **list** term (a leaf cell).
+        fn leaf(&mut self, key: Eterm, value: Eterm) -> Eterm {
+            let cell = vec![key, value].into_boxed_slice();
+            let term = beam_term::make_list(cell.as_ptr());
+            self.blocks.push(cell);
+            term
+        }
+
+        /// `[MAP_HEADER_HAMT_HEAD_BITMAP(bitmap), size, item…]` — a bitmap head.
+        fn head_bitmap(&mut self, bitmap: u16, size: usize, items: &[Eterm]) -> Eterm {
+            assert_eq!(bitmap.count_ones() as usize, items.len());
+            let mut words = vec![
+                map_header(
+                    beam_term::MAP_HEADER_TAG_HAMT_HEAD_BITMAP,
+                    1,
+                    usize::from(bitmap),
+                ),
+                Eterm::from_raw(size),
+            ];
+            words.extend_from_slice(items);
+            self.node(words)
+        }
+
+        /// `[MAP_HEADER_HAMT_HEAD_ARRAY, size, item × 16]` — an array head.
+        fn head_array(&mut self, size: usize, items: &[Eterm]) -> Eterm {
+            assert_eq!(items.len(), HAMT_ARRAY_SLOTS);
+            let mut words = vec![
+                map_header(beam_term::MAP_HEADER_TAG_HAMT_HEAD_ARRAY, 1, 0xffff),
+                Eterm::from_raw(size),
+            ];
+            words.extend_from_slice(items);
+            self.node(words)
+        }
+
+        /// `[MAP_HEADER_HAMT_NODE_BITMAP(bitmap), item…]` — an interior node.
+        fn node_bitmap(&mut self, bitmap: u16, items: &[Eterm]) -> Eterm {
+            assert_eq!(bitmap.count_ones() as usize, items.len());
+            let mut words = vec![map_header(
+                beam_term::MAP_HEADER_TAG_HAMT_NODE_BITMAP,
+                0,
+                usize::from(bitmap),
+            )];
+            words.extend_from_slice(items);
+            self.node(words)
+        }
+
+        /// `[make_arityval(n), item…]` — a collision node.
+        fn collision(&mut self, items: &[Eterm]) -> Eterm {
+            let mut words = vec![beam_term::make_arityval(items.len())];
+            words.extend_from_slice(items);
+            self.node(words)
+        }
+    }
+
+    #[test]
+    fn a_hand_built_head_node_is_recognised_as_a_hashmap() {
+        let mut hamt = Hamt::new();
+        let leaf = hamt.leaf(make_small(1), make_small(10));
+        let root = hamt.head_bitmap(0b0001, 1, &[leaf]);
+        // SAFETY: `root` is the live head node the fixture owns.
+        unsafe {
+            assert!(beam_term::is_map(root));
+            assert!(beam_term::is_hashmap(root));
+            assert!(!beam_term::is_flatmap(root));
+        }
+    }
+
+    #[test]
+    fn map_entries_reads_a_bitmap_head() {
+        let (k1, k2) = (make_small(1), make_small(2));
+        let mut hamt = Hamt::new();
+        let first = hamt.leaf(k1, make_small(10));
+        let second = hamt.leaf(k2, make_small(20));
+        let root = hamt.head_bitmap(0b0011, 2, &[first, second]);
+        assert_eq!(
+            map_entries(root).unwrap(),
+            vec![(k1, make_small(10)), (k2, make_small(20))]
+        );
+    }
+
+    #[test]
+    fn map_entries_descends_into_sub_nodes() {
+        // Head slot 0 → a leaf; head slot 1 → a bitmap node holding two leaves.
+        let mut hamt = Hamt::new();
+        let top = hamt.leaf(make_small(1), make_small(10));
+        let inner_first = hamt.leaf(make_small(2), make_small(20));
+        let inner_second = hamt.leaf(make_small(3), make_small(30));
+        let inner = hamt.node_bitmap(0b0110, &[inner_first, inner_second]);
+        let root = hamt.head_bitmap(0b0011, 3, &[top, inner]);
+        assert_eq!(
+            map_entries(root).unwrap(),
+            vec![
+                (make_small(1), make_small(10)),
+                (make_small(2), make_small(20)),
+                (make_small(3), make_small(30)),
+            ]
+        );
+    }
+
+    #[test]
+    fn map_entries_reads_an_array_head() {
+        let mut hamt = Hamt::new();
+        let mut items = Vec::new();
+        for i in 0..HAMT_ARRAY_SLOTS as i64 {
+            items.push(hamt.leaf(make_small(i), make_small(i + 100)));
+        }
+        let root = hamt.head_array(HAMT_ARRAY_SLOTS, &items);
+        let entries = map_entries(root).unwrap();
+        assert_eq!(entries.len(), HAMT_ARRAY_SLOTS);
+        for (i, (key, value)) in entries.iter().enumerate() {
+            assert_eq!(*key, make_small(i as i64));
+            assert_eq!(*value, make_small(i as i64 + 100));
+        }
+    }
+
+    #[test]
+    fn map_entries_reads_a_collision_node() {
+        let mut hamt = Hamt::new();
+        let first = hamt.leaf(make_small(1), make_small(10));
+        let second = hamt.leaf(make_small(2), make_small(20));
+        let child = hamt.collision(&[first, second]);
+        // A bitmap head whose only occupied slot holds the collision node.
+        let root = hamt.head_bitmap(0b0001, 2, &[child]);
+        assert_eq!(
+            map_entries(root).unwrap(),
+            vec![(make_small(1), make_small(10)), (make_small(2), make_small(20))]
+        );
+    }
+
+    #[test]
+    fn map_entries_rejects_malformed_hamt_nodes() {
+        // An array head with `THE_NON_VALUE` in an unoccupied slot: a typed error,
+        // never a bogus pair (and never a dereference of the non-value, which
+        // `is_boxed` would otherwise accept).
+        let mut hamt = Hamt::new();
+        let mut items = vec![beam_term::THE_NON_VALUE; HAMT_ARRAY_SLOTS];
+        items[0] = hamt.leaf(make_small(1), make_small(10));
+        let root = hamt.head_array(1, &items);
+        assert_bad_arg(map_entries(root));
+
+        // An item slot holding an immediate is not a HAMT node shape.
+        let mut hamt = Hamt::new();
+        let root = hamt.head_bitmap(0b0001, 1, &[make_small(7)]);
+        assert_bad_arg(map_entries(root));
+
+        // A boxed term whose header is not a map node at all.
+        let mut words = [make_small(0)];
+        let not_a_node = beam_term::make_boxed(words.as_mut_ptr());
+        assert_bad_arg(map_entries(not_a_node));
+    }
     // -- funs -----------------------------------------------------------------
 
     #[test]
