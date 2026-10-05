@@ -49,5 +49,5 @@ Everything published for this app comes from the extras in this directory (no mo
 ## See Also
 - `../src/` — C implementations of everything documented here (`encode/`, `decode/`, `connect/`, `global/`, `epmd/`, `misc/`); `../src/prog/ei_fake_prog.c`, `../src/prog/erl_call.c`; `../src/README.internal` internal rules.
 - `../include/` — public headers `ei.h`, `ei_connect.h`, `ei_global.h`, `eicode.h` documented by the reference pages.
-- `../../system/doc/` — release-wide documentation build (`docs.exs`, `top/`), the port/C-node tutorial and the docs conventions in `reference_manual/documentation.md`.
+- `../../../system/doc/` — release-wide documentation build (`docs.exs`, `top/`), the port/C-node tutorial and the docs conventions in `reference_manual/documentation.md`.
 - `../../../make/doc.mk`, `../../../make/ex_doc.exs`, `../../../make/markdown_to_man.escript`, `../../../make/fixup_doc_links.sh` — the build machinery used by this directory.
