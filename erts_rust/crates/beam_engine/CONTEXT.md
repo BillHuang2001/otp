@@ -76,8 +76,8 @@ pub trait ExecutionContext {
   yield `x(0)`.
 - `pub fn run_label(&mut self, module: &Module, label: Label, arity: u32, args: &[Eterm],
   ctx: &mut dyn ExecutionContext) -> Result<Eterm>` — run a raw entry label (used by `run_export`).
-- Introspection (read-only): `x(&self, n: u32) -> Option<Eterm>`, `frame_depth(&self) -> usize`,
-  `stack_depth(&self) -> usize`, `reset(&mut self)`.
+- Introspection (read-only): `x(&self, n: u32) -> Option<Eterm>`, `get_fr(&self, n: u32) -> Option<Eterm>`,
+  `frame_depth(&self) -> usize`, `stack_depth(&self) -> usize`, `reset(&mut self)` (also clears the FR file).
 - `pub enum StepOutcome { ... }` / the interpreter loop entry `pub fn run_loop(...)` — the dispatch
   loop lives in `src/interpreter.rs` (`impl Machine`).
 
