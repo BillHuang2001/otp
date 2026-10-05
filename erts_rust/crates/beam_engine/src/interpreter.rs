@@ -33,25 +33,6 @@ use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::Step;
 
-/// Fold a helper-produced [`Step`] back into the dispatch loop's `func`/`pc`.
-///
-/// The direct arms mutate the loop's `func`/`pc` in place rather than returning a
-/// [`Step`], so a raise that *lands* in a catch frame — [`Machine::raise_bif_error`]
-/// and the `families::dispatch` seam — has to be mapped back here. `Step::Done`
-/// finishes the run with `x(0)`.
-macro_rules! apply_step {
-    ($machine:ident, $step:expr, $func:ident, $pc:ident) => {
-        match $step {
-            Step::Next => $pc += 1,
-            Step::Goto { func, pc } => {
-                $func = func;
-                $pc = pc;
-            }
-            Step::Done => return $machine.finish(),
-        }
-    };
-}
-
 /// Build the module-wide `Label -> (function index, code index)` map.
 ///
 /// Labels are module-unique code addresses, so a call/fail target may live in a
@@ -116,8 +97,290 @@ impl Machine {
         self.run_loop_with_map(module, &labels, func, pc, ctx)
     }
 
+    /// Execute **exactly one** instruction at `(func, pc)` and report where control
+    /// goes next.
+    ///
+    /// This is the body of one dispatch-loop iteration factored out of
+    /// [`Machine::run_loop_with_map`], so a JIT driver can interpret a *single*
+    /// instruction and step the interpreter's state by one instruction (used for
+    /// per-instruction deopt). It performs precisely the effect the corresponding
+    /// dispatch arm performed in place, then returns:
+    ///
+    /// * [`Step::Next`] — the instruction advances `pc` by 1 in the same function.
+    /// * [`Step::Goto { func, pc }`] — it transfers control (jump/call/select/
+    ///   test-fail/raise-landing/…): the returned `(func, pc)` is the next address.
+    /// * [`Step::Done`] — it would finish the run (a `return`/`call_ext*` reaching
+    ///   the bottom frame's [`Continuation::Halt`]); the caller turns this into
+    ///   `x(0)` with [`Machine::finish`].
+    ///
+    /// A raise (or any other typed error — an out-of-range `pc`/function index, an
+    /// unsupported opcode/operand) stays an `Err(beam_common::BeamError)`; it is
+    /// never a panic and never a wrong result.
+    pub(crate) fn step_instruction(
+        &mut self,
+        module: &Module,
+        labels: &BTreeMap<Label, (u32, u32)>,
+        func: u32,
+        pc: u32,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Step> {
+        // The instruction borrows `module` (never `self`), so mutating the machine
+        // in the arms below is sound and clone-free.
+        let instr = match module.functions.get(func as usize) {
+            Some(function) => match function.code.get(pc as usize) {
+                Some(instr) => instr,
+                None => return Err(error::unsupported("run: pc out of range")),
+            },
+            None => return Err(error::unsupported("run: function index out of range")),
+        };
+
+        match instr {
+            // Metadata / no-ops. `executable_line`/`debug_line` exist for
+            // instruction counting and breakpoints (they are `_` in
+            // `emu/ops.tab:103-108`), so they do not change control flow.
+            Instr::Label(_)
+            | Instr::Line(_)
+            | Instr::FuncInfo { .. }
+            | Instr::IntCodeEnd
+            | Instr::ExecutableLine { .. }
+            | Instr::DebugLine { .. } => Ok(Step::Next),
+            Instr::Move { src, dst } => {
+                let value = read_operand(self, src)?;
+                write_operand(self, dst, value)?;
+                Ok(Step::Next)
+            }
+            Instr::Swap { a, b } => {
+                let va = read_operand(self, a)?;
+                let vb = read_operand(self, b)?;
+                write_operand(self, a, vb)?;
+                write_operand(self, b, va)?;
+                Ok(Step::Next)
+            }
+            Instr::Test { kind, fail, args } => {
+                if self.eval_test(module, *kind, args)? {
+                    Ok(Step::Next)
+                } else if *fail == NO_FAIL {
+                    Err(error::unsupported("test/no_fail"))
+                } else {
+                    let (func, pc) = resolve(labels, *fail)?;
+                    Ok(Step::Goto { func, pc })
+                }
+            }
+            Instr::SelectVal { value, fail, pairs } => {
+                let scrutinee = read_operand(self, value)?;
+                let mut target = None;
+                for (candidate, label) in pairs {
+                    let candidate_value = read_operand(self, candidate)?;
+                    if cmp(scrutinee, candidate_value, &module.atom_table).is_eq() {
+                        target = Some(*label);
+                        break;
+                    }
+                }
+                match target {
+                    Some(label) => {
+                        let (func, pc) = resolve(labels, label)?;
+                        Ok(Step::Goto { func, pc })
+                    }
+                    None if *fail == NO_FAIL => Err(error::unsupported("select_val/no_fail")),
+                    None => {
+                        let (func, pc) = resolve(labels, *fail)?;
+                        Ok(Step::Goto { func, pc })
+                    }
+                }
+            }
+            Instr::Jump { target } => {
+                let (func, pc) = resolve(labels, *target)?;
+                Ok(Step::Goto { func, pc })
+            }
+            Instr::GcBif {
+                bif,
+                fail,
+                args,
+                dst,
+                ..
+            } => {
+                let (module_name, function_name, arity) = import_target(module, *bif)?;
+                let mut arg_terms = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_terms.push(read_operand(self, arg)?);
+                }
+                match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
+                    Ok(value) => {
+                        write_operand(self, dst, value)?;
+                        Ok(Step::Next)
+                    }
+                    // No fail label ⇒ a *raise*: land in a live catch frame
+                    // (C falls through to `find_func_info`/`handle_error`) or
+                    // propagate the typed error.
+                    Err(e) if *fail == NO_FAIL => self.raise_bif_error(module, e),
+                    // Guard failure: jump to the fail label.
+                    Err(_) => {
+                        let (func, pc) = resolve(labels, *fail)?;
+                        Ok(Step::Goto { func, pc })
+                    }
+                }
+            }
+            Instr::Bif0 { bif, dst } => {
+                // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
+                // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
+                // is no fail label, so any error is a raise; C routes the call
+                // through `call_light_bif`, whose error path is catch-aware.
+                let (module_name, function_name, arity) = import_target(module, *bif)?;
+                match ctx.call_bif(module_name, function_name, arity, &[]) {
+                    Ok(value) => {
+                        write_operand(self, dst, value)?;
+                        Ok(Step::Next)
+                    }
+                    Err(e) => self.raise_bif_error(module, e),
+                }
+            }
+            Instr::Bif {
+                bif,
+                fail,
+                args,
+                dst,
+                ..
+            } => {
+                // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
+                // Like the `GcBif` arm minus the heap/live check: on failure,
+                // jump to `fail` if it is live (guard failure), else raise
+                // (landing in a live catch frame when there is one).
+                let (module_name, function_name, arity) = import_target(module, *bif)?;
+                let mut arg_terms = Vec::with_capacity(args.len());
+                for arg in args {
+                    arg_terms.push(read_operand(self, arg)?);
+                }
+                match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
+                    Ok(value) => {
+                        write_operand(self, dst, value)?;
+                        Ok(Step::Next)
+                    }
+                    Err(e) if *fail == NO_FAIL => self.raise_bif_error(module, e),
+                    // Guard failure: jump to the fail label.
+                    Err(_) => {
+                        let (func, pc) = resolve(labels, *fail)?;
+                        Ok(Step::Goto { func, pc })
+                    }
+                }
+            }
+            Instr::Call { target, .. } => {
+                // Store the continuation in the *current* frame's CP slot.
+                self.set_continuation(Continuation::Address { func, pc: pc + 1 })?;
+                let (func, pc) = resolve(labels, *target)?;
+                Ok(Step::Goto { func, pc })
+            }
+            Instr::CallLast {
+                target, deallocate, ..
+            } => {
+                self.pop_frame_checked(*deallocate)?;
+                let (func, pc) = resolve(labels, *target)?;
+                Ok(Step::Goto { func, pc })
+            }
+            Instr::CallOnly { target, .. } => {
+                let (func, pc) = resolve(labels, *target)?;
+                Ok(Step::Goto { func, pc })
+            }
+            Instr::CallExt { target, arity } => {
+                // An ext call carries no fail label: a failure is a raise (C's
+                // `i_call_ext`/`call_light_bif` end in `handle_error`, so a live
+                // catch frame catches it).
+                match self.call_import(module, *target, *arity, ctx) {
+                    Ok(value) => {
+                        self.set_x(0, value)?;
+                        Ok(Step::Next)
+                    }
+                    Err(e) => self.raise_bif_error(module, e),
+                }
+            }
+            Instr::CallExtOnly { target, arity } => {
+                match self.call_import(module, *target, *arity, ctx) {
+                    Ok(value) => {
+                        self.set_x(0, value)?;
+                        match self.continuation()? {
+                            Continuation::Halt => Ok(Step::Done),
+                            Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
+                        }
+                    }
+                    Err(e) => self.raise_bif_error(module, e),
+                }
+            }
+            Instr::CallExtLast {
+                target,
+                arity,
+                deallocate,
+            } => {
+                self.pop_frame_checked(*deallocate)?;
+                match self.call_import(module, *target, *arity, ctx) {
+                    Ok(value) => {
+                        self.set_x(0, value)?;
+                        match self.continuation()? {
+                            Continuation::Halt => Ok(Step::Done),
+                            Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
+                        }
+                    }
+                    Err(e) => self.raise_bif_error(module, e),
+                }
+            }
+            Instr::Allocate { stack_need, .. } => {
+                // `stack_need` is a `HeapNeed` (either a bare word count or a
+                // `z,3` allocation list); `.words()` recovers the total the frame
+                // reserves (see `beam_loader::HeapNeed`).
+                self.push_frame(stack_need.words())?;
+                Ok(Step::Next)
+            }
+            Instr::AllocateHeap {
+                stack_need,
+                heap_need,
+                live,
+            } => {
+                self.ensure_heap(heap_need.words(), *live, ctx)?;
+                self.push_frame(stack_need.words())?;
+                Ok(Step::Next)
+            }
+            Instr::TestHeap { heap_need, live } => {
+                self.ensure_heap(heap_need.words(), *live, ctx)?;
+                Ok(Step::Next)
+            }
+            Instr::Deallocate(n) => {
+                self.pop_frame_checked(*n)?;
+                Ok(Step::Next)
+            }
+            Instr::Trim { n, .. } => {
+                self.trim(*n)?;
+                Ok(Step::Next)
+            }
+            Instr::InitYregs { registers } => {
+                // `init_yregs {Yregs}` — initialize the listed (Y) registers to
+                // `[]` (`emu/instrs.tab:506-508` `i_init`: `make_blank($Y)`, and
+                // `make_blank` is `NIL`). Emitted right after `allocate`, so the
+                // frame is live.
+                for register in registers {
+                    write_operand(self, register, NIL)?;
+                }
+                Ok(Step::Next)
+            }
+            Instr::Return => match self.continuation()? {
+                Continuation::Halt => Ok(Step::Done),
+                Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
+            },
+            Instr::Generic { op, .. } => Err(error::unsupported(op.name())),
+            // Every remaining IR variant is routed to the per-instruction-family
+            // dispatch seam ([`crate::families`]). Each family is currently a stub
+            // returning `Ok(None)`, so an instruction no family claims yields the
+            // same documented `unsupported` error the interpreter emitted before
+            // this seam existed; a family that later implements an opcode returns
+            // a [`Step`] telling the driver where to continue. Never a panic and
+            // never a wrong result.
+            other => families::dispatch(self, module, labels, other, func, pc, ctx),
+        }
+    }
+
     /// The dispatch loop over a pre-built label map (shared by
     /// [`Machine::run_loop`] and [`Machine::run_label`]).
+    ///
+    /// A thin driver over [`Machine::step_instruction`]: it executes one
+    /// instruction at a time and folds the returned [`Step`] into the running
+    /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`].
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
@@ -127,310 +390,13 @@ impl Machine {
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
         loop {
-            // The instruction borrows `module` (never `self`), so mutating the
-            // machine in the arms below is sound and clone-free.
-            let instr = match module.functions.get(func as usize) {
-                Some(function) => match function.code.get(pc as usize) {
-                    Some(instr) => instr,
-                    None => return Err(error::unsupported("run: pc out of range")),
-                },
-                None => return Err(error::unsupported("run: function index out of range")),
-            };
-
-            match instr {
-                // Metadata / no-ops. `executable_line`/`debug_line` exist for
-                // instruction counting and breakpoints (they are `_` in
-                // `emu/ops.tab:103-108`), so they do not change control flow.
-                Instr::Label(_)
-                | Instr::Line(_)
-                | Instr::FuncInfo { .. }
-                | Instr::IntCodeEnd
-                | Instr::ExecutableLine { .. }
-                | Instr::DebugLine { .. } => {
-                    pc += 1;
+            match self.step_instruction(module, labels, func, pc, ctx)? {
+                Step::Next => pc += 1,
+                Step::Goto { func: f, pc: p } => {
+                    func = f;
+                    pc = p;
                 }
-                Instr::Move { src, dst } => {
-                    let value = read_operand(self, src)?;
-                    write_operand(self, dst, value)?;
-                    pc += 1;
-                }
-                Instr::Swap { a, b } => {
-                    let va = read_operand(self, a)?;
-                    let vb = read_operand(self, b)?;
-                    write_operand(self, a, vb)?;
-                    write_operand(self, b, va)?;
-                    pc += 1;
-                }
-                Instr::Test { kind, fail, args } => {
-                    if self.eval_test(module, *kind, args)? {
-                        pc += 1;
-                    } else if *fail == NO_FAIL {
-                        return Err(error::unsupported("test/no_fail"));
-                    } else {
-                        let (next_func, next_pc) = resolve(labels, *fail)?;
-                        func = next_func;
-                        pc = next_pc;
-                    }
-                }
-                Instr::SelectVal { value, fail, pairs } => {
-                    let scrutinee = read_operand(self, value)?;
-                    let mut target = None;
-                    for (candidate, label) in pairs {
-                        let candidate_value = read_operand(self, candidate)?;
-                        if cmp(scrutinee, candidate_value, &module.atom_table).is_eq() {
-                            target = Some(*label);
-                            break;
-                        }
-                    }
-                    match target {
-                        Some(label) => {
-                            let (next_func, next_pc) = resolve(labels, label)?;
-                            func = next_func;
-                            pc = next_pc;
-                        }
-                        None if *fail == NO_FAIL => {
-                            return Err(error::unsupported("select_val/no_fail"));
-                        }
-                        None => {
-                            let (next_func, next_pc) = resolve(labels, *fail)?;
-                            func = next_func;
-                            pc = next_pc;
-                        }
-                    }
-                }
-                Instr::Jump { target } => {
-                    let (next_func, next_pc) = resolve(labels, *target)?;
-                    func = next_func;
-                    pc = next_pc;
-                }
-                Instr::GcBif {
-                    bif,
-                    fail,
-                    args,
-                    dst,
-                    ..
-                } => {
-                    let (module_name, function_name, arity) = import_target(module, *bif)?;
-                    let mut arg_terms = Vec::with_capacity(args.len());
-                    for arg in args {
-                        arg_terms.push(read_operand(self, arg)?);
-                    }
-                    match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
-                        Ok(value) => {
-                            write_operand(self, dst, value)?;
-                            pc += 1;
-                        }
-                        // No fail label ⇒ a *raise*: land in a live catch frame
-                        // (C falls through to `find_func_info`/`handle_error`) or
-                        // propagate the typed error.
-                        Err(e) if *fail == NO_FAIL => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                        // Guard failure: jump to the fail label. Unchanged.
-                        Err(_) => {
-                            let (next_func, next_pc) = resolve(labels, *fail)?;
-                            func = next_func;
-                            pc = next_pc;
-                        }
-                    }
-                }
-                Instr::Bif0 { bif, dst } => {
-                    // `bif0 Bif Dst` — a non-garbage-collecting BIF with no
-                    // arguments (`emu/ops.tab:984-985`, e.g. `self`/`node`). There
-                    // is no fail label, so any error is a raise; C routes the call
-                    // through `call_light_bif`, whose error path is catch-aware.
-                    let (module_name, function_name, arity) = import_target(module, *bif)?;
-                    match ctx.call_bif(module_name, function_name, arity, &[]) {
-                        Ok(value) => {
-                            write_operand(self, dst, value)?;
-                            pc += 1;
-                        }
-                        Err(e) => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                    }
-                }
-                Instr::Bif {
-                    bif,
-                    fail,
-                    args,
-                    dst,
-                    ..
-                } => {
-                    // `bif{1,2,3} Fail Bif Arg… Dst` — a non-garbage-collecting BIF.
-                    // Like the `GcBif` arm minus the heap/live check: on failure,
-                    // jump to `fail` if it is live (guard failure), else raise
-                    // (landing in a live catch frame when there is one).
-                    let (module_name, function_name, arity) = import_target(module, *bif)?;
-                    let mut arg_terms = Vec::with_capacity(args.len());
-                    for arg in args {
-                        arg_terms.push(read_operand(self, arg)?);
-                    }
-                    match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
-                        Ok(value) => {
-                            write_operand(self, dst, value)?;
-                            pc += 1;
-                        }
-                        Err(e) if *fail == NO_FAIL => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                        // Guard failure: jump to the fail label. Unchanged.
-                        Err(_) => {
-                            let (next_func, next_pc) = resolve(labels, *fail)?;
-                            func = next_func;
-                            pc = next_pc;
-                        }
-                    }
-                }
-                Instr::Call { target, .. } => {
-                    // Store the continuation in the *current* frame's CP slot.
-                    self.set_continuation(Continuation::Address { func, pc: pc + 1 })?;
-                    let (next_func, next_pc) = resolve(labels, *target)?;
-                    func = next_func;
-                    pc = next_pc;
-                }
-                Instr::CallLast {
-                    target, deallocate, ..
-                } => {
-                    self.pop_frame_checked(*deallocate)?;
-                    let (next_func, next_pc) = resolve(labels, *target)?;
-                    func = next_func;
-                    pc = next_pc;
-                }
-                Instr::CallOnly { target, .. } => {
-                    let (next_func, next_pc) = resolve(labels, *target)?;
-                    func = next_func;
-                    pc = next_pc;
-                }
-                Instr::CallExt { target, arity } => {
-                    // An ext call carries no fail label: a failure is a raise (C's
-                    // `i_call_ext`/`call_light_bif` end in `handle_error`, so a live
-                    // catch frame catches it).
-                    match self.call_import(module, *target, *arity, ctx) {
-                        Ok(value) => {
-                            self.set_x(0, value)?;
-                            pc += 1;
-                        }
-                        Err(e) => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                    }
-                }
-                Instr::CallExtOnly { target, arity } => {
-                    match self.call_import(module, *target, *arity, ctx) {
-                        Ok(value) => {
-                            self.set_x(0, value)?;
-                            match self.continuation()? {
-                                Continuation::Halt => return self.finish(),
-                                Continuation::Address {
-                                    func: next_func,
-                                    pc: next_pc,
-                                } => {
-                                    func = next_func;
-                                    pc = next_pc;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                    }
-                }
-                Instr::CallExtLast {
-                    target,
-                    arity,
-                    deallocate,
-                } => {
-                    self.pop_frame_checked(*deallocate)?;
-                    match self.call_import(module, *target, *arity, ctx) {
-                        Ok(value) => {
-                            self.set_x(0, value)?;
-                            match self.continuation()? {
-                                Continuation::Halt => return self.finish(),
-                                Continuation::Address {
-                                    func: next_func,
-                                    pc: next_pc,
-                                } => {
-                                    func = next_func;
-                                    pc = next_pc;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            let step = self.raise_bif_error(module, e)?;
-                            apply_step!(self, step, func, pc);
-                        }
-                    }
-                }
-                Instr::Allocate { stack_need, .. } => {
-                    // `stack_need` is a `HeapNeed` (either a bare word count or a
-                    // `z,3` allocation list); `.words()` recovers the total the frame
-                    // reserves (see `beam_loader::HeapNeed`).
-                    self.push_frame(stack_need.words())?;
-                    pc += 1;
-                }
-                Instr::AllocateHeap {
-                    stack_need,
-                    heap_need,
-                    live,
-                } => {
-                    self.ensure_heap(heap_need.words(), *live, ctx)?;
-                    self.push_frame(stack_need.words())?;
-                    pc += 1;
-                }
-                Instr::TestHeap { heap_need, live } => {
-                    self.ensure_heap(heap_need.words(), *live, ctx)?;
-                    pc += 1;
-                }
-                Instr::Deallocate(n) => {
-                    self.pop_frame_checked(*n)?;
-                    pc += 1;
-                }
-                Instr::Trim { n, .. } => {
-                    self.trim(*n)?;
-                    pc += 1;
-                }
-                Instr::InitYregs { registers } => {
-                    // `init_yregs {Yregs}` — initialize the listed (Y) registers to
-                    // `[]` (`emu/instrs.tab:506-508` `i_init`: `make_blank($Y)`, and
-                    // `make_blank` is `NIL`). Emitted right after `allocate`, so the
-                    // frame is live.
-                    for register in registers {
-                        write_operand(self, register, NIL)?;
-                    }
-                    pc += 1;
-                }
-                Instr::Return => match self.continuation()? {
-                    Continuation::Halt => return self.finish(),
-                    Continuation::Address {
-                        func: next_func,
-                        pc: next_pc,
-                    } => {
-                        func = next_func;
-                        pc = next_pc;
-                    }
-                },
-                Instr::Generic { op, .. } => return Err(error::unsupported(op.name())),
-                // Every remaining IR variant is routed to the per-instruction-family
-                // dispatch seam ([`crate::families`]). Each family is currently a stub
-                // returning `Ok(None)`, so an instruction no family claims yields the
-                // same documented `unsupported` error the interpreter emitted before
-                // this seam existed; a family that later implements an opcode returns
-                // a [`Step`] telling this loop where to continue. Never a panic and
-                // never a wrong result.
-                other => match families::dispatch(self, module, labels, other, func, pc, ctx)? {
-                    Step::Next => pc += 1,
-                    Step::Goto { func: f, pc: p } => {
-                        func = f;
-                        pc = p;
-                    }
-                    Step::Done => return self.finish(),
-                },
+                Step::Done => return self.finish(),
             }
         }
     }
@@ -657,8 +623,9 @@ impl Machine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::context::MinimalContext;
     use beam_loader::{Function, Import};
-    use beam_term::Atom;
+    use beam_term::{make_small, Atom};
 
     /// A one-function module whose single entry label is `entry`.
     fn module_with_function(code: Vec<Instr>, imports: Vec<Import>) -> (Module, Atom) {
@@ -698,5 +665,82 @@ mod tests {
     fn resolve_label_of_a_missing_label_is_a_typed_error() {
         let (module, _) = module_with_function(vec![Instr::Return], Vec::new());
         assert!(resolve_label(&module, Label(99)).is_err());
+    }
+
+    #[test]
+    fn step_instruction_advances_exactly_one_instruction() {
+        // `[Label, move x0 <- 5, return]`.
+        let (module, _) = module_with_function(
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Move {
+                    src: Operand::Integer(5),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        // A bottom frame whose continuation is `Halt`, so the trailing `return`
+        // finishes the run rather than looking for a caller's continuation.
+        machine.push_frame(0).unwrap();
+        let mut ctx = MinimalContext::new();
+
+        // `pc = 1` is the `move`: exactly one instruction, advancing to `pc + 1`.
+        let step = machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .unwrap();
+        assert_eq!(step, Step::Next);
+        assert_eq!(machine.x(0), Some(make_small(5)));
+        // The move did not run the `return`: the frame is still live.
+        assert_eq!(machine.frame_depth(), 1);
+
+        // `pc = 2` is the `return` reaching the `Halt` continuation: the run ends.
+        let step = machine
+            .step_instruction(&module, &labels, 0, 2, &mut ctx)
+            .unwrap();
+        assert_eq!(step, Step::Done);
+    }
+
+    #[test]
+    fn step_instruction_reports_a_jump_target() {
+        // `[Label(1), jump Label(2), Label(2), return]`.
+        let (module, _) = module_with_function(
+            vec![
+                Instr::Label(Label(1)),
+                Instr::Jump { target: Label(2) },
+                Instr::Label(Label(2)),
+                Instr::Return,
+            ],
+            Vec::new(),
+        );
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+
+        // The `jump` at `pc = 1` transfers control to `Label(2)`, which is code
+        // offset 2 of the same (only) function.
+        let step = machine
+            .step_instruction(&module, &labels, 0, 1, &mut ctx)
+            .unwrap();
+        assert_eq!(step, Step::Goto { func: 0, pc: 2 });
+    }
+
+    #[test]
+    fn step_instruction_out_of_range_is_a_typed_error() {
+        let (module, _) = module_with_function(vec![Instr::Return], Vec::new());
+        let labels = build_label_map(&module);
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+
+        // An out-of-range `pc` / function index stays an `Err`, never a panic.
+        assert!(machine
+            .step_instruction(&module, &labels, 0, 99, &mut ctx)
+            .is_err());
+        assert!(machine
+            .step_instruction(&module, &labels, 99, 0, &mut ctx)
+            .is_err());
     }
 }
