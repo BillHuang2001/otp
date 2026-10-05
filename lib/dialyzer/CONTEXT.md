@@ -17,7 +17,7 @@ Public Erlang API — module `dialyzer` (declared in `src/dialyzer.erl`, the onl
 - `typer` (`src/typer.erl`) is a separate user tool (`start/0`), not part of the `dialyzer` module API.
 Public types live in `src/dialyzer.hrl`: `dial_option()`, `dial_options()`, `dial_warning()`, `dial_warn_tag()`, `anal_type()`, `warn_option()`, and records `#options{}`/`#analysis{}`/`#plt{}`/`#plt_info{}`/`#iplt_info{}`.
 Analysis types (`analysis_type` option) drive the whole PLT lifecycle: `succ_typings` (analyze), `plt_build`, `plt_add`, `plt_remove`, `plt_check`, and `incremental`.
-Front ends: `bin/dialyzer`/`bin/typer` (shell/C) and `dialyzer:plain_cl/0`/`dialyzer_cl_parse` (CLI parsing), `dialyzer_cl` (CLI driver), `dialyzer_incremental` (incremental-mode driver).
+Front ends: compiled C executables `bin/dialyzer`/`bin/typer` (built from `erts/etc/common/dialyzer.c`/`typer.c`) plus the CLI parsing/driver modules `dialyzer_cl_parse` (option parsing), `dialyzer_cl` (CLI driver) and `dialyzer_incremental` (incremental-mode driver).
 The authoritative CLI/user documentation is the `-moduledoc` of `src/dialyzer.erl` (rendered as man3 `dialyzer.3`).
 
 ## PLT Model
