@@ -27,7 +27,7 @@ Originally lived in `erts/emulator/test/esock_misc/` and were moved here (with `
 ## Known Issues
 - `esock_iow_client.erl` and `esock_iow_server.erl` hardcode the local IPv4 address `{147,214,93,147}`; they only bind/connect successfully on a host that actually owns that address.
 - `esock_iow_client:start/1` and `esock_iow_server:start/0` loop forever (the loop resets its counter instead of terminating) — they must be killed manually.
-- `socket_client`/`socket_server` require a non-loopback interface address: `which_addr/1` throws `no_address` when only `lo` exists, and both throw `no_address`/`no_address`-style errors on hosts without a suitable IPv4/IPv6 address.
+- `socket_client`/`socket_server` require a non-loopback interface address: their `which_addr/1` (and `which_addr/2`) pick the first non-`lo` interface with an address of the requested family and `throw(no_address)` on hosts that only have `lo` or only the other family.
 - `socket_client.erl` still carries large commented-out blocks (old enc/dec message helpers, timestamp helpers); they are dead text, not live API.
 - `socket_server`'s SCTP support is explicitly incomplete — `do_manager_init(..., seqpacket, sctp, ...)` only opens the socket, dumps `sctp` options, sets events and closes it.
 
