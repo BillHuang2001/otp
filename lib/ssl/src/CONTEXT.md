@@ -130,7 +130,6 @@ This directory contains no tests; nothing here is generated so `git ls-files` is
 - `../include/` — holds only `.gitignore`; no public headers are exported by `ssl`.
 - `../test/` — Common Test suites for the app (read-only cross-reference).
 - `../doc/` — user documentation (`ssl_app.md`, `guides/*.md`).
-- `../internal_doc/pem_and_cert_cache.md` — design notes for `ssl_manager`/`ssl_pem_cache`.
-- `../internal_doc/ssl_notes.md` — further internal design notes.
+- `../internal_doc/ssl_notes.md` — developer notes (OCSP stapling model, PEM/cert-cache tables, test-cert topology).
 - `../../public_key/` and `../../crypto/` — the underlying certificate/crypto APIs this app builds on.
 - `../../kernel/src/inet_tls_dist.erl`-adjacent infrastructure (`dist_util`, `net_kernel`) — the distribution side that drives `inet_tls_dist`.
