@@ -67,6 +67,8 @@ There are currently **no `.cpp` files directly in `beam/`** (the `BEAM_CPP_SRC` 
 - **Public headers are the ABI**: driver/NIF code only ever sees `erl_driver.h`/`erl_nif.h`; the emulator's internal structs are hidden behind `*_TYPES_ONLY__`/`*_TYPE_ONLY` include guards used all over these headers to let low-level files pull in just the type definitions.
 
 ## Known Issues / Gotchas
+- `packet_parser.c`/`packet_parser.h` is the shared packet/header decoder for BOTH the `erlang:decode_packet/3` BIF (`erl_bif_port.c`) and the legacy inet port driver (`../drivers/common/inet_drv.c`, which `#include "packet_parser.h"`): external symbols are `packet_get_length()` (c:248), `packet_parse_http()` (c:662), `packet_parse_ssl()` (c:864) and `packet_parser_init()` (c:235); `packet_parse()`/`packet_get_body()` are header-only `ERTS_GLB_INLINE` wrappers. `packet_parser_init()` is called once from `erl_init.c`; the inet driver never calls it.
+- `utils.c` `#include`s `packet_parser.h` (line 39) but uses nothing from it — a vestigial include.
 - Files here that look like they should be generated but are hand-maintained: `atom.names`, `bif.tab`, `erl_dirty_bif.tab`, `predicates.tab`, `generators.tab`, `erl_alloc.types`, `erlang_dtrace.d`.
 - Conversely, `erl_atom_table.*`, `erl_bif_table.*`, `erl_bif_list.h`, `erl_guard_bifs.c`, `erl_dirty_bif_wrap.c`, `erl_alloc_types.h`, `beam_opcodes.*`, `beam_hot|warm|cold.h`, `*.ycf.h` are generated into `$(TTF_DIR)` — do not look for them here and do not add them.
 - The ycf outputs come from `erl_db.c` (NOT `erl_db_util.c`): `$(TTF_DIR)/erl_db_insert_list.ycf.h` is generated from `beam/erl_db.c`.
