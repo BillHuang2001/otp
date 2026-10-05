@@ -155,3 +155,249 @@ impl FromSet {
         self.ranges.is_empty()
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the space semantics ([`HeapSpace`]) and the from-set range index
+    //! ([`FromSet`]): geometry and the bump pointer, the live-region
+    //! [`HeapSpace::contains`] / [`HeapSpace::contains_term`] tests (with the exclusive
+    //! `top()` boundary and out-of-space pointers), [`HeapSpace::reset`], the
+    //! [`HeapSpace::from_heap`] / [`HeapSpace::into_heap`] round-trip and the [`FromSet`]
+    //! range bookkeeping.
+    //!
+    //! `unsafe` below only steps pointers this test just allocated itself (and never reads
+    //! uninitialised words); every block carries a `// SAFETY:` rationale.
+
+    use core::mem::size_of;
+    use core::ptr::addr_of;
+
+    use beam_alloc::default_allocator;
+    use beam_term::prelude::{is_boxed, is_list, make_atom, make_small, Atom, Eterm, NIL};
+
+    use super::*;
+
+    /// Capacity (in term words) used by the tests that do not care about the exact size.
+    const CAP: usize = 32;
+
+    /// An empty `capacity_words`-word semi-space over the default allocator.
+    fn new_space(capacity_words: usize) -> HeapSpace {
+        HeapSpace::new(capacity_words).expect("the default allocator satisfies the request")
+    }
+
+    #[test]
+    fn geometry_tracks_capacity_and_the_bump_pointer() {
+        let mut space = new_space(CAP);
+        let word = size_of::<Eterm>();
+
+        assert_eq!(space.capacity_words(), CAP);
+        assert_eq!(space.used_words(), 0);
+        assert_eq!(space.available_words(), CAP);
+        assert_ne!(space.base() as usize, 0, "a live space has a non-null base");
+        assert_eq!(
+            space.top(),
+            space.base(),
+            "an empty space bumps at its base"
+        );
+        assert_eq!(
+            space.limit() as usize,
+            space.base() as usize + CAP * word,
+            "the limit is `capacity` words past the base"
+        );
+
+        let base = space.base();
+        let limit = space.limit();
+
+        // A partial allocation (`N < CAP`) moves only the bump pointer.
+        const N: usize = 5;
+        // SAFETY: `space` exclusively owns `CAP` writable words and `N < CAP`, so the
+        // returned pointer covers `N` in-bounds, exclusively-owned words (never read).
+        let first = unsafe { space.heap_mut().alloc_words(N) }.expect("N words fit");
+
+        assert_eq!(first, base, "the first handed-out word is the base");
+        assert_eq!(space.used_words(), N);
+        assert_eq!(space.available_words(), CAP - N);
+        assert_eq!(space.top() as usize, base as usize + N * word);
+        assert_eq!(space.base(), base, "the base never moves");
+        assert_eq!(space.limit(), limit, "the limit never moves");
+        assert_eq!(space.capacity_words(), CAP, "the capacity never changes");
+    }
+
+    #[test]
+    fn with_allocator_builds_a_space_over_the_given_allocator() {
+        let alloc = default_allocator().clone();
+        let space = HeapSpace::with_allocator(alloc.clone(), 8).expect("heap allocation");
+
+        assert_eq!(space.capacity_words(), 8);
+        assert_eq!(space.used_words(), 0);
+        assert!(
+            std::sync::Arc::ptr_eq(space.allocator(), &alloc),
+            "the space keeps the allocator it was built with"
+        );
+    }
+
+    #[test]
+    fn contains_matches_the_live_region_only() {
+        let mut space = new_space(16);
+
+        // SAFETY: both requests are in-bounds of the 16-word space, which this test
+        // exclusively owns; no handed-out word is read.
+        let first = unsafe { space.heap_mut().alloc_words(2) }.expect("2 of 16 words");
+        // SAFETY: as above — 2 of the remaining 14 words.
+        let second = unsafe { space.heap_mut().alloc_words(2) }.expect("2 of 16 words");
+
+        let top = space.top();
+        let limit = space.limit();
+
+        // The live region is `[base, top)`: every handed-out word is contained.
+        assert!(space.contains(space.base() as *const Eterm));
+        assert!(space.contains(first as *const Eterm));
+        assert!(space.contains(second as *const Eterm));
+
+        // `top()` is one past the last handed-out word, so it is NOT contained — nor is
+        // anything in the unallocated `[top, limit)` tail, up to and including `limit`.
+        assert!(!space.contains(top as *const Eterm), "top() is exclusive");
+        assert!(!space.contains(top.wrapping_add(1) as *const Eterm));
+        assert!(!space.contains(limit.wrapping_sub(1) as *const Eterm));
+        assert!(!space.contains(limit as *const Eterm));
+
+        // Pointers outside the block are never contained.
+        assert!(!space.contains(space.base().wrapping_sub(1) as *const Eterm));
+        let local: Eterm = make_small(1);
+        assert!(
+            !space.contains(addr_of!(local)),
+            "a stack address is outside the space"
+        );
+    }
+
+    #[test]
+    fn contains_term_accepts_live_boxed_and_list_terms_only() {
+        let mut space = new_space(16);
+        let mut other = new_space(16);
+
+        let tuple = space
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("tuple");
+        let list = space.heap_mut().cons(make_small(3), NIL).expect("cons");
+        let elsewhere = other.heap_mut().tuple(&[make_small(4)]).expect("tuple");
+
+        // Boxed and list terms resident in the live region are contained.
+        assert!(is_boxed(tuple));
+        assert!(space.contains_term(tuple));
+        assert!(is_list(list));
+        assert!(space.contains_term(list));
+
+        // Immediates never are, however they are tagged.
+        assert!(!space.contains_term(make_small(7)));
+        assert!(!space.contains_term(NIL));
+        assert!(!space.contains_term(make_atom(Atom::from_raw(3))));
+
+        // A boxed term resident in a *different* space is not contained here.
+        assert!(is_boxed(elsewhere));
+        assert!(!space.contains_term(elsewhere));
+        assert!(other.contains_term(elsewhere));
+    }
+
+    #[test]
+    fn reset_rewinds_the_bump_pointer_and_invalidates_live_terms() {
+        let mut space = new_space(16);
+
+        let tuple = space
+            .heap_mut()
+            .tuple(&[make_small(1), make_small(2)])
+            .expect("tuple");
+        let base = space.base();
+        assert_eq!(space.used_words(), 3);
+        assert!(space.contains_term(tuple));
+
+        space.reset();
+
+        assert_eq!(space.used_words(), 0);
+        assert_eq!(space.top(), base, "reset rewinds to the base");
+        assert_eq!(space.available_words(), space.capacity_words());
+        assert_eq!(space.capacity_words(), 16, "reset does not resize");
+        assert!(
+            !space.contains_term(tuple),
+            "the previously live term is no longer in the live region"
+        );
+        assert!(!space.contains(ptr_val(tuple)));
+    }
+
+    #[test]
+    fn from_heap_and_into_heap_round_trip() {
+        let mut heap = Heap::new(24).expect("heap allocation");
+        heap.tuple(&[make_small(1), make_small(2)])
+            .expect("tuple fits");
+        let capacity = heap.capacity();
+        let used = heap.used();
+        let hp = heap.hp();
+        let hend = heap.hend();
+
+        let mut space = HeapSpace::from_heap(heap);
+
+        // The wrapping space reports exactly the source heap's geometry.
+        assert_eq!(space.capacity_words(), capacity);
+        assert_eq!(space.used_words(), used);
+        assert_eq!(space.available_words(), capacity - used);
+        assert_eq!(space.top(), hp);
+        assert_eq!(space.limit(), hend);
+        assert_eq!(
+            space.base() as usize + capacity * size_of::<Eterm>(),
+            hend as usize
+        );
+
+        // The space remains a usable term arena.
+        space.heap_mut().cons(make_small(3), NIL).expect("cons");
+
+        let heap = space.into_heap();
+        assert_eq!(heap.capacity(), capacity, "no reallocation, no resize");
+        assert_eq!(heap.used(), used + 2, "the cons cell is 2 words");
+    }
+
+    #[test]
+    fn from_set_indexes_the_added_live_ranges() {
+        let mut young = new_space(16);
+        let mut mature = new_space(16);
+        let mut set = FromSet::new();
+
+        assert!(set.is_empty(), "a fresh set has no ranges");
+        assert_eq!(set.words(), 0);
+        assert!(
+            !set.contains(young.top() as *const Eterm),
+            "an empty set contains nothing"
+        );
+
+        let head = young.heap_mut().cons(make_small(1), NIL).expect("cons");
+        let tuple = mature
+            .heap_mut()
+            .tuple(&[make_small(2), make_small(3)])
+            .expect("tuple");
+
+        set.add(&young);
+        assert!(!set.is_empty());
+        assert_eq!(set.words(), young.used_words());
+        assert!(set.contains(ptr_val(head)));
+        assert!(
+            !set.contains(young.top() as *const Eterm),
+            "the live range is half-open: top() is not evacuated"
+        );
+        assert!(
+            !set.contains(mature.top() as *const Eterm),
+            "the mature range is not in the set yet"
+        );
+
+        set.add(&mature);
+        assert!(set.contains(ptr_val(head)), "the young range is still in");
+        assert!(set.contains(ptr_val(tuple)));
+        assert_eq!(
+            set.words(),
+            young.used_words() + mature.used_words(),
+            "the covered words are the sum of the two live ranges"
+        );
+
+        // Out-of-range pointers belong to no range of the set.
+        assert!(!set.contains(young.base().wrapping_sub(1) as *const Eterm));
+        let local: Eterm = make_small(9);
+        assert!(!set.contains(addr_of!(local)));
+    }
+}
