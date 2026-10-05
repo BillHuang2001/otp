@@ -6,10 +6,10 @@
 //! `lib/erl_interface/src/connect/ei_connect.c` (`send_name`/`send_challenge`/
 //! `send_challenge_reply`/`send_challenge_ack`/`recv_*`) and `dist.c`.
 //!
-//! The v6 challenge digest is `MD5(cookie ++ decimal(challenge))`. No crypto
-//! dependency is available in Milestone 1, so the digest is carried **opaquely**
-//! and compared through the [`ChallengeDigest`] hook; only the MD5 *value* is
-//! pluggable.
+//! The v6 challenge digest is `MD5(cookie ++ decimal(challenge))`. The message
+//! codecs carry the 16-byte digest **opaquely** and compare it through the
+//! [`ChallengeDigest`] hook, so the digest algorithm stays pluggable;
+//! [`crate::auth::Md5Digest`] is the concrete (RFC 1321) provider used on the wire.
 
 use beam_common::{BeamError, Result};
 

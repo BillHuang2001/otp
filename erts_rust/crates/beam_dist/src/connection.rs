@@ -47,19 +47,24 @@
 //! carries the single `131`. An established packet is therefore
 //!
 //! ```text
-//! 131 'D' NumberOfAtomCacheRefs [Flags] [refs]   'h'|'i' arity DOP control-term* [message]
+//! 131 'D' NumberOfAtomCacheRefs [Flags] [refs]   'h'|'i' arity 'a' DOP control-term* [message]
 //! └──────────── distribution header ──────────┘  └──────── body-form tuple + terms ───────┘
 //! ```
 //!
-//! [`Connection::send_control`] builds that tuple image (and [`Connection::recv`]
-//! decodes it back). The two private helpers in between —
-//! `encode_control_tuple`/`decode_message_body` — own the tuple framing; the
-//! public [`ControlMessage`] stays *flattened*: [`ControlMessage::terms`] holds the
-//! control arguments followed, for a `send` opcode, by the trailing message term
-//! (so `{DOP_REG_SEND, From, Cookie, ToName} -- Message` arrives as
-//! `dop + From + Cookie + ToName + Message`). The arity rule mirrors
-//! [`crate::control::decode_control`]: an **exact** [`Dop::arity`] control arguments,
-//! except the variable-arity `DOP_ALTACT_SIG_SEND`.
+//! (`'h'`/`'i'` = `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT`, `'a'` = `SMALL_INTEGER_EXT`,
+//! so the opcode is a real small-integer term.)
+//!
+//! [`Connection::send_control`] builds that tuple image through
+//! [`crate::control::encode_control`] (and [`Connection::recv`] decodes it back
+//! through [`crate::control::decode_control`]). This module keeps only the
+//! distribution-header/fragment envelope; [`crate::control`] owns the
+//! control-term codec. The public [`ControlMessage`] is *flattened*:
+//! [`ControlMessage::terms`] holds the control arguments followed, for a `send`
+//! opcode, by the trailing message term (so
+//! `{DOP_REG_SEND, From, Cookie, ToName} -- Message` arrives as
+//! `From + Cookie + ToName + Message`). The arity rule lives in [`crate::control`]:
+//! an **exact** [`Dop::arity`] control arguments, except the variable-arity
+//! `DOP_ALTACT_SIG_SEND`.
 //!
 //! # Errors
 //!
@@ -75,14 +80,13 @@ use std::net::TcpStream;
 use std::time::Duration;
 
 use beam_alloc::Heap;
-use beam_codec::{AtomCache, AtomEncoding, Decoder, Encoder, LARGE_TUPLE_EXT, SMALL_TUPLE_EXT};
+use beam_codec::AtomEncoding;
 use beam_common::{BeamError, Result};
-use beam_term::prelude::{is_small, make_small, signed_value};
 use beam_term::{AtomTable, Eterm};
 
 use crate::atom_cache::ReceiveAtomCache;
 use crate::auth::{gen_challenge, gen_digest, verify};
-use crate::control::ControlMessage;
+use crate::control::{decode_control, encode_control, ControlMessage};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -515,7 +519,7 @@ impl<T: Transport> Connection<T> {
     /// message term last — see [`Connection::send_message`]). They are encoded on
     /// the wire as the real ETF tuple `{DOP_*, …}` (see the module docs).
     pub fn send_control(&mut self, dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<()> {
-        let control = encode_control_tuple(dop, terms, atoms)?;
+        let control = encode_control(dop, terms, atoms)?;
         self.send_payload(&control, atoms)
     }
 
@@ -559,7 +563,7 @@ impl<T: Transport> Connection<T> {
         let (header, offset) = parse_header(&body, atoms)?;
         self.recv_cache.apply(&header)?;
         let payload = body.get(offset..).ok_or(BeamError::BadArg)?;
-        decode_message_body(payload, heap, atoms, self.recv_cache.table())
+        decode_control(payload, heap, atoms, Some(self.recv_cache.table()))
     }
 
     /// Records the outbound payload, prepending the distribution header and
@@ -641,158 +645,6 @@ fn parse_header(body: &[u8], atoms: &mut AtomTable) -> Result<(DistHeader, usize
     }
 }
 
-/// Whether a control opcode's message carries the message term after the control
-/// tuple (`dist.c`: `/* {DOP_SEND, From, To} -- Message */`).
-fn carries_message(dop: Dop) -> bool {
-    matches!(
-        dop,
-        Dop::Send
-            | Dop::SendTt
-            | Dop::SendSender
-            | Dop::SendSenderTt
-            | Dop::RegSend
-            | Dop::RegSendTt
-            | Dop::AliasSend
-            | Dop::AliasSendTt
-            | Dop::AltactSigSend
-    )
-}
-
-/// Appends the body-form ETF image of `term` (`Encoder::new_body`, no
-/// `VERSION_MAGIC`) to `body`.
-fn append_body_term(body: &mut Vec<u8>, term: Eterm, atoms: &AtomTable) -> Result<()> {
-    let mut encoder = Encoder::new_body(atoms);
-    encoder.encode(term)?;
-    body.extend_from_slice(&encoder.finish());
-    Ok(())
-}
-
-/// Encodes a control message into its on-wire **body form**: the ETF tuple
-/// `{DOP_*, …}` (opcode first) followed, for a `send` opcode, by the message term
-/// (`dist.c:2205`, `2468`).
-///
-/// `terms` is the *flattened* shape [`Connection::send_control`] documents: the
-/// [`Dop::arity`] control arguments and, when the opcode carries a message, the
-/// single trailing message term. The message is split off only when the count is
-/// exactly `arity + 1`; otherwise every element is a control argument, which keeps
-/// the variable-arity tolerance of `DOP_ALTACT_SIG_SEND` (`dist.c:2625`:
-/// `tuple_arity >= 4`).
-///
-/// The opcode is a real small-integer term (`external.c:6680-6685`:
-/// `ep[0] == SMALL_TUPLE_EXT && ep[1] == arity && ep[2] == SMALL_INTEGER_EXT &&
-/// ep[3] == DOP_*`). Everything is body-form — no `VERSION_MAGIC` byte, because the
-/// distribution header carries the single `131` (`external.c:772`, `1231`).
-fn encode_control_tuple(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<Vec<u8>> {
-    let has_message = carries_message(dop) && terms.len() == dop.arity() + 1;
-    let (control_terms, message) = if has_message {
-        (&terms[..dop.arity()], Some(terms[dop.arity()]))
-    } else {
-        (terms, None)
-    };
-
-    // The control tuple `{DOP_*, …}` — the opcode is its first element.
-    let arity = control_terms.len() + 1;
-    let mut body = Vec::new();
-    if arity > u8::MAX as usize {
-        body.push(LARGE_TUPLE_EXT);
-        body.extend_from_slice(&(arity as u32).to_be_bytes());
-    } else {
-        body.push(SMALL_TUPLE_EXT);
-        body.push(arity as u8);
-    }
-    append_body_term(&mut body, make_small(i64::from(dop.as_u8())), atoms)?;
-    for &term in control_terms {
-        append_body_term(&mut body, term, atoms)?;
-    }
-    // The `send` opcodes carry the message term after the control tuple.
-    if let Some(message) = message {
-        append_body_term(&mut body, message, atoms)?;
-    }
-    Ok(body)
-}
-
-/// Decodes a control body: the ETF tuple `{DOP_*, …}` plus, for a `send` opcode,
-/// the trailing message term.
-///
-/// The tuple's arity is authoritative (`dist.c:2205`), so exactly that many
-/// elements are decoded — the first is the opcode (which must be a small integer),
-/// the rest are the control arguments. A `send` opcode then contributes one more
-/// term (the message). The result is the *flattened* [`ControlMessage`] shape, so
-/// the public API is unchanged.
-///
-/// The arity rule mirrors [`crate::control::decode_control`]: the control
-/// arguments must number exactly [`Dop::arity`], except the variable-arity
-/// `DOP_ALTACT_SIG_SEND`, which accepts any count `>=` it. A malformed tuple
-/// (wrong tag, short, wrong arity, non-small opcode, trailing bytes) is
-/// [`BeamError::BadArg`].
-fn decode_message_body(
-    payload: &[u8],
-    heap: &mut Heap,
-    atoms: &mut AtomTable,
-    cache: &AtomCache,
-) -> Result<ControlMessage> {
-    // The control tuple header: `SMALL_TUPLE_EXT` + an 8-bit arity, or
-    // `LARGE_TUPLE_EXT` + a 32-bit big-endian arity (`external.h`).
-    let (arity, offset) = match payload.split_first() {
-        Some((&SMALL_TUPLE_EXT, rest)) => {
-            let arity = usize::from(*rest.first().ok_or(BeamError::BadArg)?);
-            (arity, 2usize)
-        }
-        Some((&LARGE_TUPLE_EXT, rest)) => {
-            let bytes = rest.get(..4).ok_or(BeamError::BadArg)?;
-            let arity = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-            (arity as usize, 5usize)
-        }
-        _ => return Err(BeamError::BadArg),
-    };
-    // A control tuple always holds at least the opcode.
-    if arity == 0 {
-        return Err(BeamError::BadArg);
-    }
-
-    let stream = payload.get(offset..).ok_or(BeamError::BadArg)?;
-    let mut decoder = Decoder::new_body(stream).with_atom_cache(cache);
-
-    // The first tuple element is the opcode — a small integer (`dist.c:2206`).
-    let opcode = decoder.decode(heap, atoms)?;
-    if !is_small(opcode) {
-        return Err(BeamError::BadArg);
-    }
-    let dop = u8::try_from(signed_value(opcode))
-        .ok()
-        .and_then(Dop::from_u8)
-        .ok_or(BeamError::BadArg)?;
-
-    // The remaining tuple elements are the control arguments.
-    let mut terms = Vec::with_capacity(arity.saturating_sub(1));
-    for _ in 1..arity {
-        terms.push(decoder.decode(heap, atoms)?);
-    }
-
-    let arity_ok = match dop {
-        Dop::AltactSigSend => terms.len() >= dop.arity(),
-        _ => terms.len() == dop.arity(),
-    };
-    if !arity_ok {
-        return Err(BeamError::BadArg);
-    }
-
-    // A `send` opcode carries the message term after the control tuple. It is
-    // decoded only when the wire actually has a trailing term: a control-only form
-    // (exactly the control arguments, no message) is accepted too, matching the
-    // lenient `terms.len() >= Dop::arity()` the flattened decoder used.
-    if carries_message(dop) && decoder.remaining() > 0 {
-        terms.push(decoder.decode(heap, atoms)?);
-    }
-
-    // The tuple arity and (for `send`) the message must account for every byte.
-    if decoder.remaining() != 0 {
-        return Err(BeamError::BadArg);
-    }
-
-    Ok(ControlMessage { dop, terms })
-}
-
 /// The largest body an established packet can advertise
 /// (`framing::MAX_PACKET_BODY`); re-exported here so callers of this module can
 /// reason about the bound without reaching into [`crate::framing`].
@@ -802,6 +654,7 @@ pub const MAX_ESTABLISHED_PACKET_BODY: usize = MAX_PACKET_BODY;
 mod tests {
     use super::*;
     use crate::transport::MemoryTransport;
+    use beam_codec::{Encoder, SMALL_TUPLE_EXT};
     use beam_term::prelude::{make_atom, make_small, NIL};
 
     const COOKIE: &[u8] = b"a-test-cookie";
@@ -1070,7 +923,7 @@ mod tests {
     /// header (`131, 'D', 0`) then the real `{DOP_*, …}` tuple image.
     fn packet_body(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Vec<u8> {
         let mut body = vec![beam_codec::VERSION_MAGIC, DIST_HEADER, 0];
-        body.extend_from_slice(&encode_control_tuple(dop, terms, atoms).expect("encode the tuple"));
+        body.extend_from_slice(&encode_control(dop, terms, atoms).expect("encode the tuple"));
         body
     }
 
@@ -1107,7 +960,7 @@ mod tests {
         let atoms = AtomTable::new();
         let mut body = vec![PASS_THROUGH];
         body.extend_from_slice(
-            &encode_control_tuple(Dop::Link, &[make_small(3), make_small(4)], &atoms).unwrap(),
+            &encode_control(Dop::Link, &[make_small(3), make_small(4)], &atoms).unwrap(),
         );
 
         let mut conn = connection(framed(&body, ESTABLISHED_FRAMING));
@@ -1143,7 +996,7 @@ mod tests {
     fn recv_reassembles_a_fragment_sequence() {
         let atoms = AtomTable::new();
         let control =
-            encode_control_tuple(Dop::Link, &[make_small(7), make_small(8)], &atoms).unwrap();
+            encode_control(Dop::Link, &[make_small(7), make_small(8)], &atoms).unwrap();
         let frames = split(3, &[0], &control, 4).unwrap();
         assert!(frames.len() > 1, "the payload must span fragments");
 
@@ -1163,7 +1016,7 @@ mod tests {
     fn recv_rejects_a_message_interleaved_with_a_fragment_sequence() {
         let atoms = AtomTable::new();
         let control =
-            encode_control_tuple(Dop::Link, &[make_small(1), make_small(2)], &atoms).unwrap();
+            encode_control(Dop::Link, &[make_small(1), make_small(2)], &atoms).unwrap();
         let mut payload = vec![beam_codec::VERSION_MAGIC, DIST_HEADER, 0];
         payload.extend_from_slice(&control);
         let frames = split(4, &[0], &control, 4).unwrap();

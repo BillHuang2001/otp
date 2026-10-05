@@ -12,7 +12,7 @@
 //! `erts/doc/guides/erl_ext_dist.md` §"Normal Distribution Header".
 
 use beam_alloc::Heap;
-use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, VERSION_MAGIC};
+use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, VERSION_MAGIC};
 use beam_common::{BeamError, Result};
 use beam_dist::atom_cache::{
     apply_header, atom_to_cix, slot_index, OutboundAtomCache, ReceiveAtomCache, SegmentCache,
@@ -61,15 +61,34 @@ impl Receiver {
     }
 }
 
-/// A `DOP_SEND` control body whose single argument is an `ATOM_CACHE_REF` at
-/// `index` (the second argument is a plain small integer).
+/// A `DOP_SEND` control message whose second argument is an `ATOM_CACHE_REF` at
+/// `index` (the first argument is the plain small integer `7`). The message is the
+/// real tuple form `{DOP_SEND, Arg1, Arg2}`.
 fn send_body_with_ref(index: u8) -> Vec<u8> {
-    vec![DOP_SEND, SMALL_INTEGER_EXT, 7, ATOM_CACHE_REF_EXT, index]
+    vec![
+        SMALL_TUPLE_EXT,
+        3,
+        SMALL_INTEGER_EXT,
+        DOP_SEND,
+        SMALL_INTEGER_EXT,
+        7,
+        ATOM_CACHE_REF_EXT,
+        index,
+    ]
 }
 
-/// A `DOP_SEND` body whose single argument is an inline small integer.
+/// A `DOP_SEND` control message whose first argument is an inline small integer.
 fn send_body_with_int(value: u8) -> Vec<u8> {
-    vec![DOP_SEND, SMALL_INTEGER_EXT, value, SMALL_INTEGER_EXT, 1]
+    vec![
+        SMALL_TUPLE_EXT,
+        3,
+        SMALL_INTEGER_EXT,
+        DOP_SEND,
+        SMALL_INTEGER_EXT,
+        value,
+        SMALL_INTEGER_EXT,
+        1,
+    ]
 }
 
 // ---------------------------------------------------------------------------
@@ -161,7 +180,16 @@ fn a_later_header_re_uses_the_atoms_of_an_earlier_one() {
         .expect("first message decodes");
 
     // `DOP_SEND` has arity 2: both cached refs must resolve.
-    let body = vec![DOP_SEND, ATOM_CACHE_REF_EXT, 0, ATOM_CACHE_REF_EXT, 1];
+    let body = vec![
+        SMALL_TUPLE_EXT,
+        3,
+        SMALL_INTEGER_EXT,
+        DOP_SEND,
+        ATOM_CACHE_REF_EXT,
+        0,
+        ATOM_CACHE_REF_EXT,
+        1,
+    ];
     let message = rx
         .receive(&second_header, &body)
         .expect("both cached refs resolve");
@@ -291,6 +319,9 @@ fn outbound_refs_cross_the_segment_boundary_and_still_resolve() {
 
     let mut rx = Receiver::new();
     let body = [
+        SMALL_TUPLE_EXT,
+        3,
+        SMALL_INTEGER_EXT,
         DOP_SEND,
         ATOM_CACHE_REF_EXT, 0,
         ATOM_CACHE_REF_EXT, 1,
