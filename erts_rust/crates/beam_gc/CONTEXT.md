@@ -219,7 +219,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
 - `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
-- `src/mso.rs` → `RefCount`, `Mso`, `MsoHandle`, `OffHeap` (off-heap refcounted large objects)
+- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
 - `src/stats.rs` → `GcStats`
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
