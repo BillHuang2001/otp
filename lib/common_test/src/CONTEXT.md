@@ -135,6 +135,23 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `../test/` covers the framework itself, driving it through the public `ct` API and `ct_run` (`ct_hooks_SUITE`, `ct_netconfc_SUITE`, `ct_doctest_SUITE`, `ct_release_test_SUITE`, ...); `ct_release_test_SUITE` is skipped in `../test/common_test_gh.spec` because OTP versions vary.
 - Several suites need an SSH daemon, a NETCONF server or a running release, so failures are often environmental (missing `sshd`, missing `snmp`/`inets`) rather than code bugs.
 
+## Routing Table
+No subdirectories — route by module group; all paths are in this directory.
+- User-facing API & CLI → `ct.erl`, `ct_run.erl`
+- Suite/testcase engine → `ct_framework.erl`, `ct_suite.erl`, `test_server_ctrl.erl`, `test_server.erl`, `test_server_sup.erl`, `ct_groups.erl`, `ct_repeat.erl`
+- Run state & shared helpers → `ct_util.erl` (+ `ct_util.hrl`), `ct_make.erl`, `ct_rpc.erl`, `ct_gen_conn.erl`, `ct_default_gl.erl`
+- Target nodes & IO → `test_server_node.erl`, `test_server_gl.erl`, `test_server_io.erl`, `test_server_internal.hrl`
+- Test specifications → `ct_testspec.erl`
+- Configuration → `ct_config.erl`, `ct_config_plain.erl`, `ct_config_xml.erl`
+- Logging / events / reporting → `ct_logs.erl`, `erl2html2.erl`, `ct_event.erl`, `ct_conn_log_h.erl`, `ct_master_logs.erl`, `ct_master_status.erl`, `ct_master_event.erl`
+- Hooks → `ct_hooks.erl`, `ct_hooks_lock.erl`, `cth_log_redirect.erl`, `cth_conn_log.erl`, `cth_surefire.erl`
+- Distributed execution → `ct_master.erl`, `ct_slave.erl`
+- Connectivity helpers → `ct_telnet.erl`, `ct_telnet_client.erl`, `unix_telnet.erl`, `ct_ftp.erl`, `ct_ssh.erl`, `ct_snmp.erl`, `ct_netconfc.erl` (+ `ct_netconfc.hrl`)
+- Optional features → `ct_cover.erl`, `ct_property_test.erl`, `ct_doctest.erl`, `ct_release_test.erl`, `cte_track.erl`
+- Build/app metadata → `Makefile`, `common_test.app.src`, `common_test.appup.src`
+- `../include/` → public headers (`ct.hrl`, `ct_event.hrl`, `ct_property_test.hrl`); sibling — read-only, escalate writes to `../`
+- `../test/`, `../test_server/` → CT's own test suites and the TS harness; sibling — read-only, escalate writes to `../`
+
 ## See Also
 - `../include/` — public headers (`ct.hrl`, `ct_event.hrl`, `ct_property_test.hrl`); read-only, writes escalate to `../`.
 - `../doc/` — user documentation and `docs.exs`; `../doc/notes.md` is the release notes for CT.
