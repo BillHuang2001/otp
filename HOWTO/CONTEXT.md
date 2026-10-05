@@ -51,7 +51,7 @@ Reference/manual documentation for the *product* lives in `../system/` and the p
 ## Notes for Agents
 - Do NOT edit `configure`/`Makefile` to fix issues described here; these docs only *describe* the build. The `.src`/`.in` sources live at the repo root and in `../make/`.
 - The `%OTP-REL%` / `%OTP-VSN%` / `%EX_DOC_VSN%` tokens in `INSTALL.md`, `INSTALL-CROSS.md`, `INSTALL-WIN32.md`, `INSTALL-WIN32-OLD.md` are deliberate placeholders substituted when the docs are built: `../system/doc/Makefile` (target `installation_guide/%.md`) sed-replaces them while copying the HOWTOs into the installation guide, using `OTP_VERSION` and `make/ex_doc_vsn` (currently `v0.40.4`) as the values. They are not a defect — don't "complete" them.
-- `../TAR.include` lists `HOWTO/MARKDOWN.md`, which does not exist in the tree (it was removed when docs moved to ExDoc). The file is only referenced by `../scripts/license-header.es`'s ignore list, so no in-repo build breaks; flagged here because it is how an outsider notices the stale entry.
+- `../TAR.include` lists `HOWTO/MARKDOWN.md`, which does not exist in the tree (it was removed when docs moved to ExDoc). No in-repo build script consumes `TAR.include` — only `../scripts/license-header.es`'s ignore list mentions it — so nothing breaks; flagged here because it is how an outsider notices the stale entry.
 - `DEVELOPMENT.md` explicitly warns that the non-`test`/non-`docs` make targets it showcases are *internal and unsupported* (no stability guarantee); treat only `INSTALL.md`/`TESTING.md` targets as the supported surface.
 - `INSTALL-WIN32-OLD.md` documents an environment the OTP team no longer tests; prefer `INSTALL-WIN32.md` and treat the OLD file as historical reference only.
 
