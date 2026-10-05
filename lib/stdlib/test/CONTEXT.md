@@ -78,7 +78,7 @@ All suites run against an **installed OTP release**, not against the build tree 
 - `zstd_SUITE:generate_dict/0` (not in `all/0`) writes into `$ERL_TOP/lib/stdlib/test/zstd_SUITE_data` and shells out to `zstd --train`; the checked-in `zstd_SUITE_data/dict` is its output.
 - `copyright_generator:erlang/0` is called only by `run_pcre_tests`' test-module generators, which is why it is intentionally absent from `MODULES`.
 - `stdlib_SUITE:appup_test` depends on `otp_versions.table` being reachable from the released `otp_vsns` beam (or `../priv/`) and logs/skips on a development version — it is not a reliable indicator of a real bug in a source checkout.
-- Some suites assume `ERL_TOP` and the source tree are present at runtime (`zstd_SUITE`, `shell_docs_SUITE`, `io_proto_SUITE` via `TERM`), so they can behave differently when only the release dir is kept.
+- Some suites assume `ERL_TOP` and the source tree are present at runtime (`zstd_SUITE` reads `$ERL_TOP/lib/stdlib/test/zstd_SUITE_data`, `shell_docs_SUITE` writes there), so they can behave differently when only the release dir is kept; `io_proto_SUITE` also branches on the `TERM` environment variable.
 - Runtime is dominated by the large suites (`ets_SUITE` 10.4k lines, `qlc_SUITE` 8.1k, `erl_lint_SUITE` 6.2k, `supervisor_SUITE` 4.1k, `dets_SUITE` 4.0k, `shell_SUITE` 3.7k); CI caps the whole run at 90 minutes.
 
 ## Routing Table
