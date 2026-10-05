@@ -190,9 +190,6 @@ unit tests + 12 integration tests):
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
   `ERTS_POLL_USE_WAKEUP` semantics beyond `Waker`; concurrent registration races are not guarded.
-- **The `Poller` owns the single mio wakeup handle** (created in `Poller::new`); `Waker` is a
-  cloneable `Arc`-backed handle to it, safe to obtain and call repeatedly and from any thread, and
-  safe to drop — the wakeup handle stays alive for as long as the `Poller` does.
 - **Readiness is edge-triggered** (`mio` registers with `EPOLLET`), so a driver *must* drain to
   `EAGAIN` on every callback — `FdDriver` reads/writes in a `EAGAIN`-terminated loop for exactly
   this reason. `handle_events` dispatches on `Ready::readable()`/`Ready::writable()` only, so a
