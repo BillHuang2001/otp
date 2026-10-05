@@ -1,0 +1,40 @@
+//! `pub(crate)` constructors for the allocation-failure errors.
+//!
+//! This module adds **no** error type of its own: the binding contract (crate-layer
+//! `CONTEXT.md` §3) is that `beam_common::{Result, BeamError}` is the one error
+//! surface of every crate. These helpers exist only so the failure sites do not each
+//! open-code an [`AllocFailure`], and they stay `pub(crate)`: dependents see the
+//! resulting `BeamError` values, never the constructors.
+
+use beam_common::{AllocFailure, AllocKind, BeamError};
+use beam_term::prelude::Eterm;
+
+/// Builds the `out_of_memory` failure for an allocation of `requested` bytes of
+/// `kind`.
+pub(crate) fn oom(kind: AllocKind, requested: usize) -> BeamError {
+    BeamError::Alloc(AllocFailure::new(kind, requested))
+}
+
+/// A carrier could not be obtained from the OS (`mmap` failure or a
+/// `max_footprint` cap). Classified as [`AllocKind::Carrier`].
+pub(crate) fn carrier_failure(bytes: usize) -> BeamError {
+    oom(AllocKind::Carrier, bytes)
+}
+
+/// A per-process [`crate::heap::Heap`] ran out of room for `words` term words.
+///
+/// The word count is converted to bytes so the carried [`AllocFailure`] is uniform.
+/// The engine/GC layer treats this as *collect and retry*, **not** a fatal OOM (see
+/// the crate `CONTEXT.md`, Design Decisions).
+pub(crate) fn heap_exhausted(words: usize) -> BeamError {
+    oom(AllocKind::Heap, words * core::mem::size_of::<Eterm>())
+}
+
+/// An allocation requested an alignment the allocator cannot satisfy.
+///
+/// [`BeamError::BadArg`] carries no payload, so the offending alignment is only
+/// observable through the debug log.
+pub(crate) fn bad_align(align: usize) -> BeamError {
+    beam_common::beam_debug!("beam_alloc: unsupported allocation alignment {align}");
+    BeamError::BadArg
+}
