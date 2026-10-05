@@ -108,6 +108,10 @@ impl Machine {
         pc: u32,
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
+        // Bind the running module's literal area so the operand seam can resolve
+        // `Operand::Literal(idx)` (the module is fixed for the whole run; see the
+        // `Machine::literals` field docs). `reset()` cleared any previous binding.
+        self.set_literals(module.literals.clone());
         let labels = build_label_map(module);
         self.run_loop_with_map(module, &labels, func, pc, ctx)
     }

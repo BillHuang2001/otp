@@ -30,25 +30,24 @@
 //! | `bits/1` | `<<Rest/binary, H:8>>` | `bs_start_match3`, `bs_match`, `bs_get_position`, `bs_get_tail`, `bs_set_position`, `bs_create_bin` |
 //! | `module_info/0,1` | compiler-generated | `call_ext_only` (+ `move`) |
 //!
-//! # The honest unsupported record
+//! # Static literals and the remaining unsupported record
 //!
-//! One export family cannot be completed because its IR carries a **static literal**
-//! (`Operand::Literal`) whose *generic* read path is not implemented: `read_operand`
-//! (the engine's operand seam, `beam_engine::operand`) resolves
-//! `X`/`Y`/`FloatReg`/`Integer`/`Atom`/`Nil`/`Character`/`Typed` but returns the
-//! typed `unsupported("operand: literal")` raise for `Literal`.
+//! The `LitT` static literals (`Operand::Literal`) are **supported**: the interpreter
+//! binds the running module's decoded literal area to the [`Machine`] for the run, so
+//! the generic operand seam (`beam_engine::operand::read_operand`) resolves
+//! `Literal(idx)` alongside `X`/`Y`/`FloatReg`/`Integer`/`Atom`/`Nil`/`Character`/
+//! `Typed`. This is what lets two exports complete:
 //!
 //! * `map_ops/2` — its first instruction is
 //!   `PutMapAssoc { source: Literal(#{a=>1,b=>2}), .. }`.
 //! * `safe_div(A, 0)` — its first clause is
 //!   `Move { src: Literal({error,division_by_zero}) }`.
 //!
-//! Each such call is asserted to fail with **exactly** that typed raise (the
-//! `unsupported_opcode: operand: literal` reason atom) — never silently skipped.
-//! `safe_div(A, B)` with `B =/= 0` skips the literal clause and *is* run end to end,
-//! so the `try`/`try_end`/`fconv`/`fdiv`/`fmove` path is still exercised.
+//! A `Literal` index the module does not define stays the typed
+//! `unsupported("operand: literal")` raise (never a substituted term); see the
+//! engine's `src/operand.rs` unit tests.
 //!
-//! `bits/1` is a second, distinct gap: its clause body builds `<<Rest/binary, H:8>>`
+//! `bits/1` is the one remaining gap: its clause body builds `<<Rest/binary, H:8>>`
 //! via `bs_create_bin` with an **`append` segment**, which the M1 bitstring family
 //! does not implement (`unsupported("bs_create_bin: segment type append")`). The
 //! match side (`bs_start_match3`/`bs_match`/`bs_get_position`) does execute, and the
@@ -594,20 +593,26 @@ fn safe_div_non_zero_divisor_returns_ok_with_the_float_quotient() {
 }
 
 #[test]
-fn safe_div_zero_divisor_hits_the_static_literal_operand_gap() {
-    // coverage:safe_div(1, 0) = {error, division_by_zero}, but the first clause
-    // compiles that constant tuple to `Move { src: Operand::Literal(..) }`, and the
-    // generic operand read path does not resolve a static literal:
-    // `beam_engine::operand::read_operand` returns `unsupported("operand: literal")`.
+fn safe_div_zero_divisor_returns_the_literal_error_tuple() {
+    // coverage:safe_div(1, 0) = {error, division_by_zero} (system ERTS, OTP 29.1.1).
+    //
+    // `is_eq_exact x1 = 0` takes the first clause, which compiles the constant tuple
+    // to `move {literal,{error,division_by_zero}},{x,0}` — a static literal now read
+    // through the machine's bound literal area (the `{error,badarith}` literal of the
+    // catch clause, label 21, is not reached on this path).
     let module = load();
     let mut ctx = CoverageCtx::new();
-    let result = run(
-        &mut ctx,
-        &module,
-        "safe_div",
-        &[make_small(1), make_small(0)],
+    let result = run(&mut ctx, &module, "safe_div", &[make_small(1), make_small(0)])
+        .expect("safe_div(1, 0)");
+    assert_eq!(terms::tuple_arity(result).unwrap(), 2);
+    assert_eq!(
+        terms::tuple_element(result, 0).unwrap(),
+        make_atom(atom(&module, "error"))
     );
-    assert_unsupported(result, "operand: literal");
+    assert_eq!(
+        terms::tuple_element(result, 1).unwrap(),
+        make_atom(atom(&module, "division_by_zero"))
+    );
 }
 
 #[test]
@@ -635,20 +640,28 @@ fn safe_div_badarith_from_fconv_propagates_as_a_typed_error() {
 // ---------------------------------------------------------------------------
 
 #[test]
-fn map_ops_hits_the_static_literal_operand_gap() {
-    // coverage:map_ops(a, 42) = 52, but the first instruction is
-    // `PutMapAssoc { source: Operand::Literal(#{a=>1,b=>2}), .. }`, and the map
-    // family reads its source through the generic operand seam, whose static-literal
-    // path is unimplemented (`unsupported("operand: literal")`).
+fn map_ops_reads_the_literal_source_map_and_returns_the_updated_key() {
+    // The module's first instruction is
+    // `put_map_assoc {f,0},{literal,#{a=>1,b=>2}},{x,2},2,[{atom,c},{x,1}]`, so this
+    // export exercises the static-literal operand path end to end.
+    //
+    // Oracle-derived values (system ERTS, OTP 29.1.1 / erts-17.1):
+    //   coverage:map_ops(a, 42) = 52   (M2 = #{a=>52,b=>2,c=>42}; `a` was updated)
+    //   coverage:map_ops(b, 42) = 2    (untouched by either update)
+    //   coverage:map_ops(c, 42) = 42   (inserted by the first update)
+    //   coverage:map_ops(99, 42) = 0   (the `maps:get/3` default clause, label 27)
     let module = load();
     let mut ctx = CoverageCtx::new();
-    let result = run(
-        &mut ctx,
-        &module,
-        "map_ops",
-        &[make_atom(atom(&module, "a")), make_small(42)],
-    );
-    assert_unsupported(result, "operand: literal");
+    for (key, expected) in [
+        (make_atom(atom(&module, "a")), 52),
+        (make_atom(atom(&module, "b")), 2),
+        (make_atom(atom(&module, "c")), 42),
+        (make_small(99), 0),
+    ] {
+        let result = run(&mut ctx, &module, "map_ops", &[key, make_small(42)])
+            .expect("map_ops/2 must run");
+        assert_eq!(result, make_small(expected), "map_ops(key, 42) for {key:?}");
+    }
 }
 
 // ---------------------------------------------------------------------------

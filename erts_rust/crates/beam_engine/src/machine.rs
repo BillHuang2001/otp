@@ -12,7 +12,7 @@
 //! `trim`/`continuation`) are its building blocks.
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, Result};
-use beam_loader::{Atom, Label, Module};
+use beam_loader::{Atom, Label, Module, SharedLiteralArea};
 use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 
 use crate::context::ExecutionContext;
@@ -139,6 +139,27 @@ pub struct Machine {
     class_atoms: [Eterm; 3],
     /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
     pub(crate) max_register: u32,
+    /// The static-literal area of the **module currently being executed**.
+    ///
+    /// Bound at the start of every run ([`Machine::run_loop`] clones the `Arc`
+    /// out of the `&Module` being executed) and cleared by [`Machine::reset`].
+    /// It lets the shared operand seam ([`crate::operand::read_operand`]) resolve
+    /// `Operand::Literal(idx)` through [`Machine::literal`] without threading
+    /// `&Module` through every call site.
+    ///
+    /// **Why the binding cannot go stale mid-run.** Within one
+    /// [`Machine::run_export`]/[`Machine::run_label`] the executing module is
+    /// fixed: labels are module-local and a cross-module call leaves the dispatch
+    /// loop through `CallExt` into the host [`ExecutionContext`], which never
+    /// re-enters the engine with a different `&Module` on the same run. A fresh
+    /// `run_*` calls [`Machine::reset`] (clearing this) and re-binds it, so the
+    /// area always matches the module being interpreted.
+    ///
+    /// A literal [`Eterm`] points into the area's **own** heap (never a process
+    /// heap). At Milestone 1 there is no GC, so reading/comparing/copying a
+    /// literal is safe; once the Stage-4 collector lands a literal must be treated
+    /// as permanent (never scanned/copied as a process-heap term).
+    literals: Option<SharedLiteralArea>,
 }
 
 impl Machine {
@@ -158,6 +179,7 @@ impl Machine {
             pending_exception: None,
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             max_register,
+            literals: None,
         };
         machine.reset();
         machine
@@ -281,6 +303,29 @@ impl Machine {
         // The class atoms belong to the module being run, so a reset (the start of
         // every `run_*`) invalidates them; the exceptions family reinstalls them.
         self.class_atoms = UNRESOLVED_CLASS_ATOMS;
+        // Likewise the literal area: it belongs to the module being run and is
+        // re-bound by `run_loop`.
+        self.literals = None;
+    }
+
+    /// Bind the literal area of the module about to be executed.
+    ///
+    /// Called once per run by the dispatch loop ([`crate::interpreter`]) with the
+    /// `Arc` cloned out of the `&Module` being executed; see the field docs for
+    /// why the binding is sound for the whole run.
+    pub(crate) fn set_literals(&mut self, literals: SharedLiteralArea) {
+        self.literals = Some(literals);
+    }
+
+    /// The static literal at `index` of the module currently being executed (an
+    /// `Operand::Literal(index)` reference).
+    ///
+    /// `None` when no module is bound (outside a run) or the index is outside the
+    /// module's `LitT` table. Delegates to
+    /// [`beam_loader::LiteralArea::get`] — the single source of truth for a
+    /// literal index.
+    pub fn literal(&self, index: u32) -> Option<Eterm> {
+        self.literals.as_ref()?.get(index)
     }
 
     /// Write `v` into X register `n`.

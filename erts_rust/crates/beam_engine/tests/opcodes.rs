@@ -11,17 +11,18 @@
 //! paths. Every error is a typed [`beam_common::BeamError`] — no test panics.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{Machine, MinimalContext};
 use beam_loader::{
-    Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Opcode, Operand, TestKind,
-    NO_FAIL,
+    Export, Function, HeapNeed, Import, ImportRef, Instr, Label, LiteralArea, Module, Opcode,
+    Operand, TestKind, NO_FAIL,
 };
 use beam_term::{
-    is_small, make_arityval, make_boxed, make_header, make_internal_pid, make_internal_port,
-    make_pid_data, make_port_data, make_small, signed_value, Atom, Eterm, HEADER_FLONUM,
-    HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, REF_SUBTAG,
+    is_small, make_arityval, make_atom, make_boxed, make_header, make_internal_pid,
+    make_internal_port, make_pid_data, make_port_data, make_small, signed_value, Atom, Eterm,
+    HEADER_FLONUM, HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -88,6 +89,15 @@ impl Fixture {
     fn finish(self) -> Module {
         self.module
     }
+
+    /// Decode `raw` — one ETF payload per literal, in `Operand::Literal` index
+    /// order — into the module's static-literal area, interning any atoms a payload
+    /// names in the module's own atom table (the loader's contract).
+    fn set_literals(&mut self, raw: &[Vec<u8>]) {
+        let area = LiteralArea::decode(raw, &mut self.module.atom_table)
+            .expect("decode the fixture literals");
+        self.module.literals = Arc::new(area);
+    }
 }
 
 /// Run `entry` with no BIF support.
@@ -137,6 +147,20 @@ fn run_inspected(
     (result, machine)
 }
 
+/// Assert `result` is the engine's typed `unsupported` raise for `what`
+/// (`beam_engine::error::unsupported`: the reason atom `unsupported_opcode: <what>`).
+fn assert_unsupported(result: Result<Eterm, BeamError>, what: &str) {
+    let want = format!("unsupported_opcode: {what}");
+    match result {
+        Err(BeamError::Raise(raise)) => assert_eq!(
+            raise.reason.as_atom(),
+            Some(want.as_str()),
+            "unexpected unsupported reason"
+        ),
+        other => panic!("expected the unsupported {what:?} raise, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Move / Swap / metadata
 // ---------------------------------------------------------------------------
@@ -163,6 +187,116 @@ fn move_writes_registers() {
     let entry = fixture.add_function("f", 0, code);
     let module = fixture.finish();
     assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(9)));
+}
+
+// ---------------------------------------------------------------------------
+// static literals (`Operand::Literal`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn move_from_a_static_literal_reads_the_decoded_term() {
+    // `move {literal,42},x0` — the interpreter binds the running module's decoded
+    // `LitT` area to the machine, so the shared operand reader resolves the
+    // literal (previously the typed `operand: literal` error).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Literal(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]); // term_to_binary(42)
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).unwrap(), make_small(42));
+}
+
+#[test]
+fn put_tuple2_builds_a_tuple_from_static_literals() {
+    // `put_tuple2 x0,{literal(1),literal(0)}` where literal 1 is `42` and literal 0
+    // is `{ok,17}` — both read through the operand seam into a freshly built tuple.
+    // The `MinimalContext` owns the heap the new tuple lives in, so it must stay
+    // alive while the result is inspected (the context outlives its boxed terms).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![Operand::Literal(1), Operand::Literal(0)],
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[
+        vec![131, 104, 2, 119, 2, 111, 107, 97, 17], // term_to_binary({ok,17})
+        vec![131, 97, 42],                           // term_to_binary(42)
+    ]);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let result = machine
+        .run_label(&module, entry, 0, &[], &mut ctx)
+        .expect("put_tuple2 from literals must run");
+
+    assert_eq!(beam_engine::terms::tuple_arity(result).unwrap(), 2);
+    assert_eq!(
+        beam_engine::terms::tuple_element(result, 0).unwrap(),
+        make_small(42)
+    );
+    let inner = beam_engine::terms::tuple_element(result, 1).unwrap();
+    assert_eq!(beam_engine::terms::tuple_arity(inner).unwrap(), 2);
+    assert_eq!(
+        beam_engine::terms::tuple_element(inner, 0).unwrap(),
+        make_atom(module.atom_table.lookup("ok").expect("ok is interned")),
+    );
+    assert_eq!(
+        beam_engine::terms::tuple_element(inner, 1).unwrap(),
+        make_small(17)
+    );
+    // The context owns the heap the terms were built in; drop it explicitly so the
+    // lifetime relationship is obvious.
+    drop(ctx);
+}
+
+#[test]
+fn move_from_a_missing_static_literal_is_a_typed_error() {
+    // The module defines one literal; referencing index 7 is a structural error and
+    // stays the documented typed error — the engine never substitutes a term.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Literal(7),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]);
+    let module = fixture.finish();
+    assert_unsupported(run(&module, entry, &[]), "operand: literal");
+}
+
+#[test]
+fn a_static_literal_is_not_a_valid_destination() {
+    // A literal names a term in the module's immutable area: it has no destination
+    // slot, so a `Literal` dst stays a typed error (never a silent write).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Literal(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]);
+    let module = fixture.finish();
+    assert_unsupported(run(&module, entry, &[]), "dst operand: literal");
 }
 
 #[test]
