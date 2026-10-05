@@ -383,7 +383,7 @@ fn select_wildcard_head_and_whole_object_body() {
     let spec = proper_list(&mut heap, &[clause]);
     let compiled = compile(spec, &atoms).unwrap();
 
-    let selected = t.select(&compiled, &atoms).unwrap();
+    let selected = t.select(&compiled, &atoms, &mut beam_alloc::Heap::new(4096).expect("heap")).unwrap();
     assert_eq!(selected.len(), 4);
     for k in 0..4 {
         let want = object(&mut heap, k, k * 10);
@@ -403,48 +403,50 @@ fn select_tuple_head_with_bind_and_single_element_body() {
         t.insert(object(&mut heap, k, k * 10), &atoms).unwrap();
     }
 
-    // Spec: [ {{'$1', '_'}, [], {'$1'}} ] — the key of every object.
+    // Spec: [ {{'$1', '_'}, [], ['$1']} ] — the key of every object. (A body
+    // element is an *expression*: the bare atom `'$1'`, not a one-element tuple.)
     let head = heap
         .tuple(&[
             interned_atom(&mut atoms, "$1"),
             interned_atom(&mut atoms, "_"),
         ])
         .unwrap();
-    let body = heap.tuple(&[interned_atom(&mut atoms, "$1")]).unwrap();
+    let body = proper_list(&mut heap, &[interned_atom(&mut atoms, "$1")]);
     let clause = heap.tuple(&[head, NIL, body]).unwrap();
     let spec = proper_list(&mut heap, &[clause]);
     let compiled = compile(spec, &atoms).unwrap();
 
-    let mut keys = t.select(&compiled, &atoms).unwrap();
+    let mut keys = t.select(&compiled, &atoms, &mut beam_alloc::Heap::new(4096).expect("heap")).unwrap();
     keys.sort_by(|a, b| cmp(*a, *b, &atoms));
     assert_eq!(keys, (0..5).map(make_small).collect::<Vec<_>>());
 }
 
 #[test]
-fn select_multi_element_body_is_badarg() {
+fn select_multi_element_body_returns_one_result_per_element() {
     let mut atoms = AtomTable::new();
-    let mut heap = Heap::new(64);
+    let mut heap = Heap::new(256);
     let mut t = new_table(TableKind::Set);
     t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
 
-    // Body {'$1', '_'} has two elements: M1 cannot build a fresh tuple, so the
-    // match spec is outside the supported subset.
-    let body = heap
-        .tuple(&[
+    // A body *list* with two elements yields two results (`'$1'` and `ok`) for the
+    // one matched object (verified against `erl`).
+    let body = proper_list(
+        &mut heap,
+        &[
             interned_atom(&mut atoms, "$1"),
-            interned_atom(&mut atoms, "_"),
-        ])
-        .unwrap();
+            interned_atom(&mut atoms, "ok"),
+        ],
+    );
     let clause = heap
         .tuple(&[interned_atom(&mut atoms, "_"), NIL, body])
         .unwrap();
     let spec = proper_list(&mut heap, &[clause]);
     let compiled = compile(spec, &atoms).unwrap();
 
-    assert!(matches!(
-        t.select(&compiled, &atoms),
-        Err(BeamError::BadArg)
-    ));
+    let results = t.select(&compiled, &atoms, &mut beam_alloc::Heap::new(4096).expect("heap")).unwrap();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0], make_small(1));
+    assert!(eq(results[1], interned_atom(&mut atoms, "ok"), &atoms));
 }
 
 // ---------------------------------------------------------------------------

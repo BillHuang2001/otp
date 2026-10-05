@@ -21,9 +21,7 @@ use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
 use crate::kind::{can_read, can_write, Access, TableKind, TableOptions};
 use crate::ordered_interior::OrderedSetInterior;
-use crate::select::{
-    MatchBody, MatchBodyElement, MatchElement, MatchGuard, MatchPattern, MatchSpec, SelectPredicate,
-};
+use crate::select::SelectPredicate;
 use crate::store::TermStore;
 
 /// The process-global source of table identifiers (`ets:new/2` hands one out per
@@ -872,27 +870,6 @@ impl Table {
         selected
     }
 
-    /// The objects a compiled match spec selects (the M1 subset).
-    pub fn select(&self, spec: &MatchSpec, atoms: &AtomTable) -> Result<Vec<Eterm>> {
-        let mut selected = Vec::new();
-        for object in self.interior.iter_objects() {
-            // SAFETY: as in `select_all` — a stored object is always a validated
-            // tuple, so its element slice is readable for the borrow's duration.
-            let elements = unsafe { object_elements(object) };
-            for clause in &spec.clauses {
-                // `compile` only ever yields empty guards (M1 subset).
-                if !matches!(clause.guard, MatchGuard::Empty) {
-                    continue;
-                }
-                let mut binds = Vec::new();
-                if match_head(&clause.head, elements, atoms, &mut binds) {
-                    selected.push(resolve_body(&clause.body, object, &binds)?);
-                    break;
-                }
-            }
-        }
-        Ok(selected)
-    }
 }
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
@@ -992,61 +969,6 @@ impl TableAccess<'_> {
     ) -> Result<bool> {
         self.table.check_write(self.requester)?;
         self.table.update_element(key, updates, atoms, heap)
-    }
-}
-
-/// Match one object (via its tuple element slice) against a clause head,
-/// collecting the head binds. Returns whether the head matched.
-fn match_head(
-    pattern: &MatchPattern,
-    elements: &[Eterm],
-    atoms: &AtomTable,
-    binds: &mut Vec<(u32, Eterm)>,
-) -> bool {
-    match pattern {
-        // A bare `'_'` head matches any object.
-        MatchPattern::Wildcard => true,
-        MatchPattern::Tuple(patterns) => {
-            if patterns.len() != elements.len() {
-                return false;
-            }
-            patterns
-                .iter()
-                .zip(elements)
-                .all(|(pattern, element)| match pattern {
-                    MatchElement::Wildcard => true,
-                    MatchElement::Literal(literal) => eq(*literal, *element, atoms),
-                    MatchElement::Bind(index) => {
-                        binds.push((*index, *element));
-                        true
-                    }
-                })
-        }
-    }
-}
-
-/// Build a matched clause's result from its body template and the head binds.
-///
-/// M1 can only produce a *single-element* result: constructing a fresh tuple
-/// needs a target heap this API does not have (see the crate `CONTEXT.md`,
-/// Known Issues), so a zero- or multi-element tuple body is `badarg`.
-fn resolve_body(body: &MatchBody, object: Eterm, binds: &[(u32, Eterm)]) -> Result<Eterm> {
-    match body {
-        MatchBody::WholeObject => Ok(object),
-        MatchBody::Tuple(elements) => {
-            if elements.len() != 1 {
-                return Err(badarg());
-            }
-            match &elements[0] {
-                MatchBodyElement::Literal(literal) => Ok(*literal),
-                MatchBodyElement::WholeObject => Ok(object),
-                MatchBodyElement::Bind(index) => binds
-                    .iter()
-                    .find(|(var, _)| var == index)
-                    .map(|(_, value)| *value)
-                    .ok_or_else(badarg),
-            }
-        }
     }
 }
 
