@@ -13,7 +13,7 @@ The bulk of the directory covers *headless* interpreter behaviour (no display re
 - `debugger.cover` — `{incl_app,debugger,details}.`: coverage is collected for the whole `debugger` app.
 
 ## Test Strategy
-- `make test` in `lib/debugger/` (via `make/app_targets.mk` → `make/test_target_script.sh`) builds the test release and runs `ct_run` with `debugger.spec`; suites can also be run directly with `ct_run`/`ct:run_test` against `lib/debugger/test`.
+- `make test` in `lib/debugger/` (via `make/app_targets.mk` → `make/test_target_script.sh`) installs the test set with `make release_tests_spec`, builds every `*_SUITE_data` dir with `ts:compile_datadirs/2` (which materialises the legacy `Makefile.src` files into `Makefile`) and finally runs `ct_run -spec .../debugger.spec`; suites can also be run directly with `ct_run`/`ct:run_test` against `lib/debugger/test`.
 - All suites use the `ts_install_cth` CT hook (`{ct_hooks,[ts_install_cth]}`) and a `{timetrap,...}`; they are therefore designed to run against an *installed* release (`RELSYSDIR`), not only in-tree.
 - Three families of suites (see Routing Table): interpreter-API suites, language-feature suites, and the GUI/app-level suites.
 - **Language-feature suites** interpret *themselves*: `test_lib:interpret(?MODULE)` (which uses `i:ii/1`) is called in `init_per_suite`/`init_per_testcase`, so every testcase body executes through `dbg_ieval` rather than natively — that is what makes them interpreter tests.
