@@ -27,6 +27,12 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   `Version`/`Prerelease` (parse + `Display`), `ParseVersionError`, `otp_version()`, `erts_version()`.
 - `config` — `Flavor` (`Emu`/`Jit`), `FeatureFlags`, `RuntimeConfig` (skeleton over the A.6 CLI/env
   surface), `LogLevel`.
+  `RuntimeConfig` holds only *typed* emulator values (flavor/log level/node name/cookie/dist port
+  range/scheduler counts/max_processes) and preserves unmodeled emulator flags verbatim in
+  `extra_emulator_flags`; it does **not** retain the raw command line or the `init` argument list,
+  so `init:get_argument/1`/`get_arguments/0` cannot be served from it — the raw boot argv must be
+  captured (and split into `{Flag, Values}` groups) by `beam_rt` (matching `init.erl`'s
+  `parse_boot_args/1`).
 - `logging` — dependency-free facade: `init_logging`, `init_from_env`, `set_level`, `level`,
   `enabled`, plus the `beam_trace!`/`beam_debug!`/`beam_info!`/`beam_warn!`/`beam_error!` macros.
 - `safety` — documentation-only module stating the `unsafe` convention (see Constraints).
