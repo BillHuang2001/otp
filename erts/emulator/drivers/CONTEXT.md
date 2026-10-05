@@ -13,7 +13,7 @@ Non-static (loadable) drivers can also be appended to the same table via `--enab
 
 Live drivers:
 - `common/inet_drv.c` → symbol `inet_driver_entry`, driver name `"inet"`.
-  Its `init` (run at emulator startup, thanks to `driver_tab`) registers `"tcp_inet"`, `"udp_inet"` and (when `HAVE_SCTP`) `"sctp_inet"`, then removes the placeholder `"inet"` entry; on win32 it also installs `dummy_*` entries so that opening an unsupported driver fails cleanly instead of with `badarg` from a missing name.
+  Its `init` (run at emulator startup, thanks to `driver_tab`) registers `"tcp_inet"`, `"udp_inet"` and (when `HAVE_SCTP`) `"sctp_inet"`, then removes the placeholder `"inet"` entry; the win32-only `dummy_tcp/udp/sctp_driver_entry` structs (`inet_drv.c:2196`, `:2212`, `:2229`) are **never** `add_driver_entry`-ed — dead code, so an absent driver still fails as a missing name.
   Consumed by the preloaded module `../../preloaded/src/prim_inet.erl` (`protocol2drv/1` maps `tcp|mptcp`→`tcp_inet`, `udp`→`udp_inet`, `sctp`→`sctp_inet`) and thereby by `lib/kernel`'s `gen_tcp`/`gen_udp`/`gen_sctp`, `inet_tcp`/`inet_udp`/`inet_sctp` and the `local_tcp`/`local_udp` (AF_LOCAL) backends; the newer `socket` API is *not* served here (it is `../nifs/common/prim_socket_nif.c`).
   The driver's control commands are the private `prim_inet` protocol (`ctl_cmd`), and it replies with `{inet_reply, ...}` / `{inet_async, ...}` terms rather than via NIF returns.
 - `common/ram_file_drv.c` → symbol `ram_file_driver_entry`, driver name `"ram_file_drv"`.
