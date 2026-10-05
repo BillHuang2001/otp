@@ -301,6 +301,18 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   cons cell (LIST-tagged word). `List` terms are single words (must stay so for the NIF/ETF/msg ABI).
 - `make_arityval` encodes `size << 6` with subtag `0x00`, so an arity of 0 encodes to the raw word
   `0`; table cells/`[Eterm; N]` register files must therefore not treat `0` as "empty" without care.
+- **No safe dereferencing accessor layer.** Every accessor that reads a boxed pointer's header word is
+  `pub unsafe fn` — `car`/`cdr`, `is_tuple`/`tuple_size`/`tuple_element`, `is_map`/`is_flatmap`/
+  `is_hashmap`/`is_any_fun`, `is_float`/`float_value`/`float_bits`, `is_bitstring`/`is_binary`/
+  `bitstring_size`, `class`/`is_integer`/`is_number`, and the `thing.rs` `*_parts` readers — none of
+  which is wrapped safely. Safe `fn`/`const fn` cover only raw-bit inspection (primary tag, immediates,
+  `is_list`/`is_nil`, `is_boxed`/`is_header`, the `*_header` subtag tests, `header_subtag`/
+  `map_header_*`/`arityval`, `boxed_val`/`list_val`/`tuple_val` pointer extraction) plus
+  `cmp`/`eq`/`term_hash`/`size_object`/`AtomTable` access. A `#![deny(unsafe_code)]` consumer must
+  deref `*boxed_val(t)` itself (unsafe) to reach into a tuple/list/map/float/binary; the header-word
+  subtag tests (`header_subtag`, `BoxedTag::from_raw`, `is_*_header`) are safe but take a *header
+  word*, not a boxed term — and there is no public binary byte accessor or map lookup (`pub(crate)`
+  only).
 - Interior layouts that are NOT externally pinned (list chunking, map flatmap/HAMT thresholds, ETS
   tree shape) are open and documented at their own nodes — this crate only owns what the frozen
   layout requires.
