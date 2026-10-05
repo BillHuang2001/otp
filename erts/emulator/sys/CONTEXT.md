@@ -32,7 +32,7 @@ This directory implements two contracts: (a) types/macros the whole emulator dep
 - **Common misc**: `erts_init_sys_common_misc`, filename-encoding getters/setters (`erts_get_native_filename_encoding`, `erts_get/set_user_requested_filename_encoding`, `erts_get/set_printable_characters`).
 - **I/O waiting**: `erts_init_check_io`, `erts_check_io`, `erts_check_io_interrupt`, `erts_create_pollset_thread`, `erts_check_io_max_files`, `erts_check_io_size`, `erts_check_io_info`, `erts_check_io_debug`, `erts_io_notify_port_task_executed`, `erts_io_handle_nif_select`, `erts_io_clear_nif_select_handles`, the tunables `erts_no_pollsets`/`erts_no_poll_threads`.
   `common/erl_check_io.c` also **implements the public driver API `driver_select()`** (declared in `../beam/erl_driver.h`) — it is the gateway between linked-in drivers/NIFs and the pollsets.
-- **Built-in drivers implemented here** (not under `../drivers/`): unix `spawn`, `fd` and `forker` (`unix/sys_drivers.c`, `erl_drv_entry` symbols `spawn_driver_entry`/`fd_driver_entry`/`forker_driver_entry`, `forker_driver` is referenced from `../beam/global.h`); win32 `spawn` and `fd` (`win32/sys.c`).
+- **Built-in drivers implemented here** (not under `../drivers/`): unix `spawn`, `fd` and `forker` (`unix/sys_drivers.c`, `erl_drv_entry` definitions `spawn_driver_entry`/`fd_driver_entry`/`forker_driver_entry`, from which `../utils/make_driver_tab` generates the `erts_driver_t spawn_driver`/`fd_driver`/`forker_driver` referenced from `../beam/global.h`); win32 `spawn` and `fd` (`win32/sys.c`).
 - win32-only extras: `sys_primitive_init(HMODULE beam)` (DLL init), `sys_get_key(int)`.
 
 ## Constraints
