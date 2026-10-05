@@ -78,4 +78,4 @@ The mechanism is selected by `../wxapi.conf`, not by the file:
 ## See Also
 - `../CONTEXT.md` — generator sources (`wx_gen*.erl`), `wxapi.conf`, `wx_doxygen.conf`, and the generated output layout.
 - `../../src/` and `../../c_src/` — consumers of the generated Erlang and C++ wrappers.
-- `../../../scripts/` — `license-header.es`, the reader of the `.license` sidecars.
+- `../../../../scripts/` — `license-header.es`, the reader of the `.license` sidecars.
