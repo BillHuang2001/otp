@@ -340,20 +340,27 @@ arrangement is `[BinRef(3)][ErlSubBits(5)]` with the tagged root at `hp + 3` (th
 
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
-  `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings and
+  `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
+  (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
   internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
   a structural comparison and must be extended if exact ordering is needed: big integers, external
-  pid/port/ref, funs, non-flat maps, records and on-heap bin refs (ordered by class rank, then object
+  pid/port/ref, funs, records and on-heap bin refs (ordered by class rank, then object
   arity, then raw term word); internal references (compared by raw payload words, not the decoded
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
+  Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
+  flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
 - **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
-  exact bit values are not part of any contract. Classes lacking a layout-aware representation (funs,
-  maps, records, external pid/port/ref, bin refs) use an opaque raw-word fallback, so their hash is
-  not stable across processes/images.
-- **Object-size approximations (`src/size.rs`).** Hashmaps are approximated by the head node's
-  `arity + 1` (deep HAMT nodes uncounted); sub-bitstrings report the on-heap thing size rather than
-  the copied representation; native records are treated like tuples.
+  exact bit values are not part of any contract. Maps hash structurally (their sorted pairs). Classes
+  lacking a layout-aware representation (funs, records, external pid/port/ref, bin refs) use an opaque
+  raw-word fallback, so their hash is not stable across processes/images.
+- **Object-size approximations (`src/size.rs`).** Hash maps are walked node-by-node (head
+  array/bitmap, interior bitmaps, collision nodes, flat-map leaves). Sub-bitstrings report the on-heap
+  thing size rather than the copied representation; native records are treated like tuples.
+- **Hash choices are internal (`src/map.rs`).** The HAMT trie is driven by `hashing::term_hash`, not
+  `erts_map_hash`, so a node's *bitmap* for a given key set is not `erts_map_hash`-identical. The node
+  *encodings* (headers, sizes, slot semantics, collision/flat-map formats, key order) are bit-exact to
+  ERTS; nothing outside the Rust runtime observes those bitmaps.
 
 ## Notes for Agents
 - **Read `../../erts/emulator/beam/erl_term.h` before changing any constant** — it is the ground truth;
