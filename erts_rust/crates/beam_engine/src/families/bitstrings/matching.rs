@@ -836,7 +836,11 @@ fn run_commands(
             // `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`): the next
             // `Bits` bits must equal the literal unsigned `Value` exactly (no sign
             // extension). `Value` is emitted as a plain integer up to 64 bits.
-            "'=:='" => {
+            //
+            // The atom *name* is `=:=` (the quotes `beam_disasm` prints around
+            // `'=:='` are just the non-alphanumeric-atom notation and are not part
+            // of the name).
+            "=:=" => {
                 let bits = read_size(machine, cmd_at(commands, i + 2)?)?;
                 let want_term = read_operand(machine, cmd_at(commands, i + 3)?)?;
                 let Some(want) = small_value(want_term) else {
@@ -889,5 +893,173 @@ fn ensure_at_least(remaining: usize, size: usize, unit: usize) -> bool {
         remaining >= size
     } else {
         remaining >= size && (remaining - size) % unit == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure decoders the `bs_*` match opcodes call. Their expected
+    //! values are the system `erl` oracle's answers for the same bit patterns.
+
+    use super::*;
+
+    // -- decode_utf8 (erts_bs_get_utf8) -------------------------------------
+
+    #[test]
+    fn utf8_decodes_each_sequence_length() {
+        assert_eq!(decode_utf8(&[0x41], 0, 8), Some((0x41, 8)));
+        assert_eq!(decode_utf8(&[0xC2, 0xA9], 0, 16), Some((0xA9, 16)));
+        assert_eq!(decode_utf8(&[0xE2, 0x82, 0xAC], 0, 24), Some((0x20AC, 24)));
+        assert_eq!(
+            decode_utf8(&[0xF0, 0x9F, 0x98, 0x80], 0, 32),
+            Some((0x1F600, 32))
+        );
+    }
+
+    #[test]
+    fn utf8_accepts_the_range_boundaries() {
+        // U+007F (1 byte), U+0080/U+07FF (2), U+0800/U+FFFF (3), U+10000/U+10FFFF (4).
+        assert_eq!(decode_utf8(&[0x7F], 0, 8), Some((0x7F, 8)));
+        assert_eq!(decode_utf8(&[0xC2, 0x80], 0, 16), Some((0x80, 16)));
+        assert_eq!(decode_utf8(&[0xDF, 0xBF], 0, 16), Some((0x7FF, 16)));
+        assert_eq!(decode_utf8(&[0xE0, 0xA0, 0x80], 0, 24), Some((0x800, 24)));
+        assert_eq!(decode_utf8(&[0xEF, 0xBF, 0xBF], 0, 24), Some((0xFFFF, 24)));
+        assert_eq!(
+            decode_utf8(&[0xF0, 0x90, 0x80, 0x80], 0, 32),
+            Some((0x10000, 32))
+        );
+        assert_eq!(
+            decode_utf8(&[0xF4, 0x8F, 0xBF, 0xBF], 0, 32),
+            Some((0x10FFFF, 32))
+        );
+    }
+
+    #[test]
+    fn utf8_reads_at_a_non_byte_aligned_start() {
+        // The decoder works at a *bit* offset (`read_uint_be`), so start need not be
+        // byte-aligned: skip one byte of a 2-byte buffer.
+        assert_eq!(decode_utf8(&[0x00, 0x41], 8, 16), Some((0x41, 8)));
+    }
+
+    #[test]
+    fn utf8_rejects_every_malformed_class() {
+        assert_eq!(decode_utf8(&[], 0, 0), None); // bounded out
+        assert_eq!(decode_utf8(&[0xC2], 0, 8), None); // truncated 2-byte
+        assert_eq!(decode_utf8(&[0xE2, 0x82], 0, 16), None); // truncated 3-byte
+        assert_eq!(decode_utf8(&[0x80], 0, 8), None); // continuation lead
+        assert_eq!(decode_utf8(&[0xFF], 0, 8), None); // reserved lead
+        assert_eq!(decode_utf8(&[0xE2, 0x28, 0xAC], 0, 24), None); // bad continuation
+        assert_eq!(decode_utf8(&[0xC0, 0x80], 0, 16), None); // overlong U+0000
+        assert_eq!(decode_utf8(&[0xC1, 0xBF], 0, 16), None); // overlong U+007F
+        assert_eq!(decode_utf8(&[0xE0, 0x80, 0x80], 0, 24), None); // overlong U+0000
+        assert_eq!(decode_utf8(&[0xF0, 0x80, 0x80, 0x80], 0, 32), None); // overlong
+        assert_eq!(decode_utf8(&[0xED, 0xA0, 0x80], 0, 24), None); // surrogate D800
+        assert_eq!(decode_utf8(&[0xED, 0xBF, 0xBF], 0, 24), None); // surrogate DFFF
+        assert_eq!(decode_utf8(&[0xF4, 0x90, 0x80, 0x80], 0, 32), None); // >U+10FFFF
+    }
+
+    // -- decode_utf16 (erts_bs_get_utf16) -----------------------------------
+
+    #[test]
+    fn utf16_decodes_bmp_and_surrogate_pairs() {
+        assert_eq!(decode_utf16(&[0x00, 0x41], 0, 16, 0), Some((0x41, 16)));
+        assert_eq!(decode_utf16(&[0x20, 0xAC], 0, 16, 0), Some((0x20AC, 16)));
+        // D7FF/E000 sit just outside the surrogate range and are plain scalars.
+        assert_eq!(decode_utf16(&[0xD7, 0xFF], 0, 16, 0), Some((0xD7FF, 16)));
+        assert_eq!(decode_utf16(&[0xE0, 0x00], 0, 16, 0), Some((0xE000, 16)));
+        // D83D DE00 is U+1F600.
+        assert_eq!(
+            decode_utf16(&[0xD8, 0x3D, 0xDE, 0x00], 0, 32, 0),
+            Some((0x1F600, 32))
+        );
+        // Little-endian words select `BSF_LITTLE`.
+        assert_eq!(decode_utf16(&[0xAC, 0x20], 0, 16, BSF_LITTLE), Some((0x20AC, 16)));
+        assert_eq!(
+            decode_utf16(&[0x3D, 0xD8, 0x00, 0xDE], 0, 32, BSF_LITTLE),
+            Some((0x1F600, 32))
+        );
+    }
+
+    #[test]
+    fn utf16_rejects_lone_and_malformed_surrogates() {
+        assert_eq!(decode_utf16(&[0xD8], 0, 8, 0), None); // bounded out
+        assert_eq!(decode_utf16(&[0xD8, 0x3D], 0, 16, 0), None); // lone high, no low
+        assert_eq!(decode_utf16(&[0xDE, 0x00], 0, 16, 0), None); // lone low surrogate
+        assert_eq!(decode_utf16(&[0xD8, 0x3D, 0x00, 0x41], 0, 32, 0), None); // bad low
+    }
+
+    // -- decode_utf32 (i_bs_validate_unicode_retract) -----------------------
+
+    #[test]
+    fn utf32_decodes_valid_scalars_and_rejects_the_rest() {
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0x20, 0xAC], 0, 32), Some((0x20AC, 32)));
+        assert_eq!(
+            decode_utf32(&[0x00, 0x10, 0xFF, 0xFF], 0, 32),
+            Some((0x10FFFF, 32))
+        );
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0x00], 0, 24), None); // bounded out
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0xD8, 0x00], 0, 32), None); // surrogate
+        assert_eq!(decode_utf32(&[0x00, 0x11, 0x00, 0x00], 0, 32), None); // >U+10FFFF
+    }
+
+    // -- f16_to_f32 (erl_bits.c:508) ----------------------------------------
+
+    #[test]
+    fn f16_to_f32_widens_every_class() {
+        assert_eq!(f16_to_f32(0x0000).to_bits(), 0x0000_0000); // +0
+        assert_eq!(f16_to_f32(0x8000).to_bits(), 0x8000_0000); // -0
+        assert_eq!(f16_to_f32(0x3C00).to_bits(), 0x3F80_0000); // 1.0
+        assert_eq!(f16_to_f32(0x7C00).to_bits(), 0x7F80_0000); // +Inf
+        assert_eq!(f16_to_f32(0xFC00).to_bits(), 0xFF80_0000); // -Inf
+        assert_eq!(f16_to_f32(0x7E00).to_bits(), 0x7FC0_0000); // NaN
+        assert_eq!(f16_to_f32(0x0001).to_bits(), 0x3380_0000); // min subnormal
+        assert_eq!(f16_to_f32(0x03FF).to_bits(), 0x387F_C000); // max subnormal
+        assert_eq!(f16_to_f32(0x0400).to_bits(), 0x3880_0000); // min normal (2^-14)
+        assert_eq!(f16_to_f32(0x7BFF).to_bits(), 0x477F_E000); // 65504.0 (max)
+    }
+
+    // -- read_float_field (erts_bs_get_float_2) -----------------------------
+
+    #[test]
+    fn read_float_field_handles_every_valid_size_and_endianness() {
+        assert_eq!(read_float_field(&[], 0, 0, 0).unwrap(), 0.0);
+        assert_eq!(read_float_field(&[62, 0], 0, 16, 0).unwrap(), 1.5);
+        assert_eq!(read_float_field(&[0, 62], 0, 16, BSF_LITTLE).unwrap(), 1.5);
+        assert_eq!(read_float_field(&[63, 192, 0, 0], 0, 32, 0).unwrap(), 1.5);
+        assert_eq!(
+            read_float_field(&[0, 0, 192, 63], 0, 32, BSF_LITTLE).unwrap(),
+            1.5
+        );
+        let pi = [64, 9, 33, 251, 84, 68, 45, 24];
+        assert_eq!(read_float_field(&pi, 0, 64, 0).unwrap(), std::f64::consts::PI);
+        let mut little = pi;
+        little.reverse();
+        assert_eq!(
+            read_float_field(&little, 0, 64, BSF_LITTLE).unwrap(),
+            std::f64::consts::PI
+        );
+    }
+
+    #[test]
+    fn read_float_field_rejects_an_unsupported_size_and_an_unaligned_le_field() {
+        // Only 0/16/32/64 are valid; anything else is the typed `unsupported`.
+        assert!(read_float_field(&[0, 0, 0, 0], 0, 8, 0).is_err());
+        // A little-endian field is read byte-wise, so it must be byte-aligned.
+        assert!(read_float_field(&[0, 0, 0, 0], 4, 32, BSF_LITTLE).is_err());
+    }
+
+    // -- ensure_at_least (the `bs_match` command) ---------------------------
+
+    #[test]
+    fn ensure_at_least_covers_every_documented_case() {
+        assert!(ensure_at_least(8, 8, 1)); // >= Size
+        assert!(!ensure_at_least(7, 8, 1));
+        assert!(ensure_at_least(16, 8, 8)); // whole units after Size
+        assert!(!ensure_at_least(15, 8, 8));
+        assert!(ensure_at_least(16, 0, 8)); // byte alignment only
+        assert!(!ensure_at_least(15, 0, 8));
+        assert!(ensure_at_least(15, 0, 1)); // redundant no-op
+        assert!(ensure_at_least(15, 0, 5)); // alignment to Unit
+        assert!(!ensure_at_least(14, 0, 5));
     }
 }
