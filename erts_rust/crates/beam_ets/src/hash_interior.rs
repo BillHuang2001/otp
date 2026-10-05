@@ -236,10 +236,11 @@ impl HashInterior {
     ///
     /// Counts the bucket array, every bucket's entry vector and each entry's key
     /// plus its object words, all measured at **capacity**, so the figure never
-    /// under-reports what is actually allocated. `_atoms` is accepted for
-    /// signature symmetry with the other `&AtomTable` operations: atom storage is
-    /// global (the runtime's `AtomTable`), not owned by the interior, so it
-    /// contributes no words here.
+    /// under-reports what is actually allocated, and it never decreases as objects
+    /// are inserted (the bucket array only doubles and each `Vec` only grows).
+    /// `_atoms` is accepted for signature symmetry with the other `&AtomTable`
+    /// operations: atom storage is global (the runtime's `AtomTable`), not owned by
+    /// the interior, so it contributes no words here.
     pub fn memory(&self, _atoms: &AtomTable) -> usize {
         let mut words = self.buckets.capacity() * words_of::<Vec<Entry>>();
         for bucket in &self.buckets {
@@ -890,14 +891,16 @@ mod tests {
         let empty = t.memory(&atoms);
         assert!(empty > 0);
 
+        // Inserting only ever adds storage, so the count never decreases.
+        let mut prev = empty;
         for i in 0..200i64 {
             t.insert(make_small(i), object(&mut heap, i, i), &atoms).unwrap();
+            let now = t.memory(&atoms);
+            assert!(now >= prev, "count shrank on insert {i} ({prev} -> {now})");
+            prev = now;
         }
         let populated = t.memory(&atoms);
-        assert!(
-            populated >= empty,
-            "populating must not shrink the count ({empty} -> {populated})"
-        );
+        assert!(populated >= empty);
         // Never under-reports: at least one word per stored object (keys, buckets
         // and vector overhead only add to it).
         assert!(populated >= t.size());
