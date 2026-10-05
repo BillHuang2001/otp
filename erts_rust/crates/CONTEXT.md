@@ -126,6 +126,31 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
+## Status (Milestone 1)
+- **All 15 crates architected, implemented and tested.** `cargo test --manifest-path
+  erts_rust/Cargo.toml --workspace` is GREEN (69 test suites, 0 failures); build is warning-free.
+  `beam_common`/`beam_term` were already implemented; every other crate followed its CONTEXT.md.
+- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
+  (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
+  `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
+  supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
+  fallback returns a typed error, never a wrong result).
+- **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
+  changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
+  (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
+  materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
+  to (de-duplication). Rationale: `beam_term` is a dependency sink, so writers take a caller-provided
+  `*mut Eterm`; allocation stays in `beam_alloc`.
+- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`.
+
+## Known Structural Debt (candidates for the next pass)
+- `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
+  `beam_gc::OffHeap` is push-only; the view should be absorbed into `beam_gc` (Prevent-Duplication).
+- `beam_codec::decode.rs` keeps a private `MAP_SMALL_MAP_LIMIT` decode-policy constant (not a layout
+  duplicate) — fine, but a future home for map-policy constants may be `beam_term`.
+- Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
+  entries for the `beam_term` extensions and the `beam_abi` frozen-header seam work.
+
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
