@@ -113,7 +113,7 @@ Headers are internal to `src/` (nothing exported at `include/`), so they include
 - User-supplied session-cache and CRL-cache modules plug in via the `ssl_session_cache_api` / `ssl_crl_cache_api` behaviours; the built-in `*_db`/`ssl_crl_cache` modules are just default implementations.
 - DTLS "emulated socket options" are managed per connection inside `dtls_packet_demux`, not on the raw UDP socket — option changes go through the demux process.
 - `ssl_gen_statem:ssl_config/3` pre-1.3 options are grouped by the `?'TLS-1_3_ONLY_OPTIONS'`, `?'PRE_TLS-1_3_ONLY_OPTIONS'`, `?'FROM_TLS-1_2_ONLY_OPTIONS'`, `?'TLS-1_0_ONLY_OPTIONS'` macros in `ssl_internal.hrl`; option validity is version dependent.
-- Nothing in this directory is code-generated (the `configure`/`Makefile` under `lib/ssl/` are the only generated artifacts of the app).
+- Nothing in this directory is code-generated; the app has no autoconf of its own, and the only generated artifacts are `ebin/ssl.app`/`ebin/ssl.appup` derived from the checked-in `.src` templates.
 - `-DVSN=\"$(VSN)\"` is passed to the compiler; `ssl.erl`/app modules read it only for version reporting.
 
 ## Dependencies
