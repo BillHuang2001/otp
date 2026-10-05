@@ -145,10 +145,12 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   is backed by a `Box<[MaybeUninit<Eterm>]>` and returns `TermResult`; it exists only so
   `beam_term` unit tests can build terms. Dependent crates must use **this** `Heap` (production,
   allocator-backed, returns `beam_common::Result`). The `beam_term` arena is **not** re-exported.
-- **`libc::mmap` for carriers, `munmap` when fully free.** Gives page-aligned, huge-page-eligible
-  carriers and a clean `Carrier` identity (`mmap` base = carrier base). Partially-used carriers are
-  cached per size class (reused across frees) and unmapped only when the class's carrier list is
-  drained — a simple, honest retention policy (no `madvise`/shrink in M1).
+- **`libc::mmap` for carriers, `munmap` on free/drop.** Gives page-aligned, huge-page-eligible
+  carriers and a clean `Carrier` identity (`mmap` base = carrier base). Slab carriers are cached per
+  size class (reused across frees) and retained for the allocator's lifetime, unmapped only when the
+  allocator is dropped (`Drop for AllocatorState`); a dedicated large-block carrier is unmapped
+  immediately on `dealloc` (the header's `carrier` word gives O(1) block→carrier recovery). A simple,
+  honest retention policy (no `madvise`/shrink in M1).
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `size_class` (lookup boundaries, validation rejects),
