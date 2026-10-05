@@ -5,6 +5,14 @@ edition.workspace = true
 license.workspace = true
 description = "Rust ERTS runtime binary: boot sequence, preloaded modules, CLI flags and system_info."
 
+[lib]
+name = "beam_rt"
+path = "src/lib.rs"
+
+[[bin]]
+name = "beam_rt"
+path = "src/main.rs"
+
 [dependencies]
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
