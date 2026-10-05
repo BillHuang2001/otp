@@ -71,6 +71,6 @@ Every `*_cb` exports the same callback set: `peer_up/3`, `peer_down/3`, `pick_pe
 
 ## See Also
 - `..` (`examples/`) — non-code example material (dictionaries) in the same examples tree.
-- `../src/modules.mk` — release file list containing `EXAMPLES`.
-- `../test/diameter_examples_SUITE.erl` — the suite that compiles and runs this directory.
-- `../include/diameter.hrl` — the header the callback modules include; `../src/dict/` — sources of the built-in base/relay dictionaries.
+- `../../src/modules.mk` — release file list containing `EXAMPLES`.
+- `../../test/diameter_examples_SUITE.erl` — the suite that compiles and runs this directory.
+- `../../include/diameter.hrl` — the header the callback modules include; `../../src/dict/` — sources of the built-in base/relay dictionaries.
