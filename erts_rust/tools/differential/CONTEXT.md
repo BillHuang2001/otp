@@ -111,7 +111,7 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `src/corpus/flags.rs` → CLI/config cases (A.6): `-noshell` + custom `init:get_argument` flags
 - `src/corpus/modules.rs` → module-run cases (A.2): embedded `erlc`-compiled module agreement
 - `src/harness.rs` → orchestration: `run_case`/`compare_expr`/`run_suite`, per-side argv planning, exit-3 classification, exit-code derivation
-- `src/report.rs` → JSON report schema (serde) + writer + human rendering
+- `src/report.rs` → JSON report schema (serde: `summary` + additive `by_contract` rollup; the `list` listing + optional `--by-contract` grouping) + writer + human rendering
 - `src/main.rs` → thin binary: parse args → dispatch → `process::exit(code)`
 - `tests/oracle.rs` → oracle-backed integration tests (golden reproduction for eval + module cases, oracle-vs-oracle, missing Rust runtime)
 - `tests/cli.rs` → end-to-end binary tests (exit codes, `--help`, `--out` report, `list`, fake `$BEAM_RT` mismatch/unsupported)
