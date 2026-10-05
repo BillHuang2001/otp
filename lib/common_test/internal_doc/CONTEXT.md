@@ -13,7 +13,8 @@ Non-published design notes about Common Test internals, written for OTP maintain
   - A table of which log row `ct:comment/1,2` output lands in for every `ct_hooks` callback, depending on whether the hook was installed via `ct_run`/`ct:run_test`/test spec or from `suite/0`/`init_per_suite/1`/`init_per_group/2`.
 
 ## Constraints
-- These notes are **not** part of the published documentation: the ExDoc extras wildcard covers `internal_docs/*.md` (plural), while this directory is `internal_doc/` (singular), so `ct_notes.md` is never shipped in the docs.
+- These notes are **not** published: a doc build only picks up `../internal_doc/*.md` if the app's `doc/docs.exs` lists it explicitly in `extras` (as `lib/compiler/doc/docs.exs` does), and `../doc/docs.exs` does not list `ct_notes.md`.
+- The generic ExDoc config labels extras whose path matches `internal_doc/` as the "Internal Docs" sidebar group (`make/ex_doc.exs`), which is what that opt-in relies on.
 - Diagrams are Mermaid inside markdown — keep the syntax valid when editing.
 
 ## Notes for Agents
