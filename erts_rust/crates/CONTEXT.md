@@ -164,9 +164,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
 ## Status (Milestone 1)
-- **All 15 crates architected, implemented and tested.** `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace` is GREEN (69 test suites, 0 failures); build is warning-free.
-  `beam_common`/`beam_term` were already implemented; every other crate followed its CONTEXT.md.
+- **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
+  erts_rust/Cargo.toml --workspace` is warning-free; per-crate suites are green (one pre-existing
+  failure lives outside this node's crates — see Known Structural Debt).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
