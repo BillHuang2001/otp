@@ -280,6 +280,14 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   index to the interning `Atom`; `atoms[0]` = `Atom::MAX` (NIL). `Operand::Atom` holds the interned
   `Atom`. Interning into a *shared, `atom.names`-seeded* table (needed for preloaded/positional atoms)
   is `beam_rt`'s job — see Known Issues.
+  **Shared-table seam — no dedicated entry point exists.** `load`/`load_file` always build a *private*
+  per-module table (`src/load.rs:36`). To share, drive the pipeline manually: `container::parse` →
+  `chunk::parse` → intern `chunks.atoms[1..]` (wire order) through the shared table into a `Vec<Atom>`
+  → `decode::decode_stream(stream, &atoms, &code_version, &types)` →
+  `lower::build_module(&chunks, &raw, table)`. **`build_module` takes the `AtomTable` by value and moves
+  it into `Module.atom_table`**, so pass a *clone* of the shared table to keep the same numbering; every
+  atom index baked into the IR (`Module.atoms`, `Operand::Atom`, exports/imports) then indexes the
+  shared table. The decoder resolves `a` operands through the caller-built `&[Atom]`, not the table.
 - **`z,5` `tr` is normalized to `reg` + `TypeIndex`**, so the interpreter may ignore the annotation and
   a JIT may consume it later. The `Type` chunk is parsed into `TypeTable` (with the fallback table).
 - **`Instr` is a named enum; `lower_instr` is the whole semantic mapping.** `src/lower/instr.rs` maps
