@@ -9,6 +9,11 @@ performance and non-performance gains, portability, and an appraisal of the roug
 compiler pipeline, and a quantified inventory of the external compatibility surface. Prior-art and
 technology claims were checked against current public sources (see References).*
 
+*Companion document: [`ERTS_RUST_REWRITE_DEEPDIVE.md`](./ERTS_RUST_REWRITE_DEEPDIVE.md) (Part II) continues this
+evaluation with deep dives on the core-only-rewrite seam, data structures, GC, the compiler, the JIT and the
+interpreter, and — given that development cost is now an accepted constraint — turns the conclusions into a staged
+plan. Part II sharpens Part I's findings; where the two differ, Part II is the current position.*
+
 ---
 
 ## 0. Executive summary
