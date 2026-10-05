@@ -15,9 +15,9 @@
 //! Implements the GC half of Part II §D and the Stage-4 row of Part II §H; the
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
 //!
-//! `unsafe` is confined to `copy.rs` (the word-level copier) and the raw-pointer
-//! range tests in `space.rs`; `policy.rs`, `stats.rs`, `mso.rs` and the `Collector`
-//! driving logic are safe Rust.
+//! `unsafe` is confined to `copy.rs` (the word-level copier), the raw-pointer range
+//! tests in `space.rs` and the two narrow `NonNull`-deref / `Box::from_raw` blocks in
+//! `mso.rs`; `policy.rs`, `stats.rs` and the `Collector` driving logic are safe Rust.
 
 pub mod collector;
 pub mod copy;
