@@ -48,6 +48,7 @@ Unix flag in → MSVC flag out. Each script is a translator whose contract is "a
 - Which tree is selected is decided in `otp_build` (`env_win32`/`env_win64`/`echo_env_wsl`), not here.
 - Nothing in this directory is generated or auto-updated (unlike `../../../../autoconf/`); every file here is hand-maintained. `coffix.exe` is the only build product.
 - Do not confuse this tree with the Unix launchers in `../../../unix/` or the shared Windows sources in `../../`.
+- Flat directory: no subdirectories to route into. Work on the sibling trees belongs to `../../cygwin_tools/vc/` / `../../msys_tools/vc/` (read-only from here — escalate such writes to `../../`).
 
 ## Dependencies
 - Microsoft Visual Studio (2019+) tools: `cl.exe`, `link.exe`, `lib.exe`, `rc.exe`, `mc.exe`, `mt.exe` (located by `SetupWSLcross.bat`/`vcvarsall` via `vswhere`).
