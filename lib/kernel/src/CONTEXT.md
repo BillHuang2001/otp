@@ -117,7 +117,8 @@ OS / terminal / processes:
 - `-mode minimal` starts a much smaller tree (used by escript-like minimal nodes) — see the two branches of `kernel:start/2`.
 - Two socket backends coexist: `inet_drv`/`prim_inet` (`gen_tcp`, `gen_udp`, `gen_sctp`, plus `inet_*`) and the new NIF-based `socket`/`prim_socket` stack (`gen_tcp_socket`, `gen_udp_socket`). `inet.erl` owns the shared option/address layer and must stay agnostic to the backend.
 - `pg` was rewritten on top of the new `data_publisher` abstraction instead of `pg2`'s ad-hoc protocol; `pg2` is only a tombstone module.
-- Error formatting for erts- and kernel-generated errors is delegated to `erl_erts_errors`/`erl_kernel_errors` (called from `erl_error`, stdlib) rather than being implemented here.
+- Pretty-printing of erts- and kernel-generated errors is delegated to `erl_erts_errors`/`erl_kernel_errors` (attached to raised errors through `error_info` maps) rather than being implemented inline — these live in kernel because the formatting code is plain Erlang that must not sit in erts.
+- `error_handler` carries a strong warning in its moduledoc: it interacts with the code server's `init` process and the I/O mechanism, so small edits can deadlock the system.
 - `prim_tty` (this module) is a thin wrapper over the C NIF in `erts/emulator/nifs/common/prim_tty_nif.c`; the process/terminal protocol lives in `user_drv` and `group`.
 
 ## Notes for Agents
