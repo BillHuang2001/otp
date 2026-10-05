@@ -123,7 +123,7 @@ Optional at runtime: kTLS requires OS/`socket` support (Linux/kTLS-capable kerne
 
 ## Test Strategy
 Test suites live in `lib/ssl/test/` (Common Test, run with `make test` from `lib/ssl/`) — not in this directory.
-Many suites are named `*_SUITE.erl` per feature (`tls_handshake_SUITE`, `ssl_cipher_SUITE`, `dtls_SUITE`, `tls_version_SUITE`, `ssl_session_ticket_SUITE`, …); unit-level helpers such as `ssl_cipher_format` and `ssl_config` are exercised indirectly through those.
+Many suites are named `*_SUITE.erl` per feature (e.g. `ssl_handshake_SUITE`, `ssl_cipher_SUITE`, `dtls_api_SUITE`, `tls_1_3_version_SUITE`, `ssl_session_ticket_SUITE`); there is no per-module unit-test file — helpers such as `ssl_cipher_format` and `ssl_config` are exercised indirectly through those suites.
 This directory contains no tests; nothing here is generated so `git ls-files` is authoritative for what ships.
 
 ## See Also
