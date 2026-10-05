@@ -305,8 +305,15 @@ arrangement is `[BinRef(3)][ErlSubBits(5)]` with the tagged root at `hp + 3` (th
   raw words (`0xA8`/`0x124`), the `BinRef` word pin, the pinned 8-word combined pair
   (`[BinRef][ErlSubBits]`, root at `hp + 3`), windowed `refc_offset`/`refc_size`/`refc_bytes`, and
   `is_refc_binary` rejecting on-heap bitstrings, non-bin-ref sub-bitstrings, immediates and tuples.
+- `tests/oracle.rs` — the crate-local **oracle cross-check**: spawns the system `erl`
+  (`-noshell -eval`, text protocol — no ETF re-implementation, since dev-depending on `beam_codec`
+  would cycle) and checks that `beam_term`'s map/bitstring *observables* agree with the real
+  runtime: `map_size`/`map_get`/`map_pairs` vs `maps:size`/`maps:get`/`lists:sort(maps:keys/1)`
+  across the flat/hash boundary (31/32/33/40/100 keys) and for atom-keyed maps, and
+  `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views for `<<1:3>>`-style bitstrings and
+  binaries. Skips loudly (never fails) when `erl` is absent/does not answer.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
-  compatibility gate), not to this crate's unit tests.
+  compatibility gate); `tests/oracle.rs` is only the crate-local map/bitstring smoke slice.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
   `../../scripts/cargo.sh build -p beam_term`. Never `cd`.
 
@@ -329,7 +336,7 @@ arrangement is `[BinRef(3)][ErlSubBits(5)]` with the tagged root at `hp + 3` (th
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
 
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
