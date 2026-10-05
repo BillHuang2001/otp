@@ -38,7 +38,7 @@ App version is `PARSETOOLS_VSN` in `../vsn.mk`.
 
 ### What the generated output looks like
 - yecc emits, in order: optional `Header` strings, `-module(M)`, `-file` directives, `-export([parse/1, parse_and_scan/1, format_error/1])`, the user's `Erlang code.` copied verbatim, then the contents of `../include/yeccpre.hrl` verbatim, then `yeccpars2*`, `yeccgoto_*` and the inlined action functions.
-  - The parser runtime (`yeccpars0/1,5`, `yeccpars1/5,7`, `yeccerror/1`, `return_error/2`, `yecc_end/1`, token-to-string helpers) lives entirely in `yeccpre.hrl`; the module doc for `parse/1`/`parse_and_scan/1` is injected by the user via `?YECC_PARSE_DOC`/`?YECC_PARSE_AND_SCAN_DOC`/`?YECC_FORMAT_ERROR_DOC`.
+  - The parser runtime (`yeccpars0/5`, `yeccpars1/5`, `yeccpars1/7`, `yecc_error_type/2`, `yeccerror/1`, `return_error/2`, `yecc_end/1`, token-to-string helpers) lives entirely in `yeccpre.hrl`; the module doc for `parse/1`/`parse_and_scan/1` is injected by the user via `?YECC_PARSE_DOC`/`?YECC_PARSE_AND_SCAN_DOC`/`?YECC_FORMAT_ERROR_DOC`.
 - leex copies `../include/leexinc.hrl` line by line and substitutes marker lines recognized by their first 5 characters: `##module`, `##code`, `##str`, `##tkn`, `##tks`, `##tab`, `##dfa`, `##act` (everything else is emitted verbatim).
   - The emitted scanner defines `yystate/0` (start state) + one `yystate/7` clause per DFA state group, `yyaction_N/…` per rule action, and the public wrappers `string/1,2`, `token/2,3`, `tokens/2,3`, `format_error/1`, plus `tab_size/0` when `tab_size` is set.
 - Both generators let the user override the prologue via `{includefile, F}`; yecc detects the "new" (`{1,4}`) vs old (`{1,1}`) prologue by preprocessing it (see Known Issues).
