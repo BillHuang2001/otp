@@ -40,7 +40,7 @@ Runtime contracts:
 - Everything here is `/bin/sh` (POSIX): no bashisms, no `[[ ]]`, no arrays. Android builds rewrite `/bin/sh`→`/system/bin/sh` in the generated `erl`, `cerl`, `start` and `start_erl` variants.
 - `run_erl.c`/`to_erl.c` must do all string handling through `safe_string.{c,h}` (`strn_cpy`, `strn_cat`, `strn_catf`, `sn_printf`, `vsn_printf`, `find_str`), which abort the process on overflow; fixed `FILENAME_BUFSIZ`=250 paths plus the `sn_printf`-based status line are relied upon. Both must include `run_erl.h` so their protocol versions stay in sync.
 - `setuid_socket_wrap.c` is a privileged-socket helper copied into installed releases as an *example* (`erl_interface`/`inets` use the same code); changes here are the upstream for `lib/inets/test/inets_socketwrap_SUITE_data/setuid_socket_wrap.c`.
-- `call_erl.c`/`to_erl` use `HAVE_CONFIG_H` → the `config.h` of the `erts` build; nothing compiles without a configured tree.
+- The C sources include `config.h` under `HAVE_CONFIG_H` (the `config.h` of the `erts` build); nothing here compiles without a configured tree.
 
 ## Design Decisions
 - `erl` is a shell script, not C: `ROOTDIR` must be derivable from the path of the invoked command at runtime (relocatable installs, `$ERL_ROOTDIR` overrides, symlinked/copied releases) without recompiling, and `%FINAL_ROOTDIR%`/Android-`/bin/sh` tweaks are trivial sed edits.
