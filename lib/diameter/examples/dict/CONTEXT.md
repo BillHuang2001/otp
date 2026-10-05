@@ -39,7 +39,7 @@ Build helpers for the directory:
 - `diameterc --name` sets the generated module name, `--prefix` the prefix of the generated record/constant names — both are set to the dictionary basename here.
 - The `common` keyword resolves to the dictionary bundled with the diameter application (the `<app>_base` names are produced from `../../src/dict/base_rfc3588.dia` / `base_rfc6733.dia`); `@inherits common` therefore needs a dictionary named `common` in the inheritance path.
 - Only the six `.dia` files are released into `doc/examples/dict/`; `GNUmakefile`, `depend.sed` and `.gitignore` stay in the source tree but are still present in the test release because `../../test/Makefile` tars the whole `examples/` tree.
-- Dictionary grammar and `diameterc` options are documented in `diameter_dict(4)` / `diameterc(1)` and `diameterc --help`; the grammar implementation lives in `../../src/compiler/`.
+- Dictionary grammar and `diameterc` options are documented in `../../doc/references/diameter_dict.md` (`diameter_dict(4)`) and `../../doc/references/diameterc_cmd.md` (`diameterc(1)`); `diameterc --help` lists the options, and the grammar implementation lives in `../../src/compiler/`.
 
 ## Test Strategy
 - Covered by the `dict` testcase in `../../test/diameter_examples_SUITE.erl` (run with the `diameter` Common Test suites): it locates this directory relative to the suite module, creates a temp output dir and compiles every `*.dia` with both `rfc3588_base` and `rfc6733_base` as the base dictionary, in dependency order (sorted by the `?INHERITS` table plus a recursive `dep/1` walk), asserting every `make` and `compile` returns ok.
