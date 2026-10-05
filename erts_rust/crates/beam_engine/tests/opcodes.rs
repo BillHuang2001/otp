@@ -1328,7 +1328,11 @@ fn test_heap_and_allocate_heap() {
 }
 
 #[test]
-fn trim_drops_y_slots() {
+fn trim_discards_the_lowest_y_slots_and_renumbers() {
+    // `trim N` reproduces C's `i_trim` (`E += N`): the lowest `N` Y slots are
+    // discarded and the survivors are renumbered down (`y(k) -> y(k - N)`), which
+    // is what the compiler's `beam_trim` pass assumes. Here y0 (`1`) is dropped,
+    // so the old y1 (`2`) becomes y0 and the old y2 (`3`) becomes y1.
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
@@ -1349,7 +1353,7 @@ fn trim_drops_y_slots() {
         },
         Instr::Trim { n: 1, remaining: 2 },
         Instr::Move {
-            src: Operand::Y(1),
+            src: Operand::Y(0),
             dst: Operand::X(0),
         },
         Instr::Deallocate(2),

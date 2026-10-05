@@ -438,23 +438,40 @@ impl Machine {
         self.pop_frame()
     }
 
-    /// `trim N` — drop the current frame's top `n` Y slots.
+    /// `trim N` — shrink the current frame to its **highest** Y slots.
+    ///
+    /// Reproduces C's `i_trim` (`../../erts/emulator/beam/emu/instrs.tab:593`):
+    /// `E += N`, which moves the frame's base *up* by `N` and therefore
+    /// **discards the lowest `N` Y slots**, renumbering the survivors
+    /// (`y(k) → y(k - N)`). The compiler agrees: `beam_trim.erl` treats
+    /// `trim N` as eliminating `y(0) .. y(N-1)` and remaps the rest by `-N`
+    /// (`Eliminated = [{y,N} || N <- seq(0, Trim-1)]`).
+    ///
+    /// The frame keeps `y_count - N` slots and its `y_base` is unchanged; only the
+    /// innermost frame's slots (the tail of the stack) are affected.
     pub(crate) fn trim(&mut self, n: u32) -> Result<()> {
         let n_usize = n as usize;
-        match self.frames.last_mut() {
-            Some(frame) => {
-                if n > frame.y_count {
-                    return Err(error::unsupported("trim: n exceeds frame size"));
-                }
-                frame.y_count -= n;
-            }
+        let (y_base, y_count) = match self.frames.last() {
+            Some(frame) => (frame.y_base, frame.y_count),
             None => return Err(error::unsupported("trim: no frame")),
+        };
+        if n > y_count {
+            return Err(error::unsupported("trim: n exceeds frame size"));
         }
+        let keep = y_count as usize - n_usize;
         if n_usize > self.stack.len() {
             return Err(error::unsupported("trim: stack underflow"));
         }
-        let new_len = self.stack.len() - n_usize;
-        self.stack.truncate(new_len);
+        // Drop the lowest `n` Y slots and shift the survivors down so `y(k)`
+        // addresses `y(k + n)` of the pre-trim frame.
+        if n_usize > 0 {
+            self.stack
+                .copy_within(y_base + n_usize..y_base + y_count as usize, y_base);
+        }
+        self.stack.truncate(y_base + keep);
+        if let Some(frame) = self.frames.last_mut() {
+            frame.y_count = keep as u32;
+        }
         Ok(())
     }
 
@@ -786,14 +803,20 @@ mod tests {
     }
 
     #[test]
-    fn trim_drops_top_y_slots() {
+    fn trim_discards_the_lowest_y_slots_and_renumbers() {
+        // C's `i_trim` does `E += N`: the frame base moves *up*, so the lowest
+        // `N` Y slots are discarded and the survivors are renumbered down
+        // (`y(k) -> y(k - N)`). `beam_trim.erl` eliminates `y(0)..y(N-1)`.
         let mut machine = Machine::new();
         machine.push_frame(4).unwrap();
         machine.set_y(0, Eterm::from_raw(1)).unwrap();
+        machine.set_y(2, Eterm::from_raw(3)).unwrap();
         machine.set_y(3, Eterm::from_raw(4)).unwrap();
         machine.trim(2).unwrap();
         assert_eq!(machine.stack_depth(), 2);
-        assert_eq!(machine.y(0), Some(Eterm::from_raw(1)));
+        // Old y2 (`3`) is now y0; old y3 (`4`) is now y1; old y0/y1 are gone.
+        assert_eq!(machine.y(0), Some(Eterm::from_raw(3)));
+        assert_eq!(machine.y(1), Some(Eterm::from_raw(4)));
         assert_eq!(machine.y(2), None);
         assert!(machine.trim(3).is_err());
     }
