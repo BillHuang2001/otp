@@ -44,7 +44,7 @@ Documents the `erl_call` tool built from `../../src/prog/erl_call.c`.
 - Newer functions end with an `Available since OTP <version>` line.
 
 ## Constraints
-- Keep the documented functions, variables and symbols in sync with `../../include/ei.h`, `ei_connect.h`, `ei_global.h` and with the compile-only smoke test `../../src/prog/ei_fake_prog.c` (rule stated in `../../src/README.internal`; that rule still names the removed legacy `erl_interface.h` and `prog/erl_fake_prog.c`, which do not exist today).
+- Keep the documented functions, variables and symbols in sync with `../../include/ei.h`, `ei_connect.h`, `ei_global.h` and with the compile-only smoke test `../../src/prog/ei_fake_prog.c` (rule stated in `../../src/README.internal`, whose other file inventory is stale).
 - Do not rename `## <function>()` headings or the `{: #... }` Data-Types anchors — they are link targets from other applications and from `../notes.md`.
 - Prose style: a `## Description` overview, then one section per function with an explicit parameter list and an explicit return-code sentence.
 
