@@ -74,6 +74,6 @@ Public headers in `include/`: `httpd.hrl` (records `init_data`, `mod` — the da
 
 ## See Also
 - `../CONTEXT.md` — `lib/` conventions for OTP applications (app dir schema, `vsn.mk`, `make/app_targets.mk`).
-- `../ftp/`, `../tftp/` — the FTP and TFTP services that used to be inets front-ends.
+- `../ftp/`, `../tftp/` — the FTP and TFTP client/server applications, separate from (and not services of) `inets`.
 - `../ssl/`, `../public_key/`, `../crypto/` — the TLS stack used by `httpc`/`httpd` HTTPS.
 - `../common_test/` — the test framework and `ts:compile_datadirs/2` used by `test/`.
