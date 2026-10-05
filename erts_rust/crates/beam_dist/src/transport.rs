@@ -9,7 +9,7 @@
 //! Errors: a transport failure maps to `BeamError::Io`; a short read / end of the
 //! input buffer maps to `BeamError::BadArg` (never a panic).
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 
 /// The read half of a transport: whole-buffer reads and the big-endian readers
 /// the distribution wire needs (every multi-byte field is big-endian).
@@ -127,16 +127,27 @@ impl MemoryTransport {
 
 impl Read for MemoryTransport {
     fn read_exact(&mut self, buf: &mut [u8]) -> Result<()> {
-        todo!("M1")
+        // A short read (end of buffer before `buf` is full) is a `BadArg` and
+        // must not consume any input: compute the end offset first and only
+        // advance `pos` once the whole read can succeed.
+        let end = self.pos.checked_add(buf.len()).ok_or(BeamError::BadArg)?;
+        if end > self.input.len() {
+            return Err(BeamError::BadArg);
+        }
+        buf.copy_from_slice(&self.input[self.pos..end]);
+        self.pos = end;
+        Ok(())
     }
 }
 
 impl Write for MemoryTransport {
     fn write_all(&mut self, buf: &[u8]) -> Result<()> {
-        todo!("M1")
+        self.output.extend_from_slice(buf);
+        Ok(())
     }
 
     fn flush(&mut self) -> Result<()> {
-        todo!("M1")
+        // An in-memory buffer never needs flushing.
+        Ok(())
     }
 }

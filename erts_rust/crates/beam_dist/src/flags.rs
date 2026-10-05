@@ -498,9 +498,62 @@ impl Dop {
 
     /// The number of term arguments that follow the opcode in a control message.
     ///
-    /// Taken from the `{DOP_*, …}` tuple shapes in `dist.c`.
+    /// This is `tuple_arity - 1`: the C receive path validates each `DOP_*` as a
+    /// message *tuple* `{DOP, Arg1, …}` whose first element is the opcode, while
+    /// [`encode_control`](crate::control::encode_control)/[`decode_control`](crate::control::decode_control)
+    /// carry the opcode as a bare byte followed by that many term bodies. Every
+    /// value below is the `tuple_arity` check in `erts/emulator/beam/dist.c`
+    /// minus one (read-only ground truth; never modify it).
+    ///
+    /// Citation for the C `tuple_arity` checks (comment-relative line numbers):
+    /// - `DOP_LINK` ~2224, `DOP_UNLINK_ID` ~2284, `DOP_UNLINK_ID_ACK` ~2315,
+    ///   `DOP_MONITOR_P` ~2341, `DOP_DEMONITOR_P` ~2415,
+    ///   `DOP_REG_SEND(_TT)` ~2463, `DOP_SEND(_TT)`/`DOP_SEND_SENDER(_TT)` ~2512-2531,
+    ///   `DOP_ALIAS_SEND(_TT)` ~2563, `DOP_ALTACT_SIG_SEND` ~2590,
+    ///   `DOP_MONITOR_P_EXIT`/`DOP_PAYLOAD_MONITOR_P_EXIT` ~2700,
+    ///   `DOP_EXIT(_TT)`/`DOP_PAYLOAD_EXIT(_TT)` ~2757,
+    ///   `DOP_EXIT2(_TT)`/`DOP_PAYLOAD_EXIT2(_TT)` ~2821,
+    ///   `DOP_GROUP_LEADER` ~2889, `DOP_SPAWN_REQUEST(_TT)` ~2902,
+    ///   `DOP_SPAWN_REPLY(_TT)` ~3033.
+    ///
+    /// `DOP_UNLINK` is never sent (`dist.c:2277` — the C path rejects it); its
+    /// shape `{op, From, To}` yields 2. `DOP_ALTACT_SIG_SEND` is *variable*
+    /// arity in C (`tuple_arity >= 4` — "the tuple might be extended with more
+    /// elements in the future"); this returns the documented minimum of 3, and
+    /// its variant handling is out of M1 scope.
     pub fn arity(self) -> usize {
-        todo!("M1")
+        match self {
+            Dop::Link => 2,            // {DOP_LINK, From, To}                      (dist.c:2224)
+            Dop::Send => 2,            // {DOP_SEND, From, To}                      (dist.c:2527)
+            Dop::Exit => 3,            // {DOP_EXIT, From, To, Reason}              (dist.c:2760)
+            Dop::Unlink => 2,          // never sent; {op, From, To} shape          (dist.c:2277)
+            Dop::RegSend => 3,         // {DOP_REG_SEND, From, Cookie, ToName}      (dist.c:2468)
+            Dop::GroupLeader => 2,     // {DOP_GROUP_LEADER, From, To}              (dist.c:2889)
+            Dop::Exit2 => 3,           // {DOP_EXIT2, From, To, Reason}             (dist.c:2824)
+            Dop::SendTt => 3,          // {DOP_SEND_TT, From, To, Token}            (dist.c:2513)
+            Dop::ExitTt => 4,          // {DOP_EXIT_TT, From, To, Token, Reason}    (dist.c:2759)
+            Dop::RegSendTt => 4,       // {DOP_REG_SEND_TT, From, Cookie, ToName, Token} (dist.c:2463)
+            Dop::Exit2Tt => 4,         // {DOP_EXIT2_TT, From, To, Token, Reason}   (dist.c:2823)
+            Dop::MonitorP => 3,        // {DOP_MONITOR_P, Remote, Local, Ref}       (dist.c:2341)
+            Dop::DemonitorP => 3,      // {DOP_DEMONITOR_P, Remote, Local, Ref}     (dist.c:2415)
+            Dop::MonitorPExit => 4,    // {DOP_MONITOR_P_EXIT, Remote, Local, Ref, Reason} (dist.c:2701)
+            Dop::SendSender => 2,      // {DOP_SEND_SENDER, Sender, To}             (dist.c:2526)
+            Dop::SendSenderTt => 3,    // {DOP_SEND_SENDER_TT, Sender, To, Token}   (dist.c:2512)
+            Dop::PayloadExit => 2,     // {DOP_PAYLOAD_EXIT, From, To}              (dist.c:2757)
+            Dop::PayloadExitTt => 3,   // {DOP_PAYLOAD_EXIT_TT, From, To, Token}    (dist.c:2758)
+            Dop::PayloadExit2 => 2,    // {DOP_PAYLOAD_EXIT2, From, To}             (dist.c:2822)
+            Dop::PayloadExit2Tt => 3,  // {DOP_PAYLOAD_EXIT2_TT, From, To, Token}   (dist.c:2821)
+            Dop::PayloadMonitorPExit => 3, // {DOP_PAYLOAD_MONITOR_P_EXIT, Remote, Local, Ref} (dist.c:2700)
+            Dop::SpawnRequest => 5,    // {DOP_SPAWN_REQUEST, Ref, From, GL, MFA, Opts} (dist.c:2919)
+            Dop::SpawnRequestTt => 6,  // {DOP_SPAWN_REQUEST_TT, Ref, From, GL, MFA, Opts, Token} (dist.c:2902)
+            Dop::SpawnReply => 4,      // {DOP_SPAWN_REPLY, Ref, To, Flags, From}   (dist.c:3051)
+            Dop::SpawnReplyTt => 5,    // {DOP_SPAWN_REPLY_TT, Ref, To, Flags, From, Token} (dist.c:3033)
+            Dop::AliasSend => 2,       // {DOP_ALIAS_SEND, From, To}                (dist.c:2563)
+            Dop::AliasSendTt => 3,     // {DOP_ALIAS_SEND_TT, From, To, Token}      (dist.c:2570)
+            Dop::UnlinkId => 3,        // {DOP_UNLINK_ID, Id, From, To}             (dist.c:2284)
+            Dop::UnlinkIdAck => 3,     // {DOP_UNLINK_ID_ACK, Id, From, To}         (dist.c:2315)
+            Dop::AltactSigSend => 3,   // {DOP_ALTACT_SIG_SEND, Flags, SenderPid, To[, Token]} (variable, min) (dist.c:2590)
+        }
     }
 }
 
