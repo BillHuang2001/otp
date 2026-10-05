@@ -9,11 +9,17 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::copy::CopyContext;
+use crate::copy::{copy_struct, CopyContext};
 use crate::message::{Message, Queue};
 
 /// Copies `term` into the receiver's heap `to_heap`, collects the off-heap objects it
 /// references, builds the [`Message`] and enqueues it on `to_queue`.
+///
+/// `ctx`'s **destination** off-heap table *is* the message's off-heap list: `copy_struct`
+/// refcounts every referenced off-heap object into it, and `send` drains it into the message (see
+/// the crate `CONTEXT.md`, Design Decisions). It is expected to start empty for each send,
+/// mirroring the C per-message `off_heap`; a non-empty table would attach its pre-existing handles
+/// to this message.
 pub fn send(
     from: Eterm,
     term: Eterm,
@@ -21,10 +27,10 @@ pub fn send(
     to_queue: &mut Queue,
     ctx: &mut CopyContext<'_>,
 ) -> Result<()> {
-    let _ = (from, term, to_heap, to_queue, ctx);
-    unimplemented!(
-        "TODO(mailbox::send): copy term into the receiver heap and enqueue the message"
-    )
+    let payload = copy_struct(term, to_heap, ctx)?;
+    let off_heap = ctx.dst_off_heap_mut().drain_handles();
+    to_queue.enqueue(Message::new(payload, from).with_off_heap(off_heap));
+    Ok(())
 }
 
 /// Removes and returns the first queued message whose payload satisfies `pred`.

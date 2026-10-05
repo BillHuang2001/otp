@@ -5,7 +5,6 @@
 //! the two failures the copy engine can raise, exactly as `beam_gc::error` does for the
 //! collector. Heap exhaustion mid-copy is a **normal** condition (the caller may grow the
 //! destination heap and retry), never a panic.
-#![allow(dead_code)] // stub helpers: consumed by the implementation pass
 
 use beam_common::{AllocFailure, AllocKind, BeamError};
 use beam_term::prelude::Eterm;

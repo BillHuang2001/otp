@@ -69,6 +69,15 @@ impl OffHeapTable {
     pub fn into_handles(self) -> Vec<MsoHandle> {
         self.entries
     }
+
+    /// Removes and returns every held handle, leaving the table empty.
+    ///
+    /// `send` uses this to hand the copied message its off-heap list: the destination table built
+    /// up by `copy_struct` *is* the message's off-heap list, and is expected to start empty for
+    /// each send (mirroring the C per-message `off_heap`).
+    pub fn drain_handles(&mut self) -> Vec<MsoHandle> {
+        core::mem::take(&mut self.entries)
+    }
 }
 
 #[cfg(test)]
@@ -112,5 +121,22 @@ mod tests {
         // The clone is the only extra reference; dropping it releases the shared object.
         drop(clone);
         assert_eq!(handles[0].refcount(), 1);
+    }
+
+    #[test]
+    fn drain_handles_returns_every_slot_and_empties_the_table() {
+        let mut table = OffHeapTable::new();
+        table.push(Mso::new(1u32, 4));
+        table.push(Mso::new(2u32, 4));
+
+        let drained = table.drain_handles();
+        assert_eq!(drained.len(), 2);
+        assert_eq!(drained[0].downcast_ref::<u32>(), Some(&1));
+        assert_eq!(drained[1].downcast_ref::<u32>(), Some(&2));
+
+        assert!(table.is_empty());
+        assert_eq!(table.len(), 0);
+        assert!(table.get(0).is_none());
+        assert!(table.drain_handles().is_empty());
     }
 }
