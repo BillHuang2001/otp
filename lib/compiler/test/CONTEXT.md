@@ -85,6 +85,13 @@ Dummy `.erl` stubs are generated (`ERL_DUMMY_FILES`) so the release test dir has
 | `property_test/` | PropEr/EQC property tests (`compile_prop.erl`, `beam_types_prop.erl`) |
 | Fixture data dirs (`*_SUITE_data/`) | Static inputs consumed by their matching suite: `beam_doc_`, `beam_ssa_check_`, `beam_validator_` (`.S` listings), `bif_`, `compilation_`, `compile_`, `core_fold_`, `core_` (`.core`), `error_`, `inline_`, `receive_`, `record_` |
 
+## Optimization-Correctness Guardrails (lists / maps / records / destructive update)
+- Only `beam_ssa_check_SUITE_data/*.erl` carry `%ssa%` directives (assertions consumed by `beam_ssa_check` via `{check_ssa,pre_ssa_opt|post_ssa_opt}` in `run_checks/3`); every other suite asserts on runtime values / exceptions instead.
+- Destructive-update fixtures (all under `beam_ssa_check_SUITE_data/`): `appendable.erl` (appendable-bitstring flag), `private_append.erl` (tests that `beam_ssa_destructive_update` rewrites `bs_create_bin` appends to `private_append`), `no_reuse_hint.erl` (tests the `ssa_opt_no_reuse` pass), `tuple_inplace_checks.erl` + `tuple_inplace_abort0..3.erl` (`update_record` in-place vs. abort / infinite-loop guards), `alias.erl`, `alias_chain.erl`, `alias_non_convergence.erl` (test `beam_ssa_alias_opt:opt/2` annotations and the alias-analysis convergence limit; compiled with `-compile(no_ssa_opt_destructive_update)`).
+- Runtime (non-`%ssa%`) destructive-append tests live in `bs_construct_SUITE:private_append/1` (its `private_append_1/1` covers GH-7121: alias analysis failing to mark fun arguments as aliased fooled the destructive-update pass).
+- `compile_SUITE:annotations_pp/1` counts pretty-printed SSA annotations (`Result type` / `Unique` / `Aliased`) in a `.ssaopt` listing; its comment notes that correct placement and content are verified by `beam_ssa_check_SUITE`.
+- `is_cloned/1` and `get_data_dir/1` recognise every clone suffix EXCEPT `_dialyzer_SUITE` (which has no data dir; `DIALYZER = bs_match`).
+
 ## See Also
 - `../src/CONTEXT.md` — the compiler implementation the suites exercise (passes named after the suites).
 - `../../common_test/` — the Common Test framework (`ts_install_cth`, `ct_property_test`); `../../../make/make_emakefile.in` + `make/app_targets.mk` — the Emakefile generation and `test` target.
