@@ -7,6 +7,7 @@
 //! the raw option list happens in `beam_bifs`; this module owns the **parsed**
 //! representation ([`TableOptions`]) and its defaults.
 
+use crate::table::OwnerId;
 use beam_common::Result;
 use beam_term::prelude::*;
 
@@ -35,6 +36,21 @@ impl TableKind {
             TableKind::OrderedSet => "ordered_set",
             TableKind::Bag => "bag",
             TableKind::DuplicateBag => "duplicate_bag",
+        }
+    }
+
+    /// Parse a table kind from its Erlang atom name; the inverse of
+    /// [`as_atom_name`](TableKind::as_atom_name).
+    ///
+    /// Returns `None` for an unknown name so the `ets:new/2` option parser can
+    /// reject it (`badarg`) at the call site.
+    pub fn from_atom_name(name: &str) -> Option<TableKind> {
+        match name {
+            "set" => Some(TableKind::Set),
+            "ordered_set" => Some(TableKind::OrderedSet),
+            "bag" => Some(TableKind::Bag),
+            "duplicate_bag" => Some(TableKind::DuplicateBag),
+            _ => None,
         }
     }
 
@@ -74,6 +90,20 @@ impl Access {
             Access::Private => "private",
         }
     }
+
+    /// Parse an access mode from its Erlang atom name (`protection` option); the
+    /// inverse of [`as_atom_name`](Access::as_atom_name).
+    ///
+    /// Returns `None` for an unknown name so the `ets:new/2` option parser can
+    /// reject it (`badarg`) at the call site.
+    pub fn from_atom_name(name: &str) -> Option<Access> {
+        match name {
+            "public" => Some(Access::Public),
+            "protected" => Some(Access::Protected),
+            "private" => Some(Access::Private),
+            _ => None,
+        }
+    }
 }
 
 /// The table concurrency mode (M1 skeleton).
@@ -91,6 +121,32 @@ pub enum Concurrency {
     Write,
     /// Concurrent readers and writers (both flags set).
     ReadWrite,
+}
+
+impl Concurrency {
+    /// The Erlang atom name of this concurrency mode: `"none"`, `"read"`,
+    /// `"write"` or `"read_write"`.
+    pub fn as_atom_name(&self) -> &'static str {
+        match self {
+            Concurrency::None => "none",
+            Concurrency::Read => "read",
+            Concurrency::Write => "write",
+            Concurrency::ReadWrite => "read_write",
+        }
+    }
+
+    /// Parse a concurrency mode from its atom name; the inverse of
+    /// [`as_atom_name`](Concurrency::as_atom_name). Returns `None` for an
+    /// unknown name.
+    pub fn from_atom_name(name: &str) -> Option<Concurrency> {
+        match name {
+            "none" => Some(Concurrency::None),
+            "read" => Some(Concurrency::Read),
+            "write" => Some(Concurrency::Write),
+            "read_write" => Some(Concurrency::ReadWrite),
+            _ => None,
+        }
+    }
 }
 
 /// The parsed `ets:new/2` option set.
@@ -224,11 +280,63 @@ impl TableOptions {
     pub fn read_concurrency(&self) -> bool {
         self.read_concurrency
     }
+
+    /// The concurrency mode derived from the `read_concurrency` /
+    /// `write_concurrency` flags (both set ⇒ [`Concurrency::ReadWrite`]).
+    pub fn concurrency(&self) -> Concurrency {
+        match (self.read_concurrency, self.write_concurrency) {
+            (true, true) => Concurrency::ReadWrite,
+            (true, false) => Concurrency::Read,
+            (false, true) => Concurrency::Write,
+            (false, false) => Concurrency::None,
+        }
+    }
 }
 
 impl Default for TableOptions {
     fn default() -> TableOptions {
         TableOptions::new()
+    }
+}
+
+/// Whether `requester` is the table owner.
+///
+/// The owner comparison is exactly `requester == owner`, matching the legacy
+/// `p->common.id != tb->common.owner` check in `handle_lacking_permission`
+/// (`../../erts/emulator/beam/erl_db.c`). Consequently `None == Some(x)` is
+/// `false` (an anonymous requester never owns a table), while an ownerless table
+/// accessed by an anonymous requester (`None == None`) is permitted.
+fn is_owner(owner: Option<OwnerId>, requester: Option<OwnerId>) -> bool {
+    requester == owner
+}
+
+/// Whether `requester` may read a table with the given access mode.
+///
+/// Reproduces the access model of `db_get_table_aux` / `handle_lacking_permission`
+/// in `../../erts/emulator/beam/erl_db.c` (via the `DB_READ` status mask
+/// `DB_PROTECTED | DB_PUBLIC`):
+/// * `public` — anyone may read.
+/// * `protected` — anyone may read.
+/// * `private` — only the owner may read.
+pub fn can_read(access: Access, owner: Option<OwnerId>, requester: Option<OwnerId>) -> bool {
+    match access {
+        Access::Public | Access::Protected => true,
+        Access::Private => is_owner(owner, requester),
+    }
+}
+
+/// Whether `requester` may write a table with the given access mode.
+///
+/// Reproduces the access model of `db_get_table_aux` / `handle_lacking_permission`
+/// in `../../erts/emulator/beam/erl_db.c` (via the `DB_WRITE` status mask
+/// `DB_PUBLIC`):
+/// * `public` — anyone may write.
+/// * `protected` — only the owner may write.
+/// * `private` — only the owner may write.
+pub fn can_write(access: Access, owner: Option<OwnerId>, requester: Option<OwnerId>) -> bool {
+    match access {
+        Access::Public => true,
+        Access::Protected | Access::Private => is_owner(owner, requester),
     }
 }
 
@@ -353,5 +461,172 @@ mod tests {
         opts.set_named(false);
         assert!(!opts.is_named());
         assert_eq!(opts.name(), Some(Atom::from_raw(3)));
+    }
+
+    #[test]
+    fn table_kind_atom_name_round_trip() {
+        for kind in [
+            TableKind::Set,
+            TableKind::OrderedSet,
+            TableKind::Bag,
+            TableKind::DuplicateBag,
+        ] {
+            assert_eq!(TableKind::from_atom_name(kind.as_atom_name()), Some(kind));
+        }
+        assert_eq!(TableKind::from_atom_name("nope"), None);
+        assert_eq!(TableKind::from_atom_name(""), None);
+    }
+
+    #[test]
+    fn access_atom_name_round_trip() {
+        for access in [Access::Public, Access::Protected, Access::Private] {
+            assert_eq!(Access::from_atom_name(access.as_atom_name()), Some(access));
+        }
+        assert_eq!(Access::from_atom_name("nope"), None);
+        assert_eq!(Access::from_atom_name(""), None);
+    }
+
+    #[test]
+    fn concurrency_atom_name_round_trip() {
+        assert_eq!(Concurrency::None.as_atom_name(), "none");
+        assert_eq!(Concurrency::Read.as_atom_name(), "read");
+        assert_eq!(Concurrency::Write.as_atom_name(), "write");
+        assert_eq!(Concurrency::ReadWrite.as_atom_name(), "read_write");
+
+        for concurrency in [
+            Concurrency::None,
+            Concurrency::Read,
+            Concurrency::Write,
+            Concurrency::ReadWrite,
+        ] {
+            assert_eq!(
+                Concurrency::from_atom_name(concurrency.as_atom_name()),
+                Some(concurrency)
+            );
+        }
+        assert_eq!(Concurrency::from_atom_name("nope"), None);
+        assert_eq!(Concurrency::from_atom_name(""), None);
+    }
+
+    #[test]
+    fn options_concurrency_derives_from_flags() {
+        let mut opts = TableOptions::new();
+        assert_eq!(opts.concurrency(), Concurrency::None);
+
+        opts.set_read_concurrency(true);
+        assert_eq!(opts.concurrency(), Concurrency::Read);
+
+        opts.set_write_concurrency(true);
+        assert_eq!(opts.concurrency(), Concurrency::ReadWrite);
+
+        opts.set_read_concurrency(false);
+        assert_eq!(opts.concurrency(), Concurrency::Write);
+
+        opts.set_write_concurrency(false);
+        assert_eq!(opts.concurrency(), Concurrency::None);
+    }
+
+    #[test]
+    fn can_read_matrix() {
+        let a = OwnerId::new(1);
+        let b = OwnerId::new(2);
+
+        // Public: anyone may read, regardless of owner/requester.
+        for owner in [None, Some(a)] {
+            for requester in [None, Some(a), Some(b)] {
+                assert!(
+                    can_read(Access::Public, owner, requester),
+                    "public read owner={owner:?} requester={requester:?}"
+                );
+            }
+        }
+
+        // Protected: anyone may read, regardless of owner/requester.
+        for owner in [None, Some(a)] {
+            for requester in [None, Some(a), Some(b)] {
+                assert!(
+                    can_read(Access::Protected, owner, requester),
+                    "protected read owner={owner:?} requester={requester:?}"
+                );
+            }
+        }
+
+        // Private: only an exact owner match may read.
+        assert!(can_read(Access::Private, None, None)); // None == None
+        assert!(!can_read(Access::Private, None, Some(a)));
+        assert!(!can_read(Access::Private, Some(a), None));
+        assert!(can_read(Access::Private, Some(a), Some(a)));
+        assert!(!can_read(Access::Private, Some(a), Some(b)));
+        assert!(can_read(Access::Private, Some(b), Some(b)));
+        assert!(!can_read(Access::Private, Some(b), Some(a)));
+    }
+
+    #[test]
+    fn can_write_matrix() {
+        let a = OwnerId::new(1);
+        let b = OwnerId::new(2);
+
+        // Public: anyone may write, regardless of owner/requester.
+        for owner in [None, Some(a)] {
+            for requester in [None, Some(a), Some(b)] {
+                assert!(
+                    can_write(Access::Public, owner, requester),
+                    "public write owner={owner:?} requester={requester:?}"
+                );
+            }
+        }
+
+        // Protected: only an exact owner match may write.
+        assert!(can_write(Access::Protected, None, None)); // None == None
+        assert!(!can_write(Access::Protected, None, Some(a)));
+        assert!(!can_write(Access::Protected, Some(a), None));
+        assert!(can_write(Access::Protected, Some(a), Some(a)));
+        assert!(!can_write(Access::Protected, Some(a), Some(b)));
+        assert!(can_write(Access::Protected, Some(b), Some(b)));
+        assert!(!can_write(Access::Protected, Some(b), Some(a)));
+
+        // Private: only an exact owner match may write.
+        assert!(can_write(Access::Private, None, None)); // None == None
+        assert!(!can_write(Access::Private, None, Some(a)));
+        assert!(!can_write(Access::Private, Some(a), None));
+        assert!(can_write(Access::Private, Some(a), Some(a)));
+        assert!(!can_write(Access::Private, Some(a), Some(b)));
+        assert!(can_write(Access::Private, Some(b), Some(b)));
+        assert!(!can_write(Access::Private, Some(b), Some(a)));
+    }
+
+    #[test]
+    fn access_matrix_grid_matches_db_masks() {
+        // Exhaustive 3 access modes × owner ∈ {None, Some(a)} ×
+        // requester ∈ {None, Some(a), Some(b)}, cross-checked against the legacy
+        // status-mask model (DB_READ = PROTECTED|PUBLIC, DB_WRITE = PUBLIC) plus
+        // the exact `requester == owner` fall-back in handle_lacking_permission.
+        let a = OwnerId::new(1);
+        let b = OwnerId::new(2);
+        for access in [Access::Public, Access::Protected, Access::Private] {
+            for owner in [None, Some(a)] {
+                for requester in [None, Some(a), Some(b)] {
+                    let owner_ok = requester == owner;
+                    let expect_read = match access {
+                        Access::Public | Access::Protected => true,
+                        Access::Private => owner_ok,
+                    };
+                    let expect_write = match access {
+                        Access::Public => true,
+                        Access::Protected | Access::Private => owner_ok,
+                    };
+                    assert_eq!(
+                        can_read(access, owner, requester),
+                        expect_read,
+                        "read access={access:?} owner={owner:?} requester={requester:?}"
+                    );
+                    assert_eq!(
+                        can_write(access, owner, requester),
+                        expect_write,
+                        "write access={access:?} owner={owner:?} requester={requester:?}"
+                    );
+                }
+            }
+        }
     }
 }
