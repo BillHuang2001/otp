@@ -23,7 +23,7 @@ Shipped dictionaries (all in `DICTS`, `../src/modules.mk` — except `capup_rfc6
 Generated module API (created by `../src/compiler/diameter_codegen.erl`): `name/0`, `id/0`, `vendor_id/0`, `vendor_name/0`, `msg_name/2`, `msg_header/1`, `rec2msg/1`, `msg2rec/1`, `name2rec/1`, `avp_name/2`, `avp_arity/1`, `avp_arity/2`, `avp_header/1`, `avp/4`, `enumerated_avp/3`, `empty_value/2`, `dict/0`, plus `decode_avps/3`, `encode_avps/3`, `grouped_avp/4` from `../include/diameter_gen.hrl`.
 `id/0` returns the `@id` and is the Application Id put into outgoing message headers (`msg_header/1`) and used to select the module for an incoming header; it raises `badarg` when `@id` is absent (`doic_rfc7683`).
 `name/0` returns `@name` (the module's own name), not the file name.
-Record names are `@prefix` ++ message/Grouped-AVP name *verbatim* (hyphens kept, thus quoted atoms): `#diameter_base_CER{}`, `'diameter_base_answer-message'`, `#diameter_base_accounting_ACR{}`, `#diameter_doic_OC_OLR{}`; field names are AVP names (e.g. `'Result-Code'`).
+Record names are `@prefix` ++ message/Grouped-AVP name *verbatim* (hyphens kept, thus quoted atoms): `#diameter_base_CER{}`, `'diameter_base_answer-message'`, `#diameter_base_accounting_ACR{}`, `'diameter_doic_OC-OLR'`; field names are AVP names (e.g. `'Result-Code'`).
 Records are exported through the `diameter_exprecs` parse transform, giving each record module `'#info-'/1`, `'#new-'/1`, `'#get-'/2`, `'#set-'/2` helpers used by `../src/base/diameter_capx.erl` et al.
 `@enum`/`@define` sections (e.g. `Result-Code`, `Termination-Cause`) also produce constants/macros in the generated `.hrl`.
 
