@@ -7,7 +7,7 @@ This directory is also the Docker **build context** for all CI images (see `dock
 
 ## API Surface
 - `workflows/main.yaml` — the single orchestrator ("Build and check Erlang/OTP"), triggered by `push`, `pull_request` and a nightly `schedule` (cron `0 1 * * *`). Computes the changed applications and build flags once, builds one 64-bit base, then fans out to ~18 `workflow_call` targets (per-platform builds, tests, docs, static analysis, SBOM, release).
-- `workflows/reusable-*.y*ml` — 20 reusable workflows, consumed via `workflow_call` from `main.yaml` (also callable by the release tooling). They are not standalone entry points; their inputs/outputs/secrets are the CI contract.
+- `workflows/reusable-*.y*ml` — 19 reusable workflows, consumed via `workflow_call` from `main.yaml` (also callable by the release tooling). They are not standalone entry points; their inputs/outputs/secrets are the CI contract.
 - `workflows/*.y*ml` (standalone) — independently triggered security, publishing and maintenance jobs (`license-scanner`, `github-actions-checker`, `osv-scanner-scheduled`, `ossf-compiler-flags-scanner`, `scorecard`, `security-practice-scheduled`, `openvex-sync`, `sync-github-releases`, `upload-windows-zip`, `sigstore-updater`, `pr-comment`, `update-base`, `renovate-vendored-deps`).
 - `actions/build-base-image/` — composite action that builds/caches the shared Linux docker image tagged `otp`; every Linux build/test job runs inside it.
 - `actions/ossf-compiler-flags-scanner/` — composite action wrapping the OpenSSF compiler-flag scan and SARIF generation.
