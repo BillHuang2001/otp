@@ -68,7 +68,7 @@ Contents: 21 Erlang modules (`modules.mk` splits 4 `BEHAVIOUR_MODULES` from 17 `
 - `megaco_erl_dist_encoder_mc.erl` (1898 lines) is generated-style repetitive per-record/per-version compression code; treat it as machine-like and edit only the relevant record clauses.
 - Section banners in the large modules encode the structure: "Register/unregister connections", "Handle incoming message", "SNMP statistics handling functions", "cleanup utility functions" etc.
 - Several modules carry `MEGACO_TEST_CODE` / `debug` compile-time branches (see `../app/megaco.mk`) — test-only code paths are `-ifdef`-guarded and not compiled in a normal build.
-- `megaco_stats.erl` is a generic ETS counter helper, not megaco-protocol-specific; it is used from `../binary/`, `../text/`, `../udp/`, `../tcp/` as well.
+- `megaco_stats.erl` is a generic ETS counter helper, not megaco-protocol-specific; it is also used by `../udp/` and `../tcp/`.
 
 ## Dependencies
 - `-include_lib("megaco/include/megaco.hrl")` and `-include_lib("megaco/src/app/megaco_internal.hrl")` are the normal headers; `-include_lib("megaco/include/megaco_message_v1.hrl")` is used by `megaco_filter`, `megaco_user`, `megaco_user_default` and `megaco_sdp`.
