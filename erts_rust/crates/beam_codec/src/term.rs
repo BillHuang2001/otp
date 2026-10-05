@@ -45,6 +45,24 @@ const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 /// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
 /// hashmap above it).
 const MAP_SMALL_MAP_LIMIT: usize = 32;
+/// `EXTERNAL_THING_HEAD_SIZE` (`erl_term.h:1161`):
+/// `offsetof(ExternalThing, data) / sizeof(Uint)` — the `[header, node, next]`
+/// head, three words on `ARCH_64`.
+const EXTERNAL_THING_HEAD_SIZE: usize = 3;
+/// `EXTERNAL_PORT_HEAP_SIZE` (`erl_term.h:1177`) = the head + one 64-bit data word.
+const EXTERNAL_PORT_HEAP_SIZE: usize = EXTERNAL_THING_HEAD_SIZE + 1;
+/// `EXTERNAL_PID_HEAP_SIZE` (`erl_term.h:1166`) = the head + one 64-bit data word.
+const EXTERNAL_PID_HEAP_SIZE: usize = EXTERNAL_THING_HEAD_SIZE + 1;
+/// `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`): the largest external-reference id
+/// count [`make_external_ref`] accepts (and therefore the largest
+/// [`external_ref_parts`] reports).
+pub const MAX_REF_IDS: usize = 5;
+
+// The frozen term layout is the 64-bit `ARCH_64` ABI of the C ground truth:
+// `ErtsDigit` is `Uint` = one `Eterm` word (`big.h:29`) and the
+// external-identifier data union packs two `Uint32`s per word
+// (`erl_term.h:1156`).
+const _: () = assert!(WORD_BYTES == 8, "the frozen term layout assumes ARCH_64");
 
 /// Materializes a float term on `heap`.
 ///
@@ -84,12 +102,18 @@ pub fn float_value(term: Eterm) -> Result<f64> {
 
 /// Materializes a bignum term on `heap`.
 ///
-/// `digits` are base-256 magnitude digits, **least significant first**;
-/// `negative` sets the header's `_BIG_SIGN_BIT`. Layout pinned to
-/// `erl_term.h:452-471`: `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1),
-/// d0 … d(n-1)]`, with the root word `make_boxed(hp)`. More than `BIG_ARITY_MAX`
-/// (`(1 << 16) - 1` on 64-bit) digits yields `BeamError::SystemLimit`.
-pub fn make_big(heap: &mut Heap, negative: bool, digits: &[u8]) -> Result<Eterm> {
+/// `digits` are `ErtsDigit`s (`big.h:29`: `typedef Uint ErtsDigit`, i.e. exactly one
+/// machine word — `u64` on `ARCH_64`), **least significant first**; `negative` sets
+/// the header's `_BIG_SIGN_BIT`. Layout pinned to `erl_term.h:452-471` and
+/// `big.h:68-73,96-97`: one digit per word and `BIG_NEED_SIZE(n) = n + 1` words, i.e.
+/// `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1), d0 … d(n-1)]`, with
+/// the root word `make_boxed(hp)`.
+///
+/// An empty `digits` is an illegal zero-width bignum (`external.c:4474-4486` strips
+/// the leading zeroes precisely to avoid building one) and yields
+/// `BeamError::BadArg`; more than `BIG_ARITY_MAX` (`(1 << 16) - 1`) digits yields
+/// `BeamError::SystemLimit`.
+pub fn make_big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Result<Eterm> {
     let n = digits.len();
     if n == 0 {
         return Err(error::bad_arg());
@@ -97,10 +121,9 @@ pub fn make_big(heap: &mut Heap, negative: bool, digits: &[u8]) -> Result<Eterm>
     if n > BIG_ARITY_MAX {
         return Err(error::system_limit());
     }
-    // The digits are stored **byte-packed** (contiguous magnitude bytes, not one
-    // digit per word as the C `ErtsDigit` layout): `big_parts` hands them back as a
-    // borrowed `&[u8]`, which is only possible over a packed region.
-    let words = 1 + n.div_ceil(WORD_BYTES);
+    // `BIG_NEED_SIZE(n) = n + 1` (`big.h:97`): the header word plus one word per
+    // `ErtsDigit`.
+    let words = 1 + n;
     // SAFETY: `alloc_words(words)` returned `words` exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(words)? };
     let subtag = if negative {
@@ -108,26 +131,26 @@ pub fn make_big(heap: &mut Heap, negative: bool, digits: &[u8]) -> Result<Eterm>
     } else {
         POS_BIG_SUBTAG
     };
-    // SAFETY: `hp` owns `words` words; word `0` receives the bignum header.
-    unsafe { *hp = make_header(n - 1, subtag) };
-    // SAFETY: word `1` is the base of `words - 1` bytes; the region is zeroed (which
-    // also clears the trailing padding of the last word) and the `n` magnitude bytes
-    // are copied into its front.
+    // SAFETY: `hp` owns `words = 1 + n` words; word `0` receives the bignum header
+    // (arity `n - 1`) and words `1..=n` receive the digits in least-significant-first
+    // order (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`, `big.h:68`).
     unsafe {
-        let dst = hp.add(1).cast::<u8>();
-        core::ptr::write_bytes(dst, 0, (words - 1) * WORD_BYTES);
-        core::ptr::copy_nonoverlapping(digits.as_ptr(), dst, n);
+        *hp = make_header(n - 1, subtag);
+        for (i, &digit) in digits.iter().enumerate() {
+            *hp.add(1 + i) = Eterm::from_raw(digit as usize);
+        }
     }
     Ok(make_boxed(hp))
 }
 
 /// Splits a bignum term into `(negative, digits)`.
 ///
-/// `digits` are base-256 magnitude digits, least significant first, borrowed from
-/// the term's storage (the caller must keep the owning heap alive) — the exact
-/// inverse of [`make_big`] (`erl_term.h:452-471`; the sign lives in the header's
+/// `digits` are `ErtsDigit`s (`u64`), least significant first, borrowed from the
+/// term's storage (the caller must keep the owning heap alive) — the exact inverse of
+/// [`make_big`] (`big.h:59-73`: `BIG_V(xp) = (ErtsDigit *)((xp) + 1)`,
+/// `BIG_ARITY(xp) = bignum_header_arity(*xp)`; the sign lives in the header's
 /// `_BIG_SIGN_BIT`). A term that is not a bignum yields `BeamError::BadArg`.
-pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u8])> {
+pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u64])> {
     if !is_boxed(term) {
         return Err(error::bad_arg());
     }
@@ -140,10 +163,10 @@ pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u8])> {
     }
     // The header arity is `n - 1` (`make_bignum_header(n-1)`, `erl_term.h:452-453`).
     let n = arityval(hdr) + 1;
-    // SAFETY: the header encodes the digit count `n`; `make_big` stored the `n`
-    // magnitude bytes contiguously starting at byte one of the block, and the caller
-    // keeps the owning heap alive for `'a`.
-    let digits = unsafe { core::slice::from_raw_parts(p.add(1).cast::<u8>(), n) };
+    // SAFETY: the header encodes the digit count `n` and `make_big` stored the `n`
+    // one-word `ErtsDigit`s starting at word one of the block, so the slice is live and
+    // in bounds; the caller keeps the owning heap alive for `'a`.
+    let digits = unsafe { core::slice::from_raw_parts(p.add(1).cast::<u64>(), n) };
     Ok(((hdr.raw() & BIG_SIGN_BIT) != 0, digits))
 }
 
@@ -248,10 +271,20 @@ pub fn flatmap_parts<'a>(term: Eterm) -> Result<(&'a [Eterm], &'a [Eterm])> {
 
 /// Materializes an external pid on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1160-1230` (`ExternalThing`): the header
-/// `make_external_pid_header(size)` (`= make_header(size - 1, pid_subtag)`)
-/// followed by `[node, number, serial, creation]`, with the root word
-/// `make_boxed(hp)`. `node` is the node-name atom term.
+/// Layout pinned to `erl_term.h:1137-1172` (`ExternalThing`): the three-word head
+/// `[header, node, next]` (`EXTERNAL_THING_HEAD_SIZE`) followed by the 64-bit
+/// `data.pid` union, so `EXTERNAL_PID_HEAP_SIZE = 4` words and the header is
+/// `make_external_pid_header() = make_header(EXTERNAL_PID_HEAP_SIZE - 1, …)`.
+/// `number` and `serial` are the two `Uint32`s of `data.pid` packed into the single
+/// data word (`num` first, then `ser`), exactly as C lays the struct out.
+///
+/// **M1 substitution:** in C, `node` is a pointer to a registered node (which carries
+/// the sysname *and* the creation) and `next` is the off-heap link
+/// (`etp->node = erts_find_or_insert_node(sysname, cre, …)`). This crate has no node
+/// registry yet, so word `1` holds the sysname atom term and word `2` — the unused
+/// off-heap-link slot — holds `creation`. The word positions and arity are exactly
+/// C's; only the `node`/`next` pointer semantics are deferred until a node-identity
+/// type exists (see the crate `CONTEXT.md`, "Known Issues").
 pub fn make_external_pid(
     heap: &mut Heap,
     node: Eterm,
@@ -259,25 +292,30 @@ pub fn make_external_pid(
     serial: u32,
     creation: u32,
 ) -> Result<Eterm> {
-    // SAFETY: `alloc_words(5)` returned five exclusively-owned, writable words.
-    let hp = unsafe { heap.alloc_words(5)? };
-    // SAFETY: `hp` owns exactly those five words; all are written before use. The
-    // numeric fields are stored as raw words (not small-int terms), so the full
-    // 32-bit range survives.
+    // SAFETY: `alloc_words(EXTERNAL_PID_HEAP_SIZE)` returned four exclusively-owned,
+    // writable words.
+    let hp = unsafe { heap.alloc_words(EXTERNAL_PID_HEAP_SIZE)? };
+    // SAFETY: `hp` owns exactly those four words; all are written before use. Word `3`
+    // is the `data.pid = { Uint32 num; Uint32 ser; }` union, so it carries two
+    // native-endian `u32`s and the full 32-bit range of both fields survives.
     unsafe {
-        *hp = make_header(4, EXTERNAL_PID_SUBTAG);
+        *hp = make_header(EXTERNAL_PID_HEAP_SIZE - 1, EXTERNAL_PID_SUBTAG);
         *hp.add(1) = node;
-        *hp.add(2) = Eterm::from_raw(number as usize);
-        *hp.add(3) = Eterm::from_raw(serial as usize);
-        *hp.add(4) = Eterm::from_raw(creation as usize);
+        *hp.add(2) = Eterm::from_raw(creation as usize);
+        let data = hp.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+        *data = number;
+        *data.add(1) = serial;
     }
     Ok(make_boxed(hp))
 }
 
 /// Splits an external pid term into `(node, number, serial, creation)`.
 ///
-/// The exact inverse of [`make_external_pid`] (`erl_term.h:1160-1230`). A term
-/// that is not an external pid yields `BeamError::BadArg`.
+/// The exact inverse of [`make_external_pid`] (`erl_term.h:1137-1172`): the data word
+/// is `data.pid = { num, ser }` and `creation` comes from the `next` slot (the M1
+/// substitution described on [`make_external_pid`]). A term that is not an external
+/// pid, or whose header arity is not `EXTERNAL_PID_HEAP_SIZE - 1`, yields
+/// `BeamError::BadArg`.
 pub fn external_pid_parts(term: Eterm) -> Result<(Eterm, u32, u32, u32)> {
     if !is_boxed(term) {
         return Err(error::bad_arg());
@@ -285,51 +323,56 @@ pub fn external_pid_parts(term: Eterm) -> Result<(Eterm, u32, u32, u32)> {
     let p = boxed_val(term);
     // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
     // the predicate reads that one word only.
-    if !is_external_pid_header(unsafe { *p }) {
+    let hdr = unsafe { *p };
+    if !is_external_pid_header(hdr) || arityval(hdr) + 1 != EXTERNAL_PID_HEAP_SIZE {
         return Err(error::bad_arg());
     }
-    // SAFETY: an external pid is the 5-word block `[header, node, number, serial,
-    // creation]` (`make_external_pid`), so words `1..=4` are live and initialised.
+    // SAFETY: the header arity confirms the 4-word `[header, node, creation, data]`
+    // block (`make_external_pid`), so words `1..=3` are live and initialised. The data
+    // word holds two native-endian `u32`s.
     let (node, number, serial, creation) = unsafe {
-        (
-            *p.add(1),
-            (*p.add(2)).raw() as u32,
-            (*p.add(3)).raw() as u32,
-            (*p.add(4)).raw() as u32,
-        )
+        let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+        (*p.add(1), *data, *data.add(1), (*p.add(2)).raw() as u32)
     };
     Ok((node, number, serial, creation))
 }
 
 /// Materializes an external port on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1160-1230` (`ExternalThing`): the header
-/// `make_external_port_header(size)` followed by `[node, number, creation]`, with
-/// the root word `make_boxed(hp)`. `number` is the 64-bit `V4_PORT_EXT` id.
+/// Layout pinned to `erl_term.h:1137-1183` (`ExternalThing`): the three-word head
+/// `[header, node, next]` followed by the `data.port` union, whose `id` is a `Uint64`
+/// on `ARCH_64` (`erl_term.h:1148-1155`) — so `EXTERNAL_PORT_HEAP_SIZE = 4` words and
+/// the header is
+/// `make_external_port_header() = make_header(EXTERNAL_PORT_HEAP_SIZE - 1, …)`.
+/// The `node`/`next` slots carry the sysname atom and `creation` (the M1 substitution
+/// described on [`make_external_pid`]); `number` is the 64-bit `V4_PORT_EXT` id.
 pub fn make_external_port(
     heap: &mut Heap,
     node: Eterm,
     number: u64,
     creation: u32,
 ) -> Result<Eterm> {
-    // SAFETY: `alloc_words(4)` returned four exclusively-owned, writable words.
-    let hp = unsafe { heap.alloc_words(4)? };
-    // SAFETY: `hp` owns exactly those four words; all are written before use. The
-    // `number` and `creation` fields are stored as raw words, so the full 64-bit id
-    // survives.
+    // SAFETY: `alloc_words(EXTERNAL_PORT_HEAP_SIZE)` returned four exclusively-owned,
+    // writable words.
+    let hp = unsafe { heap.alloc_words(EXTERNAL_PORT_HEAP_SIZE)? };
+    // SAFETY: `hp` owns exactly those four words; all are written before use. Word `3`
+    // is `data.port.id` (`Uint64` on `ARCH_64`), so the full 64-bit id survives.
     unsafe {
-        *hp = make_header(3, EXTERNAL_PORT_SUBTAG);
+        *hp = make_header(EXTERNAL_PORT_HEAP_SIZE - 1, EXTERNAL_PORT_SUBTAG);
         *hp.add(1) = node;
-        *hp.add(2) = Eterm::from_raw(number as usize);
-        *hp.add(3) = Eterm::from_raw(creation as usize);
+        *hp.add(2) = Eterm::from_raw(creation as usize);
+        *hp.add(EXTERNAL_THING_HEAD_SIZE) = Eterm::from_raw(number as usize);
     }
     Ok(make_boxed(hp))
 }
 
 /// Splits an external port term into `(node, number, creation)`.
 ///
-/// The exact inverse of [`make_external_port`] (`erl_term.h:1160-1230`). A term
-/// that is not an external port yields `BeamError::BadArg`.
+/// The exact inverse of [`make_external_port`] (`erl_term.h:1137-1183`): the data word
+/// is the 64-bit `data.port.id` and `creation` comes from the `next` slot (the M1
+/// substitution described on [`make_external_pid`]). A term that is not an external
+/// port, or whose header arity is not `EXTERNAL_PORT_HEAP_SIZE - 1`, yields
+/// `BeamError::BadArg`.
 pub fn external_port_parts(term: Eterm) -> Result<(Eterm, u64, u32)> {
     if !is_boxed(term) {
         return Err(error::bad_arg());
@@ -337,30 +380,35 @@ pub fn external_port_parts(term: Eterm) -> Result<(Eterm, u64, u32)> {
     let p = boxed_val(term);
     // SAFETY: `p` is a live header-word pointer (caller invariant for a boxed term);
     // the predicate reads that one word only.
-    if !is_external_port_header(unsafe { *p }) {
+    let hdr = unsafe { *p };
+    if !is_external_port_header(hdr) || arityval(hdr) + 1 != EXTERNAL_PORT_HEAP_SIZE {
         return Err(error::bad_arg());
     }
-    // SAFETY: an external port is the 4-word block `[header, node, number,
-    // creation]` (`make_external_port`), so words `1..=3` are live and initialised.
-    let (node, number, creation) =
-        unsafe { (*p.add(1), (*p.add(2)).raw() as u64, (*p.add(3)).raw() as u32) };
+    // SAFETY: the header arity confirms the 4-word `[header, node, creation, id]` block
+    // (`make_external_port`), so words `1..=3` are live and initialised.
+    let (node, number, creation) = unsafe {
+        (
+            *p.add(1),
+            (*p.add(EXTERNAL_THING_HEAD_SIZE)).raw() as u64,
+            (*p.add(2)).raw() as u32,
+        )
+    };
     Ok((node, number, creation))
 }
 
 /// Materializes an external reference on `heap`.
 ///
-/// Layout pinned to `erl_term.h:1160-1230` (`ExternalThing`): the header
-/// `make_external_ref_header(size)` followed by `[node, id0 … id(n-1), creation]`,
-/// with the root word `make_boxed(hp)`. `ids` are the 32-bit `NEWER_REFERENCE_EXT`
-/// identifier words (three on a 64-bit node). An empty or over-long `ids` slice
-/// yields `BeamError::SystemLimit`.
-///
-/// Because the frozen API hands the ids back as a borrowed `&[u32]`, this block
-/// packs them **contiguously** as native-endian `u32` (`ceil(n / 2)` words, the
-/// trailing padding of the last word zeroed) immediately after the node, with the
-/// creation as one raw word after the packed ids. That differs from the C
-/// `ExternalThing`, which stores one `ErtsDigit` per word, but keeps the id count
-/// in the header arity (`n = arityval(header) + 1`) so the block is self-describing.
+/// Layout pinned to `erl_term.h:1137-1188` (`ExternalThing`,
+/// `make_external_ref_header`) and `bif.c:4810-4848`: the three-word head
+/// `[header, node, next]`, then the `data.ui32` array holding the id **count** first
+/// (`etp->data.ui32[0] = n`, `bif.c:4840`) followed by the `n` ids. With
+/// `DW = n / 2 + 1` (`bif.c:4820`) the data section is `DW` words and
+/// `make_external_ref_header(DW) = make_header(DW + EXTERNAL_THING_HEAD_SIZE - 1, …)`,
+/// i.e. arity `n / 2 + 3` on `ARCH_64` — exactly the C word shape.
+/// `node`/`next` carry the sysname atom and `creation` (the M1 substitution described
+/// on [`make_external_pid`]); `ids` are the 32-bit `NEWER_REFERENCE_EXT` identifier
+/// words (three on a 64-bit node). An empty or over-long `ids` slice (more than
+/// `MAX_REF_IDS`) yields `BeamError::SystemLimit`.
 pub fn make_external_ref(
     heap: &mut Heap,
     node: Eterm,
@@ -368,24 +416,28 @@ pub fn make_external_ref(
     creation: u32,
 ) -> Result<Eterm> {
     let n = ids.len();
-    if n == 0 || n > 5 {
+    if n == 0 || n > MAX_REF_IDS {
         return Err(error::system_limit());
     }
-    let id_words = n.div_ceil(U32_PER_WORD);
-    let words = 2 + id_words + 1;
+    // `DW = n / sizeof(ErtsDigit) + 1` ref "words" (`bif.c:4818-4835`), i.e. one
+    // word per two `u32`s plus the word that holds the id count.
+    let data_words = n / U32_PER_WORD + 1;
+    let words = EXTERNAL_THING_HEAD_SIZE + data_words;
     // SAFETY: `alloc_words(words)` returned `words` exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(words)? };
-    // SAFETY: `hp` owns `words = 3 + id_words` words: word `0` is the header (arity
-    // `n-1`), word `1` is the node, the packed ids occupy `hp[2..2+id_words]`, and the
-    // creation is `hp[2+id_words]`. The zeroing clears the trailing padding of the
-    // last id word; the ids are then copied in as native-endian `u32`.
+    // SAFETY: `hp` owns `words = 3 + data_words` words: word `0` is the header (arity
+    // `words - 1`), word `1` is the node, word `2` is the creation, and the `data.ui32`
+    // array starts at word `EXTERNAL_THING_HEAD_SIZE` with `data_words * 2` slots. The
+    // zeroing initialises the whole data section (including the trailing padding slot
+    // of an even id count); the id count and the ids are then written into its front.
     unsafe {
-        *hp = make_header(n - 1, EXTERNAL_REF_SUBTAG);
+        *hp = make_header(words - 1, EXTERNAL_REF_SUBTAG);
         *hp.add(1) = node;
-        let ids_dst = hp.add(2).cast::<u32>();
-        core::ptr::write_bytes(ids_dst, 0, id_words * U32_PER_WORD);
-        core::ptr::copy_nonoverlapping(ids.as_ptr(), ids_dst, n);
-        *hp.add(2 + id_words) = Eterm::from_raw(creation as usize);
+        *hp.add(2) = Eterm::from_raw(creation as usize);
+        let data = hp.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+        core::ptr::write_bytes(data, 0, data_words * U32_PER_WORD);
+        *data = n as u32;
+        core::ptr::copy_nonoverlapping(ids.as_ptr(), data.add(1), n);
     }
     Ok(make_boxed(hp))
 }
@@ -393,8 +445,12 @@ pub fn make_external_ref(
 /// Splits an external reference term into `(node, ids, creation)`.
 ///
 /// `ids` is borrowed from the term's storage (the caller must keep the owning heap
-/// alive) — the exact inverse of [`make_external_ref`] (`erl_term.h:1160-1230`).
-/// A term that is not an external reference yields `BeamError::BadArg`.
+/// alive) — the exact inverse of [`make_external_ref`] (`erl_term.h:1137-1188`): the
+/// data section starts at word `EXTERNAL_THING_HEAD_SIZE` with the id count as the
+/// first `u32` (`external_ref_no_numbers(x) = external_ref_data(x)[0]`, `ARCH_64`) and
+/// the ids after it, while `creation` comes from the `next` slot (the M1 substitution
+/// described on [`make_external_pid`]). A term that is not an external reference, or
+/// whose id count does not fit its data section, yields `BeamError::BadArg`.
 pub fn external_ref_parts<'a>(term: Eterm) -> Result<(Eterm, &'a [u32], u32)> {
     if !is_boxed(term) {
         return Err(error::bad_arg());
@@ -406,18 +462,25 @@ pub fn external_ref_parts<'a>(term: Eterm) -> Result<(Eterm, &'a [u32], u32)> {
     if !is_external_ref_header(hdr) {
         return Err(error::bad_arg());
     }
-    // The header arity encodes the id count: `make_header(n - 1, …)`.
-    let n = arityval(hdr) + 1;
-    let id_words = n.div_ceil(U32_PER_WORD);
-    // SAFETY: an external reference is the block `[header, node, ids…, creation]`
-    // (`make_external_ref`); word `1` is the node, the `n` native-endian ids start at
-    // word `2`, and the creation is word `2 + ceil(n/2)`. The caller keeps the owning
-    // heap alive for `'a`.
+    // `external_thing_data_words`: `arityval(header) + 1 - EXTERNAL_THING_HEAD_SIZE`.
+    let Some(data_words) = arityval(hdr).checked_sub(EXTERNAL_THING_HEAD_SIZE - 1) else {
+        return Err(error::bad_arg());
+    };
+    // SAFETY: the header arity fixes the block size at `EXTERNAL_THING_HEAD_SIZE +
+    // data_words` words, so the data section is live and initialised; word `1` is the
+    // node and word `2` the creation.
     let (node, ids, creation) = unsafe {
+        let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+        let n = *data as usize;
+        // The count is self-describing, so it must fit the data section it was read
+        // from before any slice is built.
+        if n == 0 || n > MAX_REF_IDS || n + 1 > data_words * U32_PER_WORD {
+            return Err(error::bad_arg());
+        }
         (
             *p.add(1),
-            core::slice::from_raw_parts(p.add(2).cast::<u32>(), n),
-            (*p.add(2 + id_words)).raw() as u32,
+            core::slice::from_raw_parts(data.add(1), n),
+            (*p.add(2)).raw() as u32,
         )
     };
     Ok((node, ids, creation))
@@ -561,23 +624,21 @@ mod tests {
     #[test]
     fn bignum_block_layout_and_parts() {
         let mut heap = new_heap();
-        let digits = [0x0Au8, 0x0B, 0x0C];
+        let digits = [0x0A_u64, 0x0B, 0x0C];
         let term = make_big(&mut heap, false, &digits).expect("fits");
-        // header + ceil(3/8) = 1 word of packed digits
-        assert_eq!(heap.used(), 2);
+        // `BIG_NEED_SIZE(3) = 3 + 1`: the header word plus one `ErtsDigit` per word.
+        assert_eq!(heap.used(), 4);
 
-        // SAFETY: `term` is a bignum this test just built; word `0` is its header
-        // and the magnitude bytes are packed from byte one of the block.
+        // SAFETY: `term` is a bignum this test just built; word `0` is its header and
+        // the digit words follow it (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`).
         unsafe {
             let p = boxed_val(term);
             assert_eq!(*p, make_header(2, POS_BIG_SUBTAG));
             assert!(is_bignum_header(*p));
             assert_eq!(arityval(*p), digits.len() - 1);
             assert_eq!((*p).raw() & BIG_SIGN_BIT, 0);
-            // The digits sit contiguously at byte offset 0 of word 1, padding zeroed.
-            let bytes = core::slice::from_raw_parts(p.add(1).cast::<u8>(), 8);
-            assert_eq!(&bytes[..3], &digits[..]);
-            assert_eq!(&bytes[3..], &[0u8; 5]);
+            let stored = core::slice::from_raw_parts(p.add(1).cast::<u64>(), digits.len());
+            assert_eq!(stored, &digits[..]);
         }
 
         let (negative, got) = big_parts(term).unwrap();
@@ -586,24 +647,23 @@ mod tests {
     }
 
     #[test]
-    fn bignum_sign_bit_and_padding() {
+    fn bignum_sign_bit_and_digit_words() {
         let mut heap = new_heap();
-        let term = make_big(&mut heap, true, &[0x05]).expect("fits");
+        let term = make_big(&mut heap, true, &[u64::MAX]).expect("fits");
+        assert_eq!(heap.used(), 2, "header + one digit word");
 
         // SAFETY: `term` is a bignum this test just built; read its header and the
-        // single padded digit word.
+        // single digit word.
         unsafe {
             let p = boxed_val(term);
             assert_eq!(*p, make_header(0, NEG_BIG_SUBTAG));
             assert_ne!((*p).raw() & BIG_SIGN_BIT, 0);
-            let bytes = core::slice::from_raw_parts(p.add(1).cast::<u8>(), 8);
-            assert_eq!(&bytes[..1], &[0x05]);
-            assert_eq!(&bytes[1..], &[0u8; 7]);
+            assert_eq!((*p.add(1)).raw() as u64, u64::MAX);
         }
 
         let (negative, got) = big_parts(term).unwrap();
         assert!(negative);
-        assert_eq!(got, &[0x05]);
+        assert_eq!(got, &[u64::MAX]);
     }
 
     #[test]
@@ -612,9 +672,15 @@ mod tests {
         assert_bad_arg(make_big(&mut heap, false, &[]));
         assert_eq!(heap.used(), 0, "the rejected bignum allocated nothing");
 
-        let too_many = vec![0u8; BIG_ARITY_MAX + 1];
+        let too_many = vec![0u64; BIG_ARITY_MAX + 1];
         assert_system_limit(make_big(&mut heap, false, &too_many));
         assert_eq!(heap.used(), 0);
+
+        // Exactly `BIG_ARITY_MAX` digits is still accepted.
+        let mut big_heap = Heap::new(BIG_ARITY_MAX + 1).expect("a 64 KiB word heap");
+        let at_max = vec![1u64; BIG_ARITY_MAX];
+        let term = make_big(&mut big_heap, false, &at_max).expect("at the digit bound");
+        assert_eq!(big_parts(term).unwrap().1, &at_max[..]);
     }
 
     #[test]
@@ -707,17 +773,23 @@ mod tests {
         let node = make_small(7);
         let pid =
             make_external_pid(&mut heap, node, 0xAAAA_BBBB, 0xCCCC_DDDD, 0x1234_5678).expect("fits");
-        assert_eq!(heap.used(), 5);
+        assert_eq!(heap.used(), EXTERNAL_PID_HEAP_SIZE);
 
-        // SAFETY: `pid` is the 5-word block this test just wrote.
+        // SAFETY: `pid` is the 4-word block this test just wrote; word `3` is the
+        // `data.pid = { Uint32 num; Uint32 ser; }` union.
         unsafe {
             let p = boxed_val(pid);
-            assert_eq!(*p, make_header(4, EXTERNAL_PID_SUBTAG));
+            assert_eq!(*p, make_header(EXTERNAL_PID_HEAP_SIZE - 1, EXTERNAL_PID_SUBTAG));
             assert!(is_external_pid_header(*p));
             assert_eq!(*p.add(1), node);
-            assert_eq!((*p.add(2)).raw() as u32, 0xAAAA_BBBB);
-            assert_eq!((*p.add(3)).raw() as u32, 0xCCCC_DDDD);
-            assert_eq!((*p.add(4)).raw() as u32, 0x1234_5678);
+            assert_eq!(
+                (*p.add(2)).raw() as u32,
+                0x1234_5678,
+                "creation lives in the off-heap-link slot"
+            );
+            let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            assert_eq!(*data, 0xAAAA_BBBB);
+            assert_eq!(*data.add(1), 0xCCCC_DDDD);
         }
 
         let (n, num, ser, cre) = external_pid_parts(pid).unwrap();
@@ -726,6 +798,10 @@ mod tests {
             (node, 0xAAAA_BBBB, 0xCCCC_DDDD, 0x1234_5678)
         );
         assert_bad_arg(external_pid_parts(make_small(1)));
+        // A block of the right arity but the wrong subtag is rejected.
+        assert_bad_arg(external_pid_parts(
+            make_external_port(&mut heap, node, 1, 2).unwrap(),
+        ));
     }
 
     #[test]
@@ -734,21 +810,25 @@ mod tests {
         let node = make_small(9);
         let port = make_external_port(&mut heap, node, 0x1122_3344_5566_7788, 0x99AA_BBCC)
             .expect("fits");
-        assert_eq!(heap.used(), 4);
+        assert_eq!(heap.used(), EXTERNAL_PORT_HEAP_SIZE);
 
-        // SAFETY: `port` is the 4-word block this test just wrote.
+        // SAFETY: `port` is the 4-word block this test just wrote; word `3` is the
+        // 64-bit `data.port.id` (`ARCH_64`).
         unsafe {
             let p = boxed_val(port);
-            assert_eq!(*p, make_header(3, EXTERNAL_PORT_SUBTAG));
+            assert_eq!(*p, make_header(EXTERNAL_PORT_HEAP_SIZE - 1, EXTERNAL_PORT_SUBTAG));
             assert!(is_external_port_header(*p));
             assert_eq!(*p.add(1), node);
-            assert_eq!((*p.add(2)).raw() as u64, 0x1122_3344_5566_7788);
-            assert_eq!((*p.add(3)).raw() as u32, 0x99AA_BBCC);
+            assert_eq!((*p.add(2)).raw() as u32, 0x99AA_BBCC);
+            assert_eq!((*p.add(3)).raw() as u64, 0x1122_3344_5566_7788);
         }
 
         let (n, num, cre) = external_port_parts(port).unwrap();
         assert_eq!((n, num, cre), (node, 0x1122_3344_5566_7788, 0x99AA_BBCC));
         assert_bad_arg(external_port_parts(make_small(1)));
+        // A pid of the same size but a different subtag is not a port.
+        let pid = make_external_pid(&mut heap, node, 1, 2, 3).unwrap();
+        assert_bad_arg(external_port_parts(pid));
     }
 
     #[test]
@@ -757,23 +837,26 @@ mod tests {
         let node = make_small(11);
         let ids = [0x1111_1111u32, 0x2222_2222, 0x3333_3333];
         let r = make_external_ref(&mut heap, node, &ids, 0xABCD_1234).expect("fits");
-        // 2 head words + ceil(3/2) = 2 id words + 1 creation word.
-        assert_eq!(heap.used(), 5);
+        // `EXTERNAL_THING_HEAD_SIZE` + `DW` = 3 + (3 / 2 + 1) = 5 words.
+        assert_eq!(heap.used(), EXTERNAL_THING_HEAD_SIZE + 3 / U32_PER_WORD + 1);
 
-        // SAFETY: `r` is the 5-word block this test just wrote; the ids are packed
-        // native-endian as `u32` starting at word 2.
+        // SAFETY: `r` is the 5-word block this test just wrote. The data section is the
+        // `data.ui32` array at word 3: the id count first (`bif.c:4840`), then the ids.
         unsafe {
             let p = boxed_val(r);
-            assert_eq!(*p, make_header(2, EXTERNAL_REF_SUBTAG));
+            assert_eq!(
+                *p,
+                make_header(3 / U32_PER_WORD + 1 + EXTERNAL_THING_HEAD_SIZE - 1, EXTERNAL_REF_SUBTAG)
+            );
             assert!(is_external_ref_header(*p));
-            assert_eq!(arityval(*p) + 1, ids.len());
+            assert_eq!(arityval(*p) + 1, heap.used());
             assert_eq!(*p.add(1), node);
-            let ids_ptr = p.add(2).cast::<u32>();
-            assert_eq!(*ids_ptr, ids[0]);
-            assert_eq!(*ids_ptr.add(1), ids[1]);
-            assert_eq!(*ids_ptr.add(2), ids[2]);
-            assert_eq!(*ids_ptr.add(3), 0, "trailing padding is zeroed");
-            assert_eq!((*p.add(4)).raw() as u32, 0xABCD_1234);
+            assert_eq!((*p.add(2)).raw() as u32, 0xABCD_1234);
+            let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            assert_eq!(*data, ids.len() as u32, "the id count heads the data section");
+            assert_eq!(*data.add(1), ids[0]);
+            assert_eq!(*data.add(2), ids[1]);
+            assert_eq!(*data.add(3), ids[2]);
         }
 
         let (n, got, cre) = external_ref_parts(r).unwrap();
@@ -787,15 +870,20 @@ mod tests {
     fn external_ref_single_id_and_bounds() {
         let mut heap = new_heap();
         let r = make_external_ref(&mut heap, NIL, &[0xDEAD_BEEF], 0x01).expect("fits");
-        // 2 head words + 1 id word + 1 creation word.
-        assert_eq!(heap.used(), 4);
+        // `DW = 1 / 2 + 1 = 1`; the head (3 words) + the 1-word data section.
+        assert_eq!(heap.used(), EXTERNAL_THING_HEAD_SIZE + 1);
         // SAFETY: `r` is the 4-word block this test just wrote.
         unsafe {
             let p = boxed_val(r);
-            assert_eq!(*p, make_header(0, EXTERNAL_REF_SUBTAG));
+            assert_eq!(
+                *p,
+                make_header(1 / U32_PER_WORD + 1 + EXTERNAL_THING_HEAD_SIZE - 1, EXTERNAL_REF_SUBTAG)
+            );
             assert_eq!(*p.add(1), NIL);
-            assert_eq!(*(p.add(2).cast::<u32>()), 0xDEAD_BEEF);
-            assert_eq!((*p.add(3)).raw() as u32, 0x01);
+            assert_eq!((*p.add(2)).raw() as u32, 0x01);
+            let data = p.add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            assert_eq!(*data, 1);
+            assert_eq!(*data.add(1), 0xDEAD_BEEF);
         }
         let (n, ids, cre) = external_ref_parts(r).unwrap();
         assert_eq!(n, NIL);
@@ -804,6 +892,30 @@ mod tests {
 
         assert_system_limit(make_external_ref(&mut heap, NIL, &[], 0));
         assert_system_limit(make_external_ref(&mut heap, NIL, &[1, 2, 3, 4, 5, 6], 0));
+        // `MAX_REF_IDS` itself is accepted.
+        let max = make_external_ref(&mut heap, NIL, &[1, 2, 3, 4, 5], 0).expect("fits");
+        assert_eq!(external_ref_parts(max).unwrap().1, &[1, 2, 3, 4, 5]);
+    }
+
+    #[test]
+    fn external_ref_parts_rejects_a_corrupt_id_count() {
+        let mut heap = new_heap();
+        let r = make_external_ref(&mut heap, NIL, &[0xAA, 0xBB], 0).expect("fits");
+        // SAFETY: `r` is a block this test owns; the data section starts at word 3 and
+        // is overwritten with an id count the block cannot hold. The term is dropped
+        // afterwards, so no accessor ever sees the corrupt state.
+        unsafe {
+            let data = boxed_val(r).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            *data = (MAX_REF_IDS + 1) as u32;
+        }
+        assert_bad_arg(external_ref_parts(r));
+
+        // SAFETY: as above — a zero id count is equally impossible.
+        unsafe {
+            let data = boxed_val(r).add(EXTERNAL_THING_HEAD_SIZE).cast::<u32>();
+            *data = 0;
+        }
+        assert_bad_arg(external_ref_parts(r));
     }
 
     #[test]

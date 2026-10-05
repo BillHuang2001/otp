@@ -9,6 +9,7 @@
 //! This module is safe Rust; the raw heap writes it needs live in
 //! [`crate::term`].
 
+use core::mem::size_of;
 use core::str;
 
 use beam_alloc::Heap;
@@ -30,14 +31,14 @@ const MAX_ATOM_CHARS: usize = 255;
 /// `BIG_ARITY_MAX` (`erl_term.h:465-469`): the largest bignum digit count.
 const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 
+/// `sizeof(ErtsDigit)` (`big.h:29`): one term word on `ARCH_64`. `LARGE_BIG_EXT`'s
+/// wire bound is expressed in *bytes* (`n > BIG_ARITY_MAX*sizeof(ErtsDigit)`,
+/// `external.c:6146`).
+const BIG_DIGIT_BYTES: usize = size_of::<u64>();
+
 /// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
 /// hashmap above it).
 const MAP_SMALL_MAP_LIMIT: usize = 32;
-
-/// The largest number of ids an external reference carries (`erl_term.h`,
-/// `MAX_REF_IDS`-style bound; `make_external_ref` enforces the same limit).
-const MAX_REFERENCE_IDS: usize = 5;
-
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -159,7 +160,9 @@ impl<'a> Decoder<'a> {
             }
             Tag::NewerReference => {
                 let len = usize::from(self.reader.u16be()?);
-                if len > MAX_REFERENCE_IDS {
+                // `ERTS_MAX_REF_NUMBERS` (`erl_term.h:780`); `make_external_ref`
+                // enforces the same bound.
+                if len > crate::term::MAX_REF_IDS {
                     return Err(system_limit());
                 }
                 let node = self.decode_node_atom(heap, atoms)?;
@@ -326,15 +329,17 @@ impl<'a> Decoder<'a> {
     /// Decodes a `SMALL_BIG_EXT`/`LARGE_BIG_EXT` magnitude into a small integer
     /// when it fits one, otherwise into a bignum.
     ///
-    /// Mirrors `external.c` (`dec_term`): the sign byte is `0` (positive) or `1`
-    /// (negative), the digits are base-256 **least significant first**, and a
-    /// magnitude that fits a 60-bit small decodes to a small (never a bignum).
+    /// Mirrors `external.c:4464-4497` (`dec_term`): the sign byte is `0` (positive)
+    /// or `1` (negative), the magnitude is base-256 **least significant first**, and
+    /// a magnitude that fits a single `ErtsDigit` and a 60-bit small decodes to a
+    /// small (never a bignum). Leading zero bytes are stripped first, exactly as C
+    /// does "to avoid creating illegal bignums".
     fn decode_big(&mut self, tag: Tag, heap: &mut Heap) -> Result<Eterm> {
-        let digit_count = if tag == Tag::SmallBig {
+        let byte_count = if tag == Tag::SmallBig {
             usize::from(self.reader.u8()?)
         } else {
             let count = self.reader.u32be()? as usize;
-            if count > BIG_ARITY_MAX {
+            if count > BIG_ARITY_MAX * BIG_DIGIT_BYTES {
                 return Err(system_limit());
             }
             count
@@ -345,30 +350,30 @@ impl<'a> Decoder<'a> {
             // Any other sign byte is malformed.
             _ => return Err(bad_arg()),
         };
-        let digits = self.reader.bytes(digit_count)?;
+        let bytes = self.reader.bytes(byte_count)?;
 
-        // Strip high-order zero digits (the most significant end of a
-        // least-significant-first slice).
-        let mut end = digits.len();
-        while end > 0 && digits[end - 1] == 0 {
+        // Strip high-order zero bytes (the most significant end of a
+        // least-significant-first slice, `external.c:4474-4482`).
+        let mut end = bytes.len();
+        while end > 0 && bytes[end - 1] == 0 {
             end -= 1;
         }
-        let magnitude = &digits[..end];
+        let magnitude = &bytes[..end];
 
         if magnitude.is_empty() {
             return Ok(make_small(0));
         }
-        if magnitude.len() <= 8 {
+        if magnitude.len() <= BIG_DIGIT_BYTES {
             let mut value: u64 = 0;
-            for (i, &digit) in magnitude.iter().enumerate() {
-                value |= u64::from(digit) << (8 * i);
+            for (i, &byte) in magnitude.iter().enumerate() {
+                value |= u64::from(byte) << (8 * i);
             }
             let signed = if negative { -(value as i128) } else { value as i128 };
             if signed >= i128::from(MIN_SMALL) && signed <= i128::from(MAX_SMALL) {
                 return Ok(make_small(signed as i64));
             }
         }
-        crate::term::make_big(heap, negative, magnitude)
+        crate::term::make_big(heap, negative, &bytes_to_digits(magnitude))
     }
 }
 
@@ -380,6 +385,20 @@ pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Resu
     let term = decoder.decode(heap, atoms)?;
     decoder.finish()?;
     Ok(term)
+}
+
+/// Groups base-256 magnitude bytes (least significant first) into `ErtsDigit`s —
+/// exactly C `bytes_to_big` (`big.c:3424-3462`): one little-endian digit per full
+/// `sizeof(ErtsDigit)` byte group, the last group holding the remaining bytes.
+fn bytes_to_digits(bytes: &[u8]) -> Vec<u64> {
+    bytes
+        .chunks(BIG_DIGIT_BYTES)
+        .map(|chunk| {
+            let mut group = [0u8; BIG_DIGIT_BYTES];
+            group[..chunk.len()].copy_from_slice(chunk);
+            u64::from_le_bytes(group)
+        })
+        .collect()
 }
 
 /// Renders Latin-1 bytes as a `String`: each byte `0x00..=0xFF` is the code point
@@ -664,27 +683,44 @@ mod tests {
         let (_h, _a, term) = decode(&[131, 110, 0, 0]);
         assert_eq!(term, make_small(0));
 
-        // 12345678901234567890123 — too large for a small, decodes to a bignum.
+        // 12345678901234567890123 — too large for a small, decodes to a bignum whose
+        // ten base-256 bytes become two `ErtsDigit`s.
         let (_h, _a, term) = decode(&[
             131, 110, 10, 0, 203, 68, 66, 113, 118, 78, 182, 66, 157, 2,
         ]);
         assert!(!is_small(term));
         let (negative, digits) = big_parts(term).unwrap();
         assert!(!negative);
-        assert_eq!(digits, &[203, 68, 66, 113, 118, 78, 182, 66, 157, 2]);
+        assert_eq!(digits, &[0x42B6_4E76_7142_44CB, 0x029D]);
 
-        // `LARGE_BIG_EXT` encodes the same value with a 32-bit digit count.
+        // `LARGE_BIG_EXT` encodes the same value with a 32-bit byte count.
         let (_h, _a, term) = decode(&[
             131, 111, 0, 0, 0, 10, 0, 203, 68, 66, 113, 118, 78, 182, 66, 157, 2,
         ]);
         let (negative, digits) = big_parts(term).unwrap();
         assert!(!negative);
-        assert_eq!(digits, &[203, 68, 66, 113, 118, 78, 182, 66, 157, 2]);
+        assert_eq!(digits, &[0x42B6_4E76_7142_44CB, 0x029D]);
 
         // The sign byte is 0 or 1 only.
         assert_bad_arg(&[131, 110, 1, 2, 5]);
-        // More digits than `BIG_ARITY_MAX` is a hard wire bound.
-        assert_system_limit(&[131, 111, 0, 1, 0, 0, 0]);
+        // More base-256 bytes than `BIG_ARITY_MAX * sizeof(ErtsDigit)` (524280) is a
+        // hard wire bound (`external.c:6146`).
+        assert_system_limit(&[131, 111, 0, 8, 0, 25]);
+    }
+
+    #[test]
+    fn large_big_accepts_a_byte_count_above_the_digit_count() {
+        // The `LARGE_BIG_EXT` bound is a *byte* count (`BIG_ARITY_MAX * sizeof(ErtsDigit)`,
+        // i.e. up to 65535 `ErtsDigit`s), so 65536 base-256 bytes = 8192 digits is legal.
+        let mut image = vec![131, 111, 0, 1, 0, 0, 0]; // LARGE_BIG_EXT, 65536 bytes, +
+        image.extend(std::iter::repeat(0x37).take(65_536));
+        let mut heap = Heap::new(8193 + 64).expect("a word heap for the digits");
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&image, &mut heap, &mut atoms).expect("inside the wire bound");
+        let (negative, digits) = big_parts(term).unwrap();
+        assert!(!negative);
+        assert_eq!(digits.len(), 8192);
+        assert!(digits.iter().all(|&digit| digit == 0x3737_3737_3737_3737));
     }
 
     #[test]

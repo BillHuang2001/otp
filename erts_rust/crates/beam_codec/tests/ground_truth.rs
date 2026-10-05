@@ -82,6 +82,13 @@ const LIST_ABC: &[u8] = &[131, 108, 0, 0, 0, 3, 119, 1, 97, 119, 1, 98, 119, 1, 
 const NEG_ONE: &[u8] = &[131, 98, 255, 255, 255, 255];
 /// `100000000000000000000` — `10^20`, a `SMALL_BIG_EXT` with 9 digits.
 const BIG_1E20: &[u8] = &[131, 110, 9, 0, 0, 0, 16, 99, 45, 94, 199, 107, 5];
+/// `4294967296` (`2^32`) — a five-byte `SMALL_BIG_EXT`. The value fits a 60-bit
+/// small, so it decodes to one; it still re-encodes byte-identically because a small
+/// outside the signed 32-bit range is encoded as a bignum again.
+const BIG_2_POW_32: &[u8] = &[131, 110, 5, 0, 0, 0, 0, 0, 1];
+/// `18446744073709551633` (`2^64 + 17`) — nine bytes, i.e. one full `ErtsDigit`
+/// (`17`) plus a partial one (`1`); the wire keeps all eight bytes of the low digit.
+const BIG_2_64_PLUS_17: &[u8] = &[131, 110, 9, 0, 17, 0, 0, 0, 0, 0, 0, 0, 1];
 /// `1.0`
 const FLOAT_ONE: &[u8] = &[131, 70, 63, 240, 0, 0, 0, 0, 0, 0];
 /// `-0.0` — negative zero keeps its sign bit (`0x8000_0000_0000_0000`).
@@ -250,8 +257,9 @@ fn seed_bignum_12345678901234567890123() {
     assert!(!is_small(term), "10^23-sized values never fit a 60-bit small");
     let (negative, digits) = big_parts(term).unwrap();
     assert!(!negative);
-    // Base-256 magnitude digits, least significant first (`external.c` layout).
-    assert_eq!(digits, &[203, 68, 66, 113, 118, 78, 182, 66, 157, 2]);
+    // `ErtsDigit`s (`u64`), least significant first — one digit per word, so the ten
+    // wire bytes group into one full digit and one partial (`big.h:29`).
+    assert_eq!(digits, &[0x42B6_4E76_7142_44CB, 0x029D]);
 }
 
 // ---------------------------------------------------------------------------
@@ -296,7 +304,42 @@ fn bignum_1e20() {
     assert!(!is_small(term));
     let (negative, digits) = big_parts(term).unwrap();
     assert!(!negative);
-    assert_eq!(digits, &[0, 0, 16, 99, 45, 94, 199, 107, 5]);
+    // The nine wire bytes are one full `ErtsDigit` plus the partial digit `5`.
+    assert_eq!(digits, &[0x6BC7_5E2D_6310_0000, 0x5]);
+}
+
+#[test]
+fn bignum_2_pow_32_decodes_to_a_small() {
+    let (_heap, _atoms, term) = round_trip(BIG_2_POW_32);
+    assert!(is_small(term), "2^32 fits a 60-bit small");
+    assert_eq!(small_value(term), 4_294_967_296);
+}
+
+#[test]
+fn bignum_2_64_plus_17_keeps_the_full_low_digit() {
+    let (_heap, _atoms, term) = round_trip(BIG_2_64_PLUS_17);
+    assert!(!is_small(term), "2^64 + 17 exceeds a 60-bit small");
+    let (negative, digits) = big_parts(term).unwrap();
+    assert!(!negative);
+    assert_eq!(digits, &[17, 1]);
+}
+
+#[test]
+fn bignum_2_pow_3000_uses_large_big() {
+    // The oracle's `term_to_binary(1 bsl 3000)`: `LARGE_BIG_EXT` (`111`) with a
+    // 376-byte magnitude, i.e. `[111, 0, 0, 1, 120, 0, <375 zero bytes>, 1]`.
+    let mut image = vec![131u8, 111, 0, 0, 1, 120, 0];
+    image.extend(std::iter::repeat(0u8).take(375));
+    image.push(1);
+
+    let (_heap, _atoms, term) = round_trip(&image);
+    let (negative, digits) = big_parts(term).unwrap();
+    assert!(!negative);
+    // 376 bytes = 47 `ErtsDigit`s: 46 zero ones holding the zero bytes, plus the
+    // partial digit carrying the leading `0x01` byte at its most significant position.
+    assert_eq!(digits.len(), 47);
+    assert!(digits[..46].iter().all(|&digit| digit == 0));
+    assert_eq!(digits[46], 0x0100_0000_0000_0000);
 }
 
 #[test]

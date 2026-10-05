@@ -13,9 +13,9 @@
 //! compared by bit pattern (`to_bits`), never with `==`.
 //!
 //! Coverage: boundary integers (small/`INTEGER_EXT`/bignum/sign), bignums across the
-//! digit-count boundaries including high-zero stripping, every atom tag (short, long,
-//! multi-byte UTF-8, plus Latin-1), floats including `±0`, `±inf`, `NaN` (quiet and
-//! signaling) and subnormals, tuples at the arity boundaries, proper/improper lists
+//! wire byte-count boundaries including high-zero stripping, every atom tag (short,
+//! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, `±inf`, `NaN` (quiet
+//! and signaling) and subnormals, tuples at the arity boundaries, proper/improper lists
 //! and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover, small maps and
 //! pids/ports/references.
 //!
@@ -91,9 +91,9 @@ fn collect_list(term: Eterm) -> (Vec<Eterm>, Eterm) {
     (heads, cursor)
 }
 
-/// Drops the high-order (most significant) zero bytes of a base-256 little-endian
-/// magnitude.
-fn strip_high_zeros(digits: &[u8]) -> &[u8] {
+/// Drops the high-order (most significant) zero digits of a little-endian
+/// `ErtsDigit` magnitude.
+fn strip_high_zero_digits(digits: &[u64]) -> &[u64] {
     let mut end = digits.len();
     while end > 0 && digits[end - 1] == 0 {
         end -= 1;
@@ -101,11 +101,12 @@ fn strip_high_zeros(digits: &[u8]) -> &[u8] {
     &digits[..end]
 }
 
-/// The non-negative value of a base-256 little-endian magnitude that fits in 8 bytes.
-fn value_of(digits: &[u8]) -> i64 {
-    let mut v: u128 = 0;
-    for (i, &d) in digits.iter().enumerate() {
-        v |= u128::from(d) << (8 * i);
+/// The non-negative value of a little-endian `ErtsDigit` magnitude that fits an
+/// `i64`.
+fn digits_value(digits: &[u64]) -> i64 {
+    let mut v: i128 = 0;
+    for &digit in digits.iter().rev() {
+        v = (v << 64) | i128::from(digit);
     }
     v as i64
 }
@@ -158,7 +159,7 @@ fn assert_term_eq(a: Eterm, ta: &AtomTable, b: Eterm, tb: &AtomTable) {
         let (neg_b, dig_b) = big_parts(b).expect("expected a bignum");
         assert_eq!(neg_a, neg_b, "bignum sign mismatch");
         // High-order zero digits are not significant.
-        assert_eq!(strip_high_zeros(dig_a), strip_high_zeros(dig_b));
+        assert_eq!(strip_high_zero_digits(dig_a), strip_high_zero_digits(dig_b));
         return;
     }
     if let Ok(fa) = float_value(a) {
@@ -324,20 +325,29 @@ fn integer_tag_policy_matches_the_c_widths() {
 // Bignums
 // ---------------------------------------------------------------------------
 
-/// Base-256 little-endian digits of `len` bytes. The most significant byte is `0xFF`
-/// so it is never stripped and, once `len >= 8`, the magnitude exceeds `MAX_SMALL`.
-fn big_digits(len: usize) -> Vec<u8> {
-    let mut digits = vec![0x37u8; len];
-    *digits.last_mut().expect("len >= 1") = 0xFF;
+/// Little-endian `ErtsDigit`s whose base-256 rendering is exactly `len` bytes, with a
+/// non-zero most significant byte so nothing is stripped and, once `len >= 8`, the
+/// magnitude exceeds `MAX_SMALL`.
+fn big_digits(len: usize) -> Vec<u64> {
+    assert!(len >= 1, "a zero-width bignum is illegal");
+    /// Eight significant `0x37` bytes, so this digit never shrinks the byte count.
+    const FULL_DIGIT: u64 = 0x3737_3737_3737_3737;
+    let (full, rest) = (len / 8, len % 8);
+    let mut digits = vec![FULL_DIGIT; full];
+    if rest > 0 {
+        // A digit whose most significant byte sits at index `rest - 1`.
+        digits.push((1u64 << (8 * rest)) - 1);
+    }
     digits
 }
 
 #[test]
-fn bignums_round_trip_across_digit_counts() {
-    // `SMALL_BIG_EXT` carries up to 255 digits, `LARGE_BIG_EXT` up to `BIG_ARITY_MAX`
-    // (65535). `len >= 8` with a `0xFF` high digit guarantees the magnitude is out of
-    // the 60-bit small range, so the value round-trips as a bignum byte-for-byte.
-    for &len in &[8usize, 9, 100, 255, 256, 65535] {
+fn bignums_round_trip_across_byte_counts() {
+    // `SMALL_BIG_EXT` carries up to 255 base-256 bytes, `LARGE_BIG_EXT` up to
+    // `BIG_ARITY_MAX * sizeof(ErtsDigit)` (65535 * 8 = 524280). `len >= 8` with a
+    // non-zero most significant byte guarantees the magnitude is out of the 60-bit
+    // small range, so the value round-trips as a bignum byte-for-byte.
+    for &len in &[8usize, 9, 100, 255, 256, 65_535, 65_536] {
         for &negative in &[false, true] {
             let atoms = AtomTable::new();
             let cap = 1 + len / 8 + 64;
@@ -371,10 +381,11 @@ fn bignums_round_trip_across_digit_counts() {
 #[test]
 fn bignum_high_zero_digits_are_stripped() {
     let atoms = AtomTable::new();
-    // Eleven stored digits, but the two most significant are zero.
-    let mut digits = big_digits(11);
-    digits[9] = 0;
-    digits[10] = 0;
+    // Nine significant bytes, with a zero most significant digit appended: the wire
+    // carries only the significant ones (`big_bytes`, `big.c:3405`).
+    let mut digits = big_digits(9);
+    digits.push(0);
+    assert_eq!(digits.len(), 3);
 
     let mut h1 = heap(64);
     let t = make_big(&mut h1, false, &digits).expect("bignum fits");
@@ -384,17 +395,17 @@ fn bignum_high_zero_digits_are_stripped() {
     assert_eq!(
         usize::from(b1[2]),
         9,
-        "the two high zero digits are not on the wire"
+        "the high zero digit is not on the wire"
     );
     assert!(!is_small(t2));
     let (neg, dig) = big_parts(t2).expect("decoded bignum");
     assert!(!neg);
-    assert_eq!(dig, &digits[..9]);
+    assert_eq!(dig, &big_digits(9)[..]);
 }
 
 /// A bignum whose magnitude fits the 60-bit small range decodes to a **small** (the C
 /// `dec_term` behaviour), so the round-trip is value-preserving, not byte-identical.
-fn assert_bignum_canonicalizes_to_small(digits: &[u8], negative: bool) {
+fn assert_bignum_canonicalizes_to_small(digits: &[u64], negative: bool) {
     let atoms = AtomTable::new();
     let mut h1 = heap(64);
     let t = make_big(&mut h1, negative, digits).expect("bignum fits");
@@ -407,7 +418,7 @@ fn assert_bignum_canonicalizes_to_small(digits: &[u8], negative: bool) {
     let t2 = decode_term(&b1, &mut h2, &mut a2).expect("decode");
     assert!(is_small(t2), "a small-fitting big must decode to a small");
 
-    let magnitude = value_of(strip_high_zeros(digits));
+    let magnitude = digits_value(strip_high_zero_digits(digits));
     let expected = if negative { -magnitude } else { magnitude };
     assert_eq!(signed_value(t2), expected);
 
@@ -434,8 +445,8 @@ fn small_fitting_bignums_canonicalize_to_smalls() {
     ] {
         assert_bignum_canonicalizes_to_small(&big_digits(len), negative);
     }
-    // High zero digits stripped down to a single significant byte.
-    assert_bignum_canonicalizes_to_small(&[0xFF, 0, 0, 0, 0, 0, 0, 0, 0, 0], false);
+    // High zero digits stripped down to a single significant digit.
+    assert_bignum_canonicalizes_to_small(&[0xFF, 0], false);
 }
 
 // ---------------------------------------------------------------------------
@@ -980,12 +991,14 @@ fn over_long_atoms_are_system_limit() {
 
 #[test]
 fn oversized_bignums_are_system_limit() {
-    // `LARGE_BIG_EXT` with a digit count past `BIG_ARITY_MAX` (65535).
-    assert_system_limit(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x01, 0x00, 0x00]);
+    // `LARGE_BIG_EXT` with a byte count past `BIG_ARITY_MAX * sizeof(ErtsDigit)`
+    // (65535 * 8 = 524280 bytes, `external.c:6146`).
+    assert_system_limit(&[VERSION_MAGIC, LARGE_BIG_EXT, 0x00, 0x08, 0x00, 0x19]);
 
-    // Building such a bignum is rejected by the constructor as well.
+    // Building such a bignum is rejected by the constructor as well (the bound is on
+    // the digit count).
     let mut h1 = heap(64);
-    let digits = vec![1u8; 65536];
+    let digits = vec![1u64; 65536];
     assert!(matches!(
         make_big(&mut h1, false, &digits),
         Err(BeamError::SystemLimit)

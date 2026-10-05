@@ -83,11 +83,23 @@ through it (an unset index ⇒ `BadArg`). M1 never *emits* `82`/`78`.
 - Convenience: `pub fn decode_term(&[u8], &mut Heap, &mut AtomTable) -> Result<Eterm>`.
 
 ### `src/term.rs` — the ONLY `unsafe` module (see Design Decisions)
-Term inspection and boxed sub-term materialization over `beam_alloc::Heap`, pinned to `erl_term.h`:
-`make_float`/`float_value`, `make_big`/`big_parts`, `make_flatmap`/`flatmap_parts`,
-`make_external_pid`/`external_pid_parts`, `make_external_port`/`external_port_parts`,
-`make_external_ref`/`external_ref_parts`, plus the tuple/tuple-element and list accessors the encoder
-needs. **Public but not part of the cross-crate contract** (`beam_ets`/`beam_bifs` must get their
+Term inspection and boxed sub-term materialization over `beam_alloc::Heap`, pinned to `erl_term.h` /
+`big.h` / `erl_map.h` / `bif.c`:
+- `make_float(&mut Heap, f64) -> Result<Eterm>` / `float_value(Eterm) -> Result<f64>`;
+- `make_big(&mut Heap, negative: bool, &[u64]) -> Result<Eterm>` /
+  `big_parts(Eterm) -> Result<(bool, &[u64])>` — the slice elements are `ErtsDigit`s (`u64`, one per
+  word), least significant first;
+- `make_flatmap` / `flatmap_parts`;
+- `make_external_pid(&mut Heap, node, number: u32, serial: u32, creation: u32) -> Result<Eterm>` /
+  `external_pid_parts -> (node, number, serial, creation)`;
+- `make_external_port(&mut Heap, node, number: u64, creation: u32) -> Result<Eterm>` /
+  `external_port_parts -> (node, number, creation)`;
+- `make_external_ref(&mut Heap, node, ids: &[u32], creation: u32) -> Result<Eterm>` /
+  `external_ref_parts -> (node, &[u32] ids, creation)`;
+- `pub const MAX_REF_IDS = 5` (`ERTS_MAX_REF_NUMBERS`), plus the tuple/tuple-element and list
+  accessors the encoder needs.
+
+**Public but not part of the cross-crate contract** (`beam_ets`/`beam_bifs` must get their
 map/float/bignum constructors from `beam_term` — see Known Issues).
 
 ## Tag coverage (M1)
@@ -108,10 +120,15 @@ encoding.
 ## Layout facts pinned to the legacy C (for the term layer)
 - Float (64-bit): 2 words `[HEADER_FLONUM, f64 bits]`; root = `make_boxed(hp)`
   (`erl_term.h:479` `HEADER_FLONUM = make_header(1, FLOAT_SUBTAG)`, `PUT_DOUBLE` `erl_term.h:506`).
-- Bignum: `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1), d0 … d(n-1)]` (sign in the
-  header's `_BIG_SIGN_BIT`), digits little-endian base-256; root = `make_boxed(hp)`
-  (`erl_term.h:452-471`; `BIG_ARITY_MAX = (1<<16)-1` on 64-bit). The term layer packs the magnitude
-  bytes contiguously into words rather than one `ErtsDigit` per word — see "Known Issues".
+- Bignum: **one `ErtsDigit` per word** — `[make_pos_bignum_header(n-1) |
+  make_neg_bignum_header(n-1), d0 … d(n-1)]` with `BIG_NEED_SIZE(n) = n + 1` words, digits
+  little-endian (`d0` least significant), the sign in the header's `_BIG_SIGN_BIT`; root =
+  `make_boxed(hp)` (`erl_term.h:452-471`, `big.h:29,68-73,96-97`; `ErtsDigit` is `Uint`, i.e. a
+  `u64` on `ARCH_64`; `BIG_ARITY_MAX = (1<<16)-1` digits). The **wire** magnitude is base-256 bytes
+  (`big_to_bytes`/`bytes_to_big`, `big.c:3405-3490`: full eight bytes per non-leading digit, the
+  leading digit's significant bytes only); `SMALL_BIG_EXT` carries the byte count while it is < 256,
+  `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
+  (`external.c:6146`).
 - Flatmap (≤ 32 pairs): the block is
   `[arityval(n), k0…k(n-1), MAP_HEADER_FLATMAP, n, keys, v0…v(n-1)]`, where `keys = make_tuple(hp)`
   is the keys tuple (emitted **before** the flatmap head), the flatmap head sits at word `1+n`, and
@@ -120,9 +137,18 @@ encoding.
   `flatmap_parts` reads them. `MAP_HEADER_FLATMAP = 0x12C` (`_make_header(4, MAP_SUBTAG)`), the
   `size` field is the **raw** integer `n`; `n == 0` ⇒ 3 words
   `[MAP_HEADER_FLATMAP, 0, tuple0()]` (`erl_map.h:181-199`, `erl_map.c:673-700`).
-- Identifiers: `make_external_{pid,port,ref}_header()` = `make_header(size-1, <subtuel>)` +
-  `[node atom, …]`; root = `make_boxed(hp)`. Read `erl_term.h:1160-1230` (`ExternalThing`) for the
-  field order and the accessors to reproduce.
+- External identifiers (`ExternalThing`, `erl_term.h:1137-1188`): a three-word head
+  `[header, node, next]` (`EXTERNAL_THING_HEAD_SIZE = 3` on `ARCH_64`) followed by the data union,
+  so the header is always `make_header(total_words - 1, <subtuel>)`:
+  - pid — `EXTERNAL_PID_HEAP_SIZE = 4`: `[header, node, ?, { num: u32, ser: u32 }]`;
+  - port — `EXTERNAL_PORT_HEAP_SIZE = 4`: `[header, node, ?, id: u64]` (`ARCH_64`);
+  - ref — `DW = ref_words/2 + 1` data words and `make_external_ref_header(DW) =
+    make_header(DW + 2, EXTERNAL_REF_SUBTAG)`, i.e. arity `ref_words/2 + 3`: `[header, node, ?,
+    ref_words(u32) | id0(u32), id1 | id2, …]` — the data section is the `data.ui32` array with the
+    id **count** first (`bif.c:4818-4845`, `external_ref_no_numbers(x) = external_ref_data(x)[0]`).
+  The `?` slot is C's off-heap `next` link: this crate has no node registry, so it holds `creation`
+  while the `node` slot holds the sysname atom (the M1 substitution documented on
+  `make_external_pid` / in "Known Issues").
 - `VERSION_MAGIC` is **not** part of a distribution payload that follows a distribution header.
 
 ## Constraints
@@ -159,8 +185,11 @@ encoding.
   and the external identifiers. This is a deliberate, flagged stop-gap (see Known Issues) — the
   encoding of each block is asserted against a raw-word test and against `term_to_binary` fixtures.
 - **Integer width policy mirrors C** (`external.c:3542-3599`): `< 256 ⇒ 97`, then `98` when the value
-  fits a signed 32-bit, else `110`/`111` with the smallest digit count; `110`/`111` decode to a small
-  int whenever the value fits one, else to a bignum.
+  fits a signed 32-bit, else `110` when the magnitude's significant base-256 **byte** count is < 256,
+  else `111` — the count is derived from the `ErtsDigit`s exactly as `big_to_bytes` does (full eight
+  bytes per non-leading digit, only the leading digit's significant bytes, at least one byte), and
+  high zero bytes are stripped first. `110`/`111` decode to a small int whenever the value fits a
+  60-bit small, else to a bignum.
 - **Atoms are interned, never compared by name**: the decoder interns into the caller's
   `AtomTable` (insertion order = wire order) and the encoder renders names from it. Atom length is
   limited to 255 *characters* (the OTP limit) — longer ⇒ `SystemLimit`.
@@ -182,9 +211,9 @@ encoding.
   error mapping table + unsupported tags).
 - `tests/roundtrip.rs` — exhaustive `encode → decode → compare` over a property-style corpus
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
-  incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs), plus negative cases
-  (truncation at every offset, bad tag, over-long atom, `110` with > `BIG_ARITY_MAX` digits,
-  trailing bytes).
+  incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
+  `ErtsDigit`s), plus negative cases (truncation at every offset, bad tag, over-long atom, `LARGE_BIG`
+  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes).
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
@@ -194,6 +223,12 @@ encoding.
   `"abc"` → `131,107,0,3,97,98,99`; `#{a=>1}` → `131,116,0,0,0,1,119,1,97,97,1`;
   `3.14` → `131,70,64,9,30,184,81,235,133,31`; `true` → `131,119,4,116,114,117,101`;
   `[]` → `131,106`; `12345678901234567890123` → `131,110,10,0,203,68,66,113,118,78,182,66,157,2`.
+  The bignum vectors pin the `ErtsDigit`-per-word layout (both big tags put the
+  **count before the sign byte**): `2^32` → `131,110,5,0,0,0,0,0,1`
+  (decodes back to a small), `2^64 + 17` → `131,110,9,0,17,0,0,0,0,0,0,0,1` (the low digit keeps
+  all eight bytes), `-2^63` → `131,110,8,1,0,0,0,0,0,0,0,128`, and `1 bsl 3000` →
+  `131,111,0,0,1,120,0,<375 zero bytes>,1` — a `LARGE_BIG` whose 4-byte count is 376 and whose
+  magnitude is 375 zero bytes plus a leading `0x01`.
   (`<<"hi">>` → `131,109,0,0,0,2,104,105` is kept as the documented *unsupported* case.)
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
@@ -223,13 +258,15 @@ encoding.
 - Funs (`112`/`113`/`117`), records (`67`), `V4_PORT_EXT` (`120`), `LOCAL_EXT` (`121`) and the
   distribution header (`68`/`78`) are out of M1 scope; `beam_dist` owns the distribution header.
 - Identifiers always decode as *external* things (no local-node identity in the codec yet).
-- **Internal storage of bignums and external-ref ids deviates from the C.** The frozen `term.rs`
-  API returns *borrowed* slices (`big_parts -> &[u8]`, `external_ref_parts -> &[u32]`), so
-  `make_big` stores the magnitude **byte-packed** (contiguous base-256 bytes packed into words, one
-  byte per position) and `make_external_ref` stores its ids as **packed native-endian `u32`**
-  (`ceil(n/2)` words) — unlike the legacy `ErtsDigit`-per-word C layout. Both are internal-only:
-  the header arity still counts the digits/ids (`n = arityval(header) + 1`) so the block is
-  self-describing, and neither affects the wire format.
+- **`node` occupies the sysname-atom slot; `creation` is carried in C's off-heap `next` link
+  (a documented M1 substitution).** In C `ExternalThing`'s first data word is a pointer to a
+  *registered node* (carrying `sysname` + `creation`) and the second is the off-heap `next` link
+  (`etp->node = erts_find_or_insert_node(sysname, cre, …)`). This crate has no node registry, so the
+  `node` slot holds the sysname atom and the unused `next` slot holds `creation` — yielding **exactly
+  C's word positions/arities** (head 3 words, pid/port 4, ref `EXTERNAL_THING_HEAD_SIZE + ref_words/2 + 1`)
+  while preserving the round-trip of `creation`. The pointer semantics land when a node-identity type
+  exists (owned by `beam_term`/`beam_dist`); only then can the local-node fast path replace the
+  external forms.
 - **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode always emits `70` (as
   `term_to_binary` does), so a decode↔encode round-trip of an `99`-encoded float is
   representation-preserving, not byte-identical.

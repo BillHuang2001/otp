@@ -28,9 +28,9 @@ use crate::writer::Writer;
 /// crate `CONTEXT.md`, "Known Issues").
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 
-/// `SMALL_BIG_EXT` carries an 8-bit digit count; larger magnitudes use
-/// `LARGE_BIG_EXT`.
-const SMALL_BIG_DIGIT_MAX: usize = 255;
+/// `SMALL_BIG_EXT` carries an 8-bit **byte** count (the number of base-256 digits on
+/// the wire, `external.c:3587`); larger magnitudes use `LARGE_BIG_EXT`.
+const SMALL_BIG_BYTE_MAX: usize = 255;
 
 /// The OTP atom-name length limit, in **characters** (not bytes).
 const ATOM_CHAR_MAX: usize = 255;
@@ -154,16 +154,21 @@ impl<'a> Encoder<'a> {
             self.buf.u32be(int as u32);
             return Ok(());
         }
-        // Magnitude as base-256 little-endian digits; the sign is carried separately.
-        self.encode_bignum(value < 0, &value.unsigned_abs().to_le_bytes())
+        // The magnitude becomes a one-`ErtsDigit` bignum block; the sign is carried
+        // separately.
+        self.encode_bignum(value < 0, &[value.unsigned_abs()])
     }
 
-    /// Encodes a bignum from its `(negative, digits)` parts: `digits` are base-256
-    /// **little-endian** magnitude bytes. High-order zero bytes are stripped; an
-    /// empty magnitude is the small integer `0` on the wire.
-    fn encode_bignum(&mut self, negative: bool, digits: &[u8]) -> Result<()> {
-        let digits = strip_high_zero_bytes(digits);
-        if digits.is_empty() {
+    /// Encodes a bignum from its `(negative, digits)` parts: `digits` are
+    /// `ErtsDigit`s (`u64`), least significant first. The wire carries the magnitude
+    /// as base-256 bytes, least significant first, with the count of **significant
+    /// bytes** in the tag's length field — exactly C `big_bytes`/`big_to_bytes`
+    /// (`big.c:3405-3490`). High-order zero bytes are stripped; an all-zero magnitude
+    /// is the small integer `0` on the wire.
+    fn encode_bignum(&mut self, negative: bool, digits: &[u64]) -> Result<()> {
+        let magnitude = digits_to_le_bytes(digits);
+        let magnitude = strip_high_zero_bytes(&magnitude);
+        if magnitude.is_empty() {
             // A zero magnitude coincides with the `SMALL_INTEGER_EXT` encoding of 0,
             // so decoding the output round-trips to a small integer, as in C.
             self.buf.u8(SMALL_INTEGER_EXT);
@@ -171,17 +176,18 @@ impl<'a> Encoder<'a> {
             return Ok(());
         }
         let sign = u8::from(negative);
-        if digits.len() <= SMALL_BIG_DIGIT_MAX {
+        if magnitude.len() <= SMALL_BIG_BYTE_MAX {
             self.buf.u8(SMALL_BIG_EXT);
-            self.buf.u8(digits.len() as u8);
+            self.buf.u8(magnitude.len() as u8);
         } else {
-            // The digit count is bounded by `BIG_ARITY_MAX` (65535), so it always
-            // fits the 32-bit `LARGE_BIG_EXT` length field.
+            // The byte count is bounded by `BIG_ARITY_MAX * sizeof(ErtsDigit)`
+            // (65535 * 8 = 524280 on 64-bit), so it always fits the 32-bit
+            // `LARGE_BIG_EXT` length field.
             self.buf.u8(LARGE_BIG_EXT);
-            self.buf.u32be(digits.len() as u32);
+            self.buf.u32be(magnitude.len() as u32);
         }
         self.buf.u8(sign);
-        self.buf.bytes(digits);
+        self.buf.bytes(magnitude);
         Ok(())
     }
 
@@ -379,6 +385,29 @@ impl<'a> Encoder<'a> {
     }
 }
 
+/// Renders `ErtsDigit`s as base-256 magnitude bytes, least significant first —
+/// exactly C `big_to_bytes` (`big.c:3467-3490`): every digit but the most
+/// significant one contributes all `size_of::<u64>()` bytes, and the most
+/// significant digit contributes only its significant bytes (at least one, so an
+/// all-zero digit vector still yields a one-byte magnitude).
+fn digits_to_le_bytes(digits: &[u64]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(digits.len() * core::mem::size_of::<u64>());
+    let Some((&most_significant, rest)) = digits.split_last() else {
+        return out;
+    };
+    for &digit in rest {
+        out.extend_from_slice(&digit.to_le_bytes());
+    }
+    let mut digit = most_significant;
+    loop {
+        out.push((digit & 0xFF) as u8);
+        digit >>= 8;
+        if digit == 0 {
+            return out;
+        }
+    }
+}
+
 /// Strips the high-order zero bytes of a base-256 little-endian magnitude.
 fn strip_high_zero_bytes(digits: &[u8]) -> &[u8] {
     let mut end = digits.len();
@@ -487,19 +516,45 @@ mod tests {
         let t = make_big(&mut heap, true, &[0x0A]).unwrap();
         assert_eq!(encode_term_body(t, &atoms).unwrap(), vec![110, 1, 1, 10]);
 
-        // Digits are little-endian, so high-order zero bytes sit at the end.
-        let t = make_big(&mut heap, false, &[5, 0, 0]).unwrap();
+        // The magnitude is little-endian, so a high-order zero **digit** contributes
+        // only its (stripped) trailing byte.
+        let t = make_big(&mut heap, false, &[5, 0]).unwrap();
         assert_eq!(encode_term_body(t, &atoms).unwrap(), vec![110, 1, 0, 5]);
 
+        // A zero digit *below* the most significant one still contributes all eight of
+        // its bytes (`big_to_bytes`): the value is 2^128 + 5, i.e. 17 significant
+        // base-256 bytes.
+        let t = make_big(&mut heap, false, &[5, 0, 1]).unwrap();
+        let mut expected = vec![110u8, 17, 0, 5];
+        expected.extend(core::iter::repeat_n(0u8, 15));
+        expected.push(1);
+        assert_eq!(encode_term_body(t, &atoms).unwrap(), expected);
+
         // An all-zero magnitude coincides with the small integer 0 on the wire.
+        let t = make_big(&mut heap, false, &[0]).unwrap();
+        assert_eq!(encode_term_body(t, &atoms).unwrap(), vec![97, 0]);
         let t = make_big(&mut heap, false, &[0, 0]).unwrap();
         assert_eq!(encode_term_body(t, &atoms).unwrap(), vec![97, 0]);
     }
 
     #[test]
-    fn bignum_with_at_least_256_digits_uses_large_big() {
+    fn digit_bytes_are_little_endian_with_a_short_top_digit() {
+        assert_eq!(digits_to_le_bytes(&[]), Vec::<u8>::new());
+        assert_eq!(digits_to_le_bytes(&[1]), vec![1]);
+        assert_eq!(digits_to_le_bytes(&[0x0102]), vec![0x02, 0x01]);
+        assert_eq!(
+            digits_to_le_bytes(&[0x0102, 0x03]),
+            vec![0x02, 0x01, 0, 0, 0, 0, 0, 0, 0x03]
+        );
+        assert_eq!(digits_to_le_bytes(&[0, 0]), vec![0; 8 + 1]);
+        assert_eq!(digits_to_le_bytes(&[u64::MAX]), vec![0xFF; 8]);
+    }
+
+    #[test]
+    fn bignum_with_at_least_256_bytes_uses_large_big() {
         let atoms = AtomTable::new();
-        let digits = vec![1u8; 256];
+        // 32 words of `0x01` bytes = 256 significant base-256 bytes.
+        let digits = vec![0x0101_0101_0101_0101u64; 32];
         let mut heap = new_heap(4096);
         let t = make_big(&mut heap, false, &digits).unwrap();
 
@@ -507,7 +562,7 @@ mod tests {
         assert_eq!(bytes[0], 111);
         assert_eq!(&bytes[1..5], &[0, 0, 1, 0]); // 256, big-endian u32
         assert_eq!(bytes[5], 0); // sign
-        assert_eq!(&bytes[6..], &digits[..]);
+        assert_eq!(&bytes[6..], &vec![1u8; 256][..]);
         assert_eq!(bytes.len(), 1 + 4 + 1 + 256);
     }
 
