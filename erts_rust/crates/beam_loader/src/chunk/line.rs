@@ -1,9 +1,13 @@
 //! The `Line` chunk: the source-location table.
 //!
 //! Layout: `u32 version` (must be 0, else the whole chunk is ignored), `u32 flags`,
-//! `u32 instr_count`, `u32 item_count`, `u32 name_count`; then `item_count - 1`
-//! tagged items (`TAG_a <name_index>` / `TAG_i <line>`); then `name_count` ×
+//! `u32 instr_count`, `u32 item_count`, `u32 name_count`; then a tagged item stream
+//! (`TAG_a <name_index>` / `TAG_i <line>`); then `name_count` ×
 //! `{ i16 len, len bytes UTF-8 }` file names (`beam_file.c:443-602`).
+//!
+//! The wire `item_count` counts **only** the `TAG_i` (line) entries: a `TAG_a` sets
+//! the *current file index* and is consumed in addition, so the stream is read until
+//! `item_count` `TAG_i` entries have been emitted (`beam_file.c:506-536`).
 //!
 //! `items[0]` is the undefined location `{0, 0}` and `files[0]` is synthesized as
 //! `<module>.erl`, so the returned table always has at least those entries when the
@@ -38,12 +42,15 @@ pub fn parse(data: &[u8], module_name: &str) -> Result<LineTable> {
     let item_count = reader.u32be()?;
     let name_count = reader.u32be()?;
 
-    // The zeroth item is always the implicit "undefined location"; the wire stream
-    // then carries `item_count` tagged items (a `TAG_a` sets the current file-name
-    // index, a `TAG_i` records the line of the next instruction).
+    // The zeroth item is always the implicit "undefined location". The wire stream
+    // then carries a sequence of tagged items that runs until `item_count` `TAG_i`
+    // entries have been emitted: a `TAG_a` updates the current file-name index and is
+    // consumed in addition (it does not count toward `item_count`), a `TAG_i` records
+    // the line of the next instruction (`beam_file.c:506-536`).
     let mut items = vec![LineEntry::default()];
     let mut current_name: u32 = 0;
-    for _ in 0..item_count {
+    // `items.len() - 1` is the number of `TAG_i` entries emitted so far.
+    while items.len() as u32 <= item_count {
         let (tag, magnitude, _) = crate::decode::read_tagged(&mut reader)?;
         match tag {
             TAG_A => {
@@ -135,9 +142,10 @@ mod tests {
 
     #[test]
     fn tag_a_sets_the_current_file_index() {
-        // 0x12 ⇒ TAG_a with magnitude 1 (file index 1); 0x41 ⇒ TAG_i line 4.
+        // 0x12 ⇒ TAG_a with magnitude 1 (file index 1); 0x41 ⇒ TAG_i line 4. The
+        // `TAG_a` is consumed *in addition* to the single counted `TAG_i` item.
         let items = [0x12u8, 0x41];
-        let data = line_bytes(0, 0, 1, 2, 1, &items, &["other.erl"]);
+        let data = line_bytes(0, 0, 1, 1, 1, &items, &["other.erl"]);
         let table = parse(&data, "mod").unwrap();
         assert_eq!(table.items.len(), 2);
         assert_eq!(table.items[1], LineEntry { file: 1, line: 4 });
@@ -148,6 +156,39 @@ mod tests {
     }
 
     #[test]
+    fn tag_a_items_do_not_count_toward_item_count() {
+        // A module whose functions span two source files: the item stream interleaves
+        // `TAG_a` (file switch) with `TAG_i` (line) entries, and only the `TAG_i`
+        // entries count toward `item_count` (`beam_file.c:506-536`).
+        //
+        // 0x41 ⇒ TAG_i line 4 (still file index 0), 0x12 ⇒ TAG_a name index 1,
+        // 0x91 ⇒ TAG_i line 9 (now file index 1).
+        let items = [0x41u8, 0x12, 0x91];
+        let data = line_bytes(0, 0, 2, 2, 1, &items, &["two_file.erl"]);
+        let table = parse(&data, "m").unwrap();
+
+        assert_eq!(table.flags, 0);
+        assert_eq!(table.instruction_count, 2);
+        assert_eq!(table.items.len(), 3);
+        assert_eq!(table.items[0], LineEntry { file: 0, line: 0 });
+        assert_eq!(table.items[1], LineEntry { file: 0, line: 4 });
+        assert_eq!(table.items[2], LineEntry { file: 1, line: 9 });
+        assert_eq!(
+            table.files,
+            vec!["m.erl".to_string(), "two_file.erl".to_string()]
+        );
+    }
+
+    #[test]
+    fn stream_with_fewer_tag_i_items_than_item_count_is_rejected() {
+        // `item_count` counts only `TAG_i` entries: a stream that supplies just one
+        // `TAG_i` for a declared `item_count` of 2 must fail rather than silently
+        // returning a short table.
+        let items = [0x41u8];
+        let data = line_bytes(0, 0, 2, 2, 0, &items, &[]);
+        let err = parse(&data, "m").unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }    #[test]
     fn zero_items_yields_only_the_undefined_location() {
         let data = line_bytes(0, 0, 0, 0, 0, &[], &[]);
         let table = parse(&data, "mod").unwrap();
