@@ -80,7 +80,7 @@ No subdirectories — the node is flat (12 files). Module/file map:
 - `inets_internal.hrl` → shared internal macros (trace + HTTP characters), also installed to the release
 - `inets.mk` → shared compile-flag fragment, included by the other three subdir Makefiles
 - `inets.app.src`, `inets.appup.src` → application resource + upgrade specs (`%VSN%` templates)
-- `inets.config` → stale example app-env configuration
+- `inets.config` → stale, unused example app-env configuration (no build or test reads it)
 - `Makefile` → build/install of the six modules and of `ebin/inets.app|.appup`
 
 ## Notes for Agents
