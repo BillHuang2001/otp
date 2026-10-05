@@ -198,6 +198,18 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - **Basic blocks are label-delimited.** `Function.blocks` is one block per label, `code[start..end]`;
   `Function.labels` is the label→index map an engine walks linearly with. CFG construction is the
   engine's concern.
+- **The instruction decoder takes the atom map and the type table.** `decode_stream(stream, atoms,
+  version, types)` and `decode_operand(r, atoms, types)` (loader-internal — *not* part of the frozen
+  `ir`/`prelude`/`load` surface `beam_engine` designs against) resolve an `a` operand to the interned
+  `Atom` at decode time and collapse a `z,5` `tr` via `types.fallback`. So `RawInstr` operands already
+  hold interned atoms and `lower` never rewrites operands. `load` interns the `AtU8` names into a fresh
+  `AtomTable` *before* decoding and passes that same table on to `build_module` (interning is idempotent,
+  so `Module.atoms` matches the atoms the decoder embedded).
+- **Operand-encoding gotchas (oracle-verified).** A `label/1` operand is written with the **`u`** tag (an
+  `Integer`, not an `f` `Label`); jump/failure targets (`call*`, `call_ext*`, test `fail`, `select_val`
+  alternatives) use the `f` tag and are strict `Label`s. An `i` operand is sign-extended only in the
+  explicit-count form (`read_tagged` `byte_count >= 2`); the 1-byte-tail form (values 16–0x7FF) is
+  unsigned — matching `beam_file.c`.
 
 ## Test Strategy
 - **Fixture:** `tests/fixtures/slice.beam` (828 bytes) compiled from the checked-in
