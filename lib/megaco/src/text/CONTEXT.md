@@ -26,7 +26,7 @@ Tracked hand-maintained headers (not build products):
 Build glue: `Makefile` (`EBIN = ../../ebin`, `MEGACO_INCLUDEDIR = ../../include`, `parser`/`parser_vN` targets, `TYPE=debug` → `-Ddebug`), `modules.mk` (`MODULES`, `INTERNAL_HRL_FILES`, `INTERNAL_YRL_FILES`), `depend.mk` (per-beam dependencies).
 
 ## Constraints
-- Never hand-edit `megaco_text_parser_v{1,2,3}.erl` / `megaco_text_mini_parser.erl`; they are gitignored and regenerated from the `.yrl` by the `.yrl.erl` rule in `../rules.mk`.
+- Never hand-edit `megaco_text_parser_v{1,2,3}.erl` / `megaco_text_mini_parser.erl`; they are gitignored build output regenerated from the `.yrl` by the `.yrl` → `.erl` rule in `$(ERL_TOP)/make/$(TARGET)/otp.mk` (generated from `make/otp.mk.in`, and included at the top of `Makefile`).
 - Edit a `.yrl` and its paired `.hrl` together, and keep `Expect N` (expected shift/reduce conflicts: v1 609, v2 137, v3 94, mini 1) in sync — yecc errors if the real count differs.
 - Keep the version triplication deliberate: do not merge or parameterize `_v1/_v2/_v3`; mirror a change across versions only where the H.248 version shares the construct.
 - Adding a token requires touching `megaco_text_tokens.hrl`, the relevant `.yrl` (`safeToken`/`safeToken2` rules, `make_safe_token/1`), the paired `.hrl`, the affected `_vN`/pretty/compact encoders, `megaco_text_scanner.erl`, and the flex scanner token table in `../flex/megaco_flex_scanner_drv.flex.src`.
