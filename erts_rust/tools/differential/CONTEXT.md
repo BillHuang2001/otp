@@ -85,7 +85,8 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - **The per-contract rollup is purely additive and derived.** `RunReport.by_contract` maps each contract id present in the run to the same `Summary` shape as the top-level `summary` (a case that declares several contracts contributes to each, so the per-contract `total`s need not sum to `summary.total`). The `list` listing only carries `by_contract` when `--by-contract` is given (`serde(skip_serializing_if = "Option::is_none")`), so the plain `list` output — human text and `differential/list/1` JSON — is byte-for-byte unchanged. Schema ids are **not** bumped: both changes only add keys.
 
 ## Known Issues / Notes for Agents
-- **Today's Rust side is a partial runtime:** every **expression** case is `unsupported` (the `-eval` grammar is not implemented — `beam_rt` exits `3`), while the **module-run** cases (A.2, `modules/add` + `modules/fib`) `agree`. `differential suite` therefore reports `agree=2 mismatch=0 unsupported=17` and exits `0`; `--strict` exits `1`.
+- **Today's Rust side is a partial runtime** (155-case corpus → `agree=50 mismatch=0 unsupported=105`): the **module-run** cases `agree` (the Rust `run` action executes real `erlc`-compiled `.beam`s within its supported opcode subset), while every **expression** case is `unsupported` — `beam_rt`'s `-eval` accepts only a tiny integer-expression subset (`+ - *`, parentheses), so anything else exits `3` (`beam_rt: unsupported: cannot evaluate …`). `--strict` exits `1` (unsupported present). The eval goldens are oracle-verified, so those cases will start `agree`ing as the parallel `-eval` evaluator lands.
+- **`beam_rt` gaps that keep module-run cases integer-returning** (report up; do NOT fix here — `crates/*` is out of this node's write scope): a module function returning a non-integer term (e.g. an atom) renders a corrupted name (`ret_atom(_)->true.` prints `nt`), so module-run cases must return integers; the bit operators (`band`/`bor`/`bxor`/`bsl`/`bsr`/`bnot`) are absent from the BIF table (`beam_rt: error undef`); and bignum overflow surfaces as `beam_rt: system_limit`.
 - Build/test via the committed wrapper (read-only `$HOME`): `../../scripts/cargo.sh test --manifest-path ../../Cargo.toml -p differential`.
   Known deps (`serde`, `serde_json`) resolve **offline** — add no new crates.
 - Verified oracle (system Erlang on `PATH`, OTP 29.1.1 / erts-17.1): `{ok,42}` under the default probe ⇒ `ok <<131,104,2,119,2,111,107,97,42>>`, exit 0.
@@ -95,7 +96,9 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `tests/oracle.rs` integration: **oracle-backed** — the oracle reproduces the `{ok,42}` golden; every **eval** case reproduces its golden; every **module-run** case reproduces its golden under the oracle (compiled with `erlc`); oracle-vs-oracle on the same case ⇒ `Verdict::Agree`; a Rust runtime forced to a nonexistent path ⇒ `unsupported` (never `pass`). These **skip with a loud note** (not a silent pass) when `erl`/`erlc` is unavailable, so `cargo test` stays honest everywhere.
 - The transient-`ETXTBSY` retry is covered **deterministically** (no timing dependence): on Linux, `exec`ing a file that is held open for writing returns `ETXTBSY` at the VFS level, so the tests hold the descriptor open and assert the retry is bounded + surfaces the error (`runtime::tests::output_with_retry_is_bounded_on_etxtbsy_and_surfaces_it`, `module_build::tests::a_compiler_that_cannot_be_exec_yet_is_a_loud_error_not_a_hang`), **and** that it *recovers* once the writer releases (`runtime::tests::output_with_retry_recovers_once_the_transient_writer_closes`), that a non-`ETXTBSY` error is returned unchanged, and that a successful spawn passes through. `tests/cli.rs::fake_runtime` writes its fake `$BEAM_RT` through an explicit `File` that is flushed, `sync_all`'d and **closed** before it can be executed, removing the write-open race at its source.
 - `tests/cli.rs` drives the **binary** as a child process (so `$ERTS_ORACLE`/`$BEAM_RT` can be injected without touching the test process environment) and locks in the exit-code contract (`0`/`1`/`2`), the `--help` surface, the `--out` report file and the `list` path that needs no runtime. It also injects a fake `$BEAM_RT`: one printing a different stdout must still be `[MISMATCH]` (exit 1), one printing `beam_rt: unsupported: …` and exiting `3` must be `unsupported` (exit 0 lenient, `1` under `--strict`). Oracle-dependent cases skip loudly when `erl` is unavailable.
-- Gate: `cargo test -p differential` GREEN and `differential suite --json` runs end-to-end (module cases `agree`, expression cases `unsupported`, no `mismatch`).
+- Gate: `cargo test -p differential` GREEN and `differential suite --json` runs end-to-end with `mismatch=0` (module-run cases `agree`, expression cases `unsupported`).
+- `tests/abi.rs` covers A.3/A.4 structurally: it synthesizes `erl_int_sizes_config.h` from `cc -dM -E -x c /dev/null` and `-fsyntax-only`-compiles a C TU referencing the frozen `enif_*`/`driver_*`/`erl_drv_*` surface, plus a self-test that a bogus symbol fails the check; it **skips loudly** when no `cc`/`gcc`/`clang` is available (no `crates/*` dependency, no `unsafe`).
+- The `corpus` registry tests assert all nine contracts A.1–A.9 are represented and that ≥20 module-run (genuine-agreement) cases exist.
 - The per-contract rollup and the `list --by-contract` view are covered by `#[cfg(test)]` unit tests in `report.rs` (rollup counts per contract, a multi-contract case, the additive top-level JSON key, the contract-free `compare` rollup, and the grouped listing keeping the plain output unchanged) and in `cli.rs` (arg parsing for `--by-contract` and `--strict`, including that neither flag leaks onto a subcommand that does not take it).
 
 ## Routing Table
@@ -108,13 +111,20 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `src/corpus/mod.rs` → `Case`/`CaseKind`/`ModuleRun`/`Contract`/`Probe`/`Golden` + registry (`cases`, `find_case`, `probe_expr`)
 - `src/corpus/etf.rs` → `.beam`/ETF cases (A.2): `term_to_binary` bytes, `binary_to_term` round-trip
 - `src/corpus/terms.rs` → language-semantics cases (A.1): term ordering/equality, arithmetic
-- `src/corpus/bifs.rs` → BIF/OTP-app cases (A.7): `length`, `integer_to_binary`, `lists:reverse`
-- `src/corpus/system_info.rs` → introspection cases (A.8): `system_info/1` keys
-- `src/corpus/flags.rs` → CLI/config cases (A.6): `-noshell` + custom `init:get_argument` flags
-- `src/corpus/modules.rs` → module-run cases (A.2): embedded `erlc`-compiled module agreement
+- `src/corpus/semantics.rs` → language-semantics cases (A.1): arithmetic/precedence, bignum, `==`/`=:=`/`=/=`, term ordering, `case`/`if`/`try`, funs, comprehensions, maps/tuples/binaries
+- `src/corpus/errors.rs` → exception-protocol cases (A.1): `throw`/`exit`/`error` classes + reasons, common `badarg`/`badarith`/`function_clause` failures
+- `src/corpus/bifs.rs` → BIF/OTP-app cases (A.7): `length`, `integer_to_binary`, `lists:*`, `maps:get`, binary ops, `io_lib:format`
+- `src/corpus/system_info.rs` → introspection cases (A.8): `system_info/1` key shapes + badarg-on-unknown-key
+- `src/corpus/flags.rs` → CLI/config cases (A.6): `init:get_argument/1`, `init:get_plain_arguments/0`, `-pa`
+- `src/corpus/nif.rs` → observable NIF error surface (A.3): `erlang:nif_error/1` reason shapes
+- `src/corpus/driver.rs` → observable driver/port surface (A.4): built-in `spawn` driver + `os:cmd/1` round-trip
+- `src/corpus/wire.rs` → distribution/ETF wire cases (A.5): cross-encoded ETF blobs + encoded byte size (live handshake is a documented gap)
+- `src/corpus/boot.rs` → build/boot cases (A.9): shape-only checks on `system_version`, `code:get_path/0`, `code:all_loaded/0`
+- `src/corpus/modules.rs` → module-run cases (A.2/A.1/A.7): embedded `erlc`-compiled modules run under both runtimes (the genuine-agreement core)
 - `src/harness.rs` → orchestration: `run_case`/`compare_expr`/`run_suite`, per-side argv planning, exit-3 classification, exit-code derivation
 - `src/report.rs` → JSON report schema (serde: `summary` + additive `by_contract` rollup; the `list` listing + optional `--by-contract` grouping) + writer + human rendering
 - `src/main.rs` → thin binary: parse args → dispatch → `process::exit(code)`
+- `tests/abi.rs` → A.3/A.4 structural C-ABI check: `-fsyntax-only`-compiles a tiny C TU referencing the `enif_*`/`driver_*`/`erl_drv_*` surface with a synthesized `erl_int_sizes_config.h` (skips loudly without a C compiler; no `crates/*` dependency)
 - `tests/oracle.rs` → oracle-backed integration tests (golden reproduction for eval + module cases, oracle-vs-oracle, missing Rust runtime)
 - `tests/cli.rs` → end-to-end binary tests (exit codes, `--help`, `--out` report, `list`, fake `$BEAM_RT` mismatch/unsupported, boot-banner-vs-real-stderr classification)
 - `out/` → gitignored JSON report output (default `--out`)
