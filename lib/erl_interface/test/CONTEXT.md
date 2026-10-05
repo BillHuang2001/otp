@@ -1,7 +1,7 @@
 # erl_interface Test Suite
 
 ## Intent
-Verifies the `erl_interface` C library (`libei`/`liberl_interface`) and the `erl_call` program.
+Verifies the `ei` C library (`libei`) and the `erl_call` program.
 Each suite starts a small C program that links against the built library, and Common Test drives it from Erlang — over a command/data port, and (for the distribution suites) over real `epmd`/distribution connections between the emulator and the C node.
 This is the only test directory in OTP that uses the `Makefile.first` ts mechanism (see HOWTO/TESTING.md).
 
