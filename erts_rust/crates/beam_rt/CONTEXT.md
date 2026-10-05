@@ -147,11 +147,19 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
   `+`/`-`) and parentheses; evaluated by dispatching through the **`beam_bifs` `erlang` registry**
   (arithmetic semantics are never re-implemented). Anything outside this grammar is a **capability
   gap** (see exit code 3 below), not a genuine error.
-* **An unknown switch is never silently ignored** — it is a capability gap reported as *unsupported*,
-  naming the switch, with no usage text (exit 3). Real `erl` accepts unmodeled switches as init args
-  (`erl -noshell --nope -eval 'halt(0).'` exits 0), so this is a capability gap, not a usage error.
-* `run` and `-s` resolve modules through `code_paths` (`-pa`/`-pz`) + the file argument; M1 searches
-  for `<Mod>.beam` in the code path.
+* **Every command-line flag is an init argument.** Each recognized switch *and* each unrecognized
+  `-flag`/`+flag` (name = the flag with the leading `-`/`+` run removed; values = the following tokens
+  that do not start with `-`/`+`) is recorded as an [`InitArgs`] occurrence — the source of
+  `init:get_argument/1`, e.g. `-noshell` ⇒ `{ok,[[]]}`, `-pa /a -pa /b` ⇒ `{ok,[["/a"],["/b"]]}`.
+  An unmodeled switch is therefore **data, not a usage error**: real `erl -noshell --nope -eval
+  'halt(0).'` exits 0. Only a **stray positional argument** (outside `run`) is a usage error (exit 2).
+* `run` argument grammar (each `ARG` token): a **signed integer** (`42`, `-3`) → `ArgTerm::Int`; a
+  **double-quoted string** (`"a\n"`, escapes `\n \t \r \\ \"`) → `ArgTerm::Str` (an Erlang char list);
+  a **list** (`[1, atom, "x", [2]]`, top-level commas) → `ArgTerm::List`; otherwise a bare atom name →
+  `ArgTerm::Atom`. The materialized count must equal the arity (else exit 2). A `-`/`+`-prefixed token
+  that is not an integer is a usage error.
+* `run`, `-s` and `-run` resolve modules through `code_paths` (`-pa`/`-pz`) + the system stdlib and the
+  file argument; M1 searches for `<Mod>.beam` in the code path.
 
 ## Exit codes & the `unsupported` signal (the stable external contract)
 The CLI exposes **four** exit codes; the differential harness keys off this mapping.
