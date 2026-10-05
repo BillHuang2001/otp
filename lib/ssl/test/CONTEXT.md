@@ -35,7 +35,7 @@ Sources live in `../src/` and are handled elsewhere — this node only documents
 
 ### Spec / coverage files
 - `ssl.spec` — default spec used by `make test`: `{merge_tests,false}` + all suites in `../ssl_test` (the installed test release dir).
-- `ssl_gh.spec` — spec used by GitHub CI (selected via `SPEC_POSTFIX=gh` in `../../.github/workflows/reusable-test.yaml` and `reusable-system-test.yaml`): skips `ssl_upgrade_SUITE`, all benchmark groups and one unstable case, adds `cte_track` and `cth_log_redirect`.
+- `ssl_gh.spec` — spec used by GitHub CI (selected via `SPEC_POSTFIX=gh` in `../../../.github/workflows/reusable-test.yaml` and `reusable-system-test.yaml`): skips `ssl_upgrade_SUITE`, all benchmark groups and one unstable case, adds `cte_track` and `cth_log_redirect`.
 - `ssl_bench.spec` — runs only the `benchmark` groups of `ssl_bench_SUITE`/`ssl_dist_bench_SUITE` (`ct_run -spec ssl_bench.spec`).
 - `ssl.cover` — coverage config (`{incl_app,ssl,details}`, excludes `ssl_debug`), fed to `ct_run -cover`.
 
