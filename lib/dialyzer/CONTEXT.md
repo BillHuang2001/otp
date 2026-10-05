@@ -31,7 +31,7 @@ Default PLT locations come from `DIALYZER_PLT`/`DIALYZER_IPLT` or the OS user ca
 - Depends on the compiler's Core Erlang and `debug_info`: BEAM input must be compiled with `+debug_info` (or analysis must start from source via `{from, src_code}`), otherwise dialyzer reports a recompile hint.
 - `src/` compiles with `-Werror` and extra warnings (`+warn_export_vars +warn_unused_import +warn_missing_spec +warn_obsolete_bool_op`) — new warnings fail the build.
 - `dialyzer.app` may declare only `applications: [compiler, kernel, stdlib]`; `syntax_tools` (used heavily via `cerl`) is a `runtime_dependencies`-only requirement.
-- `ebin/` and `plt/` are build-output dirs (only `.gitignore` tracked); the app's own PLT (from `DIA_PLT_APPS = compiler syntax_tools`, see `Makefile`) lands in `plt/`.
+- `ebin/` is a build-output dir (only `.gitignore` tracked); `plt/` is an empty legacy placeholder (only an empty `.gitignore` tracked) — the app's own self-dialyzer PLT (from `DIA_PLT_APPS = compiler syntax_tools` + defaults, see `Makefile`) is built by the `dialyzer_plt` target into `priv/plt/dialyzer.plt` (rule in `$(ERL_TOP)/make/app_targets.mk`, `DIA_PLT_DIR = ./priv/plt`), which does not exist in a plain checkout.
 - Never edit generated `ebin/*.app`/`*.appup`/`.beam` by hand — edit `src/*.src` and regenerate (`%VSN%` substituted via `sed`).
 
 ## Design Decisions
