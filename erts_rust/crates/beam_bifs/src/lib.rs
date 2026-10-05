@@ -47,6 +47,7 @@ mod ets;
 mod io;
 mod lists;
 mod maps;
+mod numeric;
 mod print;
 mod proc;
 mod reason;
