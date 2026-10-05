@@ -18,22 +18,23 @@
 //! * `tuple_to_list({1,2})` ⇒ `[1,2]`; `list_to_tuple([1,2])` ⇒ `{1,2}`;
 //!   `list_to_tuple([1|2])` (improper) ⇒ `badarg`.
 //! * `length([a|b])` (improper) ⇒ `badarg`; `hd([])`/`tl([])` ⇒ `badarg`.
-//! * `size({1,2})` ⇒ `2`; `size([1,2])` ⇒ `badarg`.
+//! * `size({1,2})` ⇒ `2`; `size(<<1,2,3>>)` ⇒ `3`; `size(<<1:1>>)` ⇒ `0`;
+//!   `size([1,2])` ⇒ `badarg`.
 //!
-//! # Milestone-1 gap: `size/1` on a binary
+//! # `size/1` on a bitstring
 //!
 //! `size/1` is `tuple_size/1` for tuples and the *byte* size for a binary or
-//! bitstring. `beam_term` exposes no safe byte-size accessor and M1 builds no
-//! binaries (`beam_term` has no binary constructor reachable from safe code), so
-//! a binary operand is unreachable here and reported as `badarg`. For every term
-//! constructible in M1 this is exactly the oracle's behaviour.
+//! bitstring: the oracle truncates the bit size (`size(<<1:1>>)` ⇒ `0`,
+//! `size(<<1:9>>)` ⇒ `1`, both verified against erts-17.1). The bitstrings
+//! themselves are built and read through [`crate::bits`].
 
 use beam_common::Result;
 use beam_term::{signed_value, Eterm};
 
 use crate::access;
+use crate::bits;
 use crate::context::BifContext;
-use crate::error::badarg;
+use crate::error::{badarg, system_limit};
 use crate::registry::BifRegistry;
 
 /// `element(N, Tuple)` — 0-based element index, validated against the tuple.
@@ -139,15 +140,26 @@ fn tl(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Ok(access::cdr(args[0]))
 }
 
-/// `size(Term)` — the tuple size, or (out of M1 reach, see the module docs) a
-/// binary's byte size.
+/// `size(Term)` — the tuple size, or a bitstring's byte size.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for anything that is
+/// neither a tuple nor a bitstring (`size([1,2])` ⇒ `badarg`);
+/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) if the byte size
+/// does not fit a small integer.
 fn size(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    if !access::is_tuple(args[0]) {
-        return Err(badarg());
+    let term = args[0];
+    if access::is_tuple(term) {
+        return ctx.int(access::tuple_size(term) as i64);
     }
-    ctx.int(access::tuple_size(args[0]) as i64)
+    if bits::is_bitstring(term) {
+        // The oracle truncates: `size(<<1,2,3>>)` ⇒ `3`, `size(<<1:1>>)` ⇒ `0`.
+        let bytes = bits::bit_size(term)? / 8;
+        return ctx.int(i64::try_from(bytes).map_err(|_| system_limit())?);
+    }
+    Err(badarg())
 }
-
 /// Registers the `erlang` term-operation BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "element", 2, element);
@@ -230,14 +242,32 @@ mod tests {
             let tup = ctx.tuple(&[make_small(1), make_small(2), make_small(3)]).unwrap();
             assert_eq!(tuple_size(ctx, &[tup]).unwrap(), make_small(3));
             assert_eq!(size(ctx, &[tup]).unwrap(), make_small(3));
-            // `size([])` and `size([1,2])` are `badarg` (binaries are out of M1 reach).
+            // `size([])` and `size([1,2])` are `badarg`.
             assert!(matches!(size(ctx, &[NIL]), Err(BeamError::BadArg)));
             let list = ctx.list(&[make_small(1), make_small(2)]).unwrap();
             assert!(matches!(size(ctx, &[list]), Err(BeamError::BadArg)));
+            assert!(matches!(size(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
             assert!(matches!(tuple_size(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
         });
     }
 
+    #[test]
+    fn size_of_a_bitstring_is_its_byte_size() {
+        with_ctx(|ctx| {
+            // A three-byte binary and the empty binary.
+            let bin = bits::make_binary(ctx.heap(), &[1, 2, 3]).unwrap();
+            assert_eq!(size(ctx, &[bin]).unwrap(), make_small(3));
+            let empty = bits::make_binary(ctx.heap(), &[]).unwrap();
+            assert_eq!(size(ctx, &[empty]).unwrap(), make_small(0));
+            // The oracle truncates the bit size: `<<1:1>>` ⇒ 0, `<<1:9>>` ⇒ 1.
+            let one_bit = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).unwrap();
+            assert_eq!(size(ctx, &[one_bit]).unwrap(), make_small(0));
+            let nine_bits = bits::make_bitstring(ctx.heap(), &[0, 0b1000_0000], 9).unwrap();
+            assert_eq!(size(ctx, &[nine_bits]).unwrap(), make_small(1));
+            let eight_bits = bits::make_bitstring(ctx.heap(), &[0xFF], 8).unwrap();
+            assert_eq!(size(ctx, &[eight_bits]).unwrap(), make_small(1));
+        });
+    }
     #[test]
     fn tuple_and_list_conversions() {
         with_ctx(|ctx| {
