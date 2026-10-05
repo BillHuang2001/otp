@@ -92,6 +92,34 @@ barrier), off-heap refcounted large objects (MSO). Reject MMTk/Boehm. GenImmix i
 - Benchmark/test targets are the configured foreign repos: Cowboy, Khepri, EMQX, Elixir,
   Programming-Language-Benchmarks. Investigate them read-only; write through the task's tracked worktrees.
 
+## Status (Milestone 1)
+- **Crate tree complete:** all 15 crates + 2 tools are architected (each with its own `CONTEXT.md`),
+  implemented, and tested. `scripts/cargo.sh test --workspace` → **1441 tests, 0 failures**, warning-free.
+- **Vertical slice WORKS:** `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam` (produced by
+  the system `erlc`) and execute it — `beam_rt run <slice.beam> slice:add/2 2 3` → `5`,
+  `slice:fib/1 10` → `55`. The supported opcode subset is documented honestly per crate; anything
+  outside it returns a typed `BeamError` (never a wrong result).
+- **Compatibility gate:** `tools/differential` reports real oracle-vs-Rust **AGREEMENT** on the
+  supported module-run subset and honest `unsupported` for the rest (0 mismatches). 9-contract corpus
+  is smoke-level today.
+- **Benchmarks (system-ERTS baseline + targets, real numbers):** baseline startup p50 ≈ 116 ms /
+  p99 ≈ 154 ms · Cowboy hello-world **117,813 req/s** (p50 0.064 ms, p99 0.133 ms) · Elixir compiler
+  3.41 files/s · `erlc` 9.89 files/s. `plb`/`khepri`/`emqx` skip honestly (`dotnet`/`rebar3` absent).
+- **Honest M1 coverage gaps** (per-crate `Known Issues`): full XML/crypto-heavy ETF tags, tuples/`
+  lists`/funs/floats/literals/try-catch opcodes, full match-spec compiler, ETS concurrency/access,
+  Cranelift tier (feature-gated off). All return typed errors, never wrong results.
+
+## Not yet started (future workstreams)
+- **Stage 2 (compiler):** loop opts → operation fusion → FBIP on the existing BEAM-SSA IR
+  (`../lib/compiler`), per Part II §E/§H. Language-agnostic (Erlang/Elixir/LFE). Not part of the Rust
+  runtime rewrite; the Rust runtime must ultimately run the compiler (contract A.9, self-hosted build)
+  — that is future work.
+- **Stage 4 completion:** GenImmix mature-generation option (measurement-gated).
+- **Stage 6 (Level-2 clean-room VM):** new ISA + full toolchain — research track with an explicit exit
+  criterion (Part II §H).
+- **Legacy-C removal:** delete the corresponding C under `../erts/emulator/beam/` module-by-module as
+  each Rust crate reaches differential parity (it is retained only as oracle + `FLAVOR=emu` fallback).
+
 ## Routing Table
 - `crates/beam_common/` → shared error/result types, config, logging, feature flags, version constants (lowest common ancestor)
 - `crates/beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas, term ops
