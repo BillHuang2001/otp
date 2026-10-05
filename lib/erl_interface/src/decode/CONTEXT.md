@@ -63,7 +63,7 @@ Do not add a decoder file without adding it to `DECODESRC`, and keep one tag fam
 ## Design Decisions
 One file per tag family is deliberate: with static linking the linker only extracts the object files whose symbols are referenced, so a user of `ei_decode_long` must not drag in, e.g., the GMP bignum decoder.
 The two `*longlong.c` files are separate translation units specifically to avoid forcing a `libgcc.a` dependency (`__ashldi3`) on users who never call the long-long functions — see `../src/README.internal`, "The long long story".
-`decoders accept NULL output pointers` instead of having separate "skip" variants, which is why most decoders still parse the payload when `p == NULL` (and why `ei_decode_list_header`/`ei_decode_tuple_header` advance by 4 instead of reading when `arity == NULL`).
+Decoders accept `NULL` output pointers instead of having separate "skip" variants, which is why most decoders still parse the payload when `p == NULL` (and why `ei_decode_list_header`/`ei_decode_tuple_header` advance by 4 instead of reading when `arity == NULL`).
 `ei_decode_trace` runs all sub-decodes on a temporary index and commits only at the end, making it atomic on failure; the other decoders are not transactional.
 
 ## Known Issues / Gotchas
