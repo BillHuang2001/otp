@@ -9,7 +9,7 @@ Everything published for this app comes from the extras in this directory (no mo
 - `docs.exs` — ExDoc config: `main: "ei_users_guide"` (landing page), `api_reference: false`, and `extras` in published order: `guides/ei_users_guide.md`, `references/ei.md`, `references/ei_connect.md`, `references/ei_global.md`, `references/erl_call_cmd.md`.
 - `guides/ei_users_guide.md` — "Erl_Interface User's Guide", the ExDoc `main` page and the narrative tutorial (see `guides/CONTEXT.md`).
 - `references/ei.md`, `references/ei_connect.md`, `references/ei_global.md`, `references/erl_call_cmd.md` — per-function reference pages, each documenting one public header / tool; they double as the `ei(3)`, `ei_connect(3)`, `ei_global(3)` and `erl_call(1)` man-page sources (see `references/CONTEXT.md`).
-- `Makefile` — 36 lines: includes `$(ERL_TOP)/make/target.mk`, `make/$(TARGET)/otp.mk`, `../vsn.mk` (`VSN=$(ERL_INTERFACE_VSN)`, i.e. `EI_VSN`) and finally `$(ERL_TOP)/make/doc.mk` with `APPLICATION=erl_interface`.
+- `Makefile` — 35 lines: includes `$(ERL_TOP)/make/target.mk`, `make/$(TARGET)/otp.mk`, `../vsn.mk` (`VSN=$(ERL_INTERFACE_VSN)`, i.e. `EI_VSN`) and finally `$(ERL_TOP)/make/doc.mk` with `APPLICATION=erl_interface`.
 - `notes.md` — app release notes (`# Erl_interface Release Notes`, 100 `## Erl_Interface <vsn>` sections, newest first, down to `3.4.1`); not listed in `docs.exs`.
 
 ## How These Docs Are Built and Published
