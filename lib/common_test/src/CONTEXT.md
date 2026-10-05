@@ -19,13 +19,13 @@ The `test_server*` modules are the historical core of the framework and keep the
 ## Execution Model
 - Users enter through the `ct` API (Erlang) or the `ct_run` OS command; both funnel into the `ct_run` module.
 - The `bin/ct_run` executable is built from `erts/etc/common/ct_run.c` (part of `erts/`, NOT this directory): it starts `erl -s ct_run script_start` (also `-shell` / `-vts` modes).
-  `ct_run:script_start/0` reads `init:get_arguments/0`, merges any `erl_flags`, filters `-erl_args` and parses the result into the `#opts{}` record.
+  `ct_run:script_start/0` reads `init:get_arguments/0`, cuts the argument list at `-erl_args`, and parses the remainder into the `#opts{}` record.
 - Flow: `ct:run/1..3 | run_test/1 | run_testspec/1` → `ct_run:run_test/1..` (`run_test1/run_dir/run_prepared`) → `ct_util:start(LogDir, Verbosity, Stylesheet)` → `ct_util:do_start/5`.
 - `ct_util:do_start/5` registers the process as `ct_util_server` and starts, in order: `ct_event` (shared event manager), `ct_config` (registered `ct_config_server`), user `event_handler`s, `ct_default_gl`, `ct_logs`, and `ct_hooks`.
 - There is no OTP `supervisor` in this app; `ct_util_server` and `ct_logs` are hand-rolled `spawn_link`/receive loops, and `test_server_ctrl`, `ct_config_server` are `gen_server`s. `ct_util:stop/1` and `test_server_ctrl:stop/0` tear the run down.
 - `ct_run:do_run_test/3` then starts `test_server_ctrl:start_link(local)` (registered `test_server_ctrl`) and feeds it the test selection (`add_dir(_with_skip)/add_module/add_case/add_cases/add_conf/add_spec`), applies run options (`multiply_timetraps`, `scale_timetraps`, `create_priv_dir`, `reject_io_reqs`), and finishes with `catch test_server_ctrl:wait_finish()`.
 - `test_server_ctrl` is the central driver: it compiles suites (`ct_make`), builds the run schedule (sequential, parallel-per-testsuite or parallel-per-testcase) via `do_test_cases/do_spec`, starts/collects target nodes (`test_server_node`), and delegates all suite semantics to `ct_framework`.
-- A testcase runs inside `test_server` (the low-level API a suite actually calls; `ct:*` helpers are re-exported/delegated there).
+- A testcase runs inside `test_server`: it holds the low-level runtime API that suite code reaches through the `?config`/`?t` macros and that the `ct:*` helpers ultimately feed into.
   `test_server` is *framework-agnostic*: it dispatches `init_tc`/`end_tc`/`get_suite`/etc. through `test_server_sup:framework_call/2,3,4` to the module named by the OS env var `TEST_SERVER_FRAMEWORK`.
   `ct_run:do_run/4` sets `TEST_SERVER_FRAMEWORK=ct_framework` and `TEST_SERVER_FRAMEWORK_NAME=common_test`; if the var is `false`/`"undefined"` the `framework_call` returns its default instead of failing.
 - `test_server` also runs on remote/target nodes and manages the node's group leader through `test_server_gl` and `test_server_io`.
