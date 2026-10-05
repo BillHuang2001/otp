@@ -70,7 +70,7 @@ Internal plumbing (all `-moduledoc false`), by subsystem:
 - `#diameter_packet.errors` defaults to `[]` rather than `undefined`, so "set nothing" is signalled with the atom `false` in `diameter_traffic:make_answer_packet` (changing the default would break callers relying on the old value).
 - Grouped AVPs are represented as improper lists internally (`-dialyzer(no_improper_lists)` in `diameter_traffic`); a Grouped AVP's decoded component list is *not* retained when packed into a message record — the `AVP` field stays flat (historical).
 - Grouped/Enumerated types are handled directly by `diameter_gen.hrl`/`diameter_codec`, *not* by `diameter_types` (see the comment at the top of `diameter_types`).
-- `window`-style funs (`fun Mod:F/Arity`) must not be stored in long-lived configuration (service/transport options) because they pin old code across upgrades.
+- External funs (`fun Mod:F/Arity`) must not be stored in long-lived configuration (service/transport options) because they pin old code across upgrades.
 - `incoming_maxlen` is handled in `diameter_peer_fsm`, not `diameter_traffic`, although the option is carried in `diameter_traffic`'s `#recvdata{}` codec map.
 - `diameter_peer_fsm` cannot guarantee at connect time that the service/transport capabilities can actually build an encodable CER/CEA — that is only checked once the exchange happens.
 - Message ordering/numbering: `sequence/1` masks the Hop-by-Hop and End-to-End counters out of the shared `sequence` counter; changing the mask affects both.
