@@ -1,0 +1,4 @@
+# The committed oracle fixture is a real `.beam` (produced by the system `erlc`);
+# re-include it despite the repository-wide `*.beam` rule.
+# See tests/fixtures/README.md for the regeneration command.
+!tests/fixtures/*.beam

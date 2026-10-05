@@ -29,6 +29,59 @@ use crate::ir::{CodeVersion, TypeTable};
 use crate::opcode::Opcode;
 use crate::operand::Operand;
 
+/// Reads one packed "tagged number" from a stream (`beam_file.c:167-240`,
+/// `beamreader_read_tagged`).
+///
+/// This is the single lowest-common-ancestor decoder for the tag/length byte used by
+/// the instruction operand decoder ([`decode_operand`]) *and* by the `AtU8`/`Line`
+/// chunk parsers ([`crate::chunk::atom`], [`crate::chunk::line`]); it is exposed at
+/// crate scope so those callers share one implementation rather than re-deriving the
+/// encoding.
+///
+/// The first byte is `tag = byte & 0x07` and encodes the value's length:
+/// `byte & 0x08 == 0` ⇒ value `byte >> 4` (0–15); else `byte & 0x10 == 0` ⇒ a 1-byte
+/// big-endian tail with value `((byte >> 5) << 8) | tail`; else `(byte >> 5) + 2`
+/// big-endian magnitude bytes, where `(byte >> 5) == 7` means a `u`-tagged sub-length
+/// `S` precedes `S + 9` magnitude bytes.
+///
+/// Returns `(tag, magnitude, byte_count)`:
+/// * `tag` — the low three bits of the tag byte (`0 u`, `1 i`, `2 a`, …).
+/// * `magnitude` — the raw big-endian integer value.
+/// * `byte_count` — the number of magnitude bytes the value was packed in, `0` for
+///   the in-nibble form (used by [`decode_operand`] to sign-extend an `i` value).
+///
+/// A magnitude wider than eight bytes yields `BeamError::SystemLimit`; a sub-length
+/// whose tag is not `u` yields `BeamError::BadArg`. Never panics.
+pub(crate) fn read_tagged(r: &mut beam_codec::Reader<'_>) -> Result<(u8, u64, usize)> {
+    let b = r.u8()?;
+    let tag = b & 0x07;
+    if (b & 0x08) == 0 {
+        return Ok((tag, (b >> 4) as u64, 0));
+    }
+    if (b & 0x10) == 0 {
+        let tail = r.u8()?;
+        return Ok((tag, (((b >> 5) as u64) << 8) | tail as u64, 1));
+    }
+    let count = if (b >> 5) < 7 {
+        (b >> 5) as u64 + 2
+    } else {
+        let (sub_tag, sub_value, _) = read_tagged(r)?;
+        if sub_tag != 0 {
+            return Err(crate::error::bad_file("tagged sub-length is not unsigned"));
+        }
+        sub_value + 9
+    };
+    if count > 8 {
+        return Err(beam_common::BeamError::SystemLimit);
+    }
+    let bytes = r.bytes(count as usize)?;
+    let mut value: u64 = 0;
+    for &byte in bytes {
+        value = (value << 8) | byte as u64;
+    }
+    Ok((tag, value, count as usize))
+}
+
 /// One decoded instruction: opcode, operands and its byte offset in the stream.
 ///
 /// The offset lets [`crate::lower`] attach line/backtrace information and lets the
