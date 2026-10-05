@@ -1,7 +1,7 @@
 # erl_interface Test Suite
 
 ## Intent
-Verifies the `erl_interface` C library (`libei`/`liberl_interface`) and the `erl_call` program.
+Verifies the `ei` C library (`libei`) and the `erl_call` program.
 Each suite starts a small C program that links against the built library, and Common Test drives it from Erlang — over a command/data port, and (for the distribution suites) over real `epmd`/distribution connections between the emulator and the C node.
 This is the only test directory in OTP that uses the `Makefile.first` ts mechanism (see HOWTO/TESTING.md).
 
@@ -15,8 +15,8 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 | `ei_decode_SUITE` | `ei_decode_*` for every external term type, incl. long/ulong/longlong/ulonglong, non-optimal encodings, UTF-8 atoms, iodata, huge foreign pids/ports/refs, `ei_cmp_nc` |
 | `ei_encode_SUITE` | `ei_encode_*` for every external term type incl. failure paths (`test_ei_encode_fails`) and UTF-8 atoms + explicit length |
 | `ei_decode_encode_SUITE` | Erlang→C→Erlang round trips of funs, pids, ports, refs, big integers, large pid/port/ref containers on foreign node names; the only suite in the smoke spec |
-| `ei_format_SUITE` | `erl_format()` string→term construction (atoms, tuples, lists, maps, without version prefix) |
-| `ei_print_SUITE` | `ei_print()`/`ei_s_print_term` term→string printing (atoms, tuples, lists, strings, maps, funs, binaries, bitstrings, integers) |
+| `ei_format_SUITE` | `ei_x_format()` string→term construction (atoms, tuples, lists, maps, without version prefix) |
+| `ei_print_SUITE` | `ei_print_term()`/`ei_s_print_term` term→string printing (atoms, tuples, lists, strings, maps, funs, binaries, bitstrings, integers) |
 | `ei_tmo_SUITE` | Socket timeouts on accept/connect/recv/send, driven by manual partial distribution handshakes from Erlang; `ei_dflags` checks distribution flag negotiation |
 | `ei_global_SUITE` | `ei_global_register`/`ei_global_unregister`/`ei_global_whereis`/`ei_global_names` against the local node |
 | `erl_call_SUITE` | The `erl_call` binary: node start/lookup, `-address` (port/host:port), `-fetch_stdout`, `-no_result_term`, multi-io-request group leaders, unresolvable hostname, `-timeout` |
@@ -45,13 +45,13 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 
 ## Build Mechanism for the C Test Programs
 - No per-suite `Makefile` is committed; `Makefile.first` and `Makefile.src` are templates processed by the OTP test server (`ts_lib:make_non_erlang/2`): it runs `Makefile.first` with `make`, substitutes `@var@` placeholders in `Makefile.src` into `Makefile`, then runs `make`.
-- Substituted variables come from `lib/common_test/test_server/variables.<TYPE>.<FLAVOR>` produced by `ts:install()`, extended by `ts_erl_config:erl_interface/2`: `erl_interface_libpath`(= `lib/erl_interface/obj[.debug]/<target>`), `erl_interface_lib`, `erl_interface_eilib`, `erl_interface_include`, `erl_interface_sock_libs`, `erl_interface_threadlib`, `erl_interface_mk_include` (= `lib/erl_interface/src/<target>/eidefs.mk`, which supplies `EI_LDFLAGS`, `THR_DEFS`).
+- Substituted variables come from `lib/common_test/test_server/variables.<TYPE>.<FLAVOR>` produced by `ts:install()`, extended by `ts_erl_config:erl_interface/2`: `erl_interface_libpath`(= `lib/erl_interface/obj[.debug]/<target>`), `erl_interface_eilib`, `erl_interface_include`, `erl_interface_sock_libs`, `erl_interface_threadlib`, `erl_interface_mk_include` (= `lib/erl_interface/src/<target>/eidefs.mk`, which supplies `EI_LDFLAGS`, `THR_DEFS`).
 - `make test` (`make/test_target_script.sh`) installs the suites to `make_test_dir/erl_interface_test`, installs the ts test server, then calls `ts:compile_datadirs(".../variables.<TYPE>.<FLAVOR>", "*_SUITE_data")` to build all data dirs before `ct_run`.
 - `ts_install_cth` (declared in `suite/0` of every suite except `erl_call_SUITE`) re-runs `ts_lib:make_non_erlang/2` for the suite's data dir at start, and skips it when the ts `variables` say `cross = "yes"`.
 
 ## Test Strategy
 - Run from `lib/erl_interface`: `make test` (all suites via `erl_interface.spec`), `make test ARGS="-suite ei_decode_SUITE -case test_ei_decode_long"`, or `make test SPEC_POSTFIX=smoke`; also `make erl_interface_test` from `ERL_TOP`.
-- Prerequisites: the whole OTP tree built enough for `ct_run`, and the C library built — `lib/erl_interface/obj[.debug]/<target>/libei.a` (+ `liberl_interface.a`, needed by `ei_global_SUITE`) and `lib/erl_interface/src/<target>/eidefs.mk`; `erl_call_SUITE` additionally needs `lib/erl_interface/bin/<system_architecture>/erl_call`.
+- Prerequisites: the whole OTP tree built enough for `ct_run`, and `libei` built — `lib/erl_interface/obj[.debug]/<target>/libei.a` plus `lib/erl_interface/src/<target>/eidefs.mk`; `erl_call_SUITE` additionally needs `lib/erl_interface/bin/<system_architecture>/erl_call`.
 - Distribution is required for `ei_accept`, `ei_connect`, `ei_tmo`, `ei_global` and `ei_decode_encode`: they publish/connect C nodes, so a running `epmd` and a resolvable hostname are needed; ct_run is started with `-sname test_server`, and `ei_tmo_SUITE` registers fake node names with epmd itself over `127.0.0.1`.
 - `ei_decode`, `ei_encode`, `ei_print`, `ei_format` need no distribution — they only exchange terms over the port.
 - Slow areas: `ei_tmo_SUITE` (timetrap 1 minute; several 10–20 s waits on socket buffers), `ei_connect_SUITE` (timetrap 30 s; 32 MB term in `ei_reg_send_large`), the threaded cases (`einode`, `eiaccnode`).
@@ -67,6 +67,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 
 ## Known Issues / Notes for Agents
 - `Makefile.src` in this directory (`lib/erl_interface/test/Makefile.src`) is dead legacy: its rules reference `eterm_test.c`, `ext_test.c`, `format_test.c`, `print_term.c`, `match_test.c`, which do not exist, and this directory is never processed as a `*_data` dir.
+- `ei_global_SUITE_data/Makefile.src` still carries a leftover `LIBERL = @erl_interface_lib@`, but nothing consumes it: `@erl_interface_lib@` resolves via `ts_erl_config` to a `liberl_interface.a` path that the application no longer builds, and the only real prerequisites/link inputs are `$(LIBEI)` (`libei.a`), `ei_runner.o` and `my_ussi.o`.
 - `README` describes the ClearCase-era workflow and is obsolete — do not follow it. To add a suite, copy a similar suite plus its `*_SUITE_data/` and rename the C file.
 - `Makefile`'s `tests`/`clean`/`docs` targets are empty on purpose: tests are driven by `make test` → `make/test_target_script.sh`, not by this Makefile.
 - Tests are installed to `$(RELEASE_PATH)/erl_interface_test` (not `lib/<app>-<vsn>/test`), which is why the specs use `{suites,"../erl_interface_test",all}`.
@@ -83,10 +84,10 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 - `ei_decode_SUITE_data/` → `ei_decode_test.c` (all `ei_decode_*` cases)
 - `ei_encode_SUITE_data/` → `ei_encode_test.c` (all `ei_encode_*` cases incl. failures)
 - `ei_decode_encode_SUITE_data/` → `ei_decode_encode_test.c` (single round-trip case used by the smoke spec)
-- `ei_format_SUITE_data/` → `ei_format_test.c` (`erl_format()` cases)
-- `ei_print_SUITE_data/` → `ei_print_test.c` (`ei_print()`/`ei_s_print_term` cases)
+- `ei_format_SUITE_data/` → `ei_format_test.c` (`ei_x_format()` cases)
+- `ei_print_SUITE_data/` → `ei_print_test.c` (`ei_print_term()`/`ei_s_print_term` cases)
 - `ei_tmo_SUITE_data/` → `ei_tmo_test.c` (timeout cases driven by Erlang handshakes)
-- `ei_global_SUITE_data/` → `ei_global_test.c` (global register/whereis/names cases; links `liberl_interface.a` and `my_ussi.o`)
+- `ei_global_SUITE_data/` → `ei_global_test.c` (global register/whereis/names cases; its `Makefile.src` links `$(LIBEI)` = `libei.a` plus `../all_SUITE_data/ei_runner.o` and `my_ussi.o`)
 - `port_call_SUITE_data/` → `port_call_drv.c`, a shared library (`@SHLIB_RULES@`) loaded with `erl_ddll` from the data dir
 - `Makefile` → suite list (`EI_MODULES`), `ERTS_MODULES`, `SPEC_FILES`, `COVER_FILE`, `RELSYSDIR` install target (no `Makefile.first`); `Makefile.src` → dead legacy template (see Known Issues)
 - `runner.erl` → Erlang-side driver for the C test programs
@@ -94,7 +95,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 - `README` → obsolete ClearCase-era notes
 
 ## See Also
-- `../CONTEXT.md` — the `erl_interface` application (C library, `erl_call`, `vsn.mk`)
+- `../CONTEXT.md` — the `erl_interface` application (the `ei` library, `erl_call`, `vsn.mk`)
 - `../../common_test/test_server/CONTEXT.md` — the `ts` framework (`ts_lib:make_non_erlang/2`, `ts_erl_config`, `ts_install_cth`) that builds these data dirs
 - `../../../HOWTO/TESTING.md` — how `make test` and the `Makefile.first`/`Makefile.src` mechanism work
 - `../../../erts/emulator/test/erts_test_utils.erl` — helper used by `ei_decode_SUITE` and `ei_accept_SUITE` to build large external pid/port/ref containers
