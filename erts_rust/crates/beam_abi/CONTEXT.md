@@ -51,10 +51,15 @@ scalars `ErlNifUInt64`/`ErlNifSInt64`/`ErlNifUInt`/`ErlNifSInt`, `ErlNifTime`, `
 `ErlNifIOQueueOpts`; flag types `ErlNifResourceFlags`, `ErlNifSelectFlags`, `ErlNifUniqueInteger`,
 `ErlNifBinaryToTerm`, `ErlNifDirtyTaskFlags`.
 ### `ErlNifApi` (`nif::api`) — the NIF function table (the frozen `enif_*` surface)
-A `#[repr(C)]` struct of the **181** `enif_*` function pointers that exist on LP64, in exact
-`erl_nif_api_funcs.h` line order (the 4 `#if SIZEOF_LONG != 8` entries are excluded). This is the
-Rust analogue of the header's Windows-only `TWinDynNifCallbacks` and defines the surface the runtime
-must implement. `size_of::<ErlNifApi>() == 181 * 8 == 1448` is asserted at compile time.
+A `#[repr(C)]` struct of the **176** `enif_*` function pointers that exist on LP64, in exact
+`erl_nif_api_funcs.h` declaration order. Derivation: the token `ERL_NIF_API_FUNC_DECL` occurs 185
+times but only 180 are declarations (5 are guard/comment lines); the 4 `#if SIZEOF_LONG != 8`
+entries (`enif_get_int64`/`enif_get_uint64`/`enif_make_int64`/`enif_make_uint64`) do not exist on
+LP64 (the header `#define`s them onto their `long`/`ulong` siblings), so 180 − 4 = **176**; the
+macro-only `enif_ioq_enq` (present in the `ERL_NIF_API_FUNC_MACRO` list only, with no
+`DECL`/signature/definition) is excluded. This is the Rust analogue of the header's Windows-only
+`TWinDynNifCallbacks` and defines the surface the runtime must implement.
+`size_of::<ErlNifApi>() == 176 * 8 == 1408` is asserted at compile time.
 
 ### Driver types (`driver::types`) — `#[repr(C)]`, exactly as `erl_driver.h`
 `ErlDrvEntry`, `ErlDrvBinary`, `ErlIOVec`, `ErlDrvNowData`; opaque handles `ErlDrvPort`,
@@ -86,7 +91,7 @@ constants, and `ERL_NIF_SELECT_*` / `ErlNifSelectFlags` selector bits.
 | `ErlNifResourceTypeInit` | 40 | 8 | dtor 0, stop 8, down 16, members 24, dyncall 32 |
 | `ErlNifMapIterator` | 56 | 8 | map 0, size 8, idx 16, u 24, `__spare__` 40 |
 | `ErlNifIOVec` | 424 | 8 | iovcnt 0, size 8, iov 16, ref_bins 24, flags 32, small_iov 40, small_ref_bin 296 |
-| `ErlNifApi` | 1448 | 8 | (181 fn ptrs) |
+| `ErlNifApi` | 1408 | 8 | (176 fn ptrs) |
 | `ErlDrvSysInfo` (= `ErlNifSysInfo`) | 56 | 8 | driver_major_version 0, erts_version 8, otp_release 16, thread_support 24, … scheduler_threads 36, …, dirty_scheduler_support 48 |
 | `ErlDrvThreadOpts` | 4 | 4 | suggested_stack_size 0 |
 | `ErlDrvMonitor` | 32 | 1 | data 0 |
@@ -142,7 +147,8 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   as *exported free functions* resolved via `dlsym` (only Windows wraps them in the
   `TWinDynNifCallbacks` struct). Modelling them as `#[repr(C)]` function-pointer tables is how the
   Rust runtime will export/consume the surface, and it makes the frozen signature list explicit and
-  compile-checked. `ErlNifApi` is a faithful 181-entry mirror of `erl_nif_api_funcs.h` order;
+  compile-checked. `ErlNifApi` is a faithful 176-entry LP64 mirror of the `erl_nif_api_funcs.h`
+  declaration order;
   `ErlDrvApi` mirrors the `erl_driver.h` free-function list.
 - **`ErlDrvSysInfo` is the single definition; `ErlNifSysInfo` is a `pub use` alias** (the header does
   `typedef ErlDrvSysInfo ErlNifSysInfo;`), preventing duplication.
@@ -160,7 +166,7 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
 - `tests/term_abi.rs` — `size_of::<ERL_NIF_TERM>() == size_of::<usize>() == size_of::<Eterm>()`,
   matching `align_of`, and `nif_from_eterm(eterm_from_nif(t)) == t` round-trips over boundary raw
   values (`NIL`, `make_small(0)`, max small, atom tag) — the A.3 guarantee.
-- `tests/api_surface.rs` — `size_of::<ErlNifApi>() == 181 * 8` and `size_of::<ErlDrvApi>() == <n> * 8`
+- `tests/api_surface.rs` — `size_of::<ErlNifApi>() == 176 * 8` and `size_of::<ErlDrvApi>() == 111 * 8`
   (every column is one pointer) — the strongest available freeze of the table shape — plus a smoke
   test that an all-`None` table round-trips through `size_of_val`.
 - `tests/entry.rs` — build an `ErlNifFunc`/`ErlNifEntry` (the `nif_init` shape) with null callbacks,
@@ -177,7 +183,7 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
 - `src/common.rs` → `erl_drv_nif.h` shared types: integer typedefs, `SysIOVec`, `ErlDrvSysInfo`, `ErlDrvThreadOpts`, `ErlDirtyJobFlags`, `ErlNifSelectFlags` + `ERL_NIF_SELECT_*`, `ErlDrvMonitor`, time constants
 - `src/nif/term.rs` → `ERL_NIF_TERM`/`ERL_NIF_UINT`, `Eterm ↔ ERL_NIF_TERM` transmute seam
 - `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`)
-- `src/nif/api.rs` → `ErlNifApi` (181-entry `enif_*` function table; generated, header-ordered)
+- `src/nif/api.rs` → `ErlNifApi` (176-entry `enif_*` function table; generated, header-ordered)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`)
 - `src/driver/api.rs` → `ErlDrvApi` (`driver_*`/`erl_drv_*` function table)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)

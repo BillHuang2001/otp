@@ -3,32 +3,39 @@
 //! # Generated, header-ordered table — the field order IS the freeze
 //!
 //! This module mirrors `erts/emulator/beam/erl_nif_api_funcs.h` **entry for entry and in exact
-//! header order**: one `#[repr(C)]` field per `enif_*` entry of that file's function list. The
+//! header order**: one `#[repr(C)]` field per `enif_*` entry of that file's declaration list. The
 //! order is the compatibility contract (the header itself warns that new entries must be added at
-//! the bottom "to keep compatibility on Windows"), so a field may never be reordered or removed —
-//! only appended, at the end, in lockstep with the C header.
+//! the bottom "to keep compatibility on Windows"), so a field in this table tracks the header's
+//! declaration order exactly.
 //!
-//! # Which entries, and why
+//! # Deriving the LP64 field set: 185 → 180 → 176
 //!
-//! `erl_nif_api_funcs.h` defines the surface twice: once as `ERL_NIF_API_FUNC_DECL` (the C
-//! declaration list) and once as `ERL_NIF_API_FUNC_MACRO` (the same list, kept in the same order,
-//! used to build the `enif_*` macros / the Windows `WinDynNifCallbacks` table). Building the Rust
-//! table from the **macro list** is what yields the canonical, stable `ErlNifApi` shape used by the
-//! runtime and the sibling tests:
+//! The header's `ERL_NIF_API_FUNC_DECL` token *occurs* 185 times, but that is a raw token count:
+//! five of those occurrences are the file's own guard/comment lines (header lines 23, 28, 34, 235,
+//! 239), not declarations. The **actual declaration list therefore has 180 entries** (every line
+//! that begins with `ERL_NIF_API_FUNC_DECL(`).
 //!
-//! * the declaration list has **180** entries (the token `ERL_NIF_API_FUNC_DECL` *occurs* 185 times
-//!   in the file, but five of those are the file's own guard/comment lines, not declarations);
-//! * the macro list adds the single macro-only name `enif_ioq_enq`, which has no declaration
-//!   counterpart in current OTP — giving **181** entries;
-//! * the four `enif_*64` entries live inside `#if SIZEOF_LONG != 8`. On the supported LP64 targets
-//!   (`SIZEOF_LONG == 8`, `SIZEOF_VOID_P == 8`) they are `#define`d to their `long`/`ulong`
-//!   siblings; keeping their dedicated slots here preserves the table's alignment with the C list
-//!   (and with the Windows `TWinDynNifCallbacks` DAG) at zero ABI cost.
+//! Two further adjustments pin the table to the supported **LP64** target
+//! (`SIZEOF_LONG == 8`, `SIZEOF_VOID_P == 8`):
+//!
+//! * **remove the four `enif_*64` entries** (`enif_get_int64`, `enif_get_uint64`, `enif_make_int64`,
+//!   `enif_make_uint64`). They live inside `#if SIZEOF_LONG != 8` (header lines 135–140), so they
+//!   do **not exist on LP64** — there the header `#define`s each of them onto its `long`/`ulong`
+//!   sibling (header lines 669–674: `enif_get_int64` → `enif_get_long`, …). They are therefore not
+//!   separate table slots: **180 − 4 = 176**.
+//! * `enif_ioq_enq` is **excluded as well.** It appears only in the `ERL_NIF_API_FUNC_MACRO` list
+//!   (header line 398): it has no `ERL_NIF_API_FUNC_DECL` entry, no signature and no definition
+//!   anywhere in the tree — a vestigial macro, not a table slot.
+//!
+//! The result is the header-exact LP64 set of **176** fields, in exact `ERL_NIF_API_FUNC_DECL`
+//! order. (The macro list has 181 entries — the 180 declaration names plus the macro-only
+//! `enif_ioq_enq` — but it is only the *declaration* list that describes the runtime's actual
+//! `enif_*` surface.)
 //!
 //! Every field is `Option<unsafe extern "C" fn …>` — a C function pointer is null-pointer
 //! optimized, so each column is exactly one machine word (8 bytes on LP64) and an all-`None` table
 //! can be constructed safely ([`ErlNifApi::empty`]). `size_of::<ErlNifApi>()` is therefore
-//! `181 * 8 == 1448`, pinned by the compile-time assertion at the bottom of this file.
+//! `176 * 8 == 1408`, pinned by the compile-time assertion at the bottom of this file.
 //!
 //! The declared pointers are **never called** in this crate: the functions they name are
 //! implemented by the NIF subsystem (`beam_bifs` / `beam_rt` / `beam_io`) in a later pass. This is
@@ -48,7 +55,7 @@ use crate::nif::types::{
     ErlNifBinary, ErlNifCharEncoding, ErlNifCond, ErlNifEnv, ErlNifEvent, ErlNifHash, ErlNifIOQueue,
     ErlNifIOQueueOpts, ErlNifIOVec, ErlNifMapIterator, ErlNifMapIteratorEntry, ErlNifMonitor,
     ErlNifMutex, ErlNifOption, ErlNifPid, ErlNifPort, ErlNifResourceDtor, ErlNifResourceFlags,
-    ErlNifResourceType, ErlNifResourceTypeInit, ErlNifRWLock, ErlNifSInt64, ErlNifSysInfo,
+    ErlNifResourceType, ErlNifResourceTypeInit, ErlNifRWLock, ErlNifSysInfo,
     ErlNifTermType, ErlNifThreadOpts, ErlNifTid, ErlNifTime, ErlNifTimeUnit, ErlNifTSDKey,
     ErlNifUInt64, ErlNifUniqueInteger, VaListTag,
 };
@@ -56,10 +63,10 @@ use libc::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_ulong, c_void, si
 
 /// `ErlNifApi` — the frozen table of `enif_*` functions the runtime provides to a NIF library.
 ///
-/// One `#[repr(C)]` field per entry of `erl_nif_api_funcs.h`, in exact header order; every field is
-/// `Option<unsafe extern "C" fn …>` (the C function pointer, null-optimized). The field count is
-/// pinned by the compile-time assertion at the bottom of this file
-/// ([`ERL_NIF_API_FIELD_COUNT`] `== 181`, i.e. `1448` bytes on LP64).
+/// One `#[repr(C)]` field per entry of `erl_nif_api_funcs.h`'s declaration list that exists on LP64,
+/// in exact header order; every field is `Option<unsafe extern "C" fn …>` (the C function pointer,
+/// null-optimized). The field count is pinned by the compile-time assertion at the bottom of this
+/// file ([`ERL_NIF_API_FIELD_COUNT`] `== 176`, i.e. `1408` bytes on LP64).
 ///
 /// Use [`ErlNifApi::empty`] to build an all-`None` table (e.g. for tests, or for a runtime that has
 /// not yet wired up a function).
@@ -336,19 +343,6 @@ pub struct ErlNifApi {
     pub enif_make_resource_binary: Option<
         unsafe extern "C" fn(*mut ErlNifEnv, *mut c_void, *const c_void, size_t) -> ERL_NIF_TERM,
     >,
-    /// `int enif_get_int64(ErlNifEnv*, ERL_NIF_TERM term, ErlNifSInt64* ip);`
-    ///
-    /// `#if SIZEOF_LONG != 8` in the header; on LP64 it is the `enif_get_long` macro alias, but the
-    /// dedicated slot is kept so the table matches the C list.
-    pub enif_get_int64:
-        Option<unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ErlNifSInt64) -> c_int>,
-    /// `int enif_get_uint64(ErlNifEnv*, ERL_NIF_TERM term, ErlNifUInt64* ip);` (see `enif_get_int64`).
-    pub enif_get_uint64:
-        Option<unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ErlNifUInt64) -> c_int>,
-    /// `ERL_NIF_TERM enif_make_int64(ErlNifEnv*, ErlNifSInt64);` (see `enif_get_int64`).
-    pub enif_make_int64: Option<unsafe extern "C" fn(*mut ErlNifEnv, ErlNifSInt64) -> ERL_NIF_TERM>,
-    /// `ERL_NIF_TERM enif_make_uint64(ErlNifEnv*, ErlNifUInt64);` (see `enif_get_int64`).
-    pub enif_make_uint64: Option<unsafe extern "C" fn(*mut ErlNifEnv, ErlNifUInt64) -> ERL_NIF_TERM>,
     /// `int enif_is_exception(ErlNifEnv*, ERL_NIF_TERM term);`
     pub enif_is_exception: Option<unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM) -> c_int>,
     /// `int enif_make_reverse_list(ErlNifEnv*, ERL_NIF_TERM term, ERL_NIF_TERM *list);`
@@ -545,13 +539,6 @@ pub struct ErlNifApi {
     pub enif_ioq_create: Option<unsafe extern "C" fn(ErlNifIOQueueOpts) -> *mut ErlNifIOQueue>,
     /// `void enif_ioq_destroy(ErlNifIOQueue *q);`
     pub enif_ioq_destroy: Option<unsafe extern "C" fn(*mut ErlNifIOQueue)>,
-    /// `int enif_ioq_enq(ErlNifIOQueue *q, ERL_NIF_TERM iovec, size_t skip);`
-    ///
-    /// This name appears only in the header's `ERL_NIF_API_FUNC_MACRO` list (it has no
-    /// `ERL_NIF_API_FUNC_DECL` counterpart in current OTP and no C definition), so the signature is
-    /// the historical inline form: enqueue the I/O vector described by the `iovec` term.
-    pub enif_ioq_enq:
-        Option<unsafe extern "C" fn(*mut ErlNifIOQueue, ERL_NIF_TERM, size_t) -> c_int>,
     /// `int enif_ioq_enq_binary(ErlNifIOQueue *q, ErlNifBinary *bin, size_t skip);`
     pub enif_ioq_enq_binary:
         Option<unsafe extern "C" fn(*mut ErlNifIOQueue, *mut ErlNifBinary, size_t) -> c_int>,
@@ -782,10 +769,6 @@ impl ErlNifApi {
             enif_get_local_pid: None,
             enif_keep_resource: None,
             enif_make_resource_binary: None,
-            enif_get_int64: None,
-            enif_get_uint64: None,
-            enif_make_int64: None,
-            enif_make_uint64: None,
             enif_is_exception: None,
             enif_make_reverse_list: None,
             enif_is_number: None,
@@ -835,7 +818,6 @@ impl ErlNifApi {
             enif_whereis_port: None,
             enif_ioq_create: None,
             enif_ioq_destroy: None,
-            enif_ioq_enq: None,
             enif_ioq_enq_binary: None,
             enif_ioq_enqv: None,
             enif_ioq_size: None,
@@ -874,12 +856,13 @@ impl ErlNifApi {
 // ---------------------------------------------------------------------------------------------
 
 /// The exact number of function-pointer fields in [`ErlNifApi`], i.e. the number of `enif_*`
-/// functions in the `erl_nif_api_funcs.h` table (the `ERL_NIF_API_FUNC_MACRO` list — the
-/// declaration list's 180 entries plus the macro-only `enif_ioq_enq`).
+/// entries of `erl_nif_api_funcs.h`'s declaration list that exist on LP64 (180 declaration entries
+/// minus the four `#if SIZEOF_LONG != 8` `enif_*64` entries; the macro-only `enif_ioq_enq` is
+/// excluded).
 ///
 /// Exposed so dependent code and the sibling `tests/api_surface.rs` can assert the table shape
 /// without re-deriving it.
-pub const ERL_NIF_API_FIELD_COUNT: usize = 181;
+pub const ERL_NIF_API_FIELD_COUNT: usize = 176;
 
 const _: () = {
     // Every column is one pointer, so the table is exactly N machine words on LP64.
@@ -887,8 +870,8 @@ const _: () = {
         core::mem::size_of::<ErlNifApi>()
             == ERL_NIF_API_FIELD_COUNT * core::mem::size_of::<usize>()
     );
-    assert!(core::mem::size_of::<ErlNifApi>() == 181 * 8);
-    assert!(core::mem::size_of::<ErlNifApi>() == 1448);
+    assert!(core::mem::size_of::<ErlNifApi>() == 176 * 8);
+    assert!(core::mem::size_of::<ErlNifApi>() == 1408);
     assert!(core::mem::align_of::<ErlNifApi>() == 8);
 };
 
@@ -898,12 +881,12 @@ mod tests {
 
     #[test]
     fn table_shape_matches_the_field_count() {
-        assert_eq!(ERL_NIF_API_FIELD_COUNT, 181);
+        assert_eq!(ERL_NIF_API_FIELD_COUNT, 176);
         assert_eq!(
             core::mem::size_of::<ErlNifApi>(),
             ERL_NIF_API_FIELD_COUNT * core::mem::size_of::<usize>()
         );
-        assert_eq!(core::mem::size_of::<ErlNifApi>(), 1448);
+        assert_eq!(core::mem::size_of::<ErlNifApi>(), 1408);
         assert_eq!(core::mem::align_of::<ErlNifApi>(), 8);
     }
 
@@ -919,13 +902,14 @@ mod tests {
         assert!(copy.enif_select.is_none());
         assert!(copy.enif_set_option.is_none());
         assert!(copy.enif_max_atom_cache_index.is_none());
-        assert_eq!(core::mem::size_of_val(&api), 1448);
+        assert_eq!(core::mem::size_of_val(&api), 1408);
     }
 
     #[test]
     fn first_and_last_fields_are_the_header_anchors() {
-        // The header's first entry is `enif_priv_data` and its last is `enif_max_atom_cache_index`;
-        // a reordering or truncation of the table would move them (the field order IS the freeze).
+        // The header's first declaration entry is `enif_priv_data` and its last is
+        // `enif_max_atom_cache_index`; a reordering or truncation of the table would move them (the
+        // field order IS the freeze).
         let api = ErlNifApi::empty();
         assert_eq!(
             core::mem::offset_of!(ErlNifApi, enif_priv_data),
@@ -933,7 +917,7 @@ mod tests {
         );
         assert_eq!(
             core::mem::offset_of!(ErlNifApi, enif_max_atom_cache_index),
-            180 * core::mem::size_of::<usize>()
+            175 * core::mem::size_of::<usize>()
         );
         assert!(api.enif_priv_data.is_none());
     }

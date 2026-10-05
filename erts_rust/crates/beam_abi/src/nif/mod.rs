@@ -6,7 +6,7 @@
 //!
 //! - [`term`] — `ERL_NIF_TERM` and the safe `Eterm <=> ERL_NIF_TERM` transmute seam.
 //! - [`types`] — the `#[repr(C)]` `ErlNif*` structs/enums/flags and function-type aliases.
-//! - [`api`] — `ErlNifApi`, the frozen `enif_*` function-pointer table (181 entries on LP64).
+//! - [`api`] — `ErlNifApi`, the frozen `enif_*` function-pointer table (176 entries on LP64).
 
 pub mod api;
 pub mod term;
