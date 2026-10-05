@@ -38,7 +38,8 @@
 //! [`BeamError::SystemLimit`]. No function panics on runtime data.
 
 use beam_common::{BeamError, Result};
-use beam_term::{thing, Eterm};
+use beam_loader::Module;
+use beam_term::{make_atom, thing, Eterm};
 
 use crate::context::ExecutionContext;
 
@@ -104,33 +105,61 @@ pub fn make_tuple(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Ete
     Ok(beam_term::make_tuple(root))
 }
 
-/// Builds a proper list term from `elems`.
+/// Builds a single cons cell `[Head | Tail]`.
 ///
-/// Allocates two words per element (a header-less `[CAR, CDR]` cons cell tagged
-/// `TAG_PRIMARY_LIST` via [`make_list`](beam_term::make_list)) and links them
-/// front-to-back, the last `CDR` being [`NIL`](beam_term::NIL). An empty slice
-/// returns `NIL`.
-pub fn make_list(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Eterm> {
-    if elems.is_empty() {
-        return Ok(beam_term::NIL);
-    }
-    let n = elems.len();
-    let hp = ctx.alloc_words(2 * n)?;
-    // SAFETY: `alloc_words` returned `2n` exclusively-owned, writable words — one
-    // `[CAR, CDR]` cell per element. Cell `i` lives at `hp + 2i`, its `CAR` is the
-    // element and its `CDR` is the next cell (tagged) or `NIL`.
+/// Allocates two words and writes the header-less `[CAR, CDR]` cell tagged
+/// `TAG_PRIMARY_LIST` (via [`make_list`](beam_term::make_list)) — exactly the
+/// `put_list` layout of `emu/instrs.tab:732-737` (`HTOP[0] = $Hd; HTOP[1] = $Tl;
+/// $Dst = make_list(HTOP)`). `tail` need **not** be a list: `[H | T]` with an
+/// improper `T` is a legal Erlang term, so no shape check is performed here.
+pub fn make_cons(ctx: &mut dyn ExecutionContext, head: Eterm, tail: Eterm) -> Result<Eterm> {
+    let hp = ctx.alloc_words(2)?;
+    // SAFETY: `alloc_words` returned 2 exclusively-owned, writable words — one
+    // `[CAR, CDR]` cell; `make_list` tags the pointer as a list term.
     unsafe {
-        for (i, elem) in elems.iter().enumerate() {
-            let cell = hp.add(2 * i);
-            *cell = *elem;
-            *cell.add(1) = if i + 1 < n {
-                beam_term::make_list(hp.add(2 * (i + 1)))
-            } else {
-                beam_term::NIL
-            };
-        }
+        *hp = head;
+        *hp.add(1) = tail;
     }
     Ok(beam_term::make_list(hp))
+}
+
+/// Builds a proper list term from `elems`.
+///
+/// One `[CAR, CDR]` cell per element, linked front-to-back by [`make_cons`], the
+/// final `CDR` being [`NIL`](beam_term::NIL). An empty slice returns `NIL`. The
+/// cells are individually allocated — the C `make_list` allocates `2n` contiguous
+/// words, but contiguity is *not* part of the frozen term layout, so building on
+/// [`make_cons`] is equivalent.
+pub fn make_list(ctx: &mut dyn ExecutionContext, elems: &[Eterm]) -> Result<Eterm> {
+    let mut list = beam_term::NIL;
+    for elem in elems.iter().rev() {
+        list = make_cons(ctx, *elem, list)?;
+    }
+    Ok(list)
+}
+
+/// The `{badmatch, Value}` exception reason (class `error`) for a failed
+/// tuple/list match.
+///
+/// ERTS tags the reason with the **global** atom `badmatch` (`am_badmatch`,
+/// `beam_common.c:388`; the C `badmatch`/`get_*` opcodes store `freason = BADMATCH`
+/// and the tag is materialized during error handling). This engine's atoms are
+/// **module-local** indices (the frozen term model, `../CONTEXT.md` §2), so the tag
+/// is resolved through `module`'s atom table — the only table whose indices the
+/// loaded code compares against. The Erlang compiler never interns `badmatch` (the
+/// raising opcode uses the C global constant), so a real module normally lacks it;
+/// minting an arbitrary atom index there would be a *wrong result*, so this returns
+/// the canonical typed [`BeamError::BadMatch`] instead.
+pub fn badmatch_reason(
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    value: Eterm,
+) -> Result<Eterm> {
+    let tag = module
+        .atom_table
+        .lookup("badmatch")
+        .ok_or(BeamError::BadMatch)?;
+    make_tuple(ctx, &[make_atom(tag), value])
 }
 
 /// Builds a float term from `value`.
@@ -580,6 +609,83 @@ mod tests {
             assert_eq!(*beam_term::list_val(l), make_small(7));
             assert_eq!(*beam_term::list_val(l).add(1), NIL);
         }
+    }
+
+    // -- cons (`put_list`) ----------------------------------------------------
+
+    #[test]
+    fn cons_round_trips_through_the_ctx() {
+        let mut c = ctx();
+        let (h, t) = (make_small(1), make_small(2));
+        let cell = make_cons(&mut c, h, t).unwrap();
+        assert!(beam_term::is_list(cell));
+        assert_eq!(cons_head(cell).unwrap(), h);
+        assert_eq!(cons_tail(cell).unwrap(), t);
+        // SAFETY: `cell` is the live 2-word cons cell the arena owns.
+        unsafe {
+            assert_eq!(*beam_term::list_val(cell), h);
+            assert_eq!(*beam_term::list_val(cell).add(1), t);
+        }
+    }
+
+    #[test]
+    fn cons_accepts_a_proper_nil_tail() {
+        let mut c = ctx();
+        let cell = make_cons(&mut c, make_small(1), NIL).unwrap();
+        assert_eq!(cons_tail(cell).unwrap(), NIL);
+        assert_eq!(list_elements(cell).unwrap(), vec![make_small(1)]);
+    }
+
+    #[test]
+    fn cons_allows_an_improper_tail() {
+        // `[1 | 2]` is a legal Erlang term; `list_elements` rejects it, but the
+        // cell itself reads fine (this is what `put_list` must build).
+        let mut c = ctx();
+        let cell = make_cons(&mut c, make_small(1), make_small(2)).unwrap();
+        assert_eq!(cons_head(cell).unwrap(), make_small(1));
+        assert_eq!(cons_tail(cell).unwrap(), make_small(2));
+        assert_bad_arg(list_elements(cell));
+    }
+
+    #[test]
+    fn make_list_builds_from_cons_cells() {
+        // `make_list` is now a fold over `make_cons`; the proper-list shape and
+        // element order must be unchanged.
+        let mut c = ctx();
+        let elems = [make_small(10), make_small(20), make_small(30)];
+        let l = make_list(&mut c, &elems).unwrap();
+        let mut cursor = l;
+        for elem in elems {
+            assert_eq!(cons_head(cursor).unwrap(), elem);
+            cursor = cons_tail(cursor).unwrap();
+        }
+        assert_eq!(cursor, NIL);
+    }
+
+    // -- badmatch reason ------------------------------------------------------
+
+    #[test]
+    fn badmatch_reason_is_a_tagged_tuple_when_the_atom_is_interned() {
+        let mut c = ctx();
+        let mut module = Module::default();
+        let tag = module.atom_table.intern("badmatch");
+        let value = make_small(42);
+        let reason = badmatch_reason(&mut c, &module, value).unwrap();
+        assert_eq!(tuple_arity(reason).unwrap(), 2);
+        assert_eq!(tuple_element(reason, 0).unwrap(), make_atom(tag));
+        assert_eq!(tuple_element(reason, 1).unwrap(), value);
+    }
+
+    #[test]
+    fn badmatch_reason_is_a_typed_error_without_the_atom() {
+        // `Module::default()` interns nothing, so `badmatch` cannot be
+        // materialized: the canonical typed error, never a wrong atom.
+        let mut c = ctx();
+        let module = Module::default();
+        assert!(matches!(
+            badmatch_reason(&mut c, &module, make_small(1)),
+            Err(BeamError::BadMatch)
+        ));
     }
 
     // -- floats ---------------------------------------------------------------
