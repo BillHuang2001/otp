@@ -200,9 +200,10 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   are treated as permanent and left verbatim.
 - **A.6 runtime heap options** (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the CLI
   surface (owned by `beam_rt`).
-- **`OffHeap` automatic integration with the collector's reachability** — the sweep is exposed as
-  `OffHeap::sweep(is_live)`; the caller supplies the liveness test (the on-heap handle kind is the
-  binary/ABI layer's concern).
+- **`OffHeap` reachability is caller-driven, not integrated with the collector.** `OffHeap` holds both MSO
+  and refc-binary entries, but `OffHeap::sweep(is_live)` only applies the caller's predicate — determining
+  WHICH on-heap reference (a `BinRef` word, a fun magic ref, a sub-binary pointer) makes a registered
+  off-heap object live is `beam_process`'s concern (Stage 5), not the collector's.
 - **Sizing oracle gap (upstream, `beam_term::size::size_object`).** It gates its hashmap branch on
   `is_hashmap_header`, which only matches the two *head* node types, so an inner `HAMT_NODE_BITMAP`
   node (and everything under it) is not counted — `size_object` of a 500-key map reports `4`. It also
