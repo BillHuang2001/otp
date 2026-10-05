@@ -200,25 +200,24 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   engine's concern.
 
 ## Test Strategy
-- **Fixture (required):** `tests/fixtures/slice.beam` compiled from the checked-in
+- **Fixture:** `tests/fixtures/slice.beam` (828 bytes) compiled from the checked-in
   `tests/fixtures/slice.erl` with the system `erlc`; `tests/fixtures/README.md` documents the exact
-  regeneration command and the wire byte-summary. `slice.erl` exports `add/2`, `fib/1` and covers the
-  required opcode subset: `label, line, func_info, move, gc_bif2, is_eq_exact, swap, call_only,
-  call_ext_only, return, int_code_end` plus `tr` typed registers.
-- **Ground truth captured once** (verified with `beam_disasm:file/1` + a byte decode of the oracle
-  fixture) — the loader tests assert the disassembled IR for `add/2` and `fib/1` **matches this
-  instruction sequence exactly**:
-  - `add/2`: `label(1) line(1) func_info(slice,add,2) label(2) gc_bif2{bif=import0('+'/2),fail=0,live=2,args=[x0,x1],dst=x0} return`
-  - `fib/1` entry (`func_label=3, entry_label=4`): `label(3) line(2) func_info(slice,fib,1) label(4) move(1,x2) move(0,x1) call_only(3,label6)`
-  - `fib/3` (`func_label=5, entry_label=6`): `label(5) line(3) func_info(slice,fib,3) label(6) is_eq_exact{fail=7,args=[x0,0]} move(x1,x0) return label(7) line(4) gc_bif2{bif=import1('-'),fail=0,live=3,args=[x0,1],dst=x0} gc_bif2{bif=import0('+'),fail=0,live=3,args=[Typed{x,1,ty1},Typed{x,2,ty2}],dst=x1} swap(x1,x2) call_only(3,label6)`
-  - `module_info/0` (`func_label=8,entry_label=9`): `move(atom slice, x0) call_ext_only(1, import2{erlang,get_module_info,1})`
-  - atoms (wire order): `[NIL, slice, add, erlang, '+', fib, '-', module_info, get_module_info]`;
-    imports: `[{erlang,'+',2},{erlang,'-',2},{erlang,get_module_info,1},{erlang,get_module_info,2}]`;
-    exports: `[{add,2,label2},{fib,1,label4},{module_info,0,label9},{module_info,1,label11}]`.
-- **Container tests:** parse the fixture and assert the chunk list, the `Code` header
-  (`format_number=0`), atoms/exports/imports as above.
-- **IR tests:** the instruction sequence above; label→index maps; block decomposition; `Export.label`
-  == `Function.entry_label`.
+  regeneration command and the full wire summary (chunk order/sizes, atoms, exports/imports, and the
+  `Code`/`Line`/`Type` headers). `slice.erl` exports `add/2`, `fib/1`, `pick/1` and defines six functions
+  (`add/2 fib/1 fib/3 pick/1 module_info/0 module_info/1`) covering the M1 opcode subset (`label, line,
+  func_info, move, gc_bif2, is_eq_exact, swap, call_only, call_ext_only, return, int_code_end`) plus
+  `z,5` `tr` typed registers.
+- **Ground truth is derived, never guessed:** `beam_disasm:file("tests/fixtures/slice.beam")` plus a byte
+  decode; if a fixture byte changes, re-derive the expected IR.
+- **`tests/container.rs`:** the chunk directory (ids/sizes in file order), the `AtU8` atoms, the
+  `ExpT`/`ImpT` tables (file order preserved), the `Code` header `(0, 181, 15, 6)`, and the `Line`/`Type`
+  tables.
+- **`tests/ir.rs`:** the complete per-function instruction stream for all six functions, the
+  `func_label`/`entry_label` pairs, `export/2` → entry label, and the label→index / block decomposition.
+- **`tests/negative.rs`:** truncated header, bad `"FOR1"`, bad form type, `format_number != 0`, a chunk
+  size overrunning the file, an unknown/out-of-range opcode byte, an out-of-range atom index and a
+  truncated operand ⇒ each a typed `BeamError` (no panic).
+- Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Negative tests:** truncated header, bad `"FOR1"` magic, bad form type, `format_number != 0`,
   chunk size that overruns the file, unknown opcode tag, out-of-range atom/label index, truncated
   operand varint, `z` sub-tag `0`/unknown, compressed `LitT` ⇒ each a typed `BeamError` (no panic).
