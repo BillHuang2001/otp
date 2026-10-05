@@ -54,21 +54,42 @@
 //!
 //! # Fragmented header (`'E'`/`'F'`)
 //!
-//! The fragment tags [`DIST_FRAG_HEADER`] (`'E'`, which extends the normal header
-//! with an 8-byte sequence id and an 8-byte fragment count before
-//! `NumberOfAtomCacheRefs`) and [`DIST_FRAG_CONT`] (`'F'` + sequence id + fragment
-//! index) are **recognised** through [`DistFragment`] but their assembly is out of
-//! scope for this milestone (see the crate `CONTEXT.md`, "Known Issues").
+//! A fragmented message's first frame extends the normal header with an 8-byte
+//! `SequenceId` and an 8-byte fragment count (`FragmentId`) **before**
+//! `NumberOfAtomCacheRefs`:
+//!
+//! ```text
+//! byte   131            VERSION_MAGIC
+//! byte   69 ('E')       DIST_FRAG_HEADER
+//! bytes  SequenceId     8 bytes, big-endian
+//! bytes  FragmentId     8 bytes, big-endian (the total fragment count)
+//! bytes  <header tail>  identical to the tail of a normal `'D'` header:
+//!                       NumberOfAtomCacheRefs + Flags + AtomCacheRefs
+//! ```
+//!
+//! There is **no** separate `dist_hdr_flags` byte on the wire: `external.c`
+//! `erts_encode_ext_dist_header_finalize` folds the `LongAtoms` flag into the
+//! `Flags` half-bytes, and the receiver (`erts_prepare_dist_ext`) reads
+//! `NumberOfAtomCacheRefs` immediately after the 16-byte fragment prefix. The tail
+//! is therefore byte-identical to a `'D'` tail, which is why [`DistHeader::decode_tail`]
+//! is shared by both. [`decode_fragmented_header`] parses a complete `'E'` frame
+//! (prefix + tail) and reports where its payload begins.
+//!
+//! The `'F'` continuation (`VERSION_MAGIC + 'F'` + sequence id + fragment id) has
+//! **no** tail at all; its codec and the sender-side splitting / receiver-side
+//! reassembly live in [`crate::fragment`]. The tags are also recognised here
+//! through [`DistFragment`].
 //!
 //! Ground truth (read, never modified): `erts/emulator/beam/external.c`
-//! (`erts_encode_ext_dist_header_setup`/`_finalize`, `erts_prepare_dist_ext`),
-//! `erts/emulator/beam/external.h` and the
+//! (`erts_encode_ext_dist_header_setup`/`_fragment`/`_finalize`,
+//! `erts_prepare_dist_ext`), `erts/emulator/beam/external.h` and the
 //! `erts/doc/guides/erl_ext_dist.md` guide.
 
 use beam_codec::AtomEncoding;
 use beam_common::{BeamError, Result};
 use beam_term::{Atom, AtomTable};
 
+use crate::fragment::{FragmentHeader, DIST_FRAGMENT_HEADER_SIZE};
 use crate::transport::Write;
 
 /// `DIST_HEADER` (`'D'`, 68): the normal distribution-header tag.
@@ -78,11 +99,13 @@ use crate::transport::Write;
 pub const DIST_HEADER: u8 = beam_codec::DIST_HEADER_EXT;
 /// `DIST_FRAG_HEADER` (`'E'`, 69): the first fragment of a fragmented message.
 ///
-/// Recognised, but fragment assembly is not implemented in this milestone.
+/// Wire shape: `VERSION_MAGIC + 'E' + SequenceId(8) + FragmentId(8)` followed by
+/// the normal header tail; see [`decode_fragmented_header`].
 pub const DIST_FRAG_HEADER: u8 = 69;
 /// `DIST_FRAG_CONT` (`'F'`, 70): a continuation fragment of a fragmented message.
 ///
-/// Recognised, but fragment assembly is not implemented in this milestone.
+/// Wire shape: `VERSION_MAGIC + 'F' + SequenceId(8) + FragmentId(8)` followed by
+/// the raw payload chunk; see [`crate::fragment::FragmentCont`].
 pub const DIST_FRAG_CONT: u8 = 70;
 
 /// `ERTS_MAX_INTERNAL_ATOM_CACHE_ENTRIES` (`erts/emulator/beam/external.h:120`):
@@ -257,37 +280,63 @@ impl DistHeader {
         atoms: &mut AtomTable,
         encoding: AtomEncoding,
     ) -> Result<DistHeader> {
-        // `VERSION_MAGIC + 'D' + N`
-        if body.len() < 3 || body[0] != beam_codec::VERSION_MAGIC || body[1] != DIST_HEADER {
+        // `VERSION_MAGIC + 'D'`
+        if body.len() < 2 || body[0] != beam_codec::VERSION_MAGIC || body[1] != DIST_HEADER {
             return Err(BeamError::BadArg);
         }
-        let n = usize::from(body[2]);
+        let (header, _end) = DistHeader::decode_tail(body, 2, atoms, encoding)?;
+        Ok(header)
+    }
+
+    /// Decodes the distribution-header **tail** — `NumberOfAtomCacheRefs(1 byte)
+    /// + Flags + AtomCacheRefs` — beginning at `body[offset]`.
+    ///
+    /// This is the tail shared by the normal `'D'` header (where it starts at
+    /// offset 2) and the `'E'` fragment header (where it starts at offset
+    /// [`DIST_FRAGMENT_HEADER_SIZE`]); [`decode_fragmented_header`] uses it for the
+    /// latter. Returns the decoded header and the offset just past the tail, where
+    /// the control message / payload of the packet begins.
+    ///
+    /// `atoms` interns the `AtomText` of every [`AtomCacheRef::New`] and
+    /// `encoding` selects how those bytes are rendered. Bytes after the tail are
+    /// left to the caller.
+    ///
+    /// Errors: a missing/short `NumberOfAtomCacheRefs`/`Flags`/ref field, or
+    /// malformed UTF-8 atom text, yields `BeamError::BadArg`.
+    pub fn decode_tail(
+        body: &[u8],
+        offset: usize,
+        atoms: &mut AtomTable,
+        encoding: AtomEncoding,
+    ) -> Result<(DistHeader, usize)> {
+        let n = usize::from(*body.get(offset).ok_or(BeamError::BadArg)?);
+        let pos = offset + 1;
         if n == 0 {
-            return Ok(DistHeader::empty());
+            return Ok((DistHeader::empty(), pos));
         }
 
         // The dynamic flag field: `N/2 + 1` bytes.
         let flags_bytes = n / 2 + 1;
-        let flags_end = 3usize.checked_add(flags_bytes).ok_or(BeamError::BadArg)?;
+        let flags_end = pos.checked_add(flags_bytes).ok_or(BeamError::BadArg)?;
         if body.len() < flags_end {
             return Err(BeamError::BadArg);
         }
-        let flags = &body[3..flags_end];
+        let flags = &body[pos..flags_end];
 
         // The extra `LongAtoms` half-byte: low nibble of byte `N/2` when N is
         // even, high nibble of byte `N/2` when N is odd.
         let long_half = if n % 2 == 0 { flags[n / 2] & 0x0F } else { flags[n / 2] >> 4 };
         let long_atoms = long_half & 0x1 != 0;
 
-        let mut pos = flags_end;
+        let mut p = flags_end;
         let mut refs = Vec::with_capacity(n);
         for i in 0..n {
             let half = if i % 2 == 0 { flags[i / 2] & 0x0F } else { flags[i / 2] >> 4 };
             let segment = half & 0x7;
             let is_new = half & 0x8 != 0;
 
-            let index = *body.get(pos).ok_or(BeamError::BadArg)?;
-            pos += 1;
+            let index = *body.get(p).ok_or(BeamError::BadArg)?;
+            p += 1;
 
             if !is_new {
                 refs.push(AtomCacheRef::Cached { segment, index });
@@ -295,26 +344,26 @@ impl DistHeader {
             }
 
             let len = if long_atoms {
-                let hi = *body.get(pos).ok_or(BeamError::BadArg)?;
-                let lo = *body.get(pos + 1).ok_or(BeamError::BadArg)?;
-                pos += 2;
+                let hi = *body.get(p).ok_or(BeamError::BadArg)?;
+                let lo = *body.get(p + 1).ok_or(BeamError::BadArg)?;
+                p += 2;
                 usize::from(u16::from_be_bytes([hi, lo]))
             } else {
-                let len = usize::from(*body.get(pos).ok_or(BeamError::BadArg)?);
-                pos += 1;
+                let len = usize::from(*body.get(p).ok_or(BeamError::BadArg)?);
+                p += 1;
                 len
             };
 
-            let text_end = pos.checked_add(len).ok_or(BeamError::BadArg)?;
-            let text = body.get(pos..text_end).ok_or(BeamError::BadArg)?;
-            pos = text_end;
+            let text_end = p.checked_add(len).ok_or(BeamError::BadArg)?;
+            let text = body.get(p..text_end).ok_or(BeamError::BadArg)?;
+            p = text_end;
 
             let name = decode_atom_text(text, encoding)?;
             let atom = atoms.intern(&name);
             refs.push(AtomCacheRef::New { segment, index, atom });
         }
 
-        Ok(DistHeader { refs, long_atoms })
+        Ok((DistHeader { refs, long_atoms }, p))
     }
 }
 
@@ -356,9 +405,9 @@ fn decode_atom_text(text: &[u8], encoding: AtomEncoding) -> Result<String> {
 
 /// The kind of a distribution fragment, recognised from its tag byte (`'E'`/`'F'`).
 ///
-/// Fragment reassembly (the extended header on `'E'` and the continuation frames
-/// on `'F'`) is out of this milestone's scope (see the crate `CONTEXT.md`,
-/// "Known Issues"); this only recognises the tags.
+/// The tag also selects which codec parses the frame: [`decode_fragmented_header`]
+/// for `'E'`, and [`crate::fragment::FragmentCont::decode`] for `'F'`. This enum
+/// only names the tag byte.
 #[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
 pub enum DistFragment {
     /// `'E'` — the first fragment, carrying the fragment header.
@@ -376,6 +425,45 @@ impl DistFragment {
             _ => None,
         }
     }
+}
+
+/// A decoded `'E'` fragment-header frame: the fragment prefix, the distribution
+/// header tail it carries, and where this fragment's payload begins.
+///
+/// Produced by [`decode_fragmented_header`].
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct FragmentedHeader {
+    /// The `'E'` prefix: the sequence id and the total fragment count.
+    pub fragment: FragmentHeader,
+    /// The distribution-header tail (`NumberOfAtomCacheRefs + Flags +
+    /// AtomCacheRefs`), identical in shape to a `'D'` header's tail.
+    pub header: DistHeader,
+    /// The offset of this fragment's payload within the packet body — just past
+    /// the atom-cache tail.
+    pub payload_offset: usize,
+}
+
+/// Decodes an `'E'` fragment-header frame from the start of `body`.
+///
+/// Layout: `VERSION_MAGIC + 'E' + SequenceId(8, big-endian) + FragmentId(8,
+/// big-endian) + <the normal header tail>`. The tail is parsed by
+/// [`DistHeader::decode_tail`], so the `'D'` and `'E'` codecs share one
+/// implementation of the `NumberOfAtomCacheRefs`/`Flags`/`AtomCacheRefs` format.
+///
+/// The returned [`FragmentedHeader::payload_offset`] is the index of the first
+/// payload byte of this fragment within `body`.
+///
+/// Errors: a body that is too short, does not start with `VERSION_MAGIC` + `'E'`,
+/// or whose tail is malformed, yields `BeamError::BadArg`.
+pub fn decode_fragmented_header(
+    body: &[u8],
+    atoms: &mut AtomTable,
+    encoding: AtomEncoding,
+) -> Result<FragmentedHeader> {
+    let fragment = FragmentHeader::decode(body)?;
+    let (header, payload_offset) =
+        DistHeader::decode_tail(body, DIST_FRAGMENT_HEADER_SIZE, atoms, encoding)?;
+    Ok(FragmentedHeader { fragment, header, payload_offset })
 }
 
 #[cfg(test)]
@@ -766,5 +854,111 @@ mod tests {
         assert_eq!(new.segment(), 6);
         assert_eq!(new.index(), 0x2A);
         assert!(new.is_new());
+    }
+
+    #[test]
+    fn decode_tail_matches_decode_for_a_normal_header() {
+        // For a `'D'` body the tail starts at offset 2.
+        let (atoms, handles) = table_with(&["x"]);
+        let h = DistHeader {
+            refs: vec![AtomCacheRef::New { segment: 1, index: 9, atom: handles[0] }],
+            long_atoms: false,
+        };
+        let body = encode(&h, &atoms, AtomEncoding::Utf8);
+        let mut tail_atoms = AtomTable::new();
+        let (decoded, end) =
+            DistHeader::decode_tail(&body, 2, &mut tail_atoms, AtomEncoding::Utf8)
+                .expect("valid tail");
+        assert_eq!(decoded, h);
+        // `[131, 'D', N, flags, index, len, 'x']` -> the tail ends at byte 7.
+        assert_eq!(end, body.len());
+    }
+
+    #[test]
+    fn decode_tail_reads_the_empty_tail() {
+        let mut atoms = AtomTable::new();
+        let (header, end) = DistHeader::decode_tail(&[0, 0xFF], 0, &mut atoms, AtomEncoding::Utf8)
+            .expect("N = 0 tail");
+        assert_eq!(header, DistHeader::empty());
+        assert_eq!(end, 1);
+        // An out-of-range offset is a short body.
+        assert!(bad_arg(DistHeader::decode_tail(&[0], 5, &mut atoms, AtomEncoding::Utf8)));
+    }
+
+    #[test]
+    fn decode_fragmented_header_is_byte_exact_with_the_guide_example() {
+        // The worked example from `erl_ext_dist.md` §"Distribution Header for
+        // fragmented messages", decoded through the shared tail logic: the first
+        // 5 atom cache refs (`reg`, `call`, `set_get_state`, two cached).
+        let body = [
+            131, 69, // VERSION_MAGIC 'E'
+            0, 0, 2, 168, 0, 0, 5, 83, // SequenceId(8)
+            0, 0, 0, 0, 0, 0, 0, 2, // FragmentId(8) = 2
+            5, 4, 137, 9, // NumberOfAtomCacheRefs = 5, 3 flags bytes
+            10, 5, // two CachedAtomRefs
+            236, 3, 114, 101, 103, // NewAtomCacheRef 'reg'
+            9, 4, 99, 97, 108, 108, // NewAtomCacheRef 'call'
+            238, 13, 115, 101, 116, 95, 103, 101, 116, 95, 115, 116, 97, 116, 101, // 'set_get_state'
+            104, 4, 97, 6, // control message follows the header tail
+        ];
+        let mut atoms = AtomTable::new();
+        let frame = decode_fragmented_header(&body, &mut atoms, AtomEncoding::Utf8)
+            .expect("valid `'E'` frame");
+        assert_eq!(frame.fragment.seq_id, 0x0000_02A8_0000_0553);
+        assert_eq!(frame.fragment.fragment_count, 2);
+        assert!(!frame.header.long_atoms);
+        assert_eq!(frame.header.refs.len(), 5);
+        // Flag bytes `4, 137, 9` -> half-bytes (low nibble of even refs, high
+        // nibble of odd refs) `0100, 0000, 1001, 1000, 1001`: refs 0 & 1 are
+        // cached (MSB 0, segments 4 and 0), refs 2/3/4 are new (segments 1, 0, 1).
+        assert_eq!(frame.header.refs[0], AtomCacheRef::Cached { segment: 4, index: 10 });
+        assert_eq!(frame.header.refs[1], AtomCacheRef::Cached { segment: 0, index: 5 });
+        let name_of = |r: &AtomCacheRef| match r {
+            AtomCacheRef::New { atom, .. } => atoms.name(*atom).map(str::to_string),
+            AtomCacheRef::Cached { .. } => None,
+        };
+        assert_eq!(name_of(&frame.header.refs[2]).as_deref(), Some("reg"));
+        assert_eq!(name_of(&frame.header.refs[3]).as_deref(), Some("call"));
+        assert_eq!(name_of(&frame.header.refs[4]).as_deref(), Some("set_get_state"));
+        // The payload (the control message) starts right after the atom-cache tail.
+        assert_eq!(frame.payload_offset, 50);
+        assert_eq!(&body[frame.payload_offset..], &[104, 4, 97, 6]);
+    }
+
+    #[test]
+    fn decode_fragmented_header_accepts_an_empty_tail() {
+        let body = [
+            131, 69, // VERSION_MAGIC 'E'
+            0, 0, 0, 0, 0, 0, 0, 42, // SequenceId(8)
+            0, 0, 0, 0, 0, 0, 0, 1, // FragmentId(8)
+            0, // NumberOfAtomCacheRefs = 0
+            0xAA, 0xBB, // first payload bytes
+        ];
+        let mut atoms = AtomTable::new();
+        let frame = decode_fragmented_header(&body, &mut atoms, AtomEncoding::Utf8)
+            .expect("valid `'E'` frame");
+        assert_eq!(frame.fragment.seq_id, 42);
+        assert_eq!(frame.fragment.fragment_count, 1);
+        assert_eq!(frame.header, DistHeader::empty());
+        assert_eq!(frame.payload_offset, 19);
+        assert_eq!(&body[frame.payload_offset..], &[0xAA, 0xBB]);
+    }
+
+    #[test]
+    fn decode_fragmented_header_rejects_bad_frames() {
+        let mut atoms = AtomTable::new();
+        // Too short for the 18-byte fragment prefix.
+        assert!(bad_arg(decode_fragmented_header(&[131, 69], &mut atoms, AtomEncoding::Utf8)));
+        // A `'D'` header is not an `'E'` fragment header.
+        assert!(bad_arg(decode_fragmented_header(&[131, 68, 0], &mut atoms, AtomEncoding::Utf8)));
+        // Prefix present but the tail's `NumberOfAtomCacheRefs` is missing.
+        let mut prefix = vec![131, 69];
+        prefix.extend_from_slice(&[0u8; 16]);
+        assert!(bad_arg(decode_fragmented_header(&prefix, &mut atoms, AtomEncoding::Utf8)));
+        // Prefix + N = 1 but no flag byte / ref.
+        let mut truncated = vec![131, 69];
+        truncated.extend_from_slice(&[0u8; 16]);
+        truncated.push(1);
+        assert!(bad_arg(decode_fragmented_header(&truncated, &mut atoms, AtomEncoding::Utf8)));
     }
 }
