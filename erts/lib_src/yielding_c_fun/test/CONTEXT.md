@@ -45,7 +45,7 @@ Nothing outside `yielding_c_fun/` consumes this directory; the standalone `../GN
 - `examples/test_generated_header_file_main.c` hardcodes `#include "tmp_dir/tmp.h"` and is compiled with `-I<test dir>`; `examples/test_only_output_yielding_funs*.c` hardcode `#include "tmp.ycf.h"` with `-I tmp_dir`. Renaming `TMP_DIR`/`TMP_H_FILE`/`TMP_INC_FILE` in `test.sh` silently breaks those steps.
 - `debug_ptr_to_stack.c` is exercised twice with different expectations: in the golden loop *without* `-debug` (it is in `SIMPLE_TEST_FILES`) and again in the `-debug` negative test. It also defines the `ycf_debug_get_stack_start()`/`ycf_debug_global_stack_top_ptr` hooks that `-debug`-generated code needs.
 - `examples/test_trap.c` is referenced by nothing in `test.sh`/`GNUmakefile`, and the `.gitignore` entry `test/test_trap_out.c` is a leftover — nothing generates that file any more.
-- The commented-out sha256 NIF block (~lines 190–194) cannot be enabled as-is: its `examples/sha256_erlang_nif/c_src/Makefile` still passes the removed `-use_gc` flag, so YCF exits with an error and the demo never builds.
+- The commented-out sha256 NIF block (~lines 190–194) cannot be enabled as-is: its `examples/sha256_erlang_nif/c_src/Makefile` still passes the removed `-use_gc` flag, so YCF prints a usage error and exits **0** without producing output, leaving an empty generated file and failing the demo build (see that node's CONTEXT.md).
 - `../bin/yielding_c_fun` (wrapper) assumes the standalone layout and execs `$DIR/yielding_c_fun.bin`; it does not work in the `bin/$(TARGET)/` layout of an OTP build.
 - Two files named `yielding_c_fun`/`yielding_c_fun.bin` plus a `yielding_c_fun.exe` copy in the bootstrap tree (`Makefile.in`) are easy to confuse when debugging.
 
