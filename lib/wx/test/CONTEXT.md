@@ -80,4 +80,5 @@ This directory has no subdirectories; the whole node is leaf-level.
 ## See Also
 - `../CONTEXT.md` — the `wx` application itself (sources, `api_gen/`, `c_src/`); `../Makefile` sets `TEST_NEEDS_RELEASE=true`.
 - `../../common_test/test_server/` — the in-house `ts` tool and the `ts_install_cth` hook used by every suite here.
-- `../../HOWTO/../../HOWTO/TESTING.md` — general OTP testing/releasing workflow; `../../make/app_targets.mk` + `../../make/test_target_script.sh` — the `make test` driver.
+- `../../HOWTO/TESTING.md` — general OTP testing/releasing workflow.
+- `../../make/app_targets.mk` + `../../make/test_target_script.sh` — the `make test` driver (release-then-`ct_run` when `TEST_NEEDS_RELEASE=true`).
