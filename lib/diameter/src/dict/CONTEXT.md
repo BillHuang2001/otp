@@ -49,7 +49,7 @@ Records are exported through the `diameter_exprecs` parse transform, giving each
 - `../doc/references/diameter_dict.md` calls the RFC 3588 accounting module `diameter_gen_accounting`; the actual generated module is `diameter_gen_base_accounting`.
 - `diameter_codegen:preprocess/2` (the `forms` codegen option) pulls `include_lib` forms out of an existing `diameter_gen_relay` beam, so `diameter_gen_relay` must already be compiled and on the code path for that codegen path to work.
 - `base_rfc3588.dia` ends with a `@define Termination-Cause` block (backwards compatibility) alongside its `@enum Termination-Cause`; both are intentional.
-- Test suites in `../test/` include the generated `diameter_gen_*_info.hrl`-style headers (`.hrl` only exist after a build) and hard-code record names such as `'diameter_base_answer-message'`.
+- Test suites in `../test/` `-include` the generated `diameter_gen_*.hrl` (which only exist after a build) and hard-code record names such as `'diameter_base_answer-message'`, so renaming a dictionary or its prefix breaks tests.
 
 ## See Also
 - `../src/Makefile` — dict→module rules, `DICT_*` variables, dependency lines, `.dia` install into `$(RELSYSDIR)/src/dict`.
