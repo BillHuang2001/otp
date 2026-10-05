@@ -127,9 +127,9 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
 - **Dependencies:** `beam_common` + `libc` only (this crate is a foundation dependency sink). Nothing
-  else. `beam_common` is currently a placeholder; **do not import its not-yet-existing symbols** —
-  use the local `TermError`/`TermResult` (`error.rs`) until `beam_common::BeamError` lands, then
-  reconcile (a documented decision + `CHANGE.md` entry).
+  else. `beam_common` is used for exactly one thing: the `From<TermError> for beam_common::BeamError`
+  impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
+  `TermResult` remain this crate's error types and must not be redefined per dependent.
 - **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple` (raw pointer
   deref). Every `unsafe fn` documents a `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
@@ -191,9 +191,9 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
-- `src/error.rs` → local `TermError`/`TermResult` (to be reconciled with `beam_common`)
+- `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
+  interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
-
 ## Notes for Agents
 - **Read `../../erts/emulator/beam/erl_term.h` before changing any constant** — it is the ground truth;
   cite it in comments where a value is non-obvious.
