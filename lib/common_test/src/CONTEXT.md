@@ -65,7 +65,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `ct_testspec.erl` — parses `.spec` / `.testspec` files and `ct:run_testspec/1` terms into the internal `#testspec{}` record (also defined in `ct_util.hrl`): `prepare_tests/1,2`, `collect_tests_from_list/2,3`, `collect_tests_from_file/2,3`, `get_tests/1`, `testspec_rec2list/1,2`.
 
 ### (d) Configuration (`ct_config_callback` data)
-- `ct_config.erl` — configuration server (registered `ct_config_server`, `gen_server`); `start/1, stop/0, read_config_files/1, require/1,2, get_config/1..3, get_all_config/0, set_default_config/2,3, delete_default_config/1, reload_config/1, update_config/2, release_allocated/0, add_config/remove_config, encrypt/decrypt_config_file/2,3`.
+- `ct_config.erl` — configuration server (registered `ct_config_server`, hand-rolled process); `start/1, stop/0, read_config_files/1, require/1,2, get_config/1..3, get_all_config/0, set_default_config/2,3, delete_default_config/1, reload_config/1, update_config/2, release_allocated/0, add_config/remove_config, encrypt/decrypt_config_file/2,3`.
 - `ct_config_plain.erl` — the default `ct_config_callback` implementation: plain `.ctc` (Erlang term) config files.
 - `ct_config_xml.erl` — alternative callback reading XML config files (parsed with `xmerl`).
 
