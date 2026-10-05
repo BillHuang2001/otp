@@ -21,7 +21,7 @@
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, try_make_small};
+use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
 use beam_term::{Eterm, HEADER_FLONUM, REF_SUBTAG};
 
 // ---------------------------------------------------------------------------
@@ -286,6 +286,34 @@ pub(crate) fn make_ref_thing(heap: &mut Heap, id: u64) -> Result<Eterm> {
         *p.add(3) = id_term; // id
     }
     Ok(make_boxed(p as *const Eterm))
+}
+
+/// The numeric id encoded in the M1 ref thing [`make_ref_thing`] builds.
+///
+/// This is the read-back half of the ETS table handle: `erts_rust/crates/beam_bifs`
+/// builds the handle with [`make_ref_thing`] and recovers its id here (see
+/// `crate::ets`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not an internal-ref thing, or when its id
+/// word is not a non-negative small integer. The caller treats that as the `ets`
+/// `badarg` for an invalid handle.
+pub(crate) fn ref_thing_id(term: Eterm) -> Result<u64> {
+    if !is_internal_ref(term) {
+        return Err(BeamError::BadArg);
+    }
+    // SAFETY: [`is_internal_ref`] confirmed `term` is a boxed term whose header
+    // carries `REF_SUBTAG`. [`make_ref_thing`] is this crate's only producer of
+    // such a term and always writes a 4-word `[header, node, serial, id]` block,
+    // so word index `REF_PAYLOAD_WORDS` (the id) is in bounds and holds a small
+    // integer — never unvalidated memory.
+    let id_word = unsafe { *boxed_val(term).add(REF_PAYLOAD_WORDS) };
+    if !is_small(id_word) {
+        return Err(BeamError::BadArg);
+    }
+    let id = signed_value(id_word);
+    u64::try_from(id).map_err(|_| BeamError::BadArg)
 }
 
 #[cfg(test)]
