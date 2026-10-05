@@ -118,8 +118,8 @@ see Design Decisions. Never reallocates, so handed-out pointers stay valid for t
   ExternalPort, Fun, Ref, ExternalRef, Atom, Float, Big, Small, BinRef }` — mirrors the C `*_DEF`
   virtual tag values (term order: number < atom < ref < fun < port < pid < tuple < record < map <
   nil < cons < binary) used by comparison/ordering and `terms` code.
-- `class(Eterm) -> TermClass` (the `tag_val_def` equivalent).
-- `is_integer(Eterm)` (= small ‖ big); `is_number(Eterm)` (= integer ‖ float).
+- `unsafe fn class(Eterm) -> TermClass` (the `tag_val_def` equivalent; dereferences a boxed header).
+- `unsafe fn is_integer(Eterm)` (= small ‖ big); `unsafe fn is_number(Eterm)` (= integer ‖ float).
 - `THE_NON_VALUE: Eterm` (= `0` in release, `make_header(0, Float)` in debug); `is_non_value`,
   `is_value`, `is_zero_sized`.
 

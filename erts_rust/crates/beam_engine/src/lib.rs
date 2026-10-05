@@ -22,29 +22,38 @@
 //! The crate is **implemented** for its Milestone-1 scope: the interpreter
 //! dispatch loop and the operand read/write bodies are filled in, [`Machine`]
 //! runs a real `.beam` (via `beam_loader`) end to end, and the vertical-slice
-//! integration test exercises it. The documented coverage gaps (floats, literals,
-//! funs, maps, bitstrings, in-VM exceptions, GC) are unchanged from the design in
+//! integration test exercises it. The documented coverage gaps (floats, funs,
+//! maps, bitstrings, in-VM exceptions, GC) are unchanged from the design in
 //! this crate's `CONTEXT.md` and each returns a typed [`beam_common::BeamError`].
+//! Static literals (`Operand::Literal`) are **supported**: the running module's
+//! decoded literal area is bound to the [`Machine`] for a run and read through
+//! [`operand::read_operand`].
 //!
-//! The crate is `#![deny(unsafe_code)]`; the **only** exception is the private
-//! `predicates` module, which wraps the `beam_term` boxed-term predicates
-//! (`unsafe fn` because they dereference a header word) behind SAFETY-annotated
-//! helpers.
+//! The crate is `#![deny(unsafe_code)]`; the **only** exceptions are two
+//! SAFETY-annotated modules: the private `predicates` module, which wraps the
+//! `beam_term` boxed-term predicates (`unsafe fn` because they dereference a
+//! header word), and the `terms` module, which is the crate's single point of
+//! raw-heap construction/reading behind the [`ExecutionContext::alloc_words`] seam.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
 pub mod context;
 pub mod error;
+mod families;
 pub mod interpreter;
 pub mod jit;
 pub mod machine;
 pub mod operand;
 #[allow(unsafe_code)]
 mod predicates;
+mod step;
+#[allow(unsafe_code)]
+pub mod terms;
 pub use context::{ExecutionContext, MinimalContext};
 pub use error::{bad_register, unknown_label, unsupported};
 pub use jit::{available_tiers, JitBackend};
-pub use machine::{Machine, MAX_REGISTER};
+pub use machine::{CatchFrame, Machine, MAX_REGISTER};
+pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
 ///

@@ -36,18 +36,19 @@ use beam_term::{
     Eterm, MAX_SMALL, MIN_SMALL, NIL,
 };
 
+use beam_codec::compress::{compress, decompress};
 use beam_codec::error::is_unsupported;
 use beam_codec::term::{
-    big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
+    big_parts, bitstring_bytes, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
     flatmap_parts, float_value, make_big, make_external_pid, make_external_port, make_external_ref,
     make_flatmap, make_float, tuple_arity, tuple_element,
 };
 use beam_codec::{
-    decode_term, encode_term, encode_term_body, AtomEncoding, Decoder, Encoder, ATOM_EXT,
-    ATOM_UTF8_EXT, BINARY_EXT, FLOAT_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT,
-    MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT,
-    NIL_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT,
-    VERSION_MAGIC,
+    decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
+    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
+    INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
+    NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
+    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -165,6 +166,17 @@ fn assert_term_eq(a: Eterm, ta: &AtomTable, b: Eterm, tb: &AtomTable) {
     if let Ok(fa) = float_value(a) {
         let fb = float_value(b).expect("expected a float");
         assert_eq!(fa.to_bits(), fb.to_bits(), "float bits differ");
+        return;
+    }
+    if let Ok((bytes_a, off_a, size_a)) = bitstring_bytes(a) {
+        let (bytes_b, off_b, size_b) = bitstring_bytes(b).expect("expected a bitstring");
+        assert_eq!(size_a, size_b, "bitstring size mismatch");
+        // Compare the significant bits (MSB-first inside each byte).
+        for i in 0..size_a {
+            let bit_a = (bytes_a[(off_a + i) / 8] >> (7 - ((off_a + i) % 8))) & 1;
+            let bit_b = (bytes_b[(off_b + i) / 8] >> (7 - ((off_b + i) % 8))) & 1;
+            assert_eq!(bit_a, bit_b, "bitstring bit {i} differs");
+        }
         return;
     }
     if let Ok(arity) = tuple_arity(a) {
@@ -761,7 +773,8 @@ fn proper_and_improper_lists_round_trip() {
 
 #[test]
 fn maps_round_trip_at_pair_boundaries() {
-    for &n in &[0usize, 1, 2, 32] {
+    // Includes counts past `MAP_SMALL_MAP_LIMIT` (32): every map is a flatmap now.
+    for &n in &[0usize, 1, 2, 32, 33, 40, 100] {
         let mut atoms = AtomTable::new();
         let cap = 4 + 2 * n + 64;
         let mut h1 = heap(cap);
@@ -818,30 +831,56 @@ fn external_pids_round_trip() {
 }
 
 #[test]
-fn external_ports_round_trip_and_reject_wide_ids() {
+fn external_ports_round_trip_with_the_full_64_bit_id() {
     let mut atoms = AtomTable::new();
     let node = make_atom(atoms.intern("nonode@nohost"));
 
-    for &(number, creation) in &[(0u64, 0u32), (0x1234, 5), (u64::from(u32::MAX), u32::MAX)] {
+    for &(number, creation) in &[
+        (0u64, 0u32),
+        (0x1234, 5),
+        (u64::from(u32::MAX), u32::MAX),
+        // Above `NEW_PORT_EXT`'s 32-bit field: the modern `V4_PORT_EXT` writes it in
+        // full — never truncated, never a `SystemLimit`.
+        (1u64 << 32, 0),
+        (1u64 << 40, 7),
+        (u64::MAX, u32::MAX),
+    ] {
         let mut h1 = heap(64);
         let p = make_external_port(&mut h1, node, number, creation).unwrap();
 
         let (b1, t2, _h2, a2) = roundtrip(p, &atoms, 64);
 
-        assert_eq!(b1[1], NEW_PORT_EXT);
+        // The encoder always emits `V4_PORT_EXT` (`120`), the form the C emits.
+        assert_eq!(b1[1], V4_PORT_EXT);
+        assert_eq!(b1[1], 120);
+        // Wire: `[120][node atom][id:8 BE][creation:4 BE]`; the node atom here is a
+        // `SMALL_ATOM_UTF8_EXT` (`119`) with a 1-byte length at `b1[3]`.
+        assert_eq!(b1[2], 119);
+        let id_off = 4 + b1[3] as usize; // version + tag + atom tag + len byte + name
+        assert_eq!(
+            u64::from_be_bytes(b1[id_off..id_off + 8].try_into().unwrap()),
+            number
+        );
+        assert_eq!(
+            u32::from_be_bytes(b1[id_off + 8..id_off + 12].try_into().unwrap()),
+            creation
+        );
+
         let (n2, num2, cre2) = external_port_parts(t2).unwrap();
         assert_eq!(a2.name(atom_val(n2)).unwrap(), "nonode@nohost");
         assert_eq!((num2, cre2), (number, creation));
     }
 
-    // A 64-bit port id does not fit `NEW_PORT_EXT`'s 32-bit field: `SystemLimit`, never
-    // a silent truncation.
-    let mut h1 = heap(64);
-    let wide = make_external_port(&mut h1, node, 1u64 << 32, 0).unwrap();
-    assert!(matches!(
-        encode_term(wide, &atoms),
-        Err(BeamError::SystemLimit)
-    ));
+    // `NEW_PORT_EXT` (`89`) stays decodable even though the encoder never emits it.
+    let mut image = vec![VERSION_MAGIC, NEW_PORT_EXT];
+    image.extend_from_slice(&[119, 2, b'n', b'1']);
+    image.extend_from_slice(&7u32.to_be_bytes());
+    image.extend_from_slice(&9u32.to_be_bytes());
+    let mut h = heap(64);
+    let mut a = AtomTable::new();
+    let t = decode_term(&image, &mut h, &mut a).expect("NEW_PORT_EXT decodes");
+    assert_eq!(external_port_parts(t).unwrap().1, 7);
+    assert_eq!(external_port_parts(t).unwrap().2, 9);
 }
 
 #[test]
@@ -891,6 +930,166 @@ fn body_form_round_trips_without_the_version_byte() {
 
     // `Decoder::new` insists on the version byte that the body form lacks.
     assert!(Decoder::new(&body).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// COMPRESSED (`80`) — the zlib wrapper
+// ---------------------------------------------------------------------------
+
+/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE]` → the declared inner size.
+fn declared_inner_size(image: &[u8]) -> usize {
+    assert_eq!(image[0], VERSION_MAGIC, "a compressed image starts with 131");
+    assert_eq!(image[1], COMPRESSED_EXT, "then the COMPRESSED tag");
+    u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize
+}
+
+#[test]
+fn compressed_image_round_trips_a_small_term() {
+    let mut atoms = AtomTable::new();
+    let ok = make_atom(atoms.intern("ok"));
+    let mut h = heap(64);
+    let term = h.tuple(&[ok, make_small(17)]).unwrap();
+
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+    let body = encode_term_body(term, &atoms).unwrap();
+    assert_eq!(declared_inner_size(&image), body.len());
+    // The zlib stream carries exactly the term body (no version byte).
+    assert_eq!(decompress(&image[6..]).unwrap(), body);
+
+    let mut h2 = heap(64);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_image_round_trips_a_large_compressible_term() {
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 500], NIL);
+
+    let plain = encode_term(term, &atoms).unwrap();
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+    assert_eq!(declared_inner_size(&image), plain.len() - 1);
+    assert!(
+        image.len() * 10 < plain.len(),
+        "a 500-element list should shrink by more than 10x: {} vs {}",
+        image.len(),
+        plain.len()
+    );
+
+    let mut h2 = heap(4096);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_body_form_omits_the_version_byte() {
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 500], NIL);
+
+    let body = encode_term_body(term, &atoms).unwrap();
+    let image = encode_term_body_compressed(term, &atoms, 6).unwrap();
+
+    // `[COMPRESSED_EXT][inner_size:4 BE][zlib]` — no leading version byte.
+    assert_eq!(image[0], COMPRESSED_EXT);
+    assert_eq!(
+        u32::from_be_bytes([image[1], image[2], image[3], image[4]]) as usize,
+        body.len()
+    );
+    assert_eq!(decompress(&image[5..]).unwrap(), body);
+
+    // Prepending the version byte yields a valid versioned image for the same term.
+    let mut versioned = vec![VERSION_MAGIC];
+    versioned.extend_from_slice(&image);
+    let mut h2 = heap(4096);
+    let mut a2 = AtomTable::new();
+    let term2 = decode_term(&versioned, &mut h2, &mut a2).unwrap();
+    assert_term_eq(term, &atoms, term2, &a2);
+}
+
+#[test]
+fn compressed_level_out_of_range_is_bad_arg() {
+    let atoms = AtomTable::new();
+    let term = make_small(7);
+    assert!(matches!(
+        encode_term_compressed(term, &atoms, 10),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        encode_term_body_compressed(term, &atoms, u8::MAX),
+        Err(BeamError::BadArg)
+    ));
+    // `0` and `9` are the inclusive bounds.
+    assert!(encode_term_compressed(term, &atoms, 0).is_ok());
+    assert!(encode_term_compressed(term, &atoms, 9).is_ok());
+}
+
+#[test]
+fn compressed_wrapper_bytes_are_well_formed_on_every_level() {
+    // A term where compression pays off at every level (0 stores, 9 best).
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 256], NIL);
+    let body = encode_term_body(term, &atoms).unwrap();
+
+    for level in 0..=9u8 {
+        let image = encode_term_compressed(term, &atoms, level).unwrap();
+        assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
+        assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+
+        let mut h2 = heap(4096);
+        let mut a2 = AtomTable::new();
+        let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+        assert_term_eq(term, &atoms, term2, &a2);
+    }
+}
+
+#[test]
+fn compressed_image_negative_cases_are_bad_arg() {
+    // A valid image to corrupt.
+    let mut atoms = AtomTable::new();
+    let hello = make_atom(atoms.intern("hello"));
+    let mut h = heap(4096);
+    let term = list(&mut h, &[hello; 64], NIL);
+    let image = encode_term_compressed(term, &atoms, 6).unwrap();
+
+    // A header shorter than 6 bytes (the C only takes the `COMPRESSED` branch once
+    // the tag plus the 4-byte size are present).
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT]);
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0]);
+
+    // A declared size that does not match the decompressed length.
+    let mut wrong_size = image.clone();
+    wrong_size[2..6].copy_from_slice(&0u32.to_be_bytes());
+    assert_bad_arg(&wrong_size);
+
+    // A corrupt Adler-32 trailer is rejected by zlib.
+    let mut corrupt = image.clone();
+    let last = corrupt.len() - 1;
+    corrupt[last] ^= 0xFF;
+    assert_bad_arg(&corrupt);
+
+    // A payload that is not a zlib stream at all.
+    assert_bad_arg(&[VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 4, 1, 2, 3, 4]);
+
+    // A well-formed wrapper whose inner body is not a valid term (200 is not a tag).
+    let bad_body = [200u8];
+    let zlib = compress(&bad_body, 6).unwrap();
+    let mut bad_image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+    bad_image.extend_from_slice(&(bad_body.len() as u32).to_be_bytes());
+    bad_image.extend_from_slice(&zlib);
+    assert_bad_arg(&bad_image);
+
+    // Every truncation past the 6-byte header is rejected — never a panic.
+    for len in 6..image.len() {
+        assert_bad_arg(&image[..len]);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -966,11 +1165,39 @@ fn unknown_tag_bytes_are_bad_arg() {
 }
 
 #[test]
-fn binary_ext_is_unsupported() {
-    // `<<"hi">>` — the documented unsupported case in Milestone 1.
-    assert_unsupported(&[131, 109, 0, 0, 0, 2, b'h', b'i']);
-    // The bare tag with no payload is still reported as unsupported, not as malformed.
-    assert_unsupported(&[VERSION_MAGIC, BINARY_EXT]);
+fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
+    // `FUN_EXT` (removed in OTP 23) and `NEW_CACHE` (dead, `#if 0`) are malformed: the
+    // C decoder also rejects them outright; they are never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 117]); // FUN_EXT
+    assert_bad_arg(&[VERSION_MAGIC, 78]); // NEW_CACHE
+
+    // Recognized-but-not-yet-implemented tags report `unsupported`, never a wrong term.
+    for &tag in &[
+        112u8, // NEW_FUN_EXT
+        113,   // EXPORT_EXT
+        67,    // RECORD_EXT
+        121,   // LOCAL_EXT
+        68,    // DIST_HEADER
+    ] {
+        assert_unsupported(&[VERSION_MAGIC, tag]);
+    }
+}
+
+#[test]
+fn binaries_and_bitstrings_round_trip() {
+    // Byte-exact oracle images: `<<"hi">>` (BINARY_EXT) and `<<1:3>>` (BIT_BINARY_EXT).
+    let mut heap1 = heap(64);
+    let mut atoms1 = AtomTable::new();
+    let t = decode_term(&[131, 109, 0, 0, 0, 2, b'h', b'i'], &mut heap1, &mut atoms1).unwrap();
+    let (_b, _t2, _h, _a) = roundtrip(t, &atoms1, 64);
+
+    let mut heap2 = heap(64);
+    let mut atoms2 = AtomTable::new();
+    let t = decode_term(&[131, 77, 0, 0, 0, 1, 3, 0b0010_0000], &mut heap2, &mut atoms2).unwrap();
+    let (_b, _t2, _h, _a) = roundtrip(t, &atoms2, 64);
+
+    // The bare `BINARY_EXT` tag with a lying length is BadArg, not unsupported.
+    assert_bad_arg(&[VERSION_MAGIC, BINARY_EXT, 0, 0, 0, 5, b'h']);
 }
 
 #[test]
@@ -1017,9 +1244,32 @@ fn signed_bignum_with_bad_sign_byte_is_bad_arg() {
 }
 
 #[test]
-fn maps_with_more_than_32_pairs_are_unsupported() {
-    // 33 pairs needs the HAMT builder the M1 term layer does not have.
-    assert_unsupported(&[VERSION_MAGIC, MAP_EXT, 0, 0, 0, 33]);
+fn maps_with_more_than_32_pairs_round_trip() {
+    // 40 pairs is a flatmap now: encode → decode → encode must be byte-stable, with a
+    // 40-pair `MAP_EXT` count and the wire order preserved.
+    let n = 40usize;
+    let mut atoms = AtomTable::new();
+    let mut h1 = heap(4 + 2 * n + 64);
+    let mut pairs = Vec::new();
+    for i in 0..n {
+        let key = make_atom(atoms.intern(&format!("key{i}")));
+        pairs.push((key, make_small(i as i64)));
+    }
+    let m = make_flatmap(&mut h1, &pairs).unwrap();
+
+    let (b1, t2, _h2, a2) = roundtrip(m, &atoms, 4 + 2 * n + 64);
+
+    assert_eq!(b1[1], MAP_EXT);
+    assert_eq!(u32::from_be_bytes([b1[2], b1[3], b1[4], b1[5]]), 40);
+    let (keys, values) = flatmap_parts(t2).unwrap();
+    assert_eq!(keys.len(), n);
+    for i in 0..n {
+        assert_eq!(a2.name(atom_val(keys[i])).unwrap(), format!("key{i}"));
+        assert_eq!(values[i], make_small(i as i64));
+    }
+
+    // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`.
+    assert_system_limit(&[VERSION_MAGIC, MAP_EXT, 0x01, 0x00, 0x00, 0x00]);
 }
 
 #[test]
@@ -1051,6 +1301,10 @@ fn malformed_inputs_never_panic() {
         vec![VERSION_MAGIC, SMALL_TUPLE_EXT, 4, 97],
         vec![VERSION_MAGIC, LARGE_BIG_EXT, 0, 0, 1, 0],
         vec![VERSION_MAGIC, SMALL_BIG_EXT, 5, 0, 1, 2],
+        // `COMPRESSED` wrappers with lying size fields / non-zlib payloads.
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 1, 0],
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 255, 255, 255, 255, 1, 2, 3, 4],
+        vec![VERSION_MAGIC, COMPRESSED_EXT, 0, 0, 0, 0],
     ]);
 
     for image in &corpus {

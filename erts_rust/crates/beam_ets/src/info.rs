@@ -26,8 +26,12 @@ pub struct TableInfo {
     pub access: Access,
     /// The number of objects in the table.
     pub size: usize,
+    /// The number of words allocated to the table (`memory`).
+    pub memory: usize,
     /// The owning process, if known.
     pub owner: Option<OwnerId>,
+    /// Whether the table was created with `named_table`.
+    pub named_table: bool,
     /// Whether the table stores compressed terms.
     pub compressed: bool,
     /// Whether concurrent writers are enabled.
@@ -53,7 +57,7 @@ fn bool_term(atoms: &mut AtomTable, value: bool) -> Eterm {
 
 impl TableInfo {
     /// The `{Key, Value}` proplist pairs of the table's `ets:info/1` fields
-    /// (`id`/`name`/`type`/`keypos`/`protection`/`size`/`owner`/…).
+    /// (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/…).
     ///
     /// Heap-free: [`atoms`](AtomTable) is used only to intern the field-name
     /// atoms; values are returned as `(Atom, Eterm)` pairs.
@@ -70,14 +74,17 @@ impl TableInfo {
         let compressed = bool_term(atoms, self.compressed);
         let write_concurrency = bool_term(atoms, self.write_concurrency);
         let read_concurrency = bool_term(atoms, self.read_concurrency);
+        let named_table = bool_term(atoms, self.named_table);
 
         vec![
             pair(atoms, "id", make_small(self.id.raw() as i64)),
             pair(atoms, "name", name),
+            pair(atoms, "named_table", named_table),
             pair(atoms, "type", kind),
             pair(atoms, "keypos", make_small(self.keypos as i64)),
             pair(atoms, "protection", protection),
             pair(atoms, "size", make_small(self.size as i64)),
+            pair(atoms, "memory", make_small(self.memory as i64)),
             pair(atoms, "owner", owner),
             pair(atoms, "compressed", compressed),
             pair(atoms, "write_concurrency", write_concurrency),

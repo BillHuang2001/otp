@@ -17,31 +17,44 @@ use crate::machine::Machine;
 /// Evaluate a `.beam` operand to a term in the current machine state.
 ///
 /// Supported: `X(n)`/`Y(n)`/`Typed{reg,..}` (the register's term, bounds-checked
-/// to [`crate::error::bad_register`]), `Integer(i)`/`Character(c)` (`make_small`),
-/// `Atom(a)` (`make_atom`) and `Nil` (`NIL`). `FloatReg`/`Literal`/`Label`/
-/// `List`/`Allocation` are the documented Milestone-1 gaps and return a typed
-/// error.
+/// to [`crate::error::bad_register`]), `FloatReg(n)` (the FR-file term, likewise
+/// bounds-checked), `Integer(i)`/`Character(c)` (`make_small`), `Atom(a)`
+/// (`make_atom`), `Nil` (`NIL`) and `Literal(idx)` (the running module's decoded
+/// static literal via [`Machine::literal`]). `Label`/`List`/`Allocation` are the
+/// documented Milestone-1 gaps and return a typed error.
 pub(crate) fn read_operand(machine: &Machine, operand: &Operand) -> Result<Eterm> {
     match operand {
         Operand::X(n) => machine.x(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Y(n) => machine.y(*n).ok_or_else(|| error::bad_register(*n)),
+        Operand::FloatReg(n) => machine.get_fr(*n).ok_or_else(|| error::bad_register(*n)),
         Operand::Typed { reg, .. } => read_register(machine, *reg),
         Operand::Integer(i) => Ok(make_small(*i)),
         Operand::Atom(a) => Ok(make_atom(*a)),
         Operand::Nil => Ok(NIL),
         Operand::Character(c) => Ok(make_small(i64::from(*c))),
+        // The module's decoded `LitT` literal at `idx`, bound to the machine for
+        // the duration of the run. A missing/out-of-range index is a structural
+        // error (the code references a literal the module does not define), never
+        // a wrong term.
+        Operand::Literal(idx) => machine
+            .literal(*idx)
+            .ok_or_else(|| error::unsupported("operand: literal")),
         other => Err(error::unsupported(operand_kind(other))),
     }
 }
 
 /// Write a term into the operand's destination register / Y slot.
 ///
-/// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`; anything else is a typed error.
+/// Supported for `X(n)`/`Y(n)`/`Typed{reg,..}`/`FloatReg(n)`; anything else is a
+/// typed error. A `Literal` is never a valid destination: it names a term in the
+/// module's immutable literal area, which has no addressable slot.
 pub(crate) fn write_operand(machine: &mut Machine, operand: &Operand, value: Eterm) -> Result<()> {
     match operand {
         Operand::X(n) => machine.set_x(*n, value),
         Operand::Y(n) => machine.set_y(*n, value),
+        Operand::FloatReg(n) => machine.set_fr(*n, value),
         Operand::Typed { reg, .. } => write_register(machine, *reg, value),
+        Operand::Literal(_) => Err(error::unsupported("dst operand: literal")),
         _ => Err(error::unsupported("dst operand")),
     }
 }
@@ -65,7 +78,6 @@ fn write_register(machine: &mut Machine, reg: Reg, value: Eterm) -> Result<()> {
 /// A stable label for an unsupported operand kind (used in the error reason).
 fn operand_kind(operand: &Operand) -> &'static str {
     match operand {
-        Operand::FloatReg(_) => "operand: float register",
         Operand::Literal(_) => "operand: literal",
         Operand::Label(_) => "operand: label",
         Operand::List(_) => "operand: list",
@@ -78,9 +90,21 @@ fn operand_kind(operand: &Operand) -> &'static str {
 mod tests {
     use super::*;
     use crate::machine::Machine;
-    use beam_loader::{Label, TypeIndex};
+    use beam_loader::{Label, LiteralArea, Module, TypeIndex};
     use beam_term::Atom;
 
+    /// A module whose decoded `LitT` holds the small integer `42` (index 0) and the
+    /// tuple `{ok,17}` (index 1) — hand-built ETF payloads, no loader involved.
+    fn module_with_literals() -> Module {
+        let mut module = Module::default();
+        let raw = vec![
+            vec![131, 97, 42],
+            vec![131, 104, 2, 119, 2, 111, 107, 97, 17],
+        ];
+        let area = LiteralArea::decode(&raw, &mut module.atom_table).expect("decode literals");
+        module.literals = std::sync::Arc::new(area);
+        module
+    }
     #[test]
     fn read_register_and_immediates() {
         let mut machine = Machine::with_max_register(4);
@@ -127,13 +151,91 @@ mod tests {
     }
 
     #[test]
-    fn read_unsupported_operands_are_typed_errors() {
+    fn read_operands_missing_a_module_are_typed_errors() {
+        // No module is bound (no `run_*` in progress), so even a `Literal` cannot
+        // be resolved; the other kinds have no reader at all.
         let machine = Machine::new();
-        assert!(read_operand(&machine, &Operand::FloatReg(0)).is_err());
         assert!(read_operand(&machine, &Operand::Literal(0)).is_err());
         assert!(read_operand(&machine, &Operand::Label(Label(1))).is_err());
         assert!(read_operand(&machine, &Operand::List(vec![])).is_err());
         assert!(read_operand(&machine, &Operand::Allocation(vec![])).is_err());
+    }
+
+    #[test]
+    fn literal_operands_resolve_through_the_bound_literal_area() {
+        // The machine binds the running module's decoded `LitT` area; the operand
+        // seam reads the term at the referenced index (never a wrong term).
+        let module = module_with_literals();
+        let mut machine = Machine::with_max_register(4);
+        machine.set_literals(module.literals.clone());
+
+        assert_eq!(
+            read_operand(&machine, &Operand::Literal(0)).unwrap(),
+            make_small(42)
+        );
+        let tuple = read_operand(&machine, &Operand::Literal(1)).unwrap();
+        assert_eq!(crate::terms::tuple_arity(tuple).unwrap(), 2);
+        assert_eq!(
+            crate::terms::tuple_element(tuple, 0).unwrap(),
+            make_atom(module.atom_table.lookup("ok").expect("ok is interned")),
+        );
+        assert_eq!(crate::terms::tuple_element(tuple, 1).unwrap(), make_small(17));
+
+        // An index the module's `LitT` does not define is a structural error, not a
+        // substituted term.
+        let err = read_operand(&machine, &Operand::Literal(2)).unwrap_err();
+        match err {
+            beam_common::BeamError::Raise(raise) => assert_eq!(
+                raise.reason.as_atom(),
+                Some("unsupported_opcode: operand: literal")
+            ),
+            other => panic!("expected the typed literal error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_literal_is_never_a_valid_destination() {
+        // A literal names a term in the module's immutable area — there is no
+        // addressable destination slot, so a `Literal` dst stays a typed error.
+        let module = module_with_literals();
+        let mut machine = Machine::with_max_register(4);
+        machine.set_literals(module.literals.clone());
+        assert!(write_operand(&mut machine, &Operand::Literal(0), make_small(1)).is_err());
+    }
+    #[test]
+    fn float_register_round_trips_through_the_fr_file() {
+        let mut machine = Machine::with_max_register(4);
+        // The FR file defaults to NIL.
+        assert_eq!(
+            read_operand(&machine, &Operand::FloatReg(0)).unwrap(),
+            Eterm::default()
+        );
+
+        // set_fr then read_operand(FloatReg(..)) returns the set term.
+        let v = make_small(1234);
+        machine.set_fr(0, v).unwrap();
+        assert_eq!(read_operand(&machine, &Operand::FloatReg(0)).unwrap(), v);
+
+        // write_operand(FloatReg(..), v) stores into the FR file.
+        let w = make_small(5678);
+        write_operand(&mut machine, &Operand::FloatReg(1), w).unwrap();
+        assert_eq!(machine.get_fr(1), Some(w));
+    }
+
+    #[test]
+    fn out_of_range_float_register_is_a_typed_error() {
+        let mut machine = Machine::new();
+        let err = read_operand(
+            &machine,
+            &Operand::FloatReg(crate::machine::MAX_FLOAT_REGISTER),
+        );
+        assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
+        let err = write_operand(
+            &mut machine,
+            &Operand::FloatReg(crate::machine::MAX_FLOAT_REGISTER),
+            NIL,
+        );
+        assert!(matches!(err, Err(beam_common::BeamError::BadArg)));
     }
 
     #[test]

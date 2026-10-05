@@ -28,6 +28,7 @@
 #![warn(missing_docs)]
 
 pub mod atom_cache;
+pub mod compress;
 pub mod decode;
 pub mod encode;
 pub mod error;
@@ -41,7 +42,10 @@ pub mod prelude;
 
 pub use crate::atom_cache::AtomCache;
 pub use crate::decode::{decode_term, Decoder};
-pub use crate::encode::{encode_term, encode_term_body, AtomEncoding, Encoder};
+pub use crate::encode::{
+    encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
+    AtomEncoding, Encoder,
+};
 pub use crate::error::{is_unsupported, unsupported, UNSUPPORTED_REASON};
 pub use crate::reader::Reader;
 pub use crate::tag::*;

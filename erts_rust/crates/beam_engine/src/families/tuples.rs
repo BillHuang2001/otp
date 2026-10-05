@@ -1,0 +1,134 @@
+//! Tuple instruction family.
+//!
+//! Owns the tuple-construction/-inspection instructions (per
+//! `../beam_loader/CONTEXT.md`, "The instruction vocabulary"):
+//! - [`Instr::PutTuple2`] — build a tuple from its element operands
+//! - [`Instr::GetTupleElement`] — fetch one element of a tuple
+//! - [`Instr::SelectTupleArity`] — switch on a tuple's arity
+//!
+//! Ground truth (read-only): `emu/instrs.tab` `put_tuple2` (`:746`) and
+//! `i_get_tuple_element` (`:416`), and `emu/select_instrs.tab`
+//! `i_select_tuple_arity` (`:111`, the `select_val_lin`/`get_arity` path).
+//!
+//! ## Semantics
+//! - `PutTuple2 { dst, elements }` — read every element operand, build the tuple
+//!   (an `arityval` header + the elements) and store it in `dst`.
+//! - `GetTupleElement { source, element, dst }` — `source` must be a tuple with
+//!   `arity > element`; the C opcode trusts a preceding type test and reads the
+//!   word unchecked, so this is the **safety net**: anything else raises
+//!   `{badmatch, Source}` (class `error`).
+//! - `SelectTupleArity { tuple, fail, destinations }` — switch on the source
+//!   tuple's arity. The value must be a tuple; a non-tuple is a documented typed
+//!   error (`select_tuple_arity` is only emitted after an `is_tuple` test of the
+//!   same fail label, so the case is unreachable for compiler output). Otherwise
+//!   the matching `(Integer(n), Label)` alternative wins; with no match it falls to
+//!   `fail`, or — when `fail` is `NO_FAIL` (an exhaustive switch) — raises
+//!   `{badmatch, Tuple}`.
+//!
+//! Every failure is a typed [`beam_common::BeamError`]: `write_operand`/
+//! `read_operand` propagate, an unsupported operand is `error::unsupported`, and
+//! the `{badmatch, V}` raise is `crate::terms::badmatch_reason` +
+//! [`Machine::throw_error`] (a `Step::Goto` into a live catch frame, or a typed
+//! `Err` when there is none). Never a panic.
+
+use std::collections::BTreeMap;
+
+use beam_common::Result;
+use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::operand::{read_operand, write_operand};
+use crate::terms;
+use crate::Step;
+
+/// Execute a tuple-family instruction.
+///
+/// Returns `Ok(Some(step))` when `instr` is a tuple opcode this family executes,
+/// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
+pub(crate) fn exec(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let _ = (func, pc);
+    match instr {
+        Instr::PutTuple2 { dst, elements } => {
+            let mut elems = Vec::with_capacity(elements.len());
+            for operand in elements {
+                elems.push(read_operand(machine, operand)?);
+            }
+            let tuple = terms::make_tuple(ctx, &elems)?;
+            write_operand(machine, dst, tuple)?;
+            Ok(Some(Step::Next))
+        }
+
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => {
+            let value = read_operand(machine, source)?;
+            match terms::tuple_arity(value) {
+                Ok(arity) if (*element as usize) < arity => {
+                    let elem = terms::tuple_element(value, *element as usize)?;
+                    write_operand(machine, dst, elem)?;
+                    Ok(Some(Step::Next))
+                }
+                // Not a tuple, or the element index is out of range.
+                _ => machine
+                    .throw_error(terms::badmatch_reason(ctx, module, value)?)
+                    .map(Some),
+            }
+        }
+
+        Instr::SelectTupleArity {
+            tuple,
+            fail,
+            destinations,
+        } => {
+            let value = read_operand(machine, tuple)?;
+            // The arity switch is only emitted behind an `is_tuple` test; a
+            // non-tuple source is the documented typed-error gap.
+            let arity = match terms::tuple_arity(value) {
+                Ok(arity) => arity,
+                Err(_) => return Err(error::unsupported("select_tuple_arity: non-tuple")),
+            };
+            let mut target = None;
+            for (candidate, label) in destinations {
+                // Arities are decoded as `{integer, N}` operands; a non-integer
+                // alternative can never equal an arity and is skipped.
+                if let Operand::Integer(n) = candidate {
+                    if *n >= 0 && *n as usize == arity {
+                        target = Some(*label);
+                        break;
+                    }
+                }
+            }
+            let label = match target {
+                Some(label) => label,
+                None if *fail == NO_FAIL => {
+                    return machine
+                        .throw_error(terms::badmatch_reason(ctx, module, value)?)
+                        .map(Some);
+                }
+                None => *fail,
+            };
+            let (next_func, next_pc) = labels
+                .get(&label)
+                .copied()
+                .ok_or_else(|| error::unknown_label(label))?;
+            Ok(Some(Step::Goto {
+                func: next_func,
+                pc: next_pc,
+            }))
+        }
+
+        _ => Ok(None),
+    }
+}

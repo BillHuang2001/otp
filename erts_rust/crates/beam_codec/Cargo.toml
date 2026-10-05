@@ -9,6 +9,10 @@ description = "External Term Format (ETF) encode/decode for the Rust ERTS rewrit
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
 beam_alloc = { path = "../beam_alloc" }
+# Pure-Rust zlib for the `COMPRESSED` external-term tag (`rust_backend` = miniz_oxide,
+# no C toolchain). Declared here rather than hoisted to `[workspace.dependencies]`
+# because that manifest is outside this crate's node — see the crate `CONTEXT.md`.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 libc.workspace = true
 
 [lints]

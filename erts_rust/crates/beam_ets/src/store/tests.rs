@@ -1,317 +1,3 @@
-//! Table-owned term storage — the A.1 copy boundary.
-//!
-//! [`TermStore`] is a **never-relocating bump arena** built over a
-//! [`beam_alloc::AllocRef`] (`AllocType::Ets`): it keeps a chain of owned
-//! allocation blocks and hands out stable word pointers, so interior pointers
-//! handed out by the table never dangle across growth. An inserted object is
-//! **deep-copied** into this arena ([`TermStore::copy`]); the table never retains
-//! a pointer into a caller's or process heap.
-//!
-//! This is the *only* module of the crate allowed to contain `unsafe` (raw term
-//! reads/writes) alongside the tuple-element accessor in [`crate::key`]; every
-//! `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding
-//! `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
-//!
-//! # The copied subset (M1)
-//!
-//! [`TermStore::copy`] reproduces a term graph faithfully for: immediates
-//! (returned unchanged — their value is the word), cons cells, tuples, **flat
-//! maps**, and the pointer-free boxed leaves (float, bignum, internal ref, on-heap
-//! bitstring). Every other boxed kind — funs, records, external pid/port/ref,
-//! sub-bitstrings, off-heap binary references and hash maps — aliases storage that
-//! lives outside the term graph (code, another heap, an MSO binary) and is rejected
-//! with `badarg`; see the crate `CONTEXT.md`, *Known Issues*.
-//!
-//! # Flat-map layout (why `copy` reads the size word, not the header arity)
-//!
-//! A flat map is stored as `[MAP_HEADER_FLATMAP, n, keys, v0 … v(n-1)]`
-//! (`../../erts/emulator/beam/erl_term.h:1320-1326` `MAP_HEADER`/`MAP_SZ`;
-//! `erl_map.h:185-199`), where word `1` is the **raw pair count** `n` — an untagged
-//! integer, *not* a term — and word `2` is the keys tuple term. The map header's
-//! arity field is the constant `MAP_HEADER_FLATMAP` template value, so the number
-//! of pairs must be read from the size word (`flatmap_get_size`); a copy that
-//! dispatched on the header arity would mis-size the block and then dereference the
-//! raw size word as if it were a term. [`TermStore::copy`] therefore treats a flat
-//! map as `header + size word + keys tuple + n values`.
-
-use core::alloc::Layout;
-use core::ptr::NonNull;
-
-use beam_alloc::AllocRef;
-use beam_common::{AllocFailure, AllocKind, BeamError, Result};
-use beam_term::prelude::*;
-
-/// The number of words a fresh store block holds when the request is smaller
-/// (`CHUNK`).
-const BLOCK_WORDS: usize = 64;
-
-/// One owned, never-relocating block of the store's bump arena.
-struct StoreBlock {
-    /// Base pointer of this block's word storage.
-    base: NonNull<Eterm>,
-    /// Number of [`Eterm`] words this block can hold.
-    capacity: usize,
-    /// Words handed out of this block so far (the bump high-water mark). A block is
-    /// never reallocated or moved, so `base + used` stays stable until the store is
-    /// dropped.
-    used: usize,
-}
-
-/// The layout a block of `capacity` words is allocated with (and freed with).
-///
-/// `Layout::array` is deterministic, so one capacity always yields one layout —
-/// which is what lets [`Drop`] recover, from the stored capacity alone, the exact
-/// layout a block must be freed with.
-fn block_layout(capacity: usize) -> Result<Layout> {
-    Layout::array::<Eterm>(capacity)
-        .map_err(|_| BeamError::Alloc(AllocFailure::new(AllocKind::Other, capacity)))
-}
-
-/// A per-table bump arena over table-owned term storage.
-///
-/// Created with an explicit allocator ([`TermStore::new`]) or the registered ETS
-/// allocator ([`TermStore::with_default_allocator`]). Dropping the store frees
-/// every owned block through the allocator.
-pub struct TermStore {
-    /// The allocator every block is (de)allocated through.
-    alloc: AllocRef,
-    /// The chain of owned blocks, in allocation order.
-    blocks: Vec<StoreBlock>,
-    /// The total number of words handed out so far.
-    words: usize,
-}
-
-impl TermStore {
-    /// A store allocating through `alloc`.
-    pub fn new(alloc: AllocRef) -> TermStore {
-        TermStore {
-            alloc,
-            blocks: Vec::new(),
-            words: 0,
-        }
-    }
-
-    /// A store allocating through the registered ETS allocator
-    /// ([`beam_alloc::AllocType::Ets`]).
-    pub fn with_default_allocator() -> TermStore {
-        // `allocator` hands out the process-wide `&'static AllocRef`; clone the
-        // `Arc` so the store owns a handle that outlives the registry borrow.
-        TermStore::new(beam_alloc::allocator(beam_alloc::AllocType::Ets).clone())
-    }
-
-    /// Deep-copies the term graph rooted at `root` into table-owned memory and
-    /// returns the new root. Immediates are returned unchanged (copied by value).
-    ///
-    /// Fails with `badarg` for term kinds outside the supported subset (see the
-    /// crate `CONTEXT.md`, Known Issues).
-    ///
-    /// `root` must be a live, well-formed term graph — the same precondition
-    /// [`beam_term::compare::cmp`] states (a `Eterm` is a raw machine word, so no
-    /// safe function can re-check it).
-    pub fn copy(&mut self, root: Eterm) -> Result<Eterm> {
-        self.copy_term(root)
-    }
-
-    /// The total number of words handed out by this store.
-    pub fn words(&self) -> usize {
-        self.words
-    }
-
-    /// The number of blocks this store owns.
-    pub fn blocks(&self) -> usize {
-        self.blocks.len()
-    }
-
-    /// Reserves `n` contiguous words of table-owned storage and returns their
-    /// address. Blocks are never moved or reallocated, so a returned pointer stays
-    /// valid (and address-stable) for the store's whole lifetime.
-    fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm> {
-        // Fast path: the current (last) block still has room for `n` words.
-        if let Some(block) = self.blocks.last_mut() {
-            if block.capacity - block.used >= n {
-                // SAFETY: `used + n <= capacity`, so the `n` words at `base + used`
-                // are inside this block's allocation — exclusively owned by the
-                // store and `Eterm`-aligned (blocks are allocated with
-                // `align_of::<Eterm>()`).
-                let p = unsafe { block.base.as_ptr().add(block.used) };
-                block.used += n;
-                self.words += n;
-                return Ok(p);
-            }
-        }
-        // Slow path: map one fresh block of at least `n` words, so a single term
-        // never spans two blocks and its words stay contiguous.
-        let capacity = n.max(BLOCK_WORDS);
-        let layout = block_layout(capacity)?;
-        let raw = self.alloc.alloc(layout)?;
-        // The allocator honours `layout.align()` (== `align_of::<Eterm>()`), so
-        // `raw` already is a valid `Eterm` pointer: reinterpreting it needs no
-        // `unsafe`.
-        let base = raw.cast::<Eterm>();
-        self.blocks.push(StoreBlock {
-            base,
-            capacity,
-            used: n,
-        });
-        self.words += n;
-        Ok(base.as_ptr())
-    }
-
-    /// The recursive core of [`TermStore::copy`].
-    fn copy_term(&mut self, term: Eterm) -> Result<Eterm> {
-        if is_immediate(term) {
-            // Small ints, atoms, `NIL`, catch terms and internal pid/ports carry
-            // their value in the word itself — nothing to copy.
-            return Ok(term);
-        }
-        if is_header(term) {
-            // A bare header word (`TAG_PRIMARY_HEADER`) is never a standalone value
-            // (this includes the debug `THE_NON_VALUE`). Reject it before any
-            // dereference: the C `is_boxed` bit trick is true for this pattern too.
-            return Err(crate::error::badarg());
-        }
-        if is_list(term) {
-            // SAFETY: a `TAG_PRIMARY_LIST` word is a live, 2-word `[CAR, CDR]` cell.
-            let (car, cdr) = unsafe { (car(term), cdr(term)) };
-            let car = self.copy_term(car)?;
-            let cdr = self.copy_term(cdr)?;
-            let p = self.alloc_words(2)?;
-            // SAFETY: `p` addresses 2 freshly reserved, exclusively-owned words.
-            unsafe {
-                *p.add(CAR_OFFSET) = car;
-                *p.add(CDR_OFFSET) = cdr;
-            }
-            return Ok(make_list(p as *const Eterm));
-        }
-        if is_boxed(term) {
-            // SAFETY: a boxed word points at a live, aligned header word.
-            let hdr = unsafe { *boxed_val(term) };
-            return self.copy_boxed(term, hdr);
-        }
-        // Unreachable for a well-formed term: `is_immediate`, `is_header`, `is_list`
-        // and `is_boxed` partition the four primary-tag patterns. Kept as a total,
-        // non-panicking fallback rather than an `unreachable!()`.
-        Err(crate::error::badarg())
-    }
-
-    /// Copies a boxed term, dispatching on its header subtag.
-    ///
-    /// `hdr` is the already-read header word ([`copy_term`](TermStore::copy_term)
-    /// reads it to classify the term).
-    fn copy_boxed(&mut self, term: Eterm, hdr: Eterm) -> Result<Eterm> {
-        match BoxedTag::from_raw(header_subtag(hdr)) {
-            Some(BoxedTag::ArityVal) => {
-                let arity = thing_arityval(hdr);
-                let p = self.alloc_words(arity + 1)?;
-                // SAFETY: `p` addresses `arity + 1` freshly reserved words; the
-                // header is written before any element.
-                unsafe { *p = hdr };
-                for i in 0..arity {
-                    // SAFETY: `term` is a live tuple of `arity` elements, so `i` is
-                    // within its payload.
-                    let elem = unsafe { tuple_element(term, i) };
-                    let elem = self.copy_term(elem)?;
-                    // SAFETY: element slot `1 + i` is inside the `arity + 1` words.
-                    unsafe { *p.add(1 + i) = elem };
-                }
-                Ok(make_boxed(p as *const Eterm))
-            }
-
-            // Pointer-free leaves: the whole thing is the header plus raw payload
-            // words with no interior term pointers, so it is copied verbatim.
-            // `HeapBits` belongs here deliberately — an **on-heap** bitstring owns
-            // its data words, unlike the off-heap `BinRef`/`SubBits` kinds below.
-            Some(BoxedTag::Float)
-            | Some(BoxedTag::PosBig)
-            | Some(BoxedTag::NegBig)
-            | Some(BoxedTag::Ref)
-            | Some(BoxedTag::HeapBits) => self.copy_leaf(term, hdr),
-
-            Some(BoxedTag::Map) => {
-                if is_flatmap_header(hdr) {
-                    self.copy_flatmap(term, hdr)
-                } else {
-                    // Hash maps (HAMT heads, bitmap/array nodes and collision nodes)
-                    // share node blocks reachable from several terms; not copyable
-                    // in M1.
-                    Err(crate::error::badarg())
-                }
-            }
-
-            // Fun, Record, SubBits, BinRef, ExternalPid/Port/Ref and the reserved
-            // subtags: each aliases storage outside the term graph.
-            _ => Err(crate::error::badarg()),
-        }
-    }
-
-    /// Copies a pointer-free boxed leaf (`hdr` is its header word) verbatim.
-    fn copy_leaf(&mut self, term: Eterm, hdr: Eterm) -> Result<Eterm> {
-        // A float/bignum/ref/heap-bitstring thing is `header_arity(hdr)` payload
-        // words following its header.
-        let n = header_arity(hdr) + 1;
-        let p = self.alloc_words(n)?;
-        // SAFETY: `p` addresses `n` freshly reserved words and the source thing is
-        // exactly `n` words long. Both regions are live, `Eterm`-aligned and
-        // non-overlapping (the destination is table-owned, the source is the
-        // caller's), so a word-for-word copy is sound.
-        unsafe { core::ptr::copy_nonoverlapping(boxed_val(term), p, n) };
-        Ok(make_boxed(p as *const Eterm))
-    }
-
-    /// Copies a flat map (`term`'s header word is `hdr`, a `MAP_HEADER_FLATMAP`).
-    ///
-    /// Layout (see the module docs): `[header, n, keys, v0 … v(n-1)]`, with `n` a
-    /// raw integer. The header and the size word are reproduced verbatim; the keys
-    /// tuple and every value are deep-copied.
-    fn copy_flatmap(&mut self, term: Eterm, hdr: Eterm) -> Result<Eterm> {
-        // SAFETY: `term` is a live flat map, so word `1` of its block is the size
-        // word (a raw pair count) — readable, and not a term.
-        let n = unsafe { (*boxed_val(term).add(1)).raw() };
-        // `header + size word + keys + n values`.
-        let p = self.alloc_words(n + 3)?;
-        // SAFETY: `p` addresses `n + 3` freshly reserved words; the header and the
-        // raw size word are written before any term slot. Word `1` of the source is
-        // the size word itself, so it is copied word-for-word instead of being
-        // re-encoded as a term.
-        unsafe {
-            *p = hdr;
-            *p.add(1) = *boxed_val(term).add(1);
-        }
-        // SAFETY: word `2` of a flat-map block is the keys tuple term.
-        let keys = unsafe { *boxed_val(term).add(2) };
-        let keys = self.copy_term(keys)?;
-        // SAFETY: the keys slot is inside the freshly reserved block.
-        unsafe { *p.add(2) = keys };
-        for i in 0..n {
-            // SAFETY: value slot `3 + i` is inside the source's `n + 3` words.
-            let value = unsafe { *boxed_val(term).add(3 + i) };
-            let value = self.copy_term(value)?;
-            // SAFETY: the value slot is inside the reserved block.
-            unsafe { *p.add(3 + i) = value };
-        }
-        Ok(make_boxed(p as *const Eterm))
-    }
-}
-
-impl Drop for TermStore {
-    fn drop(&mut self) {
-        for block in &self.blocks {
-            // SAFETY: `block.base` came from `self.alloc.alloc` with exactly this
-            // layout (recomputed from the stored capacity) and is freed here exactly
-            // once — the store owns every block and is being dropped.
-            //
-            // The recomputed layout cannot fail: `alloc_words` only pushes a block
-            // after `block_layout(capacity)` succeeded for that same capacity, and
-            // `block_layout` is a pure function of it.
-            let layout = block_layout(block.capacity)
-                .expect("a capacity that was allocated has a valid layout");
-            unsafe { self.alloc.dealloc(block.base.cast::<u8>(), layout) };
-        }
-    }
-}
-
-#[cfg(test)]
-mod tests {
     //! Copy-boundary tests: structural equality with the source, distinct
     //! table-owned storage, and survival of the source heap's storage.
     //!
@@ -441,6 +127,27 @@ mod tests {
             *p = make_header(2, HEAP_BITS_SUBTAG);
             *p.add(1) = Eterm::from_raw(16); // bit size
             *p.add(2) = Eterm::from_raw(value as usize);
+        }
+        make_boxed(p as *const Eterm)
+    }
+
+    /// Builds a sub-bitstring thing (`[header, bit_offset, bit_size, off_heap_bin,
+    /// pad]`) — a kind that aliases storage outside the term graph and is therefore
+    /// *not* in the copied subset.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must have room for 5 words and must outlive the returned term.
+    unsafe fn build_sub_bits(heap: &mut Heap) -> Eterm {
+        // SAFETY: 5 exclusively-owned words, all written before the term escapes.
+        let p = unsafe { heap.alloc_words(5).expect("heap room for a sub-bits thing") };
+        // SAFETY: `p` owns exactly those 5 words.
+        unsafe {
+            *p = HEADER_SUB_BITS;
+            *p.add(1) = Eterm::from_raw(0);
+            *p.add(2) = Eterm::from_raw(4);
+            *p.add(3) = Eterm::from_raw(16);
+            *p.add(4) = make_small(0);
         }
         make_boxed(p as *const Eterm)
     }
@@ -820,20 +527,264 @@ mod tests {
     #[test]
     fn sub_bitstring_is_rejected_with_badarg() {
         let mut heap = Heap::new(16);
-        // SAFETY: an `ErlSubBits` thing is 5 words; all of them are written here.
-        let sub_bits = unsafe {
-            let p = heap.alloc_words(5).expect("heap room for a sub-bits thing");
-            *p = HEADER_SUB_BITS;
-            *p.add(1) = Eterm::from_raw(0);
-            *p.add(2) = Eterm::from_raw(4);
-            *p.add(3) = Eterm::from_raw(16);
-            *p.add(4) = make_small(0);
-            make_boxed(p as *const Eterm)
-        };
+        // SAFETY: the heap has room for the 5-word sub-bits thing and outlives it.
+        let sub_bits = unsafe { build_sub_bits(&mut heap) };
         let mut store = test_store();
         // `BeamError` has no `PartialEq`, so match the variant.
         assert!(matches!(store.copy(sub_bits), Err(BeamError::BadArg)));
         assert_eq!(store.words(), 0, "a rejected term allocates nothing");
         assert_eq!(store.blocks(), 0);
     }
-}
+
+    // --- per-object reclamation -------------------------------------------------
+
+    /// `free` reports exactly the words a copy consumed, and a second `free` of the
+    /// same root is a no-op that never underflows the live-word counter.
+    #[test]
+    fn free_reclaims_every_run_of_a_nested_copy_without_underflowing() {
+        let mut heap = Heap::new(32);
+        let inner = heap.tuple(&[make_small(7), make_small(8)]).unwrap();
+        let outer = heap.tuple(&[make_small(1), inner, make_small(9)]).unwrap();
+
+        let mut store = test_store();
+        let copied = store.copy(outer).expect("a tuple is copyable");
+        // outer (4 words) + inner (3 words).
+        assert_eq!(store.words(), 7);
+
+        assert_eq!(
+            store.free(copied),
+            7,
+            "every run of the object is reclaimed"
+        );
+        assert_eq!(store.words(), 0, "the live-word count returns to zero");
+        assert_eq!(
+            store.free(copied),
+            0,
+            "a second free of the same root reclaims nothing"
+        );
+        assert_eq!(store.words(), 0);
+        // Only the *words* were reclaimed: the block is still mapped, so the store
+        // still holds (and reports) reclaimable storage.
+        assert!(store.memory() > 0);
+    }
+
+    #[test]
+    fn freeing_a_copied_list_reclaims_every_cons_cell() {
+        let mut heap = Heap::new(16);
+        let three = heap.cons(make_small(3), NIL).unwrap();
+        let two = heap.cons(make_small(2), three).unwrap();
+        let one = heap.cons(make_small(1), two).unwrap();
+
+        let mut store = test_store();
+        let copied = store.copy(one).expect("a list is copyable");
+        // 3 cons cells x 2 words.
+        assert_eq!(store.words(), 6);
+
+        assert_eq!(store.free(copied), 6);
+        assert_eq!(store.words(), 0);
+        assert_eq!(store.free(copied), 0);
+    }
+
+    #[test]
+    fn freeing_an_immediate_or_a_foreign_term_is_a_no_op() {
+        let mut store = test_store();
+        let copied = store
+            .copy(make_small(42))
+            .expect("an immediate is copyable");
+        assert_eq!(copied, make_small(42), "immediates copy by value");
+
+        assert_eq!(store.free(copied), 0);
+        assert_eq!(store.free(NIL), 0, "a root the store never copied");
+        assert_eq!(store.free(make_small(-1)), 0);
+        assert_eq!(store.free(make_atom(Atom::from_raw(3))), 0);
+        assert_eq!(store.words(), 0, "no word accounting moved");
+        assert_eq!(store.blocks(), 0);
+        assert_eq!(store.memory(), 0);
+    }
+
+    /// Freed runs are reused by a later `copy` — and only by a later one, so every
+    /// live term survives untouched.
+    #[test]
+    fn freed_runs_are_reused_only_by_later_copies() {
+        let atoms = AtomTable::new();
+        const N: i64 = 32;
+        let mut heap = Heap::new(4 * N as usize);
+        let sources: Vec<Eterm> = (0..N)
+            .map(|i| {
+                heap.tuple(&[make_small(i), make_small(i * 10)])
+                    .expect("heap room for the source tuples")
+            })
+            .collect();
+
+        let mut store = test_store();
+        let copies: Vec<Eterm> = sources
+            .iter()
+            .map(|&t| store.copy(t).expect("a tuple is copyable"))
+            .collect();
+
+        let live_before = store.words();
+        let blocks_before = store.blocks();
+        let memory_before = store.memory();
+        assert_eq!(live_before, 3 * N as usize);
+        assert!(
+            blocks_before > 1,
+            "the store must have grown past one block"
+        );
+
+        // Free every other object; the odd ones must stay live and readable.
+        let mut freed = 0;
+        let mut freed_roots: Vec<usize> = Vec::new();
+        for (i, &c) in copies.iter().enumerate() {
+            if i % 2 == 0 {
+                freed += store.free(c);
+                freed_roots.push(c.raw());
+            }
+        }
+        assert_eq!(freed, 3 * (N / 2) as usize);
+        assert_eq!(store.words(), live_before - freed);
+        assert_eq!(
+            store.blocks(),
+            blocks_before,
+            "reclaiming words must not shrink the block chain"
+        );
+        assert_eq!(store.memory(), memory_before);
+
+        // The live (odd) objects are untouched by the frees.
+        for i in (1..N as usize).step_by(2) {
+            assert!(
+                eq(sources[i], copies[i], &atoms),
+                "live object {i} was disturbed by the frees"
+            );
+        }
+
+        // Now copy the freed objects' sources again. Every run is reused, so the
+        // roots land exactly on the freed storage and neither the block chain nor
+        // the held memory grows. (The freed roots themselves — every even-indexed
+        // `copies[i]` — must not be read from here on: their storage is being handed
+        // out again.)
+        let recopies: Vec<Eterm> = (0..N as usize)
+            .step_by(2)
+            .map(|i| store.copy(sources[i]).expect("a tuple is copyable"))
+            .collect();
+        for (k, &r) in recopies.iter().enumerate() {
+            let source_index = 2 * k;
+            assert!(
+                freed_roots.contains(&r.raw()),
+                "recopy {k} did not reuse freed storage (root {:#x})",
+                r.raw()
+            );
+            assert!(
+                eq(sources[source_index], r, &atoms),
+                "recopy {k} is not structurally equal to its source"
+            );
+        }
+        assert_eq!(store.blocks(), blocks_before, "reuse mapped no new block");
+        assert_eq!(store.memory(), memory_before, "reuse held no new memory");
+        assert_eq!(
+            store.words(),
+            live_before,
+            "the recopies cost exactly the freed words"
+        );
+
+        // Every live root reads back its original values: nothing was overwritten.
+        for i in (1..N as usize).step_by(2) {
+            // SAFETY: `copies[i]` is store-owned and the store is alive.
+            unsafe {
+                assert_eq!(tuple_size(copies[i]), 2);
+                assert_eq!(tuple_element(copies[i], 0), make_small(i as i64));
+                assert_eq!(tuple_element(copies[i], 1), make_small(i as i64 * 10));
+            }
+        }
+        for &r in &recopies {
+            // SAFETY: `r` is store-owned and the store is alive.
+            unsafe {
+                assert_eq!(tuple_size(r), 2);
+            }
+        }
+    }
+
+    #[test]
+    fn reset_releases_every_block_and_the_store_stays_usable() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(32);
+        let source = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+
+        let mut store = test_store();
+        let first = store.copy(source).expect("a tuple is copyable");
+        let second = store.copy(source).expect("a tuple is copyable");
+        assert!(store.memory() > 0);
+        assert!(store.blocks() > 0);
+        assert_eq!(store.words(), 6);
+
+        store.reset();
+        assert_eq!(store.memory(), 0, "every block is released");
+        assert_eq!(store.blocks(), 0);
+        assert_eq!(store.words(), 0);
+        // The pre-reset roots are no longer tracked, so freeing them is a no-op
+        // (they must be freed *before* the store hands their address out again).
+        assert_eq!(store.free(first), 0);
+        assert_eq!(store.free(second), 0);
+
+        // ...and the store is immediately usable again.
+        let third = store.copy(source).expect("a tuple is copyable");
+        assert!(store.memory() > 0);
+        assert_eq!(store.words(), 3);
+        assert!(eq(source, third, &atoms));
+    }
+
+    #[test]
+    fn reset_returns_the_blocks_to_the_allocator() {
+        let alloc = CarrierAllocator::new(
+            AllocatorConfig::builder()
+                .name("beam_ets_store_reset_test")
+                .carrier_size(64 * 1024)
+                .build(),
+        )
+        .expect("a fresh carrier allocator must be constructible")
+        .share();
+        let mut heap = Heap::new(16);
+        let source = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+
+        let mut store = TermStore::new(alloc.clone());
+        store.copy(source).expect("a tuple is copyable");
+        assert!(store.memory() > 0);
+        assert!(
+            alloc.stats().live_bytes > 0,
+            "the store's block must be live from the allocator's point of view"
+        );
+
+        store.reset();
+        assert_eq!(store.memory(), 0);
+        assert_eq!(
+            alloc.stats().live_bytes,
+            0,
+            "reset must free every block it owns"
+        );
+    }
+
+    /// A copy rejected part-way through hands its partial runs back, so a later copy
+    /// of the same shape reuses them instead of mapping another block.
+    #[test]
+    fn a_rejected_nested_term_leaks_no_words_and_leaves_them_reusable() {
+        let mut heap = Heap::new(32);
+        // SAFETY: the heap has room for the 5-word sub-bits thing and outlives it.
+        let sub_bits = unsafe { build_sub_bits(&mut heap) };
+        let outer = heap.tuple(&[make_small(1), sub_bits]).unwrap();
+
+        let mut store = test_store();
+        assert!(matches!(store.copy(outer), Err(BeamError::BadArg)));
+        assert_eq!(
+            store.words(),
+            0,
+            "a rejected copy returns the runs it had already allocated"
+        );
+
+        // The rolled-back run is exactly reused by the next copy of the same size,
+        // so no second block is ever mapped.
+        let good = heap.tuple(&[make_small(7), make_small(8)]).unwrap();
+        let copied = store.copy(good).expect("a tuple is copyable");
+        assert_eq!(store.words(), 3);
+        assert_eq!(store.blocks(), 1, "the rolled-back run was reused");
+        assert_eq!(store.free(copied), 3);
+        assert_eq!(store.words(), 0);
+    }

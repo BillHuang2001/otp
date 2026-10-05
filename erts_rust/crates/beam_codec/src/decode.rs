@@ -22,7 +22,7 @@ use beam_term::{AtomTable, Eterm};
 use crate::atom_cache::AtomCache;
 use crate::error::{bad_arg, system_limit, unsupported};
 use crate::reader::Reader;
-use crate::tag::{Tag, VERSION_MAGIC};
+use crate::tag::{Tag, COMPRESSED_EXT, VERSION_MAGIC};
 
 /// The OTP atom-length ceiling, in **characters** (`erts/emulator/beam/erl_term.h`):
 /// a longer name is a `SystemLimit`, never a truncated atom.
@@ -36,9 +36,6 @@ const BIG_ARITY_MAX: usize = (1 << 16) - 1;
 /// `external.c:6146`).
 const BIG_DIGIT_BYTES: usize = size_of::<u64>();
 
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count (ERTS switches to a
-/// hashmap above it).
-const MAP_SMALL_MAP_LIMIT: usize = 32;
 /// Incremental external term format decoder.
 ///
 /// `new` requires and consumes the leading version byte `131`; `new_body`
@@ -76,11 +73,13 @@ impl<'a> Decoder<'a> {
 
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
     ///
-    /// Malformed/truncated input, a bad tag, invalid UTF-8 in an atom name or an
-    /// unset atom-cache slot yield `BeamError::BadArg`; a value beyond a wire
-    /// bound yields `BeamError::SystemLimit`; heap exhaustion propagates from the
-    /// heap as `BeamError::Alloc`; a tag the M1 term layer does not support yet
-    /// yields [`crate::error::unsupported`].
+    /// Malformed/truncated input, a bad tag, an obsolete tag the C also rejects
+    /// ([`Tag::Fun`], [`Tag::NewCache`]), invalid UTF-8 in an atom name or an unset
+    /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
+    /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
+    /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
+    /// ([`Tag::NewFun`], [`Tag::Export`], [`Tag::Record`], [`Tag::Local`],
+    /// [`Tag::DistHeader`]) yields [`crate::error::unsupported`].
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
@@ -182,6 +181,15 @@ impl<'a> Decoder<'a> {
                 let creation = self.reader.u32be()?;
                 crate::term::make_external_port(heap, node, number, creation)
             }
+            Tag::V4Port => {
+                // `[V4_PORT_EXT][node atom][id:8 BE u64][creation:4 BE u32]`
+                // (`external.c:4698-4716`). This is the form the C encoder *always*
+                // emits for a port (`external.c:3675`/`:3684`).
+                let node = self.decode_node_atom(heap, atoms)?;
+                let number = self.reader.u64be()?;
+                let creation = self.reader.u32be()?;
+                crate::term::make_external_port(heap, node, number, creation)
+            }
             Tag::Pid => {
                 let node = self.decode_node_atom(heap, atoms)?;
                 let number = self.reader.u32be()?;
@@ -246,10 +254,18 @@ impl<'a> Decoder<'a> {
             }
             Tag::Map => {
                 let count = self.reader.u32be()? as usize;
-                if count > MAP_SMALL_MAP_LIMIT {
-                    // Larger maps need the HAMT builder (see the crate CONTEXT.md).
-                    return Err(unsupported(Tag::Map));
+                // The pair count becomes a flatmap `arityval`, whose size field is
+                // `MAX_ARITYVAL` wide, so a larger map cannot be represented.
+                if count > MAX_ARITYVAL {
+                    return Err(system_limit());
                 }
+                // Every map is stored as a **flatmap**, whatever its pair count: the
+                // flatmap/hashmap switchover is an *open interior* layout (workspace
+                // `CONTEXT.md` §2) and no HAMT builder exists in the workspace yet.
+                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is preserved as-is —
+                // deliberately **not** sorted/deduped, unlike ERTS's sorted-flatmap
+                // invariant (`erl_map.h:181-199`, `external.c:5042-5100`); a future
+                // pass may sort via `beam_term::cmp`.
                 let mut pairs = Vec::new();
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;
@@ -260,19 +276,46 @@ impl<'a> Decoder<'a> {
             }
 
             // ---------------------------------------------------------------
-            // Deliberately unsupported in M1 — never a wrong encoding
+            // Binaries / bitstrings
             // ---------------------------------------------------------------
-            Tag::Binary
-            | Tag::BitBinary
-            | Tag::Compressed
-            | Tag::NewFun
-            | Tag::Export
-            | Tag::Fun
-            | Tag::V4Port
-            | Tag::Local
-            | Tag::DistHeader
-            | Tag::NewCache
-            | Tag::Record => Err(unsupported(tag)),
+            Tag::Binary | Tag::BitBinary => self.decode_bitstring(tag, heap),
+
+            // ---------------------------------------------------------------
+            // `COMPRESSED` — top-level only
+            // ---------------------------------------------------------------
+            // The C accepts `COMPRESSED` (`80`) only as the outermost wrapper,
+            // immediately after the version byte (`external.c:1759`); `decode_term`
+            // unwraps it there. Reaching it here — nested inside a term, or as a
+            // bare tag — is malformed input, never a term.
+            Tag::Compressed => Err(bad_arg()),
+
+            // ---------------------------------------------------------------
+            // Obsolete / dead tags — malformed input, never a term
+            // ---------------------------------------------------------------
+            // `FUN_EXT` (`117`) was removed in OTP 23: the C decoder rejects it
+            // outright (`goto error`, `external.c:6399-6404`), so it is malformed
+            // (`BadArg`), not a "recognized but unimplemented" tag.
+            Tag::Fun => Err(bad_arg()),
+            // `NEW_CACHE` (`78`) is dead in this OTP (`#if 0`, `external.h:77-81`);
+            // byte `78` is `MAGIC_REF_INTERNAL_REF`, which only ever appears inside a
+            // distribution payload's internal-tag stream, never as a term tag — so in
+            // a term it is malformed (`BadArg`), not `unsupported`.
+            Tag::NewCache => Err(bad_arg()),
+
+            // ---------------------------------------------------------------
+            // Deliberately unsupported in M1 — never a wrong term
+            // ---------------------------------------------------------------
+            // `NEW_FUN_EXT`/`EXPORT_EXT`: blocked on a fun/export registry that does
+            // not exist yet (owned by `beam_loader`/`beam_rt`).
+            Tag::NewFun | Tag::Export => Err(unsupported(tag)),
+            // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
+            // records encode as tuples).
+            Tag::Record => Err(unsupported(tag)),
+            // `LOCAL_EXT` (`121`): needs local-node identity, which the codec has none
+            // of (owned by `beam_dist`/`beam_rt`).
+            Tag::Local => Err(unsupported(tag)),
+            // `DIST_HEADER` (`68`): owned by `beam_dist`, which frames it itself.
+            Tag::DistHeader => Err(unsupported(tag)),
         }
     }
 
@@ -375,16 +418,104 @@ impl<'a> Decoder<'a> {
         }
         crate::term::make_big(heap, negative, &bytes_to_digits(magnitude))
     }
+
+    /// Decodes `BINARY_EXT`/`BIT_BINARY_EXT` into an on-heap bitstring
+    /// (`external.c:4896-4923`).
+    ///
+    /// The wire is `[len:4 BE][data]` for a binary and `[len:4 BE][bits:1][data]`
+    /// for a bit binary — the length field comes **before** the trailing-bit count.
+    /// `len` is attacker-controlled, so it is checked against the bytes actually
+    /// left in the cursor *before* anything is allocated: a lying length is
+    /// `BeamError::BadArg`, never a blind allocation. For `BIT_BINARY_EXT` the
+    /// trailing-bit count must be `1..=8` and `len * 8` must be at least 8 (i.e.
+    /// `len != 0`), exactly as the C, and `size_in_bits = len * 8 - (8 - bits)`.
+    ///
+    /// The C clears the unused trailing bits of the last byte before copying; here
+    /// [`crate::term::make_bitstring`] zeroes them, so the term carries no garbage
+    /// from a hostile wire.
+    fn decode_bitstring(&mut self, tag: Tag, heap: &mut Heap) -> Result<Eterm> {
+        let len = self.reader.u32be()? as usize;
+        // `BIT_BINARY_EXT` carries the number of significant bits in the last byte
+        // right after the length; a plain binary is byte-aligned (a full 8).
+        let trailing_bits = if tag == Tag::BitBinary {
+            self.reader.u8()?
+        } else {
+            8
+        };
+        // A length past the end of the cursor is a lie: reject it rather than size an
+        // allocation from it.
+        if len > self.reader.remaining() {
+            return Err(bad_arg());
+        }
+        let data = self.reader.bytes(len)?;
+        // `len` is at most `u32::MAX`, so this cannot overflow on 64-bit; the guard
+        // keeps the arithmetic total on every target.
+        let size_in_bits = len.checked_mul(8).ok_or_else(system_limit)?;
+        if tag == Tag::BitBinary {
+            if !(1..=8).contains(&trailing_bits) || size_in_bits < 8 {
+                return Err(bad_arg());
+            }
+            let size_in_bits = size_in_bits - (8 - usize::from(trailing_bits));
+            crate::term::make_bitstring(heap, data, size_in_bits)
+        } else {
+            crate::term::make_binary(heap, data)
+        }
+    }
 }
 
 /// Decodes a `term_to_binary` image into `heap`, interning atoms into `atoms`.
 ///
 /// Convenience over [`Decoder::new`] + [`Decoder::decode`] + [`Decoder::finish`].
+///
+/// A top-level `COMPRESSED` (`80`) wrapper is unwrapped here **before** the inner
+/// term is decoded: see [`decompress_wrapper`]. (It cannot be handled inside
+/// [`Decoder`] without changing its lifetimes, because the decompressed body is an
+/// owned buffer the borrowed `Decoder<'a>` cannot hold.)
 pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+    if let Some(body) = decompress_wrapper(bytes)? {
+        let mut decoder = Decoder::new_body(&body);
+        let term = decoder.decode(heap, atoms)?;
+        decoder.finish()?;
+        return Ok(term);
+    }
     let mut decoder = Decoder::new(bytes)?;
     let term = decoder.decode(heap, atoms)?;
     decoder.finish()?;
     Ok(term)
+}
+
+/// Whether `bytes` is a top-level `COMPRESSED` image:
+/// `[VERSION_MAGIC][COMPRESSED_EXT][size:4 BE][zlib stream]`.
+///
+/// The 6-byte minimum mirrors the C check (`external.c:1754-1759`): once the version
+/// byte is consumed, the C requires at least the tag plus the 4-byte size before it
+/// takes the `COMPRESSED` branch, so a shorter image is treated as an ordinary (and
+/// therefore invalid) term starting at the `80` byte.
+fn is_compressed_image(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
+}
+
+/// Unwraps a top-level `COMPRESSED` image, returning the inner term body.
+///
+/// `Ok(None)` means the image is not compressed and the caller decodes it normally;
+/// `Ok(Some(body))` is the decompressed inner term — the bytes that follow the
+/// version byte of the *inner* `term_to_binary` image, so they start at the term tag
+/// and carry no version byte.
+///
+/// The 4-byte size field is the inner term's byte length **excluding** the version
+/// byte; a decompressed length that disagrees with it, or any zlib failure, yields
+/// `BeamError::BadArg` (`external.c:1807-1810`), never a partially decoded term.
+fn decompress_wrapper(bytes: &[u8]) -> Result<Option<Vec<u8>>> {
+    if !is_compressed_image(bytes) {
+        return Ok(None);
+    }
+    // `is_compressed_image` guarantees `bytes[..6]` is present.
+    let size = u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]) as usize;
+    let body = crate::compress::decompress(&bytes[6..])?;
+    if body.len() != size {
+        return Err(bad_arg());
+    }
+    Ok(Some(body))
 }
 
 /// Groups base-256 magnitude bytes (least significant first) into `ErtsDigit`s —
@@ -423,8 +554,9 @@ mod tests {
 
     use crate::error::is_unsupported;
     use crate::term::{
-        big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts,
-        external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+        big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
+        external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
+        tuple_element,
     };
 
     /// `{ok,17}` (oracle: `term_to_binary({ok,17})`).
@@ -645,7 +777,7 @@ mod tests {
     }
 
     #[test]
-    fn maps_flatmap_and_limit() {
+    fn maps_flatmap_at_any_pair_count() {
         // `#{a=>1}`.
         let (_h, atoms, term) = decode(&MAP_A_1);
         let (keys, values) = flatmap_parts(term).unwrap();
@@ -660,8 +792,25 @@ mod tests {
         assert!(keys.is_empty());
         assert!(values.is_empty());
 
-        // 33 pairs needs the HAMT builder: reported, never mis-encoded.
-        assert_unsupported(&[131, 116, 0, 0, 0, 33]);
+        // 40 pairs (> `MAP_SMALL_MAP_LIMIT`) decodes as a flatmap of 40 pairs, in
+        // wire order — no HAMT builder is needed.
+        let mut image = vec![131, 116, 0, 0, 0, 40];
+        for i in 0..40u8 {
+            image.extend_from_slice(&[97, i]); // SMALL_INTEGER_EXT key
+            image.extend_from_slice(&[97, i + 100]); // SMALL_INTEGER_EXT value
+        }
+        let (_h, _a, term) = decode(&image);
+        let (keys, values) = flatmap_parts(term).unwrap();
+        assert_eq!(keys.len(), 40);
+        assert_eq!(values.len(), 40);
+        for i in 0..40i64 {
+            assert_eq!(keys[i as usize], make_small(i));
+            assert_eq!(values[i as usize], make_small(i + 100));
+        }
+
+        // A pair count past `MAX_ARITYVAL` cannot be a flatmap `arityval`: a
+        // `SystemLimit`, and nothing is read past the count.
+        assert_system_limit(&[131, 116, 0x01, 0x00, 0x00, 0x00]);
     }
 
     #[test]
@@ -747,7 +896,7 @@ mod tests {
         assert_eq!(atoms.name(atom_val(node)), Some("n1"));
         assert_eq!((number, serial, creation), (1, 2, 3));
 
-        // `NEW_PORT_EXT`.
+        // `NEW_PORT_EXT` (decode-only; the encoder never emits it).
         let mut image = vec![131, 89];
         image.extend_from_slice(&NODE_N1);
         image.extend_from_slice(&7u32.to_be_bytes());
@@ -756,6 +905,28 @@ mod tests {
         let (node, number, creation) = external_port_parts(term).unwrap();
         assert_eq!(atoms.name(atom_val(node)), Some("n1"));
         assert_eq!((number, creation), (7, 9));
+
+        // `V4_PORT_EXT`: an 8-byte id — the form the C encoder always emits.
+        let mut image = vec![131, 120];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&0x0000_0007_0000_0001u64.to_be_bytes());
+        image.extend_from_slice(&9u32.to_be_bytes());
+        let (_h, atoms, term) = decode(&image);
+        let (node, number, creation) = external_port_parts(term).unwrap();
+        assert_eq!(atoms.name(atom_val(node)), Some("n1"));
+        assert_eq!((number, creation), (0x0000_0007_0000_0001, 9));
+
+        // `V4_PORT_EXT` with the maximum 64-bit id.
+        let mut image = vec![131, 120];
+        image.extend_from_slice(&NODE_N1);
+        image.extend_from_slice(&u64::MAX.to_be_bytes());
+        image.extend_from_slice(&u32::MAX.to_be_bytes());
+        let (_h, _a, term) = decode(&image);
+        let (number, creation) = (external_port_parts(term).unwrap().1, external_port_parts(term).unwrap().2);
+        assert_eq!((number, creation), (u64::MAX, u32::MAX));
+
+        // A `V4_PORT_EXT` whose id field is truncated is malformed.
+        assert_bad_arg(&[131, 120, 119, 2, 110, 49, 0, 0, 0, 0]);
 
         // `PORT_EXT` (legacy): a 16-bit id, 8-bit creation.
         let mut image = vec![131, 102];
@@ -834,7 +1005,15 @@ mod tests {
 
     #[test]
     fn truncation_at_every_offset_is_bad_arg() {
-        for image in [&OK_17[..], &LIST_123[..], &MAP_A_1[..]] {
+        // `<<"hi">>` and `<<1:3>>` exercise the binary / bit-binary length+payload
+        // headers as well.
+        for image in [
+            &OK_17[..],
+            &LIST_123[..],
+            &MAP_A_1[..],
+            &[131, 109, 0, 0, 0, 2, b'h', b'i'],
+            &[131, 77, 0, 0, 0, 1, 3, 0b0010_0000],
+        ] {
             for len in 0..image.len() {
                 let mut heap = Heap::new(256).unwrap();
                 let mut atoms = AtomTable::new();
@@ -847,6 +1026,77 @@ mod tests {
         }
     }
 
+    // -----------------------------------------------------------------------
+    // Binaries and bitstrings
+    // -----------------------------------------------------------------------
+
+    /// The oracle images, captured from OTP 29.1.1 with
+    /// `io:format("~w~n", [term_to_binary(T)])`.
+    #[test]
+    fn binary_and_bit_binary_decode() {
+        // `<<"hi">>`: `[109][len:4 BE][data]`.
+        let (_h, _a, term) = decode(&[131, 109, 0, 0, 0, 2, 104, 105]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[104u8, 105][..], 0, 16));
+
+        // `<<>>`: a zero-length binary is legal (only `BIT_BINARY_EXT` rejects 0).
+        let (_h, _a, term) = decode(&[131, 109, 0, 0, 0, 0]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 0);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[][..], 0, 0));
+
+        // `<<1:3>>`: `[77][len:4 BE][bits:1][data]` — the length precedes the
+        // trailing-bit count, and the byte is `0b0010_0000` (MSB-first).
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 3, 0b0010_0000]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 3);
+        assert_eq!(
+            bitstring_bytes(term).unwrap(),
+            (&[0b0010_0000u8][..], 0, 3)
+        );
+
+        // `<<5:12>>`: 2 bytes, 4 significant bits in the last one.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 4, 0x00, 0x50]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 12);
+        assert_eq!(bitstring_bytes(term).unwrap(), (&[0x00u8, 0x50][..], 0, 12));
+
+        // `<<3:13>>`.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 5, 0x00, 0x18]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 13);
+
+        // `<<1:1>>`: `len = 1`, `bits = 1` ⇒ 1 bit (the C allows `size_in_bits < 8`
+        // after the trailing-bit adjustment, as long as `len != 0`).
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 1, 0b1000_0000]);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 1);
+
+        // A trailing-bit count of 8 is accepted for backwards compatibility and is
+        // equivalent to the byte-aligned form.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 2, 8, b'h', b'i']);
+        assert_eq!(bitstring_size_bits(term).unwrap(), 16);
+
+        // The trailing (non-significant) bits of the last byte are normalised to zero.
+        let (_h, _a, term) = decode(&[131, 77, 0, 0, 0, 1, 3, 0b0011_1111]);
+        assert_eq!(
+            bitstring_bytes(term).unwrap(),
+            (&[0b0010_0000u8][..], 0, 3)
+        );
+    }
+
+    #[test]
+    fn malformed_binaries_and_bit_strings_are_bad_arg() {
+        // A trailing-bit count outside `1..=8`.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 0, 0x00]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 9, 0x00]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1, 255, 0x00]);
+        // Zero bytes: `len * 8 < 8`.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 0, 8]);
+        // A length that lies past the end of the buffer (payload missing) — rejected
+        // *before* anything is allocated.
+        assert_bad_arg(&[131, 109, 0, 0, 0, 2, b'h']);
+        assert_bad_arg(&[131, 109, 0, 0, 0xFF, 0xFF, 0xFF, 0xFF]);
+        assert_bad_arg(&[131, 77, 0, 0, 0, 2, 3, b'h']);
+        // A bit-binary without even its trailing-bit byte.
+        assert_bad_arg(&[131, 77, 0, 0, 0, 1]);
+    }
+
     #[test]
     fn unknown_and_unsupported_tags() {
         // A byte that is not a tag at all.
@@ -855,27 +1105,113 @@ mod tests {
         // `VERSION_MAGIC` is not a term tag.
         assert_bad_arg(&[131, 131]);
 
-        // Every tag the M1 term layer does not support is reported, not guessed.
+        // Obsolete/dead tags are *malformed* (`BadArg`), exactly as the C rejects
+        // them: `FUN_EXT` (removed in OTP 23) and `NEW_CACHE` (dead, `#if 0`).
+        assert_bad_arg(&[131, Tag::Fun.as_byte()]);
+        assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
+
+        // Every recognized-but-not-yet-implemented tag is reported, not guessed.
         for tag in [
-            Tag::Binary,
-            Tag::BitBinary,
-            Tag::Compressed,
             Tag::NewFun,
             Tag::Export,
-            Tag::Fun,
-            Tag::V4Port,
+            Tag::Record,
             Tag::Local,
             Tag::DistHeader,
-            Tag::NewCache,
-            Tag::Record,
         ] {
             assert_unsupported(&[131, tag.as_byte()]);
         }
 
-        // The documented oracle vector for `<<"hi">>`.
-        assert_unsupported(&[131, 109, 0, 0, 0, 2, 104, 105]);
+        // `COMPRESSED` is *covered* now, but only as the top-level wrapper: as a bare
+        // tag (a 2-byte image, below the 6-byte minimum) it is malformed, and nested
+        // inside a term it is malformed too — never `unsupported`, never a term.
+        assert_bad_arg(&[131, 80]);
+        assert_bad_arg(&[131, 104, 1, 80]);
     }
 
+    // -----------------------------------------------------------------------
+    // `COMPRESSED` (`80`) — the top-level zlib wrapper
+    // -----------------------------------------------------------------------
+
+    /// `term_to_binary(lists:duplicate(500, hello), [compressed])` — an oracle image
+    /// captured from OTP 29.1.1. Layout: `131, 80, <inner size:4 BE>, <zlib stream>`;
+    /// the declared inner size is `3506`, the length of `term_to_binary(List)` minus
+    /// its version byte.
+    const COMPRESSED_DUP_500_HELLO: [u8; 50] = [
+        131, 80, 0, 0, 13, 178, 120, 156, 237, 197, 177, 9, 0, 32, 16, 4, 176, 183, 112, 84, 65,
+        228, 192, 210, 197, 29, 192, 53, 44, 146, 38, 169, 106, 247, 244, 57, 146, 45, 73, 146,
+        36, 73, 250, 168, 245, 0, 145, 146, 3, 87,
+    ];
+
+    #[test]
+    fn compressed_top_level_wrapper_is_unwrapped() {
+        // The inner body needs 500 cons cells: a heap of 256 words is too small.
+        let mut heap = Heap::new(4096).unwrap();
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&COMPRESSED_DUP_500_HELLO, &mut heap, &mut atoms).unwrap();
+
+        // The inner term is `[hello, hello, …]` — 500 atoms, proper tail.
+        let mut count = 0usize;
+        let mut cursor = term;
+        while is_list(cursor) {
+            let head = cons_head(cursor).unwrap();
+            assert!(is_atom(head), "expected an atom element, got {head:?}");
+            assert_eq!(atoms.name(atom_val(head)), Some("hello"));
+            cursor = cons_tail(cursor).unwrap();
+            count += 1;
+        }
+        assert!(is_nil(cursor), "the inner list must be proper");
+        assert_eq!(count, 500);
+    }
+
+    #[test]
+    fn hand_built_compressed_image_decodes() {
+        // The inner body of `{ok,17}` — the `OK_17` image without its version byte.
+        let body: &[u8] = &[104, 2, 119, 2, 111, 107, 97, 17];
+        let zlib = crate::compress::compress(body, 6).unwrap();
+        let mut image = vec![VERSION_MAGIC, COMPRESSED_EXT];
+        image.extend_from_slice(&(body.len() as u32).to_be_bytes());
+        image.extend_from_slice(&zlib);
+
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms = AtomTable::new();
+        let term = decode_term(&image, &mut heap, &mut atoms).unwrap();
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(term, 0).unwrap())),
+            Some("ok")
+        );
+        assert_eq!(tuple_element(term, 1).unwrap(), make_small(17));
+    }
+
+    #[test]
+    fn compressed_negative_cases_are_bad_arg() {
+        let image = COMPRESSED_DUP_500_HELLO;
+
+        // Fewer than 6 bytes: the C does not even take the `COMPRESSED` branch
+        // (it needs the tag plus the 4-byte size, `external.c:1759`), so the `80` is
+        // treated as an ordinary — and therefore invalid — term tag.
+        assert_bad_arg(&[131, 80]);
+        assert_bad_arg(&[131, 80, 0, 0, 13]);
+
+        // A declared size that disagrees with the actual decompressed length.
+        let mut wrong_size = image.to_vec();
+        wrong_size[2..6].copy_from_slice(&1u32.to_be_bytes());
+        assert_bad_arg(&wrong_size);
+
+        // A corrupt Adler-32 trailer: zlib rejects the stream.
+        let mut corrupt = image.to_vec();
+        let last = corrupt.len() - 1;
+        corrupt[last] ^= 0xFF;
+        assert_bad_arg(&corrupt);
+
+        // A payload that is not a zlib stream at all.
+        assert_bad_arg(&[131, 80, 0, 0, 0, 10, 1, 2, 3, 4, 5, 6]);
+
+        // Every truncation past the 6-byte header must be rejected, never a panic.
+        for len in 6..image.len() {
+            assert_bad_arg(&image[..len]);
+        }
+    }
     #[test]
     fn version_byte_is_required_and_checked() {
         // Missing (empty input).

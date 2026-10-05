@@ -89,6 +89,10 @@ pub const ATOM_UTF8_EXT: u8 = 118;
 pub const SMALL_ATOM_UTF8_EXT: u8 = 119;
 
 /// `COMPRESSED` (`'P'`, `external.h:75`): a zlib-compressed payload.
+///
+/// The wire form is `[VERSION_MAGIC][COMPRESSED_EXT][uncompressed_size:4 BE][zlib
+/// stream]`, valid only as the outermost wrapper (immediately after the version byte);
+/// [`crate::decode::decode_term`] unwraps it. See [`crate::compress`].
 pub const COMPRESSED_EXT: u8 = 80;
 
 /// `BIT_BINARY_EXT` (`'M'`, `external.h:52`): a non-byte-aligned bitstring.
@@ -100,10 +104,16 @@ pub const NEW_FUN_EXT: u8 = 112;
 /// `EXPORT_EXT` (`'q'`, `external.h:56`): an exported fun.
 pub const EXPORT_EXT: u8 = 113;
 
-/// `FUN_EXT` (`'u'`, `external.h:58`): the legacy fun form.
+/// `FUN_EXT` (`'u'`, `external.h:58`): the legacy (pre-OTP 23) fun form.
+///
+/// Removed in OTP 23; the C decoder rejects it (`goto error`, `external.c:6399-6404`),
+/// so byte `117` is **malformed**, never a term and never `unsupported`.
 pub const FUN_EXT: u8 = 117;
 
 /// `V4_PORT_EXT` (`'x'`, `external.h:61`): a port with a 64-bit id.
+///
+/// The C encoder **always** emits this form for a port (`external.c:3675`/`:3684`);
+/// `NEW_PORT_EXT` (`89`) is decode-only.
 pub const V4_PORT_EXT: u8 = 120;
 
 /// `LOCAL_EXT` (`'y'`, `external.h:62`): a local (node-less) pid/port/reference.
@@ -118,7 +128,11 @@ pub const ATOM_CACHE_REF_EXT: u8 = 82;
 pub const DIST_HEADER_EXT: u8 = 68;
 
 /// `NEW_CACHE` (`'N'`, `external.h:80`): the extended distribution atom-cache
-/// update. Owned by `beam_dist`; M1 never emits it.
+/// update.
+///
+/// **Dead in this OTP** (`#if 0`, `external.h:77-81`): byte `78` is
+/// `MAGIC_REF_INTERNAL_REF` (`external.h:74`), not a term tag. Reaching it in a term
+/// is **malformed**, never `unsupported`.
 pub const NEW_CACHE_EXT: u8 = 78;
 
 /// `RECORD_EXT` (`'C'`, `external.h:63`): a tuple tagged as a record.
@@ -179,6 +193,9 @@ pub enum Tag {
     /// `SMALL_ATOM_UTF8_EXT` (`119`).
     SmallAtomUtf8,
     /// `COMPRESSED` (`80`).
+    ///
+    /// Honoured only as the top-level wrapper (right after the version byte); nested
+    /// it is malformed input. See [`Tag::covered`].
     Compressed,
     /// `BIT_BINARY_EXT` (`77`).
     BitBinary,
@@ -332,11 +349,16 @@ impl Tag {
     /// Whether the Milestone-1 term layer supports this tag.
     ///
     /// `true` for the required core set (integers, floats, all four atom tags,
-    /// references, ports, pids, tuples, `NIL`, strings, lists, small maps and the
-    /// distribution atom-cache reference); `false` for everything the codec
-    /// deliberately reports as [`crate::error::unsupported`] (`COMPRESSED`,
-    /// binaries, funs, records, `V4_PORT_EXT`, `LOCAL_EXT` and the distribution
-    /// header).
+    /// references, ports — including the modern `V4_PORT_EXT` — pids, tuples, `NIL`,
+    /// strings, lists, binaries/bitstrings, maps of any pair count, the distribution
+    /// atom-cache reference, and `COMPRESSED` as a top-level wrapper); `false` for
+    /// everything the codec deliberately reports as [`crate::error::unsupported`]
+    /// (funs, records, `LOCAL_EXT` and the distribution header) **or** rejects as
+    /// malformed ([`Tag::Fun`], [`Tag::NewCache`]).
+    ///
+    /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
+    /// but only as the outermost wrapper, immediately after the version byte
+    /// (`crate::decode::decode_term`); nested it is malformed input.
     pub fn covered(self) -> bool {
         matches!(
             self,
@@ -353,6 +375,7 @@ impl Tag {
                 | Tag::NewerReference
                 | Tag::Port
                 | Tag::NewPort
+                | Tag::V4Port
                 | Tag::Pid
                 | Tag::NewPid
                 | Tag::SmallTuple
@@ -362,8 +385,11 @@ impl Tag {
                 | Tag::List
                 | Tag::SmallBig
                 | Tag::LargeBig
+                | Tag::Binary
+                | Tag::BitBinary
                 | Tag::Map
                 | Tag::AtomCacheRef
+                | Tag::Compressed
         )
     }
 }
@@ -389,7 +415,7 @@ mod tests {
         (Tag::Nil, 106, "NIL_EXT", true),
         (Tag::String, 107, "STRING_EXT", true),
         (Tag::List, 108, "LIST_EXT", true),
-        (Tag::Binary, 109, "BINARY_EXT", false),
+        (Tag::Binary, 109, "BINARY_EXT", true),
         (Tag::SmallBig, 110, "SMALL_BIG_EXT", true),
         (Tag::LargeBig, 111, "LARGE_BIG_EXT", true),
         (Tag::NewFloat, 70, "NEW_FLOAT_EXT", true),
@@ -401,12 +427,12 @@ mod tests {
         (Tag::NewerReference, 90, "NEWER_REFERENCE_EXT", true),
         (Tag::AtomUtf8, 118, "ATOM_UTF8_EXT", true),
         (Tag::SmallAtomUtf8, 119, "SMALL_ATOM_UTF8_EXT", true),
-        (Tag::Compressed, 80, "COMPRESSED", false),
-        (Tag::BitBinary, 77, "BIT_BINARY_EXT", false),
+        (Tag::Compressed, 80, "COMPRESSED", true),
+        (Tag::BitBinary, 77, "BIT_BINARY_EXT", true),
         (Tag::NewFun, 112, "NEW_FUN_EXT", false),
         (Tag::Export, 113, "EXPORT_EXT", false),
         (Tag::Fun, 117, "FUN_EXT", false),
-        (Tag::V4Port, 120, "V4_PORT_EXT", false),
+        (Tag::V4Port, 120, "V4_PORT_EXT", true),
         (Tag::Local, 121, "LOCAL_EXT", false),
         (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
         (Tag::DistHeader, 68, "DIST_HEADER", false),

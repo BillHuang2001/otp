@@ -13,20 +13,20 @@ use beam_term::{AtomTable, Eterm};
 
 use crate::error;
 use crate::tag::{
-    ATOM_EXT, ATOM_UTF8_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT,
-    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NIL_EXT, SMALL_ATOM_EXT,
-    SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, Tag,
+    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, INTEGER_EXT,
+    LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT,
+    NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT,
+    SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
 };
 use crate::term::{
-    big_parts, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
-    flatmap_parts, float_value, tuple_arity, tuple_element,
+    big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
 };
 use crate::writer::Writer;
 
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count the encoder emits (ERTS
-/// switches to a hashmap above it, which the M1 term layer cannot build — see the
-/// crate `CONTEXT.md`, "Known Issues").
-const MAP_SMALL_MAP_LIMIT: usize = 32;
+/// `MAX_ARITYVAL` (`erl_term.h:322`): the largest flat-map pair count, bound by the
+/// `arityval` header's 24-bit size field.
+const MAX_ARITYVAL: usize = (1 << 24) - 1;
 
 /// `SMALL_BIG_EXT` carries an 8-bit **byte** count (the number of base-256 digits on
 /// the wire, `external.c:3587`); larger magnitudes use `LARGE_BIG_EXT`.
@@ -132,9 +132,13 @@ impl<'a> Encoder<'a> {
         if let Ok((node, ids, creation)) = external_ref_parts(term) {
             return self.encode_ref(node, ids, creation);
         }
-        // Anything else (in practice a binary, which the Stage-0 foundations cannot
-        // build) is not representable by the M1 term layer: report it explicitly
-        // rather than emit a wrong encoding. Tests never reach this path.
+        if let Ok((bytes, offset_bits, size_bits)) = bitstring_bytes(term) {
+            return self.encode_bitstring(bytes, offset_bits, size_bits);
+        }
+        // Anything else is not representable by the M1 term layer (in practice an
+        // off-heap `BinRef`/`Fun`/`Record` block, which the Stage-0 foundations cannot
+        // build): report it explicitly rather than emit a wrong encoding. Tests never
+        // reach this path.
         Err(error::unsupported(Tag::Binary))
     }
 
@@ -306,14 +310,18 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a flat map (≤ `MAP_SMALL_MAP_LIMIT` pairs) as `MAP_EXT`.
+    /// Encodes a flat map of **any** pair count as `MAP_EXT`.
     ///
-    /// A larger map needs the HAMT builder the M1 term layer does not have, so it
-    /// is reported as unsupported.
+    /// Every map is stored as a flatmap: the flatmap/hashmap switchover is an *open
+    /// interior* layout (workspace `CONTEXT.md` §2) and no HAMT builder exists in the
+    /// workspace yet, so there is no `MAP_SMALL_MAP_LIMIT` cutoff. The pair order is
+    /// emitted as-is (interleaved `K1,V1,…,Kn,Vn`) — deliberately **not** sorted or
+    /// deduped (`erl_map.h:181-199`); a future pass may sort via `beam_term::cmp`.
+    /// The pair count must fit the flatmap `arityval` (24-bit), else `SystemLimit`.
     fn encode_map(&mut self, keys: &[Eterm], values: &[Eterm]) -> Result<()> {
         let n = keys.len();
-        if n > MAP_SMALL_MAP_LIMIT {
-            return Err(error::unsupported(Tag::Map));
+        if n > MAX_ARITYVAL {
+            return Err(error::system_limit());
         }
         debug_assert_eq!(n, values.len(), "a flatmap's keys and values are paired");
         self.buf.u8(MAP_EXT);
@@ -335,16 +343,14 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes an external port as `NEW_PORT_EXT` (the modern form). A 64-bit port
-    /// id cannot be represented by that tag's 32-bit field; `V4_PORT_EXT` is out of
-    /// M1 scope, so a wider id is a `SystemLimit` rather than a truncation.
+    /// Encodes an external port as `V4_PORT_EXT` — the form the C encoder **always**
+    /// emits for a port (`external.c:3675`/`:3684`); `NEW_PORT_EXT` (`89`) is
+    /// decode-only. The 64-bit id is written in full, so no port id is ever a
+    /// `SystemLimit` and no id is ever truncated.
     fn encode_port(&mut self, node: Eterm, number: u64, creation: u32) -> Result<()> {
-        if number > u32::MAX as u64 {
-            return Err(error::system_limit());
-        }
-        self.buf.u8(NEW_PORT_EXT);
+        self.buf.u8(V4_PORT_EXT);
         self.encode(node)?;
-        self.buf.u32be(number as u32);
+        self.buf.u64be(number);
         self.buf.u32be(creation);
         Ok(())
     }
@@ -361,6 +367,45 @@ impl<'a> Encoder<'a> {
         for &id in ids {
             self.buf.u32be(id);
         }
+        Ok(())
+    }
+
+    /// Encodes a bitstring: `BINARY_EXT` when its size is a whole number of bytes,
+    /// `BIT_BINARY_EXT` with a trailing-bit count otherwise
+    /// (`external.c:3855-3862`: `encoding = TAIL_BITS(size) ? BIT_BINARY_EXT :
+    /// BINARY_EXT`).
+    ///
+    /// `bytes` is the base byte view, `offset_bits` the bit offset of the first
+    /// significant bit inside it and `size_bits` the bit count (see
+    /// [`crate::term::bitstring_bytes`]). The payload is repacked so the significant
+    /// bits start at bit 0 of the output and the unused trailing bits of the last
+    /// byte are **zero** — a sub-bitstring source may carry non-zero bits there
+    /// (`external.c:3914-3922`).
+    ///
+    /// The wire length field is a 32-bit byte count, so a bitstring that cannot be
+    /// represented by these two tags is a `BeamError::SystemLimit` rather than a
+    /// truncated length (the C computes the size with a `Uint` and has no such
+    /// check; the bound is also what keeps the repack buffer finite).
+    fn encode_bitstring(
+        &mut self,
+        bytes: &[u8],
+        offset_bits: usize,
+        size_bits: usize,
+    ) -> Result<()> {
+        let n_bytes = bit_count_to_bytes(size_bits);
+        let tail = size_bits % 8;
+        let len_field = u32::try_from(n_bytes).map_err(|_| error::system_limit())?;
+        if tail == 0 {
+            self.buf.u8(BINARY_EXT);
+            self.buf.u32be(len_field);
+        } else {
+            self.buf.u8(BIT_BINARY_EXT);
+            self.buf.u32be(len_field);
+            // `bits` is the number of significant bits in the last byte (`1..=8`).
+            self.buf.u8(tail as u8);
+        }
+        let payload = repack_bits(bytes, offset_bits, size_bits, n_bytes)?;
+        self.buf.bytes(&payload);
         Ok(())
     }
 
@@ -382,6 +427,35 @@ impl<'a> Encoder<'a> {
     /// Consumes the encoder, returning the written bytes.
     pub fn finish(self) -> Vec<u8> {
         self.buf.into_vec()
+    }
+
+    /// Consumes the encoder, compressing the written term into a `COMPRESSED`
+    /// (`80`) `term_to_binary` image at zlib `level` (`0..=9`).
+    ///
+    /// The written term is the *inner body*: the bytes the encoder produced, minus a
+    /// leading [`VERSION_MAGIC`](crate::VERSION_MAGIC) if [`Encoder::new`] wrote one
+    /// (a term body never starts with `131`, which is not a tag, so stripping it when
+    /// present is unambiguous). The result is
+    /// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]` — the wire layout
+    /// `erlang:term_to_binary(Term, [compressed])` produces (`external.c:2289-2297`).
+    /// (The deflate bytes themselves are implementation-defined: zlib and
+    /// `miniz_oxide` emit different, equally valid streams for the same body.)
+    ///
+    /// A `level` outside `0..=9` yields `BeamError::BadArg`; an inner body larger
+    /// than the 32-bit size field yields `BeamError::SystemLimit`; a zlib failure
+    /// would yield `BeamError::BadArg` (it cannot occur for a valid level here).
+    pub fn finish_compressed(self, level: u8) -> Result<Vec<u8>> {
+        crate::compress::reject_bad_level(level)?;
+        let buf = self.buf.into_vec();
+        let body: &[u8] = buf.strip_prefix(&[crate::VERSION_MAGIC]).unwrap_or(&buf);
+        let size = u32::try_from(body.len()).map_err(|_| error::system_limit())?;
+
+        let mut out = Writer::with_capacity(body.len() + 6);
+        out.u8(crate::VERSION_MAGIC);
+        out.u8(COMPRESSED_EXT);
+        out.u32be(size);
+        out.bytes(&crate::compress::compress(body, level)?);
+        Ok(out.into_vec())
     }
 }
 
@@ -417,6 +491,57 @@ fn strip_high_zero_bytes(digits: &[u8]) -> &[u8] {
     &digits[..end]
 }
 
+/// Repacks `size_bits` significant bits — MSB-first inside each byte — from bit
+/// `offset_bits` of `bytes` into exactly `n_bytes = ceil(size_bits / 8)` output
+/// bytes, with the significant bits starting at bit 0 and the unused trailing bits
+/// of the last byte zeroed.
+///
+/// This is C `copy_binary_to_buffer(dst, 0, base, offset, size)`
+/// (`erl_bits.h:541-556`) together with the `ep[wire_size - 1] = 0` pre-clear the
+/// `BIT_BINARY_EXT` encoder does (`external.c:3914-3922`): the destination is
+/// zeroed up front, then the `size_bits` bits are copied in.
+///
+/// `offset_bits` is `0` for a heap bitstring (and for the byte-aligned sub-bitstring
+/// case a plain `copy_from_slice` is used); a non-byte-aligned offset — only
+/// reachable from a sub-bitstring — falls back to a per-bit shift. A source range
+/// outside `bytes` yields `BeamError::BadArg` rather than a panic (a well-formed
+/// bitstring never triggers it).
+fn repack_bits(
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+    n_bytes: usize,
+) -> Result<Vec<u8>> {
+    debug_assert_eq!(
+        n_bytes,
+        bit_count_to_bytes(size_bits),
+        "the caller sized the buffer from the bit count"
+    );
+    let mut out = vec![0u8; n_bytes];
+    if size_bits == 0 {
+        return Ok(out);
+    }
+    if offset_bits % 8 == 0 {
+        let start = offset_bits / 8;
+        let end = start.checked_add(n_bytes).ok_or_else(error::bad_arg)?;
+        let src = bytes.get(start..end).ok_or_else(error::bad_arg)?;
+        out.copy_from_slice(src);
+    } else {
+        for i in 0..size_bits {
+            let bit = offset_bits + i;
+            let byte = *bytes.get(bit / 8).ok_or_else(error::bad_arg)?;
+            if byte & (0x80 >> (bit % 8)) != 0 {
+                out[i / 8] |= 0x80 >> (i % 8);
+            }
+        }
+    }
+    // The source's trailing bits are not significant: clear them.
+    if size_bits % 8 != 0 {
+        out[n_bytes - 1] &= 0xFFu8 << (8 - (size_bits % 8));
+    }
+    Ok(out)
+}
+
 /// Encodes `term` as a `term_to_binary` image: version byte plus term.
 ///
 /// Convenience over [`Encoder::new`] + [`Encoder::encode`] + [`Encoder::finish`].
@@ -434,6 +559,38 @@ pub fn encode_term_body(term: Eterm, atoms: &AtomTable) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_body(atoms);
     encoder.encode(term)?;
     Ok(encoder.finish())
+}
+
+/// Encodes `term` as a compressed `term_to_binary` image:
+/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`.
+///
+/// The term is encoded uncompressed first (the `zlib` stream is the *inner* body, so
+/// it never contains the version byte), then deflated at zlib `level`. This is the
+/// byte layout of `erlang:term_to_binary(Term, [{compressed, Level}])`
+/// (`external.c:2289-2297`), and it is exactly what [`encode_term`] would produce if
+/// compression had not helped — the C falls back to the uncompressed image in that
+/// case; this entry point always emits the compressed wrapper because compression was
+/// explicitly requested.
+///
+/// The default [`encode_term`] stays uncompressed: the wrapper is emitted only here.
+pub fn encode_term_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::new_body(atoms);
+    encoder.encode(term)?;
+    encoder.finish_compressed(level)
+}
+
+/// Encodes `term` as a compressed **body**: the same zlib wrapper as
+/// [`encode_term_compressed`] but with the leading version byte omitted, i.e.
+/// `[COMPRESSED_EXT][inner_size:4 BE][zlib body]` (the distribution-payload / ETS
+/// blob form, where the version byte is not part of the body).
+///
+/// The inner bytes are the term body (as [`encode_term_body`]); the 4-byte size is
+/// that body's length, version byte excluded.
+pub fn encode_term_body_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
+    let image = encode_term_compressed(term, atoms, level)?;
+    // Drop the leading `VERSION_MAGIC`; everything else (tag, size, zlib stream) is
+    // already the body form. `encode_term_compressed` guarantees the version byte.
+    Ok(image[1..].to_vec())
 }
 
 #[cfg(test)]
@@ -774,6 +931,29 @@ mod tests {
     }
 
     #[test]
+    fn maps_above_the_small_limit_encode_as_map_ext() {
+        // 40 pairs — past `MAP_SMALL_MAP_LIMIT` (32) — is still a `MAP_EXT` flatmap,
+        // never `unsupported` (the flatmap/hashmap switchover is an open interior
+        // layout; no HAMT builder exists).
+        let mut atoms = AtomTable::new();
+        let mut heap = new_heap(4 + 2 * 40 + 64);
+        let mut pairs = Vec::new();
+        for i in 0..40i64 {
+            let key = make_atom(atoms.intern(&format!("k{i}")));
+            pairs.push((key, make_small(i)));
+        }
+        let map = make_flatmap(&mut heap, &pairs).unwrap();
+
+        let bytes = encode_term_body(map, &atoms).unwrap();
+        assert_eq!(bytes[0], 116); // MAP_EXT
+        assert_eq!(u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]), 40);
+        // The wire order is the pair order: `K1,V1,…,Kn,Vn` (name then value).
+        assert_eq!(&bytes[5..9], &[119, 2, b'k', b'0']); // "k0"
+        assert_eq!(bytes[9], 97); // small integer
+        assert_eq!(bytes[10], 0);
+    }
+
+    #[test]
     fn external_pid_uses_new_pid_ext() {
         let mut atoms = AtomTable::new();
         let node = make_atom(atoms.intern("nonode@nohost"));
@@ -790,22 +970,36 @@ mod tests {
     }
 
     #[test]
-    fn external_port_uses_new_port_ext_and_checks_the_id_width() {
+    fn external_port_uses_v4_port_ext_with_the_full_id() {
         let mut atoms = AtomTable::new();
         let node = make_atom(atoms.intern("nonode@nohost"));
         let mut heap = new_heap(64);
 
-        let port = make_external_port(&mut heap, node, 0x1234, 5).unwrap();
-        let mut expected = vec![89u8];
-        expected.extend_from_slice(&[119, 13]);
-        expected.extend_from_slice(b"nonode@nohost");
-        expected.extend_from_slice(&0x1234u32.to_be_bytes());
-        expected.extend_from_slice(&5u32.to_be_bytes());
-        assert_eq!(encode_term_body(port, &atoms).unwrap(), expected);
+        let expected = |number: u64, creation: u32| {
+            let mut e = vec![120u8];
+            e.extend_from_slice(&[119, 13]);
+            e.extend_from_slice(b"nonode@nohost");
+            e.extend_from_slice(&number.to_be_bytes());
+            e.extend_from_slice(&creation.to_be_bytes());
+            e
+        };
 
-        // A 64-bit port id does not fit `NEW_PORT_EXT`'s 32-bit field: never truncate.
+        // A small id still uses the 64-bit `V4_PORT_EXT` form (never `NEW_PORT_EXT`).
+        let port = make_external_port(&mut heap, node, 0x1234, 5).unwrap();
+        assert_eq!(encode_term_body(port, &atoms).unwrap(), expected(0x1234, 5));
+
+        // A 64-bit port id is written in full — never truncated, never a limit.
         let wide = make_external_port(&mut heap, node, 0x1_0000_0000, 5).unwrap();
-        assert_system_limit(encode_term_body(wide, &atoms));
+        assert_eq!(
+            encode_term_body(wide, &atoms).unwrap(),
+            expected(0x1_0000_0000, 5)
+        );
+
+        let max = make_external_port(&mut heap, node, u64::MAX, u32::MAX).unwrap();
+        assert_eq!(
+            encode_term_body(max, &atoms).unwrap(),
+            expected(u64::MAX, u32::MAX)
+        );
     }
 
     #[test]

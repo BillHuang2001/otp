@@ -1,0 +1,1115 @@
+//! Bitstring **matching**: match entry, the fixed reads, the position ops and the
+//! flattened `bs_match` command interpreter.
+//!
+//! Ground truth (read-only): `emu/bs_instrs.tab` (`i_bs_start_match3` `:1199`,
+//! `i_bs_get_tail` `:1481`, `bs_get_position`/`bs_set_position` `:1085-1153`,
+//! `i_bs_get_fixed_integer` `:1420`, `i_bs_get_fixed_binary` `:1447`, `i_bs_skip`
+//! `:1512`, `i_bs_match_string` `:1004`, `i_bs_get_float2` `:227`, `i_bs_get_utf8`
+//! `:948`, `i_bs_get_utf16` `:983`, `i_bs_eq` `:1366`, `bs_test_tail_imm2` `:753`),
+//! the `bs_match` command lowering `emu/generators.tab:1102-1409` with the flag table
+//! `erl_bits.h:461-465`, and the decoders `erl_bits.c:erts_bs_get_float_2` `:550`,
+//! `erts_bs_get_utf8` `:2129`, `erts_bs_get_utf16` `:2224`, `f16_to_f32` `:508`.
+//!
+//! # Half-open restore pattern
+//!
+//! The compiler brackets a match sequence with `bs_get_position` **before** and a
+//! failure handler that runs `bs_set_position` then `bs_get_tail` then raises
+//! (`first8/1` in the fixture). A read opcode therefore must **not** advance the
+//! context when it *fails* — it only commits the new position on success — so the
+//! handler's `bs_set_position` always sees the pre-match position.
+//!
+//! # Command model
+//!
+//! `bs_match`'s `commands` operand is the raw flattened list the loader preserved
+//! (`instr.rs:730`); decoding the records is this module's job. A `pos` cursor
+//! advances locally through the commands and is written back into the context once
+//! the whole list has succeeded. `ensure_at_least`/`ensure_exactly` only test; the
+//! reads snapshot a value into a register.
+
+use std::collections::BTreeMap;
+
+use beam_common::Result;
+use beam_loader::{Instr, Label, Module, Operand};
+use beam_term::Eterm;
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::operand::{read_operand, write_operand};
+use crate::Step;
+
+use super::{
+    decode_flags, extract_bits, fail_step, is_all, le_bytes_to_digits, make_int,
+    make_small_checked, raw, read_size, read_uint_be, read_uint_le, sign_extend, small_value,
+    twos_complement_bits, BSF_LITTLE, BSF_SIGNED,
+};
+
+/// Execute a bitstring **matching** instruction.
+pub(super) fn exec(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let _ = (func, pc);
+    match instr {
+        Instr::BsStartMatch3 {
+            fail,
+            bin,
+            live: _,
+            dst,
+        } => {
+            let subject = read_operand(machine, bin)?;
+            match enter_match(ctx, subject)? {
+                Some(context) => {
+                    write_operand(machine, dst, context)?;
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, subject, ctx),
+            }
+        }
+
+        Instr::BsStartMatch4 {
+            fail,
+            live: _,
+            src,
+            dst,
+        } => {
+            let (fail_label, resume) = resolve_match4_fail(module, fail)?;
+            let subject = read_operand(machine, src)?;
+            if resume {
+                // `bs_start_match4 resume Ctx Dst` reduces to `move Ctx Dst`
+                // (`emu/ops.tab:1251-1252`): the source is already a match context,
+                // so rebinding must keep the *same* mutable context, not a copy.
+                if raw::ctx_parts(subject).is_none() {
+                    return fail_step(machine, module, labels, fail_label, subject, ctx);
+                }
+                write_operand(machine, dst, subject)?;
+                return Ok(Some(Step::Next));
+            }
+            match enter_match(ctx, subject)? {
+                Some(context) => {
+                    write_operand(machine, dst, context)?;
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, fail_label, subject, ctx),
+            }
+        }
+
+        Instr::BsGetPosition {
+            ctx: ctx_op,
+            dst,
+            live: _,
+        } => {
+            let (_, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_position")?;
+            let snapshot = raw::make_ctx(ctx, orig, start, end)?;
+            write_operand(machine, dst, snapshot)?;
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsSetPosition { ctx: ctx_op, pos } => {
+            let (term, _, _, _) = read_ctx(machine, ctx_op, "bs_set_position")?;
+            let value = read_operand(machine, pos)?;
+            let new_start = position_of(value)?;
+            raw::set_ctx_start(term, new_start);
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsGetTail {
+            ctx: ctx_op,
+            dst,
+            live: _,
+        } => {
+            // `i_bs_get_tail` builds the remaining bits from `start` to `end` and
+            // deliberately leaves the position unchanged.
+            let (_, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_tail")?;
+            let nbits = end.saturating_sub(start);
+            let bytes = raw::subject_bytes(orig)?;
+            let out = extract_bits(bytes, start, nbits)?;
+            let value = raw::make_bits(ctx, &out, nbits)?;
+            write_operand(machine, dst, value)?;
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsTestTail2 {
+            fail,
+            ctx: ctx_op,
+            bits,
+        } => {
+            let (term, _, start, end) = read_ctx(machine, ctx_op, "bs_test_tail2")?;
+            if end.saturating_sub(start) == *bits as usize {
+                Ok(Some(Step::Next))
+            } else {
+                fail_step(machine, module, labels, *fail, term, ctx)
+            }
+        }
+
+        Instr::BsGetInteger2 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            size,
+            unit,
+            flags,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_integer2")?;
+            let size = read_size(machine, size)?;
+            let Some(nbits) = size.checked_mul(*unit as usize) else {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            };
+            if nbits > end.saturating_sub(start) {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            let bytes = raw::subject_bytes(orig)?;
+            let value = read_integer_field(ctx, bytes, start, nbits, *flags)?;
+            write_operand(machine, dst, value)?;
+            raw::set_ctx_start(term, start + nbits);
+            Ok(Some(Step::Next))
+        }
+        Instr::BsGetBinary2 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            size,
+            unit,
+            flags: _,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_binary2")?;
+            let remaining = end.saturating_sub(start);
+            let nbits = if is_all(module, size) {
+                remaining
+            } else {
+                let size = read_size(machine, size)?;
+                match size.checked_mul(*unit as usize) {
+                    Some(nbits) => nbits,
+                    None => return fail_step(machine, module, labels, *fail, term, ctx),
+                }
+            };
+            if nbits > remaining {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            let bytes = raw::subject_bytes(orig)?;
+            let out = extract_bits(bytes, start, nbits)?;
+            let value = raw::make_bits(ctx, &out, nbits)?;
+            write_operand(machine, dst, value)?;
+            raw::set_ctx_start(term, start + nbits);
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsSkipBits2 {
+            fail,
+            ctx: ctx_op,
+            size,
+            unit,
+            flags: _,
+        } => {
+            let (term, _, start, end) = read_ctx(machine, ctx_op, "bs_skip_bits2")?;
+            let size = read_size(machine, size)?;
+            let Some(nbits) = size.checked_mul(*unit as usize) else {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            };
+            let Some(next) = start.checked_add(nbits) else {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            };
+            if next > end {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            raw::set_ctx_start(term, next);
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsMatch {
+            fail,
+            ctx: ctx_op,
+            commands,
+        } => run_commands(machine, module, labels, *fail, ctx_op, commands, ctx),
+
+        // `bs_match_string Fail Ctx Bits Offset` — compare the next `Bits` bits of
+        // the context against the `StrT` string at byte `Offset`
+        // (`i_bs_match_string`, `bs_instrs.tab:1004`). The comparison succeeds only
+        // when the whole string matches; a short subject or a mismatch is an ordinary
+        // match failure, and the position advances **only on success**.
+        Instr::BsMatchString {
+            fail,
+            ctx: ctx_op,
+            bits,
+            offset,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_match_string")?;
+            let size = *bits as usize;
+            if end.saturating_sub(start) < size {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            let pattern = module
+                .strings
+                .get(*offset as usize..)
+                .unwrap_or(&[]);
+            let bytes = raw::subject_bytes(orig)?;
+            if size > pattern.len() * 8 || !bits_equal(bytes, start, pattern, 0, size) {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            raw::set_ctx_start(term, start + size);
+            Ok(Some(Step::Next))
+        }
+
+        // `bs_get_float2 Fail Ctx Live Sz Flags Dst` — read a `Sz * Unit`-bit float
+        // (`i_bs_get_float2`, `bs_instrs.tab:227` into `erts_bs_get_float_2`). Only
+        // 0/16/32/64 bits are valid; a short subject or any other size is a match
+        // failure.
+        Instr::BsGetFloat2 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            size,
+            unit,
+            flags,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_float2")?;
+            let size = read_size(machine, size)?;
+            let Some(nbits) = size.checked_mul(*unit as usize) else {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            };
+            if !matches!(nbits, 0 | 16 | 32 | 64) || nbits > end.saturating_sub(start) {
+                return fail_step(machine, module, labels, *fail, term, ctx);
+            }
+            let bytes = raw::subject_bytes(orig)?;
+            let value = read_float_field(bytes, start, nbits, *flags)?;
+            let float = crate::terms::make_float(ctx, value)?;
+            write_operand(machine, dst, float)?;
+            raw::set_ctx_start(term, start + nbits);
+            Ok(Some(Step::Next))
+        }
+
+        Instr::BsGetUtf8 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags: _,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf8")?;
+            let bytes = raw::subject_bytes(orig)?;
+            match decode_utf8(bytes, start, end) {
+                Some((value, len)) => {
+                    let t = make_small_checked(value as i64)?;
+                    write_operand(machine, dst, t)?;
+                    raw::set_ctx_start(term, start + len);
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, term, ctx),
+            }
+        }
+
+        Instr::BsGetUtf16 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf16")?;
+            let bytes = raw::subject_bytes(orig)?;
+            match decode_utf16(bytes, start, end, *flags) {
+                Some((value, len)) => {
+                    let t = make_small_checked(value as i64)?;
+                    write_operand(machine, dst, t)?;
+                    raw::set_ctx_start(term, start + len);
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, term, ctx),
+            }
+        }
+
+        // `bs_get_utf32` is rewritten by `emu/ops.tab` into
+        // `bs_get_integer2 … 32 1` + `i_bs_validate_unicode_retract`; the observable
+        // result is a 32-bit big-endian read that must be a valid Unicode scalar.
+        Instr::BsGetUtf32 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags: _,
+            dst,
+        } => {
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf32")?;
+            let bytes = raw::subject_bytes(orig)?;
+            match decode_utf32(bytes, start, end) {
+                Some((value, len)) => {
+                    let t = make_small_checked(value as i64)?;
+                    write_operand(machine, dst, t)?;
+                    raw::set_ctx_start(term, start + len);
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, term, ctx),
+            }
+        }
+
+        Instr::BsSkipUtf8 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags: _,
+        } => skip_utf(machine, module, labels, ctx, ctx_op, *fail, decode_utf8),
+
+        Instr::BsSkipUtf16 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags,
+        } => {
+            let flags = *flags;
+            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_skip_utf16")?;
+            let bytes = raw::subject_bytes(orig)?;
+            match decode_utf16(bytes, start, end, flags) {
+                Some((_, len)) => {
+                    raw::set_ctx_start(term, start + len);
+                    Ok(Some(Step::Next))
+                }
+                None => fail_step(machine, module, labels, *fail, term, ctx),
+            }
+        }
+
+        Instr::BsSkipUtf32 {
+            fail,
+            ctx: ctx_op,
+            live: _,
+            flags: _,
+        } => skip_utf(machine, module, labels, ctx, ctx_op, *fail, decode_utf32),
+
+        _ => Ok(None),
+    }
+}
+
+/// Run a UTF skip: advance the position by the decoded length, or fail.
+fn skip_utf(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    ctx: &mut dyn ExecutionContext,
+    ctx_op: &Operand,
+    fail: Label,
+    decode: fn(&[u8], usize, usize) -> Option<(u32, usize)>,
+) -> Result<Option<Step>> {
+    let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_skip_utf")?;
+    let bytes = raw::subject_bytes(orig)?;
+    match decode(bytes, start, end) {
+        Some((_, len)) => {
+            raw::set_ctx_start(term, start + len);
+            Ok(Some(Step::Next))
+        }
+        None => fail_step(machine, module, labels, fail, term, ctx),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Match entry
+// ---------------------------------------------------------------------------
+
+/// Start (or resume) a match over `subject`, yielding the match context.
+///
+/// A heap binary becomes a fresh context at position 0 (`i_bs_start_match3`,
+/// `bs_instrs.tab:1199`); a term that is already an `ErlSubBits` is re-wrapped with
+/// its current position (the C `reuse` path). Anything else is a *match* failure
+/// (`None`), not an error.
+fn enter_match(ctx: &mut dyn ExecutionContext, subject: Eterm) -> Result<Option<Eterm>> {
+    if let Some((_, bits)) = raw::heap_bits(subject) {
+        return Ok(Some(raw::make_ctx(ctx, subject, 0, bits)?));
+    }
+    if let Some((orig, start, end)) = raw::ctx_parts(subject) {
+        return Ok(Some(raw::make_ctx(ctx, orig, start, end)?));
+    }
+    Ok(None)
+}
+
+/// Decode `bs_start_match4`'s `fail` operand: a label, or the atoms
+/// `no_fail`/`resume` (`emu/ops.tab:1243-1262`).
+fn resolve_match4_fail(module: &Module, fail: &Operand) -> Result<(Label, bool)> {
+    match fail {
+        Operand::Label(label) => Ok((*label, false)),
+        Operand::Atom(atom) => match module.atom_name(*atom) {
+            Some("no_fail") => Ok((beam_loader::NO_FAIL, false)),
+            Some("resume") => Ok((beam_loader::NO_FAIL, true)),
+            Some(other) => Err(error::unsupported(&format!(
+                "bs_start_match4: fail atom {other}"
+            ))),
+            None => Err(error::unsupported("bs_start_match4: unknown fail atom")),
+        },
+        _ => Err(error::unsupported(
+            "bs_start_match4: unsupported fail operand",
+        )),
+    }
+}
+
+/// Read a match-context operand, returning `(term, orig, start, end)`.
+fn read_ctx(
+    machine: &Machine,
+    operand: &Operand,
+    what: &str,
+) -> Result<(Eterm, Eterm, usize, usize)> {
+    let term = read_operand(machine, operand)?;
+    let (orig, start, end) = raw::ctx_parts(term)
+        .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
+    Ok((term, orig, start, end))
+}
+
+/// The bit position a `bs_set_position` operand denotes.
+///
+/// The engine's `bs_get_position` snapshots the whole context, so the ordinary
+/// input is another `ErlSubBits`; the C 64-bit lowering instead stores the raw
+/// position as a small integer (`bs_instrs.tab:1125-1129`), so that form is
+/// accepted too.
+fn position_of(value: Eterm) -> Result<usize> {
+    if let Some((_, start, _)) = raw::ctx_parts(value) {
+        return Ok(start);
+    }
+    if let Some(n) = small_value(value) {
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        return Err(error::unsupported("bs_set_position: negative bit position"));
+    }
+    Err(error::unsupported(
+        "bs_set_position: position is neither a context nor a small integer",
+    ))
+}
+
+/// Extract an integer field of `nbits` bits at bit `start`, honouring the
+/// `BSF_LITTLE`/`BSF_SIGNED` flags, and build the resulting term.
+///
+/// A field of at most 64 bits is collected into a machine word; a **wider** field
+/// is the `erts_bs_get_integer_2` big path (`erl_bits.c:170`) and may need a
+/// bignum, which is built through the [`ExecutionContext`].
+fn read_integer_field(
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    start: usize,
+    nbits: usize,
+    flags: u32,
+) -> Result<Eterm> {
+    if nbits > 64 {
+        return read_wide_integer_field(ctx, bytes, start, nbits, flags);
+    }
+    let raw_value = if flags & BSF_LITTLE != 0 {
+        read_uint_le(bytes, start, nbits)?
+    } else {
+        read_uint_be(bytes, start, nbits)?
+    };
+    let value = if flags & BSF_SIGNED != 0 {
+        sign_extend(raw_value, nbits)
+    } else {
+        raw_value
+    };
+    make_small_checked(value as i64)
+}
+
+/// Read an integer field **wider than 64 bits** and build the (possibly bignum)
+/// term, reproducing `erts_bs_get_integer_2` beyond its small-integer special
+/// cases (`erl_bits.c:245-398`).
+///
+/// The field's `nbits` bits are first laid out MSB-first in `field` (exactly what
+/// C's `erts_copy_bits_rev`/`erts_copy_bits_fwd` produce); `field` is then turned
+/// into the value's little-endian byte array:
+/// * **big-endian** (the default): the natural big-endian integer, i.e. value bit
+///   `k` is field bit `nbits - 1 - k`;
+/// * **little-endian**: the first 8-bit group is the least-significant byte, with
+///   the final partial group (`nbits % 8` bits) read MSB-first — C's
+///   `*MSB >>= 8 - BIT_OFFSET(num_bits)` adjustment.
+///
+/// A signed field whose top bit is set is two's-complemented into its magnitude
+/// (`MAYBE_SIGN_EXTEND`); the leading-zero normalisation is
+/// [`le_bytes_to_digits`], and `IS_USMALL` is [`make_int`].
+fn read_wide_integer_field(
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    start: usize,
+    nbits: usize,
+    flags: u32,
+) -> Result<Eterm> {
+    let num_bytes = nbits.div_ceil(8);
+    // The field's bits, MSB-first, left-aligned in `num_bytes` bytes.
+    let field = extract_bits(bytes, start, nbits)?;
+    let mut value = vec![0u8; num_bytes];
+    if flags & BSF_LITTLE != 0 {
+        let rem = nbits % 8;
+        for (j, out) in value.iter_mut().enumerate() {
+            *out = if j + 1 == num_bytes && rem != 0 {
+                field[j] >> (8 - rem)
+            } else {
+                field[j]
+            };
+        }
+    } else {
+        for k in 0..nbits {
+            let i = nbits - 1 - k;
+            let bit = (field[i / 8] >> (7 - (i % 8))) & 1;
+            value[k / 8] |= bit << (k % 8);
+        }
+    }
+    let negative = flags & BSF_SIGNED != 0 && (value[(nbits - 1) / 8] >> ((nbits - 1) % 8)) & 1 == 1;
+    if negative {
+        twos_complement_bits(&mut value, nbits);
+    }
+    let digits = le_bytes_to_digits(&value);
+    make_int(ctx, negative, &digits)
+}
+
+// ---------------------------------------------------------------------------
+// Bit-level helpers (a *bit* offset, not necessarily byte-aligned)
+// ---------------------------------------------------------------------------
+
+/// The bit at absolute index `index` (bit 0 is the MSB of byte 0).
+fn bit_at(bytes: &[u8], index: usize) -> u8 {
+    (bytes[index / 8] >> (7 - (index % 8))) & 1
+}
+
+/// Compare `nbits` bits of `a` starting at bit `astart` with `nbits` bits of `b`
+/// starting at bit `bstart`, MSB-first.
+///
+/// The caller guarantees both ranges are in bounds (a violated precondition would
+/// panic, so every call site range-checks first).
+fn bits_equal(a: &[u8], astart: usize, b: &[u8], bstart: usize, nbits: usize) -> bool {
+    (0..nbits).all(|i| bit_at(a, astart + i) == bit_at(b, bstart + i))
+}
+
+/// Read `nbits` bits (a whole number of bytes) starting at bit `start` as a
+/// **little-endian** integer: the field's least-significant byte comes first in the
+/// stream, each byte taken MSB-first.
+fn read_uint_le_bits(bytes: &[u8], start: usize, nbits: usize) -> Result<u64> {
+    if nbits % 8 != 0 {
+        return Err(error::unsupported(
+            "bitstring: little-endian field is not a whole number of bytes",
+        ));
+    }
+    if start.checked_add(nbits).is_none_or(|e| e > bytes.len() * 8) {
+        return Err(error::unsupported(
+            "bitstring: little-endian field out of range",
+        ));
+    }
+    let mut value = 0u64;
+    for k in 0..nbits / 8 {
+        let mut byte = 0u8;
+        for j in 0..8 {
+            byte = (byte << 1) | bit_at(bytes, start + 8 * k + j);
+        }
+        value |= u64::from(byte) << (8 * k);
+    }
+    Ok(value)
+}
+
+// ---------------------------------------------------------------------------
+// Float reads (`erts_bs_get_float_2`, `erl_bits.c:550`)
+// ---------------------------------------------------------------------------
+
+/// Read a `nbits`-bit float field at bit `start` and return its `f64` value.
+///
+/// `nbits` is 0/16/32/64 (validated by the caller). The field's byte order follows
+/// `BSF_LITTLE` (`big` is the default); a 16-bit field is a binary16 converted
+/// through `f16_to_f32` exactly as C does.
+fn read_float_field(bytes: &[u8], start: usize, nbits: usize, flags: u32) -> Result<f64> {
+    if nbits == 0 {
+        return Ok(0.0);
+    }
+    let little = flags & BSF_LITTLE != 0;
+    let raw = if little {
+        read_uint_le_bits(bytes, start, nbits)?
+    } else {
+        read_uint_be(bytes, start, nbits)?
+    };
+    Ok(match nbits {
+        16 => f64::from(f16_to_f32(raw as u16)),
+        32 => f64::from(f32::from_bits(raw as u32)),
+        64 => f64::from_bits(raw),
+        _ => return Err(error::unsupported("bs_get_float2: unsupported float size")),
+    })
+}
+
+/// `f16_to_f32` (`erl_bits.c:508`): IEEE-754 binary16 → binary32, exactly as C
+/// (subnormals are normalised; Inf/NaN are widened).
+fn f16_to_f32(fp: u16) -> f32 {
+    let sign = (fp >> 15) & 1;
+    let exp = (fp >> 10) & 0x1F;
+    let mantissa = fp & 0x3FF;
+    let mut res = u32::from(sign) << 31;
+    if exp == 0 {
+        if mantissa != 0 {
+            let mut m = u32::from(mantissa);
+            let mut e: i32 = 0;
+            while m & 0x400 == 0 {
+                m <<= 1;
+                e -= 1;
+            }
+            m &= 0x3FF;
+            let exp32 = (127 - 15 + 1 + e) as u32;
+            res |= exp32 << 23;
+            res |= m << 13;
+        }
+    } else if exp == 0x1F {
+        res |= 0xFF << 23;
+        if mantissa != 0 {
+            res |= u32::from(mantissa) << 13;
+        }
+    } else {
+        let exp32 = u32::from(exp) + (127 - 15);
+        res |= exp32 << 23;
+        res |= u32::from(mantissa) << 13;
+    }
+    f32::from_bits(res)
+}
+
+// ---------------------------------------------------------------------------
+// UTF reads (`erts_bs_get_utf8`/`_utf16`, `erl_bits.c:2129`/`:2224`)
+// ---------------------------------------------------------------------------
+
+/// `erts_trailing_bytes_for_utf8` (`erl_bits.c`): the number of *continuation* bytes
+/// a UTF-8 lead byte announces; `9` marks a byte that can never lead a sequence.
+fn trailing_bytes_for_utf8(b: u8) -> u8 {
+    match b {
+        0x00..=0x7F => 0,
+        0x80..=0xBF => 9,
+        0xC0..=0xDF => 1,
+        0xE0..=0xEF => 2,
+        0xF0..=0xF4 => 3,
+        _ => 9,
+    }
+}
+
+/// Decode one UTF-8 scalar from bit `start` (byte-aligned), bounded by bit `end`.
+///
+/// Returns `(code_point, bits_consumed)` or `None` for a malformed/short sequence —
+/// exactly the cases `erts_bs_get_utf8` rejects: reserved lead bytes, a bad
+/// continuation byte, an overlong encoding, a surrogate, or a value > U+10FFFF.
+/// `bs_get_utf8 -little` is not meaningful in ERTS (the flag is ignored), so the
+/// byte order is always big-endian here.
+fn decode_utf8(bytes: &[u8], start: usize, end: usize) -> Option<(u32, usize)> {
+    if end < start + 8 {
+        return None;
+    }
+    let a = read_uint_be(bytes, start, 8).ok()? as u8;
+    let trailing = trailing_bytes_for_utf8(a);
+    if trailing > 3 {
+        return None;
+    }
+    let trailing = trailing as usize;
+    let total_bits = (trailing + 1) * 8;
+    if end - start < total_bits {
+        return None;
+    }
+    let mask = if trailing == 0 {
+        0x7Fu32
+    } else {
+        (1u32 << (6 - trailing)) - 1
+    };
+    let mut result = (u32::from(a) & mask) << (6 * trailing);
+    for k in 1..=trailing {
+        let b = read_uint_be(bytes, start + 8 * k, 8).ok()? as u8;
+        if b & 0xC0 != 0x80 {
+            return None;
+        }
+        result |= u32::from(b & 0x3F) << (6 * (trailing - k));
+    }
+    // Overlong encodings (the minimum value each length may encode).
+    let min = match trailing {
+        1 => 0x80,
+        2 => 0x800,
+        3 => 0x10000,
+        _ => 0,
+    };
+    if result < min || (0xD800..=0xDFFF).contains(&result) || result > 0x10FFFF {
+        return None;
+    }
+    Some((result, total_bits))
+}
+
+/// Read a 16-bit field at bit `start` in the field's byte order.
+fn read_uint16(bytes: &[u8], start: usize, little: bool) -> Result<u16> {
+    if little {
+        Ok(read_uint_le_bits(bytes, start, 16)? as u16)
+    } else {
+        Ok(read_uint_be(bytes, start, 16)? as u16)
+    }
+}
+
+/// Decode one UTF-16 scalar from bit `start`, bounded by bit `end`
+/// (`erts_bs_get_utf16`). `BSF_LITTLE` selects little-endian 16-bit words.
+fn decode_utf16(bytes: &[u8], start: usize, end: usize, flags: u32) -> Option<(u32, usize)> {
+    let little = flags & BSF_LITTLE != 0;
+    if end < start + 16 {
+        return None;
+    }
+    let w1 = u32::from(read_uint16(bytes, start, little).ok()?);
+    if !(0xD800..=0xDFFF).contains(&w1) {
+        return Some((w1, 16));
+    }
+    // `w1` is a surrogate: it must be a high surrogate followed by a low surrogate.
+    if w1 > 0xDBFF || end - start < 32 {
+        return None;
+    }
+    let w2 = u32::from(read_uint16(bytes, start + 16, little).ok()?);
+    if !(0xDC00..=0xDFFF).contains(&w2) {
+        return None;
+    }
+    Some((((w1 & 0x3FF) << 10 | (w2 & 0x3FF)) + 0x10000, 32))
+}
+
+/// Decode one UTF-32 scalar from bit `start` (`i_bs_validate_unicode_retract`): a
+/// 32-bit big-endian read that must be a valid Unicode scalar
+/// (≤ U+10FFFF, not a surrogate).
+fn decode_utf32(bytes: &[u8], start: usize, end: usize) -> Option<(u32, usize)> {
+    if end < start + 32 {
+        return None;
+    }
+    let value = read_uint_be(bytes, start, 32).ok()? as u32;
+    if value > 0x10FFFF || (0xD800..=0xDFFF).contains(&value) {
+        return None;
+    }
+    Some((value, 32))
+}
+
+// ---------------------------------------------------------------------------
+// The `bs_match` command interpreter
+// ---------------------------------------------------------------------------
+
+/// Execute a `bs_match` command list against the context in `ctx_op`.
+fn run_commands(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    fail: Label,
+    ctx_op: &Operand,
+    commands: &[Operand],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_match")?;
+    let bytes = raw::subject_bytes(orig)?;
+    let mut pos = start;
+    let mut i = 0usize;
+    while i < commands.len() {
+        let Operand::Atom(command) = &commands[i] else {
+            return Err(error::unsupported(
+                "bs_match: command list does not start with an atom",
+            ));
+        };
+        let name = module
+            .atom_name(*command)
+            .ok_or_else(|| error::unsupported("bs_match: unknown command atom"))?;
+        match name {
+            // `ensure_at_least Size Unit` (`generators.tab:1164`).
+            "ensure_at_least" => {
+                let size = read_size(machine, cmd_at(commands, i + 1)?)?;
+                let unit = read_size(machine, cmd_at(commands, i + 2)?)?;
+                if !ensure_at_least(end.saturating_sub(pos), size, unit) {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                i += 3;
+            }
+
+            // `ensure_exactly Stride` — `bs_test_tail_imm2` (`generators.tab:1210`).
+            "ensure_exactly" => {
+                let stride = read_size(machine, cmd_at(commands, i + 1)?)?;
+                if end.saturating_sub(pos) != stride {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                i += 2;
+            }
+
+            // `skip Stride` — advance without binding (`i_bs_skip`).
+            "skip" => {
+                let stride = read_size(machine, cmd_at(commands, i + 1)?)?;
+                let Some(next) = pos.checked_add(stride) else {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                };
+                if next > end {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                pos = next;
+                i += 2;
+            }
+
+            // `integer Live Flags Size Unit Dst` (`i_bs_get_fixed_integer`).
+            "integer" => {
+                let flags = decode_flags(module, cmd_at(commands, i + 2)?)?;
+                let size = read_size(machine, cmd_at(commands, i + 3)?)?;
+                let unit = read_size(machine, cmd_at(commands, i + 4)?)?;
+                let dst = cmd_at(commands, i + 5)?;
+                let Some(nbits) = size.checked_mul(unit) else {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                };
+                if nbits > end.saturating_sub(pos) {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                let value = read_integer_field(ctx, bytes, pos, nbits, flags)?;
+                write_operand(machine, dst, value)?;                pos += nbits;
+                i += 6;
+            }
+
+            // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
+            "binary" => {
+                let size_op = cmd_at(commands, i + 3)?;
+                let unit = read_size(machine, cmd_at(commands, i + 4)?)?;
+                let dst = cmd_at(commands, i + 5)?;
+                let nbits = if is_all(module, size_op) {
+                    end.saturating_sub(pos)
+                } else {
+                    let size = read_size(machine, size_op)?;
+                    match size.checked_mul(unit) {
+                        Some(nbits) => nbits,
+                        None => return fail_step(machine, module, labels, fail, term, ctx),
+                    }
+                };
+                if nbits > end.saturating_sub(pos) {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                let out = extract_bits(bytes, pos, nbits)?;
+                let value = raw::make_bits(ctx, &out, nbits)?;
+                write_operand(machine, dst, value)?;
+                pos += nbits;
+                i += 6;
+            }
+
+            // `get_tail Live Unit Dst` — bind the whole remaining bits
+            // (`i_bs_get_tail`); the position is left unchanged (it is the last
+            // command, `bs_translate_fixup`).
+            "get_tail" => {
+                let dst = cmd_at(commands, i + 3)?;
+                let nbits = end.saturating_sub(pos);
+                let out = extract_bits(bytes, pos, nbits)?;
+                let value = raw::make_bits(ctx, &out, nbits)?;
+                write_operand(machine, dst, value)?;
+                i += 4;
+            }
+
+            // `'=:=' Nil Bits Value` (`i_bs_eq`, `bs_instrs.tab:1366`): the next
+            // `Bits` bits must equal the literal unsigned `Value` exactly (no sign
+            // extension). `Value` is emitted as a plain integer up to 64 bits.
+            //
+            // The atom *name* is `=:=` (the quotes `beam_disasm` prints around
+            // `'=:='` are just the non-alphanumeric-atom notation and are not part
+            // of the name).
+            "=:=" => {
+                let bits = read_size(machine, cmd_at(commands, i + 2)?)?;
+                let want_term = read_operand(machine, cmd_at(commands, i + 3)?)?;
+                let Some(want) = small_value(want_term) else {
+                    return Err(error::unsupported("bs_match '=:=': non-integer value"));
+                };
+                if bits > 64 || bits > end.saturating_sub(pos) {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                if read_uint_be(bytes, pos, bits)? != want as u64 {
+                    return fail_step(machine, module, labels, fail, term, ctx);
+                }
+                pos += bits;
+                i += 4;
+            }
+
+            other => {
+                return Err(error::unsupported(&format!("bs_match: command {other}")));
+            }
+        }
+    }
+    // Commit the advanced position only once the whole command list succeeded.
+    raw::set_ctx_start(term, pos);
+    Ok(Some(Step::Next))
+}
+
+/// The `i`-th command operand, or a typed error when the list is truncated.
+fn cmd_at(commands: &[Operand], index: usize) -> Result<&Operand> {
+    commands
+        .get(index)
+        .ok_or_else(|| error::unsupported("bs_match: truncated command list"))
+}
+
+/// The `ensure_at_least` test (`generators.tab:1164-1206`):
+/// * `Size != 0`, `Unit == 1` ⇒ `i_bs_ensure_bits` (`remaining >= Size`);
+/// * `Size != 0`, `Unit != 1` ⇒ `i_bs_ensure_bits_unit` (`remaining >= Size` **and**
+///   the surplus is a whole number of units);
+/// * `Size == 0`, `Unit == 8` ⇒ `i_bs_test_unit8` (byte alignment only);
+/// * `Size == 0`, `Unit != 1` ⇒ `i_bs_test_unit` (alignment to `Unit`);
+/// * `Size == 0`, `Unit == 1` ⇒ a redundant no-op.
+fn ensure_at_least(remaining: usize, size: usize, unit: usize) -> bool {
+    if size == 0 {
+        if unit == 8 {
+            remaining % 8 == 0
+        } else if unit == 1 {
+            true
+        } else {
+            remaining % unit == 0
+        }
+    } else if unit == 1 {
+        remaining >= size
+    } else {
+        remaining >= size && (remaining - size) % unit == 0
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure decoders the `bs_*` match opcodes call. Their expected
+    //! values are the system `erl` oracle's answers for the same bit patterns.
+
+    use super::*;
+
+    // -- decode_utf8 (erts_bs_get_utf8) -------------------------------------
+
+    #[test]
+    fn utf8_decodes_each_sequence_length() {
+        assert_eq!(decode_utf8(&[0x41], 0, 8), Some((0x41, 8)));
+        assert_eq!(decode_utf8(&[0xC2, 0xA9], 0, 16), Some((0xA9, 16)));
+        assert_eq!(decode_utf8(&[0xE2, 0x82, 0xAC], 0, 24), Some((0x20AC, 24)));
+        assert_eq!(
+            decode_utf8(&[0xF0, 0x9F, 0x98, 0x80], 0, 32),
+            Some((0x1F600, 32))
+        );
+    }
+
+    #[test]
+    fn utf8_accepts_the_range_boundaries() {
+        // U+007F (1 byte), U+0080/U+07FF (2), U+0800/U+FFFF (3), U+10000/U+10FFFF (4).
+        assert_eq!(decode_utf8(&[0x7F], 0, 8), Some((0x7F, 8)));
+        assert_eq!(decode_utf8(&[0xC2, 0x80], 0, 16), Some((0x80, 16)));
+        assert_eq!(decode_utf8(&[0xDF, 0xBF], 0, 16), Some((0x7FF, 16)));
+        assert_eq!(decode_utf8(&[0xE0, 0xA0, 0x80], 0, 24), Some((0x800, 24)));
+        assert_eq!(decode_utf8(&[0xEF, 0xBF, 0xBF], 0, 24), Some((0xFFFF, 24)));
+        assert_eq!(
+            decode_utf8(&[0xF0, 0x90, 0x80, 0x80], 0, 32),
+            Some((0x10000, 32))
+        );
+        assert_eq!(
+            decode_utf8(&[0xF4, 0x8F, 0xBF, 0xBF], 0, 32),
+            Some((0x10FFFF, 32))
+        );
+    }
+
+    #[test]
+    fn utf8_reads_at_a_non_byte_aligned_start() {
+        // The decoder works at a *bit* offset (`read_uint_be`), so start need not be
+        // byte-aligned: skip one byte of a 2-byte buffer.
+        assert_eq!(decode_utf8(&[0x00, 0x41], 8, 16), Some((0x41, 8)));
+    }
+
+    #[test]
+    fn utf8_rejects_every_malformed_class() {
+        assert_eq!(decode_utf8(&[], 0, 0), None); // bounded out
+        assert_eq!(decode_utf8(&[0xC2], 0, 8), None); // truncated 2-byte
+        assert_eq!(decode_utf8(&[0xE2, 0x82], 0, 16), None); // truncated 3-byte
+        assert_eq!(decode_utf8(&[0x80], 0, 8), None); // continuation lead
+        assert_eq!(decode_utf8(&[0xFF], 0, 8), None); // reserved lead
+        assert_eq!(decode_utf8(&[0xE2, 0x28, 0xAC], 0, 24), None); // bad continuation
+        assert_eq!(decode_utf8(&[0xC0, 0x80], 0, 16), None); // overlong U+0000
+        assert_eq!(decode_utf8(&[0xC1, 0xBF], 0, 16), None); // overlong U+007F
+        assert_eq!(decode_utf8(&[0xE0, 0x80, 0x80], 0, 24), None); // overlong U+0000
+        assert_eq!(decode_utf8(&[0xF0, 0x80, 0x80, 0x80], 0, 32), None); // overlong
+        assert_eq!(decode_utf8(&[0xED, 0xA0, 0x80], 0, 24), None); // surrogate D800
+        assert_eq!(decode_utf8(&[0xED, 0xBF, 0xBF], 0, 24), None); // surrogate DFFF
+        assert_eq!(decode_utf8(&[0xF4, 0x90, 0x80, 0x80], 0, 32), None); // >U+10FFFF
+    }
+
+    // -- decode_utf16 (erts_bs_get_utf16) -----------------------------------
+
+    #[test]
+    fn utf16_decodes_bmp_and_surrogate_pairs() {
+        assert_eq!(decode_utf16(&[0x00, 0x41], 0, 16, 0), Some((0x41, 16)));
+        assert_eq!(decode_utf16(&[0x20, 0xAC], 0, 16, 0), Some((0x20AC, 16)));
+        // D7FF/E000 sit just outside the surrogate range and are plain scalars.
+        assert_eq!(decode_utf16(&[0xD7, 0xFF], 0, 16, 0), Some((0xD7FF, 16)));
+        assert_eq!(decode_utf16(&[0xE0, 0x00], 0, 16, 0), Some((0xE000, 16)));
+        // D83D DE00 is U+1F600.
+        assert_eq!(
+            decode_utf16(&[0xD8, 0x3D, 0xDE, 0x00], 0, 32, 0),
+            Some((0x1F600, 32))
+        );
+        // Little-endian words select `BSF_LITTLE`.
+        assert_eq!(decode_utf16(&[0xAC, 0x20], 0, 16, BSF_LITTLE), Some((0x20AC, 16)));
+        assert_eq!(
+            decode_utf16(&[0x3D, 0xD8, 0x00, 0xDE], 0, 32, BSF_LITTLE),
+            Some((0x1F600, 32))
+        );
+    }
+
+    #[test]
+    fn utf16_rejects_lone_and_malformed_surrogates() {
+        assert_eq!(decode_utf16(&[0xD8], 0, 8, 0), None); // bounded out
+        assert_eq!(decode_utf16(&[0xD8, 0x3D], 0, 16, 0), None); // lone high, no low
+        assert_eq!(decode_utf16(&[0xDE, 0x00], 0, 16, 0), None); // lone low surrogate
+        assert_eq!(decode_utf16(&[0xD8, 0x3D, 0x00, 0x41], 0, 32, 0), None); // bad low
+    }
+
+    // -- decode_utf32 (i_bs_validate_unicode_retract) -----------------------
+
+    #[test]
+    fn utf32_decodes_valid_scalars_and_rejects_the_rest() {
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0x20, 0xAC], 0, 32), Some((0x20AC, 32)));
+        assert_eq!(
+            decode_utf32(&[0x00, 0x10, 0xFF, 0xFF], 0, 32),
+            Some((0x10FFFF, 32))
+        );
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0x00], 0, 24), None); // bounded out
+        assert_eq!(decode_utf32(&[0x00, 0x00, 0xD8, 0x00], 0, 32), None); // surrogate
+        assert_eq!(decode_utf32(&[0x00, 0x11, 0x00, 0x00], 0, 32), None); // >U+10FFFF
+    }
+
+    // -- f16_to_f32 (erl_bits.c:508) ----------------------------------------
+
+    #[test]
+    fn f16_to_f32_widens_every_class() {
+        assert_eq!(f16_to_f32(0x0000).to_bits(), 0x0000_0000); // +0
+        assert_eq!(f16_to_f32(0x8000).to_bits(), 0x8000_0000); // -0
+        assert_eq!(f16_to_f32(0x3C00).to_bits(), 0x3F80_0000); // 1.0
+        assert_eq!(f16_to_f32(0x7C00).to_bits(), 0x7F80_0000); // +Inf
+        assert_eq!(f16_to_f32(0xFC00).to_bits(), 0xFF80_0000); // -Inf
+        assert_eq!(f16_to_f32(0x7E00).to_bits(), 0x7FC0_0000); // NaN
+        assert_eq!(f16_to_f32(0x0001).to_bits(), 0x3380_0000); // min subnormal
+        assert_eq!(f16_to_f32(0x03FF).to_bits(), 0x387F_C000); // max subnormal
+        assert_eq!(f16_to_f32(0x0400).to_bits(), 0x3880_0000); // min normal (2^-14)
+        assert_eq!(f16_to_f32(0x7BFF).to_bits(), 0x477F_E000); // 65504.0 (max)
+    }
+
+    // -- read_float_field (erts_bs_get_float_2) -----------------------------
+
+    #[test]
+    fn read_float_field_handles_every_valid_size_and_endianness() {
+        assert_eq!(read_float_field(&[], 0, 0, 0).unwrap(), 0.0);
+        assert_eq!(read_float_field(&[62, 0], 0, 16, 0).unwrap(), 1.5);
+        assert_eq!(read_float_field(&[0, 62], 0, 16, BSF_LITTLE).unwrap(), 1.5);
+        assert_eq!(read_float_field(&[63, 192, 0, 0], 0, 32, 0).unwrap(), 1.5);
+        assert_eq!(
+            read_float_field(&[0, 0, 192, 63], 0, 32, BSF_LITTLE).unwrap(),
+            1.5
+        );
+        let pi = [64, 9, 33, 251, 84, 68, 45, 24];
+        assert_eq!(read_float_field(&pi, 0, 64, 0).unwrap(), std::f64::consts::PI);
+        let mut little = pi;
+        little.reverse();
+        assert_eq!(
+            read_float_field(&little, 0, 64, BSF_LITTLE).unwrap(),
+            std::f64::consts::PI
+        );
+    }
+
+    #[test]
+    fn read_float_field_rejects_an_unsupported_size_and_an_unaligned_le_field() {
+        // Only 0/16/32/64 are valid; anything else is the typed `unsupported`.
+        assert!(read_float_field(&[0, 0, 0, 0], 0, 8, 0).is_err());
+        // A little-endian field is read byte-wise, so it must be byte-aligned.
+        assert!(read_float_field(&[0, 0, 0, 0], 4, 32, BSF_LITTLE).is_err());
+    }
+
+    // -- ensure_at_least (the `bs_match` command) ---------------------------
+
+    #[test]
+    fn ensure_at_least_covers_every_documented_case() {
+        assert!(ensure_at_least(8, 8, 1)); // >= Size
+        assert!(!ensure_at_least(7, 8, 1));
+        assert!(ensure_at_least(16, 8, 8)); // whole units after Size
+        assert!(!ensure_at_least(15, 8, 8));
+        assert!(ensure_at_least(16, 0, 8)); // byte alignment only
+        assert!(!ensure_at_least(15, 0, 8));
+        assert!(ensure_at_least(15, 0, 1)); // redundant no-op
+        assert!(ensure_at_least(15, 0, 5)); // alignment to Unit
+        assert!(!ensure_at_least(14, 0, 5));
+    }
+}

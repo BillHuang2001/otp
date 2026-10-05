@@ -6,20 +6,23 @@
 //! failure), `SelectVal`, the frame instructions (`Allocate`/`AllocateHeap`/
 //! `TestHeap`/`Deallocate`/`Trim`) and the call family (`Call`/`CallLast`/
 //! `CallOnly`/`CallExt`/`CallExtOnly`/`CallExtLast`), the `GcBif` guard-fail/raise
-//! paths and the documented error paths. Every error is a typed
-//! [`beam_common::BeamError`] — no test panics.
+//! paths, the catch-frame landing of a raising BIF (`gc_bif`/`bif`/`bif0`/
+//! `call_ext*` with no fail label inside a live `try`) and the documented error
+//! paths. Every error is a typed [`beam_common::BeamError`] — no test panics.
 
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use beam_common::BeamError;
+use beam_common::{BeamError, ExceptionClass};
 use beam_engine::{Machine, MinimalContext};
 use beam_loader::{
-    Export, Function, Import, ImportRef, Instr, Label, Module, Opcode, Operand, TestKind, NO_FAIL,
+    Export, Function, HeapNeed, Import, ImportRef, Instr, Label, LiteralArea, Module, Opcode,
+    Operand, TestKind, NO_FAIL,
 };
 use beam_term::{
-    is_small, make_arityval, make_boxed, make_header, make_internal_pid, make_internal_port,
-    make_pid_data, make_port_data, make_small, signed_value, Atom, Eterm, HEADER_FLONUM,
-    HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, REF_SUBTAG,
+    is_small, make_arityval, make_atom, make_boxed, make_header, make_internal_pid,
+    make_internal_port, make_pid_data, make_port_data, make_small, signed_value, Atom, Eterm,
+    HEADER_FLONUM, HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -86,6 +89,15 @@ impl Fixture {
     fn finish(self) -> Module {
         self.module
     }
+
+    /// Decode `raw` — one ETF payload per literal, in `Operand::Literal` index
+    /// order — into the module's static-literal area, interning any atoms a payload
+    /// names in the module's own atom table (the loader's contract).
+    fn set_literals(&mut self, raw: &[Vec<u8>]) {
+        let area = LiteralArea::decode(raw, &mut self.module.atom_table)
+            .expect("decode the fixture literals");
+        self.module.literals = Arc::new(area);
+    }
 }
 
 /// Run `entry` with no BIF support.
@@ -135,6 +147,20 @@ fn run_inspected(
     (result, machine)
 }
 
+/// Assert `result` is the engine's typed `unsupported` raise for `what`
+/// (`beam_engine::error::unsupported`: the reason atom `unsupported_opcode: <what>`).
+fn assert_unsupported(result: Result<Eterm, BeamError>, what: &str) {
+    let want = format!("unsupported_opcode: {what}");
+    match result {
+        Err(BeamError::Raise(raise)) => assert_eq!(
+            raise.reason.as_atom(),
+            Some(want.as_str()),
+            "unexpected unsupported reason"
+        ),
+        other => panic!("expected the unsupported {what:?} raise, got {other:?}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Move / Swap / metadata
 // ---------------------------------------------------------------------------
@@ -161,6 +187,116 @@ fn move_writes_registers() {
     let entry = fixture.add_function("f", 0, code);
     let module = fixture.finish();
     assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(9)));
+}
+
+// ---------------------------------------------------------------------------
+// static literals (`Operand::Literal`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn move_from_a_static_literal_reads_the_decoded_term() {
+    // `move {literal,42},x0` — the interpreter binds the running module's decoded
+    // `LitT` area to the machine, so the shared operand reader resolves the
+    // literal (previously the typed `operand: literal` error).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Literal(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]); // term_to_binary(42)
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).unwrap(), make_small(42));
+}
+
+#[test]
+fn put_tuple2_builds_a_tuple_from_static_literals() {
+    // `put_tuple2 x0,{literal(1),literal(0)}` where literal 1 is `42` and literal 0
+    // is `{ok,17}` — both read through the operand seam into a freshly built tuple.
+    // The `MinimalContext` owns the heap the new tuple lives in, so it must stay
+    // alive while the result is inspected (the context outlives its boxed terms).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::PutTuple2 {
+            dst: Operand::X(0),
+            elements: vec![Operand::Literal(1), Operand::Literal(0)],
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[
+        vec![131, 104, 2, 119, 2, 111, 107, 97, 17], // term_to_binary({ok,17})
+        vec![131, 97, 42],                           // term_to_binary(42)
+    ]);
+    let module = fixture.finish();
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let result = machine
+        .run_label(&module, entry, 0, &[], &mut ctx)
+        .expect("put_tuple2 from literals must run");
+
+    assert_eq!(beam_engine::terms::tuple_arity(result).unwrap(), 2);
+    assert_eq!(
+        beam_engine::terms::tuple_element(result, 0).unwrap(),
+        make_small(42)
+    );
+    let inner = beam_engine::terms::tuple_element(result, 1).unwrap();
+    assert_eq!(beam_engine::terms::tuple_arity(inner).unwrap(), 2);
+    assert_eq!(
+        beam_engine::terms::tuple_element(inner, 0).unwrap(),
+        make_atom(module.atom_table.lookup("ok").expect("ok is interned")),
+    );
+    assert_eq!(
+        beam_engine::terms::tuple_element(inner, 1).unwrap(),
+        make_small(17)
+    );
+    // The context owns the heap the terms were built in; drop it explicitly so the
+    // lifetime relationship is obvious.
+    drop(ctx);
+}
+
+#[test]
+fn move_from_a_missing_static_literal_is_a_typed_error() {
+    // The module defines one literal; referencing index 7 is a structural error and
+    // stays the documented typed error — the engine never substitutes a term.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Literal(7),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]);
+    let module = fixture.finish();
+    assert_unsupported(run(&module, entry, &[]), "operand: literal");
+}
+
+#[test]
+fn a_static_literal_is_not_a_valid_destination() {
+    // A literal names a term in the module's immutable area: it has no destination
+    // slot, so a `Literal` dst stays a typed error (never a silent write).
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Literal(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    fixture.set_literals(&[vec![131, 97, 42]]);
+    let module = fixture.finish();
+    assert_unsupported(run(&module, entry, &[]), "dst operand: literal");
 }
 
 #[test]
@@ -419,6 +555,162 @@ fn test_arity_matches_tuple_arity() {
     assert_eq!(build(-1).map_err(|_| ()), Ok(make_small(0)));
 }
 
+#[test]
+fn is_boolean_recognises_true_and_false_atoms() {
+    // `is_boolean` compares against the module's `true`/`false` atoms, so those
+    // names must be interned into the *same* module whose code is run.
+    let mut fixture = Fixture::new();
+    let true_atom = fixture.atom("true");
+    let false_atom = fixture.atom("false");
+    let other_atom = fixture.atom("other");
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Test {
+            kind: TestKind::IsBoolean,
+            fail: Label(2),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("t", 1, code);
+    let module = fixture.finish();
+
+    let verdict = |value: Eterm| run(&module, entry, &[value]).map_err(|_| ());
+    assert_eq!(verdict(beam_term::make_atom(true_atom)), Ok(make_small(1)));
+    assert_eq!(verdict(beam_term::make_atom(false_atom)), Ok(make_small(1)));
+    // Any other atom, or a non-atom, is not a boolean.
+    assert_eq!(verdict(beam_term::make_atom(other_atom)), Ok(make_small(0)));
+    assert_eq!(verdict(make_small(1)), Ok(make_small(0)));
+    assert_eq!(verdict(NIL), Ok(make_small(0)));
+}
+
+#[test]
+fn is_function_is_true_only_for_funs() {
+    let mut ctx = MinimalContext::new();
+    let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
+
+    ok_true(TestKind::IsFunction, &[fun]);
+    ok_false(TestKind::IsFunction, &[make_small(1)]);
+    ok_false(TestKind::IsFunction, &[NIL]);
+    ok_false(TestKind::IsFunction, &[make_atom_local(7)]);
+}
+
+#[test]
+fn is_function2_matches_a_fun_of_the_given_arity() {
+    let mut ctx = MinimalContext::new();
+    let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
+
+    // `is_function2 Fail Fun Arity` — args = [Fun, {integer,Arity}].
+    let build = |value: Eterm, arity: Operand| {
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsFunction2,
+                fail: Label(2),
+                args: vec![Operand::X(0), arity],
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        let mut fixture = Fixture::new();
+        let entry = fixture.add_function("t", 1, code);
+        let module = fixture.finish();
+        run(&module, entry, &[value])
+    };
+
+    // A fun of the matching arity succeeds; the wrong arity fails.
+    assert_eq!(
+        build(fun, Operand::Integer(2)).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(fun, Operand::Integer(3)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A non-fun value fails regardless of the arity literal.
+    assert_eq!(
+        build(make_small(1), Operand::Integer(2)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A malformed (non-integer) arity operand is a typed error, never a wrong
+    // result — and only reached for a real fun (the non-fun case short-circuits).
+    assert!(build(fun, Operand::X(1)).is_err());
+}
+
+#[test]
+fn is_tagged_tuple_matches_the_arity_and_the_tag() {
+    // `{r, 9}`: a 2-tuple whose first element is the atom `r`. The tag operand is a
+    // raw atom index (`make_atom`), so the module's atom *table* is not consulted.
+    let tag = Atom::from_raw(11);
+    let other = Atom::from_raw(12);
+    let mut words = [make_arityval(2), beam_term::make_atom(tag), make_small(9)];
+    let tuple = make_boxed(words.as_mut_ptr());
+
+    // `is_tagged_tuple Fail Src Arity Tag` — args = [Src, {integer,Arity}, Tag].
+    let build = |value: Eterm, arity: i64, tag_operand: Atom| {
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTaggedTuple,
+                fail: Label(2),
+                args: vec![
+                    Operand::X(0),
+                    Operand::Integer(arity),
+                    Operand::Atom(tag_operand),
+                ],
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        let mut fixture = Fixture::new();
+        let entry = fixture.add_function("t", 1, code);
+        let module = fixture.finish();
+        run(&module, entry, &[value])
+    };
+
+    // Matching arity and tag.
+    assert_eq!(build(tuple, 2, tag).map_err(|_| ()), Ok(make_small(1)));
+    // Right tag, wrong arity.
+    assert_eq!(build(tuple, 3, tag).map_err(|_| ()), Ok(make_small(0)));
+    // Right arity, wrong tag.
+    assert_eq!(build(tuple, 2, other).map_err(|_| ()), Ok(make_small(0)));
+    // A negative or out-of-range arity can never match a tuple.
+    assert_eq!(build(tuple, -1, tag).map_err(|_| ()), Ok(make_small(0)));
+    // A non-tuple value fails.
+    assert_eq!(
+        build(make_small(1), 2, tag).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SelectVal
 // ---------------------------------------------------------------------------
@@ -581,6 +873,270 @@ fn gc_bif_failure_without_a_fail_label_raises() {
 }
 
 // ---------------------------------------------------------------------------
+// Core opcodes: Bif0 / Bif / Jump / InitYregs / debug-line no-ops
+// ---------------------------------------------------------------------------
+
+/// A hook implementing `erlang:self/0` (returns `7`) and `erlang:'+'/2`.
+fn self_and_arith_hook(
+    module: &str,
+    function: &str,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if module == "erlang" && function == "self" && arity == 0 && args.is_empty() {
+        return Ok(make_small(7));
+    }
+    arith_hook(module, function, arity, args)
+}
+
+#[test]
+fn bif0_calls_a_zero_arity_bif_and_writes_the_result() {
+    let mut fixture = Fixture::new();
+    let self_bif = fixture.import("erlang", "self", 0);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif0 {
+            bif: self_bif,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(self_and_arith_hook));
+    assert_eq!(
+        machine
+            .run_label(&module, entry, 0, &[], &mut ctx)
+            .map_err(|_| ()),
+        Ok(make_small(7))
+    );
+}
+
+#[test]
+fn bif0_failure_propagates_without_a_fail_label() {
+    let mut fixture = Fixture::new();
+    let self_bif = fixture.import("erlang", "self", 0);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif0 {
+            bif: self_bif,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    // The rejecting default hook makes the import fail; with no fail label the
+    // error propagates as a typed error.
+    assert!(run(&module, entry, &[]).is_err());
+}
+
+#[test]
+fn bif_calls_with_arguments_and_writes_the_result() {
+    let mut fixture = Fixture::new();
+    let plus = fixture.import("erlang", "+", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: plus,
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("add", 2, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run_with_hook(&module, entry, &[make_small(2), make_small(3)]).map_err(|_| ()),
+        Ok(make_small(5))
+    );
+}
+
+#[test]
+fn bif_failure_jumps_to_the_fail_label() {
+    let mut fixture = Fixture::new();
+    let bad = fixture.import("erlang", "bad", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: bad,
+            fail: Label(2),
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run_with_hook(&module, entry, &[make_small(2), make_small(3)]).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+}
+
+#[test]
+fn bif_failure_without_a_fail_label_raises() {
+    let mut fixture = Fixture::new();
+    let bad = fixture.import("erlang", "bad", 2);
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Bif {
+            arity: 2,
+            bif: bad,
+            fail: NO_FAIL,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 2, code);
+    let module = fixture.finish();
+    assert!(run_with_hook(&module, entry, &[make_small(2), make_small(3)]).is_err());
+}
+
+#[test]
+fn jump_transfers_control() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Jump { target: Label(2) },
+        // Skipped by the jump.
+        Instr::Move {
+            src: Operand::Integer(9),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(5)));
+}
+
+#[test]
+fn jump_to_an_unknown_label_is_a_typed_error() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Jump { target: Label(500) },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert!(run(&module, entry, &[]).is_err());
+}
+
+#[test]
+fn init_yregs_clears_the_listed_slots_to_nil() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(3),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::Integer(2),
+            dst: Operand::Y(1),
+        },
+        Instr::Move {
+            src: Operand::Integer(3),
+            dst: Operand::Y(2),
+        },
+        // Only Y(0) and Y(2) are re-initialised; Y(1) keeps its value.
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0), Operand::Y(2)],
+        },
+        Instr::Move {
+            src: Operand::Y(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(3),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(2)));
+}
+
+#[test]
+fn init_yregs_sets_every_listed_register_to_nil() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(2),
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::Y(0),
+        },
+        Instr::InitYregs {
+            registers: vec![Operand::Y(0), Operand::Y(1)],
+        },
+        Instr::Move {
+            src: Operand::Y(0),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(2),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(NIL));
+}
+
+#[test]
+fn debug_line_instructions_are_no_ops() {
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::ExecutableLine {
+            location: 1,
+            index: 0,
+        },
+        Instr::DebugLine {
+            kind: Operand::Atom(Atom::from_raw(0)),
+            location: 1,
+            index: 1,
+            live: 0,
+        },
+        Instr::Move {
+            src: Operand::Integer(13),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(13)));
+}
+
+// ---------------------------------------------------------------------------
 // Frames and the call family
 // ---------------------------------------------------------------------------
 
@@ -590,7 +1146,7 @@ fn allocate_call_return_deallocate_preserve_y_slots() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 2,
+            stack_need: HeapNeed::Words(2),
             live: 1,
         },
         Instr::Move {
@@ -646,7 +1202,7 @@ fn call_last_deallocates_then_jumps() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {
@@ -684,7 +1240,7 @@ fn call_last_with_wrong_deallocate_is_a_typed_error() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::CallLast {
@@ -746,12 +1302,12 @@ fn test_heap_and_allocate_heap() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::TestHeap {
-            heap_need: 4,
+            heap_need: HeapNeed::Words(4),
             live: 1,
         },
         Instr::AllocateHeap {
-            stack_need: 2,
-            heap_need: 8,
+            stack_need: HeapNeed::Words(2),
+            heap_need: HeapNeed::Words(8),
             live: 1,
         },
         Instr::Move {
@@ -772,11 +1328,15 @@ fn test_heap_and_allocate_heap() {
 }
 
 #[test]
-fn trim_drops_y_slots() {
+fn trim_discards_the_lowest_y_slots_and_renumbers() {
+    // `trim N` reproduces C's `i_trim` (`E += N`): the lowest `N` Y slots are
+    // discarded and the survivors are renumbered down (`y(k) -> y(k - N)`), which
+    // is what the compiler's `beam_trim` pass assumes. Here y0 (`1`) is dropped,
+    // so the old y1 (`2`) becomes y0 and the old y2 (`3`) becomes y1.
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 3,
+            stack_need: HeapNeed::Words(3),
             live: 0,
         },
         Instr::Move {
@@ -793,7 +1353,7 @@ fn trim_drops_y_slots() {
         },
         Instr::Trim { n: 1, remaining: 2 },
         Instr::Move {
-            src: Operand::Y(1),
+            src: Operand::Y(0),
             dst: Operand::X(0),
         },
         Instr::Deallocate(2),
@@ -810,7 +1370,7 @@ fn trim_overrun_is_a_typed_error() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 2,
+            stack_need: HeapNeed::Words(2),
             live: 0,
         },
         Instr::Trim { n: 3, remaining: 0 },
@@ -833,7 +1393,7 @@ fn call_ext_writes_x0_and_continues_to_the_next_instruction() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {
@@ -911,7 +1471,7 @@ fn call_ext_last_deallocates_calls_and_returns() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {
@@ -960,7 +1520,7 @@ fn generic_opcode_is_unsupported() {
 }
 
 #[test]
-fn float_register_operand_is_unsupported() {
+fn float_register_operand_is_read_from_the_fr_file() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Test {
@@ -975,7 +1535,9 @@ fn float_register_operand_is_unsupported() {
     let mut fixture = Fixture::new();
     let entry = fixture.add_function("f", 0, code);
     let module = fixture.finish();
-    assert!(run(&module, entry, &[]).is_err());
+    // The FR file defaults to NIL, so `is_integer(FloatReg(0))` is readable and
+    // fails the test, branching to the fail label (which returns `x(0) == NIL`).
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(NIL));
 }
 
 #[test]
@@ -1064,4 +1626,426 @@ fn run_export_of_unknown_export_is_a_typed_error() {
         Ok(NIL)
     );
     assert!(machine.run_export(&module, name, 1, &[], &mut ctx).is_err());
+}
+
+// ---------------------------------------------------------------------------
+// A raising BIF with no fail label lands in a live catch frame
+//
+// Ground truth: with no fail label `gc_bif`/`bif` fall through to
+// `find_func_info` (`erts/emulator/beam/emu/macros.tab:266-278`) and
+// `call_light_bif*` runs `handle_error` (`emu/bif_instrs.tab:308-314`, `:409-415`);
+// both end in `next_catch` (`erts/emulator/beam/beam_common.c:580-679`), which
+// jumps to the innermost live `try`/`catch` handler. The oracle therefore
+// *catches* `try 1/0 catch error:badarith -> caught end`.
+// ---------------------------------------------------------------------------
+
+/// Build a one-function `f/0` module from `code`.
+///
+/// `imports` are registered (in order, so the *i*-th entry is `ImportRef(i)`) and
+/// `atoms` interned **before** `code` is added — the body refers to the imports'
+/// `ImportRef`s, and the module must be able to *name* the reason a BIF failure
+/// raises (`badarith`, …) plus the `error` class atom a landing installs in `x(3)`.
+fn module_with(imports: &[(&str, &str, u32)], atoms: &[&str], code: Vec<Instr>) -> (Module, Label) {
+    let mut fixture = Fixture::new();
+    for (module, function, arity) in imports {
+        fixture.import(module, function, *arity);
+    }
+    for name in atoms {
+        fixture.atom(name);
+    }
+    let entry = fixture.add_function("f", 0, code);
+    (fixture.finish(), entry)
+}
+
+/// Run `entry` with `hook` as the BIF implementation, returning the result **and**
+/// the machine (so the pending exception / catch-frame state can be inspected).
+fn run_hooked(
+    module: &Module,
+    entry: Label,
+    args: &[Eterm],
+    hook: impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static,
+) -> (Result<Eterm, BeamError>, Machine) {
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(hook));
+    let result = machine.run_label(module, entry, args.len() as u32, args, &mut ctx);
+    (result, machine)
+}
+
+/// `erlang:boom/N` always raises `badarith`; every other call raises `badarg`.
+fn boom_hook(
+    _module: &str,
+    function: &str,
+    _arity: u32,
+    _args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if function == "boom" {
+        Err(BeamError::BadArith)
+    } else {
+        Err(BeamError::BadArg)
+    }
+}
+
+/// `f() -> try <body> catch _ -> Reason end`: `Label(1)` enters the `try`,
+/// `Label(3)` is the handler, which returns the landed reason from `x(1)` (a
+/// catch-all clause needs no class atom in its code, but a landing needs the
+/// `error` class atom, so it must be interned).
+fn try_wrapped(body: Vec<Instr>) -> Vec<Instr> {
+    let mut code = vec![
+        Instr::Label(Label(1)),
+        Instr::Try {
+            frame: Operand::X(9),
+            fail: Label(3),
+        },
+    ];
+    code.extend(body);
+    code.extend([
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    code
+}
+
+/// The interned `badarith` term of `module`.
+fn badarith(module: &Module) -> Eterm {
+    beam_term::make_atom(
+        module
+            .atom_table
+            .lookup("badarith")
+            .expect("badarith interned"),
+    )
+}
+
+#[test]
+fn a_raising_gc_bif_without_a_fail_label_lands_in_a_live_catch_frame() {
+    // f() -> try erlang:boom() catch _ -> Reason end.
+    // `gc_bif0 erlang:boom` with NO fail label: `badarith` must land at `Label(3)`.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(badarith(&module)),
+        "the raise must land in the handler and yield the reason"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module))),
+        "the landed exception is class `error` with the BIF's error atom"
+    );
+}
+
+#[test]
+fn a_raising_gc_bif_without_a_catch_frame_propagates_the_typed_error() {
+    // The same failing `gc_bif0`, but with no live `try`: the error still
+    // propagates as the caller's typed error (never a panic, never a wrong value).
+    // The module *can* name `badarith`, so the fallback is purely the missing
+    // catch frame.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GcBif {
+                arity: 0,
+                bif: ImportRef(0),
+                fail: NO_FAIL,
+                live: 0,
+                args: Vec::new(),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert!(
+        matches!(result, Err(BeamError::BadArith)),
+        "an uncaught raise propagates the typed error, got {result:?}"
+    );
+    assert_eq!(machine.catch_frame_depth(), 0);
+}
+
+#[test]
+fn a_raising_bif_without_a_fail_label_lands_in_a_live_catch_frame() {
+    // The non-garbage-collecting `bif1` opcode behaves identically.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::Bif {
+            arity: 1,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            args: vec![Operand::X(0)],
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_bif0_lands_in_a_live_catch_frame() {
+    // `bif0` has no fail label at all (C routes it through `call_light_bif`).
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::Bif0 {
+            bif: ImportRef(0),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_guard_bif_failure_still_jumps_to_the_fail_label_with_a_live_catch_frame() {
+    // f() -> try (case boom() of _ -> ok end) catch _ -> Reason end.
+    // The guard `gc_bif0` HAS a fail label, so a failure must jump to `Label(4)`
+    // — a guard failure is not a raise, even with a live catch frame: no
+    // exception is recorded and the catch frame is left untouched.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::Try {
+                frame: Operand::X(9),
+                fail: Label(3),
+            },
+            Instr::GcBif {
+                arity: 0,
+                bif: ImportRef(0),
+                fail: Label(4),
+                live: 0,
+                args: Vec::new(),
+                dst: Operand::X(0),
+            },
+            Instr::Move {
+                src: Operand::Integer(100),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(4)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(3)),
+            Instr::Move {
+                src: Operand::Integer(-1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(make_small(0)),
+        "the guard failure jumps to its fail label"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        None,
+        "a guard failure is not a raise"
+    );
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "the catch frame is left in place (no unwind)"
+    );
+}
+
+#[test]
+fn a_raising_call_ext_lands_in_a_live_catch_frame() {
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::CallExt {
+            arity: 1,
+            target: ImportRef(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_call_ext_only_lands_in_a_live_catch_frame() {
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::CallExtOnly {
+            arity: 1,
+            target: ImportRef(0),
+        }]),
+    );
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, badarith(&module)))
+    );
+}
+
+#[test]
+fn a_raising_call_ext_last_lands_in_the_outer_catch_frame() {
+    // outer() -> try inner() catch _ -> Reason end.
+    // inner() -> allocate 0, then `call_ext_last erlang:boom/1 D=0`.
+    //
+    // `call_ext_last` pops *its own* (inner) frame before the call, while the
+    // catch frame lives in `outer`'s frame, so the raise must still unwind to
+    // `outer`'s handler — the frame the catch tag belongs to.
+    let mut fixture = Fixture::new();
+    let boom = fixture.import("erlang", "boom", 1);
+    fixture.atom("badarith");
+    fixture.atom("error");
+
+    let outer = vec![
+        Instr::Label(Label(1)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(1),
+            live: 0,
+        },
+        Instr::Try {
+            frame: Operand::Y(0),
+            fail: Label(3),
+        },
+        Instr::Call {
+            arity: 0,
+            target: Label(20),
+        },
+        Instr::TryEnd {
+            frame: Operand::Y(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+        Instr::Label(Label(3)),
+        Instr::TryCase {
+            frame: Operand::Y(0),
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Deallocate(1),
+        Instr::Return,
+    ];
+    let inner = vec![
+        Instr::Label(Label(20)),
+        Instr::Allocate {
+            stack_need: HeapNeed::Words(0),
+            live: 0,
+        },
+        Instr::CallExtLast {
+            arity: 1,
+            target: boom,
+            deallocate: 0,
+        },
+    ];
+    let entry = fixture.add_function("outer", 0, outer);
+    fixture.add_function("inner", 0, inner);
+    let module = fixture.finish();
+
+    let (result, machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert_eq!(result.map_err(|_| ()), Ok(badarith(&module)));
+    assert_eq!(
+        machine.catch_frame_depth(),
+        0,
+        "the handler consumed the frame"
+    );
+    assert_eq!(
+        machine.frame_depth(),
+        1,
+        "the run is back at the bottom frame"
+    );
+}
+
+#[test]
+fn a_bif_error_the_module_cannot_name_propagates_unchanged() {
+    // A live catch frame but no `badarith` atom in the module: the engine refuses
+    // to substitute a *different* atom (that would be a wrong result), so the
+    // typed error propagates — a documented Milestone-1 limit.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, _machine) = run_hooked(&module, entry, &[], boom_hook);
+    assert!(
+        matches!(result, Err(BeamError::BadArith)),
+        "an unnameable error atom propagates, got {result:?}"
+    );
+}
+
+#[test]
+fn an_explicit_raise_error_is_not_folded_into_a_catch_frame() {
+    // A `BeamError::Raise` carries its own class/reason term-independently (the
+    // reason may be `ExitReason::Structured`), so it is not converted here: it
+    // propagates unchanged even with a live catch frame.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+
+    let (result, _machine) = run_hooked(&module, entry, &[], |_m, _f, _a, _args| {
+        Err(BeamError::Raise(beam_common::Raise::error(
+            beam_common::ExitReason::atom("badarith"),
+        )))
+    });
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "an explicit raise propagates, got {result:?}"
+    );
 }

@@ -46,8 +46,8 @@ fn container_chunk_directory_is_the_oracle_sequence() {
         (ChunkId::META, 45),          // Meta
         (ChunkId::LOCT, 16),          // LocT
         (ChunkId::ATTR, 39),          // Attr
-        (ChunkId::CINF, 105),         // CInf
-        (ChunkId::new(*b"Dbgi"), 104), // Dbgi (unknown id)
+        (ChunkId::CINF, 27),          // CInf
+        (ChunkId::new(*b"Dbgi"), 66), // Dbgi (unknown id)
         (ChunkId::LINE, 25),          // Line
         (ChunkId::TYPE, 30),          // Type
     ];
