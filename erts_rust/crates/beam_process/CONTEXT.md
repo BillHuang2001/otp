@@ -193,6 +193,10 @@ holds `Process` values directly.
   `beam_message`, `libc`, `parking_lot`. Adding a dependency edge requires reporting to `../`.
   `beam_engine` is **NOT** a dependency (the `ProcessRunner` trait keeps the DAG acyclic).
 - Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
+  `src/ptab.rs` (the table + signal hub) is the only file slightly over that figure, and **only**
+  because of its comprehensive inline `#[cfg(test)]` module (≈740 lines of production code + ≈330
+  lines of tests) — it has one responsibility and deliberately stays whole; do not split it for size
+  alone.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` per module: `pid` (encode/decode round-trip vs `beam_term`
   accessors, boundary fields, `from_eterm` rejects a non-pid), `registers` (live bounds, get/set range
