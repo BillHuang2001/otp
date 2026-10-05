@@ -34,7 +34,7 @@ Contents: 21 Erlang modules (`modules.mk` splits 4 `BEHAVIOUR_MODULES` from 17 `
 - `megaco_sup.erl` — the megaco application's top supervisor (`-behaviour(application)`; it is the `mod` in `megaco.app.src`). Starts `megaco_misc_sup`, `megaco_trans_sup`, `megaco_config` and `megaco_monitor`.
 - `megaco_config_misc.erl` — pure validation helpers (`verify_bool/1`, `verify_int/1,2,3`, `verify_strict_int/…`, `verify_uint/…`) used by config option validation.
 - `megaco_timer.erl` — arithmetic/validation for `#megaco_incr_timer{}` (`init/1`, `restart/1`, `verify/1`).
-- `megaco_stats.erl` — generic named-ETS counter helper (`init/1,2`, `inc/2,3,4`, `get_stats/1,2,3`, `reset_stats/1,2`) reused by other megaco subdirectories.
+- `megaco_stats.erl` — generic named-ETS counter helper (`init/1,2`, `inc/2,3,4`, `get_stats/1,2,3`, `reset_stats/1,2`) reused by the `../udp/` and `../tcp/` transports as well.
 - `megaco_filter.erl` — Megaco customisation of the Event Tracer (`et`) viewer/active filter (`start/0,1`, `filter/1`, `raw_filter/1`, `pretty_error/1`, `string_to_term/1`).
 - `megaco_message_internal.hrl` — cross-subdirectory internal record header (see Constraints).
 
