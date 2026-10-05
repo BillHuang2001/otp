@@ -157,8 +157,8 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   `block` (header encode/decode round-trip, size/offset/class/flags, alignment padding), `carrier`
   (subdivision count, free-list push/pop, exhaustion), `allocator` (alloc/dealloc/realloc round
   trips; alignment assertions for align 8/16/64/…; thousands of mixed-size allocations forcing
-  multiple carriers; dedicated-carrier path for large sizes; stats deltas; `mmap`-failure path via
-  an injected size cap), `heap` (cons/tuple/alloc_words/alloc_tuple/reset/peak, pointer stability
+  multiple carriers; dedicated-carrier path for large sizes; stats deltas; the `max_footprint` cap ⇒
+  `AllocKind::Carrier` error; a `Heap` over a real `CarrierAllocator`), `heap` (cons/tuple/alloc_words/alloc_tuple/reset/peak, pointer stability
   and non-reallocation, exhaustion → `AllocKind::Heap` error and no words consumed, `Drop` returns
   the block).
 - `tests/allocator.rs`, `tests/heap.rs` — cross-module integration over the *public* API only.
