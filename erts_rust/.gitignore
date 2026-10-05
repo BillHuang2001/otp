@@ -1,0 +1,16 @@
+# Cargo build artifacts
+/target/
+**/target/
+
+# Nix build outputs
+/result
+/result-*
+
+# Differential / benchmark scratch output
+/tools/differential/out/
+/tools/bench/out/
+/bench-results/
+
+# Editor/OS noise
+*.swp
+.DS_Store
