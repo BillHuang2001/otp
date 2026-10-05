@@ -14,7 +14,7 @@ fn pid(number: u64) -> ProcessId {
 
 #[test]
 fn selective_receive_returns_one_match_and_keeps_the_rest_fifo() {
-    let mut sender = Process::new(pid(1)).expect("the default heap allocates");
+    let sender = Process::new(pid(1)).expect("the default heap allocates");
     let mut receiver = Process::new(pid(2)).expect("the default heap allocates");
     let from = sender.pid().to_eterm();
 
