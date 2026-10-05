@@ -84,6 +84,7 @@ dependencies = [
 name = "beam_dist"
 version = "0.1.0"
 dependencies = [
+ "beam_alloc",
  "beam_codec",
  "beam_common",
  "beam_term",
