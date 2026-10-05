@@ -132,8 +132,9 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
 |---|---|
 | `-version`, `--version` | print the version banner (OTP `30.0-rc0` / erts `17.1`) and exit 0 |
 | `-noshell` | run head-less (M1 default; accepted, no interactive shell exists) |
-| `-eval Expr` | evaluate the **documented integer subset** (below) and print the result |
+| `-eval Expr` | evaluate the **documented integer subset** and print **nothing** (real `erl` semantics — `erl -eval '2+3'` prints nothing, exits 0); one trailing `.` is tolerated and stripped |
 | `-s Mod Func [Args...]` | apply `Mod:Func(a, b, …)` (Arguments are **atoms**); the result is **discarded** (real `erl` semantics); exit 0 on success |
+| `-run Mod Func [Args...]` | same, but Arguments are plain **strings**, materialized as Erlang char lists; the result is **discarded** |
 | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` dirs) |
 | `-pz Dir` | add `Dir` to the code path (searched after) |
 | `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number); M1 runs single-threaded |
