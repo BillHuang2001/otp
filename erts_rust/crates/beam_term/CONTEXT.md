@@ -254,6 +254,7 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
 - `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
 - `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
+- `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
