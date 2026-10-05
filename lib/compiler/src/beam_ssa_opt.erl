@@ -302,7 +302,7 @@ finish_1([], _StMap) ->
 -define(PASS(N), {N,fun N/1}).
 
 prologue_passes(Opts) ->
-    Ps = [?PASS(ssa_opt_split_blocks),
+    Ps0 = [?PASS(ssa_opt_split_blocks),
           ?PASS(ssa_opt_coalesce_phis),
           ?PASS(ssa_opt_tail_phis),
           ?PASS(ssa_opt_element),
@@ -312,6 +312,15 @@ prologue_passes(Opts) ->
           ?PASS(ssa_opt_update_tuple),
           ?PASS(ssa_opt_cse),                   % Helps the first type pass.
           ?PASS(ssa_opt_live)],                 % ...
+    Ps = case lists:member(loop_opt, Opts) of
+             true ->
+                 %% Opt-in loop optimizations. The pass is appended so that
+                 %% passes_1/2 derives its no_ssa_opt_loop_opt kill switch.
+                 Ps0 ++ [{ssa_opt_loop_opt,
+                          fun(St) -> beam_ssa_loop_opt:opt(St) end}];
+             false ->
+                 Ps0
+         end,
     passes_1(Ps, Opts).
 
 module_passes(Opts) ->
