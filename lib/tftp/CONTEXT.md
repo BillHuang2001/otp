@@ -56,4 +56,4 @@ Listed in `lib/Makefile` as an `ALL_ERLANG_APPLICATIONS` app — it is only buil
 ## See Also
 - `../../../system/doc/top/` and `scripts/run-dialyzer` reference `tftp` in the doc/dialyzer app lists.
 - `erts/test/upgrade_SUITE.erl` covers the historical `inets` → `ftp`/`tftp` application split during upgrade.
-- `../ftp/CONTEXT.md` — the sibling FTP application (also split out of `inets`).
+- `../ftp/` — the sibling FTP application (also split out of `inets`).
