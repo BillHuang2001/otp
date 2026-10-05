@@ -77,7 +77,7 @@ Internal plumbing (all `-moduledoc false`), by subsystem:
 
 ## Dependencies
 - Runtime: `stdlib` + `kernel` only are declared; `ssl` is required only if TLS transports are configured, and `syntax_tools`/`runtime_tools` only if the dictionary compiler / info modules are loaded.
-- The guard `-diameter max_heap_size` / `min_heap_size` application env vars are read by `diameter_lib`.
+- `diameter_lib:getenv/1` reads the `diameter` application env var `min_heap_size` (used by `spawn_opts/2`); it is the only env var read here.
 
 ## Test Strategy
 - Suites live in `../test/` and are run with Common Test; the app Makefile sets `TEST_NEEDS_RELEASE=true`, so tests run against an installed release.
