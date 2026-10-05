@@ -36,7 +36,8 @@ in-memory test double, the 2-/4-byte packet framing (with tick = empty packet), 
 message codecs (`Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`) with a
 pluggable digest hook, the `DOP_*` control-message codec (opcode + concatenated `beam_codec` term
 bodies), the distribution-header envelope, and the `epmd` request/response codecs + client driver.
-The crate is **safe Rust** (`#![deny(unsafe_code)]`). `cargo test -p beam_dist` is green.
+The crate is **safe Rust** (`#![deny(unsafe_code)]`). `cargo test -p beam_dist` is green
+(102 tests: 10 lib unit + 14 `constants` + 22 `control` + 24 `epmd` + 11 `framing` + 21 `handshake`).
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_dist::prelude::*`.
