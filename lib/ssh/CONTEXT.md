@@ -56,7 +56,7 @@ Client and server share nearly all code — the role is a state in `#ssh{}` and 
 ## Known Issues
 - Only `ssh`, `ssh_connection`, `ssh_file`, `ssh_agent`, `ssh_sftp`, `ssh_sftpd`, and the behaviour modules have published docs; the rest are `-moduledoc false` internals, so API changes there need no doc update but also give users no stability guarantee.
 - `ssh_channel` and `ssh_daemon_channel` are deprecated aliases retained for backwards compatibility; new code must use `ssh_client_channel`/`ssh_server_channel`.
-- Interactive prompting goes through the `ssh_io` behaviour-like pair `ssh_io` (real `io` prompts) and `ssh_no_io` (throws instead of prompting, used when no user is present) — daemons running without a user must be configured with the non-interactive variant.
+- Interactive prompting is done through an internal `io_cb` option resolved from the user-facing `user_interaction` (alias `allow_user_interaction`, default `true`) option: `ssh_io` prompts on stdin/stdout, `ssh_no_io` throws instead — services with no user present must set `{user_interaction, false}`.
 - The SSH hello/version string and pre-auth message-size limits are guarded by explicit macros in `ssh.hrl` (e.g. `?MAX_DISCONNECT_DESC_SIZE`); touching size limits has interop implications with OpenSSH.
 
 ## Dependencies
