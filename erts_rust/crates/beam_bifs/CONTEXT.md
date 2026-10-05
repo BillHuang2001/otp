@@ -165,6 +165,19 @@ pub fn reason_term_from_exit_reason(reason: &ExitReason, atoms: &mut AtomTable) 
 /`beam_rt` capture it); documented gap.
 
 ### `ets.rs` — minimal `ets:*` bridge over `beam_ets::Table`
+```rust
+pub struct TableRegistry { /* HashMap<u64, Table> */ }   // Default = empty
+impl TableRegistry {
+    pub fn new() -> TableRegistry;
+    pub fn insert(&mut self, handle: u64, table: Table) -> Option<Table>;  // previous table, if any
+    pub fn get(&self, handle: u64) -> Option<&Table>;
+    pub fn get_mut(&mut self, handle: u64) -> Option<&mut Table>;
+    pub fn contains(&self, handle: u64) -> bool;
+    pub fn remove(&mut self, handle: u64) -> Option<Table>;
+    pub fn len(&self) -> usize;
+    pub fn is_empty(&self) -> bool;
+}
+```
 `TableRegistry` maps an opaque handle to a `beam_ets::Table`. `ets:new/2` parses the common option
 subset (`set`/`ordered_set`/`bag`/`duplicate_bag`, `public`/`protected`/`private`, `named_table`,
 `{keypos,N}`) into `TableOptions`; the handle is an on-heap `Ref` thing built like
