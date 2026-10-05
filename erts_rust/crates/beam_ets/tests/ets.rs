@@ -245,7 +245,10 @@ fn insert_rejects_malformed_objects_with_badarg() {
     let mut t = new_table(TableKind::Set);
 
     // Non-tuples are not valid ETS objects.
-    assert!(matches!(t.insert(make_small(1), &atoms), Err(BeamError::BadArg)));
+    assert!(matches!(
+        t.insert(make_small(1), &atoms),
+        Err(BeamError::BadArg)
+    ));
     assert!(matches!(t.insert(NIL, &atoms), Err(BeamError::BadArg)));
     let list = proper_list(&mut heap, &[make_small(1)]);
     assert!(matches!(t.insert(list, &atoms), Err(BeamError::BadArg)));
@@ -319,7 +322,10 @@ fn ordered_set_iterates_in_ascending_term_order() {
     // The concrete key order: number < atom < tuple < list.
     for (object, key) in ordered.iter().zip([small, a, tuple, list]) {
         let want = heap.tuple(&[key]).unwrap();
-        assert!(eq(*object, want, &atoms), "unexpected object at this position");
+        assert!(
+            eq(*object, want, &atoms),
+            "unexpected object at this position"
+        );
     }
 }
 
@@ -368,7 +374,11 @@ fn select_wildcard_head_and_whole_object_body() {
 
     // Spec: [ {'_', [], '$_'} ] — every object, returned whole.
     let clause = heap
-        .tuple(&[interned_atom(&mut atoms, "_"), NIL, interned_atom(&mut atoms, "$_")])
+        .tuple(&[
+            interned_atom(&mut atoms, "_"),
+            NIL,
+            interned_atom(&mut atoms, "$_"),
+        ])
         .unwrap();
     let spec = proper_list(&mut heap, &[clause]);
     let compiled = compile(spec, &atoms).unwrap();
@@ -395,7 +405,10 @@ fn select_tuple_head_with_bind_and_single_element_body() {
 
     // Spec: [ {{'$1', '_'}, [], {'$1'}} ] — the key of every object.
     let head = heap
-        .tuple(&[interned_atom(&mut atoms, "$1"), interned_atom(&mut atoms, "_")])
+        .tuple(&[
+            interned_atom(&mut atoms, "$1"),
+            interned_atom(&mut atoms, "_"),
+        ])
         .unwrap();
     let body = heap.tuple(&[interned_atom(&mut atoms, "$1")]).unwrap();
     let clause = heap.tuple(&[head, NIL, body]).unwrap();
@@ -417,7 +430,10 @@ fn select_multi_element_body_is_badarg() {
     // Body {'$1', '_'} has two elements: M1 cannot build a fresh tuple, so the
     // match spec is outside the supported subset.
     let body = heap
-        .tuple(&[interned_atom(&mut atoms, "$1"), interned_atom(&mut atoms, "_")])
+        .tuple(&[
+            interned_atom(&mut atoms, "$1"),
+            interned_atom(&mut atoms, "_"),
+        ])
         .unwrap();
     let clause = heap
         .tuple(&[interned_atom(&mut atoms, "_"), NIL, body])
@@ -425,7 +441,10 @@ fn select_multi_element_body_is_badarg() {
     let spec = proper_list(&mut heap, &[clause]);
     let compiled = compile(spec, &atoms).unwrap();
 
-    assert!(matches!(t.select(&compiled, &atoms), Err(BeamError::BadArg)));
+    assert!(matches!(
+        t.select(&compiled, &atoms),
+        Err(BeamError::BadArg)
+    ));
 }
 
 // ---------------------------------------------------------------------------
@@ -446,8 +465,12 @@ fn bag_stores_distinct_objects_per_key() {
     assert_eq!(t.size(), 2);
     let looked = t.lookup(make_small(1), &atoms);
     assert_eq!(looked.len(), 2);
-    assert!(looked.iter().any(|o| eq(*o, object(&mut heap, 1, 10), &atoms)));
-    assert!(looked.iter().any(|o| eq(*o, object(&mut heap, 1, 20), &atoms)));
+    assert!(looked
+        .iter()
+        .any(|o| eq(*o, object(&mut heap, 1, 10), &atoms)));
+    assert!(looked
+        .iter()
+        .any(|o| eq(*o, object(&mut heap, 1, 20), &atoms)));
 
     // `delete` removes the whole key (all its objects).
     t.delete(make_small(1), &atoms).unwrap();
@@ -507,13 +530,31 @@ fn metadata_getters_and_info_entries() {
     assert_eq!(info_entry(&entries, &atoms, "id"), Some(make_small(42)));
     assert_eq!(info_entry(&entries, &atoms, "keypos"), Some(make_small(2)));
     assert_eq!(info_entry(&entries, &atoms, "size"), Some(make_small(0)));
-    assert_eq!(info_entry(&entries, &atoms, "type"), Some(make_atom(atoms.lookup("ordered_set").unwrap())));
-    assert_eq!(info_entry(&entries, &atoms, "protection"), Some(make_atom(atoms.lookup("public").unwrap())));
+    assert_eq!(
+        info_entry(&entries, &atoms, "type"),
+        Some(make_atom(atoms.lookup("ordered_set").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "protection"),
+        Some(make_atom(atoms.lookup("public").unwrap()))
+    );
     assert_eq!(info_entry(&entries, &atoms, "name"), Some(make_atom(name)));
-    assert_eq!(info_entry(&entries, &atoms, "owner"), Some(make_atom(atoms.lookup("undefined").unwrap())));
-    assert_eq!(info_entry(&entries, &atoms, "compressed"), Some(make_atom(atoms.lookup("true").unwrap())));
-    assert_eq!(info_entry(&entries, &atoms, "write_concurrency"), Some(make_atom(atoms.lookup("true").unwrap())));
-    assert_eq!(info_entry(&entries, &atoms, "read_concurrency"), Some(make_atom(atoms.lookup("true").unwrap())));
+    assert_eq!(
+        info_entry(&entries, &atoms, "owner"),
+        Some(make_atom(atoms.lookup("undefined").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "compressed"),
+        Some(make_atom(atoms.lookup("true").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "write_concurrency"),
+        Some(make_atom(atoms.lookup("true").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "read_concurrency"),
+        Some(make_atom(atoms.lookup("true").unwrap()))
+    );
 
     // An unnamed table reports the atom `undefined` for `name`.
     let plain = Table::new(TableId::next(), TableOptions::new()).unwrap();
@@ -596,11 +637,7 @@ fn next_and_prev_on_an_empty_table_depend_on_the_kind() {
 
     // The hash kinds anchor the walk at a present entry, so every key of an empty
     // table is unknown and `ets:next/2` raises.
-    for kind in [
-        TableKind::Set,
-        TableKind::Bag,
-        TableKind::DuplicateBag,
-    ] {
+    for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
         let t = new_table(kind);
         assert!(
             matches!(t.next(make_small(5), &atoms), Err(BeamError::BadArg)),
@@ -650,11 +687,7 @@ fn ordered_set_navigation_is_a_cmp_ordered_range_scan() {
 
 #[test]
 fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
-    for kind in [
-        TableKind::Set,
-        TableKind::Bag,
-        TableKind::DuplicateBag,
-    ] {
+    for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(256);
         let mut t = new_table(kind);
@@ -673,7 +706,8 @@ fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
         assert_eq!(walk.len(), 3, "{kind:?} walk length");
         for k in [1i64, 2, 3] {
             assert!(
-                walk.iter().any(|&visited| eq(visited, make_small(k), &atoms)),
+                walk.iter()
+                    .any(|&visited| eq(visited, make_small(k), &atoms)),
                 "{kind:?} walk covers key {k}"
             );
         }
@@ -686,10 +720,22 @@ fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
         assert_eq!(t.next(last, &atoms).unwrap(), None, "{kind:?} next(last)");
 
         // An anchor key that is not stored is `badarg` (verified `erl` behaviour).
-        assert!(matches!(t.next(make_small(0), &atoms), Err(BeamError::BadArg)));
-        assert!(matches!(t.next(make_small(99), &atoms), Err(BeamError::BadArg)));
-        assert!(matches!(t.prev(make_small(0), &atoms), Err(BeamError::BadArg)));
-        assert!(matches!(t.prev(make_small(99), &atoms), Err(BeamError::BadArg)));
+        assert!(matches!(
+            t.next(make_small(0), &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            t.next(make_small(99), &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            t.prev(make_small(0), &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            t.prev(make_small(99), &atoms),
+            Err(BeamError::BadArg)
+        ));
 
         // A multi kind reports one key per entry, so a re-walk of a `bag` whose key
         // holds several objects still visits that key once.
@@ -734,7 +780,10 @@ fn take_removes_and_returns_the_keys_objects_for_every_kind() {
         let taken = t.take(make_small(1), &atoms).unwrap();
         let expected = if kind.is_multi() { 2 } else { 1 };
         assert_eq!(taken.len(), expected, "{kind:?} take count");
-        assert!(taken.iter().any(|&o| eq(o, a, &atoms)), "{kind:?} take value");
+        assert!(
+            taken.iter().any(|&o| eq(o, a, &atoms)),
+            "{kind:?} take value"
+        );
         assert!(!t.member(make_small(1), &atoms), "{kind:?} taken key gone");
         assert_eq!(t.size(), 0, "{kind:?} take empties the entry");
 
@@ -763,25 +812,30 @@ fn lookup_element_or_returns_the_default_only_for_an_absent_key() {
 
         // Present key: the element, `pos` being 1-based.
         assert_eq!(
-            t.lookup_element_or(make_small(1), 1, default, &atoms).unwrap(),
+            t.lookup_element_or(make_small(1), 1, default, &atoms)
+                .unwrap(),
             make_small(1)
         );
         assert_eq!(
-            t.lookup_element_or(make_small(1), 2, default, &atoms).unwrap(),
+            t.lookup_element_or(make_small(1), 2, default, &atoms)
+                .unwrap(),
             make_small(10)
         );
         assert_eq!(
-            t.lookup_element_or(make_small(1), 3, default, &atoms).unwrap(),
+            t.lookup_element_or(make_small(1), 3, default, &atoms)
+                .unwrap(),
             make_small(20)
         );
 
         // Absent key: the default, whatever `pos` (verified `erl` behaviour).
         assert_eq!(
-            t.lookup_element_or(make_small(9), 2, default, &atoms).unwrap(),
+            t.lookup_element_or(make_small(9), 2, default, &atoms)
+                .unwrap(),
             default
         );
         assert_eq!(
-            t.lookup_element_or(make_small(9), 5, default, &atoms).unwrap(),
+            t.lookup_element_or(make_small(9), 5, default, &atoms)
+                .unwrap(),
             default
         );
 
@@ -853,7 +907,10 @@ fn memory_tracks_the_table_owned_storage() {
         // `delete_all_objects` releases the term storage …
         t.delete_all_objects();
         assert_eq!(t.size(), 0);
-        assert!(t.memory() < populated, "{kind:?} memory drops on delete_all");
+        assert!(
+            t.memory() < populated,
+            "{kind:?} memory drops on delete_all"
+        );
 
         // … and leaves the table usable for further inserts.
         t.insert(object(&mut heap, 1, 1), &atoms).unwrap();
@@ -959,8 +1016,14 @@ fn access_enforcement_follows_the_protection_matrix() {
                     make_small(1)
                 );
             } else {
-                assert!(matches!(view.lookup(make_small(1), &atoms), Err(BeamError::BadArg)));
-                assert!(matches!(view.member(make_small(1), &atoms), Err(BeamError::BadArg)));
+                assert!(matches!(
+                    view.lookup(make_small(1), &atoms),
+                    Err(BeamError::BadArg)
+                ));
+                assert!(matches!(
+                    view.member(make_small(1), &atoms),
+                    Err(BeamError::BadArg)
+                ));
                 assert!(matches!(
                     view.lookup_element(make_small(1), 1, &atoms),
                     Err(BeamError::BadArg)
@@ -982,8 +1045,14 @@ fn access_enforcement_follows_the_protection_matrix() {
                     view.insert_new(object(&mut heap, 2, 20), &atoms),
                     Err(BeamError::BadArg)
                 ));
-                assert!(matches!(view.delete(make_small(1), &atoms), Err(BeamError::BadArg)));
-                assert!(matches!(view.take(make_small(1), &atoms), Err(BeamError::BadArg)));
+                assert!(matches!(
+                    view.delete(make_small(1), &atoms),
+                    Err(BeamError::BadArg)
+                ));
+                assert!(matches!(
+                    view.take(make_small(1), &atoms),
+                    Err(BeamError::BadArg)
+                ));
             }
         }
 
@@ -1076,16 +1145,20 @@ fn update_counter_three_increments_the_element_after_the_key() {
 
         // `{k, 10, 20}`: `/3` touches `keypos + 1` = element 2.
         t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
-        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms)
+            .unwrap();
         assert_eq!(
             t.update_counter(make_small(1), make_small(5), &atoms, &mut out)
                 .unwrap(),
             make_small(15),
             "{kind:?}: +5"
         );
-        assert_eq!(
-            t.lookup(make_small(1), &atoms)[0],
-            int_tuple(&mut heap, &[1, 15, 20]),
+        assert!(
+            eq(
+                t.lookup(make_small(1), &atoms)[0],
+                int_tuple(&mut heap, &[1, 15, 20]),
+                &atoms
+            ),
             "{kind:?}: after +5"
         );
         assert_eq!(
@@ -1094,13 +1167,22 @@ fn update_counter_three_increments_the_element_after_the_key() {
             make_small(12),
             "{kind:?}: -3"
         );
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 12, 20]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 12, 20]),
+            &atoms
+        ));
 
         // The `/3` form takes the full operand grammar too: a `{Pos, Incr}` tuple
         // is a scalar operation.
         assert_eq!(
-            t.update_counter(make_small(1), int_tuple(&mut heap, &[3, 5]), &atoms, &mut out)
-                .unwrap(),
+            t.update_counter(
+                make_small(1),
+                int_tuple(&mut heap, &[3, 5]),
+                &atoms,
+                &mut out
+            )
+            .unwrap(),
             make_small(25),
             "{kind:?}: {{3,5}}"
         );
@@ -1112,7 +1194,11 @@ fn update_counter_three_increments_the_element_after_the_key() {
             .unwrap();
         let expected = proper_list(&mut heap, &[make_small(13), make_small(26)]);
         assert!(eq(listed, expected, &atoms), "{kind:?}: list result");
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 13, 26]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 13, 26]),
+            &atoms
+        ));
     }
 }
 
@@ -1140,11 +1226,20 @@ fn update_counter_three_rejects_bad_operands_with_badarg() {
         ));
         // A `{Pos,Incr}` tuple whose position is out of range is `badarg`.
         assert!(matches!(
-            t.update_counter(make_small(1), int_tuple(&mut heap, &[3, 1]), &atoms, &mut out),
+            t.update_counter(
+                make_small(1),
+                int_tuple(&mut heap, &[3, 1]),
+                &atoms,
+                &mut out
+            ),
             Err(BeamError::BadArg)
         ));
         // Nothing was written by any of the failures.
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], object(&mut heap, 1, 10));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            object(&mut heap, 1, 10),
+            &atoms
+        ));
 
         // An arity-1 object has no element `keypos + 1`.
         let mut t1 = new_table(kind);
@@ -1167,13 +1262,18 @@ fn update_counter_three_honours_the_table_keypos() {
     opts.set_keypos(2).unwrap();
     let mut t = Table::new(TableId::next(), opts).unwrap();
 
-    t.insert(int_tuple(&mut heap, &[100, 1, 7]), &atoms).unwrap();
+    t.insert(int_tuple(&mut heap, &[100, 1, 7]), &atoms)
+        .unwrap();
     assert_eq!(
         t.update_counter(make_small(1), make_small(5), &atoms, &mut out)
             .unwrap(),
         make_small(12)
     );
-    assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[100, 1, 12]));
+    assert!(eq(
+        t.lookup(make_small(1), &atoms)[0],
+        int_tuple(&mut heap, &[100, 1, 12]),
+        &atoms
+    ));
 }
 
 /// `ets:update_counter/4`: the default object is used (and deposited) only for an
@@ -1187,7 +1287,8 @@ fn update_counter_four_uses_and_deposits_the_default_object() {
         let mut t = new_table(kind);
 
         // A present key ignores the default (`erl` verified).
-        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms)
+            .unwrap();
         let default = int_tuple(&mut heap, &[99, 0, 0]);
         assert_eq!(
             t.update_counter_with(make_small(1), make_small(5), default, &atoms, &mut out)
@@ -1195,7 +1296,10 @@ fn update_counter_four_uses_and_deposits_the_default_object() {
             make_small(15),
             "{kind:?}: present key"
         );
-        assert!(!t.member(make_small(99), &atoms), "{kind:?}: default not used");
+        assert!(
+            !t.member(make_small(99), &atoms),
+            "{kind:?}: default not used"
+        );
 
         // An absent key behaves as if `{zzz,0,0}` (key element replaced) existed.
         let default = int_tuple(&mut heap, &[99, 0, 0]);
@@ -1205,9 +1309,12 @@ fn update_counter_four_uses_and_deposits_the_default_object() {
             make_small(5),
             "{kind:?}: absent key"
         );
-        assert_eq!(
-            t.lookup(make_small(2), &atoms)[0],
-            int_tuple(&mut heap, &[2, 5, 0]),
+        assert!(
+            eq(
+                t.lookup(make_small(2), &atoms)[0],
+                int_tuple(&mut heap, &[2, 5, 0]),
+                &atoms
+            ),
             "{kind:?}: deposited default"
         );
 
@@ -1225,7 +1332,11 @@ fn update_counter_four_uses_and_deposits_the_default_object() {
             make_small(27),
             "{kind:?}: {{3,7}}"
         );
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 15, 27]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 15, 27]),
+            &atoms
+        ));
     }
 }
 
@@ -1238,7 +1349,8 @@ fn update_counter_four_list_operand_returns_a_list() {
         let mut heap = Heap::new(256);
         let mut out = rebuild_heap();
         let mut t = new_table(kind);
-        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms)
+            .unwrap();
 
         let default = int_tuple(&mut heap, &[1, 0, 0]);
         let op_tuples = [int_tuple(&mut heap, &[2, 1]), int_tuple(&mut heap, &[3, 1])];
@@ -1251,7 +1363,11 @@ fn update_counter_four_list_operand_returns_a_list() {
             proper_list(&mut heap, &[make_small(11), make_small(21)]),
             &atoms
         ));
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 11, 21]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 11, 21]),
+            &atoms
+        ));
 
         // A one-element list is still a list result (`erl` verified).
         let default = int_tuple(&mut heap, &[1, 0, 0]);
@@ -1277,9 +1393,12 @@ fn update_counter_four_list_operand_returns_a_list() {
             .update_counter_with(make_small(7), NIL, default, &atoms, &mut out)
             .unwrap();
         assert!(eq(listed, NIL, &atoms), "{kind:?}: empty list result");
-        assert_eq!(
-            t.lookup(make_small(7), &atoms)[0],
-            int_tuple(&mut heap, &[7, 0, 0]),
+        assert!(
+            eq(
+                t.lookup(make_small(7), &atoms)[0],
+                int_tuple(&mut heap, &[7, 0, 0]),
+                &atoms
+            ),
             "{kind:?}: default deposited for the empty list"
         );
     }
@@ -1298,11 +1417,11 @@ fn update_counter_four_applies_the_threshold_and_set_value() {
         // (operation, expected counter) on a fresh `{k, 10}` object — every pair
         // is `erl`-verified.
         let cases: [([i64; 4], i64); 5] = [
-            ([2, 5, 12, 100], 100),  // 15 > 12  ⇒ warp to 100
-            ([2, 2, 12, 100], 12),   // 12 not > 12
-            ([2, -9, 3, 100], 100),  // 1 < 3    ⇒ warp to 100
-            ([2, -7, 3, 100], 3),    // 3 not < 3
-            ([2, 0, 5, 100], 100),   // 10 > 5   ⇒ warp to 100
+            ([2, 5, 12, 100], 100), // 15 > 12  ⇒ warp to 100
+            ([2, 2, 12, 100], 12),  // 12 not > 12
+            ([2, -9, 3, 100], 100), // 1 < 3    ⇒ warp to 100
+            ([2, -7, 3, 100], 3),   // 3 not < 3
+            ([2, 0, 5, 100], 100),  // 10 > 5   ⇒ warp to 100
         ];
         for (op, expected) in cases {
             let mut t = new_table(kind);
@@ -1318,9 +1437,12 @@ fn update_counter_four_applies_the_threshold_and_set_value() {
                 )
                 .unwrap();
             assert_eq!(got, make_small(expected), "{kind:?}: op {op:?}");
-            assert_eq!(
-                t.lookup(make_small(1), &atoms)[0],
-                int_tuple(&mut heap, &[1, expected]),
+            assert!(
+                eq(
+                    t.lookup(make_small(1), &atoms)[0],
+                    int_tuple(&mut heap, &[1, expected]),
+                    &atoms
+                ),
                 "{kind:?}: stored after op {op:?}"
             );
         }
@@ -1338,7 +1460,8 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
         let mut heap = Heap::new(256);
         let mut out = rebuild_heap();
         let mut t = new_table(kind);
-        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms)
+            .unwrap();
         let good_default = int_tuple(&mut heap, &[1, 0, 0]);
         let atom = interned_atom(&mut atoms, "x");
 
@@ -1378,8 +1501,14 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
         // A non-integer increment, threshold and set value.
         let bad_ops = [
             tuple_of(&mut heap, &[make_small(2), atom]),
-            tuple_of(&mut heap, &[make_small(2), make_small(1), atom, make_small(5)]),
-            tuple_of(&mut heap, &[make_small(2), make_small(1), make_small(5), atom]),
+            tuple_of(
+                &mut heap,
+                &[make_small(2), make_small(1), atom, make_small(5)],
+            ),
+            tuple_of(
+                &mut heap,
+                &[make_small(2), make_small(1), make_small(5), atom],
+            ),
         ];
         for op in bad_ops {
             assert!(matches!(
@@ -1396,7 +1525,13 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
 
         // Malformed operands: a tuple of the wrong arity and an atom.
         assert!(matches!(
-            t.update_counter_with(make_small(1), int_tuple(&mut heap, &[2, 1, 5]), good_default, &atoms, &mut out),
+            t.update_counter_with(
+                make_small(1),
+                int_tuple(&mut heap, &[2, 1, 5]),
+                good_default,
+                &atoms,
+                &mut out
+            ),
             Err(BeamError::BadArg)
         ));
         assert!(matches!(
@@ -1405,9 +1540,7 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
         ));
         // An improper list operand is `badarg`.
         let improper_head = int_tuple(&mut heap, &[2, 1]);
-        let improper = heap
-            .cons(improper_head, atom)
-            .expect("test heap has room");
+        let improper = heap.cons(improper_head, atom).expect("test heap has room");
         assert!(matches!(
             t.update_counter_with(make_small(1), improper, good_default, &atoms, &mut out),
             Err(BeamError::BadArg)
@@ -1415,13 +1548,7 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
 
         // An invalid default fails even when the key exists (verified `erl`).
         assert!(matches!(
-            t.update_counter_with(
-                make_small(1),
-                make_small(5),
-                atom,
-                &atoms,
-                &mut out
-            ),
+            t.update_counter_with(make_small(1), make_small(5), atom, &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         // …including a tuple shorter than `keypos`.
@@ -1441,7 +1568,11 @@ fn update_counter_four_rejects_bad_arguments_with_badarg() {
         ));
 
         // Nothing was written by any of the failures.
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 10, 20]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 10, 20]),
+            &atoms
+        ));
         assert_eq!(t.size(), 1, "{kind:?}: no spurious deposits");
     }
 }
@@ -1479,7 +1610,11 @@ fn update_counter_and_element_reject_multi_kinds_with_badarg() {
             t.update_element(make_small(2), &[(0, make_small(9))], &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], object(&mut heap, 1, 10));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            object(&mut heap, 1, 10),
+            &atoms
+        ));
     }
 }
 
@@ -1493,13 +1628,18 @@ fn update_element_replaces_elements_and_reports_existence() {
         let mut heap = Heap::new(256);
         let mut out = rebuild_heap();
         let mut t = new_table(kind);
-        t.insert(int_tuple(&mut heap, &[1, 10, 20, 30]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, 10, 20, 30]), &atoms)
+            .unwrap();
 
         // A single replacement.
         assert!(t
             .update_element(make_small(1), &[(2, make_small(99))], &atoms, &mut out)
             .unwrap());
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 99, 20, 30]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 99, 20, 30]),
+            &atoms
+        ));
 
         // Several replacements at once; a repeated position keeps the last value.
         assert!(t
@@ -1510,13 +1650,21 @@ fn update_element_replaces_elements_and_reports_existence() {
                 &mut out
             )
             .unwrap());
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 5, 2, 30]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 5, 2, 30]),
+            &atoms
+        ));
 
         // An empty update list on a present key is `true` and changes nothing.
         assert!(t
             .update_element(make_small(1), &[], &atoms, &mut out)
             .unwrap());
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 5, 2, 30]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 5, 2, 30]),
+            &atoms
+        ));
 
         // An absent key is `false` — even for a spec that would be `badarg` on a
         // present key (`erl` answers `false` before validating the spec).
@@ -1543,7 +1691,11 @@ fn update_element_replaces_elements_and_reports_existence() {
                 "{kind:?}: {updates:?}"
             );
         }
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 5, 2, 30]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, 5, 2, 30]),
+            &atoms
+        ));
     }
 }
 
@@ -1559,7 +1711,8 @@ fn update_element_honours_the_table_keypos() {
         opts.set_kind(kind);
         opts.set_keypos(2).unwrap();
         let mut t = Table::new(TableId::next(), opts).unwrap();
-        t.insert(int_tuple(&mut heap, &[100, 1, 7]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[100, 1, 7]), &atoms)
+            .unwrap();
 
         assert!(matches!(
             t.update_element(make_small(1), &[(2, make_small(9))], &atoms, &mut out),
@@ -1568,7 +1721,11 @@ fn update_element_honours_the_table_keypos() {
         assert!(t
             .update_element(make_small(1), &[(3, make_small(9))], &atoms, &mut out)
             .unwrap());
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[100, 1, 9]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[100, 1, 9]),
+            &atoms
+        ));
     }
 }
 
@@ -1581,7 +1738,8 @@ fn update_counter_reports_the_bignum_representation_gap() {
         let mut heap = Heap::new(64);
         let mut out = rebuild_heap();
         let mut t = new_table(kind);
-        t.insert(int_tuple(&mut heap, &[1, MAX_SMALL]), &atoms).unwrap();
+        t.insert(int_tuple(&mut heap, &[1, MAX_SMALL]), &atoms)
+            .unwrap();
 
         // `MAX_SMALL + 1` is a bignum in real ETS (verified: it returns
         // `576460752303423488`); this crate has no bignum arithmetic.
@@ -1596,7 +1754,11 @@ fn update_counter_reports_the_bignum_representation_gap() {
             Err(BeamError::SystemLimit)
         ));
         // The stored object is unchanged by either failure.
-        assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, MAX_SMALL]));
+        assert!(eq(
+            t.lookup(make_small(1), &atoms)[0],
+            int_tuple(&mut heap, &[1, MAX_SMALL]),
+            &atoms
+        ));
     }
 }
 
@@ -1633,7 +1795,11 @@ fn table_access_view_enforces_write_access_for_element_updates() {
         ),
         Err(BeamError::BadArg)
     ));
-    assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 10]));
+    assert!(eq(
+        t.lookup(make_small(1), &atoms)[0],
+        int_tuple(&mut heap, &[1, 10]),
+        &atoms
+    ));
 
     // The owner may.
     let mut owner = t.as_requester(Some(OwnerId::new(1)));
@@ -1646,5 +1812,9 @@ fn table_access_view_enforces_write_access_for_element_updates() {
     assert!(owner
         .update_element(make_small(1), &[(2, make_small(7))], &atoms, &mut out)
         .unwrap());
-    assert_eq!(t.lookup(make_small(1), &atoms)[0], int_tuple(&mut heap, &[1, 7]));
+    assert!(eq(
+        t.lookup(make_small(1), &atoms)[0],
+        int_tuple(&mut heap, &[1, 7]),
+        &atoms
+    ));
 }
