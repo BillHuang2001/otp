@@ -46,7 +46,7 @@ Key findings:
    gated on compiler work (§F.2); fresh lists are already bump-allocated contiguously, so the win is
    removing per-element decode/allocation/dispatch, not raw locality. OTP 27 already does in-place
    updates for uniquely-owned tuples/records. The one independent, low-risk win is **ETS `ordered_set`
-   AVL → K-ary B-tree**.
+   AVL → K-ary B-tree**; a rewrite may go further and share table objects by reference (finding 7).
 
 3. **The JIT's biggest untapped win is register allocation, not backend choice.** BeamAsm keeps the
    `x`/`y` register arrays *in memory* and does "hardly any cross-instruction optimization" — that is
@@ -77,9 +77,14 @@ Key findings:
 7. **Per-process isolation is the architecture; its copies are the price.** Every local send
    deep-copies the whole term graph (`copy_struct_x` `copy.c:647`) and ETS copies on every put and
    read, because per-process heaps with a moving GC forbid cross-heap pointers and BEAM has no write
-   barrier. Cheap sharing already exists (refc binaries, literal areas, `persistent_term`); the
-   reachable win is *widening that sharing template*, not general zero-copy messaging, which needs a
-   refcounted shared-heap term class plus write barriers. See §D, §E.5 and Part II §D.
+   barrier. That price is paid even for tiny messages: the ubiquitous `gen` envelope carries a **boxed
+   `reference()` id** (3 words, `ERTS_REF_THING_SIZE` `erl_term.h:873-877,990`), so `{'$gen_call',
+   {Pid,Ref},Req}`/`{Ref,Reply}` traffic is copy-bound. Sharing already exists (refc binaries, literals,
+   `persistent_term`), so the reachable wins are *opportunistic* — a bounded in-place single-pass small
+   copy and in-place message-queue auto-tuning — while general zero-copy messaging needs a refcounted
+   shared-heap term class plus write barriers. A rewrite can go further: **ETS** may store immutable
+   refcounted shared objects with COW writes and lock-free reads (gated on that enabler), alongside
+   in-place wins (`ordered_set` B-tree, secondary indexes). See §D, §E.5 and Part II §D.
 
 ---
 
@@ -246,22 +251,43 @@ The plan explicitly says: *use low-latency design over heavy JIT*. The history b
 - *Copy-on-send is fundamental.* A local send of a non-immediate term deep-copies the whole graph into
   the receiver's heap/queue (`erts_send_message` `erl_message.c:698` → `copy_struct_x` `copy.c:647`,
   reductions ∝ size). Per-process heaps + a moving GC forbid cross-heap pointers; immutability gives a
-  barrier-free generation invariant; and process death is O(1).
+  barrier-free generation invariant; and process death is O(1). Crucially, the copies are not confined
+  to large terms: the common 2–3 element, atom-tagged envelopes — `{'$gen_call',{Pid,Ref},Req}`,
+  `{Ref,Reply}`, `{'$gen_cast',Req}`, `{system,{Pid,Tag},Req}`, `{notify,Event}`, `{'EXIT',From,Reason}`,
+  `{'DOWN',Ref,process,From,Reason}` — carry a **boxed `reference()` id** (3 words, `ERTS_REF_THING_SIZE`
+  `erl_term.h:873-877,990`), so even the smallest call/reply round trip copies a reference on each leg
+  (`{Ref,Reply}` copies 5 words). Small non-immediate terms also take **two passes** with no size
+  threshold (`size_object_litopt` `erl_message.c:839` → `copy_struct_x` `copy.c:647`).
 - *Shared cheaply* (small heap handle + pointer-free, immutable, refcounted-or-permanent payload):
   immediates, **refc binaries > 64 B** (`copy.c:812-848`), module **literals**, **`persistent_term`**,
   external pid/port/ref. *Copied:* funs incl. environment, lists, maps, tuples, bignums, floats,
   small (≤64 B) binaries.
-- *The direction is to widen that template* — more immutable term classes / a register-once-read-many
-  registry — not to make messaging generally zero-copy, which needs a new refcounted shared-heap term
+- *The direction is to widen that template*, but the near-term wins are *opportunistic*, not
+  architectural: (a) an in-place **bounded single-pass small copy** (probe size ≤ N, reserve once, copy
+  once) ahead of the current two-pass path; (b) in-place **message-queue auto-tuning** — on/off-heap is
+  chosen statically today (default `SPO_ON_HEAP_MSGQ`, `erl_process.c:132`; `+hmqd`), yet an on-heap
+  queue is re-scanned into the GC rootset every collection (`erl_gc.c:2709-2777`) while an off-heap queue
+  is excluded (`erts_change_message_queue_management` `erl_message.c:1021`); (c) sharing immutable
+  fragments by **ownership transfer** on send, as `enif_send` already does with a private fragment chain
+  (`erl_nif.c:815-841,860-994`) and as receive already adopts them (`save_heap_frag_eterm`
+  `erl_proc_sig_queue.c:3923`). General zero-copy messaging still needs a new refcounted shared-heap term
   class *plus* write barriers (any class whose payload holds tagged `Eterm` pointers would need them).
 - *ETS is already an off-heap shared store* (table-owned `DbTerm`, `DB_TERM`, unaccounted to any
   process), yet **every put copies in and every read copies out**: `lookup` copies whole objects,
   `lookup_element`/`first`/`next` element/key granularity, match/select each result; nested **refc
   binaries are reference-shared on put and read** — the one exception, covering large payloads.
-- *Zero-copy ETS reads are not realistic*: they need a new first-class off-heap boxed term type
-  understood by *every* consumer (BIFs, guards/PAM, ETF, GC, introspection) plus invalidation safety and
-  GC pinning — only refc binaries meet the sharing conditions today. A *narrow* borrowed binary/snapshot
-  is conceivable; otherwise the wins are incremental.
+- *Zero-copy ETS reads hinge on the shared-term enabler, whose real cost is lifetime, not layout.*
+  Literal terms already share one layout with heap terms behind a `TAG_LITERAL_PTR` bit that accessors
+  mask off (`erts_set_literal_tag` `erl_term.c:36-69`, `erl_term.h:55-61,210-216`), so an off-heap
+  compound is read with no indirection; the obstacle is that literals are permanent, whereas a
+  refcounted shared block needs heap-scan-tracked liveness (the `BinRef`/MSO handle model,
+  `erl_bits.h:60,135`; `sweep_off_heap` `erl_gc.c:2995-3110`). Gated on that enabler, a rewrite **may
+  redesign ETS itself**: immutable refcounted shared objects returned **by reference**, with **COW
+  writes and lock-free reads** (today every whole-object read copies, `erl_db_util.h:425`, and every
+  read takes an rlock, `erl_db_hash.c:404-413`), reclaimed by refcount/RCU (`erl_db_catree.h:50,59`).
+  Independent in-place wins: skip `{compressed}` re-decode, opt-in **secondary indexes** for
+  match/select (`erl_db_hash.c:3194,3250-3276`; else a full scan), open addressing/CHAMP, and
+  `ordered_set` AVL → B+-tree (`erl_db_tree.c:84-135`).
 - *Precedent.* **Pony/ORCA** (OOPSLA'17) earns zero-copy message passing via a data-race-free type
   system co-designed with per-actor RC; **JVM/.NET** instead share one heap (no message copies) behind a
   global/STW-style collector. *Tunable, not removable:* on-/off-heap message queues (`+hmqd`); received
@@ -381,15 +407,25 @@ raise the ceiling **without** abandoning the latency principle:
 - **Local sends deep-copy; that is the architecture, not a gap.** `!` reaches `erts_send_message`
   (`erl_message.c:698`) → `copy_struct_x` (`copy.c:647`), copying the whole term graph into the
   receiver's heap or fragment. Per-process heaps plus a moving GC make cross-heap pointers illegal, and
-  BEAM's barrier-free design (immutability ⇒ no remembered set) leaves no cheap way to share mutable terms.
+  BEAM's barrier-free design (immutability ⇒ no remembered set) leaves no cheap way to share mutable
+  terms. Nor is this only a large-term cost: the common `gen` envelope's `Ref` is a boxed `reference()`
+  (`erl_term.h:873-877,990`), so `{'$gen_call',{Pid,Ref},Req}`/`{Ref,Reply}` is copy-bound, and small
+  non-immediate terms take two passes (`erl_message.c:839`).
+- **The near-term wins are opportunistic.** A bounded in-place single-pass small copy removes the second
+  pass; message-queue on/off-heap placement is static today (`SPO_ON_HEAP_MSGQ` `erl_process.c:132`;
+  `+hmqd`) and can be auto-tuned; and immutable fragments can be shared by ownership transfer, as
+  `enif_send` already does (`erl_nif.c:815-841`).
 - **What is already shared** follows one template — a small heap handle plus a pointer-free, immutable,
   refcounted-or-permanent payload outside every heap: refc binaries > 64 B, module literals,
-  `persistent_term`, immediates (everything else is copied). The reachable direction is widening that
-  template, *not* zero-copy messaging (which needs a shared-heap term class plus write barriers).
+  `persistent_term`, immediates (everything else is copied). Widening that template is what general
+  zero-copy messaging needs (a shared-heap term class plus write barriers).
 - **ETS** keeps objects off-heap in table-owned memory (unaccounted to any process) but copies every put
   in and read out; `lookup_element`/`first`/`next` already copy at element/key granularity, and nested
-  refc binaries are reference-shared. Whole-object zero-copy reads are unrealistic (a new boxed off-heap
-  term type plus invalidation and pinning), so the wins there are incremental. Detail: Part II §D.
+  refc binaries are reference-shared. Whole-object zero-copy reads are unrealistic *today*, but a
+  rewrite's **shared-object model puts them on the table**, gated on the shared-term enabler whose
+  obstacle is *lifetime*, not the access path (literals already prove a zero-indirection off-heap
+  compound layout, `erl_term.c:36-69`). Absent the enabler the wins stay incremental (in-place
+  `ordered_set` B-tree, secondary indexes). Detail: Part II §D.
 
 **Level 1 verdict:** achievable, but it is a *large compatibility re-implementation* with *modest
 net performance upside* and *targeted* robustness upside. The JIT-register-allocation and I/O items
@@ -533,10 +569,13 @@ delivers value and can be abandoned without loss:
    list interior** (chunked/unrolled lists with opportunistic chunking, RRB/finger-tree sequences) is a
    VM+compiler co-design that rides on this FBIP work. Measure allocation/GC-pressure reduction. These can
    land in `lib/compiler` + `erts` **without changing the ISA**. Add **ETS copy-trimming** (element/key
-   reads — already present — plus avoiding redundant copies when building match results, and the
-   `ordered_set` node layout), tune the on/off-heap message-queue trade-off (`+hmqd`), and keep
-   **widening the off-heap shared-term template** (refcounted immutable terms / literal-area registry) as a
-   research sub-item.
+   reads — already present — plus avoiding redundant copies when building match results, skipping
+   `{compressed}` re-decode, and the `ordered_set` node layout), add **opt-in secondary indexes** for
+   match/select and consider open addressing/CHAMP for hash buckets; tune on/off-heap message-queue
+   placement (`+hmqd`) and add a bounded in-place single-pass small copy. Separately, keep the **off-heap
+   shared-term enabler** (refcounted immutable terms / literal-area registry) as a research sub-item; it
+   gates the deeper ETS rewrite direction — immutable shared table objects with COW writes and lock-free
+   reads — rather than merely widening today's sharing template.
 4. **Workstream 4 — targeted Rust adoption (robustness, low risk).**
    Rewrite isolated, high-CVE, self-contained components in Rust behind the existing C ABI — e.g.
    the ETF/distribution codec, term decoders, the poller, allocators, or a socket backend — and
@@ -563,9 +602,10 @@ ecosystem-recompile story exist.
 | `io_uring` backend behind reactor | Medium | Medium (file I/O), low (net) | Low | Low | **Yes** |
 | Compiler fusion + loop opts + FBIP | Medium–high | Medium | Low | Medium | **Yes** |
 | ETS `ordered_set` → K-ary B-tree; flatmap/CHAMP tweaks | Low–medium | Low–medium | Low | Low | **Yes** |
-| Cheaper ETS put/read (incremental: element/key reads, match-copy trimming, `ordered_set` node layout) | Low–medium | Low–medium | Low | Low | **Yes** |
-| Widen off-heap shared-term template (refcounted immutable terms / literal-area registry) | High | Low–medium | Low | High | Research / not now |
-| Zero-copy ETS reads (borrowed off-heap view) | High | Low (repeated large-object reads only) | Low | High | No (not realistic; narrow binary view only) |
+| Cheaper ETS put/read (in-place: element/key reads, match-copy trimming, skip `{compressed}` re-decode, `ordered_set` node layout, opt-in secondary indexes) | Low–medium | Low–medium | Low | Low | **Yes** |
+| Opportunistic messaging wins (bounded in-place single-pass small copy; message-queue auto-tune) | Low | Low (neutral-to-low; no size penalty expected) | Low | Low | **Yes** |
+| Off-heap shared-term enabler (refcounted immutable terms / literal-area registry) | High | Low–medium | Low | High | Research / not now |
+| ETS redesign on the enabler (immutable shared objects returned by reference + lock-free reads; COW writes, refcount/RCU reclaim) | Very high | Medium–high (read-heavy tables) | Low | High | Gated on the enabler |
 | Cache-friendly list interior (chunked lists + FBIP; RRB/finger-tree) | High (VM+compiler) | Medium (gated on §F.2) | Low | Medium–high | Explore with compiler work |
 | Rust for isolated high-CVE components | Medium | Low | **High** | Low | **Yes** |
 | GC redesign (mark-region/Immix) | High | Uncertain | Medium | High | Evaluate only |
@@ -583,9 +623,11 @@ ecosystem-recompile story exist.
 6. **Team & timeline**: is this a research project or a shipping replacement, and by when?
 7. **Relationship to upstream OTP**: fork, upstream contributions, or parallel track? (Affects
    whether Workstreams 1–4 can be upstreamed — which they mostly can.)
-8. **Is the copy actually the bottleneck?** How much real messaging/ETS traffic is large immutable
-   payloads already shared by reference (refc binaries) versus small, copy-bound terms? Measure this
-   before gating any sharing work on it.
+8. **Is the copy actually the bottleneck, and for which traffic?** How much real messaging/ETS traffic
+   is large immutable payloads already shared by reference (refc binaries) versus small, copy-bound
+   terms — and specifically how much is **boxed-`Ref`-dominated small envelopes** (the `gen` call/reply
+   shapes) whose reference is deep-copied on every leg? Measure the split before gating any sharing or
+   small-copy work on it.
 
 ---
 
@@ -620,4 +662,10 @@ ecosystem-recompile story exist.
   https://www.ponylang.io/media/papers/orca_gc_and_type_system_co_design_for_actor_languages.pdf
 - Erlang binary handling (refc binaries, off-heap sharing): https://www.erlang.org/doc/system/binaryhandling.html
 - Erlang garbage collection (per-process generational copying): https://www.erlang.org/doc/apps/erts/garbagecollection.html
+- Erlang literals / `persistent_term` (permanent off-heap literal compounds sharing the heap layout
+  behind `TAG_LITERAL_PTR`): https://www.erlang.org/doc/apps/erts/persistent_term.html
+- RCU / epoch-based reclamation (lock-free readers with deferred/refcount reclaim): Linux kernel RCU
+  https://www.kernel.org/doc/Documentation/RCU/whatisRCU.rst ; userspace `urcu` / `crossbeam-epoch`.
+- B+-trees for ordered in-memory indexes (high fan-out, cache-friendlier than AVL nodes):
+  https://en.wikipedia.org/wiki/B%2B_tree
 - Prior art: `archseer/enigma` (Erlang VM in Rust, stalled); *Tyn* (Rust microkernel hosting real ERTS).
