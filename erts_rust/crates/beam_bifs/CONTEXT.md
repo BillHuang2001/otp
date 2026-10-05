@@ -293,8 +293,12 @@ caller's heap (they alias table storage in `beam_ets`). Small and documented; se
   `badarg`.
 - **No in-crate message delivery.** `send/2`/`!/2` require a `SendHook`; without one they raise
   `unsupported_bif`. Wiring to `beam_process::ProcessTable`/`beam_message` is `beam_rt`'s.
+- **`error/2` ignores its second argument** in M1 (it behaves exactly like `error/1`; the argument
+  list is not rendered into the reason).
 - **`error/1,2`'s structured reason** is carried only as `ExitReason::Structured` (no term); the
-  engine/`beam_rt` must capture the live reason term from the raise site.
+  engine/`beam_rt` must capture the live reason term from the raise site. Correspondingly,
+  `reason_term_from_exit_reason(&ExitReason::Structured, ..)` is `BeamError::BadArg` — there is no
+  term to reproduce in that direction.
 - **`ets` bridge is minimal**: `set`/`ordered_set` core ops; table id is a synthesized `Ref` thing;
   access control/ownership and the full option surface are `beam_ets`'s documented gaps.
 - **Registry lookup allocates a key tuple per call** (`HashMap<(String,String,u32), _>`). A future
