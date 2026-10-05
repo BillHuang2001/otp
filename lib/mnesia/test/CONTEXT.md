@@ -47,7 +47,6 @@ Network blocking: with `-proto_dist gen_tcp_blocking` (`?NETWORK_BLOCKER_DIST_OP
 ## Notes for Agents
 - Read `README` first; it documents the harness, node setup, timeout flag and the `-Ddebug` rebuild recipe.
 - For CI-equivalent runs prefer the spec route (`make test`) and consult `mnesia.spec` when a case seems absent from a run.
-- Debug instrumentation entry points live in `../src/mnesia_lib.erl` (`activate_debug_fun/5`, `eval_debug_fun/4`); `mnesia_frag_hash_test` relies on `mnesia_frag_hash:init_state/2`, `add_frag/1`, `key_to_frag_number/2`.
 - The `?init(N, Config)` macros local to `mnesia_config_test`, `mnesia_examples_test` and `mnesia_measure_test` wrap `mnesia_test_lib:prepare_test_case/5` without starting Mnesia.
 
 ## See Also
