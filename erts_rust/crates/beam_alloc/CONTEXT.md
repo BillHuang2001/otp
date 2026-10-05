@@ -193,7 +193,7 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
 - `src/heap.rs` → the per-process bump `Heap` (`alloc_words`/`cons`/`tuple`/`reset`)
 - `src/stats.rs` → `AllocStats` + internal `Counters`
 - `src/block.rs` → block layout constants + `BlockHeader` encode/decode (implementation module)
-- `src/carrier.rs` → `Carrier` (mmap-backed block, sub-division, free lists) (implementation module)
+- `src/carrier.rs` → `Carrier` (mmap-backed block, subdivision into equal class blocks) (implementation module)
 - `src/free_list.rs` → segregated free-list / slab management (implementation module)
 - `src/strategy.rs` → `Strategy` selector (implementation module; A.6 config fidelity)
 - `src/error.rs` → `pub(crate)` allocation-failure constructors (no new error enum)
