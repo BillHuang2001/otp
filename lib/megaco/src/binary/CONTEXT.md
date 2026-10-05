@@ -119,8 +119,8 @@ Generated at build time into this directory (git-ignored, never hand-edited):
   builds v1/v2/v3 together.
 - The exclusive-decode entries `decode_message_trans_partial` and `decode_message_acts_partial` are declared and
   generated but called nowhere in the current tree.
-- `release_spec` ships the generated `.erl`/`.hrl` sources plus `MEDIA-GATEWAY-MEDIA... .asn` specs, but not the
-  `.set.asn` / `.asn1config` inputs, so the shipped sources cannot be regenerated as-is.
+- `release_spec` ships the generated `.erl`/`.hrl` sources plus the `MEDIA-GATEWAY-CONTROL-vN.asn` specs, but not
+  the `.set.asn` / `.asn1config` inputs, so the shipped sources cannot be regenerated as-is.
 
 ## Notes for Agents
 - The generated `.erl`/`.hrl`/`.asn1db` files are absent from a fresh checkout (git-ignored) — build first
