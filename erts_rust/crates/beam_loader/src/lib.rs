@@ -23,11 +23,13 @@
 //! — over the frozen IR of [`ir`]. The container/chunk layer ([`container`], [`chunk`])
 //! validates the `FOR1` framing and decodes every known chunk, [`decode`] turns the
 //! `Code` stream into typed [`decode::RawInstr`]s, and [`lower`] groups them into
-//! functions and basic blocks. Coverage is the Milestone-1 opcode subset (everything
-//! else round-trips losslessly as [`ir::Instr::Generic`]); the intentional
-//! Milestone-1 gaps (literal decoding, fun descriptors, preloaded/positional atoms)
-//! are listed under "Known Issues" in the crate `CONTEXT.md`, which is the
-//! authoritative description of this crate's behaviour and frozen public API.
+//! functions and basic blocks. Coverage is the opcode set the compiler emits for
+//! ordinary Erlang code (typed [`instr::Instr`] variants, see [`instr`]); obsolete
+//! `genop.tab` entries and the OTP-29 native-record family round-trip losslessly as
+//! [`instr::Instr::Generic`]. The intentional Milestone-1 gaps (literal decoding,
+//! fun descriptors, preloaded/positional atoms) are listed under "Known Issues" in
+//! the crate `CONTEXT.md`, which is the authoritative description of this crate's
+//! behaviour and frozen public API.
 //!
 //! The container cursor is `beam_codec::Reader` (the ETF codec's bounds-checked
 //! big-endian reader) — there is no second cursor and no `unsafe` in this crate.
@@ -38,6 +40,7 @@ pub mod chunk;
 pub mod container;
 pub mod decode;
 pub mod error;
+pub mod instr;
 pub mod ir;
 pub mod load;
 pub mod lower;
