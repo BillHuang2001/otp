@@ -55,5 +55,5 @@ Each is a `-behaviour(wx_object)` implementing `start/1` (+ `init`/`handle_*`/`t
 - CI does not run the demo; verification is manual on a machine with a display and a wx-enabled build.
 
 ## See Also
-- `..//CONTEXT.md` (parent, `lib/wx/examples`) and `../CONTEXT.md` (the `wx` app) for build/install wiring.
+- `../CONTEXT.md` (parent, `lib/wx/examples`) and `../../CONTEXT.md` (the `wx` app) for build/install wiring.
 - `../../src/wx.erl` — `wx:demo/0`, the supported entry point that launches this demo.
