@@ -128,8 +128,8 @@ is part of the documented NIF/driver ABI.
     `Makefile.src` and `ts_erl_config.erl`) compile *against* these installed headers — the closest
     thing to a header smoke test.
   - `../emulator/test` and `../test` suites exercise the emulator/`lib_src` code that includes them.
-  - `--enable-preprocessor-cat` / `TYPE=debug|valgrind|asan` builds are the practical way to
-    exercise `ETHR_ASSERT`/`ETHR_XCHK` paths.
+  - `TYPE=debug|valgrind|asan` builds (and `ETHR_XCHK`, which `DEBUG` turns on via `ETHR_DEBUG`) are
+    the practical way to exercise the `ETHR_ASSERT` paths in the ethread headers.
 - A header change that breaks the include chain shows up at build time in all four consumers, not in
   a dedicated suite.
 
