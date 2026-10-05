@@ -89,7 +89,7 @@ This directory implements two contracts: (a) types/macros the whole emulator dep
   - Distribution/networking over the check I/O layer: `../test/distribution_SUITE.erl`, `../test/port_SUITE.erl`, `../test/port_bif_SUITE.erl`, `../test/trace_port_SUITE.erl`.
   - `erl_child_setup` (port spawning, exit status, tty restore): `../test/port_SUITE.erl`, `../test/port_bif_SUITE.erl`; `run_erl`/`to_erl`/`erlexec` launcher suites are at the `erts` level (`../../test/`).
   - Dynamic driver/NIF loading (`ddll`): `../test/driver_SUITE.erl`, `../test/nif_SUITE.erl`.
-- Run with `make test` from `ERL_TOP` or from `erts/emulator`; a full release must exist first (`TEST_NEEDS_RELEASE`). Use `TYPE=debug`, `TYPE=valgrind` (suppressions in `../valgrind/`) or `TYPE=asan` (suppressions in `../asan/`) to actually exercise the C paths.
+- Run with `make emulator_test ARGS="..."` (or `make test ARGS="..."` from `../`); `TEST_NEEDS_RELEASE` is NOT set at the `erts/emulator` level (only `erts/Makefile` sets it), so no full release is required. Use `TYPE=debug`, `TYPE=valgrind` (suppressions in `../valgrind/`) or `TYPE=asan` (suppressions in `../asan/`) to actually exercise the C paths.
 - Coverage gaps: OS-specific branches (kqueue, `/dev/poll`, Windows poll thread pool, `VirtualAlloc` mapper) are only exercised on the respective platform; the fallback pollset and scheduler pollset are only actively used on Linux/macOS builds where kernel polling is enabled.
 
 ## See Also
