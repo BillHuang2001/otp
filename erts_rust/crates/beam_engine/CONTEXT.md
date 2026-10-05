@@ -279,7 +279,8 @@ stable raw pointers; **only this module dereferences them**.
 - `src/machine.rs` → `Machine`: x-register file, Erlang stack, call frames, `run_export`/`run_label`, `Continuation`
 - `src/operand.rs` → `Operand` read (→ `Eterm`) / write (register or Y slot) + unsupported-operand errors
 - `src/interpreter.rs` → the dispatch loop (`impl Machine`): one arm per `Instr` variant, jump/return/allocate/trim semantics
-- `src/predicates.rs` → the crate's **only** `#[allow(unsafe_code)]` module: SAFETY-annotated wrappers over the `unsafe fn` `beam_term` boxed-term predicates (`is_integer`, `is_tuple`, `is_map`, …) used by the `Test` opcodes
+- `src/predicates.rs` → an `#[allow(unsafe_code)]` module: SAFETY-annotated wrappers over the `unsafe fn` `beam_term` boxed-term predicates (`is_integer`, `is_tuple`, `is_map`, …) used by the `Test` opcodes
+- `src/terms.rs` → the SAFETY-annotated boxed-term builder/reader (`make_tuple`/`make_list`/`make_float`/`make_flatmap`/`make_fun`/`make_heap_binary` + `tuple_*`/`cons_*`/`list_elements`/`float_value`/`map_entries`/`binary_bytes`/`fun_*` readers) over `ExecutionContext::alloc_words`
 - `src/jit.rs` → JIT tier stubs + tiering design (Cranelift behind `jit-cranelift`, default off)
 - `src/error.rs` → engine error constructors over `beam_common::BeamError` (`unsupported`, `bad_register`, `unknown_label`)
 - `tests/slice.rs` → vertical-slice integration test over the `beam_loader` slice fixture
