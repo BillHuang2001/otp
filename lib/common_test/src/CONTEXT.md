@@ -121,6 +121,7 @@ The `test_server*` modules are the historical core of the framework and keep the
 - `test_server_sup` is misnamed — it is a plain function library, not a supervisor.
 - Framework indirection: behaviour of a testcase depends on the `TEST_SERVER_FRAMEWORK` OS env var; when unset the `framework_call`s silently return defaults (no `init_tc`/`end_tc` hooks run). Code reading `test_server` alone will not find the CT implementation — that is `ct_framework`.
 - Several modules carry `nowarn_possibly_unsafe_function`/`nowarn_deprecated_function` compile options (e.g. `test_server_sup`, `ct_cover`, `ct_netconfc`, `ct`) — these are deliberate, not accidental.
+- `common_test.app.src` still registers `ct_make_ref`, which no module in the tree defines or registers; it is a stale entry, not a live process name.
 - Many-to-many coupling around the run: `test_server_ctrl`, `ct_logs`, `ct_util`, `ct_framework` and `test_server` call each other in both directions (e.g. `test_server_ctrl:escape_chars/format/print` are used by almost every module) — a "clean" module split does not exist here.
 
 ## Notes for Agents
