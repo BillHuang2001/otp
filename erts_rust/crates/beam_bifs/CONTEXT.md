@@ -278,6 +278,9 @@ caller's heap (they alias table storage in `beam_ets`). Small and documented; se
   plus the `erlang` core, `io:format`, and four `ets` BIFs are registered. `apply/3`, `spawn*`,
   `process_info`, `term_to_binary`/`binary_to_term`, `make_ref`, `list_to_atom`, `map_*`, `binary_*`
   are not registered (⇒ `undefined_bif`).
+- **`size/1` on a binary/bitstring is unreachable.** `size/1` is `tuple_size/1` for tuples and the
+  byte size for a binary; `beam_term` exposes no safe binary-size accessor and M1 builds no binaries,
+  so a binary operand is `BadArg` (identical to the oracle for every M1-constructible term).
 - **`~d` is not accepted** (matches the oracle; see above).
 - **Float formatting** is Rust's shortest round-trip + `.0`; it deviates from OTP's `%.*g` for large/
   small magnitudes (`1.0e10` prints as `10000000000`).
