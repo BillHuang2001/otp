@@ -9,7 +9,7 @@ Sources live in `../src/` and are handled elsewhere — this node only documents
 
 ### Shared helper libraries (compiled into `ebin/`, not suites)
 - `ssl_test_lib.erl` (~4460 lines) — the central helper: `clean_start/0`, `init_per_suite/2` + `init_per_group/2` + `init_per_group_openssl/2`, `cert_options/1`, `ssl_options/2,3`, `start_server/start_client/start_upgrade_*/start_*_error`, `run_where/1`, `basic_test/3`, `test_ciphers/3`, `reuse_session/3`, `openssl_*` capability probes, `portable_cmd/2` + `portable_open_port/2`, `kill_openssl/0`, `trace/0`, `hardcode_rsa_key/1`, `ktls_*` helpers, `pss_params/1`, `gen_conf/4`.
-  Treat it as a god-module and extend it rather than adding parallel helpers; it is large but intentionally unsplit.
+Treat it as a god-module and extend it rather than adding parallel helpers; it is large but intentionally unsplit.
 - `ssl_test_lib.hrl` — the CT macros suites should use: `?CT_LOG/1,2`, `?CT_PAL/1,2`, `?CT_FAIL/2` (they prefix pid/module/line/function).
 - `ssl_cert_tests.erl` — shared test-case bodies and per-algorithm certificate config builders (`rsa_config/1`, `rsa_pss_config/2`, `dsa_config/1`, `ecdsa_config/1`, `eddsa_config/1`, `mldsa_config/1`, `slh_dsa_sha2/shake_config/1`, `support_kems/1`) reused by `ssl_cert_SUITE` and the two `openssl_*_cert_SUITE`s.
 - `make_certs.erl` — builds a full OpenSSL CA hierarchy in the test `priv_dir` by driving the OpenSSL CLI (`openssl req/ca/ecparam/crl`): `all/2,3`, `rootCA/3`, `intermediateCA/4`, `enduser/4`, `revoke/3`, `gencrl/4`, `make_config/1`.
