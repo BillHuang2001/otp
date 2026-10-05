@@ -124,7 +124,9 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   (`block.rs`), exactly as legacy `Block_t` precedes each payload: `bhdr` packs block size, payload
   offset (padding for `align > UNIT_SIZE`), size-class index and flags; `carrier` gives O(1)
   block→carrier recovery without super-alignment. Header size = `UNIT_SIZE` (16 B), so payloads are
-  `UNIT_SIZE`-aligned by construction (satisfies `align_of::<Eterm>() == 8`).
+  `UNIT_SIZE`-aligned by construction (satisfies `align_of::<Eterm>() == 8`). `bhdr` uses fixed bit
+  fields — flags 8b, class 12b (`block::CLASS_NONE` = no class), payload offset 12b and block size
+  32b, both in `UNIT_SIZE` units — which bounds the largest encodable block (`block::MAX_BLOCK_SIZE`).
 - **`AllocRef = Arc<dyn Allocator>`, not a borrow.** Dependents (e.g. a `beam_ets` table) need to
   outlive the call that created them and sometimes share one allocator across threads; a
   cheaply-clonable `Arc` handle does that without a lifetime parameter on every structure.
