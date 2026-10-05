@@ -29,7 +29,8 @@ Its native code lives in `c_src/` (port programs spawned by the Erlang monitors)
 - Build-time: C compiler configured by the top-level/erts configure (`@CC@`, `@LIBS@`, `@CPU_SUP_LIBS@`, `@os_mon_programs@`).
 
 ## Test Strategy
-- Common Test suites in `test/` (`cpu_sup_SUITE`, `disksup_SUITE`, `memsup_SUITE`, `os_sup_SUITE`, `os_mon_SUITE`) run via `make test` / `make release_tests` conventions; `make test` in the app dir builds and runs them in place.
+- Common Test suites in `test/` (`cpu_sup_SUITE`, `disksup_SUITE`, `memsup_SUITE`, `os_sup_SUITE`, `os_mon_SUITE`); `make test` in this app dir compiles them and runs them through `make/test_target_script.sh` → `ts:run` (filter with `ARGS="-suite memsup_SUITE"`), while `make tests` in `test/` only compiles them.
+- `make release_tests` installs suites + `os_mon.spec`/`os_mon_smoke.spec`/`os_mon.cover` into `$RELEASE_PATH/os_mon_test`, which is what the `spec` files and `ts:run` expect.
 - Suites gate their case lists on `os:type()`, so a skipped or missing case usually means "unsupported platform", not a bug; `os_sup` cases and `os_mon_SUITE:config` effectively only run on Solaris, and `os_sup_SUITE:config` cannot run without root.
 - The C port programs have no direct unit tests — they are exercised indirectly by the suites.
 
