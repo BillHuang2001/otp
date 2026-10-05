@@ -246,9 +246,8 @@ encoding.
   `is_unsupported`, `UNSUPPORTED_REASON`
 - `src/term.rs` → **the only `unsafe` module**: term inspection + boxed sub-term materialization
   (float/bignum/flatmap/external identifiers) pinned to `erl_term.h`
-- `tests/` → cross-module integration tests; currently plan-only. `tests/ground_truth.rs` =
-  byte-exact `term_to_binary` fixture vectors (oracle-regenerated); `tests/roundtrip.rs` =
-  exhaustive encode→decode round-trips + negative/truncation cases
+- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated)
+- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
 - `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values (read-only)
 - `../../erts/emulator/beam/erl_term.h` / `erl_map.h` → term layouts for the boxed sub-terms (read-only)
 - `../../erts/doc/guides/erl_ext_dist.md` → the in-tree external term format specification (read-only)
