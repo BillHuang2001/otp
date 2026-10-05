@@ -141,7 +141,9 @@ mod tests {
     #[test]
     fn set_bif_hook_replaces_the_hook() {
         let mut ctx = MinimalContext::new();
-        ctx.set_bif_hook(Box::new(|_m, _f, _a, _args| Err(beam_common::BeamError::BadArg)));
+        ctx.set_bif_hook(Box::new(|_m, _f, _a, _args| {
+            Err(beam_common::BeamError::BadArg)
+        }));
         assert!(ctx.call_bif("x", "y", 0, &[]).is_err());
     }
 }

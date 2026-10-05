@@ -42,10 +42,7 @@ const TIERS: &[&str] = &["interpreter", "jit-cranelift"];
 #[cfg(all(not(feature = "jit-cranelift"), feature = "jit-beamasm"))]
 const TIERS: &[&str] = &["interpreter", "jit-beamasm"];
 
-#[cfg(all(
-    not(feature = "jit-cranelift"),
-    not(feature = "jit-beamasm")
-))]
+#[cfg(all(not(feature = "jit-cranelift"), not(feature = "jit-beamasm")))]
 const TIERS: &[&str] = &["interpreter"];
 
 #[cfg(test)]
