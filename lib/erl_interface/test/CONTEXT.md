@@ -95,7 +95,7 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 - `README` → obsolete ClearCase-era notes
 
 ## See Also
-- `../CONTEXT.md` — the `erl_interface` application (C library, `erl_call`, `vsn.mk`)
+- `../CONTEXT.md` — the `erl_interface` application (the `ei` library, `erl_call`, `vsn.mk`)
 - `../../common_test/test_server/CONTEXT.md` — the `ts` framework (`ts_lib:make_non_erlang/2`, `ts_erl_config`, `ts_install_cth`) that builds these data dirs
 - `../../../HOWTO/TESTING.md` — how `make test` and the `Makefile.first`/`Makefile.src` mechanism work
 - `../../../erts/emulator/test/erts_test_utils.erl` — helper used by `ei_decode_SUITE` and `ei_accept_SUITE` to build large external pid/port/ref containers
