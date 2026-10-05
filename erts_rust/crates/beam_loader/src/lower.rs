@@ -12,21 +12,26 @@
 //! * [`build_module`] assembles the [`Module`]: interned atoms, exports, imports,
 //!   functions, the type/line tables and the raw data chunks.
 //!
+//! The per-opcode vocabulary mapping (one decoded instruction → one IR [`Instr`])
+//! lives in the private submodule `instr`, which keeps this file to the
+//! grouping/assembly responsibilities.
+//!
 //! Every fallible step reports `BeamError::BadArg` through [`crate::error::bad_file`]
 //! (or `BeamError::SystemLimit` for a size bound); the module never panics and never
 //! `unwrap()`s file data.
 use std::collections::BTreeMap;
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_term::Atom;
 
 use crate::chunk::Chunks;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
-use crate::ir::{Block, Export, Function, Import, ImportRef, Instr, Module, TestKind};
-use crate::opcode::Opcode;
-use crate::operand::{Label, Operand};
+use crate::ir::{Block, Export, Function, Import, Instr, Module};
+use crate::operand::Label;
 
+mod instr;
+use instr::lower_instr;
 /// Assembles the IR [`Module`] from the parsed chunks and the decoded instructions.
 ///
 /// `atom_table` is the interning context the module's atoms are resolved through
@@ -221,189 +226,13 @@ pub fn build_blocks(code: &[Instr]) -> (Vec<Block>, BTreeMap<Label, usize>) {
     (blocks, labels)
 }
 
-/// Lowers one decoded [`RawInstr`] into the IR [`Instr`].
-///
-/// The Milestone-1 opcode subset maps to named variants; every other opcode is
-/// preserved losslessly as [`Instr::Generic`]. Operand order is the file's
-/// (`ops.tab`), e.g. `move Src Dst` and `gc_bif* Fail Live Bif Arg… Dst`. A
-/// structurally mismatched operand (a non-label where a `f` operand is required, a
-/// non-integer where a `u` operand is required) yields `BeamError::BadArg`.
-fn lower_instr(raw: &RawInstr) -> Result<Instr> {
-    let ops = &raw.operands;
-    match raw.opcode {
-        // `label/1`: the compiler writes the label *number* with the `u` tag
-        // (`encode_arg(Int, …)` in `beam_asm.erl`; `beam_disasm` prints a plain
-        // integer), unlike jump/failure targets which use the `f` tag. Both forms
-        // denote a label, so both are accepted here.
-        Opcode::label => Ok(Instr::Label(label_value(operand(ops, 0)?)?)),
-        // The `line` operand is the index into the `Line` chunk items (0 = undefined
-        // location), which is exactly the IR's `LineRef`.
-        Opcode::line => Ok(Instr::Line(as_u32(operand(ops, 0)?)?)),
-        Opcode::func_info => Ok(Instr::FuncInfo {
-            module: as_atom(operand(ops, 0)?)?,
-            function: as_atom(operand(ops, 1)?)?,
-            arity: as_u32(operand(ops, 2)?)?,
-        }),
-        Opcode::int_code_end => Ok(Instr::IntCodeEnd),
-        Opcode::r#move => Ok(Instr::Move {
-            src: operand(ops, 0)?.clone(),
-            dst: operand(ops, 1)?.clone(),
-        }),
-        // `gc_bif{1,2,3} Fail Live Bif Arg… Dst` (`erts/emulator/beam/emu/ops.tab`).
-        // The BIF operand is the index into the `ImpT` chunk, not a `bif.tab` number.
-        Opcode::gc_bif1 | Opcode::gc_bif2 | Opcode::gc_bif3 => {
-            if ops.len() < 4 {
-                return Err(bad_file("gc_bif has too few operands"));
-            }
-            let args = ops[3..ops.len() - 1].to_vec();
-            let arity = u8::try_from(args.len()).map_err(|_| BeamError::SystemLimit)?;
-            Ok(Instr::GcBif {
-                arity,
-                bif: ImportRef(as_u32(operand(ops, 2)?)?),
-                fail: as_label(operand(ops, 0)?)?,
-                live: as_u32(operand(ops, 1)?)?,
-                args,
-                dst: ops[ops.len() - 1].clone(),
-            })
-        }
-        // `select_val Value Fail {Value,Label}*` — the alternatives arrive as one
-        // `z,1` argument list, flattened into alternating value/label operands.
-        Opcode::select_val => {
-            let value = operand(ops, 0)?.clone();
-            let fail = as_label(operand(ops, 1)?)?;
-            let items = match operand(ops, 2)? {
-                Operand::List(items) => items,
-                _ => return Err(bad_file("select_val alternatives are not a list")),
-            };
-            if items.len() % 2 != 0 {
-                return Err(bad_file("select_val alternative list has an odd length"));
-            }
-            let mut pairs = Vec::with_capacity(items.len() / 2);
-            for pair in items.chunks_exact(2) {
-                pairs.push((pair[0].clone(), as_label(&pair[1])?));
-            }
-            Ok(Instr::SelectVal { value, fail, pairs })
-        }
-        Opcode::swap => Ok(Instr::Swap {
-            a: operand(ops, 0)?.clone(),
-            b: operand(ops, 1)?.clone(),
-        }),
-        Opcode::call => Ok(Instr::Call {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: as_label(operand(ops, 1)?)?,
-        }),
-        Opcode::call_last => Ok(Instr::CallLast {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: as_label(operand(ops, 1)?)?,
-            deallocate: as_u32(operand(ops, 2)?)?,
-        }),
-        Opcode::call_only => Ok(Instr::CallOnly {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: as_label(operand(ops, 1)?)?,
-        }),
-        Opcode::call_ext => Ok(Instr::CallExt {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: ImportRef(as_u32(operand(ops, 1)?)?),
-        }),
-        Opcode::call_ext_only => Ok(Instr::CallExtOnly {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: ImportRef(as_u32(operand(ops, 1)?)?),
-        }),
-        Opcode::call_ext_last => Ok(Instr::CallExtLast {
-            arity: as_u32(operand(ops, 0)?)?,
-            target: ImportRef(as_u32(operand(ops, 1)?)?),
-            deallocate: as_u32(operand(ops, 2)?)?,
-        }),
-        Opcode::allocate => Ok(Instr::Allocate {
-            stack_need: as_u32(operand(ops, 0)?)?,
-            live: as_u32(operand(ops, 1)?)?,
-        }),
-        Opcode::allocate_heap => Ok(Instr::AllocateHeap {
-            stack_need: as_u32(operand(ops, 0)?)?,
-            heap_need: as_u32(operand(ops, 1)?)?,
-            live: as_u32(operand(ops, 2)?)?,
-        }),
-        Opcode::test_heap => Ok(Instr::TestHeap {
-            heap_need: as_u32(operand(ops, 0)?)?,
-            live: as_u32(operand(ops, 1)?)?,
-        }),
-        Opcode::deallocate => Ok(Instr::Deallocate(as_u32(operand(ops, 0)?)?)),
-        Opcode::trim => Ok(Instr::Trim {
-            n: as_u32(operand(ops, 0)?)?,
-            remaining: as_u32(operand(ops, 1)?)?,
-        }),
-        Opcode::r#return => Ok(Instr::Return),
-        op => {
-            // The `is_*`/`test_arity` family: `Test Fail Arg… `. Anything else keeps
-            // its opcode and operands verbatim for the engine/JIT to extend into.
-            if let Some(kind) = TestKind::from_opcode(op) {
-                let fail = as_label(operand(ops, 0)?)?;
-                Ok(Instr::Test {
-                    kind,
-                    fail,
-                    args: ops[1..].to_vec(),
-                })
-            } else {
-                Ok(Instr::Generic {
-                    op,
-                    operands: raw.operands.clone(),
-                    offset: raw.offset,
-                })
-            }
-        }
-    }
-}
-
-/// Fetches the operand at `index`, or reports a structurally short instruction.
-fn operand(ops: &[Operand], index: usize) -> Result<&Operand> {
-    ops.get(index)
-        .ok_or_else(|| bad_file("instruction is missing an operand"))
-}
-
-/// Requires a label (`f`) operand — the failure sentinel [`crate::operand::NO_FAIL`]
-/// for `f,0` is a valid label.
-fn as_label(operand: &Operand) -> Result<Label> {
-    match operand {
-        Operand::Label(label) => Ok(*label),
-        _ => Err(bad_file("expected a label operand")),
-    }
-}
-
-/// A label *value* from either the `u` integer form the compiler writes for
-/// `label/1` or the `f` label form used for jump and failure targets.
-fn label_value(operand: &Operand) -> Result<Label> {
-    match operand {
-        Operand::Label(label) => Ok(*label),
-        Operand::Integer(value) if *value >= 0 && *value <= i64::from(u32::MAX) => {
-            Ok(Label(*value as u32))
-        }
-        _ => Err(bad_file("expected a label operand")),
-    }
-}
-
-/// Requires an unsigned integer (`u`) operand that fits the IR's 32-bit width.
-fn as_u32(operand: &Operand) -> Result<u32> {
-    match operand {
-        Operand::Integer(value) if *value >= 0 && *value <= i64::from(u32::MAX) => {
-            Ok(*value as u32)
-        }
-        _ => Err(bad_file("expected an unsigned integer operand")),
-    }
-}
-
-/// Requires an atom (`a`) operand.
-fn as_atom(operand: &Operand) -> Result<Atom> {
-    match operand {
-        Operand::Atom(atom) => Ok(*atom),
-        _ => Err(bad_file("expected an atom operand")),
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ir::ImportRef;
     use crate::opcode::Opcode;
-
+    use crate::operand::{Operand, NO_FAIL};
+    use beam_common::BeamError;
     /// One decoded instruction with the given opcode and operands.
     fn raw(opcode: Opcode, operands: Vec<Operand>) -> RawInstr {
         RawInstr {
@@ -618,6 +447,969 @@ mod tests {
         ];
         assert!(matches!(
             group_functions(&instrs).unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    // ---- the newly modelled opcode families ------------------------------
+
+    /// Lowers one instruction and unwraps the result (test shorthand).
+    fn lower(opcode: Opcode, operands: Vec<Operand>) -> Instr {
+        lower_instr(&raw(opcode, operands)).unwrap()
+    }
+
+    #[test]
+    fn lowers_jump_init_yregs_and_put_tuple2() {
+        assert_eq!(
+            lower(Opcode::jump, vec![Operand::Label(Label(7))]),
+            Instr::Jump { target: Label(7) }
+        );
+        assert_eq!(
+            lower(
+                Opcode::init_yregs,
+                vec![Operand::List(vec![Operand::Y(0), Operand::Y(1)])]
+            ),
+            Instr::InitYregs {
+                registers: vec![Operand::Y(0), Operand::Y(1)]
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::put_tuple2,
+                vec![
+                    Operand::X(0),
+                    Operand::List(vec![Operand::X(1), Operand::Integer(2)]),
+                ]
+            ),
+            Instr::PutTuple2 {
+                dst: Operand::X(0),
+                elements: vec![Operand::X(1), Operand::Integer(2)],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_get_tuple_element_and_select_tuple_arity() {
+        assert_eq!(
+            lower(
+                Opcode::get_tuple_element,
+                vec![Operand::X(1), Operand::Integer(2), Operand::Y(0)],
+            ),
+            Instr::GetTupleElement {
+                source: Operand::X(1),
+                element: 2,
+                dst: Operand::Y(0),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::select_tuple_arity,
+                vec![
+                    Operand::X(0),
+                    Operand::Label(NO_FAIL),
+                    Operand::List(vec![
+                        Operand::Integer(2),
+                        Operand::Label(Label(3)),
+                        Operand::Integer(3),
+                        Operand::Label(Label(4)),
+                    ]),
+                ],
+            ),
+            Instr::SelectTupleArity {
+                tuple: Operand::X(0),
+                fail: NO_FAIL,
+                destinations: vec![
+                    (Operand::Integer(2), Label(3)),
+                    (Operand::Integer(3), Label(4)),
+                ],
+            }
+        );
+        // An odd-length alternative list is a structural mismatch.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::select_tuple_arity,
+                vec![
+                    Operand::X(0),
+                    Operand::Label(Label(1)),
+                    Operand::List(vec![Operand::Integer(2)]),
+                ],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn lowers_the_list_instructions() {
+        assert_eq!(
+            lower(
+                Opcode::put_list,
+                vec![Operand::X(0), Operand::Nil, Operand::X(1)],
+            ),
+            Instr::PutList {
+                head: Operand::X(0),
+                tail: Operand::Nil,
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::get_list,
+                vec![Operand::X(0), Operand::X(1), Operand::Y(0)],
+            ),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(1),
+                tail: Operand::Y(0),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::get_hd, vec![Operand::X(0), Operand::Y(1)]),
+            Instr::GetHd {
+                source: Operand::X(0),
+                head: Operand::Y(1),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::get_tl, vec![Operand::X(0), Operand::Y(1)]),
+            Instr::GetTl {
+                source: Operand::X(0),
+                tail: Operand::Y(1),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_call_fun_and_call_fun2() {
+        assert_eq!(
+            lower(Opcode::call_fun, vec![Operand::Integer(2)]),
+            Instr::CallFun { arity: 2 }
+        );
+        // A statically known target keeps the raw fun-table index; the atom forms
+        // (`safe`/`unsafe`) are raw operands too.
+        let (safe, _) = atoms();
+        assert_eq!(
+            lower(
+                Opcode::call_fun2,
+                vec![Operand::Atom(safe), Operand::Integer(1), Operand::X(1)],
+            ),
+            Instr::CallFun2 {
+                tag: Operand::Atom(safe),
+                arity: 1,
+                func: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::call_fun2,
+                vec![Operand::Integer(9), Operand::Integer(0), Operand::X(0)],
+            ),
+            Instr::CallFun2 {
+                tag: Operand::Integer(9),
+                arity: 0,
+                func: Operand::X(0),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_apply_and_make_fun3() {
+        assert_eq!(
+            lower(Opcode::apply, vec![Operand::Integer(3)]),
+            Instr::Apply { arity: 3 }
+        );
+        let last = vec![Operand::Integer(2), Operand::Integer(1)];
+        assert_eq!(
+            lower(Opcode::apply_last, last),
+            Instr::ApplyLast {
+                arity: 2,
+                deallocate: 1,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::make_fun3,
+                vec![
+                    Operand::Integer(5),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Y(0), Operand::Y(1)]),
+                ],
+            ),
+            Instr::MakeFun3 {
+                index: 5,
+                dst: Operand::X(0),
+                env: vec![Operand::Y(0), Operand::Y(1)],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_bif_family() {
+        // `bif0 Bif Dst`.
+        assert_eq!(
+            lower(Opcode::bif0, vec![Operand::Integer(7), Operand::X(0)]),
+            Instr::Bif0 {
+                bif: ImportRef(7),
+                dst: Operand::X(0),
+            }
+        );
+        // `bif2 Fail Bif Arg Arg Dst` — arity is derived from the operand count.
+        assert_eq!(
+            lower(
+                Opcode::bif2,
+                vec![
+                    Operand::Label(Label(1)),
+                    Operand::Integer(3),
+                    Operand::X(0),
+                    Operand::X(1),
+                    Operand::X(2),
+                ],
+            ),
+            Instr::Bif {
+                arity: 2,
+                bif: ImportRef(3),
+                fail: Label(1),
+                args: vec![Operand::X(0), Operand::X(1)],
+                dst: Operand::X(2),
+            }
+        );
+        // A non-label failure operand is a structural mismatch.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::bif1,
+                vec![
+                    Operand::Integer(0),
+                    Operand::Integer(3),
+                    Operand::X(0),
+                    Operand::X(1),
+                ],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn lowers_the_exception_instructions() {
+        assert_eq!(
+            lower(Opcode::badmatch, vec![Operand::X(0)]),
+            Instr::Badmatch {
+                value: Operand::X(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::case_end, vec![Operand::X(1)]),
+            Instr::CaseEnd {
+                value: Operand::X(1)
+            }
+        );
+        assert_eq!(lower(Opcode::if_end, vec![]), Instr::IfEnd);
+        let try_operands = vec![Operand::Y(0), Operand::Label(Label(2))];
+        assert_eq!(
+            lower(Opcode::r#try, try_operands),
+            Instr::Try {
+                frame: Operand::Y(0),
+                fail: Label(2),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::try_end, vec![Operand::Y(0)]),
+            Instr::TryEnd {
+                frame: Operand::Y(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::catch_end, vec![Operand::Y(0)]),
+            Instr::CatchEnd {
+                frame: Operand::Y(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::try_case, vec![Operand::Y(0)]),
+            Instr::TryCase {
+                frame: Operand::Y(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::try_case_end, vec![Operand::X(0)]),
+            Instr::TryCaseEnd {
+                value: Operand::X(0)
+            }
+        );
+        let catch_operands = vec![Operand::Y(0), Operand::Label(Label(3))];
+        assert_eq!(
+            lower(Opcode::catch, catch_operands),
+            Instr::Catch {
+                frame: Operand::Y(0),
+                fail: Label(3),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::raise, vec![Operand::Y(1), Operand::Y(2)]),
+            Instr::Raise {
+                trace: Operand::Y(1),
+                value: Operand::Y(2),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::badrecord, vec![Operand::X(0)]),
+            Instr::Badrecord {
+                value: Operand::X(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::build_stacktrace, vec![]),
+            Instr::BuildStacktrace
+        );
+        assert_eq!(lower(Opcode::raw_raise, vec![]), Instr::RawRaise);
+    }
+
+    #[test]
+    fn lowers_the_float_instructions() {
+        assert_eq!(
+            lower(Opcode::fmove, vec![Operand::FloatReg(0), Operand::X(1)]),
+            Instr::Fmove {
+                src: Operand::FloatReg(0),
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::fconv, vec![Operand::X(0), Operand::FloatReg(1)]),
+            Instr::Fconv {
+                src: Operand::X(0),
+                dst: Operand::FloatReg(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::fadd,
+                vec![
+                    Operand::Label(Label(4)),
+                    Operand::FloatReg(0),
+                    Operand::FloatReg(1),
+                    Operand::FloatReg(2),
+                ],
+            ),
+            Instr::Fadd {
+                fail: Label(4),
+                lhs: Operand::FloatReg(0),
+                rhs: Operand::FloatReg(1),
+                dst: Operand::FloatReg(2),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::fdiv,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::FloatReg(0),
+                    Operand::FloatReg(1),
+                    Operand::FloatReg(0),
+                ],
+            ),
+            Instr::Fdiv {
+                fail: NO_FAIL,
+                lhs: Operand::FloatReg(0),
+                rhs: Operand::FloatReg(1),
+                dst: Operand::FloatReg(0),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::fnegate,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::FloatReg(0),
+                    Operand::FloatReg(1),
+                ],
+            ),
+            Instr::Fnegate {
+                fail: NO_FAIL,
+                src: Operand::FloatReg(0),
+                dst: Operand::FloatReg(1),
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_receive_instructions() {
+        let (tag, _) = atoms();
+        assert_eq!(lower(Opcode::send, vec![]), Instr::Send);
+        assert_eq!(lower(Opcode::timeout, vec![]), Instr::Timeout);
+        assert_eq!(lower(Opcode::remove_message, vec![]), Instr::RemoveMessage);
+        assert_eq!(
+            lower(
+                Opcode::loop_rec,
+                vec![Operand::Label(Label(1)), Operand::X(0)],
+            ),
+            Instr::LoopRec {
+                fail: Label(1),
+                dst: Operand::X(0),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::loop_rec_end, vec![Operand::Label(Label(2))]),
+            Instr::LoopRecEnd { target: Label(2) }
+        );
+        assert_eq!(
+            lower(Opcode::wait, vec![Operand::Label(Label(3))]),
+            Instr::Wait { target: Label(3) }
+        );
+        assert_eq!(
+            lower(
+                Opcode::wait_timeout,
+                vec![Operand::Label(Label(4)), Operand::Integer(1000)],
+            ),
+            Instr::WaitTimeout {
+                target: Label(4),
+                time: Operand::Integer(1000),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::recv_marker_reserve, vec![Operand::Y(0)]),
+            Instr::RecvMarkerReserve {
+                marker: Operand::Y(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::recv_marker_bind, vec![Operand::Y(0), Operand::X(0)]),
+            Instr::RecvMarkerBind {
+                marker: Operand::Y(0),
+                reference: Operand::X(0),
+            }
+        );
+        assert_eq!(
+            lower(Opcode::recv_marker_clear, vec![Operand::X(0)]),
+            Instr::RecvMarkerClear {
+                reference: Operand::X(0)
+            }
+        );
+        assert_eq!(
+            lower(Opcode::recv_marker_use, vec![Operand::Atom(tag)]),
+            Instr::RecvMarkerUse {
+                reference: Operand::Atom(tag)
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_line_markers() {
+        assert_eq!(
+            lower(
+                Opcode::executable_line,
+                vec![Operand::Integer(2), Operand::Integer(9)],
+            ),
+            Instr::ExecutableLine {
+                location: 2,
+                index: 9,
+            }
+        );
+        let (kind, _) = atoms();
+        assert_eq!(
+            lower(
+                Opcode::debug_line,
+                vec![
+                    Operand::Atom(kind),
+                    Operand::Integer(3),
+                    Operand::Integer(7),
+                    Operand::Integer(1),
+                ],
+            ),
+            Instr::DebugLine {
+                kind: Operand::Atom(kind),
+                location: 3,
+                index: 7,
+                live: 1,
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_has_map_fields_and_get_map_elements() {
+        let (key, _) = atoms();
+        assert_eq!(
+            lower(
+                Opcode::has_map_fields,
+                vec![
+                    Operand::Label(Label(1)),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(key), Operand::Integer(1)]),
+                ],
+            ),
+            Instr::HasMapFields {
+                fail: Label(1),
+                source: Operand::X(0),
+                keys: vec![Operand::Atom(key), Operand::Integer(1)],
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::get_map_elements,
+                vec![
+                    Operand::Label(Label(2)),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(key), Operand::X(1)]),
+                ],
+            ),
+            Instr::GetMapElements {
+                fail: Label(2),
+                source: Operand::X(0),
+                pairs: vec![(Operand::Atom(key), Operand::X(1))],
+            }
+        );
+        // An odd-length key/value list is a structural mismatch.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::get_map_elements,
+                vec![
+                    Operand::Label(Label(2)),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(key)]),
+                ],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
+    fn lowers_put_map_assoc_and_put_map_exact() {
+        let (key, value) = atoms();
+        let operands = |fail: Label, live: u32| {
+            vec![
+                Operand::Label(fail),
+                Operand::X(0),
+                Operand::X(1),
+                Operand::Integer(i64::from(live)),
+                Operand::List(vec![Operand::Atom(key), Operand::Atom(value)]),
+            ]
+        };
+        assert_eq!(
+            lower(Opcode::put_map_assoc, operands(NO_FAIL, 2)),
+            Instr::PutMapAssoc {
+                fail: NO_FAIL,
+                source: Operand::X(0),
+                dst: Operand::X(1),
+                live: 2,
+                pairs: vec![(Operand::Atom(key), Operand::Atom(value))],
+            }
+        );
+        assert_eq!(
+            lower(Opcode::put_map_exact, operands(Label(5), 3)),
+            Instr::PutMapExact {
+                fail: Label(5),
+                source: Operand::X(0),
+                dst: Operand::X(1),
+                live: 3,
+                pairs: vec![(Operand::Atom(key), Operand::Atom(value))],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_update_record() {
+        let (hint, _) = atoms();
+        assert_eq!(
+            lower(
+                Opcode::update_record,
+                vec![
+                    Operand::Atom(hint),
+                    Operand::Integer(4),
+                    Operand::X(0),
+                    Operand::X(1),
+                    Operand::List(vec![
+                        Operand::Integer(2),
+                        Operand::X(2),
+                        Operand::Integer(3),
+                        Operand::Y(0),
+                    ]),
+                ],
+            ),
+            Instr::UpdateRecord {
+                hint: Operand::Atom(hint),
+                size: 4,
+                src: Operand::X(0),
+                dst: Operand::X(1),
+                updates: vec![
+                    (Operand::Integer(2), Operand::X(2)),
+                    (Operand::Integer(3), Operand::Y(0)),
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_binary_match_instructions() {
+        assert_eq!(
+            lower(
+                Opcode::bs_start_match3,
+                vec![
+                    Operand::Label(Label(1)),
+                    Operand::X(0),
+                    Operand::Integer(2),
+                    Operand::X(1),
+                ],
+            ),
+            Instr::BsStartMatch3 {
+                fail: Label(1),
+                bin: Operand::X(0),
+                live: 2,
+                dst: Operand::X(1),
+            }
+        );
+        // `bs_start_match4` keeps its failure operand raw (an atom `no_fail`).
+        let (no_fail, _) = atoms();
+        assert_eq!(
+            lower(
+                Opcode::bs_start_match4,
+                vec![
+                    Operand::Atom(no_fail),
+                    Operand::Integer(1),
+                    Operand::X(0),
+                    Operand::X(1),
+                ],
+            ),
+            Instr::BsStartMatch4 {
+                fail: Operand::Atom(no_fail),
+                live: 1,
+                src: Operand::X(0),
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_match,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Integer(1), Operand::Integer(2)]),
+                ],
+            ),
+            Instr::BsMatch {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                commands: vec![Operand::Integer(1), Operand::Integer(2)],
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_match_string,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(16),
+                    Operand::Integer(0),
+                ],
+            ),
+            Instr::BsMatchString {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                bits: 16,
+                offset: 0,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_tail,
+                vec![Operand::X(0), Operand::X(1), Operand::Integer(2)],
+            ),
+            Instr::BsGetTail {
+                ctx: Operand::X(0),
+                dst: Operand::X(1),
+                live: 2,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_position,
+                vec![Operand::X(0), Operand::Y(1), Operand::Integer(2)],
+            ),
+            Instr::BsGetPosition {
+                ctx: Operand::X(0),
+                dst: Operand::Y(1),
+                live: 2,
+            }
+        );
+        let pos = vec![Operand::X(0), Operand::Y(1)];
+        assert_eq!(
+            lower(Opcode::bs_set_position, pos),
+            Instr::BsSetPosition {
+                ctx: Operand::X(0),
+                pos: Operand::Y(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_integer2,
+                vec![
+                    Operand::Label(Label(1)),
+                    Operand::X(0),
+                    Operand::Integer(2),
+                    Operand::X(1),
+                    Operand::Integer(8),
+                    Operand::Integer(0),
+                    Operand::X(2),
+                ],
+            ),
+            Instr::BsGetInteger2 {
+                fail: Label(1),
+                ctx: Operand::X(0),
+                live: 2,
+                size: Operand::X(1),
+                unit: 8,
+                flags: 0,
+                dst: Operand::X(2),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_binary2,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Atom(Atom::MAX),
+                    Operand::Integer(8),
+                    Operand::Integer(0),
+                    Operand::X(2),
+                ],
+            ),
+            Instr::BsGetBinary2 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                size: Operand::Atom(Atom::MAX),
+                unit: 8,
+                flags: 0,
+                dst: Operand::X(2),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_float2,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(64),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                    Operand::FloatReg(0),
+                ],
+            ),
+            Instr::BsGetFloat2 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                size: Operand::Integer(64),
+                unit: 1,
+                flags: 0,
+                dst: Operand::FloatReg(0),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_skip_bits2,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(8),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                ],
+            ),
+            Instr::BsSkipBits2 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                size: Operand::Integer(8),
+                unit: 1,
+                flags: 0,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_test_tail2,
+                vec![Operand::Label(Label(2)), Operand::X(0), Operand::Integer(0)],
+            ),
+            Instr::BsTestTail2 {
+                fail: Label(2),
+                ctx: Operand::X(0),
+                bits: 0,
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_utf_and_binary_building_instructions() {
+        assert_eq!(
+            lower(
+                Opcode::bs_get_utf8,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                    Operand::X(1),
+                ],
+            ),
+            Instr::BsGetUtf8 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_utf16,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                    Operand::X(1),
+                ],
+            ),
+            Instr::BsGetUtf16 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_get_utf32,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                    Operand::X(1),
+                ],
+            ),
+            Instr::BsGetUtf32 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+                dst: Operand::X(1),
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_skip_utf8,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                ],
+            ),
+            Instr::BsSkipUtf8 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_skip_utf16,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                ],
+            ),
+            Instr::BsSkipUtf16 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+            }
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_skip_utf32,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(0),
+                ],
+            ),
+            Instr::BsSkipUtf32 {
+                fail: NO_FAIL,
+                ctx: Operand::X(0),
+                live: 1,
+                flags: 0,
+            }
+        );
+        assert_eq!(
+            lower(Opcode::bs_init_writable, vec![]),
+            Instr::BsInitWritable
+        );
+        assert_eq!(
+            lower(
+                Opcode::bs_create_bin,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::Integer(3),
+                    Operand::Integer(1),
+                    Operand::Integer(8),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(Atom::MAX), Operand::Integer(0)]),
+                ],
+            ),
+            Instr::BsCreateBin {
+                fail: NO_FAIL,
+                alloc: 3,
+                live: 1,
+                unit: 8,
+                dst: Operand::X(0),
+                segments: vec![Operand::Atom(Atom::MAX), Operand::Integer(0)],
+            }
+        );
+    }
+
+    #[test]
+    fn lowers_the_module_markers() {
+        assert_eq!(lower(Opcode::nif_start, vec![]), Instr::NifStart);
+        assert_eq!(lower(Opcode::on_load, vec![]), Instr::OnLoad);
+    }
+
+    #[test]
+    fn a_named_variant_with_a_structurally_wrong_operand_is_rejected() {
+        // `put_tuple2` expects an argument list as its second operand.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::put_tuple2,
+                vec![Operand::X(0), Operand::Integer(1)],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+        // `get_tuple_element` expects the element index to be an integer.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::get_tuple_element,
+                vec![Operand::X(0), Operand::X(1), Operand::X(2)],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+        // `jump` expects a label.
+        assert!(matches!(
+            lower_instr(&raw(Opcode::jump, vec![Operand::X(0)])).unwrap_err(),
+            BeamError::BadArg
+        ));
+        // A missing operand is reported, never a panic.
+        assert!(matches!(
+            lower_instr(&raw(Opcode::get_hd, vec![Operand::X(0)])).unwrap_err(),
             BeamError::BadArg
         ));
     }
