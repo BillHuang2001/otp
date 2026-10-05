@@ -62,10 +62,10 @@ Unix flag in → MSVC flag out. Each script is a translator whose contract is "a
 
 ## See Also
 - `../CONTEXT.md` — the WSL launcher/path/INI shims that put this directory on `PATH` and supply `w32_path.sh`
-- `../../CONTEXT.md` — how `erts/etc/` splits into `common/`, `unix/`, `win32/`
-- `../../common/Makefile.in` — the consumer that sets `CC`/`LD`/`RC`/`MC` and `USING_VC` (`@MIXED_VC@`), choosing `-MT` vs `-MD` and `.res` vs `.o` message output
-- `../../../otp_build` — `env_win32`/`env_win64` environment setup and tree selection
-- `../../../make/autoconf/otp.m4` — `LM_FIND_EMU_CC` (`emu_cc.sh` discovery) and `LD=ld.sh`
-- `../../../erts/emulator/Makefile.in` — `EMU_CC`/`V_EMU_CC` consumption for the emulator core
-- `../../../HOWTO/INSTALL-WIN32.md` — the documented WSL build procedure and the rationale for minimal wrappers
-- `../../../.github/workflows/reusable-build-windows.yaml` — CI that exercises this build mode
+- `../../../CONTEXT.md` — `erts/etc/` (its `common/`, `unix/`, `win32/` split)
+- `../../../common/Makefile.in` — the consumer that sets `CC`/`LD`/`RC`/`MC` and `USING_VC` (`@MIXED_VC@`), choosing `-MT` vs `-MD` and `.res` vs `.o` message output
+- `../../../../../otp_build` — `env_win32`/`env_win64` environment setup and tree selection
+- `../../../../../make/autoconf/otp.m4` — `LM_FIND_EMU_CC` (`emu_cc.sh` discovery) and `LD=ld.sh`
+- `../../../../emulator/Makefile.in` — `EMU_CC`/`V_EMU_CC` consumption for the emulator core
+- `../../../../../HOWTO/INSTALL-WIN32.md` — the documented WSL build procedure and the rationale for minimal wrappers
+- `../../../../../.github/workflows/reusable-build-windows.yaml` — CI that exercises this build mode
