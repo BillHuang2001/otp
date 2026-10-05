@@ -9,8 +9,8 @@ Megaco internal Erlang record form and the ASN.1 codec form.
 All ASN.1 code generation for the app happens *in this directory* at build time.
 
 ## API Surface
-Codec entry points (all `-moduledoc false`; selected by the user via `{encoding_mod, Mod}` / `encoding_config`;
-they are not documented public API — the public surface is `megaco:encode_message/...` etc.):
+Codec entry points (all `-moduledoc false`; users reference them by name in `{encoding_mod, Mod}` /
+`encoding_config`, but they are internal modules — the documented API is `megaco:encode_message/...` etc.):
 
 - `megaco_binary_encoder` — the recommended BER codec (historically "ber_bin").
   Implements the `megaco_encoder` behaviour and is the only binary codec with true dynamic version detection
