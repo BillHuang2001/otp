@@ -1,7 +1,7 @@
 # `beam_engine` — Typed-IR Execution Engine (interpreter + JIT tiers)
 
 ## Intent
-Executes the **frozen typed IR** produced by `beam_loader`: a **direct-threaded interpreter** that runs a widened instruction set end to end (this crate's Stage-1 deliverable), plus the **optional JIT tiers** (`jit_beamasm`, `jit_cranelift`) that are *measurement-gated* and kept **off the critical path** (not implemented in M1).
+Executes the **frozen typed IR** produced by `beam_loader`: a **direct-threaded interpreter** that runs a widened instruction set end to end (this crate's Stage-1 deliverable), behind a real **execution-tier seam** (`src/jit/`, [`Tier`] / `JitBackend` / `available_tiers` / `Machine::run_with_tier`) the native JIT tiers plug into. The tiers themselves (`baseline-jit`, `jit-cranelift`) are **measurement-gated** and kept **off the critical path**: no native backend is built yet.
 Implements the Stage-1 engine half of Part II §H with the IR contract of §E and the interpreter/JIT trade-offs of §F (`../../CONTEXT.md` §4).
 This crate is on the **critical path of the vertical slice**: it loads a real `.beam` (via `beam_loader`) and runs it end to end.
 The dispatch loop (`src/interpreter.rs`) has explicit arms for the core opcodes and routes every other instruction to a per-instruction-family seam (`src/families/`), so a whole opcode family is implemented inside its own module without touching the loop.
