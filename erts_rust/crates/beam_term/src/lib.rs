@@ -16,6 +16,7 @@
 //! Downstream code can `use beam_term::prelude::*;`.
 
 pub mod atom;
+pub mod bitstring;
 pub mod boxed;
 pub mod compare;
 pub mod error;
@@ -27,6 +28,7 @@ pub mod list;
 pub mod literal;
 pub mod map;
 pub mod ops;
+pub mod refc;
 pub mod size;
 pub mod tag;
 pub mod thing;
@@ -34,6 +36,7 @@ pub mod tuple;
 
 /// Flat re-exports of every public item in this crate.
 pub use crate::atom::*;
+pub use crate::bitstring::*;
 pub use crate::boxed::*;
 pub use crate::compare::*;
 pub use crate::error::*;
@@ -45,6 +48,7 @@ pub use crate::list::*;
 pub use crate::literal::*;
 pub use crate::map::*;
 pub use crate::ops::*;
+pub use crate::refc::*;
 pub use crate::size::*;
 pub use crate::tag::*;
 pub use crate::thing::*;
@@ -53,6 +57,7 @@ pub use crate::tuple::*;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::atom::*;
+    pub use crate::bitstring::*;
     pub use crate::boxed::*;
     pub use crate::compare::*;
     pub use crate::error::*;
@@ -64,6 +69,7 @@ pub mod prelude {
     pub use crate::literal::*;
     pub use crate::map::*;
     pub use crate::ops::*;
+    pub use crate::refc::*;
     pub use crate::size::*;
     pub use crate::tag::*;
     pub use crate::thing::*;

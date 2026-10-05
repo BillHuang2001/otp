@@ -30,8 +30,8 @@
 //!   It is only ever used as an *internal* hash, never compared against the C.
 
 use crate::atom::AtomTable;
+use crate::bitstring::{bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, thing_arityval};
-use crate::compare::{bitstring_parts, float_bits};
 use crate::eterm::Eterm;
 use crate::immediate::{atom_val, internal_pid_data, internal_port_data, signed_value};
 use crate::list::{car, cdr, is_list};

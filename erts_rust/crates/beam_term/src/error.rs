@@ -32,6 +32,11 @@ pub enum TermError {
     /// map node held a slot that is neither a leaf, a sub-node nor a collision
     /// tuple (see [`crate::map`]).
     BadMap,
+    /// A bitstring construction argument was inconsistent: the supplied byte count
+    /// was smaller than `ceil(n_bits / 8)` for the requested bit count, or a byte
+    /// count's bit count (`bytes.len() * 8`) overflowed `usize` (see
+    /// [`crate::bitstring`]).
+    BadBitstring,
 }
 
 impl fmt::Display for TermError {
@@ -43,6 +48,7 @@ impl fmt::Display for TermError {
             TermError::InvalidAtomName => "invalid atom name",
             TermError::AtomIndexOutOfRange => "atom index out of range",
             TermError::BadMap => "not a map",
+            TermError::BadBitstring => "invalid bitstring byte count",
         };
         f.write_str(msg)
     }
@@ -63,6 +69,8 @@ impl core::error::Error for TermError {}
 /// | `HeapExhausted` | `Alloc(..)` | `out_of_memory` |
 /// | `InvalidAtomName` | `BadArg` | `badarg` |
 /// | `AtomIndexOutOfRange` | `SystemLimit` | `system_limit` |
+/// | `BadMap` | `BadArg` | `badarg` |
+/// | `BadBitstring` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
         match error {
@@ -79,6 +87,8 @@ impl From<TermError> for BeamError {
             TermError::AtomIndexOutOfRange => BeamError::SystemLimit,
             // A malformed map reached a map accessor: an argument failure.
             TermError::BadMap => BeamError::BadArg,
+            // A bitstring built from an inconsistent byte count: an argument failure.
+            TermError::BadBitstring => BeamError::BadArg,
         }
     }
 }
@@ -98,6 +108,10 @@ mod tests {
         assert_eq!(TermError::InvalidAtomName.to_string(), "invalid atom name");
         assert_eq!(TermError::AtomIndexOutOfRange.to_string(), "atom index out of range");
         assert_eq!(TermError::BadMap.to_string(), "not a map");
+        assert_eq!(
+            TermError::BadBitstring.to_string(),
+            "invalid bitstring byte count"
+        );
     }
 
     #[test]
@@ -139,6 +153,10 @@ mod tests {
             BeamError::SystemLimit
         ));
         assert!(matches!(BeamError::from(TermError::BadMap), BeamError::BadArg));
+        assert!(matches!(
+            BeamError::from(TermError::BadBitstring),
+            BeamError::BadArg
+        ));
     }
 
     #[test]

@@ -91,32 +91,27 @@ pub unsafe fn write_float(hp: *mut Eterm, value: f64) -> Eterm {
 
 /// Reads the `f64` value of a float term.
 ///
-/// The exact inverse of [`write_float`]; delegates to the single float-layout
-/// definition in [`crate::compare`].
+/// The exact inverse of [`write_float`]. The float payload layout is owned by
+/// [`crate::bitstring`] (the crate's single public definition — see
+/// [`crate::bitstring::float_value`]); this is a re-export under `beam_term::thing`
+/// so the float accessor surface here stays unchanged.
 ///
 /// # Safety
 ///
 /// `t` must be a live boxed float (`is_float(t)`), i.e. the `[HEADER_FLONUM, bits]`
 /// block written by [`write_float`], kept alive by the caller.
-pub unsafe fn float_value(t: Eterm) -> f64 {
-    // SAFETY: the caller guarantees `t` is a live boxed float, which is exactly the
-    // invariant `compare::float_value` documents.
-    unsafe { crate::compare::float_value(t) }
-}
+pub use crate::bitstring::float_value;
 
 /// Reads the raw `f64` bit pattern of a float term.
 ///
 /// The `f64` bits are the word following the float header (`erl_term.h:479`,
-/// `erl_term.h:506`); delegates to [`crate::compare`].
+/// `erl_term.h:506`); see [`crate::bitstring::float_bits`] (the crate's single
+/// public definition), re-exported here.
 ///
 /// # Safety
 ///
 /// As [`float_value`]: `t` must be a live boxed float.
-pub unsafe fn float_bits(t: Eterm) -> u64 {
-    // SAFETY: the caller guarantees `t` is a live boxed float, which is exactly the
-    // invariant `compare::float_bits` documents.
-    unsafe { crate::compare::float_bits(t) }
-}
+pub use crate::bitstring::float_bits;
 
 // ---------------------------------------------------------------------------
 // Bignum

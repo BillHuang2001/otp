@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -134,9 +134,8 @@ operators) and `<`/`>` between same-typed terms.
 - `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
   arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
   only for floats and mixed integer/float pairs).
-- `pub(crate) float_bits`/`float_value`/`bitstring_parts`/`bit_at` — helpers shared with
-  `hashing.rs` (not re-exported).
-
+- The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
+  module forwards to them so each layout has a single definition.
 ### `hashing.rs` — structural term hashing
 - `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash
   reproducing the *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
@@ -159,7 +158,8 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
 ("`t` is a live thing of this kind") and return borrowed slices.
 - Float: `pub const FLOAT_SIZE_WORDS: usize = 2`; `unsafe write_float(hp, value: f64) -> Eterm`
   (`[HEADER_FLONUM, bits]`, root `make_boxed(hp)`); `unsafe float_value(t) -> f64`;
-  `unsafe float_bits(t) -> u64` (delegate to the existing `pub(crate)` helpers in `compare.rs`).
+  `unsafe float_bits(t) -> u64` (re-exports of the single public definitions in
+  [`bitstring.rs`](#bitstringrs--bit-level-payloads)).
 - Bignum: `pub const fn big_size_words(n_digits) -> usize` (`n_digits + 1`, `BIG_NEED_SIZE`);
   `unsafe write_big(hp, negative: bool, digits: &[u64]) -> Eterm` (header arity `n - 1`, one
   `ErtsDigit` = `u64` per word, least-significant-first, sign in `_BIG_SIGN_BIT`; `digits` must be
@@ -178,6 +178,45 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   `unsafe write_external_ref(hp, node, ids: &[u32], creation: u32)` and their `unsafe *_parts`
   inverses (`external_pid_parts`/`external_port_parts`/`external_ref_parts`).
 
+### `bitstring.rs` — bit-level payloads
+The `ErlHeapBits` / `ErlSubBits` block writers and readers plus the crate's public bit/float payload
+helpers (ground truth `../../erts/emulator/beam/erl_bits.h:60-176`, `erl_bits.c:490-519`). Bits are
+**MSB-first inside each byte** (so `<<1:3>>` is the byte `0b0010_0000`); the unused trailing bits of
+the last byte are zeroed, matching `beam_codec`'s oracle-verified encoder.
+- `pub const fn bit_count_to_bytes(n_bits) -> usize` (`NBYTES`, `ceil(n_bits/8)`, overflow-free);
+  `pub const fn heap_bits_size_words(n_bits) -> usize` (`2 + ceil(ceil(n_bits/8)/8)`,
+  `heap_bits_size`); `pub const ERL_SUB_BITS_FLAG_MASK = 0x3`,
+  `ERL_SUB_BITS_FLAG_MUTABLE`/`ERL_SUB_BITS_FLAG_VOLATILE`,
+  `BITSTRING_POINTER_FLAG_MASK` (alias of the flag mask).
+- `unsafe write_heap_bits(hp, bytes: &[u8], n_bits) -> TermResult<Eterm>` — the `ErlHeapBits`
+  writer (`[make_header(words-1, HEAP_BITS_SUBTAG), n_bits, data…]`, root `make_boxed(hp)`); a
+  `bytes` shorter than `ceil(n_bits/8)` yields `TermError::BadBitstring`.
+- `unsafe write_binary(hp, bytes: &[u8]) -> TermResult<Eterm>` — a bitstring of `bytes.len()*8` bits.
+- `unsafe write_sub_bits(hp, base_flags, start, end, orig) -> Eterm` and
+  `unsafe sub_bits_parts(t) -> (Eterm, Eterm, Eterm, Eterm)` — the 5-word `ErlSubBits` block.
+- `unsafe bitstring_parts(t) -> (*const u8, usize, usize)` (data base, **bit** offset, **bit** size);
+  `unsafe bit_at(t, i) -> bool`.
+- `unsafe float_bits(t) -> u64` / `unsafe float_value(t) -> f64` — the crate's single public float
+  payload readers (`compare`/`hashing`/`thing` forward/re-export them).
+
+### `refc.rs` — off-heap (`refc`) binaries
+The on-heap `BinRef` + `ErlSubBits` **pair** for a binary/bitstring larger than the on-heap limits
+(ground truth `../../erts/emulator/beam/erl_bits.h:135-176`, `erl_bits.c:2672-2712`). The 8-word
+arrangement is `[BinRef(3)][ErlSubBits(5)]` with the tagged root at `hp + 3` (the `ErlSubBits`).
+`beam_term` cannot allocate the off-heap payload, so every writer is heap-agnostic over a caller
+`hp`/`val`.
+- `pub const fn bin_ref_size_words() -> usize` (3), `pub const fn sub_bits_size_words() -> usize` (5),
+  `pub const ERL_REFC_BITS_SIZE = 8`, `pub const ERL_ONHEAP_BINARY_LIMIT = 64`,
+  `pub const ERL_ONHEAP_BITS_LIMIT = 512`.
+- `unsafe write_bin_ref(hp, val, next) -> Eterm`; `unsafe bin_ref_parts(t) -> (*mut Eterm, *mut Eterm)`.
+- `unsafe write_refc_binary(hp, val, next, base, offset_bits, size_bits) -> Eterm` — the full pair.
+- `unsafe is_refc_binary(t) -> bool`, `unsafe refc_offset(t) -> usize` (**bits**),
+  `unsafe refc_size(t) -> usize` (**bits**, `end - start`),
+  `unsafe refc_bytes<'a>(t) -> &'a [u8]` (`ceil((offset+size)/8) - offset/8` bytes of the payload).
+- **Frozen inter-crate contract (`beam_alloc`/`beam_gc`):** `BinRef.val` holds a raw pointer to the
+  payload's **first data byte** (the off-heap object header is `beam_alloc`'s concern);
+  `ErlSubBits.orig` is a term (a boxed `BinRef`, or an on-heap bitstring for a match context); the 8
+  words are moved/copied together with `orig` fixed up to the new `BinRef` address.
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
@@ -185,8 +224,9 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   else. `beam_common` is used for exactly one thing: the `From<TermError> for beam_common::BeamError`
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
-- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple` (raw pointer
-  deref). Every `unsafe fn` documents a `# Safety` section; every `unsafe` block carries a
+- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `map`,
+  `compare`, `hashing`, `bitstring`, `refc` (raw pointer deref). Every `unsafe fn` documents a
+  `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
 - **Pure tag math is `const fn`** where the body allows (`raw`, `from_raw`, `primary_tag`, tag tests,
   `make_small`, `signed_value`, `make_atom`, `atom_val`, `make_arityval`, `arityval`, …) — these are
@@ -226,8 +266,15 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   the reverse would cycle), which is exactly why every writer takes a caller-allocated
   `hp: *mut Eterm` and returns the tagged root instead of allocating. The codec keeps only its
   error-wrapping + allocation and forwards the word layout here (removing the duplication);
-  `float_bits`/`float_value` delegate to the existing `pub(crate)` helpers in `compare.rs` so the
-  float-layout knowledge has a single definition.
+  `float_bits`/`float_value` are re-exports of the single public float readers in
+  [`bitstring.rs`](#bitstringrs--bit-level-payloads) so the float-layout knowledge has a single
+  definition.
+- **The bit/float payload readers live in `bitstring.rs`.** `bitstring_parts`, `bit_at`,
+  `float_bits` and `float_value` are defined once, publicly, in `bitstring.rs`; `compare.rs` and
+  `hashing.rs` forward to them (via `use`) and `thing.rs` re-exports `float_bits`/`float_value`.
+  Keeping one definition avoids the `ambiguous_glob_reexports` hazard of two modules exporting the
+  same name, and removes the previous `pub(crate)`-only duplication between `compare.rs` and the
+  deleted `beam_codec` bitstring shim.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` unit tests.
@@ -250,6 +297,14 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
   the 3-word empty block; the external pid/port/ref head + data words), plus write→read round-trips
   and boundaries (min/max `MAX_REF_IDS`, single-digit bignum, empty flatmap, negative bignum).
+- `src/bitstring.rs` carries its own suite: `bit_count_to_bytes`/`heap_bits_size_words` boundary
+  values (0/1/8/9/64/65/512/513 …), the `ErlHeapBits` header/word pin, non-byte-aligned sizes
+  `1..=64` round-tripped bit-by-bit (MSB-first, trailing bits zeroed), the too-short byte count
+  (`TermError::BadBitstring`), the `ErlSubBits` word pin + flag masking, and the float readers.
+- `src/refc.rs` carries its own suite: the size/limit constants + `HEADER_BIN_REF`/`HEADER_SUB_BITS`
+  raw words (`0xA8`/`0x124`), the `BinRef` word pin, the pinned 8-word combined pair
+  (`[BinRef][ErlSubBits]`, root at `hp + 3`), windowed `refc_offset`/`refc_size`/`refc_bytes`, and
+  `is_refc_binary` rejecting on-heap bitstrings, non-bin-ref sub-bitstrings, immediates and tuples.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
   compatibility gate), not to this crate's unit tests.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
@@ -270,6 +325,8 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
 - `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
+- `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
+- `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`)
