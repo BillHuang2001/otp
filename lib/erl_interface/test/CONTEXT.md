@@ -15,8 +15,8 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 | `ei_decode_SUITE` | `ei_decode_*` for every external term type, incl. long/ulong/longlong/ulonglong, non-optimal encodings, UTF-8 atoms, iodata, huge foreign pids/ports/refs, `ei_cmp_nc` |
 | `ei_encode_SUITE` | `ei_encode_*` for every external term type incl. failure paths (`test_ei_encode_fails`) and UTF-8 atoms + explicit length |
 | `ei_decode_encode_SUITE` | Erlang→C→Erlang round trips of funs, pids, ports, refs, big integers, large pid/port/ref containers on foreign node names; the only suite in the smoke spec |
-| `ei_format_SUITE` | `erl_format()` string→term construction (atoms, tuples, lists, maps, without version prefix) |
-| `ei_print_SUITE` | `ei_print()`/`ei_s_print_term` term→string printing (atoms, tuples, lists, strings, maps, funs, binaries, bitstrings, integers) |
+| `ei_format_SUITE` | `ei_x_format()` string→term construction (atoms, tuples, lists, maps, without version prefix) |
+| `ei_print_SUITE` | `ei_print_term()`/`ei_s_print_term` term→string printing (atoms, tuples, lists, strings, maps, funs, binaries, bitstrings, integers) |
 | `ei_tmo_SUITE` | Socket timeouts on accept/connect/recv/send, driven by manual partial distribution handshakes from Erlang; `ei_dflags` checks distribution flag negotiation |
 | `ei_global_SUITE` | `ei_global_register`/`ei_global_unregister`/`ei_global_whereis`/`ei_global_names` against the local node |
 | `erl_call_SUITE` | The `erl_call` binary: node start/lookup, `-address` (port/host:port), `-fetch_stdout`, `-no_result_term`, multi-io-request group leaders, unresolvable hostname, `-timeout` |
