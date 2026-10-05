@@ -246,7 +246,7 @@ The plan explicitly says: *use low-latency design over heavy JIT*. The history b
 - *Copy-on-send is fundamental.* A local send of a non-immediate term deep-copies the whole graph into
   the receiver's heap/queue (`erts_send_message` `erl_message.c:698` → `copy_struct_x` `copy.c:647`,
   reductions ∝ size). Per-process heaps + a moving GC forbid cross-heap pointers; immutability gives a
-  barrier-free generation invariant; the copy buys O(1) process death and remote ETF encoding for free.
+  barrier-free generation invariant; and process death is O(1).
 - *Shared cheaply* (small heap handle + pointer-free, immutable, refcounted-or-permanent payload):
   immediates, **refc binaries > 64 B** (`copy.c:812-848`), module **literals**, **`persistent_term`**,
   external pid/port/ref. *Copied:* funs incl. environment, lists, maps, tuples, bignums, floats,
@@ -319,7 +319,7 @@ Goal: identical `.beam` input, identical external behaviour, drop-in for `beam.s
 ### E.1 Rust core — feasibility and payoff
 - **Feasible but dominated by compatibility, not by language.** ~440 kLOC of emulator logic (plus
   ~630 kLOC of `erts`) must be reproduced with byte-exact ABI and wire behaviour (§A). This is
-  *mostly* mechanical-but-large; the genuinely novel work is in §E.2–E.4.
+  *mostly* mechanical-but-large; the genuinely novel work is in §E.2–E.5.
 - **Robustness payoff is real but concentrated.** The interpreter/JIT core is unavoidably `unsafe`.
   Rust's safety benefits land in the *periphery*: the distribution/ETF codec, term decoding, driver
   and NIF loading/validation, regex, allocators, and syscall layers — which is where most ERTS

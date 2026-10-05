@@ -11,8 +11,8 @@ a Rust VM use; (4) how far can the **compiler**, the **JIT** and the **interpret
 ETS can be made cheaper — and, given the user's stance that *development cost is acceptable as long as the path is
 straightforward and achievable*, turns the picture into a **staged plan with explicit seams and break-points**.*
 
-*Method: seven parallel read-only investigations grounded in this tree (ERTS `30.0-rc0` / `erts-17.1`) — the
-execution engine, term/GC internals, the compiler, the interpreter, the JIT, and the stdlib — cross-checked against
+*Method: parallel read-only investigations grounded in this tree (ERTS `30.0-rc0` / `erts-17.1`) — the
+execution engine, term/GC internals, messaging/ETS, the compiler, the interpreter, the JIT, and the stdlib — cross-checked against
 current public sources. In-tree claims cite `file:line`; external claims are referenced in the appendix.*
 
 ---
