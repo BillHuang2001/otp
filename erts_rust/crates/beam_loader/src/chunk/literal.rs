@@ -4,10 +4,14 @@
 //! non-zero ⇒ zlib/deflate), then `i32 count` × `{ i32 ext_size, ext_size bytes }`
 //! where each payload is Erlang external-term bytes (an ETF-encoded literal).
 //!
-//! **M1 scope:** the framing is parsed and the raw ETF bytes are retained; the
-//! literals are **not** decoded into terms, and the **compressed** form
-//! (`uncompressed_size != 0`) is unsupported (there is no zlib dependency) and
-//! yields a clear `BeamError::BadArg` (see the crate `CONTEXT.md`, "Known Issues").
+//! This module owns the *framing*: it returns the raw ETF payloads in
+//! `Operand::Literal(idx)` index order. [`crate::literal::LiteralArea`] decodes them
+//! into real terms at load time (reachable through
+//! [`Module::literal`](crate::ir::Module::literal)).
+//!
+//! The **compressed** form (`uncompressed_size != 0`) is unsupported (there is no
+//! zlib dependency) and yields a clear `BeamError::BadArg` (see the crate
+//! `CONTEXT.md`, "Known Issues").
 use beam_common::Result;
 
 use crate::error::bad_file;

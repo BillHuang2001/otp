@@ -8,13 +8,24 @@
 //!
 //! Everything here is data. The loader ([`crate::load`], [`crate::lower`],
 //! [`crate::decode`]) *produces* it; the engine and the JIT tiers *consume* it.
-//! `Instr` is a named enum for the Milestone-1 opcode subset plus a lossless
-//! [`Instr::Generic`] fallback, so an instruction the M1 interpreter does not yet
-//! execute still round-trips with its opcode and operands intact.
+//!
+//! The instruction vocabulary itself — [`Instr`] and [`TestKind`] — lives in
+//! [`crate::instr`] and is re-exported here, so `crate::ir::Instr` is this module's
+//! canonical path for the engine while the enum itself stays in one flat module.
 use std::collections::BTreeMap;
+use std::sync::Arc;
 
-use crate::opcode::Opcode;
-use crate::operand::{Label, Operand};
+use crate::literal::LiteralArea;
+use crate::operand::Label;
+
+pub use crate::instr::*;
+
+/// One machine word of the frozen term representation
+/// ([`beam_term::Eterm`](beam_term::prelude::Eterm)).
+///
+/// Re-exported here because it is the type of a resolved static literal
+/// ([`Module::literal`]).
+pub use beam_term::Eterm;
 
 /// A module-local atom: an index into the crate-owned [`beam_term::AtomTable`].
 ///
@@ -186,251 +197,35 @@ impl Default for LineTable {
     }
 }
 
-/// The `is_*` family of test instructions.
+/// One `FunT` chunk entry: the descriptor of a lambda (`fun … end` / a local fun).
 ///
-/// The opcode → kind mapping is the loader's job (the opcode roster carries the
-/// op name; the kind is the semantic classification the engine matches on).
+/// The descriptor is what `make_fun3` (and, with a statically known target,
+/// `call_fun2`) refers to: the instruction carries the **fun-table index**, which
+/// resolves through [`Module::fun`] — the index of the entry in
+/// [`Module::funs`], i.e. its position in the file's `FunT` chunk
+/// (`beam_asm.erl`'s `beam_dict:lambda/3` hands out exactly that number).
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum TestKind {
-    /// `is_lt/3`.
-    IsLt,
-    /// `is_ge/3`.
-    IsGe,
-    /// `is_eq/3`.
-    IsEq,
-    /// `is_ne/3`.
-    IsNe,
-    /// `is_eq_exact/3`.
-    IsEqExact,
-    /// `is_ne_exact/3`.
-    IsNeExact,
-    /// `is_integer/2`.
-    IsInteger,
-    /// `is_float/2`.
-    IsFloat,
-    /// `is_number/2`.
-    IsNumber,
-    /// `is_atom/2`.
-    IsAtom,
-    /// `is_pid/2`.
-    IsPid,
-    /// `is_reference/2`.
-    IsReference,
-    /// `is_port/2`.
-    IsPort,
-    /// `is_nil/2`.
-    IsNil,
-    /// `is_binary/2`.
-    IsBinary,
-    /// `is_bitstr/2`.
-    IsBitstr,
-    /// `is_list/2`.
-    IsList,
-    /// `is_nonempty_list/2`.
-    IsNonemptyList,
-    /// `is_tuple/2`.
-    IsTuple,
-    /// `is_map/2`.
-    IsMap,
-    /// `test_arity/3`.
-    TestArity,
-}
-
-impl TestKind {
-    /// Classifies a test opcode into its [`TestKind`], or `None` if the opcode is
-    /// not one of the `is_*`/`test_arity` family.
-    pub fn from_opcode(op: Opcode) -> Option<TestKind> {
-        Some(match op {
-            Opcode::is_lt => TestKind::IsLt,
-            Opcode::is_ge => TestKind::IsGe,
-            Opcode::is_eq => TestKind::IsEq,
-            Opcode::is_ne => TestKind::IsNe,
-            Opcode::is_eq_exact => TestKind::IsEqExact,
-            Opcode::is_ne_exact => TestKind::IsNeExact,
-            Opcode::is_integer => TestKind::IsInteger,
-            Opcode::is_float => TestKind::IsFloat,
-            Opcode::is_number => TestKind::IsNumber,
-            Opcode::is_atom => TestKind::IsAtom,
-            Opcode::is_pid => TestKind::IsPid,
-            Opcode::is_reference => TestKind::IsReference,
-            Opcode::is_port => TestKind::IsPort,
-            Opcode::is_nil => TestKind::IsNil,
-            Opcode::is_binary => TestKind::IsBinary,
-            Opcode::is_bitstr => TestKind::IsBitstr,
-            Opcode::is_list => TestKind::IsList,
-            Opcode::is_nonempty_list => TestKind::IsNonemptyList,
-            Opcode::is_tuple => TestKind::IsTuple,
-            Opcode::is_map => TestKind::IsMap,
-            Opcode::test_arity => TestKind::TestArity,
-            // Every other opcode (including the `is_*`-named but non-test
-            // `is_constant`/`is_boolean`/`is_function*`/`is_*_record` family) is not
-            // a test instruction the engine matches on.
-            _ => return None,
-        })
-    }
-}
-
-/// A lowered BEAM instruction.
-///
-/// Named variants cover the Milestone-1 interpreter subset; every other opcode is
-/// preserved losslessly as [`Instr::Generic`], which the engine/JIT can extend
-/// without a format change.
-#[derive(Clone, PartialEq, Debug)]
-pub enum Instr {
-    /// `label Lbl` — marks the start of a basic block.
-    Label(Label),
-    /// A source-location marker (from the `Line` chunk).
-    Line(LineRef),
-    /// `func_info M F A` — defines the enclosing function.
-    FuncInfo {
-        /// The function's module.
-        module: Atom,
-        /// The function's name.
-        function: Atom,
-        /// The function's arity.
-        arity: u32,
-    },
-    /// `int_code_end` — terminates the instruction stream for a module.
-    IntCodeEnd,
-    /// `move Src Dst`.
-    Move {
-        /// The source operand.
-        src: Operand,
-        /// The destination operand.
-        dst: Operand,
-    },
-    /// `gc_bif*` — a garbage-collecting BIF call.
-    GcBif {
-        /// The number of arguments (the BIF's arity).
-        arity: u8,
-        /// The imported `{module,function,arity}` to call.
-        bif: ImportRef,
-        /// The failure label ([`NO_FAIL`] means "raise on failure").
-        fail: Label,
-        /// The number of live X registers at the call.
-        live: u32,
-        /// The argument operands.
-        args: Vec<Operand>,
-        /// The destination operand.
-        dst: Operand,
-    },
-    /// An `is_*`/`test_arity` test instruction.
-    Test {
-        /// The classified test.
-        kind: TestKind,
-        /// The failure label ([`NO_FAIL`] means "raise on failure").
-        fail: Label,
-        /// The tested operand(s).
-        args: Vec<Operand>,
-    },
-    /// `select_val Value Fail {Value,Label}*` — a switch on an exact value.
-    SelectVal {
-        /// The scrutinee operand.
-        value: Operand,
-        /// The failure label ([`NO_FAIL`] means "raise on failure").
-        fail: Label,
-        /// The `(value, label)` alternatives.
-        pairs: Vec<(Operand, Label)>,
-    },
-    /// `swap A B` — exchange two registers.
-    Swap {
-        /// One register.
-        a: Operand,
-        /// The other register.
-        b: Operand,
-    },
-    /// `call Arity Label` — a local call preserving the frame.
-    Call {
-        /// The callee arity.
-        arity: u32,
-        /// The local target label.
-        target: Label,
-    },
-    /// `call_last Arity Label Deallocate` — a local tail call.
-    CallLast {
-        /// The callee arity.
-        arity: u32,
-        /// The local target label.
-        target: Label,
-        /// The number of stack slots to deallocate first.
-        deallocate: u32,
-    },
-    /// `call_only Arity Label` — a local tail call that deallocates the frame.
-    CallOnly {
-        /// The callee arity.
-        arity: u32,
-        /// The local target label.
-        target: Label,
-    },
-    /// `call_ext Arity Bif` — an external call preserving the frame.
-    CallExt {
-        /// The callee arity.
-        arity: u32,
-        /// The imported call target.
-        target: ImportRef,
-    },
-    /// `call_ext_only Arity Bif` — an external tail call.
-    CallExtOnly {
-        /// The callee arity.
-        arity: u32,
-        /// The imported call target.
-        target: ImportRef,
-    },
-    /// `call_ext_last Arity Bif Deallocate` — an external tail call.
-    CallExtLast {
-        /// The callee arity.
-        arity: u32,
-        /// The imported call target.
-        target: ImportRef,
-        /// The number of stack slots to deallocate first.
-        deallocate: u32,
-    },
-    /// `allocate StackNeed Live` — allocate a stack frame.
-    Allocate {
-        /// The number of Y registers (stack slots) needed.
-        stack_need: u32,
-        /// The number of live X registers.
-        live: u32,
-    },
-    /// `allocate_heap StackNeed HeapNeed Live` — allocate frame + heap.
-    AllocateHeap {
-        /// The number of Y registers (stack slots) needed.
-        stack_need: u32,
-        /// The number of heap words needed.
-        heap_need: u32,
-        /// The number of live X registers.
-        live: u32,
-    },
-    /// `test_heap HeapNeed Live` — ensure heap headroom.
-    TestHeap {
-        /// The number of heap words needed.
-        heap_need: u32,
-        /// The number of live X registers.
-        live: u32,
-    },
-    /// `deallocate N` — pop `N` stack slots.
-    Deallocate(u32),
-    /// `trim N Remaining` — trim the stack to `Remaining` after popping `N`.
-    Trim {
-        /// The number of stack slots to pop.
-        n: u32,
-        /// The number of stack slots to keep.
-        remaining: u32,
-    },
-    /// `return` — return from the current function.
-    Return,
-    /// Any opcode outside the Milestone-1 named subset, preserved losslessly.
-    Generic {
-        /// The opcode.
-        op: Opcode,
-        /// The decoded operands.
-        operands: Vec<Operand>,
-        /// The byte offset of the opcode in the `Code` stream.
-        offset: u32,
-    },
+pub struct FunDescriptor {
+    /// The name of the lambda's anonymous function.
+    pub function: Atom,
+    /// The lambda's arity (the number of *non-captured* arguments).
+    pub arity: u32,
+    /// The code label of the lambda body.
+    pub label: Label,
+    /// The index within the enclosing function's fun list.
+    pub index: u32,
+    /// The number of free variables the lambda captures.
+    pub num_free: u32,
+    /// The unique identifier of the lambda (the file's `old_uniq` field).
+    pub uniq: u32,
 }
 
 /// A fully loaded and lowered module — the loader's output and the engine's input.
+///
+/// A `Module` is `Clone` (cheap: the literal area is shared behind an [`Arc`]) and
+/// `Debug`, but it is **neither `Send` nor `Sync`**: [`LiteralArea`] owns a
+/// [`beam_alloc::Heap`] holding raw term pointers, so a loaded module is confined
+/// to the thread that loaded it (see [`crate::literal`]).
 #[derive(Clone, Debug)]
 pub struct Module {
     /// The module name (the atom at `AtU8` wire index 1).
@@ -445,14 +240,16 @@ pub struct Module {
     pub imports: Vec<Import>,
     /// The module's functions.
     pub functions: Vec<Function>,
+    /// The `FunT` lambda descriptors; `make_fun3`'s index addresses this vector.
+    pub funs: Vec<FunDescriptor>,
     /// The `Code` chunk header.
     pub code_version: CodeVersion,
     /// The decoded `Type` chunk (or its fallback).
     pub types: TypeTable,
     /// The decoded `Line` chunk.
     pub line: LineTable,
-    /// The `LitT` literal payloads (raw external-term bytes, not decoded).
-    pub literals: Vec<Vec<u8>>,
+    /// The `LitT` literals, decoded into terms once at load time.
+    pub literals: Arc<LiteralArea>,
     /// The `StrT` string table bytes.
     pub strings: Vec<u8>,
     /// The raw `Attr` chunk bytes, if present.
@@ -471,10 +268,11 @@ impl Default for Module {
             exports: Vec::new(),
             imports: Vec::new(),
             functions: Vec::new(),
+            funs: Vec::new(),
             code_version: CodeVersion::default(),
             types: TypeTable::default(),
             line: LineTable::default(),
-            literals: Vec::new(),
+            literals: Arc::new(LiteralArea::default()),
             strings: Vec::new(),
             attributes: None,
             compile_info: None,
@@ -501,5 +299,30 @@ impl Module {
         self.functions
             .iter()
             .find(|f| f.name == function && f.arity == arity)
+    }
+
+    /// The static literal at `index` (an `Operand::Literal(index)` reference).
+    ///
+    /// This is how the interpreter resolves the `z,4` literal operand of e.g.
+    /// `move`/`put_literal`. Returns `None` for an index outside the `LitT` table.
+    pub fn literal(&self, index: u32) -> Option<Eterm> {
+        self.literals.get(index)
+    }
+
+    /// The module's decoded static-literal area.
+    pub fn literals(&self) -> &LiteralArea {
+        &self.literals
+    }
+
+    /// The lambda descriptor at `index` (a `make_fun3`/`call_fun2` fun-table index).
+    ///
+    /// Returns `None` for an index outside the `FunT` table.
+    pub fn fun(&self, index: u32) -> Option<&FunDescriptor> {
+        self.funs.get(index as usize)
+    }
+
+    /// The module's lambda descriptors, in `FunT` (fun-table index) order.
+    pub fn funs(&self) -> &[FunDescriptor] {
+        &self.funs
     }
 }

@@ -14,7 +14,9 @@ use crate::ir::{Atom, Module};
 /// Loads a `.beam` image from memory into the IR [`Module`].
 ///
 /// Parses the `FOR1` container, decodes every known chunk, decodes the `Code`
-/// instruction stream and lowers the result into the typed block-structured IR.
+/// instruction stream, lowers the result into the typed block-structured IR and
+/// materializes the `LitT` static literals into terms ([`crate::literal`]); the
+/// `FunT` lambda descriptors are lowered onto [`Module::funs`].
 ///
 /// A malformed or truncated image yields `BeamError::BadArg`; an over-large
 /// size/arity/count bound yields `BeamError::SystemLimit`. Never panics.

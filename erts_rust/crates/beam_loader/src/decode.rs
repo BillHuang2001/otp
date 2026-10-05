@@ -870,6 +870,10 @@ mod tests {
             (Opcode::is_nonempty_list, TestKind::IsNonemptyList),
             (Opcode::is_tuple, TestKind::IsTuple),
             (Opcode::is_map, TestKind::IsMap),
+            (Opcode::is_boolean, TestKind::IsBoolean),
+            (Opcode::is_function, TestKind::IsFunction),
+            (Opcode::is_function2, TestKind::IsFunction2),
+            (Opcode::is_tagged_tuple, TestKind::IsTaggedTuple),
             (Opcode::test_arity, TestKind::TestArity),
         ];
         for (op, kind) in cases {
@@ -886,8 +890,6 @@ mod tests {
             Opcode::int_code_end,
             Opcode::func_info,
             Opcode::is_constant,
-            Opcode::is_boolean,
-            Opcode::is_function,
             Opcode::is_record_accessible,
             Opcode::gc_bif2,
             Opcode::select_val,
@@ -895,11 +897,11 @@ mod tests {
             assert_eq!(TestKind::from_opcode(op), None, "{}", op.name());
         }
 
-        // Exhaustively: `from_opcode` is `Some` for exactly the 21 test opcodes.
+        // Exhaustively: `from_opcode` is `Some` for exactly the 25 test opcodes.
         let classified = crate::opcode::OPCODE_TABLE
             .iter()
             .filter(|(_, op, _, _)| TestKind::from_opcode(*op).is_some())
             .count();
-        assert_eq!(classified, 21);
+        assert_eq!(classified, 25);
     }
 }
