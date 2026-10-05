@@ -93,7 +93,7 @@ use std::time::{Duration, Instant};
 // themselves integration-test targets (Cargo only builds the `.rs` files
 // directly under `tests/` as targets); the explicit `#[path]` is needed because
 // a crate root resolves its modules relative to its own directory.
-#[path = "differential/battery.rs"]
+#[path = "differential/battery/mod.rs"]
 mod battery;
 #[path = "differential/erl_program.rs"]
 mod erl_program;
