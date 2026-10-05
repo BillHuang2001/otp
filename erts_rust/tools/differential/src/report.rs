@@ -8,6 +8,7 @@
 //! Reports are written under the crate's gitignored `out/` directory unless `--out <dir>`
 //! overrides it.
 
+use std::collections::BTreeMap;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -38,6 +39,12 @@ pub struct RunReport {
     pub rust: RuntimeReport,
     /// Verdict counts over `cases`.
     pub summary: Summary,
+    /// Verdict counts rolled up per compatibility contract, keyed by the stable contract id
+    /// (`"A.1"` … `"A.9"`) and ordered by it. A case contributes to every contract it
+    /// declares, so these totals need not sum to [`Summary::total`]. Only contracts that
+    /// appear in the run are present (an empty object for a corpus-free run, e.g. an ad-hoc
+    /// `compare`).
+    pub by_contract: BTreeMap<&'static str, Summary>,
     /// One entry per executed case, in execution order.
     pub cases: Vec<CaseReport>,
 }
@@ -51,12 +58,14 @@ impl RunReport {
         cases: Vec<CaseReport>,
     ) -> RunReport {
         let summary = Summary::of(&cases);
+        let by_contract = by_contract_summary(&cases);
         RunReport {
             schema: SCHEMA,
             mode,
             oracle: RuntimeReport::of(RuntimeId::Oracle, Some(oracle)),
             rust: RuntimeReport::of(RuntimeId::Rust, rust),
             summary,
+            by_contract,
             cases,
         }
     }
@@ -135,25 +144,55 @@ pub struct Summary {
 }
 
 impl Summary {
-    /// Count the verdicts of `cases`.
-    pub fn of(cases: &[CaseReport]) -> Summary {
-        let mut summary = Summary {
-            total: cases.len(),
+    /// The zero summary (no cases, no verdicts).
+    fn empty() -> Summary {
+        Summary {
+            total: 0,
             agree: 0,
             mismatch: 0,
             unsupported: 0,
             skipped: 0,
-        };
+        }
+    }
+
+    /// Count one more case that produced `verdict`.
+    fn add(&mut self, verdict: Verdict) {
+        self.total += 1;
+        match verdict {
+            Verdict::Agree => self.agree += 1,
+            Verdict::Mismatch => self.mismatch += 1,
+            Verdict::Unsupported => self.unsupported += 1,
+            Verdict::Skipped => self.skipped += 1,
+        }
+    }
+
+    /// Count the verdicts of `cases`.
+    pub fn of(cases: &[CaseReport]) -> Summary {
+        let mut summary = Summary::empty();
         for case in cases {
-            match case.verdict {
-                Verdict::Agree => summary.agree += 1,
-                Verdict::Mismatch => summary.mismatch += 1,
-                Verdict::Unsupported => summary.unsupported += 1,
-                Verdict::Skipped => summary.skipped += 1,
-            }
+            summary.add(case.verdict);
         }
         summary
     }
+}
+
+/// Roll the case verdicts up per compatibility contract.
+///
+/// A case may cover several contracts, so it contributes to each contract it declares; the
+/// per-contract `total`s therefore need not sum to the overall [`Summary::total`]. The map
+/// is keyed by the stable contract id (`"A.1"` … `"A.9"`) and ordered by it, keeping the
+/// report deterministic regardless of corpus order.
+fn by_contract_summary(cases: &[CaseReport]) -> BTreeMap<&'static str, Summary> {
+    let mut by_contract: BTreeMap<&'static str, Summary> = BTreeMap::new();
+    for case in cases {
+        for contract in &case.contracts {
+            by_contract
+                .entry(contract.id())
+                .or_insert_with(Summary::empty)
+                .add(case.verdict);
+        }
+    }
+    by_contract
 }
 
 /// One case's report entry.
@@ -250,6 +289,10 @@ pub struct ListReport {
     pub total: usize,
     /// One entry per corpus case, in corpus order.
     pub cases: Vec<ListEntry>,
+    /// The per-contract grouping. Present only with `differential list --by-contract`;
+    /// omitted from the JSON otherwise, so the plain listing is byte-for-byte unchanged.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub by_contract: Option<Vec<ContractGroup>>,
 }
 
 impl ListReport {
@@ -260,8 +303,54 @@ impl ListReport {
             schema: LIST_SCHEMA,
             total: cases.len(),
             cases: cases.iter().map(ListEntry::of).collect(),
+            by_contract: None,
         }
     }
+
+    /// Build the listing of the built-in corpus **grouped by compatibility contract**
+    /// (the `differential list --by-contract` view).
+    pub fn from_corpus_grouped() -> ListReport {
+        ListReport {
+            by_contract: Some(contract_groups()),
+            ..ListReport::from_corpus()
+        }
+    }
+}
+
+/// One contract's cases in the grouped `list --by-contract` view.
+#[derive(Debug, Clone, Serialize)]
+pub struct ContractGroup {
+    /// The stable contract id (`"A.1"` … `"A.9"`).
+    pub id: &'static str,
+    /// The human label of the contract.
+    pub label: &'static str,
+    /// How many corpus cases cover this contract.
+    pub total: usize,
+    /// The ids of those cases, in corpus order.
+    pub case_ids: Vec<&'static str>,
+}
+
+/// Group the corpus by compatibility contract, ordered by contract id.
+fn contract_groups() -> Vec<ContractGroup> {
+    let mut groups: BTreeMap<&'static str, (&'static str, Vec<&'static str>)> = BTreeMap::new();
+    for case in corpus::cases() {
+        for contract in case.contracts {
+            groups
+                .entry(contract.id())
+                .or_insert_with(|| (contract.label(), Vec::new()))
+                .1
+                .push(case.id);
+        }
+    }
+    groups
+        .into_iter()
+        .map(|(id, (label, case_ids))| ContractGroup {
+            id,
+            label,
+            total: case_ids.len(),
+            case_ids,
+        })
+        .collect()
 }
 
 /// One corpus entry in the `list` listing.
@@ -365,6 +454,16 @@ pub fn render_human(report: &RunReport, out: &mut impl Write) -> std::io::Result
         "summary: total={} agree={} mismatch={} unsupported={} skipped={}",
         summary.total, summary.agree, summary.mismatch, summary.unsupported, summary.skipped
     )?;
+    if !report.by_contract.is_empty() {
+        writeln!(out, "by contract:")?;
+        for (id, counts) in &report.by_contract {
+            writeln!(
+                out,
+                "  {id} total={} agree={} mismatch={} unsupported={} skipped={}",
+                counts.total, counts.agree, counts.mismatch, counts.unsupported, counts.skipped
+            )?;
+        }
+    }
     if report.cases.is_empty() {
         writeln!(out, "(no cases)")?;
         return Ok(());
@@ -433,11 +532,33 @@ fn render_side(out: &mut impl Write, label: &str, side: &SideReport) -> std::io:
     )
 }
 
+/// Render the grouped `list --by-contract` view for a human reader.
+///
+/// One block per contract (ordered by id), showing the contract id, its label, its case
+/// count and the ids of the cases that cover it.
+pub fn render_list_grouped(list: &ListReport, out: &mut impl Write) -> std::io::Result<()> {
+    let groups = list.by_contract.as_deref().unwrap_or(&[]);
+    if groups.is_empty() {
+        return writeln!(out, "(no contracts)");
+    }
+    for group in groups {
+        writeln!(
+            out,
+            "{} — {} — {} case(s)",
+            group.id, group.label, group.total
+        )?;
+        for case_id in &group.case_ids {
+            writeln!(out, "  {case_id}")?;
+        }
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::{
-        default_out_dir, render_human, to_json_string, write_json_value, CaseReport, ListReport,
-        RunReport, Summary, SCHEMA,
+        default_out_dir, render_human, render_list_grouped, to_json_string, write_json_value,
+        CaseReport, ListReport, RunReport, Summary, SCHEMA,
     };
     use crate::compare::{FieldDiff, GoldenCheck, SideResult, Verdict};
     use crate::corpus::{find_case, Contract};
@@ -491,6 +612,30 @@ mod tests {
             None,
             vec![CaseReport::from_outcome(&outcome)],
         )
+    }
+
+    /// A synthetic case report with the given verdict and contracts (no runtime needed).
+    fn case(verdict: Verdict, contracts: Vec<Contract>) -> CaseReport {
+        let outcome = crate::harness::CaseOutcome {
+            case_id: "synthetic/case".to_string(),
+            description: "a synthetic case".to_string(),
+            contracts,
+            eval: "try (ok) of V -> ok end.".to_string(),
+            oracle_argv: vec!["-noshell".to_string()],
+            rust_argv: vec!["-noshell".to_string()],
+            oracle: SideResult::observed(observation(b"ok\n", Some(0))),
+            rust: SideResult::unsupported("no beam_rt"),
+            golden: GoldenCheck {
+                matched: true,
+                diffs: Vec::new(),
+            },
+            golden_asserted: true,
+            verdict,
+            diffs: Vec::new(),
+            oracle_spec: spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            rust_spec: None,
+        };
+        CaseReport::from_outcome(&outcome)
     }
 
     #[test]
@@ -627,5 +772,160 @@ mod tests {
         assert_eq!(report.schema, SCHEMA);
         assert_ne!(report.cases[0].verdict, Verdict::Agree);
         assert_eq!(report.summary.agree, 0);
+    }
+
+    #[test]
+    fn by_contract_rolls_up_every_verdict_per_contract() {
+        let cases = vec![
+            case(Verdict::Agree, vec![Contract::BeamAsm]),
+            case(Verdict::Unsupported, vec![Contract::BeamAsm]),
+            case(Verdict::Mismatch, vec![Contract::LanguageSemantics]),
+            case(Verdict::Skipped, vec![Contract::OtpApps]),
+        ];
+        let report = RunReport::new(
+            "suite",
+            &spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            None,
+            cases,
+        );
+        assert_eq!(report.by_contract.len(), 3);
+        let a2 = report.by_contract["A.2"];
+        assert_eq!(a2.total, 2);
+        assert_eq!(a2.agree, 1);
+        assert_eq!(a2.unsupported, 1);
+        assert_eq!(a2.mismatch, 0);
+        assert_eq!(a2.skipped, 0);
+        assert_eq!(report.by_contract["A.1"].mismatch, 1);
+        assert_eq!(report.by_contract["A.7"].skipped, 1);
+        // The rollup is additive: the overall summary is untouched.
+        assert_eq!(report.summary.total, 4);
+        assert_eq!(report.summary.agree, 1);
+    }
+
+    #[test]
+    fn a_case_contributes_to_every_contract_it_declares() {
+        let cases = vec![case(Verdict::Agree, vec![Contract::BeamAsm, Contract::Cli])];
+        let report = RunReport::new(
+            "suite",
+            &spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            None,
+            cases,
+        );
+        assert_eq!(report.by_contract["A.2"].total, 1);
+        assert_eq!(report.by_contract["A.6"].total, 1);
+        // One case, two contract entries: the per-contract totals exceed the case count.
+        assert_eq!(report.summary.total, 1);
+    }
+
+    #[test]
+    fn by_contract_is_an_additive_top_level_json_key() {
+        let cases = vec![
+            case(Verdict::Agree, vec![Contract::BeamAsm]),
+            case(Verdict::Unsupported, vec![Contract::BeamAsm]),
+        ];
+        let report = RunReport::new(
+            "suite",
+            &spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            None,
+            cases,
+        );
+        let json: serde_json::Value = serde_json::from_str(&report.to_json_string().unwrap()).unwrap();
+        // The existing schema id and summary are unchanged.
+        assert_eq!(json["schema"], "differential/1");
+        assert_eq!(json["summary"]["total"], 2);
+        assert_eq!(json["summary"]["agree"], 1);
+        // The new key carries the same Summary shape, keyed by contract id.
+        assert_eq!(json["by_contract"]["A.2"]["total"], 2);
+        assert_eq!(json["by_contract"]["A.2"]["agree"], 1);
+        assert_eq!(json["by_contract"]["A.2"]["mismatch"], 0);
+        assert_eq!(json["by_contract"]["A.2"]["unsupported"], 1);
+        assert_eq!(json["by_contract"]["A.2"]["skipped"], 0);
+    }
+
+    #[test]
+    fn a_contract_free_run_has_an_empty_rollup() {
+        let cases = vec![case(Verdict::Unsupported, Vec::new())];
+        let report = RunReport::new(
+            "compare",
+            &spec(RuntimeId::Oracle, "/x/erl", RuntimeSource::Path),
+            None,
+            cases,
+        );
+        assert!(report.by_contract.is_empty());
+        let json: serde_json::Value = serde_json::from_str(&report.to_json_string().unwrap()).unwrap();
+        assert!(json["by_contract"].as_object().expect("object").is_empty());
+    }
+
+    #[test]
+    fn render_human_shows_the_by_contract_table() {
+        let report = report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), Some(true));
+        let mut buf = Vec::new();
+        render_human(&report, &mut buf).expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.contains("by contract:"), "{text}");
+        assert!(
+            text.contains("A.2 total=1 agree=0 mismatch=0 unsupported=1 skipped=0"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn list_grouped_adds_the_grouping_without_changing_the_plain_listing() {
+        // The plain listing never carries `by_contract`, so `list` output is unchanged.
+        let plain = ListReport::from_corpus();
+        assert!(plain.by_contract.is_none());
+        let plain_json = to_json_string(&plain).unwrap();
+        assert!(
+            !plain_json.contains("by_contract"),
+            "the plain listing must not carry the grouping"
+        );
+
+        // The grouped listing keeps the schema/total/cases and ADDS the grouping.
+        let grouped = ListReport::from_corpus_grouped();
+        assert_eq!(grouped.schema, "differential/list/1");
+        assert_eq!(grouped.total, plain.total);
+        assert_eq!(grouped.cases.len(), plain.cases.len());
+        let json: serde_json::Value = serde_json::from_str(&to_json_string(&grouped).unwrap()).unwrap();
+        let groups = json["by_contract"].as_array().expect("by_contract array");
+        assert!(!groups.is_empty());
+
+        // Groups are ordered by contract id and unique, and each `total` matches its ids.
+        let mut previous: Option<&str> = None;
+        for group in groups {
+            let id = group["id"].as_str().expect("id");
+            let label = group["label"].as_str().expect("label");
+            assert!(!label.is_empty(), "contract {id} has no label");
+            let ids = group["case_ids"].as_array().expect("case_ids");
+            assert_eq!(group["total"].as_u64().unwrap() as usize, ids.len());
+            assert!(ids.iter().all(|value| value.as_str().is_some()));
+            if let Some(previous) = previous {
+                assert!(previous < id, "contracts are not ordered: {previous} then {id}");
+            }
+            previous = Some(id);
+        }
+
+        // A.2 covers the corpus ETF/beam cases including the two module-run agreement cases.
+        let a2 = groups
+            .iter()
+            .find(|group| group["id"] == "A.2")
+            .expect("A.2 is present");
+        let ids: Vec<&str> = a2["case_ids"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|value| value.as_str().unwrap())
+            .collect();
+        assert!(ids.contains(&"modules/add"), "{ids:?}");
+        assert!(ids.contains(&"modules/fib"), "{ids:?}");
+    }
+
+    #[test]
+    fn render_list_grouped_prints_one_block_per_contract() {
+        let grouped = ListReport::from_corpus_grouped();
+        let mut buf = Vec::new();
+        render_list_grouped(&grouped, &mut buf).expect("render");
+        let text = String::from_utf8(buf).expect("utf8");
+        assert!(text.contains("A.2 — .beam binary/ETF bytes — "), "{text}");
+        assert!(text.contains("  modules/add"), "{text}");
     }
 }
