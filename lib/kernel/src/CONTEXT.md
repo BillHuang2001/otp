@@ -109,7 +109,7 @@ OS / terminal / processes:
 - Keep `-moduledoc false` on internal modules: the doc build (`../doc/docs.exs` groups + ExDoc) publishes anything with a moduledoc, so a missing flag silently adds an internal module to the public docs.
 - Module-level `-doc`/`-moduledoc` text is the documentation source (there is no `doc/src/*.xml`); `../doc/src/` only holds `logger_arch.dia`.
 - New/changed internal `.hrl` stay in this directory; only shared headers referenced by other applications go to `../include/` and must be added to `HRL_FILES`.
-- Do not add a dependency on any application above kernel (no `ssl`, `crypto` API calls beyond what `runtime_dependencies` allows, no `inets`, `stdlib`-level helpers are acceptable).
+- Do not add a dependency on an application above kernel: dependencies limited to `erts`, `stdlib`, and the declared `crypto`/`sasl` runtime dependencies (`crypto` is used only in `inet_db` and `inet_dns_tsig`, and must never be assumed available during early boot).
 - Anything reachable during early boot (`kernel`, `application`, `error_handler`, `logger_simple_h`, `group`, `user_drv`, `code`) must keep minimal dependencies, since it may run before other kernel processes exist.
 
 ## Design Decisions
