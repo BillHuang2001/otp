@@ -14,7 +14,8 @@ use std::collections::BTreeMap;
 use beam_common::BeamError;
 use beam_engine::{Machine, MinimalContext};
 use beam_loader::{
-    Export, Function, Import, ImportRef, Instr, Label, Module, Opcode, Operand, TestKind, NO_FAIL,
+    Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Opcode, Operand, TestKind,
+    NO_FAIL,
 };
 use beam_term::{
     is_small, make_arityval, make_boxed, make_header, make_internal_pid, make_internal_port,
@@ -419,6 +420,162 @@ fn test_arity_matches_tuple_arity() {
     assert_eq!(build(-1).map_err(|_| ()), Ok(make_small(0)));
 }
 
+#[test]
+fn is_boolean_recognises_true_and_false_atoms() {
+    // `is_boolean` compares against the module's `true`/`false` atoms, so those
+    // names must be interned into the *same* module whose code is run.
+    let mut fixture = Fixture::new();
+    let true_atom = fixture.atom("true");
+    let false_atom = fixture.atom("false");
+    let other_atom = fixture.atom("other");
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Test {
+            kind: TestKind::IsBoolean,
+            fail: Label(2),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("t", 1, code);
+    let module = fixture.finish();
+
+    let verdict = |value: Eterm| run(&module, entry, &[value]).map_err(|_| ());
+    assert_eq!(verdict(beam_term::make_atom(true_atom)), Ok(make_small(1)));
+    assert_eq!(verdict(beam_term::make_atom(false_atom)), Ok(make_small(1)));
+    // Any other atom, or a non-atom, is not a boolean.
+    assert_eq!(verdict(beam_term::make_atom(other_atom)), Ok(make_small(0)));
+    assert_eq!(verdict(make_small(1)), Ok(make_small(0)));
+    assert_eq!(verdict(NIL), Ok(make_small(0)));
+}
+
+#[test]
+fn is_function_is_true_only_for_funs() {
+    let mut ctx = MinimalContext::new();
+    let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
+
+    ok_true(TestKind::IsFunction, &[fun]);
+    ok_false(TestKind::IsFunction, &[make_small(1)]);
+    ok_false(TestKind::IsFunction, &[NIL]);
+    ok_false(TestKind::IsFunction, &[make_atom_local(7)]);
+}
+
+#[test]
+fn is_function2_matches_a_fun_of_the_given_arity() {
+    let mut ctx = MinimalContext::new();
+    let fun = beam_engine::terms::make_fun(&mut ctx, 2, 0x1234, 3, &[]).unwrap();
+
+    // `is_function2 Fail Fun Arity` — args = [Fun, {integer,Arity}].
+    let build = |value: Eterm, arity: Operand| {
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsFunction2,
+                fail: Label(2),
+                args: vec![Operand::X(0), arity],
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        let mut fixture = Fixture::new();
+        let entry = fixture.add_function("t", 1, code);
+        let module = fixture.finish();
+        run(&module, entry, &[value])
+    };
+
+    // A fun of the matching arity succeeds; the wrong arity fails.
+    assert_eq!(
+        build(fun, Operand::Integer(2)).map_err(|_| ()),
+        Ok(make_small(1))
+    );
+    assert_eq!(
+        build(fun, Operand::Integer(3)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A non-fun value fails regardless of the arity literal.
+    assert_eq!(
+        build(make_small(1), Operand::Integer(2)).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+    // A malformed (non-integer) arity operand is a typed error, never a wrong
+    // result — and only reached for a real fun (the non-fun case short-circuits).
+    assert!(build(fun, Operand::X(1)).is_err());
+}
+
+#[test]
+fn is_tagged_tuple_matches_the_arity_and_the_tag() {
+    // `{r, 9}`: a 2-tuple whose first element is the atom `r`. The tag operand is a
+    // raw atom index (`make_atom`), so the module's atom *table* is not consulted.
+    let tag = Atom::from_raw(11);
+    let other = Atom::from_raw(12);
+    let mut words = [make_arityval(2), beam_term::make_atom(tag), make_small(9)];
+    let tuple = make_boxed(words.as_mut_ptr());
+
+    // `is_tagged_tuple Fail Src Arity Tag` — args = [Src, {integer,Arity}, Tag].
+    let build = |value: Eterm, arity: i64, tag_operand: Atom| {
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::Test {
+                kind: TestKind::IsTaggedTuple,
+                fail: Label(2),
+                args: vec![
+                    Operand::X(0),
+                    Operand::Integer(arity),
+                    Operand::Atom(tag_operand),
+                ],
+            },
+            Instr::Move {
+                src: Operand::Integer(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+            Instr::Label(Label(2)),
+            Instr::Move {
+                src: Operand::Integer(0),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ];
+        let mut fixture = Fixture::new();
+        let entry = fixture.add_function("t", 1, code);
+        let module = fixture.finish();
+        run(&module, entry, &[value])
+    };
+
+    // Matching arity and tag.
+    assert_eq!(build(tuple, 2, tag).map_err(|_| ()), Ok(make_small(1)));
+    // Right tag, wrong arity.
+    assert_eq!(build(tuple, 3, tag).map_err(|_| ()), Ok(make_small(0)));
+    // Right arity, wrong tag.
+    assert_eq!(build(tuple, 2, other).map_err(|_| ()), Ok(make_small(0)));
+    // A negative or out-of-range arity can never match a tuple.
+    assert_eq!(build(tuple, -1, tag).map_err(|_| ()), Ok(make_small(0)));
+    // A non-tuple value fails.
+    assert_eq!(
+        build(make_small(1), 2, tag).map_err(|_| ()),
+        Ok(make_small(0))
+    );
+}
+
 // ---------------------------------------------------------------------------
 // SelectVal
 // ---------------------------------------------------------------------------
@@ -590,7 +747,7 @@ fn allocate_call_return_deallocate_preserve_y_slots() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 2,
+            stack_need: HeapNeed::Words(2),
             live: 1,
         },
         Instr::Move {
@@ -646,7 +803,7 @@ fn call_last_deallocates_then_jumps() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {
@@ -684,7 +841,7 @@ fn call_last_with_wrong_deallocate_is_a_typed_error() {
     let caller_code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::CallLast {
@@ -746,12 +903,12 @@ fn test_heap_and_allocate_heap() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::TestHeap {
-            heap_need: 4,
+            heap_need: HeapNeed::Words(4),
             live: 1,
         },
         Instr::AllocateHeap {
-            stack_need: 2,
-            heap_need: 8,
+            stack_need: HeapNeed::Words(2),
+            heap_need: HeapNeed::Words(8),
             live: 1,
         },
         Instr::Move {
@@ -776,7 +933,7 @@ fn trim_drops_y_slots() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 3,
+            stack_need: HeapNeed::Words(3),
             live: 0,
         },
         Instr::Move {
@@ -810,7 +967,7 @@ fn trim_overrun_is_a_typed_error() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 2,
+            stack_need: HeapNeed::Words(2),
             live: 0,
         },
         Instr::Trim { n: 3, remaining: 0 },
@@ -833,7 +990,7 @@ fn call_ext_writes_x0_and_continues_to_the_next_instruction() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {
@@ -911,7 +1068,7 @@ fn call_ext_last_deallocates_calls_and_returns() {
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Allocate {
-            stack_need: 1,
+            stack_need: HeapNeed::Words(1),
             live: 0,
         },
         Instr::Move {

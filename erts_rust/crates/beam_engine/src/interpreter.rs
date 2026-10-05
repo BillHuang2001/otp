@@ -17,8 +17,8 @@ use std::collections::BTreeMap;
 use beam_common::Result;
 use beam_loader::{ImportRef, Instr, Label, Module, Operand, TestKind, NO_FAIL};
 use beam_term::{
-    cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list, Eterm,
-    MAX_ARITYVAL,
+    cmp, cmp_arith, is_atom, is_internal_pid, is_internal_port, is_nil, is_not_nil_list, make_atom,
+    Eterm, MAX_ARITYVAL,
 };
 
 use crate::context::ExecutionContext;
@@ -246,7 +246,10 @@ impl Machine {
                     }
                 }
                 Instr::Allocate { stack_need, .. } => {
-                    self.push_frame(*stack_need)?;
+                    // `stack_need` is a `HeapNeed` (either a bare word count or a
+                    // `z,3` allocation list); `.words()` recovers the total the frame
+                    // reserves (see `beam_loader::HeapNeed`).
+                    self.push_frame(stack_need.words())?;
                     pc += 1;
                 }
                 Instr::AllocateHeap {
@@ -254,12 +257,12 @@ impl Machine {
                     heap_need,
                     live,
                 } => {
-                    self.ensure_heap(*heap_need, *live, ctx)?;
-                    self.push_frame(*stack_need)?;
+                    self.ensure_heap(heap_need.words(), *live, ctx)?;
+                    self.push_frame(stack_need.words())?;
                     pc += 1;
                 }
                 Instr::TestHeap { heap_need, live } => {
-                    self.ensure_heap(*heap_need, *live, ctx)?;
+                    self.ensure_heap(heap_need.words(), *live, ctx)?;
                     pc += 1;
                 }
                 Instr::Deallocate(n) => {
@@ -281,6 +284,88 @@ impl Machine {
                     }
                 },
                 Instr::Generic { op, .. } => return Err(error::unsupported(op.name())),
+                // Every remaining IR variant — the opcode families the loader's
+                // widened `Instr` vocabulary models but this interpreter does not
+                // execute yet. Each is a documented typed error: never a panic and
+                // never a wrong result. Later tasks implement these families.
+                Instr::Bif0 { .. }
+                | Instr::Bif { .. }
+                | Instr::CallFun { .. }
+                | Instr::CallFun2 { .. }
+                | Instr::Apply { .. }
+                | Instr::ApplyLast { .. }
+                | Instr::MakeFun3 { .. }
+                | Instr::SelectTupleArity { .. }
+                | Instr::Jump { .. }
+                | Instr::InitYregs { .. }
+                | Instr::PutTuple2 { .. }
+                | Instr::GetTupleElement { .. }
+                | Instr::PutList { .. }
+                | Instr::GetList { .. }
+                | Instr::GetHd { .. }
+                | Instr::GetTl { .. }
+                | Instr::GetMapElements { .. }
+                | Instr::HasMapFields { .. }
+                | Instr::PutMapAssoc { .. }
+                | Instr::PutMapExact { .. }
+                | Instr::UpdateRecord { .. }
+                | Instr::Badmatch { .. }
+                | Instr::CaseEnd { .. }
+                | Instr::IfEnd
+                | Instr::Try { .. }
+                | Instr::Catch { .. }
+                | Instr::TryCase { .. }
+                | Instr::TryEnd { .. }
+                | Instr::TryCaseEnd { .. }
+                | Instr::CatchEnd { .. }
+                | Instr::Raise { .. }
+                | Instr::Badrecord { .. }
+                | Instr::BuildStacktrace
+                | Instr::RawRaise
+                | Instr::Fmove { .. }
+                | Instr::Fconv { .. }
+                | Instr::Fadd { .. }
+                | Instr::Fsub { .. }
+                | Instr::Fmul { .. }
+                | Instr::Fdiv { .. }
+                | Instr::Fnegate { .. }
+                | Instr::Send
+                | Instr::LoopRec { .. }
+                | Instr::LoopRecEnd { .. }
+                | Instr::Wait { .. }
+                | Instr::WaitTimeout { .. }
+                | Instr::Timeout
+                | Instr::RemoveMessage
+                | Instr::RecvMarkerReserve { .. }
+                | Instr::RecvMarkerBind { .. }
+                | Instr::RecvMarkerClear { .. }
+                | Instr::RecvMarkerUse { .. }
+                | Instr::BsStartMatch3 { .. }
+                | Instr::BsStartMatch4 { .. }
+                | Instr::BsMatch { .. }
+                | Instr::BsMatchString { .. }
+                | Instr::BsGetTail { .. }
+                | Instr::BsGetPosition { .. }
+                | Instr::BsSetPosition { .. }
+                | Instr::BsGetInteger2 { .. }
+                | Instr::BsGetFloat2 { .. }
+                | Instr::BsGetBinary2 { .. }
+                | Instr::BsSkipBits2 { .. }
+                | Instr::BsTestTail2 { .. }
+                | Instr::BsGetUtf8 { .. }
+                | Instr::BsGetUtf16 { .. }
+                | Instr::BsGetUtf32 { .. }
+                | Instr::BsSkipUtf8 { .. }
+                | Instr::BsSkipUtf16 { .. }
+                | Instr::BsSkipUtf32 { .. }
+                | Instr::BsInitWritable
+                | Instr::BsCreateBin { .. }
+                | Instr::ExecutableLine { .. }
+                | Instr::DebugLine { .. }
+                | Instr::NifStart
+                | Instr::OnLoad => {
+                    return Err(error::unsupported("widened opcode not yet executed"))
+                }
             }
         }
     }
@@ -356,8 +441,76 @@ impl Machine {
             TestKind::IsNonemptyList => Ok(is_not_nil_list(self.test_arg(args, 0)?)),
             TestKind::IsTuple => Ok(predicates::is_tuple(self.test_arg(args, 0)?)),
             TestKind::IsMap => Ok(predicates::is_map(self.test_arg(args, 0)?)),
+            TestKind::IsBoolean => {
+                // `is_boolean Fail Src` (`emu/instrs.tab:933`): `Src` is the atom
+                // `true` or `false`. Both are ordinary atoms, so compare against the
+                // module's atom table; a name absent from the table can never be the
+                // value, so a missing name is `false` (not an error).
+                let v = self.test_arg(args, 0)?;
+                if !is_atom(v) {
+                    return Ok(false);
+                }
+                let is_true = atoms
+                    .lookup("true")
+                    .map(|a| v == make_atom(a))
+                    .unwrap_or(false);
+                let is_false = atoms
+                    .lookup("false")
+                    .map(|a| v == make_atom(a))
+                    .unwrap_or(false);
+                Ok(is_true || is_false)
+            }
+            // `is_function Fail Fun` and `is_function2 Fail Fun Arity` — reuse the
+            // `terms` fun readers (`is_any_fun` / the fun-header arity field).
+            TestKind::IsFunction => Ok(crate::terms::is_fun(self.test_arg(args, 0)?)),
+            TestKind::IsFunction2 => self.eval_is_function2(args),
+            TestKind::IsTaggedTuple => self.eval_is_tagged_tuple(args),
             TestKind::TestArity => self.eval_test_arity(args),
         }
+    }
+
+    /// `is_function2 Fail Fun Arity` — `Fun` is a fun of the given arity.
+    ///
+    /// Operand order is the file's (`emu/ops.tab:831`, verified against the oracle:
+    /// `{test,is_function2,{f,N},[Fun,{integer,Arity}]}`), i.e. `args[0]` = `Fun`,
+    /// `args[1]` = `Arity` (an integer operand).
+    fn eval_is_function2(&self, args: &[Operand]) -> Result<bool> {
+        let value = self.test_arg(args, 0)?;
+        if !crate::terms::is_fun(value) {
+            return Ok(false);
+        }
+        match args.get(1) {
+            Some(Operand::Integer(arity)) if *arity >= 0 && *arity <= u32::MAX as i64 => {
+                Ok(crate::terms::fun_arity(value)? == *arity as u32)
+            }
+            _ => Err(error::unsupported("is_function2: arity operand")),
+        }
+    }
+
+    /// `is_tagged_tuple Fail Src Arity Tag` — `Src` is a tuple of `Arity` whose first
+    /// element is `Tag` (the compiler's record test).
+    ///
+    /// Operand order is the file's (`emu/ops.tab:664`; verified against the oracle:
+    /// `{test,is_tagged_tuple,{f,N},[{x,0},3,{atom,r}]}`), i.e. `args[0]` = `Src`,
+    /// `args[1]` = `Arity` (an integer), `args[2]` = `Tag` (an atom) — the same layout
+    /// `beam_loader::TestKind::IsTaggedTuple` documents.
+    fn eval_is_tagged_tuple(&self, args: &[Operand]) -> Result<bool> {
+        let value = self.test_arg(args, 0)?;
+        let arity = match args.get(1) {
+            Some(Operand::Integer(arity)) => *arity,
+            _ => return Err(error::unsupported("is_tagged_tuple: arity operand")),
+        };
+        // A tagged tuple has at least the tag element and its arity always fits
+        // `MAX_ARITYVAL`; any other operand can never match, so the test fails.
+        if !(1..=MAX_ARITYVAL as i64).contains(&arity) {
+            return Ok(false);
+        }
+        if !predicates::is_tuple_arity(value, arity as usize) {
+            return Ok(false);
+        }
+        let tag = self.test_arg(args, 2)?;
+        // The first element of a tagged tuple is the (immediate) tag atom.
+        Ok(crate::terms::tuple_element(value, 0)? == tag)
     }
 
     /// `test_arity Value Integer` — the value is a tuple of that arity.
