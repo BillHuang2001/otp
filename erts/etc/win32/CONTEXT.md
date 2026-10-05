@@ -73,7 +73,7 @@ Sibling top-level areas: `../../` (ERTS as a whole), `../../../lib/` (OTP applic
 - `Makefile`'s `INSTALL_PROGS` is a legacy subset (`inet_gethost`, `erl`, `heart`, `erlc`, `erlsrv`, `start_erl`); `escript.exe`, `erl_log.exe` and `erlexec.dll` are only contributed by `../common/Makefile.in`.
 - `version.h` is absent in a clean checkout — `erl.rc` cannot be compiled until `../common/Makefile.in` has generated it.
 - `lib/kernel/test/os_SUITE.erl` asserts that `os:version()` matches `cmd /c ver`, explicitly warning that a new Windows release requires updating `erts/etc/win32/manifest.xml`.
-- `dl`/`m` — cross-tree divergence: only `wsl_tools/vc/ld.sh` falls back to `manifest.xml`; a manifest problem seen under Cygwin/MSYS2 has a different cause.
+- Cross-tree divergence: only `wsl_tools/vc/ld.sh` falls back to `manifest.xml`; a manifest problem seen under Cygwin/MSYS2 has a different cause.
 
 ## Notes for Agents
 - To compile anything here, run `make` in `erts/etc/common` from a **configured** win32 tree; running `make` in this directory only reaches `release_spec`.
