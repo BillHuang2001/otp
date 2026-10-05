@@ -19,8 +19,8 @@ The `.el` files and their roles:
 - `vsn.mk` — `EMACS_VSN = 2.7.0`, the Emacs-mode's own version, independent of `TOOLS_VSN`; `Makefile` still uses `TOOLS_VSN` for `RELSYSDIR`.
 - `README` — user setup notes (load-path, `erlang-root-dir`, `exec-path`, require `erlang-start`; optional flymake addon).
 - `AUTHORS` — original authors and maintainers.
-- `tags.erl` — git symlink to `../src/tags.erl` (the `tags` program that generates TAGS files); the real source and its build/install live in `../src/`, so do NOT edit through the symlink.
-- `tags.3` — man page for the `tags` tool (installed by `../src/Makefile`, not by this dir's Makefile).
+- `tags.erl` — git symlink to `../src/tags.erl` (the `tags` program that generates TAGS files). No Makefile here builds or installs it; the real module is compiled and installed by `../src/Makefile` (it is in `MODULES`), so do NOT edit through the symlink.
+- `tags.3` — stale/legacy man page (old-style `ERLANG MODULE DEFINITION` format, dated 1996) for the `tags` tool. No Makefile in the tree installs it: this dir's `release_man_spec` is empty and `EMACS_FILES` excludes it, and `../src/Makefile` has no man-page rule. The tool itself lives in `../src/tags.erl` and its current documentation is generated from that module's `-moduledoc`/`-doc` into the app's `../doc/` output.
 
 ## Constraints
 - `*.elc` byte-compiled files are build artifacts produced by the CT suite / manual byte-compilation — never commit or hand-edit them.
