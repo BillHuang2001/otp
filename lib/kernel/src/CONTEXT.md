@@ -1,8 +1,9 @@
 # kernel/src — Kernel Application Sources
 
 ## Intent
-Sources of the `kernel` application: the lowest layer above `erts` — application control, the code server, file/disk-log I/O, sockets & name resolution, distribution, `logger`, OS/terminal services.
-It is a *dependency-free* app (`{applications,[]}`, `runtime_dependencies` only on erts/stdlib/sasl/crypto) so it cannot use any higher OTP app (no `lists:map` from stdlib is fine, but no `gen_server` from... note `gen_server`/`sys`/`proplists` live in stdlib and ARE usable — kernel is built after stdlib/sasl); anything that must be callable before/while the code server is up lives here.
+Sources of the `kernel` application: the lowest OTP layer above `erts` — application control, the code server, file/disk-log I/O, sockets & name resolution, distribution, `logger`, OS/terminal services.
+It declares `{applications,[]}`: it starts before any other application, so it may only use erts plus the stdlib modules that are already available (a few modules such as `kernel`, `application` and `error_handler` must also work before most of `kernel` itself is up).
+Anything that must be callable during early boot (before the code server, file server or logger exist) belongs here rather than in `stdlib`/`sasl`.
 The directory is FLAT — there are no subdirectories — so this file is both the documentation and the module map.
 
 ## API Surface
