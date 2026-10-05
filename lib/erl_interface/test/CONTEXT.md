@@ -84,8 +84,8 @@ This is the only test directory in OTP that uses the `Makefile.first` ts mechani
 - `ei_decode_SUITE_data/` → `ei_decode_test.c` (all `ei_decode_*` cases)
 - `ei_encode_SUITE_data/` → `ei_encode_test.c` (all `ei_encode_*` cases incl. failures)
 - `ei_decode_encode_SUITE_data/` → `ei_decode_encode_test.c` (single round-trip case used by the smoke spec)
-- `ei_format_SUITE_data/` → `ei_format_test.c` (`erl_format()` cases)
-- `ei_print_SUITE_data/` → `ei_print_test.c` (`ei_print()`/`ei_s_print_term` cases)
+- `ei_format_SUITE_data/` → `ei_format_test.c` (`ei_x_format()` cases)
+- `ei_print_SUITE_data/` → `ei_print_test.c` (`ei_print_term()`/`ei_s_print_term` cases)
 - `ei_tmo_SUITE_data/` → `ei_tmo_test.c` (timeout cases driven by Erlang handshakes)
 - `ei_global_SUITE_data/` → `ei_global_test.c` (global register/whereis/names cases; its `Makefile.src` links `$(LIBEI)` = `libei.a` plus `../all_SUITE_data/ei_runner.o` and `my_ussi.o`)
 - `port_call_SUITE_data/` → `port_call_drv.c`, a shared library (`@SHLIB_RULES@`) loaded with `erl_ddll` from the data dir
