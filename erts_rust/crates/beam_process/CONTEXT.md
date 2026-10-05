@@ -214,7 +214,12 @@ holds `Process` values directly.
   3. `tests/signals.rs` — **link propagation**: `A` links `B`, `A` terminates with a non-normal reason
      ⇒ `B` (not trapping) terminates with the same reason; and with `trap_exit` set ⇒ `B` survives and
      its mailbox holds `{'EXIT', A, Reason}`. **Monitor down-message**: `A` monitors `B`; `B`
-     terminates with reason `R` ⇒ `A`'s mailbox holds `{'DOWN', Ref, process, B, R}`.
+     terminates with reason `R` ⇒ `A`'s mailbox holds `{'DOWN', Ref, process, B, R}`. **Reason
+     ownership**: with a **structured (tuple)** reason (not an immediate), the delivered reason is
+     `eq` to the original *and still valid after the recipient's own `Process::collect()`* — proving it
+     was copied into the recipient's heap, not left as a dangling pointer into the source's (now
+     dropped) heap. Covered for the trapping-peer, cascaded A→B→C link, `{'DOWN'}`, and self-signal
+     cases.
   4. `tests/gc.rs` — **safepoint GC over the process root set**: allocate live terms in the young heap,
      place one in an x-register and one on the stack, enqueue a message whose payload is another live
      term, run `Process::collect()`, and assert the x-register, the stack word and the mailbox payload
