@@ -27,7 +27,7 @@ Public headers in `include/`: `httpd.hrl` (records `init_data`, `mod` — the da
 ## Constraints
 - `Makefile` sets `SUB_DIRECTORIES = src examples doc` (test suites are run through the OTP test harness, not this Makefile) and declares `DIA_PLT_APPS = runtime_tools mnesia ssl` for Dialyzer.
 - All source lives in `src/{inets_app,http_lib,http_client,http_server}` and compiles into the single shared `ebin/`; a new module must be added to the subdirectory's `MODULES` list and to the `modules` list of `src/inets_app/inets.app.src`.
-- Never edit `ebin/` contents, generated `ebin/inets.app`/`inets.appup` (sed-generated from the `.src` templates) or the generated `deps/*.d`/`.depend` files.
+- Never edit `ebin/` contents, generated `ebin/inets.app`/`inets.appup` (sed-generated from the `.src` templates) or the generated `src/*/deps/*.d` dependency files.
 - `vsn.mk` is owned by this app only; bump `INETS_VSN` there — the release-wide mapping lives in the repo-root `otp_versions.table`.
 - `include/` headers are the public, installed copies; `src/http_server/*.hrl` only re-include them with legacy guards — change the public copy, not the wrapper.
 
