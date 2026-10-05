@@ -34,6 +34,7 @@ Every `lib/<app>/` follows the same schema (some dirs optional per app):
 - Any new application directory must be added to the appropriate list in `lib/Makefile` (or picked up automatically only under `BUILD_ALL`).
 
 ## Notes for Agents
+- Every app directory below has its own `CONTEXT.md` (plus deeper nodes where warranted) — the routing table maps each app to its node.
 - App versions live in `lib/<app>/vsn.mk` (`<APP>_VSN`); the release-wide mapping of OTP version → app versions is `otp_versions.table` at the repo root.
 - `erl_interface` and `jinterface` ship C/Java (`jinterface` has `java_src/`), so their layout differs from the pure-Erlang apps.
 - `debugger`, `observer`, `wx` are GUI apps with extra runtime deps; `odbc` needs ODBC system libs; `wx` needs wxWidgets.
