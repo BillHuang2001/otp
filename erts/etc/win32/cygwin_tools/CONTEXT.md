@@ -74,4 +74,4 @@ Top level (all `#!/bin/sh` bash scripts, all shadow the real tools via `PATH`):
 - `../../common/Makefile.in` — main build-time consumer (`USING_VC`, `-MT`/`-MD`)
 - `../erl.c`, `../init_file.c` — read the `bin/erl.ini` written by `make_*_ini.sh`
 - `../../unix/` — the POSIX-only counterpart of `../` (no shims needed there)
-- `otp_build` (repo root), `HOWTO/INSTALL-WIN32.md`, `../../../../HOWTO/INSTALL-WIN32.md`
+- `otp_build` (repo root), `HOWTO/INSTALL-WIN32.md` (i.e. `../../../../HOWTO/INSTALL-WIN32.md`)
