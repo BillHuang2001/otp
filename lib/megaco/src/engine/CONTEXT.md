@@ -19,7 +19,7 @@ Contents: 21 Erlang modules (`modules.mk` splits 4 `BEHAVIOUR_MODULES` from 17 `
 - `megaco_sdp.erl` — RFC 4566 SDP encode/decode helper (`megaco_sdp:encode/1`, `decode/1`); exports the SDP types re-exported by `megaco`.
 
 ### Behaviour implementations
-- `megaco_user_default.erl` — no-op/logging default `megaco_user` implementation used when the user supplies no callback module.
+- `megaco_user_default.erl` — no-op/logging default `megaco_user` implementation; installed as the `user_mod` default by `megaco_config:init/1`.
 - `megaco_erl_dist_encoder.erl` — a `megaco_encoder` codec based on `erlang:term_to_binary/2`; honours `megaco_compressed` / `{megaco_compressed, Mod}` encoding-config options, delegating compression to `megaco_erl_dist_encoder_mc`.
 - `megaco_erl_dist_encoder_mc.erl` — the `megaco_edist_compress` implementation (version-dependent record-to-compact-term mapping) used by `megaco_erl_dist_encoder`.
 
