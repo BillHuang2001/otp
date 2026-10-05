@@ -36,18 +36,21 @@
 
 pub mod context;
 pub mod error;
+mod families;
 pub mod interpreter;
 pub mod jit;
 pub mod machine;
 pub mod operand;
 #[allow(unsafe_code)]
 mod predicates;
+mod step;
 #[allow(unsafe_code)]
 pub mod terms;
 pub use context::{ExecutionContext, MinimalContext};
 pub use error::{bad_register, unknown_label, unsupported};
 pub use jit::{available_tiers, JitBackend};
-pub use machine::{Machine, MAX_REGISTER};
+pub use machine::{CatchFrame, Machine, MAX_REGISTER};
+pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
 ///

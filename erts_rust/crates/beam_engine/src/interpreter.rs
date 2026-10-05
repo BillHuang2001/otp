@@ -23,9 +23,11 @@ use beam_term::{
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::families;
 use crate::machine::{Continuation, Machine};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
+use crate::Step;
 
 /// Build the module-wide `Label -> (function index, code index)` map.
 ///
@@ -284,88 +286,21 @@ impl Machine {
                     }
                 },
                 Instr::Generic { op, .. } => return Err(error::unsupported(op.name())),
-                // Every remaining IR variant — the opcode families the loader's
-                // widened `Instr` vocabulary models but this interpreter does not
-                // execute yet. Each is a documented typed error: never a panic and
-                // never a wrong result. Later tasks implement these families.
-                Instr::Bif0 { .. }
-                | Instr::Bif { .. }
-                | Instr::CallFun { .. }
-                | Instr::CallFun2 { .. }
-                | Instr::Apply { .. }
-                | Instr::ApplyLast { .. }
-                | Instr::MakeFun3 { .. }
-                | Instr::SelectTupleArity { .. }
-                | Instr::Jump { .. }
-                | Instr::InitYregs { .. }
-                | Instr::PutTuple2 { .. }
-                | Instr::GetTupleElement { .. }
-                | Instr::PutList { .. }
-                | Instr::GetList { .. }
-                | Instr::GetHd { .. }
-                | Instr::GetTl { .. }
-                | Instr::GetMapElements { .. }
-                | Instr::HasMapFields { .. }
-                | Instr::PutMapAssoc { .. }
-                | Instr::PutMapExact { .. }
-                | Instr::UpdateRecord { .. }
-                | Instr::Badmatch { .. }
-                | Instr::CaseEnd { .. }
-                | Instr::IfEnd
-                | Instr::Try { .. }
-                | Instr::Catch { .. }
-                | Instr::TryCase { .. }
-                | Instr::TryEnd { .. }
-                | Instr::TryCaseEnd { .. }
-                | Instr::CatchEnd { .. }
-                | Instr::Raise { .. }
-                | Instr::Badrecord { .. }
-                | Instr::BuildStacktrace
-                | Instr::RawRaise
-                | Instr::Fmove { .. }
-                | Instr::Fconv { .. }
-                | Instr::Fadd { .. }
-                | Instr::Fsub { .. }
-                | Instr::Fmul { .. }
-                | Instr::Fdiv { .. }
-                | Instr::Fnegate { .. }
-                | Instr::Send
-                | Instr::LoopRec { .. }
-                | Instr::LoopRecEnd { .. }
-                | Instr::Wait { .. }
-                | Instr::WaitTimeout { .. }
-                | Instr::Timeout
-                | Instr::RemoveMessage
-                | Instr::RecvMarkerReserve { .. }
-                | Instr::RecvMarkerBind { .. }
-                | Instr::RecvMarkerClear { .. }
-                | Instr::RecvMarkerUse { .. }
-                | Instr::BsStartMatch3 { .. }
-                | Instr::BsStartMatch4 { .. }
-                | Instr::BsMatch { .. }
-                | Instr::BsMatchString { .. }
-                | Instr::BsGetTail { .. }
-                | Instr::BsGetPosition { .. }
-                | Instr::BsSetPosition { .. }
-                | Instr::BsGetInteger2 { .. }
-                | Instr::BsGetFloat2 { .. }
-                | Instr::BsGetBinary2 { .. }
-                | Instr::BsSkipBits2 { .. }
-                | Instr::BsTestTail2 { .. }
-                | Instr::BsGetUtf8 { .. }
-                | Instr::BsGetUtf16 { .. }
-                | Instr::BsGetUtf32 { .. }
-                | Instr::BsSkipUtf8 { .. }
-                | Instr::BsSkipUtf16 { .. }
-                | Instr::BsSkipUtf32 { .. }
-                | Instr::BsInitWritable
-                | Instr::BsCreateBin { .. }
-                | Instr::ExecutableLine { .. }
-                | Instr::DebugLine { .. }
-                | Instr::NifStart
-                | Instr::OnLoad => {
-                    return Err(error::unsupported("widened opcode not yet executed"))
-                }
+                // Every remaining IR variant is routed to the per-instruction-family
+                // dispatch seam ([`crate::families`]). Each family is currently a stub
+                // returning `Ok(None)`, so an instruction no family claims yields the
+                // same documented `unsupported` error the interpreter emitted before
+                // this seam existed; a family that later implements an opcode returns
+                // a [`Step`] telling this loop where to continue. Never a panic and
+                // never a wrong result.
+                other => match families::dispatch(self, module, labels, other, func, pc, ctx)? {
+                    Step::Next => pc += 1,
+                    Step::Goto { func: f, pc: p } => {
+                        func = f;
+                        pc = p;
+                    }
+                    Step::Done => return self.finish(),
+                },
             }
         }
     }

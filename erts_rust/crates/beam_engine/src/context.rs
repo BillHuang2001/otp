@@ -6,14 +6,16 @@
 //! types"). `beam_rt` supplies the concrete implementation; [`MinimalContext`] is
 //! the test/embedding implementation (unbounded heap plus a pluggable BIF hook).
 //!
-//! The same trait also exposes the two hooks the term-building layer
-//! ([`crate::terms`]) and the external-call path need: [`alloc_words`] hands out a
-//! stable pointer to raw heap words, and [`apply`] is the general
-//! external-function dispatch entry point. Both are added with default bodies, so
-//! an existing implementor keeps compiling unchanged.
+//! The same trait also exposes the hooks the term-building layer
+//! ([`crate::terms`]) and the call paths need: [`alloc_words`] hands out a stable
+//! pointer to raw heap words, [`apply`] is the general external-function dispatch
+//! entry point, and [`apply_fun`] applies a fun/closure value (the `call_fun`/
+//! `apply` path). All are added with default bodies, so an existing implementor
+//! keeps compiling unchanged.
 //!
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
+//! [`apply_fun`]: ExecutionContext::apply_fun
 
 use beam_common::Result;
 use beam_term::Eterm;
@@ -75,6 +77,17 @@ pub trait ExecutionContext {
     /// context that only implements the BIF surface needs no extra work.
     fn apply(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm> {
         self.call_bif(module, function, arity, args)
+    }
+
+    /// Apply a fun/closure value to `args` (the `call_fun`/`apply` path).
+    ///
+    /// A host with a module/closure registry overrides this to look the fun's
+    /// target up and run it. The default body is a typed
+    /// [`crate::error::unsupported`]: the engine keeps no closure registry, so a
+    /// context that does not override this cannot apply funs.
+    fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        let _ = (fun, args);
+        Err(crate::error::unsupported("apply_fun"))
     }
 }
 

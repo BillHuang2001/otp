@@ -11,7 +11,7 @@
 //! primitives here (`set_x`/`y`/`push_frame`/`pop_frame`/`pop_frame_checked`/
 //! `trim`/`continuation`) are its building blocks.
 
-use beam_common::Result;
+use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, Result};
 use beam_loader::{Atom, Label, Module};
 use beam_term::Eterm;
 
@@ -60,6 +60,31 @@ pub(crate) struct Frame {
     pub(crate) y_count: u32,
 }
 
+/// One entry of the machine's exception catch-frame stack.
+///
+/// `try Frame Fail` / `catch Frame Fail` push one of these (the handler's
+/// `(func, pc)` target plus the catch-frame term the program keeps in `frame`);
+/// `try_end`/`catch_end` pop it. The exception layer
+/// ([`crate::families::exceptions`]) consults the stack to turn a raise into a
+/// `Step::Goto` to the handler, without touching `crate::interpreter`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CatchFrame {
+    /// The function index (into [`Module::functions`]) of the handler.
+    pub func: u32,
+    /// The code offset of the handler within that function.
+    pub pc: u32,
+    /// The catch-frame term the handler reads from its `Frame` operand.
+    pub frame: Eterm,
+}
+
+impl CatchFrame {
+    /// A catch frame resuming at `pc` in the function at index `func`, carrying
+    /// the catch-frame term `frame`.
+    pub fn new(func: u32, pc: u32, frame: Eterm) -> CatchFrame {
+        CatchFrame { func, pc, frame }
+    }
+}
+
 /// Process-state core: x-register file, Erlang stack and call-frame stack.
 pub struct Machine {
     /// The X-register file (`x[0..max_register)`); the engine's argument/result file.
@@ -76,6 +101,14 @@ pub struct Machine {
     pub(crate) stack: Vec<Eterm>,
     /// The call-frame stack (innermost last).
     pub(crate) frames: Vec<Frame>,
+    /// The exception catch-frame stack (innermost last).
+    ///
+    /// Pushed by `try`/`catch`, popped by `try_end`/`catch_end` (see
+    /// [`CatchFrame`]); empty until the exception family executes those opcodes.
+    pub(crate) catch_frames: Vec<CatchFrame>,
+    /// The pending exception `(class, reason)` recorded by [`Machine::raise`],
+    /// if any.
+    pub(crate) pending_exception: Option<(ExceptionClass, Eterm)>,
     /// The register-file size (a configurable bound, default [`MAX_REGISTER`]).
     pub(crate) max_register: u32,
 }
@@ -93,6 +126,8 @@ impl Machine {
             fr: Vec::new(),
             stack: Vec::new(),
             frames: Vec::new(),
+            catch_frames: Vec::new(),
+            pending_exception: None,
             max_register,
         };
         machine.reset();
@@ -186,6 +221,22 @@ impl Machine {
         self.stack.len()
     }
 
+    /// The number of entries on the exception catch-frame stack.
+    ///
+    /// Introspection mirroring [`Machine::frame_depth`]/[`Machine::stack_depth`];
+    /// the stack is populated by `try`/`catch` (see [`Machine::push_catch_frame`]).
+    pub fn catch_frame_depth(&self) -> usize {
+        self.catch_frames.len()
+    }
+
+    /// The pending exception `(class, reason)`, if a raise has been recorded.
+    ///
+    /// Set by [`Machine::raise`]; a host can inspect it after a run propagates a
+    /// raise. `None` when no raise has been recorded.
+    pub fn pending_exception(&self) -> Option<(ExceptionClass, Eterm)> {
+        self.pending_exception
+    }
+
     /// Reset to the initial state: a fresh (NIL-filled) register file and empty
     /// stack and frame stacks.
     pub fn reset(&mut self) {
@@ -196,6 +247,8 @@ impl Machine {
             .resize(MAX_FLOAT_REGISTER as usize, Eterm::default());
         self.stack.clear();
         self.frames.clear();
+        self.catch_frames.clear();
+        self.pending_exception = None;
     }
 
     /// Write `v` into X register `n`.
@@ -326,6 +379,44 @@ impl Machine {
         let new_len = self.stack.len() - n_usize;
         self.stack.truncate(new_len);
         Ok(())
+    }
+
+    // -----------------------------------------------------------------------
+    // Exception scaffolding (the shared state the `families::exceptions` bodies use)
+    // -----------------------------------------------------------------------
+
+    /// Push a catch frame (the `try`/`catch` handler target).
+    pub fn push_catch_frame(&mut self, frame: CatchFrame) {
+        self.catch_frames.push(frame);
+    }
+
+    /// Pop the innermost catch frame, if any.
+    pub fn pop_catch_frame(&mut self) -> Option<CatchFrame> {
+        self.catch_frames.pop()
+    }
+
+    /// Raise a BEAM `error` exception with `reason`.
+    ///
+    /// Records the pending exception (`class = Error`, `reason`) so the exception
+    /// layer can consult the catch-frame stack, and returns the typed
+    /// [`BeamError`] the caller propagates.
+    ///
+    /// **Milestone-1 honesty:** `beam_common::BeamError` cannot carry a *compound*
+    /// (tuple) reason — its [`ExitReason::Structured`] variant deliberately holds
+    /// no term, because `beam_common` has no term dependency — so the returned
+    /// error carries `Raise(error, ExitReason::Structured)` and the live reason
+    /// term lives in [`Machine::pending_exception`]. No `try`/`catch` unwinding
+    /// exists yet, so `raise` always returns the error immediately; the exception
+    /// family will fold a caught raise into a `Step::Goto` to the handler.
+    pub fn raise(&mut self, reason: Eterm) -> BeamError {
+        self.raise_with(ExceptionClass::Error, reason)
+    }
+
+    /// Like [`Machine::raise`], but with an explicit exception `class`
+    /// (`error`/`exit`/`throw`).
+    pub fn raise_with(&mut self, class: ExceptionClass, reason: Eterm) -> BeamError {
+        self.pending_exception = Some((class, reason));
+        BeamError::Raise(Raise::new(class, ExitReason::Structured))
     }
 }
 
