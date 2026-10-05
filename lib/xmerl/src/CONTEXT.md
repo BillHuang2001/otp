@@ -51,7 +51,8 @@ Undocumented (`-moduledoc false`) support modules, grouped by role — see Modul
 - The `clean` target does not remove `xmerl_xsd_re_parse.erl`, so that generated file can survive a `make clean` and be picked up by a stale build; remove it manually when the regex grammar changes.
 - `release_spec` installs only `xmerl_xpath_parse.yrl` and `xmerl_b64Bin.yrl` (plus `.erl`, internal `.hrl`, `.app.src`, `.appup.src`); `xmerl_xsd_re_parse.yrl` and all `*.erlsrc` files are absent from an installed release, so the SAX parser and XSD regex never get rebuilt from a release tree.
 - `xmerl_xpath.erl` re-declares `#state{context, acc}` locally instead of including the identically-defined `../include/xmerl_xpath.hrl`; that header is used only by `xmerl_xpath_pred.erl`, so the two copies must be kept manually identical.
-- `xmerl_simple`, `xmerl_sax_old_dom`, `xmerl_sax_simple_dom`, `xmerl_html`, `xmerl_text`, `xmerl_sgml`/`xmerl_otpsgml` and `xmerl_xlate` are not referenced by any other OTP application (only `../test/xmerl_sax_SUITE` uses `xmerl_sax_old_dom`); they are user-facing legacy surface, so treat them as frozen rather than dead code.
+- `xmerl_simple`, `xmerl_sax_old_dom` (used only by `../test/xmerl_sax_SUITE`), `xmerl_sax_simple_dom`, `xmerl_text`, `xmerl_sgml`/`xmerl_otpsgml` and `xmerl_xlate` are not referenced by any other OTP application's code; they are user-facing legacy surface, so treat them as frozen rather than dead code.
+- `xmerl_html` is load-bearing for `../edoc`: `edoc_layout`/`edoc_macros` set it as `DEFAULT_XML_EXPORT` and `edoc_doclet` calls `xmerl:export_simple(..., xmerl_html, [])`, so its tag callbacks and `'#root#'` output shape cannot change lightly.
 - `xmerl_internal.hrl` defines only the `?dbg`/`?DBG` macros (a no-op unless `debug` is defined) despite its "Records" section header — it is included by most modules for those macros, not for types.
 
 ## Notes for Agents
