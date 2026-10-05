@@ -8,7 +8,7 @@ Nothing here is compiled or installed; the files are developer/CI-facing configu
 ## API Surface
 - `erl-xcomp.conf.template` — master template. Contains every supported variable, commented out, with per-variable semantics, defaults and warnings. It doubles as user documentation. Copy it, uncomment what you need, and pass the copy to `otp_build configure --xcomp-conf=<FILE>`. `--xcomp-conf` is an `otp_build`-only argument: plain `configure` rejects it, so a direct `./configure` run must instead be given each variable as a `VAR=VALUE` argument or environment variable.
 - `erl-xcomp-vars.sh` — defines the single shell variable `erl_xcomp_vars` (19 names). `otp_build` sources this to know which variables to translate into `--<var>=<value>` `configure` arguments.
-- `README.md` — 5 lines; only points to `HOWTO/INSTALL-CROSS.md`.
+- `README.md` — short; only points to `HOWTO/INSTALL-CROSS.md`.
 - `erl-xcomp-<target>.conf` (17 files) — ready-made configs, each the template with a few lines uncommented. Naming is loose: some are `<cpu>-<os>` (e.g. `erl-xcomp-mips-linux.conf`), some add vendor/abi (e.g. `erl-xcomp-armv8-rpi3-linux-gnueabihf.conf`), some are tool-version-named (`erl-xcomp-TileraMDE2.0-tilepro.conf`), one is dynamic (`erl-xcomp-host-iossimulator.conf`, uses `` `arch` ``).
 
 ## How cross compilation is driven
