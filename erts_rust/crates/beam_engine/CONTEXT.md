@@ -220,9 +220,11 @@ pub trait ExecutionContext {
 - `src/machine.rs` → `Machine`: x-register file, Erlang stack, call frames, `run_export`/`run_label`, `Continuation`
 - `src/operand.rs` → `Operand` read (→ `Eterm`) / write (register or Y slot) + unsupported-operand errors
 - `src/interpreter.rs` → the dispatch loop (`impl Machine`): one arm per `Instr` variant, jump/return/allocate/trim semantics
+- `src/predicates.rs` → the crate's **only** `#[allow(unsafe_code)]` module: SAFETY-annotated wrappers over the `unsafe fn` `beam_term` boxed-term predicates (`is_integer`, `is_tuple`, `is_map`, …) used by the `Test` opcodes
 - `src/jit.rs` → JIT tier stubs + tiering design (Cranelift behind `jit-cranelift`, default off)
 - `src/error.rs` → engine error constructors over `beam_common::BeamError` (`unsupported`, `bad_register`, `unknown_label`)
 - `tests/slice.rs` → vertical-slice integration test over the `beam_loader` slice fixture
+- `tests/opcodes.rs` → synthetic-module tests for the opcodes the fixture does not reach (every `TestKind`, `SelectVal`, frame/call/`Deallocate`/`Trim`, `call_ext*`, error paths); a comprehensive test module, legitimately long
 - `../beam_loader/CONTEXT.md` → the frozen IR this crate consumes (read it fully; do not restate)
 - `../../erts/emulator/beam/emu/{instrs,macros,bif_instrs,select_instrs}.tab` + `beam_emu.c`, `beam_common.c` → ground-truth instruction semantics (read-only)
 - `../../erts/emulator/beam/emu/ops.tab`, `../../lib/compiler/src/genop.tab` → opcode roster / transforms (read-only)
