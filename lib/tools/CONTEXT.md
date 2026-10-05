@@ -42,7 +42,7 @@ Public tool modules (`src/`): `cover` (line coverage), `xref` (cross-reference A
 - `src/` → all tool modules (`cover`, `xref`+internals, profilers, `crashdump`, `make`, `tags`, app resources)
 - `test/` → Common Test suites and `*_SUITE_data/` fixtures for every tool
 - `doc/` → ExDoc config `docs.exs`, `guides/` chapters, `references/erlang.el.md`, release notes `notes.md`, `assets/`+`src/` figures
-- `emacs/` → Erlang Emacs mode (`erlang.el` and friends), its README, internal SGML doc, `tags` man page
+- `emacs/` → Erlang Emacs mode (`erlang.el` and friends), its README, internal SGML doc, plus the stale `tags.3`/`tags.erl` symlink no Makefile installs
 - `examples/` → `xref_examples.erl` usage example (installed as documentation)
 - `priv/` → `styles.css` for `cover` HTML reports
 - `ebin/` → build output only (`.gitignore` tracked); never edit
