@@ -55,7 +55,8 @@
 //! beam_info!("starting {} schedulers", 4);
 //! beam_warn!("this line is suppressed");
 //! beam_error!("and so is this one");
-//! ```#![forbid(unsafe_code)]
+//! ```
+#![forbid(unsafe_code)]
 #![deny(missing_docs)]
 #![warn(rustdoc::broken_intra_doc_links)]
 
