@@ -217,6 +217,32 @@ arrangement is `[BinRef(3)][ErlSubBits(5)]` with the tagged root at `hp + 3` (th
   payload's **first data byte** (the off-heap object header is `beam_alloc`'s concern);
   `ErlSubBits.orig` is a term (a boxed `BinRef`, or an on-heap bitstring for a match context); the 8
   words are moved/copied together with `orig` fixed up to the new `BinRef` address.
+
+### `map.rs` — flat map + HAMT/CHAMP builder, lookups, structural size
+The crate's second frozen interior: the Erlang **map**. A map is a boxed `MAP_SUBTAG` term in one of
+two shapes (ground truth `../../erts/emulator/beam/erl_map.h`, `erl_map.c`):
+a **flat map** (`MAP_HEADER_FLATMAP`, written by [`thing.rs`](#thingrs--off-heap-term-materialization))
+for ≤ [`MAP_SMALL_MAP_LIMIT`] pairs, else a **hash map** — a 16-way (`4` hash bits/level,
+`HAMT_MAX_LEVEL = 16`) compressed hash-array-mapped trie. Trie node layouts (frozen, exactly what
+`beam_gc::copy::move_size` sizes): head-array `[hdr][size][16 slots]` (18 words), head-bitmap
+`[hdr(bmp)][size][n slots]` (`2+n`), inner bitmap `[hdr(bmp)][n slots]` (`1+n`), collision node = a
+`make_arityval(n)` tuple of `n` key/value cons cells. One **term per slot**: a leaf cons cell, a
+pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) = (hash >> (4*(15-L)))
+& 0xF` (MSB nibble indexes the root).
+- `pub const MAP_SMALL_MAP_LIMIT: usize = 32;` (`erl_map.h:96`); `pub const HAMT_MAX_LEVEL: usize = 16;`
+- `pub const fn make_map_header(map_type, arity, val) -> Eterm` (`MAKE_MAP_HEADER`);
+  `pub const fn map_words_capacity(n_pairs) -> usize` (exact for a flat map, sound upper bound for a
+  hash map).
+- `unsafe write_map(hp, pairs: &[(Eterm,Eterm)], atoms) -> TermResult<Eterm>` — dedups (last value
+  wins), canonical order, flat map when ≤ limit else a hash map; leaves + trie are laid out in
+  canonical (hash-then-`cmp`) order so the buffer is insertion-order free.
+- `map_size(t, atoms) -> TermResult<usize>`, `map_get(t, key, atoms) -> TermResult<Option<Eterm>>`,
+  `map_pairs(t, atoms) -> TermResult<Vec<(Eterm,Eterm)>>` (sorted by [`compare::cmp`]),
+  `unsafe map_put(hp, t, key, val, atoms)` / `unsafe map_remove(hp, t, key, atoms)` (functional).
+- `pub(crate) map_pairs_flatmap_order(t, atoms)` — pairs in internal flat-map key order (the order
+  `compare`/`hashing` use so a flat map and a hash map of the same pairs present identically).
+- Non-boxed / non-map terms yield `TermError::BadMap` (never a deref of an immediate).
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
