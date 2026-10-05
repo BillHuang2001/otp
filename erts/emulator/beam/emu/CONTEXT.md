@@ -1,0 +1,84 @@
+# erts/emulator/beam/emu/ — BEAM interpreter (`FLAVOR=emu`)
+
+## Intent
+The portable C execution engine of the BEAM VM — the "emu" flavor.
+It interprets the specific BEAM instructions produced by the loader on any compiler/CPU, so it is the fallback when BeamAsm JIT is unavailable and it is the *reference* implementation that `../jit/{x86,arm}/` must stay semantically equal to.
+It also owns the emu-flavor half of the module loader (the other half is the flavor-independent `../beam_load.c`).
+Crucially, almost no instruction semantics live in hand-written C: each instruction's body is authored in the `.tab` files here and textually expanded into `beam_emu.c` by `../../utils/beam_makeops -jit no` at build time.
+
+## API Surface
+What this directory provides to the rest of the VM:
+
+- `process_main(ErtsSchedulerData*)` (`beam_emu.c`) — the interpreter loop. It is entered twice: with `NULL` once from `init_emulator()` during startup (fills `beam_ops`, installs BIFs, returns) and afterwards with a scheduler data pointer, from which it never returns while running BEAM code. Declared in `../global.h`; `process_main` for the JIT flavor lives in `../jit/beam_jit_main.cpp`.
+- `init_emulator()` — one-time initialisation entry, called from `../erl_init.c`; both flavors must provide it.
+- `beam_ops` (`void**`) — opcode number → C label jump table, declared in `../erl_vm.h`; used through the `BeamOpCodeAddr()` macro. Only populated when the computed-goto jump table is in use.
+- Named instruction addresses stored in processes/exports by other VM code: `beam_run_process`, `beam_normal_exit`, `beam_exit`, `beam_continue_exit`, `beam_i_line_breakpoint_cleanup`, `beam_finish_create_record`, `beam_return_to_trace`, `beam_return_trace`, `beam_exception_trace`, `beam_call_trace_return`, and `beam_unloaded_fun`. `beam_run_process` is declared in `../beam_common.h`. The JIT flavor defines the same set, and `../erl_vm.h` uses them with `#ifdef BEAMASM` variants — keep both flavors in sync when adding a "magic" code pointer.
+- `erts_beam_jump_table()` (`../global.h`) — 1 for the emu flavor unless built with `NO_JUMP_TABLE`; surfaces through `erlang:system_info(...)`.
+- `erts_prepare_bs_construct_fail_info()` (`../global.h`) — builds the extended bit-syntax construction error term; implemented only here and called from `bs_instrs.tab`.
+- Loader entry points in `emu_load.c`, declared in `../beam_load.h` and called by the shared loader (`../beam_load.c`): `beam_load_prepare_emit`, `beam_load_emit_op`, `beam_load_finish_emit`, `beam_load_finalize_code`, `beam_load_prepared_free`/`beam_load_prepared_dtor`, `beam_load_new_label`, `beam_load_purge_aux` (a deliberate no-op here — only the JIT owns coverage tables).
+- `load.h` — the emu `LoaderState` (`struct LoaderState_`) plus `Label`/`LabelPatch`/`Literal`/`LiteralPatch`/`StringPatch`/`LambdaPatch`/`LineInstr`. `../beam_load.h` includes this file instead of `../jit/load.h` when `BEAMASM` is not defined.
+- The `.tab` contract with `../../utils/beam_makeops`: given `lib/compiler/src/genop.tab`, `../predicates.tab`, `../generators.tab` and the `.tab` files of this directory (in that order), `beam_makeops -jit no` emits `beam_opcodes.c`, `beam_opcodes.h` and `beam_hot.h`/`beam_warm.h`/`beam_cold.h` into `$(TTF_DIR)` (`erts/emulator/<target>/<TYPE>/emu/`), which `beam_emu.c` and `emu_load.c` `#include`.
+
+## Constraints
+- Instruction semantics go into `.tab` macro bodies, not into new C files here. `beam_emu.c` deliberately holds only the loop skeleton (register variables, dispatch, context switch, error handling, init), and `emu_load.c` only the loader. The Makefile compiles exactly `beam/emu/*.c` (`BEAM_SRC += $(wildcard beam/emu/*.c)` when `FLAVOR=emu`); do not add further `.c` files without updating `../Makefile.in`.
+- Every `.tab` change that alters instruction semantics must be mirrored in `../jit/x86/instr_*.cpp` **and** `../jit/arm/instr_*.cpp`; a new/changed opcode normally also touches `lib/compiler/src/genop.tab`, `../generators.tab`, `../predicates.tab`, `../emu/ops.tab`, the matching `../emu/*_instrs.tab` and both `../jit/<arch>/ops.tab`.
+- Never edit the generated `beam_opcodes.{c,h}` / `beam_hot.h` / `beam_warm.h` / `beam_cold.h`; they are build artifacts in `$(TTF_DIR)`, not in git.
+- `.tab` file syntax: a line starting with `#` is a beam_makeops comment, `//` is a C/C++ comment (and also carries codegen directives such as `//| -no_next`); each file starts with `// -*- c -*-` for Emacs; macro definitions must start in column 0, the `{` must be on the head line and the closing `}` in column 0; macro arguments are referenced with `$`. Bodies are real C pasted into `process_main`, so `#ifdef` of `config.h` symbols (e.g. `HAVE_OVERFLOW_CHECK_BUILTINS`) is legal inside a body, while `%if ARCH_64` / `%unused` / `%hot` / `%warm` / `%cold` are beam_makeops directives.
+- Do not add `#include`s to `.tab` bodies: they are expanded inside `process_main`, whose include list in `beam_emu.c` is the available C context (add a header there if a new API is needed).
+- `../beam_load.h` requires `beam_load_emit_op` to return 1/0 (0 = load error reported through `BeamLoadError*`); the emu loader relies on `BeamLoadError*` macros that `goto load_error` inside `beam_load_emit_op`.
+
+## Design Decisions
+- **Table-driven, shared with the compiler.** The same `.tab` machinery and the same `genop.tab` that define the external generic opcodes for `lib/compiler` also produce the interpreter's code, so the runtime is always compiled against exactly the instruction set the compiler emits. `beam_makeops` sorts the specific instructions so the most specific operand types are tried first (`move_nx` before `move_cx`) and can emit a packing program that squeezes several operands into one code word.
+- **Textual inclusion into `process_main`.** `beam_hot.h` is included where the hot instructions fall through the dispatch loop, `beam_warm.h` and `beam_cold.h` are included earlier in the function; that is why all instruction bodies are macros and why they can use `reg`, `HTOP`, `E`, `I`, `FCALLS`, `c_p` directly. `%hot`/`%warm`/`%cold` in `ops.tab` is purely a code-layout (i-cache / branch locality) choice.
+- **Dispatch.** Normally computed goto on GCC/Clang label addresses (`OpCase`/`Goto`/`VALID_INSTR` macros); `NO_JUMP_TABLE` switches to `switch (Go)` with `case op_*`, and is forced for the `debug`, `valgrind` and `gcov` emulator types (`../Makefile.in` `TYPE_FLAGS`). `beam_ops` is only initialised for the jump-table build. `erts_emulator_type=icount` (`ERTS_OPCODE_COUNTER_SUPPORT`) uses the counting-opcode array instead.
+- **Factoring.** `ops.tab` = declarations and transformations only (no bodies); `predicates.tab` = `pred.*` load-time pattern tests; `generators.tab` = `gen.*` functions that build/replace instructions whose concrete form depends on operand values (the JIT has its own, simpler generators in `../jit/$(JIT_ARCH)/generators.tab`); `macros.tab` = reusable primitives with no instruction of its own (`GC_REGEXP`, `FAIL`/`JUMP`, `GC_TEST`/`GC_TEST_PRESERVE`, `AH`, `DISPATCH*`, `RETURN`, `BADARG`, `BIF_ERROR_ARITY_*`); `instrs.tab` plus the topical `*_instrs.tab` files hold the instruction bodies.
+- **Combined instructions** keep both code size and speed: a family of specific instructions is assembled from shared *fragments*, and `name := frag1.frag2.step;` lines define which fragments form which instruction (e.g. `i_bif1 := i_bif.fetch0.call`, the `select_val*` and `wait` chains). The instruction body then runs several fragments back to back without dispatching.
+- **GC cooperation** is centralised in the macros: every allocating instruction uses `AH`/`GC_TEST`/`GC_TEST_PRESERVE`, and calls that may GC swap the interpreter's cached registers out of `process_main` and back (`SWAPOUT`/`SWAPIN`, plus the `HEAP_TOP`-only `LIGHT_SWAPOUT`/`LIGHT_SWAPIN` variants and `HEAVY_SWAPOUT`/`HEAVY_SWAPIN` around calls that release the main lock). `GC_REGEXP` in `macros.tab` lets beam_makeops verify that such instructions use `$REFRESH_GEN_DEST()` where required.
+- **`FLAVOR` and `TYPE`.** `FLAVOR=emu` is selected automatically when configure's `JIT_ENABLED` is not `yes`, or explicitly with `make FLAVOR=emu`; it sets `OMIT_OMIT_FP=no` (emu C code is built with `-fomit-frame-pointer`, unlike the JIT which needs frame pointers) and the emu `OPCODE_TABLES` list. `TYPE=debug|valgrind|asan|gcov|gprof|icount|lcnt` are the ways to exercise this code with sanitizers/profilers.
+
+## Known Issues / Gotchas
+- Which `.tab` defines what: `ops.tab` — specific-instruction operand signatures (`move x x`), generic→generic transformation rules, rewrites to loader-only `i_*` instructions, `%hot/%warm/%cold` placement, `FORBIDDEN_TYPES=h`, `%if ARCH_64`; `predicates.tab` — `pred.*`; `generators.tab` — `gen.*`; `macros.tab` — macros only; `instrs.tab` — the bulk (stack/allocate, moves, calls/apply, returns, element/tuple/list access, try/catch and exceptions, jumps and comparisons); `arith_instrs.tab` — arithmetic incl. out-lined `erts_<op>` helpers and bignum paths; `bif_instrs.tab` — guard-BIF calls, `i_bif*` trapping, `call_light_bif*`, NIF calls (`nif_bif`) and `i_load_nif`; `bs_instrs.tab` — the whole bit-syntax construct/match engine (largest file, has the only `%if ARCH_64` bodies); `float_instrs.tab` — `fload`/`fstore`/`fconv`/float arithmetic; `map_instrs.tab` — map operations; `msg_instrs.tab` — `i_loop_rec`, `remove_message`, `wait*`, timeout and receive markers; `select_instrs.tab` — `select_val*`/tuple-arity binary searches built from combined fragments; `trace_instrs.tab` — `return_trace`, call trace return, breakpoints, `i_yield`/`i_hibernate`, perf counter.
+- `ops.tab` here is **not** shared with the JIT; it mirrors `../jit/$(JIT_ARCH)/ops.tab` and the two must be edited together when an opcode changes (JIT commits typically touch `emu/ops.tab` *and* both `jit/x86/ops.tab` and `jit/arm/ops.tab`). They are intentionally not identical: the emu version translates `init_yregs` back into explicit `i_init*` instructions, keeps `int_func_start`/`int_func_end`/`i_nif_padding`, the line-breakpoint instructions `i_disabled_line_breakpoint`/`i_enabled_line_breakpoint`/`i_line_breakpoint_cleanup`, and forbids `h` (the JIT also forbids `Q` and uses `aligned_label`/`i_func_label` instead of `label`).
+- A clean checkout contains no generated code: `beam_opcodes.c/h`, `beam_hot.h`, `beam_warm.h`, `beam_cold.h` exist only under `$(TTF_DIR)` after `make`; "missing" C symbols such as `op_move_xx` or `beam_hot.h` are generated there.
+- `beam_emu.c` is a single, deliberately huge function: the comment at its top explains that `OpCase` label alignment was tried and rejected (~5% slower). Helper code that must not be inlined into the loop is `ERTS_NOINLINE`.
+- `beam_load_purge_aux()` is empty here on purpose (only the JIT allocates coverage arrays); do not copy the JIT version.
+- `BEAM_WIDE_SHIFT`/`BEAM_WIDE_MASK` are emitted by `beam_makeops` and used by the operand *packing* engine and by label patching; the engine is still live, although the related "pack into the instruction word" (CODE_MODEL_SMALL) feature was removed, so `#if defined(BEAM_WIDE_SHIFT)` branches inside `emu_load.c` are around packing only.
+- The interpreter and the JIT are separate *binaries* selected at build time, not a runtime switch inside one binary: `erlang:system_info(emu_flavor)` is compiled in via `BEAMASM` (`../erl_bif_info.c`). `erl -emu_flavor emu` requires a `beam.emu` executable, i.e. an extra `make FLAVOR=emu` in a JIT-configured tree (`HOWTO/DEVELOPMENT.md`); in a tree configured with `JIT_ENABLED=no` the emu flavor is the primary and the binary is `bin/beam.smp`.
+
+## Notes for Agents
+- Read `../../internal_doc/beam_makeops.md` before touching any `.tab` file: it documents the pattern/transformation syntax, `pred.*`/`gen.*`, codegen directives (`-no_next`, `-no_prefetch`), `$NEXT_INSTRUCTION`, `$IP_ADJUSTMENT`, `$REFRESH_GEN_DEST()`, variable-operand (`*`) handling and combined instructions with worked examples drawn from these very files.
+- `../../internal_doc/BeamAsm.md` describes the JIT side and where the two implementations must agree.
+- To work on this code: build with `make FLAVOR=emu` (add `TYPE=debug` for assertions, `TYPE=valgrind|asan` for memory checking) and run the result with `erl -emu_flavor emu`; `erlang:system_info(emu_flavor)` confirms which engine you are on.
+- `../../internal_doc/CountingInstructions.md`, `GarbageCollection.md`, `Tracing.md` and `ProcessManagementOptimizations.md` explain the invariants the macros in `macros.tab` rely on.
+- Cross-flavor changes are the norm here, not the exception: expect one logical change to touch `genop.tab`, both `ops.tab`s, `generators.tab`, the emu `*_instrs.tab` and the jit `instr_*.cpp`.
+
+## Dependencies
+- Perl (to run `../../utils/beam_makeops`), GNU make, a C compiler; the generated headers land in the configured build directory, so the tree must be configured before this directory compiles.
+- The `.tab` bodies are C code compiled with the emulator's flags; they depend on the emulator C API (`erts_garbage_collect_nobump`, `erts_gc_*`, `erts_*_bif`, `erl_bits.h`, `erl_map.h`, …) and on `config.h` symbols such as `HAVE_OVERFLOW_CHECK_BUILTINS`.
+- `%if ARCH_64` / `wordsize` decisions come from `beam_makeops` (`-wordsize @EXTERNAL_WORD_SIZE@`), not from `config.h`.
+
+## Test Strategy
+- No test suites live in this directory. The VM suites in `../../test/` (≈100 `*_SUITE.erl`: `bs_*_SUITE`, `map_SUITE`, `guard_SUITE`, `nif_SUITE`, `process_SUITE`, `trace_*_SUITE`, …) are the testbed for this code and are meant to pass on **both** flavors.
+- A few suites branch on `erlang:system_info(emu_flavor)`: `../../test/jit_SUITE.erl` skips everything on emu, while `../../test/erl_debugger_SUITE.erl`, `../../test/native_record_SUITE.erl` and `../../test/bs_match_int_SUITE.erl` record emu-specific behaviour — check these when changing emu-only instructions.
+- Compiler-side tests (`lib/compiler/test/`) cover the other half of the `.tab` contract (assembler/disassembler round-trips).
+- `make TYPE=debug FLAVOR=emu` (assertions, `NO_JUMP_TABLE`) and `TYPE=valgrind|asan` are the intended ways to shake out bugs in interpreter C code; `TYPE=icount` enables the opcode counters used by `../../internal_doc/CountingInstructions.md`.
+- Level tests: `../../` (emulator level) and root-level `make test` both run the suites with whichever flavor the tree is configured for; run them once per flavor when the change is flavor-sensitive.
+
+## Routing Table
+- `beam_emu.c` → interpreter loop, dispatch macros, BIF installation, emu-only helpers (`erts_beam_jump_table`, `erts_prepare_bs_construct_fail_info`)
+- `emu_load.c`, `load.h` → emu loader: generic→specific emission, operand validation/packing, label/literal/string/lambda patching, line table, code finalization
+- `ops.tab` → instruction declarations, transformation rules, hot/warm/cold placement
+- `predicates.tab` → `pred.*` load-time predicates; `generators.tab` → `gen.*` instruction constructors
+- `macros.tab` → shared interpreter macros (no instruction of its own)
+- `instrs.tab`, `arith_instrs.tab`, `bif_instrs.tab`, `bs_instrs.tab`, `float_instrs.tab`, `map_instrs.tab`, `msg_instrs.tab`, `select_instrs.tab`, `trace_instrs.tab` → instruction bodies by area
+- `../jit/` → the BeamAsm JIT (`x86/`, `arm/` `ops.tab`, `predicates.tab`, `generators.tab`, `instr_*.cpp`, `process_main.cpp`, `asm_load.c`) that must stay semantically equivalent to this directory (sibling — read-only, escalate writes to the parent)
+- `../` → flavor-independent VM: `beam_load.c` (shared loader), `beam_load.h` (loader interface + `BEAMASM` selection of `load.h`), `generators.tab`/`predicates.tab` (shared), `erl_vm.h`, `global.h`, `bif.tab`, term/process/GC code (sibling — read-only)
+- `../../utils/beam_makeops` → the generator that consumes these `.tab` files (sibling — read-only)
+- `../../internal_doc/beam_makeops.md`, `BeamAsm.md`, `CountingInstructions.md`, `GarbageCollection.md`, `Tracing.md` → authoritative design docs for this code (sibling — read-only)
+- `../../test/` → the VM test suites that exercise both flavors (sibling — read-only)
+- `../../../Makefile.in` → `FLAVOR`/`TYPE` selection and the `OPCODE_TABLES`/`beam_makeops` build rules for this directory
+
+## See Also
+- `../beam_load.h` + `../beam_load.c` → the flavor-independent loader that drives `emu_load.c`; `emit_op`/`prepare_emit`/`finish_emit`/`finalize_code` form the contract between the two.
+- `../beam_common.h`, `../erl_vm.h` → declarations of the `beam_*` special instruction addresses and `BeamOpCodeAddr`.
+- `lib/compiler/src/genop.tab` → stable external opcode numbers shared by the compiler and this interpreter.

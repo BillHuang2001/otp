@@ -1,0 +1,80 @@
+# erts/emulator/beam/jit/ — BeamAsm, the Erlang JIT
+
+## Intent
+BeamAsm: load-time conversion of BEAM instructions into native machine code, replacing the interpreter's `process_main` dispatch loop.
+The loader still parses/optimizes each module as for the interpreter, but instead of writing `BeamInstr` code it calls in here, which emits x86-64 or AArch64 via the vendored asmjit library.
+Only compiled when `FLAVOR=jit` (the default when `configure` reports `JIT_ENABLED=yes`, i.e. 64-bit x86/aarch64 with a C++17 compiler); otherwise `FLAVOR=emu` builds the interpreter and this directory is not compiled at all.
+This directory is the source for BOTH backends plus the arch-independent glue; `../emu/` is the parallel interpreter implementation.
+
+## API Surface
+The rest of the emulator interacts with BeamAsm through two contracts:
+
+- **C interface (`beam_asm.h`, guarded by `#if defined(BEAMASM)`)** — the only entry points called from the flat/generic emulator code (mostly `asm_load.c`, `beam_load.c`):
+  `beamasm_init`, `beamasm_new_assembler`, `beamasm_emit`, `beamasm_emit_coverage`, `beamasm_codegen`, `beamasm_register_metadata`/`beamasm_unregister_metadata`, `beamasm_delete_assembler`, `beamasm_get_code`/`_lambda`/`_rodata`/`_header`/`_base`/`_offset`/`_on_load`, `beamasm_embed_rodata`/`_bss`, `beamasm_patch_catches`/`_import`/`_literal`/`_lambda`/`_strings`, `beamasm_emit_call_nif`, `beamasm_seal_module`/`beamasm_unseal_module`, `beamasm_flush_icache`, `beamasm_purge_module`, `beamasm_is_line_breakpoint_trampoline`.
+  `beam_asm.h` also defines the inlined breakpoint-trampoline helpers (`erts_asm_bp_get_flags`/`_enable`/`_disable`/`_set_flag`/`_unset_flag`) and the per-arch prologue constants `BEAM_ASM_FUNC_PROLOGUE_SIZE` / `BEAM_ASM_NFUNC_SIZE`; all are arch-conditional (`__aarch64__`).
+- **Process-main entry point `process_main(ErtsSchedulerData *)`** (defined in `beam_jit_main.cpp`) — the JIT-flavor replacement for the interpreter's scheduler loop.
+- **Runtime helpers called from generated code (`beam_jit_common.hpp`, implemented in `beam_jit_common.cpp`)** — ordinary C functions the emitted native code `call`s: `beam_jit_call_bif`, `beam_jit_call_nif`, `beam_jit_load_nif`, `beam_jit_get_map_elements`, `beam_jit_bs_init_bits`/`_get_integer`/`_bit_size`/`_put_binary_all`/`_construct_fail_info`, `beam_jit_decode_dist`, `beam_jit_remove_message`, `beam_jit_int128_to_big`, `beam_jit_take_receive_lock`/`wait_locked`/`wait_unlocked`/`wait_timeout`/`timeout`, `beam_jit_return_to_trace`, `beam_jit_build_argument_list`, `beam_jit_handle_unloaded_fun`, `beam_jit_is_list_of_immediates`, `beam_jit_is_shallow_boxed`. These are the seam where the JIT touches the generic runtime.
+- **Opcode-table contract with `../../utils/beam_makeops`** — invoked with `-jit yes`, it reads `$(JIT_ARCH)/ops.tab|predicates.tab|generators.tab` (plus the shared `../ops.tab|predicates.tab|generators.tab`) and emits:
+  - `$(TTF_DIR)/beamasm_emit.h` — a `switch (specific_op)` that calls `emit_<opname>(args[i], ...)`; included by `$(JIT_ARCH)/beam_asm_module.cpp`.
+  - `$(TTF_DIR)/beamasm_protos.h` — `void emit_<opname>(const ArgXRegister&, ...)` prototypes; included by `$(JIT_ARCH)/beam_asm.hpp`.
+  - `beam_opcodes.{c,h}` with the `opc[]` table used by `BeamModuleAssembler::emit`.
+  An instruction therefore only works if `ops.tab` names it AND a matching `emit_<name>` method exists (name is derived from the op, not chosen freely).
+- **Generated global-fragment header** — `$(TTF_DIR)/beam_asm_global.hpp` is produced by `perl $(JIT_ARCH)/beam_asm_global.hpp.pl`; it declares the `BeamGlobalAssembler::GlobalLabels` enum, the `labelNames`/`emitPtrs` maps and the `get_*()` accessors, and is included by `$(JIT_ARCH)/beam_asm.hpp`.
+- **`load.h`** — `LoaderState_` (the JIT/loader shared state struct, incl. the opaque `void *ba` assembler handle) and `Label`/`LineInstr`.
+
+## Constraints
+- Arch-specific code MUST live in `x86/` or `arm/`; the top-level `.cpp`/`.hpp` are arch-independent and compiled for both flavors. Only the configured `$(JIT_ARCH)` backend is compiled (sources taken from `beam/jit/$(JIT_ARCH)/*.cpp`); `-Ibeam/jit -Ibeam/jit/$(JIT_ARCH)` is added to includes for `FLAVOR=jit`.
+- Both backends must stay functionally in sync: they have the SAME set of `instr_*.cpp` files and parallel `ops.tab`/`predicates.tab`/`generators.tab`, and any new instruction must be implemented for x86 and arm.
+- This is the ONLY clang-formatted part of the emulator; `clang-format` runs over exactly `beam/jit/*.hpp *.c *.h *.cpp` and `beam/jit/*/*.cpp */*.hpp`, configured by the checked-in `.clang-format` (LLVM-based, 4-space indent, 80 columns, 8-space continuation).
+- New instructions are added in the `.tab` files + a new `emit_<name>` method; do NOT hand-write dispatch tables.
+- Do not create a third backend directory ad hoc; a new architecture needs asmjit support and passing `JIT_ARCH`/`JIT_ENABLED` detection in `../Makefile.in`/configure.
+- Requires a C++17 compiler; the emulator uses asmjit's Assembler API only (a small subset).
+
+## Design Decisions
+- **C++ + asmjit rather than hand-written codegen**: asmjit offers ~1:1 C++→asm mapping and abstracts x86/AArch64 encoding, letting one instruction be one `emit_*` method that calls `a.mov(...)`, `a.jmp(...)`, etc. asmjit is a static lib built from the vendored copy (see Dependencies).
+- **Shared `BeamGlobalAssembler` fragments** are the main code-size lever: common sequences (GC, dispatch/return, error raising, export trampoline, breakpoint trampolines, NIF calls) are emitted ONCE per VM and jumped to from every module, keeping loaded-code size ~10% above the interpreter. `beam_jit_main.cpp` owns the single `bga`/`bma`/`jit_allocator` instances and also builds a tiny "erts_beamasm" module for the special instruction targets (`beam_run_process`, `beam_exit`, `beam_export_trampoline`, ...).
+- **Static register allocation**: x/y/x-float state lives in the `ErtsSchedulerRegisters` struct pointed at by a fixed callee-saved register (x86: `rbx`), with `rbp`/`r12`–`r15` holding stack/ptr/reductions/heap/etc.; caller-saved regs are scratch. See `../../internal_doc/BeamAsm.md`.
+- **`beam_jit_register_cache.hpp`** — a small, templated `RegisterCache<Size, Mem, Reg>` that avoids reloading BEAM x/y registers already resident in machine registers within a straight-line sequence; instantiated per-arch (x86: 20 entries, temporaries list, `registers`/`E` bases; arm: 16 entries, `scheduler_registers`/`E` bases). `preserve_cache`/`load_cached`/`store_cache`/`mov_preserve_cache` in `$(JIT_ARCH)/beam_asm.hpp` are the guarded accessors.
+- **`beam_jit_types.hpp`** — a type-safe `BeamTypeId` (`enum class`) wrapper over `beam_types.h` BFs, with `static_assert`s that reject overlapping/ambiguous type-mask usage (`always_one_of`, `exact_type`, `masked_types`). These drive per-instruction specialization from the loader's type info.
+- **Bit syntax is arch-independent and shared**: `beam_jit_bs.hpp/.cpp` implement the segment analysis/optimization (`BscSegment` for construction, `BsmSegment` for matching, `beam_jit_bsc_init/_combine_segments`, `beam_jit_bsm_init`, `beam_jit_opt_bsm_segments`) that each backend's `instr_bs.cpp` consumes and turns into native sequences.
+- **W^X-safe code memory**: `JitAllocator` allocates dual-mapped (executable + writable alias) memory by default; `beamasm_seal_module`/`unseal_module` switch protection and `+JMsingle` / valgrind / Apple-aarch64 force single-mapped RWX. `beamasm_flush_icache` handles per-OS/per-arch I-cache invalidation (manual on aarch64 GNU/Linux, `sys_icache_invalidate` on Apple, `FlushInstructionCache` on Windows).
+- **Breakpoints / NIF loading via a per-function trampoline**: instead of rewriting an instruction as the interpreter does, each function starts with a short-jump/NOP that can be rerouted (by patching one byte/word) to a shared fragment; see `beam_asm.h`.
+
+## Known Issues / Gotchas
+- **Generated — do not edit**: `beam_asm_global.hpp` (from `$JIT_ARCH/beam_asm_global.hpp.pl`), `beamasm_emit.h`, `beamasm_protos.h`, `beam_opcodes.{c,h}`, `beam_hot/warm/cold.h` are produced by `beam_makeops`/perl into `$(TTF_DIR)`. Edit the `.tab`/`.pl` sources, never the output.
+- `beam_asm_global.cpp` includes `beam_asm_global.hpp` twice-once via a macro trick: it `#define ERTS_BEAM_ASM_GLOBAL_WANT_STATIC_DEFS` before including `beam_asm.hpp` so the static map definitions are emitted in this TU only.
+- `../../internal_doc/BeamAsm.md` "Description of each file" lists `$ARCH/beam_asm.cpp` — that file does NOT exist; init and the C↔C++ interface live in the top-level `beam_jit_main.cpp`. The doc's file list is otherwise a good map.
+- Cross-compilation copies ALL asmjit headers into `$(TTF_DIR)/asmjit/` and compiles beam/jit sources with a precompiled header (`-x c++-header -include $(TTF_DIR)/asmjit/core.h`); `ASMJIT_PCH_OBJ`/`ASMJIT_PCH_SRC` rules are in `../Makefile.in`. Missing/renamed asmjit headers break this PCH path.
+- x86 and arm diverge in real ways: arm needs veneers (`bind_veneer_target`) for out-of-range branches, has its own `ops.tab` entries, and its `BeamAssembler::GetArgReg`/register set differs; a naive copy between backends can be wrong.
+- x86 `ops.tab` sets `FORBIDDEN_TYPES=hQ`; also `h`/`q` type operands are never allowed in specific ops. The `.tab` files use the shared beam_makeops mini-language (`=>`, `|`, predicates, `gen.*` generators, `$NewBeamOp` etc.).
+- `emit_*` methods use asmjit `Label`s plus a fragment resolution mechanism (`resolve_fragment`, `_dispatchTable` thunks mapping `void(*)()` fragments to labels); calling a raw C function is done via `runtime_call<...>()` which also handles the enter/leave-runtime stack swap and (for x86) the simulated ABI.
+- `ERTS_JIT_ABI_WIN32` can be defined on non-Windows to emit Windows-convention calls, which is the supported way to debug Windows-JIT-only bugs on Linux.
+- Breakpoint-trampoline patching does exact opcode asserts (e.g. x86 `0xEB 0x06 0x90 0xE8`); changing prologue emission without updating `beam_asm.h` breaks tracing/NIF loading.
+- The `x86/` and `arm/` opcode encodings differ for the same logical instruction, so pass/fail of one backend says nothing about the other — both must be tested.
+
+## Dependencies
+- **asmjit**, vendored at `../../asmjit/` (built as a static lib); pinned commit in `../../asmjit.version` (`5fe1940275d04432da841896bac0a66cc2375551`). Built with `ASMJIT_EMBED=1 -DASMJIT_STATIC=1 -DASMJIT_NO_BUILDER -DASMJIT_NO_COMPILER -DASMJIT_NO_UJIT -DASMJIT_NO_DEPRECATED -DASMJIT_NO_FOREIGN`.
+- A C++17 compiler and a 64-bit x86-64 or aarch64 target; two ABIs supported (System V and Win32).
+- Optional: Linux `perf` (via `HAVE_LINUX_PERF_SUPPORT`, enabled by `+JPperf`), GDB JIT interface (`__jit_debug_register_code`, non-Windows/non-Apple), valgrind/asan flavors.
+
+## Test Strategy
+- There are NO tests inside this directory; they live in `../../test/` (erts/emulator/test).
+- `../../test/jit_SUITE.erl` covers JIT-specific machinery: `perf` group (symbols, perf-map/annotate, `+JPperf` perf-directory handling), `+JMsingle`, named labels; it skips unless `erlang:system_info(emu_flavor) == jit`.
+- Differential JIT-vs-interpreter testing is done by running the general emulator suites under both flavors via `-emu_flavor emu` / `erlang:system_flag(emu_flavor, ...)` (see e.g. `bs_match_int_SUITE`, `native_record_SUITE`, `erl_debugger_SUITE`).
+- Exercise C-level JIT paths with `TYPE=debug` (+ `JIT_HARD_DEBUG`), `TYPE=valgrind`, `TYPE=asan`; ``make FLAVOR=emu`` / `--disable-jit` builds the interpreter for comparison, and both flavors can coexist.
+
+## See Also
+- `../../internal_doc/BeamAsm.md` — authoritative design doc (loading, register map, shared fragments, tracing/NIF trampolines, W^X, `perf`).
+- `../../internal_doc/beam_makeops.md` and `../../utils/beam_makeops` — the `.tab` language and the `-jit yes` glue generation.
+- `../CONTEXT.md` — the flat beam/ sources (loader, `beam_load.c`, `beam_file.*`) that call into this directory.
+- `../emu/CONTEXT.md` — the interpreter, the counterpart implementation of every instruction.
+
+## Routing Table
+- `x86/` → x86-64 backend: `ops.tab`/`predicates.tab`/`generators.tab`, `beam_asm.hpp`, `beam_asm_module.cpp`, `beam_asm_global.cpp`(+`.hpp.pl`), `process_main.cpp`, `instr_*.cpp`
+- `arm/` → AArch64 backend: same file layout as `x86/` (parallel implementation, separate `ops.tab`)
+- `../emu/` (sibling) → the interpreter; each JIT instruction has a counterpart here (read-only, escalate writes to parent)
+- `../` (sibling, parent-owned) → flat emulator/loader sources that call `beam_asm.h` and consume the generated tables (read-only)
+- `../../asmjit/` → vendored asmjit library (build dependency; not this node)
+- `../../utils/beam_makeops` → generates `beamasm_emit.h`/`beamasm_protos.h`/`beam_opcodes.*` from the `.tab` files
+- `../../test/` → JIT test suites (`jit_SUITE.erl`, flavor-differential emulator suites)
+- `../../internal_doc/BeamAsm.md` → design documentation for this subsystem
