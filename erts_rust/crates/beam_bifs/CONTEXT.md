@@ -208,6 +208,21 @@ caller's heap (they alias table storage in `beam_ets`). Small and documented; se
 - Per-module `#[cfg(test)]` unit tests, plus `tests/` integration tests; the crate builds a
   `BifContext` over a real `beam_alloc::Heap` + a seeded `AtomTable` (intern the well-known atoms
   `true`, `false`, `ok`, …) and a `BytesSink` capture.
+- **`tests/` integration suite** (public API only — `beam_bifs::*` plus the declared dependency
+  crates):
+  - `tests/registry.rs` — the `BifRegistry` seam: `default_registry()` registers **exactly** the 54
+    core-BIF keys (`len() == 54`, `names()` compared against the roster built and sorted in the
+    test), a fresh registry is empty, `register` returns the replaced impl, `lookup` is exact on
+    `(module, function, arity)`, and `call` reports an unknown BIF (`undef` raise) and a bad arity
+    (`BadArity`).
+  - `tests/erlang_bifs.rs` — the `erlang`/`erts_internal` BIFs driven through `call` (arithmetic,
+    comparison incl. `1 == 1.0` vs `1 =:= 1.0` and `erts_internal:cmp_term/2`, type tests incl.
+    `is_list([])`, term ops incl. their `badarg` cases), `self/0` + `send/2` (the `SendHook` seam and
+    the `unsupported_bif` case), the raise BIFs (`error/exit/throw` classes) and the public reason
+    mapping (`exit_reason_from_term`/`reason_term_from_exit_reason`).
+  - `tests/io_ets.rs` — `io:format` **exact captured bytes** through a `BytesSink`
+    (`"~p~n"` ⇒ `{a,1}\n`, `"~w ~s ~b~n"` ⇒ `[97,98,99] a 255\n`), `~d`/`~x` ⇒ `BadArg`, and the
+    `ets:new/insert/lookup/delete` round-trip over a real `TableRegistry` (structural `compare::eq`).
 - **Required M1 evidence (the gate):**
   - `registry`: a hit returns the fn; a miss is `None`; `call` of an unknown BIF / a wrong arity errors;
     `with_core_bifs` registers every name in the list above (`names()` contains them).
