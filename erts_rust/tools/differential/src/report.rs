@@ -1,9 +1,12 @@
 //! Machine-readable reports: a stable JSON schema plus a human rendering.
 //!
-//! The JSON schema is versioned by the `schema` field ([`SCHEMA`]) and only ever grows;
-//! every key is always present (a value that does not apply is `null`) so consumers can
-//! rely on the shape. Reports are written under the crate's gitignored `out/` directory
-//! unless `--out <dir>` overrides it.
+//! The JSON schema is versioned by the `schema` field ([`SCHEMA`]) and only ever grows.
+//! An observable that does not apply is `null` (`stdout`/`stdout_hex`/`exit_code` for a
+//! side that did not run, `matched_golden` where no golden was asserted), and the two
+//! optional keys are omitted rather than guessed: `reason` only appears for an
+//! `unsupported` side and `matched_golden` only where a golden was actually checked.
+//! Reports are written under the crate's gitignored `out/` directory unless `--out <dir>`
+//! overrides it.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -200,7 +203,8 @@ impl CaseReport {
 pub struct SideReport {
     /// Whether the side ran at all.
     pub available: bool,
-    /// Why the side did not run (`null` when it ran).
+    /// Why the side did not run (key omitted when the side ran).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub reason: Option<String>,
     /// Captured stdout as text (`null` when the side did not run).
     pub stdout: Option<String>,
@@ -208,8 +212,9 @@ pub struct SideReport {
     pub stdout_hex: Option<String>,
     /// The process exit code (`null` when the side did not run, or when signalled).
     pub exit_code: Option<i32>,
-    /// Whether the oracle reproduced the case golden (`null` when no golden was asserted,
-    /// or for the Rust side).
+    /// Whether the observation reproduced the case golden (key omitted when no golden was
+    /// asserted, and for the Rust side).
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub matched_golden: Option<bool>,
 }
 
@@ -515,13 +520,24 @@ mod tests {
     }
 
     #[test]
-    fn matched_golden_is_absent_when_no_golden_was_asserted() {
+    fn optional_side_keys_are_omitted_rather_than_guessed() {
         let report = report(Verdict::Unsupported, SideResult::unsupported("no beam_rt"), None);
         let json: serde_json::Value = serde_json::from_str(&report.to_json_string().unwrap()).unwrap();
-        assert_eq!(
-            json["cases"][0]["oracle"]["matched_golden"],
-            serde_json::Value::Null
+        let oracle = &json["cases"][0]["oracle"];
+        assert!(
+            oracle.get("matched_golden").is_none(),
+            "no golden was asserted: {oracle}"
         );
+        assert!(oracle.get("reason").is_none(), "the oracle ran: {oracle}");
+        let rust = &json["cases"][0]["rust"];
+        assert_eq!(rust["available"], false);
+        assert!(rust["reason"].as_str().unwrap().contains("beam_rt"));
+        assert!(
+            rust.get("matched_golden").is_none(),
+            "the Rust side never checks a golden: {rust}"
+        );
+        assert!(rust["stdout"].is_null(), "{rust}");
+        assert!(rust["exit_code"].is_null(), "{rust}");
     }
 
     #[test]
