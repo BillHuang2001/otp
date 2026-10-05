@@ -15,3 +15,15 @@ use beam_common::BeamError;
 pub(crate) fn badarg() -> BeamError {
     BeamError::BadArg
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn badarg_is_the_badarg_error() {
+        assert!(matches!(badarg(), BeamError::BadArg));
+        // The workspace error type reports the BEAM error atom for it.
+        assert_eq!(badarg().as_atom(), Some("badarg"));
+    }
+}
