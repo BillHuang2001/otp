@@ -54,7 +54,9 @@ fn object(heap: &mut Heap, k: i64, v: Eterm, w: i64) -> Eterm {
 
 /// `[ {Head, Guards, Body} ]` for a single clause.
 fn spec1(heap: &mut Heap, head: Eterm, guards: &[Eterm], body: &[Eterm]) -> Eterm {
-    let clause = tup(heap, &[head, list(heap, guards), list(heap, body)]);
+    let guard_list = list(heap, guards);
+    let body_list = list(heap, body);
+    let clause = tup(heap, &[head, guard_list, body_list]);
     list(heap, &[clause])
 }
 
@@ -359,14 +361,10 @@ fn multi_clause_first_match_wins() {
         .unwrap();
 
     let head_one = tup(&mut heap, &[make_small(1), at(&atoms, "_")]);
-    let first = tup(
-        &mut heap,
-        &[head_one, NIL, list(&mut heap, &[at(&atoms, "ok")])],
-    );
-    let second = tup(
-        &mut heap,
-        &[at(&atoms, "_"), NIL, list(&mut heap, &[at(&atoms, "x")])],
-    );
+    let ok_body = list(&mut heap, &[at(&atoms, "ok")]);
+    let first = tup(&mut heap, &[head_one, NIL, ok_body]);
+    let x_body = list(&mut heap, &[at(&atoms, "x")]);
+    let second = tup(&mut heap, &[at(&atoms, "_"), NIL, x_body]);
     let spec = compile(list(&mut heap, &[first, second]), &atoms).unwrap();
     let got = table.select(&spec, &atoms, &mut heap).unwrap();
     assert_eq!(got.len(), 2);
@@ -377,38 +375,6 @@ fn multi_clause_first_match_wins() {
 // ---------------------------------------------------------------------------
 // Bodies
 // ---------------------------------------------------------------------------
-
-#[test]
-fn construct_body_builds_a_fresh_tuple() {
-    // erl: body `[{{'$1','$2'}}]` yields `{K,V}` per object.
-    let atoms = atoms();
-    let mut heap = Heap::new(8192).expect("test heap");
-    let mut table = new_table(TableKind::OrderedSet);
-    table
-        .insert(tup(&mut heap, &[make_small(1), make_small(10)]), &atoms)
-        .unwrap();
-    table
-        .insert(tup(&mut heap, &[make_small(2), make_small(20)]), &atoms)
-        .unwrap();
-
-    let inner = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
-    let wrapped = tup(&mut heap, &[inner]);
-    let body = list(&mut heap, &[wrapped]);
-    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
-    let spec = compile(spec1(&mut heap, head, &[], &[body]).into_term(&mut heap), &atoms);
-    let _ = spec;
-}
-
-// `spec1` takes a slice of body elements; the construct form above needs a single
-// element, so the test above builds the spec directly instead.
-trait IntoTerm {
-    fn into_term(self, heap: &mut Heap) -> Eterm;
-}
-impl IntoTerm for Eterm {
-    fn into_term(self, _heap: &mut Heap) -> Eterm {
-        self
-    }
-}
 
 #[test]
 fn construct_body_result_values() {
@@ -498,9 +464,12 @@ fn select_delete_and_count_only_act_on_a_true_body_result() {
     assert_eq!(table.size(), 1);
     assert!(table.member(make_small(1), &atoms));
     // The deleted objects' table-owned storage is reclaimed (`TermStore::free`).
+    // `Table::memory` is `TermStore::words` (the *live* word count, which `free`
+    // lowers) plus the interior's index storage — `0` for an `ordered_set` — so two
+    // deletions strictly shrink the figure rather than merely not growing it.
     assert!(
-        table.memory() <= before,
-        "deleting must not grow the table's storage"
+        table.memory() < before,
+        "deleting must reclaim the removed objects' storage"
     );
 
     // A non-`true` body result never deletes (it is not `[true]`).
@@ -523,10 +492,8 @@ fn a_nested_list_guard_never_matches() {
         .unwrap();
     let inner = list(&mut heap, &[at(&atoms, "true")]);
     let guards = list(&mut heap, &[inner]);
-    let clause = tup(
-        &mut heap,
-        &[at(&atoms, "_"), guards, list(&mut heap, &[at(&atoms, "$_")])],
-    );
+    let body = list(&mut heap, &[at(&atoms, "$_")]);
+    let clause = tup(&mut heap, &[at(&atoms, "_"), guards, body]);
     let spec = compile(list(&mut heap, &[clause]), &atoms).unwrap();
     assert!(table.select(&spec, &atoms, &mut heap).unwrap().is_empty());
 }
@@ -651,50 +618,29 @@ fn malformed_specs_are_badarg() {
     // An unknown guard call (`erl` -> badarg).
     let guard = tup(&mut heap, &[at(&atoms, "is_foo"), at(&atoms, "$1")]);
     let head = tup(&mut heap, &[at(&atoms, "$1")]);
-    let clause = tup(
-        &mut heap,
-        &[head, list(&mut heap, &[guard]), list(&mut heap, &[at(&atoms, "$_")])],
-    );
+    let guard_list = list(&mut heap, &[guard]);
+    let body_list = list(&mut heap, &[at(&atoms, "$_")]);
+    let clause = tup(&mut heap, &[head, guard_list, body_list]);
     assert!(matches!(
         compile(list(&mut heap, &[clause]), &atoms),
         Err(BeamError::BadArg)
     ));
 
     // An unbound `'$N'` in the body (`erl` -> badarg).
-    let clause = tup(
-        &mut heap,
-        &[at(&mut atoms_head(), "_"), NIL, list(&mut heap, &[make_small(0)])],
-    );
-    let _ = clause;
-    let clause = tup(
-        &mut heap,
-        &[
-            at(&atoms, "_"),
-            NIL,
-            list(&mut heap, &[at(&atoms, "$2")]),
-        ],
-    );
+    let body_list = list(&mut heap, &[at(&atoms, "$2")]);
+    let clause = tup(&mut heap, &[at(&atoms, "_"), NIL, body_list]);
     assert!(matches!(
         compile(list(&mut heap, &[clause]), &atoms),
         Err(BeamError::BadArg)
     ));
 
     // A bare tuple body element is a *call*, not a tuple (`erl` -> badarg).
-    let body = list(&mut heap, &[tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")])]);
-    let clause = tup(
-        &mut heap,
-        &[
-            tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]),
-            NIL,
-            body,
-        ],
-    );
+    let body_tuple = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let body = list(&mut heap, &[body_tuple]);
+    let head = tup(&mut heap, &[at(&atoms, "$1"), at(&atoms, "$2")]);
+    let clause = tup(&mut heap, &[head, NIL, body]);
     assert!(matches!(
         compile(list(&mut heap, &[clause]), &atoms),
         Err(BeamError::BadArg)
     ));
-}
-
-fn atoms_head() -> AtomTable {
-    atoms()
 }
