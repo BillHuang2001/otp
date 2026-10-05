@@ -133,9 +133,15 @@ pub trait ExecutionContext {
 - **Frozen term layout**: term construction/inspection is **only** `beam_term`
   (`use beam_term::prelude::*;`). Comparison uses `beam_term::{cmp, eq, cmp_arith}` — the engine
   never reimplements term ordering.
-- **`unsafe`** should be **unnecessary** (registers/stack are safe `Vec<Eterm>` indexing). If any is
-  needed it is confined to a marked module with a `# Safety`/`// SAFETY:` rationale;
-  `unsafe_op_in_unsafe_fn` stays clean.
+- **`unsafe` is confined to one helper module.** The `beam_term` boxed-term predicates the
+  `Test`/`test_arity` opcodes need (`is_integer`, `is_number`, `is_float`, `is_tuple`,
+  `is_tuple_arity`, `is_map`, `is_binary`, `is_bitstring`, `is_internal_ref`,
+  `is_external_pid`/`_port`/`_ref`) are **`unsafe fn`** because they dereference a term's header
+  word — there is no safe classifier. The crate is therefore `#![deny(unsafe_code)]` and
+  `src/predicates.rs` is its **only** `#[allow(unsafe_code)]` module: a small set of wrappers, each
+  with a `// SAFETY:` rationale (the term is a live machine word — an immediate is handled by the
+  safe fast path first; a boxed term comes from `ctx.call_bif`/machine state, never unvalidated raw
+  memory). Registers/stack stay safe `Vec<Eterm>` indexing; `unsafe_op_in_unsafe_fn` stays clean.
 - **Deps:** `beam_common`, `beam_term`, `beam_loader` (+ `libc`); **`cranelift-*` are optional**
   behind the `jit-cranelift` feature (default off). Adding a dependency edge/size change is reported
   to the crate-layer node (`../`).
