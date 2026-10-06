@@ -1,17 +1,20 @@
 //! The `LitT` chunk: the static-literal table.
 //!
-//! Layout: `u32 uncompressed_size` (`0` ⇒ the payload is stored verbatim;
-//! non-zero ⇒ zlib/deflate), then `i32 count` × `{ i32 ext_size, ext_size bytes }`
-//! where each payload is Erlang external-term bytes (an ETF-encoded literal).
+//! Layout: `u32 uncompressed_size`, then the literal record table
+//! `i32 count` × `{ i32 ext_size, ext_size bytes }` where each payload is Erlang
+//! external-term bytes (an ETF-encoded literal).
+//!
+//! `uncompressed_size == 0` means the record table is stored verbatim (OTP 28 and
+//! later, `parse_decompressed_literals`); non-zero means the **rest of the chunk** is
+//! a zlib (RFC 1950) stream that inflates to exactly `uncompressed_size` bytes of
+//! record table (`beam_file.c:parse_literal_chunk`). Inflating reuses
+//! [`beam_codec::compress::decompress`] (which bounds the output at 32 MiB), so no
+//! zlib dependency is added here.
 //!
 //! This module owns the *framing*: it returns the raw ETF payloads in
 //! `Operand::Literal(idx)` index order. [`crate::literal::LiteralArea`] decodes them
 //! into real terms at load time (reachable through
 //! [`Module::literal`](crate::ir::Module::literal)).
-//!
-//! The **compressed** form (`uncompressed_size != 0`) is unsupported (there is no
-//! zlib dependency) and yields a clear `BeamError::BadArg` (see the crate
-//! `CONTEXT.md`, "Known Issues").
 use beam_common::Result;
 
 use crate::error::bad_file;
@@ -19,18 +22,36 @@ use crate::error::bad_file;
 /// Parses a `LitT` chunk payload into its literal payloads (raw ETF bytes).
 ///
 /// The returned vector has one entry per literal, in `Operand::Literal(idx)` index
-/// order. A compressed chunk or a truncated entry yields `BeamError::BadArg`.
+/// order. A corrupt/truncated zlib stream, a declared `uncompressed_size` that
+/// disagrees with the inflated length, or a truncated literal record yields
+/// `BeamError::BadArg`.
 pub fn parse(data: &[u8]) -> Result<Vec<Vec<u8>>> {
     let mut reader = beam_codec::Reader::new(data);
 
-    // A non-zero `uncompressed_size` means the payload is zlib/deflate compressed,
-    // which M1 does not support (there is no zlib dependency). Refuse it explicitly
-    // rather than mis-parsing compressed bytes as literal records.
+    // `0` ⇒ the record table follows verbatim; non-zero ⇒ the remaining bytes are a
+    // zlib stream inflating to exactly that many bytes (`beam_file.c:1485-1506`).
     let uncompressed_size = reader.u32be()?;
-    if uncompressed_size != 0 {
-        return Err(bad_file("compressed LitT chunk is unsupported"));
+    if uncompressed_size == 0 {
+        return parse_records(&mut reader);
     }
 
+    // Inflate the rest of the chunk. `decompress` caps the output at 32 MiB and maps
+    // any zlib error to `BadArg`, so a hostile stream can neither over-allocate nor
+    // be mis-parsed as literal records.
+    let inflated = beam_codec::compress::decompress(reader.rest())?;
+    if inflated.len() != uncompressed_size as usize {
+        return Err(bad_file("LitT uncompressed size mismatch"));
+    }
+
+    let mut inflated_reader = beam_codec::Reader::new(&inflated);
+    parse_records(&mut inflated_reader)
+}
+
+/// Parses the literal record table `i32 count × { i32 ext_size, ext_size bytes }`.
+///
+/// Shared by the verbatim and the inflated paths; the reader must be positioned at
+/// the start of the record table.
+fn parse_records(reader: &mut beam_codec::Reader<'_>) -> Result<Vec<Vec<u8>>> {
     let raw_count = reader.u32be()? as i32;
     if raw_count < 0 {
         return Err(bad_file("negative literal count"));
@@ -54,18 +75,36 @@ pub fn parse(data: &[u8]) -> Result<Vec<Vec<u8>>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_codec::compress::{compress, MAX_UNCOMPRESSED};
     use beam_common::BeamError;
 
-    /// Builds a `LitT` chunk from `uncompressed_size` and `(ext_size, payload)`
-    /// records.
-    fn lit_bytes(uncompressed_size: u32, records: &[(u32, &[u8])]) -> Vec<u8> {
+    /// Builds the uncompressed record table `i32 count × { i32 ext_size, payload }`.
+    fn record_table(records: &[(u32, &[u8])]) -> Vec<u8> {
         let mut data = Vec::new();
-        data.extend_from_slice(&uncompressed_size.to_be_bytes());
         data.extend_from_slice(&(records.len() as u32).to_be_bytes());
         for (size, payload) in records {
             data.extend_from_slice(&size.to_be_bytes());
             data.extend_from_slice(payload);
         }
+        data
+    }
+
+    /// Builds a verbatim `LitT` chunk from `uncompressed_size` and the records.
+    fn lit_bytes(uncompressed_size: u32, records: &[(u32, &[u8])]) -> Vec<u8> {
+        let mut data = Vec::new();
+        data.extend_from_slice(&uncompressed_size.to_be_bytes());
+        data.extend_from_slice(&record_table(records));
+        data
+    }
+
+    /// Builds a compressed `LitT` chunk: the correct `uncompressed_size` followed by
+    /// the zlib stream of the record table.
+    fn compressed_lit_bytes(records: &[(u32, &[u8])], level: u8) -> Vec<u8> {
+        let table = record_table(records);
+        let packed = compress(&table, level).unwrap();
+        let mut data = Vec::new();
+        data.extend_from_slice(&(table.len() as u32).to_be_bytes());
+        data.extend_from_slice(&packed);
         data
     }
 
@@ -82,8 +121,78 @@ mod tests {
     }
 
     #[test]
-    fn compressed_chunk_is_rejected() {
+    fn compressed_chunk_parses_to_the_same_records() {
+        let records: &[(u32, &[u8])] = &[
+            (3, &[1, 2, 3]),
+            (2, &[9, 8]),
+            (0, &[]),
+            (5, &[0xFF, 0x00, 0x7F, 0x80, 0x01]),
+        ];
+        let verbatim = parse(&lit_bytes(0, records)).unwrap();
+        assert_eq!(verbatim, vec![
+            vec![1, 2, 3],
+            vec![9, 8],
+            vec![],
+            vec![0xFF, 0x00, 0x7F, 0x80, 0x01],
+        ]);
+        // Every compression level must inflate to byte-identical records.
+        for level in 0..=9u8 {
+            let data = compressed_lit_bytes(records, level);
+            assert_eq!(parse(&data).unwrap(), verbatim, "level {level}");
+        }
+    }
+
+    #[test]
+    fn compressed_empty_table_round_trips() {
+        let data = compressed_lit_bytes(&[], 6);
+        assert!(parse(&data).unwrap().is_empty());
+    }
+
+    #[test]
+    fn compressed_chunk_with_a_large_repetitive_payload_round_trips() {
+        // A payload large enough to span several deflate blocks, so the inflate loop
+        // in `decompress` runs more than once.
+        let payload = vec![b'A'; 100_000];
+        let data = compressed_lit_bytes(&[(payload.len() as u32, &payload)], 6);
+        assert_eq!(parse(&data).unwrap(), vec![payload]);
+    }
+
+    #[test]
+    fn corrupt_compressed_stream_is_rejected() {
+        // `uncompressed_size != 0` but the body is not a zlib stream.
         let err = parse(&lit_bytes(42, &[])).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+
+        // A truncated valid stream is rejected too (never a panic).
+        let mut data = compressed_lit_bytes(&[(3, &[1, 2, 3])], 6);
+        data.truncate(data.len() - 4);
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn uncompressed_size_disagreeing_with_the_inflated_length_is_rejected() {
+        let table = record_table(&[(3, &[1, 2, 3])]);
+        let packed = compress(&table, 6).unwrap();
+
+        // Declared one byte too large and one byte too small: both are `BadArg`.
+        for declared in [table.len() as u32 + 1, table.len() as u32 - 1] {
+            let mut data = declared.to_be_bytes().to_vec();
+            data.extend_from_slice(&packed);
+            let err = parse(&data).unwrap_err();
+            assert!(matches!(err, BeamError::BadArg), "declared {declared}");
+        }
+    }
+
+    #[test]
+    fn declared_size_over_the_decompress_bound_is_rejected() {
+        // A zlib stream of a single-byte table but a declared size above the 32 MiB
+        // output cap: the mismatch is caught without any unbounded allocation.
+        let table = record_table(&[(1, &[7])]);
+        let packed = compress(&table, 6).unwrap();
+        let mut data = (MAX_UNCOMPRESSED as u32 + 1).to_be_bytes().to_vec();
+        data.extend_from_slice(&packed);
+        let err = parse(&data).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
     }
 
@@ -91,6 +200,19 @@ mod tests {
     fn negative_count_is_rejected() {
         let mut data = 0u32.to_be_bytes().to_vec();
         data.extend_from_slice(&(-1i32).to_be_bytes());
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn negative_count_inside_a_compressed_table_is_rejected() {
+        // The inflated table itself is malformed: this must be caught by the shared
+        // record-table parser, not by a separate code path.
+        let mut table = Vec::new();
+        table.extend_from_slice(&(-1i32).to_be_bytes());
+        let packed = compress(&table, 6).unwrap();
+        let mut data = (table.len() as u32).to_be_bytes().to_vec();
+        data.extend_from_slice(&packed);
         let err = parse(&data).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
     }
@@ -111,6 +233,19 @@ mod tests {
         data.extend_from_slice(&1u32.to_be_bytes());
         data.extend_from_slice(&4i32.to_be_bytes());
         data.extend_from_slice(&[1, 2]);
+        let err = parse(&data).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn truncated_literal_inside_a_compressed_table_is_rejected() {
+        let mut table = Vec::new();
+        table.extend_from_slice(&1u32.to_be_bytes());
+        table.extend_from_slice(&4i32.to_be_bytes());
+        table.extend_from_slice(&[1, 2]);
+        let packed = compress(&table, 6).unwrap();
+        let mut data = (table.len() as u32).to_be_bytes().to_vec();
+        data.extend_from_slice(&packed);
         let err = parse(&data).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
     }
