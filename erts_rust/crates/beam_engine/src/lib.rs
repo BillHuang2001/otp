@@ -15,8 +15,11 @@
 //! interpreter is the reference tier and
 //! [`Machine::run_export`] remains its default entry point.
 //!
-//! The native backends are **not built yet**: `BaselineJit` currently routes to the
-//! interpreter (correct results, no codegen) and `Cranelift` is a typed
+//! The **native baseline tier is built** ([`jit::baseline`]): each basic block is
+//! lowered to a real x86-64 `extern "C"` function and an export runs through a
+//! driver loop that deopts to one interpreter step per instruction it does not
+//! lower natively. The **optional Cranelift hot tier is built too**, behind the
+//! default-off `jit-cranelift` feature; with the feature off `Cranelift` is a typed
 //! `unsupported` error rather than a silent fallback. [`jit::JitBackend`] is the
 //! trait those backends implement (`compile` a [`beam_loader::Module`] into their
 //! own artifact, `run_export` it on a [`Machine`]); Cranelift stays off the
@@ -56,10 +59,11 @@
 //! boxed-term predicates (`unsafe fn` because they dereference a header word) and
 //! `terms` is the crate's single point of raw-heap term construction/reading
 //! behind the [`ExecutionContext::alloc_words`] seam — both allowed where they are
-//! declared below. Two more modules carry a module-local `#![allow(unsafe_code)]`:
-//! `families::bitstrings::raw` (the frozen bitstring layouts) and [`jit::emitter`]
-//! (the baseline JIT's x86-64 encoder and the crate's only executable-memory
-//! mapping — see that module for its W^X policy).
+//! declared below. A further set of modules carry a module-local
+//! `#![allow(unsafe_code)]`: `families::bitstrings::raw` (the frozen bitstring
+//! layouts), [`jit::emitter`] (the x86-64 encoder and the crate's only
+//! executable-memory mapping — see that module for its W^X policy), the baseline
+//! backend (`jit::baseline`), and the feature-gated `jit::cranelift`.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
