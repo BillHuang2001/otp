@@ -302,7 +302,7 @@ impl Table {
   order-independent hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
   `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 60 ETS tests + 18 select
   tests.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 61 cases
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 76 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
