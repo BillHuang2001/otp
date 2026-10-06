@@ -167,7 +167,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 - **`Test` failure semantics**: the test *succeeds* ⇒ fall through; it *fails* ⇒ jump to `fail`, or raise `error::unsupported("test/no_fail")` when `fail == NO_FAIL`.
 - **`Test` comparison kinds**: `IsLt`/`IsGe`/`IsEq`/`IsNe` compare `args[0]` vs `args[1]` with arithmetic equality (`cmp_arith`); `IsEqExact`/`IsNeExact` use exact equality (`cmp`).
 - **`Test` type kinds**: `IsInteger`, `IsFloat`, `IsNumber`, `IsAtom`, `IsPid` (internal or external), `IsReference` (internal or external), `IsPort` (internal or external), `IsNil`, `IsBinary`, `IsBitstr`, `IsList` (`[]` or a cons cell), `IsNonemptyList`, `IsTuple`, `IsMap`, `IsBoolean` (the atom `true`/`false`), `IsFunction`, `IsFunction2` (`args[0]` is a fun of `args[1]` arity), `IsTaggedTuple` (`args[0]` is a tuple of `args[1]` arity whose first element is `args[2]`), `TestArity` (`args[0]` is a tuple of `args[1]` arity).
-- **`NifStart`/`OnLoad` are NOT executed** by the core loop and are claimed by no family, so reaching them yields the documented typed `unsupported` error.
+- **`NifStart`/`OnLoad` are no-op markers** (see the executed subset above).
 
 ### Operand subset — **supported**
 - `X(n)`, `Y(n)` (bounds-checked; out of range → `error::bad_register`).
