@@ -9,16 +9,16 @@
 //! * the [`AtomTable`] (atom construction never invents an index);
 //! * the calling process's [`ProcessId`] — there is no ambient "current process"
 //!   in the Rust core, so identity is injected here;
-//! * four **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
-//!   (`send/2`), a [`TableRegistry`] (`ets:*`) and a [`FunCaller`] (the
-//!   `fun`-taking `lists`/`maps` BIFs). `beam_engine` depends only on
-//!   `beam_loader`, so `beam_rt` supplies the concrete implementations; an unset
-//!   seam means `io:format` writes to stdout and the `send`/`ets`/`call_fun` BIFs
-//!   report `unsupported_bif`.
+//! * five **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
+//!   `fun`-taking `lists`/`maps` BIFs) and a [`PortHook`] (`open_port/2` and the
+//!   port BIFs). `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies
+//!   the concrete implementations; an unset seam means `io:format` writes to stdout
+//!   and the `send`/`ets`/`call_fun`/port BIFs report `unsupported_bif`.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
-use beam_process::ProcessId;
+use beam_process::{PortId, ProcessId};
 use beam_term::prelude::{make_atom, try_make_small};
 use beam_term::{Atom, AtomTable, Eterm, NIL};
 
@@ -140,6 +140,45 @@ pub trait AtomInterner {
     fn intern(&mut self, name: &str) -> Atom;
 }
 
+/// Creates, closes and inspects the runtime's ports.
+///
+/// A port *is* an OS process and a driver (`spawn`/`fd`/…) plus a port table
+/// slot — the Stage-5 machinery that lives in `beam_io`/`beam_rt`, never in a BIF.
+/// The `erlang:open_port/2`/`port_close/1`/`port_info/1,2` BIFs therefore route
+/// every port operation through this hook; `beam_rt` supplies the concrete
+/// implementation over `beam_io` and `beam_process`. Milestone-1 has no such
+/// provider, so those BIFs raise `unsupported_bif` when no hook is installed —
+/// never a fabricated port id and never a silently dropped close
+/// (workspace `CONTEXT.md` §3).
+///
+/// The hook owns argument validation: it is the only side that knows which
+/// `{spawn, …}`/`{spawn_executable, …}`/`{fd, …}` names and option lists its
+/// driver set accepts, and it reports an invalid Name/Options as
+/// [`BeamError::BadArg`].
+pub trait PortHook {
+    /// `open_port(Name, Options)` — creates a port and returns its id.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a Name/Options the installed drivers do not
+    /// accept; a [`BeamError::Raise`] to propagate a failure to the caller.
+    fn open_port(&mut self, name: Eterm, options: Eterm) -> Result<PortId>;
+
+    /// `port_close(Port)` — closes `port`.
+    ///
+    /// # Errors
+    ///
+    /// Reports a close failure as a [`BeamError`].
+    fn close_port(&mut self, port: PortId) -> Result<()>;
+
+    /// The `{Item, Value}` pairs of `port_info(Port)`, in the runtime's order.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port the runtime does not know.
+    fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -150,6 +189,7 @@ pub struct BifContext<'a> {
     tables: Option<&'a mut TableRegistry>,
     interner: Option<&'a mut dyn AtomInterner>,
     fun_caller: Option<&'a mut dyn FunCaller>,
+    port: Option<&'a mut dyn PortHook>,
 }
 
 impl<'a> BifContext<'a> {
@@ -165,6 +205,7 @@ impl<'a> BifContext<'a> {
             tables: None,
             interner: None,
             fun_caller: None,
+            port: None,
         }
     }
 
@@ -195,6 +236,12 @@ impl<'a> BifContext<'a> {
     /// Installs the fun-calling hook used by the `fun`-taking `lists`/`maps` BIFs.
     pub fn with_fun_caller(mut self, caller: &'a mut dyn FunCaller) -> Self {
         self.fun_caller = Some(caller);
+        self
+    }
+
+    /// Installs the port hook used by `open_port/2` and the port BIFs.
+    pub fn with_port_hook(mut self, hook: &'a mut dyn PortHook) -> Self {
+        self.port = Some(hook);
         self
     }
 
@@ -254,6 +301,48 @@ impl<'a> BifContext<'a> {
     pub fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         match self.fun_caller.as_deref_mut() {
             Some(caller) => caller.call_fun(fun, args),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Creates a port through the installed [`PortHook`] — the seam behind
+    /// `erlang:open_port/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure (`badarg` for an unusable Name/Options).
+    pub fn open_port(&mut self, name: Eterm, options: Eterm) -> Result<PortId> {
+        match self.port.as_deref_mut() {
+            Some(hook) => hook.open_port(name, options),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Closes `port` through the installed [`PortHook`] — the seam behind
+    /// `erlang:port_close/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn close_port(&mut self, port: PortId) -> Result<()> {
+        match self.port.as_deref_mut() {
+            Some(hook) => hook.close_port(port),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The `{Item, Value}` pairs of `port` through the installed [`PortHook`] —
+    /// the seam behind `erlang:port_info/1,2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.port.as_deref_mut() {
+            Some(hook) => hook.port_info(port),
             None => Err(crate::error::unsupported_bif()),
         }
     }
@@ -506,5 +595,60 @@ mod tests {
             assert_eq!(crate::access::tuple_element(result, 1), make_small(8));
         }
         assert_eq!(caller.calls, vec![vec![make_small(7), make_small(8)]]);
+    }
+
+    /// A minimal `PortHook` test double: it allocates `PortId::new(11)` for every
+    /// open and answers a fixed pair list from `port_info`.
+    struct StubPorts;
+
+    impl PortHook for StubPorts {
+        fn open_port(&mut self, _name: Eterm, _options: Eterm) -> Result<PortId> {
+            Ok(PortId::new(11))
+        }
+
+        fn close_port(&mut self, _port: PortId) -> Result<()> {
+            Ok(())
+        }
+
+        fn port_info(&mut self, _port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
+            Ok(vec![(make_small(1), make_small(2))])
+        }
+    }
+
+    #[test]
+    fn port_bifs_without_a_hook_are_a_typed_unsupported() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let port = PortId::new(3);
+
+        for result in [
+            ctx.open_port(make_small(1), NIL).map(|_| ()),
+            ctx.close_port(port),
+            ctx.port_info(port).map(|_| ()),
+        ] {
+            match result {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+                    assert_eq!(raise.reason, beam_common::ExitReason::atom("unsupported_bif"));
+                }
+                other => panic!("expected an unsupported_bif raise, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn port_bifs_with_a_hook_delegate() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut hook = StubPorts;
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_port_hook(&mut hook);
+
+        assert_eq!(ctx.open_port(make_small(1), NIL).expect("the hook answers"), PortId::new(11));
+        ctx.close_port(PortId::new(11)).expect("the hook closes");
+        assert_eq!(
+            ctx.port_info(PortId::new(11)).expect("the hook answers"),
+            vec![(make_small(1), make_small(2))]
+        );
     }
 }
