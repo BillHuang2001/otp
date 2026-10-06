@@ -111,7 +111,8 @@ is `decode`'s.
 - Convenience (additive; the existing signatures are unchanged): `pub fn encode_term(Eterm, &AtomTable)`
   (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
   the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
-  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`.
+  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, plus the `LOCAL_EXT` wrapper
+  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`.
 - **Funs are encoded through the classification chain.** `encode` guards the fun family with
   `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
   distinct subtag, so the classification is exact) and routes to the `src/encode/fun.rs` helpers
