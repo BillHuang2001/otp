@@ -102,12 +102,14 @@ pub enum Command {
         /// Exact output file path override.
         out_file: Option<PathBuf>,
     },
-    /// `bench compare <a.json> <b.json> [--json]`.
+    /// `bench compare <a.json> <b.json> [--json]` (two-file), or
+    /// `bench compare <report.json> [--json]` (cross-runtime, `sys` vs `rust` within
+    /// that one report).
     Compare {
-        /// The first report.
+        /// The first report; in one-path mode, the only report.
         a: PathBuf,
-        /// The second report.
-        b: PathBuf,
+        /// The second report, or `None` for the cross-runtime (one-report) mode.
+        b: Option<PathBuf>,
         /// Emit JSON.
         json: bool,
     },
@@ -246,16 +248,22 @@ fn parse_compare(args: &[String]) -> Result<Command> {
             other => positional.push(PathBuf::from(other)),
         }
     }
-    if positional.len() != 2 {
-        return Err(BenchError::usage(
-            "`compare` needs exactly two report paths: compare <a.json> <b.json>",
-        ));
+    match positional.len() {
+        1 => Ok(Command::Compare {
+            a: positional[0].clone(),
+            b: None,
+            json,
+        }),
+        2 => Ok(Command::Compare {
+            a: positional[0].clone(),
+            b: Some(positional[1].clone()),
+            json,
+        }),
+        n => Err(BenchError::usage(format!(
+            "`compare` needs one report (cross-runtime sys vs rust) or two reports \
+             (a.json b.json); got {n}"
+        ))),
     }
-    Ok(Command::Compare {
-        a: positional[0].clone(),
-        b: positional[1].clone(),
-        json,
-    })
 }
 
 /// Parses `--repo <id>=<path>` into its `(id, path)` pair.
@@ -293,7 +301,7 @@ pub fn usage() -> String {
          \x20 list      List workloads, their categories/contracts and probe status\n\
          \x20 run       Run workloads and write a JSON report\n\
          \x20 baseline  Measure the system-ERTS baseline only\n\
-         \x20 compare   Diff two JSON reports\n\
+         \x20 compare   Diff two reports, or compare sys vs rust within one report\n\
          \x20 help      Show this help, or `help <subcommand>`\n\
          \n\
          Run `bench help <SUBCOMMAND>` for subcommand options.\n\
@@ -315,7 +323,11 @@ pub fn subcommand_help(name: &str) -> Option<String> {
         "baseline" => "bench baseline [--quick|--full] [--json] [--out <dir>] [--out-file <path>]\n\
                        \n  System-ERTS baseline only.\n\
                        \x20 --out-file  Exact output path for the report (overrides --out naming).",
-        "compare" => "bench compare <a.json> <b.json> [--json]\n\n  Diff two result sets, per (workload, runtime, metric).",
+        "compare" => "bench compare <report.json> [--json]          # cross-runtime: sys vs rust within one report\n\
+                      bench compare <a.json> <b.json> [--json]   # two-file: diff two reports\n\
+                      \n  One report  Compare its `sys` rows against its `rust` rows, per (workload, metric)\n\
+                      \x20                (as produced by `bench run --runtime all`).\n\
+                      \x20 Two reports Diff them per (workload, runtime, metric); `a` is the baseline.",
         "help" => "bench help [<subcommand>]\n\n  Show top-level help, or the help for <subcommand>.",
         _ => return None,
     };
@@ -459,17 +471,50 @@ mod tests {
     }
 
     #[test]
-    fn compare_needs_two_paths() {
+    fn compare_one_path_is_cross_runtime_mode() {
+        assert_eq!(
+            parse(&args(&["compare", "report.json"])).unwrap(),
+            Command::Compare {
+                a: PathBuf::from("report.json"),
+                b: None,
+                json: false
+            }
+        );
+        assert_eq!(
+            parse(&args(&["compare", "report.json", "--json"])).unwrap(),
+            Command::Compare {
+                a: PathBuf::from("report.json"),
+                b: None,
+                json: true
+            }
+        );
+    }
+
+    #[test]
+    fn compare_two_paths_keeps_two_file_mode() {
         assert_eq!(
             parse(&args(&["compare", "a.json", "b.json"])).unwrap(),
             Command::Compare {
                 a: PathBuf::from("a.json"),
-                b: PathBuf::from("b.json"),
+                b: Some(PathBuf::from("b.json")),
                 json: false
             }
         );
-        assert!(parse(&args(&["compare", "a.json"])).is_err());
+        assert_eq!(
+            parse(&args(&["compare", "a.json", "b.json", "--json"])).unwrap(),
+            Command::Compare {
+                a: PathBuf::from("a.json"),
+                b: Some(PathBuf::from("b.json")),
+                json: true
+            }
+        );
+    }
+
+    #[test]
+    fn compare_rejects_zero_or_three_paths() {
         assert!(parse(&args(&["compare"])).is_err());
+        assert!(parse(&args(&["compare", "a.json", "b.json", "c.json"])).is_err());
+        assert!(parse(&args(&["compare", "--nope", "a.json"])).is_err());
     }
 
     #[test]
@@ -504,6 +549,9 @@ mod tests {
         assert!(t.contains("--workloads"));
         assert!(t.contains("--out"));
         assert!(t.contains("--out-file"));
+        let t = help_text(Some("compare"));
+        assert!(t.contains("cross-runtime"));
+        assert!(t.contains("<report.json>"));
         assert!(help_text(Some("nope")).contains("USAGE"));
     }
 }

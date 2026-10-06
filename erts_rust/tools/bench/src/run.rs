@@ -45,7 +45,10 @@ pub fn dispatch(command: &Command) -> Result<i32> {
             run_all(&args)?;
             Ok(0)
         }
-        Command::Compare { a, b, json } => compare_reports(a, b, *json),
+        Command::Compare { a, b, json } => match b {
+            Some(b) => compare_reports(a, b, *json),
+            None => cross_compare_report(a, *json),
+        },
     }
 }
 
@@ -322,6 +325,27 @@ fn compare_reports(a: &Path, b: &Path, json: bool) -> Result<i32> {
                 }
             }
         }
+    }
+    Ok(0)
+}
+
+/// `bench compare <report.json>` — the cross-runtime (`sys` vs `rust`) comparison
+/// *within* a single report (typically produced by `bench run --runtime all`).
+fn cross_compare_report(path: &Path, json: bool) -> Result<i32> {
+    let report = Report::load_from(path)?;
+    let label = file_label(path);
+    let cmp = compare::cross_compare_labeled(&report, &label);
+
+    if json {
+        println!("{}", cmp.to_json_pretty()?);
+    } else {
+        println!(
+            "cross-runtime compare {} — {} workload(s), {} numeric row(s)",
+            cmp.report,
+            cmp.workload_count(),
+            cmp.numeric_rows()
+        );
+        print!("{}", cmp.render_table());
     }
     Ok(0)
 }
