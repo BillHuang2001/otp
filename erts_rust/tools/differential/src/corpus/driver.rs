@@ -723,13 +723,13 @@ pub(crate) fn group() -> Vec<Case> {
             contracts: &[Contract::DriverAbi],
             kind: CaseKind::Eval {
                 // `pwd` reports the directory the driver started the child in, so the `{cd, …}`
-                // option is observable, not merely accepted.
-                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{cd,\"/tmp\"},{args,[\"-c\",\"pwd\"]}]), receive {P,{data,DD}} -> DD after 2000 -> no_data end end",
+                // option is observable (`/` always exists and is never the emulator's own cwd).
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{cd,\"/\"},{args,[\"-c\",\"pwd\"]}]), receive {P,{data,DD}} -> DD after 2000 -> no_data end end",
                 extra_argv: &[],
                 probe: Probe::TermToBinary,
             },
             golden: Golden {
-                stdout: Some("ok <<131,109,0,0,0,5,47,116,109,112,10>>"),
+                stdout: Some("ok <<131,109,0,0,0,2,47,10>>"),
                 exit_code: 0,
             },
         },
@@ -980,7 +980,7 @@ mod tests {
             ),
             (
                 "driver/spawn_executable_cd_option_takes_effect",
-                "ok <<131,109,0,0,0,5,47,116,109,112,10>>",
+                "ok <<131,109,0,0,0,2,47,10>>",
             ),
             (
                 "driver/port_command_iolist_write_read",
