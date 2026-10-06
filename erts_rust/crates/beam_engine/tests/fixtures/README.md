@@ -90,6 +90,33 @@ to the function's `func_info` label — the oracle raises `function_clause` ther
 the M1 interpreter treats `func_info` as a no-op, so that path is deliberately *not*
 exercised by `tests/floats.rs`.
 
+## `bsstring.beam` (`bsstring.erl`) — `tests/bitstrings_extra_string.rs`
+
+The `bs_create_bin` **`string` constant segment**: the compiler emits one whenever a
+binary pattern concatenates a literal byte string with a dynamic part
+(`<<"prefix", X/binary>>`). The literal goes into the `StrT` string table and the
+segment carries its byte **offset** as the value operand and its byte **count** as the
+size operand (`beam_ssa_codegen.erl:1970-1976`, `generators.tab:994-1001`). The
+committed `.beam`'s `StrT` is `<<"abhicdabczxyQ">>` (`beam_lib:chunks(F, ["StrT"])`),
+so the segment offsets are not simply 0/2/4 and the `reuse/1`/`combo/2` cases read a
+substring out of the middle of the table.
+
+| export | Erlang | what it exercises |
+|---|---|---|
+| `prefix/1` | `<<"ab", X/binary>>` | string at `StrT` offset 0 |
+| `two/1` | `<<"ab", A:8, "cd">>` | two string segments, the second at offset 4 |
+| `reuse/1` | `<<"abc", X/binary, "bc">>` | a trailing string reusing a suffix of the first (offset 7) |
+| `mixed/1` | `<<A:4, "hi", 3:4>>` | string written at a **non-byte-aligned** bit position (total stays 24 bits) |
+| `unaligned_tail/1` | `<<A:12, "Q">>` | string after a non-byte-aligned tail; the 20-bit result is a **bitstring** |
+| `combo/2` | `<<A:8, "xy", B/binary, "z">>` | strings between two dynamic segments ("z" reuses offset 9) |
+| `one/1` | `<<"z", A:8>>` | one-byte string |
+| `at_zero/1` | `<<"hi", A:8>>` | string reused from offset 2 |
+| `empty_prefix/1` | `<<"", X/binary>>` | the empty literal is dropped and rewritten as a 0-bit integer segment |
+
+Expected values were derived with the oracle, e.g.
+`erl -noshell -eval 'io:format("~w~n",[binary_to_list(bsstring:unaligned_tail(16#AAB))])'`
+(a bitstring result is asserted bit-exactly through `beam_term::bitstring_parts`).
+
 ## `mapfx.beam` (`mapfx.erl`) — `tests/maps.rs`
 
 | export | Erlang | opcodes |
