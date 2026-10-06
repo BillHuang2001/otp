@@ -1660,6 +1660,28 @@ mod tests {
     }
 
     #[test]
+    fn nif_error_raises_its_live_reason_term() {
+        // `erlang:nif_error/1,2` raises `error` with its argument as the reason. The
+        // `beam_bifs` reason is `Structured` and carries no term, so the evaluator
+        // raises the **live argument term** itself: an atom reason stays an atom and a
+        // compound reason survives verbatim (the differential `nif/nif_error_*` cases).
+        atom("try erlang:nif_error(foo) catch error:R -> R end", "foo");
+
+        // The tuple is heap-allocated, so the runtime must outlive it — drive the
+        // `RuntimeContext` directly (see `run`) and print the reason.
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let reason = eval(
+            &mut ctx,
+            "try erlang:nif_error({nif_not_loaded,m,f,0}) catch error:R -> R end",
+        )
+        .expect("the compound reason survives the raise");
+        let printed = ctx.runtime.format_term(reason, None).expect("~p renders it");
+        assert_eq!(printed.trim_end(), "{nif_not_loaded,m,f,0}");
+    }
+
+    #[test]
     fn malformed_expressions_are_capability_gaps() {
         for expr in ["1 +", "(", "case"] {
             let error = run(expr).expect_err(expr);
