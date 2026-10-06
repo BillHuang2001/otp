@@ -113,6 +113,30 @@ Design Decisions.
 This is the **only** place the engine's seam meets the Stage-5 core; it keeps the Stage-1/Stage-5
 DAG acyclic (`../CONTEXT.md`).
 
+### `port.rs` — the `PortHook` provider (contract A.4)
+```rust
+pub const PORT_INFO_ATOMS: &[&str];                                       // the `port_info/1` item vocabulary (seeded at boot)
+pub enum PortName { Spawn(String), SpawnExecutable(PathBuf), Fd(u32) }    // the accepted Name forms
+pub enum StreamType { List, Binary }                                      // `list` (default) / `binary`
+pub struct LivePort { /* child/reaped status, name, os_pid, connected, stream, links/monitors (empty) */ }
+pub struct PortRegistry { /* beam_process::PortTable + id → LivePort map + a per-registry scratch Heap */ }
+impl PortRegistry {
+    pub fn new() -> Result<PortRegistry>;
+    pub fn alloc(&mut self) -> Result<PortId>;
+    pub fn release(&mut self, id: PortId);
+    pub fn contains(&self, id: PortId) -> bool;
+    pub fn insert(&mut self, id: PortId, live: LivePort);
+    pub fn remove(&mut self, id: PortId) -> Option<LivePort>;
+}
+pub struct RuntimePorts { /* Rc<RefCell<PortRegistry>> + Rc<AtomTable> handle */ }
+impl RuntimePorts { pub fn new(registry: Rc<RefCell<PortRegistry>>, atoms: Rc<AtomTable>) -> RuntimePorts; }
+// impl beam_bifs::PortHook for RuntimePorts — open_port/2, port_close/1, port_info/1,2
+```
+`Runtime` owns the registry as an `Rc<RefCell<PortRegistry>>` (the same cheap-clone pattern as the ETS
+tables) and `call_registered` builds a `RuntimePorts` from that handle + the shared atom handle, so
+`erlang:open_port/2`/`port_close/1`/`port_info/1,2` reach a real OS process **without** a
+`&mut Runtime` borrow. The diff-harness `driver/port_backed_by_spawn_driver` case AGREEs.
+
 ### `config.rs` — parsed configuration
 ```rust
 pub type EmulatorConfig = beam_common::config::RuntimeConfig;   // the A.6 skeleton (flavor, +S, +P, …)
