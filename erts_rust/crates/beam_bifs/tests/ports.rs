@@ -126,7 +126,7 @@ fn open_port_yields_an_internal_port_that_is_port_recognises() {
 }
 
 #[test]
-fn port_close_returns_ok_and_closes_the_hooks_port() {
+fn port_close_returns_true_and_closes_the_hooks_port() {
     let reg = default_registry();
     let mut heap = Heap::new(4096).expect("test heap");
     let atoms = seeded_atoms();
@@ -139,8 +139,8 @@ fn port_close_returns_ok_and_closes_the_hooks_port() {
         reg.call("erlang", "port_close", 1, &mut ctx, &[port])
     };
 
-    let ok = result.expect("port_close returns ok");
-    assert_eq!(atoms.name(atom_val(ok)), Some("ok"));
+    let closed = result.expect("port_close returns true");
+    assert_eq!(atoms.name(atom_val(closed)), Some("true"));
     assert_eq!(hook.closed, vec![PortId::new(7)]);
 }
 

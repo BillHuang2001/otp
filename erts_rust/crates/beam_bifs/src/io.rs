@@ -100,13 +100,15 @@ use crate::print::{
 };
 use crate::registry::BifRegistry;
 
-/// Registers `io:printable_range/0`, `io:format/1,2` and `io_lib:format/2,3`.
+/// Registers `io:printable_range/0`, `io:format/1,2`, `io_lib:format/2,3` and
+/// `io_lib:printable_list/1`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("io", "format", 1, format_1);
     reg.register("io", "format", 2, format_2);
     reg.register("io", "printable_range", 0, printable_range_0);
     reg.register("io_lib", "format", 2, format_lib_2);
     reg.register("io_lib", "format", 3, format_lib_3);
+    reg.register("io_lib", "printable_list", 1, printable_list_1);
 }
 
 /// `io:printable_range/0` — the atom `latin1` or `unicode`, whichever the runtime
@@ -121,6 +123,46 @@ pub(crate) fn register(reg: &mut BifRegistry) {
 /// (`erl -noshell -eval 'io:printable_range()'` ⇒ `latin1`).
 fn printable_range_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     ctx.atom("latin1")
+}
+
+/// `io_lib:printable_list/1` — `true` iff the argument is a proper list of
+/// printable **latin1** characters, else `false`.
+///
+/// Reproduces the pure `io_lib:printable_list/1`
+/// (`../../lib/stdlib/src/io_lib.erl:1602-1610`), which dispatches on
+/// `io:printable_range/0`. This runtime always reports `latin1`
+/// ([`printable_range_0`]), so only the `latin1` path exists:
+/// ```text
+/// printable_latin1_list([C|Cs]) when is_integer(C) ->
+///     printable_character(C, latin1) andalso printable_latin1_list(Cs);
+/// printable_latin1_list([]) -> true;
+/// printable_latin1_list(_)  -> false.
+/// ```
+/// and `printable_character(C, latin1)` is `16#20..=16#7E`, `16#A0..=16#FF`, or one
+/// of `\t \n \r \v \b \f \e` (`\x09 \x0A \x0D \x0B \x08 \x0C \x1B`,
+/// `io_lib.erl:1514-1523`). A non-list, an improper list and a non-integer element
+/// are all `false`. Pinned against the oracle: `io_lib:printable_list([])` ⇒ `true`,
+/// `io_lib:printable_list([1,2,3])` ⇒ `false`, `io_lib:printable_list("abc")` ⇒ `true`,
+/// `io_lib:printable_list([127])` ⇒ `false`, `io_lib:printable_list([160])` ⇒ `true`.
+fn printable_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let printable = match proper_list(args[0]) {
+        Some(elems) => elems.iter().all(|&elem| is_printable_latin1(elem)),
+        None => false,
+    };
+    ctx.boolean(printable)
+}
+
+/// `io_lib:printable_character/2` with `latin1` (`io_lib.erl:1514-1523`).
+///
+/// A bignum is out of every printable range, so only a small integer can be printable.
+fn is_printable_latin1(term: Eterm) -> bool {
+    if !is_small(term) {
+        return false;
+    }
+    let c = signed_value(term);
+    (0x20..=0x7E).contains(&c)
+        || (0xA0..=0xFF).contains(&c)
+        || matches!(c, 0x09 | 0x0A | 0x0D | 0x0B | 0x08 | 0x0C | 0x1B)
 }
 
 /// `io:format(Format)` — writes `Format` with no arguments and returns `ok`.
