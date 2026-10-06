@@ -42,6 +42,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `run(self, roots: &mut [Eterm]) -> Result<GcStats>` — `forward_roots` + `complete`.
 - `pub fn collect(from: &HeapSpace, to: &mut HeapSpace, roots: &mut [Eterm]) -> Result<GcStats>` — the
   primitive young-generation entry over a single from-space (objective §1).
+- The shared `pub(crate)` evacuation primitives every other module builds on (so the word-level logic
+  lives in exactly one place): `Target` (`Foreign`/`Live`/`Forwarded`), the `EvacDest` trait (a
+  destination's `classify_boxed`/`classify_cons`/`can_reserve`/`reserve`), the generic
+  `forward_slot<D: EvacDest>`, `move_size`, `ScanStep`/`scan_step`, and `for_each_ref` (`for_each_ref`
+  walks from word 0 **including the header**, because the header selects the payload layout). `Copier`,
+  `immix/`, and `immix_collector`'s `PromoteDest` all consume them.
 - Fun blocks are sized and scanned from `beam_term::fun`'s inlined-descriptor layout
   (`1 + desc_words(kind) + num_free`, env at `fun_env_offset_header`), **never** via
   `header_arity`/`thing_arityval` — see Design Decisions.
