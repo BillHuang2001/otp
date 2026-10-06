@@ -204,8 +204,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
   erts_rust/Cargo.toml --workspace` is warning-free. `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace` is green in every crate here; the only whole-workspace failure is
-  a stale assertion in the sibling `../tools/differential` (see Known Structural Debt).
+  erts_rust/Cargo.toml --workspace --no-fail-fast` is fully green (3112 tests passing, 0 failures).
 - **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
   `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
   installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
