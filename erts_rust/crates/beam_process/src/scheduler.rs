@@ -171,6 +171,17 @@ impl Scheduler {
             process.set_state(ProcessState::Running);
         }
 
+        // Schedule-in: apply any signals queued for the process (exit signals, monitor-DOWNs)
+        // before it runs — this is where a signal that was deferred because the process was
+        // executing (see the crate `CONTEXT.md`) finally lands. Servicing may terminate the
+        // process, in which case there is nothing to run.
+        table.service_signals(pid)?;
+        if !table.contains(pid) {
+            self.slices = self.slices.wrapping_add(1);
+            self.resume_woken(table);
+            return Ok(Some(pid));
+        }
+
         let outcome = runner.run(pid, table, self.reductions_per_slice)?;
         self.slices = self.slices.wrapping_add(1);
 

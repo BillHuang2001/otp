@@ -25,6 +25,7 @@ use crate::monitor::{MonitoredBy, Monitors};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
 use crate::run_queue::Priority;
+use crate::signal_queue::SignalQueue;
 
 /// The scheduler-visible state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -209,6 +210,11 @@ pub struct Process {
     /// Saved BIF/NIF arguments: the last in-heap sub-rootset the collector scans (see
     /// [`SavedArgs`]).
     saved_args: SavedArgs,
+    /// The decoupled pending-signal queue (see [`crate::signal_queue::SignalQueue`]): the exit
+    /// signals and monitor-DOWN notifications generated *for* this process but not yet
+    /// applied. A queued `reason` lives in this process's own heap, so it is an extra in-heap
+    /// sub-rootset the collector must scan.
+    signals: SignalQueue,
     /// Reductions consumed in the current time slice.
     reductions: u64,
     /// Outgoing links.
@@ -253,6 +259,7 @@ impl Process {
             regs: Registers::new(),
             dict: Dict::new(),
             saved_args: SavedArgs::new(),
+            signals: SignalQueue::new(),
             reductions: 0,
             links: Links::new(),
             monitors: Monitors::new(),
@@ -420,6 +427,26 @@ impl Process {
     pub fn saved_args_mut(&mut self) -> &mut SavedArgs {
         &mut self.saved_args
     }
+
+    /// The decoupled pending-signal queue (see [`crate::signal_queue::SignalQueue`]).
+    pub fn signals(&self) -> &SignalQueue {
+        &self.signals
+    }
+
+    /// The pending-signal queue, mutably.
+    pub fn signals_mut(&mut self) -> &mut SignalQueue {
+        &mut self.signals
+    }
+
+    /// The number of signals queued for this process (pending-signal introspection).
+    ///
+    /// A non-zero count means the process has exit signals and/or monitor-DOWN notifications
+    /// generated for it that have not been applied yet — i.e. they will be applied when this
+    /// process is next scheduled in (or, for a process that is not currently executing, at the
+    /// end of the sending operation).
+    pub fn pending_signals(&self) -> usize {
+        self.signals.len()
+    }
     /// The process's off-heap (MSO) handles.
     pub fn off_heap(&self) -> &OffHeapTable {
         &self.off_heap
@@ -569,12 +596,14 @@ impl Process {
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack ([`Registers::gather_roots`]) **plus** the
-    /// mailbox payloads, the process dictionary ([`Dict::gather_roots`]) and the saved
-    /// BIF/NIF arguments ([`SavedArgs::gather_roots`]) — all in-heap sub-rootsets: the queue
-    /// is drained, every payload and the dict/saved-arg words are appended to the root buffer,
-    /// the collector runs, and each region is written back (registers via
+    /// mailbox payloads, the process dictionary ([`Dict::gather_roots`]), the saved BIF/NIF
+    /// arguments ([`SavedArgs::gather_roots`]) and the pending-signal queue
+    /// ([`SignalQueue::gather_roots`]) — all in-heap sub-rootsets: the queue is drained, every
+    /// payload and the dict/saved-arg/signal words are appended to the root buffer, the
+    /// collector runs, and each region is written back (registers via
     /// [`Registers::scatter_roots`], messages rebuilt from their relocated payloads, then the
-    /// dict and the saved args scattered back) in the SAME order it was gathered.
+    /// dict, the saved args and the pending signals scattered back) in the SAME order it was
+    /// gathered.
     ///
     /// # Errors
     ///
@@ -595,10 +624,14 @@ impl Process {
         }
         let mail_words = roots.len();
 
-        // 3. The process dictionary, then the saved BIF/NIF arguments — the remaining in-heap
-        //    sub-rootsets. `dict_start`/`saved_start` are the offsets their scatter steps take.
+        // 3. The process dictionary, the saved BIF/NIF arguments and the pending-signal queue
+        //    — the remaining in-heap sub-rootsets. A queued signal's `reason` lives in this
+        //    heap (it is copied in at enqueue time), so it must be relocated with the rest.
+        //    `dict_start`/`saved_start`/`signals_start` are the offsets their scatter steps
+        //    take.
         let dict_start = self.dict.gather_roots(&mut roots);
         let saved_start = self.saved_args.gather_roots(&mut roots);
+        let signals_start = self.signals.gather_roots(&mut roots);
 
         // 4. Collect. On failure the messages must not be silently lost, so put them back
         //    before propagating (a collection of this heap cannot fail in practice: `collect`
@@ -625,9 +658,11 @@ impl Process {
             self.mailbox.enqueue(rebuilt);
         }
 
-        // 7. Write the relocated dictionary and saved-argument words back, in gather order.
+        // 7. Write the relocated dictionary, saved-argument and pending-signal words back, in
+        //    gather order.
         self.dict.scatter_roots(&roots, dict_start);
         self.saved_args.scatter_roots(&roots, saved_start);
+        self.signals.scatter_roots(&roots, signals_start);
 
         Ok(collection)
     }

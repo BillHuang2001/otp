@@ -1,0 +1,403 @@
+//! The decoupled per-process pending-signal queue: [`SignalQueue`] and [`PendingSignal`].
+//!
+//! ERTS does **not** apply an exit signal, a link exit or a monitor `{'DOWN'}` at the instant
+//! it is generated: it *queues* the signal on the receiving process and applies it later, at a
+//! well-defined point (legacy C `erl_proc_sig_queue.c`): a process's own queue is drained when
+//! it is scheduled in, and a signal to a process that is **not** currently executing is
+//! handled eagerly at the end of the sending operation (ERTS's early signal handling). This
+//! module is that per-process queue; the application policy lives in
+//! [`crate::ptab::ProcessTable::service_signals`].
+//!
+//! # What a queued signal is
+//!
+//! A signal is either an **exit signal** — `from: ProcessId`, `reason: Eterm` — or a
+//! **monitor-DOWN** notification — `reference`, `target`, `kind`, `reason` ([`PendingSignal`]).
+//! Both carry the exit/monitor `reason` as a live term: the reason is **copied into the
+//! receiving process's own heap when the signal is enqueued** (see below), so the queue is an
+//! in-heap sub-rootset exactly like the mailbox / the process dictionary / the saved BIF
+//! arguments. A remote (external-pid) or port signal is *not* queued: it is materialised
+//! straight into the mailbox, because it carries no `trap_exit` policy decision to defer.
+//!
+//! # Ordering guarantee
+//!
+//! **Per receiver, FIFO.** Every signal enqueued for one process is applied in the exact order
+//! it was enqueued (a single FIFO per process). Because the runtime is single-threaded and a
+//! signal is enqueued at the moment it is *generated*, this gives the ERTS observable
+//! guarantee for a signalling **pair**: signals from one sender to one receiver are applied in
+//! the order they were sent (the per-`(sender, receiver)` ordering of
+//! `erl_proc_sig_queue.c`), and it is in fact stronger — it is a total order per receiver.
+//!
+//! # What is *not* guaranteed (documented honestly)
+//!
+//! * **No cross-ordering between the signal queue and the mailbox.** A `{'EXIT', …}`/
+//!   `{'DOWN', …}` signal becomes a mailbox message only when it is *applied*; an ordinary
+//!   message sent after the signal was generated can therefore be enqueued on the mailbox
+//!   first. ERTS's real signal queue tightens this by flushing the queue before the process
+//!   runs; this crate applies it at schedule-in, which fixes the end state but not the
+//!   interleaving with concurrent sends.
+//! * **No ordering between different receivers.** Two signals to two different processes may
+//!   be applied in any order (each queue is drained independently).
+//!
+//! # Term ownership (the GC contract)
+//!
+//! A queued reason term lives in the receiving process's **own** young heap (it is copied in
+//! at enqueue time through the crate's existing copy-into-heap machinery). It is therefore an
+//! **extra in-heap sub-rootset** the copying collector must scan: [`SignalQueue::gather_roots`]
+//! / [`SignalQueue::scatter_roots`] are that seam, and [`crate::process::Process::collect`]
+//! calls them in the same place it gathers the dictionary and the saved arguments. Monitor
+//! references are **not** on-heap — a [`MonitorRef`]/[`ProcessId`] is stored by value and the
+//! `Ref`/pid terms are built on the heap only when the signal is applied.
+//!
+//! Legacy C ground truth (read-only): `erts/emulator/beam/erl_proc_sig_queue.c` (the signal
+//! queue, its ordering and its serviced-at-schedule-in rule) and
+//! `erts/emulator/beam/erl_monitor_link.c`.
+
+use std::collections::VecDeque;
+
+use beam_term::prelude::Eterm;
+
+use crate::monitor::{MonitorKind, MonitorRef};
+use crate::pid::ProcessId;
+
+/// What kind of signal a [`PendingSignal`] is.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum PendingSignalKind {
+    /// An exit signal: `erlang:exit/2`, link propagation, or a node/port-close cascade.
+    Exit,
+    /// A monitor `{'DOWN', …}` notification for a watched process going down.
+    Down,
+}
+
+/// A signal waiting to be applied to a process.
+///
+/// The `reason` of either variant is a term resident in the **receiving** process's own heap
+/// (see the module docs); every other field is a plain value. The type is `Copy`, so a
+/// processor may peek it, decide the policy, and still re-read the (possibly relocated) head
+/// after a collection.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PendingSignal {
+    /// An exit signal from `from` carrying `reason`.
+    Exit {
+        /// The signalling process.
+        from: ProcessId,
+        /// The exit reason term (already owned by the receiver's heap).
+        reason: Eterm,
+    },
+    /// A monitor-DOWN notification: the watched `target` is down with `reason`.
+    Down {
+        /// The monitor reference the `{'DOWN', …}` message must carry.
+        reference: MonitorRef,
+        /// The watched process (downgraded to a `{'DOWN', …}` payload at service time).
+        target: ProcessId,
+        /// Whether a process or a port is watched (selects the `{'DOWN', …}` tag).
+        kind: MonitorKind,
+        /// The exit reason term (already owned by the receiver's heap).
+        reason: Eterm,
+    },
+}
+
+impl PendingSignal {
+    /// An exit signal from `from` with `reason`.
+    pub fn exit(from: ProcessId, reason: Eterm) -> PendingSignal {
+        PendingSignal::Exit { from, reason }
+    }
+
+    /// A monitor-DOWN notification.
+    pub fn down(
+        reference: MonitorRef,
+        target: ProcessId,
+        kind: MonitorKind,
+        reason: Eterm,
+    ) -> PendingSignal {
+        PendingSignal::Down {
+            reference,
+            target,
+            kind,
+            reason,
+        }
+    }
+
+    /// The kind of this signal (exit or monitor-DOWN).
+    pub fn kind(&self) -> PendingSignalKind {
+        match self {
+            PendingSignal::Exit { .. } => PendingSignalKind::Exit,
+            PendingSignal::Down { .. } => PendingSignalKind::Down,
+        }
+    }
+
+    /// The reason term this signal carries.
+    pub fn reason(&self) -> Eterm {
+        match self {
+            PendingSignal::Exit { reason, .. } | PendingSignal::Down { reason, .. } => *reason,
+        }
+    }
+
+    /// Replaces the reason term (used by the GC `scatter` step to write the relocated word
+    /// back).
+    fn set_reason(&mut self, reason: Eterm) {
+        match self {
+            PendingSignal::Exit { reason: slot, .. } | PendingSignal::Down { reason: slot, .. } => {
+                *slot = reason
+            }
+        }
+    }
+}
+
+/// The per-process FIFO of pending signals (see the module docs for the ordering guarantee and
+/// the GC contract).
+#[derive(Default)]
+pub struct SignalQueue {
+    entries: VecDeque<PendingSignal>,
+}
+
+impl SignalQueue {
+    /// An empty signal queue.
+    pub fn new() -> SignalQueue {
+        SignalQueue {
+            entries: VecDeque::new(),
+        }
+    }
+
+    /// Appends `signal` at the **back** of the queue (the order it will be applied in).
+    pub fn push(&mut self, signal: PendingSignal) {
+        self.entries.push_back(signal);
+    }
+
+    /// Removes and returns the **oldest** queued signal, or `None` when the queue is empty.
+    pub fn pop(&mut self) -> Option<PendingSignal> {
+        self.entries.pop_front()
+    }
+
+    /// Borrows the oldest queued signal without removing it.
+    pub fn peek(&self) -> Option<&PendingSignal> {
+        self.entries.front()
+    }
+
+    /// Removes every queued signal, returning them in application order.
+    pub fn drain(&mut self) -> Vec<PendingSignal> {
+        self.entries.drain(..).collect()
+    }
+
+    /// Removes every queued signal.
+    pub fn clear(&mut self) {
+        self.entries.clear();
+    }
+
+    /// The number of queued signals.
+    pub fn len(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// Whether the queue holds no signals.
+    pub fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+
+    /// Iterates the queued signals in application (FIFO) order.
+    pub fn iter(&self) -> impl Iterator<Item = &PendingSignal> + '_ {
+        self.entries.iter()
+    }
+
+    /// Appends every queued signal's reason (in item order) to `out` and returns the **start
+    /// offset** — the index in `out` at which this container's words begin.
+    ///
+    /// One word per signal; pairing with [`SignalQueue::scatter_roots`] with the same `start`
+    /// makes the two a clean round-trip (mirroring [`crate::dict::Dict::gather_roots`]).
+    pub fn gather_roots(&self, out: &mut Vec<Eterm>) -> usize {
+        let start = out.len();
+        for signal in &self.entries {
+            out.push(signal.reason());
+        }
+        start
+    }
+
+    /// Writes the (relocated) reason words back, starting at `start` — the offset returned by
+    /// [`SignalQueue::gather_roots`].
+    ///
+    /// Defensive and total: it never panics. A `roots` slice too short to cover the whole
+    /// queue, or a `start` past its end, simply leaves the uncovered tail untouched.
+    pub fn scatter_roots(&mut self, roots: &[Eterm], start: usize) {
+        let Some(available) = roots.len().checked_sub(start) else {
+            // `start` is past the end of the slice: nothing to write, no panic.
+            return;
+        };
+        let count = available.min(self.entries.len());
+        for (index, signal) in self.entries.iter_mut().take(count).enumerate() {
+            signal.set_reason(roots[start + index]);
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the FIFO ordering, the drain/clear semantics, the introspection
+    //! accessors and the `gather_roots`/`scatter_roots` round-trip.
+
+    use super::*;
+    use beam_term::prelude::make_small;
+
+    fn pid(number: u64) -> ProcessId {
+        ProcessId::new(number, 0)
+    }
+
+    fn reference(id: u64) -> MonitorRef {
+        // The allocator is the only constructor; use it for a real id.
+        let mut allocator = crate::monitor::RefAllocator::new();
+        for _ in 0..id {
+            allocator.next();
+        }
+        allocator.next()
+    }
+
+    #[test]
+    fn a_fresh_queue_is_empty() {
+        let queue = SignalQueue::new();
+        assert!(queue.is_empty());
+        assert_eq!(queue.len(), 0);
+        assert!(queue.peek().is_none());
+        assert!(queue.iter().next().is_none());
+    }
+
+    #[test]
+    fn push_pop_is_fifo() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        queue.push(PendingSignal::down(
+            reference(0),
+            pid(3),
+            MonitorKind::Process,
+            make_small(3),
+        ));
+        assert_eq!(queue.len(), 3);
+
+        assert_eq!(
+            queue.peek().copied(),
+            Some(PendingSignal::exit(pid(1), make_small(1)))
+        );
+        assert_eq!(
+            queue.pop(),
+            Some(PendingSignal::exit(pid(1), make_small(1)))
+        );
+        assert_eq!(
+            queue.pop(),
+            Some(PendingSignal::exit(pid(2), make_small(2)))
+        );
+        assert_eq!(queue.pop().map(|s| s.kind()), Some(PendingSignalKind::Down));
+        assert!(queue.is_empty());
+        assert_eq!(queue.pop(), None);
+    }
+
+    #[test]
+    fn drain_returns_the_signals_in_application_order() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        let drained = queue.drain();
+        assert_eq!(
+            drained,
+            vec![
+                PendingSignal::exit(pid(1), make_small(1)),
+                PendingSignal::exit(pid(2), make_small(2)),
+            ]
+        );
+        assert!(queue.is_empty());
+        assert!(queue.drain().is_empty());
+    }
+
+    #[test]
+    fn introspection_exposes_kind_and_reason() {
+        let exit = PendingSignal::exit(pid(4), make_small(41));
+        assert_eq!(exit.kind(), PendingSignalKind::Exit);
+        assert_eq!(exit.reason(), make_small(41));
+
+        let reference = reference(2);
+        let down = PendingSignal::down(reference, pid(5), MonitorKind::Process, make_small(51));
+        assert_eq!(down.kind(), PendingSignalKind::Down);
+        assert_eq!(down.reason(), make_small(51));
+        match down {
+            PendingSignal::Down {
+                reference: got,
+                target,
+                kind,
+                ..
+            } => {
+                assert_eq!(got, reference);
+                assert_eq!(target, pid(5));
+                assert_eq!(kind, MonitorKind::Process);
+            }
+            PendingSignal::Exit { .. } => panic!("a DOWN signal must be a Down"),
+        }
+    }
+
+    #[test]
+    fn clear_empties_the_queue() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.clear();
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn iter_yields_in_application_order() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+        let reasons: Vec<i64> = queue.iter().map(|s| signed(s.reason())).collect();
+        assert_eq!(reasons, vec![1, 2]);
+    }
+
+    #[test]
+    fn gather_and_scatter_round_trip() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(PendingSignal::down(
+            reference(0),
+            pid(2),
+            MonitorKind::Process,
+            make_small(2),
+        ));
+
+        let mut roots = vec![make_small(-1)]; // a caller-owned prefix is preserved
+        let start = queue.gather_roots(&mut roots);
+        assert_eq!(start, 1);
+        assert_eq!(&roots[start..], &[make_small(1), make_small(2)]);
+
+        // Simulate the collector relocating every root.
+        roots[start..].copy_from_slice(&[make_small(101), make_small(202)]);
+        queue.scatter_roots(&roots, start);
+        assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(101)));
+        assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(202)));
+    }
+
+    #[test]
+    fn gather_of_an_empty_queue_returns_the_current_len() {
+        let queue = SignalQueue::new();
+        let mut roots = vec![make_small(7)];
+        assert_eq!(queue.gather_roots(&mut roots), 1);
+        assert_eq!(roots, vec![make_small(7)]);
+    }
+
+    #[test]
+    fn scatter_is_total_for_a_mismatched_slice() {
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(1), make_small(1)));
+        queue.push(PendingSignal::exit(pid(2), make_small(2)));
+
+        // A slice covering only the first signal leaves the second untouched.
+        queue.scatter_roots(&[make_small(101)], 0);
+        assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(101)));
+        assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(2)));
+
+        // A `start` past the end is likewise a no-op.
+        let mut queue = SignalQueue::new();
+        queue.push(PendingSignal::exit(pid(3), make_small(3)));
+        queue.scatter_roots(&[make_small(9)], 99);
+        assert_eq!(queue.pop().map(|s| s.reason()), Some(make_small(3)));
+    }
+
+    /// The small-int value of an immediate term (test helper).
+    fn signed(term: Eterm) -> i64 {
+        beam_term::prelude::signed_value(term)
+    }
+}
