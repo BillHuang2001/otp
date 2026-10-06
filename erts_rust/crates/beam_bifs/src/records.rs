@@ -338,48 +338,68 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 /// `records:get_definition/2` (`records_get_definition_2`,
-/// `erl_record.c:1342-1365`).
+/// `erl_record.c:1342-1403`).
 ///
-/// The oracle resolves the pair through the code server's record-definition table
-/// (`erts_record_find_entry`, `erl_record.c:163-170`; the BIF itself is
-/// `erl_record.c:1342-1403`): an entry with a live definition yields the
-/// `[…{Key, Value}… | #{is_exported => Bool}]` list, and *everything else* —
-/// a non-atom argument, no entry at all, or an entry whose definition slot for the
-/// active code index is `THE_NON_VALUE` — is `error:badarg`.
+/// `Module`/`Name` must be atoms (a non-atom is `error:badarg`, exactly the
+/// oracle's pre-check). The pair is resolved through the code server's
+/// record-definition table (`erts_record_find_entry`, `erl_record.c:163-170`),
+/// which a `.beam` populates from its `Recs` chunk at load time
+/// (`erts_record_put`, `erl_record.c:173-178`; from `jit/asm_load.c:1246-1260`
+/// and `emu/emu_load.c:735`). This crate reaches that table through the
+/// [`RecordSource`](crate::context::RecordSource) hook — the runtime's code
+/// server resolves the module's atoms and hands back a name-resolved
+/// [`RecordDefinitionView`](crate::context::RecordDefinitionView).
 ///
-/// # Why this stays a typed gap
+/// A resolved definition renders the oracle's shape: the 2-tuple
+/// `{#{is_exported => Bool}, Fields}`, where `Fields` is the field list in
+/// **declaration** order — a field without a default contributes its bare name
+/// atom, and a field with a default contributes `{Name, Default}`. With no
+/// definition for the pair (and when no `RecordSource` hook is installed, which
+/// answers `Ok(None)`) the result is `error:badarg`, exactly the oracle's answer
+/// for a record no *loaded* module defines.
 ///
-/// That table is **not** compile-time-only: a `.beam` carries its native-record
-/// definitions in the `Recs` chunk, and the *loader* registers them
-/// (`erts_record_put(stp->module, rec.records[i].name)` from
-/// `../../erts/emulator/beam/jit/asm_load.c:1246-1260` and
-/// `../../erts/emulator/beam/emu/emu_load.c:735`, out of `stp->beam.record`; the
-/// chunk is parsed by `beam_file.c:1077-1350`, `RECORD_CHUNK = 15`). The compiler
-/// puts *every* native record of a module there, exported or not
-/// (`lib/compiler/src/beam_asm.erl:577-592`, `beam_core_to_ssa.erl:222-232`).
-/// Verified against the oracle: compiling `-record #rec{a, b}.` and loading that
-/// module makes `records:get_definition(mod, rec)` return
-/// `{#{is_exported => false},[a,b]}` — `badarg` only for a record no *loaded*
-/// module defines.
-///
-/// This runtime loads `.beam` files (contract A.9) but neither parses the `Recs`
-/// chunk nor keeps a per-module definition table (`Recs` is captured as opaque
-/// bytes in `beam_loader::chunk::misc`), so it cannot tell an *unknown* record
-/// from a *known* one. Raising `badarg` unconditionally would therefore be
-/// **wrong** for a record a loaded module defines — the honest answer is the typed
-/// [`error::unsupported_bif`], never a wrong result and never a fabricated
-/// definition. The oracle's atom pre-checks are kept verbatim: a non-atom
-/// `Module`/`Name` is `badarg`.
-///
-/// Closing the gap needs two things outside this crate: `beam_loader` must
-/// materialize the `Recs` chunk's definitions, and the runtime must expose a
-/// per-module definition registry (the counterpart of `erts_record_put` /
-/// `erts_record_module_delete`, `beam_bif_load.c:2451`) for this BIF to consult.
-fn get_definition(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+/// Verified against the oracle (erts-17.1) with a module compiled from
+/// `-record #rec{a, b = 5, c}.` + `-record #exp{x = 1, y}.` +
+/// `-export_record([exp]).`:
+/// `records:get_definition(recmod, rec)` ⇒ `{#{is_exported => false},[a,{b,5},c]}`;
+/// `records:get_definition(recmod, exp)` ⇒ `{#{is_exported => true},[{x,1},y]}`;
+/// `records:get_definition(recmod, nope)` ⇒ `error:badarg`.
+fn get_definition(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_atom(args[0]) || !access::is_atom(args[1]) {
         return Err(error::badarg());
     }
-    Err(error::unsupported_bif())
+    // An atom absent from this context's table resolves to no name and therefore
+    // names no loaded definition — the oracle answers `badarg` for an unknown pair.
+    let module = ctx
+        .atoms()
+        .name(atom_val(args[0]))
+        .ok_or_else(error::badarg)?
+        .to_string();
+    let name = ctx
+        .atoms()
+        .name(atom_val(args[1]))
+        .ok_or_else(error::badarg)?
+        .to_string();
+    let definition = match ctx.record_definition(&module, &name)? {
+        Some(definition) => definition,
+        None => return Err(error::badarg()),
+    };
+
+    let key = ctx.intern_atom("is_exported")?;
+    let value = ctx.boolean(definition.is_exported)?;
+    let map = access::make_flatmap(ctx.heap(), &[(key, value)])?;
+
+    let mut fields = Vec::with_capacity(definition.fields.len());
+    for field in &definition.fields {
+        let field_atom = ctx.intern_atom(&field.name)?;
+        let element = match field.default {
+            None => field_atom,
+            Some(default) => ctx.tuple(&[field_atom, default])?,
+        };
+        fields.push(element);
+    }
+    let fields = ctx.list(&fields)?;
+    ctx.tuple(&[map, fields])
 }
 
 /// Registers the `records` BIFs.
@@ -402,6 +422,8 @@ mod tests {
     use beam_common::BeamError;
     use beam_process::ProcessId;
     use beam_term::{is_list, is_nil, make_small, AtomTable, NIL};
+
+    use crate::context::{RecordDefinitionView, RecordFieldView, RecordSource};
 
     /// The atom table the tests seed: index 0 is `false` and index 1 is `true`,
     /// the standard `atom.names` seeding the record `is_exported` atom is built
@@ -935,37 +957,191 @@ mod tests {
         });
     }
 
-    /// `records:get_definition/2` (`records/get_definition_unknown_record` in the
-    /// differential corpus) can only be answered honestly as a typed gap, not as a
-    /// `badarg`.
+    /// A [`RecordSource`] test double: it answers exactly one `(module, name)` pair
+    /// with a fixed definition and `Ok(None)` for everything else — the same
+    /// contract as the runtime's code server for a record no loaded module defines.
+    struct StubRecords {
+        module: String,
+        name: String,
+        definition: RecordDefinitionView,
+    }
+
+    impl RecordSource for StubRecords {
+        fn record_definition(
+            &mut self,
+            module: &str,
+            name: &str,
+        ) -> Result<Option<RecordDefinitionView>> {
+            if module == self.module && name == self.name {
+                Ok(Some(self.definition.clone()))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    /// A definition of `m:r` with the fields of the oracle probe below.
+    fn sample_definition() -> RecordDefinitionView {
+        RecordDefinitionView {
+            is_exported: false,
+            fields: vec![
+                RecordFieldView { name: "a".to_string(), default: None },
+                RecordFieldView { name: "b".to_string(), default: Some(make_small(5)) },
+                RecordFieldView { name: "other".to_string(), default: None },
+            ],
+        }
+    }
+
+    /// Runs `f` over a fresh context (the seeded [`atoms`]) with `source` installed
+    /// as the [`RecordSource`].
+    fn with_source_ctx<R>(
+        source: &mut dyn RecordSource,
+        f: impl FnOnce(&mut BifContext<'_>, &AtomTable) -> R,
+    ) -> R {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = atoms();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_record_source(source);
+        f(&mut ctx, &atoms)
+    }
+
+    /// `records:get_definition/2` renders the oracle's exact shape: the 2-tuple
+    /// `{#{is_exported => Bool}, Fields}` with the fields in declaration order —
+    /// a default-less field as its bare name atom, a defaulted field as `{Name, Default}`.
     ///
-    /// The oracle's table is populated by the **loader** out of a `.beam`'s `Recs`
-    /// chunk (`erts_record_put`, `erl_record.c:173-178`; called from
-    /// `jit/asm_load.c:1246-1260` and `emu/emu_load.c:735`), so a *loaded* module's
-    /// record is resolvable — verified against the oracle: after loading a module
-    /// compiled from `-record #rec{a, b}.`, `records:get_definition(Mod, rec)`
-    /// returns `{#{is_exported => false},[a,b]}`. This runtime keeps no such table
-    /// (`Recs` is opaque bytes in `beam_loader::chunk::misc`), so it cannot tell an
-    /// *unknown* record from a *known* one: an unconditional `badarg` would be a
-    /// **wrong** result for a loaded module's record. The probe catches this typed
-    /// signal ⇒ `unsupported`, never a mismatch.
+    /// Oracle (erts-17.1), a module compiled from `-record #rec{a, b = 5, c}.`:
+    ///   erl -noshell -eval 'code:load_file(recmod),
+    ///     io:format("~p~n",[records:get_definition(recmod, rec)]), halt().'
+    ///   =>  {#{is_exported => false},[a,{b,5},c]}
     #[test]
-    fn get_definition_is_a_typed_unsupported() {
-        with_ctx(|ctx, _| {
+    fn get_definition_renders_the_oracle_shape() {
+        let mut source = StubRecords {
+            module: "m".to_string(),
+            name: "r".to_string(),
+            definition: sample_definition(),
+        };
+        with_source_ctx(&mut source, |ctx, atoms| {
             let m = atom_of(ctx, "m");
             let r = atom_of(ctx, "r");
-            // Both atoms, but no loaded module defines `m:r`; the oracle's own answer
-            // for that case is `badarg`, which this runtime must not guess at.
-            match get_definition(ctx, &[m, r]) {
-                Err(BeamError::Raise(raise)) => {
-                    assert_eq!(raise.class, beam_common::ExceptionClass::Error);
-                    assert_eq!(raise.reason, beam_common::ExitReason::atom("unsupported_bif"));
-                }
-                other => panic!("expected unsupported_bif, got {other:?}"),
-            }
+            let result = get_definition(ctx, &[m, r]).expect("the source resolves m:r");
+
+            // `{Map, Fields}`.
+            assert_eq!(access::tuple_size(result), 2, "the result is a 2-tuple");
+            let map = access::tuple_element(result, 0);
+            let fields = access::tuple_element(result, 1);
+
+            // The map is a flat map with the single key `is_exported => false`.
+            assert!(access::is_flatmap(map), "the definition map is a flat map");
+            let (keys, values) = access::flatmap_pairs(map).expect("a flat map");
+            assert_eq!(keys.len(), 1, "a single is_exported entry");
+            assert_eq!(name_of(atoms, keys[0]), "is_exported");
+            assert_eq!(name_of(atoms, values[0]), "false");
+
+            // The fields are `[a, {b,5}, other]` in declaration order.
+            let fields = list_elements(fields);
+            assert_eq!(fields.len(), 3);
+            assert_eq!(name_of(atoms, fields[0]), "a", "a default-less field is a bare atom");
+            assert!(access::is_atom(fields[0]));
+
+            let b = fields[1];
+            assert!(access::is_tuple(b), "a defaulted field is a 2-tuple");
+            assert_eq!(access::tuple_size(b), 2);
+            assert_eq!(name_of(atoms, access::tuple_element(b, 0)), "b");
+            assert_eq!(access::tuple_element(b, 1), make_small(5));
+
+            assert_eq!(name_of(atoms, fields[2]), "other", "declaration order");
         });
     }
+
+    /// The map's `is_exported` value tracks the definition: an exported record
+    /// renders the atom `true`.
+    ///
+    /// Oracle: `-export_record([exp]).` + `-record #exp{x = 1, y}.` makes
+    /// `records:get_definition(recmod, exp)` return `{#{is_exported => true},[{x,1},y]}`.
     #[test]
+    fn get_definition_renders_is_exported_true() {
+        let mut source = StubRecords {
+            module: "m".to_string(),
+            name: "r".to_string(),
+            definition: RecordDefinitionView {
+                is_exported: true,
+                fields: vec![
+                    RecordFieldView { name: "a".to_string(), default: Some(make_small(1)) },
+                    RecordFieldView { name: "b".to_string(), default: None },
+                ],
+            },
+        };
+        with_source_ctx(&mut source, |ctx, atoms| {
+            let result = get_definition(ctx, &[atom_of(ctx, "m"), atom_of(ctx, "r")]).expect("m:r");
+            let map = access::tuple_element(result, 0);
+            let (keys, values) = access::flatmap_pairs(map).expect("a flat map");
+            assert_eq!(name_of(atoms, keys[0]), "is_exported");
+            assert_eq!(name_of(atoms, values[0]), "true");
+        });
+    }
+
+    /// An unknown `(module, name)` pair (the source answers `None`) is the oracle's
+    /// `error:badarg` — the differential gate's `records/get_definition_unknown_record`.
+    ///
+    /// Oracle: after loading a module defining only `rec`/`exp`,
+    /// `records:get_definition(recmod, nope)` ⇒ `error:badarg`; likewise for a module
+    /// that defines no such record at all.
+    #[test]
+    fn get_definition_unknown_record_is_badarg() {
+        let mut source = StubRecords {
+            module: "m".to_string(),
+            name: "r".to_string(),
+            definition: sample_definition(),
+        };
+        with_source_ctx(&mut source, |ctx, _| {
+            // Both atoms are seeded and resolvable, but the pair names no definition.
+            assert!(matches!(
+                get_definition(ctx, &[atom_of(ctx, "m"), atom_of(ctx, "other")]),
+                Err(BeamError::BadArg)
+            ));
+            // A module with no definitions at all.
+            assert!(matches!(
+                get_definition(ctx, &[atom_of(ctx, "other"), atom_of(ctx, "r")]),
+                Err(BeamError::BadArg)
+            ));
+        });
+    }
+
+    /// With no [`RecordSource`] installed, [`BifContext::record_definition`] answers
+    /// `Ok(None)` ⇒ `badarg` (never a fabricated definition).
+    #[test]
+    fn get_definition_without_a_source_is_badarg() {
+        with_ctx(|ctx, _| {
+            assert!(matches!(
+                get_definition(ctx, &[atom_of(ctx, "m"), atom_of(ctx, "r")]),
+                Err(BeamError::BadArg)
+            ));
+        });
+    }
+
+    /// A field-name atom the context cannot intern (no `AtomInterner`, name not in
+    /// the table) propagates the interner's typed `TermNotFound`, never a fabricated atom.
+    #[test]
+    fn get_definition_propagates_an_uninternable_field_atom() {
+        let mut source = StubRecords {
+            module: "m".to_string(),
+            name: "r".to_string(),
+            definition: RecordDefinitionView {
+                is_exported: false,
+                fields: vec![RecordFieldView {
+                    // Not seeded in [`atoms`] and no interner is installed.
+                    name: "not_seeded".to_string(),
+                    default: None,
+                }],
+            },
+        };
+        with_source_ctx(&mut source, |ctx, _| {
+            assert!(matches!(
+                get_definition(ctx, &[atom_of(ctx, "m"), atom_of(ctx, "r")]),
+                Err(BeamError::TermNotFound)
+            ));
+        });
+    }    #[test]
     fn register_installs_every_records_bif() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
