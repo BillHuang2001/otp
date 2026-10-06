@@ -324,9 +324,15 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 ## Known Issues / Intentional M1 gaps
 * **No interactive shell, no distribution, no node.** `-noshell` is the only mode; `-name`/`-sname`
   are parsed and stored but distribution (A.5) is not started.
-* **Preloaded modules are a name-set skeleton.** Boot does **not** load preloaded `.beam`s; the
-  global atom table is seeded with a small core set (not the full `atom.names` ordering), so positional
-  atom indices for preloaded code are not yet reproduced. Boot order and the registry are in place.
+* **Preloaded modules are a name-set skeleton.** Boot does **not** load preloaded `.beam`s, and the
+  shared atom table is seeded with `CORE_ATOMS` + `INFO_ATOMS` (not the full `atom.names` ordering), so
+  positional atom indices for preloaded code are not reproduced. The erts app's `ebin` **is** on the
+  code path (`CodeServer::resolve_system_ebins`), so a preloaded module (`init`, `persistent_term`, …)
+  *can* be loaded from disk on demand; boot order and the registry are in place.
+* **`-eval` grammar gaps left as honest *unsupported*** (exit 3, never a wrong result):
+  entering a non-byte-aligned binary segment literal (e.g. `<<1:1>>`), and a binary comprehension
+  (`<< Seg || <<X>> <= Bin >>` — the parser raises on the generator). Both are classified by
+  `unsupported_reason`, not reported as exceptions.
 * **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
