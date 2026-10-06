@@ -48,6 +48,9 @@
 %%    until stable, so mutual and self recursion is handled
 %%    conservatively). A function G is fresh returning if it has at least
 %%    one #b_ret{} and *every* returned value is fresh (see below).
+%%    The return of the pseudo block `?EXCEPTION_BLOCK` is ignored: it
+%%    models "the preceding instruction failed and raised" and never
+%%    returns a value to the caller.
 %%
 %% 2. The module is traversed repeatedly (up to ?MAX_ITERATIONS times,
 %%    so that chains of updates propagate) and every copying
@@ -181,9 +184,21 @@ is_fresh_returning(Linear, Ctx) ->
             all(fun(Arg) -> is_fresh(Ctx, Arg, sets:new()) end, Rets)
     end.
 
+%% Collect the values returned by the real returns of a function.
+%%
+%% The pseudo block `?EXCEPTION_BLOCK` (beam_ssa.hrl) is ignored: it models
+%% "the preceding instruction failed and raised", the code generator turns
+%% every branch into it into a direct raise (`{f,0}`), and it therefore never
+%% returns a value to the caller. Every function whose body contains an
+%% instruction that can fail (a BIF call such as `bxor/2`, a `setelement/3`
+%% coming from a record update, ...) has such a block, so counting its
+%% `#b_ret{}` would disqualify essentially every function from being
+%% recognized as fresh returning.
 rets(Linear) ->
     rets(Linear, []).
 
+rets([{?EXCEPTION_BLOCK,_}|Rest], Acc) ->
+    rets(Rest, Acc);
 rets([{_,#b_blk{last=#b_ret{arg=Arg}}}|Rest], Acc) ->
     rets(Rest, [Arg|Acc]);
 rets([_|Rest], Acc) ->
