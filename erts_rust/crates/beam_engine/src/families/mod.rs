@@ -7,7 +7,8 @@
 //! first [`Step`] one claims; an instruction no family claims — including the
 //! families' own not-yet-implemented variants, which are stubs returning
 //! `Ok(None)` — yields the same documented `unsupported` error the interpreter
-//! emitted before this seam existed.
+//! emitted before this seam existed, with the unclaimed instruction's `ops.tab`
+//! spelling appended so the gap is diagnosable ([`instr_name`]).
 //!
 //! The point of the split is **edit locality**: a later agent implements a whole
 //! instruction family inside its own file (e.g. `tuples.rs`) and never has to
@@ -28,7 +29,8 @@
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
 //! the receive/message opcodes, the debug-line opcodes) are not claimed by any
-//! submodule, so [`dispatch`] reports them as unsupported exactly as before.
+//! submodule, so [`dispatch`] reports them as unsupported exactly as before —
+//! naming the instruction when [`instr_name`] knows its `ops.tab` spelling.
 //! (`NifStart`/`OnLoad` never reach [`dispatch`]: the interpreter executes them
 //! as no-ops in its metadata arm, and the residual `Instr::Generic` opcodes are
 //! handled by `crate::generic` before the catch-all arm too.)
@@ -43,6 +45,13 @@ use crate::error;
 use crate::machine::Machine;
 use crate::Step;
 
+/// The stable prefix of the error [`dispatch`] reports for an instruction **no**
+/// family claims.
+///
+/// It is the exact sentinel the interpreter emitted before the family seam
+/// existed, so callers that match on it keep working; [`dispatch`] appends
+/// `": <name>"` (the instruction's `ops.tab` spelling, see [`instr_name`]).
+pub(crate) const UNCLAIMED_PREFIX: &str = "widened opcode not yet executed";
 mod bitstrings;
 mod exceptions;
 mod floats;
@@ -57,8 +66,11 @@ mod tuples;
 /// Families are tried in a fixed order (see the module docs). `Ok(step)` is the
 /// control-flow decision of the claiming family; `Err` is either a family failure
 /// (a raise) or — when **no** family claims the instruction — the documented
-/// `unsupported("widened opcode not yet executed")` error, byte-identical to the
-/// message the interpreter emitted before this seam existed.
+/// `unsupported("<UNCLAIMED_PREFIX>: <name>")` error,
+/// whose prefix is byte-identical to the message the interpreter emitted before
+/// this seam existed and whose `<name>` is [`instr_name`]'s `ops.tab` spelling of
+/// the offending instruction (so e.g. an unclaimed `recv_marker_reserve` is
+/// diagnosable from the error alone).
 pub(crate) fn dispatch(
     machine: &mut Machine,
     module: &Module,
@@ -92,5 +104,234 @@ pub(crate) fn dispatch(
     if let Some(step) = bitstrings::exec(machine, module, labels, instr, func, pc, ctx)? {
         return Ok(step);
     }
-    Err(error::unsupported("widened opcode not yet executed"))
+    Err(error::unsupported(&format!(
+        "{UNCLAIMED_PREFIX}: {}",
+        instr_name(instr)
+    )))
+}
+
+/// The `ops.tab`/C spelling of the instruction [`dispatch`] could not claim.
+///
+/// [`beam_loader::Instr`] carries no name (unlike [`beam_loader::Opcode::name`],
+/// which the residual [`Instr::Generic`] path already uses in `crate::generic`),
+/// so the spelling is mapped here for the variants the interpreter can actually
+/// reach the sentinel with: the **receive/message family** (the one unclaimed
+/// family the standard compiler emits for real modules — it needs the Stage-5
+/// mailbox) and the metadata/`bif` variants the core loop executes but a family
+/// never claims. Anything else reports the generic `"instruction"`.
+///
+/// The spellings are the `ops.tab` opcode names (`../../erts/emulator/beam/emu/ops.tab`),
+/// i.e. exactly what `beam_disasm` prints, so an operator can search the compiler
+/// output for it.
+fn instr_name(instr: &Instr) -> &'static str {
+    match instr {
+        Instr::Send => "send",
+        Instr::LoopRec { .. } => "loop_rec",
+        Instr::LoopRecEnd { .. } => "loop_rec_end",
+        Instr::Wait { .. } => "wait",
+        Instr::WaitTimeout { .. } => "wait_timeout",
+        Instr::Timeout => "timeout",
+        Instr::RemoveMessage => "remove_message",
+        Instr::RecvMarkerReserve { .. } => "recv_marker_reserve",
+        Instr::RecvMarkerBind { .. } => "recv_marker_bind",
+        Instr::RecvMarkerClear { .. } => "recv_marker_clear",
+        Instr::RecvMarkerUse { .. } => "recv_marker_use",
+        Instr::Bif0 { .. } => "bif0",
+        Instr::Bif { .. } => "bif",
+        Instr::InitYregs { .. } => "init_yregs",
+        Instr::ExecutableLine { .. } => "executable_line",
+        Instr::DebugLine { .. } => "debug_line",
+        _ => "instruction",
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! The diagnostics contract of the family seam: an unclaimed instruction must
+    //! name itself in the error (the objective of this module's `instr_name`), and
+    //! the long-standing sentinel prefix must stay byte-identical.
+
+    use beam_loader::{Atom, ImportRef, Opcode, Operand, NO_FAIL};
+
+    use super::*;
+    use crate::context::MinimalContext;
+
+    /// Dispatch `instr` through the real seam (every family declines it) and return
+    /// the typed error. Machine/module/labels/context are never consulted by a
+    /// declining family, so defaults suffice.
+    fn dispatch_error(instr: &Instr) -> beam_common::BeamError {
+        let module = Module::default();
+        let labels = BTreeMap::new();
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        dispatch(&mut machine, &module, &labels, instr, 0, 0, &mut ctx)
+            .expect_err("no family claims this instruction")
+    }
+
+    /// The reason atom of the unclaimed-instruction error.
+    fn dispatch_reason(instr: &Instr) -> String {
+        match dispatch_error(instr) {
+            beam_common::BeamError::Raise(raise) => raise
+                .reason
+                .as_atom()
+                .expect("the reason is an atom")
+                .to_string(),
+            other => panic!("expected the unclaimed-instruction raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_prefix_is_unchanged() {
+        // The sentinel callers (and the differential harness) match on is frozen.
+        assert_eq!(UNCLAIMED_PREFIX, "widened opcode not yet executed");
+    }
+
+    #[test]
+    fn the_unclaimed_receive_marker_opcodes_are_named() {
+        // The four `recv_marker_*` opcodes are what a real `.beam` (e.g. kernel
+        // `code.beam`) hits first; before this change the error was the bare
+        // sentinel, so the failure was undiagnosable.
+        let cases: [(Instr, &str); 4] = [
+            (
+                Instr::RecvMarkerReserve {
+                    marker: Operand::X(0),
+                },
+                "recv_marker_reserve",
+            ),
+            (
+                Instr::RecvMarkerBind {
+                    marker: Operand::X(0),
+                    reference: Operand::X(1),
+                },
+                "recv_marker_bind",
+            ),
+            (
+                Instr::RecvMarkerClear {
+                    reference: Operand::X(1),
+                },
+                "recv_marker_clear",
+            ),
+            (
+                Instr::RecvMarkerUse {
+                    reference: Operand::X(1),
+                },
+                "recv_marker_use",
+            ),
+        ];
+        for (instr, name) in cases {
+            let reason = dispatch_reason(&instr);
+            assert_eq!(
+                reason,
+                format!("unsupported_opcode: {UNCLAIMED_PREFIX}: {name}")
+            );
+            assert!(
+                reason.contains(UNCLAIMED_PREFIX),
+                "the frozen prefix is kept for {name}"
+            );
+            assert_eq!(instr_name(&instr), name);
+        }
+    }
+
+    #[test]
+    fn the_rest_of_the_unclaimed_receive_family_is_named() {
+        let cases: [(Instr, &str); 7] = [
+            (Instr::Send, "send"),
+            (
+                Instr::LoopRec {
+                    fail: NO_FAIL,
+                    dst: Operand::X(0),
+                },
+                "loop_rec",
+            ),
+            (Instr::LoopRecEnd { target: Label(1) }, "loop_rec_end"),
+            (Instr::Wait { target: Label(1) }, "wait"),
+            (
+                Instr::WaitTimeout {
+                    target: Label(1),
+                    time: Operand::Integer(0),
+                },
+                "wait_timeout",
+            ),
+            (Instr::Timeout, "timeout"),
+            (Instr::RemoveMessage, "remove_message"),
+        ];
+        for (instr, name) in cases {
+            assert_eq!(instr_name(&instr), name);
+            assert_eq!(
+                dispatch_reason(&instr),
+                format!("unsupported_opcode: {UNCLAIMED_PREFIX}: {name}")
+            );
+        }
+    }
+
+    #[test]
+    fn the_unclaimed_bif_and_metadata_variants_are_named() {
+        // The core loop executes these, but no family claims them — so if one ever
+        // did reach `dispatch` it must still name itself.
+        let cases: [(Instr, &str); 5] = [
+            (
+                Instr::Bif0 {
+                    bif: ImportRef(0),
+                    dst: Operand::X(0),
+                },
+                "bif0",
+            ),
+            (
+                Instr::Bif {
+                    arity: 2,
+                    bif: ImportRef(0),
+                    fail: NO_FAIL,
+                    args: vec![Operand::X(0), Operand::X(1)],
+                    dst: Operand::X(0),
+                },
+                "bif",
+            ),
+            (
+                Instr::InitYregs {
+                    registers: vec![Operand::Y(0)],
+                },
+                "init_yregs",
+            ),
+            (
+                Instr::ExecutableLine {
+                    location: 0,
+                    index: 0,
+                },
+                "executable_line",
+            ),
+            (
+                Instr::DebugLine {
+                    kind: Operand::Atom(Atom::MAX),
+                    location: 0,
+                    index: 0,
+                    live: 1,
+                },
+                "debug_line",
+            ),
+        ];
+        for (instr, name) in cases {
+            assert_eq!(instr_name(&instr), name);
+            assert_eq!(
+                dispatch_reason(&instr),
+                format!("unsupported_opcode: {UNCLAIMED_PREFIX}: {name}")
+            );
+        }
+    }
+
+    #[test]
+    fn a_variant_without_a_spelling_falls_back_to_instruction() {
+        // `Instr::Generic` is normally handled by `crate::generic` (which names its
+        // opcode), so it has no entry in `instr_name`; the fallback must still name
+        // *something* rather than producing a dangling separator.
+        let generic = Instr::Generic {
+            op: Opcode::send,
+            operands: Vec::new(),
+            offset: 4,
+        };
+        assert_eq!(instr_name(&generic), "instruction");
+        assert_eq!(
+            dispatch_reason(&generic),
+            format!("unsupported_opcode: {UNCLAIMED_PREFIX}: instruction")
+        );
+    }
 }
