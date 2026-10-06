@@ -92,7 +92,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | Crate | Milestone-1 deliverable |
 |---|---|
 | `beam_alloc` | carrier allocator + size classes + process-heap bump allocator |
-| `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute |
+| `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute; the working `enif_*` host API (`NifHost` seam) + the `dlopen`-based NIF loader |
 | `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips |
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
@@ -189,7 +189,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
-- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs
+- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
@@ -286,6 +286,26 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   record-semantics failures the C branches on, and returning a typed `unsupported` only for a genuine
   capability gap. Documented gap: `put_record/6`'s **create** form (`Src == nil`) is a typed `unsupported`
   (the C resolves the definition through the code-server record table, which this runtime lacks).
+- **The NIF subsystem (contract A.3) works end-to-end.** `beam_abi` implements a real `enif_*` host API
+  (`src/nif/enif.rs`) over the host seam `NifHost`/`NifEnv` (`src/nif/host.rs`), which supplies term
+  allocation/`intern_atom`/`atom_name`/`self_pid` and optional `term_to_binary`/`binary_to_term`/`make_ref`
+  hooks — so `beam_abi` gains **no** dependency edge to `beam_codec` (the wave DAG stays acyclic). Coverage
+  spans allocation (`enif_alloc`/`free`/`alloc_binary`/`release_binary`/`make_new_binary`), accessors
+  (`enif_get_int/long/uint/ulong/int64/uint64/double/atom(+_len)/string/tuple/list_cell/list_length/
+  map_size/map_value/binary`, `enif_is_*`), constructors (`enif_make_int/long/uint/ulong/int64/uint64/
+  double/atom(+_len)/tuple(+_from_array)/list(_cell/_reverse/_from_array)/binary/string(+_len)/ref/pid/
+  badarg/map_put/map_remove`), `enif_raise_exception`, `enif_compare`, `enif_has_pending_exception`,
+  `enif_clear_env`. The **dynamic loader** (`src/nif/loader.rs`) uses `libc`'s `dlopen`/`dlsym`/`dlclose`
+  (no new dependency) to read `nif_init`'s `ErlNifEntry`, validate `ERL_NIF_MAJOR_VERSION`/
+  `ERL_NIF_MINOR_VERSION`, run the entry's `load` callback against a host `ErlNifEntry*`, and expose
+  `NifLibrary::call`. `beam_bifs` adds the `erlang:load_nif/2` BIF + the optional `NifLoader`/`current_module`
+  `BifContext` seams; `beam_rt` owns the `NifRegistry`/`NifBridge`/`NifHostImpl` and intercepts NIF calls at
+  external `call_ext` dispatch. A C fixture (`beam_abi/tests/fixtures/test_nif.c`, built with the system
+  `cc`; the test SKIPS LOUDLY if `cc`/`erl_nif.h`/`erlc` are absent) is loaded and called from interpreted
+  code in `beam_rt/tests/nif.rs`; a version mismatch / missing `nif_init` yields a typed error, never a crash.
+  `enif_*` C-variadic functions (make_tuple/list, `set_option`, the `*printf` family) are left `None` because
+  stable Rust cannot define a C-variadic `fn` (rust-lang/rust#44930); the `_from_array` variants cover
+  tuple/list building. `term_to_binary`/`binary_to_term`/`make_ref` remain defaulted `None` in `NifHostImpl`.
 
 ## Known Structural Debt (candidates for the next pass)
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
@@ -306,9 +326,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   decode+encode with the `size`-field and env-order rules and the `Local`-fun encode gap; `beam_gc` fun
   block sizing), the receive/message execution path (`beam_engine` receive family +
   `Mailbox`/block-outcome seams; `beam_message::QueueCursor`; `beam_process` resume-on-send; the
-  `beam_rt` executor runner + `PortHook` provider), and the runtime parity work
+  `beam_rt` executor runner + `PortHook` provider), the runtime parity work
   (`func_info`→`function_clause`, `DictHook`/process dictionary, `{minor_version}` adoption, port
-  parity, sorted `-eval` map literals).
+  parity, sorted `-eval` map literals), and the NIF host layer (the `enif_*` implementations, the
+  `dlopen`-based loader, the `NifHost` seam, the `beam_abi → beam_alloc` dependency edge, and the
+  `-Wl,--export-dynamic` link-arg mechanism that lets a NIF `.so` resolve `enif_*` against the host
+  process).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`

@@ -4,11 +4,19 @@
 //! Every expectation below was derived by running the same spec against the system
 //! `erl` (OTP 29 / erts-17.1, `erl -noshell -eval '…' -s init stop`); the probe
 //! results are quoted next to the assertion.
+//!
+//! This is deliberately one comprehensive suite: it is a long file (over the
+//! workspace's ~1000-line guidance) because the match-spec language is covered as
+//! a single coherent battery — heads, guards, bodies, arithmetic — and splitting it
+//! by construct would duplicate the shared fixtures and oracle probes.
+
+use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_term::prelude::*;
 use beam_common::BeamError;
 use beam_ets::prelude::*;
+use beam_ets::select::expr::set_arith_hook;
 
 /// A table of the atoms the specs below reference. `true`/`false` must be
 /// interned: guard results are the atoms they name.
@@ -19,6 +27,7 @@ fn atoms() -> AtomTable {
         "element", "abs", "size", "hd", "tl", "length", "self", "andalso", "orelse", "not",
         "is_integer", "is_atom", "is_boolean", "is_list", "is_number", "is_tuple", "is_foo",
         "=:=", "=/=", "==", "/=", "<", "=<", ">", ">=",
+        "+", "-", "*", "/", "div", "rem", "band", "bor", "bxor", "bsl", "bsr",
     ] {
         atoms.intern(name);
     }
@@ -58,6 +67,55 @@ fn spec1(heap: &mut Heap, head: Eterm, guards: &[Eterm], body: &[Eterm]) -> Eter
     let body_list = list(heap, body);
     let clause = tup(heap, &[head, guard_list, body_list]);
     list(heap, &[clause])
+}
+
+/// A match-spec call term `{Name, Args…}` (the guard/body function-call form).
+fn call(heap: &mut Heap, name: Eterm, args: &[Eterm]) -> Eterm {
+    let mut elements = Vec::with_capacity(args.len() + 1);
+    elements.push(name);
+    elements.extend_from_slice(args);
+    tup(heap, &elements)
+}
+
+/// A float term on the test heap (the float-operand probe).
+fn float(heap: &mut Heap, value: f64) -> Eterm {
+    // SAFETY: `alloc_words(2)` hands back the two exclusively-owned, writable words
+    // a float occupies (`[HEADER_FLONUM, bits]`); `write_float` writes both before
+    // the term escapes, and the heap outlives it (it is never reset here).
+    unsafe {
+        let words = heap.alloc_words(2).expect("test heap has room for a float");
+        write_float(words, value)
+    }
+}
+
+/// Compile a one-clause `{Head, Guards, Body}` spec and run `select` with it.
+fn select_one(
+    table: &Table,
+    head: Eterm,
+    guards: &[Eterm],
+    body: &[Eterm],
+    atoms: &AtomTable,
+    heap: &mut Heap,
+) -> beam_common::Result<Vec<Eterm>> {
+    let spec = compile(spec1(heap, head, guards, body), atoms).expect("the spec compiles");
+    table.select(&spec, atoms, heap)
+}
+
+/// Assert that a refused arithmetic result is the crate's typed `unsupported`
+/// raise naming match-spec arithmetic.
+fn assert_unsupported_arithmetic(err: BeamError, what: &str) {
+    let raise = err
+        .into_raise()
+        .expect("the arithmetic refusal is an explicit raise");
+    assert_eq!(raise.class, beam_common::ExceptionClass::Error, "{what}");
+    assert!(
+        raise
+            .reason
+            .as_atom()
+            .expect("the reason is an atom")
+            .starts_with("unsupported_ets: match-spec arithmetic"),
+        "the raise names the unsupported arithmetic ({what})"
+    );
 }
 
 const KINDS: [TableKind; 4] = [
@@ -144,22 +202,70 @@ fn repeated_variable_requires_the_elements_to_be_equal() {
 }
 
 #[test]
-fn head_dollar_underscore_and_dollar_dollar_never_match() {
-    // erl: `ets:match_object(T, {'$_','_','_'})` -> `[]`.
+fn head_dollar_underscore_and_dollar_dollar_are_literal_atoms() {
+    // erl, with `D = '$_'`, `DD = '$$'` and `T = [{1,'$_'},{2,'$$'},{3,9}]`:
+    //   ets:select(T, [{{1,D},[],[true]}])   -> [true]
+    //   ets:match_object(T, {1,D})           -> [{1,'$_'}]
+    //   ets:select(T, [{{1,DD},[],[true]}])  -> []
+    //   ets:match_object(T, {1,9})           -> []
+    //   ets:select(T, [{{3,9},[],[true]}])   -> [true]
+    //   ets:match_spec_run([D,1], ets:match_spec_compile([{D,[],[true]}])) -> [true]
+    // So in a HEAD `'$_'`/`'$$'` are ordinary literal atoms compared with exact
+    // `=:=` — they are special only in a *body*; the C `dmc_one_term` emits
+    // `matchEq` for any atom that is not `'_'`/`'$N'` (`erl_db_util.c:4117-4121`).
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
-    for name in ["$_", "$$"] {
-        let mut table = new_table(TableKind::Set);
-        table
-            .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
-            .unwrap();
-        let head = tup(&mut heap, &[at(&atoms, name), at(&atoms, "_"), at(&atoms, "_")]);
-        let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$_")]), &atoms).unwrap();
-        assert!(
-            table.select(&spec, &atoms, &mut heap).unwrap().is_empty(),
-            "`{name}` in a head must never match"
-        );
-    }
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "$_"), 0), &atoms)
+        .unwrap();
+    table
+        .insert(object(&mut heap, 2, at(&atoms, "$$"), 0), &atoms)
+        .unwrap();
+    table
+        .insert(object(&mut heap, 3, make_small(9), 0), &atoms)
+        .unwrap();
+
+    // A nested head `{1,'$_'}` matches exactly the object whose corresponding
+    // element IS that same atom (`{1,'$_',0}`), not the other rows.
+    let dollar = at(&atoms, "$_");
+    let nested = tup(&mut heap, &[make_small(1), dollar, at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{1,'$_'}}` matches `{{1,'$_',0}}`");
+    assert!(eq(got[0], object(&mut heap, 1, dollar, 0), &atoms));
+
+    // …but NOT `{1,9}` (the literal is `=:=`, not a wildcard) nor `{1,'$$'}`.
+    let other_literal = tup(&mut heap, &[make_small(1), make_small(9), at(&atoms, "_")]);
+    let got = select_one(&table, other_literal, &[], &[at(&atoms, "$_")], &atoms, &mut heap)
+        .unwrap();
+    assert!(got.is_empty(), "head `{{1,9}}` must not match `{{1,'$_',0}}`");
+
+    let other_atom = tup(&mut heap, &[make_small(1), at(&atoms, "$$"), at(&atoms, "_")]);
+    let got = select_one(&table, other_atom, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "head `{{1,'$$'}}` must not match `{{1,'$_',0}}`"
+    );
+
+    // `'$$'` is likewise a literal: it matches `{2,'$$',0}` and nothing else.
+    let nested = tup(&mut heap, &[make_small(2), at(&atoms, "$$"), at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{2,'$$'}}` matches `{{2,'$$',0}}`");
+
+    // A plain integer literal still compares exactly (`{3,9}` matches `{3,9,0}`).
+    let nested = tup(&mut heap, &[make_small(3), make_small(9), at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{3,9}}` matches `{{3,9,0}}`");
+
+    // The runner shares the head decoder: the oracle's
+    // `ets:match_spec_run(['$_',1], ets:match_spec_compile([{'$_',[],[true]}]))`
+    // is `[true]` — the head `'$_'` matches the literal element `'$_'` and drops
+    // `1`.
+    let spec = spec1(&mut heap, dollar, &[], &[at(&atoms, "true")]);
+    let input = list(&mut heap, &[dollar, make_small(1)]);
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_eq!(got.len(), 1, "head `'$_'` matches the literal element `'$_'`");
+    assert!(eq(got[0], at(&atoms, "true"), &atoms));
 }
 
 #[test]
@@ -430,6 +536,384 @@ fn constant_and_variable_bodies_alias_instead_of_copying() {
     let got = table.select(&constant, &atoms, &mut heap).unwrap();
     assert_eq!(got.len(), 1);
     assert!(eq(got[0], at(&atoms, "ok"), &atoms));
+}
+
+// ---------------------------------------------------------------------------
+// Arithmetic
+//
+// Every expected value below is the system `erl`'s (OTP 29 / erts-17.1):
+// `ets:select(T, [{'_', [], [EXPR]}])` / `ets:select(T, [{H, [GUARD], EXPR}])`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn binary_arithmetic_body_results_match_the_oracle() {
+    // erl: `ets:select(T, [{'_', [], [{'OP', 30, 6}]}])` on any object, one result:
+    //   '+' -> [36]   '-' -> [24]    '*' -> [180]  'div' -> [5]   'rem' -> [0]
+    //   'band' -> [6] 'bor' -> [30]  'bxor' -> [24] 'bsl' -> [1920] 'bsr' -> [0]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+
+    for (op, expected) in [
+        ("+", 36i64),
+        ("-", 24),
+        ("*", 180),
+        ("div", 5),
+        ("rem", 0),
+        ("band", 6),
+        ("bor", 30),
+        ("bxor", 24),
+        ("bsl", 1920),
+        ("bsr", 0),
+    ] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(30), make_small(6)]);
+        let got = select_one(&table, at(&atoms, "_"), &[], &[body], &atoms, &mut heap).unwrap();
+        assert_eq!(got, vec![make_small(expected)], "operator {op}");
+    }
+}
+
+#[test]
+fn arithmetic_over_bound_variables_unary_and_abs_match_the_oracle() {
+    // erl: head `{'$1','$2','$3'}` on `{7,6,-3}`, body `{OP, ARGS}`:
+    //   {'+','$2','$3'} -> [3]     {'-','$2','$3'} -> [9]
+    //   {'*','$2','$3'} -> [-18]   {'div','$2','$3'} -> [-2]
+    //   {'rem','$2','$3'} -> [0]   {'band','$2','$3'} -> [4]
+    //   {'bor','$2','$3'} -> [-1]  {'bxor','$2','$3'} -> [-5]
+    //   {'+','$3'} -> [-3]  {'-','$3'} -> [3]  {'abs','$3'} -> [3]
+    //   {'+',5} -> [5]      {'-',5} -> [-5]    {'abs',-5} -> [5]
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(
+            tup(&mut heap, &[make_small(7), make_small(6), make_small(-3)]),
+            &atoms,
+        )
+        .unwrap();
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let v2 = at(&atoms, "$2");
+    let v3 = at(&atoms, "$3");
+
+    for (op, args, expected) in [
+        ("+", vec![v2, v3], 3i64),
+        ("-", vec![v2, v3], 9),
+        ("*", vec![v2, v3], -18),
+        ("div", vec![v2, v3], -2),
+        ("rem", vec![v2, v3], 0),
+        ("band", vec![v2, v3], 4),
+        ("bor", vec![v2, v3], -1),
+        ("bxor", vec![v2, v3], -5),
+        ("+", vec![v3], -3),
+        ("-", vec![v3], 3),
+        ("abs", vec![v3], 3),
+    ] {
+        let body = call(&mut heap, at(&atoms, op), &args);
+        let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+        assert_eq!(got, vec![make_small(expected)], "operator {op}");
+    }
+
+    for (op, operand, expected) in [("+", 5i64, 5i64), ("-", 5, -5), ("abs", -5, 5)] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(operand)]);
+        let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+        assert_eq!(
+            got,
+            vec![make_small(expected)],
+            "constant operator {op} on {operand}"
+        );
+    }
+}
+
+#[test]
+fn arithmetic_in_a_guard_matches_the_oracle() {
+    // erl: on `{7,6,-3}`, guard list `[G]` with body `['$_']`:
+    //   {'=:=',{'+','$2','$3'},3}   -> the object
+    //   {'=:=',{'div','$2','$3'},-2} -> the object
+    //   {'=:=',{'band','$2','$3'},5} -> [] (the comparison is false)
+    //   {div,1,0}                    -> [] (the guard raises, so the clause fails)
+    //   {'<',{'+','$2','$3'},0}      -> [] (3 is not < 0)
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::OrderedSet);
+    table
+        .insert(
+            tup(&mut heap, &[make_small(7), make_small(6), make_small(-3)]),
+            &atoms,
+        )
+        .unwrap();
+    let head = tup(
+        &mut heap,
+        &[at(&atoms, "$1"), at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    let body = [at(&atoms, "$_")];
+
+    let cmp = |heap: &mut Heap, op: &str, args: &[Eterm], rhs: i64| -> Eterm {
+        let expr = call(heap, at(&atoms, op), args);
+        tup(
+            heap,
+            &[at(&atoms, "=:="), expr, make_small(rhs)],
+        )
+    };
+
+    let sum = cmp(&mut heap, "+", &[at(&atoms, "$2"), at(&atoms, "$3")], 3);
+    assert_eq!(
+        select_one(&table, head, &[sum], &body, &atoms, &mut heap)
+            .unwrap()
+            .len(),
+        1,
+        "'$2' + '$3' is 3"
+    );
+
+    let quotient = cmp(&mut heap, "div", &[at(&atoms, "$2"), at(&atoms, "$3")], -2);
+    assert_eq!(
+        select_one(&table, head, &[quotient], &body, &atoms, &mut heap)
+            .unwrap()
+            .len(),
+        1,
+        "'$2' div '$3' is -2"
+    );
+
+    let wrong = cmp(&mut heap, "band", &[at(&atoms, "$2"), at(&atoms, "$3")], 5);
+    assert!(select_one(&table, head, &[wrong], &body, &atoms, &mut heap)
+        .unwrap()
+        .is_empty());
+
+    // A guard that raises inside the arithmetic (`1 div 0`) fails its clause.
+    let raising = call(
+        &mut heap,
+        at(&atoms, "div"),
+        &[make_small(1), make_small(0)],
+    );
+    assert!(select_one(&table, head, &[raising], &body, &atoms, &mut heap)
+        .unwrap()
+        .is_empty());
+
+    // A guard that evaluates to a non-boolean (`3`) also fails its clause.
+    let non_boolean = call(
+        &mut heap,
+        at(&atoms, "+"),
+        &[at(&atoms, "$2"), at(&atoms, "$3")],
+    );
+    assert!(
+        select_one(&table, head, &[non_boolean], &body, &atoms, &mut heap)
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[test]
+fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
+    // erl: `/` ALWAYS yields a float (`4/2` -> 2.0); `MAX_SMALL + 1` and
+    //      `MAX_SMALL * 2` overflow into bignums; `1 + 1.5` is 2.5. None of those is
+    //      answerable as a small integer by the default hook, so each is the typed
+    //      `unsupported_ets` raise rather than a wrong result. `1 div 0`/`1 rem 0`
+    //      raise `badarg` in the oracle.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+    let head = at(&atoms, "_");
+
+    // `/` — the oracle's result is always a float.
+    let div = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
+    let err = select_one(&table, head, &[], &[div], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "'/'");
+
+    // Overflow into a bignum (`MAX_SMALL + 1`).
+    let overflow = call(
+        &mut heap,
+        at(&atoms, "+"),
+        &[make_small(MAX_SMALL), make_small(1)],
+    );
+    let err = select_one(&table, head, &[], &[overflow], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "MAX_SMALL + 1");
+
+    // Overflow through `*` (`MAX_SMALL * 2`).
+    let overflow = call(
+        &mut heap,
+        at(&atoms, "*"),
+        &[make_small(MAX_SMALL), make_small(2)],
+    );
+    let err = select_one(&table, head, &[], &[overflow], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "MAX_SMALL * 2");
+
+    // Overflow through `bsl` (the shifted-out bits must not be dropped: a bare
+    // `<<` would answer `0` here instead of the oracle's bignum).
+    let overflow = call(
+        &mut heap,
+        at(&atoms, "bsl"),
+        &[make_small(2), make_small(62)],
+    );
+    let err = select_one(&table, head, &[], &[overflow], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "2 bsl 62");
+
+    // A float operand (`1 + 1.5` is 2.5 in the oracle).
+    let fractional = float(&mut heap, 1.5);
+    let float_sum = call(&mut heap, at(&atoms, "+"), &[make_small(1), fractional]);
+    let err = select_one(&table, head, &[], &[float_sum], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "1 + 1.5");
+
+    // …and unary `+` on a float is refused the same way (it is not the identity
+    // this hook can answer with).
+    let unary_float = call(&mut heap, at(&atoms, "+"), &[fractional]);
+    let err = select_one(&table, head, &[], &[unary_float], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "unary + on 1.5");
+
+    // `div`/`rem` by zero — the oracle raises `badarg`.
+    for op in ["div", "rem"] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(1), make_small(0)]);
+        let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+        assert!(
+            matches!(err, BeamError::BadArg),
+            "{op} by zero is badarg"
+        );
+    }
+}
+
+#[test]
+fn shift_counts_negative_reverse_direction_and_bsr_saturates() {
+    // erl (OTP 29 / erts-17.1), quoted exactly:
+    //   1 bsl -1  -> 0      1 bsr -1   -> 2
+    //   8 bsr -1  -> 16     8 bsl -1   -> 4
+    //   1 bsr 100 -> 0      -1 bsr 100 -> -1
+    //   1 bsr 63  -> 0      -1 bsr 63  -> -1
+    //   0 bsl 100 -> 0      0 bsr -100 -> 0
+    //   2 bsl 57  -> 288230376151711744   288230376151711744 bsr 57 -> 2
+    // and, through the match spec (`{'OP', A, B}` as the body):
+    //   {'bsl',8,-1} -> [4]   {'bsr',1,-1} -> [2]   {'bsl',0,64} -> [0]
+    // i.e. the C `erts_shift` negates the `bsr` count and lets the resulting sign
+    // pick the direction (so `bsl`/`bsr` merely swap for a negative count), and
+    // saturates a right shift of a 60-bit small by 59 or more to the sign's
+    // `0`/`-1` (`erl_arith.c:196-247`).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+    let head = at(&atoms, "_");
+
+    for (op, a, b, expected) in [
+        ("bsl", 1i64, -1i64, 0i64),
+        ("bsr", 1, -1, 2),
+        ("bsr", 8, -1, 16),
+        ("bsl", 8, -1, 4),
+        ("bsr", 1, 100, 0),
+        ("bsr", -1, 100, -1),
+        ("bsr", 1, 63, 0),
+        ("bsr", -1, 63, -1),
+        ("bsl", 0, 100, 0),
+        ("bsr", 0, -100, 0),
+        ("bsl", 2, 57, 1 << 58),
+        ("bsr", 1 << 58, 57, 2),
+    ] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(a), make_small(b)]);
+        let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+        assert_eq!(
+            got,
+            vec![make_small(expected)],
+            "{a} {op} {b} must be {expected}"
+        );
+    }
+
+    // A left shift that leaves the 60-bit small range stays the typed
+    // `unsupported` (`1 bsl 100` is a bignum in the oracle), and so does a `bsr`
+    // with a negative count that big (`1 bsr -100` is exactly `1 bsl 100`).
+    for (op, a, b) in [("bsl", 1i64, 100i64), ("bsr", 1, -100)] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(a), make_small(b)]);
+        let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+        assert_unsupported_arithmetic(err, &format!("{a} {op} {b} widens to a bignum"));
+    }
+}
+
+/// A custom arithmetic hook that answers `/` with the truncated integer quotient,
+/// so a test can prove [`set_arith_hook`] really is consulted (and that everything
+/// it does not handle can defer to [`DefaultArithHook`]).
+#[derive(Debug)]
+struct TruncatingDivHook;
+
+impl ArithHook for TruncatingDivHook {
+    fn eval(
+        &self,
+        op: ArithOp,
+        args: &[Eterm],
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> beam_common::Result<Eterm> {
+        match (op, args) {
+            (ArithOp::Div, [left, right]) => {
+                Ok(make_small(signed_value(*left) / signed_value(*right)))
+            }
+            _ => DefaultArithHook.eval(op, args, atoms, heap),
+        }
+    }
+}
+
+#[test]
+fn a_custom_arith_hook_takes_over_and_the_default_returns() {
+    // The seam `eval` reaches for: with no hook, `/` is outside the default's
+    // small-integer subset (its Erlang result is a float); with one installed, `/`
+    // is whatever the hook answers; clearing it restores the default.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+    let head = at(&atoms, "_");
+    let body = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
+
+    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "'/' with no hook");
+
+    set_arith_hook(Some(Rc::new(TruncatingDivHook) as Rc<dyn ArithHook>));
+    // The custom hook answers `/`; everything else still goes through the default.
+    let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(2)]);
+    let product = call(
+        &mut heap,
+        at(&atoms, "*"),
+        &[make_small(30), make_small(6)],
+    );
+    assert_eq!(
+        select_one(&table, head, &[], &[product], &atoms, &mut heap).unwrap(),
+        vec![make_small(180)]
+    );
+
+    set_arith_hook(None);
+    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "'/' after clearing the hook");
+}
+
+#[test]
+fn malformed_arithmetic_arities_are_badarg() {
+    // erl rejects every one of these at compile time (`ets:select/2` -> badarg):
+    // `{'+'}`, `{'+',1,2,3}`, `{'div',1}`, `{'div',1,2,3}`, `{abs,1,2}`.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+
+    for (op, args) in [
+        ("+", vec![]),
+        ("+", vec![make_small(1), make_small(2), make_small(3)]),
+        ("div", vec![make_small(1)]),
+        ("div", vec![make_small(1), make_small(2), make_small(3)]),
+        ("abs", vec![make_small(1), make_small(2)]),
+    ] {
+        let body = call(&mut heap, at(&atoms, op), &args);
+        let spec = spec1(&mut heap, at(&atoms, "_"), &[], &[body]);
+        assert!(
+            matches!(compile(spec, &atoms), Err(BeamError::BadArg)),
+            "{op}/{} must be badarg",
+            args.len()
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------

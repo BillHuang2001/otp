@@ -401,9 +401,10 @@ pub struct ErlNifApi {
             *mut ERL_NIF_TERM,
         ) -> c_int,
     >,
-    /// `int enif_make_map_remove(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM* map_out);`
-    pub enif_make_map_remove:
-        Option<unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ERL_NIF_TERM) -> c_int>,
+    /// `int enif_make_map_remove(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_NIF_TERM* map_out);`
+    pub enif_make_map_remove: Option<
+        unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, ERL_NIF_TERM, *mut ERL_NIF_TERM) -> c_int,
+    >,
     /// `int enif_map_iterator_create(ErlNifEnv *env, ERL_NIF_TERM map, ErlNifMapIterator *iter, ErlNifMapIteratorEntry entry);`
     pub enif_map_iterator_create: Option<
         unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ErlNifMapIterator, ErlNifMapIteratorEntry) -> c_int,
@@ -669,7 +670,7 @@ impl ErlNifApi {
     /// Used by tests and by a runtime that has not yet wired up any function; the returned value is
     /// a valid `ErlNifApi` whose `size_of`/alignment match a fully populated one.
     #[allow(clippy::too_many_lines)]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             enif_priv_data: None,
             enif_alloc: None,

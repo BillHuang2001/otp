@@ -30,7 +30,7 @@
 //! (which every message here is).
 
 use beam_bifs::BifRegistry;
-use beam_common::{BeamError, ExitReason, Raise};
+use beam_common::{BeamError, ExitReason, LiveReason, Raise};
 use beam_term::{atom_val, is_atom, AtomTable, Eterm};
 /// The prefix every capability-gap reason atom starts with (see the module docs).
 pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
@@ -349,7 +349,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("function_exported", 3),
     ("load_module", 2),
     ("load_module", 3),
-    ("load_nif", 2),
     ("md5", 1),
     ("md5_init", 0),
     ("md5_update", 2),
@@ -429,6 +428,19 @@ pub(crate) fn no_process(pid: beam_process::ProcessId) -> BeamError {
 /// it is reported rather than run as a wrong (or empty) function.
 pub(crate) fn unknown_process_entry(pid: beam_process::ProcessId) -> BeamError {
     message(format!("scheduler: process {pid:?} has no engine entry point"))
+}
+
+/// The raise a NIF recorded on its environment (`enif_raise_exception`, `enif_make_badarg`).
+///
+/// The reason is a **term** the C NIF built, so it travels in the live-reason slot
+/// (`ExitReason::Structured` + [`LiveReason`]) — the same carrier the engine and
+/// `beam_bifs` use for a structured raise reason. [`live_reason_term`] recovers it and the
+/// single printer renders it, so `enif_make_badarg` surfaces as the oracle's `error:badarg`
+/// and a NIF's own reason term is never replaced by a placeholder.
+pub(crate) fn nif_raised(reason: Eterm) -> BeamError {
+    BeamError::Raise(
+        Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(reason)),
+    )
 }
 
 #[cfg(test)]

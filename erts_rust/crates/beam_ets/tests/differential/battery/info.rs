@@ -3,14 +3,16 @@
 //! combinations, the runtime-shape fields (`heir`/`node`/`decentralized_counters`)
 //! for a `set` and an `ordered_set` with write concurrency, an unknown
 //! `ets:info/2` key, `lookup_element/3,4` on the multi-object kinds
-//! (`bag`/`duplicate_bag`), and the atomicity of `ets:insert/2` over a list.
+//! (`bag`/`duplicate_bag`), the atomicity of `ets:insert/2` over a list, and the
+//! **ownership** surface (`ets:give_away/3` and the `{heir, ...}` option of
+//! `ets:setopts/2`).
 //!
 //! `id`, `memory` and `owner` are implementation-specific (a table id, an
 //! allocation figure, a pid) and are therefore never rendered; the renderable
 //! fields are read through `ets:info/2`.
 
 use super::*;
-use beam_ets::Access;
+use beam_ets::{Access, Heir, OwnerId, SetOpt};
 
 impl Battery {
     /// `ets:info(T, Field)`: the reported value, or `badarg` for a key ETS does
@@ -274,6 +276,70 @@ impl Battery {
 
         tuple_of(&[r1, l1, r2, l2])
     }
+
+    /// `ets:give_away/3`: `true` only when the caller is the current owner and the
+    /// target is a *different* live process; the not-owner, self-gift and non-pid
+    /// target cases are all `badarg`. Pids are unrenderable, so only the return
+    /// value (or the error) is rendered.
+    ///
+    /// The crate models the target as an opaque [`OwnerId`]; a `None` new owner is
+    /// its stand-in for the oracle's non-pid/dead-pid target (see
+    /// `src/table/ownership.rs`).
+    fn ownership_give_away(&mut self) -> String {
+        let owner = OwnerId::new(1);
+        let child = OwnerId::new(2);
+
+        // (a) success: the owner hands the table to a different process.
+        let mut handed = self.table(TableKind::Set, 1);
+        handed.set_owner(Some(owner));
+        let success = cap_unit(handed.give_away(Some(owner), Some(child)));
+
+        // (b) the caller is no longer the owner — it just gave the table away.
+        let not_owner = cap_unit(handed.give_away(Some(owner), Some(owner)));
+
+        // (c) the caller's own pid: an owner gifting the table to itself.
+        let mut self_gift = self.table(TableKind::Set, 1);
+        self_gift.set_owner(Some(owner));
+        let own_pid = cap_unit(self_gift.give_away(Some(owner), Some(owner)));
+
+        // (d) a non-pid target — `None` is this crate's stand-in.
+        let mut bad_target = self.table(TableKind::Set, 1);
+        bad_target.set_owner(Some(owner));
+        let non_pid = cap_unit(bad_target.give_away(Some(owner), None));
+
+        tuple_of(&[success, not_owner, own_pid, non_pid])
+    }
+
+    /// The `{heir, ...}` surface of `ets:setopts/2`: `ets:info(T, heir)` is `none`
+    /// by default, installing and clearing the heir both answer `true`, and
+    /// `ets:info(T, holder)` is `badarg`. The heir *pid* is never rendered (only
+    /// the pid-less `none`/`undefined` the crate reports).
+    fn ownership_heir(&mut self) -> String {
+        let owner = OwnerId::new(1);
+        let heir_pid = OwnerId::new(9);
+        let mut table = self.table(TableKind::Set, 1);
+        table.set_owner(Some(owner));
+
+        let default_heir_term = self
+            .info_field(&table, "heir")
+            .expect("a fresh table reports heir = none");
+        let default_heir = self.r(default_heir_term);
+        let install = cap_unit(table.setopts(
+            Some(owner),
+            SetOpt::Heir(Heir {
+                owner: heir_pid,
+                data: make_small(7),
+            }),
+        ));
+        let clear = cap_unit(table.setopts(Some(owner), SetOpt::ClearHeir));
+        let cleared_heir_term = self
+            .info_field(&table, "heir")
+            .expect("a cleared table reports heir = none");
+        let cleared_heir = self.r(cleared_heir_term);
+        let holder = cap_value(self.info_field(&table, "holder"), &self.atoms);
+
+        tuple_of(&[default_heir, install, clear, cleared_heir, holder])
+    }
 }
 
 /// The `info` cases, in the oracle's order.
@@ -292,6 +358,11 @@ pub(super) fn info_cases(battery: &mut Battery) -> Vec<(String, String)> {
         battery.lookup_element_multi(),
     ));
     cases.push(("insert_list_atomic".into(), battery.insert_list_atomic()));
+    cases.push((
+        "ownership_give_away".into(),
+        battery.ownership_give_away(),
+    ));
+    cases.push(("ownership_heir".into(), battery.ownership_heir()));
 
     cases
 }

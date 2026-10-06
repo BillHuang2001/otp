@@ -56,11 +56,20 @@
 //! with variables/wildcards/literals/guards (comparison, type test,
 //! `andalso`/`orelse`) and bodies (`'$_'`, `'$N'`, constants, `{{…}}`
 //! construction); `select_delete/2`+`select_count/2`; the `match` family;
-//! malformed specs (`badarg`); the `info` group (the registered `name` vs the
+//! malformed specs (`badarg`); `ets:match_spec_run/2` (variable/whole-element/
+//! all-bindings bodies, a repeated head variable, multi-clause first-match-wins,
+//! an empty list, a non-list `badarg`) and the body-error `EXIT` semantics;
+//! `ets:select_replace/2` (an arithmetic rewrite, an arity-1 result, the `bag`
+//! refusal, a key-changing `badarg` and the identity body); the limit/continuation
+//! forms (`select/3`+`select/1`, `match/3`+`match/1`, `match_object/3`+`match_object/1`
+//! chained to completion, `limit 0` ⇒ `badarg`, an empty table ⇒ `'$end_of_table'`);
+//! the `info` group (the registered `name` vs the
 //! `named_table` flag, the renderable `ets:info/2` option fields for four option
 //! combinations, the runtime-shape fields `heir`/`node`/`decentralized_counters`,
 //! an unknown `ets:info/2` key, `lookup_element/3,4` on the
-//! multi-object kinds, and `ets:insert/2`-over-a-list atomicity); and two
+//! multi-object kinds, and `ets:insert/2`-over-a-list atomicity);
+//! the **ownership** surface (`ets:give_away/3` success + the badarg cases, and the
+//! `{heir, ...}` option of `ets:setopts/2`); and two
 //! 10 001-key tables (`set` + `ordered_set`) exercising size, lookups, the
 //! ordered `next` chain and a guarded `select_count`.
 //!
@@ -106,6 +115,14 @@
 //!   duplicates are preserved). Only `set`/`ordered_set` are scalar. An absent key
 //!   is `badarg` (`/3`) or the default (`/4`), `Pos == 0` is `badarg`, and one
 //!   object too short for `Pos` makes the whole call `badarg`.
+//! * **`ets:match_spec_run/2` needs an already-compiled spec** (`match_spec_compile/1`):
+//!   a raw clause list is `badarg` there, whereas this crate's `match_spec_run`
+//!   takes the raw term. The all-bindings atom `'$$'` has **two** characters but an
+//!   Erlang *source literal* `'$$'` lexes to the one-character `'$'`, so the oracle
+//!   program builds it with `list_to_atom([36,36])`.
+//! * **A continuation is an opaque ref** — it is never rendered. The continuation
+//!   cases chain the `/3` entry point and its `/1` resumptions to exhaustion and
+//!   compare only the concatenated, materialized results.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -278,6 +295,30 @@ const EXPECTED: &[(&str, &str)] = &[
         "[badarg,badarg,badarg,badarg,badarg,badarg,badarg,ok:[{1,10}]]",
     ),
     (
+        "match_spec_run_bindings",
+        "{[1,2,3],[{1,10},{2,20},{3,30}],[[1,10],[2,20],[3,30]]}",
+    ),
+    ("match_spec_run_repeated_var", "[1,2]"),
+    ("match_spec_run_multi_clause", "[small,big,big]"),
+    ("match_spec_run_empty_and_badarg", "{[],badarg}"),
+    ("body_error_exit", "[EXIT,EXIT]"),
+    ("select_replace_small_int", "{ok:2,[{1,10},{2,40},{3,60}]}"),
+    ("select_replace_arity1", "{ok:2,[{1},{2}]}"),
+    ("select_replace_bag_badarg", "{badarg,[{1,10}]}"),
+    (
+        "select_replace_changed_key_badarg",
+        "{badarg,[{1,10},{2,20}]}",
+    ),
+    ("select_replace_identity", "{ok:2,[{1,10},{2,20}]}"),
+    ("select_limit_chain", "[1,2,3,4,5]"),
+    ("match_limit_chain", "[[1,x],[2,x],[3,x],[4,x],[5,x]]"),
+    (
+        "match_object_limit_chain",
+        "[{1,x},{2,x},{3,x},{4,x},{5,x}]",
+    ),
+    ("select_limit_zero_badarg", "badarg"),
+    ("select_limit_empty_table", "$end_of_table"),
+    (
         "info_name_named_table",
         "{anon_case_name,false,named_case_name,true}",
     ),
@@ -298,6 +339,8 @@ const EXPECTED: &[(&str, &str)] = &[
         "insert_list_atomic",
         "{badarg,[{1,10}],badarg,[{a,1}]}",
     ),
+    ("ownership_give_away", "{ok:true,badarg,badarg,badarg}"),
+    ("ownership_heir", "{none,ok:true,ok:true,none,badarg}"),
     (
         "set_large",
         "{10001,[{0,0},{10000,20000},{5000,10000}],5000}",

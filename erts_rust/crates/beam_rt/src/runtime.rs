@@ -46,6 +46,7 @@ use crate::eval::FunBody;
 use crate::format;
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
+use crate::nif::NifRegistry;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState, RuntimeRunner};
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
@@ -132,7 +133,17 @@ pub struct Runtime {
     /// time (see [`crate::context::RuntimeContext::call_registered`]). A **nested** borrow
     /// (a port operation re-entered from inside a port operation) is reported as a typed
     /// capability gap rather than panicking.
-    pub(crate) ports: Rc<RefCell<PortRegistry>>,    /// The pid code runs as (`erlang:self/0`).
+    pub(crate) ports: Rc<RefCell<PortRegistry>>,
+    /// The live NIF libraries behind `erlang:load_nif/2` (contract A.3).
+    ///
+    /// Shared through an [`Rc`]`<`[`RefCell`]`>` for the same reason as
+    /// [`Runtime::tables`]/[`Runtime::ports`]: the dispatch that calls a NIF
+    /// ([`RuntimeContext::call_bif`](crate::context::RuntimeContext)) holds the registry for
+    /// the duration of the call while the runtime stays free for the per-call NIF host. The
+    /// registry is `!Send` (it owns `dlopen` handles), which is fine — the runtime is
+    /// single-threaded (see [`crate::nif`]).
+    pub(crate) nifs: Rc<RefCell<NifRegistry>>,
+    /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
@@ -217,7 +228,9 @@ impl Runtime {
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
-            ports: Rc::new(RefCell::new(PortRegistry::new()?)),            self_pid,
+            ports: Rc::new(RefCell::new(PortRegistry::new()?)),
+            nifs: Rc::new(RefCell::new(NifRegistry::new())),
+            self_pid,
             booted: false,
             halt: None,
             refs: RefAllocator::new(),

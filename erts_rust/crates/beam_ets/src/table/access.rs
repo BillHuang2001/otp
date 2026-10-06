@@ -5,7 +5,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use super::{OwnerId, Table};
+use super::{OwnerId, SetOpt, Table};
 use crate::select::MatchSpec;
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
@@ -292,5 +292,25 @@ impl TableAccess<'_> {
     pub fn is_empty(&self) -> Result<bool> {
         self.table.check_read(self.requester)?;
         Ok(self.table.is_empty())
+    }
+
+    // -------------------------------------------------------------- ownership
+
+    /// `ets:give_away/3`: the requester is the caller.
+    ///
+    /// The ownership rules (`badarg` unless the requester is the current owner and
+    /// `new_owner` is a different live one) live in [`Table::give_away`]; this view
+    /// only supplies the caller. `ets:give_away/3` does **not** consult the
+    /// `protection` mode — it is an ownership operation, not a read/write one.
+    pub fn give_away(&mut self, new_owner: Option<OwnerId>) -> Result<()> {
+        self.table.give_away(self.requester, new_owner)
+    }
+
+    /// `ets:setopts/2` (the `{heir, ...}` option): the requester is the caller.
+    ///
+    /// Requires the requester to be the table owner (`badarg` otherwise), exactly
+    /// like the oracle; see [`Table::setopts`].
+    pub fn setopts(&mut self, opt: SetOpt) -> Result<()> {
+        self.table.setopts(self.requester, opt)
     }
 }

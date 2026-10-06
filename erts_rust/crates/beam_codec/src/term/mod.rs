@@ -1,28 +1,25 @@
-//! Thin forwarding layer over [`beam_term::thing`], [`beam_term::fun`],
-//! [`beam_term::record`], [`beam_term::tuple`] and [`beam_term::list`], split into the
-//! local **bitstring word-layout shim** ([`binary`]) and the **fun / export** ([`fun`])
-//! and **native-record** ([`record`]) forwarding layers.
+//! Thin forwarding layer over [`beam_term::thing`], [`beam_term::bitstring`],
+//! [`beam_term::fun`], [`beam_term::record`], [`beam_term::tuple`] and
+//! [`beam_term::list`], split into the **bitstring** ([`binary`]), the
+//! **fun / export** ([`fun`]) and the **native-record** ([`record`]) forwarding
+//! layers.
 //!
 //! The frozen interior layout of a float, a bignum, a flat map, the external
-//! pid/port/ref blocks, **every kind of fun/export** and a **native record**, is owned
-//! by [`beam_term`] (the lowest common ancestor for term operations — workspace
-//! `CONTEXT.md` §2, "No duplication across crates"). Every constructor and accessor
-//! here therefore only:
+//! pid/port/ref blocks, a bitstring, **every kind of fun/export** and a **native
+//! record**, is owned by [`beam_term`] (the lowest common ancestor for term
+//! operations — workspace `CONTEXT.md` §2, "No duplication across crates"). Every
+//! constructor and accessor here therefore only:
 //!
 //! 1. checks the documented bounds/type/validity preconditions, mapping a failure
 //!    to a [`beam_common::BeamError`], and
 //! 2. either allocates the block from [`beam_alloc::Heap`] (the `make_*` family) or
-//!    forwards straight to the matching [`beam_term::thing`] accessor (the
-//!    `*_parts` family and the tuple/cons accessors).
+//!    forwards straight to the matching [`beam_term`] accessor (the `*_parts`
+//!    family, the bitstring sizing helpers and the tuple/cons accessors).
 //!
 //! All layout arithmetic — header construction, word offsets, digit/slice math —
-//! lives in [`beam_term::thing`]; this module retains only the small guard
-//! constants declared below.
-//!
-//! **Exception:** the bitstring (`ErlHeapBits` / `ErlSubBits`) block layout is
-//! implemented **locally** in [`binary`], because this node may not write
-//! [`beam_term`]. It is built only from public [`beam_term`] constants/primitives
-//! and is a deliberate, temporary deviation — see [`binary`]'s module docs.
+//! lives in [`beam_term`]; this module retains only the small guard constants
+//! declared below plus the one oversized *flat* map writer that [`beam_term`] cannot
+//! produce (see [`make_flatmap`]).
 //!
 //! [`beam_term`]'s accessors are `unsafe fn` because the validity of an `Eterm` is
 //! a caller invariant and there is no safe way to read or write a heap word, so the
@@ -30,8 +27,8 @@
 //! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`, which
 //! covers [`binary`], [`fun`] and [`record`] too). The crate's entire `unsafe`
 //! surface is this single auditable subtree: the `beam_alloc` allocation calls, the
-//! `beam_term` forwarders, the bitstring shim and the minimal type/validity guards —
-//! each carrying a `// SAFETY:` rationale.
+//! `beam_term` forwards and the minimal type/validity guards — each carrying a
+//! `// SAFETY:` rationale.
 //!
 //! Every error stays [`beam_common::Result`] (via [`crate::error`]); an accessor
 //! never panics and never exhibits undefined behaviour on a mismatched term.
@@ -72,7 +69,7 @@ use beam_common::Result;
 use beam_term::prelude::{
     arityval, boxed_val, is_big, is_external_pid, is_external_port, is_external_ref, is_flatmap,
     is_float, is_list, is_tuple, make_arityval, make_boxed, make_header, make_tuple, Eterm,
-    MAP_SUBTAG, MAX_ARITYVAL,
+    MAP_SMALL_MAP_LIMIT, MAP_SUBTAG, MAX_ARITYVAL,
 };
 use beam_term::thing;
 
@@ -82,12 +79,7 @@ use crate::error;
 /// digit count [`make_big`] accepts. The bignum layout itself is owned by
 /// [`beam_term::thing`].
 const BIG_ARITY_MAX: usize = (1 << 16) - 1;
-/// `MAP_SMALL_MAP_LIMIT`: the largest flat-map pair count
-/// [`beam_term::thing::write_flatmap`] writes (ERTS switches to a hashmap above it).
-/// Larger maps are written by this crate's own flatmap writer
-/// ([`write_large_flatmap`]), which `beam_term` explicitly delegates to
-/// `beam_codec`. The flat-map layout itself is owned by [`beam_term::thing`].
-const MAP_SMALL_MAP_LIMIT: usize = 32;
+
 /// `EXTERNAL_THING_HEAD_SIZE` (`erl_term.h:1161`):
 /// `offsetof(ExternalThing, data) / sizeof(Uint)` — the `[header, node, next]`
 /// head, three words on `ARCH_64`. Only the external-reference validity guard needs
@@ -178,7 +170,8 @@ pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u64])> {
 ///
 /// The `[arityval(n), k0 … k(n-1), head, n, keys, v0 … v(n-1)]` layout (and the
 /// 3-word empty block) is written by [`beam_term::thing::write_flatmap`] for
-/// `n <= MAP_SMALL_MAP_LIMIT` and by [`write_large_flatmap`] above it (identical
+/// `n <= MAP_SMALL_MAP_LIMIT` ([`beam_term::map::MAP_SMALL_MAP_LIMIT`], imported
+/// here from its owner) and by [`write_large_flatmap`] above it (byte-identical
 /// layout — see that writer).
 ///
 /// Builds a **flat** map and keeps the caller's pair order as-is (no sort, no dedup), so
@@ -215,17 +208,22 @@ pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> 
     }
 }
 
-/// Writes a flat map with **more than** `MAP_SMALL_MAP_LIMIT` pairs at `hp` and
-/// returns the tagged root term.
+/// Writes a flat map of any non-empty pair count at `hp` and returns the tagged
+/// root term.
 ///
 /// # Why this lives here
 ///
-/// [`beam_term::thing::write_flatmap`] `debug_assert!`s the small-map limit and its
-/// own docs delegate the larger map to `beam_codec`; this crate's node may not
-/// write the sibling `beam_term`, so the (identical) word layout for the oversized
-/// case is written here. It is byte-for-byte the layout `write_flatmap` emits —
-/// pinned by the `flatmap_layout_matches_beam_term` test — so a map of any pair
-/// count round-trips as a flatmap and every existing reader still applies.
+/// The lowest common ancestor cannot produce a flat map with more than
+/// [`MAP_SMALL_MAP_LIMIT`] pairs: [`beam_term::thing::write_flatmap`] asserts that
+/// limit and [`beam_term::map::write_map`] switches to a **hash map** (a different
+/// term kind with a different interior) above it. `beam_codec` needs the oversized
+/// *flat* map nonetheless: our decoder materializes **every** `MAP_EXT` image as one
+/// flat map, and the encoder must re-emit it byte-exactly in the map's stored order
+/// (see the crate `CONTEXT.md`, §"Map key encode order"). This writer is that
+/// missing LCA entry point, verbatim: it is byte-for-byte the layout
+/// [`beam_term::thing::write_flatmap`] emits for the small case — pinned by
+/// `oversized_flatmap_layout_matches_beam_term` — so a map of any pair count
+/// round-trips as a flat map and every existing reader still applies.
 ///
 /// Layout (`erl_map.c:673-700`, `erl_map.h:181-199`): the word block
 /// `[arityval(n), k0 … k(n-1), MAP_HEADER_FLATMAP, n, keys, v0 … v(n-1)]`, where
@@ -237,12 +235,12 @@ pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> 
 /// `hp` must point at [`beam_term::thing::flatmap_size_words`]`(pairs.len())`
 /// exclusively-owned, writable words, which are all written by this call and must
 /// stay live (and unmoved) for as long as the returned term is used.
-/// `MAP_SMALL_MAP_LIMIT < pairs.len() <= MAX_ARITYVAL`.
+/// `0 < pairs.len() <= MAX_ARITYVAL`.
 unsafe fn write_large_flatmap(hp: *mut Eterm, pairs: &[(Eterm, Eterm)]) -> Eterm {
     let n = pairs.len();
     debug_assert!(
-        n > MAP_SMALL_MAP_LIMIT && n <= MAX_ARITYVAL,
-        "the oversized flatmap writer holds more than MAP_SMALL_MAP_LIMIT pairs"
+        n > 0 && n <= MAX_ARITYVAL,
+        "a non-empty flat map fits the arityval header"
     );
     // SAFETY: the caller reserved `4 + 2n` words at `hp`. The keys tuple occupies
     // `hp[0..=n]`, the flatmap head prefix `[head, size, keys]` occupies
@@ -262,7 +260,6 @@ unsafe fn write_large_flatmap(hp: *mut Eterm, pairs: &[(Eterm, Eterm)]) -> Eterm
         make_boxed(hp.add(1 + n))
     }
 }
-
 /// Splits a flat map into its `(keys, values)`.
 ///
 /// Both slices are borrowed from the term's storage (the caller must keep the
@@ -770,6 +767,49 @@ mod tests {
     }
 
     #[test]
+    fn oversized_flatmap_layout_matches_beam_term() {
+        // The retained writer is the LCA's flatmap writer with its `MAP_SMALL_MAP_LIMIT`
+        // bound lifted, so the same pairs must produce the same block word for word.
+        // Checked at a small pair count, where both writers are in range.
+        let pairs: Vec<(Eterm, Eterm)> = (0..4)
+            .map(|i| (make_small(i as i64), make_small(i as i64 + 1000)))
+            .collect();
+        let n = pairs.len();
+        let words = thing::flatmap_size_words(n);
+        let mut heap = Heap::new(2 * words).expect("a tiny heap");
+        // SAFETY: `alloc_words` returned `words` exclusively-owned, writable words per
+        // block, and `n <= MAP_SMALL_MAP_LIMIT` is inside both writers' documented range.
+        let (lca_hp, lca, ours_hp, ours) = unsafe {
+            let lca_hp = heap.alloc_words(words).unwrap();
+            let ours_hp = heap.alloc_words(words).unwrap();
+            (
+                lca_hp,
+                thing::write_flatmap(lca_hp, &pairs),
+                ours_hp,
+                write_large_flatmap(ours_hp, &pairs),
+            )
+        };
+        // SAFETY: both blocks are the `4 + 2n` words the calls above just initialised.
+        let (lca_words, ours_words) = unsafe {
+            (
+                core::slice::from_raw_parts(lca_hp, words),
+                core::slice::from_raw_parts(ours_hp, words),
+            )
+        };
+        for i in 0..words {
+            if i == 3 + n {
+                // The keys tuple term points back at the block base, so its raw word is
+                // block-specific: compare the *offset* it encodes, not the address.
+                assert_eq!(boxed_val(lca_words[i]), lca_hp, "LCA keys tuple");
+                assert_eq!(boxed_val(ours_words[i]), ours_hp, "our keys tuple");
+            } else {
+                assert_eq!(lca_words[i], ours_words[i], "word {i} of the flat map");
+            }
+        }
+        // The same root offset: the flatmap head at `hp + 1 + n`.
+        assert_eq!(boxed_val(lca), lca_hp.wrapping_add(1 + n));
+        assert_eq!(boxed_val(ours), ours_hp.wrapping_add(1 + n));
+    }    #[test]
     fn flatmap_parts_rejects_non_maps_and_a_corrupt_size() {
         let mut heap = new_heap();
         let tuple = heap.tuple(&[make_small(1)]).unwrap();

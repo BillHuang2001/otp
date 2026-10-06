@@ -4,7 +4,9 @@
 
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
-    use beam_term::prelude::{make_atom, make_small, Atom, NIL};
+    use beam_term::prelude::{
+        make_atom, make_internal_pid, make_pid_data, make_small, Atom, NIL,
+    };
 
     use super::*;
     use crate::error::is_unsupported;
@@ -413,6 +415,32 @@
         expected.extend_from_slice(&2u32.to_be_bytes());
         expected.extend_from_slice(&3u32.to_be_bytes());
         assert_eq!(encode_term_body(pid, &atoms).unwrap(), expected);
+    }
+
+    #[test]
+    fn internal_pid_uses_local_node_for_new_pid_ext() {
+        let mut atoms = AtomTable::new();
+        let sysname = atoms.intern("nonode@nohost");
+        // `make_pid_data(ser, num)` ⇒ serial 0, process number 10.
+        let pid = make_internal_pid(make_pid_data(0, 10));
+
+        // With a local node identity the internal pid becomes a `NEW_PID_EXT`.
+        let mut encoder = Encoder::new(&atoms).with_local_node(sysname, 0);
+        encoder.encode(pid).unwrap();
+        assert_eq!(
+            encoder.finish(),
+            vec![
+                131, 88, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115,
+                116, 0, 0, 0, 10, 0, 0, 0, 0, 0, 0, 0, 0,
+            ]
+        );
+
+        // Without a local node identity an internal id has no wire image.
+        let mut bare = Encoder::new(&atoms);
+        let err = bare
+            .encode(pid)
+            .expect_err("an internal pid without a local node is unsupported");
+        assert!(is_unsupported(&err));
     }
 
     #[test]

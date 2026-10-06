@@ -15,8 +15,11 @@ mod fun;
 mod record;
 
 use beam_common::Result;
-use beam_term::prelude::{atom_val, is_atom, is_list, is_nil, is_small, signed_value};
-use beam_term::{AtomTable, Eterm};
+use beam_term::prelude::{
+    atom_val, is_atom, is_internal_pid, is_internal_port, is_list, is_nil, is_small, make_atom,
+    pid_number, pid_serial, port_number, signed_value,
+};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::atom_cache::AtomCacheWriter;
 use crate::error;
@@ -125,6 +128,11 @@ pub struct Encoder<'a> {
     /// The outbound atom cache, when the caller installed one via
     /// [`Encoder::with_atom_cache`]. `None` writes every atom inline.
     atom_cache: Option<&'a mut dyn AtomCacheWriter>,
+    /// The local node identity (`sysname` atom + `creation`) used to encode
+    /// internal pid/port immediates as `NEW_PID_EXT`/`V4_PORT_EXT`. Node identity
+    /// is owned by the runtime, so it is an optional input; without it an internal
+    /// id has no wire image.
+    local_node: Option<(Atom, u32)>,
 }
 
 impl<'a> Encoder<'a> {
@@ -146,6 +154,7 @@ impl<'a> Encoder<'a> {
             atom_encoding: AtomEncoding::Utf8,
             minor_version: MinorVersion::V2,
             atom_cache: None,
+            local_node: None,
         }
     }
 
@@ -214,6 +223,15 @@ impl<'a> Encoder<'a> {
         self
     }
 
+    /// The local node identity (`sysname` atom + `creation`) used to encode
+    /// internal pid/port immediates as `NEW_PID_EXT`/`V4_PORT_EXT`. Without it an
+    /// internal id has no wire image (the sysname/creation are node identity,
+    /// owned by the runtime), so it reports `unsupported`.
+    pub fn with_local_node(mut self, node: Atom, creation: u32) -> Self {
+        self.local_node = Some((node, creation));
+        self
+    }
+
     /// Encodes `term`, appending it to the output.
     ///
     /// A tag the M1 term layer does not support yields
@@ -279,6 +297,25 @@ impl<'a> Encoder<'a> {
         }
         if let Ok((bytes, offset_bits, size_bits)) = bitstring_bytes(term) {
             return self.encode_bitstring(bytes, offset_bits, size_bits);
+        }
+        // Internal pids/ports are 60-bit `Eterm` immediates (not boxed external id
+        // things). They carry no node identity of their own, so the local node's
+        // sysname/creation — owned by the runtime — must be supplied via
+        // [`Encoder::with_local_node`].
+        if let Some((local_node, creation)) = self.local_node {
+            // Reading the id-tag bits of any `Eterm` is a safe, frozen-layout
+            // (`beam_term`) operation — no `unsafe` needed (the crate denies it).
+            if is_internal_pid(term) {
+                return self.encode_internal_pid(
+                    local_node,
+                    pid_number(term),
+                    pid_serial(term),
+                    creation,
+                );
+            }
+            if is_internal_port(term) {
+                return self.encode_internal_port(local_node, port_number(term), creation);
+            }
         }
         // Anything else is not representable by the M1 term layer (in practice an
         // off-heap `BinRef` block, which the Stage-0 foundations cannot build):
@@ -582,6 +619,34 @@ impl<'a> Encoder<'a> {
     fn encode_port(&mut self, node: Eterm, number: u64, creation: u32) -> Result<()> {
         self.buf.u8(V4_PORT_EXT);
         self.encode(node)?;
+        self.buf.u64be(number);
+        self.buf.u32be(creation);
+        Ok(())
+    }
+
+    /// Encodes an internal pid as `NEW_PID_EXT`: `[node][number:u32 BE][serial:u32 BE][creation:u32 BE]`.
+    fn encode_internal_pid(
+        &mut self,
+        node: Atom,
+        number: u64,
+        serial: u64,
+        creation: u32,
+    ) -> Result<()> {
+        let number = u32::try_from(number).map_err(|_| error::system_limit())?;
+        let serial = u32::try_from(serial).map_err(|_| error::system_limit())?;
+        self.buf.u8(NEW_PID_EXT);
+        self.encode(make_atom(node))?;
+        self.buf.u32be(number);
+        self.buf.u32be(serial);
+        self.buf.u32be(creation);
+        Ok(())
+    }
+
+    /// Encodes an internal port as `V4_PORT_EXT`: `[node][number:u64 BE][creation:u32 BE]`
+    /// (the C encoder always emits the v4 form for a port).
+    fn encode_internal_port(&mut self, node: Atom, number: u64, creation: u32) -> Result<()> {
+        self.buf.u8(V4_PORT_EXT);
+        self.encode(make_atom(node))?;
         self.buf.u64be(number);
         self.buf.u32be(creation);
         Ok(())

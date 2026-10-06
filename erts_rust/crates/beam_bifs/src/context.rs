@@ -9,14 +9,16 @@
 //! * the [`AtomTable`] (atom construction never invents an index);
 //! * the calling process's [`ProcessId`] — there is no ambient "current process"
 //!   in the Rust core, so identity is injected here;
-//! * six **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//! * the calling module's name, when the runtime knows it ([`BifContext::current_module`])
+//!   — the oracle derives a BIF's call site from it (`erlang:load_nif/2`);
+//! * seven **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
 //!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
 //!   `fun`-taking `lists`/`maps` BIFs), a [`PortHook`] (`open_port/2` and the
-//!   port BIFs) and a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
-//!   process-dictionary BIFs). `beam_engine` depends only on `beam_loader`, so
-//!   `beam_rt` supplies the concrete implementations; an unset seam means
-//!   `io:format` writes to stdout and the `send`/`ets`/`call_fun`/port/dict BIFs
-//!   report `unsupported_bif`.
+//!   port BIFs), a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
+//!   process-dictionary BIFs) and a [`NifLoader`] (`erlang:load_nif/2`).
+//!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
+//!   concrete implementations; an unset seam means `io:format` writes to stdout
+//!   and the `send`/`ets`/`call_fun`/port/dict/nif BIFs report `unsupported_bif`.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -237,11 +239,65 @@ pub trait DictHook {
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>>;
 }
 
+/// The structured failure of a NIF-load attempt.
+///
+/// The host ([`NifLoader`]) reports *why* a load failed; the `erlang:load_nif/2`
+/// BIF renders each variant as the oracle's `{error, {Reason, Text}}` term —
+/// `Reason` is the atom named here and `Text` the accompanying message
+/// (`../../erts/emulator/beam/erl_nif.c`, `load_nif_error`/`erts_load_nif`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum NifLoadError {
+    /// `{error, {load_failed, Text}}` — the shared object could not be loaded.
+    LoadFailed(String),
+    /// `{error, {bad_lib, Text}}` — the library is not a usable NIF library.
+    BadLib(String),
+    /// `{error, {reload, Text}}` — the library is already loaded.
+    Reload(String),
+    /// `{error, {load, Text}}` — a load error.
+    Load(String),
+    /// `{error, {upgrade, Text}}` — an upgrade error.
+    Upgrade(String),
+    /// `{error, {old_code, Text}}` — `load_nif` called from old code.
+    OldCode(String),
+}
+
+/// Loads a NIF library for the calling module.
+///
+/// A NIF library is a shared object whose symbols are bound into the emulator's
+/// NIF/driver ABI (Stage-5 machinery that lives in `beam_rt`/`beam_abi`, never in
+/// a BIF), so `erlang:load_nif/2` routes every load through this hook; `beam_rt`
+/// supplies the concrete implementation. Milestone-1 has no such provider, so the
+/// BIF raises `unsupported_bif` when no hook is installed (or the calling module is
+/// unknown) — never a fabricated `ok` and never a silently dropped load.
+///
+/// `module` is the module whose code contains the call site (the oracle derives it
+/// from the call instruction); `path` is the decoded string from the `Path`
+/// argument. The hook owns the shared-object suffix/suffixes it appends.
+///
+/// The return type is a plain [`core::result::Result`] (not the crate's
+/// [`beam_common::Result`] alias): a `NifLoadError` is *not* a [`BeamError`], and
+/// the BIF renders it as a term, so no `From<NifLoadError> for BeamError` is needed.
+pub trait NifLoader {
+    /// Loads the NIF library `path` for `module`, with the caller's `load_info`.
+    ///
+    /// # Errors
+    ///
+    /// A [`NifLoadError`] naming the failure; the BIF renders it as the oracle's
+    /// `{error, {Reason, Text}}` term (a normal return, not a raise — see `nif.rs`).
+    fn load_nif(
+        &mut self,
+        module: &str,
+        path: &str,
+        load_info: Eterm,
+    ) -> core::result::Result<(), NifLoadError>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
     atoms: &'a AtomTable,
     self_pid: ProcessId,
+    current_module: Option<&'a str>,
     output: Option<&'a mut dyn OutputSink>,
     sender: Option<&'a mut dyn SendHook>,
     tables: Option<&'a mut TableRegistry>,
@@ -249,6 +305,7 @@ pub struct BifContext<'a> {
     fun_caller: Option<&'a mut dyn FunCaller>,
     port: Option<&'a mut dyn PortHook>,
     dict: Option<&'a mut dyn DictHook>,
+    nif_loader: Option<&'a mut dyn NifLoader>,
 }
 
 impl<'a> BifContext<'a> {
@@ -259,6 +316,7 @@ impl<'a> BifContext<'a> {
             heap,
             atoms,
             self_pid,
+            current_module: None,
             output: None,
             sender: None,
             tables: None,
@@ -266,6 +324,7 @@ impl<'a> BifContext<'a> {
             fun_caller: None,
             port: None,
             dict: None,
+            nif_loader: None,
         }
     }
 
@@ -312,6 +371,19 @@ impl<'a> BifContext<'a> {
         self
     }
 
+    /// Installs the NIF-loading hook used by `erlang:load_nif/2`.
+    pub fn with_nif_loader(mut self, loader: &'a mut dyn NifLoader) -> Self {
+        self.nif_loader = Some(loader);
+        self
+    }
+
+    /// Sets the name of the module whose code is executing — the call site of a BIF
+    /// (the oracle derives `erlang:load_nif/2`'s module from its call instruction).
+    pub fn with_current_module(mut self, module: &'a str) -> Self {
+        self.current_module = Some(module);
+        self
+    }
+
     /// The destination heap.
     pub fn heap(&mut self) -> &mut Heap {
         &mut *self.heap
@@ -325,6 +397,14 @@ impl<'a> BifContext<'a> {
     /// The calling process's pid.
     pub fn self_pid(&self) -> ProcessId {
         self.self_pid
+    }
+
+    /// The name of the module whose code is executing, when the runtime knows it.
+    ///
+    /// The oracle derives `erlang:load_nif/2`'s owning module from the call site;
+    /// with `None` the BIF reports `unsupported_bif` rather than guessing.
+    pub fn current_module(&self) -> Option<&str> {
+        self.current_module
     }
 
     /// Writes `s` to the configured sink, or to stdout when none is installed.
@@ -349,6 +429,14 @@ impl<'a> BifContext<'a> {
     /// stay valid for the context's own lifetime, not merely the accessor's borrow.
     pub fn sender(&mut self) -> Option<&mut (dyn SendHook + 'a)> {
         self.sender.as_deref_mut()
+    }
+
+    /// The installed NIF-loading hook, if any.
+    ///
+    /// The trait-object lifetime is spelled out (`dyn NifLoader + 'a`) for the same
+    /// invariance reason as [`BifContext::sender`].
+    pub fn nif_loader(&mut self) -> Option<&mut (dyn NifLoader + 'a)> {
+        self.nif_loader.as_deref_mut()
     }
 
     /// The installed table registry, if any.
