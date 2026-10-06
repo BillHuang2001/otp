@@ -437,9 +437,9 @@ holds `Process` values directly.
 - `beam_alloc::Heap` exhaustion (`AllocKind::Heap`) from the young heap means **collect and retry**
   (see `beam_alloc`/`beam_gc` Design Decisions), not fatal OOM — `Process::deliver` implements that
   retry.
-- The collector moves live terms, so **every** in-heap reference must be a root: registers, stack and
-  (M1) the mailbox payloads. If you add an in-heap sub-rootset (process dictionary, saved args), add it
-  to `Process::collect`'s gather/scatter in the same change.
+- The collector moves live terms, so **every** in-heap reference must be a root. `Process::collect`
+  scans registers/stack, mailbox payloads, the process dictionary (`Dict`) and saved args (`SavedArgs`)
+  — add any NEW in-heap sub-rootset to its gather/scatter, in the same order, in the same change.
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, the seam types and the wave-3 dependency position.
 - `../../CONTEXT.md` → workspace contracts (§1 A.1 process semantics, §3 error strategy, §5 GC/memory model, §6 test gate).
