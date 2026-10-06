@@ -31,12 +31,25 @@ use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::{MonitoredBy, Monitor, MonitorKind, MonitorRef, PortId, ProcessId};
+use beam_process::{MonitoredBy, Monitor, MonitorKind, MonitorRef, PortId, Priority, ProcessId};
 use beam_term::{atom_val, is_atom, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
 
+/// The `spawn_opt/2,3,4` options the runtime honours.
+///
+/// The option list is parsed once, before the child is created, so an unsupported or
+/// malformed option is reported **without** spawning a process the caller did not ask for.
+#[derive(Default)]
+struct SpawnOptions {
+    /// `link` — link the child to the caller.
+    link: bool,
+    /// `monitor` — monitor the child and answer `{Pid, Ref}`.
+    monitor: bool,
+    /// `{priority, P}` — the child's scheduling priority.
+    priority: Option<Priority>,
+}
 impl RuntimeContext<'_> {
     // -- erlang:make_ref/0 ----------------------------------------------------
 
@@ -51,7 +64,231 @@ impl RuntimeContext<'_> {
         Ok(term)
     }
 
-    // -- erlang:monitor/2 and erlang:demonitor/1,2 ----------------------------
+    // -- erlang:spawn/1,2,3, spawn_link/1,2,3, spawn_opt/2,3,4 ----------------
+
+    /// `erlang:spawn(Fun)`: a new process applying the 0-arity `Fun`.
+    ///
+    /// The fun is applied to **no** arguments (the oracle's `spawn/1` requires a 0-arity
+    /// fun); the child is registered with the runtime's own process table and appended to
+    /// the scheduler's run queue, so it runs at the next scheduler pass — including a pass
+    /// the `-eval` evaluator's `receive` drives (`Runtime::pump_scheduler`).
+    ///
+    /// A non-fun argument is the oracle's `badarg`.
+    pub(super) fn spawn_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fun = *args.first().ok_or(BeamError::BadArg)?;
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        self.spawn_fun_child(fun, Vec::new())
+    }
+
+    /// `erlang:spawn(Module, Function)`: `Module:Function/0` in a new process.
+    pub(super) fn spawn_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let (module, function) = self.export_target(args)?;
+        self.spawn_export_child(&module, &function, Vec::new())
+    }
+
+    /// `erlang:spawn(Module, Function, Args)`: `Module:Function(Args...)` in a new process.
+    ///
+    /// `Args` must be a list; anything else is the oracle's `badarg`.
+    pub(super) fn spawn_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let (module, function) = self.export_target(args)?;
+        let call_args = self.argument_list(*args.get(2).ok_or(BeamError::BadArg)?)?;
+        self.spawn_export_child(&module, &function, call_args)
+    }
+
+    /// `erlang:spawn_link(Fun)`: `spawn/1`, with a **link** to the calling process.
+    pub(super) fn spawn_link_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let child = self.spawn_1(args)?;
+        self.link_to_child(child)
+    }
+
+    /// `erlang:spawn_link(Module, Function)`: `spawn/2` plus a link.
+    pub(super) fn spawn_link_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let child = self.spawn_2(args)?;
+        self.link_to_child(child)
+    }
+
+    /// `erlang:spawn_link(Module, Function, Args)`: `spawn/3` plus a link.
+    pub(super) fn spawn_link_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let child = self.spawn_3(args)?;
+        self.link_to_child(child)
+    }
+
+    /// `erlang:spawn_opt(Fun, Options)`.
+    pub(super) fn spawn_opt_2(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let fun = *args.first().ok_or(BeamError::BadArg)?;
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        let options = self.spawn_options(*args.get(1).ok_or(BeamError::BadArg)?, 2)?;
+        let child = self.spawn_fun_child(fun, Vec::new())?;
+        self.apply_spawn_options(child, &options)
+    }
+
+    /// `erlang:spawn_opt(Module, Function, Options)`.
+    pub(super) fn spawn_opt_3(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let (module, function) = self.export_target(args)?;
+        let options = self.spawn_options(*args.get(2).ok_or(BeamError::BadArg)?, 3)?;
+        let child = self.spawn_export_child(&module, &function, Vec::new())?;
+        self.apply_spawn_options(child, &options)
+    }
+
+    /// `erlang:spawn_opt(Module, Function, Args, Options)`.
+    pub(super) fn spawn_opt_4(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let (module, function) = self.export_target(args)?;
+        let call_args = self.argument_list(*args.get(2).ok_or(BeamError::BadArg)?)?;
+        let options = self.spawn_options(*args.get(3).ok_or(BeamError::BadArg)?, 4)?;
+        let child = self.spawn_export_child(&module, &function, call_args)?;
+        self.apply_spawn_options(child, &options)
+    }
+
+    // -- the spawn family's helpers -------------------------------------------
+
+    /// The `(Module, Function)` atoms a `spawn/2,3`-shaped call names, as names.
+    fn export_target(&mut self, args: &[Eterm]) -> Result<(String, String)> {
+        let module = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        let function = self
+            .atom_name(*args.get(1).ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        Ok((module, function))
+    }
+
+    /// `term` as the call-argument list (`BadArg` for a non-list).
+    fn argument_list(&self, term: Eterm) -> Result<Vec<Eterm>> {
+        terms::list_elements(term).map_err(|_| BeamError::BadArg)
+    }
+
+    /// Spawns a fun-bodied child and answers its pid term.
+    ///
+    /// The child is created in the runtime's **own** process table, so a spawn from inside
+    /// a scheduler slice — whose pass owns that table — is refused as a typed capability
+    /// gap rather than silently lost (see [`Self::check_spawnable`]).
+    fn spawn_fun_child(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<Eterm> {
+        self.check_spawnable()?;
+        Ok(self.runtime.spawn_fun_process(fun, args)?.to_eterm())
+    }
+
+    /// Spawns an `Module:Function(Args…)` child and answers its pid term.
+    ///
+    /// The module is resolved through the code server exactly as an external call's is, so
+    /// its not-found/not-exported diagnostic — and the system code-path seeding — come from
+    /// the one place that owns them (`Runtime::spawn_process`).
+    fn spawn_export_child(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: Vec<Eterm>,
+    ) -> Result<Eterm> {
+        self.check_spawnable()?;
+        Ok(self.runtime.spawn_process(module, function, args)?.to_eterm())
+    }
+
+    /// Refuses a spawn made from inside a scheduler slice.
+    ///
+    /// A context built by [`RuntimeContext::for_process`] runs *inside* a scheduler pass,
+    /// which has moved the runtime's process table and runner state out for the duration —
+    /// a child appended to the runtime's own table would never be run (and would be
+    /// overwritten when the pass puts its table back), so it is reported honestly.
+    fn check_spawnable(&self) -> Result<()> {
+        if !self.owns_process_table() {
+            return Err(error::unsupported(
+                "erlang:spawn from inside a scheduler slice",
+            ));
+        }
+        Ok(())
+    }
+
+    /// Links the calling process to the child `pid_term` stands for (`spawn_link/*`).
+    fn link_to_child(&mut self, pid_term: Eterm) -> Result<Eterm> {
+        let child = ProcessId::from_eterm(pid_term)?;
+        let parent = self.pid();
+        self.process_table_mut().link(parent, child)?;
+        Ok(pid_term)
+    }
+
+    /// The parsed `spawn_opt/2,3,4` option list.
+    ///
+    /// `arity` only names the call in a reported gap.
+    fn spawn_options(&mut self, term: Eterm, arity: u32) -> Result<SpawnOptions> {
+        let options = self.argument_list(term)?;
+        let mut parsed = SpawnOptions::default();
+        for option in options {
+            if let Some(name) = self.atom_name(option) {
+                match name.as_str() {
+                    "link" => parsed.link = true,
+                    "monitor" => parsed.monitor = true,
+                    // A *named* option the runtime does not honour is reported, never
+                    // silently ignored: the caller asked for a guarantee it would not get.
+                    _ => {
+                        return Err(error::unsupported(&format!(
+                            "erlang:spawn_opt/{arity} option {name}"
+                        )))
+                    }
+                }
+                continue;
+            }
+            if terms::tuple_arity(option).is_ok() {
+                match self.atom_name(terms::tuple_element(option, 0)?).as_deref() {
+                    Some("priority") => {
+                        let name = self
+                            .atom_name(terms::tuple_element(option, 1)?)
+                            .ok_or(BeamError::BadArg)?;
+                        parsed.priority =
+                            Some(self.spawn_priority(&name).ok_or(BeamError::BadArg)?);
+                    }
+                    Some(other) => {
+                        return Err(error::unsupported(&format!(
+                            "erlang:spawn_opt/{arity} option {{{other}, _}}"
+                        )))
+                    }
+                    None => return Err(BeamError::BadArg),
+                }
+                continue;
+            }
+            // Junk that is neither an option atom nor an option tuple.
+            return Err(BeamError::BadArg);
+        }
+        Ok(parsed)
+    }
+
+    /// The [`Priority`] the `max|high|normal|low` atom `name` names.
+    fn spawn_priority(&self, name: &str) -> Option<Priority> {
+        Priority::LEVELS
+            .into_iter()
+            .find(|priority| priority.name() == name)
+    }
+
+    /// Applies the parsed options to the freshly spawned `child` and answers what
+    /// `spawn_opt` returns: the bare pid, or `{Pid, Ref}` when `monitor` was asked for.
+    fn apply_spawn_options(&mut self, child_term: Eterm, options: &SpawnOptions) -> Result<Eterm> {
+        let child = ProcessId::from_eterm(child_term)?;
+        let parent = self.pid();
+        if options.link {
+            self.process_table_mut().link(parent, child)?;
+        }
+        if let Some(priority) = options.priority {
+            self.process_table_mut().set_priority(child, priority)?;
+        }
+        if options.monitor {
+            let reference = self
+                .process_table_mut()
+                .monitor(parent, child, MonitorKind::Process)?;
+            let ref_term = {
+                let mut heap = self.runtime.take_bif_heap()?;
+                let term = reference.to_eterm(&mut heap);
+                self.runtime.put_bif_heap(heap);
+                term?
+            };
+            // Recorded so `erlang:demonitor/1` recognises the reference (the same term →
+            // monitor map the native `erlang:monitor/2` fills).
+            self.runtime.references.insert(ref_term, Some(reference));
+            return terms::make_tuple(self, &[child_term, ref_term]);
+        }
+        Ok(child_term)
+    }    // -- erlang:monitor/2 and erlang:demonitor/1,2 ----------------------------
 
     /// `erlang:monitor(process, Target)`: a fresh reference, with the monitor recorded on
     /// both sides (the caller's outgoing `Monitors` and the target's `monitored_by`).
