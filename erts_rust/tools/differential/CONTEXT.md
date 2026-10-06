@@ -115,21 +115,21 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **`gate.sh` layers the CI exit codes on the binary.** The binary keeps its `0/1/2` contract (and lenient `run` stays `0` for an unsupported case); the script reads the report's top-level `summary` and maps mismatch→`1`, unsupported/skipped→`3`. See the *gate.sh* section.
 
 ## Known Issues / Notes for Agents
-- **The Rust side is a partial runtime; today's gate is 0 mismatches** (333-case corpus). The **module-run** cases (embedded sources + the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
-  - Current rollup (**stable across repeated runs**): **333 total · 323 agree · 0 mismatch · 10 unsupported · 0 skipped** (`gate.sh` → exit `3`).
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (431-case corpus). The **module-run** cases (embedded sources, the native-record module group, and the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention.
+  - Current rollup (**stable across repeated runs** — verified byte-identical over 6 consecutive full-suite runs): **431 total · 423 agree · 0 mismatch · 8 unsupported · 0 skipped** (`gate.sh` → exit `3`).
   - Per-contract rollup (A.1–A.9; a case may declare several contracts, so the column totals exceed `summary.total`):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
-| A.1 language semantics | 96 | 96 | 0 | 0 | 0 |
-| A.2 .beam binary/ETF bytes | 115 | 115 | 0 | 0 | 0 |
-| A.3 NIF C ABI | 8 | 8 | 0 | 0 | 0 |
-| A.4 driver C ABI / port | 22 | 21 | 0 | 1 | 0 |
-| A.5 distribution wire protocol | 55 | 51 | 0 | 4 | 0 |
-| A.6 CLI flags and configuration | 6 | 6 | 0 | 0 | 0 |
-| A.7 OTP application contracts | 99 | 99 | 0 | 0 | 0 |
+| A.1 language semantics | 118 | 118 | 0 | 0 | 0 |
+| A.2 .beam binary/ETF bytes | 134 | 134 | 0 | 0 | 0 |
+| A.3 NIF C ABI | 18 | 18 | 0 | 0 | 0 |
+| A.4 driver C ABI / port | 37 | 37 | 0 | 0 | 0 |
+| A.5 distribution wire protocol | 62 | 58 | 0 | 4 | 0 |
+| A.6 CLI flags and configuration | 16 | 16 | 0 | 0 | 0 |
+| A.7 OTP application contracts | 128 | 127 | 0 | 1 | 0 |
 | A.8 introspection / system_info | 9 | 9 | 0 | 0 | 0 |
-| A.9 build and bootstrapping | 40 | 35 | 0 | 5 | 0 |
+| A.9 build and bootstrapping | 52 | 49 | 0 | 3 | 0 |
 
 - **The 10 `unsupported` cases (all honest capability gaps, none a mismatch).** Their goldens are the oracle's own output, so each flips to `agree` automatically once the gap closes:
   - **A.4 (1) — a port write BIF:** `driver/port_command_write_read` (`beam_rt: unsupported: erlang:port_command/2 is a known BIF that is not implemented`).
