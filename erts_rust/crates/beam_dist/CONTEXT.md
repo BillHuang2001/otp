@@ -7,11 +7,14 @@ capability (`DFLAG_*`) negotiation, control-message (`DOP_*`) framing + term pay
 fragmentation/reassembly, the distribution atom cache, the on-wire packet-length framing, the
 distribution-header envelope, and the `epmd` port-mapper client protocol.
 
-The crate is primarily **pure protocol/value code over the abstract [`transport`] seam** — the codecs
+The crate's core is **pure protocol/value code over the abstract [`transport`] seam** — the codecs
 never open a socket. The [`connection`] module adds a concrete `std::net::TcpStream` adapter
-([`connection::TcpTransport`]) and drives a **live distribution link end-to-end** (handshake → `DOP_*`
-exchange), which is what the runtime drives; a live test exercises it against a real `erl` node (see
-Test Strategy). The runtime's production transport remains `beam_io`'s job.
+([`connection::TcpTransport`] + [`connection::TcpListener`]) and drives a **live distribution link
+end-to-end** (epmd lookup → handshake → `DOP_*` exchange) through the blocking
+[`connection::Connection`]; the [`driver`] module adds a **non-blocking `ConnectionDriver`** (a
+poll/step state machine over a byte-fed internal buffer) so a runtime can multiplex many links on one
+thread. Both are live-tested against a real `erl` node (see Test Strategy). The runtime's production
+transport remains `beam_io`'s job.
 
 Term encoding/decoding is **never re-implemented here**: every term crosses the wire through
 `beam_codec` (ETF). This crate owns only the *distribution-specific* wire: the flag/opcode vocabulary,
