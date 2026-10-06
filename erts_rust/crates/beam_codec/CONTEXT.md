@@ -340,10 +340,23 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   vectors assert. The block layout itself is the one boxed layout `beam_term` does not yet own, so it
   lives in the local, explicitly-marked shim `src/term/binary.rs` (`make_bitstring`/`bitstring_parts`/
   `bitstring_bytes`) and is **owed** to `beam_term::thing` (see that module's `TODO(extract …)`).
+  The *reader* `binary.rs::bitstring_parts` is a validated duplicate of the already-present
+  `beam_term::compare::bitstring_parts` (a `pub(crate) unsafe fn` doing the same
+  base/offset/size arithmetic, plus `boxed::bitstring_size`), which the codec re-derives with
+  `is_bitstring` + header-arity + `end >= start` guards. `BITSTRING_POINTER_FLAG_MASK` (`0x3`)
+  duplicates the `& !3usize` that `beam_term::compare::bitstring_parts` hardcodes. Promoting that
+  reader to `beam_term::thing` (public) and adding a `write_bitstring` constructor would make the
+  whole shim a thin forwarder.
 - **Maps are always flatmaps, of any pair count** (the interior flatmap/hashmap switchover is an
-  *open* layout, so there is no `MAP_SMALL_MAP_LIMIT` cutoff here — the decode policy constant in
-  `decode.rs` is not a layout duplicate). Pair order is preserved as-is on the wire; duplicate keys
-  are **not** detected (that needs term comparison) and the wire order is kept exactly.
+  *open* layout, so there is no `MAP_SMALL_MAP_LIMIT` cutoff here). The cap exists in
+  `beam_term::thing::write_flatmap` (a `debug_assert!` at `n <= 32`) and is *worked around*, not
+  hit: `term/mod.rs` picks `thing::write_flatmap` for `n <= 32` and its **own**
+  `write_large_flatmap` (`term/mod.rs:213`) above it — the crate's `MAP_SMALL_MAP_LIMIT` const is
+  in `term/mod.rs:66` (not `decode.rs`). `write_large_flatmap` emits byte-for-byte the same flatmap
+  layout as `thing::write_flatmap` (pinned by `flatmap_layout_matches_beam_term`), so a public
+  oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
+  as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
+  order is kept exactly.
 - Funs (`112`/`113`), records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain
   unsupported: funs/exports are blocked on a fun/export registry that does not exist yet (owned by
   `beam_loader`/`beam_rt`), records are a legacy native term (ordinary Erlang records encode as

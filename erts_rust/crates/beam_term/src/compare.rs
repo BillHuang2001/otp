@@ -55,7 +55,8 @@
 use core::cmp::Ordering;
 
 use crate::atom::AtomTable;
-use crate::boxed::{boxed_val, header_arity, is_float, HEADER_SUB_BITS};
+use crate::bitstring::{bit_at, bitstring_parts, float_bits, float_value};
+use crate::boxed::{boxed_val, header_arity, is_float};
 use crate::eterm::Eterm;
 use crate::immediate::{
     atom_val, internal_pid_data, internal_port_data, is_atom, is_small, signed_value,
@@ -160,9 +161,67 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         TermClass::Port => internal_port_data(a).cmp(&internal_port_data(b)),
         TermClass::Ref => unsafe { cmp_refs(a, b) },
         TermClass::Nil => Ordering::Equal,
+        // SAFETY: both operands are live maps.
+        TermClass::Map => cmp_maps(a, b, atoms, exact),
         // Documented deterministic fallback (see the module `Known Issues`).
         _ => fallback_cmp(a, b),
     }
+}
+
+/// The *internal* flat-map key order — `erts_cmp_flatmap_keys`
+/// (`erts/emulator/beam/erl_utils.h:267-272`).
+///
+/// Two atom keys are ordered by **atom index** (`key_a - key_b` in the C); any
+/// other pair is ordered by the exact term order ([`cmp`]). This is the order in
+/// which a flat map stores its keys (`erts_validate_and_sort_flatmap`) and the
+/// order the C uses to compare map keys, so it — not the plain term order — is
+/// what [`cmp_maps`] must use to be observable-compatible.
+pub fn cmp_flatmap_keys(key_a: Eterm, key_b: Eterm, atoms: &AtomTable) -> Ordering {
+    if is_atom(key_a) && is_atom(key_b) {
+        atom_val(key_a).raw().cmp(&atom_val(key_b).raw())
+    } else {
+        cmp(key_a, key_b, atoms)
+    }
+}
+
+/// Compare two maps — the `MAP_SUBTAG` arm of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:1955-2118`).
+///
+/// Erlang map order is: **size first**, then the key/value pairs ordered by the
+/// *flat-map key order* ([`cmp_flatmap_keys`]). The C compares the whole key
+/// sequence before the value sequence (it pushes the value comparisons first and
+/// the key comparisons last on its work stack, so keys are popped — and
+/// therefore compared — first), which is exactly a lexicographic comparison of
+/// `(key-list, value-list)`; we reproduce that literally.
+///
+/// Both operands are, by the caller invariant, well-formed maps. A malformed
+/// map (only reachable if the term was forged outside this crate) falls back to
+/// the deterministic [`fallback_cmp`] rather than panicking.
+fn cmp_maps(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    let (pa, pb) = match (
+        crate::map::map_pairs_flatmap_order(a, atoms),
+        crate::map::map_pairs_flatmap_order(b, atoms),
+    ) {
+        (Ok(pa), Ok(pb)) => (pa, pb),
+        _ => return fallback_cmp(a, b),
+    };
+    if pa.len() != pb.len() {
+        return pa.len().cmp(&pb.len());
+    }
+    for i in 0..pa.len() {
+        let ord = cmp_flatmap_keys(pa[i].0, pb[i].0, atoms);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    for i in 0..pa.len() {
+        // SAFETY: the value sub-terms of two live, well-formed maps.
+        let ord = cmp_impl(pa[i].1, pb[i].1, atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
 }
 
 /// `erts_cmp_atoms` — lexicographic comparison of the atom *names*.
@@ -178,25 +237,6 @@ fn cmp_atoms(a: Eterm, b: Eterm, atoms: &AtomTable) -> Ordering {
         (Some(na), Some(nb)) => na.as_bytes().cmp(nb.as_bytes()),
         _ => ia.raw().cmp(&ib.raw()),
     }
-}
-
-/// The `f64` value stored in a boxed float term.
-///
-/// # Safety
-///
-/// `x` must be a live boxed float (`is_float(x)`).
-pub(crate) unsafe fn float_value(x: Eterm) -> f64 {
-    f64::from_bits(unsafe { float_bits(x) })
-}
-
-/// The raw `f64` bits stored in a boxed float term.
-///
-/// # Safety
-///
-/// `x` must be a live boxed float (`is_float(x)`).
-pub(crate) unsafe fn float_bits(x: Eterm) -> u64 {
-    // The 64-bit flonum is a 1-word thing: value at `boxed_val(x)[1]`.
-    unsafe { (*boxed_val(x).add(1)).raw() as u64 }
 }
 
 /// `erts_float_exact_sortable` — a total order over `f64` bits where
@@ -410,54 +450,22 @@ unsafe fn cmp_lists(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Order
 /// `a` and `b` must be live bitstring terms.
 unsafe fn cmp_bitstrings(a: Eterm, b: Eterm) -> Ordering {
     // SAFETY: both are bitstrings.
-    let (ab, ao, asz) = unsafe { bitstring_parts(a) };
-    let (bb, bo, bsz) = unsafe { bitstring_parts(b) };
+    let asz = unsafe { bitstring_parts(a) }.2;
+    // SAFETY: as above.
+    let bsz = unsafe { bitstring_parts(b) }.2;
     let n = asz.min(bsz);
     let mut i = 0;
     while i < n {
-        // SAFETY: bit `ao + i` / `bo + i` is within the respective bitstring.
-        let abit = unsafe { bit_at(ab, ao + i) };
-        let bbit = unsafe { bit_at(bb, bo + i) };
+        // SAFETY: bit `i` is within both bitstrings (`i < n <= asz, bsz`).
+        let abit = unsafe { bit_at(a, i) };
+        // SAFETY: as above.
+        let bbit = unsafe { bit_at(b, i) };
         if abit != bbit {
             return abit.cmp(&bbit);
         }
         i += 1;
     }
     asz.cmp(&bsz)
-}
-
-/// Read bit `bit` (0 = most significant of the first byte) of a bitstring base.
-///
-/// # Safety
-///
-/// `base` must point at the bit data of a bitstring covering bit `bit`.
-pub(crate) unsafe fn bit_at(base: *const u8, bit: usize) -> u8 {
-    // SAFETY: the caller guarantees the byte is in range.
-    unsafe { (*base.add(bit >> 3) >> (7 - (bit & 7))) & 1 }
-}
-
-/// Decompose a bitstring into `(base byte pointer, start bit offset, bit size)`.
-///
-/// # Safety
-///
-/// `x` must be a live bitstring (heap bits or sub bits) term, and — for sub bits
-/// — the base pointer must still be valid (i.e. it must not be a volatile
-/// writable binary).
-pub(crate) unsafe fn bitstring_parts(x: Eterm) -> (*const u8, usize, usize) {
-    // SAFETY: `x` is a live boxed bitstring.
-    let p = boxed_val(x);
-    let hdr = unsafe { *p };
-    if hdr == HEADER_SUB_BITS {
-        // ErlSubBits: [thing_word, base_flags, start, end, orig].
-        let base_flags = unsafe { *p.add(1) }.raw();
-        let start = unsafe { *p.add(2) }.raw();
-        let end = unsafe { *p.add(3) }.raw();
-        ((base_flags & !3usize) as *const u8, start, end - start)
-    } else {
-        // ErlHeapBits: [thing_word, size, data...].
-        let size = unsafe { *p.add(1) }.raw();
-        (unsafe { p.add(2) } as *const u8, 0, size)
-    }
 }
 
 /// Compare two internal references by their raw payload words, most significant

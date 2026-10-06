@@ -21,6 +21,16 @@ pub(crate) fn carrier_failure(bytes: usize) -> BeamError {
     oom(AllocKind::Carrier, bytes)
 }
 
+/// An off-heap large object (a [`crate::binary::RefcBinary`] payload) could not be
+/// allocated. Classified as [`AllocKind::LargeObject`].
+///
+/// The payload is an off-heap large object regardless of which allocator path served
+/// it, so a failure is reported as such rather than as the underlying carrier/heap
+/// class the caller cannot see.
+pub(crate) fn large_object_failure(bytes: usize) -> BeamError {
+    oom(AllocKind::LargeObject, bytes)
+}
+
 /// A per-process [`crate::heap::Heap`] ran out of room for `words` term words.
 ///
 /// The word count is converted to bytes so the carried [`AllocFailure`] is uniform.

@@ -33,7 +33,12 @@ Inherited and refined from `../CONTEXT.md` — do not restate, obey:
 
 ### The seam types (the inter-crate interface each crate MUST expose for its dependents)
 This is the frozen public-API shape dependents design against; keep it stable.
-- `beam_alloc` → `Allocator`/`AllocRef` (carrier-backed), `Heap`/bump process-heap, size classes.
+- `beam_term` → frozen term layout; `map` (flat-map ↔ HAMT/CHAMP builder: `write_map`/`map_words_capacity`/
+  `map_size`/`map_get`/`map_pairs`/`map_put`/`map_remove`), `bitstring` (`write_heap_bits`/`write_binary`/
+  `write_sub_bits`/public `bitstring_parts`/`bit_at`/`float_bits`/`float_value`), `refc` (`BinRef`/`ErlSubBits`
+  layout + accessors), plus `thing`/`compare`/`hashing`/`size`.
+- `beam_alloc` → `Allocator`/`AllocRef` (carrier-backed), `Heap`/bump process-heap, size classes; `RefCount`
+  (the single `erts_refc_*` primitive); `RefcBinary` (off-heap refcounted large-binary payload).
 - `beam_abi` → `#[repr(C)]` NIF (`ERL_NIF_TERM`, `ErlNifEnv`, `ErlNifEntry`, `enif_*` fn table) and
   driver (`ErlDrvEntry`, `ErlDrvBinary`, `erl_drv_*`) types + `Eterm ↔ ERL_NIF_TERM` transmute.
 - `beam_codec` → `Encoder`/`Decoder` (ETF), tag constants, `VERSION_MAGIC = 131`, compression.
@@ -43,7 +48,8 @@ This is the frozen public-API shape dependents design against; keep it stable.
   process/stack state, trap/signal handling) so the engine depends only on `beam_loader` and the
   concrete context is supplied by `beam_rt` (keeps the Stage-1/Stage-5 DAG acyclic).
 - `beam_ets` → `Table` handle + set/ordered_set/hash ops.
-- `beam_gc` → per-process copying collector entry (`gc`/`collect`) + MSO refcount interface.
+- `beam_gc` → per-process copying collector entry (`gc`/`collect`) + `OffHeap` refcount interface
+  (`OffHeapEntry::{Mso, Binary}`); re-exports `beam_alloc::RefCount`.
 - `beam_message` → `copy_struct` (term movement across heaps) + send/receive envelope.
 - `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue, signals/links/monitors.
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface.
@@ -86,6 +92,37 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_io` | `mio` poller/reactor + `Port` + one built-in driver |
 | `beam_rt` | boot/CLI/`system_info` + end-to-end vertical-slice integration test |
 
+## Term/heap foundation: maps · bitstrings · refc binaries (current state)
+The shared blockers that capped maps, bitstrings and large-binary memory efficiency are implemented.
+Frozen inter-crate contract — all term-layout writers are **heap-agnostic** (`beam_term` cannot allocate;
+the caller reserves the words and passes `hp: *mut Eterm`):
+- **Maps** (`beam_term::map`) — flat map ↔ HAMT/CHAMP at the ERTS threshold `MAP_SMALL_MAP_LIMIT = 32`
+  (`erl_map.c`). `write_map` (dedup last-wins, canonical order, flat map ≤32 else hash map),
+  `map_words_capacity(n)` for sizing, `map_size`/`map_get`/`map_pairs`(key-ordered)/`map_put`/`map_remove`.
+  Node interiors are the **ERTS layout** — head-array `[hdr][size][16 slots]`, head-bitmap `2+n`, inner
+  node-bitmap `1+n`, one term per slot, flat-map/collision leaves — chosen so `beam_gc::copy::move_size`
+  and its Cheney scan already size and walk it (proven by `beam_gc/tests/map_copy.rs`). `compare`/`hashing`/
+  `size` are structural over maps.
+- **Bitstrings** (`beam_term::bitstring`) — `heap_bits_size_words`, `bit_count_to_bytes`, `write_heap_bits`,
+  `write_binary`, `write_sub_bits`/`sub_bits_parts`, public `bitstring_parts`/`bit_at`/`float_bits`/
+  `float_value`; non-byte-aligned supported. (Replaces `beam_codec`'s private `binary.rs` shims.)
+- **Refc binaries** — bit-exact on-heap layout in `beam_term::refc`: `BinRef` (3 words) + `ErlSubBits`
+  (5 words), the 8-word `[BinRef][ErlSubBits]` pair with the root at the SubBits; `ERL_ONHEAP_BINARY_LIMIT
+  = 64` bytes / `ERL_ONHEAP_BITS_LIMIT = 512` bits. Off-heap payload = `beam_alloc::RefcBinary` (refcounted,
+  `AllocType::Binary`); **`BinRef.val` == `RefcBinary::data_ptr()` — the pointer to the first payload byte**
+  (the internal header is `beam_alloc`'s concern). Reclamation: hold a `RefcBinary` handle in
+  `beam_gc::OffHeap` and release it when the on-heap reference dies. Small binaries stay on-heap
+  (`ErlHeapBits`).
+
+## Handoffs (owned by other nodes — NOT yet adopted)
+- `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
+  `beam_term::{map,bitstring}`; it currently decodes >32-key maps as oversized flat maps — switch to
+  `map::write_map` (builder) + `map::map_pairs` (encode).
+- `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
+- `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
+  liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
+  off-heap payloads).
+
 ## Constraints
 - **Keep the workspace green**: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`
   must pass after every wave. Per-crate gate:
@@ -108,14 +145,14 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 
 ## Routing Table
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
-- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas (frozen, Stage 0)
-- `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator
+- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc` (frozen, Stage 0)
+- `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` seam
-- `beam_gc/` → per-process generational copying GC, MSO sweep, heap sizing (Stage 4)
+- `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4)
 - `beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
@@ -127,29 +164,40 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
 ## Status (Milestone 1)
-- **All 15 crates architected, implemented and tested.** `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace` is GREEN (69 test suites, 0 failures); build is warning-free.
-  `beam_common`/`beam_term` were already implemented; every other crate followed its CONTEXT.md.
+- **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
+  erts_rust/Cargo.toml --workspace` is warning-free; per-crate suites are green (one pre-existing
+  failure lives outside this node's crates — see Known Structural Debt).
 - **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
   supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
   fallback returns a typed error, never a wrong result).
+- **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
+  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
+  `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
+  copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
-  changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
-  (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
-  materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
-  to (de-duplication). Rationale: `beam_term` is a dependency sink, so writers take a caller-provided
-  `*mut Eterm`; allocation stays in `beam_alloc`.
-- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`.
+  changed): `From<TermError> for BeamError`; `compare`/`hashing`/`size` utilities (term ordering,
+  structural hash, `size_object`); `thing` — heap-agnostic off-heap term materialization
+  (float/big/flatmap/external pid/port/ref). Writers take a caller-provided `*mut Eterm`;
+  allocation stays in `beam_alloc`.
+- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`;
+  `RefCount` moved down into `beam_alloc` (the LCA) and re-exported by `beam_gc`.
 
 ## Known Structural Debt (candidates for the next pass)
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
-  `beam_gc::OffHeap` is push-only; the view should be absorbed into `beam_gc` (Prevent-Duplication).
-- `beam_codec::decode.rs` keeps a private `MAP_SMALL_MAP_LIMIT` decode-policy constant (not a layout
-  duplicate) — fine, but a future home for map-policy constants may be `beam_term`.
+  `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
+  (Prevent-Duplication).
+- The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
+  `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
+  oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
+- Pre-existing test failure OUTSIDE this node (fails identically at the pre-work baseline):
+  `beam_bifs::binconv::tests::binary_terms_are_the_documented_codec_gap` — belongs to the
+  `beam_bifs`/`beam_codec` nodes.
 - Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
-  entries for the `beam_term` extensions and the `beam_abi` frozen-header seam work.
+  entries for the `beam_term` foundation extensions (`map`/`bitstring`/`refc`), the `RefCount` move into
+  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, and the
+  `beam_abi` frozen-header seam work.
 
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not

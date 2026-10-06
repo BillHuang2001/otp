@@ -64,16 +64,22 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   +20%, capped at `2^53 / word`), `LazyLock`-built from `erts_init_gc` (`erl_gc.c:240-303`).
 - `pub fn next_heap_size(size, offset) -> usize` — `erts_next_heap_size` over that table.
 
-### `mso.rs` — off-heap refcounted large objects
-- `pub struct RefCount` — atomic refcount with `erts_refc_*` semantics: `new(initial)`, `count()`,
-  `inc()`, `dec()`, `dec_and_test(min) -> bool`.
+### `mso.rs` — off-heap refcounted large objects & refc binaries
+- `RefCount` — **re-exported** from `beam_alloc` (`pub use beam_alloc::RefCount;`); the workspace's single
+  `erts_refc_*` primitive (`new`, `count`, `inc`, `dec`, `dec_and_test(min)`). This crate defines no count
+  of its own; both `beam_gc::RefCount` and `beam_gc::mso::RefCount` resolve.
 - `pub struct Mso` — an off-heap, immutable, refcounted shared object: `new(payload, apparent_size)`,
   `downcast_ref::<T>()`, `apparent_size()`, `refcount()`.
 - `pub struct MsoHandle` — clonable owning handle to an `Mso` (the on-heap `BinRef` analogue):
   `Clone` bumps the refcount; the last `Drop` runs the destructor (the payload's `Drop`) and frees it.
-- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(MsoHandle)`, `len()`, `is_empty()`,
-  `overhead_bytes()`, `sweep(is_live) -> usize` (retains the handles a collection found live, releasing
-  the rest).
+- `pub enum OffHeapEntry { Mso(MsoHandle), Binary(beam_alloc::RefcBinary) }` — an entry of the per-process
+  off-heap list: `overhead_bytes()`/`apparent_size()` (Mso → the MSO's apparent size; Binary → `len()`),
+  `as_mso() -> Option<&MsoHandle>`, `as_binary() -> Option<&RefcBinary>`; `From<MsoHandle>`/`From<RefcBinary>`.
+- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)`, `len()`,
+  `is_empty()`, `overhead_bytes()` (the summed off-heap payload bytes, not the `Vec` capacity), and
+  `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` (retains the entries a collection found live,
+  releasing the rest — dropping a `Binary` decrements its refcount and frees the payload at zero; dropping
+  an `Mso` runs the MSO destructor at zero). The caller supplies the liveness predicate (see Known Gaps).
 
 ### `stats.rs` — `GcStats`
 `words_copied`, `words_reclaimed`, `objects_copied`, `minor_collections`, `major_collections`
@@ -108,13 +114,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
   test and is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
-- **Local object-size traversal; `beam_term` is not modified.** A shared `beam_term::size_object` is
-  an *upstream, parallel* addition and **is not present in this crate's build**. Rather than duplicate a
-  generic term-size function, `copy.rs` computes only what the copier needs — `move_size(header, ptr)`
-  (the `nelts` of `move_boxed`: `header_arity` plus the flatmap/HAMT/fun extras) — reading the boxed
-  layout through `beam_term`'s public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`,
-  `map_header_val`, `is_fun_header`, …). If `beam_term::size_object` lands, this can be reconciled
-  then; the decision and the exact formula live here so no agent re-derives them.
+- **Local object-size traversal; `beam_term` is not modified.** `copy.rs` computes only what the copier
+  needs — an *incremental, per-object* `move_size(header, ptr)`: the `nelts` of the C `move_boxed`
+  (`header_arity` plus the flatmap/HAMT/fun extras), read through `beam_term`'s public accessors
+  (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`, `is_fun_header`, …), which
+  the scan then walks word by word. It does **not** call `beam_term::size::size_object`: that is a
+  whole-graph size (it cannot size the single object the copier is looking at), and it under-reports
+  HAMT maps (see Known Gaps). The decision and the exact formula live here so no agent re-derives them.
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
@@ -124,13 +130,15 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   production bump heap (its `AllocKind::Heap` exhaustion means "collect", per that crate's
   Design Decisions). `HeapSpace` adds only space semantics (`contains`, `reset`, `base`/`top`/`limit`),
   so the collector and the mutator share one allocation implementation (Prevent-Duplication).
-- **MSO is modelled as `RefCount` + `Mso`/`MsoHandle` + `OffHeap`, not bolted onto the heap.** The
-  payload lives **outside** every process heap; the collector **copies only the small heap-resident
-  handle's scalar words** and leaves every off-heap pointer verbatim (the C `sweep_off_heap` rule,
-  `erl_gc.c:2995-3110`). Refcount changes are the **MSO API's** responsibility (`inc` on a new handle,
-  `dec`/destructor when the sweep drops a dead one), so the collector never has to walk off-heap
-  payloads. The on-heap `BinRef`/magic-ref *handle term* itself is the binary/ABI layer's job; this
-  crate owns the refcounted off-heap object and its list.
+- **The off-heap list is `Mso`/`MsoHandle` + `beam_alloc::RefcBinary` + `OffHeap`, not bolted onto the
+  heap.** Both payload kinds live **outside** every process heap; the collector **copies only the small
+  heap-resident handle's scalar words** and leaves every off-heap pointer verbatim (the C
+  `sweep_off_heap` rule, `erl_gc.c:2995-3110`). Refcount changes are the **off-heap API's** responsibility
+  (`inc` on a new handle, `dec`/destructor when the sweep drops a dead one), so the collector never has to
+  walk off-heap payloads. The count is `beam_alloc::RefCount` — the workspace's single `erts_refc_*`
+  primitive, **re-exported** here (no duplicate) — so a refc binary and an MSO share one implementation.
+  The on-heap `BinRef`/`ErlSubBits` *handle term* itself is `beam_term`'s job; this crate owns the
+  refcounted off-heap objects, the shared count, and the per-process list.
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
@@ -154,7 +162,8 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   round-trip), `copy` (forward of immediates/cons/boxed/nested tuples/lists; forwarding markers;
   out-of-from-space left verbatim), `policy` (table shape: 12, 38, … 233; `next_heap_size` offset 0/1;
   growth/shrink decisions), `mso` (refcount `inc`/`dec`/`dec_and_test`; `MsoHandle` clone/drop runs the
-  destructor exactly once; `OffHeap::sweep` releases dead handles).
+  destructor exactly once; `OffHeapEntry` accessor dispatch; `OffHeap::sweep` releases dead handles, frees
+  a swept `RefcBinary`'s payload exactly once, and sweeps a mixed Mso+Binary list selectively).
 - **`tests/copy_correctness.rs` — the required copy-correctness evidence.** Build a real term graph in
   a `HeapSpace` (nested tuples + cons lists + boxed leaves, plus deliberate garbage), place tagged
   pointers to live objects into a root slice, run `collect`/`Copier`, then assert: (1) **structural
@@ -166,6 +175,14 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - **`tests/generations.rs`.** Drive a `Collector` through several minors and a forced major; assert
   `CollectionKind`, that live data survives across generations, that the nursery is empty after a minor,
   and that a too-small mature escalates to a major.
+- **`tests/map_copy.rs` / `tests/refc_binary_copy.rs` — the new-shape evidence.** Prove the copier
+  preserves the *recently added* interiors: a flat map, a 500-key HAMT (head + inner nodes + collision
+  nodes) and the 8-word `[BinRef][ErlSubBits]` refc-binary pair. Each is built in a `HeapSpace` with the
+  public `beam_term` writers (`write_map`/`write_refc_binary`), collected as the sole root, and then
+  checked *from the updated root* for root relocation, full key/pair (or `orig`) round-trip, and exact
+  size accounting. The expected size is measured **independently** of any size heuristic: a `MARKER`
+  is pre-written over the reservation and the map's contiguous footprint is recovered by scanning back
+  (the copier's `to.used_words()` must equal it), while the pair's size is the frozen `ERL_REFC_BITS_SIZE`.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
@@ -184,9 +201,18 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   are treated as permanent and left verbatim.
 - **A.6 runtime heap options** (`+hms`, `+hmbs`, …) — this crate exposes `HeapPolicy`, not the CLI
   surface (owned by `beam_rt`).
-- **`OffHeap` automatic integration with the collector's reachability** — the sweep is exposed as
-  `OffHeap::sweep(is_live)`; the caller supplies the liveness test (the on-heap handle kind is the
-  binary/ABI layer's concern).
+- **`OffHeap` reachability is caller-driven, not integrated with the collector.** `OffHeap` holds both MSO
+  and refc-binary entries, but `OffHeap::sweep(is_live)` only applies the caller's predicate — determining
+  WHICH on-heap reference (a `BinRef` word, a fun magic ref, a sub-binary pointer) makes a registered
+  off-heap object live is `beam_process`'s concern (Stage 5), not the collector's.
+- **Sizing oracle gap (upstream, `beam_term::size::size_object`).** It gates its hashmap branch on
+  `is_hashmap_header`, which only matches the two *head* node types, so an inner `HAMT_NODE_BITMAP`
+  node (and everything under it) is not counted — `size_object` of a 500-key map reports `4`. It also
+  reports a refc binary's `ErlSubBits` alone (5) rather than the C's `ERL_REFC_BITS_SIZE` (8). The real
+  C `size_object_x` (`copy.c:192-214,219-231`) handles all three node types and the BinRef case. This
+  crate's copier is unaffected (`move_size` uses `map_header_val`/`header_arity` and is exact — see
+  `tests/map_copy.rs`), which is why the tests measure a map's footprint directly rather than via
+  `size_object`. Fixing `size_object` is `beam_term`'s job.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -194,11 +220,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
 - `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
-- `src/mso.rs` → `RefCount`, `Mso`, `MsoHandle`, `OffHeap` (off-heap refcounted large objects)
+- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
 - `src/stats.rs` → `GcStats`
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
 - `tests/generations.rs` → `Collector` minor/major/tenure/escalation integration
+- `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
+- `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)

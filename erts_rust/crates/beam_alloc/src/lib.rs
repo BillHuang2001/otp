@@ -39,13 +39,17 @@ pub mod stats;
 pub mod allocator;
 pub mod registry;
 pub mod heap;
+pub mod refcount;
+pub mod binary;
 mod error; // pub(crate) helpers only — NOT public
 
 pub use crate::allocator::{
     AllocRef, Allocator, AllocatorConfig, AllocatorConfigBuilder, CarrierAllocator, MIN_ALIGN,
     WORD_ALIGN,
 };
+pub use crate::binary::RefcBinary;
 pub use crate::heap::Heap;
+pub use crate::refcount::RefCount;
 pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
 pub use crate::size_class::SizeClasses;
 pub use crate::stats::AllocStats;
@@ -56,7 +60,9 @@ pub mod prelude {
     pub use crate::allocator::{
         Allocator, AllocRef, AllocatorConfig, CarrierAllocator, MIN_ALIGN, WORD_ALIGN,
     };
+    pub use crate::binary::RefcBinary;
     pub use crate::heap::Heap;
+    pub use crate::refcount::RefCount;
     pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
     pub use crate::size_class::SizeClasses;
     pub use crate::stats::AllocStats;

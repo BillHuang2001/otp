@@ -8,13 +8,18 @@ and the collector (`beam_gc`) construct terms in. It is the **lowest common ance
 allocation**: `beam_codec`, `beam_ets`, `beam_gc`, `beam_message` and `beam_process` all depend
 downward on it (Stage 0 foundations, Part II §H; §D "the current collector … per-process heaps").
 
-Two responsibilities, deliberately in one node:
+Three responsibilities, deliberately in one node:
 1. **Byte allocation** for anything off the process heap — ETS nodes, code, binaries, carriers
    themselves (`Allocator`/`AllocRef`) — mirroring `erts_alloc(type, size)` / `erts_realloc` /
    `erts_free` and the carrier framework of `../../erts/emulator/beam/erl_alloc_util.c`.
 2. **Term allocation** within a fixed per-process heap (`Heap`) — the *production* version of the
    minimal `beam_term::heap::Heap` test arena, with identical geometry (`hp`/`hend`, never
    reallocates) but backed by a real allocator and growing by *replacement* (GC), not reallocation.
+3. **Refcounted off-heap objects** — the shared atomic reference count (`RefCount`, `refcount.rs`,
+   the workspace's one `erts_refc_*` implementation) and the reference-counted off-heap byte buffer
+   built on it (`RefcBinary`, `binary.rs`, the `binary_alloc` analogue), whose lifetime the copy
+   engine and term layer rely on. `RefCount` lives here because `beam_alloc` is the lowest common
+   ancestor that both `beam_gc` (MSO payloads) and the binary users depend on.
 
 Ground truth = legacy C (`../../erts/emulator/beam/erl_alloc.h`, `erl_alloc.c`,
 `erl_alloc_util.{c,h}`, `erl_goodfit_alloc.c`/`erl_bestfit_alloc.c`/`erl_afit_alloc.c`/
@@ -22,8 +27,9 @@ Ground truth = legacy C (`../../erts/emulator/beam/erl_alloc.h`, `erl_alloc.c`,
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_alloc::prelude::*`. The **frozen seam** for dependents is
-`allocator`, `heap`, `size_class`, `registry`, `stats`; `block`/`carrier`/`free_list`/`strategy` are
-implementation modules (public for testing/reuse, not part of the cross-crate contract).
+`allocator`, `heap`, `size_class`, `registry`, `stats`, `refcount`, `binary`;
+`block`/`carrier`/`free_list`/`strategy` are implementation modules (public for testing/reuse, not
+part of the cross-crate contract).
 
 ### `allocator.rs` — the `Allocator` seam
 - `pub trait Allocator: Send + Sync + 'static`
@@ -89,6 +95,51 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   M1 implements the **segregated first-fit** family; `FirstFit` is the implemented behaviour and the
   other variants currently select it too (plugin seam reserved — see Design Decisions).
 
+### `refcount.rs` — the shared atomic reference count (`RefCount`)
+The workspace's one refcount primitive (`erts_refc_*` semantics). Safe Rust; the only interior
+mutability is the `AtomicUsize`, so `RefCount` is `Send + Sync`.
+- `#[repr(transparent)] pub struct RefCount { count: AtomicUsize }`
+- `pub const fn new(initial: usize) -> RefCount`
+- `pub fn count(&self) -> usize` — `load(Ordering::Acquire)`
+- `pub fn inc(&self) -> usize` — `fetch_add(1, AcqRel) + 1`
+- `pub fn dec(&self) -> usize` — `fetch_sub(1, AcqRel) - 1`
+- `pub fn dec_and_test(&self, min: usize) -> bool` — `fetch_sub(1, AcqRel) - 1 <= min` (the caller
+  that sees `true` must destroy the object; with `min == 0` that is exactly the last reference).
+- `impl Debug` — prints the current count.
+This is the **single** refcount type for the workspace: `beam_gc` exposes its own `RefCount` today and
+is expected to re-export this one (`pub use beam_alloc::RefCount;`) in a follow-up pass, so the same
+type is shared rather than duplicated across crates.
+
+### `binary.rs` — off-heap refcounted large binary (`RefcBinary`, `binary_alloc` analogue)
+The **allocation / ownership bookkeeping** half of the reference-counted binary feature: an
+immutable, refcounted, off-heap byte buffer plus the small control header that carries its reference
+count. The bit-exact *on-heap* term layout (`BinRef = [HEADER_BIN_REF, val, next]`, `SubBits`, the
+`ERL_ONHEAP_BINARY_LIMIT`/`ERL_ONHEAP_BITS_LIMIT` thresholds) is owned by `beam_term`; the
+**off-heap interior here is private** — it never crosses the ABI or the ETF wire.
+- `pub struct RefcBinary { /* private: AllocRef + base NonNull<u8> + len */ }`
+- `pub fn new(bytes: &[u8]) -> beam_common::Result<RefcBinary>` — copies `bytes` off-heap through
+  `allocator(AllocType::Binary)`; the reference count starts at **1**.
+- `pub fn with_allocator(alloc: AllocRef, bytes: &[u8]) -> beam_common::Result<RefcBinary>` — same,
+  but on a caller-supplied allocator (tests / injection).
+- `pub fn len(&self) -> usize`; `pub fn is_empty(&self) -> bool`; `pub fn as_bytes(&self) -> &[u8]`.
+- `pub fn refcount(&self) -> usize` — the current atomic count.
+- `pub fn data_ptr(&self) -> *mut u8` — a pointer to the **first payload byte** (the value stored in
+  the on-heap `BinRef.val` word); `UNIT_SIZE`-aligned; see the `data_ptr` contract below.
+- `impl Clone` — bumps the refcount (`RefCount::inc`) and shares the same buffer (no byte copy).
+- `impl Drop` — `RefCount::dec_and_test(0)`; the **last** handle frees the buffer **exactly once**,
+  through the **same** `AllocRef` and the **exact** `Layout` used in `new`/`with_allocator`.
+- `unsafe impl Send` — see Design Decisions (thread-safety contract). `Sync` is deliberately **not**
+  implemented (the on-heap `BinRef` ownership model is single-threaded per process).
+- **Off-heap layout (private):** a `#[repr(C)]` control header `BinaryHeader { refc: RefCount, len:
+  usize }` (= `UNIT_SIZE` = 16 B, asserted at compile time) sits immediately **before** the payload in
+  one allocation of `HEADER_SIZE + len` bytes at `MIN_ALIGN`; `data_ptr = base + HEADER_SIZE`.
+- **`data_ptr` contract:** the header is **not** part of what `data_ptr` exposes, so consumers treat
+  the pointer as a raw byte pointer to the binary data (`as_bytes().as_ptr() == data_ptr()`).
+- **Sizes 0 … 1 MiB** work (slab path ≤ the 1 KiB threshold, dedicated single-block carrier above;
+  `len == 0` is a valid, non-dereferenced, `UNIT_SIZE`-aligned `data_ptr`). Allocation failure maps
+  to `BeamError::Alloc(AllocFailure::new(AllocKind::LargeObject, requested))` — the first use of
+  `AllocKind::LargeObject`.
+
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
   (return `Err(BeamError::Alloc(AllocFailure::new(kind, requested)))`), no `unwrap()` on runtime
@@ -96,10 +147,10 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   large off-heap objects ⇒ `LargeObject`, else `Other`. Invalid alignment/`Layout` ⇒
   `BeamError::BadArg`.
 - **`unsafe` confinement:** `unsafe` is allowed **only** in `block`, `carrier`, `free_list`,
-  `allocator` and `heap` (raw memory). Every `unsafe fn` carries a `# Safety` section and every
-  `unsafe` block a preceding `// SAFETY:` rationale (`../beam_common/src/safety.rs` convention).
-  `size_class`, `registry`, `stats`, `strategy`, `error` must be safe Rust. `unsafe_op_in_unsafe_fn`
-  stays clean (workspace lint).
+  `allocator`, `heap` and `binary` (raw memory). Every `unsafe fn` carries a `# Safety` section and
+  every `unsafe` block a preceding `// SAFETY:` rationale (`../beam_common/src/safety.rs` convention).
+  `size_class`, `registry`, `stats`, `strategy`, `refcount`, `error` must be safe Rust.
+  `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
 - **Carriers come from the OS via `libc::mmap`** (anonymous, private) and are `munmap`'d on free/drop
   — the carrier *is* the OS-level block (legacy `erts_mmap`/mseg). `mmap` failure ⇒
   `AllocFailure{kind: Carrier}`. Page-aligned carriers are relied on for block→carrier recovery.
@@ -151,6 +202,25 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   allocator is dropped (`Drop for AllocatorState`); a dedicated large-block carrier is unmapped
   immediately on `dealloc` (the header's `carrier` word gives O(1) block→carrier recovery). A simple,
   honest retention policy (no `madvise`/shrink in M1).
+- **The refcount lives here, not in `beam_gc`.** `RefCount` is the single `erts_refc_*` primitive for
+  the whole workspace; the crate-layer contract forbids duplicating a type across crates, and
+  `beam_alloc` is the lowest common ancestor that both `beam_gc` (the MSO payload container) and the
+  binary/term users depend on. `beam_gc`'s own `RefCount` is expected to be replaced by a re-export
+  of this one (`pub use beam_alloc::RefCount;`) in a follow-up pass, preserving `beam_gc`'s API.
+- **`RefcBinary` keeps its control header *before* the payload, so `data_ptr` is a raw first byte.**
+  One allocation of `HEADER_SIZE + len` bytes at `MIN_ALIGN` holds `[BinaryHeader][payload]`, with
+  `data_ptr = base + HEADER_SIZE`. The header is `#[repr(C)] { refc: RefCount, len: usize }`, exactly
+  `UNIT_SIZE` (16 B, compile-time asserted), so the payload stays `UNIT_SIZE`-aligned and `Drop`
+  recovers `base` deterministically as `data_ptr - HEADER_SIZE` for the exact `Layout` used at
+  construction — no side table, no double free, no leak. The header is deliberately **not** exposed by
+  `data_ptr`: the on-heap `BinRef.val` word must be a raw pointer to the first data byte (the same
+  pointer the copy engine and `beam_term`'s byte access use), so the refcount/length bookkeeping stays
+  private to this crate. The off-heap interior never crosses the NIF/driver ABI or the ETF wire.
+- **`RefcBinary` is `Send`, deliberately not `Sync`.** The only shared mutable state is the atomic
+  `RefCount` and the payload is written once at construction and never mutated, so moving a handle
+  across threads cannot race (the `AllocRef` handle is `Send + Sync` by the `Allocator` contract).
+  `Sync` is withheld because the on-heap `BinRef` ownership model is single-threaded per process; a
+  future need for shared `&RefcBinary` across threads is a considered, separate decision.
 
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests`: `size_class` (lookup boundaries, validation rejects),
@@ -160,7 +230,12 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   multiple carriers; dedicated-carrier path for large sizes; stats deltas; the `max_footprint` cap ⇒
   `AllocKind::Carrier` error; a `Heap` over a real `CarrierAllocator`), `heap` (cons/tuple/alloc_words/alloc_tuple/reset/peak, pointer stability
   and non-reallocation, exhaustion → `AllocKind::Heap` error and no words consumed, `Drop` returns
-  the block).
+  the block), `refcount` (inc/dec/count, `dec_and_test` at the zero and non-zero `min` boundaries, and
+  a concurrent inc/dec race where exactly one thread wins the last reference), `binary`
+  (`RefcBinary` content round-trip for lengths 0/1/63/64/65/1024/1 MiB, the `data_ptr` first-byte and
+  alignment contract, clone/drop refcount accounting, final-drop-frees-exactly-once with no leak via
+  `stats` deltas, the `AllocKind::LargeObject` OOM path, cross-thread handle movement, and varied-size
+  dealloc exercise).
 - `tests/allocator.rs`, `tests/heap.rs` — cross-module integration over the *public* API only.
 - Prefer property-style loops over boundary ranges; assert **no leak** (drops free every carrier) so
   a Miri / leak-check run is meaningful (recommended in CI, not required by M1).
@@ -182,8 +257,10 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
   (typically 4096) is rejected with `BeamError::BadArg`; super-aligned mappings are not implemented.
 - The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`) and the class
   count (`block::MAX_CLASS_COUNT`); a request beyond the encodable bound is rejected, never truncated.
-- The `erts_alloc`/`enif_alloc` C ABI shims (owned by `beam_abi`) and MSO/binary ref-counted
-  off-heap objects (owned by `beam_gc`).
+- The `erts_alloc`/`enif_alloc` C ABI shims (owned by `beam_abi`). The refcounted off-heap **binary**
+  object (`RefcBinary`) and the shared `RefCount` now live here; still out of scope are bit-level
+  `SubBits`/`Bitstring` handling and the on-heap `BinRef` layout (owned by `beam_term`) and the
+  generic MSO payload container (`beam_gc`).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -191,6 +268,8 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
 - `src/size_class.rs` → `SizeClasses` (size classes + large threshold)
 - `src/registry.rs` → `AllocType` + lazily-initialised process-wide allocators (`erts_allctrs` equiv)
 - `src/heap.rs` → the per-process bump `Heap` (`alloc_words`/`cons`/`tuple`/`reset`)
+- `src/refcount.rs` → `RefCount`: the shared atomic reference count (`erts_refc_*` semantics; safe Rust)
+- `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (`binary_alloc` analogue; raw memory)
 - `src/stats.rs` → `AllocStats` + internal `Counters`
 - `src/block.rs` → block layout constants + `BlockHeader` encode/decode (implementation module)
 - `src/carrier.rs` → `Carrier` (mmap-backed block, subdivision into equal class blocks) (implementation module)
@@ -210,8 +289,11 @@ lifetime); heap growth is by allocating a *new* larger heap and copying (done by
 - Read `../../erts/emulator/beam/erl_alloc_util.h` for the `Block_t`/`Carrier_t`/`Allctr_t` layout
   and `erl_alloc_util.c` for the alloc/free/realloc flow before changing block or carrier code.
 - `AllocKind::Heap` from `Heap::alloc_words` means "collect", not "fatal OOM" — see Design Decisions.
-- Interior layouts (carrier size, class spacing, retention policy) are **not** externally pinned;
-  only the seam in `allocator.rs`/`heap.rs`/`size_class.rs`/`registry.rs`/`stats.rs` is frozen.
+- Interior layouts (carrier size, class spacing, retention policy, and the `RefcBinary` off-heap
+  header) are **not** externally pinned; only the seam in
+  `allocator.rs`/`heap.rs`/`size_class.rs`/`registry.rs`/`stats.rs`/`refcount.rs`/`binary.rs` is
+  frozen, and of `binary.rs` only the public signatures plus the `data_ptr` first-byte contract are
+  observable.
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 0).
