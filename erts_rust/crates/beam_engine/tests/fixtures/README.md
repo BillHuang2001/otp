@@ -220,3 +220,155 @@ neutral dir, then
 does **not** return `empty`: `wait_timeout` suspends and the run reports
 `RunOutcome::Wait` (the timer is the host's job). `tests/receive.rs` asserts that
 honest outcome instead of the oracle value; every other row matches the oracle.
+
+## `bssmall.beam` (`bssmall.erl`) — `tests/bitstrings_extra_big.rs`
+
+The **at-most-64-bit** integer fields whose value can still exceed `MAX_SMALL`
+(`2^59-1`), plus the little-endian fields that are *not* a whole number of bytes. Every
+read is `<<Y:N, _/bitstring>> = B` (an `ensure_at_least N 1` followed by an `integer`
+command of `N` bits), so a whole-byte subject of at least `N` bits can be supplied from
+the test side (the engine has no partial-bit subject builder); `u64x/1` is the plain
+exhaustive `<<Y:64>>` form. `e256/1` writes `Value mod 2^256` so a (possibly bignum)
+result can be pinned byte-exactly through the crate's public `terms::binary_bytes`.
+
+| exports | shape |
+|---|---|
+| `u9/1` … `u62/1`, `u64/1` | unsigned big-endian `<<Y:N, _/bitstring>>` |
+| `u64x/1` | the exhaustive `<<Y:64>>` form |
+| `s59/1`, `s60/1`, `s61/1`, `s64/1` | signed big-endian |
+| `u9le/1` … `u64le/1`, `s64le/1` | little-endian, non-byte-multiple fields |
+| `c_u64/1` | a `case`-wrapped 64-bit read (the `case_clause` failure path) |
+| `e256/1` | the construction helper `<<A:256>>` |
+
+Expected values are the real system `erl` oracle's answers for the same inputs.
+
+## `bsfailseg.beam` (`bsfailseg.erl`) — `tests/bitstrings_create_fail.rs`
+
+The `bs_create_bin` **segment-failure surface**: the `{Class, Reason}` pair a caught
+construction failure produces, so the reason atoms `badarg` and `system_limit` are
+pinned end to end against the real `erl`.
+
+`pinned_atoms/0` returns the literal list `[badarg, badmatch, system_limit, error]`. A
+compiled module does **not** carry the runtime's exception reason atoms in its atom
+chunk (`beam_lib:chunks("bsfailseg.beam", [atoms])` lists no `badarg`/`system_limit`; the
+runtime keeps them globally interned, `erts/emulator/beam/beam_common.c:382-406`), and
+the engine resolves a failure's reason atom from the *running module's* atom table
+without substituting a different atom. `beam_loader` interns the atoms of
+`pinned_atoms/0`'s `LitT` literal while decoding it, so every failure below lands as a
+real `{error, ReasonAtom}` 2-tuple. (`bscreate.beam` pins none of them, which is why its
+cases assert the typed `BeamError` instead; see `tests/bitstrings_extra_create.rs`.)
+
+Each export is a single `bs_create_bin` with the `{f,0}` (`no_fail`) label (confirmed
+with `beam_disasm:file/1`), wrapped in `try ... catch K:R -> {K,R} end`:
+
+| export | Erlang | what it exercises |
+|---|---|---|
+| `bin_one/1` | `<<X:1/binary>>` | a `binary` segment needing one byte of a shorter source |
+| `bin_all/1` | `<<X/binary>>` | the whole-tail `append` segment |
+| `bin_all_unit/1` | `<<X/binary-unit:8>>` | the whole-tail unit check (`erts_bs_put_binary_all`) |
+| `bin_fixed/1` | `<<X:8/binary>>` | a fixed `size*unit` = 64-bit `binary` segment |
+| `bin_size/2` | `<<X:S/binary>>` | a dynamic `binary` size |
+| `bin_big_size/1` | `<<X:(1 bsl 59)/binary>>` | a positive-bignum size (`2^59 = MAX_SMALL + 1`) |
+| `utf8/1`, `utf16/1`, `utf16le/1`, `utf32/1` | `<<Cp/utfN>>` | a non-scalar codepoint / a non-integer value |
+| `int_size/2` | `<<V:S/integer>>` | the shared dynamic-size validation |
+| `int_fixed/1` | `<<V:3/integer>>` | a fixed 3-bit `integer` segment |
+| `float_size/2` | `<<F:S/float>>` | a dynamic float width |
+
+Expected values derived with the oracle in a neutral dir, e.g.
+`erl -noshell -eval 'io:format("~p~n",[bsfailseg:bin_one(<<1:4>>)]),halt().'` ⇒ `{error,badarg}`:
+
+| expression | value |
+|---|---|
+| `pinned_atoms()` | `[badarg,badmatch,system_limit,error]` |
+| `bin_one(<<1:4>>)` | `{error,badarg}` |
+| `bin_one(<<1:8>>)` | `<<1>>` |
+| `bin_all(<<1,2>>)` | `<<1,2>>` |
+| `bin_all_unit(<<1:4>>)` | `{error,badarg}` |
+| `bin_all_unit(<<1:8>>)` | `<<1>>` |
+| `bin_fixed(<<1,2,3>>)` | `{error,badarg}` |
+| `bin_fixed(<<1,2,3,4,5,6,7,8>>)` | `<<1,2,3,4,5,6,7,8>>` |
+| `bin_size(<<1:4>>, -(1 bsl 59))` | `{error,badarg}` |
+| `bin_big_size(<<1:4>>)` | `{error,system_limit}` |
+| `utf8/utf16/utf16le/utf32(-1)`, `(16#D800)`, `(16#110000)`, `(oops)` | `{error,badarg}` |
+| `int_size(1, -1)` | `{error,badarg}` |
+| `int_size(1, 1 bsl 59)` | `{error,system_limit}` |
+| `int_size(1, 3)` | `<<1:3>>` |
+| `int_fixed(oops)` | `{error,badarg}` |
+| `int_fixed(5)` | `<<5:3>>` |
+| `float_size(1.0, 0)`, `float_size(1.0, 24)` | `{error,badarg}` |
+| `float_size(1.0, 32)` | `<<63,128,0,0>>` |
+
+## `excpaths.beam` (`excpaths.erl`) — `tests/exceptions.rs`, `tests/exceptions_corpus.rs`
+
+The "shared-atom host" fixture. Its atom chunk deliberately contains **none** of the
+runtime's well-known exception atoms (`function_clause`, `case_clause`, `if_clause`,
+`try_clause`, `badmatch`, `error`, `'EXIT'`, …; verify with
+`beam_lib:chunks("excpaths.beam", [atoms])`), so the tests can only pass when the host
+seeds those atoms into every loaded module — the host's analogue of the runtime's global
+interning (`erts/emulator/beam/beam_common.c:382-406`). It sticks to opcodes the
+Milestone-1 interpreter + families execute (`func_info`, `case_end`, `if_end`,
+`try_case_end`, `bs_start_match3`/`bs_match`/`bs_get_position`/`bs_set_position`/
+`bs_get_tail`, `badmatch`, `try`/`try_case`/`try_end`, `catch`/`catch_end`,
+`build_stacktrace`, `put_tuple2`, `init_yregs`, plain calls/returns).
+
+`tests/exceptions.rs` calls the raising primitives uncaught (asserting the propagated
+error) and the catching wrappers (asserting the `{Class, Reason}` pair);
+`tests/exceptions_corpus.rs` loads the same file as its corpus fixture.
+
+Derived with the oracle (system `erl`):
+
+| expression | value |
+|---|---|
+| `excpaths:fc(b)` | `error:function_clause` |
+| `excpaths:cc(b)` | `error:{case_clause,b}` |
+| `excpaths:ii(-1)` | `error:if_clause` |
+| `excpaths:bm(a)` | `error:{badmatch,a}` |
+| `excpaths:tc(b)` | `error:{try_clause,b}` |
+| `excpaths:catch_fc(b)` | `{error,function_clause}` |
+| `excpaths:catch_cc(b)` | `{error,{case_clause,b}}` |
+| `excpaths:catch_ii(-1)` | `{error,if_clause}` |
+| `excpaths:catch_bm(a)` | `{error,{badmatch,a}}` |
+| `excpaths:catch_tc(b)` | `{error,{try_clause,b}}` |
+| `excpaths:catch_class(b)` | `error` |
+| `excpaths:oldcatch_bm(a)` | `{'EXIT',{{badmatch,a},Stacktrace}}` |
+| `excpaths:trace(b)` | `{error,{case_clause,b},Stacktrace}` |
+
+## `error_path_targets.txt` — `tests/exceptions_corpus.rs`
+
+The oracle-checked error-path call corpus for the corpus error-path suite
+(`corpus_error_paths_execute_and_agree_with_the_oracle`). Every non-comment line is
+
+```text
+<module>:<function>/<arity>  <POISONS>  =>  <EXPECTED>   # oracle: <erl command>
+```
+
+`<EXPECTED>` is the exception the real system Erlang (OTP 29 / erts-17.1) raises for
+`Module:Function(<poison args>)`, and the trailing comment quotes the exact
+`erl -noshell -eval` invocation that reproduces it. `POISONS` is one entry per argument
+(`atom` = the atom `genesis_poison`, `int` = `7`, `nil` = `[]`, `tuple0` = `{}`), so its
+length equals the arity. `<EXPECTED>` is a bare-atom `function_clause`, a `{tag}`
+2-tuple reason (`case_clause`/`badmatch`/`badrecord`, whose payload is the **last**
+poison), or `unsupported` for a call that needs host machinery the test does not serve.
+The file documents its deterministic capping rule and the un-capped sweep totals; the
+suite enforces `MODULE_FLOOR = 213` over the modules whose error paths execute and
+agree. It is *data*: regenerate it, never hand-edit a value.
+
+## `stdlib_breadth_targets.txt` — `tests/stdlib_lists.rs`
+
+The oracle-checked call corpus for the breadth suite
+(`breadth_runs_a_large_fraction_of_the_installed_corpus`). Every line is
+
+```text
+<module>:<function>(<args>) => <expected>   # oracle: erl -noshell -eval '<command>'
+```
+
+where `<expected>` is the verbatim `~w` rendering the real system Erlang (OTP 29 /
+erts-17.1) produced for `Module:Function(Args)`, and the trailing comment quotes the
+exact `erl -noshell -eval …` invocation that produces it — one `# oracle: erl …` command
+per row, copy-pasteable to re-verify any single entry. The corpus was generated by
+evaluating every expression in one `erl` node (`erl_eval:exprs/2` inside a spawned
+process whose group leader is a sink, so no library output leaks into the result) and
+printing `~w`. The suite enforces the floors `BREADTH_MODULE_FLOOR = 171` (distinct
+corpus modules that actually execute) and `BREADTH_CALL_FLOOR = 480` (oracle-checked
+calls that execute); `#`-prefixed and blank lines are ignored. It is *data*: regenerate
+it, never hand-edit a value.
