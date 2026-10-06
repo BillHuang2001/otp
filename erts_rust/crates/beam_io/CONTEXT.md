@@ -382,10 +382,34 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   no-arg `fn`, so it cannot carry the command/argv/options a spawn port needs; the driver is therefore built
   directly from a `SpawnSpec` (its `Driver::name()` stays `"spawn"` for `port_info` reporting). The child is
   started in the **constructor** so a failed spawn is a constructor error that leaves nothing registered and the
-  runtime can read `os_pid()` before `PortRegistry::open`. `{fd, N}` adopts the descriptor as the **read** fd and
-  never closes it (the Erlang side owns it, matching the reference runtime's `LivePort::close`), and writing to
-  such a port is a typed `BadArg`. `stop`/`Drop` kill **and** reap, and `Drop` reaps too because Rust's `Child`
-  does not: dropping it otherwise leaks a zombie.
+  runtime can read `os_pid()` before `PortRegistry::open`. `{fd, N}` adopts one descriptor as a **duplex** stream
+  (one `Interest::BOTH` registration; `arm_output`/`disarm_output`/`release_stdout` are no-ops for it) and never
+  closes it (the Erlang side owns it, matching the reference runtime's `LivePort::close`). `stop`/`Drop` kill
+  **and** reap, and `Drop` reaps too because Rust's `Child` does not: dropping it otherwise leaks a zombie.
+- **Regular files ride a `poll(2)` fallback inside the poller.** `epoll` cannot watch a regular file, so `Poller`
+  keeps a second, `libc::poll(2)`-based registration set for descriptors `mio` rejects and merges its readiness
+  into `Poller::poll` — reproducing the reference runtime's `poll(2)` readiness path ("a regular file is trivially
+  always ready", `erts/emulator/sys/common/erl_poll.c`) without changing the public `Poller`/`Port` API or adding a
+  dependency, and without giving up the edge-triggered `mio` model for the descriptors it serves. Because the
+  fallback is level-triggered, `FdDriver` de-registers a read fd at EOF.
+- **A failed spawn raises the errno atom.** The reference raises `erl_errno_id(errno)` from
+  `erts_internal_open_port_2` (`erts/emulator/beam/erl_bif_port.c`), so a direct-exec spawn failure is returned as a
+  `BeamError::Raise` carrying the errno's lowercase name (`enoent`/`eacces`/`enotdir`/…) rather than `BeamError::Io`,
+  which stays the fallback for an unmapped errno.
+- **The child's stderr is discarded, not piped.** A piped-but-undrained stderr deadlocks a child that writes more
+  than the pipe capacity; a child's stderr is not port data (the oracle does not deliver it either), so
+  `build_command` sends it to `/dev/null` (`Stdio::null()`). `SpawnSpec`/`SpawnOptions` are unchanged (the runtime
+  cannot pass a `stderr_to_stdout` option through them today).
+- **The timer seam is driver-declared and mirrored; the port-exit channel is advisory and once-only.** A driver
+  declares the next deadline it wants via `Driver::next_timeout`, which `Port` mirrors into its single `TIMEOUT` task
+  after each interaction (deadline-gated, so it never fires early); `PortRegistry::{schedule_timeout,cancel_timeout}`
+  are the runtime's explicit override. `Driver::port_exit` (via `PortRegistry::notify_port_exit`) is a once-only,
+  advisory notification distinct from the teardown `stop`, so a driver can react to its port exiting without owning
+  the lifecycle. Both are additive trait methods with defaults, so every existing driver compiles unchanged.
+- **The TCP driver is a floor, not a full `inet`.** `tcp_inet` covers the core
+  `open`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`shutdown`/`close` verbs with the C's reply encodings; the
+  async-op queue, per-op timeouts, the second-port `accept`, IPv6/UDP/SCTP/Unix-domain, `{active,…}` modes and DNS
+  are deferred (see the module docs).
 
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
