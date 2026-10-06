@@ -476,7 +476,10 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
         let right = int_list(ctx, &[10, 20]);
         let args = [make_small(ADD), left, right];
         // `lists:zipwith/3` is `zipwith(F, Xs, Ys, fail)`, whose `fail` mode has no
-        // clause for a length mismatch (the oracle raises `function_clause`).
+        // clause for a length mismatch — *it does not stop at the shorter list*.
+        // Verified against the oracle: `lists:zipwith(fun(X,Y) -> X+Y end, [1,2], [3])`
+        // raises `function_clause` at `zipwith/4` (lists.erl:965); Milestone-1 reports
+        // `badarg`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`.
         assert!(matches!(
             reg.call("lists", "zipwith", 3, ctx, &args),
             Err(BeamError::BadArg)
