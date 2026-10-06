@@ -238,20 +238,26 @@ fn a_waiter_with_no_sender_never_hangs_the_pass() {
 }
 
 /// Spawning resolves `function/arity` honestly: an unexported function and a missing
-/// module are diagnostics, and neither leaves a half-spawned process behind.
+/// module both raise the oracle's bare `error:undef` (reason atom `undef`; the
+/// module/function/arity live in the stacktrace, not the reason), exactly as the run
+/// path does — and neither leaves a half-spawned process behind.
 #[test]
-fn a_spawn_of_an_unexported_function_or_unknown_module_is_a_diagnostic() {
+fn a_spawn_of_an_unexported_function_or_unknown_module_raises_undef() {
     let mut rt = runtime_with(RECV_BEAM);
 
     let error = rt
         .spawn_process("recv", "nope", vec![])
         .expect_err("recv:nope/0 is not exported");
-    assert!(error.to_string().contains("recv:nope/0"), "{error}");
+    assert!(error.is_raise(), "{error}");
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
+    // The bare atom, not a message: it is a genuine runtime error (the CLI exits 1),
+    // never a Milestone-1 capability gap (which would print `unsupported: …`).
+    assert_eq!(error.to_string(), "error undef");
 
     let error = rt
         .spawn_process("recv", "bomb", vec![])
         .expect_err("recv:bomb/0 does not exist");
-    assert!(error.to_string().contains("recv:bomb/0"), "{error}");
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
 
     let error = rt
         .spawn_process("no_such_module_at_all", "f", vec![])

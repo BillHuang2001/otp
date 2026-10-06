@@ -29,8 +29,9 @@
 //! [`ExitReason::Atom`](beam_common::ExitReason::Atom) backed by an owned `String`
 //! (which every message here is).
 
-use beam_common::{BeamError, ExitReason, Raise};
 use beam_bifs::BifRegistry;
+use beam_common::{BeamError, ExitReason, Raise};
+use beam_term::Eterm;
 
 /// The prefix every capability-gap reason atom starts with (see the module docs).
 pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
@@ -142,11 +143,6 @@ pub(crate) fn unknown_module(module: &str) -> BeamError {
     message(format!("module {module:?} is not loaded"))
 }
 
-/// A function/arity that the module does not export.
-pub(crate) fn unknown_function(module: &str, function: &str, arity: u32) -> BeamError {
-    message(format!("{module}:{function}/{arity} is not exported"))
-}
-
 /// A `run` argument outside the documented term grammar.
 pub(crate) fn bad_run_argument(argument: &str) -> BeamError {
     message(format!("{argument:?} is not a valid run argument"))
@@ -180,6 +176,37 @@ pub(crate) fn unsupported(what: &str) -> BeamError {
 /// compares reasons exactly.
 pub(crate) fn undef() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("undef")))
+}
+
+/// The live **structured reason term** carried by a raise, when it has one.
+///
+/// A reason that is not an atom travels out of band: `beam_common`'s
+/// [`ExitReason`] has no term variant, so such a raise is
+/// [`ExitReason::Structured`] and the reason *term* itself (`{badkey, K}`,
+/// `{badmap, M}`, `{case_clause, V}`, …) is the payload of
+/// [`Raise::live_reason`](beam_common::Raise::live_reason) — the
+/// `beam_bifs`/`beam_engine` convention, whose payload type is
+/// [`Eterm`]. This is the **single** place that recovers it, so every consumer
+/// (`crate::runner`'s `exit_reason`, the `run` diagnostic in `crate::cli`)
+/// downcasts the same way instead of repeating the incantation.
+///
+/// Returns `None` for anything that is not such a raise, **and** for a raise whose
+/// reason *is* an atom: an atom reason is the authoritative one (the oracle's
+/// `undef`, `badarg`, `unsupported_opcode: …`, …), so a term attached next to one
+/// must never shadow it. The gate reads [`ExitReason::as_atom`], which — unlike
+/// [`BeamError::as_atom`] — also sees atoms backed by an owned `String` (every
+/// message this module builds).
+pub(crate) fn live_reason_term(error: &BeamError) -> Option<Eterm> {
+    let BeamError::Raise(raise) = error else {
+        return None;
+    };
+    if raise.reason.as_atom().is_some() {
+        return None;
+    }
+    raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
 }
 
 /// A receive-seam operation with no mailbox to serve it.
@@ -347,6 +374,7 @@ pub(crate) fn unknown_process_entry(pid: beam_process::ProcessId) -> BeamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_common::LiveReason;
 
     #[test]
     fn message_errors_render_their_text() {
@@ -416,6 +444,31 @@ mod tests {
     }
 
     #[test]
+    fn the_live_reason_term_is_recovered_only_for_a_structured_reason() {
+        let term = beam_term::make_small(42);
+        // A raise whose reason is a non-atom carries the reason *term* in the
+        // live-reason slot (`ExitReason::Structured` + `LiveReason`).
+        let structured = BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(term)),
+        );
+        assert_eq!(live_reason_term(&structured), Some(term));
+        // … and one that carries no term at all has none to recover.
+        assert_eq!(
+            live_reason_term(&BeamError::Raise(Raise::error(ExitReason::Structured))),
+            None
+        );
+        // An **atom** reason is authoritative: a payload stored next to it must never
+        // shadow it (including an owned-`String` atom, invisible to `BeamError::as_atom`).
+        let atom = BeamError::Raise(
+            Raise::error(ExitReason::atom(String::from("badmatch")))
+                .with_live_reason(LiveReason::new(term)),
+        );
+        assert_eq!(live_reason_term(&atom), None);
+        // A non-raise carries no live reason at all.
+        assert_eq!(live_reason_term(&BeamError::BadArg), None);
+    }
+
+    #[test]
     fn a_halt_raise_carries_its_status_and_is_not_a_capability_gap() {
         for status in [0, 1, 42, 255] {
             let error = halt(status);
@@ -430,9 +483,6 @@ mod tests {
 
     #[test]
     fn diagnostics_name_the_offending_item() {
-        assert!(unknown_function("slice", "add", 3)
-            .to_string()
-            .contains("slice:add/3"));
         assert!(bad_run_argument("1+").to_string().contains("1+"));
         assert!(bad_switch_value("+P", "x").to_string().contains("\"x\""));
         assert!(unexpected_argument("junk").to_string().contains("junk"));

@@ -67,7 +67,7 @@
 
 use std::path::{Path, PathBuf};
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::Eterm;
 
 use crate::boot;
@@ -640,6 +640,9 @@ fn apply(runtime: &mut Runtime, module: &str, function: &str, args: &[Eterm]) ->
 /// The result is rendered with `~w~n` — exactly what the oracle's
 /// `io:format("~w~n",[V])` produces — and the loaded module's name must be the one the
 /// spec named (a mismatch means the file is not the requested module).
+///
+/// An **uncaught raise** leaves through [`reported_reason`], which renders a
+/// structured reason with its real term (see there).
 fn run_file(
     runtime: &mut Runtime,
     file: &Path,
@@ -649,13 +652,52 @@ fn run_file(
     args: &[ArgTerm],
 ) -> Result<()> {
     let terms = runtime.materialize_args(args)?;
-    let result = runtime.run_function(file, function, arity, &terms)?;
+    let result = match runtime.run_function(file, function, arity, &terms) {
+        Ok(result) => result,
+        Err(error) => return Err(reported_reason(runtime, error)),
+    };
     if runtime.module(module).is_none() {
         return Err(error::unknown_module(module));
     }
     let text = runtime.format_term_w(result, None)?;
     print!("{text}");
     Ok(())
+}
+
+/// The diagnostic [`run`] prints for an **uncaught raise**: the raise with its real
+/// reason.
+///
+/// `BeamError` renders a raise as `<class> <reason>` ([`std::fmt::Display`]), and
+/// `beam_common` cannot render a term — so a raise whose reason is a **structured**
+/// term (`{badkey, K}`, `{badmap, M}`, `{case_clause, V}`, …) is
+/// [`ExitReason::Structured`](beam_common::ExitReason::Structured) and would print the
+/// placeholder `<structured reason>`. The term itself travels in the raise's
+/// live-reason slot, so it is recovered with [`error::live_reason_term`] and rendered
+/// through the runtime's one printer (the registered `~w`): the reported line becomes
+/// `beam_rt: error {badkey,nokey}` — the same `error <reason>` shape an atom reason
+/// already has.
+///
+/// A raise that is **not** structured is returned unchanged, which keeps every other
+/// classification exactly as it was:
+///
+/// * an **atom** reason (`undef`, `function_clause`, …) already renders as
+///   `error <atom>`;
+/// * a **halt** and a **capability gap** are classified by [`run`] *before* the
+///   diagnostic — and a structured reason is a genuine `error`-class raise, so it is
+///   never one of them.
+///
+/// A term the printer itself rejects (a printer limitation, not a runtime error) leaves
+/// the original raise in place: the failure is still reported, never replaced by an
+/// invented reason.
+fn reported_reason(runtime: &mut Runtime, error: BeamError) -> BeamError {
+    let Some(term) = error::live_reason_term(&error) else {
+        return error;
+    };
+    match runtime.format_term_w(term, None) {
+        // `~w~n` ends the rendering with a newline; the CLI's `eprintln!` adds its own.
+        Ok(text) => error::message(text.trim_end_matches('\n')),
+        Err(_) => error,
+    }
 }
 
 #[cfg(test)]

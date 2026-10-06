@@ -205,16 +205,12 @@ fn exit_reason(runtime: &mut Runtime, error: &BeamError) -> Eterm {
         if let Some(name) = raise.reason.as_atom() {
             return runtime.intern(name);
         }
-        // A structured reason travels as a live term (the `beam_common::Raise` convention;
-        // the payload is the reason as an `Eterm`, built on a BIF heap that M1 never
-        // resets or moves). Return it directly — no reshaping, no loss.
-        if let Some(term) = raise
-            .live_reason()
-            .and_then(|live| live.downcast_ref::<Eterm>())
-            .copied()
-        {
-            return term;
-        }
+    }
+    // A structured reason travels as a live term (the `beam_common::Raise` convention;
+    // the payload is the reason as an `Eterm`, built on a BIF heap that M1 never
+    // resets or moves). Return it directly — no reshaping, no loss.
+    if let Some(term) = crate::error::live_reason_term(error) {
+        return term;
     }
     runtime.intern(&error.to_string())
 }
