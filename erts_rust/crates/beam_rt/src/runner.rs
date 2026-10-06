@@ -30,10 +30,14 @@
 //! A process that runs to its `return` exits with the reason `normal` — **not** with the
 //! value it produced (that is the BEAM contract: `x(0)` is the *return value* of the
 //! function, not the process's exit reason). The value would otherwise be lost, so the
-//! runner records it per pid in [`RunnerState::result`], where
+//! runner copies it onto the runtime's pointer-stable arena
+//! ([`Runtime::stabilize_term`](crate::Runtime::stabilize_term)) and records it per pid in
+//! [`RunnerState::result`], where
 //! [`Runtime::process_result`](crate::runtime::Runtime::process_result) exposes it after
-//! the pass. The value lives on the runtime's pointer-stable arena, which Milestone 1
-//! never resets, so it stays valid for the runtime's lifetime.
+//! the pass. The copy matters: a value taken out of the mailbox (a port's stream, say)
+//! points into the *process's own* heap, which is dropped the moment it terminates. The
+//! arena never moves its terms and Milestone 1 never resets it, so the recorded value
+//! stays valid for the runtime's lifetime.
 //!
 //! A process that fails records the raise's reason term in [`RunnerState::exit`]
 //! ([`Runtime::process_exit`](crate::runtime::Runtime::process_exit)) and exits with that
@@ -271,8 +275,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
 
         match outcome {
             Ok(EngineRunOutcome::Returned(value)) => {
-                // `x(0)`, not an exit reason: record it so the caller can observe it, and
-                // terminate the process normally.
+                // `x(0)`, not an exit reason: copy it onto the runtime's pointer-stable
+                // arena (so it outlives the process, whose own heap dies with it) and
+                // record it, then terminate the process normally.
+                let value = self.runtime.stabilize_term(value)?;
                 self.state.results.insert(pid, value);
                 Ok(RunOutcome::Exit(normal(self.runtime)))
             }

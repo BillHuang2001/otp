@@ -382,15 +382,27 @@ mod tests {
             InfoValue::Int(0)
         );
 
-        // Open a `{fd, 0}` descriptor port — a live port with **no** child process —
-        // through the real `erlang:open_port/2` path, and the count rises; closing it
-        // drops the count again, so the answer tracks the live port set exactly.
+        // Open a real `{spawn, "true"}` port through `erlang:open_port/2`: the count rises
+        // while it is live and drops once it is closed, so the answer tracks the live port
+        // set exactly. (The childless `{fd, N}` form needs a descriptor the caller owns —
+        // adopting an *inherited* one is refused here by `fcntl` with `EPERM`; it is
+        // covered instead by `port::tests::a_fd_port_adopts_a_caller_owned_descriptor`.)
         let port = {
             let mut sink = beam_bifs::NullSink;
             let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
-            let fd = context.atom("fd").expect("the `fd` atom");
-            let descriptor = beam_term::make_small(0);
-            let name = terms::make_tuple(&mut context, &[fd, descriptor]).expect("a {fd, N}");
+            let spawn = context.atom("spawn").expect("the `spawn` atom");
+            let command = {
+                let bytes = beam_engine::terms::make_list(
+                    &mut context,
+                    &"true"
+                        .bytes()
+                        .map(|b| beam_term::make_small(i64::from(b)))
+                        .collect::<Vec<_>>(),
+                )
+                .expect("the command string");
+                bytes
+            };
+            let name = terms::make_tuple(&mut context, &[spawn, command]).expect("a {spawn, Cmd}");
             let options = terms::make_list(&mut context, &[]).expect("[]");
             context
                 .call_bif("erlang", "open_port", 2, &[name, options])

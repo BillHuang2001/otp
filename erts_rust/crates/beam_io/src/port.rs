@@ -364,6 +364,20 @@ impl Port {
         driver.control(&mut ctx, command, arg)
     }
 
+    /// Takes the reaped exit status of the OS child this port owns, once.
+    ///
+    /// Forwards to the driver's [`Driver::take_exit_status`]: a port whose driver starts no
+    /// child (the built-in `fd`/`efile` drivers) always answers `Ok(None)`, and so does a
+    /// port whose child has not been reaped yet or whose status has already been taken (see
+    /// [`crate::drivers::SpawnDriver`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's `take_exit_status` returns.
+    pub fn take_exit_status(&mut self) -> Result<Option<i32>> {
+        self.driver.take_exit_status()
+    }
+
     /// Stops the driver and marks the port [`PortState::Closed`].
     ///
     /// # Errors
@@ -732,6 +746,24 @@ impl PortRegistry {
         }
         match self.ports.get_mut(&id.number()) {
             Some(port) => port.control(poller, op, arg),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Takes the reaped exit status of the OS child behind port `id`, once.
+    ///
+    /// This is the seam a runtime uses to synthesize the `{Port, {exit_status, Status}}`
+    /// message of a port opened with the `exit_status` option: `Ok(None)` means "no child",
+    /// "not reaped yet" or "already reported", so a caller polls it and reports the status
+    /// exactly once (see [`crate::drivers::SpawnDriver::take_exit_status`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's
+    /// driver returns.
+    pub fn take_exit_status(&mut self, id: PortId) -> Result<Option<i32>> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.take_exit_status(),
             None => Err(error::badarg()),
         }
     }

@@ -2,9 +2,14 @@
 //!
 //! Milestone-1 ships the built-in byte-stream driver [`FdDriver`] (registered under the
 //! name `"fd"`), which is enough to prove the poller→port→driver path end to end, plus
-//! the [`EfileDriver`] (`"efile"`) built on top of it. The legacy C's
-//! `tcp_inet`/`forker`/`spawn` drivers (`erts/emulator/drivers/common/*.c`) are documented
+//! the [`EfileDriver`] (`"efile"`) built on top of it and the OS-child [`SpawnDriver`]
+//! (`"spawn"`, the Rust counterpart of the C `spawn` driver). The legacy C's
+//! `tcp_inet`/`forker` drivers (`erts/emulator/drivers/common/*.c`) are documented
 //! follow-ups (see the crate `CONTEXT.md`, Known Issues).
+//!
+//! `SpawnDriver` is constructed **directly** from a [`SpawnSpec`] rather than through the
+//! [`crate::DriverRegistry`]: a [`DriverFactory`](crate::DriverFactory) is a no-argument
+//! function, so it cannot carry the command/argv/options a spawn port needs.
 //!
 //! `FdDriver` also carries the two framing facilities a real port driver needs, in
 //! dedicated modules:
@@ -19,8 +24,10 @@ pub mod binary_io;
 pub mod efile;
 pub mod fd;
 pub mod line_buffer;
+pub mod spawn;
 
 pub use crate::drivers::binary_io::{Phase, PhaseChange};
 pub use crate::drivers::efile::{make_efile, EfileDriver};
 pub use crate::drivers::fd::FdDriver;
 pub use crate::drivers::line_buffer::{LineBuffer, DEFAULT_MAX_LINE_LEN};
+pub use crate::drivers::spawn::{build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream};

@@ -8,35 +8,68 @@
 //! the legacy C's `spawn` driver (`../../erts/emulator/beam/erl_bif_port.c` and
 //! `../../erts/emulator/drivers/unix/spawn_driver.c`).
 //!
+//! # One OS-child implementation: `beam_io`
+//!
+//! The child process, its argv vector, its descriptors and its teardown all belong to
+//! [`beam_io`] — this module owns **none** of them. [`beam_io::SpawnDriver`] really starts
+//! the child (or adopts `{fd, N}`) in its constructor, [`beam_io::PortRegistry`] holds the
+//! live ports and allocates their ids from `beam_process`'s port table, and
+//! [`beam_io::Poller`] is the readiness reactor the drivers register their descriptors
+//! with. This crate keeps exactly two things `beam_io` does not:
+//!
+//! * the **Erlang term decoding** of `open_port/2`'s `Name`/`Options` (which produces a
+//!   term-free [`beam_io::SpawnSpec`]/[`beam_io::SpawnOptions`] pair), and
+//! * the **`port_info/1` metadata** `beam_io` deliberately does not expose
+//!   ([`PortMeta`]: the command name, the OS pid, the stream type, `connected`, the exit
+//!   notification flag, links/monitors and the **owning pid**).
+//!
+//! Both live in [`PortRegistry`], which wraps `{ poller, registry, meta, heap }`: **one**
+//! `beam_io::Poller` created once and kept for the runtime's lifetime (registrations live
+//! in the poll set, so a per-call poller would drop them), **one** `beam_io::PortRegistry`,
+//! the `port_info` metadata by port number, and the term arena a `port_info/1` result is
+//! built on.
+//!
+//! # The two message producers
+//!
+//! A port produces two kinds of message: the child's **stream** (`{Port, {data, Data}}`)
+//! and its **exit status** (`{Port, {exit_status, Status}}`, only for the `exit_status`
+//! option). [`PortRegistry::pump`] is the single place both are harvested: it polls the
+//! persistent poller in bounded slices, turns readiness into scheduled port tasks
+//! ([`beam_io::PortRegistry::schedule_events`] + `execute_port_tasks`), and reports the
+//! [`PortNotification`]s as [`PortEvent`]s.
+//!
+//! Two callers drive it, and each owns a different delivery point:
+//!
+//! * the **scheduler path** ([`Runtime::deliver_port_messages`], called from the scheduler
+//!   pass) delivers every event into the **owning process's mailbox** with
+//!   `beam_process`'s own deliver path, so a process blocked in a compiled `receive` is
+//!   woken by the existing resume-on-send machinery;
+//! * the **`-eval` `receive … after T`** path ([`RuntimeContext::poll_port_messages`])
+//!   returns the built messages inline, because `-eval` runs outside a scheduler slice and
+//!   matches them against the clause patterns itself.
+//!
 //! # What is real, and what is not (yet)
 //!
-//! **Real:** `open_port({spawn, Cmd}, _)` runs `Cmd` through `/bin/sh -c` (or, for an
-//! argv list, runs the program directly) exactly as the `spawn` driver does;
-//! `{spawn_executable, Path}` runs `Path` directly with the `{args, …}` option; `{fd, N}`
-//! registers a descriptor port; the port gets a real [`PortId`] out of [`PortTable`];
-//! `port_close/1` kills and reaps the child and returns the id to the table;
-//! `port_info/1,2` answers real items; and the child's **stdout is polled** — a
-//! `receive {Port, {data, Data}}` reads the driver's stream back, delivering a `binary`
-//! for a `binary`-stream port (a char list otherwise) through
-//! [`RuntimeContext::poll_port_messages`].
+//! **Real:** `open_port({spawn, Cmd}, _)` runs `Cmd` through `/bin/sh -c` (or, for an argv
+//! list, runs the program directly); `{spawn_executable, Path}` runs `Path` directly with
+//! the `{args, …}` option; `{fd, N}` registers a descriptor port; the port gets a real
+//! [`PortId`] out of `beam_io`'s registry; `port_close/1` kills and reaps the child and
+//! returns the id to the table; `port_info/1,2` answers real items; and the child's stdout
+//! is polled — a `receive {Port, {data, Data}}` reads the driver's stream back, delivering
+//! a `binary` for a `binary`-stream port (a char list otherwise).
 //!
 //! `port_command/2,3` writes to the child's **stdin** (an iolist, a binary or a char list),
-//! which is what makes `open_port({spawn,"cat"},[])` echo its input back — see
-//! [`RuntimeContext::port_command`](crate::context::RuntimeContext). The `exit_status`
-//! option is honored: the poller synthesizes the driver's `{Port, {exit_status, Status}}`
-//! message once the child has been reaped ([`RuntimeContext::poll_port_messages`]).
+//! which is what makes `open_port({spawn,"cat"},[])` echo its input back: the bytes are
+//! queued through [`beam_io::PortRegistry::port_command`] and the scheduled `OUTPUT` task is
+//! run immediately so they reach the child before the call returns.
 //!
-//! **Not yet:** the child's stderr *is* a pipe but is never read, only **stdout** is polled
-//! and only **one** `Read::read` per readiness (a message per read, rather than a stream
-//! coalesced per driver callback); `connected` still only flips to `false` at
-//! `port_close/1` rather than when the child exits by itself; a stream read of more than
-//! `ERL_ONHEAP_BINARY_LIMIT` (64) bytes on a `binary` port is a typed *unsupported* gap
-//! (there is no off-heap ref-counted binary build path here yet); the `eof` option is
-//! accepted but inert (its `{Port, eof}` message is not synthesized); and a
-//! `port_command/2,3` write to a `{fd, N}` port (which owns no pipe of ours) is a typed
-//! *unsupported* gap. Wiring the poller into the scheduler's wait set (rather than into the
-//! `-eval` `receive`) is the follow-up; this module keeps the honest state rather than
-//! pretending an unread pipe is delivered data.
+//! **Not yet:** the child's stderr *is* a pipe but is never read, only **stdout** is polled;
+//! `connected` only flips to `false` at `port_close/1` rather than when the child exits by
+//! itself; a stream read of more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes on a `binary`
+//! port is a typed *unsupported* gap (there is no off-heap ref-counted binary build path
+//! here yet); the `eof` option is accepted but inert (its `{Port, eof}` message is not
+//! synthesized); and a `port_command/2,3` write to a `{fd, N}` port (which owns no child
+//! pipe) is a typed *unsupported* gap.
 //!
 //! # `port_info` items (and the deliberate deviations)
 //!
@@ -70,21 +103,13 @@
 //! fun-caller bridge needs `&mut Runtime` at the same time. The port state therefore
 //! travels the same way the ETS tables do: [`Runtime::ports`](crate::Runtime) is an
 //! `Rc<RefCell<PortRegistry>>`, [`RuntimePorts`] holds a cheap clone of that `Rc` plus a
-//! clone of the shared atom-table handle, and a nested borrow is reported as a typed
-//! capability gap instead of panicking (the crate is `#![deny(unsafe_code)]` and never
-//! panics on runtime data).
-//!
-//! # `unsafe`-free
-//!
-//! Everything here is safe Rust: `std::process::Command` starts the child, the
-//! `beam_process` port table hands out ids, and terms are built through
-//! `beam_term`/`beam_engine::terms`.
+//! clone of the shared atom-table handle and the **owning pid** an `open_port/2` records,
+//! and a nested borrow is reported as a typed capability gap instead of panicking (the
+//! crate is `#![deny(unsafe_code)]` and never panics on runtime data).
 
 use std::cell::{RefCell, RefMut};
 use std::collections::HashMap;
-use std::io::{Read, Write};
-use std::os::fd::{AsRawFd, RawFd};
-use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
@@ -92,8 +117,11 @@ use beam_alloc::Heap;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_io::{Interest, Poller};
-use beam_process::{PortId, PortTable, ProcessId};
+use beam_io::{
+    Driver, Poller, PortCommandOptions, PortNotification, PortRegistry as IoPortRegistry,
+    SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, PORT_REDS_EXECUTE,
+};
+use beam_process::{PortId, ProcessId, ProcessTable};
 use beam_term::{
     atom_val, is_atom, is_small, make_atom, make_small, signed_value, try_make_small, AtomTable,
     Eterm, NIL,
@@ -101,6 +129,7 @@ use beam_term::{
 
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::Runtime;
 
 /// The size in term words of the arena a port's `port_info/1` result is built on.
 ///
@@ -108,15 +137,19 @@ use crate::error;
 /// term, and a term is a pointer, so its cells must outlive the call that produced it.
 const PORT_HEAP_WORDS: usize = 4_096;
 
-/// How long one [`RuntimeContext::poll_port_messages`] wait round may block before the
-/// port exit statuses are re-checked.
+/// How long one poll round may block before a driver's second kind of message — the
+/// `{Port, {exit_status, Status}}` of a reaped child — is re-checked.
 ///
-/// A `{Port, {exit_status, Status}}` message is *not* a stream event — a child that wrote
-/// nothing still reports its status — so the poller cannot rely on readiness to notice a
-/// child that was reaped during the wait. Slicing the wait bounds how late that message can
-/// be, and a round that *did* see readiness never waits at all (so the slice costs a
-/// data-producing port nothing).
-const EXIT_STATUS_POLL_SLICE: Duration = Duration::from_millis(25);
+/// An exit status is *not* a stream event (a child that wrote nothing still reports its
+/// status), so the poller cannot rely on readiness to notice a child that was reaped during
+/// the wait. Slicing a wait by this bounds how late that message can be, and a round that
+/// *did* see readiness never waits at all (so the slice costs a data-producing port
+/// nothing).
+///
+/// The scheduler path uses the very same slice as its per-round port-poll budget: one round
+/// of [`Runtime::deliver_port_messages`] blocks for at most this long, so a runtime whose
+/// run queue is drained and whose ports are quiet returns promptly instead of spinning.
+pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// The atom vocabulary `port_info/1,2` can emit.
 ///
@@ -177,89 +210,100 @@ impl StreamType {
     }
 }
 
-/// A live port: the spawned OS process plus the metadata `port_info/1,2` reports.
+impl From<StreamType> for SpawnStream {
+    /// The `beam_io` stream option a runtime-side [`StreamType`] names.
+    fn from(stream: StreamType) -> SpawnStream {
+        match stream {
+            StreamType::Binary => SpawnStream::Binary,
+            StreamType::List => SpawnStream::List,
+        }
+    }
+}
+
+/// The `port_info/1,2` metadata of one live port — what [`beam_io`] deliberately does not
+/// expose.
 ///
-/// A port is a `!Send` value owned by the single-threaded runtime. The child handle is
-/// kept so `port_close/1` can kill and reap it.
+/// `beam_io`'s port owns the child, the descriptors and the lifecycle; these are the Erlang
+/// side's facts: the `Name` the port was opened with, the OS pid the driver reported, the
+/// stream option, the `connected` answer, the `exit_status` flag and the process the port
+/// belongs to (which is where its stream/exit messages are delivered).
 #[derive(Debug)]
-pub struct LivePort {
-    /// Which driver backs this port.
+struct PortMeta {
+    /// Which `Name` form opened the port.
     name: PortName,
     /// The raw command line (a shell command, or an argv join) or path — the
     /// `port_info(Port, name)` value.
     command: String,
-    /// The child process; absent for a `{fd, N}` port.
-    child: Option<Child>,
-    /// The child's read end of the port stream.
-    ///
-    /// Taken out of the child after the spawn (`child.stdout.take()`) so a `Read` can be
-    /// performed on it directly; `None` for a `{fd, N}` port (which owns no stream of
-    /// ours) and after the pipeline reaches EOF (dropping the handle). A message is
-    /// delivered by reading this handle — see [`RuntimeContext::poll_port_messages`].
-    stdout: Option<ChildStdout>,
-    /// The child's **write** end of the port stream — what `port_command/2,3` writes to.
-    ///
-    /// Taken out of the child after the spawn for the same reason `stdout` is; `None` for a
-    /// `{fd, N}` port (so a `port_command` to one is a typed capability gap rather than a
-    /// write to the wrong descriptor). Dropping it at port close closes the child's stdin,
-    /// which is the graceful `cat`-style shutdown the driver gets from `port_close/1`.
-    stdin: Option<ChildStdin>,
-    /// The OS process id; absent for a `{fd, N}` port.
+    /// The OS process id the driver reported **before** the port was registered; absent for
+    /// a `{fd, N}` port.
     os_pid: Option<u32>,
-    /// `port_info(Port, connected)`. Tracks the *port*, not the child: nothing polls the
-    /// child yet, so an independently exited child does not flip this (see the module
-    /// docs).
-    connected: bool,
     /// The `binary`/`list` option.
     stream: StreamType,
-    /// Whether the `exit_status` option was asked for — i.e. whether the driver would queue
-    /// a `{Port, {exit_status, Status}}` message once the child has been reaped.
+    /// `port_info(Port, connected)`. Tracks the *port*, not the child: an independently
+    /// exited child does not flip this (see the module docs).
+    connected: bool,
+    /// Whether the `exit_status` option was asked for.
+    ///
+    /// `beam_io`'s driver already hands the status out exactly once
+    /// ([`beam_io::PortRegistry::take_exit_status`]), so this flag is not a once-only
+    /// guard — it is what [`PortRegistry::pump`] uses to skip the status check for a port
+    /// that never asked for it.
     notify_exit: bool,
-    /// Whether that message has already been delivered, so the poller synthesizes it once.
-    exit_notified: bool,
     /// The processes linked to this port. Empty in Milestone-1: nothing links a port yet.
     links: Vec<ProcessId>,
     /// The processes monitoring this port. Empty in Milestone-1: nothing monitors a port
     /// yet, and `beam_term` has no reference term to identify a monitor by.
     monitors: Vec<ProcessId>,
+    /// The process the port belongs to — the recipient of its `{Port, {data, …}}` and
+    /// `{Port, {exit_status, …}}` messages.
+    owner: ProcessId,
 }
 
-impl LivePort {
-    /// Kills and reaps the child, if there is one.
-    ///
-    /// A child that has already exited is reaped by `try_wait` and needs no kill — so the
-    /// one case where `kill` legitimately fails is never mistaken for a genuine failure,
-    /// and a genuine `kill`/`wait` failure is reported rather than swallowed.
-    fn close(&mut self) -> Result<()> {
-        // A `{fd, N}` port owns no process: the descriptor belongs to the Erlang side, so
-        // closing the port must not touch it.
-        if self.name == PortName::Fd {
-            return Ok(());
-        }
-        // A `spawn`/`spawn_executable` port is always created with a child.
-        let Some(child) = self.child.as_mut() else {
-            return Ok(());
-        };
-        match child.try_wait().map_err(BeamError::Io)? {
-            Some(_status) => Ok(()),
-            None => {
-                child.kill().map_err(BeamError::Io)?;
-                child.wait().map_err(BeamError::Io)?;
-                Ok(())
-            }
-        }
-    }
-}
-
-/// The runtime's port subsystem state: the id table plus the live ports.
+/// A message a live port has produced: the child's stream bytes, or its reaped exit status.
 ///
-/// Shared as `Rc<RefCell<PortRegistry>>` (see the module docs). It also owns the arena a
-/// `port_info/1` result is built on — see [`PortRegistry::heap`].
+/// This is [`PortRegistry::pump`]'s report, and the seam between the port poller and the
+/// two things that turn it into an Erlang term: the scheduler path
+/// ([`Runtime::deliver_port_messages`], which delivers it to `owner`'s mailbox) and the
+/// `-eval` `receive` path ([`RuntimeContext::poll_port_messages`], which builds it inline).
+#[derive(Debug)]
+enum PortEvent {
+    /// The child wrote `bytes`; the message is `{Port, {data, Data}}` with `Data` shaped by
+    /// `stream`.
+    Data {
+        /// The port the bytes came from.
+        port: PortId,
+        /// The bytes one driver read produced.
+        bytes: Vec<u8>,
+        /// The port's `binary`/`list` option.
+        stream: StreamType,
+        /// The process the message belongs to.
+        owner: ProcessId,
+    },
+    /// The child was reaped and its `exit_status` option asked for the status.
+    Exited {
+        /// The port whose child went away.
+        port: PortId,
+        /// The child's status (its own exit code, or `128 + signal`).
+        status: i32,
+        /// The process the message belongs to.
+        owner: ProcessId,
+    },
+}
+
+/// The runtime's port subsystem state: one poller, one `beam_io` port registry, the
+/// `port_info` metadata and the term arena.
+///
+/// Shared as `Rc<RefCell<PortRegistry>>` (see the module docs). The [`Poller`] is created
+/// **once**, here, and kept for the runtime's lifetime: a port's descriptors are registered
+/// with the poll set when its driver starts, so a poller re-created per call would lose
+/// every registration.
 pub struct PortRegistry {
-    /// The port-number table (`beam_process` owns the numbering).
-    table: PortTable,
-    /// The live ports, by port number.
-    live: HashMap<u64, LivePort>,
+    /// The readiness reactor every live port's descriptors are registered with.
+    poller: Poller,
+    /// The `beam_io` port registry: the id authority and the live ports with their drivers.
+    registry: IoPortRegistry,
+    /// The `port_info/1` metadata, keyed by port number.
+    meta: HashMap<u64, PortMeta>,
     /// The arena a `port_info/1` result is built on.
     ///
     /// `port_info/1` hands its `{Item, Value}` pairs to `beam_bifs`, which copies them into
@@ -273,107 +317,218 @@ pub struct PortRegistry {
 }
 
 impl PortRegistry {
-    /// An empty registry with its term arena.
+    /// An empty registry with its poller and term arena.
     ///
     /// # Errors
     ///
-    /// Propagates the arena's allocation failure.
+    /// Propagates the poll set's and the arena's allocation failures.
     pub fn new() -> Result<PortRegistry> {
         Ok(PortRegistry {
-            table: PortTable::new(),
-            live: HashMap::new(),
+            poller: Poller::new()?,
+            registry: IoPortRegistry::new(),
+            meta: HashMap::new(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
         })
     }
 
-    /// Allocates a fresh port id.
+    /// Registers `driver` as a new port and records its `port_info` `meta`.
+    ///
+    /// The id is allocated by [`beam_io::PortRegistry::open`], which also starts the driver
+    /// and tears it down (and releases the number) when the start fails — so a failed start
+    /// leaks neither the poll set nor the id space, and the metadata is only recorded once
+    /// the port is genuinely live.
     ///
     /// # Errors
     ///
-    /// [`BeamError::SystemLimit`] when the port number space is exhausted.
-    pub fn alloc(&mut self) -> Result<PortId> {
-        self.table.alloc()
+    /// [`BeamError::SystemLimit`] when the id space is exhausted, or whatever the driver's
+    /// `start` returns (the driver having been torn down).
+    fn register(&mut self, driver: Box<dyn Driver>, meta: PortMeta) -> Result<PortId> {
+        let id = self.registry.open(&mut self.poller, driver)?;
+        self.meta.insert(id.number(), meta);
+        Ok(id)
     }
 
-    /// Returns `id` to the port table without touching the live map.
-    pub fn release(&mut self, id: PortId) {
-        self.table.release(id);
-    }
-
-    /// Whether `id` is currently allocated.
-    pub fn contains(&self, id: PortId) -> bool {
-        self.table.contains(id)
-    }
-
-    /// Whether `id` names a port the runtime currently **holds** — i.e. a live entry, not
-    /// merely an allocated table slot.
+    /// Whether `id` names a port the runtime currently **holds**.
     ///
-    /// [`PortRegistry::remove`] releases the slot together with the entry, so this and
-    /// [`PortRegistry::contains`] agree for every port this crate closes; the distinction
-    /// matters only for a caller that released a slot without dropping its entry. The
-    /// native `port_info/1,2` floor uses it to tell "a port I know" (delegate to
+    /// The native `port_info/1,2` floor uses it to tell "a port I know" (delegate to
     /// `beam_bifs`) from "a port I do not" (the oracle's `undefined`).
     pub fn is_live(&self, id: PortId) -> bool {
-        self.live.contains_key(&id.number())
+        self.meta.contains_key(&id.number())
+    }
+
+    /// Whether `id` names a port the runtime currently holds.
+    ///
+    /// [`PortRegistry::close`] removes the metadata and the `beam_io` entry together, so
+    /// this and [`PortRegistry::is_live`] always agree.
+    pub fn contains(&self, id: PortId) -> bool {
+        self.meta.contains_key(&id.number())
     }
 
     /// Writes `bytes` to the port's child — `erlang:port_command/2,3`.
+    ///
+    /// The bytes are queued through [`beam_io::PortRegistry::port_command`] and the
+    /// `OUTPUT` task it scheduled is run immediately, so the child has been handed the data
+    /// before this call returns (the BIF's `true` answer means exactly that).
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never
     /// opened) — the oracle's own reason for `port_command` on a dead port; a capability
-    /// gap for a port that owns no pipe of ours (a `{fd, N}` port); [`BeamError::Io`] when
-    /// the write itself fails.
+    /// gap for a port that owns no child pipe of ours (a `{fd, N}` port); [`BeamError::Io`]
+    /// when the write itself fails (a child that closed its stdin yields `EPIPE`).
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        let Some(live) = self.live.get_mut(&id.number()) else {
+        let Some(meta) = self.meta.get(&id.number()) else {
             return Err(BeamError::BadArg);
         };
-        let Some(stdin) = live.stdin.as_mut() else {
+        // A `{fd, N}` port adopts a descriptor the Erlang side owns: there is no child
+        // stdin of ours to write to, so the call is a typed capability gap — never a write
+        // to some other descriptor and never a fabricated success (the `beam_io` registry
+        // would otherwise answer its own `badarg`, losing the distinction).
+        if meta.name == PortName::Fd {
             return Err(error::unsupported(
                 "port_command/2 on a port with no child stdin ({fd, N} port)",
             ));
-        };
-        stdin.write_all(bytes).map_err(BeamError::Io)?;
-        stdin.flush().map_err(BeamError::Io)
+        }
+        self.registry
+            .port_command(&mut self.poller, id, bytes, PortCommandOptions::EMPTY)?;
+        // `port_command` only queues the bytes and schedules the task; run it now so the
+        // write really happened.
+        let _outcome = self
+            .registry
+            .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+        Ok(())
     }
 
     /// The number of **live** ports — the value `erlang:system_info(port_count)` reports.
     pub fn len(&self) -> usize {
-        self.live.len()
+        self.meta.len()
     }
 
     /// Whether no port is open.
     pub fn is_empty(&self) -> bool {
-        self.live.is_empty()
+        self.meta.is_empty()
     }
+
     /// The ids of the **live** ports, in port-number order.
     ///
-    /// The live map holds exactly the ports `open_port/2` recorded, so it is the direct
+    /// The metadata map holds exactly the ports `open_port/2` recorded, so it is the direct
     /// source of truth for `erlang:ports/0` — reported here rather than recovered by
-    /// scanning `contains` upward from zero, which a slot released *below* a still-live
-    /// port would cut short. The numbers are sorted so the answer does not depend on the
-    /// map's iteration order.
+    /// scanning the table upward from zero, which a slot released *below* a still-live port
+    /// would cut short. The numbers are sorted so the answer does not depend on the map's
+    /// iteration order.
     pub fn ids(&self) -> Vec<PortId> {
-        let mut numbers: Vec<u64> = self.live.keys().copied().collect();
+        let mut numbers: Vec<u64> = self.meta.keys().copied().collect();
         numbers.sort_unstable();
         numbers.into_iter().map(PortId::new).collect()
     }
 
-    /// Records `live` as the port `id`.
-    pub fn insert(&mut self, id: PortId, live: LivePort) {
-        self.live.insert(id.number(), live);
+    /// Closes the port `id`: kills and reaps its child, releases its id and drops its
+    /// metadata.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a port the runtime does not hold — never a silently
+    /// accepted close of a port that does not exist; otherwise whatever the driver's
+    /// teardown reports (the port is gone from the registry either way).
+    pub fn close(&mut self, id: PortId) -> Result<()> {
+        self.meta.remove(&id.number()).ok_or(BeamError::BadArg)?;
+        self.registry.close(&mut self.poller, id)
     }
 
-    /// Removes the port `id`, releasing its table slot, and returns it.
+    /// Polls the live ports for up to `timeout`, runs the port tasks the readiness implies,
+    /// and reports the messages they produced.
     ///
-    /// The slot is released even when the caller then fails to reap the child: the caller
-    /// asked to close the port, and a close that reports an error must not leave the port
-    /// half-registered.
-    pub fn remove(&mut self, id: PortId) -> Option<LivePort> {
-        let live = self.live.remove(&id.number())?;
-        self.table.release(id);
-        Some(live)
+    /// The wait is spent in [`PORT_POLL_SLICE`] slices so a driver's second kind of message
+    /// is picked up as well: a port opened with the `exit_status` option reports
+    /// [`PortEvent::Exited`] once its child has been reaped, which is **not** tied to stream
+    /// readiness. A due exit status is checked **before** the wait too, so a child reaped
+    /// before this call is reported without any polling. The method returns as soon as any
+    /// event is available, and with an empty report once `timeout` elapses.
+    ///
+    /// Nothing at all is polled when no port is live, so a runtime that never opened a port
+    /// never sleeps here.
+    ///
+    /// # Errors
+    ///
+    /// The poller's own failures ([`BeamError::Io`] when the poll syscall fails) and any
+    /// error a port's driver raises while a scheduled task runs.
+    fn pump(&mut self, timeout: Duration) -> Result<Vec<PortEvent>> {
+        let mut events = self.take_due_exit_statuses()?;
+        if self.registry.is_empty() {
+            return Ok(events);
+        }
+        let deadline = Instant::now() + timeout;
+        loop {
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            let polled = self.poller.poll(Some(remaining.min(PORT_POLL_SLICE)))?;
+            if !polled.is_empty() {
+                // Readiness becomes *scheduled tasks* (the ERTS port-task model) — the
+                // driver is called when the task runs, never from the event loop.
+                self.registry.schedule_events(&polled);
+            }
+            let outcome = self
+                .registry
+                .execute_port_tasks(&mut self.poller, PORT_REDS_EXECUTE)?;
+            for notification in outcome.notifications {
+                match notification {
+                    PortNotification::Data { port, bytes } => {
+                        if bytes.is_empty() {
+                            continue;
+                        }
+                        // A notification for a port whose metadata is gone (closed while the
+                        // task was queued) has no recipient and is dropped.
+                        if let Some(meta) = self.meta.get(&port.number()) {
+                            events.push(PortEvent::Data {
+                                port,
+                                bytes,
+                                stream: meta.stream,
+                                owner: meta.owner,
+                            });
+                        }
+                    }
+                    // A close is the caller's own `port_close/1` (which has already dropped
+                    // the port's metadata), so there is nobody to notify: an explicit close
+                    // produces no message in ERTS either.
+                    PortNotification::Closed { .. } => {}
+                }
+            }
+            events.extend(self.take_due_exit_statuses()?);
+            if !events.is_empty() || Instant::now() >= deadline {
+                return Ok(events);
+            }
+        }
+    }
+
+    /// The `{Port, {exit_status, Status}}` events that are due now.
+    ///
+    /// Only a port opened with the `exit_status` option is consulted, and
+    /// [`beam_io::PortRegistry::take_exit_status`] hands each status out exactly once, so a
+    /// second round cannot report the same exit twice.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::Io`] when the wait itself fails.
+    fn take_due_exit_statuses(&mut self) -> Result<Vec<PortEvent>> {
+        let numbers: Vec<u64> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| meta.notify_exit)
+            .map(|(number, _)| *number)
+            .collect();
+        let mut events = Vec::new();
+        for number in numbers {
+            let port = PortId::new(number);
+            if let Some(status) = self.registry.take_exit_status(port)? {
+                if let Some(meta) = self.meta.get(&number) {
+                    events.push(PortEvent::Exited {
+                        port,
+                        status,
+                        owner: meta.owner,
+                    });
+                }
+            }
+        }
+        Ok(events)
     }
 
     /// The `{Item, Value}` pairs of `port` — the `port_info/1` answer.
@@ -390,7 +545,7 @@ impl PortRegistry {
     /// runtime condition — the list is [`PORT_INFO_ATOMS`]); the arena's allocation failure
     /// when a value does not fit.
     fn info(&mut self, port: PortId, atoms: &AtomTable) -> Result<Vec<(Eterm, Eterm)>> {
-        let Some(live) = self.live.get(&port.number()) else {
+        let Some(meta) = self.meta.get(&port.number()) else {
             return Ok(Vec::new());
         };
         let item = |name: &str| -> Result<Eterm> {
@@ -399,19 +554,19 @@ impl PortRegistry {
                 .map(make_atom)
                 .ok_or(BeamError::TermNotFound)
         };
-        // `self.live` and `self.heap` are disjoint fields, so the immutable borrow of the
+        // `self.meta` and `self.heap` are disjoint fields, so the immutable borrow of the
         // port and the mutable borrow of the arena coexist.
-        let name = charlist(&mut self.heap, &live.command)?;
-        let links = pid_list(&mut self.heap, &live.links)?;
-        let monitors = monitor_list(&mut self.heap, atoms, &live.monitors)?;
-        let os_pid = match live.os_pid {
+        let name = charlist(&mut self.heap, &meta.command)?;
+        let links = pid_list(&mut self.heap, &meta.links)?;
+        let monitors = monitor_list(&mut self.heap, atoms, &meta.monitors)?;
+        let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
             // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
             // the oracle's own answer.
             None => item("undefined")?,
         };
-        let connected = item(if live.connected { "true" } else { "false" })?;
-        let stream = item(live.stream.atom_name())?;
+        let connected = item(if meta.connected { "true" } else { "false" })?;
+        let stream = item(meta.stream.atom_name())?;
         Ok(vec![
             (item("name")?, name),
             (item("id")?, port.to_eterm()),
@@ -433,8 +588,33 @@ struct NameSpec {
     command: String,
     /// The argv vector to run directly, when the name carried one (`{spawn, […]}`).
     argv: Option<Vec<String>>,
+    /// The adopted descriptor of a `{fd, N}` name.
+    fd: Option<RawFd>,
     /// The inline option list of `{spawn_executable, Path, Opts}`, if given.
     inline_options: Option<Eterm>,
+}
+
+impl NameSpec {
+    /// The term-free [`beam_io::SpawnSpec`] this validated name describes.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a `{fd, N}` name without a validated descriptor (a
+    /// programming error — [`RuntimePorts::name_spec`] always records one).
+    fn spawn_spec(&self) -> Result<SpawnSpec> {
+        match self.kind {
+            PortName::Spawn => Ok(SpawnSpec::Spawn {
+                command: self.command.clone(),
+                argv: self.argv.clone(),
+            }),
+            PortName::SpawnExecutable => Ok(SpawnSpec::SpawnExecutable {
+                path: self.command.clone(),
+            }),
+            PortName::Fd => Ok(SpawnSpec::Fd {
+                fd: self.fd.ok_or(BeamError::BadArg)?,
+            }),
+        }
+    }
 }
 
 /// The validated option list of an `open_port/2` call.
@@ -483,11 +663,12 @@ impl PortOptions {
     }
 }
 
-/// The concrete [`PortHook`]: validates `open_port/2` arguments, really starts the OS
-/// process, and answers the port BIFs from the runtime's [`PortRegistry`].
+/// The concrete [`PortHook`]: validates `open_port/2` arguments, hands the term-free
+/// result to `beam_io`'s `spawn` driver (which really starts the OS process), and answers
+/// the port BIFs from the runtime's [`PortRegistry`].
 ///
 /// One is built per BIF call (see the module docs). It owns nothing but two cheap `Rc`
-/// clones, so it never borrows the [`Runtime`](crate::Runtime).
+/// clones and the owning pid, so it never borrows the [`Runtime`](crate::Runtime).
 pub struct RuntimePorts {
     /// The shared port state.
     registry: Rc<RefCell<PortRegistry>>,
@@ -499,12 +680,25 @@ pub struct RuntimePorts {
     /// does not have, and the handle is dropped when the call ends. The names are instead
     /// part of the boot seed ([`PORT_INFO_ATOMS`]) and only ever looked up here.
     atoms: Rc<AtomTable>,
+    /// The process the port is opened **for** — what `PortMeta::owner` records, so the
+    /// port's `{Port, {data, …}}` and `{Port, {exit_status, …}}` messages can be delivered
+    /// to the process that opened it.
+    owner: ProcessId,
 }
 
 impl RuntimePorts {
-    /// A provider over `registry` that resolves its item atoms in `atoms`.
-    pub fn new(registry: Rc<RefCell<PortRegistry>>, atoms: Rc<AtomTable>) -> RuntimePorts {
-        RuntimePorts { registry, atoms }
+    /// A provider over `registry` that resolves its item atoms in `atoms` and records
+    /// `owner` as the process every port it opens belongs to.
+    pub fn new(
+        registry: Rc<RefCell<PortRegistry>>,
+        atoms: Rc<AtomTable>,
+        owner: ProcessId,
+    ) -> RuntimePorts {
+        RuntimePorts {
+            registry,
+            atoms,
+            owner,
+        }
     }
 
     /// Borrows the shared registry for one operation.
@@ -568,6 +762,7 @@ impl RuntimePorts {
                     kind: PortName::Spawn,
                     command,
                     argv,
+                    fd: None,
                     inline_options: None,
                 })
             }
@@ -575,12 +770,14 @@ impl RuntimePorts {
                 kind: PortName::SpawnExecutable,
                 command: self.string_value(terms::tuple_element(name, 1)?)?,
                 argv: None,
+                fd: None,
                 inline_options: None,
             }),
             ("spawn_executable", 3) => Ok(NameSpec {
                 kind: PortName::SpawnExecutable,
                 command: self.string_value(terms::tuple_element(name, 1)?)?,
                 argv: None,
+                fd: None,
                 inline_options: Some(terms::tuple_element(name, 2)?),
             }),
             ("fd", 2) => {
@@ -590,10 +787,12 @@ impl RuntimePorts {
                 if !is_small(descriptor) || signed_value(descriptor) < 0 {
                     return Err(BeamError::BadArg);
                 }
+                let fd = i32::try_from(signed_value(descriptor)).map_err(|_| BeamError::BadArg)?;
                 Ok(NameSpec {
                     kind: PortName::Fd,
-                    command: format!("fd:{}", signed_value(descriptor)),
+                    command: format!("fd:{fd}"),
                     argv: None,
+                    fd: Some(fd),
                     inline_options: None,
                 })
             }
@@ -646,7 +845,7 @@ impl RuntimePorts {
                     Some("binary") => parsed.stream = Some(StreamType::Binary),
                     Some("list") => parsed.stream = Some(StreamType::List),
                     // The driver queues a `{Port, {exit_status, Status}}` message once the
-                    // child has been reaped — the poller synthesizes it.
+                    // child has been reaped — the pump reports it.
                     Some("exit_status") => parsed.exit_status = true,
                     // Recognized, accepted, and without effect (see the module docs).
                     Some("eof") => {}
@@ -697,88 +896,6 @@ impl RuntimePorts {
             .map(|element| self.string_value(element))
             .collect()
     }
-
-    /// Starts the OS process `spec`/`options` describe.
-    ///
-    /// A `{fd, N}` port has no process at all. Everything else runs `/bin/sh -c` for a
-    /// shell command line, or the argv program directly, with `{cd, Dir}` / `{env, …}`
-    /// applied. The child's three standard streams are pipes: **stdout** is polled for
-    /// `{Port, {data, …}}` messages and **stdin** is what `port_command/2,3` writes to
-    /// (stderr is never read), and they keep the child from inheriting the emulator's own
-    /// captured output.
-    ///
-    /// # Errors
-    ///
-    /// A diagnostic naming the command when the process cannot be started; the argv form
-    /// with an empty vector is [`BeamError::BadArg`].
-    fn spawn(&self, spec: &NameSpec, options: &PortOptions) -> Result<LivePort> {
-        let live = |child: Option<Child>, os_pid: Option<u32>| {
-            // Take the read and write ends out of the child so they can be used directly (a
-            // `{fd, N}` port has neither).
-            let mut child = child;
-            let stdout = child.as_mut().and_then(|child| child.stdout.take());
-            let stdin = child.as_mut().and_then(|child| child.stdin.take());
-            LivePort {
-                name: spec.kind,
-                command: spec.command.clone(),
-                child,
-                stdout,
-                stdin,
-                os_pid,
-                connected: true,
-                stream: options.stream(),
-                notify_exit: options.exit_status,
-                exit_notified: false,
-                links: Vec::new(),
-                monitors: Vec::new(),
-            }
-        };
-        if spec.kind == PortName::Fd {
-            return Ok(live(None, None));
-        }
-        // `{spawn_executable, Path}` builds its argv from the `args` option; `{spawn,
-        // [Prog, Arg…]}` already carries one; a shell command line carries none.
-        let argv = match spec.kind {
-            PortName::SpawnExecutable => {
-                let mut argv = Vec::with_capacity(1 + options.args.len());
-                argv.push(spec.command.clone());
-                argv.extend(options.args.iter().cloned());
-                Some(argv)
-            }
-            _ => spec.argv.clone(),
-        };
-        let mut command = match &argv {
-            Some(argv) => {
-                let program = argv.first().ok_or(BeamError::BadArg)?;
-                let mut command = Command::new(program);
-                command.args(&argv[1..]);
-                command
-            }
-            None => {
-                let mut command = Command::new("/bin/sh");
-                command.arg("-c").arg(&spec.command);
-                command
-            }
-        };
-        if let Some(dir) = &options.cd {
-            command.current_dir(dir);
-        }
-        for (key, value) in &options.env {
-            command.env(key, value);
-        }
-        command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        let child = command.spawn().map_err(|source| {
-            error::message(format!(
-                "open_port: cannot start {:?}: {source}",
-                spec.command
-            ))
-        })?;
-        let os_pid = child.id();
-        Ok(live(Some(child), Some(os_pid)))
-    }
 }
 
 impl PortHook for RuntimePorts {
@@ -794,37 +911,43 @@ impl PortHook for RuntimePorts {
         };
         resolved.overlay(self.port_options(options)?);
 
-        // The id is allocated first so that a start failure cannot leak a slot, and it is
-        // released again if the start fails. The registry stays borrowed across the
-        // `spawn`: starting a process cannot re-enter a port operation, and a nested borrow
-        // is reported as a typed error rather than panicking.
+        // `beam_io`'s driver constructor really starts the child (or adopts `{fd, N}`)
+        // before anything is registered anywhere, so a failure here cannot leak an id; the
+        // OS pid the driver reports is what `port_info(Port, os_pid)` answers.
+        let stream = resolved.stream();
+        let spawn_options = SpawnOptions {
+            stream: stream.into(),
+            cd: resolved.cd,
+            env: resolved.env,
+            args: resolved.args,
+            exit_status: resolved.exit_status,
+        };
+        let driver = SpawnDriver::new(&spec.spawn_spec()?, &spawn_options)?;
+        let os_pid = driver.os_pid();
+        let meta = PortMeta {
+            name: spec.kind,
+            command: spec.command,
+            os_pid,
+            stream,
+            connected: true,
+            notify_exit: spawn_options.exit_status,
+            links: Vec::new(),
+            monitors: Vec::new(),
+            owner: self.owner,
+        };
+        // The registry stays borrowed across `register`: starting a port cannot re-enter a
+        // port operation, and a nested borrow is a typed error rather than a panic.
         let mut registry = self.registry_mut()?;
-        let id = registry.alloc()?;
-        match self.spawn(&spec, &resolved) {
-            Ok(live) => {
-                registry.insert(id, live);
-                Ok(id)
-            }
-            Err(error) => {
-                registry.release(id);
-                Err(error)
-            }
-        }
+        registry.register(Box::new(driver), meta)
     }
 
     fn close_port(&mut self, port: PortId) -> Result<()> {
         let mut registry = self.registry_mut()?;
         // An unknown port is `badarg` — never a silently dropped close.
-        if !registry.contains(port) {
+        if !registry.is_live(port) {
             return Err(BeamError::BadArg);
         }
-        // `contains` established the port is registered, so it has a live entry; the
-        // second lookup keeps the invariant checked rather than assumed.
-        let Some(mut live) = registry.remove(port) else {
-            return Err(BeamError::BadArg);
-        };
-        live.connected = false;
-        live.close()
+        registry.close(port)
     }
 
     fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
@@ -834,146 +957,131 @@ impl PortHook for RuntimePorts {
     }
 }
 
-impl RuntimeContext<'_> {
-    /// Reads any pending port-stream output as `{Port, {data, Data}}` messages.
+impl Runtime {
+    /// Drives the port poller for up to `timeout` and **delivers** every message the ports
+    /// produced into its owning process's mailbox in `table`, returning how many were
+    /// delivered.
     ///
-    /// This is the runtime's port **poller** (the legacy C's `erts_poll`/driver
-    /// `ready_input` callback equivalent): it registers every live port that still has a
-    /// readable stream with a [`beam_io::Poller`] and waits up to `timeout` for readiness.
-    /// A readable descriptor is read **once** (a readable poll guarantees the read does not
-    /// block) and its bytes become one `{Port, {data, Data}}` message — an Erlang **binary**
-    /// for a `binary`-stream port, else a char list. It returns as soon as the first message
-    /// has been produced, `Ok(vec![])` once `timeout` elapses, and immediately when no live
-    /// port has a readable stream (an absent stream is never slept on). A read that returns
-    /// `0` is EOF: the handle is dropped so a later poll cannot spin on the closed
-    /// descriptor.
+    /// This is the scheduler path's port half: the runtime's main loop calls it once the
+    /// run queue is drained, so a process blocked in a compiled `receive` waiting for
+    /// `{Port, {data, …}}` is woken through `beam_process`'s own deliver path (the
+    /// `ProcessTable` wake list, which `Scheduler::resume_woken` then resumes). The message
+    /// is `copy_struct`-ed into the recipient's heap by `deliver_simple`, so the transient
+    /// term built here on the runtime's arena is not shared.
     ///
-    /// The wait is spent in short slices so a second kind of driver message can be picked up
-    /// as well: a port opened with the `exit_status` option queues
-    /// `{Port, {exit_status, Status}}` once its child has been reaped (see
-    /// [`Self::take_port_exit_message`]), which is **not** tied to stream readiness — a child
-    /// that produced no output at all still reports its status.
-    ///
-    /// The `data` atom is interned in the runtime's **one shared** table, and the terms are
-    /// built on the runtime's pointer-stable arena, so the messages are nameable by the
-    /// printer and comparable by the evaluator's `receive` clauses.
+    /// Nothing is polled when no port is live (so a runtime that never opened a port pays
+    /// nothing), and a message whose owner is no longer in `table` is skipped rather than
+    /// treated as an error.
     ///
     /// # Errors
     ///
-    /// The poller's own failures ([`BeamError::Io`] when the poll/register syscall or a
-    /// read fails); a nested borrow of the port table is a typed capability gap rather than
-    /// a panic; the arena's allocation failure when a term does not fit.
-    pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
-        // The shared port state is cloned out so the *message* — which needs `&mut self` —
-        // is never built while the registry is borrowed (the same snapshot rule `native.rs`
-        // follows).
-        let registry = Rc::clone(&self.runtime.ports);
-        // A requested exit status that is already due wins over the stream: the child was
-        // reaped before this call, so its message is queued now (and is not tied to the
-        // stream, which may have produced nothing).
-        if let Some(message) = self.take_port_exit_message()? {
-            return Ok(vec![message]);
-        }
-        // Which live ports still have a readable stream: (port number, raw fd, stream).
-        let registrations: Vec<(u64, RawFd, StreamType)> = {
-            let registry = registry
+    /// The poller's/driver's failures, a nested borrow of the port table (a typed
+    /// capability gap), the term builders' allocation failures, and the deliver path's own
+    /// errors.
+    pub(crate) fn deliver_port_messages(
+        &mut self,
+        table: &mut ProcessTable,
+        timeout: Duration,
+    ) -> Result<usize> {
+        // No live port ⇒ nothing to wait for: never sleep.
+        {
+            let registry = self
+                .ports
                 .try_borrow()
                 .map_err(|_| error::unsupported("the port table is already in use"))?;
-            registry
-                .live
-                .iter()
-                .filter_map(|(number, live)| {
-                    live.stdout
-                        .as_ref()
-                        .map(|stdout| (*number, stdout.as_raw_fd(), live.stream))
-                })
-                .collect()
+            if registry.is_empty() {
+                return Ok(0);
+            }
+        }
+        let events = {
+            let mut registry = self
+                .ports
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            registry.pump(timeout)?
         };
-        // No readable stream at all ⇒ nothing to wait for: return at once, never sleep.
-        if registrations.is_empty() {
-            return Ok(self.take_port_exit_message()?.into_iter().collect());
-        }
-        let mut poller = Poller::new()?;
-        // The token indexes the poller's registration so an EOF'd descriptor can be
-        // de-registered before its handle (and therefore its fd) is dropped.
-        let mut registered: Vec<(u64, RawFd, StreamType, beam_io::Token)> =
-            Vec::with_capacity(registrations.len());
-        for (number, fd, stream) in registrations {
-            let token = poller.register(fd, Interest::READABLE, number)?;
-            registered.push((number, fd, stream, token));
-        }
-        let deadline = Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let events = poller.poll(Some(remaining.min(EXIT_STATUS_POLL_SLICE)))?;
-            // An empty round means this slice elapsed with no readiness. It is also the
-            // point at which a child that died during the slice is observable, so the exit
-            // statuses are re-checked before the round is declared over.
-            if events.is_empty() {
-                if let Some(message) = self.take_port_exit_message()? {
-                    return Ok(vec![message]);
+        let mut delivered = 0;
+        for event in events {
+            // The term is built on the runtime's arena (the `RuntimeContext` the builders
+            // need) *after* the registry borrow has been released — the same snapshot rule
+            // the `-eval` poller follows.
+            let (owner, from, message) = {
+                let mut ctx = RuntimeContext::new(&mut *self);
+                match &event {
+                    PortEvent::Data {
+                        port,
+                        bytes,
+                        stream,
+                        owner,
+                    } => (
+                        *owner,
+                        port.to_eterm(),
+                        ctx.port_data_message(*port, bytes, *stream)?,
+                    ),
+                    PortEvent::Exited { port, status, owner } => (
+                        *owner,
+                        port.to_eterm(),
+                        ctx.port_exit_message(*port, *status)?,
+                    ),
                 }
-                if Instant::now() >= deadline {
-                    return Ok(Vec::new());
-                }
+            };
+            // A port whose owner has since terminated has no recipient: the message is
+            // dropped, not an error.
+            if !table.contains(owner) {
                 continue;
             }
-            for event in events {
-                // A half-close (HUP) or an error condition also means "read now": a `read`
-                // then returns the remaining bytes and finally `0` at EOF.
-                let ready = event.ready();
-                if !(ready.readable() || ready.is_read_closed() || ready.is_error()) {
-                    continue;
+            table.deliver_simple(owner, from, message)?;
+            delivered += 1;
+        }
+        Ok(delivered)
+    }
+}
+
+impl RuntimeContext<'_> {
+    /// Reads any pending port-stream output as `{Port, {data, Data}}` messages.
+    ///
+    /// This is the `-eval` `receive … after T` path's port half: it waits up to `timeout`
+    /// (in [`PORT_POLL_SLICE`] slices — see [`PortRegistry::pump`]) for the live ports to
+    /// produce something and builds the messages **on the runtime's pointer-stable arena**,
+    /// so the caller can match them against its `receive` clauses. The `data` atom is
+    /// interned in the runtime's **one shared** table, so the message is nameable by the
+    /// printer and comparable by the evaluator's own clauses.
+    ///
+    /// `Ok(vec![])` means nothing arrived within `timeout`; nothing is polled at all when no
+    /// port is live (a receive with no port never sleeps here).
+    ///
+    /// The scheduler path uses [`Runtime::deliver_port_messages`] instead, because there the
+    /// messages belong in a process's mailbox rather than in the caller's hands.
+    ///
+    /// # Errors
+    ///
+    /// The poller's/driver's failures; a nested borrow of the port table is a typed
+    /// capability gap rather than a panic; the arena's allocation failure when a term does
+    /// not fit (including the documented >`ERL_ONHEAP_BINARY_LIMIT` *unsupported* gap for a
+    /// wide `binary`-stream read).
+    pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>> {
+        // The shared port state is cloned out so the *messages* — which need `&mut self` —
+        // are never built while the registry is borrowed (the same snapshot rule
+        // `native.rs` follows).
+        let registry = Rc::clone(&self.runtime.ports);
+        let events = {
+            let mut registry = registry
+                .try_borrow_mut()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            registry.pump(timeout)?
+        };
+        let mut messages = Vec::with_capacity(events.len());
+        for event in events {
+            match event {
+                PortEvent::Data {
+                    port, bytes, stream, ..
+                } => messages.push(self.port_data_message(port, &bytes, stream)?),
+                PortEvent::Exited { port, status, .. } => {
+                    messages.push(self.port_exit_message(port, status)?)
                 }
-                let number = event.key();
-                let Some((fd, stream, token)) = registered
-                    .iter()
-                    .find(|(registered, _, _, _)| *registered == number)
-                    .map(|(_, fd, stream, token)| (*fd, *stream, *token))
-                else {
-                    continue;
-                };
-                // One `Read::read` after a readable poll does not block. The bytes are
-                // snapshotted into owned data and the registry borrow is dropped before the
-                // term is built (see the snapshot rule above).
-                let message: Option<(Vec<u8>, StreamType)> = {
-                    let mut registry = registry
-                        .try_borrow_mut()
-                        .map_err(|_| error::unsupported("the port table is already in use"))?;
-                    let Some(live) = registry.live.get_mut(&number) else {
-                        continue;
-                    };
-                    // Move the handle out so the EOF path can leave it dropped (closing the
-                    // descriptor) without aliasing the borrow.
-                    let mut handle = live.stdout.take();
-                    let read = match handle.as_mut() {
-                        Some(stdout) => {
-                            let mut buf = [0u8; 4096];
-                            let count = stdout.read(&mut buf).map_err(BeamError::Io)?;
-                            if count == 0 {
-                                // EOF: de-register while the descriptor is still open, so a
-                                // later poll cannot spin on the closed fd; `handle` then
-                                // drops here and closes it.
-                                poller.deregister(fd, token)?;
-                                None
-                            } else {
-                                Some((buf[..count].to_vec(), stream))
-                            }
-                        }
-                        None => None,
-                    };
-                    // Put the live handle back unless the stream reached EOF.
-                    if read.is_some() {
-                        live.stdout = handle;
-                    }
-                    read
-                };
-                let Some((bytes, stream)) = message else {
-                    continue;
-                };
-                return Ok(vec![self.port_data_message(PortId::new(number), &bytes, stream)?]);
             }
         }
+        Ok(messages)
     }
 
     /// The `{Port, {data, Data}}` message of one port-stream read.
@@ -982,7 +1090,7 @@ impl RuntimeContext<'_> {
     /// `list` default, `erl`'s own). The `data` atom is interned into the runtime's one
     /// shared table, so the message is nameable by the printer and matchable by a `receive`
     /// clause.
-    fn port_data_message(
+    pub(crate) fn port_data_message(
         &mut self,
         port: PortId,
         bytes: &[u8],
@@ -1004,73 +1112,19 @@ impl RuntimeContext<'_> {
     }
 
     /// The `{Port, {exit_status, Status}}` message of a port whose child has been reaped,
-    /// when that port's `exit_status` option asked for it and it has not been reported yet.
+    /// when that port's `exit_status` option asked for it.
     ///
     /// This is the `spawn` driver's exit notification (legacy C:
     /// `erts/emulator/drivers/unix/spawn_driver.c` queues `{exit_status, Status}` when
-    /// `waitpid` reports the child gone). A port without the option, a port whose child is
-    /// still running, and a port already reported all answer `None` — so the caller falls
-    /// through to the stream wait, and a `receive` that did not ask for the option never
-    /// sees a fabricated message.
-    ///
-    /// Reaping here is safe to repeat: `Child::try_wait` caches the status it reaped, so
-    /// `port_close/1`'s own `try_wait` still answers `Some` afterwards.
-    ///
-    /// # Errors
-    ///
-    /// [`BeamError::Io`] when the wait itself fails; a capability gap when the port table is
-    /// already borrowed; the arena's allocation failure when a term does not fit.
-    fn take_port_exit_message(&mut self) -> Result<Option<Eterm>> {
-        let registry = Rc::clone(&self.runtime.ports);
-        let exit = {
-            let mut registry = registry
-                .try_borrow_mut()
-                .map_err(|_| error::unsupported("the port table is already in use"))?;
-            let mut exit = None;
-            for (number, live) in registry.live.iter_mut() {
-                if !live.notify_exit || live.exit_notified {
-                    continue;
-                }
-                let Some(child) = live.child.as_mut() else {
-                    continue;
-                };
-                if let Some(status) = child.try_wait().map_err(BeamError::Io)? {
-                    // Reported once: a second `receive` must not see the same exit twice.
-                    live.exit_notified = true;
-                    exit = Some((*number, exit_status_code(status)));
-                    break;
-                }
-            }
-            exit
-        };
-        match exit {
-            Some((number, status)) => {
-                Ok(Some(self.port_exit_message(PortId::new(number), status)?))
-            }
-            None => Ok(None),
-        }
-    }
-
-    /// The `{Port, {exit_status, Status}}` message itself — the sibling of
-    /// [`Self::port_data_message`], with the same interned-atom/pointer-stable-arena rule.
-    fn port_exit_message(&mut self, port: PortId, status: i32) -> Result<Eterm> {
+    /// `waitpid` reports the child gone). The status itself is handed out exactly once by
+    /// [`beam_io::PortRegistry::take_exit_status`], so a second `receive` cannot see the same
+    /// exit twice. The sibling of [`Self::port_data_message`], with the same
+    /// interned-atom/pointer-stable-arena rule.
+    pub(crate) fn port_exit_message(&mut self, port: PortId, status: i32) -> Result<Eterm> {
         let tag = make_atom(self.runtime.code_server.atoms_mut().intern("exit_status"));
         let inner = terms::make_tuple(self, &[tag, make_small(i64::from(status))])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
-}
-
-/// The status a `{Port, {exit_status, Status}}` message reports for `status`.
-///
-/// A child that exited reports its own exit code; one that was **killed by a signal**
-/// reports `128 + signal` — the shell convention, and what the legacy `spawn` driver's
-/// status carries. The two are told apart through `ExitStatusExt` because
-/// `ExitStatus::code` is `None` for a signal.
-fn exit_status_code(status: std::process::ExitStatus) -> i32 {
-    use std::os::unix::process::ExitStatusExt;
-    status
-        .code()
-        .unwrap_or_else(|| 128 + status.signal().unwrap_or(0))
 }
 
 /// `text` as an Erlang string (a char list of bytes), built on `heap`.
@@ -1124,6 +1178,9 @@ mod tests {
     use super::*;
     use crate::boot;
 
+    /// The process every port the fixture's hook opens claims as its owner.
+    const OWNER: ProcessId = ProcessId::new(7, 0);
+
     /// A test fixture: the shared registry, the atom table both the provider and the test
     /// resolve names through, the provider itself, and a term heap.
     ///
@@ -1159,7 +1216,7 @@ mod tests {
         }
         let atoms = Rc::new(atoms);
         let registry = Rc::new(RefCell::new(PortRegistry::new().expect("a port registry")));
-        let hook = RuntimePorts::new(Rc::clone(&registry), Rc::clone(&atoms));
+        let hook = RuntimePorts::new(Rc::clone(&registry), Rc::clone(&atoms), OWNER);
         Fixture {
             registry,
             atoms,
@@ -1183,7 +1240,7 @@ mod tests {
         fn list(&mut self, elements: &[Eterm]) -> Eterm {
             let mut list = NIL;
             for element in elements.iter().rev() {
-                list = self.heap.cons(*element, list).expect("a cons cell");
+                list = heap_cons(&mut self.heap, *element, list);
             }
             list
         }
@@ -1214,6 +1271,12 @@ mod tests {
         }
     }
 
+    /// A cons cell built directly on the fixture's heap (the `beam_alloc` interface, which
+    /// is what the production `charlist`/`pid_list` helpers use).
+    fn heap_cons(heap: &mut Heap, head: Eterm, tail: Eterm) -> Eterm {
+        heap.cons(head, tail).expect("a cons cell")
+    }
+
     /// `term` read as a byte string.
     fn text_of(term: Eterm) -> String {
         terms::list_elements(term)
@@ -1233,6 +1296,31 @@ mod tests {
             "expected badarg, got {result:?}"
         );
     }
+
+    /// Drains the fixture's port poller until `port` produces stream data, returning it.
+    ///
+    /// The child's output is *not* read by the test any more: the runtime's poller owns the
+    /// descriptors (the whole point of the `beam_io` adoption), so the bytes are recovered
+    /// through the same `pump` the runtime itself uses.
+    fn pump_data(registry: &mut PortRegistry, port: PortId) -> Vec<u8> {
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            for event in registry.pump(Duration::from_millis(50)).expect("pump") {
+                if let PortEvent::Data {
+                    port: source,
+                    bytes,
+                    ..
+                } = event
+                {
+                    if source == port {
+                        return bytes;
+                    }
+                }
+            }
+        }
+        panic!("no stream data for {port:?}");
+    }
+
     #[test]
     fn spawn_true_opens_a_real_registered_port() {
         let mut fx = fixture();
@@ -1246,7 +1334,8 @@ mod tests {
         assert!(PortId::is_port(port.to_eterm()), "a real internal port");
         assert!(fx.registry.borrow().contains(port));
 
-        // The child really started: `os_pid` is its process id.
+        // The child really started: `os_pid` is its process id, captured from the driver
+        // before the port was registered.
         let os_pid = signed_value(fx.item(port, "os_pid"));
         assert!(os_pid > 0, "a spawned child has an os pid, got {os_pid}");
 
@@ -1305,9 +1394,18 @@ mod tests {
         assert_eq!(text_of(fx.item(port, "name")), "/bin/sh");
         assert_eq!(fx.item(port, "stream"), fx.atom("binary"));
 
-        // `{fd, N}` registers a descriptor port with no OS process.
-        let name = fx.name("fd", make_small(2));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, 2}");
+        // `{fd, N}` registers a descriptor port with no OS process. The descriptor is a
+        // socketpair end the **test** owns and keeps open: `beam_io`'s driver adopts a
+        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
+        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
+        // accepts it, so the childless name form is exercised independently of the test
+        // harness's fds.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
         // `os_pid` is `undefined` for a port without an OS process — the oracle's answer.
         assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
         assert_eq!(fx.item(port, "connected"), fx.atom("true"));
@@ -1450,22 +1548,15 @@ mod tests {
     #[test]
     fn write_command_really_writes_to_the_child_and_an_unknown_port_is_badarg() {
         let mut fx = fixture();
-        // `cat` echoes exactly what it is given, so the write is observable through the same
-        // stream handle the poller reads (the stdin/stdout halves of one child).
+        // `cat` echoes exactly what it is given, so the write is observable through the
+        // runtime's own poller (the same path that delivers `{Port, {data, …}}`).
         let name = fx.spawn("cat");
         let port = fx.hook.open_port(name, NIL).expect("open_port({spawn, \"cat\"}, [])");
         fx.registry
             .borrow_mut()
             .write_command(port, b"hello")
             .expect("port_command");
-        let echo = {
-            let mut registry = fx.registry.borrow_mut();
-            let live = registry.live.get_mut(&port.number()).expect("a live port");
-            let stdout = live.stdout.as_mut().expect("cat's stdout");
-            let mut buf = [0u8; 5];
-            stdout.read_exact(&mut buf).expect("cat echoes the 5 bytes");
-            buf
-        };
+        let echo = pump_data(&mut fx.registry.borrow_mut(), port);
         assert_eq!(&echo, b"hello");
 
         // A port the registry does not hold is `badarg` (the oracle's reason for a closed
@@ -1478,10 +1569,19 @@ mod tests {
     #[test]
     fn a_fd_port_has_no_child_stdin_to_write_to() {
         let mut fx = fixture();
-        let name = fx.name("fd", make_small(2));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, 2}");
+        // A descriptor the **test** owns and keeps open: `beam_io`'s driver adopts a
+        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
+        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
+        // accepts it, so the gap is exercised independently of the test harness's fds.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
         // A `{fd, N}` port owns no pipe of ours: writing to it is a typed capability gap,
-        // never a write to some other descriptor and never a fabricated success.
+        // never a write to some other descriptor and never a fabricated success. (The
+        // `beam_io` registry would answer its own `badarg`; the gap is preserved here.)
         let error = fx
             .registry
             .borrow_mut()
@@ -1491,6 +1591,44 @@ mod tests {
             error::unsupported_reason(&error).as_deref(),
             Some(reason) if reason.contains("port_command")
         ));
+    }
+
+    #[test]
+    fn a_fd_port_adopts_a_caller_owned_descriptor() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let mut fx = fixture();
+        // A descriptor the **test** owns and keeps open for the whole test.
+        // `beam_io`'s driver adopts a `{fd, N}` by putting it in non-blocking mode
+        // (`fcntl(F_SETFL, O_NONBLOCK)`), which the sandbox refuses for an inherited
+        // descriptor (fd 0 yields `EPERM`); a socketpair end always accepts it, so the
+        // childless name form is exercised independently of the test harness's fds.
+        let (mut local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx
+            .hook
+            .open_port(name, NIL)
+            .expect("{fd, N} adopts the descriptor");
+
+        // A descriptor port has no OS process of its own, is connected, and reports the
+        // `fd:<N>` rendering the reference implementation uses.
+        assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
+        assert_eq!(fx.item(port, "connected"), fx.atom("true"));
+        assert_eq!(text_of(fx.item(port, "name")), format!("fd:{fd}"));
+        assert!(fx.registry.borrow().contains(port));
+
+        // Closing the port releases it but **never closes** the adopted descriptor: it
+        // belongs to the Erlang side. The write below would fail with `EBADF` if the
+        // driver had closed it.
+        fx.hook.close_port(port).expect("port_close/1");
+        assert!(!fx.registry.borrow().contains(port));
+        local
+            .write_all(b"x")
+            .expect("the adopted descriptor is still open after port_close/1");
     }
 
     #[test]
@@ -1517,7 +1655,7 @@ mod tests {
     #[test]
     fn the_exit_status_option_is_remembered_on_the_port() {
         let mut fx = fixture();
-        // Without the option the poller has nothing to synthesize.
+        // Without the option the poller has nothing to report.
         let name = fx.spawn("true");
         let plain = fx.hook.open_port(name, NIL).expect("open_port");
         let exit_status = fx.atom("exit_status");
@@ -1526,17 +1664,89 @@ mod tests {
         let with_option = fx.hook.open_port(name, options).expect("open_port");
         let registry = fx.registry.borrow();
         assert!(
-            !registry.live.get(&plain.number()).expect("a port").notify_exit,
-            "a port opened without exit_status must not queue an exit message"
+            !registry.meta.get(&plain.number()).expect("a port").notify_exit,
+            "a port opened without exit_status must not report an exit message"
         );
         assert!(
             registry
-                .live
+                .meta
                 .get(&with_option.number())
                 .expect("a port")
                 .notify_exit,
             "the exit_status option must be recorded"
         );
+    }
+
+    #[test]
+    fn the_pump_reports_a_reaped_childs_exit_status_once() {
+        let mut fx = fixture();
+        let exit_status = fx.atom("exit_status");
+        let options = fx.list(&[exit_status]);
+        let name = fx.spawn("sh -c \"exit 3\"");
+        let port = fx.hook.open_port(name, options).expect("open_port");
+
+        // The status is not tied to stream readiness: a child that wrote nothing still
+        // reports it, and it is reported exactly once.
+        let deadline = Instant::now() + Duration::from_secs(10);
+        let mut status = None;
+        let mut reports = 0;
+        while Instant::now() < deadline {
+            for event in fx
+                .registry
+                .borrow_mut()
+                .pump(Duration::from_millis(50))
+                .expect("pump")
+            {
+                if let PortEvent::Exited {
+                    port: source,
+                    status: reported,
+                    ..
+                } = event
+                {
+                    assert_eq!(source, port);
+                    status = Some(reported);
+                    reports += 1;
+                }
+            }
+            if status.is_some() {
+                break;
+            }
+        }
+        assert_eq!(status, Some(3), "the reaped child's exit code");
+        assert_eq!(reports, 1);
+
+        // A second round must not report it again.
+        let quiet = fx
+            .registry
+            .borrow_mut()
+            .pump(Duration::from_millis(50))
+            .expect("pump");
+        assert!(
+            quiet.is_empty(),
+            "an exit status is handed out exactly once: {quiet:?}"
+        );
+
+        // A port opened *without* the option never reports one.
+        let name = fx.spawn("true");
+        let plain = fx.hook.open_port(name, NIL).expect("open_port");
+        let deadline = Instant::now() + Duration::from_secs(10);
+        while Instant::now() < deadline {
+            let events = fx
+                .registry
+                .borrow_mut()
+                .pump(Duration::from_millis(50))
+                .expect("pump");
+            for event in events {
+                assert!(
+                    !matches!(event, PortEvent::Exited { port: p, .. } if p == plain),
+                    "a port without the exit_status option must not report one"
+                );
+            }
+            if fx.registry.borrow().is_live(plain) {
+                // The child has certainly exited by now; nothing was reported for it.
+                break;
+            }
+        }
     }
 
     #[test]
@@ -1556,9 +1766,9 @@ mod tests {
     #[test]
     fn an_empty_port_registry_has_no_ports() {
         let registry = PortRegistry::new().expect("a port registry");
-        assert!(registry.live.is_empty());
-        assert!(!registry.contains(PortId::new(0)));
         assert!(registry.is_empty());
+        assert!(!registry.contains(PortId::new(0)));
+        assert_eq!(registry.len(), 0);
         assert!(registry.ids().is_empty());
     }
 
@@ -1579,8 +1789,8 @@ mod tests {
             "the live ports are reported in port-number order"
         );
 
-        // Closing the *lower* port leaves a gap below the still-live higher one. The live
-        // map is the source of truth, so `ids` still reports the higher port (a
+        // Closing the *lower* port leaves a gap below the still-live higher one. The
+        // metadata map is the source of truth, so `ids` still reports the higher port (a
         // scan-from-zero recovery would have stopped at the gap and missed it).
         fx.hook.close_port(first).expect("closing the first port");
         assert!(!fx.registry.borrow().contains(first));

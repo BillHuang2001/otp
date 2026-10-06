@@ -33,6 +33,7 @@
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
 //! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
+//! | [`records`] | A.1/A.2/A.7 — native records: the `records:*` BIFs + the native-record opcodes |
 //!
 //! A.3 and A.4 are only *partially* reachable through the black-box CLI (their corpus
 //! groups pin the observable raise/port surface), so the C-declaration half of both is
@@ -48,6 +49,7 @@ mod flags;
 mod mexec;
 mod modules;
 mod nif;
+mod records;
 mod semantics;
 mod system_info;
 mod terms;
@@ -298,6 +300,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(semantics::group());
     cases.extend(errors::group());
     cases.extend(nif::group());
+    cases.extend(records::group());
     cases.extend(driver::group());
     cases.extend(wire::group());
     cases.extend(bifs::group());

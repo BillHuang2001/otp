@@ -64,7 +64,7 @@ This is the frozen public-API shape dependents design against; keep it stable.
   `Scheduler::resume_woken`) wakes a receiver blocked in `receive`.
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus the
   optional host seams `FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`.
-- `beam_io` → the poller/reactor (`mio`-backed) + `Port` + built-in-driver registry.
+- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
   process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
@@ -102,7 +102,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
 | `beam_bifs` | `BifRegistry` + core `erlang` BIFs (arith, comparison, type tests, term ops) + `io` floor |
 | `beam_ets` | `set` + `ordered_set` core ops (`new/insert/lookup/delete/select`) |
-| `beam_io` | `mio` poller/reactor + `Port` + one built-in driver |
+| `beam_io` | `mio` poller/reactor + `Port`/`PortRegistry` + port-task scheduling + built-in `fd`/`efile` **and OS-child `spawn`** drivers |
 | `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
 
 ## Term/heap foundation: maps · bitstrings · refc binaries (current state)
@@ -199,8 +199,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`)
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`)
 - `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag), B-tree/CHAMP interiors
-- `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, built-in drivers
-- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), and the `PortHook` provider
+- `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
+- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider
 - `../tools/differential/` → differential-test harness vs real ERTS (sibling — read-only, escalate writes to `..`)
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
@@ -224,14 +224,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
   scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
   `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
-  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). Runtime port I/O is
-  polling-backed: `beam_rt` keeps the child's stdout, registers its fd with `beam_io`'s poller, reads it
-  and delivers `{Port,{data,Data}}` to the owning process (driven from the `-eval` `receive … after T`
-  path); `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
-  `total=333 agree=325 mismatch=0 unsupported=8`** (re-measured at this node's HEAD; the corpus grew
-  from 285 to 333 cases since the earlier note). The 8 `unsupported` are all `beam_rt` capability gaps —
-  `driver/port_command_write_read` (`port_command/2`), the two `wire/*` fun-encode cases
-  (`local_fun`), and the five `boot/*` `spawn`/`spawn_link` cases — and **no case disagrees**
+  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). **The port subsystem is consolidated onto `beam_io`:** `beam_rt` owns one long-lived `beam_io::Poller`
+  + `PortRegistry`, spawns OS children through `beam_io`'s `SpawnDriver`, runs the port-task round from its
+  main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
+  messages **delivered to the owning process**, so a receiver blocked on port data is woken through
+  `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
+  `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
+  `total=333 agree=332 mismatch=0 unsupported=1 skipped=0`** (re-measured at this node's HEAD). The 1
+  `unsupported` is `wire/new_fun_ext_encode` (`beam_rt`'s `local_fun` gap); **no case disagrees**
   (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,

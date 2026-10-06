@@ -356,6 +356,28 @@ impl Runtime {
         self.arena.alloc_words(n)
     }
 
+    /// Copies a scheduled process's return value onto the runtime's long-lived,
+    /// never-reset `-eval` arena and returns the copy.
+    ///
+    /// A process's code runs on a heap that dies with it, and a value taken out of the
+    /// mailbox lives in exactly that heap — so an `x(0)` that is a container or a binary
+    /// would dangle the moment the process terminated. The runner records every return
+    /// value through here ([`crate::runner`]) so
+    /// [`Runtime::process_result`](Runtime::process_result) really does hand back a term
+    /// valid for the runtime's lifetime — the property the scheduler tests rely on (see
+    /// `tests/port_wake.rs`, where the receiver returns the port's stream binary).
+    ///
+    /// The destination is the same pointer-stable arena the `-eval` evaluator's
+    /// non-byte-aligned bitstrings use ([`Runtime::eval_heap`]); nothing resets it in
+    /// Milestone 1. An immediate is returned unchanged (the copier shares immediates).
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the value does not fit. That is an honest
+    /// error, never a dangling term.
+    pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
+        beam_message::copy_struct_simple(term, &mut self.eval_heap)
+    }
     /// Ensures `heap_need` words are available in the arena.
     ///
     /// # Errors
@@ -599,27 +621,22 @@ impl Runtime {
     /// The runtime's scheduler and runner state persist across calls (they are moved out
     /// and put back), so a pump resumes exactly where the previous one left off.
     ///
-    /// Returns the number of slices that ran; `0` means nothing was runnable.
+    /// Returns the number of slices that ran **plus** the port messages a live port
+    /// delivered into their owner's mailbox (see [`Runtime::scheduler_pass`]); `0` means
+    /// neither happened. The caller — the evaluator's `receive` — treats a non-zero answer
+    /// as "the mailbox may have changed, rescan it", so a port message is picked up exactly
+    /// like a message another process sent.
     ///
     /// # Errors
     ///
     /// * a typed diagnostic when an enqueued pid has no registered engine;
     /// * the process table's errors while terminating a process or delivering a message
-    ///   between processes.
+    ///   between processes;
+    /// * the port poller's/driver's failures and a nested borrow of the port table (a typed
+    ///   capability gap).
     pub(crate) fn pump_scheduler(&mut self, max_slices: u64) -> Result<u64> {
-        self.boot_if_needed()?;
-        let mut table = self.take_processes();
-        let mut scheduler = std::mem::replace(&mut self.scheduler, Scheduler::new());
-        let mut state = std::mem::take(&mut self.runner_state);
-        let outcome = {
-            let mut runner = RuntimeRunner::new(self, &mut state);
-            scheduler.resume_woken(&mut table);
-            scheduler.run_ready(&mut table, &mut runner, Some(max_slices))
-        };
-        self.runner_state = state;
-        self.scheduler = scheduler;
-        self.put_processes(table);
-        outcome
+        let (ran, delivered) = self.scheduler_pass(Some(max_slices), true)?;
+        Ok(ran + delivered as u64)
     }
 
     /// Appends a process created by [`Runtime::spawn_process`] to the scheduler's run
@@ -723,19 +740,102 @@ impl Runtime {
     /// runner can hold `&mut Runtime` while the scheduler holds `&mut ProcessTable` — two
     /// borrows that cannot coexist inside one value (see [`crate::runner`]). Both go back
     /// when the pass ends, whatever its outcome.
+    ///
+    /// Returns the number of slices that ran; the port half (see
+    /// [`Runtime::scheduler_pass`]) is not counted here.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::scheduler_pass`].
     fn run_pass(&mut self, max_slices: Option<u64>) -> Result<u64> {
+        self.scheduler_pass(max_slices, false).map(|(ran, _)| ran)
+    }
+
+    /// Runs a scheduler pass **and drives the port poller**: the shared body of every
+    /// `run_*` entry and of [`Runtime::pump_scheduler`].
+    ///
+    /// The move-out dance is [`Runtime::run_pass`]'s (the runner needs `&mut Runtime` while
+    /// the scheduler needs `&mut ProcessTable`). On top of it this adds the runtime's
+    /// **port half** — the loop that lets a live port wake a blocked process:
+    ///
+    /// 1. run the scheduler until the run queue drains (bounded by `max_slices` when given);
+    /// 2. with no port live, stop — a runtime that never opened a port pays nothing;
+    /// 3. otherwise poll the runtime's **one persistent** port poller for at most
+    ///    [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE), run the port tasks readiness
+    ///    scheduled, and **deliver** every `{Port, {data, …}}`/`{Port, {exit_status, …}}`
+    ///    message into its **owning process's mailbox**
+    ///    ([`Runtime::deliver_port_messages`], which uses `beam_process`'s own deliver path);
+    /// 4. a delivery is what wakes a receiver blocked in a compiled `receive`, so it
+    ///    enqueues the woken process ([`Scheduler::resume_woken`]) and the loop runs the
+    ///    scheduler again — until nothing is delivered and the queue is empty.
+    ///
+    /// A round therefore either runs a slice or delivers a port message; when neither
+    /// happens the pass is quiescent and the loop ends (never a busy spin — the poll itself
+    /// is bounded by [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE)).
+    ///
+    /// `resume_first` absorbs the table's pending wake list **before** the first slice — the
+    /// behaviour [`Runtime::pump_scheduler`] needs (a send made *outside* a scheduler slice
+    /// must be enqueued), which [`Runtime::run_pass`] does not do (its `run_ready` absorbs
+    /// wakes at each slice's end anyway).
+    ///
+    /// Returns `(slices that ran, port messages delivered)`.
+    ///
+    /// # Errors
+    ///
+    /// * a typed diagnostic when an enqueued pid has no registered engine;
+    /// * the process table's errors while terminating a process or delivering a message
+    ///   between processes;
+    /// * the port poller's/driver's failures; a nested borrow of the port table is a typed
+    ///   capability gap rather than a panic.
+    fn scheduler_pass(
+        &mut self,
+        max_slices: Option<u64>,
+        resume_first: bool,
+    ) -> Result<(u64, usize)> {
         self.boot_if_needed()?;
         let mut table = self.take_processes();
         let mut scheduler = std::mem::replace(&mut self.scheduler, Scheduler::new());
         let mut state = std::mem::take(&mut self.runner_state);
-        let outcome = {
-            let mut runner = RuntimeRunner::new(self, &mut state);
-            scheduler.run_ready(&mut table, &mut runner, max_slices)
+        // A wake produced *outside* a scheduler slice before this pass started (a `-eval`
+        // send, say) must be enqueued first when the caller asked for it.
+        if resume_first {
+            scheduler.resume_woken(&mut table);
+        }
+        let mut ran: u64 = 0;
+        let mut delivered: usize = 0;
+        let outcome: Result<()> = loop {
+            // `run_ready` also stops once its own budget is spent; the loop's budget counts
+            // every slice across the rounds, so a bounded pass never overshoots.
+            let budget = max_slices.map(|max| max.saturating_sub(ran));
+            if budget == Some(0) {
+                break Ok(());
+            }
+            let slices = {
+                let mut runner = RuntimeRunner::new(self, &mut state);
+                scheduler.run_ready(&mut table, &mut runner, budget)
+            };
+            match slices {
+                Ok(executed) => ran += executed,
+                Err(err) => break Err(err),
+            }
+            // The port half: with a live port, read what it produced and deliver it into
+            // the owning process's mailbox (which may wake a blocked receiver).
+            match self.deliver_port_messages(&mut table, crate::port::PORT_POLL_SLICE) {
+                Ok(0) => break Ok(()),
+                Ok(count) => {
+                    delivered += count;
+                    // The delivery may have woken a blocked receiver: absorb the wake list so
+                    // the next round runs it.
+                    scheduler.resume_woken(&mut table);
+                }
+                Err(err) => break Err(err),
+            }
         };
         self.runner_state = state;
         self.scheduler = scheduler;
         self.put_processes(table);
-        outcome
+        outcome?;
+        Ok((ran, delivered))
     }
 
     /// Moves the process table out of the runtime for a scheduler pass.
