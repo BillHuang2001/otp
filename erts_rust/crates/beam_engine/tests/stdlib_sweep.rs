@@ -36,7 +36,9 @@
 //!   an unimplemented BIF/mechanism, [`blocked_mechanisms_report_their_typed_error`]
 //!   prints `SKIP: <module>:<f>/<n> — <typed error>` **and asserts the exact typed
 //!   error**, so a later regression that turns a typed error into a *wrong result*
-//!   is caught. It is never a silent pass and never a fabricated expected value.
+//!   is caught. It is never a silent pass and never a fabricated expected value. Its
+//!   synthetic-module counterpart — the full opcode/seam capability-gap inventory —
+//!   lives in `tests/gaps.rs`.
 //!
 //! Ground truth is always the system `erl` (see `tests/fixtures/README.md`); the
 //! stdlib/kernel directories are located at **test time** and every test skips
@@ -44,14 +46,12 @@
 
 mod support;
 
-use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use beam_common::BeamError;
-use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
-use beam_loader::{Function, Instr, Label, Module, Operand, TestKind, NO_FAIL};
-use beam_term::{make_small, Atom, Eterm};
+use beam_engine::terms;
+use beam_term::{make_small, Eterm};
 use support::{
     app_ebin, assert_atom, assert_int_list, assert_int_pair_list, assert_small, assert_term,
     int_list, skip_reason, term_tuple, ModuleHost,
@@ -582,7 +582,20 @@ fn sweep_base64_builds_an_off_heap_binary() {
 // 4. Blocked mechanisms (asserted loudly, never silently passed)
 // ---------------------------------------------------------------------------
 
-/// Real functions that a **documented, still-open** gap blocks.
+/// Asserts `err` is the exact typed BEAM `badarg` (`BeamError::BadArg`) and prints
+/// the probe's `SKIP:` line — the shared shape of the blocked-mechanism probes.
+fn assert_blocked_badarg(name: &str, err: BeamError) {
+    println!("SKIP: {name} — {err:?}");
+    assert!(
+        matches!(err, BeamError::BadArg),
+        "unexpected `{name}` error: {err:?}"
+    );
+    assert_eq!(
+        err.as_atom(),
+        Some("badarg"),
+        "`{name}` must be the typed BEAM `badarg`"
+    );
+}/// Real functions that a **documented, still-open** gap blocks.
 ///
 /// The property under test is: *the Rust runtime returns a typed [`BeamError`]
 /// where the oracle returns a correct value* — never a silently-wrong value. Each
@@ -595,6 +608,22 @@ fn sweep_base64_builds_an_off_heap_binary() {
 /// floor: the map-operation BIFs (`maps:put/3`, `maps:size/1`, `maps:get/2`, …)
 /// are `erlang` BIFs the harness does not serve, so any call that needs them is a
 /// typed `BadArg`.
+///
+/// Every probe is a *real installed module's export* and is verified empirically:
+/// the oracle value is quoted beside it and the exact typed error is asserted, so
+/// the invariant under test is "a typed error where the oracle returns a value" —
+/// never a wrong value and never a silent pass.
+///
+/// Candidates that were tried and **dropped** after measuring (kept here so the
+/// next pass does not re-try them):
+/// * `string:uppercase/1` — the host **serves** it: `sweep_string_module` runs it to
+///   the oracle's `"ABC"`, so it is evidence of the served floor, not a gap.
+/// * `erlang:process_info/1` / `erlang:spawn/1` — `erlang` is not a loadable module,
+///   so `host.call("erlang", …)` fails at **load** with `BeamError::Io`
+///   (no `erlang.beam`): a harness artifact, not a BIF-floor gap. The real exports
+///   that reach them (`c:i/0`, `rpc:async_call/4`) are blocked on the whole
+///   process/mailbox/distribution machinery, which the `code_server:call/1` probe
+///   below pins to its own exact typed error.
 #[test]
 fn blocked_mechanisms_report_their_typed_error() {
     if skip_if_unavailable() {
@@ -644,6 +673,133 @@ fn blocked_mechanisms_report_their_typed_error() {
         matches!(err, BeamError::BadArg),
         "unexpected `unicode:characters_to_binary/1` error: {err:?}"
     );
+
+    // `unicode:characters_to_list/1` — the mirror direction, a `unicode` NIF
+    // (`characters_to_list/1` → `call_ext characters_to_list/2` → `bif`) the host
+    // floor does not serve, so the real module's call is a typed `badarg`.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[unicode:characters_to_list("hi")]),halt().'
+    //         "hi"
+    let s = chars(&mut host, "hi");
+    assert_blocked_badarg(
+        "unicode:characters_to_list/1",
+        host.call("unicode", "characters_to_list", &[s])
+            .expect_err("`unicode:characters_to_list/1` is a NIF the host floor does not serve"),
+    );
+
+    // ---- real `maps` operations ------------------------------------------
+    // `maps:new/0` is pure compiled code (`new() -> #{}`), so it *runs*; every
+    // `maps` operation over an argument then stops at an unserved BIF. The map is
+    // built test-side (the runtime cannot build a non-empty one — `maps:put/3` is
+    // itself one of the unserved BIFs), so each probe is a real `maps` export over
+    // a real `#{k => 1}`.
+    //
+    // Installed-`maps.beam` evidence (`beam_disasm`): `maps:get/2`, `maps:keys/1`
+    // and `maps:put/3` are `erlang:nif_error(undef)` stubs — the harness's
+    // `nif_error/1` answers the typed `badarg` — and `maps:size/1` opens with a
+    // `gc_bif` for the map-size BIF, likewise unserved.
+    let map = terms::make_flatmap(&mut host, &[(k, make_small(1))]).expect("a flat map #{k=>1}");
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:size(#{k=>1})]),halt().'
+    //         1
+    assert_blocked_badarg(
+        "maps:size/1",
+        host.call("maps", "size", &[map])
+            .expect_err("`maps:size/1` needs an unserved map BIF"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:get(k,#{k=>1})]),halt().'
+    //         1
+    assert_blocked_badarg(
+        "maps:get/2",
+        host.call("maps", "get", &[k, map])
+            .expect_err("`maps:get/2` is an `erlang:nif_error/1` stub"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:keys(#{k=>1})]),halt().'
+    //         [k]
+    assert_blocked_badarg(
+        "maps:keys/1",
+        host.call("maps", "keys", &[map])
+            .expect_err("`maps:keys/1` is an `erlang:nif_error/1` stub"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:put(k,1,#{k=>1})]),halt().'
+    //         #{k => 1}
+    assert_blocked_badarg(
+        "maps:put/3",
+        host.call("maps", "put", &[k, make_small(1), map])
+            .expect_err("`maps:put/3` is an `erlang:nif_error/1` stub"),
+    );
+
+    // ---- ets -------------------------------------------------------------
+    // `ets:new/2` is likewise an `erlang:nif_error(undef)` stub: the host has no
+    // table registry, so creating a table is a typed `badarg`, never a fake tid.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[is_reference(ets:new(t,[]))]),halt().'
+    //         true
+    let table = host.intern("t");
+    let opts = support::term_list(&mut host, &[]);
+    assert_blocked_badarg(
+        "ets:new/2",
+        host.call("ets", "new", &[table, opts])
+            .expect_err("`ets:new/2` needs the ETS BIF the host does not serve"),
+    );
+
+    // ---- code loading ----------------------------------------------------
+    // `code:which/1` resolves a module's `.beam` through the code server and the
+    // loader BIFs; the host serves neither, so it is a typed `badarg` (in the
+    // oracle it is the `…/lists.beam` path).
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[is_list(code:which(lists))]),halt().'
+    //         true
+    let lists = host.intern("lists");
+    assert_blocked_badarg(
+        "code:which/1",
+        host.call("code", "which", &[lists])
+            .expect_err("`code:which/1` needs the code-loading BIFs"),
+    );
+
+    // ---- io --------------------------------------------------------------
+    // The host has no `io` device/port, so `io:format/2` cannot be served: it is a
+    // typed `badarg` rather than a silent no-op (the oracle prints and returns
+    // `ok`).
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[1]),halt().'
+    //         1
+    //         ok
+    let fmt = chars(&mut host, "~p~n");
+    let args = support::term_list(&mut host, &[make_small(1)]);
+    assert_blocked_badarg(
+        "io:format/2",
+        host.call("io", "format", &[fmt, args])
+            .expect_err("`io:format/2` needs the `io` device the host does not have"),
+    );
+
+    // ---- a live process / mailbox ----------------------------------------
+    // `code_server:call/1` (a real `kernel` export) drives the code server's
+    // request/reply protocol, which needs a **live process with a mailbox**. The
+    // host installs no mailbox, so the engine's receive family answers with its
+    // exact typed seam error at the first marker operation — the real-corpus
+    // confirmation of the `context/mailbox-*` inventory rows in `tests/gaps.rs`.
+    // (The oracle blocks here and returns the reply, e.g. `code_server:call/1`
+    // with a code-server request.)
+    let which = host.intern("which");
+    let err = host
+        .call("code_server", "call", &[which])
+        .expect_err("`code_server:call/1` needs a live process mailbox");
+    println!("SKIP: code_server:call/1 — {err:?}");
+    match &err {
+        BeamError::Raise(raise) => {
+            let got = raise.reason.as_atom();
+            assert_eq!(
+                got,
+                Some("unsupported_opcode: receive_marker_reserve"),
+                "unexpected `code_server:call/1` typed error: {err:?}"
+            );
+        }
+        other => panic!("`code_server:call/1` must be the typed mailbox error, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -699,754 +855,6 @@ fn sweep_newly_loading_modules_execute() {
     let end_atom = host.intern("end");
     let got = run(&mut host, "erl_scan", "reserved_word", &[end_atom]);
     assert_atom(&host, got, "true");
-}
-
-// ---------------------------------------------------------------------------
-// 6. Capability-gap inventory — every remaining gap pinned to its EXACT error
-// ---------------------------------------------------------------------------
-//
-// Each gap below is driven through the **real** public execution path
-// (`Machine::run_label` / `Machine::resume_outcome` over a synthetic `Module` +
-// `MinimalContext`), exactly like `tests/opcodes.rs` and `tests/census.rs` do.
-// The assertion is always the **exact** typed error (`unsupported_opcode: <what>`
-// reason atom, or `BeamError::BadArg`) — never a wrong value, never the
-// `families::UNCLAIMED_PREFIX` sentinel. A regression that turns a typed error
-// into a value (or into the sentinel) fails here.
-//
-// Corpus reachability (evidence: `tests/census.rs`'s counts over the installed
-// OTP's 261 stdlib/kernel/compiler modules, 793,319 instructions, plus
-// `erl_features:configurable()` ⇒ `[compr_assign,maybe_expr]`):
-//   * CORPUS-REACHABLE  — the compiler emits the instruction today; the gap is a
-//     live limitation a real module can hit.
-//   * FORWARD-COMPAT    — the instruction is never emitted by the installed
-//     toolchain (`native_record` is not a configurable feature, `erlc
-//     -enable-feature native_record` ⇒ "the feature 'native_record' does not
-//     exist", and a `-record` module disassembles to only `update_record`), so
-//     the gap exists only for a future toolchain that emits it.
-
-/// Map every `Instr::Label` in `code` to its index (the loader's contract).
-fn gap_labels_of(code: &[Instr]) -> BTreeMap<Label, usize> {
-    let mut labels = BTreeMap::new();
-    for (index, instr) in code.iter().enumerate() {
-        if let Instr::Label(label) = instr {
-            labels.insert(*label, index);
-        }
-    }
-    labels
-}
-
-/// A builder for the synthetic modules the gap inventory drives.
-struct GapFixture {
-    module: Module,
-}
-
-impl GapFixture {
-    fn new() -> GapFixture {
-        let mut module = Module::default();
-        module.name = module.atom_table.intern("gap");
-        GapFixture { module }
-    }
-
-    fn atom(&mut self, name: &str) -> Atom {
-        self.module.atom_table.intern(name)
-    }
-
-    /// Append a function; returns its entry label (the first label in `code`).
-    fn add_function(&mut self, name: &str, arity: u32, code: Vec<Instr>) -> Label {
-        let name = self.atom(name);
-        let module = self.module.name;
-        let labels = gap_labels_of(&code);
-        let entry = labels.keys().next().copied().unwrap_or(Label(0));
-        self.module.functions.push(Function {
-            func_label: entry,
-            entry_label: entry,
-            module,
-            name,
-            arity,
-            code,
-            blocks: Vec::new(),
-            labels,
-        });
-        entry
-    }
-
-    fn finish(self) -> Module {
-        self.module
-    }
-}
-
-/// Drive one function of `module` through the real public entry with the default
-/// (`MinimalContext`) context: no BIF hook, no apply hook, **no mailbox**.
-fn run_gap(module: &Module, entry: Label, args: &[Eterm]) -> std::result::Result<Eterm, BeamError> {
-    let mut machine = Machine::new();
-    let mut ctx = MinimalContext::new();
-    machine.run_label(module, entry, args.len() as u32, args, &mut ctx)
-}
-
-/// Drive one function with a caller-supplied context (for a context that is *not*
-/// `MinimalContext`).
-fn run_gap_with(
-    module: &Module,
-    entry: Label,
-    args: &[Eterm],
-    ctx: &mut dyn ExecutionContext,
-) -> std::result::Result<Eterm, BeamError> {
-    let mut machine = Machine::new();
-    machine.run_label(module, entry, args.len() as u32, args, &mut ctx)
-}
-
-/// Pin `result` to the exact typed `unsupported_opcode: <want>` error, print the
-/// one-line `GAP:` inventory entry, and prove it is **not** the unclaimed sentinel.
-fn pin(name: &str, result: std::result::Result<Eterm, BeamError>, want: &str) {
-    let want_atom = format!("unsupported_opcode: {want}");
-    match result {
-        Err(BeamError::Raise(raise)) => {
-            let got = raise.reason.as_atom().unwrap_or("<non-atom reason>");
-            println!("GAP: {name} — {got}");
-            assert_eq!(got, want_atom, "gap `{name}` produced the wrong typed error");
-            assert!(
-                !want_atom.contains("widened opcode not yet executed"),
-                "gap `{name}` must never be the unclaimed sentinel"
-            );
-        }
-        other => panic!("GAP `{name}`: expected the typed error {want_atom:?}, got {other:?}"),
-    }
-}
-
-/// Pin `result` to the typed `badarg` (`BeamError::BadArg` — `bad_register` /
-/// `unknown_label` carry no atom) and print the inventory entry.
-fn pin_badarg(name: &str, result: std::result::Result<Eterm, BeamError>) {
-    println!("GAP: {name} — BeamError::BadArg (the BEAM `badarg` atom)");
-    match result {
-        Err(BeamError::BadArg) => {}
-        other => panic!("GAP `{name}`: expected BeamError::BadArg, got {other:?}"),
-    }
-}
-
-/// The whole inventory. Groups mirror the owning family/file; each line names the
-/// exact typed error the engine produces today.
-#[test]
-fn interpreter_capability_gaps_report_their_exact_typed_error() {
-    // --- core loop: the `NO_FAIL` guard branches (src/interpreter.rs) ---------
-    // CORPUS-REACHABLE: `test`/`select_val` are emitted for every match.
-    {
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            // `is_tuple` on a small int fails, and `fail` is `NO_FAIL` (the
-            // compiler's "cannot fail" marker) ⇒ typed error, never a fall-through.
-            Instr::Test {
-                kind: TestKind::IsTuple,
-                fail: NO_FAIL,
-                args: vec![Operand::X(0)],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "test/no_fail",
-            run_gap(&module, entry, &[make_small(0)]),
-            "test/no_fail",
-        );
-    }
-    {
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::SelectVal {
-                value: Operand::X(0),
-                fail: NO_FAIL,
-                pairs: vec![(Operand::Integer(99), Label(2))],
-            },
-            Instr::Label(Label(2)),
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "select_val/no_fail",
-            run_gap(&module, entry, &[make_small(0)]),
-            "select_val/no_fail",
-        );
-    }
-
-    // --- maps family (src/families/maps.rs) ----------------------------------
-    // CORPUS-REACHABLE: map reads/updates are emitted by every map-using module.
-    {
-        // `get_map_elements` with an absent key and `fail == NO_FAIL`. The map is
-        // built in a separate context that stays alive for the run.
-        let mut f = GapFixture::new();
-        let a = f.atom("a");
-        let b = f.atom("b");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::GetMapElements {
-                fail: NO_FAIL,
-                source: Operand::X(0),
-                pairs: vec![(Operand::Atom(a), Operand::X(1))],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-
-        let mut builder = MinimalContext::new();
-        let map = terms::make_flatmap(&mut builder, &[(beam_term::make_atom(b), make_small(1))])
-            .expect("a flat map");
-        pin(
-            "get_map_elements/no_fail",
-            run_gap(&module, entry, &[map]),
-            "get_map_elements: key absent with no fail label",
-        );
-    }
-    {
-        let mut f = GapFixture::new();
-        let a = f.atom("a");
-        let b = f.atom("b");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::HasMapFields {
-                fail: NO_FAIL,
-                source: Operand::X(0),
-                keys: vec![Operand::Atom(a)],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-
-        let mut builder = MinimalContext::new();
-        let map = terms::make_flatmap(&mut builder, &[(beam_term::make_atom(b), make_small(1))])
-            .expect("a flat map");
-        pin(
-            "has_map_fields/no_fail",
-            run_gap(&module, entry, &[map]),
-            "has_map_fields: key absent with no fail label",
-        );
-    }
-    {
-        // `put_map_assoc` / `put_map_exact` with a **non-map** source and
-        // `fail == NO_FAIL`: the C ground truth is a `{badmap, Source}` raise, and
-        // the engine can only raise it if the module can name the `badmap` atom.
-        // This module deliberately cannot, so the gap surfaces as its exact
-        // "the tag atom is absent" error rather than a fabricated atom.
-        let mut f = GapFixture::new();
-        let a = f.atom("a");
-        let assoc = vec![
-            Instr::Label(Label(1)),
-            Instr::PutMapAssoc {
-                fail: NO_FAIL,
-                source: Operand::X(0),
-                dst: Operand::X(0),
-                live: 1,
-                pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, assoc);
-        let module = f.finish();
-        pin(
-            "put_map_assoc/no_fail",
-            run_gap(&module, entry, &[make_small(7)]),
-            "maps: no 'badmap' atom in the module",
-        );
-    }
-    {
-        let mut f = GapFixture::new();
-        let a = f.atom("a");
-        let exact = vec![
-            Instr::Label(Label(1)),
-            Instr::PutMapExact {
-                fail: NO_FAIL,
-                source: Operand::X(0),
-                dst: Operand::X(0),
-                live: 1,
-                pairs: vec![(Operand::Atom(a), Operand::Integer(1))],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, exact);
-        let module = f.finish();
-        pin(
-            "put_map_exact/no_fail",
-            run_gap(&module, entry, &[make_small(7)]),
-            "maps: no 'badmap' atom in the module",
-        );
-    }
-
-    // --- records family (src/families/records/mod.rs) ------------------------
-    // FORWARD-COMPAT: the installed toolchain never emits the `native_record`
-    // family (`erl_features:configurable()` ⇒ `[compr_assign,maybe_expr]`; `erlc
-    // -enable-feature native_record` ⇒ "the feature 'native_record' does not
-    // exist"), so all 7 opcodes have ZERO corpus occurrences. Pinned anyway so a
-    // future toolchain cannot regress them silently.
-    {
-        // `is_any_native_record` with a non-record source and `NO_FAIL`.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::IsAnyNativeRecord {
-                fail: NO_FAIL,
-                src: Operand::X(0),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "is_any_native_record/no_fail",
-            run_gap(&module, entry, &[make_small(0)]),
-            "is_any_native_record/no_fail",
-        );
-    }
-    {
-        // `put_record`'s **create** form (`Src == nil`): the C resolves the record
-        // definition through the code server's record table (`erl_record.c:102-170`),
-        // a facility this runtime does not have. FORWARD-COMPAT (see above).
-        let mut f = GapFixture::new();
-        let rec = f.atom("rec");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::PutRecord {
-                fail: NO_FAIL,
-                id: Operand::Atom(rec),
-                src: Operand::Nil,
-                dst: Operand::X(0),
-                live: 0,
-                updates: vec![],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "put_record/create",
-            run_gap(&module, entry, &[]),
-            "put_record: create (record definition table unavailable)",
-        );
-    }
-    {
-        // `put_record`'s **update** form with a non-record source and `NO_FAIL`.
-        let mut f = GapFixture::new();
-        let rec = f.atom("rec");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::PutRecord {
-                fail: NO_FAIL,
-                id: Operand::Atom(rec),
-                src: Operand::X(0),
-                dst: Operand::X(0),
-                live: 1,
-                updates: vec![],
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "put_record/no_fail",
-            run_gap(&module, entry, &[make_small(0)]),
-            "put_record/no_fail",
-        );
-    }
-
-    // --- bitstrings family (src/families/bitstrings/{create,raw}.rs) ---------
-    // CORPUS-REACHABLE: `bs_create_bin` is emitted for every binary builder.
-    {
-        // An `append`/`private_append` segment that is **not** the first: the
-        // compiler only ever emits it first; C seeds the build from the source, so
-        // a non-first one is refused rather than mis-handled. The segment list is
-        // `[Type, Index, Unit, Flags, Value, Size]` per segment.
-        let mut f = GapFixture::new();
-        let integer = f.atom("integer");
-        let append = f.atom("append");
-        let segments = vec![
-            // segment 0 — a valid `integer:8` segment.
-            Operand::Atom(integer),
-            Operand::Integer(1),
-            Operand::Integer(1),
-            Operand::Nil,
-            Operand::Integer(7),
-            Operand::Integer(8),
-            // segment 6 — the misplaced `append`.
-            Operand::Atom(append),
-            Operand::Integer(0),
-            Operand::Integer(1),
-            Operand::Nil,
-            Operand::Integer(0),
-            Operand::Integer(0),
-        ];
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::BsCreateBin {
-                fail: NO_FAIL,
-                alloc: 0,
-                live: 1,
-                unit: 8,
-                dst: Operand::X(1),
-                segments,
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "bs_create_bin/append-not-first",
-            run_gap(&module, entry, &[]),
-            "bs_create_bin: append/private_append is not the first segment",
-        );
-    }
-    {
-        // A refc-binary `ErlSubBits` window that does **not** start on a byte
-        // boundary: `raw::heap_bits` refuses it (the engine only ever builds
-        // byte-aligned refc binaries), so a match-context op over it reports the
-        // unreadable subject instead of reading the wrong bytes.
-        //
-        // `bs_get_tail` takes its context operand and reads `orig` out of it; the
-        // misaligned refc term *is* an `ErlSubBits`, whose `orig` is the bare
-        // `BinRef` — which `heap_bits` refuses.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::BsGetTail {
-                ctx: Operand::X(0),
-                dst: Operand::X(1),
-                live: 1,
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-
-        // Keep the misaligned refc term (and its payload) alive for the run. Both
-        // are word-aligned (a `Vec<Eterm>`), satisfying `beam_term::refc`'s
-        // frozen-layout contract; `offset_bits = 1` is the misalignment under test.
-        let mut builder = MinimalContext::new();
-        let mut payload: Vec<Eterm> = vec![Eterm::default(); 2];
-        let base = payload.as_ptr().cast::<u8>();
-        let value = payload.as_mut_ptr();
-        let hp = builder
-            .alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)
-            .expect("the arena hands out 8 words");
-        // SAFETY: `hp` points at `ERL_REFC_BITS_SIZE` (8) exclusively-owned words in
-        // the context's pointer-stable arena, `value`/`base` point at the live,
-        // word-aligned `payload`, and `next` is null (a chain terminator). The
-        // returned term is used only while `builder`/`payload` live.
-        let refc = unsafe {
-            beam_term::refc::write_refc_binary(
-                hp,
-                value,
-                core::ptr::null_mut(),
-                base,
-                1,
-                16,
-            )
-        };
-        // The term must survive the run: pass it as the argument (the payload stays
-        // alive in `payload`/`builder` for the whole call).
-        pin(
-            "bitstring/refc-window-not-byte-aligned",
-            run_gap(&module, entry, &[refc]),
-            "bitstring: subject is not a readable binary",
-        );
-        core::hint::black_box(&payload);
-    }
-
-    // --- exceptions family (src/families/exceptions.rs) ----------------------
-    // CORPUS-REACHABLE: `badmatch`/`raise`/`try_case` are emitted for every match.
-    {
-        // A `badmatch` raise on a module whose atom table cannot name the tag: the
-        // engine refuses to substitute a *different* atom.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::Badmatch {
-                value: Operand::X(0),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "exceptions/unnameable-raise-reason-atom",
-            run_gap(&module, entry, &[make_small(0)]),
-            "exceptions: no 'badmatch' atom in the module",
-        );
-    }
-    {
-        // `raise` with no exception currently being handled (`pending_class` unset).
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::Raise {
-                trace: Operand::Nil,
-                value: Operand::X(0),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 1, code);
-        let module = f.finish();
-        pin(
-            "exceptions/raise-with-nothing-handled",
-            run_gap(&module, entry, &[make_small(0)]),
-            "exceptions: raise with no exception being handled",
-        );
-    }
-    {
-        // `try_case` reached without an exception having landed: `x(0)` is not the
-        // `THE_NON_VALUE` marker. `Try` pushes the (balanced) catch frame first.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::Try {
-                frame: Operand::X(1),
-                fail: Label(2),
-            },
-            Instr::TryCase {
-                frame: Operand::X(2),
-            },
-            Instr::Label(Label(2)),
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "try_case/x0-not-THE_NON_VALUE",
-            run_gap(&module, entry, &[]),
-            "try_case: x(0) is not THE_NON_VALUE (no exception landed)",
-        );
-    }
-    {
-        // An unbalanced catch-frame pop: `try_case` with no frame pushed.
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::TryCase {
-                frame: Operand::X(1),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "try_case/unbalanced-catch-frames",
-            run_gap(&module, entry, &[]),
-            "try_case: unbalanced catch frames",
-        );
-    }
-
-    // --- `ExecutionContext` trait defaults (src/context.rs) ------------------
-    // CORPUS-REACHABLE: a `MinimalContext` with no hook installed.
-    {
-        // `apply_fun` with no apply hook (`call_fun2`).
-        let mut f = GapFixture::new();
-        let safe = f.atom("safe");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::CallFun2 {
-                tag: Operand::Atom(safe),
-                arity: 0,
-                func: Operand::X(0),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "context/apply_fun-has-no-hook",
-            run_gap(&module, entry, &[]),
-            "apply_fun",
-        );
-    }
-    {
-        // The nine mailbox seam methods, each the trait's typed `unsupported` on a
-        // bare `MinimalContext` (no mailbox installed).
-        let cases: Vec<(&str, Instr, &str)> = vec![
-            ("send", Instr::Send, "send_message"),
-            (
-                "loop_rec",
-                Instr::LoopRec {
-                    fail: Label(2),
-                    dst: Operand::X(1),
-                },
-                "receive_next",
-            ),
-            (
-                "loop_rec_end",
-                Instr::LoopRecEnd { target: Label(2) },
-                "receive_skip",
-            ),
-            ("timeout", Instr::Timeout, "receive_reset"),
-            ("remove_message", Instr::RemoveMessage, "receive_remove"),
-            (
-                "recv_marker_reserve",
-                Instr::RecvMarkerReserve {
-                    marker: Operand::X(1),
-                },
-                "receive_marker_reserve",
-            ),
-            (
-                "recv_marker_bind",
-                Instr::RecvMarkerBind {
-                    marker: Operand::X(1),
-                    reference: Operand::X(2),
-                },
-                "receive_marker_bind",
-            ),
-            (
-                "recv_marker_use",
-                Instr::RecvMarkerUse {
-                    reference: Operand::X(1),
-                },
-                "receive_marker_use",
-            ),
-            (
-                "recv_marker_clear",
-                Instr::RecvMarkerClear {
-                    reference: Operand::X(1),
-                },
-                "receive_marker_clear",
-            ),
-        ];
-        for (label, instr, method) in cases {
-            let mut f = GapFixture::new();
-            let code = vec![Instr::Label(Label(1)), instr, Instr::Label(Label(2)), Instr::Return];
-            let entry = f.add_function("f", 0, code);
-            let module = f.finish();
-            pin(
-                &format!("context/mailbox-{label}"),
-                run_gap(&module, entry, &[]),
-                method,
-            );
-        }
-    }
-    {
-        // `receive` with no mailbox: `wait`/`wait_timeout(non-zero)` **suspend**, and
-        // the non-blocking entry folds that into the documented typed error (there
-        // is no host timer at M1, so a non-zero/`infinity` timeout suspends too).
-        let mut f = GapFixture::new();
-        let infinity = f.atom("infinity");
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::WaitTimeout {
-                target: Label(2),
-                time: Operand::Atom(infinity),
-            },
-            Instr::Label(Label(2)),
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        pin(
-            "receive/wait_timeout-infinity-suspends",
-            run_gap(&module, entry, &[]),
-            "run: process blocked (no message available)",
-        );
-    }
-    {
-        // `alloc_words` on a context that does **not** override it (the trait
-        // default): a core `move` of an out-of-range integer materializes an exact
-        // bignum, which needs raw heap words.
-        struct BareCtx;
-        impl ExecutionContext for BareCtx {
-            fn call_bif(
-                &mut self,
-                _module: &str,
-                _function: &str,
-                _arity: u32,
-                _args: &[Eterm],
-            ) -> std::result::Result<Eterm, BeamError> {
-                Err(BeamError::BadArg)
-            }
-            fn ensure_heap(
-                &mut self,
-                _heap_need: u32,
-                _live: u32,
-                _x_regs: &mut [Eterm],
-                _stack: &mut [Eterm],
-            ) -> std::result::Result<(), BeamError> {
-                Ok(())
-            }
-        }
-
-        let mut f = GapFixture::new();
-        let code = vec![
-            Instr::Label(Label(1)),
-            Instr::Move {
-                src: Operand::Integer(beam_term::MAX_SMALL + 1),
-                dst: Operand::X(0),
-            },
-            Instr::Return,
-        ];
-        let entry = f.add_function("f", 0, code);
-        let module = f.finish();
-        let mut ctx = BareCtx;
-        pin(
-            "context/alloc_words-trait-default",
-            run_gap_with(&module, entry, &[], &mut ctx),
-            "alloc_words",
-        );
-    }
-
-    // --- interpreter / operand guards (src/interpreter.rs, src/operand.rs) ----
-    // CORPUS-REACHABLE: malformed/edge bytecode paths.
-    {
-        let mut f = GapFixture::new();
-        let entry = f.add_function("f", 0, vec![Instr::Label(Label(1)), Instr::Return]);
-        let module = f.finish();
-        let mut machine = Machine::new();
-        let mut ctx = MinimalContext::new();
-        // A `pc` past the function's last instruction is the loop's own typed error.
-        pin(
-            "run/pc-out-of-range",
-            machine
-                .resume_outcome(&module, 0, 99_999, &mut ctx)
-                .map(|_| make_small(0)),
-            "run: pc out of range",
-        );
-        let mut machine = Machine::new();
-        let mut ctx = MinimalContext::new();
-        pin(
-            "run/function-index-out-of-range",
-            machine
-                .resume_outcome(&module, 99, 0, &mut ctx)
-                .map(|_| make_small(0)),
-            "run: function index out of range",
-        );
-    }
-    {
-        // An out-of-range register (`bad_register`) and an absent jump target
-        // (`unknown_label`) are both the typed BEAM `badarg`.
-        let mut f = GapFixture::new();
-        let entry = f.add_function(
-            "f",
-            0,
-            vec![
-                Instr::Label(Label(1)),
-                Instr::Move {
-                    src: Operand::X(2000),
-                    dst: Operand::X(0),
-                },
-                Instr::Return,
-            ],
-        );
-        let module = f.finish();
-        pin_badarg("operand/bad_register", run_gap(&module, entry, &[]));
-
-        let mut f = GapFixture::new();
-        let entry = f.add_function(
-            "f",
-            0,
-            vec![
-                Instr::Label(Label(1)),
-                Instr::Jump { target: Label(99) },
-                Instr::Return,
-            ],
-        );
-        let module = f.finish();
-        pin_badarg("jump/unknown_label", run_gap(&module, entry, &[]));
-    }
 }
 
 // ---------------------------------------------------------------------------
