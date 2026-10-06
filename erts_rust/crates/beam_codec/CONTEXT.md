@@ -443,11 +443,17 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
   order is kept exactly.
-- Funs (`112`/`113`), records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain
-  unsupported: funs/exports are blocked on a fun/export registry that does not exist yet (owned by
-  `beam_loader`/`beam_rt`), records are a legacy native term (ordinary Erlang records encode as
-  tuples), `LOCAL_EXT` needs local-node identity, and the distribution header is `beam_dist`'s. The
-  obsolete `FUN` (`117`) and `NEW_CACHE` (`78`) tags are rejected as `BadArg`.
+- Records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain unsupported: records
+  are a legacy native term (ordinary Erlang records encode as tuples), `LOCAL_EXT` needs local-node
+  identity, and the distribution header is `beam_dist`'s. The obsolete `FUN` (`117`) and `NEW_CACHE`
+  (`78`) tags are rejected as `BadArg`.
+- **Funs are supported except for encoding a `FunKind::Local` term.** `NEW_FUN_EXT`/`EXPORT_EXT`
+  decode and encode byte-exactly; a local (`make_fun3`) fun has no faithful wire image (no module /
+  16-byte `uniq` / creator pid in its inlined descriptor) so `encode` returns
+  `error::unsupported_local_fun()` — never a mis-encoded term. The `NEW_FUN_EXT` creator pid is read
+  directly off the wire by `decode_creator_pid`, which accepts only `PID_EXT`/`NEW_PID_EXT` (so a
+  `LOCAL_EXT` creator pid — which the codec does not model — is `BadArg`): a slight narrowing vs C,
+  which accepts any `is_pid` term.
 - **`COMPRESSED` decompression is capped at `MAX_UNCOMPRESSED` (32 MiB)** (`compress.rs`), mirroring
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
