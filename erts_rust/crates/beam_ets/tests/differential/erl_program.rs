@@ -124,6 +124,12 @@ battery() ->
     emit("match_family", match_family()),
     emit("malformed_specs", malformed_specs()),
 
+    emit("info_name_named_table", info_name_named_table()),
+    emit("info_option_fields", info_option_fields()),
+    emit("info_unknown_key", info_unknown_key()),
+    emit("lookup_element_multi", lookup_element_multi()),
+    emit("insert_list_atomic", insert_list_atomic()),
+
     emit("set_large", set_large()),
     emit("ordered_large", ordered_large()),
     ok.
@@ -428,6 +434,82 @@ malformed_specs() ->
              [{'_', [{is_integer, '$1'}], ['$_']}],
              [{'_', [], ['$_']}]],
     l([cap(fun() -> ets:select(T, C) end) || C <- Cases]).
+
+%% --------------------- info / new-option surface ---------------------
+
+%% The registered `name` and the `named_table` flag are independent: a name is
+%% recorded whether or not `named_table` was requested, and only the option sets
+%% the flag. A `named_table` registers its name globally in the oracle VM, so the
+%% named table below uses a unique atom and is created exactly once.
+info_name_named_table() ->
+    Anon = ets:new(anon_case_name, []),
+    N1 = ets:info(Anon, name),
+    B1 = ets:info(Anon, named_table),
+    Named = ets:new(named_case_name, [named_table]),
+    N2 = ets:info(Named, name),
+    B2 = ets:info(Named, named_table),
+    t([r(N1), r(B1), r(N2), r(B2)]).
+
+%% The renderable `ets:info/2` fields for four option combinations. `id`,
+%% `memory`, `owner` and `node` are implementation-specific and never rendered.
+info_option_fields() ->
+    T1 = ets:new(diff, []),
+    T2 = ets:new(diff, [{keypos, 2}]),
+    T3 = ets:new(diff, [ordered_set, public, compressed,
+                        {write_concurrency, true}, {read_concurrency, true}]),
+    T4 = ets:new(diff, [private, {write_concurrency, true},
+                        {read_concurrency, true}]),
+    t([info_opts(T1), info_opts(T2), info_opts(T3), info_opts(T4)]).
+
+info_opts(T) ->
+    t([r(ets:info(T, name)), r(ets:info(T, named_table)), r(ets:info(T, type)),
+       r(ets:info(T, keypos)), r(ets:info(T, protection)),
+       r(ets:info(T, compressed)), r(ets:info(T, write_concurrency)),
+       r(ets:info(T, read_concurrency))]).
+
+%% `ets:info/2` rejects a key it does not report.
+info_unknown_key() ->
+    T = new(set),
+    cap(fun() -> ets:info(T, no_such_key) end).
+
+%% `ets:lookup_element/3` on a multi-object kind answers with the *list* of the
+%% `Pos`-th element of every object under `Key` (a `set` stays scalar); an absent
+%% key is `badarg` (`/3`) or the default (`/4`), `Pos == 0` is `badarg`, and one
+%% object too short for `Pos` makes the whole call `badarg`.
+lookup_element_multi() ->
+    Bag = new(bag),
+    ets:insert(Bag, {1, 10}), ets:insert(Bag, {1, 20}),
+    BagE = ets:lookup_element(Bag, 1, 2),
+    One = new(bag),
+    ets:insert(One, {2, 7}),
+    OneE = ets:lookup_element(One, 2, 1),
+    Dup = new(duplicate_bag),
+    ets:insert(Dup, {1, 10}), ets:insert(Dup, {1, 10}), ets:insert(Dup, {1, 20}),
+    DupE = ets:lookup_element(Dup, 1, 2),
+    Set = new(set),
+    ets:insert(Set, {1, 10}),
+    SetE = ets:lookup_element(Set, 1, 2),
+    Absent3 = cap(fun() -> ets:lookup_element(Bag, 99, 2) end),
+    Absent4 = ets:lookup_element(Bag, 99, 2, default),
+    Pos0 = cap(fun() -> ets:lookup_element(Bag, 1, 0) end),
+    Short = new(bag),
+    ets:insert(Short, {3, 5, 6}), ets:insert(Short, {3, 7}),
+    ShortErr = cap(fun() -> ets:lookup_element(Short, 3, 3) end),
+    t([r(BagE), r(OneE), r(DupE), r(SetE), Absent3, r(Absent4), Pos0, ShortErr]).
+
+%% `ets:insert/2` over a list is atomic: one invalid element makes the whole
+%% call `badarg` and inserts none of the elements, not even the valid ones that
+%% precede it.
+insert_list_atomic() ->
+    T = new(set),
+    ets:insert(T, {1, 10}),
+    R1 = cap(fun() -> ets:insert(T, [{2, 20}, foo]) end),
+    L1 = srt(ets:tab2list(T)),
+    T2 = new(set, 2),
+    ets:insert(T2, {a, 1}),
+    R2 = cap(fun() -> ets:insert(T2, [{b, 2}, {c}]) end),
+    L2 = srt(ets:tab2list(T2)),
+    t([R1, L1, R2, L2]).
 
 %% --------------------- update_counter with bignums ---------------------
 

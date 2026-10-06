@@ -56,9 +56,12 @@
 //! with variables/wildcards/literals/guards (comparison, type test,
 //! `andalso`/`orelse`) and bodies (`'$_'`, `'$N'`, constants, `{{…}}`
 //! construction); `select_delete/2`+`select_count/2`; the `match` family;
-//! malformed specs (`badarg`); and two 10 001-key tables (`set` + `ordered_set`)
-//! exercising size, lookups, the ordered `next` chain and a guarded
-//! `select_count`.
+//! malformed specs (`badarg`); the `info` group (the registered `name` vs the
+//! `named_table` flag, the renderable `ets:info/2` option fields for four option
+//! combinations, an unknown `ets:info/2` key, `lookup_element/3,4` on the
+//! multi-object kinds, and `ets:insert/2`-over-a-list atomicity); and two
+//! 10 001-key tables (`set` + `ordered_set`) exercising size, lookups, the
+//! ordered `next` chain and a guarded `select_count`.
 //!
 //! # Behaviours real ETS forced (recorded here and in the case comments)
 //!
@@ -80,6 +83,23 @@
 //!   `Table::match_delete` returns the count, so the differential renders a
 //!   successful call as `true` and verifies the deletion through `size` and
 //!   `tab2list` inside the same case.
+//! * **`name` and `named_table` are independent.** `ets:new(my_name, [])` records
+//!   `name => my_name` but reports `named_table => false`; only the `named_table`
+//!   option sets the flag (and makes the name resolve to the table). Our
+//!   `TableOptions::set_name` records the name only, so the two must agree without
+//!   the flag being implied.
+//! * **`ets:info/2` rejects an unknown key** with `badarg` (it does not return
+//!   `undefined`).
+//! * **`ets:insert/2` over a list is atomic**: one invalid element makes the whole
+//!   call `badarg` and inserts none of the elements, not even the valid ones that
+//!   precede it — the oracle program pins this through `tab2list` after the
+//!   failure.
+//! * **`ets:lookup_element/3` answers a *list* on a multi-object kind**
+//!   (`bag`/`duplicate_bag`): the `Pos`-th element of every object under the key,
+//!   in stored order (a single object yields a one-element list, `duplicate_bag`
+//!   duplicates are preserved). Only `set`/`ordered_set` are scalar. An absent key
+//!   is `badarg` (`/3`) or the default (`/4`), `Pos == 0` is `badarg`, and one
+//!   object too short for `Pos` makes the whole call `badarg`.
 
 use std::collections::BTreeMap;
 use std::env;
@@ -250,6 +270,23 @@ const EXPECTED: &[(&str, &str)] = &[
     (
         "malformed_specs",
         "[badarg,badarg,badarg,badarg,badarg,badarg,badarg,ok:[{1,10}]]",
+    ),
+    (
+        "info_name_named_table",
+        "{anon_case_name,false,named_case_name,true}",
+    ),
+    (
+        "info_option_fields",
+        "{{diff,false,set,1,protected,false,false,false},{diff,false,set,2,protected,false,false,false},{diff,false,ordered_set,1,public,true,true,true},{diff,false,set,1,private,false,false,false}}",
+    ),
+    ("info_unknown_key", "badarg"),
+    (
+        "lookup_element_multi",
+        "{[10,20],[2],[10,10,20],10,badarg,default,badarg,badarg}",
+    ),
+    (
+        "insert_list_atomic",
+        "{badarg,[{1,10}],badarg,[{a,1}]}",
     ),
     (
         "set_large",
