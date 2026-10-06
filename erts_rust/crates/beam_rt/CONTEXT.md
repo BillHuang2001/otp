@@ -367,6 +367,13 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
+* **Nested-BIF re-entrancy gaps (a `fun` applied inside a BIF).** When a `fun`-taking `lists:*`/`maps:*`
+  BIF calls back through `FunBridge`, the nested `RuntimeContext` takes a **fresh pooled heap** and
+  passes **no** `TableRegistry` — a re-entrant borrow is impossible and a panic is forbidden, so the
+  guard is `try_borrow_mut().ok()` and the tables are simply omitted: `ets:*` inside such a `fun` raises
+  `unsupported_bif` (never a wrong result). The nested context also carries **no** output sink (the
+  outer call holds it), so nested `io:format` writes to stdout rather than the caller's sink. Both are
+  honest M1 gaps, not silent misbehavior.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
