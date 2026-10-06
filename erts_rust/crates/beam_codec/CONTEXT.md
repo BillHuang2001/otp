@@ -305,6 +305,12 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 < 256, `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
 (`external.c:6146`).
 - `VERSION_MAGIC` is **not** part of a distribution payload that follows a distribution header.
+- The `LOCAL_EXT` (`121`) 4-byte field is a **node hash the caller supplies**, not computed or
+  verified here: `Encoder::finish_local(hash)`/`encode_term_local(term, atoms, hash)` take it as an
+  argument and `decode` consumes it without checking (matching the C `dec_term`, `external.c:5250`).
+  The hash (`local_node_hash`) and any verification belong to the node-identity owner
+  (`beam_rt`/`beam_dist`); the C verifies it only in the sizing pass (`decoded_size`,
+  `external.c:6437-6512`). No node-identity type is in this crate's scope.
 
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only** — no crate-local error enum.
