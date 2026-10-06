@@ -177,7 +177,7 @@ impl Table {
   `update_counter(key, pos, incr, atoms) -> Result<Eterm>` (set/ordered_set semantics; in-place),
   `update_element(key, updates, atoms) -> Result<bool>`, `memory(atoms) -> usize`.
   It implements `keys()` (bucket-scan order) but **not** `first_key`/`last_key`/`next_key`/`prev_key`,
-  so the trait defaults supply them (see Known Issues, navigation order).
+  so the trait defaults supply them (see Design Decisions, hash-kind navigation order).
 
 ### `ordered_interior/` — the K-ary B+-tree interior (`ordered_set`)
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
