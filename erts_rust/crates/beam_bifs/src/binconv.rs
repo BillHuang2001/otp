@@ -68,28 +68,20 @@
 //!   Following the same rule as `io:format`'s `~d` (see [`crate::io`]), the
 //!   oracle wins over the illustrative list: only `/1` and `/2` are registered.
 //! * **The `compressed` option is unsupported** (`term_to_binary/2` with
-//!   `compressed` or `{compressed, Level}` raises `error:unsupported_bif`): the
-//!   Stage-0 `beam_codec` has no zlib. The *option* is validated like the oracle
-//!   (its value must be a small integer) and then reported.
+//!   `compressed` or `{compressed, Level}` raises `error:unsupported_bif`). The
+//!   *option* is validated like the oracle (its value must be a small integer) and
+//!   then reported.
 //! * **`{minor_version, 0|1}` is accepted but has no effect.** The codec has no
 //!   legacy-tag switch, so `term_to_binary(T, [{minor_version, 1}])` emits the
 //!   minor-version-2 tag set (`SMALL_ATOM_UTF8_EXT` where the oracle emits
 //!   `ATOM_EXT`). The image still decodes to the identical term — it is a
 //!   byte-level, not a semantic, deviation.
-//! * **`beam_codec` cannot encode or decode a binary** (`BINARY_EXT`/
-//!   `BIT_BINARY_EXT`): `term_to_binary(Term)` for a `Term` that *contains* a
-//!   binary, and `binary_to_term(Bin)` for an image that contains one, report the
-//!   codec's explicit `unsupported_external_term` error (detectable with
-//!   `beam_codec::error::is_unsupported`). This is the one place where a BIF in
-//!   this module rejects an input the oracle accepts. Every other BIF here is
-//!   total for the Milestone-1 term set, which is exactly why
-//!   `list_to_binary/binary_to_list/binary_part/...` build their results on the
-//!   heap (see [`crate::bits`]) rather than through the codec.
 //! * **`beam_codec` encodes only *external* pids/ports/refs.** An internal pid
-//!   (`self()`) is not representable, so `term_to_binary(self())` reports the same
-//!   `unsupported` error instead of the oracle's `NEW_PID_EXT`. A decoded
-//!   `NEW_PID_EXT` stays an external id, so `binary_to_term` ∘ `term_to_binary`
-//!   round-trips the wire term, not an internal pid.
+//!   (`self()`) is not representable, so `term_to_binary(self())` reports the
+//!   codec's `unsupported_external_term` error instead of the oracle's
+//!   `NEW_PID_EXT`. A decoded `NEW_PID_EXT` stays an external id, so
+//!   `binary_to_term` ∘ `term_to_binary` round-trips the wire term, not an
+//!   internal pid.
 //! * **No bignums.** `integer_to_binary/1,2` and `binary_to_integer/1,2` cover the
 //!   60-bit small range; an out-of-range value reports
 //!   [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) where the
@@ -589,9 +581,8 @@ fn term_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `term_to_binary(Term, Options)`.
 ///
 /// The option list is validated exactly like the oracle; the `compressed` family
-/// is then reported as unsupported (the codec has no zlib) and an accepted
-/// `{minor_version, 0|1}` has no effect on the emitted tags — both documented in
-/// the module docs.
+/// is then reported as unsupported and an accepted `{minor_version, 0|1}` has no
+/// effect on the emitted tags — both documented in the module docs.
 fn term_to_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     check_term_to_binary_options(ctx.atoms(), args[1])?;
     term_to_binary_1(ctx, &args[..1])
@@ -670,7 +661,7 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
 /// malformed/truncated image, an unknown option, or `safe` with an image that
 /// would create an atom; the codec's `unsupported_external_term` raise for a tag
-/// Milestone-1 cannot build (in particular a binary).
+/// it cannot build (funs, exports, records, `LOCAL`).
 fn decode_term_bif(
     ctx: &mut BifContext<'_>,
     input: Eterm,
@@ -788,7 +779,7 @@ mod tests {
         10, 0, 0, 0, 0, 0, 0, 0, 0,
     ];
 
-    /// `<<"hi">>` — `BINARY_EXT`, the tag the codec cannot build (M1 gap).
+    /// `<<"hi">>` — its `BINARY_EXT` image, i.e. `term_to_binary(<<"hi">>)`.
     const BINARY_HI: &[u8] = &[131, 109, 0, 0, 0, 2, 104, 105];
 
     fn table() -> AtomTable {
@@ -1741,22 +1732,57 @@ mod tests {
     }
 
     #[test]
-    fn binary_terms_are_the_documented_codec_gap() {
+    fn term_to_binary_and_binary_to_term_round_trip_terms() {
         with_ctx(|ctx| {
-            // Decoding a `BINARY_EXT` image is the codec's explicit "unsupported".
-            let err = binary_to_term_1(ctx, &[bin(BINARY_HI)]).unwrap_err();
-            assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+            // `binary_to_term(term_to_binary(T))` re-encodes to the very same image
+            // for every term class the codec's M1 set covers.
+            let one = ctx.int(1).expect("fits");
+            let two = ctx.int(2).expect("fits");
+            // `2^64 + 1`: a bignum, beyond the 60-bit small range.
+            let big = beam_codec::term::make_big(ctx.heap(), false, &[1, 1]).expect("fits");
+            assert!(access::is_big(big), "expected a bignum");
+            let atom = ctx.atom("hello").expect("seeded");
+            let tuple = ctx.tuple(&[ctx.atom("a").expect("seeded"), one]).expect("fits");
+            let list = ctx.list(&[one, two, ctx.int(3).expect("fits")]).expect("fits");
+            let binary = bin(b"hi");
+            let float = ctx.make_float(1.5).expect("fits");
+            let map = access::make_flatmap(ctx.heap(), &[(one, two)]).expect("fits");
 
-            // Encoding a term that *contains* a binary reports the same, never a
-            // wrong image.
-            let nested = ctx.tuple(&[bin(b"hi")]).expect("fits");
-            let err = term_to_binary_1(ctx, &[nested]).unwrap_err();
-            assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+            for term in [one, big, atom, tuple, list, binary, float, map] {
+                let image = text(term_to_binary_1(ctx, &[term]).unwrap());
+                let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+                assert_eq!(
+                    text(term_to_binary_1(ctx, &[back]).unwrap()),
+                    image,
+                    "round trip of {term:?}"
+                );
+            }
 
-            // An internal pid is not encodable either (the codec has only the
-            // external id forms).
+            // The `<<"hi">>` `BINARY_EXT` fixture decodes to that binary, whose
+            // re-encoding is the fixture again.
+            let decoded = binary_to_term_1(ctx, &[bin(BINARY_HI)]).unwrap();
+            assert!(access::is_binary(decoded));
+            assert_eq!(text(decoded), b"hi".to_vec());
+            assert_eq!(
+                text(term_to_binary_1(ctx, &[decoded]).unwrap()),
+                BINARY_HI.to_vec()
+            );
+        });
+    }
+
+    #[test]
+    fn internal_pids_are_not_encodable() {
+        with_ctx(|ctx| {
+            // `self()` is an *internal* pid; the codec carries only the external
+            // wire forms, so encoding one reports `unsupported` rather than the
+            // oracle's `NEW_PID_EXT` (an open limitation, not a codec gap).
             let self_pid = ctx.self_pid().to_eterm();
             let err = term_to_binary_1(ctx, &[self_pid]).unwrap_err();
+            assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+
+            // A term that merely *contains* an internal pid fails the same way.
+            let nested = ctx.tuple(&[self_pid]).expect("fits");
+            let err = term_to_binary_1(ctx, &[nested]).unwrap_err();
             assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
         });
     }
