@@ -382,6 +382,9 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
 - `tests/generations.rs` → `Collector` minor/major/tenure/escalation integration
 - `tests/gen_immix_collector.rs` → one corpus through `AnyCollector::Copying` and `AnyCollector::Immix` (parity of collection kinds, roots relocated, live graph intact); `from_config(default)` → Copying
+- `tests/immix_parity.rs` → the full corpus (nested tuples/lists/boxed leaves + garbage, flat & >32-key HAMT maps, local/external/imported funs, the refc-binary pair) through both strategies; one canonical structural walker must agree and every root must resolve in its own space
+- `tests/immix_partial_block.rs` → targeted per-object reclamation: interleaved live/dead objects; live survive + roots relocated; a `kept`-pinned object keeps its address and a reference to it is left verbatim (not a spurious exhaustion); freed lines reusable
+- `tests/immix_measure.rs` → the measured gate (copying copy cost vs Immix evacuated/pinned split), asserted + printed (table in Design Decisions §Measured)
 - `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
 - `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
 - `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)
