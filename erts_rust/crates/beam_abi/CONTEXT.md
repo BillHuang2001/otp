@@ -95,8 +95,8 @@ against (so this crate keeps its "declaration layer" role and pulls in no ETF/sc
   `unsafe from_opaque(*mut ErlNifEnv) -> Option<&mut NifEnv>`, and the pending-exception slot
   (`pending_exception`/`set_exception`/`clear`, the C `enif_raise_exception`/`enif_clear_env`
   semantics). Re-exported at the crate root as `beam_abi::{NifEnv, NifHost}`.
-- `nif::enif` / `nif::loader` are **empty placeholders** (doc comments only) for the `enif_*` host
-  functions and the dynamic NIF loader / `ErlNifEntry` load contract — later steps.
+- `nif::enif` implements the `enif_*` host functions over this seam; `nif::loader` implements the
+  dynamic NIF loader / `ErlNifEntry` load contract. See **"NIF host layer (implemented)"** below.
 
 ## Frozen layout table (LP64, asserted at compile time in `layout.rs`)
 | type | size | align | asserted field offsets |
