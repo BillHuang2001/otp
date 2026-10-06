@@ -13,11 +13,10 @@
 //! `take` / counter / element-update operations (`ets:take/2`,
 //! `ets:update_counter/3,4`, `ets:update_element/3`) for the hash kinds. Those
 //! mirror the real ETS semantics, checked against the system `erl`
-//! (OTP 29 / erts-17.1); they share the counter arithmetic (`add_counters`) and
-//! the tuple-rebuild helpers with the `Interior` trait defaults in
-//! [`crate::table`], and the residual gap (bignum counters) is called out on
-//! each method. The `pos == keypos` rule is enforced by [`crate::Table`], which
-//! owns `keypos`.
+//! (OTP 29 / erts-17.1); they share the counter arithmetic (`add_counters`,
+//! arbitrary precision) and the tuple-rebuild helpers with the `Interior` trait
+//! defaults in [`crate::table`]. The `pos == keypos` rule is enforced by
+//! [`crate::Table`], which owns `keypos`.
 
 use core::mem::size_of;
 
@@ -125,9 +124,10 @@ impl HashInterior {
         }
     }
 
-    /// Add small-integer `incr` (which may be negative) to element `pos` (1-based)
-    /// of the object stored under `key`, writing the result back, and return the
-    /// new counter value. Mirrors `ets:update_counter/3,4` for `set`.
+    /// Add integer `incr` (which may be negative, and may be a bignum) to element
+    /// `pos` (1-based) of the object stored under `key`, writing the result back,
+    /// and return the new counter value. Mirrors `ets:update_counter/3,4` for
+    /// `set`.
     ///
     /// Failure modes, matching `ets:update_counter/3` verified against `erl`:
     /// * `bag`/`duplicate_bag` → `badarg` (only `set`/`ordered_set` have counters);
@@ -138,21 +138,30 @@ impl HashInterior {
     /// * `pos` outside `1..=arity` (including `0`) → `badarg`;
     /// * a non-integer element at `pos`, or a non-integer `incr` → `badarg`.
     ///
+    /// The arithmetic is exact and arbitrary precision (shared with the `Interior`
+    /// default): a sum that leaves the 60-bit small range is **promoted to a
+    /// bignum**, exactly as real ETS does (`erl_db_util.c:3203` `db_add_counter`).
+    ///
     /// Gaps (documented, never a silently-wrong value):
     /// * `pos == keypos` is `badarg`, but the interior carries no `keypos`, so the
     ///   caller ([`crate::Table`], which owns `keypos`) rejects it — this method
     ///   is the `Interior` override and is only reached through that caller;
-    /// * a bignum counter/increment, or a sum that does not fit a 60-bit small
-    ///   integer (a real-ETS *success*, since it promotes to a bignum), reports
-    ///   [`BeamError::SystemLimit`] — this crate has no bignum arithmetic;
     /// * the `{Pos, Incr, Threshold, SetValue}` threshold form has no parameter
     ///   here and is not applied (the caller applies it).
+    ///
+    /// A small result is written **destructively** into the stored object's element
+    /// slot (an immediate needs no allocation). A **bignum** result does not fit
+    /// one element word, so the object is rebuilt on `heap` with
+    /// [`replace_elements`] and the rebuilt root replaces the stored one; the
+    /// caller ([`crate::Table::update_counter`]) then copies it into table-owned
+    /// storage (the A.1 copy boundary) via its `relocate_rebuilt_object` step.
     pub fn update_counter(
         &mut self,
         key: Eterm,
         pos: usize,
         incr: Eterm,
         atoms: &AtomTable,
+        heap: &mut beam_alloc::Heap,
     ) -> Result<Eterm> {
         if self.kind != TableKind::Set {
             return Err(badarg());
@@ -160,22 +169,34 @@ impl HashInterior {
         // The key must exist first: real ETS raises `badarg` here before it even
         // inspects the update operand.
         let bi = self.bucket_index(key, atoms);
-        let object = match Self::entry_pos(&self.buckets[bi], key, atoms) {
-            Some(pos) => *self.buckets[bi][pos].objs.first().ok_or_else(badarg)?,
+        let entry = match Self::entry_pos(&self.buckets[bi], key, atoms) {
+            Some(entry) => entry,
             None => return Err(badarg()),
         };
+        let object = *self.buckets[bi][entry].objs.first().ok_or_else(badarg)?;
         // Validate the position against the object's arity and locate the element.
         let slot = counter_slot(object, pos)?;
         // SAFETY: `slot` is element `pos` of a live tuple owned by the table (an
         // entry always stores a deep copy), so the word is an initialised term.
         let oldcnt = unsafe { *slot };
-        let newcnt = add_counters(oldcnt, incr)?;
-        // Destructive in-place update, exactly as `ets:update_counter` mutates the
-        // stored object (the table owns this copy). The new value is a small
-        // integer — an immediate — so it needs no allocation and cannot dangle.
-        // SAFETY: as above — `slot` is a writable element word of a table-owned
-        // tuple, and `newcnt` is an immediate that owns no external storage.
-        unsafe { *slot = newcnt };
+        let newcnt = add_counters(oldcnt, incr, heap)?;
+        if is_small(newcnt) {
+            // Destructive in-place update, exactly as `ets:update_counter` mutates
+            // the stored object (the table owns this copy). The new value is a small
+            // integer — an immediate — so it needs no allocation and cannot dangle.
+            // SAFETY: as above — `slot` is a writable element word of a table-owned
+            // tuple, and `newcnt` is an immediate that owns no external storage.
+            unsafe { *slot = newcnt };
+        } else {
+            // A bignum does not fit one element word: rebuild the tuple on the
+            // caller's `heap` and store the new root. `counter_slot` established
+            // that `object` is a live tuple and `1 <= pos <= arity`.
+            // SAFETY: `object` is a live tuple (checked by `counter_slot`), so its
+            // header word holds a valid arity.
+            let arity = unsafe { tuple_size(object) };
+            let rebuilt = replace_elements(object, arity, &[(pos, newcnt)], heap)?;
+            self.buckets[bi][entry].objs[0] = rebuilt;
+        }
         Ok(newcnt)
     }
 
@@ -413,11 +434,12 @@ impl Interior for HashInterior {
         pos: usize,
         incr: Eterm,
         atoms: &AtomTable,
-        _heap: &mut beam_alloc::Heap,
+        heap: &mut beam_alloc::Heap,
     ) -> Result<Eterm> {
-        // The hash index owns the stored object, so the element is written
-        // destructively — no rebuild and hence no `heap` use.
-        HashInterior::update_counter(self, key, pos, incr, atoms)
+        // The hash index owns the stored object, so a small element is written
+        // destructively; a bignum result rebuilds the tuple on `heap` (see the
+        // inherent method).
+        HashInterior::update_counter(self, key, pos, incr, atoms, heap)
     }
 
     fn update_element(
@@ -648,10 +670,42 @@ mod tests {
         assert!(!dup.member(make_small(7), &atoms));
     }
 
+    /// A bignum term of `digits` (least significant first) built on the caller's
+    /// `beam_alloc::Heap` — the heap an `update_counter` bignum result lands on.
+    fn big(heap: &mut beam_alloc::Heap, negative: bool, digits: &[u64]) -> Eterm {
+        // SAFETY: `alloc_words` hands out exactly `big_size_words(n)` writable
+        // words, which `write_big` fills completely.
+        let hp = unsafe { heap.alloc_words(big_size_words(digits.len())).unwrap() };
+        // SAFETY: `hp` addresses `big_size_words(n)` words and `digits` is non-empty.
+        unsafe { write_big(hp, negative, digits) }
+    }
+
+    /// The `(negative, magnitude)` view of an integer term, in the same
+    /// little-endian limb representation (leading zero limbs stripped) the
+    /// production arithmetic uses — so a test can assert the exact value
+    /// independent of its small/bignum encoding.
+    fn magnitude_of(term: Eterm) -> (bool, Vec<u64>) {
+        let (negative, mut digits) = if is_small(term) {
+            let value = signed_value(term);
+            (value < 0, vec![value.unsigned_abs()])
+        } else {
+            assert!(unsafe { is_big(term) }, "the test only asks for integers");
+            // SAFETY: `term` is a live bignum, so `big_parts` reads its header and
+            // digit words.
+            let (negative, digits) = unsafe { big_parts(term) };
+            (negative, digits.to_vec())
+        };
+        while matches!(digits.last(), Some(0)) {
+            digits.pop();
+        }
+        (negative, digits)
+    }
+
     #[test]
     fn update_counter_increments_decrements_and_writes_back() {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(64);
+        let mut out = beam_alloc::Heap::new(64).expect("a test heap is allocatable");
         let k = make_small(1);
         // {1, 10, 20}
         let object = heap.tuple(&[k, make_small(10), make_small(20)]).unwrap();
@@ -660,18 +714,21 @@ mod tests {
 
         // Increment the element at pos 2, and check it was stored back.
         assert_eq!(
-            t.update_counter(k, 2, make_small(5), &atoms).unwrap(),
+            t.update_counter(k, 2, make_small(5), &atoms, &mut out)
+                .unwrap(),
             make_small(15)
         );
         assert_eq!(elem(t.lookup(k, &atoms)[0], 1), make_small(15));
 
         // A negative increment at a different position.
         assert_eq!(
-            t.update_counter(k, 3, make_small(-25), &atoms).unwrap(),
+            t.update_counter(k, 3, make_small(-25), &atoms, &mut out)
+                .unwrap(),
             make_small(-5)
         );
         assert_eq!(
-            t.update_counter(k, 3, make_small(7), &atoms).unwrap(),
+            t.update_counter(k, 3, make_small(7), &atoms, &mut out)
+                .unwrap(),
             make_small(2)
         );
         // Counter updates never change the object count (set: one object per key).
@@ -683,12 +740,13 @@ mod tests {
     fn update_counter_absent_key_and_wrong_kind_are_badarg() {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(64);
+        let mut out = beam_alloc::Heap::new(64).expect("a test heap is allocatable");
         let k = make_small(1);
 
         // Absent key: real ETS raises `badarg` ("no object ... and no default").
         let mut set = HashInterior::new(TableKind::Set);
         assert!(matches!(
-            set.update_counter(k, 2, make_small(1), &atoms),
+            set.update_counter(k, 2, make_small(1), &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         assert_eq!(set.size(), 0, "a failed update must not create an object");
@@ -698,7 +756,7 @@ mod tests {
             let mut t = HashInterior::new(kind);
             t.insert(k, object(&mut heap, 1, 10), &atoms).unwrap();
             assert!(matches!(
-                t.update_counter(k, 2, make_small(1), &atoms),
+                t.update_counter(k, 2, make_small(1), &atoms, &mut out),
                 Err(BeamError::BadArg)
             ));
         }
@@ -708,6 +766,7 @@ mod tests {
     fn update_counter_position_and_type_errors_are_badarg() {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(64);
+        let mut out = beam_alloc::Heap::new(64).expect("a test heap is allocatable");
         let k = make_small(1);
         // {1, 10, 20}
         let object = heap.tuple(&[k, make_small(10), make_small(20)]).unwrap();
@@ -717,16 +776,16 @@ mod tests {
         let an_atom = make_atom(Atom::from_raw(0));
         // pos below 1 and above the arity are both `badarg`.
         assert!(matches!(
-            t.update_counter(k, 0, make_small(1), &atoms),
+            t.update_counter(k, 0, make_small(1), &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         assert!(matches!(
-            t.update_counter(k, 4, make_small(1), &atoms),
+            t.update_counter(k, 4, make_small(1), &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         // A non-integer increment is `badarg`.
         assert!(matches!(
-            t.update_counter(k, 2, an_atom, &atoms),
+            t.update_counter(k, 2, an_atom, &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         // Nothing changed after the failures.
@@ -737,46 +796,85 @@ mod tests {
         let bad = heap.tuple(&[k2, an_atom]).unwrap();
         t.insert(k2, bad, &atoms).unwrap();
         assert!(matches!(
-            t.update_counter(k2, 2, make_small(1), &atoms),
+            t.update_counter(k2, 2, make_small(1), &atoms, &mut out),
             Err(BeamError::BadArg)
         ));
         assert_eq!(t.lookup(k2, &atoms), vec![bad]);
     }
 
     #[test]
-    fn update_counter_overflow_reports_the_representation_gap() {
+    fn update_counter_promotes_out_of_range_sums_to_bignums() {
         let atoms = AtomTable::new();
         let mut heap = Heap::new(64);
+        let mut out = beam_alloc::Heap::new(256).expect("a test heap is allocatable");
         let mut t = HashInterior::new(TableKind::Set);
 
-        // `MAX_SMALL + 1` is a bignum in real ETS; here it is an honest error, and
-        // the stored value is left untouched (no partially-applied update).
+        // `MAX_SMALL + 1` leaves the 60-bit range: real ETS promotes to a bignum.
         let hi = make_small(1);
         let object = heap.tuple(&[hi, make_small(MAX_SMALL)]).unwrap();
         t.insert(hi, object, &atoms).unwrap();
-        assert!(matches!(
-            t.update_counter(hi, 2, make_small(1), &atoms),
-            Err(BeamError::SystemLimit)
-        ));
-        assert_eq!(elem(t.lookup(hi, &atoms)[0], 1), make_small(MAX_SMALL));
+        let sum = t
+            .update_counter(hi, 2, make_small(1), &atoms, &mut out)
+            .unwrap();
+        assert!(unsafe { is_big(sum) });
+        // `2^59` is one limb and does not fit a small.
+        assert_eq!(magnitude_of(sum), (false, vec![1u64 << 59]));
+        // The stored object now holds the bignum (the interior rebuilt it).
+        assert_eq!(elem(t.lookup(hi, &atoms)[0], 1), sum);
 
-        // `MIN_SMALL - 1` likewise underflows the small range.
+        // Subtracting back lands exactly on `MAX_SMALL` — normalised to a small.
+        let back = t
+            .update_counter(hi, 2, make_small(-1), &atoms, &mut out)
+            .unwrap();
+        assert_eq!(back, make_small(MAX_SMALL));
+
+        // `MIN_SMALL - 1` underflows the small range the same way.
         let lo = make_small(2);
         let object = heap.tuple(&[lo, make_small(MIN_SMALL)]).unwrap();
         t.insert(lo, object, &atoms).unwrap();
-        assert!(matches!(
-            t.update_counter(lo, 2, make_small(-1), &atoms),
-            Err(BeamError::SystemLimit)
-        ));
-        assert_eq!(elem(t.lookup(lo, &atoms)[0], 1), make_small(MIN_SMALL));
+        let sum = t
+            .update_counter(lo, 2, make_small(-1), &atoms, &mut out)
+            .unwrap();
+        assert!(unsafe { is_big(sum) });
+        assert_eq!(magnitude_of(sum), (true, vec![(1u64 << 59) + 1]));
 
-        // A sum landing exactly on the boundary still succeeds.
+        // A sum landing exactly on the boundary is still a small.
         assert_eq!(
-            t.update_counter(hi, 2, make_small(MIN_SMALL), &atoms).unwrap(),
-            make_small(-1)
+            t.update_counter(lo, 2, make_small(1), &atoms, &mut out)
+                .unwrap(),
+            make_small(MIN_SMALL)
         );
     }
 
+    #[test]
+    fn update_counter_accepts_bignum_elements_and_operands() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut out = beam_alloc::Heap::new(256).expect("a test heap is allocatable");
+        let mut t = HashInterior::new(TableKind::Set);
+        let k = make_small(1);
+
+        // Element `2^64` (two limbs `[0, 1]`), a bignum.
+        let element = big(&mut out, false, &[0, 1]);
+        let object = heap.tuple(&[k, element]).unwrap();
+        t.insert(k, object, &atoms).unwrap();
+
+        // bignum element + small increment.
+        let sum = t
+            .update_counter(k, 2, make_small(10), &atoms, &mut out)
+            .unwrap();
+        assert_eq!(magnitude_of(sum), (false, vec![10, 1]));
+
+        // bignum element + bignum increment (`2^64 + 10` plus `2^64 + 5`).
+        let operand = big(&mut out, false, &[5, 1]);
+        let sum = t.update_counter(k, 2, operand, &atoms, &mut out).unwrap();
+        assert_eq!(magnitude_of(sum), (false, vec![15, 2]));
+
+        // A bignum that exactly cancels the element leaves the small zero.
+        let operand = big(&mut out, true, &[15, 2]);
+        let sum = t.update_counter(k, 2, operand, &atoms, &mut out).unwrap();
+        assert_eq!(sum, make_small(0));
+    }
     #[test]
     fn update_element_replaces_elements_and_reports_existence() {
         let atoms = AtomTable::new();
