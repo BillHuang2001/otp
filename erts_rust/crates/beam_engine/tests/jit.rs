@@ -700,3 +700,282 @@ fn a_compiled_artifact_can_be_run_more_than_once() {
         add_expected,
     );
 }
+
+// ---------------------------------------------------------------------------
+// Registers beyond the cache budget: direct `machine.x` addressing
+// ---------------------------------------------------------------------------
+
+/// The number of x-registers the baseline block emitter holds in machine registers
+/// (`CACHE_REGISTERS`). Stated here as a literal so the tests below say which budget
+/// they are exceeding; the structural assertions verify the allocator agrees.
+const CACHE_BUDGET: u32 = 4;
+
+/// A hand-built module with a single exported `export/arity` whose whole body is one
+/// basic block (the loader is not involved). `imports` are the module's
+/// `{module,function,arity}` imports, in `ImportRef` order.
+fn block_module(
+    name: &str,
+    export: &str,
+    imports: &[(&str, &str, u32)],
+    code: Vec<Instr>,
+) -> Module {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern(name);
+    for (module_name, function_name, arity) in imports {
+        let import_module = module.atom_table.intern(module_name);
+        let import_function = module.atom_table.intern(function_name);
+        module.imports.push(Import {
+            module: import_module,
+            function: import_function,
+            arity: *arity,
+        });
+    }
+    let function = module.atom_table.intern(export);
+    let label = Label(1);
+    let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+    module.functions.push(Function {
+        func_label: label,
+        entry_label: label,
+        module: module.name,
+        name: function,
+        arity: 0,
+        code,
+        blocks,
+        labels,
+    });
+    module.exports.push(Export {
+        function,
+        arity: 0,
+        label,
+    });
+    module
+}
+
+/// `spread/0` — one straight-line block that reads and writes **eight** x-registers,
+/// well past the four the emitter caches, so `x(4)`..`x(7)` live only in `machine.x`:
+///
+/// ```text
+///   x0=1 x1=2 x2=3 x3=4 x4=10     ; x4 is the first register past the cache budget
+///   x5 = x4                       ; `machine.x` → `machine.x`
+///   x6 = x0 + x1          (= 3)   ; fast path with a `machine.x` destination
+///   x4 = x6 + x3          (= 7)   ; fast path with `machine.x` operands and dst
+///   swap x4 x5                    ; x4=10, x5=7 (both `machine.x`)
+///   x7 = x4 + x5          (= 17)
+///   x0 = x7                       ; `machine.x` → cached register
+/// ```
+///
+/// Returns `17`.
+fn spread_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| Instr::GcBif {
+        arity: 2,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: dst.max(a).max(b) + 1,
+        args: vec![Operand::X(a), Operand::X(b)],
+        dst: Operand::X(dst),
+    };
+    block_module(
+        "spread",
+        "spread",
+        &[("erlang", "+", 2)],
+        vec![
+            Instr::Label(Label(1)),
+            mv(1, 0),
+            mv(2, 1),
+            mv(3, 2),
+            mv(4, 3),
+            mv(10, 4),
+            Instr::Move {
+                src: Operand::X(4),
+                dst: Operand::X(5),
+            },
+            add(0, 1, 6),
+            add(6, 3, 4),
+            Instr::Swap {
+                a: Operand::X(4),
+                b: Operand::X(5),
+            },
+            add(4, 5, 7),
+            Instr::Move {
+                src: Operand::X(7),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    )
+}
+
+/// `swaps/0` — one block exercising **every** cached/`machine.x` combination of
+/// `swap`, with `x(4)`/`x(5)` past the cache budget:
+///
+/// ```text
+///   x0=1 x1=2 x2=3 x3=4 x4=5 x5=6
+///   swap x0 x4     ; cached      <-> machine.x
+///   swap x4 x5     ; machine.x   <-> machine.x
+///   swap x0 x1     ; cached      <-> cached
+///   swap x4 x3     ; machine.x   <-> cached
+///   x0 = x4
+/// ```
+///
+/// Returns `4` (the value `x(3)` started with, carried through the last swap).
+fn swaps_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let swap = |a: u32, b: u32| Instr::Swap {
+        a: Operand::X(a),
+        b: Operand::X(b),
+    };
+    block_module(
+        "swaps",
+        "swaps",
+        &[],
+        vec![
+            Instr::Label(Label(1)),
+            mv(1, 0),
+            mv(2, 1),
+            mv(3, 2),
+            mv(4, 3),
+            mv(5, 4),
+            mv(6, 5),
+            swap(0, 4),
+            swap(4, 5),
+            swap(0, 1),
+            swap(4, 3),
+            Instr::Move {
+                src: Operand::X(4),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    )
+}
+
+#[test]
+fn the_multi_register_blocks_touch_registers_beyond_the_cache() {
+    // Structural evidence that the direct-`machine.x` path is what is under test: the
+    // allocator caches exactly the four budget registers and the block addresses
+    // x(7) (resp. x(5)) — far past them — without a machine register.
+    let compiled = BaselineJit::new()
+        .compile(&spread_module())
+        .expect("compile the spread fixture");
+    assert_eq!(compiled.block_count(), 1);
+    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.highest_native_register(), Some(7));
+    assert!(
+        compiled.highest_native_register() > compiled.highest_cached_register(),
+        "the block must touch registers the cache budget could not hold"
+    );
+
+    let compiled = BaselineJit::new()
+        .compile(&swaps_module())
+        .expect("compile the swaps fixture");
+    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+}
+
+#[test]
+fn multi_register_moves_and_arithmetic_agree_with_the_interpreter() {
+    let spread = spread_module();
+    assert_eq!(
+        agree_module(&spread, "spread", 0, &[]).expect("spread/0"),
+        make_small(17)
+    );
+    let swaps = swaps_module();
+    assert_eq!(
+        agree_module(&swaps, "swaps", 0, &[]).expect("swaps/0"),
+        make_small(4)
+    );
+}
+
+#[test]
+fn the_multi_register_fast_path_does_not_consult_the_bif_hook() {
+    // All three `gc_bif '+'/2`s read their operands (and write the result) through
+    // `machine.x` — they are past the cache budget — and are still lowered
+    // natively: the BIF hook the interpreter would call is never reached. A deopt
+    // to `jit_step_one` would call it.
+    let module = spread_module();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let got = run_module_tier(
+        Tier::BaselineJit,
+        &module,
+        "spread",
+        0,
+        &[],
+        counting_arith_hook(Arc::clone(&calls)),
+    )
+    .expect("spread/0 on the native tier");
+    assert_eq!(got, make_small(17));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the multi-register fast path must not call the BIF"
+    );
+
+    // The interpreter is the control: it calls the BIF once per `gc_bif`.
+    let interpreted_calls = Arc::new(AtomicUsize::new(0));
+    let interpreted = run_module_tier(
+        Tier::Interpreter,
+        &module,
+        "spread",
+        0,
+        &[],
+        counting_arith_hook(Arc::clone(&interpreted_calls)),
+    )
+    .expect("spread/0 on the interpreter");
+    assert_eq!(interpreted, got);
+    assert_eq!(interpreted_calls.load(Ordering::SeqCst), 3);
+}
+
+#[test]
+fn multi_register_blocks_agree_across_register_file_sizes() {
+    // `with_max_register(8)` covers x(0)..x(7), so the block runs natively with
+    // x(4)..x(7) addressed in `machine.x`; a shorter file than the highest
+    // natively-touched register must not be entered at all (the run stays on the
+    // interpreter step and reports the interpreter's exact `bad_register`). Either
+    // way the two tiers must agree.
+    for module in [spread_module(), swaps_module()] {
+        for max_register in [2u32, CACHE_BUDGET, 8, beam_engine::MAX_REGISTER] {
+            let export = module.atom_name(module.exports[0].function).unwrap().to_string();
+
+            let mut interpreted = Machine::with_max_register(max_register);
+            let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+            let expected = interpreted.run_export(
+                &module,
+                atom(&module, &export),
+                0,
+                &[],
+                &mut ctx,
+            );
+
+            let mut jitted = Machine::with_max_register(max_register);
+            let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+            let got = jitted.run_with_tier(
+                &module,
+                atom(&module, &export),
+                0,
+                &[],
+                &mut ctx,
+                Tier::BaselineJit,
+            );
+
+            match (got, expected) {
+                (Ok(got), Ok(expected)) => assert_eq!(got, expected),
+                (Err(got), Err(expected)) => assert_eq!(
+                    format!("{got:?}"),
+                    format!("{expected:?}"),
+                    "tiers disagree on the typed error for {export} with max_register={max_register}"
+                ),
+                (got, expected) => panic!(
+                    "tiers disagree for {export} with max_register={max_register}: \
+                     {got:?} vs {expected:?}"
+                ),
+            }
+        }
+    }
+}

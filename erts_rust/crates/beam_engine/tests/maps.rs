@@ -10,8 +10,10 @@
 //!
 //! The flat-map arguments are built by the engine's own flat-map builder and keyed
 //! by the **module's** atom table, so the fixture's key operands compare equal.
-//! The **hashmap** (HAMT) arguments are hand-written (see [`Hamt`]) because no
-//! crate in the rewrite can build a HAMT yet — the engine can only *read* one.
+//! The **hashmap** (HAMT) *source* arguments are hand-written (see [`Hamt`]) so the
+//! read path can be exercised against an arbitrary frozen node shape; a hashmap the
+//! *engine builds* comes from `put_map_assoc`/`put_map_exact` crossing the flat-map
+//! limit (`beam_term::map::write_map`).
 
 use beam_common::BeamError;
 use beam_engine::{terms, Machine, MinimalContext};
@@ -302,14 +304,13 @@ fn has_reports_presence_in_a_hashmap() {
 }
 
 // ---------------------------------------------------------------------------
-// Hashmap (HAMT) construction — the documented blocker
+// Hashmap (HAMT) construction — growing a map past the flat-map limit
 // ---------------------------------------------------------------------------
 
 #[test]
-fn assoc_that_would_exceed_the_flat_map_limit_is_a_typed_unsupported() {
-    // 32 source keys plus the new key `c` would need a 33-pair map, i.e. the HAMT
-    // builder no crate implements yet, so the update must be a *typed* unsupported
-    // (a raise) — never a wrong result.
+fn assoc_that_exceeds_the_flat_map_limit_builds_a_hashmap() {
+    // A 32-key source map plus the new key `c` makes 33 distinct keys, so the update
+    // must build a **hashmap** — and every binding must be readable back.
     let module = load();
     let mut ctx = MinimalContext::new();
     let mut keys = vec![make_atom(atom(&module, "a"))];
@@ -317,15 +318,32 @@ fn assoc_that_would_exceed_the_flat_map_limit_is_a_typed_unsupported() {
     let mut hamt = Hamt::new();
     let map = hashmap_32(&mut hamt, &keys);
 
-    let err = run(&mut ctx, &module, "assoc", &[map]).unwrap_err();
-    assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    let result = run(&mut ctx, &module, "assoc", &[map]).expect("assoc grows to a 33-key map");
+    assert!(terms::is_hashmap(result), "33 keys must be a hashmap");
+    assert_eq!(terms::map_entries(result).unwrap().len(), 33);
+    assert_eq!(
+        beam_term::map::map_size(result, &module.atom_table).unwrap(),
+        33
+    );
+
+    // Every source key survives with its original value, plus the new `c`.
+    // (`hashmap_32` gives the leaf at index `i` the value `i`, so `a` ⇒ 0.)
+    assert_eq!(entry(result, &module, "a"), Some(make_small(0)));
+    for i in 1..=31i64 {
+        assert_eq!(
+            beam_term::map::map_get(result, make_small(i), &module.atom_table).unwrap(),
+            Some(make_small(i)),
+            "key {i}"
+        );
+    }
+    assert_eq!(entry(result, &module, "c"), Some(make_small(3)));
 }
 
 #[test]
 fn exact_on_a_32_pair_hashmap_builds_an_equivalent_flat_map() {
     // A ≤ 32-pair result still fits the flat-map layout, so `put_map_exact` updates
-    // a hashmap source successfully; the *bindings* are identical (M1 represents the
-    // result as a flat map — the representation is not part of the map contract).
+    // a hashmap source successfully; the *bindings* are identical and the ≤ 32-pair
+    // result is written back as a flat map (the layout rule the oracle uses).
     let module = load();
     let mut ctx = MinimalContext::new();
     let mut keys = vec![make_atom(atom(&module, "a"))];
@@ -334,6 +352,7 @@ fn exact_on_a_32_pair_hashmap_builds_an_equivalent_flat_map() {
     let map = hashmap_32(&mut hamt, &keys);
 
     let result = run(&mut ctx, &module, "exact", &[map]).expect("exact on a <=32-pair hashmap");
+    assert!(!terms::is_hashmap(result), "32 pairs is a flat map");
     assert_eq!(entry(result, &module, "a"), Some(make_small(9)));
     assert_eq!(terms::map_entries(result).unwrap().len(), 32);
 }

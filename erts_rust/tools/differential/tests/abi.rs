@@ -16,6 +16,8 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
+mod common;
+
 /// The `enif_*` symbols the structural check references (a representative slice of the
 /// NIF ABI: allocation, term construction/access, binaries, lists/maps, resources,
 /// comparison, string/term marshalling, messaging, monitors, I/O, threads and
@@ -205,7 +207,9 @@ impl TempDir {
     fn new(tag: &str) -> std::io::Result<TempDir> {
         static COUNTER: AtomicU64 = AtomicU64::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
+        // Under the worktree-local scratch root (see `common::scratch_root`), not the
+        // shared/volatile `$TMPDIR` that a sibling worker may clean out from under us.
+        let dir = common::scratch_root().join(format!(
             "differential-abi-{}-{}-{n}",
             tag,
             std::process::id()

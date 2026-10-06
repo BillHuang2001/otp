@@ -1572,11 +1572,11 @@ fn markers_between_two_labels_do_not_disturb_control_flow() {
 }
 
 // ---------------------------------------------------------------------------
-// Residual `Instr::Generic`: `is_any_native_record` (the `is_record/1` guard)
+// `Instr::IsAnyNativeRecord`: the `is_record/1` native-record guard
 // ---------------------------------------------------------------------------
 
-/// A one-function module whose code is the `is_any_native_record` opcode under
-/// test, shaped like the compiler's output:
+/// A one-function module whose code is the typed `IsAnyNativeRecord` instruction
+/// under test, shaped like the compiler's output:
 ///
 /// ```text
 /// Label(1)
@@ -1596,10 +1596,9 @@ fn native_record_test_module() -> (Module, Label) {
     let fail = fixture.atom("fail");
     let code = vec![
         Instr::Label(Label(1)),
-        Instr::Generic {
-            op: Opcode::is_any_native_record,
-            operands: vec![Operand::Label(Label(2)), Operand::X(0)],
-            offset: 0,
+        Instr::IsAnyNativeRecord {
+            fail: Label(2),
+            src: Operand::X(0),
         },
         Instr::Move {
             src: Operand::Atom(ok),

@@ -56,6 +56,7 @@ mod port;
 mod print;
 mod proc;
 mod reason;
+mod records;
 mod registry;
 mod string;
 mod term_ops;

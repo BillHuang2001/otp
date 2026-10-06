@@ -30,13 +30,13 @@
 //! `beam_term` owner and hand-rolls a layout here, pinned line-by-line to the C
 //! ground truth in the function docs.
 //!
-//! The **hashmap (HAMT) read path** is hand-rolled here as well: `beam_term` owns
-//! the frozen map-header tag constants (`HAMT_SUBTAG_*`) and the `is_hashmap`
-//! classifier but no node reader, so [`map_entries`] walks the `erl_map.h` node
-//! tree itself. No hash function is needed — the walk descends every occupied slot
-//! and key matching stays with the caller's `beam_term::cmp` scan. No crate in the
-//! rewrite can yet *build* a HAMT, so map construction ([`make_flatmap`]) stays
-//! capped at the flat-map limit.
+//! The **hashmap (HAMT) read *and* build paths** are hand-rolled here as well:
+//! `beam_term` owns the frozen map-header tag constants (`HAMT_SUBTAG_*`), the
+//! `is_hashmap` classifier and the HAMT builder/reader
+//! ([`beam_term::map::write_map`]), so [`map_entries`] walks the `erl_map.h` node
+//! tree itself while [`make_map`] delegates construction to
+//! [`beam_term::map::write_map`] — a flat map at/below `MAP_SMALL_MAP_LIMIT` (32)
+//! pairs, a hashmap above it, exactly the oracle's choice.
 //!
 //! # Error strategy
 //!
@@ -49,21 +49,21 @@
 //!
 //! It is the crate's single raw-heap boxed-term builder/reader (the widening
 //! contract: one `#[allow(unsafe_code)]` home for every term layout), so tuples,
-//! cons cells, lists, floats, flat maps, the HAMT reader, funs and the heap binary
+//! cons cells, lists, floats, maps (flat and HAMT), funs and the heap binary
 //! all live here, each with the frozen-layout proof it needs — plus a comprehensive
 //! in-module test suite (raw-word layout assertions and the HAMT fixtures). Moving
 //! a family out would spread `unsafe` across modules and needs `lib.rs` wiring, so
 //! the responsibility deliberately stays in one file.
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
-use beam_term::{make_atom, make_small, thing, Eterm, MAX_SMALL, MIN_SMALL};
+use beam_term::{make_atom, make_small, thing, AtomTable, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::context::ExecutionContext;
 
 /// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
-/// Above it ERTS uses a **hashmap** (HAMT). No crate in the rewrite can build one
-/// yet (it belongs to `beam_term`/`beam_codec`), so [`make_flatmap`] rejects a
-/// larger map — but [`map_entries`] can still *read* one.
+/// Above it ERTS uses a **hashmap** (HAMT), which [`make_map`] builds; this
+/// constant is the flat-layout boundary [`make_flatmap`] enforces and
+/// [`flatmap_entries`] validates against.
 const MAP_SMALL_MAP_LIMIT: usize = 32;
 
 /// The word offset of a HAMT node's first item when the node carries the
@@ -228,21 +228,50 @@ pub fn make_integer(ctx: &mut dyn ExecutionContext, value: i64) -> Result<Eterm>
 /// by [`beam_term::thing::write_flatmap`]. Duplicate keys are not detected here
 /// (that needs term comparison).
 ///
-/// More than `MAP_SMALL_MAP_LIMIT` (32) pairs requires a **hashmap** and a HAMT
-/// builder. No crate in the rewrite implements one (`beam_term` — the frozen-layout
-/// LCA — owns no HAMT builder, and `beam_codec` has neither a builder nor a HAMT
-/// decoder), so a larger map yields [`crate::error::unsupported`] rather than a
-/// wrong term. This is the documented construction-side gap; the read side
-/// ([`map_entries`]) *does* handle a HAMT.
+/// This is the *flat-layout-only* builder: more than `MAP_SMALL_MAP_LIMIT` (32)
+/// pairs would need a **hashmap**, so it is rejected with
+/// [`crate::error::unsupported`] rather than writing a wrong term. Use [`make_map`]
+/// for the general builder, which selects the layout (flat ≤ 32 pairs, hashmap
+/// above) as the oracle does.
 pub fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
     let n = pairs.len();
     if n > MAP_SMALL_MAP_LIMIT {
-        return Err(crate::error::unsupported("map > 32 pairs (no HAMT builder)"));
+        return Err(crate::error::unsupported("map > 32 pairs (use make_map)"));
     }
     let hp = ctx.alloc_words(thing::flatmap_size_words(n))?;
     // SAFETY: `alloc_words` returned `flatmap_size_words(n)` writable words and
     // `n <= MAP_SMALL_MAP_LIMIT`, the preconditions `write_flatmap` documents.
     Ok(unsafe { thing::write_flatmap(hp, pairs) })
+}
+
+/// Builds a map term from `pairs`, choosing the frozen layout by size — the
+/// general map builder (`put_map_assoc` / `put_map_exact`).
+///
+/// Delegates to [`beam_term::map::write_map`], which reproduces
+/// `erts_map_from_ks_and_vs` / `erts_maps_put`: duplicate keys are collapsed
+/// **last value wins**, a map of at most `MAP_SMALL_MAP_LIMIT` (32) distinct keys
+/// is written as a **flat** map (keys in `erts_cmp_flatmap_keys` order) and a
+/// larger one as a **hash map** (HAMT), so a map grown past the flat-map limit by
+/// compiled code becomes a correct hashmap, exactly as the oracle builds it. The
+/// pair order of `pairs` is irrelevant.
+///
+/// Storage is reserved with [`beam_term::map::map_words_capacity`]`(pairs.len())`
+/// — the exact flat-map size and a sound upper bound for a hashmap. Because
+/// `write_map` deduplicates its input, reserving for the *input* length is always
+/// sufficient for the produced map.
+pub fn make_map(
+    ctx: &mut dyn ExecutionContext,
+    pairs: &[(Eterm, Eterm)],
+    atoms: &AtomTable,
+) -> Result<Eterm> {
+    let hp = ctx.alloc_words(beam_term::map::map_words_capacity(pairs.len()))?;
+    // SAFETY: `alloc_words` returned `map_words_capacity(pairs.len())`
+    // exclusively-owned, writable words. `write_map` writes every word of the
+    // produced map and never more than that (deduplication can only shrink the
+    // map), the precondition its own `# Safety` section documents. The returned
+    // term borrows the arena storage the context keeps live.
+    let map = unsafe { beam_term::map::write_map(hp, pairs, atoms) }?;
+    Ok(map)
 }
 
 /// Builds a local **fun** (closure) term.
@@ -426,6 +455,19 @@ pub fn float_value(t: Eterm) -> Result<f64> {
     }
     // SAFETY: `is_float` established that `t` is a live boxed float.
     Ok(unsafe { thing::float_value(t) })
+}
+
+/// Whether `t` is a map using the frozen **hashmap** (HAMT) layout.
+///
+/// A safe wrapper over [`beam_term::is_hashmap`] (a classifier that dereferences
+/// the term's header word), so callers that may not use `unsafe` — e.g. tests under
+/// the crate-wide `#![deny(unsafe_code)]` — can classify a map's representation.
+/// Returns `false` for a flat map and for any non-map term.
+pub fn is_hashmap(t: Eterm) -> bool {
+    // SAFETY: the classifier handles an immediate term first (`is_boxed` rejects it
+    // before any dereference); a boxed `t` is a live term from the context heap or a
+    // literal area, never unvalidated raw memory.
+    unsafe { beam_term::is_hashmap(t) }
 }
 
 /// Splits a map term into its `(key, value)` entries, in storage order.

@@ -27,10 +27,13 @@ loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers and over `beam_term::fun` for funs) plus the local
 bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
-(see "Tag coverage" below); the only still-`unsupported` tag is `RECORD` (`67`), `LOCAL_EXT` (`121`)
+(see "Tag coverage" below); **no producible tag is `unsupported`** — `RECORD_EXT` (`67`) now decodes
+and encodes through `beam_term::record` (§Records) — `LOCAL_EXT` (`121`)
 is honoured as a top-level wrapper, the encoder emits `ATOM_CACHE_REF` (`82`) through the
 `AtomCacheWriter` hook, and `DIST_HEADER` (`68`) plus the obsolete `FUN` (`117`) / `NEW_CACHE` (`78`)
-tags are rejected as `BadArg` — never a wrong term.
+tags are rejected as `BadArg` — never a wrong term. The `COMPRESSED` (`80`) encoder reproduces C's
+*shrink rule*: it emits the wrapper only when zlib beats the plain image, else the plain image
+(`external.c:2276-2298`).
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
 `#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
@@ -125,9 +128,10 @@ is `decode`'s.
   body (never containing the version byte). `Encoder::finish_compressed` strips a leading version byte
   written by `Encoder::new`; `encode_term_body_compressed` omits the wrapper's version byte for the
   dist/ETS body form (`[COMPRESSED_EXT][inner_size:4 BE][zlib body]`). The wrapper is emitted **only**
-  when explicitly requested — `encode_term` stays uncompressed. (C additionally reverts to the plain
-  image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
-  when compression is requested.)
+  when explicitly requested — `encode_term` stays uncompressed — and then only when zlib *shrinks* the
+  body: C's shrink rule (`external.c:2276-2298`) gives zlib a destination cap of `body_len - 5` bytes
+  (the 5-byte wrapper) and the **plain** image is emitted when the compressed stream does not fit, so
+  `encode_term_compressed([1,2,3], level)` is the plain `[131,107,0,3,1,2,3]`, exactly the oracle.
 - **`LOCAL_EXT` wrapper** — `Encoder::finish_local(hash)` / `encode_term_local(Eterm, &AtomTable,
   hash: u32)` emit `[VERSION_MAGIC][LOCAL_EXT (121)][hash:4 BE][body]`, the `term_to_binary/2 [local]`
   image (`external.c:3305-3315`, hash patched at `:4046-4105`). `body` is the term image with the
@@ -239,13 +243,16 @@ flatmap/hashmap switchover is an *open* layout this crate deliberately collapses
 §Term-layout ownership), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
 whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
-`encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
-by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
+`encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, and
+only when zlib shrinks the body — otherwise the plain image is emitted, per the C shrink rule),
+`121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
 4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
+`67 RECORD_EXT` (native records — see §Records; the interior layout is `beam_term::record`'s),
 `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
-**Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
-result):** `67 RECORD` (native record — blocked on a `beam_term` record layout, see §Known Issues);
-plus any atom name not representable in the emitted encoding.
+**No recognized tag is left `unsupported`.** `RECORD_EXT` (`67`) decodes and encodes through
+`beam_term::record` (§Records). An `unsupported` outcome remains only for a *term kind* the wire
+cannot carry: an atom name not representable in the emitted encoding, and a `FunKind::Local` fun on
+**encode** (`error::unsupported_local_fun`, see §Error surface).
 **Tags rejected as malformed `BadArg`** (exactly as the C term decoder does): `68 DIST_HEADER` (a
 distribution-transport wrapper, never a term — `goto error`, `external.c:6464`; the `'D'` framing is
 `beam_dist`'s), `117 FUN` (removed in OTP 23, `external.c:6399-6404`) and `78 NEW_CACHE` (dead
@@ -291,6 +298,33 @@ and forwards to `write_fun_external`/`write_fun_imported` (`src/term/fun.rs`).
   - `FunKind::Local` (the `make_fun3` closure) has **no faithful wire image** — its inlined
     descriptor carries no module, no 16-byte `uniq` and no creator pid — so encoding one returns
     `error::unsupported_local_fun()` (see §Error surface), never a mis-encoded term.
+
+### Records (`RECORD_EXT` `67`)
+Native records (the OTP 29 `ErtsRecordDefinition`/`ErtsRecordInstance` terms produced by the
+`records:*` BIFs, distinct from classic tagged-tuple records) decode and encode through the
+**`beam_term::record`** layout — the term-layout owner (`../beam_term/CONTEXT.md`). Wire form
+(`external.c:4006-4036` encode, `:5257-5381` decode):
+
+```text
+[67][num_fields:4 BE][flags:1][module atom][name atom]
+[num_fields × key atom]                 # DECLARATION order
+[num_fields × value term]               # DECLARATION order
+```
+
+- `flags` is `0` (`is_exported == false`) or `1` (`true`); any other byte is `BadArg`.
+- Keys and values are both in **declaration** order. The instance/definition store keys/values in
+  ascending atom-index order, so the encoder maps declaration → sorted rank through `field_order`
+  (`erl_record.c:1072-1073`) and the decoder inverts it.
+- A duplicate key is `BadArg`; a field count whose definition arity overflows `MAX_ARITYVAL` is
+  `SystemLimit` (checked before any allocation); the record block is allocated only after every value
+  has decoded, so a malformed tail never leaves a half-built record.
+- Code: `src/term/record.rs` forwards to `beam_term::record` (`is_record`, `make_record`,
+  `record_block_words`, the `record_*` readers, `AM_TRUE`/`AM_FALSE`); `src/encode/record.rs`
+  (`Encoder::encode_record`) and `src/decode/record.rs` (`Decoder::decode_record`) are the wire halves.
+  `Encoder::encode` probes `is_record` **before** the boxed-family probes (a record header carries the
+  distinct `RECORD_SUBTAG`).
+- The cached definition `hash` (definition word 2) is `make_small(0)` — `beam_term` cannot reproduce
+  C's `make_hash2`; it is **not on the wire** (see §Known Issues).
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
@@ -390,13 +424,22 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `decode_term` requires `inflate` success **and** `decompressed.len() == size`, otherwise `BadArg`.
   Trailing bytes after the zlib stream are ignored, exactly as the C's `uncompress` does (the deflate
   stream is not self-delimiting). Encoding writes the wrapper **only** on the explicit
-  `*_compressed` entry points; it is never emitted by default.
-- **Compressed output is not byte-comparable with the oracle.** zlib (C) and `miniz_oxide` produce
-  different — equally valid — deflate byte streams for the same input, so the `COMPRESSED`
-  ground-truth vector pins the **decoder** and the **inner body** (which must equal our uncompressed
-  encoding), not our compressor's bytes. Round-trip byte-stability is asserted among *our own*
-  encode/decode; interoperability (the system `erl`'s `binary_to_term/1` accepting our wrapper and
-  our uncompressed re-encoding) is asserted live by `tests/interop.rs`.
+  `*_compressed` entry points, and then only when it *shrinks* the body: zlib is given a destination
+  cap of `body_len - 5` bytes (the C's rule, `external.c:2276-2298`) and the **plain** image is
+  emitted when the stream does not fit, so `encode_term` is never compressed and
+  `encode_term_compressed` matches the oracle's *choice* of wrapper vs plain byte-exactly.
+- **Only the *deflate bytes* of a compressed image are not byte-comparable with the oracle.** zlib
+  (C) and `miniz_oxide` produce different — equally valid — streams for the same input, so the
+  `COMPRESSED` ground-truth vector pins the **decoder** and the **inner body** (which must equal our
+  uncompressed encoding), not our compressor's bytes. The wrapper-vs-plain *choice* **is**
+  oracle-exact (both implement the `body_len - 5` shrink rule above). Round-trip byte-stability is
+  asserted among *our own* encode/decode; interoperability (the system `erl`'s `binary_to_term/1`
+  accepting our wrapper and our uncompressed re-encoding) is asserted live by `tests/interop.rs`.
+- **A native record's layout is owned by `beam_term::record`; the codec only maps it to the wire.**
+  `RECORD_EXT` (`67`) is *not* a tuple: the encoder probes `is_record` before the tuple/boxed
+  families and forwards to `beam_term::record`, so the atom-index sort rule, `field_order` and the
+  declaration↔sorted inversion stay in the layout owner. The cached definition `hash` is not on the
+  wire, and `beam_term` cannot reproduce C's `make_hash2`, so the codec passes `make_small(0)`.
 - **The interop harness compares terms structurally, not by `beam_term::compare::eq`.** `eq`'s
   documented fallback for maps and external identifiers compares the raw term word (a heap address),
   so it would report two structurally-equal terms decoded into different heaps as unequal. The
@@ -418,10 +461,11 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
   incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
   `ErtsDigit`s), plus negative cases (truncation at every offset, bad tag, over-long atom, `LARGE_BIG`
-  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes). The `COMPRESSED` section round-trips a small
-  and a large compressible term through `encode_term_compressed`/`encode_term_body_compressed` →
-  `decode_term` at every level, and covers the negative cases (short header, lying size, corrupt
-  trailer, non-zlib payload, non-term inner body, truncation at every offset).
+  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes). The `COMPRESSED` section pins the shrink
+  rule (a small term reverts to the plain image at every level; a large compressible term emits the
+  wrapper) and round-trips both forms through `decode_term`, plus the negative cases (short header,
+  lying size, corrupt trailer, non-zlib payload, non-term inner body, truncation at every offset). It
+  also pins the oracle fun blobs (`EXPORT_EXT` and the `fun() -> ok end` `erl_eval` `NEW_FUN_EXT`).
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
@@ -443,8 +487,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   image `131,80,0,0,13,178,<zlib>`, whose declared inner size is `3506` (the inner body equals
   `term_to_binary(lists:duplicate(500, hello))` minus its version byte); it is asserted by decoding
   and by comparing the inflated stream to our own `encode_term_body`. `term_to_binary({ok,17},
-  [compressed])` is kept as the fallback case (the C emits the plain `OK_17` image when zlib cannot
-  shrink the term, `external.c:2284-2293`).
+  [compressed])` is kept as the fallback case (a small term where zlib cannot shrink the body, so the
+  plain `OK_17` image is emitted — `external.c:2276-2298`).
 - `tests/interop.rs` — the **live differential harness** against the system `erl` oracle (the same
   resolution rule as `../tools/differential`: `$ERTS_ORACLE` if it names an existing executable, else
   `erl` on `$PATH`; when neither exists the oracle-dependent test prints a loud stderr note and
@@ -487,13 +531,12 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
   order is kept exactly.
-- **Records (`67`) remain `unsupported` — blocked on a term-layer record layout.** The C decoder builds
-  a native record term (`external.c:5257-5381`) from `ErtsRecordInstance`/`ErtsRecordDefinition`
-  (`../../erts/emulator/beam/erl_record.h:43-95`, incl. `RECORD_INST_SIZE`/`RECORD_DEF_SIZE`); the
-  codec must not invent that interior, so implementing `67` requires a record-instance/definition
-  layout exposed by **`beam_term`** (the term-layout owner — `../beam_term/CONTEXT.md`). Ordinary
-  Erlang records encode as tuples and are unaffected. The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`)
-  tags are rejected as `BadArg`.
+- **The decoded record's cached definition `hash` is `make_small(0)`, not C's `make_hash2`.** C stores
+  `make_hash2({module,name,is_exported,keys_declaration_order})` in definition word 2; `beam_term`
+  cannot reproduce `make_hash2` (its `hashing` is deliberately not bit-exact), so both
+  `crate::term::make_record` and the `RECORD_EXT` decoder pass `make_small(0)` unless a caller supplies
+  a value. The hash is **not on the wire**, so this is not wire-observable (round-trips are byte-exact).
+  The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`) tags are rejected as `BadArg`.
 - **`LOCAL_EXT` (`121`) decode does not verify the node hash.** The C verifies it only in the
   `decoded_size` sizing pass (`external.c:6437-6512`) against a Bob-Jenkins hash seeded with the node's
   `local_node_hash` (hostname/pid/time derived) — node identity, `beam_rt`/`beam_dist`'s. The codec
@@ -510,10 +553,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
   to keep a hostile stream from driving an unbounded allocation.
-- **The compressed wrapper is always emitted when compression is explicitly requested**, even when it
-  makes the image larger — the C reverts to the plain image in that case. This is a deliberate,
-  documented difference (`encode_term_compressed` obeys the caller; `encode_term` is the uncompressed
-  API).
+- **Compressed output is not byte-comparable with the oracle** for the *deflate bytes* (zlib (C) and
+  `miniz_oxide` produce different, equally valid streams) — but whether a wrapper or the plain image is
+  emitted **is** oracle-exact (the shrink rule above). See §Design Decisions.
 - Identifiers always decode as *external* things (no local-node identity in the codec yet).
 - **`node` occupies the sysname-atom slot; `creation` is carried in C's off-heap `next` link
   (a documented M1 substitution).** In C `ExternalThing`'s first data word is a pointer to a
@@ -544,34 +586,42 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   fun-classification chain inside `Encoder::encode`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
+- `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
 - `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
   `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`,
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
+- `src/decode/record.rs` → the `RECORD_EXT` (`67`) decoder (`Decoder::decode_record` — see §Records)
 - `src/error.rs` → error constructors (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`, plus the local-fun surface (`unsupported_local_fun`,
   `is_unsupported_local_fun`, `LOCAL_FUN_REASON`)
 - `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
   `beam_alloc::Heap` and forwards to `beam_term::thing` /
   `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier
-  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface
+  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface and the
+  `src/term/record.rs` native-record surface
 - `src/term/fun.rs` → the fun/export forwarding layer (inside the `unsafe` subtree):
   `make_fun_external`/`make_fun_imported`, the `fun_*_term` accessors, the `#[cfg(test)]`
   local-fun builder, and the `beam_term::fun` re-exports
+- `src/term/record.rs` → the native-record forwarding layer (inside the `unsafe` subtree):
+  `is_record`/`make_record` plus the `beam_term::record` `record_*` readers and `AM_*`/size constants
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
   incl. the `COMPRESSED` seed
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
-  incl. the `COMPRESSED` wrapper round-trips and negatives
+  incl. the `COMPRESSED` wrapper/plain-revert round-trips and the oracle fun blobs (`EXPORT_EXT`,
+  `NEW_FUN_EXT` incl. the `fun() -> ok end` `erl_eval` golden)
+- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pin
 - `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
   streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
 - `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
   encode↔decode, atom-cache encode↔decode, no-cache control)
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
-  legacy-`FLOAT_EXT` decode vector and malformed-input typed-error cases
+  legacy-`FLOAT_EXT` decode vector, the malformed-input typed-error cases, and the oracle-gated
+  `oracle_accepts_our_new_fun_and_record_images` check
 - `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values
   (read-only), incl. `binary2term_prepare` (`1744-1816`) for the `COMPRESSED` wrapper
 - `../../erts/emulator/beam/erl_zlib.c` / `erl_zlib.h` → the C zlib wrapper the stream form matches

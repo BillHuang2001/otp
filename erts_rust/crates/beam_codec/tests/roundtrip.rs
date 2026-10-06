@@ -1024,22 +1024,28 @@ fn declared_inner_size(image: &[u8]) -> usize {
 }
 
 #[test]
-fn compressed_image_round_trips_a_small_term() {
+fn compressed_image_reverts_to_plain_for_a_small_term() {
+    // `{ok,17}` has an 8-byte body; zlib cannot fit it into `8 - 5 == 3` bytes, so
+    // `encode_term_compressed` reverts to the plain image — exactly what the C
+    // (`external.c:2276-2298`) and the oracle produce:
+    // `term_to_binary({ok,17}, [compressed]) == term_to_binary({ok,17})`.
     let mut atoms = AtomTable::new();
     let ok = make_atom(atoms.intern("ok"));
     let mut h = heap(64);
     let term = h.tuple(&[ok, make_small(17)]).unwrap();
 
-    let image = encode_term_compressed(term, &atoms, 6).unwrap();
     let body = encode_term_body(term, &atoms).unwrap();
-    assert_eq!(declared_inner_size(&image), body.len());
-    // The zlib stream carries exactly the term body (no version byte).
-    assert_eq!(decompress(&image[6..]).unwrap(), body);
-
-    let mut h2 = heap(64);
-    let mut a2 = AtomTable::new();
-    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
-    assert_term_eq(term, &atoms, term2, &a2);
+    let plain = encode_term(term, &atoms).unwrap();
+    for level in 0..=9u8 {
+        let image = encode_term_compressed(term, &atoms, level).unwrap();
+        assert_eq!(image, plain, "level {level}: a small term must revert");
+        assert_eq!(&image[1..], &body[..]);
+        // The plain image still decodes back to the original term.
+        let mut h2 = heap(64);
+        let mut a2 = AtomTable::new();
+        let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+        assert_term_eq(term, &atoms, term2, &a2);
+    }
 }
 
 #[test]
@@ -1110,18 +1116,30 @@ fn compressed_level_out_of_range_is_bad_arg() {
 }
 
 #[test]
-fn compressed_wrapper_bytes_are_well_formed_on_every_level() {
-    // A term where compression pays off at every level (0 stores, 9 best).
+fn compressed_image_is_a_wrapper_or_a_plain_revert_on_every_level() {
+    // A term where compression pays off at most levels, but not necessarily at level
+    // 0 (which stores rather than deflates).
     let mut atoms = AtomTable::new();
     let hello = make_atom(atoms.intern("hello"));
     let mut h = heap(4096);
     let term = list(&mut h, &[hello; 256], NIL);
     let body = encode_term_body(term, &atoms).unwrap();
+    let plain = encode_term(term, &atoms).unwrap();
 
     for level in 0..=9u8 {
         let image = encode_term_compressed(term, &atoms, level).unwrap();
-        assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
-        assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+        if image[1] == COMPRESSED_EXT {
+            // The wrapper only appears when the stream fits in `body_len - 5` bytes.
+            assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
+            assert!(
+                image.len() <= plain.len(),
+                "level {level}: the wrapper shrinks the image"
+            );
+            assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+        } else {
+            // Reverted: the plain image, byte-for-byte.
+            assert_eq!(image, plain, "level {level}: revert must be the plain image");
+        }
 
         let mut h2 = heap(4096);
         let mut a2 = AtomTable::new();
@@ -1481,6 +1499,51 @@ fn oracle_new_fun_image_round_trips() {
     }
 }
 
+/// Byte-exact oracle vector for the `erl_eval` lambda `fun() -> ok end` — the exact
+/// blob the differential case `wire/new_fun_ext_encode` compares. Generated with:
+/// `erl -noshell -eval 'io:format("~w~n",[term_to_binary(fun() -> ok end)])' -s init stop`.
+///
+/// It is `NEW_FUN_EXT` (`112`), total size 136, `arity` 0, module `erl_eval`,
+/// `index` 43, `num_free` 1, `old_index` a `SMALL_INTEGER_EXT` 43 and `old_uniq` an
+/// `INTEGER_EXT` `0x07C1297F` (130099583). The single environment element is
+/// `erl_eval`'s free-variable tree and the creator pid is the default
+/// `nonode@nohost` node (`0`/`0`/`0`).
+const ORACLE_NEW_FUN_EVAL: &[u8] = &[
+    131, 112, 0, 0, 0, 136, 0, 248, 37, 47, 246, 123, 244, 211, 6, 126, 138, 154, 65, 205, 61, 207,
+    38, 0, 0, 0, 43, 0, 0, 0, 1, 119, 8, 101, 114, 108, 95, 101, 118, 97, 108, 97, 43, 98, 7, 193,
+    41, 127, 88, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115, 116, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 104, 6, 97, 1, 106, 119, 4, 110, 111, 110, 101, 119, 4, 110, 111,
+    110, 101, 116, 0, 0, 0, 0, 108, 0, 0, 0, 1, 104, 5, 119, 6, 99, 108, 97, 117, 115, 101, 97, 1,
+    106, 106, 108, 0, 0, 0, 1, 104, 3, 119, 4, 97, 116, 111, 109, 97, 1, 119, 2, 111, 107, 106, 106,
+];
+
+#[test]
+fn oracle_eval_new_fun_image_round_trips() {
+    // `roundtrip_image` decodes the blob, re-encodes the decoded term and asserts the
+    // re-encoding equals the input **byte-for-byte** (then decodes once more and checks
+    // structural equality). An offline golden test: it never needs `erl`.
+    let (t2, _h2, a2) = roundtrip_image(ORACLE_NEW_FUN_EVAL, 1024);
+
+    assert_eq!(fun_kind_term(t2).unwrap(), FunKind::Imported);
+    assert_eq!(a2.name(fun_module(t2).unwrap()), Some("erl_eval"));
+    assert_eq!(fun_arity_term(t2).unwrap(), 0);
+    assert_eq!(fun_num_free_term(t2).unwrap(), 1);
+    assert_eq!(fun_index(t2).unwrap(), 43);
+    assert_eq!(fun_old_index(t2).unwrap(), 43);
+    assert_eq!(fun_old_uniq(t2).unwrap(), 0x07C1_297F);
+    assert_eq!(
+        fun_uniq_bytes(t2).unwrap(),
+        [248, 37, 47, 246, 123, 244, 211, 6, 126, 138, 154, 65, 205, 61, 207, 38]
+    );
+
+    let creator = fun_creator_pid(t2).unwrap();
+    assert_eq!(a2.name(creator.node), Some("nonode@nohost"));
+    assert_eq!((creator.number, creator.serial, creator.creation), (0, 0, 0));
+
+    // The one environment slot is `erl_eval`'s free-variable tree.
+    assert_eq!(fun_env(t2).unwrap().len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Negative cases
 // ---------------------------------------------------------------------------
@@ -1506,11 +1569,6 @@ fn assert_system_limit(bytes: &[u8]) {
         matches!(err, BeamError::SystemLimit),
         "expected SystemLimit, got {err:?}"
     );
-}
-
-fn assert_unsupported(bytes: &[u8]) {
-    let err = decode_err(bytes);
-    assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
 }
 
 #[test]
@@ -1560,9 +1618,9 @@ fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
     assert_bad_arg(&[VERSION_MAGIC, 117]); // FUN_EXT
     assert_bad_arg(&[VERSION_MAGIC, 78]); // NEW_CACHE
 
-    // `RECORD_EXT` is recognized but not yet implemented: `unsupported`, never a wrong
-    // term (blocked on a `beam_term` record layout).
-    assert_unsupported(&[VERSION_MAGIC, 67]); // RECORD_EXT
+    // `RECORD_EXT` (67) is implemented now, so a bare tag byte is a *truncation* (the
+    // count, flags and fields are missing) — `BadArg`, never a wrong term.
+    assert_bad_arg(&[VERSION_MAGIC, 67]); // RECORD_EXT
 
     // `LOCAL_EXT` (121) is honoured now as the `term_to_binary/2 [local]` wrapper
     // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4][term]`, so a bare tag byte is a

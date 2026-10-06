@@ -44,17 +44,26 @@
 //! atom keys compare by their raw term word (i.e. by atom index / intern order),
 //! anything else by the exact term order (`beam_term::compare::cmp`).
 //!
+//! # `~p`/`~P` re-flow (`io_lib_pretty`)
+//!
+//! The oracle runs `io_lib_pretty`, which breaks a container across lines when its
+//! single-line rendering is at least `line_length - column` characters (80 columns
+//! and column 1 by default). [`pretty_chunk`] reproduces that break for a
+//! proper/improper list, a tagged/untagged tuple and a map each of whose elements
+//! renders single-line (the break separator `,`, the improper tail after `|`, a
+//! `tag_len + 2` indent after a tuple tag, a two-space indent after `#{`); for the
+//! forms it does not model — a nested container, an element too long to fit on a
+//! line of its own, a non-printable bitstring, a long tuple tag, a depth-limited
+//! `~P` — it raises `error:badarg` rather than emit a line the oracle would have
+//! broken differently. See the `crate::io` module docs for the precise rule, the
+//! term classes and the narrowest repro.
+//!
 //! # Deviations from the oracle (documented)
 //!
 //! * **Floats** use Rust's shortest round-trip with a `.0` appended when integral
 //!   (`1.0`, `1.5`, `0.1`, `3.14159`), not OTP's `float_to_list(F, [short])`:
 //!   large/small magnitudes differ (`1.0e10` renders `10000000000`, the oracle
 //!   `1.0e10`).
-//! * **The `~p` printer never line-breaks.** The oracle runs `io_lib_pretty`,
-//!   which reflows a term that does not fit `line_length` (80 columns by default)
-//!   and honours a `~p` field width as a maximum *column*; this printer always
-//!   emits the single-line form. [`crate::io`] rejects a `~p`/`~P` whose rendering
-//!   exceeds an explicitly given field width rather than emit a mis-formatted line.
 //! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
 //!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
@@ -222,6 +231,405 @@ pub(crate) fn proper_list(term: Eterm) -> Option<Vec<Eterm>> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// `io_lib_pretty`-style re-flow (`~p`/`~P`)
+// ---------------------------------------------------------------------------
+
+/// Whether the oracle's `io_lib_pretty` may break `term` across lines: a tuple, a
+/// map, a **non-printable** list, or a **non-printable** bitstring (`print_length/7`
+/// gives those a container intermediate; a printable string or binary is written on
+/// one line however long).
+pub(crate) fn is_reflowable(term: Eterm) -> bool {
+    if is_tuple(term) || is_map(term) {
+        return true;
+    }
+    if bits::is_bitstring(term) {
+        return !binary_printable(term);
+    }
+    if is_list(term) {
+        return !list_printable(term);
+    }
+    false
+}
+
+/// Whether `term` is a non-empty proper list of small integers in `32..=126`
+/// (the printable-string rule).
+fn list_printable(term: Eterm) -> bool {
+    match proper_list(term) {
+        Some(elems) if !elems.is_empty() => {
+            elems.iter().all(|&e| is_small(e) && (32..=126).contains(&signed_value(e)))
+        }
+        _ => false,
+    }
+}
+
+/// Whether `term` is a non-empty binary whose every byte is in `32..=126`.
+fn binary_printable(term: Eterm) -> bool {
+    match bits::bytes(term) {
+        Ok(bytes) if !bytes.is_empty() => bytes.iter().all(|&b| (32..=126).contains(&b)),
+        _ => false,
+    }
+}
+
+/// One rendered re-flow element: its chunk and its flat length.
+struct FlatElem {
+    chunk: Chunk,
+    len: usize,
+}
+
+/// Renders `term` for a `~p`/`~P` directive: the flat single-line form when it fits
+/// `line_length - column`, else the `io_lib_pretty` line break for the supported
+/// container forms.
+///
+/// The re-flow models `io_lib_pretty:print/10` for a container all of whose
+/// elements are themselves single-line ("atomic"): proper and improper lists,
+/// (tagged and untagged) tuples, and maps of atomic pairs, at unlimited depth.
+/// Anything else — a container holding another container, a non-printable
+/// bitstring (`pp_binary` packs a different number of bytes per line), a
+/// depth-limited `~P` (the elements' depths change the atomic test), or a long
+/// tuple tag (`cind/7` then picks `4`/`1` instead of `-1`) — is not modelled and
+/// reported as `error:badarg` rather than rendered wrongly.
+///
+/// # Errors
+///
+/// As [`term_chunk`]; additionally `BadArg` for a re-flowable container whose
+/// break is not modelled (see the module docs).
+pub(crate) fn pretty_chunk(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    depth: i64,
+    line_length: usize,
+    column: usize,
+) -> Result<Chunk> {
+    let flat = term_chunk(ctx, term, printable, depth)?;
+    if !is_reflowable(term) || flat.flat_len() < line_length.saturating_sub(column) {
+        return Ok(flat);
+    }
+    if depth >= 0 {
+        return Err(badarg());
+    }
+    let chars_max = flat.flat_len();
+    match reflow(ctx, term, printable, line_length, column, chars_max)? {
+        Some(chunk) => Ok(chunk),
+        None => Err(badarg()),
+    }
+}
+
+/// The re-flow of a supported container, or `None` when the form is not modelled.
+fn reflow(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    ll: usize,
+    col: usize,
+    m: usize,
+) -> Result<Option<Chunk>> {
+    if is_list(term) {
+        reflow_list(ctx, term, printable, ll, col, m)
+    } else if is_tuple(term) {
+        reflow_tuple(ctx, term, printable, ll, col, m)
+    } else if is_map(term) {
+        reflow_map(ctx, term, printable, ll, col, m)
+    } else {
+        Ok(None)
+    }
+}
+
+/// `io_lib_pretty:indent/1` — the base indentation of a term starting at column
+/// `col` (`chars($\s, col - 1)`; empty for column 1).
+fn indent_base(col: usize) -> Chunk {
+    dup_chars(' ', col.saturating_sub(1))
+}
+
+/// `io_lib_pretty:indent/2` — prepend `n` spaces to `base`.
+fn indent_chunk(n: usize, base: &Chunk) -> Chunk {
+    let prefix = match n {
+        1 => Chunk::List(vec![Chunk::Char(' ')]),
+        4 => Chunk::List(vec![dup_chars(' ', 2), dup_chars(' ', 2)]),
+        _ => Chunk::List(vec![dup_chars(' ', n)]),
+    };
+    let mut items = prefix.into_items();
+    items.extend(base.clone().into_items());
+    Chunk::List(items)
+}
+
+/// Renders `term` as an atomic element (`io_lib_pretty`'s `?ATM`) or reports that
+/// it is a container the oracle would break onto its own line (`None`).
+fn atomic_elem(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+) -> Result<Option<FlatElem>> {
+    if is_reflowable(term) {
+        return Ok(None);
+    }
+    let chunk = term_chunk(ctx, term, printable, UNLIMITED_DEPTH)?;
+    let len = chunk.flat_len();
+    Ok(Some(FlatElem { chunk, len }))
+}
+
+/// The column of a container's first element and the oracle's `chars_max` guard
+/// values, bundled to keep [`pp_atomic`] readable.
+struct PpCtx<'a> {
+    /// Column of the first element (`pp_list`/`pp_map`'s third argument).
+    col0: usize,
+    /// Line length.
+    ll: usize,
+    /// The container's flat length (the oracle's `chars_max`).
+    m: usize,
+    /// The running width the oracle threads into the first element's guard.
+    w_first: usize,
+    /// The running width the oracle threads into the tail loop.
+    w_after_first: usize,
+    /// The continuation indent.
+    ind: &'a Chunk,
+}
+
+/// `io_lib_pretty:pp_list/9` + `pp_tail/10` for a sequence of atomic elements
+/// (the list and non-tagged-tuple path; the same shape serves maps).
+///
+/// Returns `None` when a guard this model does not reproduce would fire.
+fn pp_atomic(
+    elems: &[FlatElem],
+    tail: Option<&FlatElem>,
+    p: &PpCtx<'_>,
+    tail_sep: char,
+) -> Option<Chunk> {
+    let first = elems.first()?;
+    let ld_first = usize::from(elems.len() == 1);
+    // `pp_element/8`'s guard; a failing guard emits the element flat and forces a
+    // break (`WE = Ll`), which this model does not reproduce.
+    if first.len >= p.ll.saturating_sub(p.col0 + ld_first) || first.len + p.w_first + ld_first > p.m {
+        return None;
+    }
+    let mut out: Vec<Chunk> = vec![first.chunk.clone()];
+    let mut col = p.col0 + first.len;
+    let mut w = p.w_after_first;
+    let n = elems.len();
+    for i in 1..n {
+        let e = &elems[i];
+        let ld1 = usize::from(i == n - 1);
+        let elen = 1 + e.len;
+        let fits = if ld1 == 0 {
+            elen + 1 < p.ll.saturating_sub(col) && w + elen + 1 <= p.m
+        } else {
+            elen < p.ll.saturating_sub(col).saturating_sub(1) && w + elen + 1 <= p.m
+        };
+        if fits {
+            out.push(Chunk::Char(','));
+            out.push(e.chunk.clone());
+            col += elen;
+            w += elen;
+        } else {
+            // The break branch's `pp_element`: `WE = Ll` unless the element fits on
+            // a line of its own.
+            if e.len >= p.ll.saturating_sub(p.col0 + ld1) {
+                return None;
+            }
+            out.push(Chunk::Char(','));
+            out.push(Chunk::Char('\n'));
+            out.push(p.ind.clone());
+            out.push(e.chunk.clone());
+            col = p.col0 + e.len;
+            w = e.len;
+        }
+    }
+    if let Some(t) = tail {
+        let fits = t.len + 1 < p.ll.saturating_sub(col).saturating_sub(1)
+            && t.len + 1 + w + 1 <= p.m;
+        out.push(Chunk::Char(tail_sep));
+        if fits {
+            out.extend(t.chunk.clone().into_items());
+        } else {
+            out.push(Chunk::Char('\n'));
+            out.push(p.ind.clone());
+            out.extend(t.chunk.clone().into_items());
+        }
+    }
+    Some(Chunk::List(out))
+}
+
+/// `io_lib_pretty:pp/8` for a list (the `[ … ]` wrapper plus [`pp_atomic`]).
+fn reflow_list(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    ll: usize,
+    col: usize,
+    m: usize,
+) -> Result<Option<Chunk>> {
+    let mut heads: Vec<Eterm> = Vec::new();
+    let mut cur = term;
+    while is_list(cur) {
+        heads.push(car(cur));
+        cur = cdr(cur);
+    }
+    let tail_term = if is_nil(cur) { None } else { Some(cur) };
+    let mut elems = Vec::with_capacity(heads.len());
+    for &head in &heads {
+        match atomic_elem(ctx, head, printable)? {
+            Some(e) => elems.push(e),
+            None => return Ok(None),
+        }
+    }
+    if elems.is_empty() {
+        return Ok(None);
+    }
+    if elems.len() == 1 && tail_term.is_none() {
+        // A one-element container is always written flat.
+        return Ok(Some(term_chunk(ctx, term, printable, UNLIMITED_DEPTH)?));
+    }
+    let tail = match tail_term {
+        None => None,
+        Some(t) => match atomic_elem(ctx, t, printable)? {
+            Some(e) => Some(e),
+            None => return Ok(None),
+        },
+    };
+    let col0 = col + 1;
+    let ind = indent_chunk(1, &indent_base(col));
+    let p = PpCtx {
+        col0,
+        ll,
+        m,
+        w_first: 1,
+        w_after_first: 1 + elems[0].len,
+        ind: &ind,
+    };
+    match pp_atomic(&elems, tail.as_ref(), &p, '|') {
+        Some(body) => Ok(Some(Chunk::List(vec![
+            Chunk::Char('['),
+            body,
+            Chunk::Char(']'),
+        ]))),
+        None => Ok(None),
+    }
+}
+
+/// `io_lib_pretty:pp/8` for a tuple (the `{ … }` wrapper, with the tagged-tuple
+/// tag indentation of `pp_tag_tuple/10`).
+fn reflow_tuple(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    ll: usize,
+    col: usize,
+    m: usize,
+) -> Result<Option<Chunk>> {
+    let arity = tuple_size(term);
+    if arity <= 1 {
+        return Ok(None);
+    }
+    let mut elems = Vec::with_capacity(arity);
+    for i in 0..arity {
+        match atomic_elem(ctx, tuple_element(term, i), printable)? {
+            Some(e) => elems.push(e),
+            None => return Ok(None),
+        }
+    }
+    if is_atom(tuple_element(term, 0)) {
+        // Tagged: `pp_tag_tuple` with `TInd = -1` (the `cind/7` probe succeeds
+        // only while the tag is short; otherwise the oracle uses `4`/`1`).
+        let tag_ind = elems[0].len + 2;
+        if col + tag_ind >= ll / 2 {
+            return Ok(None);
+        }
+        let ind = indent_chunk(tag_ind, &indent_base(col));
+        let col0 = col + tag_ind;
+        let p = PpCtx {
+            col0,
+            ll,
+            m,
+            w_first: 1 + elems[0].len + 1,
+            w_after_first: 2 + elems[0].len,
+            ind: &ind,
+        };
+        return Ok(match pp_atomic(&elems[1..], None, &p, ',') {
+            // `[${, pp_tag_tuple(...), $}]` with `[Tag, $, | pp_list(...)]`.
+            Some(body) => {
+                let mut items = vec![Chunk::Char('{'), elems[0].chunk.clone(), Chunk::Char(',')];
+                items.extend(body.into_items());
+                items.push(Chunk::Char('}'));
+                Some(Chunk::List(items))
+            }
+            None => None,
+        });
+    }
+    let col0 = col + 1;
+    let ind = indent_chunk(1, &indent_base(col));
+    let p = PpCtx {
+        col0,
+        ll,
+        m,
+        w_first: 1,
+        w_after_first: 1 + elems[0].len,
+        ind: &ind,
+    };
+    Ok(match pp_atomic(&elems, None, &p, ',') {
+        Some(body) => Some(Chunk::List(vec![
+            Chunk::Char('{'),
+            body,
+            Chunk::Char('}'),
+        ])),
+        None => None,
+    })
+}
+
+/// `io_lib_pretty:pp/8` for a map (the `#{ … }` wrapper plus `pp_map/9`).
+fn reflow_map(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    ll: usize,
+    col: usize,
+    m: usize,
+) -> Result<Option<Chunk>> {
+    let (keys, values) = flatmap_pairs(term)?;
+    let mut pairs: Vec<(Eterm, Eterm)> = keys.into_iter().zip(values).collect();
+    if pairs.is_empty() {
+        return Ok(None);
+    }
+    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, ctx.atoms()));
+    let mut elems = Vec::with_capacity(pairs.len());
+    for (key, value) in &pairs {
+        let (kc, vc) = match (
+            atomic_elem(ctx, *key, printable)?,
+            atomic_elem(ctx, *value, printable)?,
+        ) {
+            (Some(k), Some(v)) => (k, v),
+            _ => return Ok(None),
+        };
+        let len = kc.len + 4 + vc.len; // key + " => " + value
+        let chunk = Chunk::List(vec![kc.chunk, Chunk::text(" => "), vc.chunk]);
+        elems.push(FlatElem { chunk, len });
+    }
+    if elems.len() == 1 {
+        // A one-pair map is always written flat.
+        return Ok(Some(term_chunk(ctx, term, printable, UNLIMITED_DEPTH)?));
+    }
+    let col0 = col + 2;
+    let ind = indent_chunk(2, &indent_base(col));
+    let p = PpCtx {
+        col0,
+        ll,
+        m,
+        w_first: 1,
+        // `pp_map/9` threads `PW` (the first pair's width) into the tail.
+        w_after_first: elems[0].len,
+        ind: &ind,
+    };
+    Ok(match pp_atomic(&elems, None, &p, ',') {
+        Some(body) => Some(Chunk::List(vec![
+            Chunk::Char('#'),
+            Chunk::Char('{'),
+            body,
+            Chunk::Char('}'),
+        ])),
+        None => None,
+    })
 }
 
 /// Renders `term` as one element chunk (`io_lib:write1/4` for `~w`, or

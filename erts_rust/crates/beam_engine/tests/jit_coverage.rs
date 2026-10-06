@@ -37,6 +37,8 @@
 //! | `bits/1` | match side + `bs_create_bin` append via helper | helper `Goto`/`Next` |
 
 use beam_common::{BeamError, Result};
+use beam_engine::jit::baseline::BaselineJit;
+use beam_engine::jit::JitBackend;
 use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier};
 use beam_loader::{load_file, Module};
 use beam_term::{is_small, make_atom, make_small, signed_value, Atom, Eterm};
@@ -47,6 +49,11 @@ const COVERAGE_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
     "/../beam_loader/tests/fixtures/coverage.beam"
 );
+
+/// The number of x-registers the baseline block emitter caches in machine
+/// registers (`CACHE_REGISTERS`), i.e. the budget past which a register is
+/// addressed directly in `machine.x`.
+const CACHE_BUDGET: u32 = 4;
 
 /// Resolve a name interned in the module's atom table.
 fn atom(module: &Module, name: &str) -> Atom {
@@ -455,4 +462,109 @@ fn the_append_segment_agrees_on_both_tiers() {
         &[2, 3, 1],
         "bits/1 rotates the leading byte to the end"
     );
+}
+
+// ---------------------------------------------------------------------------
+// Registers beyond the cache budget (direct `machine.x` addressing)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_fixture_stays_within_the_cache_budget() {
+    // The baseline emitter holds `CACHE_BUDGET` x-registers in machine registers;
+    // every x-register a block names **beyond** that budget is addressed directly in
+    // `machine.x`, and the artifact records the highest index the driver's
+    // `native_ok` guard has to cover.
+    //
+    // This fixture — idiomatic output of the system `erlc` — turns out to stay
+    // exactly inside the budget: a block's inline prefix ends at the first
+    // instruction the emitter does not lower, so a wide register only ever reaches
+    // machine code when the whole block up to it was inlined. That makes this a real
+    // regression guard (a change to the allocator or the inline set that starts
+    // addressing more registers shows up here), and it is why the wide-block path
+    // itself is covered by `tests/jit.rs`
+    // (`the_multi_register_blocks_touch_registers_beyond_the_cache`), which builds
+    // the IR explicitly.
+    let module = load();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile coverage.beam");
+    let cached = compiled
+        .highest_cached_register()
+        .expect("the fixture must cache some registers");
+    let native = compiled
+        .highest_native_register()
+        .expect("the fixture must touch some registers natively");
+    assert_eq!(cached, CACHE_BUDGET - 1, "the allocator fills the budget");
+    assert_eq!(
+        native, cached,
+        "coverage.beam is expected to stay inside the cache budget"
+    );
+    assert!(
+        native < beam_engine::MAX_REGISTER,
+        "the bound must be addressable in `machine.x`"
+    );
+}
+
+#[test]
+fn the_fixture_agrees_on_a_register_file_covering_exactly_the_native_bound() {
+    // A machine whose register file is exactly as long as the highest natively
+    // touched register is the tightest native entry the driver's guard allows; a
+    // shorter one (see `tests/jit.rs`) must stay on the interpreter step. Both must
+    // agree with the interpreter, result or typed error.
+    let module = load();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile coverage.beam");
+    let native = compiled
+        .highest_native_register()
+        .expect("the fixture must touch some registers natively");
+    let max_register = native + 1;
+
+    let mut ctx = context();
+    for (name, args) in [
+        ("tuple_ops", vec![terms::make_tuple(&mut ctx, &[make_small(1), make_small(2)]).unwrap()]),
+        ("classify", vec![make_small(7)]),
+        ("float_ops", vec![make_small(3), make_small(4)]),
+        ("map_ops", vec![make_atom(atom(&module, "a")), make_small(42)]),
+        ("bits", vec![terms::make_heap_binary(&mut ctx, &[1, 2, 3]).unwrap()]),
+    ] {
+        let mut interpreted = Machine::with_max_register(max_register);
+        let expected = interpreted.run_export(
+            &module,
+            atom(&module, name),
+            args.len() as u32,
+            &args,
+            &mut ctx,
+        );
+        for tier in NATIVE_TIERS {
+            let mut jitted = Machine::with_max_register(max_register);
+            let got = jitted.run_with_tier(
+                &module,
+                atom(&module, name),
+                args.len() as u32,
+                &args,
+                &mut ctx,
+                tier,
+            );
+            match (got, &expected) {
+                (Ok(got), Ok(expected)) => assert!(
+                    beam_term::cmp(got, *expected, &module.atom_table).is_eq(),
+                    "{name}/{} differs on {} with max_register={max_register}: {got:?} vs {expected:?}",
+                    args.len(),
+                    tier.name()
+                ),
+                (Err(got), Err(expected)) => assert_eq!(
+                    format!("{got:?}"),
+                    format!("{expected:?}"),
+                    "{name}/{} disagrees on the typed error with max_register={max_register}",
+                    args.len()
+                ),
+                (got, expected) => panic!(
+                    "{name}/{} disagrees on {} with max_register={max_register}: {got:?} vs {expected:?}",
+                    args.len(),
+                    tier.name()
+                ),
+            }
+        }
+    }
 }

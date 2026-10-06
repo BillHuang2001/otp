@@ -21,7 +21,8 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, AtomTable, Eterm};
 
-use crate::pid::ProcessId;
+use crate::pid::{PortId, ProcessId};
+use crate::remote::RemotePid;
 
 /// The well-known atom indices used to build signal messages.
 ///
@@ -31,18 +32,20 @@ pub struct SignalAtoms {
     exit: Atom,
     down: Atom,
     process: Atom,
+    port: Atom,
     normal: Atom,
     kill: Atom,
     killed: Atom,
 }
 
 impl SignalAtoms {
-    /// Interns `'EXIT'`, `'DOWN'`, `process`, `normal`, `kill` and `killed` in `t`.
+    /// Interns `'EXIT'`, `'DOWN'`, `process`, `port`, `normal`, `kill` and `killed` in `t`.
     pub fn from_table(t: &mut AtomTable) -> SignalAtoms {
         SignalAtoms {
             exit: t.intern("EXIT"),
             down: t.intern("DOWN"),
             process: t.intern("process"),
+            port: t.intern("port"),
             normal: t.intern("normal"),
             kill: t.intern("kill"),
             killed: t.intern("killed"),
@@ -64,7 +67,10 @@ impl SignalAtoms {
         self.process
     }
 
-    /// The `normal` atom.
+    /// The `port` atom (the tag of a `{'DOWN', …}` message about a port).
+    pub fn port(&self) -> Atom {
+        self.port
+    }    /// The `normal` atom.
     pub fn normal(&self) -> Atom {
         self.normal
     }
@@ -156,6 +162,24 @@ pub fn exit_policy(reason: Eterm, trapping: bool, atoms: &SignalAtoms) -> ExitPo
     }
 }
 
+/// Builds `{'EXIT', From, Reason}` on `heap`, with an arbitrary `from` term.
+///
+/// The general form of [`build_exit_message`]: link/exit propagation towards a **remote**
+/// pid needs the `from` slot to hold an external pid term rather than a local
+/// [`ProcessId`].
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when `heap` cannot fit the tuple.
+pub fn build_exit_message_term(
+    heap: &mut Heap,
+    atoms: &SignalAtoms,
+    from: Eterm,
+    reason: Eterm,
+) -> Result<Eterm> {
+    heap.tuple(&[make_atom(atoms.exit()), from, reason])
+}
+
 /// Builds `{'EXIT', From, Reason}` on `heap`.
 ///
 /// # Errors
@@ -167,7 +191,33 @@ pub fn build_exit_message(
     from: ProcessId,
     reason: Eterm,
 ) -> Result<Eterm> {
-    heap.tuple(&[make_atom(atoms.exit()), from.to_eterm(), reason])
+    build_exit_message_term(heap, atoms, from.to_eterm(), reason)
+}
+
+/// Builds `{'DOWN', Reference, Tag, Target, Reason}` on `heap`, with an arbitrary monitor
+/// tag (`process`/`port`) and an arbitrary `target` term.
+///
+/// The general form of [`build_down_message`]: a `{'DOWN', …}` about a **remote**
+/// process/port carries an external pid/port term in the target slot.
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when `heap` cannot fit the tuple.
+pub fn build_down_message_term(
+    heap: &mut Heap,
+    atoms: &SignalAtoms,
+    reference: Eterm,
+    tag: Atom,
+    target: Eterm,
+    reason: Eterm,
+) -> Result<Eterm> {
+    heap.tuple(&[
+        make_atom(atoms.down()),
+        reference,
+        make_atom(tag),
+        target,
+        reason,
+    ])
 }
 
 /// Builds `{'DOWN', Reference, process, Pid, Reason}` on `heap`.
@@ -182,13 +232,46 @@ pub fn build_down_message(
     pid: ProcessId,
     reason: Eterm,
 ) -> Result<Eterm> {
-    heap.tuple(&[
-        make_atom(atoms.down()),
-        reference,
-        make_atom(atoms.process()),
-        pid.to_eterm(),
-        reason,
-    ])
+    build_down_message_term(heap, atoms, reference, atoms.process(), pid.to_eterm(), reason)
+}
+
+/// Builds `{'DOWN', Reference, process, RemotePid, Reason}` on `heap`, materialising the
+/// remote target's external-pid term on that same heap.
+///
+/// This is what a dropped distribution connection queues on each of the dead node's
+/// monitors.
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when `heap` cannot fit the external pid thing and the tuple.
+pub fn build_down_message_remote(
+    heap: &mut Heap,
+    atoms: &SignalAtoms,
+    reference: Eterm,
+    remote: RemotePid,
+    reason: Eterm,
+) -> Result<Eterm> {
+    let target = remote.to_eterm(heap)?;
+    build_down_message_term(heap, atoms, reference, atoms.process(), target, reason)
+}
+
+/// Builds `{'DOWN', Reference, port, Port, Reason}` on `heap`.
+///
+/// The port analogue of [`build_down_message`]: the monitor tag slot carries the `port`
+/// atom rather than `process`, and the target is the port immediate (see
+/// `erts/emulator/beam/erl_monitor_link.c`).
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when `heap` cannot fit the tuple.
+pub fn build_down_message_port(
+    heap: &mut Heap,
+    atoms: &SignalAtoms,
+    reference: Eterm,
+    port: PortId,
+    reason: Eterm,
+) -> Result<Eterm> {
+    build_down_message_term(heap, atoms, reference, atoms.port(), port.to_eterm(), reason)
 }
 
 #[cfg(test)]
@@ -219,6 +302,7 @@ mod tests {
         assert_eq!(f.table.name(f.atoms.exit()), Some("EXIT"));
         assert_eq!(f.table.name(f.atoms.down()), Some("DOWN"));
         assert_eq!(f.table.name(f.atoms.process()), Some("process"));
+        assert_eq!(f.table.name(f.atoms.port()), Some("port"));
         assert_eq!(f.table.name(f.atoms.normal()), Some("normal"));
         assert_eq!(f.table.name(f.atoms.kill()), Some("kill"));
         assert_eq!(f.table.name(f.atoms.killed()), Some("killed"));
@@ -315,6 +399,32 @@ mod tests {
             assert_eq!(tuple_element(message, 1), reference);
             assert_eq!(tuple_element(message, 2), make_atom(atoms.process()));
             assert_eq!(tuple_element(message, 3), pid.to_eterm());
+            assert_eq!(tuple_element(message, 4), reason);
+        }
+    }
+
+    #[test]
+    fn build_down_message_port_has_arity_five_and_the_port_tag() {
+        let f = fixture();
+        let atoms = &f.atoms;
+        let mut heap = Heap::new(16).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference = crate::monitor::RefAllocator::new()
+            .next()
+            .to_eterm(&mut ref_heap)
+            .expect("the ref fits");
+        let port = PortId::new(42);
+        let reason = atoms.normal_term();
+        let message =
+            build_down_message_port(&mut heap, atoms, reference, port, reason).expect("fits");
+
+        // SAFETY: `message` is a live tuple written by `Heap::tuple`.
+        unsafe {
+            assert_eq!(tuple_size(message), 5);
+            assert_eq!(tuple_element(message, 0), make_atom(atoms.down()));
+            assert_eq!(tuple_element(message, 1), reference);
+            assert_eq!(tuple_element(message, 2), make_atom(atoms.port()));
+            assert_eq!(tuple_element(message, 3), port.to_eterm());
             assert_eq!(tuple_element(message, 4), reason);
         }
     }

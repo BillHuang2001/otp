@@ -210,6 +210,10 @@ pub(crate) fn int_from_f64(ctx: &mut BifContext<'_>, value: f64) -> Result<Eterm
 /// The `f64` nearest to an **integer** term, ties to even — the C `big_to_double`
 /// behind the oracle's `float/1`.
 ///
+/// The bignum case is the shared, canonical `big_to_double` port
+/// [`beam_term::number::big_to_f64`] (the LCA term-layout crate), not a local
+/// copy of the rounding algorithm.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-integer *and*
@@ -219,8 +223,9 @@ pub(crate) fn integer_to_f64(term: Eterm) -> Result<f64> {
         return Ok(signed_value(term) as f64);
     }
     if access::is_big(term) {
-        let (negative, digits) = beam_codec::term::big_parts(term)?;
-        return Big::from_parts(negative, digits).to_f64().map_err(|_| badarg());
+        // `None` is the C's `big_to_double(...) < 0`, which `float/1` reports as
+        // `badarg` (the oracle's `float(1 bsl 2000)`).
+        return beam_term::number::big_to_f64(term).ok_or_else(badarg);
     }
     Err(badarg())
 }
@@ -724,6 +729,10 @@ impl Big {
 
     /// The `f64` nearest to `self`, ties to even — the C `big_to_double`.
     ///
+    /// This is only for the crate's **internal** sign+magnitude value (mixed
+    /// int/float arithmetic on [`Num`]); the BIF-visible `Eterm` → `f64`
+    /// conversion is [`beam_term::number::big_to_f64`].
+    ///
     /// # Errors
     ///
     /// `badarith` when the magnitude is not representable as a finite `f64`
@@ -1034,6 +1043,10 @@ fn subtract_product(window: &mut [u64], factor: u64, divisor: &[u64]) -> bool {
 // ---------------------------------------------------------------------------
 
 /// The `f64` nearest to a magnitude, ties to even.
+///
+/// The internal sign+magnitude companion of [`beam_term::number::big_to_f64`] (the
+/// BIF-visible `Eterm` → `f64` conversion); this one serves the crate's internal
+/// arbitrary-precision `Big` arithmetic.
 ///
 /// # Errors
 ///

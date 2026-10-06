@@ -369,11 +369,10 @@ impl Tag {
     /// `true` for the required core set (integers, floats, all four atom tags,
     /// references, ports — including the modern `V4_PORT_EXT` — pids, tuples, `NIL`,
     /// strings, lists, binaries/bitstrings, maps of any pair count, funs/export
-    /// literals, the distribution atom-cache reference, `COMPRESSED` as a top-level
-    /// wrapper, and `LOCAL_EXT` as the `[local]` wrapper); `false` for everything the
-    /// codec either rejects as malformed ([`Tag::Fun`], [`Tag::NewCache`], and the
-    /// distribution header [`Tag::DistHeader`], which is never a term) **or**
-    /// deliberately reports as [`crate::error::unsupported`] (records, [`Tag::Record`]).
+    /// literals, native records, the distribution atom-cache reference, `COMPRESSED`
+    /// as a top-level wrapper, and `LOCAL_EXT` as the `[local]` wrapper); `false` for
+    /// everything the codec rejects as malformed ([`Tag::Fun`], [`Tag::NewCache`], and
+    /// the distribution header [`Tag::DistHeader`], which is never a term).
     ///
     /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
     /// but only as the outermost wrapper, immediately after the version byte
@@ -382,7 +381,9 @@ impl Tag {
     /// wherever it appears.
     ///
     /// `NEW_FUN_EXT`/`EXPORT_EXT` are covered: they decode to fun terms and encode
-    /// back byte-exactly (see `crate::decode`/`crate::encode`).
+    /// back byte-exactly (see `crate::decode`/`crate::encode`). `RECORD_EXT` (`67`) is
+    /// covered too: it decodes to a native-record term (`beam_term::record`) and
+    /// encodes back through the record family.
     pub fn covered(self) -> bool {
         matches!(
             self,
@@ -414,6 +415,7 @@ impl Tag {
                 | Tag::Map
                 | Tag::NewFun
                 | Tag::Export
+                | Tag::Record
                 | Tag::AtomCacheRef
                 | Tag::Compressed
                 | Tag::Local
@@ -464,7 +466,7 @@ mod tests {
         (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
         (Tag::DistHeader, 68, "DIST_HEADER", false),
         (Tag::NewCache, 78, "NEW_CACHE", false),
-        (Tag::Record, 67, "RECORD_EXT", false),
+        (Tag::Record, 67, "RECORD_EXT", true),
     ];
 
     #[test]

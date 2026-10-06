@@ -20,10 +20,14 @@
 //!
 //! A **correct single-OS-thread** core: one [`Scheduler`], no thread pools, no dirty
 //! schedulers, no lock-free/threaded run queues and no cross-scheduler barrier beyond the
-//! documented single-scheduler [`ThreadProgress`] stub. Multi-scheduler balancing, the
-//! decoupled signal queue, priority run queues, the process dictionary and
-//! distribution-wide links/monitors are documented follow-ups (see the crate
-//! `CONTEXT.md`, Known Issues).
+//! documented single-scheduler [`ThreadProgress`] stub. The run queue is served
+//! highest-priority first (max/high/normal/low — see [`RunQueue`]), though the C's shared
+//! NORMAL/LOW physical queue with the `schedule_count` deferral is approximated by four
+//! distinct FIFOs. Exit/link/monitor signals are **decoupled**: they are queued on the
+//! receiver ([`SignalQueue`]) and applied at schedule-in (or eagerly, for a receiver that is
+//! not currently executing — see [`ProcessTable::service_signals`]). Multi-scheduler balancing
+//! and distribution-wide links/monitors are documented follow-ups (see the crate `CONTEXT.md`,
+//! Known Issues).
 //!
 //! # Contracts
 //!
@@ -34,8 +38,9 @@
 //!   [`beam_common::Result`] — never a crate-local error enum, never a panic on runtime
 //!   data and never a swallowed error.
 //! * **Root set** (§4/§5): `x_reg_array[0..Live)` plus the whole Erlang stack, with no
-//!   frame liveness maps; [`Process::collect`] gathers the registers and the mailbox
-//!   payloads into a flat root slice for `beam_gc`.
+//!   frame liveness maps; [`Process::collect`] gathers the registers, the mailbox payloads,
+//!   the process dictionary ([`Dict`]), the saved BIF/NIF arguments ([`SavedArgs`]) and the
+//!   pending-signal queue ([`SignalQueue`]) into a flat root slice for `beam_gc`.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.{c,h}`,
 //! `erl_proc_sig_queue.c`, `erl_monitor_link.c`, `erl_ptab.{c,h}`, `erl_process_dict.c`
@@ -43,40 +48,55 @@
 
 #![warn(missing_docs)]
 
+pub mod dict;
+pub mod fragments;
 pub mod link;
 pub mod monitor;
 pub mod pid;
+pub mod port;
 pub mod process;
 pub mod progress;
 pub mod ptab;
 pub mod registers;
+pub mod remote;
 pub mod run_queue;
 pub mod scheduler;
 pub mod signal;
+pub mod signal_queue;
 
 mod error; // pub(crate) constructors only — NOT public
 
+pub use crate::dict::*;
+pub use crate::fragments::*;
 pub use crate::link::*;
 pub use crate::monitor::*;
 pub use crate::pid::*;
+pub use crate::port::*;
 pub use crate::process::*;
 pub use crate::progress::*;
 pub use crate::ptab::*;
 pub use crate::registers::*;
+pub use crate::remote::*;
 pub use crate::run_queue::*;
 pub use crate::scheduler::*;
 pub use crate::signal::*;
+pub use crate::signal_queue::*;
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
+    pub use crate::dict::*;
+    pub use crate::fragments::*;
     pub use crate::link::*;
     pub use crate::monitor::*;
     pub use crate::pid::*;
+    pub use crate::port::*;
     pub use crate::process::*;
     pub use crate::progress::*;
     pub use crate::ptab::*;
     pub use crate::registers::*;
+    pub use crate::remote::*;
     pub use crate::run_queue::*;
     pub use crate::scheduler::*;
     pub use crate::signal::*;
+    pub use crate::signal_queue::*;
 }

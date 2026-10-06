@@ -10,7 +10,7 @@
 //! | IR variant | C body | semantics |
 //! |---|---|---|
 //! | `Fmove`   | `fload`/`fstore` (`emu/ops.tab:1337-1338`) | copy a float between an FR slot and a value register / literal |
-//! | `Fconv`   | `i_fconv` (`:38-52`) | small int / bignum / float → FR; otherwise `badarith` (`$BADARITH0`) |
+//! | `Fconv`   | `i_fconv` (`:38-52`) | small int / float / bignum (faithful `big_to_double`) → FR; otherwise `badarith` (`$BADARITH0`) |
 //! | `Fadd`/`Fsub`/`Fmul`/`Fdiv` | `i_f{add,sub,mul,div}` (`:62-76`) | `Dst = Src1 op Src2`; a **non-finite** result is `badarith` |
 //! | `Fnegate` | `i_fnegate` (`:78-84`) | `Dst = -Src`; flipping a finite float's sign stays finite, so no finiteness check |
 //!
@@ -39,10 +39,15 @@
 //!   [`BeamError::BadArith`]. The compiler only ever emits `NO_FAIL` for these
 //!   opcodes (verified with `beam_disasm` against the oracle), so the live-label
 //!   branch is engine-side robustness, exactly like `GcBif`.
-//! * `Fconv` carries **no** fail label: a non-numeric source always raises
-//!   `badarith` through the same catch machinery. A *bignum* source is a documented
-//!   M1 coverage gap (no safe wide-integer → `f64` conversion exists yet) and
-//!   yields a typed [`crate::error::unsupported`].
+//! * `Fconv` carries **no** fail label: a non-numeric source, and a bignum whose
+//!   magnitude is too large for a finite double, both raise `badarith` through the
+//!   same catch machinery.
+//! * `Fconv` of a *bignum* source is the faithful `big_to_double` conversion
+//!   (`i_fconv` → `../../erts/emulator/beam/big.c:2412`, via
+//!   [`beam_term::number::big_to_f64`]): the nearest double, ties to even, exactly
+//!   as the oracle computes it. A bignum that is not a finite double
+//!   (`bitlen > 1024`, or one rounding up to `2^1024`) is C's `< 0` failure, so it
+//!   is the `badarith` raise — never a silently wrong float.
 //! * An operand the shared seam cannot evaluate (out-of-range register, unsupported
 //!   operand kind) propagates unchanged — that is a malformed/unsupported program,
 //!   not a value error, and must not be masked as `badarith`.
@@ -51,6 +56,7 @@ use std::collections::BTreeMap;
 
 use beam_common::{BeamError, ExceptionClass, Result};
 use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
+use beam_term::number::big_to_f64;
 use beam_term::{is_small, make_atom, signed_value, Eterm};
 
 use crate::context::ExecutionContext;
@@ -87,17 +93,15 @@ pub(crate) fn exec(
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
-        // `fconv Src Dst` — integer/float → float register. No fail label.
+        // `fconv Src Dst` — small int / float / bignum → float register. No fail label.
         Instr::Fconv { src, dst } => {
             let source = read_value(machine, module, ctx, src)?;
-            let value = match conv_to_float(ctx, source) {
-                Ok(value) => value,
-                // A non-numeric source is the `$BADARITH0` raise; `fconv` has no
-                // fail label, so it goes through the catch machinery.
-                Err(BeamError::BadArith) => return raise_badarith(machine, module).map(Some),
-                // Everything else (the bignum coverage gap, a structural operand
-                // error) is not a `badarith` value error and propagates unchanged.
-                Err(other) => return Err(other),
+            let value = match conv_to_float(ctx, source)? {
+                Conv::Value(value) => value,
+                // A non-numeric source, and a bignum that is not a finite double, are
+                // both the `$BADARITH0` raise; `fconv` has no fail label, so it goes
+                // through the catch machinery.
+                Conv::BadArith => return raise_badarith(machine, module).map(Some),
             };
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
@@ -272,25 +276,41 @@ fn raise_badarith(machine: &mut Machine, module: &Module) -> Result<Step> {
     machine.throw_error(make_atom(atom))
 }
 
-/// `fconv`: a small integer or a float → the boxed float for `Dst`.
+/// The outcome of a `fconv` source conversion.
+enum Conv {
+    /// The boxed float term to store in the destination register.
+    Value(Eterm),
+    /// C's `i_fconv` conversion failure, which `$BADARITH0` turns into the
+    /// `badarith` raise.
+    BadArith,
+}
+
+/// `fconv`: a small integer, a float or a bignum → the boxed float for `Dst`.
 ///
 /// `fconv` carries no fail label, so every failure is a raise
-/// (`emu/float_instrs.tab:38-52` calls `$BADARITH0`).
-fn conv_to_float(ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Eterm> {
+/// (`emu/float_instrs.tab:38-52` calls `$BADARITH0`). A small int is the C
+/// `SMALL_TO_DOUBLE` path; a float is `LOAD_DOUBLE` (the value is unchanged); a
+/// bignum is `big_to_double` (`../../erts/emulator/beam/big.c:2412`) via
+/// [`beam_term::number::big_to_f64`], whose `None` is exactly C's `< 0` failure — a
+/// value that is not a finite double. A non-number is the raise too.
+fn conv_to_float(ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Conv> {
     if is_small(source) {
-        return make_float(ctx, signed_value(source) as f64);
+        return Ok(Conv::Value(make_float(ctx, signed_value(source) as f64)?));
     }
     if predicates::is_float(source) {
         // Float → float is the C `LOAD_DOUBLE` path: the value is unchanged.
-        return Ok(source);
+        return Ok(Conv::Value(source));
     }
     if predicates::is_number(source) {
-        // A bignum: the C path is `big_to_double`. M1 has no *safe* wide-integer →
-        // `f64` conversion (`beam_term`'s is `unsafe`, and this module is safe
-        // Rust), so this documented coverage gap is reported, never guessed.
-        return Err(error::unsupported("fconv: bignum"));
+        // A bignum: `big_to_double` is a faithful round-to-nearest (ties to even)
+        // conversion; `None` is the C's `< 0` (the magnitude is too large for a
+        // finite double), which `i_fconv` turns into `badarith`.
+        return Ok(match big_to_f64(source) {
+            Some(value) => Conv::Value(make_float(ctx, value)?),
+            None => Conv::BadArith,
+        });
     }
-    Err(BeamError::BadArith)
+    Ok(Conv::BadArith)
 }
 
 /// Evaluate a float instruction's operand.
@@ -535,6 +555,68 @@ mod tests {
             Err(_) => {}
             Ok(_) => panic!("expected an error"),
         }
+    }
+
+    #[test]
+    fn fconv_converts_a_representable_bignum_to_the_nearest_double() {
+        // The sources below are *bignums* (outside the 60-bit immediate range), so
+        // `fconv` takes the faithful `big_to_double` path rather than the small-int
+        // cast. Every expected value is the oracle's:
+        // `erl -noshell -eval 'io:format("~.17e~n",[float(1 bsl 60)])'` etc.
+        let cases: [(i64, f64); 4] = [
+            // 2^60 — exact.
+            (1i64 << 60, 2.0f64.powi(60)),
+            // 10^18 = 2^18 * 5^18 — exact.
+            (1_000_000_000_000_000_000, 1.0e18),
+            // 2^60 + 1 rounds down to the nearest double, 2^60.
+            ((1i64 << 60) + 1, 2.0f64.powi(60)),
+            // -(2^60) keeps the sign.
+            (-(1i64 << 60), -(2.0f64.powi(60))),
+        ];
+        for (source_value, expected) in cases {
+            let mut machine = Machine::new();
+            let mut ctx = MinimalContext::new();
+            let source = crate::terms::make_integer(&mut ctx, source_value)
+                .expect("the arena builds a bignum");
+            assert!(!is_small(source), "{source_value} must be a bignum");
+            machine.set_x(0, source).unwrap();
+            let instr = Instr::Fconv {
+                src: Operand::X(0),
+                dst: Operand::FloatReg(0),
+            };
+            assert_eq!(
+                step(&mut machine, &no_labels(), &instr, &mut ctx).unwrap(),
+                Some(Step::Next)
+            );
+            let stored = machine.get_fr(0).expect("the FR slot is written");
+            assert_eq!(
+                float_value(stored).unwrap(),
+                expected,
+                "fconv({source_value})"
+            );
+        }
+    }
+
+    #[test]
+    fn fconv_rounds_a_small_int_beyond_2_pow_53_to_the_nearest_double() {
+        // `2^53 + 1` is still an immediate (`MAX_SMALL = 2^59 - 1`), so `fconv` takes
+        // the small-int cast; that cast must round to nearest, ties to even
+        // (`float(9007199254740993)` = `9.0071992547409920e+15`).
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let source = make_small((1i64 << 53) + 1);
+        assert!(is_small(source));
+        machine.set_x(0, source).unwrap();
+        let instr = Instr::Fconv {
+            src: Operand::X(0),
+            dst: Operand::FloatReg(0),
+        };
+        assert_eq!(
+            step(&mut machine, &no_labels(), &instr, &mut ctx).unwrap(),
+            Some(Step::Next)
+        );
+        let stored = machine.get_fr(0).expect("the FR slot is written");
+        assert_eq!(float_value(stored).unwrap(), 2.0f64.powi(53));
     }
 
     // -- fadd / fsub / fmul / fdiv --------------------------------------------

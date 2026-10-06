@@ -4,11 +4,13 @@
 //! [`VERSION_MAGIC`](crate::VERSION_MAGIC)) and distribution payload/ETS bodies
 //! (without it) — the constructor decides which. Term inspection goes through
 //! [`crate::term`]; this module owns only the *bytes*. The fun/export encoders
-//! live in the child [`fun`] module, as a second `impl` block on [`Encoder`].
+//! live in the child [`fun`] module and the native-record encoder in the child
+//! [`record`] module, each as a second `impl` block on [`Encoder`].
 //!
-//! This module is safe Rust, like its child [`fun`].
+//! This module is safe Rust, like its children [`fun`] and [`record`].
 
 mod fun;
+mod record;
 
 use beam_common::Result;
 use beam_term::prelude::{atom_val, is_atom, is_list, is_nil, is_small, signed_value};
@@ -19,13 +21,14 @@ use crate::error;
 use crate::tag::{
     ATOM_CACHE_REF_EXT, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT,
     INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT,
-    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT,
-    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
+    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT,
+    SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT,
+    Tag,
 };
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
-    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, tuple_arity,
-    tuple_element,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, is_record,
+    tuple_arity, tuple_element,
 };
 use crate::writer::Writer;
 
@@ -142,6 +145,12 @@ impl<'a> Encoder<'a> {
         if let Ok(kind) = fun_kind_term(term) {
             return self.encode_fun(term, kind);
         }
+        // Native records likewise: a record header carries its own subtag
+        // (`RECORD_SUBTAG`), so `is_record` cannot collide with the tuple probe
+        // below (`Tag::Record`, `external.c:4006-4036`).
+        if is_record(term) {
+            return self.encode_record(term);
+        }
         if let Ok((negative, digits)) = big_parts(term) {
             return self.encode_bignum(negative, digits);
         }
@@ -169,9 +178,9 @@ impl<'a> Encoder<'a> {
             return self.encode_bitstring(bytes, offset_bits, size_bits);
         }
         // Anything else is not representable by the M1 term layer (in practice an
-        // off-heap `BinRef`/`Record` block, which the Stage-0 foundations cannot
-        // build): report it explicitly rather than emit a wrong encoding. Tests never
-        // reach this path.
+        // off-heap `BinRef` block, which the Stage-0 foundations cannot build):
+        // report it explicitly rather than emit a wrong encoding. Tests never reach
+        // this path.
         Err(error::unsupported(Tag::Binary))
     }
 
@@ -479,15 +488,26 @@ impl<'a> Encoder<'a> {
         self.buf.into_vec()
     }
 
-    /// Consumes the encoder, compressing the written term into a `COMPRESSED`
-    /// (`80`) `term_to_binary` image at zlib `level` (`0..=9`).
+    /// Consumes the encoder, producing a `COMPRESSED` (`80`) `term_to_binary` image
+    /// at zlib `level` (`0..=9`) — **or the plain image when compression does not
+    /// help**.
     ///
     /// The written term is the *inner body*: the bytes the encoder produced, minus a
     /// leading [`VERSION_MAGIC`](crate::VERSION_MAGIC) if [`Encoder::new`] wrote one
     /// (a term body never starts with `131`, which is not a tag, so stripping it when
-    /// present is unambiguous). The result is
-    /// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]` — the wire layout
-    /// `erlang:term_to_binary(Term, [compressed])` produces (`external.c:2289-2297`).
+    /// present is unambiguous).
+    ///
+    /// When the zlib stream is small enough that the wrapper still shrinks the image
+    /// the result is `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`
+    /// (`external.c:2289-2297`). The wrapper costs 5 bytes (`COMPRESSED_EXT` + the
+    /// 4-byte size), so — exactly as the C does with a `dest_len` of `body_len - 5`
+    /// (`external.c:2276-2298`) — the wrapper is emitted only when the stream fits in
+    /// `body_len - 5` bytes; otherwise the **plain** image
+    /// `[VERSION_MAGIC][body]` is returned instead (compression was requested but is
+    /// not profitable, and `erlang:term_to_binary/2` yields the uncompressed image
+    /// then). A body shorter than 5 bytes can never fit the wrapper and always
+    /// reverts.
+    ///
     /// (The deflate bytes themselves are implementation-defined: zlib and
     /// `miniz_oxide` emit different, equally valid streams for the same body.)
     ///
@@ -500,12 +520,26 @@ impl<'a> Encoder<'a> {
         let body: &[u8] = buf.strip_prefix(&[crate::VERSION_MAGIC]).unwrap_or(&buf);
         let size = u32::try_from(body.len()).map_err(|_| error::system_limit())?;
 
-        let mut out = Writer::with_capacity(body.len() + 6);
-        out.u8(crate::VERSION_MAGIC);
-        out.u8(COMPRESSED_EXT);
-        out.u32be(size);
-        out.bytes(&crate::compress::compress(body, level)?);
-        Ok(out.into_vec())
+        // The C compresses into a `body_len - 5`-byte destination and keeps the
+        // plain image when that overflows (`external.c:2276-2298`): the 5 bytes are
+        // the `COMPRESSED_EXT` tag plus the 4-byte size field the wrapper adds.
+        match compress_if_smaller(body, level)? {
+            Some(stream) => {
+                let mut out = Writer::with_capacity(body.len() + 6);
+                out.u8(crate::VERSION_MAGIC);
+                out.u8(COMPRESSED_EXT);
+                out.u32be(size);
+                out.bytes(&stream);
+                Ok(out.into_vec())
+            }
+            None => {
+                // Reverted to the plain image: `[VERSION_MAGIC][body]`.
+                let mut out = Writer::with_capacity(body.len() + 1);
+                out.u8(crate::VERSION_MAGIC);
+                out.bytes(body);
+                Ok(out.into_vec())
+            }
+        }
     }
 
     /// Consumes the encoder, wrapping the written term in a `LOCAL_EXT` (`121`)
@@ -575,6 +609,25 @@ fn strip_high_zero_bytes(digits: &[u8]) -> &[u8] {
     &digits[..end]
 }
 
+/// zlib-compresses `body`, returning the stream **only when the 5-byte
+/// `COMPRESSED` wrapper still shrinks the image** — the destination-capacity rule
+/// the C applies (`external.c:2276-2298`).
+///
+/// The C compresses into a buffer of `body_len - 5` bytes (`0` when `body_len < 5`)
+/// and keeps the plain image when `compress2` reports `Z_BUF_ERROR`. Equivalently:
+/// the wrapper is used only when `stream.len() + 5 <= body_len`, i.e.
+/// `stream.len() <= body_len - 5`. A body shorter than 5 bytes can never satisfy
+/// this (a non-empty zlib stream is always longer than 0), so it always reverts.
+///
+/// A `level` outside `0..=9` never reaches here (the caller rejected it); any zlib
+/// failure propagates as `BeamError::BadArg`.
+fn compress_if_smaller(body: &[u8], level: u8) -> Result<Option<Vec<u8>>> {
+    let Some(cap) = body.len().checked_sub(5) else {
+        return Ok(None);
+    };
+    let stream = crate::compress::compress(body, level)?;
+    Ok(if stream.len() <= cap { Some(stream) } else { None })
+}
 /// Repacks `size_bits` significant bits — MSB-first inside each byte — from bit
 /// `offset_bits` of `bytes` into exactly `n_bytes = ceil(size_bits / 8)` output
 /// bytes, with the significant bits starting at bit 0 and the unused trailing bits
@@ -646,17 +699,20 @@ pub fn encode_term_body(term: Eterm, atoms: &AtomTable) -> Result<Vec<u8>> {
 }
 
 /// Encodes `term` as a compressed `term_to_binary` image:
-/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`.
+/// `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]` — **or** the plain
+/// `[VERSION_MAGIC][body]` image when compression does not shrink the term.
 ///
 /// The term is encoded uncompressed first (the `zlib` stream is the *inner* body, so
 /// it never contains the version byte), then deflated at zlib `level`. This is the
 /// byte layout of `erlang:term_to_binary(Term, [{compressed, Level}])`
-/// (`external.c:2289-2297`), and it is exactly what [`encode_term`] would produce if
-/// compression had not helped — the C falls back to the uncompressed image in that
-/// case; this entry point always emits the compressed wrapper because compression was
-/// explicitly requested.
+/// (`external.c:2289-2297`), which reverts to the uncompressed image whenever zlib
+/// cannot fit the stream into `body_len - 5` bytes — the space the 5-byte wrapper
+/// itself costs (`external.c:2276-2298`). The revert is applied by
+/// [`Encoder::finish_compressed`], so a small term (e.g. `[1,2,3]`) yields exactly
+/// what [`encode_term`] would.
 ///
-/// The default [`encode_term`] stays uncompressed: the wrapper is emitted only here.
+/// The default [`encode_term`] stays uncompressed: the wrapper is emitted only here
+/// (and only when it helps).
 pub fn encode_term_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_body(atoms);
     encoder.encode(term)?;
@@ -669,11 +725,15 @@ pub fn encode_term_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Resu
 /// blob form, where the version byte is not part of the body).
 ///
 /// The inner bytes are the term body (as [`encode_term_body`]); the 4-byte size is
-/// that body's length, version byte excluded.
+/// that body's length, version byte excluded. When compression does not shrink the
+/// term, [`encode_term_compressed`] returns the plain image `[VERSION_MAGIC][body]`
+/// and this entry point drops that version byte, yielding the plain `[body]` — so
+/// the result is always a valid body either way.
 pub fn encode_term_body_compressed(term: Eterm, atoms: &AtomTable, level: u8) -> Result<Vec<u8>> {
     let image = encode_term_compressed(term, atoms, level)?;
-    // Drop the leading `VERSION_MAGIC`; everything else (tag, size, zlib stream) is
-    // already the body form. `encode_term_compressed` guarantees the version byte.
+    // Drop the leading `VERSION_MAGIC`; everything else (tag, size, zlib stream — or
+    // just the plain body) is already the body form. Both `finish_compressed` forms
+    // start with the version byte, which a term body never does.
     Ok(image[1..].to_vec())
 }
 

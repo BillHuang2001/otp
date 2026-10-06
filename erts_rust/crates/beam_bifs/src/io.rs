@@ -49,23 +49,43 @@
 //! is smaller than the field width when the directive forbids it, a wrong argument
 //! type or count for a directive, running out of arguments, leaving arguments
 //! unconsumed, a `~` at the end of the format, a `~-<n>p`/`~-p` (a left-adjusted
-//! `~p`, which has no clause in `io_lib_format`), and a `~p`/`~P` whose single-line
-//! rendering would have to be re-flowed (see below).
+//! `~p`, which has no clause in `io_lib_format`), and a `~p`/`~P` of a long
+//! container outside the re-flow model (see below).
+//!
+//! # `~p`/`~P` re-flow (`io_lib_pretty`)
+//!
+//! The oracle prints a container under `~p`/`~P` with `io_lib_pretty`, which
+//! breaks it across lines exactly when its single-line rendering is **at least**
+//! `line_length - column` characters long (`line_length` is 80 by default, or the
+//! directive's field width; `column` is 1 by default, or the directive's
+//! precision). Terms the oracle never breaks — `~p` of an atom, number, ref, pid,
+//! fun, **printable** list or **printable** binary — are always emitted on one
+//! line however long.
+//!
+//! This engine reproduces the break ([`crate::print::pretty_chunk`]) for a
+//! **proper or improper list, a tagged or untagged tuple, and a map** each of
+//! whose elements renders single-line, at unlimited depth. It wraps with a break
+//! separator `,` (an improper-list tail uses `|`), indenting continuation lines by
+//! one space, by `tag_len + 2` after a tuple tag, and by two after `#{`; the
+//! narrowest repro is the oracle's own boundary —
+//! `io_lib:format("~p", [lists:seq(1,29)])` (79 chars) returns `[1,…,28,` / ` 29]`
+//! (a break after the 28th element, one-space indent), while `lists:seq(1,28)`
+//! (76 chars) and `lists:seq(1,28) ++ [x]` (78 chars) stay on one line. The flat
+//! condition is the oracle's `length < line_length - column`
+//! (`io_lib_pretty:print/10`, erts-17.1).
+//!
+//! Re-flow is **not** modelled for a container holding another container (nested
+//! re-flow), an element too long to fit on a line of its own, a non-printable
+//! bitstring (`pp_binary` packs its own number of bytes per line), a long tuple
+//! tag (`cind/7` then selects a different indent), or a depth-limited `~P`; those
+//! raise the typed `error:badarg` rather than emit a line the oracle would have
+//! broken differently — never a wrong string.
 //!
 //! # Deviations from the oracle (documented)
 //!
 //! * **Output is a Rust `String` (UTF-8).** Raw format bytes `>= 128` and
 //!   `~s`/`~c` values `>= 128` are emitted as their UTF-8 encoding, not raw latin1
 //!   bytes. The ASCII subset is byte-exact.
-//! * **No `~p`/`~P` re-flow.** The oracle runs `io_lib_pretty`, which can break a
-//!   term across lines to fit `line_length` (80 by default, or a `~p` field width).
-//!   This engine always emits the single-line form of [`crate::print`]; when a
-//!   term class that the oracle *would* re-flow (a tuple, a map, a non-printable
-//!   list, or a non-printable bitstring) does not satisfy the oracle's flat
-//!   condition (`length < line_length - column`), the directive is rejected with
-//!   `badarg` rather than emitting a line the oracle would have broken. Terms that
-//!   never re-flow (`~p` of an atom, number, ref, pid, printable list or printable
-//!   binary) are always emitted.
 //! * **`~k`/`~K` are rejected.** They select a *map printing order*; this engine's
 //!   printer always uses the flatmap internal order, so honouring them is not
 //!   possible and a silent wrong order is worse than `badarg`.
@@ -89,14 +109,14 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple, tuple_element, tuple_size,
+    float_value, is_atom, is_float, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::print::{
-    adjust_chunk, dup_chars, field_chunk, flatten, proper_list, string_field_chunk, term_chunk,
-    Chunk, UNLIMITED_DEPTH,
+    adjust_chunk, dup_chars, field_chunk, flatten, pretty_chunk, proper_list, string_field_chunk,
+    term_chunk, Chunk, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -726,8 +746,10 @@ fn byte_string(elems: &[Eterm]) -> Result<String> {
     Ok(out)
 }
 
-/// `io_lib_format:print/…` for `~p`/`~P`: the printable single-line rendering,
-/// guarded against the re-flow the oracle applies (see the module docs).
+/// `io_lib_format:print/…` for `~p`/`~P`: the printable rendering, re-flowed the
+/// way `io_lib_pretty` breaks a container across lines when it does not fit
+/// `line_length - column` (see [`crate::print::pretty_chunk`] and the module docs
+/// for the supported forms and the remaining gap).
 fn render_p(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -739,51 +761,10 @@ fn render_p(
         // A left-adjusted `~p`/`~P` has no clause in `io_lib_format`.
         return Err(badarg());
     }
-    let chunk = term_chunk(ctx, term, printable, depth)?;
     let line_length = spec.width.unwrap_or(80);
     let column = spec.precision.unwrap_or(1);
-    if reflowable(term) && chunk.flat_len() >= line_length.saturating_sub(column) {
-        // The oracle would break this across lines; we cannot reproduce that.
-        return Err(badarg());
-    }
-    Ok(chunk)
+    pretty_chunk(ctx, term, printable, depth, line_length, column)
 }
-
-/// Whether the oracle's `io_lib_pretty` may break `term` across lines (a tuple,
-/// map, non-printable list, or non-printable bitstring) rather than printing it
-/// flat like an atom, number, ref, printable string or printable binary.
-fn reflowable(term: Eterm) -> bool {
-    if is_tuple(term) || is_map(term) {
-        return true;
-    }
-    if bits::is_bitstring(term) {
-        return !binary_printable(term);
-    }
-    if is_list(term) {
-        return !list_printable(term);
-    }
-    false
-}
-
-/// Whether `term` is a non-empty proper list of small integers in `32..=126`
-/// (the printable-string rule of [`crate::print`]).
-fn list_printable(term: Eterm) -> bool {
-    match proper_list(term) {
-        Some(elems) if !elems.is_empty() => elems.iter().all(|&e| {
-            is_small(e) && (32..=126).contains(&signed_value(e))
-        }),
-        _ => false,
-    }
-}
-
-/// Whether `term` is a non-empty binary whose every byte is in `32..=126`.
-fn binary_printable(term: Eterm) -> bool {
-    match bits::bytes(term) {
-        Ok(bytes) if !bytes.is_empty() => bytes.iter().all(|&b| (32..=126).contains(&b)),
-        _ => false,
-    }
-}
-
 /// `io_lib_format:term/6` — the field-width / truncation rule for a term
 /// rendering (`~w`/`~W` and the integer directives).
 fn term_field(chunk: Chunk, spec: &Spec) -> Chunk {
@@ -1565,15 +1546,21 @@ mod tests {
     }
 
     #[test]
-    fn print_of_a_long_container_is_badarg_instead_of_misformatted() {
-        // The oracle would re-flow a 40-element list under `~p`; we reject rather
-        // than emit a single line the oracle would have broken.
-        let (_, result) = run_io("~p", |ctx| {
+    fn print_of_a_long_container_reflows_like_the_oracle() {
+        // The oracle breaks a 40-element list under `~p` at the 80-column default;
+        // erts-17.1 `io:format("~p",[lists:seq(0,39)])` is exactly:
+        //   [0,1,…,27,28,
+        //    29,…,39]
+        let (output, result) = run_io("~p", |ctx| {
             let elems: Vec<Eterm> = (0..40).map(|i| ctx.int(i).expect("fits")).collect();
             let list = ctx.list(&elems).expect("fits");
             one(ctx, list)
         });
-        assert!(matches!(result, Err(BeamError::BadArg)));
+        assert!(result.is_ok(), "re-flowed: {result:?}");
+        assert_eq!(
+            output,
+            "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,\n 29,30,31,32,33,34,35,36,37,38,39]"
+        );
 
         // A short list is fine.
         let (output, result) = run_io("~p", |ctx| {

@@ -7,28 +7,56 @@
 //! link targets / watchers, then mutate each target transiently. A [`Process`] itself
 //! holds only its own sets (see the crate `CONTEXT.md`, Design Decisions).
 //!
-//! Milestone-1 is single-threaded, so the table owns the `Process` values directly and
-//! propagates exit signals, links and monitors **synchronously** through a worklist inside
-//! [`ProcessTable::terminate`]/[`ProcessTable::apply_exit_signal`], instead of the C's
-//! decoupled per-process signal queue serviced at schedule-in — a documented follow-up.
+//! # Decoupled, ordered signals
+//!
+//! Exit/link/monitor signals are **never applied where they are generated**. A signalling
+//! operation *enqueues* a [`PendingSignal`] on the receiver's own
+//! [`SignalQueue`](crate::signal_queue::SignalQueue) — copying the reason into the receiver's
+//! heap so it survives the signaller's death — and the signal is applied later:
+//!
+//! * **at the receiver's schedule-in**, through [`ProcessTable::service_signals`] (the
+//!   scheduler calls it on the dequeued pid before running it); and
+//! * **eagerly at the end of the sending operation**, for a receiver that is **not** the
+//!   currently executing process (ERTS's early signal handling). "Currently executing" is
+//!   [`ProcessState::Running`]: the single scheduler sets it before a runner runs, so at most
+//!   one process is `Running` at a time, and a signal to that process is deferred to its next
+//!   schedule-in. This choice is what preserves the observable end state of a synchronous
+//!   propagation (a signal to a blocked/idle peer is still applied before the caller returns).
+//!
+//! Servicing drains a receiver's queue **in FIFO order** and applies each signal through
+//! [`exit_policy`] (terminate / trap as `{'EXIT', …}` / ignore) or builds the `{'DOWN', …}`
+//! message. A termination cascades through an explicit worklist (the pending-service queue),
+//! never through recursion, so a link cycle (A↔B) terminates in a bounded number of steps.
+//! [`crate::signal_queue`] states the exact ordering guarantee (and its limits).
+//!
+//! A local **link exit** and a local **monitor-DOWN** go through the queue. A **remote**
+//! (external-pid) or **port** signal does not: it would carry no `trap_exit` policy decision
+//! to defer, so `node_down`/`port_closed` materialise it straight into the mailbox.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_ptab.{c,h}` (the process/port
 //! table and the local name registry), `erl_process.c` (`erts_ptab_new_process`) and
-//! `erl_proc_sig_queue.c` (the signal queue being simplified away).
+//! `erl_proc_sig_queue.c` (the signal queue this module reproduces).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_gc::HeapPolicy;
-use beam_message::{copy_struct, CopyContext, Message, MsoHandle, OffHeapTable};
-use beam_term::prelude::{Atom, Eterm, PORT_DATA_SIZE};
+use beam_message::{Message, MsoHandle, OffHeapTable};
+use beam_term::prelude::{Atom, Eterm};
 
 use crate::error;
 use crate::monitor::{Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator};
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
+use crate::port::PortTable;
 use crate::process::{DeliverOutcome, Process, ProcessState};
-use crate::signal::{build_down_message, build_exit_message, exit_policy, ExitPolicy, ExitSignal, SignalAtoms};
+use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
+use crate::run_queue::Priority;
+use crate::signal::{
+    build_down_message_port, build_down_message_remote, build_down_message_term,
+    build_exit_message, build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
+};
+use crate::signal_queue::PendingSignal;
 
 /// The outcome of applying an exit signal to a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,12 +100,12 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
 /// `process`'s heap, collecting once and retrying when the heap is exhausted (a full heap is a
 /// normal condition, not fatal OOM).
 ///
-/// `build` produces *both* the term and the handles of the fresh off-heap table it copied into:
-/// it creates that table itself, so a retry always starts from a clean table and never reuses a
-/// stale handle.
-fn build_signal_term<F>(process: &mut Process, build: F) -> Result<(Eterm, Vec<MsoHandle>)>
+/// `build` returns whatever the caller needs (the term plus the handles of the fresh off-heap
+/// table it copied into, or the term plus extra terms materialised on the same heap). It creates
+/// that table itself, so a retry always starts from a clean table and never reuses a stale handle.
+fn build_signal_term<T, F>(process: &mut Process, build: F) -> Result<T>
 where
-    F: Fn(&mut Heap) -> Result<(Eterm, Vec<MsoHandle>)>,
+    F: Fn(&mut Heap) -> Result<T>,
 {
     match build(process.heap_mut()) {
         Ok(built) => Ok(built),
@@ -113,38 +141,45 @@ fn copy_reason_onto(
     }
 }
 
+/// A standalone copy of `src`'s off-heap handles (each cloned — the refcount is bumped), with
+/// the **same slot indices** so a term copied against the snapshot resolves exactly as it would
+/// against `src`.
+///
+/// Used when the copy source lives in the table and the copy destination is mutated through the
+/// same `&mut ProcessTable`: the snapshot breaks the aliasing so
+/// [`Process::copy_into_heap`](crate::process::Process::copy_into_heap) can borrow the
+/// destination. The cloned handles are released when the snapshot drops, so the refcounts net
+/// out.
+fn snapshot_off_heap(src: &OffHeapTable) -> OffHeapTable {
+    let mut snapshot = OffHeapTable::new();
+    for handle in src.iter() {
+        snapshot.push(handle.clone());
+    }
+    snapshot
+}
+
 /// Builds `{'EXIT', from, reason}` on `recipient`'s heap and enqueues it as a message.
 ///
-/// `reason` is copied — from the heap described by `src_off_heap` — **before** the tuple is
-/// built, so the delivered reason always resides in the recipient's own heap (an immediate or
-/// literal-area term is shared verbatim by the copy, so this is a no-op for those). `None` means
-/// the reason is already owned by `recipient`.
+/// `reason` is already owned by `recipient`'s heap: it was copied in when the signal was
+/// enqueued (`enqueue_exit_signal`), so the delivered reason always resides in the recipient's
+/// own heap. This deliberately does **not** collect on heap exhaustion — a collection would
+/// relocate `reason`, turning the raw word stale — so a full heap surfaces as
+/// `BeamError::Alloc` and the caller retries after a collection with a freshly read reason
+/// (see [`ProcessTable::deliver_head_signal`]).
 ///
 /// # Errors
 ///
-/// Propagates `BeamError::Alloc` when the message still does not fit after a collection.
+/// Propagates `BeamError::Alloc` when the message does not fit.
 fn enqueue_exit_on(
     recipient: &mut Process,
     atoms: &SignalAtoms,
     from: ProcessId,
     reason: Eterm,
-    src_off_heap: Option<&OffHeapTable>,
 ) -> Result<()> {
-    let (term, off_heap) = match src_off_heap {
-        Some(src) => build_signal_term(recipient, |heap| {
-            let mut scratch = OffHeapTable::new();
-            let copied = copy_struct(reason, heap, &mut CopyContext::new(src, &mut scratch))?;
-            let term = build_exit_message(heap, atoms, from, copied)?;
-            Ok((term, scratch.drain_handles()))
-        })?,
-        // The reason already lives in `recipient`'s own heap: read it exactly once and build.
-        // A collect-and-retry would relocate `reason` (making the raw word stale), so this
-        // branch deliberately does not collect — a full heap surfaces as `BeamError::Alloc`.
-        None => (build_exit_message(recipient.heap_mut(), atoms, from, reason)?, Vec::new()),
-    };
+    let term = build_exit_message(recipient.heap_mut(), atoms, from, reason)?;
     recipient
         .mailbox_mut()
-        .enqueue(Message::new(term, from.to_eterm()).with_off_heap(off_heap));
+        .enqueue(Message::new(term, from.to_eterm()));
     Ok(())
 }
 
@@ -164,6 +199,14 @@ pub struct ProcessTable {
     /// runnable, so the single-threaded scheduler can absorb them (see
     /// [`ProcessTable::drain_woken`] and `crate::scheduler::Scheduler::resume_woken`).
     ready: Vec<ProcessId>,
+    /// Per local process: its remote (external-node) link partners.
+    remote_links: HashMap<ProcessId, Vec<RemotePid>>,
+    /// Per local process: its outgoing monitors on remote processes/ports.
+    remote_monitors: HashMap<ProcessId, Vec<RemoteMonitor>>,
+    /// The distribution seam (see [`DistSignalRouter`]); `None` means **record-only** — the
+    /// local relationship is still tracked, only the wire signal is dropped (a node with no
+    /// distribution configured).
+    router: Option<Box<dyn DistSignalRouter>>,
 }
 
 impl ProcessTable {
@@ -176,9 +219,11 @@ impl ProcessTable {
             refs: RefAllocator::new(),
             atoms,
             ready: Vec::new(),
+            remote_links: HashMap::new(),
+            remote_monitors: HashMap::new(),
+            router: None,
         }
-    }
-    // --- allocation / lookup -------------------------------------------------
+    }    // --- allocation / lookup -------------------------------------------------
 
     /// Allocates a fresh pid, reusing a free slot with a bumped serial.
     ///
@@ -306,6 +351,17 @@ impl ProcessTable {
             .map(|(number, slot)| ProcessId::new(number as u64, slot.serial))
     }
 
+    /// Sets the scheduling priority of the process named by `pid`
+    /// (`erlang:process_flag(priority, P)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn set_priority(&mut self, pid: ProcessId, priority: Priority) -> Result<()> {
+        self.get_mut(pid)
+            .ok_or_else(error::unknown_process)
+            .map(|process| process.set_priority(priority))
+    }
     // --- message delivery ----------------------------------------------------
 
     /// Delivers `term` (with off-heap references resolved against `src_off_heap`) from `from`
@@ -372,7 +428,19 @@ impl ProcessTable {
     }
 
     // --- signals / links / monitors -----------------------------------------
-    /// Applies an exit signal to `target`, following [`crate::signal::exit_policy`].
+    /// Sends an exit signal to `target`, following [`crate::signal::exit_policy`].
+    ///
+    /// The signal is **enqueued** on the target's [`SignalQueue`](crate::signal_queue) — never
+    /// applied inline (the reason is copied into the target's own heap, so it outlives the
+    /// signaller) — and then serviced **eagerly** unless the target is the currently executing
+    /// process ([`ProcessState::Running`]), whose signal is deferred to its next schedule-in
+    /// (see [`ProcessTable::service_signals`]).
+    ///
+    /// # Return value for a deferred signal
+    ///
+    /// The returned [`ExitEffect`] is the effect [`exit_policy`] predicts **now**: for an
+    /// eagerly applied signal it is the observed outcome; for a deferred one it is the
+    /// prediction (what will happen when the target next runs).
     ///
     /// # Errors
     ///
@@ -387,48 +455,27 @@ impl ProcessTable {
             return Err(error::unknown_process());
         };
         let trapping = process.is_trapping_exit();
-        match exit_policy(signal.reason, trapping, &self.atoms) {
-            ExitPolicy::Ignore => Ok(ExitEffect::Ignored),
-            ExitPolicy::Trap => {
-                // The signalling process is still live, but its off-heap table (the copy
-                // source) can never be borrowed together with the recipient's heap through
-                // `&mut self`. Follow the crate's collect-then-apply discipline: take the
-                // recipient out of the table, build its message against the local, and put it
-                // back.
-                let Some(mut recipient) = self.take(target) else {
-                    return Err(error::unknown_process());
-                };
-                let fallback = OffHeapTable::new();
-                let outcome = {
-                    let src = self.source_off_heap(target, signal.from, &fallback);
-                    enqueue_exit_on(&mut recipient, &self.atoms, signal.from, signal.reason, src)
-                };
-                // A trapped `{'EXIT', …}` is a message too: wake a blocked target. The wake
-                // must be recorded before `insert` (which consumes `recipient`).
-                let woke = recipient.wake();
-                self.insert(recipient)?;
-                outcome?;
-                if woke {
-                    self.ready.push(target);
-                }
-                Ok(ExitEffect::Trapped)
-            }
-            ExitPolicy::Terminate(reason) => {
-                // `terminate` releases the dying heap, so the reason must already live in the
-                // target's own heap: copy it in before re-inserting and terminating.
-                let Some(mut recipient) = self.take(target) else {
-                    return Err(error::unknown_process());
-                };
-                let fallback = OffHeapTable::new();
-                let copied = {
-                    let src = self.source_off_heap(target, signal.from, &fallback);
-                    copy_reason_onto(&mut recipient, reason, src)
-                };
-                self.insert(recipient)?;
-                self.terminate(target, copied?)?;
-                Ok(ExitEffect::Terminated)
-            }
-        }
+        let effect = match exit_policy(signal.reason, trapping, &self.atoms) {
+            ExitPolicy::Ignore => ExitEffect::Ignored,
+            ExitPolicy::Trap => ExitEffect::Trapped,
+            ExitPolicy::Terminate(_) => ExitEffect::Terminated,
+        };
+
+        // Generate: enqueue, never apply inline. The signaller's off-heap handles are
+        // snapshotted because the target may be the currently executing process, which cannot
+        // be moved out of the table to copy against a borrowed source.
+        let fallback = OffHeapTable::new();
+        let src = self
+            .source_off_heap(target, signal.from, &fallback)
+            .map(snapshot_off_heap);
+        self.enqueue_exit_signal(target, signal.from, signal.reason, src.as_ref())?;
+
+        // Eagerly service unless the target is the currently executing process, whose signal
+        // is deferred to its next schedule-in.
+        let mut pending = VecDeque::new();
+        self.schedule_service(target, &mut pending);
+        self.drain_signals(&mut pending)?;
+        Ok(effect)
     }
 
     /// Links `a` and `b` (both directions).
@@ -520,15 +567,24 @@ impl ProcessTable {
     /// Removes the outgoing monitor `watcher` holds under `reference`, reporting whether it
     /// existed.
     ///
+    /// The reference may name a **local** monitor (the ordinary case, whose incoming entry on
+    /// the target is dropped too) or an outgoing **remote** monitor, which is removed from the
+    /// table and routed to the remote node as a `DOP_DEMONITOR_P` control signal.
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when the watcher is unknown.
+    /// Returns `BeamError::TermNotFound` when the watcher is unknown; propagates the router's
+    /// transport errors for a remote monitor.
     pub fn demonitor(&mut self, watcher: ProcessId, reference: MonitorRef) -> Result<bool> {
-        let Some(process) = self.get_mut(watcher) else {
+        if !self.contains(watcher) {
             return Err(error::unknown_process());
-        };
-        let Some(monitor) = process.monitors_mut().remove(reference) else {
-            return Ok(false);
+        }
+        let local = self
+            .get_mut(watcher)
+            .and_then(|process| process.monitors_mut().remove(reference));
+        let Some(monitor) = local else {
+            // No local monitor under that reference: it may be an outgoing remote one.
+            return self.demonitor_remote(watcher, reference);
         };
         // Drop the matching incoming entry from the (still living) target.
         if let Some(target) = self.get_mut(monitor.target) {
@@ -539,8 +595,44 @@ impl ProcessTable {
         Ok(true)
     }
 
+    /// Removes the outgoing **remote** monitor `watcher` holds under `reference`, reporting
+    /// whether it existed, and routes the `DOP_DEMONITOR_P` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the router's transport errors.
+    fn demonitor_remote(&mut self, watcher: ProcessId, reference: MonitorRef) -> Result<bool> {
+        let (monitor, emptied) = {
+            let Some(monitors) = self.remote_monitors.get_mut(&watcher) else {
+                return Ok(false);
+            };
+            let Some(index) = monitors
+                .iter()
+                .position(|monitor| monitor.reference == reference)
+            else {
+                return Ok(false);
+            };
+            let monitor = monitors.remove(index);
+            (monitor, monitors.is_empty())
+        };
+        if emptied {
+            self.remote_monitors.remove(&watcher);
+        }
+        self.route(DistSignal::Demonitor {
+            watcher,
+            target: monitor.remote,
+            reference,
+        })?;
+        Ok(true)
+    }
+
     /// Terminates `pid` with `reason`, propagating to its links and monitors and cascading
-    /// through a worklist.
+    /// through the pending-signal worklist.
+    ///
+    /// The dying process's links are sent **exit signals** and its monitors `{'DOWN', …}`
+    /// **signals**, queued on each receiver ([`ProcessTable::service_signals`] applies them);
+    /// a receiver that is not the currently executing process is serviced eagerly, so the
+    /// observable end state matches a synchronous propagation.
     ///
     /// # Errors
     ///
@@ -550,85 +642,730 @@ impl ProcessTable {
         if !self.contains(pid) {
             return Err(error::unknown_process());
         }
+        let mut pending = VecDeque::new();
+        self.terminate_into(pid, reason, &mut pending)?;
+        self.drain_signals(&mut pending)
+    }
 
-        // A cascading termination is a worklist, never recursion: a link cycle (A↔B) then
-        // terminates in a bounded number of steps instead of recursing forever.
-        let mut worklist: Vec<(ProcessId, Eterm)> = vec![(pid, reason)];
+    /// The signal-generation half of [`ProcessTable::terminate`]: reclaims `pid` and **queues**
+    /// the signals its death implies on the affected receivers, pushing each receiver onto the
+    /// `pending` worklist. It never recurses, so a cyclic link cascade is bounded.
+    ///
+    /// `reason` may live in `pid`'s own heap (a terminated exit reason queued for it); it is
+    /// copied into every receiver's heap before `pid`'s heap is released.
+    fn terminate_into(
+        &mut self,
+        pid: ProcessId,
+        reason: Eterm,
+        pending: &mut VecDeque<ProcessId>,
+    ) -> Result<()> {
+        // A process can be signalled twice within one propagation (two links into the same
+        // target); the second visit finds the slot already reclaimed and is a no-op.
+        let Some(mut process) = self.take(pid) else {
+            return Ok(());
+        };
 
-        while let Some((pid, reason)) = worklist.pop() {
-            // A process can be signalled twice within one propagation (two links into the
-            // same target); the second visit finds the slot already reclaimed and is a
-            // no-op.
-            let Some(mut process) = self.take(pid) else {
+        // A dying process keeps no name registration.
+        self.names.retain(|_, registered| *registered != pid);
+
+        // Snapshot every relationship before the PCB is recycled.
+        let links = process.links_mut().drain();
+        let watchers: Vec<MonitoredBy> = core::mem::take(process.monitored_by_mut());
+        let outgoing = process.monitors_mut().drain();
+        process.set_exit_reason(reason);
+        process.set_state(ProcessState::Terminated);
+        // `process` stays alive until the end of this body: `reason` lives in its heap, so
+        // every receiver must be handed a *copy* before the dying heap is released (the drop
+        // sits after the loops). The dying process's own pending signals go with it.
+        //
+        // Each receiver is *recorded* here and scheduled for servicing **after** the drop: the
+        // dying process has already been reclaimed (`take` above), so `is_running` would report
+        // it wrongly, and — more importantly — a receiver that is a still-`Running` process
+        // must keep its signal pending. The eager-vs-deferred decision is therefore made by
+        // `schedule_service`, once the receivers are fully populated.
+        let mut receivers: Vec<ProcessId> = Vec::new();
+
+        // 1. Links: drop the back-link, then queue an exit signal on the peer. The peer decides
+        //    (through `exit_policy`, at service time) whether it terminates or traps.
+        for target in links {
+            if let Some(peer) = self.get_mut(target) {
+                peer.links_mut().remove(pid);
+            }
+            if !self.contains(target) {
+                // The peer died earlier in this same propagation.
                 continue;
-            };
-
-            // A dying process keeps no name registration.
-            self.names.retain(|_, registered| *registered != pid);
-
-            // Snapshot every relationship before the PCB is recycled.
-            let links = process.links_mut().drain();
-            let watchers: Vec<MonitoredBy> = core::mem::take(process.monitored_by_mut());
-            let outgoing = process.monitors_mut().drain();
-            process.set_exit_reason(reason);
-            process.set_state(ProcessState::Terminated);
-            // `process` stays alive until the end of this iteration: `reason` lives in its
-            // heap, so every recipient must be handed a *copy* before the dying heap is
-            // released (the drop now sits after the link/monitor loops).
-
-            // 1. Links: drop the back-link, then either trap the signal on the peer or
-            //    queue the peer's termination.
-            for target in links {
-                if let Some(peer) = self.get_mut(target) {
-                    peer.links_mut().remove(pid);
-                }
-                let Some(peer) = self.get(target) else {
-                    // The peer died earlier in this same propagation.
-                    continue;
-                };
-                let trapping = peer.is_trapping_exit();
-                match exit_policy(reason, trapping, &self.atoms) {
-                    ExitPolicy::Ignore => {}
-                    ExitPolicy::Trap => {
-                        self.enqueue_exit_message(target, pid, reason, process.off_heap())?;
-                    }
-                    ExitPolicy::Terminate(peer_reason) => {
-                        // Copy the reason into the peer's own heap so the queued entry never
-                        // points into the dying heap the moment `process` is dropped.
-                        let Some(peer) = self.get_mut(target) else {
-                            continue;
-                        };
-                        let copied =
-                            copy_reason_onto(peer, peer_reason, Some(process.off_heap()))?;
-                        worklist.push((target, copied));
-                    }
-                }
             }
-
-            // 2. Monitors: every watcher is told the target is down.
-            for watcher in watchers {
-                self.enqueue_down_message(
-                    watcher.watcher,
-                    watcher.reference,
-                    pid,
-                    reason,
-                    process.off_heap(),
-                )?;
-            }
-
-            // 3. The dying process's own outgoing monitors vanish with it.
-            for monitor in outgoing {
-                if let Some(target) = self.get_mut(monitor.target) {
-                    target
-                        .monitored_by_mut()
-                        .retain(|entry| entry.reference != monitor.reference);
-                }
-            }
-
-            // Every copy that read `reason` from the dying heap is done — release it.
-            drop(process);
+            self.enqueue_exit_signal(target, pid, reason, Some(process.off_heap()))?;
+            receivers.push(target);
         }
 
+        // 2. Monitors: every watcher is told the target is down.
+        for watcher in watchers {
+            if !self.contains(watcher.watcher) {
+                // The watcher died earlier in this same propagation.
+                continue;
+            }
+            self.enqueue_down_signal(
+                watcher.watcher,
+                watcher.reference,
+                pid,
+                watcher.kind,
+                reason,
+                Some(process.off_heap()),
+            )?;
+            receivers.push(watcher.watcher);
+        }
+
+        // 3. The dying process's own outgoing monitors vanish with it.
+        for monitor in outgoing {
+            if let Some(target) = self.get_mut(monitor.target) {
+                target
+                    .monitored_by_mut()
+                    .retain(|entry| entry.reference != monitor.reference);
+            }
+        }
+
+        // 4. Remote links and monitors: a dying process leaves the node's records, and every
+        //    remote link partner must be told the process is gone. This runs before
+        //    `drop(process)` because `reason` may live in the dying heap the router reads.
+        for remote in self.remote_links.remove(&pid).unwrap_or_default() {
+            self.route(DistSignal::Exit {
+                from: pid,
+                to: remote,
+                reason,
+            })?;
+        }
+        // Outgoing *remote* monitors die with the watcher: the remote node will simply
+        // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
+        self.remote_monitors.remove(&pid);
+
+        // Every copy that read `reason` from the dying heap is done — release it.
+        drop(process);
+
+        // Now that the dying PCB is gone, schedule the receivers the death signalled: each is
+        // serviced eagerly unless it is the currently executing process.
+        for receiver in receivers {
+            self.schedule_service(receiver, pending);
+        }
+        Ok(())
+    }
+
+    /// Applies every signal queued for `pid`, in FIFO order, cascading to any process those
+    /// signals affect.
+    ///
+    /// This is the **schedule-in** entry point: the scheduler calls it on the dequeued pid
+    /// before running it, so a process signalled while it was blocked sees the signal before
+    /// its next reduction. A pid that is no longer live has nothing to apply, so it is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the message builders' `BeamError::Alloc` (after a collection) and the
+    /// cascading termination's errors.
+    pub fn service_signals(&mut self, pid: ProcessId) -> Result<()> {
+        if !self.contains(pid) {
+            return Ok(());
+        }
+        let mut pending = VecDeque::new();
+        pending.push_back(pid);
+        self.drain_signals(&mut pending)
+    }
+
+    /// Drains the signal queues of every pid in `pending`, and of any process the servicing
+    /// itself signals, until no queue is left to drain.
+    ///
+    /// Iterative — the `pending` worklist is the only recursion the cascade has, so a link
+    /// cycle (A↔B) terminates in a bounded number of steps.
+    fn drain_signals(&mut self, pending: &mut VecDeque<ProcessId>) -> Result<()> {
+        while let Some(pid) = pending.pop_front() {
+            while self.apply_head_signal(pid, pending)? {}
+        }
+        Ok(())
+    }
+
+    /// Applies the signal at the head of `pid`'s queue, removing it, and returns whether the
+    /// process **survived** (`false` when the queue is empty, the process is gone, or the
+    /// signal terminated it).
+    ///
+    /// A terminating signal adds the affected receivers to `pending` (through
+    /// [`ProcessTable::terminate_into`]) rather than recurring.
+    fn apply_head_signal(
+        &mut self,
+        pid: ProcessId,
+        pending: &mut VecDeque<ProcessId>,
+    ) -> Result<bool> {
+        let Some(signal) = self.head_signal(pid) else {
+            return Ok(false);
+        };
+        match signal {
+            PendingSignal::Exit { from, reason } => {
+                let Some(process) = self.get(pid) else {
+                    return Ok(false);
+                };
+                let trapping = process.is_trapping_exit();
+                match exit_policy(reason, trapping, &self.atoms) {
+                    ExitPolicy::Ignore => {
+                        // A `normal` reason to a non-trapping process is discarded.
+                        self.pop_head_signal(pid);
+                        Ok(true)
+                    }
+                    ExitPolicy::Trap => {
+                        self.deliver_trapped_exit(pid, from)?;
+                        Ok(true)
+                    }
+                    ExitPolicy::Terminate(reason) => {
+                        // `reason` still lives in `pid`'s heap, which `terminate_into`
+                        // reclaims last, so it can be copied to the peers first.
+                        self.terminate_into(pid, reason, pending)?;
+                        Ok(false)
+                    }
+                }
+            }
+            PendingSignal::Down {
+                reference,
+                target,
+                kind,
+                ..
+            } => {
+                self.deliver_down_message(pid, reference, target, kind)?;
+                Ok(true)
+            }
+        }
+    }
+
+    /// The signal at the head of `pid`'s queue, if any (a copy of the small descriptor).
+    fn head_signal(&self, pid: ProcessId) -> Option<PendingSignal> {
+        lookup(&self.slots, pid)?.signals().peek().copied()
+    }
+
+    /// The reason of the signal at the head of `pid`'s queue, if any.
+    fn head_signal_reason(&self, pid: ProcessId) -> Option<Eterm> {
+        lookup(&self.slots, pid)?
+            .signals()
+            .peek()
+            .map(PendingSignal::reason)
+    }
+
+    /// Removes the signal at the head of `pid`'s queue.
+    fn pop_head_signal(&mut self, pid: ProcessId) {
+        if let Some(process) = lookup_mut(&mut self.slots, pid) {
+            process.signals_mut().pop();
+        }
+    }
+
+    /// Whether `pid` names the currently executing process (`ProcessState::Running`).
+    fn is_running(&self, pid: ProcessId) -> bool {
+        matches!(
+            lookup(&self.slots, pid).map(Process::state),
+            Some(ProcessState::Running)
+        )
+    }
+
+    /// Adds `pid` to the `pending` service worklist **unless** it is the currently executing
+    /// process, whose signals are deferred to its next schedule-in.
+    ///
+    /// This is the single place the eager-vs-deferred rule is decided; every signal-generation
+    /// path funnels its receivers through it. The rule is stated in the module docs: a signal
+    /// generated for a process that is *not* running right now is serviced before the generating
+    /// operation returns (ERTS's early signal handling), which is what makes the observable end
+    /// state of `terminate`/`apply_exit_signal`/`send_exit` match a synchronous propagation for
+    /// a non-running receiver, while a running receiver keeps its signal pending.
+    fn schedule_service(&self, pid: ProcessId, pending: &mut VecDeque<ProcessId>) {
+        if !self.is_running(pid) {
+            pending.push_back(pid);
+        }
+    }
+
+    /// Builds the head signal's message, retrying once after a collection.
+    ///
+    /// The queued signal is an in-heap sub-rootset, so a heap-exhaustion collection relocates
+    /// its `reason` in place: `build` is handed a freshly read reason each attempt. On success
+    /// the head signal is removed and a blocked `pid` is woken (and recorded on the wake list).
+    fn deliver_head_signal<F>(&mut self, pid: ProcessId, mut build: F) -> Result<()>
+    where
+        F: FnMut(&mut Self, Eterm) -> Result<()>,
+    {
+        let mut attempt = 0;
+        loop {
+            let Some(reason) = self.head_signal_reason(pid) else {
+                // The queue emptied (or the process is gone): nothing to deliver.
+                return Ok(());
+            };
+            match build(self, reason) {
+                Ok(()) => break,
+                Err(BeamError::Alloc(_)) if attempt == 0 => {
+                    attempt += 1;
+                    let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
+                        return Ok(());
+                    };
+                    recipient.collect()?;
+                }
+                Err(error) => return Err(error),
+            }
+        }
+        self.pop_head_signal(pid);
+        let woke = lookup_mut(&mut self.slots, pid)
+            .map(|process| process.wake())
+            .unwrap_or(false);
+        if woke {
+            self.ready.push(pid);
+        }
+        Ok(())
+    }
+
+    /// Delivers the head (exit) signal of `pid` as a `{'EXIT', from, reason}` message.
+    ///
+    /// The reason is already owned by `pid`'s heap, so it is built without copying (the
+    /// earlier `copy_reason_onto` at enqueue time did the ownership transfer).
+    fn deliver_trapped_exit(&mut self, pid: ProcessId, from: ProcessId) -> Result<()> {
+        self.deliver_head_signal(pid, |this, reason| {
+            this.build_and_enqueue_exit(pid, from, reason)
+        })
+    }
+
+    /// Delivers the head (monitor-DOWN) signal of `pid` as a `{'DOWN', …}` message.
+    fn deliver_down_message(
+        &mut self,
+        pid: ProcessId,
+        reference: MonitorRef,
+        target: ProcessId,
+        kind: MonitorKind,
+    ) -> Result<()> {
+        self.deliver_head_signal(pid, |this, reason| {
+            this.build_and_enqueue_down(pid, reference, target, kind, reason)
+        })
+    }
+
+    /// Builds `{'EXIT', from, reason}` on `pid`'s heap — `reason` already resident in that
+    /// heap — and enqueues it as a message.
+    fn build_and_enqueue_exit(
+        &mut self,
+        pid: ProcessId,
+        from: ProcessId,
+        reason: Eterm,
+    ) -> Result<()> {
+        let atoms = &self.atoms;
+        let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
+            return Ok(());
+        };
+        enqueue_exit_on(recipient, atoms, from, reason)
+    }
+
+    /// Builds `{'DOWN', Ref, Tag, Target, reason}` on `pid`'s heap — `reason` already resident
+    /// in that heap — and enqueues it as a message.
+    fn build_and_enqueue_down(
+        &mut self,
+        pid: ProcessId,
+        reference: MonitorRef,
+        target: ProcessId,
+        kind: MonitorKind,
+        reason: Eterm,
+    ) -> Result<()> {
+        let atoms = &self.atoms;
+        let Some(recipient) = lookup_mut(&mut self.slots, pid) else {
+            return Ok(());
+        };
+        let tag = match kind {
+            MonitorKind::Process => atoms.process(),
+            MonitorKind::Port => atoms.port(),
+        };
+        let reference_term = reference.to_eterm(recipient.heap_mut())?;
+        let term = build_down_message_term(
+            recipient.heap_mut(),
+            atoms,
+            reference_term,
+            tag,
+            target.to_eterm(),
+            reason,
+        )?;
+        recipient
+            .mailbox_mut()
+            .enqueue(Message::new(term, target.to_eterm()));
+        Ok(())
+    }
+
+    /// Enqueues an exit signal on `to`'s signal queue, copying `reason` out of the heap
+    /// described by `src` (the signaller's off-heap table, or `None` for a self-signal whose
+    /// reason already lives in `to`'s heap) so the queued reason always outlives the signaller.
+    ///
+    /// An unknown `to` is skipped: the caller is propagating a signal through the table and
+    /// the target may have died earlier in the same propagation.
+    fn enqueue_exit_signal(
+        &mut self,
+        to: ProcessId,
+        from: ProcessId,
+        reason: Eterm,
+        src: Option<&OffHeapTable>,
+    ) -> Result<()> {
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
+        };
+        let reason = copy_reason_onto(recipient, reason, src)?;
+        recipient
+            .signals_mut()
+            .push(PendingSignal::exit(from, reason));
+        Ok(())
+    }
+
+    /// Enqueues a monitor-DOWN signal on `to`'s signal queue, copying `reason` out of the heap
+    /// described by `src` (see [`ProcessTable::enqueue_exit_signal`]).
+    fn enqueue_down_signal(
+        &mut self,
+        to: ProcessId,
+        reference: MonitorRef,
+        target: ProcessId,
+        kind: MonitorKind,
+        reason: Eterm,
+        src: Option<&OffHeapTable>,
+    ) -> Result<()> {
+        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+            return Ok(());
+        };
+        let reason = copy_reason_onto(recipient, reason, src)?;
+        recipient
+            .signals_mut()
+            .push(PendingSignal::down(reference, target, kind, reason));
+        Ok(())
+    }
+
+    /// The number of signals queued for `pid` (pending-signal introspection).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn pending_signals(&self, pid: ProcessId) -> Result<usize> {
+        self.get(pid)
+            .map(Process::pending_signals)
+            .ok_or_else(error::unknown_process)
+    }
+
+    /// The signal queue of `pid`, for iteration over the pending signals.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn signals(&self, pid: ProcessId) -> Result<&crate::signal_queue::SignalQueue> {
+        self.get(pid)
+            .map(Process::signals)
+            .ok_or_else(error::unknown_process)
+    }
+
+    // --- remote (distributed) links and monitors -----------------------------
+
+    /// Installs the distribution seam the table routes remote signals through.
+    ///
+    /// Without a router the table is **record-only**: local relationships are tracked but no
+    /// wire control signal is emitted (see [`ProcessTable::route`]).
+    pub fn set_dist_router(&mut self, router: Box<dyn DistSignalRouter>) {
+        self.router = Some(router);
+    }
+
+    /// Takes the distribution seam out of the table, returning it to the caller.
+    pub fn take_dist_router(&mut self) -> Option<Box<dyn DistSignalRouter>> {
+        self.router.take()
+    }
+
+    /// Whether a distribution seam is installed.
+    pub fn has_dist_router(&self) -> bool {
+        self.router.is_some()
+    }
+
+    /// Routes `signal` through the distribution seam, if one is installed.
+    ///
+    /// With no seam the local record stands and the signal is dropped: the relationship is
+    /// still known to the table, there is simply nowhere to send it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the router's transport failure (an unknown/unconnected node, an I/O error).
+    fn route(&mut self, signal: DistSignal) -> Result<()> {
+        match &mut self.router {
+            Some(router) => router.route(signal),
+            None => Ok(()),
+        }
+    }
+
+    /// `erlang:link/1` against an arbitrary pid term: a local pid links through
+    /// [`ProcessTable::link`], an external pid is recorded as a remote link and routed as a
+    /// `DOP_LINK` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `b` is not a pid; for a local `b`,
+    /// propagates [`ProcessTable::link`]'s `BeamError::TermNotFound`; for a remote `b`,
+    /// `BeamError::TermNotFound` when `a` is unknown; and the router's transport errors.
+    pub fn link_term(&mut self, a: ProcessId, b: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(b)? {
+            PidTarget::Local(pid) => self.link(a, pid),
+            PidTarget::Remote(remote) => {
+                if !self.contains(a) {
+                    return Err(error::unknown_process());
+                }
+                let links = self.remote_links.entry(a).or_default();
+                // Like `Links::add`: a re-link of an already-linked pair changes nothing.
+                if !links.contains(&remote) {
+                    links.push(remote);
+                }
+                self.route(DistSignal::Link { from: a, to: remote })
+            }
+        }
+    }
+
+    /// `erlang:unlink/1` against an arbitrary pid term: a local pid unlinks through
+    /// [`ProcessTable::unlink`], an external pid drops the recorded remote link and routes a
+    /// `DOP_UNLINK_ID` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `b` is not a pid; for a local `b`,
+    /// propagates [`ProcessTable::unlink`]'s `BeamError::TermNotFound`; and the router's
+    /// transport errors.
+    pub fn unlink_term(&mut self, a: ProcessId, b: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(b)? {
+            PidTarget::Local(pid) => self.unlink(a, pid),
+            PidTarget::Remote(remote) => {
+                let emptied = match self.remote_links.get_mut(&a) {
+                    Some(links) => {
+                        if let Some(index) = links.iter().position(|entry| *entry == remote) {
+                            links.remove(index);
+                        }
+                        links.is_empty()
+                    }
+                    None => false,
+                };
+                if emptied {
+                    // An emptied link set carries no information.
+                    self.remote_links.remove(&a);
+                }
+                self.route(DistSignal::Unlink { from: a, to: remote })
+            }
+        }
+    }
+
+    /// `erlang:monitor/2` against an arbitrary pid term: a local pid monitors through
+    /// [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote monitor and
+    /// routed as a `DOP_MONITOR_P` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid; for a local
+    /// `target`, propagates [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a remote
+    /// `target`, `BeamError::TermNotFound` when `watcher` is unknown; and the router's transport
+    /// errors.
+    pub fn monitor_term(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        kind: MonitorKind,
+    ) -> Result<MonitorRef> {
+        match PidTarget::from_eterm(target)? {
+            PidTarget::Local(pid) => self.monitor(watcher, pid, kind),
+            PidTarget::Remote(remote) => {
+                if !self.contains(watcher) {
+                    return Err(error::unknown_process());
+                }
+                let reference = self.refs.next();
+                self.remote_monitors
+                    .entry(watcher)
+                    .or_default()
+                    .push(RemoteMonitor {
+                        reference,
+                        remote,
+                        kind,
+                    });
+                self.route(DistSignal::Monitor {
+                    watcher,
+                    target: remote,
+                    reference,
+                    kind,
+                })?;
+                Ok(reference)
+            }
+        }
+    }
+
+    /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
+    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `to` is not a pid; for a local `to`,
+    /// propagates [`ProcessTable::send_exit`]'s errors; and the router's transport errors.
+    pub fn send_exit_term(&mut self, from: ProcessId, to: Eterm, reason: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(to)? {
+            PidTarget::Local(pid) => self.send_exit(from, pid, reason),
+            PidTarget::Remote(remote) => self.route(DistSignal::Exit {
+                from,
+                to: remote,
+                reason,
+            }),
+        }
+    }
+
+    /// The remote link partners recorded for `pid`.
+    ///
+    /// A pid that is no longer live resolves to nothing — the same rule
+    /// [`ProcessTable::whereis`] applies to a name whose process is gone.
+    pub fn remote_links(&self, pid: ProcessId) -> &[RemotePid] {
+        if !self.contains(pid) {
+            return &[];
+        }
+        self.remote_links
+            .get(&pid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The outgoing remote monitors recorded for `pid`.
+    ///
+    /// A pid that is no longer live resolves to nothing (see
+    /// [`ProcessTable::remote_links`]).
+    pub fn remote_monitors(&self, pid: ProcessId) -> &[RemoteMonitor] {
+        if !self.contains(pid) {
+            return &[];
+        }
+        self.remote_monitors
+            .get(&pid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// A whole remote **node** went away (its distribution connection dropped): every local
+    /// relationship with that node is resolved the way the signals would have been, had the
+    /// node been alive to send them, and then purged.
+    ///
+    /// This is a collect-then-apply sweep, matching the crate's discipline (the table is the
+    /// only place that mutates two processes at once, so it never mutates while iterating):
+    ///
+    /// 1. every outgoing monitor on `node` queues `{'DOWN', Ref, process, RemotePid, Reason}`
+    ///    on its watcher and wakes a blocked watcher;
+    /// 2. every link to `node` follows [`exit_policy`] on the local peer: `Ignore` does
+    ///    nothing, `Trap` queues `{'EXIT', RemotePid, Reason}`, anything else terminates the
+    ///    peer (with the usual cascading propagation);
+    /// 3. every record mentioning `node` is purged.
+    ///
+    /// `reason` is the node-down reason (an immediate such as `noconnection`) and is embedded
+    /// verbatim — there is no source heap to copy it from, so the caller must pass a term that
+    /// does not live in a heap that may be recycled underneath this call.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the message builders' `BeamError::Alloc` (after a collection) and the
+    /// cascading termination's errors.
+    pub fn node_down(&mut self, node: Eterm, reason: Eterm) -> Result<()> {
+        // 1. Monitors: snapshot the (watcher, monitor) pairs that watch `node`.
+        let down: Vec<(ProcessId, RemoteMonitor)> = self
+            .remote_monitors
+            .iter()
+            .flat_map(|(watcher, monitors)| {
+                monitors
+                    .iter()
+                    .filter(|monitor| monitor.remote.node() == node)
+                    .map(move |monitor| (*watcher, *monitor))
+            })
+            .collect();
+        for (watcher, monitor) in down {
+            self.enqueue_remote_down_message(watcher, monitor.reference, monitor.remote, reason)?;
+        }
+
+        // 2. Links: snapshot the (peer, remote) pairs linked to `node`.
+        let linked: Vec<(ProcessId, RemotePid)> = self
+            .remote_links
+            .iter()
+            .flat_map(|(peer, partners)| {
+                partners
+                    .iter()
+                    .filter(|remote| remote.node() == node)
+                    .map(move |remote| (*peer, *remote))
+            })
+            .collect();
+        for (peer, remote) in linked {
+            let Some(process) = self.get(peer) else {
+                // The peer died earlier in this sweep.
+                continue;
+            };
+            let trapping = process.is_trapping_exit();
+            match exit_policy(reason, trapping, &self.atoms) {
+                ExitPolicy::Ignore => {}
+                ExitPolicy::Trap => self.enqueue_remote_exit_message(peer, remote, reason)?,
+                ExitPolicy::Terminate(peer_reason) => self.terminate(peer, peer_reason)?,
+            }
+        }
+
+        // 3. Purge every record mentioning `node`: the relationships are gone with it.
+        for partners in self.remote_links.values_mut() {
+            partners.retain(|remote| remote.node() != node);
+        }
+        self.remote_links.retain(|_, partners| !partners.is_empty());
+        for monitors in self.remote_monitors.values_mut() {
+            monitors.retain(|monitor| monitor.remote.node() != node);
+        }
+        self.remote_monitors
+            .retain(|_, monitors| !monitors.is_empty());
+        Ok(())
+    }
+
+    /// Enqueues `{'DOWN', Ref, process, RemotePid, Reason}` into `watcher`'s mailbox — built on
+    /// the watcher's own heap — and wakes a blocked watcher.
+    ///
+    /// An unknown watcher is skipped (it died earlier in the same sweep).
+    fn enqueue_remote_down_message(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        remote: RemotePid,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+                return Ok(());
+            };
+            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let from = remote.to_eterm(heap)?;
+                let term =
+                    build_down_message_remote(heap, atoms, reference_term, remote, reason)?;
+                Ok((term, from, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(watcher);
+        }
+        Ok(())
+    }
+
+    /// Enqueues `{'EXIT', RemotePid, Reason}` into `peer`'s mailbox — built on the peer's own
+    /// heap — and wakes a blocked peer.
+    ///
+    /// An unknown peer is skipped (it died earlier in the same sweep).
+    fn enqueue_remote_exit_message(
+        &mut self,
+        peer: ProcessId,
+        remote: RemotePid,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
+                return Ok(());
+            };
+            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+                let from = remote.to_eterm(heap)?;
+                let term = build_exit_message_term(heap, atoms, from, reason)?;
+                Ok((term, from, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(peer);
+        }
         Ok(())
     }
 
@@ -697,142 +1434,110 @@ impl ProcessTable {
         }
     }
 
-    /// Enqueues `{'EXIT', from, reason}` into `to`'s mailbox, building it on `to`'s heap with
-    /// `reason` copied out of the heap described by `src_off_heap`, and wakes `to` when it was
-    /// blocked.
+    // --- port close propagation ----------------------------------------------
+
+    /// Reports that `port` has closed with `reason`: delivers
+    /// `{'DOWN', Ref, port, Port, Reason}` to every process monitoring the port (via
+    /// [`PortTable::close`]) and an `{'EXIT', Port, Reason}` signal to every process linked
+    /// to it.
     ///
-    /// An unknown `to` is skipped: the caller is propagating a signal through the table and
-    /// the target may have died earlier in the same propagation.
-    fn enqueue_exit_message(
-        &mut self,
-        to: ProcessId,
-        from: ProcessId,
-        reason: Eterm,
-        src_off_heap: &OffHeapTable,
-    ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-                return Ok(());
-            };
-            enqueue_exit_on(recipient, atoms, from, reason, Some(src_off_heap))?;
-            recipient.wake()
-        };
-        if woke {
-            self.ready.push(to);
-        }
-        Ok(())
-    }
-
-    /// Enqueues `{'DOWN', reference, process, pid, reason}` into `to`'s mailbox, building it on
-    /// `to`'s heap with `reason` copied out of the heap described by `src_off_heap`, and wakes
-    /// `to` when it was blocked.
-    ///
-    /// An unknown `to` is skipped (the watcher died earlier in the same propagation).
-    fn enqueue_down_message(
-        &mut self,
-        to: ProcessId,
-        reference: MonitorRef,
-        pid: ProcessId,
-        reason: Eterm,
-        src_off_heap: &OffHeapTable,
-    ) -> Result<()> {
-        let woke = {
-            let atoms = &self.atoms;
-            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-                return Ok(());
-            };
-            let (term, off_heap) = build_signal_term(recipient, |heap| {
-                let mut scratch = OffHeapTable::new();
-                let copied =
-                    copy_struct(reason, heap, &mut CopyContext::new(src_off_heap, &mut scratch))?;
-                let reference_term = reference.to_eterm(heap)?;
-                let term = build_down_message(heap, atoms, reference_term, pid, copied)?;
-                Ok((term, scratch.drain_handles()))
-            })?;
-            recipient
-                .mailbox_mut()
-                .enqueue(Message::new(term, pid.to_eterm()).with_off_heap(off_heap));
-            recipient.wake()
-        };
-        if woke {
-            self.ready.push(to);
-        }
-        Ok(())
-    }
-}
-
-/// The minimal port-id table: allocation and ownership only.
-///
-/// Port *behaviour* (scheduling, port signals, port links/monitors) is `beam_io`'s; this is
-/// only the number table the legacy C keeps alongside the pid table.
-pub struct PortTable {
-    /// Number → whether the slot is in use.
-    slots: Vec<bool>,
-    /// Free slot numbers available for reuse.
-    free: Vec<u64>,
-}
-
-impl PortTable {
-    /// An empty port table.
-    pub fn new() -> PortTable {
-        PortTable {
-            slots: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-
-    /// Allocates a fresh port id.
+    /// A linked process follows [`exit_policy`]: a trapping peer receives the `{'EXIT', …}`
+    /// message, a non-trapping one terminates with `reason` (cascading through its own links
+    /// and monitors), and a `normal` reason is ignored. A peer that already died is skipped.
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::SystemLimit` when the port number space is exhausted.
-    pub fn alloc(&mut self) -> Result<PortId> {
-        if let Some(number) = self.free.pop() {
-            if let Some(slot) = self.slots.get_mut(number as usize) {
-                *slot = true;
-            }
-            return Ok(PortId::new(number));
-        }
-        let number = self.slots.len() as u64;
-        // The whole 60-bit immediate payload is the port number (`_PORT_DATA_SIZE`).
-        if number > (1u64 << PORT_DATA_SIZE) - 1 {
-            return Err(error::system_limit());
-        }
-        self.slots.push(true);
-        Ok(PortId::new(number))
-    }
+    /// Returns `BeamError::BadArg` when `port` is not allocated; propagates the message
+    /// builders' `BeamError::Alloc` (after a collection) and the cascading termination's
+    /// errors.
+    pub fn port_closed(&mut self, ports: &mut PortTable, port: PortId, reason: Eterm) -> Result<()> {
+        let closed = ports.close(port)?;
 
-    /// Releases `id`, returning its number to the free list.
-    pub fn release(&mut self, id: PortId) {
-        let number = id.number();
-        if let Some(slot) = self.slots.get_mut(number as usize) {
-            if *slot {
-                *slot = false;
-                self.free.push(number);
+        // 1. Monitors: every watcher is told the port is down.
+        for monitor in closed.monitors {
+            self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, reason)?;
+        }
+
+        // 2. Links: each linked process either traps the exit or follows it.
+        for pid in closed.links {
+            let Some(peer) = self.get(pid) else {
+                // The peer died earlier.
+                continue;
+            };
+            let trapping = peer.is_trapping_exit();
+            match exit_policy(reason, trapping, &self.atoms) {
+                ExitPolicy::Ignore => {}
+                ExitPolicy::Trap => self.enqueue_port_exit_message(pid, port, reason)?,
+                ExitPolicy::Terminate(peer_reason) => self.terminate(pid, peer_reason)?,
             }
         }
+        Ok(())
     }
 
-    /// Whether `id` is currently allocated.
-    pub fn contains(&self, id: PortId) -> bool {
-        self.slots
-            .get(id.number() as usize)
-            .copied()
-            .unwrap_or(false)
+    /// Enqueues `{'DOWN', Ref, port, Port, Reason}` into `to`'s mailbox — built on `to`'s own
+    /// heap — and wakes `to` when it was blocked.
+    ///
+    /// An unknown `to` is skipped (the watcher died earlier).
+    fn enqueue_port_down_message(
+        &mut self,
+        to: ProcessId,
+        reference: MonitorRef,
+        port: PortId,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            let from = port.to_eterm();
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let term = build_down_message_port(heap, atoms, reference_term, port, reason)?;
+                Ok((term, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
     }
 
-    /// The number of allocated ports.
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|&&used| used).count()
+    /// Enqueues `{'EXIT', Port, Reason}` into `to`'s mailbox — built on `to`'s own heap — and
+    /// wakes `to` when it was blocked.
+    ///
+    /// An unknown `to` is skipped (the linked peer died earlier).
+    fn enqueue_port_exit_message(&mut self, to: ProcessId, port: PortId, reason: Eterm) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            let from = port.to_eterm();
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let term = build_exit_message_term(heap, atoms, from, reason)?;
+                Ok((term, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
     }
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod tests {
     //! Unit tests for pid allocation/serial bumping/stale-pid rejection, the name
-    //! registry, link/unlink, the exit-signal outcomes, monitor/demonitor and the minimal
-    //! port table. The cascading link/monitor propagation is covered by `tests/signals.rs`.
+    //! registry, link/unlink, the exit-signal outcomes and monitor/demonitor. The cascading
+    //! link/monitor propagation is covered by `tests/signals.rs` and the port
+    //! ownership/link/monitor surface by `crate::port` and `tests/ports.rs`.
 
     use beam_term::prelude::{
         make_atom, make_small, tuple_element, tuple_size, AtomTable,
@@ -1105,7 +1810,10 @@ mod tests {
         let from = table.spawn_default().expect("from");
         assert_eq!(
             table
-                .apply_exit_signal(target, ExitSignal { from, reason: normal })
+                .apply_exit_signal(
+                    target,
+                    ExitSignal { from, reason: normal }
+                )
                 .expect("a live target"),
             ExitEffect::Ignored
         );
@@ -1115,7 +1823,10 @@ mod tests {
         let other = make_small(1234);
         assert_eq!(
             table
-                .apply_exit_signal(target, ExitSignal { from, reason: other })
+                .apply_exit_signal(
+                    target,
+                    ExitSignal { from, reason: other }
+                )
                 .expect("a live target"),
             ExitEffect::Terminated
         );
@@ -1126,7 +1837,10 @@ mod tests {
         table.get_mut(target).expect("target").set_trap_exit(true);
         assert_eq!(
             table
-                .apply_exit_signal(target, ExitSignal { from, reason: other })
+                .apply_exit_signal(
+                    target,
+                    ExitSignal { from, reason: other }
+                )
                 .expect("a live target"),
             ExitEffect::Trapped
         );
@@ -1178,7 +1892,12 @@ mod tests {
             .monitor(watcher, target, MonitorKind::Process)
             .expect("both live");
         assert_eq!(
-            table.get(watcher).expect("watcher").monitors().find(reference).map(|m| m.target),
+            table
+                .get(watcher)
+                .expect("watcher")
+                .monitors()
+                .find(reference)
+                .map(|m| m.target),
             Some(target)
         );
         assert_eq!(table.get(target).expect("target").monitored_by().len(), 1);
@@ -1231,7 +1950,11 @@ mod tests {
 
         table.terminate(pid, make_small(1)).expect("live");
         assert!(!table.contains(pid));
-        assert_eq!(table.whereis(name), None, "a name whose process is gone is gone");
+        assert_eq!(
+            table.whereis(name),
+            None,
+            "a name whose process is gone is gone"
+        );
     }
 
     #[test]
@@ -1244,10 +1967,7 @@ mod tests {
         let pid2 = table.spawn_default().expect("b");
 
         table.register(name, pid).expect("the name is free");
-        assert!(matches!(
-            table.register(name, pid2),
-            Err(BeamError::BadArg)
-        ));
+        assert!(matches!(table.register(name, pid2), Err(BeamError::BadArg)));
         assert_eq!(table.whereis(name), Some(pid));
         assert_eq!(table.whereis(other), None);
 
@@ -1263,31 +1983,5 @@ mod tests {
         table.register(name, pid2).expect("free again");
         table.remove(pid2);
         assert_eq!(table.registered().count(), 0);
-    }
-
-    #[test]
-    fn port_table_allocates_releases_and_reuses() {
-        let mut ports = PortTable::new();
-        assert_eq!(ports.len(), 0);
-
-        let a = ports.alloc().expect("room");
-        let b = ports.alloc().expect("room");
-        assert_ne!(a, b);
-        assert_eq!(ports.len(), 2);
-        assert!(ports.contains(a) && ports.contains(b));
-
-        ports.release(a);
-        assert!(!ports.contains(a));
-        assert_eq!(ports.len(), 1);
-
-        let reused = ports.alloc().expect("the freed number is reused");
-        assert_eq!(reused, a);
-        assert!(ports.contains(reused));
-        assert_eq!(ports.len(), 2);
-
-        // Releasing twice does not double-free.
-        ports.release(b);
-        ports.release(b);
-        assert_eq!(ports.len(), 1);
     }
 }

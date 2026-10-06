@@ -8,20 +8,26 @@
 //!
 //! The cases cover the concrete tags the distribution encoder/decoder actually uses:
 //!
-//! * numbers — `NEW_FLOAT_EXT` (70), `SMALL_BIG_EXT` (110), `LARGE_BIG_EXT` (111);
+//! * numbers — `SMALL_INTEGER_EXT` (97), `INTEGER_EXT` (98), `NEW_FLOAT_EXT` (70),
+//!   `SMALL_BIG_EXT` (110), `LARGE_BIG_EXT` (111);
+//! * tuples — `SMALL_TUPLE_EXT` (104) and `LARGE_TUPLE_EXT` (105, for a >255-element tuple);
 //! * lists — `NIL_EXT` (106), `STRING_EXT` (107), `LIST_EXT` (108) (including an
 //!   improper tail);
-//! * `BINARY_EXT` (109);
-//! * atoms — `ATOM_UTF8_EXT` (118), `SMALL_ATOM_UTF8_EXT` (119), including the UTF-8 bytes
-//!   of a non-Latin-1 atom;
+//! * binaries — `BINARY_EXT` (109) and `BIT_BINARY_EXT` (77);
+//! * maps — `MAP_EXT` (116); a *multi-key* map is compared through its **sorted** key list,
+//!   because map iteration order is an internal detail and not part of the wire contract;
+//! * atoms — the legacy `ATOM_EXT` (100), and the UTF-8 `ATOM_UTF8_EXT` (118) /
+//!   `SMALL_ATOM_UTF8_EXT` (119) including the UTF-8 bytes of a non-Latin-1 atom;
 //! * external things — `NEW_PID_EXT` (88), `NEWER_REFERENCE_EXT` (90), `NEW_PORT_EXT` (89)
-//!   and `NEWER_PORT_EXT` (120) — encoded through the *decode → re-encode* round-trip,
-//!   which is deterministic inside one node's encoder (`term_to_binary(self())` and
-//!   `term_to_binary(make_ref())` are **not** usable: the runtime BIFs `make_ref/0` /
+//!   and `NEWER_PORT_EXT` (120), plus the *legacy* `PID_EXT` (103), `REFERENCE_EXT` (101)
+//!   and `NEW_REFERENCE_EXT` (114) forms — all encoded through the *decode → re-encode*
+//!   round-trip, which is deterministic inside one node's encoder (`term_to_binary(self())`
+//!   and `term_to_binary(make_ref())` are **not** usable: the runtime BIFs `make_ref/0` /
 //!   `ports/0` raise a plain Erlang reason that would be an observation, i.e. a mismatch,
 //!   while the encoder path that *is* reachable — `term_to_binary(self())` — is a clean
 //!   capability gap; see the crate report);
-//! * funs — `EXPORT_EXT` (113) and `NEW_FUN_EXT` (112);
+//! * funs — `EXPORT_EXT` (113) (both its encode-side `unsupported` case and its
+//!   decode → re-encode round-trip) and `NEW_FUN_EXT` (112);
 //! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option, and
 //!   `{minor_version, 2}`;
 //! * `ATOM_CACHE_REF` (82) — a blob carrying one is decoded with **no** atom-cache context,
@@ -30,9 +36,22 @@
 //! The live handshake / a node-to-node loopback and the `DOP_*` control-message framing are
 //! **not** expressible through a single CLI process (they need two connected nodes and the
 //! `DFLAG_*` protocol), so they remain an honest, documented gap rather than a fabricated
-//! case. Decoding a `compressed` (80) blob is likewise not a case: the oracle succeeds
-//! while the Rust runtime raises a plain `badarg` (an observation, i.e. a mismatch), so it
-//! is reported rather than encoded as a case.
+//! case.
+//!
+//! ## Honest capability gaps (documented here, not asserted as cases)
+//!
+//! * The `compressed` (80) **encode** option and the free-standing encode of an
+//!   `EXPORT_EXT` (113) / `NEW_FUN_EXT` (112) fun are the Rust runtime's remaining A.5
+//!   *encode*-side gaps; the four `wire/*_encode*` cases pinning them report
+//!   `unsupported` (`beam_rt: unsupported: bif` / `unsupported: local_fun`), never a
+//!   mismatch.
+//! * Decoding a `compressed` (80) blob is not a case: the oracle decompresses while the
+//!   Rust runtime raises a plain `badarg` (an observation, i.e. a mismatch), so it is
+//!   reported rather than encoded as a case.
+//! * `FUN_EXT` (115) is deliberately not a case: the reference decoder does not validate it
+//!   (even a truncated blob decodes to the empty atom `''`), so any golden would pin an
+//!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is
+//!   the tag that matters for the distribution wire.
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -615,6 +634,231 @@ pub(crate) fn group() -> Vec<Case> {
             golden: Golden {
                 stdout: Some("exception error badarg"),
                 exit_code: 1,
+            },
+        },
+        // -- NEW_REFERENCE_EXT (114): the compact reference form --------------------
+        Case {
+            id: "wire/new_reference_ext_is_reference",
+            description: "a NEW_REFERENCE_EXT (114) blob decodes to a reference",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "is_reference(binary_to_term(<<131,114,0,3,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,0,0,0,0,0,2,35,202,52,184,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/new_reference_ext_roundtrip",
+            description: "a NEW_REFERENCE_EXT (114) blob re-encodes as the equivalent NEWER_REFERENCE_EXT (90) bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(binary_to_term(<<131,114,0,3,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,0,0,0,0,0,2,35,202,52,184,0,0,0,1,0,0,0,2,0,0,0,3,0,0,0,4>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,90,0,3,119,13,110,111,110,111,100,101,64,110,111,104,111,115,116,0,0,0,0,0,0,0,0,2,35,202,52,184,0,0,0>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        // -- BIT_BINARY_EXT (77): bitstrings with a bit count -----------------------
+        Case {
+            id: "wire/bit_binary_ext_decode",
+            description: "a fixed BIT_BINARY_EXT (77) blob decodes to the bitstring it carries",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,77,0,0,0,1,3,96>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<3:3>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/bit_binary_ext_encode",
+            description: "a 3-bit bitstring encodes as BIT_BINARY_EXT (77) with its bit count",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(<<3:3>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,77,0,0,0,1,3,96>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/bit_binary_ext_roundtrip",
+            description: "binary_to_term/1 inverts term_to_binary/1 for a bitstring",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(<<3:3>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<3:3>>"),
+                exit_code: 0,
+            },
+        },
+        // -- tuples: SMALL_TUPLE_EXT (104) / LARGE_TUPLE_EXT (105) -------------------
+        Case {
+            id: "wire/small_tuple_ext_encode",
+            description: "a 2-tuple encodes as SMALL_TUPLE_EXT (104) with a 32-bit arity",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary({a,1})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,1,97,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/small_tuple_ext_roundtrip",
+            description: "binary_to_term/1 inverts term_to_binary/1 for a tuple",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary({a,1}))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {a,1}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/large_tuple_ext_encode_tag",
+            description: "a 300-element tuple encodes with the LARGE_TUPLE_EXT (105) tag",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary:at(term_to_binary(list_to_tuple(lists:seq(1,300))), 1)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 105"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/large_tuple_ext_roundtrip",
+            description: "binary_to_term/1 inverts term_to_binary/1 for a 300-element tuple",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "tuple_size(binary_to_term(term_to_binary(list_to_tuple(lists:seq(1,300)))))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 300"),
+                exit_code: 0,
+            },
+        },
+        // -- MAP_EXT (116): a multi-key map, compared order-independently ------------
+        Case {
+            id: "wire/map_ext_multi_key_roundtrip",
+            description: "a multi-key map round-trips through MAP_EXT (116), compared as a sorted key list",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "lists:sort(maps:to_list(binary_to_term(term_to_binary(#{z => 1, a => 2, m => 3}))))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [{a,2},{m,3},{z,1}]"),
+                exit_code: 0,
+            },
+        },
+        // -- legacy integer / atom forms: INTEGER_EXT (98), ATOM_EXT (100) -----------
+        Case {
+            id: "wire/integer_ext_legacy_decode",
+            description: "a fixed legacy INTEGER_EXT (98) blob decodes to the 32-bit integer it carries",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,98,0,0,1,44>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 300"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/atom_ext_legacy_decode",
+            description: "a fixed legacy ATOM_EXT (100) blob decodes to the atom it names",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,100,0,3,102,111,111>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok foo"),
+                exit_code: 0,
+            },
+        },
+        // -- legacy external forms: PID_EXT (103) / REFERENCE_EXT (101) --------------
+        Case {
+            id: "wire/pid_ext_upgrades_to_new_pid",
+            description: "a legacy PID_EXT (103) blob re-encodes as the equivalent NEW_PID_EXT (88) bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(binary_to_term(<<131,103,119,7,102,111,111,64,98,97,114,0,0,0,1,0,0,0,0,0>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,88,119,7,102,111,111,64,98,97,114,0,0,0,1,0,0,0,0,0,0,0,0>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/reference_ext_upgrades_to_newer",
+            description: "a legacy REFERENCE_EXT (101) blob re-encodes as the equivalent NEWER_REFERENCE_EXT (90) bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(binary_to_term(<<131,101,119,7,102,111,111,64,98,97,114,0,0,0,1,0>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,90,0,1,119,7,102,111,111,64,98,97,114,0,0,0,0,0,0,0,1>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        // -- EXPORT_EXT (113): the decode direction of an exported fun --------------
+        Case {
+            id: "wire/export_ext_decode_roundtrip",
+            description: "a fixed EXPORT_EXT (113) blob decodes to the exported fun and re-encodes identically",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(binary_to_term(<<131,113,119,5,108,105,115,116,115,119,7,114,101,118,101,114,115,101,97,1>>))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,113,119,5,108,105,115,116,115,119,7,114,101,118,101,114,115,101,97,1>>",
+                ),
+                exit_code: 0,
             },
         },
     ]

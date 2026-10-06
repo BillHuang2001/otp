@@ -737,3 +737,102 @@ fn malformed_images_are_typed_errors_never_panics() {
     assert_bad_arg(&[]);
     assert_bad_arg(&[VERSION_MAGIC]);
 }
+
+// ---------------------------------------------------------------------------
+// Oracle acceptance of our `NEW_FUN_EXT` / `RECORD_EXT` images
+// ---------------------------------------------------------------------------
+
+/// A hand-written `RECORD_EXT` (`67`) image: module `m`, name `r`, not exported, with
+/// the two fields declared `[(b, 22), (a, 11)]` (the wire keys are `b`, `a`). Ordinary
+/// Erlang records encode as tuples, so `term_to_binary/1` never emits `67`; the oracle
+/// is asked below to `binary_to_term/1` this one and confirm it accepts it.
+const RECORD_IMAGE: &[u8] = &[
+    131, 67, 0, 0, 0, 2, 0, 119, 1, b'm', 119, 1, b'r', 119, 1, b'b', 119, 1, b'a', 97, 22, 97, 11,
+];
+
+/// Oracle-gated acceptance check for the two tags whose images are pinned offline
+/// (`tests/roundtrip.rs::oracle_eval_new_fun_image_round_trips` and
+/// `tests/record_roundtrip.rs::record_ext_declaration_order_round_trips_byte_exact`):
+///
+/// * the oracle's own `term_to_binary(fun() -> ok end)` (`NEW_FUN_EXT`) is decoded by
+///   **our** decoder and re-encoded; the oracle must read our re-encoding as the same
+///   fun;
+/// * our re-encoded `RECORD_EXT` image must be accepted by the oracle's
+///   `binary_to_term/1` without raising.
+///
+/// Skipped **loudly** when no `erl` oracle is available, exactly like the corpus test —
+/// never a silent pass. The two offline pins stay independent of this test.
+#[test]
+fn oracle_accepts_our_new_fun_and_record_images() {
+    let Some(oracle) = oracle_or_skip("oracle_accepts_our_new_fun_and_record_images") else {
+        return;
+    };
+
+    // ONE erl spawn: the oracle's own `NEW_FUN_EXT` image for the `erl_eval` lambda.
+    let images = parse_binary_list(&run_erl(
+        &oracle,
+        "io:format(\"~w~n\", [ term_to_binary(fun() -> ok end) ])",
+    ));
+    assert_eq!(images.len(), 1, "expected exactly one image: {images:?}");
+    let oracle_fun = &images[0];
+    assert_eq!(oracle_fun.first(), Some(&VERSION_MAGIC));
+    assert_eq!(
+        oracle_fun.get(1),
+        Some(&NEW_FUN_EXT),
+        "the oracle's `fun() -> ok end` image must be NEW_FUN_EXT ({NEW_FUN_EXT})"
+    );
+
+    // Our decoder accepts the oracle's fun image…
+    let mut h = heap();
+    let mut atoms = AtomTable::new();
+    let fun = decode_term(oracle_fun, &mut h, &mut atoms)
+        .unwrap_or_else(|e| panic!("our decoder rejected the oracle NEW_FUN_EXT image: {e:?}"));
+    assert_eq!(fun_kind_term(fun).expect("a fun"), FunKind::Imported);
+
+    // …and our re-encoding of it is the image the oracle must read back.
+    let our_fun = encode_term(fun, &atoms).expect("re-encode the decoded fun");
+
+    // Our own `RECORD_EXT` image (the decoder and encoder are inverse on the wire, so
+    // re-encoding it here reproduces the same bytes — see the offline record pin).
+    let mut rec_atoms = AtomTable::new();
+    rec_atoms.seed(["false", "true"]);
+    rec_atoms.seed(["m", "r", "a", "b"]);
+    let mut rec_heap = heap();
+    let rec = decode_term(RECORD_IMAGE, &mut rec_heap, &mut rec_atoms)
+        .expect("our decoder accepts the hand-written RECORD_EXT image");
+    let our_record = encode_term(rec, &rec_atoms).expect("re-encode the decoded record");
+
+    let check = format!(
+        "io:format(\"~w~n\", [ [ \
+            (fun() -> try binary_to_term(list_to_binary({record})), true \
+                      catch _:_ -> false end end)(), \
+            binary_to_term(list_to_binary({ours})) =:= binary_to_term(list_to_binary({theirs})) \
+         ] ])",
+        record = erl_bytes(&our_record),
+        ours = erl_bytes(&our_fun),
+        theirs = erl_bytes(oracle_fun),
+    );
+    let printed = run_erl(&oracle, &check);
+    let bools = parse_bool_list(printed.trim());
+    assert_eq!(
+        bools.len(),
+        2,
+        "the oracle returned {} booleans for 2 checks: {printed:?}",
+        bools.len()
+    );
+    assert!(
+        bools[0],
+        "the oracle's binary_to_term/1 rejected our RECORD_EXT image {our_record:?}"
+    );
+    assert!(
+        bools[1],
+        "the oracle read our NEW_FUN_EXT image {our_fun:?} as a different fun than its \
+         own {oracle_fun:?}"
+    );
+    eprintln!(
+        "[beam_codec interop] the oracle accepted our re-encoded NEW_FUN_EXT ({} bytes) and \
+         RECORD_EXT ({} bytes) images, and read our fun as =:= its own",
+        our_fun.len(),
+        our_record.len()
+    );
+}
