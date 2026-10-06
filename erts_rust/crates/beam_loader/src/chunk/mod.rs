@@ -13,6 +13,7 @@ pub mod code;
 pub mod line;
 pub mod literal;
 pub mod misc;
+pub mod record;
 pub mod table;
 pub mod types;
 
@@ -44,6 +45,8 @@ pub struct Chunks<'a> {
     pub imports: Vec<table::RawImport>,
     /// The `FunT` lambda descriptors, in file (fun-table index) order.
     pub funs: Vec<table::RawFun>,
+    /// The `Recs` native-record definitions, in file order (empty when absent).
+    pub records: Vec<record::RawRecord>,
     /// The decoded `Line` table, if a usable `Line` chunk was present.
     pub line: Option<LineTable>,
     /// The decoded `Type` table (or its fallback).
@@ -107,6 +110,12 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         Some(chunk) => table::parse_funs(chunk.data)?,
         None => Vec::new(),
     };
+    // `Recs` carries the module's native-record definitions. It is parsed with the
+    // atom *names* because the export flag is the atom `true`/`false`.
+    let records = match chunks.find(ChunkId::RECS) {
+        Some(chunk) => record::parse(chunk.data, &atoms)?,
+        None => Vec::new(),
+    };
     let literals = match chunks.find(ChunkId::LITT) {
         Some(chunk) => literal::parse(chunk.data)?,
         None => Vec::new(),
@@ -134,6 +143,7 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         locals,
         imports,
         funs,
+        records,
         line,
         types,
         literals,

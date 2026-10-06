@@ -220,6 +220,32 @@ pub struct FunDescriptor {
     pub uniq: u32,
 }
 
+/// One field of a native-record definition ([`RecordDefinition`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct RecordField {
+    /// The field-name atom.
+    pub name: Atom,
+    /// The field's default value, or `None` when the field has **no** default.
+    ///
+    /// `None` is the file's absent sentinel (`u,0`); a field whose default is
+    /// literally `0` is `Some(<small 0>)`, never `None`.
+    pub default: Option<Eterm>,
+}
+
+/// One native-record definition from the `Recs` chunk.
+///
+/// A module's native records (`-record #name{…}`) are what the
+/// `records:get_definition/2` BIF serves as `{#{is_exported => Bool}, Fields}`.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct RecordDefinition {
+    /// The record-name atom.
+    pub name: Atom,
+    /// Whether the record is exported (`-export_record/1`).
+    pub is_exported: bool,
+    /// The fields, in **declaration order** (the file order — never sorted).
+    pub fields: Vec<RecordField>,
+}
+
 /// A fully loaded and lowered module — the loader's output and the engine's input.
 ///
 /// A `Module` is `Clone` (cheap: the literal area is shared behind an [`Arc`]) and
@@ -250,6 +276,8 @@ pub struct Module {
     pub functions: Vec<Function>,
     /// The `FunT` lambda descriptors; `make_fun3`'s index addresses this vector.
     pub funs: Vec<FunDescriptor>,
+    /// The `Recs` native-record definitions, in file (declaration) order.
+    pub records: Vec<RecordDefinition>,
     /// The `Code` chunk header.
     pub code_version: CodeVersion,
     /// The decoded `Type` chunk (or its fallback).
@@ -278,6 +306,7 @@ impl Default for Module {
             imports: Vec::new(),
             functions: Vec::new(),
             funs: Vec::new(),
+            records: Vec::new(),
             code_version: CodeVersion::default(),
             types: TypeTable::default(),
             line: LineTable::default(),
@@ -333,5 +362,28 @@ impl Module {
     /// The module's lambda descriptors, in `FunT` (fun-table index) order.
     pub fn funs(&self) -> &[FunDescriptor] {
         &self.funs
+    }
+
+    /// The module's native-record definitions (`Recs` chunk), in file order.
+    pub fn records(&self) -> &[RecordDefinition] {
+        &self.records
+    }
+
+    /// The definition of the record named by the module-local `name` atom.
+    ///
+    /// Returns the first match, or `None` when the module defines no such record.
+    pub fn record(&self, name: Atom) -> Option<&RecordDefinition> {
+        self.records.iter().find(|record| record.name == name)
+    }
+
+    /// The definition of the record named `name`, resolved through this module's atom
+    /// table.
+    ///
+    /// This is the lookup the `records:get_definition/2` BIF needs: it receives the
+    /// record name as a **runtime** atom (whose identity need not be shared with the
+    /// loader's table), so the name string is resolved first.
+    pub fn record_by_name(&self, name: &str) -> Option<&RecordDefinition> {
+        let atom = self.atom_table.lookup(name)?;
+        self.record(atom)
     }
 }

@@ -238,9 +238,21 @@ tooling-only).
   `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
   into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
-- **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Dbgi` / `Recs`** — data-only; `StrT`/`Attr`/`CInf`
-  are captured raw (`StrT` → bytes, `Attr`/`CInf` → `Option<Vec<u8>>`); `Meta`/`DbgB`/`Dbgi`/`Recs`
+- **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Dbgi`** — data-only; `StrT`/`Attr`/`CInf`
+  are captured raw (`StrT` → bytes, `Attr`/`CInf` → `Option<Vec<u8>>`); `Meta`/`DbgB`/`Dbgi`
   are recognized ids whose payloads are deliberately **not** parsed (debug info is tooling-only).
+- **`Recs`** — `u32 version` (must be `0`; a non-zero version means "no records" — chunk-absent,
+  *not* an error, `beam_file.c:1335-1348`), `i32 record_count` (`≥ 0`; negative ⇒ `BadArg`),
+  `i32 total_field_count` (informational; `≥ 0`), then `record_count` record entries EACH encoded as
+  one BEAM instruction: an opcode byte that must be `Opcode::call_last` (5 — reused only because it
+  has 3 operands), then operand 1 = the record-name **atom**, operand 2 = the `true`/`false`
+  export-flag **atom**, operand 3 = a `z,1` **argument list** (`u` element count `N`, must be **even**,
+  then `N/2` `(field-name atom, default)` pairs). Field defaults (raw tag, *not* via
+  `decode_operand`): `u` = **no default** (the `make_catch(0)` sentinel), `i` = a signed small
+  integer, a wide `i` = a signed **bignum** (`marshal_integer`), `a` = an atom (`0` ⇒ `nil`),
+  `z,4` = a `LitT` literal index. `src/chunk/record.rs` parses it into `Chunks.records`; the
+  record's module is the module being loaded (the chunk carries none, like the C's
+  `tmp_def->module = beam->module`).
 ### Operand tags (`src/operand.rs` + `src/decode.rs`) — the authoritative table
 Each operand = one *tag/length* byte then optional payload (`beam_file.c:167-240`). Tag = `byte & 0x07`
 (3 bits ⇒ a file carries only tags 0–7; tags 8–14 are loader-internal and **never appear in a file**):
