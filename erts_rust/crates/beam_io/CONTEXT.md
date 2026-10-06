@@ -120,6 +120,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   Each driver interaction (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the
   port timer from `Driver::next_timeout` through the internal `refresh_timeout`: `Some(d)` arms/**re-points** the
   single `TIMEOUT` task at `d`, `None` clears it (a driver's declaration is authoritative until its next interaction).
+  `port.rs` also re-exports `PortRegistry` (`pub use crate::registry::PortRegistry`) so the existing
+  `crate::port::PortRegistry` paths keep resolving.
+### `registry.rs`
 - `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
   port number: `new()`, `open(poller, Box<dyn Driver>) -> Result<PortId>`,
   `open_named(poller, &DriverRegistry, name) -> Result<PortId>`, `get(id)`, `get_mut(id)`,
