@@ -197,7 +197,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`)
-- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`)
+- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`/`DictHook`)
 - `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag), B-tree/CHAMP interiors
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
 - `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider
@@ -230,9 +230,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
   `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
-  `total=333 agree=332 mismatch=0 unsupported=1 skipped=0`** (re-measured at this node's HEAD). The 1
-  `unsupported` is `wire/new_fun_ext_encode` (`beam_rt`'s `local_fun` gap); **no case disagrees**
-  (`mismatch=0`, `skipped=0`).
+  `total=431 agree=429 mismatch=0 unsupported=2 skipped=0`** (re-measured at this node's HEAD). The 2
+  `unsupported` are `records/get_definition_unknown_record` (A.7) and `wire/new_fun_ext_encode`
+  (A.5, `beam_rt`'s `local_fun` gap); **no case disagrees** (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
@@ -260,8 +260,24 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
   `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). The one remaining
   degradation is a tag atom that cannot be interned (no `AtomInterner` hook) ⇒ plain `badarg`.
-  **Handoff:** `beam_rt::runner::exit_reason` can replace its `<structured reason>` placeholder by
-  reading the live-reason slot.
+  `beam_rt::runner::exit_reason` recovers the live reason term from the slot and renders it as the
+  uncaught-exception reason.
+- **Failed head-clause/guard terminates via `func_info`; a missing module/function is bare `undef`.**
+  `beam_engine`'s `Instr::FuncInfo` (`src/interpreter.rs`) raises class `error` with the **bare atom
+  `function_clause`** (resolved from the running module's atom table; a module whose table lacks the
+  atom yields a typed `unsupported`, never a substituted wrong atom), matching C `i_func_info_IaaI` —
+  treating it as a no-op would let a failed head clause fall through to the entry label and loop.
+  `beam_rt::boot::CORE_ATOMS` seeds `function_clause`/`exit`/`throw` so a fixture module lacking the
+  atom still resolves it; a call to a missing module/function yields the bare atom `undef`.
+- **Host seams and BIF-level oracle parity.** The process dictionary is wired end-to-end — `beam_bifs`
+  adds a 7th optional `BifContext` seam `DictHook` (`put`/`get`/`erase`/`get_keys`/`get_keys_for_value`)
+  backing `erlang:put/2`/`get/1`/`erase/1`/`get_keys/0,1`, and `beam_rt` supplies it
+  (`context::DictBridge`). `term_to_binary/2` adopts `beam_codec`'s minor-version API
+  (`MinorVersion::{V0,V1,V2}`, legacy `ATOM_EXT` 100 / ASCII `FLOAT_EXT` 99), byte-identical to the
+  oracle. The port BIFs match the oracle: `port_info/1` = the 7-item set in oracle order, `port_info/2`
+  = `{Item,Value}` (`badarg` for an unknown item), `port_command/3 [force]` ⇒ `error:notsup`,
+  `open_port(_, [list])` ⇒ `badarg`. `-eval` map literals are stored term-order-sorted (the oracle's
+  key order).
 - **The OTP-29 native-record opcode family is fully modelled and executed.** `beam_loader` lowers all eight
   members (`is_any_native_record/2`, `is_native_record/4`, `get_record_elements/3`, `put_record/6`,
   `is_record_accessible/3`, `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`) to
@@ -275,14 +291,24 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
-- Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
-  entries for the `beam_term` foundation extensions (`map`/`bitstring`/`refc`), the `RefCount` move into
-  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` owning refc binaries, the
-  `beam_abi` frozen-header seam work, and the fun/export literal work (`beam_term::fun` layout;
-  `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT` decode+encode with the `size`-field and env-order rules and the
-  `Local`-fun encode gap; `beam_gc` fun block sizing). Also owed: the receive/message execution path
-  (`beam_engine` receive family + `Mailbox`/block-outcome seams; `beam_message::QueueCursor`;
-  `beam_process` resume-on-send; the `beam_rt` executor runner + `PortHook` provider).
+- `beam_bifs`'s `ets:info/1` bridge still emits its own 12-field subset instead of
+  `beam_ets::TableInfo::entries` (15 fields), and `records:get_definition/2` remains a typed
+  `unsupported_bif` (it needs the code-server `Recs`-chunk record table, unreachable from
+  `beam_loader`'s `Recs` id today).
+- `wire/new_fun_ext_encode` (encoding a runtime-made `Local` fun) stays `unsupported`; a faithful ETF
+  image needs the module identity/MD5 the inlined descriptor does not carry.
+- `open_port({spawn_executable, ...})` on a nonexistent path diverges: the oracle raises `error:enoent`
+  while `beam_io`'s `SpawnDriver` maps the spawn failure to `BeamError::Io` (a `beam_io`/`beam_rt` fix).
+- Repo-root owned (outside this node): owed `../../CHANGE.md` entries for the `beam_term` foundation
+  extensions (`map`/`bitstring`/`refc`), the `RefCount` move into `beam_alloc` + the `RefcBinary`
+  off-heap seam, `beam_gc::OffHeap` owning refc binaries, the `beam_abi` frozen-header seam work, the
+  fun/export literal work (`beam_term::fun` layout; `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT`
+  decode+encode with the `size`-field and env-order rules and the `Local`-fun encode gap; `beam_gc` fun
+  block sizing), the receive/message execution path (`beam_engine` receive family +
+  `Mailbox`/block-outcome seams; `beam_message::QueueCursor`; `beam_process` resume-on-send; the
+  `beam_rt` executor runner + `PortHook` provider), and the runtime parity work
+  (`func_info`→`function_clause`, `DictHook`/process dictionary, `{minor_version}` adoption, port
+  parity, sorted `-eval` map literals).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
@@ -312,9 +338,11 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The system Erlang toolchain (OTP 29 / erts-17.1) is on `PATH` — `erlc`/`erl`/`escript` are usable
   for producing `.beam` fixtures and as the differential oracle.
 - **Differential-corpus coverage gap (for the `tools/differential` owner):** no case directly exercises the
-  native-record opcode family, and none exercises the structured raise reasons
-  (`case_clause`/`badmap`/`badkey`/`badrecord`/`badfield`); both are covered only by crate-level tests, so
-  the gate's `mismatch=0` is consistent with them but does not pin them.
+  native-record opcode family; none exercises the `func_info` clause-failure path, the structured raise
+  reasons (`case_clause`/`{badkey,_}`/`{badmap,_}`/`{bad_generator,_}`/`{badrecord,_}`/`{badfield,_}`) or
+  bare-atom `undef`; and none pins the port divergences (`port_info`/`port_command`/`open_port`). All are
+  covered only by crate-level tests, so the gate's `mismatch=0` is consistent with them but does not pin
+  them.
 
 ## See Also
 - `../CONTEXT.md` → workspace root: the binding cross-crate contracts and routing table.
