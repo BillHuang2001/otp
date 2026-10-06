@@ -218,9 +218,10 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **120 tests, 0 failures** —
-`104` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
-`drivers/{fd,line_buffer,binary_io,efile}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` + `tests/port_task.rs` `4`.
+**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **148 tests, 0 failures** —
+`118` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
+`drivers/{fd,line_buffer,binary_io,efile,spawn}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` +
+`tests/port_task.rs` `4` + `tests/spawn.rs` `14`.
 - `tests/poller.rs` (integration, real OS fds): socketpair readability reports the right `key`; poll-with-no-events;
   blocking poll interrupted by `Waker::wake` (same + other thread); multiple shareable wakers; reregister flips
   direction; deregister stops events; double-register errors.
