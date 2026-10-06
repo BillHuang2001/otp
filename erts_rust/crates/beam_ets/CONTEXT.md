@@ -296,24 +296,6 @@ impl Table {
   erts_rust/Cargo.toml -p beam_ets --test differential`.
 
 ## Known Issues (honest gaps — not full parity)
-- **Bignum counters are a representation gap.** A bignum element/operand is valid in real ETS but
-  unaddable here, and a sum outside the 60-bit small range (which real ETS promotes to a bignum)
-  reports `BeamError::SystemLimit` rather than a wrong value.
-- **`take` reclaims the stored objects but the returned copies are checked out, not counted.** Each
-  removed object is deep-copied out of the store and the table's own original is
-  `TermStore::free`d, so an `insert`+`take` churn does not grow `Table::memory()`. The returned copies
-  are `relinquish`ed: valid for the table's lifetime and never handed out again, but no longer counted
-  as table memory (matching real `ets:take/2`, whose objects leave the table). Their words stay held by
-  the store's block until `delete_all_objects`/drop, since the arena never shrinks.
-- **Hash-interior navigation order is unspecified (per the ETS contract).** `HashInterior` supplies the
-  bucket-scan `keys()` and relies on the `Interior` trait defaults for `first_key`/`last_key`/
-  `next_key`/`prev_key`, so `first`/`last` are the first/last keys of that internal order and
-  `next`/`prev` are its position-based successor/predecessor (`last != first` and `prev != next` in
-  general). Real `erl` answers `first == last` for a small hash table — a *different* internal order,
-  equally unspecified. Only the order is unspecified: every key the walk yields is a present key, the
-  `first`+`next` walk is a permutation of the stored keys, and `next`/`prev` on an **absent** anchor are
-  `badarg`. `ordered_set` navigation is exact (ascending `beam_term` order, absent keys read as range
-  bounds).
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
 - **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
