@@ -513,10 +513,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
   to keep a hostile stream from driving an unbounded allocation.
-- **The compressed wrapper is always emitted when compression is explicitly requested**, even when it
-  makes the image larger — the C reverts to the plain image in that case. This is a deliberate,
-  documented difference (`encode_term_compressed` obeys the caller; `encode_term` is the uncompressed
-  API).
+- **Compressed output is not byte-comparable with the oracle** for the *deflate bytes* (zlib (C) and
+  `miniz_oxide` produce different, equally valid streams) — but whether a wrapper or the plain image is
+  emitted **is** oracle-exact (the shrink rule above). See §Design Decisions.
 - Identifiers always decode as *external* things (no local-node identity in the codec yet).
 - **`node` occupies the sysname-atom slot; `creation` is carried in C's off-heap `next` link
   (a documented M1 substitution).** In C `ExternalThing`'s first data word is a pointer to a
