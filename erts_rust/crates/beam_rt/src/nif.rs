@@ -1,0 +1,340 @@
+//! The NIF subsystem: the runtime's **live NIF libraries** and the host they run against.
+//!
+//! This is the runtime half of contract **A.3** (the NIF C ABI). `beam_abi` freezes the ABI
+//! *shape* and owns the `dlopen` loader ([`beam_abi::nif::loader`]); this module owns the
+//! **state**: which libraries a `beam_rt` process has loaded, the [`NifHost`] the `enif_*`
+//! functions draw their runtime services from, and the call path that lets interpreted Erlang
+//! reach a C NIF.
+//!
+//! # Two host handles, one library
+//!
+//! [`beam_abi::nif::loader::load`] **erases the borrow** of the [`NifHost`] it is given into
+//! a raw `*mut dyn NifHost`, because the library's `unload` callback (run from
+//! [`beam_abi::nif::loader::NifLibrary`]'s `Drop`) needs a host again and cannot name the
+//! borrow's lifetime. The host passed to `load` must therefore **outlive the library**.
+//!
+//! [`NifEntry`] is that guarantee: it stores the [`NifLibrary`] **and** the boxed
+//! [`NifHostImpl`] it was loaded against, and — because Rust drops struct fields in
+//! declaration order — the library (and hence `unload`) drops *before* the host. A NIF
+//! **call**, by contrast, runs against a **fresh** per-call host ([`NifHostImpl`] built by
+//! [`RuntimeContext::try_call_nif`](crate::context::RuntimeContext)) that owns the per-call
+//! heap and the per-call [`PendingInterner`](crate::context::PendingInterner). Keeping the
+//! two apart is what lets the unload host be long-lived while the call host is cheap and
+//! correctly rooted at the current atom-table length.
+//!
+//! # Deferred atom interning
+//!
+//! A NIF interns atoms through [`NifHost::intern_atom`] (an `enif_make_atom`), which must add
+//! names to the runtime's **one** shared [`AtomTable`] — a table the BIF layer borrows
+//! immutably. The host therefore uses the same deferred-commit
+//! [`PendingInterner`](crate::context::PendingInterner) the BIF layer uses, and it shares the
+//! **same** interner as the BIF call that triggered it: a `load` callback and the
+//! `erlang:load_nif/2` BIF itself may interleave new-atom creations, and two independent
+//! predicted-index lists would corrupt each other. One shared list, committed once by the
+//! caller, keeps every predicted index exact.
+//!
+//! # Typed gaps (never a wrong result)
+//!
+//! [`NifHostImpl`] leaves `term_to_binary`/`binary_to_term`/`make_ref` at the trait defaults
+//! (the typed `None`), so an `enif_term_to_binary`/`enif_binary_to_term`/`enif_make_ref` NIF
+//! reports failure rather than fabricating a term. `erlang:load_nif/2` on an
+//! already-loaded module is a `reload` (the oracle's rule since OTP 20).
+
+use std::collections::HashMap;
+use std::rc::Rc;
+
+use beam_abi::nif::loader::{NifCallError, NifLibrary};
+use beam_abi::{NifEnv, NifHost};
+use beam_alloc::Heap;
+use beam_bifs::AtomInterner;
+use beam_term::prelude::{atom_val, is_atom, make_atom, Eterm};
+use beam_term::AtomTable;
+
+use crate::context::PendingInterner;
+
+/// One loaded NIF library plus the host it was loaded against.
+///
+/// The field order is load-bearing: `lib` is declared **first** so it is dropped first, and
+/// its `Drop` (which runs the library's `unload` callback against the erased host pointer)
+/// therefore still sees a live `host`.
+pub(crate) struct NifEntry {
+    /// The `dlopen`ed library (its `Drop` runs `unload` + `dlclose`).
+    lib: NifLibrary,
+    /// The host the library was loaded against — kept alive for the library's lifetime.
+    ///
+    /// Read only indirectly (through the erased pointer inside `lib`), which is why the field
+    /// carries an explicit `allow`: it is the *ownership* that matters, not any Rust access.
+    #[allow(dead_code)]
+    host: Box<NifHostImpl>,
+}
+
+impl NifEntry {
+    /// A library entry pairing `lib` with the `host` it was loaded against.
+    pub(crate) fn new(lib: NifLibrary, host: Box<NifHostImpl>) -> NifEntry {
+        NifEntry { lib, host }
+    }
+
+    /// The `{name, arity}` pairs the library exports.
+    fn funcs(&self) -> &[(String, u32)] {
+        self.lib.funcs()
+    }
+}
+
+/// The runtime's live NIF libraries, keyed by the Erlang module each implements.
+///
+/// **Not `Send`**: a [`NifLibrary`] owns raw `dlopen` handles and an erased host pointer, so a
+/// registry is confined to the thread that loaded it — which is fine, because the whole
+/// runtime is single-threaded (`beam_rt` has no `unsafe` and no cross-thread sharing).
+pub(crate) struct NifRegistry {
+    /// The loaded libraries, by module name.
+    libs: HashMap<String, NifEntry>,
+}
+
+impl NifRegistry {
+    /// An empty registry.
+    ///
+    /// The [`enif_api_table`](beam_abi::nif::enif::enif_api_table) reference is **load-bearing**:
+    /// it drags the `enif_*`-carrying codegen unit into the link so the symbols a loaded `.so`
+    /// imports are actually present (see `build.rs`'s `--export-dynamic`).
+    pub(crate) fn new() -> NifRegistry {
+        let _ = std::hint::black_box(beam_abi::nif::enif::enif_api_table());
+        NifRegistry {
+            libs: HashMap::new(),
+        }
+    }
+
+    /// Whether `module` already has a loaded NIF library (the oracle's `reload` condition).
+    pub(crate) fn is_loaded(&self, module: &str) -> bool {
+        self.libs.contains_key(module)
+    }
+
+    /// Records `entry` as the library implementing `module`.
+    pub(crate) fn insert(&mut self, module: String, entry: NifEntry) {
+        self.libs.insert(module, entry);
+    }
+
+    /// Whether `module`'s library exports `function/arity`.
+    ///
+    /// This is the NIF-dispatch predicate: `false` (a miss) is a perfect no-op, so a call to an
+    /// ordinary Erlang function of a module that also has a NIF library is never intercepted.
+    pub(crate) fn lookup(&self, module: &str, function: &str, arity: u32) -> bool {
+        self.libs
+            .get(module)
+            .is_some_and(|entry| entry.funcs().iter().any(|(n, a)| n == function && *a == arity))
+    }
+
+    /// Calls `module`'s NIF `function/arity` with `args` over `env`.
+    ///
+    /// A module with no library, or one that does not export `function/arity`, is the typed
+    /// [`NifCallError::UnknownFunction`] — never a panic and never a fabricated value.
+    pub(crate) fn call(
+        &self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        env: &mut NifEnv,
+        args: &[Eterm],
+    ) -> std::result::Result<Eterm, NifCallError> {
+        match self.libs.get(module) {
+            Some(entry) => entry.lib.call(env, function, arity, args),
+            None => Err(NifCallError::UnknownFunction {
+                name: function.to_string(),
+                arity,
+            }),
+        }
+    }
+}
+
+/// The runtime services one NIF call (or one library `load`/`unload`) draws on.
+///
+/// It **owns** its [`Heap`] so it has a stable address when boxed (the library's erased host
+/// pointer must stay valid), and carries a handle to the runtime's one shared [`AtomTable`]
+/// plus the in-flight [`PendingInterner`] a new atom is recorded on.
+pub(crate) struct NifHostImpl {
+    /// The term-allocation arena for the NIF's lifetime.
+    heap: Heap,
+    /// A handle to the runtime's one shared atom table (index resolution).
+    atoms: Rc<AtomTable>,
+    /// The deferred-commit interner new atoms are recorded on.
+    ///
+    /// Shared (via its `Rc`) with the BIF call that triggered this host, so the interleaved
+    /// names of one `load_nif/2` call land in one ordered, exactly-predicted list.
+    interner: PendingInterner,
+    /// `erlang:self()` as seen by the NIF.
+    self_pid: Eterm,
+}
+
+impl NifHostImpl {
+    /// A host over `heap`, resolving atoms against `atoms`/`interner`, running as `self_pid`.
+    pub(crate) fn new(
+        heap: Heap,
+        atoms: Rc<AtomTable>,
+        interner: PendingInterner,
+        self_pid: Eterm,
+    ) -> NifHostImpl {
+        NifHostImpl {
+            heap,
+            atoms,
+            interner,
+            self_pid,
+        }
+    }
+
+    /// Takes the heap back out (the per-call host is consumed once the call returns).
+    pub(crate) fn into_heap(self) -> Heap {
+        self.heap
+    }
+}
+
+impl NifHost for NifHostImpl {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// Interns `name`: an existing atom keeps its index, a new one is recorded on the shared
+    /// interner at its predicted index (committed by the caller after the call returns).
+    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+        if let Some(atom) = self.atoms.lookup(name) {
+            return Some(make_atom(atom));
+        }
+        Some(make_atom(self.interner.intern(name)))
+    }
+
+    /// The text of `atom`, or `None` for a non-atom term or an index this table does not hold.
+    fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+        if !is_atom(atom) {
+            return None;
+        }
+        self.atoms.name(atom_val(atom)).map(str::to_string)
+    }
+
+    /// `erlang:self()` inside the NIF — the pid the calling process runs as.
+    fn self_pid(&mut self) -> Option<Eterm> {
+        Some(self.self_pid)
+    }
+}
+
+/// Maps `beam_abi`'s loader error onto `beam_bifs`'s identically-shaped one.
+///
+/// The two enums exist because `beam_abi` must not depend on `beam_bifs` (the dependency runs
+/// downward); the mapping is variant-for-variant, so the `{error, {Reason, Text}}` term the BIF
+/// renders is the same regardless of which layer produced it.
+pub(crate) fn map_load_error(
+    error: beam_abi::nif::loader::NifLoadError,
+) -> beam_bifs::NifLoadError {
+    use beam_abi::nif::loader::NifLoadError as Abi;
+    use beam_bifs::NifLoadError as Bifs;
+    match error {
+        Abi::LoadFailed(text) => Bifs::LoadFailed(text),
+        Abi::BadLib(text) => Bifs::BadLib(text),
+        Abi::Reload(text) => Bifs::Reload(text),
+        Abi::Load(text) => Bifs::Load(text),
+        Abi::Upgrade(text) => Bifs::Upgrade(text),
+        Abi::OldCode(text) => Bifs::OldCode(text),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_term::prelude::{make_small, Atom};
+
+    #[test]
+    fn a_fresh_registry_knows_no_library() {
+        let registry = NifRegistry::new();
+        assert!(!registry.is_loaded("test_nif"));
+        assert!(!registry.lookup("test_nif", "add", 2));
+
+        // The dispatch predicate is a no-op miss: `call` reports the typed unknown function.
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            atoms,
+            PendingInterner::new(0),
+            make_small(7),
+        );
+        let mut env = NifEnv::new(&mut host);
+        match registry.call("test_nif", "add", 2, &mut env, &[]) {
+            Err(NifCallError::UnknownFunction { name, arity }) => {
+                assert_eq!(name, "add");
+                assert_eq!(arity, 2);
+            }
+            other => panic!("expected UnknownFunction, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn the_host_resolves_existing_atoms_and_records_new_ones() {
+        let mut table = AtomTable::new();
+        let known = table.intern("known");
+        let atoms = Rc::new(table);
+        let interner = PendingInterner::new(atoms.len());
+        let mut host = NifHostImpl::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::clone(&atoms),
+            interner.clone(),
+            make_small(7),
+        );
+
+        // An existing atom keeps its index.
+        assert_eq!(host.intern_atom("known"), Some(make_atom(known)));
+        // A new atom is predicted at `base + 0` (nothing else interning in between).
+        let fresh = host.intern_atom("fresh").expect("always interns");
+        assert!(is_atom(fresh));
+        assert_eq!(atom_val(fresh), Atom::from_raw(atoms.len() as u32));
+        // The name is not in the live table yet — it is committed by the caller.
+        assert_eq!(host.atom_name(fresh), None);
+        // A non-atom term never names an atom.
+        assert_eq!(host.atom_name(make_small(9)), None);
+        // `self_pid` is reported verbatim.
+        assert_eq!(host.self_pid(), Some(make_small(7)));
+
+        // The committed names land exactly at the predicted index.
+        let mut committed = (*atoms).clone();
+        interner.commit(&mut committed);
+        assert_eq!(committed.name(atom_val(fresh)), Some("fresh"));
+
+        // A second call to intern the same name deduplicates within the call.
+        assert_eq!(host.intern_atom("fresh"), Some(fresh));
+    }
+
+    #[test]
+    fn the_host_hands_its_heap_back() {
+        let atoms = Rc::new(AtomTable::new());
+        let host = NifHostImpl::new(
+            Heap::new(64).expect("a test heap"),
+            atoms,
+            PendingInterner::new(0),
+            make_small(7),
+        );
+        let heap = host.into_heap();
+        assert!(heap.available() > 0, "the heap survives the host");
+    }
+
+    #[test]
+    fn load_errors_map_variant_for_variant() {
+        use beam_abi::nif::loader::NifLoadError as Abi;
+        use beam_bifs::NifLoadError as Bifs;
+        assert_eq!(
+            map_load_error(Abi::LoadFailed("a".into())),
+            Bifs::LoadFailed("a".into())
+        );
+        assert_eq!(
+            map_load_error(Abi::BadLib("b".into())),
+            Bifs::BadLib("b".into())
+        );
+        assert_eq!(
+            map_load_error(Abi::Reload("c".into())),
+            Bifs::Reload("c".into())
+        );
+        assert_eq!(map_load_error(Abi::Load("d".into())), Bifs::Load("d".into()));
+        assert_eq!(
+            map_load_error(Abi::Upgrade("e".into())),
+            Bifs::Upgrade("e".into())
+        );
+        assert_eq!(
+            map_load_error(Abi::OldCode("f".into())),
+            Bifs::OldCode("f".into())
+        );
+    }
+}
