@@ -506,9 +506,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/tag.rs` → raw tag constants/masks/shifts, `PrimaryTag`/`BoxedTag`, `primary_tag`, `is_header`
 - `src/eterm.rs` → the `Eterm` word newtype (`raw`/`from_raw`), ABI contract
 - `src/immediate.rs` → small ints, atom immediates, NIL, catch, pid/port immediates
-- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser)
+- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser, `hvalue` = the C `slot.bucket.hvalue` hashpjw used by `make_hash`/`make_hash2`)
 - `src/list.rs` → cons-cell construction/access (`make_list`, `car`, `cdr`, `is_list`)
-- `src/boxed.rs` → boxed pointers, header words, arityval, boxed sub-type predicates, map headers
+- `src/boxed.rs` → boxed pointers, header words, arityval, boxed sub-type predicates, map headers, `internal_ref_numbers`
 - `src/tuple.rs` → tuple construction/size/element access
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
