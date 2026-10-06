@@ -587,7 +587,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
   `beam_alloc::Heap` and forwards to `beam_term::thing` /
   `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier
-  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface
+  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface and the
+  `src/term/record.rs` native-record surface
 - `src/term/fun.rs` → the fun/export forwarding layer (inside the `unsafe` subtree):
   `make_fun_external`/`make_fun_imported`, the `fun_*_term` accessors, the `#[cfg(test)]`
   local-fun builder, and the `beam_term::fun` re-exports
