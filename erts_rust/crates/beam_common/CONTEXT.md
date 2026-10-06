@@ -16,11 +16,26 @@ here must be justified in `../../CONTEXT.md` and `../../../CHANGE.md`.
 Re-exported at the crate root (`beam_common::…`); modules are private except `safety`.
 
 - `error` — `BeamError` (the ONE workspace error type), `Result<T>`, and the term-independent
-  exception machinery: `ExceptionClass`, `ExitReason`, `Raise`, `StackTrace`, `StackFrame`,
-  `SourceLocation`, `AtomName`, `AllocFailure`, `AllocKind`.
+  exception machinery: `ExceptionClass`, `ExitReason`, `Raise`, `LiveReason`, `StackTrace`,
+  `StackFrame`, `SourceLocation`, `AtomName`, `AllocFailure`, `AllocKind`.
   - `pub type Result<T> = core::result::Result<T, BeamError>;`
   - `BeamError` variants: `BadArg`, `BadArith`, `BadArity`, `BadMatch`, `SystemLimit`,
     `Alloc(AllocFailure)`, `TermNotFound`, `Io(std::io::Error)`, `Raise(Raise)`.
+  - `Raise { class, reason, stacktrace, live_reason }` (all fields public). `live_reason:
+    Option<LiveReason>` is the **opaque live-reason slot**: `ExitReason::Structured` is a unit variant,
+    so a structured reason's live *term* travels out-of-band here instead of in the reason. Builders
+    `new`/`error`/`exit`/`throw`/`with_stacktrace`/`with_live_reason`, accessor `live_reason()`.
+    `Debug`+`Clone`+`PartialEq`+`Eq` are kept, but `Debug`, `PartialEq` and `Eq` are **manual**:
+    equality compares only the observable parts (`class`/`reason`/`stacktrace`) and ignores the slot,
+    and `Debug` prints the placeholder `<live reason>` for it — so the payload is never printed,
+    dereferenced or compared. `Clone` stays derived (the handle is an `Arc`).
+  - `LiveReason` — the opaque handle: `new<T: Any + Send + Sync + 'static>(T)`,
+    `downcast_ref::<T>(&self) -> Option<&T>`, `as_any(&self) -> &dyn Any`; `Clone` + `Send` + `Sync`;
+    `Debug` prints `<live reason>` (never the payload).
+  - **Live-reason convention (for adopters):** a raising crate with a term representation stores its
+    live reason term as an `Eterm` payload (`LiveReason::new(term)`) and attaches it with
+    `Raise::with_live_reason`; a consumer recovers it with `downcast_ref::<Eterm>()`. `beam_common`
+    names no term type — that is the adopter's payload type, not a dependency of this crate.
   - `#![forbid(unsafe_code)]` in this crate; `AtomName` wraps `Cow<'static, str>` (no interning,
     no term dependency).
 - `version` — `OTP_VERSION` ("30.0-rc0"), `ERTS_VERSION` ("17.1"), `ERTS_VSN` ("erts-17.1"),
@@ -42,8 +57,9 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
   Fallible operations return `Result<T, BeamError>`; the engine turns a `BeamError::Raise` (or a
   reason error like `BadArg`) into the actual BEAM raise (exception tag in `x(0)`).
 - **No dependency on `beam_term`.** `ExitReason`/`Raise`/`AtomName` are **term-independent**; the
-  raising crate maps them to live terms. A structured (tuple/list/map) reason is carried out-of-band
-  and shown here only as `ExitReason::Structured`.
+  raising crate maps them to live terms. A structured (tuple/list/map) reason is shown here as
+  `ExitReason::Structured` (unit variant, no term), and its live term rides along out-of-band in the
+  opaque `Raise::live_reason` slot — never as a `beam_term` dependency.
 - **Stability:** public enums/structs are `#[non_exhaustive]`; construct via `Default`/`new` +
   builder setters. `BeamError` implements `Display` + `std::error::Error` (source = the inner
   `io::Error`); `From<std::io::Error>` is provided.
@@ -60,7 +76,11 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` only (no fixture/data needs).
   - `error`: `Display` for every `BeamError` variant and reason; `From<io::Error>`; `source()`;
-    `as_atom()` mapping; `Raise` builders + `ExitReason` display; `AtomName` conversions.
+    `as_atom()` mapping; `Raise` builders + `ExitReason` display; `AtomName` conversions;
+    `LiveReason` round-trip + wrong-type `downcast_ref`/`as_any`; `Raise` slot survives `Clone`;
+    `PartialEq` ignores the slot but still splits `class`/`reason`/`stacktrace`; `Debug` hides the
+    payload and `Display` is unchanged; a slot-less raise behaves as before and a `Structured` raise
+    with a slot still yields `as_atom() == None`.
   - `version`: parse/round-trip `OTP_VERSION`/`ERTS_VERSION`, prerelease parse, `Display`, and the
     rejection of malformed input (`ParseVersionError`).
   - `config`: `Default` values, `Flavor` parse/`as_str`, `FeatureFlags::for_flavor`, builder setters,
