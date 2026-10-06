@@ -274,13 +274,27 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
     thread): both handshake roles, a `DOP_*` round-trip, a >`DIST_FRAGMENT_SIZE` message, a tick, a
     wrong-cookie failure that is not a hang, and the **outbound atom cache over a real link** (one
     `New` ref per atom, `82 + index` payload, the peer resolves the names). A spy transport asserts
-    `'E'` frames really crossed.
-  - `tests/live_interop.rs` — **live interop with a real `erl` node.** Starts
-    `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P inet_dist_listen_max P` (P a free
-    loopback port; epmd is NOT used — raw TCP to epmd is blocked in this sandbox), connects with
-    `Connection::client`, completes the handshake, sends a `DOP_REG_SEND` that the node prints
-    (`GOT {hello,42}`), and receives the node's `DOP_SEND_SENDER` reply (`{echo,42}`). Skips honestly
-    (clear `eprintln`) only when `erl` is absent on `PATH`; never fakes a pass.
+    `'E'` frames really crossed; the new `TcpListener` path is exercised (`accept` on a thread, plus a
+    non-blocking `accept` → `WouldBlock`), and the typed `send_reg_send`/`send_link`/`send_exit`/
+    `send_monitor_p` helpers round-trip.
+  - `tests/epmd.rs` — the epmd codecs plus **live epmd**: `publish` an `ALIVE2_REQ` on one connection,
+    `port_please`/`lookup_port` it over a second, observe de-registration on close, and `connect_to_node`
+    end-to-end; the `PORT2_REQ` framing pin (frame length = `1 + name.len()`, the name is the packet
+    remainder). Skips loudly when epmd is unreachable.
+  - `tests/driver.rs` — the `ConnectionDriver`, hermetic: two drivers shuttling `take_output()` bytes
+    (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
+    (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
+    (`'E'` verified), a tick answered, and malformed/truncated/EOF/send-before-established errors.
+  - `tests/live_interop.rs` (blocking) + `tests/live_driver.rs` (non-blocking) — **live interop with a
+    real `erl` node.** Each starts `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P
+    inet_dist_listen_max P` (P a free loopback port), resolves P through **`epmd::lookup_port`**
+    (falling back to P if epmd is unreachable), and completes the handshake. `live_interop.rs` then
+    sends a `DOP_REG_SEND` (the node prints `GOT {hello,42}`), receives the node's `DOP_SEND_SENDER`
+    reply, sends a `DOP_SEND` to the node pid the node echoed back (the node prints `GOT {direct,99}`),
+    and completes a monitor round-trip (`DOP_MONITOR_P` decoded → `DOP_MONITOR_P_EXIT` → the node prints
+    `DOWN … noproc`). `live_driver.rs` drives the `ConnectionDriver` over a genuine non-blocking
+    `TcpStream`. The shared spawn/harness lives in `tests/common/mod.rs`. Both skip honestly (clear
+    `eprintln`) only when `erl` is absent on `PATH`; never fake a pass.
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
