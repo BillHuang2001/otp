@@ -541,10 +541,13 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `cmp`/`eq`/`term_hash`/`size_object`/`AtomTable` access. A `#![deny(unsafe_code)]` consumer must
   deref `*boxed_val(t)` itself (unsafe) to reach into a tuple/list/map/float/binary; the header-word
   subtag tests (`header_subtag`, `BoxedTag::from_raw`, `is_*_header`) are safe but take a *header
-  word*, not a boxed term. The public map/bitstring/refc APIs added for siblings
+  word*, not a boxed term. The public map/bitstring/refc/record APIs added for siblings
   (`map::{write_map,map_get,map_pairs,map_put,map_remove}`, `bitstring::{bitstring_parts,bit_at,
-  float_bits,float_value,write_heap_bits,...}`, `refc::{bin_ref_parts,refc_bytes,...}`) are likewise
-  `unsafe`: callers carry a `// SAFETY:` rationale.
+  float_bits,float_value,write_heap_bits,...}`, `refc::{bin_ref_parts,refc_bytes,...}`,
+  `record::{write_record,record_get,record_is_native,record_definition_*}`) are likewise
+  `unsafe`: callers carry a `// SAFETY:` rationale. The one exception is
+  `number::{big_to_f64,number_as_f64}`, which are **safe** (a total, validated conversion — the crate's
+  `cmp`/`size_object` convention).
 - Interior layouts that are NOT externally pinned (list chunking, ETS tree shape) are open and
   documented at their own nodes. The map (flat-map + HAMT node) layout *is* owned here (`src/map.rs`)
   because `beam_gc` sizes it — keep it byte-compatible with the copier.
