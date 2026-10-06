@@ -21,8 +21,10 @@
 //! only the public API.
 
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, BifRegistry};
-use beam_codec::term::{cons_head, cons_tail, make_flatmap};
+use beam_bifs::{
+    default_registry, BifContext, BifRegistry, RecordDefinitionView, RecordFieldView, RecordSource,
+};
+use beam_codec::term::{cons_head, cons_tail, flatmap_parts, make_flatmap, tuple_arity, tuple_element};
 use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
 use beam_term::{atom_val, is_list, is_nil, make_small, AtomTable, Eterm, NIL};
@@ -527,24 +529,181 @@ fn create_badarg_cases() {
     });
 }
 
+/// A [`RecordSource`] test double: it answers exactly one `(module, name)` pair
+/// with a fixed definition and `Ok(None)` for everything else (the runtime's code
+/// server for a record no loaded module defines).
+struct StubRecords {
+    module: String,
+    name: String,
+    definition: RecordDefinitionView,
+}
+
+impl RecordSource for StubRecords {
+    fn record_definition(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<RecordDefinitionView>> {
+        if module == self.module && name == self.name {
+            Ok(Some(self.definition.clone()))
+        } else {
+            Ok(None)
+        }
+    }
+}
+
+/// Runs `f` over the default registry and a context with `source` installed as the
+/// [`RecordSource`]. Like [`run`], the heap is leaked so the built terms stay valid.
+fn run_with_source<R>(
+    source: &mut dyn RecordSource,
+    f: impl FnOnce(&BifRegistry, &mut BifContext<'_>, &AtomTable) -> R,
+) -> R {
+    let reg = default_registry();
+    let atoms = seeded_atoms();
+    let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(65_536).expect("test heap")));
+    let mut ctx =
+        BifContext::new(heap, &atoms, ProcessId::new(1, 0)).with_record_source(source);
+    f(&reg, &mut ctx, &atoms)
+}
+
+/// `records:get_definition(Module, Name)` through the registry.
+fn get_definition(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    module: Eterm,
+    name: Eterm,
+) -> Result<Eterm> {
+    reg.call("records", "get_definition", 2, ctx, &[module, name])
+}
+
+/// `records:get_definition/2` (`records/get_definition_unknown_record` in the
+/// differential corpus) is the oracle's `error:badarg` when the pair names no
+/// definition — and, with no [`RecordSource`] hook installed, `badarg` too.
 #[test]
-fn get_definition_is_a_typed_unsupported_for_atoms() {
+fn get_definition_rejects_non_atom_and_unknown() {
+    let m = |ctx: &BifContext<'_>| ctx.atom("m").expect("seeded");
+    let r = |ctx: &BifContext<'_>| ctx.atom("r").expect("seeded");
+
+    // Oracle: records:get_definition(m, 2) / (1, r) / (1, 2) => error:badarg.
     run(|reg, ctx, _| {
-        let m = ctx.atom("m").expect("seeded");
-        let r = ctx.atom("r").expect("seeded");
-        // Oracle: records:get_definition(1, r) => badarg.
         assert!(matches!(
-            reg.call("records", "get_definition", 2, ctx, &[make_small(1), r]),
+            get_definition(reg, ctx, m(ctx), make_small(2)),
             Err(BeamError::BadArg)
         ));
-        // The (unimplementable) code-table lookup is a typed gap.
-        match reg.call("records", "get_definition", 2, ctx, &[m, r]) {
-            Err(BeamError::Raise(raise)) => {
-                assert_eq!(raise.class, beam_common::ExceptionClass::Error);
-                assert_eq!(raise.reason, beam_common::ExitReason::atom("unsupported_bif"));
-            }
-            other => panic!("expected unsupported_bif, got {other:?}"),
-        }
+        assert!(matches!(
+            get_definition(reg, ctx, make_small(1), r(ctx)),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            get_definition(reg, ctx, make_small(1), make_small(2)),
+            Err(BeamError::BadArg)
+        ));
+    });
+
+    // No `RecordSource` hook: the seam answers `None` ⇒ `badarg`.
+    run(|reg, ctx, _| {
+        assert!(matches!(
+            get_definition(reg, ctx, m(ctx), r(ctx)),
+            Err(BeamError::BadArg)
+        ));
+    });
+
+    // A hook that knows another pair ⇒ `badarg` for the unknown one.
+    let mut source = StubRecords {
+        module: "m".to_string(),
+        name: "r".to_string(),
+        definition: RecordDefinitionView { is_exported: false, fields: Vec::new() },
+    };
+    run_with_source(&mut source, |reg, ctx, _| {
+        let other = ctx.atom("other").expect("seeded");
+        assert!(matches!(
+            get_definition(reg, ctx, m(ctx), other),
+            Err(BeamError::BadArg)
+        ));
+    });
+}
+
+/// `records:get_definition/2` renders the oracle's exact shape.
+///
+/// Oracle (erts-17.1), a module compiled from `-record #rec{a, b = 5, c}.`:
+///   erl -noshell -eval 'code:load_file(recmod),
+///     io:format("~p~n",[records:get_definition(recmod, rec)]), halt().'
+///   =>  {#{is_exported => false},[a,{b,5},c]}
+#[test]
+fn get_definition_renders_the_oracle_shape() {
+    let mut source = StubRecords {
+        module: "m".to_string(),
+        name: "r".to_string(),
+        definition: RecordDefinitionView {
+            is_exported: false,
+            fields: vec![
+                RecordFieldView { name: "a".to_string(), default: None },
+                RecordFieldView { name: "b".to_string(), default: Some(make_small(5)) },
+                RecordFieldView { name: "e".to_string(), default: None },
+            ],
+        },
+    };
+    run_with_source(&mut source, |reg, ctx, _| {
+        let m = ctx.atom("m").expect("seeded");
+        let r = ctx.atom("r").expect("seeded");
+        let result = get_definition(reg, ctx, m, r).expect("the source resolves m:r");
+
+        // `{Map, Fields}`.
+        assert_eq!(tuple_arity(result).expect("a tuple"), 2, "the result is a 2-tuple");
+        let map = tuple_element(result, 0).expect("element 0");
+        let fields = elements(tuple_element(result, 1).expect("element 1"));
+
+        // The map is exactly `#{is_exported => false}`.
+        let (keys, values) = flatmap_parts(map).expect("a flat map");
+        assert_eq!(keys.len(), 1, "the map has a single entry");
+        assert_eq!(name_of(ctx, keys[0]), "is_exported");
+        assert_eq!(name_of(ctx, values[0]), "false");
+
+        // The fields are `[a, {b,5}, e]` in declaration order: a default-less field
+        // is its bare name atom, a defaulted field is `{Name, Default}`.
+        assert_eq!(fields.len(), 3, "fields: {fields:?}");
+        assert_eq!(
+            fields[0],
+            ctx.atom("a").expect("seeded"),
+            "a default-less field is the bare name atom"
+        );
+        let b = fields[1];
+        assert_eq!(tuple_arity(b).expect("a tuple"), 2, "a defaulted field is a 2-tuple");
+        assert_eq!(tuple_element(b, 0).expect("name"), ctx.atom("b").expect("seeded"));
+        assert_eq!(tuple_element(b, 1).expect("default"), make_small(5));
+        assert_eq!(
+            fields[2],
+            ctx.atom("e").expect("seeded"),
+            "the fields keep declaration order"
+        );
+    });
+}
+
+/// An exported record renders `#{is_exported => true}`.
+///
+/// Oracle: `-record #exp{x = 1, y}.` + `-export_record([exp]).` makes
+/// `records:get_definition(recmod, exp)` return `{#{is_exported => true},[{x,1},y]}`.
+#[test]
+fn get_definition_renders_is_exported_true() {
+    let mut source = StubRecords {
+        module: "m".to_string(),
+        name: "r".to_string(),
+        definition: RecordDefinitionView {
+            is_exported: true,
+            fields: vec![
+                RecordFieldView { name: "a".to_string(), default: Some(make_small(1)) },
+                RecordFieldView { name: "b".to_string(), default: None },
+            ],
+        },
+    };
+    run_with_source(&mut source, |reg, ctx, _| {
+        let m = ctx.atom("m").expect("seeded");
+        let r = ctx.atom("r").expect("seeded");
+        let result = get_definition(reg, ctx, m, r).expect("the source resolves m:r");
+        let map = tuple_element(result, 0).expect("element 0");
+        let (keys, values) = flatmap_parts(map).expect("a flat map");
+        assert_eq!(name_of(ctx, keys[0]), "is_exported");
+        assert_eq!(name_of(ctx, values[0]), "true");
     });
 }
 
