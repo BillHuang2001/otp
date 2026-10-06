@@ -355,6 +355,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
   and a compressed `LitT` ⇒ each a typed `BeamError` (no panic).
+- **`tests/real_modules.rs`:** loads every `.beam` of the installed OTP `stdlib`/`kernel`/`compiler`
+  `ebin` dirs through the public pipeline, asserting a load floor while allowlisting the known failures
+  (a NEW failure fails the test; a module dropping off the allowlist is only reported). Loudly skips when
+  the system `erl`/OTP is unavailable.
+- **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
 - Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Gate (GREEN required):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
