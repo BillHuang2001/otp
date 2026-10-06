@@ -228,6 +228,9 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - **`handle_events` schedules *and* runs the default round.** This preserves the historic "driving the reactor
   makes ports progress" behavior; callers wanting full budget control use `schedule_events` +
   `execute_port_tasks`. (The strict-enqueue-only variant would break callers that rely on the single call.)
+  Unlike `execute_port_tasks`, it does **not** harvest `PortNotification`s: input bytes stay in the port's queue
+  (reachable via `Port::drain_input`), and closes are not reported. Only `execute_port_tasks` yields the
+  `Data`/`Closed` notifications a runtime turns into `{Port, {data, Data}}`/port-exit messages.
 - **Driver = Rust trait now; C-ABI bridge layered later.** The frozen `ErlDrvEntry`/`ErlDrvApi`
   (`beam_abi::driver`) is an ABI, not a Rust interface; a later `beam_abi`-backed adapter implements `Driver`
   over an `ErlDrvEntry` + `ErlDrvApi` function table (`start→init/start`, `output→output/outputv`,
