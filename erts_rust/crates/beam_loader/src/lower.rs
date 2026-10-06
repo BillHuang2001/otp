@@ -1168,6 +1168,78 @@ mod tests {
     }
 
     #[test]
+    fn lowers_bs_create_bin_with_an_allocation_list_alloc() {
+        // `bs_create_bin`'s `Alloc` operand is written as a bare word count *or* as
+        // a `z,3` allocation list — the compiler hoists a block's pending heap need
+        // into the preceding `bs_create_bin` (`beam_ssa_codegen.erl:342-352`). This
+        // is the exact operand of `bsalloc.beam`'s `pack/2`
+        // (`{alloc,[{words,4},{floats,0},{funs,1}]}`); 89 real OTP modules (incl.
+        // `dets_v9`, `shell_docs`) hit this form, and a bare-integer-only lowering
+        // rejected the whole module with `BadArg`.
+        assert_eq!(
+            lower(
+                Opcode::bs_create_bin,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::Allocation(vec![
+                        crate::operand::AllocKind {
+                            kind: 0,
+                            number: 4,
+                            words: 4,
+                        },
+                        crate::operand::AllocKind {
+                            kind: 1,
+                            number: 0,
+                            words: 0,
+                        },
+                        crate::operand::AllocKind {
+                            kind: 2,
+                            number: 1,
+                            words: 1,
+                        },
+                    ]),
+                    Operand::Integer(2),
+                    Operand::Integer(8),
+                    Operand::X(2),
+                    Operand::List(vec![Operand::Atom(Atom::MAX), Operand::Integer(1)]),
+                ],
+            ),
+            Instr::BsCreateBin {
+                fail: NO_FAIL,
+                // 4 heap words + 0 floats + 1 fun (the loader's `number`-words
+                // placeholder for a fun entry, `decode::allocation_entry`); exactly
+                // what the real loader produces (`marshal_allocation_list`,
+                // `beam_file.c:2234-2284`).
+                alloc: 5,
+                live: 2,
+                unit: 8,
+                dst: Operand::X(2),
+                segments: vec![Operand::Atom(Atom::MAX), Operand::Integer(1)],
+            }
+        );
+    }
+
+    #[test]
+    fn a_bs_create_bin_with_a_non_integer_non_alloc_alloc_operand_is_rejected() {
+        // A register is neither a word count nor an allocation list.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::bs_create_bin,
+                vec![
+                    Operand::Label(NO_FAIL),
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::Integer(8),
+                    Operand::X(0),
+                    Operand::List(vec![]),
+                ],
+            ))
+            .unwrap_err(),
+            BeamError::BadArg
+        ));
+    }
+
+    #[test]
     fn lowers_the_module_markers() {
         assert_eq!(lower(Opcode::nif_start, vec![]), Instr::NifStart);
         assert_eq!(lower(Opcode::on_load, vec![]), Instr::OnLoad);
