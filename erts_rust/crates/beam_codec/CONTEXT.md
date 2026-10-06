@@ -27,9 +27,10 @@ loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers and over `beam_term::fun` for funs) plus the local
 bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
-(see "Tag coverage" below); the still-unsupported tags (records, `LOCAL`, the
-distribution header) return `error::unsupported`, and the obsolete `FUN` (`117`) / `NEW_CACHE`
-(`78`) tags return `BadArg`, rather than a wrong term.
+(see "Tag coverage" below); the only still-`unsupported` tag is `RECORD` (`67`), `LOCAL_EXT` (`121`)
+is honoured as a top-level wrapper, the encoder emits `ATOM_CACHE_REF` (`82`) through the
+`AtomCacheWriter` hook, and `DIST_HEADER` (`68`) plus the obsolete `FUN` (`117`) / `NEW_CACHE` (`78`)
+tags are rejected as `BadArg` — never a wrong term.
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
 `#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
