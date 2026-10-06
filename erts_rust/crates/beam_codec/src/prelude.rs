@@ -5,12 +5,12 @@
 //! term-layer helpers in [`crate::term`] are deliberately **not** re-exported:
 //! they are an internal stop-gap, not part of the cross-crate contract.
 
-pub use crate::atom_cache::AtomCache;
+pub use crate::atom_cache::{AtomCache, AtomCacheWriter};
 pub use crate::compress::{compress, decompress};
 pub use crate::decode::{decode_term, Decoder};
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    AtomEncoding, Encoder,
+    encode_term_local, AtomEncoding, Encoder,
 };
 pub use crate::error::{
     is_unsupported, is_unsupported_local_fun, unsupported, unsupported_local_fun, LOCAL_FUN_REASON,
