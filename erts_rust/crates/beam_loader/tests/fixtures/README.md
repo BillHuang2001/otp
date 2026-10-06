@@ -407,3 +407,192 @@ is_eq_exact, label, line, move, return, swap`, plus `int_code_end`), the unusual
 
 The six `is_*`/`bs_start_match3` opcodes are the type tests shown by `beam_disasm` as
 `{test, …}`.
+
+## `records_fixture.beam`
+
+`records_fixture.beam` is the committed oracle fixture for the **`Recs` chunk** — a
+module's compile-time **native-record** (`-record #name{…}`, OTP 29 syntax) definitions,
+which the `records:get_definition/2` BIF serves. The module body is deliberately trivial
+(`noop/0`), so the only interesting payload is the record table. It is produced by the
+same **system Erlang** toolchain (OTP 29 / `erts-17.1`) as the oracle.
+
+The module is named `records_fixture`, **not** `records`: `records` is a *stdlib* module,
+so a fixture named `records` would replace it on `code:load_file/1`, after which the
+oracle's own `records:get_definition/2` never returns (an empirical infinite loop). The
+record *names* are unaffected by the module name, so the pinned oracle output is
+independent of this choice.
+
+### Regeneration
+
+Compile from a neutral scratch dir under `$TMPDIR` with `+deterministic`, exactly as for
+`slice.beam`, so the committed binary embeds **no** source path:
+
+```sh
+SCRATCH="$TMPDIR/neuter_fixtures"
+mkdir -p "$SCRATCH/recordsgen"
+cp records_fixture.erl "$SCRATCH/recordsgen/"
+( cd "$SCRATCH/recordsgen" && erlc +deterministic records_fixture.erl )
+cp "$SCRATCH/recordsgen/records_fixture.beam" records_fixture.beam   # writes records_fixture.beam (752 bytes)
+```
+
+`erlc` warns that the three non-exported records are unused (the body never constructs
+one); that is expected and harmless.
+
+`records_fixture.erl` (the input, also committed):
+
+```erlang
+-module(records_fixture).
+
+-export([noop/0]).
+
+%% Native records (OTP 29 syntax). Every definition below ends up in the `Recs`
+%% chunk; the module body is deliberately trivial so the only interesting payload
+%% is the record table.
+-record #user{id = -1, name, city}.
+
+-record #empty{}.
+
+%% Mixed defaults: a small-int `0` (distinct from an *absent* field), an absent
+%% field, an atom default, a tuple literal, a list literal and a bignum.
+-record #mixed{a = 0, b, c = undefined, d = {1, 2}, e = [a, b],
+               f = 10000000000000000000000000}.
+
+%% An exported record (`-export_record([...])`) — `is_exported => true`.
+-record #shared{key, value = none}.
+
+-export_record([shared]).
+
+noop() -> ok.
+```
+
+Any byte change in the fixture invalidates the expected values in `tests/records.rs`;
+re-derive them with `beam_disasm:file("records_fixture.beam")` plus a byte decode, do
+**not** guess.
+
+### Wire summary (verified against the oracle, `beam_disasm` + byte decode)
+
+File size **752 bytes**; `FOR1` form length **744** (= file_size − 8); form type `BEAM`.
+Chunks in file order (id · payload size):
+
+| # | id | size | parsed |
+|---|----|------|--------|
+| 1 | `AtU8` | 148 | atom names |
+| 2 | `Code` | 70 | `Code` header + instruction stream |
+| 3 | `StrT` | 0 | empty string table |
+| 4 | `ImpT` | 28 | 2 imports |
+| 5 | `ExpT` | 40 | 3 exports |
+| 6 | `LitT` | 36 | 2 literals |
+| 7 | `Meta` | 45 | skipped |
+| 8 | `Recs` | 80 | native-record table (the subject of this fixture) |
+| 9 | `LocT` | 4 | parsed (empty JIT-only local-function table) |
+| 10 | `Attr` | 39 | raw attributes |
+| 11 | `CInf` | 27 | raw compile info (path-free) |
+| 12 | `Dbgi` | 66 | recognized id, payload unparsed (debug info) |
+| 13 | `Line` | 22 | line table |
+| 14 | `Type` | 10 | type table |
+
+`Dbgi` is a recognized id whose payload is deliberately left unparsed (like `Meta`); the
+`Recs` payload *is* parsed.
+
+### `AtU8` — atoms
+`i32` count = **−25** ⇒ **long (tagged) lengths**; real count 25. Wire index 0 is the NIL
+placeholder. At wire indices 1..=25:
+
+`records_fixture, noop, ok, module_info, erlang, get_module_info, user, false, id, name,
+city, empty, mixed, a, b, c, undefined, d, e, f, shared, true, key, value, none`
+
+The record names, field names, and the two default-tagging atoms `false` (8) and `true`
+(22) all live here — the `Recs` parser needs the atom *names* because the export flag is
+compared by name, exactly as the C compares against `am_true`/`am_false`.
+
+### `Code` header
+`head_size = 16`, `format_number = 0`, `max_opcode = 181`, `label_count = 7`,
+`function_count = 3`. The 50-byte instruction stream ends after the `int_code_end`
+instruction. The three functions are `noop/0`, `module_info/0` and `module_info/1`.
+
+### `ImpT` — imports (file order)
+```
+0: {erlang, get_module_info, 1}
+1: {erlang, get_module_info, 2}
+```
+
+### `ExpT` — exports (file order — preserved, *not* sorted)
+```
+{module_info, 1} -> label 6
+{module_info, 0} -> label 4
+{noop, 0}        -> label 2
+```
+`Export.label` is the function **entry** label. `LocT` is present but empty (`i32 count`
+0), so `Module.locals` is empty.
+
+### `LitT` — literal pool
+`uncompressed_size = 0` ⇒ the payload is stored **verbatim** (not zlib-compressed). `i32`
+count = **2**; each literal is `{i32 ext_size, ext_size bytes}` of Erlang external-term
+bytes:
+
+```
+0:  7 bytes  83 68 02 61 01 61 02              = {1, 2}
+1: 13 bytes  83 6c 00 00 00 02 77 01 61 77 01 62 6a
+                                               = [a, b]
+```
+
+(`0x83` = `VERSION_MAGIC` 131, `0x68`/104 = `SMALL_TUPLE_EXT`, `0x61`/97 =
+`SMALL_INTEGER_EXT`, `0x6c`/108 = `LIST_EXT`, `0x77`/119 = `ATOM_UTF8_EXT`, `0x6a`/106 =
+`NIL`.) Both literals are the defaults of `#mixed.d` and `#mixed.e`, referenced from the
+`Recs` payload by a `z,4` operand.
+
+### `Recs` — native-record table
+Raw payload (80 bytes), with the 12-byte header split out:
+
+```
+00 00 00 00   version = 0 (a non-zero version means "no record table", not an error)
+00 00 00 04   record_count = 4
+00 00 00 0b   total_field_count = 11 (= 3 + 0 + 6 + 2, informational)
+```
+
+then one entry per record, each encoded as one `call_last`-shaped instruction
+(`05` = `call_last`, reused only for its three operands: name, export flag, field list):
+
+| record | entry bytes | export flag | fields, in declaration order |
+|--------|-------------|-------------|------------------------------|
+| `user`   | `05 72 82 17 60 92 19 ff ff a2 00 b2 00` | `82` = atom 8 = `false` | `{id, -1}` · `name` · `city` |
+| `empty`  | `05 c2 82 17 00` | `82` = atom 8 = `false` | *(none)* |
+| `mixed`  | `05 d2 82 17 c0 e2 01 f2 00 0a 10 0a 11 0a 12 47 00 0a 13 47 10 0a 14 f9 20 08 45 95 16 14 01 48 4a 00 00 00` | `82` = atom 8 = `false` | `{a, 0}` · `b` · `{c, undefined}` · `{d, {1,2}}` · `{e, [a,b]}` · `{f, 10000000000000000000000000}` |
+| `shared` | `05 0a 15 0a 16 17 40 0a 17 00 0a 18 0a 19` | `0a 16` = atom 22 = `true` | `key` · `{value, none}` |
+
+Decoding the operands of the first entry, byte by byte:
+
+- `72` = `a` tag, value `7` → record name = atom 7 = `user`.
+- `82` = `a` tag, value `8` → the export flag = `false`.
+- `17` = `z` tag, sub-tag `1` → the `z,1` argument list (the record's fields).
+- `60` = `u` tag, value `6` → the list length (6 = 3 `(name, default)` pairs).
+- `92` = `a`, value `9` → field `id`; then `19 ff ff` = an `i` tag with an explicit
+  2-byte magnitude `FFFF`, sign-extended to **−1** (still a small integer, so the loader
+  inlines it: `Some(-1)`).
+- `a2` = `a`, value `10` → field `name`; then `00` = `u,0` → **no default**.
+- `b2` = `a`, value `11` → field `city`; then `00` = `u,0` → **no default**.
+
+The `u`/`i` distinction is the whole reason defaults are decoded from the **raw tag**
+rather than through the shared operand decoder (which collapses both to `Integer`):
+`#mixed.a` is encoded `01` = `i,0` (**a real default of the integer 0**) while `#mixed.b`
+is encoded `00` = `u,0` (**absent**). They share a magnitude and differ only by tag.
+
+`#mixed.f` is a **wide `i`** field — the `f9 20 …` form: tag byte `0xF9` (both length
+bits set, sub-length selector `7`), a `u`-tagged sub-length `20` (⇒ `0x02 + 9 = 11`
+magnitude bytes), then the 11-byte two's-complement magnitude `08 45 95 16 14 01 48 4a 00
+00 00` = `10^25`. It is **not** in the file's `LitT`; the loader appends it to the
+synthesized-literal set, so `Module::literals().len() == 3` and `Module::literal(2)` is
+this bignum (see `tests/records.rs`).
+
+`#mixed.d`/`#mixed.e` use `z,4` (static literal) operands — `47 00` = a `LitT` index of
+`0` (`00` = `u,0`) and `47 10` = index `1` (`10` = `u,1`).
+
+### `Line`
+`version 0`, `flags 0`, `instr_count 3`, `item_count 1`, `name_count 0`. The 2-byte item
+stream `09 19` is one `TAG_i` item with line `25`. The loader prepends the implicit
+"undefined location" entry, giving `items.len() == 2` and
+`files == ["records_fixture.erl"]`.
+
+### `Type`
+`version 4`, `count 1`; the single entry is the "any" entry `{raw: 0x1FFF}`. A one-entry
+table is *not* the fallback `TypeTable` (`fallback == false`).

@@ -1,5 +1,5 @@
 //! Integration tests for the `Recs` chunk — a module's compile-time **native-record
-//! definitions** — over the committed oracle fixture `tests/fixtures/records.beam`.
+//! definitions** — over the committed oracle fixture `tests/fixtures/records_fixture.beam`.
 //!
 //! `Recs` is what the `records:get_definition/2` BIF serves; `beam_loader` parses it
 //! into [`beam_loader::RecordDefinition`]s (see `src/chunk/record.rs` for the wire
@@ -25,19 +25,19 @@
 //!   negative cases go through the whole [`beam_loader::load`] pipeline on a
 //!   hand-built image.
 use std::path::{Path, PathBuf};
-use std::process::Command;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use beam_codec::term::{big_parts, cons_head, cons_tail, tuple_arity, tuple_element};
 use beam_common::BeamError;
 use beam_loader::{load, load_file, Atom, Module, RecordDefinition, RecordField};
 use beam_term::prelude::{atom_val, is_atom, is_nil, is_small, signed_value, Eterm};
 
-/// Loads the committed `records.beam` oracle fixture.
+/// Loads the committed `records_fixture.beam` oracle fixture.
 fn load_records() -> Module {
     load_file(concat!(
         env!("CARGO_MANIFEST_DIR"),
-        "/tests/fixtures/records.beam"
+        "/tests/fixtures/records_fixture.beam"
     ))
     .expect("the records oracle fixture must load")
 }
@@ -138,8 +138,16 @@ fn records_resolve_by_name_and_by_atom() {
     // The atom-based lookup returns the same definition.
     assert_eq!(module.record(atom(&module, "user")), Some(user));
 
+    // A name that is not a record resolves to `None` (by name) …
     assert!(module.record_by_name("nope").is_none());
-    assert!(module.record(atom(&module, "nope")).is_none());
+    // … and so does a *known* atom that names no record: `noop/0` is exported by the
+    // fixture, so its atom is in the module's table but is not a record name.
+    let noop = atom(&module, "noop");
+    assert!(
+        !module.records().iter().any(|record| record.name == noop),
+        "`noop` must not be a record name"
+    );
+    assert_eq!(module.record(noop), None);
 }
 
 #[test]
@@ -244,8 +252,8 @@ fn the_shared_record_is_exported() {
 // Oracle cross-check
 // ---------------------------------------------------------------------------
 
-/// The pinned `records:get_definition(records, Name)` results, captured from the
-/// system `erl` (OTP 29 / erts-17.1), with all whitespace removed.
+/// The pinned `records:get_definition(records_fixture, Name)` results, captured from
+/// the system `erl` (OTP 29 / erts-17.1), with all whitespace removed.
 ///
 /// `records:get_definition/2` returns `{#{is_exported => Bool}, Fields}`, `Fields` in
 /// **declaration order**, each field `{Name, Default}` when it has a default and the
@@ -268,34 +276,68 @@ fn normalize(text: &str) -> String {
     text.chars().filter(|c| !c.is_whitespace()).collect()
 }
 
+/// The wall-clock bound for one oracle `erl`/`erlc` invocation.
+const ORACLE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// Runs `command`, waiting at most `limit` for it to exit.
+///
+/// A process that cannot be spawned yields its `io::Error`, so a caller skips
+/// **loudly** when the toolchain is absent (matching `tests/real_modules.rs`). A
+/// process that does not exit within `limit` is killed and this **panics**: the
+/// oracle is a real `erl`/`erlc`, and an invocation that never terminates must fail
+/// CI rather than hang it forever. Outputs here are tiny (well under a pipe buffer),
+/// so reaping the child before draining its pipes cannot deadlock.
+fn run_bounded(command: &mut Command, limit: Duration) -> std::io::Result<std::process::Output> {
+    let mut child = command
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()?;
+    let deadline = Instant::now() + limit;
+    loop {
+        if child.try_wait()?.is_some() {
+            return child.wait_with_output();
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!("the bounded oracle command did not exit within {limit:?}");
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
+
 /// Compiles the committed fixture with the **system** `erlc` and asks the **system**
 /// `erl` for `records:get_definition/2`, asserting the live output matches the pinned
 /// [`ORACLE`] constants.
+///
+/// The fixture module is named `records_fixture`, deliberately **not** `records`: an
+/// earlier `-module(records)` collided with the stdlib `records` module, so loading it
+/// replaced the stdlib one and the oracle's `records:get_definition/2` hung forever.
 ///
 /// A missing `erl`/`erlc` (or a toolchain that rejects the fixture) skips **loudly** —
 /// it never fails in that case, matching `tests/real_modules.rs`.
 #[test]
 fn the_live_oracle_agrees_with_the_pinned_definitions() {
-    let dir = unique_temp_dir("records");
+    let dir = unique_temp_dir("records_fixture");
 
     // Compile the committed fixture source with the system compiler (the same command
     // `tests/fixtures/README.md` documents).
-    let source = Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/records.erl");
+    let source =
+        Path::new(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/records_fixture.erl");
     if std::fs::create_dir_all(&dir).is_err() {
         eprintln!("SKIP: cannot create {} for the oracle cross-check", dir.display());
         return;
     }
-    if let Err(error) = std::fs::copy(&source, dir.join("records.erl")) {
+    if let Err(error) = std::fs::copy(&source, dir.join("records_fixture.erl")) {
         eprintln!("SKIP: cannot stage {} ({error})", source.display());
         let _ = std::fs::remove_dir_all(&dir);
         return;
     }
-    match Command::new("erlc")
-        .arg("+deterministic")
-        .arg("records.erl")
-        .current_dir(&dir)
-        .output()
-    {
+    let mut erlc = Command::new("erlc");
+    erlc.arg("+deterministic")
+        .arg("records_fixture.erl")
+        .current_dir(&dir);
+    match run_bounded(&mut erlc, ORACLE_TIMEOUT) {
         Ok(output) if output.status.success() => {}
         Ok(output) => {
             eprintln!(
@@ -314,17 +356,17 @@ fn the_live_oracle_agrees_with_the_pinned_definitions() {
     }
 
     // `records:get_definition/2` is a BIF: it reads the *loaded* module's `Recs`
-    // chunk. The fixture module is itself named `records`, loaded from this dir.
-    let eval = "{module,records}=code:load_file(records),\
+    // chunk, so the fixture must be loaded under its own (uniquely named) module.
+    let eval = "{module,records_fixture}=code:load_file(records_fixture),\
                 lists:foreach(fun(R) -> \
-                    io:format(\"~s@~p@;\", [R, records:get_definition(records, R)]) \
+                    io:format(\"~s@~p@;\", [R, records:get_definition(records_fixture, R)]) \
                 end, [user, empty, mixed, shared]),\
-                halt().";    let output = match Command::new("erl")
-        .args(["-noshell", "-pa"])
+                halt().";
+    let mut erl = Command::new("erl");
+    erl.args(["-noshell", "-pa"])
         .arg(&dir)
-        .args(["-eval", eval])
-        .output()
-    {
+        .args(["-eval", eval]);
+    let output = match run_bounded(&mut erl, ORACLE_TIMEOUT) {
         Ok(output) => output,
         Err(error) => {
             eprintln!("SKIP: cannot run `erl` ({error}) — need the system OTP runtime");
@@ -340,13 +382,14 @@ fn the_live_oracle_agrees_with_the_pinned_definitions() {
         String::from_utf8_lossy(&output.stderr).trim()
     );
 
-    // The eval emits `name@<~p output>@;` per record; whitespace-normalize the whole
-    // output first (the `~p` line-wrapping is insignificant for these terms), then
-    // split on the markers.
+    // The eval emits `name@<~p output>@;` per record — a trailing `@` before each
+    // `;`. Whitespace-normalize the whole output first (the `~p` line-wrapping is
+    // insignificant for these terms), drop the trailing `@`, then split on the marker.
     let raw = String::from_utf8(output.stdout).expect("the oracle writes UTF-8");
     let text = normalize(&raw);
     let mut observed: Vec<(String, String)> = Vec::new();
     for entry in text.trim_end_matches(';').split(';') {
+        let entry = entry.strip_suffix('@').unwrap_or(entry);
         let (name, value) = entry
             .split_once('@')
             .unwrap_or_else(|| panic!("malformed oracle line: {entry:?}"));
@@ -395,8 +438,13 @@ fn wrap(body: Vec<u8>) -> Vec<u8> {
 /// A minimal, otherwise-valid module image carrying `recs` as its `Recs` payload.
 ///
 /// The atom table holds `m` (the module name), `false`, `true`, `rec` and `f1`, so a
-/// well-formed record entry can name them; the `Code` chunk is the single
-/// `int_code_end` instruction, so only the `Recs` payload varies.
+/// well-formed record entry can name them. The `Code` chunk holds one trivial
+/// function — `label 1; func_info m:m/0; label 2; return; int_code_end` — which is
+/// **required**: `lower::group_functions` rejects a stream with no `func_info` (the C
+/// reader groups functions the same way, so a `.beam` without one is malformed). With
+/// the function in place, only the `Recs` payload varies between the control image and
+/// the malformed ones below, so each negative case fails in the `Recs` parser rather
+/// than for a structural reason.
 fn image_with_recs(recs: &[u8]) -> Vec<u8> {
     let mut body = Vec::new();
 
@@ -412,8 +460,17 @@ fn image_with_recs(recs: &[u8]) -> Vec<u8> {
     code.extend_from_slice(&16u32.to_be_bytes()); // head_size
     code.extend_from_slice(&0u32.to_be_bytes()); // format_number
     code.extend_from_slice(&181u32.to_be_bytes()); // max_opcode
-    code.extend_from_slice(&1u32.to_be_bytes()); // label_count
-    code.extend_from_slice(&0u32.to_be_bytes()); // function_count
+    code.extend_from_slice(&2u32.to_be_bytes()); // label_count
+    code.extend_from_slice(&1u32.to_be_bytes()); // function_count
+    // `label 1` — opcode 1 with the `u,1` label operand.
+    code.extend_from_slice(&[1, 0x10]);
+    // `func_info m m 0` — opcode 2 with `{a,1}` (module `m`), `{a,1}` (function `m`)
+    // and `{u,0}` (arity 0).
+    code.extend_from_slice(&[2, 0x12, 0x12, 0x00]);
+    // `label 2` — the function's entry label (it must follow `func_info`).
+    code.extend_from_slice(&[1, 0x20]);
+    // `return` (opcode 19) then the `int_code_end` (opcode 3) terminator.
+    code.extend_from_slice(&[19]);
     code.push(3); // `int_code_end`
     push_chunk(&mut body, b"Code", &code);
 
@@ -451,6 +508,14 @@ fn a_hand_built_recs_chunk_loads() {
     recs.extend_from_slice(&[0x00]); // `u,0` — no default
 
     let module = load(&image_with_recs(&recs)).expect("the control image must load");
+
+    // The image is genuinely well-formed, not merely "not rejected": it carries the
+    // `m:m/0` function every `func_info`-grouped `.beam` needs.
+    assert_eq!(module.atom_name(module.name), Some("m"));
+    assert_eq!(module.functions.len(), 1);
+    assert_eq!(module.atom_name(module.functions[0].name), Some("m"));
+    assert_eq!(module.functions[0].arity, 0);
+
     assert_eq!(module.records().len(), 1);
     let record = &module.records()[0];
     assert_eq!(module.atom_name(record.name), Some("rec"));

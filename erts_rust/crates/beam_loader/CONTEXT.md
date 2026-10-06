@@ -44,13 +44,18 @@ Both are the *only* entry points; all intermediate types are public for inspecti
 ### The IR (`src/ir.rs` + the re-exported `src/instr.rs`)
 - `pub struct Module { pub name: Atom, pub atoms: Vec<Atom>, pub atom_table: AtomTable,
   pub exports: Vec<Export>, pub locals: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
-  pub funs: Vec<FunDescriptor>, pub code_version: CodeVersion, pub types: TypeTable, pub line: LineTable,
-  pub literals: Arc<LiteralArea>, pub strings: Vec<u8>, pub attributes: Option<Vec<u8>>,
-  pub compile_info: Option<Vec<u8>> }`
+  pub funs: Vec<FunDescriptor>, pub records: Vec<RecordDefinition>, pub code_version: CodeVersion,
+  pub types: TypeTable, pub line: LineTable, pub literals: Arc<LiteralArea>, pub strings: Vec<u8>,
+  pub attributes: Option<Vec<u8>>, pub compile_info: Option<Vec<u8>> }`
   + `Module::atom_name(&self, Atom) -> Option<&str>`, `Module::export(&self, Atom, u32) -> Option<Label>`,
   `Module::function(&self, Atom, u32) -> Option<&Function>`, `Module::literal(&self, u32) -> Option<Eterm>`,
   `Module::literals(&self) -> &LiteralArea`, `Module::fun(&self, u32) -> Option<&FunDescriptor>`,
-  `Module::funs(&self) -> &[FunDescriptor]`.
+  `Module::funs(&self) -> &[FunDescriptor]`, `Module::records(&self) -> &[RecordDefinition]`,
+  `Module::record(&self, Atom) -> Option<&RecordDefinition>`,
+  `Module::record_by_name(&self, &str) -> Option<&RecordDefinition>`.
+  `records` is the lowered `Recs` table (native-record definitions, declaration order); `record_by_name`
+  resolves a *runtime* atom by looking its string up in the module's `atom_table` first (the lookup the
+  `records:get_definition/2` BIF needs).
   `atoms[i]` = the atom for wire index `i`; `atoms[0]` = `Atom::MAX` (NIL placeholder, never a real atom).
   `Module` is `Clone` (cheap: `literals` is shared behind the `Arc`) and `Debug`, but it is **neither
   `Send` nor `Sync`** (see `src/literal.rs` / Design Decisions) — a loaded module stays on its loading thread.
@@ -76,6 +81,28 @@ Both are the *only* entry points; all intermediate types are public for inspecti
 - `pub struct FunDescriptor { pub function: Atom, pub arity: u32, pub label: Label, pub index: u32,
   pub num_free: u32, pub uniq: u32 }` — one `FunT` lambda descriptor; `Module::fun(i)` selects the
   entry whose `make_fun3`/`call_fun2` *fun-table index* is `i` (its position in `Module::funs`).
+- `pub struct RecordDefinition { pub name: Atom, pub is_exported: bool, pub fields: Vec<RecordField> }`
+  — one `Recs` **native-record** definition (`-record #name{…}`), i.e. what the
+  `records:get_definition/2` BIF serves as `{#{is_exported => Bool}, Fields}`. `name` is the record-name
+  atom; `fields` is in **declaration order** (the file order — never sorted).
+  `pub struct RecordField { pub name: Atom, pub default: Option<Eterm> }` — `None` is the file's
+  **absent** sentinel (`u,0`), which is *distinct* from a field whose default is literally `0`
+  (`i,0` ⇒ `Some(<small 0>)`); see the `Recs` default rule under Design Decisions.
+### The raw `Recs` chunk (`src/chunk/record.rs`)
+- `pub fn record::parse(data: &[u8], atoms: &[String]) -> Result<Vec<RawRecord>>` — parses a `Recs`
+  payload; `atoms` (the `AtU8` names, index 0 = NIL placeholder) is needed to recognize the `true`/`false`
+  export flag by name, exactly as the C compares against `am_true`/`am_false`. A non-zero version yields
+  an empty vector ("no record table", not an error); a negative count, a wrong opcode byte, a non-atom
+  name, an odd field-list length, an unsupported operand tag or a truncated payload ⇒ `BeamError::BadArg`.
+- `pub struct RawRecord { pub name: u32, pub is_exported: bool, pub fields: Vec<RawRecordField> }`,
+  `pub struct RawRecordField { pub name: u32, pub default: RawRecordDefault }` — **wire** atom indices,
+  not interned atoms; the lowered, atom-interned form is `Module.records`.
+- `pub enum RawRecordDefault { Absent, Integer(i64), Atom(u32), Literal(u32),
+  BigInteger { negative: bool, magnitude: Vec<u8> } }` — a field default in the exact form the file
+  encodes it (`Absent` = `u,0`; `Atom(0)` = `nil`/`[]`; `Literal(i)` = a `z,4` index into the module's
+  static `LitT` literals; `BigInteger.magnitude` is the big-endian two's-complement field).
+- The parsed raw set is carried on `Chunks.records` (in file order; empty when the chunk is absent).
+  See `record::parse`'s sibling list types in `src/chunk/mod.rs`.
 ### The literal area (`src/literal.rs`)
 - `pub struct LiteralArea` — the `LitT` literals materialized into **one immutable heap** at load time;
   fields are private (`heap: Option<Heap>`, `terms: Vec<Eterm>`), with a manual `Debug` and a `Default`
@@ -360,6 +387,23 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   module's literal set and rewrites the operand to `Operand::Literal`. This keeps `.beam`-wire concerns in
   `beam_loader`, mirrors the C (`marshal_integer` → `beamfile_add_literal`) and needs no engine change
   (the engine already resolves `Operand::Literal` via `Machine::literal`).
+- **`Recs` field defaults are classified from the *raw* operand tag, and the record table keeps
+  declaration order.** Two facts pin the `Recs` output:
+  1. **Declaration order.** `records:get_definition/2` returns a record's fields in **declaration
+     order**, and the file writes them in that order, so neither `record::parse` nor `lower::build_records`
+     sorts them (`RecordDefinition.fields` is exactly the file's `(name, default)` pair sequence).
+     Records themselves are likewise kept in file order.
+  2. **`u,0` (absent) vs `i,0` (integer `0`).** A default's *operand tag* — not its magnitude — carries
+     the absent/`0` distinction: `u` (`u,0`) is the C's absent sentinel `make_catch(0)` ⇒
+     `RawRecordDefault::Absent` ⇒ `RecordField.default == None`; `i` (`i,0`) is a real small-integer
+     default of `0` ⇒ `Some(<small 0>)`. The shared instruction decoder (`decode_operand`) collapses
+     both tags to `Operand::Integer`, so `record::parse` reads defaults through the raw tag via the
+     shared `decode::read_tagged` and classifies them in `record::read_default` — `u` ⇒ absent, `i` ⇒
+     small integer or (wider than a small) a signed bignum, `a` ⇒ atom (`a,0` = `nil`), `z,4` ⇒ a
+     static-`LitT` literal index (`beam_file.c:1200-1216`). A wide `i` default stays a `BigInteger` on
+     the field; `build_records` appends its ETF payload to the module's synthesized-literal set
+     (numbered after the file's own `LitT`, the same rule wide instruction operands follow) and
+     `resolve_records` then materializes the term once the literal area is decoded.
 - **The `bs_create_bin` allocation operand accepts both encodings.** The compiler hoists a block's heap
   need into a preceding `bs_create_bin` (`beam_ssa_codegen.erl`, `need_heap_terminator`), so that `z`-op
   operand can be a bare word count or a `z,3` allocation list. `lower_instr` decodes it through
@@ -367,10 +411,10 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   matching the C `marshal_allocation_list`, which always marshals any `z,3` to a single word total.
 
 ## Test Strategy
-- **Fixtures:** two committed oracle `.beam` files, both compiled from the checked-in `.erl` sources with
+- **Fixtures:** the committed oracle `.beam` files, all compiled from the checked-in `.erl` sources with
   the system `erlc` (OTP 29 / `erts-17.1`, the differential oracle); `tests/fixtures/README.md` documents
   the exact regeneration command and the full wire summary (chunk order/sizes, atoms, exports/imports,
-  and the `Code`/`Line`/`Type`/`FunT`/`LitT` details).
+  and the `Code`/`Line`/`Type`/`FunT`/`LitT`/`Recs` details).
   - `tests/fixtures/slice.beam` (712 bytes) from `slice.erl` — the vertical-slice module (`add/2`,
     `fib/1`, `pick/1`, plus `module_info/0,1`) covering the minimal generic opcode subset.
   - `tests/fixtures/coverage.beam` from `coverage.erl` — a broader idiomatic slice: tuples
@@ -379,6 +423,12 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
     `try_end`), float arithmetic, maps (`put_map_assoc`/`put_map_exact`/`get_map_elements`), bitstrings
     (`bs_match`/`bs_start_match3`/`bs_get_*`/`bs_create_bin`), the `z,3` allocation-list need form, and
     `LitT` literals (`{error,division_by_zero}`, `{error,badarith}`, `#{a=>1,b=>2}`).
+  - `tests/fixtures/records_fixture.beam` from `records_fixture.erl` — the `Recs`-chunk fixture: four
+    native records (`#user` with an `i,-1` default; `#empty`; `#mixed` exercising *every* default
+    encoding — `i,0`, the `u,0` absent sentinel, an atom, a tuple/`LitT` literal, a list/`LitT` literal
+    and a wide-`i` bignum; `#shared` carrying `-export_record([shared])`). The module is named
+    `records_fixture`, **not** `records`, to avoid colliding with the stdlib `records` module (which
+    would make the oracle's `records:get_definition/2` loop forever).
 - **Ground truth is derived, never guessed:** `beam_disasm:file(...)` plus a byte decode; if a fixture
   byte changes, re-derive the expected IR.
 - **`tests/container.rs`:** the chunk directory (ids/sizes in file order), the `AtU8` atoms, the
@@ -401,6 +451,16 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `{module,function,arity}` (`fun maps:remove/2`, `gen_server:format_log/1,2`) — semantic evidence, not a
   count. Loudly skips when the system `erl`/OTP is unavailable.
 - **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
+- **`tests/records.rs`:** the `Recs` chunk over `tests/fixtures/records_fixture.beam` — the parsed
+  definitions reproduce the pinned `records:get_definition/2` output (declaration order, every default
+  encoding incl. the `u,0`/`i,0` distinction and the synthesized wide-`i` bignum literal), plus the
+  `record_by_name`/`record` lookups, a live-`erl` re-derivation of the pinned facts (bounded wall-clock,
+  loud skip without OTP), and hand-built malformed-`Recs` images rejected with `BeamError::BadArg` through
+  the whole `load` pipeline — each next to a well-formed **control** image (same `AtU8`/`Code`, only the
+  `Recs` payload varying) that genuinely loads, so the negative cases cannot pass for a structural reason.
+- **`tests/generic_census.rs`:** the residual `Instr::Generic` census over every installed
+  stdlib/kernel/compiler `.beam` — asserts the unmodelled-opcode set equals the documented baseline, so a
+  newly-emitted unmodelled opcode fails the test; loud skip when `erl`/OTP is absent.
 - Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Gate (GREEN required):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
@@ -427,12 +487,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/chunk/line.rs` → `Line` table parser
 - `src/chunk/types.rs` → `Type` chunk parser (`TypeTable`)
 - `src/chunk/literal.rs` → `LitT` framing parser (raw ETF payloads; compressed ⇒ documented error)
-- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` / `Recs` raw capture (`DbgB`/`Dbgi` unparsed)
+- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` raw capture (`DbgB`/`Dbgi` unparsed)
+- `src/chunk/record.rs` → `Recs` parser: `RawRecord`/`RawRecordField`/`RawRecordDefault` + `parse` (raw-tag defaults, declaration order)
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
 - `src/instr.rs` → the typed instruction vocabulary: `Instr` (~120 variants) + `TestKind`
-- `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
+- `src/ir.rs` → the IR data types: `Module`, `Function`, `Export`, `Import`, `FunDescriptor`, `RecordDefinition`/`RecordField`, `Block`, `LineTable`, `TypeTable`, … (+ `pub use crate::instr::*`)
 - `src/literal.rs` → `LiteralArea` / `SharedLiteralArea`: decoded `LitT` literals materialized into a heap
 - `src/lower.rs` → `build_module` + module assembly (re-exports the `group` helpers)
 - `src/lower/group.rs` → `group_functions` (the `func_info` boundary rule) + `build_blocks`
@@ -440,8 +501,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/load.rs` → `load` / `load_file` orchestrator
 - `tests/fixtures/slice.erl` + `slice.beam` → the vertical-slice oracle fixture
 - `tests/fixtures/coverage.erl` + `coverage.beam` → the widened-IR oracle fixture
+- `tests/fixtures/records_fixture.erl` + `records_fixture.beam` → the `Recs`-chunk oracle fixture (native-record definitions for `records:get_definition/2`)
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
-- `tests/` → container/IR/widened-IR/negative/real-module integration tests
+- `tests/` → container/IR/widened-IR/records/negative/real-module integration tests
+- `tests/records.rs` → `Recs`-chunk integration tests: declaration order, every default encoding, name/atom lookups, the pinned-`ORACLE` ↔ live-`erl` `records:get_definition/2` cross-check (bounded), and malformed-image rejection through `load` beside a well-formed control image
+- `tests/generic_census.rs` → the residual `Instr::Generic` census over the installed OTP (asserts the unmodelled-opcode set equals the documented baseline)
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/native_record.rs` → real-module structural check of the OTP-29 native-record family (186-193): the `erl_eval` `is_any_native_record` positive control, a stdlib/kernel/compiler sweep asserting **no** family member lowers to `Instr::Generic`, and a system-`erlc`-compiled native-record module proving 186-191 lower typed; loud skip when `erl`/`erlc`/OTP is absent
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand

@@ -279,7 +279,7 @@ fn the_debug_chunk_ids_are_distinct_and_recognized() {
     assert!(container.find(ChunkId::DBGB).is_none());
 
     // The debug payload is deliberately not parsed: `chunk::parse` succeeds (the
-    // recognized id is simply ignored, exactly like `Meta`/`Recs`).
+    // recognized id is simply ignored, exactly like `Meta`).
     chunk::parse(&container).expect("chunk::parse ignores the Dbgi payload");
 }
 

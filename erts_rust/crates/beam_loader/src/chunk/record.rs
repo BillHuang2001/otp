@@ -355,7 +355,8 @@ mod tests {
     #[test]
     fn parses_a_record_with_every_default_encoding() {
         // `10^25` as the compiler encodes it: a positive 11-byte two's-complement
-        // field (`test/../records.beam`'s `#mixed{f = 10000000000000000000000000}`).
+        // field (`test/../fixtures/records_fixture.beam`'s
+        // `#mixed{f = 10000000000000000000000000}`).
         let bignum = [0x08, 0x45, 0x95, 0x16, 0x14, 0x01, 0x48, 0x4a, 0x00, 0x00, 0x00];
         let payload = chunk(
             0,

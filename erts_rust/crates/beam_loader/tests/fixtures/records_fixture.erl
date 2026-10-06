@@ -1,4 +1,7 @@
--module(records).
+%% The module name must NOT collide with an OTP library module: `records` is a
+%% stdlib module, and loading this fixture as `records` replaces it, after which
+%% the oracle's own `records:get_definition/2` hangs. A unique name avoids that.
+-module(records_fixture).
 
 -export([noop/0]).
 
