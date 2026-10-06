@@ -57,15 +57,24 @@
 //! * **Output is a Rust `String` (UTF-8).** Raw format bytes `>= 128` and
 //!   `~s`/`~c` values `>= 128` are emitted as their UTF-8 encoding, not raw latin1
 //!   bytes. The ASCII subset is byte-exact.
-//! * **No `~p`/`~P` re-flow.** The oracle runs `io_lib_pretty`, which can break a
-//!   term across lines to fit `line_length` (80 by default, or a `~p` field width).
-//!   This engine always emits the single-line form of [`crate::print`]; when a
-//!   term class that the oracle *would* re-flow (a tuple, a map, a non-printable
-//!   list, or a non-printable bitstring) does not satisfy the oracle's flat
-//!   condition (`length < line_length - column`), the directive is rejected with
-//!   `badarg` rather than emitting a line the oracle would have broken. Terms that
-//!   never re-flow (`~p` of an atom, number, ref, pid, printable list or printable
-//!   binary) are always emitted.
+//! * **No `~p`/`~P` re-flow (a typed `badarg`, never a broken line).** The oracle
+//!   prints a container under `~p`/`~P` with `io_lib_pretty`, which breaks it
+//!   across lines exactly when its single-line rendering is **at least**
+//!   `line_length - column` characters long (`line_length` is 80 by default, or
+//!   the directive's field width; `column` is 1 by default, or the directive's
+//!   precision). This engine only implements the single-line form ([`crate::print`]),
+//!   so for the term classes the oracle *would* re-flow — a **tuple, a map, a
+//!   non-printable list, or a non-printable bitstring** — whose rendering reaches
+//!   that length it raises `error:badarg` instead of emitting a line the oracle
+//!   would have broken. Terms the oracle never re-flows (`~p` of an atom, number,
+//!   ref, pid, fun, **printable** list or **printable** binary — those print on
+//!   one line however long) are always emitted. The narrowest repro is a 79-character
+//!   non-printable list: `io_lib:format("~p", [lists:seq(1,29)])` (rendering
+//!   `[1,…,29]`, 79 chars) raises `error:badarg` here, while the oracle returns
+//!   `[1,2,…,28,` / ` 29]` (a break after the 28th element, a one-space indent);
+//!   `lists:seq(1,28)` (76 chars) and `[lists:seq(1,28) ++ [x]]` (78 chars) stay on
+//!   one line here and in the oracle. The rule is the oracle's own flat condition
+//!   `length < line_length - column` (`io_lib_pretty:print/10`, erts-17.1).
 //! * **`~k`/`~K` are rejected.** They select a *map printing order*; this engine's
 //!   printer always uses the flatmap internal order, so honouring them is not
 //!   possible and a silent wrong order is worse than `badarg`.

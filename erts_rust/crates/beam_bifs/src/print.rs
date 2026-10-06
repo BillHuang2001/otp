@@ -51,10 +51,14 @@
 //!   large/small magnitudes differ (`1.0e10` renders `10000000000`, the oracle
 //!   `1.0e10`).
 //! * **The `~p` printer never line-breaks.** The oracle runs `io_lib_pretty`,
-//!   which reflows a term that does not fit `line_length` (80 columns by default)
-//!   and honours a `~p` field width as a maximum *column*; this printer always
-//!   emits the single-line form. [`crate::io`] rejects a `~p`/`~P` whose rendering
-//!   exceeds an explicitly given field width rather than emit a mis-formatted line.
+//!   which reflows a container whose single-line rendering is at least
+//!   `line_length - column` characters (80 columns and column 1 by default) across
+//!   lines; this printer always emits the single-line form. [`crate::io`] enforces
+//!   that boundary: for a re-flowable class (tuple, map, non-printable list,
+//!   non-printable bitstring) whose rendering reaches the length it raises
+//!   `error:badarg` rather than emit a line the oracle would have broken — see the
+//!   `crate::io` module docs for the precise rule, the term classes and the
+//!   narrowest repro.
 //! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
 //!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
