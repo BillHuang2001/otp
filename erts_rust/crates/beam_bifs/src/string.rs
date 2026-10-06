@@ -271,7 +271,12 @@ mod tests {
                 .map(|b| ctx.int(i64::from(b)).expect("a byte"))
                 .collect();
             let expected = if expected.is_empty() { NIL } else { ctx.list(&expected).unwrap() };
-            assert_eq!(rest_term, expected, "{text} rest");
+            // Structural (`=:=`) equality: the rest is the *tail of the original
+            // argument*, so its raw words differ from a freshly built list.
+            assert!(
+                beam_term::compare::eq(rest_term, expected, ctx.atoms()),
+                "{text} rest"
+            );
         }
         });
     }

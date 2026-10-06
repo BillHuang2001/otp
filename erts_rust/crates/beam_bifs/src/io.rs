@@ -1781,6 +1781,26 @@ mod tests {
     }
 
     #[test]
+    fn printable_range_is_latin1_by_default() {
+        // `io:printable_range/0` ⇒ `latin1`: the `ERL_PRINTABLE_CHARACTERS_LATIN1`
+        // default (`erl_init.c:1379-1382`), which only `+pc unicode` upgrades, and
+        // Milestone-1 has no flag plumbing — exactly what the oracle reports without
+        // `+pc` (`erl -noshell -eval 'io:printable_range().'`).
+        let mut heap = Heap::new(1024).expect("test heap");
+        let mut atoms = AtomTable::new();
+        // Both atoms are seeded, so a hard-coded `unicode` result could not pass by
+        // accident (an unseeded name would be `TermNotFound`, not a wrong answer).
+        atoms.seed(["latin1", "unicode"]);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let result = printable_range_0(&mut ctx, &[]).expect("latin1 is seeded");
+        let latin1 = ctx.atom("latin1").expect("seeded");
+        let unicode = ctx.atom("unicode").expect("seeded");
+        assert_eq!(result, latin1);
+        assert_ne!(result, unicode);
+        assert!(crate::registry::default_registry().contains("io", "printable_range", 0));
+    }
+
+    #[test]
     fn field_value_and_adjust_helpers() {
         // `print.rs`'s `dup_chars` (the oracle's `chars/2`), `adjust_chunk`
         // (`adjust/3`) and `string_field_chunk` (`string/6`, `flat_trunc/3`),

@@ -1692,7 +1692,8 @@ mod tests {
             assert_eq!(show(ctx, "bin_is_7bit", &[list]), "false");
             assert_eq!(show(ctx, "bin_is_7bit", &[make_small(5)]), "false");
             assert_eq!(show(ctx, "bin_is_7bit", &[enc(ctx, "ok")]), "false");
-            assert_eq!(show(ctx, "bin_is_7bit", &[ctx.make_float(1.0).unwrap()]), "false");
+            let one_f = ctx.make_float(1.0).unwrap();
+            assert_eq!(show(ctx, "bin_is_7bit", &[one_f]), "false");
         });
     }
 }
