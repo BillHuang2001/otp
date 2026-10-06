@@ -245,7 +245,7 @@ fn count_inner_nodes(node: Eterm) -> usize {
 
 #[test]
 fn hash_map_over_32_keys_is_copied_as_a_whole_trie() {
-    let mut atoms = AtomTable::new();
+    let atoms = AtomTable::new();
 
     // 40 distinct small-integer keys exceed `MAP_SMALL_MAP_LIMIT` (32), so `write_map` builds a
     // genuine HAMT (hash map) rather than a flat map.
