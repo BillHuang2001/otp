@@ -565,9 +565,9 @@ mod tests {
         // the digit words follow it (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`).
         unsafe {
             let p = boxed_val(term);
-            assert_eq!(*p, make_header(2, POS_BIG_SUBTAG));
+            assert_eq!(*p, make_header(3, POS_BIG_SUBTAG));
             assert!(is_bignum_header(*p));
-            assert_eq!(arityval(*p), digits.len() - 1);
+            assert_eq!(arityval(*p), digits.len());
             assert_eq!((*p).raw() & BIG_SIGN_BIT, 0);
             let stored = core::slice::from_raw_parts(p.add(1).cast::<u64>(), digits.len());
             assert_eq!(stored, &digits[..]);
@@ -588,7 +588,7 @@ mod tests {
         // single digit word.
         unsafe {
             let p = boxed_val(term);
-            assert_eq!(*p, make_header(0, NEG_BIG_SUBTAG));
+            assert_eq!(*p, make_header(1, NEG_BIG_SUBTAG));
             assert_ne!((*p).raw() & BIG_SIGN_BIT, 0);
             assert_eq!((*p.add(1)).raw() as u64, u64::MAX);
         }
