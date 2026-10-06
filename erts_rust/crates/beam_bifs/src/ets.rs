@@ -62,7 +62,9 @@
 use std::collections::HashMap;
 
 use beam_common::Result;
-use beam_ets::{key_of, Access, Table, TableId, TableInfo, TableKind, TableOptions};
+use beam_ets::{
+    compile, key_of, Access, MatchContinuation, Table, TableId, TableInfo, TableKind, TableOptions,
+};
 use beam_term::{atom_val, make_atom, signed_value, AtomTable, Eterm};
 
 use crate::access::{
@@ -99,11 +101,33 @@ const INFO_ITEMS: &[&str] = &[
     "protection",
 ];
 
+/// The base of the continuation-id namespace.
+///
+/// [`TableId::next`] counts up from `1`, so a continuation id is allocated from a
+/// high, disjoint base (`1 << 40`, well inside [`crate::access::make_ref_thing`]'s
+/// 60-bit id range) and can never collide with a table handle — a continuation ref
+/// thing therefore never compares `=:=` to a table handle.
+const CONTINUATION_ID_BASE: u64 = 1 << 40;
+
+/// A live `ets:select/3` continuation: the traversal state plus the handle of the
+/// table it belongs to, so `ets:select/1` can find the table again.
+struct Continuation {
+    /// The registry handle of the table the traversal runs against.
+    table: u64,
+    /// The opaque traversal state [`beam_ets::Table::select_continue`] resumes.
+    state: MatchContinuation,
+}
+
 /// The runtime's ETS tables, keyed by the numeric id of the on-heap ref thing
 /// built by [`crate::access::make_ref_thing`].
 #[derive(Default)]
 pub struct TableRegistry {
     tables: HashMap<u64, Table>,
+    /// The live `ets:select/3` continuations, keyed by the numeric id of the
+    /// continuation ref thing handed to Erlang.
+    continuations: HashMap<u64, Continuation>,
+    /// The next continuation id to hand out.
+    next_continuation: u64,
 }
 
 impl TableRegistry {
@@ -111,12 +135,18 @@ impl TableRegistry {
     pub fn new() -> TableRegistry {
         TableRegistry {
             tables: HashMap::new(),
+            continuations: HashMap::new(),
+            next_continuation: CONTINUATION_ID_BASE,
         }
     }
 
     /// Inserts `table` under `handle`, returning the previous table if the handle
     /// was already present.
+    ///
+    /// Any continuations of the replaced table are dropped (they name a table that
+    /// no longer exists).
     pub fn insert(&mut self, handle: u64, table: Table) -> Option<Table> {
+        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.insert(handle, table)
     }
 
@@ -135,8 +165,10 @@ impl TableRegistry {
         self.tables.contains_key(&handle)
     }
 
-    /// Removes and returns the table stored under `handle`, if any.
+    /// Removes and returns the table stored under `handle`, if any, dropping every
+    /// continuation that belonged to it.
     pub fn remove(&mut self, handle: u64) -> Option<Table> {
+        self.continuations.retain(|_, cont| cont.table != handle);
         self.tables.remove(&handle)
     }
 
@@ -148,6 +180,26 @@ impl TableRegistry {
     /// Whether the registry holds no tables.
     pub fn is_empty(&self) -> bool {
         self.tables.is_empty()
+    }
+
+    /// Registers `state` as a live continuation of the table stored under
+    /// `table`, returning the fresh continuation id (the id of the ref thing the
+    /// `ets:select` BIFs hand to Erlang).
+    pub fn insert_continuation(&mut self, table: u64, state: MatchContinuation) -> u64 {
+        let handle = self.next_continuation;
+        self.next_continuation += 1;
+        self.continuations
+            .insert(handle, Continuation { table, state });
+        handle
+    }
+
+    /// Removes and returns the continuation stored under `handle`, together with
+    /// the handle of its table (`None` when `handle` is unknown — the caller
+    /// raises `badarg`).
+    pub fn take_continuation(&mut self, handle: u64) -> Option<(u64, MatchContinuation)> {
+        self.continuations
+            .remove(&handle)
+            .map(|cont| (cont.table, cont.state))
     }
 }
 
@@ -181,6 +233,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("ets", "update_counter", 3, update_counter_3);
     reg.register("ets", "update_counter", 4, update_counter_4);
     reg.register("ets", "update_element", 3, update_element_3);
+    // Selection (compiled match specs) and the limit/continuation forms.
+    reg.register("ets", "select", 1, select_1);
+    reg.register("ets", "select", 2, select_2);
+    reg.register("ets", "select", 3, select_3);
 }
 
 // --------------------------------------------------------------- creation
@@ -583,6 +639,101 @@ fn parse_updates(spec: Eterm) -> Result<Vec<(usize, Eterm)>> {
     Ok(updates)
 }
 
+// ------------------------------------------------------------- selection
+
+/// `ets:select(Tab, MatchSpec)` — the body values every object the compiled spec
+/// selects produces, copied onto the caller's heap.
+///
+/// `MatchSpec` is a raw match-spec list compiled by [`beam_ets::compile`]; a spec
+/// outside the supported subset is `badarg`.
+fn select_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = ref_thing_id(args[0])?;
+    let spec = compile(args[1], ctx.atoms())?;
+
+    let table = take_table(ctx, handle)?;
+    // `Table::select` needs the atom table *and* the caller heap at once; the
+    // context lends them through two conflicting borrows, so it is given a clone
+    // of the atom table (identical indices, and the call only reads it — the same
+    // pattern `update_counter` uses).
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select(&spec, &atoms, ctx.heap());
+    restore_table(ctx, handle, table)?;
+    copy_out_list(outcome?, ctx)
+}
+
+/// `ets:select(Tab, MatchSpec, Limit)` — as [`select_2`], but stop after at most
+/// `Limit` results (the oracle's chunking).
+///
+/// A reached limit yields a continuation, which [`select_1`] resumes; a traversal
+/// that finishes first yields the results with no continuation. `Limit` is a
+/// non-negative integer and `0` is `badarg` (the oracle raises it).
+fn select_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = ref_thing_id(args[0])?;
+    let spec = compile(args[1], ctx.atoms())?;
+    // A non-integer or a negative limit is `badarg` here; `0` is rejected by
+    // `select_limit` (matching the oracle).
+    let limit = element_pos(args[2])?;
+
+    let table = take_table(ctx, handle)?;
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select_limit(&spec, limit, &atoms, ctx.heap());
+    restore_table(ctx, handle, table)?;
+    let (results, cont) = outcome?;
+    finish_select(ctx, handle, results, cont)
+}
+
+/// `ets:select(Continuation)` — resumes an [`select_3`] traversal.
+///
+/// The argument is a continuation ref thing returned by an earlier `select/3`
+/// (or `select/1`); an unknown one is `badarg`.
+fn select_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = ref_thing_id(args[0])?;
+    let (table_handle, cont) = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.take_continuation(handle).ok_or_else(badarg)?
+    };
+
+    let table = take_table(ctx, table_handle)?;
+    let atoms = ctx.atoms().clone();
+    let outcome = table.select_continue(&cont, &atoms, ctx.heap());
+    restore_table(ctx, table_handle, table)?;
+    let (results, next) = outcome?;
+    finish_select(ctx, table_handle, results, next)
+}
+
+/// Renders one `select` chunk exactly as the oracle (erts-17.1) does:
+///
+/// * a produced continuation ⇒ the 2-tuple `{Results, ContTerm}`, where
+///   `ContTerm` is a fresh continuation ref thing;
+/// * the traversal finished ⇒ the 2-tuple `{Results, '$end_of_table'}` — or the
+///   **bare** atom `'$end_of_table'` when `Results` is empty (verified against the
+///   system `erl`: a 4-object table with `limit` 2 renders the final chunk as the
+///   bare atom while a 5-object table renders `{[{5,a}], '$end_of_table'}`).
+fn finish_select(
+    ctx: &mut BifContext<'_>,
+    table: u64,
+    results: Vec<Eterm>,
+    cont: Option<MatchContinuation>,
+) -> Result<Eterm> {
+    match cont {
+        Some(state) => {
+            let handle = {
+                let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+                tables.insert_continuation(table, state)
+            };
+            let cont_term = make_ref_thing(ctx.heap(), handle)?;
+            let list = copy_out_list(results, ctx)?;
+            ctx.tuple(&[list, cont_term])
+        }
+        None if results.is_empty() => ctx.intern_atom(END_OF_TABLE),
+        None => {
+            let list = copy_out_list(results, ctx)?;
+            let end = ctx.intern_atom(END_OF_TABLE)?;
+            ctx.tuple(&[list, end])
+        }
+    }
+}
+
 // ----------------------------------------------------------------- helpers
 
 /// Removes the table under `handle`, or `badarg` when it is unknown.
@@ -792,6 +943,10 @@ mod tests {
             "none",
             "node",
             "nonode@nohost",
+            // The match-spec variables the `ets:select` specs use.
+            "$1",
+            "$2",
+            "c",
             "p",
             "q",
             "z",
@@ -1388,5 +1543,94 @@ mod tests {
         assert!(matches!(parse_updates(a), Err(BeamError::BadArg)));
         let improper = ctx.cons(good, good).expect("fits");
         assert!(matches!(parse_updates(improper), Err(BeamError::BadArg)));
+    }
+
+    /// Creates an `ordered_set` table in `ctx` and returns its handle (so the
+    /// `select` iteration order is deterministic).
+    fn new_ordered_table(ctx: &mut BifContext<'_>, name: &str) -> Eterm {
+        let name = ctx.atom(name).expect("seeded");
+        let kind = ctx.atom("ordered_set").expect("seeded");
+        let opts = ctx.list(&[kind]).expect("fits");
+        new_2(ctx, &[name, opts]).expect("ets:new")
+    }
+
+    /// The spec `[{{'$1','$2'}, [], [{{'$1','$2'}}]}]` — the whole matched object
+    /// per match — built on `ctx`.
+    fn whole_object_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        let projected = ctx.tuple(&[v1, v2]).expect("fits");
+        let body_item = ctx.tuple(&[projected]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    #[test]
+    fn select_projects_and_resumes_through_opaque_continuations() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+        let handle = new_ordered_table(&mut ctx, "mytab");
+        for (key, value) in [("a", 1), ("b", 2), ("c", 3), ("p", 4)] {
+            let obj = pair(&mut ctx, key, value);
+            insert_2(&mut ctx, &[handle, obj]).expect("insert");
+        }
+
+        // `select/2` projects the whole object for every match, in iteration order.
+        let spec = whole_object_spec(&mut ctx);
+        let all = select_2(&mut ctx, &[handle, spec]).expect("select/2");
+        assert_eq!(proper_list(all).expect("list").len(), 4);
+
+        // `select/3` with a limit yields `{Results, Continuation}`. The continuation
+        // is a fresh ref thing in the continuation-id namespace, so it never
+        // compares `=:=` to the table handle.
+        let two = ctx.int(2).expect("fits");
+        let spec = whole_object_spec(&mut ctx);
+        let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("select/3");
+        let results = tuple_element(chunk, 0);
+        let cont = tuple_element(chunk, 1);
+        assert_eq!(proper_list(results).expect("list").len(), 2);
+        assert!(!beam_term::compare::eq(cont, handle, &atoms));
+        assert!(ref_thing_id(cont).expect("continuation ref") >= CONTINUATION_ID_BASE);
+
+        // Resuming draws the second chunk, still with a continuation.
+        let chunk = select_1(&mut ctx, &[cont]).expect("select/1");
+        let cont = tuple_element(chunk, 1);
+        assert_eq!(proper_list(tuple_element(chunk, 0)).expect("list").len(), 2);
+
+        // The traversal finished with no results left, so it renders as the **bare**
+        // `'$end_of_table'` atom (the oracle's rule).
+        let chunk = select_1(&mut ctx, &[cont]).expect("select/1");
+        assert_eq!(atoms.name(atom_val(chunk)), Some(END_OF_TABLE));
+
+        // `limit == 0` is `badarg` (the oracle raises it).
+        let zero = ctx.int(0).expect("fits");
+        let spec = whole_object_spec(&mut ctx);
+        assert!(matches!(
+            select_3(&mut ctx, &[handle, spec, zero]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-continuation (here, the table handle) is `badarg`.
+        assert!(matches!(
+            select_1(&mut ctx, &[handle]),
+            Err(BeamError::BadArg)
+        ));
+
+        // Deleting the table drops its continuations, so a stale one is `badarg`.
+        let spec = whole_object_spec(&mut ctx);
+        let chunk = select_3(&mut ctx, &[handle, spec, two]).expect("select/3");
+        let stale = tuple_element(chunk, 1);
+        assert!(is_true(
+            &atoms,
+            delete_1(&mut ctx, &[handle]).expect("delete/1")
+        ));
+        assert!(matches!(
+            select_1(&mut ctx, &[stale]),
+            Err(BeamError::BadArg)
+        ));
     }
 }
