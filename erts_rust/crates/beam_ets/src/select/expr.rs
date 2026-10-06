@@ -8,15 +8,42 @@
 //! anything else is a constant. Comparison delegates to `beam_term::compare`
 //! (`cmp` for the exact operators, `cmp_arith` for the arithmetic/ordinal ones) —
 //! term order is never re-implemented here.
+//!
+//! # Arithmetic (the [`ArithHook`] seam)
+//!
+//! `+ - * / div rem band bor bxor bsl bsr` are accepted in **both** guards and
+//! bodies, binary as well as unary for `+`/`-` (`abs/1` stays the separate
+//! [`Expr::Abs`]). The C `guard_tab` maps them straight onto the ordinary BIFs —
+//! `erl_db_util.c:887-894` binds `bsl`/`bsr` to `bsl_2`/`bsr_2` — so a match spec
+//! sees exactly what the corresponding Erlang expression worker sees.
+//!
+//! Evaluation goes through the [`ArithHook`] seam rather than a hard-coded
+//! implementation: a runtime with real bignum/float arithmetic installs its own
+//! hook with [`set_arith_hook`], and without one [`DefaultArithHook`] answers.
+//! The default implements **small-integer** arithmetic only, and it never
+//! fabricates a result — a non-small operand (bignum/float), an `i64` overflow, a
+//! result outside the 60-bit small range, or `/` (whose Erlang result is *always* a
+//! float: `4/2` is `2.0`) is the typed `unsupported_ets` raise, and `div`/`rem` by
+//! zero is `badarg` (what the oracle raises).
+//!
+//! One deliberate divergence from the oracle is documented at
+//! [`default_arith`]: the C `erts_shift` *reverses the direction* for a negative
+//! shift count (`8 bsr -1` is `16`), whereas the default hook refuses it.
+//!
+//! Like every other guard construct, arithmetic that raises inside a **guard**
+//! makes its clause fail and is skipped by the caller; the body path is the
+//! executor's (`select/exec.rs`).
 
+use std::cell::RefCell;
 use std::collections::BTreeSet;
+use std::rc::Rc;
 
 use beam_alloc::Heap;
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::prelude::*;
 
 use super::{atom_name, var_index};
-use crate::error::badarg;
+use crate::error::{badarg, unsupported};
 
 /// A comparison operator usable in a guard.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -72,6 +99,102 @@ pub enum TypeTest {
     Boolean,
 }
 
+/// An arithmetic operator usable in a guard or a body.
+///
+/// All eleven spellings are accepted in **both** guards and bodies (verified
+/// against the system `erl`); a **unary** `+`/`-` (`{'+', A}`/`{'-', A}`) reuses
+/// [`Add`](ArithOp::Add)/[`Sub`](ArithOp::Sub) with a one-element operand vector.
+/// `abs/1` is *not* here — it is the separate [`Expr::Abs`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ArithOp {
+    /// `+` — binary addition, or unary plus with one operand.
+    Add,
+    /// `-` — binary subtraction, or unary minus with one operand.
+    Sub,
+    /// `*`.
+    Mul,
+    /// `/` — **always** a float result in Erlang (`1/2` is `0.5`, `4/2` is `2.0`).
+    Div,
+    /// `div`.
+    IntDiv,
+    /// `rem`.
+    Rem,
+    /// `band`.
+    Band,
+    /// `bor`.
+    Bor,
+    /// `bxor`.
+    Bxor,
+    /// `bsl`.
+    Bsl,
+    /// `bsr`.
+    Bsr,
+}
+
+/// The evaluation seam for match-spec arithmetic (see the module docs).
+///
+/// [`eval`] takes no hook parameter — the executor in `select/exec.rs` calls it
+/// directly — so the hook is installed **per thread** with [`set_arith_hook`]
+/// instead of being threaded through every expression. A runtime that owns real
+/// bignum/float arithmetic installs its own implementation there; without one
+/// [`DefaultArithHook`] answers, and it implements **small integers only**.
+pub trait ArithHook {
+    /// Evaluate one arithmetic operation over its already-evaluated operands.
+    ///
+    /// `args` holds the operand terms (one for a unary `+`/`-`, two otherwise;
+    /// [`decode`] rejects every other arity with `badarg`). `heap` is the caller's
+    /// heap, for an implementation that has to materialize a term (a bignum, say).
+    fn eval(
+        &self,
+        op: ArithOp,
+        args: &[Eterm],
+        _atoms: &AtomTable,
+        _heap: &mut Heap,
+    ) -> Result<Eterm> {
+        default_arith(op, args)
+    }
+}
+
+/// The built-in arithmetic hook: **small-integer** `+ - * div rem band bor bxor
+/// bsl bsr` (and unary `+`/`-`) via checked `i64` arithmetic.
+///
+/// Every case outside that subset is a typed error rather than a fabricated
+/// answer — see [`default_arith`], which lists exactly which failure each case
+/// maps to.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DefaultArithHook;
+
+impl ArithHook for DefaultArithHook {}
+
+thread_local! {
+    /// The arithmetic hook installed on this thread; `None` means
+    /// [`DefaultArithHook`] (see [`set_arith_hook`]).
+    static ARITH_HOOK: RefCell<Option<Rc<dyn ArithHook + 'static>>> = RefCell::new(None);
+}
+
+/// Install `hook` as the arithmetic hook of the **current thread**; `None`
+/// restores [`DefaultArithHook`].
+///
+/// Process-local by construction: every table op runs on the calling thread, and
+/// `beam_rt` installs the hook for the process it is running.
+pub fn set_arith_hook(hook: Option<Rc<dyn ArithHook + 'static>>) {
+    ARITH_HOOK.with(|cell| *cell.borrow_mut() = hook);
+}
+
+/// The arithmetic hook in force on this thread: the installed one, else
+/// [`DefaultArithHook`].
+///
+/// The `Rc` is **cloned out** of the `RefCell` before it is returned, so no borrow
+/// is ever held across an [`eval`] call — the hook may itself evaluate
+/// expressions.
+fn arith_hook() -> Rc<dyn ArithHook + 'static> {
+    ARITH_HOOK.with(|cell| {
+        cell.borrow()
+            .clone()
+            .unwrap_or_else(|| Rc::new(DefaultArithHook))
+    })
+}
+
 /// One guard/body expression node.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Expr {
@@ -109,6 +232,10 @@ pub enum Expr {
     Element(Box<Expr>, Box<Expr>),
     /// `abs/1`.
     Abs(Box<Expr>),
+    /// An arithmetic operator over its operands (`+ - * / div rem band bor bxor
+    /// bsl bsr`, with a one-element operand vector for unary `+`/`-`). Evaluated
+    /// through the [`ArithHook`] seam, never inline.
+    Arith(ArithOp, Vec<Expr>),
     /// `size/1`.
     Size(Box<Expr>),
     /// `hd/1`.
@@ -232,6 +359,12 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
         }
         Ok(Expr::Test(test, Box::new(arg(0)?)))
     };
+    let binary_arith = |op: ArithOp| -> Result<Expr> {
+        if args.len() != 2 {
+            return Err(badarg());
+        }
+        Ok(Expr::Arith(op, vec![arg(0)?, arg(1)?]))
+    };
     match name {
         // Special forms.
         "andalso" | "and" | "orelse" | "or" => {
@@ -301,6 +434,30 @@ fn decode_call(name: &str, args: &[Eterm], atoms: &AtomTable, vars: &BTreeSet<u3
             }
             Ok(Expr::Abs(Box::new(arg(0)?)))
         }
+        // Arithmetic. `+`/`-` are unary as well as binary — the C `guard_tab`
+        // carries both arities — while the rest are binary only; any other arity
+        // is `badarg` (verified against `erl`, which rejects `{'+',1,2,3}`,
+        // `{'+'}`, `{'div',1}` and `{abs,1,2}` alike).
+        "+" | "-" => {
+            if args.is_empty() || args.len() > 2 {
+                return Err(badarg());
+            }
+            let op = if name == "+" { ArithOp::Add } else { ArithOp::Sub };
+            let mut parts = Vec::with_capacity(args.len());
+            for index in 0..args.len() {
+                parts.push(arg(index)?);
+            }
+            Ok(Expr::Arith(op, parts))
+        }
+        "*" => binary_arith(ArithOp::Mul),
+        "/" => binary_arith(ArithOp::Div),
+        "div" => binary_arith(ArithOp::IntDiv),
+        "rem" => binary_arith(ArithOp::Rem),
+        "band" => binary_arith(ArithOp::Band),
+        "bor" => binary_arith(ArithOp::Bor),
+        "bxor" => binary_arith(ArithOp::Bxor),
+        "bsl" => binary_arith(ArithOp::Bsl),
+        "bsr" => binary_arith(ArithOp::Bsr),
         "size" => {
             if args.len() != 1 {
                 return Err(badarg());
@@ -450,6 +607,16 @@ pub(super) fn eval(
             }
             Ok(Value::Term(make_small(signed_value(operand).abs())))
         }
+        Expr::Arith(op, parts) => {
+            let mut values = Vec::with_capacity(parts.len());
+            for part in parts {
+                values.push(eval_term(part, binds, object, atoms, heap)?);
+            }
+            // The hook is resolved through the thread-local seam and its `Rc` is
+            // cloned out of the `RefCell` before the call (see [`arith_hook`]), so
+            // no borrow is held while the hook runs.
+            arith_hook().eval(*op, &values, atoms, heap).map(Value::Term)
+        }
         Expr::Size(operand) => {
             let operand = eval_term(operand, binds, object, atoms, heap)?;
             size(operand).map(Value::Term)
@@ -517,6 +684,134 @@ fn classify(term: Eterm) -> TermClass {
     // SAFETY: `class` reads a boxed header only for a boxed word; `term` is a live
     // term (a spec subterm or a matched value), so its header is valid.
     unsafe { class(term) }
+}
+
+/// The Erlang spelling of an [`ArithOp`] (used in the typed error messages, so a
+/// refusal reads as the operator the spec actually wrote).
+fn arith_name(op: ArithOp) -> &'static str {
+    match op {
+        ArithOp::Add => "+",
+        ArithOp::Sub => "-",
+        ArithOp::Mul => "*",
+        ArithOp::Div => "/",
+        ArithOp::IntDiv => "div",
+        ArithOp::Rem => "rem",
+        ArithOp::Band => "band",
+        ArithOp::Bor => "bor",
+        ArithOp::Bxor => "bxor",
+        ArithOp::Bsl => "bsl",
+        ArithOp::Bsr => "bsr",
+    }
+}
+
+/// The typed "outside the small-integer subset" failure for `op`.
+fn not_small(op: &str) -> BeamError {
+    unsupported(&format!(
+        "match-spec arithmetic '{op}': the result is not a small integer"
+    ))
+}
+
+/// The [`DefaultArithHook`] implementation: small-integer `+ - * div rem band bor
+/// bxor bsl bsr`, plus unary `+`/`-`, all through checked `i64`.
+///
+/// It is deliberately **total-or-refusing** — never wrong:
+///
+/// * A **non-small operand** (bignum, float, atom, tuple, …) ⇒ `unsupported_ets`.
+///   The oracle would answer several of those (`1 + 1.0` is `2.5`), but only with
+///   float/bignum arithmetic this hook does not have; guessing a small integer
+///   would be a wrong result.
+/// * An `i64` overflow, or a result outside the 60-bit small range (`MAX_SMALL +
+///   1`, `-1 bsl 62`, … — bignums in the oracle) ⇒ `unsupported_ets`.
+/// * `/` ⇒ `unsupported_ets`: its Erlang result is **always** a float (`1/2` is
+///   `0.5`, `4/2` is `2.0`).
+/// * `div`/`rem` by zero ⇒ `badarg`, which is what the oracle raises.
+/// * A **negative** shift count ⇒ `badarg`. This is the one documented
+///   divergence: the C `erts_shift`
+///   (`../../erts/emulator/beam/erl_arith.c:229-236`) *reverses the direction*
+///   instead (`8 bsr -1` is `16`, `1 bsl -1` is `0`) and so the oracle answers
+///   these. The default hook scopes a negative count out, like every other case it
+///   cannot answer exactly — it never guesses a value. A shift count of 64 or more
+///   is refused the same way (the oracle saturates `bsr` to `0`/`-1` and widens
+///   `bsl` to a bignum).
+/// * A wrong operand count ⇒ `badarg`; only reachable by calling the seam
+///   directly, since [`decode_call`] rejects it at compile time.
+fn default_arith(op: ArithOp, args: &[Eterm]) -> Result<Eterm> {
+    let name = arith_name(op);
+    // An operand is in the subset only when it *is* a small integer.
+    let operand = |index: usize| -> Result<i64> {
+        let term = args.get(index).copied().ok_or_else(badarg)?;
+        if is_small(term) {
+            Ok(signed_value(term))
+        } else {
+            Err(unsupported(&format!(
+                "match-spec arithmetic '{name}': operand {} is not a small integer",
+                index + 1
+            )))
+        }
+    };
+    // A computed value is in the subset only when it still fits a 60-bit small.
+    let result = |value: i64| -> Result<Eterm> {
+        try_make_small(value).map_err(|_| not_small(name))
+    };
+    // The checked `i64` form: `None` is the overflow the checked op detected.
+    let checked = |value: Option<i64>| -> Result<Eterm> {
+        match value {
+            Some(value) => result(value),
+            None => Err(not_small(name)),
+        }
+    };
+    match (op, args.len()) {
+        // Unary `+` — the identity on a small integer.
+        (ArithOp::Add, 1) => result(operand(0)?),
+        // Unary `-`.
+        (ArithOp::Sub, 1) => checked(operand(0)?.checked_neg()),
+        (ArithOp::Add, 2) => checked(operand(0)?.checked_add(operand(1)?)),
+        (ArithOp::Sub, 2) => checked(operand(0)?.checked_sub(operand(1)?)),
+        (ArithOp::Mul, 2) => checked(operand(0)?.checked_mul(operand(1)?)),
+        // `/` always yields a float, so it can never be a small-integer answer.
+        (ArithOp::Div, 2) => Err(unsupported(
+            "match-spec arithmetic '/': the result is a float",
+        )),
+        (ArithOp::IntDiv, 2) | (ArithOp::Rem, 2) => {
+            let (left, right) = (operand(0)?, operand(1)?);
+            if right == 0 {
+                return Err(badarg());
+            }
+            checked(if op == ArithOp::IntDiv {
+                left.checked_div(right)
+            } else {
+                left.checked_rem(right)
+            })
+        }
+        // `band`/`bor`/`bxor` on two 60-bit values always stay 60-bit, but the
+        // result is range-checked like every other op rather than assumed.
+        (ArithOp::Band, 2) => result(operand(0)? & operand(1)?),
+        (ArithOp::Bor, 2) => result(operand(0)? | operand(1)?),
+        (ArithOp::Bxor, 2) => result(operand(0)? ^ operand(1)?),
+        (ArithOp::Bsl, 2) | (ArithOp::Bsr, 2) => {
+            let (value, count) = (operand(0)?, operand(1)?);
+            if count < 0 {
+                return Err(badarg());
+            }
+            let Some(amount) = u32::try_from(count).ok().filter(|count| *count < 64) else {
+                return Err(not_small(name));
+            };
+            // `bsl` must not silently drop the shifted-out bits: `2 bsl 62` is a
+            // bignum in the oracle, and a bare `<<` would answer `0`. The
+            // round-trip catches exactly the bits that were lost.
+            let (shifted, round_trip) = if op == ArithOp::Bsl {
+                let shifted = value << amount;
+                (shifted, shifted >> amount)
+            } else {
+                (value >> amount, value)
+            };
+            if round_trip != value {
+                return Err(not_small(name));
+            }
+            result(shifted)
+        }
+        _ => Err(badarg()),
+    }
 }
 
 /// A comparison, using `beam_term::compare` (never a local term order).
