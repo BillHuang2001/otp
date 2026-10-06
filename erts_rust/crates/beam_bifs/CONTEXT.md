@@ -346,8 +346,8 @@ immediate); `port_close/1` and `port_info/1,2` decode the argument with `PortId:
 2-tuples; `port_info/2` returns the matching value or the atom `undefined` (a documented deviation
 from erts-17.1, which raises `badarg` for an unknown item). `list_to_port/1`/`port_to_list/1` are pure
 (`#Port<0.Num>`, node number `0` = `nonode@nohost`) and fully implemented.
-The `PortId` type comes from the **existing `beam_process` dependency** — no `beam_io` dependency edge
-was added. The concrete port machinery (spawning the OS process through the `spawn` driver, allocating
+The `PortId` type comes from the **existing `beam_process` dependency** — there is no `beam_io`
+dependency edge. The concrete port machinery (spawning the OS process through the `spawn` driver, allocating
 the port-table slot, registering with the poller) is the `beam_io`/`beam_rt` handoff below.
 
 ## Fun-taking `lists`/`maps` BIFs (the `FunCaller` seam)
