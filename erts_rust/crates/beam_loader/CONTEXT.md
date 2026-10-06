@@ -389,16 +389,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 
 ## Known Issues / Intentional M1 gaps
 - **Residual `Instr::Generic` opcodes.** The opcodes the loader deliberately does not model still lower
-  losslessly to `Instr::Generic`: the **OTP-29 native-record family** (`is_any_native_record/2`,
-  `is_native_record/4`, `get_record_elements/3`, `put_record/6`, `is_record_accessible/3`,
-  `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`), whose operands need
-  record-descriptor modelling the IR does not own yet, and the obsolete/transform-only `genop.tab`
-  entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
+  losslessly to `Instr::Generic`: the remaining **OTP-29 native-record family** (`is_native_record/4`,
+  `get_record_elements/3`, `put_record/6`, `is_record_accessible/3`, `get_record_field/5`,
+  `get_record_elements_id/4`, `update_record_id/7`), whose operands need record-descriptor modelling the
+  IR does not own yet (`is_any_native_record/2` **is** lowered, to `Instr::IsAnyNativeRecord`), and the
+  obsolete/transform-only `genop.tab` entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
-- **`Type` chunk version 3 (OTP 27/28) is parsed with version-4 bit positions** — the OTP 27/28 layout
-  shifts the metadata bits (`beam_file.c:654-687`) and is not re-mapped, so such a chunk yields plausible
-  but possibly wrong bounds. Version 4 (OTP 29+) is correct.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
