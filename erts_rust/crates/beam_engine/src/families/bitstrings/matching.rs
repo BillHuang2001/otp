@@ -482,9 +482,20 @@ fn position_of(value: Eterm) -> Result<usize> {
 /// Extract an integer field of `nbits` bits at bit `start`, honouring the
 /// `BSF_LITTLE`/`BSF_SIGNED` flags, and build the resulting term.
 ///
-/// A field of at most 64 bits is collected into a machine word; a **wider** field
-/// is the `erts_bs_get_integer_2` big path (`erl_bits.c:170`) and may need a
-/// bignum, which is built through the [`ExecutionContext`].
+/// `erts_bs_get_integer_2` (`erl_bits.c:170`) has fast paths for fields that are
+/// *guaranteed* to fit a small integer (`<= 8` bits, and `< SMALL_BITS` bits
+/// big-endian) and one general path for everything else. Only the fast paths are
+/// special-cased here; a field of at most 64 bits that is **not** guaranteed to
+/// fit is collected into a machine word and handed to the same `IS_USMALL`
+/// decision the general path uses ([`make_int`], which delegates the bignum
+/// itself to `beam_term`). A field **wider** than 64 bits is the general path's
+/// byte-array form ([`read_wide_integer_field`]).
+///
+/// Because `MAX_SMALL` is only `2^59-1`, the fast paths a *big-endian* field
+/// needs are `nbits <= 8` and `9 <= nbits < 59` — a 59-bit unsigned field's
+/// maximum (`2^59-1`) still fits. A 60..64-bit field, and every little-endian
+/// field of 9 or more bits (C has no small fast path for those), can therefore
+/// exceed `MAX_SMALL` and must build a bignum.
 fn read_integer_field(
     ctx: &mut dyn ExecutionContext,
     bytes: &[u8],
@@ -492,20 +503,32 @@ fn read_integer_field(
     nbits: usize,
     flags: u32,
 ) -> Result<Eterm> {
-    if nbits > 64 {
+    let little = flags & BSF_LITTLE != 0;
+    // A byte-aligned little-endian field is the only one `read_uint_le` handles;
+    // every other little-endian field takes the general bit-level path (C's
+    // `erts_copy_bits_fwd` + `*MSB >>= 8 - BIT_OFFSET(num_bits)`,
+    // `erl_bits.c:305-313`), including the **non-byte-multiple** widths the
+    // standard compiler emits (`<<Y:12/little>>`, `<<Y:20/little>>`, …).
+    let le_fast_path = nbits % 8 == 0 && start % 8 == 0;
+    if nbits > 64 || (little && !le_fast_path) {
         return read_wide_integer_field(ctx, bytes, start, nbits, flags);
     }
-    let raw_value = if flags & BSF_LITTLE != 0 {
+    let raw_value = if little {
         read_uint_le(bytes, start, nbits)?
     } else {
         read_uint_be(bytes, start, nbits)?
     };
-    let value = if flags & BSF_SIGNED != 0 {
-        sign_extend(raw_value, nbits)
+    // The sign and magnitude exactly as `erts_bs_get_integer_2` derives them: a
+    // signed field is sign-extended at its own width first (`MAYBE_SIGN_EXTEND`),
+    // so its machine word read as `i64` **is** the value; an unsigned field's word
+    // is a pure magnitude (never reinterpreted as negative, even above `2^63`).
+    let (negative, magnitude) = if flags & BSF_SIGNED != 0 {
+        let signed = sign_extend(raw_value, nbits) as i64;
+        (signed < 0, signed.unsigned_abs())
     } else {
-        raw_value
+        (false, raw_value)
     };
-    make_small_checked(value as i64)
+    make_int(ctx, negative, &[magnitude])
 }
 
 /// Read an integer field **wider than 64 bits** and build the (possibly bignum)
