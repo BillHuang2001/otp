@@ -61,37 +61,28 @@ use crate::registry::BifRegistry;
 // ---------------------------------------------------------------------------
 /// The `f64` value of a numeric operand (`math_call_1`'s coercion).
 ///
+/// A bignum is rounded by the shared, canonical `big_to_double` port
+/// [`beam_term::number::big_to_f64`] — the LCA term-layout crate — rather than a
+/// second copy of the algorithm. Its `None` result is the C's `int < 0` failure,
+/// which `math_call_1` turns into `badarith`.
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for anything that is not a float, a small integer or a
-/// bignum — the C's `p->freason = BADARG` branch.
-fn operand(ctx: &mut BifContext<'_>, term: Eterm) -> Result<f64> {
+/// bignum — the C's `p->freason = BADARG` branch;
+/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a bignum whose
+/// magnitude is not representable as a finite `f64` — the oracle's
+/// `big_to_double(...) < 0` branch.
+fn operand(term: Eterm) -> Result<f64> {
     if access::is_float(term) {
         Ok(access::float_value(term))
     } else if access::is_small(term) {
         Ok(signed_value(term) as f64)
     } else if access::is_big(term) {
-        big_to_f64(ctx, term)
+        beam_term::number::big_to_f64(term).ok_or_else(badarith)
     } else {
         Err(badarg())
     }
-}
-/// The `f64` nearest to a bignum operand — the C `big_to_double`
-/// (`big.c:2412`, `Big::to_f64`).
-///
-/// Computed through the crate's **shared arithmetic path** (`arith::add_terms`
-/// with a float zero) rather than a second copy of the bignum rounding algorithm:
-/// `+` coerces an integer operand with exactly `as_float`/`to_f64`, so this is the
-/// same rounding, including its failure mode.
-///
-/// # Errors
-///
-/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) when the magnitude is not representable as a finite
-/// `f64` — the oracle's `big_to_double(...) < 0` branch.
-fn big_to_f64(ctx: &mut BifContext<'_>, term: Eterm) -> Result<f64> {
-    let zero = ctx.make_float(0.0)?;
-    let sum = crate::arith::add_terms(ctx, term, zero)?;
-    Ok(access::float_value(sum))
 }
 /// Applies a unary `f64 → f64` function and materializes the result as a float,
 /// with the C's `!isfinite(result) ⇒ badarith` check (`ERTS_FP_ERROR_THOROUGH`).
@@ -100,7 +91,7 @@ fn big_to_f64(ctx: &mut BifContext<'_>, term: Eterm) -> Result<f64> {
 ///
 /// The operand's own error (see [`operand`]), `badarith` for a non-finite result.
 fn unary(ctx: &mut BifContext<'_>, arg: Eterm, func: fn(f64) -> f64) -> Result<Eterm> {
-    let value = func(operand(ctx, arg)?);
+    let value = func(operand(arg)?);
     if !value.is_finite() {
         return Err(badarith());
     }
@@ -118,8 +109,8 @@ fn binary(
     second: Eterm,
     func: fn(f64, f64) -> f64,
 ) -> Result<Eterm> {
-    let a = operand(ctx, first)?;
-    let b = operand(ctx, second)?;
+    let a = operand(first)?;
+    let b = operand(second)?;
     let value = func(a, b);
     if !value.is_finite() {
         return Err(badarith());
@@ -585,6 +576,44 @@ mod tests {
             // A bignum beyond `f64` range is `badarith` (`big_to_double` fails).
             let huge = beam_codec::term::make_big(ctx.heap(), false, &[0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1]).expect("a bignum");
             assert!(matches!(floor_1(ctx, &[huge]), Err(BeamError::BadArith)));
+        });
+    }
+    /// The bignum operand coercion is the canonical `big_to_double` port
+    /// (`beam_term::number::big_to_f64`): ties-to-even rounding and the same
+    /// `badarith` at the finite-double limit as the oracle.
+    #[test]
+    fn bignum_operands_use_the_canonical_big_to_double_port() {
+        with_ctx(|ctx| {
+            // `math:sqrt(1 bsl 100)` ⇒ `1125899906842624.0` (`2^50`).
+            let two_to_100 =
+                beam_codec::term::make_big(ctx.heap(), false, &[0, 1u64 << 36]).expect("a bignum");
+            assert_eq!(
+                float_of(sqrt_1(ctx, &[two_to_100]).unwrap()),
+                1125899906842624.0
+            );
+            // `math:exp(1 bsl 100)` overflows to `inf` ⇒ `badarith`.
+            assert!(matches!(exp_1(ctx, &[two_to_100]), Err(BeamError::BadArith)));
+
+            // Ties to even: `(1 bsl 53) + 1` (halfway) ⇒ `9.007199254740992e15`.
+            let tie = beam_codec::term::make_big(ctx.heap(), false, &[(1u64 << 53) + 1])
+                .expect("a bignum");
+            assert_eq!(float_of(floor_1(ctx, &[tie]).unwrap()), 9007199254740992.0);
+
+            // The largest finite double `(1 bsl 1024) - (1 bsl 971) = (2^53-1)·2^971`
+            // coerces exactly (`f64::MAX`); one half-ulp above it —
+            // `(1 bsl 1024) - (1 bsl 970)` — rounds up to `2^1024`, not finite, so it
+            // is `badarith` (the `big_to_f64` `None` boundary).
+            let mut max_limbs = vec![0u64; 16];
+            max_limbs[15] = ((1u64 << 53) - 1) << 11;
+            let max =
+                beam_codec::term::make_big(ctx.heap(), false, &max_limbs).expect("a bignum");
+            assert_eq!(float_of(floor_1(ctx, &[max]).unwrap()), f64::MAX);
+
+            let mut carry_limbs = vec![0u64; 16];
+            carry_limbs[15] = u64::MAX << 10;
+            let carry =
+                beam_codec::term::make_big(ctx.heap(), false, &carry_limbs).expect("a bignum");
+            assert!(matches!(floor_1(ctx, &[carry]), Err(BeamError::BadArith)));
         });
     }
     #[test]

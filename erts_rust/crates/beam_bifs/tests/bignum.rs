@@ -261,6 +261,68 @@ fn bignum_operands_mix_with_floats_like_the_oracle() {
     assert!(matches!(fx.call("/", &[huge, two]), Err(BeamError::BadArith)));
 }
 
+/// The BIF-visible `Eterm` bignum → `f64` conversion is the canonical
+/// `big_to_double` port (`beam_term::number::big_to_f64`): the oracle's ties-to-even
+/// rounding, and the same `badarith` at the finite-double limit.
+#[test]
+fn bignum_plus_float_rounds_like_the_canonical_big_to_double() {
+    let mut fx = Fixture::new();
+    let zero = fx.float(0.0);
+
+    // Ties to even: `(1 bsl 53) + 1` is halfway between `2^53` and `2^53 + 2`, so the
+    // even one wins; `(1 bsl 53) + 3` rounds up. Oracle:
+    // `float((1 bsl 53) + 1)` ⇒ 9.007199254740992e15,
+    // `float((1 bsl 53) + 3)` ⇒ 9.007199254740996e15.
+    let tie = fx.bignum(false, &[(1u64 << 53) + 1]);
+    assert_eq!(
+        float(fx.call("+", &[tie, zero]).expect("erlang:'+'/2")),
+        9007199254740992.0
+    );
+    let tie_up = fx.bignum(false, &[(1u64 << 53) + 3]);
+    assert_eq!(
+        float(fx.call("+", &[tie_up, zero]).expect("erlang:'+'/2")),
+        9007199254740996.0
+    );
+
+    // The largest finite double is `(1 bsl 1024) - (1 bsl 971) = (2^53 - 1)·2^971`;
+    // `+ 0.0` yields exactly it. Oracle: 1.7976931348623157e308.
+    let mut max_limbs = vec![0u64; 16];
+    max_limbs[15] = ((1u64 << 53) - 1) << 11;
+    let max = fx.bignum(false, &max_limbs);
+    assert_eq!(
+        float(fx.call("+", &[max, zero]).expect("erlang:'+'/2")),
+        f64::MAX
+    );
+
+    // One half-ulp above — `(1 bsl 1024) - (1 bsl 970)` (bits 970..=1023) — rounds up
+    // to `2^1024`, which is not finite, so it is `badarith` (the oracle's
+    // `big_to_double` failure). `(1 bsl 1024)` is the same failure.
+    let mut carry_limbs = vec![0u64; 16];
+    carry_limbs[15] = u64::MAX << 10;
+    let carry = fx.bignum(false, &carry_limbs);
+    assert!(matches!(
+        fx.call("+", &[carry, zero]),
+        Err(BeamError::BadArith)
+    ));
+
+    // `(1 bsl 1023)` is representable (`8.98846567431158e307`), and `(1 bsl 1023) - 1`
+    // rounds up to it.
+    let mut p1023 = vec![0u64; 16];
+    p1023[15] = 1u64 << 63;
+    let two_to_1023 = fx.bignum(false, &p1023);
+    assert_eq!(
+        float(fx.call("+", &[two_to_1023, zero]).expect("erlang:'+'/2")),
+        8.98846567431158e307
+    );
+    let mut below = vec![0u64; 16];
+    below[15] = u64::MAX >> 1;
+    let below_1023 = fx.bignum(false, &below);
+    assert_eq!(
+        float(fx.call("+", &[below_1023, zero]).expect("erlang:'+'/2")),
+        8.98846567431158e307
+    );
+}
+
 #[test]
 fn bad_operands_stay_badarg_family_errors() {
     let mut fx = Fixture::new();

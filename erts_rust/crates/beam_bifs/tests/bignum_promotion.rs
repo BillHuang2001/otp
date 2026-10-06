@@ -569,6 +569,41 @@ fn float_of_a_bignum_rounds_to_the_nearest_double() {
     assert_eq!(fx.erlang("float", &[float]).expect("float/1"), float);
 }
 
+/// `float/1` at the finite-double boundary: the exact nearest double just below,
+/// `badarg` just above — the `beam_term::number::big_to_f64` `None` contract.
+#[test]
+fn float_at_the_finite_double_boundary() {
+    let mut fx = Fixture::new();
+
+    // `(1 bsl 1024) - (1 bsl 971) = (2^53 - 1)·2^971` is the largest finite double.
+    // Oracle: `float((1 bsl 1024) - (1 bsl 971))` ⇒ 1.7976931348623157e308.
+    let mut max_limbs = vec![0u64; 16];
+    max_limbs[15] = ((1u64 << 53) - 1) << 11;
+    let max = fx.bignum(false, &max_limbs);
+    let term = fx.erlang("float", &[max]).expect("float/1");
+    assert_eq!(beam_codec::term::float_value(term).expect("a float"), f64::MAX);
+
+    // One half-ulp above — `(1 bsl 1024) - (1 bsl 970)` (bits 970..=1023) — rounds up
+    // to `2^1024`, not a finite double, so `float/1` is `badarg`, as the oracle.
+    let mut carry_limbs = vec![0u64; 16];
+    carry_limbs[15] = u64::MAX << 10;
+    let carry = fx.bignum(false, &carry_limbs);
+    assert!(matches!(fx.erlang("float", &[carry]), Err(BeamError::BadArg)));
+    // `1 bsl 1024` (bit length 1025) is the same failure.
+    let mut over = vec![0u64; 17];
+    over[16] = 1;
+    let over = fx.bignum(false, &over);
+    assert!(matches!(fx.erlang("float", &[over]), Err(BeamError::BadArg)));
+
+    // Ties to even: `float((1 bsl 53) + 1)` ⇒ 9.007199254740992e15 (`2^53`).
+    let tie = fx.bignum(false, &[(1u64 << 53) + 1]);
+    let term = fx.erlang("float", &[tie]).expect("float/1");
+    assert_eq!(
+        beam_codec::term::float_value(term).expect("a float"),
+        9007199254740992.0
+    );
+}
+
 #[test]
 fn round_trunc_ceil_floor_promote_past_i64() {
     let mut fx = Fixture::new();
