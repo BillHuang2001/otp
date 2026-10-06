@@ -380,6 +380,13 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. Used by
   [`compare::cmp_arith`].
 
+### `error.rs` — crate error types
+- `pub enum TermError` / `pub type TermResult<T>` — this crate's error types, reconciled into
+  `beam_common::BeamError` by an owned `From` impl.
+- `TermError::FunIdentityUnavailable` — `make_hash`/`make_hash2` return this for a `make_fun3`
+  `Local` fun, whose inlined descriptor carries no `module`/`old_uniq` (a documented capability gap).
+  Maps to `BeamError::BadArg` (never a wrong hash value).
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
