@@ -24,9 +24,10 @@ never modify it.
 `reader`/`writer` cursors, the distribution `atom_cache`, the `compress` zlib
 plumbing, the `encode`/`decode`
 loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
-float/bignum/flatmap/external identifiers) plus the local bitstring word-layout shim
+float/bignum/flatmap/external identifiers and over `beam_term::fun` for funs) plus the local
+bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
-(see "Tag coverage" below); the still-unsupported tags (funs, exports, records, `LOCAL`, the
+(see "Tag coverage" below); the still-unsupported tags (records, `LOCAL`, the
 distribution header) return `error::unsupported`, and the obsolete `FUN` (`117`) / `NEW_CACHE`
 (`78`) tags return `BadArg`, rather than a wrong term.
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
@@ -88,7 +89,7 @@ is `decode`'s.
 - `pub const MIN_LEVEL: u8 = 0`, `pub const MAX_LEVEL: u8 = 9`, `pub const MAX_UNCOMPRESSED: usize`.
 - `pub(crate) fn reject_bad_level(level: u8) -> Result<()>` — used by `encode` to fail fast.
 
-### `src/encode.rs` — the `Encoder` seam
+### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
   `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
@@ -102,7 +103,7 @@ is `decode`'s.
   `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`.
 - **Funs are encoded through the classification chain.** `encode` guards the fun family with
   `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
-  distinct subtag, so the classification is exact) and routes to the private
+  distinct subtag, so the classification is exact) and routes to the `src/encode/fun.rs` helpers
   `encode_fun`/`encode_fun_external`/`encode_fun_imported`: `FunKind::External` ⇒ `EXPORT_EXT` (`113`),
   `FunKind::Imported` ⇒ `NEW_FUN_EXT` (`112`) with the `size` field patched via
   `Writer::patch_u32be` (`4 + payload_len`), and `FunKind::Local` ⇒ `error::unsupported_local_fun()`
@@ -116,14 +117,15 @@ is `decode`'s.
   image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
   when compression is requested.)
 
-### `src/decode.rs` — the `Decoder` seam
+### `src/decode/` — the `Decoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
   `VERSION_MAGIC`), `new_body(&'a [u8]) -> Decoder<'a>` (no version byte), `with_atom_cache(&'a AtomCache)`,
   `decode(&mut self, &mut Heap, &mut AtomTable) -> Result<Eterm>`, `position()`, `remaining()`,
   `finish() -> Result<()>` (trailing bytes ⇒ `BadArg`).
 - Convenience: `pub fn decode_term(&[u8], &mut Heap, &mut AtomTable) -> Result<Eterm>`.
 - **Funs are decoded inside the walker.** The `decode` dispatch handles `Tag::Export` (`113`) and
-  `Tag::NewFun` (`112`) itself (private helpers `decode_export`, `decode_new_fun`, plus
+  `Tag::NewFun` (`112`) itself and calls the `src/decode/fun.rs` helpers (`decode_export`,
+  `decode_new_fun`, plus
   `decode_small_u32` and the wire-direct `decode_creator_pid`), so a fun nested in a tuple/list/map
   — e.g. a `.beam` `LitT` literal — decodes like any other sub-term. See §Fun encodings for the
   field rules (arity small `>= 0`; `old_index`/`old_uniq` smalls; `num_free <= MAX_ARG`; the ignored
@@ -137,7 +139,8 @@ is `decode`'s.
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
 
 ### `src/term/` — materialization layer (the ONLY `unsafe` subtree; see Design Decisions)
-`src/term/mod.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term materialization over
+`src/term/mod.rs` + `src/term/fun.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term
+materialization over
 `beam_alloc::Heap` that **forwards to** `beam_term::thing` (float/bignum/flatmap/external-identifier
 constructors + readers), `beam_term::fun` (the fun/export block) and
 `beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons
@@ -160,8 +163,8 @@ allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapp
   `bitstring_parts(Eterm) -> Result<(*const u8, usize /*offset_bits*/, usize /*size_bits*/)>`,
   `bitstring_bytes(Eterm) -> Result<(&[u8], usize, usize)>`, `bitstring_size_bits`,
   `heap_bits_size_words`, `bit_count_to_bytes`;
-- **funs** (all layout owned by `beam_term::fun`; this module allocates + forwards, see §Fun
-  encodings):
+- **funs** (`src/term/fun.rs`; all layout owned by `beam_term::fun`; the module allocates + forwards,
+  see §Fun encodings):
   - `make_fun_external(&mut Heap, arity, module: Atom, function: Atom) -> Result<Eterm>` — the
     `EXPORT_EXT` `FunKind::External` block (`fun_words(FunKind::External, 0)` = 3 words);
   - `make_fun_imported(&mut Heap, arity, module: Atom, uniq: &[u8;16], index: u32, old_index: u32,
@@ -218,7 +221,7 @@ result):** `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-nod
 Both fun tags are handled **inside the shared term walker** (`Decoder::decode`), so a fun nested in
 a tuple/list/map (exactly the shape of a `.beam` `LitT` literal) decodes like any other sub-term.
 The interior layout is owned by `beam_term::fun`; this crate only allocates the block (`beam_alloc`)
-and forwards to `write_fun_external`/`write_fun_imported` (`src/term/mod.rs`).
+and forwards to `write_fun_external`/`write_fun_imported` (`src/term/fun.rs`).
 - **`EXPORT_EXT` (`113`) ⇒ `FunKind::External`** — `[module atom][function atom][arity term]`
   (`external.c:5006-5040`). The two atoms are decoded in stream order via `decode_node_atom` (atom
   interning follows the wire order) and the arity is a **normal decoded term** that must be a small
@@ -257,8 +260,9 @@ and forwards to `write_fun_external`/`write_fun_imported` (`src/term/mod.rs`).
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
-by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `term/mod.rs`
-only forwards to it. The **one exception** is the bitstring block (`ErlHeapBits`/`ErlSubBits`), whose
+by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `src/term/`
+modules
+only forward to it. The **one exception** is the bitstring block (`ErlHeapBits`/`ErlSubBits`), whose
 layout lives in the local shim `src/term/binary.rs` — built only from public `beam_term` primitives —
 because this node cannot write `beam_term`; it is **owed** to `beam_term::thing` (see Known Issues).
 The codec's own layout-relevant policy is the **wire** form of a bignum magnitude —
@@ -301,7 +305,7 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 ## Design Decisions
 - **Two layers, one `unsafe` module.** The *wire layer* (`tag`, `reader`, `writer`, `atom_cache`,
   and every byte-level step of `encode`/`decode`) is safe Rust and is where the entire mandated tag
-  set is parsed and emitted. The *term layer* (`term.rs`) is a thin forwarding layer whose `unsafe`
+  set is parsed and emitted. The *term layer* (`src/term/`) is a thin forwarding layer whose `unsafe`
   is limited to the `beam_alloc` allocation calls, the `beam_term` accessors (which `beam_term` marks
   `unsafe fn` because the validity of an `Eterm` is a caller invariant and there is no safe way to
   read/write a heap word) and the minimal type/size guards it needs to turn a wrong kind of term into
@@ -312,7 +316,7 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - **The decoder targets `beam_alloc::Heap` + `beam_term::AtomTable` directly** (no trait, no
   intermediate value tree): the objective fixes this seam and downstream crates need real `Eterm`s.
 - **This crate does not own the term layout — `beam_term` (`src/thing.rs`) does; the bitstring block
-  is a documented local exception.** `term/mod.rs` forwards to the heap-agnostic `beam_term::thing`
+  is a documented local exception.** `src/term/mod.rs` forwards to the heap-agnostic `beam_term::thing`
   writers/readers and `beam_term::{tuple_size, tuple_element, car, cdr}`; it keeps only what it needs
   for allocation sizing (`beam_term::thing::*_size_words`) and the guard constants (`BIG_ARITY_MAX`,
   `EXTERNAL_THING_HEAD_SIZE`, `U32_PER_WORD`). The bitstring `ErlHeapBits`/`ErlSubBits` layout is the
@@ -436,9 +440,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - **Maps are always flatmaps, of any pair count** (the interior flatmap/hashmap switchover is an
   *open* layout, so there is no `MAP_SMALL_MAP_LIMIT` cutoff here). The cap exists in
   `beam_term::thing::write_flatmap` (a `debug_assert!` at `n <= 32`) and is *worked around*, not
-  hit: `term/mod.rs` picks `thing::write_flatmap` for `n <= 32` and its **own**
-  `write_large_flatmap` (`term/mod.rs:213`) above it — the crate's `MAP_SMALL_MAP_LIMIT` const is
-  in `term/mod.rs:66` (not `decode.rs`). `write_large_flatmap` emits byte-for-byte the same flatmap
+  hit: `src/term/mod.rs` picks `thing::write_flatmap` for `n <= 32` and its **own**
+  `write_large_flatmap` above it — the crate's `MAP_SMALL_MAP_LIMIT` const is
+  in `src/term/mod.rs`. `write_large_flatmap` emits byte-for-byte the same flatmap
   layout as `thing::write_flatmap` (pinned by `flatmap_layout_matches_beam_term`), so a public
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
@@ -484,19 +488,25 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `NEW_FUN_EXT` size-field patch)
 - `src/atom_cache.rs` → `AtomCache` (2048-slot distribution atom cache)
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
-- `src/encode.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
+- `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
   `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`; the private
-  `encode_fun`/`encode_fun_external`/`encode_fun_imported`
-- `src/decode.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
-  `decompress_wrapper`/`is_compressed_image`; the private fun helpers `decode_export`,
-  `decode_new_fun`, `decode_small_u32`, `decode_creator_pid`
+  fun-classification chain inside `Encoder::encode`
+- `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
+  as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
+- `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
+  `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`)
+- `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
+  `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
 - `src/error.rs` → error constructors (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`, plus the local-fun surface (`unsupported_local_fun`,
   `is_unsupported_local_fun`, `LOCAL_FUN_REASON`)
 - `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
-  `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::fun` /
-  `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier and
-  fun/export construction and inspection
+  `beam_alloc::Heap` and forwards to `beam_term::thing` /
+  `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier
+  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface
+- `src/term/fun.rs` → the fun/export forwarding layer (inside the `unsafe` subtree):
+  `make_fun_external`/`make_fun_imported`, the `fun_*_term` accessors, the `#[cfg(test)]`
+  local-fun builder, and the `beam_term::fun` re-exports
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
