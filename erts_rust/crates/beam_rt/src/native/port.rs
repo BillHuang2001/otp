@@ -18,10 +18,17 @@
 //! integers/binaries (`io_lib:format/2` output is the common case). It is written to the
 //! child's stdin, which is what makes `open_port({spawn,"cat"},[])` echo its input back —
 //! the read side is [`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext).
-//! The result is the atom `true` (the oracle's own value). A non-port argument, a port the
-//! runtime does not hold (closed, or never opened), and non-iodata are
-//! [`BeamError::BadArg`] — the oracle's reason; a port with no child stdin of ours (a
-//! `{fd, N}` port) is a typed *capability gap*, never a silent write elsewhere.
+//!
+//! `/3` `Options` are validated **and honored**: `nosuspend` changes nothing here (the write
+//! is always asynchronous and buffered), while `force` is rejected with the oracle's
+//! `error:notsup` because the spawn driver does not carry `ERL_DRV_FLAG_SOFT_BUSY`. Every
+//! other option — an unknown atom, a non-atom element, an improper tail or a non-list
+//! container — is `error:badarg`, and the port liveness check precedes the `force` check, so
+//! a dead port with `[force]` is `badarg` rather than `notsup`. The result is the atom
+//! `true` (the oracle's own value). A non-port argument, a port the runtime does not hold
+//! (closed, or never opened), and non-iodata are [`BeamError::BadArg`] — the oracle's
+//! reason; a port with no child stdin of ours (a `{fd, N}` port) is a typed *capability
+//! gap*, never a silent write elsewhere.
 //!
 //! # `port_info/1,2` on a closed port
 //!
@@ -66,30 +73,53 @@ impl RuntimeContext<'_> {
     /// `erlang:port_command(Port, Data[, Options])`: write `Data`'s bytes to the port's
     /// child and answer the atom `true`.
     ///
-    /// The `/3` `Options` are validated as a list (`[force, nosuspend]` and friends) and
-    /// otherwise **ignored**: none of them changes what an asynchronous, always-buffered
-    /// write here does, and rejecting one the real driver accepts would be worse than
-    /// accepting it as a no-op (the same rule `open_port/2`'s options follow — see
-    /// [`crate::port`]).
+    /// The steps follow the oracle's own order (`erts_internal_port_command_3`, with the
+    /// `badopt` → `badarg` mapping `erlang.erl`'s `port_command/3` wrapper applies):
+    ///
+    /// 1. decode the port (a non-port is [`BeamError::BadArg`]);
+    /// 2. validate **every** `/3` option ([`RuntimeContext::port_command_options`]);
+    /// 3. the port must still be live — the same check the `/2` path makes, and it
+    ///    deliberately precedes the `force` check, so a dead port with `[force]` is `badarg`
+    ///    rather than `notsup`;
+    /// 4. `force` — a request to bypass the driver's busy state — is `error:notsup`, because
+    ///    the spawn driver does not carry `ERL_DRV_FLAG_SOFT_BUSY`;
+    /// 5. otherwise collect `Data` as iodata and write it.
     ///
     /// # Errors
     ///
-    /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a
-    /// non-list `Options` or non-iodata `Data`; a capability gap for a port that owns no
-    /// child stdin; [`BeamError::Io`] when the write fails.
+    /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a malformed
+    /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force`; a
+    /// capability gap for a port that owns no child stdin; [`BeamError::Io`] when the write
+    /// fails.
     fn port_command(&mut self, args: &[Eterm], with_options: bool) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let data = *args.get(1).ok_or(BeamError::BadArg)?;
-        if with_options {
-            // A malformed option container is badarg; the options themselves are a no-op.
-            terms::list_elements(*args.get(2).ok_or(BeamError::BadArg)?)?;
-        }
-        let mut bytes = Vec::new();
-        self.iodata_bytes(data, &mut bytes)?;
+        let force = if with_options {
+            self.port_command_options(*args.get(2).ok_or(BeamError::BadArg)?)?
+        } else {
+            false
+        };
         // The registry is reached through a cheap clone of its `Rc` handle so writing to the
         // child never holds a borrow of the runtime while a term (the atom `true`) is built —
         // the same snapshot rule the port poller follows (`crate::port`).
         let ports = std::rc::Rc::clone(&self.runtime.ports);
+        {
+            let registry = ports
+                .try_borrow()
+                .map_err(|_| error::unsupported("the port table is already in use"))?;
+            if !registry.is_live(port) {
+                return Err(BeamError::BadArg);
+            }
+        }
+        if force {
+            // `force` asks the driver to push the command through a busy port regardless.
+            // The spawn driver does not advertise `ERL_DRV_FLAG_SOFT_BUSY`, so the oracle
+            // answers the atom `notsup` — an **error**-class raise, deliberately not a
+            // capability gap (see `crate::error`'s `unsupported` convention).
+            return Err(error::message("notsup"));
+        }
+        let mut bytes = Vec::new();
+        self.iodata_bytes(data, &mut bytes)?;
         {
             let mut registry = ports
                 .try_borrow_mut()
@@ -99,6 +129,31 @@ impl RuntimeContext<'_> {
         self.atom("true")
     }
 
+    /// Validates `erlang:port_command/3`'s `Options` and reports whether `force` was
+    /// requested.
+    ///
+    /// The oracle accepts exactly the atoms `force` and `nosuspend` as elements
+    /// (`erts_internal_port_command_3`'s `is_not_nil`/`is_list` loop) and maps everything
+    /// else to `badarg`: an unknown atom, a non-atom element, an **improper** tail
+    /// (`[force|bogus]`) and a non-list container all fail. `[]` and `nosuspend` change
+    /// nothing about the write here (it is always asynchronous and buffered), so only
+    /// `force` is reported back — the caller rejects it as `notsup`.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a malformed option container/tail or an unrecognized
+    /// option element.
+    fn port_command_options(&self, options: Eterm) -> Result<bool> {
+        let mut force = false;
+        for element in terms::list_elements(options).map_err(|_| BeamError::BadArg)? {
+            match self.atom_name(element).as_deref() {
+                Some("force") => force = true,
+                Some("nosuspend") => {}
+                _ => return Err(BeamError::BadArg),
+            }
+        }
+        Ok(force)
+    }
     /// `erlang:port_info/1,2` for a port the runtime does **not** hold: `Some(Ok(undefined))`
     /// — the oracle's answer for a closed port.
     ///
@@ -153,6 +208,7 @@ impl RuntimeContext<'_> {
 mod tests {
     use super::*;
     use crate::native::test_support::{atom, call, chars, runtime};
+    use crate::runtime::Runtime;
     use beam_bifs::NullSink;
     use beam_term::{make_small, NIL};
 
@@ -163,6 +219,49 @@ mod tests {
         terms::make_list(&mut *context, &[make_small(72), binary, inner]).expect("an iolist")
     }
 
+    /// A real, **live** `cat` port opened through the runtime's own `open_port/2` — the
+    /// same child the write test below drives (and the one `cat` echoes back).
+    fn live_port(runtime: &mut Runtime) -> PortId {
+        let name = {
+            let mut sink = NullSink;
+            let mut context = RuntimeContext::with_output(runtime, &mut sink);
+            let command = context.charlist("cat").expect("a command");
+            let spawn = context.atom("spawn").expect("the spawn atom");
+            terms::make_tuple(&mut context, &[spawn, command]).expect("a name tuple")
+        };
+        let port = call(runtime, "erlang", "open_port", &[name, NIL]).expect("open_port");
+        PortId::from_eterm(port).expect("a port term")
+    }
+
+    /// `elements` as a list on the runtime's heap (the `/3` option-container shape).
+    fn list_of(runtime: &mut Runtime, elements: &[Eterm]) -> Eterm {
+        terms::make_list(&mut RuntimeContext::new(runtime), elements).expect("a list")
+    }
+
+    /// The **error**-class raise reason atom of `error`, panicking when it is not one.
+    ///
+    /// The floor builds its message raises with [`crate::error::message`], whose reason is an
+    /// atom backed by an owned `String`; [`BeamError::as_atom`] must return a `&'static str`
+    /// and so reports `None` for it — the name has to be read through
+    /// [`ExitReason::as_atom`](beam_common::ExitReason::as_atom).
+    fn raise_atom(error: &BeamError) -> String {
+        match error {
+            BeamError::Raise(raise) => {
+                assert_eq!(
+                    raise.class,
+                    beam_common::ExceptionClass::Error,
+                    "the oracle raises `error`: {raise}"
+                );
+                raise
+                    .reason
+                    .as_atom()
+                    .unwrap_or_else(|| panic!("a non-atom reason: {raise}"))
+                    .to_string()
+            }
+            other => panic!("not a raise: {other}"),
+        }
+    }
+
     #[test]
     fn port_command_writes_the_char_list_bytes_and_answers_true() {
         let mut runtime = runtime();
@@ -170,15 +269,7 @@ mod tests {
         // the child does with the bytes — `cat` echoes them — is asserted through the
         // port's own stream handle in `crate::port`'s tests, and through the poller at the
         // CLI boundary in `tests/eval.rs`.)
-        let name = {
-            let mut sink = NullSink;
-            let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
-            let command = context.charlist("cat").expect("a command");
-            let spawn = context.atom("spawn").expect("the spawn atom");
-            terms::make_tuple(&mut context, &[spawn, command]).expect("a name tuple")
-        };
-        let port = call(&mut runtime, "erlang", "open_port", &[name, NIL]).expect("open_port");
-        let port = PortId::from_eterm(port).expect("a port term");
+        let port = live_port(&mut runtime);
         let data = chars(&mut runtime, "hello");
 
         let answer = call(&mut runtime, "erlang", "port_command", &[port.to_eterm(), data])
@@ -191,7 +282,6 @@ mod tests {
         let registry = ports.try_borrow().expect("the port table");
         assert!(registry.is_live(port), "port_command must not close the port");
     }
-
     #[test]
     fn port_command_rejects_a_non_port_a_dead_port_and_non_iodata() {
         let mut runtime = runtime();
@@ -229,20 +319,29 @@ mod tests {
     fn port_command_3_tolerates_a_list_of_options() {
         let mut runtime = runtime();
         let data = chars(&mut runtime, "x");
-        // `nosuspend` is a real `port_command/3` option; the write itself still happens
-        // (here: it fails on a dead port, so the option list was clearly *not* the reason).
+        // `nosuspend` is a real `port_command/3` option and is accepted; the write itself
+        // still happens (here: it fails the port-liveness check on a dead port, so the
+        // option list was clearly *not* the reason) — the liveness check precedes both the
+        // `force` check and the write, exactly as the oracle looks the port up first.
         let option = atom(&mut runtime, "nosuspend");
-        let options = terms::make_list(
-            &mut RuntimeContext::new(&mut runtime),
-            &[option],
-        )
-        .expect("an option list");
+        let options = list_of(&mut runtime, &[option]);
         assert!(matches!(
             call(
                 &mut runtime,
                 "erlang",
                 "port_command",
                 &[PortId::new(7).to_eterm(), data, options]
+            ),
+            Err(BeamError::BadArg)
+        ));
+        // An empty option list is fine too (the `/2` arity is `port_command(P, D, [])`).
+        let empty = list_of(&mut runtime, &[]);
+        assert!(matches!(
+            call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[PortId::new(7).to_eterm(), data, empty]
             ),
             Err(BeamError::BadArg)
         ));
@@ -257,6 +356,85 @@ mod tests {
             ),
             Err(BeamError::BadArg)
         ));
+    }
+
+    /// `[force]` on a **live** port: the spawn driver does not carry
+    /// `ERL_DRV_FLAG_SOFT_BUSY`, so the oracle raises `error:notsup` (never `badarg`, and
+    /// never a capability gap — `notsup` does not start with `unsupported`).
+    #[test]
+    fn port_command_3_force_on_a_live_port_is_notsup() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        let data = chars(&mut runtime, "x");
+        let force = atom(&mut runtime, "force");
+        let nosuspend = atom(&mut runtime, "nosuspend");
+        for options in [
+            list_of(&mut runtime, &[force]),
+            list_of(&mut runtime, &[force, nosuspend]),
+            list_of(&mut runtime, &[nosuspend, force]),
+        ] {
+            let error = call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[port.to_eterm(), data, options],
+            )
+            .expect_err("`force` is not supported by the spawn driver");
+            assert_eq!(raise_atom(&error), "notsup", "{error}");
+            // `notsup` is a genuine error, **not** a capability gap: the differential
+            // harness turns any `unsupported`-prefixed reason into the exit-3 signal, and
+            // the oracle exits non-zero with `error:notsup`.
+            assert_eq!(error::unsupported_reason(&error), None, "{error}");
+        }
+        // Rejecting `force` neither closes the port nor consumes it: a plain `/2` write
+        // still succeeds afterwards.
+        let answer = call(
+            &mut runtime,
+            "erlang",
+            "port_command",
+            &[port.to_eterm(), data],
+        )
+        .expect("port_command/2 after the notsup");
+        assert_eq!(runtime.atom_name_of(answer), Some("true"));
+    }
+
+    /// A live port with a malformed/unrecognized option list is `badarg` — the oracle's
+    /// `badopt`, which `erlang.erl`'s `port_command/3` wrapper maps onto `badarg`. This is
+    /// checked **before** `force` would be honored, so `[force|bogus]` is `badarg`, not
+    /// `notsup`.
+    #[test]
+    fn port_command_3_rejects_unknown_and_malformed_options_on_a_live_port() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        let data = chars(&mut runtime, "x");
+        let force = atom(&mut runtime, "force");
+        let bogus = atom(&mut runtime, "bogus");
+        let one = make_small(1);
+        let not_a_list = atom(&mut runtime, "not_options");
+        // `[force|bogus]`: a cons whose tail is an atom, i.e. an **improper** list.
+        let improper = terms::make_cons(&mut RuntimeContext::new(&mut runtime), force, bogus)
+            .expect("an improper list");
+        for (label, options) in [
+            ("an unknown atom", list_of(&mut runtime, &[bogus])),
+            (
+                "`force` mixed with an unknown atom",
+                list_of(&mut runtime, &[force, bogus]),
+            ),
+            ("a non-atom element", list_of(&mut runtime, &[one])),
+            ("an improper tail", improper),
+            ("a non-list container", not_a_list),
+        ] {
+            match call(
+                &mut runtime,
+                "erlang",
+                "port_command",
+                &[port.to_eterm(), data, options],
+            ) {
+                Err(BeamError::BadArg) => {}
+                Err(other) => panic!("{label} must be badarg, got {other}"),
+                Ok(_) => panic!("{label} must not be accepted"),
+            }
+        }
     }
 
     #[test]

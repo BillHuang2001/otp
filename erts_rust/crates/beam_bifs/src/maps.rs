@@ -29,9 +29,9 @@
 //!   for its side effects and returns `ok`.
 //! * A predicate result that is not a `true`/`false` atom is the oracle's
 //!   `error:{case_clause, Value}` (see the structured-reason section below).
-//! * The traversal order is the map's **stored** order (OTP documents map order as
-//!   unspecified; see the section below), so a `fold` that accumulates into a list
-//!   may order that list differently from the oracle.
+//! * The traversal order is the map's **stored** order — the oracle's canonical
+//!   flat-map key order (see the section below) — so a `fold` that accumulates into
+//!   a list sees the oracle's pair sequence for any map this crate built.
 //!
 //! The fun argument is **not** arity-checked here — that is the runtime's job when
 //! it invokes it — so `maps:map(5, #{})` returns `#{}` where the oracle raises
@@ -86,10 +86,31 @@
 //!
 //! # Order
 //!
-//! OTP documents map iteration order as unspecified, and the oracle's own order is
-//! neither insertion nor sorted order (`maps:keys(#{b=>2,a=>1,c=>3})` ⇒ `[c,a,b]`).
-//! Every BIF here therefore returns the map's **stored** order, which
-//! [`crate::access::make_flatmap`] preserves as given.
+//! OTP documents map iteration order as unspecified, but the oracle is *not*
+//! arbitrary: every flat map it holds — one from a literal, one from
+//! `maps:from_list/1`, one rebuilt by `maps:put/3` — stores its keys in
+//! `erts_cmp_flatmap_keys` order (`erts/emulator/beam/erl_utils.h:267-272`;
+//! `erts_validate_and_sort_flatmap`): **atom keys by atom index, every other pair by
+//! the exact term order**. That is the order `maps:keys/1`/`maps:to_list/1` report and
+//! the order the `term_to_binary/1` image carries, so it is observable.
+//!
+//! [`build_map`] — the writer behind every producer here (`from_list`, `put`,
+//! `update`, `remove`, `take`, `from_keys`, `merge`, `with`, `without`, `map`,
+//! `filter`) — therefore sorts the pairs with [`compare::cmp_flatmap_keys`] before
+//! handing them to [`crate::access::make_flatmap`], and every reader returns the
+//! map's **stored** order unchanged. Oracle-pinned:
+//! `maps:from_list([{3,a},{1,b},{2,c}])` ⇒ `#{1 => b, 2 => c, 3 => a}` (keys
+//! `[1,2,3]`), and atom-keyed order follows the *index* rather than insertion or name
+//! (`X = list_to_atom("zzzq"), Y = list_to_atom("aaaq")` ⇒
+//! `maps:keys(maps:from_list([{X,1},{Y,2}]))` = `[zzzq,aaaq]`, while adding `a` gives
+//! `[a,zzzq,aaaq]`). The runtime's own atom indices are a documented Milestone-1 gap
+//! (`beam_rt`'s `CORE_ATOMS` is not the legacy `atom.names` order), so an
+//! *atom-keyed* order can still differ from the oracle's while the ordering *rule*
+//! above is identical.
+//!
+//! The `fun`-taking `map/2`/`fold/3`/`filter/2`/`foreach/2` traverse (and, where they
+//! rebuild, store) that same order, so a `fold` that accumulates into a list sees the
+//! oracle's pair sequence.
 
 use beam_common::Result;
 use beam_term::{atom_val, compare, AtomTable, Eterm};
@@ -140,7 +161,21 @@ fn find_key(atoms: &AtomTable, keys: &[Eterm], key: Eterm) -> Option<usize> {
     keys.iter().position(|&k| compare::eq(k, key, atoms))
 }
 
-/// Builds a flat map from parallel key/value vectors, preserving their order.
+/// Builds a flat map from parallel key/value vectors, storing the keys in the
+/// oracle's canonical **flat-map key order**.
+///
+/// ERTS keeps a flat map's key tuple sorted by `erts_cmp_flatmap_keys`
+/// (`erts/emulator/beam/erl_utils.h:267-272`, `erts_validate_and_sort_flatmap`):
+/// **two atom keys order by atom index, any other pair by the exact term order** —
+/// reproduced by [`compare::cmp_flatmap_keys`]. That stored order is observable
+/// through `maps:keys/1`, `maps:to_list/1`, `maps:iterator/1` and the
+/// `term_to_binary/1` image (the encoder emits the pairs in stored order), so an
+/// insertion-order writer diverges from the oracle. Oracle-pinned:
+/// `maps:from_list([{3,a},{1,b},{2,c}])` ⇒ `#{1 => b, 2 => c, 3 => a}` (keys
+/// `[1,2,3]`, image `<<131,116,0,0,0,3,97,1,119,1,98,97,2,119,1,99,97,3,119,1,97>>`).
+///
+/// Every caller passes already-deduplicated keys (each insert collapses a duplicate
+/// last-wins), so this sort is the only normalization the writer needs.
 ///
 /// # Errors
 ///
@@ -151,7 +186,9 @@ fn build_map(ctx: &mut BifContext<'_>, keys: &[Eterm], values: &[Eterm]) -> Resu
     if keys.len() > MAP_SMALL_MAP_LIMIT {
         return Err(system_limit());
     }
-    let pairs: Vec<(Eterm, Eterm)> = keys.iter().copied().zip(values.iter().copied()).collect();
+    let mut pairs: Vec<(Eterm, Eterm)> =
+        keys.iter().copied().zip(values.iter().copied()).collect();
+    pairs.sort_by(|a, b| compare::cmp_flatmap_keys(a.0, b.0, ctx.atoms()));
     access::make_flatmap(ctx.heap(), &pairs)
 }
 
@@ -775,6 +812,97 @@ mod tests {
             assert_eq!(size_1(ctx, &[m]).unwrap(), make_small(1));
             assert_eq!(keys_of(m), vec![one]);
             assert_eq!(values_of(m), vec![b]);
+        });
+    }
+
+    #[test]
+    fn from_list_stores_keys_in_the_canonical_flatmap_key_order() {
+        with_ctx(|ctx| {
+            // Oracle pin:
+            //   erl -noshell -eval 'io:format("~w~n",[maps:keys(maps:from_list([{3,a},{1,b},{2,c}]))]), halt().'
+            //     => [1,2,3]
+            //   erl -noshell -eval 'io:format("~w~n",[term_to_binary(maps:from_list([{3,a},{1,b},{2,c}]))]), halt().'
+            //     => <<131,116,0,0,0,3,97,1,119,1,98,97,2,119,1,99,97,3,119,1,97>>
+            // i.e. `#{1 => b, 2 => c, 3 => a}`: the keys are stored sorted, so the
+            // *values* follow the keys, not the input list.
+            let one = ctx.int(1).unwrap();
+            let two = ctx.int(2).unwrap();
+            let three = ctx.int(3).unwrap();
+            let a = ctx.atom("a").unwrap();
+            let b = ctx.atom("b").unwrap();
+            let c = ctx.atom("c").unwrap();
+            let p3 = ctx.tuple(&[three, a]).unwrap();
+            let p1 = ctx.tuple(&[one, b]).unwrap();
+            let p2 = ctx.tuple(&[two, c]).unwrap();
+            let list = ctx.list(&[p3, p1, p2]).unwrap();
+
+            let m = from_list_1(ctx, &[list]).expect("maps:from_list/1");
+            // The insertion order would be [3, 1, 2]; the oracle stores [1, 2, 3].
+            assert_eq!(keys_of(m), vec![one, two, three]);
+            assert_eq!(values_of(m), vec![b, c, a]);
+
+            // `to_list/1` reports the same stored order.
+            let back = to_list_1(ctx, &[m]).expect("maps:to_list/1");
+            let elems = proper_list(back).expect("a proper list");
+            assert_eq!(access::tuple_element(elems[0], 0), one);
+            assert_eq!(access::tuple_element(elems[0], 1), b);
+            assert_eq!(access::tuple_element(elems[2], 0), three);
+            assert_eq!(access::tuple_element(elems[2], 1), a);
+        });
+    }
+
+    #[test]
+    fn atom_keys_order_by_the_flatmap_key_rule_not_by_insertion() {
+        with_ctx(|ctx| {
+            // Oracle: atom keys are stored by *atom index* (`erts_cmp_flatmap_keys`),
+            // never by insertion order or by name:
+            //   erl -noshell -eval 'X=list_to_atom("zzzq"), Y=list_to_atom("aaaq"),
+            //     io:format("~w~n",[maps:keys(maps:from_list([{X,1},{Y,2}]))]), halt().'
+            //     => [zzzq,aaaq]   (X was interned first)
+            //   erl -noshell -eval 'io:format("~w~n",[maps:keys(maps:from_list([{a,1},{b,2},{c,3}]))]), halt().'
+            //     => [c,b,a]       (in ERTS, index(c) < index(b) < index(a))
+            // This test table seeds `a`, `b`, `c` in that order, so here the index
+            // order *is* [a, b, c] and an insertion-order writer would give [c, b, a].
+            let a = ctx.atom("a").unwrap();
+            let b = ctx.atom("b").unwrap();
+            let c = ctx.atom("c").unwrap();
+            let pairs: Vec<Eterm> = [c, b, a]
+                .iter()
+                .map(|&k| ctx.tuple(&[k, make_small(1)]).unwrap())
+                .collect();
+            let list = ctx.list(&pairs).unwrap();
+
+            let m = from_list_1(ctx, &[list]).expect("maps:from_list/1");
+            assert_eq!(keys_of(m), vec![a, b, c]);
+            // Exactly the order the shared flat-map key comparator defines.
+            let mut expected = vec![a, b, c];
+            expected.sort_by(|x, y| compare::cmp_flatmap_keys(*x, *y, ctx.atoms()));
+            assert_eq!(keys_of(m), expected);
+        });
+    }
+
+    #[test]
+    fn every_producer_stores_keys_in_the_canonical_order() {
+        with_ctx(|ctx| {
+            let zero = ctx.int(0).unwrap();
+            let one = ctx.int(1).unwrap();
+            let two = ctx.int(2).unwrap();
+            let a = ctx.atom("a").unwrap();
+
+            let m = map(ctx, &[(one, a), (two, a)]);
+            // Inserting a key that sorts *first* stores it first (the oracle's
+            // `erts_maps_put` inserts into the sorted key tuple).
+            let inserted = put_3(ctx, &[zero, a, m]).unwrap();
+            assert_eq!(keys_of(inserted), vec![zero, one, two]);
+
+            // `merge/2` re-stores the union in the same order.
+            let first = map(ctx, &[(zero, a)]);
+            let merged = merge_2(ctx, &[m, first]).unwrap();
+            assert_eq!(keys_of(merged), vec![zero, one, two]);
+
+            // `remove/2` of an absent key still yields the canonical order.
+            let absent = remove_2(ctx, &[zero, m]).unwrap();
+            assert_eq!(keys_of(absent), vec![one, two]);
         });
     }
 

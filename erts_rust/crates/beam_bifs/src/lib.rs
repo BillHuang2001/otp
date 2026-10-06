@@ -44,6 +44,7 @@ mod bool;
 mod compare;
 mod context;
 mod convert;
+mod dict;
 mod error;
 mod ets;
 mod io;
@@ -65,8 +66,8 @@ mod type_test;
 mod unicode;
 
 pub use crate::context::{
-    AtomInterner, BifContext, BytesSink, FunCaller, NullSink, OutputSink, PortHook, SendHook,
-    StdoutSink,
+    AtomInterner, BifContext, BytesSink, DictHook, FunCaller, NullSink, OutputSink, PortHook,
+    SendHook, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -82,6 +83,6 @@ pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
-        FunCaller, NullSink, OutputSink, PortHook, SendHook, StdoutSink, TableRegistry,
+        DictHook, FunCaller, NullSink, OutputSink, PortHook, SendHook, StdoutSink, TableRegistry,
     };
 }

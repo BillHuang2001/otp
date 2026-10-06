@@ -72,16 +72,18 @@ fn run_module_takes_a_caller_owned_module_and_atom_arguments() {
 }
 
 #[test]
-fn a_missing_export_is_a_typed_error() {
+fn a_missing_export_raises_undef() {
+    // The oracle raises `exception error undef` for a call to a function the release does
+    // not have; the module/function/arity live in the stacktrace, not the reason.
     let mut rt = runtime();
     let error = rt
         .run_function(SLICE_BEAM, "nope", 0, &[])
         .expect_err("not exported");
-    assert!(error.to_string().contains("nope"), "{error}");
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
     let error = rt
         .run_function(SLICE_BEAM, "add", 3, &[make_small(1)])
         .expect_err("wrong arity");
-    assert!(error.to_string().contains("add/3"), "{error}");
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
 }
 
 #[test]

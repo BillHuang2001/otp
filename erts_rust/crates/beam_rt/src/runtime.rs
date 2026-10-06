@@ -1063,16 +1063,19 @@ mod tests {
     }
 
     #[test]
-    fn unknown_function_and_arity_are_diagnostics() {
+    fn a_missing_export_raises_undef() {
+        // `run_function`/`run_module` delegate the export lookup to
+        // `RuntimeContext::run_export`, which now raises the oracle's bare `error:undef`
+        // for a function the module does not have (see `crate::context::run_export`).
         let mut rt = runtime();
         let error = rt
             .run_function(SLICE_BEAM, "nope", 0, &[])
             .expect_err("not exported");
-        assert!(error.to_string().contains("slice:nope/0"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
         let error = rt
             .run_function(SLICE_BEAM, "add", 1, &[make_small(1)])
             .expect_err("wrong arity");
-        assert!(error.to_string().contains("slice:add/1"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
     }
 
     #[test]

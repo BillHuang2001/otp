@@ -470,46 +470,64 @@ fn a_bare_receive_with_no_sender_is_unsupported_not_a_hang() {
 /// `RuntimeContext::call_registered` installs are all on this path. The `src/port.rs`
 /// unit tests cover the provider in isolation; this covers it end to end.
 ///
-/// The three `port_info/2` goldens that differ from erts are this crate's **documented**
-/// contract (`crate::port`): `connected` is a boolean where erts reports the controlling
-/// pid, and `links`/`monitors` are genuinely empty because nothing links or monitors a
-/// port yet.
+/// The item values that depend on the *dynamic* owner pid or port number are probed by
+/// **shape** (`is_*`/`element/2`) rather than by a literal golden: `links` is a list, `id`
+/// an integer, `connected` a pid — the oracle's own answer shapes. `stream` is not an item
+/// at all, so `erlang:port_info(P, stream)` raises `error:badarg` (the oracle's answer).
 #[test]
 fn open_port_spawns_a_real_os_process() {
-    let cases: &[(&str, &str)] = &[
+    let cases: &[(&str, &str, i32)] = &[
         // The corpus's own A.4 probe — the gate case.
-        ("is_port(open_port({spawn,\"true\"},[]))", "ok true"),
-        // A real OS process: the port answers with a real integer `os_pid`.
+        ("is_port(open_port({spawn,\"true\"},[]))", "ok true", 0),
+        // A real OS process: the port answers with a real integer `os_pid` (the `/2` arity
+        // returns the `{Item, Value}` pair, so the value is `element/2`).
         (
-            "is_integer(erlang:port_info(open_port({spawn,\"true\"},[]), os_pid))",
+            "is_integer(element(2, erlang:port_info(open_port({spawn,\"true\"},[]), os_pid)))",
             "ok true",
+            0,
         ),
         // The `port_info/1` item list is well formed …
         (
             "is_list(erlang:port_info(open_port({spawn,\"true\"},[])))",
             "ok true",
+            0,
         ),
-        // … nothing links or monitors such a port …
-        ("erlang:port_info(open_port({spawn,\"true\"},[]), links)", "ok []"),
-        // … `list` is the default stream type and the port is connected …
-        ("erlang:port_info(open_port({spawn,\"true\"},[]), stream)", "ok list"),
+        // … `links` is a list (the owner as a one-element list), `id` a bare integer and
+        // `connected` the owner pid …
         (
-            "erlang:port_info(open_port({spawn,\"true\"},[]), connected)",
+            "is_list(element(2, erlang:port_info(open_port({spawn,\"true\"},[]), links)))",
             "ok true",
+            0,
+        ),
+        (
+            "is_integer(element(2, erlang:port_info(open_port({spawn,\"true\"},[]), id)))",
+            "ok true",
+            0,
+        ),
+        (
+            "is_pid(element(2, erlang:port_info(open_port({spawn,\"true\"},[]), connected)))",
+            "ok true",
+            0,
+        ),
+        // … while `stream` is **not** an item (the oracle raises `badarg`) …
+        (
+            "erlang:port_info(open_port({spawn,\"true\"},[]), stream)",
+            "exception error badarg",
+            1,
         ),
         // … and `port_close/1` kills and reaps the child, answering `true` (the oracle's
         // value: `erts_internal:port_close/1` returns the atom `true`, not `ok`).
-        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok true"),
+        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok true", 0),
     ];
 
-    for (expr, expected) in cases {
+    for (expr, expected, expected_exit) in cases {
         let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
         assert_eq!(
             stdout,
             format!("{expected}\n"),
             "{expr}: stdout (stderr {stderr:?})"
         );
-        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
         assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
     }
 }

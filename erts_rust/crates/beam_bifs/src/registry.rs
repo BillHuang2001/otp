@@ -58,6 +58,7 @@ impl BifRegistry {
         crate::time::register(&mut reg);
         crate::phash::register(&mut reg);
         crate::proc::register(&mut reg);
+        crate::dict::register(&mut reg);
         crate::reason::register(&mut reg);
         crate::string::register(&mut reg);
         crate::io::register(&mut reg);

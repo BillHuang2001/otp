@@ -199,10 +199,11 @@ fn the_s_action_applies_with_atom_arguments_and_discards_the_result() {
 
 #[test]
 fn the_code_path_is_searched_for_the_module() {
-    // Without `-pa`, the module cannot be found: a runtime error, not a panic.
+    // Without `-pa`, the module cannot be found: the oracle's `error:undef`, a runtime
+    // error (exit 1), not a panic and not a usage error.
     let output = beam_rt(&["-s", "slice", "pick", "a"]);
     assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
     let message = stderr(&output);
-    assert!(message.contains("slice.beam"), "{message}");
+    assert!(message.contains("undef"), "{message}");
     assert!(!message.contains("Usage:"), "{message}");
 }

@@ -127,9 +127,22 @@ fn get_field_names(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `records:is_exported/1` (`records_is_exported_1`, `erl_record.c:1328-1340`):
 /// the definition's stored `true`/`false` atom; a non-record is the structured
 /// `error:{badrecord, Term}`.
+///
+/// # The stored flag is a *frozen* atom index, not a runtime-table name
+///
+/// `beam_term::write_record` stores the flag word as the frozen
+/// [`AM_FALSE`](beam_term::AM_FALSE)/[`AM_TRUE`](beam_term::AM_TRUE) atom
+/// **index** (`0`/`1`, the legacy `atom.names` positions), so the word must be
+/// decoded back to a `bool` and re-materialized through *this* context's atom
+/// table. Returning the raw word instead hands the caller whatever name happens
+/// to sit at index `0`/`1` here: the runtime seeds the platform atoms first
+/// (`unix`, `linux` — `beam_rt::boot::CORE_ATOMS`), so an exported record reads
+/// back as `linux` and a non-exported one as `unix` instead of `true`/`false`.
+/// This is the same decode `records:update/4` already performs.
 fn is_exported(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let def = definition_or_badrecord(ctx, args[0])?;
-    access::native_record_definition_is_exported(def)
+    let flag = access::native_record_definition_is_exported(def)?;
+    ctx.boolean(atom_val(flag) == beam_term::AM_TRUE)
 }
 
 /// The `(key, value)` pairs of the `records:create/4` `Fields` argument.
@@ -327,10 +340,41 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `records:get_definition/2` (`records_get_definition_2`,
 /// `erl_record.c:1342-1365`).
 ///
-/// The oracle looks the record up in the code server's compile-time record table
-/// (`erts_record_find_entry`), which this crate has no access to — a typed
-/// [`error::unsupported_bif`], never a wrong result. The atom pre-checks are kept:
-/// a non-atom `Module`/`Name` is the oracle's `badarg`.
+/// The oracle resolves the pair through the code server's record-definition table
+/// (`erts_record_find_entry`, `erl_record.c:163-170`; the BIF itself is
+/// `erl_record.c:1342-1403`): an entry with a live definition yields the
+/// `[…{Key, Value}… | #{is_exported => Bool}]` list, and *everything else* —
+/// a non-atom argument, no entry at all, or an entry whose definition slot for the
+/// active code index is `THE_NON_VALUE` — is `error:badarg`.
+///
+/// # Why this stays a typed gap
+///
+/// That table is **not** compile-time-only: a `.beam` carries its native-record
+/// definitions in the `Recs` chunk, and the *loader* registers them
+/// (`erts_record_put(stp->module, rec.records[i].name)` from
+/// `../../erts/emulator/beam/jit/asm_load.c:1246-1260` and
+/// `../../erts/emulator/beam/emu/emu_load.c:735`, out of `stp->beam.record`; the
+/// chunk is parsed by `beam_file.c:1077-1350`, `RECORD_CHUNK = 15`). The compiler
+/// puts *every* native record of a module there, exported or not
+/// (`lib/compiler/src/beam_asm.erl:577-592`, `beam_core_to_ssa.erl:222-232`).
+/// Verified against the oracle: compiling `-record #rec{a, b}.` and loading that
+/// module makes `records:get_definition(mod, rec)` return
+/// `{#{is_exported => false},[a,b]}` — `badarg` only for a record no *loaded*
+/// module defines.
+///
+/// This runtime loads `.beam` files (contract A.9) but neither parses the `Recs`
+/// chunk nor keeps a per-module definition table (`Recs` is captured as opaque
+/// bytes in `beam_loader::chunk::misc`), so it cannot tell an *unknown* record
+/// from a *known* one. Raising `badarg` unconditionally would therefore be
+/// **wrong** for a record a loaded module defines — the honest answer is the typed
+/// [`error::unsupported_bif`], never a wrong result and never a fabricated
+/// definition. The oracle's atom pre-checks are kept verbatim: a non-atom
+/// `Module`/`Name` is `badarg`.
+///
+/// Closing the gap needs two things outside this crate: `beam_loader` must
+/// materialize the `Recs` chunk's definitions, and the runtime must expose a
+/// per-module definition registry (the counterpart of `erts_record_put` /
+/// `erts_record_module_delete`, `beam_bif_load.c:2451`) for this BIF to consult.
 fn get_definition(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !access::is_atom(args[0]) || !access::is_atom(args[1]) {
         return Err(error::badarg());
@@ -387,6 +431,44 @@ mod tests {
     fn with_ctx<R>(f: impl FnOnce(&mut BifContext<'_>, &AtomTable) -> R) -> R {
         let mut heap = Heap::new(4096).expect("test heap");
         let atoms = atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        f(&mut ctx, &atoms)
+    }
+
+    /// An atom table seeded the way the **runtime** seeds its global table
+    /// (`beam_rt::boot::CORE_ATOMS`): the `system_info/1` platform atoms come
+    /// first, so the boolean atoms are *not* at indices 0/1 (`false` is 5, `true`
+    /// is 4). A native-record definition always stores its `is_exported` flag as
+    /// the *frozen* `AM_FALSE`/`AM_TRUE` index (0/1), so an `is_exported/1` that
+    /// returned that raw word would hand the caller `unix`/`linux` here — the exact
+    /// runtime divergence this table exists to pin.
+    fn runtime_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed([
+            "unix",
+            "linux",
+            "win32",
+            "nt",
+            "true",
+            "false",
+            "is_exported",
+            "_",
+            "a",
+            "b",
+            "m",
+            "r",
+            "other",
+            "badrecord",
+            "badmap",
+            "badfield",
+        ]);
+        atoms
+    }
+
+    /// As [`with_ctx`], but over the [`runtime_atoms`] table.
+    fn with_runtime_ctx<R>(f: impl FnOnce(&mut BifContext<'_>, &AtomTable) -> R) -> R {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let atoms = runtime_atoms();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         f(&mut ctx, &atoms)
     }
@@ -510,6 +592,42 @@ mod tests {
             let rec2 = create(ctx, &[module, name, NIL, true_opts]).unwrap();
             assert_eq!(name_of(atoms, is_exported(ctx, &[rec2]).unwrap()), "true");
             assert!(list_elements(get_field_names(ctx, &[rec2]).unwrap()).is_empty());
+        });
+    }
+
+    #[test]
+    fn is_exported_materializes_true_and_false_even_when_they_are_not_at_indices_0_1() {
+        // A record definition's flag word holds the *frozen* `AM_FALSE`/`AM_TRUE`
+        // index (`0`/`1`), but the runtime's atom table puts `unix`/`linux` there
+        // (`beam_rt::boot::CORE_ATOMS`), so `is_exported/1` must resolve the
+        // boolean back through this context's table rather than return the raw
+        // word. This table is seeded runtime-style precisely so it *would* catch a
+        // regression to that raw word (which read back as `unix`/`linux`).
+        with_runtime_ctx(|ctx, atoms| {
+            // `records:create(m, r, …, #{is_exported => false})`.
+            let not_exported = sample(ctx);
+            let term = is_exported(ctx, &[not_exported]).unwrap();
+            assert_eq!(name_of(atoms, term), "false");
+            assert_eq!(term, ctx.boolean(false).unwrap());
+
+            // The `is_exported => true` flag of a field-less record.
+            let module = atom_of(ctx, "m");
+            let name = atom_of(ctx, "r");
+            let true_opts = opts(ctx, true);
+            let exported = create(ctx, &[module, name, NIL, true_opts]).unwrap();
+            let term = is_exported(ctx, &[exported]).unwrap();
+            assert_eq!(name_of(atoms, term), "true");
+            assert_eq!(term, ctx.boolean(true).unwrap());
+
+            // The flag survives a `records:update/4` that rebuilds the instance
+            // (the definition, and so the exported flag, is preserved).
+            let update_map = updates(ctx, "a", 9);
+            let updated =
+                update(ctx, &[not_exported, module, name, update_map]).expect("records:update/4");
+            assert_eq!(
+                name_of(atoms, is_exported(ctx, &[updated]).unwrap()),
+                "false"
+            );
         });
     }
 
@@ -795,16 +913,49 @@ mod tests {
         });
     }
     #[test]
-    fn get_definition_is_a_typed_unsupported() {
+    fn get_definition_rejects_non_atom_arguments() {
         with_ctx(|ctx, _| {
+            let m = atom_of(ctx, "m");
             let r = atom_of(ctx, "r");
-            // Non-atom arguments are the oracle's `badarg`.
+            // Oracle: records:get_definition(1, 2) / (m, 2) / (1, r) => error:badarg.
+            //   erl -noshell -eval 'try records:get_definition(m, 2) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:badarg
+            assert!(matches!(
+                get_definition(ctx, &[make_small(1), make_small(2)]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                get_definition(ctx, &[m, make_small(2)]),
+                Err(BeamError::BadArg)
+            ));
             assert!(matches!(
                 get_definition(ctx, &[make_small(1), r]),
                 Err(BeamError::BadArg)
             ));
-            // The (unimplementable) code-table lookup is a typed gap.
+        });
+    }
+
+    /// `records:get_definition/2` (`records/get_definition_unknown_record` in the
+    /// differential corpus) can only be answered honestly as a typed gap, not as a
+    /// `badarg`.
+    ///
+    /// The oracle's table is populated by the **loader** out of a `.beam`'s `Recs`
+    /// chunk (`erts_record_put`, `erl_record.c:173-178`; called from
+    /// `jit/asm_load.c:1246-1260` and `emu/emu_load.c:735`), so a *loaded* module's
+    /// record is resolvable — verified against the oracle: after loading a module
+    /// compiled from `-record #rec{a, b}.`, `records:get_definition(Mod, rec)`
+    /// returns `{#{is_exported => false},[a,b]}`. This runtime keeps no such table
+    /// (`Recs` is opaque bytes in `beam_loader::chunk::misc`), so it cannot tell an
+    /// *unknown* record from a *known* one: an unconditional `badarg` would be a
+    /// **wrong** result for a loaded module's record. The probe catches this typed
+    /// signal ⇒ `unsupported`, never a mismatch.
+    #[test]
+    fn get_definition_is_a_typed_unsupported() {
+        with_ctx(|ctx, _| {
             let m = atom_of(ctx, "m");
+            let r = atom_of(ctx, "r");
+            // Both atoms, but no loaded module defines `m:r`; the oracle's own answer
+            // for that case is `badarg`, which this runtime must not guess at.
             match get_definition(ctx, &[m, r]) {
                 Err(BeamError::Raise(raise)) => {
                     assert_eq!(raise.class, beam_common::ExceptionClass::Error);
@@ -814,7 +965,6 @@ mod tests {
             }
         });
     }
-
     #[test]
     fn register_installs_every_records_bif() {
         let mut reg = BifRegistry::new();

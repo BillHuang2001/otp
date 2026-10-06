@@ -30,8 +30,9 @@
 //!
 //! # Failure is loud
 //!
-//! A module that cannot be found is a typed error naming every directory that was
-//! searched — never a silent miss. The system code path is resolved either from the
+//! A module that cannot be found raises the bare `error:undef` the oracle raises for a call
+//! to a module the release does not have (see [`CodeServer::not_found`]) — never a silent
+//! miss and never a fabricated module. The system code path is resolved either from the
 //! `ERTS_STDLIB_DIR` environment override or by asking the system `erl`; if neither
 //! works, [`CodeServer::add_system_paths`] reports an honest error rather than
 //! quietly running without a standard library.
@@ -230,15 +231,16 @@ impl CodeServer {
     ///
     /// # Errors
     ///
-    /// A message-carrying error naming every directory searched when `<name>.beam` is
-    /// not found, plus the loader's own error for a malformed `.beam`.
+    /// The bare `error:undef` raise when `<name>.beam` is on no code-path directory (the
+    /// oracle's reason for a call to a module the release does not have — see
+    /// [`CodeServer::not_found`]), plus the loader's own error for a malformed `.beam`.
     pub fn load(&mut self, name: &str) -> Result<Arc<Module>> {
         if let Some(module) = self.modules.get(name) {
             return Ok(module.clone());
         }
         let path = self
             .find_file(name)
-            .ok_or_else(|| self.not_found(name))?;
+            .ok_or_else(|| self.not_found())?;
         self.load_path(&path)
     }
 
@@ -311,18 +313,13 @@ impl CodeServer {
     }
 
     /// The error returned when `<name>.beam` is on no code-path directory.
-    fn not_found(&self, name: &str) -> beam_common::BeamError {
-        if self.paths.is_empty() {
-            error::message(format!(
-                "cannot find {name}.beam: the code path is empty (no -pa/-pz directory and no system stdlib)"
-            ))
-        } else {
-            let searched: Vec<String> = self.paths.iter().map(|p| p.display().to_string()).collect();
-            error::message(format!(
-                "cannot find {name}.beam in the code path [{}]",
-                searched.join(", ")
-            ))
-        }
+    ///
+    /// A module that cannot be found is what the oracle reports as `error:undef` (class
+    /// `error`, bare reason atom `undef`) for a call to a module the release does not have,
+    /// so this returns exactly that raise (see [`crate::error::undef`]) — never a
+    /// fabricated module and never a capability gap.
+    fn not_found(&self) -> beam_common::BeamError {
+        error::undef()
     }
 }
 
@@ -519,7 +516,8 @@ mod tests {
         let error = server
             .load("lists")
             .expect_err("an empty code path cannot resolve a module");
-        assert!(error.to_string().contains("lists.beam"), "{error}");
+        // A module on no code-path directory raises the oracle's bare `error:undef`.
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
         assert!(CodeServer::default().paths().is_empty());
     }
 
@@ -536,15 +534,14 @@ mod tests {
     }
 
     #[test]
-    fn a_missing_module_names_every_searched_directory() {
+    fn a_missing_module_raises_undef() {
         let mut server = CodeServer::new();
         server.add_path("/one");
         server.add_path("/two");
         let error = server.load("nosuchmodule").expect_err("not on the code path");
-        let message = error.to_string();
-        assert!(message.contains("nosuchmodule.beam"), "{message}");
-        assert!(message.contains("/one"), "{message}");
-        assert!(message.contains("/two"), "{message}");
+        // The oracle raises `error:undef` for a call to a missing module; the searched
+        // directories are no longer part of the reason (see `CodeServer::not_found`).
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
     }
 
     #[test]

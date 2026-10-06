@@ -233,7 +233,7 @@ fn the_module_prints_through_the_registered_io_format() {
 }
 
 #[test]
-fn a_missing_export_in_the_fixture_is_a_typed_error() {
+fn a_missing_export_in_the_fixture_raises_undef() {
     if !system_stdlib_available() {
         return;
     }
@@ -244,7 +244,8 @@ fn a_missing_export_in_the_fixture_is_a_typed_error() {
     let error = runtime
         .run_function(&fixture.beam, "nope", 0, &[])
         .expect_err("not exported");
-    assert!(error.to_string().contains("multimod:nope/0"), "{error}");
+    // The oracle raises `exception error undef` for a missing function, not a message.
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
 
     fixture.cleanup();
 }

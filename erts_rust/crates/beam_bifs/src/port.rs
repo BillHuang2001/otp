@@ -40,7 +40,7 @@
 use beam_common::Result;
 use beam_process::PortId;
 use beam_term::compare;
-use beam_term::{signed_value, Eterm};
+use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
@@ -73,32 +73,62 @@ fn port_close(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(true)
 }
 
-/// The `erlang:port_info/1` BIF: the hook's `{Item, Value}` pairs as a list.
+/// The `Item` keys `erlang:port_info/1` reports — the oracle's `port_info/1` roster.
+///
+/// `erts_internal:port_info/1` emits exactly these seven pairs; every other port item
+/// (e.g. `monitors`) is reachable only through `/2`.
+const PORT_INFO_1_ITEMS: [&str; 7] = [
+    "name",
+    "links",
+    "id",
+    "connected",
+    "input",
+    "output",
+    "os_pid",
+];
+
+/// The `erlang:port_info/1` BIF: the seven `/1`-item `{Item, Value}` pairs.
+///
+/// The oracle's `port_info/1` is *not* the whole `/2` item set — it reports only
+/// `name`, `links`, `id`, `connected`, `input`, `output` and `os_pid`. So the hook's
+/// pair list is filtered: a pair survives iff its key is an atom naming one of those
+/// seven items; every other pair (a `/2`-only item such as `monitors`, or a non-atom
+/// key) is dropped. The surviving pairs keep their hook order.
 fn port_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     let pairs = ctx.port_info(port)?;
     let mut tuples = Vec::with_capacity(pairs.len());
     for (item, value) in pairs {
+        let keep = access::is_atom(item)
+            && ctx
+                .atoms()
+                .name(atom_val(item))
+                .is_some_and(|name| PORT_INFO_1_ITEMS.contains(&name));
+        if !keep {
+            continue;
+        }
         tuples.push(ctx.tuple(&[item, value])?);
     }
     ctx.list(&tuples)
 }
 
-/// The `erlang:port_info/2` BIF: the value whose item is *exactly* (`=:=`) `args[1]`,
-/// or the atom `undefined` when no pair matches.
+/// The `erlang:port_info/2` BIF: the 2-tuple `{Item, Value}` whose item is *exactly*
+/// (`=:=`) `args[1]`.
 ///
-/// `undefined` for an unknown item is this crate's contract (the seam's pair list is
-/// the authority); erts-17.1 raises `badarg` there instead — a documented deviation.
+/// Unlike `/1`, `/2` searches **every** hook pair — including the items `/1` filters
+/// out (e.g. `monitors`). An item matching no pair (in particular a non-atom item, or
+/// an item the oracle does not know such as `stream`) is `error:badarg`, matching
+/// erts-17.1.
 fn port_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     let item = args[1];
     let pairs = ctx.port_info(port)?;
     for (key, value) in pairs {
         if compare::eq(key, item, ctx.atoms()) {
-            return Ok(value);
+            return ctx.tuple(&[key, value]);
         }
     }
-    ctx.intern_atom("undefined")
+    Err(badarg())
 }
 
 /// The largest internal port number.
@@ -194,8 +224,19 @@ mod tests {
     /// A `PortHook` test double: it hands out `PortId::new(3)` and answers a fixed
     /// pair list.
     struct StubPorts {
+        info: Vec<(Eterm, Eterm)>,
         opened: Vec<(Eterm, Eterm)>,
         closed: Vec<PortId>,
+    }
+
+    impl StubPorts {
+        fn new(info: Vec<(Eterm, Eterm)>) -> StubPorts {
+            StubPorts {
+                info,
+                opened: Vec::new(),
+                closed: Vec::new(),
+            }
+        }
     }
 
     impl crate::context::PortHook for StubPorts {
@@ -210,13 +251,21 @@ mod tests {
         }
 
         fn port_info(&mut self, _port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
-            Ok(vec![(make_small(1), make_small(2))])
+            Ok(self.info.clone())
         }
     }
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["true", "false", "ok", "undefined", "name"]);
+        atoms.seed([
+            "true",
+            "false",
+            "ok",
+            "undefined",
+            "name",
+            "links",
+            "monitors",
+        ]);
         atoms
     }
 
@@ -224,10 +273,7 @@ mod tests {
     fn open_port_returns_the_hooks_id_and_forwards_the_arguments() {
         let mut heap = Heap::new(64).expect("test heap");
         let atoms = seeded_atoms();
-        let mut hook = StubPorts {
-            opened: Vec::new(),
-            closed: Vec::new(),
-        };
+        let mut hook = StubPorts::new(Vec::new());
         let name = make_small(9);
         {
             let mut ctx =
@@ -257,13 +303,20 @@ mod tests {
 
     #[test]
     fn port_close_and_port_info_decode_the_port_first() {
-        let mut heap = Heap::new(256).expect("test heap");
+        let mut heap = Heap::new(4096).expect("test heap");
         let atoms = seeded_atoms();
-        let mut hook = StubPorts {
-            opened: Vec::new(),
-            closed: Vec::new(),
-        };
         let port = PortId::new(5).to_eterm();
+
+        // The pair list the stub answers with: two `/1` items, in hook order.
+        let info = {
+            let ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+            let name = ctx.atom("name").expect("seeded");
+            let links = ctx.atom("links").expect("seeded");
+            let one = make_small(1);
+            let two = make_small(2);
+            vec![(name, two), (links, one)]
+        };
+        let mut hook = StubPorts::new(info);
         {
             let mut ctx =
                 BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_port_hook(&mut hook);
@@ -271,12 +324,34 @@ mod tests {
             let closed = port_close(&mut ctx, &[port]).expect("port_close");
             assert_eq!(ctx.atoms().name(atom_val(closed)), Some("true"));
 
+            // `/1` keeps the two `/1` items, in hook order.
             let all = port_info_1(&mut ctx, &[port]).expect("port_info/1");
             let elems = proper_list(all).expect("a proper list");
-            assert_eq!(elems.len(), 1);
+            assert_eq!(elems.len(), 2);
             // `tuple_element` is 0-based (`tuple_val(x)[i]`).
-            assert_eq!(access::tuple_element(elems[0], 0), make_small(1));
+            assert_eq!(access::tuple_element(elems[0], 0), ctx.atom("name").unwrap());
             assert_eq!(access::tuple_element(elems[0], 1), make_small(2));
+            assert_eq!(access::tuple_element(elems[1], 0), ctx.atom("links").unwrap());
+            assert_eq!(access::tuple_element(elems[1], 1), make_small(1));
+
+            // `/2` of a matching item is the 2-tuple `{Item, Value}`.
+            let name = ctx.atom("name").expect("seeded");
+            let named = port_info_2(&mut ctx, &[port, name]).expect("port_info/2");
+            assert_eq!(access::tuple_size(named), 2);
+            assert_eq!(access::tuple_element(named, 0), name);
+            assert_eq!(access::tuple_element(named, 1), make_small(2));
+
+            // An item matching no pair is `badarg`.
+            let unknown = ctx.atom("undefined").expect("seeded");
+            assert!(matches!(
+                port_info_2(&mut ctx, &[port, unknown]),
+                Err(BeamError::BadArg)
+            ));
+            // A non-atom item never matches, so it is `badarg` too.
+            assert!(matches!(
+                port_info_2(&mut ctx, &[port, make_small(1)]),
+                Err(BeamError::BadArg)
+            ));
 
             // A non-port is `badarg`, before the seam is consulted.
             assert!(matches!(
