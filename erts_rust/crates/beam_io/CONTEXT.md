@@ -428,11 +428,12 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
 - **`SpawnDriver` is the OS-child floor, not the whole `spawn` driver.** Decoding the `open_port/2` terms into a
   [`SpawnSpec`](src/drivers/spawn.rs)/`SpawnOptions` (and synthesizing `{Port, {data, …}}`,
   `{Port, {exit_status, …}}` and a `{Port, eof}` message from them) stays the runtime's job — this crate only
-  moves the bytes and kills/reaps the child. The child's stderr is piped (so it never inherits the emulator's own
-  output) but **never read**; the driver signals EOF only by latching its own state (`eof()`), it does not report
-  an event. Writing to a child that closed its stdin fails with a typed `BeamError::Io` (the queued remainder is
-  kept, never silently discarded), and `{fd, N}` is a **read-only** adoption — writing to it is `BadArg`, so a
-  descriptor port is not yet a bidirectional stream. Adopting a descriptor also requires it to be switchable to
+  moves the bytes and kills/reaps the child. The child's stderr is discarded (`Stdio::null()`); the driver signals
+  EOF only by latching its own state (`eof()`), it does not report an event. Writing to a child that closed its
+  stdin fails with a typed `BeamError::Io` (the queued remainder is kept, never silently discarded), and `{fd, N}`
+  is a **duplex** adoption — one descriptor behind one `Interest::BOTH` registration, read and written by the port
+  (end-to-end `port_command` to a `{fd, N}` port is still intercepted as `unsupported` in `beam_rt`, a handoff).
+  Adopting a descriptor also requires it to be switchable to
   non-blocking (`F_SETFL` + `O_NONBLOCK`); a descriptor that refuses that (some inherited descriptors return
   `EPERM`) fails the open with `BeamError::Io`, because the reactor is edge-triggered and cannot serve a blocking
   descriptor. Input is not line-framed (there is no `line` control verb):
