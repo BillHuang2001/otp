@@ -519,14 +519,19 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `FLOAT_EXT`→`NEW_FLOAT_EXT` rewrite are not byte-canonical).
 
 ## Test Strategy
-- In-module `#[cfg(test)] mod tests`: `tag` (values against `external.h`, `from_byte`/`as_byte`
+- Unit tests live in `#[cfg(test)] mod tests` submodules: in-module for
+  `tag` (values against `external.h`, `from_byte`/`as_byte`
   round-trip, `covered` table), `reader`/`writer` (BE round-trips, every truncation ⇒ `BadArg`, no
   panic), `atom_cache`, `compress` (round-trip at every level 0..=9, empty/large inputs, out-of-range
-  level, bad header/truncation/corrupt-trailer), `term` (raw-word assertions that the forwarded
+  level, bad header/truncation/corrupt-trailer) and `term` (raw-word assertions that the forwarded
   `beam_term::thing` layout is byte-exact — float, bignum sign/digits, flatmap head/size/keys/vals,
-  external id fields — plus the guard/error behaviour), `encode`/`decode` (per-tag round-trips + the
+  external id fields — plus the guard/error behaviour); the `encode`/`decode` codec suites (per-tag
+  round-trips + the
   error mapping table + unsupported tags, plus the top-level `COMPRESSED` unwrap, a hand-built
-  compressed image and its negative cases).
+  compressed image and its negative cases) sit in the sibling files `src/encode/tests.rs` and
+  `src/decode/tests.rs` (`mod tests;`), which also expose the `pub(crate)` test helpers
+  (`new_heap`, `assert_bad_arg`, `assert_system_limit`, `decode`) their `fun`/`record` submodules
+  reuse.
 - `tests/roundtrip.rs` — exhaustive `encode → decode → compare` over a property-style corpus
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
   incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
