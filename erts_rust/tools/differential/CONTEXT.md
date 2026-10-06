@@ -165,11 +165,12 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - `src/corpus/bifs.rs` → BIF/OTP-app cases (A.7): `length`, `integer_to_binary`, `lists:*`, `maps:get`, binary ops, `io_lib:format`
 - `src/corpus/system_info.rs` → introspection cases (A.8): `system_info/1` key shapes + badarg-on-unknown-key
 - `src/corpus/flags.rs` → CLI/config cases (A.6): `init:get_argument/1`, `init:get_plain_arguments/0`, `-pa`
-- `src/corpus/nif.rs` → observable NIF error surface (A.3): `erlang:nif_error/1` reason shapes
-- `src/corpus/driver.rs` → observable driver/port surface (A.4): built-in `spawn` driver + `os:cmd/1` round-trip
-- `src/corpus/wire.rs` → distribution/ETF wire cases (A.5): cross-encoded ETF blobs + encoded byte size (live handshake is a documented gap)
-- `src/corpus/boot.rs` → build/boot cases (A.9): shape-only checks on `system_version`, `code:get_path/0`, `code:all_loaded/0`
+- `src/corpus/nif.rs` → observable NIF error surface (A.3): `erlang:nif_error/1` reason shapes (atoms, tuples, nested, integers, lists)
+- `src/corpus/driver.rs` → observable driver/port surface (A.4): `os:cmd/1` round-trips + the port term/stream seam (the `open_port/2` cases are honest `unsupported` until the port wiring lands)
+- `src/corpus/wire.rs` → distribution/ETF wire cases (A.5): the ETF tags the wire codec uses — floats, small/large bignums, NIL/STRING/LIST/BINARY, UTF-8 atoms, pid/ref/port, export/new fun, compression, version framing, atom-cache-without-context (live handshake is a documented gap)
+- `src/corpus/boot.rs` → build/boot cases (A.9): boot / code-server / preloaded observability (`system_info` shapes, `code:get_path/0`, `code:which/1`, `code:lib_dir/1`, `code:all_loaded/0`, `init:get_status/0`)
 - `src/corpus/modules.rs` → module-run cases (A.2/A.1/A.7): embedded `erlc`-compiled modules run under both runtimes (the genuine-agreement core)
+- `src/corpus/mexec.rs` → "modules execute" sweep group (A.2/A.7): tiny `erlc`-compiled wrappers whose int-arg functions call real system stdlib/kernel modules (`calendar`, `ordsets`, `queue`, `gb_trees`, `gb_sets`, `proplists`, `orddict`, `array`, `string`, `unicode`, `io_lib`, `filename`, `erl_scan`, `base64`) end-to-end under both runtimes
 - `src/harness.rs` → orchestration: `run_case`/`compare_expr`/`run_suite`, per-side argv planning, exit-3 classification, exit-code derivation
 - `src/report.rs` → JSON report schema (serde: `summary` + additive `by_contract` rollup; the `list` listing + optional `--by-contract` grouping) + writer + human rendering
 - `src/main.rs` → thin binary: parse args → dispatch → `process::exit(code)`
