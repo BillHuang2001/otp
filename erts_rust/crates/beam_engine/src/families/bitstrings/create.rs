@@ -11,21 +11,24 @@
 //! `[TypeAtom, Index, Unit, Flags, Value, Size]` (the compiler's `bs_args/3` layout
 //! as `beam_asm` writes it). The compiler emits groups such as
 //! `{atom,integer},1,1,nil,{x,0},{integer,8}` and
-//! `{atom,binary},2,8,nil,{x,0},{atom,all}`; a `string` constant is its own
-//! `{string,Bs}` value operand.
+//! `{atom,binary},2,8,nil,{x,0},{atom,all}`; a `string` constant's value operand is
+//! written as an untagged integer byte offset into the module's `StrT` string table
+//! (`beam_asm.erl:771-773`), which the loader decodes to `Operand::Integer`.
 //!
 //! # Scope
 //!
 //! Implemented: `integer` (any width, big- or little-endian, the value masked into
 //! the field — up to 64 bits through the machine-word path, wider fields through the
-//! bignum path [`super::push_wide_int`]), `binary` and `string` segments
-//! (byte-aligned, `all` or an explicit bit count), `float` (16/32/64 bits, big- or
-//! little-endian), and `utf8`/`utf16`/`utf32`, combined into one result bitstring.
+//! bignum path [`super::push_wide_int`]), `binary` (byte-aligned, `all` or an
+//! explicit bit count), `string` constants from the `StrT` table, `float` (16/32/64
+//! bits, big- or little-endian), and `utf8`/`utf16`/`utf32`, combined into one result
+//! bitstring.
 //!
 //! Not implemented (each a precise typed [`crate::error::unsupported`]): `append`,
 //! `private_append` and `bs_init_writable` (they need a mutable off-heap
-//! ref-counted binary the term layer does not provide), results larger than the
-//! on-heap binary limit, and an `integer` segment whose value is not an integer.
+//! ref-counted binary the term layer does not provide — see
+//! `HANDOFF_bs_init_writable.md`), results larger than the on-heap binary limit, and
+//! an `integer` segment whose value is not an integer.
 
 use std::collections::BTreeMap;
 
@@ -60,7 +63,9 @@ pub(super) fn exec(
         // writable off-heap ref-counted binary and a match context over it, so a
         // following `bs_create_bin` with an `append`/`private_append` segment can grow
         // it in place. Neither the mutable-binary allocation nor the term layer's
-        // ref-counted binary exists yet, so this is a documented gap.
+        // ref-counted binary exists yet, and the engine cannot reach `beam_alloc`, so
+        // this is a documented gap — see `HANDOFF_bs_init_writable.md` for the exact
+        // missing capability and the candidate fixes.
         Instr::BsInitWritable => Err(error::unsupported(
             "bs_init_writable: needs a writable off-heap ref-counted binary",
         )),
@@ -152,8 +157,9 @@ fn assemble(
                     }
                 }
             }
-            "binary" | "string" => {
-                let (bytes, src_bits) = segment_source(machine, module, value_op, kind)?;
+            // `binary Unit Fs Value Size` — append a bitstring operand's bytes.
+            "binary" => {
+                let (bytes, src_bits) = segment_source(machine, module, value_op)?;
                 let nbits = if is_all(module, size_op) {
                     src_bits
                 } else {
@@ -169,6 +175,19 @@ fn assemble(
                     return fail_seg(machine, module, labels, fail, value_op, ctx);
                 }
                 writer.push_bits_from(bytes, 0, nbits);
+            }
+
+            // `string Unit Fs Offset Size` — append a constant byte string from the
+            // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
+            // `bs_instrs.tab:627-633`, `erl_bits.c:1641`). The compiler emits the
+            // *value* operand as the string's byte offset into `StrT`
+            // (`beam_asm.erl:771-773` writes it with `tag_u`) and the *size* operand
+            // as its byte count, always with unit 8
+            // (`beam_ssa_codegen.erl:1976`); C computes `size * 8` bits and no
+            // failure is possible here, so this segment never branches to `fail`.
+            "string" => {
+                let bytes = string_source(module, value_op, size_op, machine)?;
+                writer.push_bits_from(bytes, 0, bytes.len() * 8);
             }
 
             // `float Unit Fs Value Size` — write a 16/32/64-bit float
@@ -216,8 +235,9 @@ fn assemble(
             }
 
             // `append`/`private_append` (BSC_APPEND/BSC_PRIVATE_APPEND) need a
-            // writable in-place binary (see `bs_init_writable`); they fall through to
-            // the generic unsupported-segment-type error.
+            // writable in-place off-heap binary (see `bs_init_writable` and
+            // `HANDOFF_bs_init_writable.md`); they fall through to the generic
+            // unsupported-segment-type error.
             other => {
                 return Err(error::unsupported(&format!(
                     "bs_create_bin: segment type {other}"
@@ -263,26 +283,53 @@ fn read_value(machine: &Machine, module: &Module, operand: &Operand) -> Result<E
     }
 }
 
-/// The byte slice and bit count a `binary`/`string` segment draws from.
-///
-/// A `string` segment whose value is the empty-string atom (the compiler's
-/// "no string table" form) contributes nothing.
+/// The byte slice and bit count a `binary` segment draws from.
 fn segment_source<'a>(
     machine: &Machine,
     module: &Module,
     operand: &Operand,
-    kind: &str,
 ) -> Result<(&'a [u8], usize)> {
-    if kind == "string" {
-        if let Operand::Atom(_) = operand {
-            return Ok((&[], 0));
-        }
-    }
     let value = read_value(machine, module, operand)?;
     let (_, bits) = raw::heap_bits(value)
         .ok_or_else(|| error::unsupported("bs_create_bin: segment value is not a binary"))?;
     let bytes = raw::subject_bytes(value)?;
     Ok((bytes, bits))
+}
+
+/// The `StrT` bytes a `string` constant segment appends.
+///
+/// The value operand is the string's byte offset into [`Module::strings`]
+/// (`beam_asm.erl:771-773` writes it as an untagged integer) and the size operand
+/// is its byte count; C computes `size * 8` bits and the unit operand is asserted
+/// to be 8 (`generators.tab:994-1001`) and otherwise unused.
+///
+/// A value operand that is not an integer, a size that is `all`/negative, or a
+/// range outside the `StrT` table is a typed [`crate::error::unsupported`] — a
+/// malformed segment is never turned into a wrong byte sequence.
+fn string_source<'a>(
+    module: &'a Module,
+    value_op: &Operand,
+    size_op: &Operand,
+    machine: &Machine,
+) -> Result<&'a [u8]> {
+    let Operand::Integer(offset) = value_op else {
+        return Err(error::unsupported(
+            "bs_create_bin: string segment value is not a StrT offset",
+        ));
+    };
+    if is_all(module, size_op) {
+        return Err(error::unsupported("bs_create_bin: string segment size `all`"));
+    }
+    let size = read_size(machine, size_op)?;
+    let start = usize::try_from(*offset)
+        .map_err(|_| error::unsupported("bs_create_bin: negative StrT offset"))?;
+    let end = start
+        .checked_add(size)
+        .ok_or_else(|| error::unsupported("bs_create_bin: string segment size overflow"))?;
+    module
+        .strings
+        .get(start..end)
+        .ok_or_else(|| error::unsupported("bs_create_bin: string segment outside the StrT table"))
 }
 
 /// The `f64` a float-segment value denotes: an Erlang float, or a small integer
@@ -439,9 +486,98 @@ fn put_utf32(value: i64) -> Option<Vec<u8>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_common::BeamError;
+
+    // --- `string_source` (the `StrT` constant segment) ---------------------
+
+    /// The fixture's `StrT` table (`bsstring.beam`, from
+    /// `beam_lib:chunks(F, ["StrT"])`), used so the offsets are the oracle's.
+    const STRT: &[u8] = b"abhicdabczxyQ";
+
+    fn strt_module() -> Module {
+        let mut module = Module::default();
+        module.strings = STRT.to_vec();
+        module
+    }
+
+    #[test]
+    fn string_source_slices_the_strt_table() {
+        let module = strt_module();
+        let machine = Machine::new();
+        let slice = |offset: i64, size: i64| {
+            string_source(
+                &module,
+                &Operand::Integer(offset),
+                &Operand::Integer(size),
+                &machine,
+            )
+        };
+        assert_eq!(slice(0, 2).unwrap(), b"ab");
+        assert_eq!(slice(4, 2).unwrap(), b"cd");
+        assert_eq!(slice(9, 1).unwrap(), b"z");
+        assert_eq!(slice(12, 1).unwrap(), b"Q");
+        // A zero-length slice resolves to the empty slice, never an error.
+        assert_eq!(slice(3, 0).unwrap(), b"");
+    }
+
+    #[test]
+    fn string_source_rejects_a_value_that_is_not_a_strt_offset() {
+        let module = strt_module();
+        let machine = Machine::new();
+        let size = Operand::Integer(2);
+        for value in [Operand::Nil, Operand::Atom(module.name), Operand::X(0)] {
+            let err = string_source(&module, &value, &size, &machine).unwrap_err();
+            assert!(matches!(err, BeamError::Raise(_)), "{value:?}: got {err:?}");
+        }
+    }
+
+    #[test]
+    fn string_source_rejects_an_all_size() {
+        let mut module = strt_module();
+        let all = Operand::Atom(module.atom_table.intern("all"));
+        let machine = Machine::new();
+        let err = string_source(&module, &Operand::Integer(0), &all, &machine).unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn string_source_rejects_a_negative_offset_and_a_bad_size() {
+        let module = strt_module();
+        let machine = Machine::new();
+        let err =
+            string_source(&module, &Operand::Integer(-1), &Operand::Integer(1), &machine)
+                .unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+        // A negative size is not a byte count.
+        let err =
+            string_source(&module, &Operand::Integer(0), &Operand::Integer(-1), &machine)
+                .unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    }
+
+    #[test]
+    fn string_source_rejects_a_slice_outside_the_table() {
+        let module = strt_module();
+        let machine = Machine::new();
+        // Offset 2 + size 2 runs past the end of a 3-byte table.
+        let mut short = Module::default();
+        short.strings = b"abc".to_vec();
+        let err =
+            string_source(&short, &Operand::Integer(2), &Operand::Integer(2), &machine)
+                .unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+        // A start past the end of the whole table is rejected too.
+        let err = string_source(
+            &module,
+            &Operand::Integer(999),
+            &Operand::Integer(1),
+            &machine,
+        )
+        .unwrap_err();
+        assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    }
 
     // --- `put_float` -------------------------------------------------------
-
     #[test]
     fn put_float_is_big_endian_for_every_width() {
         assert_eq!(put_float(0.0, 16, false), vec![0x00, 0x00]);
