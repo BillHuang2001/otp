@@ -724,16 +724,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
 ## Handoffs (owned by OTHER nodes)
-`differential suite` is at **`total=285 agree=280 mismatch=1 unsupported=4 skipped=0`**. Remaining asks
-owned elsewhere:
-* **`beam_bifs` — the one mismatch.** `driver/port_close_through_spawn_driver` is the sole
-  disagreement; it exercises the same `port_info`-shape deviation this crate documents (`connected` is a
-  boolean, not the controlling pid), so it is owned by the `beam_bifs` node, not here.
-* **The 4 `unsupported` are the `wire/*` ETF-encode cases**, owned elsewhere.
-* **`tools/differential` — a stale pin.** Its `tests/cli.rs` still asserts the expression corpus has a
-  capability gap (`unsupported + skipped >= 1`) and its `CONTEXT.md` still describes the (now closed)
-  `driver/port_backed_by_spawn_driver` mismatch, so that one workspace test fails against the current
-  suite. The pin lives under `../../tools/` (read-only here) and is owed to that node.
+`differential suite` is at **`summary: total=285 agree=281 mismatch=0 unsupported=4 skipped=0`**.
+Remaining asks owned elsewhere:
+* **The 4 `unsupported` are the `wire/*` ETF-encode cases**, owned by `beam_codec`/`beam_dist`.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also
