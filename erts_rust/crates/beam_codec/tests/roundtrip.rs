@@ -16,39 +16,47 @@
 //! wire byte-count boundaries including high-zero stripping, every atom tag (short,
 //! long, multi-byte UTF-8, plus Latin-1), floats including `±0`, `±inf`, `NaN` (quiet
 //! and signaling) and subnormals, tuples at the arity boundaries, proper/improper lists
-//! and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover, small maps and
-//! pids/ports/references.
+//! and byte lists up to the `STRING_EXT`/`LIST_EXT` switchover, small maps,
+//! pids/ports/references and both fun tags — `EXPORT_EXT` (`113`) and `NEW_FUN_EXT`
+//! (`112`), standalone and nested inside tuples/lists/maps.
 //!
 //! Two documented *non*-byte-identical transformations are asserted explicitly: a
 //! bignum whose magnitude fits the 60-bit small range decodes to a small (matching the
 //! C `dec_term`), and a legacy `FLOAT_EXT` re-encodes as `NEW_FLOAT_EXT`.
 //!
-//! Negative cases cover truncation at every byte offset, unknown/unsupported tags,
-//! over-long atoms and bignums (`BeamError::SystemLimit`), oversized maps
-//! (`error::unsupported`), a malformed bignum sign and trailing bytes. Every malformed
-//! input must yield an error — never a panic, never a silently truncated or
-//! mis-encoded term.
+//! Negative cases cover truncation at every byte offset (including every `NEW_FUN_EXT`
+//! field boundary), unknown/unsupported/obsolete tags (the removed `FUN_EXT`), the fun
+//! field rules (non-small `old_index`/`old_uniq`, a non-pid creator, `num_free` past
+//! its 8-bit field, missing environment terms), over-long atoms and bignums
+//! (`BeamError::SystemLimit`), oversized maps (`error::unsupported`), a malformed
+//! bignum sign and trailing bytes. Encoding a local (`make_fun3`) fun — which has no
+//! faithful wire image — raises `unsupported_local_fun`, never a mis-encoded term.
+//! Every malformed input must yield an error — never a panic, never a silently
+//! truncated or mis-encoded term.
 
 use beam_alloc::Heap;
 use beam_common::BeamError;
 use beam_term::{
-    atom_val, is_atom, is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable,
-    Eterm, MAX_SMALL, MIN_SMALL, NIL,
+    atom_val, is_atom, is_list, is_nil, is_small, make_atom, make_boxed, make_fun_header,
+    make_small, signed_value, AtomTable, Eterm, MAX_SMALL, MIN_SMALL, NIL,
 };
 
 use beam_codec::compress::{compress, decompress};
-use beam_codec::error::is_unsupported;
+use beam_codec::error::{is_unsupported, is_unsupported_local_fun};
 use beam_codec::term::{
     big_parts, bitstring_bytes, cons_head, cons_tail, external_pid_parts, external_port_parts, external_ref_parts,
-    flatmap_parts, float_value, make_big, make_external_pid, make_external_port, make_external_ref,
-    make_flatmap, make_float, tuple_arity, tuple_element,
+    flatmap_parts, float_value, fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index,
+    fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes,
+    make_big, make_binary, make_external_pid, make_external_port, make_external_ref, make_flatmap,
+    make_float, make_fun_external, make_fun_imported, tuple_arity, tuple_element,
 };
 use beam_codec::{
     decode_term, encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, FLOAT_EXT,
-    INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT,
-    NEW_FLOAT_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT, NIL_EXT, SMALL_ATOM_UTF8_EXT,
-    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, VERSION_MAGIC,
+    AtomEncoding, Decoder, Encoder, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, COMPRESSED_EXT, EXPORT_EXT,
+    FLOAT_EXT, FunKind, FunPid, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT,
+    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_FUN_EXT, NEW_PID_EXT, NEW_PORT_EXT, NEW_REFERENCE_EXT,
+    NIL_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT,
+    V4_PORT_EXT, VERSION_MAGIC,
 };
 
 // ---------------------------------------------------------------------------
@@ -155,6 +163,78 @@ fn assert_term_eq(a: Eterm, ta: &AtomTable, b: Eterm, tb: &AtomTable) {
             assert_term_eq(xt, ta, yt, tb);
             return;
         }
+    }
+    // Funs (`EXPORT_EXT`/`NEW_FUN_EXT`): the two sides may live in different heaps and
+    // atom tables, so module/function atoms (and the creator pid's node) are compared
+    // by **name** and the environment recursively. The classification is exact — a fun
+    // header carries a distinct subtag — so this cannot shadow another family.
+    if let Ok(kind_a) = fun_kind_term(a) {
+        let kind_b = fun_kind_term(b).expect("expected a fun");
+        assert_eq!(kind_a, kind_b, "fun kind mismatch");
+        assert_eq!(
+            fun_arity_term(a).expect("a fun has an arity"),
+            fun_arity_term(b).expect("a fun has an arity"),
+            "fun arity mismatch"
+        );
+        assert_eq!(
+            fun_num_free_term(a).expect("a fun has a num_free"),
+            fun_num_free_term(b).expect("a fun has a num_free"),
+            "fun env size mismatch"
+        );
+        match kind_a {
+            FunKind::External => {
+                assert_eq!(
+                    ta.name(fun_module(a).expect("external fun module")),
+                    tb.name(fun_module(b).expect("external fun module")),
+                    "fun module mismatch"
+                );
+                assert_eq!(
+                    ta.name(fun_function(a).expect("external fun function")),
+                    tb.name(fun_function(b).expect("external fun function")),
+                    "fun function mismatch"
+                );
+            }
+            FunKind::Imported => {
+                assert_eq!(
+                    ta.name(fun_module(a).expect("imported fun module")),
+                    tb.name(fun_module(b).expect("imported fun module")),
+                    "fun module mismatch"
+                );
+                assert_eq!(
+                    fun_uniq_bytes(a).expect("imported fun uniq"),
+                    fun_uniq_bytes(b).expect("imported fun uniq"),
+                    "fun uniq mismatch"
+                );
+                assert_eq!(fun_index(a).unwrap(), fun_index(b).unwrap());
+                assert_eq!(fun_old_index(a).unwrap(), fun_old_index(b).unwrap());
+                assert_eq!(fun_old_uniq(a).unwrap(), fun_old_uniq(b).unwrap());
+                let (pa, pb) = (
+                    fun_creator_pid(a).expect("imported fun creator"),
+                    fun_creator_pid(b).expect("imported fun creator"),
+                );
+                assert_eq!(ta.name(pa.node), tb.name(pb.node), "creator node mismatch");
+                assert_eq!(
+                    (pa.number, pa.serial, pa.creation),
+                    (pb.number, pb.serial, pb.creation),
+                    "creator pid mismatch"
+                );
+                let (ea, eb) = (fun_env(a).unwrap(), fun_env(b).unwrap());
+                assert_eq!(ea.len(), eb.len(), "fun env length mismatch");
+                for i in 0..ea.len() {
+                    assert_term_eq(ea[i], ta, eb[i], tb);
+                }
+            }
+            FunKind::Local => {
+                // A local fun inlines no module/uniq/creator pid.
+                assert_eq!(fun_index(a).unwrap(), fun_index(b).unwrap());
+                let (ea, eb) = (fun_env(a).unwrap(), fun_env(b).unwrap());
+                assert_eq!(ea.len(), eb.len(), "local fun env length mismatch");
+                for i in 0..ea.len() {
+                    assert_term_eq(ea[i], ta, eb[i], tb);
+                }
+            }
+        }
+        return;
     }
     if let Ok((neg_a, dig_a)) = big_parts(a) {
         let (neg_b, dig_b) = big_parts(b).expect("expected a bignum");
@@ -1093,6 +1173,315 @@ fn compressed_image_negative_cases_are_bad_arg() {
 }
 
 // ---------------------------------------------------------------------------
+// Funs — `EXPORT_EXT` (113) / `NEW_FUN_EXT` (112)
+// ---------------------------------------------------------------------------
+
+/// The 16-byte MD5 `uniq` used by the hand-built `NEW_FUN_EXT` fixtures (any fixed
+/// value works — the wire carries it verbatim).
+const UNIQ: [u8; 16] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15];
+
+/// The `SMALL_ATOM_UTF8_EXT` wire image of a short atom name.
+fn small_atom(name: &str) -> Vec<u8> {
+    let bytes = name.as_bytes();
+    assert!(bytes.len() <= 255, "small_atom is for short names only");
+    let mut v = vec![SMALL_ATOM_UTF8_EXT, bytes.len() as u8];
+    v.extend_from_slice(bytes);
+    v
+}
+
+/// A `NEW_PID_EXT` creator-pid image for `nonode@nohost` with id `(1, 2, 3)` — the
+/// modern form the encoder always emits (`external.c:3989`). Matches the creator
+/// [`imported_fun`] builds, so it can be asserted byte-for-byte.
+fn creator_pid_image() -> Vec<u8> {
+    let mut v = vec![NEW_PID_EXT];
+    v.extend_from_slice(&small_atom("nonode@nohost"));
+    v.extend_from_slice(&1u32.to_be_bytes());
+    v.extend_from_slice(&2u32.to_be_bytes());
+    v.extend_from_slice(&3u32.to_be_bytes());
+    v
+}
+
+/// An `EXPORT_EXT` (`fun lists:reverse/Arity`) term on `h`.
+fn external_fun(h: &mut Heap, atoms: &mut AtomTable, arity: usize) -> Eterm {
+    let module = atoms.intern("lists");
+    let function = atoms.intern("reverse");
+    make_fun_external(h, arity, module, function).expect("a fresh heap holds a fun")
+}
+
+/// A `NEW_FUN_EXT` fun on `h` with module `ftest`, index `index`, `old_index` 7,
+/// `old_uniq` 3 and the fixed creator pid [`creator_pid_image`] describes. `env` is
+/// the environment in **wire order** (`env[0]` is stream element 0).
+fn imported_fun(h: &mut Heap, atoms: &mut AtomTable, arity: usize, index: u32, env: &[Eterm]) -> Eterm {
+    let module = atoms.intern("ftest");
+    let creator = FunPid {
+        node: atoms.intern("nonode@nohost"),
+        number: 1,
+        serial: 2,
+        creation: 3,
+    };
+    make_fun_imported(h, arity, module, &UNIQ, index, 7, 3, creator, env)
+        .expect("a fresh heap holds a fun")
+}
+
+/// Decodes a `term_to_binary` image, re-encodes the decoded term and asserts the
+/// re-encoding is **byte-identical** to the input (the wire form is canonical), then
+/// decodes the re-encoding once more and checks the two terms are structurally equal.
+///
+/// Returns the twice-decoded term with the heap/atom-table that own it.
+fn roundtrip_image(image: &[u8], cap: usize) -> (Eterm, Heap, AtomTable) {
+    let mut h1 = heap(cap);
+    let mut a1 = AtomTable::new();
+    let t1 = decode_term(image, &mut h1, &mut a1).expect("decode the fixture image");
+
+    let b = encode_term(t1, &a1).expect("re-encode the decoded term");
+    assert_eq!(
+        b, image,
+        "decode → encode must reproduce the wire image byte-for-byte"
+    );
+
+    let mut h2 = heap(cap);
+    let mut a2 = AtomTable::new();
+    let t2 = decode_term(&b, &mut h2, &mut a2).expect("decode the re-encoding");
+    assert_term_eq(t1, &a1, t2, &a2);
+    (t2, h2, a2)
+}
+
+#[test]
+fn external_funs_round_trip() {
+    // Arity 0 (`fun f/0`), 1 and the 8-bit-header maximum 255.
+    for &arity in &[0usize, 1, 255] {
+        let mut atoms = AtomTable::new();
+        let mut h = heap(64);
+        let fun = external_fun(&mut h, &mut atoms, arity);
+        let (img, t2, _h2, _a2) = roundtrip(fun, &atoms, 64);
+
+        // `[113][module atom][function atom][arity as a small]`, byte-exact.
+        let mut expected = vec![VERSION_MAGIC, EXPORT_EXT];
+        expected.extend_from_slice(&small_atom("lists"));
+        expected.extend_from_slice(&small_atom("reverse"));
+        expected.extend_from_slice(&[SMALL_INTEGER_EXT, arity as u8]);
+        assert_eq!(img, expected);
+
+        // The decoded term is the same external fun, with no environment.
+        assert_eq!(fun_kind_term(t2).unwrap(), FunKind::External);
+        assert_eq!(fun_arity_term(t2).unwrap(), arity);
+        assert_eq!(fun_num_free_term(t2).unwrap(), 0);
+        assert_eq!(fun_env(t2).unwrap(), &[] as &[Eterm]);
+    }
+
+    // A fun whose module atom is longer than 255 *characters* cannot be encoded
+    // (`SystemLimit`, exactly like a bare over-long atom).
+    let mut atoms = AtomTable::new();
+    let module = atoms.intern(&"m".repeat(256));
+    let function = atoms.intern("f");
+    let mut h = heap(64);
+    let fun = make_fun_external(&mut h, 1, module, function).unwrap();
+    assert!(matches!(
+        encode_term(fun, &atoms),
+        Err(BeamError::SystemLimit)
+    ));
+}
+
+#[test]
+fn imported_funs_round_trip() {
+    // `num_free` 0, 1 and 3, with distinguishable env values (a small, a list and a
+    // binary) so a wrong environment **order** would be caught.
+    let mut atoms = AtomTable::new();
+    let mut h = heap(512);
+
+    let envs: Vec<Vec<Eterm>> = vec![
+        vec![],
+        vec![make_small(1)],
+        vec![
+            make_small(1000),
+            list(&mut h, &[make_small(1), make_small(2), make_small(3)], NIL),
+            make_binary(&mut h, b"abc").unwrap(),
+        ],
+    ];
+
+    for (n, env) in envs.iter().enumerate() {
+        let fun = imported_fun(&mut h, &mut atoms, n, n as u32, env);
+        let (img, t2, _h2, a2) = roundtrip(fun, &atoms, 512);
+
+        // The fixed header: `[112][size:4][arity:1][uniq:16][index:4][num_free:4]`.
+        assert_eq!(img[1], NEW_FUN_EXT);
+        assert_eq!(img[6], n as u8);
+        assert_eq!(img[7..23], UNIQ);
+        assert_eq!(img[23..27], (n as u32).to_be_bytes());
+        assert_eq!(img[27..31], (env.len() as u32).to_be_bytes());
+        // `[module][old_index small][old_uniq small][creator pid NEW_PID_EXT]`.
+        let mut head = small_atom("ftest");
+        head.extend_from_slice(&[SMALL_INTEGER_EXT, 7]); // old_index
+        head.extend_from_slice(&[SMALL_INTEGER_EXT, 3]); // old_uniq
+        head.extend_from_slice(&creator_pid_image());
+        assert_eq!(&img[31..31 + head.len()], &head[..]);
+        // The size field counts from its own first byte through the end of the fun.
+        assert_eq!(
+            u32::from_be_bytes([img[2], img[3], img[4], img[5]]) as usize,
+            img.len() - 2
+        );
+
+        // The decoded fun round-trips every descriptor field.
+        assert_eq!(fun_kind_term(t2).unwrap(), FunKind::Imported);
+        assert_eq!(a2.name(fun_module(t2).unwrap()), Some("ftest"));
+        assert_eq!(fun_arity_term(t2).unwrap(), n);
+        assert_eq!(fun_num_free_term(t2).unwrap(), env.len());
+        assert_eq!(fun_uniq_bytes(t2).unwrap(), UNIQ);
+        assert_eq!(fun_index(t2).unwrap(), n as u32);
+        assert_eq!(fun_old_index(t2).unwrap(), 7);
+        assert_eq!(fun_old_uniq(t2).unwrap(), 3);
+        let creator = fun_creator_pid(t2).unwrap();
+        assert_eq!(a2.name(creator.node), Some("nonode@nohost"));
+        assert_eq!((creator.number, creator.serial, creator.creation), (1, 2, 3));
+
+        // ENV ORDER: `env[k]` is stream element `k`, element by element.
+        let decoded = fun_env(t2).unwrap();
+        assert_eq!(decoded.len(), env.len());
+        for k in 0..env.len() {
+            assert_term_eq(env[k], &atoms, decoded[k], &a2);
+        }
+    }
+}
+
+#[test]
+fn nested_funs_round_trip() {
+    let mut atoms = AtomTable::new();
+    let mut h = heap(1024);
+
+    let ext = external_fun(&mut h, &mut atoms, 1);
+    let imp = imported_fun(&mut h, &mut atoms, 0, 9, &[make_small(42)]);
+
+    // A fun inside a tuple.
+    let t = h.tuple(&[make_small(1), ext]).unwrap();
+    let (img, _t2, _h2, _a2) = roundtrip(t, &atoms, 1024);
+    assert_eq!(img[1], SMALL_TUPLE_EXT);
+
+    // A fun inside a list.
+    let l = list(&mut h, &[make_small(2), imp], NIL);
+    roundtrip(l, &atoms, 1024);
+
+    // A fun as a map value.
+    let key = make_atom(atoms.intern("k"));
+    let m = make_flatmap(&mut h, &[(key, imp)]).unwrap();
+    roundtrip(m, &atoms, 1024);
+
+    // A fun inside a tuple, itself inside a list.
+    let inner = h.tuple(&[ext, imp]).unwrap();
+    let outer = list(&mut h, &[make_small(3), inner], NIL);
+    let (img, outer2, _h2, _a2) = roundtrip(outer, &atoms, 1024);
+    // `[108 LIST_EXT][arity:4][head][tail]` with the head a 2-tuple.
+    assert_eq!(img[1], LIST_EXT);
+    let (heads, tail) = collect_list(outer2);
+    assert!(is_nil(tail));
+    assert_eq!(heads.len(), 2);
+    assert_eq!(tuple_arity(heads[1]).unwrap(), 2);
+    assert_eq!(fun_kind_term(tuple_element(heads[1], 0).unwrap()).unwrap(), FunKind::External);
+    assert_eq!(fun_kind_term(tuple_element(heads[1], 1).unwrap()).unwrap(), FunKind::Imported);
+}
+
+#[test]
+fn funs_round_trip_mixed_with_other_tags() {
+    // One enclosing tuple carrying a fun alongside floats, bignums, bitstrings, atoms
+    // and strings — the fun tags must route through the shared walker.
+    let mut atoms = AtomTable::new();
+    let mut h = heap(1024);
+
+    let float = make_float(&mut h, 3.5).unwrap();
+    let big = make_big(&mut h, false, &[0, 1]).unwrap(); // 2^64 ⇒ a bignum
+    let bin = make_binary(&mut h, b"hello").unwrap();
+    let atom = make_atom(atoms.intern("an_atom"));
+    let str_list = byte_list(&mut h, b"xyz");
+    let ext = external_fun(&mut h, &mut atoms, 2);
+    let imp = imported_fun(&mut h, &mut atoms, 1, 5, &[make_small(7)]);
+
+    let t = h
+        .tuple(&[float, big, bin, atom, str_list, ext, imp])
+        .unwrap();
+    let (img, t2, _h2, _a2) = roundtrip(t, &atoms, 1024);
+
+    assert_eq!(img[1], SMALL_TUPLE_EXT);
+    assert_eq!(img[2], 7);
+    assert_eq!(tuple_arity(t2).unwrap(), 7);
+    assert_eq!(fun_kind_term(tuple_element(t2, 5).unwrap()).unwrap(), FunKind::External);
+    assert_eq!(fun_kind_term(tuple_element(t2, 6).unwrap()).unwrap(), FunKind::Imported);
+}
+
+/// Byte-exact oracle vector for an `EXPORT_EXT` fun, generated with:
+/// `erl -noshell -eval 'io:format("~w~n",[term_to_binary(fun lists:reverse/1)])' -s init stop`.
+const ORACLE_EXPORT_FUN: &[u8] = &[
+    131, 113, 119, 5, 108, 105, 115, 116, 115, 119, 7, 114, 101, 118, 101, 114, 115, 101, 97, 1,
+];
+
+/// Byte-exact oracle vector for a genuine `NEW_FUN_EXT`, from a helper module whose
+/// source is:
+/// ```erlang
+/// -module(ftest).
+/// -export([make3/3]).
+/// make3(A,B,C) -> fun() -> {A,B,C} end.
+/// ```
+/// compiled with `erlc ftest.erl` and generated with:
+/// `erl -noshell -eval 'io:format("~w~n",[term_to_binary(ftest:make3("aa","bb","cc"))])' -s init stop`.
+/// It is `NEW_FUN_EXT`, size 86, arity 0, module `ftest`, index 0, `num_free` 3, the
+/// `old_index` a `SMALL_INTEGER_EXT` 0 and the `old_uniq` an `INTEGER_EXT` `0x056D5F58`,
+/// with the environment `["aa","bb","cc"]` **in that wire order**.
+///
+/// The generator's node atom is the default `nonode@nohost` (13 characters); the
+/// vector below spells its `SMALL_ATOM_UTF8_EXT` payload in full. Verified against the
+/// system oracle: `binary_to_term/1` accepts it (`#Fun<ftest.0.91053912>`) and
+/// `term_to_binary/1` reproduces these exact bytes.
+const ORACLE_NEW_FUN: &[u8] = &[
+    131, 112, 0, 0, 0, 86, 0, 173, 171, 235, 30, 156, 214, 196, 144, 67, 13, 207, 141, 193, 52,
+    206, 33, 0, 0, 0, 0, 0, 0, 0, 3, 119, 5, 102, 116, 101, 115, 116, 97, 0, 98, 5, 109, 95, 88,
+    88, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115, 116, 0, 0, 0, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 107, 0, 2, 97, 97, 107, 0, 2, 98, 98, 107, 0, 2, 99, 99,
+];
+
+#[test]
+fn oracle_external_fun_image_round_trips() {
+    // Decode → re-encode reproduces the oracle bytes; the decoded term is asserted
+    // through the public accessors.
+    let (t2, _h2, a2) = roundtrip_image(ORACLE_EXPORT_FUN, 64);
+    assert_eq!(fun_kind_term(t2).unwrap(), FunKind::External);
+    assert_eq!(a2.name(fun_module(t2).unwrap()), Some("lists"));
+    assert_eq!(a2.name(fun_function(t2).unwrap()), Some("reverse"));
+    assert_eq!(fun_arity_term(t2).unwrap(), 1);
+    assert_eq!(fun_num_free_term(t2).unwrap(), 0);
+    assert_eq!(fun_env(t2).unwrap(), &[] as &[Eterm]);
+}
+
+#[test]
+fn oracle_new_fun_image_round_trips() {
+    let (t2, _h2, a2) = roundtrip_image(ORACLE_NEW_FUN, 256);
+
+    assert_eq!(fun_kind_term(t2).unwrap(), FunKind::Imported);
+    assert_eq!(a2.name(fun_module(t2).unwrap()), Some("ftest"));
+    assert_eq!(fun_arity_term(t2).unwrap(), 0);
+    assert_eq!(fun_num_free_term(t2).unwrap(), 3);
+    assert_eq!(fun_index(t2).unwrap(), 0);
+    assert_eq!(fun_old_index(t2).unwrap(), 0);
+    assert_eq!(fun_old_uniq(t2).unwrap(), 0x056D_5F58);
+    assert_eq!(
+        fun_uniq_bytes(t2).unwrap(),
+        [173, 171, 235, 30, 156, 214, 196, 144, 67, 13, 207, 141, 193, 52, 206, 33]
+    );
+
+    let creator = fun_creator_pid(t2).unwrap();
+    assert_eq!(a2.name(creator.node), Some("nonode@nohost"));
+    assert_eq!((creator.number, creator.serial, creator.creation), (0, 0, 0));
+
+    // The environment is `["aa","bb","cc"]` **in that order** (a reversed decode
+    // would put `"cc"` first).
+    let env = fun_env(t2).unwrap();
+    assert_eq!(env.len(), 3);
+    for (i, want) in ["aa", "bb", "cc"].iter().enumerate() {
+        let (heads, tail) = collect_list(env[i]);
+        assert!(is_nil(tail), "env[{i}] must be a proper list");
+        let bytes: Vec<u8> = heads.iter().map(|&c| signed_value(c) as u8).collect();
+        assert_eq!(bytes, want.as_bytes(), "env[{i}] order mismatch");
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Negative cases
 // ---------------------------------------------------------------------------
 
@@ -1173,14 +1562,236 @@ fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
 
     // Recognized-but-not-yet-implemented tags report `unsupported`, never a wrong term.
     for &tag in &[
-        112u8, // NEW_FUN_EXT
-        113,   // EXPORT_EXT
-        67,    // RECORD_EXT
-        121,   // LOCAL_EXT
-        68,    // DIST_HEADER
+        67u8, // RECORD_EXT
+        121,  // LOCAL_EXT
+        68,   // DIST_HEADER
     ] {
         assert_unsupported(&[VERSION_MAGIC, tag]);
     }
+
+    // `NEW_FUN_EXT` (112) and `EXPORT_EXT` (113) are implemented now, so a bare tag
+    // byte is a *truncation* — `BadArg` (the C also errors running off the end) —
+    // never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 112]); // NEW_FUN_EXT
+    assert_bad_arg(&[VERSION_MAGIC, 113]); // EXPORT_EXT
+}
+
+#[test]
+fn export_fun_decode_negative_cases_are_typed_errors() {
+    let m = small_atom("m");
+    let f = small_atom("f");
+
+    // Truncated right after the tag — the module atom is entirely absent.
+    assert_bad_arg(&[VERSION_MAGIC, EXPORT_EXT]);
+
+    // The module is not an atom (a small integer here).
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]);
+    assert_bad_arg(&img);
+
+    // The function is not an atom.
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&m);
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]);
+    assert_bad_arg(&img);
+
+    // The arity term is absent.
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&m);
+    img.extend_from_slice(&f);
+    assert_bad_arg(&img);
+
+    // The arity is not a small: an atom, an (empty) tuple or a bignum.
+    for bad in [
+        small_atom("a"),
+        vec![SMALL_TUPLE_EXT, 0],
+        vec![SMALL_BIG_EXT, 9, 0, 0, 0, 0, 0, 0, 0, 0, 1], // 2^64 ⇒ a bignum
+    ] {
+        let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+        img.extend_from_slice(&m);
+        img.extend_from_slice(&f);
+        img.extend_from_slice(&bad);
+        assert_bad_arg(&img);
+    }
+
+    // A negative arity ⇒ `BadArg` (the C requires `>= 0`).
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&m);
+    img.extend_from_slice(&f);
+    img.extend_from_slice(&[INTEGER_EXT, 0xFF, 0xFF, 0xFF, 0xFF]); // -1
+    assert_bad_arg(&img);
+
+    // An arity past the header's 8-bit field ⇒ `SystemLimit`.
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&m);
+    img.extend_from_slice(&f);
+    img.extend_from_slice(&[INTEGER_EXT, 0, 0, 1, 0]); // 256
+    assert_system_limit(&img);
+
+    // Trailing garbage after a complete `EXPORT_EXT` fun ⇒ `BadArg`.
+    let mut img = vec![VERSION_MAGIC, EXPORT_EXT];
+    img.extend_from_slice(&m);
+    img.extend_from_slice(&f);
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 1]);
+    img.push(0);
+    assert_bad_arg(&img);
+}
+
+/// The fixed `NEW_FUN_EXT` header through the `num_free` field:
+/// `[tag][size:4][arity:1][uniq:16][index:4][num_free:4]`. The `size` field is a
+/// placeholder — the decoder reads and ignores it (`external.c:5115`).
+fn new_fun_header(arity: u8, num_free: u32) -> Vec<u8> {
+    let mut v = vec![VERSION_MAGIC, NEW_FUN_EXT];
+    v.extend_from_slice(&0u32.to_be_bytes());
+    v.push(arity);
+    v.extend_from_slice(&UNIQ);
+    v.extend_from_slice(&0u32.to_be_bytes()); // index
+    v.extend_from_slice(&num_free.to_be_bytes());
+    v
+}
+
+/// A complete, valid `NEW_FUN_EXT` whose environment is `env` (each a small value).
+fn new_fun_image(arity: u8, env: &[u8]) -> Vec<u8> {
+    let mut v = new_fun_header(arity, env.len() as u32);
+    v.extend_from_slice(&small_atom("ftest")); // module
+    v.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_index
+    v.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_uniq
+    v.extend_from_slice(&creator_pid_image());
+    for &e in env {
+        v.extend_from_slice(&[SMALL_INTEGER_EXT, e]);
+    }
+    v
+}
+
+#[test]
+fn new_fun_truncation_at_every_field_boundary_is_bad_arg() {
+    // A valid hand-built image: truncating it at *any* offset — the tag, the 4-byte
+    // size, the arity, mid-`uniq`, the index, `num_free`, mid-module, the creator pid
+    // or the environment — must be `BadArg`, never a panic.
+    let image = new_fun_image(1, &[1, 2, 3]);
+    for len in 0..image.len() {
+        assert_bad_arg(&image[..len]);
+    }
+    // The oracle image truncates the same way.
+    for len in 0..ORACLE_NEW_FUN.len() {
+        assert_bad_arg(&ORACLE_NEW_FUN[..len]);
+    }
+}
+
+#[test]
+fn new_fun_field_violations_are_typed_errors() {
+    // `num_free` past the 8-bit header field ⇒ `BadArg` (never a corrupt header). The
+    // decoder rejects it before reading the module atom, so the header alone suffices.
+    assert_bad_arg(&new_fun_header(0, 256));
+
+    // The module must be an atom.
+    let mut img = new_fun_header(0, 0);
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]);
+    assert_bad_arg(&img);
+
+    // `old_index` must be a small: an atom, an (empty) tuple or a bignum.
+    for bad in [
+        small_atom("a"),
+        vec![SMALL_TUPLE_EXT, 0],
+        vec![SMALL_BIG_EXT, 9, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    ] {
+        let mut img = new_fun_header(0, 0);
+        img.extend_from_slice(&small_atom("m"));
+        img.extend_from_slice(&bad);
+        assert_bad_arg(&img);
+    }
+
+    // `old_uniq` must be a small too.
+    for bad in [
+        small_atom("a"),
+        vec![SMALL_TUPLE_EXT, 0],
+        vec![SMALL_BIG_EXT, 9, 0, 0, 0, 0, 0, 0, 0, 0, 1],
+    ] {
+        let mut img = new_fun_header(0, 0);
+        img.extend_from_slice(&small_atom("m"));
+        img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_index
+        img.extend_from_slice(&bad); // old_uniq
+        assert_bad_arg(&img);
+    }
+
+    // The creator term must be a pid: a reference, a port, an atom, a tuple and the
+    // unsupported `LOCAL_EXT` tag are all rejected (the C accepts only `is_pid`).
+    for bad in [
+        vec![NEWER_REFERENCE_EXT], // 90
+        vec![NEW_PORT_EXT],        // 89
+        vec![V4_PORT_EXT],         // 120
+        vec![121],                 // LOCAL_EXT
+        small_atom("a"),
+        vec![SMALL_TUPLE_EXT, 0],
+    ] {
+        let mut img = new_fun_header(0, 0);
+        img.extend_from_slice(&small_atom("m"));
+        img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_index
+        img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_uniq
+        img.extend_from_slice(&bad); // creator
+        assert_bad_arg(&img);
+    }
+
+    // Fewer environment terms than `num_free` ⇒ `BadArg` (a truncated env).
+    let mut img = new_fun_header(0, 2);
+    img.extend_from_slice(&small_atom("m"));
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_index
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 0]); // old_uniq
+    img.extend_from_slice(&creator_pid_image());
+    img.extend_from_slice(&[SMALL_INTEGER_EXT, 7]); // env[0] only — env[1] is missing
+    assert_bad_arg(&img);
+
+    // Trailing garbage after a complete fun ⇒ `BadArg` (`finish` rejects it).
+    let mut img = new_fun_image(0, &[]);
+    img.push(0);
+    assert_bad_arg(&img);
+}
+
+#[test]
+fn obsolete_fun_and_cache_tags_are_bad_arg() {
+    // `FUN_EXT` (117) was removed in OTP 23 and `NEW_CACHE` (78) is dead (`#if 0`);
+    // the C rejects both outright — with or without a payload — and they are never
+    // `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 117]);
+    assert_bad_arg(&[VERSION_MAGIC, 117, 0, 0, 0, 0]);
+    assert_bad_arg(&[VERSION_MAGIC, 78]);
+    assert_bad_arg(&[VERSION_MAGIC, 78, 0, 0]);
+}
+
+#[test]
+fn encoding_a_local_fun_is_unsupported_local_fun() {
+    // A local (`make_fun3`) closure has no faithful `NEW_FUN_EXT` image (no module, no
+    // 16-byte `uniq`, no creator pid). The codec's test-only `make_fun_local` builder
+    // is not visible from an integration test, so build the identical 3-word block
+    // `[header, uniq, index]` from the public `beam_term` API: the header from
+    // `make_fun_header` plus `make_boxed` over the two descriptor words. The `Vec`
+    // owns the words and stays alive for the whole test.
+    let words = vec![
+        make_fun_header(1, 0, FunKind::Local).unwrap(),
+        Eterm::from_raw(0x42), // uniq
+        Eterm::from_raw(5),    // index
+    ];
+    let local = make_boxed(words.as_ptr());
+
+    let atoms = AtomTable::new();
+    let err = encode_term(local, &atoms).expect_err("a local fun has no wire image");
+    assert!(
+        is_unsupported_local_fun(&err),
+        "expected unsupported_local_fun, got {err:?}"
+    );
+    // It is reported through its own reason atom, distinct from the general
+    // "recognized tag not implemented" signal.
+    assert!(
+        !is_unsupported(&err),
+        "a local fun is not the generic unsupported tag"
+    );
+    assert_eq!(beam_codec::LOCAL_FUN_REASON, "unsupported_local_fun");
+
+    // Reaching a local fun nested in another term fails the same way.
+    let mut h = heap(64);
+    let t = h.tuple(&[local]).unwrap();
+    let err = encode_term(t, &atoms).expect_err("a nested local fun has no wire image");
+    assert!(is_unsupported_local_fun(&err), "got {err:?}");
 }
 
 #[test]

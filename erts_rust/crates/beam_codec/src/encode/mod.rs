@@ -3,9 +3,12 @@
 //! One encoder serves both `term_to_binary` bytes (with the leading
 //! [`VERSION_MAGIC`](crate::VERSION_MAGIC)) and distribution payload/ETS bodies
 //! (without it) — the constructor decides which. Term inspection goes through
-//! [`crate::term`]; this module owns only the *bytes*.
+//! [`crate::term`]; this module owns only the *bytes*. The fun/export encoders
+//! live in the child [`fun`] module, as a second `impl` block on [`Encoder`].
 //!
-//! This module is safe Rust.
+//! This module is safe Rust, like its child [`fun`].
+
+mod fun;
 
 use beam_common::Result;
 use beam_term::prelude::{atom_val, is_atom, is_list, is_nil, is_small, signed_value};
@@ -20,7 +23,8 @@ use crate::tag::{
 };
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
-    external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, tuple_arity,
+    tuple_element,
 };
 use crate::writer::Writer;
 
@@ -90,8 +94,10 @@ impl<'a> Encoder<'a> {
     /// Encodes `term`, appending it to the output.
     ///
     /// A tag the M1 term layer does not support yields
-    /// [`crate::error::unsupported`]; a value beyond a wire bound yields
-    /// `BeamError::SystemLimit`. The encoder never silently mis-encodes.
+    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun — which has no
+    /// faithful wire image — yields [`crate::error::unsupported_local_fun`]; a value
+    /// beyond a wire bound yields `BeamError::SystemLimit`. The encoder never
+    /// silently mis-encodes.
     pub fn encode(&mut self, term: Eterm) -> Result<()> {
         // Classification order is deliberate (see the crate `CONTEXT.md`,
         // "`src/encode.rs`"): immediates first, then each boxed family through its
@@ -108,6 +114,11 @@ impl<'a> Encoder<'a> {
         }
         if is_list(term) {
             return self.encode_list(term);
+        }
+        // Funs come before the boxed-family probes: a fun header carries a distinct
+        // subtag, so the classification cannot overlap any other family.
+        if let Ok(kind) = fun_kind_term(term) {
+            return self.encode_fun(term, kind);
         }
         if let Ok((negative, digits)) = big_parts(term) {
             return self.encode_bignum(negative, digits);
@@ -136,7 +147,7 @@ impl<'a> Encoder<'a> {
             return self.encode_bitstring(bytes, offset_bits, size_bits);
         }
         // Anything else is not representable by the M1 term layer (in practice an
-        // off-heap `BinRef`/`Fun`/`Record` block, which the Stage-0 foundations cannot
+        // off-heap `BinRef`/`Record` block, which the Stage-0 foundations cannot
         // build): report it explicitly rather than emit a wrong encoding. Tests never
         // reach this path.
         Err(error::unsupported(Tag::Binary))
@@ -611,8 +622,9 @@ mod tests {
     };
 
     /// A heap large enough for every term a test builds (tests pass a bigger one
-    /// when they need it).
-    fn new_heap(words: usize) -> Heap {
+    /// when they need it). Shared with the [`fun`](crate::encode::fun) submodule's
+    /// tests.
+    pub(crate) fn new_heap(words: usize) -> Heap {
         Heap::new(words).expect("the carrier allocator never fails for a test heap")
     }
 
@@ -623,7 +635,7 @@ mod tests {
         }
     }
 
-    fn assert_system_limit<T: core::fmt::Debug>(result: Result<T>) {
+    pub(crate) fn assert_system_limit<T: core::fmt::Debug>(result: Result<T>) {
         match result {
             Err(BeamError::SystemLimit) => {}
             other => panic!("expected SystemLimit, got {other:?}"),
@@ -1052,4 +1064,5 @@ mod tests {
         expected.extend_from_slice(&[116, 0, 0, 0, 1, 119, 1, 97, 97, 7]); // #{a => 7}
         assert_eq!(encode_term_body(tuple, &atoms).unwrap(), expected);
     }
+
 }

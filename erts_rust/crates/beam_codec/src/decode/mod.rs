@@ -7,7 +7,10 @@
 //! payloads and ETS blobs.
 //!
 //! This module is safe Rust; the raw heap writes it needs live in
-//! [`crate::term`].
+//! [`crate::term`]. The fun/export tag arms' helpers live in the child [`fun`]
+//! module, as a second `impl` block on [`Decoder`].
+
+mod fun;
 
 use core::mem::size_of;
 use core::str;
@@ -78,8 +81,11 @@ impl<'a> Decoder<'a> {
     /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
     /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
     /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
-    /// ([`Tag::NewFun`], [`Tag::Export`], [`Tag::Record`], [`Tag::Local`],
-    /// [`Tag::DistHeader`]) yields [`crate::error::unsupported`].
+    /// ([`Tag::Record`], [`Tag::Local`], [`Tag::DistHeader`]) yields
+    /// [`crate::error::unsupported`]. Funs decode for real: [`Tag::Export`] becomes
+    /// a [`FunKind::External`](crate::FunKind) fun and [`Tag::NewFun`] a
+    /// [`FunKind::Imported`](crate::FunKind) one (see [`Decoder::decode_export`] and
+    /// [`Decoder::decode_new_fun`]).
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
@@ -303,11 +309,18 @@ impl<'a> Decoder<'a> {
             Tag::NewCache => Err(bad_arg()),
 
             // ---------------------------------------------------------------
+            // Funs / exports
+            // ---------------------------------------------------------------
+            // `EXPORT_EXT` (`113`) and `NEW_FUN_EXT` (`112`) become the two
+            // corresponding fun kinds; both are handled *here*, inside the shared
+            // walker, so a fun nested in a tuple/list/map decodes like any other
+            // sub-term (a `.beam` `LitT` literal is exactly that).
+            Tag::Export => self.decode_export(heap, atoms),
+            Tag::NewFun => self.decode_new_fun(heap, atoms),
+
+            // ---------------------------------------------------------------
             // Deliberately unsupported in M1 — never a wrong term
             // ---------------------------------------------------------------
-            // `NEW_FUN_EXT`/`EXPORT_EXT`: blocked on a fun/export registry that does
-            // not exist yet (owned by `beam_loader`/`beam_rt`).
-            Tag::NewFun | Tag::Export => Err(unsupported(tag)),
             // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
             // records encode as tuples).
             Tag::Record => Err(unsupported(tag)),
@@ -568,7 +581,7 @@ mod tests {
 
     /// Decodes a full image, returning the heap and atom table the term points
     /// into (the term borrows their storage, so all three are returned).
-    fn decode(bytes: &[u8]) -> (Heap, AtomTable, Eterm) {
+    pub(crate) fn decode(bytes: &[u8]) -> (Heap, AtomTable, Eterm) {
         let mut heap = Heap::new(256).expect("tiny heap allocation");
         let mut atoms = AtomTable::new();
         let term = decode_term(bytes, &mut heap, &mut atoms).expect("valid image decodes");
@@ -582,14 +595,14 @@ mod tests {
         decode_term(bytes, &mut heap, &mut atoms).expect_err("input must be rejected")
     }
 
-    fn assert_bad_arg(bytes: &[u8]) {
+    pub(crate) fn assert_bad_arg(bytes: &[u8]) {
         match decode_err(bytes) {
             BeamError::BadArg => {}
             other => panic!("expected BadArg, got {other:?}"),
         }
     }
 
-    fn assert_system_limit(bytes: &[u8]) {
+    pub(crate) fn assert_system_limit(bytes: &[u8]) {
         match decode_err(bytes) {
             BeamError::SystemLimit => {}
             other => panic!("expected SystemLimit, got {other:?}"),
@@ -1111,15 +1124,15 @@ mod tests {
         assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
 
         // Every recognized-but-not-yet-implemented tag is reported, not guessed.
-        for tag in [
-            Tag::NewFun,
-            Tag::Export,
-            Tag::Record,
-            Tag::Local,
-            Tag::DistHeader,
-        ] {
+        for tag in [Tag::Record, Tag::Local, Tag::DistHeader] {
             assert_unsupported(&[131, tag.as_byte()]);
         }
+
+        // `NEW_FUN_EXT`/`EXPORT_EXT` are implemented now, so a bare tag byte is a
+        // *truncation* (the C would also run off the end and error), never
+        // `unsupported`.
+        assert_bad_arg(&[131, Tag::NewFun.as_byte()]);
+        assert_bad_arg(&[131, Tag::Export.as_byte()]);
 
         // `COMPRESSED` is *covered* now, but only as the top-level wrapper: as a bare
         // tag (a 2-byte image, below the 6-byte minimum) it is malformed, and nested

@@ -350,15 +350,18 @@ impl Tag {
     ///
     /// `true` for the required core set (integers, floats, all four atom tags,
     /// references, ports — including the modern `V4_PORT_EXT` — pids, tuples, `NIL`,
-    /// strings, lists, binaries/bitstrings, maps of any pair count, the distribution
-    /// atom-cache reference, and `COMPRESSED` as a top-level wrapper); `false` for
-    /// everything the codec deliberately reports as [`crate::error::unsupported`]
-    /// (funs, records, `LOCAL_EXT` and the distribution header) **or** rejects as
-    /// malformed ([`Tag::Fun`], [`Tag::NewCache`]).
+    /// strings, lists, binaries/bitstrings, maps of any pair count, funs/export
+    /// literals, the distribution atom-cache reference, and `COMPRESSED` as a
+    /// top-level wrapper); `false` for everything the codec deliberately reports as
+    /// [`crate::error::unsupported`] (records, `LOCAL_EXT` and the distribution
+    /// header) **or** rejects as malformed ([`Tag::Fun`], [`Tag::NewCache`]).
     ///
     /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
     /// but only as the outermost wrapper, immediately after the version byte
     /// (`crate::decode::decode_term`); nested it is malformed input.
+    ///
+    /// `NEW_FUN_EXT`/`EXPORT_EXT` are covered: they decode to fun terms and encode
+    /// back byte-exactly (see `crate::decode`/`crate::encode`).
     pub fn covered(self) -> bool {
         matches!(
             self,
@@ -388,6 +391,8 @@ impl Tag {
                 | Tag::Binary
                 | Tag::BitBinary
                 | Tag::Map
+                | Tag::NewFun
+                | Tag::Export
                 | Tag::AtomCacheRef
                 | Tag::Compressed
         )
@@ -429,8 +434,8 @@ mod tests {
         (Tag::SmallAtomUtf8, 119, "SMALL_ATOM_UTF8_EXT", true),
         (Tag::Compressed, 80, "COMPRESSED", true),
         (Tag::BitBinary, 77, "BIT_BINARY_EXT", true),
-        (Tag::NewFun, 112, "NEW_FUN_EXT", false),
-        (Tag::Export, 113, "EXPORT_EXT", false),
+        (Tag::NewFun, 112, "NEW_FUN_EXT", true),
+        (Tag::Export, 113, "EXPORT_EXT", true),
         (Tag::Fun, 117, "FUN_EXT", false),
         (Tag::V4Port, 120, "V4_PORT_EXT", true),
         (Tag::Local, 121, "LOCAL_EXT", false),

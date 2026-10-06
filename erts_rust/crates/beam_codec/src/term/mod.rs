@@ -1,11 +1,13 @@
-//! Thin forwarding layer over [`beam_term::thing`], [`beam_term::tuple`] and
-//! [`beam_term::list`], plus the local **bitstring word-layout shim**
-//! ([`binary`]).
+//! Thin forwarding layer over [`beam_term::thing`], [`beam_term::fun`],
+//! [`beam_term::tuple`] and [`beam_term::list`], split into the local **bitstring
+//! word-layout shim** ([`binary`]) and the **fun / export forwarding layer**
+//! ([`fun`]).
 //!
-//! The frozen interior layout of a float, a bignum, a flat map and the external
-//! pid/port/ref blocks is owned by [`beam_term`] (the lowest common ancestor for
-//! term operations — workspace `CONTEXT.md` §2, "No duplication across crates").
-//! Every constructor and accessor here therefore only:
+//! The frozen interior layout of a float, a bignum, a flat map, the external
+//! pid/port/ref blocks **and every kind of fun/export** is owned by [`beam_term`]
+//! (the lowest common ancestor for term operations — workspace `CONTEXT.md` §2,
+//! "No duplication across crates"). Every constructor and accessor here therefore
+//! only:
 //!
 //! 1. checks the documented bounds/type/validity preconditions, mapping a failure
 //!    to a [`beam_common::BeamError`], and
@@ -26,8 +28,8 @@
 //! a caller invariant and there is no safe way to read or write a heap word, so the
 //! crate-wide `#![deny(unsafe_code)]` is lifted for this module subtree alone
 //! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`, which
-//! covers [`binary`] too). The crate's entire `unsafe` surface is this single
-//! auditable subtree: the `beam_alloc` allocation calls, the `beam_term`
+//! covers [`binary`] and [`fun`] too). The crate's entire `unsafe` surface is this
+//! single auditable subtree: the `beam_alloc` allocation calls, the `beam_term`
 //! forwarders, the bitstring shim and the minimal type/validity guards — each
 //! carrying a `// SAFETY:` rationale.
 //!
@@ -35,11 +37,23 @@
 //! never panics and never exhibits undefined behaviour on a mismatched term.
 
 mod binary;
+mod fun;
 
 pub use binary::{
     bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
     make_bitstring, BITSTRING_POINTER_FLAG_MASK,
 };
+/// The whole fun / export forwarding layer ([`fun`]): the boxed fun-term
+/// constructors, the term-level accessors and the frozen layout surface
+/// (`fun_kind_of_header`/`fun_words` plus [`FunKind`], [`FunPid`], `FUN_MAX_FIELD`
+/// and `MAX_ARG`) re-exported verbatim from the layout owner (`beam_term::fun`).
+pub use fun::{
+    fun_arity_term, fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_of_header,
+    fun_kind_term, fun_module, fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes,
+    fun_words, make_fun_external, make_fun_imported, FunKind, FunPid, FUN_MAX_FIELD, MAX_ARG,
+};
+#[cfg(test)]
+pub use fun::make_fun_local;
 
 use core::mem::size_of;
 
@@ -486,22 +500,23 @@ mod tests {
     use beam_alloc::Heap;
     use beam_common::{BeamError, Result};
     use beam_term::prelude::{
-        is_bignum_header, is_external_pid_header, is_external_port_header,
-        is_external_ref_header, is_flatmap_header, is_map_header, make_arityval, make_header,
-        make_small, make_tuple, tuple0, BIG_SIGN_BIT, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG,
-        EXTERNAL_REF_SUBTAG, HEADER_FLONUM, MAP_SUBTAG, NEG_BIG_SUBTAG, NIL, POS_BIG_SUBTAG,
+        is_bignum_header, is_external_pid_header, is_external_port_header, is_external_ref_header,
+        is_flatmap_header, is_map_header, make_arityval, make_header, make_small, make_tuple,
+        tuple0, BIG_SIGN_BIT, EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG, EXTERNAL_REF_SUBTAG,
+        HEADER_FLONUM, MAP_SUBTAG, NEG_BIG_SUBTAG, NIL, POS_BIG_SUBTAG,
     };
 
     use super::*;
 
-    /// A heap large enough for every block built in this module.
-    fn new_heap() -> Heap {
+    /// A heap large enough for every block built in this module (shared with the
+    /// [`fun`](crate::term::fun) submodule's tests).
+    pub(crate) fn new_heap() -> Heap {
         Heap::new(256).expect("the carrier allocator never fails for a tiny heap")
     }
 
     /// Asserts a codec call failed with `BeamError::BadArg` (`BeamError` is not
     /// `PartialEq`, so `matches!` is used).
-    fn assert_bad_arg<T: core::fmt::Debug>(result: Result<T>) {
+    pub(crate) fn assert_bad_arg<T: core::fmt::Debug>(result: Result<T>) {
         match result {
             Err(BeamError::BadArg) => {}
             other => panic!("expected BadArg, got {other:?}"),
@@ -509,7 +524,7 @@ mod tests {
     }
 
     /// Asserts a codec call failed with `BeamError::SystemLimit`.
-    fn assert_system_limit<T: core::fmt::Debug>(result: Result<T>) {
+    pub(crate) fn assert_system_limit<T: core::fmt::Debug>(result: Result<T>) {
         match result {
             Err(BeamError::SystemLimit) => {}
             other => panic!("expected SystemLimit, got {other:?}"),

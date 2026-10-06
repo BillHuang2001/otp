@@ -36,10 +36,29 @@
 //!
 //! Big ints (incl. `1 bsl 200`), a multi-byte UTF-8 atom, floats (`3.14`, `-0.0`,
 //! `1.0e300`), binaries (short and >64 bytes), non-byte-aligned bitstrings, flat maps
-//! of 1/2/40 pairs, lists/strings/tuples/`[]`, a reference, a pid, and a large
-//! compressed term. **Excluded:** funs, exports, records and the distribution header —
-//! the codec returns a typed `unsupported` `BeamError` for those (never a wrong term),
-//! so they cannot be part of a round-trip corpus.
+//! of 1/2/40 pairs, lists/strings/tuples/`[]`, a reference, a pid, the fun/export tags,
+//! and a large compressed term.
+//!
+//! The fun family is covered by both of its wire tags:
+//!
+//! * `EXPORT_EXT` (`113`) — three exported funs of different arities/modules
+//!   (`fun lists:reverse/1`, `fun maps:remove/2`, `fun erlang:error/1`), plus
+//!   occurrences **nested** in containers (a fun inside a list inside a tuple, a fun as
+//!   a map value, a closure inside a list of tuples).
+//! * `NEW_FUN_EXT` (`112`) — real closures with a **non-empty environment**. Note that
+//!   the corpus is one `erl -eval` expression, so a `fun` literal in it is built by
+//!   `erl_eval`: the compiler cannot constant-fold the body away, and the capture is
+//!   `erl_eval`'s free-variable environment (a nested term tree of its own, itself good
+//!   nesting coverage). The harness asserts below that the corpus really produces
+//!   `112` images with `num_free > 0` — an export or zero-env fun is not evidence that
+//!   the environment path works.
+//! * a **real OTP literal pool** — `beam_lib:chunks(code:which(maps), [literals])`,
+//!   whose literal list is `[{0,…}, {1,…}, {2, fun maps:remove/2}]`: the exact `.beam`
+//!   shape (a fun nested inside a tuple inside a list) that motivated fun support.
+//!
+//! **Excluded:** records and the distribution header — the codec returns a typed
+//! `unsupported` `BeamError` for those (never a wrong term), so they cannot be part of a
+//! round-trip corpus.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -49,12 +68,15 @@ use beam_common::BeamError;
 
 use beam_codec::term::{
     big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
-    external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_arity_term,
+    fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,
+    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, make_fun_external,
+    make_fun_imported, tuple_arity, tuple_element, FunKind, FunPid,
 };
-use beam_codec::{decode_term, encode_term, FLOAT_EXT, VERSION_MAGIC};
+use beam_codec::{decode_term, encode_term, EXPORT_EXT, FLOAT_EXT, NEW_FUN_EXT, VERSION_MAGIC};
 
 use beam_term::prelude::{
-    atom_val, is_atom, is_list, is_nil, is_small, signed_value, AtomTable, Eterm,
+    atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, AtomTable, Eterm,
 };
 
 // ---------------------------------------------------------------------------
@@ -188,6 +210,89 @@ fn terms_equal(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool {
 
     // Boxed: probe the type-specific accessors in turn (each returns `Err` for a term
     // of the wrong kind, so the guards are exhaustive).
+
+    // Funs come first in the boxed-family chain: a fun header carries a distinct
+    // subtag, so this probe cannot be confused with any of the probes below. Funs are
+    // **not** byte-canonical across the two encoders (`NEW_FUN_EXT`'s `size` field is
+    // written differently by the C and is ignored on both sides), so they are compared
+    // field by field — and the environment element-wise, recursively.
+    let kind_a = fun_kind_term(a);
+    let kind_b = fun_kind_term(b);
+    if kind_a.is_ok() || kind_b.is_ok() {
+        let (Ok(kind_a), Ok(kind_b)) = (kind_a, kind_b) else {
+            // Exactly one side is a fun: a genuine inequality, not a harness bug.
+            return false;
+        };
+        if kind_a != kind_b
+            || fun_arity_term(a).expect("a fun's arity")
+                != fun_arity_term(b).expect("a fun's arity")
+        {
+            return false;
+        }
+        let module_eq = |x: Eterm, y: Eterm| {
+            atoms.name(fun_module(x).expect("the module of a fun"))
+                == atoms.name(fun_module(y).expect("the module of a fun"))
+        };
+        match kind_a {
+            // `EXPORT_EXT`: module + function (+ the arity compared above) is the
+            // whole identity of the fun.
+            FunKind::External => {
+                return module_eq(a, b)
+                    && atoms.name(fun_function(a).expect("an external fun's function"))
+                        == atoms.name(fun_function(b).expect("an external fun's function"));
+            }
+            // `NEW_FUN_EXT`: the descriptor — module, 16-byte `uniq`, `index`,
+            // `old_index`, `old_uniq`, creator pid — **and** the environment, whose
+            // element `k` is the wire element `k` (stream order; never permuted here).
+            FunKind::Imported => {
+                let (pa, pb) = (
+                    fun_creator_pid(a).expect("an imported fun's creator pid"),
+                    fun_creator_pid(b).expect("an imported fun's creator pid"),
+                );
+                let creator_eq = atoms.name(pa.node) == atoms.name(pb.node)
+                    && pa.number == pb.number
+                    && pa.serial == pb.serial
+                    && pa.creation == pb.creation;
+                if !(module_eq(a, b)
+                    && fun_uniq_bytes(a).expect("an imported fun's uniq")
+                        == fun_uniq_bytes(b).expect("an imported fun's uniq")
+                    && fun_index(a).expect("an imported fun's index")
+                        == fun_index(b).expect("an imported fun's index")
+                    && fun_old_index(a).expect("an imported fun's old_index")
+                        == fun_old_index(b).expect("an imported fun's old_index")
+                    && fun_old_uniq(a).expect("an imported fun's old_uniq")
+                        == fun_old_uniq(b).expect("an imported fun's old_uniq")
+                    && creator_eq)
+                {
+                    return false;
+                }
+                let (ea, eb) = (
+                    fun_env(a).expect("an imported fun's env"),
+                    fun_env(b).expect("an imported fun's env"),
+                );
+                return ea.len() == eb.len()
+                    && ea.iter().zip(eb).all(|(x, y)| terms_equal(*x, *y, atoms));
+            }
+            // Unreachable from the wire: our decoder never materializes a local
+            // (`make_fun3`) fun and cannot encode one, so neither side can be one.
+            // Compared structurally anyway (index + environment) for totality.
+            FunKind::Local => {
+                return fun_index(a).expect("a local fun's index")
+                    == fun_index(b).expect("a local fun's index")
+                    && fun_num_free_term(a).expect("a local fun's num_free")
+                        == fun_num_free_term(b).expect("a local fun's num_free")
+                    && {
+                        let (ea, eb) = (
+                            fun_env(a).expect("a local fun's env"),
+                            fun_env(b).expect("a local fun's env"),
+                        );
+                        ea.len() == eb.len()
+                            && ea.iter().zip(eb).all(|(x, y)| terms_equal(*x, *y, atoms))
+                    };
+            }
+        }
+    }
+
     if let (Ok(x), Ok(y)) = (float_value(a), float_value(b)) {
         return x.to_bits() == y.to_bits();
     }
@@ -264,7 +369,20 @@ const CORPUS: &str = r#"[ term_to_binary(12345678901234567890123)
                        , term_to_binary([])
                        , term_to_binary(make_ref())
                        , term_to_binary(self())
+                       , term_to_binary(fun lists:reverse/1)
+                       , term_to_binary(fun maps:remove/2)
+                       , term_to_binary(fun erlang:error/1)
+                       , term_to_binary(begin Aa=1,Bb=2,Cc=3, fun() -> {Aa,Bb,Cc} end end)
+                       , term_to_binary(begin Xx=hd(lists:seq(7,7)), fun(Zz) -> Xx + Zz end end)
+                       , term_to_binary({fun lists:reverse/1, [1, 2, fun maps:remove/2]})
+                       , term_to_binary(#{f => fun lists:reverse/1, g => 2})
+                       , term_to_binary([{maps, fun maps:remove/2}, begin Yy=hd(lists:seq(9,9)), fun() -> [Yy] end end])
+                       , begin {ok,{_,[{literals,L}]}} = beam_lib:chunks(code:which(maps),[literals]), term_to_binary(L) end
                        , term_to_binary(lists:duplicate(500, hello), [compressed]) ]"#;
+
+/// How many entries [`CORPUS`] evaluates to — i.e. how many reference images the
+/// oracle must print in direction 1.
+const CORPUS_LEN: usize = 31;
 
 /// Parse the `[<<131,104,...>>,<<...>>]` list the oracle prints into byte vectors.
 fn parse_binary_list(out: &str) -> Vec<Vec<u8>> {
@@ -324,14 +442,25 @@ fn oracle_agrees_on_the_corpus_in_both_directions() {
     // ONE erl spawn: print the list of reference images.
     let get_images = ["io:format(\"~w~n\", [ ", CORPUS, " ])"].concat();
     let images = parse_binary_list(&run_erl(&oracle, &get_images));
-    assert!(
-        images.len() >= 21,
-        "the oracle printed too few images ({}): {images:?}",
+    assert_eq!(
+        images.len(),
+        CORPUS_LEN,
+        "the oracle printed {} images for a {CORPUS_LEN}-entry corpus: {images:?}",
         images.len()
     );
     assert!(
         images.iter().all(|i| i.first() == Some(&VERSION_MAGIC)),
         "every oracle image must start with the version byte {VERSION_MAGIC}: {images:?}"
+    );
+    // The fun coverage must be real, not incidental: the corpus carries top-level
+    // `EXPORT_EXT` and `NEW_FUN_EXT` images. (Nested funs — in tuples/lists/maps and
+    // in the literal pool — are covered by the structural walk below.)
+    let tagged = |tag: u8| images.iter().filter(|i| i.get(1) == Some(&tag)).count();
+    assert!(
+        tagged(EXPORT_EXT) >= 3 && tagged(NEW_FUN_EXT) >= 2,
+        "the corpus must carry real EXPORT_EXT ({EXPORT_EXT}) and NEW_FUN_EXT \
+         ({NEW_FUN_EXT}) images: {:?}",
+        images.iter().map(|i| i.get(1).copied()).collect::<Vec<_>>()
     );
     // Exactly one corpus entry is the compressed wrapper.
     assert_eq!(
@@ -345,12 +474,19 @@ fn oracle_agrees_on_the_corpus_in_both_directions() {
 
     let mut pairs: Vec<(Vec<u8>, Vec<u8>)> = Vec::new();
     let mut byte_identical = 0usize;
+    // How many images decode to a `NEW_FUN_EXT` fun with a *non-empty* environment.
+    let mut funs_with_env = 0usize;
     for (i, bi) in images.iter().enumerate() {
         // One AtomTable for both decodes so atom names resolve on both sides.
         let mut atoms = AtomTable::new();
         let mut h1 = heap();
         let term1 = decode_term(bi, &mut h1, &mut atoms)
             .unwrap_or_else(|e| panic!("corpus #{i}: our decoder rejected the oracle image {bi:?}: {e:?}"));
+        if matches!(fun_kind_term(term1), Ok(FunKind::Imported))
+            && fun_num_free_term(term1).expect("an imported fun's num_free") > 0
+        {
+            funs_with_env += 1;
+        }
         let bip = encode_term(term1, &atoms)
             .unwrap_or_else(|e| panic!("corpus #{i}: our encoder rejected the decoded term: {e:?}"));
         if &bip == bi {
@@ -368,10 +504,21 @@ fn oracle_agrees_on_the_corpus_in_both_directions() {
         );
         pairs.push((bi.clone(), bip));
     }
+    assert!(
+        funs_with_env >= 2,
+        "only {funs_with_env} corpus image(s) decoded to a NEW_FUN_EXT fun with a \
+         non-empty environment — an export or zero-env fun is not evidence that the \
+         env path round-trips"
+    );
     eprintln!(
         "[beam_codec interop] direction 1: {} images decoded, re-encoded and re-decoded \
-         ({byte_identical} of them byte-identical to the oracle image)",
-        pairs.len()
+         ({} of them byte-identical to the oracle image; \
+         {} EXPORT_EXT / {} NEW_FUN_EXT top-level images, {} with a non-empty env)",
+        pairs.len(),
+        byte_identical,
+        tagged(EXPORT_EXT),
+        tagged(NEW_FUN_EXT),
+        funs_with_env,
     );
 
     // --- Direction 2: us → oracle ------------------------------------------------
@@ -436,6 +583,75 @@ fn parse_bool_list(out: &str) -> Vec<bool> {
 // ---------------------------------------------------------------------------
 // Oracle-independent checks
 // ---------------------------------------------------------------------------
+
+/// [`terms_equal`]'s fun branch must really discriminate: two funs equal in every
+/// identity field are equal, any differing field (kind, module/function, arity, the
+/// `NEW_FUN_EXT` descriptor, or the environment *by slot*) is not, and a fun is never
+/// equal to a non-fun. The corpus above only ever compares *equal* funs, so this pins
+/// the comparator itself. Oracle-independent: the funs are built with this crate's own
+/// writers, so the run never depends on a system `erl`.
+#[test]
+fn terms_equal_discriminates_funs() {
+    let mut atoms = AtomTable::new();
+    let node = atoms.intern("nonode@nohost");
+    let (lists, reverse, maps, remove, erlang, error) = (
+        atoms.intern("lists"),
+        atoms.intern("reverse"),
+        atoms.intern("maps"),
+        atoms.intern("remove"),
+        atoms.intern("erlang"),
+        atoms.intern("error"),
+    );
+
+    let mut build = heap();
+    let rev1 = make_fun_external(&mut build, 1, lists, reverse).expect("an export fun");
+    let rev2 = make_fun_external(&mut build, 1, lists, reverse).expect("an export fun");
+    let remove2 = make_fun_external(&mut build, 2, maps, remove).expect("an export fun");
+    // Same arity as `rev1`, but a different module *and* function.
+    let err1 = make_fun_external(&mut build, 1, erlang, error).expect("an export fun");
+
+    // The same MFA materialized twice is equal (two distinct heap blocks); a differing
+    // arity, module or function is not.
+    assert!(terms_equal(rev1, rev2, &atoms));
+    assert!(!terms_equal(rev1, remove2, &atoms));
+    assert!(!terms_equal(rev1, err1, &atoms));
+
+    // A fun is never equal to a non-fun, from either side.
+    let small = make_small(1);
+    assert!(!terms_equal(rev1, small, &atoms));
+    assert!(!terms_equal(small, rev1, &atoms));
+
+    // `NEW_FUN_EXT`: identical descriptors, so the *only* difference is the environment
+    // — compared element-wise, in wire order, never as an unordered set.
+    let uniq = [7u8; 16];
+    let creator = FunPid {
+        node,
+        number: 0,
+        serial: 0,
+        creation: 0,
+    };
+    let imported = |build: &mut Heap, env: &[Eterm]| {
+        make_fun_imported(build, 1, lists, &uniq, 3, 4, 5, creator, env).expect("an imported fun")
+    };
+    let env12 = [make_small(1), make_small(2)];
+    let env12b = [make_small(1), make_small(2)];
+    let env21 = [make_small(2), make_small(1)];
+    let env13 = [make_small(1), make_small(3)];
+    let env1 = [make_small(1)];
+    let f12 = imported(&mut build, &env12);
+    let f12b = imported(&mut build, &env12b);
+    let f21 = imported(&mut build, &env21);
+    let f13 = imported(&mut build, &env13);
+    let f1 = imported(&mut build, &env1);
+    assert!(terms_equal(f12, f12b, &atoms));
+    assert!(!terms_equal(f12, f21, &atoms));
+    assert!(!terms_equal(f12, f13, &atoms));
+    assert!(!terms_equal(f12, f1, &atoms));
+
+    // Different kind, same module/function/arity: still unequal.
+    assert!(!terms_equal(f12, rev1, &atoms));
+    assert!(!terms_equal(rev1, f12, &atoms));
+}
 
 /// A `FLOAT_EXT` (`99`) is the legacy `%.20e`, NUL-terminated, 31-byte form; modern
 /// `term_to_binary/1` never emits it, so it is pinned here by hand and decoded only.
