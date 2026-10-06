@@ -91,6 +91,9 @@ assume a different layout.**
 - Sub-type predicates: `is_map`/`is_map_header`/`is_flatmap`/`is_hashmap`, `is_float`, `is_big`,
   `is_internal_ref`, `is_any_fun`, `is_record`, `is_bitstring`/`is_binary`,
   `is_external_pid`/`is_external_port`/`is_external_ref`.
+- `unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32]` — the internal reference's `num[]`
+  (`erl_term.h` `internal_ref_numbers`); consumed by `make_hash`/`make_hash2`. Caller invariant: `t`
+  is a live internal ref.
 - Map header field accessors: `MAP_HEADER_TYPE/ARITY/VAL(Hdr)` (per `erl_term.h`).
 
 ### `tuple.rs` — tuples
