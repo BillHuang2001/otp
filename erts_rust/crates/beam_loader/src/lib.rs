@@ -30,9 +30,9 @@
 //! Erlang code (typed [`instr::Instr`] variants, see [`instr`]); obsolete `genop.tab`
 //! entries and the OTP-29 native-record family round-trip losslessly as
 //! [`instr::Instr::Generic`]. The remaining intentional Milestone-1 gaps
-//! (preloaded/positional atoms, compressed `LitT`) are listed under "Known Issues" in
-//! the crate `CONTEXT.md`, which is the authoritative description of this crate's
-//! behaviour and frozen public API.
+//! (preloaded/positional atoms) are listed under "Known Issues" in the crate
+//! `CONTEXT.md`, which is the authoritative description of this crate's behaviour and
+//! frozen public API.
 //!
 //! The container cursor is `beam_codec::Reader` (the ETF codec's bounds-checked
 //! big-endian reader) — there is no second cursor and no `unsafe` in this crate.

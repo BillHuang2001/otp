@@ -524,10 +524,16 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
         }
         Opcode::bs_init_writable => Ok(Instr::BsInitWritable),
         // `bs_create_bin Fail Alloc Live Unit Dst {Segments}` — the segments stay a
-        // flat operand list (type/size/unit/flags/value per segment).
+        // flat operand list (type/size/unit/flags/value per segment). Like the frame
+        // instructions, `Alloc` is written *either* as a bare word count *or* as a
+        // `z,3` allocation list (the compiler hoists a block's allocation into the
+        // `bs_create_bin` it precedes, `beam_ssa_codegen.erl`), so it is decoded
+        // through `HeapNeed`. The IR keeps the word total, exactly what the real
+        // loader produces: it marshals an allocation list to the sum of its heap
+        // words (`marshal_allocation_list`, `beam_file.c:2234-2284`).
         Opcode::bs_create_bin => Ok(Instr::BsCreateBin {
             fail: as_label(operand(ops, 0)?)?,
-            alloc: as_u32(operand(ops, 1)?)?,
+            alloc: HeapNeed::from_operand(operand(ops, 1)?)?.words(),
             live: as_u32(operand(ops, 2)?)?,
             unit: as_u32(operand(ops, 3)?)?,
             dst: op(ops, 4)?,

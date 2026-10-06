@@ -51,7 +51,9 @@ pub fn parse(data: &[u8], module_name: &str) -> Result<LineTable> {
     let mut current_name: u32 = 0;
     // `items.len() - 1` is the number of `TAG_i` entries emitted so far.
     while items.len() as u32 <= item_count {
-        let (tag, magnitude, _) = crate::decode::read_tagged(&mut reader)?;
+        let item = crate::decode::read_tagged(&mut reader)?;
+        let tag = item.tag;
+        let magnitude = item.word_or_system_limit()?;
         match tag {
             TAG_A => {
                 // The name table is off by one (index 0 is the module name), so the

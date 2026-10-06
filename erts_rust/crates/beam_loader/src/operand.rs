@@ -87,6 +87,31 @@ pub enum Operand {
         /// The `Type` chunk index annotating the register.
         ty: TypeIndex,
     },
+    /// A wide signed-integer operand (the `i` tag) whose value does not fit a BEAM
+    /// small integer.
+    ///
+    /// The C reader (`beamreader_read_tagged`, `beam_file.c:209-236`) inlines an `i`
+    /// value only while the sign-extended magnitude still satisfies `IS_SSMALL`;
+    /// otherwise the value is kept as its raw big-endian field, and
+    /// `marshal_integer` (`beam_file.c:2134-2232`) turns it into a bignum **static
+    /// literal** (`beamfile_add_literal`) that the instruction references by index.
+    ///
+    /// This variant is the loader's *decode-time* form of that field: [`crate::lower`]
+    /// performs the same conversion, appending the bignum term to the module's
+    /// literal area and rewriting the operand to [`Operand::Literal`]`(idx)`. A
+    /// loaded [`Module`](crate::ir::Module) therefore never carries this variant —
+    /// the engine resolves the synthesized literal through
+    /// [`Module::literal`](crate::ir::Module::literal) like any other literal, so no
+    /// engine change is needed.
+    BigInteger {
+        /// Whether the packed field is negative (the top bit of its most significant
+        /// byte, `beam_file.c:2174`).
+        negative: bool,
+        /// The **big-endian** magnitude, normalized exactly like the C (at most one
+        /// leading zero byte is removed; two would be a corrupt field,
+        /// `beam_file.c:2186-2203`). Never empty.
+        magnitude: Vec<u8>,
+    },
     /// An argument list (`z,1`): the sub-operands of a `gc_bif*`/`call_*`/… argument
     /// vector, in order.
     List(Vec<Operand>),
