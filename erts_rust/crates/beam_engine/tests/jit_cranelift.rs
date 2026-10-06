@@ -1036,6 +1036,7 @@ fn small_result(a: i64, b: i64, function: &str) -> Option<i64> {
     let result = match function {
         "+" => a.checked_add(b),
         "-" => a.checked_sub(b),
+        "*" => a.checked_mul(b),
         _ => return None,
     }?;
     (MIN_SMALL..=MAX_SMALL).contains(&result).then_some(result)
