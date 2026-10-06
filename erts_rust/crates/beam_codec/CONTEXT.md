@@ -739,32 +739,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `is_record`/`make_record` plus the `beam_term::record` `record_*` readers and `AM_*`/size constants
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
-- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
-  incl. the `COMPRESSED` seed
-- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
-  incl. the `COMPRESSED` wrapper/plain-revert round-trips and the oracle fun blobs (`EXPORT_EXT`,
-  `NEW_FUN_EXT` incl. the `fun() -> ok end` `erl_eval` golden)
-- `tests/map_key_order.rs` → the `MAP_EXT` key-order contract (see §Map key encode order):
-  stored-order preservation, the integer-keyed oracle golden + live cross-check, the atom-index
-  nondeterminism demonstration, and the HAMT-not-encodable gap
-- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pins in
-  **both** atom flavours (UTF-8 `119` and `AtomEncoding::Latin1` `115`) plus the
-  allocation-after-every-value-decodes check and a live oracle check (the system `erl` accepts both of
-  our images, decodes them to equal records and re-encodes them to our exact bytes — which also proves
-  the local `make_small(0)` cached definition hash is not on the wire)
-- `tests/compressed_decode.rs` → the top-level `COMPRESSED` (`80`) decode contract: the in-tree oracle
-  seed (`term_to_binary(lists:duplicate(500,hello),[compressed])`, declared inner size 3506), the
-  wrapper's transparency for a hand-built image, **bytes after the zlib stream and after the inner term
-  are ignored** (oracle-verified; the plain path stays strict), and the negative cases (wrong declared
-  size, declared size over the 32 MiB cap, truncated/corrupt zlib, non-zlib payload, a bare/nested
-  `80` below the 6-byte minimum, arbitrary tail bytes never panic)
-- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
-  streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
-- `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
-  encode↔decode, atom-cache encode↔decode, no-cache control)
-- `tests/minor_version.rs` → `{minor_version,N}` byte-exact goldens (atom `ATOM_EXT`/UTF-8 fallback,
-  `FLOAT_EXT` payloads) + round-trips + a **live** `erl` cross-check of the `V0`/`V1` images over a
-  mixed corpus (loud stderr skip when no oracle) — see §Minor-version flavours
+- `tests/ground_truth.rs` → byte-exact `term_to_binary` oracle vectors (incl. the `COMPRESSED` seed)
+- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
+- `tests/minor_version.rs` → `{minor_version,N}` byte-exact goldens + live `erl` cross-check
+- `tests/map_key_order.rs` → the `MAP_EXT` key-order contract (see §Map key encode order)
+- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode, both atom flavours
+- `tests/compressed_decode.rs` → the top-level `COMPRESSED` (`80`) decode contract + negatives
+- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook (cached vs inline atom bytes)
+- `tests/wire_roundtrip.rs` → end-to-end `LOCAL_EXT` / atom-cache wire round-trips
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
   legacy-`FLOAT_EXT` decode vector, the malformed-input typed-error cases, and the oracle-gated
