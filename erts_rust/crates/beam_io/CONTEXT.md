@@ -210,9 +210,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub struct SpawnOptions { pub stream: SpawnStream, pub cd: Option<String>, pub env: Vec<(String, String)>,
   pub args: Vec<String>, pub exit_status: bool }` (`Default`: `list`, nothing else) — the honored options.
 - `pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<Command>>` — the single place
-  the argv vector, shell-vs-direct, `{cd, …}`/`{env, …}` and the three piped standard streams are set up;
-  `None` for `SpawnSpec::Fd` (nothing is started), `BadArg` for an empty argv. Starts nothing, so it is
-  unit-testable on its own.
+  the argv vector, shell-vs-direct, `{cd, …}`/`{env, …}` and the standard streams (`stdin`/`stdout` piped,
+  `stderr` discarded to `/dev/null`) are set up; `None` for `SpawnSpec::Fd` (nothing is started), `BadArg` for an
+  empty argv. Starts nothing, so it is unit-testable on its own.
 - `pub struct SpawnDriver` (`name() == "spawn"`) — constructed **directly** from a spec/options pair (a
   `DriverFactory` is a no-arg `fn` and cannot carry one, so it is *not* in `DriverRegistry`):
   `new(&SpawnSpec, &SpawnOptions) -> Result<SpawnDriver>` **really spawns** (or adopts the fd) so a failure
