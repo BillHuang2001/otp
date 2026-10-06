@@ -63,6 +63,14 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `pub fn wake(&self) -> Result<()>` (thread-safe, callable repeatedly and from any thread; the
   woken event carries `key() == WAKER_KEY`).
 - `pub const WAKER_KEY: u64` — the key of a waker event (`u64::MAX`).
+- **Regular-file fallback source (internal, no public signature change).** `mio`/epoll refuses regular
+  files (`EPOLL_CTL_ADD` ⇒ `EPERM`), so `Poller::register` keeps a `libc::poll(2)`-backed fallback set:
+  a descriptor `mio` rejects as unsupported (`EPERM`/`EINVAL`, i.e. a regular file) is watched with
+  `poll(2)` and its readiness is **merged** into `Poller::poll` in the same `Event`/`Ready` shape (a
+  regular file ⇒ readable on `POLLIN`, writable on `POLLOUT`). `reregister`/`deregister`/`registration`/
+  `len`/`is_empty` treat both sources uniformly; any other `mio` error (`EEXIST`/`ENOENT`/`EBADF`/…) is
+  still reported as `BeamError::Io`. `Poller::poll` never blocks indefinitely while the fallback set is
+  non-empty (private `FALLBACK_POLL_CAP`, 1 ms; zero wait when the fallback probe already fired).
 ### `timer.rs`
 - `pub struct Timeout` (`Copy`) — a single deadline: `infinite()`, `after(Duration)`, `at(Instant)`,
   `poll_timeout() -> Option<Duration>`, `is_expired() -> bool`.
