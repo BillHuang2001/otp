@@ -44,21 +44,38 @@ Ground truth (read-only, never modified):
 All byte values, tag bytes and field orders are **wire-frozen** (A.5): reproduce them exactly.
 
 ## Status
-**Implemented.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte framing,
-handshake message codecs + MD5 authentication, the byte-exact distribution header, message
+**Implemented and live-verified.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte
+framing, handshake message codecs + MD5 authentication, the byte-exact distribution header, message
 fragmentation/reassembly, the **outbound and inbound distribution atom cache**, the control-message
-codec, the `epmd` client, and a `Connection` API that drives a **live handshake + message exchange
-against a real `erl` node**. `cargo test -p beam_dist` is green (241 tests) and warning-free. The
-crate is safe Rust (`#![deny(unsafe_code)]`).
+codec, the `epmd` client (with real TCP lookup), a blocking `Connection` API, and a **non-blocking
+`ConnectionDriver`** (the poll/step state machine). `cargo test -p beam_dist` is green (266 tests + 1
+doc-test) and warning-free; the crate is safe Rust (`#![deny(unsafe_code)]`).
+
+**Live interop (blocking `Connection`, `tests/live_interop.rs`).** Against a real `erl -sname` node
+whose port is resolved through **`epmd`** (`epmd::lookup_port`, fallback to the pinned port): the OTP-23
+`'N'` handshake completes; a `DOP_REG_SEND` is delivered (the node prints `GOT {hello,42}`) and its
+reply is decoded back over the same connection; the node echoes its own pid; the client sends a
+`DOP_SEND`/`DOP_SEND_SENDER` to that pid (the node prints `GOT {direct,99}`); and a **monitor
+round-trip** completes — the node's `DOP_MONITOR_P` is decoded, the client answers
+`DOP_MONITOR_P_EXIT`, and the node prints `DOWN … noproc`.
+
+**Live interop (non-blocking `ConnectionDriver`, `tests/live_driver.rs`).** A genuine non-blocking
+`TcpStream` is driven manually (`feed`/`step`/`take_output`/`next_message`) against a real `erl` node:
+the handshake completes incrementally and a `DOP_REG_SEND` is delivered (the node prints
+`GOT {hello,7,…}`).
 
 The **outbound atom-cache path is wired end-to-end**: `OutboundAtomCache` implements
-`beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder`
-per control message, and `Connection::send_payload` emits the real `OutboundAtomCache::take_header()`
-header (no longer the empty header) — so an atom-bearing message writes `ATOM_CACHE_REF` (`82`) +
-index on the payload and teaches/re-uses the refs in the header. An atom-free message still emits the
-exact `131, 68, 0` header. A `Connection` client creation is now settable
-(`connect_client_with_creation` / `Connection::client_with_creation`; the default stays
-`CLIENT_CREATION = 0`).
+`beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder` per
+control message, and both `Connection::send_payload` and `ConnectionDriver::send_control` emit the real
+`OutboundAtomCache::take_header()` header — an atom-bearing message writes `ATOM_CACHE_REF` (`82`) +
+index on the payload and teaches/re-uses those refs in the header; an atom-free message emits the exact
+`131, 68, 0` header.
+
+**`epmd` over real TCP works** (an earlier "blocked in this sandbox" note was a misdiagnosis — see
+Design Decisions): `EpmdClient::connect` / `epmd::lookup_port` / `epmd::lookup` talk to a live `epmd`;
+a live test publishes a node (`ALIVE2_REQ`), looks its port up over a *second* connection, and observes
+de-registration. `connect_to_node(host, node, our_name, cookie)` chains epmd lookup → TCP connect →
+handshake.
 
 The `DOP_*` **flag vocabularies** are complete: `DIST_SPAWN_FLAG_LINK`/`_MONITOR` and
 `DOP_ALTACT_SIG_FLG_PRIO`/`_TOKEN`/`_ALIAS`/`_NAME`/`_EXIT` (plus the `DistSpawnFlags`/`AltactSigFlags`
