@@ -203,16 +203,33 @@ impl Table {
 - `pattern.rs` — `pub enum Pattern` (nested tuple/list/improper patterns, quoted literals, `'_'`,
   `'$N'` binds with repeat-occurrence equality; every other atom — including `'$_'`/`'$$'`, which are
   special only in a *body* — is an exact `=:=` literal).
-- `expr.rs` — `pub enum Expr`, `pub enum CmpOp`, `pub enum TypeTest`: the guard/body expression
-  language. Guards: `andalso`/`and`, `orelse`/`or`, `not`, `const`, bare truthiness; comparisons
-  `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=` (structural `cmp` for exact, `cmp_arith` for `==`-family);
-  type tests `is_atom/integer/float/number/tuple/list/binary/bitstring/map/pid/port/reference/function/boolean`;
-  guard BIFs `element/2`, `abs/1`, `size/1`, `hd/1`, `tl/1`, `length/1`, `self/0`. Bodies: sequences
-  (value = last expression), tuple/list construction, literals, `'$N'`, `'$_'`, `'$$'`. Guard truth
-  is an internal `Expr::Bool` (independent of whether `true`/`false` are interned).
-  Anything outside the recognised set ⇒ `compile`/`expr` `badarg` (Known Issues).
-- `exec.rs` — the `impl Table` block for the select family + `pub enum BodyKind`
-  (`WholeObject`/`AllBindings`/`LiteralTrue`) that reuses the compiler for `ets:match*`.
+- `expr.rs` — `pub enum Expr`, `pub enum CmpOp`, `pub enum TypeTest`, `pub enum ArithOp`: the
+  guard/body expression language. Guards: `andalso`/`and`, `orelse`/`or`, `not`, `const`, bare
+  truthiness; comparisons `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=` (structural `cmp` for exact,
+  `cmp_arith` for `==`-family); type tests `is_atom/integer/float/number/tuple/list/binary/bitstring/
+  map/pid/port/reference/function/boolean`; guard BIFs `element/2`, `abs/1`, `size/1`, `hd/1`, `tl/1`,
+  `length/1`, `self/0`. **Arithmetic** (`+ - * / div rem band bor bxor bsl bsr`, unary `+`/`-`) is
+  routed through the `pub trait ArithHook` seam (default methods) with `pub struct DefaultArithHook`
+  installed via a `thread_local` (`pub fn set_arith_hook`) so there is no crate edge to `beam_bifs`;
+  the default does checked small-int (i64) arithmetic — overflow/bignum/float/`/` ⇒ a typed
+  `unsupported`, `div`/`rem` by zero ⇒ `badarg`, a negative shift count reverses direction and `bsr`
+  saturates (the C `erts_shift`). Bodies: sequences (value = last expression), tuple/list
+  construction, literals, `'$N'`, `'$_'`, `'$$'`. Guard truth is an internal `Expr::Bool` (independent
+  of whether `true`/`false` are interned). Anything outside the recognised set ⇒ `compile`/`expr`
+  `badarg` (Known Issues).
+- `exec.rs` — the `impl Table` block for the select family (`select`/`select_delete`/`select_count`/
+  `match*`/`select_replace`) + `pub enum BodyKind` (`WholeObject`/`AllBindings`/`LiteralTrue`) that
+  reuses the compiler for `ets:match*`. `select_replace` is value-validated (the clause value must be
+  a tuple of arity ≥ keypos whose keypos element equals the matched key, else whole-call `badarg`),
+  supported on set/ordered_set/duplicate_bag (`bag` ⇒ `badarg`). A BODY runtime failure is replaced by
+  the atom `EXIT` and evaluation continues (the C `FAIL_TERM`); a GUARD failure skips the clause.
+- `run.rs` — `pub fn match_spec_run(list, spec, atoms, heap) -> Result<Vec<Eterm>>`: the
+  table-independent `ets:match_spec_run/2` runner (compiles the raw spec; the oracle requires
+  `ets:match_spec_compile/1` first — a `beam_bifs` bridge handoff).
+- `continuation.rs` — `pub struct MatchContinuation` (opaque: table id + compiled spec + limit +
+  position) and the limited forms `select_limit`/`select_continue`/`match_limit`/`match_continue`/
+  `match_object_limit`/`match_object_continue`, each returning `(Vec<Eterm>, Option<MatchContinuation>)`
+  (`None` ⇒ the oracle's `'$end_of_table'`).
 
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
