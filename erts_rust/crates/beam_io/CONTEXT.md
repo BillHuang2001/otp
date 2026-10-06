@@ -100,7 +100,8 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `id()`, `state()`, `driver_name()`, `input_len()`, `read_input(&mut [u8]) -> usize`, `drain_input() -> Vec<u8>`,
   `output_len()`, `open(&mut Poller)`, `output(&mut Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`,
   `ready_output(&mut Poller) -> Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`,
-  `close(&mut Poller)`, and the scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
+  `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver), and the
+  scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
   `schedule_timeout(Instant) -> bool`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
   `has_pending_task(PortTaskKind) -> bool`, `timeout(&mut Poller) -> Result<()>`.
 - `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
