@@ -27,7 +27,11 @@ Both are the *only* entry points; all intermediate types are public for inspecti
 - `pub type LineRef = u32;` — index into `Module.line.items` (`items[0]` = undefined location).
 - `pub enum Operand { X(u32), Y(u32), Integer(i64), Atom(Atom), Nil, Label(Label), Character(u32),
   FloatReg(u32), Literal(u32), Typed { reg: Reg, ty: TypeIndex }, List(Vec<Operand>),
-  Allocation(Vec<AllocKind>) }` — a *typed* `.beam` operand.
+  Allocation(Vec<AllocKind>), BigInteger { negative: bool, magnitude: Vec<u8> } }` — a *typed* `.beam`
+  operand.
+  `Operand::BigInteger` is a **decode-time-only** form — the C `TAG_o` overflow state for an `i` operand
+  wider than a machine word (`beam_file.c:207-237`); `lower::build_module` rewrites it to a synthesized
+  `Operand::Literal` (a bignum literal), so a loaded `Module` never carries it.
   `Operand::Literal(idx)` is an index into the module's decoded [`LiteralArea`], resolved through `Module::literal`.
 - `pub struct AllocKind { pub kind: u32, pub number: u32, pub words: u32 }` — one decoded
   `z,3` allocation entry (`words` = the entry's contribution to the heap-word total).
