@@ -80,10 +80,20 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `pub use beam_gc::MsoHandle;` — the off-heap object handle is **beam_gc's** (MSO object + atomic
   `RefCount`); this crate never re-implements MSO.
 - `pub struct OffHeapTable` — a **slot-indexed** table of `MsoHandle`s (slot = the on-heap
-  off-heap-reference's `val` word). `new()`/`Default`, `push(MsoHandle) -> usize` (returns the slot),
-  `get(slot) -> Option<&MsoHandle>`, `clone_slot(slot) -> Option<MsoHandle>` (**bumps the refcount**),
-  `len()`, `is_empty()`, `iter()`, `overhead_bytes()`, `into_handles() -> Vec<MsoHandle>`,
-  `drain_handles() -> Vec<MsoHandle>` (returns and empties the handles — `send`'s per-message list).
+  off-heap-reference's `val` word). A thin MSO-typed façade whose storage is delegated to
+  `beam_gc::OffHeap` (the workspace's single owner of the off-heap list); it adds only the
+  slot↔object association (the `beam_gc` storage is slot-indexed via `insert`/`get`/`iter`).
+  `new()`/`Default` (manual — `beam_gc::OffHeap` is not `Default`), `push(MsoHandle) -> usize`
+  (returns the slot), `get(slot) -> Option<&MsoHandle>`, `clone_slot(slot) -> Option<MsoHandle>`
+  (**bumps the refcount**), `len()`, `is_empty()`, `iter()`, `overhead_bytes()`,
+  `into_handles() -> Vec<MsoHandle>`, `drain_handles() -> Vec<MsoHandle>` (returns and empties the
+  handles — `send`'s per-message list).
+  - **Slots are stable; this table NEVER calls `beam_gc::OffHeap::sweep`** (which compacts and would
+    shift the slot indices the copier writes into on-heap containers). Only the append-only
+    `insert`/`get`/`iter` path is used.
+  - `into_handles`/`drain_handles` **clone-then-drop** each handle (refcount++ then refcount-- when
+    the consumed list drops), because `beam_gc::OffHeap` has no move-out API — net refcount is
+    unchanged, so behaviour matches the previous move-based implementation.
 
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only.** Heap exhaustion mid-copy ⇒
@@ -118,13 +128,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   tuple (`HEADER_ARITYVAL` with arity 0) is the shared `beam_term::tuple0()` literal and is returned
   as-is.
 - **`beam_gc` is a new dependency; MSO is reused, not reimplemented.** The off-heap object, its atomic
-  `RefCount` and its owning `MsoHandle` are **entirely `beam_gc::mso`'s**. `beam_gc::OffHeap` is
-  *push-only* (no read access), but the copy boundary must **read** the source process's off-heap
-  objects to re-register (refcount) them — so `off_heap.rs` adds a minimal **slot-indexed**
-  `OffHeapTable` over `MsoHandle`. It stores no new object model and no new refcounting: it only adds
-  the index association the copier needs. **Dependency edge `beam_message → beam_gc` is new**
-  (acyclic: `beam_gc` depends only on the wave-0/1 foundations and never on `beam_message`) and is
-  reported to `../` for the routing table; `Cargo.toml` is updated here.
+  `RefCount`, its owning `MsoHandle` and the per-process off-heap list are **entirely
+  `beam_gc::mso`'s**. `beam_gc::OffHeap` now exposes slot-indexed read access additively
+  (`insert`/`get`/`iter`), so the copy boundary reads the source process's off-heap objects to
+  re-register (refcount) them straight from the shared storage — `off_heap.rs` holds **no duplicate
+  storage**: `OffHeapTable` is a thin MSO-typed façade over `beam_gc::OffHeap` that adds only the
+  `MsoHandle`-typed accessors the copier needs. No new object model and no new refcounting.
+  **Dependency edge `beam_message → beam_gc` is new** (acyclic: `beam_gc` depends only on the
+  wave-0/1 foundations and never on `beam_message`) and is reported to `../` for the routing table;
+  `Cargo.toml` is updated here.
 - **Off-heap reference term — the M1 encoding (documented substitution).** An off-heap reference is
   the frozen `BinRef` container thing `[HEADER_BIN_REF, val, next]` (`ERL_BIN_REF_SIZE = 3`). There is
   no on-heap binary handle type yet (binaries are a documented upstream gap — `beam_codec` returns
@@ -147,7 +159,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` per module: `layout` (per-object word counts + child-slot
   enumeration for tuple/record/fun/flatmap/off-heap container), `off_heap` (slot push/get/clone bumps
-  the refcount; `into_handles`), `message` (builder + accessors; `Queue` FIFO/`peek`/`len`/`clear`;
+  the refcount; `into_handles`; `drain_handles` empties the table and leaves it re-usable with slots
+  restarting at 0), `message` (builder + accessors; `Queue` FIFO/`peek`/`len`/`clear`;
   cursor start/`position`, FIFO `advance` saturating past the end, `remove_at` shifting the rest,
   draining via a re-derived cursor, empty-queue past-the-end, `cursor_at`),
   `copy` (immediates shared; cons/tuple/record/nested copied; literal shared; off-heap container
@@ -192,9 +205,10 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   Large messages that do not fit a process heap fragment stream across buffers in C; M1 assumes the
   destination heap can hold the copy (exhaustion ⇒ `AllocKind::Message`). `Fragments`/`HeapFragment`
   land when `beam_process`'s heap management and the binary layer exist.
-- **`beam_gc::OffHeap` read access is missing.** The copy boundary needs to *read* the source off-heap
-  objects; `beam_gc::OffHeap` is push-only. `off_heap.rs` adds the indexed `OffHeapTable` locally —
-  **escalated to `../`** so a future `beam_gc::OffHeap::get`/`iter` can absorb it (Prevent-Duplication).
+- **`beam_gc::OffHeap` is read-only-indexable here but never swept.** The copy boundary reads the
+  source off-heap objects via `off_heap.rs`'s `OffHeapTable`, which delegates storage to
+  `beam_gc::OffHeap` (the single owner) and therefore never calls `sweep` (which would compact and
+  shift the stable slot indices). Off-heap reclamation belongs to the collector (`beam_gc`).
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
@@ -205,7 +219,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
 - `src/layout.rs` → per-object word counts + child-slot enumeration + the off-heap container encoding
-- `src/off_heap.rs` → `OffHeapTable` (slot-indexed `beam_gc::MsoHandle` table); MSO handle re-export
+- `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`); MSO handle re-export
 - `src/message.rs` → `Message` envelope + `Queue` FIFO
 - `src/mailbox.rs` → `send` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors (no new error type)
