@@ -167,6 +167,34 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `unopened()`, `read_only(fd)`, `write_only(fd)`, `connected(read, write)`, `path() -> Option<&[u8]>`, `eof()`;
   `control` verbs `open <path>` / `close` / `path` / `eof` plus the delegated `line`/`noline`/`binary`/`text`/`getopts`.
   `pub fn make_efile() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered as the built-in `"efile"`).
+### `drivers/spawn.rs` (the OS-child driver + its term-free spec)
+- `pub enum SpawnStream { Binary, List }` (`Default = List`) with `atom_name(&self) -> &'static str`
+  (`"binary"`/`"list"`) — the `binary`/`list` option, applied by the **runtime** when it builds
+  `{Port, {data, Data}}` (the driver hands bytes through unchanged).
+- `pub enum SpawnSpec { Spawn { command: String, argv: Option<Vec<String>> }, SpawnExecutable { path: String },
+  Fd { fd: RawFd } }` — the term-free `open_port/2` `Name`: `/bin/sh -c Cmd` (or `argv` run directly),
+  `Path` run directly (with `SpawnOptions::args`), or an adopted descriptor with no child. `command(&self) -> String`
+  is the `port_info(Port, name)` value (`fd:<N>` for the descriptor form), `spawns_a_child(&self) -> bool` says
+  whether a process is started.
+- `pub struct SpawnOptions { pub stream: SpawnStream, pub cd: Option<String>, pub env: Vec<(String, String)>,
+  pub args: Vec<String>, pub exit_status: bool }` (`Default`: `list`, nothing else) — the honored options.
+- `pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<Command>>` — the single place
+  the argv vector, shell-vs-direct, `{cd, …}`/`{env, …}` and the three piped standard streams are set up;
+  `None` for `SpawnSpec::Fd` (nothing is started), `BadArg` for an empty argv. Starts nothing, so it is
+  unit-testable on its own.
+- `pub struct SpawnDriver` (`name() == "spawn"`) — constructed **directly** from a spec/options pair (a
+  `DriverFactory` is a no-arg `fn` and cannot carry one, so it is *not* in `DriverRegistry`):
+  `new(&SpawnSpec, &SpawnOptions) -> Result<SpawnDriver>` **really spawns** (or adopts the fd) so a failure
+  registers nothing and the runtime can read `os_pid()` before `PortRegistry::open`; `os_pid() -> Option<u32>`,
+  `command() -> &str`, `stream() -> SpawnStream`, `eof() -> bool`, `exited() -> Result<Option<i32>>` (a plain
+  liveness probe), `take_exit_status() -> Result<Option<i32>>` (the `exit_status` option, reported once).
+  `start` only registers the already-created descriptors; the child's stdout is read into the port input queue
+  (drained to `EAGAIN`, EOF latched + the descriptor deregistered/closed), its stdin drains the port output queue
+  (set `O_NONBLOCK`, `EAGAIN` leaves the remainder queued and arms write readiness, a write failure is a typed
+  `BeamError::Io`); `stop` and `Drop` kill + reap the child (an already-exited child is reaped via `try_wait`,
+  no kill) and deregister/close every descriptor. Descriptors of a spawned child are owned and closed; an
+  adopted `{fd, N}` descriptor is deregistered but **never** closed (the Erlang side owns it), and stderr is
+  piped but never read.
 
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures ⇒ `BeamError::Io`,
