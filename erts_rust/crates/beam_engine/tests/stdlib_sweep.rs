@@ -712,3 +712,4 @@ fn chars(host: &mut ModuleHost, text: &str) -> Eterm {
 fn assert_str(host: &ModuleHost, got: Eterm, want: &str) {
     assert_int_list(host, got, &want.bytes().map(i64::from).collect::<Vec<_>>());
 }
+
