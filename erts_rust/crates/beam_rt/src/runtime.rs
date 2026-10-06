@@ -32,7 +32,9 @@ use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
 use beam_common::Result;
 use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_loader::Module;
-use beam_process::{ProcessId, ProcessState, ProcessTable, Scheduler, SignalAtoms};
+use beam_process::{
+    MonitorRef, ProcessId, ProcessState, ProcessTable, RefAllocator, Scheduler, SignalAtoms,
+};
 use beam_term::{atom_val, is_atom, make_atom, make_small, AtomTable, Eterm};
 
 use crate::boot::{self, PreloadedModules};
@@ -136,6 +138,19 @@ pub struct Runtime {
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
+    /// The reference id space every `erlang:make_ref/0` and `erlang:monitor/2` draws from.
+    ///
+    /// One space for both, so a bare reference and a monitor reference can never collide
+    /// (see `crate::native::process`).
+    pub(crate) refs: RefAllocator,
+    /// Every reference term the runtime minted, keyed by the term itself.
+    ///
+    /// A reference term is the address of a freshly allocated 4-word thing, so it is a
+    /// unique key; the entry is `Some(MonitorRef)` for a monitor reference and `None` for a
+    /// bare `make_ref/0`. This is how `erlang:demonitor/1` recovers the monitor a reference
+    /// stands for without reading the thing's payload — which would need `unsafe`, and this
+    /// crate is `#![deny(unsafe_code)]`.
+    pub(crate) references: HashMap<Eterm, Option<MonitorRef>>,
     /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
     ///
     /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
@@ -191,6 +206,8 @@ impl Runtime {
             ports: Rc::new(RefCell::new(PortRegistry::new()?)),            self_pid,
             booted: false,
             halt: None,
+            refs: RefAllocator::new(),
+            references: HashMap::new(),
             eval_closures: Vec::new(),
         })
     }
@@ -285,6 +302,12 @@ impl Runtime {
     /// Heap words still available to the running code (unbounded in Milestone-1).
     pub fn arena_available(&self) -> usize {
         self.arena.heap_available()
+    }
+
+    /// The runtime's one reference id space (the source of `erlang:make_ref/0` and every
+    /// `erlang:monitor/2` reference — see [`Runtime::references`]).
+    pub fn refs_mut(&mut self) -> &mut RefAllocator {
+        &mut self.refs
     }
 
     /// Takes a heap for one BIF call out of the pool.
