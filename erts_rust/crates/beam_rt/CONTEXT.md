@@ -468,13 +468,13 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../beam_loader/tests/fixtures/slice.beam` → the shared oracle fixture reused by the slice tests (read-only)
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
-## Handoffs (the remaining non-agreeing cases are owned by OTHER nodes)
-`differential suite` is at **196 agree / 1 mismatch / 0 unsupported** (of 197). The single remaining
-mismatch has its root cause in another node; recorded so the next pass routes directly:
-* `driver/port_backed_by_spawn_driver` (A.4) — `erlang:open_port/2` (`{spawn,"true"}`) is not a BIF, so
-  the Rust side exits 1 `exception error 'erlang:open_port/2 is not a BIF'` where the oracle prints
-  `ok true`. Ports are **`beam_bifs`**/**`beam_io`** territory (`beam_io` owns `Port` + built-in
-  drivers).
+## Handoffs (owned by OTHER nodes)
+`differential suite` is at **197 agree / 0 mismatch / 0 unsupported** (of 197) — the whole corpus
+agrees. Remaining asks owned elsewhere:
+* **`tools/differential` — a stale pin.** Its `tests/cli.rs` still asserts the expression corpus has a
+  capability gap (`unsupported + skipped >= 1`) and its `CONTEXT.md` still describes the (now closed)
+  `driver/port_backed_by_spawn_driver` mismatch, so that one workspace test fails against a fully
+  agreeing suite. The pin lives under `../../tools/` (read-only here) and is owed to that node.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also
