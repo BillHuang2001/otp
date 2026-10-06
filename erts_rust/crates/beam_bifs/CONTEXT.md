@@ -771,7 +771,7 @@ function_exported/is_builtin`), and the rest of `ets:*` (beyond the 22 registere
 - `tests/lists_funs.rs` / `tests/maps_funs.rs` → the fun-taking BIFs over a mock `FunCaller`
 - `tests/io_lib.rs` → the `io_lib:format` deep-list segmentation (oracle-pinned)
 - `tests/io_ets.rs` → `io:format` exact bytes + a small `ets` round-trip
-- `tests/ets_ops.rs` → the expanded `ets` bridge over a real `TableRegistry`
+- `tests/ets_ops.rs` → the `ets` bridge over a real `TableRegistry`
 - `../beam_engine/CONTEXT.md` → the `ExecutionContext::call_bif` seam this registry plugs into (read-only)
 - `../beam_process/CONTEXT.md` → `ProcessId`, `PortId`/`PortTable`, the exit-reason handoff (read-only)
 - `../beam_ets/CONTEXT.md` → `Table`/`TableOptions`/`TableId` the `ets` bridge drives (read-only)
