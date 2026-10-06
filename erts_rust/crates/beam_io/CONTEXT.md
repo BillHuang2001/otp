@@ -234,7 +234,7 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   is a `BeamError::Raise` carrying the errno atom (`enoent`/`eacces`/`enotdir`/…), matching the oracle; an
   unmapped errno falls back to `BeamError::Io` (see `src/error.rs`).
 
-### `drivers/inet.rs` (the TCP `tcp_inet` socket driver floor)
+### `drivers/inet/` (`mod.rs` + `wire.rs`) — the TCP `tcp_inet` socket driver floor
 - `pub const DRIVER_NAME: &str = "tcp_inet"` — the name `port_info(Port, name)` reports and `prim_inet` opens;
   `pub fn make_tcp_inet() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered by `with_builtins`).
 - `pub struct TcpInetDriver` (`name() == "tcp_inet"`) — a non-blocking TCP socket behind a port; `from_socket(fd)`
