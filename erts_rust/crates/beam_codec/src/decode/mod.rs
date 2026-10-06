@@ -275,13 +275,14 @@ impl<'a> Decoder<'a> {
                 if count > MAX_ARITYVAL {
                     return Err(system_limit());
                 }
-                // Every map is stored as a **flatmap**, whatever its pair count: the
-                // flatmap/hashmap switchover is an *open interior* layout (workspace
-                // `CONTEXT.md` §2) and no HAMT builder exists in the workspace yet.
-                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is preserved as-is —
-                // deliberately **not** sorted/deduped, unlike ERTS's sorted-flatmap
-                // invariant (`erl_map.h:181-199`, `external.c:5042-5100`); a future
-                // pass may sort via `beam_term::cmp`.
+                // The wire order (interleaved `K1,V1,…,Kn,Vn`) is what defines the map,
+                // so it is preserved verbatim: this crate never sorts or dedupes on
+                // decode either. ERTS stores a ≤ 32-pair map sorted in
+                // `erts_cmp_flatmap_keys` order and emits that order on the wire
+                // (`erl_map.h:181-199`, `external.c:3746-3769`), so a faithful
+                // decode→re-encode is byte-stable (see the crate `CONTEXT.md`,
+                // §"Map key encode order"). Any pair count (including a > 32-pair HAMT's
+                // image) is materialized as one flat map here.
                 let mut pairs = Vec::new();
                 for _ in 0..count {
                     let key = self.decode(heap, atoms)?;

@@ -181,10 +181,13 @@ pub fn big_parts<'a>(term: Eterm) -> Result<(bool, &'a [u64])> {
 /// `n <= MAP_SMALL_MAP_LIMIT` and by [`write_large_flatmap`] above it (identical
 /// layout — see that writer).
 ///
-/// Every map is stored as a flatmap: the flatmap/hashmap switchover is an *open
-/// interior* layout (workspace `CONTEXT.md` §2) and no HAMT builder exists in the
-/// workspace yet. A pair count beyond `MAX_ARITYVAL` cannot be represented by the
-/// `arityval` header and yields `BeamError::SystemLimit`.
+/// Builds a **flat** map and keeps the caller's pair order as-is (no sort, no dedup), so
+/// the wire order equals the given order. A map with more than `MAP_SMALL_MAP_LIMIT`
+/// (32) distinct keys would normally be a hash map instead — build that with
+/// [`beam_term::map::write_map`], which applies ERTS's `erts_cmp_flatmap_keys` order
+/// (see the crate `CONTEXT.md`, §"Map key encode order"). A pair count beyond
+/// `MAX_ARITYVAL` cannot be represented by the `arityval` header and yields
+/// `BeamError::SystemLimit`.
 pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
     let n = pairs.len();
     if n > MAX_ARITYVAL {
@@ -192,10 +195,11 @@ pub fn make_flatmap(heap: &mut Heap, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> 
         return Err(error::system_limit());
     }
     // NOTE: duplicate keys are **not** detected — that needs term comparison (owned
-    // by `beam_term`/`beam_ets`), so the caller's pair order is preserved as-is,
-    // deliberately **not** the sorted order ERTS's flatmaps maintain (`erl_map.h`
-    // `MAP_HEADER_FLATMAP`; `external.c:5042-5100`). A future pass may sort via
-    // `beam_term::cmp`. (See the crate `CONTEXT.md`, "Known Issues".)
+    // by `beam_term`/`beam_ets`) — so the caller's pair order is preserved as-is,
+    // deliberately **not** re-sorted into ERTS's `erts_cmp_flatmap_keys` order
+    // (`erl_map.h` `MAP_HEADER_FLATMAP`; `external.c:3746-3769`). Sorting is the map
+    // *constructor's* job (`beam_term::map::write_map`), not the codec's. (See the
+    // crate `CONTEXT.md`, §"Map key encode order".)
     // SAFETY: `alloc_words` returned `thing::flatmap_size_words(n)` exclusively-owned,
     // writable words.
     let hp = unsafe { heap.alloc_words(thing::flatmap_size_words(n))? };

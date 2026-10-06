@@ -507,14 +507,20 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a flat map of **any** pair count as `MAP_EXT`.
+    /// Encodes a **flat** map of any pair count as `MAP_EXT`.
     ///
-    /// Every map is stored as a flatmap: the flatmap/hashmap switchover is an *open
-    /// interior* layout (workspace `CONTEXT.md` §2) and no HAMT builder exists in the
-    /// workspace yet, so there is no `MAP_SMALL_MAP_LIMIT` cutoff. The pair order is
-    /// emitted as-is (interleaved `K1,V1,…,Kn,Vn`) — deliberately **not** sorted or
-    /// deduped (`erl_map.h:181-199`); a future pass may sort via `beam_term::cmp`.
+    /// The pair order is emitted **as stored** (interleaved `K1,V1,…,Kn,Vn`): the codec
+    /// preserves the map's order and deliberately does **not** sort or dedupe it. Order is
+    /// the *constructor's* job, applied before the term reaches the codec — ERTS stores a
+    /// ≤ 32-pair map sorted in `erts_cmp_flatmap_keys` order (`erl_utils.h:265-272`) and
+    /// the encoder walks that stored order (`external.c:3746-3769`, `ENC_MAP_PAIR`, no
+    /// sort without the `deterministic` dflag), so sorting here would corrupt a
+    /// decode→re-encode round-trip. See the crate `CONTEXT.md`, §"Map key encode order".
     /// The pair count must fit the flatmap `arityval` (24-bit), else `SystemLimit`.
+    ///
+    /// Only *flat* maps reach this function: [`flatmap_parts`] rejects a hash-map (HAMT)
+    /// term, so a map of more than 32 pairs built by `beam_term::map::write_map` falls
+    /// through to a typed `unsupported` (never a wrong encoding) — see `Known Issues`.
     fn encode_map(&mut self, keys: &[Eterm], values: &[Eterm]) -> Result<()> {
         let n = keys.len();
         if n > MAX_ARITYVAL {
@@ -1306,9 +1312,9 @@ mod tests {
 
     #[test]
     fn maps_above_the_small_limit_encode_as_map_ext() {
-        // 40 pairs — past `MAP_SMALL_MAP_LIMIT` (32) — is still a `MAP_EXT` flatmap,
-        // never `unsupported` (the flatmap/hashmap switchover is an open interior
-        // layout; no HAMT builder exists).
+        // A *flat* map of 40 pairs — past `MAP_SMALL_MAP_LIMIT` (32) — still encodes as a
+        // single `MAP_EXT` in stored order. (A real > 32-pair *hash map* is a different
+        // shape the encoder does not handle; see `tests/map_key_order.rs`.)
         let mut atoms = AtomTable::new();
         let mut heap = new_heap(4 + 2 * 40 + 64);
         let mut pairs = Vec::new();
