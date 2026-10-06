@@ -39,6 +39,9 @@ MODULES= \
 	beam_reorder_SUITE \
 	beam_ssa_SUITE \
 	beam_ssa_check_SUITE \
+	beam_ssa_fbip_SUITE \
+	beam_ssa_fus_SUITE \
+	beam_ssa_loop_opt_SUITE \
 	beam_type_SUITE \
 	beam_types_SUITE \
 	beam_utils_SUITE \
