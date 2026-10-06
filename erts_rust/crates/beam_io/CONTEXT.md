@@ -19,12 +19,13 @@ Four things live here:
    drivers, the OS-child `spawn` driver, line buffering, and the text⇄binary phase-change protocol.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
-`beam_process` (ports are the peer of pids in `ptab`). **`beam_rt` today consumes only the poller
-types** (`Poller`/`Interest`/`Token`/`Ready`/`Event`/`Waker`); it has its own `beam_rt::port::PortRegistry`
-and does **not** yet use `beam_io::PortRegistry`/`Port` — `PortNotification` is the seam for it to adopt,
-and [`SpawnDriver`](src/drivers/spawn.rs) is the port driver it will construct from its decoded
-`open_port/2` terms. This crate is the **library**; the scheduler *thread* wiring (the poll loop driving
-port tasks every round, port run queues) belongs to `beam_process`/`beam_rt`.
+`beam_process` (ports are the peer of pids in `ptab`). `beam_rt` **drives its ports through this crate**:
+it holds one long-lived `Poller` + `PortRegistry`, constructs a [`SpawnDriver`](src/drivers/spawn.rs) from
+its decoded `open_port/2` terms, runs the port-task round (`execute_port_tasks`) from its main loop, and
+consumes the [`PortNotification`]s — delivering `{Port,{data,…}}`/`{Port,{exit_status,…}}` to the owning
+process and waking a receiver blocked on port data through the `beam_process` scheduler. This crate is the
+**library**; the scheduler *thread* wiring (driving a port-task round from the poll loop, port run queues)
+lives in `beam_rt` (single-threaded), not here.
 
 Legacy C ground truth (read-only): `../../erts/emulator/sys/common/erl_poll.c` + `erl_check_io.c` (the
 poll loop, one-shot re-armed read/write readiness, self-pipe wakeup), `../../erts/emulator/beam/io.c`
