@@ -100,6 +100,13 @@ is `decode`'s.
   (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
   the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
   `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`.
+- **Funs are encoded through the classification chain.** `encode` guards the fun family with
+  `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
+  distinct subtag, so the classification is exact) and routes to the private
+  `encode_fun`/`encode_fun_external`/`encode_fun_imported`: `FunKind::External` ⇒ `EXPORT_EXT` (`113`),
+  `FunKind::Imported` ⇒ `NEW_FUN_EXT` (`112`) with the `size` field patched via
+  `Writer::patch_u32be` (`4 + payload_len`), and `FunKind::Local` ⇒ `error::unsupported_local_fun()`
+  (no faithful wire image). See §Fun encodings.
 - **Compressed wrapper** — `[VERSION_MAGIC][COMPRESSED_EXT][inner_size:4 BE][zlib body]`, where
   `inner_size` is the inner term *body* length (version byte excluded) and the deflated payload is the
   body (never containing the version byte). `Encoder::finish_compressed` strips a leading version byte
