@@ -68,6 +68,10 @@ assume a different layout.**
 - `AtomTable::seed_from_atom_names(&mut self, src: &str) -> TermResult<()>` — parse the `atom.names`
   grammar (`atom` <name>+ ; names are bare, `'quoted'`, or `CName='printname'`; `#` comments) and
   intern in file order. `from_atom_names(src) -> TermResult<AtomTable>` convenience.
+- `AtomTable::hvalue(&self, a: Atom) -> u32` — the C `atom_tab(a)->slot.bucket.hvalue`: the
+  Dragon-Book `hashpjw` over the atom's UTF-8 name bytes with the latin1 clutch (`atom.c:82`
+  `atom_hash`). This is the value `make_hash`/`make_hash2` mix for an atom; an out-of-range index
+  falls back to `a.raw()` (documented, panic-free).
 - Note: generating the standard `am_*`-equivalent `Atom` constants from the full `atom.names` is a
   codegen/boot step (routed to `beam_rt`); this crate owns only the mechanism + parser.
 
