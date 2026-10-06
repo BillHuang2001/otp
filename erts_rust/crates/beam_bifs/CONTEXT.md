@@ -705,7 +705,7 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
   does not depend on interning module/function ids.
 
 ### Capability-gap audit: registry vs installed OTP (evidence)
-Audited `default_registry()` (286 entries = **182 real `bif.tab` BIFs + 104 stdlib fast-paths**)
+Audited `default_registry()` (286 entries = **211 real `bif.tab` BIFs + 75 stdlib fast-paths**)
 against the imports of all **261** installed OTP 29 / erts-17.1 stdlib/kernel/compiler `.beam`
 modules (`beam_lib:chunks(F,[imports])`; stdlib-8.1 + kernel-11.0.4 + compiler-10.0.6).
 **181 real `bif.tab` BIFs referenced by those modules are NOT registered**, each resolving to
