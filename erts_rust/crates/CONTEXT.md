@@ -164,7 +164,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 
 ## Routing Table
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
-- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc` (frozen, Stage 0)
+- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
