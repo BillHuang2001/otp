@@ -8,8 +8,8 @@
 //! lowest common ancestor, workspace `CONTEXT.md` §2), but `beam_term` is a
 //! dependency *sink*: it never allocates. This module is the glue that obtains raw
 //! storage from [`ExecutionContext::alloc_words`] and passes it to the
-//! `beam_term` writers (or, where `beam_term` owns no layout — funs, and the heap
-//! binary — writes the frozen C layout directly).
+//! `beam_term` writers — the fun header/descriptor layout is owned by
+//! [`beam_term::fun`] and only the **heap binary** layout is hand-rolled here.
 //!
 //! # Ownership model
 //!
@@ -24,11 +24,11 @@
 //! * Every `unsafe` block carries a `// SAFETY:` rationale and every body is an
 //!   explicit `unsafe {}` block, so `unsafe_op_in_unsafe_fn` stays clean.
 //!
-//! Reuse is deliberate: tuples, cons cells, floats, flat maps, bignums and the
-//! external pid/port/ref blocks are written by the matching `beam_term` primitive;
-//! only the two families `beam_term` does not own — **funs** and the **heap
-//! binary** — hand-roll a layout here, each pinned line-by-line to the C ground
-//! truth in the function docs.
+//! Reuse is deliberate: tuples, cons cells, floats, flat maps, bignums, the
+//! external pid/port/ref blocks and **funs** ([`beam_term::fun`]) are built and read
+//! by the matching `beam_term` primitive; only the **heap binary** family has no
+//! `beam_term` owner and hand-rolls a layout here, pinned line-by-line to the C
+//! ground truth in the function docs.
 //!
 //! The **hashmap (HAMT) read path** is hand-rolled here as well: `beam_term` owns
 //! the frozen map-header tag constants (`HAMT_SUBTAG_*`) and the `is_hashmap`
@@ -59,20 +59,6 @@ use beam_loader::Module;
 use beam_term::{make_atom, make_small, thing, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::context::ExecutionContext;
-
-/// `FUN_HEADER_ARITY_OFFS` (`erl_term.h:413`): `_HEADER_ARITY_OFFS + 2`.
-const FUN_HEADER_ARITY_OFFS: u32 = 8;
-/// `FUN_HEADER_ENV_SIZE_OFFS` (`erl_term.h:414`): `FUN_HEADER_ARITY_OFFS + 8`.
-const FUN_HEADER_ENV_SIZE_OFFS: u32 = 16;
-/// The arity / environment size fields of a fun header are 8 bits
-/// (`erl_term.h:404-410`: "both limited to 255").
-const FUN_FIELD_MAX: usize = 0xFF;
-/// The M1 fun-entry descriptor words inlined after the header (`uniq`, `index`) —
-/// see [`make_fun`] for why the C `entry` pointer is expanded.
-const FUN_DESCRIPTOR_WORDS: usize = 2;
-/// Word offset of the first free variable (`env[0]`): the header plus the inlined
-/// descriptor.
-const FUN_ENV_OFFSET: usize = 1 + FUN_DESCRIPTOR_WORDS;
 
 /// `MAP_SMALL_MAP_LIMIT` (`erl_map.h:93-97`): the largest flat-map pair count.
 /// Above it ERTS uses a **hashmap** (HAMT). No crate in the rewrite can build one
@@ -261,25 +247,27 @@ pub fn make_flatmap(ctx: &mut dyn ExecutionContext, pairs: &[(Eterm, Eterm)]) ->
 
 /// Builds a local **fun** (closure) term.
 ///
-/// # Frozen word layout (M1)
+/// # Frozen word layout
+///
+/// The on-heap header/descriptor layout is owned by [`beam_term::fun`] (the
+/// frozen-layout lowest common ancestor); this function only obtains the storage
+/// from the execution context and writes it through that module's
+/// [`make_fun_header`](beam_term::fun::make_fun_header) and
+/// [`FUN_DESC_WORDS_LOCAL`](beam_term::fun::FUN_DESC_WORDS_LOCAL).
 ///
 /// C's `ErlFunThing` (`erl_fun.h:65-99`) is
-/// `[thing_word, entry, env[0..num_free]]`, i.e. `ERL_FUN_SIZE (= 2) + num_free`
-/// words, where `thing_word = MAKE_FUN_HEADER(Arity, NumFree, 0)`
-/// (`erl_term.h:413-424`; the header packs arity at bit 8, the environment size at
-/// bit 16 and the external-fun kind at bit 24 — 8 bits each, hence the 255 limit),
-/// and `entry` is a **pointer** to an out-of-line `ErlFunEntry`/`Export` that owns
-/// the code address, `uniq[16]` and `index` (`erl_fun.c`, `emu/instrs.tab:545-584`
-/// `make_fun3`).
+/// `[thing_word, entry, env[0..num_free]]`, where `entry` is a **pointer** to an
+/// out-of-line `ErlFunEntry`/`Export` that owns the code address, `uniq[16]` and
+/// `index` (`erl_fun.c`, `emu/instrs.tab:545-584` `make_fun3`).
 ///
 /// M1 has no code addresses or fun-entry table, so the single `entry` pointer is
-/// **inlined as two descriptor words** — this is the same documented
-/// "M1 substitution" idea as the external-pid `node` slot (see
-/// `beam_term::thing::write_external_pid`). The resulting block is
+/// **inlined as two descriptor words** — the
+/// [`FunKind::Local`](beam_term::fun::FunKind::Local) substitution
+/// [`beam_term::fun`] owns. The resulting block is
 /// `1 (header) + 2 (uniq, index) + num_free` words:
 ///
 /// ```text
-/// word 0            MAKE_FUN_HEADER(arity, num_free, external = 0)  (exact C encoding)
+/// word 0            MAKE_FUN_HEADER(arity, num_free, Local)  (exact C encoding)
 /// word 1            uniq   (u64, the fun's identity)  — replaces the entry pointer
 /// word 2            index  (u32, the fun's lambda-table index)
 /// words 3 .. 3+n    env[0..num_free]                  (identical to C's order/position)
@@ -296,19 +284,24 @@ pub fn make_fun(
     free: &[Eterm],
 ) -> Result<Eterm> {
     let num_free = free.len();
-    if arity as usize > FUN_FIELD_MAX || num_free > FUN_FIELD_MAX {
+    if arity as usize > beam_term::fun::FUN_MAX_FIELD || num_free > beam_term::fun::FUN_MAX_FIELD {
         return Err(BeamError::SystemLimit);
     }
-    let hp = ctx.alloc_words(1 + FUN_DESCRIPTOR_WORDS + num_free)?;
-    // SAFETY: `alloc_words` returned `1 + 2 + num_free` exclusively-owned, writable
-    // words. Word 0 receives the fun header, word 1 the `uniq`, word 2 the `index`
-    // and words `3..3+num_free` the free variables — every write is in bounds.
+    let header =
+        beam_term::fun::make_fun_header(arity as usize, num_free, beam_term::fun::FunKind::Local)
+            .map_err(BeamError::from)?;
+    let env_offset = 1 + beam_term::fun::FUN_DESC_WORDS_LOCAL;
+    let hp = ctx.alloc_words(env_offset + num_free)?;
+    // SAFETY: `alloc_words` returned `1 + FUN_DESC_WORDS_LOCAL + num_free`
+    // exclusively-owned, writable words. Word 0 receives the fun header, word 1 the
+    // `uniq`, word 2 the `index` and words `env_offset..env_offset + num_free` the
+    // free variables — every write is in bounds.
     let root = unsafe {
-        *hp = fun_header(arity as usize, num_free);
+        *hp = header;
         *hp.add(1) = Eterm::from_raw(uniq as usize);
         *hp.add(2) = Eterm::from_raw(index as usize);
         for (i, var) in free.iter().enumerate() {
-            *hp.add(FUN_ENV_OFFSET + i) = *var;
+            *hp.add(env_offset + i) = *var;
         }
         hp
     };
@@ -346,21 +339,6 @@ pub fn make_heap_binary(ctx: &mut dyn ExecutionContext, bytes: &[u8]) -> Result<
         core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, num_bytes);
     }
     Ok(beam_term::make_boxed(hp))
-}
-
-/// `MAKE_FUN_HEADER(arity, num_free, external = 0)` (`erl_term.h:417-424`).
-///
-/// `_TAG_HEADER_FUN` is `TAG_PRIMARY_HEADER | FUN_SUBTAG`; the arity starts at bit
-/// `FUN_HEADER_ARITY_OFFS` (8) and the environment size at bit
-/// `FUN_HEADER_ENV_SIZE_OFFS` (16). The external-fun kind bit (24) is left clear
-/// — this module builds only local funs. The caller has already bounded both
-/// fields to 8 bits.
-fn fun_header(arity: usize, num_free: usize) -> Eterm {
-    Eterm::from_raw(
-        beam_term::FUN_SUBTAG
-            | (arity << FUN_HEADER_ARITY_OFFS)
-            | (num_free << FUN_HEADER_ENV_SIZE_OFFS),
-    )
 }
 
 // ---------------------------------------------------------------------------
@@ -647,55 +625,64 @@ pub fn is_fun(t: Eterm) -> bool {
 }
 
 /// The arity of a fun term; a non-fun yields [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_arity`] (the layout owner) over the term's
+/// header word.
 pub fn fun_arity(t: Eterm) -> Result<u32> {
-    Ok(((fun_header_word(t)? >> FUN_HEADER_ARITY_OFFS) & FUN_FIELD_MAX as usize) as u32)
+    Ok(beam_term::fun::fun_arity(Eterm::from_raw(fun_header_word(t)?)) as u32)
 }
 
 /// The number of free variables (`env` size) of a fun term; a non-fun yields
 /// [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_num_free`] (the layout owner) over the term's
+/// header word.
 pub fn fun_num_free(t: Eterm) -> Result<usize> {
-    Ok((fun_header_word(t)? >> FUN_HEADER_ENV_SIZE_OFFS) & FUN_FIELD_MAX as usize)
+    Ok(beam_term::fun::fun_num_free(Eterm::from_raw(
+        fun_header_word(t)?,
+    )))
 }
 
 /// The unique identity (`uniq`) stored in a fun term; a non-fun yields
 /// [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_uniq`] (the layout owner), which reads the
+/// [`FunKind::Local`](beam_term::fun::FunKind::Local) descriptor word — the only
+/// kind this engine builds.
 pub fn fun_uniq(t: Eterm) -> Result<u64> {
-    fun_header_word(t)?;
-    // SAFETY: `fun_header_word` established that `t` is a live fun, so descriptor
-    // word 1 is live and initialised.
-    Ok(unsafe { (*beam_term::boxed_val(t).add(1)).raw() as u64 })
+    // SAFETY: `t` must be a live fun term (the caller's contract; `make_fun` only
+    // ever builds `FunKind::Local` funs); `fun_uniq` re-checks the kind before
+    // reading the descriptor word.
+    unsafe { beam_term::fun::fun_uniq(t) }.map_err(BeamError::from)
 }
 
 /// The lambda-table index stored in a fun term; a non-fun yields
 /// [`BeamError::BadArg`].
+///
+/// Forwarded to [`beam_term::fun::fun_index`] (the layout owner).
 pub fn fun_index(t: Eterm) -> Result<u32> {
-    fun_header_word(t)?;
-    // SAFETY: as [`fun_uniq`] — descriptor word 2 is live and initialised.
-    Ok(unsafe { (*beam_term::boxed_val(t).add(2)).raw() as u32 })
+    // SAFETY: `t` must be a live fun term (the caller's contract); `fun_index`
+    // re-checks the kind (`Local`/`Imported`) before reading the descriptor word.
+    unsafe { beam_term::fun::fun_index(t) }.map_err(BeamError::from)
 }
 
 /// The free variables of a fun term, in `env` order; a non-fun yields
 /// [`BeamError::BadArg`].
 ///
-/// The returned slice borrows the term's storage (see [`make_fun`] for the
-/// layout), so the caller must keep the owning heap alive and unmoved.
+/// Forwarded to [`beam_term::fun::fun_env`] (the layout owner). The returned slice
+/// borrows the term's storage, so the caller must keep the owning heap alive and
+/// unmoved.
 pub fn fun_free<'a>(t: Eterm) -> Result<&'a [Eterm]> {
-    let num_free = fun_num_free(t)?;
-    if num_free == 0 {
-        return Ok(&[]);
-    }
-    // SAFETY: `fun_num_free` established that `t` is a live fun of `num_free` free
-    // variables, which start at word `FUN_ENV_OFFSET`; the block is that plus
-    // `num_free` words, so the slice is live and in bounds. The caller keeps the
-    // owning heap alive for `'a`.
-    Ok(unsafe {
-        core::slice::from_raw_parts(beam_term::boxed_val(t).add(FUN_ENV_OFFSET), num_free)
-    })
+    // SAFETY: `t` must be a live fun term whose storage the caller keeps alive and
+    // unmoved for `'a` (the documented borrow contract); `fun_env` re-checks the
+    // fun subtag before computing the env slice.
+    unsafe { beam_term::fun::fun_env(t) }.map_err(BeamError::from)
 }
 
 /// The raw header word of a fun term, or [`BeamError::BadArg`] if `t` is not a fun.
 ///
-/// Shared by the fun readers so the type check lives in exactly one place.
+/// The type check [`fun_arity`]/[`fun_num_free`] share before forwarding the header
+/// word to [`beam_term::fun`].
 fn fun_header_word(t: Eterm) -> Result<usize> {
     if !is_fun(t) {
         return Err(BeamError::BadArg);
@@ -1175,7 +1162,7 @@ mod tests {
     fn fun_layout_is_header_uniq_index_env() {
         // Raw-word proof of the exact block the widened interpreter relies on.
         let mut words = [Eterm::default(); 3 + 1];
-        words[0] = fun_header(2, 1);
+        words[0] = beam_term::fun::make_fun_header(2, 1, beam_term::fun::FunKind::Local).unwrap();
         words[1] = Eterm::from_raw(0x1234_5678_9ABC);
         words[2] = Eterm::from_raw(9);
         words[3] = make_small(42);
