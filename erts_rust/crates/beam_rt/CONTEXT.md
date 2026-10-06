@@ -682,6 +682,14 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
+* **A lambda has no faithful `NEW_FUN_EXT` image.** `fun M:F/A` builds a real `FunKind::External` term
+  (`term_to_binary` → `EXPORT_EXT`, the `wire/export_ext_encode` case), but a lambda
+  (`fun() -> ok end`) is an evaluator closure (`EVAL_FUN_UNIQ` + an index into
+  `Runtime::eval_closures`) — a `Local` fun, which the ETF codec cannot encode, so
+  `term_to_binary(fun() -> ok end)` is the honest typed `unsupported: local_fun` (the
+  `wire/new_fun_ext_encode` case). A byte-exact `NEW_FUN_EXT` would need `erl_eval`'s own 16-byte MD5
+  uniq, fun index, creator pid and expression env — not reproducible without mimicking `erl_eval`
+  internals; no wrong encoding is emitted.
 * **Nested-BIF re-entrancy (a `fun` applied inside a BIF) is handled — with one limitation.**
   When a `fun`-taking `lists:*`/`maps:*` BIF calls back through `FunBridge`, the nested `RuntimeContext`
   takes a **fresh pooled heap**, shares the caller's sink through a `SharedSink` clone and reaches the
