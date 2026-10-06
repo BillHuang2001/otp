@@ -232,6 +232,15 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   driver; the reduction budget bounds a round; and the **wake-path evidence** — a `PortNotification::Data` from a
   scheduled task, delivered to a process blocked in receive via `beam_process::ProcessTable::deliver_simple`
   (`DeliverOutcome::Woke`) then `Scheduler::resume_woken` enqueues it.
+- `tests/spawn.rs` (integration, **real child processes**): `echo` output read back through the port input queue;
+  the argv form and `{spawn_executable, Path}` + `{args, …}`; `cat` echoing bytes written through the output queue
+  (`port_command` → OUTPUT task); the same bytes through the `PortNotification` seam; EOF deregistering the child's
+  stdout; a stalled write (256 KiB into a child that never reads, on a `sleep`) staying queued and arming write
+  readiness (observed through `Poller::len`); the reaped `exit_status` taken once through
+  `PortRegistry::take_exit_status`; a port without the option never reporting one; an unknown id answering `BadArg`;
+  `stop` killing **and** reaping a long-lived child (evidence via `/proc/<pid>` disappearing, guarded on procfs
+  being present); the `{fd, N}` form reading an adopted `pipe(2)` end with no child and leaving the descriptor open;
+  a failed spawn being a constructor error that registers nothing; `{cd, …}`/`{env, …}` reaching the child.
 - In-module unit tests cover: `ByteQueue`; `Interest`/`Ready`/`Event`; `Poller` register/deregister + `WAKER_KEY` +
   wakers; `Timeout`/`Timer`; `DriverRegistry` (both built-ins, dup rejection, missing-name `BadArg`); `PortState`
   transitions; `PortRegistry` alloc/close/reuse + unknown-id `BadArg`; `FdDriver` (pipe round-trip, EOF, error
