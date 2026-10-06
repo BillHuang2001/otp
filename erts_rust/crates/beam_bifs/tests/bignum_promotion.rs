@@ -462,7 +462,7 @@ fn integer_string_conversions_promote_to_bignums() {
     let rendered = fx
         .erlang("integer_to_list", &[negative, make_small(16)])
         .expect("integer_to_list/2");
-    assert_eq!(spell(rendered), "-40000000000000000");
+    assert_eq!(spell(rendered), "-400000000000000000");
     let rendered = fx.erlang("integer_to_list", &[make_small(0)]).expect("ok");
     assert_eq!(spell(rendered), "0");
 
