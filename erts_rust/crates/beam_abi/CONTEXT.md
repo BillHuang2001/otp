@@ -310,8 +310,7 @@ A NIF `.so` leaves `enif_*` **undefined** and the dynamic linker binds them, at 
 - `tests/common/mod.rs` is invisible to `cargo test` unless some `tests/*.rs` says `mod common;` —
   keep at least one includer (currently `host_seam.rs`) so it stays compiled; Cargo would in
   particular *not* report a `tests/common/mod.rs` that fails to compile.
-- Do not implement any `enif_*`/`erl_drv_*` *function body* in this crate yet; `nif::enif`/`nif::loader`
-  stay doc-only placeholders. Do not touch `../../tools/`.
+- The **driver** ABI (`erl_drv_*`) still has **no** function bodies here; only the NIF `enif_*` subset is implemented. Do not touch `../../tools/` or `../../erts/`.
 - Adding a `cargo::rustc-link-arg-bins` instruction to `build.rs` **breaks the build** (no `[[bin]]`
   target in this package).
 
