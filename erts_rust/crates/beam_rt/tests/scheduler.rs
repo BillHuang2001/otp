@@ -25,7 +25,7 @@
 
 use beam_process::ProcessState;
 use beam_rt::Runtime;
-use beam_term::signed_value;
+use beam_term::{make_small, signed_value};
 
 /// The committed receive fixture (`../beam_engine/tests/fixtures/recv.beam`).
 const RECV_BEAM: &str = concat!(
@@ -35,6 +35,10 @@ const RECV_BEAM: &str = concat!(
 
 /// This crate's own receive fixture (`tests/fixtures/mailbox.beam`).
 const MAILBOX_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/mailbox.beam");
+
+/// This crate's sender fixture (`tests/fixtures/sched.beam`), which can send a matching
+/// message *after* a non-matching head (something `recv:bomb/1` cannot do).
+const SCHED_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/sched.beam");
 
 /// A runtime with `fixture` loaded explicitly (so the module is resolved from the code
 /// server's cache, exactly as a `-pa` directory would resolve it).
@@ -181,6 +185,36 @@ fn a_receive_scans_past_a_non_matching_head_to_the_matching_message() {
         7
     );
     assert!(rt.processes().get(pid).is_none(), "it terminated normally");
+}
+
+/// The **cross-process** version of the same shape: one process sends the non-matching
+/// head and then the match, and the receiver — which was already blocked — wakes up,
+/// scans past the head and takes the match.
+///
+/// Oracle: `R = spawn(recv, scan, []), S = spawn(sched, send2, [R, 0])` ⇒ the receiver
+/// delivers `7` and the sender returns `ok`; both terminate.
+#[test]
+fn a_sender_that_sends_a_head_then_a_match_completes_the_receive() {
+    let mut rt = runtime_with(RECV_BEAM);
+    rt.load_module(SCHED_BEAM).expect("the fixture loads");
+    let receiver = rt
+        .spawn_process("recv", "scan", vec![])
+        .expect("spawn recv:scan/0");
+    let sender = rt
+        .spawn_process("sched", "send2", vec![receiver.to_eterm(), make_small(0)])
+        .expect("spawn sched:send2/2");
+
+    rt.run_scheduler().expect("the pass drains the queue");
+
+    assert_eq!(
+        signed_value(rt.process_result(receiver).expect("the receiver returned")),
+        7,
+        "the receive skipped the `42` and took the `{{bar, 7}}` that followed it"
+    );
+    let sender_result = rt.process_result(sender).expect("the sender returned");
+    assert_eq!(rt.atom_name_of(sender_result), Some("ok"));
+    assert!(rt.processes().get(receiver).is_none());
+    assert!(rt.processes().get(sender).is_none());
 }
 
 /// A process waiting for a message nobody sends simply stays `Waiting`; the loop ends
