@@ -219,9 +219,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
   scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
   `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
-  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). The **differential gate is
-  197/197 agree** (the last `unsupported`, `driver/port_backed_by_spawn_driver`, is closed by the
-  installed `PortHook`, which spawns through a real spawn driver).
+  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). Runtime port I/O is
+  polling-backed: `beam_rt` keeps the child's stdout, registers its fd with `beam_io`'s poller, reads it
+  and delivers `{Port,{data,Data}}` to the owning process (driven from the `-eval` `receive … after T`
+  path); `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
+  `total=285 agree=281 mismatch=0 unsupported=4`** — the 4 `unsupported` are the `wire/*` ETF-encode
+  cases (`beam_codec`-owned), and no case disagrees.
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
