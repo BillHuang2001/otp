@@ -557,9 +557,11 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   Owner: `beam_codec` (outside this node).
 - **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
   `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
-  `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a
-  caller-supplied word (`write_record`'s `definition_hash`) because this crate's `hashing` is not
-  bit-exact to `make_hash2`, so `erlang:phash2/1` on a native record remains a hashing-module gap.
+  `record::*`, `number::big_to_f64` and `hashing::compute_record_definition_hash` — the last lets
+  `records:create/4`/`update/4` compute the definition's `hash` word (the C's
+  `make_hash2(TUPLE(module,name,is_exported,keys-in-declaration-order))`, `erl_record.c:1041-1046`)
+  instead of the `make_small(0)` placeholder they currently cache; `write_record` still takes that
+  word as a caller-supplied argument.
   `compare`/`hashing`/`size` still treat records with their generic fallbacks (class-rank / opaque /
   tuple-like); now that the interior is readable they can be made structural later.
 
