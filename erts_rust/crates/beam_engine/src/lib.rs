@@ -60,6 +60,7 @@
 pub mod context;
 pub mod error;
 mod families;
+mod generic;
 pub mod interpreter;
 pub mod jit;
 pub mod machine;

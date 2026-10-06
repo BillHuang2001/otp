@@ -21,8 +21,8 @@ use beam_loader::{
 };
 use beam_term::{
     is_small, make_arityval, make_atom, make_boxed, make_header, make_internal_pid,
-    make_internal_port, make_pid_data, make_port_data, make_small, signed_value, Atom, Eterm,
-    HEADER_FLONUM, HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, REF_SUBTAG,
+    make_internal_port, make_pid_data, make_port_data, make_small, make_tuple, signed_value, Atom,
+    Eterm, HEADER_FLONUM, HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, RECORD_SUBTAG, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -1496,6 +1496,186 @@ fn call_ext_last_deallocates_calls_and_returns() {
     assert_eq!(result.map_err(|_| ()), Ok(make_small(9)));
     assert_eq!(machine.frame_depth(), 1);
     assert_eq!(machine.stack_depth(), 0);
+}
+
+// ---------------------------------------------------------------------------
+// Module-level markers (`nif_start` / `on_load`)
+// ---------------------------------------------------------------------------
+
+#[test]
+fn nif_start_is_a_no_op_that_falls_through() {
+    // `nif_start` marks the start of a function listed in `-nifs()`
+    // (`emu/ops.tab:43`: a bare opcode with no body, so the C emulator falls
+    // through it). It is a pure control-flow marker: the instruction after it runs.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::NifStart,
+        Instr::Move {
+            src: Operand::Integer(7),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(7)));
+}
+
+#[test]
+fn on_load_is_a_no_op_that_falls_through() {
+    // `on_load` marks the `-on_load/1` entry point (`emu/ops.tab:1572`, also a bare
+    // opcode): it falls through to the next instruction.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::OnLoad,
+        Instr::Move {
+            src: Operand::Integer(11),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run(&module, entry, &[]).map_err(|_| ()),
+        Ok(make_small(11))
+    );
+}
+
+#[test]
+fn markers_between_two_labels_do_not_disturb_control_flow() {
+    // `Label(2)`..`Label(3)` hold nothing but the two markers: a `jump` to
+    // `Label(2)` walks straight through them to the code after `Label(3)`, so the
+    // marker path and the label-targeted path reach the same `move`.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Jump { target: Label(2) },
+        Instr::Label(Label(2)),
+        Instr::NifStart,
+        Instr::OnLoad,
+        Instr::Label(Label(3)),
+        Instr::Move {
+            src: Operand::Integer(21),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(
+        run(&module, entry, &[]).map_err(|_| ()),
+        Ok(make_small(21))
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Residual `Instr::Generic`: `is_any_native_record` (the `is_record/1` guard)
+// ---------------------------------------------------------------------------
+
+/// A one-function module whose code is the `is_any_native_record` opcode under
+/// test, shaped like the compiler's output:
+///
+/// ```text
+/// Label(1)
+///   is_any_native_record Label(2) x0   ; succeeds -> fall through
+///   move ok,x0                          ; the success path
+///   return
+/// Label(2)
+///   move fail,x0                        ; the failure path
+///   return
+/// ```
+///
+/// `run` seeds `x0` from the argument, so the returned `x0` selects the path: the
+/// atom `ok` means the test fell through, `fail` means it branched to `Label(2)`.
+fn native_record_test_module() -> (Module, Label) {
+    let mut fixture = Fixture::new();
+    let ok = fixture.atom("ok");
+    let fail = fixture.atom("fail");
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Generic {
+            op: Opcode::is_any_native_record,
+            operands: vec![Operand::Label(Label(2)), Operand::X(0)],
+            offset: 0,
+        },
+        Instr::Move {
+            src: Operand::Atom(ok),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Move {
+            src: Operand::Atom(fail),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 1, code);
+    (fixture.finish(), entry)
+}
+
+#[test]
+fn is_any_native_record_falls_through_on_a_record() {
+    // `is_any_native_record(Fail, Src) { if (!is_record($Src)) { $FAIL($Fail); } }`
+    // (`emu/instrs.tab:1323`): the test succeeds (falls through) iff `Src` is a
+    // native record. A native record is a *boxed* thing whose header carries
+    // `RECORD_SUBTAG` (`erl_term.h:433-438`), i.e. `is_record(x)` is
+    // `is_boxed(x) && is_record_header(*boxed_val(x))`.
+    let (module, entry) = native_record_test_module();
+    let ok = make_atom(module.atom_table.lookup("ok").expect("ok is interned"));
+    let record_words = [make_header(2, RECORD_SUBTAG), make_small(1), make_small(2)];
+    let record = make_boxed(record_words.as_ptr());
+    assert_eq!(run(&module, entry, &[record]).map_err(|_| ()), Ok(ok));
+}
+
+#[test]
+fn is_any_native_record_branches_to_fail_on_a_non_record() {
+    // The three natural negative shapes: `NIL` and a small integer are immediates
+    // (never boxed, so never a record), and a *tuple* is boxed but carries the
+    // `ARITYVAL` subtag — `is_record` is not a tuple test (`erlang:is_record/1`
+    // documents `is_record({a,b,c}) == false`). All of them must branch to `Fail`.
+    let (module, entry) = native_record_test_module();
+    let fail = make_atom(module.atom_table.lookup("fail").expect("fail is interned"));
+    let mut tuple_words = [make_arityval(2), make_small(1), make_small(2)];
+    let tuple = make_tuple(tuple_words.as_mut_ptr());
+
+    for (name, src) in [("nil", NIL), ("small int", make_small(42)), ("tuple", tuple)] {
+        assert_eq!(
+            run(&module, entry, &[src]).map_err(|_| ()),
+            Ok(fail),
+            "is_any_native_record must fail on {name}"
+        );
+    }
+}
+
+#[test]
+fn a_generic_opcode_with_no_implementation_keeps_the_named_unsupported_error() {
+    // `is_native_record` — the 4-operand sibling of `is_any_native_record` that no
+    // module implements yet — must keep the documented typed error carrying the
+    // opcode's own name (`error::unsupported(op.name())`), never a wrong result.
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::Generic {
+            op: Opcode::is_native_record,
+            operands: vec![
+                Operand::Label(Label(2)),
+                Operand::X(0),
+                Operand::X(1),
+                Operand::X(2),
+            ],
+            offset: 0,
+        },
+        Instr::Return,
+        Instr::Label(Label(2)),
+        Instr::Return,
+    ];
+    let mut fixture = Fixture::new();
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_unsupported(run(&module, entry, &[]), "is_native_record");
 }
 
 // ---------------------------------------------------------------------------

@@ -60,6 +60,15 @@ pub(crate) fn is_map(x: Eterm) -> bool {
     unsafe { beam_term::is_map(x) }
 }
 
+/// `is_record(x)` — a boxed native record (`RECORD_SUBTAG`).
+///
+/// This is the C `is_record` macro (`erl_term.h:437`), **not** a tuple test: a
+/// tuple carries the `ARITYVAL` subtag, so `is_record({a,b,c})` is `false`.
+pub(crate) fn is_record(x: Eterm) -> bool {
+    // SAFETY: as [`is_float`].
+    unsafe { beam_term::is_record(x) }
+}
+
 /// `is_binary(x)` — a bitstring whose size is a whole number of bytes.
 pub(crate) fn is_binary(x: Eterm) -> bool {
     // SAFETY: as [`is_float`].
@@ -125,5 +134,28 @@ mod tests {
         assert!(is_tuple_arity(t, 1));
         assert!(!is_tuple_arity(t, 2));
         assert!(!is_map(t));
+    }
+
+    #[test]
+    fn a_record_is_not_a_tuple_and_vice_versa() {
+        // `is_record` is the `RECORD_SUBTAG` test, not a tuple test: a tuple is
+        // *not* a native record (`erlang:is_record/1`: `is_record({a,b,c}) == false`)
+        // and a record is not a tuple.
+        let record_words = [
+            beam_term::make_header(2, beam_term::RECORD_SUBTAG),
+            make_small(0),
+            make_small(0),
+        ];
+        let record = beam_term::make_boxed(record_words.as_ptr());
+        assert!(is_record(record));
+        assert!(!is_tuple(record));
+
+        let mut tuple_words = [make_arityval(2), make_small(0), make_small(0)];
+        let tuple = make_tuple(tuple_words.as_mut_ptr());
+        assert!(!is_record(tuple));
+
+        // Immediates are never records.
+        assert!(!is_record(NIL));
+        assert!(!is_record(make_small(7)));
     }
 }
