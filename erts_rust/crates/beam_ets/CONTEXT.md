@@ -85,7 +85,7 @@ impl Table {
     // metadata
     pub fn id(&self) -> TableId;
     pub fn kind(&self) -> TableKind;
-    pub fn name(&self) -> Option<Atom>;      // Some iff named_table
+    pub fn name(&self) -> Option<Atom>;      // Some iff a name was recorded (independent of named_table)
     pub fn keypos(&self) -> usize;           // 1-based
     pub fn access(&self) -> Access;
     pub fn owner(&self) -> Option<OwnerId>;
