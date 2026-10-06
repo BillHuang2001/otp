@@ -138,12 +138,52 @@ operators) and `<`/`>` between same-typed terms.
   former crate-private helper was removed).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
-### `hashing.rs` — structural term hashing
-- `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash
-  reproducing the *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
-  **The exact hash values are internal and NOT part of any compatibility contract** (nothing
-  outside the Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+### `hashing.rs` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
+Two distinct surfaces live here:
 
+- **The pinned contract: `make_hash2`/`make_hash`.** Bit-exact u32-wrapping ports of
+  `../../erts/emulator/beam/erl_term_hashing.c` (`make_hash2_helper`, `make_hash`), i.e. the values
+  `erlang:phash2/1,2` and `erlang:phash/2` return — so, unlike `term_hash`, **these values ARE part of
+  the Level-1 drop-in contract** and are cross-checked against the live oracle.
+  - `pub fn make_hash2(t: Eterm, atoms: &AtomTable) -> TermResult<u32>` (`erl_term_hashing.c:1597-1601`).
+    The `hash == 0` entry fast paths are applied (`atom ⇒ hvalue`, `small ⇒ SINT32_HASH`/`NOT_SSMALL28_HASH`,
+    `nil ⇒ 3468870702`), then the body runs with an empty work stack. Covers smalls, atoms, nil, tuples,
+    byte-batched lists, flat maps and HAMT maps (xor pair protocol), bitstrings (byte-aligned ⇒
+    `block_hash(bytes, HCONST_13 + hash)`; non-byte-aligned ⇒ bit-copy into a flat buffer; a trailing
+    partial byte ⇒ `UINT32_HASH_2(bitsize, last >> (8-bitsize), HCONST_15)`), floats (`±0.0` normalized
+    to `+0.0`), ± bignums, internal/external refs, external pid/port, and funs.
+  - `pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32>` (`erl_term_hashing.c:165-425`).
+    `erlang:phash(T, R)` is `1 + (make_hash(T) % R)` for `R < 2^32` and `make_hash(T) + 1` for `R = 2^32`
+    (`bif.c:5413-5452`).
+  - `pub fn compute_record_definition_hash(def: Eterm, atoms: &AtomTable) -> TermResult<u32>` — the
+    synthetic record-definition hash (see [`record.rs`](#recordrs) below); named `compute_*` so it does
+    not collide with `record::record_definition_hash` (the header *reader*) under `lib.rs`'s glob re-exports.
+  - **Fun-kind coverage:** `FunKind::External` (`EXPORT_EXT`) and `FunKind::Imported` (`NEW_FUN_EXT`,
+    which carries the same `module`/`index`/`old_uniq`/env fields as the C's `ErlFunEntry`) both compute
+    the oracle's value. `FunKind::Local` (a `make_fun3` closure) returns the typed
+    `TermError::FunIdentityUnavailable` — its inlined 2-word descriptor `[uniq:u64][index:u32]` carries
+    no module and no `old_uniq`, so the C's `UINT32_HASH_2(num_free, hvalue(module), HCONST)` is not
+    reproducible; a wrong value is never substituted.
+- **The internal structural hash: `term_hash`.**
+  `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash reproducing the
+  *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
+  **The exact hash values are internal and NOT part of any compatibility contract** (nothing outside the
+  Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+- `tests/oracle.rs::oracle_agrees_on_make_hash2_and_make_hash` is the live cross-check: one `Spec`
+  description is materialized **both** as a `beam_term` term and as Erlang source text (~90 terms), and
+  the four contract identities above are asserted for every one of them. 25 of the resulting vectors are
+  pinned offline in `hashing::exact_hash_tests::make_hash2_and_make_hash_pin_the_oracle_vectors`, so the
+  contract still has teeth without `erl` on `PATH`.
+
+### `ihash.rs` — the bit-exact `erts_map_hash`
+The **erlang map hash** (`erl_term_hashing.c:1955-2130`, `IHASH_*`/`make_internal_hash`):
+`erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers
+`swizzle_map_hash` (a nibble reversal of the 64-bit hash) and `hashmap_nibble` (the level-`L`
+least-significant nibble). This is what [`map.rs`](#maprs--flat-map--hamtchamp-builder-lookups-structural-size)
+places leaves with, so a `write_map`-built hash map's stored pair order equals the oracle's
+`maps:to_list/1` order (`tests/map_hash.rs`). Classes whose C hash is pointer-derived (external
+pid/port/ref, external/local fun, internal ref) use a documented deterministic substitute; the C hash is
+itself documented non-portable across VM instances.
 ### `size.rs` — object word size
 - `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
   occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
