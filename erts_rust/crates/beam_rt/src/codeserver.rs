@@ -40,6 +40,7 @@ use std::collections::HashMap;
 use std::env;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::rc::Rc;
 use std::sync::{Arc, OnceLock};
 
 use beam_common::Result;
@@ -52,7 +53,15 @@ use crate::error;
 /// ordered code path.
 pub struct CodeServer {
     /// The one atom table every loaded module is interned into.
-    atoms: AtomTable,
+    ///
+    /// Shared through an [`Rc`] so a BIF call can hand a `BifContext` a table handle that
+    /// does **not** borrow the runtime: [`CodeServer::atoms_handle`] clones the `Rc` and
+    /// the context borrows the clone's contents, leaving the runtime free for the
+    /// fun-caller bridge (`../beam_rt/src/context.rs`). Interning goes through
+    /// [`CodeServer::atoms_mut`], which is copy-on-write ([`Rc::make_mut`]): while a
+    /// caller still holds a handle (a BIF in flight), a write clones the table instead of
+    /// aliasing it, and the clone keeps every index identical (interning is append-only).
+    atoms: Rc<AtomTable>,
     /// Loaded modules, by name — `Arc` so a caller can hold one while the server keeps
     /// loading others (`Module` is `!Send`/`!Sync`, so it is never shared across threads).
     modules: HashMap<String, Arc<Module>>,
@@ -71,7 +80,7 @@ impl CodeServer {
     /// path never depends on a system Erlang installation.
     pub fn new() -> CodeServer {
         CodeServer {
-            atoms: AtomTable::new(),
+            atoms: Rc::new(AtomTable::new()),
             modules: HashMap::new(),
             module_paths: HashMap::new(),
             paths: Vec::new(),
@@ -112,8 +121,21 @@ impl CodeServer {
     }
 
     /// The one shared atom table, mutably — the runtime seeds and interns through it.
+    ///
+    /// Copy-on-write: while another holder still has a handle (a BIF in flight), the
+    /// write clones the table rather than aliasing it (the clone preserves every index).
     pub fn atoms_mut(&mut self) -> &mut AtomTable {
-        &mut self.atoms
+        Rc::make_mut(&mut self.atoms)
+    }
+
+    /// A cheap handle to the shared atom table, for a BIF call.
+    ///
+    /// The handle does not borrow the server, so a caller can keep a `BifContext` over
+    /// the table's contents (through the handle's `Deref`) while the runtime itself stays
+    /// mutably borrowed by the fun-caller bridge. Interning still goes through
+    /// [`CodeServer::atoms_mut`].
+    pub(crate) fn atoms_handle(&self) -> Rc<AtomTable> {
+        Rc::clone(&self.atoms)
     }
 
     /// The code path, in search order.
@@ -263,7 +285,7 @@ impl CodeServer {
         let mut wire: Vec<Atom> = Vec::with_capacity(chunks.atoms.len());
         wire.push(Atom::MAX);
         for name in &chunks.atoms[1..] {
-            wire.push(self.atoms.intern(name));
+            wire.push(self.atoms_mut().intern(name));
         }
 
         let raw = decode::decode_stream(
@@ -277,11 +299,11 @@ impl CodeServer {
         // decodes the `LitT` literals; any atom that appeared only in a literal is
         // appended after the clone's prefix at exactly `atoms.len()..`, so merging
         // them back in index order keeps the shared indices identical.
-        let module = lower::build_module(&chunks, &raw, self.atoms.clone())?;
+        let module = lower::build_module(&chunks, &raw, (*self.atoms).clone())?;
         let base = self.atoms.len();
         for index in base..module.atom_table.len() {
             if let Some(name) = module.atom_table.name(Atom::from_raw(index as u32)) {
-                self.atoms.intern(name);
+                self.atoms_mut().intern(name);
             }
         }
 

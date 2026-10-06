@@ -478,6 +478,51 @@ fn lowers_the_bitstring_opcodes_to_typed_variants() {
     }
 }
 
+// ---- `bs_create_bin` with an allocation-list `Alloc` ------------------------
+
+/// Loads the committed `bsalloc.beam` oracle fixture.
+fn load_bsalloc() -> Module {
+    load_file(concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/bsalloc.beam"
+    ))
+    .expect("the bsalloc oracle fixture must load")
+}
+
+#[test]
+fn lowers_bs_create_bin_with_an_allocation_list_alloc() {
+    // `bsalloc.beam`'s single `bs_create_bin` carries
+    // `{alloc,[{words,4},{floats,0},{funs,1}]}` as its `Alloc` operand: the
+    // compiler hoists a block's heap need into the `bs_create_bin` it precedes
+    // (`beam_ssa_codegen.erl:342-352`). The loader must accept the `z,3` form —
+    // `dets_v9.beam`/`shell_docs.beam` (and 87 other real OTP modules) failed the
+    // whole load with `BadArg` before it did.
+    let module = load_bsalloc();
+    let instr = find(&module, |i| matches!(i, Instr::BsCreateBin { .. }))
+        .expect("a `bs_create_bin` lowers to Instr::BsCreateBin");
+    match instr {
+        Instr::BsCreateBin {
+            fail,
+            alloc,
+            live,
+            unit,
+            dst,
+            segments,
+        } => {
+            assert_eq!(*fail, NO_FAIL);
+            // 4 heap words + 0 floats + 1 fun (the loader's `number`-words
+            // placeholder for a fun entry) — the word total the real loader
+            // computes with `marshal_allocation_list` (`beam_file.c:2234-2284`).
+            assert_eq!(*alloc, 5);
+            assert_eq!(*live, 2);
+            assert_eq!(*unit, 8);
+            assert_eq!(*dst, Operand::X(2));
+            assert!(!segments.is_empty(), "the flattened segment list is retained");
+        }
+        other => panic!("expected Instr::BsCreateBin, got {other:?}"),
+    }
+}
+
 // ---- stack frames / heap need ----------------------------------------------
 
 #[test]

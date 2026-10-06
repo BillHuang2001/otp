@@ -24,12 +24,56 @@
 //! All reads go through [`beam_codec::Reader`] (the shared bounds-checked
 //! big-endian cursor); a malformed stream yields `BeamError::BadArg`, never a panic.
 use beam_common::Result;
-use beam_term::Atom;
+use beam_term::{Atom, MAX_SMALL, MIN_SMALL};
 
 use crate::error::bad_file;
 use crate::ir::{CodeVersion, TypeTable};
 use crate::opcode::Opcode;
 use crate::operand::{AllocKind, Label, Operand, Reg, TypeIndex};
+
+/// The `u` (unsigned) operand tag: the low three bits of the tag byte.
+const TAG_U: u8 = 0;
+/// The `i` (signed) operand tag. It is the **only** tag allowed to hold a negative
+/// value or one wider than a machine word (`beam_file.c:228-231`).
+const TAG_I: u8 = 1;
+
+/// One decoded tag/length number: the tag and its magnitude
+/// (`beam_file.c:167-240`, `beamreader_read_tagged`).
+///
+/// The C reader first tries to unpack the magnitude into one machine word
+/// (`unpack_varint`); when that succeeds — and, for an `i` value, when the
+/// sign-extended result is still a small integer (`IS_SSMALL`) — the value is
+/// *inline* and [`TaggedNumber::bytes`] is empty, with [`TaggedNumber::word`]
+/// holding it. Otherwise the value stays as its raw big-endian field and the C keeps
+/// the `count` bytes in `ptr_value` with `size = count`; that is
+/// [`TaggedNumber::bytes`] here (and `word` is then meaningless, mirroring the C's
+/// union, which the overflow path overwrites).
+pub(crate) struct TaggedNumber<'a> {
+    /// The low three bits of the tag byte (`0 u`, `1 i`, `2 a`, …).
+    pub(crate) tag: u8,
+    /// The value when it fits one machine word: the raw unpacked value for every tag
+    /// but `i`, the sign-extended value for a small `i`. Meaningless when `bytes` is
+    /// non-empty.
+    pub(crate) word: i64,
+    /// The raw **big-endian** magnitude bytes when the value did not fit a machine
+    /// word (or an `i` value did not stay a small); empty otherwise.
+    pub(crate) bytes: &'a [u8],
+}
+
+impl TaggedNumber<'_> {
+    /// The inline value as an unsigned word.
+    ///
+    /// The `AtU8`/`Line` chunk parsers need a plain length/index and assert the
+    /// number fit a word (`len.size == 0`, `beam_file.c:282`), so a wider one is the
+    /// loader's documented [`beam_common::BeamError::SystemLimit`].
+    pub(crate) fn word_or_system_limit(&self) -> Result<u64> {
+        if self.bytes.is_empty() {
+            Ok(self.word as u64)
+        } else {
+            Err(beam_common::BeamError::SystemLimit)
+        }
+    }
+}
 
 /// Reads one packed "tagged number" from a stream (`beam_file.c:167-240`,
 /// `beamreader_read_tagged`).
@@ -46,42 +90,87 @@ use crate::operand::{AllocKind, Label, Operand, Reg, TypeIndex};
 /// big-endian magnitude bytes, where `(byte >> 5) == 7` means a `u`-tagged sub-length
 /// `S` precedes `S + 9` magnitude bytes.
 ///
-/// Returns `(tag, magnitude, byte_count)`:
-/// * `tag` — the low three bits of the tag byte (`0 u`, `1 i`, `2 a`, …).
-/// * `magnitude` — the raw big-endian integer value.
-/// * `byte_count` — the number of magnitude bytes the value was packed in, `0` for
-///   the in-nibble form (used by [`decode_operand`] to sign-extend an `i` value).
-///
-/// A magnitude wider than eight bytes yields `BeamError::SystemLimit`; a sub-length
-/// whose tag is not `u` yields `BeamError::BadArg`. Never panics.
-pub(crate) fn read_tagged(r: &mut beam_codec::Reader<'_>) -> Result<(u8, u64, usize)> {
+/// The value is inlined into [`TaggedNumber::word`] when it fits one machine word
+/// — for an `i` value only while its sign extension is still `IS_SSMALL`
+/// (`beam_file.c:209-225`) — and otherwise returned as the raw big-endian
+/// [`TaggedNumber::bytes`]. A sub-length whose tag is not `u`, or one at/above the
+/// C's `ERTS_SINT32_MAX - 9` bound (`beam_file.c:201`), yields
+/// `BeamError::BadArg`. Never panics.
+pub(crate) fn read_tagged<'a>(r: &mut beam_codec::Reader<'a>) -> Result<TaggedNumber<'a>> {
     let b = r.u8()?;
     let tag = b & 0x07;
     if (b & 0x08) == 0 {
-        return Ok((tag, (b >> 4) as u64, 0));
+        return Ok(TaggedNumber {
+            tag,
+            word: i64::from(b >> 4),
+            bytes: &[],
+        });
     }
     if (b & 0x10) == 0 {
         let tail = r.u8()?;
-        return Ok((tag, (((b >> 5) as u64) << 8) | tail as u64, 1));
+        let value = (u64::from(b >> 5) << 8) | u64::from(tail);
+        return Ok(TaggedNumber {
+            tag,
+            word: value as i64,
+            bytes: &[],
+        });
     }
     let count = if (b >> 5) < 7 {
-        (b >> 5) as u64 + 2
+        usize::from(b >> 5) + 2
     } else {
-        let (sub_tag, sub_value, _) = read_tagged(r)?;
-        if sub_tag != 0 {
-            return Err(crate::error::bad_file("tagged sub-length is not unsigned"));
+        let prefix = read_tagged(r)?;
+        // `LoadAssert(size_prefix.tag == TAG_u)` (`beam_file.c:198`).
+        if prefix.tag != TAG_U {
+            return Err(bad_file("tagged sub-length is not unsigned"));
         }
-        sub_value + 9
+        // `LoadAssert(unpacked_size < (ERTS_SINT32_MAX - size_base))`
+        // (`beam_file.c:201`): the bound keeps `count` far away from overflowing.
+        let length = prefix.word_or_system_limit()?;
+        if length >= u64::from(i32::MAX as u32) - 9 {
+            return Err(bad_file("tagged sub-length is too large"));
+        }
+        length as usize + 9
     };
-    if count > 8 {
-        return Err(beam_common::BeamError::SystemLimit);
+    let bytes = r.bytes(count)?;
+
+    // `unpack_varint` (`beam_file.c:150-165`): a value packed in at most one machine
+    // word is unpacked here. `count` is never zero (`>= 2` above).
+    if count <= 8 {
+        let mut raw: u64 = 0;
+        for &byte in bytes {
+            raw = (raw << 8) | u64::from(byte);
+        }
+        if tag == TAG_I {
+            // The C sign-extends an `i` value from `count * 8` bits and keeps it
+            // inline only while it is *still* a small (`beam_file.c:209-221`); a
+            // wider value keeps its raw bytes and is turned into a bignum literal by
+            // `marshal_integer`. An `i` operand that is neither would be handed to
+            // `make_small` out of range, i.e. a wrong term.
+            let signed = sign_extend(raw, count);
+            if (MIN_SMALL..=MAX_SMALL).contains(&signed) {
+                return Ok(TaggedNumber {
+                    tag,
+                    word: signed,
+                    bytes: &[],
+                });
+            }
+        } else if (raw as i64) >= 0 {
+            // For every other tag the C keeps the value only while it is
+            // non-negative as a *signed* word (`beam_file.c:222-225`); anything else
+            // overflows to the valueless `TAG_o`, which the callers reject.
+            return Ok(TaggedNumber {
+                tag,
+                word: raw as i64,
+                bytes: &[],
+            });
+        }
     }
-    let bytes = r.bytes(count as usize)?;
-    let mut value: u64 = 0;
-    for &byte in bytes {
-        value = (value << 8) | byte as u64;
-    }
-    Ok((tag, value, count as usize))
+
+    Ok(TaggedNumber {
+        tag,
+        word: 0,
+        bytes,
+    })
 }
 
 /// One decoded instruction: opcode, operands and its byte offset in the stream.
@@ -169,8 +258,13 @@ pub fn decode_stream(
 /// X/Y register (the type index is discarded), and a `z,1` argument list recurses
 /// into [`decode_operand`].
 ///
-/// A short read, an out-of-range atom index or an unknown/obsolete `z` sub-tag
-/// (notably sub-tag 0, the obsolete float form) yields
+/// An `i` operand whose value does not fit a small integer decodes to
+/// [`Operand::BigInteger`] (the C's bignum-literal operand, `beam_file.c:2134-2232`);
+/// every *other* tag whose value did not fit a machine word overflowed to the C's
+/// valueless `TAG_o` (`beam_file.c:228-233`), which is a malformed image here.
+///
+/// A short read, an out-of-range atom index, an over-wide non-`i` operand or an
+/// unknown/obsolete `z` sub-tag (notably sub-tag 0, the obsolete float form) yields
 /// [`beam_common::BeamError::BadArg`]. Never panics.
 pub fn decode_operand(
     r: &mut beam_codec::Reader<'_>,
@@ -178,22 +272,28 @@ pub fn decode_operand(
     types: &TypeTable,
 ) -> Result<Operand> {
     // One tag/length byte plus its magnitude, decoded by the shared primitive.
-    let (tag, magnitude, byte_count) = read_tagged(r)?;
+    let tagged = read_tagged(r)?;
+    let tag = tagged.tag;
+    if !tagged.bytes.is_empty() {
+        // The value did not fit a machine word: only `i` is allowed to be wider than
+        // a word (it becomes a bignum literal); any other tag is the C's valueless
+        // `TAG_o`, which fails the load (`beam_file.c:228-233`).
+        if tag != TAG_I {
+            return Err(bad_file("operand is wider than a machine word"));
+        }
+        return big_integer_operand(tagged.bytes);
+    }
+    let magnitude = tagged.word as u64;
 
     match tag {
         // `u` — untagged integer. The file's encoding is unsigned; the value is
         // carried as the IR's `i64` (the compiler only emits tagged integers that
-        // fit, and `i` is the tag for a negative value).
+        // fit, and `i` is the tag for a negative value). A `u` value above
+        // `i64::MAX` is rejected above as an overflow (`beam_file.c:222-225`).
         0 => Ok(Operand::Integer(magnitude as i64)),
-        // `i` — signed integer. A negative value is *always* packed in the
-        // explicit-count form (2–8 magnitude bytes, so `byte_count >= 2`): the
-        // compiler's writer routes every `N < 0` through `encode1/2`
-        // (`../../lib/compiler/src/beam_asm.erl:856`), and `beamreader_read_tagged`
-        // sign-extends only that branch, from `count * 8` bits
-        // (`beam_file.c:205-215`). The in-nibble form (0–15) and the 1-byte-tail
-        // form (16–0x7FF) are read as positive values, because that is what a
-        // *positive* operand of either width is written as (`beam_asm.erl:858-860`).
-        1 if byte_count >= 2 => Ok(Operand::Integer(sign_extend(magnitude, byte_count))),
+        // `i` — signed integer, already sign-extended (and small-checked) by
+        // `read_tagged`; a value too wide for a small took the [`Operand::BigInteger`]
+        // path above.
         1 => Ok(Operand::Integer(magnitude as i64)),
         // `a` — atom index (0 ⇒ NIL).
         2 => {
@@ -221,11 +321,55 @@ pub fn decode_operand(
     }
 }
 
+/// Builds the IR operand for an `i`-tagged integer that does not fit a machine word
+/// (or no longer fits a small after sign extension).
+///
+/// `bytes` is the raw **big-endian** `count`-byte field, which the C reads as a
+/// signed `count * 8`-bit two's-complement integer: it takes the sign from the top
+/// bit, negates the field when negative and normalizes at most one leading zero
+/// byte; a field with two leading zero bytes is "not normalized" and a corrupt file
+/// (`marshal_integer`, `beam_file.c:2155-2208`). The result is the value's sign and
+/// magnitude, which [`crate::lower`] materializes as a bignum static literal.
+fn big_integer_operand(bytes: &[u8]) -> Result<Operand> {
+    // `bytes` is non-empty (the explicit-count form packs at least two bytes).
+    debug_assert!(!bytes.is_empty(), "an operand field is never empty");
+    let negative = bytes[0] & 0x80 != 0;
+
+    // The magnitude, little-endian first (the order the C builds in `conv_buf`).
+    let mut magnitude: Vec<u8> = bytes.iter().rev().copied().collect();
+    if negative {
+        // Two's-complement negation, exactly `beam_file.c:2175-2184`. The field is a
+        // two's-complement encoding of a negative value, so the carry is consumed
+        // within its width.
+        let mut carry = 1u16;
+        for byte in &mut magnitude {
+            let negated = u16::from(!*byte) + carry;
+            *byte = negated as u8;
+            carry = negated >> 8;
+        }
+    }
+
+    // Strip at most one leading zero byte; two mean the field was not normalized.
+    if magnitude.last() == Some(&0) {
+        magnitude.pop();
+        if magnitude.last().is_none_or(|byte| *byte == 0) {
+            return Err(bad_file("wide integer operand is not normalized"));
+        }
+    }
+
+    magnitude.reverse();
+    Ok(Operand::BigInteger {
+        negative,
+        magnitude,
+    })
+}
+
 /// Sign-extends an `i`-tagged magnitude packed in `byte_count` magnitude bytes.
 ///
-/// Only the explicit-count form (`2..=8` bytes — see [`decode_operand`]'s `i` arm)
-/// reaches here, so the value's sign bit is the top bit of that width and the left
-/// shift is `16..=48`, which never overflows (`beam_file.c:205-215`).
+/// Only the explicit-count form (`2..=8` bytes — the `count <= 8` branch of
+/// [`read_tagged`], the only place an `i` value is sign-extended) reaches here, so
+/// the value's sign bit is the top bit of that width and the left shift is `16..=48`,
+/// which never overflows (`beam_file.c:205-215`).
 fn sign_extend(magnitude: u64, byte_count: usize) -> i64 {
     let shift = 64 - 8 * byte_count;
     ((magnitude << shift) as i64) >> shift
@@ -309,13 +453,16 @@ fn decode_extended(
 /// Reads one `u`-tagged (unsigned) sub-operand, rejecting every other tag.
 ///
 /// Every `z` sub-tag payload is an unsigned count or index (`beam_file.c` asserts
-/// `TAG_u` at each of them), so any other tag means the stream is malformed.
+/// `TAG_u` at each of them), so any other tag means the stream is malformed — as does
+/// a value that did not fit a machine word.
 fn read_unsigned(r: &mut beam_codec::Reader<'_>, msg: &str) -> Result<u64> {
-    let (tag, value, _) = read_tagged(r)?;
-    if tag != 0 {
+    let tagged = read_tagged(r)?;
+    if tagged.tag != TAG_U {
         return Err(bad_file(msg));
     }
-    Ok(value)
+    tagged
+        .word_or_system_limit()
+        .map_err(|_| bad_file("unsigned sub-operand is wider than a machine word"))
 }
 
 /// One `z,3` allocation-list entry, with its heap-word contribution.
@@ -602,6 +749,87 @@ mod tests {
             .unwrap(),
             Operand::Integer(-1)
         );
+    }
+
+    /// Packs a `>= 9`-byte magnitude into the file's *sub-length* form: the tag byte
+    /// `0xF8 | tag` (`(byte >> 5) == 7`) announces a `u`-tagged sub-length `S`, after
+    /// which `S + 9` magnitude bytes follow (`beam_file.c:192-204`). This is the only
+    /// encoding that carries a field wider than one machine word.
+    fn tagged_wide(tag: u8, magnitude_be: &[u8]) -> Vec<u8> {
+        assert!(tag <= 7, "a `.beam` file only ever carries tags 0-7");
+        assert!(
+            magnitude_be.len() >= 9,
+            "the direct-count form covers 2..=8 bytes"
+        );
+        let mut out = vec![0xF8 | tag];
+        out.extend(tagged(0, (magnitude_be.len() - 9) as u64));
+        out.extend_from_slice(magnitude_be);
+        out
+    }
+
+    #[test]
+    fn decodes_a_wide_signed_integer_operand() {
+        // A 9-byte negative field: `FF 00 … 00` is `-2^64` as a 72-bit
+        // two's-complement integer (`marshal_integer`, `beam_file.c:2168-2208`).
+        let mut field = vec![0xFFu8];
+        field.extend_from_slice(&[0u8; 8]);
+        let bytes = tagged_wide(1, &field);
+        assert_eq!(
+            decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
+            Operand::BigInteger {
+                negative: true,
+                magnitude: vec![1, 0, 0, 0, 0, 0, 0, 0, 0],
+            }
+        );
+
+        // A 9-byte positive field `00 FF … FF` is `2^64 - 1`; the single leading zero
+        // byte is normalized away, exactly as the C does (`beam_file.c:2186-2203`).
+        let mut field = vec![0x00u8];
+        field.extend_from_slice(&[0xFFu8; 8]);
+        let bytes = tagged_wide(1, &field);
+        assert_eq!(
+            decode_operand(&mut beam_codec::Reader::new(&bytes), &[], &fallback_types()).unwrap(),
+            Operand::BigInteger {
+                negative: false,
+                magnitude: vec![0xFF; 8],
+            }
+        );
+
+        // The raw field is reported as the overflow field, never unpacked into a word
+        // (`unpack_varint` refuses `count > sizeof(SWord)`).
+        let mut field = vec![0x00u8];
+        field.extend_from_slice(&[0xFFu8; 8]);
+        let bytes = tagged_wide(1, &field);
+        let tagged = read_tagged(&mut beam_codec::Reader::new(&bytes)).unwrap();
+        assert_eq!(tagged.tag, TAG_I);
+        assert_eq!(tagged.bytes.len(), 9);
+    }
+
+    #[test]
+    fn rejects_a_non_i_operand_wider_than_a_machine_word() {
+        // Only `i` may be negative or wider than a word; every other tag overflows to
+        // the C's valueless `TAG_o` (`beam_file.c:228-233`), which is a malformed image
+        // here (the parser rejects it before any tag-specific work).
+        for tag in [0u8, 2, 3, 4, 5, 6, 7] {
+            let bytes = tagged_wide(tag, &[0xFF; 9]);
+            assert_bad_arg(decode_operand(
+                &mut beam_codec::Reader::new(&bytes),
+                &[],
+                &fallback_types(),
+            ));
+        }
+    }
+
+    #[test]
+    fn rejects_a_non_normalized_wide_integer_operand() {
+        // Two leading zero bytes after negation mean the field was not normalized (a
+        // corrupt file); `marshal_integer` returns 0 (`beam_file.c:2190-2202`).
+        let bytes = tagged_wide(1, &[0u8; 9]);
+        assert_bad_arg(decode_operand(
+            &mut beam_codec::Reader::new(&bytes),
+            &[],
+            &fallback_types(),
+        ));
     }
 
     #[test]

@@ -42,8 +42,9 @@ pub fn parse(data: &[u8]) -> Result<Vec<String>> {
 
     for _ in 0..count {
         let len = if long {
-            // The length is itself a packed tag/length number (tag `u`).
-            crate::decode::read_tagged(&mut reader)?.1 as usize
+            // The length is itself a packed tag/length number (tag `u`), which the
+            // C asserts fits a word (`len.size == 0`).
+            crate::decode::read_tagged(&mut reader)?.word_or_system_limit()? as usize
         } else {
             reader.u8()? as usize
         };

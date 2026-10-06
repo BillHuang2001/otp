@@ -54,9 +54,10 @@
 //! no GC in the engine yet (`../beam_engine` Known Issues). The production collector is
 //! Stage 4 (`beam_gc`), which will run *here* and may move terms.
 
+use std::rc::Rc;
 use std::sync::Arc;
 
-use beam_bifs::{AtomInterner, BifContext, OutputSink};
+use beam_bifs::{AtomInterner, BifContext, FunCaller, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
@@ -142,6 +143,22 @@ impl<'a> RuntimeContext<'a> {
     /// without aliasing it: the interner records the names, the BIF runs against the
     /// immutable table, and the names are committed (in order, at their predicted
     /// indices) once the BIF has returned and released the borrow — see the module docs.
+    ///
+    /// # Why every resource is a local
+    ///
+    /// The `fun`-taking `lists`/`maps` BIFs call back into the runtime through
+    /// [`FunBridge`] (the [`FunCaller`] seam), which needs `&mut Runtime`. The
+    /// [`BifContext`] therefore holds **no** borrow of the runtime: the registry, the
+    /// atom table and the tables are cheap `Rc` clones (the atom handle dereferences to
+    /// the shared table without borrowing the server), the heap comes from the BIF heap
+    /// pool, and the output sink is a disjoint field of this context. The only borrow of
+    /// the runtime is the bridge's.
+    ///
+    /// A **nested** call (inside a fun a BIF applied) re-enters here through the bridge:
+    /// it takes its own heap, shares the atom table through another `Rc` handle, and
+    /// finds the tables already borrowed — so it runs without ETS (the `ets:*` BIFs raise
+    /// `unsupported_bif`, never a wrong result). Its output goes to the process's stdout,
+    /// because the outer call holds the sink.
     fn call_registered(
         &mut self,
         module: &str,
@@ -149,35 +166,67 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let Runtime {
-            registry,
-            heap,
-            code_server,
-            self_pid,
-            tables,
-            ..
-        } = self.runtime;
+        // Cheap handles that do NOT borrow the runtime: the runtime stays free for the
+        // fun-caller bridge.
+        let registry = Rc::clone(&self.runtime.registry);
+        let atoms = self.runtime.code_server.atoms_handle();
+        let tables_handle = Rc::clone(&self.runtime.tables);
+        let mut heap = self.runtime.take_bif_heap()?;
+        let self_pid = self.runtime.self_pid;
         // `base` is the shared table's length before the call: the index the first new
-        // name gets, because nothing else can intern while this single-threaded call runs.
-        let mut pending = PendingInterner::new(code_server.atoms().len());
-        // The `BifContext` borrows `code_server`'s table immutably; the interner is a
-        // separate local, so the two borrows never overlap.
+        // name gets, because nothing else interns while this single-threaded call runs.
+        let mut pending = PendingInterner::new(atoms.len());
         let result = {
-            let mut context = BifContext::new(heap, code_server.atoms(), *self_pid)
-                .with_atom_interner(&mut pending);
-            if let Some(sink) = self.output.as_deref_mut() {
+            let RuntimeContext { runtime, output } = self;
+            // The tables are held for the duration of this call; a nested call finds them
+            // taken and runs without ETS rather than aliasing or panicking.
+            let mut tables = tables_handle.try_borrow_mut().ok();
+            let mut bridge = FunBridge { runtime };
+            let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                .with_atom_interner(&mut pending)
+                .with_fun_caller(&mut bridge);
+            if let Some(sink) = output.as_deref_mut() {
                 context = context.with_output(sink);
             }
-            context = context.with_tables(tables);
+            if let Some(tables) = tables.as_deref_mut() {
+                context = context.with_tables(tables);
+            }
             registry.call(module, function, arity, &mut context, args)
         };
-        // The BIF is done and the table borrow released, so commit the names it interned:
+        // The BIF is done and every borrow released, so commit the names it interned:
         // each lands at the index the interner predicted, keeping the BIF's atom terms
         // (and every printer/comparison that resolves them) consistent.
         for name in pending.into_pending() {
-            code_server.atoms_mut().intern(&name);
+            self.runtime.code_server.atoms_mut().intern(&name);
         }
+        self.runtime.put_bif_heap(heap);
         result
+    }
+}
+
+/// The `beam_bifs` fun-calling seam: runs a fun term for a `fun`-taking BIF.
+///
+/// The `fun`-taking `lists`/`maps` BIFs (`lists:map/2`, `lists:foldl/3`, `lists:sort/2`,
+/// `maps:map/2`, …) are plain Rust functions and cannot execute BEAM code themselves, so
+/// they call their fun through [`BifContext::call_fun`] — this is the concrete
+/// [`FunCaller`] the runtime installs. It borrows the whole runtime (the caller's
+/// `BifContext` holds only locals and cheap clones, so the runtime is free), builds a
+/// nested [`RuntimeContext`] over it and delegates to [`ExecutionContext::apply_fun`]:
+/// an `-eval` closure (`uniq` == [`crate::eval::EVAL_FUN_UNIQ`]) is applied through
+/// [`crate::eval::apply_eval_closure`], and every other fun is a `.beam` fun applied
+/// through `Machine::run_label` — exactly the semantics a direct `call_fun` opcode has.
+struct FunBridge<'a> {
+    /// The runtime the fun runs on.
+    runtime: &'a mut Runtime,
+}
+
+impl FunCaller for FunBridge<'_> {
+    fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        // A fresh nested context over the same runtime. It carries no output sink (the
+        // outer BIF call holds it), so a nested `io:format` writes to stdout — an honest
+        // Milestone-1 gap, never a wrong result.
+        let mut ctx = RuntimeContext::new(self.runtime);
+        ctx.apply_fun(fun, args)
     }
 }
 

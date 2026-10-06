@@ -27,7 +27,11 @@ Both are the *only* entry points; all intermediate types are public for inspecti
 - `pub type LineRef = u32;` — index into `Module.line.items` (`items[0]` = undefined location).
 - `pub enum Operand { X(u32), Y(u32), Integer(i64), Atom(Atom), Nil, Label(Label), Character(u32),
   FloatReg(u32), Literal(u32), Typed { reg: Reg, ty: TypeIndex }, List(Vec<Operand>),
-  Allocation(Vec<AllocKind>) }` — a *typed* `.beam` operand.
+  Allocation(Vec<AllocKind>), BigInteger { negative: bool, magnitude: Vec<u8> } }` — a *typed* `.beam`
+  operand.
+  `Operand::BigInteger` is a **decode-time-only** form — the C `TAG_o` overflow state for an `i` operand
+  wider than a machine word (`beam_file.c:207-237`); `lower::build_module` rewrites it to a synthesized
+  `Operand::Literal` (a bignum literal), so a loaded `Module` never carries it.
   `Operand::Literal(idx)` is an index into the module's decoded [`LiteralArea`], resolved through `Module::literal`.
 - `pub struct AllocKind { pub kind: u32, pub number: u32, pub words: u32 }` — one decoded
   `z,3` allocation entry (`words` = the entry's contribution to the heap-word total).
@@ -202,11 +206,13 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
   `entries[0]` = "any"), then per entry `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
-- **`LitT`** — `u32 uncompressed_size` (`0` ⇒ payload stored verbatim; non-zero ⇒ zlib/deflate), then
-  `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes). `src/chunk/literal.rs`
+- **`LitT`** — `u32 uncompressed_size` (`0` ⇒ the records follow verbatim; non-zero ⇒ the rest of the
+  chunk is a zlib (RFC 1950) stream that inflates to exactly `uncompressed_size` bytes, which ARE the
+  records), then `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes).
+  `src/chunk/literal.rs` handles **both** forms — the compressed form via the public
+  `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
-  into a term once at load time. The **compressed (`uncompressed_size != 0`) form is unsupported**
-  (no zlib dep) and returns a clear `BadArg`. Static literals are referenced by `Operand::Literal(idx)`.
+  into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
 - **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Recs`** — data-only; captured raw (`StrT` → bytes,
   `Attr`/`CInf` → `Option<Vec<u8>>`). No parsing.
 ### Operand tags (`src/operand.rs` + `src/decode.rs`) — the authoritative table
@@ -310,6 +316,17 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   alternatives) use the `f` tag and are strict `Label`s. An `i` operand is sign-extended only in the
   explicit-count form (`read_tagged` `byte_count >= 2`); the 1-byte-tail form (values 16–0x7FF) is
   unsigned — matching `beam_file.c`.
+- **Wide integer instruction operands become synthesized literals.** A `u`/`i` operand whose magnitude
+  does not fit a machine word is the C `TAG_o` overflow state (`beam_file.c:207-237`); the decoder models
+  it as `Operand::BigInteger`, and `lower::build_module` appends a synthesized ETF bignum payload to the
+  module's literal set and rewrites the operand to `Operand::Literal`. This keeps `.beam`-wire concerns in
+  `beam_loader`, mirrors the C (`marshal_integer` → `beamfile_add_literal`) and needs no engine change
+  (the engine already resolves `Operand::Literal` via `Machine::literal`).
+- **The `bs_create_bin` allocation operand accepts both encodings.** The compiler hoists a block's heap
+  need into a preceding `bs_create_bin` (`beam_ssa_codegen.erl`, `need_heap_terminator`), so that `z`-op
+  operand can be a bare word count or a `z,3` allocation list. `lower_instr` decodes it through
+  `HeapNeed` (exactly as `test_heap`/`allocate` do), taking `HeapNeed::words()` for the `u32` field —
+  matching the C `marshal_allocation_list`, which always marshals any `z,3` to a single word total.
 
 ## Test Strategy
 - **Fixtures:** two committed oracle `.beam` files, both compiled from the checked-in `.erl` sources with
@@ -338,6 +355,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   a chunk size that overruns the file, an unknown/out-of-range opcode byte, an out-of-range atom/label
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
   and a compressed `LitT` ⇒ each a typed `BeamError` (no panic).
+- **`tests/real_modules.rs`:** loads every `.beam` of the installed OTP `stdlib`/`kernel`/`compiler`
+  `ebin` dirs through the public pipeline, asserting a load floor while allowlisting the known failures
+  (a NEW failure fails the test; a module dropping off the allowlist is only reported). Loudly skips when
+  the system `erl`/OTP is unavailable.
+- **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
 - Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Gate (GREEN required):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
@@ -351,12 +373,14 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`), whose operands need
   record-descriptor modelling the IR does not own yet, and the obsolete/transform-only `genop.tab`
   entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
-- **The compressed `LitT` form is unsupported** (`uncompressed_size != 0`, i.e. zlib/deflate; there is no
-  zlib dependency) ⇒ a typed `BadArg`.
-- **Upstream `beam_codec` literal-materialization gap.** `beam_codec::decode_term` does not yet decode
-  `EXPORT_EXT` or `BINARY_EXT`, so a module whose `LitT` holds an exported fun or a binary literal fails
-  to load with a typed `BadArg`. This is an upstream (`beam_codec`) dependency limitation, observed for
-  real stdlib modules such as `gen_server`, `maps` and `string`; the fix belongs in `beam_codec`, not here.
+- **`EXPORT_EXT` / `NEW_FUN_EXT` fun literals are not decoded** (an upstream `beam_codec` limitation:
+  `decode_term` returns `unsupported_external_term`). They appear **nested** inside tuples/maps (e.g.
+  `{2, fun maps:remove/2}`, `#{report_cb => fun M:F/1}`), so a top-level-only workaround in `LiteralArea`
+  cannot reach them — the shared ETF walker in `beam_codec::decode` must. This is the dominant remaining
+  load blocker (~36 of 261 real OTP modules: `maps`, `gen_server`, `proc_lib`, `supervisor`, `logger*`,
+  `json`, `compile`, `shell_docs`, …). It needs a fun/export *term layout* that `beam_term` does not
+  currently own, so it is a coordinated cross-crate change (`beam_term` layout + `beam_codec` decode +
+  `beam_engine` consumption), not a `beam_loader` fix. `BINARY_EXT`/`BIT_BINARY_EXT` ARE already decoded.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 - **`LocT` (jit-only local table) is not parsed** (irrelevant to interpretation).
@@ -365,8 +389,6 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   but possibly wrong bounds. Version 4 (OTP 29+) is correct.
 - **`ChunkId::DBGB` names `"DbgB"`**, but the real debug-info chunk id is `"Dbgi"` (present in the
   fixture); `Dbgi` is therefore treated as an unknown chunk and skipped — the desired behavior.
-- **Inline big-integer instruction operands wider than 8 magnitude bytes ⇒ `SystemLimit`** — the decoder
-  models no big-integer operand (a `u`/`i` operand is at most `u64`).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -393,7 +415,9 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/slice.erl` + `slice.beam` → the vertical-slice oracle fixture
 - `tests/fixtures/coverage.erl` + `coverage.beam` → the widened-IR oracle fixture
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
-- `tests/` → container/IR/widened-IR/negative integration tests
+- `tests/` → container/IR/widened-IR/negative/real-module integration tests
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (loud skip when `erl`/OTP is absent; allowlisted known failures)
+- `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
 - `../../lib/compiler/src/beam_asm.erl` → the compiler-side writer of the same format (read-only)

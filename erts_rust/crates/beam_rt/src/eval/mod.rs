@@ -681,6 +681,20 @@ impl Evaluator<'_, '_> {
                     })
                 }
                 ("raise", 3) => return self.raise_3(&args),
+                ("nif_error", 1) | ("nif_error", 2) => {
+                    // `erlang:nif_error/1,2` raises `error` with its **first argument**
+                    // as the reason (the second is crash-report metadata, per
+                    // `nif_error_2` in `../../erts/emulator/beam/bif.c:1525`). A
+                    // compound reason is served here rather than by the registered BIF:
+                    // `beam_common::ExitReason` cannot carry a term, so the BIF's
+                    // structured reason would lose it. Keeping the live term preserves
+                    // the exact reason (`{nif_not_loaded,m,f,0}` stays that tuple).
+                    return Err(Flow::Raise {
+                        class: ExceptionClass::Error,
+                        reason: args[0],
+                        origin: None,
+                    });
+                }
                 ("apply", 2) => return self.apply_2(&args),
                 ("apply", 3) => return self.apply_3(&args),
                 _ => {}
@@ -1643,6 +1657,28 @@ mod tests {
         assert_eq!(signed_value(elements[0]), 1);
         assert_eq!(signed_value(elements[1]), 4);
         assert_eq!(signed_value(elements[2]), 9);
+    }
+
+    #[test]
+    fn nif_error_raises_its_live_reason_term() {
+        // `erlang:nif_error/1,2` raises `error` with its argument as the reason. The
+        // `beam_bifs` reason is `Structured` and carries no term, so the evaluator
+        // raises the **live argument term** itself: an atom reason stays an atom and a
+        // compound reason survives verbatim (the differential `nif/nif_error_*` cases).
+        atom("try erlang:nif_error(foo) catch error:R -> R end", "foo");
+
+        // The tuple is heap-allocated, so the runtime must outlive it — drive the
+        // `RuntimeContext` directly (see `run`) and print the reason.
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let reason = eval(
+            &mut ctx,
+            "try erlang:nif_error({nif_not_loaded,m,f,0}) catch error:R -> R end",
+        )
+        .expect("the compound reason survives the raise");
+        let printed = ctx.runtime.format_term(reason, None).expect("~p renders it");
+        assert_eq!(printed.trim_end(), "{nif_not_loaded,m,f,0}");
     }
 
     #[test]

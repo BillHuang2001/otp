@@ -36,7 +36,10 @@
 //!   float/float via the total `erts_float_exact_sortable` order in exact mode
 //!   (so `-0.0 < +0.0` and NaN has a stable position) or IEEE comparison in
 //!   arithmetic mode. In *exact* mode a mixed integer/float pair (`1` vs `1.0`)
-//!   compares by class rank, not numerically — exactly as `erts_cmp` does.
+//!   compares by class rank, not numerically — exactly as `erts_cmp` does. In
+//!   *arithmetic* mode a mixed integer/float pair instead compares via the
+//!   approximate best-effort `f64` conversion [`number_as_f64`] (a bignum beyond
+//!   2^53 may lose precision).
 //! * **Tuples** compare elementwise after the arity; **lists** (cons cells)
 //!   compare elementwise with the shorter/improper tail deciding a prefix tie;
 //!   **bitstrings** compare bit-by-bit (most-significant first) then by bit size;
@@ -45,12 +48,12 @@
 //!   (most-significant first). The C compares the decoded `num[]` array; the
 //!   payload-word comparison is a deterministic proxy that is equivalent as long
 //!   as the platform ref layout is stable.
-//! * **Big integers, external pid/port/ref, funs, non-flat maps, records and
-//!   on-heap bin refs** have a *deterministic fallback*: they are ordered by
-//!   class first (which is exact), then by object arity, then by the raw term
-//!   word (a stable proxy). This never panics but is not a faithful reproduction
-//!   of the C's structural comparison for those specific classes; callers that
-//!   need exact ordering for them must extend this module.
+//! * **External pid/port/ref, funs, records and on-heap bin refs** have a
+//!   *deterministic fallback*: they are ordered by class first (which is exact),
+//!   then by object arity, then by the raw term word (a stable proxy). This never
+//!   panics but is not a faithful reproduction of the C's structural comparison
+//!   for those specific classes; callers that need exact ordering for them must
+//!   extend this module.
 
 use core::cmp::Ordering;
 

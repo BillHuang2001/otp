@@ -81,8 +81,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/system_info/
     //             init:get_argument,init:get_arguments,init:get_plain_arguments/erlang:display/
     //             os:cmd/code:get_path,code:all_loaded,code:which,code:lib_dir)
-    //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` over
-    //             {heap, code_server atoms, self_pid, tables, output, PendingInterner}); else if
+    //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` seeded via
+    //             `with_fun_caller(FunBridge)` over {pooled heap, code_server atom handle,
+    //             self_pid, tables, output, PendingInterner}); else if
     //             module == "erlang" → `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
     // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
@@ -99,6 +100,9 @@ impl ExecutionContext for RuntimeContext<'_> {
 names into the **one shared table** in order after the BIF returns (their predicted indices are exact
 — interning is append-only and single-threaded). This is what makes a `binary_to_term`-decoded atom
 nameable by the printer/comparison — see Design Decisions.
+`call_bif` also installs the **`FunCaller`** (`FunBridge`) on that `BifContext`, so the `fun`-taking
+`lists:*`/`maps:*` BIFs apply their `fun` argument by re-entering `RuntimeContext::apply_fun` — see
+Design Decisions.
 This is the **only** place the engine's seam meets the Stage-5 core; it keeps the Stage-1/Stage-5
 DAG acyclic (`../CONTEXT.md`).
 
@@ -282,6 +286,30 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   without a heap and keeps the materialization in one place.
 * **`main.rs` is a thin shim** over `cli::run(argv)`; all logic lives in the library so it is unit- and
   integration-testable.
+* **The `FunCaller` seam (`FunBridge`).** `beam_bifs` applies a user fun through `BifContext::call_fun`
+  (default: `unsupported_bif`, i.e. every `fun`-taking `lists:*`/`maps:*` BIF raises until a caller is
+  installed); `beam_rt` installs a `FunBridge` there. A `FunCaller` needs `&mut Runtime` while
+  `BifContext` still borrows runtime state — two `&mut` on one value is impossible — so **every**
+  `BifContext` resource is made a non-runtime-borrowing clone: `Rc<BifRegistry>`, an `Rc<AtomTable>`
+  atom handle (`CodeServer::atoms_handle`, copy-on-write on intern), an `Rc<RefCell<TableRegistry>>`,
+  a **pooled** `beam_alloc::Heap` (`take_bif_heap`/`put_bif_heap`, stack discipline — a nested call
+  takes a fresh heap) and the disjoint `output` field. That leaves `FunBridge` as the only
+  `&mut Runtime` borrow in `call_registered`. `FunBridge::call_fun` delegates to the **existing**
+  `RuntimeContext::apply_fun` (an `-eval` closure via `eval::apply_eval_closure`, a `.beam` fun via the
+  engine's `Machine::run_label`) — the evaluator is never re-implemented. This is what makes
+  `lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, including a loaded module applying an `-eval`
+  fun (`eval::tests::a_loaded_module_applies_an_eval_closure`).
+* **Atom-table sharing is by handle (`Rc<AtomTable>`), interned copy-on-write.** `CodeServer` owns the
+  table in an `Rc`; `atoms_mut` is `Rc::make_mut` and `atoms_handle` a cheap `Rc` clone. A `BifContext`
+  can therefore name atoms without borrowing the runtime, and a commit after a BIF call that grew the
+  table clones it (COW) while preserving **every** existing index — safe because interning is
+  append-only and single-threaded.
+* **`nif_error` raises the live reason term.** `beam_bifs`' `erlang:nif_error/1,2` build a `Structured`
+  reason that carries no `Eterm`, which would print a generic placeholder. `src/eval/mod.rs` therefore
+  intercepts `nif_error/1,2` and raises `Flow::Raise { class: Error, reason: <the argument term> }`, so
+  the **exact** term survives (`nif_error(foo)` → `exception error foo`;
+  `nif_error({nif_not_loaded,m,f,0})` → the exact tuple) and the raise stays catchable. The same
+  term-carrying `Flow::Raise` path is used for `error`/`exit`/`throw` with a live reason.
 
 ## Test Strategy
 * **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + `init_args`
@@ -290,6 +318,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, the
   evaluator (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, `case`/`catch`/`fun`/comprehension cases, malformed
   input → typed gap), CLI `+S/+P/-pa/-pz` mapping,
+  the evaluator's `FunCaller` path (`lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, i.e. a loaded
+  stdlib module applying an `-eval` closure) and `nif_error`'s live reason term (atom → atom; the tuple
+  `{nif_not_loaded,m,f,0}` printed verbatim),
   the native floor (`erlang:halt/0,1` records `Runtime::halt`, `init:get_argument` occurrences/absent),
   `error::unsupported_reason` (`Some` for `bad_eval`/`unsupported_opcode`/`unsupported_bif`, `None` for
   `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`.
@@ -343,6 +374,13 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
+* **Nested-BIF re-entrancy gaps (a `fun` applied inside a BIF).** When a `fun`-taking `lists:*`/`maps:*`
+  BIF calls back through `FunBridge`, the nested `RuntimeContext` takes a **fresh pooled heap** and
+  passes **no** `TableRegistry` — a re-entrant borrow is impossible and a panic is forbidden, so the
+  guard is `try_borrow_mut().ok()` and the tables are simply omitted: `ets:*` inside such a `fun` raises
+  `unsupported_bif` (never a wrong result). The nested context also carries **no** output sink (the
+  outer call holds it), so nested `io:format` writes to stdout rather than the caller's sink. Both are
+  honest M1 gaps, not silent misbehavior.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
@@ -350,10 +388,10 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `src/error.rs` → `pub(crate)` `BeamError` constructors (missing value, unexpected argument, bad spec, arity mismatch, bad run argument, unknown module/function/info key/bif, unsupported, bad eval) + the halt helpers (`HALT_PREFIX`, `halt`/`halt_status`) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
 * `src/config.rs` → `RuntimeConfig`, `Action`, `ArgTerm`, `InitArgs`, `EmulatorConfig` alias, defaults/setters
 * `src/cli.rs` → `USAGE`, `parse` (the A.6 parser + the `run` argument grammar), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
-* `src/codeserver.rs` → `CodeServer`: the **one** shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
+* `src/codeserver.rs` → `CodeServer`: the **one** shared atom table (held as an `Rc<AtomTable>`, copy-on-write on intern — see Design Decisions) + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir`/`atoms_handle` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed (also interns `info::INFO_ATOMS`) + the boot banner
 * `src/info.rs` → `SUPPORTED_KEYS`, `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call)
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through
 * `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`, `os:cmd/1`, `code:get_path/0`/`all_loaded/0`/`which/1`/`lib_dir/0,1` — always consulted before the registry)
 * `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
@@ -370,13 +408,17 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../beam_loader/tests/fixtures/slice.beam` → the shared oracle fixture reused by the slice tests (read-only)
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
-## Handoffs (remaining differential mismatches owned by OTHER nodes)
-`differential suite` is at **147 agree / 6 mismatch / 2 unsupported**. Every remaining `mismatch`
-belongs to a sibling crate (not this node) — recorded so the next pass routes directly:
-* `semantics/bignum_multiplication` (A.1) — `123456789012345678 * 98` raises `system_limit`; **`beam_bifs`** has no bignum promotion.
-* `nif/nif_error_atom_reason`, `nif/nif_error_tuple_reason`, `nif/nif_error_default` (A.3) — `erlang:nif_error/1` must raise `error` **with its argument as the reason**; not implemented in **`beam_bifs`**.
-* `driver/port_backed_by_spawn_driver` (A.4) — `erlang:open_port/2` (`{spawn,"true"}`) is not a BIF (**`beam_bifs`**).
-* `bifs/io_lib_format` (A.7) — `io_lib:format("~w",[42])` must return the **deep** list `[[52,50]]`, not the flat `[52,50]` (**`beam_bifs`**).
+## Handoffs (the remaining non-agreeing cases are owned by OTHER nodes)
+`differential suite` is at **194 agree / 1 mismatch / 2 unsupported** (of 197). No non-agreeing case
+has its root cause in this node; recorded so the next pass routes directly:
+* `driver/port_backed_by_spawn_driver` (A.4) — `erlang:open_port/2` (`{spawn,"true"}`) is not a BIF, so
+  the Rust side exits 1 `exception error 'erlang:open_port/2 is not a BIF'` where the oracle prints
+  `ok true`. Ports are **`beam_bifs`**/**`beam_io`** territory (`beam_io` owns `Port` + built-in
+  drivers).
+* `semantics/binary_comprehension` and `semantics/bit_size_of_bitstring` (A.1) — **by design** in this
+  node: the `-eval` grammar has no binary comprehension and cannot enter a non-byte-aligned binary
+  segment literal, so each is an honest exit-3 `beam_rt: unsupported: …` (see Known Issues), never a
+  wrong result.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also

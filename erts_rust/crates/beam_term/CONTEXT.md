@@ -161,7 +161,8 @@ which forwards here (see Design Decisions). Readers are `unsafe` with a caller i
   `unsafe float_bits(t) -> u64` (re-exports of the single public definitions in
   [`bitstring.rs`](#bitstringrs--bit-level-payloads)).
 - Bignum: `pub const fn big_size_words(n_digits) -> usize` (`n_digits + 1`, `BIG_NEED_SIZE`);
-  `unsafe write_big(hp, negative: bool, digits: &[u64]) -> Eterm` (header arity `n - 1`, one
+  `unsafe write_big(hp, negative: bool, digits: &[u64]) -> Eterm` (header arity is the digit count
+  `n` — `big.h:70` `BIG_ARITY(xp) = bignum_header_arity(*xp)` — one
   `ErtsDigit` = `u64` per word, least-significant-first, sign in `_BIG_SIGN_BIT`; `digits` must be
   non-empty); `unsafe big_parts<'a>(t) -> (bool, &'a [u64])`.
 - Flat map: `pub const fn flatmap_size_words(n_pairs) -> usize` (`3` for the empty map, else
@@ -319,8 +320,8 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   structural-hash equality for equal terms (and inequality for different terms), and `size_object`
   for immediates / cons / tuple / boxed. Prefer property-style boundary loops.
 - `src/thing.rs` carries its own `#[cfg(test)]` suite pinning each block's raw words against the
-  legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n-1` + LS-first `u64` digits
-  and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
+  legacy headers (float `[HEADER_FLONUM, bits]`; bignum header arity `n`, the digit count, + LS-first
+  `u64` digits and the sign bit; flatmap `[arityval(n), k.., MAP_HEADER_FLATMAP, raw size, keys-tuple, v..]` plus
   the 3-word empty block; the external pid/port/ref head + data words), plus write→read round-trips
   and boundaries (min/max `MAX_REF_IDS`, single-digit bignum, empty flatmap, negative bignum).
 - `src/bitstring.rs` carries its own suite: `bit_count_to_bytes`/`heap_bits_size_words` boundary
@@ -337,9 +338,11 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   runtime: `map_size`/`map_get`/`map_pairs` vs `maps:size`/`maps:get`/`lists:sort(maps:keys/1)`
   across the flat/hash boundary (31/32/33/40/100 keys) and for atom-keyed maps, and
   `bitstring_parts`/`bit_at` vs `bit_size`/per-bit/byte views for `<<1:3>>`-style bitstrings and
-  binaries. Skips loudly (never fails) when `erl` is absent/does not answer.
+  binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
+  `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
+  3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
-  compatibility gate); `tests/oracle.rs` is only the crate-local map/bitstring smoke slice.
+  compatibility gate); `tests/oracle.rs` is only the crate-local map/bitstring/bignum smoke slice.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
   `../../scripts/cargo.sh build -p beam_term`. Never `cd`.
 
@@ -370,7 +373,7 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
   (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
   internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
-  a structural comparison and must be extended if exact ordering is needed: big integers, external
+  a structural comparison and must be extended if exact ordering is needed: external
   pid/port/ref, funs, records and on-heap bin refs (ordered by class rank, then object
   arity, then raw term word); internal references (compared by raw payload words, not the decoded
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
