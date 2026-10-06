@@ -30,7 +30,9 @@
 //! [`PortId`] to/from `#Port<0.Num>` (the shape `port_to_list_1` renders and
 //! `list_to_port_1` parses). The node part is this node's *node number*, which is
 //! `0` for the `nonode@nohost` node Milestone-1 always is (`convert::node_0`); a port
-//! naming any other node cannot exist here and is `badarg`.
+//! naming any other node cannot exist here and is `badarg`. Both shapes are pinned
+//! against `erl -noshell` (`#Port<1.3>`, `#Port<0.>`, `#Port<0.3` are all `badarg`
+//! in the oracle, `#Port<0.24>` round-trips).
 //!
 //! Failure is return-based: a non-port argument is `BeamError::BadArg`, a malformed
 //! `#Port<…>` list is `BeamError::BadArg`, and an unset seam is `unsupported_bif`.
@@ -80,6 +82,9 @@ fn port_info_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// The `erlang:port_info/2` BIF: the value whose item is *exactly* (`=:=`) `args[1]`,
 /// or the atom `undefined` when no pair matches.
+///
+/// `undefined` for an unknown item is this crate's contract (the seam's pair list is
+/// the authority); erts-17.1 raises `badarg` there instead — a documented deviation.
 fn port_info_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     let item = args[1];
