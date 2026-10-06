@@ -304,8 +304,10 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
-  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`, a closure
-  escaping into a higher-order stdlib call) are typed errors in `src/eval/mod.rs`. Real `erl`
+  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`) are typed
+  errors in `src/eval/mod.rs`. A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
+  is **uncatchable**: it travels as `Flow::Fatal` (like `halt`) so a `try`/`catch` in the probe cannot
+  turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
@@ -318,13 +320,13 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed + the boot banner
 * `src/info.rs` → `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
 * `src/codeserver.rs` → `CodeServer`: the shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file` (the load-on-demand host)
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun`; heap check)
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call)
 * `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1` — always consulted before the registry)
-* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` is uncatchable), dispatching calls through `RuntimeContext`
+* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
 * `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
-* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`
+* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`, and `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`)
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)

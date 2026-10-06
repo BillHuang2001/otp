@@ -51,13 +51,13 @@
 //!
 //! * `!` (send) — there is no mailbox in `-eval`, so it is a typed `unsupported`.
 //! * `receive` without an `after` clause — likewise (it would block forever).
-//! * a `fun` value that escapes into a *term* is a real fun term only for
-//!   `fun m:f/A` captures and locally-defined funs; higher-order stdlib calls
-//!   (`lists:map/2` with an `-eval` closure) cannot apply it because the closure
-//!   table lives in this evaluator, not in the runtime — a typed error, never a
-//!   wrong result.
 //! * `catch Expr` yields `{'EXIT', Reason}` for the `error`/`exit` classes (the
 //!   oracle appends a stacktrace); M1 evaluates without one.
+//!
+//! A `fun` built here **can** escape into a loaded module: the closure bodies live on
+//! the [`Runtime`](crate::runtime::Runtime) (not on the evaluator), so a higher-order
+//! stdlib call such as `lists:map(fun(X) -> X*X end, …)` applies it back through
+//! [`RuntimeContext::apply_fun`](crate::context::RuntimeContext).
 
 mod ast;
 mod parse;
