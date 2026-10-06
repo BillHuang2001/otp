@@ -489,21 +489,6 @@ impl Table {
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
 
-## Oracle reference: the remaining missing `ets` ops (measured on OTP 29 / erts-17.1)
-Ground-truth observable behavior for the ops this crate still does not implement, captured from the
-live system `erl` (via `erl -noshell -eval`) so a future implementation need not re-derive it. (The
-oracle behavior of the now-implemented `select_replace`/`select/3`/`match_spec_run` family lives in
-the Design Decisions above and the corresponding `tests/` files.)
-- **`ets:match_spec_test/3`** (and `/2`) **do not exist in OTP 29** (`ets:module_info(exports)` has
-  no `match_spec_test`) — the call raises `error:undef`.
-- **`ets:give_away/3`** — `true` on success (the new owner receives `{'ETS-TRANSFER', TabId(Ref),
-  FromPid, GiftData}`); the caller not being the owner, a dead pid, a non-pid, the caller's own pid,
-  or an unknown table all ⇒ `badarg`. `ets:info(T, owner)` afterwards is the new pid.
-- **`ets:setopts/2`** with `{heir, Pid, Data}` (and `{heir, none}` to clear) returns `true`;
-  `ets:info(T, heir)` reports **only the pid** (or `none`) — the heir data is never reported. When
-  the owner dies the table transfers to the heir with `{'ETS-TRANSFER', TabId, FromPid, HeirData}`.
-  `ets:info(T, holder)` is `badarg` (no such item).
-
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/kind.rs` → `TableKind`, `Access`, `Concurrency`, `TableOptions`, `can_read`/`can_write`
