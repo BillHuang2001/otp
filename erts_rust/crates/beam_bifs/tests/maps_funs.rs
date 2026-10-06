@@ -35,8 +35,35 @@ const RAISES: i64 = 5;
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok"]);
+    atoms.seed(["true", "false", "ok", "case_clause"]);
     atoms
+}
+
+/// Asserts `result` is the oracle's structured raise whose live reason term is
+/// structurally equal to `expected`.
+///
+/// The full contract this crate now honours: `Err(BeamError::Raise(r))`,
+/// `r.reason == ExitReason::Structured` (so `BeamError::as_atom()` is `None`) and
+/// `r.live_reason()` carrying the real reason term.
+#[track_caller]
+fn assert_structured(result: Result<Eterm>, ctx: &BifContext<'_>, expected: Eterm) {
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.class, beam_common::ExceptionClass::Error, "class");
+            assert_eq!(raise.reason, beam_common::ExitReason::Structured, "reason");
+            assert_eq!(raise.reason.as_atom(), None, "as_atom");
+            let live = *raise
+                .live_reason()
+                .expect("a structured reason carries its live term")
+                .downcast_ref::<Eterm>()
+                .expect("the payload is the live reason term");
+            assert!(
+                beam_term::compare::eq(live, expected, ctx.atoms()),
+                "live reason differs from the expected reason tuple"
+            );
+        }
+        other => panic!("expected a structured raise, got {other:?}"),
+    }
 }
 
 /// The mock `FunCaller`: it recognises the sentinel fun term and computes the
@@ -280,11 +307,14 @@ fn filter_keeps_only_the_pairs_the_predicate_accepts() {
 fn filter_rejects_a_non_boolean_predicate_result() {
     let ((), calls) = with_mock(|reg, ctx| {
         let map = int_map(reg, ctx, &[(1, 10)]);
-        // Oracle: `{case_clause, 1}` — an error, never a truthy key.
-        assert!(matches!(
-            reg.call("maps", "filter", 2, ctx, &[make_small(KEY), map]),
-            Err(BeamError::BadArg)
-        ));
+        // Oracle: maps:filter(fun(K,_V) -> K end, #{1=>10}) => error:{case_clause,1}
+        // (the fun's own non-boolean result is the `case_clause` value).
+        //   erl -noshell -eval 'try maps:filter(fun(K,_V) -> K end, #{1=>10}) catch C:R ->
+        //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{case_clause,1}
+        let result = reg.call("maps", "filter", 2, ctx, &[make_small(KEY), map]);
+        let case_clause = ctx.atom("case_clause").expect("seeded");
+        let expected = ctx.tuple(&[case_clause, make_small(1)]).expect("fits");
+        assert_structured(result, ctx, expected);
     });
     assert_eq!(calls.len(), 1);
 }
