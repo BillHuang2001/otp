@@ -64,7 +64,7 @@ This is the frozen public-API shape dependents design against; keep it stable.
   `Scheduler::resume_woken`) wakes a receiver blocked in `receive`.
 - `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus the
   optional host seams `FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`.
-- `beam_io` → the poller/reactor (`mio`-backed) + `Port` + built-in-driver registry.
+- `beam_io` → the poller/reactor (`mio`-backed) + `Port`/`PortRegistry` + port-task scheduling + built-in drivers (`fd`/`efile`, and the OS-child `spawn` driver with its `Driver::take_exit_status` seam).
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
   `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
   process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
