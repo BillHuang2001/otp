@@ -451,8 +451,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   [`bitstring.rs`](#bitstringrs--bit-level-payloads) so the float-layout knowledge has a single
   definition.
 - **The bit/float payload readers live in `bitstring.rs`.** `bitstring_parts`, `bit_at`,
-  `float_bits` and `float_value` are defined once, publicly, in `bitstring.rs`; `compare.rs` and
-  `hashing.rs` forward to them (via `use`) and `thing.rs` re-exports `float_bits`/`float_value`.
+  `float_bits` and `float_value` are defined once, publicly, in `bitstring.rs`; `compare.rs` and the
+  `hashing/` module (`mod.rs`, `make_hash.rs`, `make_hash2.rs`, `common.rs`) forward to them (via `use`)
+  and `thing.rs` re-exports `float_bits`/`float_value`.
   Keeping one definition avoids the `ambiguous_glob_reexports` hazard of two modules exporting the
   same name, and removes the previous `pub(crate)`-only duplication between `compare.rs` and the
   deleted `beam_codec` bitstring shim.
