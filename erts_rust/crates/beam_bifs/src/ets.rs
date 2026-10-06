@@ -37,21 +37,23 @@
 //!
 //! # `ets:info/1,2` and the info-field set
 //!
-//! `ets:info/1` renders the `{Item, Value}` proplist of the fields
-//! [`TableInfo`] carries (`id`, `name`, `named_table`, `type`, `keypos`,
-//! `protection`, `size`, `memory`, `owner`, `compressed`, `write_concurrency`,
-//! `read_concurrency`); `ets:info/2` answers a single `Item`. The mapping is
-//! written here from the public [`TableInfo`] fields rather than through
+//! `ets:info/1` renders the oracle's **15** fields in the oracle's order — `id`,
+//! `decentralized_counters`, `read_concurrency`, `write_concurrency`, `compressed`,
+//! `memory`, `owner`, `heir`, `name`, `size`, `node`, `named_table`, `type`,
+//! `keypos`, `protection` — and `ets:info/2` answers a single `Item`. The mapping
+//! is written here from the public [`TableInfo`] fields rather than through
 //! [`TableInfo::entries`], because that helper needs a `&mut AtomTable` and a BIF
 //! may only borrow the atom table immutably (`ctx.atoms()`), while the field-name
-//! and value atoms are interned through [`BifContext::intern_atom`].
+//! and value atoms are interned through [`BifContext::intern_atom`]. This
+//! reproduces [`TableInfo::entries`] field-for-field (see [`info_field`]).
 //! `ets:info(T, Item)` raises `badarg` for an unknown `Item` — the verified
 //! system `erl` behaviour (it does **not** return `undefined`).
 //!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! The match-spec family (`select*`/`match`/`match_object`/`select_count`,
-//! `foldl`/`foldr`) needs a match-spec compiler; the `*_lookup` navigation forms
+//! The rest of the match-spec family (`match`/`match_object`/`select_count`/
+//! `select_delete`/`match_delete`, `foldl`/`foldr`) needs the match-spec
+//! machinery this pass does not wire up; the `*_lookup` navigation forms
 //! and the ownership verbs (`rename`/`safe_fixtable`/`give_away`/`setopts`/
 //! `whereis`/`give_away`) are out of M1 scope; and access-control/ownership
 //! enforcement is a documented M1 simplification (the [`Table`] primitives are
@@ -77,20 +79,24 @@ use crate::registry::BifRegistry;
 /// `atom.names`' `EOT='$end_of_table'`).
 const END_OF_TABLE: &str = "$end_of_table";
 
-/// The `ets:info/1` field names, in the order [`TableInfo`] defines them.
+/// The `ets:info/1` field names, in the oracle's order (the reverse of the C
+/// `fields[]` array in `erl_db.c`, reproduced by [`TableInfo::entries`]).
 const INFO_ITEMS: &[&str] = &[
     "id",
+    "decentralized_counters",
+    "read_concurrency",
+    "write_concurrency",
+    "compressed",
+    "memory",
+    "owner",
+    "heir",
     "name",
+    "size",
+    "node",
     "named_table",
     "type",
     "keypos",
     "protection",
-    "size",
-    "memory",
-    "owner",
-    "compressed",
-    "write_concurrency",
-    "read_concurrency",
 ];
 
 /// The runtime's ETS tables, keyed by the numeric id of the on-heap ref thing
@@ -195,7 +201,7 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
         tables.insert(id.raw(), table);
     }
-    crate::access::make_ref_thing(ctx.heap(), id.raw())
+    make_ref_thing(ctx.heap(), id.raw())
 }
 
 // ------------------------------------------------------------- whole-table
@@ -634,26 +640,44 @@ fn element_pos(term: Eterm) -> Result<usize> {
 /// not know (the verified system `erl` behaviour: `ets:info(T, bogus_item)`
 /// raises `badarg`).
 ///
-/// `id` is the table **handle** (the on-heap ref thing), so
-/// `ets:info(T, id) =:= T` holds as it does in the oracle. The `owner` field has
-/// no pid term in Milestone-1 and is reported as `undefined`.
+/// This reproduces [`TableInfo::entries`] field-for-field — [`entries`] cannot be
+/// called directly because it needs a `&mut AtomTable` while a BIF may only borrow
+/// the atom table immutably (`ctx.atoms()`), so the field-name and value atoms are
+/// instead interned through [`BifContext::intern_atom`]. Two fields are fixed by
+/// the M1 runtime shape rather than by the table: `owner` and a set `heir` are the
+/// atom `undefined` (there is no pid term yet), and `node` is always
+/// `nonode@nohost` (the runtime is never distributed).
+///
+/// [`entries`]: TableInfo::entries
 fn info_field(ctx: &mut BifContext<'_>, info: &TableInfo, item: &str) -> Result<Eterm> {
     match item {
-        "id" => make_ref_thing(ctx.heap(), info.id.raw()),
+        "id" => ctx.int(info.id.raw() as i64),
+        // The CATREE path: the oracle reports decentralized counters only for an
+        // `ordered_set` whose normalized `write_concurrency` flag is on.
+        "decentralized_counters" => ctx.boolean(info.kind.is_ordered() && info.write_concurrency),
+        "read_concurrency" => ctx.boolean(info.read_concurrency),
+        "write_concurrency" => ctx.boolean(info.write_concurrency),
+        "compressed" => ctx.boolean(info.compressed),
+        "memory" => ctx.int(info.memory as i64),
+        // M1 has no pid terms to report (the documented gap): the owner is always
+        // `undefined`, and an installed heir is likewise `undefined` (a fresh
+        // table's heir is the atom `none`).
+        "owner" => ctx.intern_atom("undefined"),
+        "heir" => match info.heir {
+            None => ctx.intern_atom("none"),
+            Some(_) => ctx.intern_atom("undefined"),
+        },
         "name" => match info.name {
             Some(atom) => Ok(make_atom(atom)),
             None => ctx.intern_atom("undefined"),
         },
+        "size" => ctx.int(info.size as i64),
+        // The runtime is never distributed.
+        "node" => ctx.intern_atom("nonode@nohost"),
         "named_table" => ctx.boolean(info.named_table),
         "type" => ctx.intern_atom(info.kind.as_atom_name()),
         "keypos" => ctx.int(info.keypos as i64),
         "protection" => ctx.intern_atom(info.access.as_atom_name()),
-        "size" => ctx.int(info.size as i64),
-        "memory" => ctx.int(info.memory as i64),
-        "owner" => ctx.intern_atom("undefined"),
-        "compressed" => ctx.boolean(info.compressed),
-        "write_concurrency" => ctx.boolean(info.write_concurrency),
-        "read_concurrency" => ctx.boolean(info.read_concurrency),
         _ => Err(badarg()),
     }
 }
@@ -726,7 +750,7 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::NIL;
 
-    use crate::access::{is_tuple, tuple_element, tuple_size};
+    use crate::access::{is_tuple, ref_thing_id, tuple_element, tuple_size};
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -762,6 +786,12 @@ mod tests {
             "compressed",
             "read_concurrency",
             "write_concurrency",
+            // The remaining 15-field `ets:info/1` names/values.
+            "decentralized_counters",
+            "heir",
+            "none",
+            "node",
+            "nonode@nohost",
             "p",
             "q",
             "z",
@@ -1201,18 +1231,37 @@ mod tests {
         let name = info_2(&mut ctx, &[handle, name_item]).expect("info/2 name");
         assert_eq!(atoms.name(atom_val(name)), Some("mytab"));
 
-        // `info/2` `id` is the table handle itself (a fresh ref thing with the
-        // same payload, so it compares `=:=` to `T` as in the oracle).
+        // `info/2` `id` is the table's numeric id (`TableInfo::entries` renders it
+        // as a small int, not the tid the oracle reports — see `info_field`).
         let id_item = ctx.atom("id").expect("seeded");
         let id = info_2(&mut ctx, &[handle, id_item]).expect("info/2 id");
-        assert!(beam_term::compare::eq(id, handle, &atoms));
+        assert_eq!(id, ctx.int(ref_thing_id(handle).expect("handle id") as i64).unwrap());
 
-        // The full proplist has one pair per `INFO_ITEMS` entry.
+        // The full proplist has one pair per `INFO_ITEMS` entry — the oracle's 15
+        // fields, in the oracle's order.
+        assert_eq!(INFO_ITEMS.len(), 15);
         let proplist = info_1(&mut ctx, &[handle]).expect("info/1");
-        assert_eq!(
-            proper_list(proplist).expect("a proper list").len(),
-            INFO_ITEMS.len()
-        );
+        let pairs = proper_list(proplist).expect("a proper list");
+        assert_eq!(pairs.len(), INFO_ITEMS.len());
+        for (pair, item) in pairs.iter().zip(INFO_ITEMS) {
+            let name = ctx
+                .atoms()
+                .name(atom_val(tuple_element(*pair, 0)))
+                .expect("a field-name atom");
+            assert_eq!(name, *item, "info/1 field order mismatch");
+        }
+
+        // `heir` is `none` on a fresh table and `node` is `nonode@nohost`; a
+        // `set` reports `decentralized_counters => false`.
+        let heir_item = ctx.atom("heir").expect("seeded");
+        let heir = info_2(&mut ctx, &[handle, heir_item]).expect("info/2 heir");
+        assert_eq!(ctx.atoms().name(atom_val(heir)), Some("none"));
+        let node_item = ctx.atom("node").expect("seeded");
+        let node = info_2(&mut ctx, &[handle, node_item]).expect("info/2 node");
+        assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
+        let dc_item = ctx.atom("decentralized_counters").expect("seeded");
+        let dc = info_2(&mut ctx, &[handle, dc_item]).expect("info/2 decentralized_counters");
+        assert!(is_false(&atoms, dc));
 
         // An unknown item is `badarg` (the verified `erl` behaviour).
         let bogus = ctx.atom("z").expect("seeded");

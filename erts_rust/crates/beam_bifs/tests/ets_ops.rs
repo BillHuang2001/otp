@@ -48,6 +48,11 @@ fn seeded_atoms() -> AtomTable {
         "compressed",
         "read_concurrency",
         "write_concurrency",
+        "decentralized_counters",
+        "heir",
+        "none",
+        "node",
+        "nonode@nohost",
         "my_tab",
         "tab2",
         "a",
@@ -488,18 +493,41 @@ fn info_reports_the_table_fields() {
         );
     }
 
-    // `info/2` `id` is the table handle (structurally equal, as the oracle's is).
+    // `info/2` `id` reproduces `TableInfo::entries`: the table's numeric id as a
+    // small integer (the oracle reports a tid reference here instead — see the
+    // `ets.rs` `info_field` docs).
     let id_item = ctx.atom("id").expect("seeded");
     let id = reg
         .call("ets", "info", 2, &mut ctx, &[handle, id_item])
         .expect("info/2 id");
-    assert!(beam_term::compare::eq(id, handle, &atoms));
+    let is_int = reg
+        .call("erlang", "is_integer", 1, &mut ctx, &[id])
+        .expect("erlang:is_integer");
+    assert!(is_true(&atoms, is_int), "info/2 `id` is not an integer");
 
-    // `info/1` is a proplist with one `{Item, Value}` pair per field.
+    // `heir` is `none` on a fresh table; `node` is `nonode@nohost`; a `set` reports
+    // `decentralized_counters => false` (verified against the system `erl`).
+    for (item, expected) in [
+        ("heir", ctx.atom("none").unwrap()),
+        ("node", ctx.atom("nonode@nohost").unwrap()),
+        ("decentralized_counters", ctx.atom("false").unwrap()),
+    ] {
+        let item = ctx.atom(item).expect("seeded");
+        let value = reg
+            .call("ets", "info", 2, &mut ctx, &[handle, item])
+            .expect("ets:info/2");
+        assert!(
+            beam_term::compare::eq(value, expected, &atoms),
+            "info/2 item mismatch"
+        );
+    }
+
+    // `info/1` is the oracle's 15-field proplist, in the oracle's order, with one
+    // `{Item, Value}` pair per field.
     let proplist = reg
         .call("ets", "info", 1, &mut ctx, &[handle])
         .expect("ets:info/1");
-    assert_eq!(length(&reg, &mut ctx, proplist), 12);
+    assert_eq!(length(&reg, &mut ctx, proplist), 15);
     let first_pair = nth(&reg, &mut ctx, 1, proplist);
     assert_eq!(element(&reg, &mut ctx, 1, first_pair), id_item);
 
