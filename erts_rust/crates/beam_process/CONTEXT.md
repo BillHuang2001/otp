@@ -406,7 +406,9 @@ holds `Process` values directly.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, message delivery + GC entry
+- `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, message delivery + GC entry + the dict/saved-args sub-rootsets
+- `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter)
+- `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
 - `src/run_queue.rs` → `RunQueue` (the ready queue)
 - `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `Scheduler::resume_woken` (wake absorption)
 - `src/progress.rs` → `ThreadProgress` (single-scheduler stub)
