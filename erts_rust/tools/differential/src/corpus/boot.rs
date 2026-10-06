@@ -17,10 +17,13 @@
 //! `get_all_env/1`, `loaded_applications/0`, `which_applications/0`, `get_key/2`) — again by
 //! shape wherever the value is release/installation-specific.
 //!
-//! The **process-messaging** cases drive a real `spawn` + `receive` round trip (a message
-//! crossing the mailbox boundary). The Rust runtime's `-eval` subset has no `spawn`/`!` yet,
-//! so it signals `unsupported` (exit `3`) — an honest *gap* held against the **oracle's**
-//! golden, so each case flips to `agree` automatically once the process/messaging seam lands.
+//! The **process** surface is driven through `-eval` and asserted **by shape**, never by an
+//! exact pid (pids vary per VM start): `spawn/1`, `spawn_link/1` and `spawn_opt/2` must return
+//! a pid, the mailbox carries a real `spawn` + `!` + `receive` round trip (including a
+//! non-zero `after` timeout), and `erlang:processes/0` is a list. The **process dictionary**
+//! (`put/2`, `get/1`, `erase/1`) is a genuine capability gap in the Rust runtime today; those
+//! cases are pinned against the **oracle's** golden, so each flips to `agree` automatically
+//! once the BIFs land — an honest `unsupported`, never a mismatch.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.9 cases: boot/version observability, asserted by shape.
@@ -490,7 +493,7 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
-        // --- Process messaging: a real spawn + receive round trip (Rust: unsupported) ----
+        // --- Process surface: spawn + mailbox round trip, asserted by shape (never a pid) --
         Case {
             id: "boot/receive_message_from_spawned_process",
             description: "a spawned process sends its parent an atom, which the parent receives (spawn+receive round trip)",
@@ -561,7 +564,179 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "boot/spawn_returns_pid",
+            description: "spawn/1 returns a pid (shape only — the pid value varies per VM start)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_pid(spawn(fun() -> ok end))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/spawn_link_returns_pid",
+            description: "spawn_link/1 returns a pid (shape only — the pid value varies per VM start)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_pid(spawn_link(fun() -> ok end))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/spawn_opt_returns_pid",
+            description: "spawn_opt/2 with options returns a pid (shape only)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_pid(spawn_opt(fun() -> ok end, [link]))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/spawn_opt_empty_options_returns_pid",
+            description: "spawn_opt/2 with an empty option list returns a pid (shape only)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_pid(spawn_opt(fun() -> ok end, []))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/spawned_process_round_trip",
+            description: "a spawned process replies with a tagged tuple the parent selectively receives",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), spawn(fun() -> Self ! {roundtrip, ok} end), receive {roundtrip, Value} -> Value after 50 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,2,111,107>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/receive_after_timeout",
+            description: "a receive with a non-zero `after` timeout and an empty mailbox yields `timeout`",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "receive Msg -> Msg after 50 -> timeout end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,7,116,105,109,101,111,117,116>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/receive_after_message_arrives",
+            description: "a queued message is received before the `after` timeout expires",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin self() ! hi, receive Msg -> Msg after 5000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,2,104,105>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/processes_is_list",
+            description: "erlang:processes/0 is a list of pids (shape, not the contents)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_list(erlang:processes())",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/processes_contains_self",
+            description: "erlang:processes/0 contains the running process's own pid",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "lists:member(self(), erlang:processes())",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
         // --- Capability gaps, recorded honestly as `unsupported` (never a mismatch) -----
+        // The process dictionary: the Rust runtime reports `erlang:put/2` etc. as
+        // "a known BIF that is not implemented" and exits `3`, so each case is a genuine
+        // `unsupported` — the golden is the *oracle's* own output, so it flips to `agree`
+        // by itself once the BIFs land.
+        Case {
+            id: "boot/process_dictionary_put_get",
+            description: "put/2 stores a value that get/1 returns (the process dictionary; Rust: unsupported)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin put(k, 1), get(k) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/process_dictionary_get_missing",
+            description: "get/1 of an unset key yields the atom `undefined` (Rust: unsupported)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "get(a_nonexistent_key_xyz)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/process_dictionary_erase",
+            description: "erase/1 removes a key so a later get/1 yields `undefined` (Rust: unsupported)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin put(k, 1), erase(k), get(k) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>"),
+                exit_code: 0,
+            },
+        },
         Case {
             id: "boot/init_get_status_is_tuple",
             description: "init:get_status/0 is the {State,Started} boot-status tuple (Rust: unsupported)",
@@ -591,4 +766,120 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{group, CaseKind, Contract, Probe};
+
+    /// The process cases this group adds whose *spawn* is expected to succeed today: they are
+    /// asserted **by shape** (a pid, a list, a tag), never by an exact pid/ref/port value.
+    const SHAPE_CASES: &[&str] = &[
+        "boot/spawn_returns_pid",
+        "boot/spawn_link_returns_pid",
+        "boot/spawn_opt_returns_pid",
+        "boot/spawn_opt_empty_options_returns_pid",
+        "boot/spawned_process_round_trip",
+        "boot/receive_after_timeout",
+        "boot/receive_after_message_arrives",
+        "boot/processes_is_list",
+        "boot/processes_contains_self",
+    ];
+
+    /// The process-dictionary cases: a genuine capability gap in the Rust runtime today, so
+    /// they are pinned against the oracle's golden as an honest `unsupported`.
+    const PROCESS_DICTIONARY_CASES: &[&str] = &[
+        "boot/process_dictionary_put_get",
+        "boot/process_dictionary_get_missing",
+        "boot/process_dictionary_erase",
+    ];
+
+    fn case<'a>(cases: &'a [super::Case], id: &str) -> &'a super::Case {
+        cases
+            .iter()
+            .find(|c| c.id == id)
+            .unwrap_or_else(|| panic!("case {id} is missing from the boot group"))
+    }
+
+    #[test]
+    fn process_cases_are_registered_as_build_eval_cases() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in SHAPE_CASES.iter().chain(PROCESS_DICTIONARY_CASES) {
+            let case = case(cases, id);
+            assert_eq!(case.contracts, &[Contract::Build], "case {id}");
+            assert!(
+                matches!(case.kind, CaseKind::Eval { .. }),
+                "case {id} must be an Eval case"
+            );
+            assert!(
+                case.extra_argv().is_empty(),
+                "case {id} takes no extra argv"
+            );
+        }
+    }
+
+    #[test]
+    fn process_cases_never_pin_an_unstable_pid() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in SHAPE_CASES.iter().chain(PROCESS_DICTIONARY_CASES) {
+            let golden = case(cases, id)
+                .golden
+                .stdout
+                .unwrap_or_else(|| panic!("case {id} asserts stdout"));
+            assert!(
+                !golden.contains("<0."),
+                "case {id}: the golden pins an unstable pid: {golden:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn spawn_cases_assert_pid_shape_not_identity() {
+        let cases = group();
+        let cases = cases.as_slice();
+        for id in [
+            "boot/spawn_returns_pid",
+            "boot/spawn_link_returns_pid",
+            "boot/spawn_opt_returns_pid",
+            "boot/spawn_opt_empty_options_returns_pid",
+        ] {
+            let CaseKind::Eval { expr, probe, .. } = case(cases, id).kind else {
+                panic!("case {id} must be an Eval case");
+            };
+            assert_eq!(probe, Probe::TermToBinary, "case {id}");
+            assert!(expr.starts_with("is_pid("), "case {id}: {expr:?}");
+        }
+    }
+
+    #[test]
+    fn receive_after_case_uses_a_non_zero_timeout() {
+        let cases = group();
+        let cases = cases.as_slice();
+        let CaseKind::Eval { expr, .. } = case(cases, "boot/receive_after_timeout").kind else {
+            panic!("must be an Eval case");
+        };
+        assert!(
+            expr.contains("after 50 ->"),
+            "the receive/after case must use a non-zero timeout: {expr:?}"
+        );
+        assert!(
+            expr.contains("timeout"),
+            "the receive/after case must assert the timeout outcome: {expr:?}"
+        );
+    }
+
+    #[test]
+    fn process_dictionary_cases_exercise_put_get_erase() {
+        let cases = group();
+        let cases = cases.as_slice();
+        let exprs: Vec<&str> = PROCESS_DICTIONARY_CASES
+            .iter()
+            .map(|id| case(cases, id).expr().expect("an Eval case has an expr"))
+            .collect();
+        assert!(exprs.iter().any(|e| e.contains("put(")), "no put/2 case");
+        assert!(exprs.iter().any(|e| e.contains("get(")), "no get case");
+        assert!(exprs.iter().any(|e| e.contains("erase(")), "no erase/1 case");
+    }
 }
