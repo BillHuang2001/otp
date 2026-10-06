@@ -1,7 +1,8 @@
 //! Bitstring **wide integer field** integration tests — integer fields **wider
-//! than 64 bits**, on both the match and the construction side.
+//! than 64 bits**, plus the at-most-64-bit fields whose value can still exceed
+//! `MAX_SMALL`, on both the match and the construction side.
 //!
-//! Two instruction forms own a wide integer field; both are covered here:
+//! Two instruction forms own an integer field; both are covered here:
 //!
 //! * the `integer` **command** of a flattened `bs_match` command list — the
 //!   `erts_bs_get_integer_2` big path (`erl_bits.c:170-398`). Every read export of
@@ -15,6 +16,15 @@
 //! * the `integer` **segment** of `bs_create_bin` (`fmt_big_be`/`fmt_big_le`,
 //!   `erl_bits.c:724`/`:811`), which accepts a small integer *or* a bignum and writes
 //!   `value mod 2^Size` (a negative value becoming its `Size`-bit two's complement).
+//!
+//! The second committed oracle fixture, `tests/fixtures/bssmall.beam`, covers the
+//! **at-most-64-bit** fields: `MAX_SMALL` is only `2^59-1`, so a 60..64-bit unsigned
+//! field — and *every* little-endian field of 9 or more bits, for which ERTS has no
+//! small-integer fast path — can produce a bignum, and a non-byte-multiple
+//! little-endian field (`<<Y:12/little>>`, `<<Y:20/little>>`, …) takes ERTS' general
+//! bit-level path (`erl_bits.c:305-313`). Those reads converge on the same
+//! `IS_USMALL` (`big.h:76`) small-vs-bignum decision, so a correct engine yields a
+//! small exactly when the value is in `MIN_SMALL..=MAX_SMALL`.
 //!
 //! Every expected value is the **real system `erl` oracle's** answer for the same
 //! input (OTP 29 / `erts-17.1`), re-derived with a probe module exactly as
@@ -54,10 +64,25 @@ use std::collections::BTreeMap;
 use beam_common::BeamError;
 use beam_engine::{terms, Machine, MinimalContext};
 use beam_loader::{load_file, Function, Instr, Label, Module, Operand, NO_FAIL};
-use beam_term::{make_small, Atom, Eterm};
+use beam_term::{is_small, make_small, Atom, Eterm, MAX_SMALL};
 
 /// The committed wide-integer fixture (`erlc bsbig.erl`).
 const BSBIG_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bsbig.beam");
+
+/// The committed at-most-64-bit fixture (`erlc bssmall.erl`).
+const BSSMALL_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/bssmall.beam");
+
+/// `is_big(x)` — a boxed bignum. `beam_term`'s predicate dereferences the header
+/// word of a boxed term, so it is `unsafe` (the same reason
+/// `beam_engine::predicates` exists); this test module's only `unsafe`.
+///
+/// SAFETY: every call site passes a term the engine just returned from a run — a
+/// live machine word — so if it is boxed its header is a live term word.
+#[allow(unsafe_code)]
+fn is_bignum(term: Eterm) -> bool {
+    // SAFETY: `term` is a live machine word returned by an engine run.
+    unsafe { beam_term::is_big(term) }
+}
 
 /// The `BSF_LITTLE` flag bit (`erl_bits.h:462`) — the fixture's flag literals decode
 /// to these bits, and the synthetic modules below set them directly.
@@ -67,6 +92,12 @@ const BSF_SIGNED: u32 = 4;
 
 fn load() -> Module {
     load_file(BSBIG_BEAM).unwrap_or_else(|e| panic!("load {BSBIG_BEAM}: {e:?}"))
+}
+
+/// The at-most-64-bit fixture, whose `e256/1` pins a (possibly bignum) result
+/// byte-exactly through the crate's public binary reader.
+fn load_small() -> Module {
+    load_file(BSSMALL_BEAM).unwrap_or_else(|e| panic!("load {BSSMALL_BEAM}: {e:?}"))
 }
 
 fn export_atom(module: &Module, name: &str) -> Atom {
@@ -162,6 +193,50 @@ fn expect_raise(module: &Module, name: &str, input: &[u8], ctx: &mut MinimalCont
     assert!(
         matches!(result, Err(BeamError::Raise(_))),
         "{name}({input:?}) should raise, got {result:?}"
+    );
+}
+
+/// Assert `name(input)` (a `bssmall` read of at most 64 bits) returns exactly
+/// `negative ? -magnitude : magnitude`, **and** that its representation is the one
+/// ERTS' `IS_USMALL` (`big.h:76`) picks.
+///
+/// A small integer is correct exactly when the magnitude is `<= MAX_SMALL`, or
+/// `<= MAX_SMALL + 1` for a negative value (i.e. down to `MIN_SMALL`); anything
+/// else must be a bignum. The classification is asserted with `beam_term`'s own
+/// predicates — a bignum where a small is correct would be just as wrong as the
+/// reverse. The exact value is pinned through the fixture's own `e256/1` (see the
+/// module docs for why an integration test cannot read a bignum directly).
+fn expect_field(
+    module: &Module,
+    ctx: &mut MinimalContext,
+    name: &str,
+    input: &[u8],
+    magnitude: u64,
+    negative: bool,
+) {
+    let arg = bin(ctx, input);
+    let value =
+        run(module, name, &[arg], ctx).unwrap_or_else(|e| panic!("{name}({input:?}): {e:?}"));
+    let max_small = MAX_SMALL as u64;
+    let fits_small = magnitude <= max_small || (negative && magnitude == max_small + 1);
+    if fits_small {
+        assert!(
+            is_small(value),
+            "{name}({input:?}) = {value:?} must be a SMALL integer"
+        );
+    } else {
+        assert!(
+            is_bignum(value),
+            "{name}({input:?}) = {value:?} must be a bignum"
+        );
+    }
+    let encoded = run(module, "e256", &[value], ctx)
+        .map(bytes)
+        .unwrap_or_else(|e| panic!("e256({name}({input:?})): {e:?}"));
+    assert_eq!(
+        encoded,
+        be256_parts(u128::from(magnitude), negative),
+        "{name}({input:?})"
     );
 }
 
@@ -748,4 +823,363 @@ fn every_wide_export_is_present() {
     ] {
         let _: Atom = export_atom(&module, name);
     }
+}
+
+#[test]
+fn every_at_most_64_bit_export_is_present() {
+    let module = load_small();
+    for name in [
+        "u9", "u12", "u17", "u20", "u36", "u59", "u60", "u61", "u62", "u64", "u64x", "s59", "s60",
+        "s61", "s64", "u9le", "u12le", "u17le", "u20le", "u36le", "u60le", "u64le", "s64le",
+        "c_u64", "e256",
+    ] {
+        let _: Atom = export_atom(&module, name);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// At most 64 bits: a value above `MAX_SMALL` still needs the exact integer
+// (`bssmall.beam`)
+// ---------------------------------------------------------------------------
+
+/// The headline case: a legal **64-bit unsigned** field above `MAX_SMALL`
+/// (`2^59-1`) must yield the exact bignum, not a typed error, while a value that
+/// fits a small must stay a small.
+#[test]
+fn u64_reads_the_exact_bignum_above_max_small() {
+    let module = load_small();
+    let mut ctx = MinimalContext::new();
+
+    // Oracle: `erl -noshell -eval '<<Y:64>> = <<16#F000000000000000:64>>,
+    //        io:format("~p~n",[Y]), halt().'` → 17293822569102704640
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64x",
+        &[0xF0, 0, 0, 0, 0, 0, 0, 0],
+        17293822569102704640,
+        false,
+    );
+    // Oracle: `<<Y:64>> = <<16#8000000000000000:64>>` → 9223372036854775808
+    // (the sign bit set, but the field is *unsigned*: `2^63`, not `-2^63`).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64x",
+        &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        9223372036854775808,
+        false,
+    );
+    // Oracle: `<<Y:64>> = <<16#FFFFFFFFFFFFFFFF:64>>` → 18446744073709551615
+    // (`2^64-1`: the largest field a machine word can hold, a one-digit bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64",
+        &[0xFF; 8],
+        18446744073709551615,
+        false,
+    );
+    // Oracle: `u64(<<16#ABCDEF0123456789:64>>)` → 12379813738877118345.
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64",
+        &[0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89],
+        12379813738877118345,
+        false,
+    );
+    // The same read with `ensure_exactly 64` (`<<Y:64>>`): `0x07FFFFFFFFFFFFFF`
+    // is exactly `MAX_SMALL`, so it must stay a SMALL — a bignum here would be a
+    // divergence just as much as a small where a bignum belongs.
+    // Oracle: `<<Y:64>> = <<16#07FFFFFFFFFFFFFF:64>>` → 576460752303423487
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64x",
+        &[0x07, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        576460752303423487,
+        false,
+    );
+    // Oracle: `<<Y:64>> = <<1:64>>` → 1 (the small path is untouched).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64x",
+        &[0, 0, 0, 0, 0, 0, 0, 1],
+        1,
+        false,
+    );
+}
+
+/// The `MAX_SMALL`/`MIN_SMALL` boundary, at the widths where it matters.
+///
+/// A 59-bit unsigned field's maximum is exactly `MAX_SMALL` (`2^59-1`), so it can
+/// **never** need a bignum; a 60-bit one crosses the line at `2^59`.
+#[test]
+fn the_max_small_boundary_is_a_small_and_the_next_value_is_a_bignum() {
+    let module = load_small();
+    let mut ctx = MinimalContext::new();
+
+    // Oracle: `erl -noshell -eval '<<Y:59>> = <<16#7FFFFFFFFFFFFFF:59>>,
+    //        io:format("~p~n",[Y]), halt().'` → 576460752303423487 (a SMALL).
+    // Read the first 59 bits of an all-ones 8-byte subject.
+    expect_field(&module, &mut ctx, "u59", &[0xFF; 8], 576460752303423487, false);
+    // Oracle: `<<Y:60>> = <<16#800000000000000:60>>` → 576460752303423488
+    // (`MAX_SMALL + 1`: the first value at 60 bits that needs a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u60",
+        &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        576460752303423488,
+        false,
+    );
+    // Oracle: `«u60»(<<0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF,0xFF>>)` read as a 60-bit
+    // field → 1152921504606846975 (`2^60-1`, a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u60",
+        &[0xFF; 8],
+        1152921504606846975,
+        false,
+    );
+    // Oracle: `«u61»(<<0xFF;8>>)` → 2305843009213693951 (`2^61-1`).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u61",
+        &[0xFF; 8],
+        2305843009213693951,
+        false,
+    );
+    // Oracle: `«u62»(<<16#3FFFFFFFFFFFFFFF:64>>)` → 1152921504606846975.
+    expect_field(
+        &module,
+        &mut ctx,
+        "u62",
+        &[0x3F, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF],
+        1152921504606846975,
+        false,
+    );
+}
+
+/// Signed fields go through the same small-vs-bignum decision: the magnitude of a
+/// negative value may reach `MAX_SMALL + 1` (`MIN_SMALL`) and still be a small.
+#[test]
+fn signed_fields_use_the_same_small_vs_bignum_split() {
+    let module = load_small();
+    let mut ctx = MinimalContext::new();
+
+    // Oracle: `erl -noshell -eval '<<Y:59/signed>> = <<16#FFFFFFFFFFFFFFFF:59>>,
+    //        io:format("~p~n",[Y]), halt().'` → -1 (a SMALL; `signed` sign-extends
+    // at 59 bits, so 59 one-bits are `-1`). The low 5 bits of the 8-byte subject
+    // are not part of the 59-bit field.
+    expect_field(&module, &mut ctx, "s59", &[0xFF; 8], 1, true);
+    // Oracle: `<<Y:60/signed>> = <<16#800000000000000:60>>` → -576460752303423488
+    // (`MIN_SMALL` = `-(MAX_SMALL + 1)`: negative but still a SMALL).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s60",
+        &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        576460752303423488,
+        true,
+    );
+    // Oracle: `«s60»(<<16#40,0,0,0,0,0,0,0>>)` read as 60 signed bits →
+    // 288230376151711744 (`2^58`, positive and a SMALL).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s60",
+        &[0x40, 0, 0, 0, 0, 0, 0, 0],
+        288230376151711744,
+        false,
+    );
+    // Oracle: `«s61»(<<16#40,0,...>>)` read as 61 signed bits →
+    // 576460752303423488 (`2^59`, positive, a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s61",
+        &[0x40, 0, 0, 0, 0, 0, 0, 0],
+        576460752303423488,
+        false,
+    );
+    // Oracle: `«s61»(<<16#C0,0,...>>)` → -576460752303423488 (`-2^59` = `MIN_SMALL`,
+    // a SMALL: sign-extending bit 60 makes the 61-bit field `-2^59`).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s61",
+        &[0xC0, 0, 0, 0, 0, 0, 0, 0],
+        576460752303423488,
+        true,
+    );
+    // Oracle: `<<Y:64/signed>> = <<16#8000000000000000:64>>` → -9223372036854775808
+    // (`-2^63`, the most negative 64-bit value: a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s64",
+        &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        9223372036854775808,
+        true,
+    );
+    // Oracle: `<<Y:64/signed>> = <<16#FFFFFFFFFFFFFFFF:64>>` → -1 (a SMALL).
+    expect_field(&module, &mut ctx, "s64", &[0xFF; 8], 1, true);
+}
+
+/// Little-endian fields of 9 or more bits have **no** small-integer fast path in
+/// ERTS (`erl_bits.c:280-313`), so they all take the general path — including the
+/// non-byte-multiple widths the standard compiler emits. Before this fix those
+/// returned a typed `unsupported` (the byte-wise `read_uint_le` requires a whole
+/// number of bytes).
+#[test]
+fn non_byte_aligned_little_endian_fields_read_exactly() {
+    let module = load_small();
+    let mut ctx = MinimalContext::new();
+    let probe = [0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89];
+
+    // Oracle: `u12le(<<16#ABCDEF0123456789:64>>)` → 3243, i.e. the first 12 bits
+    // read little-endian (`0xAB` low byte, the high nibble `0xC`).
+    expect_field(&module, &mut ctx, "u12le", &probe, 3243, false);
+    // Oracle: `u17le(<<16#ABCDEF0123456789:64>>)` → 118187.
+    expect_field(&module, &mut ctx, "u17le", &probe, 118187, false);
+    // Oracle: `u20le(<<16#ABCDEF0123456789:64>>)` → 970155.
+    expect_field(&module, &mut ctx, "u20le", &probe, 970155, false);
+    // Oracle: `u36le(<<16#ABCDEF0123456789:64>>)` → 8622427563 (a SMALL).
+    expect_field(&module, &mut ctx, "u36le", &probe, 8622427563, false);
+    // Oracle: `u9le(<<16#F0,0,...>>)` → 240 (9 bits = one whole byte plus one bit:
+    // `0xF0` is the low byte and the 9th bit, the top bit of the next byte, is 0).
+    expect_field(&module, &mut ctx, "u9le", &[0xF0, 0, 0, 0, 0, 0, 0, 0], 240, false);
+    // Oracle: `u9le(<<16#ABCDEF0123456789:64>>)` → 427 (the 9th bit — the top bit
+    // of the second byte `0xCD` — is set, so it contributes `2^8`).
+    expect_field(&module, &mut ctx, "u9le", &probe, 427, false);
+    // Oracle: `u17le(<<16#12,16#34,16#56,16#78,16#9A,16#BC,16#DE,16#F0>>)` → 13330.
+    expect_field(
+        &module,
+        &mut ctx,
+        "u17le",
+        &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+        13330,
+        false,
+    );
+}
+
+/// A little-endian field can also need a bignum (`> MAX_SMALL`), and a
+/// byte-aligned one still works.
+#[test]
+fn little_endian_fields_above_max_small_build_the_exact_bignum() {
+    let module = load_small();
+    let mut ctx = MinimalContext::new();
+
+    // Oracle: `u60le(<<16#FF;8>>)` → 1152921504606846975 (`2^60-1`, a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u60le",
+        &[0xFF; 8],
+        1152921504606846975,
+        false,
+    );
+    // Oracle: `u60le(<<16#12,16#34,16#56,16#78,16#9A,16#BC,16#DE,16#F0>>)` →
+    // 1143558727028585490 (a 60-bit little-endian field, a bignum).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u60le",
+        &[0x12, 0x34, 0x56, 0x78, 0x9A, 0xBC, 0xDE, 0xF0],
+        1143558727028585490,
+        false,
+    );
+    // Oracle: `u64le(<<16#FFFFFFFFFFFFFFFF:64>>)` → 18446744073709551615.
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64le",
+        &[0xFF; 8],
+        18446744073709551615,
+        false,
+    );
+    // Oracle: `u64le(<<16#ABCDEF0123456789:64>>)` → 9900958322455989675.
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64le",
+        &[0xAB, 0xCD, 0xEF, 0x01, 0x23, 0x45, 0x67, 0x89],
+        9900958322455989675,
+        false,
+    );
+    // Oracle: `u64le(<<16#F0,0,...>>)` → 240 (a byte-aligned LE field, a SMALL).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u64le",
+        &[0xF0, 0, 0, 0, 0, 0, 0, 0],
+        240,
+        false,
+    );
+    // Oracle: `u60le(<<16#80,0,...>>)` → 128 (a SMALL).
+    expect_field(
+        &module,
+        &mut ctx,
+        "u60le",
+        &[0x80, 0, 0, 0, 0, 0, 0, 0],
+        128,
+        false,
+    );
+    // Oracle: `s64le(<<16#C0,0,...>>)` → 192 (byte-aligned `little-signed`, positive).
+    expect_field(
+        &module,
+        &mut ctx,
+        "s64le",
+        &[0xC0, 0, 0, 0, 0, 0, 0, 0],
+        192,
+        false,
+    );
+    // Oracle: `s64le(<<16#FF;8>>)` → -1 (byte-aligned `little-signed`).
+    expect_field(&module, &mut ctx, "s64le", &[0xFF; 8], 1, true);
+}
+
+/// The standalone `bs_get_integer2` opcode (the compiler emits it only for a
+/// **dynamic** size) takes the same fixed path: a 64-bit unsigned field above
+/// `MAX_SMALL` is the exact bignum, and the in-range case stays a small.
+#[test]
+fn bs_get_integer2_reads_a_64_bit_field_above_max_small() {
+    let fixture = load_small();
+    let mut ctx = MinimalContext::new();
+
+    // Oracle: `<<Y:64>> = <<16#F000000000000000:64>>` → 17293822569102704640.
+    let (module, entry) = get_integer_module(64, 1, 0);
+    let arg = bin(&mut ctx, &[0xF0, 0, 0, 0, 0, 0, 0, 0]);
+    let mut machine = Machine::new();
+    let value = machine
+        .run_label(&module, entry, 1, &[arg], &mut ctx)
+        .expect("bs_get_integer2");
+    assert!(is_bignum(value), "{value:?} must be a bignum");
+    let encoded = bytes(run(&fixture, "e256", &[value], &mut ctx).expect("e256"));
+    assert_eq!(encoded, be256_parts(17293822569102704640, false));
+
+    // Oracle: `<<Y:64>> = <<1:64>>` → 1 (in range, stays a SMALL).
+    let arg = bin(&mut ctx, &[0, 0, 0, 0, 0, 0, 0, 1]);
+    let mut machine = Machine::new();
+    let value = machine
+        .run_label(&module, entry, 1, &[arg], &mut ctx)
+        .expect("bs_get_integer2");
+    assert_eq!(value, make_small(1));
+
+    // A 60-bit little-endian `bs_get_integer2` field above `MAX_SMALL`:
+    // Oracle: `<<Y:60/little>> = <<16#FFFFFFFFFFFFFFFF:60>>`... the first 60 bits of
+    // an all-ones subject read little-endian → 1152921504606846975.
+    let (module, entry) = get_integer_module(60, 1, BSF_LITTLE);
+    let arg = bin(&mut ctx, &[0xFF; 8]);
+    let mut machine = Machine::new();
+    let value = machine
+        .run_label(&module, entry, 1, &[arg], &mut ctx)
+        .expect("bs_get_integer2");
+    assert!(is_bignum(value), "{value:?} must be a bignum");
+    let encoded = bytes(run(&fixture, "e256", &[value], &mut ctx).expect("e256"));
+    assert_eq!(encoded, be256_parts(1152921504606846975, false));
 }
