@@ -185,8 +185,8 @@ pub(crate) trait Interior {
     /// index (`ets:info(Tab, memory)`'s interior contribution).
     ///
     /// The default is `0` — an interior that does not account for its index
-    /// storage contributes nothing; the hash interior reports its honest
-    /// bucket/entry allocation.
+    /// storage contributes nothing; the hash and `ordered_set` interiors report
+    /// their honest bucket/entry and B+-tree node-arena allocations respectively.
     fn memory(&self) -> usize {
         0
     }
@@ -215,7 +215,7 @@ pub(crate) trait Interior {
     ) -> Result<Eterm> {
         let object = self.lookup(key, atoms).into_iter().next().ok_or_else(badarg)?;
         let arity = object_arity(object)?;
-        let newcnt = add_counters(read_counter(object, pos)?, incr)?;
+        let newcnt = add_counters(read_counter(object, pos)?, incr, heap)?;
         let updated = replace_elements(object, arity, &[(pos, newcnt)], heap)?;
         self.insert(key, updated, atoms)?;
         Ok(newcnt)
@@ -664,8 +664,7 @@ impl Table {
             if op.pos == keypos || op.pos == 0 || op.pos > arity {
                 return Err(badarg());
             }
-            // The addressed element must be an integer (and small — the bignum
-            // element is the documented representation gap).
+            // The addressed element must be an integer.
             read_counter(object, op.pos)?;
         }
 
@@ -688,7 +687,7 @@ impl Table {
                 .interior
                 .update_counter(key, op.pos, op.incr, atoms, heap)?;
             let value = match op.warp {
-                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold) => {
+                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold, atoms) => {
                     // The threshold rule replaces the counter outright; the hash
                     // override has no "write this value" entry point, so route it
                     // through `update_element` (same observable result).

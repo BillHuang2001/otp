@@ -1,8 +1,8 @@
 //! `ets:update_counter/3,4` and `ets:update_element/3`.
 //!
 //! Every expected value below was derived from the system `erl` (OTP 29 /
-//! erts-17.1); the residual representation gap (a small-int sum that real ETS
-//! promotes to a bignum) is asserted explicitly.
+//! erts-17.1); the arbitrary-precision promotion of an out-of-range sum (and a
+//! bignum element/operand) is asserted explicitly.
 
 mod common;
 
@@ -606,36 +606,96 @@ fn update_element_honours_the_table_keypos() {
     }
 }
 
-/// A small-int sum that real ETS promotes to a bignum is the documented
-/// representation gap: it reports `SystemLimit` rather than a wrong value.
+/// A counter update leaves the 60-bit small range: real ETS (and this crate)
+/// promotes the sum to a **bignum**, and a bignum element/operand is accepted.
 #[test]
-fn update_counter_reports_the_bignum_representation_gap() {
+fn update_counter_promotes_to_bignums_and_accepts_bignum_operands() {
     for kind in [TableKind::Set, TableKind::OrderedSet] {
         let atoms = AtomTable::new();
-        let mut heap = Heap::new(64);
+        let mut heap = Heap::new(256);
         let mut out = rebuild_heap();
         let mut t = new_table(kind);
         t.insert(int_tuple(&mut heap, &[1, MAX_SMALL]), &atoms)
             .unwrap();
 
-        // `MAX_SMALL + 1` is a bignum in real ETS (verified: it returns
-        // `576460752303423488`); this crate has no bignum arithmetic.
-        assert!(matches!(
-            t.update_counter(make_small(1), make_small(1), &atoms, &mut out),
-            Err(BeamError::SystemLimit)
-        ));
-        // A bignum operand is likewise unavailable.
-        let bignum = bignum_term();
-        assert!(matches!(
-            t.update_counter(make_small(1), bignum, &atoms, &mut out),
-            Err(BeamError::SystemLimit)
-        ));
-        // The stored object is unchanged by either failure.
+        // `MAX_SMALL + 1` is `2^59` (verified against `erl`: it returns
+        // `576460752303423488`), a one-limb bignum.
+        let sum = t
+            .update_counter(make_small(1), make_small(1), &atoms, &mut out)
+            .unwrap();
+        let two_pow_59 = big(&mut heap, false, &[1u64 << 59]);
+        assert!(unsafe { is_big(sum) }, "{kind:?}: the sum is a bignum");
+        assert!(eq(sum, two_pow_59, &atoms), "{kind:?}: exact value");
+        let expected = tuple_of(&mut heap, &[make_small(1), two_pow_59]);
+        assert!(
+            eq(t.lookup(make_small(1), &atoms)[0], expected, &atoms),
+            "{kind:?}: the stored object holds the bignum"
+        );
+
+        // Subtracting 1 lands back exactly on `MAX_SMALL` — a small again.
+        assert_eq!(
+            t.update_counter(make_small(1), make_small(-1), &atoms, &mut out)
+                .unwrap(),
+            make_small(MAX_SMALL),
+            "{kind:?}: normalised back to a small"
+        );
+
+        // A small element plus a bignum operand: `10 + 2^60` is the one-limb
+        // bignum `2^60 + 10` (`bignum_term()` is `2^60`).
+        t.insert(int_tuple(&mut heap, &[2, 10]), &atoms).unwrap();
+        let operand = bignum_term();
+        let sum = t
+            .update_counter(make_small(2), operand, &atoms, &mut out)
+            .unwrap();
+        let expected = big(&mut heap, false, &[(1u64 << 60) + 10]);
+        assert!(eq(sum, expected, &atoms), "{kind:?}: small + bignum");
+
+        // …and a negative bignum operand brings it back down exactly.
+        let negative = big(&mut heap, true, &[1u64 << 60]);
+        let sum = t
+            .update_counter(make_small(2), negative, &atoms, &mut out)
+            .unwrap();
+        assert_eq!(sum, make_small(10), "{kind:?}: sum cancels to a small");
         assert!(eq(
-            t.lookup(make_small(1), &atoms)[0],
-            int_tuple(&mut heap, &[1, MAX_SMALL]),
+            t.lookup(make_small(2), &atoms)[0],
+            int_tuple(&mut heap, &[2, 10]),
             &atoms
         ));
+    }
+}
+
+/// A **bignum position** is still `badarg` even though a bignum `Incr`,
+/// `Threshold` and `SetValue` are accepted (`erl_db.c:1573`).
+#[test]
+fn update_counter_rejects_a_bignum_position_with_badarg() {
+    for kind in [TableKind::Set, TableKind::OrderedSet] {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut out = rebuild_heap();
+        let mut t = new_table(kind);
+        t.insert(int_tuple(&mut heap, &[1, 10, 20]), &atoms)
+            .unwrap();
+
+        let position = bignum_term();
+        let operand = tuple_of(&mut heap, &[position, make_small(1)]);
+        assert!(matches!(
+            t.update_counter(make_small(1), operand, &atoms, &mut out),
+            Err(BeamError::BadArg)
+        ));
+        // A bignum `Threshold`/`SetValue` is *accepted* (only the position is
+        // small-only): `10 + 1 = 11 > 5` fires the warp rule and stores the bignum
+        // `2^60`.
+        let set_value = bignum_term();
+        let operand = {
+            let pos = make_small(2);
+            let incr = make_small(1);
+            let thr = make_small(5);
+            tuple_of(&mut heap, &[pos, incr, thr, set_value])
+        };
+        let warped = t
+            .update_counter(make_small(1), operand, &atoms, &mut out)
+            .unwrap();
+        assert!(eq(warped, set_value, &atoms), "{kind:?}: warped to the bignum");
     }
 }
 

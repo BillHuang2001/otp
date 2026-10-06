@@ -58,6 +58,13 @@ pub fn render(term: Eterm, atoms: &AtomTable) -> String {
     if is_small(term) {
         return signed_value(term).to_string();
     }
+    // SAFETY: `is_big` classifies `term` through its tag/header word.
+    if unsafe { is_big(term) } {
+        // SAFETY: the check above established a live bignum, so `big_parts` reads
+        // its header and digit words.
+        let (negative, digits) = unsafe { big_parts(term) };
+        return decimal_of(negative, digits);
+    }
     if is_atom(term) {
         return match atoms.name(atom_val(term)) {
             Some(name) => name.to_string(),
@@ -107,10 +114,68 @@ pub fn render(term: Eterm, atoms: &AtomTable) -> String {
 pub fn tuple_of(parts: &[String]) -> String {
     format!("{{{}}}", parts.join(","))
 }
-
 /// The oracle's `l/1`: join already-rendered parts as a list.
 pub fn list_of(parts: &[String]) -> String {
     format!("[{}]", parts.join(","))
+}
+
+/// The decimal text of an integer magnitude — the port of the oracle's
+/// `integer_to_list/1` for the bignum class (`r/1`'s `is_integer` clause).
+///
+/// `digits` are little-endian `ErtsDigit` (`u64`) limbs, least significant first;
+/// the magnitude is repeatedly divided by ten, emitting one decimal digit per
+/// step, which is exact for any width.
+fn decimal_of(negative: bool, digits: &[u64]) -> String {
+    let mut limbs = digits.to_vec();
+    let mut text: Vec<u8> = Vec::new();
+    while !limbs.is_empty() {
+        let mut remainder: u128 = 0;
+        for limb in limbs.iter_mut().rev() {
+            let current = (remainder << 64) | *limb as u128;
+            *limb = (current / 10) as u64;
+            remainder = current % 10;
+        }
+        text.push(b'0' + remainder as u8);
+        while matches!(limbs.last(), Some(0)) {
+            limbs.pop();
+        }
+    }
+    if text.is_empty() {
+        // A zero-width magnitude never occurs (a normalised bignum has at least one
+        // non-zero limb), but render it as the conventional `0` just in case.
+        text.push(b'0');
+    }
+    let mut rendered: String = text.iter().rev().map(|byte| *byte as char).collect();
+    if negative {
+        rendered.insert(0, '-');
+    }
+    rendered
+}
+
+/// The little-endian `u64` limbs of `2^exp` — the magnitude the oracle's
+/// `1 bsl exp` produces.
+fn pow2(exp: u32) -> Vec<u64> {
+    let mut digits = vec![0u64; (exp / 64 + 1) as usize];
+    digits[(exp / 64) as usize] = 1u64 << (exp % 64);
+    digits
+}
+
+/// The limbs of `2^exp + delta` for a non-negative `delta` (used to build the
+/// oracle's `(1 bsl 192) + 7`-style operands).
+fn pow2_plus(exp: u32, delta: u64) -> Vec<u64> {
+    let mut digits = pow2(exp);
+    let mut carry = delta;
+    let mut index = 0usize;
+    while carry != 0 {
+        if index == digits.len() {
+            digits.push(0);
+        }
+        let (sum, overflow) = digits[index].overflowing_add(carry);
+        digits[index] = sum;
+        carry = u64::from(overflow);
+        index += 1;
+    }
+    digits
 }
 
 /// `true`/`false` as the oracle renders them.
@@ -207,6 +272,26 @@ impl Battery {
     /// A `{Key, Value}` object with integral elements.
     fn object(&mut self, key: i64, value: i64) -> Eterm {
         self.ints(&[key, value])
+    }
+
+    /// A bignum of `digits` (least significant first, non-empty) on the arena.
+    fn big(&mut self, negative: bool, digits: &[u64]) -> Eterm {
+        // SAFETY: `alloc_words` hands out exactly `big_size_words(n)` writable
+        // words, all of which `write_big` fills (`digits` is non-empty everywhere
+        // this is called).
+        let hp = unsafe {
+            self.heap
+                .alloc_words(big_size_words(digits.len()))
+                .expect("the battery arena has room")
+        };
+        // SAFETY: `hp` addresses exactly `big_size_words(len)` words.
+        unsafe { write_big(hp, negative, digits) }
+    }
+
+    /// A `{Key, Value}` object whose value is a bignum.
+    fn big_object(&mut self, key: i64, negative: bool, digits: &[u64]) -> Eterm {
+        let value = self.big(negative, digits);
+        self.tuple(&[make_small(key), value])
     }
 
     /// A fresh table of `kind` with the given 1-based `keypos`.

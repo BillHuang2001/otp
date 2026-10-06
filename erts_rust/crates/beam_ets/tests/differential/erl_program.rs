@@ -99,6 +99,16 @@ battery() ->
     emit("update_counter_multi_kind", update_counter_multi_kind()),
     emit("update_element_variants", update_element_variants()),
 
+    emit("update_counter_bignum_overflow", update_counter_bignum_overflow()),
+    emit("update_counter_bignum_kinds", update_counter_bignum_kinds()),
+    emit("update_counter_bignum_operand", update_counter_bignum_operand()),
+    emit("update_counter_bignum_element", update_counter_bignum_element()),
+    emit("update_counter_bignum_add", update_counter_bignum_add()),
+    emit("update_counter_bignum_mixed_sign", update_counter_bignum_mixed_sign()),
+    emit("update_counter_bignum_threshold", update_counter_bignum_threshold()),
+    emit("update_counter_bignum_warp_value", update_counter_bignum_warp_value()),
+    emit("update_counter_bignum_list_ops", update_counter_bignum_list_ops()),
+    emit("update_counter_bignum_position_badarg", update_counter_bignum_position_badarg()),
     emit("take_and_lookup_element", take_and_lookup_element()),
 
     emit("select_head_vars", select_head_vars()),
@@ -418,6 +428,93 @@ malformed_specs() ->
              [{'_', [{is_integer, '$1'}], ['$_']}],
              [{'_', [], ['$_']}]],
     l([cap(fun() -> ets:select(T, C) end) || C <- Cases]).
+
+%% --------------------- update_counter with bignums ---------------------
+
+update_counter_bignum_overflow() ->
+    T = new(set),
+    M = (1 bsl 59) - 1,
+    ets:insert(T, {1, M}),
+    V1 = ets:update_counter(T, 1, 1),
+    L1 = ets:lookup(T, 1),
+    V2 = ets:update_counter(T, 1, -1),
+    t([r(V1), srt(L1), r(V2), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_kinds() ->
+    l([begin
+           T = new(Kind),
+           ets:insert(T, {1, (1 bsl 59) - 1}),
+           V1 = ets:update_counter(T, 1, 1),
+           V2 = ets:update_counter(T, 1, 1 bsl 100),
+           t([r(V1), r(V2), srt(ets:lookup(T, 1))])
+       end || Kind <- [set, ordered_set]]).
+
+update_counter_bignum_operand() ->
+    T = new(set),
+    B = 1 bsl 100,
+    ets:insert(T, {1, 10}),
+    V1 = ets:update_counter(T, 1, B),
+    V2 = ets:update_counter(T, 1, -B),
+    t([r(V1), r(V2), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_element() ->
+    T = new(set),
+    B = -(1 bsl 100),
+    ets:insert(T, {1, B}),
+    V1 = ets:update_counter(T, 1, 5),
+    V2 = ets:update_counter(T, 1, -3),
+    t([r(V1), r(V2), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_add() ->
+    T = new(set),
+    A = 1 bsl 200,
+    B = (1 bsl 192) + 7,
+    ets:insert(T, {1, A}),
+    V1 = ets:update_counter(T, 1, B),
+    V2 = ets:update_counter(T, 1, -A),
+    t([r(V1), r(V2), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_mixed_sign() ->
+    T = new(set),
+    A = 1 bsl 100,
+    ets:insert(T, {1, -A}),
+    V1 = ets:update_counter(T, 1, A),
+    V2 = ets:update_counter(T, 1, -(A + 1)),
+    V3 = ets:update_counter(T, 1, A),
+    t([r(V1), r(V2), r(V3), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_threshold() ->
+    Ops = [{2, 1 bsl 100, 1 bsl 99, 7},
+           {2, -(1 bsl 100), -(1 bsl 99), -7},
+           {2, 1 bsl 100, 1 bsl 101, 0}],
+    l([begin
+           T = new(set),
+           ets:insert(T, {1, 0}),
+           V = ets:update_counter(T, 1, Op),
+           t([r(V), srt(ets:lookup(T, 1))])
+       end || Op <- Ops]).
+
+update_counter_bignum_warp_value() ->
+    T = new(set),
+    ets:insert(T, {1, 10}),
+    V = ets:update_counter(T, 1, {2, 1, 5, 1 bsl 100}),
+    t([r(V), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_list_ops() ->
+    T = new(set),
+    ets:insert(T, {1, 0, 0}),
+    V = ets:update_counter(T, 1, [{2, 1 bsl 100}, {3, -(1 bsl 100)}]),
+    t([r(V), srt(ets:lookup(T, 1))]).
+
+update_counter_bignum_position_badarg() ->
+    T = new(set),
+    ets:insert(T, {1, 10}),
+    P = 1 bsl 100,
+    C1 = cap(fun() -> ets:update_counter(T, 1, {P, 1}) end),
+    C2 = cap(fun() -> ets:update_counter(T, 1, {2, 1, P, 5}) end),
+    C3 = cap(fun() -> ets:update_counter(T, 1, nope) end),
+    C4 = cap(fun() -> ets:update_counter(T, 1, {2, nope}) end),
+    t([C1, C2, C3, C4, srt(ets:lookup(T, 1))]).
 
 %% ------------------------------ large tables ------------------------------
 

@@ -101,6 +101,16 @@ impl OrderedSetInterior {
     pub fn prev_from(&self, bound: Eterm, inclusive: bool, atoms: &AtomTable) -> Option<Eterm> {
         self.tree.prev_from(bound, inclusive, atoms)
     }
+
+    /// An honest, non-negative word count of the B+-tree node arena — the
+    /// `ordered_set` interior contribution to `ets:info(Tab, memory)`.
+    ///
+    /// Measured at capacity (the node arena's honest allocation), so it is strictly
+    /// positive even when empty (the root leaf exists), never decreases as keys are
+    /// inserted, and is at least one word per stored object.
+    pub fn memory(&self) -> usize {
+        self.tree.memory()
+    }
 }
 
 impl Interior for OrderedSetInterior {
@@ -141,6 +151,11 @@ impl Interior for OrderedSetInterior {
 
     fn size(&self) -> usize {
         self.tree.len()
+    }
+
+    fn memory(&self) -> usize {
+        // The honest node-arena count, not the `Interior` default of 0.
+        OrderedSetInterior::memory(self)
     }
 
     fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_> {
@@ -770,8 +785,9 @@ mod tests {
             Some(make_small(3))
         );
 
-        // The B+-tree does not account for its node storage yet (documented gap).
-        assert_eq!(Interior::memory(&t), 0);
+        // The B+-tree reports its node-arena storage through the seam.
+        assert!(Interior::memory(&t) > 0);
+        assert_eq!(Interior::memory(&t), OrderedSetInterior::memory(&t));
 
         // Draining the tree empties both `keys` and the extremes.
         for v in [1i64, 2, 3] {
@@ -780,5 +796,42 @@ mod tests {
         assert!(Interior::keys(&t).is_empty());
         assert_eq!(Interior::first_key(&t, &atoms), None);
         assert_eq!(Interior::last_key(&t, &atoms), None);
+    }
+
+    /// The `ordered_set` interior answers `ets:info(Tab, memory)` honestly: the
+    /// node-arena word count is strictly positive even when empty (the root leaf
+    /// exists), never decreases as keys are inserted, and is at least one word per
+    /// stored object.
+    #[test]
+    fn memory_is_a_non_negative_honest_word_count() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64 * 1024);
+        let mut t = OrderedSetInterior::new();
+
+        // Even an empty tree owns its root leaf and the slot table, so the count is
+        // strictly positive.
+        let empty = t.memory();
+        assert!(empty > 0, "an empty B+-tree owns its node arena");
+
+        // Insert well past `ORDER` (32) so the tree splits into branch + multiple
+        // leaves, and assert the count never decreases at any step.
+        let mut prev = empty;
+        for i in 0..2000i64 {
+            let o = object(&mut heap, i, i * 2);
+            t.insert_new(make_small(i), o, &atoms).unwrap();
+            let now = t.memory();
+            assert!(now >= prev, "count shrank on insert {i} ({prev} -> {now})");
+            prev = now;
+        }
+        let populated = t.memory();
+        assert!(populated > empty, "inserting grows the node arena");
+
+        // Never under-reports: at least one word per stored object (node vectors and
+        // the slot table only add to it).
+        assert!(populated >= t.size());
+        assert_eq!(t.size(), 2000);
+
+        // The seam and the inherent accessor agree.
+        assert_eq!(Interior::memory(&t), populated);
     }
 }

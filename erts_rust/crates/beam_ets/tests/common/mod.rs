@@ -81,3 +81,17 @@ pub fn bignum_term() -> Eterm {
     // the digit slice is non-empty as `write_big` requires.
     unsafe { write_big(leaked.as_mut_ptr(), false, &[1u64 << 60]) }
 }
+
+/// A bignum of `digits` (least significant first, non-empty) built on `heap`.
+///
+/// The counter tests use it to name the *exact* expected result of an
+/// arbitrary-precision sum, independent of the small/bignum encoding: two bignums
+/// with the same sign and digits are `=:=` (`beam_term::compare::cmp` compares
+/// their limbs).
+pub fn big(heap: &mut Heap, negative: bool, digits: &[u64]) -> Eterm {
+    // SAFETY: `alloc_words` hands out exactly `big_size_words(n)` uninitialised
+    // words, which `write_big` fills completely.
+    let hp = unsafe { heap.alloc_words(big_size_words(digits.len())).expect("test heap has room") };
+    // SAFETY: `hp` addresses `big_size_words(len)` words and `digits` is non-empty.
+    unsafe { write_big(hp, negative, digits) }
+}
