@@ -1,0 +1,405 @@
+%%
+%% %CopyrightBegin%
+%%
+%% SPDX-License-Identifier: Apache-2.0
+%%
+%% Copyright Ericsson AB 2026. All Rights Reserved.
+%%
+%% Licensed under the Apache License, Version 2.0 (the "License");
+%% you may not use this file except in compliance with the License.
+%% You may obtain a copy of the License at
+%%
+%%     http://www.apache.org/licenses/LICENSE-2.0
+%%
+%% Unless required by applicable law or agreed to in writing, software
+%% distributed under the License is distributed on an "AS IS" BASIS,
+%% WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+%% See the License for the specific language governing permissions and
+%% limitations under the License.
+%%
+%% %CopyrightEnd%
+%%
+%% Tests for the opt-in "FBIP" (functional-but-in-place) pass
+%% beam_ssa_fbip/1.
+%%
+%% The pass is only run when the compile option `fbip_opt' is given; the
+%% gating is done by beam_ssa_destructive_update:opt/2, which invokes the
+%% pass after the regular alias/destructive-update transforms. Without the
+%% option the update_record hint is whatever the ordinary destructive-update
+%% pass produced.
+%%
+%% The pass rewrites a *copying* `update_record' to the `inplace' hint when
+%% the update source is a value that is provably
+%%
+%%   * freshly allocated (a tuple, a writable binary, a call to a local
+%%     "fresh returning" function, or a value that is already an inplace
+%%     update result),
+%%   * uniquely owned (not a function argument, used exactly once), and
+%%   * defined in the same block as the update or in its single predecessor
+%%     block (so the update cannot run twice per allocation).
+%%
+%% Everything else must keep its hint, i.e. the transform may never weaken a
+%% `copy'/`reuse' that was required for safety. This suite checks both
+%% directions:
+%%
+%%   * a provably safe update gets `inplace' with `fbip_opt' and stays
+%%     `copy' without it,
+%%   * unsafe sources (function argument, value sent with `!', value
+%%     captured by a fun, value used twice) keep exactly the same hint with
+%%     and without the option and are never rewritten to `inplace', and
+%%   * the two builds behave identically: every probe function is loadable
+%%     and returns exactly the same values and exceptions in both builds.
+%%
+%% The tests operate on a small probe module that is compiled twice under
+%% the option sets in opt_sets/0 and disassembled with beam_disasm: see
+%% `update_record' hint assertions below.
+%%
+%% An update_record instruction is disassembled as
+%%
+%%     {update_record,{atom,Hint},Size,Src,SrcFun,Dst,{list,Updates}}
+%%
+%% i.e. the hint is element(2, Instr) and is one of {atom,copy},
+%% {atom,inplace} or {atom,reuse}. Functions whose record updates are
+%% constant-folded away before the SSA passes contain no update_record
+%% instruction at all; that case is exercised (and documented) by the
+%% `literal_sources' probe functions.
+%%
+-module(beam_ssa_fbip_SUITE).
+
+-include_lib("stdlib/include/assert.hrl").
+
+-export([all/0,suite/0,groups/0,init_per_suite/1,end_per_suite/1,
+         init_per_group/2,end_per_group/2]).
+-export([safe_hint_rewritten/1,
+         unsafe_hints_unchanged/1,
+         literal_sources_not_rewritten/1,
+         behaviour_identical/1]).
+
+suite() ->
+    [{ct_hooks,[ts_install_cth]},
+     {timetrap,{minutes,5}}].
+
+all() ->
+    [{group,p}].
+
+groups() ->
+    [{p,[parallel],
+      [safe_hint_rewritten,
+       unsafe_hints_unchanged,
+       literal_sources_not_rewritten,
+       behaviour_identical]}].
+
+init_per_suite(Config) ->
+    Config.
+
+end_per_suite(_Config) ->
+    ok.
+
+init_per_group(_GroupName, Config) ->
+    Config.
+
+end_per_group(_GroupName, Config) ->
+    Config.
+
+%%============================================================================
+%% Test cases
+%%============================================================================
+
+%% The positive case: the source of the update is the result of a local
+%% function that always returns a freshly allocated record, it is used
+%% exactly once and is not otherwise observable, so the pass may turn the
+%% copying update into an in-place update - but only when it is enabled.
+safe_hint_rewritten(Config) ->
+    {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_safe"),
+
+    ?assertEqual({atom,copy}, hint(plain, Builds, safe, 1)),
+    ?assertEqual({atom,inplace}, hint(fbip, Builds, safe, 1)),
+    ok.
+
+%% The unsafe witnesses. None of them may be rewritten, and - even more
+%% importantly - the option must not change their hint at all. The
+%% function-argument source is expected to keep the `reuse' that the
+%% ordinary destructive-update pass produces (it reuses the argument's
+%% frame slot); the value that is sent, captured by a fun or simply used
+%% twice must keep the copying update.
+unsafe_hints_unchanged(Config) ->
+    {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_unsafe"),
+
+    %% A value that is handed out to another process (`!') is observable
+    %% outside this function, so it may never be written in place.
+    unchanged(Builds, sent, 1, {atom,copy}),
+
+    %% A value captured by a fun is reachable from the fun object, so the
+    %% update must copy.
+    unchanged(Builds, captured, 1, {atom,copy}),
+
+    %% A value that is used more than once has an observable alias after the
+    %% update, so the update must copy.
+    unchanged(Builds, used_twice, 1, {atom,copy}),
+
+    %% The source is a function argument: it is not freshly allocated and
+    %% the ordinary destructive-update pass reuses the argument's own frame
+    %% slot. The pass must leave that `reuse' untouched (and in particular
+    %% must not claim `inplace').
+    unchanged(Builds, arg_src, 1, {atom,reuse}),
+    ok.
+
+%% Sources that are compile-time literal records (`(#r{a=1})#r{b=2}',
+%% `T = #r{a=1}, T#r{b=2}', and a `case' returning literal records) are
+%% constant-folded before the SSA passes, so no update_record instruction is
+%% emitted for them at all - there is nothing for the pass to rewrite. This
+%% is asserted for both builds; note in particular that no `inplace' update
+%% may appear here.
+literal_sources_not_rewritten(Config) ->
+    {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_literal"),
+
+    lists:foreach(fun(Fun) ->
+                          lists:foreach(fun(Set) ->
+                                                ?assertEqual(none, hint(Set, Builds, Fun, 1))
+                                        end, [plain,fbip])
+                  end, [lit_inline,lit_var,lit_case]),
+    ok.
+
+%% The transform must be behaviour preserving: every probe function must
+%% load and return exactly the same values (and the same exceptions) in both
+%% builds, and those results must be the expected ones.
+behaviour_identical(Config) ->
+    {_Mod, Builds} = build_probe(Config, "beam_ssa_fbip_behaviour"),
+
+    lists:foreach(fun({Fun, Args}) ->
+                          check_calls(Builds, Fun, Args)
+                  end, cases()),
+    ok.
+
+%%============================================================================
+%% Probes
+%%============================================================================
+
+%% `Mod' is the module name of the probe; the source is generated, so the
+%% same probe can be compiled under several names and thus be used from
+%% parallel test cases without them clobbering each other in the code
+%% server.
+probe_source(Mod) ->
+    ["-module(", Mod, ").\n",
+     "-export([mk/1,safe/1,sent/1,captured/1,used_twice/1,arg_src/1,\n",
+     "         lit_inline/1,lit_var/1,lit_case/1]).\n",
+     "\n",
+     "%% The literal-source probes below update a known-at-compile-time\n",
+     "%% record on purpose, which erl_lint warns about.\n",
+     "-compile(nowarn_update_literal).\n",
+     "\n",
+     "%% An ordinary record (a tuple), so that the record access cannot\n",
+     "%% interfere with the pass.\n",
+     "-record(r, {a, b, c}).\n",
+     "\n",
+     "%% A local constructor that always returns a freshly allocated record;\n",
+     "%% the pass treats it as a 'fresh returning' function.\n",
+     "mk(X) -> #r{a=X}.\n",
+     "\n",
+     "%% SAFE: the source is the result of a local fresh call, it is used\n",
+     "%% exactly once and it is not otherwise observable.\n",
+     "safe(X) ->\n",
+     "    R0 = mk(X),\n",
+     "    R0#r{b=1}.\n",
+     "\n",
+     "%% UNSAFE: the value is handed to another process before the update, so\n",
+     "%% the update must copy.\n",
+     "sent(X) ->\n",
+     "    R0 = mk(X),\n",
+     "    self() ! R0,\n",
+     "    R0#r{b=1}.\n",
+     "\n",
+     "%% UNSAFE: the value is captured by a fun, so it stays reachable through\n",
+     "%% the fun and the update must copy. The fun is applied so that the\n",
+     "%% result of the function is comparable between builds.\n",
+     "captured(X) ->\n",
+     "    R0 = mk(X),\n",
+     "    F = fun() -> R0 end,\n",
+     "    {R0#r{b=1}, F()}.\n",
+     "\n",
+     "%% UNSAFE: the value is used twice.\n",
+     "used_twice(X) ->\n",
+     "    R0 = mk(X),\n",
+     "    {R0, R0#r{b=1}}.\n",
+     "\n",
+     "%% UNSAFE: the source is a function argument, which is never fresh. The\n",
+     "%% ordinary destructive-update pass reuses the argument's frame slot.\n",
+     "arg_src(R) -> R#r{a=1}.\n",
+     "\n",
+     "%% Literal sources: the record value is known at compile time, so the\n",
+     "%% update is constant-folded before the SSA passes run and no\n",
+     "%% update_record instruction is generated at all.\n",
+     "lit_inline(_) -> (#r{a=1})#r{b=2}.\n",
+     "\n",
+     "lit_var(_) ->\n",
+     "    T = #r{a=1},\n",
+     "    T#r{b=2}.\n",
+     "\n",
+     "lit_case(X) ->\n",
+     "    T = case X of\n",
+     "            1 -> #r{a=1};\n",
+     "            _ -> #r{a=2}\n",
+     "        end,\n",
+     "    T#r{b=2}.\n"].
+
+%%============================================================================
+%% Compiling, disassembling and running the probes
+%%============================================================================
+
+%% The option sets every probe is compiled with. `fbip' enables the pass,
+%% `plain' is the default without it.
+opt_sets() ->
+    [{plain, [binary]},
+     {fbip,  [binary,fbip_opt]}].
+
+%% Write the probe named `Mod' into a fresh scratch directory and compile it
+%% with every option set in opt_sets/0. Returns the module name and the list
+%% of builds.
+build_probe(Config, Mod) ->
+    Dir = tmp_dir(Config),
+    File = write_probe(Dir, Mod, probe_source(Mod)),
+    {Mod, [build(File, Set, Opts) || {Set,Opts} <- opt_sets()]}.
+
+%% Compile to memory only, so that the builds cannot influence each other.
+build(File, Set, Opts) ->
+    case compile:file(File, [return_errors,return_warnings|Opts]) of
+        {ok, Mod, Bin, []} ->
+            {Set, Mod, Bin, disasm(Bin)};
+        {ok, _Mod, _Bin, Warnings} ->
+            ct:fail({unexpected_warnings, File, Warnings});
+        {error, Errors, Warnings} ->
+            ct:fail({compile_failed, File, Errors, Warnings})
+    end.
+
+%% The hint of the update_record instruction in `Fun/Arity' of one build.
+%% Fails if the function defines more than one update_record (the probes are
+%% built so that they never do) and returns `none' if there is none at all.
+hint(Set, Builds, Fun, Arity) ->
+    case lists:keyfind(Set, 1, Builds) of
+        {Set, _Mod, _Bin, Code} ->
+            case function_code(Code, Fun, Arity) of
+                not_found ->
+                    ct:fail({missing_function, Set, Fun, Arity});
+                Is ->
+                    case [element(2,I) || I <- Is, is_update_record(I)] of
+                        [Hint] -> Hint;
+                        [] -> none;
+                        More -> ct:fail({multiple_update_records, Set, Fun, Arity, More})
+                    end
+            end;
+        false ->
+            ct:fail({missing_option_set, Set})
+    end.
+
+%% Assert that `Fun/Arity' has exactly `Expected' as hint in every build and
+%% that the option does not change it (and never makes it `inplace').
+unchanged(Builds, Fun, Arity, Expected) ->
+    Hints = [{Set, hint(Set, Builds, Fun, Arity)} || {Set,_,_,_} <- Builds],
+    ?assertEqual([{plain,Expected},{fbip,Expected}], Hints),
+    ?assertNotEqual({atom,inplace}, Expected),
+    ok.
+
+is_update_record(I) ->
+    is_tuple(I) andalso tuple_size(I) =:= 6 andalso element(1, I) =:= update_record.
+
+function_code(Code, Name, Arity) ->
+    case [Is || {function,N,A,_,Is} <- Code, N =:= Name, A =:= Arity] of
+        [Is] -> Is;
+        [] -> not_found
+    end.
+
+%% The code of one build, i.e. the list of `{function,Name,Arity,Label,Is}'
+%% entries. beam_disasm:file/1 returns the #beam_file{} record; it is matched
+%% as a plain tuple here so that this suite does not have to include the
+%% compiler internal beam_disasm.hrl.
+disasm(Bin) ->
+    case beam_disasm:file(Bin) of
+        {beam_file, _Mod, _Exports, _Attrs, _CompileInfo, Code} ->
+            Code;
+        {error, Mod, Reason} ->
+            ct:fail({beam_disasm_failed, Mod, Reason})
+    end.
+
+%%============================================================================
+%% Running the probes
+%%============================================================================
+
+%% The probe functions and the arguments they are called with. `arg_src'
+%% also gets values that are not (well-formed) records so that the exception
+%% path is compared as well.
+cases() ->
+    [{mk,         [0, 42, x, [1,2], {a,b}]},
+     {safe,       [0, 42, x, [1,2]]},
+     {sent,       [0, 42, x]},
+     {captured,   [0, 42, x]},
+     {used_twice, [0, 42, x]},
+     {arg_src,    [{r,1,2,3}, {r,undefined,undefined,undefined},
+                   {s,1,2,3}, {r,1,2}, 42, not_a_record]},
+     {lit_inline, [0, ignored]},
+     {lit_var,    [0, ignored]},
+     {lit_case,   [1, 2, other, 0]}].
+
+%% Call `Fun(Arg)' in every build and check that both builds return exactly
+%% the expected result or exception, and that they agree with each other.
+check_calls(Builds, Fun, Args) ->
+    Expected = [expected(Fun, Arg) || Arg <- Args],
+    Results = [{Set, [run(Mod, Bin, Fun, Arg) || Arg <- Args]}
+               || {Set, Mod, Bin, _Code} <- Builds],
+    lists:foreach(fun({Set, Values}) ->
+                          ?assertEqual({Set, Expected}, {Set, Values})
+                  end, Results),
+    ?assertEqual(1, length(lists:usort([Values || {_Set,Values} <- Results]))),
+    ok.
+
+%% The expected result of `Fun(Arg)': `{ok,Value}' for a normal return,
+%% `{Class,Reason}' for an exception.
+expected(mk, X) -> {ok,{r,X,undefined,undefined}};
+expected(safe, X) -> {ok,{r,X,1,undefined}};
+expected(sent, X) -> {ok,{r,X,1,undefined}};
+expected(captured, X) -> {ok,{{r,X,1,undefined},{r,X,undefined,undefined}}};
+expected(used_twice, X) -> {ok,{{r,X,undefined,undefined},{r,X,1,undefined}}};
+expected(arg_src, {r,_A,B,C}) -> {ok,{r,1,B,C}};
+expected(arg_src, Other) -> {error,{badrecord,Other}};
+expected(lit_inline, _) -> {ok,{r,1,2,undefined}};
+expected(lit_var, _) -> {ok,{r,1,2,undefined}};
+expected(lit_case, 1) -> {ok,{r,1,2,undefined}};
+expected(lit_case, _) -> {ok,{r,2,2,undefined}}.
+
+%% Run `Mod:Fun(Arg)' in the code that was just loaded. The result is
+%% `{ok,Value}' for a normal return and `{Class,Reason}' for an exception;
+%% the stacktrace is deliberately not part of the comparison.
+run(Mod, Bin, Fun, Arg) ->
+    _ = code:purge(Mod),
+    {module, Mod} = code:load_binary(Mod, atom_to_list(Mod) ++ ".erl", Bin),
+    try apply(Mod, Fun, [Arg]) of
+        Value ->
+            {ok, Value}
+    catch
+        Class:Reason ->
+            {Class, Reason}
+    end.
+
+%%============================================================================
+%% Helpers
+%%============================================================================
+
+tmp_dir(Config) ->
+    Base = case proplists:get_value(priv_dir, Config) of
+               undefined ->
+                   case os:getenv("TMPDIR") of
+                       false -> "/tmp";
+                       "" -> "/tmp";
+                       EnvDir -> EnvDir
+                   end;
+               PrivDir ->
+                   PrivDir
+           end,
+    Sub = "beam_ssa_fbip_" ++ integer_to_list(erlang:unique_integer([positive])),
+    Dir = filename:join(Base, Sub),
+    ok = filelib:ensure_path(Dir),
+    Dir.
+
+write_probe(Dir, Mod, Source) ->
+    File = filename:join(Dir, Mod ++ ".erl"),
+    ok = file:write_file(File, Source),
+    File.

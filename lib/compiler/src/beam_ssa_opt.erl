@@ -302,7 +302,7 @@ finish_1([], _StMap) ->
 -define(PASS(N), {N,fun N/1}).
 
 prologue_passes(Opts) ->
-    Ps = [?PASS(ssa_opt_split_blocks),
+    Ps0 = [?PASS(ssa_opt_split_blocks),
           ?PASS(ssa_opt_coalesce_phis),
           ?PASS(ssa_opt_tail_phis),
           ?PASS(ssa_opt_element),
@@ -312,6 +312,15 @@ prologue_passes(Opts) ->
           ?PASS(ssa_opt_update_tuple),
           ?PASS(ssa_opt_cse),                   % Helps the first type pass.
           ?PASS(ssa_opt_live)],                 % ...
+    Ps = case lists:member(loop_opt, Opts) of
+             true ->
+                 %% Opt-in loop optimizations. The pass is appended so that
+                 %% passes_1/2 derives its no_ssa_opt_loop_opt kill switch.
+                 Ps0 ++ [{ssa_opt_loop_opt,
+                          fun(St) -> beam_ssa_loop_opt:opt(St) end}];
+             false ->
+                 Ps0
+         end,
     passes_1(Ps, Opts).
 
 module_passes(Opts) ->
@@ -328,21 +337,26 @@ module_passes(Opts) ->
 %% These passes all benefit from each other (in roughly this order), so they
 %% are repeated as required.
 repeated_passes(Opts) ->
-    Ps = [?PASS(ssa_opt_live),
-          ?PASS(ssa_opt_sw),
-          ?PASS(ssa_opt_is_between),
-          ?PASS(ssa_opt_ne),
-          ?PASS(ssa_opt_bs_create_bin),
-          ?PASS(ssa_opt_dead),
-          ?PASS(ssa_opt_cse),
-          ?PASS(ssa_opt_tail_phis),
-          ?PASS(ssa_opt_sink),
-          ?PASS(ssa_opt_tuple_size),
-          ?PASS(ssa_opt_merge_updates),
-          ?PASS(ssa_opt_record),
-          ?PASS(ssa_opt_try),
-          ?PASS(ssa_opt_type_continue)],        %Must run after ssa_opt_dead to
+    Ps0 = [?PASS(ssa_opt_live),
+           ?PASS(ssa_opt_sw),
+           ?PASS(ssa_opt_is_between),
+           ?PASS(ssa_opt_ne),
+           ?PASS(ssa_opt_bs_create_bin),
+           ?PASS(ssa_opt_dead),
+           ?PASS(ssa_opt_cse),
+           ?PASS(ssa_opt_tail_phis),
+           ?PASS(ssa_opt_sink),
+           ?PASS(ssa_opt_tuple_size),
+           ?PASS(ssa_opt_merge_updates),
+           ?PASS(ssa_opt_record),
+           ?PASS(ssa_opt_try),
+           ?PASS(ssa_opt_type_continue)],       %Must run after ssa_opt_dead to
                                                 %clean up phi nodes.
+    Ps = case lists:member(fusion_opt, Opts) of
+             true ->
+                 Ps0 ++ [{ssa_opt_fus, fun beam_ssa_fus:ssa_opt_fus/1}];
+             false -> Ps0
+         end,
     passes_1(Ps, Opts).
 
 epilogue_module_passes(Opts) ->
@@ -364,6 +378,11 @@ early_epilogue_passes(Opts) ->
     passes_1(Ps, Opts).
 
 late_epilogue_passes(Opts) ->
+    %% Record whether the opt-in FBIP pass should run. This function is
+    %% evaluated while the phase list is built (before any pass runs), so
+    %% the flag is available to beam_ssa_destructive_update:opt/2, which
+    %% invokes beam_ssa_fbip:opt/2.
+    put('$fbip_opt', member(fbip_opt, Opts)),
     Ps = [%% Run live one more time to clean up after the previous
           %% epilogue passes.
           ?PASS(ssa_opt_live),
