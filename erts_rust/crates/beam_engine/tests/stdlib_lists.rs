@@ -430,9 +430,12 @@ const BREADTH_TARGETS: &str = include_str!("fixtures/stdlib_breadth_targets.txt"
 
 /// The floor this suite enforces: the number of distinct corpus modules that
 /// must have **at least one export actually interpreted** on an oracle-checked
-/// input. Set to the honest number this suite measures (151 of 261; it was 15
+/// input. Set to the honest number this suite measures (171 of 261; it was 15
 /// before the breadth corpus was added), not to a wishful one.
-const BREADTH_MODULE_FLOOR: usize = 151;
+const BREADTH_MODULE_FLOOR: usize = 171;
+/// The floor on the number of oracle-checked calls the corpus must actually
+/// execute (set to the honest number this suite measures: 504).
+const BREADTH_CALL_FLOOR: usize = 480;
 
 /// One parsed corpus line: `module:function(args) => expected`.
 struct BreadthTarget<'a> {
@@ -468,55 +471,94 @@ fn parse_breadth_target(line: &str) -> Option<BreadthTarget<'_>> {
     })
 }
 
-/// Builds the argument list for one of the corpus's fixed argument shapes (the
-/// 21 shapes the corpus uses; an unknown shape is a corpus bug and panics).
-fn breadth_args(host: &mut ModuleHost, args: &str) -> Vec<Eterm> {
-    match args {
-        "" => vec![],
-        "0" => vec![beam_term::make_small(0)],
-        "5" => vec![beam_term::make_small(5)],
-        "true" => vec![host.intern("true")],
-        "a" => vec![host.intern("a")],
-        "[1,2,3]" => vec![int_list(host, &[1, 2, 3])],
-        "[]" => vec![beam_term::NIL],
-        "\"abc\"" => vec![int_list(host, &[97, 98, 99])],
-        "{1,2}" => vec![support::term_tuple(
-            host,
-            &[beam_term::make_small(1), beam_term::make_small(2)],
-        )],
-        "1,[]" => vec![beam_term::make_small(1), beam_term::NIL],
-        "3,7" => vec![beam_term::make_small(3), beam_term::make_small(7)],
-        "a,b" => vec![host.intern("a"), host.intern("b")],
-        "1,2,3" => vec![
-            beam_term::make_small(1),
-            beam_term::make_small(2),
-            beam_term::make_small(3),
-        ],
-        "2,[1,2,3]" => vec![beam_term::make_small(2), int_list(host, &[1, 2, 3])],
-        "[1,2],[3,4]" => vec![int_list(host, &[1, 2]), int_list(host, &[3, 4])],
-        "[3,1,2],2" => vec![int_list(host, &[3, 1, 2]), beam_term::make_small(2)],
-        "a,1,[]" => vec![
-            host.intern("a"),
-            beam_term::make_small(1),
-            beam_term::NIL,
-        ],
-        "2,[1,2,3],9" => vec![
-            beam_term::make_small(2),
-            int_list(host, &[1, 2, 3]),
-            beam_term::make_small(9),
-        ],
-        "[1,2,3],1,3" => vec![
-            int_list(host, &[1, 2, 3]),
-            beam_term::make_small(1),
-            beam_term::make_small(3),
-        ],
-        "[1,2,3],[1,2],[3]" => vec![
-            int_list(host, &[1, 2, 3]),
-            int_list(host, &[1, 2]),
-            int_list(host, &[3]),
-        ],
-        other => panic!("unknown corpus argument shape: `({other})`"),
+/// Splits an argument list on **top-level** commas, respecting `[]`/`{}`/`<<>>`
+/// nesting and `"`-quoted strings.
+fn split_arg_terms(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut start = 0usize;
+    for (index, &byte) in args.as_bytes().iter().enumerate() {
+        match byte {
+            b'"' => in_string = !in_string,
+            b'[' | b'{' | b'<' if !in_string => depth += 1,
+            b']' | b'}' | b'>' if !in_string => depth -= 1,
+            b',' if !in_string && depth == 0 => {
+                parts.push(&args[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
     }
+    parts.push(&args[start..]);
+    parts
+}
+
+/// Builds one corpus argument from its source text: `[]`, `[a,b,c]` (a list of
+/// nested terms), `{a,b}` (a tuple), `<<1,2,3>>` (a byte binary), `"abc"` (a
+/// code-point string), an integer, an atom (bare or `'quoted'`).
+fn arg_term(host: &mut ModuleHost, text: &str) -> Eterm {
+    let text = text.trim();
+    if let Some(inner) = text.strip_prefix("<<").and_then(|t| t.strip_suffix(">>")) {
+        let bytes: Vec<u8> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_arg_terms(inner)
+                .iter()
+                .map(|part| {
+                    part.trim()
+                        .parse::<u8>()
+                        .expect("a corpus binary element is a byte literal")
+                })
+                .collect()
+        };
+        return terms::make_heap_binary(host, &bytes).expect("build the corpus binary argument");
+    }
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        if inner.trim().is_empty() {
+            return beam_term::NIL;
+        }
+        let elements: Vec<Eterm> = split_arg_terms(inner)
+            .iter()
+            .map(|part| arg_term(host, part))
+            .collect();
+        return terms::make_list(host, &elements).expect("build the corpus list argument");
+    }
+    if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        let elements: Vec<Eterm> = split_arg_terms(inner)
+            .iter()
+            .map(|part| arg_term(host, part))
+            .collect();
+        return terms::make_tuple(host, &elements).expect("build the corpus tuple argument");
+    }
+    if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        let chars: Vec<Eterm> = inner
+            .bytes()
+            .map(|byte| beam_term::make_small(i64::from(byte)))
+            .collect();
+        return terms::make_list(host, &chars).expect("build the corpus string argument");
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        return beam_term::make_small(value);
+    }
+    match text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Some(quoted) => host.intern(quoted),
+        None => host.intern(text),
+    }
+}
+
+/// Builds the argument list for a corpus call from its `(<args>)` text. The text
+/// is a comma-separated list of the term shapes [`arg_term`] understands; the
+/// empty text is the zero-arity call. A malformed argument is a corpus bug and
+/// panics, so a broken fixture can never be silently skipped.
+fn breadth_args(host: &mut ModuleHost, args: &str) -> Vec<Eterm> {
+    if args.trim().is_empty() {
+        return Vec::new();
+    }
+    split_arg_terms(args)
+        .iter()
+        .map(|part| arg_term(host, part))
+        .collect()
 }
 
 /// The words `~w` quotes when they appear as atoms (`io_lib:write_atom/1`).
@@ -736,6 +778,13 @@ fn breadth_runs_a_large_fraction_of_the_installed_corpus() {
         corpus.len()
     );
     assert!(
+        calls >= BREADTH_CALL_FLOOR,
+        "only {calls} oracle-checked calls executed (floor {BREADTH_CALL_FLOOR}); \
+         {} call(s) were blocked:\n{}",
+        skips.len(),
+        skips.join("\n")
+    );
+    assert!(
         executed.len() >= BREADTH_MODULE_FLOOR,
         "only {} of {} corpus modules were actually executed (floor {BREADTH_MODULE_FLOOR}); \
          {} call(s) were blocked:\n{}",
@@ -806,3 +855,4 @@ fn breadth_blocked_calls_report_their_exact_typed_error() {
         "unexpected `maps:from_list/1` error: {error:?}"
     );
 }
+
