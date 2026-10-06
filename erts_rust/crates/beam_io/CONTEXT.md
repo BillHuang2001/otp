@@ -334,7 +334,10 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   output) but **never read**; the driver signals EOF only by latching its own state (`eof()`), it does not report
   an event. Writing to a child that closed its stdin fails with a typed `BeamError::Io` (the queued remainder is
   kept, never silently discarded), and `{fd, N}` is a **read-only** adoption — writing to it is `BadArg`, so a
-  descriptor port is not yet a bidirectional stream. Input is not line-framed (there is no `line` control verb):
+  descriptor port is not yet a bidirectional stream. Adopting a descriptor also requires it to be switchable to
+  non-blocking (`F_SETFL` + `O_NONBLOCK`); a descriptor that refuses that (some inherited descriptors return
+  `EPERM`) fails the open with `BeamError::Io`, because the reactor is edge-triggered and cannot serve a blocking
+  descriptor. Input is not line-framed (there is no `line` control verb):
   the `binary`/`list` choice rides on `SpawnStream` for the runtime to apply.
 - **`EfileDriver` cannot open a regular file.** `mio`/epoll rejects `EPOLL_CTL_ADD` on regular files (`EPERM`), so
   `control("open", path)` fails with `BeamError::Io` for them; it works for the descriptors epoll supports
