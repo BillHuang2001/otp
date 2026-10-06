@@ -146,6 +146,67 @@ impl RuntimeContext<'_> {
 `beam_io::drivers::SpawnDriver` is the **single** OS-child implementation; this crate owns only the **Erlang term decoding** of `open_port/2`'s `Name`/`Options` (into a term-free `beam_io::SpawnSpec`/`SpawnOptions`) and the `PortMeta` — the driver, the option semantics and the read-back gaps are in the ports Known-Issues entry.
 `PortRegistry::pump` is the single message producer (polls in `PORT_POLL_SLICE`, runs scheduled port tasks, reports `PortEvent::{Data, Exited}`), consumed by the **scheduler path** (a blocked compiled `receive` is woken by `beam_process`'s deliver + `Scheduler::resume_woken`) and by the **`-eval` `receive … after T`** path (`poll_port_messages`, messages returned inline).
 
+### `nif.rs` — the live NIF libraries (contract A.3)
+```rust
+// NifEntry/NifRegistry are `!Send`: a NifLibrary owns dlopen handles + an erased host pointer
+// (fine — the runtime is single-threaded).
+pub(crate) struct NifEntry { /* lib: NifLibrary, host: Box<NifHostImpl> */ }   // FIELD ORDER IS LOAD-BEARING
+impl NifEntry { pub(crate) fn new(lib: NifLibrary, host: Box<NifHostImpl>) -> NifEntry; }
+pub(crate) struct NifRegistry { /* libs: HashMap<String, NifEntry> — by Erlang module */ }
+impl NifRegistry {
+    pub(crate) fn new() -> NifRegistry;                       // anchors the enif_* codegen unit (see build.rs)
+    pub(crate) fn is_loaded(&self, module: &str) -> bool;     // the oracle's `reload` condition
+    pub(crate) fn insert(&mut self, module: String, entry: NifEntry);
+    pub(crate) fn lookup(&self, module: &str, function: &str, arity: u32) -> bool;   // THE dispatch predicate
+    pub(crate) fn call(&self, module, function, arity, env: &mut NifEnv, args: &[Eterm])
+        -> core::result::Result<Eterm, NifCallError>;         // miss ⇒ NifCallError::UnknownFunction
+}
+pub(crate) struct NifHostImpl { /* heap: Heap, atoms: Rc<AtomTable>, interner: PendingInterner, self_pid: Eterm */ }
+impl NifHostImpl { pub(crate) fn new(heap, atoms, interner, self_pid) -> NifHostImpl;
+                   pub(crate) fn into_heap(self) -> Heap; }
+// impl beam_abi::NifHost for NifHostImpl — heap/intern_atom/atom_name/self_pid
+pub(crate) fn map_load_error(beam_abi::nif::loader::NifLoadError) -> beam_bifs::NifLoadError;  // variant-for-variant
+```
+`Runtime` owns **one** NIF registry: `pub(crate) nifs: Rc<RefCell<NifRegistry>>` — the ETS-tables/ports pattern (the dispatch that calls a NIF holds the registry for the call's duration while the runtime stays free for the per-call host).
+`NifEntry`'s **field order is load-bearing**: `lib` is declared first, and Rust drops fields in declaration order, so the library (whose `Drop` runs the C `unload` against the erased host pointer) drops *before* the boxed `NifHostImpl` it was loaded against — a `beam_abi::nif::loader` constraint (`load` erases the host borrow into a raw `*mut dyn NifHost`, so the host must outlive the library).
+The **load-time host** (long-lived, boxed in the entry) is the `unload` context; a NIF **call** runs against a **fresh** per-call `NifHostImpl` (see `try_call_nif`). Both own their `Heap` so a boxed host has a **stable address**; both share the runtime's **one** `Rc<AtomTable>` handle and the in-flight `PendingInterner`.
+`lookup` is the dispatch predicate and a **miss is a perfect no-op** (`Ok(None)`), so a call to an ordinary Erlang function of a module that also has a NIF library is never intercepted — exactly the BEAM's own NIF lookup.
+
+### The two host seams (`call_registered` / `try_call_nif`)
+```rust
+// beam_bifs::NifLoader — implemented by NifBridge (a struct in context.rs)
+struct NifBridge<'a> { /* runtime: &'a mut Runtime, atoms: Rc<AtomTable>, interner: PendingInterner, self_pid: Eterm */ }
+// beam_abi::NifHost — implemented by NifHostImpl (nif.rs)
+```
+`call_registered` installs exactly **one** of three mutually exclusive bridges: `NifBridge` for `("erlang","load_nif",2)` **checked before the filesystem**, so a second `load_nif` for a module that already has a library is `beam_bifs::NifLoadError::Reload` (the oracle's rule since OTP 20) rather than a `dlopen`; `DictBridge` for the five process-dictionary BIFs; else `FunBridge`. Each needs a borrow (`&mut Runtime` / `&mut ProcessTable`) that cannot co-exist with the others.
+`NifBridge::load_nif` builds a dedicated long-lived host `Heap`, `Box`es the host and pairs it with the `dlopen`ed `NifLibrary` in a `NifEntry` (see the drop-order note above); a load failure is mapped variant-for-variant by `map_load_error` and returned — never raised.
+
+### Caller-module tracking (`load_nif/2`'s owning module)
+```rust
+pub struct RuntimeContext<'a> { /* …, pub(crate) current_module: Option<String> */ }
+```
+`RuntimeContext::run_export` **sets** `current_module` to the module it is about to run and **restores** the previous value afterwards, so a nested/external call that returns keeps the outer module's identity; `FunBridge::call_fun` **inherits** it into the nested context. It reaches the BIF through `BifContext::with_current_module` — that is how `erlang:load_nif/2` learns which module owns the library (the oracle derives it from the call site). With `None` the BIF reports `unsupported_bif` rather than guessing.
+
+### NIF dispatch — `RuntimeContext::try_call_nif`
+`try_call_nif` runs as the **first statement of `call_bif`** (before the native floor and the `beam_bifs` registry), so a NIF replaces the Erlang stub of the same `{module,function,arity}` exactly as the BEAM's own dispatch does. Its returned term lives in the **pooled BIF heap** (pointer-stable; the pool never resets — no GC in Milestone 1), and the per-call `PendingInterner` is committed **after the registry borrow is released** (which needs `&mut` on the code server). `NifCallError::Raised(reason)` becomes `error::nif_raised` (a **live-reason-term** raise — never swallowed, never a placeholder); the defensive `UnknownFunction` maps to the bare `error::undef`.
+**The interception is at external dispatch only.** A *local* call inside the NIF's own module is compiled to the `call` opcode, which the engine resolves inside the module it is already running and never routes through `call_bif` (there is no code patching in M1) — so the `tests/nif.rs` fixture's caller is deliberately a *separate* module. This is the same seam the BEAM uses for a cross-module call.
+
+### The shared deferred interner — `PendingInterner`
+```rust
+#[derive(Clone)]
+pub(crate) struct PendingInterner { /* inner: Rc<RefCell<PendingInternerInner{ base: usize, names: Vec<String> }>> */ }
+impl PendingInterner {
+    pub(crate) fn new(base: usize) -> PendingInterner;          // base = the shared table's length before the call
+    pub(crate) fn commit(&self, atoms: &mut AtomTable);         // interns the names, in order, at their predicted indices
+}
+// impl beam_bifs::AtomInterner for PendingInterner — append-only prediction + in-call dedup
+```
+One `erlang:load_nif/2` call has **two** new-atom writers that may interleave: the BIF layer (through `BifContext`'s `AtomInterner`) **and** the C `load` callback (through the host's `enif_make_atom`). Two independent predicted-index lists would hand out colliding indices, so the host holds a **clone of the same** `Rc<RefCell<…>>` handle and the single `commit` by `call_registered` lands every name at `base + <names recorded so far>`. Each call gets a fresh handle rooted at the table's current length; interning is append-only and the runtime single-threaded, so the prediction is exact.
+
+### `build.rs` — exporting the `enif_*` symbols a real NIF imports
+`build.rs` emits `cargo::rustc-link-arg-bins=-Wl,--export-dynamic` **and** `…-tests=…` (legal here because `beam_rt` has a `[[bin]]`), so the built binary and the test executables publish their dynamic symbol table; `NifRegistry::new` additionally anchors `beam_abi`'s `enif_*`-carrying codegen unit with `std::hint::black_box(beam_abi::nif::enif::enif_api_table())`, which drags those symbols into the link. Without either half, `dlopen(RTLD_NOW)` of a real NIF fails on an unresolved symbol. The empirical proof is `tests/nif.rs::the_binary_exports_the_enif_symbols_a_nif_imports` (`nm -D` / `readelf --dyn-syms` on `CARGO_BIN_EXE_beam_rt`).
+**Typed gaps (never a wrong result):** the host leaves `term_to_binary` / `binary_to_term` / `make_ref` at the `NifHost` trait defaults (`None`), so those `enif_*` calls report failure rather than fabricating a term.
+
 ### `config.rs` — parsed configuration
 ```rust
 pub type EmulatorConfig = beam_common::config::RuntimeConfig;   // the A.6 skeleton (flavor, +S, +P, …)
