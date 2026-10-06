@@ -72,12 +72,14 @@ impl RuntimeContext<'_> {
             ("init", "get_argument", 1) => Some(self.get_argument(args)),
             ("init", "get_plain_arguments", 0) => Some(self.get_plain_arguments()),
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
+            ("init", "get_status", 0) => Some(self.get_status()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
             ("code", "get_path", 0) => Some(self.code_get_path()),
             ("code", "all_loaded", 0) => Some(self.code_all_loaded()),
             ("code", "which", 1) => Some(self.code_which(args)),
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
+            ("code", "root_dir", 0) => Some(self.code_root_dir()),
             _ => None,
         }
     }
@@ -248,6 +250,24 @@ impl RuntimeContext<'_> {
         terms::make_list(self, &pairs)
     }
 
+    // -- init:get_status/0 ----------------------------------------------------
+
+    /// `init:get_status/0`: the boot-status 2-tuple `{starting, started}`.
+    ///
+    /// The oracle's `init.beam` reports the state transition of the boot process; a
+    /// runtime that has reached a point where code is running has completed it, so the
+    /// value is the terminal state — verified against OTP 29/erts-17.1
+    /// (`io:format("~p~n", [init:get_status()])` → `{starting,started}`).
+    ///
+    /// This is preloaded-module surface (contract A.7): `init` is preloaded and its
+    /// `.beam` is not run (see the module docs), so the constant is answered here rather
+    /// than by loading a module this runtime cannot execute.
+    fn get_status(&mut self) -> Result<Eterm> {
+        let starting = self.atom("starting")?;
+        let started = self.atom("started")?;
+        terms::make_tuple(self, &[starting, started])
+    }
+
     // -- os:cmd/1 -------------------------------------------------------------
 
     /// `os:cmd(Cmd)`: run `Cmd` through `/bin/sh -c` and return its **stdout**.
@@ -405,6 +425,32 @@ impl RuntimeContext<'_> {
                 terms::make_tuple(self, &[tag, reason])
             }
         }
+    }
+
+    /// `code:root_dir/0`: the Erlang installation root the system booted from, as a
+    /// string.
+    ///
+    /// It is the **parent** of the `<lib>` directory [`Self::code_lib_dir_0`] reports —
+    /// verified against OTP 29/erts-17.1, where `code:root_dir()` is
+    /// `…/lib/erlang` and `code:lib_dir()` is `…/lib/erlang/lib`. The derivation is
+    /// therefore `lib_root().parent()`, so both answers come from the one resolved code
+    /// path (no second source of truth).
+    ///
+    /// # Errors
+    ///
+    /// The same hard errors as [`Self::code_lib_dir_0`] — an unresolvable system code
+    /// path, or a `<lib>` entry with no parent component.
+    fn code_root_dir(&mut self) -> Result<Eterm> {
+        self.runtime.code_server.add_system_paths()?;
+        let lib_root = self.runtime.code_server.lib_root().ok_or_else(|| {
+            error::message(
+                "code:root_dir/0: the code path has no <lib>/<app>-<vsn>/ebin directory",
+            )
+        })?;
+        let root = lib_root.parent().ok_or_else(|| {
+            error::message("code:root_dir/0: the <lib> directory has no parent component")
+        })?;
+        self.charlist(&root.display().to_string())
     }
 
     /// The `.beam` file of `name`: its recorded load path, its code-path entry, or —
@@ -993,5 +1039,48 @@ mod tests {
             runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
             Some("bad_name")
         );
+    }
+
+    // -- init:get_status/0 ----------------------------------------------------
+
+    #[test]
+    fn get_status_is_the_two_atom_boot_tuple() {
+        // Verified against the oracle: `init:get_status()` is `{starting,started}`.
+        let mut runtime = runtime();
+        let status = call(&mut runtime, "init", "get_status", &[]).expect("init:get_status/0");
+        assert_eq!(terms::tuple_arity(status).expect("a 2-tuple"), 2);
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(status, 0).unwrap()),
+            Some("starting")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(status, 1).unwrap()),
+            Some("started")
+        );
+    }
+
+    // -- code:root_dir/0 ------------------------------------------------------
+
+    #[test]
+    fn code_root_dir_is_the_parent_of_the_lib_root() {
+        // `code:root_dir/0` is a string and is the parent of `code:lib_dir/0`'s `<lib>`
+        // directory — this is what the differential `boot/root_dir_is_string` case checks
+        // (`is_list(code:root_dir())`).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let root = call(&mut runtime, "code", "root_dir", &[]).expect("code:root_dir/0");
+        assert!(beam_term::is_list(root), "root_dir/0 is a string");
+        let root = string_of(root);
+        let lib = call(&mut runtime, "code", "lib_dir", &[]).expect("code:lib_dir/0");
+        let lib = string_of(lib);
+        assert_eq!(
+            std::path::Path::new(&lib)
+                .parent()
+                .map(|parent| parent.to_string_lossy().to_string()),
+            Some(root.clone()),
+            "{root} must be the parent of {lib}"
+        );
+        assert!(std::path::Path::new(&root).is_dir(), "{root} is a directory");
     }
 }
