@@ -15,7 +15,7 @@ use beam_term::{atom_val, make_small, AtomTable, Eterm, NIL};
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
-    atoms.seed(["true", "false", "ok", "a", "b", "normal", "foo"]);
+    atoms.seed(["true", "false", "ok", "a", "b", "normal", "foo", "bad_generator", "shutdown"]);
     atoms
 }
 
@@ -33,6 +33,46 @@ fn raise_of(result: Result<Eterm>) -> (ExceptionClass, ExitReason) {
     match result {
         Err(BeamError::Raise(raise)) => (raise.class, raise.reason),
         other => panic!("expected a raise, got {other:?}"),
+    }
+}
+
+/// The live reason term attached to a raise, if any — the opaque
+/// `beam_common::Raise::live_reason` slot, whose payload is the reason `Eterm`.
+fn live_reason_of(result: Result<Eterm>) -> Option<Eterm> {
+    match result {
+        Err(BeamError::Raise(raise)) => raise
+            .live_reason()
+            .and_then(|live| live.downcast_ref::<Eterm>().copied()),
+        other => panic!("expected a raise, got {other:?}"),
+    }
+}
+
+/// Asserts `result` is a raise of `class` whose reason is `ExitReason::Structured`
+/// and whose live reason term downcasts to an `Eterm` structurally equal to
+/// `expected` (a non-atom reason: a tuple like `{bad_generator,5}`, a bare `42`, …).
+#[track_caller]
+fn assert_structured(
+    result: Result<Eterm>,
+    ctx: &BifContext<'_>,
+    class: ExceptionClass,
+    expected: Eterm,
+) {
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.class, class, "class");
+            assert_eq!(raise.reason, ExitReason::Structured, "reason");
+            assert_eq!(raise.reason.as_atom(), None, "as_atom");
+            let live = *raise
+                .live_reason()
+                .expect("a structured reason carries its live term")
+                .downcast_ref::<Eterm>()
+                .expect("the payload is the live reason term");
+            assert!(
+                beam_term::compare::eq(live, expected, ctx.atoms()),
+                "live reason differs from the expected reason term"
+            );
+        }
+        other => panic!("expected a structured raise, got {other:?}"),
     }
 }
 
@@ -346,6 +386,45 @@ fn raise_bifs_set_the_class_and_public_builders_agree() {
     assert_eq!(
         raise_of(reg.call("erlang", "error", 2, &mut ctx, &[a, make_small(1)],)),
         (ExceptionClass::Error, ExitReason::atom("a"))
+    );
+
+    // An **atom** reason keeps its exact `ExitReason` and carries **no** live slot.
+    assert_eq!(live_reason_of(reg.call("erlang", "error", 1, &mut ctx, &[a])), None);
+    assert_eq!(live_reason_of(reg.call("erlang", "exit", 1, &mut ctx, &[a])), None);
+    assert_eq!(live_reason_of(reg.call("erlang", "throw", 1, &mut ctx, &[a])), None);
+
+    // A **non-atom** reason is `ExitReason::Structured` and carries the real reason
+    // term in the opaque `Raise::live_reason` slot.
+    // Oracle: erlang:error({bad_generator,5}) => error:{bad_generator,5}
+    //   erl -noshell -eval 'try erlang:error({bad_generator,5}) catch C:R ->
+    //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{bad_generator,5}
+    let bad_generator = ctx.atom("bad_generator").expect("seeded");
+    let tuple = ctx.tuple(&[bad_generator, make_small(5)]).expect("fits");
+    assert_structured(
+        reg.call("erlang", "error", 1, &mut ctx, &[tuple]),
+        &ctx,
+        ExceptionClass::Error,
+        tuple,
+    );
+    // Oracle: erlang:throw(42) => throw:42.
+    //   erl -noshell -eval 'try erlang:throw(42) catch C:R ->
+    //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  throw:42
+    assert_structured(
+        reg.call("erlang", "throw", 1, &mut ctx, &[make_small(42)]),
+        &ctx,
+        ExceptionClass::Throw,
+        make_small(42),
+    );
+    // Oracle: erlang:exit({shutdown,1}) => exit:{shutdown,1}.
+    //   erl -noshell -eval 'try erlang:exit({shutdown,1}) catch C:R ->
+    //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  exit:{shutdown,1}
+    let shutdown = ctx.atom("shutdown").expect("seeded");
+    let tuple = ctx.tuple(&[shutdown, make_small(1)]).expect("fits");
+    assert_structured(
+        reg.call("erlang", "exit", 1, &mut ctx, &[tuple]),
+        &ctx,
+        ExceptionClass::Exit,
+        tuple,
     );
 
     // The public raise builders produce the same `Raise` values.

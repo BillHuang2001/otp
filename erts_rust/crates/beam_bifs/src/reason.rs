@@ -350,9 +350,8 @@ mod tests {
         );
 
         // `erlang:nif_error({nif_not_loaded,m,f,0})` ⇒ `error:{nif_not_loaded,m,f,0}`.
-        // A compound reason is the documented `Structured` gap: the BIF reports the
-        // class and `Structured`, and the engine preserves the live term at the
-        // raise site (`beam_rt`'s term-carrying `Flow::Raise`).
+        // A compound reason is `ExitReason::Structured`; the reason term itself rides
+        // the opaque `Raise::live_reason` slot (see [`raise`]).
         let nif_not_loaded = ctx.atom("nif_not_loaded").expect("seeded");
         let m = ctx.atom("m").expect("seeded");
         let f = ctx.atom("f").expect("seeded");
@@ -360,8 +359,8 @@ mod tests {
             .tuple(&[nif_not_loaded, m, f, make_small(0)])
             .expect("fits");
         assert_eq!(
-            raise_of(nif_error_1, tuple),
-            (ExceptionClass::Error, ExitReason::Structured)
+            raise_of3(nif_error_1, tuple),
+            (ExceptionClass::Error, ExitReason::Structured, Some(tuple))
         );
     }
 

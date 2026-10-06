@@ -374,6 +374,11 @@ mod tests {
             "m",
             "r",
             "other",
+            // The structured-reason tag atoms the introspection/`create`/`update`
+            // failures build (`error:{badrecord,_}`, `{badmap,_}`, `{badfield,_}`).
+            "badrecord",
+            "badmap",
+            "badfield",
         ]);
         atoms
     }
@@ -386,6 +391,48 @@ mod tests {
         f(&mut ctx, &atoms)
     }
 
+    /// The live reason term of a structured raise, asserting the full contract:
+    /// `Err(BeamError::Raise(r))`, `r.reason == ExitReason::Structured` (so
+    /// `BeamError::as_atom()` is `None`) and `r.live_reason()` carrying the real
+    /// reason term.
+    #[track_caller]
+    fn structured_reason(result: Result<Eterm>) -> Eterm {
+        match result {
+            Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.class, beam_common::ExceptionClass::Error, "class");
+                assert_eq!(raise.reason, beam_common::ExitReason::Structured, "reason");
+                assert_eq!(raise.reason.as_atom(), None, "as_atom");
+                *raise
+                    .live_reason()
+                    .expect("a structured reason carries its live term")
+                    .downcast_ref::<Eterm>()
+                    .expect("the payload is the live reason term")
+            }
+            other => panic!("expected a structured raise, got {other:?}"),
+        }
+    }
+
+    /// Asserts `result` is the structured `error:{Tag, Elements…}` raise.
+    #[track_caller]
+    fn assert_structured(result: Result<Eterm>, ctx: &BifContext<'_>, tag: &str, elements: &[Eterm]) {
+        let term = structured_reason(result);
+        assert_eq!(
+            access::tuple_size(term),
+            elements.len() + 1,
+            "{tag} reason arity"
+        );
+        assert_eq!(
+            access::tuple_element(term, 0),
+            ctx.atom(tag).expect("a seeded tag atom"),
+            "{tag} reason tag"
+        );
+        for (i, &expected) in elements.iter().enumerate() {
+            assert!(
+                eq(access::tuple_element(term, i + 1), expected, ctx.atoms()),
+                "{tag} reason element {i}"
+            );
+        }
+    }
     fn atom_of(ctx: &BifContext<'_>, name: &str) -> Eterm {
         ctx.atom(name).expect("a seeded atom")
     }
@@ -492,22 +539,47 @@ mod tests {
     fn introspection_rejects_non_records() {
         with_ctx(|ctx, _| {
             let not_a_record = ctx.tuple(&[make_small(1), make_small(2)]).unwrap();
-            for result in [
-                get_module(ctx, &[not_a_record]),
-                get_name(ctx, &[not_a_record]),
+            // Oracle: records:get_module({1,2}) / records:get_name({1,2}) => error:badarg.
+            //   erl -noshell -eval 'try records:get_module({1,2}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:badarg
+            assert!(matches!(get_module(ctx, &[not_a_record]), Err(BeamError::BadArg)));
+            assert!(matches!(get_name(ctx, &[not_a_record]), Err(BeamError::BadArg)));
+            // Oracle: records:get_field_names({1,2}) / records:is_exported({1,2}) =>
+            //   error:{badrecord,{1,2}}.
+            //   erl -noshell -eval 'try records:get_field_names({1,2}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badrecord,{1,2}}
+            assert_structured(
                 get_field_names(ctx, &[not_a_record]),
+                ctx,
+                "badrecord",
+                &[not_a_record],
+            );
+            assert_structured(
                 is_exported(ctx, &[not_a_record]),
-            ] {
-                assert!(matches!(result, Err(BeamError::BadArg)));
-            }
+                ctx,
+                "badrecord",
+                &[not_a_record],
+            );
             // A bare immediate is likewise rejected.
-            assert!(matches!(
-                get_module(ctx, &[make_small(7)]),
-                Err(BeamError::BadArg)
-            ));
+            // Oracle: records:get_module(5) => error:badarg; records:get_field_names(5)
+            // / records:is_exported(5) => error:{badrecord,5}.
+            //   erl -noshell -eval 'try records:get_field_names(5) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badrecord,5}
+            assert!(matches!(get_module(ctx, &[make_small(5)]), Err(BeamError::BadArg)));
+            assert_structured(
+                get_field_names(ctx, &[make_small(5)]),
+                ctx,
+                "badrecord",
+                &[make_small(5)],
+            );
+            assert_structured(
+                is_exported(ctx, &[make_small(5)]),
+                ctx,
+                "badrecord",
+                &[make_small(5)],
+            );
         });
     }
-
     #[test]
     fn create_rejects_malformed_arguments() {
         with_ctx(|ctx, _| {
@@ -520,20 +592,33 @@ mod tests {
 
             let good_opts = opts(ctx, false);
 
-            // Non-atom module/name: `{badrecord, Name}` (collapsed).
-            assert!(matches!(
-                create(ctx, &[make_small(1), name, NIL, good_opts]),
-                Err(BeamError::BadArg)
-            ));
-            assert!(matches!(
-                create(ctx, &[module, make_small(1), NIL, good_opts]),
-                Err(BeamError::BadArg)
-            ));
-            // Opts non-map: `{badmap, Opts}` (collapsed).
-            assert!(matches!(
+            // Oracle: records:create(1, r, [], #{is_exported=>false}) => {badrecord, r}
+            // (the reported element is the *name*, not the bad module).
+            //   erl -noshell -eval 'try records:create(1, r, [], #{is_exported=>false})
+            //     catch C:R -> io:format("~p:~p~n",[C,R]) end, halt().'
+            //     =>  error:{badrecord,r}
+            assert_structured(
+                create(ctx, &[one, name, NIL, good_opts]),
+                ctx,
+                "badrecord",
+                &[name],
+            );
+            // Oracle: records:create(m, 1, [], #{is_exported=>false}) => {badrecord, 1}.
+            assert_structured(
+                create(ctx, &[module, one, NIL, good_opts]),
+                ctx,
+                "badrecord",
+                &[one],
+            );
+            // Oracle: records:create(m, r, [], []) => {badmap, []}.
+            //   erl -noshell -eval 'try records:create(m, r, [], []) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,[]}
+            assert_structured(
                 create(ctx, &[module, name, NIL, NIL]),
-                Err(BeamError::BadArg)
-            ));
+                ctx,
+                "badmap",
+                &[NIL],
+            );
             // Empty opts map: badarg.
             let empty_opts = access::make_flatmap(ctx.heap(), &[]).expect("fits");
             assert!(matches!(
@@ -565,6 +650,7 @@ mod tests {
             // Fields must be a proper list of 2-tuples.
             let good_opts = opts(ctx, false);
             let key_a = atom_of(ctx, "a");
+            // Oracle: records:create(m, r, a, #{is_exported=>false}) => badarg.
             assert!(matches!(
                 create(ctx, &[module, name, key_a, good_opts]),
                 Err(BeamError::BadArg)
@@ -572,6 +658,7 @@ mod tests {
             let pair_a = ctx.tuple(&[key_a, one]).unwrap();
             let improper = ctx.cons(pair_a, other).unwrap();
             let good_opts = opts(ctx, false);
+            // Oracle: records:create(m, r, [{a,1}|a], #{is_exported=>false}) => badarg.
             assert!(matches!(
                 create(ctx, &[module, name, improper, good_opts]),
                 Err(BeamError::BadArg)
@@ -579,18 +666,26 @@ mod tests {
             let triple = ctx.tuple(&[one, one, one]).unwrap();
             let not_a_pair = ctx.list(&[triple]).unwrap();
             let good_opts = opts(ctx, false);
+            // Oracle: records:create(m, r, [{1,2,3}], #{is_exported=>false}) => badarg.
             assert!(matches!(
                 create(ctx, &[module, name, not_a_pair, good_opts]),
                 Err(BeamError::BadArg)
             ));
-            // A non-atom key: `{badfield, ...}` (collapsed).
+            // Oracle: records:create(m, r, [{1,1}], #{is_exported=>false})
+            //   => {badfield, {{m,r}, 1}}.
+            //   erl -noshell -eval 'try records:create(m, r, [{a,1},{a,2},{1,3}],
+            //     #{is_exported=>true}) catch C:R -> io:format("~p:~p~n",[C,R]) end,
+            //     halt().'  =>  error:{badfield,{{m,r},1}}
             let non_atom_pair = ctx.tuple(&[one, one]).unwrap();
             let non_atom_key = ctx.list(&[non_atom_pair]).unwrap();
             let good_opts = opts(ctx, false);
-            assert!(matches!(
+            let identifier = ctx.tuple(&[module, name]).unwrap();
+            assert_structured(
                 create(ctx, &[module, name, non_atom_key, good_opts]),
-                Err(BeamError::BadArg)
-            ));
+                ctx,
+                "badfield",
+                &[identifier, one],
+            );
             // A duplicate key: badarg.
             let dup_a = ctx.tuple(&[key_a, one]).unwrap();
             let dup_b = ctx.tuple(&[key_a, make_small(2)]).unwrap();
@@ -601,9 +696,7 @@ mod tests {
                 Err(BeamError::BadArg)
             ));
         });
-    }
-
-    #[test]
+    }    #[test]
     fn update_rebuilds_with_the_new_values() {
         with_ctx(|ctx, atoms| {
             let rec = sample(ctx);
@@ -650,41 +743,57 @@ mod tests {
             let other = atom_of(ctx, "other");
             let u = updates(ctx, "a", 9);
 
-            // Non-record: `{badrecord, Record}` (collapsed).
+            // Oracle: records:update({}, m, r, #{a=>9}) => {badrecord, {}}.
+            //   erl -noshell -eval 'try records:update({}, m, r, #{a=>9}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badrecord,{}}
             let not_a_record = ctx.tuple(&[]).unwrap();
-            assert!(matches!(
+            assert_structured(
                 update(ctx, &[not_a_record, module, name, u]),
-                Err(BeamError::BadArg)
-            ));
-            // A name mismatch: `{badrecord, Name}` (collapsed).
-            assert!(matches!(
+                ctx,
+                "badrecord",
+                &[not_a_record],
+            );
+            // Oracle: a name mismatch => {badrecord, other}.
+            assert_structured(
                 update(ctx, &[rec, module, other, u]),
-                Err(BeamError::BadArg)
-            ));
-            // A module mismatch too.
-            assert!(matches!(
-                update(ctx, &[rec, other, name, u]),
-                Err(BeamError::BadArg)
-            ));
-            // Non-atom module/name (unless wildcard): `{badrecord, Name}` (collapsed).
-            assert!(matches!(
+                ctx,
+                "badrecord",
+                &[other],
+            );
+            // A module mismatch reports the *name* => {badrecord, r}.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, other, r, #{a=>9}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badrecord,r}
+            assert_structured(update(ctx, &[rec, other, name, u]), ctx, "badrecord", &[name]);
+            // Non-atom module/name (unless wildcard) => {badrecord, r}.
+            assert_structured(
                 update(ctx, &[rec, make_small(1), name, u]),
-                Err(BeamError::BadArg)
-            ));
-            // Updates non-map: `{badmap, Updates}` (collapsed).
-            assert!(matches!(
+                ctx,
+                "badrecord",
+                &[name],
+            );
+            // Oracle: updates non-map => {badmap, []}.
+            assert_structured(
                 update(ctx, &[rec, module, name, NIL]),
-                Err(BeamError::BadArg)
-            ));
-            // An update key that names no field: `{badfield, ...}` (collapsed).
+                ctx,
+                "badmap",
+                &[NIL],
+            );
+            // Oracle: an update key that names no field
+            //   => {badfield, {{m,r}, other}}.
+            //   erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+            //     try records:update(R, '"'"'_'"'"', '"'"'_'"'"', #{zz=>9}) catch C:T ->
+            //     io:format("~p:~p~n",[C,T]) end, halt().'  =>  error:{badfield,{{m,r},zz}}
             let bad_key = updates(ctx, "other", 9);
-            assert!(matches!(
+            let identifier = ctx.tuple(&[module, name]).unwrap();
+            assert_structured(
                 update(ctx, &[rec, module, name, bad_key]),
-                Err(BeamError::BadArg)
-            ));
+                ctx,
+                "badfield",
+                &[identifier, other],
+            );
         });
     }
-
     #[test]
     fn get_definition_is_a_typed_unsupported() {
         with_ctx(|ctx, _| {
