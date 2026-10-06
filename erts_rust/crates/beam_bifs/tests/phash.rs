@@ -12,7 +12,8 @@
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry};
 use beam_codec::term::{
-    make_big, make_binary, make_bitstring, make_fun_external, make_fun_imported, FunPid,
+    make_big, make_binary, make_bitstring, make_flatmap, make_fun_external, make_fun_imported,
+    FunPid,
 };
 use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_process::ProcessId;
@@ -20,8 +21,9 @@ use beam_term::{signed_value, AtomTable, Eterm, NIL};
 
 /// The atom names the cases below use. Only interned names resolve, and the atom
 /// hash is computed from the name, so the table is seeded up front.
-const ATOMS: [&str; 10] = [
-    "true", "abc", "hello", "node", "a", "x", "erlang", "abs", "lists", "map",
+const ATOMS: [&str; 19] = [
+    "true", "abc", "hello", "node", "a", "x", "erlang", "abs", "lists", "map", "b", "c", "foo",
+    "bar", "h", "false", "is_exported", "rec", "k",
 ];
 
 fn seeded_atoms() -> AtomTable {
@@ -72,6 +74,39 @@ fn assert_phash(
     what: &str,
 ) {
     let got = phash(reg, ctx, term, range);
+    assert!(
+        beam_term::is_small(got),
+        "{what}: expected a small integer result, got {got:?}"
+    );
+    assert_eq!(signed_value(got), expected, "{what}");
+}
+
+/// `erlang:phash2(Term)` — the `make_hash2` hash reduced to the low 27 bits.
+fn phash2(reg: &BifRegistry, ctx: &mut BifContext<'_>, args: &[Eterm]) -> Eterm {
+    call(reg, ctx, "erlang", "phash2", args)
+}
+
+/// Asserts `phash2/1` equals the oracle's value.
+fn assert_phash2(ctx: &mut BifContext<'_>, args: &[Eterm], expected: i64, what: &str) {
+    let reg = default_registry();
+    let got = phash2(&reg, ctx, args);
+    assert!(
+        beam_term::is_small(got),
+        "{what}: expected a small integer result, got {got:?}"
+    );
+    assert_eq!(signed_value(got), expected, "{what}");
+}
+
+/// Asserts `phash2/2` equals the oracle's value.
+fn assert_phash2_range(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    range: Eterm,
+    expected: i64,
+    what: &str,
+) {
+    let got = phash2(reg, ctx, &[term, range]);
     assert!(
         beam_term::is_small(got),
         "{what}: expected a small integer result, got {got:?}"
@@ -358,39 +393,49 @@ fn external_funs_match_the_oracle() {
 }
 
 #[test]
-fn imported_funs_raise_unsupported_bif() {
+fn imported_funs_match_the_oracle() {
     run(|reg, ctx| {
         let range = int_term(ctx, 1_000_000);
 
-        // A `NEW_FUN_EXT` (`FunKind::Imported`) fun: its C identity (`ErlFunEntry`'s
-        // `module`/`index`/`old_uniq` and the free-variable environment) is not part of
-        // this tree's inlined descriptor, so `make_hash`'s local-fun rule could only be
-        // guessed. The BIF must raise the typed error, never a wrong number.
-        let module = ctx.atoms().lookup("lists").expect("seeded");
+        // A `NEW_FUN_EXT` (`FunKind::Imported`) fun built from the **exact bytes** of
+        // the oracle closure `fun(X) -> {X,1} end` compiled in a module named `h`
+        // (`term_to_binary/1` then `binary_to_term/1`, so the descriptor is real):
+        // arity 1, module `h`, the 16-byte `erefuniq`, index 0, old_index 0,
+        // old_uniq 97692434, creator `<0.0.0>`, empty environment. In C terms this is
+        // a *local* fun (`external.c:5125` writes `MAKE_FUN_HEADER(arity,num_free,0)`),
+        // so `make_hash2`'s local rule applies — and every field it reads is carried
+        // by this tree's inlined descriptor.
+        let module = ctx.atoms().lookup("h").expect("seeded");
         let node = ctx.atoms().lookup("node").expect("seeded");
         let creator = FunPid {
             node,
-            number: 1,
-            serial: 2,
-            creation: 3,
+            number: 0,
+            serial: 0,
+            creation: 0,
         };
         let imported = make_fun_imported(
             ctx.heap(),
-            2,
+            1,
             module,
-            &[0u8; 16],
+            &[
+                186, 85, 98, 89, 101, 7, 175, 30, 108, 198, 92, 203, 158, 188, 155, 63,
+            ],
             0,
             0,
-            0,
+            97_692_434,
             creator,
             &[],
         )
         .expect("fits");
 
-        assert_unsupported(
-            reg.call("erlang", "phash", 2, ctx, &[imported, range])
-                .expect_err("an imported fun must not hash"),
-            "phash(an imported fun,1000000)",
+        assert_phash2(ctx, &[imported], 10_652_292, "phash2(fun h:'-f/0'/1)");
+
+        // The legacy `make_hash` local-fun rule is exact here too (`h*F10+num_free;
+        // h*F1+hvalue(module); h*F2+index; h*F2+old_uniq`, then the environment).
+        let got = phash(reg, ctx, imported, range);
+        assert!(
+            beam_term::is_small(got) && (1..=1_000_000).contains(&signed_value(got)),
+            "phash(a local/imported fun, 1000000) must be a small integer in range"
         );
     });
 }
