@@ -18,6 +18,8 @@ use beam_gc::{Collection, Collector, HeapPolicy};
 use beam_message::{copy_struct, CopyContext, Message, OffHeapTable, Queue};
 use beam_term::prelude::Eterm;
 
+use crate::dict::Dict;
+use crate::fragments::SavedArgs;
 use crate::link::Links;
 use crate::monitor::{MonitoredBy, Monitors};
 use crate::pid::ProcessId;
@@ -201,6 +203,12 @@ pub struct Process {
     mailbox: Queue,
     /// The root-set containers (x-registers + Erlang stack).
     regs: Registers,
+    /// The per-process dictionary (`erlang:put/2`, `get/1`, `erase/1`, …): an in-heap
+    /// sub-rootset the collector must scan (see [`Dict`]).
+    dict: Dict,
+    /// Saved BIF/NIF arguments: the last in-heap sub-rootset the collector scans (see
+    /// [`SavedArgs`]).
+    saved_args: SavedArgs,
     /// Reductions consumed in the current time slice.
     reductions: u64,
     /// Outgoing links.
@@ -243,6 +251,8 @@ impl Process {
             off_heap: OffHeapTable::new(),
             mailbox: Queue::new(),
             regs: Registers::new(),
+            dict: Dict::new(),
+            saved_args: SavedArgs::new(),
             reductions: 0,
             links: Links::new(),
             monitors: Monitors::new(),
@@ -391,6 +401,25 @@ impl Process {
         &mut self.regs
     }
 
+    /// The per-process dictionary (`erlang:put/2`/`get/1`/`erase/1`).
+    pub fn dict(&self) -> &Dict {
+        &self.dict
+    }
+
+    /// The per-process dictionary, mutably.
+    pub fn dict_mut(&mut self) -> &mut Dict {
+        &mut self.dict
+    }
+
+    /// The saved BIF/NIF arguments (an extra in-heap sub-rootset).
+    pub fn saved_args(&self) -> &SavedArgs {
+        &self.saved_args
+    }
+
+    /// The saved BIF/NIF arguments, mutably.
+    pub fn saved_args_mut(&mut self) -> &mut SavedArgs {
+        &mut self.saved_args
+    }
     /// The process's off-heap (MSO) handles.
     pub fn off_heap(&self) -> &OffHeapTable {
         &self.off_heap
@@ -540,9 +569,12 @@ impl Process {
     /// Runs a safepoint collection over the whole process root set.
     ///
     /// The root set is the registers/stack ([`Registers::gather_roots`]) **plus** the
-    /// mailbox payloads (the queue is an in-heap sub-rootset): the queue is drained, its
-    /// payloads appended to the root buffer, the collector runs, the registers are
-    /// scattered back and each message is rebuilt from its relocated payload.
+    /// mailbox payloads, the process dictionary ([`Dict::gather_roots`]) and the saved
+    /// BIF/NIF arguments ([`SavedArgs::gather_roots`]) — all in-heap sub-rootsets: the queue
+    /// is drained, every payload and the dict/saved-arg words are appended to the root buffer,
+    /// the collector runs, and each region is written back (registers via
+    /// [`Registers::scatter_roots`], messages rebuilt from their relocated payloads, then the
+    /// dict and the saved args scattered back) in the SAME order it was gathered.
     ///
     /// # Errors
     ///
@@ -561,8 +593,14 @@ impl Process {
             roots.push(message.payload());
             drained.push(message);
         }
+        let mail_words = roots.len();
 
-        // 3. Collect. On failure the messages must not be silently lost, so put them back
+        // 3. The process dictionary, then the saved BIF/NIF arguments — the remaining in-heap
+        //    sub-rootsets. `dict_start`/`saved_start` are the offsets their scatter steps take.
+        let dict_start = self.dict.gather_roots(&mut roots);
+        let saved_start = self.saved_args.gather_roots(&mut roots);
+
+        // 4. Collect. On failure the messages must not be silently lost, so put them back
         //    before propagating (a collection of this heap cannot fail in practice: `collect`
         //    escalates a would-not-fit minor to a major, which sizes its to-space up front).
         let collection = match self.collector.collect(&mut roots) {
@@ -575,17 +613,21 @@ impl Process {
             }
         };
 
-        // 4. Write the (relocated) registers and stack words back.
+        // 5. Write the (relocated) registers and stack words back.
         self.regs.scatter_roots(&roots, x_live);
 
-        // 5. Rebuild every message around its relocated payload, preserving FIFO order.
-        let payloads = &roots[reg_words..];
+        // 6. Rebuild every message around its relocated payload, preserving FIFO order.
+        let payloads = &roots[reg_words..mail_words];
         for (index, message) in drained.into_iter().enumerate() {
             let rebuilt = Message::new(payloads[index], message.from())
                 .with_token(message.token())
                 .with_off_heap(message.off_heap().to_vec());
             self.mailbox.enqueue(rebuilt);
         }
+
+        // 7. Write the relocated dictionary and saved-argument words back, in gather order.
+        self.dict.scatter_roots(&roots, dict_start);
+        self.saved_args.scatter_roots(&roots, saved_start);
 
         Ok(collection)
     }

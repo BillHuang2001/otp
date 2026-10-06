@@ -239,3 +239,23 @@ fn a_woken_process_resumes_at_its_own_priority() {
         ProcessState::Runnable
     );
 }
+
+#[test]
+fn table_set_priority_reaches_the_pcb_and_rejects_unknown_pids() {
+    let mut table = table();
+    let pid = table.spawn_default().expect("a process");
+    assert_eq!(table.get(pid).expect("live").priority(), Priority::Normal);
+
+    // `ProcessTable::set_priority` delegates to the PCB's own setter.
+    table
+        .set_priority(pid, Priority::High)
+        .expect("the process is live");
+    assert_eq!(table.get(pid).expect("live").priority(), Priority::High);
+
+    // An unknown pid is a typed `TermNotFound`, not a panic.
+    let unknown = ProcessId::new(9999, 0);
+    assert!(matches!(
+        table.set_priority(unknown, Priority::Low),
+        Err(beam_common::BeamError::TermNotFound)
+    ));
+}

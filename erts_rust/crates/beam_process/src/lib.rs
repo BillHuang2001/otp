@@ -23,9 +23,9 @@
 //! documented single-scheduler [`ThreadProgress`] stub. The run queue is served
 //! highest-priority first (max/high/normal/low — see [`RunQueue`]), though the C's shared
 //! NORMAL/LOW physical queue with the `schedule_count` deferral is approximated by four
-//! distinct FIFOs. Multi-scheduler balancing, the decoupled signal queue, the process
-//! dictionary and distribution-wide links/monitors are documented follow-ups (see the crate
-//! `CONTEXT.md`, Known Issues).
+//! distinct FIFOs. Multi-scheduler balancing, the decoupled signal queue and
+//! distribution-wide links/monitors are documented follow-ups (see the crate `CONTEXT.md`,
+//! Known Issues).
 //!
 //! # Contracts
 //!
@@ -36,8 +36,9 @@
 //!   [`beam_common::Result`] — never a crate-local error enum, never a panic on runtime
 //!   data and never a swallowed error.
 //! * **Root set** (§4/§5): `x_reg_array[0..Live)` plus the whole Erlang stack, with no
-//!   frame liveness maps; [`Process::collect`] gathers the registers and the mailbox
-//!   payloads into a flat root slice for `beam_gc`.
+//!   frame liveness maps; [`Process::collect`] gathers the registers, the mailbox payloads,
+//!   the process dictionary ([`Dict`]) and the saved BIF/NIF arguments ([`SavedArgs`]) into a
+//!   flat root slice for `beam_gc`.
 //!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.{c,h}`,
 //! `erl_proc_sig_queue.c`, `erl_monitor_link.c`, `erl_ptab.{c,h}`, `erl_process_dict.c`
@@ -45,6 +46,8 @@
 
 #![warn(missing_docs)]
 
+pub mod dict;
+pub mod fragments;
 pub mod link;
 pub mod monitor;
 pub mod pid;
@@ -60,6 +63,8 @@ pub mod signal;
 
 mod error; // pub(crate) constructors only — NOT public
 
+pub use crate::dict::*;
+pub use crate::fragments::*;
 pub use crate::link::*;
 pub use crate::monitor::*;
 pub use crate::pid::*;
@@ -75,6 +80,8 @@ pub use crate::signal::*;
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
+    pub use crate::dict::*;
+    pub use crate::fragments::*;
     pub use crate::link::*;
     pub use crate::monitor::*;
     pub use crate::pid::*;

@@ -30,6 +30,7 @@ use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::port::PortTable;
 use crate::process::{DeliverOutcome, Process, ProcessState};
 use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
+use crate::run_queue::Priority;
 use crate::signal::{
     build_down_message, build_down_message_port, build_down_message_remote, build_exit_message,
     build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
@@ -321,6 +322,17 @@ impl ProcessTable {
             .map(|(number, slot)| ProcessId::new(number as u64, slot.serial))
     }
 
+    /// Sets the scheduling priority of the process named by `pid`
+    /// (`erlang:process_flag(priority, P)`).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `pid` is unknown.
+    pub fn set_priority(&mut self, pid: ProcessId, priority: Priority) -> Result<()> {
+        self.get_mut(pid)
+            .ok_or_else(error::unknown_process)
+            .map(|process| process.set_priority(priority))
+    }
     // --- message delivery ----------------------------------------------------
 
     /// Delivers `term` (with off-heap references resolved against `src_off_heap`) from `from`
