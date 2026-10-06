@@ -174,7 +174,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - `src/corpus/etf.rs` → `.beam`/ETF cases (A.2): `term_to_binary` bytes, `binary_to_term` round-trip
 - `src/corpus/terms.rs` → language-semantics cases (A.1): term ordering/equality, arithmetic
 - `src/corpus/semantics.rs` → language-semantics cases (A.1): arithmetic/precedence, bignum, `==`/`=:=`/`=/=`, term ordering, `case`/`if`/`try`, funs, comprehensions, maps/tuples/binaries
-- `src/corpus/errors.rs` → exception-protocol cases (A.1): `throw`/`exit`/`error` classes + reasons, common `badarg`/`badarith`/`function_clause` failures
+- `src/corpus/errors.rs` → exception-protocol cases (A.1): `throw`/`exit`/`error` classes + reasons, common `badarg`/`badarith`/`function_clause` failures, and `try … catch error:Reason -> Reason` structured-reason cases (`{case_clause,_}`, `{badmatch,_}`, `if_clause`, …)
 - `src/corpus/bifs.rs` → BIF/OTP-app cases (A.7): `length`, `integer_to_binary`, `lists:*`, `maps:get`, binary ops, `io_lib:format`
 - `src/corpus/system_info.rs` → introspection cases (A.8): `system_info/1` key shapes + badarg-on-unknown-key
 - `src/corpus/flags.rs` → CLI/config cases (A.6): `init:get_argument/1`, `init:get_plain_arguments/0`, `-pa`
