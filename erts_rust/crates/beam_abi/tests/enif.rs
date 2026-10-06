@@ -15,7 +15,6 @@ use beam_abi::nif::enif::*;
 use beam_abi::nif::host::NifEnv;
 use beam_abi::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM};
 use beam_abi::nif::types::ErlNifBinary;
-use beam_abi::NifHost;
 use beam_term::prelude::*;
 
 /// Intern `name` in the host and return the atom term.
@@ -45,6 +44,8 @@ fn make_int_round_trips_through_get_int() {
 #[test]
 fn get_int_rejects_out_of_range_and_non_integers() {
     let mut host = common::TestHost::new();
+    // Intern the atom *before* the env borrows the host (`NifEnv` holds the host mutably).
+    let zzz = atom(&mut host, "zzz");
     let mut env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-pointers are live locals.
     unsafe {
@@ -58,7 +59,7 @@ fn get_int_rejects_out_of_range_and_non_integers() {
         assert_eq!(enif_get_long(env.as_ptr(), big, &mut lout), 1);
         assert_eq!(lout, 1i64 << 40);
         // Non-integers are rejected.
-        let an_atom = nif_from_eterm(atom(&mut env.host().into(), "zzz"));
+        let an_atom = nif_from_eterm(zzz);
         assert_eq!(enif_get_int(env.as_ptr(), an_atom, &mut out), 0);
         // A negative value is not a `ulong`.
         let mut uout = 0u64;
@@ -71,6 +72,8 @@ fn get_int_rejects_out_of_range_and_non_integers() {
 #[test]
 fn double_round_trip_and_non_finite_is_badarg() {
     let mut host = common::TestHost::new();
+    // Intern the atom *before* the env borrows the host.
+    let badarg = atom(&mut host, "badarg");
     let mut env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; out-pointers are live locals.
     unsafe {
@@ -81,7 +84,7 @@ fn double_round_trip_and_non_finite_is_badarg() {
         assert_eq!(out, 1.5);
         // NaN cannot be represented as a heap float by the constructor: it raises `badarg`.
         let nan = enif_make_double(env.as_ptr(), f64::NAN);
-        assert_eq!(eterm_from_nif(nan), atom(&mut env.host().into(), "badarg"));
+        assert_eq!(eterm_from_nif(nan), badarg);
         assert!(env.pending_exception().is_some());
         env.clear();
         // A plain integer is not a float.
@@ -92,13 +95,14 @@ fn double_round_trip_and_non_finite_is_badarg() {
 #[test]
 fn atoms_make_get_length_round_trip() {
     let mut host = common::TestHost::new();
+    // Intern the atom *before* the env borrows the host.
+    let hello = atom(&mut host, "hello");
     let mut env = NifEnv::new(&mut host);
     let name = std::ffi::CString::new("hello").unwrap();
     // SAFETY: `env` is live; `name` is a valid NUL-terminated string; buffers are live.
     unsafe {
         let term = enif_make_atom(env.as_ptr(), name.as_ptr());
-        let expected = atom(&mut env.host().into(), "hello");
-        assert_eq!(eterm_from_nif(term), expected);
+        assert_eq!(eterm_from_nif(term), hello);
         assert_eq!(enif_is_atom(env.as_ptr(), term), 1);
 
         let mut buf = [0i8; 16];
@@ -153,12 +157,14 @@ fn atoms_make_get_length_round_trip() {
 #[test]
 fn atom_len_and_encoding_validation() {
     let mut host = common::TestHost::new();
+    // Intern the atom *before* the env borrows the host.
+    let abc = atom(&mut host, "abc");
     let mut env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; the byte slices are live.
     unsafe {
         let bytes = b"abc";
         let term = enif_make_atom_len(env.as_ptr(), bytes.as_ptr().cast(), bytes.len());
-        assert_eq!(eterm_from_nif(term), atom(&mut env.host().into(), "abc"));
+        assert_eq!(eterm_from_nif(term), abc);
         // A Latin-1 name that is not valid UTF-8 is still representable in Latin-1.
         let latin = [0xE5u8]; // "å" in Latin-1
         let term = enif_make_new_atom_len(
@@ -364,7 +370,7 @@ fn iolist_inspection_flattens_to_an_owned_buffer() {
     let mut env = NifEnv::new(&mut host);
     // SAFETY: `env` is live; `arr` is live; `bin` is a live struct.
     unsafe {
-        // "ab" ++ [99] == <<"abc">>
+        // `[<<"ab">>, 99]` == `<<"ab">> ++ [99]` == `<<"abc">>` (the head is emitted first).
         let inner = {
             let bytes = b"ab";
             let term = enif_make_new_binary(env.as_ptr(), 2, std::ptr::null_mut());
@@ -375,8 +381,8 @@ fn iolist_inspection_flattens_to_an_owned_buffer() {
             core::ptr::copy_nonoverlapping(bytes.as_ptr(), b.data, 2);
             enif_make_binary(env.as_ptr(), &mut b)
         };
-        let list = enif_make_list_cell(env.as_ptr(), inner, nif_from_eterm(NIL));
-        let list = enif_make_list_cell(env.as_ptr(), nif_from_eterm(make_small(99)), list);
+        let list = enif_make_list_cell(env.as_ptr(), nif_from_eterm(make_small(99)), nif_from_eterm(NIL));
+        let list = enif_make_list_cell(env.as_ptr(), inner, list);
         let mut bin = ErlNifBinary::default();
         assert_eq!(enif_inspect_iolist_as_binary(env.as_ptr(), list, &mut bin), 1);
         assert_eq!(bin.size, 3);
@@ -467,6 +473,8 @@ fn identical_and_compare() {
 #[test]
 fn malformed_input_never_panics() {
     let mut host = common::TestHost::new();
+    // Intern the atom *before* the env borrows the host.
+    let badarg = atom(&mut host, "badarg");
     let mut env = NifEnv::new(&mut host);
     let env_ptr = env.as_ptr();
     // SAFETY: every call below is deliberately handed garbage, nulls or wrong-kind terms. The
@@ -475,15 +483,16 @@ fn malformed_input_never_panics() {
         // Null env everywhere.
         assert_eq!(enif_is_atom(std::ptr::null_mut(), nif_from_eterm(make_small(1))), 0);
         assert_eq!(enif_is_binary(std::ptr::null_mut(), nif_from_eterm(make_small(1))), 0);
-        assert_eq!(enif_make_int(std::ptr::null_mut(), 7).raw() >= 0, true);
-        assert!(enif_make_long(std::ptr::null_mut(), 1).raw() >= 0);
+        assert_eq!(eterm_from_nif(enif_make_int(std::ptr::null_mut(), 7)), make_small(7));
+        assert_eq!(eterm_from_nif(enif_make_long(std::ptr::null_mut(), 1)), NIL);
         assert_eq!(eterm_from_nif(enif_make_atom(std::ptr::null_mut(), std::ptr::null())), NIL);
         assert_eq!(eterm_from_nif(enif_make_double(std::ptr::null_mut(), 0.0)), NIL);
         assert_eq!(eterm_from_nif(enif_make_ref(std::ptr::null_mut())), NIL);
         assert_eq!(eterm_from_nif(enif_make_new_map(std::ptr::null_mut())), NIL);
         assert_eq!(eterm_from_nif(enif_make_list_cell(std::ptr::null_mut(), nif_from_eterm(NIL), nif_from_eterm(NIL))), NIL);
         assert_eq!(enif_make_map_put(std::ptr::null_mut(), nif_from_eterm(NIL), nif_from_eterm(NIL), nif_from_eterm(NIL), std::ptr::null_mut()), 0);
-        assert_eq!(enif_get_list_length(std::ptr::null_mut(), nif_from_eterm(NIL), std::ptr::null_mut()), 1);
+        // A null out-pointer is refused (the length is returned through `*len`), no panic.
+        assert_eq!(enif_get_list_length(std::ptr::null_mut(), nif_from_eterm(NIL), std::ptr::null_mut()), 0);
 
         // A garbage word (raw 0 = `THE_NON_VALUE` in release) must not crash the predicates.
         let garbage = ERL_NIF_TERM::from_raw(0);
@@ -497,9 +506,9 @@ fn malformed_input_never_panics() {
         let _ = enif_term_size(garbage);
 
         // Null strings / buffers.
-        assert_eq!(enif_make_atom(env_ptr, std::ptr::null()), nif_from_eterm(atom(&mut env.host().into(), "badarg")));
+        assert_eq!(enif_make_atom(env_ptr, std::ptr::null()), nif_from_eterm(badarg));
         env.clear();
-        assert_eq!(enif_make_string(env_ptr, std::ptr::null(), beam_abi::nif::types::ErlNifCharEncoding::Utf8).raw() > 0, true);
+        assert!(enif_make_string(env_ptr, std::ptr::null(), beam_abi::nif::types::ErlNifCharEncoding::Utf8).raw() > 0);
         // Null `size_t` out-pointer for a map size.
         assert_eq!(enif_get_map_size(env_ptr, nif_from_eterm(make_small(1)), std::ptr::null_mut()), 0);
         // Null tuple out-pointers.
@@ -632,7 +641,12 @@ fn pid_port_and_term_type_helpers() {
             enif_term_type(env.as_ptr(), nif_from_eterm(NIL)),
             beam_abi::nif::types::ErlNifTermType::List
         ));
-        assert!(enif_term_size(nif_from_eterm(make_small(1))) > 0);
+        // Immediates occupy no heap: the C `size_object` is 0 words for a small int (copy.c:250).
+        assert_eq!(enif_term_size(nif_from_eterm(make_small(1))), 0);
+        // A boxed term is `arity + 1` heap words (`2-tuple` → 3 words).
+        let pair = [make_small(1), make_small(2)].map(nif_from_eterm);
+        let pair_term = enif_make_tuple_from_array(env.as_ptr(), pair.as_ptr(), 2);
+        assert_eq!(enif_term_size(pair_term), 3 * core::mem::size_of::<ERL_NIF_TERM>());
     }
 }
 

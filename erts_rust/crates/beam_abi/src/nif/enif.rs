@@ -2,8 +2,9 @@
 //!
 //! Every function here is a real `#[no_mangle] pub unsafe extern "C" fn` whose signature matches the
 //! corresponding field of the frozen [`super::api::ErlNifApi`] table **exactly**. Each one drives the
-//! per-call [`NifEnv`]/[`NifHost`] seam in [`super::host`]: term construction goes through
-//! `beam_term` writers over the host's [`beam_alloc::Heap`], atoms through `NifHost::intern_atom`.
+//! per-call [`NifEnv`]/[`super::host::NifHost`] seam in [`super::host`]: term construction goes
+//! through `beam_term` writers over the host's [`beam_alloc::Heap`], atoms through
+//! `NifHost::intern_atom`.
 //!
 //! [`enif_api_table`] exposes the `#[used] static ENIF_API` — the runtime's `enif_*` surface as a
 //! populated table. The `#[used]` static is what keeps the `#[no_mangle]` symbols in the linkage of a
@@ -56,12 +57,11 @@
 
 use libc::{c_char, c_double, c_int, c_long, c_uchar, c_uint, c_ulong, c_void, size_t};
 
-use beam_alloc::Heap;
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{self, Eterm, NIL};
 
 use crate::nif::api::{ErlNifApi, ERL_NIF_API_FIELD_COUNT};
-use crate::nif::host::{NifEnv, NifHost};
+use crate::nif::host::NifEnv;
 use crate::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM};
 use crate::nif::types::{
     ErlNifBinary, ErlNifCharEncoding, ErlNifHash, ErlNifPid, ErlNifPort, ErlNifTermType,
@@ -170,6 +170,9 @@ const UNDEFINED_PID: ERL_NIF_TERM = ERL_NIF_TERM::from_raw(NIL.raw());
 /// Whether `t` is a pid (internal or external).
 #[inline]
 fn is_pid(t: Eterm) -> bool {
+    if !is_term_word(t) {
+        return false;
+    }
     prelude::is_internal_pid(t)
         // SAFETY: `is_external_pid` only dereferences the header of a boxed term.
         || unsafe { prelude::is_external_pid(t) }
@@ -178,6 +181,9 @@ fn is_pid(t: Eterm) -> bool {
 /// Whether `t` is a port (internal or external).
 #[inline]
 fn is_port(t: Eterm) -> bool {
+    if !is_term_word(t) {
+        return false;
+    }
     prelude::is_internal_port(t)
         // SAFETY: as `is_pid`.
         || unsafe { prelude::is_external_port(t) }
@@ -186,6 +192,9 @@ fn is_port(t: Eterm) -> bool {
 /// Whether `t` is a reference (internal or external).
 #[inline]
 fn is_ref(t: Eterm) -> bool {
+    if !is_term_word(t) {
+        return false;
+    }
     // SAFETY: the predicates only dereference the header of a boxed term.
     unsafe { prelude::is_internal_ref(t) || prelude::is_external_ref(t) }
 }
@@ -195,12 +204,29 @@ fn no_atoms() -> AtomTable {
     AtomTable::new()
 }
 
+/// Whether `term` is a *term word at all* — i.e. it is not the invalid `HEADER` pattern.
+///
+/// A term carries one of the primary tags `LIST`, `BOXED` or `IMMED1`; the `HEADER` pattern
+/// (primary tag `0` — the raw word `0`, `THE_NON_VALUE`, or any bare header word) is **not** a term.
+/// The C's `is_boxed` bit trick classifies it as *boxed* (`(x & (MASK-BOXED)) == 0` holds for `0`),
+/// so `is_binary`/`is_tuple`/`size_object`/… would dereference a null pointer on it — in the C that
+/// is a `SIGSEGV`. Every `enif_*` entry point below therefore rejects such a word up front and
+/// returns the C-safe default (`0`, `NULL`, `None`), so an errored or hostile NIF cannot take the
+/// runtime down. This is strictly *safer* than the C and never changes the answer for a valid term.
+#[inline]
+fn is_term_word(term: Eterm) -> bool {
+    (term.raw() & prelude::TAG_PRIMARY_MASK) != prelude::TAG_PRIMARY_HEADER
+}
+
 // ---------------------------------------------------------------------------------------------
 // Integer conversion (C `term_to_Sint` / `term_to_Uint`, big.c)
 // ---------------------------------------------------------------------------------------------
 
 /// `term_to_Sint` — the term's value as an `i64`, or `None` when it is not an integer that fits.
 fn term_to_sint64(t: Eterm) -> Option<i64> {
+    if !is_term_word(t) {
+        return None;
+    }
     if prelude::is_small(t) {
         return Some(prelude::signed_value(t));
     }
@@ -231,6 +257,9 @@ fn term_to_sint64(t: Eterm) -> Option<i64> {
 
 /// `term_to_Uint` — the term's value as a `u64`, or `None` (negative, or wider than 64 bits).
 fn term_to_uint64(t: Eterm) -> Option<u64> {
+    if !is_term_word(t) {
+        return None;
+    }
     if prelude::is_small(t) {
         let v = prelude::signed_value(t);
         return if v < 0 { None } else { Some(v as u64) };
@@ -397,6 +426,9 @@ pub unsafe extern "C" fn enif_inspect_binary(
         return 0;
     }
     let term = t(bin_term);
+    if !is_term_word(term) {
+        return 0;
+    }
     // SAFETY: `is_bitstring` only dereferences the header of a boxed term.
     if !unsafe { prelude::is_bitstring(term) } {
         return 0;
@@ -428,6 +460,9 @@ pub unsafe extern "C" fn enif_inspect_binary(
 
 /// Append the bytes of an iolist (or a binary) to `out`; `false` for anything else.
 fn flatten_iolist(term: Eterm, out: &mut Vec<u8>) -> bool {
+    if !is_term_word(term) {
+        return false;
+    }
     if prelude::is_nil(term) {
         return true;
     }
@@ -604,6 +639,9 @@ pub unsafe extern "C" fn enif_make_sub_binary(
         return bare_badarg();
     };
     let term = t(bin_term);
+    if !is_term_word(term) {
+        return n(badarg_atom(e));
+    }
     // SAFETY: `is_binary` only dereferences the header of a boxed term.
     if !unsafe { prelude::is_binary(term) } {
         return n(badarg_atom(e));
@@ -657,6 +695,9 @@ pub unsafe extern "C" fn enif_term_to_binary(
         return 0;
     };
     if bin.is_null() {
+        return 0;
+    }
+    if !is_term_word(t(term)) {
         return 0;
     }
     let Some(bytes) = e.host().term_to_binary(t(term)) else {
@@ -738,7 +779,7 @@ pub unsafe extern "C" fn enif_get_int(
     match term_to_sint64(t(term)) {
         Some(v) if (c_int::MIN as i64..=c_int::MAX as i64).contains(&v) => {
             // SAFETY: `ip` may be null (handled) or valid for one write (caller contract).
-            unsafe { write_out(ip, v as c_int) } as c_int
+            (unsafe { write_out(ip, v as c_int) }) as c_int
         }
         _ => 0,
     }
@@ -758,7 +799,7 @@ pub unsafe extern "C" fn enif_get_uint(
     match term_to_uint64(t(term)) {
         Some(v) if v <= c_uint::MAX as u64 => {
             // SAFETY: `ip` may be null (handled) or valid for one write.
-            unsafe { write_out(ip, v as c_uint) } as c_int
+            (unsafe { write_out(ip, v as c_uint) }) as c_int
         }
         _ => 0,
     }
@@ -777,7 +818,7 @@ pub unsafe extern "C" fn enif_get_long(
 ) -> c_int {
     match term_to_sint64(t(term)) {
         // SAFETY: `ip` may be null (handled) or valid for one write.
-        Some(v) => unsafe { write_out(ip, v as c_long) } as c_int,
+        Some(v) => (unsafe { write_out(ip, v as c_long) }) as c_int,
         None => 0,
     }
 }
@@ -795,7 +836,7 @@ pub unsafe extern "C" fn enif_get_ulong(
 ) -> c_int {
     match term_to_uint64(t(term)) {
         // SAFETY: `ip` may be null (handled) or valid for one write.
-        Some(v) => unsafe { write_out(ip, v as c_ulong) } as c_int,
+        Some(v) => (unsafe { write_out(ip, v as c_ulong) }) as c_int,
         None => 0,
     }
 }
@@ -847,6 +888,9 @@ pub unsafe extern "C" fn enif_get_double(
     dp: *mut c_double,
 ) -> c_int {
     let term = t(term);
+    if !is_term_word(term) {
+        return 0;
+    }
     // SAFETY: `is_float` only dereferences the header of a boxed term.
     if !unsafe { prelude::is_float(term) } {
         return 0;
@@ -854,7 +898,7 @@ pub unsafe extern "C" fn enif_get_double(
     // SAFETY: `term` is a live boxed float.
     let value = unsafe { prelude::float_value(term) };
     // SAFETY: `dp` may be null (handled) or valid for one write.
-    unsafe { write_out(dp, value) } as c_int
+    (unsafe { write_out(dp, value) }) as c_int
 }
 
 /// `int enif_get_atom(ErlNifEnv*, ERL_NIF_TERM atom, char* buf, unsigned len, ErlNifCharEncoding);`
@@ -948,7 +992,7 @@ pub unsafe extern "C" fn enif_get_atom_length(
         ErlNifCharEncoding::Utf8 => name.len() as c_uint,
     };
     // SAFETY: `len` may be null (handled) or valid for one write.
-    unsafe { write_out(len, n) } as c_int
+    (unsafe { write_out(len, n) }) as c_int
 }
 
 /// `int enif_get_string(ErlNifEnv*, ERL_NIF_TERM list, char* buf, unsigned len, ErlNifCharEncoding);`
@@ -1071,7 +1115,7 @@ pub unsafe extern "C" fn enif_get_string_length(
     let mut cur = t(list);
     if prelude::is_nil(cur) {
         // SAFETY: `len` may be null (handled) or valid for one write.
-        return unsafe { write_out(len, 0) } as c_int;
+        return (unsafe { write_out(len, 0) }) as c_int;
     }
     match encoding {
         ErlNifCharEncoding::Latin1 => {
@@ -1092,7 +1136,7 @@ pub unsafe extern "C" fn enif_get_string_length(
                 return 0;
             }
             // SAFETY: `len` may be null (handled) or valid for one write.
-            unsafe { write_out(len, n) } as c_int
+            (unsafe { write_out(len, n) }) as c_int
         }
         ErlNifCharEncoding::Utf8 => {
             let mut codepoints: Vec<char> = Vec::new();
@@ -1110,7 +1154,7 @@ pub unsafe extern "C" fn enif_get_string_length(
             }
             let bytes = codepoints.iter().collect::<String>().len();
             // SAFETY: `len` may be null (handled) or valid for one write.
-            unsafe { write_out(len, bytes as c_uint) } as c_int
+            (unsafe { write_out(len, bytes as c_uint) }) as c_int
         }
     }
 }
@@ -1128,6 +1172,9 @@ pub unsafe extern "C" fn enif_get_tuple(
     array: *mut *const ERL_NIF_TERM,
 ) -> c_int {
     let term = t(tpl);
+    if !is_term_word(term) {
+        return 0;
+    }
     // SAFETY: `is_tuple` only dereferences the header of a boxed term.
     if unsafe { prelude::is_not_tuple(term) } {
         return 0;
@@ -1138,11 +1185,14 @@ pub unsafe extern "C" fn enif_get_tuple(
     if !(unsafe { write_out(arity, size as c_int) }) {
         return 0;
     }
-    // SAFETY: `array` may be null (handled) or valid for one write. The element array starts at the
-    // word after the tuple's header (`tuple_val(t) + 1`), exactly as the C sets it.
-    let elements = prelude::tuple_val(term).add(1).cast::<ERL_NIF_TERM>().cast_const();
+    // SAFETY: `term` is a live tuple (checked above); `tuple_val` returns its first word and the
+    // element array starts at the word after the header (`tuple_val(t) + 1`). `array` may be null
+    // (handled) or valid for one write.
+    let elements = unsafe { prelude::tuple_val(term).add(1) }
+        .cast::<ERL_NIF_TERM>()
+        .cast_const();
     // SAFETY: `array` may be null (handled) or valid for one write.
-    unsafe { write_out(array, elements) } as c_int
+    (unsafe { write_out(array, elements) }) as c_int
 }
 
 /// `int enif_get_list_cell(ErlNifEnv* env, ERL_NIF_TERM term, ERL_NIF_TERM* head, ERL_NIF_TERM* tail);`
@@ -1186,7 +1236,7 @@ pub unsafe extern "C" fn enif_get_list_length(
     loop {
         if prelude::is_nil(cur) {
             // SAFETY: `len` may be null (handled) or valid for one write.
-            return unsafe { write_out(len, n as c_uint) } as c_int;
+            return (unsafe { write_out(len, n as c_uint) }) as c_int;
         }
         if !prelude::is_list(cur) {
             return 0;
@@ -1211,9 +1261,12 @@ pub unsafe extern "C" fn enif_get_map_size(
     term: ERL_NIF_TERM,
     size: *mut size_t,
 ) -> c_int {
+    if !is_term_word(t(term)) {
+        return 0;
+    }
     match prelude::map_size(t(term), &no_atoms()) {
         // SAFETY: `size` may be null (handled) or valid for one write.
-        Ok(n) => unsafe { write_out(size, n) } as c_int,
+        Ok(n) => (unsafe { write_out(size, n) }) as c_int,
         Err(_) => 0,
     }
 }
@@ -1233,7 +1286,7 @@ pub unsafe extern "C" fn enif_get_map_value(
     match prelude::map_get(t(map), t(key), &no_atoms()) {
         Ok(Some(v)) => {
             // SAFETY: `value` may be null (handled) or valid for one write.
-            unsafe { write_out(value, n(v)) } as c_int
+            (unsafe { write_out(value, n(v)) }) as c_int
         }
         _ => 0,
     }
@@ -1267,7 +1320,10 @@ pub unsafe extern "C" fn enif_is_binary(
     term: ERL_NIF_TERM,
 ) -> c_int {
     // SAFETY: `is_binary` only dereferences the header of a boxed term.
-    unsafe { prelude::is_binary(t(term)) } as c_int
+    if !is_term_word(t(term)) {
+        return 0;
+    }
+    (unsafe { prelude::is_binary(t(term)) }) as c_int
 }
 
 /// `int enif_is_ref(ErlNifEnv*, ERL_NIF_TERM term);`
@@ -1294,7 +1350,10 @@ pub unsafe extern "C" fn enif_is_fun(
     term: ERL_NIF_TERM,
 ) -> c_int {
     // SAFETY: `is_any_fun` only dereferences the header of a boxed term.
-    unsafe { prelude::is_any_fun(t(term)) } as c_int
+    if !is_term_word(t(term)) {
+        return 0;
+    }
+    (unsafe { prelude::is_any_fun(t(term)) }) as c_int
 }
 
 /// `int enif_is_pid(ErlNifEnv*, ERL_NIF_TERM term);`
@@ -1363,7 +1422,10 @@ pub unsafe extern "C" fn enif_is_tuple(
     term: ERL_NIF_TERM,
 ) -> c_int {
     // SAFETY: `is_tuple` only dereferences the header of a boxed term.
-    unsafe { prelude::is_tuple(t(term)) } as c_int
+    if !is_term_word(t(term)) {
+        return 0;
+    }
+    (unsafe { prelude::is_tuple(t(term)) }) as c_int
 }
 
 /// `int enif_is_map(ErlNifEnv* env, ERL_NIF_TERM term);`
@@ -1377,7 +1439,10 @@ pub unsafe extern "C" fn enif_is_map(
     term: ERL_NIF_TERM,
 ) -> c_int {
     // SAFETY: `is_map` only dereferences the header of a boxed term.
-    unsafe { prelude::is_map(t(term)) } as c_int
+    if !is_term_word(t(term)) {
+        return 0;
+    }
+    (unsafe { prelude::is_map(t(term)) }) as c_int
 }
 
 /// `int enif_is_number(ErlNifEnv*, ERL_NIF_TERM term);`
@@ -1391,7 +1456,10 @@ pub unsafe extern "C" fn enif_is_number(
     term: ERL_NIF_TERM,
 ) -> c_int {
     // SAFETY: `is_number` only inspects tags/headers, never panics.
-    unsafe { prelude::is_number(t(term)) } as c_int
+    if !is_term_word(t(term)) {
+        return 0;
+    }
+    (unsafe { prelude::is_number(t(term)) }) as c_int
 }
 
 /// `int enif_is_exception(ErlNifEnv*, ERL_NIF_TERM term);`
@@ -1469,6 +1537,9 @@ pub unsafe extern "C" fn enif_hash(
 /// `term` is any term; no pointers.
 #[no_mangle]
 pub unsafe extern "C" fn enif_term_size(term: ERL_NIF_TERM) -> size_t {
+    if !is_term_word(t(term)) {
+        return 0;
+    }
     prelude::size_object(t(term)) * core::mem::size_of::<Eterm>()
 }
 
@@ -1486,6 +1557,9 @@ pub unsafe extern "C" fn enif_term_type(
     term: ERL_NIF_TERM,
 ) -> ErlNifTermType {
     let term = t(term);
+    if !is_term_word(term) {
+        return ErlNifTermType::MissingDefaultCaseReadTheManual;
+    }
     if prelude::is_atom(term) {
         return ErlNifTermType::Atom;
     }
@@ -1545,7 +1619,7 @@ pub unsafe extern "C" fn enif_get_local_pid(
         return 0;
     }
     // SAFETY: `pid` may be null (handled) or valid for one write.
-    unsafe { write_out(pid, ErlNifPid { pid: n(term) }) } as c_int
+    (unsafe { write_out(pid, ErlNifPid { pid: n(term) }) }) as c_int
 }
 
 /// `int enif_get_local_port(ErlNifEnv* env, ERL_NIF_TERM, ErlNifPort* port_id);`
@@ -1564,7 +1638,7 @@ pub unsafe extern "C" fn enif_get_local_port(
         return 0;
     }
     // SAFETY: `port_id` may be null (handled) or valid for one write.
-    unsafe { write_out(port_id, ErlNifPort { port_id: n(term) }) } as c_int
+    (unsafe { write_out(port_id, ErlNifPort { port_id: n(term) }) }) as c_int
 }
 
 /// `ErlNifPid* enif_self(ErlNifEnv* caller_env, ErlNifPid* pid);`
@@ -1863,7 +1937,7 @@ pub unsafe extern "C" fn enif_make_new_atom(
     };
     match decode_name(bytes, encoding).and_then(|s| e.host().intern_atom(&s)) {
         // SAFETY: `atom` may be null (handled) or valid for one write.
-        Some(term) => unsafe { write_out(atom, n(term)) } as c_int,
+        Some(term) => (unsafe { write_out(atom, n(term)) }) as c_int,
         None => 0,
     }
 }
@@ -1889,7 +1963,7 @@ pub unsafe extern "C" fn enif_make_new_atom_len(
     };
     match decode_name(bytes, encoding).and_then(|s| e.host().intern_atom(&s)) {
         // SAFETY: `atom` may be null (handled) or valid for one write.
-        Some(term) => unsafe { write_out(atom, n(term)) } as c_int,
+        Some(term) => (unsafe { write_out(atom, n(term)) }) as c_int,
         None => 0,
     }
 }
@@ -2156,7 +2230,7 @@ pub unsafe extern "C" fn enif_make_map_put(
     };
     match unsafe { prelude::map_put(hp, map, t(key), t(value), &no_atoms()) } {
         // SAFETY: `map_out` may be null (handled) or valid for one write.
-        Ok(out) => unsafe { write_out(map_out, n(out)) } as c_int,
+        Ok(out) => (unsafe { write_out(map_out, n(out)) }) as c_int,
         Err(_) => 0,
     }
 }
@@ -2192,7 +2266,7 @@ pub unsafe extern "C" fn enif_make_map_update(
     };
     match unsafe { prelude::map_put(hp, map, t(key), t(value), &no_atoms()) } {
         // SAFETY: `map_out` may be null (handled) or valid for one write.
-        Ok(out) => unsafe { write_out(map_out, n(out)) } as c_int,
+        Ok(out) => (unsafe { write_out(map_out, n(out)) }) as c_int,
         Err(_) => 0,
     }
 }
@@ -2229,7 +2303,7 @@ pub unsafe extern "C" fn enif_make_map_from_arrays(
     };
     match unsafe { prelude::write_map(hp, &pairs, &no_atoms()) } {
         // SAFETY: `map_out` may be null (handled) or valid for one write.
-        Ok(map) => unsafe { write_out(map_out, n(map)) } as c_int,
+        Ok(map) => (unsafe { write_out(map_out, n(map)) }) as c_int,
         Err(_) => 0,
     }
 }
@@ -2407,9 +2481,11 @@ pub fn enif_api_table() -> &'static ErlNifApi {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_alloc::Heap;
     use beam_term::atom::AtomTable;
     use beam_term::prelude::{atom_val, is_atom, make_small};
 
+    use crate::nif::host::NifHost;
     struct TestHost {
         heap: Heap,
         atoms: AtomTable,
