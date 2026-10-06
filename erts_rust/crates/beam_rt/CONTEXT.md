@@ -199,8 +199,9 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
   base, lists/tuples/maps/binaries, the full operator set with Erlang precedence,
   `case`/`if`/`begin`/`try`/`catch`/`receive`, `fun`s, and list/map/**binary** comprehensions
   (including a **binary generator**, `<<Seg || <<X>> <= Bin>>`) — evaluated by an `erl_eval`-style
-  tree-walk that dispatches arithmetic/comparison to the **`beam_bifs` `erlang` registry** (semantics
-  are never re-implemented). Binary segments accumulate a bit buffer, so construction need not be
+  tree-walk that dispatches arithmetic/comparison/**bit operators** (`band`/`bor`/`bxor`/`bsl`/`bsr`/
+  `bnot`, arbitrary-precision) to the **`beam_bifs` `erlang` registry** (semantics are never
+  re-implemented — only `and`/`or`/`xor`/`not`/`andalso`/`orelse`/`++`/`--` remain special forms here). Binary segments accumulate a bit buffer, so construction need not be
   byte-aligned (`<<1:1>>`, `<<A:1,B:7>>`, `<<255:12/little>>`); a byte-aligned result is a **binary**,
   a non-byte-aligned one a **bitstring** materialized by `beam_codec::term::make_bitstring` on the
   runtime's long-lived `eval_heap` (`RuntimeContext::eval_heap`). An expression outside the grammar is
