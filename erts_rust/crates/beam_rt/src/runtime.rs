@@ -23,6 +23,7 @@
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -42,6 +43,7 @@ use crate::error;
 use crate::eval::FunBody;
 use crate::format;
 use crate::info::{self, InfoValue};
+use crate::mailbox::MailboxState;
 use crate::port::PortRegistry;
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
 ///
@@ -64,7 +66,18 @@ pub struct Runtime {
     /// The code server: the one shared atom table, the module cache, the code path.
     pub(crate) code_server: CodeServer,
     /// The process table (Milestone-1: the runtime's own single process).
-    processes: ProcessTable,
+    ///
+    /// `pub(crate)` so [`RuntimeContext`](crate::context::RuntimeContext) can resolve a
+    /// process's mailbox against it (the receive seam) without a runtime accessor.
+    pub(crate) processes: ProcessTable,
+    /// The per-process **mailbox scan state** — the receive cursor and the
+    /// `recv_marker_*` table — keyed by pid.
+    ///
+    /// It lives here, not in a context, because a `receive` that suspends on an empty
+    /// mailbox is resumed against exactly this position once a message arrives (see
+    /// `crate::mailbox`). A pid with no entry has never scanned, which is the default
+    /// state (cursor at the first message, no markers).
+    pub(crate) mailboxes: HashMap<ProcessId, MailboxState>,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
     /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
@@ -150,6 +163,7 @@ impl Runtime {
             registry: Rc::new(BifRegistry::with_core_bifs()),
             code_server,
             processes,
+            mailboxes: HashMap::new(),
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,

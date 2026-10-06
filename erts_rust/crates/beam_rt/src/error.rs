@@ -174,6 +174,16 @@ pub(crate) fn unsupported(what: &str) -> BeamError {
     message(format!("{UNSUPPORTED_PREFIX}: {what}"))
 }
 
+/// A receive-seam operation with no mailbox to serve it.
+///
+/// The runtime always owns a process table holding the running process, so this is
+/// unreachable in Milestone 1; it exists so a context whose pid has no process (a
+/// scheduler pass running a terminated pid, say) reports a typed capability gap rather
+/// than a wrong result or a panic.
+pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
+    unsupported(&format!("receive: process {pid:?} has no mailbox"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
