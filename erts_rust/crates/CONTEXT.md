@@ -171,7 +171,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` seam
-- `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4)
+- `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
