@@ -157,6 +157,15 @@ is `decode`'s.
   body is an owned buffer a borrowed `Decoder<'a>` cannot hold. `Decoder::new`/`new_body` are otherwise
   unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
+- **`LOCAL_EXT` (`121`) consumes its node hash and continues.** The `Tag::Local` arm reads the 4-byte
+  node hash and returns the *following* term (`external.c:5250-5254`: `ep += 4; goto
+  continue_this_obj`), so `[VERSION_MAGIC][121][hash:4][term]` decodes to `term` via `Decoder::new`
+  and the same holds at any nesting. A short read (missing hash or term) is `BadArg`. The hash is NOT
+  verified here — the C verifies it only in the `decoded_size` sizing pass (`external.c:6437-6512`)
+  against a hash seeded with the node's `local_node_hash` (`beam_rt`/`beam_dist`'s).
+- **`DIST_HEADER` (`68`) is malformed, not a term.** The C term decoder has no `case DIST_HEADER`
+  (`goto error`, `external.c:6464`), so a `68` byte is `BeamError::BadArg`; the `'D'`/`'E'`/`'F'`
+  framing is wholly `beam_dist`'s (`../beam_dist/src/dist_header.rs`) and is not duplicated here.
 
 ### `src/term/` — materialization layer (the ONLY `unsafe` subtree; see Design Decisions)
 `src/term/mod.rs` + `src/term/fun.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term
