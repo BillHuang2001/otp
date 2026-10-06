@@ -9,12 +9,13 @@
 //!
 //! The second half of the file is the evidence for the tier's one optimisation —
 //! the **guarded small-int arithmetic fast path** for `erlang:'+'/2`/`'-'/2`
-//! (`src/jit/baseline.rs`): it proves the fast path produces exactly the
+//! (`src/jit/baseline/`): it proves the fast path produces exactly the
 //! interpreter's results across the small-int range (including the boundary cases
 //! that must fall back to `jit_step_one`), that it never consults the BIF hook,
 //! and that a rejected (non-small) operand really does fall back.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 
 use beam_common::BeamError;
 use beam_engine::jit::baseline::BaselineJit;
@@ -257,22 +258,22 @@ fn a_missing_export_is_a_typed_error_on_the_native_tier() {
 }
 
 // ---------------------------------------------------------------------------
-// The small-int arithmetic fast path (`src/jit/baseline.rs`)
+// The small-int arithmetic fast path (`src/jit/baseline/`)
 // ---------------------------------------------------------------------------
 
-/// Counts every call the counting BIF hook serves, so a test can assert *which*
-/// path (the native fast path or the `jit_step_one` fallback) a run took.
-static ARITH_HOOK_CALLS: AtomicUsize = AtomicUsize::new(0);
-
-/// [`arith_hook`] plus a call counter.
+/// [`arith_hook`] plus a call counter, so a test can assert *which* path (the
+/// native fast path or the `jit_step_one` fallback) a run took.
+///
+/// The counter is **per-call-site** (each test owns its own `Arc`) rather than a
+/// process-global `static`: the tests in this file run in parallel in one binary,
+/// so a shared counter would interleave across runs and flake.
 fn counting_arith_hook(
-    module: &str,
-    function: &str,
-    arity: u32,
-    args: &[Eterm],
-) -> Result<Eterm, BeamError> {
-    ARITH_HOOK_CALLS.fetch_add(1, Ordering::SeqCst);
-    arith_hook(module, function, arity, args)
+    counter: Arc<AtomicUsize>,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static {
+    move |module, function, arity, args| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        arith_hook(module, function, arity, args)
+    }
 }
 
 /// [`arith_hook`], but range-checked: a result outside `MIN_SMALL..=MAX_SMALL` is
@@ -520,19 +521,19 @@ fn the_synthetic_fixture_compiles_and_its_small_int_plus_bypasses_the_hook() {
 
     // ... and behavioural evidence: the compiled `gc_bif '+'/2` computes the sum
     // itself, so the BIF hook is never consulted.
-    ARITH_HOOK_CALLS.store(0, Ordering::SeqCst);
+    let calls = Arc::new(AtomicUsize::new(0));
     let got = run_module_tier(
         Tier::BaselineJit,
         &module,
         "plus",
         2,
         &[make_small(19), make_small(23)],
-        counting_arith_hook,
+        counting_arith_hook(Arc::clone(&calls)),
     )
     .expect("plus(19, 23)");
     assert_eq!(got, make_small(42));
     assert_eq!(
-        ARITH_HOOK_CALLS.load(Ordering::SeqCst),
+        calls.load(Ordering::SeqCst),
         0,
         "the fast path must not call the BIF"
     );
@@ -546,36 +547,36 @@ fn the_native_fast_path_does_not_consult_the_bif_hook() {
     let module = slice_module();
     let args = [make_small(20), make_small(22)];
 
-    ARITH_HOOK_CALLS.store(0, Ordering::SeqCst);
+    let interpreted_calls = Arc::new(AtomicUsize::new(0));
     let interpreted = run_module_tier(
         Tier::Interpreter,
         &module,
         "add",
         2,
         &args,
-        counting_arith_hook,
+        counting_arith_hook(Arc::clone(&interpreted_calls)),
     )
     .expect("add(20, 22) via the interpreter");
     assert_eq!(interpreted, make_small(42));
     assert_eq!(
-        ARITH_HOOK_CALLS.load(Ordering::SeqCst),
+        interpreted_calls.load(Ordering::SeqCst),
         1,
         "the interpreter must call the BIF exactly once"
     );
 
-    ARITH_HOOK_CALLS.store(0, Ordering::SeqCst);
+    let jitted_calls = Arc::new(AtomicUsize::new(0));
     let jitted = run_module_tier(
         Tier::BaselineJit,
         &module,
         "add",
         2,
         &args,
-        counting_arith_hook,
+        counting_arith_hook(Arc::clone(&jitted_calls)),
     )
     .expect("add(20, 22) via the native tier");
     assert_eq!(jitted, interpreted);
     assert_eq!(
-        ARITH_HOOK_CALLS.load(Ordering::SeqCst),
+        jitted_calls.load(Ordering::SeqCst),
         0,
         "the native fast path must not call the BIF"
     );
@@ -590,29 +591,29 @@ fn a_non_small_operand_falls_back_to_the_interpreter_helper() {
     for bad in [beam_term::NIL, atom_arg] {
         let args = [bad, make_small(1)];
 
-        ARITH_HOOK_CALLS.store(0, Ordering::SeqCst);
+        let interpreted_calls = Arc::new(AtomicUsize::new(0));
         let interpreted = run_module_tier(
             Tier::Interpreter,
             &module,
             "plus",
             2,
             &args,
-            counting_arith_hook,
+            counting_arith_hook(Arc::clone(&interpreted_calls)),
         );
-        assert_eq!(ARITH_HOOK_CALLS.load(Ordering::SeqCst), 1);
+        assert_eq!(interpreted_calls.load(Ordering::SeqCst), 1);
 
-        ARITH_HOOK_CALLS.store(0, Ordering::SeqCst);
+        let jitted_calls = Arc::new(AtomicUsize::new(0));
         let jitted = run_module_tier(
             Tier::BaselineJit,
             &module,
             "plus",
             2,
             &args,
-            counting_arith_hook,
+            counting_arith_hook(Arc::clone(&jitted_calls)),
         );
         // The fallback is the interpreter itself, so the hook ran exactly once...
         assert_eq!(
-            ARITH_HOOK_CALLS.load(Ordering::SeqCst),
+            jitted_calls.load(Ordering::SeqCst),
             1,
             "the rejected guard must fall back to the BIF"
         );
