@@ -53,11 +53,30 @@
 //!   *characters*, while `binary_to_existing_atom/2` reports `badarg` for such a
 //!   name (it cannot exist) — the `must_exist` split in `erl_unicode.c`.
 //! * `term_to_binary/1` is the `beam_codec` image of the term;
-//!   `term_to_binary/2` accepts `{minor_version, 0|1|2}` (`3` is `badarg`) and
-//!   `compressed`/`{compressed, Level}`. `binary_to_term/1` ignores trailing
-//!   bytes; `binary_to_term/2` takes `safe` and `used`
+//!   `term_to_binary/2` accepts `compressed` (zlib level 6, the oracle's
+//!   `Z_DEFAULT_COMPRESSION`), `{compressed, 0..=9}` and `{minor_version, 0|1|2}`
+//!   (`3`, `-1` and a non-small version are `badarg`). `binary_to_term/1` ignores
+//!   trailing bytes; `binary_to_term/2` takes `safe` and `used`
 //!   (`binary_to_term(<<131,97,17>>, [used])` is `{17, 3}` — the count includes
 //!   the `131` version byte). `safe` refuses a term that would create an atom.
+//!
+//! # The `term_to_binary/2` options
+//!
+//! * **`compressed`/`{compressed, Level}`.** The term is encoded as a *body* (no
+//!   version byte) and deflated; the compressed wrapper
+//!   `[131][80][body_len:4 BE][zlib]` is emitted **only** when the zlib stream fits
+//!   the C's `real_size - 5` budget, otherwise the plain uncompressed image is
+//!   returned (`external.c:2250-2301`). That is why
+//!   `term_to_binary([1,2,3], [compressed])` is the *uncompressed*
+//!   `<<131,107,0,3,1,2,3>>` — a small body cannot pay for zlib's framing — while a
+//!   large one (`lists:duplicate(500, hello)`) becomes a real `COMPRESSED` image.
+//!   The deflate bytes themselves are implementation-defined (miniz_oxide vs zlib),
+//!   so only the framing and the round-trip are pinned.
+//! * **`{minor_version, N}`** selects the tag set `parse_t2b_opts` builds
+//!   (`external.c:1499-1514`): `2` (the default) is UTF-8 atoms + `NEW_FLOAT_EXT`;
+//!   `1` clears `DFLAG_UTF8_ATOMS` (Latin-1 `ATOM_EXT` atoms); `0` additionally clears
+//!   `DFLAG_NEW_FLOATS` (legacy `FLOAT_EXT` floats). A version outside `0..=2`, a
+//!   non-small version and a non-small compression level are `badarg`.
 //!
 //! # Documented Milestone-1 gaps (never a silently wrong result)
 //!
@@ -67,22 +86,36 @@
 //!   registering it would *invent* a BIF arity the oracle answers with `undef`.
 //!   Following the same rule as `io:format`'s `~d` (see [`crate::io`]), the
 //!   oracle wins over the illustrative list: only `/1` and `/2` are registered.
-//! * **The `compressed` option is unsupported** (`term_to_binary/2` with
-//!   `compressed` or `{compressed, Level}` raises `error:unsupported_bif`). The
-//!   *option* is validated like the oracle (its value must be a small integer) and
-//!   then reported.
-//! * **`{minor_version, 0|1}` is accepted but has no effect.** The codec has no
-//!   legacy-tag switch, so `term_to_binary(T, [{minor_version, 1}])` emits the
-//!   minor-version-2 tag set (`SMALL_ATOM_UTF8_EXT` where the oracle emits
-//!   `ATOM_EXT`). The image still decodes to the identical term — it is a
-//!   byte-level, not a semantic, deviation.
+//! * **`{minor_version, 1}` is a `beam_codec` handoff for any term whose image would
+//!   carry an atom.** `beam_codec` offers its Latin-1 atoms only in the *distribution*
+//!   flavour: [`AtomEncoding::Latin1`] writes `SMALL_ATOM_EXT` (`115`) for a name of
+//!   at most 255 bytes — because the negotiated distribution flag set includes
+//!   `DFLAG_SMALL_ATOM_TAGS` — and reports `unsupported_external_term` for a name that
+//!   is not Latin-1 representable. `term_to_binary`'s `TERM_TO_BINARY_DFLAGS` carries
+//!   **no** `DFLAG_SMALL_ATOM_TAGS`, so the C `enc_atom` always writes `ATOM_EXT`
+//!   (`100`) — e.g. the oracle's `term_to_binary(#{a => 1}, [{minor_version, 1}])` is
+//!   `<<131,116,0,0,0,1,100,0,1,97,97,1>>` where the codec would emit `115,1,97` — and
+//!   falls back to the UTF-8 tag family for a wider name (`external.c:2906-2932`).
+//!   Emitting `SMALL_ATOM_EXT` would be a *wrong image*, so a term the scan shows
+//!   contains an atom reports `error:unsupported_bif` instead; an atom-free term is
+//!   byte-identical to the oracle. The fix belongs to `beam_codec` (a
+//!   `term_to_binary` Latin-1 mode: always `ATOM_EXT`, UTF-8 fallback for a wide name).
+//! * **`{minor_version, 0}` has the same atom gap *and* a float gap.** Minor version 0
+//!   also clears `DFLAG_NEW_FLOATS`, so a float goes on the wire as the legacy 31-byte
+//!   `FLOAT_EXT` (`99`) — the oracle's `term_to_binary(1.5, [{minor_version, 0}])` is
+//!   `<<131,99,"1.50000000000000000000e+00",0,0,0,0,0>>` — which `beam_codec` cannot
+//!   write (it emits `NEW_FLOAT_EXT` unconditionally). A term whose image would carry
+//!   an atom or a float is therefore `error:unsupported_bif` (also a `beam_codec`
+//!   handoff); a term with neither is byte-identical to the oracle.
+//! * **`local`/`deterministic` (and `iovec`/`fragment`) options are not
+//!   supported** — `badarg`. A `LOCAL_EXT` image needs the node's local hash, which is
+//!   `beam_rt`'s/`beam_dist`'s state, not this crate's.
 //! * **`beam_codec` encodes only *external* pids/ports/refs.** An internal pid
 //!   (`self()`) is not representable, so `term_to_binary(self())` reports the
 //!   codec's `unsupported_external_term` error instead of the oracle's
 //!   `NEW_PID_EXT`. A decoded `NEW_PID_EXT` stays an external id, so
 //!   `binary_to_term` ∘ `term_to_binary` round-trips the wire term, not an
-//!   internal pid.
-//! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
+//!   internal pid.//! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
 //!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
 //!   `system_limit` (the same documented gap as
@@ -116,7 +149,10 @@
 //! extend the very table `ctx.atoms()` borrows) is the one
 //! [`crate::context`] documents for the hook.
 
-use beam_codec::{encode_term, Decoder};
+use beam_codec::compress::compress as zlib_compress;
+use beam_codec::{
+    decode_term, encode_term, AtomEncoding, Decoder, Encoder, COMPRESSED_EXT, VERSION_MAGIC,
+};
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm};
 
@@ -577,29 +613,74 @@ fn term_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     make_bin(ctx, &bytes)
 }
 
-/// `term_to_binary(Term, Options)`.
+/// `term_to_binary(Term, Options)` — the `compressed` family and `{minor_version, N}`.
 ///
-/// The option list is validated exactly like the oracle; the `compressed` family
-/// is then reported as unsupported and an accepted `{minor_version, 0|1}` has no
-/// effect on the emitted tags — both documented in the module docs.
-fn term_to_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    check_term_to_binary_options(ctx.atoms(), args[1])?;
-    term_to_binary_1(ctx, &args[..1])
-}
-
-/// Validates a `term_to_binary/2` option list.
+/// The option list is validated exactly like the oracle's `parse_t2b_opts` and the
+/// image is built for the selected tag set / compression (see the module docs).
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-list or an
-/// unknown option, a `{minor_version, N}` outside `0..=2`, or a non-integer
-/// compression level; `error:unsupported_bif` for the recognised-but-unimplemented
-/// `compressed`/`{compressed, Level}` (see the module docs).
-fn check_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<()> {
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed option list,
+/// an unknown option or an out-of-range value; `error:unsupported_bif` for
+/// `{minor_version, 0}` on a term whose legacy-float image the codec cannot write;
+/// the codec's errors otherwise.
+fn term_to_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let options = parse_term_to_binary_options(ctx.atoms(), args[1])?;
+    let image = encode_image(ctx, args[0], &options)?;
+    make_bin(ctx, &image)
+}
+
+/// The parsed `term_to_binary/2` options (`parse_t2b_opts`, `external.c:1481-1520`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct T2bOptions {
+    /// The selected `{minor_version, N}` (`0..=2`).
+    minor_version: u8,
+    /// The zlib level of `compressed`/`{compressed, Level}`, `None` when neither was
+    /// given (the oracle's `level` default).
+    compression: Option<u8>,
+}
+
+impl Default for T2bOptions {
+    /// `{minor_version, 2}` (the current default flag set) and no compression —
+    /// exactly the oracle's `TERM_TO_BINARY_DFLAGS` with `level = 0`.
+    fn default() -> Self {
+        T2bOptions {
+            minor_version: 2,
+            compression: None,
+        }
+    }
+}
+
+/// The zlib level the bare `compressed` atom selects.
+///
+/// The C sets `Z_DEFAULT_COMPRESSION` (`-1`), which zlib maps to level 6, so the
+/// explicit [`flate2`](beam_codec::compress) level is 6.
+const DEFAULT_COMPRESSED_LEVEL: u8 = 6;
+
+/// The largest `{compressed, Level}` level — the C requires `0 =< Level < 10`.
+const MAX_COMPRESSED_LEVEL: i64 = 9;
+
+/// The zlib wrapper overhead the C's `real_size - 5` compression budget accounts
+/// for: the `COMPRESSED` tag, the 4-byte size field — the encoded body already
+/// carries neither, so a compressed image only pays off when the deflate stream is
+/// at least these 5 bytes shorter than the body.
+const COMPRESSED_OVERHEAD: usize = 5;
+
+/// Parses and validates a `term_to_binary/2` option list.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-list (including an
+/// improper list), an unknown atom/tuple option, a `{minor_version, N}` outside
+/// `0..=2`, or a `{compressed, Level}` whose level is not a small integer in
+/// `0..=9` — the C `parse_t2b_opts` rejections.
+fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<T2bOptions> {
+    let mut parsed = T2bOptions::default();
     for item in proper_list(opts).ok_or_else(badarg)? {
         if access::is_atom(item) {
             if atoms.name(atom_val(item)) == Some("compressed") {
-                return Err(unsupported_bif());
+                parsed.compression = Some(DEFAULT_COMPRESSED_LEVEL);
+                continue;
             }
             return Err(badarg());
         }
@@ -617,19 +698,198 @@ fn check_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<()> {
                 if !(0..=MAX_MINOR_VERSION).contains(&version) {
                     return Err(badarg());
                 }
+                parsed.minor_version = version as u8;
             }
             Some("compressed") => {
-                // The level is still validated (the oracle reports `badarg` for a
-                // non-integer level), then the option itself is reported.
-                small_arg(value)?;
-                return Err(unsupported_bif());
+                let level = small_arg(value)?;
+                if !(0..=MAX_COMPRESSED_LEVEL).contains(&level) {
+                    return Err(badarg());
+                }
+                parsed.compression = Some(level as u8);
             }
             _ => return Err(badarg()),
         }
     }
-    Ok(())
+    Ok(parsed)
 }
 
+/// Encodes `term` as the `term_to_binary/2` image `options` select.
+///
+/// # Errors
+///
+/// `error:unsupported_bif` for the `{minor_version, 0}` float gap (see the module
+/// docs); the encoder's and zlib's errors otherwise.
+fn encode_image(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+    let body = encode_body(ctx, term, options)?;
+    match options.compression {
+        None => Ok(plain_image(&body)),
+        Some(level) => compressed_image(&body, level),
+    }
+}
+
+/// Encodes `term` as a **body** — the term with no version byte — under the tag set
+/// `options.minor_version` selects.
+///
+/// # Errors
+///
+/// `error:unsupported_bif` for a `{minor_version, 0|1}` term whose image cannot be
+/// reproduced byte-exactly (see [`scan_features`]); the encoder's errors otherwise.
+fn encode_body(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+    if options.minor_version < 2 {
+        // Minor versions 0/1 clear `DFLAG_UTF8_ATOMS`, so an atom goes on the wire in
+        // the Latin-1 tag family — which `beam_codec` only offers in its *distribution*
+        // flavour (`SMALL_ATOM_EXT`, 115, and a hard error for a non-Latin-1 name),
+        // whereas `term_to_binary`'s `TERM_TO_BINARY_DFLAGS` carry no
+        // `DFLAG_SMALL_ATOM_TAGS` and the C therefore always writes `ATOM_EXT` (100)
+        // (`external.c:2906-2932`). An image that would contain an atom would silently
+        // disagree with the oracle, so it is refused; an atom-free term (and, for
+        // minor version 0, a float-free one — 0 also clears `DFLAG_NEW_FLOATS` and
+        // writes the legacy `FLOAT_EXT`, 99, which the codec cannot emit either) is
+        // byte-identical to the oracle and is encoded.
+        let features = scan_features(term);
+        if features.atoms || (options.minor_version == 0 && features.floats) {
+            return Err(unsupported_bif());
+        }
+    }
+    let encoding = if options.minor_version == 2 {
+        AtomEncoding::Utf8
+    } else {
+        // The checks above proved the term carries no atom, so this cannot change a
+        // byte; it states the selected tag family for the (atom-free) body.
+        AtomEncoding::Latin1
+    };
+    let mut encoder = Encoder::new_body(ctx.atoms());
+    encoder.set_atom_encoding(encoding);
+    encoder.encode(term)?;
+    Ok(encoder.finish())
+}
+/// The plain image: the version byte followed by the body.
+fn plain_image(body: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(body.len() + 1);
+    out.push(VERSION_MAGIC);
+    out.extend_from_slice(body);
+    out
+}
+
+/// The C's compressed-or-revert rule (`external.c:2250-2301`).
+///
+/// The body is deflated at `level`; the `[131][80][body_len:4 BE][zlib]` image is
+/// emitted only when the stream fits the `body_len - 5` budget, otherwise the plain
+/// image is returned (which is what happens for every small body — zlib's own
+/// framing costs more than the body saves).
+///
+/// # Errors
+///
+/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) for a body that
+/// does not fit the 4-byte size field (unreachable in practice: the term would have
+/// to be larger than 4 GiB).
+fn compressed_image(body: &[u8], level: u8) -> Result<Vec<u8>> {
+    if body.len() >= COMPRESSED_OVERHEAD {
+        if let Ok(deflated) = zlib_compress(body, level) {
+            if deflated.len() <= body.len() - COMPRESSED_OVERHEAD {
+                let size = u32::try_from(body.len()).map_err(|_| system_limit())?;
+                let mut out = Vec::with_capacity(deflated.len() + 6);
+                out.push(VERSION_MAGIC);
+                out.push(COMPRESSED_EXT);
+                out.extend_from_slice(&size.to_be_bytes());
+                out.extend_from_slice(&deflated);
+                return Ok(out);
+            }
+        }
+    }
+    Ok(plain_image(body))
+}
+
+/// What a conservative walk of a term found — the two tag-set switches a
+/// `{minor_version, N}` selects (`external.c:1499-1514`: `DFLAG_UTF8_ATOMS` and
+/// `DFLAG_NEW_FLOATS`).
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct TermFeatures {
+    /// Whether the image would contain an atom (an atom, an external id's `node` name,
+    /// or an interior this crate cannot read).
+    atoms: bool,
+    /// Whether the image would contain a float (a float, or an interior this crate
+    /// cannot read).
+    floats: bool,
+}
+
+/// Walks `term`'s full contents, reporting whether its image would carry an atom or a
+/// float.
+///
+/// The walk is iterative (an explicit work stack) and deliberately **conservative**: a
+/// term type whose interior this crate cannot read — a fun (its environment is only
+/// reachable through the `unsafe` `beam_term::fun::fun_env`), a native record or a HAMT
+/// map — reports *both* features, since such an image certainly carries atoms (a fun's
+/// module/function, a record's module/name) and might carry a float, so the caller
+/// refuses rather than claims their absence. Every other term is either a leaf that
+/// cannot carry one (immediates, bignums, bitstrings) or a container whose elements are
+/// walked. An external pid/port/ref is a leaf for floats but not for atoms: its wire
+/// form carries the `node` atom.
+fn scan_features(root: Eterm) -> TermFeatures {
+    let mut features = TermFeatures::default();
+    let mut stack = vec![root];
+    while let Some(term) = stack.pop() {
+        if access::is_atom(term) || is_external_id(term) {
+            features.atoms = true;
+            continue;
+        }
+        if access::is_float(term) {
+            features.floats = true;
+            continue;
+        }
+        if access::is_tuple(term) {
+            for index in 0..access::tuple_size(term) {
+                stack.push(access::tuple_element(term, index));
+            }
+            continue;
+        }
+        if access::is_list(term) {
+            stack.push(access::car(term));
+            stack.push(access::cdr(term));
+            continue;
+        }
+        if access::is_flatmap(term) {
+            // A malformed map is left to the encoder to reject; the scan cannot vouch
+            // for an interior it could not read.
+            match access::flatmap_pairs(term) {
+                Ok((keys, values)) => stack.extend(keys.into_iter().chain(values)),
+                Err(_) => return TermFeatures::opaque(),
+            }
+            continue;
+        }
+        if !is_feature_free_leaf(term) {
+            return TermFeatures::opaque();
+        }
+    }
+    features
+}
+
+impl TermFeatures {
+    /// The features of an interior this crate cannot walk: assume both.
+    fn opaque() -> TermFeatures {
+        TermFeatures {
+            atoms: true,
+            floats: true,
+        }
+    }
+}
+
+/// Whether `term` is an external pid/port/ref — a term whose image carries the `node`
+/// atom (so it is a leaf for floats, but not for atoms).
+fn is_external_id(term: Eterm) -> bool {
+    access::is_external_pid(term) || access::is_external_port(term) || access::is_external_ref(term)
+}
+
+/// Whether `term` is a term that can carry neither an atom nor a float.
+fn is_feature_free_leaf(term: Eterm) -> bool {
+    access::is_small(term)
+        || access::is_nil(term)
+        || access::is_big(term)
+        || access::is_bitstring(term)
+        || access::is_internal_pid(term)
+        || access::is_internal_port(term)
+        || access::is_internal_ref(term)
+}
 /// `binary_to_term(Binary)` — trailing bytes are ignored.
 fn binary_to_term_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     decode_term_bif(ctx, args[0], false, false)
@@ -655,6 +915,12 @@ fn binary_to_term_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// Decodes an external term image (see the module docs for the atom-index
 /// coupling this relies on).
 ///
+/// A top-level `COMPRESSED` (`80`) image — the form `term_to_binary/2` with a
+/// `compressed` option produces — is unwrapped first, exactly as the oracle does
+/// (`external.c:1754-1816`); its `used` count is the whole image, since the wrapper's
+/// zlib stream is consumed to the end (trailing bytes after it are ignored, like the
+/// plain case).
+///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary, a
@@ -672,7 +938,14 @@ fn decode_term_bif(
     // the clone has the context's indices (the names are interned in order).
     let mut local = ctx.atoms().clone();
     let known = local.len();
-    let (term, position) = {
+    let (term, position) = if is_compressed_image(&data) {
+        // `beam_codec::decode_term` owns the wrapper handling (the 4-byte size check
+        // and the inner body decode) — its `decompress_wrapper` is private, so the
+        // wrapper is recognised here with the same two-byte test it uses.
+        let heap = ctx.heap();
+        let decoded = decode_term(&data, heap, &mut local)?;
+        (decoded, data.len())
+    } else {
         let heap = ctx.heap();
         let mut decoder = Decoder::new(&data)?;
         let decoded = decoder.decode(heap, &mut local)?;
@@ -703,6 +976,15 @@ fn decode_term_bif(
     }
 }
 
+/// Whether `bytes` is a top-level `COMPRESSED` image:
+/// `[131][COMPRESSED_EXT][size:4 BE][zlib stream]`.
+///
+/// Mirrors `beam_codec::decode`'s private `is_compressed_image` (its 6-byte minimum is
+/// the C check at `external.c:1754-1759`); `beam_codec::decode_term` validates the size
+/// field and the stream, so this test only selects the entry point.
+fn is_compressed_image(bytes: &[u8]) -> bool {
+    bytes.len() >= 6 && bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT
+}
 /// Registers the `erlang` binary/atom conversion and term (de)serialization BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "list_to_binary", 1, list_to_binary_1);
@@ -869,6 +1151,32 @@ mod tests {
     fn float_of(term: Eterm) -> f64 {
         assert!(access::is_float(term), "not a float");
         access::float_value(term)
+    }
+
+    /// Asserts `result` is the `unsupported_bif` raise (the capability-gap class).
+    fn assert_unsupported_bif(result: Result<Eterm>) {
+        match result {
+            Err(beam_common::BeamError::Raise(raise)) => assert_eq!(
+                raise.reason,
+                beam_common::ExitReason::atom("unsupported_bif"),
+                "the reason is the capability-gap atom"
+            ),
+            other => panic!("expected unsupported_bif, got {other:?}"),
+        }
+    }
+
+    /// The option list `[{Name, Value}]` for a `term_to_binary/2` call.
+    fn option_tuple(ctx: &mut BifContext<'_>, name: &str, value: Eterm) -> Eterm {
+        let pair = ctx
+            .tuple(&[ctx.atom(name).expect("seeded"), value])
+            .expect("fits");
+        ctx.list(&[pair]).expect("fits")
+    }
+
+    /// The option list `[compressed]`.
+    fn compressed_option(ctx: &mut BifContext<'_>) -> Eterm {
+        ctx.list(&[ctx.atom("compressed").expect("seeded")])
+            .expect("fits")
     }
 
     /// Asserts `result` is `badarg`.
@@ -1547,61 +1855,250 @@ mod tests {
                 assert_eq!(&text(term_to_binary_1(ctx, &[*term]).unwrap()), expected);
             }
 
-            // `{minor_version, 0|1|2}` is accepted (the tags stay at version 2 —
-            // documented deviation); `3` and an unknown option are `badarg`.
+            // Every accepted `{minor_version, N}` leaves an integer term unchanged; a
+            // version outside `0..=2` and an unknown option are `badarg`.
+            let seventeen = ctx.int(17).expect("fits");
             for version in [0i64, 1, 2] {
-                let option = ctx
-                    .tuple(&[ctx.atom("minor_version").expect("seeded"), ctx.int(version).expect("fits")])
-                    .expect("fits");
-                let options = ctx.list(&[option]).expect("fits");
-                let args = [ctx.int(17).expect("fits"), options];
+                let options = option_tuple(ctx, "minor_version", ctx.int(version).expect("fits"));
                 assert_eq!(
-                    text(term_to_binary_2(ctx, &args).unwrap()),
+                    text(term_to_binary_2(ctx, &[seventeen, options]).unwrap()),
                     vec![131, 97, 17],
                     "{{minor_version, {version}}}"
                 );
             }
-            let bad_version = ctx
-                .tuple(&[
-                    ctx.atom("minor_version").expect("seeded"),
+            for version in [-1i64, 3] {
+                let options = option_tuple(ctx, "minor_version", ctx.int(version).expect("fits"));
+                assert_badarg(term_to_binary_2(ctx, &[seventeen, options]));
+            }
+            // The version must be a *small* integer (`is_small`, `external.c:1502`).
+            let one_point_zero = ctx.make_float(1.0).expect("fits");
+            let float_version = option_tuple(ctx, "minor_version", one_point_zero);
+            assert_badarg(term_to_binary_2(ctx, &[seventeen, float_version]));
+
+            let unknown = ctx.list(&[ctx.atom("a").expect("seeded")]).expect("fits");
+            assert_badarg(term_to_binary_2(ctx, &[seventeen, unknown]));
+            // A non-list (including a bare atom) or an improper list is `badarg`.
+            let not_a_list = ctx.atom("a").expect("seeded");
+            assert_badarg(term_to_binary_2(ctx, &[seventeen, not_a_list]));
+            let improper = ctx
+                .cons(ctx.atom("compressed").expect("seeded"), seventeen)
+                .expect("fits");
+            assert_badarg(term_to_binary_2(ctx, &[seventeen, improper]));
+
+            // `{compressed, Level}` requires `0 =< Level =< 9` (`Level < 10`).
+            for level in [-1i64, 10] {
+                let options = option_tuple(ctx, "compressed", ctx.int(level).expect("fits"));
+                assert_badarg(term_to_binary_2(ctx, &[seventeen, options]));
+            }
+            let six_point_zero = ctx.make_float(6.0).expect("fits");
+            let float_level = option_tuple(ctx, "compressed", six_point_zero);
+            assert_badarg(term_to_binary_2(ctx, &[seventeen, float_level]));
+        });
+    }
+
+    #[test]
+    fn term_to_binary_minor_version_selects_the_atom_encoding() {
+        with_ctx(|ctx| {
+            let one = ctx.int(1).expect("fits");
+            // `#{a => 1}` — the map the differential `wire/minor_version_2_map` case pins.
+            let key = ctx.atom("a").expect("seeded");
+            let map = access::make_flatmap(ctx.heap(), &[(key, one)]).expect("fits");
+            let hello = ctx.atom("hello").expect("seeded");
+
+            // The default (minor version 2) and `{minor_version, 2}`: UTF-8 atom tags.
+            let utf8_map: &[u8] = &[131, 116, 0, 0, 0, 1, 119, 1, 97, 97, 1];
+            let utf8_hello: &[u8] = &[131, 119, 5, 104, 101, 108, 108, 111];
+            assert_eq!(text(term_to_binary_1(ctx, &[map]).unwrap()), utf8_map);
+            let mv2 = option_tuple(ctx, "minor_version", ctx.int(2).expect("fits"));
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[map, mv2]).unwrap()),
+                utf8_map
+            );
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[hello, mv2]).unwrap()),
+                utf8_hello
+            );
+
+            // Minor versions 1 and 0 clear `DFLAG_UTF8_ATOMS`: the oracle writes
+            // `ATOM_EXT` (`100`) — `term_to_binary(#{a => 1}, [{minor_version, N}])` is
+            // `<<131,116,0,0,0,1,100,0,1,97,97,1>>`. `beam_codec`'s `AtomEncoding::Latin1`
+            // is the *distribution* flavour (`DFLAG_SMALL_ATOM_TAGS` negotiated) and writes
+            // `SMALL_ATOM_EXT` (`115`) for a ≤255-byte name, so a term whose image would
+            // carry an atom reports `unsupported_bif` rather than silently mis-encoding it
+            // (the `beam_codec` handoff — see the module docs).
+            for version in [0i64, 1] {
+                let options = option_tuple(ctx, "minor_version", ctx.int(version).expect("fits"));
+                assert_unsupported_bif(term_to_binary_2(ctx, &[map, options]));
+                assert_unsupported_bif(term_to_binary_2(ctx, &[hello, options]));
+            }
+
+            // Minor version 1 keeps `NEW_FLOAT_EXT` and carries no atom, so a bare float
+            // is byte-identical to the oracle (`term_to_binary(1.5, [{minor_version,1}])`).
+            let mv1 = option_tuple(ctx, "minor_version", ctx.int(1).expect("fits"));
+            let float = ctx.make_float(1.5).expect("fits");
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[float, mv1]).unwrap()),
+                vec![131, 70, 63, 248, 0, 0, 0, 0, 0, 0]
+            );
+        });
+    }
+
+    #[test]
+    fn term_to_binary_minor_version_0_refuses_a_legacy_float_image() {
+        with_ctx(|ctx| {
+            let mv0 = option_tuple(ctx, "minor_version", ctx.int(0).expect("fits"));
+            let float = ctx.make_float(1.5).expect("fits");
+            // Minor version 0 clears `DFLAG_NEW_FLOATS`, so the oracle writes the legacy
+            // `FLOAT_EXT` (99): `term_to_binary(1.5, [{minor_version,0}])` is
+            // `<<131,99,"1.50000000000000000000e+00",0,0,0,0,0>>`. The codec cannot emit
+            // that form, so the option reports the gap rather than `NEW_FLOAT_EXT`.
+            assert_unsupported_bif(term_to_binary_2(ctx, &[float, mv0]));
+
+            // A float nested anywhere is enough — the scan walks containers.
+            let one = ctx.int(1).expect("fits");
+            let tuple = ctx.tuple(&[one, float]).expect("fits");
+            let list = ctx.list(&[float]).expect("fits");
+            assert_unsupported_bif(term_to_binary_2(ctx, &[tuple, mv0]));
+            assert_unsupported_bif(term_to_binary_2(ctx, &[list, mv0]));
+            let map =
+                access::make_flatmap(ctx.heap(), &[(one, float)]).expect("representable");
+            assert_unsupported_bif(term_to_binary_2(ctx, &[map, mv0]));
+
+            // A fun's environment is opaque to this crate (`fun_env` is `unsafe`), so a
+            // fun reports *both* features and is refused rather than guessed at.
+            let module = atom_val(ctx.atom("hello").expect("seeded"));
+            let function = atom_val(ctx.atom("a").expect("seeded"));
+            let fun = beam_codec::term::make_fun_external(ctx.heap(), 1, module, function)
+                .expect("fits");
+            assert_eq!(
+                scan_features(fun),
+                TermFeatures {
+                    atoms: true,
+                    floats: true
+                }
+            );
+            assert_eq!(
+                scan_features(float),
+                TermFeatures {
+                    atoms: false,
+                    floats: true
+                }
+            );
+            assert_eq!(
+                scan_features(tuple),
+                TermFeatures {
+                    atoms: false,
+                    floats: true
+                }
+            );
+            assert_eq!(
+                scan_features(ctx.list(&[one, ctx.atom("a").expect("seeded")]).expect("fits")),
+                TermFeatures {
+                    atoms: true,
+                    floats: false
+                }
+            );
+            assert_eq!(
+                scan_features(ctx.list(&[one, ctx.int(2).expect("fits")]).expect("fits")),
+                TermFeatures {
+                    atoms: false,
+                    floats: false
+                }
+            );
+        });
+        // A term with no float at all is accepted at minor version 0 (byte-identical
+        // to the oracle — see `term_to_binary_minor_version_selects_the_atom_encoding`).
+        with_ctx(|ctx| {
+            let mv0 = option_tuple(ctx, "minor_version", ctx.int(0).expect("fits"));
+            let list = ctx
+                .list(&[
+                    ctx.int(1).expect("fits"),
+                    ctx.int(2).expect("fits"),
                     ctx.int(3).expect("fits"),
                 ])
                 .expect("fits");
-            let bad_options = ctx.list(&[bad_version]).expect("fits");
-            let seventeen = ctx.int(17).expect("fits");
-            assert_badarg(term_to_binary_2(ctx, &[seventeen, bad_options]));
-            let unknown = ctx.list(&[ctx.atom("a").expect("seeded")]).expect("fits");
-            assert_badarg(term_to_binary_2(ctx, &[seventeen, unknown]));
-            assert_badarg(term_to_binary_2(
-                ctx,
-                &[seventeen, ctx.atom("a").expect("seeded")],
-            ));
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[list, mv0]).unwrap()),
+                vec![131, 107, 0, 3, 1, 2, 3]
+            );
+        });
+    }
 
-            // `compressed` is recognised but unimplemented (documented gap).
-            let compressed = ctx.list(&[ctx.atom("compressed").expect("seeded")]).expect("fits");
-            match term_to_binary_2(ctx, &[seventeen, compressed]) {
-                Err(beam_common::BeamError::Raise(raise)) => assert_eq!(
-                    raise.reason,
-                    beam_common::ExitReason::atom("unsupported_bif")
-                ),
-                other => panic!("expected unsupported_bif, got {other:?}"),
-            }
-            let level = ctx
-                .tuple(&[
-                    ctx.atom("compressed").expect("seeded"),
-                    ctx.int(6).expect("fits"),
+    #[test]
+    fn term_to_binary_compressed_follows_the_oracles_revert_rule() {
+        with_ctx(|ctx| {
+            let list = ctx
+                .list(&[
+                    ctx.int(1).expect("fits"),
+                    ctx.int(2).expect("fits"),
+                    ctx.int(3).expect("fits"),
                 ])
                 .expect("fits");
-            let level = ctx.list(&[level]).expect("fits");
-            assert!(matches!(
-                term_to_binary_2(ctx, &[seventeen, level]),
-                Err(beam_common::BeamError::Raise(_))
-            ));
+            let plain = vec![131u8, 107, 0, 3, 1, 2, 3];
+            // A small body cannot pay for zlib's framing (`real_size - 5` budget), so the
+            // image stays uncompressed — the oracle-pinned
+            // `term_to_binary([1,2,3], [compressed])`.
+            let compressed = compressed_option(ctx);
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[list, compressed]).unwrap()),
+                plain
+            );
+            for level in [0i64, 1, 6, 9] {
+                let options = option_tuple(ctx, "compressed", ctx.int(level).expect("fits"));
+                assert_eq!(
+                    text(term_to_binary_2(ctx, &[list, options]).unwrap()),
+                    plain,
+                    "{{compressed, {level}}}"
+                );
+            }
+
+            // A large, highly repetitive body does compress: `[131][80][len:4 BE][zlib]`.
+            let hello = ctx.atom("hello").expect("seeded");
+            let mut big = beam_term::NIL;
+            for _ in 0..500 {
+                big = ctx.cons(hello, big).expect("fits");
+            }
+            let plain = text(term_to_binary_1(ctx, &[big]).unwrap());
+            assert_eq!(plain.len(), 3507, "the oracle's plain image for 500 `hello`s");
+            let compressed = compressed_option(ctx);
+            let image = text(term_to_binary_2(ctx, &[big, compressed]).unwrap());
+            assert_eq!(image[0], 131, "VERSION_MAGIC");
+            assert_eq!(image[1], 80, "COMPRESSED_EXT");
+            assert_eq!(
+                u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize,
+                plain.len() - 1,
+                "the size field is the body length (without the version byte)"
+            );
+            assert!(
+                image.len() < plain.len(),
+                "compression helped: {} vs {}",
+                image.len(),
+                plain.len()
+            );
+
+            // The compressed image round-trips to the very same term.
+            let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+            assert_eq!(text(term_to_binary_1(ctx, &[back]).unwrap()), plain);
+
+            // `{compressed, 9}` wraps a large body as well.
+            let level9 = option_tuple(ctx, "compressed", ctx.int(9).expect("fits"));
+            let image9 = text(term_to_binary_2(ctx, &[big, level9]).unwrap());
+            assert_eq!(image9[0], 131);
+            assert_eq!(image9[1], 80);
+            let back = binary_to_term_1(ctx, &[bin(&image9)]).unwrap();
+            assert_eq!(text(term_to_binary_1(ctx, &[back]).unwrap()), plain);
+
+            // Level 0 stores without compressing, so the wrapper does not pay off
+            // (`body.len() + overhead > body.len()`): the image reverts to plain.
+            let store = option_tuple(ctx, "compressed", ctx.int(0).expect("fits"));
+            assert_eq!(
+                text(term_to_binary_2(ctx, &[big, store]).unwrap()),
+                plain
+            );
         });
     }
 
     // -- binary_to_term ---------------------------------------------------
-
     #[test]
     fn binary_to_term_matches_the_oracle() {
         with_ctx(|ctx| {
