@@ -51,13 +51,16 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 
 /// The atoms the runtime's global atom table is seeded with at construction.
 ///
-/// Two groups:
+/// Three groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
 ///   and the boolean atoms (`unix`, `linux`, `win32`, `nt`, `true`, `false`);
 /// * a small **documented core set** covering the runtime's own vocabulary and the
 ///   signal machinery of `beam_process` (`ok`, `error`, `undefined`, `EXIT`, `DOWN`,
-///   `process`, `normal`, `kill`, `killed`), plus the module names of the boot surface.
+///   `process`, `normal`, `kill`, `killed`), plus the module names of the boot surface;
+/// * the atoms the runtime-native `code:*` floor ([`crate::native`]) answers with —
+///   `preloaded`/`non_existing` (`code:which/1`, `code:all_loaded/0`) and `bad_name`
+///   (the `{error, bad_name}` of `code:lib_dir/1`).
 ///
 /// This is deliberately **not** the full `atom.names` ordering of the legacy emulator:
 /// positional atom indices for preloaded code are a documented Milestone-1 gap.
@@ -79,6 +82,10 @@ pub const CORE_ATOMS: &[&str] = &[
     "erl_prim_loader",
     "kernel",
     "stdlib",
+    // The runtime-native `code:*` floor (`native.rs`).
+    "preloaded",
+    "non_existing",
+    "bad_name",
     // `beam_process` signal vocabulary (`SignalAtoms::from_table`).
     "EXIT",
     "DOWN",
@@ -204,6 +211,10 @@ mod tests {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
         for name in ["EXIT", "DOWN", "normal", "kill", "killed", "process"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        // The runtime-native `code:*` floor's answer atoms.
+        for name in ["preloaded", "non_existing", "bad_name"] {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
     }

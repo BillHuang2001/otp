@@ -26,7 +26,7 @@
 //!
 //! [`CodeServer::find_file`] searches, in order: the `-pa` directories, the `-pz`
 //! directories (both as configured) and finally the **system** `ebin` directories
-//! (stdlib, kernel) resolved from the running Erlang installation at start-up.
+//! (stdlib, kernel and erts) resolved from the running Erlang installation at start-up.
 //!
 //! # Failure is loud
 //!
@@ -56,6 +56,9 @@ pub struct CodeServer {
     /// Loaded modules, by name — `Arc` so a caller can hold one while the server keeps
     /// loading others (`Module` is `!Send`/`!Sync`, so it is never shared across threads).
     modules: HashMap<String, Arc<Module>>,
+    /// The `.beam` file each cached module was loaded from (see
+    /// [`CodeServer::loaded_path`]); absent for a module supplied in memory.
+    module_paths: HashMap<String, PathBuf>,
     /// The code path: `-pa` dirs, then `-pz` dirs, then the system `ebin` dirs.
     paths: Vec<PathBuf>,
 }
@@ -70,6 +73,7 @@ impl CodeServer {
         CodeServer {
             atoms: AtomTable::new(),
             modules: HashMap::new(),
+            module_paths: HashMap::new(),
             paths: Vec::new(),
         }
     }
@@ -84,7 +88,8 @@ impl CodeServer {
         }
     }
 
-    /// Appends the **system** `ebin` directories (stdlib, then kernel) to the code path.
+    /// Appends the **system** `ebin` directories (stdlib, kernel and erts) to the code
+    /// path.
     ///
     /// The directories are resolved once per process (see [`system_ebins`]) from
     /// `$ERTS_STDLIB_DIR` or, failing that, from the system `erl`. A failure here is a
@@ -123,6 +128,58 @@ impl CodeServer {
             .iter()
             .map(|dir| dir.join(&file))
             .find(|candidate| candidate.is_file())
+    }
+
+    /// The `.beam` file `name` was loaded from, if it was loaded from a file.
+    ///
+    /// `None` for a module that has not been loaded, and for one supplied in memory
+    /// through [`CodeServer::load_bytes`] (which has no file).
+    pub fn loaded_path(&self, name: &str) -> Option<&Path> {
+        self.module_paths.get(name).map(PathBuf::as_path)
+    }
+
+    /// The system library root (`<lib>`) the code-path `ebin` directories live under.
+    ///
+    /// Derived from a code-path entry shaped `<lib>/<app>-<vsn>/ebin` — the shape
+    /// [`CodeServer::add_system_paths`] installs — so it is `None` until the system
+    /// directories have been added, and for a runtime that only has explicit
+    /// `-pa`/`-pz` directories.
+    pub fn lib_root(&self) -> Option<PathBuf> {
+        self.paths
+            .iter()
+            .filter(|path| is_ebin(path))
+            .find_map(|path| ebin_lib_root(path))
+    }
+
+    /// The application directory `<lib>/<app>-<vsn>` of the application `app`, if it is
+    /// installed.
+    ///
+    /// `app` is matched against the code path first (so the version actually in use
+    /// wins), then against the [`lib_root`](CodeServer::lib_root)'s siblings — the
+    /// latter covers an installed application that is not on the code path (e.g.
+    /// `crypto`).
+    pub fn app_dir(&self, app: &str) -> Option<PathBuf> {
+        let matches = |dir: &Path| {
+            dir.file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name == app || name.starts_with(&format!("{app}-")))
+        };
+        for path in self.paths.iter().filter(|path| is_ebin(path)) {
+            if let Some(dir) = path.parent() {
+                if matches(dir) && dir.is_dir() {
+                    return Some(dir.to_path_buf());
+                }
+            }
+        }
+        let root = self.lib_root()?;
+        let mut candidates: Vec<PathBuf> = std::fs::read_dir(&root)
+            .ok()?
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| matches(path) && path.join("ebin").is_dir())
+            .collect();
+        candidates.sort();
+        candidates.into_iter().next()
     }
 
     /// Whether `name` has been loaded (and cached) already.
@@ -183,7 +240,8 @@ impl CodeServer {
             .ok_or_else(|| error::message(format!("{} has no module name", path.display())))?
             .to_string();
         let module = Arc::new(module);
-        self.modules.insert(name, module.clone());
+        self.modules.insert(name.clone(), module.clone());
+        self.module_paths.insert(name, path.to_path_buf());
         Ok(module)
     }
 
@@ -257,7 +315,7 @@ impl Default for CodeServer {
 // Resolving the system code path (once per process)
 // ---------------------------------------------------------------------------
 
-/// The system `ebin` directories (stdlib, kernel), resolved **once** per process.
+/// The system `ebin` directories (stdlib, kernel, erts), resolved **once** per process.
 ///
 /// # Errors
 ///
@@ -274,26 +332,11 @@ fn system_ebins() -> Result<Vec<PathBuf>> {
 /// Resolves the system `ebin` directories from the environment or the system `erl`.
 fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
     if let Ok(dir) = env::var("ERTS_STDLIB_DIR") {
-        let dir = PathBuf::from(dir);
-        let ebin = app_ebin(&dir, "lists").ok_or_else(|| {
-            error::message(format!(
-                "$ERTS_STDLIB_DIR ({}) does not contain lists.beam (neither directly nor under ebin/)",
-                dir.display()
-            ))
-        })?;
-        let mut dirs = vec![ebin.clone()];
-        if let Some(kernel) = lib_root(&ebin).and_then(|root| find_app_ebin(&root, "kernel")) {
-            dirs.push(kernel);
-        }
-        return Ok(dirs);
+        return stdlib_dir_override(Path::new(&dir));
     }
 
     let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s~n~s~n\",[code:lib_dir(stdlib),code:lib_dir(kernel)]),halt().",
-        ])
+        .args(["-noshell", "-eval", &system_apps_eval()])
         .output()
         .map_err(|source| {
             error::message(format!(
@@ -319,22 +362,59 @@ fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
     let mut dirs = Vec::new();
     for (index, app_dir) in app_dirs.iter().enumerate() {
         let app_dir = PathBuf::from(app_dir);
-        match index {
+        let (app, module) = SYSTEM_APPS.get(index).copied().unwrap_or(("", ""));
+        match app_ebin(&app_dir, module) {
+            Some(ebin) => dirs.push(ebin),
             // stdlib must be usable, or nothing below it can be loaded.
-            0 => {
-                let ebin = app_ebin(&app_dir, "lists").ok_or_else(|| {
-                    error::message(format!(
-                        "the system stdlib ({}) does not contain lists.beam",
-                        app_dir.display()
-                    ))
-                })?;
-                dirs.push(ebin);
+            None if index == 0 => {
+                return Err(error::message(format!(
+                    "the system {app} ({}) does not contain {module}.beam",
+                    app_dir.display()
+                )));
             }
-            // kernel is best-effort: `<app dir>/ebin` when it holds kernel.beam.
-            _ => {
-                if let Some(ebin) = app_ebin(&app_dir, "kernel") {
-                    dirs.push(ebin);
-                }
+            // kernel and erts are best-effort: `<app dir>/ebin` when it holds the
+            // probe module.
+            None => {}
+        }
+    }
+    Ok(dirs)
+}
+
+/// The system applications whose `ebin` directories make up the default code path, in
+/// the order [`system_apps_eval`] asks the system `erl` for them, each paired with a
+/// module the directory must contain (the resolver's proof that it is the real thing).
+///
+/// `erts` holds the **preloaded** modules' `.beam` files (`init`, `persistent_term`,
+/// `prim_*`, …): they ship in `<lib>/erts-<vsn>/ebin`, not in stdlib or kernel, so the
+/// code path must include that directory for the loader to resolve them.
+const SYSTEM_APPS: &[(&str, &str)] = &[("stdlib", "lists"), ("kernel", "kernel"), ("erts", "init")];
+
+/// The `erl -eval` program that prints the [`SYSTEM_APPS`] directories, one per line.
+fn system_apps_eval() -> String {
+    let control: String = SYSTEM_APPS.iter().map(|_| "~s~n").collect();
+    let args: Vec<String> = SYSTEM_APPS
+        .iter()
+        .map(|(app, _)| format!("code:lib_dir({app})"))
+        .collect();
+    format!("io:format(\"{control}\",[{}]),halt().", args.join(","))
+}
+
+/// The system `ebin` directories when `$ERTS_STDLIB_DIR` names the stdlib directory.
+///
+/// The stdlib directory is mandatory (it must hold `lists.beam`); the sibling `kernel`
+/// and `erts` directories are added when they can be found next to it.
+fn stdlib_dir_override(dir: &Path) -> Result<Vec<PathBuf>> {
+    let ebin = app_ebin(dir, "lists").ok_or_else(|| {
+        error::message(format!(
+            "$ERTS_STDLIB_DIR ({}) does not contain lists.beam (neither directly nor under ebin/)",
+            dir.display()
+        ))
+    })?;
+    let mut dirs = vec![ebin.clone()];
+    if let Some(root) = ebin_lib_root(&ebin) {
+        for (app, module) in SYSTEM_APPS.iter().skip(1) {
+            if let Some(sibling) = find_sibling_ebin(&root, app, module) {
+                dirs.push(sibling);
             }
         }
     }
@@ -344,6 +424,9 @@ fn resolve_system_ebins() -> Result<Vec<PathBuf>> {
 /// The `ebin` directory holding `<module>.beam`, given either the application
 /// directory or its `ebin` subdirectory.
 fn app_ebin(dir: &Path, module: &str) -> Option<PathBuf> {
+    if module.is_empty() {
+        return None;
+    }
     let file = format!("{module}.beam");
     if dir.join(&file).is_file() {
         return Some(dir.to_path_buf());
@@ -355,15 +438,21 @@ fn app_ebin(dir: &Path, module: &str) -> Option<PathBuf> {
     None
 }
 
+/// Whether `path` is shaped like an application's `ebin` directory.
+fn is_ebin(path: &Path) -> bool {
+    path.file_name().and_then(|name| name.to_str()) == Some("ebin")
+}
+
 /// The `<lib>` directory an `…/<lib>/<app>-<vsn>/ebin` path belongs to.
-fn lib_root(ebin: &Path) -> Option<PathBuf> {
+fn ebin_lib_root(ebin: &Path) -> Option<PathBuf> {
     // <lib>/<app>-<vsn>/ebin -> <lib>/<app>-<vsn> -> <lib>
     ebin.parent()?.parent().map(Path::to_path_buf)
 }
 
-/// The `ebin` directory of the `<app>-<vsn>` sibling of `lib_root`, if present.
-fn find_app_ebin(lib_root: &Path, app: &str) -> Option<PathBuf> {
-    let prefix = format!("{app}-");
+/// The `ebin` directory of the `<prefix>-<vsn>` directory under `lib_root` that holds
+/// `<module>.beam`, if any (the lexicographically first match).
+fn find_sibling_ebin(lib_root: &Path, prefix: &str, module: &str) -> Option<PathBuf> {
+    let prefix = format!("{prefix}-");
     let mut candidates: Vec<PathBuf> = std::fs::read_dir(lib_root)
         .ok()?
         .filter_map(|entry| entry.ok())
@@ -377,7 +466,7 @@ fn find_app_ebin(lib_root: &Path, app: &str) -> Option<PathBuf> {
     candidates.sort();
     candidates
         .iter()
-        .find_map(|candidate| app_ebin(candidate, app))
+        .find_map(|candidate| app_ebin(candidate, module))
 }
 
 #[cfg(test)]
@@ -484,5 +573,88 @@ mod tests {
         drop(first);
         drop(second);
         assert_eq!(server.loaded().len(), 1);
+    }
+
+    #[test]
+    fn the_system_apps_probe_asks_for_every_app_in_order() {
+        assert_eq!(
+            SYSTEM_APPS.iter().map(|(app, _)| *app).collect::<Vec<_>>(),
+            vec!["stdlib", "kernel", "erts"]
+        );
+        let probe = system_apps_eval();
+        for (app, _) in SYSTEM_APPS {
+            assert!(probe.contains(&format!("code:lib_dir({app})")), "{probe}");
+        }
+        // One `~s~n` per app, and the argument list has exactly as many entries.
+        assert_eq!(probe.matches("~s~n").count(), SYSTEM_APPS.len());
+        assert!(probe.starts_with("io:format(\"~s~n~s~n~s~n\",["));
+        assert!(probe.ends_with("]),halt()."));
+    }
+
+    #[test]
+    fn the_system_code_path_includes_the_erts_preloaded_modules() {
+        let Some(server) = system_server() else {
+            return;
+        };
+        // `init` and `persistent_term` are *preloaded* modules whose `.beam` files ship
+        // in `<lib>/erts-<vsn>/ebin`, so the code path must hold that directory.
+        for module in ["init", "persistent_term", "lists", "kernel"] {
+            let file = server
+                .find_file(module)
+                .unwrap_or_else(|| panic!("{module}.beam must be resolvable on the code path"));
+            assert!(
+                file.is_file(),
+                "{} is not a file",
+                file.display()
+            );
+        }
+    }
+
+    #[test]
+    fn loaded_path_records_the_source_file() {
+        let Some(mut server) = system_server() else {
+            return;
+        };
+        assert_eq!(server.loaded_path("lists"), None, "not loaded yet");
+        let path = server.find_file("lists").expect("lists.beam on the path");
+        server.load("lists").expect("lists loads");
+        assert_eq!(server.loaded_path("lists"), Some(path.as_path()));
+        // An in-memory load has no file.
+        let image = beam_loader::load_file(
+            concat!(env!("CARGO_MANIFEST_DIR"), "/../beam_loader/tests/fixtures/slice.beam"),
+        )
+        .expect("the slice fixture loads");
+        let name = image.atom_name(image.name).expect("a module name").to_string();
+        assert_eq!(name, "slice");
+        assert_eq!(server.loaded_path(&name), None);
+    }
+
+    #[test]
+    fn the_lib_root_and_app_dirs_come_from_the_resolved_paths() {
+        let Some(server) = system_server() else {
+            return;
+        };
+        let root = server.lib_root().expect("the system code path has a <lib> root");
+        assert!(root.is_dir(), "{} is a directory", root.display());
+        // The probed applications are found by name, without the version suffix.
+        for app in ["stdlib", "kernel", "erts"] {
+            let dir = server
+                .app_dir(app)
+                .unwrap_or_else(|| panic!("{app} must be installed under {}", root.display()));
+            assert!(dir.join("ebin").is_dir(), "{} has an ebin", dir.display());
+        }
+        // An application that is not installed is honestly absent.
+        assert_eq!(server.app_dir("definitely_not_an_otp_app"), None);
+    }
+
+    #[test]
+    fn a_lib_root_is_derived_only_from_an_ebin_entry() {
+        let mut server = CodeServer::new();
+        server.add_path("/a");
+        assert_eq!(server.lib_root(), None, "/a is not an `ebin` directory");
+        server.add_path("/libs/otp-1.0/ebin");
+        assert_eq!(server.lib_root(), Some(PathBuf::from("/libs")));
+        // Nothing under the (non-existent) root is found, honestly.
+        assert_eq!(server.app_dir("otp"), None);
     }
 }
