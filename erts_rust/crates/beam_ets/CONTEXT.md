@@ -216,10 +216,14 @@ impl Table {
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
   Option<OwnerId>, named_table: bool, compressed: bool, write_concurrency: bool, read_concurrency: bool }`;
-  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — a heap-free subset of the
-  `{Key, Value}` pairs (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/
-  `named_table`/…). The *observable* `ets:info/1` proplist is built by the sibling `beam_bifs`
-  bridge, not by this method; see Known Issues for the omitted fields.
+  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — the heap-free `{Key, Value}`
+  pairs of the oracle's **15** `ets:info/1` fields, in the oracle's order (`id`,
+  `decentralized_counters`, `read_concurrency`, `write_concurrency`, `compressed`, `memory`, `owner`,
+  `heir`, `name`, `size`, `node`, `named_table`, `type`, `keypos`, `protection`). `heir`/`node` are the
+  runtime-shape constants `none`/`nonode@nohost`; `decentralized_counters` follows the oracle's CATREE
+  rule (`ordered_set && write_concurrency`); `owner` (a pid in the oracle) renders as `undefined` and
+  `id` as a small integer (see Known Issues). The *observable* `ets:info/1` proplist is built by the
+  sibling `beam_bifs` bridge, not by this method — see the Known Issues handoff.
 
 ### `error.rs` — failure constructors
 - `pub(crate) fn badarg() -> BeamError` — the `badarg` failures (bad object/`keypos`, absent element,
@@ -298,6 +302,14 @@ impl Table {
   when `access == Private`, matching the oracle (`is_fine_locked && !DB_PRIVATE` in `erl_db.c`);
   `compressed` is unaffected. Normalizing in the getters keeps `TableOptions`, `TableInfo` and the
   bridge in agreement and makes the rule order-independent (access may be set before or after).
+- **`ets:info/1` mirrors the oracle's 15 fields in the oracle's order.** `TableInfo::entries` emits
+  `id, decentralized_counters, read_concurrency, write_concurrency, compressed, memory, owner, heir,
+  name, size, node, named_table, type, keypos, protection` — the system `erl`'s exact proplist order
+  (the reverse of the C `fields[]` array in `erl_db.c:4406`). `heir`/`node` are the runtime-shape
+  constants `none`/`nonode@nohost`; `decentralized_counters` is `ordered_set && write_concurrency` (the
+  oracle's CATREE rule — the explicit `{decentralized_counters, Bool}` creation option is unsupported).
+  No field was added to the public `TableInfo` struct; the runtime-shape fields are computed in
+  `entries`.
 - **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
   mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
   unchanged, as the oracle does.
@@ -310,11 +322,12 @@ impl Table {
   compile/execute, info. 91 unit tests.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
-  duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs`, `ets_nav.rs` (incl. the
-  order-independent hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 60 ETS tests + 18 select
+  duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
+  `entries_emits_the_oracle_field_set_in_order`), `ets_nav.rs` (incl. the order-independent
+  hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 61 ETS tests + 18 select
   tests.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 76 cases
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 77 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
@@ -322,10 +335,10 @@ impl Table {
   `{keypos,2}`, ordered navigation, `update_counter/3,4` + `update_element`, `take`/`lookup_element`,
   the select/match family with guards, malformed specs, >10 000-key tables, and an `info`/option
   group (name vs `named_table`, the `ets:info/2` option fields incl. the `private` concurrency
-  flags and unknown-key `badarg`, the multi-kind `lookup_element` list, and atomic `insert_list`).
-  `KNOWN_DIVERGENCES`
-  is empty. Without `erl` the live-oracle test skips; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into
-  a failure (use it in CI).
+  flags and unknown-key `badarg`, the fixed `heir`/`node`/`decentralized_counters` fields, the
+  multi-kind `lookup_element` list, and atomic `insert_list`). `KNOWN_DIVERGENCES` is empty. Without
+  `erl` the live-oracle test skips; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure (use it
+  in CI).
 - **Gates (GREEN required):**
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` and
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`.
@@ -335,10 +348,13 @@ impl Table {
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
-- **`ets:info/1` field set is a subset.** `TableInfo::entries` emits 12 of the oracle's 15 fields —
-  it omits `heir`, `node` and `decentralized_counters`, and renders `owner` as `undefined` and `id`
-  as a small integer (M1 has no pid/node/ref terms). The observable `ets:info/1` proplist is produced
-  by the sibling `beam_bifs` bridge; `entries` is a heap-free convenience used by tests.
+- **`ets:info/1` `owner` is `undefined` and `id` is a small integer.** `TableInfo::entries` emits the
+  oracle's full 15-field order, but `owner` — a pid in the oracle — has no term representation at this
+  stage, so it renders as the atom `undefined`, and `id` renders as a small integer rather than a ref.
+  **Handoff:** the *observable* `ets:info/1` proplist is produced by the sibling `beam_bifs` bridge
+  (`src/ets.rs`, its own `INFO_ITEMS` + `info_field`), which still emits the older 12-field subset in a
+  different order; it must adopt this completed `entries` (or extend `INFO_ITEMS`/`info_field` to the
+  15-field oracle set and order). This crate does not own `beam_bifs`.
 - **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
   `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*
   there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
@@ -348,7 +364,8 @@ impl Table {
   `select/3` + `select_reverse/*`, `match/3`, `match_object/3` (limited), `foldl`/`foldr`,
   `select_replace/2`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`, `table/1,2`, `slot/2`,
   `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1` do **not** exist in
-  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
+  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).
+- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
   crate holds no global state, so it must not duplicate that registry).
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
@@ -378,7 +395,7 @@ impl Table {
 - `src/select/pattern.rs` → head patterns (`Pattern`)
 - `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`)
 - `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`) + `BodyKind`
-- `src/info.rs` → `TableInfo` + `entries` (the `ets:info` pairs)
+- `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update)
