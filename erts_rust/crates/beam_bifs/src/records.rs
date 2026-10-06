@@ -560,14 +560,23 @@ mod tests {
                 "badrecord",
                 &[not_a_record],
             );
-            // A bare immediate is likewise rejected (`get_module(7)` => badarg;
-            // the introspection pair => `{badrecord,7}`).
-            assert!(matches!(get_module(ctx, &[make_small(7)]), Err(BeamError::BadArg)));
+            // A bare immediate is likewise rejected.
+            // Oracle: records:get_module(5) => error:badarg; records:get_field_names(5)
+            // / records:is_exported(5) => error:{badrecord,5}.
+            //   erl -noshell -eval 'try records:get_field_names(5) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badrecord,5}
+            assert!(matches!(get_module(ctx, &[make_small(5)]), Err(BeamError::BadArg)));
             assert_structured(
-                get_field_names(ctx, &[make_small(7)]),
+                get_field_names(ctx, &[make_small(5)]),
                 ctx,
                 "badrecord",
-                &[make_small(7)],
+                &[make_small(5)],
+            );
+            assert_structured(
+                is_exported(ctx, &[make_small(5)]),
+                ctx,
+                "badrecord",
+                &[make_small(5)],
             );
         });
     }
