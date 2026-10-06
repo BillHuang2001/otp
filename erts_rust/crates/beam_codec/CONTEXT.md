@@ -534,7 +534,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/reader.rs` → `Reader<'a>`, the bounds-checked BE cursor (safe)
 - `src/writer.rs` → `Writer`, the growable byte sink (safe); crate-internal `patch_u32be` (the
   `NEW_FUN_EXT` size-field patch)
-- `src/atom_cache.rs` → `AtomCache` (2048-slot distribution atom cache)
+- `src/atom_cache.rs` → `AtomCache` (read, 2048-slot distribution atom cache) + the `AtomCacheWriter`
+  hook trait (`intern`) `beam_dist` implements for outbound caching
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
 - `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
   `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`; the private
