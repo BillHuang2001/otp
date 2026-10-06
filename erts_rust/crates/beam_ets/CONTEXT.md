@@ -43,7 +43,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `set_access`, `set_named(bool)`, `set_name(Atom)`, `set_compressed(bool)`,
   `set_write_concurrency(bool)`, `set_read_concurrency(bool)`; getters `kind()/keypos()/access()/
   is_named()/name() -> Option<Atom>/is_compressed()/write_concurrency()/read_concurrency()/
-  concurrency() -> Concurrency`; `impl Default`.
+  concurrency() -> Concurrency`; `impl Default`. `set_name` records the registered name **only** —
+  it does not set the `named_table` flag (that is `set_named`), mirroring the oracle where
+  `ets:new(myanon, [])` reports `name => myanon` but `named_table => false`.
 - `pub fn can_read(access: Access, owner: Option<OwnerId>, requester: Option<OwnerId>) -> bool` and
   `pub fn can_write(...) -> bool` — the access matrix (`requester == owner` ⇒ everything).
 
