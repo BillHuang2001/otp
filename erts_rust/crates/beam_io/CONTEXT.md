@@ -508,6 +508,9 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A (the two clean seams) and §H (Stage 5).
 - `../beam_abi/CONTEXT.md` → the `ErlDrvEntry`/`ErlDrvApi` layouts the C-ABI bridge will target.
 - `../beam_process/CONTEXT.md` → `PortTable`/`PortId`, `Scheduler`/`ProcessTable` and the scheduler that will drive ports.
-- Owed upstream (repo-root owned, outside this node): a `../../CHANGE.md` entry for the port-task model +
-  `PortNotification` seam + `port_command`/`port_control` surface, the line/phase/`efile` driver additions, and the
-  `DriverRegistry` `"efile"` registration.
+- Owed upstream (repo-root owned, outside this node): `../../CHANGE.md` entries for the port-task model +
+  `PortNotification` seam + `port_command`/`port_control` surface; the line/phase/`efile` driver additions and the
+  `DriverRegistry` `"efile"` registration; the poller `libc::poll(2)` regular-file fallback + the `FdDriver` EOF
+  de-registration; the errno→atom failed-spawn raise (`error::errno_atom`/`spawn_failure`); the child-stderr discard
+  and the duplex `{fd, N}` adoption; the two new defaulted driver seams (`Driver::next_timeout` /
+  `Driver::port_exit` + `PortExitReason`); and the `"tcp_inet"` driver registration.
