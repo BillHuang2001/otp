@@ -10,7 +10,7 @@
 %% derived from the same system `erl` oracle.
 -module(bscreate).
 
--export([f16/1, f16le/1, f32/1, f32le/1, f64/1, f64le/1, f8/1,
+-export([f16/1, f16le/1, f32/1, f32le/1, f64/1, f64le/1, f0/1, f8/1,
          u8/1, u16/1, u16le/1, u32/1]).
 
 %% Float segments: 16/32/64-bit IEEE-754, big- and little-endian.
@@ -20,6 +20,10 @@ f32(F) -> <<F:32/float>>.
 f32le(F) -> <<F:32/float-little>>.
 f64(F) -> <<F:64/float>>.
 f64le(F) -> <<F:64/float-little>>.
+%% A zero-bit float field: `erlc` emits the segment with a "bad float bit size"
+%% warning (the size operand is the integer 0, unit 1) and the construction fails
+%% at run time with `badarg` -- `erts_bs_put_float` accepts only 16/32/64 bits.
+f0(F) -> <<F:0/float>>.
 %% An 8-bit float field is not a valid float size; the compiler emits the segment
 %% with a "bad float bit size" warning and the construction fails at run time.
 f8(F) -> <<F:8/float>>.
