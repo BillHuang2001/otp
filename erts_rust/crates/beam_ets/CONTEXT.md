@@ -97,7 +97,7 @@ impl Table {
     // writes (object = the whole tuple; key derived from keypos)
     pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
     pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool>; // false if key exists
-    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>;
+    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>; // ATOMIC: validates the whole list first
     pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()>;          // ets:delete/2 (by key)
     pub fn delete_object(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
     pub fn delete_all_objects(&mut self);
