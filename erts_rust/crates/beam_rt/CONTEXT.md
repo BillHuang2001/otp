@@ -318,13 +318,20 @@ behaviour must not change** — it keeps the currently-agreeing cases green.
 ### `erlang`-namespace fallback and the known-unimplemented list
 `RuntimeContext::call_bif` consults the floor, then the `beam_bifs` registry, and only then falls back
 to a diagnostic for the `erlang` namespace. That fallback first checks
-`error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS` (`error::is_known_unimplemented_bif`): a **known** OTP `erlang`
-BIF this runtime has not implemented raises the capability-gap `unsupported: erlang:X/Y …` (exit 3),
-never the plain `'erlang:X/Y is not a BIF'` a typo gets. The list is **curated** and holds only names
-`beam_bifs`' `erlang` registry does **not** provide (a registered name would be dead — the registry is
-dispatched first); a genuinely unknown name still falls through to `error::unknown_bif`. `error::undef()`
-is the sibling helper for a call that names a function the release does not have (`code:is_sticky/2`),
-raising the bare `error:undef` the oracle does.
+`error::is_known_unimplemented_bif(&registry, function, arity)`: a **known** OTP `erlang` BIF this
+runtime has not implemented raises the capability-gap `unsupported: erlang:X/Y …` (exit 3), never the
+plain `'erlang:X/Y is not a BIF'` a typo gets; a genuinely unknown name still falls through to
+`error::unknown_bif`. `error::undef()` is the sibling helper for a call that names a function the
+release does not have (`code:is_sticky/2`), raising the bare `error:undef` the oracle does.
+
+The **effective** gap set is the curated static list
+(`error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`, `error::listed_as_unimplemented`) **intersected with what the
+live registry does not own** — computed at use time, not baked in. So a later `beam_bifs` change that
+registers a name the list still carries can never shadow the registry or turn a served BIF into an
+`unsupported` gap (e.g. `erlang:phash/2` and `erlang:phash2/1,2` are registered by `beam_bifs` and are
+therefore **not** classified here). A registered name left in the static list is dead weight, not a
+hazard; the drift guard is
+`error::tests::the_effective_gap_set_never_shadows_the_registry`.
 
 ## CLI subset (contract A.6 — the *exact* supported surface; anything else is *unsupported*, exit 3)
 | Switch | Meaning in `beam_rt` |
