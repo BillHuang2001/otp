@@ -15,25 +15,31 @@
 //! ```
 //!
 //! * `ErlHeapBits.thing_word` is `_make_header(heap_bits_size(bits) - 1,
-//!   HEAP_BITS_SUBTAG)`, i.e. `HEAP_BITS_SUBTAG` after masking — the M1 engine only
-//!   ever *builds* heap bitstrings (off-heap ref-counted binaries are a documented
-//!   gap), so any other bitstring header is rejected here rather than guessed at.
+//!   HEAP_BITS_SUBTAG)`, i.e. `HEAP_BITS_SUBTAG` after masking.
 //! * `ErlSubBits` is the match-context form: word 2 is the current **read
 //!   position** in bits and word 3 is the subject size in bits, so `end - start`
 //!   is exactly `bitstring_size/1` for a context (`erl_bits.h:52-56`). The engine
 //!   keeps `base_flags` at 0 (the C `ERL_SUB_BITS_FLAG_MUTABLE` bit only gates the
 //!   native match-context reuse path, which the interpreter reproduces by re-reading
 //!   the term each opcode instead).
+//! * An `ErlSubBits` whose `orig` is a boxed `BinRef` is a **refc binary** — the
+//!   off-heap form of a binary bigger than `ERL_ONHEAP_BINARY_LIMIT` bytes
+//!   ([`beam_term::refc`]). `heap_bits` accepts it as a readable subject (its
+//!   base/size come from the frozen `ErlSubBits`), which is what lets a
+//!   `bs_create_bin` `append` seed itself from a previously built refc binary.
 //!
-//! `orig` is the subject term (an on-heap byte binary), kept so the context stays
-//! self-contained and its byte slice can be re-derived at every opcode.
+//! `orig` is the subject term, kept so the context stays self-contained and its
+//! byte slice can be re-derived at every opcode.
 #![allow(unsafe_code)]
 
 use beam_common::Result;
-use beam_term::{boxed_val, Eterm, ERL_SUB_BITS_SIZE, HEADER_BIN_REF, HEADER_SUB_BITS};
+use beam_term::{
+    boxed_val, Eterm, ERL_SUB_BITS_SIZE, HEADER_BIN_REF, HEADER_SUB_BITS,
+};
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::machine::Machine;
 
 /// `ERL_ONHEAP_BINARY_LIMIT` (`erl_bits.h:167`): the largest byte count a hardware
 /// *heap* binary holds; a larger result needs the off-heap ref-counted binary this
@@ -46,12 +52,19 @@ const WORD_BYTES: usize = core::mem::size_of::<Eterm>();
 /// The two fixed head words of an `ErlHeapBits` (`thing_word`, `size`).
 const HEAP_BITS_HEAD_WORDS: usize = 2;
 
-/// The data pointer and **bit** size of an on-heap bitstring term.
+/// The data pointer and **bit** size of an on-heap or refc bitstring term.
 ///
-/// Returns `None` for anything that is not a heap bitstring: a non-boxed term, a
-/// sub-bitstring/match context ([`HEADER_SUB_BITS`]) or an off-heap binary
+/// Returns `None` for anything that is not a readable bitstring subject: a
+/// non-boxed term, an engine match context ([`HEADER_SUB_BITS`] whose `orig` is not
+/// a `BinRef`, i.e. the term [`make_ctx`] builds) or a bare off-heap binary
 /// reference ([`HEADER_BIN_REF`]). Callers turn `None` into their own failure
 /// (a `bs_start_match3` match failure, or a typed `unsupported`).
+///
+/// A **refc binary** — the off-heap form `beam_term::refc` builds for a result
+/// larger than [`ERL_ONHEAP_BINARY_LIMIT`] bytes — *is* accepted: its base and size
+/// come from the frozen `ErlSubBits` ([`beam_term::bitstring_parts`]), so the rest
+/// of the family (which only ever sees a `(ptr, bits)` pair plus
+/// [`subject_bytes`]) reads it exactly like a heap binary.
 pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
     // SAFETY: `is_bitstring` checks `is_boxed` before it dereferences the header.
     if !unsafe { beam_term::is_bitstring(t) } {
@@ -61,7 +74,29 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
     // SAFETY: `is_bitstring` established that `t` is a live bitstring block, so
     // word 0 is its header.
     let hdr = unsafe { *p };
-    if hdr == HEADER_SUB_BITS || hdr == HEADER_BIN_REF {
+    if hdr == HEADER_SUB_BITS {
+        // SAFETY: `t` is a live bitstring whose header is `ErlSubBits`, so its
+        // `orig` slot (word 4) is a live term.
+        if !unsafe { beam_term::refc::is_refc_binary(t) } {
+            // An engine match context (or a non-refc sub-bitstring): not a
+            // readable subject here.
+            return None;
+        }
+        // SAFETY: `t` is a live refc-binary bitstring (an `ErlSubBits` over a
+        // `BinRef`), so `bitstring_parts` recovers its frozen base/offset/size.
+        let (base, start, size) = unsafe { beam_term::bitstring_parts(t) };
+        if start % 8 != 0 {
+            // The engine only ever builds byte-aligned refc binaries; a bit-offset
+            // window would need the bit-level reader this `(ptr, bits)` pair cannot
+            // express, so refuse rather than read the wrong bytes.
+            return None;
+        }
+        // SAFETY: `base` points at the byte holding bit 0 of the payload, so the
+        // byte holding the window's first bit is `base + start / 8`; the window
+        // covers `size` bits from there (the caller keeps the payload alive).
+        return Some((unsafe { base.add(start / 8) }, size));
+    }
+    if hdr == HEADER_BIN_REF {
         return None;
     }
     // SAFETY: an `ErlHeapBits` is `[thing_word, size, data…]`; word 1 is the bit
@@ -71,27 +106,28 @@ pub(super) fn heap_bits(t: Eterm) -> Option<(*const u8, usize)> {
     let data = unsafe { p.add(HEAP_BITS_HEAD_WORDS).cast::<u8>() };
     Some((data as *const u8, bits))
 }
-
-/// The byte payload of an on-heap bitstring term: `ceil(bits / 8)` bytes.
+/// The byte payload of a bitstring **subject** term: `ceil(bits / 8)` bytes.
 ///
-/// A non-heap-bitstring subject (a match context, an off-heap reference, a
-/// non-bitstring) is the documented M1 gap and yields
-/// [`crate::error::unsupported`]. The returned slice borrows the subject's
-/// storage, so the caller must keep the owning heap alive and unmoved for as long
-/// as it is used (the [`ExecutionContext`] ownership contract).
+/// A subject that is not a readable bitstring (a match context, a non-bitstring) is
+/// the documented M1 gap and yields [`crate::error::unsupported`]. The returned
+/// slice borrows the subject's storage, so the caller must keep the owning heap (or
+/// off-heap payload) alive and unmoved for as long as it is used (the
+/// [`ExecutionContext`] ownership contract; an off-heap payload is held by the
+/// [`Machine`] that built it).
 pub(super) fn subject_bytes<'a>(t: Eterm) -> Result<&'a [u8]> {
     let (ptr, bits) = heap_bits(t)
-        .ok_or_else(|| error::unsupported("bitstring: subject is not an on-heap binary"))?;
+        .ok_or_else(|| error::unsupported("bitstring: subject is not a readable binary"))?;
     let num_bytes = bits.div_ceil(8);
     if num_bytes == 0 {
         return Ok(&[]);
     }
-    // SAFETY: a live heap-bits block owns `2 + ceil(num_bytes / word_bytes)` words,
-    // so the `num_bytes` data bytes starting at word 2 are in bounds and readable;
-    // the caller keeps the owning heap alive and unmoved for `'a`.
+    // SAFETY: a live subject covers `ceil(num_bytes / word_bytes)` words' worth of
+    // storage from `ptr` (a heap-bits block's data region at word 2, or the
+    // byte-aligned window of an off-heap payload), so the `num_bytes` data bytes
+    // starting there are in bounds and readable; the caller keeps that storage alive
+    // and unmoved for `'a`.
     Ok(unsafe { core::slice::from_raw_parts(ptr, num_bytes) })
 }
-
 /// The `(orig, start, end)` triple of an `ErlSubBits` match context.
 ///
 /// `None` when `t` is not a boxed `ErlSubBits` term (`erl_bits.h:60-82`).
@@ -232,4 +268,153 @@ pub(super) fn make_bits(
         }
     }
     Ok(beam_term::make_boxed(hp))
+}
+
+/// Build a bitstring of exactly `nbits` bits from the leading bits of `bytes`,
+/// choosing the representation the frozen limits prescribe.
+///
+/// `<= ERL_ONHEAP_BINARY_LIMIT` bytes become an on-heap `ErlHeapBits`
+/// ([`make_bits`]); a larger result becomes an **off-heap refc binary** — the
+/// 8-word `[BinRef][ErlSubBits]` pair of `beam_term::refc` whose `BinRef.val` word
+/// points at a fresh ref-counted payload allocated through `machine`
+/// ([`Machine::alloc_refc_binary`]). That is exactly the C threshold
+/// (`bs_instrs.tab:562-566` picks `ERL_REFC_BITS_SIZE` above `ERL_ONHEAP_BITS_LIMIT`
+/// bits), so a `bs_create_bin` result of any size is representable.
+///
+/// `bytes` must hold at least `ceil(nbits / 8)` bytes; a longer slice is fine (the
+/// surplus is ignored) and the unused trailing bits of the final byte are zeroed
+/// (the canonical "unused low bits are zero" invariant).
+pub(super) fn make_binary(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    bytes: &[u8],
+    nbits: usize,
+) -> Result<Eterm> {
+    let num_bytes = nbits.div_ceil(8);
+    if num_bytes <= ERL_ONHEAP_BINARY_LIMIT {
+        return make_bits(ctx, bytes, nbits);
+    }
+    if bytes.len() < num_bytes {
+        // An internal invariant: every caller passes a buffer covering `nbits`.
+        return Err(error::unsupported("bitstring: short byte buffer"));
+    }
+    let mut payload = bytes[..num_bytes].to_vec();
+    if nbits % 8 != 0 {
+        let keep = nbits % 8;
+        payload[num_bytes - 1] &= 0xFFu8 << (8 - keep);
+    }
+    let hp = ctx.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)?;
+    let data = machine.alloc_refc_binary(&payload)?;
+    // SAFETY: `alloc_words` returned exactly `ERL_REFC_BITS_SIZE` (8)
+    // exclusively-owned words — the `[BinRef][ErlSubBits]` pair `write_refc_binary`
+    // fully writes — and `data` points at the first byte of a live off-heap payload
+    // the machine keeps alive (and unmoved) for at least as long as the term is
+    // used; `beam_alloc` guarantees it is `UNIT_SIZE`-aligned, so the low
+    // `ERL_SUB_BITS_FLAG_MASK` bits of the base pointer are clear.
+    Ok(unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            data.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            data,
+            0,
+            nbits,
+        )
+    })
+}
+
+/// Build the empty writable binary `bs_init_writable` produces.
+///
+/// C's `erts_bs_init_writable` (`erl_bits.c:2021`) allocates a fresh ref-counted
+/// payload of `capacity` bytes and returns an `ErlSubBits` whose window is
+/// **zero-length** (`build_writable_bitstring` passes `current_size = 0`), carrying
+/// the capacity only in the off-heap binary's `apparent_size`. The engine
+/// reproduces the observable part exactly: a 0-bit refc binary over a
+/// `capacity`-byte payload, which the first `bs_create_bin` `append`/`private_append`
+/// segment then extends.
+pub(super) fn make_writable(
+    machine: &mut Machine,
+    ctx: &mut dyn ExecutionContext,
+    capacity: usize,
+) -> Result<Eterm> {
+    let hp = ctx.alloc_words(beam_term::refc::ERL_REFC_BITS_SIZE)?;
+    let data = machine.alloc_refc_binary(&vec![0u8; capacity])?;
+    // SAFETY: as `make_binary` — 8 exclusively-owned words for the pair, a live
+    // `UNIT_SIZE`-aligned off-heap payload owned by `machine`, and a 0-bit window
+    // (`start = end = 0`).
+    Ok(unsafe {
+        beam_term::refc::write_refc_binary(
+            hp,
+            data.cast::<Eterm>(),
+            core::ptr::null_mut(),
+            data,
+            0,
+            0,
+        )
+    })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::context::MinimalContext;
+
+    /// `make_binary` picks the frozen representation: an on-heap `ErlHeapBits` at
+    /// the 64-byte limit, an off-heap refc binary above it — and the read path
+    /// (`heap_bits`/`subject_bytes`) recovers the same bytes either way.
+    #[test]
+    fn make_binary_picks_the_frozen_representation() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let heap_bytes: Vec<u8> = (0..64u8).collect();
+        let heap = make_binary(&mut machine, &mut ctx, &heap_bytes, 64 * 8).unwrap();
+        // SAFETY: `heap` is a live bitstring term built on the line above.
+        assert!(!unsafe { beam_term::refc::is_refc_binary(heap) });
+        assert_eq!(subject_bytes(heap).unwrap(), heap_bytes.as_slice());
+        assert_eq!(heap_bits(heap).unwrap().1, 64 * 8);
+
+        let refc_bytes: Vec<u8> = (1..=65u8).collect();
+        let refc = make_binary(&mut machine, &mut ctx, &refc_bytes, 65 * 8).unwrap();
+        // SAFETY: `refc` is a live bitstring term built on the line above.
+        assert!(unsafe { beam_term::refc::is_refc_binary(refc) });
+        assert_eq!(subject_bytes(refc).unwrap(), refc_bytes.as_slice());
+        assert_eq!(heap_bits(refc).unwrap().1, 65 * 8);
+        // The generic reader (`terms::binary_bytes`) is refc-aware too.
+        assert_eq!(
+            crate::terms::binary_bytes(refc).unwrap(),
+            refc_bytes.as_slice()
+        );
+    }
+
+    /// A non-byte-aligned refc result keeps its exact bit count and zeroes the
+    /// unused low bits of the final byte.
+    #[test]
+    fn make_binary_masks_the_trailing_bits_of_a_refc_result() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let bytes = vec![0xFFu8; 65];
+        let nbits = 65 * 8 - 5;
+        let term = make_binary(&mut machine, &mut ctx, &bytes, nbits).unwrap();
+        // SAFETY: `term` is a live bitstring term built on the line above.
+        assert!(unsafe { beam_term::refc::is_refc_binary(term) });
+        assert_eq!(heap_bits(term).unwrap().1, nbits);
+        let read = subject_bytes(term).unwrap();
+        assert_eq!(read.len(), 65);
+        assert_eq!(read[64], 0b1110_0000);
+    }
+
+    /// `make_writable` is the 0-bit refc window `bs_init_writable` returns: its
+    /// payload is live (so a following append can seed from it) but it covers no
+    /// bits.
+    #[test]
+    fn make_writable_returns_a_zero_bit_refc_window() {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        let term = make_writable(&mut machine, &mut ctx, 256).unwrap();
+        // SAFETY: `term` is a live bitstring term built on the line above.
+        assert!(unsafe { beam_term::refc::is_refc_binary(term) });
+        let (_, bits) = heap_bits(term).unwrap();
+        assert_eq!(bits, 0);
+        assert_eq!(subject_bytes(term).unwrap(), &[] as &[u8]);
+    }
 }
