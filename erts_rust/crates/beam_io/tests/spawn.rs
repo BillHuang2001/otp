@@ -7,6 +7,7 @@
 //! `schedule_events` + `execute_port_tasks`) and the port's queues. Every wait is bounded, so
 //! a broken driver fails the test instead of hanging it.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -474,7 +475,7 @@ fn an_adopted_fd_is_read_without_starting_a_child() {
 }
 
 #[test]
-fn a_failed_spawn_is_a_constructor_error_that_registers_nothing() {
+fn a_failed_spawn_is_an_errno_atom_constructor_error_that_registers_nothing() {
     let poller = poller();
     let result = SpawnDriver::new(
         &SpawnSpec::SpawnExecutable {
@@ -482,10 +483,12 @@ fn a_failed_spawn_is_a_constructor_error_that_registers_nothing() {
         },
         &SpawnOptions::default(),
     );
-    assert!(
-        matches!(result.map(|_| ()), Err(BeamError::Io(_))),
-        "a program that cannot be started is an I/O failure, not a panic"
-    );
+    // The oracle raises `error:enoent` for this path, so the constructor error carries that
+    // atom rather than a generic I/O failure (`test a_failed_spawn_matches_the_oracle_errno_atom`).
+    let error = result
+        .map(|_| ())
+        .expect_err("a program that cannot be started is a constructor error");
+    assert_eq!(error.as_atom(), Some("enoent"));
     assert!(
         poller.is_empty(),
         "a failed spawn leaves nothing registered with the poller"
@@ -514,4 +517,144 @@ fn cd_and_env_are_honored_by_the_child() {
         "the env option reaches the child"
     );
     registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check: the failed-spawn reason atom
+// ---------------------------------------------------------------------------
+
+/// Wall-clock budget for a single `erl` invocation before the oracle is declared unusable
+/// and the check skips (mirrors `beam_term/tests/oracle.rs`).
+const ERL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outcome of the oracle's `open_port({spawn_executable, Path}, [])`.
+enum OracleOutcome {
+    /// `erl` could not be run (absent from `PATH`, or silent past [`ERL_TIMEOUT`]).
+    Unavailable,
+    /// The oracle opened the port (it left the failed `exec` to the forked child).
+    Opened,
+    /// The oracle raised `error:Reason`.
+    Raised(String),
+}
+
+/// Runs `<expr>, halt(0).` under the system `erl` with `BEAM_IO_ORACLE_PATH=path` in the
+/// environment, returning its stdout.
+///
+/// Returns `None` — after a clear skip message — when `erl` cannot be spawned or does not
+/// answer within [`ERL_TIMEOUT`], so `cargo test -p beam_io` stays green on a host without a
+/// system Erlang. A *spawned* `erl` that exits non-zero is a bug in the embedded expression,
+/// so that is asserted rather than skipped.
+fn erl_stdout(expr: &str, path: &str) -> Option<String> {
+    let code = format!("{expr}, halt(0).");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("erl")
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(&code)
+            .env("BEAM_IO_ORACLE_PATH", &path)
+            .output();
+        // The receiver may have timed out and gone away; that is fine.
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(ERL_TIMEOUT) {
+        Err(_) => {
+            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("skipping oracle check: could not spawn `erl` ({e}); is Erlang on PATH?");
+            None
+        }
+        Ok(Ok(out)) => {
+            assert!(
+                out.status.success(),
+                "the oracle expression failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    }
+}
+
+/// Drives the real `erlang:open_port/2` on `path` and classifies the outcome.
+///
+/// The path travels through the environment (`BEAM_IO_ORACLE_PATH`), so it never has to be
+/// escaped into the `-eval` source.
+fn oracle_outcome(path: &str) -> OracleOutcome {
+    let expr = r#"P = case os:getenv("BEAM_IO_ORACLE_PATH") of false -> ""; V -> V end, try erlang:open_port({spawn_executable, P}, []) of _Port -> io:format("ok~n") catch error:Reason -> io:format("~p~n", [Reason]) end"#;
+    match erl_stdout(expr, path) {
+        None => OracleOutcome::Unavailable,
+        Some(out) => {
+            let line = out.trim();
+            if line == "ok" {
+                OracleOutcome::Opened
+            } else {
+                OracleOutcome::Raised(line.to_string())
+            }
+        }
+    }
+}
+
+/// The atom this crate's driver reports for a failed direct exec of `path`, or `None` when
+/// the driver started it.
+fn driver_spawn_reason(path: &str) -> Option<String> {
+    SpawnDriver::new(
+        &SpawnSpec::SpawnExecutable {
+            path: path.to_string(),
+        },
+        &SpawnOptions::default(),
+    )
+    .map(|_| ())
+    .err()
+    .and_then(|error| error.as_atom().map(str::to_string))
+}
+
+#[test]
+fn a_failed_spawn_matches_the_oracle_errno_atom() {
+    // The oracle answers `erl_errno_id(errno)` for a program the `exec` rejects; this crate
+    // must raise the same atom. The three cases live in a private scratch directory, so the
+    // outcome does not depend on the host's `/etc` — and the no-permission file carries
+    // **no** execute bit at all, so `access(X_OK)` fails for root and non-root alike.
+    let dir = std::env::temp_dir().join(format!("beam_io_spawn_oracle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+
+    let missing = dir.join("this-path-does-not-exist");
+    let regular = dir.join("a-regular-file");
+    std::fs::write(&regular, b"x").expect("the regular file");
+    let no_perm = dir.join("no-execute-bit");
+    std::fs::write(&no_perm, b"#!/bin/sh\nexit 0\n").expect("the script");
+    std::fs::set_permissions(&no_perm, std::fs::Permissions::from_mode(0o000))
+        .expect("every permission bit is stripped");
+    // A path component that is a file, not a directory (`ENOTDIR`).
+    let not_dir = regular.join("below");
+
+    let cases = [
+        ("missing", &missing),
+        ("no-permission", &no_perm),
+        ("not-a-directory", &not_dir),
+    ];
+
+    for (label, path) in cases {
+        let path = path.to_string_lossy().into_owned();
+        let oracle = match oracle_outcome(&path) {
+            OracleOutcome::Unavailable => {
+                eprintln!("skipping failed-spawn oracle check: the system `erl` is unavailable");
+                break;
+            }
+            OracleOutcome::Opened => None,
+            OracleOutcome::Raised(reason) => Some(reason),
+        };
+        assert_eq!(
+            driver_spawn_reason(&path),
+            oracle,
+            "the {label} reason matches the oracle for {path}"
+        );
+    }
+
+    // The parent directory's write/search bits are enough to unlink the mode-0 file.
+    let _ = std::fs::set_permissions(&no_perm, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&dir);
 }

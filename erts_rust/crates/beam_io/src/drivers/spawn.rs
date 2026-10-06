@@ -29,10 +29,21 @@
 //! [`SpawnDriver::new`] really starts the process (or adopts `{fd, N}`) and returns a
 //! `Result`, so the runtime can read [`SpawnDriver::os_pid`] **before** handing the driver
 //! to [`crate::PortRegistry::open`]; a failed spawn is a constructor error that registers
-//! nothing. [`Driver::start`] only registers the already-created descriptors with the
-//! poller. [`Driver::stop`] and the `Drop` impl both kill and reap the child (a child that
-//! already exited is reaped through `try_wait` and needs no kill), deregister every fd they
-//! registered and close the fds they own. Nothing else may close those fds.
+//! nothing and carries the **errno-derived atom** the oracle raises (`error:enoent`,
+//! `error:eacces`, … — see `error::spawn_failure`). [`Driver::start`] only
+//! registers the already-created descriptors with the poller. [`Driver::stop`] and the
+//! `Drop` impl both kill and reap the child (a child that already exited is reaped through
+//! `try_wait` and needs no kill), deregister every fd they registered and close the fds
+//! they own. Nothing else may close those fds.
+//!
+//! The failure is detected **synchronously** here, which is faithful for every spawn the
+//! `exec` itself rejects (a missing/unreadable/non-directory program path) but not for the
+//! cases the reference defers to the forked child: `{spawn_executable, "/etc"}` opens a port
+//! in the oracle (its `access(path, X_OK)` precheck passes for a searchable directory, and
+//! only the child's later `exec` fails), whereas this driver's `Command::spawn` reports the
+//! directory's `EACCES` up front. That divergence is architectural — a synchronous spawn
+//! cannot hand back a port whose child is about to fail — and is recorded in the crate
+//! `CONTEXT.md`.
 //!
 //! # Readiness model
 //!
@@ -304,10 +315,15 @@ impl SpawnDriver {
     ///
     /// # Errors
     ///
-    /// [`beam_common::BeamError::Io`] when the process cannot be started (an unknown program,
-    /// a bad `{cd, …}`, …), or when putting a descriptor in non-blocking mode fails;
-    /// [`beam_common::BeamError::BadArg`] for an `{fd, N}` spec with a negative descriptor or
-    /// for an empty argv vector.
+    /// [`beam_common::BeamError::Raise`] carrying the **errno atom** the oracle raises when
+    /// the child cannot be started — `error:enoent` for an unknown program, `error:eacces`
+    /// for an unreadable one, `error:enotdir` for a path through a non-directory, … The
+    /// reference answers `erl_errno_id(errno)` (`erts_internal_open_port_2`,
+    /// `erl_bif_port.c:84`) and the atom is the lowercase errno name (see the crate's `error`
+    /// module). An errno this crate does not recognise falls back to
+    /// [`beam_common::BeamError::Io`], as does a failure putting a descriptor in non-blocking
+    /// mode (or reaping a child a failed spawn left behind); [`beam_common::BeamError::BadArg`]
+    /// for an `{fd, N}` spec with a negative descriptor or for an empty argv vector.
     pub fn new(spec: &SpawnSpec, options: &SpawnOptions) -> Result<SpawnDriver> {
         let command = spec.command();
         if let SpawnSpec::Fd { fd } = spec {
@@ -335,7 +351,7 @@ impl SpawnDriver {
         let Some(mut built) = build_command(spec, options)? else {
             return Err(error::badarg());
         };
-        let mut child = built.spawn().map_err(error::io)?;
+        let mut child = built.spawn().map_err(error::spawn_failure)?;
         let os_pid = child.id();
         // Take both ends out of the child so the driver owns them as plain descriptors (the
         // same reason `FdDriver` owns its fds: the poller and the syscall wrappers work on
@@ -857,14 +873,16 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_program_is_a_constructor_error() {
+    fn an_unknown_program_is_the_errno_atom_constructor_error() {
         let spec = SpawnSpec::SpawnExecutable {
             path: "/nonexistent/xyz-not-real".to_string(),
         };
-        assert!(matches!(
-            SpawnDriver::new(&spec, &SpawnOptions::default()).map(|_| ()),
-            Err(BeamError::Io(_))
-        ));
+        let error = SpawnDriver::new(&spec, &SpawnOptions::default())
+            .map(|_| ())
+            .expect_err("a program that cannot be started is a constructor error");
+        // The oracle raises `error:enoent` for the same path, so the reason is the atom.
+        assert_eq!(error.as_atom(), Some("enoent"));
+        assert!(matches!(error, BeamError::Raise(_)));
     }
 
     #[test]
