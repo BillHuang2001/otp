@@ -47,7 +47,8 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - `differential suite [--strict] [--json] [--out <dir>]` — run the whole built-in corpus.
 - `differential list [--by-contract] [--json] [--out <dir>]` — list corpus case ids + the contract each covers. `--by-contract` groups by contract id (A.1…A.9) with per-contract case counts and ids; without it the output is byte-for-byte the plain listing.
 - `differential --help` / `-h`; `differential <sub> --help`.
-- **Exit codes:** `0` all executed cases agreed (skips/`unsupported` reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to failure.
+- **Exit codes (the binary):** `0` all executed cases agreed (skips/`unsupported` reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to failure. `gate.sh` (below) layers the `0/1/2/3` CI mapping on top; the binary's own contract is unchanged.
+- `gate.sh` (executable, POSIX `sh`, repo-relative — no baked paths) — the **CI gate** wrapper. It builds `beam_rt` + `differential` via the committed `../../scripts/cargo.sh`, runs the corpus as `suite --strict --json --out <tmpdir>`, and maps the written `report.json` to its own exit code.
 
 ### Library (`src/lib.rs`) — the public API `cargo test` asserts against
 - `error` — `Error` (`Usage`/`Env`/`Io`, all → exit `2`), `Result<T>`.
