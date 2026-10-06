@@ -326,9 +326,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   decode+encode with the `size`-field and env-order rules and the `Local`-fun encode gap; `beam_gc` fun
   block sizing), the receive/message execution path (`beam_engine` receive family +
   `Mailbox`/block-outcome seams; `beam_message::QueueCursor`; `beam_process` resume-on-send; the
-  `beam_rt` executor runner + `PortHook` provider), and the runtime parity work
+  `beam_rt` executor runner + `PortHook` provider), the runtime parity work
   (`func_info`→`function_clause`, `DictHook`/process dictionary, `{minor_version}` adoption, port
-  parity, sorted `-eval` map literals).
+  parity, sorted `-eval` map literals), and the NIF host layer (the `enif_*` implementations, the
+  `dlopen`-based loader, the `NifHost` seam, the `beam_abi → beam_alloc` dependency edge, and the
+  `-Wl,--export-dynamic` link-arg mechanism that lets a NIF `.so` resolve `enif_*` against the host
+  process).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
