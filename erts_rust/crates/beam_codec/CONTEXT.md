@@ -485,8 +485,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   image `131,80,0,0,13,178,<zlib>`, whose declared inner size is `3506` (the inner body equals
   `term_to_binary(lists:duplicate(500, hello))` minus its version byte); it is asserted by decoding
   and by comparing the inflated stream to our own `encode_term_body`. `term_to_binary({ok,17},
-  [compressed])` is kept as the fallback case (the C emits the plain `OK_17` image when zlib cannot
-  shrink the term, `external.c:2284-2293`).
+  [compressed])` is kept as the fallback case (a small term where zlib cannot shrink the body, so the
+  plain `OK_17` image is emitted — `external.c:2276-2298`).
 - `tests/interop.rs` — the **live differential harness** against the system `erl` oracle (the same
   resolution rule as `../tools/differential`: `$ERTS_ORACLE` if it names an existing executable, else
   `erl` on `$PATH`; when neither exists the oracle-dependent test prints a loud stderr note and
