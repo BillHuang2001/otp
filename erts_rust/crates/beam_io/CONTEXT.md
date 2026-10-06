@@ -121,6 +121,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   - `port_control(poller, id, op, arg) -> Result<Vec<u8>>` — the `erts_port_control` seam: the reserved name
     `"close"` closes the port (empty reply); **every other `op`** is forwarded verbatim to the driver's
     `control(op, arg)` and its reply returned (unknown verb ⇒ the driver's `BeamError::BadArg`).
+  - `take_exit_status(id) -> Result<Option<i32>>` — the exit-status seam: takes the reaped status of the OS
+    child behind `id` **once** (`Ok(None)` for an unknown id's driver with no child, a child that has not
+    exited, or a status already reported; `BeamError::BadArg` for an unknown id).
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
 - `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the poller
