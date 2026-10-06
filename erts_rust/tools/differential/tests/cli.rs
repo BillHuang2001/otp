@@ -229,22 +229,22 @@ fn a_bad_oracle_or_rust_runtime_is_a_loud_env_error() {
     assert!(bad_rust.stderr.contains("$BEAM_RT"), "{}", bad_rust.describe());
 }
 
-/// Case ids whose Rust-side result is a **known, documented runtime gap**: a genuine
-/// divergence from the oracle that the rewrite has not implemented yet — *not* a capability
-/// gap the runtime itself labels `unsupported`. Each entry is a handoff note to the agent
-/// that owns the gap (`beam_rt`); none of them is fixed here.
+/// Case ids whose Rust-side result is a **known, documented runtime gap** that surfaces as a
+/// genuine `mismatch` — a real divergence from the oracle that the rewrite has not implemented
+/// yet, and that the runtime does *not* label via its own `unsupported` convention.
 ///
-/// This allowlist is the enclosing invariant around the suite test below: a `mismatch` is
-/// tolerated **only** for an id listed here, so an *unexpected* mismatch still fails the
-/// test — while the target remains zero mismatches (the list shrinks as gaps are closed).
-const KNOWN_RUNTIME_GAPS: &[&str] = &[
-    // driver/port_backed_by_spawn_driver — `erlang:open_port/2` is not implemented, so
-    //   `open_port({spawn,"true"},[])` raises `'erlang:open_port/2 is not a BIF'` instead of
-    //   yielding a real port. The reason is a plain Erlang term, not the runtime's
-    //   `unsupported` convention, so it is an *observation* → mismatch; handoff to the
-    //   beam_rt agent.
-    "driver/port_backed_by_spawn_driver",
-];
+/// This list is **empty**: there are currently **zero** mismatches. A capability gap the
+/// runtime signals honestly (its documented `unsupported` convention — exit `3` with a
+/// `beam_rt: unsupported: …` stderr line, or a probe-caught `unsupported…` reason) is
+/// classified `unsupported`, never a mismatch; e.g. the port/driver seam
+/// (`erlang:open_port/2` not wired) now reports `unsupported` (exit `3`) and `gate.sh` maps it
+/// to exit `3`.
+///
+/// This allowlist is the enclosing invariant around the suite test below: since it is empty,
+/// **any** `mismatch` is unexpected and fails the test. It exists only as an escape hatch so a
+/// newly-discovered, understood divergence can be recorded explicitly rather than silently
+/// tolerated — it must never be widened to mask a genuine behavioral regression.
+const KNOWN_RUNTIME_GAPS: &[&str] = &[];
 
 #[test]
 fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
