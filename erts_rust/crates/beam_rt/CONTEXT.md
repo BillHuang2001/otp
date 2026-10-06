@@ -519,8 +519,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   a **pooled** `beam_alloc::Heap` (`take_bif_heap`/`put_bif_heap`, stack discipline — a nested call
   takes a fresh heap) and the disjoint `output` field. That leaves `FunBridge` as the only
   `&mut Runtime` borrow in `call_registered`. `FunBridge::call_fun` delegates to the **existing**
-  `RuntimeContext::apply_fun` (an `-eval` closure via `eval::apply_eval_closure`, a `.beam` fun via the
-  engine's `Machine::run_label`) — the evaluator is never re-implemented. This is what makes
+  `RuntimeContext::apply_fun` (an external `fun M:F/A` via `call_bif`, an `-eval` closure via
+  `eval::apply_eval_closure`, a `.beam` local fun via the engine's `Machine::run_label`) — the
+  evaluator is never re-implemented. This is what makes
   `lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, including a loaded module applying an `-eval`
   fun (`eval::tests::a_loaded_module_applies_an_eval_closure`).
 * **Atom-table sharing is by handle (`Rc<AtomTable>`), interned copy-on-write.** `CodeServer` owns the
