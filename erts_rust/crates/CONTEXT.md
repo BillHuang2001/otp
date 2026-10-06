@@ -220,10 +220,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
   scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
   `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
-  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). Runtime port I/O is
-  polling-backed: `beam_rt` keeps the child's stdout, registers its fd with `beam_io`'s poller, reads it
-  and delivers `{Port,{data,Data}}` to the owning process (driven from the `-eval` `receive … after T`
-  path); `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
+  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). **The port subsystem is consolidated onto `beam_io`:** `beam_rt` owns one long-lived `beam_io::Poller`
+  + `PortRegistry`, spawns OS children through `beam_io`'s `SpawnDriver`, runs the port-task round from its
+  main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
+  messages **delivered to the owning process**, so a receiver blocked on port data is woken through
+  `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
+  `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
   `total=333 agree=332 mismatch=0 unsupported=1 skipped=0`** (re-measured at this node's HEAD). The 1
   `unsupported` is `wire/new_fun_ext_encode` (`beam_rt`'s `local_fun` gap); **no case disagrees**
   (`mismatch=0`, `skipped=0`).
