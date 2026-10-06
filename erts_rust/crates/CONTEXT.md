@@ -212,14 +212,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
-- Pre-existing test failure OUTSIDE this node (fails identically at the pre-work baseline):
-  `beam_bifs::binconv::tests::binary_terms_are_the_documented_codec_gap` — belongs to the
-  `beam_bifs`/`beam_codec` nodes.
 - Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
   entries for the `beam_term` foundation extensions (`map`/`bitstring`/`refc`), the `RefCount` move into
-  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, and the
-  `beam_abi` frozen-header seam work.
-
+  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, the
+  `beam_abi` frozen-header seam work, and the fun/export literal work (`beam_term::fun` layout;
+  `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT` decode+encode with the `size`-field and env-order rules and the
+  `Local`-fun encode gap; `beam_gc` fun block sizing).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
