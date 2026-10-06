@@ -209,6 +209,10 @@ fn logical_processors() -> i64 {
 /// honest answer is `0` (the oracle boots with its `standard_io` port already open, which
 /// this runtime has no counterpart for).
 ///
+/// That divergence is **deliberate and must not be "fixed"** to match a run-time figure:
+/// like `erlang:ports/0`, this key reports *this* runtime's table, not the oracle's (see
+/// the same note in [`crate::port`]).
+///
 /// The registry is shared through an [`Rc`]`<`[`std::cell::RefCell`]`>` so a port BIF in
 /// flight can hold it without borrowing the runtime; a `RefCell` conflict is reported as
 /// the typed capability gap rather than panicking — the crate is `#![deny(unsafe_code)]`

@@ -326,7 +326,9 @@ The **local record** of a process's relationships with processes on other nodes.
   distribution seam**: implemented downstream (`beam_rt`) over `beam_dist`. `route` must serialise the
   signal **synchronously** (`reason` may live in the signaller's heap, which the caller may drop right
   after). The table's remote records (`remote_links`/`remote_monitors`) and `set_dist_router`/
-  `has_dist_router` are on `ptab.rs`.
+  `has_dist_router` are on `ptab.rs`. **This seam is OUTBOUND only** (local → remote): there is no
+  inbound control-message (`DOP_LINK`/`DOP_MONITOR_P`/…) interpreter in this crate — an inbound handler
+  belongs to `beam_rt` (see Known Issues).
 ### `port.rs` — the port-id table + ownership / link / monitor surface
 `PortTable` is the number table the C keeps alongside the pid table, extended with the relationships a
 dying port must resolve. Port *behaviour* (driver, scheduling, read path) is `beam_io`'s. The crate-root

@@ -35,8 +35,9 @@ tags are rejected as `BadArg` — never a wrong term. The `COMPRESSED` (`80`) en
 *shrink rule*: it emits the wrapper only when zlib beats the plain image, else the plain image
 (`external.c:2276-2298`).
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
-`#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
-`#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
+`#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. `#[cfg(test)] mod tests`
+suites cover the wire, term and codec layers (the `encode`/`decode` suites sit in the sibling files
+`src/encode/tests.rs` / `src/decode/tests.rs`); `tests/roundtrip.rs` holds
 the exhaustive encode→decode corpus plus the negative/truncation cases,
 `tests/ground_truth.rs` holds the byte-exact `term_to_binary` oracle vectors (each
 asserted in both directions), `tests/interop.rs` is a live **differential harness**
@@ -100,22 +101,28 @@ is `decode`'s.
 - `pub const MIN_LEVEL: u8 = 0`, `pub const MAX_LEVEL: u8 = 9`, `pub const MAX_UNCOMPRESSED: usize`.
 - `pub(crate) fn reject_bad_level(level: u8) -> Result<()>` — used by `encode` to fail fast.
 
-### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs`)
+### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs` + `record.rs` + `float.rs`)
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
-  `with_atom_cache(&'a mut dyn AtomCacheWriter)` (installs the outbound atom cache — a cached atom is
-  then written as `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) ->
-  Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
+  `set_minor_version(MinorVersion)` / `with_minor_version(MinorVersion)` (the `term_to_binary/2`
+  `{minor_version,N}` flavour — see §Minor-version flavours), `with_atom_cache(&'a mut dyn
+  AtomCacheWriter)` (installs the outbound atom cache — a cached atom is then written as
+  `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
   `finish_compressed(level: u8) -> Result<Vec<u8>>` and `finish_local(hash: u32) -> Vec<u8>`
   (see below).
 - `pub enum AtomEncoding { Utf8, Latin1 }` — default `Utf8`: emit `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`
   (exactly what `term_to_binary` emits). `Latin1` emits `SMALL_ATOM_EXT`/`ATOM_EXT` for nodes that did
-  not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`).
+  not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`). Under a [`MinorVersion`] other than `V2` the
+  atom tags are **pinned** by the flavour and `AtomEncoding` is ignored (see §Minor-version flavours).
+- `pub enum MinorVersion { V0, V1, V2 }` (default `V2`) — the `term_to_binary/2` `{minor_version, N}`
+  wire flavour. `set_minor_version`/`with_minor_version` select it; the default (and every un-flavoured
+  entry point) reproduces today's bytes exactly.
 - Convenience (additive; the existing signatures are unchanged): `pub fn encode_term(Eterm, &AtomTable)`
   (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
   the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
-  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, plus the `LOCAL_EXT` wrapper
-  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`.
+  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, the `LOCAL_EXT` wrapper
+  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`, and the minor-version entry point
+  `pub fn encode_term_with_minor_version(Eterm, &AtomTable, MinorVersion)`.
 - **Funs are encoded through the classification chain.** `encode` guards the fun family with
   `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
   distinct subtag, so the classification is exact) and routes to the `src/encode/fun.rs` helpers
@@ -141,6 +148,33 @@ is `decode`'s.
   verifies it. (A local **fun** — `make_fun3` — still has no wire form:
   `error::unsupported_local_fun`, unchanged.)
 
+#### Minor-version flavours (`{minor_version, N}`)
+`parse_t2b_opts` (`external.c:1501-1516`) maps `{minor_version, N}` onto encoder dflags.
+`TERM_TO_BINARY_DFLAGS` (`dist.h:138-139`) is `DFLAG_NEW_FLOATS | DFLAG_UTF8_ATOMS` and carries
+**no** `DFLAG_SMALL_ATOM_TAGS`, so:
+
+| `MinorVersion` | atoms | floats |
+|---|---|---|
+| `V0` (`{minor_version,0}`) | `ATOM_EXT` (`100`) for a Latin-1 name (never `115`, any length), UTF-8 tags for a non-Latin-1 name | `FLOAT_EXT` (`99`), 31-byte text |
+| `V1` (`{minor_version,1}`) | same as `V0` | `NEW_FLOAT_EXT` (`70`) |
+| `V2` (default, `{minor_version,2}`) | `AtomEncoding` (UTF-8 by default) | `NEW_FLOAT_EXT` (`70`) |
+- The crate-internal `AtomFlavour` projects the C `enc_atom` decision (`external.c:2906-2950`); the
+  public `AtomEncoding::Latin1` (the `DFLAG_SMALL_ATOM_TAGS` dist flavour — `115`/`100`, `unsupported`
+  for a non-Latin-1 name) is **unchanged** and is only consulted under `V2`. Under `V0`/`V1` the
+  `Latin1WideOnly` flavour always emits `ATOM_EXT` for a Latin-1 name and **falls back to the UTF-8
+  tags** for a non-Latin-1 one (`external.c:2910`: `utf8_atoms || a->latin1_chars < 0`) — never
+  `unsupported`.
+- Floats: `NEW_FLOAT_EXT` + 8 IEEE-754 bytes when `DFLAG_NEW_FLOATS` is set (`V1`/`V2`, today's
+  behaviour); otherwise `FLOAT_EXT` + a **fixed 31-byte** field — `sys_double_to_chars(f, buf, 31)`
+  (= `snprintf(buf, 31, "%.20e", f)`, `SYS_DEFAULT_FLOAT_DECIMALS 20`) then zero-fill
+  (`external.c:3840-3847`). `src/encode/float.rs` renders the payload: Rust's `format!("{:.20e}", f)`
+  has the same correctly-rounded (round-half-to-even) mantissa as glibc but a different exponent tail
+  (`e0`/`e-5`/`e20`), so `normalize_exponent` rewrites it to C's always-signed, ≥2-digit `e+00`/`e-05`/
+  `e+20`. Non-finite values use glibc's `inf`/`-inf`/`nan` spelling. A rendered string longer than 31
+  bytes would be a `SystemLimit` rather than a silent truncation (unreachable for a finite `f64`).
+- Byte-exactness is asserted by `tests/minor_version.rs` (pinned oracle goldens + a **live** `erl`
+  cross-check of the `V0`/`V1` images over a mixed corpus) and by `src/encode/float.rs`'s unit tests.
+
 ### `src/decode/` — the `Decoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
   `VERSION_MAGIC`), `new_body(&'a [u8]) -> Decoder<'a>` (no version byte), `with_atom_cache(&'a AtomCache)`,
@@ -157,7 +191,11 @@ is `decode`'s.
 - **`COMPRESSED` is a top-level-only wrapper.** `decode_term` detects `bytes.len() >= 6 &&
   bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT`, reads the 4-byte inner size, inflates and
   requires `decompressed.len() == size`, then decodes the inner body with `Decoder::new_body` +
-  `finish()`. It is handled at the entry point rather than inside `Decoder` because the decompressed
+  `decode` — **without** a `finish()`, so bytes after the inner term are ignored exactly as the C
+  does (it hands the *inflated* buffer to the ordinary term decoder, which never requires full
+  consumption — `binary2term_prepare` `external.c:1744-1816`; `binary_to_term/2`'s `used` option
+  exists precisely because trailing bytes are permitted). The **plain** (non-compressed) path keeps
+  its historical strict `finish()`. It is handled at the entry point rather than inside `Decoder` because the decompressed
   body is an owned buffer a borrowed `Decoder<'a>` cannot hold. `Decoder::new`/`new_body` are otherwise
   unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
@@ -229,8 +267,10 @@ constants only.
 ## Tag coverage (current)
 **Encode + decode + byte-exact round-trip** (the full producible set):
 `97, 98, 110, 111` (integers; a big that fits a 60-bit small decodes to a small, as in C),
-`99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`**, matching `term_to_binary`),
-`100, 115, 118, 119` (all four atom tags decode; encode emits UTF-8 per §AtomEncoding),
+`99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`** by default, `99` only under
+`MinorVersion::V0` — see §Minor-version flavours),
+`100, 115, 118, 119` (all four atom tags decode; encode emits UTF-8 per §AtomEncoding, or the
+`{minor_version,0|1}` `ATOM_EXT`/UTF-8-fallback form per §Minor-version flavours),
 `101, 114, 90` (references), `102, 89, 120` (ports: all three decode, **encode always emits `120
 V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are decode-only),
 `103, 88` (pids), `104, 105` (tuples), `106` (NIL),
@@ -238,9 +278,9 @@ V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are
 ≤ 65535, else `108`), `108` (lists, including improper tails),
 `109 BINARY_EXT` / `77 BIT_BINARY_EXT` (both decode into an on-heap bitstring block, see
 `term/binary.rs`; encode emits `109` for a byte-aligned bitstring and `77` otherwise),
-`116` (maps of **any** pair count — every map is stored as a flatmap; the interior
-flatmap/hashmap switchover is an *open* layout this crate deliberately collapses, see
-§Term-layout ownership), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
+`116` (**flat** maps of any pair count — encode emits the stored pair order faithfully; a hash-map
+(HAMT) term with more than 32 pairs is not encodable and reports `unsupported`, see §Map key encode
+order and `Known Issues`), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
 whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, and
@@ -325,6 +365,37 @@ Native records (the OTP 29 `ErtsRecordDefinition`/`ErtsRecordInstance` terms pro
   distinct `RECORD_SUBTAG`).
 - The cached definition `hash` (definition word 2) is `make_small(0)` — `beam_term` cannot reproduce
   C's `make_hash2`; it is **not on the wire** (see §Known Issues).
+
+## Map key encode order
+`encode_map` (`src/encode/mod.rs`) is the sole `MAP_EXT` (`116`) emitter and it emits the map's
+**stored** pair order verbatim (interleaved `K1,V1,…,Kn,Vn`); it **never** sorts, reorders or
+deduplicates. This is the ERTS contract: the encoder walks a flat map's key/value arrays in storage
+order (`external.c:3746-3769`, `flatmap_get_keys`/`flatmap_get_values` + `ENC_MAP_PAIR`, no sort
+unless the `deterministic` dflag is set). Order is the **constructor's** job, applied *before* the
+term reaches the codec:
+
+- A map built through the normal path is ordered by [`beam_term::map::write_map`] (used by
+  `beam_engine`'s compiled `…_map` opcodes), which sorts ≤ [`beam_term::map::MAP_SMALL_MAP_LIMIT`]
+  (32) keys in `erts_cmp_flatmap_keys` order (`../../erts/emulator/beam/erl_utils.h:265-272`: two
+  **atom** keys by atom-table index, every other pair by full term order) and builds a HAMT above it.
+- A flat map built directly on a heap (`beam_codec::term::make_flatmap`, `beam_term::thing::write_flatmap`)
+  keeps the caller's pair order as-is.
+
+Because encode→decode→encode is order-preserving, a decoded map re-encodes **byte-exactly** for
+non-atom keys — the property `tests/map_key_order.rs` pins.
+
+**Atom-keyed multi-key maps are not byte-comparable across implementations.** A flat map's atom keys
+sort by **atom-table index**, which depends on the order the atoms were first interned *during this
+VM start* and is therefore not stable across runs: the same map can produce different `MAP_EXT`
+bytes in two fresh `erl` processes (demonstrated live by
+`tests/map_key_order.rs::atom_keyed_map_bytes_depend_on_interning_order`). Byte-exact
+cross-implementation comparison is thus meaningful only for **non-atom** keys or an already-ordered
+flatmap; the live oracle cross-check in that file uses an integer-keyed corpus for this reason.
+
+Sorting inside `beam_codec` would be **wrong** — do not add one: it breaks the byte-exact fixture
+`tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` (a real `gen_server`
+literal pool whose map wire order is not this crate's atom-table index order) and the live
+`tests/interop.rs` harness.
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
@@ -449,14 +520,19 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `FLOAT_EXT`→`NEW_FLOAT_EXT` rewrite are not byte-canonical).
 
 ## Test Strategy
-- In-module `#[cfg(test)] mod tests`: `tag` (values against `external.h`, `from_byte`/`as_byte`
+- Unit tests live in `#[cfg(test)] mod tests` submodules: in-module for
+  `tag` (values against `external.h`, `from_byte`/`as_byte`
   round-trip, `covered` table), `reader`/`writer` (BE round-trips, every truncation ⇒ `BadArg`, no
   panic), `atom_cache`, `compress` (round-trip at every level 0..=9, empty/large inputs, out-of-range
-  level, bad header/truncation/corrupt-trailer), `term` (raw-word assertions that the forwarded
+  level, bad header/truncation/corrupt-trailer) and `term` (raw-word assertions that the forwarded
   `beam_term::thing` layout is byte-exact — float, bignum sign/digits, flatmap head/size/keys/vals,
-  external id fields — plus the guard/error behaviour), `encode`/`decode` (per-tag round-trips + the
+  external id fields — plus the guard/error behaviour); the `encode`/`decode` codec suites (per-tag
+  round-trips + the
   error mapping table + unsupported tags, plus the top-level `COMPRESSED` unwrap, a hand-built
-  compressed image and its negative cases).
+  compressed image and its negative cases) sit in the sibling files `src/encode/tests.rs` and
+  `src/decode/tests.rs` (`mod tests;`), which also expose the `pub(crate)` test helpers
+  (`new_heap`, `assert_bad_arg`, `assert_system_limit`, `decode`) their `fun`/`record` submodules
+  reuse.
 - `tests/roundtrip.rs` — exhaustive `encode → decode → compare` over a property-style corpus
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
   incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
@@ -466,6 +542,15 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   wrapper) and round-trips both forms through `decode_term`, plus the negative cases (short header,
   lying size, corrupt trailer, non-zlib payload, non-term inner body, truncation at every offset). It
   also pins the oracle fun blobs (`EXPORT_EXT` and the `fun() -> ok end` `erl_eval` `NEW_FUN_EXT`).
+- `tests/map_key_order.rs` — the `MAP_EXT` **key-order contract** (see §Map key encode order):
+  the codec preserves a flat map's stored pair order (a scrambled integer-keyed flatmap encodes in
+  exactly that order — never sorted); a map built in ERTS `erts_cmp_flatmap_keys` order encodes to
+  the pinned oracle golden `#{10=>1,2=>2,3=>3}` → `131,116,0,0,0,3,97,2,97,2,97,3,97,3,97,10,97,1`;
+  a **live** oracle cross-check over an integer-keyed corpus (decode the oracle's `MAP_EXT` bytes and
+  assert our re-encode is byte-exact); a live demonstration that atom-keyed `MAP_EXT` bytes depend on
+  per-VM-start atom interning order (two fresh VMs, same map, different bytes); and the HAMT (> 32
+  pairs) gap — a hash-map term is rejected by `flatmap_parts` and encoded as a typed `unsupported`.
+  The oracle-dependent cases skip loudly with a stderr note when no `erl` is found.
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
@@ -502,6 +587,17 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   still the sibling `../tools/differential/` harness. The same file also holds the pure,
   oracle-independent checks: a hand-built legacy `FLOAT_EXT` decode vector and the malformed-input
   cases (truncated tag, lying/oversized length, invalid-UTF-8 atom ⇒ typed `BeamError`, never a panic).
+- `tests/minor_version.rs` — the `{minor_version,0|1|2}` byte-exact goldens: `ATOM_EXT`(100) for
+  Latin-1 names of any length and the `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT` fallback for a
+  non-Latin-1 name, the 31-byte `FLOAT_EXT`(99) payloads, the unchanged `V2` default, and a **live**
+  `erl` cross-check over a mixed corpus (loud stderr skip when no oracle). See §Minor-version flavours.
+- `tests/compressed_decode.rs` — the top-level `COMPRESSED`(80) decode contract: the in-tree oracle
+  seed, wrapper transparency on a hand-built image, bytes after the zlib stream **and** after the
+  inner term ignored, the strict plain path, and the negative cases (bare/nested `80` below the
+  6-byte minimum, wrong declared size, over-cap size, truncated/corrupt zlib, non-zlib payload).
+- `tests/record_roundtrip.rs` — byte-exact `RECORD_EXT`(67) decode→re-encode in declaration order,
+  in **both** atom flavours (UTF-8 and `SMALL_ATOM_EXT` Latin-1), allocation-only-after-values, and a
+  live oracle check that the system `erl` accepts and reproduces our record images.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../tools/`.
@@ -521,16 +617,28 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   duplicates the `& !3usize` that `beam_term::compare::bitstring_parts` hardcodes. Promoting that
   reader to `beam_term::thing` (public) and adding a `write_bitstring` constructor would make the
   whole shim a thin forwarder.
-- **Maps are always flatmaps, of any pair count** (the interior flatmap/hashmap switchover is an
-  *open* layout, so there is no `MAP_SMALL_MAP_LIMIT` cutoff here). The cap exists in
-  `beam_term::thing::write_flatmap` (a `debug_assert!` at `n <= 32`) and is *worked around*, not
-  hit: `src/term/mod.rs` picks `thing::write_flatmap` for `n <= 32` and its **own**
-  `write_large_flatmap` above it — the crate's `MAP_SMALL_MAP_LIMIT` const is
-  in `src/term/mod.rs`. `write_large_flatmap` emits byte-for-byte the same flatmap
-  layout as `thing::write_flatmap` (pinned by `flatmap_layout_matches_beam_term`), so a public
-  oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
-  as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
-  order is kept exactly.
+- **Only *flat* maps are encodable; a real HAMT term is not.** `encode` probes `flatmap_parts`,
+  which accepts only a flat map, so a **hash-map** term (built by `beam_term::map::write_map` for
+  more than [`beam_term::map::MAP_SMALL_MAP_LIMIT`] = 32 pairs) falls through to a typed
+  `error::unsupported` — never a wrong encoding (pinned by
+  `tests/map_key_order.rs::hashmap_terms_are_not_encodable`). A faithful HAMT encoder must walk the
+  trie in ERTS's **storage traversal order** (`external.c:3779-3823`: head-array slots in index
+  order, then head-bitmap/node-bitmap slots in index order, descending into sub-nodes and collision
+  tuples in place). `beam_term::map` exposes **no public accessor for that order** — only the
+  *sorted* `map_pairs` (and `map_pairs_flatmap_order`, which is `pub(crate)`) — and this node may
+  not add API to the sibling crate. The **exact public API `beam_term::map` would need** is an
+  ordered, storage-order pair accessor, e.g.
+  `pub fn map_pairs_storage_order(t: Eterm) -> TermResult<Vec<(Eterm, Eterm)>>`, returning the pairs
+  in the node-slot traversal order above (today's private `collect_slots`, `src/map.rs`). Even then
+  the wire order would not be byte-identical to ERTS's own HAMT output, because this crate's HAMT
+  bitmaps are built from `term_hash`, not `erts_map_hash` — the image would be valid and
+  ERTS-decodable, just not byte-equal (see `../beam_term/CONTEXT.md`).
+- **Constructed flat maps may hold any pair count** (`src/term/mod.rs::make_flatmap`): `n <= 32`
+  forwards to `beam_term::thing::write_flatmap`, above it the crate's own `write_large_flatmap`
+  emits the byte-identical layout (pinned by `flatmap_layout_matches_beam_term`), so a flat map of
+  any size encodes and round-trips. Pair order is preserved as-is; duplicate keys are **not**
+  detected (that needs term comparison) and the wire order is kept exactly (see §Map key encode
+  order).
 - **The decoded record's cached definition `hash` is `make_small(0)`, not C's `make_hash2`.** C stores
   `make_hash2({module,name,is_exported,keys_declaration_order})` in definition word 2; `beam_term`
   cannot reproduce `make_hash2` (its `hashing` is deliberately not bit-exact), so both
@@ -553,6 +661,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
   to keep a hostile stream from driving an unbounded allocation.
+- **`decode_term`'s *plain* path is deliberately stricter than the oracle on trailing bytes** (it calls
+  `finish()`), whereas `binary_to_term/1,2` — which goes through `Decoder::decode` in `beam_bifs` — and
+  `decode_term`'s *compressed* path tolerate them. This is a crate-local convenience contract, not
+  observable through the BIF; both behaviours are pinned by `tests/compressed_decode.rs`.
 - **Compressed output is not byte-comparable with the oracle** for the *deflate bytes* (zlib (C) and
   `miniz_oxide` produce different, equally valid streams) — but whether a wrapper or the plain image is
   emitted **is** oracle-exact (the shrink rule above). See §Design Decisions.
@@ -566,9 +678,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   while preserving the round-trip of `creation`. The pointer semantics land when a node-identity type
   exists (owned by `beam_term`/`beam_dist`); only then can the local-node fast path replace the
   external forms.
-- **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode always emits `70` (as
-  `term_to_binary` does), so a decode↔encode round-trip of an `99`-encoded float is
-  representation-preserving, not byte-identical.
+- **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode emits `70` by default (as
+  `term_to_binary/1` does) and `99` only under `MinorVersion::V0`, so a decode↔encode round-trip of a
+  `99`-encoded float under the default flavour is representation-preserving, not byte-identical;
+  under `V0` the 31-byte text form is reproduced exactly (see §Minor-version flavours).
+- **A non-finite float has no oracle-verifiable `FLOAT_EXT` golden.** The system `erl`'s
+  `binary_to_term` aborts on a NaN/Inf `NEW_FLOAT_EXT`, so such a term never reaches
+  `term_to_binary/2 {minor_version,0}`; `src/encode/float.rs` still renders `inf`/`-inf`/`nan` (the
+  glibc `%.20e` spelling) rather than panicking.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `VERSION_MAGIC`
@@ -579,17 +696,31 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/atom_cache.rs` → `AtomCache` (read, 2048-slot distribution atom cache) + the `AtomCacheWriter`
   hook trait (`intern`) `beam_dist` implements for outbound caching
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
-- `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
+- `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `MinorVersion`,
+  `encode_term`/`encode_term_body`/`encode_term_with_minor_version`,
   `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`,
   `Encoder::with_atom_cache` (attaches an `AtomCacheWriter` ⇒ cached atoms emit `ATOM_CACHE_REF`),
-  `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the private
-  fun-classification chain inside `Encoder::encode`
+  `Encoder::set_minor_version`/`with_minor_version` + the private `AtomFlavour`/`latin1_bytes`
+  flavour resolution, `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the
+  private fun-classification chain inside `Encoder::encode`
+- `src/encode/tests.rs` → the `encode` unit-test suite (`#[cfg(test)] mod tests;` — per-tag byte-exact
+  assertions and the width-policy boundaries); also the `pub(crate)` encoder test helpers
+  (`new_heap`, `assert_system_limit`) shared with `src/encode/fun.rs`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
 - `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
-- `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
-  `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`,
+- `src/encode/float.rs` → the `FLOAT_EXT` (`99`) text formatter (`format_float_ext` +
+  `normalize_exponent`, `FLOAT_EXT_LEN`) for the `MinorVersion::V0` float flavour — see
+  §Minor-version flavours
+- `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image; the inflated
+  body is decoded without a `finish()`, so bytes after the inner term are ignored like the C, while the
+  plain path stays strict), `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl.
+  `Tag::Export`/`Tag::NewFun`,
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
+- `src/decode/tests.rs` → the `decode` unit-test suite (`#[cfg(test)] mod tests;` — the seeded
+  `term_to_binary` vectors, the accessor-asserted term structure and the error mapping); also the
+  `pub(crate)` decoder test helpers (`decode`, `assert_bad_arg`, `assert_system_limit`) shared with
+  `src/decode/fun.rs`/`src/decode/record.rs`
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
 - `src/decode/record.rs` → the `RECORD_EXT` (`67`) decoder (`Decoder::decode_record` — see §Records)
@@ -608,16 +739,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `is_record`/`make_record` plus the `beam_term::record` `record_*` readers and `AM_*`/size constants
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
-- `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
-  incl. the `COMPRESSED` seed
-- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
-  incl. the `COMPRESSED` wrapper/plain-revert round-trips and the oracle fun blobs (`EXPORT_EXT`,
-  `NEW_FUN_EXT` incl. the `fun() -> ok end` `erl_eval` golden)
-- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pin
-- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
-  streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
-- `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
-  encode↔decode, atom-cache encode↔decode, no-cache control)
+- `tests/ground_truth.rs` → byte-exact `term_to_binary` oracle vectors (incl. the `COMPRESSED` seed)
+- `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
+- `tests/minor_version.rs` → `{minor_version,N}` byte-exact goldens + live `erl` cross-check
+- `tests/map_key_order.rs` → the `MAP_EXT` key-order contract (see §Map key encode order)
+- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode, both atom flavours
+- `tests/compressed_decode.rs` → the top-level `COMPRESSED` (`80`) decode contract + negatives
+- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook (cached vs inline atom bytes)
+- `tests/wire_roundtrip.rs` → end-to-end `LOCAL_EXT` / atom-cache wire round-trips
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
   legacy-`FLOAT_EXT` decode vector, the malformed-input typed-error cases, and the oracle-gated

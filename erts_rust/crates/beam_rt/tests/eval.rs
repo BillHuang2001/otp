@@ -328,6 +328,87 @@ fn the_binary_segment_probes_agree_with_the_oracle() {
     }
 }
 
+/// The five `boot/*` corpus probes this pass closed: an `erlang:spawn/1` (or
+/// `spawn_link/1`) process sends its parent a message, which the parent's `receive` picks up
+/// from the mailbox. They previously hit the typed *capability gap* (the `-eval` evaluator
+/// had no `!` send, no bare-`receive` scheduler pump and no `spawn`); they now **AGREE** with
+/// the oracle.
+///
+/// Each expression is the corpus's own text (`tools/differential/src/corpus/boot.rs`) and is
+/// run through the **same** probe wrapper and argv the corpus builds, so the capability can
+/// never silently regress even where the oracle `erl` is unavailable. The `receive … after
+/// 1000 -> timeout` fallback in each probe makes a lost or dropped message an observable
+/// `ok timeout` divergence rather than a hang — and every golden below is the oracle's own
+/// `ok <value>` line.
+#[test]
+fn the_boot_spawn_probes_agree_with_the_oracle() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "boot/receive_message_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! hello end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok hello",
+        ),
+        (
+            "boot/receive_computed_value_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! 21 * 2 end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok 42",
+        ),
+        (
+            "boot/receive_pattern_match_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! {self(), ok} end), \
+             receive {From, _} -> From =/= Self after 1000 -> timeout end end",
+            "ok true",
+        ),
+        (
+            "boot/receive_ping_pong_between_processes",
+            "begin Self = self(), P = spawn(fun() -> \
+             receive {ping, From} -> From ! pong end end), \
+             P ! {ping, Self}, receive M -> M after 1000 -> timeout end end",
+            "ok pong",
+        ),
+        (
+            "boot/spawn_link_notifies_caller",
+            "begin Self = self(), spawn_link(fun() -> Self ! linked end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok linked",
+        ),
+    ];
+
+    for (id, expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{id}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{id}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{id}: stderr {stderr:?}");
+    }
+}
+
+/// The honest boundary underneath the `spawn` capability: a **bare** `receive` (no `after`)
+/// in `-eval` has no host timer to block on, and with nothing runnable to deliver a message it
+/// is a typed *capability gap* — exit 3 with exactly one `beam_rt: unsupported: …` line, never
+/// a hang and never a wrong `ok`.
+///
+/// The `receive … after 1000` fallback the `spawn` probes above rely on is what keeps them
+/// observable; this pins the complementary case. The gap is uncatchable (it travels as an
+/// uncatchable control signal), so the probe's own `try … catch` cannot turn it into an
+/// apparent `exception`, and stdout stays empty.
+#[test]
+fn a_bare_receive_with_no_sender_is_unsupported_not_a_hang() {
+    let (stdout, exit, stderr) = probe("receive X -> X end", &[], Kind::Value);
+    assert_eq!(exit, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stdout.is_empty(), "stdout {stdout:?}");
+    assert!(
+        stderr.starts_with("beam_rt: unsupported: "),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
+}
+
 /// The A.4 driver probe the differential corpus carries
 /// (`driver/port_backed_by_spawn_driver`): `erlang:open_port/2` **really** starts an OS
 /// process through the `spawn` driver and yields a real internal port.
@@ -453,6 +534,134 @@ fn a_spawn_driver_port_stream_is_read_back_as_a_data_message() {
         "ok {true,2,true,true,data,<<104,105,10>>}\n",
         "shape probe: stdout (stderr {stderr:?})"
     );
+}
+
+/// The A.4 **`port_command/2,3` write** probe the differential corpus carries
+/// (`driver/port_command_write_read`): `port_command/2` writes to the spawn child's stdin
+/// and its echo reads back through the same poll path as any other port output.
+///
+/// The corpus expression is pinned exactly (`cat` echoes `"hello"` ⇒
+/// `ok [104,101,108,108,111]`), together with the data forms the write accepts (a binary,
+/// a nested iolist, arbitrary bytes above 127), the `/3` arity's options, and the two
+/// `badarg` shapes the oracle raises (a non-port argument, and a port the runtime no longer
+/// holds).
+#[test]
+fn port_command_writes_to_the_spawn_child_and_its_echo_reads_back() {
+    let cases: &[(&str, &str, i32)] = &[
+        // The corpus's own A.4 probe — the gate case.
+        (
+            "begin P = open_port({spawn,\"cat\"}, []), port_command(P, \"hello\"), \
+             receive {P,{data,D}} -> D after 1000 -> no_data end end",
+            "ok [104,101,108,108,111]",
+            0,
+        ),
+        // A `binary`-stream port echoes the bytes as a binary.
+        (
+            "begin P = open_port({spawn,\"cat\"}, [binary]), port_command(P, \"hello\"), \
+             receive {P,{data,D}} -> D after 1000 -> no_data end end",
+            "ok <<104,101,108,108,111>>",
+            0,
+        ),
+        // A binary and a nested iolist are iodata; a byte above 127 goes through untouched
+        // (the stream is bytes, not text).
+        (
+            "begin P = open_port({spawn,\"cat\"}, []), port_command(P, <<255,0,1>>), \
+             port_command(P, [<<\"ab\">>, [99]]), \
+             receive {P,{data,D}} -> D after 1000 -> no_data end end",
+            "ok [255,0,1,97,98,99]",
+            0,
+        ),
+        // `port_command/3` takes an option list (`[]` here) and answers `true`.
+        (
+            "begin P = open_port({spawn,\"cat\"}, []), Res = port_command(P, \"hello\", []), \
+             receive {P,{data,D}} -> {Res,D} after 1000 -> {Res,no_data} end end",
+            "ok {true,[104,101,108,108,111]}",
+            0,
+        ),
+        // A non-port argument is `badarg` (the oracle's own class and reason). The variable
+        // is deliberately not named `R`: the probe's `catch C:R` would make it unsafe.
+        (
+            "port_command(5, \"x\")",
+            "exception error badarg",
+            1,
+        ),
+        // A port the runtime no longer holds is `badarg` too — never a silent success.
+        (
+            "begin P = open_port({spawn,\"cat\"},[]), erlang:port_close(P), \
+             port_command(P, \"x\") end",
+            "exception error badarg",
+            1,
+        ),
+    ];
+
+    for (expr, expected, expected_exit) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+}
+
+/// The two A.4 **port lifecycle** divergences the native floor and the poller close: a
+/// `port_info/1,2` on a port the runtime no longer holds answers the atom `undefined` (the
+/// oracle's value — *not* `badarg` and not an empty list), and a port opened with the
+/// `exit_status` option reports its reaped child's status as `{Port, {exit_status, Status}}`.
+///
+/// Every golden here is the system oracle's own answer, including the two boundaries: a
+/// port opened *without* `exit_status` never gets an exit message (the `after` fallback
+/// fires), and a normally-exiting child reports status `0`.
+#[test]
+fn port_info_after_close_and_exit_status_follow_the_oracle() {
+    let cases: &[(&str, &str)] = &[
+        // Closed port: `undefined` for both arities (verified against OTP 29/erts-17.1).
+        (
+            "begin P = open_port({spawn,\"true\"},[]), erlang:port_close(P), \
+             erlang:port_info(P) end",
+            "ok undefined",
+        ),
+        (
+            "begin P = open_port({spawn,\"true\"},[]), erlang:port_close(P), \
+             erlang:port_info(P, name) end",
+            "ok undefined",
+        ),
+        // A live port keeps its item list (the native floor must not shadow it).
+        (
+            "is_list(erlang:port_info(open_port({spawn,\"true\"},[])))",
+            "ok true",
+        ),
+        // The `exit_status` option: the reaped child's status is delivered.
+        (
+            "begin P = open_port({spawn,\"sh -c \\\"exit 3\\\"\"},[exit_status]), \
+             receive {P,{exit_status,S}} -> S after 2000 -> no_data end end",
+            "ok 3",
+        ),
+        (
+            "begin P = open_port({spawn,\"true\"},[exit_status]), \
+             receive {P,{exit_status,S}} -> S after 2000 -> no_data end end",
+            "ok 0",
+        ),
+        // Without the option there is no exit message at all — the fallback fires.
+        (
+            "begin P = open_port({spawn,\"true\"},[]), \
+             receive {P,{exit_status,S}} -> S after 300 -> no_data end end",
+            "ok no_data",
+        ),
+    ];
+
+    for (expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
 }
 
 /// A `binary`-stream read wider than the on-heap binary limit (64 bytes) is a typed

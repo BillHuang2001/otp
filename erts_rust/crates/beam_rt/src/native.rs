@@ -52,6 +52,7 @@
 mod application;
 mod code;
 mod init;
+mod port;
 mod process;
 #[cfg(test)]
 mod test_support;
@@ -92,6 +93,13 @@ impl RuntimeContext<'_> {
             ("init", "get_arguments", 0) => Some(self.get_arguments()),
             ("init", "get_status", 0) => Some(self.get_status()),
             ("os", "cmd", 1) => Some(self.os_cmd(args)),
+            // The port surface the `PortHook` seam cannot express: `port_command/2,3` (the
+            // port's *input* direction — see [`port`]) and the closed-port half of
+            // `port_info/1,2`. Every other form of those two names falls through to the
+            // registry (`port_native` answers `None` for it).
+            ("erlang", "port_command" | "port_info", 1 | 2 | 3) => {
+                self.port_native(function, arity, args)
+            }
             ("code", "get_path", 0) => Some(self.code_get_path()),
             ("code", "all_loaded", 0) => Some(self.code_all_loaded()),
             ("code", "which", 1) => Some(self.code_which(args)),
@@ -114,6 +122,15 @@ impl RuntimeContext<'_> {
                 Some(self.application_which_applications())
             }
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
+            ("erlang", "spawn", 1) => Some(self.spawn_1(args)),
+            ("erlang", "spawn", 2) => Some(self.spawn_2(args)),
+            ("erlang", "spawn", 3) => Some(self.spawn_3(args)),
+            ("erlang", "spawn_link", 1) => Some(self.spawn_link_1(args)),
+            ("erlang", "spawn_link", 2) => Some(self.spawn_link_2(args)),
+            ("erlang", "spawn_link", 3) => Some(self.spawn_link_3(args)),
+            ("erlang", "spawn_opt", 2) => Some(self.spawn_opt_2(args)),
+            ("erlang", "spawn_opt", 3) => Some(self.spawn_opt_3(args)),
+            ("erlang", "spawn_opt", 4) => Some(self.spawn_opt_4(args)),
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),

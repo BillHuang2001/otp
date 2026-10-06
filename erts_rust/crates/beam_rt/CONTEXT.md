@@ -68,6 +68,9 @@ impl Runtime {
     /// its `return` (a normally-returning process's *exit reason* is `normal`, not that
     /// value — see `runner.rs`/Design Decisions).
     pub fn spawn_process(&mut self, module: &str, function: &str, args: Vec<Eterm>) -> Result<ProcessId>;
+    /// Spawn a process whose entry point is a **fun** — a `.beam` fun term or an `-eval`
+    /// closure — and make it runnable (the `spawn/1` path; see `runner.rs`).
+    pub fn spawn_fun_process(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<ProcessId>;
     /// Put a spawned process back on the run queue and mark it `Runnable` (idempotent —
     /// an already-queued pid is a no-op; a pid with no engine is a typed error).
     pub fn enqueue_process(&mut self, pid: ProcessId) -> Result<()>;
@@ -155,8 +158,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     //             module == "erlang" → `error::is_known_unimplemented_bif` ? `unsupported:` :
     //             `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
-    // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
-    //             `eval::apply_eval_closure`; otherwise resolve the fun's module
+    // apply_fun → an **external** fun (`fun M:F/A`, `EXPORT_EXT`) dispatches its module/function/arity
+    //             through `call_bif`; an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`)
+    //             goes to `eval::apply_eval_closure`; otherwise resolve the fun's module
     //             (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
     //             `FunDescriptor { uniq, index }`) across `code_server.modules()`, then
     //             `Machine::new().run_label(...)`.
@@ -277,17 +281,25 @@ a **directory module**, split by responsibility:
 * `src/native/init.rs` — `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`,
   `init:get_status/0` (→ `{starting, started}`, the terminal boot state).
 * `src/native/code.rs` — `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`
-  (→ `{file, Path}` / atom `preloaded` / atom `false`), `code:is_sticky/1` (boolean) and `code:is_sticky/2`
+  (→ `{file, Path}` / atom `preloaded` / atom `false`; a module loaded from bytes with no recorded
+  path reports the empty string `""`, oracle-verified — never the atom `preloaded`), `code:is_sticky/1` (boolean) and `code:is_sticky/2`
   (an `error:undef` raise — the release does not have the `/2`), `code:ensure_loaded/1`
   (→ `{module, Mod}` / `{error, nofile}`), `code:lib_dir/0,1`, `code:root_dir/0` (the parent of
   `lib_dir/0`, i.e. the installation root).
-* `src/native/process.rs` — the `erlang` process/registry/reference entries: `make_ref/0`, the monitor
+* `src/native/process.rs` — the `erlang` process/registry/reference entries: `self/0` (the **running**
+  pid — `RuntimeContext::pid()`, so a spawned process reports its own), `make_ref/0`, the monitor
   pair `monitor/2` + `demonitor/1,2` (real, over `beam_process`'s monitor machinery and
-  [`Runtime::refs_mut`](crate::Runtime::refs_mut)), `ports/0` (the live ports, via
+  [`Runtime::refs_mut`](crate::Runtime::refs_mut)), the **spawn family** `spawn/1,2,3`,
+  `spawn_link/1,2,3`, `spawn_opt/2,3,4` (a fun entry — an `-eval` closure or a `.beam` fun — or an
+  `M:F/A` export; see Design Decisions), `ports/0` (the live ports, via
   `PortRegistry::ids`), `processes/0`, `pre_loaded/0` (the oracle's **exact** list *and* order, see
   `src/boot.rs`), `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`.
   `whereis(init)` answers the runtime's own root process — `Runtime::new` registers the name `init` on
   that pid, the same pid `group_leader/0` reports (the oracle answers `<0.0.0>`).
+* `src/native/port.rs` — `erlang:port_command/2,3` (writes to the spawn child's `stdin`; a binary /
+  char list / nested iolist) and the `port_info/1,2` item mapping (an unknown/closed port is the atom
+  `undefined`, matching the oracle). The `{fd, N}` form is a typed capability gap. See the ports
+  Known-Issues entry for the exact deviations.
 * `src/native/application.rs` — `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`,
   `loaded_applications/0`, `which_applications/0`, answered from a minimal native app view (the `.app`
   files resolved through the [`CodeServer`](crate::CodeServer) and a recursive-descent parser for the
@@ -510,8 +522,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   a **pooled** `beam_alloc::Heap` (`take_bif_heap`/`put_bif_heap`, stack discipline — a nested call
   takes a fresh heap) and the disjoint `output` field. That leaves `FunBridge` as the only
   `&mut Runtime` borrow in `call_registered`. `FunBridge::call_fun` delegates to the **existing**
-  `RuntimeContext::apply_fun` (an `-eval` closure via `eval::apply_eval_closure`, a `.beam` fun via the
-  engine's `Machine::run_label`) — the evaluator is never re-implemented. This is what makes
+  `RuntimeContext::apply_fun` (an external `fun M:F/A` via `call_bif`, an `-eval` closure via
+  `eval::apply_eval_closure`, a `.beam` local fun via the engine's `Machine::run_label`) — the
+  evaluator is never re-implemented. This is what makes
   `lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, including a loaded module applying an `-eval`
   fun (`eval::tests::a_loaded_module_applies_an_eval_closure`).
 * **Atom-table sharing is by handle (`Rc<AtomTable>`), interned copy-on-write.** `CodeServer` owns the
@@ -663,12 +676,23 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   `code:` section above), not a running `code_server` process.
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
-  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`) are typed
-  errors in `src/eval/mod.rs`. A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
+  the grammar is *unsupported* (exit 3). The `!` **send operator** and a **bare `receive`** that drives
+  a spawned sender are supported; the remaining M1 expression gaps are a bare `receive` that never
+  receives a message (no sender is runnable ⇒ `unsupported: receive: no matching message arrived`), a
+  `receive` inside a spawned process, and `after infinity` — all typed errors in `src/eval/mod.rs`.
+  A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
   is **uncatchable**: it travels as `Flow::Fatal` (like `halt`) so a `try`/`catch` in the probe cannot
   turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
+* **A lambda has no faithful `NEW_FUN_EXT` image.** `fun M:F/A` builds a real `FunKind::External` term
+  (`term_to_binary` → `EXPORT_EXT`, the `wire/export_ext_encode` case), but a lambda
+  (`fun() -> ok end`) is an evaluator closure (`EVAL_FUN_UNIQ` + an index into
+  `Runtime::eval_closures`) — a `Local` fun, which the ETF codec cannot encode, so
+  `term_to_binary(fun() -> ok end)` is the honest typed `unsupported: local_fun` (the
+  `wire/new_fun_ext_encode` case). A byte-exact `NEW_FUN_EXT` would need `erl_eval`'s own 16-byte MD5
+  uniq, fun index, creator pid and expression env — not reproducible without mimicking `erl_eval`
+  internals; no wrong encoding is emitted.
 * **Nested-BIF re-entrancy (a `fun` applied inside a BIF) is handled — with one limitation.**
   When a `fun`-taking `lists:*`/`maps:*` BIF calls back through `FunBridge`, the nested `RuntimeContext`
   takes a **fresh pooled heap**, shares the caller's sink through a `SharedSink` clone and reaches the
@@ -691,10 +715,14 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   blocked in `receive` waiting for a `{Port, {data, …}}` message stays `Waiting` (nothing drives the
   poller from the process mailbox). The read is **one** `Read::read` per readiness (one message per read,
   not a stream coalesced per driver callback); **stdin and stderr are never read** (they are pipes, but
-  nothing consumes them); `port_command/2` does not exist (it is on the known-unimplemented list), so
-  nothing is ever written to the child's stdin; `connected` flips to `false` only at `port_close/1`,
-  not when the child exits by itself; `exit_status`/`eof` are recognized but inert (their only
-  observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
+  nothing consumes them); `erlang:port_command/2,3` writes to the child's stdin (captured as
+  `LivePort.stdin`, `PortRegistry::write_command`; `src/native/port.rs`), accepting a binary / char
+  list / nested iolist and returning `true`, `BadArg` for a non-port or an unknown/closed id — the
+  `{fd, N}` form is a typed capability gap; `connected` flips to `false` only at `port_close/1`,
+  not when the child exits by itself; the `exit_status` option is honored — `poll_port_messages`
+  reaps the child (`Child::try_wait`, sliced at `EXIT_STATUS_POLL_SLICE` = 25 ms) and emits one
+  `{Port, {exit_status, Status}}` message (`Status` = `code()` else `128 + signal()`); `eof` is still
+  inert (its only observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
   exits on its own is reaped only by `port_close/1` or at runtime exit. A `binary`-stream read wider
   than 64 bytes is the typed *unsupported* gap (no off-heap ref-counted binary build path yet).
   `os:cmd/1` remains the runtime-native host spawn, unchanged.
@@ -708,26 +736,27 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `src/cli.rs` → `USAGE`, `parse` (the A.6 parser + the `run` argument grammar), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
 * `src/codeserver.rs` → `CodeServer`: the **one** shared atom table (held as an `Rc<AtomTable>`, copy-on-write on intern — see Design Decisions) + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir`/`atoms_handle` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7): `PRELOADED_MODULE_NAMES` is the oracle's **exact** `erlang:pre_loaded/0` list *and* order (`persistent_term` first … `erts_code_purger` last, verified against OTP 29/erts-17.1), which `pre_loaded/0` and `code:all_loaded/0` reproduce verbatim + the core-atom seed (also interns `info::INFO_ATOMS` and `port::PORT_INFO_ATOMS`) + the boot banner
-* `src/port.rs` → the A.4 `PortHook` provider: `PortRegistry` (a `beam_process::PortTable` + an id → `LivePort` map + a per-registry scratch `Heap`; `contains`/`len`/`is_empty`/`ids`), `LivePort` (which keeps the child's `stdout` handle so the stream can be read), `RuntimePorts` (the `beam_bifs::PortHook`: Name/Options parsing + validation → `BeamError::BadArg`, the spawn driver via `std::process::Command`, kill/reap on close, real `port_info` pairs), `RuntimeContext::poll_port_messages` (the `beam_io::Poller`-driven read that produces `{Port, {data, Data}}` messages), `PortName`/`StreamType`/`PORT_INFO_ATOMS`
+* `src/port.rs` → the A.4 `PortHook` provider: `PortRegistry` (a `beam_process::PortTable` + an id → `LivePort` map + a per-registry scratch `Heap`; `contains`/`len`/`is_empty`/`ids`/`is_live`/`write_command`), `LivePort` (keeps the child's `stdout` handle so the stream can be read and, since the `port_command` write path, its `stdin`), `RuntimePorts` (the `beam_bifs::PortHook`: Name/Options parsing + validation → `BeamError::BadArg`, the spawn driver via `std::process::Command`, kill/reap on close, real `port_info` pairs — an unknown/closed port answers `undefined`), `RuntimeContext::poll_port_messages` (the `beam_io::Poller`-driven read that produces `{Port, {data, Data}}` messages and, for an `exit_status` port, the reaped `{Port, {exit_status, S}}`), `PortName`/`StreamType`/`PORT_INFO_ATOMS`
 * `src/info.rs` → `SUPPORTED_KEYS`, `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `eval_heap` exposes the runtime's long-lived `-eval` heap a non-byte-aligned bitstring is materialized on; `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `SharedSink` — the cloneable `Rc<RefCell<..>>`-backed output handle a nested context shares; `reentrancy_capable` (installs the `TableRegistry` only for a call that cannot apply a fun argument, so `ets:*` inside a fun reaches the outer tables); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through; `call_registered` installs exactly these three `BifContext` seams (`AtomInterner`/`FunCaller`/`PortHook`) and **no** `SendHook`, so the `beam_bifs`-registered `erlang:send/2` / `erlang:'!'/2` raise `unsupported_bif` (message delivery is owned by a future `beam_process`/`beam_message` wiring); its `erlang`-namespace fallback consults `error::is_known_unimplemented_bif` **after** the registry dispatch, so a known-but-unimplemented OTP `erlang` BIF is `unsupported:` (exit 3) rather than a plain `is not a BIF` diagnostic
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` dispatches an external `fun M:F/A` through `call_bif`, an `-eval` closure (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`, and a `.beam` local fun through the engine's `Machine::run_label`; `send_message` (the `ExecutionContext` seam) delivers to the target pid's mailbox; heap check); `eval_heap` exposes the runtime's long-lived `-eval` heap a non-byte-aligned bitstring is materialized on; `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `SharedSink` — the cloneable `Rc<RefCell<..>>`-backed output handle a nested context shares; `reentrancy_capable` (installs the `TableRegistry` only for a call that cannot apply a fun argument, so `ets:*` inside a fun reaches the outer tables); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through; `call_registered` installs exactly these three `BifContext` seams (`AtomInterner`/`FunCaller`/`PortHook`) and **no** `SendHook`, so the `beam_bifs`-registered `erlang:send/2` / `erlang:'!'/2` raise `unsupported_bif` (message delivery is owned by a future `beam_process`/`beam_message` wiring); its `erlang`-namespace fallback consults `error::is_known_unimplemented_bif` **after** the registry dispatch, so a known-but-unimplemented OTP `erlang` BIF is `unsupported:` (exit 3) rather than a plain `is not a BIF` diagnostic
 * `src/native.rs` → the runtime-native BIF floor: the module docs, `try_native` (the `(module, function, arity)` dispatch consulted **before** the registry) and the shared helpers; the `erlang`-core entries `halt/0,1`, `display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `os:cmd/1`; declares the submodules below
 * `src/native/init.rs` → the `init:*` entries (`get_argument/1`, `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`)
 * `src/native/code.rs` → the `code:*` entries (`get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0`) over the `CodeServer` state + the preloaded registry
-* `src/native/process.rs` → the `erlang` process/registry/reference entries (`make_ref/0`, `monitor/2`, `demonitor/1,2`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`) over `beam_process`'s tables + the runtime reference id space
+* `src/native/process.rs` → the `erlang` process/registry/reference entries (`self/0`, `make_ref/0`, `monitor/2`, `demonitor/1,2`, the spawn family `spawn/1,2,3`/`spawn_link/1,2,3`/`spawn_opt/2,3,4`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`) over `beam_process`'s tables + the runtime reference id space
+* `src/native/port.rs` → the `erlang:port_command/2,3` write path (the child's `stdin`) and the `port_info/1,2` item mapping (`undefined` for an unknown/closed port)
 * `src/native/application.rs` → the `application:*` entries (`get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0`) over a minimal native app view (the `.app` files resolved through the `CodeServer` + a recursive-descent `.app` term-text parser). Its production half is ~700 lines; the file legitimately reads past the ~1000-line baseline because of the comprehensive colocated `#[cfg(test)] mod tests` (stated in the file header) — it is **not** restructured
 * `src/native/test_support.rs` → the floor's shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`)
-* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; binary-comprehension evaluation (`Qual::BinaryGenerator`) and the bit-buffer construction (`BitBuf`/`materialize_bits`, byte-aligned → binary, else a bitstring on `eval_heap`); `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
+* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; the `!` send operator (delivers to the target pid's mailbox) and `receive` (scans the running process's mailbox; a bare `receive` and `receive … after T` pump the scheduler via `Runtime::pump_scheduler` so a spawned sender is driven); `fun M:F/A` builds a real `FunKind::External` term (lambdas stay evaluator closures); binary-comprehension evaluation (`Qual::BinaryGenerator`) and the bit-buffer construction (`BitBuf`/`materialize_bits`, byte-aligned → binary, else a bitstring on `eval_heap`); `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
 * `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; the `<=` binary-generator qualifier; a segment's `:Size` parsed in segment context so a following `/Type` is a specifier, not a division; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
 * `src/mailbox.rs` → `RuntimeContext`'s nine `beam_engine::Mailbox` seam methods over the running process's real `beam_message::Queue`, with per-pid scan/marker state in `Runtime.mailboxes: HashMap<ProcessId, MailboxState>` (the receive cursor + the `recv_marker_*` table); `MailboxState` + `Runtime::mailboxes` are the durable position a blocked `receive` resumes against
-* `src/runner.rs` → the `beam_process::ProcessRunner`: `ProcessEntry`, `ProcessEngine`, `RunnerState` (`engines`/`results`/`exits`), `RuntimeRunner` (implements `ProcessRunner::run` over `RuntimeContext::for_process`; first run `run_export_outcome`, resume `resume_outcome`; maps `Returned`→record+`Exit(normal)`, `Wait`→park+`ProcessState::Waiting`+`RunOutcome::Wait`, `Err`→`exit_reason` term+`Exit`); `exit_reason` maps a `BeamError` to an atom reason (never panics); module docs carry the borrow strategy + the "exit reason is not the return value" rule
-* `src/runtime.rs` → `Runtime`: boot-wiring (registers the `init` name on its own root process at construction, so `whereis(init)` / `group_leader/0` agree with the oracle), code server, module cache, `run_function`/`run_module`/`run_named` (the slice), the **scheduler API** (`spawn_process`/`enqueue_process`/`run_one_slice`/`run_slices`/`run_scheduler`/`process_result`/`process_exit`/`run_queue_len` + the private `run_pass`/`take_processes`/`put_processes` move-out dance), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`); `refs_mut` (the one `beam_process::RefAllocator` shared by `make_ref/0` and monitor/demonitor); fields `processes` (`pub(crate)`), `mailboxes`, `scheduler`, `runner_state`, `refs`, `references` (the reference→monitor map `demonitor/1` reads)
+* `src/runner.rs` → the `beam_process::ProcessRunner`: `ProcessEntry`, `ProcessEngine`, `RunnerState` (`engines`/`results`/`exits`), `RuntimeRunner` (implements `ProcessRunner::run` over `RuntimeContext::for_process`; first run `run_export_outcome`, resume `resume_outcome`; maps `Returned`→record+`Exit(normal)`, `Wait`→park+`ProcessState::Waiting`+`RunOutcome::Wait`, `Err`→`exit_reason` term+`Exit`); `exit_reason` maps a `BeamError` to an atom reason (never panics); `ProcessEntry` also describes a **fun entry** (a `.beam` fun term or an `-eval` closure) so `spawn/1` can run a fun body (see `Runtime::spawn_fun_process`); module docs carry the borrow strategy + the "exit reason is not the return value" rule
+* `src/runtime.rs` → `Runtime`: boot-wiring (registers the `init` name on its own root process at construction, so `whereis(init)` / `group_leader/0` agree with the oracle), code server, module cache, `run_function`/`run_module`/`run_named` (the slice), the **scheduler API** (`spawn_process`/`enqueue_process`/`run_one_slice`/`run_slices`/`run_scheduler`/`process_result`/`process_exit`/`run_queue_len` + the private `run_pass`/`take_processes`/`put_processes` move-out dance), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`); `spawn_fun_process` (spawn a process whose entry point is a fun — a `.beam` fun or an `-eval` closure) and `pump_scheduler` (drive scheduler slices from the `-eval` receive path so a spawned sender runs); `refs_mut` (the one `beam_process::RefAllocator` shared by `make_ref/0` and monitor/demonitor); fields `processes` (`pub(crate)`), `mailboxes`, `scheduler`, `runner_state`, `refs`, `references` (the reference→monitor map `demonitor/1` reads)
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
-* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the `driver/port_backed_by_spawn_driver` port probe (a real OS process, the `port_info` pairs, `port_close/1`), the `driver/spawn_driver_port_stream_read` port-stream probe (the `ok <<104,105,10>>` golden, the `list` default, the bound-port match, the `after` fallback, the >64-byte binary read as an exit-3 capability gap), the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
+* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the `driver/port_backed_by_spawn_driver` port probe (a real OS process, the `port_info` pairs, `port_close/1`), the `driver/spawn_driver_port_stream_read` port-stream probe (the `ok <<104,105,10>>` golden, the `list` default, the bound-port match, the `after` fallback, the >64-byte binary read as an exit-3 capability gap), the two `semantics/*` binary-segment probes, the 5 `boot/*` spawn probes (`the_boot_spawn_probes_agree_with_the_oracle`), the `erlang:port_command/2` write/echo probe and the `wire/export_ext_encode` golden, control-flow extras and the unsupported-classification check
 * `tests/port_stream.rs` → the port-stream read at the **library** boundary (`Runtime::eval`), asserting the `{Port, {data, Data}}` term structurally (binary payload, char-list payload, and the `after` fallback) rather than only through the printer
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
@@ -736,9 +765,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
 ## Handoffs (owned by OTHER nodes)
-`differential suite` is at **`summary: total=285 agree=281 mismatch=0 unsupported=4 skipped=0`**.
+`differential suite` is at **`summary: total=333 agree=332 mismatch=0 unsupported=1 skipped=0`**.
 Remaining asks owned elsewhere:
-* **The 4 `unsupported` are the `wire/*` ETF-encode cases**, owned by `beam_codec`/`beam_dist`.
+* **The 1 `unsupported` is `wire/new_fun_ext_encode`** (a lambda's `NEW_FUN_EXT` image — see the Known-Issues entry above; no wrong encoding is emitted). Legacy `wire/*` encode/decode asks (`port_info/2` item shape, `PORT_EXT`/`V4_PORT_EXT`, `{minor_version,1}` atom encoding, map-key encode order, `compressed` decode, `string:to_integer/1`'s missing `erts_internal:list_to_integer/2`) live in `beam_codec`/`beam_bifs` and are outside this crate.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also

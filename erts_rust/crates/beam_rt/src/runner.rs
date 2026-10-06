@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
-use beam_engine::{Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
 use beam_loader::Module;
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 use beam_term::{Atom, Eterm};
@@ -56,13 +56,34 @@ use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
 
 /// The entry point of one runtime-scheduled process: what to run, with which arguments.
-pub(crate) struct ProcessEntry {
-    /// The module the entry point lives in (shared with the code server's cache).
-    pub(crate) module: Arc<Module>,
-    /// The exported function's name atom, in that module's atom table.
-    pub(crate) function: Atom,
-    /// The arity the function is entered with (always `args.len()`).
-    pub(crate) arity: u32,
+///
+/// A process's entry point lives here (not on the `beam_process` PCB, which has no such
+/// field) because only the runtime knows how to execute code: it is the runtime's own
+/// pid → entry side table.
+pub(crate) enum ProcessEntry {
+    /// A module export: enter `module:function/arity` with the process's args.
+    Export {
+        /// The module the entry point lives in (shared with the code server's cache).
+        module: Arc<Module>,
+        /// The exported function's name atom, in that module's atom table.
+        function: Atom,
+        /// The arity the function is entered with (always `args.len()`).
+        arity: u32,
+    },
+    /// A fun value: apply the fun to the process's args.
+    ///
+    /// This is what `erlang:spawn/1` (and the fun head of `spawn_link/1`/`spawn_opt/2`)
+    /// creates: an `-eval` evaluator closure, or a `.beam` fun term. There is no engine
+    /// [`Machine`] for it — the fun is applied through
+    /// [`ExecutionContext::apply_fun`](beam_engine::ExecutionContext::apply_fun), which
+    /// routes an `-eval` closure back into the evaluator (`crate::eval::apply_eval_closure`)
+    /// instead of re-implementing the evaluator here.
+    Fun {
+        /// The fun term to apply, built on a heap that outlives the process (the
+        /// runtime's arena or a pooled BIF heap — both are pointer-stable and never
+        /// reset in Milestone 1).
+        fun: Eterm,
+    },
 }
 
 /// The engine state of one runtime-scheduled process.
@@ -77,6 +98,10 @@ struct ProcessEngine {
     /// has run, but kept so a re-run of a finished process is impossible to get wrong.
     args: Vec<Eterm>,
     /// The `(func, pc)` a `receive` suspended at, until the process is woken.
+    ///
+    /// Only an [`ProcessEntry::Export`] process can park: a fun entry is applied
+    /// synchronously (the evaluator never returns a resume address), so `parked` stays
+    /// `None` for it.
     parked: Option<(u32, u32)>,
 }
 
@@ -107,6 +132,15 @@ impl RunnerState {
                 parked: None,
             },
         );
+    }
+
+    /// Registers a freshly spawned process whose entry point is a **fun value**.
+    ///
+    /// This is the `erlang:spawn/1` (and `spawn_link/1`/`spawn_opt/2`) path: `fun` is an
+    /// `-eval` closure or a `.beam` fun term and it is applied to `args` when the process
+    /// first runs (see [`ProcessEntry::Fun`]).
+    pub(crate) fn spawn_fun(&mut self, pid: ProcessId, fun: Eterm, args: Vec<Eterm>) {
+        self.spawn(pid, ProcessEntry::Fun { fun }, args);
     }
 
     /// Whether `pid` is a process this runtime spawned an engine for.
@@ -201,17 +235,37 @@ impl ProcessRunner for RuntimeRunner<'_> {
             match engine.parked {
                 // A resume continues the SAME machine: the registers, the Erlang stack and
                 // the frames of the suspended `receive` must survive, so this deliberately
-                // does not reset (see `Machine::resume_outcome`).
-                Some((func, pc)) => engine
-                    .machine
-                    .resume_outcome(&engine.entry.module, func, pc, &mut ctx),
-                None => engine.machine.run_export_outcome(
-                    &engine.entry.module,
-                    engine.entry.function,
-                    engine.entry.arity,
-                    &engine.args,
-                    &mut ctx,
-                ),
+                // does not reset (see `Machine::resume_outcome`). Only a module-export
+                // process can park, so a parked fun entry is unreachable — it is reported
+                // as a typed capability gap rather than run as a wrong (or empty) function.
+                Some((func, pc)) => match &engine.entry {
+                    ProcessEntry::Export { module, .. } => {
+                        engine.machine.resume_outcome(module, func, pc, &mut ctx)
+                    }
+                    ProcessEntry::Fun { .. } => Err(crate::error::unsupported(
+                        "resume of a fun-bodied process (a fun entry never suspends)",
+                    )),
+                },
+                None => match &engine.entry {
+                    ProcessEntry::Export {
+                        module,
+                        function,
+                        arity,
+                    } => engine.machine.run_export_outcome(
+                        module,
+                        *function,
+                        *arity,
+                        &engine.args,
+                        &mut ctx,
+                    ),
+                    // A fun entry is applied synchronously: `apply_fun` routes an `-eval`
+                    // closure back into the evaluator and a `.beam` fun into the engine's
+                    // label entry — the evaluator is never re-implemented here. A returned
+                    // value is the fun's result, so it records exactly like an export's.
+                    ProcessEntry::Fun { fun } => ctx
+                        .apply_fun(*fun, &engine.args)
+                        .map(EngineRunOutcome::Returned),
+                },
             }
         };
 
@@ -329,7 +383,7 @@ mod tests {
         let function = module.atom_table.lookup("add").expect("add is interned");
         state.spawn(
             pid,
-            ProcessEntry {
+            ProcessEntry::Export {
                 module,
                 function,
                 arity: 2,
@@ -338,6 +392,20 @@ mod tests {
         );
         assert!(state.contains(pid));
         assert!(state.result(pid).is_none());
+    }
+
+    #[test]
+    fn spawn_fun_registers_a_fun_engine() {
+        // The `erlang:spawn/1` bookkeeping: a fun-bodied process has an engine (so the
+        // scheduler can run it and a re-enqueue is not a silent no-op), with no module
+        // and no recorded outcome yet.
+        let mut state = RunnerState::default();
+        let pid = ProcessId::new(5, 0);
+        assert!(!state.contains(pid));
+        state.spawn_fun(pid, make_small(1), Vec::new());
+        assert!(state.contains(pid));
+        assert!(state.result(pid).is_none());
+        assert!(state.exit(pid).is_none());
     }
 
     #[test]

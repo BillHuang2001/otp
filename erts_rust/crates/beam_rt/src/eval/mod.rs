@@ -51,25 +51,25 @@
 //!
 //! # Known Milestone-1 gaps (typed errors, never wrong results)
 //!
-//! * `!` (send) — there is no mailbox in `-eval`, so it is a typed `unsupported`.
-//! * `receive` without an `after` clause — likewise (it would block forever). A
-//!   `receive … after T` *does* run: its clauses are matched against the port messages
-//!   `RuntimeContext::poll_port_messages` polls from `open_port/2` streams within `T` ms,
-//!   and the `after` body is the fallback.
+//! * `receive` without an `after` clause **and** with nothing runnable to deliver a message
+//!   is a typed `unsupported` (there is no host timer to block on); a bare `receive` inside a
+//!   spawned process is too, because that context runs *inside* a scheduler slice and must
+//!   not re-enter the scheduler.
 //! * `catch Expr` yields `{'EXIT', Reason}` for the `error`/`exit` classes (the
 //!   oracle appends a stacktrace); M1 evaluates without one.
 //!
 //! A `fun` built here **can** escape into a loaded module: the closure bodies live on
 //! the [`Runtime`](crate::runtime::Runtime) (not on the evaluator), so a higher-order
 //! stdlib call such as `lists:map(fun(X) -> X*X end, …)` applies it back through
-//! [`RuntimeContext::apply_fun`](crate::context::RuntimeContext).
+//! [`RuntimeContext::apply_fun`](crate::context::RuntimeContext). A `fun m:f/A` is not a
+//! closure at all: it is the real `EXPORT_EXT` term, applied through the host's dispatch.
 
 mod ast;
 mod parse;
 
 use std::collections::HashMap;
 use std::rc::Rc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use beam_common::{BeamError, ExceptionClass, Raise, Result};
 use beam_engine::{terms, ExecutionContext};
@@ -87,6 +87,15 @@ use ast::{is_var_name, BinOp, CatchClause, Clause, Expr, MapField, Qual, Seg, Se
 /// recognised as one of *its* closures and resolved through
 /// [`Runtime::eval_closures`](crate::runtime::Runtime).
 pub(crate) const EVAL_FUN_UNIQ: u64 = 0x6265_616d_7274_0001;
+
+/// How many scheduler slices one `receive` pump may run before it gives up.
+///
+/// The pump exists so a process `erlang:spawn/1` started can run and deliver a message the
+/// evaluator is waiting for. It must be **bounded**: `-eval` has no scheduler of its own and
+/// a receive that could pump forever would hang the CLI (the very thing a capability gap is
+/// meant to avoid). 64 slices is far more than the corpus needs and small enough that a
+/// pathological program reports the gap promptly.
+const RECEIVE_PUMP_SLICES: u64 = 64;
 
 /// Converts a `Result<_, BeamError>` into the evaluator's control flow.
 ///
@@ -135,17 +144,12 @@ pub(crate) struct FunBody {
     env: Env,
 }
 
-/// The two kinds of fun this evaluator builds.
+/// The kind of fun this evaluator builds.
+///
+/// A `fun m:f/A` is **not** one of these: it is the real
+/// [`FunKind::External`](beam_codec::FunKind::External) term (see
+/// [`Evaluator::fun_ref`]), so only the local closure needs a stored body.
 enum FunKind {
-    /// `fun m:f/A` — apply `m:f` with the call's arguments.
-    Remote {
-        /// The target module.
-        module: String,
-        /// The target function.
-        function: String,
-        /// The target arity.
-        arity: u32,
-    },
     /// `fun (Params) -> Body end` — a closure over `env`.
     Local {
         /// The optional self-recursion name (`fun F(…) -> … end`).
@@ -695,9 +699,18 @@ impl Evaluator<'_, '_> {
                 };
                 self.call("erlang", name, &[left, right])
             }
-            BinOp::Send => Err(Flow::Fatal(error::unsupported(
-                "the send operator '!' (no mailbox in -eval)",
-            ))),
+            BinOp::Send => {
+                // `Target ! Message`: evaluate the target, then the message, and deliver
+                // through the host's `send_message` seam (which resolves the pid and copies
+                // the message into the recipient's mailbox). The value of `!` is the message,
+                // exactly as the oracle's is.
+                let target = self.expr(lhs, env)?;
+                let message = self.expr(rhs, env)?;
+                match self.ctx.send_message(target, message) {
+                    Ok(()) => Ok(message),
+                    Err(err) => Err(self.flow_from_error(err)),
+                }
+            }
             _ => {
                 let left = self.expr(lhs, env)?;
                 let right = self.expr(rhs, env)?;
@@ -880,8 +893,19 @@ impl Evaluator<'_, '_> {
     }
 
     /// Applies a fun value: one of this evaluator's closures, or a `.beam` fun.
+    ///
+    /// An **external** fun (`fun m:f/A`) is neither: it carries no `uniq`/`index`
+    /// descriptor — its whole identity is `module/function/arity` — so it must skip the
+    /// closure lookup (`terms::fun_uniq` rejects it with `BadArg`) and go straight to the
+    /// host's ordinary dispatch, which is what
+    /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) does for it.
     fn apply_value(&mut self, function: Eterm, args: &[Eterm]) -> EResult<Eterm> {
-        if terms::is_fun(function) {
+        if terms::is_fun(function)
+            && !matches!(
+                heap!(beam_codec::term::fun_kind_term(function)),
+                beam_codec::FunKind::External
+            )
+        {
             let uniq = heap!(terms::fun_uniq(function));
             let index = heap!(terms::fun_index(function)) as usize;
             if uniq == EVAL_FUN_UNIQ {
@@ -904,16 +928,6 @@ impl Evaluator<'_, '_> {
         args: &[Eterm],
     ) -> EResult<Eterm> {
         match &body.kind {
-            FunKind::Remote {
-                module,
-                function: name,
-                arity,
-            } => {
-                if args.len() != *arity as usize {
-                    return Err(Flow::Fatal(BeamError::BadArity));
-                }
-                self.call(module, name, args)
-            }
             FunKind::Local { name, clauses } => {
                 for clause in clauses {
                     if clause.params.len() != args.len() {
@@ -1070,36 +1084,143 @@ impl Evaluator<'_, '_> {
 
     /// `receive … end`.
     ///
-    /// `-eval` has no process mailbox, so a bare `receive` (no `after`) is an uncatchable
-    /// capability gap. A `receive … after T` does have a meaning, though: it is the shape
-    /// the runtime's port poller delivers into — `open_port({spawn, …}, …)` output arrives
-    /// as `{Port, {data, Data}}` messages. The clause is therefore matched against the
-    /// messages [`RuntimeContext::poll_port_messages`] produces within `T` milliseconds,
-    /// and the `after` body runs only when none matched (the `no_data` fallback preserved).
+    /// The `-eval` evaluator scans the running process's **real mailbox** (the same one the
+    /// engine's compiled `receive` scans): the first message a clause's pattern and guards
+    /// match is removed and its clause body evaluated. A message that matches nothing stays
+    /// in the mailbox (that is the BEAM's selective receive).
+    ///
+    /// Because `-eval` runs *outside* a scheduler slice, a message that has not arrived yet
+    /// has a meaning here too: the scheduler is **pumped** (bounded — see
+    /// [`RECEIVE_PUMP_SLICES`]) so a process `erlang:spawn/1` started runs and can deliver.
+    /// That is what makes `spawn(fun() -> Self ! hello end), receive M -> M after 1000 -> …`
+    /// work end to end.
+    ///
+    /// * **with `after T`** — the mailbox is scanned, then the scheduler pumped, then — with
+    ///   nothing runnable — the port poller waited on for the remaining time (the shape
+    ///   `open_port({spawn, …}, …)` output arrives through). The `after` body runs once the
+    ///   deadline passes with no match. The wait is bounded by a single deadline, so the case
+    ///   with nothing to run and no port output cannot busy-spin.
+    /// * **without `after`** — a blocking receive. It pumps the scheduler while anything is
+    ///   runnable and then reports the typed capability gap `receive: no matching message
+    ///   arrived` rather than hanging (there is no host timer to block on in Milestone 1).
     fn receive(&mut self, receive: &ast::Receive, env: &mut Env) -> EResult<Eterm> {
         match &receive.after {
             Some((timeout, body)) => {
                 let mut timeout_env = env.clone();
                 let value = self.expr(timeout, &mut timeout_env)?;
                 let millis = self.timeout_millis(value)?;
-                let messages = match self.ctx.poll_port_messages(Duration::from_millis(millis)) {
-                    Ok(messages) => messages,
-                    Err(err) => return Err(Flow::Fatal(err)),
-                };
-                for message in messages {
-                    if let Some(result) = self.match_clauses(&receive.clauses, message, env)? {
-                        return Ok(result);
+                let deadline = Instant::now() + Duration::from_millis(millis);
+                loop {
+                    if let Some((index, bound)) = self.try_mailbox_receive(&receive.clauses, env)? {
+                        let mut clause_env = bound;
+                        return self.exprs(&receive.clauses[index].body, &mut clause_env);
                     }
+                    // A runnable process (a `spawn`ed child, say) may deliver the message we
+                    // are waiting for: pump it and rescan. `0` slices means nothing was
+                    // runnable, so the mailbox cannot have changed.
+                    if self.ctx.may_pump_scheduler() {
+                        let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
+                        if ran > 0 {
+                            continue;
+                        }
+                    }
+                    let remaining = deadline.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        break;
+                    }
+                    // The port poller owns the *other* message source (see the module docs of
+                    // `crate::context`): its messages are produced, matched and discarded, not
+                    // enqueued, so a non-matching one is not left behind.
+                    let messages = match self.ctx.poll_port_messages(remaining) {
+                        Ok(messages) => messages,
+                        Err(err) => return Err(Flow::Fatal(err)),
+                    };
+                    for message in messages {
+                        if let Some(result) = self.match_clauses(&receive.clauses, message, env)? {
+                            return Ok(result);
+                        }
+                    }
+                    // Nothing runnable and no matching port output. The poller waited the
+                    // remaining time, so a second round could only repeat it: run the `after`
+                    // body rather than spinning.
+                    break;
                 }
                 let mut body_env = env.clone();
                 self.exprs(body, &mut body_env)
             }
-            None => Err(Flow::Fatal(error::unsupported(
-                "receive without an after clause (no mailbox in -eval)",
-            ))),
+            None => loop {
+                if let Some((index, bound)) = self.try_mailbox_receive(&receive.clauses, env)? {
+                    let mut clause_env = bound;
+                    return self.exprs(&receive.clauses[index].body, &mut clause_env);
+                }
+                // A bare receive inside a spawned process cannot pump the scheduler it is
+                // itself running under (that would run a second process from within a slice),
+                // and there is no host timer to block on — a typed gap, never a hang.
+                if !self.ctx.may_pump_scheduler() {
+                    return Err(Flow::Fatal(error::unsupported(
+                        "receive (no after clause) inside a spawned process",
+                    )));
+                }
+                let ran = heap!(self.ctx.runtime.pump_scheduler(RECEIVE_PUMP_SLICES));
+                if ran == 0 {
+                    return Err(Flow::Fatal(error::unsupported(
+                        "receive: no matching message arrived",
+                    )));
+                }
+            },
         }
     }
 
+    /// The first clause of `clauses` that matches `value` (pattern, then guards), with the
+    /// environment it bound and the clause's index.
+    ///
+    /// The clause **body is not evaluated** — the caller decides when to run it (a `receive`
+    /// removes the message first, the BEAM's `remove_message` ordering).
+    fn select_clause(
+        &mut self,
+        clauses: &[Clause],
+        value: Eterm,
+        env: &Env,
+    ) -> EResult<Option<(usize, Env)>> {
+        for (index, clause) in clauses.iter().enumerate() {
+            let mut clause_env = env.clone();
+            if let Some(pattern) = &clause.pattern {
+                if !self.match_pattern(pattern, value, &mut clause_env)? {
+                    continue;
+                }
+            }
+            if !self.guards_ok(&clause.guards, &mut clause_env)? {
+                continue;
+            }
+            return Ok(Some((index, clause_env)));
+        }
+        Ok(None)
+    }
+
+    /// Scans the running process's mailbox for the first message a clause matches.
+    ///
+    /// On a match the message is **removed from the mailbox** (before the body runs, the
+    /// BEAM's `remove_message` ordering) and `(clause_index, bound_env)` is returned.
+    /// `Ok(None)` means no message in the mailbox matches — every message stays queued.
+    fn try_mailbox_receive(
+        &mut self,
+        clauses: &[Clause],
+        env: &Env,
+    ) -> EResult<Option<(usize, Env)>> {
+        let messages = match self.ctx.mailbox_messages() {
+            Ok(messages) => messages,
+            Err(err) => return Err(self.flow_from_error(err)),
+        };
+        for (message_index, message) in messages.iter().enumerate() {
+            if let Some((clause_index, bound)) = self.select_clause(clauses, *message, env)? {
+                if let Err(err) = self.ctx.remove_mailbox_message(message_index) {
+                    return Err(self.flow_from_error(err));
+                }
+                return Ok(Some((clause_index, bound)));
+            }
+        }
+        Ok(None)
+    }
     /// A `receive … after T` timeout as a millisecond count.
     ///
     /// A negative value, a float or any other term is `error:badarg` (the oracle's own
@@ -1140,16 +1261,23 @@ impl Evaluator<'_, '_> {
     }
 
     /// `fun Name/Arity` / `fun Mod:Name/Arity` — a local `fun f/A` is `erlang:f/A`.
+    ///
+    /// The result is the real [`FunKind::External`](beam_codec::FunKind::External) term
+    /// (the `EXPORT_EXT` encoding), **not** one of this evaluator's closures: `fun m:f/A`
+    /// captures no environment and its whole identity is `module/function/arity`, so the
+    /// term *is* the fun — `term_to_binary/1` encodes it as `EXPORT_EXT` and
+    /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) applies it through the
+    /// ordinary dynamic call, exactly as the oracle does.
     fn fun_ref(&mut self, module: Option<&str>, name: &str, arity: u32) -> EResult<Eterm> {
-        let body = FunBody {
-            kind: FunKind::Remote {
-                module: module.unwrap_or("erlang").to_string(),
-                function: name.to_string(),
-                arity,
-            },
-            env: Env::new(),
-        };
-        self.register_fun(body, arity)
+        let module = self.atom(module.unwrap_or("erlang"));
+        let function = self.atom(name);
+        let heap = self.ctx.eval_heap();
+        Ok(heap!(beam_codec::term::make_fun_external(
+            heap,
+            arity as usize,
+            atom_val(module),
+            atom_val(function),
+        )))
     }
 
     /// `fun [(Name)](Params) -> Body … end`.
@@ -1971,6 +2099,35 @@ mod tests {
     }
 
     #[test]
+    fn an_exported_fun_is_the_real_export_ext_term() {
+        // `fun m:f/A` is not one of this evaluator's closures: it captures no environment,
+        // so the term **is** the fun — the real `EXPORT_EXT` encoding. `term_to_binary/1`
+        // therefore emits tag 113 + module `lists` + function `reverse` + arity 1, the
+        // differential `wire/export_ext_encode` golden (20 bytes).
+        assert_eq!(
+            bits("term_to_binary(fun lists:reverse/1)"),
+            (
+                vec![
+                    131, 113, 119, 5, 108, 105, 115, 116, 115, 119, 7, 114, 101, 118, 101, 114,
+                    115, 101, 97, 1,
+                ],
+                0,
+                20 * 8
+            )
+        );
+        // Applying it stays an ordinary dynamic call, so all three shapes work: a remote
+        // fun, the `erlang:apply/2` seam, an auto-imported `erlang` fun and the
+        // module-relative `fun Name/Arity` form.
+        assert_eq!(ints("(fun lists:reverse/1)([1,2,3])"), vec![3, 2, 1]);
+        assert_eq!(
+            ints("erlang:apply(fun lists:reverse/1, [[1,2,3]])"),
+            vec![3, 2, 1]
+        );
+        assert_eq!(ints("lists:map(fun erlang:abs/1, [-1,2])"), vec![1, 2]);
+        assert_eq!(ints("lists:map(fun length/1, [[1],[2,3]])"), vec![1, 2]);
+    }
+
+    #[test]
     fn comprehensions() {
         int("length([X * 2 || X <- [1,2,3]])", 3);
         int("lists:sum([X || X <- lists:seq(1, 5), X > 2])", 12);
@@ -2068,13 +2225,18 @@ mod tests {
 
     #[test]
     fn documented_gaps_are_typed_not_wrong() {
-        for expr in ["self() ! hello", "receive X -> X end"] {
-            let error = run(expr).expect_err(expr);
-            assert!(
-                error::unsupported_reason(&error).is_some(),
-                "{expr}: {error}"
-            );
-        }
+        // `self() ! hello` is **implemented**: the send reaches the running process's own
+        // mailbox, so the expression's value is the message term — the atom `hello`, exactly
+        // as the oracle's `self() ! hello` returns it.
+        atom("self() ! hello", "hello");
+        // A bare `receive` with nothing runnable to deliver a message is still a genuine
+        // capability gap (there is no host timer to block on in `-eval`), never a wrong
+        // result.
+        let error = run("receive X -> X end").expect_err("a bare receive is a gap");
+        assert!(
+            error::unsupported_reason(&error).is_some(),
+            "receive X -> X end: {error}"
+        );
     }
 
     /// Evaluates `expr` to a bitstring and copies out its `(bytes, offset_bits,

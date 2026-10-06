@@ -55,17 +55,15 @@ impl RuntimeContext<'_> {
 
     /// `code:all_loaded/0`: `{Module, Beam}` for every preloaded and loaded module.
     ///
-    /// `Beam` is the atom `preloaded` for a preloaded module and its `.beam` file path
-    /// (a string) for a loaded one. The preloaded names come first — in
+    /// `Beam` is the atom `preloaded` for a preloaded module, its `.beam` file path (a
+    /// string) for a loaded one, and the **empty string** for one loaded from memory (no
+    /// source file: [`CodeServer::load_bytes`]) — see [`Self::beam_location`], which is the
+    /// single source of truth for the shape (so `all_loaded/0`, `which/1` and `is_loaded/1`
+    /// can never disagree). The preloaded names come first — in
     /// [`erlang:pre_loaded/0`](crate::PreloadedModules::names)'s order — so the list is
     /// never empty, as the oracle's always is. The oracle orders the list by load time;
     /// here the loaded modules that are not preloaded are sorted by name. Neither order is
     /// part of any contract, but the preloaded prefix is the oracle's.
-    ///
-    /// A module loaded **from memory** (no source file: [`CodeServer::load_bytes`]) is
-    /// reported with the atom `preloaded` as its `Beam`: Milestone-1 records no load
-    /// filename, and inventing one would be worse than the oracle's own
-    /// `load_binary/3` filename hint, which this runtime does not take.
     ///
     /// [`CodeServer::load_bytes`]: crate::CodeServer::load_bytes
     pub(super) fn code_all_loaded(&mut self) -> Result<Eterm> {
@@ -85,11 +83,11 @@ impl RuntimeContext<'_> {
         let mut tuples = Vec::with_capacity(names.len());
         for name in &names {
             let name_atom = self.atom(name)?;
+            // A module with no `Beam` at all cannot occur here: every name is either
+            // preloaded or loaded, and `beam_location` answers both of those.
             let beam = match self.beam_location(name)? {
                 Some(beam) => beam,
-                // A module with no source file (loaded from memory through
-                // `CodeServer::load_bytes`) is reported as `preloaded`.
-                None => self.atom("preloaded")?,
+                None => self.charlist("")?,
             };
             tuples.push(terms::make_tuple(self, &[name_atom, beam])?);
         }
@@ -226,11 +224,32 @@ impl RuntimeContext<'_> {
     }
 
     /// The `Beam` half of a `{Module, Beam}` / `{file, Beam}` pair: the atom `preloaded`
-    /// for a preloaded module, its `.beam` path (a string) for one that is loaded or on
-    /// the code path, and `None` when the module is nowhere to be found.
+    /// for a preloaded module, its recorded `.beam` path (a string) for one that is loaded
+    /// or on the code path, the **empty string** for one loaded from memory, and `None` when
+    /// the module is nowhere to be found.
+    ///
+    /// The empty string is the oracle's own value, not an invention: `code_server` stores
+    /// the filename a module was loaded with, and a module loaded from bytes (the runtime's
+    /// [`CodeServer::load_bytes`], i.e. OTP's `load_binary/3` with no filename) has none.
+    /// Oracle-verified (OTP 29/erts-17.1) for
+    /// `code:load_binary(M, "", Bin)`: `code:which(M)` ⇒ `[]`, `code:is_loaded(M)` ⇒
+    /// `{file,[]}` and `code:all_loaded/0` ⇒ `[{M,[]}]`. This runtime has no
+    /// `load_binary/3` surface, so a memory-loaded module never carries a non-empty
+    /// filename — `[]` is the only honest value, and reporting the atom `preloaded` (which
+    /// means "a preloaded OTP module") would be wrong.
+    ///
+    /// [`CodeServer::load_bytes`]: crate::CodeServer::load_bytes
     fn beam_location(&mut self, name: &str) -> Result<Option<Eterm>> {
         if self.runtime.preloaded().is_preloaded(name) {
             return Ok(Some(self.atom("preloaded")?));
+        }
+        // Loaded, but with no recorded path: a module loaded from memory (checked before the
+        // code-path search, because the loaded filename is what the oracle reports even when
+        // a `.beam` of the same name is *also* findable on the path).
+        if self.runtime.code_server.loaded_path(name).is_none()
+            && self.runtime.code_server.is_loaded(name)
+        {
+            return Ok(Some(self.charlist("")?));
         }
         match self.module_file(name) {
             Some(path) => Ok(Some(self.charlist(&path)?)),
