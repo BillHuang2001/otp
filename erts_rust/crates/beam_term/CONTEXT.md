@@ -244,6 +244,38 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   `compare`/`hashing` use so a flat map and a hash map of the same pairs present identically).
 - Non-boxed / non-map terms yield `TermError::BadMap` (never a deref of an immediate).
 
+### `fun.rs` — the on-heap fun / export term layout
+The boxed closure term: a `make_fun3` local closure or an `EXPORT_EXT`/`NEW_FUN_EXT` literal
+(ground truth `../../erts/emulator/beam/erl_term.h:403-425`, `erl_fun.h:61-99`,
+`emu/instrs.tab:545-584`, `external.c:3966-4003/5006-5040/5102-5176`, `utils.c:2149-2210`).
+The header word is C-exact: bits 0..5 [`FUN_SUBTAG`] (`0x14`), bits 8..15 `arity`,
+bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
+[`FUN_HEADER_IMPORTED_OFFS`] (this crate's `NEW_FUN_EXT` marker).
+- Constants: `FUN_HEADER_ARITY_OFFS=8`, `FUN_HEADER_ENV_SIZE_OFFS=16`, `FUN_HEADER_KIND_OFFS=24`,
+  `FUN_HEADER_IMPORTED_OFFS=25`, `FUN_MAX_FIELD=0xFF`, `MAX_ARG=255`, `FUN_DESC_WORDS_LOCAL=2`,
+  `FUN_DESC_WORDS_EXTERNAL=2`, `FUN_DESC_WORDS_IMPORTED=10`.
+- `pub enum FunKind { Local, External, Imported }`; `pub struct FunPid { node: Atom, number, serial, creation: u32 }`.
+- Pure (no `unsafe`, take a *header word*) helpers: `make_fun_header(arity, num_free, kind) -> TermResult<Eterm>`,
+  `fun_kind_of_header(hdr) -> FunKind` (const), `fun_kind(hdr) -> TermResult<FunKind>`,
+  `fun_arity`/`fun_num_free` (const), `fun_desc_words(kind)`, `fun_words(kind, num_free)`,
+  `fun_desc_words_header`/`fun_env_offset_header`/`fun_block_words_header` (term→error on non-fun).
+- `pub fn fun_block_words(t: Eterm) -> TermResult<usize>` (boxed-fun required).
+- Heap-agnostic writers (`pub unsafe fn`, caller reserves `fun_words(kind, num_free)` words):
+  `write_fun_local(hp, arity, uniq: u64, index: u32, env: &[Eterm])`,
+  `write_fun_external(hp, arity, module: Atom, function: Atom)`,
+  `write_fun_imported(hp, arity, module: Atom, uniq: &[u8;16], index, old_index, old_uniq: u32, creator: FunPid, env: &[Eterm])`.
+- Accessors (`pub unsafe fn`, wrong-kind/non-fun ⇒ `TermError::BadFun`, never a panic):
+  `fun_uniq -> TermResult<u64>`, `fun_uniq_bytes -> TermResult<[u8;16]>`, `fun_index`/`fun_old_index`/`fun_old_uniq -> TermResult<u32>`,
+  `fun_module`/`fun_function -> TermResult<Atom>`, `fun_creator_pid -> TermResult<FunPid>`, `fun_env -> TermResult<&[Eterm]>`.
+- Word layout, `env[i]` at `hp[1 + desc_words(kind) + i]`, block = `1 + desc_words + num_free` words:
+  `Local` = `[hdr][uniq:u64][index:u32][env…]`; `External` = `[hdr][module:Atom][function:Atom]`;
+  `Imported` = `[hdr][module][uniq0..8][uniq8..16][index][old_index][old_uniq][pid_node][pid_number][pid_serial][pid_creation][env…]`.
+- `boxed.rs` gains header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
+- `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
+  (`Local` by `(uniq,index)` then `num_free` then env; `External` by `(module,function,arity)`;
+  `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
+  fields `compare` compares — funs are no longer on an opaque fallback.
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
