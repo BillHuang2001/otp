@@ -718,25 +718,32 @@ const CACHE_BUDGET: u32 = 5;
 
 /// A hand-built module with a single exported `export/arity` whose whole body is one
 /// basic block (the loader is not involved). `imports` are the module's
-/// `{module,function,arity}` imports, in `ImportRef` order.
-fn block_module(
+/// `{module,function,arity}` imports, in `ImportRef` order; `build_code` runs once the
+/// module name and imports are in place, so it can intern the atoms its instructions
+/// reference.
+fn arity_module<F>(
     name: &str,
     export: &str,
+    arity: u32,
     imports: &[(&str, &str, u32)],
-    code: Vec<Instr>,
-) -> Module {
+    build_code: F,
+) -> Module
+where
+    F: FnOnce(&mut Module) -> Vec<Instr>,
+{
     let mut module = Module::default();
     module.name = module.atom_table.intern(name);
-    for (module_name, function_name, arity) in imports {
+    for (module_name, function_name, import_arity) in imports {
         let import_module = module.atom_table.intern(module_name);
         let import_function = module.atom_table.intern(function_name);
         module.imports.push(Import {
             module: import_module,
             function: import_function,
-            arity: *arity,
+            arity: *import_arity,
         });
     }
     let function = module.atom_table.intern(export);
+    let code = build_code(&mut module);
     let label = Label(1);
     let (blocks, labels) = beam_loader::lower::build_blocks(&code);
     module.functions.push(Function {
@@ -744,17 +751,27 @@ fn block_module(
         entry_label: label,
         module: module.name,
         name: function,
-        arity: 0,
+        arity,
         code,
         blocks,
         labels,
     });
     module.exports.push(Export {
         function,
-        arity: 0,
+        arity,
         label,
     });
     module
+}
+
+/// [`arity_module`] with an arity-0 export — the shape most fixtures below take.
+fn block_module(
+    name: &str,
+    export: &str,
+    imports: &[(&str, &str, u32)],
+    code: Vec<Instr>,
+) -> Module {
+    arity_module(name, export, 0, imports, |_| code)
 }
 
 /// `spread/0` — one straight-line block that reads and writes **eight** x-registers,
@@ -1165,4 +1182,192 @@ fn multi_register_blocks_agree_across_register_file_sizes() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The exact-value switch (`select_val`)
+// ---------------------------------------------------------------------------
+
+/// `select/1` — a `select_val` on the argument with one case per immediate the tier
+/// inlines (a small int, another small int, an atom, and `nil`), plus a fail arm:
+///
+/// ```text
+///   select_val x0 L10 {1 -> L2; 2 -> L3; case_a -> L4; nil -> L5}
+///   L2: x0 = 100   L3: x0 = 200   L4: x0 = 300   L5: x0 = 400   L10: x0 = -1
+/// ```
+///
+/// (The case order matters: the interpreter takes the first match, exactly as the
+/// emitted `cmp`/`jcc` chain does.)
+fn select_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    arity_module("select", "select", 1, &[], |module| {
+        let case_a = module.atom_table.intern("case_a");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: Label(10),
+                pairs: vec![
+                    (Operand::Integer(1), Label(2)),
+                    (Operand::Integer(2), Label(3)),
+                    (Operand::Atom(case_a), Label(4)),
+                    (Operand::Nil, Label(5)),
+                ],
+            },
+            Instr::Label(Label(2)),
+            mv(100, 0),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            mv(200, 0),
+            Instr::Return,
+            Instr::Label(Label(4)),
+            mv(300, 0),
+            Instr::Return,
+            Instr::Label(Label(5)),
+            mv(400, 0),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            mv(-1, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+/// `select_big/1` — a `select_val` whose **first** case is a bignum constant (above
+/// the 60-bit immediate range), so a plain word compare cannot reproduce `=:=` and
+/// the whole switch must deopt to `jit_step_one`:
+///
+/// ```text
+///   select_val x0 L10 {<bignum MAX_SMALL+1> -> L2; 2 -> L3}
+///   L2: x0 = 100   L3: x0 = 200   L10: x0 = -1
+/// ```
+fn select_bignum_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    arity_module("select_big", "select_big", 1, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: Label(10),
+                pairs: vec![
+                    (Operand::Integer(MAX_SMALL + 1), Label(2)),
+                    (Operand::Integer(2), Label(3)),
+                ],
+            },
+            Instr::Label(Label(2)),
+            mv(100, 0),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            mv(200, 0),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            mv(-1, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+/// `scrutinee/0` — the block's **only** register reference is a `select_val`'s
+/// scrutinee, so the allocator caches `x(5)` exactly when the switch is inlined (a
+/// deopted `select_val` contributes no native touch at all).
+fn scrutinee_module() -> Module {
+    arity_module("scrutinee", "scrutinee", 0, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(5),
+                fail: Label(10),
+                pairs: vec![(Operand::Integer(1), Label(2))],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            Instr::Return,
+        ]
+    })
+}
+
+#[test]
+fn a_select_val_inlines_and_caches_its_scrutinee() {
+    // Structural evidence that the switch is lowered natively: `x(5)` is named by no
+    // other inlinable instruction, so it appears in the allocator's resident set — and
+    // the block's native-register bound covers it — only because the `select_val` was
+    // inlined (a deopted instruction contributes no native touch).
+    let compiled = BaselineJit::new()
+        .compile(&scrutinee_module())
+        .expect("compile the select_val scrutinee fixture");
+    assert_eq!(compiled.cached_registers(), &[5u32]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+}
+
+#[test]
+fn select_val_matches_the_interpreter_on_every_case_and_the_fail_path() {
+    let module = select_module();
+
+    // Each inlined alternative, then the no-match path (which falls through to the fail
+    // label's target). `agree_module` asserts the two tiers produce the same value.
+    for (arg, expected) in [
+        (make_small(1), make_small(100)),
+        (make_small(2), make_small(200)),
+        (NIL, make_small(400)),
+        (make_small(99), make_small(-1)),
+        (make_small(-5), make_small(-1)),
+    ] {
+        assert_eq!(
+            agree_module(&module, "select", 1, &[arg]).expect("select/1"),
+            expected,
+            "select/1 on {arg:?}"
+        );
+    }
+
+    // The atom case: the argument is the very atom the case names (an atom is `=:=`
+    // only to the identical immediate word).
+    let case_a = module.atom_table.lookup("case_a").expect("case_a interned");
+    assert_eq!(
+        agree_module(&module, "select", 1, &[make_atom(case_a)]).expect("select/1"),
+        make_small(300)
+    );
+    // A different atom is not `=:=` to `case_a` — it falls through to the fail arm.
+    let other = module.atom_table.lookup("select").expect("select interned");
+    assert_eq!(
+        agree_module(&module, "select", 1, &[make_atom(other)]).expect("select/1"),
+        make_small(-1)
+    );
+}
+
+#[test]
+fn select_val_with_a_bignum_case_deopts_and_still_agrees() {
+    // A non-immediate case value keeps the whole switch on the interpreter step; the
+    // tiers must still agree (and the interpreter's result is the reference).
+    let module = select_bignum_module();
+    // `1` matches neither the bignum nor `2` -> the fail arm.
+    assert_eq!(
+        agree_module(&module, "select_big", 1, &[make_small(1)]).expect("select_big/1"),
+        make_small(-1)
+    );
+    // `2` matches the second (immediate) alternative even though the first cannot be
+    // compared by word.
+    assert_eq!(
+        agree_module(&module, "select_big", 1, &[make_small(2)]).expect("select_big/1"),
+        make_small(200)
+    );
+}
+
+#[test]
+fn the_inlined_select_val_fail_path_agrees_with_the_interpreter() {
+    // `scrutinee/0` takes its scrutinee from the (NIL-initialised) `x(5)`, matches no
+    // case, and returns through the fail arm — exercising the inlined switch's no-match
+    // path directly.
+    let module = scrutinee_module();
+    assert_eq!(
+        agree_module(&module, "scrutinee", 0, &[]).expect("scrutinee/0"),
+        NIL
+    );
 }
