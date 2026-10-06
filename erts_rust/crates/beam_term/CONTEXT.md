@@ -241,6 +241,9 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   canonical (hash-then-`cmp`) order so the buffer is insertion-order free.
 - `map_size(t, atoms) -> TermResult<usize>`, `map_get(t, key, atoms) -> TermResult<Option<Eterm>>`,
   `map_pairs(t, atoms) -> TermResult<Vec<(Eterm,Eterm)>>` (sorted by [`compare::cmp`]),
+  `map_pairs_storage_order(t) -> TermResult<Vec<(Eterm,Eterm)>>` (the map's *stored* pair order —
+  flat map ⇒ keys-tuple order, hash map ⇒ HAMT slot traversal order; representation-dependent, NOT
+  the `cmp` order; the order an image-preserving serializer needs),
   `unsafe map_put(hp, t, key, val, atoms)` / `unsafe map_remove(hp, t, key, atoms)` (functional).
 - `pub(crate) map_pairs_flatmap_order(t, atoms)` — pairs in internal flat-map key order (the order
   `compare`/`hashing` use so a flat map and a hash map of the same pairs present identically).
@@ -457,7 +460,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
-- `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
+- `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`/`map_pairs_storage_order`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
 - `src/record.rs` → native records (`ErtsRecordDefinition`/`ErtsRecordInstance`): size fns, `write_record`, the `record_*` / `record_definition_*` readers (frozen record block; `erl_record.h`/`erl_record.c`)
 - `src/number.rs` → safe numeric → `f64`: `big_to_f64` (faithful `big_to_double`) + `number_as_f64`
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
@@ -467,23 +470,11 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
-- **Structured exit/error reasons need a `beam_common` change — NOT fixable inside `beam_term` (owning node `../beam_common`).**
-  `ExitReason` carries a non-atom reason only as `Structured` with **no term** (`beam_common` must not
-  depend on `beam_term`, so it cannot hold an `Eterm`); the live term stays owned out-of-band by the
-  raising crate. Consequently `beam_bifs` collapses `{case_clause,X}`, `{bad_generator,X}`, `{badmap,M}`,
-  `{badkey,K}` and `badmatch` to `BeamError::BadArg`, and an *uncaught* structured raise reaches
-  `beam_rt` as a placeholder reason atom (`beam_rt::runner::exit_reason` interns `"<structured reason>"`).
-  The term-building primitives already exist here (`tuple`/`list`/`make_small`/`make_atom` — e.g.
-  `{badkey,K}` is a 2-tuple), so **no new `beam_term` API is required**; the missing piece is upstream.
-  **Required change:** give `Raise` (or `ExitReason`) an opaque live-reason slot that does not create a
-  `beam_term` dependency — e.g. a `Box<dyn Any + Send + Sync>` payload (or an equivalent documented
-  side-channel keyed by the `Raise`). **Adopters:** `beam_bifs` (build the reason term at the raise site
-  and attach it), `beam_engine` (`Machine::throw_with_trace` already keeps the live reason in
-  `pending_exception`; it must attach it to the propagated `BeamError::Raise`), `beam_rt`
-  (`runner::exit_reason` then uses the attached term instead of the `Display` fallback).
-  `function_clause` needs no term change: its reason is the bare atom (already
-  `ExitReason::atom("function_clause")`) and its *arguments* belong to the `StackTrace` in
-  `beam_common`, not this layer.
+- **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
+  `unsupported` for >32-key (HAMT) maps because it cannot read the order the map stores its pairs in;
+  `map::map_pairs_storage_order` supplies exactly that (flat map ⇒ keys-tuple order, hash map ⇒ HAMT
+  slot traversal order), so a serializer can emit an existing map's image without re-sorting it.
+  Owner: `beam_codec` (outside this node).
 - **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
   `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
   `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a

@@ -58,7 +58,8 @@
 //! construction); `select_delete/2`+`select_count/2`; the `match` family;
 //! malformed specs (`badarg`); the `info` group (the registered `name` vs the
 //! `named_table` flag, the renderable `ets:info/2` option fields for four option
-//! combinations, an unknown `ets:info/2` key, `lookup_element/3,4` on the
+//! combinations, the runtime-shape fields `heir`/`node`/`decentralized_counters`,
+//! an unknown `ets:info/2` key, `lookup_element/3,4` on the
 //! multi-object kinds, and `ets:insert/2`-over-a-list atomicity); and two
 //! 10 001-key tables (`set` + `ordered_set`) exercising size, lookups, the
 //! ordered `next` chain and a guarded `select_count`.
@@ -90,6 +91,11 @@
 //!   the flag being implied.
 //! * **`ets:info/2` rejects an unknown key** with `badarg` (it does not return
 //!   `undefined`).
+//! * **`heir` and `node` are fixed**: the oracle reports `heir => none` (no heir
+//!   was set) and `node => nonode@nohost` (the `-noshell` VM is not distributed).
+//!   **`decentralized_counters` is the CATREE path**: `true` iff the table is an
+//!   `ordered_set` with `write_concurrency` on, and `false` otherwise
+//!   (`info_static_fields` pins both cases).
 //! * **`ets:insert/2` over a list is atomic**: one invalid element makes the whole
 //!   call `badarg` and inserts none of the elements, not even the valid ones that
 //!   precede it — the oracle program pins this through `tab2list` after the
@@ -278,6 +284,10 @@ const EXPECTED: &[(&str, &str)] = &[
     (
         "info_option_fields",
         "{{diff,false,set,1,protected,false,false,false},{diff,false,set,2,protected,false,false,false},{diff,false,ordered_set,1,public,true,true,true},{diff,false,set,1,private,false,false,false}}",
+    ),
+    (
+        "info_static_fields",
+        "{none,nonode@nohost,false,none,nonode@nohost,true}",
     ),
     ("info_unknown_key", "badarg"),
     (

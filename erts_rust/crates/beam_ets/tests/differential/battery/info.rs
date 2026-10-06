@@ -1,12 +1,13 @@
 //! The **`info` / option-surface** case group: the `name` vs `named_table`
 //! distinction, the renderable `ets:info/2` option fields for four option
-//! combinations, an unknown `ets:info/2` key, `lookup_element/3,4` on the
-//! multi-object kinds (`bag`/`duplicate_bag`), and the atomicity of
-//! `ets:insert/2` over a list.
+//! combinations, the runtime-shape fields (`heir`/`node`/`decentralized_counters`)
+//! for a `set` and an `ordered_set` with write concurrency, an unknown
+//! `ets:info/2` key, `lookup_element/3,4` on the multi-object kinds
+//! (`bag`/`duplicate_bag`), and the atomicity of `ets:insert/2` over a list.
 //!
-//! `id`, `memory`, `owner` and `node` are implementation-specific (a table id,
-//! an allocation figure, a pid) and are therefore never rendered; only the
-//! renderable option fields are read, through `ets:info/2`.
+//! `id`, `memory` and `owner` are implementation-specific (a table id, an
+//! allocation figure, a pid) and are therefore never rendered; the renderable
+//! fields are read through `ets:info/2`.
 
 use super::*;
 use beam_ets::Access;
@@ -116,6 +117,45 @@ impl Battery {
         let c = self.info_opts(&public);
         let d = self.info_opts(&private);
         tuple_of(&[a, b, c, d])
+    }
+
+    /// The three `ets:info/1` fields fixed by the runtime shape rather than by
+    /// the table, read for a plain `set` and for a public `ordered_set` with
+    /// `write_concurrency` — one tuple of six values, in this order:
+    /// `{set_heir, set_node, set_decentralized_counters,
+    ///   ordered_heir, ordered_node, ordered_decentralized_counters}`.
+    ///
+    /// `heir` is always `none`, `node` always `nonode@nohost` (the runtime is
+    /// never distributed), and `decentralized_counters` is `true` iff an
+    /// `ordered_set` has `write_concurrency` on (the CATREE path).
+    fn info_static_fields(&mut self) -> String {
+        // Both tables record the name `diff` and are `public`, mirroring the
+        // oracle's `new/1`/`new/2` helpers.
+        let name = self.atoms.intern("diff");
+
+        let mut set_opts = TableOptions::new();
+        set_opts.set_name(name).set_access(Access::Public);
+        let set = Table::new(TableId::next(), set_opts).expect("a fresh table");
+
+        let mut ordered_opts = TableOptions::new();
+        ordered_opts
+            .set_name(name)
+            .set_kind(TableKind::OrderedSet)
+            .set_access(Access::Public)
+            .set_write_concurrency(true);
+        let ordered = Table::new(TableId::next(), ordered_opts).expect("a fresh table");
+
+        let fields = ["heir", "node", "decentralized_counters"];
+        let mut parts = Vec::with_capacity(2 * fields.len());
+        for table in [&set, &ordered] {
+            for field in fields {
+                let value = self
+                    .info_field(table, field)
+                    .expect("a fixed info field is reported");
+                parts.push(self.r(value));
+            }
+        }
+        tuple_of(&parts)
     }
 
     /// `ets:info(T, no_such_key)` is `badarg`.
@@ -245,6 +285,7 @@ pub(super) fn info_cases(battery: &mut Battery) -> Vec<(String, String)> {
         battery.info_name_named_table(),
     ));
     cases.push(("info_option_fields".into(), battery.info_option_fields()));
+    cases.push(("info_static_fields".into(), battery.info_static_fields()));
     cases.push(("info_unknown_key".into(), battery.info_unknown_key()));
     cases.push((
         "lookup_element_multi".into(),

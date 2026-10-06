@@ -126,6 +126,7 @@ battery() ->
 
     emit("info_name_named_table", info_name_named_table()),
     emit("info_option_fields", info_option_fields()),
+    emit("info_static_fields", info_static_fields()),
     emit("info_unknown_key", info_unknown_key()),
     emit("lookup_element_multi", lookup_element_multi()),
     emit("insert_list_atomic", insert_list_atomic()),
@@ -466,6 +467,19 @@ info_opts(T) ->
        r(ets:info(T, keypos)), r(ets:info(T, protection)),
        r(ets:info(T, compressed)), r(ets:info(T, write_concurrency)),
        r(ets:info(T, read_concurrency))]).
+
+%% The three `ets:info/1` fields fixed by the runtime shape rather than by the
+%% table, read for a plain `set` and for a public `ordered_set` with
+%% `write_concurrency`: `heir` (always `none`), `node` (always `nonode@nohost`,
+%% this VM is never distributed) and `decentralized_counters` (`true` iff an
+%% `ordered_set` has `write_concurrency` on — the CATREE path).
+info_static_fields() ->
+    Set = new(set),
+    Ordered = ets:new(diff, [ordered_set, public, {write_concurrency, true}]),
+    t([r(ets:info(Set, heir)), r(ets:info(Set, node)),
+       r(ets:info(Set, decentralized_counters)),
+       r(ets:info(Ordered, heir)), r(ets:info(Ordered, node)),
+       r(ets:info(Ordered, decentralized_counters))]).
 
 %% `ets:info/2` rejects a key it does not report.
 info_unknown_key() ->

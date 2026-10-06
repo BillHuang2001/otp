@@ -5,6 +5,24 @@
 //! BIF turns into the `ets:info/1` list. No term construction happens here — the
 //! pairs are `(Atom, Eterm)` and interning the field-name atoms is the only use
 //! of the [`AtomTable`].
+//!
+//! The proplist carries the oracle's **15** fields, in the oracle's order
+//! (`id`, `decentralized_counters`, `read_concurrency`, `write_concurrency`,
+//! `compressed`, `memory`, `owner`, `heir`, `name`, `size`, `node`, `named_table`,
+//! `type`, `keypos`, `protection` — the reverse of the C `fields[]` array in
+//! `erl_db.c`), for every kind, named or not. Three of them are fixed by the
+//! runtime shape rather than by the table:
+//!
+//! * `heir` is always the atom `none` (this crate has no heir support);
+//! * `node` is always the atom `nonode@nohost` (the runtime is never
+//!   distributed, matching the oracle's `erl -noshell` with no `-sname`);
+//! * `decentralized_counters` is `true` iff the table is an `ordered_set`
+//!   **and** `write_concurrency` is on (the CATREE path the oracle reports),
+//!   otherwise `false`. The explicit `{decentralized_counters, Bool}` creation
+//!   option is not supported by this crate.
+//!
+//! `owner` is a **documented gap**: the oracle reports the owner *pid*, which
+//! this stage cannot represent, so it is rendered as the atom `undefined`.
 
 use beam_term::prelude::*;
 
@@ -56,8 +74,15 @@ fn bool_term(atoms: &mut AtomTable, value: bool) -> Eterm {
 }
 
 impl TableInfo {
-    /// The `{Key, Value}` proplist pairs of the table's `ets:info/1` fields
-    /// (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/…).
+    /// The `{Key, Value}` proplist pairs of the table's `ets:info/1` fields, in
+    /// the oracle's order: `id`, `decentralized_counters`, `read_concurrency`,
+    /// `write_concurrency`, `compressed`, `memory`, `owner`, `heir`, `name`,
+    /// `size`, `node`, `named_table`, `type`, `keypos`, `protection`.
+    ///
+    /// `heir`/`node` are the fixed atoms `none`/`nonode@nohost`;
+    /// `decentralized_counters` is `true` iff this is an `ordered_set` with
+    /// `write_concurrency` on (see the module docs); `owner` is the atom
+    /// `undefined` (the documented pid gap).
     ///
     /// Heap-free: [`atoms`](AtomTable) is used only to intern the field-name
     /// atoms; values are returned as `(Atom, Eterm)` pairs.
@@ -75,20 +100,30 @@ impl TableInfo {
         let write_concurrency = bool_term(atoms, self.write_concurrency);
         let read_concurrency = bool_term(atoms, self.read_concurrency);
         let named_table = bool_term(atoms, self.named_table);
+        // The CATREE path: the oracle reports decentralized counters only for an
+        // `ordered_set` whose normalized `write_concurrency` flag is on.
+        let decentralized_counters =
+            bool_term(atoms, self.kind.is_ordered() && self.write_concurrency);
+        // This crate has no heir support and the runtime is never distributed.
+        let heir = atom_term(atoms, "none");
+        let node = atom_term(atoms, "nonode@nohost");
 
         vec![
             pair(atoms, "id", make_small(self.id.raw() as i64)),
+            pair(atoms, "decentralized_counters", decentralized_counters),
+            pair(atoms, "read_concurrency", read_concurrency),
+            pair(atoms, "write_concurrency", write_concurrency),
+            pair(atoms, "compressed", compressed),
+            pair(atoms, "memory", make_small(self.memory as i64)),
+            pair(atoms, "owner", owner),
+            pair(atoms, "heir", heir),
             pair(atoms, "name", name),
+            pair(atoms, "size", make_small(self.size as i64)),
+            pair(atoms, "node", node),
             pair(atoms, "named_table", named_table),
             pair(atoms, "type", kind),
             pair(atoms, "keypos", make_small(self.keypos as i64)),
             pair(atoms, "protection", protection),
-            pair(atoms, "size", make_small(self.size as i64)),
-            pair(atoms, "memory", make_small(self.memory as i64)),
-            pair(atoms, "owner", owner),
-            pair(atoms, "compressed", compressed),
-            pair(atoms, "write_concurrency", write_concurrency),
-            pair(atoms, "read_concurrency", read_concurrency),
         ]
     }
 }

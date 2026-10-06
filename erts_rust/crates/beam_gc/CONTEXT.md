@@ -118,8 +118,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `pub enum OffHeapEntry { Mso(MsoHandle), Binary(beam_alloc::RefcBinary) }` — an entry of the per-process
   off-heap list: `overhead_bytes()`/`apparent_size()` (Mso → the MSO's apparent size; Binary → `len()`),
   `as_mso() -> Option<&MsoHandle>`, `as_binary() -> Option<&RefcBinary>`; `From<MsoHandle>`/`From<RefcBinary>`.
-- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)`, `len()`,
-  `is_empty()`, `overhead_bytes()` (the summed off-heap payload bytes, not the `Vec` capacity), and
+- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)` (a
+  slot-discarding append), `insert(impl Into<OffHeapEntry>) -> usize` (append returning the slot — the
+  index an on-heap off-heap reference stores in its `val` word), `get(slot) -> Option<&OffHeapEntry>`,
+  `iter() -> impl Iterator<Item = &OffHeapEntry>`, `len()`, `is_empty()`, `overhead_bytes()` (the summed
+  off-heap payload bytes, not the `Vec` capacity), and
   `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` (retains the entries a collection found live,
   releasing the rest — dropping a `Binary` decrements its refcount and frees the payload at zero; dropping
   an `Mso` runs the MSO destructor at zero). The caller supplies the liveness predicate (see Known Gaps).
@@ -231,8 +234,8 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   every other boxed object is `header_arity` plus the flatmap/HAMT extras, read through `beam_term`'s
   public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`). The scan
   then walks the block word by word. It does **not** call `beam_term::size::size_object`: that is a
-  whole-graph size (it cannot size the single object the copier is looking at), and it under-reports
-  HAMT maps (see Known Gaps). The decision and the exact formulas live here so no agent re-derives them.
+  whole-graph size (it cannot size the single object the copier is looking at). The decision and the
+  exact formulas live here so no agent re-derives them.
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
@@ -251,6 +254,12 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   primitive, **re-exported** here (no duplicate) — so a refc binary and an MSO share one implementation.
   The on-heap `BinRef`/`ErlSubBits` *handle term* itself is `beam_term`'s job; this crate owns the
   refcounted off-heap objects, the shared count, and the per-process list.
+- **`OffHeap` owns the slot↔object index; a copy boundary only reads it.** An on-heap off-heap reference
+  stores a *slot number* into the owning list, so that index association is a property of the list itself
+  and lives here (the LCA that owns the MSO model): `insert -> slot`, `get(slot)`, `iter()`. `push` stays
+  the slot-discarding append for callers that do not need the index. A slot is stable across `insert`s but
+  **not** across a `sweep` (it `retain`s, shifting later slots down), so a caller that keeps raw slot
+  numbers must re-resolve them after any sweep.
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
@@ -356,14 +365,6 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   and refc-binary entries, but `OffHeap::sweep(is_live)` only applies the caller's predicate — determining
   WHICH on-heap reference (a `BinRef` word, a fun magic ref, a sub-binary pointer) makes a registered
   off-heap object live is `beam_process`'s concern (Stage 5), not the collector's.
-- **Sizing oracle gap (upstream, `beam_term::size::size_object`).** It gates its hashmap branch on
-  `is_hashmap_header`, which only matches the two *head* node types, so an inner `HAMT_NODE_BITMAP`
-  node (and everything under it) is not counted — `size_object` of a 500-key map reports `4`. It also
-  reports a refc binary's `ErlSubBits` alone (5) rather than the C's `ERL_REFC_BITS_SIZE` (8). The real
-  C `size_object_x` (`copy.c:192-214,219-231`) handles all three node types and the BinRef case. This
-  crate's copier is unaffected (`move_size` uses `map_header_val`/`header_arity` and is exact — see
-  `tests/map_copy.rs`), which is why the tests measure a map's footprint directly rather than via
-  `size_object`. Fixing `size_object` is `beam_term`'s job.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -376,7 +377,7 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
 - `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`
 - `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
-- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
+- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the slot-indexed off-heap list (`push`/`insert`/`get`/`iter`/`sweep`) over off-heap refcounted large objects **and** refc binaries
 - `src/stats.rs` → `GcStats`
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
