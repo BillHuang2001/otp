@@ -251,6 +251,16 @@ fn head_dollar_underscore_and_dollar_dollar_are_literal_atoms() {
     let nested = tup(&mut heap, &[make_small(3), make_small(9), at(&atoms, "_")]);
     let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
     assert_eq!(got.len(), 1, "head `{{3,9}}` matches `{{3,9,0}}`");
+
+    // The runner shares the head decoder: the oracle's
+    // `ets:match_spec_run(['$_',1], ets:match_spec_compile([{'$_',[],[true]}]))`
+    // is `[true]` — the head `'$_'` matches the literal element `'$_'` and drops
+    // `1`.
+    let spec = spec1(&mut heap, dollar, &[], &[at(&atoms, "true")]);
+    let input = list(&mut heap, &[dollar, make_small(1)]);
+    let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
+    assert_eq!(got.len(), 1, "head `'$_'` matches the literal element `'$_'`");
+    assert!(eq(got[0], at(&atoms, "true"), &atoms));
 }
 
 #[test]
