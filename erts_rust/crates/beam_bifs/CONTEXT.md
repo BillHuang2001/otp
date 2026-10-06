@@ -575,7 +575,10 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
   representable here (the oracle would return a bignum) — `system_limit`, never a truncated size.
 - **`function_clause` collapses to `BadArg`.** `lists.erl`'s no-clause failures (`nth(3,[a,b])`,
   `last([])`, `zip([1],[2,3])`, `zipwith/3` on unequal lengths, `sublist([1],0,1)`, …) are reported as
-  `BadArg` (no `function_clause` in `BeamError`).
+  `BadArg`. The erts-17.1 reason is the **atom** `function_clause` (the arguments travel in the
+  *stacktrace*, not the reason — `erts/emulator/beam/beam_common.c:1014`; oracle-verified), so this is
+  representable from this crate alone as `raise_error(ExitReason::atom("function_clause"))` with no
+  `beam_common` change; the call sites are the `lists.erl` fast paths in `src/lists.rs`.
 - **`lists:usort/2` diverges from the oracle for degenerate (non-total) comparators.** The oracle's
   `usort_1`/`ufsplit_*` behaviour on such a fun is not reproduced (documented).
 - **Structured `error:{badkey,..}` / `error:{badmap,..}` reasons collapse to `BadArg`.** `maps`'s
