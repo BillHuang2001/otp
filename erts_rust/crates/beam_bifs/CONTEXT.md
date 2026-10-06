@@ -558,11 +558,22 @@ Current handoffs:
 Every gap below is a typed `BeamError`, never a silently wrong result. The recurring causes are
 `beam_common::ExitReason` carrying a non-atom reason only as `ExitReason::Structured` (no term), and
 `beam_term` having no off-heap binaries / no `function_clause` variant.
-- **Bignum arithmetic is exact only for the operator BIFs and `lists:sum/1`.** `+ - * div rem abs`
-  unary `-`/`+`, the six bit operators, and `lists:sum/1` promote to exact bignums. Other
-  integer-producing BIFs (`binary:decode_unsigned`, the `time` BIFs, `convert` helpers, …) still
-  report `SystemLimit` where the oracle would return an exact bignum. A bignum operand to a BIF that
-  has not been promoted is `BadArg`/`BadArith`.
+- **Bignum promotion covers only the operator BIFs (`src/arith.rs`, `int_term`) and `lists:sum/1`.**
+  Every other integer-producing BIF routes its value through `BifContext::int` (`src/context.rs:357`
+  = `try_make_small`) and reports `SystemLimit` past the 60-bit range where the oracle returns a
+  bignum. Sites whose value is already an `i64`/`u64` (promotion = one-limb `beam_codec::term::make_big`):
+  `erlang:system_time/0,1` (`src/time.rs:172,178`), `time_offset/0,1` (`:184,191`; ns/native units
+  only — e.g. `system_time()`⇒`1791262319626721005`, `time_offset()`⇒`2367723071446488673`),
+  `binary:decode_unsigned/1,2` (`src/binary.rs:788`; a >8-significant-byte input is capped earlier at
+  `:772-773` and needs multi-limb — `decode_unsigned(<<255×8>>)`⇒`18446744073709551615`),
+  `round/trunc/ceil/floor` (`src/convert.rs:325-333`; `round(1.0e18)`⇒`1000000000000000000`, values
+  beyond `i64` need float→big), `list_to_integer/1,2` (`src/convert.rs:164`) and
+  `binary_to_integer/1,2` (`src/binconv.rs:385`) via `numeric::parse_integer` (`src/numeric.rs:155,163`,
+  a `u128` magnitude ⇒ ≤2 limbs). `size/1` (`src/term_ops.rs:159`) and `bit_size/byte_size`
+  (`src/binconv.rs:275,283`) are bounded by `usize` sizes — unreachable in practice.
+- **A bignum *operand* is `BadArg` at un-promoted BIFs** where the oracle accepts it:
+  `integer_to_list/1,2` (`src/convert.rs:125-137` via `numeric::small_arg`),
+  `binary:encode_unsigned/1,2` (`src/binary.rs:807`) and `float/1` (`src/convert.rs:363`).
 - **The bit operators cap the result at `BIG_ARITY_MAX` digits (4_194_240 bits).** A shift whose result
   would exceed that (`1 bsl 4194240`) or a shift count that does not fit the runtime's word is
   `system_limit` (the C `big_norm` arity bound), reported before allocating — never a partial result.
