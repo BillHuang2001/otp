@@ -17,12 +17,13 @@
 use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
-use beam_term::Atom;
+use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
+use crate::chunk::record::{RawRecord, RawRecordDefault};
 use crate::chunk::Chunks;
 use crate::decode::RawInstr;
 use crate::error::bad_file;
-use crate::ir::{Export, Function, FunDescriptor, Import, Module};
+use crate::ir::{Export, Function, FunDescriptor, Import, Module, RecordDefinition, RecordField};
 use crate::literal::LiteralArea;
 use crate::operand::{Label, Operand};
 
@@ -99,6 +100,12 @@ pub fn build_module(
     let rewritten = rewrite_wide_integers(raw_instrs, chunks.literals.len(), &mut synthesized)?;
     let raw_instrs: &[RawInstr] = rewritten.as_deref().unwrap_or(raw_instrs);
 
+    // The `Recs` native-record definitions: wire atom indices become interned atoms,
+    // and a bignum field default is appended to the *same* synthesized-literal set as a
+    // wide instruction operand, so it is materialized by the machinery below.
+    let pending_records =
+        build_records(&chunks.records, &atoms, chunks.literals.len(), &mut synthesized)?;
+
     let functions = group_functions(raw_instrs)?;
 
     // `FunT` carries wire atom indices; the fun-table index (`make_fun3`'s operand)
@@ -133,6 +140,10 @@ pub fn build_module(
     };
     let literals = Arc::new(literals);
 
+    // Literal-backed record defaults (`z,4` and bignums) resolve only now that the
+    // area they point into exists.
+    let records = resolve_records(pending_records, &literals)?;
+
     Ok(Module {
         name,
         atoms,
@@ -142,6 +153,7 @@ pub fn build_module(
         imports,
         functions,
         funs,
+        records,
         code_version: chunks.code_version,
         types: chunks.types.clone(),
         line: chunks.line.clone().unwrap_or_default(),
@@ -259,6 +271,109 @@ fn big_integer_payload(negative: bool, magnitude: &[u8]) -> Vec<u8> {
     payload.push(u8::from(negative));
     payload.extend(magnitude.iter().rev());
     payload
+}
+
+/// A record field's default before its literal-backed values are resolved.
+enum PendingDefault {
+    /// The field has no default.
+    Absent,
+    /// The default is already a materialized term (a small integer or an atom).
+    Term(Eterm),
+    /// The default is the literal at this index in the module's literal area (a `z,4`
+    /// file reference, or a synthesized bignum).
+    Literal(u32),
+}
+
+/// A record definition whose literal-backed defaults are not yet resolved.
+struct PendingRecord {
+    /// The record-name atom.
+    name: Atom,
+    /// Whether the record is exported.
+    is_exported: bool,
+    /// The `(field name, default)` pairs, in declaration order.
+    fields: Vec<(Atom, PendingDefault)>,
+}
+
+/// Maps the raw `Recs` records onto interned atoms, appending every bignum default's
+/// ETF payload to `synthesized`.
+///
+/// `literal_base` is the number of the module's own `LitT` literals, so a synthesized
+/// bignum is numbered `literal_base + synthesized.len()` — the same index-space rule
+/// [`rewrite_wide_integers`] follows for instruction operands, and the reason the
+/// literal bumps must be appended *before* the area is decoded.
+fn build_records(
+    raw: &[RawRecord],
+    atoms: &[Atom],
+    literal_base: usize,
+    synthesized: &mut Vec<Vec<u8>>,
+) -> Result<Vec<PendingRecord>> {
+    let mut next = literal_base + synthesized.len();
+    let mut records = Vec::with_capacity(raw.len());
+    for record in raw {
+        let name = atom_at(atoms, record.name)?;
+        let mut fields = Vec::with_capacity(record.fields.len());
+        for field in &record.fields {
+            let field_name = atom_at(atoms, field.name)?;
+            let default = match &field.default {
+                RawRecordDefault::Absent => PendingDefault::Absent,
+                RawRecordDefault::Integer(value) => PendingDefault::Term(make_small(*value)),
+                // Wire index 0 is the NIL placeholder, i.e. the default `nil`/`[]`.
+                RawRecordDefault::Atom(0) => PendingDefault::Term(NIL),
+                RawRecordDefault::Atom(index) => {
+                    PendingDefault::Term(make_atom(atom_at(atoms, *index)?))
+                }
+                RawRecordDefault::Literal(index) => PendingDefault::Literal(*index),
+                RawRecordDefault::BigInteger {
+                    negative,
+                    magnitude,
+                } => {
+                    if next > u32::MAX as usize {
+                        return Err(BeamError::SystemLimit);
+                    }
+                    synthesized.push(big_integer_payload(*negative, magnitude));
+                    let index = next as u32;
+                    next += 1;
+                    PendingDefault::Literal(index)
+                }
+            };
+            fields.push((field_name, default));
+        }
+        records.push(PendingRecord {
+            name,
+            is_exported: record.is_exported,
+            fields,
+        });
+    }
+    Ok(records)
+}
+
+/// Resolves the literal-backed record defaults against the built literal area.
+fn resolve_records(
+    pending: Vec<PendingRecord>,
+    literals: &LiteralArea,
+) -> Result<Vec<RecordDefinition>> {
+    let mut records = Vec::with_capacity(pending.len());
+    for record in pending {
+        let mut fields = Vec::with_capacity(record.fields.len());
+        for (name, default) in record.fields {
+            let default = match default {
+                PendingDefault::Absent => None,
+                PendingDefault::Term(term) => Some(term),
+                PendingDefault::Literal(index) => Some(
+                    literals
+                        .get(index)
+                        .ok_or_else(|| bad_file("record default literal index is out of range"))?,
+                ),
+            };
+            fields.push(RecordField { name, default });
+        }
+        records.push(RecordDefinition {
+            name: record.name,
+            is_exported: record.is_exported,
+            fields,
+        });
+    }
+    Ok(records)
 }
 
 #[cfg(test)]
@@ -1417,6 +1532,7 @@ mod tests {
             locals: Vec::new(),
             imports: Vec::new(),
             funs,
+            records: Vec::new(),
             line: None,
             types: TypeTable::default(),
             literals,

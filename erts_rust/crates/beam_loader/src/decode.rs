@@ -331,6 +331,27 @@ pub fn decode_operand(
 /// (`marshal_integer`, `beam_file.c:2155-2208`). The result is the value's sign and
 /// magnitude, which [`crate::lower`] materializes as a bignum static literal.
 fn big_integer_operand(bytes: &[u8]) -> Result<Operand> {
+    let (negative, magnitude) = bignum_sign_magnitude(bytes)?;
+    Ok(Operand::BigInteger {
+        negative,
+        magnitude,
+    })
+}
+
+/// Extracts the sign and normalized little-endian magnitude of a wide `i`-tagged
+/// integer field.
+///
+/// `bytes` is the raw **big-endian** `count`-byte field, which the C reads as a
+/// signed `count * 8`-bit two's-complement integer: it takes the sign from the top
+/// bit, negates the field when negative and normalizes at most one leading zero
+/// byte; a field with two leading zero bytes is "not normalized" and a corrupt file
+/// (`marshal_integer`, `beam_file.c:2155-2208`). The result is the value's sign and
+/// magnitude, which callers materialize as a bignum.
+///
+/// This is the single lowest-common-ancestor decoder for a wide `i` field: the
+/// instruction-stream operand decoder ([`decode_operand`]) and the `Recs` chunk's
+/// field-default decoder ([`crate::chunk::record`]) both share it.
+pub(crate) fn bignum_sign_magnitude(bytes: &[u8]) -> Result<(bool, Vec<u8>)> {
     // `bytes` is non-empty (the explicit-count form packs at least two bytes).
     debug_assert!(!bytes.is_empty(), "an operand field is never empty");
     let negative = bytes[0] & 0x80 != 0;
@@ -358,10 +379,7 @@ fn big_integer_operand(bytes: &[u8]) -> Result<Operand> {
     }
 
     magnitude.reverse();
-    Ok(Operand::BigInteger {
-        negative,
-        magnitude,
-    })
+    Ok((negative, magnitude))
 }
 
 /// Sign-extends an `i`-tagged magnitude packed in `byte_count` magnitude bytes.
@@ -454,8 +472,8 @@ fn decode_extended(
 ///
 /// Every `z` sub-tag payload is an unsigned count or index (`beam_file.c` asserts
 /// `TAG_u` at each of them), so any other tag means the stream is malformed — as does
-/// a value that did not fit a machine word.
-fn read_unsigned(r: &mut beam_codec::Reader<'_>, msg: &str) -> Result<u64> {
+/// a value that did not fit a machine word. Shared with the `Recs` chunk reader.
+pub(crate) fn read_unsigned(r: &mut beam_codec::Reader<'_>, msg: &str) -> Result<u64> {
     let tagged = read_tagged(r)?;
     if tagged.tag != TAG_U {
         return Err(bad_file(msg));
