@@ -286,6 +286,26 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   record-semantics failures the C branches on, and returning a typed `unsupported` only for a genuine
   capability gap. Documented gap: `put_record/6`'s **create** form (`Src == nil`) is a typed `unsupported`
   (the C resolves the definition through the code-server record table, which this runtime lacks).
+- **The NIF subsystem (contract A.3) works end-to-end.** `beam_abi` implements a real `enif_*` host API
+  (`src/nif/enif.rs`) over the host seam `NifHost`/`NifEnv` (`src/nif/host.rs`), which supplies term
+  allocation/`intern_atom`/`atom_name`/`self_pid` and optional `term_to_binary`/`binary_to_term`/`make_ref`
+  hooks — so `beam_abi` gains **no** dependency edge to `beam_codec` (the wave DAG stays acyclic). Coverage
+  spans allocation (`enif_alloc`/`free`/`alloc_binary`/`release_binary`/`make_new_binary`), accessors
+  (`enif_get_int/long/uint/ulong/int64/uint64/double/atom(+_len)/string/tuple/list_cell/list_length/
+  map_size/map_value/binary`, `enif_is_*`), constructors (`enif_make_int/long/uint/ulong/int64/uint64/
+  double/atom(+_len)/tuple(+_from_array)/list(_cell/_reverse/_from_array)/binary/string(+_len)/ref/pid/
+  badarg/map_put/map_remove`), `enif_raise_exception`, `enif_compare`, `enif_has_pending_exception`,
+  `enif_clear_env`. The **dynamic loader** (`src/nif/loader.rs`) uses `libc`'s `dlopen`/`dlsym`/`dlclose`
+  (no new dependency) to read `nif_init`'s `ErlNifEntry`, validate `ERL_NIF_MAJOR_VERSION`/
+  `ERL_NIF_MINOR_VERSION`, run the entry's `load` callback against a host `ErlNifEntry*`, and expose
+  `NifLibrary::call`. `beam_bifs` adds the `erlang:load_nif/2` BIF + the optional `NifLoader`/`current_module`
+  `BifContext` seams; `beam_rt` owns the `NifRegistry`/`NifBridge`/`NifHostImpl` and intercepts NIF calls at
+  external `call_ext` dispatch. A C fixture (`beam_abi/tests/fixtures/test_nif.c`, built with the system
+  `cc`; the test SKIPS LOUDLY if `cc`/`erl_nif.h`/`erlc` are absent) is loaded and called from interpreted
+  code in `beam_rt/tests/nif.rs`; a version mismatch / missing `nif_init` yields a typed error, never a crash.
+  `enif_*` C-variadic functions (make_tuple/list, `set_option`, the `*printf` family) are left `None` because
+  stable Rust cannot define a C-variadic `fn` (rust-lang/rust#44930); the `_from_array` variants cover
+  tuple/list building. `term_to_binary`/`binary_to_term`/`make_ref` remain defaulted `None` in `NifHostImpl`.
 
 ## Known Structural Debt (candidates for the next pass)
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
