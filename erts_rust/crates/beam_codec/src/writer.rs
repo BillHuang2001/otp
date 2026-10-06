@@ -4,6 +4,10 @@
 //! through it so byte order and buffer growth live in one place. This module is
 //! safe Rust.
 
+use beam_common::Result;
+
+use crate::error;
+
 /// A growable sink for network-order bytes.
 ///
 /// The writer appends; nothing is ever rewritten, so `as_slice` stays stable
@@ -75,10 +79,32 @@ impl Writer {
     pub fn clear(&mut self) {
         self.buf.clear();
     }
+
+    /// Overwrites the four bytes starting at `pos` with the big-endian encoding of
+    /// `value`, leaving every other byte untouched.
+    ///
+    /// This is the codec's only backward write: a length-prefixed block whose size
+    /// is only known once its body has been emitted (the `NEW_FUN_EXT` total-size
+    /// field) writes a zero placeholder, emits the body, then patches the size in.
+    ///
+    /// **Internal invariant:** the caller has already written the four bytes at
+    /// `pos` (typically the placeholder), so `pos + 4 <= len`. A `pos` that is out
+    /// of range — or `pos + 4` overflowing `usize` — yields `BeamError::BadArg`
+    /// rather than a panic or a silent short write.
+    pub(crate) fn patch_u32be(&mut self, pos: usize, value: u32) -> Result<()> {
+        let end = pos
+            .checked_add(core::mem::size_of::<u32>())
+            .ok_or_else(error::bad_arg)?;
+        let slot = self.buf.get_mut(pos..end).ok_or_else(error::bad_arg)?;
+        slot.copy_from_slice(&value.to_be_bytes());
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
+    use beam_common::BeamError;
+
     use super::*;
 
     #[test]
@@ -180,5 +206,39 @@ mod tests {
         assert_eq!(writer.as_slice(), &[] as &[u8]);
         // `clear` must not release the allocation.
         assert!(writer.into_vec().capacity() >= 32);
+    }
+
+    #[test]
+    fn patch_u32be_overwrites_only_the_four_addressed_bytes() {
+        let mut writer = Writer::new();
+        writer.bytes(&[0xAA, 0xBB, 0, 0, 0, 0, 0xCC]);
+        writer.patch_u32be(2, 0xDEAD_BEEF).unwrap();
+        assert_eq!(
+            writer.as_slice(),
+            &[0xAA, 0xBB, 0xDE, 0xAD, 0xBE, 0xEF, 0xCC]
+        );
+
+        // The patched region may be the whole buffer, and values are network-order.
+        let mut tail = Writer::new();
+        tail.u32be(0);
+        tail.patch_u32be(0, 1).unwrap();
+        assert_eq!(tail.as_slice(), &[0, 0, 0, 1]);
+        tail.patch_u32be(0, u32::MAX).unwrap();
+        assert_eq!(tail.as_slice(), &[0xFF; 4]);
+    }
+
+    #[test]
+    fn patch_u32be_rejects_an_out_of_range_position() {
+        let mut writer = Writer::new();
+        writer.u32be(0);
+        // Past the end, the end itself, and a `pos` that cannot hold four bytes.
+        assert!(matches!(writer.patch_u32be(1, 1), Err(BeamError::BadArg)));
+        assert!(matches!(writer.patch_u32be(4, 1), Err(BeamError::BadArg)));
+        assert!(matches!(
+            writer.patch_u32be(usize::MAX, 1),
+            Err(BeamError::BadArg)
+        ));
+        // The rejected calls left the buffer untouched.
+        assert_eq!(writer.as_slice(), &[0, 0, 0, 0]);
     }
 }

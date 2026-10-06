@@ -8,19 +8,24 @@
 //! This module is safe Rust.
 
 use beam_common::Result;
-use beam_term::prelude::{atom_val, is_atom, is_list, is_nil, is_small, signed_value};
+use beam_term::prelude::{
+    atom_val, is_atom, is_list, is_nil, is_small, make_atom, signed_value,
+};
 use beam_term::{AtomTable, Eterm};
 
 use crate::error;
 use crate::tag::{
-    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, INTEGER_EXT,
+    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, EXPORT_EXT, INTEGER_EXT,
     LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT,
-    NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT,
-    SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
+    NEW_FUN_EXT, NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT,
+    SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
 };
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
-    external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+    external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_arity_term,
+    fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,
+    fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, tuple_arity, tuple_element,
+    FunKind,
 };
 use crate::writer::Writer;
 
@@ -90,8 +95,10 @@ impl<'a> Encoder<'a> {
     /// Encodes `term`, appending it to the output.
     ///
     /// A tag the M1 term layer does not support yields
-    /// [`crate::error::unsupported`]; a value beyond a wire bound yields
-    /// `BeamError::SystemLimit`. The encoder never silently mis-encodes.
+    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun — which has no
+    /// faithful wire image — yields [`crate::error::unsupported_local_fun`]; a value
+    /// beyond a wire bound yields `BeamError::SystemLimit`. The encoder never
+    /// silently mis-encodes.
     pub fn encode(&mut self, term: Eterm) -> Result<()> {
         // Classification order is deliberate (see the crate `CONTEXT.md`,
         // "`src/encode.rs`"): immediates first, then each boxed family through its
@@ -108,6 +115,11 @@ impl<'a> Encoder<'a> {
         }
         if is_list(term) {
             return self.encode_list(term);
+        }
+        // Funs come before the boxed-family probes: a fun header carries a distinct
+        // subtag, so the classification cannot overlap any other family.
+        if let Ok(kind) = fun_kind_term(term) {
+            return self.encode_fun(term, kind);
         }
         if let Ok((negative, digits)) = big_parts(term) {
             return self.encode_bignum(negative, digits);
@@ -136,7 +148,7 @@ impl<'a> Encoder<'a> {
             return self.encode_bitstring(bytes, offset_bits, size_bits);
         }
         // Anything else is not representable by the M1 term layer (in practice an
-        // off-heap `BinRef`/`Fun`/`Record` block, which the Stage-0 foundations cannot
+        // off-heap `BinRef`/`Record` block, which the Stage-0 foundations cannot
         // build): report it explicitly rather than emit a wrong encoding. Tests never
         // reach this path.
         Err(error::unsupported(Tag::Binary))
@@ -409,6 +421,88 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
+    /// Encodes a fun term by kind (`external.c:3966-4004`).
+    ///
+    /// `FunKind::External` becomes `EXPORT_EXT` (`113`) and `FunKind::Imported`
+    /// becomes `NEW_FUN_EXT` (`112`). `FunKind::Local` — the `make_fun3` closure —
+    /// has **no** faithful wire image: its inlined descriptor carries no module, no
+    /// 16-byte `uniq` and no creator pid, so it is reported as
+    /// [`crate::error::unsupported_local_fun`] rather than mis-encoded.
+    fn encode_fun(&mut self, term: Eterm, kind: FunKind) -> Result<()> {
+        match kind {
+            FunKind::External => self.encode_fun_external(term),
+            FunKind::Imported => self.encode_fun_imported(term),
+            FunKind::Local => Err(error::unsupported_local_fun()),
+        }
+    }
+
+    /// Encodes an `EXPORT_EXT` fun: `[113][module atom][function atom][arity small]`
+    /// (`external.c:3997-4001`).
+    fn encode_fun_external(&mut self, term: Eterm) -> Result<()> {
+        let module = fun_module(term)?;
+        let function = fun_function(term)?;
+        let arity = fun_arity_term(term)?;
+        self.buf.u8(EXPORT_EXT);
+        self.encode_atom(make_atom(module))?;
+        self.encode_atom(make_atom(function))?;
+        // The C writes `make_small(arity)`; `encode_small` picks the width tag.
+        self.encode_small(arity as i64)?;
+        Ok(())
+    }
+
+    /// Encodes a `NEW_FUN_EXT` fun:
+    ///
+    /// ```text
+    /// [112][size:4 BE][arity:1][uniq:16][index:4 BE][num_free:4 BE]
+    /// [module][old_index small][old_uniq small][creator pid: NEW_PID_EXT]
+    /// [env[0] … env[num_free-1]]
+    /// ```
+    ///
+    /// `size` is the number of bytes from the **first byte of the size field**
+    /// through the end of the fun (`4 + payload_len`) — the C computes exactly
+    /// `ep - size_p` where `size_p` is the size field's own address
+    /// (`external.c:3363`). It is only known once the body is emitted, so a
+    /// placeholder is written and [`Writer::patch_u32be`] patches it; that is the
+    /// documented internal invariant of the patch.
+    ///
+    /// The environment is emitted `env[0]` first (`external.c:3991-3993` pushes
+    /// `env[num_free-1]`…`env[0]` onto a LIFO work stack), the same order the
+    /// decoder reads it (`external.c:5171-5174`), so `env[k]` is stream element `k`.
+    fn encode_fun_imported(&mut self, term: Eterm) -> Result<()> {
+        let arity = fun_arity_term(term)?;
+        let num_free = fun_num_free_term(term)?;
+        let module = fun_module(term)?;
+        let uniq = fun_uniq_bytes(term)?;
+        let index = fun_index(term)?;
+        let old_index = fun_old_index(term)?;
+        let old_uniq = fun_old_uniq(term)?;
+        let creator = fun_creator_pid(term)?;
+        let env = fun_env(term)?;
+
+        self.buf.u8(NEW_FUN_EXT);
+        // The size field's own position: `size` counts from here (`ep - size_p`).
+        let size_pos = self.buf.len();
+        self.buf.u32be(0); // placeholder, patched once the body is written
+        // `arity`/`num_free` both fit their 8-bit header fields (the layout enforced
+        // that when the term was built), so these casts cannot truncate.
+        self.buf.u8(arity as u8);
+        self.buf.bytes(&uniq);
+        self.buf.u32be(index);
+        self.buf.u32be(num_free as u32);
+        self.encode_atom(make_atom(module))?;
+        self.encode_small(i64::from(old_index))?;
+        self.encode_small(i64::from(old_uniq))?;
+        // The creator pid is always the modern `NEW_PID_EXT` (88) — the form the C
+        // `enc_pid` emits here (`external.c:3989`).
+        self.encode_pid(make_atom(creator.node), creator.number, creator.serial, creator.creation)?;
+        for &free in env {
+            self.encode(free)?;
+        }
+        let size = u32::try_from(self.buf.len() - size_pos).map_err(|_| error::system_limit())?;
+        self.buf.patch_u32be(size_pos, size)?;
+        Ok(())
+    }
+
     /// The bytes written so far.
     pub fn as_bytes(&self) -> &[u8] {
         self.buf.as_slice()
@@ -604,10 +698,10 @@ mod tests {
     use beam_term::prelude::{make_atom, make_small, Atom, NIL};
 
     use super::*;
-    use crate::error::is_unsupported;
+    use crate::error::{is_unsupported, is_unsupported_local_fun};
     use crate::term::{
         make_big, make_external_pid, make_external_port, make_external_ref, make_flatmap,
-        make_float,
+        make_float, make_fun_external, make_fun_imported, make_fun_local, FunPid, MAX_ARG,
     };
 
     /// A heap large enough for every term a test builds (tests pass a bigger one
@@ -1051,5 +1145,128 @@ mod tests {
         expected.extend_from_slice(&[107, 0, 2, 1, 2]); // [1, 2]
         expected.extend_from_slice(&[116, 0, 0, 0, 1, 119, 1, 97, 97, 7]); // #{a => 7}
         assert_eq!(encode_term_body(tuple, &atoms).unwrap(), expected);
+    }
+
+    // -- funs / exports -------------------------------------------------------
+
+    #[test]
+    fn external_fun_encodes_as_export_ext() {
+        let mut atoms = AtomTable::new();
+        let module = atoms.intern("lists");
+        let function = atoms.intern("reverse");
+        let mut heap = new_heap(64);
+        let fun = make_fun_external(&mut heap, 1, module, function).unwrap();
+
+        // `term_to_binary(fun lists:reverse/1)`:
+        // `[113][SMALL_ATOM_UTF8 "lists"][SMALL_ATOM_UTF8 "reverse"][SMALL_INTEGER 1]`.
+        let mut expected = vec![131u8, 113];
+        expected.extend_from_slice(&[119, 5, b'l', b'i', b's', b't', b's']);
+        expected.extend_from_slice(&[119, 7, b'r', b'e', b'v', b'e', b'r', b's', b'e']);
+        expected.extend_from_slice(&[97, 1]);
+        assert_eq!(encode_term(fun, &atoms).unwrap(), expected);
+
+        // Arity 0 is the `SMALL_INTEGER_EXT` zero; the byte form is unchanged.
+        let zero = make_fun_external(&mut heap, 0, module, function).unwrap();
+        let bytes = encode_term_body(zero, &atoms).unwrap();
+        assert_eq!(bytes[0], 113);
+        assert_eq!(*bytes.last().unwrap(), 0);
+        assert_eq!(bytes.len(), 1 + (2 + 5) + (2 + 7) + 2);
+
+        // Arity 255 is still a single `SMALL_INTEGER_EXT`.
+        let max = make_fun_external(&mut heap, MAX_ARG, module, function).unwrap();
+        let bytes = encode_term_body(max, &atoms).unwrap();
+        assert_eq!(&bytes[bytes.len() - 2..], &[97, 255]);
+
+        // Arity 256 cannot fit the layout header ⇒ `SystemLimit` at construction.
+        assert_system_limit(make_fun_external(&mut heap, MAX_ARG + 1, module, function));
+    }
+
+    #[test]
+    fn imported_fun_encodes_as_new_fun_ext_with_the_c_size_rule() {
+        let mut atoms = AtomTable::new();
+        let module = atoms.intern("m");
+        let node = atoms.intern("n1");
+        let mut uniq = [0u8; 16];
+        for (i, byte) in uniq.iter_mut().enumerate() {
+            *byte = i as u8 + 1; // 1..=16
+        }
+        let creator = FunPid {
+            node,
+            number: 0xAAAA_BBBB,
+            serial: 0xCCCC_DDDD,
+            creation: 0x1122_3344,
+        };
+        let env = [make_small(11), make_small(22)];
+        let mut heap = new_heap(64);
+        let fun =
+            make_fun_imported(&mut heap, 2, module, &uniq, 0x0102_0304, 7, 3, creator, &env)
+                .unwrap();
+
+        let mut payload = Vec::new();
+        payload.push(2u8); // arity
+        payload.extend_from_slice(&uniq);
+        payload.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // index
+        payload.extend_from_slice(&2u32.to_be_bytes()); // num_free
+        payload.extend_from_slice(&[119, 1, b'm']); // module atom
+        payload.extend_from_slice(&[97, 7]); // old_index small
+        payload.extend_from_slice(&[97, 3]); // old_uniq small
+        payload.push(88); // NEW_PID_EXT
+        payload.extend_from_slice(&[119, 2, b'n', b'1']);
+        payload.extend_from_slice(&0xAAAA_BBBBu32.to_be_bytes());
+        payload.extend_from_slice(&0xCCCC_DDDDu32.to_be_bytes());
+        payload.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        // The environment is emitted `env[0]` first.
+        payload.extend_from_slice(&[97, 11, 97, 22]);
+
+        // `size` counts from the first byte of the size field through the end of the
+        // fun — `4 + payload_len` (C `ep - size_p`, `external.c:3363`).
+        let size = 4 + payload.len();
+        let mut expected = vec![112u8];
+        expected.extend_from_slice(&(size as u32).to_be_bytes());
+        expected.extend_from_slice(&payload);
+
+        assert_eq!(encode_term_body(fun, &atoms).unwrap(), expected);
+        // The size field excludes the `112` tag itself.
+        assert_eq!(expected.len(), 1 + size);
+    }
+
+    #[test]
+    fn imported_fun_with_no_free_variables_round_trips_its_fields() {
+        let mut atoms = AtomTable::new();
+        let module = atoms.intern("m");
+        let creator = FunPid {
+            node: atoms.intern("n1"),
+            number: 1,
+            serial: 2,
+            creation: 3,
+        };
+        let mut heap = new_heap(64);
+        let fun =
+            make_fun_imported(&mut heap, 3, module, &[0x5Au8; 16], 9, 8, 7, creator, &[]).unwrap();
+        let bytes = encode_term_body(fun, &atoms).unwrap();
+
+        // `112 [size 4]` then `arity` immediately follows.
+        assert_eq!(bytes[0], 112);
+        assert_eq!(bytes[5], 3); // arity
+        assert_eq!(bytes[6..22], [0x5Au8; 16]); // uniq
+        assert_eq!(&bytes[22..26], &9u32.to_be_bytes()); // index
+        assert_eq!(&bytes[26..30], &0u32.to_be_bytes()); // num_free
+        // The encoded body is exactly `size` bytes.
+        let size = u32::from_be_bytes([bytes[1], bytes[2], bytes[3], bytes[4]]) as usize;
+        assert_eq!(bytes.len(), 1 + size);
+    }
+
+    #[test]
+    fn local_fun_has_no_wire_form() {
+        let atoms = AtomTable::new();
+        let mut heap = new_heap(64);
+        let local = make_fun_local(&mut heap, 0, 0xDEAD_BEEF, 5, &[]).unwrap();
+        let err = encode_term(local, &atoms).unwrap_err();
+        assert!(
+            is_unsupported_local_fun(&err),
+            "a local fun must report the precise local-fun reason, got {err:?}"
+        );
+        // The general "unsupported tag" signal is deliberately *not* reused.
+        assert!(!is_unsupported(&err));
     }
 }

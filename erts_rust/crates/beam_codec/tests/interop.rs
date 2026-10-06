@@ -37,9 +37,10 @@
 //! Big ints (incl. `1 bsl 200`), a multi-byte UTF-8 atom, floats (`3.14`, `-0.0`,
 //! `1.0e300`), binaries (short and >64 bytes), non-byte-aligned bitstrings, flat maps
 //! of 1/2/40 pairs, lists/strings/tuples/`[]`, a reference, a pid, and a large
-//! compressed term. **Excluded:** funs, exports, records and the distribution header —
-//! the codec returns a typed `unsupported` `BeamError` for those (never a wrong term),
-//! so they cannot be part of a round-trip corpus.
+//! compressed term. **Excluded:** records and the distribution header — the codec
+//! returns a typed `unsupported` `BeamError` for those (never a wrong term), so they
+//! cannot be part of a round-trip corpus. Funs and exports are supported by the codec
+//! (`NEW_FUN_EXT`/`EXPORT_EXT`); their interop corpus entries land in a later pass.
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};

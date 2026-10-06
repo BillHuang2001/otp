@@ -1173,14 +1173,18 @@ fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
 
     // Recognized-but-not-yet-implemented tags report `unsupported`, never a wrong term.
     for &tag in &[
-        112u8, // NEW_FUN_EXT
-        113,   // EXPORT_EXT
-        67,    // RECORD_EXT
-        121,   // LOCAL_EXT
-        68,    // DIST_HEADER
+        67u8, // RECORD_EXT
+        121,  // LOCAL_EXT
+        68,   // DIST_HEADER
     ] {
         assert_unsupported(&[VERSION_MAGIC, tag]);
     }
+
+    // `NEW_FUN_EXT` (112) and `EXPORT_EXT` (113) are implemented now, so a bare tag
+    // byte is a *truncation* — `BadArg` (the C also errors running off the end) —
+    // never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 112]); // NEW_FUN_EXT
+    assert_bad_arg(&[VERSION_MAGIC, 113]); // EXPORT_EXT
 }
 
 #[test]

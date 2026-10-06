@@ -15,7 +15,8 @@ use core::str;
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{
-    is_atom, make_atom, make_small, try_make_small, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL, NIL,
+    atom_val, is_atom, is_small, make_atom, make_small, signed_value, try_make_small, FunPid,
+    MAX_ARITYVAL, MAX_ARG, MAX_SMALL, MIN_SMALL, NIL,
 };
 use beam_term::{AtomTable, Eterm};
 
@@ -78,8 +79,11 @@ impl<'a> Decoder<'a> {
     /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
     /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
     /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
-    /// ([`Tag::NewFun`], [`Tag::Export`], [`Tag::Record`], [`Tag::Local`],
-    /// [`Tag::DistHeader`]) yields [`crate::error::unsupported`].
+    /// ([`Tag::Record`], [`Tag::Local`], [`Tag::DistHeader`]) yields
+    /// [`crate::error::unsupported`]. Funs decode for real: [`Tag::Export`] becomes
+    /// a [`FunKind::External`](crate::FunKind) fun and [`Tag::NewFun`] a
+    /// [`FunKind::Imported`](crate::FunKind) one (see [`Decoder::decode_export`] and
+    /// [`Decoder::decode_new_fun`]).
     pub fn decode(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let byte = self.reader.u8()?;
         let tag = Tag::from_byte(byte).ok_or_else(bad_arg)?;
@@ -303,11 +307,18 @@ impl<'a> Decoder<'a> {
             Tag::NewCache => Err(bad_arg()),
 
             // ---------------------------------------------------------------
+            // Funs / exports
+            // ---------------------------------------------------------------
+            // `EXPORT_EXT` (`113`) and `NEW_FUN_EXT` (`112`) become the two
+            // corresponding fun kinds; both are handled *here*, inside the shared
+            // walker, so a fun nested in a tuple/list/map decodes like any other
+            // sub-term (a `.beam` `LitT` literal is exactly that).
+            Tag::Export => self.decode_export(heap, atoms),
+            Tag::NewFun => self.decode_new_fun(heap, atoms),
+
+            // ---------------------------------------------------------------
             // Deliberately unsupported in M1 — never a wrong term
             // ---------------------------------------------------------------
-            // `NEW_FUN_EXT`/`EXPORT_EXT`: blocked on a fun/export registry that does
-            // not exist yet (owned by `beam_loader`/`beam_rt`).
-            Tag::NewFun | Tag::Export => Err(unsupported(tag)),
             // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
             // records encode as tuples).
             Tag::Record => Err(unsupported(tag)),
@@ -358,6 +369,138 @@ impl<'a> Decoder<'a> {
             return Err(bad_arg());
         }
         Ok(node)
+    }
+
+    /// Decodes `EXPORT_EXT` (`113`): `[module atom][function atom][arity term]`
+    /// (`external.c:5006-5040`).
+    ///
+    /// The module and function atoms are decoded **in stream order** (so atom
+    /// interning follows the wire order) and the arity is a *normal* decoded term:
+    /// the C requires it to be a small (`is_small(temp)`) whose value is `>= 0`
+    /// (`external.c:5025-5031`), so a negative or non-small arity is `BadArg`. The
+    /// result is a [`FunKind::External`](crate::FunKind) fun with an empty
+    /// environment — the inlined-descriptor replacement for the C `Export`
+    /// (`num_free == 0`). An arity past the header's 8-bit field is a
+    /// `BeamError::SystemLimit` (via the layout's `make_fun_header`).
+    fn decode_export(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        let module = self.decode_node_atom(heap, atoms)?;
+        let function = self.decode_node_atom(heap, atoms)?;
+        let arity = self.decode(heap, atoms)?;
+        if !is_small(arity) {
+            return Err(bad_arg());
+        }
+        // `signed_val` < 0 is rejected by the C; so is anything the wire could not
+        // hold as a non-negative small.
+        let Ok(arity) = usize::try_from(signed_value(arity)) else {
+            return Err(bad_arg());
+        };
+        crate::term::make_fun_external(heap, arity, atom_val(module), atom_val(function))
+    }
+
+    /// Decodes `NEW_FUN_EXT` (`112`):
+    /// `[size:4 BE][arity:1][uniq:16][index:4 BE][num_free:4 BE][module atom]
+    /// [old_index term][old_uniq term][creator pid term][env…]`
+    /// (`external.c:5102-5176`).
+    ///
+    /// * `size` is **read and ignored**: since OTP 23 the C writes a total size that
+    ///   may be wrong (`external.c:5115`), so it is not validated.
+    /// * `old_index`/`old_uniq` must decode to **smalls** (`external.c:5139-5151`);
+    ///   their value is stored as the fun's `u32` descriptor fields.
+    /// * `num_free > MAX_ARG` (255) cannot fit the header's 8-bit `num_free` field
+    ///   and is `BadArg`, never a corrupt header.
+    /// * the creator pid is parsed straight off the wire (see
+    ///   [`Decoder::decode_creator_pid`]) so no throw-away external-pid block is
+    ///   left on `heap`.
+    ///
+    /// The `num_free` environment terms are decoded **in stream order**: stream
+    /// element `k` is `env[k]` (C `external.c:5171-5174` links `env[0]` first; the
+    /// C encoder emits `env[0]` first, `external.c:3991-3993`).
+    fn decode_new_fun(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
+        let _total_size = self.reader.u32be()?;
+        let arity = usize::from(self.reader.u8()?);
+        let mut uniq = [0u8; 16];
+        uniq.copy_from_slice(self.reader.bytes(16)?);
+        let index = self.reader.u32be()?;
+        let num_free = self.reader.u32be()? as usize;
+        if num_free > MAX_ARG {
+            return Err(bad_arg());
+        }
+        let module = self.decode_node_atom(heap, atoms)?;
+        let old_index = self.decode_small_u32(heap, atoms)?;
+        let old_uniq = self.decode_small_u32(heap, atoms)?;
+        let creator = self.decode_creator_pid(heap, atoms)?;
+        // Wire order: the first environment term is `env[0]`.
+        let mut env = Vec::new();
+        for _ in 0..num_free {
+            env.push(self.decode(heap, atoms)?);
+        }
+        crate::term::make_fun_imported(
+            heap,
+            arity,
+            atom_val(module),
+            &uniq,
+            index,
+            old_index,
+            old_uniq,
+            creator,
+            &env,
+        )
+    }
+
+    /// Decodes the next term and requires it to be a small, returning its value as
+    /// the `u32` a fun's `old_index`/`old_uniq` descriptor field holds.
+    ///
+    /// The C reads those two `NEW_FUN_EXT` fields with `is_small(temp)` followed by
+    /// `unsigned_val` (`external.c:5136-5151`); a non-small is `BadArg`.
+    fn decode_small_u32(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<u32> {
+        let term = self.decode(heap, atoms)?;
+        if !is_small(term) {
+            return Err(bad_arg());
+        }
+        Ok(signed_value(term) as u32)
+    }
+
+    /// Decodes a `NEW_FUN_EXT` creator pid **without** materializing a throw-away
+    /// external-pid block on `heap`.
+    ///
+    /// The C decodes a term and requires `is_pid(temp)` before discarding it
+    /// (`external.c:5153-5160`); the length-delimited pid forms that can appear here
+    /// are `PID_EXT` (`103`) and `NEW_PID_EXT` (`88`). Reading their fields directly
+    /// keeps the node atom's interning in wire order and leaves the caller's heap
+    /// free of the dead block; any other tag (including a `LOCAL_EXT` pid, which this
+    /// codec does not support) is `BadArg`.
+    ///
+    /// The C encoder always emits the `88` form (`enc_pid` on `erts_init_process_id`,
+    /// `external.c:3989`), and `103` is accepted because it, too, decodes to a pid.
+    fn decode_creator_pid(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<FunPid> {
+        let tag = Tag::from_byte(self.reader.u8()?).ok_or_else(bad_arg)?;
+        match tag {
+            Tag::Pid => {
+                let node = self.decode_node_atom(heap, atoms)?;
+                let number = self.reader.u32be()?;
+                let serial = self.reader.u32be()?;
+                let creation = u32::from(self.reader.u8()?);
+                Ok(FunPid {
+                    node: atom_val(node),
+                    number,
+                    serial,
+                    creation,
+                })
+            }
+            Tag::NewPid => {
+                let node = self.decode_node_atom(heap, atoms)?;
+                let number = self.reader.u32be()?;
+                let serial = self.reader.u32be()?;
+                let creation = self.reader.u32be()?;
+                Ok(FunPid {
+                    node: atom_val(node),
+                    number,
+                    serial,
+                    creation,
+                })
+            }
+            _ => Err(bad_arg()),
+        }
     }
 
     /// Reads `len` big-endian `u32` reference ids.
@@ -553,10 +696,13 @@ mod tests {
     use beam_term::prelude::{atom_val, is_list, is_nil, is_small, signed_value};
 
     use crate::error::is_unsupported;
+    use crate::tag::{EXPORT_EXT, NEW_FUN_EXT};
     use crate::term::{
         big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
-        external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
-        tuple_element,
+        external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_arity_term,
+        fun_creator_pid, fun_env, fun_function, fun_index, fun_kind_term, fun_module,
+        fun_num_free_term, fun_old_index, fun_old_uniq, fun_uniq_bytes, tuple_arity, tuple_element,
+        FunKind,
     };
 
     /// `{ok,17}` (oracle: `term_to_binary({ok,17})`).
@@ -1111,21 +1257,177 @@ mod tests {
         assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
 
         // Every recognized-but-not-yet-implemented tag is reported, not guessed.
-        for tag in [
-            Tag::NewFun,
-            Tag::Export,
-            Tag::Record,
-            Tag::Local,
-            Tag::DistHeader,
-        ] {
+        for tag in [Tag::Record, Tag::Local, Tag::DistHeader] {
             assert_unsupported(&[131, tag.as_byte()]);
         }
+
+        // `NEW_FUN_EXT`/`EXPORT_EXT` are implemented now, so a bare tag byte is a
+        // *truncation* (the C would also run off the end and error), never
+        // `unsupported`.
+        assert_bad_arg(&[131, Tag::NewFun.as_byte()]);
+        assert_bad_arg(&[131, Tag::Export.as_byte()]);
 
         // `COMPRESSED` is *covered* now, but only as the top-level wrapper: as a bare
         // tag (a 2-byte image, below the 6-byte minimum) it is malformed, and nested
         // inside a term it is malformed too — never `unsupported`, never a term.
         assert_bad_arg(&[131, 80]);
         assert_bad_arg(&[131, 104, 1, 80]);
+    }
+
+    // -----------------------------------------------------------------------
+    // Funs / exports
+    // -----------------------------------------------------------------------
+
+    /// `EXPORT_EXT`: `[module atom][function atom][arity term]`.
+    #[test]
+    fn export_ext_decodes_to_an_external_fun() {
+        // `fun lists:reverse/1` shape: module `lists`, function `reverse`, arity 1.
+        let mut image = vec![131, EXPORT_EXT];
+        image.extend_from_slice(&[119, 5, b'l', b'i', b's', b't', b's']);
+        image.extend_from_slice(&[119, 7, b'r', b'e', b'v', b'e', b'r', b's', b'e']);
+        image.push(97);
+        image.push(1);
+        let (_h, atoms, term) = decode(&image);
+        assert_eq!(fun_kind_term(term).unwrap(), FunKind::External);
+        assert_eq!(fun_arity_term(term).unwrap(), 1);
+        assert_eq!(fun_num_free_term(term).unwrap(), 0);
+        assert_eq!(
+            atoms.name(fun_module(term).unwrap()),
+            Some("lists"),
+            "the module atom is interned in wire order"
+        );
+        assert_eq!(atoms.name(fun_function(term).unwrap()), Some("reverse"));
+        assert_eq!(fun_env(term).unwrap(), &[] as &[Eterm]);
+
+        // A non-small arity is malformed, as is a negative small.
+        let mut bad = vec![131, EXPORT_EXT];
+        bad.extend_from_slice(&[119, 1, b'm']);
+        bad.extend_from_slice(&[119, 1, b'f']);
+        bad.push(104); // SMALL_TUPLE_EXT — not a small
+        bad.push(0);
+        assert_bad_arg(&bad);
+
+        let mut negative = vec![131, EXPORT_EXT];
+        negative.extend_from_slice(&[119, 1, b'm']);
+        negative.extend_from_slice(&[119, 1, b'f']);
+        negative.extend_from_slice(&[98, 255, 255, 255, 255]); // INTEGER_EXT -1
+        assert_bad_arg(&negative);
+
+        // A module/function field that is not an atom is malformed.
+        assert_bad_arg(&[131, EXPORT_EXT, 97, 1, 119, 1, b'f', 97, 0]);
+        // An arity past the 8-bit header field is a `SystemLimit`.
+        assert_system_limit(&[131, EXPORT_EXT, 119, 1, b'm', 119, 1, b'f', 98, 0, 0, 1, 0]);
+    }
+
+    /// `NEW_FUN_EXT`: the full six-field header, the creator pid and the env.
+    #[test]
+    fn new_fun_ext_decodes_to_an_imported_fun() {
+        const NODE: [u8; 4] = [119, 2, b'n', b'1']; // the UTF-8 atom "n1"
+        let mut uniq = [0u8; 16];
+        for (i, byte) in uniq.iter_mut().enumerate() {
+            *byte = i as u8 + 1;
+        }
+
+        let mut image = vec![131, NEW_FUN_EXT];
+        image.extend_from_slice(&0u32.to_be_bytes()); // size — read, ignored
+        image.push(2); // arity
+        image.extend_from_slice(&uniq);
+        image.extend_from_slice(&0x0102_0304u32.to_be_bytes()); // index
+        image.extend_from_slice(&2u32.to_be_bytes()); // num_free
+        image.extend_from_slice(&[119, 6, b'm', b'o', b'd', b'u', b'l', b'e']); // module
+        image.extend_from_slice(&[97, 7]); // old_index 7
+        image.extend_from_slice(&[97, 3]); // old_uniq 3
+        // Creator pid as `NEW_PID_EXT` (88) — the form the C encoder emits.
+        image.push(88);
+        image.extend_from_slice(&NODE);
+        image.extend_from_slice(&0xAAAA_BBBBu32.to_be_bytes());
+        image.extend_from_slice(&0xCCCC_DDDDu32.to_be_bytes());
+        image.extend_from_slice(&0x1122_3344u32.to_be_bytes());
+        // Environment, in wire order: env[0] = 11, env[1] = 22.
+        image.extend_from_slice(&[97, 11, 97, 22]);
+
+        let (_h, atoms, term) = decode(&image);
+        assert_eq!(fun_kind_term(term).unwrap(), FunKind::Imported);
+        assert_eq!(fun_arity_term(term).unwrap(), 2);
+        assert_eq!(fun_num_free_term(term).unwrap(), 2);
+        assert_eq!(atoms.name(fun_module(term).unwrap()), Some("module"));
+        assert_eq!(fun_uniq_bytes(term).unwrap(), uniq);
+        assert_eq!(fun_index(term).unwrap(), 0x0102_0304);
+        assert_eq!(fun_old_index(term).unwrap(), 7);
+        assert_eq!(fun_old_uniq(term).unwrap(), 3);
+        let creator = fun_creator_pid(term).unwrap();
+        assert_eq!(atoms.name(creator.node), Some("n1"));
+        assert_eq!((creator.number, creator.serial, creator.creation), (
+            0xAAAA_BBBB,
+            0xCCCC_DDDD,
+            0x1122_3344
+        ));
+        // The stream order is the env order: element 0 is `env[0]`.
+        assert_eq!(fun_env(term).unwrap(), &[make_small(11), make_small(22)]);
+
+        // The `size` field is ignored even when it lies; only the field widths matter.
+        let mut lying = image.clone();
+        lying[2..6].copy_from_slice(&0xDEAD_BEEFu32.to_be_bytes());
+        let (_h, _a, term) = decode(&lying);
+        assert_eq!(fun_arity_term(term).unwrap(), 2);
+
+        // A legacy `PID_EXT` (103) creator is accepted (8-bit creation).
+        let mut pid_legacy = vec![131, NEW_FUN_EXT];
+        pid_legacy.extend_from_slice(&0u32.to_be_bytes());
+        pid_legacy.push(0);
+        pid_legacy.extend_from_slice(&uniq);
+        pid_legacy.extend_from_slice(&1u32.to_be_bytes());
+        pid_legacy.extend_from_slice(&0u32.to_be_bytes());
+        pid_legacy.extend_from_slice(&[119, 1, b'm']);
+        pid_legacy.extend_from_slice(&[97, 1, 97, 2]);
+        pid_legacy.push(103);
+        pid_legacy.extend_from_slice(&NODE);
+        pid_legacy.extend_from_slice(&1u32.to_be_bytes());
+        pid_legacy.extend_from_slice(&2u32.to_be_bytes());
+        pid_legacy.push(3); // 8-bit creation
+        let (_h, atoms, term) = decode(&pid_legacy);
+        let creator = fun_creator_pid(term).unwrap();
+        assert_eq!(atoms.name(creator.node), Some("n1"));
+        assert_eq!((creator.number, creator.serial, creator.creation), (1, 2, 3));
+        assert_eq!(fun_num_free_term(term).unwrap(), 0);
+    }
+
+    #[test]
+    fn malformed_new_fun_ext_is_rejected() {
+        // A `num_free` past the 8-bit header field.
+        let mut too_free = vec![131, NEW_FUN_EXT];
+        too_free.extend_from_slice(&0u32.to_be_bytes());
+        too_free.push(0);
+        too_free.extend_from_slice(&[0u8; 16]);
+        too_free.extend_from_slice(&0u32.to_be_bytes());
+        too_free.extend_from_slice(&256u32.to_be_bytes()); // num_free = 256
+        assert_bad_arg(&too_free);
+
+        // A creator field that is not a pid.
+        let mut not_pid = vec![131, NEW_FUN_EXT];
+        not_pid.extend_from_slice(&0u32.to_be_bytes());
+        not_pid.push(0);
+        not_pid.extend_from_slice(&[0u8; 16]);
+        not_pid.extend_from_slice(&0u32.to_be_bytes());
+        not_pid.extend_from_slice(&0u32.to_be_bytes());
+        not_pid.extend_from_slice(&[119, 1, b'm']);
+        not_pid.extend_from_slice(&[97, 1, 97, 2, 97, 3]); // creator is a small
+        assert_bad_arg(&not_pid);
+
+        // `old_index`/`old_uniq` must be smalls.
+        let mut not_small = vec![131, NEW_FUN_EXT];
+        not_small.extend_from_slice(&0u32.to_be_bytes());
+        not_small.push(0);
+        not_small.extend_from_slice(&[0u8; 16]);
+        not_small.extend_from_slice(&0u32.to_be_bytes());
+        not_small.extend_from_slice(&0u32.to_be_bytes());
+        not_small.extend_from_slice(&[119, 1, b'm']);
+        not_small.extend_from_slice(&[104, 0]); // SMALL_TUPLE_EXT
+        not_small.extend_from_slice(&[97, 1]);
+        not_small.push(88);
+        not_small.extend_from_slice(&[119, 2, b'n', b'1']);
+        not_small.extend_from_slice(&[0u8; 12]);
+        assert_bad_arg(&not_small);
     }
 
     // -----------------------------------------------------------------------
