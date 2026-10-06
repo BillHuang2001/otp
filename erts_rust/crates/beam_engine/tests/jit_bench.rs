@@ -7,8 +7,9 @@
 //! the interpreter's). It never asserts that a JIT is faster: that is
 //! environment-dependent and would be flaky; the printed numbers are the evidence.
 //!
-//! Three workloads, chosen to hit the three shapes the baseline tier treats
-//! differently:
+//! Four workloads: the first three hit the three shapes the baseline tier's
+//! arithmetic/register story treats differently, the fourth the **aggregate reads**
+//! it inlines in the same round.
 //!
 //! * **`fib(20)`** — the real `.beam` fixture's `fib/1`
 //!   (`beam_loader/tests/fixtures/slice.beam`, reused by relative path so there is
@@ -29,6 +30,15 @@
 //!   addressing* of the `move`/`swap`/fast-path lowering is for: the same body used
 //!   to deopt at the first instruction touching `x(4)` and run the rest one
 //!   interpreter step at a time.
+//! * **`aggr/2`** — the same synthetic style, but a straight-line body of
+//!   [`AGGR_STEPS`] steps whose every instruction is either one of the guarded
+//!   aggregate reads (`get_list`/`get_hd`/`get_tl`, `get_tuple_element`,
+//!   `select_tuple_arity`) or a small-int `erlang:'*'/2` `gc_bif` — the opcodes
+//!   inlined in the same round as the direct-addressing work. The cons cell and the
+//!   tuple are built **once** at the top of the body (the `put_list`/`put_tuple2`
+//!   builders stay on the interpreter step) and every read result is fed into the
+//!   multiply chain, so the timed loop is dominated by the new inlines rather than by
+//!   the aggregate construction, the BIF machinery or the per-run setup.
 //!
 //! # Method — execution, not compilation
 //!
@@ -57,7 +67,8 @@
 //! compilation. What remains in `ns/op` is per-run setup (`Machine::reset` of the
 //! register/float-register files plus the module-wide label-map build) plus the
 //! actual execution; for `fib(20)` that is thousands of instructions, for the
-//! kernel it is [`KERNEL_OPS`] inlined adds.
+//! kernel it is [`KERNEL_OPS`] inlined adds, for the aggregate kernel it is
+//! [`AGGR_STEPS`] steps of the inlined aggregate reads plus `'*'`.
 //!
 //! Run with `--nocapture` to see the table.
 //!
@@ -100,10 +111,19 @@ const WIDE_REGISTERS: u32 = 8;
 /// this count), so the inlined small-int fast path lowers every single step.
 const WIDE_OPS: usize = 256;
 
-/// The slice BIF hook: `erlang:'+'/2` and `erlang:'-'/2` over small integers.
+/// The number of straight-line steps in the aggregate kernel — one
+/// `get_list`/`get_hd`/`get_tl` trio, one `get_tuple_element` and two
+/// `gc_bif '*'/2` fast-path multiplies each.
+const AGGR_STEPS: usize = 128;
+
+/// The slice BIF hook: `erlang:'+'/2`, `erlang:'-'/2` and `erlang:'*'/2` over
+/// small integers.
 ///
-/// The same implementation serves both workloads (the synthetic kernel imports
-/// `erlang:'+'/2`).
+/// The same implementation serves every workload (the synthetic kernels import
+/// `erlang:'+'/2`, the aggregate kernel imports `erlang:'*'/2`). It is reached only
+/// on a **deopt** path: a native tier's inlined fast path computes the same small-int
+/// results itself, so the hook is what the *interpreter* tier (and any rejected
+/// operand) goes through.
 fn arith_hook(
     module: &str,
     function: &str,
@@ -120,6 +140,7 @@ fn arith_hook(
     match function {
         "+" => Ok(make_small(a + b)),
         "-" => Ok(make_small(a - b)),
+        "*" => Ok(make_small(a * b)),
         _ => Err(BeamError::BadArg),
     }
 }
@@ -145,6 +166,8 @@ enum Kind {
     Kernel,
     /// The hand-built straight-line kernel wide enough to exceed the register cache.
     Wide,
+    /// The hand-built straight-line kernel of the inlined aggregate reads.
+    Aggr,
 }
 
 impl Kind {
@@ -166,6 +189,10 @@ impl Kind {
             // [`WIDE_OPS`] `move`+`add` steps per run: the interpreter pays a full
             // step for each of them.
             Kind::Wide => 5_000,
+            // [`AGGR_STEPS`] steps of six inlined instructions each (the aggregate
+            // reads plus two `'*'` multiplies) — roughly three times the wide body per
+            // run, so a smaller count keeps the whole file inside its ~1 s budget.
+            Kind::Aggr => 2_500,
         }
     }
 }
@@ -404,6 +431,158 @@ fn wide_workload() -> Workload {
         function: wide,
         arity: 2,
         args: vec![make_small(0), make_small(0)],
+    }
+}
+
+/// The synthetic **aggregate** kernel: `aggr/2` is a straight-line body of
+/// [`AGGR_STEPS`] steps, each reading the same cons cell and tuple through every
+/// aggregate read the baseline tier inlines and feeding each result into a small-int
+/// `erlang:'*'/2` `gc_bif` chain:
+///
+/// ```text
+///   x2 = [1 | 2]                     ; put_list        (interpreter step)
+///   x3 = {1, 1, 1}                   ; put_tuple2      (interpreter step)
+///   select_tuple_arity x3 Fail {3 -> body}   ; inlined switch
+/// body:
+///   get_list x2 x4 x5                ; x4 = CAR (1), x5 = CDR (2)
+///   get_hd   x2 x4                   ; x4 = CAR
+///   get_tl   x2 x5                   ; x5 = CDR
+///   get_tuple_element x3 1 x6        ; x6 = element 1 (1)
+///   x0 = x0 * x4                     ; '*'/2 fast path
+///   x0 = x0 * x6                     ; '*'/2 fast path
+///   ... repeated [`AGGR_STEPS`] times, then `return`
+/// ```
+///
+/// The aggregates are built **once per run** at the top of the body and the two
+/// multipliers are deliberately `1`: `x(0)` arrives as `1` (the call argument), so
+/// the product stays `1` and can never leave the small-integer range. That is what
+/// keeps the measurement on the **inlined** fast path — the inlined `'*'` range check
+/// would take its deopt branch (and this workload would then time the interpreter
+/// fallback) as soon as the accumulator left the small range, which a growing product
+/// does after ~59 steps.
+///
+/// Registers `x(0)`, `x(2)`..`x(6)` are touched; the block caches four of them and
+/// addresses the rest directly in `machine.x`, so both lowering paths are exercised.
+/// The body is three blocks (`build_blocks`): the entry block that builds the
+/// aggregates, the body block, and the (unreachable) `select_tuple_arity` fail arm.
+fn aggregate_workload() -> Workload {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("jit_bench_aggregate");
+    // The reads' deopt path builds `{badmatch, Source}`; the workload never takes it,
+    // but the atom is interned so the typed reason cannot differ from the oracle's.
+    module.atom_table.intern("badmatch");
+
+    let star_module = module.atom_table.intern("erlang");
+    let star_function = module.atom_table.intern("*");
+    module.imports.push(Import {
+        module: star_module,
+        function: star_function,
+        arity: 2,
+    });
+    let star = ImportRef(0);
+
+    let aggr = module.atom_table.intern("aggr");
+    let entry = Label(1);
+    let body = Label(2);
+    let fail = Label(9);
+    module.exports.push(Export {
+        function: aggr,
+        arity: 2,
+        label: entry,
+    });
+
+    // `x0 = x0 * x(b)` — the small-int `'*'/2` fast path the native tiers inline.
+    let mul = |arg: u32| Instr::GcBif {
+        arity: 2,
+        bif: star,
+        fail: NO_FAIL,
+        live: 7,
+        args: vec![Operand::X(0), Operand::X(arg)],
+        dst: Operand::X(0),
+    };
+
+    let mut code = vec![
+        Instr::Label(entry),
+        // The cons cell `[1 | 2]` (both halves small integers, so every read result
+        // is a legal multiplier) and the 3-tuple `{1, 1, 1}` — built once per run.
+        Instr::PutList {
+            head: Operand::Integer(1),
+            tail: Operand::Integer(2),
+            dst: Operand::X(2),
+        },
+        Instr::PutTuple2 {
+            dst: Operand::X(3),
+            elements: vec![
+                Operand::Integer(1),
+                Operand::Integer(1),
+                Operand::Integer(1),
+            ],
+        },
+        Instr::SelectTupleArity {
+            tuple: Operand::X(3),
+            fail,
+            destinations: vec![(Operand::Integer(3), body)],
+        },
+        Instr::Label(body),
+    ];
+    for _ in 0..AGGR_STEPS {
+        code.push(Instr::GetList {
+            source: Operand::X(2),
+            head: Operand::X(4),
+            tail: Operand::X(5),
+        });
+        code.push(Instr::GetHd {
+            source: Operand::X(2),
+            head: Operand::X(4),
+        });
+        code.push(Instr::GetTl {
+            source: Operand::X(2),
+            tail: Operand::X(5),
+        });
+        code.push(Instr::GetTupleElement {
+            source: Operand::X(3),
+            element: 1,
+            dst: Operand::X(6),
+        });
+        code.push(mul(4));
+        code.push(mul(6));
+    }
+    code.push(Instr::Return);
+    // The `select_tuple_arity` fail arm: reachable only if the tuple were not arity
+    // 3, i.e. never — it exists so the switch is inlined (a `NO_FAIL` switch deopts).
+    code.push(Instr::Label(fail));
+    code.push(Instr::Move {
+        src: Operand::Integer(-1),
+        dst: Operand::X(0),
+    });
+    code.push(Instr::Return);
+
+    // The faithful decomposition of that body: the loader's own label-delimited
+    // grouping (a native tier compiles blocks, so a wrong grouping would leave the
+    // body block without a native entry point).
+    let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name: aggr,
+        arity: 2,
+        code,
+        blocks,
+        labels,
+    });
+
+    Workload {
+        label: format!(
+            "aggr/2 ({AGGR_STEPS} steps of get_list/get_hd/get_tl + get_tuple_element + \
+             gc_bif '*'/2)"
+        ),
+        kind: Kind::Aggr,
+        module,
+        function: aggr,
+        arity: 2,
+        args: vec![make_small(1), make_small(1)],
     }
 }
 
@@ -671,12 +850,22 @@ fn bench_workload(workload: &Workload) {
 
 #[test]
 fn interpreter_and_native_tiers_agree_and_report_timings() {
-    // One test (not two) so the two workload timings never run concurrently and
-    // contaminate each other; both workloads are still measured and asserted.
+    // One test (not several) so the workload timings never run concurrently and
+    // contaminate each other; every workload is still measured and asserted.
     let fib = fib_workload();
     let kernel = kernel_workload();
     let wide = wide_workload();
-    for workload in [&fib, &kernel, &wide] {
+    let aggr = aggregate_workload();
+    // The aggregate kernel's shape is pinned: `x(0)` arrives as `1` and every
+    // multiplier the reads produce is `1`, so the interpreter's reference result is
+    // exactly `1` (a taken fail arm would make it `-1`, and a non-small operand would
+    // raise instead of returning).
+    assert_eq!(
+        measure(Tier::Interpreter, &aggr).result,
+        make_small(1),
+        "the aggregate kernel's reference result must be the bounded accumulator"
+    );
+    for workload in [&fib, &kernel, &wide, &aggr] {
         bench_workload(workload);
     }
 }
