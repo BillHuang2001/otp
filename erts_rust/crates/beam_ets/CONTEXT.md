@@ -510,8 +510,9 @@ live system `erl` (via `erl -noshell -eval`) so a future implementation need not
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update)
-- `tests/select.rs` → the match-spec compiler integration tests
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation)
+- `tests/select.rs` → the match-spec compiler + arithmetic integration tests
+- `tests/match_spec_run.rs` → the table-independent `ets:match_spec_run/2` runner tests
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl`
 - `../../erts/emulator/beam/erl_db.c` → the API + trap-loop semantics being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` → the interiors + key/match handling being mirrored (read-only)
