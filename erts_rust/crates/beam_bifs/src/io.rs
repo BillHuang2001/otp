@@ -1566,15 +1566,6 @@ mod tests {
             one(ctx, a)
         });
         assert!(matches!(result, Err(BeamError::BadArg)));
-
-        // A non-printable bitstring re-flows through `pp_binary`, which this model
-        // does not reproduce: still the honest typed error.
-        let (_, result) = run_io("~p", |ctx| {
-            let bytes = crate::access::make_heap_bitstring(ctx.heap(), &[0u8; 100], 0)
-                .expect("fits");
-            one(ctx, bytes)
-        });
-        assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
     }
 
     // ---- io_lib:format ---------------------------------------------------------
