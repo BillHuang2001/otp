@@ -32,6 +32,19 @@
 //! table, handing the BIFs that same table is exactly right: an atom a BIF builds is an
 //! index the engine can compare and the printer can name, for **every** loaded module.
 //!
+//! # Interning new atoms (the predicted-index commit)
+//!
+//! Some BIFs (`binary_to_term/1`, `list_to_atom/1`, …) must be able to add a **new** atom
+//! to that same shared table, but the [`BifContext`] only borrows it *immutably* for index
+//! resolution. Since this crate is `#![deny(unsafe_code)]`, the interner cannot hold a
+//! second, mutable borrow of the one table. The [`AtomInterner`] hook solves this without
+//! aliasing: [`PendingInterner`] records the names a BIF interns during a call and
+//! **predicts** each index as `base + <names already recorded>` (interning is append-only
+//! and the runtime is single-threaded, so the prediction is exact); after the BIF returns
+//! — releasing the table borrow — [`RuntimeContext::call_registered`] commits the recorded
+//! names into the shared table in the same order, so each lands at exactly the predicted
+//! index. A name seen twice in one call is deduplicated and gets the same index.
+//!
 //! # No collector yet
 //!
 //! [`ensure_heap`](ExecutionContext::ensure_heap) and
@@ -43,11 +56,11 @@
 
 use std::sync::Arc;
 
-use beam_bifs::{BifContext, OutputSink};
+use beam_bifs::{AtomInterner, BifContext, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
-use beam_term::Eterm;
+use beam_term::{Atom, Eterm};
 
 use crate::error;
 use crate::runtime::Runtime;
@@ -123,6 +136,12 @@ impl<'a> RuntimeContext<'a> {
 
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
     /// runtime's shared state and this context's output sink.
+    ///
+    /// The context is handed a [`PendingInterner`] so a BIF that builds a *new* atom
+    /// (`binary_to_term/1`, `list_to_atom/1`, …) can intern it into the one shared table
+    /// without aliasing it: the interner records the names, the BIF runs against the
+    /// immutable table, and the names are committed (in order, at their predicted
+    /// indices) once the BIF has returned and released the borrow — see the module docs.
     fn call_registered(
         &mut self,
         module: &str,
@@ -138,12 +157,71 @@ impl<'a> RuntimeContext<'a> {
             tables,
             ..
         } = self.runtime;
-        let mut context = BifContext::new(heap, code_server.atoms(), *self_pid);
-        if let Some(sink) = self.output.as_deref_mut() {
-            context = context.with_output(sink);
+        // `base` is the shared table's length before the call: the index the first new
+        // name gets, because nothing else can intern while this single-threaded call runs.
+        let mut pending = PendingInterner::new(code_server.atoms().len());
+        // The `BifContext` borrows `code_server`'s table immutably; the interner is a
+        // separate local, so the two borrows never overlap.
+        let result = {
+            let mut context = BifContext::new(heap, code_server.atoms(), *self_pid)
+                .with_atom_interner(&mut pending);
+            if let Some(sink) = self.output.as_deref_mut() {
+                context = context.with_output(sink);
+            }
+            context = context.with_tables(tables);
+            registry.call(module, function, arity, &mut context, args)
+        };
+        // The BIF is done and the table borrow released, so commit the names it interned:
+        // each lands at the index the interner predicted, keeping the BIF's atom terms
+        // (and every printer/comparison that resolves them) consistent.
+        for name in pending.into_pending() {
+            code_server.atoms_mut().intern(&name);
         }
-        context = context.with_tables(tables);
-        registry.call(module, function, arity, &mut context, args)
+        result
+    }
+}
+
+/// Interns atom names for the duration of one BIF call, predicting their indices.
+///
+/// A [`BifContext`] borrows the shared [`AtomTable`](beam_term::AtomTable) immutably for
+/// index resolution while the interner must add names to it; this crate is
+/// `#![deny(unsafe_code)]`, so the interner cannot hold a coexisting mutable borrow of the
+/// same table. Interning is **append-only** and the runtime is **single-threaded**, so a
+/// name added during one call always lands at `base + <names recorded so far>` — the
+/// interner records the names and predicts that index; [`RuntimeContext::call_registered`]
+/// commits them, in order, after the call. A name seen twice in one call is deduplicated
+/// and returns the same index.
+struct PendingInterner {
+    /// The shared table's length when the call began: the first new name's index.
+    base: usize,
+    /// Names interned during this call, in order (deduplicated).
+    pending: Vec<String>,
+}
+
+impl PendingInterner {
+    /// A pending interner rooted at `base` (the current shared-table length).
+    fn new(base: usize) -> PendingInterner {
+        PendingInterner {
+            base,
+            pending: Vec::new(),
+        }
+    }
+
+    /// The recorded names, in intern order, to be committed by the caller.
+    fn into_pending(self) -> Vec<String> {
+        self.pending
+    }
+}
+
+impl AtomInterner for PendingInterner {
+    fn intern(&mut self, name: &str) -> Atom {
+        if let Some(offset) = self.pending.iter().position(|pending| pending == name) {
+            // A duplicate within this call reuses the predicted index.
+            return Atom::from_raw((self.base + offset) as u32);
+        }
+        let index = self.base + self.pending.len();
+        self.pending.push(name.to_string());
+        Atom::from_raw(index as u32)
     }
 }
 
@@ -204,7 +282,11 @@ impl ExecutionContext for RuntimeContext<'_> {
 
     /// Applies a fun/closure value.
     ///
-    /// A `.beam` fun carries only its `uniq` (per-module) and `index` (the module-level
+    /// A fun built by the `-eval` evaluator (`uniq` == `eval::EVAL_FUN_UNIQ`) is applied
+    /// through the evaluator's own store (`Runtime::eval_closures`): the fun may escape
+    /// into a loaded module (`lists:map(fun(X) -> X*X end, …)`) which calls back into it,
+    /// and the closure body can only be run by the evaluator. Every other fun is a
+    /// `.beam` fun: it carries only its `uniq` (per-module) and `index` (the module-level
     /// lambda index); together they identify the [`FunDescriptor`] — hence the defining
     /// module and its entry label — unambiguously across every module the code server
     /// has loaded. The closure body is entered with the **free variables first**,
@@ -217,6 +299,10 @@ impl ExecutionContext for RuntimeContext<'_> {
             return Err(BeamError::BadArg);
         }
         let uniq = terms::fun_uniq(fun)?;
+        if uniq == crate::eval::EVAL_FUN_UNIQ {
+            let index = terms::fun_index(fun)? as usize;
+            return crate::eval::apply_eval_closure(self, fun, index, args);
+        }
         let index = terms::fun_index(fun)?;
         let mut combined = terms::fun_free(fun)?.to_vec();
         combined.extend_from_slice(args);

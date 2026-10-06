@@ -23,6 +23,7 @@
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
@@ -37,6 +38,7 @@ use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
 use crate::context::RuntimeContext;
 use crate::error;
+use crate::eval::FunBody;
 use crate::format;
 use crate::info::{self, InfoValue};
 
@@ -75,6 +77,16 @@ pub struct Runtime {
     booted: bool,
     /// The exit status recorded by a native `erlang:halt/1` (see [`crate::native`]).
     pub(crate) halt: Option<i32>,
+    /// Closures built by the `-eval` evaluator, indexed by the fun term's `index`.
+    ///
+    /// An `-eval` `fun` may be applied *inside a loaded module* (e.g.
+    /// `lists:map(fun(X) -> X*X end, …)` calls back into the closure), so the closure
+    /// bodies must outlive the one evaluation and be reachable from
+    /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext). The evaluator
+    /// stamps its funs with the sentinel `uniq` [`crate::eval::EVAL_FUN_UNIQ`] and pushes
+    /// the body here; the store is append-only, so an index is stable for the runtime's
+    /// lifetime.
+    pub(crate) eval_closures: Vec<Rc<FunBody>>,
 }
 
 impl Runtime {
@@ -115,6 +127,7 @@ impl Runtime {
             self_pid,
             booted: false,
             halt: None,
+            eval_closures: Vec::new(),
         })
     }
 

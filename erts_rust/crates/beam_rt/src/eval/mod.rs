@@ -38,9 +38,14 @@
 //! as the `origin`, so an uncaught exception reaches the CLI with exactly the
 //! diagnostic the raising crate built.
 //!
-//! **`erlang:halt/0,1` is uncatchable.** The halt raise travels as
-//! [`Flow::Fatal`], which no `catch`/`try` clause matches — that is what makes
-//! `… halt(0) catch … end` terminate with status 0.
+//! **`erlang:halt/0,1` and a capability gap are uncatchable.** The halt raise travels
+//! as [`Flow::Fatal`], which no `catch`/`try` clause matches — that is what makes
+//! `… halt(0) catch … end` terminate with status 0. A raise carrying the
+//! `unsupported*` convention (a Milestone-1 capability gap: `unsupported_opcode: …`
+//! from the engine, `unsupported_bif` from the BIF registry) is likewise [`Flow::Fatal`]
+//! — a probe wrapped in `try … catch … end` must not turn a documented gap into an
+//! apparent `exception`, so it propagates out and the CLI exits 3 with
+//! `beam_rt: unsupported: <reason>` (see [`crate::error::unsupported_reason`]).
 //!
 //! # Known Milestone-1 gaps (typed errors, never wrong results)
 //!
@@ -73,8 +78,9 @@ use crate::error;
 use ast::{is_var_name, BinOp, CatchClause, Clause, Expr, MapField, Qual, Seg, SegKind, Try, UnOp};
 
 /// The `uniq` stamped into every fun this evaluator builds, so a fun can be
-/// recognised as one of *its* closures and resolved through `closures`.
-const EVAL_FUN_UNIQ: u64 = 0x6265_616d_7274_0001;
+/// recognised as one of *its* closures and resolved through
+/// [`Runtime::eval_closures`](crate::runtime::Runtime).
+pub(crate) const EVAL_FUN_UNIQ: u64 = 0x6265_616d_7274_0001;
 
 /// Converts a `Result<_, BeamError>` into the evaluator's control flow.
 ///
@@ -112,7 +118,11 @@ type EResult<T> = core::result::Result<T, Flow>;
 type Env = HashMap<String, Eterm>;
 
 /// The body of a fun built by this evaluator.
-struct FunBody {
+///
+/// Stored on the [`Runtime`](crate::runtime::Runtime) (not on the evaluator) so a fun
+/// that escapes into a loaded module — `lists:map(F, …)` calling `F` back — can still
+/// be applied through [`RuntimeContext::apply_fun`](crate::context::RuntimeContext).
+pub(crate) struct FunBody {
     /// What the fun does.
     kind: FunKind,
     /// The variables captured when the fun was created.
@@ -175,12 +185,19 @@ enum CompOut {
 ///   Milestone-1 gap ([`crate::error::unsupported`]).
 pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
     let tree = parse::parse(expr)?;
-    let mut evaluator = Evaluator {
-        ctx,
-        closures: Vec::new(),
-    };
+    let mut evaluator = Evaluator { ctx };
     let mut env = Env::new();
-    match evaluator.expr(&tree, &mut env) {
+    let outcome = evaluator.expr(&tree, &mut env);
+    finish(outcome, evaluator.ctx)
+}
+
+/// Converts the evaluator's control flow into a runtime [`Result`].
+///
+/// A [`Flow::Fatal`] is returned unchanged. A [`Flow::Raise`] that came from a BIF
+/// (`origin`) is returned unchanged too; one the evaluator produced itself is
+/// re-built as a [`BeamError::Raise`] from its live reason term.
+fn finish(result: EResult<Eterm>, ctx: &RuntimeContext<'_>) -> Result<Eterm> {
+    match result {
         Ok(value) => Ok(value),
         Err(Flow::Fatal(err)) => Err(err),
         Err(Flow::Raise {
@@ -192,7 +209,7 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
             None => {
                 let reason = beam_bifs::exit_reason_from_term(
                     reason,
-                    evaluator.ctx.runtime.code_server.atoms(),
+                    ctx.runtime.code_server.atoms(),
                 );
                 Err(BeamError::Raise(Raise::new(class, reason)))
             }
@@ -200,12 +217,37 @@ pub fn eval(ctx: &mut RuntimeContext<'_>, expr: &str) -> Result<Eterm> {
     }
 }
 
+/// Applies one of the `-eval` evaluator's closures by `index`, with `args`.
+///
+/// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) calls this when a
+/// loaded module applies a fun whose `uniq` is [`EVAL_FUN_UNIQ`] (e.g.
+/// `lists:map(fun(X) -> X*X end, …)`). A fresh [`Evaluator`] is built over the same
+/// host so the closure body is evaluated and its errors are converted with exactly
+/// the semantics a direct `-eval` application would use.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when no closure is stored at `index` (the fun is an `-eval`
+/// fun, but not one this runtime built), plus whatever the closure raises.
+pub(crate) fn apply_eval_closure(
+    ctx: &mut RuntimeContext<'_>,
+    fun: Eterm,
+    index: usize,
+    args: &[Eterm],
+) -> Result<Eterm> {
+    // Clone the `Rc` so the store is not borrowed while the fresh evaluator runs.
+    let Some(body) = ctx.runtime.eval_closures.get(index).cloned() else {
+        return Err(BeamError::BadArg);
+    };
+    let mut evaluator = Evaluator { ctx };
+    let result = evaluator.apply_closure(&body, fun, args);
+    finish(result, evaluator.ctx)
+}
+
 /// The tree-walking evaluator.
 struct Evaluator<'a, 'b> {
     /// The host: the BIF registry, the shared atom table, the heap, the pid.
     ctx: &'a mut RuntimeContext<'b>,
-    /// The funs this evaluation built, indexed by the fun term's `index` field.
-    closures: Vec<Rc<FunBody>>,
 }
 
 impl Evaluator<'_, '_> {
@@ -688,7 +730,7 @@ impl Evaluator<'_, '_> {
             let uniq = heap!(terms::fun_uniq(function));
             let index = heap!(terms::fun_index(function)) as usize;
             if uniq == EVAL_FUN_UNIQ {
-                if let Some(body) = self.closures.get(index).cloned() {
+                if let Some(body) = self.ctx.runtime.eval_closures.get(index).cloned() {
                     return self.apply_closure(&body, function, args);
                 }
             }
@@ -932,11 +974,11 @@ impl Evaluator<'_, '_> {
         self.register_fun(body, arity)
     }
 
-    /// Builds a fun term for `body` and records the closure in the side table.
+    /// Builds a fun term for `body` and records the closure in the runtime's store.
     fn register_fun(&mut self, body: FunBody, arity: u32) -> EResult<Eterm> {
-        let index = u32::try_from(self.closures.len())
+        let index = u32::try_from(self.ctx.runtime.eval_closures.len())
             .map_err(|_| Flow::Fatal(BeamError::SystemLimit))?;
-        self.closures.push(Rc::new(body));
+        self.ctx.runtime.eval_closures.push(Rc::new(body));
         Ok(heap!(terms::make_fun(
             self.ctx,
             arity,
@@ -1232,10 +1274,20 @@ impl Evaluator<'_, '_> {
     /// Converts a [`BeamError`] into the evaluator's control flow.
     ///
     /// A `halt` is [`Flow::Fatal`] — an Erlang `catch`/`try` must not intercept
-    /// it. A structured reason (which `beam_common` cannot carry as a term) is
-    /// also fatal rather than silently reshaped.
+    /// it. A **capability gap** is also fatal: a raise whose reason atom starts with
+    /// `unsupported` (the `unsupported_opcode:`/`unsupported_bif` convention, read
+    /// through the single classifier [`crate::error::unsupported_reason`]) is the
+    /// runtime telling the host "this build cannot do that", not an Erlang
+    /// exception — so a `try`/`catch` in the evaluated expression must not swallow
+    /// it and the CLI can still exit 3 with `beam_rt: unsupported: <reason>`. Every
+    /// genuine `error`/`exit`/`throw` stays fully catchable. A structured reason
+    /// (which `beam_common` cannot carry as a term) is likewise fatal rather than
+    /// silently reshaped.
     fn flow_from_error(&mut self, err: BeamError) -> Flow {
         if error::halt_status(&err).is_some() {
+            return Flow::Fatal(err);
+        }
+        if error::unsupported_reason(&err).is_some() {
             return Flow::Fatal(err);
         }
         let converted = match &err {
