@@ -577,11 +577,18 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 - **The bit operators cap the result at `BIG_ARITY_MAX` digits (4_194_240 bits).** A shift whose result
   would exceed that (`1 bsl 4194240`) or a shift count that does not fit the runtime's word is
   `system_limit` (the C `big_norm` arity bound), reported before allocating — never a partial result.
-- **The native-record half of `is_record/2,3` is `unsupported_bif`.** Matching `Tag`/`Size` against an
-  `ErlRecordDefinition` needs the record's name/size, which is not readable through this crate's safe
-  term access, so a term that *is* a native record raises `error:unsupported_bif` rather than
-  answering with a possibly wrong boolean. `is_record/1` still reports `true` for a native record; no
-  crate in the workspace can build one yet, so the branch is unreachable in practice.
+- **The native-record half of `is_record/2,3` is `unsupported_bif`** — `src/type_test.rs:187-191`
+  (`is_record_2`) and `:207-214` (`is_record_3`). A native record is a boxed `RECORD_SUBTAG` thing
+  (`beam_term::boxed::is_record`, wrapped at `src/access.rs:157`), distinguishable at the header; its
+  module/name live in the heap `ErtsRecordDefinition` reached through word 1 of the instance —
+  `[RECORD_SUBTAG hdr, def_ptr, values…]`, def = `[hdr, field_order, hash, module, name, is_exported,
+  keys…]` (C `../../erts/emulator/beam/erl_record.h:43-92`). `beam_term` exposes **only**
+  `is_record`/`is_record_header` — there is no record-definition reader, and a `record` module in
+  `beam_term` (the frozen-layout owner, like `fun`/`refc`/`map`) would be the LCA; until it exists the
+  branch must raise, never guess. Oracle (compiled `-record #rec{…}`): `is_record(R)`⇒`true`,
+  `is_record(R,rec)`⇒`true` / `(R,other)`⇒`false`, and the native `is_record(R,Mod,Name)` compares the
+  captured module **and** name (`is_record(R,nrtest,rec)`⇒`true`). Native records also render
+  `#Mod:rec{a = 1,b = 2}` (which `src/print.rs` would `badarg`). No workspace crate builds one yet.
 - **`iolist_size/1` returns a small int only.** A size that exceeds the 60-bit small range is not
   representable here (the oracle would return a bignum) — `system_limit`, never a truncated size.
 - **`function_clause` collapses to `BadArg`.** `lists.erl`'s no-clause failures (`nth(3,[a,b])`,
