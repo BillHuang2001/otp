@@ -10,8 +10,14 @@
 //! tool-driven workloads; see [`crate::workloads::tool`]. It too is validated with a
 //! bounded `--version` probe and, if it fails, the honest `rebar3-absent` skip is kept
 //! (never a fabricated number).
+//!
+//! The checkout must also actually **be** a `rebar3` project (carry a root
+//! `rebar.config`). EMQX is a `make`/`mix` project, so `rebar3 compile` at its root
+//! would print `===> Verifying dependencies...`, compile *nothing*, and still exit `0`
+//! — a silent no-op that would otherwise be recorded as a fabricated broker-build
+//! number. That case is an honest `skipped(not-a-rebar3-project)`.
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::metrics::{Category, Metric, Probe, Runtimes, Status};
 use crate::proc;
@@ -32,11 +38,22 @@ const TOOL_NIX_ATTR: &str = "rebar3";
 /// The honest skip reason reported when [`TOOL`] cannot be resolved.
 const TOOL_ABSENT: &str = "rebar3-absent";
 
+/// The honest skip reason reported when the checkout is not a `rebar3` project (no root
+/// `rebar.config`), so `rebar3 compile` would be a silent no-op.
+const NOT_A_REBAR3_PROJECT: &str = "not-a-rebar3-project";
+
 /// The EMQX workload.
 pub struct Emqx;
 
 fn repo() -> PathBuf {
     resolve_repo("emqx", DEFAULT_REPO)
+}
+
+/// Whether `repo` is a `rebar3` project — it carries a root `rebar.config`. EMQX is a
+/// `make`/`mix` project, so `rebar3 compile` there builds nothing yet exits `0`; this
+/// guard turns that into an honest skip rather than a fabricated build number.
+fn is_rebar3_project(repo: &Path) -> bool {
+    repo.join("rebar.config").is_file()
 }
 
 impl Workload for Emqx {
@@ -67,6 +84,9 @@ impl Workload for Emqx {
         if !tool::available(TOOL) {
             return Probe::skipped(TOOL_ABSENT);
         }
+        if !is_rebar3_project(&repo()) {
+            return Probe::skipped(NOT_A_REBAR3_PROJECT);
+        }
         Probe::Ready
     }
 
@@ -91,6 +111,18 @@ impl Workload for Emqx {
                 TOOL_ABSENT,
             );
         };
+        // A checkout without a root `rebar.config` is not a `rebar3` project: `rebar3
+        // compile` would succeed while compiling nothing, so report the honest skip
+        // instead of recording a meaningless wall time.
+        if !is_rebar3_project(&r) {
+            return WorkloadResult::skipped(
+                self.id(),
+                kind,
+                self.category(),
+                self.description(),
+                NOT_A_REBAR3_PROJECT,
+            );
+        }
 
         // Stage the read-only checkout into a private scratch copy and run there, so the
         // build never writes build artifacts into the source repository.
@@ -163,5 +195,28 @@ mod tests {
         if repo().is_dir() && !tool::available(TOOL) {
             assert_eq!(p.reason(), Some(TOOL_ABSENT));
         }
+    }
+
+    /// The root-`rebar.config` guard: a plain directory is not a `rebar3` project, a
+    /// directory carrying `rebar.config` is. This is what keeps EMQX's no-op
+    /// `rebar3 compile` an honest skip rather than a fabricated build number.
+    #[test]
+    fn is_rebar3_project_requires_a_root_rebar_config() {
+        let dir = std::env::temp_dir().join(format!("bench-emqx-proj-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+
+        assert!(
+            !is_rebar3_project(&dir),
+            "an empty directory is not a rebar3 project"
+        );
+
+        std::fs::write(dir.join("rebar.config"), "{deps, []}.\n").expect("write rebar.config");
+        assert!(
+            is_rebar3_project(&dir),
+            "a root rebar.config makes it a rebar3 project"
+        );
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
