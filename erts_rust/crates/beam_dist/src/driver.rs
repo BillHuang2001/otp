@@ -577,6 +577,10 @@ impl ConnectionDriver {
         self.eof
     }
 
+    /// Whether this driver plays the connecting (client) handshake role.
+    pub fn is_client(&self) -> bool {
+        self.role == Role::Client
+    }
     /// One handshake transition.
     fn handshake_step(&mut self) -> Result<HsProgress> {
         match self.phase {
@@ -765,11 +769,6 @@ impl ConnectionDriver {
     /// Queues a tick reply into the output buffer.
     fn queue_tick(&mut self) -> Result<()> {
         write_tick(&mut VecSink(&mut self.output), ESTABLISHED_FRAMING)
-    }
-
-    /// The handshake role (a diagnostic).
-    pub fn is_client(&self) -> bool {
-        self.role == Role::Client
     }
 }
 
