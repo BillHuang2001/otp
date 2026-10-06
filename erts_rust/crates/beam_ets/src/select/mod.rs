@@ -13,8 +13,10 @@
 //!   literals (compared with exact `=:=` — `beam_term::compare::eq`), nested
 //!   tuples and (proper or improper) lists, and `'$N'` variables. A repeated
 //!   `'$N'` requires the two elements to be equal (the C emits `matchCmp` for an
-//!   already-bound variable). `'$_'`/`'$$'` in a head never match, exactly as the
-//!   C does (they are reserved for expressions). `'$0'` **is** a valid variable
+//!   already-bound variable). `'$_'`/`'$$'` in a head are **ordinary literal
+//!   atoms** compared with exact `=:=` — they are special only in a *body* (the C
+//!   `dmc_one_term` emits `matchEq` for any atom that is not `'_'`/`'$N'`,
+//!   `erl_db_util.c:4117-4121`). `'$0'` **is** a valid variable
 //!   (the C `db_is_variable` accepts `$0`); a malformed `$`-atom such as `'$'`,
 //!   `'$x'`, `'$1x'` or `'$01'` is an ordinary **literal atom** (not an error),
 //!   matching `db_is_variable` returning `-1`.
@@ -47,7 +49,8 @@
 //!
 //! # Verified against the system `erl`
 //!
-//! Every semantic above (head `'$_'`/`'$0'`/`'$x'`, repeated `'$N'`, the flat
+//! Every semantic above (head `'$_'`/`'$$'` literals, `'$0'`/`'$x'`, repeated
+//! `'$N'`, the flat
 //! all-must-be-`true` guard list, guard runtime errors skipping the clause while
 //! body runtime errors are `badarg`, the `{{ … }}` construct form, the
 //! last-expression body value, `andalso`/`orelse` short-circuiting, and the

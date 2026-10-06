@@ -197,22 +197,60 @@ fn repeated_variable_requires_the_elements_to_be_equal() {
 }
 
 #[test]
-fn head_dollar_underscore_and_dollar_dollar_never_match() {
-    // erl: `ets:match_object(T, {'$_','_','_'})` -> `[]`.
+fn head_dollar_underscore_and_dollar_dollar_are_literal_atoms() {
+    // erl, with `D = '$_'`, `DD = '$$'` and `T = [{1,'$_'},{2,'$$'},{3,9}]`:
+    //   ets:select(T, [{{1,D},[],[true]}])   -> [true]
+    //   ets:match_object(T, {1,D})           -> [{1,'$_'}]
+    //   ets:select(T, [{{1,DD},[],[true]}])  -> []
+    //   ets:match_object(T, {1,9})           -> []
+    //   ets:select(T, [{{3,9},[],[true]}])   -> [true]
+    //   ets:match_spec_run([D,1], ets:match_spec_compile([{D,[],[true]}])) -> [true]
+    // So in a HEAD `'$_'`/`'$$'` are ordinary literal atoms compared with exact
+    // `=:=` — they are special only in a *body*; the C `dmc_one_term` emits
+    // `matchEq` for any atom that is not `'_'`/`'$N'` (`erl_db_util.c:4117-4121`).
     let atoms = atoms();
     let mut heap = Heap::new(8192).expect("test heap");
-    for name in ["$_", "$$"] {
-        let mut table = new_table(TableKind::Set);
-        table
-            .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
-            .unwrap();
-        let head = tup(&mut heap, &[at(&atoms, name), at(&atoms, "_"), at(&atoms, "_")]);
-        let spec = compile(spec1(&mut heap, head, &[], &[at(&atoms, "$_")]), &atoms).unwrap();
-        assert!(
-            table.select(&spec, &atoms, &mut heap).unwrap().is_empty(),
-            "`{name}` in a head must never match"
-        );
-    }
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "$_"), 0), &atoms)
+        .unwrap();
+    table
+        .insert(object(&mut heap, 2, at(&atoms, "$$"), 0), &atoms)
+        .unwrap();
+    table
+        .insert(object(&mut heap, 3, make_small(9), 0), &atoms)
+        .unwrap();
+
+    // A nested head `{1,'$_'}` matches exactly the object whose corresponding
+    // element IS that same atom (`{1,'$_',0}`), not the other rows.
+    let dollar = at(&atoms, "$_");
+    let nested = tup(&mut heap, &[make_small(1), dollar, at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{1,'$_'}}` matches `{{1,'$_',0}}`");
+    assert!(eq(got[0], object(&mut heap, 1, dollar, 0), &atoms));
+
+    // …but NOT `{1,9}` (the literal is `=:=`, not a wildcard) nor `{1,'$$'}`.
+    let other_literal = tup(&mut heap, &[make_small(1), make_small(9), at(&atoms, "_")]);
+    let got = select_one(&table, other_literal, &[], &[at(&atoms, "$_")], &atoms, &mut heap)
+        .unwrap();
+    assert!(got.is_empty(), "head `{{1,9}}` must not match `{{1,'$_',0}}`");
+
+    let other_atom = tup(&mut heap, &[make_small(1), at(&atoms, "$$"), at(&atoms, "_")]);
+    let got = select_one(&table, other_atom, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert!(
+        got.is_empty(),
+        "head `{{1,'$$'}}` must not match `{{1,'$_',0}}`"
+    );
+
+    // `'$$'` is likewise a literal: it matches `{2,'$$',0}` and nothing else.
+    let nested = tup(&mut heap, &[make_small(2), at(&atoms, "$$"), at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{2,'$$'}}` matches `{{2,'$$',0}}`");
+
+    // A plain integer literal still compares exactly (`{3,9}` matches `{3,9,0}`).
+    let nested = tup(&mut heap, &[make_small(3), make_small(9), at(&atoms, "_")]);
+    let got = select_one(&table, nested, &[], &[at(&atoms, "$_")], &atoms, &mut heap).unwrap();
+    assert_eq!(got.len(), 1, "head `{{3,9}}` matches `{{3,9,0}}`");
 }
 
 #[test]
@@ -721,6 +759,62 @@ fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
             matches!(err, BeamError::BadArg),
             "{op} by zero is badarg"
         );
+    }
+}
+
+#[test]
+fn shift_counts_negative_reverse_direction_and_bsr_saturates() {
+    // erl (OTP 29 / erts-17.1), quoted exactly:
+    //   1 bsl -1  -> 0      1 bsr -1   -> 2
+    //   8 bsr -1  -> 16     8 bsl -1   -> 4
+    //   1 bsr 100 -> 0      -1 bsr 100 -> -1
+    //   1 bsr 63  -> 0      -1 bsr 63  -> -1
+    //   0 bsl 100 -> 0      0 bsr -100 -> 0
+    //   2 bsl 57  -> 288230376151711744   288230376151711744 bsr 57 -> 2
+    // and, through the match spec (`{'OP', A, B}` as the body):
+    //   {'bsl',8,-1} -> [4]   {'bsr',1,-1} -> [2]   {'bsl',0,64} -> [0]
+    // i.e. the C `erts_shift` negates the `bsr` count and lets the resulting sign
+    // pick the direction (so `bsl`/`bsr` merely swap for a negative count), and
+    // saturates a right shift of a 60-bit small by 59 or more to the sign's
+    // `0`/`-1` (`erl_arith.c:196-247`).
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+    let head = at(&atoms, "_");
+
+    for (op, a, b, expected) in [
+        ("bsl", 1i64, -1i64, 0i64),
+        ("bsr", 1, -1, 2),
+        ("bsr", 8, -1, 16),
+        ("bsl", 8, -1, 4),
+        ("bsr", 1, 100, 0),
+        ("bsr", -1, 100, -1),
+        ("bsr", 1, 63, 0),
+        ("bsr", -1, 63, -1),
+        ("bsl", 0, 100, 0),
+        ("bsr", 0, -100, 0),
+        ("bsl", 2, 57, 1 << 58),
+        ("bsr", 1 << 58, 57, 2),
+    ] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(a), make_small(b)]);
+        let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+        assert_eq!(
+            got,
+            vec![make_small(expected)],
+            "{a} {op} {b} must be {expected}"
+        );
+    }
+
+    // A left shift that leaves the 60-bit small range stays the typed
+    // `unsupported` (`1 bsl 100` is a bignum in the oracle), and so does a `bsr`
+    // with a negative count that big (`1 bsr -100` is exactly `1 bsl 100`).
+    for (op, a, b) in [("bsl", 1i64, 100i64), ("bsr", 1, -100)] {
+        let body = call(&mut heap, at(&atoms, op), &[make_small(a), make_small(b)]);
+        let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+        assert_unsupported_arithmetic(err, &format!("{a} {op} {b} widens to a bignum"));
     }
 }
 

@@ -2,9 +2,10 @@
 //! table object against it.
 //!
 //! Mirrors the C `dmc_expr` head path (`erl_db_util.c`): `'_'` is a wildcard,
-//! `'$_'`/`'$$'` never match in a head, `'$N'` binds (a repeated `'$N'` compares
-//! equal), tuples and cons cells recurse structurally, and everything else is an
-//! exact (`=:=`) literal.
+//! `'$N'` binds (a repeated `'$N'` compares equal), tuples and cons cells recurse
+//! structurally, and **every other atom is an exact (`=:=`) literal** — including
+//! `'$_'`/`'$$'`, which are special only in a *body* (the C `dmc_one_term` emits
+//! `matchEq` for any atom that is not `'_'`/`'$N'`, `erl_db_util.c:4117-4121`).
 
 use std::collections::BTreeSet;
 
@@ -18,11 +19,11 @@ use super::{atom_name, tuple_elements, var_index};
 pub enum Pattern {
     /// `'_'` — matches any term.
     Wildcard,
-    /// `'$_'` / `'$$'` in a head — matches nothing (reserved for expressions).
-    Fail,
     /// `'$N'` — matches any term and binds it to variable `N`.
     Bind(u32),
-    /// Any other term — must compare equal (exactly, `=:=`).
+    /// Any other term — must compare equal (exactly, `=:=`). `'$_'`/`'$$'` land
+    /// here: in a **head** they are ordinary literal atoms (they are special only
+    /// in a body).
     Literal(Eterm),
     /// A tuple pattern: matches a tuple of the same arity whose elements match.
     Tuple(Vec<Pattern>),
@@ -35,10 +36,10 @@ pub(super) fn decode(term: Eterm, atoms: &AtomTable, vars: &mut BTreeSet<u32>) -
     if let Some(name) = atom_name(term, atoms) {
         match name {
             "_" => return Ok(Pattern::Wildcard),
-            "$_" | "$$" => return Ok(Pattern::Fail),
             _ => {
-                // `'$0'`/`'$N'` bind; a malformed `$`-atom is an ordinary literal
-                // (the C `db_is_variable` returns -1 for it).
+                // `'$0'`/`'$N'` bind; any other atom — including a malformed
+                // `$`-atom such as `'$_'`/`'$$'`/`'$x'` (the C `db_is_variable`
+                // returns -1 for them) — is an ordinary literal.
                 if let Some(index) = var_index(name) {
                     vars.insert(index);
                     return Ok(Pattern::Bind(index));
@@ -80,7 +81,6 @@ pub(super) fn matches(
 ) -> bool {
     match pattern {
         Pattern::Wildcard => true,
-        Pattern::Fail => false,
         // A repeated `'$N'` must compare equal (the C emits `matchCmp`).
         Pattern::Literal(literal) => eq(*literal, object, atoms),
         Pattern::Bind(index) => match binds.iter().find(|(var, _)| var == index) {
@@ -139,6 +139,6 @@ pub(super) fn bound_vars(pattern: &Pattern, out: &mut BTreeSet<u32>) {
             bound_vars(head, out);
             bound_vars(tail, out);
         }
-        Pattern::Wildcard | Pattern::Fail | Pattern::Literal(_) => {}
+        Pattern::Wildcard | Pattern::Literal(_) => {}
     }
 }

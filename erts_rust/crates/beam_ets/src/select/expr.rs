@@ -26,9 +26,14 @@
 //! float: `4/2` is `2.0`) is the typed `unsupported_ets` raise, and `div`/`rem` by
 //! zero is `badarg` (what the oracle raises).
 //!
-//! One deliberate divergence from the oracle is documented at
-//! [`default_arith`]: the C `erts_shift` *reverses the direction* for a negative
-//! shift count (`8 bsr -1` is `16`), whereas the default hook refuses it.
+//! Shift operators follow the C `erts_shift`
+//! (`../../erts/emulator/beam/erl_arith.c:196-247`) exactly over the small-integer
+//! subset: a **negative** count *reverses* the direction (the `bsr` count is
+//! negated and the sign of the resulting count picks the direction, so `bsl`/`bsr`
+//! merely swap — `8 bsr -1` is `16`, `1 bsl -1` is `0`), and a **right** shift by
+//! 59 or more saturates to the sign's `0`/`-1` (`-1 bsr 100` is `-1`). A **left**
+//! shift that leaves the 60-bit small range (`2 bsl 62`, `1 bsl 100`) is a bignum
+//! in the oracle and stays the typed `unsupported`.
 //!
 //! Like every other guard construct, arithmetic that raises inside a **guard**
 //! makes its clause fail and is skipped by the caller; the body path is the
@@ -725,14 +730,17 @@ fn not_small(op: &str) -> BeamError {
 /// * `/` ⇒ `unsupported_ets`: its Erlang result is **always** a float (`1/2` is
 ///   `0.5`, `4/2` is `2.0`).
 /// * `div`/`rem` by zero ⇒ `badarg`, which is what the oracle raises.
-/// * A **negative** shift count ⇒ `badarg`. This is the one documented
-///   divergence: the C `erts_shift`
-///   (`../../erts/emulator/beam/erl_arith.c:229-236`) *reverses the direction*
-///   instead (`8 bsr -1` is `16`, `1 bsl -1` is `0`) and so the oracle answers
-///   these. The default hook scopes a negative count out, like every other case it
-///   cannot answer exactly — it never guesses a value. A shift count of 64 or more
-///   is refused the same way (the oracle saturates `bsr` to `0`/`-1` and widens
-///   `bsl` to a bignum).
+/// * Shift operators mirror the C `erts_shift`
+///   (`../../erts/emulator/beam/erl_arith.c:196-247`). A **negative** count
+///   *reverses* the direction: the `bsr` count is negated and the sign of the
+///   resulting count chooses the direction, so `bsl`/`bsr` merely swap (`8 bsr -1`
+///   is `16`, `1 bsl -1` is `0`, `8 bsl -1` is `4`). A **right** shift of a 60-bit
+///   small by 59 or more (including 64+) saturates to the sign's `0`/`-1`
+///   (`1 bsr 100` is `0`, `-1 bsr 100` is `-1`) — never `badarg`. A **left** shift
+///   (directly, or a `bsr` with a negative count) that leaves the 60-bit small
+///   range — a count of 64 or more, or lost bits such as `2 bsl 62` — is a bignum
+///   in the oracle, so it is the typed `unsupported_ets`. A zero operand short-
+///   circuits to `0` for every count (`0 bsl 100` is `0`), as the C does.
 /// * A wrong operand count ⇒ `badarg`; only reachable by calling the seam
 ///   directly, since [`decode_call`] rejects it at compile time.
 fn default_arith(op: ArithOp, args: &[Eterm]) -> Result<Eterm> {
@@ -790,25 +798,43 @@ fn default_arith(op: ArithOp, args: &[Eterm]) -> Result<Eterm> {
         (ArithOp::Bxor, 2) => result(operand(0)? ^ operand(1)?),
         (ArithOp::Bsl, 2) | (ArithOp::Bsr, 2) => {
             let (value, count) = (operand(0)?, operand(1)?);
-            if count < 0 {
-                return Err(badarg());
+            // The C `erts_shift` returns the value unchanged for a zero count or a
+            // zero operand (`i == 0 || ires == 0`); the zero-operand case matters
+            // because it short-circuits even an out-of-range count (`0 bsl 100`).
+            if value == 0 || count == 0 {
+                return result(value);
             }
-            let Some(amount) = u32::try_from(count).ok().filter(|count| *count < 64) else {
-                return Err(not_small(name));
-            };
-            // `bsl` must not silently drop the shifted-out bits: `2 bsl 62` is a
-            // bignum in the oracle, and a bare `<<` would answer `0`. The
-            // round-trip catches exactly the bits that were lost.
-            let (shifted, round_trip) = if op == ArithOp::Bsl {
-                let shifted = value << amount;
-                (shifted, shifted >> amount)
+            // …and it *reverses the direction* for a negative count: `bsr` negates
+            // the count (`i = -signed_val(arg2)`), and the sign of the resulting
+            // count chooses the direction, so `bsl`/`bsr` merely swap. `|count|`
+            // fits `i64` because a small integer is at most 60 bits.
+            let (left, amount) = if count > 0 {
+                (op == ArithOp::Bsl, count)
             } else {
-                (value >> amount, value)
+                (op == ArithOp::Bsr, -count)
             };
-            if round_trip != value {
-                return Err(not_small(name));
+            // A count past `u32` is far beyond the 64-bit width; saturate so the
+            // boundary handling below applies (left ⇒ bignum, right ⇒ sign).
+            let amount = u32::try_from(amount).unwrap_or(u32::MAX);
+            if left {
+                // A left shift must not silently drop shifted-out bits: `2 bsl 62`
+                // is a bignum in the oracle and a bare `<<` would answer `0`. Any
+                // count of 64 or more leaves the 60-bit range for sure, so it is
+                // refused the same way (never guessed).
+                if amount >= 64 {
+                    return Err(not_small(name));
+                }
+                let shifted = value << amount;
+                if (shifted >> amount) != value {
+                    return Err(not_small(name));
+                }
+                result(shifted)
+            } else {
+                // An arithmetic right shift of a 60-bit value saturates to the
+                // sign's `0`/`-1`; clamping the amount at 63 yields exactly that
+                // (and keeps the shift in range for the `i64` operation).
+                result(value >> amount.min(63))
             }
-            result(shifted)
         }
         _ => Err(badarg()),
     }
