@@ -9,7 +9,7 @@
 //! (`../../erts/emulator/beam/big.c:4038-4044`).
 //!
 //! This is the **legacy** hash. `phash2/1,2` uses `make_hash2` (+ `MIX`) and is a
-//! different function; it is not implemented here.
+//! different function; it is registered as a typed `unsupported_bif` capability gap.
 //!
 //! # The algorithm
 //!
@@ -409,9 +409,22 @@ fn phash_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     arith::int_from_i64(ctx, final_hash as i64)
 }
 
-/// Registers `erlang:phash/2`.
+/// Registers `erlang:phash/2` plus the `erlang:phash2/1,2` capability gaps.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "phash", 2, phash_2);
+    reg.register("erlang", "phash2", 1, phash2_gap);
+    reg.register("erlang", "phash2", 2, phash2_gap);
+}
+
+/// `erlang:phash2/1,2` — the *other* hash (`make_hash2`), a capability gap.
+///
+/// These are real `bif.tab` BIFs (`../../erts/emulator/beam/bif.tab:83-84`) whose
+/// algorithm (`make_hash2`, a `MIX`-based hash unrelated to `phash`'s `make_hash`)
+/// Milestone-1 does not reproduce. Registering them to raise `unsupported_bif`
+/// (which the runtime reports as a documented capability gap / exit 3) is the
+/// honest classification — never a plain `undef`, and never a guessed value.
+fn phash2_gap(_ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    Err(unsupported_bif())
 }
 
 #[cfg(test)]

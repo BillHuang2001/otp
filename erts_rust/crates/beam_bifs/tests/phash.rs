@@ -527,7 +527,32 @@ fn phash_2_is_registered() {
     // The arity is part of the key: `phash/1` does not exist.
     assert!(!reg.contains("erlang", "phash", 1));
     assert!(!reg.contains("erlang", "phash", 3));
-    // `phash2` is a *different* hash function and is deliberately not registered.
-    assert!(!reg.contains("erlang", "phash2", 1));
-    assert!(!reg.contains("erlang", "phash2", 2));
+}
+
+#[test]
+fn phash2_is_a_typed_capability_gap_not_an_undef() {
+    // `phash2/1,2` are real `bif.tab` BIFs (`bif.tab:83-84`) whose `make_hash2`
+    // algorithm this crate does not reproduce. They are registered to raise the
+    // typed `unsupported_bif` (a documented capability gap the runtime reports as
+    // exit 3), never a plain `undef` that the oracle would answer differently.
+    let reg = default_registry();
+    assert!(reg.contains("erlang", "phash2", 1));
+    assert!(reg.contains("erlang", "phash2", 2));
+    run(|reg, ctx| {
+        let arg = int_term(ctx, 42);
+        assert_unsupported(
+            reg.call("erlang", "phash2", 1, ctx, &[arg])
+                .expect_err("phash2/1 is a registered capability gap"),
+            "phash2/1",
+        );
+    });
+    run(|reg, ctx| {
+        let arg = int_term(ctx, 42);
+        let range = int_term(ctx, 16);
+        assert_unsupported(
+            reg.call("erlang", "phash2", 2, ctx, &[arg, range])
+                .expect_err("phash2/2 is a registered capability gap"),
+            "phash2/2",
+        );
+    });
 }
