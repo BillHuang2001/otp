@@ -142,7 +142,7 @@ impl Table {
 }
 ```
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
-  (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/
+  (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
   `iter_objects`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
   `update_counter`/`update_element`). `Table` stores `Box<dyn Interior>`. `insert` returns
   `Result<bool>` — **whether the object was retained** — so `Table::insert` reclaims the deep copy it
