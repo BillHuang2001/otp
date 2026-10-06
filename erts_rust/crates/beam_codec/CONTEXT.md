@@ -167,14 +167,53 @@ flatmap/hashmap switchover is an *open* layout this crate deliberately collapses
 §Term-layout ownership), `82` (atom cache refs, decode only), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
-by default).
+by default), `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
 **Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
-result):** `112 NEW_FUN` / `113 EXPORT` (blocked on a fun/export registry owned by
-`beam_loader`/`beam_rt`), `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node
-identity), `68` (distribution header — `beam_dist`'s); plus any atom name not representable in the
-emitted encoding.
+result):** `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node identity), `68`
+(distribution header — `beam_dist`'s); plus any atom name not representable in the emitted encoding.
 **Obsolete tags rejected as `BadArg`** (as the C does): `117 FUN` (removed in OTP 23,
 `external.c:6399-6404`) and `78 NEW_CACHE` (dead `#if 0`, `external.h:77-81`).
+
+### Fun encodings (`EXPORT_EXT` `113` / `NEW_FUN_EXT` `112`)
+Both fun tags are handled **inside the shared term walker** (`Decoder::decode`), so a fun nested in
+a tuple/list/map (exactly the shape of a `.beam` `LitT` literal) decodes like any other sub-term.
+The interior layout is owned by `beam_term::fun`; this crate only allocates the block (`beam_alloc`)
+and forwards to `write_fun_external`/`write_fun_imported` (`src/term/mod.rs`).
+- **`EXPORT_EXT` (`113`) ⇒ `FunKind::External`** — `[module atom][function atom][arity term]`
+  (`external.c:5006-5040`). The two atoms are decoded in stream order via `decode_node_atom` (atom
+  interning follows the wire order) and the arity is a **normal decoded term** that must be a small
+  `>= 0` (C `is_small`/`signed_val`), else `BadArg`; an arity past the header's 8-bit field is a
+  `SystemLimit` (via the layout's `make_fun_header`). Encode emits `[113][module][function][arity as
+  a small]`.
+- **`NEW_FUN_EXT` (`112`) ⇒ `FunKind::Imported`** —
+  `[size:4 BE][arity:1][uniq:16][index:4 BE][num_free:4 BE][module atom][old_index term]
+  [old_uniq term][creator pid term][env…]` (`external.c:5102-5176`).
+  - `size` is **read and ignored**: since OTP 23 the C may write a wrong total size
+    (`external.c:5115`), so it is not validated. On **encode** it is `4 + payload_len` — bytes from
+    the first byte of the size field through the end of the fun (C `ep - size_p`,
+    `external.c:3363`), i.e. the tag byte is excluded. Verified against the oracle: for
+    `ftest:make3("aa","bb","cc")` the image is `131,112,0,0,0,86,…` and the payload after the size
+    field is 82 = 86 − 4. Implemented by writing a 4-byte placeholder, emitting the body, then
+    patching via `Writer::patch_u32be` (new crate-internal backward write).
+  - `old_index`/`old_uniq` must decode to **smalls** (C `is_small`), else `BadArg`; they are stored
+    as the descriptor's `u32` fields.
+  - `num_free > MAX_ARG` (255) cannot fit the 8-bit header field ⇒ `BadArg` (never a corrupt
+    header).
+  - The creator pid is parsed **directly off the wire** by `decode_creator_pid` (only `PID_EXT` `103`
+    and `NEW_PID_EXT` `88`; the C encoder always emits `88`, `external.c:3989`), so no throw-away
+    external-pid block is left on the caller's heap and the node atom is interned in wire order.
+    Anything else (including a `LOCAL_EXT` pid, which this codec does not model) is `BadArg` — a
+    **slight narrowing vs C** (which accepts any `is_pid` term). Encode always emits the modern
+    `NEW_PID_EXT` via the existing `encode_pid`.
+  - **ENV ORDER — wire order is the env order.** Stream element `k` is `env[k]`. The C decoder links
+    `env[0]` first (`external.c:5171-5174`, `for (i = num_free-1; i >= 0; i--) funp->env[i] = next`)
+    and the C encoder pushes `env[num_free-1]…env[0]` onto a LIFO work stack, emitting `env[0]` first
+    (`external.c:3991-3993`) — so decode reads `env[k]` and encode writes `env[k]` in order; nothing
+    is reversed. (Confirmed empirically: flipping the wire-first env byte of
+    `term_to_binary(ftest:make3("aa","bb","cc"))` changes the fun body's `x0`.)
+  - `FunKind::Local` (the `make_fun3` closure) has **no faithful wire image** — its inlined
+    descriptor carries no module, no 16-byte `uniq` and no creator pid — so encoding one returns
+    `error::unsupported_local_fun()` (see §Error surface), never a mis-encoded term.
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
