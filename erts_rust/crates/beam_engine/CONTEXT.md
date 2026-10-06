@@ -160,7 +160,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 `Test` (**all** `TestKind`s, see below), `SelectVal` (exact `=:=` match against each `(value, label)`, else `fail`, else a raise when `fail == NO_FAIL`).
 `Jump`, `Call`, `CallLast`, `CallOnly`, `CallExt`, `CallExtOnly`, `CallExtLast`, `Allocate`, `AllocateHeap`, `TestHeap`, `Deallocate`, `Trim`, `Return`.
 `GcBif`, `Bif0`, `Bif`.
-`Instr::Generic { op, .. }` is **not** executed: it returns `error::unsupported(op.name())`.
+`Instr::Generic { op, operands, .. }` executes exactly **one** opcode — `is_any_native_record` (via `src/generic.rs`); every other Generic opcode returns `error::unsupported(op.name())`.
 - **`GcBif`/`Bif` failure semantics**: evaluate the arg operands, call `ctx.call_bif`. On `Ok`, store into `dst`. On `Err` with a live `fail` label, **jump to `fail`** (guard failure). On `Err` with `fail == NO_FAIL`, **raise** via `raise_bif_error` (mirrors `FAIL_HEAD_OR_BODY`, `emu/macros.tab:266`).
 - **`Bif0`/`CallExt*` failure semantics**: these carry no fail label, so **every** error is a raise through `raise_bif_error`.
 - **`raise_bif_error`**: with no live catch frame (or a `BeamError::Raise`), the error propagates unchanged. With a live catch frame, the error's BEAM atom name (`BeamError::as_atom()`: `badarg`/`badarith`/`badarity`/`badmatch`/`system_limit`/`out_of_memory`) is resolved in the running module's atom table, turned into a term and raised with class `error` — the class every BIF failure carries. An error the engine cannot name as a term (no atom, a `Raise`, `TermNotFound`, `Io`, or an atom absent from the module) propagates unchanged rather than being substituted by a *different* atom.
