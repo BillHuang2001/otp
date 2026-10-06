@@ -361,6 +361,7 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN` (`{line, N}` framing)
 - `src/drivers/binary_io.rs` → `Phase`, `PhaseChange` (the text⇄binary phase-change protocol)
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile` (the built-in `efile` driver)
+- `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
 - `src/error.rs` → `pub(crate)` error constructors (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
