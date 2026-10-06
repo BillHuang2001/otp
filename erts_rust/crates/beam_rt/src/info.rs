@@ -384,9 +384,9 @@ mod tests {
 
         // Open a real `{spawn, "true"}` port through `erlang:open_port/2`: the count rises
         // while it is live and drops once it is closed, so the answer tracks the live port
-        // set exactly. (A `{fd, N}` port would exercise the childless form, but adopting a
-        // descriptor requires the poller to put it in non-blocking mode, which the test
-        // environment refuses for the inherited descriptors — `EPERM` from `fcntl`.)
+        // set exactly. (The childless `{fd, N}` form needs a descriptor the caller owns —
+        // adopting an *inherited* one is refused here by `fcntl` with `EPERM`; it is
+        // covered instead by `port::tests::a_fd_port_adopts_a_caller_owned_descriptor`.)
         let port = {
             let mut sink = beam_bifs::NullSink;
             let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);

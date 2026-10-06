@@ -182,47 +182,73 @@ DAG acyclic (`../CONTEXT.md`).
 ### `port.rs` — the `PortHook` provider (contract A.4)
 ```rust
 pub const PORT_INFO_ATOMS: &[&str];                        // the `port_info/1` item vocabulary (seeded at boot)
+pub(crate) const PORT_POLL_SLICE: Duration;                // one poll round's budget (25 ms)
 pub enum PortName { Spawn, SpawnExecutable, Fd }           // the accepted Name forms / backing driver
 pub enum StreamType { List, Binary }                       // `list` (default) / `binary`
-pub struct LivePort { /* driver name, command, child, stdout: Option<ChildStdout>, os_pid,
-                         connected, stream, links/monitors (empty) */ }
-pub struct PortRegistry { /* beam_process::PortTable + id → LivePort map + a per-registry scratch Heap */ }
+pub struct PortRegistry { /* poller: beam_io::Poller, registry: beam_io::PortRegistry,
+                             meta: HashMap<u64, PortMeta>, heap: Heap */ }
 impl PortRegistry {
     pub fn new() -> Result<PortRegistry>;
-    pub fn alloc(&mut self) -> Result<PortId>;
-    pub fn release(&mut self, id: PortId);
+    pub fn is_live(&self, id: PortId) -> bool;
     pub fn contains(&self, id: PortId) -> bool;
+    pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()>;   // `erlang:port_command/2,3`
     pub fn len(&self) -> usize;                            // the live-port count (`system_info(port_count)`)
     pub fn is_empty(&self) -> bool;
     pub fn ids(&self) -> Vec<PortId>;                      // the LIVE ports' ids, port-number order (`erlang:ports/0`)
-    pub fn insert(&mut self, id: PortId, live: LivePort);
-    pub fn remove(&mut self, id: PortId) -> Option<LivePort>;
+    pub fn close(&mut self, id: PortId) -> Result<()>;
+    // private: register(driver, meta), pump(timeout) -> Vec<PortEvent>, take_due_exit_statuses, info
 }
-pub struct RuntimePorts { /* Rc<RefCell<PortRegistry>> + Rc<AtomTable> handle */ }
-impl RuntimePorts { pub fn new(registry: Rc<RefCell<PortRegistry>>, atoms: Rc<AtomTable>) -> RuntimePorts; }
+pub struct RuntimePorts { /* Rc<RefCell<PortRegistry>> + Rc<AtomTable> handle + the owning ProcessId */ }
+impl RuntimePorts { pub fn new(registry: Rc<RefCell<PortRegistry>>, atoms: Rc<AtomTable>, owner: ProcessId) -> RuntimePorts; }
 // impl beam_bifs::PortHook for RuntimePorts — open_port/2, port_close/1, port_info/1,2
+// PortMeta (private): name, command, os_pid, stream, connected, notify_exit, links, monitors, owner
+// PortEvent (private): Data { port, bytes, stream, owner } | Exited { port, status, owner }
 
+impl Runtime {
+    /// Polls the live ports for up to `timeout`, **delivers** every `{Port, {data, Data}}` /
+    /// `{Port, {exit_status, Status}}` into the **owning** process's mailbox (`table.deliver_simple`),
+    /// and returns how many were delivered (0 when no port is live — never sleeps).
+    pub(crate) fn deliver_port_messages(&mut self, table: &mut ProcessTable, timeout: Duration) -> Result<usize>;
+}
 impl RuntimeContext<'_> {
-    /// The port poller: registers every live port's stdout fd with a `beam_io::Poller`, waits up
-    /// to `timeout` for readiness, does ONE non-blocking `Read::read` per readable/EOF/error event,
-    /// and returns the `{PortId::to_eterm(), {data, Data}}` messages it produced (an Erlang binary
-    /// for a `binary` stream, else a char list). `Ok(vec![])` once the timeout elapses with no
-    /// readiness; EOF drops the stream handle so a later poll cannot spin on the closed fd.
+    /// The `-eval` port half: the same poll, but the built messages are returned inline (the
+    /// evaluator matches them against its own `receive` clauses). `Ok(vec![])` once the timeout
+    /// elapses; nothing is polled when no port is live.
     pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>>;
+    pub(crate) fn port_data_message(&mut self, port: PortId, bytes: &[u8], stream: StreamType) -> Result<Eterm>;
+    pub(crate) fn port_exit_message(&mut self, port: PortId, status: i32) -> Result<Eterm>;
 }
 ```
-`Runtime` owns the registry as an `Rc<RefCell<PortRegistry>>` (the same cheap-clone pattern as the ETS
-tables) and `call_registered` builds a `RuntimePorts` from that handle + the shared atom handle, so
-`erlang:open_port/2`/`port_close/1`/`port_info/1,2` reach a real OS process **without** a
-`&mut Runtime` borrow. The diff-harness `driver/port_backed_by_spawn_driver` and
-`driver/spawn_driver_port_stream_read` cases AGREE.
+`PortRegistry` wraps `{ poller, registry, meta, heap }`: **one** long-lived `beam_io::Poller` (a port's
+descriptors are registered when its driver starts, so a per-call poller would lose every registration),
+**one** `beam_io::PortRegistry` (the id authority plus the live ports and their drivers), the
+`port_info/1` metadata `beam_io` deliberately does not expose, and the arena a `port_info/1` result is
+built on. `Runtime` owns it as an `Rc<RefCell<PortRegistry>>` (the same cheap-clone pattern as the ETS
+tables); `RuntimeContext::call_registered` builds a `RuntimePorts` from that handle + the shared atom
+handle + the **owning pid** it runs as, so `erlang:open_port/2`/`port_close/1`/`port_info/1,2` reach a
+real OS process **without** a `&mut Runtime` borrow. The diff-harness
+`driver/port_backed_by_spawn_driver` and `driver/spawn_driver_port_stream_read` cases AGREE.
 
-The **port stream read** is closed end-to-end: a `spawn`/`spawn_executable` port keeps the child's
-`stdout` handle (`LivePort.stdout`), `RuntimeContext::poll_port_messages` reads it through a
-`beam_io::Poller`, and `src/eval/mod.rs`'s `receive … after T` polls for up to `T` ms and matches the
-produced messages against the receive clauses (falling back to the `after` body). The message's `data`
-atom is interned in the runtime's **one** shared table and the term is built on the runtime's
-pointer-stable arena, so it is nameable by the printer and matchable by a `receive` clause. A
+`beam_io::drivers::SpawnDriver` is the **single** OS-child implementation: `SpawnDriver::new` really
+starts the child (or adopts `{fd, N}`) before anything is registered anywhere, `port_command` writes to
+the child's stdin through the `beam_io` registry, and the driver's teardown kills and reaps the child.
+This crate owns only the **Erlang term decoding** of `open_port/2`'s `Name`/`Options` (into a term-free
+`beam_io::SpawnSpec`/`SpawnOptions` pair) and the `port_info` metadata `beam_io` does not expose
+([`PortMeta`], including the owning pid).
+
+`PortRegistry::pump` is the single message producer: it polls in `PORT_POLL_SLICE` (25 ms) slices, turns
+readiness into scheduled port tasks and reports `PortEvent::{Data, Exited}`. Two callers consume it, and
+each owns a different delivery point:
+
+* the **scheduler path** — `Runtime::scheduler_pass` calls `Runtime::deliver_port_messages` once the run
+  queue drains, so a process blocked in a compiled `receive` on `{Port, {data, …}}` is woken by
+  `beam_process`'s own deliver path and `Scheduler::resume_woken` re-enqueues it (proven end-to-end by
+  `tests/port_wake.rs`); and
+* the **`-eval` `receive … after T`** path — `RuntimeContext::poll_port_messages` returns the built
+  messages inline.
+
+Both intern the message's `data`/`exit_status` atom in the runtime's **one** shared table and build the
+term on a pointer-stable arena, so it is nameable by the printer and matchable by a `receive` clause. A
 `binary`-stream read wider than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes is the honest typed *unsupported*
 gap (there is no off-heap ref-counted binary build path here yet).
 
@@ -702,30 +728,32 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   argument would not get tables — none exists in M1. Output sharing costs `RuntimeContext` a
   destructor (the `Rc`-backed `SharedSink`), so a caller that keeps a `RuntimeContext` alive cannot
   reuse the `Runtime` binding directly until it goes out of scope; read it through the context instead.
-* **Ports: spawned, registered, queryable, and stdout-polled on the `-eval` receive path.** `erlang:open_port/2`
-  really spawns the OS process (`{spawn, Cmd}` through `/bin/sh -c`, `{spawn_executable, …}` directly,
-  `{fd, N}` as a descriptor port), allocates a `beam_process::PortId` and records the live port (real
-  `os_pid`, `connected`, stream type, the child's `stdout` handle); `port_close/1` kills/reaps the child
-  and releases the id; `port_info/1,2` answer the seeded item vocabulary; `erlang:ports/0` reports the
-  live ports. Deliberate `port_info` deviations from erts-17.1 (never fabricated): `id` is the port
-  **term** (erts: a bare integer), `connected` is a **boolean** (erts: the controlling pid) and `stream`
-  is reported (erts reports `input`/`output` byte counters); `links`/`monitors` are `[]` (truly empty
-  here). **stdout is read back only on the `-eval` `receive … after T` path**
-  (`RuntimeContext::poll_port_messages`); the **scheduler/runner** path never polls, so a BEAM process
-  blocked in `receive` waiting for a `{Port, {data, …}}` message stays `Waiting` (nothing drives the
-  poller from the process mailbox). The read is **one** `Read::read` per readiness (one message per read,
-  not a stream coalesced per driver callback); **stdin and stderr are never read** (they are pipes, but
-  nothing consumes them); `erlang:port_command/2,3` writes to the child's stdin (captured as
-  `LivePort.stdin`, `PortRegistry::write_command`; `src/native/port.rs`), accepting a binary / char
-  list / nested iolist and returning `true`, `BadArg` for a non-port or an unknown/closed id — the
-  `{fd, N}` form is a typed capability gap; `connected` flips to `false` only at `port_close/1`,
-  not when the child exits by itself; the `exit_status` option is honored — `poll_port_messages`
-  reaps the child (`Child::try_wait`, sliced at `EXIT_STATUS_POLL_SLICE` = 25 ms) and emits one
-  `{Port, {exit_status, Status}}` message (`Status` = `code()` else `128 + signal()`); `eof` is still
-  inert (its only observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
-  exits on its own is reaped only by `port_close/1` or at runtime exit. A `binary`-stream read wider
-  than 64 bytes is the typed *unsupported* gap (no off-heap ref-counted binary build path yet).
-  `os:cmd/1` remains the runtime-native host spawn, unchanged.
+* **Ports: spawned, registered, queryable, and readable on *both* producers.** `erlang:open_port/2`
+  really spawns the OS process (`{spawn, Cmd}` through `/bin/sh -c` — or the argv list directly —,
+  `{spawn_executable, …}` directly, `{fd, N}` by **adopting** the caller's descriptor), allocates a
+  `beam_process::PortId` out of `beam_io`'s registry and records the `port_info` metadata; `port_close/1`
+  kills/reaps the child and releases the id; `port_info/1,2` answer the seeded item vocabulary;
+  `erlang:ports/0` reports the live ports. The child, its descriptors and its teardown belong to
+  `beam_io::drivers::SpawnDriver` — the **one** OS-child implementation (see Design Decisions).
+  Deliberate `port_info` deviations from erts-17.1 (never fabricated): `id` is the port **term** (erts: a
+  bare integer), `connected` is a **boolean** (erts: the controlling pid) and `stream` is reported (erts
+  reports `input`/`output` byte counters); `links`/`monitors` are `[]` (truly empty here). The child's
+  **stdout** is read back by both port-message producers: the **scheduler path** delivers
+  `{Port, {data, Data}}` into the **owning** process's mailbox (so a blocked compiled `receive` is woken
+  by the runtime's own resume-on-send machinery — proven by `tests/port_wake.rs`), and the
+  **`-eval` `receive … after T`** path returns the same messages inline. The read is **one**
+  `Read::read` per readiness (one message per read, not a stream coalesced per driver callback);
+  **stderr is never read** (it is a pipe, but nothing consumes it); `erlang:port_command/2,3` writes to
+  the child's stdin (an iolist, a binary or a char list) through `beam_io::PortRegistry::port_command`
+  and returns `true`, `BadArg` for a non-port or an unknown/closed id — the `{fd, N}` form
+  is a typed capability gap (there is no child pipe to write to); `connected` flips to `false` only at
+  `port_close/1`, not when the child exits by itself; the `exit_status` option is honored — a reap
+  emits exactly one `{Port, {exit_status, Status}}` (`Status` = the exit `code()` else
+  `128 + signal()`), handed out **once** by [`PortRegistry::pump`], never twice; `eof` is still inert
+  (its only observable form is a `{Port, …}` message, which the poller does not synthesize); and a child
+  that exits on its own is reaped by a later poll or by `port_close/1`/runtime exit. A `binary`-stream
+  read wider than 64 bytes is the typed *unsupported* gap (no off-heap ref-counted binary build path
+  yet). `os:cmd/1` remains the runtime-native host spawn, unchanged.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 * **No memory introspection.** The runtime exposes **no** way to observe allocated memory: `erlang:memory/0,1`, `erlang:process_info/1,2` and `erlang:statistics/1` are **not** registered BIFs (`beam_bifs` raises `… is not a BIF`, exit 1) and none of the twelve `system_info/1` keys reports memory (`SUPPORTED_KEYS`). The registered `ets:info(T, memory)` is the only memory number available.
 

@@ -356,6 +356,28 @@ impl Runtime {
         self.arena.alloc_words(n)
     }
 
+    /// Copies a scheduled process's return value onto the runtime's long-lived,
+    /// never-reset `-eval` arena and returns the copy.
+    ///
+    /// A process's code runs on a heap that dies with it, and a value taken out of the
+    /// mailbox lives in exactly that heap — so an `x(0)` that is a container or a binary
+    /// would dangle the moment the process terminated. The runner records every return
+    /// value through here ([`crate::runner`]) so
+    /// [`Runtime::process_result`](Runtime::process_result) really does hand back a term
+    /// valid for the runtime's lifetime — the property the scheduler tests rely on (see
+    /// `tests/port_wake.rs`, where the receiver returns the port's stream binary).
+    ///
+    /// The destination is the same pointer-stable arena the `-eval` evaluator's
+    /// non-byte-aligned bitstrings use ([`Runtime::eval_heap`]); nothing resets it in
+    /// Milestone 1. An immediate is returned unchanged (the copier shares immediates).
+    ///
+    /// # Errors
+    ///
+    /// The arena's allocation failure when the value does not fit. That is an honest
+    /// error, never a dangling term.
+    pub(crate) fn stabilize_term(&mut self, term: Eterm) -> Result<Eterm> {
+        beam_message::copy_struct_simple(term, &mut self.eval_heap)
+    }
     /// Ensures `heap_need` words are available in the arena.
     ///
     /// # Errors

@@ -342,7 +342,7 @@ impl PortRegistry {
     ///
     /// [`BeamError::SystemLimit`] when the id space is exhausted, or whatever the driver's
     /// `start` returns (the driver having been torn down).
-    pub(crate) fn register(&mut self, driver: Box<dyn Driver>, meta: PortMeta) -> Result<PortId> {
+    fn register(&mut self, driver: Box<dyn Driver>, meta: PortMeta) -> Result<PortId> {
         let id = self.registry.open(&mut self.poller, driver)?;
         self.meta.insert(id.number(), meta);
         Ok(id)
@@ -1574,6 +1574,44 @@ mod tests {
             error::unsupported_reason(&error).as_deref(),
             Some(reason) if reason.contains("port_command")
         ));
+    }
+
+    #[test]
+    fn a_fd_port_adopts_a_caller_owned_descriptor() {
+        use std::io::Write;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
+        let mut fx = fixture();
+        // A descriptor the **test** owns and keeps open for the whole test.
+        // `beam_io`'s driver adopts a `{fd, N}` by putting it in non-blocking mode
+        // (`fcntl(F_SETFL, O_NONBLOCK)`), which the sandbox refuses for an inherited
+        // descriptor (fd 0 yields `EPERM`); a socketpair end always accepts it, so the
+        // childless name form is exercised independently of the test harness's fds.
+        let (mut local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx
+            .hook
+            .open_port(name, NIL)
+            .expect("{fd, N} adopts the descriptor");
+
+        // A descriptor port has no OS process of its own, is connected, and reports the
+        // `fd:<N>` rendering the reference implementation uses.
+        assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
+        assert_eq!(fx.item(port, "connected"), fx.atom("true"));
+        assert_eq!(text_of(fx.item(port, "name")), format!("fd:{fd}"));
+        assert!(fx.registry.borrow().contains(port));
+
+        // Closing the port releases it but **never closes** the adopted descriptor: it
+        // belongs to the Erlang side. The write below would fail with `EBADF` if the
+        // driver had closed it.
+        fx.hook.close_port(port).expect("port_close/1");
+        assert!(!fx.registry.borrow().contains(port));
+        local
+            .write_all(b"x")
+            .expect("the adopted descriptor is still open after port_close/1");
     }
 
     #[test]
