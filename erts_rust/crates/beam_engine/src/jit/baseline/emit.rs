@@ -1,12 +1,25 @@
 //! The baseline JIT's emitter: typed IR → x86-64 basic blocks.
 //!
 //! The register allocator ([`allocate_registers`]) and the per-instruction
-//! lowering ([`emit_block`]) — the inline `move`/`jump`/metadata set, the
+//! lowering ([`emit_block`]) — the inline `move`/`swap`/`jump`/metadata set, the
 //! spill-across-blocks discipline ([`CACHE_REGISTERS`]) and the tier's one
 //! optimisation, the guarded small-int `erlang:'+'/2`/`'-'/2` fast path
 //! ([`try_inline_gc_bif`]). [`compile_module`] lowers every basic block of a
 //! module into the [`CompiledModule`] artifact. See `super` for the block ABI (in
 //! `runtime`) and the driver that runs the emitted code.
+//!
+//! **Only [`CACHE_REGISTERS`]`.len()` x-registers are held in machine registers**;
+//! every other x-register a block names is addressed **directly in `machine.x`**
+//! (`[rbx + x*8]`, `rbx` = the array base the prologue loads from
+//! [`RUNTIME_XREGS_DISP`]) — the same slot the exit spill writes — so a block that
+//! touches more registers than the cache budget still runs natively instead of
+//! deopting. That is safe precisely because the cache membership is fixed for the
+//! whole block ([`Allocation`]): an x-register is either *always* held in its
+//! machine register (and written back at every block exit) or *never* cached, so
+//! the two representations can never disagree. The highest x-register index a block
+//! touches natively — cached or direct — is recorded on the [`CompiledModule`] so
+//! [`run_compiled`](super::run_compiled) can refuse native entry to a machine whose
+//! register file does not cover it.
 #![allow(unsafe_code)]
 
 use std::collections::{BTreeMap, HashMap};
@@ -46,6 +59,30 @@ pub(crate) const CACHE_REGISTERS: [Reg; 4] = [Reg::R12, Reg::R13, Reg::R14, Reg:
 /// The byte offset of the prologue-reserved `rt` slot from `rsp`.
 pub(crate) const RUNTIME_SLOT_DISP: i32 = 0;
 
+/// The caller-saved scratch registers a block uses to shuffle values between
+/// `machine.x` slots (a `move`/`swap` whose source, destination, or both are not
+/// cached), and for the raw `Eterm` word of a constant stored into `machine.x`.
+///
+/// Both are caller-saved (System V AMD64), so clobbering them across an instruction
+/// boundary is free; neither is a cache register ([`CACHE_REGISTERS`]) nor the
+/// block's reserved `rbx` (the `machine.x` base) / `rsp` (the `rt` slot). They are
+/// used strictly *within* one instruction's lowering — no value survives into the
+/// next instruction — so they may also be reused by the small-int fast path's
+/// temporaries.
+pub(crate) const MOVE_SCRATCH: Reg = Reg::R11;
+/// The second `machine.x`-shuffle scratch register (`swap` needs two values in
+/// flight at once).
+pub(crate) const MOVE_SCRATCH_2: Reg = Reg::R10;
+
+/// Record that x-register `x` is touched natively by the block (loaded into a
+/// cache register, or addressed directly in `machine.x`).
+fn touch(highest: &mut Option<u32>, x: u32) {
+    *highest = Some(match *highest {
+        Some(previous) => previous.max(x),
+        None => x,
+    });
+}
+
 /// A block's register allocation: the `(x-register index, machine register)` pairs
 /// the prologue loads and the epilogue spills.
 #[derive(Default)]
@@ -70,6 +107,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
     let mut entries: HashMap<(u32, u32), *const u8> = HashMap::new();
     let mut highest_cached_register: Option<u32> = None;
+    let mut highest_native_register: Option<u32> = None;
 
     for (func_index, function) in module.functions.iter().enumerate() {
         let func = func_index as u32;
@@ -84,10 +122,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             }
             let allocation = allocate_registers(module, code, start, end);
             for (x, _) in &allocation.slots {
-                highest_cached_register = Some(match highest_cached_register {
-                    Some(prev) => prev.max(*x),
-                    None => *x,
-                });
+                touch(&mut highest_cached_register, *x);
             }
 
             let offset = buffer.len();
@@ -100,6 +135,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
                 start,
                 end,
                 &allocation,
+                &mut highest_native_register,
             )?;
             // SAFETY: the block was fully emitted (no error), so `offset` is the
             // start of a complete native function inside the buffer;
@@ -114,16 +150,18 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
         buffer,
         entries,
         highest_cached_register,
+        highest_native_register,
     })
 }
 
 /// A generous byte-count estimate for the code `module` lowers to.
 ///
-/// A block costs a prologue/epilogue pair (~48 bytes) plus its inlined instructions
-/// (~7–10 bytes each); a `gc_bif` costs either the helper call sequence (~40
-/// bytes) or, when the small-int fast path lowers it, the whole guarded sequence
-/// (up to ~150 bytes: two operand loads, two tag checks, the arithmetic with two
-/// overflow branches, two range checks, the store and the fallback jump).
+/// A block costs a prologue/epilogue pair (~64 bytes) plus its inlined
+/// instructions; a `move`/`swap` whose operands live in `machine.x` is at most two
+/// loads plus two stores (~28 bytes), so [`INSTRUCTION_BYTES`] is budgeted per
+/// instruction. A `gc_bif` costs either the helper call sequence (~50 bytes) or,
+/// when the small-int fast path lowers it, the whole guarded sequence plus its
+/// helper fallback ([`FAST_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
 /// *every* `gc_bif`, whether or not the fast path claims it, and
@@ -141,12 +179,19 @@ fn code_capacity_estimate(module: &Module) -> usize {
             .filter(|instr| matches!(instr, Instr::GcBif { .. }))
             .count();
     }
-    64 * blocks + 16 * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
+    64 * blocks + INSTRUCTION_BYTES * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
 }
 
+/// The code-size budget reserved for one instruction (see
+/// [`code_capacity_estimate`]) — comfortably above the largest lowering (a
+/// two-`machine.x`-operand `swap`: two loads, two stores and a constant).
+const INSTRUCTION_BYTES: usize = 32;
+
 /// The code-size budget reserved for one `gc_bif` (see
-/// [`code_capacity_estimate`]).
-const FAST_PATH_BYTES: usize = 176;
+/// [`code_capacity_estimate`]): the guarded small-int fast path (~140 bytes with
+/// `machine.x` operand loads and a `machine.x` result store) plus the
+/// spill-and-`jit_step_one` fallback it branches to (~70 bytes).
+const FAST_PATH_BYTES: usize = 240;
 
 /// Pick the x-registers a block caches, in first-appearance order.
 ///
@@ -204,6 +249,10 @@ fn push_slot(allocation: &mut Allocation, x: u32) {
 }
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
+///
+/// `highest_touched` accumulates the highest x-register index the emitted code
+/// touches natively (a cached load/store, or a direct `machine.x` access); the
+/// driver refuses native entry to a machine whose register file does not cover it.
 #[allow(clippy::too_many_arguments)]
 fn emit_block(
     buffer: &mut CodeBuffer,
@@ -214,6 +263,7 @@ fn emit_block(
     start: usize,
     end: usize,
     allocation: &Allocation,
+    highest_touched: &mut Option<u32>,
 ) -> Result<()> {
     // --- prologue -----------------------------------------------------------
     for reg in SAVED_REGISTERS {
@@ -226,6 +276,7 @@ fn emit_block(
     // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
     buffer.mov_rm(Reg::Rbx, Reg::Rdi, RUNTIME_XREGS_DISP)?;
     for (x, reg) in &allocation.slots {
+        touch(highest_touched, *x);
         buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
     }
 
@@ -244,7 +295,17 @@ fn emit_block(
             | Instr::ExecutableLine { .. }
             | Instr::DebugLine { .. } => {}
             Instr::Move { src, dst } => {
-                if !try_inline_move(buffer, src, dst, allocation)? {
+                if !try_inline_move(buffer, src, dst, allocation, highest_touched)? {
+                    emit_helper(buffer, done, allocation, func, pc)?;
+                    fell_through = false;
+                    break;
+                }
+            }
+            // `swap A B` exchanges two x-registers; a block normally caches fewer
+            // registers than the instruction touches, so this is a common deopt it
+            // is cheap to remove (a three-`mov` shuffle, register or memory).
+            Instr::Swap { a, b } => {
+                if !try_inline_swap(buffer, a, b, allocation, highest_touched)? {
                     emit_helper(buffer, done, allocation, func, pc)?;
                     fell_through = false;
                     break;
@@ -252,10 +313,10 @@ fn emit_block(
             }
             // The one optimised BIF: the small-int `erlang:'+'/2`/`'-'/2`. When
             // the guarded fast path is emitted the block keeps going; otherwise
-            // (any other BIF, an un-cacheable operand, or a register the budget
+            // (any other BIF, an un-addressable operand, or a register the budget
             // could not cache) it is exactly the `_` arm below.
             Instr::GcBif { .. } => {
-                if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc)? {
+                if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc, highest_touched)? {
                     emit_helper(buffer, done, allocation, func, pc)?;
                     fell_through = false;
                     break;
@@ -302,39 +363,144 @@ fn emit_block(
     buffer.ret()
 }
 
+/// Where a `move`'s source value comes from.
+enum MoveSource {
+    /// An x-register the block holds in a machine register.
+    Cached(Reg),
+    /// An x-register the block does **not** cache — read straight from its
+    /// `machine.x` slot (`[rbx + x*8]`), which is where the value is at a block
+    /// boundary.
+    Memory(u32),
+    /// A constant operand, materialised as its raw `Eterm` word.
+    Constant(i64),
+}
+
 /// Emit `move Src Dst` natively, or report that the block must helper it.
 ///
-/// Returns `true` when the move was emitted. The conditions are exactly the
-/// documented inline set: `dst` an x-register that is cached, and `src` either a
-/// cached x-register or a constant operand.
+/// Returns `true` when the move was emitted. **Any** destination that names an
+/// x-register inside the engine's [`MAX_REGISTER`] bound is inlined, whether or not
+/// the register allocator could cache it:
+///
+/// * a **cached** destination is written in its machine register;
+/// * a destination **beyond the cache budget** is written straight into `machine.x`
+///   (`mov [rbx + dst*8], …`) — the very slot [`spill`] would have written, so the
+///   tier's liveness model is unchanged (cached values live in registers *within* a
+///   block and are always back in `machine.x` at a block boundary).
+///
+/// The source is read from its cached register, from its `machine.x` slot, or from
+/// a constant word. A `move` with a Y destination (or any other operand shape), or
+/// one naming an x-register no machine can hold, still deopts to the helper — which
+/// reports the interpreter's exact result (including its faithful `bad_register`
+/// error).
 fn try_inline_move(
     buffer: &mut CodeBuffer,
     src: &Operand,
     dst: &Operand,
     allocation: &Allocation,
+    highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
     let Some(dst_x) = x_register(dst) else {
         return Ok(false);
     };
-    let Some(dst_reg) = allocation.slot(dst_x) else {
+    if dst_x >= MAX_REGISTER {
+        // `machine.x` is at most `MAX_REGISTER` long, so addressing `dst_x` directly
+        // would be out of bounds; the helper reports the faithful `bad_register`.
+        return Ok(false);
+    }
+    let source = match x_register(src) {
+        Some(src_x) if src_x < MAX_REGISTER => match allocation.slot(src_x) {
+            Some(reg) => MoveSource::Cached(reg),
+            None => MoveSource::Memory(src_x),
+        },
+        // A register index outside the engine's bound (same rule as the
+        // destination): the interpreter step reports the exact error.
+        Some(_) => return Ok(false),
+        None => match constant_word(src) {
+            Some(word) => MoveSource::Constant(word),
+            None => return Ok(false),
+        },
+    };
+
+    match (allocation.slot(dst_x), source) {
+        // Cached destination: write its machine register.
+        (Some(dst_reg), MoveSource::Cached(src_reg)) => buffer.mov_rr(dst_reg, src_reg)?,
+        (Some(dst_reg), MoveSource::Memory(src_x)) => {
+            buffer.mov_rm(dst_reg, Reg::Rbx, x_offset(src_x))?;
+            touch(highest_touched, src_x);
+        }
+        (Some(dst_reg), MoveSource::Constant(word)) => buffer.mov_ri(dst_reg, word)?,
+        // Uncached destination: write its `machine.x` slot directly.
+        (None, MoveSource::Cached(src_reg)) => {
+            buffer.mov_mr(Reg::Rbx, x_offset(dst_x), src_reg)?;
+        }
+        (None, MoveSource::Memory(src_x)) => {
+            buffer.mov_rm(MOVE_SCRATCH, Reg::Rbx, x_offset(src_x))?;
+            buffer.mov_mr(Reg::Rbx, x_offset(dst_x), MOVE_SCRATCH)?;
+            touch(highest_touched, src_x);
+        }
+        (None, MoveSource::Constant(word)) => {
+            buffer.mov_ri(MOVE_SCRATCH, word)?;
+            buffer.mov_mr(Reg::Rbx, x_offset(dst_x), MOVE_SCRATCH)?;
+        }
+    }
+    touch(highest_touched, dst_x);
+    Ok(true)
+}
+
+/// Emit `swap A B` natively, or report that the block must helper it.
+///
+/// Returns `true` when the exchange was emitted. Both operands must name
+/// x-registers inside the engine's [`MAX_REGISTER`] bound; each is then read and
+/// written through its own representation — a cached operand through its machine
+/// register, a non-cached one through its `machine.x` slot — so the swap is exact
+/// for every combination of the four. A `Y` (or other) operand deopts, and the
+/// helper performs the interpreter's exact `write(b, read(a))` / `write(a, read(b))`
+/// exchange.
+fn try_inline_swap(
+    buffer: &mut CodeBuffer,
+    a: &Operand,
+    b: &Operand,
+    allocation: &Allocation,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
         return Ok(false);
     };
-    match x_register(src) {
-        Some(src_x) => match allocation.slot(src_x) {
-            Some(src_reg) => {
-                buffer.mov_rr(dst_reg, src_reg)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        },
-        None => match constant_word(src) {
-            Some(word) => {
-                buffer.mov_ri(dst_reg, word)?;
-                Ok(true)
-            }
-            None => Ok(false),
-        },
+    if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
+        return Ok(false);
     }
+    match (allocation.slot(a_x), allocation.slot(b_x)) {
+        (Some(a_reg), Some(b_reg)) => {
+            // `xchg` spelled as three moves through the scratch register (the
+            // encoder has no `xchg`, and a register pair that overlaps the
+            // destination is not expressible with `mov` alone otherwise).
+            buffer.mov_rr(MOVE_SCRATCH, a_reg)?;
+            buffer.mov_rr(a_reg, b_reg)?;
+            buffer.mov_rr(b_reg, MOVE_SCRATCH)?;
+        }
+        (Some(a_reg), None) => {
+            // a is cached, b lives in `machine.x`.
+            buffer.mov_rm(MOVE_SCRATCH, Reg::Rbx, x_offset(b_x))?;
+            buffer.mov_mr(Reg::Rbx, x_offset(b_x), a_reg)?;
+            buffer.mov_rr(a_reg, MOVE_SCRATCH)?;
+            touch(highest_touched, b_x);
+        }
+        (None, Some(b_reg)) => {
+            buffer.mov_rm(MOVE_SCRATCH, Reg::Rbx, x_offset(a_x))?;
+            buffer.mov_mr(Reg::Rbx, x_offset(a_x), b_reg)?;
+            buffer.mov_rr(b_reg, MOVE_SCRATCH)?;
+            touch(highest_touched, a_x);
+        }
+        (None, None) => {
+            buffer.mov_rm(MOVE_SCRATCH, Reg::Rbx, x_offset(a_x))?;
+            buffer.mov_rm(MOVE_SCRATCH_2, Reg::Rbx, x_offset(b_x))?;
+            buffer.mov_mr(Reg::Rbx, x_offset(a_x), MOVE_SCRATCH_2)?;
+            buffer.mov_mr(Reg::Rbx, x_offset(b_x), MOVE_SCRATCH)?;
+            touch(highest_touched, a_x);
+            touch(highest_touched, b_x);
+        }
+    }
+    Ok(true)
 }
 
 /// Emit the spill-then-helper-then-exit sequence for instruction `(func, pc)`.
@@ -595,23 +761,42 @@ fn import_names<'m>(module: &'m Module, target: ImportRef) -> Option<(&'m str, &
 enum FastSource {
     /// A cached x-register (already loaded by the prologue).
     Cached(Reg),
+    /// A non-cached x-register, read straight from its `machine.x` slot.
+    Memory(u32),
     /// A small-int constant, loaded as a raw `Eterm` word.
     Constant(i64),
 }
 
-/// The [`FastSource`] for `operand`, or `None` when it is neither cached nor a
-/// small constant.
+/// The [`FastSource`] for `operand`, or `None` when it is neither an addressable
+/// x-register nor a small constant.
+///
+/// A non-cached x-register is a `machine.x` read, not a deopt: the register
+/// allocator's four-register budget decides only *where* the value is read from,
+/// never whether the instruction can be lowered.
 fn fast_source(operand: &Operand, allocation: &Allocation) -> Option<FastSource> {
     match x_register(operand) {
-        Some(x) => allocation.slot(x).map(FastSource::Cached),
+        Some(x) if x < MAX_REGISTER => match allocation.slot(x) {
+            Some(reg) => Some(FastSource::Cached(reg)),
+            None => Some(FastSource::Memory(x)),
+        },
+        Some(_) => None,
         None => small_constant(operand).map(FastSource::Constant),
     }
 }
 
-/// Load `source` into scratch register `reg`.
-fn load_into(buffer: &mut CodeBuffer, source: FastSource, reg: Reg) -> Result<()> {
+/// Load `source` into scratch register `reg`, recording a `machine.x` read.
+fn load_into(
+    buffer: &mut CodeBuffer,
+    source: FastSource,
+    reg: Reg,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
     match source {
         FastSource::Cached(src) => buffer.mov_rr(reg, src),
+        FastSource::Memory(x) => {
+            touch(highest_touched, x);
+            buffer.mov_rm(reg, Reg::Rbx, x_offset(x))
+        }
         FastSource::Constant(word) => buffer.mov_ri(reg, word),
     }
 }
@@ -620,15 +805,18 @@ fn load_into(buffer: &mut CodeBuffer, source: FastSource, reg: Reg) -> Result<()
 /// helper it.
 ///
 /// Returns `true` when the whole guarded sequence was emitted, leaving the
-/// result in the destination's cached register and letting the block continue
-/// with the next instruction. Returns `false` **without having emitted a byte**
-/// when the shape matched ([`fast_arith`]) but an operand or the destination is
-/// not cached — the caller then emits exactly today's `jit_step_one` fallback.
+/// result in the destination (its cached machine register, or its `machine.x`
+/// slot when it is beyond the cache budget) and letting the block continue with
+/// the next instruction. Returns `false` **without having emitted a byte** when
+/// the shape matched ([`fast_arith`]) but an operand names a register outside the
+/// engine's bound or the destination is not an addressable x-register — the caller
+/// then emits exactly today's `jit_step_one` fallback.
 ///
 /// The emitted shape (see the section comment above for why it is exact):
 ///
 /// ```text
-///   mov  rax, a          ; or movabs rax, <small constant>
+///   mov  rax, a          ; the operand: a cached register, `[rbx + x*8]`, or a
+///                        ; movabs of a small constant
 ///   mov  r8,  b
 ///   mov  rcx, SMALL_MASK
 ///   mov  r10, rax ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; a is small?
@@ -641,7 +829,8 @@ fn load_into(buffer: &mut CodeBuffer, source: FastSource, reg: Reg) -> Result<()
 ///   jo   fallback
 ///   mov  rcx, MIN_SMALL_WORD ; cmp r11, rcx ; jl fallback
 ///   mov  rcx, MAX_SMALL_WORD ; cmp r11, rcx ; jg fallback
-///   mov  <dst>, r11         ; store the result in its cached x-register
+///   mov  <dst>, r11         ; cached destination: its machine register;
+///                           ; otherwise `mov [rbx + dst*8], r11`
 ///   jmp  fast_done
 /// fallback:
 ///   <spill cached x-registers; call jit_step_one; jmp the block epilogue>
@@ -650,8 +839,10 @@ fn load_into(buffer: &mut CodeBuffer, source: FastSource, reg: Reg) -> Result<()
 /// ```
 ///
 /// The fast path never spills: the destination's cached register is written
-/// back by the next helper call or by the block's own exit spill, so the
-/// spill-across-blocks discipline is unchanged.
+/// back by the next helper call or by the block's own exit spill, and a
+/// non-cached destination is written to `machine.x` — the exact slot the spill
+/// would write — so the spill-across-blocks discipline is unchanged.
+#[allow(clippy::too_many_arguments)]
 fn try_inline_gc_bif(
     buffer: &mut CodeBuffer,
     module: &Module,
@@ -660,6 +851,7 @@ fn try_inline_gc_bif(
     done: CodeLabel,
     func: u32,
     pc: u32,
+    highest_touched: &mut Option<u32>,
 ) -> Result<bool> {
     let Some(fast) = fast_arith(module, instr) else {
         return Ok(false);
@@ -670,16 +862,13 @@ fn try_inline_gc_bif(
     let Some(b_source) = fast_source(fast.b, allocation) else {
         return Ok(false);
     };
-    let Some(dst_reg) = allocation.slot(fast.dst_x) else {
-        return Ok(false);
-    };
 
     let fallback: CodeLabel = buffer.label();
     let fast_done: CodeLabel = buffer.label();
 
     // Load both operands into scratch registers.
-    load_into(buffer, a_source, FAST_A)?;
-    load_into(buffer, b_source, FAST_B)?;
+    load_into(buffer, a_source, FAST_A, highest_touched)?;
+    load_into(buffer, b_source, FAST_B, highest_touched)?;
 
     // Both operands must be small integers: `(word & 0xF) == 0xF`. The mask and
     // the tag are the same nibble (asserted above), so one register serves both.
@@ -716,8 +905,16 @@ fn try_inline_gc_bif(
     buffer.cmp_rr(FAST_R, FAST_C)?;
     buffer.jcc(Cond::G, fallback)?;
 
-    // Success: store the result and skip the fallback.
-    buffer.mov_rr(dst_reg, FAST_R)?;
+    // Success: store the result — in the destination's cached register, or
+    // straight into its `machine.x` slot when the budget could not cache it —
+    // and skip the fallback.
+    match allocation.slot(fast.dst_x) {
+        Some(dst_reg) => buffer.mov_rr(dst_reg, FAST_R)?,
+        None => {
+            buffer.mov_mr(Reg::Rbx, x_offset(fast.dst_x), FAST_R)?;
+            touch(highest_touched, fast.dst_x);
+        }
+    }
     buffer.jmp(fast_done)?;
 
     // Rejected (or not lowered): one interpreter step, then leave the block.

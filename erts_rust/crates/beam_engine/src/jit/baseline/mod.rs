@@ -59,11 +59,18 @@
 //! (`x[0..live)` + the whole stack) with no per-frame liveness maps
 //! (`../../CONTEXT.md` §4).
 //!
-//! A block that references more than the cached budget simply does not inline those
-//! `move`s — the extras are executed by the helper, which is always correct. The
-//! allocation is computed by [`allocate_registers`] from the block's *shape*-
-//! inlinable `move`s, in first-appearance order, so a block's inline prefix always
-//! has the registers it wants.
+//! The cache is **not** a coverage limit. An x-register the allocator could not
+//! cache is simply addressed **directly in `machine.x`** (`[rbx + x*8]`) — the same
+//! slot the exit spill writes — so a `move`/`swap`/fast-path `gc_bif` touching more
+//! registers than the budget runs natively instead of deopting. That is exact
+//! because the cache membership is fixed for the whole block: an x-register is
+//! either always in its machine register (and written back at every block exit) or
+//! never, so the two representations cannot disagree. The allocation is computed by
+//! [`allocate_registers`] from the block's *shape*-inlinable `move`s, in
+//! first-appearance order, so a block's inline prefix always has the registers it
+//! wants; the highest x-register index any block touches natively is recorded on the
+//! artifact so the driver can refuse native entry to a register file that does not
+//! cover it.
 //!
 //! # What is inlined, what is helper-executed
 //!
@@ -73,8 +80,12 @@
 //!   `executable_line`/`debug_line`) — nothing at all;
 //! * `move Src Dst` where `Dst` is an x-register (`x`/`tr`-annotated) **and**
 //!   `Src` is an x-register or a constant (`Integer`/`Character`/`Atom`/`Nil`) —
-//!   a `mov` between the allocated machine registers, or a `mov` of the raw `Eterm`
-//!   word (`make_small`/`make_atom`/`NIL`);
+//!   a `mov` between machine registers, a `mov` of the raw `Eterm` word
+//!   (`make_small`/`make_atom`/`NIL`), or — for a register outside the cache budget
+//!   — a load/store of that register's `machine.x` slot;
+//! * `swap A B` where both operands are x-registers — the same three-`mov` shuffle,
+//!   each operand through its own representation (machine register or `machine.x`
+//!   slot);
 //! * `jump Label` whose target resolves in the module-wide label map — the
 //!   `(func, pc)` pair is known at compile time, so it is a constant return word;
 //! * the **guarded small-int arithmetic fast path** for `gc_bif` of
@@ -85,16 +96,17 @@
 //!   real BIF and produces the bignum/float/error result natively unreachable
 //!   here. This is the tier's one optimisation (`../../CONTEXT.md` §7); it is
 //!   conservative by construction — it can only ever produce a result the helper
-//!   would have produced — see [`try_inline_gc_bif`].
+//!   would have produced — see [`try_inline_gc_bif`]. Its operands and its
+//!   destination may be registers beyond the cache budget (read/written through
+//!   `machine.x`).
 //!
 //! **Helper-executed** (`jit_step_one`, literally the interpreter's
 //! [`Machine::step_instruction`](crate::Machine)): **every other instruction**, plus
-//! a `move` with an operand outside the cached set, a `jump` to a label the
-//! module does not define (so the interpreter's exact `unknown_label` error
-//! surfaces rather than an invented one), and a `gc_bif` with either an
-//! un-cacheable operand or a BIF outside the fast path's two (or a fast-path
-//! `gc_bif` whose registers the allocator's four-register budget could not
-//! cache).
+//! a `move`/`swap` with a `Y` (or other non-x) operand or a register index outside
+//! the engine's [`MAX_REGISTER`](crate::machine::MAX_REGISTER) bound, a `jump` to a
+//! label the module does not define (so the interpreter's exact `unknown_label`
+//! error surfaces rather than an invented one), and a `gc_bif` whose BIF is outside
+//! the fast path's two (or one with an un-addressable operand).
 //!
 //! A block's *inline prefix* runs natively and the **first** non-inlinable
 //! instruction is handed to the helper, after which the block returns: this is the
@@ -232,10 +244,15 @@ pub struct CompiledModule {
     /// The start `(func, pc)` of each compiled block → its native entry point.
     entries: HashMap<(u32, u32), *const u8>,
     /// The highest x-register index any block caches in a machine register.
+    highest_cached_register: Option<u32>,
+    /// The highest x-register index any block touches natively — a cached load,
+    /// the exit spill, or a direct `machine.x` access for a register beyond the
+    /// cache budget.
     ///
     /// The driver refuses to enter native code when the running machine's register
-    /// file is not at least this long (see [`run_compiled`]).
-    highest_cached_register: Option<u32>,
+    /// file is not at least this long (see [`run_compiled`]): every one of those
+    /// accesses is unchecked.
+    highest_native_register: Option<u32>,
 }
 
 impl CompiledModule {
@@ -253,6 +270,12 @@ impl CompiledModule {
     /// The highest x-register index cached in a machine register by any block.
     pub fn highest_cached_register(&self) -> Option<u32> {
         self.highest_cached_register
+    }
+
+    /// The highest x-register index any block touches natively (cached in a machine
+    /// register, spilled back, or addressed directly in `machine.x`).
+    pub fn highest_native_register(&self) -> Option<u32> {
+        self.highest_native_register
     }
 
     /// The number of bytes of machine code emitted.
@@ -287,10 +310,11 @@ fn run_compiled(
     args: &[Eterm],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Eterm> {
-    // A block loads its cached x-registers out of `machine.x` without a bounds
-    // check, so a machine whose register file is shorter than the highest cached
+    // A block loads its cached x-registers out of `machine.x` — and addresses the
+    // registers beyond the cache budget there directly — without a bounds check, so
+    // a machine whose register file is shorter than the highest natively-touched
     // index cannot enter native code; such a run stays on the interpreter step.
-    let native_ok = match compiled.highest_cached_register {
+    let native_ok = match compiled.highest_native_register {
         Some(highest) => machine.x.len() > highest as usize,
         None => true,
     };
@@ -305,8 +329,9 @@ fn run_compiled(
 struct BlockEntries<'a> {
     /// The compiled block table the addresses are looked up in.
     compiled: &'a CompiledModule,
-    /// Whether the running machine's register file covers every cached slot; when
-    /// it does not, no block may be entered (see [`run_compiled`]).
+    /// Whether the running machine's register file covers every register the
+    /// compiled blocks touch natively; when it does not, no block may be entered
+    /// (see [`run_compiled`]).
     native_ok: bool,
 }
 

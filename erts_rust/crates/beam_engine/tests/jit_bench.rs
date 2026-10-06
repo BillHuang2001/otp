@@ -7,7 +7,7 @@
 //! the interpreter's). It never asserts that a JIT is faster: that is
 //! environment-dependent and would be flaky; the printed numbers are the evidence.
 //!
-//! Two workloads, chosen to hit the two shapes the baseline tier treats
+//! Three workloads, chosen to hit the three shapes the baseline tier treats
 //! differently:
 //!
 //! * **`fib(20)`** — the real `.beam` fixture's `fib/1`
@@ -21,7 +21,14 @@
 //!   accumulating on `x(0)`/`x(1)`, ending in `return`. This is exactly the shape
 //!   the baseline tier's inlined guarded small-int fast path (`try_inline_gc_bif`)
 //!   lowers to native machine code with no interpreter round-trip, and it is sized
-//!   so that execution — not the per-run setup — dominates the measurement.
+//!   so that execution — not the per-run setup — dominates the measurement. Every
+//!   register it touches is one of the four the block caches.
+//! * **`wide/2`** — the same synthetic style, but straight-line over
+//!   [`WIDE_REGISTERS`] (8) x-registers ([`WIDE_OPS`] moves plus adds), i.e. **more
+//!   than the four the emitter caches**. That is the shape the *direct `machine.x`
+//!   addressing* of the `move`/`swap`/fast-path lowering is for: the same body used
+//!   to deopt at the first instruction touching `x(4)` and run the rest one
+//!   interpreter step at a time.
 //!
 //! # Method — execution, not compilation
 //!
@@ -83,6 +90,16 @@ const SLICE_BEAM: &str = concat!(
 /// the point of the kernel workload: it measures compute, not call overhead.
 const KERNEL_OPS: usize = 256;
 
+/// The number of x-registers the wide kernel walks — twice the number of registers
+/// a block caches in machine registers, so half of them are addressed directly in
+/// `machine.x`.
+const WIDE_REGISTERS: u32 = 8;
+
+/// The number of straight-line steps (one `move` plus one `gc_bif '+'/2`) in the
+/// wide kernel. Every value stays a small integer (the accumulator is bounded by
+/// this count), so the inlined small-int fast path lowers every single step.
+const WIDE_OPS: usize = 256;
+
 /// The slice BIF hook: `erlang:'+'/2` and `erlang:'-'/2` over small integers.
 ///
 /// The same implementation serves both workloads (the synthetic kernel imports
@@ -126,6 +143,8 @@ enum Kind {
     Fib,
     /// The hand-built straight-line arithmetic kernel.
     Kernel,
+    /// The hand-built straight-line kernel wide enough to exceed the register cache.
+    Wide,
 }
 
 impl Kind {
@@ -144,6 +163,9 @@ impl Kind {
             // [`KERNEL_OPS`] chained inlined adds per run: a few microseconds on the
             // interpreter, well under a microsecond on the baseline tier.
             Kind::Kernel => 5_000,
+            // [`WIDE_OPS`] `move`+`add` steps per run: the interpreter pays a full
+            // step for each of them.
+            Kind::Wide => 5_000,
         }
     }
 }
@@ -275,6 +297,111 @@ fn kernel_workload() -> Workload {
         kind: Kind::Kernel,
         module,
         function: kernel,
+        arity: 2,
+        args: vec![make_small(0), make_small(0)],
+    }
+}
+
+/// The synthetic **wide** kernel: `wide/2` is a straight-line body of [`WIDE_OPS`]
+/// `move`+`gc_bif '+'/2` steps over [`WIDE_REGISTERS`] x-registers.
+///
+/// Each step writes `1` into `x(r)` and accumulates it into `x(r + 1)`, walking all
+/// eight registers. The block caches only four of them, so `x(4)`..`x(7)` — reached
+/// from the fourth step on — are addressed **directly in `machine.x`** by the
+/// inlined `move` and by the fast path's operand loads / result store. Before that
+/// path existed the block deopted at the first instruction touching `x(4)` and the
+/// whole remaining body ran one interpreter step at a time, which is exactly the
+/// difference this workload is here to measure.
+///
+/// Every value stays a small integer (the accumulator is bounded by [`WIDE_OPS`]
+/// writes of `1`), so the fast path lowers every step; the leading block of `move`s
+/// seeds all eight registers with `0` so that not even the first guard sees a
+/// non-small value (a fresh `Machine` starts every register at `NIL`).
+///
+/// The body is one basic block, exactly like [`kernel_workload`] — a function with an
+/// empty `blocks` list has no native entry point at all.
+fn wide_workload() -> Workload {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("jit_bench_wide");
+
+    let plus_module = module.atom_table.intern("erlang");
+    let plus_function = module.atom_table.intern("+");
+    module.imports.push(Import {
+        module: plus_module,
+        function: plus_function,
+        arity: 2,
+    });
+    let plus = ImportRef(0);
+
+    let wide = module.atom_table.intern("wide");
+    let entry = Label(1);
+    module.exports.push(Export {
+        function: wide,
+        arity: 2,
+        label: entry,
+    });
+
+    let mut code = vec![Instr::Label(entry)];
+    for register in 0..WIDE_REGISTERS {
+        code.push(Instr::Move {
+            src: Operand::Integer(0),
+            dst: Operand::X(register),
+        });
+    }
+    for step in 0..WIDE_OPS {
+        let register = (step as u32) % WIDE_REGISTERS;
+        let next = (register + 1) % WIDE_REGISTERS;
+        code.push(Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(register),
+        });
+        code.push(Instr::GcBif {
+            arity: 2,
+            bif: plus,
+            fail: NO_FAIL,
+            live: WIDE_REGISTERS,
+            args: vec![Operand::X(register), Operand::X(next)],
+            dst: Operand::X(next),
+        });
+    }
+    code.push(Instr::Move {
+        src: Operand::X(WIDE_REGISTERS - 1),
+        dst: Operand::X(0),
+    });
+    code.push(Instr::Return);
+
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+
+    // One block: the whole straight-line body, from the entry label to the end.
+    let blocks = vec![Block {
+        label: entry,
+        start: 0,
+        end: code.len(),
+    }];
+
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name: wide,
+        arity: 2,
+        code,
+        blocks,
+        labels,
+    });
+
+    Workload {
+        label: format!("wide/2 ({WIDE_OPS} steps over {WIDE_REGISTERS} x-registers)"),
+        kind: Kind::Wide,
+        module,
+        function: wide,
         arity: 2,
         args: vec![make_small(0), make_small(0)],
     }
@@ -548,7 +675,8 @@ fn interpreter_and_native_tiers_agree_and_report_timings() {
     // contaminate each other; both workloads are still measured and asserted.
     let fib = fib_workload();
     let kernel = kernel_workload();
-    for workload in [&fib, &kernel] {
+    let wide = wide_workload();
+    for workload in [&fib, &kernel, &wide] {
         bench_workload(workload);
     }
 }
