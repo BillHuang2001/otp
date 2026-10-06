@@ -165,7 +165,7 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by `SpawnDriver`).
 - `pub type DriverFactory = fn() -> Result<Box<dyn Driver>>`.
 - `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`, `with_builtins()`
-  (**registers both `"fd"` and `"efile"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
+  (**registers `"fd"`, `"efile"` and `"tcp_inet"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
   `contains(name)`, `names() -> Vec<&str>` (sorted).
 ### `drivers/fd.rs`
 - `pub struct FdDriver` — the built-in `"fd"` byte-stream driver, **owns** its fds (closed on `stop`/`Drop`):
