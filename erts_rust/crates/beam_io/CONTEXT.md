@@ -16,7 +16,8 @@ Four things live here:
    (`port_task.rs`), mirroring `erts_port_task_execute`;
 4. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
    `ErlDrvEntry` bridge as documented future work, plus the built-in `fd` and `efile` byte-stream
-   drivers, the OS-child `spawn` driver, line buffering, and the text⇄binary phase-change protocol.
+   drivers, the OS-child `spawn` driver, the TCP `tcp_inet` socket driver, line buffering, and the
+   text⇄binary phase-change protocol.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
 `beam_process` (ports are the peer of pids in `ptab`). `beam_rt` **drives its ports through this crate**:
