@@ -13,9 +13,9 @@ Consumed by `beam_rt`, which adapts `BifRegistry` into the engine's
 
 Failure is **return-based** (workspace `../CONTEXT.md` §3): a bad argument is `BeamError::BadArg`,
 non-numeric arithmetic is `BeamError::BadArith`, a wrong arg count is `BeamError::BadArity`, a
-60-bit overflow is `BeamError::SystemLimit`, and `error`/`exit`/`throw`/`undef`/`unsupported_bif` are
-`BeamError::Raise`. The engine turns these into a BEAM raise (exception tag in `x(0)`) — there is no
-`setjmp`/`longjmp` and no silent failure.
+60-bit overflow that "should have been" an exact integer is `BeamError::SystemLimit`, and
+`error`/`exit`/`throw`/`nif_error`/`undef`/`unsupported_bif` are `BeamError::Raise`. The engine turns
+these into a BEAM raise (exception tag in `x(0)`) — there is no `setjmp`/`longjmp` and no silent failure.
 
 Ground truth (read-only, never modify): `../../erts/emulator/beam/bif.tab` (the authoritative BIF
 roster), `bif.c`/`bif.h`, `erl_bif_op.c`/`erl_bif_guard.c`/`erl_bif_lists.c`/`erl_bif_tuple.c`/
@@ -26,8 +26,8 @@ format), `erl_unicode.c`, `erl_time_sup.c`/`erl_bif_unique.c`, `../../erts/emula
 
 ## API Surface (FROZEN — `beam_rt` and tests design against this)
 Re-exported at the crate root and via `beam_bifs::prelude::*`: [`BifRegistry`]/[`BifFn`]/
-`default_registry`, [`BifContext`] + its seams (`OutputSink`/`SendHook`/`AtomInterner` and the sink
-impls `StdoutSink`/`NullSink`/`BytesSink`), the raise builders
+`default_registry`, [`BifContext`] + its seams (`OutputSink`/`SendHook`/`AtomInterner`/`FunCaller` and
+the sink impls `StdoutSink`/`NullSink`/`BytesSink`), the raise builders
 (`raise_error`/`raise_exit`/`raise_throw`), the reason-term mapping
 (`exit_reason_from_term`/`reason_term_from_exit_reason`) and `TableRegistry`.
 
@@ -41,7 +41,7 @@ pub struct BifRegistry { /* HashMap<(String, String, u32), BifFn> */ }
 
 impl BifRegistry {
     pub fn new() -> Self;
-    /// Every BIF the per-module `register` functions install (the 183-BIF roster below).
+    /// Every BIF the per-module `register` functions install (the 209-BIF roster below).
     pub fn with_core_bifs() -> Self;
     /// Returns the previous implementation if `(module, function, arity)` was already registered.
     pub fn register(&mut self, module: &str, function: &str, arity: u32, f: BifFn) -> Option<BifFn>;
@@ -85,19 +85,28 @@ pub trait SendHook { fn send(&mut self, to: Eterm, term: Eterm) -> Result<()>; }
 /// `BeamError::TermNotFound` (never a fabricated index).
 pub trait AtomInterner { fn intern(&mut self, name: &str) -> Atom; }
 
-pub struct BifContext<'a> { /* heap, atoms, self_pid, output, sender, tables, interner */ }
+/// Calls a fun term with `args` — the apply/callback seam the fun-taking `lists`/`maps` BIFs are
+/// built on. Milestone-1 has no in-crate evaluator, so without a hook those BIFs raise
+/// `unsupported_bif` (never a wrong result); `beam_rt` supplies the concrete caller over the
+/// engine's fun-application machinery.
+pub trait FunCaller { fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>; }
+
+pub struct BifContext<'a> { /* heap, atoms, self_pid, output, sender, tables, interner, fun_caller */ }
 impl<'a> BifContext<'a> {
     pub fn new(heap: &'a mut beam_alloc::Heap, atoms: &'a AtomTable, self_pid: ProcessId) -> Self;
-    pub fn with_output(self, sink: &'a mut dyn OutputSink) -> Self;      // default when unset: stdout
-    pub fn with_sender(self, hook: &'a mut dyn SendHook) -> Self;        // default when unset: none
-    pub fn with_tables(self, reg: &'a mut TableRegistry) -> Self;        // default when unset: none
+    pub fn with_output(self, sink: &'a mut dyn OutputSink) -> Self;       // default when unset: stdout
+    pub fn with_sender(self, hook: &'a mut dyn SendHook) -> Self;         // default when unset: none
+    pub fn with_tables(self, reg: &'a mut TableRegistry) -> Self;         // default when unset: none
     pub fn with_atom_interner(self, interner: &'a mut dyn AtomInterner) -> Self; // default when unset: none
+    pub fn with_fun_caller(self, caller: &'a mut dyn FunCaller) -> Self;  // default when unset: none
     pub fn heap(&mut self) -> &mut beam_alloc::Heap;
     pub fn atoms(&self) -> &AtomTable;
     pub fn self_pid(&self) -> ProcessId;
     pub fn write_output(&mut self, s: &str) -> Result<()>;   // sink, or stdout
     pub fn sender(&mut self) -> Option<&mut (dyn SendHook + 'a)>;
     pub fn tables(&mut self) -> Option<&mut TableRegistry>;
+    /// Apply `fun` to `args`: the installed `FunCaller`, else `unsupported_bif`.
+    pub fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>;
     // constructors / writers (all fallible → Result)
     pub fn int(&self, v: i64) -> Result<Eterm>;          // try_make_small; out of 60-bit range ⇒ SystemLimit
     pub fn atom(&self, name: &str) -> Result<Eterm>;     // AtomTable::lookup; absent ⇒ TermNotFound
@@ -110,9 +119,10 @@ impl<'a> BifContext<'a> {
     pub fn list(&mut self, elems: &[Eterm]) -> Result<Eterm>;   // NIL for empty
 }
 ```
-- The four seams (`output`/`sender`/`tables`/`interner`) are **optional**: unset ⇒ `io:format` writes
-  to stdout, `send/2`/`"!"/2` raise `unsupported_bif`, `ets:*` raises `unsupported_bif`, and a
-  new-atom BIF reports `TermNotFound`.
+- The five seams (`output`/`sender`/`tables`/`interner`/`fun_caller`) are **optional**: unset ⇒
+  `io:format` writes to stdout, `send/2`/`"!"/2` raise `unsupported_bif`, `ets:*` raises
+  `unsupported_bif`, a new-atom BIF reports `TermNotFound`, and every fun-taking `lists`/`maps` BIF
+  raises `unsupported_bif`.
 - `intern_atom` resolves an already-interned name without the hook; only a *new* name needs it.
 
 ### `access.rs` — the crate's ONLY `#[allow(unsafe_code)]` module
@@ -143,6 +153,7 @@ pub fn reason_term_from_exit_reason(reason: &ExitReason, atoms: &mut AtomTable) 
 `killed`, `aborted`) to their dedicated `ExitReason` variants, any other atom to `Atom(name)`, and a
 non-atom (or a name missing from `atoms`) to `ExitReason::Structured`.
 `reason_term_from_exit_reason` rejects `Structured` with `BadArg` (it carries no term).
+The registered BIFs are `error/1,2`, `exit/1`, `throw/1` and `nif_error/1,2`.
 
 ### `ets.rs` — the `ets:*` bridge over `beam_ets::Table`
 ```rust
@@ -162,12 +173,13 @@ The handle is an on-heap `Ref` thing built by `access::make_ref_thing`
 (`[make_header(3, REF_SUBTAG), 0, 0, id]`); `ref_thing_id` recovers its numeric id, which is the
 registry key (the M1 substitution for a real `tid()`).
 
-## The implemented BIFs (183)
-`default_registry()` registers **183** BIFs (count the `reg.register(` calls across `src/*.rs`;
-its `len()` is 183). Names/arities are verbatim from `bif.tab` / the stdlib export lists.
+## The implemented BIFs (209)
+`default_registry()` registers **209** BIFs (count the `reg.register(` calls across `src/*.rs`; its
+`len()` is 209). Names/arities are verbatim from `bif.tab` / the stdlib export lists.
 
 Module `erlang`:
-- `arith.rs` (9): `"+"/2 "-"/2 "*"/2 "/"/2 "div"/2 "rem"/2 "abs"/1 "-"/1 "+"/1`.
+- `arith.rs` (9): `"+"/2 "-"/2 "*"/2 "/"/2 "div"/2 "rem"/2 "abs"/1 "-"/1 "+"/1` — **exact integer
+  arithmetic** (see below).
 - `compare.rs` (9): `"=="/2 "/="/2 "=:="/2 "=/="/2 "<"/2 ">"/2 "=<"/2 ">="/2`, plus
   `erts_internal:cmp_term/2`.
 - `type_test.rs` (14): `is_atom/1 is_list/1 is_tuple/1 is_float/1 is_integer/1 is_number/1 is_pid/1
@@ -180,32 +192,64 @@ Module `erlang`:
 - `binconv.rs` (24): `list_to_binary/1 binary_to_list/1,3 byte_size/1 bit_size/1 binary_part/2,3
   integer_to_binary/1,2 binary_to_integer/1,2 float_to_binary/1,2 binary_to_float/1 atom_to_binary/1,2
   binary_to_atom/1,2 binary_to_existing_atom/1,2 term_to_binary/1,2 binary_to_term/1,2`.
-- `maps.rs` (3 of its 21): `map_get/2 map_size/1 is_map_key/2`.
+- `maps.rs` (3 of its 25): `map_get/2 map_size/1 is_map_key/2`.
 - `time.rs` (9): `monotonic_time/0,1 system_time/0,1 time_offset/0,1 unique_integer/0,1 timestamp/0`.
 - `proc.rs` (3): `self/0 send/2 "!"/2`.
-- `reason.rs` (4): `error/1 error/2 exit/1 throw/1`.
+- `reason.rs` (6): `error/1 error/2 exit/1 throw/1 nif_error/1,2`.
 
-Module `lists` (`lists.rs`, 25): `member/2 reverse/1,2 keyfind/3 append/1,2 nth/2 nthtail/2 last/1
+Module `lists` (`lists.rs`, 43): `member/2 reverse/1,2 keyfind/3 append/1,2 nth/2 nthtail/2 last/1
 sublist/2,3 seq/2,3 flatten/1,2 sum/1 max/1 min/1 duplicate/2 delete/2 keysort/2 sort/1 usort/1 zip/2
-unzip/1`.
+unzip/1` **plus the 18 fun-taking functions** `map/2 filter/2 foldl/3 foldr/3 foreach/2 sort/2 usort/2
+flatmap/2 zipwith/3 mapfoldl/3 mapfoldr/3 all/2 any/2 takewhile/2 dropwhile/2 partition/2 splitwith/2
+keymap/3` (see the fun-taking section below).
 Only `member/2`/`reverse/2`/`keyfind/3` are real `bif.tab` `lists` BIFs; the rest are `lists.erl`
 exports registered as Rust fast paths (identical observable results). `keymember/3` and
-`keysearch/3` (the two other real `lists` BIFs) and the `fun`-taking functions are not registered.
+`keysearch/3` (the two other real `lists` BIFs) are not registered.
 
-Module `maps` (`maps.rs`, 18 of its 21): `new/0 from_list/1 to_list/1 get/2,3 find/2 put/3 update/3
-remove/2 keys/1 values/1 size/1 is_key/2 merge/2 with/2 without/2 iterator/1 next/1`.
+Module `maps` (`maps.rs`, 25): `new/0 from_list/1 to_list/1 get/2,3 find/2 put/3 update/3
+remove/2 keys/1 values/1 size/1 is_key/2 merge/2 with/2 without/2 iterator/1 next/1` **plus** the
+fun-taking `map/2 fold/3 filter/2 foreach/2` (see below).
 
-Module `binary` (`binary.rs`, 21): `at/2 part/2,3 copy/1,2 list_to_bin/1 bin_to_list/1,2,3
-decode_unsigned/1,2 encode_unsigned/1,2 first/1 last/1 split/2,3 concat/2 match/2,3
-longest_common_prefix/1`.
+Module `binary` (`binary.rs`, 23): `at/2 part/2,3 copy/1,2 list_to_bin/1 bin_to_list/1,2,3
+decode_unsigned/1,2 encode_unsigned/1,2 first/1 last/1 split/2,3 match/2,3 matches/2,3
+longest_common_prefix/1 longest_common_suffix/1`.
 
 Module `unicode` (`unicode.rs`, 5): `characters_to_binary/1,2,3 characters_to_list/1,2`.
 
-Module `io` (`io.rs`, 4): `io:format/1,2` and `io_lib:format/1,2` (one shared directive engine).
+Module `io` (`io.rs`, 4): `io:format/1,2` and `io_lib:format/2,3` (one shared directive engine).
 
 Module `ets` (`ets.rs`, 4): `new/2 insert/2 lookup/2 delete/1` over `TableRegistry`.
 
 Module `erts_internal`: only `cmp_term/2` (above).
+
+## Exact integer arithmetic (`arith.rs`) and `lists:sum/1`
+`+ - * div rem abs` and unary `-`/`+` operate on **arbitrary-precision** integers: a small-int operand
+is read via `signed_value`, a bignum via `beam_term::thing::big_parts`, the op is performed on
+sign+magnitude limbs, and a result that does not fit the 60-bit small range is materialized as a heap
+bignum. Construction uses the **safe** `beam_codec::term::make_big(&mut beam_alloc::Heap, negative,
+digits)` (the crate is `#![deny(unsafe_code)]`; `beam_term::thing::write_big` needs `unsafe`).
+`div`/`rem` use Knuth algorithm D. The `pub(crate) fn add_terms(ctx, a, b)` helper is shared with
+`lists:sum/1`, which also promotes to a bignum (the oracle keeps `lists:sum` exact). This makes
+`semantics/bignum_multiplication` (`123456789012345678 * 98` → the exact `SMALL_BIG_EXT` image) agree
+with the oracle.
+**Scope:** the promotion covers the operator BIFs above and `lists:sum/1`. Other integer-producing
+BIFs may still report `SystemLimit` where an exact bignum is needed (see Known Issues).
+
+## Fun-taking `lists`/`maps` BIFs (the `FunCaller` seam)
+The 18 `lists` and 4 `maps` functions above take a **fun** argument. A BIF cannot invoke a fun itself
+— Milestone-1 has no in-crate evaluator — so `BifContext::call_fun` delegates to the optional
+[`FunCaller`] seam. Semantics are pinned to the OTP stdlib (`lists.erl`/`maps.erl`):
+- `lists:map/2` applies left-to-right; `filter/2` keeps elements the predicate returns `true` for;
+  `foldl/3`/`foldr/3` fold left/right from the accumulator; `foreach/2` discards results and returns
+  `ok`; `sort/2`/`usort/2` order by the fun's result (stable, arithmetic order); `flatmap/2` maps then
+  appends; `zipwith/3` raises when the lists differ in length (a `function_clause` in the oracle,
+  collapsed to `BadArg` in M1); `mapfoldl/3`/`mapfoldr/3` thread an accumulator; `all/2`/`any/2`
+  short-circuit on the first `false`/`true`; `takewhile/2`/`dropwhile/2`/`splitwith/2`/`partition/2`
+  share the predicate semantics; `keymap/3` maps the value at each tuple's key position.
+- `maps:map/2` rebuilds every value; `maps:fold/3` visits every `{Key,Value}`; `maps:filter/2` keeps
+  pairs the predicate accepts (a non-boolean result is `BadArg`); `maps:foreach/2` returns `ok`.
+- Without an installed `FunCaller` **every** one of these raises `unsupported_bif` (never a wrong
+  result) — the runtime-side handoff below.
 
 ## `io`/`io_lib` directive set and the printer
 `src/io.rs` (the exact support, verified against erts-17.1):
@@ -216,8 +260,17 @@ Module `erts_internal`: only `cmp_term/2` (above).
   base 2–36), `~x`/`~X` (a two-argument `(Integer, Prefix)` integer), `~e`/`~f`/`~g` (floats).
 - Control-sequence prefix: optional `-` (left adjust), decimal field width (or `*`), optional `.`
   precision (decimal or `*`), optional `.*` pad character, and the `t`/`l` modifiers.
-- `io:format/1,2` write to the context's `OutputSink` and return `ok`; `io_lib:format/1,2` return the
-  rendering as an **iolist** (a flat list of small ints; `NIL` for empty) and write nothing.
+- `io:format/1,2` write to the context's `OutputSink` and return `ok`.
+- **`io_lib:format/2,3` return the oracle's DEEP list** — the top-level result is a list of the
+  format's *segments*, each segment itself a chardata. Segmentation follows `io_lib_format.erl`:
+  literal characters become individual small ints; the "small" controls (`~s` of an *atom* only,
+  `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) are spliced flat; every other control
+  (`~w`, `~p`, `~W`, `~P`, and `~s` of a list/binary) contributes a single sub-list element (itself
+  deeply chunked). Example: `io_lib:format("~w", [[52,50]])` ⇒ `[[52,50]]`, not `[52,50]`.
+  `io_lib:format/3` accepts the same options; the oracle ignores every option except
+  `{chars_limit, N}`, and a *limiting* `chars_limit` is a typed `unsupported_bif` here (a negative
+  value is the oracle default and is accepted). `io_lib:format/1` is **not** an OTP BIF/export — it is
+  deliberately not registered.
 - Rejected (`badarg`): `~d` (not a directive in the oracle — `~b` is the base-10 form), `~+`, `~#`, a
   base outside `2..=36`, a too-small precision (`~.1e`, `~.0f`, `~.0g`), wrong arg type/count,
   running out of / leaving unconsumed arguments, a trailing `~`, a left-adjusted `~p`/`~-<n>p`, and a
@@ -225,22 +278,41 @@ Module `erts_internal`: only `cmp_term/2` (above).
   no map-printing-order switch).
 
 `src/print.rs` (`~w`/`~p`/`~W`/`~P` renderer; registers no BIFs): small ints, atoms (bare iff
-`[a-z][A-Za-z0-9_@]*`, else `'…'`), `NIL`, floats, proper/improper lists, tuples, flat maps,
-binaries (each class as the oracle renders it). Depth semantics reproduce `io_lib:write1/4` (depth
-`0` ⇒ `...`, depth `1` elides container contents, negative ⇒ unlimited). The `~p` printable-string
-rule (a non-empty proper list of small ints in `32..=126` ⇒ `"…"`, escaping `"`/`\`; also applied to
-binaries ⇒ `<<"…">>`) only under `printable = true`. Maps render `#{k => v,…}` in the oracle's
-flatmap key order.
+`[a-z][A-Za-z0-9_@]*`, else `'…'`), `NIL`, floats, bignums, proper/improper lists, tuples, flat maps,
+binaries/references (each class as the oracle renders it). Depth semantics reproduce
+`io_lib:write1/4` (depth `0` ⇒ `...`, depth `1` elides container contents, negative ⇒ unlimited). The
+`~p` printable-string rule (a non-empty proper list of small ints in `32..=126` ⇒ `"…"`, escaping
+`"`/`\`; also applied to binaries ⇒ `<<"…">>`) only under `printable = true`. Maps render
+`#{k => v,…}` in the oracle's flatmap key order.
 
 ## Notes for Agents
-- **`access.rs` and `bits.rs` are PRIVATE modules** (`mod access;`/`mod bits;` in `src/lib.rs:37,41`) — their `pub(crate)` safe wrappers are *not* reachable from other crates (e.g. `beam_rt`). The crate's cross-crate public surface is exactly the `pub use` list in `src/lib.rs:60-66` + `prelude` (`BifContext` and its seams, `BifRegistry`/`BifFn`/`default_registry`, the raise builders, `TableRegistry`, the reason mapping). There is **no public term construction/destruction helper module**.
-- **A dependent needing to destructure/construct boxed terms from safe Rust has two routes outside this crate:** (a) call the registered BIFs through `BifRegistry::call` (`hd`/`tl`/`element`/`map_get`/`binary:at`/`is_tuple`/`is_map`/`is_float`/`maps:from_list`/`list_to_binary`/`binary:copy`/`float`/`erlang:'/'` are all registered); or (b) use the sibling **safe** helper modules `beam_engine::terms::*` (`make_tuple`/`make_cons`/`make_list`/`make_float`/`make_flatmap`/`make_heap_binary`/`make_fun`, `tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/`list_elements`/`float_value`/`map_entries`/`binary_bytes`, fun readers `is_fun`/`fun_arity`/`fun_num_free`/`fun_uniq`/`fun_index`/`fun_free`; take `&mut dyn ExecutionContext`) and `beam_codec::term::*` (`make_float`/`make_big`/`make_flatmap`/`make_binary`/`make_bitstring`, `flatmap_parts`/`tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/`bitstring_bytes`/`float_value`; take `&mut Heap`). Both are `#[allow(unsafe_code)]` modules exposing safe `Result` APIs; `beam_term`'s own boxed accessors are all `unsafe fn` with no safe wrapper.
-- `BifContext` constructs **floats, lists, tuples, cons, small ints, atoms** safely (`make_float`/`list`/`tuple`/`cons`/`int`/`atom`/`intern_atom`) but has **no** binary/bitstring or map constructor — build those via the routes above.
+- **`access.rs` and `bits.rs` are PRIVATE modules** (`mod access;`/`mod bits;` in `src/lib.rs`) — their
+  `pub(crate)` safe wrappers are *not* reachable from other crates (e.g. `beam_rt`). The crate's
+  cross-crate public surface is exactly the `pub use` list in `src/lib.rs` + `prelude` (`BifContext`
+  and its seams incl. `FunCaller`, `BifRegistry`/`BifFn`/`default_registry`, the raise builders,
+  `TableRegistry`, the reason mapping). There is **no public term construction/destruction helper
+  module**.
+- **A dependent needing to destructure/construct boxed terms from safe Rust has two routes outside
+  this crate:** (a) call the registered BIFs through `BifRegistry::call` (`hd`/`tl`/`element`/
+  `map_get`/`binary:at`/`is_tuple`/`is_map`/`is_float`/`maps:from_list`/`list_to_binary`/
+  `binary:copy`/`float`/`erlang:'/'` are all registered); or (b) use the sibling **safe** helper
+  modules `beam_engine::terms::*` (`make_tuple`/`make_cons`/`make_list`/`make_float`/`make_flatmap`/
+  `make_heap_binary`/`make_fun`, `tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/
+  `list_elements`/`float_value`/`map_entries`/`binary_bytes`, fun readers `is_fun`/`fun_arity`/
+  `fun_num_free`/`fun_uniq`/`fun_index`/`fun_free`; take `&mut dyn ExecutionContext`) and
+  `beam_codec::term::*` (`make_float`/`make_big`/`make_flatmap`/`make_binary`/`make_bitstring`,
+  `flatmap_parts`/`tuple_arity`/`tuple_element`/`cons_head`/`cons_tail`/`bitstring_bytes`/
+  `float_value`; take `&mut Heap`). Both are `#[allow(unsafe_code)]` modules exposing safe `Result`
+  APIs; `beam_term`'s own boxed accessors are all `unsafe fn` with no safe wrapper.
+- `BifContext` constructs **floats, lists, tuples, cons, small ints, atoms** safely
+  (`make_float`/`list`/`tuple`/`cons`/`int`/`atom`/`intern_atom`) but has **no** binary/bitstring,
+  bignum or map constructor — build those via the routes above (`make_big` for bignums).
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only — never a crate-local error enum, never
   `panic!`, never `unwrap()` on runtime data, never a wrong result. Argument violations ⇒ `BadArg`;
-  non-numeric arithmetic ⇒ `BadArith`; wrong arg count ⇒ `BadArity`; 60-bit overflow ⇒ `SystemLimit`.
+  non-numeric arithmetic ⇒ `BadArith`; wrong arg count ⇒ `BadArity`; a size/overflow the runtime
+  cannot represent ⇒ `SystemLimit`.
 - **Never re-implement term order/size/hashing/construction.** Comparison ⇒ `beam_term::compare::{cmp,
   cmp_arith}`; term construction/inspection ⇒ `beam_term` accessors only (via `access.rs`);
   allocation ⇒ `beam_alloc::Heap`.
@@ -250,8 +322,8 @@ flatmap key order.
 - **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_process`,
   `beam_message`, `beam_codec`, `beam_ets`, `beam_gc`, `libc`. In use: `beam_common`, `beam_term`,
   `beam_alloc`, `beam_process`, `beam_ets`, `beam_message` (the `ets` copy-out), `beam_codec` (the
-  `term_to_binary`/`binary_to_term` image and `print`'s bignum reader). `beam_gc`/`libc` remain
-  declared seams. Adding a dependency edge requires reporting to `../`.
+  `term_to_binary`/`binary_to_term` image, `print`'s bignum reader, and `make_big` for arithmetic).
+  `beam_gc`/`libc` remain declared seams. Adding a dependency edge requires reporting to `../`.
 - **Files target ~1000 lines.** Several `src/*.rs` files exceed 1000 total *only* because of their
   comprehensive in-module `#[cfg(test)]` suites; each file's implementation section is under ~1300
   lines (the documented "legitimately long file" exception). Split by responsibility when the
@@ -261,23 +333,31 @@ flatmap key order.
 ## Test Strategy
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` (the well-known atoms `true`, `false`, `ok`, …) and a `BytesSink`/`NullSink`
-  capture. `cargo test -p beam_bifs` runs **216** lib tests (units + in-module integration).
+  capture. `cargo test -p beam_bifs` runs **230** lib tests (units + in-module integration).
 - **`tests/` integration suite** (public API only — `beam_bifs::*` plus the declared dependency
-  crates); 16 tests total:
+  crates); **62** tests total:
   - `tests/registry.rs` (4) — the `BifRegistry` seam: `default_registry()` is a **superset** of the
-    54-key Milestone-1 core roster (`len() >= 54`; every core key present) with `names()` sorted and
+    Milestone-1 core roster (`len() >= 54`; every core key present) with `names()` sorted and
     `entries().count() == len()`, a fresh registry is empty, `register` returns the replaced impl,
     `lookup` is exact on `(module, function, arity)`, and `call` reports an unknown BIF (`undef`
     raise) and a bad arity (`BadArity`).
   - `tests/erlang_bifs.rs` (8) — the `erlang`/`erts_internal` core BIFs driven through `call`
     (arithmetic, comparison incl. `1 == 1.0` vs `1 =:= 1.0` and `erts_internal:cmp_term/2`, type
     tests incl. `is_list([])`, term ops incl. their `badarg` cases), `self/0` + `send/2`/`"!"/2` (the
-    `SendHook` seam), the raise BIFs (`error`/`exit`/`throw` classes) and the public reason mapping
-    (`exit_reason_from_term`/`reason_term_from_exit_reason`).
+    `SendHook` seam), the raise BIFs (`error`/`exit`/`throw` classes) and the public reason mapping.
+  - `tests/bignum.rs` (7) — exact integer arithmetic: the pinned `term_to_binary` image for
+    `semantics/bignum_multiplication`, large `+`/`-`/`*`, `div`/`rem`, mixed small/big operands,
+    conversion to f64, all pinned against `erl -noshell -eval`.
+  - `tests/binary_to_term_atoms.rs` (4) — `binary_to_term` interns decoded atoms through the
+    `AtomInterner` seam so they are resolvable globally (the A.5 wire-decode handoff).
+  - `tests/lists_funs.rs` (18) / `tests/maps_funs.rs` (9) — the fun-taking BIFs driven through a mock
+    `FunCaller` (order, accumulator threading, short-circuiting, `badarg` cases, and the
+    `unsupported_bif` contract when no caller is installed).
+  - `tests/io_lib.rs` (8) — the `io_lib:format/2,3` deep-list segmentation for several formats,
+    pinned byte-for-byte against the oracle.
   - `tests/io_ets.rs` (4) — `io:format` **exact captured bytes** through a `BytesSink` (`"~p~n"` ⇒
     `{a,1}\n`, `"~w ~s ~b~n"` ⇒ `[97,98,99] a 255\n`), `~d`/`~x` ⇒ `BadArg`, and the
-    `ets:new/insert/lookup/delete` round-trip over a real `TableRegistry` (structural `compare::eq`,
-    including the empty-list miss and the `badarg` after delete).
+    `ets:new/insert/lookup/delete` round-trip over a real `TableRegistry` (structural `compare::eq`).
 - **Gate (GREEN required):**
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_bifs` and
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
@@ -285,23 +365,50 @@ flatmap key order.
   `../../tools/` or `../../erts/` (read-only oracle).
 - Full differential cross-checks belong to the sibling `../../tools/differential/` harness.
 
+## Differential gate & handoffs (sibling nodes)
+Running `erts_rust/scripts/cargo.sh run -q --release -p differential -- suite` currently reports
+**141 AGREE / 12 MISMATCH / 2 UNSUPPORTED**. The `beam_bifs`-owned cases all AGREE; the remaining
+mismatches are owned by sibling nodes:
+- `semantics/bignum_multiplication`, `nif/nif_error_atom_reason`, `nif/nif_error_default`,
+  `bifs/io_lib_format` — **fixed** by this crate (exact bignum arithmetic, `nif_error/1,2`, the
+  `io_lib` deep-list result).
+- `semantics/lists_map_fun` — `beam_bifs` registers `lists:map/2` and raises `unsupported_bif` with no
+  `FunCaller`; `beam_rt` must install a `FunCaller` on its `BifContext` (wired to fun application) and
+  consult the registry for `lists:*`/`maps:*`.
+- `nif/nif_error_tuple_reason` — the atom case agrees; the compound-reason case needs `beam_rt`'s
+  term-carrying raise to preserve the live reason term (`Flow::Raise { reason: <Eterm> }`), as
+  `error`/`exit`/`throw` already do.
+- `wire/decode_reference_atom_blob`, `wire/decode_reference_map_blob` — `beam_bifs` interns decoded
+  atoms through `AtomInterner` (tested); `beam_rt` must install an `AtomInterner` over the same global
+  atom table that printing resolves against.
+- `driver/*`, `system_info/*`, `boot/*`, `flags/*` — `beam_engine`/`beam_rt`/loader concerns
+  (opcodes, boot, code path, CLI), outside `beam_bifs`.
+
 ## Design Decisions
 - **`BifFn` is a plain `fn` pointer, not a boxed closure.** The registry is built once at boot and
   looked up per BIF call; `fn` keeps it `Copy`, allocation-free to register, and impossible to close
   over state (all BIF state flows through `BifContext`).
-- **`BifContext` holds optional seams (`output`/`sender`/`tables`/`interner`), not concrete runtime
-  types.** The engine depends only on `beam_loader`; `beam_rt` supplies the concrete context. Optional
-  seams keep the crate testable with a bare heap + atom table and keep the Stage-1/Stage-5 DAG
-  acyclic (no `beam_engine` edge).
+- **`BifContext` holds optional seams (`output`/`sender`/`tables`/`interner`/`fun_caller`), not
+  concrete runtime types.** The engine depends only on `beam_loader`; `beam_rt` supplies the concrete
+  context. Optional seams keep the crate testable with a bare heap + atom table and keep the
+  Stage-1/Stage-5 DAG acyclic (no `beam_engine` edge).
 - **`AtomInterner` exists because atom indices are global and owned by the runtime.** The context
   borrows the atom table immutably, so a BIF that must *create* an atom routes through the hook;
   without one it resolves an existing name or reports `TermNotFound` — never a fabricated index.
   `binary_to_term` decodes into a clone of the context's table and hands the decoder's appended names
   back through `intern_atom` (sound because `AtomTable` assigns indices in insertion order).
+- **`FunCaller` exists because a BIF cannot apply a fun.** There is no ambient evaluator in the
+  registry; the `lists`/`maps` higher-order BIFs route fun application through the hook, which
+  `beam_rt` supplies. Every fun-taking BIF therefore has a **default-unsupported** behaviour, so the
+  workspace builds and behaves honestly before `beam_rt` adopts the seam.
 - **`self/0` reads the pid from the context, not a global.** There is no ambient "current process" in
   the Rust core (the engine is a pure state machine); `BifContext::self_pid` is the injected identity.
 - **All BIF allocation uses the upstream `beam_alloc::Heap`.** `beam_term::heap::Heap` is a test arena
   only (see `../beam_alloc/CONTEXT.md`).
+- **Bignums are built with `beam_codec::term::make_big`, not `beam_term::thing::write_big`.** The
+  latter needs `unsafe` (raw heap-word writes); the crate is `#![deny(unsafe_code)]`, so arithmetic
+  goes through the safe codec constructor (`beam_codec` depends downward on `beam_term`, so this adds
+  no cycle).
 - **Comparison delegates to `beam_term`.** `==`/`/=` and `< > =< >=` use `cmp_arith` (arithmetic
   order); `=:=`/`=/=` and `erts_internal:cmp_term/2` use `cmp` (exact order) — the OTP semantics
   (`1 < 1.0` is false; `1 =:= 1.0` is false).
@@ -323,19 +430,34 @@ flatmap key order.
   base 10 and `~d` is `badarg` in real erts-17.1; `~t` is the unicode *modifier* (there is no column
   directive); `float_to_binary/3` is not registered (the oracle has only `/1`,`/2`). Reproducing the
   oracle wins over illustrative wording.
+- **`io_lib:format` returns the oracle's deep list, not a flat iolist.** The segmentation rule (which
+  controls splice flat, which become sub-lists) is copied from `io_lib_format.erl`; a flat
+  `[52,50]`-style result would compare unequal to the real `io_lib:format`.
 - **Float rendering** is Rust's shortest round-trip with a `.0` appended when integral (a documented
   deviation from OTP's `%.*g` / `[short]`).
 
 ## Known Issues / Intentional M1 gaps
-Every gap below is a typed `BeamError`, never a silently wrong result. The recurring cause is
-`beam_common::ExitReason` carrying a non-atom reason only as `ExitReason::Structured` (no term), and
-`beam_term` having no bignums / no off-heap binaries / no `function_clause` variant.
-- **No bignums (everywhere).** An integer result outside the 60-bit small range is `SystemLimit`
-  (`arith`, `lists`, `convert`, `binconv`, `binary:decode_unsigned`, `time`); a bignum operand is
-  `BadArg`/`BadArith`. Real Erlang promotes to a bignum.
+Every gap below is a typed `BeamError`, never a silently wrong result. The recurring causes are
+`beam_common::ExitReason` carrying a non-atom reason only as `ExitReason::Structured` (no term),
+`beam_term` having no off-heap binaries / no `function_clause` variant, and a `beam_term::compare`
+bignum bug (below).
+- **Bignum arithmetic is exact only for the operator BIFs and `lists:sum/1`.** `+ - * div rem abs`
+  unary `-`/`+` and `lists:sum/1` promote to exact bignums. Other integer-producing BIFs
+  (`binary:decode_unsigned`, the `time` BIFs, `convert` helpers, …) still report `SystemLimit` where
+  the oracle would return an exact bignum. A bignum operand to a BIF that has not been promoted is
+  `BadArg`/`BadArith`.
+- **`beam_term::compare` mishandles bignums (SIBLING-NODE BUG — handoff to `beam_term`).**
+  `beam_term::thing::write_big` stores the header arity as `digits - 1` (C's `BIG_ARITY` is the digit
+  count), but `compare` reads that field *as* the digit count, so `cmp_bigs`/`number_as_f64` drop the
+  most-significant limb. Symptom: `(1 bsl 134) =:= (63 bsl 128)` is `true` in Rust (oracle `false`)
+  and `(1 bsl 70) > 1.0` is `false` (oracle `true`). Because `beam_bifs` delegates all comparison to
+  `beam_term::compare`, this leaks into `=:=`/`==`/`<`/`>`, `lists:sort`/`usort`, `max`/`min`, map
+  key ordering and `ets` ordered_set. The fix belongs in `beam_term`.
 - **`function_clause` collapses to `BadArg`.** `lists.erl`'s no-clause failures (`nth(3,[a,b])`,
-  `last([])`, `zip([1],[2,3])`, `sublist([1],0,1)`, …) are reported as `BadArg` (no
-  `function_clause` in `BeamError`).
+  `last([])`, `zip([1],[2,3])`, `zipwith/3` on unequal lengths, `sublist([1],0,1)`, …) are reported as
+  `BadArg` (no `function_clause` in `BeamError`).
+- **`lists:usort/2` diverges from the oracle for degenerate (non-total) comparators.** The oracle's
+  `usort_1`/`ufsplit_*` behaviour on such a fun is not reproduced (documented).
 - **Structured `error:{badkey,..}` / `error:{badmap,..}` reasons collapse to `BadArg`.** `maps`'s
   missing-key / non-map failures and `convert:raise/3` with a non-atom reason are `BadArg` rather
   than the structured term the oracle raises (the `Structured`-has-no-term gap).
@@ -375,13 +497,15 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 - **`prim_*` modules are unimplemented.** The registry supports them; nothing is registered. Only
   `erts_internal:cmp_term/2` exists among the `erts_internal` surface.
 - **Process-coupled BIFs are NOT implemented:** no `apply/3`, `spawn*`, `process_info`,
-  `process_flag`, `get`/`put`/`erase`, `make_ref`, `list_to_ref`, `fun`-taking `lists`/`maps` BIFs
-  (`map/2`, `filter/2`, `foldl/3`, `foldr/3`, `sort/2`, `maps:fold/3`, …). They need an apply/callback
-  seam and are left to the interpreted stdlib / a later pass.
-- **No in-crate message delivery.** `send/2`/`"!"/2` require a `SendHook`; without one they raise
-  `unsupported_bif`. Wiring to `beam_process`/`beam_message` is `beam_rt`'s.
+  `process_flag`, `get`/`put`/`erase`, `make_ref`, `list_to_ref`, `erts_internal:open_port/2`,
+  `system_info` (the runtime supplies the last two). They need an apply/callback seam and are left to
+  the interpreted stdlib / a later pass.
+- **No in-crate message delivery or fun application.** `send/2`/`"!"/2` require a `SendHook`; the
+  fun-taking `lists`/`maps` BIFs require a `FunCaller`. Without the hook they raise `unsupported_bif`.
+  Wiring to `beam_process`/`beam_message`/fun application is `beam_rt`'s.
 - **`error/2` ignores its second argument** (behaves exactly like `error/1`); the argument list is not
-  rendered into the reason.
+  rendered into the reason. Likewise `nif_error/2`'s second argument is crash-report metadata, not the
+  reason.
 - **`time` native unit is fixed to nanoseconds.** `system_time/0`, `time_offset/0`,
   `system_time(nanosecond)` and `system_time(native)` exceed the 60-bit small range and report
   `SystemLimit` (real ERTS returns a bignum); `monotonic_time/0` uses a process-global `Instant`
@@ -397,34 +521,39 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `#![deny(unsafe_code)]`
 - `src/registry.rs` → `BifFn`, `BifRegistry` (register/lookup/call/names/entries), `with_core_bifs`, `default_registry`
-- `src/context.rs` → `BifContext` + `AtomInterner`/`OutputSink`/`SendHook` and the sink impls (`StdoutSink`/`NullSink`/`BytesSink`)
+- `src/context.rs` → `BifContext` + the `OutputSink`/`SendHook`/`AtomInterner`/`FunCaller` seams and the sink impls (`StdoutSink`/`NullSink`/`BytesSink`)
 - `src/error.rs` → `pub(crate)` failure constructors + the public `raise_error`/`raise_exit`/`raise_throw` builders
 - `src/access.rs` → the ONLY `#[allow(unsafe_code)]` module: term classification/structure/float wrappers, the M1 ref thing, heap-bitstring builders, flatmap accessors
-- `src/arith.rs` → `+ - * / div rem abs` and unary `-`/`+` BIFs
+- `src/arith.rs` → exact (bignum-promoting) `+ - * / div rem abs` and unary `-`/`+`; the shared `add_terms` helper
 - `src/compare.rs` → `== /= =:= =/= < > =< >=` BIFs + `erts_internal:cmp_term/2`
 - `src/type_test.rs` → the `is_*` type-test BIFs
 - `src/term_ops.rs` → `element setelement tuple_size tuple_to_list list_to_tuple length hd tl size`
 - `src/convert.rs` → pure `erlang` conversions/numeric helpers (`integer_to_list`, `list_to_integer`, `float_to_list`, `min`/`max`, `round`/`trunc`/`float`/`ceil`/`floor`, `make_tuple`, `raise`, `node`, …)
-- `src/lists.rs` → the `lists` module BIFs/fast paths (no `fun`-taking functions)
-- `src/maps.rs` → the `maps` module BIFs + `erlang:map_get`/`map_size`/`is_map_key`
-- `src/binary.rs` → the `binary` module BIFs (`at part copy list_to_bin bin_to_list decode/encode_unsigned first last split concat match longest_common_prefix`)
+- `src/lists.rs` → the `lists` module BIFs/fast paths, including the 18 fun-taking functions over `FunCaller`
+- `src/maps.rs` → the `maps` module BIFs (incl. the fun-taking `map/fold/filter/foreach`) + `erlang:map_get`/`map_size`/`is_map_key`
+- `src/binary.rs` → the `binary` module BIFs (`at part copy list_to_bin bin_to_list decode/encode_unsigned first last split match matches longest_common_prefix longest_common_suffix`)
 - `src/binconv.rs` → `erlang` binary/atom/integer conversions + `term_to_binary`/`binary_to_term` (via `beam_codec`)
 - `src/unicode.rs` → `unicode:characters_to_binary/1,2,3` + `characters_to_list/1,2` (latin1 + utf8)
 - `src/time.rs` → `monotonic_time`/`system_time`/`time_offset`/`unique_integer`/`timestamp`
 - `src/proc.rs` → `self/0`, `send/2` (`"!"/2`)
-- `src/reason.rs` → the `error`/`exit`/`throw` BIFs + `ExitReason` ↔ reason-term mapping
-- `src/io.rs` → `io:format/1,2` + `io_lib:format/1,2` + the directive engine
+- `src/reason.rs` → the `error`/`exit`/`throw`/`nif_error` BIFs + `ExitReason` ↔ reason-term mapping
+- `src/io.rs` → `io:format/1,2` + `io_lib:format/2,3` + the directive engine + the segment tree behind the deep-list result
 - `src/print.rs` → the `~w`/`~p`/`~W`/`~P` term printer (registers no BIFs)
 - `src/bits.rs` → the safe on-heap bitstring/binary facade shared by `binary`/`unicode`/`term_ops`
 - `src/numeric.rs` → shared `pub(crate)` numeric helpers (int/float parse + render, base/digit handling, `FloatFormat`/`parse_float_options`) used by `convert.rs` and `binconv.rs`
 - `src/ets.rs` → `TableRegistry` + the `ets:new/insert/lookup/delete` bridge over `beam_ets::Table`
 - `tests/registry.rs` → the `BifRegistry` seam (core-roster superset, unknown/bad-arity contract)
 - `tests/erlang_bifs.rs` → the `erlang`/`erts_internal` BIF sweep + `SendHook` + reason mapping
+- `tests/bignum.rs` → exact integer arithmetic, pinned to the oracle (incl. the differential case's `term_to_binary` image)
+- `tests/binary_to_term_atoms.rs` → `binary_to_term` atom interning through `AtomInterner`
+- `tests/lists_funs.rs` / `tests/maps_funs.rs` → the fun-taking BIFs over a mock `FunCaller`
+- `tests/io_lib.rs` → the `io_lib:format` deep-list segmentation (oracle-pinned)
 - `tests/io_ets.rs` → `io:format` exact bytes + the `ets` bridge round-trip
 - `../beam_engine/CONTEXT.md` → the `ExecutionContext::call_bif` seam this registry plugs into (read-only)
 - `../beam_process/CONTEXT.md` → `ProcessId`, the exit-reason handoff (read-only)
 - `../beam_ets/CONTEXT.md` → `Table`/`TableOptions`/`TableId` the `ets` bridge drives (read-only)
-- `../beam_codec/CONTEXT.md` → the ETF codec `term_to_binary`/`binary_to_term` route through (read-only)
+- `../beam_codec/CONTEXT.md` → the ETF codec `term_to_binary`/`binary_to_term` and `term::make_big` route through (read-only)
+- `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`size`/`thing` utilities (the bignum-compare bug lives there) (read-only)
 - `../../erts/emulator/beam/bif.tab` / `bif.c` / `erl_bif_*.c` / `erl_arith.c` / `erl_map.c` / `external.c` / `erl_unicode.c` / `erl_time_sup.c` / `erl_bits.h` → authoritative names/arities/semantics (read-only)
 
 ## See Also
@@ -432,4 +561,4 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 - `../../CONTEXT.md` → workspace contracts (§1 A.7, §2 frozen term layout, §3 error strategy, §6 test gate).
 - `../../ERTS_RUST_REWRITE_EVALUATION.md` §A.7 → the OTP app contracts (preloaded/boot/`erts_internal`/`prim_*`).
 - `../beam_term/CONTEXT.md` → the frozen term API + the shared `compare`/`size`/`thing` utilities.
-- `../beam_rt/` → the runtime that supplies the concrete `BifContext` and adapts the registry into the engine.
+- `../beam_rt/` → the runtime that supplies the concrete `BifContext` (incl. the `FunCaller`/`AtomInterner` seams) and adapts the registry into the engine.
