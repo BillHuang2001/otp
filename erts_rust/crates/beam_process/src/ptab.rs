@@ -28,7 +28,11 @@ use crate::error;
 use crate::monitor::{Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator};
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
 use crate::process::{DeliverOutcome, Process, ProcessState};
-use crate::signal::{build_down_message, build_exit_message, exit_policy, ExitPolicy, ExitSignal, SignalAtoms};
+use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
+use crate::signal::{
+    build_down_message, build_down_message_remote, build_exit_message, build_exit_message_term,
+    exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
+};
 
 /// The outcome of applying an exit signal to a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -72,12 +76,12 @@ fn lookup_mut(slots: &mut [Slot], pid: ProcessId) -> Option<&mut Process> {
 /// `process`'s heap, collecting once and retrying when the heap is exhausted (a full heap is a
 /// normal condition, not fatal OOM).
 ///
-/// `build` produces *both* the term and the handles of the fresh off-heap table it copied into:
-/// it creates that table itself, so a retry always starts from a clean table and never reuses a
-/// stale handle.
-fn build_signal_term<F>(process: &mut Process, build: F) -> Result<(Eterm, Vec<MsoHandle>)>
+/// `build` returns whatever the caller needs (the term plus the handles of the fresh off-heap
+/// table it copied into, or the term plus extra terms materialised on the same heap). It creates
+/// that table itself, so a retry always starts from a clean table and never reuses a stale handle.
+fn build_signal_term<T, F>(process: &mut Process, build: F) -> Result<T>
 where
-    F: Fn(&mut Heap) -> Result<(Eterm, Vec<MsoHandle>)>,
+    F: Fn(&mut Heap) -> Result<T>,
 {
     match build(process.heap_mut()) {
         Ok(built) => Ok(built),
@@ -164,6 +168,14 @@ pub struct ProcessTable {
     /// runnable, so the single-threaded scheduler can absorb them (see
     /// [`ProcessTable::drain_woken`] and `crate::scheduler::Scheduler::resume_woken`).
     ready: Vec<ProcessId>,
+    /// Per local process: its remote (external-node) link partners.
+    remote_links: HashMap<ProcessId, Vec<RemotePid>>,
+    /// Per local process: its outgoing monitors on remote processes/ports.
+    remote_monitors: HashMap<ProcessId, Vec<RemoteMonitor>>,
+    /// The distribution seam (see [`DistSignalRouter`]); `None` means **record-only** — the
+    /// local relationship is still tracked, only the wire signal is dropped (a node with no
+    /// distribution configured).
+    router: Option<Box<dyn DistSignalRouter>>,
 }
 
 impl ProcessTable {
@@ -176,9 +188,11 @@ impl ProcessTable {
             refs: RefAllocator::new(),
             atoms,
             ready: Vec::new(),
+            remote_links: HashMap::new(),
+            remote_monitors: HashMap::new(),
+            router: None,
         }
-    }
-    // --- allocation / lookup -------------------------------------------------
+    }    // --- allocation / lookup -------------------------------------------------
 
     /// Allocates a fresh pid, reusing a free slot with a bumped serial.
     ///
@@ -520,15 +534,24 @@ impl ProcessTable {
     /// Removes the outgoing monitor `watcher` holds under `reference`, reporting whether it
     /// existed.
     ///
+    /// The reference may name a **local** monitor (the ordinary case, whose incoming entry on
+    /// the target is dropped too) or an outgoing **remote** monitor, which is removed from the
+    /// table and routed to the remote node as a `DOP_DEMONITOR_P` control signal.
+    ///
     /// # Errors
     ///
-    /// Returns `BeamError::TermNotFound` when the watcher is unknown.
+    /// Returns `BeamError::TermNotFound` when the watcher is unknown; propagates the router's
+    /// transport errors for a remote monitor.
     pub fn demonitor(&mut self, watcher: ProcessId, reference: MonitorRef) -> Result<bool> {
-        let Some(process) = self.get_mut(watcher) else {
+        if !self.contains(watcher) {
             return Err(error::unknown_process());
-        };
-        let Some(monitor) = process.monitors_mut().remove(reference) else {
-            return Ok(false);
+        }
+        let local = self
+            .get_mut(watcher)
+            .and_then(|process| process.monitors_mut().remove(reference));
+        let Some(monitor) = local else {
+            // No local monitor under that reference: it may be an outgoing remote one.
+            return self.demonitor_remote(watcher, reference);
         };
         // Drop the matching incoming entry from the (still living) target.
         if let Some(target) = self.get_mut(monitor.target) {
@@ -536,6 +559,37 @@ impl ProcessTable {
                 .monitored_by_mut()
                 .retain(|entry| entry.reference != reference);
         }
+        Ok(true)
+    }
+
+    /// Removes the outgoing **remote** monitor `watcher` holds under `reference`, reporting
+    /// whether it existed, and routes the `DOP_DEMONITOR_P` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the router's transport errors.
+    fn demonitor_remote(&mut self, watcher: ProcessId, reference: MonitorRef) -> Result<bool> {
+        let (monitor, emptied) = {
+            let Some(monitors) = self.remote_monitors.get_mut(&watcher) else {
+                return Ok(false);
+            };
+            let Some(index) = monitors
+                .iter()
+                .position(|monitor| monitor.reference == reference)
+            else {
+                return Ok(false);
+            };
+            let monitor = monitors.remove(index);
+            (monitor, monitors.is_empty())
+        };
+        if emptied {
+            self.remote_monitors.remove(&watcher);
+        }
+        self.route(DistSignal::Demonitor {
+            watcher,
+            target: monitor.remote,
+            reference,
+        })?;
         Ok(true)
     }
 
@@ -625,10 +679,344 @@ impl ProcessTable {
                 }
             }
 
+            // 4. Remote links and monitors: a dying process leaves the node's records, and
+            //    every remote link partner must be told the process is gone. This runs before
+            //    `drop(process)` because `reason` may live in the dying heap the router reads.
+            for remote in self.remote_links.remove(&pid).unwrap_or_default() {
+                self.route(DistSignal::Exit {
+                    from: pid,
+                    to: remote,
+                    reason,
+                })?;
+            }
+            // Outgoing *remote* monitors die with the watcher: the remote node will simply
+            // never see a `DOP_DEMONITOR_P`, which mirrors the local case above.
+            self.remote_monitors.remove(&pid);
+
             // Every copy that read `reason` from the dying heap is done — release it.
             drop(process);
         }
 
+        Ok(())
+    }
+
+    // --- remote (distributed) links and monitors -----------------------------
+
+    /// Installs the distribution seam the table routes remote signals through.
+    ///
+    /// Without a router the table is **record-only**: local relationships are tracked but no
+    /// wire control signal is emitted (see [`ProcessTable::route`]).
+    pub fn set_dist_router(&mut self, router: Box<dyn DistSignalRouter>) {
+        self.router = Some(router);
+    }
+
+    /// Takes the distribution seam out of the table, returning it to the caller.
+    pub fn take_dist_router(&mut self) -> Option<Box<dyn DistSignalRouter>> {
+        self.router.take()
+    }
+
+    /// Whether a distribution seam is installed.
+    pub fn has_dist_router(&self) -> bool {
+        self.router.is_some()
+    }
+
+    /// Routes `signal` through the distribution seam, if one is installed.
+    ///
+    /// With no seam the local record stands and the signal is dropped: the relationship is
+    /// still known to the table, there is simply nowhere to send it.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the router's transport failure (an unknown/unconnected node, an I/O error).
+    fn route(&mut self, signal: DistSignal) -> Result<()> {
+        match &mut self.router {
+            Some(router) => router.route(signal),
+            None => Ok(()),
+        }
+    }
+
+    /// `erlang:link/1` against an arbitrary pid term: a local pid links through
+    /// [`ProcessTable::link`], an external pid is recorded as a remote link and routed as a
+    /// `DOP_LINK` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `b` is not a pid; for a local `b`,
+    /// propagates [`ProcessTable::link`]'s `BeamError::TermNotFound`; for a remote `b`,
+    /// `BeamError::TermNotFound` when `a` is unknown; and the router's transport errors.
+    pub fn link_term(&mut self, a: ProcessId, b: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(b)? {
+            PidTarget::Local(pid) => self.link(a, pid),
+            PidTarget::Remote(remote) => {
+                if !self.contains(a) {
+                    return Err(error::unknown_process());
+                }
+                let links = self.remote_links.entry(a).or_default();
+                // Like `Links::add`: a re-link of an already-linked pair changes nothing.
+                if !links.contains(&remote) {
+                    links.push(remote);
+                }
+                self.route(DistSignal::Link { from: a, to: remote })
+            }
+        }
+    }
+
+    /// `erlang:unlink/1` against an arbitrary pid term: a local pid unlinks through
+    /// [`ProcessTable::unlink`], an external pid drops the recorded remote link and routes a
+    /// `DOP_UNLINK_ID` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `b` is not a pid; for a local `b`,
+    /// propagates [`ProcessTable::unlink`]'s `BeamError::TermNotFound`; and the router's
+    /// transport errors.
+    pub fn unlink_term(&mut self, a: ProcessId, b: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(b)? {
+            PidTarget::Local(pid) => self.unlink(a, pid),
+            PidTarget::Remote(remote) => {
+                let emptied = match self.remote_links.get_mut(&a) {
+                    Some(links) => {
+                        if let Some(index) = links.iter().position(|entry| *entry == remote) {
+                            links.remove(index);
+                        }
+                        links.is_empty()
+                    }
+                    None => false,
+                };
+                if emptied {
+                    // An emptied link set carries no information.
+                    self.remote_links.remove(&a);
+                }
+                self.route(DistSignal::Unlink { from: a, to: remote })
+            }
+        }
+    }
+
+    /// `erlang:monitor/2` against an arbitrary pid term: a local pid monitors through
+    /// [`ProcessTable::monitor`], an external pid is recorded as an outgoing remote monitor and
+    /// routed as a `DOP_MONITOR_P` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `target` is not a pid; for a local
+    /// `target`, propagates [`ProcessTable::monitor`]'s `BeamError::TermNotFound`; for a remote
+    /// `target`, `BeamError::TermNotFound` when `watcher` is unknown; and the router's transport
+    /// errors.
+    pub fn monitor_term(
+        &mut self,
+        watcher: ProcessId,
+        target: Eterm,
+        kind: MonitorKind,
+    ) -> Result<MonitorRef> {
+        match PidTarget::from_eterm(target)? {
+            PidTarget::Local(pid) => self.monitor(watcher, pid, kind),
+            PidTarget::Remote(remote) => {
+                if !self.contains(watcher) {
+                    return Err(error::unknown_process());
+                }
+                let reference = self.refs.next();
+                self.remote_monitors
+                    .entry(watcher)
+                    .or_default()
+                    .push(RemoteMonitor {
+                        reference,
+                        remote,
+                        kind,
+                    });
+                self.route(DistSignal::Monitor {
+                    watcher,
+                    target: remote,
+                    reference,
+                    kind,
+                })?;
+                Ok(reference)
+            }
+        }
+    }
+
+    /// `erlang:exit/2` against an arbitrary pid term: a local pid exits through
+    /// [`ProcessTable::send_exit`], an external pid is routed as a `DOP_EXIT` control signal.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when `to` is not a pid; for a local `to`,
+    /// propagates [`ProcessTable::send_exit`]'s errors; and the router's transport errors.
+    pub fn send_exit_term(&mut self, from: ProcessId, to: Eterm, reason: Eterm) -> Result<()> {
+        match PidTarget::from_eterm(to)? {
+            PidTarget::Local(pid) => self.send_exit(from, pid, reason),
+            PidTarget::Remote(remote) => self.route(DistSignal::Exit {
+                from,
+                to: remote,
+                reason,
+            }),
+        }
+    }
+
+    /// The remote link partners recorded for `pid`.
+    ///
+    /// A pid that is no longer live resolves to nothing — the same rule
+    /// [`ProcessTable::whereis`] applies to a name whose process is gone.
+    pub fn remote_links(&self, pid: ProcessId) -> &[RemotePid] {
+        if !self.contains(pid) {
+            return &[];
+        }
+        self.remote_links
+            .get(&pid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// The outgoing remote monitors recorded for `pid`.
+    ///
+    /// A pid that is no longer live resolves to nothing (see
+    /// [`ProcessTable::remote_links`]).
+    pub fn remote_monitors(&self, pid: ProcessId) -> &[RemoteMonitor] {
+        if !self.contains(pid) {
+            return &[];
+        }
+        self.remote_monitors
+            .get(&pid)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// A whole remote **node** went away (its distribution connection dropped): every local
+    /// relationship with that node is resolved the way the signals would have been, had the
+    /// node been alive to send them, and then purged.
+    ///
+    /// This is a collect-then-apply sweep, matching the crate's discipline (the table is the
+    /// only place that mutates two processes at once, so it never mutates while iterating):
+    ///
+    /// 1. every outgoing monitor on `node` queues `{'DOWN', Ref, process, RemotePid, Reason}`
+    ///    on its watcher and wakes a blocked watcher;
+    /// 2. every link to `node` follows [`exit_policy`] on the local peer: `Ignore` does
+    ///    nothing, `Trap` queues `{'EXIT', RemotePid, Reason}`, anything else terminates the
+    ///    peer (with the usual cascading propagation);
+    /// 3. every record mentioning `node` is purged.
+    ///
+    /// `reason` is the node-down reason (an immediate such as `noconnection`) and is embedded
+    /// verbatim — there is no source heap to copy it from, so the caller must pass a term that
+    /// does not live in a heap that may be recycled underneath this call.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the message builders' `BeamError::Alloc` (after a collection) and the
+    /// cascading termination's errors.
+    pub fn node_down(&mut self, node: Eterm, reason: Eterm) -> Result<()> {
+        // 1. Monitors: snapshot the (watcher, monitor) pairs that watch `node`.
+        let down: Vec<(ProcessId, RemoteMonitor)> = self
+            .remote_monitors
+            .iter()
+            .flat_map(|(watcher, monitors)| {
+                monitors
+                    .iter()
+                    .filter(|monitor| monitor.remote.node() == node)
+                    .map(move |monitor| (*watcher, *monitor))
+            })
+            .collect();
+        for (watcher, monitor) in down {
+            self.enqueue_remote_down_message(watcher, monitor.reference, monitor.remote, reason)?;
+        }
+
+        // 2. Links: snapshot the (peer, remote) pairs linked to `node`.
+        let linked: Vec<(ProcessId, RemotePid)> = self
+            .remote_links
+            .iter()
+            .flat_map(|(peer, partners)| {
+                partners
+                    .iter()
+                    .filter(|remote| remote.node() == node)
+                    .map(move |remote| (*peer, *remote))
+            })
+            .collect();
+        for (peer, remote) in linked {
+            let Some(process) = self.get(peer) else {
+                // The peer died earlier in this sweep.
+                continue;
+            };
+            let trapping = process.is_trapping_exit();
+            match exit_policy(reason, trapping, &self.atoms) {
+                ExitPolicy::Ignore => {}
+                ExitPolicy::Trap => self.enqueue_remote_exit_message(peer, remote, reason)?,
+                ExitPolicy::Terminate(peer_reason) => self.terminate(peer, peer_reason)?,
+            }
+        }
+
+        // 3. Purge every record mentioning `node`: the relationships are gone with it.
+        for partners in self.remote_links.values_mut() {
+            partners.retain(|remote| remote.node() != node);
+        }
+        self.remote_links.retain(|_, partners| !partners.is_empty());
+        for monitors in self.remote_monitors.values_mut() {
+            monitors.retain(|monitor| monitor.remote.node() != node);
+        }
+        self.remote_monitors
+            .retain(|_, monitors| !monitors.is_empty());
+        Ok(())
+    }
+
+    /// Enqueues `{'DOWN', Ref, process, RemotePid, Reason}` into `watcher`'s mailbox — built on
+    /// the watcher's own heap — and wakes a blocked watcher.
+    ///
+    /// An unknown watcher is skipped (it died earlier in the same sweep).
+    fn enqueue_remote_down_message(
+        &mut self,
+        watcher: ProcessId,
+        reference: MonitorRef,
+        remote: RemotePid,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, watcher) else {
+                return Ok(());
+            };
+            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let from = remote.to_eterm(heap)?;
+                let term =
+                    build_down_message_remote(heap, atoms, reference_term, remote, reason)?;
+                Ok((term, from, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(watcher);
+        }
+        Ok(())
+    }
+
+    /// Enqueues `{'EXIT', RemotePid, Reason}` into `peer`'s mailbox — built on the peer's own
+    /// heap — and wakes a blocked peer.
+    ///
+    /// An unknown peer is skipped (it died earlier in the same sweep).
+    fn enqueue_remote_exit_message(
+        &mut self,
+        peer: ProcessId,
+        remote: RemotePid,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, peer) else {
+                return Ok(());
+            };
+            let (term, from, off_heap) = build_signal_term(recipient, |heap| {
+                let from = remote.to_eterm(heap)?;
+                let term = build_exit_message_term(heap, atoms, from, reason)?;
+                Ok((term, from, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(peer);
+        }
         Ok(())
     }
 
