@@ -560,10 +560,10 @@ mod tests {
         default_out_dir, render_human, render_list_grouped, to_json_string, write_json_value,
         CaseReport, ListReport, RunReport, Summary, SCHEMA,
     };
-    use crate::compare::{FieldDiff, GoldenCheck, SideResult, Verdict};
+    use crate::compare::{verdict_with, FieldDiff, GoldenCheck, Observables, SideResult, Verdict};
     use crate::corpus::{find_case, Contract};
-    use crate::harness::run_case;
-    use crate::runtime::{Observation, RuntimeId, RuntimeSource, RuntimeSpec};
+    use crate::harness::{run_case, run_case_in, RuntimeContext};
+    use crate::runtime::{resolve_oracle, Observation, RuntimeId, RuntimeSource, RuntimeSpec};
     use std::path::PathBuf;
 
     fn spec(id: RuntimeId, program: &str, source: RuntimeSource) -> RuntimeSpec {
@@ -756,11 +756,51 @@ mod tests {
         assert!(text.contains("golden=ok"));
     }
 
-    /// The report of a real (oracle-backed) run of an expression case must never claim
-    /// agreement for a capability-gap side. Skipped loudly when the oracle is unavailable.
+    /// A real (oracle-backed) run must never report *fabricated* agreement.
+    ///
+    /// The property is pinned deterministically, independent of how capable the Rust
+    /// runtime is today: with **no** Rust runtime the Rust side is necessarily
+    /// `Unsupported`, so the verdict can never be `Agree`. When the runtime *is* capable
+    /// the report's verdict must equal the one re-derived from the recorded observations,
+    /// and an `Agree` must be backed by an identical stdout + exit status. Skipped loudly
+    /// when the oracle is unavailable.
     #[test]
     fn a_real_run_never_reports_fabricated_agreement() {
         let case = find_case("etf/term_to_binary_tuple").expect("case");
+
+        // (1) A real oracle run with NO Rust runtime: the Rust side is necessarily
+        //     `Unsupported`, so the report can never claim agreement.
+        let oracle = match resolve_oracle() {
+            Ok(oracle) => oracle,
+            Err(err) => {
+                eprintln!("SKIP: oracle erl not available ({err})");
+                return;
+            }
+        };
+        let no_rust = RuntimeContext {
+            oracle,
+            rust: None,
+        };
+        let outcome = match run_case_in(&no_rust, case) {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                eprintln!("SKIP: oracle erl not available ({err})");
+                return;
+            }
+        };
+        assert!(
+            !outcome.rust.is_observed(),
+            "no Rust runtime ⇒ the Rust side must be unsupported"
+        );
+        let report = RunReport::from_case("run", &outcome);
+        assert_eq!(report.schema, SCHEMA);
+        assert_ne!(report.cases[0].verdict, Verdict::Agree);
+        assert_eq!(report.summary.agree, 0);
+
+        // (2) The same property, still meaningful once the runtime IS capable: re-run the
+        //     case against the real resolved runtime and require the report's verdict to be
+        //     exactly the one re-derived from the recorded observations, so a fabricated
+        //     `Agree` can never survive.
         let outcome = match run_case(case) {
             Ok(outcome) => outcome,
             Err(err) => {
@@ -769,9 +809,21 @@ mod tests {
             }
         };
         let report = RunReport::from_case("run", &outcome);
-        assert_eq!(report.schema, SCHEMA);
-        assert_ne!(report.cases[0].verdict, Verdict::Agree);
-        assert_eq!(report.summary.agree, 0);
+        let rederived =
+            verdict_with(&outcome.oracle, &outcome.rust, &outcome.golden, Observables::All);
+        assert_eq!(report.cases[0].verdict, rederived);
+        if rederived == Verdict::Agree {
+            let oracle_obs = outcome.oracle.observation().expect("oracle observed");
+            let rust_obs = outcome.rust.observation().expect("rust observed");
+            assert_eq!(
+                rust_obs.stdout, oracle_obs.stdout,
+                "an Agree must be backed by identical stdout"
+            );
+            assert_eq!(
+                rust_obs.exit_code, oracle_obs.exit_code,
+                "an Agree must be backed by an identical exit status"
+            );
+        }
     }
 
     #[test]
