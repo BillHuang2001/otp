@@ -118,8 +118,11 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `pub enum OffHeapEntry { Mso(MsoHandle), Binary(beam_alloc::RefcBinary) }` — an entry of the per-process
   off-heap list: `overhead_bytes()`/`apparent_size()` (Mso → the MSO's apparent size; Binary → `len()`),
   `as_mso() -> Option<&MsoHandle>`, `as_binary() -> Option<&RefcBinary>`; `From<MsoHandle>`/`From<RefcBinary>`.
-- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)`, `len()`,
-  `is_empty()`, `overhead_bytes()` (the summed off-heap payload bytes, not the `Vec` capacity), and
+- `pub struct OffHeap` — the per-process list (`MSO(p)`): `push(impl Into<OffHeapEntry>)` (a
+  slot-discarding append), `insert(impl Into<OffHeapEntry>) -> usize` (append returning the slot — the
+  index an on-heap off-heap reference stores in its `val` word), `get(slot) -> Option<&OffHeapEntry>`,
+  `iter() -> impl Iterator<Item = &OffHeapEntry>`, `len()`, `is_empty()`, `overhead_bytes()` (the summed
+  off-heap payload bytes, not the `Vec` capacity), and
   `sweep<F: FnMut(&OffHeapEntry) -> bool>(is_live) -> usize` (retains the entries a collection found live,
   releasing the rest — dropping a `Binary` decrements its refcount and frees the payload at zero; dropping
   an `Mso` runs the MSO destructor at zero). The caller supplies the liveness predicate (see Known Gaps).
