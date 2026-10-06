@@ -574,6 +574,7 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   fun-classification chain inside `Encoder::encode`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
+- `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
 - `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
   `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`,
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
