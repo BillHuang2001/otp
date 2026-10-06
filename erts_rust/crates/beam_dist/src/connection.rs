@@ -80,7 +80,7 @@
 //! "short read" semantics. A refused handshake carries the peer's status text in
 //! `Io(ErrorKind::ConnectionRefused)`.
 
-use std::net::TcpStream;
+use std::net::{SocketAddr, TcpListener as StdTcpListener, TcpStream};
 use std::time::Duration;
 
 use beam_alloc::Heap;
@@ -203,6 +203,64 @@ impl Write for TcpTransport {
 
     fn flush(&mut self) -> Result<()> {
         std::io::Write::flush(&mut self.stream).map_err(BeamError::Io)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The listening (accepting) side.
+// ---------------------------------------------------------------------------
+
+/// A [`std::net::TcpListener`] adapter: the accepting half of a distribution link.
+///
+/// [`TcpTransport`] covers the connecting side; a node that *listens* for
+/// distribution connections (a published node, `DFLAG_PUBLISHED`) needs the other
+/// half. [`accept`](TcpListener::accept) hands out a [`TcpTransport`] configured
+/// exactly as [`TcpTransport::connect`] configures one (a
+/// [`DEFAULT_READ_TIMEOUT`] read timeout and `TCP_NODELAY`), so an accepted link
+/// cannot stall a caller forever; clear the timeout with
+/// [`TcpTransport::set_read_timeout`] for a deliberately blocking link.
+#[derive(Debug)]
+pub struct TcpListener {
+    /// The underlying standard listener.
+    listener: StdTcpListener,
+}
+
+impl TcpListener {
+    /// Binds `addr` (a `host:port` pair; port `0` asks the OS for a free port —
+    /// read it back with [`local_addr`](TcpListener::local_addr)).
+    pub fn bind(addr: &str) -> Result<TcpListener> {
+        let listener = StdTcpListener::bind(addr).map_err(BeamError::Io)?;
+        Ok(TcpListener { listener })
+    }
+
+    /// The bound address — in particular the actual port when `bind` was passed
+    /// port `0`.
+    pub fn local_addr(&self) -> Result<SocketAddr> {
+        self.listener.local_addr().map_err(BeamError::Io)
+    }
+
+    /// Accepts one connection and returns the transport for it, ready for
+    /// [`accept_server`] / [`Connection::server`].
+    ///
+    /// The returned transport carries [`DEFAULT_READ_TIMEOUT`] and `TCP_NODELAY`.
+    pub fn accept(&self) -> Result<TcpTransport> {
+        let (stream, _peer) = self.listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(DEFAULT_READ_TIMEOUT))?;
+        transport.set_nodelay(true)?;
+        Ok(transport)
+    }
+
+    /// Sets the listener non-blocking (a subsequent [`accept`](TcpListener::accept)
+    /// with no pending connection then reports
+    /// [`std::io::ErrorKind::WouldBlock`] as a [`BeamError::Io`]).
+    pub fn set_nonblocking(&self, nonblocking: bool) -> Result<()> {
+        self.listener.set_nonblocking(nonblocking).map_err(BeamError::Io)
+    }
+
+    /// Consumes the adapter, returning the underlying standard listener.
+    pub fn into_inner(self) -> StdTcpListener {
+        self.listener
     }
 }
 
@@ -447,6 +505,48 @@ fn accept_server_with<T: Transport>(
 }
 
 // ---------------------------------------------------------------------------
+// Connecting to a published node via `epmd`.
+// ---------------------------------------------------------------------------
+
+/// Connects to a **published node** by `epmd` lookup: resolves `node_name`'s listen
+/// port with [`crate::epmd::lookup_port`], opens a TCP link to `host:port` and
+/// completes the client handshake.
+///
+/// `host` is the host *part* of the node name — the address to connect to, since
+/// this crate owns no name resolution — and `node_name` is the peer's registered
+/// node name (`name@host` is *not* accepted here: `epmd` is queried with the bare
+/// name, exactly as `PORT2_REQ` requires). `our_name`/`cookie` are this node's name
+/// and the shared cookie.
+///
+/// The client advertises [`CLIENT_CREATION`] as its own creation; use
+/// [`connect_to_node_with_creation`] to advertise an explicit one.
+pub fn connect_to_node(
+    host: &str,
+    node_name: &[u8],
+    our_name: &[u8],
+    cookie: &[u8],
+) -> Result<Connection<TcpTransport>> {
+    connect_to_node_with_creation(host, node_name, our_name, cookie, CLIENT_CREATION)
+}
+
+/// [`connect_to_node`] advertising an explicit node `creation`.
+///
+/// A peer with `DFLAG_BIG_CREATION` may reject [`CLIENT_CREATION`] (`0`); this entry
+/// point sends the given `creation` in the `Name` frame instead (see
+/// [`Connection::client_with_creation`]).
+pub fn connect_to_node_with_creation(
+    host: &str,
+    node_name: &[u8],
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+) -> Result<Connection<TcpTransport>> {
+    let port = crate::epmd::lookup_port(node_name)?;
+    let transport = TcpTransport::connect(&format!("{host}:{port}"))?;
+    Connection::client_with_creation(transport, our_name, cookie, creation)
+}
+
+// ---------------------------------------------------------------------------
 // The established connection.
 // ---------------------------------------------------------------------------
 
@@ -597,6 +697,66 @@ impl<T: Transport> Connection<T> {
             Dop::Send
         };
         self.send_control(dop, &[from, to, msg], atoms)
+    }
+
+    /// Sends `{DOP_REG_SEND, From, Cookie, ToName}` with `msg` as the trailing
+    /// message term (`dist.c:2468`: `/* {DOP_REG_SEND, From, Cookie, ToName} --
+    /// Message */`, [`Dop::RegSend`], arity 3 **plus** the message).
+    ///
+    /// `cookie` is the `tuple[3]` atom (the empty atom in practice — the cookie is
+    /// also implicitly carried by the external pids; `dist.c:2469-2500` checks it
+    /// against the connection's own), and `to_name` is the **registered process
+    /// name** the message is delivered to.
+    pub fn send_reg_send(
+        &mut self,
+        from: Eterm,
+        cookie: Eterm,
+        to_name: Eterm,
+        msg: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.send_control(Dop::RegSend, &[from, cookie, to_name, msg], atoms)
+    }
+
+    /// Sends `{DOP_LINK, From, To}` (`dist.c:2224`, [`Dop::Link`], arity 2).
+    pub fn send_link(&mut self, from: Eterm, to: Eterm, atoms: &AtomTable) -> Result<()> {
+        self.send_control(Dop::Link, &[from, to], atoms)
+    }
+
+    /// Sends `{DOP_EXIT, From, To, Reason}` (`dist.c:2760`, [`Dop::Exit`], arity 3).
+    pub fn send_exit(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        reason: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.send_control(Dop::Exit, &[from, to, reason], atoms)
+    }
+
+    /// Sends `{DOP_MONITOR_P, Remote, Local, Ref}` (`dist.c:2341`,
+    /// [`Dop::MonitorP`], arity 3): `from` asks to monitor `to`, identified by
+    /// `reference`.
+    pub fn send_monitor_p(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        reference: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.send_control(Dop::MonitorP, &[from, to, reference], atoms)
+    }
+
+    /// Sends `{DOP_DEMONITOR_P, Remote, Local, Ref}` (`dist.c:2415`,
+    /// [`Dop::DemonitorP`], arity 3): cancels the monitor `from` holds on `to`.
+    pub fn send_demonitor_p(
+        &mut self,
+        from: Eterm,
+        to: Eterm,
+        reference: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<()> {
+        self.send_control(Dop::DemonitorP, &[from, to, reference], atoms)
     }
 
     /// Sends a tick (a zero-length packet).

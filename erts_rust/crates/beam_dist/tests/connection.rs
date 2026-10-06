@@ -12,7 +12,7 @@
 //! ([`TEST_TIMEOUT`]), so a wire bug surfaces as a failed assertion rather than a
 //! hung suite.
 
-use std::net::TcpListener;
+use std::net::{SocketAddr, TcpListener};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
@@ -20,7 +20,7 @@ use std::time::Duration;
 use beam_alloc::Heap;
 use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT};
 use beam_common::BeamError;
-use beam_dist::connection::{Connection, TcpTransport};
+use beam_dist::connection::{Connection, TcpListener as DistListener, TcpTransport};
 use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
 use beam_dist::flags::Dop;
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
@@ -563,4 +563,115 @@ fn client_with_creation_advertises_its_creation_to_the_peer() {
 
     assert_eq!(server.peer_creation(), 42, "the server sees the client's creation");
     assert_eq!(client.peer_creation(), SERVER_CREATION, "and vice versa");
+}
+
+// ---------------------------------------------------------------------------
+// (h) The crate's own listener adapter + the typed `DOP_*` send helpers.
+// ---------------------------------------------------------------------------
+
+/// Binds loopback, starts the server thread over the crate's own
+/// [`DistListener`], and connects the client.
+///
+/// Returns the live client connection and the server thread's handle (join it
+/// with [`joined`]).
+fn connect_pair_over_listener() -> (Connection<TcpTransport>, ServerHandle) {
+    let listener = DistListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = thread::spawn(move || {
+        let transport = listener.accept()?;
+        Connection::server(transport, SERVER_NAME, COOKIE, SERVER_CREATION)
+    });
+    let client = Connection::client(
+        TcpTransport::connect(&addr.to_string()).expect("connect to server"),
+        CLIENT_NAME,
+        COOKIE,
+    )
+    .expect("client handshake");
+    (client, server)
+}
+
+#[test]
+fn the_listener_adapter_binds_accepts_and_into_inner_round_trips() {
+    let listener = DistListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr: SocketAddr = listener.local_addr().expect("local_addr");
+    assert_ne!(addr.port(), 0, "port 0 must resolve to a real, free port");
+
+    // `into_inner` hands back the standard listener unchanged.
+    let std_listener = listener.into_inner();
+    assert_eq!(std_listener.local_addr().expect("local_addr"), addr);
+}
+
+#[test]
+fn a_nonblocking_listener_reports_would_block_instead_of_hanging() {
+    let listener = DistListener::bind("127.0.0.1:0").expect("bind loopback");
+    listener.set_nonblocking(true).expect("set_nonblocking(true)");
+
+    // No pending connection ⇒ the accept must fail fast rather than block.
+    match listener.accept() {
+        Err(BeamError::Io(err)) => assert_eq!(err.kind(), std::io::ErrorKind::WouldBlock),
+        other => panic!("expected WouldBlock, got {other:?}"),
+    }
+
+    listener.set_nonblocking(false).expect("set_nonblocking(false)");
+}
+
+/// The typed send helpers put the opcode and its arguments in the
+/// [`Dop::arity`] order the C receive path validates (`dist.c`), and the peer
+/// decodes every one of them.
+#[test]
+fn the_typed_send_helpers_round_trip_over_the_listener() {
+    let (mut client, server) = connect_pair_over_listener();
+    let mut server = joined(server);
+
+    assert_eq!(client.peer_name(), SERVER_NAME);
+    assert_eq!(server.peer_name(), CLIENT_NAME);
+
+    let mut atoms = AtomTable::new();
+    let mut client_heap = Heap::new(8192).expect("client heap");
+    let mut server_heap = Heap::new(8192).expect("server heap");
+
+    let from = make_atom(atoms.intern("from"));
+    let to = make_atom(atoms.intern("to"));
+    let cookie = make_atom(atoms.intern(""));
+    let to_name = make_atom(atoms.intern("registered"));
+    let reason = make_atom(atoms.intern("normal"));
+    let reference = make_small(17);
+    let message = client_heap
+        .tuple(&[make_atom(atoms.intern("hello")), make_small(42)])
+        .expect("build the message tuple");
+
+    // `{DOP_REG_SEND, From, Cookie, ToName} -- Message` — arity 3 *plus* the
+    // trailing message term (`dist.c:2468`).
+    client
+        .send_reg_send(from, cookie, to_name, message, &atoms)
+        .expect("send_reg_send");
+    let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_REG_SEND");
+    assert_eq!(got.dop, Dop::RegSend);
+    assert_eq!(got.terms.len(), 4, "From, Cookie, ToName and the message");
+    assert_eq!(&got.terms[..3], &[from, cookie, to_name]);
+    assert_eq!(body_image(got.terms[3], &atoms), body_image(message, &atoms));
+
+    // `{DOP_LINK, From, To}` — arity 2.
+    client.send_link(from, to, &atoms).expect("send_link");
+    let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_LINK");
+    assert_eq!(got.dop, Dop::Link);
+    assert_eq!(got.terms, vec![from, to]);
+
+    // `{DOP_EXIT, From, To, Reason}` — arity 3.
+    client.send_exit(from, to, reason, &atoms).expect("send_exit");
+    let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_EXIT");
+    assert_eq!(got.dop, Dop::Exit);
+    assert_eq!(got.terms, vec![from, to, reason]);
+
+    // `{DOP_MONITOR_P, Remote, Local, Ref}` — arity 3.
+    client.send_monitor_p(from, to, reference, &atoms).expect("send_monitor_p");
+    let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_MONITOR_P");
+    assert_eq!(got.dop, Dop::MonitorP);
+    assert_eq!(got.terms, vec![from, to, reference]);
+
+    // `{DOP_DEMONITOR_P, Remote, Local, Ref}` — arity 3.
+    client.send_demonitor_p(from, to, reference, &atoms).expect("send_demonitor_p");
+    let got = server.recv(&mut server_heap, &mut atoms).expect("recv DOP_DEMONITOR_P");
+    assert_eq!(got.dop, Dop::DemonitorP);
+    assert_eq!(got.terms, vec![from, to, reference]);
 }
