@@ -1,5 +1,4 @@
 # `beam_message` — Copy Engine (`copy_struct`) & Messaging
-
 ## Intent
 Owns the **copy half of the process memory model**: moving a term graph between two process heaps
 (`copy_struct`) and the data-level messaging primitives built on it — the `Message` envelope, the
@@ -14,16 +13,13 @@ Ground truth = the legacy C `erts/emulator/beam/copy.c` (`copy_struct_x` — the
 iterative copier; `size_object_x`; `erts_move_multi_frags`), `erl_message.c`/`erl_message.h`
 (the `ErtsMessage` envelope, `ErlHeapFragment`, the message queue) and the `OffHeap`/MSO rule of
 `erl_gc.c`. Read the C; never modify it.
-
 ## Inheritance (binding)
 Obeys the crate-layer `../CONTEXT.md` contracts verbatim: frozen term layout (§2 — construct/inspect
 **only** through `beam_term`), return-based errors (§3 — `beam_common::Result<T>`, no panics, no
 crate-local error enum), `unsafe` confinement (marked modules, `# Safety`/`// SAFETY:`),
 `unsafe_op_in_unsafe_fn` clean, ~1000-line files, licensing Apache-2.0. **Do not restate them here.**
-
 ## API Surface (the seam dependents design against)
 Re-exported at the crate root and via `beam_message::prelude::*`.
-
 ### `copy.rs` — the copy engine (the `unsafe` core)
 - `pub struct CopyContext<'a>` — the copy boundary: the source process's off-heap table (to resolve
   off-heap references) and the destination's (where referenced off-heap objects are re-registered).
@@ -34,14 +30,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `pub fn copy_struct(term: Eterm, to: &mut beam_alloc::Heap, ctx: &mut CopyContext<'_>) -> Result<Eterm>`
   — copy `term`'s graph into `to`, returning the copied root. **Iterative** (an explicit worklist —
   deep lists never recurse on the native stack). Immediates and literal-area terms are **shared**
-  (returned unchanged); cons cells, tuples/records, funs, flatmaps and off-heap containers are
-  copied. Off-heap references are **refcounted**, never deep-copied.
+  (returned unchanged); cons cells, tuples/records, funs, flat maps (a `flatmap`) and **hash maps**
+  (the whole HAMT trie — every node kind: head-array, head-bitmap, inner node-bitmap — plus its leaf
+  cons cells and collision tuples), and off-heap containers are copied. Off-heap references are
+  **refcounted**, never deep-copied.
 - `pub fn copy_struct_simple(term: Eterm, to: &mut beam_alloc::Heap) -> Result<Eterm>` — the common
   case with empty off-heap tables (graphs that contain no off-heap references).
 - `pub fn size_of_copy(term: Eterm) -> usize` — thin forwarder to `beam_term::size_object` (the total
   flat word count `copy_struct` preflights against `Heap::available`). Exposed so callers/tests can
   size a destination heap without re-deriving it.
-
 ### `message.rs` — the envelope and the queue
 - `pub struct Message` — the copied payload plus sender identity and the off-heap objects it owns.
   - `Message::new(payload: Eterm, from: Eterm) -> Message` (token = `NIL`, no off-heap objects)
@@ -64,7 +61,6 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   **monotonic scan position** over a `Queue`, not a stable handle: `remove_at` shifts every later
   position, so a cursor outstanding across a removal is stale and callers re-derive one via
   `Queue::cursor()` (the engine does exactly this: remove the match, then reset to the first message).
-
 ### `mailbox.rs` — send / receive primitives (data level)
 - `pub fn send(from: Eterm, term: Eterm, to_heap: &mut Heap, to_queue: &mut Queue, ctx: &mut CopyContext<'_>) -> Result<()>`
   — copy `term` into `to_heap`, collect the off-heap objects it references, build the `Message` and
@@ -75,10 +71,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   skeleton). Waiting, `after` timeouts, the save queue and signal ordering live in `beam_process`.
 - `pub fn receive_ref<F: FnMut(&Message) -> bool>(queue: &Queue, pred: F) -> Option<&Message>` —
   non-destructive variant.
-
 ### `off_heap.rs` — the off-heap (MSO) reference table
 - `pub use beam_gc::MsoHandle;` — the off-heap object handle is **beam_gc's** (MSO object + atomic
-  `RefCount`); this crate never re-implements MSO.
+  `RefCount`); this crate never re-implements (nor re-stores) MSO.
 - `pub struct OffHeapTable` — a **slot-indexed** table of `MsoHandle`s (slot = the on-heap
   off-heap-reference's `val` word). A thin MSO-typed façade whose storage is delegated to
   `beam_gc::OffHeap` (the workspace's single owner of the off-heap list); it adds only the
@@ -94,7 +89,6 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   - `into_handles`/`drain_handles` **clone-then-drop** each handle (refcount++ then refcount-- when
     the consumed list drops), because `beam_gc::OffHeap` has no move-out API — net refcount is
     unchanged, so behaviour matches the previous move-based implementation.
-
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only.** Heap exhaustion mid-copy ⇒
   `BeamError::Alloc(AllocFailure::new(AllocKind::Message, bytes))` — **never panic**, never a
@@ -106,11 +100,11 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `unsafe_op_in_unsafe_fn` stays clean.
 - **Never assume a different `Eterm` layout** — read headers/words through `beam_term` accessors.
   The frozen word layouts (cons `[CAR,CDR]`, header words, `BinRef [thing_word,val,next]`) are the
-  contract; interiors that are not externally pinned (hashmap HAMT shape) are documented approximations.
+  contract; interiors that are not externally pinned are read through the owning `beam_term` accessors
+  (e.g. the HAMT node shapes via `map_header_type`/`map_header_val`/`header_arity`), never re-derived.
 - **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_codec`, `beam_gc`,
-  `libc`. The `beam_gc` edge is **new** (see Design Decisions) and must be reported to `../`.
+  `libc` (the `beam_gc` edge is described under Design Decisions).
 - Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
-
 ## Design Decisions
 - **Fidelity scope: a correct, iterative *tree* copy, not the C's single-allocation `htop`/`hbot`
   layout.** The C pre-sizes (`size_object`), then bumps lists up from the heap base and boxed things
@@ -127,16 +121,14 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   returned as-is — the literal bit means the term is permanent and heap-independent. The zero-arity
   tuple (`HEADER_ARITYVAL` with arity 0) is the shared `beam_term::tuple0()` literal and is returned
   as-is.
-- **`beam_gc` is a new dependency; MSO is reused, not reimplemented.** The off-heap object, its atomic
-  `RefCount`, its owning `MsoHandle` and the per-process off-heap list are **entirely
-  `beam_gc::mso`'s**. `beam_gc::OffHeap` now exposes slot-indexed read access additively
-  (`insert`/`get`/`iter`), so the copy boundary reads the source process's off-heap objects to
-  re-register (refcount) them straight from the shared storage — `off_heap.rs` holds **no duplicate
-  storage**: `OffHeapTable` is a thin MSO-typed façade over `beam_gc::OffHeap` that adds only the
-  `MsoHandle`-typed accessors the copier needs. No new object model and no new refcounting.
-  **Dependency edge `beam_message → beam_gc` is new** (acyclic: `beam_gc` depends only on the
-  wave-0/1 foundations and never on `beam_message`) and is reported to `../` for the routing table;
-  `Cargo.toml` is updated here.
+- **MSO is reused from `beam_gc`, not reimplemented.** The off-heap object, its atomic `RefCount`,
+  its owning `MsoHandle` and the per-process off-heap list are **entirely `beam_gc::mso`'s**.
+  `beam_gc::OffHeap` exposes slot-indexed read access (`insert`/`get`/`iter`), so the copy boundary
+  reads the source process's off-heap objects to re-register (refcount) them straight from the shared
+  storage — `off_heap.rs` holds **no duplicate storage**: `OffHeapTable` is a thin MSO-typed façade
+  over `beam_gc::OffHeap` that adds only the `MsoHandle`-typed accessors the copier needs. No new
+  object model and no new refcounting. The `beam_message → beam_gc` edge is acyclic (`beam_gc`
+  depends only on the wave-0/1 foundations and never on `beam_message`).
 - **Off-heap reference term — the M1 encoding (documented substitution).** An off-heap reference is
   the frozen `BinRef` container thing `[HEADER_BIN_REF, val, next]` (`ERL_BIN_REF_SIZE = 3`). There is
   no on-heap binary handle type yet (binaries are a documented upstream gap — `beam_codec` returns
@@ -153,12 +145,13 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - **`size_object` is used, not re-derived.** `beam_term::size_object` (`size_object_x` port) gives the
   total word count for the capacity preflight; a tiny local `layout::object_words` gives the
   *single-object* word count the incremental allocator needs — the same split as `beam_gc::copy`'s
-  `move_size` (a single-object size is a different function from the graph total). Both are documented
-  against `copy.c`'s `move_boxed`/`size_object_x`.
-
+  `move_size` (a single-object size is a different function from the graph total). All three are
+  documented against `copy.c`'s `move_boxed`/`size_object_x`, and all three size/walk every HAMT node
+  kind with the same `1 + header_arity + popcount(MAP_HEADER_VAL)` formulation, so a hash map copies
+  as a whole trie.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` per module: `layout` (per-object word counts + child-slot
-  enumeration for tuple/record/fun/flatmap/off-heap container), `off_heap` (slot push/get/clone bumps
+  enumeration for tuple/record/fun/flatmap/**HAMT node**/off-heap container), `off_heap` (slot push/get/clone bumps
   the refcount; `into_handles`; `drain_handles` empties the table and leaves it re-usable with slots
   restarting at 0), `message` (builder + accessors; `Queue` FIFO/`peek`/`len`/`clear`;
   cursor start/`position`, FIFO `advance` saturating past the end, `remove_at` shifting the rest,
@@ -177,6 +170,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
      is rewritten, and the payload was **not** deep-copied.
   5. **Heap exhaustion** — copying a graph larger than the destination heap returns
      `BeamError::Alloc(AllocKind::Message)` and never panics.
+  6. **HAMT (>32-key) map** — a 40-key map built with `beam_term::map::write_map` copies as a whole
+     trie: `compare::eq`, `map_size`/`map_get` on the copy, `dst.used() == size_object(map)`, a
+     preserved hash-map head kind, and matching sub-node counts source-vs-copy.
 - **`tests/queue.rs`** — `send` copies into the receiver heap + enqueues; FIFO order; `receive` selects
   (and removes) the first matching message and leaves non-matching ones queued; `receive_ref` borrows;
   a cursor scans candidates (advance on a miss) and removes the match while the scanned-over messages
@@ -185,7 +181,6 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness, not here.
-
 ## Known Issues / Intentional M1 gaps
 - **No sharing-preserving copy.** A subterm that appears twice is copied twice (C's default
   `copy_struct` behaviour); the separate C sharing-preserving copier is out of scope. Only immediates,
@@ -195,41 +190,31 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   (fixed-size thing words); its interior has no navigable child on-heap terms in M1, and a `SUB_BITS`
   whose `orig` points at a source-heap object is copied as-is (a documented gap, unreachable until a
   binary constructor exists).
-- **Hashmaps (HAMT) are approximated.** A non-flatmap `MAP_SUBTAG` head is copied by its head-node
-  word count only (`thing_arityval + 1`), matching `beam_term::size_object`'s documented approximation;
-  deep HAMT nodes are not walked. Flatmaps (`≤ MAP_SMALL_MAP_LIMIT`) are copied correctly (keys tuple +
-  values). Maps are not constructible in M1 anyway.
 - **External pid/port/ref are copied verbatim** (their words are raw/immediate; the node field is an
   atom). C links them into `off_heap` via a node registry that does not exist yet.
 - **Fragmented messages (`ErlHeapFragment`, `erts_move_multi_frags`) are a documented follow-up.**
   Large messages that do not fit a process heap fragment stream across buffers in C; M1 assumes the
   destination heap can hold the copy (exhaustion ⇒ `AllocKind::Message`). `Fragments`/`HeapFragment`
   land when `beam_process`'s heap management and the binary layer exist.
-- **`beam_gc::OffHeap` is read-only-indexable here but never swept.** The copy boundary reads the
-  source off-heap objects via `off_heap.rs`'s `OffHeapTable`, which delegates storage to
-  `beam_gc::OffHeap` (the single owner) and therefore never calls `sweep` (which would compact and
-  shift the stable slot indices). Off-heap reclamation belongs to the collector (`beam_gc`).
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
 - **`Message.token` is a plain field (`NIL` when absent).** The seq-trace / distribution-token
   machinery that fills it is `beam_dist`/`beam_rt`.
-
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
-- `src/layout.rs` → per-object word counts + child-slot enumeration + the off-heap container encoding
+- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + the off-heap container encoding
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`); MSO handle re-export
 - `src/message.rs` → `Message` envelope + `Queue` FIFO
 - `src/mailbox.rs` → `send` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors (no new error type)
-- `tests/copy.rs` → copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion
+- `tests/copy.rs` → copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
 - `../../erts/emulator/beam/copy.c` → the authoritative copier (`copy_struct_x`/`size_object_x`/`erts_move_multi_frags`) (read-only)
 - `../../erts/emulator/beam/erl_message.h` / `erl_message.c` → the message envelope, `ErlHeapFragment`, queue layout (read-only)
 - `../../erts/emulator/beam/erl_gc.c` → the MSO/`OffHeap` sweep rule (`sweep_off_heap`) (read-only)
 - `../beam_gc/` → the collector + `MsoHandle`/`RefCount`/`OffHeap` this crate depends on (sibling — read-only, escalate writes to `..`)
-
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = the
   `beam_loader`-adjacent wave-2 messaging node; consumes wave-0/1 foundations + `beam_gc`).
