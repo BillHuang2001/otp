@@ -12,10 +12,18 @@
 //!
 //! # Readiness model
 //!
-//! The poller's backend is **edge-triggered** (`mio` registers descriptors with
+//! The poller's `mio` backend is **edge-triggered** (`mio` registers descriptors with
 //! `EPOLLET`), so every callback must drain to `EAGAIN`: [`FdDriver::ready_input`] reads
 //! until the fd is empty (or reports EOF) and the write path loops until the queue is
 //! drained or the kernel buffer is full.
+//!
+//! A **regular file**, which `epoll` refuses, is served by the poller's `poll(2)`-based
+//! fallback readiness source instead (see [`crate::poller`]) — and that source is
+//! *level*-triggered. Because a read fd at end-of-file can never become ready again,
+//! [`FdDriver::ready_input`] latches EOF and then **de-registers** the read fd: it stops the
+//! level-triggered fallback from reporting an exhausted regular file forever. The fd itself
+//! stays attached (and owned) until [`Driver::stop`], so a further post-EOF `ready_input`
+//! still answers `Ok` (a no-op) rather than `badarg`.
 //!
 //! # Input phases and line buffering
 //!
@@ -234,7 +242,9 @@ impl FdDriver {
 
     /// Deregisters and closes the attached read fd, if any (the `efile` `close` path).
     ///
-    /// A deregistration failure is reported but the fd is closed either way.
+    /// A deregistration failure is reported but the fd is closed either way, and an fd that
+    /// was already de-registered (a read fd that reached end-of-file, see
+    /// [`FdDriver::disarm_input`]) is still closed.
     ///
     /// # Errors
     ///
@@ -242,16 +252,41 @@ impl FdDriver {
     pub(crate) fn release_read_fd(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         self.read_eof = false;
         let token = self.in_token.take();
-        match (token, self.read_fd.take()) {
-            (Some(token), Some(fd)) => {
-                let result = ctx.deregister(fd, token);
-                // SAFETY: `fd` is owned by this driver and has just been removed from the
-                // struct, so it is closed exactly once.
-                let _ = unsafe { libc::close(fd) };
-                result
-            }
-            _ => Ok(()),
+        let fd = self.read_fd.take();
+        let mut result = Ok(());
+        if let (Some(token), Some(fd)) = (token, fd) {
+            result = ctx.deregister(fd, token);
         }
+        if let Some(fd) = fd {
+            // SAFETY: `fd` is owned by this driver and has just been removed from the
+            // struct, so it is closed exactly once.
+            let _ = unsafe { libc::close(fd) };
+        }
+        result
+    }
+
+    /// Drops the read-fd registration, so no further read-readiness events arrive for it.
+    ///
+    /// Only the poll registration is removed: the fd stays attached (and owned) — that is
+    /// what [`FdDriver::ready_input`] needs after it latches end-of-file, since a further
+    /// post-EOF call must still answer `Ok` rather than `badarg`.
+    ///
+    /// Used when the read fd reaches end-of-file. The `mio` registrations are
+    /// edge-triggered and would stop on their own, but a descriptor served by the poller's
+    /// regular-file fallback is *level*-triggered and would report readiness forever; a
+    /// read fd with no data left can never become ready again, so removing the
+    /// registration is correct for both sources.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::Io` when the poller rejects the deregistration.
+    fn disarm_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        if let Some(token) = self.in_token.take() {
+            if let Some(fd) = self.read_fd {
+                ctx.deregister(fd, token)?;
+            }
+        }
+        Ok(())
     }
 
     /// Arms write readiness for `fd` — registering it the first time, re-registering it
@@ -412,10 +447,13 @@ impl Driver for FdDriver {
                 continue;
             }
             if n == 0 {
-                // End of file: release any trailing partial line and latch EOF so no
-                // further reads are attempted on this fd.
+                // End of file: release any trailing partial line, latch EOF so no further
+                // reads are attempted on this fd, and drop the read registration — the fd
+                // can never become readable again, and a level-triggered fallback source
+                // would otherwise keep reporting it.
                 self.flush_input(ctx);
                 self.read_eof = true;
+                self.disarm_input(ctx)?;
                 return Ok(());
             }
             let err = std::io::Error::last_os_error();
