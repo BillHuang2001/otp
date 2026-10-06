@@ -250,6 +250,34 @@ Ground truth `../../erts/emulator/beam/erl_nif.c` (`erts_load_nif`, line 4729) �
 - Empirical raw outputs (module `m`, NIF entry name `m`): success `ok`; missing path → `{error,{load_failed,"Failed to load NIF library: '.../nope.so: cannot open shared object file: No such file or directory'"}}`; text file → `{error,{load_failed,"Failed to load NIF library: '.../nota.so: file too short'"}}`; major 99 → `{error,{bad_lib,"That 'm' NIF library needs erts-99.0 or newer. ..."}}`; no `nif_init` → `{error,{bad_lib,"Failed to find library init function: '.../emptysym.so: undefined symbol: _nif_init'"}}`; reload → `{error,{reload,"NIF library already loaded (reload disallowed since OTP 20)."}}`; `-on_load` calling `load_nif` succeeds and the module's NIF is callable; `apply/3` → the stub error. Return type is the atom `ok` / `{error,_}`; callable from `-on_load/0` (must return `ok`) or an ordinary function.
 - (Note: in this Nix-packaged runtime `code:lib_dir(erts,include)` points at a non-existent path; the real header is `.../lib/erlang/erts-17.1/include/erl_nif.h`.)
 
+## NIF host layer (implemented)
+### `enif_*` functions (`src/nif/enif.rs`)
+Every one is `#[no_mangle] pub unsafe extern "C"` with the exact signature of its matching `nif::api`
+field. Implemented:
+- **allocation** `enif_alloc`/`enif_free`/`enif_realloc` (libc-backed), `enif_alloc_binary`/`enif_realloc_binary`/`enif_release_binary`;
+- **binaries/ETF** `enif_inspect_binary`, `enif_inspect_iolist_as_binary`, `enif_make_new_binary`, `enif_make_binary`, `enif_make_sub_binary`, `enif_term_to_binary`, `enif_binary_to_term`;
+- **accessors** `enif_get_int/uint/long/ulong/double`, `enif_get_atom`, `enif_get_atom_length`, `enif_get_string`, `enif_get_string_length`, `enif_get_tuple`, `enif_get_list_cell`, `enif_get_list_length`, `enif_get_map_size`, `enif_get_map_value`;
+- **predicates/compare** `enif_is_atom/binary/ref/fun/pid/port/empty_list/list/tuple/map/number/exception`, `enif_is_identical`, `enif_compare`, `enif_term_type`, `enif_term_size`, `enif_hash`, `enif_get_atom_cache_index`, `enif_max_atom_cache_index`;
+- **constructors** `enif_make_int/uint/long/ulong/double`, `enif_make_atom(_len)`, `enif_make_new_atom(_len)`, `enif_make_tuple_from_array`, `enif_make_list_cell`, `enif_make_list_from_array`, `enif_make_reverse_list`, `enif_make_string(_len)`, `enif_make_ref`;
+- **maps** `enif_make_new_map`, `enif_make_map_put`, `enif_make_map_update`, `enif_make_map_from_arrays`;
+- **exceptions/misc** `enif_make_badarg`, `enif_raise_exception`, `enif_has_pending_exception`, `enif_clear_env`, `enif_self`, `enif_get_local_pid`, `enif_get_local_port`, `enif_set_pid_undefined`, `enif_is_pid_undefined`; plus the non-table LP64 aliases `enif_get_int64/uint64` + `enif_make_int64/uint64`.
+
+`pub fn enif_api_table() -> &'static ErlNifApi` returns a `#[used] static` populated with `Some` for every implemented slot (built with `..ErlNifApi::empty()`, now a `const fn`). The `#[used]` static is what keeps the `#[no_mangle]` symbols in the final link — a test that calls `enif_api_table()` also forces the symbol-bearing codegen unit into the link.
+
+**Intentionally `None`:** the C-variadic entries `enif_make_tuple`, `enif_make_list`, `enif_set_option`, `enif_fprintf`, `enif_snprintf`, `enif_vfprintf`, `enif_vsnprintf` (stable Rust 1.98 cannot *define* a C-variadic `fn`; the `_from_array` variants cover tuple/list building), plus the resource / thread / ioq / select / monitor / time / `enif_send` / `enif_schedule_nif` / `whereis_*` / `priv_data` / `alloc_env` / map-iterator / `make_existing_atom` surfaces (owned by subsystems not yet wired through the `NifHost` seam).
+
+### Dynamic loader (`src/nif/loader.rs`)
+`load(path, module, host, load_info) -> Result<NifLibrary, NifLoadError>` does `dlopen(path+".so", RTLD_NOW|RTLD_LOCAL)`, `dlsym("nif_init")` (fallback `_nif_init`), then validates in the oracle's exact order (the table above) and invokes `entry.load`. `NifLibrary::call(env, name, arity, args)` looks the function up by `(name, arity)`, calls `fptr(env.as_ptr(), arity, args.as_ptr())`, and turns a pending env exception into `NifCallError::Raised`. `Drop` runs `entry.unload` then `dlclose`. `Reload`/`Upgrade`/`OldCode` variants exist for surface completeness but `load()` never produces them (no module-instance / old-code state here).
+
+### Symbol-export mechanism (load-bearing)
+A NIF `.so` leaves `enif_*` **undefined** and the dynamic linker binds them, at `dlopen(RTLD_NOW)`, against the **loading process's** dynamic symbol table. `build.rs` emits `cargo::rustc-link-arg-tests=-Wl,--export-dynamic` so each `beam_abi` test binary exports its globals. Proven: `nm -D --undefined-only test_nif.so` lists the six used `enif_*` as `U`; the same names appear `T` (defined) in the test binary's `.dynsym`; and loading the same `.so` from a process that does **not** export them fails with `undefined symbol: enif_make_int`. (`cargo::rustc-link-arg-bins` must NOT be emitted — this package has no `[[bin]]` and cargo hard-errors.)
+
+### Known gaps
+- `ErlNifApi::enif_make_map_remove` is declared with **3** parameters (`(env, map_in, map_out)`) in the frozen `nif::api`, but the real C symbol takes **4** (`env, map_in, key, map_out`). The slot is left `None` rather than export an ABI-mismatched symbol; the frozen table was deliberately not changed — flagged to the table owner.
+- `enif_make_map_*` / `enif_compare` / `enif_is_identical` / `enif_hash` take no env, hence no host/atom table: identical terms take a raw-word fast path and distinct **atoms** fall back to `beam_term`'s index order (exact for non-atom keys, the common NIF case).
+- Integers: small ints + one-limb bignums; a wider value makes the accessor return `0` rather than truncate. `enif_make_binary` builds an **on-heap** binary (off-heap refc binaries are not exposed by the seam). `enif_inspect_binary` refuses a *bit*-offset base instead of fabricating an unaligned pointer.
+- Malformed-term guard: a bare `THE_NON_VALUE` / `HEADER`-tagged word is rejected at the term-inspecting entry points (the C would deref it); a *forged* pointer-tagged word is still undetectable from the word alone, exactly as in the C.
+
 ## Routing Table
 - `build.rs` → the link-flag build script: `-Wl,--export-dynamic` on the test targets (a NIF `.so` resolves `enif_*` out of the loading process); nothing else
 - `src/lib.rs` → crate docs, module wiring, root re-exports (`NifEnv`/`NifHost` included), the ABI **version constants** (`ERL_NIF_*`, `ERL_DRV_EXTENDED_*`, `ERL_NIF_VM_VARIANT`, `ERL_NIF_MIN_ERTS_VERSION`)
