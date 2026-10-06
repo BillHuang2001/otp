@@ -223,6 +223,16 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("disconnect_node", 1),
     ("monitor_node", 2),
     ("monitor_node", 3),
+    // `port_command/2,3` is a **pending** entry: a parallel workstream implements it in
+    // the runtime's port provider. Until that work lands in this tree the name must stay
+    // listed, so the call is the typed capability gap `unsupported: …` (exit 3) rather
+    // than a plain `not a BIF` diagnostic — the differential harness counts the former as
+    // `unsupported` and the latter as a MISMATCH. The entry is dead weight, not a hazard,
+    // once the provider serves it: `is_known_unimplemented_bif` intersects this list with
+    // the live registry (and the native floor is consulted first), so an implemented
+    // `port_command` is never shadowed by it. Remove it when the provider lands.
+    ("port_command", 2),
+    ("port_command", 3),
     ("port_connect", 2),
     ("port_control", 3),
     ("port_call", 3),
@@ -482,12 +492,11 @@ mod tests {
     }
 
     #[test]
-    fn the_spawn_family_and_port_command_are_no_longer_curated_gaps() {
-        // The native floor serves `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`
-        // and the runtime's port provider serves `port_command/2,3`. Keeping any of them
-        // in the curated list would be dead weight (they are answered before the
-        // `erlang`-namespace fallback is reached at all) and the `/4` arities OTP does
-        // not have must not be presented as a documented capability gap either.
+    fn the_spawn_family_is_no_longer_a_curated_gap() {
+        // The native floor serves `spawn/1,2,3`, `spawn_link/1,2,3` and `spawn_opt/2,3,4`.
+        // Keeping any of them in the curated list would be dead weight (they are answered
+        // before the `erlang`-namespace fallback is reached at all) and the `/4` arities
+        // OTP does not have must not be presented as a documented capability gap either.
         for (function, arity) in [
             ("spawn", 1u32),
             ("spawn", 2),
@@ -500,14 +509,18 @@ mod tests {
             ("spawn_opt", 2),
             ("spawn_opt", 3),
             ("spawn_opt", 4),
-            ("port_command", 2),
-            ("port_command", 3),
         ] {
             assert!(
                 !listed_as_unimplemented(function, arity),
                 "erlang:{function}/{arity} must no longer be a curated gap"
             );
         }
+        // `port_command/2,3` is deliberately still curated: a parallel workstream owns
+        // the implementation, and until it lands in this tree the call must remain the
+        // typed `unsupported:` gap (never the plain `not a BIF` diagnostic, which the
+        // harness counts as a mismatch).
+        assert!(listed_as_unimplemented("port_command", 2));
+        assert!(listed_as_unimplemented("port_command", 3));
     }
 
     #[test]
