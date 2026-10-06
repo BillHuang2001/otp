@@ -387,11 +387,10 @@ holds `Process` values directly.
   synchronously; the queue, its ordering guarantees vs. messages, and "pending signal" introspection
   are follow-ups.
 - **Priority run queues** (max/high/normal/low), `erlang:process_flag(priority, …)` and port tasks.
-- **Process dictionary** (`erl_process_dict.c`): the per-process `put/get/erase` term dictionary is
-  not modelled; it is a sub-rootset the collector must also scan — a follow-up (as is
-  `erlang:process_info/1`'s view of it).
-- **Saved BIF/NIF arguments and heap fragments** as extra sub-rootsets (`erts_proc_sig_queue` fragments,
-  `ErlHeapFragment` copy-in) — follow-ups; M1 assumes a message fits the receiver's young heap
+- **Process-dictionary interior and heap fragments.** The dictionary is modelled as a flat key/value
+  list (no hash-array interior), and `erlang:process_info/1`'s view of it is still absent. A real
+  in-heap `ErlHeapFragment` (a `beam_gc`/`beam_message`-owned type, still absent) is not modelled: saved
+  args are a plain `Eterm` root list and M1 assumes a message fits the receiver's young heap
   (collect-and-retry once).
 - **Distribution-wide links/monitors** (`erl_monitor_link.c`'s node part): only local pids are linked/
   monitored; a link/monitor to an external pid is rejected or ignored, not routed through `beam_dist`.
