@@ -192,26 +192,6 @@ fn exact_results_fold_back_into_small_integers() {
 
 /// Comparison of a bignum against a specific term — the order itself is
 /// `beam_term::compare`'s; `beam_bifs` never re-derives term order.
-///
-/// # Scope note: two upstream `beam_term` ordering defects
-///
-/// `beam_term::thing::write_big` stores a bignum header's arity as `digits - 1`,
-/// but `beam_term::compare` reads that field *as* the digit count:
-///
-/// 1. `number_as_f64` — the arithmetic-mode (`==`, `<`, `>`, `=<`, `>=`)
-///    bignum→`f64` conversion — drops the most significant limb, so
-///    `(1 bsl 70) > 1.0` compares `false` (oracle `true`).
-/// 2. `cmp_bigs` — the exact-mode bignum/bignum loop — also drops the most
-///    significant limb, so `(63 bsl 128) =:= (1 bsl 134)` compares `true`
-///    (oracle `false`).
-///
-/// Both are pre-existing and live in the sibling `beam_term` crate, so this test
-/// pins only the pairs that are exact today: a `small` against a `big` (decided
-/// by the bignum's sign, `cmp_numbers`' `(Small, Big)` arms), a `big` against
-/// itself, and single-limb bignums. `beam_bifs` must not re-implement term order
-/// (crate `CONTEXT.md`, Constraints) — the defects are reported upstream instead,
-/// together with the `beam_term::thing::write_big` header-arity deviation from
-/// the C `BIG_ARITY` (which is the digit count, `big.h:70`).
 #[test]
 fn mixed_small_and_bignum_comparisons_use_the_term_order() {
     let mut fx = Fixture::new();
