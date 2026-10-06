@@ -26,9 +26,11 @@ use crate::store::TermStore;
 
 mod access;
 mod element;
+mod ownership;
 mod update;
 
 pub use access::TableAccess;
+pub use ownership::{Heir, SetOpt};
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
 use update::{object_arity, read_counter};
 
@@ -324,6 +326,8 @@ pub struct Table {
     opts: TableOptions,
     /// The owning process, if known.
     owner: Option<OwnerId>,
+    /// The heir installed with `ets:setopts/2` (`{heir, Pid, Data}`), if any.
+    heir: Option<Heir>,
     /// The table-owned term storage (the copy boundary).
     store: TermStore,
     /// The interior index dispatching the table ops.
@@ -350,6 +354,7 @@ impl Table {
             id,
             opts,
             owner: None,
+            heir: None,
             store,
             interior,
         })
@@ -393,6 +398,57 @@ impl Table {
         self.owner = owner;
     }
 
+    /// `ets:give_away/3`. Transfers ownership from `caller` to `new_owner`.
+    ///
+    /// `badarg` (owner unchanged) when `caller` is not the current owner, when
+    /// `new_owner` is `None` (no live target process — the crate's stand-in for the
+    /// oracle's non-pid/dead-pid target), or when `new_owner` is the current owner
+    /// (the caller's own pid). On success the owner becomes `new_owner`; the
+    /// `{'ETS-TRANSFER', …}` message to the new owner is the BIF/runtime layer's
+    /// job, not this crate's (see [`super::ownership`]).
+    pub fn give_away(
+        &mut self,
+        caller: Option<OwnerId>,
+        new_owner: Option<OwnerId>,
+    ) -> Result<()> {
+        // Mirror the C `ets_give_away_3` order: bad-pid check, then the
+        // not-owner check, then the self-gift check — all `badarg`.
+        let Some(new_owner) = new_owner else {
+            return Err(badarg());
+        };
+        if caller != self.owner {
+            return Err(badarg());
+        }
+        if Some(new_owner) == self.owner {
+            return Err(badarg());
+        }
+        self.owner = Some(new_owner);
+        Ok(())
+    }
+
+    /// The table's current heir, if any.
+    pub fn heir(&self) -> Option<Heir> {
+        self.heir
+    }
+
+    /// Set (or clear) the heir directly (owner-level primitive; no access check).
+    pub fn set_heir(&mut self, heir: Option<Heir>) {
+        self.heir = heir;
+    }
+
+    /// `ets:setopts/2` for the `{heir, ...}` option: requires `caller` to be the
+    /// current owner (`badarg` otherwise), then installs/clears the heir.
+    pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()> {
+        if caller != self.owner {
+            return Err(badarg());
+        }
+        match opt {
+            SetOpt::Heir(heir) => self.heir = Some(heir),
+            SetOpt::ClearHeir => self.heir = None,
+        }
+        Ok(())
+    }
+
     /// A snapshot of the table's introspection fields.
     pub fn info(&self) -> TableInfo {
         TableInfo {
@@ -404,6 +460,7 @@ impl Table {
             size: self.interior.size(),
             memory: self.memory(),
             owner: self.owner,
+            heir: self.heir.map(|h| h.owner),
             named_table: self.opts.is_named(),
             compressed: self.opts.is_compressed(),
             write_concurrency: self.opts.write_concurrency(),

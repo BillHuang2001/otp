@@ -92,6 +92,10 @@ impl Table {
     pub fn access(&self) -> Access;
     pub fn owner(&self) -> Option<OwnerId>;
     pub fn set_owner(&mut self, owner: Option<OwnerId>);
+    pub fn give_away(&mut self, caller: Option<OwnerId>, new_owner: Option<OwnerId>) -> Result<()>;
+    pub fn heir(&self) -> Option<Heir>;
+    pub fn set_heir(&mut self, heir: Option<Heir>);
+    pub fn setopts(&mut self, caller: Option<OwnerId>, opt: SetOpt) -> Result<()>;
     pub fn info(&self) -> TableInfo;
 
     // writes (object = the whole tuple; key derived from keypos)
@@ -151,6 +155,16 @@ impl Table {
   object on the caller's heap (what the B+-tree needs); the hash interior overrides the element
   updates with **destructive in-place writes**. Private — **not** part of the cross-crate API.
 
+### `table/ownership.rs` — `ets:give_away/3` + the `{heir, ...}` option
+- `pub struct Heir { pub owner: OwnerId, pub data: Eterm }` — a table heir (the inheriting
+  process + the `{'ETS-TRANSFER', Tab, FromPid, GiftData}` gift data).
+- `pub enum SetOpt { Heir(Heir), ClearHeir }` — the parsed `{heir, ...}` option of
+  `ets:setopts/2` (the subset modelled).
+- The module holds the oracle semantics for `Table::give_away`/`setopts` (see Design Decisions)
+  and the **pid-gap** documentation: a `None` new owner stands in for a non-pid/dead pid target,
+  an unknown table id is the registry/BIF layer's concern, and a set heir renders as `undefined`
+  (no pid term).
+
 ### `table/access.rs` — the access-enforcing view
 - `pub struct TableAccess<'a>` (from `Table::as_requester`) — rechecks `can_read`/`can_write` on
   every op and raises `BeamError::BadArg` on a violation, exactly like `ets`. It wraps the **whole**
@@ -163,6 +177,9 @@ impl Table {
   `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
   wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
   `next_key`/`prev_key` with exact B+-tree searches, but the access layer sits above the `Table`).
+  The two ownership wrappers are requester-implicit: `give_away(&mut self, new_owner: Option<OwnerId>)
+  -> Result<()>` (the requester is the caller; **no** `protection` check — ownership is not a
+  read/write op) and `setopts(&mut self, opt: SetOpt) -> Result<()>` (owner-gated, like the oracle).
   The underlying `Table` methods stay owner-level primitives (no access check). The matrix is
   verified against the system `erl` (OTP 29 / erts-17.1).
 
@@ -215,12 +232,14 @@ impl Table {
 
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
-  Option<OwnerId>, named_table: bool, compressed: bool, write_concurrency: bool, read_concurrency: bool }`;
+  Option<OwnerId>, heir: Option<OwnerId>, named_table: bool, compressed: bool, write_concurrency:
+  bool, read_concurrency: bool }`;
   `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — the heap-free `{Key, Value}`
   pairs of the oracle's **15** `ets:info/1` fields, in the oracle's order (`id`,
   `decentralized_counters`, `read_concurrency`, `write_concurrency`, `compressed`, `memory`, `owner`,
-  `heir`, `name`, `size`, `node`, `named_table`, `type`, `keypos`, `protection`). `heir`/`node` are the
-  runtime-shape constants `none`/`nonode@nohost`; `decentralized_counters` follows the oracle's CATREE
+  `heir`, `name`, `size`, `node`, `named_table`, `type`, `keypos`, `protection`). `heir` is the atom
+  `none` when unset and `undefined` when set (a pid gap — see below) and `node` is the runtime-shape
+  constant `nonode@nohost`; `decentralized_counters` follows the oracle's CATREE
   rule (`ordered_set && write_concurrency`); `owner` (a pid in the oracle) renders as `undefined` and
   `id` as a small integer (see Known Issues). The *observable* `ets:info/1` proplist is built by the
   sibling `beam_bifs` bridge, not by this method — see the Known Issues handoff.
@@ -308,8 +327,15 @@ impl Table {
   (the reverse of the C `fields[]` array in `erl_db.c:4406`). `heir`/`node` are the runtime-shape
   constants `none`/`nonode@nohost`; `decentralized_counters` is `ordered_set && write_concurrency` (the
   oracle's CATREE rule — the explicit `{decentralized_counters, Bool}` creation option is unsupported).
-  No field was added to the public `TableInfo` struct; the runtime-shape fields are computed in
-  `entries`.
+  The public `TableInfo` gained a structured `heir: Option<OwnerId>` field (the *pid* only — the gift
+  data is never reported), populated by `Table::info`; the rendering-only runtime-shape fields are
+  still computed in `entries`.
+- **Ownership/heir semantics are a `Table`-level concern, not an access-mode one.** `give_away/3` and
+  `setopts/2` do **not** consult `protection`; they are owner-gated (the oracle's
+  `EXI_NOT_OWNER`/`EXI_OWNER` `badarg`s). `give_away` follows the C `ets_give_away_3` order (bad-pid →
+  not-owner → self-gift, all `badarg`, owner unchanged on failure); `setopts` requires the caller to be
+  the owner. The heir is stored as a full `Heir` (pid + gift data) for the runtime's `{'ETS-TRANSFER',…}`
+  message, but `ets:info` renders only the pid — which this crate cannot represent (the documented gap).
 - **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
   mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
   unchanged, as the oracle does.
@@ -319,13 +345,14 @@ impl Table {
   split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
   `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
   (incl. the `insert`-retained-bool), B+-tree invariants (incl. 10 000-key churn), select
-  compile/execute, info. 91 unit tests.
+  compile/execute, info. 96 unit tests.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
   `entries_emits_the_oracle_field_set_in_order`), `ets_nav.rs` (incl. the order-independent
-  hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 61 ETS tests + 18 select
+  hash-navigation contract), `ets_access.rs`, `ets_update.rs`, `ets_ownership.rs` (the
+  `give_away`/`setopts`/`heir` semantics + the pid-gap rendering), sharing helpers from
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 68 ETS tests + 18 select
   tests.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 77 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
@@ -348,13 +375,24 @@ impl Table {
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
-- **`ets:info/1` `owner` is `undefined` and `id` is a small integer.** `TableInfo::entries` emits the
+- **`ets:info/1` `owner`/`heir` are `undefined` and `id` is a small integer.** `TableInfo::entries` emits the
   oracle's full 15-field order, but `owner` — a pid in the oracle — has no term representation at this
   stage, so it renders as the atom `undefined`, and `id` renders as a small integer rather than a ref.
-  **Handoff:** the *observable* `ets:info/1` proplist is produced by the sibling `beam_bifs` bridge
+  The `heir` field follows the same convention: `none` when unset, `undefined` when a heir is installed
+  (its structured `TableInfo::heir` still carries the pid). **Handoff:** the *observable* `ets:info/1`
+  proplist is produced by the sibling `beam_bifs` bridge
   (`src/ets.rs`, its own `INFO_ITEMS` + `info_field`), which still emits the older 12-field subset in a
   different order; it must adopt this completed `entries` (or extend `INFO_ITEMS`/`info_field` to the
   15-field oracle set and order). This crate does not own `beam_bifs`.
+- **Ownership modelling has no pid/liveness concept.** `ets:give_away/3` treats a `None` new owner as
+  the oracle's non-pid/dead-pid target (both `badarg`); an *unknown table id* is the registry/BIF
+  layer's concern, not this crate's. The `{'ETS-TRANSFER', Tab, FromPid, GiftData}` message the new
+  owner receives, and the heir hand-off when an owner dies, are the BIF/runtime layer's job — this
+  crate models only the ownership/heir *state*.
+- **`ets:setopts/2` is modelled only for `{heir, ...}`.** The other `setopts/2` options
+  (`{heir, Pid}` arity-2, `{heir, Pid, Data}` duplication-checking, `safe_fixtable`, `{write_concurrency, _}`,
+  …) are out of M1 scope; the crate exposes the `{heir, Pid, Data}` / `{heir, none}` subset via
+  `SetOpt`. `ets:info(T, holder)` has no `holder` item (the oracle is `badarg`) and none is emitted.
 - **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
   `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*
   there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
@@ -421,6 +459,7 @@ live system `erl` (via `erl -noshell -eval`) so a future implementation need not
 - `src/store/tests.rs` → the `TermStore` unit-test module
 - `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, reads/navigation, `select_all`, metadata
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
+- `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
 - `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
 - `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/hash_interior.rs` → `HashInterior` (bucket hash index) for `set`/`bag`/`duplicate_bag`

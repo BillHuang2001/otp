@@ -13,7 +13,9 @@
 //! `erl_db.c`), for every kind, named or not. Three of them are fixed by the
 //! runtime shape rather than by the table:
 //!
-//! * `heir` is always the atom `none` (this crate has no heir support);
+//! * `heir` is the atom `none` when no heir is installed and the atom
+//!   `undefined` when one is (a **documented pid gap**: the oracle reports the
+//!   heir *pid*, which this stage cannot represent — see [`TableInfo::heir`]);
 //! * `node` is always the atom `nonode@nohost` (the runtime is never
 //!   distributed, matching the oracle's `erl -noshell` with no `-sname`);
 //! * `decentralized_counters` is `true` iff the table is an `ordered_set`
@@ -48,6 +50,13 @@ pub struct TableInfo {
     pub memory: usize,
     /// The owning process, if known.
     pub owner: Option<OwnerId>,
+    /// The heir installed with `ets:setopts/2` (`{heir, Pid, _}`), if any.
+    ///
+    /// The introspectable heir is **only the pid**: the gift data is never
+    /// reported by `ets:info/2` (the C `ets_setopts_2` keeps it out of the info
+    /// fields). As with [`owner`](Self::owner) this crate has no pid term, so
+    /// [`TableInfo::entries`] renders a set heir as the atom `undefined`.
+    pub heir: Option<OwnerId>,
     /// Whether the table was created with `named_table`.
     pub named_table: bool,
     /// Whether the table stores compressed terms.
@@ -79,10 +88,11 @@ impl TableInfo {
     /// `write_concurrency`, `compressed`, `memory`, `owner`, `heir`, `name`,
     /// `size`, `node`, `named_table`, `type`, `keypos`, `protection`.
     ///
-    /// `heir`/`node` are the fixed atoms `none`/`nonode@nohost`;
-    /// `decentralized_counters` is `true` iff this is an `ordered_set` with
-    /// `write_concurrency` on (see the module docs); `owner` is the atom
-    /// `undefined` (the documented pid gap).
+    /// `heir` is the atom `none` when unset and `undefined` when an heir is
+    /// installed (the documented pid gap — see [`owner`](Self::owner) and
+    /// [`heir`](Self::heir)); `decentralized_counters` is `true` iff this is an
+    /// `ordered_set` with `write_concurrency` on (see the module docs); `owner`
+    /// is the atom `undefined` (the documented pid gap).
     ///
     /// Heap-free: [`atoms`](AtomTable) is used only to intern the field-name
     /// atoms; values are returned as `(Atom, Eterm)` pairs.
@@ -104,10 +114,14 @@ impl TableInfo {
         // `ordered_set` whose normalized `write_concurrency` flag is on.
         let decentralized_counters =
             bool_term(atoms, self.kind.is_ordered() && self.write_concurrency);
-        // This crate has no heir support and the runtime is never distributed.
-        let heir = atom_term(atoms, "none");
+        // A fresh table's heir is the atom `none`; an installed heir is a pid term
+        // this stage cannot represent (the documented gap), so it is `undefined`.
+        let heir = match self.heir {
+            None => atom_term(atoms, "none"),
+            Some(_) => atom_term(atoms, "undefined"),
+        };
+        // The runtime is never distributed.
         let node = atom_term(atoms, "nonode@nohost");
-
         vec![
             pair(atoms, "id", make_small(self.id.raw() as i64)),
             pair(atoms, "decentralized_counters", decentralized_counters),
