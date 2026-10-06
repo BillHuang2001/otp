@@ -248,7 +248,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
   by `beam_gc`.
-- **Term-carrying structured raise reasons landed (coordinated across three crates).** `beam_common::Raise`
+- **Term-carrying structured raise reasons (coordinated across three crates).** `beam_common::Raise`
   gained an **opaque live-reason slot** — `pub live_reason: Option<LiveReason>`, `Raise::with_live_reason`/
   `raise.live_reason()`, `LiveReason::new<T: Any + Send + Sync + 'static>` + `downcast_ref<T>()` — whose
   payload convention is the **live reason term as a `beam_term::Eterm`**. `ExitReason` is unchanged
