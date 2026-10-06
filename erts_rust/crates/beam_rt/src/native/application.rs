@@ -44,14 +44,18 @@
 //! therefore answers its not-found shape for a non-atom argument rather than raising
 //! `badarg`.
 //!
-//! # One honest deviation
+//! # The one documented deviation
 //!
 //! `application:get_all_env(kernel)` in the oracle reports the **runtime's** environment,
-//! which the kernel application's own start injects extra entries into (it is not equal to
-//! kernel.app's declared `{env, [...]}`). This runtime runs no application start, so it
-//! reports the file's **declared** environment honestly — never a fabricated injected
-//! entry. The declared entries themselves (`net_ticktime` ⇒ `60`, …) agree with the
-//! oracle.
+//! which the kernel application's own start injects extra entries into: it lists **nine**
+//! pairs where `kernel.app` declares **seven**. The two extra ones are `logger` (the
+//! default handler configuration kernel's start installs) and `connect_all` (set on the
+//! distribution/global startup). This runtime runs no application start, so it reports the
+//! file's **declared** environment honestly — the seven the file lists, never a fabricated
+//! injected entry. The declared entries themselves agree with the oracle key-for-key
+//! (`net_ticktime` ⇒ `60`, `logger_level` ⇒ `notice`, …); only their *order* differs,
+//! because the oracle's is its application controller's internal storage order, which no
+//! contract pins. (`length(application:get_all_env(kernel))` ⇒ oracle 9, here 7.)
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
@@ -944,6 +948,42 @@ mod tests {
             make_small(60),
             "the declared value is the file's own 60"
         );
+
+        // The declared key **set** is exactly kernel.app's `{env, [...]}` — seven entries,
+        // in the file's order. The oracle reports nine: its application controller injects
+        // `logger` (the default handler config kernel's own start installs) and
+        // `connect_all` (set on the distribution/global startup) at run time. This runtime
+        // runs no application start, so those two are honestly absent — never fabricated.
+        // Oracle (OTP 29/erts-17.1):
+        //   `length(application:get_all_env(kernel))` ⇒ 9
+        //   `application:get_env(kernel, logger)` ⇒ `{ok, [{handler, default, …}]}`
+        //   `application:get_env(kernel, connect_all)` ⇒ `{ok, true}`
+        let keys: Vec<&str> = entries
+            .iter()
+            .map(|entry| {
+                runtime
+                    .atom_name_of(pair(*entry).0)
+                    .expect("a declared key atom")
+            })
+            .collect();
+        assert_eq!(keys.len(), 7, "kernel.app declares seven env entries: {keys:?}");
+        for declared in [
+            "logger_level",
+            "logger_sasl_compatible",
+            "net_tickintensity",
+            "net_ticktime",
+            "prevent_overlapping_partitions",
+            "shell_docs_ansi",
+            "shell_history_drop",
+        ] {
+            assert!(keys.contains(&declared), "{declared} is declared: {keys:?}");
+        }
+        for injected in ["logger", "connect_all"] {
+            assert!(
+                !keys.contains(&injected),
+                "{injected} is injected by the oracle's running application, not declared"
+            );
+        }
     }
 
     // -- loaded_applications/0 and which_applications/0 ------------------------

@@ -367,8 +367,9 @@ fn open_port_spawns_a_real_os_process() {
             "erlang:port_info(open_port({spawn,\"true\"},[]), connected)",
             "ok true",
         ),
-        // … and `port_close/1` kills and reaps the child, answering `ok`.
-        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok ok"),
+        // … and `port_close/1` kills and reaps the child, answering `true` (the oracle's
+        // value: `erts_internal:port_close/1` returns the atom `true`, not `ok`).
+        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok true"),
     ];
 
     for (expr, expected) in cases {

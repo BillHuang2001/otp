@@ -153,11 +153,10 @@ impl RuntimeContext<'_> {
 
     /// `erlang:pre_loaded/0`: the preloaded module names as a list of atoms.
     ///
-    /// The set is exactly the oracle's; the **order** is this runtime's boot order
-    /// ([`PreloadedModules::names`](crate::PreloadedModules::names), `erlang` first), where
-    /// the oracle iterates an internal table whose order is an implementation detail (its
-    /// head happens to be `persistent_term` on OTP 29/erts-17.1). Only set membership is
-    /// meaningful; no contract pins the order.
+    /// The set **and the order** are the oracle's, verbatim
+    /// ([`PreloadedModules::names`](crate::PreloadedModules::names); verified against OTP
+    /// 29/erts-17.1: `persistent_term` first, `erts_code_purger` last — see
+    /// [`PRELOADED_MODULE_NAMES`](crate::boot::PRELOADED_MODULE_NAMES)).
     pub(super) fn pre_loaded_0(&mut self) -> Result<Eterm> {
         let names: Vec<String> = self
             .runtime
@@ -665,7 +664,7 @@ mod tests {
     }
 
     #[test]
-    fn pre_loaded_lists_the_standard_set_of_atoms() {
+    fn pre_loaded_lists_the_standard_set_of_atoms_in_the_oracles_order() {
         let mut runtime = runtime();
         let modules = call(&mut runtime, "erlang", "pre_loaded", &[]).expect("pre_loaded/0");
         let entries = terms::list_elements(modules).expect("a list");
@@ -678,18 +677,54 @@ mod tests {
             .iter()
             .map(|entry| runtime.atom_name_of(*entry).expect("an atom"))
             .collect();
-        // The oracle's set (OTP 29/erts-17.1); the order is this runtime's boot order.
-        for expected in [
-            "erlang",
-            "erts_internal",
-            "erl_prim_loader",
-            "init",
-            "persistent_term",
-            "zlib",
-        ] {
-            assert!(names.contains(&expected), "{expected} is preloaded: {names:?}");
-        }
+        // The oracle's exact list, **in the oracle's order** (`erl -noshell -eval
+        // 'io:format("~w~n",[erlang:pre_loaded()]),halt(0).'`, OTP 29/erts-17.1).
+        assert_eq!(
+            names,
+            vec![
+                "persistent_term",
+                "counters",
+                "atomics",
+                "erts_dirty_process_signal_handler",
+                "erts_trace_cleaner",
+                "erts_literal_area_collector",
+                "erl_tracer",
+                "erts_internal",
+                "erlang",
+                "erl_prim_loader",
+                "prim_zip",
+                "prim_net",
+                "prim_socket",
+                "socket_registry",
+                "zlib",
+                "prim_file",
+                "prim_inet",
+                "prim_eval",
+                "prim_buffer",
+                "init",
+                "erl_init",
+                "erts_code_purger",
+            ]
+        );
         assert!(!names.contains(&"lists"), "a library module is not preloaded");
+    }
+
+    #[test]
+    fn whereis_init_is_the_runtime_process() {
+        // The oracle registers its `init` process (`erlang:whereis(init)` ⇒ `<0.0.0>`).
+        // Milestone-1 runs no separate `init` process, so the runtime's own root process
+        // stands in for it and is registered under the name at construction — the *same*
+        // pid `erlang:group_leader/0` reports.
+        let mut runtime = runtime();
+        let name = atom(&mut runtime, "init");
+        let answer = call(&mut runtime, "erlang", "whereis", &[name]).expect("whereis/1");
+        assert_eq!(
+            answer,
+            runtime.self_pid().to_eterm(),
+            "whereis(init) is the runtime's own process"
+        );
+        let leader = call(&mut runtime, "erlang", "group_leader", &[]).expect("group_leader/0");
+        assert_eq!(answer, leader, "the init name and the group leader agree");
     }
 
     #[test]

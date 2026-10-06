@@ -56,10 +56,11 @@ impl RuntimeContext<'_> {
     /// `code:all_loaded/0`: `{Module, Beam}` for every preloaded and loaded module.
     ///
     /// `Beam` is the atom `preloaded` for a preloaded module and its `.beam` file path
-    /// (a string) for a loaded one. The preloaded names come first, so the list is never
-    /// empty — as the oracle's always is. The oracle orders the list by load time; here
-    /// the preloaded set is in boot order and the loaded modules are sorted by name
-    /// (neither order is part of any contract).
+    /// (a string) for a loaded one. The preloaded names come first — in
+    /// [`erlang:pre_loaded/0`](crate::PreloadedModules::names)'s order — so the list is
+    /// never empty, as the oracle's always is. The oracle orders the list by load time;
+    /// here the loaded modules that are not preloaded are sorted by name. Neither order is
+    /// part of any contract, but the preloaded prefix is the oracle's.
     ///
     /// A module loaded **from memory** (no source file: [`CodeServer::load_bytes`]) is
     /// reported with the atom `preloaded` as its `Beam`: Milestone-1 records no load
@@ -389,16 +390,30 @@ mod tests {
                 "the beam is the atom `preloaded` or a path string"
             );
         }
-        // The preloaded set comes first, starting with `erlang`.
+        // The preloaded set comes first, in the oracle's `erlang:pre_loaded/0` order
+        // (`persistent_term` heads the list).
         let first = entries[0];
         assert_eq!(
             runtime.atom_name_of(terms::tuple_element(first, 0).unwrap()),
-            Some("erlang")
+            Some("persistent_term")
         );
         assert_eq!(
             runtime.atom_name_of(terms::tuple_element(first, 1).unwrap()),
             Some("preloaded")
         );
+        // Every preloaded name is present, and `erlang` is one of them.
+        let names: Vec<Option<&str>> = entries
+            .iter()
+            .map(|entry| {
+                runtime.atom_name_of(terms::tuple_element(*entry, 0).expect("the module name"))
+            })
+            .collect();
+        for preloaded in runtime.preloaded().names() {
+            assert!(
+                names.contains(&Some(preloaded)),
+                "{preloaded} is reported: {names:?}"
+            );
+        }
     }
 
     #[test]

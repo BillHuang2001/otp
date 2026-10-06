@@ -519,7 +519,10 @@ impl ExecutionContext for RuntimeContext<'_> {
             return self.call_registered(module, function, arity, args);
         }
         if module == "erlang" {
-            if error::is_known_unimplemented_bif(function, arity) {
+            // The **effective** gap set: the curated list intersected with what the live
+            // registry does not own, so a freshly-registered BIF can never be shadowed (see
+            // `error::is_known_unimplemented_bif`).
+            if error::is_known_unimplemented_bif(&self.runtime.registry, function, arity) {
                 return Err(error::known_unimplemented_bif(function, arity));
             }
             return Err(error::unknown_bif(module, function, arity));

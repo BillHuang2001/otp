@@ -185,6 +185,20 @@ impl Runtime {
         let signals = SignalAtoms::from_table(code_server.atoms_mut());
         let mut processes = ProcessTable::new(signals);
         let self_pid = processes.spawn_default()?;
+        // The runtime's own root process stands in for OTP's `init`: it is the process the
+        // runtime boots and runs the start action as, and the one `erlang:group_leader/0`
+        // already reports (`src/native/process.rs`). Registering the name is what makes
+        // `erlang:whereis(init)` answer that live pid — the oracle answers `<0.0.0>` — and
+        // makes `erlang:registered/0`/`erlang:whereis/1` honest about the runtime's own
+        // name registry rather than reporting an empty one. `init` is in the core-atom seed
+        // interned two lines up, so the lookup cannot miss.
+        let init_name = code_server
+            .atoms()
+            .lookup("init")
+            .ok_or_else(|| error::message("boot: the `init` atom is not seeded"))?;
+        processes
+            .register(init_name, self_pid)
+            .map_err(|_| error::message("boot: the `init` name is already registered"))?;
         // A zero-word heap can hold nothing, so the configured size is floored: the
         // runtime must always be able to run the smallest program.
         let heap_words = config.heap_words.max(MIN_HEAP_WORDS);
