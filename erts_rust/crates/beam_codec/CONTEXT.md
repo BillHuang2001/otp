@@ -62,7 +62,11 @@ Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)]
   `is_empty()`, `u8()`, `u16be()`, `u32be()`, `u64be()`, `bytes(n) -> Result<&'a [u8]>`, `rest()`,
   `peek_u8()`. Any short read ⇒ `BeamError::BadArg` (never a panic, never a silent truncation).
 - `pub struct Writer` — growable sink: `new()`, `with_capacity(n)`, `u8(v)`, `u16be(v)`, `u32be(v)`,
-  `u64be(v)`, `bytes(&[u8])`, `len()`, `is_empty()`, `as_slice()`, `into_vec()`, `clear()`.
+  `u64be(v)`, `bytes(&[u8])`, `len()`, `is_empty()`, `as_slice()`, `into_vec()`, `clear()`, plus the
+  crate-internal `pub(crate) fn patch_u32be(pos, value) -> Result<()>` — the codec's only backward
+  write, used to patch the `NEW_FUN_EXT` total-size field after its body is emitted. It is
+  bounds-checked (`pos + 4 <= len`; an out-of-range `pos` or a `pos + 4` overflow ⇒ `BadArg`), never
+  panics, and never short-writes.
 
 ### `src/atom_cache.rs` — distribution atom cache (`erl_ext_dist.md` §Distribution Header)
 `pub struct AtomCache` — 8 segments × 256 = 2048 slots: `new()`, `set(index: u8, atom)`,
