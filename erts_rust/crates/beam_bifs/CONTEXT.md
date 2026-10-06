@@ -500,7 +500,7 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
     pinned byte-for-byte against the oracle.
   - `tests/io_ets.rs` (4) — `io:format` **exact captured bytes** through a `BytesSink` (`"~p~n"` ⇒
     `{a,1}\n`, `"~w ~s ~b~n"` ⇒ `[97,98,99] a 255\n`), `~d`/`~x` ⇒ `BadArg`.
-  - `tests/ets_ops.rs` (11) — the expanded `ets` bridge over a real `TableRegistry`: `insert`/
+  - `tests/ets_ops.rs` (11) — the `ets` bridge over a real `TableRegistry`: `insert`/
     `insert_new`, `lookup`/`lookup_element`/`member`/`take`, `first`/`last`/`next`/`prev`,
     `update_counter`/`update_element`, `delete`/`delete_object`/`delete_all_objects`, `info`/`tab2list`.
 - **Gate (GREEN required):**
