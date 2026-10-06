@@ -46,6 +46,10 @@ const IDENTITY: i64 = 12;
 const RAISES: i64 = 13;
 /// `fun(X) -> X > 0 end`.
 const POSITIVE: i64 = 14;
+/// `fun({K1, _}, {K2, _}) -> K1 =< K2 end` — an ordering fun over `{Key, Value}`
+/// pairs that compares the **keys** only, so two pairs with the same key are
+/// mutually `Fun`-equivalent.
+const KEY_LESS_EQ: i64 = 15;
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
@@ -56,7 +60,7 @@ fn seeded_atoms() -> AtomTable {
 /// The mock `FunCaller`: it recognises the sentinel fun term and computes the
 /// operation's result on **its own** heap.
 struct MockFuns {
-    heap: Heap,
+    heap: &'static mut Heap,
     truth: Eterm,
     falsity: Eterm,
     calls: Vec<(i64, Vec<Eterm>)>,
@@ -65,8 +69,13 @@ struct MockFuns {
 impl MockFuns {
     fn new(atoms: &AtomTable) -> MockFuns {
         let atom = |name: &str| make_atom(atoms.lookup(name).expect("seeded atom"));
+        // Leaked on purpose, for the same reason as the context heap in `with_mock`:
+        // the funs that build terms (`CONS`, `DUPLICATE`, `ACC_TEN`) allocate here,
+        // and the tests inspect those terms *after* `with_mock` has returned —
+        // freeing this heap would make those reads a use-after-free.
+        let heap: &'static mut Heap = Box::leak(Box::new(Heap::new(8192).expect("mock heap")));
         MockFuns {
-            heap: Heap::new(8192).expect("mock heap"),
+            heap,
             truth: atom("true"),
             falsity: atom("false"),
             calls: Vec::new(),
@@ -88,6 +97,11 @@ impl MockFuns {
 fn number(term: Eterm) -> i64 {
     assert!(is_small(term), "the mock is only called with small integers");
     signed_value(term)
+}
+
+/// The small-integer **key** of a `{Key, Value}` pair argument of the mock.
+fn key(term: Eterm) -> i64 {
+    number(tuple_element(term, 0).expect("a {Key, Value} pair"))
 }
 
 impl FunCaller for MockFuns {
@@ -117,6 +131,7 @@ impl FunCaller for MockFuns {
             IDENTITY => Ok(args[0]),
             RAISES => Err(BeamError::BadArg),
             POSITIVE => Ok(self.boolean(number(args[0]) > 0)),
+            KEY_LESS_EQ => Ok(self.boolean(key(args[0]) <= key(args[1]))),
             other => panic!("unknown mock fun {other}"),
         }
     }
@@ -198,9 +213,9 @@ fn map_of_the_empty_list_calls_nothing() {
 #[test]
 fn map_rejects_a_non_list_and_an_improper_list() {
     let ((), calls) = with_mock(|reg, ctx| {
-        let atoms_list = ctx.list(&[ctx.atom("a").expect("seeded")]).expect("fits");
+        let non_list = ctx.atom("a").expect("seeded");
         let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
-        for bad in [ctx.atom("a").expect("seeded"), improper, atoms_list] {
+        for bad in [non_list, improper] {
             let args = [make_small(SQUARE), bad];
             // The oracle raises `case_clause`/`function_clause`; Milestone-1 reports
             // `badarg` (documented in the module docs).
@@ -211,6 +226,21 @@ fn map_rejects_a_non_list_and_an_improper_list() {
         }
     });
     assert!(calls.is_empty(), "no element of a rejected list is visited");
+
+    // A *proper* list of non-integers is **not** rejected by `map/2` itself: the walk
+    // reaches the fun, whose own failure is what surfaces (oracle:
+    // `lists:map(fun(X) -> X * X end, [a])` raises the fun body's `badarith`). With
+    // an identity fun the accepted case is observable — oracle:
+    // `lists:map(fun(X) -> X end, [a])` => `[a]`.
+    let (mapped, calls) = with_mock(|reg, ctx| {
+        let a = ctx.atom("a").expect("seeded");
+        let list = ctx.list(&[a]).expect("fits");
+        let args = [make_small(IDENTITY), list];
+        reg.call("lists", "map", 2, ctx, &args).expect("lists:map/2")
+    });
+    let a = make_atom(seeded_atoms().lookup("a").expect("seeded"));
+    assert_eq!(elements(mapped), vec![a]);
+    assert_eq!(calls, vec![(IDENTITY, vec![a])]);
 }
 
 #[test]
@@ -261,15 +291,18 @@ fn foldl_and_foldr_walk_in_opposite_directions() {
         reg.call("lists", "foldl", 3, ctx, &args)
             .expect("lists:foldl/3")
     });
-    // Oracle: lists:foldl(fun(X, A) -> A + X end, 0, [1,2,3]) => 6.
+    // Oracle: lists:foldl(fun(X, A) -> A + X end, 0, [1,2,3]) => 6, calling
+    // Fun(1, 0), Fun(2, 1), Fun(3, 3) — `Fun(Elem, Acc)` with the *running*
+    // accumulator, left to right.
     assert_eq!(number(sum), 6);
     assert_eq!(
         foldl_calls,
         vec![
             (ADD, vec![make_small(1), make_small(0)]),
-            (ADD, vec![make_small(2), make_small(3)]),
-            (ADD, vec![make_small(3), make_small(6)]),
-        ]
+            (ADD, vec![make_small(2), make_small(1)]),
+            (ADD, vec![make_small(3), make_small(3)]),
+        ],
+        "`foldl` calls Fun(Elem, Acc) left to right with the running accumulator"
     );
 
     let (built, foldr_calls) = with_mock(|reg, ctx| {
@@ -278,16 +311,20 @@ fn foldl_and_foldr_walk_in_opposite_directions() {
         reg.call("lists", "foldr", 3, ctx, &args)
             .expect("lists:foldr/3")
     });
-    // Oracle: lists:foldr(fun(X, A) -> [X | A] end, [], [1,2,3]) => [1,2,3].
+    // Oracle: lists:foldr(fun(X, A) -> [X | A] end, [], [1,2,3]) => [1,2,3],
+    // calling Fun(3, []), Fun(2, [3]), Fun(1, [2,3]) — right to left.
     assert_eq!(ints(built), vec![1, 2, 3]);
     assert_eq!(
-        foldr_calls,
-        vec![
-            (CONS, vec![make_small(3), NIL]),
-            (CONS, vec![make_small(2), make_small(3)]),
-        ],
+        foldr_calls.iter().map(|(_, args)| number(args[0])).collect::<Vec<_>>(),
+        vec![3, 2, 1],
         "`foldr` reaches the last element first"
     );
+    assert_eq!(foldr_calls.len(), 3, "the fun runs once per element");
+    // The accumulator threaded into the *first* call is the seed; the later ones are
+    // the fun's own list results (built on the mock's heap, so only their identity
+    // is asserted here).
+    assert_eq!(foldr_calls[0].1[1], NIL, "the last element folds into the seed");
+    assert_ne!(foldr_calls[1].1[1], NIL, "…and each earlier call gets the running accumulator");
 }
 
 #[test]
@@ -439,7 +476,10 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
         let right = int_list(ctx, &[10, 20]);
         let args = [make_small(ADD), left, right];
         // `lists:zipwith/3` is `zipwith(F, Xs, Ys, fail)`, whose `fail` mode has no
-        // clause for a length mismatch (the oracle raises `function_clause`).
+        // clause for a length mismatch — *it does not stop at the shorter list*.
+        // Verified against the oracle: `lists:zipwith(fun(X,Y) -> X+Y end, [1,2], [3])`
+        // raises `function_clause` at `zipwith/4` (lists.erl:965); Milestone-1 reports
+        // `badarg`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`.
         assert!(matches!(
             reg.call("lists", "zipwith", 3, ctx, &args),
             Err(BeamError::BadArg)
@@ -500,37 +540,72 @@ fn sort2_sorts_stably_and_usort2_collapses_equivalent_runs() {
         let args = [make_small(LESS_EQ), list];
         reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
     });
-    // Oracle: lists:usort(fun(A,B) -> A =< B end, [3,1,2,1]) => [1,2].
-    assert_eq!(ints(unique), vec![1, 2]);
+    // Oracle: lists:usort(fun(A,B) -> A =< B end, [3,1,2,1]) => [1,2,3]. `usort/2`
+    // collapses only elements that are *mutually* `Fun`-equivalent, and under `=<`
+    // that means arithmetically equal — so the duplicate `1` disappears while the
+    // distinct `3` stays.
+    assert_eq!(ints(unique), vec![1, 2, 3]);
 
-    // Stability: `{1, a}` and `{1, b}` are `=<`-equivalent, so the stable sort keeps
-    // the input order (oracle: lists:sort(F, [{1,a},{1,b}]) => [{1,a},{1,b}]).
-    let (stable, _) = with_mock(|reg, ctx| {
+    // Stability: `{1, a}` and `{1, b}` have equal keys, so `Fun` considers them
+    // equivalent and the stable sort keeps the input order
+    // (oracle: lists:sort(F, [{1,a},{1,b}]) => [{1,a},{1,b}], where
+    // F = fun({K1,_},{K2,_}) -> K1 =< K2 end).
+    let ((stable, reordered), _) = with_mock(|reg, ctx| {
         let a = ctx.atom("a").expect("seeded");
         let b = ctx.atom("b").expect("seeded");
-        let first = ctx.tuple(&[make_small(1), a]).expect("fits");
-        let second = ctx.tuple(&[make_small(1), b]).expect("fits");
-        let list = ctx.list(&[first, second]).expect("fits");
-        let args = [make_small(LESS_EQ), list];
-        reg.call("lists", "sort", 2, ctx, &args).expect("lists:sort/2")
+        let one_a = ctx.tuple(&[make_small(1), a]).expect("fits");
+        let one_b = ctx.tuple(&[make_small(1), b]).expect("fits");
+        let two_a = ctx.tuple(&[make_small(2), a]).expect("fits");
+        let equal_keys = ctx.list(&[one_a, one_b]).expect("fits");
+        let out_of_order = ctx.list(&[two_a, one_b]).expect("fits");
+        let stable = reg
+            .call("lists", "sort", 2, ctx, &[make_small(KEY_LESS_EQ), equal_keys])
+            .expect("lists:sort/2");
+        let reordered = reg
+            .call("lists", "sort", 2, ctx, &[make_small(KEY_LESS_EQ), out_of_order])
+            .expect("lists:sort/2");
+        (stable, reordered)
     });
     let order = elements(stable);
     assert_eq!(order.len(), 2);
-    assert_eq!(tuple_element(order[0], 1).expect("a"), tuple_element(order[1], 1).expect("a"));
+    assert_eq!(number(tuple_element(order[0], 0).expect("key")), 1);
+    assert_eq!(number(tuple_element(order[1], 0).expect("key")), 1);
+    let a = make_atom(seeded_atoms().lookup("a").expect("seeded"));
+    let b = make_atom(seeded_atoms().lookup("b").expect("seeded"));
+    assert_eq!(tuple_element(order[0], 1).expect("value"), a);
+    assert_eq!(tuple_element(order[1], 1).expect("value"), b);
+    // The keys do decide the order: oracle
+    // `lists:sort(F, [{2,a},{1,b}])` => `[{1,b},{2,a}]`.
+    let order = elements(reordered);
+    assert_eq!(order.len(), 2);
+    assert_eq!(number(tuple_element(order[0], 0).expect("key")), 1);
+    assert_eq!(number(tuple_element(order[1], 0).expect("key")), 2);
 
-    // A one-directional comparator (`fun(A,B) -> A < B end`) considers the two
-    // equal *and* leaves them in place, and `usort/2` — which collapses only
-    // mutually-equivalent elements — keeps both (oracle behaviour).
+    // `usort/2` *does* collapse a mutually `Fun`-equivalent run — here the second
+    // pair of the sorted ([{1,a},{1,b}]) has the same key as the first
+    // (oracle: lists:usort(F, [{1,a},{1,b}]) => [{1,a}]).
     let (unique, _) = with_mock(|reg, ctx| {
         let a = ctx.atom("a").expect("seeded");
         let b = ctx.atom("b").expect("seeded");
         let first = ctx.tuple(&[make_small(1), a]).expect("fits");
         let second = ctx.tuple(&[make_small(1), b]).expect("fits");
         let list = ctx.list(&[first, second]).expect("fits");
+        let args = [make_small(KEY_LESS_EQ), list];
+        reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
+    });
+    let order = elements(unique);
+    assert_eq!(order.len(), 1);
+    assert_eq!(tuple_element(order[0], 1).expect("value"), a);
+
+    // A *one-directional* comparator (`fun(A, B) -> A < B end`) considers distinct
+    // elements non-equivalent in both directions, so `usort/2` removes nothing
+    // (oracle: lists:usort(fun(A,B) -> A < B end, [3,1,2,1]) => [1,1,2,3]).
+    let (unique, _) = with_mock(|reg, ctx| {
+        let list = int_list(ctx, &[3, 1, 2, 1]);
         let args = [make_small(LESS), list];
         reg.call("lists", "usort", 2, ctx, &args).expect("lists:usort/2")
     });
-    assert_eq!(elements(unique).len(), 2);
+    assert_eq!(ints(unique), vec![1, 1, 2, 3]);
 
     let (empty, _) = with_mock(|reg, ctx| {
         let args = [make_small(LESS_EQ), NIL];
@@ -596,7 +671,14 @@ fn without_a_fun_caller_every_fun_taking_bif_is_a_typed_unsupported() {
     let atoms = seeded_atoms();
     let mut heap = Heap::new(1024).expect("test heap");
     let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
-    let list = ctx.list(&[make_small(1)]).expect("fits");
+    // Two 2-tuples, so that *every* BIF below reaches its fun: `sort/2`/`usort/2`
+    // need a second element to compare, and `keymap/3` needs a tuple with an
+    // element 2 so its `element/2` check passes before the fun call.
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let first = ctx.tuple(&[a, make_small(1)]).expect("fits");
+    let second = ctx.tuple(&[b, make_small(2)]).expect("fits");
+    let list = ctx.list(&[first, second]).expect("fits");
 
     let cases: [(&str, u32, Vec<Eterm>); 18] = [
         ("map", 2, vec![make_small(SQUARE), list]),
@@ -626,5 +708,23 @@ fn without_a_fun_caller_every_fun_taking_bif_is_a_typed_unsupported() {
             }
             other => panic!("lists:{name}/{arity} should need a FunCaller, got {other:?}"),
         }
+    }
+
+    // A list of fewer than two elements needs no comparison, so `sort/2`/`usort/2`
+    // legitimately answer without a `FunCaller` (oracle: `lists:sort(F, [])` => [],
+    // `lists:sort(F, [X])` => `[X]` — the ordering fun is never applied). That is
+    // precisely why the cases above use a two-element list.
+    let single = ctx.list(&[make_small(1)]).expect("fits");
+    for name in ["sort", "usort"] {
+        let sorted = registry
+            .call("lists", name, 2, &mut ctx, &[make_small(LESS_EQ), single])
+            .expect("no comparison needed");
+        assert_eq!(ints(sorted), vec![1]);
+        assert_eq!(
+            registry
+                .call("lists", name, 2, &mut ctx, &[make_small(LESS_EQ), NIL])
+                .expect("no comparison needed"),
+            NIL
+        );
     }
 }

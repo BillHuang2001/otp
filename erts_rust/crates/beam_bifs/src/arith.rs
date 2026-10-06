@@ -136,6 +136,16 @@ fn add(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
 }
 
+/// `a + b`, exactly as the `erlang:'+'/2` BIF computes it — **including** the
+/// promotion to a bignum when an integer sum leaves the 60-bit small range.
+///
+/// Exposed for the pure-Erlang `lists.erl` fast paths that fold with `+`, so
+/// [`crate::lists::sum`] promotes exactly like the oracle instead of reporting a
+/// 60-bit overflow (`lists:sum([576460752303423487,1])` ⇒ `576460752303423488`).
+pub(crate) fn add_terms(ctx: &mut BifContext<'_>, a: Eterm, b: Eterm) -> Result<Eterm> {
+    add(ctx, &[a, b])
+}
+
 /// `A - B`.
 fn sub(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match (number(args[0])?, number(args[1])?) {
