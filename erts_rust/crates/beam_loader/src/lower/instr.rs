@@ -369,6 +369,16 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             dst: op(ops, 3)?,
             updates: key_value_pairs(operand(ops, 4)?)?,
         }),
+        // `is_any_native_record Fail Src` (`ops.tab:1634`) — the `is_record/1` guard
+        // on native records (opcode 186). The sibling native-record opcodes
+        // (`is_native_record`, `get_record_elements`, `put_record`,
+        // `is_record_accessible`, `get_record_field`, `get_record_elements_id`,
+        // `update_record_id`) keep their lossless `Instr::Generic` fallback below:
+        // their operands need record-descriptor modelling the IR does not own yet.
+        Opcode::is_any_native_record => Ok(Instr::IsAnyNativeRecord {
+            fail: as_label(operand(ops, 0)?)?,
+            src: op(ops, 1)?,
+        }),
 
         // ---- binary syntax ----------------------------------------------------
         Opcode::bs_start_match3 => Ok(Instr::BsStartMatch3 {
@@ -889,5 +899,67 @@ mod tests {
         }
         assert!(saw_funs, "the funs-capturing allocation form is missing");
         assert!(saw_floats, "the floats-capturing allocation form is missing");
+    }
+
+    #[test]
+    fn is_any_native_record_lowers_to_its_typed_variant() {
+        // `is_any_native_record f xy` (`ops.tab:1634`): an `f` failure label then an
+        // x/y source register — the file's operand order.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::is_any_native_record,
+                vec![Operand::Label(Label(2)), Operand::X(0)],
+            ))
+            .unwrap(),
+            Instr::IsAnyNativeRecord {
+                fail: Label(2),
+                src: Operand::X(0),
+            }
+        );
+        // The source may equally be a Y register.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::is_any_native_record,
+                vec![Operand::Label(Label(7)), Operand::Y(3)],
+            ))
+            .unwrap(),
+            Instr::IsAnyNativeRecord {
+                fail: Label(7),
+                src: Operand::Y(3),
+            }
+        );
+        // The `f,0` failure sentinel is a valid label.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::is_any_native_record,
+                vec![Operand::Label(crate::operand::NO_FAIL), Operand::X(1)],
+            ))
+            .unwrap(),
+            Instr::IsAnyNativeRecord {
+                fail: crate::operand::NO_FAIL,
+                src: Operand::X(1),
+            }
+        );
+    }
+
+    #[test]
+    fn is_any_native_record_rejects_a_wrongly_typed_operand() {
+        // The failure operand is a label (`f`), never a register.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::is_any_native_record,
+                vec![Operand::X(0), Operand::X(1)],
+            )),
+            Err(BeamError::BadArg)
+        ));
+        // A structurally short instruction (no source) is rejected, like any
+        // other arity mismatch.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::is_any_native_record,
+                vec![Operand::Label(Label(2))],
+            )),
+            Err(BeamError::BadArg)
+        ));
     }
 }
