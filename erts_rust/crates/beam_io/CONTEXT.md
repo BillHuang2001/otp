@@ -16,14 +16,15 @@ Four things live here:
    (`port_task.rs`), mirroring `erts_port_task_execute`;
 4. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
    `ErlDrvEntry` bridge as documented future work, plus the built-in `fd` and `efile` byte-stream
-   drivers, line buffering, and the text⇄binary phase-change protocol.
+   drivers, the OS-child `spawn` driver, line buffering, and the text⇄binary phase-change protocol.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
 `beam_process` (ports are the peer of pids in `ptab`). **`beam_rt` today consumes only the poller
 types** (`Poller`/`Interest`/`Token`/`Ready`/`Event`/`Waker`); it has its own `beam_rt::port::PortRegistry`
-and does **not** yet use `beam_io::PortRegistry`/`Port` — `PortNotification` is the seam for it to adopt.
-This crate is the **library**; the scheduler *thread* wiring (the poll loop driving port tasks every
-round, port run queues) belongs to `beam_process`/`beam_rt`.
+and does **not** yet use `beam_io::PortRegistry`/`Port` — `PortNotification` is the seam for it to adopt,
+and [`SpawnDriver`](src/drivers/spawn.rs) is the port driver it will construct from its decoded
+`open_port/2` terms. This crate is the **library**; the scheduler *thread* wiring (the poll loop driving
+port tasks every round, port run queues) belongs to `beam_process`/`beam_rt`.
 
 Legacy C ground truth (read-only): `../../erts/emulator/sys/common/erl_poll.c` + `erl_check_io.c` (the
 poll loop, one-shot re-armed read/write readiness, self-pipe wakeup), `../../erts/emulator/beam/io.c`
