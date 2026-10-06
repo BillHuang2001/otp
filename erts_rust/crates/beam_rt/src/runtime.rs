@@ -542,7 +542,7 @@ impl Runtime {
         let pid = self.processes.spawn_default()?;
         self.runner_state.spawn(
             pid,
-            ProcessEntry {
+            ProcessEntry::Export {
                 module: loaded,
                 function: function_atom,
                 arity,
@@ -551,6 +551,75 @@ impl Runtime {
         );
         self.enqueue_process(pid)?;
         Ok(pid)
+    }
+
+    /// Spawns a process whose entry point is the **fun** `fun`, applied to `args`.
+    ///
+    /// This is the process half of `erlang:spawn/1` (and the fun head of
+    /// `spawn_link/1`/`spawn_opt/2`): the child is created in the runtime's own process
+    /// table, its engine entry registered as a
+    /// [`ProcessEntry::Fun`](crate::runner::ProcessEntry::Fun), and it is appended to the
+    /// scheduler's run queue — so it runs on the next scheduler pass, including a pass
+    /// driven from inside `-eval` ([`Runtime::pump_scheduler`]).
+    ///
+    /// `fun` must be a fun term built on a heap that outlives the process (the runtime's
+    /// arena or a pooled BIF heap — both are pointer-stable and never reset in Milestone 1).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when `fun` is not a fun term (the caller — the native
+    /// `erlang:spawn/*` floor — checks this first and reports the oracle's `badarg`, so a
+    /// non-fun here is a programming error and never a wrong process), plus the process
+    /// table's allocation failure.
+    pub fn spawn_fun_process(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<ProcessId> {
+        if !terms::is_fun(fun) {
+            return Err(BeamError::BadArg);
+        }
+        self.boot_if_needed()?;
+        let pid = self.processes.spawn_default()?;
+        self.runner_state.spawn_fun(pid, fun, args);
+        self.enqueue_process(pid)?;
+        Ok(pid)
+    }
+
+    /// Runs a **bounded** scheduler pass from inside the running code — the `-eval`
+    /// evaluator's `receive` pump.
+    ///
+    /// It performs exactly [`Runtime::run_pass`]'s move-out dance (the process table and
+    /// the runner state leave the runtime so the runner can hold `&mut Runtime` while the
+    /// scheduler holds `&mut ProcessTable`), with two differences that matter to a caller
+    /// that is *not* the entry point:
+    ///
+    /// * the slice count is always bounded (`max_slices`), because the caller is the
+    ///   evaluator's `receive` and must never block (or hang) forever;
+    /// * the wake list is absorbed **first** ([`Scheduler::resume_woken`]), so a process a
+    ///   send made *outside* a scheduler slice woke is enqueued and run — the
+    ///   send→wake→resume path a `receive` waiting for a spawned process's reply needs.
+    ///
+    /// The runtime's scheduler and runner state persist across calls (they are moved out
+    /// and put back), so a pump resumes exactly where the previous one left off.
+    ///
+    /// Returns the number of slices that ran; `0` means nothing was runnable.
+    ///
+    /// # Errors
+    ///
+    /// * a typed diagnostic when an enqueued pid has no registered engine;
+    /// * the process table's errors while terminating a process or delivering a message
+    ///   between processes.
+    pub(crate) fn pump_scheduler(&mut self, max_slices: u64) -> Result<u64> {
+        self.boot_if_needed()?;
+        let mut table = self.take_processes();
+        let mut scheduler = std::mem::replace(&mut self.scheduler, Scheduler::new());
+        let mut state = std::mem::take(&mut self.runner_state);
+        let outcome = {
+            let mut runner = RuntimeRunner::new(self, &mut state);
+            scheduler.resume_woken(&mut table);
+            scheduler.run_ready(&mut table, &mut runner, Some(max_slices))
+        };
+        self.runner_state = state;
+        self.scheduler = scheduler;
+        self.put_processes(table);
+        outcome
     }
 
     /// Appends a process created by [`Runtime::spawn_process`] to the scheduler's run

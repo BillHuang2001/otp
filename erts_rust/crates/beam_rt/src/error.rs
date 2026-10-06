@@ -223,22 +223,9 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("disconnect_node", 1),
     ("monitor_node", 2),
     ("monitor_node", 3),
-    ("port_command", 2),
-    ("port_command", 3),
     ("port_connect", 2),
     ("port_control", 3),
     ("port_call", 3),
-    ("spawn", 1),
-    ("spawn", 2),
-    ("spawn", 3),
-    ("spawn", 4),
-    ("spawn_link", 1),
-    ("spawn_link", 2),
-    ("spawn_link", 3),
-    ("spawn_link", 4),
-    ("spawn_opt", 2),
-    ("spawn_opt", 3),
-    ("spawn_opt", 4),
     ("spawn_request", 2),
     ("spawn_request", 3),
     ("spawn_request", 4),
@@ -480,18 +467,47 @@ mod tests {
         // A curated entry is a documented capability gap, classified by the same
         // convention as every other `unsupported*` raise (so the CLI exits 3), not the
         // plain `is not a BIF` diagnostic a typo gets.
-        assert!(listed_as_unimplemented("spawn", 1));
-        assert!(is_known_unimplemented_bif(&registry, "spawn", 1));
-        assert!(unsupported_reason(&known_unimplemented_bif("spawn", 1)).is_some());
+        assert!(listed_as_unimplemented("nodes", 0));
+        assert!(is_known_unimplemented_bif(&registry, "nodes", 0));
+        assert!(unsupported_reason(&known_unimplemented_bif("nodes", 0)).is_some());
         assert!(
-            unsupported_reason(&known_unimplemented_bif("spawn", 1))
+            unsupported_reason(&known_unimplemented_bif("nodes", 0))
                 .expect("a capability gap")
-                .contains("erlang:spawn/1")
+                .contains("erlang:nodes/0")
         );
         // An arity that is not curated is not a known gap.
-        assert!(!listed_as_unimplemented("spawn", 0));
-        assert!(!is_known_unimplemented_bif(&registry, "spawn", 0));
+        assert!(!listed_as_unimplemented("nodes", 1));
+        assert!(!is_known_unimplemented_bif(&registry, "nodes", 1));
         assert!(!is_known_unimplemented_bif(&registry, "nope", 1));
+    }
+
+    #[test]
+    fn the_spawn_family_and_port_command_are_no_longer_curated_gaps() {
+        // The native floor serves `spawn/1,2,3`, `spawn_link/1,2,3`, `spawn_opt/2,3,4`
+        // and the runtime's port provider serves `port_command/2,3`. Keeping any of them
+        // in the curated list would be dead weight (they are answered before the
+        // `erlang`-namespace fallback is reached at all) and the `/4` arities OTP does
+        // not have must not be presented as a documented capability gap either.
+        for (function, arity) in [
+            ("spawn", 1u32),
+            ("spawn", 2),
+            ("spawn", 3),
+            ("spawn", 4),
+            ("spawn_link", 1),
+            ("spawn_link", 2),
+            ("spawn_link", 3),
+            ("spawn_link", 4),
+            ("spawn_opt", 2),
+            ("spawn_opt", 3),
+            ("spawn_opt", 4),
+            ("port_command", 2),
+            ("port_command", 3),
+        ] {
+            assert!(
+                !listed_as_unimplemented(function, arity),
+                "erlang:{function}/{arity} must no longer be a curated gap"
+            );
+        }
     }
 
     #[test]
@@ -510,8 +526,8 @@ mod tests {
         }
         // The guard is not vacuous: a name the registry does *not* own that is on the list
         // still classifies as a gap …
-        assert!(!registry.contains("erlang", "spawn", 1));
-        assert!(is_known_unimplemented_bif(&registry, "spawn", 1));
+        assert!(!registry.contains("erlang", "nodes", 0));
+        assert!(is_known_unimplemented_bif(&registry, "nodes", 0));
         // … and a listed name the registry *has* since grown (the drift this intersection
         // exists to absorb) is a registered BIF, never a gap.
         for grown in [("phash", 2), ("phash2", 1), ("phash2", 2)] {
