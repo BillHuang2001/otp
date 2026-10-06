@@ -408,7 +408,14 @@ impl Table {
   refs/sub-bitstrings cannot be copied into table storage (`insert` ⇒ `BadArg`).
 - **The match-spec compiler covers the common guard set**, not the full Erlang guard language
   (`map_get`, `float`/`trunc`/`round`, `list_to_tuple`, comprehensions in bodies, …); anything
-  outside the recognised set is `badarg`.
+  outside the recognised set is `badarg`. Match-spec **arithmetic** is covered by the default
+  `ArithHook` for small integers only: bignum/float operands and `/` (a float result) return a typed
+  `unsupported`; a real runtime installs a full hook via `set_arith_hook`.
+- **`select_replace/2`'s key check is value-based, not the C's static syntactic check.** The oracle
+  (`db_match_keeps_key`) rejects a body that is not syntactically `'$_'`/`{{ … }}`/`{const,{…}}`/
+  `{element,KeyPos,'$_'}` even when nothing matches; this crate accepts any body whose *value* keeps
+  the key, so it diverges on exotic multi-expression bodies (pinned by the `recorded_divergence_*`
+  tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
 
