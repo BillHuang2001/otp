@@ -15,12 +15,14 @@
 //! Implements the GC half of Part II §D and the Stage-4 row of Part II §H; the
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
 //!
-//! `unsafe` is confined to `copy.rs` (the word-level copier), the raw-pointer range
+//! `unsafe` is confined to `copy.rs` (the word-level copier) and `immix/` (the
+//! mark-region space's word-level mark/evacuation walks), the raw-pointer range
 //! tests in `space.rs` and the two narrow `NonNull`-deref / `Box::from_raw` blocks in
 //! `mso.rs`; `policy.rs`, `stats.rs` and the `Collector` driving logic are safe Rust.
 
 pub mod collector;
 pub mod copy;
+pub mod immix;
 mod error; // pub(crate) helpers only — NOT public
 pub mod mso;
 pub mod policy;
@@ -29,6 +31,7 @@ pub mod stats;
 
 pub use crate::collector::*;
 pub use crate::copy::*;
+pub use crate::immix::*;
 pub use crate::mso::*;
 pub use crate::policy::*;
 pub use crate::space::*;
@@ -38,6 +41,7 @@ pub use crate::stats::*;
 pub mod prelude {
     pub use crate::collector::*;
     pub use crate::copy::*;
+    pub use crate::immix::*;
     pub use crate::mso::*;
     pub use crate::policy::*;
     pub use crate::space::*;

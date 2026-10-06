@@ -119,6 +119,67 @@ pub(crate) fn move_size(hdr: Eterm, ptr: *const Eterm) -> usize {
     nelts + 1
 }
 
+/// Calls `visit` with the address of every *reference word* of the boxed object at
+/// `ptr`, which occupies `total` words (`total` = the [`move_size`] of its header).
+///
+/// This is the **per-object** form of the word walk [`Copier::complete`] performs over its
+/// contiguous to-space region: both step through words with [`scan_step`], so a fun's
+/// inlined descriptor is skipped opaquely, a transparent arityval is stepped word by word,
+/// and an `ErlSubBits`'s `orig` word is visited. They are not merged into one routine
+/// because `complete` walks a *region* that grows as it copies (the Cheney invariant
+/// `while (n_hp != n_htop)`), not an object of known size; sharing the loop would thread a
+/// moving region bound through the copier's hot path for no gain. The mark-region space
+/// ([`crate::immix`]) uses this to enumerate objects it marks and objects it copies.
+///
+/// # Safety
+///
+/// `ptr` must address a live boxed object of exactly `total` words, all of which are
+/// readable, and `visit` must not invalidate them.
+pub(crate) unsafe fn for_each_ref<F>(
+    ptr: *mut Eterm,
+    total: usize,
+    visit: &mut F,
+) -> Result<()>
+where
+    F: FnMut(*mut Eterm) -> Result<()>,
+{
+    let mut i = 1usize;
+    while i < total {
+        // SAFETY: `i < total`, so this word is inside the live `total`-word object.
+        let word = unsafe { *ptr.add(i) };
+        match primary_tag(word) {
+            PrimaryTag::Boxed | PrimaryTag::List => {
+                // SAFETY: word `i` of a live object is a live reference word.
+                visit(unsafe { ptr.add(i) })?;
+                i += 1;
+            }
+            PrimaryTag::Header => match scan_step(word)? {
+                ScanStep::Word => i += 1,
+                ScanStep::Thing { step, orig_index } => {
+                    if let Some(index) = orig_index {
+                        let at = i + index;
+                        if at < total {
+                            // SAFETY: `at < total`, so the interior reference is inside the
+                            // object.
+                            visit(unsafe { ptr.add(at) })?;
+                        }
+                    }
+                    if step == 0 || i + step > total {
+                        // A malformed object cannot happen for the objects this crate
+                        // writes; stopping is the safe reading of one rather than
+                        // walking out of the object.
+                        debug_assert!(false, "object at {ptr:p} over-runs its {total} words");
+                        break;
+                    }
+                    i += step;
+                }
+            },
+            PrimaryTag::Immed1 => i += 1,
+        }
+    }
+    Ok(())
+}
+
 /// How the object a BOXED/LIST reference points at relates to an evacuation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Target {
