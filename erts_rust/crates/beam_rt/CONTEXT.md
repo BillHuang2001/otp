@@ -100,6 +100,9 @@ impl ExecutionContext for RuntimeContext<'_> {
 names into the **one shared table** in order after the BIF returns (their predicted indices are exact
 — interning is append-only and single-threaded). This is what makes a `binary_to_term`-decoded atom
 nameable by the printer/comparison — see Design Decisions.
+`call_bif` also installs the **`FunCaller`** (`FunBridge`) on that `BifContext`, so the `fun`-taking
+`lists:*`/`maps:*` BIFs apply their `fun` argument by re-entering `RuntimeContext::apply_fun` — see
+Design Decisions.
 This is the **only** place the engine's seam meets the Stage-5 core; it keeps the Stage-1/Stage-5
 DAG acyclic (`../CONTEXT.md`).
 
