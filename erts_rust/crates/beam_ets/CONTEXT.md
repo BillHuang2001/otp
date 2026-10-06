@@ -201,7 +201,8 @@ impl Table {
   `pub struct MatchClause { head, guard, body }`, `pub fn compile(spec: Eterm, atoms: &AtomTable) -> Result<MatchSpec>`;
   type aliases `MatchPattern`/`MatchElement` = `Pattern`, `MatchGuard`/`MatchBody`/`MatchBodyElement` = `Expr`.
 - `pattern.rs` — `pub enum Pattern` (nested tuple/list/improper patterns, quoted literals, `'_'`,
-  `'$N'` binds with repeat-occurrence equality, `'$_'`/`'$$'` which never match in a head).
+  `'$N'` binds with repeat-occurrence equality; every other atom — including `'$_'`/`'$$'`, which are
+  special only in a *body* — is an exact `=:=` literal).
 - `expr.rs` — `pub enum Expr`, `pub enum CmpOp`, `pub enum TypeTest`: the guard/body expression
   language. Guards: `andalso`/`and`, `orelse`/`or`, `not`, `const`, bare truthiness; comparisons
   `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=` (structural `cmp` for exact, `cmp_arith` for `==`-family);
