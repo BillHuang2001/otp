@@ -431,7 +431,13 @@ impl Evaluator<'_, '_> {
                 None => pairs.push((key, value)),
             }
         }
-        Ok(heap!(terms::make_flatmap(self.ctx, &pairs)))
+        // Use the general, **canonical-order** map builder (not the insertion-order
+        // flat-map writer), so a map literal's observable key order matches the oracle
+        // (`maps:keys(#{3=>a,1=>b,2=>c})` → `[1,2,3]`) and a >32-key literal lifts to a
+        // hashmap instead of hitting the flat-map cap. The atoms handle is an owned
+        // `Rc` clone, so it does not conflict with the mutable `self.ctx` borrow.
+        let atoms = self.ctx.runtime.code_server.atoms_handle();
+        Ok(heap!(terms::make_map(self.ctx, &pairs, &atoms)))
     }
 
     /// `<<Seg, …>>`.
@@ -1327,7 +1333,12 @@ impl Evaluator<'_, '_> {
         self.comp_collect(&template, quals, 0, env, &mut out)?;
         match out {
             CompOut::List(elements) => Ok(heap!(terms::make_list(self.ctx, &elements))),
-            CompOut::Map(pairs) => Ok(heap!(terms::make_flatmap(self.ctx, &pairs))),
+            CompOut::Map(pairs) => {
+                // The canonical-order builder (see the `#{…}` literal): the map
+                // comprehension's key order must match the oracle's, not insertion order.
+                let atoms = self.ctx.runtime.code_server.atoms_handle();
+                Ok(heap!(terms::make_map(self.ctx, &pairs, &atoms)))
+            }
             CompOut::Bits(buf) => self.materialize_bits(&buf),
         }
     }
@@ -1407,9 +1418,14 @@ impl Evaluator<'_, '_> {
                 let source = self.expr(source, env)?;
                 let Ok((bytes, offset_bits, size_bits)) = beam_codec::term::bitstring_bytes(source)
                 else {
-                    // `erl` raises `{bad_generator, X}`; Milestone-1's term-free raise
-                    // carries the reason atom only (as `iterable` does for a list generator).
-                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                    // The source is not a bitstring: the oracle raises
+                    // `{bad_generator, X}` for the offending value, so the reason is a
+                    // live term rather than a bare atom.
+                    return Err(Flow::Raise {
+                        class: ExceptionClass::Error,
+                        reason: self.bad_generator(source)?,
+                        origin: None,
+                    });
                 };
                 // The pattern may materialize terms (a `binary` sub-segment) on the heaps
                 // the source lives on, so own the payload rather than borrowing it.
@@ -1449,7 +1465,13 @@ impl Evaluator<'_, '_> {
         if let Ok(bytes) = terms::binary_bytes(value) {
             return Ok(bytes.iter().map(|b| make_small(i64::from(*b))).collect());
         }
-        Err(self.raise(ExceptionClass::Error, "badarg"))
+        // A non-iterable generator source raises `{bad_generator, X}` (the offending
+        // value), matching the oracle for both the list and the binary generator forms.
+        Err(Flow::Raise {
+            class: ExceptionClass::Error,
+            reason: self.bad_generator(value)?,
+            origin: None,
+        })
     }
 
     // -- patterns -------------------------------------------------------------
@@ -1719,15 +1741,40 @@ impl Evaluator<'_, '_> {
     /// runtime telling the host "this build cannot do that", not an Erlang
     /// exception — so a `try`/`catch` in the evaluated expression must not swallow
     /// it and the CLI can still exit 3 with `beam_rt: unsupported: <reason>`. Every
-    /// genuine `error`/`exit`/`throw` stays fully catchable. A structured reason
-    /// (which `beam_common` cannot carry as a term) is likewise fatal rather than
-    /// silently reshaped.
+    /// genuine `error`/`exit`/`throw` stays fully catchable.
+    ///
+    /// A **structured** reason — one `beam_bifs` carries as a live term
+    /// (`{badmap, M}`, `{badkey, K}`, `{case_clause, V}`, …) in the raise's
+    /// [`live_reason`](beam_common::Raise::live_reason) slot — is a genuine
+    /// Erlang exception and is converted to a **catchable** [`Flow::Raise`]
+    /// carrying that exact term. Its term was built on a pooled BIF heap that
+    /// Milestone 1 never resets and never moves, so it stays valid for the
+    /// runtime's lifetime; no copy is needed. Only an error that carries *no*
+    /// term at all is [`Flow::Fatal`] rather than silently reshaped.
     fn flow_from_error(&mut self, err: BeamError) -> Flow {
         if error::halt_status(&err).is_some() {
             return Flow::Fatal(err);
         }
         if error::unsupported_reason(&err).is_some() {
             return Flow::Fatal(err);
+        }
+        // A structured reason is a real exception: recover its live term and raise it
+        // catchably (the `beam_bifs` `raise.live_reason().downcast_ref::<Eterm>()`
+        // convention). This runs before the atom-only mapping below, so a tag atom
+        // (`badkey`/`badmap`) never shadows the term the producer built.
+        if let BeamError::Raise(raise) = &err {
+            let live_term = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied();
+            if let Some(reason) = live_term {
+                let class = raise.class;
+                return Flow::Raise {
+                    class,
+                    reason,
+                    origin: Some(err),
+                };
+            }
         }
         let converted = match &err {
             BeamError::Raise(raise) => raise
@@ -1792,6 +1839,14 @@ impl Evaluator<'_, '_> {
             reason,
             origin: None,
         }
+    }
+
+    /// The `{bad_generator, X}` reason a comprehension generator raises for a source that
+    /// cannot be iterated (`[Y || Y <- X]` / `<<… || <<…>> <= X>>` on a non-list /
+    /// non-bitstring `X`) — the oracle's exact reason, with `X` the offending value.
+    fn bad_generator(&mut self, value: Eterm) -> EResult<Eterm> {
+        let tag = self.atom("bad_generator");
+        Ok(heap!(terms::make_tuple(self.ctx, &[tag, value])))
     }
 
     /// `value` as a boolean, or `error:badarg`.

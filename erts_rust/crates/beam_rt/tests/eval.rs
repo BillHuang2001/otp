@@ -303,6 +303,55 @@ fn evaluates_control_flow_like_the_oracle() {
     }
 }
 
+/// Structured/uncaught raise **reasons** (D6) at the CLI boundary: the *reason* a probe
+/// carries must be the real term the producer built (`{badkey,K}` / `{badmap,X}` /
+/// `{bad_generator,X}`), never a reshaped atom — and a map literal's key order must be the
+/// oracle's canonical order, not insertion order.
+///
+/// Every golden is the system oracle's own line (`erl -noshell`, OTP 29 / erts-17.1),
+/// captured through the **same** probe wrapper and argv the corpus builds:
+///
+/// ```text
+/// try (maps:get(nokey,#{})) of V -> … catch C:R -> io:format("exception ~w ~w~n",[C,R]) …
+///   ⇒ exception error {badkey,nokey}   (exit 1)
+/// ```
+///
+/// `tests/structured_errors.rs` asserts the same terms **structurally** through
+/// [`Runtime::eval`](beam_rt::Runtime::eval) (including that a `try … catch` really *catches*
+/// them); this pins the printer + exit-code boundary the differential gate reads.
+#[test]
+fn structured_raise_reasons_and_map_key_order_match_the_oracle() {
+    let cases: &[(&str, &str, i32)] = &[
+        ("maps:get(nokey,#{})", "exception error {badkey,nokey}", 1),
+        (
+            "map_get(a, not_a_map)",
+            "exception error {badmap,not_a_map}",
+            1,
+        ),
+        (
+            "[Y || Y <- not_a_list]",
+            "exception error {bad_generator,not_a_list}",
+            1,
+        ),
+        (
+            "<<Y || <<Y>> <= not_a_binary>>",
+            "exception error {bad_generator,not_a_binary}",
+            1,
+        ),
+        ("maps:keys(#{3=>a,1=>b,2=>c})", "ok [1,2,3]", 0),
+    ];
+
+    for (expr, expected, expected_exit) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, *expected_exit, "{expr}: exit (stderr {stderr:?})");
+    }
+}
+
 /// The two `semantics/*` corpus probes this pass closed — a binary comprehension and
 /// `bit_size/1` of a **non-byte-aligned** bitstring. Both were previously `unsupported`
 /// (the `-eval` grammar had no binary generator and could not enter a non-byte-aligned

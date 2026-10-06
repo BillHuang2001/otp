@@ -191,10 +191,12 @@ fn normal(runtime: &mut Runtime) -> Eterm {
 ///
 /// An error that carries an atom reason — the standard `badarg`/`badarith`/… atoms, or a
 /// raise whose reason is an atom (`unsupported_opcode: …`, `badmatch`, …) — becomes that
-/// atom. Anything else (a term-carrying `Structured` reason, or runtime plumbing such as
-/// `TermNotFound`) has no atom of its own, so its [`Display`](std::fmt::Display) text is
-/// interned as the reason instead: the failure stays observable and is never silently
-/// replaced by a plausible-looking value.
+/// atom. A raise that carries a **structured** reason as a live term (`{badmap, M}`,
+/// `{badkey, K}`, …) becomes that very term, so the process's exit reason is the real
+/// value the producer built rather than a reshaped atom. Anything else (runtime plumbing
+/// such as `TermNotFound`) has no atom of its own, so its
+/// [`Display`](std::fmt::Display) text is interned as the reason instead: the failure
+/// stays observable and is never silently replaced by a plausible-looking value.
 fn exit_reason(runtime: &mut Runtime, error: &BeamError) -> Eterm {
     if let Some(name) = error.as_atom() {
         return runtime.intern(name);
@@ -202,6 +204,16 @@ fn exit_reason(runtime: &mut Runtime, error: &BeamError) -> Eterm {
     if let BeamError::Raise(raise) = error {
         if let Some(name) = raise.reason.as_atom() {
             return runtime.intern(name);
+        }
+        // A structured reason travels as a live term (the `beam_common::Raise` convention;
+        // the payload is the reason as an `Eterm`, built on a BIF heap that M1 never
+        // resets or moves). Return it directly — no reshaping, no loss.
+        if let Some(term) = raise
+            .live_reason()
+            .and_then(|live| live.downcast_ref::<Eterm>())
+            .copied()
+        {
+            return term;
         }
     }
     runtime.intern(&error.to_string())
