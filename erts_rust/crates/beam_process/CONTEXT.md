@@ -73,8 +73,11 @@ liveness maps.
   - `reductions() -> u64`, `bump_reductions(n)`, `reset_reductions()`
   - `heap(&self) -> &beam_alloc::Heap`, `heap_mut(&mut self) -> &mut beam_alloc::Heap` (the **young**
     mutator heap, `collector.young_mut().heap_mut()`)
+  - `priority() -> Priority`, `set_priority(Priority)`; `save_calls() -> u16`, `set_save_calls(u16)`;
+    `is_sensitive()/set_sensitive(bool)`
   - `mailbox() -> &Queue`, `mailbox_mut() -> &mut Queue`
   - `registers() -> &Registers`, `registers_mut() -> &mut Registers`
+  - `dict() -> &Dict`, `dict_mut() -> &mut Dict`; `saved_args() -> &SavedArgs`, `saved_args_mut() -> &mut SavedArgs`
   - `off_heap() -> &OffHeapTable`, `off_heap_mut() -> &mut OffHeapTable`
   - `links() -> &Links`, `links_mut() -> &mut Links`
   - `monitors() -> &Monitors`, `monitors_mut() -> &mut Monitors`
