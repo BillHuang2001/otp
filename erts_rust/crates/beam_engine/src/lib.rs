@@ -71,7 +71,7 @@ mod step;
 pub mod terms;
 pub use context::{ExecutionContext, MinimalContext};
 pub use error::{bad_register, unknown_label, unsupported};
-pub use jit::{available_tiers, JitBackend, Tier};
+pub use jit::{available_tiers, JitBackend, Tier, TierPolicy};
 pub use machine::{CatchFrame, Machine, MAX_REGISTER};
 pub(crate) use step::Step;
 

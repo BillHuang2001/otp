@@ -46,6 +46,17 @@
 //! [`Machine::run_export`](crate::Machine::run_export)). [`baseline::BaselineJit`]
 //! and — with the `jit-cranelift` feature — [`cranelift::CraneliftJit`] are the
 //! backends built today.
+//!
+//! # The tiering policy
+//!
+//! [`tiering::TierPolicy`] models the interpret → baseline → hot **escalation
+//! ladder** of Part II §F (§F "Tiering"): a per-function execution counter crosses a
+//! baseline threshold to move a function onto [`Tier::BaselineJit`], and a hot
+//! threshold to move it onto [`Tier::Cranelift`] *when that tier is compiled in*
+//! (otherwise it stays on the baseline). It is a demonstrated **policy** — nothing on
+//! an execution path consults it: [`Machine::run_with_tier`](crate::Machine::run_with_tier)
+//! still runs the single tier its caller names, and no backend recompiles or promotes
+//! mid-run. Wiring a real per-function counter and promotion is later work.
 
 use beam_common::Result;
 use beam_loader::{Atom, Module};
@@ -58,6 +69,9 @@ pub mod baseline;
 #[cfg(feature = "jit-cranelift")]
 pub mod cranelift;
 pub mod emitter;
+pub mod tiering;
+
+pub use tiering::{TierPolicy, DEFAULT_BASELINE_THRESHOLD, DEFAULT_HOT_THRESHOLD};
 
 /// An execution tier of the typed IR.
 ///
