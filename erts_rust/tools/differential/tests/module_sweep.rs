@@ -210,6 +210,8 @@ fn case_for(index: usize, entry: &Entry, sources: &BTreeMap<&'static str, &'stat
             function,
             arity: entry.args.len() as u32,
             args: entry.args,
+            // The sweep runs plain system modules: no C/NIF fixture (contract A.3) is needed.
+            nif: None,
         }),
         // No stdout golden: the sweep records *agreement*, not a value. The oracle is only
         // required to exit 0 (a well-formed entry); a non-zero oracle exit is corpus drift.

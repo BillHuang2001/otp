@@ -25,6 +25,7 @@
 //! | [`errors`] | A.1 — the exception classes (`error`/`exit`/`throw`) and reasons |
 //! | [`etf`] | A.2 — `.beam` binary / `term_to_binary` bytes |
 //! | [`nif`] | A.3 — the observable `erlang:nif_error/1` NIF surface |
+//! | [`nif_so`] | A.3 — the NIF C ABI *end to end*: a real `.so`-backed NIF round trip |
 //! | [`driver`] | A.4 — the observable port/`spawn`-driver surface |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`flags`] | A.6 — CLI / configuration |
@@ -36,10 +37,14 @@
 //! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
 //! | [`records`] | A.1/A.2/A.7 — native records: the `records:*` BIFs + the native-record opcodes |
 //!
-//! A.3 and A.4 are only *partially* reachable through the black-box CLI (their corpus
-//! groups pin the observable raise/port surface), so the C-declaration half of both is
-//! asserted **structurally** in `tests/abi.rs`: a C translation unit that references the
-//! `enif_*` / `driver_*` / `erl_drv_*` declarations must still compile.
+//! A.3 is reachable **end to end**, not only through its raise surface: the [`nif_so`] group
+//! runs a compiled module that `erlang:load_nif/2`s a **real `.so`** (built into the case's
+//! temp dir by [`crate::module_build::build`]) and calls the library's functions, so the NIF
+//! *call* path and the `{error, {Reason, Text}}` failure shapes are exercised, not just
+//! `erlang:nif_error/1`. The C-declaration half of A.3 and *all* of A.4 stay asserted
+//! **structurally** in `tests/abi.rs` (a C translation unit that references the `enif_*` /
+//! `driver_*` / `erl_drv_*` declarations must still compile) because the driver C ABI is not
+//! observable through the black-box CLI at all.
 
 mod bifs;
 mod boot;
@@ -51,6 +56,7 @@ mod flags;
 mod mexec;
 mod modules;
 mod nif;
+mod nif_so;
 mod records;
 mod semantics;
 mod system_info;
@@ -60,6 +66,7 @@ mod wire;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
+use crate::module_build::NifFixture;
 use crate::runtime::eval_argv_owned;
 
 /// One of the nine ERTS compatibility contracts that the rewrite must reproduce exactly
@@ -192,6 +199,13 @@ pub struct ModuleRun {
     pub arity: u32,
     /// The integer arguments passed to the function.
     pub args: &'static [i64],
+    /// The C/NIF artifacts the module loads at run time (contract A.3), materialized into the
+    /// **same** temp dir as the compiled `.beam` — the module locates them with
+    /// `filename:dirname(code:which(?MODULE))`, so neither runtime's argv changes.
+    ///
+    /// `None` for the ordinary module-run cases (and for a NIF case that deliberately loads
+    /// a path naming no library at all, which needs no artifact and therefore no compiler).
+    pub nif: Option<NifFixture>,
 }
 
 impl ModuleRun {
@@ -302,6 +316,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(semantics::group());
     cases.extend(errors::group());
     cases.extend(nif::group());
+    cases.extend(nif_so::group());
     cases.extend(records::group());
     cases.extend(driver::group());
     cases.extend(wire::group());
@@ -496,7 +511,17 @@ mod tests {
             assert!(
                 case.contracts
                     .iter()
-                    .all(|c| matches!(c, Contract::BeamAsm | Contract::LanguageSemantics | Contract::OtpApps)),
+                    .all(|c| matches!(
+                        c,
+                        Contract::BeamAsm
+                            | Contract::LanguageSemantics
+                            | Contract::OtpApps
+                            // `nif_so` (A.3): a module-run case that loads a real NIF `.so`
+                            // evidences the NIF C ABI end to end — the library is compiled
+                            // from C against the host `erl_nif.h` and its functions run
+                            // under both runtimes (see `super::nif_so`).
+                            | Contract::NifAbi
+                    )),
                 "case {}: a module-run case may only claim the contracts it evidences",
                 case.id
             );

@@ -146,6 +146,7 @@ fn case(
             function,
             arity,
             args,
+            nif: None,
         }),
         golden: Golden {
             stdout: Some(golden),
@@ -169,6 +170,7 @@ pub(crate) fn group() -> Vec<Case> {
                 function: "add",
                 arity: 2,
                 args: &[2, 3],
+                nif: None,
             }),
             golden: Golden {
                 stdout: Some("5"),
@@ -185,6 +187,7 @@ pub(crate) fn group() -> Vec<Case> {
                 function: "fib",
                 arity: 1,
                 args: &[10],
+                nif: None,
             }),
             golden: Golden {
                 stdout: Some("55"),

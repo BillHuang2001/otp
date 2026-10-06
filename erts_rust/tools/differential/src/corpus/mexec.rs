@@ -178,6 +178,7 @@ fn case(
             function,
             arity,
             args,
+            nif: None,
         }),
         golden: Golden {
             stdout: Some(golden),

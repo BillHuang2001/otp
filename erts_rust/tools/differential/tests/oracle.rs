@@ -195,15 +195,17 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
 }
 
 /// Every module-run case must reproduce its golden under the oracle too: the embedded
-/// module is compiled with the system `erlc` and applied through `-pa <dir> -eval …`.
-/// Skips loudly (never a silent pass) when `erlc` is unavailable.
+/// module is compiled with the system `erlc` (and, for a NIF case, its `.so` is built next to
+/// it with the host C compiler and `erl_nif.h`) and applied through `-pa <dir> -eval …`.
+/// Skips loudly (never a silent pass) when `erlc` is unavailable, and reports each case whose
+/// C/NIF fixture cannot be built as skipped rather than passing it.
 #[test]
 fn module_run_cases_reproduce_their_golden_under_the_oracle() {
     let Some(oracle) = oracle_or_skip() else {
         return;
     };
-    let erlc = match module_build::resolve_erlc() {
-        Ok(Some(erlc)) => erlc,
+    match module_build::resolve_erlc() {
+        Ok(Some(_)) => {}
         Ok(None) => {
             eprintln!("SKIP: erlc not available — cannot compile the module-run cases");
             return;
@@ -212,13 +214,24 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
     };
 
     let mut checked = 0;
+    let mut skipped = 0;
     for case in differential::corpus::cases() {
         let CaseKind::Module(module_run) = &case.kind else {
             continue;
         };
         checked += 1;
-        let compiled = module_build::compile(&erlc, module_run.source, module_run.module)
-            .unwrap_or_else(|error| panic!("case {}: erlc failed: {error}", case.id));
+        let compiled = match module_build::build(module_run.source, module_run.module, module_run.nif)
+        {
+            Ok(module_build::Build::Compiled(compiled)) => compiled,
+            Ok(module_build::Build::Skipped(reason)) => {
+                // A host tool the case needs is missing: it was not run, so it can neither
+                // pass nor fail here — say so loudly and move on.
+                eprintln!("SKIP: case {} needs a missing host tool: {reason}", case.id);
+                skipped += 1;
+                continue;
+            }
+            Err(error) => panic!("case {}: building the module failed: {error}", case.id),
+        };
         let argv = module_run.oracle_argv(compiled.dir());
         let observation = run(&oracle, &argv).unwrap_or_else(|error| {
             panic!("case {}: failed to run the oracle: {error}", case.id)
@@ -237,6 +250,9 @@ fn module_run_cases_reproduce_their_golden_under_the_oracle() {
         checked >= 2,
         "the corpus must carry at least two module-run cases"
     );
+    if skipped > 0 {
+        eprintln!("NOTE: {skipped} module-run case(s) skipped for a missing host tool");
+    }
 }
 
 #[test]
