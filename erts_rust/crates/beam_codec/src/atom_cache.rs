@@ -1,14 +1,19 @@
-//! The distribution atom cache.
+//! The distribution atom cache — both halves of the send/receive seam.
 //!
-//! Mirrors `erl_ext_dist.md` §Distribution Header: 8 segments of 256 entries
-//! (2048 slots in total). The *distribution header* that carries the segment
-//! updates is owned by `beam_dist`; `beam_dist` fills this cache and the decoder
-//! resolves an `ATOM_CACHE_REF` (`82`) through it. Milestone 1 never *emits*
-//! `82`/`78`.
+//! * **Read side** — [`AtomCache`]. Mirrors `erl_ext_dist.md` §Distribution Header:
+//!   8 segments of 256 entries (2048 slots in total). The *distribution header* that
+//!   carries the segment updates is owned by `beam_dist`; `beam_dist` fills this cache
+//!   and the decoder resolves an `ATOM_CACHE_REF` (`82`) through it.
+//! * **Write side** — [`AtomCacheWriter`]. The narrow trait an outbound cache
+//!   (`beam_dist::OutboundAtomCache`) implements so the encoder can emit
+//!   `[ATOM_CACHE_REF (82), index]` instead of the atom name. The encoder never emits
+//!   the legacy `NEW_CACHE` (`78`) tag: `external.h` defines it, but ERTS's encoder
+//!   never writes it — new atoms travel in the distribution *header* and the payload
+//!   only ever carries `82`.
 //!
 //! This module is safe Rust.
 
-use beam_term::Atom;
+use beam_term::{Atom, AtomTable};
 
 /// Number of atom-cache segments (the distribution header rotates through them).
 const SEGMENTS: usize = 8;
@@ -51,6 +56,42 @@ impl AtomCache {
     pub fn clear(&mut self) {
         self.slots = [None; SLOTS];
     }
+}
+
+/// The outbound (send-side) atom-cache hook.
+///
+/// `beam_dist` classifies each outbound atom (`New` vs `Cached`) and addresses it in
+/// the distribution header, but it must not be depended on by this crate (the DAG is
+/// `beam_dist → beam_codec`). The encoder therefore exposes this narrow trait and
+/// `beam_dist::OutboundAtomCache` implements it.
+///
+/// [`Encoder::with_atom_cache`](crate::Encoder::with_atom_cache) installs an
+/// implementation: from then on [`Encoder::encode`](crate::Encoder::encode) consults
+/// [`intern`](AtomCacheWriter::intern) for **every** atom and, when it returns an
+/// index, writes `[ATOM_CACHE_REF_EXT (82), index]` instead of the inline
+/// `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT` (or Latin-1) form.
+///
+/// Ground truth — C `enc_atom` (`erts/emulator/beam/external.c:2877`):
+///
+/// ```c
+/// iix = get_iix_acache_map(acache, atom, &cached);
+/// if (iix >= 0) { *ep++ = ATOM_CACHE_REF; put_int8(ep, iix); return ep; }
+/// /* iix == -1 (no cache map, or the atom is not cacheable) ⇒ inline atom */
+/// ```
+///
+/// A [`None`] return is exactly C's `-1`: the atom is written inline. The encoder
+/// performs **no** name-length validation on the cached path (the C does none either —
+/// the name travels in the distribution header, not in the payload).
+pub trait AtomCacheWriter {
+    /// Registers `atom` with the outbound cache for the message being encoded and
+    /// returns its payload `ATOM_CACHE_REF` index, or [`None`] when the atom cannot
+    /// be cached (write it inline, exactly as `enc_atom` does when the cache lookup
+    /// returns `-1`).
+    ///
+    /// `atoms` is the encoder's [`AtomTable`], supplied so an implementation can read
+    /// the name (for example to apply the `LongAtoms` / per-message budget /
+    /// collision rules, all of which live in `beam_dist`, not in the codec).
+    fn intern(&mut self, atom: Atom, atoms: &AtomTable) -> Option<u8>;
 }
 
 #[cfg(test)]
@@ -148,5 +189,56 @@ mod tests {
         cache.clear();
         cache.set(5, reusing);
         assert_eq!(cache.get(5), Some(reusing));
+    }
+
+    /// A minimal [`AtomCacheWriter`] for the trait's unit tests: it records every
+    /// atom it is asked about and returns a fixed index for one chosen atom.
+    struct RecordingWriter {
+        /// The one atom this writer caches.
+        chosen: Atom,
+        /// The index returned for `chosen`.
+        index: u8,
+        /// Every atom the encoder asked about, in order.
+        seen: Vec<Atom>,
+    }
+
+    impl AtomCacheWriter for RecordingWriter {
+        fn intern(&mut self, atom: Atom, _atoms: &AtomTable) -> Option<u8> {
+            self.seen.push(atom);
+            (atom == self.chosen).then_some(self.index)
+        }
+    }
+
+    #[test]
+    fn a_writer_implementation_receives_the_atom_and_the_table() {
+        let atoms = AtomTable::new();
+        let chosen = atom(7);
+        let mut writer = RecordingWriter {
+            chosen,
+            index: 5,
+            seen: Vec::new(),
+        };
+
+        assert_eq!(writer.intern(chosen, &atoms), Some(5));
+        assert_eq!(writer.intern(atom(8), &atoms), None);
+        assert_eq!(writer.seen, vec![chosen, atom(8)]);
+    }
+
+    #[test]
+    fn the_read_and_write_halves_meet_at_a_slot() {
+        // A `Some(index)` from the write side is exactly what the read side resolves:
+        // `set(index, atom)` + `get(index)` recover the atom the encoder referenced.
+        let atoms = AtomTable::new();
+        let chosen = atom(11);
+        let mut writer = RecordingWriter {
+            chosen,
+            index: 200,
+            seen: Vec::new(),
+        };
+        let index = writer.intern(chosen, &atoms).expect("the chosen atom is cached");
+
+        let mut cache = AtomCache::new();
+        cache.set(index, chosen);
+        assert_eq!(cache.get(index), Some(chosen));
     }
 }
