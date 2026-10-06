@@ -10,12 +10,23 @@
 //! `src/native.rs`'s `code:*` behaviour is load-bearing for the differential corpus's
 //! `boot/*` cases, all of which currently agree with the oracle.
 
+use std::path::Path;
+
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_term::Eterm;
 
 use crate::context::RuntimeContext;
 use crate::error;
+
+/// The application directories the oracle marks **sticky** (see `code.erl`'s
+/// `maybe_stick_dirs/1`: `kernel`, `stdlib` and `compiler`).
+///
+/// The preloaded set is sticky from boot as well (see [the docs on
+/// `is_sticky`](RuntimeContext::is_sticky)), which is how the emulator's own modules
+/// (`init`, `erl_prim_loader`, …) — resolved from the `erts` `ebin`, not one of these
+/// directories — are sticky too. This list is the *directory* half of the rule only.
+const STICKY_APPS: &[&str] = &["kernel", "stdlib", "compiler"];
 
 impl RuntimeContext<'_> {
     /// `code:get_path/0`: the code path, one directory string per entry, in search
@@ -57,25 +68,26 @@ impl RuntimeContext<'_> {
     ///
     /// [`CodeServer::load_bytes`]: crate::CodeServer::load_bytes
     pub(super) fn code_all_loaded(&mut self) -> Result<Eterm> {
-        // `None` marks a preloaded module (which has no `.beam` file of its own).
-        let mut entries: Vec<(String, Option<String>)> = Vec::new();
-        for name in self.runtime.preloaded().names() {
-            entries.push((name.to_string(), None));
-        }
-        let loaded = self.runtime.code_server.loaded();
-        for name in loaded {
-            if self.runtime.preloaded().is_preloaded(&name) {
-                continue;
+        // The preloaded names first, then every loaded module that is not preloaded.
+        let mut names: Vec<String> = self
+            .runtime
+            .preloaded()
+            .names()
+            .map(str::to_string)
+            .collect();
+        for name in self.runtime.code_server.loaded() {
+            if !self.runtime.preloaded().is_preloaded(&name) {
+                names.push(name);
             }
-            let path = self.module_file(&name);
-            entries.push((name, path));
         }
 
-        let mut tuples = Vec::with_capacity(entries.len());
-        for (name, path) in &entries {
+        let mut tuples = Vec::with_capacity(names.len());
+        for name in &names {
             let name_atom = self.atom(name)?;
-            let beam = match path {
-                Some(path) => self.charlist(path)?,
+            let beam = match self.beam_location(name)? {
+                Some(beam) => beam,
+                // A module with no source file (loaded from memory through
+                // `CodeServer::load_bytes`) is reported as `preloaded`.
                 None => self.atom("preloaded")?,
             };
             tuples.push(terms::make_tuple(self, &[name_atom, beam])?);
@@ -90,12 +102,138 @@ impl RuntimeContext<'_> {
         let name = self
             .atom_name(*args.first().ok_or(BeamError::BadArg)?)
             .ok_or(BeamError::BadArg)?;
-        if self.runtime.preloaded().is_preloaded(&name) {
-            return self.atom("preloaded");
-        }
-        match self.module_file(&name) {
-            Some(path) => self.charlist(&path),
+        match self.beam_location(&name)? {
+            Some(beam) => Ok(beam),
             None => self.atom("non_existing"),
+        }
+    }
+
+    /// `code:is_loaded(Module)`: `{file, Beam}` for a module that has a `.beam` file (or
+    /// is preloaded), and the atom `false` for one that is nowhere to be found.
+    ///
+    /// Oracle-verified (OTP 29/erts-17.1): `code:is_loaded(lists)` ⇒
+    /// `{file,"…/stdlib-8.1/ebin/lists.beam"}`, `code:is_loaded(erlang)` ⇒
+    /// `{file,preloaded}` (the *atom*, from the preloaded registry) and
+    /// `code:is_loaded(no_such_mod_xyz)` ⇒ `false`. The location is exactly
+    /// [`Self::code_which`]'s minus its `non_existing`, so the two can never disagree.
+    ///
+    /// A non-atom argument cannot name a module and is `badarg` — the local convention
+    /// every `code:*` entry already follows (the oracle's own reason is
+    /// `function_clause`).
+    pub(super) fn code_is_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        match self.beam_location(&name)? {
+            Some(beam) => {
+                let file = self.atom("file")?;
+                terms::make_tuple(self, &[file, beam])
+            }
+            None => self.atom("false"),
+        }
+    }
+
+    /// `code:is_sticky(Module)`: whether `Module` is a **sticky** module.
+    ///
+    /// A sticky module cannot be (re)loaded by unprivileged code and, in the oracle,
+    /// covers two sets: the **preloaded** modules (sticky from boot) and every module
+    /// whose `.beam` lives in a `kernel`, `stdlib` or `compiler` application directory
+    /// (`code.erl`'s `maybe_stick_dirs/1`). Any other module — including one merely
+    /// findable on the code path — answers `false`, which is what the oracle answers for
+    /// e.g. `mnesia`.
+    ///
+    /// A non-atom argument is `badarg` (see [`Self::code_is_loaded`]).
+    ///
+    /// Oracle-verified (OTP 29/erts-17.1): `lists`, `kernel`, `code`, `proplists`,
+    /// `ordsets`, `gen_server`, `erl_eval`, `zlib`, `persistent_term`, `erl_init` and
+    /// `erl_prim_loader` are `true`; `mnesia` and `no_such_mod_xyz` are `false`.
+    pub(super) fn code_is_sticky_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        let sticky = self.is_sticky(&name);
+        self.atom(if sticky { "true" } else { "false" })
+    }
+
+    /// `code:is_sticky/2` — a function this OTP release does **not** have.
+    ///
+    /// Oracle-verified (OTP 29/erts-17.1): `catch code:is_sticky(kernel,stdlib)` ⇒
+    /// `{'EXIT',{undef,…}}`. The runtime reproduces that raise exactly (reason atom
+    /// `undef`) instead of inventing a value or reporting a capability gap — the function
+    /// is genuinely absent from the release, not unimplemented here.
+    pub(super) fn code_is_sticky_2(&mut self) -> Result<Eterm> {
+        Err(error::undef())
+    }
+
+    /// `code:ensure_loaded(Module)`: `{module, Module}` once the module is loaded (or is
+    /// preloaded), and `{error, nofile}` when it cannot be found.
+    ///
+    /// The module is loaded on demand from the code path exactly as a call would resolve
+    /// it (the system library directories are seeded first), so a successful answer
+    /// really has the module in the shared code area. Oracle-verified (OTP 29/erts-17.1):
+    /// `code:ensure_loaded(lists)` ⇒ `{module,lists}`, `code:ensure_loaded(no_such_mod_xyz)`
+    /// ⇒ `{error,nofile}`.
+    ///
+    /// A `.beam` that *is* found but fails to load is **not** reported as `nofile`: the
+    /// loader's own error is propagated rather than hidden behind the not-found shape.
+    pub(super) fn code_ensure_loaded(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        if self.runtime.preloaded().is_preloaded(&name)
+            || self.runtime.code_server.is_loaded(&name)
+        {
+            return self.module_pair(&name);
+        }
+        if self.module_file(&name).is_none() {
+            return self.no_file();
+        }
+        self.runtime.code_server.load(&name)?;
+        self.module_pair(&name)
+    }
+
+    /// The `{module, Module}` pair [`Self::code_ensure_loaded`] answers with.
+    fn module_pair(&mut self, name: &str) -> Result<Eterm> {
+        let module = self.atom("module")?;
+        let name = self.atom(name)?;
+        terms::make_tuple(self, &[module, name])
+    }
+
+    /// The `{error, nofile}` pair [`Self::code_ensure_loaded`] answers with.
+    fn no_file(&mut self) -> Result<Eterm> {
+        let error = self.atom("error")?;
+        let nofile = self.atom("nofile")?;
+        terms::make_tuple(self, &[error, nofile])
+    }
+
+    /// Whether `name` is sticky: preloaded, or resolved to a `.beam` under one of the
+    /// [`STICKY_APPS`] application directories (see [`Self::code_is_sticky_1`]).
+    fn is_sticky(&mut self, name: &str) -> bool {
+        if self.runtime.preloaded().is_preloaded(name) {
+            return true;
+        }
+        let Some(path) = self.module_file(name) else {
+            return false;
+        };
+        let path = Path::new(&path);
+        STICKY_APPS.iter().any(|app| {
+            self.runtime
+                .code_server
+                .app_dir(app)
+                .is_some_and(|dir| path.starts_with(dir))
+        })
+    }
+
+    /// The `Beam` half of a `{Module, Beam}` / `{file, Beam}` pair: the atom `preloaded`
+    /// for a preloaded module, its `.beam` path (a string) for one that is loaded or on
+    /// the code path, and `None` when the module is nowhere to be found.
+    fn beam_location(&mut self, name: &str) -> Result<Option<Eterm>> {
+        if self.runtime.preloaded().is_preloaded(name) {
+            return Ok(Some(self.atom("preloaded")?));
+        }
+        match self.module_file(name) {
+            Some(path) => Ok(Some(self.charlist(&path)?)),
+            None => Ok(None),
         }
     }
 
@@ -395,5 +533,204 @@ mod tests {
             std::path::Path::new(&root).is_dir(),
             "{root} is a directory"
         );
+    }
+
+    /// The atom `is_loaded`/`is_sticky` answer for the module `name` — a fresh atom in the
+    /// shared table, so the argument names the module by name, not by a stale index.
+    fn module_atom(runtime: &mut crate::Runtime, name: &str) -> Eterm {
+        atom(runtime, name)
+    }
+
+    #[test]
+    fn code_is_loaded_reports_file_preloaded_and_false() {
+        let mut runtime = runtime();
+        // A module nowhere to be found is the atom `false`.
+        let missing = module_atom(&mut runtime, "definitely_not_a_module");
+        let answer = call(&mut runtime, "code", "is_loaded", &[missing]).expect("is_loaded/1");
+        assert_eq!(runtime.atom_name_of(answer), Some("false"));
+
+        // A preloaded module answers `{file, preloaded}` — the *atom*, from the registry.
+        let init = module_atom(&mut runtime, "init");
+        let answer = call(&mut runtime, "code", "is_loaded", &[init]).expect("is_loaded/1");
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2);
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("file")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("preloaded")
+        );
+
+        // A loaded module reports the file it was loaded from.
+        let slice = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures/slice.beam"
+        );
+        runtime.load_module(slice).expect("the slice fixture loads");
+        let slice_atom = module_atom(&mut runtime, "slice");
+        let answer = call(&mut runtime, "code", "is_loaded", &[slice_atom]).expect("is_loaded/1");
+        assert_eq!(string_of(terms::tuple_element(answer, 1).unwrap()), slice);
+
+        // A system module is found through the resolved code path and agrees with
+        // `code:which/1` (the two share the location helper).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let lists = module_atom(&mut runtime, "lists");
+        let loaded = call(&mut runtime, "code", "is_loaded", &[lists]).expect("is_loaded/1");
+        let which = call(&mut runtime, "code", "which", &[lists]).expect("which/1");
+        assert_eq!(
+            string_of(terms::tuple_element(loaded, 1).unwrap()),
+            string_of(which),
+            "is_loaded/1 and which/1 must agree on the location"
+        );
+        assert!(string_of(which).ends_with("lists.beam"));
+    }
+
+    #[test]
+    fn code_is_sticky_matches_the_oracle() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        // Every oracle-`true` module this runtime can resolve: the preloaded set plus the
+        // `kernel`/`stdlib`-directory modules.
+        for name in [
+            "lists",
+            "kernel",
+            "code",
+            "proplists",
+            "ordsets",
+            "gen_server",
+            "erl_eval",
+            "zlib",
+            "persistent_term",
+            "erl_init",
+            "erl_prim_loader",
+        ] {
+            let module = module_atom(&mut runtime, name);
+            let answer = call(&mut runtime, "code", "is_sticky", &[module]).expect("is_sticky/1");
+            assert_eq!(
+                runtime.atom_name_of(answer),
+                Some("true"),
+                "{name} is sticky"
+            );
+        }
+        // A module that is not installed on this code path is honestly not sticky.
+        for name in ["mnesia", "definitely_not_a_module"] {
+            let module = module_atom(&mut runtime, name);
+            let answer = call(&mut runtime, "code", "is_sticky", &[module]).expect("is_sticky/1");
+            assert_eq!(
+                runtime.atom_name_of(answer),
+                Some("false"),
+                "{name} is not sticky"
+            );
+        }
+    }
+
+    #[test]
+    fn code_is_sticky_2_is_undef_because_the_function_does_not_exist() {
+        // Oracle-verified: this OTP release has no `code:is_sticky/2`, so the call raises
+        // `error:undef` — never an invented value and never a capability gap.
+        let mut runtime = runtime();
+        let kernel = module_atom(&mut runtime, "kernel");
+        let stdlib = module_atom(&mut runtime, "stdlib");
+        let error = call(&mut runtime, "code", "is_sticky", &[kernel, stdlib])
+            .expect_err("is_sticky/2 does not exist");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
+        assert!(
+            crate::error::unsupported_reason(&error).is_none(),
+            "undef is a genuine error, not a capability gap: {error}"
+        );
+    }
+
+    #[test]
+    fn code_ensure_loaded_reports_module_or_nofile() {
+        let mut runtime = runtime();
+        // A missing module is `{error, nofile}`.
+        let missing = module_atom(&mut runtime, "definitely_not_a_module");
+        let answer = call(&mut runtime, "code", "ensure_loaded", &[missing]).expect("ensure/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("error")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("nofile")
+        );
+
+        // A preloaded module is `{module, M}` without touching the code path.
+        let init = module_atom(&mut runtime, "init");
+        let answer = call(&mut runtime, "code", "ensure_loaded", &[init]).expect("ensure/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("init")
+        );
+
+        // A system module is loaded on demand and reported as `{module, M}`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let lists = module_atom(&mut runtime, "lists");
+        let answer = call(&mut runtime, "code", "ensure_loaded", &[lists]).expect("ensure/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("module")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("lists")
+        );
+        assert!(runtime.code_server.is_loaded("lists"), "the module really loaded");
+        // A second call is answered from the cache.
+        let again = call(&mut runtime, "code", "ensure_loaded", &[lists]).expect("ensure/1");
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(again, 0).unwrap()),
+            Some("module")
+        );
+    }
+
+    #[test]
+    fn code_all_loaded_pins_the_preloaded_atom_and_the_file_string() {
+        // The oracle's entry shapes: a preloaded module's `Beam` is the **atom**
+        // `preloaded`, a loaded module's is its `.beam` **path string**.
+        // `code:all_loaded()` in the oracle: `[X || {M,X} <- code:all_loaded(), M =:= erlang]`
+        // ⇒ `[preloaded]`.
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        runtime.code_server.load("lists").expect("stdlib lists loads");
+        let loaded = call(&mut runtime, "code", "all_loaded", &[]).expect("all_loaded/0");
+        let entries = terms::list_elements(loaded).expect("a list");
+
+        let erlang = entries
+            .iter()
+            .find(|entry| {
+                runtime.atom_name_of(terms::tuple_element(**entry, 0).unwrap()) == Some("erlang")
+            })
+            .expect("erlang is in all_loaded/0");
+        let beam = terms::tuple_element(*erlang, 1).unwrap();
+        assert!(
+            is_atom(beam),
+            "a preloaded module's beam is the atom `preloaded`, got {beam:?}"
+        );
+        assert_eq!(runtime.atom_name_of(beam), Some("preloaded"));
+
+        let lists = entries
+            .iter()
+            .find(|entry| {
+                runtime.atom_name_of(terms::tuple_element(**entry, 0).unwrap()) == Some("lists")
+            })
+            .expect("lists is in all_loaded/0");
+        let beam = terms::tuple_element(*lists, 1).unwrap();
+        assert!(
+            terms::list_elements(beam).is_ok(),
+            "a loaded module's beam is a path string, got {beam:?}"
+        );
+        assert!(string_of(beam).ends_with("lists.beam"));
     }
 }

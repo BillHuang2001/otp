@@ -16,7 +16,7 @@
 //! | `init:get_plain_arguments/0` | the (always empty) plain-argument list — the CLI models no plain arguments |
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args` |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
-//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:lib_dir/0,1` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
+//! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //!
 //! The `init`/`code` calls are **preloaded-module surface** (contract A.7): the oracle
 //! serves them from `init.beam`/`code.beam`, but those modules are written against the
@@ -90,6 +90,10 @@ impl RuntimeContext<'_> {
             ("code", "get_path", 0) => Some(self.code_get_path()),
             ("code", "all_loaded", 0) => Some(self.code_all_loaded()),
             ("code", "which", 1) => Some(self.code_which(args)),
+            ("code", "is_loaded", 1) => Some(self.code_is_loaded(args)),
+            ("code", "is_sticky", 1) => Some(self.code_is_sticky_1(args)),
+            ("code", "is_sticky", 2) => Some(self.code_is_sticky_2()),
+            ("code", "ensure_loaded", 1) => Some(self.code_ensure_loaded(args)),
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
             ("code", "root_dir", 0) => Some(self.code_root_dir()),

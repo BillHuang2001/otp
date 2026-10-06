@@ -174,6 +174,21 @@ pub(crate) fn unsupported(what: &str) -> BeamError {
     message(format!("{UNSUPPORTED_PREFIX}: {what}"))
 }
 
+/// The `error:undef` raise of a call that names a function the release does not have.
+///
+/// `code:is_sticky/2` does not exist in this OTP release, so the oracle raises
+/// `error:undef` (verified against OTP 29/erts-17.1:
+/// `catch code:is_sticky(kernel,stdlib)` ⇒ `{'EXIT',{undef,…}}`). Reproducing the
+/// *absence* honestly means raising the same class and **reason atom** the oracle does
+/// (`undef` — the module/function/arity live in the stacktrace, not the reason) rather
+/// than inventing a value or reporting a capability gap.
+///
+/// The reason is the bare atom `undef`, never a message: the differential harness
+/// compares reasons exactly.
+pub(crate) fn undef() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("undef")))
+}
+
 /// A receive-seam operation with no mailbox to serve it.
 ///
 /// The runtime always owns a process table holding the running process, so this is
@@ -386,6 +401,19 @@ mod tests {
     fn unknown_info_key_is_bare_badarg() {
         assert!(matches!(unknown_info_key("nonsense"), BeamError::BadArg));
         assert_eq!(unknown_info_key("nonsense").as_atom(), Some("badarg"));
+    }
+
+    #[test]
+    fn undef_is_the_bare_reason_atom_and_not_a_capability_gap() {
+        // The oracle raises `error:undef` (reason atom `undef`) for a function the
+        // release does not have, and the differential harness compares reasons exactly.
+        let error = undef();
+        assert!(error.is_raise());
+        assert_eq!(error.as_atom(), Some("undef"));
+        assert_eq!(error.to_string(), "error undef");
+        // It is a genuine error, not a Milestone-1 capability gap.
+        assert_eq!(unsupported_reason(&error), None);
+        assert_eq!(halt_status(&error), None);
     }
 
     #[test]
