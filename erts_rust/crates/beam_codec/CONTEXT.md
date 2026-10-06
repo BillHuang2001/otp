@@ -565,6 +565,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   incl. the `COMPRESSED` seed
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
   incl. the `COMPRESSED` wrapper round-trips and negatives
+- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
+  streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
+- `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
+  encode↔decode, atom-cache encode↔decode, no-cache control)
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
   legacy-`FLOAT_EXT` decode vector and malformed-input typed-error cases
