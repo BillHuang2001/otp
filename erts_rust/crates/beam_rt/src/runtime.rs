@@ -32,7 +32,7 @@ use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
 use beam_common::Result;
 use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_loader::Module;
-use beam_process::{ProcessId, ProcessTable, SignalAtoms};
+use beam_process::{ProcessId, ProcessState, ProcessTable, Scheduler, SignalAtoms};
 use beam_term::{atom_val, is_atom, make_atom, make_small, AtomTable, Eterm};
 
 use crate::boot::{self, PreloadedModules};
@@ -45,6 +45,7 @@ use crate::format;
 use crate::info::{self, InfoValue};
 use crate::mailbox::MailboxState;
 use crate::port::PortRegistry;
+use crate::runner::{ProcessEntry, RunnerState, RuntimeRunner};
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
 ///
 /// It is `reset()` at the start of every such call, so it only has to hold one
@@ -88,6 +89,20 @@ pub struct Runtime {
     pub(crate) bif_heaps: Vec<Heap>,
     /// The size in term words of a freshly created BIF heap.
     pub(crate) bif_heap_words: usize,
+    /// The single-threaded scheduler: the run queue of the processes
+    /// [`Runtime::spawn_process`] created, plus its thread-progress counter.
+    ///
+    /// It persists across calls, so [`Runtime::run_one_slice`] followed by
+    /// [`Runtime::run_scheduler`] continues exactly where the slice left off.
+    scheduler: Scheduler,
+    /// The per-pid engine state (the machine, its entry point and the address a blocked
+    /// `receive` resumes at) and the recorded outcomes of every spawned process.
+    ///
+    /// It lives here rather than in a pass-local value because it must outlive a single
+    /// scheduler pass — a process blocked in a `receive` is resumed by a *later* pass —
+    /// and it is **moved out** for the duration of a pass so the runner can hold it at the
+    /// same time as the process table (see [`crate::runner`]).
+    runner_state: RunnerState,
     /// The pointer-stable arena serving the engine's `alloc_words` seam.
     pub(crate) arena: MinimalContext,
     /// The scratch heap for `system_info`/`format_term`, reset per call.
@@ -167,6 +182,8 @@ impl Runtime {
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,
+            scheduler: Scheduler::new(),
+            runner_state: RunnerState::default(),
             arena: MinimalContext::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
@@ -440,11 +457,200 @@ impl Runtime {
         context.run_export(&loaded, function, arity, args)
     }
 
+    // --- spawning and scheduling (the process runner's public API) ------------
+
+    /// Spawns a process whose entry point is `module:function/arity(args)` and makes it
+    /// **runnable** (it is appended to the scheduler's run queue).
+    ///
+    /// The module is resolved through the code path exactly as an external call is (`-pa`/
+    /// `-pz` directories first, then the system library `ebin`s), so it is loaded on
+    /// demand and cached in the one shared atom table. `args` must already be valid terms:
+    /// the runtime never moves them (Milestone 1 has no GC), and they are seeded into the
+    /// process's `x(0..arity)` when it first runs.
+    ///
+    /// The process does **not** run until [`Runtime::run_slices`]/
+    /// [`Runtime::run_scheduler`] is called. Its `x(0)` is recorded and readable through
+    /// [`Runtime::process_result`] once it has run to its `return` (a normally-returning
+    /// process's *exit reason* is `normal`, not that value — see [`crate::runner`]).
+    ///
+    /// # Errors
+    ///
+    /// * the code server's not-found/malformed diagnostic for `module`;
+    /// * a diagnostic when `function/arity` is not exported by it;
+    /// * the process table's allocation failure.
+    pub fn spawn_process(
+        &mut self,
+        module: &str,
+        function: &str,
+        args: Vec<Eterm>,
+    ) -> Result<ProcessId> {
+        self.boot_if_needed()?;
+        // A module the code server already holds (loaded explicitly by
+        // [`Runtime::load_module`], say) needs no code-path search — which also avoids
+        // resolving the system library directories. Otherwise a miss here is not fatal:
+        // `CodeServer::load` reports it, naming every directory searched.
+        if self.code_server.module(module).is_none() {
+            let _ = self.find_module_file(module);
+        }
+        let loaded = self.code_server.load(module)?;
+        let name = loaded.atom_name(loaded.name).unwrap_or("<unnamed>").to_string();
+        let arity = args.len() as u32;
+        let function_atom = loaded
+            .atom_table
+            .lookup(function)
+            .ok_or_else(|| error::unknown_function(&name, function, arity))?;
+        if loaded.export(function_atom, arity).is_none() {
+            return Err(error::unknown_function(&name, function, arity));
+        }
+        let pid = self.processes.spawn_default()?;
+        self.runner_state.spawn(
+            pid,
+            ProcessEntry {
+                module: loaded,
+                function: function_atom,
+                arity,
+            },
+            args,
+        );
+        self.enqueue_process(pid)?;
+        Ok(pid)
+    }
+
+    /// Appends a process created by [`Runtime::spawn_process`] to the scheduler's run
+    /// queue and marks it `Runnable`.
+    ///
+    /// [`Runtime::spawn_process`] already does this, so a caller needs it only to put a
+    /// process it took off the queue **back** on it — for instance a receiver woken by a
+    /// message delivered from outside a scheduler pass. Enqueuing a pid that is already
+    /// queued is a no-op, so a caller cannot accidentally run one process twice per round.
+    ///
+    /// # Errors
+    ///
+    /// A typed diagnostic when `pid` is not a process this runtime spawned (there is no
+    /// entry point to run) — never a silent no-op that would hide the mistake.
+    pub fn enqueue_process(&mut self, pid: ProcessId) -> Result<()> {
+        if !self.runner_state.contains(pid) {
+            return Err(error::unknown_process_entry(pid));
+        }
+        if let Some(process) = self.processes.get_mut(pid) {
+            if process.flags().in_run_queue() {
+                return Ok(());
+            }
+            process.flags_mut().set_in_run_queue(true);
+            process.set_state(ProcessState::Runnable);
+        }
+        self.scheduler.enqueue(pid);
+        Ok(())
+    }
+
+    /// Runs **one** scheduler slice (one process, once), returning how many slices ran
+    /// (`0` or `1`).
+    ///
+    /// This is the step hook for observing a run in progress: the scheduler and its run
+    /// queue persist, so `run_one_slice` then [`Runtime::run_scheduler`] continues where
+    /// the slice left off.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::run_scheduler`].
+    pub fn run_one_slice(&mut self) -> Result<u64> {
+        self.run_slices(1)
+    }
+
+    /// Runs at most `max_slices` scheduler slices, returning how many ran.
+    ///
+    /// # Errors
+    ///
+    /// As [`Runtime::run_scheduler`].
+    pub fn run_slices(&mut self, max_slices: u64) -> Result<u64> {
+        self.run_pass(Some(max_slices))
+    }
+
+    /// Runs the scheduler until the run queue is empty, returning the number of slices
+    /// executed.
+    ///
+    /// A process blocked on an empty `receive` leaves the queue and simply stays
+    /// `Waiting`; a message delivered to it **during** a slice is absorbed at the end of
+    /// that slice (the scheduler's `resume_woken`), so a single `run_scheduler` call
+    /// carries a send→wake→resume through to completion. A process that is waiting for a
+    /// message nobody will send simply stays `Waiting` and the loop ends — it never hangs.
+    ///
+    /// # Errors
+    ///
+    /// * a typed diagnostic when an enqueued pid has no registered engine;
+    /// * the process table's allocation/propagation errors while terminating a process
+    ///   or delivering a message between processes.
+    ///
+    /// A raise *inside* a process is not an error here: it terminates that process with
+    /// the raised reason (observable through [`Runtime::process_exit`]) and the pass
+    /// continues.
+    pub fn run_scheduler(&mut self) -> Result<u64> {
+        self.run_pass(None)
+    }
+
+    /// The `x(0)` a process spawned with [`Runtime::spawn_process`] returned, once it has
+    /// run to its `return`.
+    ///
+    /// A process that is still running, blocked, or finished by raising has no recorded
+    /// result (`None`); see [`Runtime::process_exit`] for the failing case.
+    pub fn process_result(&self, pid: ProcessId) -> Option<Eterm> {
+        self.runner_state.result(pid)
+    }
+
+    /// The exit reason a process spawned with [`Runtime::spawn_process`] finished with,
+    /// once it **raised**.
+    ///
+    /// A normally-returning process records no exit reason here (its termination is
+    /// `normal` and its value is [`Runtime::process_result`]).
+    pub fn process_exit(&self, pid: ProcessId) -> Option<Eterm> {
+        self.runner_state.exit(pid)
+    }
+
+    /// The number of processes waiting in the scheduler's run queue.
+    pub fn run_queue_len(&self) -> usize {
+        self.scheduler.run_queue().len()
+    }
+
+    /// Runs a scheduler pass: the shared dance every `run_*` entry performs.
+    ///
+    /// The **process table** and the **runner state** are moved out of the runtime, so the
+    /// runner can hold `&mut Runtime` while the scheduler holds `&mut ProcessTable` — two
+    /// borrows that cannot coexist inside one value (see [`crate::runner`]). Both go back
+    /// when the pass ends, whatever its outcome.
+    fn run_pass(&mut self, max_slices: Option<u64>) -> Result<u64> {
+        self.boot_if_needed()?;
+        let mut table = self.take_processes();
+        let mut scheduler = std::mem::replace(&mut self.scheduler, Scheduler::new());
+        let mut state = std::mem::take(&mut self.runner_state);
+        let outcome = {
+            let mut runner = RuntimeRunner::new(self, &mut state);
+            scheduler.run_ready(&mut table, &mut runner, max_slices)
+        };
+        self.runner_state = state;
+        self.scheduler = scheduler;
+        self.put_processes(table);
+        outcome
+    }
+
+    /// Moves the process table out of the runtime for a scheduler pass.
+    ///
+    /// The placeholder is an equivalent **empty** table sharing the runtime's atom table
+    /// (so its signal atoms are the runtime's); it is only ever observed by a runtime-side
+    /// accessor during the pass, never by the running code, which sees the real table.
+    fn take_processes(&mut self) -> ProcessTable {
+        let placeholder = ProcessTable::new(SignalAtoms::from_table(self.code_server.atoms_mut()));
+        std::mem::replace(&mut self.processes, placeholder)
+    }
+
+    /// Puts back the process table taken by [`Runtime::take_processes`].
+    fn put_processes(&mut self, table: ProcessTable) {
+        self.processes = table;
+    }
+
     /// Materializes parsed command-line arguments into terms on the shared atom table
     /// and heap (an atom's index can only be assigned here).
     ///
     /// # Errors
-    ///
     /// Propagates heap allocation failures while building lists.
     pub fn materialize_args(&mut self, args: &[ArgTerm]) -> Result<Vec<Eterm>> {
         let mut out = Vec::with_capacity(args.len());

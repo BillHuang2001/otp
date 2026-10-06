@@ -184,6 +184,17 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
     unsupported(&format!("receive: process {pid:?} has no mailbox"))
 }
 
+/// A scheduler pass asked to run a pid the runtime never spawned an engine for.
+///
+/// [`Runtime::spawn_process`](crate::runtime::Runtime::spawn_process) registers an entry
+/// point for every process it creates and
+/// [`Runtime::enqueue_process`](crate::runtime::Runtime::enqueue_process) refuses a pid
+/// without one, so this is a programming error in a caller driving the scheduler by hand;
+/// it is reported rather than run as a wrong (or empty) function.
+pub(crate) fn unknown_process_entry(pid: beam_process::ProcessId) -> BeamError {
+    message(format!("scheduler: process {pid:?} has no engine entry point"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -20,6 +20,8 @@
 //! * `mailbox` — the per-process receive scan state (`MailboxState`: the mailbox cursor
 //!   plus the `recv_marker_*` table) that [`Runtime`] keys by pid and
 //!   [`RuntimeContext`] drives the receive seam through.
+//! * `runner` — the `beam_process::ProcessRunner` behind the scheduler: the engine state
+//!   and recorded outcomes of every process [`Runtime::spawn_process`] created.
 //! * [`eval`] — the `-eval` Erlang expression parser and `erl_eval`-style evaluator.
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
@@ -50,6 +52,7 @@ mod mailbox;
 mod native;
 pub mod port;
 pub mod runtime;
+mod runner;
 pub use crate::boot::{boot_banner, PreloadedModules};
 pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE};
 pub use crate::codeserver::CodeServer;
