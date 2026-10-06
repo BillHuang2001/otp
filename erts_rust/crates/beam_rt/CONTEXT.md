@@ -133,6 +133,8 @@ impl PreloadedModules { pub fn standard() -> PreloadedModules; pub fn is_preload
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; }
 
 // info.rs (A.8)
+pub const SUPPORTED_KEYS: &[&str];                              // the 12 answered keys
+pub const INFO_ATOMS: &[&str];                                  // the atom vocabulary the surface needs seeded
 pub enum InfoValue { Int(i64), Str(String), Atom(&'static str), Bool(bool), Tuple(&'static str, &'static str) }
 impl InfoValue { pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm>; }
 pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue>;
