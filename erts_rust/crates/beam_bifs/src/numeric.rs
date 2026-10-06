@@ -12,15 +12,17 @@
 //! and `../../erts/emulator/sys/unix/sys_float.c` (`sys_double_to_chars_fast`,
 //! `sys_chars_to_double`).
 //!
-//! This module is safe Rust: it inspects terms only through [`crate::access`] and
-//! builds no heap terms, so it needs no `unsafe` block (the crate is
-//! `#![deny(unsafe_code)]`, with `crate::access` its only allowed-`unsafe` module).
+//! This module is safe Rust: it inspects terms only through [`crate::access`] (and
+//! [`beam_codec::term::big_parts`] for a bignum's limbs) and builds no heap terms
+//! — the integer-promotion materializer lives in [`crate::arith`], so it needs no
+//! `unsafe` block (the crate is `#![deny(unsafe_code)]`, with `crate::access` its
+//! only allowed-`unsafe` module).
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, AtomTable, Eterm};
 
 use crate::access;
-use crate::error::{badarg, system_limit};
+use crate::error::badarg;
 use crate::print::proper_list;
 
 /// `SYS_DEFAULT_FLOAT_DECIMALS` (`../../erts/emulator/beam/sys.h`): the mantissa
@@ -49,7 +51,8 @@ const FIXED_FAST_DECIMALS: i64 = 19;
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a
-/// small integer (Milestone-1 has no bignums, so `is_small` is `is_integer`).
+/// small integer — a bignum included (the arithmetic operators accept one, the
+/// positional/arity arguments here do not).
 pub(crate) fn small_arg(term: Eterm) -> Result<i64> {
     if !access::is_small(term) {
         return Err(badarg());
@@ -75,32 +78,74 @@ pub(crate) fn base_arg(term: Eterm) -> Result<u32> {
 // Integer rendering/parsing
 // ---------------------------------------------------------------------------
 
-/// Renders `value` in `base` the way `Sint_to_buf` does: uppercase digits
-/// `A`..`Z` for 10..35 and a leading `-`.
-pub(crate) fn int_to_digits(value: i64, base: u32) -> String {
-    let mut n = i128::from(value).unsigned_abs();
+/// Renders an exact integer — a sign plus a little-endian `u64` magnitude —
+/// in `base` the way `Sint_to_buf` (`bif.c`) and `big_to_charbuf` (`big.c`) do:
+/// uppercase digits `A`..`Z` for 10..35 and a leading `-`. Leading zero limbs are
+/// dropped and a zero magnitude renders as `"0"`.
+pub(crate) fn mag_to_digits(negative: bool, mag: &[u64], base: u32) -> String {
+    let mut mag = mag.to_vec();
+    trim_mag(&mut mag);
     let radix = u128::from(base);
     let mut digits = Vec::new();
-    if n == 0 {
-        digits.push(b'0');
-    }
-    while n > 0 {
-        let digit = (n % radix) as u8;
+    while !mag.is_empty() {
+        let digit = div_mod_small(&mut mag, radix) as u8;
         digits.push(if digit < 10 {
             b'0' + digit
         } else {
             b'A' + (digit - 10)
         });
-        n /= radix;
+    }
+    if digits.is_empty() {
+        digits.push(b'0');
     }
     let mut out = String::with_capacity(digits.len() + 1);
-    if value < 0 {
+    if negative {
         out.push('-');
     }
     for &digit in digits.iter().rev() {
         out.push(char::from(digit));
     }
     out
+}
+
+/// Replaces `mag` with `mag / divisor`, dropping the leading zero limbs, and
+/// returns `mag % divisor` (`divisor` is a conversion base, `2..=36`).
+fn div_mod_small(mag: &mut Vec<u64>, divisor: u128) -> u32 {
+    let mut remainder: u128 = 0;
+    for limb in mag.iter_mut().rev() {
+        let current = (remainder << 64) | u128::from(*limb);
+        *limb = (current / divisor) as u64;
+        remainder = current % divisor;
+    }
+    trim_mag(mag);
+    remainder as u32
+}
+
+/// Drops the leading zero limbs of a little-endian magnitude.
+fn trim_mag(mag: &mut Vec<u64>) {
+    while mag.last() == Some(&0) {
+        mag.pop();
+    }
+}
+
+/// The digit string for an **integer** term — a small integer or an
+/// arbitrary-precision bignum — in `base`. The shared core of
+/// `integer_to_list/1,2` and `integer_to_binary/1,2`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a float or any other
+/// non-integer (`integer_to_list(1.0)` in the oracle).
+pub(crate) fn integer_digits(term: Eterm, base: u32) -> Result<String> {
+    if access::is_small(term) {
+        let value = signed_value(term);
+        return Ok(mag_to_digits(value < 0, &[value.unsigned_abs()], base));
+    }
+    if access::is_big(term) {
+        let (negative, digits) = beam_codec::term::big_parts(term)?;
+        return Ok(mag_to_digits(negative, digits, base));
+    }
+    Err(badarg())
 }
 
 /// The value of the digit `byte` in `base`, or `None` when it is not a valid
@@ -127,14 +172,19 @@ fn digit_value(byte: u8, base: u32) -> Option<u32> {
 
 /// Parses the whole of `text` as an integer in `base`, as
 /// `erts_internal:list_to_integer/2` and `binary_to_integer/2` do (an optional
-/// `+`/`-`, then digits).
+/// `+`/`-`, then digits), returning the sign and the little-endian `u64` magnitude
+/// of an **arbitrary-precision** result. The caller materializes it with
+/// [`crate::arith::int_from_mag`], which promotes to a bignum past the 60-bit
+/// small range (the `big_from_charbuf` fold-in the oracle uses).
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a bad character or a
-/// missing digit; [`BeamError::SystemLimit`] for a value beyond the 60-bit small
-/// range (real Erlang promotes to a bignum, see the module docs).
-pub(crate) fn parse_integer(text: &str, base: u32) -> Result<i64> {
+/// missing digit (`list_to_integer("")`, `("1a")`). A magnitude that exceeds
+/// [`beam_codec::term::make_big`]'s `BIG_ARITY_MAX` limb bound is reported by the
+/// materializer as `system_limit`, exactly as the oracle reports
+/// `list_to_integer` of a >1.26M-digit string.
+pub(crate) fn parse_integer(text: &str, base: u32) -> Result<(bool, Vec<u64>)> {
     let bytes = text.as_bytes();
     let (negative, digits) = match bytes.first() {
         Some(b'-') => (true, &bytes[1..]),
@@ -144,23 +194,23 @@ pub(crate) fn parse_integer(text: &str, base: u32) -> Result<i64> {
     if digits.is_empty() {
         return Err(badarg());
     }
-    // `i64::MAX + 1` is the smallest magnitude that cannot be a small integer, so
-    // anything beyond it is reported as a limit rather than as a wrong value.
-    let ceiling: u128 = (i64::MAX as u128) + 1;
-    let mut magnitude: u128 = 0;
+    let radix = u128::from(base);
+    let mut magnitude: Vec<u64> = Vec::new();
     for &byte in digits {
         let digit = digit_value(byte, base).ok_or_else(badarg)?;
-        magnitude = magnitude * u128::from(base) + u128::from(digit);
-        if magnitude > ceiling {
-            return Err(system_limit());
+        // `magnitude = magnitude * base + digit`, one limb at a time.
+        let mut carry = u128::from(digit);
+        for limb in magnitude.iter_mut() {
+            let value = u128::from(*limb) * radix + carry;
+            *limb = value as u64;
+            carry = value >> 64;
+        }
+        if carry != 0 {
+            magnitude.push(carry as u64);
         }
     }
-    let signed = if negative {
-        -(magnitude as i128)
-    } else {
-        magnitude as i128
-    };
-    i64::try_from(signed).map_err(|_| system_limit())
+    trim_mag(&mut magnitude);
+    Ok((negative, magnitude))
 }
 
 // ---------------------------------------------------------------------------
