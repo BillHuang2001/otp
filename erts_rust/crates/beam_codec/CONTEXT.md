@@ -244,10 +244,12 @@ by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded
 4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
 `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
 **Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
-result):** `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node identity), `68`
-(distribution header — `beam_dist`'s); plus any atom name not representable in the emitted encoding.
-**Obsolete tags rejected as `BadArg`** (as the C does): `117 FUN` (removed in OTP 23,
-`external.c:6399-6404`) and `78 NEW_CACHE` (dead `#if 0`, `external.h:77-81`).
+result):** `67 RECORD` (native record — blocked on a `beam_term` record layout, see §Known Issues);
+plus any atom name not representable in the emitted encoding.
+**Tags rejected as malformed `BadArg`** (exactly as the C term decoder does): `68 DIST_HEADER` (a
+distribution-transport wrapper, never a term — `goto error`, `external.c:6464`; the `'D'` framing is
+`beam_dist`'s), `117 FUN` (removed in OTP 23, `external.c:6399-6404`) and `78 NEW_CACHE` (dead
+`#if 0`, `external.h:77-81`).
 
 ### Fun encodings (`EXPORT_EXT` `113` / `NEW_FUN_EXT` `112`)
 Both fun tags are handled **inside the shared term walker** (`Decoder::decode`), so a fun nested in
