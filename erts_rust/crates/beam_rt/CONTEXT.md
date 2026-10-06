@@ -246,17 +246,19 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * **Files ~1000 lines**, split by responsibility. `#![warn(missing_docs)]`; every public item documented.
 
 ## Design Decisions
-* **Atom-table bridge (module-local vs runtime atoms).** A loaded `Module` owns a **module-local
-  `AtomTable`** (its `Atu8` wire order) and the engine compares/prints atoms against *that* table
-  (`beam_engine/src/interpreter.rs` `cmp(.., &module.atom_table)`). `beam_bifs`' `BifContext` also
-  needs an `&AtomTable` for name resolution. To keep BIF-constructed atoms comparable with the
-  engine's, `RuntimeContext::call_bif` passes the **module's atom table** (not a separate global one)
-  — so every atom a BIF returns is a `make_atom` of an index in the table the engine uses. `Runtime`
-  additionally owns a **global runtime `AtomTable`**, seeded at boot, used only by
-  `system_info`/`format_term` where no module is in play. Consequence (documented): a BIF that names
-  an atom absent from the current module's table returns `BeamError::TermNotFound`; this is a
-  Milestone-1 limitation, not a design hole — a later revision interns module atoms into the global
-  table at load time.
+* **One shared atom table (the code server's).** There is **no** separate module-local / global split:
+  `CodeServer` owns **one** `AtomTable`, every module it loads is interned into it
+  (`CodeServer::load_bytes` re-runs the loader pipeline seeded with that table), and
+  `RuntimeContext::call_bif` hands `beam_bifs`' `BifContext` that same table. So an atom a BIF builds
+  is an index the engine compares against (`beam_engine`'s `cmp(.., &module.atom_table)`, whose prefix
+  is the shared table) and the printer (`src/format.rs`) names, for **every** loaded module —
+  `Runtime::intern`/`atoms` are thin delegates to it. Indices are assigned in insertion order and never
+  renumber. A BIF that must *create* a new atom (`binary_to_term`, `list_to_atom`, `binary_to_atom`)
+  goes through `PendingInterner`: `BifContext` borrows the table immutably, so the interner records the
+  name (predicting `base + pending` — exact because interning is append-only and single-threaded) and
+  the runtime commits the recorded names into the shared table, in order, right after the call — at
+  exactly the indices the BIF already used. This is what makes a `binary_to_term`-decoded atom
+  nameable (`wire/decode_reference_atom_blob` / `..._map_blob` agree with the oracle).
 * **Heap lifetime.** `Runtime` **owns** the process heap (`heap`) so a returned `Eterm` stays valid
   after `run_*` returns (the `RuntimeContext` only borrows it). `system_info`/`format_term` use a
   separate `info_heap`, `reset()` at the start of each call — so a term returned by `system_info` is
