@@ -102,7 +102,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
 | `beam_bifs` | `BifRegistry` + core `erlang` BIFs (arith, comparison, type tests, term ops) + `io` floor |
 | `beam_ets` | `set` + `ordered_set` core ops (`new/insert/lookup/delete/select`) |
-| `beam_io` | `mio` poller/reactor + `Port` + one built-in driver |
+| `beam_io` | `mio` poller/reactor + `Port`/`PortRegistry` + port-task scheduling + built-in `fd`/`efile` **and OS-child `spawn`** drivers |
 | `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
 
 ## Term/heap foundation: maps · bitstrings · refc binaries (current state)
