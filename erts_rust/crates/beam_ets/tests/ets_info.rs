@@ -90,6 +90,71 @@ fn metadata_getters_and_info_entries() {
     );
 }
 
+/// A `private` table reports both concurrency flags as `false`, whatever was
+/// requested; `public`/`protected` report the requested values, and `compressed`
+/// is **not** forced off.
+///
+/// Verified against the system `erl` (OTP 29 / erts-17.1), which clears the
+/// fine-locked flag for `DB_PRIVATE` tables:
+/// * `ets:new(t, [private, {write_concurrency,true}, {read_concurrency,true}])` →
+///   `write_concurrency => false`, `read_concurrency => false`;
+/// * the same options on a `protected`/`public` table → `true`/`true`;
+/// * `ets:new(t, [private, compressed])` → `compressed => true`.
+#[test]
+fn private_tables_report_the_concurrency_flags_as_false() {
+    let mut atoms = AtomTable::new();
+    let true_atom = make_atom(atoms.intern("true"));
+    let false_atom = make_atom(atoms.intern("false"));
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        let mut opts = TableOptions::new();
+        opts.set_access(access)
+            .set_write_concurrency(true)
+            .set_read_concurrency(true)
+            .set_compressed(true);
+        let concurrency = opts.concurrency();
+        let t = Table::new(TableId::next(), opts).unwrap();
+
+        let expected = access != Access::Private;
+        let flag_atom = if expected { true_atom } else { false_atom };
+
+        let info = t.info();
+        assert_eq!(info.write_concurrency, expected, "{access:?} write_concurrency");
+        assert_eq!(info.read_concurrency, expected, "{access:?} read_concurrency");
+        // `private` does not suppress compression.
+        assert!(info.compressed, "{access:?} keeps compressed");
+        assert_eq!(
+            concurrency == beam_ets::Concurrency::None,
+            !expected,
+            "{access:?} concurrency mode follows the normalized flags"
+        );
+
+        let entries = info.entries(&mut atoms);
+        for (field, want) in [
+            ("write_concurrency", flag_atom),
+            ("read_concurrency", flag_atom),
+            // The oracle reports `compressed => true` for a private table.
+            ("compressed", true_atom),
+        ] {
+            assert_eq!(
+                info_entry(&entries, &atoms, field),
+                Some(want),
+                "{access:?} `{field}`"
+            );
+        }
+    }
+
+    // The order of the options does not matter: the rule is applied on read.
+    let mut flag_first = TableOptions::new();
+    flag_first
+        .set_write_concurrency(true)
+        .set_read_concurrency(true)
+        .set_access(Access::Private);
+    let t = Table::new(TableId::next(), flag_first).unwrap();
+    assert!(!t.info().write_concurrency);
+    assert!(!t.info().read_concurrency);
+}
+
 #[test]
 fn table_id_next_returns_distinct_increasing_ids() {
     let first = TableId::next();

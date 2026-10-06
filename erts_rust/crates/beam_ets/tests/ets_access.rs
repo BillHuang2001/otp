@@ -457,3 +457,65 @@ fn a_denied_write_never_reports_success() {
     drop(view);
     assert_eq!(t.size(), before);
 }
+
+/// The multi-kind element-list lookups are read-gated exactly like the scalar
+/// ones: a denied read is `badarg` for both the `/3` and the `/4` form, and the
+/// permitted ones return the element list (never a scalar).
+#[test]
+fn the_element_list_lookups_follow_the_read_gate() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(512);
+            let mut opts = TableOptions::new();
+            opts.set_kind(beam_ets::TableKind::Bag);
+            opts.set_access(access);
+            let mut t = Table::new(TableId::next(), opts).unwrap();
+            t.set_owner(Some(owner));
+            {
+                let mut as_owner = t.as_requester(Some(owner));
+                as_owner.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+                as_owner.insert(object(&mut heap, 1, 20), &atoms).unwrap();
+            }
+
+            let (read_ok, _) = expected(access, owner, requester);
+            let tag = format!("bag {access:?}/{who}");
+            let default = make_small(-1);
+            let view = t.as_requester(requester);
+
+            assert_gate(
+                view.lookup_element_all(make_small(1), 2, &atoms),
+                read_ok,
+                &format!("{tag} lookup_element_all"),
+            );
+            assert_gate(
+                view.lookup_element_all_or(make_small(1), 2, default, &atoms),
+                read_ok,
+                &format!("{tag} lookup_element_all_or"),
+            );
+
+            if read_ok {
+                let values = view.lookup_element_all(make_small(1), 2, &atoms).unwrap();
+                assert_eq!(values.len(), 2, "{tag}");
+                assert!(
+                    values
+                        .iter()
+                        .any(|v| eq(*v, make_small(10), &atoms))
+                        && values.iter().any(|v| eq(*v, make_small(20), &atoms)),
+                    "{tag}: both objects' elements are projected"
+                );
+                // An absent key is `None` (the caller substitutes the default).
+                assert_eq!(
+                    view.lookup_element_all_or(make_small(9), 2, default, &atoms)
+                        .unwrap(),
+                    None,
+                    "{tag}"
+                );
+            }
+        }
+    }
+}
