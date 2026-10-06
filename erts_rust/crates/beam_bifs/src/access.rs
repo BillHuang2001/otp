@@ -22,8 +22,8 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
 use beam_term::{
-    Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_ARITY_OFFS, HEADER_FLONUM,
-    HEAP_BITS_SUBTAG, REF_SUBTAG,
+    Atom, AtomTable, Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_ARITY_OFFS,
+    HEADER_FLONUM, HEAP_BITS_SUBTAG, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -561,6 +561,148 @@ pub(crate) fn flatmap_pairs(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
     // alive regardless).
     let (keys, values) = unsafe { beam_term::thing::flatmap_parts(term) };
     Ok((keys.to_vec(), values.to_vec()))
+}
+
+// ---------------------------------------------------------------------------
+// Native records (`beam_term::record` owns the frozen layout; `erl_record.h`)
+//
+// Milestone-1 had no record layout; `beam_term::record` now provides it, so the
+// record BIFs (`crate::records`) and the native half of `erlang:is_record/2,3`
+// (`crate::type_test`) read and write through these safe wrappers. Every
+// `beam_term::record::*` function is `unsafe` (it dereferences a header word), so
+// the wrappers below carry the crate's single `#[allow(unsafe_code)]`.
+// ---------------------------------------------------------------------------
+
+/// Builds a native-record construction block on `heap` and returns the tagged
+/// **instance** root (`record_defs`/`write_record`, `erl_record.h:41-96`).
+///
+/// Reserves `record_block_words(fields.len())` words from the caller's
+/// `beam_alloc::Heap`, then lays out the frozen
+/// `[field_order tuple][definition][instance]` block with
+/// [`beam_term::write_record`]. `fields` are `(key-atom-term, value)` pairs in
+/// **declaration** order; the definition hash is `make_small(0)` because this
+/// crate cannot compute the C `make_hash2` value (see `beam_term::record`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when [`beam_term::write_record`] rejects the fields — a
+/// non-atom key, a duplicate key, or an arity beyond `MAX_ARITYVAL`
+/// (`TermError::BadRecord` reconciled to `badarg`); otherwise propagates
+/// [`BeamError::Alloc`](beam_common::BeamError::Alloc) when `heap` cannot fit the
+/// block.
+pub(crate) fn native_record_write(
+    heap: &mut Heap,
+    module: Atom,
+    name: Atom,
+    is_exported: bool,
+    fields: &[(Eterm, Eterm)],
+) -> Result<Eterm> {
+    let words = beam_term::record_block_words(fields.len());
+    // SAFETY: `alloc_words` hands out `words` exclusively-owned, writable words.
+    let p = unsafe { heap.alloc_words(words)? };
+    // SAFETY: `p` is the base of those `words` words; `write_record` writes all of
+    // them (the `field_order` tuple, the definition and the instance) and returns a
+    // boxed root into the same block, which stays live (and unmoved) for as long as
+    // `heap` does.
+    Ok(unsafe {
+        beam_term::write_record(p, module, name, is_exported, fields, make_small(0))?
+    })
+}
+
+/// The definition term of a native-record instance
+/// (`record_definition`, the boxed pointer at instance word 1).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `rec` is not a well-formed native record
+/// (`TermError::BadRecord` reconciled to `badarg`).
+pub(crate) fn native_record_definition(rec: Eterm) -> Result<Eterm> {
+    // SAFETY: `rec` is a live machine word; `record_definition` returns
+    // `TermError::BadRecord` (never a panic) for a non-record or a malformed block.
+    Ok(unsafe { beam_term::record_definition(rec)? })
+}
+
+/// The `module` atom term of a native-record definition (word 3).
+///
+/// `def` must come from [`native_record_definition`].
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition.
+pub(crate) fn native_record_definition_module(def: Eterm) -> Result<Eterm> {
+    // SAFETY: `def` is a live definition term obtained from
+    // `native_record_definition`; `record_definition_module` re-validates it.
+    Ok(unsafe { beam_term::record_definition_module(def)? })
+}
+
+/// The `name` atom term of a native-record definition (word 4).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition.
+pub(crate) fn native_record_definition_name(def: Eterm) -> Result<Eterm> {
+    // SAFETY: as [`native_record_definition_module`].
+    Ok(unsafe { beam_term::record_definition_name(def)? })
+}
+
+/// The `is_exported` atom term (`true`/`false`) of a native-record definition
+/// (word 5).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition.
+pub(crate) fn native_record_definition_is_exported(def: Eterm) -> Result<Eterm> {
+    // SAFETY: as [`native_record_definition_module`].
+    Ok(unsafe { beam_term::record_definition_is_exported(def)? })
+}
+
+/// The definition's field **keys** in **declaration** order
+/// (`records_get_field_names_1`, `erl_record.c:1298-1326`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `def` is not a well-formed definition or its
+/// `field_order` is malformed.
+pub(crate) fn native_record_declaration_keys(def: Eterm) -> Result<Vec<Eterm>> {
+    // SAFETY: as [`native_record_definition_module`].
+    Ok(unsafe { beam_term::record_declaration_keys(def)? })
+}
+
+/// The value of the field whose key equals `key`, or `None` when no key matches
+/// (`records_get_2`, `erl_record.c:1247-1274`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `rec` is not a well-formed native record.
+pub(crate) fn native_record_get(
+    rec: Eterm,
+    key: Eterm,
+    atoms: &AtomTable,
+) -> Result<Option<Eterm>> {
+    // SAFETY: `rec` is a live machine word; `record_get` returns
+    // `TermError::BadRecord` for a non-record and never indexes out of bounds.
+    Ok(unsafe { beam_term::record_get(rec, key, atoms)? })
+}
+
+/// The native-record branch of `is_record_2` (`erl_bif_op.c:306-312`) — whether
+/// `rec` is a native record whose definition name is `name`.
+///
+/// A non-record returns `false` (never a panic).
+#[inline]
+pub(crate) fn native_record_name_is(rec: Eterm, name: Atom) -> bool {
+    // SAFETY: `rec` is a live machine word; `record_name_is` is a total predicate
+    // that dereferences only a validated record header.
+    unsafe { beam_term::record_name_is(rec, name) }
+}
+
+/// `erl_is_native_record` (`erl_record.c:214-221`) — whether `rec` is a native
+/// record whose definition module and name are `module`/`name`.
+///
+/// A non-record returns `false` (never a panic).
+#[inline]
+pub(crate) fn native_record_is_native(rec: Eterm, module: Atom, name: Atom) -> bool {
+    // SAFETY: as [`native_record_name_is`].
+    unsafe { beam_term::record_is_native(rec, module, name) }
 }
 
 #[cfg(test)]

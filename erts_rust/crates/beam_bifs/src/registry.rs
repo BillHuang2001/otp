@@ -63,6 +63,7 @@ impl BifRegistry {
         crate::io::register(&mut reg);
         crate::ets::register(&mut reg);
         crate::port::register(&mut reg);
+        crate::records::register(&mut reg);
         reg
     }
 
