@@ -272,9 +272,6 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   (the C resolves the definition through the code-server record table, which this runtime lacks).
 
 ## Known Structural Debt (candidates for the next pass)
-- `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
-  `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
-  (Prevent-Duplication).
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
