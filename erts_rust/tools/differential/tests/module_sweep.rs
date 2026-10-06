@@ -32,10 +32,12 @@
 
 use std::collections::BTreeMap;
 
-use differential::harness::{resolve_context, run_case_in};
+use differential::harness::{run_case_in, RuntimeContext};
 use differential::module_build;
 use differential::runtime::resolve_oracle;
 use differential::{Case, CaseKind, Contract, Golden, ModuleRun, Verdict};
+
+mod common;
 
 /// One sweep entry: a real system module + function invoked with integer arguments.
 struct Entry {
@@ -253,7 +255,12 @@ fn real_module_execution_sweep_never_mismatches() {
         }
     }
 
-    let context = resolve_context().expect("the oracle resolves (checked above)");
+    // An explicit context so the sweep observes the freshly built debug `beam_rt` rather
+    // than the (stale-prone) `release`-first workspace default.
+    let context = RuntimeContext {
+        oracle: resolve_oracle().expect("the oracle resolves (checked above)"),
+        rust: common::fresh_rust_spec(),
+    };
     let sources = wrapper_sources();
 
     let mut agree = 0usize;

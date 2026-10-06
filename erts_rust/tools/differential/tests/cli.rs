@@ -8,6 +8,8 @@
 use std::path::PathBuf;
 use std::process::Command;
 
+mod common;
+
 /// The observed result of one child-process invocation.
 struct Invocation {
     code: Option<i32>,
@@ -68,10 +70,25 @@ fn oracle_available() -> bool {
     differential::runtime::resolve_oracle().is_ok()
 }
 
-/// Whether a Rust runtime is resolvable from the test process (the child binary resolves
-/// the same one, since both embed the same `CARGO_MANIFEST_DIR`).
+/// Whether the fresh Rust runtime (the one the tests inject as `$BEAM_RT`) is available.
+///
+/// This must mirror the path actually injected: left to its own default resolution the
+/// child binary would prefer `target/release/beam_rt`, so a stale release build could
+/// shadow the fresh debug build. [`common::fresh_rust_runtime`] is the sibling of this
+/// crate's test binary — the artifact cargo just built.
 fn rust_runtime_available() -> bool {
-    matches!(differential::runtime::resolve_rust(), Ok(Some(_)))
+    common::fresh_rust_runtime().is_some()
+}
+
+/// The `$BEAM_RT` injection for a child invocation that would otherwise rely on **default**
+/// resolution: the freshly built debug runtime, or nothing when it was not built (the child
+/// then reports the Rust side as `unsupported` — honest, never a fabricated pass).
+fn fresh_beam_rt_env<'a>(fresh: &'a Option<PathBuf>) -> Vec<(&'static str, &'a str)> {
+    fresh
+        .as_ref()
+        .map(|path| ("BEAM_RT", path.to_str().expect("utf-8 runtime path")))
+        .into_iter()
+        .collect()
 }
 
 /// Whether the module-run cases can be exercised (they need the system `erlc`).
@@ -256,11 +273,16 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     // not, the module-run cases degrade to `unsupported`/`skipped` (never a fabricated pass).
     let agreement_possible = rust_runtime_available() && erlc_available();
     if !agreement_possible {
-        eprintln!("NOTE: no usable ($BEAM_RT + erlc) pair — module agreement not exercised");
+        eprintln!("NOTE: no usable (fresh beam_rt + erlc) pair — module agreement not exercised");
     }
     let scratch = Scratch::new("suite");
+    // Inject the freshly built debug `beam_rt`: the workspace default would prefer a
+    // `target/release/beam_rt`, and a stale release artifact must never shadow the fresh
+    // build this test is meant to exercise.
+    let fresh = common::fresh_rust_runtime();
+    let env = fresh_beam_rt_env(&fresh);
 
-    let lenient = invoke(&["suite", "--json", "--out", &scratch.arg()], &[]);
+    let lenient = invoke(&["suite", "--json", "--out", &scratch.arg()], &env);
     let json: serde_json::Value =
         serde_json::from_str(&lenient.stdout).expect("the suite report parses");
     assert_eq!(json["schema"], "differential/1");
@@ -327,13 +349,17 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     } else {
         assert_eq!(agree, 0, "nothing may agree without a usable Rust runtime");
     }
-    assert!(
-        unsupported + skipped >= 1,
-        "the expression corpus is still a capability gap somewhere: {}",
+    // Every case is accounted for by exactly one verdict bucket, so this holds both today
+    // (with capability gaps) and once the gate is fully green — unlike a hard-coded
+    // `unsupported + skipped >= 1`, which would pin the current gap count.
+    assert_eq!(
+        agree + unsupported + skipped + mismatched.len() as u64,
+        json["summary"]["total"].as_u64().expect("a total count"),
+        "every case must fall into exactly one verdict bucket: {}",
         lenient.stdout
     );
 
-    let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &[]);
+    let strict = invoke(&["suite", "--strict", "--out", &scratch.arg()], &env);
     let strict_expected = if !mismatched.is_empty() || unsupported + skipped > 0 {
         1
     } else {
@@ -344,7 +370,7 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     // A single case can be re-run by id without touching anything else.
     let one = invoke(
         &["run", "etf/term_to_binary_tuple", "--json", "--out", &scratch.arg()],
-        &[],
+        &env,
     );
     assert_eq!(one.code, Some(0), "{}", one.describe());
     let json: serde_json::Value = serde_json::from_str(&one.stdout).expect("parses");
@@ -360,12 +386,16 @@ fn compare_evaluates_an_ad_hoc_expression_without_a_golden() {
         return;
     }
     if !rust_runtime_available() {
-        eprintln!("SKIP: no Rust runtime ($BEAM_RT / target beam_rt) — nothing to compare");
+        eprintln!("SKIP: no fresh Rust runtime (target/debug/beam_rt) — nothing to compare");
         return;
     }
+    // Default resolution would prefer a (possibly stale) `target/release/beam_rt`; inject
+    // the freshly built debug runtime instead.
+    let fresh = common::fresh_rust_runtime();
+    let env = fresh_beam_rt_env(&fresh);
     let invocation = invoke(
         &["compare", "length([a,b,c])", "--json", "--out", &Scratch::new("compare").arg()],
-        &[],
+        &env,
     );
     assert_eq!(invocation.code, Some(0), "{}", invocation.describe());
     let json: serde_json::Value = serde_json::from_str(&invocation.stdout).expect("parses");

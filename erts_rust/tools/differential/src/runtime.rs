@@ -10,6 +10,14 @@
 //!   `Ok(None)`; the harness then reports the Rust side as *unsupported* instead of
 //!   inventing a result.
 //!
+//! The workspace default searches `release` **before** `debug` on purpose: it is what the
+//! real CLI and the CI `gate.sh` want, so the fastest artifact present is measured. That
+//! order is *wrong* under `cargo test`, where only the `debug` artifacts are (re)built — a
+//! stale `target/release/beam_rt` could then shadow the fresh build. The integration tests
+//! therefore inject `$BEAM_RT` (the fresh debug `beam_rt` sibling of the test binary; see
+//! `../../tests/common/mod.rs`), so a stale release binary is never observed by a test.
+//! This is purely a resolution *preference*: the order itself is never changed here.
+//!
 //! The harness never inspects runtime internals: it only spawns the program, feeds it
 //! argv with `stdin` closed, and records the observed stdout/stderr/exit status. The two
 //! runtimes receive **identical** argv for the expression corpus cases but **different**
@@ -173,6 +181,12 @@ pub fn resolve_rust() -> Result<Option<RuntimeSpec>> {
 ///   otherwise this is a loud [`Error::Env`].
 /// * `manifest_dir` — the crate directory (`$CARGO_MANIFEST_DIR`); the workspace default
 ///   is `<manifest_dir>/../../target/{release,debug}/beam_rt`.
+///
+/// The `release` profile is searched before `debug` deliberately: the real CLI and
+/// `gate.sh` want the fastest artifact available. Integration tests must **not** rely on
+/// this default — they inject `$BEAM_RT` pointing at the freshly built debug `beam_rt`
+/// (see `../../tests/common/mod.rs`), so a stale `release` binary can never shadow a fresh
+/// `debug` build. The preference order is intentionally left unchanged.
 pub fn resolve_rust_from(
     beam_rt: Option<OsString>,
     manifest_dir: &Path,

@@ -16,6 +16,8 @@ use differential::runtime::{
     eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, RuntimeSpec,
 };
 
+mod common;
+
 /// The canonical `{ok,42}` ETF probe line (the frozen A.2 golden).
 const OK_42_GOLDEN: &str = "ok <<131,104,2,119,2,111,107,97,42>>";
 
@@ -54,7 +56,13 @@ fn oracle_reproduces_the_ok_42_golden() {
     let golden = check_golden(&observation, &case.golden);
     assert!(golden.matched, "golden drift: {:?}", golden.diffs);
 
-    let outcome = run_case(case).expect("harness run");
+    // Observe the real Rust runtime through an explicit context so the freshly built debug
+    // `beam_rt` is used, never the (stale-prone) `release`-first workspace default.
+    let context = RuntimeContext {
+        oracle,
+        rust: common::fresh_rust_spec(),
+    };
+    let outcome = run_case_in(&context, case).expect("harness run");
     assert!(outcome.golden.matched, "{:?}", outcome.golden.diffs);
     assert_eq!(outcome.eval, case.eval());
 }
