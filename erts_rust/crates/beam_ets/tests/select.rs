@@ -5,10 +5,13 @@
 //! `erl` (OTP 29 / erts-17.1, `erl -noshell -eval '…' -s init stop`); the probe
 //! results are quoted next to the assertion.
 
+use std::rc::Rc;
+
 use beam_alloc::Heap;
 use beam_term::prelude::*;
 use beam_common::BeamError;
 use beam_ets::prelude::*;
+use beam_ets::select::expr::set_arith_hook;
 
 /// A table of the atoms the specs below reference. `true`/`false` must be
 /// interned: guard results are the atoms they name.
@@ -719,6 +722,65 @@ fn arithmetic_outside_the_small_integer_subset_is_a_typed_error() {
             "{op} by zero is badarg"
         );
     }
+}
+
+/// A custom arithmetic hook that answers `/` with the truncated integer quotient,
+/// so a test can prove [`set_arith_hook`] really is consulted (and that everything
+/// it does not handle can defer to [`DefaultArithHook`]).
+#[derive(Debug)]
+struct TruncatingDivHook;
+
+impl ArithHook for TruncatingDivHook {
+    fn eval(
+        &self,
+        op: ArithOp,
+        args: &[Eterm],
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> beam_common::Result<Eterm> {
+        match (op, args) {
+            (ArithOp::Div, [left, right]) => {
+                Ok(make_small(signed_value(*left) / signed_value(*right)))
+            }
+            _ => DefaultArithHook.eval(op, args, atoms, heap),
+        }
+    }
+}
+
+#[test]
+fn a_custom_arith_hook_takes_over_and_the_default_returns() {
+    // The seam `eval` reaches for: with no hook, `/` is outside the default's
+    // small-integer subset (its Erlang result is a float); with one installed, `/`
+    // is whatever the hook answers; clearing it restores the default.
+    let atoms = atoms();
+    let mut heap = Heap::new(8192).expect("test heap");
+    let mut table = new_table(TableKind::Set);
+    table
+        .insert(object(&mut heap, 1, at(&atoms, "a"), 10), &atoms)
+        .unwrap();
+    let head = at(&atoms, "_");
+    let body = call(&mut heap, at(&atoms, "/"), &[make_small(4), make_small(2)]);
+
+    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "'/' with no hook");
+
+    set_arith_hook(Some(Rc::new(TruncatingDivHook) as Rc<dyn ArithHook>));
+    // The custom hook answers `/`; everything else still goes through the default.
+    let got = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap();
+    assert_eq!(got, vec![make_small(2)]);
+    let product = call(
+        &mut heap,
+        at(&atoms, "*"),
+        &[make_small(30), make_small(6)],
+    );
+    assert_eq!(
+        select_one(&table, head, &[], &[product], &atoms, &mut heap).unwrap(),
+        vec![make_small(180)]
+    );
+
+    set_arith_hook(None);
+    let err = select_one(&table, head, &[], &[body], &atoms, &mut heap).unwrap_err();
+    assert_unsupported_arithmetic(err, "'/' after clearing the hook");
 }
 
 #[test]

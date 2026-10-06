@@ -725,14 +725,14 @@ fn not_small(op: &str) -> BeamError {
 /// * `/` ⇒ `unsupported_ets`: its Erlang result is **always** a float (`1/2` is
 ///   `0.5`, `4/2` is `2.0`).
 /// * `div`/`rem` by zero ⇒ `badarg`, which is what the oracle raises.
-/// * A **negative** shift count ⇒ `badarg`. ⚠ This is the one documented
-///   divergence from the oracle: the C `erts_shift`
+/// * A **negative** shift count ⇒ `badarg`. This is the one documented
+///   divergence: the C `erts_shift`
 ///   (`../../erts/emulator/beam/erl_arith.c:229-236`) *reverses the direction*
-///   instead (`8 bsr -1` is `16`, `1 bsl -1` is `0`). Reversing is outside this
-///   hook's checked-small subset, and the crate's convention for an operation it
-///   does not implement is a typed refusal — a `badarg` here is scoped out on
-///   purpose, not a guess. A shift count of 64 or more is refused the same way
-///   (the oracle saturates `bsr` and widens `bsl` to a bignum).
+///   instead (`8 bsr -1` is `16`, `1 bsl -1` is `0`) and so the oracle answers
+///   these. The default hook scopes a negative count out, like every other case it
+///   cannot answer exactly — it never guesses a value. A shift count of 64 or more
+///   is refused the same way (the oracle saturates `bsr` to `0`/`-1` and widens
+///   `bsl` to a bignum).
 /// * A wrong operand count ⇒ `badarg`; only reachable by calling the seam
 ///   directly, since [`decode_call`] rejects it at compile time.
 fn default_arith(op: ArithOp, args: &[Eterm]) -> Result<Eterm> {
