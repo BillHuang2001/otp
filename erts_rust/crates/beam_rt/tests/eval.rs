@@ -328,6 +328,87 @@ fn the_binary_segment_probes_agree_with_the_oracle() {
     }
 }
 
+/// The five `boot/*` corpus probes this pass closed: an `erlang:spawn/1` (or
+/// `spawn_link/1`) process sends its parent a message, which the parent's `receive` picks up
+/// from the mailbox. They previously hit the typed *capability gap* (the `-eval` evaluator
+/// had no `!` send, no bare-`receive` scheduler pump and no `spawn`); they now **AGREE** with
+/// the oracle.
+///
+/// Each expression is the corpus's own text (`tools/differential/src/corpus/boot.rs`) and is
+/// run through the **same** probe wrapper and argv the corpus builds, so the capability can
+/// never silently regress even where the oracle `erl` is unavailable. The `receive … after
+/// 1000 -> timeout` fallback in each probe makes a lost or dropped message an observable
+/// `ok timeout` divergence rather than a hang — and every golden below is the oracle's own
+/// `ok <value>` line.
+#[test]
+fn the_boot_spawn_probes_agree_with_the_oracle() {
+    let cases: &[(&str, &str, &str)] = &[
+        (
+            "boot/receive_message_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! hello end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok hello",
+        ),
+        (
+            "boot/receive_computed_value_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! 21 * 2 end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok 42",
+        ),
+        (
+            "boot/receive_pattern_match_from_spawned_process",
+            "begin Self = self(), spawn(fun() -> Self ! {self(), ok} end), \
+             receive {From, _} -> From =/= Self after 1000 -> timeout end end",
+            "ok true",
+        ),
+        (
+            "boot/receive_ping_pong_between_processes",
+            "begin Self = self(), P = spawn(fun() -> \
+             receive {ping, From} -> From ! pong end end), \
+             P ! {ping, Self}, receive M -> M after 1000 -> timeout end end",
+            "ok pong",
+        ),
+        (
+            "boot/spawn_link_notifies_caller",
+            "begin Self = self(), spawn_link(fun() -> Self ! linked end), \
+             receive M -> M after 1000 -> timeout end end",
+            "ok linked",
+        ),
+    ];
+
+    for (id, expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{id}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{id}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{id}: stderr {stderr:?}");
+    }
+}
+
+/// The honest boundary underneath the `spawn` capability: a **bare** `receive` (no `after`)
+/// in `-eval` has no host timer to block on, and with nothing runnable to deliver a message it
+/// is a typed *capability gap* — exit 3 with exactly one `beam_rt: unsupported: …` line, never
+/// a hang and never a wrong `ok`.
+///
+/// The `receive … after 1000` fallback the `spawn` probes above rely on is what keeps them
+/// observable; this pins the complementary case. The gap is uncatchable (it travels as an
+/// uncatchable control signal), so the probe's own `try … catch` cannot turn it into an
+/// apparent `exception`, and stdout stays empty.
+#[test]
+fn a_bare_receive_with_no_sender_is_unsupported_not_a_hang() {
+    let (stdout, exit, stderr) = probe("receive X -> X end", &[], Kind::Value);
+    assert_eq!(exit, 3, "stdout {stdout:?} stderr {stderr:?}");
+    assert!(stdout.is_empty(), "stdout {stdout:?}");
+    assert!(
+        stderr.starts_with("beam_rt: unsupported: "),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
+}
+
 /// The A.4 driver probe the differential corpus carries
 /// (`driver/port_backed_by_spawn_driver`): `erlang:open_port/2` **really** starts an OS
 /// process through the `spawn` driver and yields a real internal port.
