@@ -1,4 +1,4 @@
-//! `io:format/1,2`, `io_lib:format/1,2` and the shared format-directive engine.
+//! `io:format/1,2`, `io_lib:format/2,3` and the shared format-directive engine.
 //!
 //! Implements the Milestone-1 `io`/`io_lib` subset (compatibility contract Part I
 //! §A.7). `Format` is a flat proper list of byte-sized small integers (`io_lib`
@@ -6,11 +6,19 @@
 //!
 //! * `io:format/1,2` write the rendered text to the context's [`OutputSink`]
 //!   ([`crate::context::BifContext::write_output`]) and return the atom `ok`.
-//! * `io_lib:format/1,2` return the rendered text as an **iolist** (here a flat
-//!   list of small integers, `NIL` for the empty result) and write nothing.
+//! * `io_lib:format/2,3` return the rendering as the oracle's **deep list** and
+//!   write nothing: literal format characters and the "small" controls (`~s` of an
+//!   atom, `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) are
+//!   spliced flat as individual small integers, while the "non-small" controls
+//!   (`~w`, `~p`, `~W`, `~P` and `~s` of a list/binary) each contribute a single
+//!   **sub-list** element (the exact nesting `io_lib`/`io_lib_pretty` build — see
+//!   [`crate::print::Chunk`]). So `io_lib:format("~w", [42])` is `[[52,50]]`,
+//!   `io_lib:format("a~wb~n", [42])` is `[97,[52,50],98,10]` and
+//!   `io_lib:format("hello", [])` is `[104,101,108,108,111]`.
 //!
-//! Both share one directive engine ([`render_format`]), so their output is
-//! identical by construction.
+//! Both share one directive engine ([`render_format`]), so their text is
+//! identical by construction: `io:format` flattens the chunk tree the
+//! `io_lib:format` list is materialized from.
 //!
 //! # The supported directive set (verified against erts-17.1)
 //!
@@ -68,25 +76,36 @@
 //!   maximum length for `~w`/`~W` and an initial column for `~p`/`~P`.
 //! * Integer directives accept **small integers only** (`~b`/`~x`/`~c` of a bignum
 //!   is `badarg`); the oracle would print the full bignum. A documented gap.
+//! * **`io_lib:format/3` ignores unknown options but not `chars_limit`.** The only
+//!   option erts-17.1 recognises is `{chars_limit, N}`; other elements are ignored
+//!   (verified against the oracle). A *limiting* `chars_limit` (`N >= 0`) selects
+//!   `io_lib_pretty`'s "…"-eliding rendering, which Milestone-1 does not implement,
+//!   so it is rejected with a typed error (`error:unsupported_bif`) rather than
+//!   emitting a wrong (unlimited) line. A non-integer `N` is `badarg`, and a
+//!   non-list `Options` is `badarg`, exactly as in the oracle; a negative
+//!   `chars_limit` (the oracle's default, i.e. no limit) behaves like `format/2`.
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple,
+    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::badarg;
-use crate::print::{format_term, format_term_depth, proper_list, UNLIMITED_DEPTH};
+use crate::error::{badarg, unsupported_bif};
+use crate::print::{
+    adjust_chunk, dup_chars, field_chunk, flatten, proper_list, string_field_chunk, term_chunk,
+    Chunk, UNLIMITED_DEPTH,
+};
 use crate::registry::BifRegistry;
 
-/// Registers `io:format/1,2` and `io_lib:format/1,2`.
+/// Registers `io:format/1,2` and `io_lib:format/2,3`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("io", "format", 1, format_1);
     reg.register("io", "format", 2, format_2);
-    reg.register("io_lib", "format", 1, format_lib_1);
     reg.register("io_lib", "format", 2, format_lib_2);
+    reg.register("io_lib", "format", 3, format_lib_3);
 }
 
 /// `io:format(Format)` — writes `Format` with no arguments and returns `ok`.
@@ -99,42 +118,89 @@ fn format_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     io_format(ctx, args[0], Some(args[1]))
 }
 
-/// `io_lib:format(Format)` — returns the rendering of `Format` as an iolist.
-fn format_lib_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    io_lib_format(ctx, args[0], None)
-}
-
 /// `io_lib:format(Format, Args)` — returns the rendering as an iolist.
 fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     io_lib_format(ctx, args[0], Some(args[1]))
 }
 
+/// `io_lib:format(Format, Args, Options)` — the rendering as an iolist, with the
+/// oracle's `format_options()` (`[{chars_limit, N}]`).
+///
+/// Only the default/unlimited options are reproduced (see [`check_options`]).
+fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    check_options(ctx, args[2])?;
+    io_lib_format(ctx, args[0], Some(args[1]))
+}
+
+/// Validates `io_lib:format/3`'s `Options` list
+/// (`io_lib_format:get_option/3` over `lists:keyfind/3`).
+///
+/// `Options` must be a proper list (`badarg` otherwise, as in the oracle).
+/// Elements other than `{chars_limit, N}` are ignored — the oracle only reads that
+/// one key. A limiting `chars_limit` (`N >= 0`) would need `io_lib_pretty`'s
+/// "…"-eliding rendering, which Milestone-1 does not implement, so it is a typed
+/// error ([`unsupported_bif`]) rather than a wrong (unlimited) line; a negative
+/// `N` is the oracle's default (no limit) and is accepted.
+fn check_options(ctx: &BifContext<'_>, options: Eterm) -> Result<()> {
+    for option in proper_list(options).ok_or_else(badarg)? {
+        if let Some(limit) = chars_limit_option(ctx, option)? {
+            if limit >= 0 {
+                return Err(unsupported_bif());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `N` of a `{chars_limit, N}` element, `None` for any other element (which
+/// the oracle ignores). A `chars_limit` whose value is not a small integer is
+/// `badarg` (the oracle's `chars_limit` is an `integer()`).
+fn chars_limit_option(ctx: &BifContext<'_>, option: Eterm) -> Result<Option<i64>> {
+    if !is_tuple(option) || tuple_size(option) != 2 {
+        return Ok(None);
+    }
+    let tag = tuple_element(option, 0);
+    if !is_atom(tag) || ctx.atoms().name(atom_val(tag)) != Some("chars_limit") {
+        return Ok(None);
+    }
+    let value = tuple_element(option, 1);
+    if !is_small(value) {
+        return Err(badarg());
+    }
+    Ok(Some(signed_value(value)))
+}
+
 /// `io:format`: render, write the result, return `ok`.
 fn io_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<Eterm> {
-    let rendered = render(ctx, format, args)?;
-    ctx.write_output(&rendered)?;
+    let chunks = render_format_of(ctx, format, args)?;
+    ctx.write_output(&flatten(&chunks))?;
     ctx.ok()
 }
 
-/// `io_lib:format`: render and return the bytes as a flat list of small integers.
+/// `io_lib:format`: render and return the oracle's **deep list**.
+///
+/// The list is *not* flat: each literal format character and each "small" control
+/// contributes its own element, while every other control contributes a single
+/// sub-list element (see [`render_format`]).
 fn io_lib_format(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<Eterm> {
-    let rendered = render(ctx, format, args)?;
-    let elems: Vec<Eterm> = rendered
-        .as_bytes()
-        .iter()
-        .map(|&b| ctx.int(i64::from(b)))
-        .collect::<Result<Vec<_>>>()?;
-    ctx.list(&elems)
+    let chunks = render_format_of(ctx, format, args)?;
+    chunks_to_term(ctx, &chunks)
 }
 
-/// The shared body: decode the format list, render against the arguments.
-fn render(ctx: &mut BifContext<'_>, format: Eterm, args: Option<Eterm>) -> Result<String> {
+/// Decodes the format/argument terms and renders them to a chunk list.
+fn render_format_of(
+    ctx: &mut BifContext<'_>,
+    format: Eterm,
+    args: Option<Eterm>,
+) -> Result<Vec<Chunk>> {
     let bytes = format_bytes(format)?;
     let arg_terms = match args {
         Some(term) => proper_list(term).ok_or_else(badarg)?,
         None => Vec::new(),
     };
-    render_format(ctx, &bytes, &arg_terms)
+    let mut chunks = Vec::new();
+    render_format(ctx, &bytes, &arg_terms, &mut chunks)?;
+    Ok(chunks)
 }
 
 /// Decodes the format term: a flat proper list of byte-sized small integers.
@@ -185,29 +251,104 @@ impl Spec {
     }
 }
 
-/// Renders `bytes` against `args`, returning the captured text.
-fn render_format(ctx: &mut BifContext<'_>, bytes: &[u8], args: &[Eterm]) -> Result<String> {
-    let mut out = String::new();
+/// Renders `bytes` against `args` into `out` — the oracle's
+/// `io_lib_format:build_small/2` + `build_limited/5`.
+///
+/// * a literal format character becomes **one element**;
+/// * a *small* control (`io_lib_format:control_small/7`: `~s` of an **atom**,
+///   `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) has its result
+///   spliced **flat**, one character per element (`lists:flatten(S)`);
+/// * any other control (`~w`, `~p`, `~W`, `~P`, `~s` of a list/binary) contributes
+///   its result as a **single sub-list element** (`[S | …]`).
+///
+/// `io:format` flattens `out` to text; `io_lib:format` materializes it as the deep
+/// list the oracle returns.
+fn render_format(
+    ctx: &mut BifContext<'_>,
+    bytes: &[u8],
+    args: &[Eterm],
+    out: &mut Vec<Chunk>,
+) -> Result<()> {
     let mut i = 0usize;
     let mut next_arg = 0usize;
 
     while i < bytes.len() {
         let byte = bytes[i];
         if byte != b'~' {
-            out.push(byte as char);
+            out.push(Chunk::Char(byte as char));
             i += 1;
             continue;
         }
         i += 1;
         let (spec, ctrl) = parse_cseq(bytes, &mut i, args, &mut next_arg)?;
         let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg)?;
-        out.push_str(&piece);
+        if piece.small {
+            splice_flat(out, piece.chunk);
+        } else {
+            out.push(piece.chunk);
+        }
     }
 
     if next_arg != args.len() {
         return Err(badarg());
     }
-    Ok(out)
+    Ok(())
+}
+
+/// One directive's result: the chunk tree plus whether it is a *small* control.
+struct Piece {
+    /// The rendering (`io_lib_format:control_small`'s chars).
+    chunk: Chunk,
+    /// Whether the control is "small" — its characters are spliced flat into the
+    /// outer list rather than inserted as a single sub-list element.
+    small: bool,
+}
+
+impl Piece {
+    /// A control whose characters are spliced flat into the outer list.
+    fn small(chunk: Chunk) -> Self {
+        Piece { chunk, small: true }
+    }
+
+    /// A control whose rendering is one sub-list element.
+    fn element(chunk: Chunk) -> Self {
+        Piece { chunk, small: false }
+    }
+}
+
+/// Splices `chunk` into `out` as individual characters (`lists:flatten/1`).
+fn splice_flat(out: &mut Vec<Chunk>, chunk: Chunk) {
+    match chunk {
+        Chunk::Char(c) => out.push(Chunk::Char(c)),
+        Chunk::List(items) => {
+            for item in items {
+                splice_flat(out, item);
+            }
+        }
+    }
+}
+
+/// Materializes the top-level chunks as the deep list `io_lib:format` returns.
+fn chunks_to_term(ctx: &mut BifContext<'_>, chunks: &[Chunk]) -> Result<Eterm> {
+    let mut elems = Vec::with_capacity(chunks.len());
+    for chunk in chunks {
+        elems.push(chunk_to_term(ctx, chunk)?);
+    }
+    ctx.list(&elems)
+}
+
+/// Materializes one chunk: a character is a small integer, a list a sub-list.
+fn chunk_to_term(ctx: &mut BifContext<'_>, chunk: &Chunk) -> Result<Eterm> {
+    match chunk {
+        Chunk::Char(c) => ctx.int(i64::from(*c as u32)),
+        Chunk::List(items) => {
+            let mut elems = Vec::with_capacity(items.len());
+            for item in items {
+                elems.push(chunk_to_term(ctx, item)?);
+            }
+            ctx.list(&elems)
+        }
+    }
 }
 
 /// Parses one `~…` control sequence prefix, returning the [`Spec`] and the control
@@ -343,45 +484,53 @@ fn take(args: &[Eterm], next: &mut usize) -> Result<Eterm> {
 }
 
 /// Dispatches one control character (`io_lib_format:control_small` /
-/// `control_limited`).
+/// `control_limited`), reporting whether it is a "small" control.
+#[allow(clippy::too_many_arguments)]
 fn dispatch(
     ctx: &mut BifContext<'_>,
     ctrl: u8,
     spec: &Spec,
     args: &[Eterm],
     next_arg: &mut usize,
-) -> Result<String> {
+) -> Result<Piece> {
     match ctrl {
-        b'~' => render_char('~', spec),
-        b'n' => render_newline(spec),
+        b'~' => Ok(Piece::small(char_chunk('~', spec)?)),
+        b'n' => Ok(Piece::small(newline_chunk(spec)?)),
         b'i' => {
             let _ = take(args, next_arg)?;
-            Ok(String::new())
+            Ok(Piece::small(Chunk::List(Vec::new())))
         }
         b'w' => {
             let arg = take(args, next_arg)?;
-            let text = format_term(ctx, arg, false)?;
-            Ok(apply_term(&text, spec))
+            let chunk = term_chunk(ctx, arg, false, UNLIMITED_DEPTH)?;
+            Ok(Piece::element(term_field(chunk, spec)))
         }
         b'p' => {
             let arg = take(args, next_arg)?;
-            render_p(ctx, arg, spec.strings, UNLIMITED_DEPTH, spec)
+            Ok(Piece::element(render_p(
+                ctx,
+                arg,
+                spec.strings,
+                UNLIMITED_DEPTH,
+                spec,
+            )?))
         }
         b'W' => {
             let arg = take(args, next_arg)?;
             let depth = take_depth(args, next_arg)?;
-            let text = format_term_depth(ctx, arg, false, depth)?;
-            Ok(apply_term(&text, spec))
+            let chunk = term_chunk(ctx, arg, false, depth)?;
+            Ok(Piece::element(term_field(chunk, spec)))
         }
         b'P' => {
             let arg = take(args, next_arg)?;
             let depth = take_depth(args, next_arg)?;
-            render_p(ctx, arg, spec.strings, depth, spec)
+            Ok(Piece::element(render_p(ctx, arg, spec.strings, depth, spec)?))
         }
         b's' => {
             let arg = take(args, next_arg)?;
-            let text = string_arg(ctx, arg)?;
-            render_string(&text, spec)
+            let (text, small) = string_arg(ctx, arg)?;
+            let chunk = string_field_chunk(text, spec.width, spec.left, spec.precision, spec.pad)?;
+            Ok(Piece { chunk, small })
         }
         b'c' => {
             let arg = take(args, next_arg)?;
@@ -395,7 +544,7 @@ fn dispatch(
             } else {
                 (value & 0xff) as u8 as char
             };
-            render_char(ch, spec)
+            Ok(Piece::small(char_chunk(ch, spec)?))
         }
         b'b' | b'B' => {
             let arg = take(args, next_arg)?;
@@ -403,7 +552,13 @@ fn dispatch(
                 return Err(badarg());
             }
             let base = spec.precision.unwrap_or(10);
-            render_radix(signed_value(arg), base, "", ctrl == b'B', spec)
+            Ok(Piece::small(radix_chunk(
+                signed_value(arg),
+                base,
+                "",
+                ctrl == b'B',
+                spec,
+            )?))
         }
         b'x' | b'X' => {
             let arg = take(args, next_arg)?;
@@ -412,7 +567,13 @@ fn dispatch(
             }
             let prefix = prefix_arg(ctx, take(args, next_arg)?)?;
             let base = spec.precision.unwrap_or(10);
-            render_radix(signed_value(arg), base, &prefix, ctrl == b'X', spec)
+            Ok(Piece::small(radix_chunk(
+                signed_value(arg),
+                base,
+                &prefix,
+                ctrl == b'X',
+                spec,
+            )?))
         }
         b'e' => {
             let f = take_float(args, next_arg)?;
@@ -421,7 +582,7 @@ fn dispatch(
                 return Err(badarg());
             }
             let text = float_e(f, precision);
-            Ok(apply_float_field(&text, spec))
+            Ok(Piece::small(float_field(Chunk::text(&text), spec)))
         }
         b'f' => {
             let f = take_float(args, next_arg)?;
@@ -430,13 +591,13 @@ fn dispatch(
                 return Err(badarg());
             }
             let text = float_f(f, precision);
-            Ok(apply_float_field(&text, spec))
+            Ok(Piece::small(float_field(Chunk::text(&text), spec)))
         }
         b'g' => {
             let f = take_float(args, next_arg)?;
             let precision = spec.precision.unwrap_or(6);
             let text = float_g(f, precision)?;
-            Ok(apply_float_field(&text, spec))
+            Ok(Piece::small(float_field(Chunk::text(&text), spec)))
         }
         _ => Err(badarg()),
     }
@@ -465,38 +626,37 @@ fn prefix_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<String> {
     if is_atom(arg) {
         return Ok(ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?.to_string());
     }
-    let elems = proper_list(arg).ok_or_else(badarg)?;
-    let mut out = String::with_capacity(elems.len());
-    for elem in elems {
-        if !is_small(elem) {
-            return Err(badarg());
-        }
-        let value = signed_value(elem);
-        if !(0..=255).contains(&value) {
-            return Err(badarg());
-        }
-        out.push(value as u8 as char);
-    }
-    Ok(out)
+    byte_string(&proper_list(arg).ok_or_else(badarg)?)
 }
 
 /// Renders the `~s` argument: an atom's name, a proper list of byte-sized small
 /// integers, or a binary's bytes.
-fn string_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<String> {
+///
+/// Also reports whether the control is "small": only `~s` of an **atom** is
+/// (`io_lib_format:control_small/7` has a clause for atoms alone), so a list or a
+/// binary is inserted as a single sub-list element while an atom's characters are
+/// spliced flat.
+fn string_arg(ctx: &BifContext<'_>, arg: Eterm) -> Result<(Chunk, bool)> {
     if is_atom(arg) {
         let name = ctx.atoms().name(atom_val(arg)).ok_or_else(badarg)?;
-        return Ok(name.to_string());
+        return Ok((Chunk::text(name), true));
     }
     if bits::is_bitstring(arg) {
         if !bits::is_binary(arg) {
             // A non-byte-aligned bitstring has no byte string rendering in M1.
             return Err(badarg());
         }
-        return Ok(bits::bytes(arg)?.iter().map(|&b| b as char).collect());
+        let text: String = bits::bytes(arg)?.iter().map(|&b| b as char).collect();
+        return Ok((Chunk::text(&text), false));
     }
     let elems = proper_list(arg).ok_or_else(badarg)?;
+    Ok((Chunk::text(&byte_string(&elems)?), false))
+}
+
+/// Renders a proper list of byte-sized small integers as its latin1 string.
+fn byte_string(elems: &[Eterm]) -> Result<String> {
     let mut out = String::with_capacity(elems.len());
-    for elem in elems {
+    for &elem in elems {
         if !is_small(elem) {
             return Err(badarg());
         }
@@ -517,20 +677,19 @@ fn render_p(
     printable: bool,
     depth: i64,
     spec: &Spec,
-) -> Result<String> {
+) -> Result<Chunk> {
     if spec.left {
         // A left-adjusted `~p`/`~P` has no clause in `io_lib_format`.
         return Err(badarg());
     }
-    let text = format_term_depth(ctx, term, printable, depth)?;
+    let chunk = term_chunk(ctx, term, printable, depth)?;
     let line_length = spec.width.unwrap_or(80);
     let column = spec.precision.unwrap_or(1);
-    let length = text.chars().count();
-    if reflowable(term) && length >= line_length.saturating_sub(column) {
+    if reflowable(term) && chunk.flat_len() >= line_length.saturating_sub(column) {
         // The oracle would break this across lines; we cannot reproduce that.
         return Err(badarg());
     }
-    Ok(text)
+    Ok(chunk)
 }
 
 /// Whether the oracle's `io_lib_pretty` may break `term` across lines (a tuple,
@@ -568,113 +727,63 @@ fn binary_printable(term: Eterm) -> bool {
     }
 }
 
-/// `io_lib_format:term/6` — the field-width / truncation rule.
-fn apply_term(text: &str, spec: &Spec) -> String {
-    match spec.width {
-        None => match spec.precision {
-            None => text.to_string(),
-            Some(p) => apply_term(text, &Spec { width: Some(p), ..*spec }),
-        },
-        Some(field) => {
-            let length = text.chars().count();
-            let limit = spec.precision.map_or(field, |p| p.min(field));
-            let effective = length.min(limit);
-            if length > effective {
-                // Too long: `effective` stars, padded to the field width.
-                adjust(&"*".repeat(effective), spec.pad, field - effective, spec.left)
-            } else {
-                adjust(text, spec.pad, field - length, spec.left)
-            }
-        }
-    }
+/// `io_lib_format:term/6` — the field-width / truncation rule for a term
+/// rendering (`~w`/`~W` and the integer directives).
+fn term_field(chunk: Chunk, spec: &Spec) -> Chunk {
+    field_chunk(chunk, spec.width, spec.left, spec.precision, spec.pad)
 }
 
 /// `fwrite_e`/`fwrite_f`/`fwrite_g` use the field width as both the width and the
 /// precision (`term(_Chars, F, Adj, F, Pad, _)`).
-fn apply_float_field(text: &str, spec: &Spec) -> String {
+fn float_field(chunk: Chunk, spec: &Spec) -> Chunk {
     match spec.width {
-        None => text.to_string(),
-        Some(field) => apply_term(text, &Spec { precision: Some(field), ..*spec }),
-    }
-}
-
-/// `io_lib_format:string/6` for `~s`.
-fn render_string(text: &str, spec: &Spec) -> Result<String> {
-    let length = text.chars().count();
-    match (spec.width, spec.precision) {
-        (None, None) => Ok(text.to_string()),
-        (Some(field), None) => Ok(string_field(text, field, spec.left, length, spec.pad)),
-        (None, Some(p)) => Ok(string_field(text, p, true, length, spec.pad)),
-        (Some(field), Some(p)) if field >= p => {
-            if field > p {
-                if length > p {
-                    let head = truncate(text, p);
-                    Ok(adjust(&head, spec.pad, field - p, spec.left))
-                } else if length < p {
-                    let tail = pad_of(spec.pad, p - length);
-                    Ok(adjust(
-                        &format!("{text}{tail}"),
-                        spec.pad,
-                        field - p,
-                        spec.left,
-                    ))
-                } else {
-                    Ok(adjust(text, spec.pad, field - p, spec.left))
-                }
-            } else {
-                Ok(string_field(text, field, spec.left, length, spec.pad))
-            }
-        }
-        _ => Err(badarg()),
-    }
-}
-
-/// `io_lib_format:string_field/6`.
-fn string_field(text: &str, field: usize, left: bool, length: usize, pad: u8) -> String {
-    if length > field {
-        truncate(text, field)
-    } else if length < field {
-        adjust(text, pad, field - length, left)
-    } else {
-        text.to_string()
+        None => chunk,
+        Some(field) => field_chunk(chunk, Some(field), spec.left, Some(field), spec.pad),
     }
 }
 
 /// `io_lib_format:char/5` for `~c`/`~~`.
-fn render_char(ch: char, spec: &Spec) -> Result<String> {
+fn char_chunk(ch: char, spec: &Spec) -> Result<Chunk> {
     match (spec.width, spec.precision) {
-        (None, None) => Ok(ch.to_string()),
-        (Some(field), None) => Ok(ch.to_string().repeat(field)),
-        (None, Some(p)) => Ok(ch.to_string().repeat(p)),
-        (Some(field), Some(p)) if field >= p => {
-            let body = ch.to_string().repeat(p);
-            Ok(adjust(&body, spec.pad, field - p, spec.left))
-        }
+        (None, None) => Ok(Chunk::List(vec![Chunk::Char(ch)])),
+        (Some(field), None) => Ok(dup_chars(ch, field)),
+        (None, Some(p)) => Ok(dup_chars(ch, p)),
+        (Some(field), Some(p)) if field >= p => Ok(adjust_chunk(
+            dup_chars(ch, p),
+            dup_chars(spec.pad as char, field - p),
+            spec.left,
+        )),
         _ => Err(badarg()),
     }
 }
 
 /// `io_lib_format:newline/4` for `~n` (only the right-adjust clause exists).
-fn render_newline(spec: &Spec) -> Result<String> {
+fn newline_chunk(spec: &Spec) -> Result<Chunk> {
     match spec.width {
-        None => Ok("\n".to_string()),
-        Some(field) if !spec.left => Ok("\n".repeat(field)),
+        None => Ok(Chunk::List(vec![Chunk::Char('\n')])),
+        Some(field) if !spec.left => Ok(dup_chars('\n', field)),
         _ => Err(badarg()),
     }
 }
 
 /// `unprefixed_integer`/`prefixed_integer`: sign, prefix and `.<base>` digits.
-fn render_radix(value: i64, base: usize, prefix: &str, upper: bool, spec: &Spec) -> Result<String> {
+fn radix_chunk(value: i64, base: usize, prefix: &str, upper: bool, spec: &Spec) -> Result<Chunk> {
     if !(2..=36).contains(&base) {
         return Err(badarg());
     }
-    let mut out = String::new();
+    let mut text = String::new();
     if value < 0 {
-        out.push('-');
+        text.push('-');
     }
-    out.push_str(prefix);
-    out.push_str(&int_to_base_string(value.unsigned_abs(), base as u32, upper));
-    Ok(apply_term(&out, &Spec { precision: None, ..*spec }))
+    text.push_str(prefix);
+    text.push_str(&int_to_base_string(value.unsigned_abs(), base as u32, upper));
+    Ok(field_chunk(
+        Chunk::text(&text),
+        spec.width,
+        spec.left,
+        None,
+        spec.pad,
+    ))
 }
 
 /// Renders `magnitude` in `base` (2–36), lowercase when `!upper`.
@@ -694,29 +803,6 @@ fn int_to_base_string(magnitude: u64, base: u32, upper: bool) -> String {
         reversed.push('0');
     }
     reversed.chars().rev().collect()
-}
-
-/// `io_lib_format:adjust/3`.
-fn adjust(data: &str, pad: u8, count: usize, left: bool) -> String {
-    if count == 0 {
-        return data.to_string();
-    }
-    let fill = pad_of(pad, count);
-    if left {
-        format!("{data}{fill}")
-    } else {
-        format!("{fill}{data}")
-    }
-}
-
-/// `io_lib_format:chars/2` — `count` copies of `pad` as a string.
-fn pad_of(pad: u8, count: usize) -> String {
-    std::iter::repeat(pad as char).take(count).collect()
-}
-
-/// `io_lib_format:flat_trunc/3` — the first `n` characters.
-fn truncate(text: &str, n: usize) -> String {
-    text.chars().take(n).collect()
 }
 
 /// `fwrite_e`/`float_e` — a float in scientific notation with `p` significands
@@ -873,14 +959,15 @@ fn round_digit(digit: u8, tail: String, carry: bool) -> (String, bool) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
-    use beam_common::BeamError;
+    use beam_common::{BeamError, ExitReason};
     use beam_process::ProcessId;
     use beam_term::{make_small, AtomTable, NIL};
 
     use crate::context::BytesSink;
 
-    const SEED: [&str; 13] = [
+    const SEED: [&str; 14] = [
         "true", "false", "ok", "hello", "a", "b", "c", "abc", "hi", "foo", "abcdefgh", "", "e",
+        "chars_limit",
     ];
 
     /// Runs `io:format` over a fresh context, returning the captured output and the
@@ -905,7 +992,8 @@ mod tests {
         (sink.as_str(), result)
     }
 
-    /// Runs `io_lib:format/2` and flattens the returned iolist back to a `String`.
+    /// Runs `io_lib:format/2` and flattens the returned **deep list** back to a
+    /// `String`.
     fn run_io_lib(
         format: &str,
         build_args: impl FnOnce(&mut BifContext<'_>) -> Eterm,
@@ -921,22 +1009,28 @@ mod tests {
             let args = build_args(&mut ctx);
             let result = format_lib_2(&mut ctx, &[format_term, args]);
             let rendered = match result {
-                Ok(term) => match proper_list(term) {
-                    Some(elems) => elems
-                        .iter()
-                        .map(|&e| {
-                            assert!(is_small(e), "io_lib:format returns byte-sized ints");
-                            signed_value(e) as u8 as char
-                        })
-                        .collect(),
-                    None => panic!("io_lib:format must return a proper list"),
-                },
+                Ok(term) => deep_text(term),
                 Err(BeamError::BadArg) => String::new(),
                 Err(other) => panic!("unexpected error {other:?}"),
             };
             (result.map(|_| ()).map_err(|e| e), rendered)
         };
         (rendered, result.map(|()| make_small(0)).map_err(|e| e))
+    }
+
+    /// Deep-flattens an `io_lib:format` result (the oracle's nested char list) to
+    /// its text — every nested sub-list contributes its characters in order.
+    fn deep_text(term: Eterm) -> String {
+        let mut out = String::new();
+        let elems = proper_list(term).expect("io_lib:format returns a proper list");
+        for elem in elems {
+            if is_small(elem) {
+                out.push(signed_value(elem) as u8 as char);
+            } else {
+                out.push_str(&deep_text(elem));
+            }
+        }
+        out
     }
 
     /// Builds a format list term from raw ASCII bytes on `ctx`'s heap.
@@ -1457,7 +1551,7 @@ mod tests {
         atoms.seed(SEED);
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         let format_term = list_from_bytes(&mut ctx, b"");
-        let result = format_lib_1(&mut ctx, &[format_term]).expect("fits");
+        let result = format_lib_2(&mut ctx, &[format_term, NIL]).expect("fits");
         assert_eq!(result.raw(), NIL.raw());
 
         // `io_lib:format` writes nothing to the output sink.
@@ -1469,13 +1563,129 @@ mod tests {
             let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
                 .with_output(&mut sink);
             let format_term = list_from_bytes(&mut ctx, b"hi~n");
-            assert!(format_lib_1(&mut ctx, &[format_term]).is_ok());
+            assert!(format_lib_2(&mut ctx, &[format_term, NIL]).is_ok());
         }
         assert_eq!(sink.contents(), b"");
     }
 
+    /// The result of one `io_lib:format` run, materialized *before* the context's
+    /// heap is dropped (the returned `Eterm`s must not outlive it).
+    #[derive(Debug)]
+    enum Outcome {
+        Text(String),
+        Err(BeamError),
+    }
+
+    fn outcome(result: Result<Eterm>) -> Outcome {
+        match result {
+            Ok(term) => Outcome::Text(deep_text(term)),
+            Err(err) => Outcome::Err(err),
+        }
+    }
+
+    fn text(outcome: Outcome) -> String {
+        match outcome {
+            Outcome::Text(text) => text,
+            Outcome::Err(err) => panic!("expected a rendering, got {err:?}"),
+        }
+    }
+
+    /// Renders `format` with the small-int `args` under `build_options`, both
+    /// through `io_lib:format/3` and (as the reference) `io_lib:format/2`.
+    fn run_lib3(
+        format: &str,
+        args: &[i64],
+        build_options: impl Fn(&mut BifContext<'_>) -> Eterm,
+    ) -> (Outcome, Outcome) {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let format_term = list_from_bytes(&mut ctx, format.as_bytes());
+        let arg_elems: Vec<Eterm> = args.iter().map(|&v| ctx.int(v).expect("fits")).collect();
+        let args3 = ctx.list(&arg_elems).expect("fits");
+        let args2 = ctx.list(&arg_elems).expect("fits");
+        let options = build_options(&mut ctx);
+        let three = outcome(format_lib_3(&mut ctx, &[format_term, args3, options]));
+        let two = outcome(format_lib_2(&mut ctx, &[format_term, args2]));
+        (three, two)
+    }
+
+    fn chars_limit(ctx: &mut BifContext<'_>, limit: Eterm) -> Eterm {
+        let tag = ctx.atom("chars_limit").expect("seeded");
+        let option = ctx.tuple(&[tag, limit]).expect("fits");
+        ctx.list(&[option]).expect("fits")
+    }
+
+    fn option_empty_tuple(ctx: &mut BifContext<'_>) -> Eterm {
+        let empty = ctx.tuple(&[]).expect("fits");
+        ctx.list(&[empty]).expect("fits")
+    }
+
+    fn option_foo_atom(ctx: &mut BifContext<'_>) -> Eterm {
+        let foo = ctx.atom("foo").expect("seeded");
+        ctx.list(&[foo]).expect("fits")
+    }
+
+    fn option_chars_limit_neg(ctx: &mut BifContext<'_>) -> Eterm {
+        let neg = ctx.int(-1).expect("fits");
+        chars_limit(ctx, neg)
+    }
+
+    fn option_chars_limit_three(ctx: &mut BifContext<'_>) -> Eterm {
+        let three = ctx.int(3).expect("fits");
+        chars_limit(ctx, three)
+    }
+
+    fn option_chars_limit_atom(ctx: &mut BifContext<'_>) -> Eterm {
+        let value = ctx.atom("foo").expect("seeded");
+        chars_limit(ctx, value)
+    }
+
+    fn option_not_a_list(ctx: &mut BifContext<'_>) -> Eterm {
+        ctx.atom("foo").expect("seeded")
+    }
+
     #[test]
-    fn io_lib_format_1_and_2_agree_with_io_format() {
+    fn io_lib_format_3_options_are_validated() {
+        // Empty options reproduce `format/2` exactly.
+        let (three, two) = run_lib3("~w", &[42], |ctx| ctx.list(&[]).expect("fits"));
+        let reference = text(two);
+        assert_eq!(text(three), reference);
+        assert_eq!(reference, "42");
+
+        // Unknown options are ignored (the oracle only reads `chars_limit`).
+        for build in [option_empty_tuple, option_foo_atom] {
+            let (three, two) = run_lib3("~w", &[42], build);
+            assert_eq!(text(three), text(two), "an unknown option must be ignored");
+        }
+
+        // A negative `chars_limit` is the oracle's default (no limit).
+        let (three, two) = run_lib3("~w", &[42], option_chars_limit_neg);
+        assert_eq!(text(three), text(two));
+
+        // A limiting `chars_limit` is a typed error, never a wrong (unlimited) line.
+        let (three, _) = run_lib3("~w", &[42], option_chars_limit_three);
+        match three {
+            Outcome::Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
+            }
+            other => panic!("expected a typed unsupported-option error, got {other:?}"),
+        }
+
+        // A non-integer `chars_limit` value and a non-list `Options` are `badarg`.
+        let (three, _) = run_lib3("~w", &[42], option_chars_limit_atom);
+        assert!(matches!(three, Outcome::Err(BeamError::BadArg)));
+        let (three, _) = run_lib3("~w", &[42], option_not_a_list);
+        assert!(matches!(three, Outcome::Err(BeamError::BadArg)));
+
+        // `format/3` still renders directives normally.
+        let (three, _) = run_lib3("~b~n", &[255], |ctx| ctx.list(&[]).expect("fits"));
+        assert_eq!(text(three), "255\n");
+    }
+
+    #[test]
+    fn io_lib_format_2_agrees_with_io_format() {
         for format in ["~w", "~p", "~s", "~c", "~b", "~x", "~e", "~f", "~g", "~W", "~P"] {
             let (io_out, io_res) = run_io(format, |ctx| {
                 let a = ctx.atom("a").expect("seeded");
@@ -1557,10 +1767,25 @@ mod tests {
 
     #[test]
     fn field_value_and_adjust_helpers() {
-        assert_eq!(adjust("x", b'*', 3, false), "***x");
-        assert_eq!(adjust("x", b'*', 3, true), "x***");
-        assert_eq!(adjust("x", b'*', 0, true), "x");
-        assert_eq!(truncate("hello", 3), "hel");
-        assert_eq!(pad_of(b'0', 3), "000");
+        // `print.rs`'s `dup_chars` (the oracle's `chars/2`), `adjust_chunk`
+        // (`adjust/3`) and `string_field_chunk` (`string/6`, `flat_trunc/3`),
+        // asserted through their flattened text.
+        let pad = || dup_chars('*', 3);
+        assert_eq!(flatten(&[adjust_chunk(Chunk::text("x"), pad(), false)]), "***x");
+        assert_eq!(flatten(&[adjust_chunk(Chunk::text("x"), pad(), true)]), "x***");
+        assert_eq!(
+            flatten(&[adjust_chunk(
+                Chunk::text("x"),
+                Chunk::List(Vec::new()),
+                true
+            )]),
+            "x"
+        );
+        assert_eq!(flatten(&[dup_chars('0', 3)]), "000");
+        assert_eq!(
+            flatten(&[string_field_chunk(Chunk::text("hello"), Some(3), false, None, b' ')
+                .expect("fits")]),
+            "hel"
+        );
     }
 }

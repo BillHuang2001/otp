@@ -78,18 +78,27 @@ impl<'a> RuntimeContext<'a> {
     pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
 }
 impl ExecutionContext for RuntimeContext<'_> {
-    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/init:get_argument/system_info)
+    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/system_info/
+    //             init:get_argument,init:get_arguments,init:get_plain_arguments/erlang:display/
+    //             os:cmd/code:get_path,code:all_loaded,code:which,code:lib_dir)
     //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` over
-    //             {heap, code_server atoms, self_pid, tables, output}); else if module == "erlang"
-    //             → `error::unknown_bif`; else seed the system code path
+    //             {heap, code_server atoms, self_pid, tables, output, PendingInterner}); else if
+    //             module == "erlang" → `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
-    // apply_fun → resolve the fun's module (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
+    // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
+    //             `eval::apply_eval_closure`; otherwise resolve the fun's module
+    //             (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
     //             `FunDescriptor { uniq, index }`) across `code_server.modules()`, then
     //             `Machine::new().run_label(...)`.
     // ensure_heap → Ok when `heap_available() >= heap_need`, else `BeamError::SystemLimit`
     //             (M1 has no GC — see Known Issues).
 }
 ```
+`call_bif` builds the `BifContext` with a **`PendingInterner`**: a BIF that must create a *new* atom
+(`binary_to_term`/`list_to_atom`/`binary_to_atom`) records the name; the runtime commits the recorded
+names into the **one shared table** in order after the BIF returns (their predicted indices are exact
+— interning is append-only and single-threaded). This is what makes a `binary_to_term`-decoded atom
+nameable by the printer/comparison — see Design Decisions.
 This is the **only** place the engine's seam meets the Stage-5 core; it keeps the Stage-1/Stage-5
 DAG acyclic (`../CONTEXT.md`).
 
@@ -124,6 +133,8 @@ impl PreloadedModules { pub fn standard() -> PreloadedModules; pub fn is_preload
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; }
 
 // info.rs (A.8)
+pub const SUPPORTED_KEYS: &[&str];                              // the 12 answered keys
+pub const INFO_ATOMS: &[&str];                                  // the atom vocabulary the surface needs seeded
 pub enum InfoValue { Int(i64), Str(String), Atom(&'static str), Bool(bool), Tuple(&'static str, &'static str) }
 impl InfoValue { pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm>; }
 pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue>;
@@ -184,6 +195,12 @@ Unsupported is emitted for:
 2. a BEAM-engine capability gap — a raise whose reason atom starts with `unsupported_opcode`;
 3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`.
 
+A capability gap is **uncatchable**: in `src/eval/mod.rs` `flow_from_error` turns it into `Flow::Fatal`
+(like `halt`), so the self-terminating `try (EXPR) of … catch C:R -> … end` probe the differential
+harness wraps its expressions in **cannot** swallow it and print it as an apparent `exception error …`.
+It escapes the evaluator, reaches `cli::run`, and becomes the exit-3 `beam_rt: unsupported: <reason>`
+signal — so an unimplemented feature is honestly `unsupported`, never a false `error`, in the gate.
+
 **Classification convention.** A capability gap is signalled by a raise whose **reason atom starts
 with `unsupported`**. `src/error.rs::unsupported_reason` is the **single** place that convention is
 interpreted: the constructors there (`unsupported`, `bad_eval`) and the sibling crates (`beam_engine`
@@ -210,7 +227,15 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 | `process_count` | `Int(rt.processes.len())` (the M1 process table) |
 | `os_type` | `Tuple("unix","linux")` (or `("win32","nt")`) |
 | `threads` | `Bool(true)` → atom `true`/`false` |
+| `emu_flavor` | `Atom(rt.config().emulator.flavor.as_str())` → `jit` by default (the baseline JIT), `emu` for a `Flavor::Emu` config |
+| `schedulers` | `Int` — an explicit `+S N` wins; `+S 0`/unset falls through to `available_parallelism()`; always `> 0` |
 | anything else | `Err(BeamError::BadArg)` — matches the oracle's `error:badarg` |
+
+`src/info.rs` also exports `INFO_ATOMS` — the complete atom vocabulary of the surface
+(`unix,linux,win32,nt,true,false,jit,emu`). `seed_core_atoms` (`src/boot.rs`) interns it, because
+`InfoValue::to_eterm` resolves atoms **through the runtime's atom table** and reports
+`BeamError::TermNotFound` rather than inventing a term — so a key whose value is an atom only agrees
+once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 
 ## Constraints
 * **Errors are return-based, workspace-wide** (`../CONTEXT.md` §3): every fallible API returns
@@ -227,17 +252,19 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * **Files ~1000 lines**, split by responsibility. `#![warn(missing_docs)]`; every public item documented.
 
 ## Design Decisions
-* **Atom-table bridge (module-local vs runtime atoms).** A loaded `Module` owns a **module-local
-  `AtomTable`** (its `Atu8` wire order) and the engine compares/prints atoms against *that* table
-  (`beam_engine/src/interpreter.rs` `cmp(.., &module.atom_table)`). `beam_bifs`' `BifContext` also
-  needs an `&AtomTable` for name resolution. To keep BIF-constructed atoms comparable with the
-  engine's, `RuntimeContext::call_bif` passes the **module's atom table** (not a separate global one)
-  — so every atom a BIF returns is a `make_atom` of an index in the table the engine uses. `Runtime`
-  additionally owns a **global runtime `AtomTable`**, seeded at boot, used only by
-  `system_info`/`format_term` where no module is in play. Consequence (documented): a BIF that names
-  an atom absent from the current module's table returns `BeamError::TermNotFound`; this is a
-  Milestone-1 limitation, not a design hole — a later revision interns module atoms into the global
-  table at load time.
+* **One shared atom table (the code server's).** There is **no** separate module-local / global split:
+  `CodeServer` owns **one** `AtomTable`, every module it loads is interned into it
+  (`CodeServer::load_bytes` re-runs the loader pipeline seeded with that table), and
+  `RuntimeContext::call_bif` hands `beam_bifs`' `BifContext` that same table. So an atom a BIF builds
+  is an index the engine compares against (`beam_engine`'s `cmp(.., &module.atom_table)`, whose prefix
+  is the shared table) and the printer (`src/format.rs`) names, for **every** loaded module —
+  `Runtime::intern`/`atoms` are thin delegates to it. Indices are assigned in insertion order and never
+  renumber. A BIF that must *create* a new atom (`binary_to_term`, `list_to_atom`, `binary_to_atom`)
+  goes through `PendingInterner`: `BifContext` borrows the table immutably, so the interner records the
+  name (predicting `base + pending` — exact because interning is append-only and single-threaded) and
+  the runtime commits the recorded names into the shared table, in order, right after the call — at
+  exactly the indices the BIF already used. This is what makes a `binary_to_term`-decoded atom
+  nameable (`wire/decode_reference_atom_blob` / `..._map_blob` agree with the oracle).
 * **Heap lifetime.** `Runtime` **owns** the process heap (`heap`) so a returned `Eterm` stays valid
   after `run_*` returns (the `RuntimeContext` only borrows it). `system_info`/`format_term` use a
   separate `info_heap`, `reset()` at the start of each call — so a term returned by `system_info` is
@@ -297,15 +324,23 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 ## Known Issues / Intentional M1 gaps
 * **No interactive shell, no distribution, no node.** `-noshell` is the only mode; `-name`/`-sname`
   are parsed and stored but distribution (A.5) is not started.
-* **Preloaded modules are a name-set skeleton.** Boot does **not** load preloaded `.beam`s; the
-  global atom table is seeded with a small core set (not the full `atom.names` ordering), so positional
-  atom indices for preloaded code are not yet reproduced. Boot order and the registry are in place.
+* **Preloaded modules are a name-set skeleton.** Boot does **not** load preloaded `.beam`s, and the
+  shared atom table is seeded with `CORE_ATOMS` + `INFO_ATOMS` (not the full `atom.names` ordering), so
+  positional atom indices for preloaded code are not reproduced. The erts app's `ebin` **is** on the
+  code path (`CodeServer::resolve_system_ebins`), so a preloaded module (`init`, `persistent_term`, …)
+  *can* be loaded from disk on demand; boot order and the registry are in place.
+* **`-eval` grammar gaps left as honest *unsupported*** (exit 3, never a wrong result):
+  entering a non-byte-aligned binary segment literal (e.g. `<<1:1>>`), and a binary comprehension
+  (`<< Seg || <<X>> <= Bin >>` — the parser raises on the generator). Both are classified by
+  `unsupported_reason`, not reported as exceptions.
 * **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
-  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`, a closure
-  escaping into a higher-order stdlib call) are typed errors in `src/eval/mod.rs`. Real `erl`
+  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`) are typed
+  errors in `src/eval/mod.rs`. A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
+  is **uncatchable**: it travels as `Flow::Fatal` (like `halt`) so a `try`/`catch` in the probe cannot
+  turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
   recorded as init arguments rather than acted on.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
@@ -315,16 +350,16 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * `src/error.rs` → `pub(crate)` `BeamError` constructors (missing value, unexpected argument, bad spec, arity mismatch, bad run argument, unknown module/function/info key/bif, unsupported, bad eval) + the halt helpers (`HALT_PREFIX`, `halt`/`halt_status`) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
 * `src/config.rs` → `RuntimeConfig`, `Action`, `ArgTerm`, `InitArgs`, `EmulatorConfig` alias, defaults/setters
 * `src/cli.rs` → `USAGE`, `parse` (the A.6 parser + the `run` argument grammar), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
-* `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed + the boot banner
-* `src/info.rs` → `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/codeserver.rs` → `CodeServer`: the shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file` (the load-on-demand host)
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun`; heap check)
-* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1` — always consulted before the registry)
-* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` is uncatchable), dispatching calls through `RuntimeContext`
+* `src/codeserver.rs` → `CodeServer`: the **one** shared atom table + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
+* `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed (also interns `info::INFO_ATOMS`) + the boot banner
+* `src/info.rs` → `SUPPORTED_KEYS`, `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call)
+* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`, `os:cmd/1`, `code:get_path/0`/`all_loaded/0`/`which/1`/`lib_dir/0,1` — always consulted before the registry)
+* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
 * `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
-* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`
+* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`, and `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`)
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
@@ -334,6 +369,15 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
 * `../beam_loader/tests/fixtures/slice.beam` → the shared oracle fixture reused by the slice tests (read-only)
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
+
+## Handoffs (remaining differential mismatches owned by OTHER nodes)
+`differential suite` is at **147 agree / 6 mismatch / 2 unsupported**. Every remaining `mismatch`
+belongs to a sibling crate (not this node) — recorded so the next pass routes directly:
+* `semantics/bignum_multiplication` (A.1) — `123456789012345678 * 98` raises `system_limit`; **`beam_bifs`** has no bignum promotion.
+* `nif/nif_error_atom_reason`, `nif/nif_error_tuple_reason`, `nif/nif_error_default` (A.3) — `erlang:nif_error/1` must raise `error` **with its argument as the reason**; not implemented in **`beam_bifs`**.
+* `driver/port_backed_by_spawn_driver` (A.4) — `erlang:open_port/2` (`{spawn,"true"}`) is not a BIF (**`beam_bifs`**).
+* `bifs/io_lib_format` (A.7) — `io_lib:format("~w",[42])` must return the **deep** list `[[52,50]]`, not the flat `[52,50]` (**`beam_bifs`**).
+* **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also
 * `../CONTEXT.md` → crate-layer contracts, the seam types, the wave-6 position, the M1 scope table.

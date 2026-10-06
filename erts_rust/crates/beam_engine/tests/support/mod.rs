@@ -49,8 +49,8 @@ use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{Atom, FunDescriptor, Module};
 use beam_term::{
-    cmp, cmp_arith, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, MAX_SMALL,
-    MIN_SMALL,
+    cmp, cmp_arith, is_atom, is_small, make_atom, make_small, signed_value, atom_val, AtomTable,
+    Eterm, MAX_SMALL, MIN_SMALL,
 };
 
 // ---------------------------------------------------------------------------
@@ -69,24 +69,37 @@ use beam_term::{
 /// A caller that gets `None` must **skip loudly** (never fail): see
 /// [`skip_reason`].
 pub fn stdlib_ebin() -> Option<PathBuf> {
-    if let Ok(dir) = env::var("ERTS_STDLIB_DIR") {
+    app_ebin("stdlib")
+}
+
+/// The `ebin` directory of the running Erlang's `app` application (e.g.
+/// `stdlib`, `kernel`, `compiler`), or `None` when it cannot be located.
+///
+/// Resolution order:
+/// 1. `$ERTS_<APP>_DIR` (uppercased app name; accepts either the application dir
+///    — `…/lib/stdlib-8.1` — or its `ebin` subdir);
+/// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir(<app>)]),halt().'`
+///    evaluated at test time.
+///
+/// This is the general form of [`stdlib_ebin`]; a caller that gets `None` must
+/// **skip loudly** (never fail) — see [`skip_reason`].
+pub fn app_ebin(app: &str) -> Option<PathBuf> {
+    let env_key = format!("ERTS_{}_DIR", app.to_uppercase());
+    if let Ok(dir) = env::var(&env_key) {
         let dir = PathBuf::from(dir);
-        if dir.join("lists.beam").is_file() {
+        if has_beams(&dir) {
             return Some(dir);
         }
         let ebin = dir.join("ebin");
-        if ebin.join("lists.beam").is_file() {
+        if has_beams(&ebin) {
             return Some(ebin);
         }
         return None;
     }
 
+    let eval = format!("io:format(\"~s\",[code:lib_dir({app})]),halt().");
     let output = Command::new("erl")
-        .args([
-            "-noshell",
-            "-eval",
-            "io:format(\"~s\",[code:lib_dir(stdlib)]),halt().",
-        ])
+        .args(["-noshell", "-eval", &eval])
         .output()
         .ok()?;
     if !output.status.success() {
@@ -94,11 +107,26 @@ pub fn stdlib_ebin() -> Option<PathBuf> {
     }
     let dir = String::from_utf8(output.stdout).ok()?;
     let ebin = PathBuf::from(dir.trim()).join("ebin");
-    if ebin.join("lists.beam").is_file() {
+    if has_beams(&ebin) {
         Some(ebin)
     } else {
         None
     }
+}
+
+/// True when `dir` is a directory that contains at least one `*.beam` file — the
+/// signal [`app_ebin`] uses to accept a candidate `ebin` directory.
+fn has_beams(dir: &std::path::Path) -> bool {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return false;
+    };
+    entries.filter_map(|entry| entry.ok()).any(|entry| {
+        entry
+            .path()
+            .extension()
+            .map(|extension| extension == "beam")
+            .unwrap_or(false)
+    })
 }
 
 /// The message a test prints (and the reason it returns early) when the oracle
@@ -177,8 +205,11 @@ pub struct ModuleHost {
     modules: HashMap<String, Arc<Module>>,
     /// Explicit `name -> .beam path` registrations (the harness fixture).
     explicit: HashMap<String, PathBuf>,
-    /// The stdlib `ebin` directory used as the fallback code path.
+    /// The stdlib `ebin` directory used as the primary code path.
     ebin: PathBuf,
+    /// Extra `ebin` directories searched after `ebin` (e.g. `kernel`'s `ebin`),
+    /// so a cross-module call into a second application resolves.
+    search: Vec<PathBuf>,
 }
 
 impl ModuleHost {
@@ -190,12 +221,42 @@ impl ModuleHost {
             modules: HashMap::new(),
             explicit: HashMap::new(),
             ebin: ebin.into(),
+            search: Vec::new(),
         }
     }
 
     /// Registers `name` to load from a specific `.beam` path (the harness).
     pub fn register(&mut self, name: &str, path: impl Into<PathBuf>) {
         self.explicit.insert(name.to_string(), path.into());
+    }
+
+    /// Adds `dir` to the fallback search path (searched after the primary
+    /// `ebin`), so a module living in another application's `ebin` — e.g.
+    /// `kernel` — can be loaded by name. Additive: an unregistered directory is
+    /// never searched.
+    pub fn add_search_dir(&mut self, dir: impl Into<PathBuf>) {
+        self.search.push(dir.into());
+    }
+
+    /// The `.beam` path for `name`: an explicit registration, else the primary
+    /// `ebin`, else the first search directory that holds it (falling back to the
+    /// primary path so a genuine miss still reports a file-not-found error).
+    fn module_path(&self, name: &str) -> PathBuf {
+        if let Some(path) = self.explicit.get(name) {
+            return path.clone();
+        }
+        let file = format!("{name}.beam");
+        let primary = self.ebin.join(&file);
+        if primary.is_file() {
+            return primary;
+        }
+        for dir in &self.search {
+            let candidate = dir.join(&file);
+            if candidate.is_file() {
+                return candidate;
+            }
+        }
+        primary
     }
 
     /// The one shared atom table (for `beam_term::cmp` in assertions).
@@ -209,16 +270,27 @@ impl ModuleHost {
     }
 
     /// Loads `name` (memoized). A registered module uses its explicit path;
-    /// otherwise `<ebin>/<name>.beam` is used.
+    /// otherwise the primary `ebin`, then any search directory, is tried.
     pub fn load(&mut self, name: &str) -> Result<Arc<Module>> {
         if let Some(module) = self.modules.get(name) {
             return Ok(module.clone());
         }
-        let path = match self.explicit.get(name) {
-            Some(path) => path.clone(),
-            None => self.ebin.join(format!("{name}.beam")),
-        };
+        let path = self.module_path(name);
         let bytes = std::fs::read(&path)?;
+        let module = Arc::new(load_with_shared_atoms(&bytes, &mut self.atoms)?);
+        self.modules.insert(name.to_string(), module.clone());
+        Ok(module)
+    }
+
+    /// Loads the `.beam` at `path` under the module name `name` (memoized),
+    /// bypassing the `ebin`/search-path lookup — the hook a directory **sweep**
+    /// uses to load *every* `*.beam` it finds, regardless of where it lives.
+    /// `name` is what later `call`/external-call lookups use.
+    pub fn load_from_path(&mut self, name: &str, path: impl Into<PathBuf>) -> Result<Arc<Module>> {
+        if let Some(module) = self.modules.get(name) {
+            return Ok(module.clone());
+        }
+        let bytes = std::fs::read(path.into())?;
         let module = Arc::new(load_with_shared_atoms(&bytes, &mut self.atoms)?);
         self.modules.insert(name.to_string(), module.clone());
         Ok(module)
@@ -242,9 +314,16 @@ impl ModuleHost {
     /// A `.beam` fun inlines only its `uniq` (per-module) and `index` (the
     /// module-level lambda index); together they identify the `FunT` descriptor
     /// [`FunDescriptor`] — and hence the defining module and entry label —
-    /// unambiguously. The closure body is entered with the free variables
-    /// **first** followed by the call arguments (a lambda's captured variables
-    /// are its leading parameters).
+    /// unambiguously.
+    ///
+    /// The register file is set up exactly as the C emulator's `call_fun` does
+    /// (`../../erts/emulator/beam/beam_common.c:1631-1633`,
+    /// `reg[i + arity] = funp->env[i]`): the **call arguments** occupy
+    /// `x(0..arity)` and the closure's **free variables** follow at
+    /// `x(arity..arity+num_free)` — arguments first, then captures. A lambda's
+    /// non-constant free variables are therefore its *trailing* compiled
+    /// parameters (`-f/1-fun-0-/3` reads its one argument from `x0` and its two
+    /// captures from `x1`/`x2`).
     fn apply_resolved(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
@@ -266,8 +345,8 @@ impl ModuleHost {
         }
         let (module, descriptor) = found.ok_or(BeamError::BadArg)?;
 
-        let mut combined = free;
-        combined.extend_from_slice(args);
+        let mut combined = args.to_vec();
+        combined.extend_from_slice(&free);
         if combined.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
         }
@@ -409,8 +488,26 @@ impl ModuleHost {
             ("erlang", ">", 2) => Some(self.compare(args, Compare::Gt)),
             ("erlang", ">=", 2) => Some(self.compare(args, Compare::Ge)),
             ("erlang", "element", 2) => Some(element(args)),
+            // `setelement(Index, Tuple, Value)` — `dict` rebuilds its segment
+            // tuples with it (`on_bucket`/`put_bucket_s`).
+            ("erlang", "setelement", 3) => Some(self.setelement(args)),
             ("erlang", "tuple_size", 1) => Some(tuple_size(args)),
             ("erlang", "length", 1) => Some(length(args)),
+            // `hd/1` — the head of a cons cell (`calendar`/`unicode` walk lists
+            // with it).
+            ("erlang", "hd", 1) => Some(hd(args)),
+            // `X rem Y` — the integer remainder (`calendar` computes a weekday
+            // from a day count with it).
+            ("erlang", "rem", 2) => Some(self.rem_bif(args)),
+            // `list_to_tuple/1` — `array` and `calendar` build tuples from lists.
+            ("erlang", "list_to_tuple", 1) => Some(self.list_to_tuple(args)),
+            // `atom_to_list/1` — `filename` turns path components (atoms) into
+            // strings with it.
+            ("erlang", "atom_to_list", 1) => Some(self.atom_to_list(args)),
+            // `phash/2` — the portable hash `dict` buckets its keys with.
+            ("erlang", "phash", 2) => Some(self.phash(args)),
+            // `system_info/1` — `filename` branches on `os_type`.
+            ("erlang", "system_info", 1) => Some(self.system_info(args)),
             ("erlang", "++", 2) => Some(self.append(args)),
             ("erlang", "--", 2) => Some(self.subtract(args)),
             // Bit shifts: `gb_trees`/`gb_sets`/`array` size arithmetic uses them.
@@ -608,6 +705,120 @@ impl ModuleHost {
             .any(|&element| cmp(element, args[0], &self.atoms).is_eq());
         Ok(self.boolean(found))
     }
+
+    /// `X rem Y` — the integer remainder. The result carries the *dividend's* sign
+    /// (Rust's `%` truncates toward zero, exactly as Erlang's `rem` does, so
+    /// `-7 rem 2` is `-1`). `rem(X, 0)` and any non-integer operand is a
+    /// `badarith`, matching the real BIF.
+    fn rem_bif(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        match (number(args[0]), number(args[1])) {
+            (Some(Number::Int(x)), Some(Number::Int(y))) => {
+                if y == 0 {
+                    Err(BeamError::BadArith)
+                } else {
+                    Ok(make_small(x % y))
+                }
+            }
+            _ => Err(BeamError::BadArith),
+        }
+    }
+
+    /// `list_to_tuple(List)` — a (proper) list as a tuple. A non-list operand is a
+    /// `badarg` (the real BIF raises `badarg`).
+    fn list_to_tuple(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let list = args.first().ok_or(BeamError::BadArg)?;
+        let elements = terms::list_elements(*list)?;
+        terms::make_tuple(self, &elements)
+    }
+
+    /// `setelement(Index, Tuple, Value)` — a **new** tuple with the 1-based
+    /// `Index` replaced by `Value` (the source is copied, exactly as the real BIF
+    /// behaves). A non-integer index, an index outside `1..=tuple_size(Tuple)`, or
+    /// a non-tuple operand is a `badarg`.
+    fn setelement(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 3 || !is_small(args[0]) {
+            return Err(BeamError::BadArg);
+        }
+        let index = signed_value(args[0]);
+        let arity = terms::tuple_arity(args[1])?;
+        if index < 1 || index as usize > arity {
+            return Err(BeamError::BadArg);
+        }
+        let mut elements = Vec::with_capacity(arity);
+        for offset in 0..arity {
+            elements.push(if offset + 1 == index as usize {
+                args[2]
+            } else {
+                terms::tuple_element(args[1], offset)?
+            });
+        }
+        terms::make_tuple(self, &elements)
+    }
+
+    /// `atom_to_list(Atom)` — the atom's name as a list of code points (ASCII for
+    /// every atom these tests use). A non-atom operand is a `badarg`.
+    fn atom_to_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let atom = args.first().copied().ok_or(BeamError::BadArg)?;
+        if !is_atom(atom) {
+            return Err(BeamError::BadArg);
+        }
+        let name = self
+            .atoms
+            .name(atom_val(atom))
+            .ok_or(BeamError::BadArg)?
+            .to_string();
+        let chars: Vec<Eterm> = name.chars().map(|c| make_small(i64::from(c as u32))).collect();
+        terms::make_list(self, &chars)
+    }
+
+    /// `phash(Term, Range)` — the portable hash `dict` buckets its keys with,
+    /// returned in `1..=Range`.
+    ///
+    /// The exact `erts_phash` bit pattern is not reproduced (it is not an
+    /// externally pinned value); a **deterministic structural hash** is used
+    /// instead. That is observationally equivalent for every `dict` operation these
+    /// tests exercise (`size`/`fetch`/`is_key`, which do not expose the bucket
+    /// order): `dict` only ever compares hashes it computed with the *same*
+    /// function. A non-positive or non-integer `Range` is a `badarg`.
+    fn phash(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let range = match number(args[1]) {
+            Some(Number::Int(range)) if range > 0 => range,
+            _ => return Err(BeamError::BadArg),
+        };
+        let hash = beam_term::hashing::term_hash(args[0], &self.atoms);
+        Ok(make_small((hash % range as u64) as i64 + 1))
+    }
+
+    /// `system_info(Key)` — the few options the real modules this host runs
+    /// consult. Only `os_type` is served (as `{Family, Name}` derived from the
+    /// **host** OS, so `filename` takes the same path-syntax branch the local
+    /// oracle does); every other option is a `badarg`, exactly like an unknown BIF.
+    fn system_info(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let key = args.first().copied().ok_or(BeamError::BadArg)?;
+        if !is_atom(key) {
+            return Err(BeamError::BadArg);
+        }
+        match self.atoms.name(atom_val(key)) {
+            Some("os_type") => {
+                let (family, name) = match std::env::consts::OS {
+                    "macos" => ("unix", "darwin"),
+                    "windows" => ("win32", "nt"),
+                    "linux" => ("unix", "linux"),
+                    _ => ("unix", "linux"),
+                };
+                let family = self.intern(family);
+                let name = self.intern(name);
+                terms::make_tuple(self, &[family, name])
+            }
+            _ => Err(BeamError::BadArg),
+        }
+    }
 }
 
 /// `erlang:element/2` — the 1-based element of a tuple.
@@ -632,6 +843,12 @@ fn length(args: &[Eterm]) -> Result<Eterm> {
 fn tuple_size(args: &[Eterm]) -> Result<Eterm> {
     let tuple = args.first().ok_or(BeamError::BadArg)?;
     Ok(make_small(terms::tuple_arity(*tuple)? as i64))
+}
+
+/// `erlang:hd/1` — the head of a cons cell; anything else is a `badarg`.
+fn hd(args: &[Eterm]) -> Result<Eterm> {
+    let list = args.first().ok_or(BeamError::BadArg)?;
+    terms::cons_head(*list)
 }
 
 // ---------------------------------------------------------------------------

@@ -1,7 +1,14 @@
-//! Pure `lists` module BIFs (the subset of `lists.erl` with no `fun` argument):
-//! `member/2`, `reverse/1,2`, `keyfind/3`, `append/1,2`, `nth/2`, `nthtail/2`,
-//! `last/1`, `sublist/2,3`, `seq/2,3`, `flatten/1,2`, `sum/1`, `max/1`, `min/1`,
-//! `duplicate/2`, `delete/2`, `keysort/2`, `sort/1`, `usort/1`, `zip/2`, `unzip/1`.
+//! `lists` module BIFs.
+//!
+//! The pure subset of `lists.erl` (no `fun` argument): `member/2`, `reverse/1,2`,
+//! `keyfind/3`, `append/1,2`, `nth/2`, `nthtail/2`, `last/1`, `sublist/2,3`,
+//! `seq/2,3`, `flatten/1,2`, `sum/1`, `max/1`, `min/1`, `duplicate/2`, `delete/2`,
+//! `keysort/2`, `sort/1`, `usort/1`, `zip/2`, `unzip/1` — plus the **`fun`-taking**
+//! functions `map/2`, `filter/2`, `foldl/3`, `foldr/3`, `foreach/2`, `sort/2`,
+//! `usort/2`, `flatmap/2`, `zipwith/3`, `mapfoldl/3`, `mapfoldr/3`, `all/2`,
+//! `any/2`, `takewhile/2`, `dropwhile/2`, `partition/2`, `splitwith/2`,
+//! `keymap/3`, which call their fun through the [`crate::FunCaller`] seam
+//! ([`BifContext::call_fun`]) — see below.
 //!
 //! Ground truth (read-only): `../../lib/stdlib/src/lists.erl` (the semantics these
 //! fast paths reproduce) and the `bif.tab` roster
@@ -9,9 +16,50 @@
 //! `bif lists:member/2`, `bif lists:reverse/2`, `bif lists:keyfind/3`, …) plus the C
 //! implementations in `../../erts/emulator/beam/erl_bif_lists.c`.
 //!
-//! The `fun`-taking BIFs (`map/2`, `filter/2`, `foldl/3`, `foldr/3`, `foreach/2`,
-//! `flatmap/2`, `sort/2`, `usort/2`) are deliberately *not* registered here: they
-//! need an `apply`/callback seam into the engine, so the real `lists.erl` runs them.
+//! # The `fun`-taking functions need an evaluator — the `FunCaller` seam
+//!
+//! A BIF is plain Rust and cannot execute BEAM code, so calling an Erlang fun goes
+//! through [`BifContext::call_fun`], which delegates to the runtime's
+//! [`crate::FunCaller`]. With no caller installed (Milestone-1 has no in-crate
+//! evaluator) every `fun`-taking BIF here raises `unsupported_bif`; the whole
+//! module stays usable and the interpreter runs the real `lists.erl` until
+//! `beam_rt` installs the seam. A fun's own failures (`badarg`, a `badfun`, a BEAM
+//! raise from its body) are propagated verbatim — this module never re-wraps them.
+//!
+//! The *shape* of each walk is nonetheless pinned to the oracle, because it decides
+//! which fun calls happen:
+//!
+//! * left to right: `map/2`, `foreach/2`, `filter/2`, `foldl/3`, `all/2`, `any/2`,
+//!   `takewhile/2`, `dropwhile/2`, `partition/2`, `splitwith/2`, `mapfoldl/3`,
+//!   `flatmap/2`, `keymap/3`, `zipwith/3`;
+//! * right to left: `foldr/3` (`Fun(Elem, AccIn)`) and `mapfoldr/3`;
+//! * `all/2` and `any/2` **short-circuit**: the first `false`/`true` decides without
+//!   calling the fun again (`all(P, [1,2,3])` with `P(2) = false` calls it twice);
+//! * `takewhile/2`, `dropwhile/2` and `splitwith/2` stop at the first `false` and
+//!   never touch the remainder — so an *improper* tail is only an error when the
+//!   walk actually reaches it (`lists:takewhile(fun(_) -> false end, [1|2])` ⇒ `[]`,
+//!   while `lists:takewhile(fun(_) -> true end, [1|2])` ⇒ an error), exactly as
+//!   `takewhile_1`/`dropwhile_1`/`splitwith_1` behave.
+//!
+//! Every predicate result is read the way `lists.erl` reads it — a `case … of
+//! true -> …; false -> … end` — so a **non-boolean** result is an error and not a
+//! truthy value: `lists:filter` reports `{bad_filter, 1}` for
+//! `fun(X) -> X end`, and `all/2`/`partition/2`/`takewhile/2`/`dropwhile/2` report
+//! `case_clause`. Milestone-1 collapses all of these to
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) (see the errors section).
+//!
+//! # `sort/2` and `usort/2` — the ordering fun
+//!
+//! `Fun(A, B)` is the `=<` relation, so it is probed in **both** directions: only
+//! `Fun(A,B) = true, Fun(B,A) = false` is a strict order; both-true is equivalence
+//! (the stable sort then keeps the input order, `sort(U, [{1,a},{1,b}])` ⇒
+//! `[{1,a},{1,b}]`) and so is the degenerate neither-true case (the oracle's own
+//! `sort` keeps the input order for `fun(A,B) -> A < B end`). `usort/2` then drops
+//! the *later* of each mutually-`Fun`-equivalent run, so a one-directional
+//! comparator such as `fun(A,B) -> A < B end` removes nothing. The sort itself is a
+//! local **stable merge sort** (not `slice::sort_by`): the comparator can raise, and
+//! an Erlang ordering fun is user-supplied, so a degenerate one must not panic the
+//! BIF.
 //!
 //! # Which of these are real BIFs?
 //!
@@ -49,9 +97,11 @@
 //! Milestone-1 has no `function_clause` in [`beam_common::BeamError`], so **both**
 //! are reported as [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a
 //! wrong result. Arithmetic on a non-number (`sum([a])`) is
-//! [`BeamError::BadArith`](beam_common::BeamError::BadArith) and a 60-bit overflow
-//! is [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit), matching the
-//! sibling `arith` module (real Erlang promotes to a bignum).
+//! [`BeamError::BadArith`](beam_common::BeamError::BadArith). `sum/1` folds with the
+//! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle; a
+//! 60-bit overflow is
+//! [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) only where the
+//! arithmetic is *not* term arithmetic (`seq/2,3`'s bound check).
 //!
 //! # `is_list/1` in guards is *shallow*
 //!
@@ -65,14 +115,13 @@ use core::cmp::Ordering;
 
 use beam_common::Result;
 use beam_term::compare::{cmp_arith, eq};
-use beam_term::{signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
-    car, cdr, float_value, is_float, is_list, is_nil, is_small, is_tuple, tuple_element,
-    tuple_size,
+    car, cdr, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
-use crate::error::{badarg, badarith, system_limit};
+use crate::error::{badarg, system_limit};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -133,6 +182,165 @@ fn sort_by_arith(atoms: &AtomTable, elems: &[Eterm]) -> Vec<Eterm> {
     let mut sorted = elems.to_vec();
     sorted.sort_by(|a, b| cmp_arith(*a, *b, atoms));
     sorted
+}
+
+// ---------------------------------------------------------------------------
+// Helpers for the `fun`-taking functions (the `FunCaller` seam)
+// ---------------------------------------------------------------------------
+
+/// The boolean value of a `true`/`false` **atom**, else `badarg`.
+///
+/// Every predicate read in this module goes through `case Pred(E) of true -> …;
+/// false -> … end`, so a non-boolean result is an error rather than a truthy value
+/// (the oracle reports `case_clause` or `{bad_filter, E}`; Milestone-1 reports
+/// `badarg` — see the module docs).
+fn boolean_result(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
+    if is_atom(result) {
+        match ctx.atoms().name(atom_val(result)) {
+            Some("true") => return Ok(true),
+            Some("false") => return Ok(false),
+            _ => {}
+        }
+    }
+    Err(badarg())
+}
+
+/// Calls the predicate `fun` on `args` and reads its boolean result.
+fn call_predicate(ctx: &mut BifContext<'_>, fun: Eterm, args: &[Eterm]) -> Result<bool> {
+    let result = ctx.call_fun(fun, args)?;
+    boolean_result(ctx, result)
+}
+
+/// The `Fun(A, B)` ordering of two elements for `sort/2`/`usort/2`.
+///
+/// `Fun` is the `=<` relation, so it is probed both ways: `true`/`false` is a
+/// strict order, both-`true` is equivalence, and the degenerate neither-`true` case
+/// is equivalence too (which keeps the input order of elements a one-directional
+/// comparator such as `fun(A, B) -> A < B end` considers equal — the oracle's own
+/// `sort/2` does the same).
+fn fun_order(ctx: &mut BifContext<'_>, fun: Eterm, a: Eterm, b: Eterm) -> Result<Ordering> {
+    if call_predicate(ctx, fun, &[a, b])? {
+        if call_predicate(ctx, fun, &[b, a])? {
+            Ok(Ordering::Equal)
+        } else {
+            Ok(Ordering::Less)
+        }
+    } else if call_predicate(ctx, fun, &[b, a])? {
+        Ok(Ordering::Greater)
+    } else {
+        Ok(Ordering::Equal)
+    }
+}
+
+/// Whether `Fun` considers `a` and `b` equivalent — `Fun(A, B)` **and**
+/// `Fun(B, A)`, evaluated in that order (short-circuiting, as `usort_1` does).
+///
+/// Only a *mutual* `true` collapses `usort/2` duplicates, so a one-directional
+/// comparator (`fun(A, B) -> A < B end`) removes nothing.
+fn fun_equivalent(ctx: &mut BifContext<'_>, fun: Eterm, a: Eterm, b: Eterm) -> Result<bool> {
+    if !call_predicate(ctx, fun, &[a, b])? {
+        return Ok(false);
+    }
+    call_predicate(ctx, fun, &[b, a])
+}
+
+/// A **stable** bottom-up merge sort with a fallible comparator.
+///
+/// `slice::sort_by` is unusable here: the comparator calls an Erlang fun (which can
+/// raise), and `sort_by` additionally requires a total order — an Erlang ordering
+/// fun is user-supplied, so a degenerate one must never panic a BIF. Elements the
+/// comparator reports `Equal` keep their input order.
+fn merge_sort_elems(
+    elems: Vec<Eterm>,
+    mut order: impl FnMut(Eterm, Eterm) -> Result<Ordering>,
+) -> Result<Vec<Eterm>> {
+    let len = elems.len();
+    let mut source = elems;
+    let mut width = 1;
+    while width < len {
+        let mut merged = Vec::with_capacity(len);
+        let mut start = 0;
+        while start < len {
+            let middle = (start + width).min(len);
+            let end = (start + 2 * width).min(len);
+            let (mut left, mut right) = (start, middle);
+            while left < middle && right < end {
+                // `Greater` means the right run's element must come first; anything
+                // else takes the left element, which is what makes the sort stable.
+                if order(source[left], source[right])? == Ordering::Greater {
+                    merged.push(source[right]);
+                    right += 1;
+                } else {
+                    merged.push(source[left]);
+                    left += 1;
+                }
+            }
+            merged.extend_from_slice(&source[left..middle]);
+            merged.extend_from_slice(&source[right..end]);
+            start = end;
+        }
+        source = merged;
+        width *= 2;
+    }
+    Ok(source)
+}
+
+/// Walks `list` while `fun` holds, returning `(taken, rest)`.
+///
+/// `rest` is the first sublist whose head fails the predicate (or `NIL`). The walk
+/// is **lazy**: it stops at the first `false` and never looks at the remainder, so
+/// an improper tail is an error only when the walk actually reaches it — exactly
+/// `lists.erl`'s `takewhile_1`/`dropwhile_1`/`splitwith_1`.
+fn take_while_prefix(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    list: Eterm,
+) -> Result<(Vec<Eterm>, Eterm)> {
+    let mut cur = list;
+    let mut taken = Vec::new();
+    loop {
+        if is_nil(cur) {
+            return Ok((taken, NIL));
+        }
+        if !is_list(cur) {
+            return Err(badarg());
+        }
+        let elem = car(cur);
+        if !call_predicate(ctx, fun, &[elem])? {
+            return Ok((taken, cur));
+        }
+        taken.push(elem);
+        cur = cdr(cur);
+    }
+}
+
+/// Splits the `{Mapped, Acc}` 2-tuple a `mapfoldl`/`mapfoldr` fun must return.
+///
+/// A fun returning anything else is the oracle's `badmatch`, which Milestone-1
+/// reports as [`BeamError::BadArg`](beam_common::BeamError::BadArg).
+fn map_fold_pair(result: Eterm) -> Result<(Eterm, Eterm)> {
+    if !is_tuple(result) || tuple_size(result) != 2 {
+        return Err(badarg());
+    }
+    Ok((tuple_element(result, 0), tuple_element(result, 1)))
+}
+
+/// `setelement(Index, Tuple, Value)` — a **new** tuple with element `Index`
+/// (1-based) replaced, or `badarg` when `Tuple` is not a tuple or is too short.
+fn replace_element(
+    ctx: &mut BifContext<'_>,
+    tuple: Eterm,
+    index: usize,
+    value: Eterm,
+) -> Result<Eterm> {
+    if !is_tuple(tuple) || index > tuple_size(tuple) {
+        return Err(badarg());
+    }
+    let mut elems: Vec<Eterm> = (0..tuple_size(tuple))
+        .map(|i| tuple_element(tuple, i))
+        .collect();
+    elems[index - 1] = value;
+    ctx.tuple(&elems)
 }
 
 // ---------------------------------------------------------------------------
@@ -521,60 +729,30 @@ fn flatten2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // lists:sum/1, lists:max/1, lists:min/1
 // ---------------------------------------------------------------------------
 
-/// The running `lists:sum/1` accumulator: an integer until a float appears.
-enum Acc {
-    Int(i64),
-    Float(f64),
-}
-
-impl Acc {
-    /// Adds one list element, the way `Sum + H` does.
-    ///
-    /// # Errors
-    ///
-    /// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-number;
-    /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) for an
-    /// integer sum past the 60-bit small range (the `arith` module's documented
-    /// M1 limit).
-    fn add(self, term: Eterm) -> Result<Acc> {
-        if is_small(term) {
-            let value = signed_value(term);
-            match self {
-                Acc::Int(sum) => Ok(Acc::Int(sum.checked_add(value).ok_or_else(system_limit)?)),
-                Acc::Float(sum) => Ok(Acc::Float(sum + value as f64)),
-            }
-        } else if is_float(term) {
-            let value = float_value(term);
-            match self {
-                Acc::Int(sum) => Ok(Acc::Float(sum as f64 + value)),
-                Acc::Float(sum) => Ok(Acc::Float(sum + value)),
-            }
-        } else {
-            Err(badarith())
-        }
-    }
-
-    /// Materialises the accumulator as a term.
-    fn into_term(self, ctx: &mut BifContext<'_>) -> Result<Eterm> {
-        match self {
-            Acc::Int(sum) => ctx.int(sum),
-            Acc::Float(sum) => ctx.make_float(sum),
-        }
-    }
-}
-
-/// `sum(List)` — the sum of a proper list of numbers (`sum([])` ⇒ `0`).
+/// `sum(List)` — the fold `Sum + H` over a proper list of numbers (`sum([])` ⇒ `0`).
+///
+/// The addition is [`crate::arith::add_terms`] — the very `+` the oracle's
+/// `lists.erl` folds with — so an integer sum that leaves the 60-bit small range
+/// **promotes to a bignum**, exactly as real Erlang does
+/// (`lists:sum([576460752303423487, 1])` ⇒ `576460752303423488`), and a bignum
+/// *element* is summed exactly.
+///
+/// # Errors
+///
+/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-number
+/// (`sum([a])` ⇒ `badarith`), and `badarg` when `List` is not a proper list (the
+/// oracle's `function_clause`).
 fn sum(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let mut acc = Acc::Int(0);
+    let mut acc = ctx.int(0)?;
     let mut cur = args[0];
     while is_list(cur) {
-        acc = acc.add(car(cur))?;
+        acc = crate::arith::add_terms(ctx, acc, car(cur))?;
         cur = cdr(cur);
     }
     if !is_nil(cur) {
         return Err(badarg());
     }
-    acc.into_term(ctx)
+    Ok(acc)
 }
 
 /// Walks a non-empty proper list, keeping the element that beats the running
@@ -766,14 +944,290 @@ fn unzip(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 }
 
 // ---------------------------------------------------------------------------
+// The `fun`-taking functions (via the `FunCaller` seam)
+// ---------------------------------------------------------------------------
+
+/// `map(Fun, List)` — `Fun` applied to every element, left to right.
+///
+/// # Errors
+///
+/// `badarg` when `List` is not a proper list (the oracle raises `case_clause` for a
+/// non-list and `function_clause` for an improper tail); otherwise propagates
+/// whatever `Fun` raises through [`BifContext::call_fun`].
+fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let mut mapped = Vec::with_capacity(elems.len());
+    for elem in elems {
+        mapped.push(ctx.call_fun(fun, &[elem])?);
+    }
+    build_list(ctx, &mapped, NIL)
+}
+
+/// `foreach(Fun, List)` — `Fun` called for its side effects, left to right; `ok`.
+fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    for elem in elems {
+        ctx.call_fun(fun, &[elem])?;
+    }
+    ctx.ok()
+}
+
+/// `filter(Pred, List)` — the elements for which `Pred` returns `true`, in order.
+fn filter2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let mut kept = Vec::new();
+    for elem in elems {
+        if call_predicate(ctx, fun, &[elem])? {
+            kept.push(elem);
+        }
+    }
+    build_list(ctx, &kept, NIL)
+}
+
+/// `foldl(Fun, Acc0, List)` — `Acc = Fun(Elem, Acc)`, left to right.
+fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut acc = args[1];
+    for elem in proper_list(args[2]).ok_or_else(badarg)? {
+        acc = ctx.call_fun(fun, &[elem, acc])?;
+    }
+    Ok(acc)
+}
+
+/// `foldr(Fun, Acc0, List)` — `Acc = Fun(Elem, Acc)`, **right to left**.
+fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut acc = args[1];
+    for &elem in proper_list(args[2]).ok_or_else(badarg)?.iter().rev() {
+        acc = ctx.call_fun(fun, &[elem, acc])?;
+    }
+    Ok(acc)
+}
+
+/// `all(Pred, List)` — whether `Pred` holds for every element.
+///
+/// **Short-circuits**: the first `false` decides and no further element is visited.
+/// The walk is lazy for the same reason, so — like `all/2` in `lists.erl` — it can
+/// answer before an improper tail is ever reached.
+fn all2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut cur = args[1];
+    while is_list(cur) {
+        let elem = car(cur);
+        if !call_predicate(ctx, fun, &[elem])? {
+            return ctx.boolean(false);
+        }
+        cur = cdr(cur);
+    }
+    if !is_nil(cur) {
+        return Err(badarg());
+    }
+    ctx.boolean(true)
+}
+
+/// `any(Pred, List)` — whether `Pred` holds for some element.
+///
+/// **Short-circuits**: the first `true` decides and no further element is visited.
+fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut cur = args[1];
+    while is_list(cur) {
+        let elem = car(cur);
+        if call_predicate(ctx, fun, &[elem])? {
+            return ctx.boolean(true);
+        }
+        cur = cdr(cur);
+    }
+    if !is_nil(cur) {
+        return Err(badarg());
+    }
+    ctx.boolean(false)
+}
+
+/// `flatmap(Fun, List)` — `Fun(Elem)` (a list) applied to every element, the
+/// results concatenated left to right.
+///
+/// # Errors
+///
+/// `badarg` when `List` is not proper, or when a `Fun` result is not a proper list
+/// (`List ++ Rest` is `badarg` in the oracle).
+fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let mut flat: Vec<Eterm> = Vec::new();
+    for elem in elems {
+        let result = ctx.call_fun(fun, &[elem])?;
+        let sub = proper_list(result).ok_or_else(badarg)?;
+        flat.extend_from_slice(&sub);
+    }
+    build_list(ctx, &flat, NIL)
+}
+
+/// `takewhile(Pred, List)` — the longest prefix whose elements satisfy `Pred`.
+fn takewhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (taken, _rest) = take_while_prefix(ctx, args[0], args[1])?;
+    build_list(ctx, &taken, NIL)
+}
+
+/// `dropwhile(Pred, List)` — `List` with its longest `Pred`-satisfying prefix
+/// removed (the remainder is returned as-is, sharing its tail).
+fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (_taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
+    Ok(rest)
+}
+
+/// `partition(Pred, List)` — `{Satisfied, NotSatisfied}`, both order-preserving.
+fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let mut satisfied = Vec::new();
+    let mut not_satisfied = Vec::new();
+    for elem in elems {
+        if call_predicate(ctx, fun, &[elem])? {
+            satisfied.push(elem);
+        } else {
+            not_satisfied.push(elem);
+        }
+    }
+    let satisfied = build_list(ctx, &satisfied, NIL)?;
+    let not_satisfied = build_list(ctx, &not_satisfied, NIL)?;
+    ctx.tuple(&[satisfied, not_satisfied])
+}
+
+/// `splitwith(Pred, List)` — `{takewhile(Pred, List), dropwhile(Pred, List)}` in a
+/// single pass (`splitwith_1`).
+fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (taken, rest) = take_while_prefix(ctx, args[0], args[1])?;
+    let taken = build_list(ctx, &taken, NIL)?;
+    ctx.tuple(&[taken, rest])
+}
+
+/// `mapfoldl(Fun, Acc0, List)` — `{Mapped, Acc}` with `{M, Acc1} = Fun(Elem, Acc)`
+/// applied left to right; the mapped values are in element order.
+fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut acc = args[1];
+    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let mut mapped = Vec::with_capacity(elems.len());
+    for elem in elems {
+        let (mapped_elem, next_acc) = map_fold_pair(ctx.call_fun(fun, &[elem, acc])?)?;
+        mapped.push(mapped_elem);
+        acc = next_acc;
+    }
+    let mapped = build_list(ctx, &mapped, NIL)?;
+    ctx.tuple(&[mapped, acc])
+}
+
+/// `mapfoldr(Fun, Acc0, List)` — `{Mapped, Acc}` with `Fun(Elem, Acc)` applied
+/// **right to left**; the mapped values are still returned in *element* order
+/// (`mapfoldr_1` conses without reversing its accumulator).
+fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut acc = args[1];
+    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let mut mapped = vec![NIL; elems.len()];
+    for (index, &elem) in elems.iter().enumerate().rev() {
+        let (mapped_elem, next_acc) = map_fold_pair(ctx.call_fun(fun, &[elem, acc])?)?;
+        mapped[index] = mapped_elem;
+        acc = next_acc;
+    }
+    let mapped = build_list(ctx, &mapped, NIL)?;
+    ctx.tuple(&[mapped, acc])
+}
+
+/// `zipwith(Fun, List1, List2)` — `[Fun(X, Y) | …]`, element by element.
+///
+/// The two lists must have the **same length**: `zipwith/3` is
+/// `zipwith(F, Xs, Ys, fail)` in `lists.erl`, whose `fail` mode has no clause for
+/// a length mismatch, so `zipwith(F, [1,2,3], [10,20])` raises `function_clause`
+/// (Milestone-1: [`BeamError::BadArg`](beam_common::BeamError::BadArg)) exactly
+/// like `zip/2`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`, which this
+/// module does not register.
+fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut left = args[1];
+    let mut right = args[2];
+    let mut zipped = Vec::new();
+    loop {
+        match (is_list(left), is_list(right)) {
+            (true, true) => {
+                zipped.push(ctx.call_fun(fun, &[car(left), car(right)])?);
+                left = cdr(left);
+                right = cdr(right);
+            }
+            (false, false) if is_nil(left) && is_nil(right) => break,
+            _ => return Err(badarg()),
+        }
+    }
+    build_list(ctx, &zipped, NIL)
+}
+
+/// `sort(Fun, List)` — a **stable** sort in the `Fun` (`=<`) order.
+fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
+    ctx.list(&sorted)
+}
+
+/// `usort(Fun, List)` — `sort/2` with each run of mutually `Fun`-equivalent
+/// elements collapsed to its first element.
+fn usort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
+    let mut unique: Vec<Eterm> = Vec::with_capacity(sorted.len());
+    for elem in sorted {
+        let duplicate = match unique.last() {
+            Some(&previous) => fun_equivalent(ctx, fun, previous, elem)?,
+            None => false,
+        };
+        if !duplicate {
+            unique.push(elem);
+        }
+    }
+    ctx.list(&unique)
+}
+
+/// `keymap(Fun, Index, TupleList)` — `Fun` applied to the `Index`th element of
+/// every tuple, the result replacing it.
+///
+/// # Errors
+///
+/// `badarg` when `TupleList` is not a proper list, or an element is not a tuple
+/// with at least `Index` elements (`element/2` runs *before* `Fun`, so the fun is
+/// never called for such an element), or `Index` is not a small integer `>= 1`.
+fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let index = small_int(args[1])?;
+    if index < 1 {
+        return Err(badarg());
+    }
+    let index = index as usize;
+    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let mut mapped = Vec::with_capacity(elems.len());
+    for elem in elems {
+        if !is_tuple(elem) || index > tuple_size(elem) {
+            return Err(badarg());
+        }
+        let updated = ctx.call_fun(fun, &[tuple_element(elem, index - 1)])?;
+        mapped.push(replace_element(ctx, elem, index, updated)?);
+    }
+    build_list(ctx, &mapped, NIL)
+}
+
+// ---------------------------------------------------------------------------
 // Registration
 // ---------------------------------------------------------------------------
 
-/// Registers the pure `lists` module BIFs.
+/// Registers the `lists` module BIFs.
 ///
-/// 25 keys: the three real `bif.tab` BIFs (`member/2`, `reverse/2`, `keyfind/3`)
-/// plus the pure-Erlang `lists.erl` functions in this module's scope, as Rust fast
-/// paths. The `fun`-taking functions are not registered (see the module docs).
+/// 43 keys: the three real `bif.tab` BIFs (`member/2`, `reverse/2`, `keyfind/3`),
+/// the pure-Erlang `lists.erl` functions as Rust fast paths, and the 18
+/// `fun`-taking functions (which need the [`crate::FunCaller`] seam).
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("lists", "member", 2, member);
     reg.register("lists", "reverse", 1, reverse1);
@@ -800,6 +1254,25 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("lists", "usort", 1, usort);
     reg.register("lists", "zip", 2, zip);
     reg.register("lists", "unzip", 1, unzip);
+    // The `fun`-taking functions: they call their fun through `BifContext::call_fun`.
+    reg.register("lists", "map", 2, map2);
+    reg.register("lists", "filter", 2, filter2);
+    reg.register("lists", "foldl", 3, foldl3);
+    reg.register("lists", "foldr", 3, foldr3);
+    reg.register("lists", "foreach", 2, foreach2);
+    reg.register("lists", "sort", 2, sort2);
+    reg.register("lists", "usort", 2, usort2);
+    reg.register("lists", "flatmap", 2, flatmap2);
+    reg.register("lists", "zipwith", 3, zipwith3);
+    reg.register("lists", "mapfoldl", 3, mapfoldl3);
+    reg.register("lists", "mapfoldr", 3, mapfoldr3);
+    reg.register("lists", "all", 2, all2);
+    reg.register("lists", "any", 2, any2);
+    reg.register("lists", "takewhile", 2, takewhile2);
+    reg.register("lists", "dropwhile", 2, dropwhile2);
+    reg.register("lists", "partition", 2, partition2);
+    reg.register("lists", "splitwith", 2, splitwith2);
+    reg.register("lists", "keymap", 3, keymap3);
 }
 
 #[cfg(test)]
@@ -1173,6 +1646,24 @@ mod tests {
             assert_badarith(call!(ctx, sum, [atoms_list(ctx, &["a"])]));
             rejects!(ctx, sum, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
             rejects!(ctx, sum, [ctx.atom("a").unwrap()]);
+
+            // A sum that leaves the 60-bit small range **promotes to a bignum**: the
+            // fold uses the exact `+` (`MAX_SMALL` is 576460752303423487, so adding 1
+            // crosses it). Oracle: lists:sum([576460752303423487,1]) => 576460752303423488,
+            // lists:sum([-576460752303423488,-1]) => -576460752303423489.
+            show!(ctx, sum, [ints(ctx, &[beam_term::MAX_SMALL, 1])], "576460752303423488");
+            show!(
+                ctx,
+                sum,
+                [ints(ctx, &[beam_term::MIN_SMALL, -1])],
+                "-576460752303423489"
+            );
+
+            // A bignum *element* is summed exactly too (oracle:
+            // lists:sum([1 bsl 70]) => 1180591620717411303424).
+            let two_to_70 = beam_codec::term::make_big(ctx.heap(), false, &[0, 64]).unwrap();
+            let single_big = ctx.list(&[two_to_70]).unwrap();
+            show!(ctx, sum, [single_big], "1180591620717411303424");
         });
     }
 
@@ -1200,6 +1691,13 @@ mod tests {
             let tup = ctx.tuple(&[ctx.atom("b").unwrap()]).unwrap();
             show!(ctx, max, [ctx.list(&[ctx.atom("a").unwrap(), tup]).unwrap()], "{b}");
             show!(ctx, min, [ctx.list(&[ctx.atom("a").unwrap(), tup]).unwrap()], "a");
+
+            // A bignum element is ordered exactly (oracle:
+            // lists:max([1, 1 bsl 70]) => 1180591620717411303424).
+            let two_to_70 = beam_codec::term::make_big(ctx.heap(), false, &[0, 64]).unwrap();
+            let with_big = ctx.list(&[make_small(1), two_to_70]).unwrap();
+            show!(ctx, max, [with_big], "1180591620717411303424");
+            show!(ctx, min, [with_big], "1");
 
             rejects!(ctx, max, [NIL]);
             rejects!(ctx, min, [NIL]);
@@ -1404,15 +1902,31 @@ mod tests {
             ("unzip", 1),
             ("usort", 1),
             ("zip", 2),
+            // The `fun`-taking functions (`lists.erl` exports backed by the
+            // `FunCaller` seam).
+            ("all", 2),
+            ("any", 2),
+            ("dropwhile", 2),
+            ("filter", 2),
+            ("flatmap", 2),
+            ("foldl", 3),
+            ("foldr", 3),
+            ("foreach", 2),
+            ("keymap", 3),
+            ("map", 2),
+            ("mapfoldl", 3),
+            ("mapfoldr", 3),
+            ("partition", 2),
+            ("sort", 2),
+            ("splitwith", 2),
+            ("takewhile", 2),
+            ("usort", 2),
+            ("zipwith", 3),
         ];
         for (name, arity) in expected {
             assert!(reg.contains("lists", name, arity), "missing lists:{name}/{arity}");
         }
         assert_eq!(reg.len(), expected.len());
-        // The fun-taking functions need an apply/callback seam: not registered.
-        for (name, arity) in [("map", 2), ("filter", 2), ("foldl", 3), ("sort", 2), ("usort", 2)] {
-            assert!(!reg.contains("lists", name, arity), "lists:{name}/{arity} must not be a BIF");
-        }
     }
 
     #[test]

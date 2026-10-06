@@ -1,15 +1,22 @@
 //! The `binary` module BIFs (`binary:at/2`, `part/2,3`, `copy/1,2`,
 //! `list_to_bin/1`, `bin_to_list/1,2,3`, `decode_unsigned/1,2`,
-//! `encode_unsigned/1,2`, `first/1`, `last/1`, `split/2,3`, `concat/2`,
-//! `match/2,3`, `longest_common_prefix/1`).
+//! `encode_unsigned/1,2`, `first/1`, `last/1`, `split/2,3`,
+//! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
+//! `longest_common_suffix/1`).
 //!
 //! Ground truth (read-only): [`../../erts/emulator/beam/erl_bif_binary.c`]
 //! (`binary_at_2`, `erts_binary_part`, `do_binary_copy`, `start_longest_common`,
 //! `binary_first_1`/`binary_last_1`, `do_encode_unsigned`/`do_decode_unsigned`,
-//! `binary_match`, `binary_split`, `do_binary_match_compile`,
+//! `binary_match`, `binary_matches`, `binary_split`, `do_binary_match_compile`,
 //! `parse_match_opts_list`/`parse_split_opts_list`) and the `bif.tab` roster
 //! (`bif binary:at/2`, `bif binary:part/2 binary_binary_part_2`, `…`). Every
 //! value below is pinned against the OTP 29 / erts-17.1 oracle.
+//!
+//! The roster is exactly the `bif.tab` `binary` surface (minus the documented
+//! gaps): `compile_pattern/1`, `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
+//! `longest_common_suffix/1`, `first/1`, `last/1`, `at/2`, `part/2,3`,
+//! `list_to_bin/1`, `copy/1,2`, `referenced_byte_size/1`, `encode_unsigned/1,2`,
+//! `decode_unsigned/1,2`, `split/2,3`.
 //!
 //! Registers its BIFs through [`register`]; the shared heap-bitstring helpers live
 //! in [`crate::bits`] and the "is this a proper list?" rule in [`crate::print`].
@@ -46,7 +53,11 @@
 //!   (`[<<"xy">>,<<"cd">>]`) pick the match with the **leftmost start**, and
 //!   among alternatives matching at that start the **longest** (`match(<<"ab">>,
 //!   [<<"a">>,<<"ab">>])` ⇒ `{0,2}`). An empty alternative ⇒ `badarg`.
-//! * `longest_common_prefix([<<"abc">>,<<"abd">>])` ⇒ `2`; an empty list, a
+//! * `matches(<<"abcabcab">>, <<"ab">>)` ⇒ `[{0,2},{3,2},{6,2}]` (every
+//!   non-overlapping match, leftmost-longest); no match ⇒ `[]` (not `nomatch`).
+//!   An empty pattern and a non-list option ⇒ `badarg`.
+//! * `longest_common_prefix([<<"abc">>,<<"abd">>])` ⇒ `2`,
+//!   `longest_common_suffix([<<"abc">>,<<"abd">>])` ⇒ `0`; an empty list, a
 //!   non-binary element and a non-list argument ⇒ `badarg`.
 //!
 //! # Documented Milestone-1 gaps (never a silently wrong result)
@@ -58,6 +69,7 @@
 //!   `{bm, Ref}`/`{am, Ref}` pattern would need a magic-ref binary, which
 //!   Milestone-1 does not build, so it is `badarg` (`maybe_binary_match_compile`
 //!   rejects anything that is not a valid compiled pattern the same way).
+//!   `referenced_byte_size/1` is likewise not registered.
 //! * **No bignums.** `decode_unsigned` of a value that leaves the 60-bit small
 //!   range reports [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)
 //!   where real Erlang builds a bignum; `encode_unsigned` of a bignum is `badarg`
@@ -69,10 +81,10 @@
 //!   than the destination heap can hold reports `system_limit` rather than
 //!   allocating without bound (the same convention `convert::make_tuple` uses).
 //! * **`bin_to_list/1,2,3` are Erlang functions in OTP** (`lib/stdlib/src/
-//!   binary.erl`, wrapping `binary_to_list/1,3`) and **`binary:concat/2` does not
-//!   exist in OTP at all**; both are registered here as BIFs so the runtime can
-//!   resolve the documented call set. Their observable behaviour follows the
-//!   `binary.erl` wrapper (verified against the oracle for every case below).
+//!   binary.erl`, wrapping `binary_to_list/1,3`); they are registered here as
+//!   BIFs so the runtime can resolve the documented call set, with the
+//!   `binary.erl` wrapper's observable behaviour (verified against the oracle for
+//!   every case below). They are *not* `bif.tab` entries.
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
@@ -706,13 +718,6 @@ fn split_not_found(ctx: &mut BifContext<'_>, bytes: &[u8], trimming: bool) -> Re
     ctx.list(&[whole])
 }
 
-/// `concat(Binary1, Binary2)`.
-fn concat_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let mut out = bits::bytes(args[0])?;
-    out.extend_from_slice(&bits::bytes(args[1])?);
-    bits::make_binary(ctx.heap(), &out)
-}
-
 /// `match(Subject, Pattern)`.
 fn match_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     do_match(ctx, args[0], args[1], None)
@@ -743,9 +748,53 @@ fn do_match(
     }
 }
 
+/// `matches(Subject, Pattern)`.
+fn matches_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    do_matches(ctx, args[0], args[1], None)
+}
+
+/// `matches(Subject, Pattern, Options)`.
+fn matches_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    do_matches(ctx, args[0], args[1], Some(args[2]))
+}
+
+/// `binary_matches`: every non-overlapping match as `[{Pos, Len}, …]`, in
+/// position order — `[]` when there is none (not `nomatch`). The pattern/option
+/// rules are the same `parse_pattern`/`parse_match_opts_list` `match/2,3` uses.
+fn do_matches(
+    ctx: &mut BifContext<'_>,
+    subject: Eterm,
+    pattern: Eterm,
+    opts: Option<Eterm>,
+) -> Result<Eterm> {
+    let bytes = bits::bytes(subject)?;
+    let alternatives = parse_pattern(pattern)?;
+    let (start, end) = match_options(ctx, opts, bytes.len())?;
+    let matches = find_all(&bytes, &alternatives, start, end);
+    let mut elems = Vec::with_capacity(matches.len());
+    for (pos, len) in matches {
+        let pos = ctx.int(pos as i64)?;
+        let len = ctx.int(len as i64)?;
+        elems.push(ctx.tuple(&[pos, len])?);
+    }
+    ctx.list(&elems)
+}
+
 /// `longest_common_prefix(Binaries)` — the byte length of the common prefix.
 fn longest_common_prefix_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let items = proper_list(args[0]).ok_or_else(badarg)?;
+    common_edge(ctx, args[0], false)
+}
+
+/// `longest_common_suffix(Binaries)` — the byte length of the common suffix.
+fn longest_common_suffix_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    common_edge(ctx, args[0], true)
+}
+
+/// `start_longest_common`: the byte length of the common prefix (`from_end`
+/// false) or suffix (`from_end` true) of a non-empty list of byte-aligned
+/// binaries. An empty list, a non-binary element and a non-list are `badarg`.
+fn common_edge(ctx: &mut BifContext<'_>, list: Eterm, from_end: bool) -> Result<Eterm> {
+    let items = proper_list(list).ok_or_else(badarg)?;
     if items.is_empty() {
         return Err(badarg());
     }
@@ -753,16 +802,18 @@ fn longest_common_prefix_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<E
     for item in items {
         binaries.push(bits::bytes(item)?);
     }
-    let mut shortest = binaries.first().map_or(0, |b| b.len());
+    let mut shortest = usize::MAX;
     for binary in &binaries {
         shortest = shortest.min(binary.len());
     }
+    let first = &binaries[0];
     let mut common = 0;
-    'prefix: for i in 0..shortest {
-        let byte = binaries[0][i];
+    'edge: for i in 0..shortest {
+        let byte = if from_end { first[first.len() - 1 - i] } else { first[i] };
         for binary in &binaries[1..] {
-            if binary[i] != byte {
-                break 'prefix;
+            let other = if from_end { binary[binary.len() - 1 - i] } else { binary[i] };
+            if other != byte {
+                break 'edge;
             }
         }
         common += 1;
@@ -789,10 +840,12 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("binary", "last", 1, last_1);
     reg.register("binary", "split", 2, split_2);
     reg.register("binary", "split", 3, split_3);
-    reg.register("binary", "concat", 2, concat_2);
     reg.register("binary", "match", 2, match_2);
     reg.register("binary", "match", 3, match_3);
+    reg.register("binary", "matches", 2, matches_2);
+    reg.register("binary", "matches", 3, matches_3);
     reg.register("binary", "longest_common_prefix", 1, longest_common_prefix_1);
+    reg.register("binary", "longest_common_suffix", 1, longest_common_suffix_1);
 }
 
 #[cfg(test)]
@@ -1385,23 +1438,121 @@ mod tests {
         });
     }
 
+    /// The `[{Pos, Len}, …]` result of `matches/2,3` as `(Pos, Len)` pairs.
+    fn positions(term: Eterm) -> Vec<(i64, i64)> {
+        proper_list(term)
+            .expect("matches returns a proper list")
+            .into_iter()
+            .map(|pair| {
+                assert!(access::is_tuple(pair) && access::tuple_size(pair) == 2);
+                (
+                    signed_value(access::tuple_element(pair, 0)),
+                    signed_value(access::tuple_element(pair, 1)),
+                )
+            })
+            .collect()
+    }
+
     #[test]
-    fn concat_joins_two_binaries() {
+    fn matches_returns_every_non_overlapping_match() {
         with_ctx(|ctx| {
-            let head = bin(ctx, &[1, 2]);
-            let tail = bin(ctx, &[3]);
-            assert_eq!(bytes(concat_2(ctx, &[head, tail]).unwrap()), vec![1, 2, 3]);
+            let subject = bin(ctx, &[b'a', b'b', b'c', b'a', b'b', b'c', b'a', b'b']);
+            let ab = bin(ctx, &[b'a', b'b']);
+            assert_eq!(
+                positions(matches_2(ctx, &[subject, ab]).unwrap()),
+                vec![(0, 2), (3, 2), (6, 2)]
+            );
 
+            // No match is `[]` (not the `nomatch` atom `match/2` returns).
+            let zz = bin(ctx, &[b'z', b'z']);
+            assert!(access::is_nil(matches_2(ctx, &[subject, zz]).unwrap()));
+
+            // Adjacent non-overlapping occurrences, never overlapping ones.
+            let aaaa = bin(ctx, &[b'a', b'a', b'a', b'a']);
+            let aa = bin(ctx, &[b'a', b'a']);
+            assert_eq!(positions(matches_2(ctx, &[aaaa, aa]).unwrap()), vec![(0, 2), (2, 2)]);
+
+            // An alternative list picks the leftmost-longest match at each step.
+            let aaa = bin(ctx, &[b'a', b'a', b'a']);
+            let alts = ctx.list(&[aa, aaa]).unwrap();
+            assert_eq!(positions(matches_2(ctx, &[aaaa, alts]).unwrap()), vec![(0, 3)]);
+
+            // `{scope, …}` restricts the searched range (only whole matches).
+            let sc = scope(ctx, 1, 5);
+            let scoped = ctx.list(&[sc]).unwrap();
+            assert_eq!(positions(matches_3(ctx, &[subject, ab, scoped]).unwrap()), vec![(3, 2)]);
+
+            // An empty pattern, an empty alternative list, a bad option and a
+            // non-list option list are `badarg`.
             let empty = bin(ctx, &[]);
-            assert_eq!(bytes(concat_2(ctx, &[empty, tail]).unwrap()), vec![3]);
-            assert_eq!(bytes(concat_2(ctx, &[head, empty]).unwrap()), vec![1, 2]);
-            assert!(bytes(concat_2(ctx, &[empty, empty]).unwrap()).is_empty());
+            assert!(matches!(matches_2(ctx, &[subject, empty]), Err(BeamError::BadArg)));
+            let empty_list = ctx.list(&[]).unwrap();
+            assert!(matches!(matches_2(ctx, &[subject, empty_list]), Err(BeamError::BadArg)));
+            let bad = ctx.list(&[ctx.atom("a").unwrap()]).unwrap();
+            assert!(matches!(matches_3(ctx, &[subject, ab, bad]), Err(BeamError::BadArg)));
+            let non_list_opts = ctx.atom("foo").unwrap();
+            assert!(matches!(
+                matches_3(ctx, &[subject, ab, non_list_opts]),
+                Err(BeamError::BadArg)
+            ));
 
-            let atom = ctx.atom("a").unwrap();
-            assert!(matches!(concat_2(ctx, &[atom, tail]), Err(BeamError::BadArg)));
-            assert!(matches!(concat_2(ctx, &[head, atom]), Err(BeamError::BadArg)));
+            // A non-byte-aligned subject is `badarg`; an empty subject has none.
             let bits = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).expect("fits");
-            assert!(matches!(concat_2(ctx, &[bits, tail]), Err(BeamError::BadArg)));
+            assert!(matches!(matches_2(ctx, &[bits, ab]), Err(BeamError::BadArg)));
+            let empty_subject = bin(ctx, &[]);
+            assert!(access::is_nil(matches_2(ctx, &[empty_subject, ab]).unwrap()));
+        });
+    }
+
+    #[test]
+    fn longest_common_suffix_mirrors_the_prefix() {
+        with_ctx(|ctx| {
+            let cases: [(&[&[u8]], i64, i64); 6] = [
+                (&[b"abc", b"abd"], 2, 0),
+                (&[b"abc", b"abc"], 3, 3),
+                (&[b"abc", b"xbc"], 0, 2),
+                (&[b"abcd", b"ab"], 2, 0),
+                (&[b"", b""], 0, 0),
+                (&[b"abc"], 3, 3),
+            ];
+            for (inputs, prefix, suffix) in cases {
+                let mut elems = Vec::with_capacity(inputs.len());
+                for input in inputs {
+                    elems.push(bin(ctx, input));
+                }
+                let list = ctx.list(&elems).unwrap();
+                assert_eq!(
+                    longest_common_prefix_1(ctx, &[list]).unwrap(),
+                    ctx.int(prefix).unwrap(),
+                    "prefix of {inputs:?}"
+                );
+                assert_eq!(
+                    longest_common_suffix_1(ctx, &[list]).unwrap(),
+                    ctx.int(suffix).unwrap(),
+                    "suffix of {inputs:?}"
+                );
+            }
+
+            // An empty list, a non-binary element, a non-list and a
+            // non-byte-aligned element are all `badarg`.
+            let empty = ctx.list(&[]).unwrap();
+            assert!(matches!(
+                longest_common_suffix_1(ctx, &[empty]),
+                Err(BeamError::BadArg)
+            ));
+            let atom = ctx.atom("abc").unwrap();
+            let with_atom = ctx.list(&[atom]).unwrap();
+            assert!(matches!(
+                longest_common_suffix_1(ctx, &[with_atom]),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(longest_common_suffix_1(ctx, &[atom]), Err(BeamError::BadArg)));
+            let bits = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).expect("fits");
+            let with_bits = ctx.list(&[bits, bits]).unwrap();
+            assert!(matches!(
+                longest_common_suffix_1(ctx, &[with_bits]),
+                Err(BeamError::BadArg)
+            ));
         });
     }
 
@@ -1572,13 +1723,15 @@ mod tests {
             ("last", 1),
             ("split", 2),
             ("split", 3),
-            ("concat", 2),
             ("match", 2),
             ("match", 3),
+            ("matches", 2),
+            ("matches", 3),
             ("longest_common_prefix", 1),
+            ("longest_common_suffix", 1),
         ] {
             assert!(reg.contains("binary", name, arity), "missing binary:{name}/{arity}");
         }
-        assert_eq!(reg.len(), 21);
+        assert_eq!(reg.len(), 23);
     }
 }

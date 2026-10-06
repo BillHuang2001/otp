@@ -100,31 +100,28 @@ fn le16_builds_a_little_endian_segment() {
 }
 
 #[test]
-fn lit_bin_string_segment_is_a_documented_gap() {
-    // lit_bin(X) -> <<"ab", X/binary>>  — the loader resolves the `{string,_}`
-    // constant segment to `Operand::Literal`, whose literal payload is not a heap
-    // binary, so the milestone reports a typed `unsupported` rather than guessing.
+fn lit_bin_appends_a_string_constant_segment() {
+    // lit_bin(X) -> <<"ab", X/binary>>. The `{atom,string}` segment carries the
+    // `StrT` byte offset of "ab" and its byte count, so the engine appends those
+    // bytes before the operand.
+    // `erl -noshell -eval 'binary_to_list(bitstrings:lit_bin(<<7,9>>))'` -> [97,98,7,9]
     let module = load(BITSTRINGS_BEAM);
     let mut ctx = MinimalContext::new();
     let x = bin(&mut ctx, &[7, 9]);
-    let result = run(&module, "lit_bin", 1, &[x], &mut ctx);
-    assert!(
-        matches!(result, Err(BeamError::Raise(_))),
-        "expected a typed raise, got {result:?}"
-    );
+    let result = run(&module, "lit_bin", 1, &[x], &mut ctx).expect("lit_bin");
+    assert_eq!(bytes(result), vec![97, 98, 7, 9]);
 }
 
 #[test]
 fn lit3_mixes_integer_string_and_binary_segments() {
-    // lit3(A, B) -> <<A:8, "z", B/binary>>
+    // lit3(A, B) -> <<A:8, "z", B/binary>>. `bitstrings.beam`'s `StrT` is `<<"abz">>`,
+    // so the `"z"` segment indexes offset 2.
+    // `erl -noshell -eval 'binary_to_list(bitstrings:lit3(3,<<4,5>>))'` -> [3,122,4,5]
     let module = load(BITSTRINGS_BEAM);
     let mut ctx = MinimalContext::new();
     let b = bin(&mut ctx, &[4, 5]);
-    let result = run(&module, "lit3", 2, &[make_small(3), b], &mut ctx);
-    assert!(
-        matches!(result, Err(BeamError::Raise(_))),
-        "expected a typed raise, got {result:?}"
-    );
+    let result = run(&module, "lit3", 2, &[make_small(3), b], &mut ctx).expect("lit3");
+    assert_eq!(bytes(result), vec![3, 122, 4, 5]);
 }
 
 // ---------------------------------------------------------------------------

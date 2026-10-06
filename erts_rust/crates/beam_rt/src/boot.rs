@@ -49,15 +49,22 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
     "zlib",
 ];
 
-/// The atoms the runtime's global atom table is seeded with at construction.
+/// The core atoms the runtime's global atom table is seeded with at construction.
 ///
-/// Two groups:
+/// This is the *core* subset of the seed: [`seed_core_atoms`] also interns the whole
+/// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
+/// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
+///
+/// Three groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
 ///   and the boolean atoms (`unix`, `linux`, `win32`, `nt`, `true`, `false`);
 /// * a small **documented core set** covering the runtime's own vocabulary and the
 ///   signal machinery of `beam_process` (`ok`, `error`, `undefined`, `EXIT`, `DOWN`,
-///   `process`, `normal`, `kill`, `killed`), plus the module names of the boot surface.
+///   `process`, `normal`, `kill`, `killed`), plus the module names of the boot surface;
+/// * the atoms the runtime-native `code:*` floor ([`crate::native`]) answers with —
+///   `preloaded`/`non_existing` (`code:which/1`, `code:all_loaded/0`) and `bad_name`
+///   (the `{error, bad_name}` of `code:lib_dir/1`).
 ///
 /// This is deliberately **not** the full `atom.names` ordering of the legacy emulator:
 /// positional atom indices for preloaded code are a documented Milestone-1 gap.
@@ -79,6 +86,10 @@ pub const CORE_ATOMS: &[&str] = &[
     "erl_prim_loader",
     "kernel",
     "stdlib",
+    // The runtime-native `code:*` floor (`native.rs`).
+    "preloaded",
+    "non_existing",
+    "bad_name",
     // `beam_process` signal vocabulary (`SignalAtoms::from_table`).
     "EXIT",
     "DOWN",
@@ -134,12 +145,21 @@ impl PreloadedModules {
     }
 }
 
-/// Interns [`CORE_ATOMS`] (and the signal vocabulary of `beam_process`).
+/// Interns [`CORE_ATOMS`], the whole `system_info/1` atom vocabulary
+/// ([`crate::info::INFO_ATOMS`]) and the signal vocabulary of `beam_process`.
 ///
 /// Idempotent — [`AtomTable::intern`] returns the existing index for a name already
 /// present — so it is safe to call on a table that already has entries.
 pub fn seed_core_atoms(atoms: &mut AtomTable) {
     for name in CORE_ATOMS {
+        atoms.intern(name);
+    }
+    // The introspection surface ([`crate::info`]) materializes its atom-valued keys
+    // through this table, so every name it can emit must be present. `INFO_ATOMS` is the
+    // single source of truth for that vocabulary (the platform/boolean group overlaps
+    // `CORE_ATOMS`, and interning is idempotent), so derive the seed from it rather than
+    // repeating the names here.
+    for name in crate::info::INFO_ATOMS {
         atoms.intern(name);
     }
     // The signal machinery interns its own names through this helper; doing it here
@@ -204,6 +224,28 @@ mod tests {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
         for name in ["EXIT", "DOWN", "normal", "kill", "killed", "process"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        // The runtime-native `code:*` floor's answer atoms.
+        for name in ["preloaded", "non_existing", "bad_name"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+    }
+
+    #[test]
+    fn seed_core_atoms_interns_the_whole_info_vocabulary() {
+        // The introspection surface (`crate::info`) resolves an `InfoValue::Atom` through
+        // this table and reports `TermNotFound` for a name that is absent, so the seed
+        // must contain every name `system_info/1` can emit. `INFO_ATOMS` is that list and
+        // the seed is derived from it, so deriving and asserting cannot drift apart; the
+        // flavor atom (`jit` for the JIT emulator, `emu` for the interpreter) is the one
+        // that used to fall through the seed.
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        for name in crate::info::INFO_ATOMS {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        for name in ["jit", "emu", "true", "false", "unix", "linux", "win32", "nt"] {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
     }

@@ -85,6 +85,22 @@ pub trait ExecutionContext {
     /// target up and run it. The default body is a typed
     /// [`crate::error::unsupported`]: the engine keeps no closure registry, so a
     /// context that does not override this cannot apply funs.
+    ///
+    /// # Required x-register layout (frozen)
+    ///
+    /// The engine passes the **call arguments** in `args` (already read from
+    /// `x(0..arity)`); the context must enter the closure's target with
+    /// `x(0..arity)` = those call arguments, and then `x(arity..)` = the
+    /// closure's **free variables** — the C `call_fun` order
+    /// (`reg[i] = args[i]` for `i < arity`, then `reg[i + arity] = funp->env[i]`,
+    /// `../../erts/emulator/beam/beam_common.c:1631-1633`).
+    ///
+    /// Entering with the captures **before** the arguments (`free ++ args`) is a
+    /// **silent** wrong-result / infinite-loop bug: the target reads `x(k)` for
+    /// `k < arity` and gets a capture instead of an argument. A closure with
+    /// **zero** captures cannot detect this (both layouts coincide), so the bug is
+    /// invisible to zero-capture funs and only surfaces with a genuinely capturing
+    /// closure.
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         let _ = (fun, args);
         Err(crate::error::unsupported("apply_fun"))

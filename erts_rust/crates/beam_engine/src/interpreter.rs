@@ -50,7 +50,7 @@ pub(crate) fn build_label_map(module: &Module) -> BTreeMap<Label, (u32, u32)> {
 }
 
 /// Resolve a label against an already-built map; a missing label is a typed error.
-fn resolve(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<(u32, u32)> {
+pub(crate) fn resolve(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<(u32, u32)> {
     labels
         .get(&label)
         .copied()
@@ -138,12 +138,22 @@ impl Machine {
             // Metadata / no-ops. `executable_line`/`debug_line` exist for
             // instruction counting and breakpoints (they are `_` in
             // `emu/ops.tab:103-108`), so they do not change control flow.
+            //
+            // `nif_start` (`emu/ops.tab:43`) and `on_load` (`emu/ops.tab:1572`)
+            // are bare markers with no body — the C emulator falls straight
+            // through them — so they are no-ops too: `nif_start` marks the start
+            // of a `-nifs()` function (`beam_ssa_codegen.erl:2451` emits it) and
+            // `on_load` marks the `-on_load/1` entry point
+            // (`beam_disasm.erl:1259` resolves `{on_load,[]}` to `on_load`).
+            // Neither carries operands nor touches machine state.
             Instr::Label(_)
             | Instr::Line(_)
             | Instr::FuncInfo { .. }
             | Instr::IntCodeEnd
             | Instr::ExecutableLine { .. }
-            | Instr::DebugLine { .. } => Ok(Step::Next),
+            | Instr::DebugLine { .. }
+            | Instr::NifStart
+            | Instr::OnLoad => Ok(Step::Next),
             Instr::Move { src, dst } => {
                 let value = read_operand(self, src)?;
                 write_operand(self, dst, value)?;
@@ -363,7 +373,11 @@ impl Machine {
                 Continuation::Halt => Ok(Step::Done),
                 Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
             },
-            Instr::Generic { op, .. } => Err(error::unsupported(op.name())),
+            // An opcode the loader has no typed IR variant for: a small residual
+            // set is executed by [`crate::generic`] (currently only
+            // `is_any_native_record`); everything else stays the documented
+            // `unsupported(op.name())` typed error.
+            Instr::Generic { op, operands, .. } => crate::generic::exec(self, labels, *op, operands),
             // Every remaining IR variant is routed to the per-instruction-family
             // dispatch seam ([`crate::families`]). Each family is currently a stub
             // returning `Ok(None)`, so an instruction no family claims yields the

@@ -27,9 +27,11 @@
 //! - [`bitstrings`] — the `Bs*` family
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
-//! the receive/message opcodes, the debug-line opcodes,
-//! `NifStart`/`OnLoad`) are not claimed by any submodule, so [`dispatch`] reports
-//! them as unsupported exactly as before.
+//! the receive/message opcodes, the debug-line opcodes) are not claimed by any
+//! submodule, so [`dispatch`] reports them as unsupported exactly as before.
+//! (`NifStart`/`OnLoad` never reach [`dispatch`]: the interpreter executes them
+//! as no-ops in its metadata arm, and the residual `Instr::Generic` opcodes are
+//! handled by `crate::generic` before the catch-all arm too.)
 
 use std::collections::BTreeMap;
 
