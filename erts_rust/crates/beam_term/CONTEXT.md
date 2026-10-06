@@ -278,6 +278,48 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
   fields `compare` compares — funs are no longer on an opaque fallback.
 
+### `record.rs` — native records (`ErtsRecordDefinition`/`ErtsRecordInstance`)
+The OTP 29 native-record term interior, owned here (the frozen-layout LCA) like [`fun.rs`]/[`refc.rs`].
+Ground truth `../../erts/emulator/beam/erl_record.h` + `erl_record.c` (`records_create_4`,
+`erts_canonical_record_def`, `records_get_2`, `records_get_field_names_1`, `records_is_exported_1`) and
+`external.c` (`RECORD_EXT`). A record is **two** boxed things:
+- **Instance** (`RECORD_INST_SIZE(n) == 2 + n` words), root `make_boxed(hp)`:
+  `[0] thing_word = make_record_header(n + 1)` (i.e. `make_header(n+1, RECORD_SUBTAG)`),
+  `[1] record_definition = make_boxed(def)` (a **tuple-tagged** pointer), `[2..2+n]` the field
+  **values in sorted-key order**. `record_field_count = header_arity - 1`.
+- **Definition** (`RECORD_DEF_SIZE(n) == 6 + n` words; its `thing_word` IS an arityval, so it reads as
+  a tuple via `tuple_val`): `[0] make_arityval(n + 5)`, `[1] field_order` (tuple
+  `[make_arityval(n)][rank…]`, `tuple0()` for `n == 0`), `[2] hash`, `[3] module`, `[4] name`,
+  `[5] is_exported` (the atom `true`/`false`), `[6..6+n]` the field **keys in ascending atom-index
+  order**. `field_order[declared_index]` = the field's rank in the sorted keys/values arrays (C
+  `order[fields[i].order] = make_small(i)`).
+- Construction block (exactly what `records_create_4` / the ETF decoder allocate):
+  `[field_order tuple (n+1, absent when n==0)][definition][instance]`.
+
+Public surface: size fns `RECORD_INST_FIXED_WORDS = 2` / `RECORD_DEF_FIXED_WORDS = 6` /
+`record_inst_size_words` / `record_def_size_words` / `record_block_words` (with `const _: () = assert!`
+pins); the heap-agnostic writer `unsafe write_record(hp, module, name, is_exported, fields, definition_hash)`
+(`fields` in declaration order; sorts keys by `atom_val`, builds `field_order`, stores values in sorted
+order; duplicate/non-atom keys and an arity overflow ⇒ `TermError::BadRecord`); and the readers
+(all `unsafe`, non-record/malformed ⇒ `BadRecord`): `record_field_count`, `record_definition`,
+`record_values`, `record_get(t, key, atoms) -> TermResult<Option<Eterm>>` (linear key scan via
+`compare::eq`), `record_is_native(t, module, name)`, `record_name_is(t, name)`, and the definition
+readers `record_definition_{field_count,module,name,is_exported,hash,keys,field_order}` plus
+`record_declaration_keys(def)`. `AM_TRUE`/`AM_FALSE` (= `Atom 1`/`0`, the `atom.names` order) are
+exported for the `is_exported` word; `boxed.rs` gained the one-line `make_record_header(size)`.
+
+### `number.rs` — safe numeric → `f64`
+The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
+`../../erts/emulator/beam/big.c:2412-2529` `big_to_double`; caller `emu/float_instrs.tab` `i_fconv`).
+- `pub fn big_to_f64(x: Eterm) -> Option<f64>` — a faithful `big_to_double`: `bitlen =
+  (limbs-1)*64 + msd_bits`, reject `bitlen > 1024`, take the top 54 bits and round to nearest
+  **ties-to-even**, scale by `2^exp`, apply the sign. `Some(d)` only for a finite representable
+  value; `None` for a non-bignum or an out-of-range magnitude (the C's `< 0`, which `i_fconv` turns
+  into `badarith`) — never a silently wrong value. This is the API `beam_engine`'s `Fconv` will adopt.
+- `pub fn number_as_f64(x: Eterm) -> f64` — total/panic-free: small → value, float → value, bignum →
+  `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. Used by
+  [`compare::cmp_arith`].
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
