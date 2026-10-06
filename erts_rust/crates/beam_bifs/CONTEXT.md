@@ -558,6 +558,40 @@ Current handoffs:
 Every gap below is a typed `BeamError`, never a silently wrong result. The recurring causes are
 `beam_common::ExitReason` carrying a non-atom reason only as `ExitReason::Structured` (no term), and
 `beam_term` having no off-heap binaries / no `function_clause` variant.
+
+### Capability-gap audit: registry vs installed OTP (evidence)
+Audited `default_registry()` (237 entries = **164 real `bif.tab` BIFs + 73 stdlib fast-paths**)
+against the imports of all **261** installed OTP 29 / erts-17.1 stdlib/kernel/compiler `.beam`
+modules (`beam_lib:chunks(F,[imports])`; stdlib-8.1 + kernel-11.0.4 + compiler-10.0.6).
+**208 real `bif.tab` BIFs referenced by those modules are NOT registered** (105 distinct `erlang`
+imports, 31 `ets`, 19 `erts_internal`, 7 `records`, 6 `re`, 6 `os`, 6 `math`, 5 `persistent_term`,
+5 `erts_debug`, 5 `erl_ddll`, 2 `maps`, 2 `lists`, 1 each `atomics`/`binary`/`code`/`error_logger`/
+`file`/`io`/`net_kernel`/`string`/`unicode`). Each resolves to `undefined_bif`.
+Most-referenced (distinct owning modules): `erlang:get_module_info/1,2` (261 — imported by every
+module), `process_flag/2` (44), `put/2`+`get/1` (36), `make_ref/0` (35), `whereis/1` (32),
+`monitor/2` (31), `demonitor/2` (29), `lists:keysearch/3` (25), `process_info/2` (24), `node/1`
+(24), `exit/2` (22), `link/1` (17), `ets:delete/2` (16), `register/2` (15),
+`system_info/1`/`function_exported/3` (14), `os:getenv/1`/`re:run/3`/`persistent_term:put/2`/
+`error/3` (13), `maps:take/2`/`fun_info/2` (12), `maps:from_keys/2`/`group_leader/0` (11),
+`spawn/3`/`send_after/3`/`start_timer/3,4`/`cancel_timer/1,2`.
+Cheap **pure** (non-process-coupled) gaps: `lists:keymember/3`/`keysearch/3`, `maps:take/2`/
+`from_keys/2`, `unicode:bin_is_7bit/1`, `binary:compile_pattern/1`, `io:printable_range/0`,
+`string:list_to_float/1`, `math:{exp,log,log10,log2,pow,sqrt}`.
+The rest are **process/global-state-coupled** (would need `beam_process`/`beam_rt`/`beam_io` seams
+the crate deliberately lacks): process registry & signals (`whereis/register/unregister/
+registered/processes/process_flag/process_info/get/put/erase/exit/link/unlink/monitor/demonitor/
+group_leader/spawn*/hibernate`), timers (`start_timer/send_after/cancel_timer/read_timer`),
+node/dist (`node/1 nodes/* setnode dist_ctrl_* dist_get_stat`), tracing/introspection
+(`statistics/system_info/system_flag/seq_trace*/trace_delivered/erts_debug:*`), code loading
+(`load_nif/finish_loading/delete_module/get_module_info/module_loaded/function_exported/is_builtin`),
+and `ets:*` beyond the four registered ops.
+`json` is **pure Erlang** — `bif.tab` has no `json` entries. The real `unicode` BIFs are
+`characters_to_binary/2` (line 508), `characters_to_list/2` (509), `bin_is_7bit/1` (510); the
+registry has the first two. `maps:get/3`, `maps:with/2`, `maps:without/2`, `maps:fold/3`, `maps:map/2`,
+`maps:iterator/1`, `maps:new/0`, `maps:size/1`, `maps:to_list/1`, `io:format/1,2`, `io_lib:format/2,3`
+are **not** `bif.tab` BIFs (plain `maps.erl`/`io.erl` functions) — the registry ships them as extra
+Rust fast-paths.
+
 - **Bignum arithmetic is exact only for the operator BIFs and `lists:sum/1`.** `+ - * div rem abs`
   unary `-`/`+`, the six bit operators, and `lists:sum/1` promote to exact bignums. Other
   integer-producing BIFs (`binary:decode_unsigned`, the `time` BIFs, `convert` helpers, …) still
