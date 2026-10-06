@@ -373,8 +373,6 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   but possibly wrong bounds. Version 4 (OTP 29+) is correct.
 - **`ChunkId::DBGB` names `"DbgB"`**, but the real debug-info chunk id is `"Dbgi"` (present in the
   fixture); `Dbgi` is therefore treated as an unknown chunk and skipped — the desired behavior.
-- **Inline big-integer instruction operands wider than 8 magnitude bytes ⇒ `SystemLimit`** — the decoder
-  models no big-integer operand (a `u`/`i` operand is at most `u64`).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
