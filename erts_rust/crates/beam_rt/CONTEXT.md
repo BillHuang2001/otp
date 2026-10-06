@@ -470,7 +470,7 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
-* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
+* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the `driver/port_backed_by_spawn_driver` port probe (a real OS process, the `port_info` pairs, `port_close/1`), the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
