@@ -457,6 +457,32 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
 
+## Handoffs (owned by other nodes — escalate writes to the parent)
+- **Structured exit/error reasons need a `beam_common` change — NOT fixable inside `beam_term` (owning node `../beam_common`).**
+  `ExitReason` carries a non-atom reason only as `Structured` with **no term** (`beam_common` must not
+  depend on `beam_term`, so it cannot hold an `Eterm`); the live term stays owned out-of-band by the
+  raising crate. Consequently `beam_bifs` collapses `{case_clause,X}`, `{bad_generator,X}`, `{badmap,M}`,
+  `{badkey,K}` and `badmatch` to `BeamError::BadArg`, and an *uncaught* structured raise reaches
+  `beam_rt` as a placeholder reason atom (`beam_rt::runner::exit_reason` interns `"<structured reason>"`).
+  The term-building primitives already exist here (`tuple`/`list`/`make_small`/`make_atom` — e.g.
+  `{badkey,K}` is a 2-tuple), so **no new `beam_term` API is required**; the missing piece is upstream.
+  **Required change:** give `Raise` (or `ExitReason`) an opaque live-reason slot that does not create a
+  `beam_term` dependency — e.g. a `Box<dyn Any + Send + Sync>` payload (or an equivalent documented
+  side-channel keyed by the `Raise`). **Adopters:** `beam_bifs` (build the reason term at the raise site
+  and attach it), `beam_engine` (`Machine::throw_with_trace` already keeps the live reason in
+  `pending_exception`; it must attach it to the propagated `BeamError::Raise`), `beam_rt`
+  (`runner::exit_reason` then uses the attached term instead of the `Display` fallback).
+  `function_clause` needs no term change: its reason is the bare atom (already
+  `ExitReason::atom("function_clause")`) and its *arguments* belong to the `StackTrace` in
+  `beam_common`, not this layer.
+- **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
+  `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
+  `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a
+  caller-supplied word (`write_record`'s `definition_hash`) because this crate's `hashing` is not
+  bit-exact to `make_hash2`, so `erlang:phash2/1` on a native record remains a hashing-module gap.
+  `compare`/`hashing`/`size` still treat records with their generic fallbacks (class-rank / opaque /
+  tuple-like); now that the interior is readable they can be made structural later.
+
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
