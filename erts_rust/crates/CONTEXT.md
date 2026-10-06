@@ -114,7 +114,26 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `beam_gc::OffHeap` and release it when the on-heap reference dies. Small binaries stay on-heap
   (`ErlHeapBits`).
 
+- **Funs / exports** (`beam_term::fun`) — the on-heap `ErlFunThing` interior, as heap-agnostic
+  writers/readers. Header word = `FUN_SUBTAG | arity<<8 | num_free<<16 | external<<24 | imported<<25`
+  (the first three fields are C's `MAKE_FUN_HEADER` encoding). Three kinds: `Local` (descriptor
+  `[uniq:u64][index:u32]` — what `beam_engine`'s `make_fun3` builds), `External` (`[module][function]`,
+  an `EXPORT_EXT` literal), `Imported` (10-word descriptor: module, 16-byte MD5, index, old_index,
+  old_uniq, creator pid — a `NEW_FUN_EXT` literal). `env` follows the descriptor; block =
+  `1 + desc_words(kind) + num_free`, with `desc_words` = 2 / 2 / 10. The C's out-of-line
+  `ErlFunEntry`/`Export` `entry` pointer is **inlined into the term** — the same documented M1
+  substitution as the external-pid `node` slot. `beam_gc` sizes/scans fun copies through
+  `fun_block_words`/`fun_env_offset`, and `compare`/`hashing` order/hash funs structurally per the C
+  (`utils.c:2149-2210`).
+
 ## Handoffs (owned by other nodes — NOT yet adopted)
+- **Fun literals materialize but cannot be *called*, and a runtime-made `Local` closure has no ETF
+  image.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
+  `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`, but fun application goes
+  through `beam_engine::ExecutionContext::apply_fun`, whose concrete implementation is `beam_rt`'s
+  (outside this node). Encoding a `Local` (`make_fun3`) fun returns the typed
+  `error::unsupported_local_fun` — its inlined descriptor carries no module, 16-byte `uniq` or creator
+  pid, so a faithful image needs the module identity/MD5.
 - `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
   `beam_term::{map,bitstring}`; it currently decodes >32-key maps as oversized flat maps — switch to
   `map::write_map` (builder) + `map::map_pairs` (encode).
