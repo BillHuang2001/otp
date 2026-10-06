@@ -762,7 +762,7 @@ function_exported/is_builtin`), and the rest of `ets:*` (beyond the 22 registere
 - `tests/bignum.rs` → exact integer arithmetic, pinned to the oracle (incl. the differential case's `term_to_binary` image)
 - `tests/bignum_promotion.rs` → the generalized integer→bignum promotion, oracle-pinned
 - `tests/function_clause.rs` → the `lists.erl` no-clause `error:function_clause` raise
-- `tests/pure_bifs.rs` → the newly registered pure BIFs (`maps:take`/`from_keys`, `lists:keymember`/`keysearch`, `unicode:bin_is_7bit`, `io:printable_range`, `string:list_to_float`, `math:*`)
+- `tests/pure_bifs.rs` → the pure BIFs (`maps:take`/`from_keys`, `lists:keymember`/`keysearch`, `unicode:bin_is_7bit`, `io:printable_range`, `string:list_to_float`, `math:*`)
 - `tests/binary_to_term_atoms.rs` → `binary_to_term` atom interning through `AtomInterner`
 - `tests/iolist.rs` → the `erlang` iolist/bitstring BIFs (`iolist_to_binary`/`iolist_size`/`list_to_bitstring`/`split_binary`)
 - `tests/bitstring_print.rs` → the non-byte-aligned bitstring `~w`/`~p` rendering
