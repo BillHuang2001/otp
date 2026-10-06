@@ -85,13 +85,17 @@ use beam_term::prelude::*;
 
 use crate::error::badarg;
 
+mod continuation;
 mod exec;
-mod expr;
+pub mod expr;
 mod pattern;
+mod run;
 
+pub use continuation::MatchContinuation;
 pub use exec::BodyKind;
 pub use expr::{CmpOp, Expr, TypeTest};
 pub use pattern::Pattern;
+pub use run::match_spec_run;
 
 /// The code-level select primitive: receives an object's tuple element slice and
 /// returns whether the object is kept.

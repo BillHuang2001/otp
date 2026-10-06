@@ -45,7 +45,11 @@ pub enum BodyKind {
 
 /// Build a one-clause spec from a bare pattern term (the `match_object`/`match`/
 /// `match_delete` form).
-fn spec_for_pattern(pattern_term: Eterm, atoms: &AtomTable, kind: BodyKind) -> Result<MatchSpec> {
+pub(super) fn spec_for_pattern(
+    pattern_term: Eterm,
+    atoms: &AtomTable,
+    kind: BodyKind,
+) -> Result<MatchSpec> {
     let mut vars = BTreeSet::new();
     let head = pattern::decode(pattern_term, atoms, &mut vars)?;
     let body = match kind {
@@ -67,7 +71,7 @@ fn spec_for_pattern(pattern_term: Eterm, atoms: &AtomTable, kind: BodyKind) -> R
 ///
 /// A guard that raises makes its clause fail (mirroring the C `matchCatch`); a
 /// body that raises propagates `badarg`.
-fn run_clauses(
+pub(super) fn run_clauses(
     spec: &MatchSpec,
     object: Eterm,
     atoms: &AtomTable,
@@ -104,7 +108,7 @@ fn run_clauses(
 /// Guard truth is taken from the value *kind*: a comparison/type test/connective
 /// carries an internal boolean, so no `AtomTable` lookup is needed for the common
 /// case; only a literal `true`/`false` guard term is resolved by name.
-fn guards_hold(
+pub(super) fn guards_hold(
     guards: &[expr::Expr],
     binds: &[(u32, Eterm)],
     object: Eterm,
@@ -127,7 +131,7 @@ fn guards_hold(
 ///
 /// An internal boolean is checked directly; a term-valued body (e.g. the literal
 /// `true`) is resolved by name.
-fn is_true(value: expr::Value, atoms: &AtomTable) -> bool {
+pub(super) fn is_true(value: expr::Value, atoms: &AtomTable) -> bool {
     expr::value_bool(value, atoms).unwrap_or(false)
 }
 
