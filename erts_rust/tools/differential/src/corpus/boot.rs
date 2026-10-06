@@ -8,13 +8,19 @@
 //! machine-dependent — the oracle is OTP 29 while the rewrite targets OTP 30, and the
 //! code path is installation-specific. What both runtimes must share is the *shape*;
 //! only the values that are stable across releases and installations (`non_existing`,
-//! `preloaded`, `{error,bad_name}`, `".beam"`) are asserted exactly.
+//! `preloaded`, `false`, `undefined`, `{module,Module}`, `{error,bad_name}`, `".beam"`) are
+//! asserted exactly.
 //!
-//! The last two cases deliberately record a **capability gap**: `init:get_status/0`
-//! (the boot-status tuple) and `code:root_dir/0` (the installation root) are not reached
-//! by the Rust runtime's `-eval` subset yet, so it signals `unsupported` (exit `3`) — an
-//! honest *gap*, never a fabricated pass and never a `mismatch`.
-
+//! Beyond the code path and loaded-module registry, the group also pins the **code
+//! server's query surface** (`code:is_loaded/1`, `code:ensure_loaded/1`, `code:is_sticky/1`)
+//! and the **OTP application surface** the booted system exposes (`application:get_env/1,2,3`,
+//! `get_all_env/1`, `loaded_applications/0`, `which_applications/0`, `get_key/2`) — again by
+//! shape wherever the value is release/installation-specific.
+//!
+//! The **process-messaging** cases drive a real `spawn` + `receive` round trip (a message
+//! crossing the mailbox boundary). The Rust runtime's `-eval` subset has no `spawn`/`!` yet,
+//! so it signals `unsupported` (exit `3`) — an honest *gap* held against the **oracle's**
+//! golden, so each case flips to `agree` automatically once the process/messaging seam lands.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.9 cases: boot/version observability, asserted by shape.
@@ -269,6 +275,289 @@ pub(crate) fn group() -> Vec<Case> {
             },
             golden: Golden {
                 stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        // --- Code server: is_loaded / ensure_loaded / is_sticky -------------------------
+        Case {
+            id: "boot/code_is_loaded_shape",
+            description: "code:is_loaded/1 reports {file,Path} for a loaded module (shape, not the path)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin L = code:is_loaded(lists), is_tuple(L) andalso element(1, L) =:= file andalso is_list(element(2, L)) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_is_loaded_unknown_is_false",
+            description: "code:is_loaded/1 reports the atom `false` for an unknown module",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "code:is_loaded(a_definitely_nonexistent_module_xyz)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok false"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_ensure_loaded_loadable",
+            description: "code:ensure_loaded/1 loads a known module and reports {module,Module}",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "code:ensure_loaded(lists)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {module,lists}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_ensure_loaded_unknown_is_error",
+            description: "code:ensure_loaded/1 reports an {error,Reason} shape for an unloadable module",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Loaded = code:ensure_loaded(a_definitely_nonexistent_module_xyz), is_tuple(Loaded) andalso element(1, Loaded) =:= error end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_is_sticky_erlang",
+            description: "code:is_sticky/1 on the preloaded `erlang` module is a boolean",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_boolean(code:is_sticky(erlang))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_is_sticky_kernel",
+            description: "code:is_sticky/1 on the booted `kernel` module is a boolean",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_boolean(code:is_sticky(kernel))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/code_is_sticky_2_arity_is_undef",
+            description: "the code module exports no is_sticky/2, so the call raises error:undef",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "code:is_sticky(erlang, preloaded)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error undef"),
+                exit_code: 1,
+            },
+        },
+        // --- OTP application surface: get_env / get_all_env / loaded_applications / get_key
+        Case {
+            id: "boot/application_get_env_1_shape",
+            description: "application:get_env/1 for kernel is `undefined` or {ok,Value} (shape, not a machine value)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Env = application:get_env(kernel), Env =:= undefined orelse (is_tuple(Env) andalso element(1, Env) =:= ok) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_get_env_2_shape",
+            description: "application:get_env/2 for kernel is `undefined` or {ok,Value} (shape, not a machine value)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Env = application:get_env(kernel, a_nonexistent_key_xyz), Env =:= undefined orelse (is_tuple(Env) andalso element(1, Env) =:= ok) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_get_env_3_default",
+            description: "application:get_env/3 returns the supplied default for an unset key",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "application:get_env(kernel, a_nonexistent_key_xyz, default_value)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok default_value"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_get_all_env_is_list",
+            description: "application:get_all_env/1 for kernel is a list of {Key,Value} pairs",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_list(application:get_all_env(kernel))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_loaded_applications_shape",
+            description: "application:loaded_applications/0 is a list of {App,Description,Vsn} triples",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "lists:all(fun(X) -> is_tuple(X) andalso tuple_size(X) =:= 3 end, application:loaded_applications())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_which_applications_shape",
+            description: "application:which_applications/0 is a list of {App,Description,Vsn} triples",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "lists:all(fun(X) -> is_tuple(X) andalso tuple_size(X) =:= 3 end, application:which_applications())",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_get_key_shape",
+            description: "application:get_key/2 for a present key returns {ok,Value} (shape, not the version)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Key = application:get_key(kernel, vsn), is_tuple(Key) andalso element(1, Key) =:= ok andalso is_list(element(2, Key)) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/application_get_key_missing_is_undefined",
+            description: "application:get_key/2 reports `undefined` for a key the application does not set",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "application:get_key(kernel, a_nonexistent_key_xyz)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok undefined"),
+                exit_code: 0,
+            },
+        },
+        // --- Process messaging: a real spawn + receive round trip (Rust: unsupported) ----
+        Case {
+            id: "boot/receive_message_from_spawned_process",
+            description: "a spawned process sends its parent an atom, which the parent receives (spawn+receive round trip)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), spawn(fun() -> Self ! hello end), receive M -> M after 1000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok hello"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/receive_computed_value_from_spawned_process",
+            description: "a spawned process computes and sends a value, which the parent receives",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), spawn(fun() -> Self ! 21 * 2 end), receive M -> M after 1000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/receive_pattern_match_from_spawned_process",
+            description: "the parent selectively receives the pid inside a message tuple",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), spawn(fun() -> Self ! {self(), ok} end), receive {From, _} -> From =/= Self after 1000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/receive_ping_pong_between_processes",
+            description: "two processes exchange a request and a reply through the mailbox",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), P = spawn(fun() -> receive {ping, From} -> From ! pong end end), P ! {ping, Self}, receive M -> M after 1000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok pong"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "boot/spawn_link_notifies_caller",
+            description: "spawn_link/1 spawns a process that notifies its parent through the mailbox",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "begin Self = self(), spawn_link(fun() -> Self ! linked end), receive M -> M after 1000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok linked"),
                 exit_code: 0,
             },
         },
