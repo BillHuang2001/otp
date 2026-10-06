@@ -88,8 +88,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     //             init:get_argument,init:get_arguments,init:get_plain_arguments/erlang:display/
     //             os:cmd/code:get_path,code:all_loaded,code:which,code:lib_dir)
     //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` seeded via
-    //             `with_fun_caller(FunBridge)` over {pooled heap, code_server atom handle,
-    //             self_pid, tables, output, PendingInterner}); else if
+    //             `with_fun_caller(FunBridge)` and `with_port_hook(RuntimePorts)` over {pooled heap,
+    //             code_server atom handle, self_pid, the tables (only for a call that cannot apply a
+    //             fun argument), output, PendingInterner}); else if
     //             module == "erlang" → `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
     // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
