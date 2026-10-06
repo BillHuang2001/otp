@@ -703,6 +703,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `Encoder::set_minor_version`/`with_minor_version` + the private `AtomFlavour`/`latin1_bytes`
   flavour resolution, `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the
   private fun-classification chain inside `Encoder::encode`
+- `src/encode/tests.rs` → the `encode` unit-test suite (`#[cfg(test)] mod tests;` — per-tag byte-exact
+  assertions and the width-policy boundaries); also the `pub(crate)` encoder test helpers
+  (`new_heap`, `assert_system_limit`) shared with `src/encode/fun.rs`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
 - `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
