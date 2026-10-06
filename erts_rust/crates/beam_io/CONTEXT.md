@@ -1,4 +1,4 @@
-# `beam_io` — Poller/Reactor, Ports, Built-in Drivers
+# `beam_io` — Poller/Reactor, Ports, Port-Task Scheduling, Built-in Drivers
 
 ## Intent
 Owns the **I/O subsystem** of the Rust ERTS rewrite (Stage 5, Part II §H) and the **OS/driver seam** —
@@ -6,39 +6,32 @@ one of the two clean, already-existing rewrite seams (Part II §A): it is the la
 reproduced with the *frozen* driver C ABI on top of it (workspace `../CONTEXT.md` §1 **A.4**), so a
 driver `.so` compiled against the unmodified `erl_driver.h` links and behaves identically.
 
-Three things live here:
+Four things live here:
 1. the **event poller/reactor** — a `mio`-backed readiness loop (epoll/kqueue/…) with a
    `Token`→registration map (stage 5's "I/O" row);
 2. the **`Port`** — a process-like I/O endpoint: a port id (bit-exact with `beam_term`'s internal-port
    immediate), an **input** byte queue and an **output** byte queue, a lifecycle, and dispatch to a
    driver;
-3. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
-   `ErlDrvEntry` bridge as documented future work, plus one built-in byte-stream driver.
+3. **port-task scheduling** — real per-port `INPUT`/`OUTPUT`/`TIMEOUT` tasks with reduction accounting
+   (`port_task.rs`), mirroring `erts_port_task_execute`;
+4. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
+   `ErlDrvEntry` bridge as documented future work, plus the built-in `fd` and `efile` byte-stream
+   drivers, line buffering, and the text⇄binary phase-change protocol.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
-`beam_process` (ports are the peer of pids in `ptab`). This crate is the **library**; the *scheduler*
-wiring (port tasks, reductions, the reactor thread) belongs to `beam_process`/`beam_rt`.
+`beam_process` (ports are the peer of pids in `ptab`). **`beam_rt` today consumes only the poller
+types** (`Poller`/`Interest`/`Token`/`Ready`/`Event`/`Waker`); it has its own `beam_rt::port::PortRegistry`
+and does **not** yet use `beam_io::PortRegistry`/`Port` — `PortNotification` is the seam for it to adopt.
+This crate is the **library**; the scheduler *thread* wiring (the poll loop driving port tasks every
+round, port run queues) belongs to `beam_process`/`beam_rt`.
 
 Legacy C ground truth (read-only): `../../erts/emulator/sys/common/erl_poll.c` + `erl_check_io.c` (the
 poll loop, one-shot re-armed read/write readiness, self-pipe wakeup), `../../erts/emulator/beam/io.c`
 (`erts_port_command`/`erts_port_control`, the `ioq` output queue), `erl_port.h`
 (`struct _erl_drv_port`, `ERTS_PORT_SFLG_*`), `erl_io_queue.{c,h}` (`SysIOVec` queue),
-`erl_port_task.{c,h}` (the asynchronous work unit), `../../erts/emulator/drivers/common/inet_drv.c`
-(the representative fd+poller driver: lazy `driver_select`, EAGAIN leaves data queued).
-
-## Milestone-1 scope (what "implemented" means for THIS pass)
-A **real, tested, single-OS-thread library core** — documented subsets, not a full port:
-1. `Poller`: register/reregister/deregister of **raw fds** (`mio::unix::SourceFd`), `Token`→key map,
-   `poll(timeout)` returning owned `Event`s, and an async **`Waker`** (mio's eventfd/pipe).
-2. `Port` + `PortRegistry`: id allocation **reusing `beam_process::PortTable`** (never duplicated),
-   input/output `ByteQueue`s, lifecycle (`open`/`output`/`ready_input`/`ready_output`/`control`/`close`),
-   and event→port dispatch (`handle_events`).
-3. One built-in driver, `FdDriver` (an fd/pipe byte-stream driver) implemented end-to-end over the
-   poller: `pipe()` self-echo round-trip is the proof of the poller→port→driver path.
-4. `Timeout` + `Timer` (multi-deadline) primitives for poll timeouts, and `ByteQueue`.
-Out of scope (documented follow-ups): real OS-threaded poll threads, port tasks/reductions, the
-`ERL_DRV_FLAG_USE_PORT_LOCKING` locking, distribution fd handling, `/dev/poll`-style backends,
-`io_uring`, and the frozen C-ABI bridge (see Design Decisions).
+`erl_port_task.{c,h}` (the asynchronous work unit + reductions), `../../erts/emulator/drivers/common/inet_drv.c`
+(the representative fd+poller driver: lazy `driver_select`, EAGAIN leaves data queued), and
+`../../erts/emulator/sys/unix/erl_child_setup.c` (the `{line, N}` / binary phase-change behavior).
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_io::prelude::*`.
@@ -50,8 +43,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `fn is_writable(self) -> bool`.
 - `pub struct Ready` (`Copy + Default + Eq + Debug`) — observed readiness:
   `readable()/writable()/is_error()/is_read_closed()/is_write_closed() -> bool`.
+  **No public constructor** — only `Ready::default()` and (in `port_task.rs`) `From<Ready> for Readiness`.
 - `pub struct Event` — `token() -> Token`, `key() -> u64` (the caller key it was registered with),
-  `ready() -> Ready`.
+  `ready() -> Ready`; `Event::new(token, key, ready)` lets tests/forgers build one.
 - `pub struct Poller` (owns `mio::Poll` **and the single `mio::Waker`** created in `new()`):
   - `pub fn new() -> Result<Poller>`
   - `pub fn register(&mut self, fd: RawFd, interest: Interest, key: u64) -> Result<Token>`
@@ -63,183 +57,264 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
     to call any number of times); `pub fn registration(&self, token: Token) -> Option<u64>`
   - `pub fn len(&self) -> usize`, `pub fn is_empty(&self) -> bool`
 - `pub struct Waker` — an `Arc`-backed, cloneable handle to the poller's single wakeup handle:
-  `pub fn wake(&self) -> Result<()>` (thread-safe async notification, safe to call repeatedly and
-  from any thread; the woken event carries `key() == WAKER_KEY`).
-- `pub const WAKER_KEY: u64` — the key of a waker event.
+  `pub fn wake(&self) -> Result<()>` (thread-safe, callable repeatedly and from any thread; the
+  woken event carries `key() == WAKER_KEY`).
+- `pub const WAKER_KEY: u64` — the key of a waker event (`u64::MAX`).
 ### `timer.rs`
-- `pub struct Timeout` (`Copy`) — a single deadline: `infinite()` (no deadline), `after(Duration)`,
-  `at(Instant)`, `poll_timeout() -> Option<Duration>` (remaining; `Some(0)` once elapsed; `None` if
-  infinite), `is_expired() -> bool`.
-- `pub struct Timer` — a set of scheduled deadlines keyed by `u64`: `new()`, `schedule(key, Instant)`,
-  `next_deadline() -> Option<Instant>`, `poll_timeout() -> Option<Duration>`, `pop_expired(now) ->
-  Vec<u64>`, `cancel(key) -> bool`, `len()`, `is_empty()`.
+- `pub struct Timeout` (`Copy`) — a single deadline: `infinite()`, `after(Duration)`, `at(Instant)`,
+  `poll_timeout() -> Option<Duration>`, `is_expired() -> bool`.
+- `pub struct Timer` — a set of deadlines keyed by `u64`: `new()`, `schedule(key, Instant)`,
+  `next_deadline() -> Option<Instant>`, `poll_timeout() -> Option<Duration>`, `pop_expired(now) -> Vec<u64>`,
+  `cancel(key) -> bool`, `len()`, `is_empty()`.
 ### `queue.rs`
-- `pub struct ByteQueue` — a byte buffer (read-cursor `Vec<u8>`, `front()` is always contiguous):
-  `new()`, `with_capacity(n)`, `len()`, `is_empty()`, `push(&[u8])`, `front() -> &[u8]`,
-  `consume(n) -> usize`, `read_into(&mut [u8]) -> usize`, `clear()`.
+- `pub struct ByteQueue` — a byte buffer (`front()` always contiguous): `new()`, `with_capacity(n)`,
+  `len()`, `is_empty()`, `push(&[u8])`, `front() -> &[u8]`, `consume(n) -> usize`, `read_into(&mut [u8]) -> usize`, `clear()`.
+### `port_task.rs` (port-task scheduling — `erts_port_task_execute`)
+- Reduction constants: `CONTEXT_REDS = 4000`, `PORT_REDS_INPUT = PORT_REDS_OUTPUT = PORT_REDS_TIMEOUT =
+  CONTEXT_REDS / 100 (40)`, `PORT_REDS_EXECUTE = CONTEXT_REDS / 4 (1000)` (C: `erl_port.h`/`erl_vm.h`).
+- `pub enum PortTaskKind { Input, Output, Timeout }` — `priority() -> u8` (Input < Output < Timeout) and
+  `reductions() -> usize`.
+- `pub struct PortTask` (`Copy + Eq + Debug`) — `kind()`, `deadline() -> Option<Instant>`, `seq() -> u64`,
+  `reductions()`, `is_ready_at(Instant) -> bool`.
+- `pub struct PortTaskQueue` — one pending task per kind (dedupe), ordered by kind priority then FIFO
+  `seq`, with deadline gating for timeouts: `new()`, `enqueue(kind) -> bool`, `enqueue_timeout(deadline) -> bool`,
+  `len()`, `is_empty()`, `contains(kind)`, `next() -> Option<PortTaskKind>`, `pop_next(now) -> Option<PortTask>`,
+  `remove(kind) -> bool`, `clear()`.
+- `pub struct Readiness { readable, writable, error, read_closed, write_closed }` (`Copy + Default + Eq + Debug`),
+  with `read_ready()` (readable ‖ read_closed ‖ error), `write_ready()` (writable ‖ write_closed), `is_idle()`,
+  and `impl From<Ready> for Readiness`.
+- `pub enum PortNotification { Data { port: PortId, bytes: Vec<u8> }, Closed { port: PortId } }` — the seam the
+  runtime turns into `{Port, {data, Data}}`/port-exit messages.
+- `pub struct PortTaskOutcome { pub ran: usize, pub reds_used: usize, pub notifications: Vec<PortNotification> }`.
+### `port.rs`
+- `pub enum PortState { Opening, Open, Closing, Closed }`.
+- `pub const DEFAULT_READINESS_RED_BUDGET: usize = PORT_REDS_EXECUTE` — the budget `handle_events` runs.
+- `pub struct PortControl;` with `pub const PortControl::CLOSE: &'static str = "close"` — the one **reserved**
+  control-op name (a namespace marker, not an enum: any other name is a driver verb, see `port_control`).
+- `pub struct PortCommandOptions { nosuspend, force }` (`Copy + Default + Eq`) — `EMPTY`, `new()`,
+  `with_nosuspend(bool)`, `with_force(bool)`, `is_nosuspend()`, `is_force()`. Milestone-1 ports are never
+  busy, so both flags are carried/validated but change nothing (the BIF layer owns their effect once a
+  busy-port command queue exists).
+- `pub struct Port` — owns a `Box<dyn Driver>` + the two queues:
+  `id()`, `state()`, `driver_name()`, `input_len()`, `read_input(&mut [u8]) -> usize`, `drain_input() -> Vec<u8>`,
+  `output_len()`, `open(&mut Poller)`, `output(&mut Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`,
+  `ready_output(&mut Poller) -> Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`,
+  `close(&mut Poller)`, and the scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
+  `schedule_timeout(Instant) -> bool`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
+  `has_pending_task(PortTaskKind) -> bool`, `timeout(&mut Poller) -> Result<()>`.
+- `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
+  port number: `new()`, `open(poller, Box<dyn Driver>) -> Result<PortId>`,
+  `open_named(poller, &DriverRegistry, name) -> Result<PortId>`, `get(id)`, `get_mut(id)`,
+  `output(poller, id, &[u8]) -> Result<usize>`, `contains(id)`, `len()`, `is_empty()`, `close(poller, id) -> Result<()>`, plus:
+  - `handle_events(poller, &[Event]) -> Result<usize>` — schedules the implied tasks then runs one round
+    under `DEFAULT_READINESS_RED_BUDGET`; returns how many events named a live port.
+  - `schedule_events(&[Event]) -> usize` / `schedule_readiness(key: u64, Readiness) -> bool` — enqueue only
+    (no execution) so a caller drives the queue itself; readiness ⇒ `INPUT`/`OUTPUT` task per
+    `Readiness::read_ready`/`write_ready`, **but only for directions the driver actually armed**
+    (`DriverContext` records this in `driver::PortArms`).
+  - `execute_port_tasks(poller, reds_budget) -> Result<PortTaskOutcome>` — run queued tasks in port-number
+    order under the budget, returning what ran + the notifications.
+  - `port_command(poller, id, data, PortCommandOptions) -> Result<()>` — queue output + schedule an
+    `OUTPUT` task (the `erlang:port_command` write path; the write happens in the task, not here).
+  - `port_control(poller, id, op, arg) -> Result<Vec<u8>>` — the `erts_port_control` seam: the reserved name
+    `"close"` closes the port (empty reply); **every other `op`** is forwarded verbatim to the driver's
+    `control(op, arg)` and its reply returned (unknown verb ⇒ the driver's `BeamError::BadArg`).
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
-- `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the
-  poller or the queues**: `port() -> PortId`, `register(fd, interest) -> Result<Token>`,
+- `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the poller
+  or the queues**: `port() -> PortId`, `register(fd, interest) -> Result<Token>`,
   `reregister(fd, token, interest) -> Result<()>`, `deregister(fd, token) -> Result<()>`,
-  `input() -> &mut ByteQueue` (append bytes the driver read), `output() -> &mut ByteQueue` (pull bytes
-  waiting to be written). Registration keys are assigned by the context (the port number).
+  `input() -> &mut ByteQueue`, `output() -> &mut ByteQueue`. Registration keys are the port number.
+  (`pub(crate) struct PortArms` inside the context records which directions the driver armed; not public.)
 - `pub trait Driver` — `name() -> &str` (+ `flags()` default `empty()`); required `start(ctx)`,
-  `output(ctx) -> Result<usize>` (drain `ctx.output()`, return bytes written), `ready_input(ctx)`,
-  `stop(ctx)`; defaulted `ready_output(ctx)` (calls `output`), `control(ctx, command, arg) ->
-  Result<Vec<u8>>` (`Ok(vec![])`), `timeout(ctx)` (`Ok(())`).
+  `output(ctx) -> Result<usize>`, `ready_input(ctx)`, `stop(ctx)`; defaulted `ready_output(ctx)` (= `output`),
+  `control(ctx, command: &str, arg: &[u8]) -> Result<Vec<u8>>` (= `Ok(vec![])`), `timeout(ctx)` (= `Ok(())`).
 - `pub type DriverFactory = fn() -> Result<Box<dyn Driver>>`.
-- `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`,
-  `with_builtins()` (registers `"fd"`), `register(name, factory) -> bool`, `create(name) ->
-  Result<Box<dyn Driver>>`, `contains(name)`, `names() -> Vec<&str>`.
-### `port.rs`
-- `pub enum PortState { Opening, Open, Closing, Closed }` (`Copy + Eq + Debug`).
-- `pub struct Port` — owns a `Box<dyn Driver>` + the two queues:
-  `id() -> PortId`, `state() -> PortState`, `driver_name() -> &str`, `input_len()`, `read_input(&mut
-  [u8]) -> usize`, `drain_input() -> Vec<u8>`, `output_len()`, `open(&mut Poller)`, `output(&mut
-  Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`, `ready_output(&mut Poller) ->
-  Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`, `close(&mut Poller)`.
-- `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>`
-  keyed by port number: `new()`, `open(poller, Box<dyn Driver>) -> Result<PortId>`,
-  `open_named(poller, &DriverRegistry, name) -> Result<PortId>`, `get(id)`, `get_mut(id)`,
-  `output(poller, id, &[u8]) -> Result<usize>`, `handle_events(poller, &[Event]) -> Result<usize>`
-  (the reactor glue: dispatch each event's `ready` to `ready_input`/`ready_output`), `close(poller,
-  id) -> Result<()>`, `contains(id)`, `len()`, `is_empty()`.
+- `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`, `with_builtins()`
+  (**registers both `"fd"` and `"efile"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
+  `contains(name)`, `names() -> Vec<&str>` (sorted).
 ### `drivers/fd.rs`
-- `pub struct FdDriver` — the built-in byte-stream driver, **owns** its fds (closed on `stop`/`Drop`):
-  `pipe() -> Result<FdDriver>` (a fresh OS `pipe(2)`: writes to `write_fd` are read from `read_fd`),
-  `connected(read_fd, write_fd)`, `read_only(fd)`, `write_only(fd)`. Implements `Driver`: registers
-  the read fd `READABLE` on `start`; `output` drains `ctx.output()` to the write fd (`libc::write`),
-  keeping the remainder queued and selecting `WRITABLE` on `EAGAIN`; `ready_input` reads into
-  `ctx.input()` (`libc::read`, `EAGAIN`-tolerant, EOF ⇒ no more reads).
+- `pub struct FdDriver` — the built-in `"fd"` byte-stream driver, **owns** its fds (closed on `stop`/`Drop`):
+  constructors `pipe()`, `connected(read_fd, write_fd)`, `read_only(fd)`, `write_only(fd)` (unchanged);
+  mode/framing surface `with_line_mode(max_len)`, `set_line_mode(max_len)` (0 = unlimited), `set_binary_mode()`,
+  `is_line_buffered()`, `phase() -> Phase`, `set_phase(Phase)`, `max_line_len()`, `set_max_line_len(usize)`,
+  `pending_input()`, `eof()`.
+  Implements `Driver`: registers the read fd `READABLE` on `start`; `output`/`ready_output` drain `ctx.output()`
+  to the write fd (`libc::write`, `EAGAIN` ⇒ keep queued + arm `WRITABLE`); `ready_input` reads into
+  `ctx.input()` (`libc::read`, loops to `EAGAIN`, latches `read_eof` on `read(2)==0`, flushes a pending
+  partial line at EOF). `control` verbs: `line [decimal(N) | "line,<N>"]`, `noline`, `binary`, `text`,
+  `getopts` (reply `b"line,<N>"` / `b"binary"`); unknown ⇒ `BeamError::BadArg`.
+### `drivers/line_buffer.rs`
+- `pub const DEFAULT_MAX_LINE_LEN: usize = 1024`. `pub struct LineBuffer`: `new(max_len)`, `max_len()`,
+  `set_max_len(max_len)`, `pending()`, `push(&[u8])`, `take_lines() -> Vec<Vec<u8>>`,
+  `drain(&mut impl FnMut(&[u8]))`, `flush_all() -> Vec<Vec<u8>>`. Frames on `\n` (a preceding `\r` is kept as
+  part of the terminator), splits a line longer than `max_len`, holds a partial line until `flush_all`/EOF.
+### `drivers/binary_io.rs`
+- `pub enum Phase { Text, Binary }` (`is_text`/`is_binary`/`as_str`) and `pub struct PhaseChange` — the
+  `erl_child_setup` text⇄binary phase machine, default `Phase::Binary` (byte-identical to raw passthrough):
+  `new()`, `with_max_line_len(max_len)`, `current()`, `set(Phase)`, `to_binary()`, `to_text()`, `max_line_len()`,
+  `set_max_line_len(usize)`, `pending()`, `line_buffer()`, `handle(&[u8]) -> Vec<Vec<u8>>` (Binary ⇒ one raw
+  frame; Text ⇒ line frames), `flush() -> Vec<Vec<u8>>` (trailing partial line, Text only).
+### `drivers/efile.rs`
+- `pub struct EfileDriver` (`name() == "efile"`) — delegates byte movement to a composed `FdDriver`:
+  `unopened()`, `read_only(fd)`, `write_only(fd)`, `connected(read, write)`, `path() -> Option<&[u8]>`, `eof()`;
+  `control` verbs `open <path>` / `close` / `path` / `eof` plus the delegated `line`/`noline`/`binary`/`text`/`getopts`.
+  `pub fn make_efile() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered as the built-in `"efile"`).
 
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures ⇒ `BeamError::Io`,
   argument faults ⇒ `BeamError::BadArg`, id/registration exhaustion ⇒ `BeamError::SystemLimit`.
   **Never panic** on runtime data, never `unwrap()`, never `todo!`/`unreachable!` in shipped code.
 - **Safe Rust by default.** `unsafe` is confined to the raw-fd syscall wrappers (`libc::read`/`write`/
-  `pipe`/`fcntl`/`close`) and `mio::unix::SourceFd` construction. Every `unsafe` block carries a
-  preceding `// SAFETY:` rationale; `unsafe_op_in_unsafe_fn` stays clean (`--workspace` lint).
+  `pipe`/`fcntl`/`close`) and `mio::unix::SourceFd` construction. Every `unsafe` block carries a preceding
+  `// SAFETY:` rationale; `unsafe_op_in_unsafe_fn` stays clean (`--workspace` lint).
 - **Port ids are allocated by `beam_process::PortTable`** — do not add a second number allocator.
   `PortId` encoding stays `beam_term`'s internal-port immediate (via `beam_process::PortId`).
-- Files ~1000 lines, split by responsibility: poller / port / driver / timer / queue / drivers.
-- Deps: `beam_common`, `beam_term`, `beam_process`, `libc`, `mio` only (already declared). No new deps.
+- **Single-thread invariant (enforced).** `Port`/`PortRegistry` are **not** thread-safe and this crate has no
+  locking: they must be created and driven from **one OS thread**, and concurrent registration/dispatch is
+  unsupported. `PortRegistry` carries a `PhantomData<core::cell::Cell<()>>` marker so it is neither `Send`
+  nor `Sync`; a `Port` holds a `Box<dyn Driver>` with no `Send`/`Sync` bound, so it is single-threaded too.
+  (Not yet enforced on `Poller`/`Waker` — the `Waker` is explicitly meant to cross threads.)
+- **The `Driver` trait and `DriverContext` public methods are the frozen driver seam** — do not change their
+  signatures. New driver capabilities must be additive with defaults that keep the built-in drivers compiling
+  unchanged.
+- Files target ~1000 lines, split by responsibility: poller / port / port_task / driver / timer / queue / drivers.
+- Deps: `beam_common`, `beam_term`, `beam_process`, `libc`, `mio` only. No new deps.
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN**. All of the following exist and pass (43 in-module
-unit tests + 12 integration tests):
-- `tests/poller.rs` (integration, real OS fds): a **socketpair** registered `READABLE` reports a
-  readiness event with the right `key` after a write to the peer; **poll-with-no-events** returns empty
-  after ≈ the timeout; `poll(Some(2s))` is interrupted by `Waker::wake` from another thread; **two
-  wakers obtained from the same `Poller`** both fire (and one may be dropped mid-test), which is safe
-  because the poller owns a single shared wakeup handle; a waker clone moved to another
-  thread wakes a later blocking poll; reregister switches readability → writability; deregister stops
-  events; a double-register of the same fd errors (`AlreadyExists` → `Io`).
-- `tests/port.rs` (integration, end-to-end): `PortRegistry::open` a `FdDriver::pipe()` port →
-  `port.output(b"hello")` → `poller.poll` → `registry.handle_events` → `port.read_input` returns
-  `"hello"`; `close` releases the id (a later alloc reuses it) and leaves the poller empty; `open_named`
-  uses the built-in registry and an unknown name is `BadArg`; `handle_events` skips unknown keys.
-- In-module `#[cfg(test)]` unit tests: `ByteQueue` (push/front/consume/read_into/clear + wrap-around
-  compaction), `Interest`/`to_mio_interest`, `Ready`/`Event` accessors, `Poller` register/deregister +
-  `WAKER_KEY` + repeated shareable `waker()` handles, `Timeout` (infinite/remaining/expired/saturating),
-  `Timer` (ordering, `pop_expired`, `cancel`, duplicate-key reschedule), `DriverRegistry`
-  (`with_builtins`/`create`/missing name ⇒ `BadArg`/`names`), `PortState` transitions, `PortRegistry`
-  alloc/close/reuse, and `FdDriver` (pipe round-trip, EOF, write-only/read-only/inert error paths,
-  `stop` deregistration, fd closing on `Drop` + `stop`).
+**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **120 tests, 0 failures** —
+`104` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
+`drivers/{fd,line_buffer,binary_io,efile}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` + `tests/port_task.rs` `4`.
+- `tests/poller.rs` (integration, real OS fds): socketpair readability reports the right `key`; poll-with-no-events;
+  blocking poll interrupted by `Waker::wake` (same + other thread); multiple shareable wakers; reregister flips
+  direction; deregister stops events; double-register errors.
+- `tests/port.rs` (integration, end-to-end): `open` a `FdDriver::pipe()` port → `output` → `poll` →
+  `handle_events` → `read_input` round-trip; `close` releases the id (reused) and empties the poller; `open_named`
+  uses the built-in registry, unknown name ⇒ `BadArg`; unknown keys (incl. `WAKER_KEY`) are skipped.
+- `tests/port_task.rs` (integration): scheduled OUTPUT+INPUT end-to-end; a **pure EOF** event still reaches the
+  driver; the reduction budget bounds a round; and the **wake-path evidence** — a `PortNotification::Data` from a
+  scheduled task, delivered to a process blocked in receive via `beam_process::ProcessTable::deliver_simple`
+  (`DeliverOutcome::Woke`) then `Scheduler::resume_woken` enqueues it.
+- In-module unit tests cover: `ByteQueue`; `Interest`/`Ready`/`Event`; `Poller` register/deregister + `WAKER_KEY` +
+  wakers; `Timeout`/`Timer`; `DriverRegistry` (both built-ins, dup rejection, missing-name `BadArg`); `PortState`
+  transitions; `PortRegistry` alloc/close/reuse + unknown-id `BadArg`; `FdDriver` (pipe round-trip, EOF, error
+  paths, `stop` deregistration, fd closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and
+  control; port-task ordering/reductions/dedupe; the failed-`start` teardown (`FailingStartDriver` double).
 
 ## Design Decisions
-- **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker`
-  (epoll on Linux, kqueue elsewhere) and a correct one-shot re-arm model, matching the C's one-shot
-  `EPOLLONESHOT`/`EV_ONESHOT` semantics. The public API is **mio-independent**: registration is by
-  **raw `RawFd`** through `Interest`/`Token`/`Ready` newtypes, so a future io_uring or `/dev/poll`
-  backend can be swapped without touching callers. `io_uring` (Part II §A) is a documented
-  alternative backend, not M1.
-- **Async notification = one `mio::Waker` per `Poller`, shared via `Arc`.** The C uses a non-blocking
-  `pipe()` (`ps->wake_fds[2]`) because its pollsets are its own; `mio` already provides a portable,
-  internally-correct wakeup (eventfd/pipe). Reuse it (Prevent-Duplication); `Waker` token `0`/key
-  `WAKER_KEY` identify it. `mio` permits **exactly one** `Waker` per `Poll` (a debug-build assertion),
-  so the `Poller` creates the wakeup handle once in `new()` and owns it; `Poller::waker` returns a
-  cheap `Arc` clone (a `pub struct Waker(Arc<mio::Waker>)`), making `waker()` idempotent, callable from
-  any number of places, and safe to drop — the handle lives as long as the `Poller`.
-- **Who owns the output queue.** The `Port` (not the driver) owns both `ByteQueue`s, mirroring the C
-  `ioq` (Erlang→driver) being the single source of truth. `Port::output` appends to the output queue
-  and calls `Driver::output`, which **pulls** from `ctx.output()` and returns bytes written; `EAGAIN`
-  leaves the remainder queued and the driver arms `WRITABLE`. This avoids double-buffering the same
-  bytes in both the port and the driver.
+- **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker` and a correct
+  one-shot re-arm model matching the C's `EPOLLONESHOT`/`EV_ONESHOT`. The public API is **mio-independent**
+  (registration by raw `RawFd` through `Interest`/`Token`/`Ready`), so a future io_uring/`/dev/poll` backend swaps
+  in without touching callers. `io_uring` is a documented alternative, not M1.
+- **Async notification = one `mio::Waker` per `Poller`, shared via `Arc`.** `mio` permits exactly one `Waker`
+  per `Poll`, so the `Poller` creates it once in `new()`; `Poller::waker` returns a cheap `Arc` clone
+  (`pub struct Waker(Arc<mio::Waker>)`), making `waker()` idempotent and safe to drop.
+- **Who owns the output queue.** The `Port` (not the driver) owns both `ByteQueue`s, mirroring the C `ioq`.
+  `Port::output` appends and calls `Driver::output`, which **pulls** from `ctx.output()` and returns bytes
+  written; `EAGAIN` leaves the remainder queued and the driver arms `WRITABLE` (no double buffering).
+- **Port-task execution lives in `beam_io`; the scheduler thread lives above it.** `PortTask`/`PortTaskKind`/
+  `PortTaskQueue`/reductions model `erl_port_task.h`; `PortRegistry::execute_port_tasks` runs a round. The poll
+  loop that drives a round every iteration, port run queues and reductions charged to a *scheduler* belong to
+  `beam_process`/`beam_rt`. `PortNotification` is the seam so the runtime (not this crate) turns port output into
+  messages and wakes the owner via `beam_process` — this keeps the DAG clean and the engine/runtime split intact.
+- **Readiness ⇒ task, gated by `PortArms`.** The poller keys every registration by port number, so an `Event`
+  names the port but not which of its fds fired; `DriverContext` records the armed directions in `PortArms` so a
+  full close (`EPOLLHUP` ⇒ `read_closed` **and** `write_closed`) does not schedule a bogus OUTPUT task on a
+  read-only driver. This restores the information the C gets from per-event task handles (`ErlDrvEvent`).
+  **Documented divergence:** the C keeps three FIFO queues with no cross-kind priority; this crate uses one queue
+  ordered by kind priority (INPUT → OUTPUT → TIMEOUT) with enqueue sequence as FIFO tie-break — observable only in
+  the order two *different* kinds run within one round.
+- **`handle_events` schedules *and* runs the default round.** This preserves the historic "driving the reactor
+  makes ports progress" behavior; callers wanting full budget control use `schedule_events` +
+  `execute_port_tasks`. (The strict-enqueue-only variant would break callers that rely on the single call.)
 - **Driver = Rust trait now; C-ABI bridge layered later.** The frozen `ErlDrvEntry`/`ErlDrvApi`
-  (`beam_abi::driver`) is an ABI, not a Rust interface; a NIF/driver `.so` cannot implement a Rust
-  trait. The plan: a later `beam_abi`-backed adapter implements `Driver` over an `ErlDrvEntry` +
-  `ErlDrvApi` function table, mapping `start→init/start`, `output→output/outputv`, `ready_input→
-  ready_input`, `ready_output→ready_output`, `control→control`, `timeout→timeout`, `stop→stop`, and
-  delivering `driver_select` registrations through `DriverContext::register`. Modeling the driver as a
-  trait first keeps the poller/port core testable without the frozen-ABI machinery and lets the bridge
-  be purely additive. (Record in `../../CHANGE.md` when the bridge lands.)
+  (`beam_abi::driver`) is an ABI, not a Rust interface; a later `beam_abi`-backed adapter implements `Driver`
+  over an `ErlDrvEntry` + `ErlDrvApi` function table (`start→init/start`, `output→output/outputv`,
+  `ready_input→ready_input`, `control→control`, `timeout→timeout`, `stop→stop`, `driver_select` ⇒
+  `DriverContext::register`). Modeling the driver as a trait first keeps the poller/port core testable without
+  the frozen-ABI machinery. (Record in `../../CHANGE.md` when the bridge lands.)
 - **Port ids reuse `beam_process::PortTable`.** `PortRegistry` wraps it for allocation and adds the
-  `HashMap<u64, Port>` of live port objects keyed by port *number*; it never allocates its own number.
-  This keeps `ptab` the single id authority (Prevent-Duplication) and lets `beam_process` keep seeing
-  the same id space.
-- **Driver→Erlang output is a byte input queue here, not (yet) messages.** The C emits driver output
-  as *messages* to the port owner (no inbound queue). For M1 the port keeps an **input byte queue** so
-  the poller→port→driver path is provable and testable without the message layer; the runtime (M2+)
-  replaces `drain_input` with `beam_message` sends to the owner.
-- **`Poll` returns owned `Vec<Event>`.** The reactor glue (`handle_events`) needs `&mut Poller` to
-  re-register while iterating events; returning a borrowed slice would borrow `Poller` for the loop.
-  An owned `Vec` keeps the borrow honest; the internal `mio::Events` buffer is still reused.
+  `HashMap<u64, Port>` keyed by port *number*; a failed driver `start` runs the driver's teardown (so any fd it
+  registered is deregistered) and releases the number — the id space and the poller never leak.
+- **`Poll` returns owned `Vec<Event>`.** The reactor glue needs `&mut Poller` while iterating events; an owned
+  `Vec` keeps the borrow honest, reusing the internal `mio::Events` buffer.
+- **Line/phase framing is driver-side.** `{line, N}` and the text⇄binary phase change live in the `FdDriver`
+  (via `LineBuffer`/`PhaseChange`), matching `erl_child_setup`: the line flag affects how a port *delivers input
+  to its owner*, not how it accepts output. Default phase = Binary, so nothing changes unless toggled.
 
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
-  `ERTS_POLL_USE_WAKEUP` semantics beyond `Waker`; concurrent registration races are not guarded.
-- **Readiness is edge-triggered** (`mio` registers with `EPOLLET`), so a driver *must* drain to
-  `EAGAIN` on every callback — `FdDriver` reads/writes in a `EAGAIN`-terminated loop for exactly
-  this reason. `handle_events` dispatches on `Ready::readable()`/`Ready::writable()` only, so a
-  pure EOF/`EPOLLHUP` event with neither bit set reaches the port only through the readable edge.
-- **A failed `Port::start` leaks the poller registration.** `PortRegistry::open` releases the port
-  id and drops the driver (closing its fds) when `start` fails, but a registration the driver made
-  before failing is only reclaimed when the OS closes the fd.
-- **Ports are not yet scheduled.** No port tasks (`INPUT`/`OUTPUT`/`TIMEOUT`), reductions, or
-  `erts_port_task_execute`; `PortRegistry::handle_events` is a synchronous stand-in. `beam_rt` wires
-  ports into the scheduler later.
-- **`FdDriver` is deliberately minimal.** Byte-stream only; no line buffering, no `binary_io`
-  phase-change, no `control` protocol family (`inet`/`efile` are future drivers). `read_only`/
-  `write_only` variants exist and are covered, but the primary tested path is `pipe()`.
-- **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of
-  scope (as in `beam_abi`). Registration is lazy-capable but M1 registers in `start`.
-- **`port_control`/command atoms** are not decoded here (the C decodes Erlang tuples in `io.c`); M1
-  `control(command, arg)` takes a `&str` command and raw bytes.
+  `ERTS_POLL_USE_WAKEUP` beyond `Waker`; the single-thread invariant is enforced on `Port`/`PortRegistry` (see
+  Constraints) but **not** guarded on `Poller` itself — use it from one thread.
+- **Readiness is edge-triggered** (`mio` registers with `EPOLLET`), so a driver *must* drain to `EAGAIN` on every
+  callback — `FdDriver` reads/writes in an `EAGAIN`-terminated loop for exactly this reason. Readiness is only
+  scheduled for directions the driver armed (`PortArms`), so a driver that never registers a direction never sees
+  its events.
+- **Port tasks exist but nothing schedules them yet at runtime.** `PortRegistry::execute_port_tasks` runs a
+  round on demand; there is no port run queue, no per-iteration drive from a poll thread, and reductions are not
+  yet charged to a `beam_process` scheduler. `beam_rt` has not adopted `beam_io::PortRegistry`/`PortNotification`.
+- **`FdDriver` is deliberately minimal.** Byte-stream only; line mode frames input but does **not** line-frame
+  output (matching the emulator's line flag). No `inet`/`forker`/`spawn` drivers; no packet framing.
+- **`EfileDriver` cannot open a regular file.** `mio`/epoll rejects `EPOLL_CTL_ADD` on regular files (`EPERM`), so
+  `control("open", path)` fails with `BeamError::Io` for them; it works for the descriptors epoll supports
+  (pipes/FIFOs/char devices/sockets). A real `efile`/`inet` needs a non-epoll readiness source (a dedicated
+  poll/thread pool, or `io_uring`) — this drops in behind `EfileDriver`'s interface.
+- **`DriverContext` seam gaps for future drivers.** An `efile`/`inet` driver needing timer deadlines or port-exit
+  notifications has no seam: `Driver::timeout` exists but nothing schedules it (`schedule_timeout` is only on
+  `Port`), and there is no port-exit notification channel to the driver.
+- **`port_control`/control atoms are not decoded here.** `port_control(op, &[u8])` takes a `&str` op + raw bytes;
+  the C decodes Erlang tuples in `io.c` — atom/tuple decoding of `{command, …}`/`{connect, …}` is the runtime's job.
+- **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of scope (as in
+  `beam_abi`).
+- **`src/port.rs` is ~1400 lines, ~590 of which are its in-module test suite** (source ≈ 815 lines, under the
+  ~1000 baseline). A future split by responsibility (move `PortRegistry` + reactor glue to `registry.rs`, keeping
+  `Port` in `port.rs`) is reasonable; the file is long only because the tests are comprehensive in-place.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/poller.rs` → `Poller`, `Token`, `Interest`, `Ready`, `Event`, `Waker` (the `mio`-backed reactor)
 - `src/timer.rs` → `Timeout`, `Timer` (poll-deadline primitives)
 - `src/queue.rs` → `ByteQueue` (the port input/output byte buffers)
-- `src/driver.rs` → `Driver` trait, `DriverContext`, `DriverFlags`, `DriverRegistry` (the driver seam)
-- `src/port.rs` → `Port`, `PortState`, `PortRegistry` (port id + queues + driver dispatch)
-- `src/drivers/fd.rs` → `FdDriver` (the built-in fd/pipe byte-stream driver)
+- `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome` (the `erts_port_task_execute` model)
+- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `PortRegistry` (port id + queues + task scheduling + driver dispatch)
+- `src/driver.rs` → `Driver` trait, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms` (the driver seam)
+- `src/drivers/fd.rs` → `FdDriver` (the built-in fd/pipe byte-stream driver, incl. line/phase modes + `control`)
+- `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN` (`{line, N}` framing)
+- `src/drivers/binary_io.rs` → `Phase`, `PhaseChange` (the text⇄binary phase-change protocol)
+- `src/drivers/efile.rs` → `EfileDriver`, `make_efile` (the built-in `efile` driver)
+- `src/drivers/mod.rs` → driver-module wiring + re-exports
 - `src/error.rs` → `pub(crate)` error constructors (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
 - `tests/port.rs` → `open`→`output`→`poll`→`handle_events`→`read_input` byte round-trip
-- `../beam_process/src/ptab.rs` → `PortTable` port-id allocation (sibling — read-only, escalate writes to `..`)
+- `tests/port_task.rs` → port-task scheduling end-to-end + the receive-wake path (`PortNotification` → `beam_process` scheduler)
+- `../beam_process/src/ptab.rs`, `scheduler.rs`, `process.rs` → `PortTable`/`PortId`, `Scheduler::resume_woken`, `ProcessTable::deliver`/`drain_woken`, `DeliverOutcome` (sibling — read-only)
 - `../beam_abi/CONTEXT.md` → the frozen `ErlDrvEntry`/`ErlDrvApi` driver C ABI to bridge later (sibling — read-only)
-- `../../erts/emulator/sys/common/erl_poll.c`, `../../erts/emulator/beam/io.c`, `../../erts/emulator/beam/erl_port.h`, `../../erts/emulator/drivers/common/inet_drv.c` → legacy C ground truth (read-only reference)
+- `../../erts/emulator/sys/common/erl_poll.c`, `../../erts/emulator/beam/io.c`, `../../erts/emulator/beam/erl_port.h`, `../../erts/emulator/beam/erl_port_task.{c,h}`, `../../erts/emulator/drivers/common/inet_drv.c`, `../../erts/emulator/sys/unix/erl_child_setup.c` → legacy C ground truth (read-only reference)
 
 ## Notes for Agents
 - Read `../CONTEXT.md` (crate-layer contracts, the poller/`Port`/driver-registry seam), `../beam_process/CONTEXT.md`
-  (`PortTable`/`PortId`) and `../../CONTEXT.md` §1 A.4/§3 before changing this crate.
-- Build/test: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (sandbox
-  `$HOME` is read-only — always the wrapper). Never `cd`; never touch `../../tools/`.
-- A driver never touches the queues or the poller directly — it goes through `DriverContext`. When a
-  `Port` method calls the driver, **destructure `self`** (`let Port { driver, input, output, id, .. }`)
-  so the driver and its context borrow disjoint fields; do not add a combined raw-pointer accessor.
-- `Poller::poll` returns owned events; call `registry.handle_events(&mut poller, &events)` after it.
-  Keys are port *numbers* (`PortId::number()`), so the registry looks the port up by `u64`.
-- `FdDriver` closes the fds it is given (on `stop` and on `Drop`); do not close them elsewhere.
-- `mio::unix::SourceFd` borrows `&mut RawFd` only for the duration of the syscall — build it from a
-  local `let mut fd = fd;` inside the wrapper; the raw fd number is what mio registers.
+  (`PortTable`/`PortId`, `Scheduler`/`ProcessTable`) and `../../CONTEXT.md` §1 A.4/§3 before changing this crate.
+- Build/test: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` (sandbox `$HOME`
+  is read-only — always the wrapper). Never `cd`; never touch `../../tools/`.
+- A driver never touches the queues or the poller directly — it goes through `DriverContext`. When a `Port`
+  method calls the driver, **destructure `self`** (`let Port { driver, input, output, id, .. }`) so the driver and
+  its context borrow disjoint fields; do not add a combined raw-pointer accessor.
+- `Poller::poll` returns owned events; call `registry.handle_events(&mut poller, &events)` after it, or drive the
+  queue explicitly with `schedule_events` + `execute_port_tasks`. Keys are port *numbers* (`PortId::number()`).
+- `FdDriver` closes the fds it is given (on `stop` and on `Drop`); do not close them elsewhere. `EfileDriver`
+  composes an `FdDriver`, so the same ownership rule applies through it.
+- `mio::unix::SourceFd` borrows `&mut RawFd` only for the duration of the syscall — build it from a local
+  `let mut fd = fd;` inside the wrapper; the raw fd number is what mio registers.
+- `Ready` has **no public constructor**: tests that need a specific readiness forge it through
+  `Event::new(token, key, ready)` with a real `Ready` or through the public `schedule_readiness(key, Readiness)`.
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, the seam types, the Stage-0…6 mapping (§7) and wave-5 position.
 - `../../CONTEXT.md` → workspace contracts: §1 A.4 (driver C ABI) / A.6 (CLI/config), §3 (error strategy).
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A (the two clean seams) and §H (Stage 5).
 - `../beam_abi/CONTEXT.md` → the `ErlDrvEntry`/`ErlDrvApi` layouts the C-ABI bridge will target.
-- `../beam_process/CONTEXT.md` → `PortTable`/`PortId` and the scheduler that will drive ports.
+- `../beam_process/CONTEXT.md` → `PortTable`/`PortId`, `Scheduler`/`ProcessTable` and the scheduler that will drive ports.
+- Owed upstream (repo-root owned, outside this node): a `../../CHANGE.md` entry for the port-task model +
+  `PortNotification` seam + `port_command`/`port_control` surface, the line/phase/`efile` driver additions, and the
+  `DriverRegistry` `"efile"` registration.
