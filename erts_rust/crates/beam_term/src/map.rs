@@ -445,6 +445,17 @@ pub fn map_pairs(t: Eterm, atoms: &AtomTable) -> TermResult<Vec<(Eterm, Eterm)>>
     Ok(pairs)
 }
 
+/// Every `(key, value)` pair of the map `t` in the order the map **stores** them.
+///
+/// A flat map yields its keys-tuple order; a hash map its HAMT slot traversal
+/// order. That order is representation-dependent (and, for a hash map,
+/// hash-dependent), so it is **not** the [`crate::compare::cmp`] key order that
+/// [`map_pairs`] produces. It is the order an image-preserving serializer must
+/// use to reproduce an existing map byte-for-byte.
+pub fn map_pairs_storage_order(t: Eterm) -> TermResult<Vec<(Eterm, Eterm)>> {
+    collect_pairs(t)
+}
+
 /// Like [`map_pairs`] but in the *internal* flat-map key order
 /// ([`crate::compare::cmp_flatmap_keys`]): two atom keys order by atom index,
 /// every other pair by term order.
@@ -645,7 +656,7 @@ mod tests {
         header_arity, is_flatmap, is_hashmap, is_hashmap_header, map_header_val,
     };
     use crate::heap::Heap;
-    use crate::immediate::{make_atom, make_small, NIL};
+    use crate::immediate::{make_atom, make_small, signed_value, NIL};
     use crate::size::size_object;
 
     /// A permanently-invalid marker word: `write_map` must never touch it.
@@ -746,6 +757,82 @@ mod tests {
         assert_eq!(pairs[1].0, k3);
         assert_eq!(pairs[2].0, k1);
         assert_eq!(pairs[2].1, make_small(10));
+    }
+
+    #[test]
+    fn storage_order_is_the_flatmap_keys_tuple_order() {
+        let a = atoms();
+        let mut heap = Heap::new(64);
+        let k3 = heap.tuple(&[make_small(3)]).unwrap();
+        let k1 = heap.cons(make_small(1), NIL).unwrap();
+        let raw = [
+            (make_small(5), make_small(50)),
+            (k3, make_atom(a.lookup("a").unwrap())),
+            (k1, make_small(10)),
+        ];
+        let b = build(&raw, &a);
+        // SAFETY: `b.map` is a live boxed map.
+        assert!(unsafe { is_flatmap(b.map) });
+        // SAFETY: `b.map` is a live flat map.
+        let (keys, values) = unsafe { flatmap_parts(b.map) };
+        let stored = map_pairs_storage_order(b.map).unwrap();
+        assert_eq!(stored.len(), 3);
+        assert_eq!(
+            stored,
+            keys.iter()
+                .copied()
+                .zip(values.iter().copied())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(stored[0].0, make_small(5));
+
+        // Flat-map storage order is atom-*index* order, which is not the `cmp`
+        // (name) order `map_pairs` returns: seed "b" before "a".
+        let mut t = AtomTable::new();
+        t.seed(["b", "a"]);
+        let b_atom = make_atom(t.lookup("b").unwrap());
+        let a_atom = make_atom(t.lookup("a").unwrap());
+        let built = build(&[(a_atom, make_small(1)), (b_atom, make_small(2))], &t);
+        let stored = map_pairs_storage_order(built.map).unwrap();
+        assert_eq!(stored, vec![(b_atom, make_small(2)), (a_atom, make_small(1))]);
+        assert_ne!(stored, map_pairs(built.map, &t).unwrap());
+    }
+
+    #[test]
+    fn storage_order_matches_the_hamt_traversal_of_a_hash_map() {
+        let a = atoms();
+        let n = 40i64;
+        let b = build(&pairs_of(&keys_1_to(n), &a), &a);
+        // SAFETY: `b.map` is a live boxed map.
+        assert!(unsafe { is_hashmap(b.map) });
+        let stored = map_pairs_storage_order(b.map).unwrap();
+        // Every input key appears exactly once, with its matching value.
+        assert_eq!(stored.len(), n as usize);
+        let mut keys: Vec<i64> = stored.iter().map(|(k, _)| signed_value(*k)).collect();
+        keys.sort_unstable();
+        assert_eq!(keys, keys_1_to(n));
+        for (k, v) in &stored {
+            assert_eq!(*v, make_small(signed_value(*k) * 10));
+        }
+        // The order is the raw HAMT slot traversal, not a re-sorted one.
+        let mut direct: Vec<(Eterm, Eterm)> = Vec::new();
+        collect_slots(boxed_val(b.map), &mut direct).unwrap();
+        assert_eq!(stored, direct);
+    }
+
+    #[test]
+    fn storage_order_rejects_non_maps() {
+        assert_eq!(
+            map_pairs_storage_order(make_small(1)).unwrap_err(),
+            TermError::BadMap
+        );
+        assert_eq!(
+            map_pairs_storage_order(NIL).unwrap_err(),
+            TermError::BadMap
+        );
+        let mut heap = Heap::new(8);
+        let tup = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+        assert_eq!(map_pairs_storage_order(tup).unwrap_err(), TermError::BadMap);
     }
 
     #[test]
