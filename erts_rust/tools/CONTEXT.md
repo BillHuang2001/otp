@@ -35,13 +35,17 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - Files target ~1000 lines; split by responsibility. Apache-2.0.
 
 ## Constraints
-- **Do not couple to `crates/*` internals.** The only contract with `beam_rt` is its documented external CLI (A.6). `beam_rt` is a working runtime — its `run` action executes real `.beam`s — and it signals an unimplemented capability with exit code `3` plus a `beam_rt: unsupported: …` stderr line, which both tools must classify as `unsupported` — **never** `mismatch` — and must never crash on.
+- **Do not couple to `crates/*` internals.** The only contract with `beam_rt` is its documented external CLI (A.6). `beam_rt` is a working runtime: a real `-eval` evaluator (`erl_eval`-style tree-walk over the `beam_bifs` `erlang` registry), a global-atom code server (`code:*`/`init:*` native floor), native `os:cmd/1`, and a `run` action that executes real `erlc`-compiled `.beam`s.
+- **The two `beam_rt` capability-gap signals — both must classify as `unsupported`, never `mismatch`, and both tools must never crash on them:**
+  1. **escaped** — the capability-gap raise escaped the program, so the CLI exits `3` and prints exactly one `beam_rt: unsupported: <reason>` stderr line (an out-of-grammar `-eval` expression, an `unsupported_opcode`/`unsupported_bif` reason);
+  2. **probe-caught** — a probe-wrapped (eval) case's probe *caught* the raise and printed it as its single `exception <class> <reason>` stdout line, exiting `1`, where `<reason>` (after stripping one pair of surrounding `'…'` quotes) follows the runtime's documented `unsupported` reason convention (`unsupported`, `unsupported: X`, `unsupported_opcode: …`, `unsupported_bif`).
+  The probe-caught classification is **deliberately narrow**: only the documented `unsupported` prefix (with a following `:`/`_`/whitespace, or nothing) triggers it, so a genuine Erlang reason (`badarg`, `system_limit`, `function_clause`, `'erlang:open_port/2 is not a BIF'`, …) stays an *observation* ⇒ `mismatch`.
 - `bench` investigates the external repos **read-only** (`/home/bill/Source/{elixir,cowboy,khepri,emqx,Programming-Language-Benchmarks}`): it may build/run them but must **not** commit into them.
 - Keep default runs fast (`--quick`); full suites are milestone-only (Part I §C; root §6).
 - `unsafe` is forbidden in both crates.
 
 ## Routing Table
-- `differential/` → differential-test compatibility gate: `Eval` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (stdout, exit status, stderr, `term_to_binary`, exception class+reason, `system_info`), exit-`3` ⇒ `unsupported` classification, built-in conformance corpus, JSON reports
+- `differential/` → differential-test compatibility gate: `Eval` cases (shared argv) + `Module` cases (per-side argv, `erlc`-compiled), oracle runner, Rust-runtime runner (`run` action), observable-result comparison (stdout, exit status, stderr, `term_to_binary`, exception class+reason, `system_info`), the two-signal ⇒ `unsupported` classification (escaped exit-`3` **and** probe-caught `exception` reason), built-in conformance corpus, JSON reports
 - `bench/` → benchmark driver: pluggable workload plugins (Elixir compiler, PLB kernels, Cowboy, Khepri, EMQX), system-ERTS baseline, result store + `compare`
 
 ## Notes for Agents
