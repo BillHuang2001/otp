@@ -323,7 +323,20 @@ impl Table {
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
-- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
+- **`ets:info/1` field set is a subset.** `TableInfo::entries` emits 12 of the oracle's 15 fields —
+  it omits `heir`, `node` and `decentralized_counters`, and renders `owner` as `undefined` and `id`
+  as a small integer (M1 has no pid/node/ref terms). The observable `ets:info/1` proplist is produced
+  by the sibling `beam_bifs` bridge; `entries` is a heap-free convenience used by tests.
+- **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
+  `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*
+  there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
+  `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
+  build the list.
+- **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
+  `select/3` + `select_reverse/*`, `match/3`, `match_object/3` (limited), `foldl`/`foldr`,
+  `select_replace/2`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`, `table/1,2`, `slot/2`,
+  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1` do **not** exist in
+  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
   crate holds no global state, so it must not duplicate that registry).
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
