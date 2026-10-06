@@ -151,6 +151,7 @@ is `decode`'s.
 `parse_t2b_opts` (`external.c:1501-1516`) maps `{minor_version, N}` onto encoder dflags.
 `TERM_TO_BINARY_DFLAGS` (`dist.h:138-139`) is `DFLAG_NEW_FLOATS | DFLAG_UTF8_ATOMS` and carries
 **no** `DFLAG_SMALL_ATOM_TAGS`, so:
+
 | `MinorVersion` | atoms | floats |
 |---|---|---|
 | `V0` (`{minor_version,0}`) | `ATOM_EXT` (`100`) for a Latin-1 name (never `115`, any length), UTF-8 tags for a non-Latin-1 name | `FLOAT_EXT` (`99`), 31-byte text |
