@@ -627,7 +627,16 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   shared atom table is seeded with `CORE_ATOMS` + `INFO_ATOMS` (not the full `atom.names` ordering), so
   positional atom indices for preloaded code are not reproduced. The erts app's `ebin` **is** on the
   code path (`CodeServer::resolve_system_ebins`), so a preloaded module (`init`, `persistent_term`, …)
-  *can* be loaded from disk on demand; boot order and the registry are in place.
+  *can* be loaded from disk on demand; the registry (the oracle's **exact** `erlang:pre_loaded/0` list
+  *and* order) is in place.
+* **Answers that read *this* runtime's own state differ from the oracle by construction** — they are
+  not bugs and must not be "fixed" to match a run-time figure: `erlang:processes/0` (this runtime's own
+  table — its root process plus whatever `spawn_process` created, never the oracle's 40-odd background
+  processes), `erlang:ports/0` and `erlang:system_info(port_count)` (the live [`PortRegistry`], empty
+  until something opens a port), and `erlang:module_loaded/1` (the preloaded names + the modules this
+  runtime actually loaded). `erlang:whereis(init)` **does** agree: `Runtime::new` registers its root
+  process under the name `init`, the same pid `group_leader/0` reports (oracle: `<0.0.0>`).
+  `erlang:registered/0` is not implemented (it is on the known-unimplemented list).
 * **`-eval` results that are not byte-aligned cannot be *printed*.** Construction and `bit_size/1` are
   supported for a non-byte-aligned bitstring (`<<1:1>>`, `<<255:12/little>>`), but the registered
   `beam_bifs` `io:format` `~w`/`~p` printer rejects one with `badarg` — a **`beam_bifs` printer gap
