@@ -92,7 +92,7 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | Crate | Milestone-1 deliverable |
 |---|---|
 | `beam_alloc` | carrier allocator + size classes + process-heap bump allocator |
-| `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute |
+| `beam_abi` | layout-frozen NIF/driver struct + fn-table types, static size/offset asserts, transmute; the working `enif_*` host API (`NifHost` seam) + the `dlopen`-based NIF loader |
 | `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips |
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
