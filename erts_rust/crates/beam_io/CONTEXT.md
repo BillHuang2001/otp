@@ -111,10 +111,15 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `id()`, `state()`, `driver_name()`, `input_len()`, `read_input(&mut [u8]) -> usize`, `drain_input() -> Vec<u8>`,
   `output_len()`, `open(&mut Poller)`, `output(&mut Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`,
   `ready_output(&mut Poller) -> Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`,
-  `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver), and the
+  `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver),
+  `notify_exit(&mut Poller, PortExitReason) -> Result<()>` (the once-only port-exit notification), and the
   scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
-  `schedule_timeout(Instant) -> bool`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
+  `schedule_timeout(Instant) -> bool`, `arm_timeout(Instant)`, `cancel_timeout() -> bool`,
+  `next_timeout() -> Option<Instant>`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
   `has_pending_task(PortTaskKind) -> bool`, `timeout(&mut Poller) -> Result<()>`.
+  Each `IDriver` interaction (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the
+  port timer from `Driver::next_timeout` through the internal `refresh_timeout`: `Some(d)` arms/**re-points** the
+  single `TIMEOUT` task at `d`, `None` clears it (a driver's declaration is authoritative until its next interaction).
 - `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
   port number: `new()`, `open(poller, Box<dyn Driver>) -> Result<PortId>`,
   `open_named(poller, &DriverRegistry, name) -> Result<PortId>`, `get(id)`, `get_mut(id)`,
