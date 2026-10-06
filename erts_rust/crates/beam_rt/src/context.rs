@@ -58,16 +58,18 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
+use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{AtomInterner, BifContext, DictHook, FunCaller, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
 use beam_message::{Message, Queue};
 use beam_process::{ProcessId, ProcessTable};
-use beam_term::{Atom, Eterm};
+use beam_term::{Atom, AtomTable, Eterm};
 
 use crate::error;
 use crate::mailbox::MailboxState;
+use crate::nif::{NifEntry, NifHostImpl};
 use crate::port::RuntimePorts;
 use crate::runtime::Runtime;
 
@@ -160,6 +162,14 @@ pub struct RuntimeContext<'a> {
     ///
     /// [`Runtime::pump_scheduler`]: crate::runtime::Runtime::pump_scheduler
     may_pump_scheduler: bool,
+    /// The name of the module whose **code** is executing — the call site of a BIF.
+    ///
+    /// [`ExecutionContext::call_bif`] only supplies the *callee* module, but
+    /// `erlang:load_nif/2` must know the module the **call site** lives in (the oracle derives
+    /// it from the call instruction). [`RuntimeContext::run_export`] is the one place that
+    /// knows it, so it sets this for the duration of the call and restores the previous value
+    /// afterwards; [`RuntimeContext::call_registered`] forwards it to the [`BifContext`].
+    current_module: Option<String>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -173,6 +183,7 @@ impl<'a> RuntimeContext<'a> {
             mailbox_pid,
             mailbox_table: None,
             may_pump_scheduler: true,
+            current_module: None,
         }
     }
 
@@ -185,6 +196,7 @@ impl<'a> RuntimeContext<'a> {
             mailbox_pid,
             mailbox_table: None,
             may_pump_scheduler: true,
+            current_module: None,
         }
     }
 
@@ -214,6 +226,7 @@ impl<'a> RuntimeContext<'a> {
             mailbox_pid: pid,
             mailbox_table: Some(table),
             may_pump_scheduler: false,
+            current_module: None,
         }
     }
 
@@ -356,9 +369,18 @@ impl<'a> RuntimeContext<'a> {
         if module.export(function_atom, arity).is_none() {
             return Err(error::undef());
         }
-        Machine::new()
+        // Everything this call executes is this module's code, so a BIF reached from it (in
+        // particular `erlang:load_nif/2`, whose owning module the oracle derives from the call
+        // instruction) must see *this* name. The previous value is restored afterwards, so a
+        // nested/external call that returns to the outer module keeps the right identity.
+        let previous = self
+            .current_module
+            .replace(module.atom_name(module.name).unwrap_or_default().to_string());
+        let result = Machine::new()
             .run_export(module, function_atom, arity, args, self)
-            .map_err(|err| error::name_atom_raise(err, self.runtime.atoms()))
+            .map_err(|err| error::name_atom_raise(err, self.runtime.atoms()));
+        self.current_module = previous;
+        result
     }
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
     /// runtime's shared state and this context's output sink.
@@ -419,6 +441,13 @@ impl<'a> RuntimeContext<'a> {
         // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
         // cannot co-exist (see the method docs).
         let uses_dict = Self::uses_dict(module, function, arity);
+        // Whether this is `erlang:load_nif/2`, which needs the NIF-loading bridge (also a
+        // `&mut Runtime` borrow, and therefore a third mutually exclusive arm).
+        let uses_nif_loader = Self::uses_nif_loader(module, function, arity);
+        // The caller's module name, cloned out *before* `self` is destructured: it outlives
+        // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
+        // the owner), and it is forwarded to both the NIF bridge and the nested fun bridge.
+        let caller_module = self.current_module.clone();
         let result = {
             let RuntimeContext {
                 runtime,
@@ -426,6 +455,7 @@ impl<'a> RuntimeContext<'a> {
                 mailbox_pid,
                 mailbox_table,
                 may_pump_scheduler,
+                current_module: _,
             } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
@@ -473,15 +503,41 @@ impl<'a> RuntimeContext<'a> {
                     context = context.with_tables(tables);
                 }
                 registry.call(module, function, arity, &mut context, args)
+            } else if uses_nif_loader {
+                // `erlang:load_nif/2`: the NIF bridge needs `&mut Runtime` (to store the loaded
+                // library in the runtime's NIF registry), so it is the only runtime borrow in
+                // this arm — mutually exclusive with the dict/fun-caller arms. Its host shares
+                // *this* call's `pending` interner, so a name the C `load` callback interns and
+                // a name the BIF interns land in one ordered, exactly-predicted list.
+                let mut bridge = NifBridge {
+                    runtime,
+                    atoms: Rc::clone(&atoms),
+                    interner: pending.clone(),
+                    self_pid: self_pid.to_eterm(),
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_nif_loader(&mut bridge)
+                    .with_current_module(caller_module.as_deref().unwrap_or(""))
+                    .with_port_hook(&mut ports);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
-                // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`.
+                // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
+                // inherits the caller's module name so a nested call still knows its call site.
                 let mut bridge = FunBridge {
                     runtime,
                     output: output.clone(),
                     mailbox_pid: *mailbox_pid,
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
+                    current_module: caller_module,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
@@ -496,12 +552,11 @@ impl<'a> RuntimeContext<'a> {
                 registry.call(module, function, arity, &mut context, args)
             }
         };
-        // The BIF is done and every borrow released, so commit the names it interned:
-        // each lands at the index the interner predicted, keeping the BIF's atom terms
-        // (and every printer/comparison that resolves them) consistent.
-        for name in pending.into_pending() {
-            self.runtime.code_server.atoms_mut().intern(&name);
-        }
+        // The BIF (and any NIF a bridge ran) is done and every borrow released, so commit the
+        // names interned during the call: each lands at the index the interner predicted,
+        // keeping the BIF's/NIF's atom terms (and every printer/comparison that resolves them)
+        // consistent.
+        pending.commit(self.runtime.code_server.atoms_mut());
         self.runtime.put_bif_heap(heap);
         result
     }
@@ -533,6 +588,69 @@ impl<'a> RuntimeContext<'a> {
     /// limitation documented there).
     fn reentrancy_capable(args: &[Eterm]) -> bool {
         args.iter().any(|arg| terms::is_fun(*arg))
+    }
+
+    /// Whether `(module, function, arity)` is `erlang:load_nif/2`, which must run against the
+    /// [`NifBridge`] (the NIF-loading seam).
+    ///
+    /// The bridge needs `&mut Runtime` to store the loaded library, so it cannot co-exist with
+    /// [`FunBridge`]'s `&mut Runtime` borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
+    /// [`Self::call_registered`] installs exactly one of the three. `load_nif/2` takes no fun
+    /// argument and no dictionary, so nothing is lost.
+    fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
+        matches!((module, function, arity), ("erlang", "load_nif", 2))
+    }
+
+    /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
+    ///
+    /// A perfect no-op on a miss (`Ok(None)`), so it is safe to try before *every* BIF: only a
+    /// `(module, function, arity)` a loaded NIF library actually exports is intercepted, exactly
+    /// as the BEAM's own NIF dispatch works (a NIF replaces the Erlang stub of the same name).
+    ///
+    /// The NIF runs against a **fresh** per-call [`NifHostImpl`] over a pooled BIF heap, with a
+    /// fresh [`PendingInterner`] rooted at the shared table's current length. The term it
+    /// returns lives on that pooled heap, which is pointer-stable and never reset (no GC in
+    /// Milestone 1), so it stays valid after the heap is put back — the same convention
+    /// [`Self::call_registered`] relies on.
+    ///
+    /// # Errors
+    ///
+    /// A NIF that records a pending exception (`enif_raise_exception`, `enif_make_badarg`)
+    /// raises that reason as a live reason term ([`crate::error::nif_raised`]) — never swallowed
+    /// and never replaced by a placeholder. An unexported `{name, arity}` (impossible here, the
+    /// lookup already confirmed it) is the bare [`crate::error::undef`].
+    fn try_call_nif(
+        &mut self,
+        module: &str,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Option<Eterm>> {
+        if !self.runtime.nifs.borrow().lookup(module, function, arity) {
+            return Ok(None);
+        }
+        let atoms = self.runtime.code_server.atoms_handle();
+        let interner = PendingInterner::new(atoms.len());
+        let heap = self.runtime.take_bif_heap()?;
+        let self_pid = self.mailbox_pid.to_eterm();
+        let mut host =
+            NifHostImpl::new(heap, Rc::clone(&atoms), interner.clone(), self_pid);
+        // The registry is borrowed immutably only for the duration of the call, and released
+        // before the interner is committed (which needs `&mut` on the code server).
+        let outcome = {
+            let nifs = self.runtime.nifs.borrow();
+            let mut env = beam_abi::NifEnv::new(&mut host);
+            nifs.call(module, function, arity, &mut env, args)
+        };
+        self.runtime.put_bif_heap(host.into_heap());
+        interner.commit(self.runtime.code_server.atoms_mut());
+        match outcome {
+            Ok(term) => Ok(Some(term)),
+            Err(NifCallError::Raised(reason)) => Err(error::nif_raised(reason)),
+            // Defensive: `lookup` above already confirmed the export, so this cannot happen —
+            // but a library raced out from under us would be `undef`, never a fabricated value.
+            Err(NifCallError::UnknownFunction { .. }) => Err(error::undef()),
+        }
     }
 }
 
@@ -568,6 +686,9 @@ struct FunBridge<'a> {
     /// The outer call's [`RuntimeContext::may_pump_scheduler`], inherited so the nested
     /// context can pump the scheduler exactly when the caller could.
     may_pump_scheduler: bool,
+    /// The outer call's executing-module name, inherited so a nested call keeps the same
+    /// call-site identity (see [`RuntimeContext::current_module`]).
+    current_module: Option<String>,
 }
 
 impl FunCaller for FunBridge<'_> {
@@ -584,6 +705,7 @@ impl FunCaller for FunBridge<'_> {
             mailbox_pid: self.mailbox_pid,
             mailbox_table: self.mailbox_table.as_deref_mut(),
             may_pump_scheduler: self.may_pump_scheduler,
+            current_module: self.current_module.clone(),
         };
         ctx.apply_fun(fun, args)
     }
@@ -651,6 +773,72 @@ impl DictHook for DictBridge<'_> {
     }
 }
 
+/// The `beam_bifs` NIF-loading seam: `dlopen`s a NIF library and registers it with the runtime.
+///
+/// `erlang:load_nif/2` is a plain Rust function that cannot open a shared object or bind its
+/// entry points itself, so it routes every load through the [`NifLoader`](beam_bifs::NifLoader)
+/// seam — this is the concrete provider the runtime installs. It needs `&mut Runtime` (to store
+/// the loaded [`NifEntry`](crate::nif::NifEntry) in [`Runtime::nifs`](crate::runtime::Runtime)),
+/// so [`RuntimeContext::call_registered`] installs it as its own mutually exclusive arm.
+///
+/// # The persistent host (why the load host is not the call host)
+///
+/// The host handed to [`beam_abi::nif::loader::load`] is **boxed and stored with the library**:
+/// the loader erases the host borrow into a raw pointer, and the library's `unload` callback
+/// (run from the library's `Drop`) later needs a host again. The box must therefore outlive the
+/// library; [`crate::nif::NifEntry`] pairs them in the right drop order. A **call** to a NIF,
+/// by contrast, builds its own fresh host ([`RuntimeContext::try_call_nif`]), so this long-lived
+/// host is only ever the `unload` context.
+///
+/// The host's [`PendingInterner`] is a clone of this call's, so a name the C `load` callback
+/// interns is committed (at its predicted index) together with any the BIF interns.
+struct NifBridge<'a> {
+    /// The runtime whose NIF registry stores the loaded library.
+    runtime: &'a mut Runtime,
+    /// A cheap handle to the shared atom table, cloned for each host.
+    atoms: Rc<AtomTable>,
+    /// The in-flight deferred interner, shared with the BIF call.
+    interner: PendingInterner,
+    /// `erlang:self()` as seen by the library's `load` callback.
+    self_pid: Eterm,
+}
+
+impl beam_bifs::NifLoader for NifBridge<'_> {
+    fn load_nif(
+        &mut self,
+        module: &str,
+        path: &str,
+        load_info: Eterm,
+    ) -> core::result::Result<(), beam_bifs::NifLoadError> {
+        // The oracle's rule since OTP 20: a second `load_nif` for a module that already has a
+        // library is a `reload` (upgrading needs `reload`/`upgrade` callbacks the runtime does
+        // not model). Checked *before* touching the filesystem, which is the oracle's order.
+        if self.runtime.nifs.borrow().is_loaded(module) {
+            return Err(beam_bifs::NifLoadError::Reload(
+                "NIF library already loaded (reload disallowed since OTP 20).".to_string(),
+            ));
+        }
+        // A dedicated, long-lived host heap: the library's `unload` callback runs against this
+        // host long after this call returns, so it may not use a pooled BIF heap.
+        let heap = beam_alloc::Heap::new(self.runtime.bif_heap_words).map_err(|error| {
+            beam_bifs::NifLoadError::Load(format!("cannot allocate the NIF host heap: {error}"))
+        })?;
+        let mut host = Box::new(NifHostImpl::new(
+            heap,
+            Rc::clone(&self.atoms),
+            self.interner.clone(),
+            self.self_pid,
+        ));
+        let lib = beam_abi::nif::loader::load(path, module, host.as_mut(), load_info)
+            .map_err(crate::nif::map_load_error)?;
+        self.runtime
+            .nifs
+            .borrow_mut()
+            .insert(module.to_string(), NifEntry::new(lib, host));
+        Ok(())
+    }
+}
+
 /// Interns atom names for the duration of one BIF call, predicting their indices.
 ///
 /// A [`BifContext`] borrows the shared [`AtomTable`](beam_term::AtomTable) immutably for
@@ -658,39 +846,64 @@ impl DictHook for DictBridge<'_> {
 /// `#![deny(unsafe_code)]`, so the interner cannot hold a coexisting mutable borrow of the
 /// same table. Interning is **append-only** and the runtime is **single-threaded**, so a
 /// name added during one call always lands at `base + <names recorded so far>` — the
-/// interner records the names and predicts that index; [`RuntimeContext::call_registered`]
-/// commits them, in order, after the call. A name seen twice in one call is deduplicated
-/// and returns the same index.
-struct PendingInterner {
+/// interner records the names and predicts that index; the caller commits them, in order,
+/// after the call. A name seen twice in one call is deduplicated and returns the same index.
+///
+/// # Why the inner state is shared (`Rc<RefCell<…>>`)
+///
+/// One `erlang:load_nif/2` call has **two** new-atom writers: the BIF layer (through
+/// [`BifContext`]'s [`AtomInterner`]) and the NIF host the load runs against
+/// ([`NifHostImpl`](crate::nif::NifHostImpl)'s `enif_make_atom`). They may interleave, so two
+/// independent predicted-index lists would hand out colliding indices. A cloneable handle over
+/// one shared list makes both writers agree on `base + <names recorded>`, and the single
+/// [`PendingInterner::commit`] by the caller lands every name at exactly its predicted index.
+/// The handle is **not** shared across calls: each call gets a fresh one rooted at the table's
+/// current length.
+#[derive(Clone)]
+pub(crate) struct PendingInterner {
+    /// The shared base + recorded names (one allocation per call).
+    inner: Rc<RefCell<PendingInternerInner>>,
+}
+
+/// The mutable half of a [`PendingInterner`].
+struct PendingInternerInner {
     /// The shared table's length when the call began: the first new name's index.
     base: usize,
     /// Names interned during this call, in order (deduplicated).
-    pending: Vec<String>,
+    names: Vec<String>,
 }
 
 impl PendingInterner {
     /// A pending interner rooted at `base` (the current shared-table length).
-    fn new(base: usize) -> PendingInterner {
+    pub(crate) fn new(base: usize) -> PendingInterner {
         PendingInterner {
-            base,
-            pending: Vec::new(),
+            inner: Rc::new(RefCell::new(PendingInternerInner {
+                base,
+                names: Vec::new(),
+            })),
         }
     }
 
-    /// The recorded names, in intern order, to be committed by the caller.
-    fn into_pending(self) -> Vec<String> {
-        self.pending
+    /// Commits the recorded names into `atoms`, in intern order.
+    ///
+    /// Must be called once the BIF/host has returned and released its borrow of the table, so
+    /// each name lands at exactly the index the interner predicted.
+    pub(crate) fn commit(&self, atoms: &mut AtomTable) {
+        for name in self.inner.borrow_mut().names.drain(..) {
+            atoms.intern(&name);
+        }
     }
 }
 
 impl AtomInterner for PendingInterner {
     fn intern(&mut self, name: &str) -> Atom {
-        if let Some(offset) = self.pending.iter().position(|pending| pending == name) {
+        let mut inner = self.inner.borrow_mut();
+        if let Some(offset) = inner.names.iter().position(|pending| pending == name) {
             // A duplicate within this call reuses the predicted index.
-            return Atom::from_raw((self.base + offset) as u32);
+            return Atom::from_raw((inner.base + offset) as u32);
         }
-        let index = self.base + self.pending.len();
-        self.pending.push(name.to_string());
+        let index = inner.base + inner.names.len();
+        inner.names.push(name.to_string());
         Atom::from_raw(index as u32)
     }
 }
@@ -710,6 +923,11 @@ impl ExecutionContext for RuntimeContext<'_> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
+        // A loaded NIF library wins over every other route: a NIF replaces the Erlang stub of
+        // the same `{module, function, arity}`. On a miss this is a no-op (`Ok(None)`).
+        if let Some(term) = self.try_call_nif(module, function, arity, args)? {
+            return Ok(term);
+        }
         if let Some(result) = self.try_native(module, function, arity, args) {
             return result;
         }

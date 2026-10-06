@@ -50,6 +50,7 @@ pub mod format;
 pub mod info;
 mod mailbox;
 mod native;
+mod nif;
 pub mod port;
 pub mod runtime;
 mod runner;
