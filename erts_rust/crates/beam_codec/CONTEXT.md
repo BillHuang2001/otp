@@ -36,9 +36,10 @@ tags are rejected as `BadArg` — never a wrong term.
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
 the exhaustive encode→decode corpus plus the negative/truncation cases,
 `tests/ground_truth.rs` holds the byte-exact `term_to_binary` oracle vectors (each
-asserted in both directions), and `tests/interop.rs` is a live **differential harness**
-that shells out to the system `erl` and compares our codec against it in both directions
-(see "Test Strategy").
+asserted in both directions), `tests/interop.rs` is a live **differential harness**
+that shells out to the system `erl` and compares our codec against it in both directions,
+and `tests/atom_cache_writer.rs` / `tests/wire_roundtrip.rs` cover the outbound atom-cache
+seam and the end-to-end `LOCAL_EXT` + atom-cache round trips (see "Test Strategy").
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_codec::prelude::*`.
