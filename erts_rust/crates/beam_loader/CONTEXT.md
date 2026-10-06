@@ -357,12 +357,14 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`), whose operands need
   record-descriptor modelling the IR does not own yet, and the obsolete/transform-only `genop.tab`
   entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
-- **The compressed `LitT` form is unsupported** (`uncompressed_size != 0`, i.e. zlib/deflate; there is no
-  zlib dependency) ⇒ a typed `BadArg`.
-- **Upstream `beam_codec` literal-materialization gap.** `beam_codec::decode_term` does not yet decode
-  `EXPORT_EXT` or `BINARY_EXT`, so a module whose `LitT` holds an exported fun or a binary literal fails
-  to load with a typed `BadArg`. This is an upstream (`beam_codec`) dependency limitation, observed for
-  real stdlib modules such as `gen_server`, `maps` and `string`; the fix belongs in `beam_codec`, not here.
+- **`EXPORT_EXT` / `NEW_FUN_EXT` fun literals are not decoded** (an upstream `beam_codec` limitation:
+  `decode_term` returns `unsupported_external_term`). They appear **nested** inside tuples/maps (e.g.
+  `{2, fun maps:remove/2}`, `#{report_cb => fun M:F/1}`), so a top-level-only workaround in `LiteralArea`
+  cannot reach them — the shared ETF walker in `beam_codec::decode` must. This is the dominant remaining
+  load blocker (~36 of 261 real OTP modules: `maps`, `gen_server`, `proc_lib`, `supervisor`, `logger*`,
+  `json`, `compile`, `shell_docs`, …). It needs a fun/export *term layout* that `beam_term` does not
+  currently own, so it is a coordinated cross-crate change (`beam_term` layout + `beam_codec` decode +
+  `beam_engine` consumption), not a `beam_loader` fix. `BINARY_EXT`/`BIT_BINARY_EXT` ARE already decoded.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 - **`LocT` (jit-only local table) is not parsed** (irrelevant to interpretation).
