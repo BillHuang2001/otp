@@ -401,9 +401,10 @@ pub struct ErlNifApi {
             *mut ERL_NIF_TERM,
         ) -> c_int,
     >,
-    /// `int enif_make_map_remove(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM* map_out);`
-    pub enif_make_map_remove:
-        Option<unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ERL_NIF_TERM) -> c_int>,
+    /// `int enif_make_map_remove(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_NIF_TERM* map_out);`
+    pub enif_make_map_remove: Option<
+        unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, ERL_NIF_TERM, *mut ERL_NIF_TERM) -> c_int,
+    >,
     /// `int enif_map_iterator_create(ErlNifEnv *env, ERL_NIF_TERM map, ErlNifMapIterator *iter, ErlNifMapIteratorEntry entry);`
     pub enif_map_iterator_create: Option<
         unsafe extern "C" fn(*mut ErlNifEnv, ERL_NIF_TERM, *mut ErlNifMapIterator, ErlNifMapIteratorEntry) -> c_int,

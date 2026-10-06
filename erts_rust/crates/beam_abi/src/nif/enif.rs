@@ -2271,6 +2271,40 @@ pub unsafe extern "C" fn enif_make_map_update(
     }
 }
 
+/// `int enif_make_map_remove(ErlNifEnv* env, ERL_NIF_TERM map_in, ERL_NIF_TERM key, ERL_NIF_TERM* map_out);`
+///
+/// Returns `0` **only** when `map_in` is not a map; for any map it returns `1`, leaving `map_out`
+/// equal to `map_in` when `key` is absent. This is the C's behaviour (`erl_nif.c:3759`): it ignores
+/// `erts_maps_take`'s found/absent result and returns `1` unconditionally after the `is_map` guard.
+///
+/// # Safety
+///
+/// `env` must be a live env; `map_out` must be null or writable.
+#[no_mangle]
+pub unsafe extern "C" fn enif_make_map_remove(
+    env: *mut crate::nif::types::ErlNifEnv,
+    map_in: ERL_NIF_TERM,
+    key: ERL_NIF_TERM,
+    map_out: *mut ERL_NIF_TERM,
+) -> c_int {
+    let Some(e) = (unsafe { env_mut(env) }) else {
+        return 0;
+    };
+    let map = t(map_in);
+    let Ok(size) = prelude::map_size(map, &no_atoms()) else {
+        return 0;
+    };
+    // SAFETY: `map_words_capacity(size)` sizes the result of a remove — the pair count only shrinks.
+    let Some(hp) = (unsafe { alloc(e, prelude::map_words_capacity(size)) }) else {
+        return 0;
+    };
+    match unsafe { prelude::map_remove(hp, map, t(key), &no_atoms()) } {
+        // SAFETY: `map_out` may be null (handled) or valid for one write.
+        Ok(out) => (unsafe { write_out(map_out, n(out)) }) as c_int,
+        Err(_) => 0,
+    }
+}
+
 /// `int enif_make_map_from_arrays(ErlNifEnv *env, ERL_NIF_TERM keys[], ERL_NIF_TERM values[], size_t cnt, ERL_NIF_TERM *map_out);`
 ///
 /// # Safety
@@ -2457,6 +2491,7 @@ static ENIF_API: ErlNifApi = ErlNifApi {
     enif_make_map_from_arrays: Some(enif_make_map_from_arrays),
     enif_make_map_put: Some(enif_make_map_put),
     enif_make_map_update: Some(enif_make_map_update),
+    enif_make_map_remove: Some(enif_make_map_remove),
     enif_make_new_binary: Some(enif_make_new_binary),
     enif_term_to_binary: Some(enif_term_to_binary),
     enif_binary_to_term: Some(enif_binary_to_term),

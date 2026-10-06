@@ -607,6 +607,83 @@ fn maps_new_put_get_size_and_predicate() {
 }
 
 #[test]
+fn maps_remove_existing_missing_and_non_map() {
+    let mut host = common::TestHost::new();
+    let mut env = NifEnv::new(&mut host);
+    // SAFETY: `env` is live for the whole test; every out-param is a live local.
+    unsafe {
+        // Build #{1 => 10, 2 => 20}.
+        let empty = enif_make_new_map(env.as_ptr());
+        let mut m = ERL_NIF_TERM::default();
+        assert_eq!(
+            enif_make_map_put(env.as_ptr(), empty, nif_from_eterm(make_small(1)), nif_from_eterm(make_small(10)), &mut m),
+            1
+        );
+        assert_eq!(
+            enif_make_map_put(env.as_ptr(), m, nif_from_eterm(make_small(2)), nif_from_eterm(make_small(20)), &mut m),
+            1
+        );
+
+        // Removing a present key succeeds and yields the reduced map (`erl_nif.c:3759`).
+        let mut removed = ERL_NIF_TERM::default();
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), m, nif_from_eterm(make_small(1)), &mut removed),
+            1
+        );
+        let mut size: usize = 99;
+        assert_eq!(enif_get_map_size(env.as_ptr(), removed, &mut size), 1);
+        assert_eq!(size, 1);
+        let mut value = ERL_NIF_TERM::default();
+        assert_eq!(
+            enif_get_map_value(env.as_ptr(), removed, nif_from_eterm(make_small(2)), &mut value),
+            1
+        );
+        assert_eq!(eterm_from_nif(value), make_small(20));
+        assert_eq!(
+            enif_get_map_value(env.as_ptr(), removed, nif_from_eterm(make_small(1)), &mut value),
+            0
+        );
+
+        // An absent key is still a success: the C ignores `erts_maps_take`'s found/absent result
+        // and returns 1 for any map, leaving `map_out` equal to `map_in`.
+        let mut unchanged = ERL_NIF_TERM::default();
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), m, nif_from_eterm(make_small(3)), &mut unchanged),
+            1
+        );
+        assert_eq!(enif_get_map_size(env.as_ptr(), unchanged, &mut size), 1);
+        assert_eq!(size, 2);
+
+        // Non-maps fail (0) — the only `0` return — without raising or panicking.
+        let mut out = ERL_NIF_TERM::default();
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), nif_from_eterm(make_small(7)), nif_from_eterm(make_small(1)), &mut out),
+            0
+        );
+        // Nil (`[]`) and a boxed non-map (a 2-tuple) are refused the same way.
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), nif_from_eterm(NIL), nif_from_eterm(make_small(1)), &mut out),
+            0
+        );
+        let pair = [make_small(1), make_small(2)].map(nif_from_eterm);
+        let tuple = enif_make_tuple_from_array(env.as_ptr(), pair.as_ptr(), 2);
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), tuple, nif_from_eterm(make_small(1)), &mut out),
+            0
+        );
+        // A null env or null out-param never panics.
+        assert_eq!(
+            enif_make_map_remove(std::ptr::null_mut(), m, nif_from_eterm(make_small(1)), &mut out),
+            0
+        );
+        assert_eq!(
+            enif_make_map_remove(env.as_ptr(), m, nif_from_eterm(make_small(1)), std::ptr::null_mut()),
+            0
+        );
+    }
+}
+
+#[test]
 fn pid_port_and_term_type_helpers() {
     let mut host = common::TestHost::new();
     let mut env = NifEnv::new(&mut host);
@@ -663,6 +740,8 @@ fn populated_table_has_the_expected_shape() {
     assert!(table.enif_make_tuple_from_array.is_some());
     assert!(table.enif_make_list_from_array.is_some());
     assert!(table.enif_make_map_put.is_some());
+    assert!(table.enif_make_map_update.is_some());
+    assert!(table.enif_make_map_remove.is_some());
     assert!(table.enif_make_badarg.is_some());
     assert!(table.enif_raise_exception.is_some());
     assert!(table.enif_has_pending_exception.is_some());
