@@ -17,6 +17,34 @@
 //! until the fd is empty (or reports EOF) and the write path loops until the queue is
 //! drained or the kernel buffer is full.
 //!
+//! # Input phases and line buffering
+//!
+//! Input is delivered through a [`PhaseChange`] state machine (the ERTS port "phase
+//! change", `ERTS_PORT_SFLG_BINARY_IO`). The **default is [`Phase::Binary`]**, in which
+//! every chunk read from the fd is appended to the port input queue unchanged. Enabling
+//! the text phase ([`FdDriver::set_line_mode`], or the `line`/`text` control commands)
+//! frames the stream into lines first (`{line, N}`, see [`crate::drivers::line_buffer`]):
+//! only complete lines reach the port input queue, a line longer than the maximum is
+//! split, and a trailing partial line is released on EOF/`stop`.
+//!
+//! Output is **not** line-framed: in the emulator the line flag
+//! (`ERTS_PORT_SFLG_LINEBUF_IO`) affects how a port *delivers* input to its owner, not how
+//! it accepts output, so [`Driver::output`] stays a raw byte-stream drain.
+//!
+//! # Control handshake
+//!
+//! [`Driver::control`] accepts a UTF-8 command string plus raw argument bytes:
+//!
+//! | command | argument | effect |
+//! |---|---|---|
+//! | `line` | optional decimal max line length | enable line buffering (text phase) |
+//! | `noline` | — | disable line buffering (binary phase) |
+//! | `binary` | — | switch to the raw binary phase |
+//! | `text` | — | switch to the line-framed text phase |
+//! | `getopts` | — | reply `line,<N>` in the text phase, `binary` otherwise |
+//!
+//! An unknown command is rejected with [`beam_common::BeamError::BadArg`].
+//!
 //! All raw syscalls (`read`/`write`/`pipe`/`fcntl`/`close`) live in this module; every
 //! `unsafe` block carries a `// SAFETY:` rationale.
 
@@ -25,6 +53,7 @@ use std::os::unix::io::RawFd;
 use beam_common::Result;
 
 use crate::driver::{Driver, DriverContext};
+use crate::drivers::binary_io::{Phase, PhaseChange};
 use crate::error;
 use crate::poller::{Interest, Token};
 
@@ -45,6 +74,8 @@ pub struct FdDriver {
     out_token: Option<Token>,
     /// Set once the read fd reported end-of-file, so no further reads are attempted.
     read_eof: bool,
+    /// The input framing phase (defaults to raw binary pass-through).
+    phase: PhaseChange,
 }
 
 impl FdDriver {
@@ -80,6 +111,12 @@ impl FdDriver {
         FdDriver::from_fds(None, Some(fd))
     }
 
+    /// A driver owning no fds, used by the [`crate::drivers::EfileDriver`] unopened state
+    /// (and by tests exercising the inert paths).
+    pub(crate) fn inert() -> FdDriver {
+        FdDriver::from_fds(None, None)
+    }
+
     /// The shared constructor: the driver takes ownership of every fd it is handed.
     fn from_fds(read_fd: Option<RawFd>, write_fd: Option<RawFd>) -> FdDriver {
         FdDriver {
@@ -89,6 +126,131 @@ impl FdDriver {
             in_token: None,
             out_token: None,
             read_eof: false,
+            phase: PhaseChange::new(),
+        }
+    }
+
+    /// Enables line-buffered (text-phase) input delivery with `max_len` as the maximum
+    /// line length in bytes (`0` = no length limit).
+    ///
+    /// Builder form of [`FdDriver::set_line_mode`]; the default behaviour of a freshly
+    /// constructed driver is raw byte pass-through and is unchanged.
+    pub fn with_line_mode(mut self, max_len: usize) -> FdDriver {
+        self.set_line_mode(max_len);
+        self
+    }
+
+    /// Enables line-buffered (text-phase) input delivery with `max_len` as the maximum
+    /// line length in bytes (`0` = no length limit).
+    ///
+    /// Only complete lines reach the port input queue; a line longer than `max_len` is
+    /// split and any trailing partial line is released on EOF/`stop`.
+    pub fn set_line_mode(&mut self, max_len: usize) {
+        self.phase.set_max_line_len(max_len);
+        self.phase.to_text();
+    }
+
+    /// Disables line buffering, restoring raw byte pass-through (the binary phase).
+    pub fn set_binary_mode(&mut self) {
+        self.phase.to_binary();
+    }
+
+    /// Whether line-buffered (text-phase) input delivery is active.
+    pub fn is_line_buffered(&self) -> bool {
+        self.phase.current().is_text()
+    }
+
+    /// The input framing phase.
+    pub fn phase(&self) -> Phase {
+        self.phase.current()
+    }
+
+    /// Sets the input framing phase.
+    pub fn set_phase(&mut self, phase: Phase) {
+        self.phase.set(phase);
+    }
+
+    /// The maximum line length used in the text/line phase (`0` = unlimited).
+    pub fn max_line_len(&self) -> usize {
+        self.phase.max_line_len()
+    }
+
+    /// Sets the maximum line length (`0` = unlimited); the phase is not changed.
+    pub fn set_max_line_len(&mut self, max_len: usize) {
+        self.phase.set_max_line_len(max_len);
+    }
+
+    /// The number of input bytes held back from the port input queue by line framing.
+    pub fn pending_input(&self) -> usize {
+        self.phase.pending()
+    }
+
+    /// The reply bytes of the `getopts` control command.
+    ///
+    /// The documented format is `line,<N>` in the text/line phase (`<N>` being the
+    /// decimal maximum line length) and `binary` in the raw binary phase.
+    fn options_reply(&self) -> Vec<u8> {
+        match self.phase.current() {
+            Phase::Text => format!("line,{}", self.phase.max_line_len()).into_bytes(),
+            Phase::Binary => Phase::Binary.as_str().as_bytes().to_vec(),
+        }
+    }
+
+    /// Whether a read fd is currently attached.
+    pub(crate) fn has_read_fd(&self) -> bool {
+        self.read_fd.is_some()
+    }
+
+    /// Whether the read fd has reported end-of-file (after which [`Driver::ready_input`]
+    /// is a no-op).
+    pub fn eof(&self) -> bool {
+        self.read_eof
+    }
+
+    /// Attaches and registers a read fd opened after [`Driver::start`] (the `efile`
+    /// `open` path).
+    ///
+    /// The fd is put into non-blocking mode and registered [`Interest::READABLE`] under
+    /// this port's key.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`beam_common::BeamError::BadArg`] when a read fd is already attached, or
+    /// whatever `fcntl`/registration returns.
+    pub(crate) fn adopt_read_fd(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        fd: RawFd,
+    ) -> Result<()> {
+        if self.read_fd.is_some() {
+            return Err(error::badarg());
+        }
+        set_nonblocking(fd)?;
+        self.in_token = Some(ctx.register(fd, Interest::READABLE)?);
+        self.read_fd = Some(fd);
+        self.read_eof = false;
+        Ok(())
+    }
+
+    /// Deregisters and closes the attached read fd, if any (the `efile` `close` path).
+    ///
+    /// A deregistration failure is reported but the fd is closed either way.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::Io` when the poller rejects the deregistration.
+    pub(crate) fn release_read_fd(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        self.read_eof = false;
+        let token = self.in_token.take();
+        match (token, self.read_fd.take()) {
+            (Some(token), Some(fd)) => {
+                let result = ctx.deregister(fd, token);
+                // SAFETY: `fd` is owned by this driver and has just been removed from the
+                // struct, so it is closed exactly once.
+                let _ = unsafe { libc::close(fd) };
+                result
+            }
+            _ => Ok(()),
         }
     }
 
@@ -167,6 +329,28 @@ impl FdDriver {
         Ok(written)
     }
 
+    /// Hands `data`, freshly read from the fd, up through the current input phase:
+    /// binary mode appends it to the port input queue unchanged, text mode frames it into
+    /// complete lines (holding back a trailing partial line).
+    fn deliver_input(&mut self, ctx: &mut DriverContext<'_>, data: &[u8]) {
+        match self.phase.current() {
+            Phase::Binary => ctx.input().push(data),
+            Phase::Text => {
+                for frame in self.phase.handle(data) {
+                    ctx.input().push(&frame);
+                }
+            }
+        }
+    }
+
+    /// Releases any input held back by text-phase framing (a trailing partial line) into
+    /// the port input queue. A no-op in the binary phase.
+    fn flush_input(&mut self, ctx: &mut DriverContext<'_>) {
+        for frame in self.phase.flush() {
+            ctx.input().push(&frame);
+        }
+    }
+
     /// Closes every fd still owned by the driver.
     ///
     /// Each field is `take()`n first, so this is idempotent: `stop` and `Drop` can never
@@ -212,6 +396,8 @@ impl Driver for FdDriver {
     fn ready_input(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         let fd = self.read_fd.ok_or_else(error::badarg)?;
         if self.read_eof {
+            // End of file was already observed: further read readiness is a no-op (the
+            // poller may still report the fd, e.g. on a lingering `EPOLLHUP`).
             return Ok(());
         }
         let mut buf = [0u8; READ_CHUNK];
@@ -221,12 +407,14 @@ impl Driver for FdDriver {
             // most `READ_CHUNK` bytes into it.
             let n = unsafe { libc::read(fd, buf.as_mut_ptr().cast(), READ_CHUNK) };
             if n > 0 {
-                ctx.input().push(&buf[..n as usize]);
+                self.deliver_input(ctx, &buf[..n as usize]);
                 // Edge-triggered readiness: keep reading until the fd is empty.
                 continue;
             }
             if n == 0 {
-                // End of file: nothing more will ever arrive on this fd.
+                // End of file: release any trailing partial line and latch EOF so no
+                // further reads are attempted on this fd.
+                self.flush_input(ctx);
                 self.read_eof = true;
                 return Ok(());
             }
@@ -244,7 +432,39 @@ impl Driver for FdDriver {
         self.write_pending(ctx)
     }
 
+    fn control(
+        &mut self,
+        _ctx: &mut DriverContext<'_>,
+        command: &str,
+        arg: &[u8],
+    ) -> Result<Vec<u8>> {
+        match command {
+            "line" => {
+                if arg.is_empty() {
+                    // Keep the currently configured limit.
+                    self.set_line_mode(self.phase.max_line_len());
+                } else {
+                    let max_len = parse_line_len(arg)?;
+                    self.set_line_mode(max_len);
+                }
+                Ok(Vec::new())
+            }
+            "noline" | "binary" => {
+                self.set_binary_mode();
+                Ok(Vec::new())
+            }
+            "text" => {
+                self.phase.to_text();
+                Ok(Vec::new())
+            }
+            "getopts" => Ok(self.options_reply()),
+            _ => Err(error::badarg()),
+        }
+    }
+
     fn stop(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        // Release anything still held by text-phase framing before the fds go away.
+        self.flush_input(ctx);
         let in_result = match (self.in_token.take(), self.read_fd) {
             (Some(token), Some(fd)) => ctx.deregister(fd, token),
             _ => Ok(()),
@@ -285,9 +505,26 @@ fn set_nonblocking(fd: RawFd) -> Result<()> {
     Ok(())
 }
 
+/// Parses the `line` command's optional maximum-length argument.
+///
+/// The argument is a decimal byte count, optionally prefixed with `line,` so that the
+/// [`FdDriver::options_reply`] of `getopts` (`line,<N>`) can be fed straight back in.
+///
+/// # Errors
+///
+/// Returns [`beam_common::BeamError::BadArg`] when the argument is not valid UTF-8 or not
+/// a decimal number.
+fn parse_line_len(arg: &[u8]) -> Result<usize> {
+    let text = std::str::from_utf8(arg).map_err(|_| error::badarg())?;
+    let trimmed = text.trim();
+    let digits = trimmed.strip_prefix("line,").unwrap_or(trimmed).trim();
+    digits.parse::<usize>().map_err(|_| error::badarg())
+}
+
 #[cfg(test)]
 mod tests {
     use super::FdDriver;
+    use crate::drivers::Phase;
     use crate::poller::Poller;
     use crate::port::{PortRegistry, PortState};
     use beam_common::BeamError;
@@ -516,5 +753,270 @@ mod tests {
                 "fd {fd} is closed"
             );
         }
+    }
+
+    #[test]
+    fn phase_and_line_mode_accessors_track_the_configuration() {
+        let mut driver = FdDriver::inert();
+        // A fresh driver is in the raw binary phase, so nothing is framed.
+        assert_eq!(driver.phase(), Phase::Binary);
+        assert!(!driver.is_line_buffered());
+        assert_eq!(driver.pending_input(), 0);
+
+        driver.set_line_mode(8);
+        assert_eq!(driver.phase(), Phase::Text);
+        assert!(driver.is_line_buffered());
+        assert_eq!(driver.max_line_len(), 8);
+
+        // Changing the limit does not change the phase.
+        driver.set_max_line_len(4);
+        assert_eq!(driver.max_line_len(), 4);
+        assert_eq!(driver.phase(), Phase::Text);
+
+        driver.set_phase(Phase::Binary);
+        assert_eq!(driver.phase(), Phase::Binary);
+        assert!(!driver.is_line_buffered());
+        driver.set_phase(Phase::Text);
+        assert_eq!(driver.phase(), Phase::Text);
+
+        driver.set_binary_mode();
+        assert_eq!(driver.phase(), Phase::Binary);
+
+        // The builder form is equivalent to `set_line_mode`.
+        let built = FdDriver::pipe().expect("a pipe").with_line_mode(16);
+        assert!(built.is_line_buffered());
+        assert_eq!(built.max_line_len(), 16);
+    }
+
+    #[test]
+    fn the_control_family_toggles_line_and_phase() {
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(&mut poller, Box::new(FdDriver::inert()))
+            .expect("the port starts");
+
+        let opts = |registry: &mut PortRegistry, poller: &mut Poller| -> Vec<u8> {
+            registry
+                .get_mut(id)
+                .expect("live")
+                .control(poller, "getopts", b"")
+                .expect("getopts")
+        };
+        let ctl = |registry: &mut PortRegistry,
+                   poller: &mut Poller,
+                   cmd: &str,
+                   arg: &[u8]|
+         -> beam_common::Result<Vec<u8>> {
+            registry
+                .get_mut(id)
+                .expect("live")
+                .control(poller, cmd, arg)
+        };
+
+        // Default: raw binary phase.
+        assert_eq!(opts(&mut registry, &mut poller), b"binary");
+
+        // `line` with no argument keeps the default limit.
+        assert!(ctl(&mut registry, &mut poller, "line", b"").expect("line").is_empty());
+        assert_eq!(opts(&mut registry, &mut poller), b"line,1024");
+
+        // `line,<N>` (the getopts reply shape) round-trips.
+        ctl(&mut registry, &mut poller, "line", b"line,512").expect("line,512");
+        assert_eq!(opts(&mut registry, &mut poller), b"line,512");
+        ctl(&mut registry, &mut poller, "line", b"32").expect("line 32");
+        assert_eq!(opts(&mut registry, &mut poller), b"line,32");
+
+        // `text` keeps the limit but switches phase; `noline`/`binary` reset to binary.
+        ctl(&mut registry, &mut poller, "text", b"").expect("text");
+        assert_eq!(opts(&mut registry, &mut poller), b"line,32");
+        ctl(&mut registry, &mut poller, "noline", b"").expect("noline");
+        assert_eq!(opts(&mut registry, &mut poller), b"binary");
+        ctl(&mut registry, &mut poller, "text", b"").expect("text");
+        ctl(&mut registry, &mut poller, "binary", b"").expect("binary");
+        assert_eq!(opts(&mut registry, &mut poller), b"binary");
+
+        // A malformed length argument and an unknown command are both rejected without
+        // changing the options.
+        assert!(matches!(
+            ctl(&mut registry, &mut poller, "line", b"not-a-number"),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            ctl(&mut registry, &mut poller, "bogus", b""),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(opts(&mut registry, &mut poller), b"binary");
+
+        registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn line_mode_delivers_only_complete_lines() {
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(
+                &mut poller,
+                Box::new(FdDriver::pipe().expect("a pipe").with_line_mode(1024)),
+            )
+            .expect("the port starts");
+
+        // "one\ntw": only the complete first line may cross the port boundary.
+        assert_eq!(
+            registry
+                .output(&mut poller, id, b"one\ntw")
+                .expect("writes"),
+            6
+        );
+        let events = poller
+            .poll(Some(Duration::from_millis(200)))
+            .expect("poll succeeds");
+        registry
+            .handle_events(&mut poller, &events)
+            .expect("events dispatch");
+        assert_eq!(
+            registry.get_mut(id).expect("live").drain_input(),
+            b"one",
+            "the partial second line is held back"
+        );
+        assert!(registry
+            .get_mut(id)
+            .expect("live")
+            .drain_input()
+            .is_empty());
+
+        // Completing the second line releases it.
+        assert_eq!(
+            registry
+                .output(&mut poller, id, b"o\n")
+                .expect("writes"),
+            2
+        );
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 3),
+            b"two"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn turning_line_mode_off_restores_raw_pass_through() {
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(&mut poller, Box::new(FdDriver::pipe().expect("a pipe")))
+            .expect("the port starts");
+
+        // Enable line mode, then disable it through control: input must pass through
+        // unframed again.
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "line", b"")
+            .expect("line");
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "binary", b"")
+            .expect("binary");
+
+        assert_eq!(
+            registry
+                .output(&mut poller, id, b"a\nb")
+                .expect("writes"),
+            3
+        );
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 3),
+            b"a\nb",
+            "the raw bytes arrive unmodified"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn line_mode_flushes_a_partial_line_at_eof() {
+        let (peer, read_end) = UnixStream::pair().expect("socketpair");
+        // SAFETY: `read_end.as_raw_fd()` names an open descriptor of a live stream.
+        let fd = unsafe { libc::dup(read_end.as_raw_fd()) };
+        assert!(fd >= 0, "dup(2) succeeded");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(
+                &mut poller,
+                Box::new(FdDriver::read_only(fd).with_line_mode(1024)),
+            )
+            .expect("the port starts");
+
+        let mut writer = &peer;
+        writer
+            .write_all(b"complete\npartial")
+            .expect("writes");
+
+        // The complete line is delivered; the trailing partial one is still buffered.
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 8),
+            b"complete"
+        );
+
+        // Closing the peer delivers EOF, which flushes the partial line.
+        drop(peer);
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 7),
+            b"partial",
+            "EOF flushes the trailing partial line"
+        );
+
+        registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn eof_after_the_peer_closes_delivers_pending_bytes_then_stays_quiet() {
+        let (peer, read_end) = UnixStream::pair().expect("socketpair");
+        // SAFETY: `read_end.as_raw_fd()` names an open descriptor of a live stream.
+        let fd = unsafe { libc::dup(read_end.as_raw_fd()) };
+        assert!(fd >= 0, "dup(2) succeeded");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(&mut poller, Box::new(FdDriver::read_only(fd)))
+            .expect("the port starts");
+
+        // Write and then close the peer: the bytes and the EOF become ready together.
+        let mut writer = &peer;
+        writer.write_all(b"tail").expect("writes");
+        drop(peer);
+
+        assert_eq!(
+            pump_until_input(&mut poller, &mut registry, id, 4),
+            b"tail",
+            "bytes written before the close are delivered"
+        );
+
+        // A further read after the latched EOF must neither error nor add bytes.
+        let before = registry.get(id).expect("live").input_len();
+        registry
+            .get_mut(id)
+            .expect("live")
+            .ready_input(&mut poller)
+            .expect("a post-EOF ready_input is not an error");
+        assert_eq!(
+            registry.get(id).expect("live").input_len(),
+            before,
+            "nothing new arrives after EOF"
+        );
+        assert!(registry
+            .get_mut(id)
+            .expect("live")
+            .drain_input()
+            .is_empty());
+
+        registry.close(&mut poller, id).expect("closes");
     }
 }
