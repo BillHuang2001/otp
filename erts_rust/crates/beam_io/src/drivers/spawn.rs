@@ -262,8 +262,9 @@ fn program_command(argv: &[String]) -> Result<Command> {
 /// handed to [`crate::PortRegistry::open`], which runs [`Driver::start`] and thereby
 /// registers the child's stdout with the poller.
 ///
-/// The driver is single-threaded like the port that owns it: it holds a
-/// [`std::process::Child`] and raw descriptors, and it takes no locks.
+/// The driver takes no locks and adds no `Send`/`Sync` bound, so once it is boxed into a
+/// [`crate::Port`] it stays on that port's **single OS thread** (the same invariant the other
+/// drivers carry; see the crate docs).
 pub struct SpawnDriver {
     /// The port "name" string (the shell command line, the argv join, or `fd:<N>`).
     command: String,
