@@ -224,10 +224,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   polling-backed: `beam_rt` keeps the child's stdout, registers its fd with `beam_io`'s poller, reads it
   and delivers `{Port,{data,Data}}` to the owning process (driven from the `-eval` `receive … after T`
   path); `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
-  `total=333 agree=325 mismatch=0 unsupported=8`** (re-measured at this node's HEAD; the corpus grew
-  from 285 to 333 cases since the earlier note). The 8 `unsupported` are all `beam_rt` capability gaps —
-  `driver/port_command_write_read` (`port_command/2`), the two `wire/*` fun-encode cases
-  (`local_fun`), and the five `boot/*` `spawn`/`spawn_link` cases — and **no case disagrees**
+  `total=333 agree=332 mismatch=0 unsupported=1 skipped=0`** (re-measured at this node's HEAD). The 1
+  `unsupported` is `wire/new_fun_ext_encode` (`beam_rt`'s `local_fun` gap); **no case disagrees**
   (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
