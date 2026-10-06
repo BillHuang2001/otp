@@ -39,3 +39,19 @@ pub fn unknown_label(label: beam_loader::Label) -> BeamError {
     let _ = label;
     BeamError::BadArg
 }
+
+/// The typed error a **non-blocking** run surfaces when a `receive` finds no
+/// message available.
+///
+/// The blocking-aware entries ([`crate::Machine::run_export_outcome`]/
+/// [`crate::Machine::run_label_outcome`]) report the suspension as a
+/// [`crate::RunOutcome::Wait`] instead; the plain [`crate::Machine::run_export`]/
+/// [`crate::Machine::run_label`] fold that outcome into this error, because a
+/// non-blocking entry cannot suspend and must never invent a result.
+///
+/// Like every other engine diagnostic it is a [`BeamError::Raise`] whose reason
+/// atom reads `unsupported_opcode: run: process blocked (no message available)`;
+/// this constructor is the **single definition** of that string.
+pub fn blocked() -> BeamError {
+    unsupported("run: process blocked (no message available)")
+}

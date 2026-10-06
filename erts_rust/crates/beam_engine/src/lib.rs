@@ -28,10 +28,16 @@
 //!
 //! The engine depends only on `beam_loader` (+ `beam_term`/`beam_common`) — never
 //! on the Stage-5 runtime core. Everything the runtime must supply (BIF dispatch,
-//! heap/GC, process/stack limits) is abstracted behind the
+//! heap/GC, process/stack limits, the mailbox) is abstracted behind the
 //! [`ExecutionContext`] trait; `beam_rt` provides the concrete implementation.
 //! This keeps the Stage-1/Stage-5 DAG acyclic and lets the engine be tested with a
 //! minimal context.
+//!
+//! A `receive` that finds no message available **suspends** the process: the
+//! blocking-aware entries ([`Machine::run_export_outcome`]/
+//! [`Machine::resume_outcome`]) report it as [`RunOutcome::Wait`], while the plain
+//! [`Machine::run_export`]/[`Machine::run_label`] (and the native JIT tiers) fold
+//! it into the typed [`error::blocked`] error.
 //!
 //! ## Status
 //!
@@ -70,19 +76,20 @@ mod predicates;
 mod step;
 #[allow(unsafe_code)]
 pub mod terms;
-pub use context::{ExecutionContext, MinimalContext};
-pub use error::{bad_register, unknown_label, unsupported};
+pub use context::{ExecutionContext, Mailbox, MinimalContext};
+pub use error::{bad_register, blocked, unknown_label, unsupported};
 pub use jit::{available_tiers, JitBackend, Tier, TierPolicy};
-pub use machine::{CatchFrame, Machine, MAX_REGISTER};
+pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
 ///
-/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam, the
-/// [`Machine`] core (with its register-file bound [`MAX_REGISTER`]) and the
+/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam and the
+/// mailbox seam [`Mailbox`], the [`Machine`] core (with its register-file bound
+/// [`MAX_REGISTER`] and the blocking-aware run outcome [`RunOutcome`]) and the
 /// execution-tier selector [`Tier`] (for [`Machine::run_with_tier`]) into scope.
 pub mod prelude {
-    pub use crate::context::{ExecutionContext, MinimalContext};
+    pub use crate::context::{ExecutionContext, Mailbox, MinimalContext};
     pub use crate::jit::Tier;
-    pub use crate::machine::{Machine, MAX_REGISTER};
+    pub use crate::machine::{Machine, RunOutcome, MAX_REGISTER};
 }

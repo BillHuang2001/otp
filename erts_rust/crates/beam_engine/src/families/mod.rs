@@ -19,18 +19,19 @@
 //! Family ownership (per `../beam_loader/CONTEXT.md`, "The instruction
 //! vocabulary"):
 //! - [`tuples`] — `PutTuple2`/`GetTupleElement`/`SelectTupleArity`
+//! - [`records`] — `UpdateRecord`
 //! - [`lists`] — `PutList`/`GetList`/`GetHd`/`GetTl`
 //! - [`funs`] — `MakeFun3`/`CallFun`/`CallFun2`/`Apply`/`ApplyLast`
 //! - [`exceptions`] — `Badmatch`/`CaseEnd`/`IfEnd`/`Raise`/`Try`/`Catch`/`TryCase`/`TryEnd`/`TryCaseEnd`/`CatchEnd`/`Badrecord`/`BuildStacktrace`/`RawRaise`
 //! - [`floats`] — `Fmove`/`Fconv`/`Fadd`/`Fsub`/`Fmul`/`Fdiv`/`Fnegate`
 //! - [`maps`] — `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact`
-//! - [`records`] — `UpdateRecord`
 //! - [`bitstrings`] — the `Bs*` family
+//! - [`receive`] — `Send`/`LoopRec`/`LoopRecEnd`/`Wait`/`WaitTimeout`/`Timeout`/`RemoveMessage`/`RecvMarkerReserve`/`RecvMarkerBind`/`RecvMarkerUse`/`RecvMarkerClear`
 //!
 //! Variants owned by **no** family (`Bif0`/`Bif`, `Jump`, `InitYregs`,
-//! the receive/message opcodes, the debug-line opcodes) are not claimed by any
-//! submodule, so [`dispatch`] reports them as unsupported exactly as before —
-//! naming the instruction when [`instr_name`] knows its `ops.tab` spelling.
+//! the debug-line opcodes) are not claimed by any submodule, so [`dispatch`]
+//! reports them as unsupported exactly as before — naming the instruction when
+//! [`instr_name`] knows its `ops.tab` spelling.
 //! (`NifStart`/`OnLoad` never reach [`dispatch`]: the interpreter executes them
 //! as no-ops in its metadata arm, and the residual `Instr::Generic` opcodes are
 //! handled by `crate::generic` before the catch-all arm too.)
@@ -58,6 +59,7 @@ mod floats;
 mod funs;
 mod lists;
 mod maps;
+mod receive;
 mod records;
 mod tuples;
 
@@ -69,8 +71,8 @@ mod tuples;
 /// `unsupported("<UNCLAIMED_PREFIX>: <name>")` error,
 /// whose prefix is byte-identical to the message the interpreter emitted before
 /// this seam existed and whose `<name>` is [`instr_name`]'s `ops.tab` spelling of
-/// the offending instruction (so e.g. an unclaimed `recv_marker_reserve` is
-/// diagnosable from the error alone).
+/// the offending instruction (so the unresolvable variant is diagnosable from the
+/// error alone).
 pub(crate) fn dispatch(
     machine: &mut Machine,
     module: &Module,
@@ -104,6 +106,9 @@ pub(crate) fn dispatch(
     if let Some(step) = bitstrings::exec(machine, module, labels, instr, func, pc, ctx)? {
         return Ok(step);
     }
+    if let Some(step) = receive::exec(machine, module, labels, instr, func, pc, ctx)? {
+        return Ok(step);
+    }
     Err(error::unsupported(&format!(
         "{UNCLAIMED_PREFIX}: {}",
         instr_name(instr)
@@ -115,27 +120,14 @@ pub(crate) fn dispatch(
 /// [`beam_loader::Instr`] carries no name (unlike [`beam_loader::Opcode::name`],
 /// which the residual [`Instr::Generic`] path already uses in `crate::generic`),
 /// so the spelling is mapped here for the variants the interpreter can actually
-/// reach the sentinel with: the **receive/message family** (the one unclaimed
-/// family the standard compiler emits for real modules — it needs the Stage-5
-/// mailbox) and the metadata/`bif` variants the core loop executes but a family
-/// never claims. Anything else reports the generic `"instruction"`.
+/// reach the sentinel with: the metadata/`bif` variants the core loop executes but
+/// a family never claims. Anything else reports the generic `"instruction"`.
 ///
 /// The spellings are the `ops.tab` opcode names (`../../erts/emulator/beam/emu/ops.tab`),
 /// i.e. exactly what `beam_disasm` prints, so an operator can search the compiler
 /// output for it.
 fn instr_name(instr: &Instr) -> &'static str {
     match instr {
-        Instr::Send => "send",
-        Instr::LoopRec { .. } => "loop_rec",
-        Instr::LoopRecEnd { .. } => "loop_rec_end",
-        Instr::Wait { .. } => "wait",
-        Instr::WaitTimeout { .. } => "wait_timeout",
-        Instr::Timeout => "timeout",
-        Instr::RemoveMessage => "remove_message",
-        Instr::RecvMarkerReserve { .. } => "recv_marker_reserve",
-        Instr::RecvMarkerBind { .. } => "recv_marker_bind",
-        Instr::RecvMarkerClear { .. } => "recv_marker_clear",
-        Instr::RecvMarkerUse { .. } => "recv_marker_use",
         Instr::Bif0 { .. } => "bif0",
         Instr::Bif { .. } => "bif",
         Instr::InitYregs { .. } => "init_yregs",
@@ -149,7 +141,9 @@ fn instr_name(instr: &Instr) -> &'static str {
 mod tests {
     //! The diagnostics contract of the family seam: an unclaimed instruction must
     //! name itself in the error (the objective of this module's `instr_name`), and
-    //! the long-standing sentinel prefix must stay byte-identical.
+    //! the long-standing sentinel prefix must stay byte-identical. The receive
+    //! family's tests are the converse: a variant `families::receive` owns must
+    //! **never** reach the sentinel again.
 
     use beam_loader::{Atom, ImportRef, Opcode, Operand, NO_FAIL};
 
@@ -180,6 +174,34 @@ mod tests {
         }
     }
 
+    /// Dispatch `instr` through the real seam with `labels`, returning whatever it
+    /// produced: the claiming family's [`Step`], or a typed error.
+    ///
+    /// Unlike [`dispatch_error`] this does not require the sentinel — it is how the
+    /// "the receive family claims this variant now" tests observe the family's own
+    /// decision.
+    fn dispatch_step(
+        instr: &Instr,
+        labels: &BTreeMap<Label, (u32, u32)>,
+    ) -> beam_common::Result<Step> {
+        let module = Module::default();
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::new();
+        dispatch(&mut machine, &module, labels, instr, 0, 0, &mut ctx)
+    }
+
+    /// The `unsupported_opcode: <name>` reason of a typed error.
+    fn error_reason(result: beam_common::Result<Step>) -> String {
+        match result.expect_err("expected a typed error") {
+            beam_common::BeamError::Raise(raise) => raise
+                .reason
+                .as_atom()
+                .expect("the reason is an atom")
+                .to_string(),
+            other => panic!("expected a typed raise, got {other:?}"),
+        }
+    }
+
     #[test]
     fn the_prefix_is_unchanged() {
         // The sentinel callers (and the differential harness) match on is frozen.
@@ -187,81 +209,93 @@ mod tests {
     }
 
     #[test]
-    fn the_unclaimed_receive_marker_opcodes_are_named() {
+    fn the_receive_marker_opcodes_are_claimed_by_the_receive_family() {
         // The four `recv_marker_*` opcodes are what a real `.beam` (e.g. kernel
-        // `code.beam`) hits first; before this change the error was the bare
-        // sentinel, so the failure was undiagnosable.
+        // `code.beam`) hits first. They used to fall through to the unclaimed
+        // sentinel; [`super::receive`] owns them now, so `dispatch` reports that
+        // family's own error — here the receive seam's typed `unsupported`, since
+        // the bare `MinimalContext` below has no mailbox installed.
+        let labels = BTreeMap::new();
         let cases: [(Instr, &str); 4] = [
             (
                 Instr::RecvMarkerReserve {
                     marker: Operand::X(0),
                 },
-                "recv_marker_reserve",
+                "receive_marker_reserve",
             ),
             (
                 Instr::RecvMarkerBind {
                     marker: Operand::X(0),
                     reference: Operand::X(1),
                 },
-                "recv_marker_bind",
+                "receive_marker_bind",
             ),
             (
                 Instr::RecvMarkerClear {
                     reference: Operand::X(1),
                 },
-                "recv_marker_clear",
+                "receive_marker_clear",
             ),
             (
                 Instr::RecvMarkerUse {
                     reference: Operand::X(1),
                 },
-                "recv_marker_use",
+                "receive_marker_use",
             ),
         ];
-        for (instr, name) in cases {
-            let reason = dispatch_reason(&instr);
-            assert_eq!(
-                reason,
-                format!("unsupported_opcode: {UNCLAIMED_PREFIX}: {name}")
-            );
+        for (instr, method) in cases {
+            let reason = error_reason(dispatch_step(&instr, &labels));
+            assert_eq!(reason, format!("unsupported_opcode: {method}"));
             assert!(
-                reason.contains(UNCLAIMED_PREFIX),
-                "the frozen prefix is kept for {name}"
+                !reason.contains(UNCLAIMED_PREFIX),
+                "{method} is claimed, so the unclaimed sentinel must be gone"
             );
-            assert_eq!(instr_name(&instr), name);
         }
     }
 
     #[test]
-    fn the_rest_of_the_unclaimed_receive_family_is_named() {
-        let cases: [(Instr, &str); 7] = [
-            (Instr::Send, "send"),
+    fn the_rest_of_the_receive_family_is_claimed_too() {
+        // `loop_rec`/`loop_rec_end` jump through module labels, so give them one.
+        let labels = BTreeMap::from([(Label(3), (0u32, 3u32)), (Label(4), (0u32, 4u32))]);
+
+        // The send/mailbox opcodes reach the receive seam, whose typed
+        // `unsupported` names the method (no mailbox is installed here).
+        let cases: [(Instr, &str); 5] = [
+            (Instr::Send, "send_message"),
             (
                 Instr::LoopRec {
-                    fail: NO_FAIL,
+                    fail: Label(4),
                     dst: Operand::X(0),
                 },
-                "loop_rec",
+                "receive_next",
             ),
-            (Instr::LoopRecEnd { target: Label(1) }, "loop_rec_end"),
-            (Instr::Wait { target: Label(1) }, "wait"),
-            (
-                Instr::WaitTimeout {
-                    target: Label(1),
+            (Instr::LoopRecEnd { target: Label(3) }, "receive_skip"),
+            (Instr::Timeout, "receive_reset"),
+            (Instr::RemoveMessage, "receive_remove"),
+        ];
+        for (instr, method) in cases {
+            let reason = error_reason(dispatch_step(&instr, &labels));
+            assert_eq!(reason, format!("unsupported_opcode: {method}"));
+            assert!(!reason.contains(UNCLAIMED_PREFIX));
+        }
+
+        // `wait`/`wait_timeout` need no mailbox at all: they execute and report the
+        // suspension (or the zero-timeout fall-through) the driver acts on.
+        assert_eq!(
+            dispatch_step(&Instr::Wait { target: Label(3) }, &labels).unwrap(),
+            Step::Wait { func: 0, pc: 3 }
+        );
+        assert_eq!(
+            dispatch_step(
+                &Instr::WaitTimeout {
+                    target: Label(3),
                     time: Operand::Integer(0),
                 },
-                "wait_timeout",
-            ),
-            (Instr::Timeout, "timeout"),
-            (Instr::RemoveMessage, "remove_message"),
-        ];
-        for (instr, name) in cases {
-            assert_eq!(instr_name(&instr), name);
-            assert_eq!(
-                dispatch_reason(&instr),
-                format!("unsupported_opcode: {UNCLAIMED_PREFIX}: {name}")
-            );
-        }
+                &labels
+            )
+            .unwrap(),
+            Step::Goto { func: 0, pc: 1 }
+        );
     }
 
     #[test]

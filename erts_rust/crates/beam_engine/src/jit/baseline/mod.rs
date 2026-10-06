@@ -419,6 +419,12 @@ pub(crate) fn run_native(
                 func = next_func;
                 pc = next_pc;
             }
+            // A native tier is a **non-blocking** entry: it cannot suspend the
+            // process, so a `receive` that finds no message is reported as the same
+            // typed error the interpreter's `run_export` reports for that outcome
+            // (`run_export` folds `RunOutcome::Wait` the same way) — never a wrong
+            // result and never a silent continue.
+            Step::Wait { .. } => return Err(crate::error::blocked()),
             Step::Done => {
                 // SAFETY: `machine_ptr` points at the live driver-owned `Machine`.
                 return unsafe { (*machine_ptr).finish() };
