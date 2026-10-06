@@ -34,7 +34,7 @@
 //! | `float_ops/2` | `gc_bif '+'\''-'\''*'` via helper | `Next` |
 //! | `map_ops/2` | `put_map_*`/`get_map_elements` via helper | helper `Goto` |
 //! | `module_info/0,1` | `call_ext_only` via helper | `Done` |
-//! | `bits/1` | match side via helper | typed error (append segment) |
+//! | `bits/1` | match side + `bs_create_bin` append via helper | helper `Goto`/`Next` |
 
 use beam_common::{BeamError, Result};
 use beam_engine::{available_tiers, terms, Machine, MinimalContext, Tier};
@@ -174,35 +174,6 @@ fn agree(ctx: &mut MinimalContext, module: &Module, name: &str, args: &[Eterm]) 
         assert!(
             beam_term::cmp(got, interpreted, &module.atom_table).is_eq(),
             "{name}/{} differs on {}: {got:?} vs {interpreted:?}",
-            args.len(),
-            tier.name()
-        );
-    }
-    interpreted
-}
-
-/// Assert every native tier fails with the **same** typed error and return it.
-fn agree_error(
-    ctx: &mut MinimalContext,
-    module: &Module,
-    name: &str,
-    args: &[Eterm],
-) -> BeamError {
-    let interpreted = run_on_tier(ctx, module, Tier::Interpreter, name, args)
-        .expect_err("the interpreter must fail");
-    for tier in NATIVE_TIERS {
-        let got = match run_on_tier(ctx, module, tier, name, args) {
-            Ok(value) => panic!(
-                "{} {name}/{} unexpectedly produced {value:?}",
-                tier.name(),
-                args.len()
-            ),
-            Err(err) => err,
-        };
-        assert_eq!(
-            format!("{got:?}"),
-            format!("{interpreted:?}"),
-            "{name}/{}: {} disagrees on the typed error",
             args.len(),
             tier.name()
         );
@@ -457,7 +428,7 @@ fn module_info_agrees_across_tiers() {
 }
 
 // ---------------------------------------------------------------------------
-// The supported match path and the unsupported construction path
+// The supported match path and the supported construction path
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -471,19 +442,17 @@ fn the_bitstring_match_path_agrees_across_tiers() {
 }
 
 #[test]
-fn the_unsupported_append_segment_errors_identically_on_both_tiers() {
+fn the_append_segment_agrees_on_both_tiers() {
     let module = load();
     let mut ctx = context();
-    // The clause body builds `<<Rest/binary, H:8>>` via an `append` segment the M1
-    // family does not implement; the helper returns `ERROR` and the driver must
-    // surface the interpreter's exact typed raise.
+    // The clause body builds `<<Rest/binary, H:8>>` via an `append` segment the
+    // bitstring family supports (a copy-rebuild); both tiers must produce the
+    // rotated bytes `<<2,3,1>>` and agree with the interpreter.
     let binary = terms::make_heap_binary(&mut ctx, &[1, 2, 3]).expect("binary");
-    let err = agree_error(&mut ctx, &module, "bits", &[binary]);
-    match err {
-        BeamError::Raise(raise) => assert_eq!(
-            raise.reason.as_atom(),
-            Some("unsupported_opcode: bs_create_bin: segment type append")
-        ),
-        other => panic!("expected the unsupported append raise, got {other:?}"),
-    }
+    let result = agree(&mut ctx, &module, "bits", &[binary]);
+    assert_eq!(
+        terms::binary_bytes(result).expect("a binary"),
+        &[2, 3, 1],
+        "bits/1 rotates the leading byte to the end"
+    );
 }

@@ -47,12 +47,11 @@
 //! `unsupported("operand: literal")` raise (never a substituted term); see the
 //! engine's `src/operand.rs` unit tests.
 //!
-//! `bits/1` is the one remaining gap: its clause body builds `<<Rest/binary, H:8>>`
-//! via `bs_create_bin` with an **`append` segment**, which the M1 bitstring family
-//! does not implement (`unsupported("bs_create_bin: segment type append")`). The
-//! match side (`bs_start_match3`/`bs_match`/`bs_get_position`) does execute, and the
-//! `<<>>` input takes the no-match clause (`bs_set_position`/`bs_get_tail`) and is
-//! fully supported.
+//! `bits/1` builds `<<Rest/binary, H:8>>` via `bs_create_bin` with an **`append`
+//! segment**, which the bitstring family now supports (a copy-rebuild; see
+//! `HANDOFF_bs_init_writable.md`). The match side
+//! (`bs_start_match3`/`bs_match`/`bs_get_position`) also executes, and the `<<>>`
+//! input takes the no-match clause (`bs_set_position`/`bs_get_tail`).
 //!
 //! `safe_div([], B)` documents the family-raise path: `fconv`'s non-numeric source
 //! raises `badarith` **through the catch machinery** (`$BADARITH0` → `next_catch`,
@@ -286,22 +285,6 @@ fn assert_tuple(ctx: &mut CoverageCtx, module: &Module, result: Result<Eterm>, e
     );
 }
 
-/// Assert `result` is the exact engine `unsupported` raise for `what`.
-///
-/// The reason atom is `unsupported_opcode: <what>` (`beam_engine::error::unsupported`).
-fn assert_unsupported(result: Result<Eterm>, what: &str) {
-    let want = format!("unsupported_opcode: {what}");
-    match result {
-        Err(BeamError::Raise(raise)) => assert_eq!(
-            raise.reason.as_atom(),
-            Some(want.as_str()),
-            "unexpected unsupported reason"
-        ),
-        Ok(term) => panic!("expected the unsupported {what:?} raise, got Ok({term:?})"),
-        Err(other) => panic!("expected the unsupported {what:?} raise, got {other:?}"),
-    }
-}
-
 // ---------------------------------------------------------------------------
 // Module inventory
 // ---------------------------------------------------------------------------
@@ -526,27 +509,34 @@ fn float_ops_over_integers_stays_integral() {
 
 #[test]
 fn bits_rotates_the_leading_byte_to_the_end() {
-    // coverage:bits(<<1,2,3>>) = <<2,3,1>> in the oracle. The interpreter runs the
-    // whole match side (`bs_start_match3`, `bs_get_position`, `bs_match`), but the
-    // clause body's `bs_create_bin` uses an **`append` segment** — a
-    // `<<Rest/binary, H:8>>` construction — which the M1 bitstring family does not
-    // implement, so it takes the typed `bs_create_bin` unsupported path.
+    // coverage:bits(<<1,2,3>>) = <<2,3,1>>. The interpreter runs the whole match
+    // side (`bs_start_match3`, `bs_get_position`, `bs_match`) to split off the
+    // leading byte `H = 1` and the tail `Rest = <<2,3>>`, then the clause body's
+    // `bs_create_bin` `<append, Rest/binary, H:8>` segment rebuilds `<<2,3,1>>`.
     let module = load();
     let mut ctx = CoverageCtx::new();
     let arg = terms::make_heap_binary(&mut ctx, &[1, 2, 3]).expect("binary");
-    let result = run(&mut ctx, &module, "bits", &[arg]);
-    assert_unsupported(result, "bs_create_bin: segment type append");
+    let result = run(&mut ctx, &module, "bits", &[arg]).expect("bits(<<1,2,3>>)");
+    assert_eq!(
+        terms::binary_bytes(result).expect("a binary"),
+        &[2, 3, 1],
+        "bits/1 rotates the leading byte to the end"
+    );
 }
 
 #[test]
-fn bits_of_a_single_byte_hits_the_same_append_segment_gap() {
-    // coverage:bits(<<7>>) = <<7>> in the oracle (H = 7, Rest = <<>>); the engine
-    // still fails at the clause body's `bs_create_bin` `append` segment.
+fn bits_of_a_single_byte_is_unchanged() {
+    // coverage:bits(<<7>>) = <<7>> (H = 7, Rest = <<>>): the `append` segment is
+    // seeded with the empty tail and then writes the leading byte back.
     let module = load();
     let mut ctx = CoverageCtx::new();
     let arg = terms::make_heap_binary(&mut ctx, &[7]).expect("binary");
-    let result = run(&mut ctx, &module, "bits", &[arg]);
-    assert_unsupported(result, "bs_create_bin: segment type append");
+    let result = run(&mut ctx, &module, "bits", &[arg]).expect("bits(<<7>>)");
+    assert_eq!(
+        terms::binary_bytes(result).expect("a binary"),
+        &[7],
+        "bits/1 on a single byte leaves it unchanged"
+    );
 }
 
 #[test]
