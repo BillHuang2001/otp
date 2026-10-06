@@ -272,7 +272,7 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - **The `Driver` trait and `DriverContext` public methods are the frozen driver seam** — do not change their
   signatures. New driver capabilities must be additive with defaults that keep the built-in drivers compiling
   unchanged.
-- Files target ~1000 lines, split by responsibility: poller / port / port_task / driver / timer / queue / drivers.
+- Files target ~1000 lines, split by responsibility: poller / port / registry / port_task / driver / timer / queue / drivers.
 - Deps: `beam_common`, `beam_term`, `beam_process`, `libc`, `mio` only. No new deps.
 
 ## Test Strategy
