@@ -44,6 +44,7 @@ impl BifRegistry {
     pub fn with_core_bifs() -> BifRegistry {
         let mut reg = BifRegistry::new();
         crate::arith::register(&mut reg);
+        crate::bool::register(&mut reg);
         crate::compare::register(&mut reg);
         crate::type_test::register(&mut reg);
         crate::term_ops::register(&mut reg);

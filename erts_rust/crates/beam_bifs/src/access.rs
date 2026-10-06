@@ -22,7 +22,8 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_term::prelude::{boxed_val, make_boxed, make_header, make_small, signed_value, try_make_small};
 use beam_term::{
-    Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_FLONUM, HEAP_BITS_SUBTAG, REF_SUBTAG,
+    Eterm, BITSTRING_TAG_MASK, ERL_HEAP_BITS_SIZE, HEADER_ARITY_OFFS, HEADER_FLONUM,
+    HEAP_BITS_SUBTAG, REF_SUBTAG,
 };
 
 // ---------------------------------------------------------------------------
@@ -122,10 +123,36 @@ pub(crate) fn is_function(x: Eterm) -> bool {
     unsafe { beam_term::is_any_fun(x) }
 }
 
-/// `is_record(x)` — a native record.
-// A documented part of the `access.rs` surface reserved for dependents: M1 builds no
-// native records, so no BIF dispatches on it yet.
-#[allow(dead_code)]
+/// `FUN_HEADER_ARITY_OFFS` (`erl_term.h:413`): `_HEADER_ARITY_OFFS + 2`.
+const FUN_HEADER_ARITY_OFFS: u32 = HEADER_ARITY_OFFS + 2;
+
+/// The width of the fun header's `arity`/`environment` fields — `erl_fun.h`'s
+/// "the arity and number of free variables are both limited to 255"
+/// (`erl_term.h:403`).
+const FUN_FIELD_MAX: usize = 0xFF;
+
+/// The `arity` field of a fun term's header, or `None` when `x` is not a fun.
+///
+/// `MAKE_FUN_HEADER(Arity, NumFree, External)` (`erl_term.h:417-424`) packs the
+/// arity at bit `FUN_HEADER_ARITY_OFFS` (8) and the environment size at bit 16,
+/// eight bits each; `TAG_PRIMARY_HEADER` is zero, so the header word is the pure
+/// bit field. `erlang:is_function/2` (`crate::type_test`) is the only caller.
+#[inline]
+pub(crate) fn fun_arity(x: Eterm) -> Option<u32> {
+    if !is_function(x) {
+        return None;
+    }
+    // SAFETY: [`is_function`] (`is_any_fun`) established that `x` is boxed with a
+    // `FUN_SUBTAG` header, so its header word is a live, initialised term word.
+    let header = unsafe { (*boxed_val(x)).raw() };
+    Some(((header >> FUN_HEADER_ARITY_OFFS) & FUN_FIELD_MAX) as u32)
+}
+
+/// `is_record(x)` — a native record (`RECORD_SUBTAG`).
+///
+/// This is the C `is_record` macro (`erl_term.h:437`), **not** a tuple test: a
+/// tuple carries the `ARITYVAL` subtag, so `is_record({a,b})` is `false` — exactly
+/// what `erlang:is_record/1` documents.
 #[inline]
 pub(crate) fn is_record(x: Eterm) -> bool {
     // SAFETY: as [`is_tuple`].
@@ -330,7 +357,7 @@ pub(crate) fn ref_thing_id(term: Eterm) -> Result<u64> {
 // dependents: `crate::bits` is their only caller, and `erlang:size/1`
 // (`crate::term_ops`) is the only BIF wired to it in M1 — the `binary`/`unicode` BIFs
 // that read the bytes back land later, so the unused-tail items carry
-// `#[allow(dead_code)]` (the same convention as [`is_big`]/[`is_record`] above).
+// `#[allow(dead_code)]` (the same convention as [`is_big`] above).
 // ---------------------------------------------------------------------------
 
 /// `ERL_HEAP_BITS_SIZE` — the number of words *before* the data area of an on-heap
