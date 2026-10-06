@@ -221,7 +221,11 @@ impl Table {
   turns into the `ets:info/1` list. Heap-free.
 
 ### `error.rs` — failure constructors
-- `pub(crate) fn badarg() -> BeamError` (and siblings). No crate-local error enum.
+- `pub(crate) fn badarg() -> BeamError` — the `badarg` failures (bad object/`keypos`, absent element,
+  malformed spec, …).
+- `pub(crate) fn unsupported(what: &str) -> BeamError` — a `BeamError::Raise` (error class) with
+  reason atom `unsupported_ets: <what>`, for an operation the crate deliberately does not implement
+  (currently the scalar `lookup_element` on a multi kind). No crate-local error enum.
 
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. `badarg`-style failures ⇒ `BeamError::BadArg`;
