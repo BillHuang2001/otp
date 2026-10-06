@@ -97,9 +97,11 @@
 //! Milestone-1 has no `function_clause` in [`beam_common::BeamError`], so **both**
 //! are reported as [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a
 //! wrong result. Arithmetic on a non-number (`sum([a])`) is
-//! [`BeamError::BadArith`](beam_common::BeamError::BadArith) and a 60-bit overflow
-//! is [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit), matching the
-//! sibling `arith` module (real Erlang promotes to a bignum).
+//! [`BeamError::BadArith`](beam_common::BeamError::BadArith). `sum/1` folds with the
+//! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle; a
+//! 60-bit overflow is
+//! [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) only where the
+//! arithmetic is *not* term arithmetic (`seq/2,3`'s bound check).
 //!
 //! # `is_list/1` in guards is *shallow*
 //!
@@ -116,11 +118,10 @@ use beam_term::compare::{cmp_arith, eq};
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access::{
-    car, cdr, float_value, is_atom, is_float, is_list, is_nil, is_small, is_tuple, tuple_element,
-    tuple_size,
+    car, cdr, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
-use crate::error::{badarg, badarith, system_limit};
+use crate::error::{badarg, system_limit};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -728,60 +729,30 @@ fn flatten2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // lists:sum/1, lists:max/1, lists:min/1
 // ---------------------------------------------------------------------------
 
-/// The running `lists:sum/1` accumulator: an integer until a float appears.
-enum Acc {
-    Int(i64),
-    Float(f64),
-}
-
-impl Acc {
-    /// Adds one list element, the way `Sum + H` does.
-    ///
-    /// # Errors
-    ///
-    /// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-number;
-    /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) for an
-    /// integer sum past the 60-bit small range (the `arith` module's documented
-    /// M1 limit).
-    fn add(self, term: Eterm) -> Result<Acc> {
-        if is_small(term) {
-            let value = signed_value(term);
-            match self {
-                Acc::Int(sum) => Ok(Acc::Int(sum.checked_add(value).ok_or_else(system_limit)?)),
-                Acc::Float(sum) => Ok(Acc::Float(sum + value as f64)),
-            }
-        } else if is_float(term) {
-            let value = float_value(term);
-            match self {
-                Acc::Int(sum) => Ok(Acc::Float(sum as f64 + value)),
-                Acc::Float(sum) => Ok(Acc::Float(sum + value)),
-            }
-        } else {
-            Err(badarith())
-        }
-    }
-
-    /// Materialises the accumulator as a term.
-    fn into_term(self, ctx: &mut BifContext<'_>) -> Result<Eterm> {
-        match self {
-            Acc::Int(sum) => ctx.int(sum),
-            Acc::Float(sum) => ctx.make_float(sum),
-        }
-    }
-}
-
-/// `sum(List)` — the sum of a proper list of numbers (`sum([])` ⇒ `0`).
+/// `sum(List)` — the fold `Sum + H` over a proper list of numbers (`sum([])` ⇒ `0`).
+///
+/// The addition is [`crate::arith::add_terms`] — the very `+` the oracle's
+/// `lists.erl` folds with — so an integer sum that leaves the 60-bit small range
+/// **promotes to a bignum**, exactly as real Erlang does
+/// (`lists:sum([576460752303423487, 1])` ⇒ `576460752303423488`), and a bignum
+/// *element* is summed exactly.
+///
+/// # Errors
+///
+/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-number
+/// (`sum([a])` ⇒ `badarith`), and `badarg` when `List` is not a proper list (the
+/// oracle's `function_clause`).
 fn sum(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let mut acc = Acc::Int(0);
+    let mut acc = ctx.int(0)?;
     let mut cur = args[0];
     while is_list(cur) {
-        acc = acc.add(car(cur))?;
+        acc = crate::arith::add_terms(ctx, acc, car(cur))?;
         cur = cdr(cur);
     }
     if !is_nil(cur) {
         return Err(badarg());
     }
-    acc.into_term(ctx)
+    Ok(acc)
 }
 
 /// Walks a non-empty proper list, keeping the element that beats the running
@@ -1675,6 +1646,24 @@ mod tests {
             assert_badarith(call!(ctx, sum, [atoms_list(ctx, &["a"])]));
             rejects!(ctx, sum, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
             rejects!(ctx, sum, [ctx.atom("a").unwrap()]);
+
+            // A sum that leaves the 60-bit small range **promotes to a bignum**: the
+            // fold uses the exact `+` (`MAX_SMALL` is 576460752303423487, so adding 1
+            // crosses it). Oracle: lists:sum([576460752303423487,1]) => 576460752303423488,
+            // lists:sum([-576460752303423488,-1]) => -576460752303423489.
+            show!(ctx, sum, [ints(ctx, &[beam_term::MAX_SMALL, 1])], "576460752303423488");
+            show!(
+                ctx,
+                sum,
+                [ints(ctx, &[beam_term::MIN_SMALL, -1])],
+                "-576460752303423489"
+            );
+
+            // A bignum *element* is summed exactly too (oracle:
+            // lists:sum([1 bsl 70]) => 1180591620717411303424).
+            let two_to_70 = beam_codec::term::make_big(ctx.heap(), false, &[0, 64]).unwrap();
+            let single_big = ctx.list(&[two_to_70]).unwrap();
+            show!(ctx, sum, [single_big], "1180591620717411303424");
         });
     }
 
@@ -1702,6 +1691,13 @@ mod tests {
             let tup = ctx.tuple(&[ctx.atom("b").unwrap()]).unwrap();
             show!(ctx, max, [ctx.list(&[ctx.atom("a").unwrap(), tup]).unwrap()], "{b}");
             show!(ctx, min, [ctx.list(&[ctx.atom("a").unwrap(), tup]).unwrap()], "a");
+
+            // A bignum element is ordered exactly (oracle:
+            // lists:max([1, 1 bsl 70]) => 1180591620717411303424).
+            let two_to_70 = beam_codec::term::make_big(ctx.heap(), false, &[0, 64]).unwrap();
+            let with_big = ctx.list(&[make_small(1), two_to_70]).unwrap();
+            show!(ctx, max, [with_big], "1180591620717411303424");
+            show!(ctx, min, [with_big], "1");
 
             rejects!(ctx, max, [NIL]);
             rejects!(ctx, min, [NIL]);
