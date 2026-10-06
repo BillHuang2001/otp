@@ -348,17 +348,24 @@ fn render_format(
 ) -> Result<()> {
     let mut i = 0usize;
     let mut next_arg = 0usize;
+    // The running indentation `I` of `io_lib_format:build_limited/5`: advanced by one
+    // per literal character, reset at `\n`, rounded up to the next tab stop at `\t`,
+    // and set to the column a `~…` control's own output ends at (`indentation/2`).
+    // `~p`/`~P` use `I + 1` as their initial column when no precision is given.
+    let mut column = 0i64;
 
     while i < bytes.len() {
         let byte = bytes[i];
         if byte != b'~' {
             out.push(Chunk::Char(byte as char));
+            column = indent_char(byte as char, column);
             i += 1;
             continue;
         }
         i += 1;
         let (spec, ctrl) = parse_cseq(bytes, &mut i, args, &mut next_arg)?;
-        let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg)?;
+        let piece = dispatch(ctx, ctrl, &spec, args, &mut next_arg, column)?;
+        column = indentation_of(&piece.chunk, column);
         if piece.small {
             splice_flat(out, piece.chunk);
         } else {
@@ -390,6 +397,24 @@ impl Piece {
     /// A control whose rendering is one sub-list element.
     fn element(chunk: Chunk) -> Self {
         Piece { chunk, small: false }
+    }
+}
+
+/// One step of `io_lib_format:indentation/2`'s running column for a single
+/// character: a newline resets it and a tab advances to the next multiple of eight.
+fn indent_char(c: char, column: i64) -> i64 {
+    match c {
+        '\n' => 0,
+        '\t' => ((column + 8) / 8) * 8,
+        _ => column + 1,
+    }
+}
+
+/// `io_lib_format:indentation/2` — the column the rendered `chunk` ends at.
+fn indentation_of(chunk: &Chunk, column: i64) -> i64 {
+    match chunk {
+        Chunk::Char(c) => indent_char(*c, column),
+        Chunk::List(items) => items.iter().fold(column, |col, item| indentation_of(item, col)),
     }
 }
 
@@ -569,6 +594,7 @@ fn dispatch(
     spec: &Spec,
     args: &[Eterm],
     next_arg: &mut usize,
+    column: i64,
 ) -> Result<Piece> {
     match ctrl {
         b'~' => Ok(Piece::small(char_chunk('~', spec)?)),
@@ -590,6 +616,7 @@ fn dispatch(
                 spec.strings,
                 UNLIMITED_DEPTH,
                 spec,
+                column,
             )?))
         }
         b'W' => {
@@ -601,7 +628,14 @@ fn dispatch(
         b'P' => {
             let arg = take(args, next_arg)?;
             let depth = take_depth(args, next_arg)?;
-            Ok(Piece::element(render_p(ctx, arg, spec.strings, depth, spec)?))
+            Ok(Piece::element(render_p(
+                ctx,
+                arg,
+                spec.strings,
+                depth,
+                spec,
+                column,
+            )?))
         }
         b's' => {
             let arg = take(args, next_arg)?;
@@ -756,13 +790,16 @@ fn render_p(
     printable: bool,
     depth: i64,
     spec: &Spec,
+    at: i64,
 ) -> Result<Chunk> {
     if spec.left {
         // A left-adjusted `~p`/`~P` has no clause in `io_lib_format`.
         return Err(badarg());
     }
     let line_length = spec.width.unwrap_or(80);
-    let column = spec.precision.unwrap_or(1);
+    // `io_lib_format:print/12` defaults the column to `I + 1` — the running
+    // indentation at the directive — not to 1 (`io_lib_pretty:print/10`'s `Column`).
+    let column = spec.precision.unwrap_or((at + 1).max(1) as usize);
     pretty_chunk(ctx, term, printable, depth, line_length, column)
 }
 /// `io_lib_format:term/6` — the field-width / truncation rule for a term
