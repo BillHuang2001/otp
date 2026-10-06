@@ -294,6 +294,23 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - **Line/phase framing is driver-side.** `{line, N}` and the text⇄binary phase change live in the `FdDriver`
   (via `LineBuffer`/`PhaseChange`), matching `erl_child_setup`: the line flag affects how a port *delivers input
   to its owner*, not how it accepts output. Default phase = Binary, so nothing changes unless toggled.
+- **Exit status travels through a defaulted trait method, not a notification variant.** The runtime must be able
+  to obtain a child's reaped status **once** for a port opened with `exit_status`, without reaching into driver
+  internals. The chosen seam is a defaulted `Driver::take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`, so
+  `FdDriver`/`EfileDriver` compile unchanged) plus the additive
+  `PortRegistry::take_exit_status(id) -> Result<Option<i32>>` accessor — `Ok(None)` means "no child", "not reaped
+  yet" or "already reported", and an unknown id is `BadArg`. It is `Result` rather than a bare `Option` so a
+  failing `wait` is reported instead of swallowed. A `PortNotification` variant was rejected: exit status is not a
+  *task-round* outcome (it is neither readiness- nor reduction-driven, exactly why the reference runtime polls it
+  between stream rounds), and a variant would force every round to carry a status the port may not owe.
+- **The spawn driver is constructed, not registered — and reaps its child eagerly.** A `DriverFactory` is a
+  no-arg `fn`, so it cannot carry the command/argv/options a spawn port needs; the driver is therefore built
+  directly from a `SpawnSpec` (its `Driver::name()` stays `"spawn"` for `port_info` reporting). The child is
+  started in the **constructor** so a failed spawn is a constructor error that leaves nothing registered and the
+  runtime can read `os_pid()` before `PortRegistry::open`. `{fd, N}` adopts the descriptor as the **read** fd and
+  never closes it (the Erlang side owns it, matching the reference runtime's `LivePort::close`), and writing to
+  such a port is a typed `BadArg`. `stop`/`Drop` kill **and** reap, and `Drop` reaps too because Rust's `Child`
+  does not: dropping it otherwise leaks a zombie.
 
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
