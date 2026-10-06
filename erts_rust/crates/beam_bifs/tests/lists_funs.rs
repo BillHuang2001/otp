@@ -13,7 +13,7 @@
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry, FunCaller};
-use beam_common::{BeamError, Result};
+use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_codec::term::{cons_head, cons_tail, tuple_arity, tuple_element};
 use beam_process::ProcessId;
 use beam_term::{is_list, is_nil, is_small, make_atom, make_small, signed_value, AtomTable, Eterm, NIL};
@@ -409,14 +409,18 @@ fn takewhile_dropwhile_and_splitwith_are_lazy() {
     });
     assert_eq!(calls.len(), 3, "one predicate call per BIF");
 
-    // A predicate that holds past the last proper element does reach the tail.
+    // A predicate that holds past the last proper element does reach the tail,
+    // which has no clause — `error:function_clause` (verified against the oracle:
+    // `lists:takewhile(fun(X) -> X < 3 end, [1|2])` etc.).
     let ((), _) = with_mock(|reg, ctx| {
         let improper = ctx.cons(make_small(1), make_small(2)).expect("fits");
         for name in ["takewhile", "dropwhile", "splitwith"] {
             let args = [make_small(LT3), improper];
             assert!(matches!(
                 reg.call("lists", name, 2, ctx, &args),
-                Err(BeamError::BadArg)
+                Err(BeamError::Raise(r))
+                    if r.class == ExceptionClass::Error
+                        && r.reason == ExitReason::atom("function_clause")
             ));
         }
     });
@@ -478,11 +482,13 @@ fn zipwith_pairs_and_rejects_a_length_mismatch() {
         // `lists:zipwith/3` is `zipwith(F, Xs, Ys, fail)`, whose `fail` mode has no
         // clause for a length mismatch — *it does not stop at the shorter list*.
         // Verified against the oracle: `lists:zipwith(fun(X,Y) -> X+Y end, [1,2], [3])`
-        // raises `function_clause` at `zipwith/4` (lists.erl:965); Milestone-1 reports
-        // `badarg`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`.
+        // raises `error:function_clause` at `zipwith/4` (lists.erl:965), which this
+        // BIF reproduces. The `trim`/`{pad, …}` behaviours live in `zipwith/4`.
         assert!(matches!(
             reg.call("lists", "zipwith", 3, ctx, &args),
-            Err(BeamError::BadArg)
+            Err(BeamError::Raise(r))
+                if r.class == ExceptionClass::Error
+                    && r.reason == ExitReason::atom("function_clause")
         ));
         let empty = [make_small(ADD), NIL, NIL];
         assert_eq!(

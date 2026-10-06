@@ -69,8 +69,7 @@
 //! registers all of them under the `lists` module as Rust **fast paths**: the
 //! names and arities are verbatim from the `lists.erl` export list, so a loader
 //! that resolves them against this registry bypasses the interpreted Erlang with
-//! identical observable results. `keymember/3` and `keysearch/3` are the two real
-//! `lists` BIFs not in scope and are not registered (documented gap).
+//! identical observable results.
 //!
 //! The module also registers the four **list operators** of the `erlang` module —
 //! `'++'/2` and `'--'/2` (`bif erlang:'++'/2 ebif_plusplus_2`,
@@ -94,15 +93,17 @@
 //! `[1,1.0]`). `usort/1` removes the *later* of each arithmetically-equal run
 //! (`usort([1.0, 1])` ⇒ `[1.0]`, `usort([1, 1.0])` ⇒ `[1]`).
 //!
-//! # Errors — `badarg` only (documented M1 simplification)
+//! # Errors — `function_clause`, `badarg` or `badarith`
 //!
 //! The oracle distinguishes *argument* failures (`badarg` — e.g.
 //! `lists:member(x, [a|b])`, `keysort(1, [b,c])`) from *no-clause* failures
-//! (`function_clause` — e.g. `lists:nth(3, [a,b])`, `lists:last([])`,
-//! `lists:zip([1], [2,3])`, `lists:nthtail(5, [1,2])`, `lists:sublist([1],0,1)`).
-//! Milestone-1 has no `function_clause` in [`beam_common::BeamError`], so **both**
-//! are reported as [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a
-//! wrong result. Arithmetic on a non-number (`sum([a])`) is
+//! (`error:function_clause` — e.g. `lists:nth(3, [a,b])`, `lists:last([])`,
+//! `lists:zip([1], [2,3])`, `lists:nthtail(5, [1,2])`, `lists:sublist([1],0,1)`),
+//! and this module reproduces both: a no-clause failure is the `function_clause`
+//! constructor in `crate::error` (class `error`, the bare atom `function_clause` as
+//! the reason — the arguments travel in the stacktrace), everything else is
+//! [`BeamError::BadArg`](beam_common::BeamError::BadArg) — never a wrong result.
+//! Arithmetic on a non-number (`sum([a])`) is
 //! [`BeamError::BadArith`](beam_common::BeamError::BadArith). `sum/1` folds with the
 //! `arith` module's exact `+`, so it promotes to a bignum exactly like the oracle; a
 //! 60-bit overflow is
@@ -601,7 +602,7 @@ fn nth(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `nthtail(N, List)` — the sublist of `List` from position `N+1` on.
 ///
-/// `nthtail(0, L)` is `L` itself (so a non-list `L` is `badarg`), and the tail of
+/// `nthtail(0, L)` is `L` itself (so a non-list `L` is `function_clause`), and the tail of
 /// the `N`th cell is returned verbatim — thus `nthtail(1, [1|2])` ⇒ `2`.
 fn nthtail(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let count = small_int_clause(args[0])?;
@@ -653,7 +654,7 @@ fn last(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// Iterative form of `sublist_2([H|T], L) when L > 0 -> ...; sublist_2(_, 0) -> [];
 /// sublist_2(List, L) when is_list(List), L > 0 -> []` — a non-list term before
-/// `len` is reached is `badarg`.
+/// `len` is reached is `function_clause`.
 fn sublist_prefix(ctx: &mut BifContext<'_>, list: Eterm, len: i64) -> Result<Eterm> {
     if len < 0 {
         return Err(function_clause());
@@ -803,7 +804,7 @@ fn seq_loop(ctx: &mut BifContext<'_>, count: i64, incr: i64, first: i64) -> Resu
 /// An explicit work stack rather than recursion, so a deeply nested list cannot
 /// overflow the Rust stack (`lists:flatten` is depth-unbounded in the oracle: the
 /// BEAM stack grows). A non-list term reached before the traversal finishes is
-/// `badarg`, matching `do_flatten/2`'s missing clause.
+/// `function_clause`, matching `do_flatten/2`'s missing clause.
 fn flatten_leaves(root: Eterm) -> Result<Vec<Eterm>> {
     let mut leaves = Vec::new();
     let mut work = vec![root];
@@ -856,8 +857,7 @@ fn flatten2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// # Errors
 ///
 /// [`BeamError::BadArith`](beam_common::BeamError::BadArith) for a non-number
-/// (`sum([a])` ⇒ `badarith`), and `badarg` when `List` is not a proper list (the
-/// oracle's `function_clause`).
+/// (`sum([a])` ⇒ `badarith`), and `function_clause` when `List` is not a proper list.
 fn sum(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let mut acc = ctx.int(0)?;
     let mut cur = args[0];
@@ -1168,8 +1168,8 @@ fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// `badarg` when `List` is not proper, or when a `Fun` result is not a proper list
-/// (`List ++ Rest` is `badarg` in the oracle).
+/// `function_clause` when `List` is not proper, or `badarg` when a `Fun` result is
+/// not a proper list (`List ++ Rest` is `badarg` in the oracle).
 fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
@@ -1259,9 +1259,8 @@ fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// The two lists must have the **same length**: `zipwith/3` is
 /// `zipwith(F, Xs, Ys, fail)` in `lists.erl`, whose `fail` mode has no clause for
 /// a length mismatch, so `zipwith(F, [1,2,3], [10,20])` raises `function_clause`
-/// (Milestone-1: [`BeamError::BadArg`](beam_common::BeamError::BadArg)) exactly
-/// like `zip/2`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`, which this
-/// module does not register.
+/// exactly like `zip/2`. The `trim`/`{pad, …}` behaviours live in `zipwith/4`, which
+/// this module does not register.
 fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut left = args[1];
@@ -1445,10 +1444,19 @@ mod tests {
         }};
     }
 
+    /// Calls a BIF and asserts that it fails with `error:function_clause` — the
+    /// `lists.erl` no-clause failure the oracle reports for these argument problems.
+    macro_rules! rejects_clause {
+        ($ctx:expr, $f:expr, [$($arg:expr),* $(,)?]) => {{
+            assert_function_clause(call!($ctx, $f, [$($arg),*]));
+        }};
+    }
+
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
         atoms.seed([
             "true", "false", "ok", "a", "b", "c", "d", "e", "f", "g", "h", "tail", "x",
+            "value",
         ]);
         atoms
     }
@@ -1494,6 +1502,17 @@ mod tests {
         assert!(
             matches!(result, Err(BeamError::BadArg)),
             "expected badarg, got {result:?}"
+        );
+    }
+
+    /// Asserts that `result` is the `error:function_clause` raise a `lists.erl`
+    /// no-clause failure produces (class `error`, reason the bare atom).
+    fn assert_function_clause(result: Result<Eterm>) {
+        assert!(
+            matches!(&result, Err(BeamError::Raise(r))
+                if r.class == beam_common::ExceptionClass::Error
+                    && r.reason == beam_common::ExitReason::atom("function_clause")),
+            "expected function_clause, got {result:?}"
         );
     }
 
@@ -1590,7 +1609,7 @@ mod tests {
             // Every element but the last must be a proper list.
             rejects!(ctx, append1, [ints(ctx, &[1, 2])]);
             rejects!(ctx, append1, [atoms_list(ctx, &["a", "a"])]);
-            rejects!(ctx, append1, [ctx.cons(make_small(1), a).unwrap()]);
+            rejects_clause!(ctx, append1, [ctx.cons(make_small(1), a).unwrap()]);
         });
     }
 
@@ -1608,13 +1627,13 @@ mod tests {
             assert_eq!(call!(ctx, nth, [make_small(3), abc]).unwrap(), c);
             assert_eq!(call!(ctx, nth, [make_small(1), improper]).unwrap(), a);
             for n in [0, 4, -1] {
-                rejects!(ctx, nth, [make_small(n), abc]);
+                rejects_clause!(ctx, nth, [make_small(n), abc]);
             }
-            rejects!(ctx, nth, [make_small(2), improper]);
-            rejects!(ctx, nth, [make_small(1), NIL]);
-            rejects!(ctx, nth, [make_small(1), a]);
-            rejects!(ctx, nth, [ctx.make_float(1.0).unwrap(), abc]);
-            rejects!(ctx, nth, [a, abc]);
+            rejects_clause!(ctx, nth, [make_small(2), improper]);
+            rejects_clause!(ctx, nth, [make_small(1), NIL]);
+            rejects_clause!(ctx, nth, [make_small(1), a]);
+            rejects_clause!(ctx, nth, [ctx.make_float(1.0).unwrap(), abc]);
+            rejects_clause!(ctx, nth, [a, abc]);
 
             // nthtail/2: `nthtail(0, L)` is `L`; the Nth tail is returned verbatim.
             assert_eq!(call!(ctx, nthtail, [make_small(0), NIL]).unwrap(), NIL);
@@ -1623,20 +1642,20 @@ mod tests {
             show!(ctx, nthtail, [make_small(2), abc], "[c]");
             show!(ctx, nthtail, [make_small(3), abc], "[]");
             assert_eq!(call!(ctx, nthtail, [make_small(1), improper]).unwrap(), b);
-            rejects!(ctx, nthtail, [make_small(2), improper]);
-            rejects!(ctx, nthtail, [make_small(4), abc]);
-            rejects!(ctx, nthtail, [make_small(1), NIL]);
-            rejects!(ctx, nthtail, [make_small(-1), abc]);
-            rejects!(ctx, nthtail, [ctx.make_float(1.0).unwrap(), abc]);
-            rejects!(ctx, nthtail, [make_small(0), a]);
-            rejects!(ctx, nthtail, [make_small(1), a]);
+            rejects_clause!(ctx, nthtail, [make_small(2), improper]);
+            rejects_clause!(ctx, nthtail, [make_small(4), abc]);
+            rejects_clause!(ctx, nthtail, [make_small(1), NIL]);
+            rejects_clause!(ctx, nthtail, [make_small(-1), abc]);
+            rejects_clause!(ctx, nthtail, [ctx.make_float(1.0).unwrap(), abc]);
+            rejects_clause!(ctx, nthtail, [make_small(0), a]);
+            rejects_clause!(ctx, nthtail, [make_small(1), a]);
 
             // last/1.
             assert_eq!(call!(ctx, last, [abc]).unwrap(), c);
             assert_eq!(call!(ctx, last, [ints(ctx, &[7])]).unwrap(), make_small(7));
-            rejects!(ctx, last, [NIL]);
-            rejects!(ctx, last, [improper]);
-            rejects!(ctx, last, [a]);
+            rejects_clause!(ctx, last, [NIL]);
+            rejects_clause!(ctx, last, [improper]);
+            rejects_clause!(ctx, last, [a]);
         });
     }
 
@@ -1650,10 +1669,10 @@ mod tests {
             show!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), make_small(5)], "[1,2,3]");
             show!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), make_small(0)], "[]");
             show!(ctx, sublist2, [improper, make_small(0)], "[]");
-            rejects!(ctx, sublist2, [improper, make_small(2)]);
-            rejects!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), make_small(-1)]);
-            rejects!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), ctx.make_float(1.0).unwrap()]);
-            rejects!(ctx, sublist2, [a, make_small(2)]);
+            rejects_clause!(ctx, sublist2, [improper, make_small(2)]);
+            rejects_clause!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), make_small(-1)]);
+            rejects_clause!(ctx, sublist2, [ints(ctx, &[1, 2, 3]), ctx.make_float(1.0).unwrap()]);
+            rejects_clause!(ctx, sublist2, [a, make_small(2)]);
 
             show!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(1), make_small(2)], "[1,2]");
             show!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(2), make_small(2)], "[2,3]");
@@ -1662,10 +1681,10 @@ mod tests {
             show!(ctx, sublist3, [ints(ctx, &[1, 2]), make_small(3), make_small(1)], "[]");
             show!(ctx, sublist3, [ints(ctx, &[1, 2, 3]), make_small(1), make_small(0)], "[]");
             show!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(2), make_small(0)], "[]");
-            rejects!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(0), make_small(2)]);
-            rejects!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(2), make_small(-1)]);
-            rejects!(ctx, sublist3, [improper, make_small(1), make_small(2)]);
-            rejects!(ctx, sublist3, [ints(ctx, &[1, 2, 3]), ctx.make_float(1.0).unwrap(), make_small(1)]);
+            rejects_clause!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(0), make_small(2)]);
+            rejects_clause!(ctx, sublist3, [ints(ctx, &[1, 2, 3, 4]), make_small(2), make_small(-1)]);
+            rejects_clause!(ctx, sublist3, [improper, make_small(1), make_small(2)]);
+            rejects_clause!(ctx, sublist3, [ints(ctx, &[1, 2, 3]), ctx.make_float(1.0).unwrap(), make_small(1)]);
         });
     }
 
@@ -1675,9 +1694,9 @@ mod tests {
             show!(ctx, seq2, [make_small(1), make_small(10)], "[1,2,3,4,5,6,7,8,9,10]");
             show!(ctx, seq2, [make_small(4), make_small(4)], "[4]");
             show!(ctx, seq2, [make_small(1), make_small(0)], "[]");
-            rejects!(ctx, seq2, [make_small(5), make_small(1)]);
-            rejects!(ctx, seq2, [ctx.make_float(1.0).unwrap(), make_small(5)]);
-            rejects!(ctx, seq2, [ctx.atom("a").unwrap(), make_small(5)]);
+            rejects_clause!(ctx, seq2, [make_small(5), make_small(1)]);
+            rejects_clause!(ctx, seq2, [ctx.make_float(1.0).unwrap(), make_small(5)]);
+            rejects_clause!(ctx, seq2, [ctx.atom("a").unwrap(), make_small(5)]);
             let thousand = call!(ctx, seq2, [make_small(1), make_small(1000)]).unwrap();
             assert_eq!(proper_list(thousand).expect("proper list").len(), 1000);
 
@@ -1718,10 +1737,10 @@ mod tests {
             show!(ctx, flatten1, [deep], "[1,2,3,4]");
             let empty = ctx.list(&[NIL]).unwrap();
             show!(ctx, flatten1, [ctx.list(&[empty]).unwrap()], "[]");
-            rejects!(ctx, flatten1, [a]);
+            rejects_clause!(ctx, flatten1, [a]);
             // A non-list *tail* reached by the walk has no `do_flatten/2` clause.
             let improper = ctx.cons(b, c).unwrap();
-            rejects!(ctx, flatten1, [ctx.list(&[a, improper]).unwrap()]);
+            rejects_clause!(ctx, flatten1, [ctx.list(&[a, improper]).unwrap()]);
 
             // flatten/2: only the *top* of the tail is checked, the rest is verbatim.
             show!(ctx, flatten2, [ctx.list(&[a, inner]).unwrap(), atoms_list(ctx, &["c"])], "[a,b,c]");
@@ -1730,9 +1749,9 @@ mod tests {
             let nested_tail = ctx.list(&[b_list]).unwrap();
             show!(ctx, flatten2, [ctx.list(&[a]).unwrap(), nested_tail], "[a,[b]]");
             show!(ctx, flatten2, [flat, NIL], "[1,2,3]");
-            rejects!(ctx, flatten2, [a, NIL]);
-            rejects!(ctx, flatten2, [ctx.list(&[a]).unwrap(), a]);
-            rejects!(ctx, flatten2, [flat, b]);
+            rejects_clause!(ctx, flatten2, [a, NIL]);
+            rejects_clause!(ctx, flatten2, [ctx.list(&[a]).unwrap(), a]);
+            rejects_clause!(ctx, flatten2, [flat, b]);
         });
     }
 
@@ -1773,8 +1792,8 @@ mod tests {
             show!(ctx, sum, [halves], "4.0");
 
             assert_badarith(call!(ctx, sum, [atoms_list(ctx, &["a"])]));
-            rejects!(ctx, sum, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
-            rejects!(ctx, sum, [ctx.atom("a").unwrap()]);
+            rejects_clause!(ctx, sum, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
+            rejects_clause!(ctx, sum, [ctx.atom("a").unwrap()]);
 
             // A sum that leaves the 60-bit small range **promotes to a bignum**: the
             // fold uses the exact `+` (`MAX_SMALL` is 576460752303423487, so adding 1
@@ -1828,10 +1847,10 @@ mod tests {
             show!(ctx, max, [with_big], "1180591620717411303424");
             show!(ctx, min, [with_big], "1");
 
-            rejects!(ctx, max, [NIL]);
-            rejects!(ctx, min, [NIL]);
-            rejects!(ctx, max, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
-            rejects!(ctx, min, [ctx.atom("a").unwrap()]);
+            rejects_clause!(ctx, max, [NIL]);
+            rejects_clause!(ctx, min, [NIL]);
+            rejects_clause!(ctx, max, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
+            rejects_clause!(ctx, min, [ctx.atom("a").unwrap()]);
         });
     }
 
@@ -1843,8 +1862,8 @@ mod tests {
 
             show!(ctx, duplicate, [make_small(0), a], "[]");
             show!(ctx, duplicate, [make_small(3), a], "[a,a,a]");
-            rejects!(ctx, duplicate, [make_small(-1), a]);
-            rejects!(ctx, duplicate, [ctx.make_float(1.0).unwrap(), a]);
+            rejects_clause!(ctx, duplicate, [make_small(-1), a]);
+            rejects_clause!(ctx, duplicate, [ctx.make_float(1.0).unwrap(), a]);
 
             // The removed position yields its tail verbatim.
             let improper = ctx.cons(a, b).unwrap();
@@ -1852,7 +1871,7 @@ mod tests {
             show!(ctx, delete, [a, atoms_list(ctx, &["a", "a"])], "[a]");
             show!(ctx, delete, [a, atoms_list(ctx, &["b", "a", "c"])], "[b,c]");
             show!(ctx, delete, [ctx.atom("d").unwrap(), atoms_list(ctx, &["a", "b"])], "[a,b]");
-            rejects!(ctx, delete, [b, improper]);
+            rejects_clause!(ctx, delete, [b, improper]);
 
             // Exact, not arithmetic: `1 =:= 1.0` is false.
             let f1 = ctx.make_float(1.0).unwrap();
@@ -1893,6 +1912,51 @@ mod tests {
     }
 
     #[test]
+    fn keymember_and_keysearch_match_the_oracle() {
+        with_ctx(|ctx| {
+            let a = ctx.atom("a").unwrap();
+            let b = ctx.atom("b").unwrap();
+            let x = ctx.atom("x").unwrap();
+            let one = make_small(1);
+            let first = tuple2(ctx, a, one);
+            let second = tuple2(ctx, b, make_small(2));
+            let tuples = ctx.list(&[first, second]).unwrap();
+            let one_short = ctx.tuple(&[a]).unwrap();
+
+            // keymember/3 — `true` iff some tuple's Nth element `==` the key.
+            show!(ctx, keymember, [a, one, tuples], "true");
+            // Non-tuple elements are skipped; a tuple shorter than N never matches.
+            show!(ctx, keymember, [a, one, ctx.list(&[x, first]).unwrap()], "true");
+            show!(ctx, keymember, [a, make_small(2), ctx.list(&[first]).unwrap()], "false");
+            show!(ctx, keymember, [a, make_small(3), ctx.list(&[first]).unwrap()], "false");
+            show!(ctx, keymember, [a, one, NIL], "false");
+            // Arithmetic (`==`) key match: `1.0` finds `1`.
+            let one_f = ctx.make_float(1.0).unwrap();
+            let int_one = ctx.tuple(&[make_small(1)]).unwrap();
+            show!(ctx, keymember, [one_f, one, ctx.list(&[int_one]).unwrap()], "true");
+            // A match short-circuits *before* an improper tail is ever reached.
+            show!(ctx, keymember, [a, one, ctx.cons(one_short, make_small(2)).unwrap()], "true");
+
+            // A non-integer index, an index below 1, or a non-list are `badarg`.
+            rejects!(ctx, keymember, [a, make_small(0), ctx.list(&[one_short]).unwrap()]);
+            rejects!(ctx, keymember, [a, a, ctx.list(&[one_short]).unwrap()]);
+            rejects!(ctx, keymember, [a, one, x]);
+            // A match that *is* never found leaves the improper tail exposed: `badarg`.
+            rejects!(ctx, keymember, [b, one, ctx.cons(one_short, make_small(2)).unwrap()]);
+
+            // keysearch/3 — `{value, Tuple}` for the first match, else the atom `false`.
+            show!(ctx, keysearch, [a, one, tuples], "{value,{a,1}}");
+            show!(ctx, keysearch, [a, make_small(2), ctx.list(&[first]).unwrap()], "false");
+            show!(ctx, keysearch, [a, one, NIL], "false");
+            show!(ctx, keysearch, [one_f, one, ctx.list(&[int_one]).unwrap()], "{value,{1}}");
+            show!(ctx, keysearch, [a, one, ctx.cons(one_short, make_small(2)).unwrap()], "{value,{a}}");
+            rejects!(ctx, keysearch, [a, make_small(0), ctx.list(&[one_short]).unwrap()]);
+            rejects!(ctx, keysearch, [a, a, ctx.list(&[one_short]).unwrap()]);
+            rejects!(ctx, keysearch, [a, one, x]);
+        });
+    }
+
+    #[test]
     fn sort_and_usort_are_stable_and_deduplicate_arithmetically() {
         with_ctx(|ctx| {
             let a = ctx.atom("a").unwrap();
@@ -1912,8 +1976,8 @@ mod tests {
             let two = ints(ctx, &[2]);
             let nested = ctx.list(&[two, one_zero, one]).unwrap();
             show!(ctx, sort, [nested], "[[1],[1,0],[2]]");
-            rejects!(ctx, sort, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
-            rejects!(ctx, sort, [a]);
+            rejects_clause!(ctx, sort, [ctx.cons(make_small(1), make_small(2)).unwrap()]);
+            rejects_clause!(ctx, sort, [a]);
 
             // Stable: arithmetically equal elements keep their input order.
             let f1 = ctx.make_float(1.0).unwrap();
@@ -1929,7 +1993,7 @@ mod tests {
             show!(ctx, usort, [ctx.list(&[make_small(1), f1]).unwrap()], "[1]");
             let f1_list = ctx.list(&[f1]).unwrap();
             show!(ctx, usort, [ctx.list(&[one, f1_list, one]).unwrap()], "[[1]]");
-            rejects!(ctx, usort, [a]);
+            rejects_clause!(ctx, usort, [a]);
         });
     }
 
@@ -1958,9 +2022,9 @@ mod tests {
             show!(ctx, keysort, [make_small(1), ctx.list(&[key1, key1]).unwrap()], "[{1,a},{1,a}]");
             show!(ctx, keysort, [make_small(1), ctx.list(&[key1_float, key1]).unwrap()], "[{1.0,b},{1,a}]");
 
-            rejects!(ctx, keysort, [make_small(0), ctx.list(&[key1]).unwrap()]);
-            rejects!(ctx, keysort, [make_small(-1), ctx.list(&[key1, key1]).unwrap()]);
-            rejects!(ctx, keysort, [ctx.make_float(1.0).unwrap(), NIL]);
+            rejects_clause!(ctx, keysort, [make_small(0), ctx.list(&[key1]).unwrap()]);
+            rejects_clause!(ctx, keysort, [make_small(-1), ctx.list(&[key1, key1]).unwrap()]);
+            rejects_clause!(ctx, keysort, [ctx.make_float(1.0).unwrap(), NIL]);
             // `element(N, X)` on a non-tuple or a too-short tuple is badarg.
             let b_only = ctx.tuple(&[b]).unwrap();
             rejects!(ctx, keysort, [make_small(2), ctx.list(&[a_two, b_only]).unwrap()]);
@@ -1985,19 +2049,19 @@ mod tests {
             show!(ctx, unzip, [pairs], "{[1,2],[a,b]}");
             show!(ctx, unzip, [NIL], "{[],[]}");
 
-            rejects!(ctx, zip, [ints(ctx, &[1]), ints(ctx, &[2, 3])]);
-            rejects!(ctx, zip, [ctx.cons(make_small(1), make_small(2)).unwrap(), ints(ctx, &[3])]);
-            rejects!(ctx, zip, [ints(ctx, &[1]), ctx.cons(make_small(2), make_small(3)).unwrap()]);
-            rejects!(ctx, zip, [NIL, a]);
-            rejects!(ctx, zip, [a, NIL]);
+            rejects_clause!(ctx, zip, [ints(ctx, &[1]), ints(ctx, &[2, 3])]);
+            rejects_clause!(ctx, zip, [ctx.cons(make_small(1), make_small(2)).unwrap(), ints(ctx, &[3])]);
+            rejects_clause!(ctx, zip, [ints(ctx, &[1]), ctx.cons(make_small(2), make_small(3)).unwrap()]);
+            rejects_clause!(ctx, zip, [NIL, a]);
+            rejects_clause!(ctx, zip, [a, NIL]);
 
             let single = ctx.tuple(&[a]).unwrap();
-            rejects!(ctx, unzip, [ctx.list(&[single]).unwrap()]);
+            rejects_clause!(ctx, unzip, [ctx.list(&[single]).unwrap()]);
             let triple = ctx.tuple(&[a, make_small(1), b]).unwrap();
-            rejects!(ctx, unzip, [ctx.list(&[triple]).unwrap()]);
+            rejects_clause!(ctx, unzip, [ctx.list(&[triple]).unwrap()]);
             let pair = tuple2(ctx, a, make_small(1));
-            rejects!(ctx, unzip, [ctx.cons(pair, b).unwrap()]);
-            rejects!(ctx, unzip, [a]);
+            rejects_clause!(ctx, unzip, [ctx.cons(pair, b).unwrap()]);
+            rejects_clause!(ctx, unzip, [a]);
         });
     }
 
@@ -2013,6 +2077,8 @@ mod tests {
             ("flatten", 1),
             ("flatten", 2),
             ("keyfind", 3),
+            ("keymember", 3),
+            ("keysearch", 3),
             ("keysort", 2),
             ("last", 1),
             ("max", 1),
