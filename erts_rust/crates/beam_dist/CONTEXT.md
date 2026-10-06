@@ -336,6 +336,20 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - **Handshake framing is 2-byte; established framing is 4-byte.** The frame read after `ChallengeAck`
   is treated as the OTP-23 `Complement` only when its tag is `'c'`; otherwise it is buffered and
   delivered by the next `recv`.
+- **epmd frames its requests but not its replies.** A client *request* is 2-byte length-framed
+  (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
+  (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
+  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list. An earlier note
+  here that "epmd over raw TCP is blocked in this sandbox" was a misdiagnosis: the old client wrongly
+  re-read the reply through `read_packet`, so the first two reply bytes were parsed as a bogus ~30 KB
+  length. Requests are unchanged; only the three response readers changed.
+- **`ConnectionDriver` is byte-fed and transport-agnostic; its header parse is deferred to
+  `next_message`.** The runtime owns the socket; the driver only parses/serializes, which keeps this
+  crate free of `mio` and lets `beam_rt` register the link with `beam_io`'s poller. `step` does a cheap
+  *structural* check of each packet's leading bytes so garbage is rejected immediately, but the
+  distribution header is decoded (and applied to the receive atom cache) in `next_message`, because a
+  `NewAtomCacheRef`'s interned atoms must land in the *same* `AtomTable` the payload decodes against
+  (otherwise a payload `ATOM_CACHE_REF` could collide with an inline atom's index).
 - **`NamesResp::encode` is lossy** (per-node ports are not retained) — decoding (the client direction)
   is exact.
 
