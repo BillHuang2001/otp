@@ -195,6 +195,12 @@ Unsupported is emitted for:
 2. a BEAM-engine capability gap — a raise whose reason atom starts with `unsupported_opcode`;
 3. a `beam_bifs` capability gap — the reason atom `unsupported_bif`.
 
+A capability gap is **uncatchable**: in `src/eval/mod.rs` `flow_from_error` turns it into `Flow::Fatal`
+(like `halt`), so the self-terminating `try (EXPR) of … catch C:R -> … end` probe the differential
+harness wraps its expressions in **cannot** swallow it and print it as an apparent `exception error …`.
+It escapes the evaluator, reaches `cli::run`, and becomes the exit-3 `beam_rt: unsupported: <reason>`
+signal — so an unimplemented feature is honestly `unsupported`, never a false `error`, in the gate.
+
 **Classification convention.** A capability gap is signalled by a raise whose **reason atom starts
 with `unsupported`**. `src/error.rs::unsupported_reason` is the **single** place that convention is
 interpreted: the constructors there (`unsupported`, `bad_eval`) and the sibling crates (`beam_engine`
