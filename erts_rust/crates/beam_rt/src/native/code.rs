@@ -1,0 +1,399 @@
+//! The `code:*` runtime-native floor: the code path, the loaded and preloaded module set
+//! and the installation directories.
+//!
+//! `code` is the module library's front end; its `.beam` (and the `code_server` process
+//! behind it) needs facilities outside Milestone-1, so the runtime answers these calls
+//! directly from the state of its own [`CodeServer`](crate::CodeServer) and the
+//! preloaded-module registry instead of loading a module it cannot execute (see the
+//! parent module's docs).
+//!
+//! `src/native.rs`'s `code:*` behaviour is load-bearing for the differential corpus's
+//! `boot/*` cases, all of which currently agree with the oracle.
+
+use beam_common::{BeamError, Result};
+use beam_engine::terms;
+use beam_term::Eterm;
+
+use crate::context::RuntimeContext;
+use crate::error;
+
+impl RuntimeContext<'_> {
+    /// `code:get_path/0`: the code path, one directory string per entry, in search
+    /// order.
+    ///
+    /// The system library directories (`stdlib`, `kernel`, `erts`) are resolved on first
+    /// use, exactly as a module lookup does, so the list is the order
+    /// [`CodeServer::find_file`](crate::CodeServer::find_file) searches. Resolution is
+    /// deliberately **best-effort** here, matching [`Runtime::find_module_file`]: a
+    /// failure leaves the configured `-pa`/`-pz` directories and is reported loudly by
+    /// the module *load* that actually needed a system module, never silently by this
+    /// listing.
+    ///
+    /// [`Runtime::find_module_file`]: crate::Runtime::find_module_file
+    pub(super) fn code_get_path(&mut self) -> Result<Eterm> {
+        let _ = self.runtime.code_server.add_system_paths();
+        let dirs: Vec<String> = self
+            .runtime
+            .code_server
+            .paths()
+            .iter()
+            .map(|path| path.display().to_string())
+            .collect();
+        self.string_list(&dirs)
+    }
+
+    /// `code:all_loaded/0`: `{Module, Beam}` for every preloaded and loaded module.
+    ///
+    /// `Beam` is the atom `preloaded` for a preloaded module and its `.beam` file path
+    /// (a string) for a loaded one. The preloaded names come first, so the list is never
+    /// empty — as the oracle's always is. The oracle orders the list by load time; here
+    /// the preloaded set is in boot order and the loaded modules are sorted by name
+    /// (neither order is part of any contract).
+    ///
+    /// A module loaded **from memory** (no source file: [`CodeServer::load_bytes`]) is
+    /// reported with the atom `preloaded` as its `Beam`: Milestone-1 records no load
+    /// filename, and inventing one would be worse than the oracle's own
+    /// `load_binary/3` filename hint, which this runtime does not take.
+    ///
+    /// [`CodeServer::load_bytes`]: crate::CodeServer::load_bytes
+    pub(super) fn code_all_loaded(&mut self) -> Result<Eterm> {
+        // `None` marks a preloaded module (which has no `.beam` file of its own).
+        let mut entries: Vec<(String, Option<String>)> = Vec::new();
+        for name in self.runtime.preloaded().names() {
+            entries.push((name.to_string(), None));
+        }
+        let loaded = self.runtime.code_server.loaded();
+        for name in loaded {
+            if self.runtime.preloaded().is_preloaded(&name) {
+                continue;
+            }
+            let path = self.module_file(&name);
+            entries.push((name, path));
+        }
+
+        let mut tuples = Vec::with_capacity(entries.len());
+        for (name, path) in &entries {
+            let name_atom = self.atom(name)?;
+            let beam = match path {
+                Some(path) => self.charlist(path)?,
+                None => self.atom("preloaded")?,
+            };
+            tuples.push(terms::make_tuple(self, &[name_atom, beam])?);
+        }
+        terms::make_list(self, &tuples)
+    }
+
+    /// `code:which(Module)`: the atom `preloaded` for a preloaded module, the module's
+    /// `.beam` path (a string) for one that is loaded or on the code path, and the atom
+    /// `non_existing` otherwise.
+    pub(super) fn code_which(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let name = self
+            .atom_name(*args.first().ok_or(BeamError::BadArg)?)
+            .ok_or(BeamError::BadArg)?;
+        if self.runtime.preloaded().is_preloaded(&name) {
+            return self.atom("preloaded");
+        }
+        match self.module_file(&name) {
+            Some(path) => self.charlist(&path),
+            None => self.atom("non_existing"),
+        }
+    }
+
+    /// `code:lib_dir/0`: the system library root (`<lib>`) the code path's `ebin`
+    /// directories live under, as a string.
+    ///
+    /// # Errors
+    ///
+    /// A diagnostic when the system code path cannot be resolved (a hard error: without
+    /// it there is no `<lib>` to report) or holds no `<lib>/<app>-<vsn>/ebin` entry.
+    pub(super) fn code_lib_dir_0(&mut self) -> Result<Eterm> {
+        self.runtime.code_server.add_system_paths()?;
+        let root = self.runtime.code_server.lib_root().ok_or_else(|| {
+            error::message(
+                "code:lib_dir/0: the code path has no <lib>/<app>-<vsn>/ebin directory",
+            )
+        })?;
+        self.charlist(&root.display().to_string())
+    }
+
+    /// `code:lib_dir(App)`: the application directory `<lib>/<app>-<vsn>` of `App` as a
+    /// string, or `{error, bad_name}` when `App` is not an installed application.
+    pub(super) fn code_lib_dir_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let argument = *args.first().ok_or(BeamError::BadArg)?;
+        let found = match self.atom_name(argument) {
+            Some(app) => {
+                self.runtime.code_server.add_system_paths()?;
+                self.runtime.code_server.app_dir(&app)
+            }
+            // A non-atom argument names no application.
+            None => None,
+        };
+        match found {
+            Some(dir) => self.charlist(&dir.display().to_string()),
+            None => {
+                let tag = self.atom("error")?;
+                let reason = self.atom("bad_name")?;
+                terms::make_tuple(self, &[tag, reason])
+            }
+        }
+    }
+
+    /// `code:root_dir/0`: the Erlang installation root the system booted from, as a
+    /// string.
+    ///
+    /// It is the **parent** of the `<lib>` directory [`Self::code_lib_dir_0`] reports —
+    /// verified against OTP 29/erts-17.1, where `code:root_dir()` is
+    /// `…/lib/erlang` and `code:lib_dir()` is `…/lib/erlang/lib`. The derivation is
+    /// therefore `lib_root().parent()`, so both answers come from the one resolved code
+    /// path (no second source of truth).
+    ///
+    /// # Errors
+    ///
+    /// The same hard errors as [`Self::code_lib_dir_0`] — an unresolvable system code
+    /// path, or a `<lib>` entry with no parent component.
+    pub(super) fn code_root_dir(&mut self) -> Result<Eterm> {
+        self.runtime.code_server.add_system_paths()?;
+        let lib_root = self.runtime.code_server.lib_root().ok_or_else(|| {
+            error::message(
+                "code:root_dir/0: the code path has no <lib>/<app>-<vsn>/ebin directory",
+            )
+        })?;
+        let root = lib_root.parent().ok_or_else(|| {
+            error::message("code:root_dir/0: the <lib> directory has no parent component")
+        })?;
+        self.charlist(&root.display().to_string())
+    }
+
+    /// The `.beam` file of `name`: its recorded load path, its code-path entry, or —
+    /// after a best-effort resolution of the system directories — its code-path entry
+    /// again.
+    ///
+    /// `None` when the module is nowhere to be found; the resolution failure itself is
+    /// not an error here (see [`Self::code_get_path`]).
+    fn module_file(&mut self, name: &str) -> Option<String> {
+        if let Some(path) = self.runtime.code_server.loaded_path(name) {
+            return Some(path.display().to_string());
+        }
+        if let Some(path) = self.runtime.code_server.find_file(name) {
+            return Some(path.display().to_string());
+        }
+        if self.runtime.code_server.add_system_paths().is_ok() {
+            if let Some(path) = self.runtime.code_server.find_file(name) {
+                return Some(path.display().to_string());
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the `code:*` entries: the code path, the loaded/preloaded module
+    //! set and the installation directories.
+
+    use super::*;
+    use crate::native::test_support::{atom, call, runtime, string_of, system_runtime};
+    use beam_term::{is_atom, make_small};
+
+    #[test]
+    fn code_get_path_is_a_list_of_strings() {
+        let mut runtime = runtime();
+        let path = call(&mut runtime, "code", "get_path", &[]).expect("code:get_path/0");
+        // Whatever the code path is, it is a (possibly empty) list of char lists.
+        for entry in terms::list_elements(path).expect("a list") {
+            assert!(
+                terms::list_elements(entry).is_ok(),
+                "every code-path entry is a string"
+            );
+        }
+    }
+
+    #[test]
+    fn code_get_path_includes_the_resolved_system_dirs() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let path = call(&mut runtime, "code", "get_path", &[]).expect("code:get_path/0");
+        let entries: Vec<String> = terms::list_elements(path)
+            .expect("a list")
+            .iter()
+            .map(|entry| string_of(*entry))
+            .collect();
+        let expected: Vec<String> = runtime
+            .code_server
+            .paths()
+            .iter()
+            .map(|dir| dir.display().to_string())
+            .collect();
+        assert_eq!(entries, expected);
+        assert!(
+            entries.iter().any(|dir| dir.ends_with("ebin")),
+            "the resolved system dirs are on the path: {entries:?}"
+        );
+    }
+
+    #[test]
+    fn code_all_loaded_is_tagged_and_never_empty() {
+        let mut runtime = runtime();
+        let loaded = call(&mut runtime, "code", "all_loaded", &[]).expect("code:all_loaded/0");
+        let entries = terms::list_elements(loaded).expect("a list");
+        assert!(
+            !entries.is_empty(),
+            "the preloaded module names make the list non-empty"
+        );
+        for entry in &entries {
+            assert_eq!(terms::tuple_arity(*entry).expect("a {Module, Beam} pair"), 2);
+            let name = terms::tuple_element(*entry, 0).expect("the module name");
+            assert!(is_atom(name), "every entry is tagged by a module atom");
+            let beam = terms::tuple_element(*entry, 1).expect("the beam location");
+            assert!(
+                is_atom(beam) || terms::list_elements(beam).is_ok(),
+                "the beam is the atom `preloaded` or a path string"
+            );
+        }
+        // The preloaded set comes first, starting with `erlang`.
+        let first = entries[0];
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(first, 0).unwrap()),
+            Some("erlang")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(first, 1).unwrap()),
+            Some("preloaded")
+        );
+    }
+
+    #[test]
+    fn code_all_loaded_reports_a_loaded_module_with_its_file() {
+        let mut runtime = runtime();
+        let slice = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures/slice.beam"
+        );
+        runtime.load_module(slice).expect("the slice fixture loads");
+        let loaded = call(&mut runtime, "code", "all_loaded", &[]).expect("code:all_loaded/0");
+        let slice_entry = terms::list_elements(loaded)
+            .expect("a list")
+            .into_iter()
+            .find(|entry| {
+                runtime.atom_name_of(terms::tuple_element(*entry, 0).unwrap()) == Some("slice")
+            })
+            .expect("slice is in all_loaded/0");
+        assert_eq!(
+            string_of(terms::tuple_element(slice_entry, 1).unwrap()),
+            slice
+        );
+    }
+
+    #[test]
+    fn code_which_reports_preloaded_loaded_and_missing() {
+        let mut runtime = runtime();
+        // A preloaded module is `preloaded` (it has no `.beam` file of its own).
+        let init = atom(&mut runtime, "init");
+        let which = call(&mut runtime, "code", "which", &[init]).expect("code:which/1");
+        assert_eq!(runtime.atom_name_of(which), Some("preloaded"));
+
+        // A module nowhere to be found is `non_existing`.
+        let missing = atom(&mut runtime, "definitely_not_a_module");
+        let which = call(&mut runtime, "code", "which", &[missing]).expect("code:which/1");
+        assert_eq!(runtime.atom_name_of(which), Some("non_existing"));
+
+        // A loaded module reports the file it was loaded from.
+        let slice = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures/slice.beam"
+        );
+        runtime.load_module(slice).expect("the slice fixture loads");
+        let slice_atom = atom(&mut runtime, "slice");
+        let which = call(&mut runtime, "code", "which", &[slice_atom]).expect("code:which/1");
+        assert_eq!(string_of(which), slice);
+
+        // A system module is found through the resolved code path (skip loudly without
+        // a system Erlang).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let lists = atom(&mut runtime, "lists");
+        let which = call(&mut runtime, "code", "which", &[lists]).expect("code:which/1");
+        let text = string_of(which);
+        assert!(text.ends_with("lists.beam"), "{text}");
+    }
+
+    #[test]
+    fn code_lib_dir_of_a_non_atom_is_bad_name() {
+        let mut runtime = runtime();
+        let answer =
+            call(&mut runtime, "code", "lib_dir", &[make_small(42)]).expect("code:lib_dir/1");
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2);
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("error")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("bad_name")
+        );
+    }
+
+    #[test]
+    fn code_lib_dir_reports_installed_and_unknown_apps() {
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let kernel = atom(&mut runtime, "kernel");
+        let dir = call(&mut runtime, "code", "lib_dir", &[kernel]).expect("code:lib_dir(kernel)");
+        let app_dir = string_of(dir);
+        assert!(app_dir.contains("kernel-"), "{app_dir}");
+        assert!(
+            std::path::Path::new(&app_dir).join("ebin").is_dir(),
+            "{app_dir} holds an ebin"
+        );
+
+        // `code:lib_dir/0` is the `<lib>` root the app directory lives under.
+        let root = call(&mut runtime, "code", "lib_dir", &[]).expect("code:lib_dir/0");
+        let root = string_of(root);
+        assert!(
+            app_dir.starts_with(&root),
+            "{root} is not a prefix of {app_dir}"
+        );
+
+        // An application that is not installed is `{error, bad_name}`.
+        let missing = atom(&mut runtime, "definitely_not_an_otp_app");
+        let answer = call(&mut runtime, "code", "lib_dir", &[missing]).expect("code:lib_dir/1");
+        assert_eq!(terms::tuple_arity(answer).expect("a pair"), 2);
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 0).unwrap()),
+            Some("error")
+        );
+        assert_eq!(
+            runtime.atom_name_of(terms::tuple_element(answer, 1).unwrap()),
+            Some("bad_name")
+        );
+    }
+
+    #[test]
+    fn code_root_dir_is_the_parent_of_the_lib_root() {
+        // `code:root_dir/0` is a string and is the parent of `code:lib_dir/0`'s `<lib>`
+        // directory — this is what the differential `boot/root_dir_is_string` case checks
+        // (`is_list(code:root_dir())`).
+        let Some(mut runtime) = system_runtime() else {
+            return;
+        };
+        let root = call(&mut runtime, "code", "root_dir", &[]).expect("code:root_dir/0");
+        assert!(beam_term::is_list(root), "root_dir/0 is a string");
+        let root = string_of(root);
+        let lib = call(&mut runtime, "code", "lib_dir", &[]).expect("code:lib_dir/0");
+        let lib = string_of(lib);
+        assert_eq!(
+            std::path::Path::new(&lib)
+                .parent()
+                .map(|parent| parent.to_string_lossy().to_string()),
+            Some(root.clone()),
+            "{root} must be the parent of {lib}"
+        );
+        assert!(
+            std::path::Path::new(&root).is_dir(),
+            "{root} is a directory"
+        );
+    }
+}

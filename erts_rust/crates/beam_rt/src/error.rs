@@ -184,6 +184,141 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
     unsupported(&format!("receive: process {pid:?} has no mailbox"))
 }
 
+/// The `erlang` BIFs that are **known** (they are part of the OTP `erlang` surface) but
+/// deliberately not implemented by Milestone-1.
+///
+/// A call to one of these must never be reported as the *plain* diagnostic
+/// [`unknown_bif`] builds (`erlang:X/Y is not a BIF`): that would present a documented
+/// capability gap as a genuine runtime error. It is classified as *unsupported* instead
+/// (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) — see
+/// [`known_unimplemented_bif`].
+///
+/// Only names that `beam_bifs`' `erlang` registry does **not** provide belong here: a name
+/// the registry owns is dispatched before this list is consulted, so an entry would be
+/// dead. The list is curated rather than generated — a name is added when the runtime
+/// answers it with a plain `not a BIF` diagnostic and it is in fact an OTP BIF.
+pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
+    ("nodes", 0),
+    ("node", 1),
+    ("set_cookie", 2),
+    ("disconnect_node", 1),
+    ("monitor_node", 2),
+    ("monitor_node", 3),
+    ("port_command", 2),
+    ("port_command", 3),
+    ("port_connect", 2),
+    ("port_control", 3),
+    ("port_call", 3),
+    ("spawn", 1),
+    ("spawn", 2),
+    ("spawn", 3),
+    ("spawn", 4),
+    ("spawn_link", 1),
+    ("spawn_link", 2),
+    ("spawn_link", 3),
+    ("spawn_link", 4),
+    ("spawn_opt", 2),
+    ("spawn_opt", 3),
+    ("spawn_opt", 4),
+    ("spawn_request", 2),
+    ("spawn_request", 3),
+    ("spawn_request", 4),
+    ("spawn_request", 5),
+    ("exit", 2),
+    ("link", 1),
+    ("unlink", 1),
+    ("is_process_alive", 1),
+    ("process_flag", 2),
+    ("process_flag", 3),
+    ("process_info", 1),
+    ("process_info", 2),
+    ("process_display", 2),
+    ("suspend_process", 1),
+    ("resume_process", 1),
+    ("register", 3),
+    ("registered", 0),
+    ("system_monitor", 0),
+    ("system_monitor", 1),
+    ("system_monitor", 2),
+    ("system_profile", 0),
+    ("system_profile", 1),
+    ("system_profile", 2),
+    ("start_timer", 3),
+    ("start_timer", 4),
+    ("cancel_timer", 1),
+    ("cancel_timer", 2),
+    ("send_after", 3),
+    ("send_after", 4),
+    ("garbage_collect", 0),
+    ("garbage_collect", 1),
+    ("garbage_collect", 2),
+    ("trace", 3),
+    ("trace_pattern", 5),
+    ("seq_trace", 1),
+    ("seq_trace", 2),
+    ("get", 0),
+    ("get", 1),
+    ("put", 2),
+    ("erase", 0),
+    ("erase", 1),
+    ("apply", 1),
+    ("function_exported", 2),
+    ("function_exported", 3),
+    ("load_module", 2),
+    ("load_module", 3),
+    ("load_nif", 2),
+    ("md5", 1),
+    ("md5_init", 0),
+    ("md5_update", 2),
+    ("md5_final", 1),
+    ("phash", 2),
+    ("phash2", 1),
+    ("phash2", 2),
+    ("system_info", 2),
+    ("localtime", 0),
+    ("universaltime", 0),
+    ("localtime_to_universaltime", 1),
+    ("localtime_to_universaltime", 2),
+    ("universaltime_to_localtime", 1),
+    ("statistics", 0),
+    ("statistics", 1),
+    ("crc32", 2),
+    ("error", 3),
+    ("insert_element", 3),
+    ("delete_element", 2),
+    ("map_get", 3),
+    ("concatenate", 2),
+];
+
+/// A **known** `erlang` BIF that Milestone-1 deliberately does not implement.
+///
+/// Reporting it as [`unknown_bif`] would be indistinguishable from a typo (`erlang:nope/1`)
+/// and, worse, would classify a documented capability gap as a genuine runtime error. The
+/// reason atom therefore starts with `unsupported`, so
+/// [`unsupported_reason`](crate::error::unsupported_reason) recognises it and
+/// [`cli::run`](crate::cli::run) exits with
+/// [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED) — exactly like the `beam_engine`
+/// `unsupported_opcode:` and `beam_bifs` `unsupported_bif` gaps.
+pub(crate) fn known_unimplemented_bif(function: &str, arity: u32) -> BeamError {
+    unsupported(&format!("erlang:{function}/{arity} is a known BIF that is not implemented"))
+}
+
+/// Whether `(function, arity)` is a curated known-but-unimplemented `erlang` BIF.
+pub(crate) fn is_known_unimplemented_bif(function: &str, arity: u32) -> bool {
+    KNOWN_UNIMPLEMENTED_ERLANG_BIFS.contains(&(function, arity))
+}
+
+/// A monitor whose watching process is not in the process table.
+///
+/// A context running a pid the table does not hold (a scheduler pass over a terminated
+/// pid, say) cannot record a monitor: it reports a typed capability gap rather than
+/// silently dropping the monitor or inventing a watcher.
+pub(crate) fn no_process(pid: beam_process::ProcessId) -> BeamError {
+    unsupported(&format!(
+        "erlang:monitor/2: watching process {pid:?} has no process"
+    ))
+}
+
 /// A scheduler pass asked to run a pid the runtime never spawned an engine for.
 ///
 /// [`Runtime::spawn_process`](crate::runtime::Runtime::spawn_process) registers an entry
