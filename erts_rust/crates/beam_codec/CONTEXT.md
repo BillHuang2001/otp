@@ -100,22 +100,28 @@ is `decode`'s.
 - `pub const MIN_LEVEL: u8 = 0`, `pub const MAX_LEVEL: u8 = 9`, `pub const MAX_UNCOMPRESSED: usize`.
 - `pub(crate) fn reject_bad_level(level: u8) -> Result<()>` — used by `encode` to fail fast.
 
-### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs`)
+### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs` + `record.rs` + `float.rs`)
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
-  `with_atom_cache(&'a mut dyn AtomCacheWriter)` (installs the outbound atom cache — a cached atom is
-  then written as `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) ->
-  Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
+  `set_minor_version(MinorVersion)` / `with_minor_version(MinorVersion)` (the `term_to_binary/2`
+  `{minor_version,N}` flavour — see §Minor-version flavours), `with_atom_cache(&'a mut dyn
+  AtomCacheWriter)` (installs the outbound atom cache — a cached atom is then written as
+  `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
   `finish_compressed(level: u8) -> Result<Vec<u8>>` and `finish_local(hash: u32) -> Vec<u8>`
   (see below).
 - `pub enum AtomEncoding { Utf8, Latin1 }` — default `Utf8`: emit `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`
   (exactly what `term_to_binary` emits). `Latin1` emits `SMALL_ATOM_EXT`/`ATOM_EXT` for nodes that did
-  not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`).
+  not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`). Under a [`MinorVersion`] other than `V2` the
+  atom tags are **pinned** by the flavour and `AtomEncoding` is ignored (see §Minor-version flavours).
+- `pub enum MinorVersion { V0, V1, V2 }` (default `V2`) — the `term_to_binary/2` `{minor_version, N}`
+  wire flavour. `set_minor_version`/`with_minor_version` select it; the default (and every un-flavoured
+  entry point) reproduces today's bytes exactly.
 - Convenience (additive; the existing signatures are unchanged): `pub fn encode_term(Eterm, &AtomTable)`
   (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
   the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
-  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, plus the `LOCAL_EXT` wrapper
-  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`.
+  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, the `LOCAL_EXT` wrapper
+  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`, and the minor-version entry point
+  `pub fn encode_term_with_minor_version(Eterm, &AtomTable, MinorVersion)`.
 - **Funs are encoded through the classification chain.** `encode` guards the fun family with
   `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
   distinct subtag, so the classification is exact) and routes to the `src/encode/fun.rs` helpers
@@ -140,6 +146,33 @@ is `decode`'s.
   owned by `beam_rt`/`beam_dist` — so the *caller* supplies it; the codec neither computes nor
   verifies it. (A local **fun** — `make_fun3` — still has no wire form:
   `error::unsupported_local_fun`, unchanged.)
+
+#### Minor-version flavours (`{minor_version, N}`)
+`parse_t2b_opts` (`external.c:1501-1516`) maps `{minor_version, N}` onto encoder dflags.
+`TERM_TO_BINARY_DFLAGS` (`dist.h:138-139`) is `DFLAG_NEW_FLOATS | DFLAG_UTF8_ATOMS` and carries
+**no** `DFLAG_SMALL_ATOM_TAGS`, so:
+
+| `MinorVersion` | atoms | floats |
+|---|---|---|
+| `V0` (`{minor_version,0}`) | `ATOM_EXT` (`100`) for a Latin-1 name (never `115`, any length), UTF-8 tags for a non-Latin-1 name | `FLOAT_EXT` (`99`), 31-byte text |
+| `V1` (`{minor_version,1}`) | same as `V0` | `NEW_FLOAT_EXT` (`70`) |
+| `V2` (default, `{minor_version,2}`) | `AtomEncoding` (UTF-8 by default) | `NEW_FLOAT_EXT` (`70`) |
+- The crate-internal `AtomFlavour` projects the C `enc_atom` decision (`external.c:2906-2950`); the
+  public `AtomEncoding::Latin1` (the `DFLAG_SMALL_ATOM_TAGS` dist flavour — `115`/`100`, `unsupported`
+  for a non-Latin-1 name) is **unchanged** and is only consulted under `V2`. Under `V0`/`V1` the
+  `Latin1WideOnly` flavour always emits `ATOM_EXT` for a Latin-1 name and **falls back to the UTF-8
+  tags** for a non-Latin-1 one (`external.c:2910`: `utf8_atoms || a->latin1_chars < 0`) — never
+  `unsupported`.
+- Floats: `NEW_FLOAT_EXT` + 8 IEEE-754 bytes when `DFLAG_NEW_FLOATS` is set (`V1`/`V2`, today's
+  behaviour); otherwise `FLOAT_EXT` + a **fixed 31-byte** field — `sys_double_to_chars(f, buf, 31)`
+  (= `snprintf(buf, 31, "%.20e", f)`, `SYS_DEFAULT_FLOAT_DECIMALS 20`) then zero-fill
+  (`external.c:3840-3847`). `src/encode/float.rs` renders the payload: Rust's `format!("{:.20e}", f)`
+  has the same correctly-rounded (round-half-to-even) mantissa as glibc but a different exponent tail
+  (`e0`/`e-5`/`e20`), so `normalize_exponent` rewrites it to C's always-signed, ≥2-digit `e+00`/`e-05`/
+  `e+20`. Non-finite values use glibc's `inf`/`-inf`/`nan` spelling. A rendered string longer than 31
+  bytes would be a `SystemLimit` rather than a silent truncation (unreachable for a finite `f64`).
+- Byte-exactness is asserted by `tests/minor_version.rs` (pinned oracle goldens + a **live** `erl`
+  cross-check of the `V0`/`V1` images over a mixed corpus) and by `src/encode/float.rs`'s unit tests.
 
 ### `src/decode/` — the `Decoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
@@ -233,8 +266,10 @@ constants only.
 ## Tag coverage (current)
 **Encode + decode + byte-exact round-trip** (the full producible set):
 `97, 98, 110, 111` (integers; a big that fits a 60-bit small decodes to a small, as in C),
-`99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`**, matching `term_to_binary`),
-`100, 115, 118, 119` (all four atom tags decode; encode emits UTF-8 per §AtomEncoding),
+`99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`** by default, `99` only under
+`MinorVersion::V0` — see §Minor-version flavours),
+`100, 115, 118, 119` (all four atom tags decode; encode emits UTF-8 per §AtomEncoding, or the
+`{minor_version,0|1}` `ATOM_EXT`/UTF-8-fallback form per §Minor-version flavours),
 `101, 114, 90` (references), `102, 89, 120` (ports: all three decode, **encode always emits `120
 V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are decode-only),
 `103, 88` (pids), `104, 105` (tuples), `106` (NIL),
@@ -574,9 +609,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   while preserving the round-trip of `creation`. The pointer semantics land when a node-identity type
   exists (owned by `beam_term`/`beam_dist`); only then can the local-node fast path replace the
   external forms.
-- **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode always emits `70` (as
-  `term_to_binary` does), so a decode↔encode round-trip of an `99`-encoded float is
-  representation-preserving, not byte-identical.
+- **`FLOAT_EXT` (99) is decoded via its `%.20e` string form**; encode emits `70` by default (as
+  `term_to_binary/1` does) and `99` only under `MinorVersion::V0`, so a decode↔encode round-trip of a
+  `99`-encoded float under the default flavour is representation-preserving, not byte-identical;
+  under `V0` the 31-byte text form is reproduced exactly (see §Minor-version flavours).
+- **A non-finite float has no oracle-verifiable `FLOAT_EXT` golden.** The system `erl`'s
+  `binary_to_term` aborts on a NaN/Inf `NEW_FLOAT_EXT`, so such a term never reaches
+  `term_to_binary/2 {minor_version,0}`; `src/encode/float.rs` still renders `inf`/`-inf`/`nan` (the
+  glibc `%.20e` spelling) rather than panicking.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `VERSION_MAGIC`
@@ -587,14 +627,19 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/atom_cache.rs` → `AtomCache` (read, 2048-slot distribution atom cache) + the `AtomCacheWriter`
   hook trait (`intern`) `beam_dist` implements for outbound caching
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
-- `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
+- `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `MinorVersion`,
+  `encode_term`/`encode_term_body`/`encode_term_with_minor_version`,
   `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`,
   `Encoder::with_atom_cache` (attaches an `AtomCacheWriter` ⇒ cached atoms emit `ATOM_CACHE_REF`),
-  `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the private
-  fun-classification chain inside `Encoder::encode`
+  `Encoder::set_minor_version`/`with_minor_version` + the private `AtomFlavour`/`latin1_bytes`
+  flavour resolution, `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the
+  private fun-classification chain inside `Encoder::encode`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
 - `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
+- `src/encode/float.rs` → the `FLOAT_EXT` (`99`) text formatter (`format_float_ext` +
+  `normalize_exponent`, `FLOAT_EXT_LEN`) for the `MinorVersion::V0` float flavour — see
+  §Minor-version flavours
 - `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image; the inflated
   body is decoded without a `finish()`, so bytes after the inner term are ignored like the C, while the
   plain path stays strict), `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl.
@@ -638,6 +683,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
 - `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
   encode↔decode, atom-cache encode↔decode, no-cache control)
+- `tests/minor_version.rs` → `{minor_version,N}` byte-exact goldens (atom `ATOM_EXT`/UTF-8 fallback,
+  `FLOAT_EXT` payloads) + round-trips + a **live** `erl` cross-check of the `V0`/`V1` images over a
+  mixed corpus (loud stderr skip when no oracle) — see §Minor-version flavours
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
   legacy-`FLOAT_EXT` decode vector, the malformed-input typed-error cases, and the oracle-gated
