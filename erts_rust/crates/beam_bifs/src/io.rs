@@ -49,32 +49,43 @@
 //! is smaller than the field width when the directive forbids it, a wrong argument
 //! type or count for a directive, running out of arguments, leaving arguments
 //! unconsumed, a `~` at the end of the format, a `~-<n>p`/`~-p` (a left-adjusted
-//! `~p`, which has no clause in `io_lib_format`), and a `~p`/`~P` whose single-line
-//! rendering would have to be re-flowed (see below).
+//! `~p`, which has no clause in `io_lib_format`), and a `~p`/`~P` of a long
+//! container outside the re-flow model (see below).
+//!
+//! # `~p`/`~P` re-flow (`io_lib_pretty`)
+//!
+//! The oracle prints a container under `~p`/`~P` with `io_lib_pretty`, which
+//! breaks it across lines exactly when its single-line rendering is **at least**
+//! `line_length - column` characters long (`line_length` is 80 by default, or the
+//! directive's field width; `column` is 1 by default, or the directive's
+//! precision). Terms the oracle never breaks — `~p` of an atom, number, ref, pid,
+//! fun, **printable** list or **printable** binary — are always emitted on one
+//! line however long.
+//!
+//! This engine reproduces the break ([`crate::print::pretty_chunk`]) for a
+//! **proper or improper list, a tagged or untagged tuple, and a map** each of
+//! whose elements renders single-line, at unlimited depth. It wraps with a break
+//! separator `,` (an improper-list tail uses `|`), indenting continuation lines by
+//! one space, by `tag_len + 2` after a tuple tag, and by two after `#{`; the
+//! narrowest repro is the oracle's own boundary —
+//! `io_lib:format("~p", [lists:seq(1,29)])` (79 chars) returns `[1,…,28,` / ` 29]`
+//! (a break after the 28th element, one-space indent), while `lists:seq(1,28)`
+//! (76 chars) and `lists:seq(1,28) ++ [x]` (78 chars) stay on one line. The flat
+//! condition is the oracle's `length < line_length - column`
+//! (`io_lib_pretty:print/10`, erts-17.1).
+//!
+//! Re-flow is **not** modelled for a container holding another container (nested
+//! re-flow), an element too long to fit on a line of its own, a non-printable
+//! bitstring (`pp_binary` packs its own number of bytes per line), a long tuple
+//! tag (`cind/7` then selects a different indent), or a depth-limited `~P`; those
+//! raise the typed `error:badarg` rather than emit a line the oracle would have
+//! broken differently — never a wrong string.
 //!
 //! # Deviations from the oracle (documented)
 //!
 //! * **Output is a Rust `String` (UTF-8).** Raw format bytes `>= 128` and
 //!   `~s`/`~c` values `>= 128` are emitted as their UTF-8 encoding, not raw latin1
 //!   bytes. The ASCII subset is byte-exact.
-//! * **No `~p`/`~P` re-flow (a typed `badarg`, never a broken line).** The oracle
-//!   prints a container under `~p`/`~P` with `io_lib_pretty`, which breaks it
-//!   across lines exactly when its single-line rendering is **at least**
-//!   `line_length - column` characters long (`line_length` is 80 by default, or
-//!   the directive's field width; `column` is 1 by default, or the directive's
-//!   precision). This engine only implements the single-line form ([`crate::print`]),
-//!   so for the term classes the oracle *would* re-flow — a **tuple, a map, a
-//!   non-printable list, or a non-printable bitstring** — whose rendering reaches
-//!   that length it raises `error:badarg` instead of emitting a line the oracle
-//!   would have broken. Terms the oracle never re-flows (`~p` of an atom, number,
-//!   ref, pid, fun, **printable** list or **printable** binary — those print on
-//!   one line however long) are always emitted. The narrowest repro is a 79-character
-//!   non-printable list: `io_lib:format("~p", [lists:seq(1,29)])` (rendering
-//!   `[1,…,29]`, 79 chars) raises `error:badarg` here, while the oracle returns
-//!   `[1,2,…,28,` / ` 29]` (a break after the 28th element, a one-space indent);
-//!   `lists:seq(1,28)` (76 chars) and `[lists:seq(1,28) ++ [x]]` (78 chars) stay on
-//!   one line here and in the oracle. The rule is the oracle's own flat condition
-//!   `length < line_length - column` (`io_lib_pretty:print/10`, erts-17.1).
 //! * **`~k`/`~K` are rejected.** They select a *map printing order*; this engine's
 //!   printer always uses the flatmap internal order, so honouring them is not
 //!   possible and a silent wrong order is worse than `badarg`.

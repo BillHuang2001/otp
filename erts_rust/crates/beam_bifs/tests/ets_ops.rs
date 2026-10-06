@@ -468,19 +468,10 @@ fn info_reports_the_table_fields() {
         ("size", ctx.int(1).unwrap()),
         ("type", ctx.atom("set").unwrap()),
         ("name", ctx.atom("my_tab").unwrap()),
-        // SOURCE/ORACLE DISCREPANCY (reported upward). In erts-17.1 a table
-        // created *without* the `named_table` option reports
-        // `named_table => false` (verified:
-        // `ets:info(ets:new(t1, [set]), named_table)` ⇒ `false`) even though
-        // `ets:info(T, name)` still returns the name. The M1 bridge marks every
-        // table named — `beam_bifs::ets::new/2` always calls
-        // `TableOptions::set_name`, which `beam_ets` documents as "implies a
-        // named table" — so the sampled value is `true`. The source is frozen
-        // here, so this assertion pins the bridge's actual behaviour;
-        // TODO(beam_bifs/beam_ets): decouple, then expect `false`, as the
-        // oracle does. (`name` above is oracle-correct either way: the name is
-        // always recorded, named or not.)
-        ("named_table", ctx.atom("true").unwrap()),
+        // The table was created without the `named_table` option, so it reports
+        // `named_table => false` (`ets:info(ets:new(t1, [set]), named_table)` ⇒
+        // `false` in the oracle).
+        ("named_table", ctx.atom("false").unwrap()),
         // The `ets:new(T, [set])` default protection is `protected`, not
         // `public` (verified: `ets:info(ets:new(t, [set]), protection)` ⇒
         // `protected`).
