@@ -274,6 +274,227 @@ impl Battery {
             self.srt(&l4),
         ])
     }
+    fn update_counter_bignum_overflow(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.ints(&[1, MAX_SMALL]);
+        table.insert(object, &self.atoms).expect("insert");
+        // `MAX_SMALL + 1` leaves the 60-bit range and is promoted to a bignum.
+        let v1 = table
+            .update_counter(make_small(1), make_small(1), &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v1 = self.r(v1);
+        let l1 = self.srt(&table.lookup(make_small(1), &self.atoms));
+        // …and subtracting 1 normalises it back to a small.
+        let v2 = table
+            .update_counter(make_small(1), make_small(-1), &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let l2 = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[v1, l1, v2, l2])
+    }
+
+    fn update_counter_bignum_kinds(&mut self) -> String {
+        let mut rendered = Vec::new();
+        for kind in [TableKind::Set, TableKind::OrderedSet] {
+            let mut table = self.table(kind, 1);
+            let object = self.ints(&[1, MAX_SMALL]);
+            table.insert(object, &self.atoms).expect("insert");
+            let v1 = table
+                .update_counter(make_small(1), make_small(1), &self.atoms, &mut self.out)
+                .expect("update_counter");
+            let v1 = self.r(v1);
+            let operand = self.big(false, &pow2(100));
+            let v2 = table
+                .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+                .expect("update_counter");
+            let v2 = self.r(v2);
+            let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+            rendered.push(tuple_of(&[v1, v2, stored]));
+        }
+        list_of(&rendered)
+    }
+
+    fn update_counter_bignum_operand(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.ints(&[1, 10]);
+        table.insert(object, &self.atoms).expect("insert");
+        let operand = self.big(false, &pow2(100));
+        let v1 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v1 = self.r(v1);
+        let operand = self.big(true, &pow2(100));
+        let v2 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[v1, v2, stored])
+    }
+
+    fn update_counter_bignum_element(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.big_object(1, true, &pow2(100));
+        table.insert(object, &self.atoms).expect("insert");
+        let v1 = table
+            .update_counter(make_small(1), make_small(5), &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v1 = self.r(v1);
+        let v2 = table
+            .update_counter(make_small(1), make_small(-3), &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[v1, v2, stored])
+    }
+
+    fn update_counter_bignum_add(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.big_object(1, false, &pow2(200));
+        table.insert(object, &self.atoms).expect("insert");
+        // `2^200 + (2^192 + 7)`: a carry-free two-limb-bignum addition.
+        let operand = self.big(false, &pow2_plus(192, 7));
+        let v1 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v1 = self.r(v1);
+        let operand = self.big(true, &pow2(200));
+        let v2 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[v1, v2, stored])
+    }
+
+    fn update_counter_bignum_mixed_sign(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.big_object(1, true, &pow2(100));
+        table.insert(object, &self.atoms).expect("insert");
+        let operand = self.big(false, &pow2(100));
+        let v1 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v1 = self.r(v1);
+        let operand = self.big(true, &pow2_plus(100, 1));
+        let v2 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v2 = self.r(v2);
+        let operand = self.big(false, &pow2(100));
+        let v3 = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let v3 = self.r(v3);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[v1, v2, v3, stored])
+    }
+
+    fn update_counter_bignum_threshold(&mut self) -> String {
+        let mut rendered = Vec::new();
+        for which in 0..3 {
+            let mut table = self.table(TableKind::Set, 1);
+            let object = self.ints(&[1, 0]);
+            table.insert(object, &self.atoms).expect("insert");
+            let operand = match which {
+                0 => {
+                    let incr = self.big(false, &pow2(100));
+                    let threshold = self.big(false, &pow2(99));
+                    self.tuple(&[make_small(2), incr, threshold, make_small(7)])
+                }
+                1 => {
+                    let incr = self.big(true, &pow2(100));
+                    let threshold = self.big(true, &pow2(99));
+                    self.tuple(&[make_small(2), incr, threshold, make_small(-7)])
+                }
+                _ => {
+                    let incr = self.big(false, &pow2(100));
+                    let threshold = self.big(false, &pow2(101));
+                    self.tuple(&[make_small(2), incr, threshold, make_small(0)])
+                }
+            };
+            let value = table
+                .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+                .expect("update_counter");
+            let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+            rendered.push(tuple_of(&[self.r(value), stored]));
+        }
+        list_of(&rendered)
+    }
+
+    fn update_counter_bignum_warp_value(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.ints(&[1, 10]);
+        table.insert(object, &self.atoms).expect("insert");
+        // `10 + 1 = 11 > 5` fires the threshold rule, which stores the bignum
+        // `SetValue`.
+        let set_value = self.big(false, &pow2(100));
+        let operand = self.tuple(&[make_small(2), make_small(1), make_small(5), set_value]);
+        let value = table
+            .update_counter(make_small(1), operand, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let value = self.r(value);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[value, stored])
+    }
+
+    fn update_counter_bignum_list_ops(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.ints(&[1, 0, 0]);
+        table.insert(object, &self.atoms).expect("insert");
+        let first = {
+            let incr = self.big(false, &pow2(100));
+            self.tuple(&[make_small(2), incr])
+        };
+        let second = {
+            let incr = self.big(true, &pow2(100));
+            self.tuple(&[make_small(3), incr])
+        };
+        let operations = self.list(&[first, second]);
+        let value = table
+            .update_counter(make_small(1), operations, &self.atoms, &mut self.out)
+            .expect("update_counter");
+        let value = self.r(value);
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[value, stored])
+    }
+
+    fn update_counter_bignum_position_badarg(&mut self) -> String {
+        let mut table = self.table(TableKind::Set, 1);
+        let object = self.ints(&[1, 10]);
+        table.insert(object, &self.atoms).expect("insert");
+
+        // A bignum *position* is badarg (`erl_db.c:1573` requires a small there).
+        let position = self.big(false, &pow2(100));
+        let operand = self.tuple(&[position, make_small(1)]);
+        let c1 = cap_value(
+            table.update_counter(make_small(1), operand, &self.atoms, &mut self.out),
+            &self.atoms,
+        );
+        // A bignum *threshold* is accepted: `10 + 1 = 11` is not above `2^100`.
+        let threshold = self.big(false, &pow2(100));
+        let operand = self.tuple(&[make_small(2), make_small(1), threshold, make_small(5)]);
+        let c2 = cap_value(
+            table.update_counter(make_small(1), operand, &self.atoms, &mut self.out),
+            &self.atoms,
+        );
+        // A non-integer operand is still badarg, scalar and positional alike.
+        let operand = self.atom("nope");
+        let c3 = cap_value(
+            table.update_counter(make_small(1), operand, &self.atoms, &mut self.out),
+            &self.atoms,
+        );
+        let operand = {
+            let atom = self.atom("nope");
+            self.tuple(&[make_small(2), atom])
+        };
+        let c4 = cap_value(
+            table.update_counter(make_small(1), operand, &self.atoms, &mut self.out),
+            &self.atoms,
+        );
+        let stored = self.srt(&table.lookup(make_small(1), &self.atoms));
+        tuple_of(&[c1, c2, c3, c4, stored])
+    }
 }
 
 /// The `update_counter` / `update_element` cases, in the oracle's order.
@@ -311,6 +532,46 @@ pub(super) fn counter_cases(battery: &mut Battery) -> Vec<(String, String)> {
     cases.push((
         "update_element_variants".into(),
         battery.update_element_variants(),
+    ));
+    cases.push((
+        "update_counter_bignum_overflow".into(),
+        battery.update_counter_bignum_overflow(),
+    ));
+    cases.push((
+        "update_counter_bignum_kinds".into(),
+        battery.update_counter_bignum_kinds(),
+    ));
+    cases.push((
+        "update_counter_bignum_operand".into(),
+        battery.update_counter_bignum_operand(),
+    ));
+    cases.push((
+        "update_counter_bignum_element".into(),
+        battery.update_counter_bignum_element(),
+    ));
+    cases.push((
+        "update_counter_bignum_add".into(),
+        battery.update_counter_bignum_add(),
+    ));
+    cases.push((
+        "update_counter_bignum_mixed_sign".into(),
+        battery.update_counter_bignum_mixed_sign(),
+    ));
+    cases.push((
+        "update_counter_bignum_threshold".into(),
+        battery.update_counter_bignum_threshold(),
+    ));
+    cases.push((
+        "update_counter_bignum_warp_value".into(),
+        battery.update_counter_bignum_warp_value(),
+    ));
+    cases.push((
+        "update_counter_bignum_list_ops".into(),
+        battery.update_counter_bignum_list_ops(),
+    ));
+    cases.push((
+        "update_counter_bignum_position_badarg".into(),
+        battery.update_counter_bignum_position_badarg(),
     ));
 
     cases
