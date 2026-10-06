@@ -56,6 +56,7 @@ impl BifRegistry {
         crate::binconv::register(&mut reg);
         crate::unicode::register(&mut reg);
         crate::time::register(&mut reg);
+        crate::phash::register(&mut reg);
         crate::proc::register(&mut reg);
         crate::reason::register(&mut reg);
         crate::string::register(&mut reg);
