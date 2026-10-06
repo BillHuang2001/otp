@@ -26,21 +26,23 @@
 //!
 //! * `is_record/1` is the **native-record** test (`RECORD_SUBTAG`), *not* a tuple
 //!   test: `erlang:is_record({a,b})` is `false`.
-//! * `is_record(Term, Tag)` is true iff `Tag` is an atom **and** `Term` is a tuple
-//!   of arity ≥ 1 whose first element is `Tag`. The `arity >= 1` guard is what
-//!   makes `erlang:is_record({}, a)` `false`; a non-atom `Tag` is `badarg`
+//! * `is_record(Term, Tag)` is true iff `Tag` is an atom **and** either `Term` is a
+//!   tuple of arity ≥ 1 whose first element is `Tag`, **or** `Term` is a native
+//!   record whose definition `name` is `Tag` (`is_record_2`,
+//!   `erl_bif_op.c:293-315`). The `arity >= 1` guard is what makes
+//!   `erlang:is_record({}, a)` `false`; a non-atom `Tag` is `badarg`
 //!   (`erlang:is_record({a,b}, 1)` ⇒ `error:badarg`).
-//! * `is_record(Term, Tag, Size)`: for a small-integer `Size` the same test with
+//! * `is_record(Term, Tag, Size)`: for a small-integer `Size` the tuple form with
 //!   the *exact* tuple arity `Size` (so `erlang:is_record({}, a, 0)` is `false`,
-//!   while `erlang:is_record({a}, a, 1)` is `true`); for an atom `Size` it is the
-//!   native-record form.
+//!   while `erlang:is_record({a}, a, 1)` is `true`); for an atom `Size` the
+//!   native-record form — `Term` is a native record whose definition module is
+//!   `Tag` **and** name is `Size` (`erl_is_native_record`).
 //!
-//! The native-record half of `is_record/2,3` (comparing `Tag`/`Size` against an
-//! `ErlRecordDefinition`) is a **documented Milestone-1 gap**: the record's
-//! name/size is not readable through this crate's safe term access, so a term that
-//! *is* a native record raises `error:unsupported_bif` rather than answering with a
-//! possibly wrong boolean (see the crate `CONTEXT.md`, Known Issues). No crate in
-//! the workspace can build a native record yet, so the branch is unreachable today.
+//! The native-record halves read the frozen `ErtsRecordDefinition` through
+//! `crate::access`'s safe wrappers over [`beam_term::record`]. Note that a direct,
+//! compiled `is_record/2` call on a native record is translated *by the compiler*
+//! to the tuple test alone (so it answers `false`); the BIF implemented here is the
+//! `apply(erlang, is_record, [R, Name])` behaviour the oracle's BIF actually has.
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
@@ -159,20 +161,20 @@ fn is_function_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `erlang:is_record/1` — a native record (`RECORD_SUBTAG`), not a tuple.
 ///
-/// `is_record_1` (`erl_bif_op.c:279-285`). Milestone-1 builds no native record, so
-/// this is `false` for every term this crate can construct — the same answer the
-/// oracle gives for `erlang:is_record({a,b})`.
+/// `is_record_1` (`erl_bif_op.c:279-285`). A native record is built by the
+/// `records:create/4` family (`crate::records`); `erlang:is_record({a,b})` is
+/// `false`.
 fn is_record_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(access::is_record(args[0]))
 }
 
 /// `erlang:is_record/2` — `Term` is a tuple of arity ≥ 1 whose first element is the
-/// atom `Tag`.
+/// atom `Tag`, or a native record whose definition name is `Tag`.
 ///
 /// `is_record_2` (`erl_bif_op.c:293-315`). A non-atom `Tag` is `badarg`; a term
-/// that is not such a tuple is `false` — including the empty tuple `{}`, which is
-/// why the `arity >= 1` guard is present (`tuple_element(term, 0)` would otherwise
-/// read past a 0-arity tuple).
+/// that is neither such a tuple nor such a native record is `false` — including the
+/// empty tuple `{}`, which is why the `arity >= 1` guard is present
+/// (`tuple_element(term, 0)` would otherwise read past a 0-arity tuple).
 fn is_record_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (term, tag) = (args[0], args[1]);
     if !access::is_atom(tag) {
@@ -185,9 +187,9 @@ fn is_record_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return ctx.boolean(true);
     }
     if access::is_record(term) {
-        // A native record: the oracle compares `RECORD_DEF_P(...)->name` with `Tag`,
-        // which this crate cannot read — a typed error, never a wrong boolean.
-        return Err(error::unsupported_bif());
+        // A native record: compare the definition's `name` with `Tag`
+        // (`is_record_2`, `erl_bif_op.c:306-312`). `Tag` is already an atom.
+        return ctx.boolean(access::native_record_name_is(term, atom_val(tag)));
     }
     ctx.boolean(false)
 }
@@ -205,11 +207,14 @@ fn is_record_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(error::badarg());
     }
     if access::is_atom(size) {
-        // The native-record form (`erl_is_native_record`): the size/name pair is not
-        // readable here, so a native record is a typed error rather than a wrong
-        // `false` (see the module docs). No workspace crate builds one yet.
+        // The native-record form (`erl_is_native_record`): match the record's
+        // definition module (`Tag`) and name (`Size`), both atoms.
         if access::is_record(term) {
-            return Err(error::unsupported_bif());
+            return ctx.boolean(access::native_record_is_native(
+                term,
+                atom_val(tag),
+                atom_val(size),
+            ));
         }
         return ctx.boolean(false);
     }
