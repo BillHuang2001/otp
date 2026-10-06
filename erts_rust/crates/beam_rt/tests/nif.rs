@@ -333,6 +333,11 @@ fn run_binary(args: &[String]) -> Run {
 }
 
 /// The `-noshell -pa <dir> run <caller.beam> caller:<function>/1 "<load-path>"` invocation.
+///
+/// The load path is **double-quoted**: the `run` argument grammar parses a bare token as an atom
+/// and only a quoted token as an Erlang char list, and `erlang:load_nif/2` requires a list or a
+/// binary (an atom is `badarg`). The scratch path carries no `"` or backslash, so no escaping is
+/// needed.
 fn invoke(fixture: &Fixture, function: &str, load_path: &Path) -> Run {
     let args = vec![
         "-noshell".to_string(),
@@ -341,7 +346,7 @@ fn invoke(fixture: &Fixture, function: &str, load_path: &Path) -> Run {
         "run".to_string(),
         fixture.caller.display().to_string(),
         format!("caller:{function}/1"),
-        load_path.display().to_string(),
+        format!("\"{}\"", load_path.display()),
     ];
     run_binary(&args)
 }
