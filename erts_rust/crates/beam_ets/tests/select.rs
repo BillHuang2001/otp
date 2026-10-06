@@ -4,6 +4,11 @@
 //! Every expectation below was derived by running the same spec against the system
 //! `erl` (OTP 29 / erts-17.1, `erl -noshell -eval '…' -s init stop`); the probe
 //! results are quoted next to the assertion.
+//!
+//! This is deliberately one comprehensive suite: it is a long file (over the
+//! workspace's ~1000-line guidance) because the match-spec language is covered as
+//! a single coherent battery — heads, guards, bodies, arithmetic — and splitting it
+//! by construct would duplicate the shared fixtures and oracle probes.
 
 use std::rc::Rc;
 

@@ -43,6 +43,12 @@
 //! rule this crate is specified against — which is strictly more permissive in the
 //! corners pinned by the `recorded_divergence_*` tests at the end of this file.
 //! Wherever the oracle *accepts*, the two agree on every case here.
+//!
+//! This is deliberately one comprehensive suite: it is a long file (over the
+//! workspace's ~1000-line guidance) because `select_replace/2`, the body
+//! runtime-failure rule and the recorded static-check divergence are covered as a
+//! single battery against one shared oracle renderer; splitting it by rule would
+//! duplicate that harness.
 
 mod common;
 

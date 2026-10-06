@@ -3,10 +3,14 @@
 //!
 //! [`Table`] owns the table metadata (id, kind, keypos, access, owner), a
 //! table-owned [`TermStore`] (the copy boundary) and one interior behind the
-//! private `Interior` trait. The interior shape is *not* externally pinned
-//! (workspace `CONTEXT.md` §2): a hash index and an ordered index implement the
-//! same trait, so a future CHAMP/HAMT/B-tree interior slots in without touching
-//! this dispatch or any dependent.
+//! private `Interior` trait (see the `interior` module). The interior shape is
+//! *not* externally pinned (workspace `CONTEXT.md` §2): a hash index and an
+//! ordered index implement the same trait, so a future CHAMP/HAMT/B-tree interior
+//! slots in without touching this dispatch or any dependent.
+//!
+//! This module keeps the metadata, the constructors and the write operations;
+//! the read/navigation surface lives in the `read` module, the `Interior` seam in
+//! the `interior` module.
 
 use core::fmt;
 use core::sync::atomic::{AtomicU64, Ordering};
@@ -15,24 +19,25 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::error::{badarg, unsupported};
-use crate::hash_interior::HashInterior;
+use crate::error::badarg;
 use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
 use crate::kind::{can_read, can_write, Access, TableKind, TableOptions};
-use crate::ordered_interior::OrderedSetInterior;
 use crate::select::SelectPredicate;
 use crate::store::TermStore;
 
 mod access;
 mod element;
+mod interior;
 mod ownership;
+mod read;
 mod update;
 
 pub use access::TableAccess;
 pub use ownership::{Heir, SetOpt};
+pub(crate) use interior::Interior;
+use interior::build_interior;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
-use update::{object_arity, read_counter};
 
 /// The process-global source of table identifiers (`ets:new/2` hands one out per
 /// table). Monotonic and never reused; the identifier itself is opaque to
@@ -89,232 +94,6 @@ impl OwnerId {
     /// The raw owner identifier value.
     pub fn raw(self) -> u64 {
         self.0
-    }
-}
-
-/// The internal dispatch seam implemented by the crate's interiors
-/// (`HashInterior`, `OrderedSetInterior`).
-///
-/// Private: **not** part of the cross-crate API. [`Table`] derives the key from
-/// the object (`crate::key::key_of`) and passes both to the interior, so the two
-/// interiors can share one dispatch surface despite different shapes. All term
-/// ordering/hashing is delegated to `beam_term`.
-pub(crate) trait Interior {
-    /// Insert `object` under `key`, applying the kind's duplicate rules
-    /// (replace for `set`/`ordered_set`), and report whether the object was
-    /// **retained**.
-    ///
-    /// `true` means the interior stored `object` (or replaced the entry with it)
-    /// and now owns it; `false` means the interior rejected the object as a
-    /// duplicate no-op (`bag`), so it did **not** store it and the object is
-    /// unreferenced. The caller ([`Table::insert`]) reclaims a rejected copy from
-    /// the store, so a rejected duplicate never leaks storage. `set`/`ordered_set`
-    /// always retain (a replace keeps the *new* object) and `duplicate_bag` always
-    /// retains; only `bag` can answer `false`.
-    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool>;
-
-    /// Insert `object` under `key` only if `key` is absent; returns whether the
-    /// object was inserted.
-    fn insert_new(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool>;
-
-    /// Remove every object stored under `key`.
-    fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()>;
-
-    /// Remove the single object that equals `object` within `key`'s objects.
-    fn delete_object(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<()>;
-
-    /// All objects stored under `key` (0 or 1 for `set`/`ordered_set`).
-    fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;
-
-    /// Whether any object is stored under `key`.
-    fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;
-
-    /// The `pos`-th element (0-based) of the single object stored under `key`;
-    /// `badarg` when `key` is absent.
-    fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>;
-
-    /// The `pos`-th element (0-based) of **every** object stored under `key`, in
-    /// this interior's stored order — `ets:lookup_element/3`'s result for a
-    /// multi-object kind (`bag`/`duplicate_bag`), where the oracle returns a
-    /// *list*.
-    ///
-    /// `badarg` when `key` is absent, and when **any** stored object's arity is at
-    /// most `pos` — the oracle fails the whole call, it does not skip the short
-    /// object (verified against the system `erl`, OTP 29 / erts-17.1). The
-    /// single-object kinds (`set`/`ordered_set`) store at most one object per key,
-    /// so their list has exactly one element.
-    ///
-    /// The default reads the objects through [`lookup`](Interior::lookup) and
-    /// projects each with [`key_of`] (which is what rejects a short object); an
-    /// interior may override it with a single-pass version.
-    fn lookup_elements(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>> {
-        let keypos = pos.checked_add(1).ok_or_else(badarg)?;
-        let objects = self.lookup(key, atoms);
-        if objects.is_empty() {
-            return Err(badarg());
-        }
-        let mut elements = Vec::with_capacity(objects.len());
-        for object in objects {
-            elements.push(key_of(object, keypos)?);
-        }
-        Ok(elements)
-    }
-    /// The total number of stored objects (not keys, for the multi kinds).
-    fn size(&self) -> usize;
-
-    /// Every stored object, ordered for `ordered_set`.
-    fn iter_objects(&self) -> Box<dyn Iterator<Item = Eterm> + '_>;
-
-    // ------------------------------------- removal, navigation and storage
-
-    /// Remove `key`'s entry and return **every** object stored under it (an empty
-    /// vector when `key` is absent), mirroring `ets:take/2`.
-    ///
-    /// The returned objects **alias table storage** (they are the interior's own
-    /// copies); [`Table::take`], the only caller through the public API, deep-copies
-    /// them out of the store and then reclaims these originals, so no returned pointer
-    /// is ever a reclaimed word. The drop-in default locates the objects and then
-    /// deletes the entry; the hash interior overrides it with its one-pass removal.
-    fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
-        let objects = self.lookup(key, atoms);
-        if !objects.is_empty() {
-            self.delete(key, atoms)?;
-        }
-        Ok(objects)
-    }
-
-    /// Every stored key, in this interior's own iteration order (ascending
-    /// `beam_term` order for `ordered_set`, bucket-scan order for the hash kinds).
-    fn keys(&self) -> Vec<Eterm>;
-
-    /// The first key in this interior's iteration order (`ets:first/1`); `None`
-    /// when the table is empty (`'$end_of_table'`).
-    fn first_key(&self, _atoms: &AtomTable) -> Option<Eterm> {
-        self.keys().first().copied()
-    }
-
-    /// The last key in this interior's iteration order (`ets:last/1`); `None`
-    /// when the table is empty.
-    fn last_key(&self, _atoms: &AtomTable) -> Option<Eterm> {
-        self.keys().last().copied()
-    }
-
-    /// The key following `key` in this interior's iteration order, or `None` at
-    /// the end of that order.
-    ///
-    /// An **absent** `key` has no position in the iteration order, so the answer
-    /// falls back to the nearest key in `beam_term` term order (the first key
-    /// strictly greater than `key`); that is exactly the `ordered_set` range
-    /// semantics, and it gives the hash default a well-defined answer too.
-    fn next_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
-        let keys = self.keys();
-        match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {
-            Some(position) => keys.get(position + 1).copied(),
-            None => keys
-                .into_iter()
-                .find(|&candidate| cmp(candidate, key, atoms).is_gt()),
-        }
-    }
-
-    /// The key preceding `key` in this interior's iteration order, or `None` at
-    /// the start of that order (the mirror of [`Interior::next_key`]).
-    fn prev_key(&self, key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
-        let keys = self.keys();
-        match keys.iter().position(|&candidate| eq(candidate, key, atoms)) {
-            Some(position) => position.checked_sub(1).map(|before| keys[before]),
-            None => keys
-                .into_iter()
-                .rev()
-                .find(|&candidate| cmp(candidate, key, atoms).is_lt()),
-        }
-    }
-
-    /// The number of `Eterm`-sized words this interior has allocated for its own
-    /// index (`ets:info(Tab, memory)`'s interior contribution).
-    ///
-    /// The default is `0` — an interior that does not account for its index
-    /// storage contributes nothing; the hash and `ordered_set` interiors report
-    /// their honest bucket/entry and B+-tree node-arena allocations respectively.
-    fn memory(&self) -> usize {
-        0
-    }
-
-    // ------------------------------------- element updates (`ets:update_*`)
-
-    /// `ets:update_counter/3,4` on a single position: add `incr` to element `pos`
-    /// (1-based) of the object stored under `key` and return the **new** counter
-    /// value.
-    ///
-    /// The drop-in default reads the element, adds through the shared
-    /// [`add_counters`] helper, rebuilds the object on `heap` and inserts it back
-    /// — which is exactly what the B+-tree interior (no writable index slot)
-    /// needs. The hash interior overrides it with a destructive element write.
-    ///
-    /// `badarg` when `key` is absent, `pos` is outside `1..=arity`, or the element
-    /// / `incr` is not an integer. The `pos == keypos` rule is the caller's: the
-    /// interior does not know `keypos`.
-    fn update_counter(
-        &mut self,
-        key: Eterm,
-        pos: usize,
-        incr: Eterm,
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<Eterm> {
-        let object = self.lookup(key, atoms).into_iter().next().ok_or_else(badarg)?;
-        let arity = object_arity(object)?;
-        let newcnt = add_counters(read_counter(object, pos)?, incr, heap)?;
-        let updated = replace_elements(object, arity, &[(pos, newcnt)], heap)?;
-        self.insert(key, updated, atoms)?;
-        Ok(newcnt)
-    }
-
-    /// `ets:update_element/3`: replace element `pos` (1-based) of the object
-    /// stored under `key` with each `[pos, value]` of `updates` (later entries win
-    /// for a repeated position), building the replacement on `heap`. Returns
-    /// whether `key` existed.
-    ///
-    /// The drop-in default rebuilds the object on `heap` and inserts it back,
-    /// which is what the B+-tree interior needs; the hash interior overrides it.
-    ///
-    /// `Ok(false)` for an absent `key` (not an error), `badarg` for a `pos`
-    /// outside `1..=arity` — with **nothing** written, since every position is
-    /// validated before any is applied.
-    fn update_element(
-        &mut self,
-        key: Eterm,
-        updates: &[(usize, Eterm)],
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<bool> {
-        let object = match self.lookup(key, atoms).into_iter().next() {
-            Some(object) => object,
-            None => return Ok(false),
-        };
-        let arity = object_arity(object)?;
-        for &(pos, _) in updates {
-            if pos == 0 || pos > arity {
-                return Err(badarg());
-            }
-        }
-        if updates.is_empty() {
-            // Nothing to change; the key existed, so `ets` reports `true`.
-            return Ok(true);
-        }
-        let updated = replace_elements(object, arity, updates, heap)?;
-        self.insert(key, updated, atoms)?;
-        Ok(true)
-    }
-}
-
-/// Build the interior matching `kind`: the hash index for `set`/`bag`/
-/// `duplicate_bag`, the key-sorted index for `ordered_set`.
-fn build_interior(kind: TableKind) -> Box<dyn Interior> {
-    match kind {
-        TableKind::Set | TableKind::Bag | TableKind::DuplicateBag => {
-            Box::new(HashInterior::new(kind))
-        }
-        TableKind::OrderedSet => Box::new(OrderedSetInterior::new()),
     }
 }
 
@@ -610,237 +389,6 @@ impl Table {
         self.interior = build_interior(self.opts.kind());
     }
 
-    /// The objects stored under `key` (0 or 1 for `set`/`ordered_set`).
-    pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm> {
-        self.interior.lookup(key, atoms)
-    }
-
-    /// Whether `key` is present.
-    pub fn member(&self, key: Eterm, atoms: &AtomTable) -> bool {
-        self.interior.member(key, atoms)
-    }
-
-    /// The `pos`-th element (1-based) of the object stored under `key`;
-    /// `badarg` when `key` is absent or `pos` is out of range.
-    ///
-    /// Only `set`/`ordered_set` — which store at most one object per key — have a
-    /// scalar answer. The multi kinds (`bag`/`duplicate_bag`) hold **several**
-    /// objects under one key and `ets:lookup_element/3` returns a *list* of their
-    /// `pos`-th elements; a scalar is therefore undefined for them, and this method
-    /// raises the crate's typed
-    /// [`unsupported`](crate::error::unsupported) instead of a wrong element. Use
-    /// [`lookup_element_all`](Table::lookup_element_all) for those kinds.
-    ///
-    /// The oracle's *failures* are still answered exactly: `pos == 0`, an absent
-    /// `key`, and a stored object whose arity is `< pos` are all `badarg`.
-    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm> {
-        // The public position is 1-based; `0` is `badarg` (mirroring `ets`).
-        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
-        if self.opts.kind().is_multi() {
-            // `lookup_elements` reproduces the oracle's `badarg`s (absent key, a
-            // short object); where the oracle has an answer it is the *list*, so a
-            // scalar would be a wrong result.
-            return self
-                .interior
-                .lookup_elements(key, pos, atoms)
-                .and_then(|_| Err(unsupported(MULTI_ELEMENT_SCALAR)));
-        }
-        self.interior.lookup_element(key, pos, atoms)
-    }
-
-    /// `ets:lookup_element/4`: exactly [`lookup_element`](Table::lookup_element),
-    /// except that an absent `key` yields `default` instead of `badarg`.
-    ///
-    /// Verified against the system `erl` (OTP 29 / erts-17.1): `pos` is 1-based and
-    /// `pos == 0` is `badarg` whatever the key; an **absent** key returns `default`
-    /// even when `pos` is beyond the object's arity; a **present** key with a `pos`
-    /// outside the object's arity is `badarg`.
-    ///
-    /// Like the `/3` form it is scalar, so for `bag`/`duplicate_bag` it raises the
-    /// typed [`unsupported`](crate::error::unsupported) for a present key (an absent
-    /// key still yields `default`); use
-    /// [`lookup_element_all_or`](Table::lookup_element_all_or) there.
-    pub fn lookup_element_or(
-        &self,
-        key: Eterm,
-        pos: usize,
-        default: Eterm,
-        atoms: &AtomTable,
-    ) -> Result<Eterm> {
-        // `pos` is validated before the key is consulted (mirroring `ets`).
-        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
-        let present = self.interior.member(key, atoms);
-        match (self.opts.kind().is_multi(), present) {
-            // An absent key is `default` whatever the kind.
-            (_, false) => Ok(default),
-            // A present key on a multi kind: the oracle's answer is the element
-            // *list* (or `badarg` for an object too short to have `pos`).
-            (true, true) => self
-                .interior
-                .lookup_elements(key, pos, atoms)
-                .and_then(|_| Err(unsupported(MULTI_ELEMENT_SCALAR))),
-            (false, true) => self.interior.lookup_element(key, pos, atoms),
-        }
-    }
-
-    /// `ets:lookup_element/3` for a multi-object kind (`bag`/`duplicate_bag`): the
-    /// `pos`-th element (1-based) of **every** object stored under `key`, in
-    /// stored order.
-    ///
-    /// Heap-free, like [`lookup`](Table::lookup): the returned elements read
-    /// table-owned storage (`Immediate` elements are copied by value), so no
-    /// allocation or host heap is involved. Mirrors the system `erl` (OTP 29 /
-    /// erts-17.1), where the multi kinds answer with a list: a key holding a single
-    /// object yields a one-element list, duplicates (`duplicate_bag`) are
-    /// preserved, an **absent** `key` is `badarg`, `pos == 0` is `badarg`, and one
-    /// object whose arity is `< pos` makes the **whole** call `badarg`.
-    ///
-    /// `set`/`ordered_set` store at most one object per key, so for them the vector
-    /// always holds exactly one element — the same element
-    /// [`lookup_element`](Table::lookup_element) returns.
-    pub fn lookup_element_all(
-        &self,
-        key: Eterm,
-        pos: usize,
-        atoms: &AtomTable,
-    ) -> Result<Vec<Eterm>> {
-        // The public position is 1-based; `0` is `badarg` (mirroring `ets`).
-        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
-        self.interior.lookup_elements(key, pos, atoms)
-    }
-
-    /// `ets:lookup_element/4` for a multi-object kind: exactly
-    /// [`lookup_element_all`](Table::lookup_element_all), except that an absent
-    /// `key` is reported as `Ok(None)` — the caller yields `default` — instead of
-    /// `badarg`.
-    ///
-    /// The split mirrors the oracle exactly: `pos == 0` is `badarg` **before** the
-    /// key is consulted, an absent key yields `default` whatever `pos`, and a
-    /// present key keeps every failure of
-    /// [`lookup_element_all`](Table::lookup_element_all). It is heap-free and
-    /// cannot build `default` itself, which is why the absent key is a `None`
-    /// rather than a term.
-    pub fn lookup_element_all_or(
-        &self,
-        key: Eterm,
-        pos: usize,
-        default: Eterm,
-        atoms: &AtomTable,
-    ) -> Result<Option<Vec<Eterm>>> {
-        // `pos` is validated before the key is consulted (mirroring `ets`).
-        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
-        // `default` belongs to the caller: this method reports the absent key as
-        // `None` and the BIF layer substitutes the term.
-        let _ = default;
-        if !self.interior.member(key, atoms) {
-            return Ok(None);
-        }
-        Ok(Some(self.interior.lookup_elements(key, pos, atoms)?))
-    }
-    /// The number of words allocated to the table (`ets:info(Tab, memory)`): the
-    /// table-owned term storage plus the interior's own index storage.
-    pub fn memory(&self) -> usize {
-        self.store.words() + self.interior.memory()
-    }
-
-    // --------------------------------------------------------------- navigation
-
-    /// The first key in the table's iteration order (`ets:first/1`); `None` is the
-    /// `'$end_of_table'` result and an empty table always yields it.
-    pub fn first(&self, atoms: &AtomTable) -> Option<Eterm> {
-        self.interior.first_key(atoms)
-    }
-
-    /// The last key in the table's iteration order (`ets:last/1`); `None` is the
-    /// `'$end_of_table'` result and an empty table always yields it.
-    pub fn last(&self, atoms: &AtomTable) -> Option<Eterm> {
-        self.interior.last_key(atoms)
-    }
-
-    /// The key following `key` (`ets:next/2`); `Ok(None)` is the
-    /// `'$end_of_table'` result.
-    ///
-    /// Mirrors the verified `erl` (OTP 29 / erts-17.1) behaviour: an `ordered_set`
-    /// reads `key` as a **range bound** — an absent key is fine and the answer is
-    /// the nearest stored key above it (so an empty table yields `'$end_of_table'`)
-    /// — whereas the hash kinds (`set`/`bag`/`duplicate_bag`) walk an internal
-    /// order anchored at a *present* entry and raise `badarg` for an unknown key,
-    /// which includes every key of an empty table.
-    pub fn next(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
-        self.check_navigable(key, atoms)?;
-        Ok(self.interior.next_key(key, atoms))
-    }
-
-    /// The key preceding `key` (`ets:prev/2`); `Ok(None)` is the
-    /// `'$end_of_table'` result. Mirrors [`next`](Table::next) (verified against the
-    /// system `erl`): a range bound for `ordered_set`, a present-key requirement
-    /// (`badarg` otherwise) for the hash kinds.
-    pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>> {
-        self.check_navigable(key, atoms)?;
-        Ok(self.interior.prev_key(key, atoms))
-    }
-
-    /// The guard shared by [`next`](Table::next)/[`prev`](Table::prev): only the
-    /// hash kinds need the anchor key to be present.
-    fn check_navigable(&self, key: Eterm, atoms: &AtomTable) -> Result<()> {
-        if self.opts.kind().is_ordered() || self.interior.member(key, atoms) {
-            Ok(())
-        } else {
-            Err(badarg())
-        }
-    }
-
-    /// Remove `key`'s entry and return every object stored under it
-    /// (`ets:take/2`); an absent key yields an empty vector.
-    ///
-    /// The removed objects are **handed to the caller**: each is deep-copied out of
-    /// table storage and the table's own original copy is reclaimed
-    /// ([`TermStore::free`](crate::store::TermStore::free)), so a churn of `insert` +
-    /// `take` does not grow the table's memory. The returned copies are
-    /// [`relinquish`](crate::store::TermStore::relinquish)ed: they stay valid for the
-    /// table's lifetime and their words are never reused (a later `copy` can never
-    /// hand the caller's term out again), but they no longer count as table memory —
-    /// exactly the real `ets:take/2`, where the objects move off the table.
-    ///
-    /// Every object is copied **before** any original is reclaimed: a copy reads its
-    /// original's words, which `free` would return to the store's free lists.
-    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
-        let removed = self.interior.take(key, atoms)?;
-        if removed.is_empty() {
-            return Ok(Vec::new());
-        }
-        // Deep-copy every removed object out first (see the doc above).
-        let mut taken = Vec::with_capacity(removed.len());
-        for &original in &removed {
-            match self.store.copy(original) {
-                Ok(copy) => taken.push(copy),
-                Err(err) => {
-                    // The entry is gone either way, so nothing may stay counted:
-                    // reclaim the copies taken so far **and** every original before
-                    // reporting. (In practice unreachable — a table-owned object is
-                    // always a copy of a supported term — but the failure path must
-                    // not leak.)
-                    for copy in taken.drain(..) {
-                        self.store.free(copy);
-                    }
-                    for &original in &removed {
-                        self.store.free(original);
-                    }
-                    return Err(err);
-                }
-            }
-        }
-        // Hand the copies to the caller (no longer table memory, never reusable) and
-        // reclaim the table's own originals.
-        for &copy in &taken {
-            self.store.relinquish(copy);
-        }
-        for &original in &removed {
-            self.store.free(original);
-        }
-        Ok(taken)
-    }
-
     /// Whether `requester` may **read** the table; an access violation is
     /// `BeamError::BadArg`, matching how `ets` reports it.
     pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()> {
@@ -873,25 +421,6 @@ impl Table {
             table: self,
             requester,
         }
-    }
-
-    /// The number of objects in the table.
-    ///
-    /// The `ets` accessor is `ets:info(T, size)`; `ets:size/1` does not exist in
-    /// this OTP (OTP 29 / erts-17.1), so the differential battery reads it through
-    /// `ets:info/2`.
-    pub fn size(&self) -> usize {
-        self.interior.size()
-    }
-
-    /// Whether the table holds no objects.
-    pub fn is_empty(&self) -> bool {
-        self.size() == 0
-    }
-
-    /// Every object in the table (ordered for `ordered_set`).
-    pub fn tab2list(&self) -> Vec<Eterm> {
-        self.interior.iter_objects().collect()
     }
 
     /// Every object whose element slice `pred` accepts (the M1 select
