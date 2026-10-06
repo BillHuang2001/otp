@@ -424,6 +424,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/negative/real-module integration tests
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
+- `tests/native_record.rs` → real-module structural check that `is_any_native_record` lowers to `Instr::IsAnyNativeRecord` (never `Instr::Generic`) across the stdlib ebin; loud skip when `erl`/OTP is absent
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
