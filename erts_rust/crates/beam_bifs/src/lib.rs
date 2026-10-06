@@ -21,7 +21,8 @@
 //!
 //! * [`registry`] — the `(module, function, arity) → impl` seam ([`BifRegistry`],
 //!   [`BifFn`]) that the engine/`beam_rt` resolves against.
-//! * [`context`] — [`BifContext`] and the optional `output`/`sender`/`tables` seams.
+//! * [`context`] — [`BifContext`] and the optional
+//!   `output`/`sender`/`tables`/`fun_caller` seams.
 //! * [`error`] — the `badarg`/`badarith`/`badarity`/`system_limit` constructors and
 //!   the public `error`/`exit`/`throw` raise builders.
 //! * `access` — the crate's **only** `unsafe` module: safe wrappers over
@@ -58,7 +59,7 @@ mod type_test;
 mod unicode;
 
 pub use crate::context::{
-    AtomInterner, BifContext, BytesSink, NullSink, OutputSink, SendHook, StdoutSink,
+    AtomInterner, BifContext, BytesSink, FunCaller, NullSink, OutputSink, SendHook, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -74,6 +75,6 @@ pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
-        NullSink, OutputSink, SendHook, StdoutSink, TableRegistry,
+        FunCaller, NullSink, OutputSink, SendHook, StdoutSink, TableRegistry,
     };
 }

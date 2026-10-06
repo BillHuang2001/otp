@@ -9,11 +9,12 @@
 //! * the [`AtomTable`] (atom construction never invents an index);
 //! * the calling process's [`ProcessId`] — there is no ambient "current process"
 //!   in the Rust core, so identity is injected here;
-//! * three **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
-//!   (`send/2`) and a [`TableRegistry`] (`ets:*`). `beam_engine` depends only on
+//! * four **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//!   (`send/2`), a [`TableRegistry`] (`ets:*`) and a [`FunCaller`] (the
+//!   `fun`-taking `lists`/`maps` BIFs). `beam_engine` depends only on
 //!   `beam_loader`, so `beam_rt` supplies the concrete implementations; an unset
-//!   seam means `io:format` writes to stdout and the `send`/`ets` BIFs report
-//!   `unsupported_bif`.
+//!   seam means `io:format` writes to stdout and the `send`/`ets`/`call_fun` BIFs
+//!   report `unsupported_bif`.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -105,6 +106,26 @@ pub trait SendHook {
     fn send(&mut self, to: Eterm, term: Eterm) -> Result<()>;
 }
 
+/// Calls an Erlang fun from inside a BIF.
+///
+/// A [`BifFn`](crate::registry::BifFn) is a plain Rust function: it cannot execute
+/// BEAM code itself. The `fun`-taking `lists`/`maps` BIFs (`lists:map/2`,
+/// `lists:foldl/3`, `lists:sort/2`, `maps:map/2`, …) must nevertheless *call* an
+/// Erlang fun, so the runtime supplies this hook over its evaluator's closure
+/// table (`beam_rt` wires it to `beam_engine::ExecutionContext`'s apply-fun seam).
+/// Milestone-1 has no in-crate evaluator, so those BIFs raise `unsupported_bif`
+/// when no hook is installed — never a wrong result.
+pub trait FunCaller {
+    /// Calls `fun` with `args`, returning its result term.
+    ///
+    /// # Errors
+    ///
+    /// Propagates whatever the call raises: an argument mismatch
+    /// (`badarg`/`badarity`), or a BEAM raise (`error`/`exit`/`throw`) raised by
+    /// the fun body, as a [`BeamError`].
+    fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm>;
+}
+
 /// Interns a new atom name into the runtime's *global* atom table.
 ///
 /// The context only borrows the atom table immutably ([`BifContext::atoms`]),
@@ -128,6 +149,7 @@ pub struct BifContext<'a> {
     sender: Option<&'a mut dyn SendHook>,
     tables: Option<&'a mut TableRegistry>,
     interner: Option<&'a mut dyn AtomInterner>,
+    fun_caller: Option<&'a mut dyn FunCaller>,
 }
 
 impl<'a> BifContext<'a> {
@@ -142,6 +164,7 @@ impl<'a> BifContext<'a> {
             sender: None,
             tables: None,
             interner: None,
+            fun_caller: None,
         }
     }
 
@@ -166,6 +189,12 @@ impl<'a> BifContext<'a> {
     /// Installs the atom-interning hook used by `list_to_atom`/`binary_to_atom`.
     pub fn with_atom_interner(mut self, interner: &'a mut dyn AtomInterner) -> Self {
         self.interner = Some(interner);
+        self
+    }
+
+    /// Installs the fun-calling hook used by the `fun`-taking `lists`/`maps` BIFs.
+    pub fn with_fun_caller(mut self, caller: &'a mut dyn FunCaller) -> Self {
+        self.fun_caller = Some(caller);
         self
     }
 
@@ -211,6 +240,22 @@ impl<'a> BifContext<'a> {
     /// The installed table registry, if any.
     pub fn tables(&mut self) -> Option<&mut TableRegistry> {
         self.tables.as_deref_mut()
+    }
+
+    /// Calls `fun` with `args` through the installed [`FunCaller`].
+    ///
+    /// This is the seam the `fun`-taking `lists`/`maps` BIFs use to execute an
+    /// Erlang fun (`lists:map/2`, `lists:foldl/3`, `maps:map/2`, …).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no caller;
+    /// otherwise propagates the callee's own failure.
+    pub fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+        match self.fun_caller.as_deref_mut() {
+            Some(caller) => caller.call_fun(fun, args),
+            None => Err(crate::error::unsupported_bif()),
+        }
     }
 
     /// A 60-bit small integer.
@@ -399,5 +444,67 @@ mod tests {
         let float = ctx.make_float(1.5).expect("fits");
         assert!(crate::access::is_float(float));
         assert_eq!(crate::access::float_value(float), 1.5);
+    }
+
+    /// A minimal `FunCaller` test double: it recognises a *sentinel* fun term (the
+    /// small integer `1`) and answers with `Args ++ Marker` on its own heap.
+    ///
+    /// Milestone-1 cannot build a real `FUN_SUBTAG` term from safe Rust without an
+    /// evaluator, so the tests identify "the fun" structurally — exactly what a
+    /// `beam_rt` implementation does with a real closure reference.
+    struct RecordingCaller {
+        heap: Heap,
+        calls: Vec<Vec<Eterm>>,
+    }
+
+    impl RecordingCaller {
+        fn new() -> RecordingCaller {
+            RecordingCaller {
+                heap: Heap::new(64).expect("test heap"),
+                calls: Vec::new(),
+            }
+        }
+    }
+
+    impl FunCaller for RecordingCaller {
+        fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+            assert_eq!(fun, make_small(1), "only the sentinel fun is recognised");
+            self.calls.push(args.to_vec());
+            self.heap.tuple(args)
+        }
+    }
+
+    #[test]
+    fn call_fun_without_a_caller_is_a_typed_unsupported() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        match ctx.call_fun(make_small(1), &[make_small(2)]) {
+            Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+                assert_eq!(raise.reason, beam_common::ExitReason::atom("unsupported_bif"));
+            }
+            other => panic!("expected an unsupported_bif raise, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn call_fun_with_a_caller_delegates_with_the_arguments() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let fun = make_small(1);
+        let mut caller = RecordingCaller::new();
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_fun_caller(&mut caller);
+            let result = ctx
+                .call_fun(fun, &[make_small(7), make_small(8)])
+                .expect("the caller answers");
+            assert!(crate::access::is_tuple(result));
+            assert_eq!(crate::access::tuple_size(result), 2);
+            assert_eq!(crate::access::tuple_element(result, 1), make_small(8));
+        }
+        assert_eq!(caller.calls, vec![vec![make_small(7), make_small(8)]]);
     }
 }

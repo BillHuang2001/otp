@@ -1,7 +1,8 @@
 //! `maps` module BIFs over flat maps: `new/0`, `from_list/1`, `to_list/1`,
 //! `get/2,3`, `find/2`, `put/3`, `update/3`, `remove/2`, `keys/1`, `values/1`,
 //! `size/1`, `is_key/2`, `merge/2`, `with/2`, `without/2`, `iterator/1`, `next/1`,
-//! plus the `erlang:map_*` entries `map_get/2`, `map_size/1` and `is_map_key/2`.
+//! the `fun`-taking `map/2`, `fold/3`, `filter/2` and `foreach/2`, plus the
+//! `erlang:map_*` entries `map_get/2`, `map_size/1` and `is_map_key/2`.
 //!
 //! Ground truth (read-only): `../../erts/emulator/beam/erl_map.c` (the
 //! `maps_*` BIFs), `../../lib/stdlib/src/maps.erl` (the `new/0`/`to_list/1`/
@@ -13,8 +14,29 @@
 //! `erlang:is_map_key/2`). Flat-map layout is owned by `beam_term::thing`
 //! (`write_flatmap`/`flatmap_parts`) and reached through [`crate::access`].
 //!
-//! The `fun`-taking BIFs (`fold/3`, `map/2`, `update_with/3,4`, `filter/2`) are not
-//! registered here (they need an apply/callback seam; the stdlib module runs them).
+//! # The `fun`-taking BIFs
+//!
+//! `map/2`, `fold/3`, `filter/2` and `foreach/2` are real `erl_map.c` BIFs, so
+//! they are registered here rather than left to `maps.erl`. They call their fun
+//! through [`BifContext::call_fun`] (the [`crate::FunCaller`] seam); with no caller
+//! installed (Milestone-1 has no in-crate evaluator) they raise `unsupported_bif`,
+//! and a fun's own failures propagate verbatim.
+//!
+//! * `map(Fun, Map)` calls `Fun(Key, Value)` and stores the result — the keys are
+//!   unchanged, the values are the fun's results, in the map's stored order.
+//! * `fold(Fun, Init, Map)` is `Acc = Fun(Key, Value, Acc)`; `filter(Pred, Map)`
+//!   keeps the pairs whose predicate returns `true`; `foreach(Fun, Map)` is called
+//!   for its side effects and returns `ok`.
+//! * A predicate result that is not a `true`/`false` atom is `badarg` (the oracle
+//!   reports `case_clause`).
+//! * The traversal order is the map's **stored** order (OTP documents map order as
+//!   unspecified; see the section below), so a `fold` that accumulates into a list
+//!   may order that list differently from the oracle.
+//!
+//! The fun argument is **not** arity-checked here — that is the runtime's job when
+//! it invokes it — so `maps:map(5, #{})` returns `#{}` where the oracle raises
+//! `badarg` (documented Milestone-1 gap: a non-fun is only detected once a fun call
+//! actually happens).
 //!
 //! # Key identity is exact (`=:=`)
 //!
@@ -433,6 +455,81 @@ fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.tuple(&[key, value, next_iter])
 }
 
+// ---------------------------------------------------------------------------
+// The `fun`-taking BIFs (via the `FunCaller` seam)
+// ---------------------------------------------------------------------------
+
+/// The boolean value of a `true`/`false` **atom** predicate result, else `badarg`.
+///
+/// `maps:filter/2` reads its predicate through the oracle's `case Pred(K, V) of
+/// true -> …; false -> … end`, so a non-boolean is an error and not a truthy value
+/// (the oracle reports `case_clause`; Milestone-1 reports `badarg`).
+fn predicate_holds(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
+    if is_atom_named(ctx, result, "true") {
+        Ok(true)
+    } else if is_atom_named(ctx, result, "false") {
+        Ok(false)
+    } else {
+        Err(badarg())
+    }
+}
+
+/// `maps:map(Fun, Map)` — `Fun(Key, Value)` supplies each value.
+///
+/// The keys and their order are unchanged; only the values are the fun's results.
+/// A `>32`-pair result is [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)
+/// like every other map producer here.
+fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let (keys, values) = map_parts(args[1])?;
+    let mut mapped = Vec::with_capacity(values.len());
+    for (&key, &value) in keys.iter().zip(values.iter()) {
+        mapped.push(ctx.call_fun(fun, &[key, value])?);
+    }
+    build_map(ctx, &keys, &mapped)
+}
+
+/// `maps:fold(Fun, Init, Map)` — `Acc = Fun(Key, Value, Acc)` over every pair.
+fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let mut acc = args[1];
+    let (keys, values) = map_parts(args[2])?;
+    for (&key, &value) in keys.iter().zip(values.iter()) {
+        acc = ctx.call_fun(fun, &[key, value, acc])?;
+    }
+    Ok(acc)
+}
+
+/// `maps:filter(Pred, Map)` — the `{Key, Value}` pairs whose predicate is `true`.
+fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let (keys, values) = map_parts(args[1])?;
+    let mut kept_keys = Vec::new();
+    let mut kept_values = Vec::new();
+    for (&key, &value) in keys.iter().zip(values.iter()) {
+        let result = ctx.call_fun(fun, &[key, value])?;
+        if predicate_holds(ctx, result)? {
+            kept_keys.push(key);
+            kept_values.push(value);
+        }
+    }
+    build_map(ctx, &kept_keys, &kept_values)
+}
+
+/// `maps:foreach(Fun, Map)` — `Fun(Key, Value)` for its side effects; `ok`.
+fn foreach_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let fun = args[0];
+    let (keys, values) = map_parts(args[1])?;
+    for (&key, &value) in keys.iter().zip(values.iter()) {
+        ctx.call_fun(fun, &[key, value])?;
+    }
+    ctx.ok()
+}
+
+// ---------------------------------------------------------------------------
+// Registration
+// ---------------------------------------------------------------------------
+
 /// Registers the `maps` module BIFs and the `erlang:map_*` entries.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("maps", "new", 0, new_0);
@@ -453,6 +550,11 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("maps", "without", 2, without_2);
     reg.register("maps", "iterator", 1, iterator_1);
     reg.register("maps", "next", 1, next_1);
+    // The `fun`-taking BIFs: they call their fun through `BifContext::call_fun`.
+    reg.register("maps", "map", 2, map_2);
+    reg.register("maps", "fold", 3, fold_3);
+    reg.register("maps", "filter", 2, filter_2);
+    reg.register("maps", "foreach", 2, foreach_2);
     // The `erlang:map_*` entries of `bif.tab` (`ubif erlang:map_size/1`,
     // `erlang:map_get/2`, `erlang:is_map_key/2`).
     reg.register("erlang", "map_get", 2, get_2);
@@ -905,6 +1007,11 @@ mod tests {
             ("maps", "without", 2),
             ("maps", "iterator", 1),
             ("maps", "next", 1),
+            // The `fun`-taking BIFs (backed by the `FunCaller` seam).
+            ("maps", "map", 2),
+            ("maps", "fold", 3),
+            ("maps", "filter", 2),
+            ("maps", "foreach", 2),
             ("erlang", "map_get", 2),
             ("erlang", "map_size", 1),
             ("erlang", "is_map_key", 2),
@@ -914,7 +1021,7 @@ mod tests {
                 "missing {module}:{name}/{arity}"
             );
         }
-        assert_eq!(reg.len(), 21);
+        assert_eq!(reg.len(), 25);
     }
 
     #[test]
