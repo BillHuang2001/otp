@@ -228,7 +228,10 @@ fn info_reports_memory_and_named_table() {
     t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
 
     let info = t.info();
-    assert!(info.named_table);
+    // The registered name and the `named_table` flag are independent. Oracle:
+    // `ets:info(ets:new(mem_table, []), named_table) =:= false` (and `name` is
+    // still `mem_table`) — only the `named_table` option sets the flag.
+    assert!(!info.named_table);
     assert_eq!(info.name, Some(name));
     assert!(info.memory > 0);
     assert_eq!(info.memory, t.memory());
@@ -238,8 +241,22 @@ fn info_reports_memory_and_named_table() {
         info_entry(&entries, &atoms, "memory"),
         Some(make_small(info.memory as i64))
     );
+    assert_eq!(info_entry(&entries, &atoms, "name"), Some(make_atom(name)));
     assert_eq!(
         info_entry(&entries, &atoms, "named_table"),
+        Some(make_atom(atoms.lookup("false").unwrap()))
+    );
+
+    // Setting the `named_table` option (independently of the name) flips it.
+    let mut opts = TableOptions::new();
+    opts.set_name(name).set_named(true);
+    let named = Table::new(TableId::next(), opts).unwrap();
+    let named_info = named.info();
+    assert!(named_info.named_table);
+    assert_eq!(named_info.name, Some(name));
+    let named_entries = named_info.entries(&mut atoms);
+    assert_eq!(
+        info_entry(&named_entries, &atoms, "named_table"),
         Some(make_atom(atoms.lookup("true").unwrap()))
     );
 

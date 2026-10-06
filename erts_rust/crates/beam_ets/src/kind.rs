@@ -164,7 +164,9 @@ pub struct TableOptions {
     access: Access,
     /// Whether `named_table` was requested.
     named: bool,
-    /// The explicitly registered name (`Some` iff named).
+    /// The registered name, if one was given. Recorded for every table (the
+    /// oracle's `ets:info/2` `name` always returns it), independent of the
+    /// `named_table` flag.
     name: Option<Atom>,
     /// Whether `compressed` was requested.
     compressed: bool,
@@ -216,10 +218,15 @@ impl TableOptions {
         self
     }
 
-    /// Set the registered table name (implies a named table).
+    /// Record the registered table name.
+    ///
+    /// This records the name only; it does **not** by itself mark the table
+    /// `named_table` (that is [`set_named`](TableOptions::set_named)). The two
+    /// are independent, exactly as in the oracle: `ets:new(myanon, [])` reports
+    /// `name => myanon` but `named_table => false`, and only the `named_table`
+    /// option makes the name resolve to the table.
     pub fn set_name(&mut self, name: Atom) -> &mut Self {
         self.name = Some(name);
-        self.named = true;
         self
     }
 
@@ -442,12 +449,19 @@ mod tests {
     }
 
     #[test]
-    fn set_name_implies_named() {
+    fn set_name_does_not_imply_named() {
+        // `name` and `named_table` are independent, as in the oracle:
+        // `ets:info(ets:new(n, []), named_table) =:= false` while `name` is `n`.
         let mut opts = TableOptions::new();
         assert!(!opts.is_named());
 
         let name = Atom::from_raw(7);
         opts.set_name(name);
+        assert!(!opts.is_named());
+        assert_eq!(opts.name(), Some(name));
+
+        // The `named_table` option is what sets the flag (`set_named`).
+        opts.set_named(true);
         assert!(opts.is_named());
         assert_eq!(opts.name(), Some(name));
     }

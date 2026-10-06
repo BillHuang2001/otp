@@ -331,7 +331,10 @@ impl Table {
         self.opts.kind()
     }
 
-    /// The registered table name, if any (`Some` iff named).
+    /// The registered table name, if any.
+    ///
+    /// Independent of `named_table`: a name is recorded for every table the
+    /// `ets:new/2` option parser named, whether or not `named_table` was given.
     pub fn name(&self) -> Option<Atom> {
         self.opts.name()
     }
