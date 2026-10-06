@@ -308,7 +308,10 @@ impl Table {
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
   table ids/`memory`/pids/floats/binaries never rendered). Coverage: all 4 kinds × 8 core ops,
   `{keypos,2}`, ordered navigation, `update_counter/3,4` + `update_element`, `take`/`lookup_element`,
-  the select/match family with guards, malformed specs, and >10 000-key tables. `KNOWN_DIVERGENCES`
+  the select/match family with guards, malformed specs, >10 000-key tables, and an `info`/option
+  group (name vs `named_table`, the `ets:info/2` option fields incl. the `private` concurrency
+  flags and unknown-key `badarg`, the multi-kind `lookup_element` list, and atomic `insert_list`).
+  `KNOWN_DIVERGENCES`
   is empty. Without `erl` the live-oracle test skips; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into
   a failure (use it in CI).
 - **Gates (GREEN required):**
