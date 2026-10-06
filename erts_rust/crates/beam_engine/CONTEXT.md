@@ -42,7 +42,7 @@ pub trait ExecutionContext {
 - `call_bif` failure is an `Err(BeamError)` (a `BadArith`/`BadArg`/`Raise`/…): the engine turns it into a guard branch or a raise, never a panic.
 - `ensure_heap(heap_need, live, x_regs, stack)` makes the root-set contract concrete: the live roots are `x_regs[0..live)` plus the whole `stack`; a real context (`beam_rt`, Stage 4/5) runs the collector here and may **move terms** in place, updating `x_regs`/`stack` without frame liveness maps.
 - `alloc_words(n)` hands out a stable pointer to `n` **uninitialized** words, valid only until the next `ensure_heap`/GC (mirrors `HAlloc`/`heap_top`); the default body is a typed `error::unsupported`.
-- `apply` is the general external-function hook (default forwards to `call_bif`), and `apply_fun` is the fun-application hook (default a typed `error::unsupported`, since the engine keeps no closure registry).
+- `apply` is the general external-function hook (default forwards to `call_bif`), and `apply_fun` is the fun-application hook (default a typed `error::unsupported`, since the engine keeps no closure registry). A concrete context must enter the closure with `x(0..arity)` = the call arguments and `x(arity..)` = the closure's free variables — see Design Decisions.
 - `pub type BifHook = Box<dyn FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm>>`.
 - `pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>`.
 - `MinimalContext` — the test/embedding context: an unbounded heap (`ensure_heap` is a no-op `Ok(())`), a **pluggable BIF hook** and an **optional apply hook**.
