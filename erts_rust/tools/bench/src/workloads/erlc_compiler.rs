@@ -10,7 +10,7 @@
 //!   (`<elixir>/lib/elixir/src`, resolved via `resolve_repo("elixir_compiler", …)`).
 //!
 //! This runs today on any host with `erlc` on `PATH` and gives a repeatable files/sec,
-//! LOC/sec and wall time for both runtimes (oracle and, once it exists, `beam_rt`).
+//! LOC/sec and wall time for both runtimes (oracle and `beam_rt`).
 //!
 //! Honest reporting: if `erlc` produces **zero** `.beam` files the result is `failed`
 //! (never a fabricated throughput); a *partial* success is recorded `ok` with a note.

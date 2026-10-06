@@ -8,8 +8,8 @@
 //!   oracle is a loud [`BenchError::Env`] (process exit `2`);
 //! * the **Rust runtime** (`rust`) — `$BEAM_RT` if set, else the workspace-relative
 //!   `target/{release,debug}/beam_rt`. It is *optional*: when it cannot be resolved
-//!   (today it is an unbuilt stub) every rust-runtime cell degrades to
-//!   `skipped(runtime-unsupported)`, never a crash and never a fabricated number.
+//!   every rust-runtime cell degrades to `skipped(runtime-unsupported)`, never a
+//!   crash and never a fabricated number.
 //!
 //! A runtime is considered *supported* only if it passes [`Runtime::self_check`] — the
 //! canonical probe `-noshell -eval 'io:format("~p~n",[1+1]), halt().'` printing `2`.
@@ -114,8 +114,7 @@ impl Runtime {
             notes.push(match self.kind {
                 RuntimeKind::Sys => "oracle not resolved ($ERTS_ORACLE / `erl` on PATH)".to_string(),
                 RuntimeKind::Rust => {
-                    "beam_rt not resolved (stub / not built; set $BEAM_RT or build the workspace)"
-                        .to_string()
+                    "beam_rt not resolved (set $BEAM_RT or build the workspace)".to_string()
                 }
             });
         } else if !supported {
