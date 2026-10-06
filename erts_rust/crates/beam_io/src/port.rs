@@ -12,8 +12,9 @@
 //! scheduled tasks under a reduction budget and reports what happened as a
 //! [`PortNotification`] list — the seam the runtime turns into `{Port, {data, Data}}`
 //! messages. [`PortRegistry::port_command`] queues data and schedules an `OUTPUT` task;
-//! [`PortRegistry::port_control`] delivers a recognised `{command, …}`-style control
-//! operation to the driver's `control`.
+//! [`PortRegistry::port_control`] forwards a named control operation **verbatim** to the
+//! driver's `control` (as the C `erts_port_control` does), reserving only `"close"` for
+//! itself.
 //!
 //! The legacy C analogue is the `Port`/`erts_port` control block and its `ioq`
 //! (`erts/emulator/beam/erl_port.h`, `io.c`). The *scheduler* wiring (port run queues, poll
@@ -389,50 +390,28 @@ impl Port {
     }
 }
 
-/// A recognised port-control operation.
+/// The **reserved** port-control operation namespace.
 ///
-/// This is the `{command, …}` surface [`PortRegistry::port_control`] decodes. Only the
-/// names this crate can serve **honestly** are recognised, and the atom/tuple decoding of
-/// the Erlang side (`Port ! {self(), {command, Data}}`, `erlang:port_control/3`'s integer
-/// operations) is deliberately the runtime's job:
+/// [`PortRegistry::port_control`] forwards every operation name it is handed **verbatim** to
+/// the port's driver: the driver's `control` vocabulary (`"line"`/`"noline"`/`"binary"`/
+/// `"text"`/`"getopts"` for the built-in `fd` driver, plus the `efile` family's
+/// `"open"`/`"close"`/`"path"`/`"eof"` with an attached fd — see [`crate::drivers`]) is
+/// authoritative, exactly as in the C `erts_port_control`. The registry itself never decodes
+/// that vocabulary; it reserves **one** name before any driver sees it:
 ///
 /// | Name | Meaning here |
 /// |---|---|
-/// | `"command"` | forward the payload to the driver's `control` |
-/// | `"getopts"` | forward to the driver's `control` (the default driver has no options) |
-/// | `"close"` | close the port (driver `stop` + id release) |
+/// | [`PortControl::CLOSE`] (`"close"`) | close the port (driver `stop` + id release) |
 ///
-/// Anything else is an argument fault (`BeamError::BadArg`) rather than a silently ignored
-/// command.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-pub enum PortControl {
-    /// A driver-defined command carrying payload bytes.
-    Command,
-    /// Ask the driver for its current options.
-    GetOpts,
-    /// Close the port.
-    Close,
-}
+/// Every other name — recognised by a driver or not — is passed through unchanged, so an
+/// unrecognised verb surfaces the driver's own [`beam_common::BeamError::BadArg`] rather than
+/// being silently ignored here.
+pub struct PortControl;
 
 impl PortControl {
-    /// Decodes a control-operation name, or `None` when the name is not recognised.
-    pub fn from_str(name: &str) -> Option<PortControl> {
-        match name {
-            "command" => Some(PortControl::Command),
-            "getopts" => Some(PortControl::GetOpts),
-            "close" => Some(PortControl::Close),
-            _ => None,
-        }
-    }
-
-    /// The canonical name of this operation (the string the driver's `control` sees).
-    pub const fn as_str(self) -> &'static str {
-        match self {
-            PortControl::Command => "command",
-            PortControl::GetOpts => "getopts",
-            PortControl::Close => "close",
-        }
-    }
+    /// The reserved `"close"` operation: closes the port like [`PortRegistry::close`] and
+    /// answers with no bytes.
+    pub const CLOSE: &'static str = "close";
 }
 
 /// The options `erlang:port_command/3` accepts, as a small flag set.
@@ -730,35 +709,30 @@ impl PortRegistry {
 
     /// Delivers a named port-control operation to the port's driver.
     ///
-    /// Only the [`PortControl`] names are recognised; an unknown name, or an `id` that is
-    /// not a live port, is `BeamError::BadArg`. `"command"`/`"getopts"` are forwarded to the
-    /// driver's `control` (whose default accepts everything and answers with no bytes);
-    /// `"close"` closes the port like [`PortRegistry::close`] and returns no bytes.
+    /// The operation name `op` is forwarded **verbatim** to the driver's `control` — the
+    /// driver owns the vocabulary (see [`PortControl`]) — and its reply bytes are returned.
+    /// The single exception is the reserved [`PortControl::CLOSE`] (`"close"`), which closes
+    /// the port like [`PortRegistry::close`] and answers with no bytes.
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::BadArg` for an unknown control name or an unknown port, or
-    /// whatever the driver's `control`/`stop` returns.
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the driver's
+    /// `control`/`stop` returns; an unrecognised operation is the *driver's*
+    /// `BeamError::BadArg`, not a silent no-op.
     pub fn port_control(
         &mut self,
         poller: &mut Poller,
         id: PortId,
-        command: &str,
+        op: &str,
         arg: &[u8],
     ) -> Result<Vec<u8>> {
-        let Some(control) = PortControl::from_str(command) else {
-            return Err(error::badarg());
-        };
-        match control {
-            PortControl::Close => {
-                self.close(poller, id)?;
-                Ok(Vec::new())
-            }
-            PortControl::Command | PortControl::GetOpts => match self.ports.get_mut(&id.number())
-            {
-                Some(port) => port.control(poller, control.as_str(), arg),
-                None => Err(error::badarg()),
-            },
+        if op == PortControl::CLOSE {
+            self.close(poller, id)?;
+            return Ok(Vec::new());
+        }
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.control(poller, op, arg),
+            None => Err(error::badarg()),
         }
     }
 
@@ -935,6 +909,21 @@ mod tests {
             .expect("the fd driver is built in");
         assert_eq!(registry.get(id).expect("live").driver_name(), "fd");
         registry.close(&mut poller, id).expect("closes");
+    }
+
+    #[test]
+    fn the_built_in_efile_driver_opens_and_closes() {
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let drivers = DriverRegistry::with_builtins();
+        let id = registry
+            .open_named(&mut poller, &drivers, "efile")
+            .expect("the efile driver is built in");
+        assert_eq!(registry.get(id).expect("live").driver_name(), "efile");
+        // An unopened `efile` port owns no fds, so `start` registers nothing with the poller.
+        assert!(poller.is_empty());
+        registry.close(&mut poller, id).expect("closes cleanly");
+        assert!(!registry.contains(id));
     }
 
     #[test]
@@ -1289,43 +1278,50 @@ mod tests {
     }
 
     #[test]
-    fn the_control_protocol_family_is_decoded() {
-        assert_eq!(PortControl::from_str("command"), Some(PortControl::Command));
-        assert_eq!(PortControl::from_str("getopts"), Some(PortControl::GetOpts));
-        assert_eq!(PortControl::from_str("close"), Some(PortControl::Close));
-        assert_eq!(PortControl::from_str("nosuch"), None);
-
-        assert_eq!(PortControl::Command.as_str(), "command");
-        assert_eq!(PortControl::GetOpts.as_str(), "getopts");
-        assert_eq!(PortControl::Close.as_str(), "close");
+    fn the_reserved_control_op_is_close() {
+        // The registry reserves exactly one control op for itself; every other name is the
+        // driver's vocabulary and is forwarded verbatim (see `PortControl`/`port_control`).
+        assert_eq!(PortControl::CLOSE, "close");
     }
 
     #[test]
-    fn port_control_forwards_known_commands_and_rejects_unknown_ones() {
+    fn port_control_forwards_driver_verbs_and_rejects_unknown_ones() {
         let mut poller = poller();
         let (mut registry, id) = registry_with_pipe(&mut poller);
 
-        // `getopts`/`command` reach the driver's `control`; the fd driver's default accepts
-        // them and answers with no bytes.
-        assert!(registry
-            .port_control(&mut poller, id, "getopts", b"")
-            .expect("getopts is recognised")
-            .is_empty());
-        assert!(registry
-            .port_control(&mut poller, id, "command", b"\x00")
-            .expect("command is recognised")
-            .is_empty());
+        // `getopts` reaches the driver, which answers with its current options; the default
+        // pipe `FdDriver` is in binary mode.
+        assert_eq!(
+            registry
+                .port_control(&mut poller, id, "getopts", b"")
+                .expect("getopts reaches the driver"),
+            b"binary"
+        );
 
-        // An unknown name is an argument fault, never a silent no-op.
+        // A real driver verb is reachable through the same verbatim forwarding: `line`
+        // switches the driver into line mode ...
+        assert!(registry
+            .port_control(&mut poller, id, "line", b"1024")
+            .expect("line is a driver verb")
+            .is_empty());
+        // ... which the next `getopts` then reflects.
+        assert_eq!(
+            registry
+                .port_control(&mut poller, id, "getopts", b"")
+                .expect("getopts reaches the driver"),
+            b"line,1024"
+        );
+
+        // An unknown verb surfaces the driver's `BadArg`, never a silent no-op.
         assert!(matches!(
             registry.port_control(&mut poller, id, "invent", b""),
             Err(BeamError::BadArg)
         ));
 
-        // `close` closes the port and answers with no bytes.
+        // The reserved `close` closes the port and answers with no bytes.
         assert!(registry
-            .port_control(&mut poller, id, "close", b"")
-            .expect("close is recognised")
+            .port_control(&mut poller, id, PortControl::CLOSE, b"")
+            .expect("close is reserved")
             .is_empty());
         assert!(!registry.contains(id));
 

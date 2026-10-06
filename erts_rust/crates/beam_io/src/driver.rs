@@ -187,8 +187,9 @@ impl<'a> DriverContext<'a> {
 
 /// A port driver.
 ///
-/// Implemented by the built-in drivers ([`crate::drivers::FdDriver`]) and, later, by the
-/// frozen C-ABI bridge. Every method receives a [`DriverContext`] and nothing else.
+/// Implemented by the built-in drivers ([`crate::drivers::FdDriver`],
+/// [`crate::drivers::EfileDriver`]) and, later, by the frozen C-ABI bridge. Every method
+/// receives a [`DriverContext`] and nothing else.
 pub trait Driver {
     /// The driver's registered name (the key it is looked up under in the
     /// [`DriverRegistry`]).
@@ -295,11 +296,13 @@ impl DriverRegistry {
 
     /// A registry pre-populated with this crate's built-in drivers.
     ///
-    /// Milestone-1 registers the single built-in `"fd"` driver
-    /// ([`crate::drivers::FdDriver`]).
+    /// Milestone-1 registers two built-ins: `"fd"` ([`crate::drivers::FdDriver`], a byte-stream
+    /// driver over a pipe/fd) and `"efile"` ([`crate::drivers::EfileDriver`], the file driver —
+    /// an `FdDriver` plus the `efile` control family).
     pub fn with_builtins() -> DriverRegistry {
         let mut registry = DriverRegistry::new();
         registry.register("fd", make_fd);
+        registry.register("efile", crate::drivers::make_efile);
         registry
     }
 
@@ -363,14 +366,17 @@ mod tests {
     }
 
     #[test]
-    fn with_builtins_registers_the_fd_driver() {
+    fn with_builtins_registers_the_built_in_drivers() {
         let registry = DriverRegistry::with_builtins();
         assert!(registry.contains("fd"));
-        assert_eq!(registry.names(), vec!["fd"]);
+        assert!(registry.contains("efile"));
+        assert_eq!(registry.names(), vec!["efile", "fd"]);
 
         let driver = registry.create("fd").expect("the fd driver exists");
         assert_eq!(driver.name(), "fd");
         assert!(driver.flags() == DriverFlags::empty());
+        let efile = registry.create("efile").expect("the efile driver exists");
+        assert_eq!(efile.name(), "efile");
         assert!(matches!(registry.create("nope"), Err(BeamError::BadArg)));
     }
 
