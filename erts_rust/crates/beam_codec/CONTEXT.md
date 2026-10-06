@@ -27,10 +27,13 @@ loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers and over `beam_term::fun` for funs) plus the local
 bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
-(see "Tag coverage" below); the only still-`unsupported` tag is `RECORD` (`67`), `LOCAL_EXT` (`121`)
+(see "Tag coverage" below); **no producible tag is `unsupported`** — `RECORD_EXT` (`67`) now decodes
+and encodes through `beam_term::record` (§Records) — `LOCAL_EXT` (`121`)
 is honoured as a top-level wrapper, the encoder emits `ATOM_CACHE_REF` (`82`) through the
 `AtomCacheWriter` hook, and `DIST_HEADER` (`68`) plus the obsolete `FUN` (`117`) / `NEW_CACHE` (`78`)
-tags are rejected as `BadArg` — never a wrong term.
+tags are rejected as `BadArg` — never a wrong term. The `COMPRESSED` (`80`) encoder reproduces C's
+*shrink rule*: it emits the wrapper only when zlib beats the plain image, else the plain image
+(`external.c:2276-2298`).
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
 `#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
