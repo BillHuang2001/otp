@@ -71,12 +71,18 @@ Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)]
   bounds-checked (`pos + 4 <= len`; an out-of-range `pos` or a `pos + 4` overflow ⇒ `BadArg`), never
   panics, and never short-writes.
 
-### `src/atom_cache.rs` — distribution atom cache (`erl_ext_dist.md` §Distribution Header)
-`pub struct AtomCache` — 8 segments × 256 = 2048 slots: `new()`, `set(index: u8, atom)`,
-`get(index: u8) -> Option<Atom>`, `clear()`. The *distribution header* itself (`68`/`78`) is
-`beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
-through it (an unset index ⇒ `BadArg`). The encoder never *emits* `82` (as `term_to_binary` does
-not); byte `78` (`NEW_CACHE`) is dead in this OTP and is rejected as `BadArg`.
+### `src/atom_cache.rs` — the atom-cache seam: read (`AtomCache`) + write (`AtomCacheWriter`)
+- `pub struct AtomCache` (**read**): 8 segments × 256 = 2048 slots — `new()`, `set(index: u8, atom)`,
+  `get(index: u8) -> Option<Atom>`, `clear()`. The *distribution header* itself (`68`/`78`) is
+  `beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
+  through it (an unset index ⇒ `BadArg`).
+- `pub trait AtomCacheWriter` (**write**): `fn intern(&mut self, atom: Atom, atoms: &AtomTable) ->
+  Option<u8>`. Installed on an `Encoder` with `Encoder::with_atom_cache`; on `Some(index)` the encoder
+  writes `ATOM_CACHE_REF` (`82`) + `index` in place of the inline atom tag, and on `None` (or with no
+  cache) writes the atom inline — exactly C `enc_atom` (`external.c:2877`, `get_iix_acache_map` first;
+  `-1` ⇒ inline). `beam_dist::OutboundAtomCache` is the concrete implementor; the persistent 8×256
+  classification lives in `beam_dist`. The encoder never emits byte `78` (`NEW_CACHE`, dead in this
+  OTP — rejected as `BadArg`).
 
 ### `src/compress.rs` — zlib plumbing for `COMPRESSED` (`80`)
 Safe Rust (`flate2` zlib wrappers; no `unsafe`). Owns only the RFC-1950 stream — the wrapper bytes
