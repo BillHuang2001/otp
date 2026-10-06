@@ -76,13 +76,25 @@
 //!   a `mov` between the allocated machine registers, or a `mov` of the raw `Eterm`
 //!   word (`make_small`/`make_atom`/`NIL`);
 //! * `jump Label` whose target resolves in the module-wide label map — the
-//!   `(func, pc)` pair is known at compile time, so it is a constant return word.
+//!   `(func, pc)` pair is known at compile time, so it is a constant return word;
+//! * the **guarded small-int arithmetic fast path** for `gc_bif` of
+//!   `erlang:'+'/2` and `erlang:'-'/2`: the tagged-word arithmetic is emitted
+//!   natively behind a small-int guard + overflow + range check, and *any* case
+//!   the guard rejects (a non-small operand, an `i64` overflow, a result outside
+//!   `MIN_SMALL..=MAX_SMALL`) jumps straight to `jit_step_one`, which runs the
+//!   real BIF and produces the bignum/float/error result natively unreachable
+//!   here. This is the tier's one optimisation (`../../CONTEXT.md` §7); it is
+//!   conservative by construction — it can only ever produce a result the helper
+//!   would have produced — see [`try_inline_gc_bif`].
 //!
 //! **Helper-executed** (`jit_step_one`, literally the interpreter's
 //! [`Machine::step_instruction`](crate::Machine)): **every other instruction**, plus
-//! a `move` with an operand outside the cached set and a `jump` to a label the
+//! a `move` with an operand outside the cached set, a `jump` to a label the
 //! module does not define (so the interpreter's exact `unknown_label` error
-//! surfaces rather than an invented one).
+//! surfaces rather than an invented one), and a `gc_bif` with either an
+//! un-cacheable operand or a BIF outside the fast path's two (or a fast-path
+//! `gc_bif` whose registers the allocator's four-register budget could not
+//! cache).
 //!
 //! A block's *inline prefix* runs natively and the **first** non-inlinable
 //! instruction is handed to the helper, after which the block returns: this is the
@@ -103,13 +115,16 @@ use std::collections::{BTreeMap, HashMap};
 use std::mem;
 
 use beam_common::{BeamError, Result};
-use beam_loader::{Atom, Instr, Label, Module, Operand, Reg as RegRef};
-use beam_term::{make_atom, make_small, Eterm, NIL};
+use beam_loader::{Atom, ImportRef, Instr, Label, Module, Operand, Reg as RegRef};
+use beam_term::{
+    make_atom, make_small, Eterm, MAX_SMALL, MIN_SMALL, NIL, TAG_IMMED1_MASK, TAG_IMMED1_SIZE,
+    TAG_IMMED1_SMALL,
+};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
-use crate::jit::emitter::{CodeBuffer, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
+use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAPACITY};
 use crate::jit::JitBackend;
 use crate::machine::{Machine, MAX_REGISTER};
 use crate::Step;
@@ -424,7 +439,7 @@ fn compile_module(module: &Module) -> Result<CompiledModule> {
                 // step handles that address exactly as before.
                 continue;
             }
-            let allocation = allocate_registers(code, start, end);
+            let allocation = allocate_registers(module, code, start, end);
             for (x, _) in &allocation.slots {
                 highest_cached_register = Some(match highest_cached_register {
                     Some(prev) => prev.max(*x),
@@ -435,6 +450,7 @@ fn compile_module(module: &Module) -> Result<CompiledModule> {
             let offset = buffer.len();
             emit_block(
                 &mut buffer,
+                module,
                 &labels,
                 func,
                 code,
@@ -461,44 +477,64 @@ fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// A generous byte-count estimate for the code `module` lowers to.
 ///
 /// A block costs a prologue/epilogue pair (~48 bytes) plus its inlined instructions
-/// (~7–10 bytes each); under-estimating would turn a large module into a
-/// `SystemLimit` compile error, so the estimate is deliberately loose.
-/// [`CodeBuffer::with_capacity`] rounds it up to whole pages.
+/// (~7–10 bytes each); a `gc_bif` costs either the helper call sequence (~40
+/// bytes) or, when the small-int fast path lowers it, the whole guarded sequence
+/// (up to ~150 bytes: two operand loads, two tag checks, the arithmetic with two
+/// overflow branches, two range checks, the store and the fallback jump).
+/// Under-estimating would turn a large module into a `SystemLimit` compile error,
+/// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
+/// *every* `gc_bif`, whether or not the fast path claims it, and
+/// [`CodeBuffer::with_capacity`] rounds the total up to whole pages.
 fn code_capacity_estimate(module: &Module) -> usize {
     let mut instructions = 0usize;
     let mut blocks = 0usize;
+    let mut gc_bifs = 0usize;
     for function in &module.functions {
         instructions += function.code.len();
         blocks += function.blocks.len();
+        gc_bifs += function
+            .code
+            .iter()
+            .filter(|instr| matches!(instr, Instr::GcBif { .. }))
+            .count();
     }
-    64 * blocks + 16 * instructions + DEFAULT_CAPACITY
+    64 * blocks + 16 * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
 }
+
+/// The code-size budget reserved for one `gc_bif` (see
+/// [`code_capacity_estimate`]).
+const FAST_PATH_BYTES: usize = 176;
 
 /// Pick the x-registers a block caches, in first-appearance order.
 ///
 /// Only `move`s whose *shape* could be inlined contribute (`dst` an x-register and
 /// `src` an x-register or a constant), so the registers a block's actual inline
 /// prefix needs are collected before any register from a later, never-inlined
-/// instruction. A register index outside the engine's [`MAX_REGISTER`] bound is
-/// never cached: reading it would be out of bounds, whereas the interpreter step
-/// reports the faithful `bad_register` error.
-fn allocate_registers(code: &[Instr], start: usize, end: usize) -> Allocation {
+/// instruction. A `gc_bif` the small-int arithmetic fast path can lower
+/// ([`fast_arith`]) contributes its operands and destination the same way, so the
+/// inline path always finds a register for each of them. A register index outside
+/// the engine's [`MAX_REGISTER`] bound is never cached: reading it would be out of
+/// bounds, whereas the interpreter step reports the faithful `bad_register` error.
+fn allocate_registers(module: &Module, code: &[Instr], start: usize, end: usize) -> Allocation {
     let mut allocation = Allocation::default();
     for instr in &code[start..end] {
-        let Instr::Move { src, dst } = instr else {
-            continue;
-        };
-        let Some(dst_x) = x_register(dst) else {
-            continue;
-        };
-        let src_x = x_register(src);
-        if src_x.is_none() && constant_word(src).is_none() {
-            continue;
+        if let Instr::Move { src, dst } = instr {
+            let Some(dst_x) = x_register(dst) else {
+                continue;
+            };
+            let src_x = x_register(src);
+            if src_x.is_none() && constant_word(src).is_none() {
+                continue;
+            }
+            if let Some(n) = src_x {
+                push_slot(&mut allocation, n);
+            }
+            push_slot(&mut allocation, dst_x);
+        } else if let Some(fast) = fast_arith(module, instr) {
+            for x in fast.registers() {
+                push_slot(&mut allocation, x);
+            }
         }
-        if let Some(n) = src_x {
-            push_slot(&mut allocation, n);
-        }
-        push_slot(&mut allocation, dst_x);
     }
     allocation
 }
@@ -520,8 +556,10 @@ fn push_slot(allocation: &mut Allocation, x: u32) {
 }
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
+#[allow(clippy::too_many_arguments)]
 fn emit_block(
     buffer: &mut CodeBuffer,
+    module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
     func: u32,
     code: &[Instr],
@@ -559,6 +597,17 @@ fn emit_block(
             | Instr::DebugLine { .. } => {}
             Instr::Move { src, dst } => {
                 if !try_inline_move(buffer, src, dst, allocation)? {
+                    emit_helper(buffer, done, allocation, func, pc)?;
+                    fell_through = false;
+                    break;
+                }
+            }
+            // The one optimised BIF: the small-int `erlang:'+'/2`/`'-'/2`. When
+            // the guarded fast path is emitted the block keeps going; otherwise
+            // (any other BIF, an un-cacheable operand, or a register the budget
+            // could not cache) it is exactly the `_` arm below.
+            Instr::GcBif { .. } => {
+                if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc)? {
                     emit_helper(buffer, done, allocation, func, pc)?;
                     fell_through = false;
                     break;
@@ -701,6 +750,317 @@ fn constant_word(operand: &Operand) -> Option<i64> {
         Operand::Nil => Some(NIL.raw() as i64),
         _ => None,
     }
+}
+
+// ---------------------------------------------------------------------------
+// The small-int arithmetic fast path
+// ---------------------------------------------------------------------------
+//
+// The tier's **one** bounded optimisation: `gc_bif` of `erlang:'+'/2` and
+// `erlang:'-'/2` over small integers, emitted natively behind a guard that can
+// only ever *reject* (falling back to `jit_step_one`). It cannot produce a value
+// the interpreter step would not have produced:
+//
+// * the two operands must both be small integers — the same `is_small` the
+//   `operand`/`Test` seams use (`(word & 0xF) == 0xF`, `../../beam_term/src/immediate.rs`);
+// * the arithmetic is done on the tagged words, which is exact because
+//   `make_small(v) == v * 16 + 15`, so `a_word + b_word - 15 == make_small(va+vb)`
+//   (`- 15` becomes `+ 15` for the subtraction form);
+// * any `i64` overflow of either step, and any result outside
+//   `[MIN_SMALL_WORD, MAX_SMALL_WORD]`, jumps to the helper, which calls the real
+//   BIF (`BeamError`/bignum/float path) — so a result that is not a small
+//   integer is never fabricated here.
+//
+// Everything else (another BIF, another module, an operand that is not a cached
+// x-register or a small constant, a destination that is not a cached x-register)
+// keeps today's behaviour: one `jit_step_one` call.
+
+/// The two BIFs the fast path lowers — `erlang:'+'/2` and `erlang:'-'/2`, and
+/// nothing else.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SmallArith {
+    /// `erlang:'+'/2`.
+    Add,
+    /// `erlang:'-'/2`.
+    Sub,
+}
+
+/// `TAG_IMMED1_MASK` as an `i64` — the low-nibble mask `is_small` tests with.
+const SMALL_MASK: i64 = TAG_IMMED1_MASK as i64;
+
+/// `TAG_IMMED1_SMALL` as an `i64` — the immediate-1 small tag, which is also
+/// `make_small`'s addend (`((v << TAG_IMMED1_SIZE) + TAG_IMMED1_SMALL)`).
+const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
+
+/// The emitted guard compares the masked word against [`SMALL_MASK`] (one
+/// register holds both, per the objective's shape), so the mask and the tag must
+/// be the same nibble. `beam_term` defines both as `0b1111`.
+const _: () = assert!(SMALL_MASK == SMALL_TAG);
+
+/// The shift `make_small` applies (`TAG_IMMED1_SIZE`).
+const SMALL_SHIFT: u32 = TAG_IMMED1_SIZE;
+
+/// The raw word of the smallest small integer (`make_small(MIN_SMALL)`).
+///
+/// `MIN_SMALL * 16` is exactly `i64::MIN`, so the (saturating, hence exact) word
+/// is `i64::MIN + 15`.
+const MIN_SMALL_WORD: i64 = MIN_SMALL
+    .saturating_mul(1i64 << SMALL_SHIFT)
+    .saturating_add(SMALL_TAG);
+
+/// The raw word of the largest small integer (`make_small(MAX_SMALL)`) — which
+/// saturates to exactly `i64::MAX`.
+const MAX_SMALL_WORD: i64 = MAX_SMALL
+    .saturating_mul(1i64 << SMALL_SHIFT)
+    .saturating_add(SMALL_TAG);
+
+/// The scratch machine registers the fast path uses for the two operands, the
+/// tag/range temporary, the constant, and the result.
+///
+/// All are caller-saved (System V AMD64), so clobbering them is free, and none
+/// overlaps the block's cached x-registers (`r12`–`r15`) or its reserved `rbx`
+/// (x-register base) / `rsp` (the `rt` slot). `r11` is also `emit_helper`'s
+/// helper-address scratch, but the helper sequence is emitted *after* the fast
+/// path has finished with it.
+const FAST_A: Reg = Reg::Rax;
+/// The second operand's scratch register.
+const FAST_B: Reg = Reg::R8;
+/// The tag/range temporary.
+const FAST_T: Reg = Reg::R10;
+/// The tag mask / arithmetic constant.
+const FAST_C: Reg = Reg::Rcx;
+/// The computed result word.
+const FAST_R: Reg = Reg::R11;
+
+/// A `gc_bif` shape the fast path can lower.
+struct FastArith<'a> {
+    /// Which of the two BIFs is called.
+    op: SmallArith,
+    /// The first operand (a cacheable `x(i)` or a small-int constant).
+    a: &'a Operand,
+    /// The second operand.
+    b: &'a Operand,
+    /// The x-register index the result is written to.
+    dst_x: u32,
+}
+
+impl FastArith<'_> {
+    /// The x-register indices the shape needs cached, in load order (the
+    /// operands first, then the destination) — exactly the order
+    /// [`allocate_registers`] caches them in.
+    fn registers(&self) -> Vec<u32> {
+        let mut registers = Vec::with_capacity(3);
+        for operand in [self.a, self.b] {
+            if let Some(x) = x_register(operand) {
+                registers.push(x);
+            }
+        }
+        registers.push(self.dst_x);
+        registers
+    }
+}
+
+/// The fast path's shape test for `instr`, a *purely syntactic* check (it never
+/// consults the register allocation, so [`allocate_registers`] and [`emit_block`]
+/// agree on which `gc_bif`s the fast path targets).
+///
+/// The shape is the small-int `erlang:'+'/2`/`'-'/2` of `args.len() == 2` whose
+/// every operand is a cacheable x-register or a small-int constant and whose
+/// destination is a cacheable x-register.
+fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastArith<'a>> {
+    let Instr::GcBif {
+        arity, bif, args, dst, ..
+    } = instr
+    else {
+        return None;
+    };
+    let (module_name, function_name, import_arity) = import_names(module, *bif)?;
+    if module_name != "erlang" || import_arity != 2 || *arity != 2 || args.len() != 2 {
+        return None;
+    }
+    let op = match function_name {
+        "+" => SmallArith::Add,
+        "-" => SmallArith::Sub,
+        _ => return None,
+    };
+    let dst_x = x_register(dst)?;
+    if dst_x >= MAX_REGISTER || args.iter().any(|operand| !loadable(operand)) {
+        return None;
+    }
+    Some(FastArith {
+        op,
+        a: &args[0],
+        b: &args[1],
+        dst_x,
+    })
+}
+
+/// Whether `operand` is something the fast path can load into a scratch
+/// register: a cacheable x-register or a small-int constant.
+fn loadable(operand: &Operand) -> bool {
+    match x_register(operand) {
+        Some(x) => x < MAX_REGISTER,
+        None => small_constant(operand).is_some(),
+    }
+}
+
+/// The raw `Eterm` word of a **small-int** constant operand (`integer`/
+/// `character`), or `None` for anything else — including the non-small `atom`/
+/// `nil` constants, which the run-time guard would reject anyway (so refusing
+/// them at compile time only saves the emission).
+fn small_constant(operand: &Operand) -> Option<i64> {
+    constant_word(operand).filter(|word| (word & SMALL_MASK) == SMALL_TAG)
+}
+
+/// Resolve an imported `{module,function,arity}` to its names, or `None` when
+/// the [`ImportRef`] or one of its atoms is missing from `module`.
+///
+/// This deliberately reproduces `crate::interpreter`'s (private) `import_target`:
+/// the fast path must classify a BIF by exactly the strings the interpreter's
+/// `GcBif` arm hands to [`ExecutionContext::call_bif`], or it would lower a call
+/// the interpreter routes somewhere else.
+fn import_names<'m>(module: &'m Module, target: ImportRef) -> Option<(&'m str, &'m str, u32)> {
+    let import = module.imports.get(target.0 as usize)?;
+    let module_name = module.atom_name(import.module)?;
+    let function_name = module.atom_name(import.function)?;
+    Some((module_name, function_name, import.arity))
+}
+
+/// Where the fast path reads one operand from.
+#[derive(Clone, Copy)]
+enum FastSource {
+    /// A cached x-register (already loaded by the prologue).
+    Cached(Reg),
+    /// A small-int constant, loaded as a raw `Eterm` word.
+    Constant(i64),
+}
+
+/// The [`FastSource`] for `operand`, or `None` when it is neither cached nor a
+/// small constant.
+fn fast_source(operand: &Operand, allocation: &Allocation) -> Option<FastSource> {
+    match x_register(operand) {
+        Some(x) => allocation.slot(x).map(FastSource::Cached),
+        None => small_constant(operand).map(FastSource::Constant),
+    }
+}
+
+/// Load `source` into scratch register `reg`.
+fn load_into(buffer: &mut CodeBuffer, source: FastSource, reg: Reg) -> Result<()> {
+    match source {
+        FastSource::Cached(src) => buffer.mov_rr(reg, src),
+        FastSource::Constant(word) => buffer.mov_ri(reg, word),
+    }
+}
+
+/// Lower a fast-path-eligible `gc_bif` natively, or report that the block must
+/// helper it.
+///
+/// Returns `true` when the whole guarded sequence was emitted, leaving the
+/// result in the destination's cached register and letting the block continue
+/// with the next instruction. Returns `false` **without having emitted a byte**
+/// when the shape matched ([`fast_arith`]) but an operand or the destination is
+/// not cached — the caller then emits exactly today's `jit_step_one` fallback.
+///
+/// The emitted shape (see the section comment above for why it is exact):
+///
+/// ```text
+///   mov  rax, a          ; or movabs rax, <small constant>
+///   mov  r8,  b
+///   mov  rcx, SMALL_MASK
+///   mov  r10, rax ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; a is small?
+///   mov  r10, r8  ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; b is small?
+///   mov  r11, rax
+///   add  r11, r8            ; sub for '-'
+///   jo   fallback           ; not both representable as an i64 tagged word
+///   mov  rcx, SMALL_TAG  ; the double-tag adjustment make_small re-adds
+///   sub  r11, rcx           ; add for '-'
+///   jo   fallback
+///   mov  rcx, MIN_SMALL_WORD ; cmp r11, rcx ; jl fallback
+///   mov  rcx, MAX_SMALL_WORD ; cmp r11, rcx ; jg fallback
+///   mov  <dst>, r11         ; store the result in its cached x-register
+///   jmp  fast_done
+/// fallback:
+///   <spill cached x-registers; call jit_step_one; jmp the block epilogue>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// The fast path never spills: the destination's cached register is written
+/// back by the next helper call or by the block's own exit spill, so the
+/// spill-across-blocks discipline is unchanged.
+fn try_inline_gc_bif(
+    buffer: &mut CodeBuffer,
+    module: &Module,
+    instr: &Instr,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+) -> Result<bool> {
+    let Some(fast) = fast_arith(module, instr) else {
+        return Ok(false);
+    };
+    let Some(a_source) = fast_source(fast.a, allocation) else {
+        return Ok(false);
+    };
+    let Some(b_source) = fast_source(fast.b, allocation) else {
+        return Ok(false);
+    };
+    let Some(dst_reg) = allocation.slot(fast.dst_x) else {
+        return Ok(false);
+    };
+
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    // Load both operands into scratch registers.
+    load_into(buffer, a_source, FAST_A)?;
+    load_into(buffer, b_source, FAST_B)?;
+
+    // Both operands must be small integers: `(word & 0xF) == 0xF`. The mask and
+    // the tag are the same nibble (asserted above), so one register serves both.
+    buffer.mov_ri(FAST_C, SMALL_MASK)?;
+    for operand in [FAST_A, FAST_B] {
+        buffer.mov_rr(FAST_T, operand)?;
+        buffer.and_rr(FAST_T, FAST_C)?;
+        buffer.cmp_rr(FAST_T, FAST_C)?;
+        buffer.jcc(Cond::Ne, fallback)?;
+    }
+
+    // Tagged-word arithmetic; an `i64` overflow of either step means the result
+    // is not representable as a tagged small word, so the helper computes it.
+    buffer.mov_rr(FAST_R, FAST_A)?;
+    match fast.op {
+        SmallArith::Add => buffer.add_rr(FAST_R, FAST_B)?,
+        SmallArith::Sub => buffer.sub_rr(FAST_R, FAST_B)?,
+    }
+    buffer.jcc(Cond::O, fallback)?;
+    buffer.mov_ri(FAST_C, SMALL_TAG)?;
+    match fast.op {
+        SmallArith::Add => buffer.sub_rr(FAST_R, FAST_C)?,
+        SmallArith::Sub => buffer.add_rr(FAST_R, FAST_C)?,
+    }
+    buffer.jcc(Cond::O, fallback)?;
+
+    // Range check: a tagged word is a valid small integer iff it lies in
+    // `[MIN_SMALL_WORD, MAX_SMALL_WORD]` (the encoding `v -> v*16 + 15` maps the
+    // value range onto that interval bijectively).
+    buffer.mov_ri(FAST_C, MIN_SMALL_WORD)?;
+    buffer.cmp_rr(FAST_R, FAST_C)?;
+    buffer.jcc(Cond::L, fallback)?;
+    buffer.mov_ri(FAST_C, MAX_SMALL_WORD)?;
+    buffer.cmp_rr(FAST_R, FAST_C)?;
+    buffer.jcc(Cond::G, fallback)?;
+
+    // Success: store the result and skip the fallback.
+    buffer.mov_rr(dst_reg, FAST_R)?;
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then leave the block.
+    buffer.bind(fallback)?;
+    emit_helper(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(true)
 }
 
 // ---------------------------------------------------------------------------
@@ -865,6 +1225,7 @@ pub(crate) fn run_native(
 mod tests {
     use super::*;
     use crate::MinimalContext;
+    use beam_loader::{Import, NO_FAIL};
 
     #[test]
     fn target_encoding_round_trips() {
@@ -944,7 +1305,7 @@ mod tests {
                 dst: Operand::Y(0),
             },
         ];
-        let allocation = allocate_registers(&code, 0, code.len());
+        let allocation = allocate_registers(&Module::default(), &code, 0, code.len());
         // x3 (src) then x1 (dst) — the `Y` destination is not cacheable.
         assert_eq!(
             allocation.slots,
@@ -963,7 +1324,7 @@ mod tests {
             src: Operand::Integer(1),
             dst: Operand::X(MAX_REGISTER),
         }];
-        let allocation = allocate_registers(&code, 0, code.len());
+        let allocation = allocate_registers(&Module::default(), &code, 0, code.len());
         assert!(allocation.slots.is_empty());
     }
 
@@ -991,5 +1352,173 @@ mod tests {
         );
         assert_eq!(x_register(&Operand::Y(4)), None);
         assert_eq!(x_register(&Operand::Nil), None);
+    }
+
+    // -- the small-int arithmetic fast path ---------------------------------
+
+    /// A module carrying `imports`, enough to exercise [`fast_arith`].
+    fn module_with_imports(imports: &[(&str, &str, u32)]) -> (Module, Vec<ImportRef>) {
+        let mut module = Module::default();
+        module.name = module.atom_table.intern("m");
+        let mut refs = Vec::new();
+        for (module_name, function_name, arity) in imports {
+            let module_atom = module.atom_table.intern(module_name);
+            let function_atom = module.atom_table.intern(function_name);
+            module.imports.push(Import {
+                module: module_atom,
+                function: function_atom,
+                arity: *arity,
+            });
+            refs.push(ImportRef((module.imports.len() - 1) as u32));
+        }
+        (module, refs)
+    }
+
+    /// A `GcBif` instruction over `bif` with the given operands.
+    fn gc_bif(bif: ImportRef, args: Vec<Operand>, dst: Operand) -> Instr {
+        Instr::GcBif {
+            arity: args.len() as u8,
+            bif,
+            fail: NO_FAIL,
+            live: args.len() as u32,
+            args,
+            dst,
+        }
+    }
+
+    #[test]
+    fn fast_path_constants_match_the_frozen_small_encoding() {
+        // The guard's nibble and the two range bounds are derived from
+        // `beam_term`, so they must equal what `beam_term` itself encodes.
+        assert_eq!(SMALL_MASK, 0xF);
+        assert_eq!(SMALL_TAG, 0xF);
+        assert_eq!(SMALL_SHIFT, 4);
+        assert_eq!(MIN_SMALL_WORD, make_small(MIN_SMALL).raw() as i64);
+        assert_eq!(MAX_SMALL_WORD, make_small(MAX_SMALL).raw() as i64);
+        assert_eq!(MIN_SMALL_WORD, i64::MIN + 15);
+        assert_eq!(MAX_SMALL_WORD, i64::MAX);
+        // Every small integer's word is tagged and inside the window the range
+        // check accepts (which is why the emitted code needs no re-tag check).
+        for value in [MIN_SMALL, MIN_SMALL + 1, -1, 0, 1, MAX_SMALL - 1, MAX_SMALL] {
+            let word = make_small(value).raw() as i64;
+            assert_eq!(word & SMALL_MASK, SMALL_TAG, "word for {value}");
+            assert!(
+                (MIN_SMALL_WORD..=MAX_SMALL_WORD).contains(&word),
+                "word for {value} outside the accepted window"
+            );
+        }
+        // The scratch registers must not overlap the cached x-registers or the
+        // block's reserved `rbx`/`rsp`.
+        for reg in [FAST_A, FAST_B, FAST_T, FAST_C, FAST_R] {
+            assert!(!CACHE_REGISTERS.contains(&reg), "{reg:?} is a cache register");
+            assert!(!SAVED_REGISTERS.contains(&reg), "{reg:?} is callee-saved");
+        }
+    }
+
+    #[test]
+    fn tagged_word_arithmetic_reproduces_make_small() {
+        // The emitted fast path is exact because `make_small(v) == v*16 + 15`,
+        // so `a_word + b_word - 15 == make_small(va + vb)` whenever neither step
+        // overflows an `i64`; otherwise the `jo`/range guards bail to the helper.
+        for (a, b) in [
+            (0, 0), (2, 3), (-4, 10), (7, -20), (-1, -1),
+            (MAX_SMALL - 2, 1), (MIN_SMALL + 2, -1), (MAX_SMALL, 0), (MIN_SMALL, 0),
+            (MAX_SMALL, MAX_SMALL), (MIN_SMALL, -1),
+        ] {
+            let a_word = make_small(a).raw() as i64;
+            let b_word = make_small(b).raw() as i64;
+            let sum = a_word.checked_add(b_word).and_then(|s| s.checked_sub(SMALL_TAG));
+            let difference = a_word.checked_sub(b_word).and_then(|d| d.checked_add(SMALL_TAG));
+            for (word, expected) in [
+                (sum, a.checked_add(b)),
+                (difference, a.checked_sub(b)),
+            ] {
+                match word {
+                    Some(word) if (MIN_SMALL_WORD..=MAX_SMALL_WORD).contains(&word) => {
+                        assert_eq!(
+                            word,
+                            make_small(expected.expect("in-range word")).raw() as i64,
+                            "{a} / {b}"
+                        );
+                    }
+                    // Out of the window: the range check bails, and the true
+                    // value genuinely is not a small integer.
+                    Some(_) => assert!(
+                        matches!(expected, Some(v) if v < MIN_SMALL || v > MAX_SMALL),
+                        "{a} / {b} produced an out-of-window word in range"
+                    ),
+                    // An `i64` overflow: the `jo` guard bails.
+                    None => {}
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn fast_arith_recognizes_only_the_two_small_int_bifs() {
+        let (module, refs) = module_with_imports(&[
+            ("erlang", "+", 2),
+            ("erlang", "-", 2),
+            ("erlang", "*", 2),
+            ("erlang", "+", 3),
+            ("lists", "+", 2),
+        ]);
+        let args = vec![Operand::X(0), Operand::Integer(1)];
+        for (index, expected) in [
+            (0usize, Some(SmallArith::Add)),
+            (1, Some(SmallArith::Sub)),
+            (2, None),
+            (3, None),
+            (4, None),
+        ] {
+            let instr = gc_bif(refs[index], args.clone(), Operand::X(0));
+            assert_eq!(
+                fast_arith(&module, &instr).map(|fast| fast.op),
+                expected,
+                "import {index}"
+            );
+        }
+        // Shapes the fast path refuses: a Y destination, a Y operand, a non-small
+        // constant operand, a wrong argument count, an out-of-bound register.
+        let plus = refs[0];
+        let atom = module.name;
+        for instr in [
+            gc_bif(plus, args.clone(), Operand::Y(0)),
+            gc_bif(plus, vec![Operand::X(0), Operand::Y(1)], Operand::X(0)),
+            gc_bif(plus, vec![Operand::X(0), Operand::Atom(atom)], Operand::X(0)),
+            gc_bif(plus, vec![Operand::X(0), Operand::Nil], Operand::X(0)),
+            gc_bif(plus, vec![Operand::X(0)], Operand::X(0)),
+            gc_bif(
+                plus,
+                vec![Operand::X(MAX_REGISTER), Operand::Integer(1)],
+                Operand::X(0),
+            ),
+            gc_bif(plus, args.clone(), Operand::X(MAX_REGISTER)),
+        ] {
+            assert!(fast_arith(&module, &instr).is_none(), "{instr:?}");
+        }
+    }
+
+    #[test]
+    fn allocation_caches_the_fast_path_operands_and_destination() {
+        let (module, refs) = module_with_imports(&[("erlang", "+", 2)]);
+        let code = vec![
+            Instr::Label(Label(1)),
+            gc_bif(refs[0], vec![Operand::X(4), Operand::Integer(1)], Operand::X(2)),
+            Instr::Return,
+        ];
+        let allocation = allocate_registers(&module, &code, 0, code.len());
+        // x4 (the operand) then x2 (the destination), in that order.
+        assert_eq!(allocation.slots, vec![(4, Reg::R12), (2, Reg::R13)]);
+        assert_eq!(allocation.slot(2), Some(Reg::R13));
+
+        // A `gc_bif` outside the fast path caches nothing.
+        let (module, refs) = module_with_imports(&[("erlang", "*", 2)]);
+        let code = vec![gc_bif(
+            refs[0],
+            vec![Operand::X(4), Operand::Integer(1)],
+            Operand::X(2),
+        )];
+        assert!(allocate_registers(&module, &code, 0, code.len()).slots.is_empty());
     }
 }
