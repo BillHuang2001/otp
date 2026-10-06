@@ -378,7 +378,7 @@ impl Table {
 - `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`)
 - `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`) + `BodyKind`
 - `src/info.rs` → `TableInfo` + `entries` (the `ets:info` pairs)
-- `src/error.rs` → `badarg`/failure constructors (no new error enum)
+- `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update)
 - `tests/select.rs` → the match-spec compiler integration tests
