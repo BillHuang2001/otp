@@ -61,10 +61,11 @@ liveness maps.
 - `pub struct ProcessFlags` — a `u32` bitset newtype (no `bitflags` dep): `trap_exit`, `system`,
   `in_run_queue`, `garbage_collecting`, `active`. `new()`, per-flag get/set, `bits()/from_bits()`.
 - `pub struct Process` — the PCB. Owns: `pid: ProcessId`, `state: ProcessState`, `flags: ProcessFlags`,
-  `collector: beam_gc::Collector` (young + mature heap spaces), `off_heap: beam_message::OffHeapTable`
-  (the process's MSO handles), `mailbox: beam_message::Queue`, `regs: Registers`, `reductions: u64`,
-  `links: Links`, `monitors: Monitors` (outgoing), `monitored_by: Vec<MonitoredBy>` (incoming),
-  `exit_reason: Option<Eterm>`.
+  `priority: Priority`, `save_calls: u16`, `collector: beam_gc::Collector` (young + mature heap spaces),
+  `off_heap: beam_message::OffHeapTable` (the process's MSO handles), `mailbox: beam_message::Queue`,
+  `regs: Registers`, `dict: Dict` (the process dictionary), `saved_args: SavedArgs` (saved BIF/NIF
+  arguments), `reductions: u64`, `links: Links`, `monitors: Monitors` (outgoing), `monitored_by:
+  Vec<MonitoredBy>` (incoming), `exit_reason: Option<Eterm>`.
   - `new(pid) -> Result<Process>` (default `HeapPolicy`); `with_policy(pid, policy) -> Result<Process>`
   - `pid()`, `state()`, `set_state()`, `flags()/flags_mut()`, `is_trapping_exit()/set_trap_exit(bool)`
   - `wake(&mut self) -> bool` — if `state` is `Waiting` or `Suspended`, set it to `Runnable` and return
