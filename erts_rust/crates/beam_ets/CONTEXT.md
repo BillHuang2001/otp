@@ -156,8 +156,9 @@ impl Table {
   read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
   `lookup_element_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
   -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
-  `is_empty -> Result<bool>`. `ordered_set` navigation needs no interior support — `first`/`last`/
-  `next`/`prev` are table-level, so the same read-checked wrappers cover them as for the hash kinds.
+  `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
+  wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
+  `next_key`/`prev_key` with exact B+-tree searches, but the access layer sits above the `Table`).
   The underlying `Table` methods stay owner-level primitives (no access check). The matrix is
   verified against the system `erl` (OTP 29 / erts-17.1).
 
@@ -182,7 +183,8 @@ impl Table {
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
   `first`/`last`, `first_key`/`last_key`, `next`/`prev`, `next_from(bound, inclusive)`/
   `prev_from(bound, inclusive)` (the partial-bound range searches) — all via `beam_term::compare::cmp`.
-  Plus its `Interior` impl. Interior storage is **not** counted by `memory()` (Known Issues).
+  Plus its `Interior` impl (which overrides `first_key`/`last_key`/`next_key`/`prev_key` and
+  `memory`). Interior storage (the node arena) **is** counted by `memory()`.
 - `node.rs` — the arena node layout + `ORDER`/`MIN_OCCUPANCY` constants and the `NodeStore`
   (`NodeId` slots + free list; nodes never relocate).
 - `tree.rs` — insert/lookup/delete with split + borrow-or-merge rebalance and the separator invariant
@@ -303,9 +305,6 @@ impl Table {
   are `relinquish`ed: valid for the table's lifetime and never handed out again, but no longer counted
   as table memory (matching real `ets:take/2`, whose objects leave the table). Their words stay held by
   the store's block until `delete_all_objects`/drop, since the arena never shrinks.
-- **`ordered_set` `memory()` under-reports.** The `Interior::memory` default is 0, so
-  `Table::memory()` for `ordered_set` counts only the term store, not the B+-tree node arena. The
-  hash interior reports its honest bucket/entry allocation.
 - **Hash-interior navigation order is unspecified (per the ETS contract).** `HashInterior` supplies the
   bucket-scan `keys()` and relies on the `Interior` trait defaults for `first_key`/`last_key`/
   `next_key`/`prev_key`, so `first`/`last` are the first/last keys of that internal order and
@@ -314,7 +313,8 @@ impl Table {
   equally unspecified. Only the order is unspecified: every key the walk yields is a present key, the
   `first`+`next` walk is a permutation of the stored keys, and `next`/`prev` on an **absent** anchor are
   `badarg`. `ordered_set` navigation is exact (ascending `beam_term` order, absent keys read as range
-  bounds).- **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
+  bounds).
+- **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
 - **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
