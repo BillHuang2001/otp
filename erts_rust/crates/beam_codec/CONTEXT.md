@@ -426,12 +426,13 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   cap of `body_len - 5` bytes (the C's rule, `external.c:2276-2298`) and the **plain** image is
   emitted when the stream does not fit, so `encode_term` is never compressed and
   `encode_term_compressed` matches the oracle's *choice* of wrapper vs plain byte-exactly.
-- **Compressed output is not byte-comparable with the oracle.** zlib (C) and `miniz_oxide` produce
-  different — equally valid — deflate byte streams for the same input, so the `COMPRESSED`
-  ground-truth vector pins the **decoder** and the **inner body** (which must equal our uncompressed
-  encoding), not our compressor's bytes. Round-trip byte-stability is asserted among *our own*
-  encode/decode; interoperability (the system `erl`'s `binary_to_term/1` accepting our wrapper and
-  our uncompressed re-encoding) is asserted live by `tests/interop.rs`.
+- **Only the *deflate bytes* of a compressed image are not byte-comparable with the oracle.** zlib
+  (C) and `miniz_oxide` produce different — equally valid — streams for the same input, so the
+  `COMPRESSED` ground-truth vector pins the **decoder** and the **inner body** (which must equal our
+  uncompressed encoding), not our compressor's bytes. The wrapper-vs-plain *choice* **is**
+  oracle-exact (both implement the `body_len - 5` shrink rule above). Round-trip byte-stability is
+  asserted among *our own* encode/decode; interoperability (the system `erl`'s `binary_to_term/1`
+  accepting our wrapper and our uncompressed re-encoding) is asserted live by `tests/interop.rs`.
 - **The interop harness compares terms structurally, not by `beam_term::compare::eq`.** `eq`'s
   documented fallback for maps and external identifiers compares the raw term word (a heap address),
   so it would report two structurally-equal terms decoded into different heaps as unequal. The
