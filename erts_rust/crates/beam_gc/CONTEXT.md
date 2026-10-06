@@ -274,6 +274,14 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   proves the descriptor words are opaque**: it plants an `Imported` fun whose `uniq[0..8]` is a
   BOXED-tagged pointer into the from-space, so a scan that stepped `thing_arityval + 1` would follow that
   raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim.
+- **`immix_collector` / `any_collector` in-module tests + `tests/gen_immix_collector.rs` — the integrated
+  evidence.** The in-module tests build a graph through `young_mut()`, drive minors and majors, and check
+  the graph survives (root relocation, structure, values); they include the hard `major` cases — a
+  fullsweep-cadence major, a major that reclaims dead mature objects, a would-not-fit minor escalating to
+  a major, and a **young→mature reference surviving a major's in-place evacuation**. `tests/gen_immix_collector.rs`
+  drives the **same** corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public
+  API and asserts identical collection-kind sequences and an intact, relocated live graph for both, plus
+  that `from_config(&GcConfig::default())` selects the Copying path.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
