@@ -335,8 +335,9 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - `boxed.rs` provides header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
 - `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
   (`Local` by `(uniq,index)` then `num_free` then env; `External` by `(module,function,arity)`;
-  `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
-  fields `compare` compares — funs are hashed structurally, not an opaque fallback.
+  `Imported` by `(module,index,old_uniq)` then `num_free` then env); the `hashing/` module's
+  structural `term_hash` hashes exactly the fields `compare` compares — funs are hashed structurally,
+  not an opaque fallback.
 
 ### `record.rs` — native records (`ErtsRecordDefinition`/`ErtsRecordInstance`)
 The OTP 29 native-record term interior, owned here (the frozen-layout LCA) like [`fun.rs`]/[`refc.rs`].
