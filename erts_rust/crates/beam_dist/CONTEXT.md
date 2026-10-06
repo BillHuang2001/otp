@@ -313,6 +313,8 @@ distribution header carries it).
 - `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
 - `src/connection.rs` → `TcpTransport`, the handshake driver (client/server + creation), `Connection`
   (owning the outbound atom cache), `send_control`/`send_message`/`recv`
+- `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
+  `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/epmd.rs` → `epmd` request/response codecs + `EpmdClient` over `Transport`
 - `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection}.rs` → seams
 - `tests/live_interop.rs` → real-`erl` handshake + message exchange (the interop evidence)
