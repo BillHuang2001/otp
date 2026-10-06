@@ -38,8 +38,9 @@
 //!   arithmetic mode. In *exact* mode a mixed integer/float pair (`1` vs `1.0`)
 //!   compares by class rank, not numerically — exactly as `erts_cmp` does. In
 //!   *arithmetic* mode a mixed integer/float pair instead compares via the
-//!   approximate best-effort `f64` conversion [`number_as_f64`] (a bignum beyond
-//!   2^53 may lose precision).
+//!   best-effort `f64` conversion
+//!   [`crate::number::number_as_f64`] (faithful nearest-double rounding for a
+//!   representable bignum; an unrepresentable magnitude becomes `±inf`).
 //! * **Tuples** compare elementwise after the arity; **lists** (cons cells)
 //!   compare elementwise with the shorter/improper tail deciding a prefix tie;
 //!   **bitstrings** compare bit-by-bit (most-significant first) then by bit size;
@@ -63,7 +64,7 @@
 use core::cmp::Ordering;
 
 use crate::atom::AtomTable;
-use crate::bitstring::{bit_at, bitstring_parts, float_bits, float_value};
+use crate::bitstring::{bit_at, bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, is_float};
 use crate::eterm::Eterm;
 use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
@@ -71,6 +72,7 @@ use crate::immediate::{
     atom_val, internal_pid_data, internal_port_data, is_atom, is_small, signed_value,
 };
 use crate::list::{car, cdr, is_list};
+use crate::number::number_as_f64;
 use crate::ops::{class, TermClass};
 use crate::tag::BIG_SIGN_BIT;
 use crate::tuple::{tuple_element, tuple_size};
@@ -307,8 +309,8 @@ fn cmp_numbers(a: Eterm, b: Eterm, ca: TermClass, cb: TermClass, exact: bool) ->
             if exact {
                 class_rank(ca).cmp(&class_rank(cb))
             } else {
-                // SAFETY: both are live numeric terms.
-                unsafe { number_as_f64(a).partial_cmp(&number_as_f64(b)) }
+                number_as_f64(a)
+                    .partial_cmp(&number_as_f64(b))
                     .unwrap_or(Ordering::Greater)
             }
         }
@@ -363,38 +365,6 @@ unsafe fn cmp_bigs(a: Eterm, b: Eterm) -> Ordering {
         magnitude.reverse()
     } else {
         magnitude
-    }
-}
-
-/// Best-effort `f64` value of a numeric term (used only by arithmetic mixed
-/// comparisons). Bignum conversion may lose precision.
-///
-/// # Safety
-///
-/// `x` must be a live numeric term.
-unsafe fn number_as_f64(x: Eterm) -> f64 {
-    match unsafe { class(x) } {
-        TermClass::Small => signed_value(x) as f64,
-        TermClass::Float => unsafe { float_value(x) },
-        TermClass::Big => {
-            // SAFETY: `x` is a boxed bignum.
-            let p = boxed_val(x);
-            let hdr = unsafe { *p };
-            let arity = header_arity(hdr);
-            let mut value = 0.0f64;
-            let mut i = arity;
-            while i > 0 {
-                i -= 1;
-                // SAFETY: limb `i` is within the bignum's payload.
-                value = value * 18_446_744_073_709_551_616.0 + unsafe { (*p.add(1 + i)).raw() } as f64;
-            }
-            if big_is_negative(x) {
-                -value
-            } else {
-                value
-            }
-        }
-        _ => f64::NAN,
     }
 }
 
