@@ -493,10 +493,17 @@ fn compile_pattern_arg(pattern: Eterm) -> Result<(PatternTag, Vec<Vec<u8>>)> {
 /// Mints a fresh `Ref` thing and records `tag`/`alternatives` under its id,
 /// returning the `{Tag, Ref}` tuple the oracle returns.
 ///
+/// The tag atom is resolved with [`BifContext::intern_atom`] rather than
+/// [`BifContext::atom`]: `bm`/`ac` are the C's pre-interned `am_bm`/`am_ac`, and a
+/// runtime that has not seeded them still gets them (through the `AtomInterner`
+/// seam) instead of a spurious `TermNotFound` — the same on-demand intern the
+/// `nif`/`error` modules already do for their reason atoms. An already-interned
+/// name never needs the seam, so the common path costs nothing.
+///
 /// The id is reserved (and the ref built) *before* the entry is inserted, so a
 /// pattern that fails to construct — an exhausted id space, a heap that cannot
-/// fit the ref — leaves no orphan entry, and a reserved-but-never-inserted id is
-/// simply skipped (ids are never reused).
+/// fit the ref, an uninternable tag — leaves no orphan entry, and a
+/// reserved-but-never-inserted id is simply skipped (ids are never reused).
 fn intern_compiled(
     ctx: &mut BifContext<'_>,
     tag: PatternTag,
@@ -509,7 +516,7 @@ fn intern_compiled(
         id
     };
     let ref_term = access::make_ref_thing(ctx.heap(), id)?;
-    let tag_term = ctx.atom(tag.atom())?;
+    let tag_term = ctx.intern_atom(tag.atom())?;
     let handle = ctx.tuple(&[tag_term, ref_term])?;
     lock_patterns().entries.insert(id, CompiledPattern { tag, alternatives });
     Ok(handle)
@@ -2291,6 +2298,63 @@ mod tests {
             let out_of_range = byte_list(ctx, &[256]);
             assert!(matches!(compile_pattern_1(ctx, &[out_of_range]), Err(BeamError::BadArg)));
         });
+    }
+
+    #[test]
+    fn compile_pattern_interns_its_tag_atom_on_demand() {
+        // The oracle's `bm`/`ac` are pre-interned from `atom.names`, but the Rust
+        // runtime's boot seed need not hold them: the BIF resolves the tag through
+        // `BifContext::intern_atom`, so an absent name is interned via the
+        // `AtomInterner` seam instead of failing with `TermNotFound`.
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(["ab", "cd"]); // deliberately without `bm`/`ac`
+
+        let mut interner = Interner { table: std::cell::RefCell::new(AtomTable::new()) };
+        let (bm_tag, ac_tag) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_atom_interner(&mut interner);
+            let ab = bin(&mut ctx, b"ab");
+            let cd = bin(&mut ctx, b"cd");
+
+            // One search string ⇒ `bm`, interned on demand.
+            let bm = compile_pattern_1(&mut ctx, &[ab]).expect("interns `bm` on demand");
+            let bm_tag = access::tuple_element(bm, 0);
+            assert!(access::is_atom(bm_tag));
+            // Several search strings ⇒ `ac`, likewise.
+            let list = ctx.list(&[ab, cd]).unwrap();
+            let ac = compile_pattern_1(&mut ctx, &[list]).expect("interns `ac` on demand");
+            (bm_tag, access::tuple_element(ac, 0))
+        };
+
+        // `ctx` is gone, so the interner can be inspected: the tags landed under
+        // exactly the oracle's names.
+        let names = interner.table.borrow();
+        assert_eq!(names.name(atom_val(bm_tag)), Some("bm"));
+        assert_eq!(names.name(atom_val(ac_tag)), Some("ac"));
+        drop(names);
+
+        // Without an interner an unresolvable tag atom is the typed
+        // `TermNotFound`, never a fabricated index (the `atoms` table above has
+        // neither name and this context has no seam).
+        let mut bare = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let ab = bin(&mut bare, b"ab");
+        assert!(matches!(
+            compile_pattern_1(&mut bare, &[ab]),
+            Err(BeamError::TermNotFound)
+        ));
+    }
+
+    /// An `AtomInterner` over its own table (the `convert.rs` mock): the table
+    /// *is* the shared atom table in a real runtime.
+    struct Interner {
+        table: std::cell::RefCell<AtomTable>,
+    }
+
+    impl crate::context::AtomInterner for Interner {
+        fn intern(&mut self, name: &str) -> beam_term::Atom {
+            self.table.borrow_mut().intern(name)
+        }
     }
 
     #[test]
