@@ -245,6 +245,111 @@ mod tests {
         unsafe { write_float(hp, value) }
     }
 
+    /// The bignum whose value is `sum(limbs[i] << (64 * i))`, as a decimal string.
+    ///
+    /// Arbitrary-precision integer → decimal (schoolbook, base 10^9 limbs). Used to
+    /// build an **independent** correctly-rounded reference for [`big_to_f64`]: a
+    /// full-precision decimal string parsed by `str::parse::<f64>()` is guaranteed
+    /// by Rust to yield the nearest representable double (ties to even) or `±inf`
+    /// on overflow — no dependency on this crate's own rounding.
+    fn limbs_to_decimal(limbs: &[u64]) -> String {
+        const BASE: u128 = 1_000_000_000;
+        // Little-endian base-1e9 digits; start at 0.
+        let mut dec: Vec<u32> = vec![0];
+        for &limb in limbs.iter().rev() {
+            // dec = dec * 2^64 + limb
+            let mut carry = limb as u128;
+            for d in dec.iter_mut() {
+                let t = ((*d as u128) << 64) + carry;
+                *d = (t % BASE) as u32;
+                carry = t / BASE;
+            }
+            while carry > 0 {
+                dec.push((carry % BASE) as u32);
+                carry /= BASE;
+            }
+        }
+        let mut s = String::new();
+        let mut it = dec.iter().rev();
+        s.push_str(&it.next().unwrap().to_string());
+        for d in it {
+            s.push_str(&format!("{d:09}"));
+        }
+        s
+    }
+
+    /// The correctly-rounded `f64` of the bignum `limbs` (LS-first), independent of
+    /// [`big_to_f64`]: full-precision decimal → `str::parse::<f64>()` (documented as
+    /// correctly rounded; overflow yields `±inf`).
+    fn reference_f64(negative: bool, limbs: &[u64]) -> f64 {
+        let mut s = limbs_to_decimal(limbs);
+        if negative {
+            s.insert(0, '-');
+        }
+        s.parse::<f64>().expect("decimal parses as f64")
+    }
+
+    /// Assert [`big_to_f64`] agrees with the independent reference for one bignum:
+    /// `Some(d)` (finite, nearest-even) for a representable value, `None` exactly
+    /// when the value overflows to `±inf`.
+    fn check_against_reference(negative: bool, limbs: &[u64]) {
+        let mut heap = Heap::new(big_size_words(limbs.len()) + 8);
+        let t = big(&mut heap, negative, limbs);
+        let want = reference_f64(negative, limbs);
+        match big_to_f64(t) {
+            Some(got) => {
+                assert!(
+                    want.is_finite(),
+                    "big_to_f64 gave {got:e} but the exact value overflows ({limbs:?})"
+                );
+                assert_eq!(
+                    got.to_bits(),
+                    want.to_bits(),
+                    "big_to_f64 gave {got:e}, reference gives {want:e} for {limbs:?}"
+                );
+            }
+            None => {
+                assert!(
+                    !want.is_finite(),
+                    "big_to_f64 gave None but the exact value is {want:e} for {limbs:?}"
+                );
+            }
+        }
+    }
+
+    /// The limbs of the value `2^bitlen - 1` (all `bitlen` low bits set).
+    fn all_ones(bitlen: usize) -> Vec<u64> {
+        let n = bitlen.div_ceil(64);
+        let mut v = vec![u64::MAX; n];
+        let rem = bitlen % 64;
+        if rem != 0 {
+            *v.last_mut().unwrap() = (1u64 << rem) - 1;
+        }
+        v
+    }
+
+    /// The limbs of `2^(bitlen-1)` (single top bit set), `bitlen >= 1`.
+    fn lone_top_bit(bitlen: usize) -> Vec<u64> {
+        let n = bitlen.div_ceil(64);
+        let mut v = vec![0u64; n];
+        v[(bitlen - 1) / 64] = 1u64 << ((bitlen - 1) % 64);
+        v
+    }
+
+    /// The limbs of the value `big + 1`, where `big` is `limbs` (little-endian).
+    fn plus_one(limbs: &[u64]) -> Vec<u64> {
+        let mut v = limbs.to_vec();
+        for w in v.iter_mut() {
+            let (s, carry) = w.overflowing_add(1);
+            *w = s;
+            if !carry {
+                return v;
+            }
+        }
+        v.push(1);
+        v
+    }
+
     #[test]
     fn big_to_f64_rejects_non_bignums() {
         let mut heap = Heap::new(8);
@@ -349,5 +454,291 @@ mod tests {
         let mut carry = vec![0u64; 16];
         carry[15] = u64::MAX << 10; // bits 10..=63 of limb 15 => bits 970..=1023
         assert_eq!(big_to_f64(big(&mut heap, false, &carry)), None);
+    }
+
+    /// The limbs of a pseudo-random `bitlen`-bit value (top bit forced set so the
+    /// bignum is normalised), deterministic for a given `seed`.
+    fn pattern_limbs(bitlen: usize, seed: u64) -> Vec<u64> {
+        let n = bitlen.div_ceil(64);
+        let mut v = vec![0u64; n];
+        let mut x = seed | 1;
+        for w in v.iter_mut() {
+            x = x
+                .wrapping_mul(6_364_136_223_846_793_005)
+                .wrapping_add(1_442_695_040_888_963_407);
+            *w = x;
+        }
+        let rem = bitlen % 64;
+        if rem != 0 {
+            *v.last_mut().unwrap() &= (1u64 << rem) - 1;
+        }
+        v[(bitlen - 1) / 64] |= 1u64 << ((bitlen - 1) % 64);
+        v
+    }
+
+    /// A systematic sweep of the whole `bitlen` range: every width `1..=1100`
+    /// against a power of two, an all-ones value and a random pattern, both signs.
+    /// Each is checked against the independent correctly-rounded reference
+    /// ([`reference_f64`]) — this covers the mantissa ties-to-even behaviour, the
+    /// 1024-bit finite/overflow boundary and many-limb (≥3 limbs) values.
+    #[test]
+    fn bit_length_sweep_matches_correctly_rounded_reference() {
+        for bitlen in 1..=1100usize {
+            let cases = [
+                lone_top_bit(bitlen),
+                all_ones(bitlen),
+                pattern_limbs(bitlen, (bitlen as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)),
+            ];
+            for limbs in cases {
+                check_against_reference(false, &limbs);
+                check_against_reference(true, &limbs);
+            }
+        }
+    }
+
+    /// One ULP either side of the rounding boundary across every bit width: for each
+    /// `bitlen` the value `2^bitlen - 1` (which rounds up to `2^bitlen` when the
+    /// mantissa carries) and its successor `2^bitlen` are both checked.
+    #[test]
+    fn sweep_across_carry_boundaries() {
+        for bitlen in 54..=1030usize {
+            let ones = all_ones(bitlen);
+            check_against_reference(false, &ones);
+            check_against_reference(true, &ones);
+            let succ = plus_one(&ones); // 2^bitlen
+            check_against_reference(false, &succ);
+            check_against_reference(true, &succ);
+        }
+    }
+
+    /// The exact overflow threshold and its neighbours, bitlen 1024.
+    #[test]
+    fn overflow_threshold_neighbourhood() {
+        // f64::MAX = 2^1024 - 2^971: bits 971..=1023 set (limb 15, offsets 11..=63).
+        let mut max = vec![0u64; 16];
+        max[15] = u64::MAX << 11;
+        assert_eq!(big_to_f64(big(&mut Heap::new(32), false, &max)), Some(f64::MAX));
+        check_against_reference(false, &max);
+
+        // f64::MAX - 2^970: one ULP below the max is still finite.
+        let mut below = max.clone();
+        below[15] &= !(1u64 << 10); // clear bit 970
+        check_against_reference(false, &below);
+        assert!(big_to_f64(big(&mut Heap::new(32), false, &below)).unwrap().is_finite());
+
+        // f64::MAX + 1 = 2^1024 - 2^970: the exact halfway point to 2^1024; it
+        // overflows to infinity (and `big_to_f64` fails -> the caller raises
+        // badarith).
+        let mut above = max.clone();
+        above[15] |= 1u64 << 10;
+        assert_eq!(big_to_f64(big(&mut Heap::new(32), false, &above)), None);
+        assert_eq!(number_as_f64(big(&mut Heap::new(32), true, &above)), f64::NEG_INFINITY);
+        check_against_reference(false, &above);
+
+        // 2^1024 (bitlen 1025): rejected up front.
+        let p1024 = lone_top_bit(1025);
+        assert_eq!(big_to_f64(big(&mut Heap::new(32), false, &p1024)), None);
+    }
+
+    /// Hand-computed vectors at and around the 53/54-bit mantissa boundary, pinned
+    /// against the exact semantics of ties-to-even. These are the values that a
+    /// naive digit-by-digit accumulation gets wrong.
+    #[test]
+    fn mantissa_boundary_hand_computed() {
+        let mut heap = Heap::new(32);
+        let cases: &[(u64, f64)] = &[
+            // 2^53 is exactly representable.
+            (1u64 << 53, (1u64 << 53) as f64),
+            // 2^53 + 1: exactly halfway between 2^53 and 2^53+2 -> ties to even -> 2^53.
+            ((1u64 << 53) + 1, (1u64 << 53) as f64),
+            // 2^53 + 2: representable (even).
+            ((1u64 << 53) + 2, ((1u64 << 53) + 2) as f64),
+            // 2^53 + 3: halfway between 2^53+2 and 2^53+4 -> ties to even -> 2^53+4.
+            ((1u64 << 53) + 3, ((1u64 << 53) + 4) as f64),
+            // 2^54 + 2: halfway between 2^54 and 2^54+4 -> ties to even -> 2^54.
+            ((1u64 << 54) + 2, (1u64 << 54) as f64),
+            // 2^54 + 6: halfway between 2^54+4 and 2^54+8 -> ties to even -> 2^54+8.
+            ((1u64 << 54) + 6, ((1u64 << 54) + 8) as f64),
+            // 2^60 (one limb, still exact).
+            (1u64 << 60, (1u64 << 60) as f64),
+        ];
+        for &(value, want) in cases {
+            assert_eq!(big_to_f64(big(&mut heap, false, &[value])), Some(want), "{value}");
+        }
+    }
+
+    /// A two-limb value where the rounded result carries out of the mantissa and
+    /// increments the exponent: `2^70 - 1` rounds up to `2^70`.
+    #[test]
+    fn carry_out_of_mantissa_increments_exponent() {
+        let mut heap = Heap::new(64);
+        // 2^70 - 1: two limbs, the low 64 bits and the low 6 bits of the next.
+        let v = vec![u64::MAX, (1u64 << 6) - 1];
+        assert_eq!(big_to_f64(big(&mut heap, false, &v)), Some(2.0f64.powi(70)));
+        check_against_reference(false, &v);
+
+        // 2^70 - 2^17 = 2^17 * (2^53 - 1) is exactly representable (mantissa 2^53-1).
+        let mut exact = v.clone();
+        exact[0] &= !((1u64 << 17) - 1);
+        assert_eq!(
+            big_to_f64(big(&mut heap, false, &exact)),
+            Some(2.0f64.powi(70) - 2.0f64.powi(17)),
+        );
+        check_against_reference(false, &exact);
+    }
+
+    /// The limbs of the value with exactly the given bit positions set.
+    fn value_from_bits(bits: &[usize]) -> Vec<u64> {
+        let maxb = *bits.iter().max().expect("at least one bit");
+        let mut v = vec![0u64; maxb / 64 + 1];
+        for &b in bits {
+            v[b / 64] |= 1u64 << (b % 64);
+        }
+        v
+    }
+
+    /// A curated set of vectors whose expected `f64` values were **verified against
+    /// the real system Erlang** (`erl -noshell -eval 'float(X)'` →
+    /// `<<F:64/float>>`): `tests/number_oracle.rs` performs the live cross-check over
+    /// a wide sweep; this test keeps a meaningful, oracle-pinned core in the crate
+    /// itself so it is exercised even where `erl` is not installed. Expected values
+    /// are the oracle's exact output bits.
+    #[test]
+    fn oracle_verified_vectors() {
+        // (name, negative, limbs, expected) with `None` = the oracle raised
+        // `badarg` (out of range; `i_fconv` raises `badarith`).
+        let two_pow = |e: i32| 2.0f64.powi(e);
+        let max = {
+            let mut v = vec![0u64; 16];
+            v[15] = u64::MAX << 11; // 2^1024 - 2^971
+            v
+        };
+        let halfway = {
+            let mut v = vec![0u64; 16];
+            v[15] = u64::MAX << 10; // 2^1024 - 2^970
+            v
+        };
+        let cases: Vec<(&str, bool, Vec<u64>, Option<f64>)> = vec![
+            // 2^53 + 1 -> 2^53 (ties to even). Oracle: 0x4340000000000000.
+            ("2^53 + 1", false, vec![(1u64 << 53) + 1], Some(two_pow(53))),
+            // 2^54 + 2 -> 2^54 (ties to even). Oracle: 0x4350000000000000.
+            ("2^54 + 2", false, vec![(1u64 << 54) + 2], Some(two_pow(54))),
+            // 2^54 + 6 -> 2^54 + 8. Oracle: 0x4350000000000002.
+            ("2^54 + 6", false, vec![(1u64 << 54) + 6], Some(two_pow(54) + 8.0)),
+            // 2^70 - 1 -> 2^70 (mantissa carries). Oracle: 0x4450000000000000.
+            ("2^70 - 1", false, vec![u64::MAX, (1u64 << 6) - 1], Some(two_pow(70))),
+            // 2^117 + 2^64 + 1 -> 2^117 + 2^65 (just past halfway). Oracle: 0x4740000000000001.
+            (
+                "2^117 + 2^64 + 1",
+                false,
+                value_from_bits(&[117, 64, 0]),
+                Some(f64::from_bits(0x4740_0000_0000_0001)),
+            ),
+            // 2^70 + 2^17 is the exact halfway point -> ties to even -> 2^70.
+            ("2^70 + 2^17", false, value_from_bits(&[70, 17]), Some(two_pow(70))),
+            // 2^70 + 2^17 + 2^16 is past halfway -> rounds up to 2^70 + 2^18.
+            (
+                "2^70 + 2^17 + 2^16",
+                false,
+                value_from_bits(&[70, 17, 16]),
+                Some(f64::from_bits(0x4450_0000_0000_0001)),
+            ),
+            // 2^70 + 2^18 + 2^17 is the next halfway point -> ties to even -> 2^70 + 2^19.
+            (
+                "2^70 + 2^18 + 2^17",
+                false,
+                value_from_bits(&[70, 18, 17]),
+                Some(f64::from_bits(0x4450_0000_0000_0002)),
+            ),
+            // 2^100 + 2^47 + 12345: just above halfway -> 2^100 + 2^48.
+            (
+                "2^100 + 2^47 + 12345",
+                false,
+                {
+                    let mut v = value_from_bits(&[100, 47]);
+                    v[0] += 12345;
+                    v
+                },
+                Some(f64::from_bits(0x4630_0000_0000_0001)),
+            ),
+            // 2^200 + 1 -> 2^200.
+            ("2^200 + 1", false, value_from_bits(&[200, 0]), Some(two_pow(200))),
+            // 2^1023: the largest power of two representable exactly.
+            ("2^1023", false, value_from_bits(&[1023]), Some(f64::from_bits(0x7FE0_0000_0000_0000))),
+            // f64::MAX = 2^1024 - 2^971: representable exactly.
+            ("f64::MAX", false, max.clone(), Some(f64::MAX)),
+            // -(2^70 - 1) -> -2^70. Oracle: 0xC450000000000000.
+            ("-(2^70 - 1)", true, vec![u64::MAX, (1u64 << 6) - 1], Some(-two_pow(70))),
+            // 2^1024 - 2^970: the exact halfway point to 2^1024 -> overflow -> None.
+            ("2^1024 - 2^970", false, halfway, None),
+            // 2^1024 - 1: overflow -> None.
+            ("2^1024 - 1", false, vec![u64::MAX; 16], None),
+        ];
+
+        // The bit patterns above were captured from the system Erlang; the two
+        // `from_bits` constants double as a documentation of the oracle output.
+        assert_eq!(f64::from_bits(0x4740_0000_0000_0001), two_pow(117) + two_pow(65));
+
+        for (name, negative, limbs, want) in cases {
+            let mut heap = Heap::new(big_size_words(limbs.len()) + 8);
+            let t = big(&mut heap, negative, &limbs);
+            assert_eq!(big_to_f64(t), want, "big_to_f64({name})");
+            // Independently confirmed against the same correctly-rounded reference.
+            check_against_reference(negative, &limbs);
+            match want {
+                Some(w) => assert_eq!(number_as_f64(t).to_bits(), w.to_bits(), "number_as_f64({name})"),
+                None => assert_eq!(
+                    number_as_f64(t),
+                    if negative { f64::NEG_INFINITY } else { f64::INFINITY },
+                    "number_as_f64({name})",
+                ),
+            }
+        }
+    }
+
+    /// The tie-break descent across **lower limbs**: when the half bit is set and the
+    /// kept mantissa is even, the C walks down through the remaining limbs looking for
+    /// any set "lesser" bit — it may descend through many all-zero limbs to `i == 0`
+    /// (round down) or stop at the first non-zero limb (round up). Every expected value
+    /// below was captured from the system Erlang (`float/1`).
+    #[test]
+    fn multi_limb_tie_break_descent() {
+        // (name, limbs, expected)
+        let cases: Vec<(&str, Vec<u64>, f64)> = vec![
+            // Exactly even and a half with every lower limb zero -> round down.
+            ("2^200 + 2^147", value_from_bits(&[200, 147]), 2.0f64.powi(200)),
+            // A single set bit far below the window wins the tie -> round up.
+            (
+                "2^200 + 2^147 + 1",
+                value_from_bits(&[200, 147, 0]),
+                f64::from_bits(0x4C70_0000_0000_0001), // 2^200 + 2^148
+            ),
+            // Five limbs, tie, all lower limbs zero -> round down.
+            ("2^300 + 2^247", value_from_bits(&[300, 247]), 2.0f64.powi(300)),
+            (
+                "2^300 + 2^247 + 2^100",
+                value_from_bits(&[300, 247, 100]),
+                f64::from_bits(0x52B0_0000_0000_0001), // 2^300 + 2^248
+            ),
+            // Just past the tie -> round up.
+            (
+                "2^200 + 2^148 + 2^147",
+                value_from_bits(&[200, 148, 147]),
+                f64::from_bits(0x4C70_0000_0000_0002), // 2^200 + 2^149
+            ),
+            // 16 limbs: the descent walks from limb 15 all the way to limb 0.
+            ("2^1023 + 2^970", value_from_bits(&[1023, 970]), 2.0f64.powi(1023)),
+            (
+                "2^1023 + 2^970 + 1",
+                value_from_bits(&[1023, 970, 0]),
+                f64::from_bits(0x7FE0_0000_0000_0001), // 2^1023 + 2^971
+            ),
+        ];
+        for (name, limbs, want) in cases {
+            let mut heap = Heap::new(big_size_words(limbs.len()) + 8);
+            let t = big(&mut heap, false, &limbs);
+            assert_eq!(big_to_f64(t), Some(want), "big_to_f64({name})");
+            check_against_reference(false, &limbs);
+        }
     }
 }
