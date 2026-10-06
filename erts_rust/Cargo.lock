@@ -102,6 +102,7 @@ dependencies = [
 name = "beam_engine"
 version = "0.1.0"
 dependencies = [
+ "beam_alloc",
  "beam_common",
  "beam_loader",
  "beam_term",

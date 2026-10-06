@@ -210,7 +210,16 @@ pub struct ModuleHost {
     /// Extra `ebin` directories searched after `ebin` (e.g. `kernel`'s `ebin`),
     /// so a cross-module call into a second application resolves.
     search: Vec<PathBuf>,
-}
+    /// Every [`Machine`] this host has run, kept alive for the host's lifetime.
+    ///
+    /// A `Machine` owns the **off-heap ref-counted binary payloads** its runs built
+    /// ([`Machine::alloc_refc_binary`]): a term bigger than 64 bytes — e.g.
+    /// `base64:encode/1`'s 80-byte result — is an on-heap `[BinRef][ErlSubBits]` pair
+    /// pointing at a machine-owned payload. The host consumes a returned `Eterm`
+    /// *after* the run, so dropping the machine that produced it would free a payload
+    /// still in use. Keeping every machine alive is the test-host analogue of a real
+    /// process heap, which outlives a function return.
+    machines: Vec<Machine>,}
 
 impl ModuleHost {
     /// A host whose module fallback path is `ebin` (a stdlib `ebin` directory).
@@ -222,9 +231,9 @@ impl ModuleHost {
             explicit: HashMap::new(),
             ebin: ebin.into(),
             search: Vec::new(),
+            machines: Vec::new(),
         }
     }
-
     /// Registers `name` to load from a specific `.beam` path (the harness).
     pub fn register(&mut self, name: &str, path: impl Into<PathBuf>) {
         self.explicit.insert(name.to_string(), path.into());
@@ -305,9 +314,16 @@ impl ModuleHost {
             .lookup(function)
             .ok_or(BeamError::BadArg)?;
         let mut machine = Machine::new();
-        machine.run_export(&module, function_atom, args.len() as u32, args, self)
+        let result = machine.run_export(&module, function_atom, args.len() as u32, args, self);
+        self.retain(machine);
+        result
     }
 
+    /// Keeps `machine` (and therefore every off-heap binary payload its run built)
+    /// alive for the rest of the host's lifetime — see the `machines` field.
+    fn retain(&mut self, machine: Machine) {
+        self.machines.push(machine);
+    }
     /// Run the fun `fun` on its defining module (the `call_fun`/`call_fun2`
     /// path).
     ///
@@ -352,10 +368,11 @@ impl ModuleHost {
         }
 
         let mut machine = Machine::new();
-        machine.run_label(&module, descriptor.label, descriptor.arity, &combined, self)
+        let result = machine.run_label(&module, descriptor.label, descriptor.arity, &combined, self);
+        self.retain(machine);
+        result
     }
 }
-
 // ---------------------------------------------------------------------------
 // ExecutionContext
 // ---------------------------------------------------------------------------
@@ -383,11 +400,12 @@ impl ExecutionContext for ModuleHost {
             .lookup(function)
             .ok_or(BeamError::BadArg)?;
         let mut machine = Machine::new();
-        machine.run_export(&module, function_atom, arity, args, self)
+        let result = machine.run_export(&module, function_atom, arity, args, self);
+        self.retain(machine);
+        result
     }
 
-    fn ensure_heap(
-        &mut self,
+    fn ensure_heap(        &mut self,
         heap_need: u32,
         live: u32,
         x_regs: &mut [Eterm],

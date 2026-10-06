@@ -609,10 +609,22 @@ pub fn binary_bytes<'a>(t: Eterm) -> Result<&'a [u8]> {
     if !unsafe { beam_term::is_binary(t) } {
         return Err(BeamError::BadArg);
     }
+    // A binary larger than `ERL_ONHEAP_BINARY_LIMIT` bytes is stored **off** the
+    // process heap: its term is the frozen 8-word `[BinRef][ErlSubBits]` pair, so the
+    // heap path below would read the pair's own words instead of the payload.
+    // `beam_term::refc::refc_bytes` re-derives the byte view from that frozen layout.
+    // SAFETY: `t` is a live bitstring (checked above); if its header is an
+    // `ErlSubBits` its `orig` slot is a live term, which is all `is_refc_binary`
+    // dereferences.
+    if unsafe { beam_term::refc::is_refc_binary(t) } {
+        // SAFETY: `t` is a live refc-binary bitstring whose off-heap payload is owned
+        // by the machine that built it (a `beam_alloc::RefcBinary` handle), so the
+        // payload stays alive and unmoved for `'a` — the caller's contract.
+        return Ok(unsafe { beam_term::refc::refc_bytes(t) });
+    }
     // SAFETY: `is_binary` established that `t` is a live bitstring whose size is a
     // whole number of bytes; the size word (word 1) is live.
-    let num_bytes = unsafe { beam_term::bitstring_size(t) } / 8;
-    if num_bytes == 0 {
+    let num_bytes = unsafe { beam_term::bitstring_size(t) } / 8;    if num_bytes == 0 {
         return Ok(&[]);
     }
     // SAFETY: a well-formed byte binary owns `2 + ceil(num_bytes / word_bytes)`

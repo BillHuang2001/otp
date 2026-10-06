@@ -667,10 +667,58 @@ fn sweep_dict_grows_past_the_expansion_threshold() {
 /// Real functions that a **documented** engine/codec gap still blocks. Each is
 /// printed and its exact typed error asserted, so a regression that turns the
 /// typed error into a *wrong result* is caught.
+// ---------------------------------------------------------------------------
+// 3. Off-heap (refc) binary construction: `bs_init_writable` + `private_append`
+// ---------------------------------------------------------------------------
+
+/// `base64:encode/1` end to end — the canonical **off-heap refc binary** builder.
+///
+/// The real `base64` module opens an accumulator with `bs_init_writable` and
+/// extends it with a `bs_create_bin` `private_append` segment on every loop
+/// iteration, so this test drives exactly the two opcode forms the engine gained
+/// (and the `> ERL_ONHEAP_BINARY_LIMIT` result representation, since a 60-byte
+/// input encodes to 80 bytes).
+///
+/// The expected bytes are the system `erl` oracle verbatim:
+///
+/// ```text
+/// erl -noshell -eval 'io:format("~p~n",
+///     [base64:encode(list_to_binary(lists:seq(0,59)))]),halt().'
+/// <<"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7">>
+/// ```
 #[test]
-fn blocked_mechanisms_report_their_typed_error() {
+fn sweep_base64_builds_an_off_heap_binary() {
     if skip_if_unavailable() {
         return;
+    }
+    let mut host = exec_host();
+
+    // The input `list_to_binary(lists:seq(0,59))`: bytes 0..59, built test-side
+    // (60 bytes is still an on-heap binary; the *result* is the refc one).
+    let input: Vec<u8> = (0u8..60).collect();
+    let bin = terms::make_heap_binary(&mut host, &input).expect("a 60-byte heap binary");
+    let got = run(&mut host, "base64", "encode", &[bin]);
+    let bytes = terms::binary_bytes(got).expect("base64:encode/1 must return a binary");
+    assert_eq!(
+        bytes,
+        &b"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7"[..],
+        "base64:encode/1 must byte-equal the oracle (80 bytes, an off-heap refc binary)"
+    );
+
+    // A short input still round-trips through the same builder but stays inside the
+    // on-heap limit: oracle `base64:encode(<<"A">>)` = `<<"QQ==">>`.
+    let short = terms::make_heap_binary(&mut host, b"A").expect("a 1-byte binary");
+    let got = run(&mut host, "base64", "encode", &[short]);
+    assert_eq!(
+        terms::binary_bytes(got).expect("a binary"),
+        &b"QQ=="[..],
+        "base64:encode/1 on a 1-byte input"
+    );
+}
+
+#[test]
+fn blocked_mechanisms_report_their_typed_error() {
+    if skip_if_unavailable() {        return;
     }
     let mut host = exec_host();
 
@@ -700,22 +748,13 @@ fn blocked_mechanisms_report_their_typed_error() {
     );
 
     // ---- binaries / bitstrings -------------------------------------------
-    // `base64` builds its result with `bs_init_writable`, which needs a writable
-    // off-heap ref-counted binary the engine does not have yet.
-    let bin = terms::make_heap_binary(&mut host, &[1, 2, 3]).expect("a heap binary");
-    let err = host
-        .call("base64", "encode", &[bin])
-        .expect_err("`base64:encode/1` needs `bs_init_writable`");
-    println!("SKIP: base64:encode/1 — {err:?}");
-    assert!(
-        format!("{err:?}").contains("unsupported_opcode"),
-        "unexpected `base64:encode/1` error: {err:?}"
-    );
-
+    // `base64:encode/1` — the canonical `bs_init_writable` +
+    // `bs_create_bin`/`private_append` builder — is no longer blocked; it is
+    // exercised positively by `sweep_base64_builds_an_off_heap_binary` below.
+    //
     // `unicode:characters_to_binary/1` is a `unicode` BIF the host floor does not
     // serve, so the real module's call fails as a typed `BadArg`.
-    let s = chars(&mut host, "hi");
-    let err = host
+    let s = chars(&mut host, "hi");    let err = host
         .call("unicode", "characters_to_binary", &[s])
         .expect_err("`unicode:characters_to_binary/1` is not in the host floor");
     println!("SKIP: unicode:characters_to_binary/1 — {err:?}");

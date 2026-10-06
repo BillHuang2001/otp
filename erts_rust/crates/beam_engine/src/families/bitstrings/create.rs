@@ -21,15 +21,30 @@
 //! the field — up to 64 bits through the machine-word path, wider fields through the
 //! bignum path [`super::push_wide_int`]), `binary` (byte-aligned, `all` or an
 //! explicit bit count), `string` constants from the `StrT` table, `float` (16/32/64
-//! bits, big- or little-endian), and `utf8`/`utf16`/`utf32`, combined into one result
-//! bitstring.
+//! bits, big- or little-endian), `utf8`/`utf16`/`utf32`, an `append`/`private_append`
+//! **first** segment, and `bs_init_writable` — combined into one result bitstring of
+//! any size (an on-heap `ErlHeapBits` up to the 64-byte limit, an off-heap refc
+//! binary above it; see [`raw::make_binary`]).
 //!
-//! Not implemented (each a precise typed [`crate::error::unsupported`]): `append`,
-//! `private_append` and `bs_init_writable` (they need a mutable off-heap
-//! ref-counted binary the term layer does not provide — see
-//! `HANDOFF_bs_init_writable.md`), results larger than the on-heap binary limit, and
-//! an `integer` segment whose value is not an integer.
-
+//! # `append` / `private_append`: copy-rebuild, not in-place growth
+//!
+//! C's `private_append` (and `append` on a writable source) *reallocates and extends*
+//! the source's off-heap payload in place and returns a new `ErlSubBits` aliasing it,
+//! so a loop that appends `n` times is amortised O(n). The engine's payloads are
+//! immutable ([`beam_alloc::RefcBinary`] has no grow operation and `BinRef.val` has no
+//! setter), so an append instead **seeds a bit vector with the source's bits, appends
+//! the remaining segments, and materialises a fresh term**. The result bytes are
+//! identical for every successful build (so this is observationally correct), but a
+//! long append loop is O(n²) rather than amortised O(n). Three further C observables
+//! are deliberately unmodelled in M1: the `BIN_FLAG_WRITABLE`/`BIN_FLAG_ACTIVE_WRITER`
+//! flags on the underlying binary, `binary:referenced_byte_size/1`'s "capacity vs
+//! size" answer, and the fact that a `private_append` result lets a *later*
+//! `private_append` reuse the same buffer (the engine's result is an ordinary,
+//! non-writable refc binary — which the next append simply seeds from).
+//!
+//! Not implemented (each a precise typed [`crate::error::unsupported`]): an
+//! `append`/`private_append` segment that is not the first, and an `integer` segment
+//! whose value is not an integer.
 use std::collections::BTreeMap;
 
 use beam_common::Result;
@@ -47,6 +62,9 @@ use super::{
     BSF_LITTLE,
 };
 
+/// `erts_bs_init_writable`'s default payload capacity (`erl_bits.c:2023`):
+/// `bin_size = 1024` unless `x(0)` holds a non-negative small integer.
+const DEFAULT_WRITABLE_SIZE: usize = 1024;
 /// Execute a bitstring **construction** instruction.
 pub(super) fn exec(
     machine: &mut Machine,
@@ -59,16 +77,22 @@ pub(super) fn exec(
 ) -> Result<Option<Step>> {
     let _ = (func, pc);
     match instr {
-        // `bs_init_writable` (`i_bs_init_writable`, `bs_instrs.tab:285`) allocates a
-        // writable off-heap ref-counted binary and a match context over it, so a
-        // following `bs_create_bin` with an `append`/`private_append` segment can grow
-        // it in place. Neither the mutable-binary allocation nor the term layer's
-        // ref-counted binary exists yet, and the engine cannot reach `beam_alloc`, so
-        // this is a documented gap — see `HANDOFF_bs_init_writable.md` for the exact
-        // missing capability and the candidate fixes.
-        Instr::BsInitWritable => Err(error::unsupported(
-            "bs_init_writable: needs a writable off-heap ref-counted binary",
-        )),
+        // `bs_init_writable` (`i_bs_init_writable`, `emu/bs_instrs.tab:285`) is the
+        // compiler's accumulator opener: C does `x(0) = erts_bs_init_writable(c_p,
+        // x(0))` — the size hint is in `x(0)`, and the result replaces it. ERTS
+        // allocates the ref-counted payload with that capacity but reports a
+        // **zero-length** window (`build_writable_bitstring` passes
+        // `current_size = 0`), so the term is a 0-bit refc binary that the first
+        // `bs_create_bin` `append`/`private_append` segment extends.
+        Instr::BsInitWritable => {
+            let capacity = match machine.x(0).and_then(small_value) {
+                Some(size) if size >= 0 => size as usize,
+                _ => DEFAULT_WRITABLE_SIZE,
+            };
+            let value = raw::make_writable(machine, ctx, capacity)?;
+            machine.set_x(0, value)?;
+            Ok(Some(Step::Next))
+        }
         Instr::BsCreateBin {
             fail,
             alloc: _,
@@ -82,7 +106,7 @@ pub(super) fn exec(
                 // `assemble` already produced the failure `Step`.
                 Err(step) => return Ok(Some(step)),
             };
-            let value = raw::make_bits(ctx, &bytes, nbits)?;
+            let value = raw::make_binary(machine, ctx, &bytes, nbits)?;
             write_operand(machine, dst, value)?;
             if *fail != beam_loader::NO_FAIL {
                 // The compiler emits `{f,0}`, but a live fail label is harmless: a
@@ -234,10 +258,34 @@ fn assemble(
                 }
             }
 
-            // `append`/`private_append` (BSC_APPEND/BSC_PRIVATE_APPEND) need a
-            // writable in-place off-heap binary (see `bs_init_writable` and
-            // `HANDOFF_bs_init_writable.md`); they fall through to the generic
-            // unsupported-segment-type error.
+            // `append`/`private_append` (`BSC_APPEND`/`BSC_PRIVATE_APPEND`,
+            // `bs_instrs.tab:541-569`). The compiler emits it as the **first**
+            // segment only, with the accumulator in the value operand and the size
+            // operand `all`; C seeds the build with the whole of the source
+            // bitstring (`erts_bs_append_checked` / `erts_bs_private_append_checked`
+            // take `sb->end` as the starting position) and then appends the
+            // remaining segments. The source may be the `bs_init_writable` result
+            // (a 0-bit refc binary) or a previously built refc binary, both of which
+            // [`raw::heap_bits`] reads.
+            //
+            // The engine seeds its bit vector from the source and rebuilds a fresh
+            // term rather than growing the source's payload in place (the engine's
+            // payloads are immutable). That is observationally identical for a
+            // successful build; see the module docs for the honest divergences.
+            "append" | "private_append" => {
+                if i != 0 {
+                    return Err(error::unsupported(
+                        "bs_create_bin: append/private_append is not the first segment",
+                    ));
+                }
+                let value = read_value(machine, module, ctx, value_op)?;
+                let Some((_, src_bits)) = raw::heap_bits(value) else {
+                    return fail_seg(machine, module, labels, fail, value_op, ctx);
+                };
+                let bytes = raw::subject_bytes(value)?;
+                writer.push_bits_from(bytes, 0, src_bits);
+            }
+
             other => {
                 return Err(error::unsupported(&format!(
                     "bs_create_bin: segment type {other}"

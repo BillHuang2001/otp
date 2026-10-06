@@ -161,8 +161,22 @@ pub struct Machine {
     /// literal is safe; once the Stage-4 collector lands a literal must be treated
     /// as permanent (never scanned/copied as a process-heap term).
     literals: Option<SharedLiteralArea>,
+    /// The **off-heap ref-counted binary payloads** this machine has built.
+    ///
+    /// A binary larger than [`beam_term::refc::ERL_ONHEAP_BINARY_LIMIT`] is stored
+    /// off the process heap: the on-heap term is the frozen 8-word
+    /// `[BinRef][ErlSubBits]` pair whose `BinRef.val` word points at the payload
+    /// ([`beam_term::refc`]). The payload itself is a [`beam_alloc::RefcBinary`]
+    /// handle, and holding the handle here is what keeps the payload alive (and
+    /// its address stable) for as long as the machine lives — dropping the machine
+    /// releases every payload it built. See [`Machine::alloc_refc_binary`].
+    ///
+    /// **Never cleared by [`Machine::reset`].** A returned term may outlive the run
+    /// that built it (`Machine::run_export` resets at the start of *every* run, and
+    /// a host may consume the returned `Eterm` afterwards), so a reset must not free
+    /// a payload a caller can still read.
+    pub(crate) refc_binaries: Vec<beam_alloc::RefcBinary>,
 }
-
 impl Machine {
     /// A machine with the default register file ([`MAX_REGISTER`] registers).
     pub fn new() -> Machine {
@@ -181,6 +195,7 @@ impl Machine {
             class_atoms: UNRESOLVED_CLASS_ATOMS,
             max_register,
             literals: None,
+            refc_binaries: Vec::new(),
         };
         machine.reset();
         machine
@@ -369,6 +384,25 @@ impl Machine {
         self.literals.as_ref()?.get(index)
     }
 
+    /// Allocate an **off-heap ref-counted binary payload** holding `bytes` and
+    /// return a pointer to its first data byte.
+    ///
+    /// This is the payload half of the frozen refc-binary representation
+    /// ([`beam_term::refc`]): the returned pointer is exactly the value the
+    /// `BinRef.val` word of an `[BinRef][ErlSubBits]` term must hold, and it stays
+    /// valid (and unmoved) until this machine is dropped — the machine keeps the
+    /// [`beam_alloc::RefcBinary`] handle that owns the payload in
+    /// [`Machine::refc_binaries`], which [`Machine::reset`] never clears.
+    ///
+    /// The payload is `beam_alloc`'s `binary_alloc` allocation and is *immutable*:
+    /// there is no in-place growth, so a caller that needs a larger binary builds a
+    /// new one (mirroring C's copy fallback in `erts_bs_private_append_checked`).
+    pub(crate) fn alloc_refc_binary(&mut self, bytes: &[u8]) -> Result<*mut u8> {
+        let binary = beam_alloc::RefcBinary::new(bytes)?;
+        let data = binary.data_ptr();
+        self.refc_binaries.push(binary);
+        Ok(data)
+    }
     /// Write `v` into X register `n`.
     ///
     /// Returns [`crate::error::bad_register`] if `n` is outside the register file.

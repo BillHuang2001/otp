@@ -1,124 +1,66 @@
 # Handoff: `bs_init_writable` + `bs_create_bin` `append` / `private_append`
 
-**Status:** deliberately **not implemented** in `beam_engine`. The two opcode forms below
-still return a typed `error::unsupported(..)`. This note records exactly why, and the two
-candidate ways to close the gap.
+**Status: implemented** in `beam_engine` (copy-rebuild). Both forms previously returned a
+typed `error::unsupported(..)`; they now build a correct result, including results larger
+than the on-heap binary limit. This note records what landed, the approach, and the honest
+divergences that remain.
 
-## What is unsupported
+## What now works
 
-| Instruction / operand | Where it is rejected | Current error |
+| Instruction / operand | Where it is handled | Behaviour |
 |---|---|---|
-| `bs_init_writable` (`Instr::BsInitWritable`) | `src/families/bitstrings/create.rs`, the `Instr::BsInitWritable` arm | `unsupported("bs_init_writable: needs a writable off-heap ref-counted binary")` |
-| `bs_create_bin` with a first segment of type `append` or `private_append` | `src/families/bitstrings/create.rs`, the `other =>` fall-through of `assemble` | `unsupported("bs_create_bin: segment type append")` / `… private_append` |
+| `bs_init_writable` (`Instr::BsInitWritable`) | `src/families/bitstrings/create.rs`, the `Instr::BsInitWritable` arm | Capacity from `x(0)` when it is a non-negative small integer, else `DEFAULT_WRITABLE_SIZE = 1024` (C `erts_bs_init_writable`, `erl_bits.c:2021`); builds a **0-bit** refc binary (`raw::make_writable`) and writes it to `x(0)`. |
+| `bs_create_bin` first segment `append` / `private_append` | `src/families/bitstrings/create.rs`, the `"append" \| "private_append"` arm of `assemble` | Seeds the bit writer with the source's bits (`raw::heap_bits` + `raw::subject_bytes`, which now accept a refc root), then appends the remaining segments. |
+| `bs_create_bin` result > 64 bytes | `src/families/bitstrings/create.rs` → `raw::make_binary` | Builds an off-heap refc binary (`beam_term::refc::write_refc_binary` over a `beam_alloc::RefcBinary` payload) instead of the former `> 64 bytes` typed error. |
+| Reading a refc result | `src/families/bitstrings/raw.rs` (`heap_bits`) and `src/terms.rs` (`binary_bytes`) | A refc root is accepted as a readable subject / byte payload. |
 
-`bs_create_bin` `string` constant segments — the third documented gap — **are now
-implemented** (see `tests/bitstrings_extra_string.rs`); this note does not cover them.
+## Approach: copy-rebuild, not in-place growth
 
-## Why it is not implementable inside the engine's frozen seams
+C's `private_append` (and `append` on a writable source) **reallocates and extends** the
+source's off-heap payload in place and returns a new `ErlSubBits` aliasing it, so an append
+loop is amortised O(n). The engine's payloads are immutable — `beam_alloc::RefcBinary` is
+immutable and `BinRef.val` has no setter — so an append instead seeds a bit vector with the
+source's bits, appends the remaining segments, and materialises one fresh term. The result
+bytes are identical for every successful build, so the transformation is observationally
+correct; it is not the same algorithm.
 
-Ground truth:
-* `emu/bs_instrs.tab:285-289` (`bs_init_writable`), `:541-569` (`BSC_APPEND` /
-  `BSC_PRIVATE_APPEND` allocation), `:627-633` + `erl_bits.c:1641` (`erts_bs_put_string`).
-* `erl_bits.c:1724` `erts_bs_append_checked`, `:1927` `erts_bs_private_append_checked`,
-  `:1674` `build_writable_bitstring`, `:2021` `erts_bs_init_writable`.
+The read-side gap the old note flagged is closed: a refc root is an `ErlSubBits` over a
+`BinRef`, and `raw::heap_bits` recognises it via the public `beam_term::refc::is_refc_binary`
++ `beam_term::bitstring::bitstring_parts` APIs, so a partially-built binary can be read back.
 
-The semantics that must be reproduced:
+## Dependency edge (escalation to the crate-layer node)
 
-1. `bs_init_writable` allocates a **fresh, mutable, off-heap ref-counted binary**
-   (`erts_bin_nrml_alloc(1024)`, or the size in `x(0)`) and returns an `ErlSubBits` match
-   context whose `orig` is a `BinRef` (`HEADER_BIN_REF`) over that binary, flagged
-   `BIN_FLAG_WRITABLE | BIN_FLAG_ACTIVE_WRITER`.
-2. A following `bs_create_bin` whose first segment is `append`/`private_append` **grows and
-   reallocates that same off-heap binary in place** (`erts_bin_realloc`), rewrites the
-   `BinRef`, and returns a **new `ErlSubBits` that aliases the same payload**. The returned
-   term is itself writable, so the pattern is re-applied in a loop (e.g.
-   `base64:encode_binary/4`, `binary:encode_hex2/3`).
-3. `append` (public) may also be applied to a non-writable bitstring; it then allocates a
-   writable binary and copies the old contents into it.
-4. The result can be arbitrarily large (the whole point of the construct), and it is
-   *shared* with the context: `bs_start_match4` `resume` later reads the bytes written so
-   far out of the same payload.
+`beam_engine` gained `beam_alloc = { path = "../beam_alloc" }` (a wave-0 → wave-4 downward
+edge — directionally legal, but a new layer-DAG edge that must be recorded upstream). The
+off-heap payload handles live on `Machine` as `Vec<beam_alloc::RefcBinary>` through
+`Machine::alloc_refc_binary(&[u8]) -> Result<*mut u8>` (returning `RefcBinary::data_ptr()`).
+The vector is deliberately **not** cleared by `Machine::reset`, because a returned term may
+outlive the reset. All frozen `BinRef`/`ErlSubBits` layout construction stays in
+`beam_term::refc` — the engine never hand-rolls the layout.
 
-The engine cannot express any of steps 1–4:
+## Honest divergences (unmodelled in M1)
 
-* **No off-heap binary.** The engine builds only on-heap `ErlHeapBits` terms through
-  `raw::make_bits`, capped at `ERL_ONHEAP_BINARY_LIMIT = 64` bytes (`beam_term::refc`,
-  `beam_engine/src/families/bitstrings/raw.rs:41`). There is no way to allocate the
-  ref-counted payload, and no `BinRef`-rooted term the engine may write.
-* **No mutable/aliasing storage.** An on-heap bitstring owns its bytes; two terms cannot
-  share one payload. The writable context and every result of an append must alias.
-* **Frozen seams.** The crate depends on exactly `beam_common`, `beam_term`, `beam_loader`
-  and `libc`; it has no `beam_alloc` edge. `ExecutionContext` (`src/context.rs`) is a frozen
-  public trait and `alloc_words` returns heap words valid **only until the next
-  `ensure_heap`/GC**, so it cannot hand out a stable, growable, off-heap payload either.
-* **`HEADER_BIN_REF` is rejected by the read path.** `raw::heap_bits` explicitly returns
-  `None` for a `HEADER_BIN_REF` match context, and `raw::subject_bytes` errors with
-  "subject is not an on-heap binary", so a writable context could not even be matched.
+* **No in-place amortised growth.** A long append loop is O(n²) rather than amortised O(n).
+* **`BIN_FLAG_WRITABLE` / `BIN_FLAG_ACTIVE_WRITER` are not modelled.** The engine's result is
+  an ordinary non-writable refc binary; the next append simply seeds from it.
+* **`binary:referenced_byte_size/1`'s "capacity vs size" answer** (C's `apparent_size`) is not
+  modelled — the writable buffer's capacity is invisible to the engine (`make_writable`
+  builds a 0-bit window, as C's `build_writable_bitstring` reports `current_size = 0`).
+* **Bit-offset windows on a refc root are refused.** `raw::heap_bits` returns `None` when a
+  refc root's window does not start on a byte boundary (the engine only ever builds
+  byte-aligned ones); a `bs_start_match` over such a subject is the documented typed error
+  rather than a wrong read.
 
-A partial implementation would be **wrong**, not merely incomplete: dropping the
-writable/aliasing property, or silently truncating the result at 64 bytes, changes the
-observable bytes of any program whose appended output exceeds the on-heap limit. The
-engine therefore keeps the typed `unsupported` rather than guessing.
+## Evidence
 
-## Candidate fixes (both outside this node's scope)
+The end-to-end gate is `base64:encode/1` over the real system stdlib `base64.beam`, driven
+through `tests/support/mod.rs`'s module host: a 60-byte input yields the 80-byte oracle string
+`<<"AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8gISIjJCUmJygpKissLS4vMDEyMzQ1Njc4OTo7">>`
+(an 80-byte result is above the 64-byte limit, so it exercises the refc path). Focused unit
+tests for the new pieces live in `src/families/bitstrings/raw.rs`
+(`make_binary_picks_the_frozen_representation`, `make_binary_masks_the_trailing_bits_of_a_refc_result`,
+`make_writable_returns_a_zero_bit_refc_window`).
 
-### (a) A binary-allocation seam on `ExecutionContext`, supplied by `beam_rt` — **preferred**
-
-Add (a future round) one method to the frozen `ExecutionContext` trait, e.g.
-
-```rust
-/// Allocate an off-heap ref-counted binary payload of `size` bytes and return a
-/// writable `ErlSubBits`/`BinRef` term over it, registered for GC liveness by the
-/// context. Valid until the next `ensure_heap`.
-fn alloc_writable_binary(&mut self, size: usize) -> Result<Eterm>;
-```
-
-`beam_rt` implements it over `beam_alloc::RefcBinary` + `beam_term::refc`, registers the
-handle in `beam_gc::OffHeap`, and supplies the lifetime/GC rules; the engine only calls it
-and then writes the payload through the family's `raw.rs` (the one `unsafe` module).
-
-* Pros: keeps the Stage-1/Stage-5 DAG acyclic and the "the engine owns no allocator"
-  discipline; keeps all raw layout work in `beam_term::refc`/`beam_alloc` (the owners of the
-  frozen `BinRef`/`ErlSubBits`/`RefcBinary` layout); the GC liveness of the writable payload
-  is owned where MSO already is.
-* Cons: expands a trait the crate `CONTEXT.md` declares frozen; needs the realloc/grow
-  protocol (`erts_bin_realloc` + `update_wb_overhead` semantics) to be modelled by the
-  context, since growth invalidates the previously handed-out pointer; the engine must learn
-  to *re-read* the context term after an append rather than caching the payload pointer.
-
-### (b) An engine → `beam_alloc` dependency edge
-
-Give `beam_engine` a direct `beam_alloc` dependency and let `create.rs` build
-`RefcBinary`/`BinRef`/`ErlSubBits` itself through `beam_term::refc` + `beam_alloc::RefcBinary`.
-
-* Pros: no trait change; the engine holds the payload handle directly.
-* Cons: adds a layer-DAG edge (wave 0 → wave 4) that the crate layer's routing notes flag as
-  an escalation, and moves off-heap term-layout construction into the engine — the engine
-  would hand-roll a layout it does not own, exactly the thing the current design forbids;
-  `beam_alloc`'s `RefcBinary` refcount/`RefCount` contract would then also have to be
-  honoured by the engine.
-
-Either way the work must also cover the read side: a writable context is an `ErlSubBits`
-over a `BinRef`, so `raw::heap_bits`/`subject_bytes` need a `HEADER_BIN_REF` path (or the
-context must materialise the bytes back into a heap term at each append) before
-`bs_start_match4 resume` can read a partially-built binary.
-
-## Evidence that this is a real, load-bearing gap
-
-`bs_init_writable` appears 71 times across the system OTP tree's `ebin`. Confirmed
-end-to-end in the dialect of this crate's own fixtures:
-
-```
-erl -noshell -eval 'io:format("~p~n",[beam_disasm:file(code:which(binary))]),halt().'
-```
-
-* `base64.beam` — `base64:encode/1` and `encode/2` (`bs_init_writable` at
-  disassembly line 87/106, with the initial size `256` left in `x(0)`), feeding
-  `base64:encode_binary/4`, which uses `bs_create_bin` `private_append`.
-* `binary.beam` — `binary:encode_hex1/2` (`bs_init_writable` at line 818) feeding the
-  `binary:encode_hex2/3` loop (`private_append` at disassembly line 918).
-* Also `beam_asm`, `beam_dict`, `beam_ssa_check`, `beam_types`, `asn1ct_gen`,
-  `asn1ct_value`, …
-
-Neither `bs_init_writable` nor `append`/`private_append` can produce a correct result in
-`beam_engine` until capability (a) or (b) lands upstream.
+`bs_init_writable` appears ~71 times across the installed OTP `ebin` tree (`base64`,
+`binary`/`binary:encode_hex*`, `beam_asm`, `beam_dict`, `beam_ssa_check`, `beam_types`,
+`asn1ct_gen`, …); the construct is the compiler's standard accumulator builder.
