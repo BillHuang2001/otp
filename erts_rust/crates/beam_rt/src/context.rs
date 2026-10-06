@@ -1204,7 +1204,19 @@ mod tests {
         // A duplicate within the same call reuses its predicted index.
         assert_eq!(interner.intern("foo").raw(), 10);
         assert_eq!(interner.intern("baz").raw(), 12);
-        assert_eq!(interner.into_pending(), vec!["foo", "bar", "baz"]);
+
+        // Committing lands each recorded name at exactly the index it predicted. The table
+        // must already hold `base` names (`AtomTable` assigns indices in insertion order).
+        let mut atoms = AtomTable::new();
+        for i in 0..10 {
+            atoms.intern(&format!("pad{i}"));
+        }
+        assert_eq!(atoms.len(), 10);
+        interner.commit(&mut atoms);
+        assert_eq!(atoms.name(Atom::from_raw(10)), Some("foo"));
+        assert_eq!(atoms.name(Atom::from_raw(11)), Some("bar"));
+        assert_eq!(atoms.name(Atom::from_raw(12)), Some("baz"));
+        assert_eq!(atoms.len(), 13);
     }
 
     #[test]
