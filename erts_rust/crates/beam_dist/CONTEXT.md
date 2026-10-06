@@ -392,13 +392,22 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 - `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, and the
   `beam_codec::AtomCacheWriter` impl on `OutboundAtomCache` (the outbound `intern` hook)
 - `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
-- `src/connection.rs` → `TcpTransport`, the handshake driver (client/server + creation), `Connection`
-  (owning the outbound atom cache), `send_control`/`send_message`/`recv`
+- `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation),
+  `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
+  `send_control`/`send_message`/`send_tick`/`recv` + the typed `send_reg_send`/`send_link`/`send_exit`/
+  `send_monitor_p`/`send_demonitor_p` helpers
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
-- `src/epmd.rs` → `epmd` request/response codecs + `EpmdClient` over `Transport`
-- `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection}.rs` → seams
-- `tests/live_interop.rs` → real-`erl` handshake + message exchange (the interop evidence)
+- `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
+  `take_output`/`next_message`/`send_control`) + `DriverState`/`StepOutcome`
+- `src/epmd.rs` → `epmd` request/response codecs, `EpmdClient` over `Transport`, and the real TCP client
+  (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
+- `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection,driver}.rs` →
+  seams
+- `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
+  `resolve_listen_port`) used by the live tests
+- `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange
+- `tests/live_driver.rs` → real-`erl` non-blocking `ConnectionDriver` handshake + send
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
 - `../../../erts/doc/guides/erl_dist_protocol.md` + `erl_ext_dist.md` → the wire guides (read-only)
