@@ -518,19 +518,129 @@ pub enum Instr {
     /// [`TestKind`] — `beam_engine` matches `TestKind` exhaustively, so classifying
     /// it there would break that surface, whereas a new `Instr` variant is additive.
     ///
-    /// It is the only member of the OTP-29 native-record family the standard
-    /// compiler emits (sites in `erl_eval`/`io_lib`/`erl_types`/
-    /// `dialyzer_codeserver`/`dbg_ieval`). Its siblings (`is_native_record`,
-    /// `get_record_elements`, `put_record`, `is_record_accessible`,
-    /// `get_record_field`, `get_record_elements_id`, `update_record_id`) still lower
-    /// to [`Instr::Generic`]: they need record-descriptor modelling the IR does not
-    /// own yet.
+    ///
+    /// One of the OTP-29 native-record family (generic opcodes 186-193), each
+    /// lowered to its own typed variant below; the C ground truth is
+    /// `erts/emulator/beam/erl_record.c`.
     IsAnyNativeRecord {
         /// The failure label ([`crate::operand::NO_FAIL`] means "no explicit fail
         /// target").
         fail: Label,
         /// The source x/y register holding the term to test.
         src: Operand,
+    },
+    /// `is_native_record Fail Src Mod Name` — like [`Instr::IsAnyNativeRecord`] but
+    /// additionally requiring the record to be `Name` as defined in `Mod` (generic
+    /// opcode 187; `erl_is_native_record`, `emu/instrs.tab:1329`; operand shape
+    /// `f xy a a` in `emu/ops.tab:1639`).
+    IsNativeRecord {
+        /// The failure label.
+        fail: Label,
+        /// The source x/y register holding the candidate record.
+        src: Operand,
+        /// The module the record is required to be defined in.
+        module: Operand,
+        /// The required record name.
+        name: Operand,
+    },
+    /// `get_record_elements Fail Src {FieldName,Register}*` — read the named fields
+    /// of the native record in `Src` into the listed registers (generic opcode 188;
+    /// `erl_get_record_elements`, `emu/instrs.tab:1347`; `Fail Src Size Matches=*` in
+    /// `emu/ops.tab:1641`, where `Size` is the match count derived from the list).
+    /// Branches to `Fail` if any field name is absent from the record.
+    GetRecordElements {
+        /// The failure label.
+        fail: Label,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The `(field name, destination register)` pairs, in file order.
+        fields: Vec<(Operand, Operand)>,
+    },
+    /// `put_record Fail Id Src Dst Live {FieldName,Value}*` — create (`Src` is `nil`)
+    /// or update (`Src` is a register) a native record (generic opcode 189;
+    /// `erl_create_native_record_emu`/`erl_update_native_record`,
+    /// `emu/instrs.tab:1373,1418`; `Fail Id Src Dst Live Updates=*` in
+    /// `emu/ops.tab:1648-1654`). `Id` is the record's compile-time identity (an atom,
+    /// or a `{Module,Name}` literal for a foreign record); failure branches to `Fail`.
+    PutRecord {
+        /// The failure label.
+        fail: Label,
+        /// The record identity (atom, `{Module,Name}` literal, or register).
+        id: Operand,
+        /// `nil` to create a fresh record, or the register holding the record to update.
+        src: Operand,
+        /// The destination register.
+        dst: Operand,
+        /// The number of live x registers at the instruction.
+        live: u32,
+        /// The `(field name, value)` pairs to set, in file order.
+        updates: Vec<(Operand, Operand)>,
+    },
+    /// `is_record_accessible Fail Src Scope` — test whether the fields of the native
+    /// record in `Src` are accessible from the executing module (generic opcode 190;
+    /// `erl_is_record_accessible`/`erl_is_wildcard_record_accessible`,
+    /// `emu/instrs.tab:1335,1341`; `f xy a` in `emu/ops.tab:1672-1678`). `Scope` is
+    /// the atom `external` (must be exported) or the current module.
+    IsRecordAccessible {
+        /// The failure label.
+        fail: Label,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The accessibility scope (`external`, or the current module).
+        scope: Operand,
+    },
+    /// `get_record_field Fail Src Id Field Dst` — read the single field `Field` of the
+    /// native record in `Src` into `Dst` (generic opcode 191;
+    /// `erl_get_local_record_field`/`erl_get_record_field`, `emu/instrs.tab:1433,1446`;
+    /// `Fail Src Id Field Dst` in `emu/ops.tab:1680-1686`). Branches to `Fail` if the
+    /// field cannot be extracted; `Id` is the record identity (atom or `{Module,Name}`
+    /// literal).
+    GetRecordField {
+        /// The failure label.
+        fail: Label,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The record identity (atom, `{Module,Name}` literal, or register).
+        id: Operand,
+        /// The field name to read.
+        field: Operand,
+        /// The destination register.
+        dst: Operand,
+    },
+    /// `get_record_elements_id Fail Id Src {FieldName,Register}*` — like
+    /// [`Instr::GetRecordElements`] but carrying the record identity `Id` so field
+    /// positions can be bound at load time (generic opcode 192, OTP 30; operand shape
+    /// `Fail Id Src Elements` per `lib/compiler/src/beam_disasm.erl:1424`). `Id` is an
+    /// atom, a `{Module,Name}` literal, or `[]` for an anonymous match.
+    GetRecordElementsId {
+        /// The failure label.
+        fail: Label,
+        /// The record identity (atom, `{Module,Name}` literal, or `[]`).
+        id: Operand,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The `(field name, destination register)` pairs, in file order.
+        fields: Vec<(Operand, Operand)>,
+    },
+    /// `update_record_id Fail Hint Id Src Dst Live {FieldName,Value}*` — update a
+    /// native record, carrying the record identity `Id` and the reuse `Hint` like
+    /// [`Instr::UpdateRecord`] (generic opcode 193, OTP 30; operand shape
+    /// `Fail Hint Id Src Dst Live Updates` per `lib/compiler/src/beam_disasm.erl:1428`).
+    UpdateRecordId {
+        /// The failure label.
+        fail: Label,
+        /// The compiler's reuse hint (`copy`/`reuse`/`inplace`).
+        hint: Operand,
+        /// The record identity (atom, `{Module,Name}` literal, or `[]`).
+        id: Operand,
+        /// The source x/y register holding the record.
+        src: Operand,
+        /// The destination register.
+        dst: Operand,
+        /// The number of live x registers at the instruction.
+        live: u32,
+        /// The `(field name, value)` pairs to set, in file order.
+        updates: Vec<(Operand, Operand)>,
     },
 
     // ---- exceptions --------------------------------------------------------

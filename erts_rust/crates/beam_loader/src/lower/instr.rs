@@ -369,15 +369,69 @@ pub(super) fn lower_instr(raw: &RawInstr) -> Result<Instr> {
             dst: op(ops, 3)?,
             updates: key_value_pairs(operand(ops, 4)?)?,
         }),
-        // `is_any_native_record Fail Src` (`ops.tab:1634`) — the `is_record/1` guard
-        // on native records (opcode 186). The sibling native-record opcodes
-        // (`is_native_record`, `get_record_elements`, `put_record`,
-        // `is_record_accessible`, `get_record_field`, `get_record_elements_id`,
-        // `update_record_id`) keep their lossless `Instr::Generic` fallback below:
-        // their operands need record-descriptor modelling the IR does not own yet.
+        // ---- native records (OTP 29, generic opcodes 186-193) ------------------
+        // One source opcode lowers to one typed variant carrying the file's raw
+        // decoded operands (`erts/emulator/beam/emu/ops.tab`), like the `bs_*`
+        // family. `is_any_native_record Fail Src` is the `is_record/1` guard
+        // (`ops.tab:1634`).
         Opcode::is_any_native_record => Ok(Instr::IsAnyNativeRecord {
             fail: as_label(operand(ops, 0)?)?,
             src: op(ops, 1)?,
+        }),
+        // `is_native_record Fail Src Mod Name` (`ops.tab:1636`, C `f xy a a`).
+        Opcode::is_native_record => Ok(Instr::IsNativeRecord {
+            fail: as_label(operand(ops, 0)?)?,
+            src: op(ops, 1)?,
+            module: op(ops, 2)?,
+            name: op(ops, 3)?,
+        }),
+        // `get_record_elements Fail Src {FieldName,Register}*` (`ops.tab:1641`).
+        Opcode::get_record_elements => Ok(Instr::GetRecordElements {
+            fail: as_label(operand(ops, 0)?)?,
+            src: op(ops, 1)?,
+            fields: key_value_pairs(operand(ops, 2)?)?,
+        }),
+        // `put_record Fail Id Src Dst Live {FieldName,Value}*` (`ops.tab:1648-1654`).
+        Opcode::put_record => Ok(Instr::PutRecord {
+            fail: as_label(operand(ops, 0)?)?,
+            id: op(ops, 1)?,
+            src: op(ops, 2)?,
+            dst: op(ops, 3)?,
+            live: as_u32(operand(ops, 4)?)?,
+            updates: key_value_pairs(operand(ops, 5)?)?,
+        }),
+        // `is_record_accessible Fail Src Scope` (`ops.tab:1672-1678`).
+        Opcode::is_record_accessible => Ok(Instr::IsRecordAccessible {
+            fail: as_label(operand(ops, 0)?)?,
+            src: op(ops, 1)?,
+            scope: op(ops, 2)?,
+        }),
+        // `get_record_field Fail Src Id Field Dst` (`ops.tab:1680-1686`).
+        Opcode::get_record_field => Ok(Instr::GetRecordField {
+            fail: as_label(operand(ops, 0)?)?,
+            src: op(ops, 1)?,
+            id: op(ops, 2)?,
+            field: op(ops, 3)?,
+            dst: op(ops, 4)?,
+        }),
+        // `get_record_elements_id Fail Id Src {FieldName,Register}*` (OTP 30;
+        // `beam_disasm.erl:1424`).
+        Opcode::get_record_elements_id => Ok(Instr::GetRecordElementsId {
+            fail: as_label(operand(ops, 0)?)?,
+            id: op(ops, 1)?,
+            src: op(ops, 2)?,
+            fields: key_value_pairs(operand(ops, 3)?)?,
+        }),
+        // `update_record_id Fail Hint Id Src Dst Live {FieldName,Value}*` (OTP 30;
+        // `beam_disasm.erl:1428`).
+        Opcode::update_record_id => Ok(Instr::UpdateRecordId {
+            fail: as_label(operand(ops, 0)?)?,
+            hint: op(ops, 1)?,
+            id: op(ops, 2)?,
+            src: op(ops, 3)?,
+            dst: op(ops, 4)?,
+            live: as_u32(operand(ops, 5)?)?,
+            updates: key_value_pairs(operand(ops, 6)?)?,
         }),
 
         // ---- binary syntax ----------------------------------------------------
@@ -958,6 +1012,262 @@ mod tests {
             lower_instr(&raw(
                 Opcode::is_any_native_record,
                 vec![Operand::Label(Label(2))],
+            )),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    /// The atoms used by the native-record tests, interned into one shared table so
+    /// the `a` operands are realistic.
+    fn record_atoms() -> Vec<Atom> {
+        let mut table = beam_term::AtomTable::new();
+        vec![
+            table.intern("rec"),
+            table.intern("recdef"),
+            table.intern("a"),
+            table.intern("b"),
+            table.intern("copy"),
+            table.intern("external"),
+        ]
+    }
+
+    #[test]
+    fn native_record_family_lowers_to_typed_variants() {
+        let at = record_atoms();
+        let (rec, recdef, fa, fb, copy, external) = (at[0], at[1], at[2], at[3], at[4], at[5]);
+
+        // `is_native_record Fail Src Mod Name` (`ops.tab:1636`): Fail, Src, Mod, Name.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::is_native_record,
+                vec![
+                    Operand::Label(Label(7)),
+                    Operand::X(0),
+                    Operand::Atom(recdef),
+                    Operand::Atom(rec),
+                ],
+            ))
+            .unwrap(),
+            Instr::IsNativeRecord {
+                fail: Label(7),
+                src: Operand::X(0),
+                module: Operand::Atom(recdef),
+                name: Operand::Atom(rec),
+            }
+        );
+
+        // `get_record_elements Fail Src {FieldName,Register}*` (`ops.tab:1641`): the
+        // field list is the file's flattened `[Name, Reg, …]`.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::get_record_elements,
+                vec![
+                    Operand::Label(Label(3)),
+                    Operand::X(0),
+                    Operand::List(vec![
+                        Operand::Atom(fb),
+                        Operand::X(2),
+                        Operand::Atom(fa),
+                        Operand::X(1),
+                    ]),
+                ],
+            ))
+            .unwrap(),
+            Instr::GetRecordElements {
+                fail: Label(3),
+                src: Operand::X(0),
+                fields: vec![
+                    (Operand::Atom(fb), Operand::X(2)),
+                    (Operand::Atom(fa), Operand::X(1)),
+                ],
+            }
+        );
+
+        // `put_record Fail Id Src Dst Live {FieldName,Value}*` (`ops.tab:1648-1654`):
+        // the create form has `Src = nil` and an atom `Id`.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::put_record,
+                vec![
+                    Operand::Label(crate::operand::NO_FAIL),
+                    Operand::Atom(rec),
+                    Operand::Nil,
+                    Operand::X(0),
+                    Operand::Integer(1),
+                    Operand::List(vec![
+                        Operand::Atom(fa),
+                        Operand::Integer(1),
+                        Operand::Atom(fb),
+                        Operand::Integer(2),
+                    ]),
+                ],
+            ))
+            .unwrap(),
+            Instr::PutRecord {
+                fail: crate::operand::NO_FAIL,
+                id: Operand::Atom(rec),
+                src: Operand::Nil,
+                dst: Operand::X(0),
+                live: 1,
+                updates: vec![
+                    (Operand::Atom(fa), Operand::Integer(1)),
+                    (Operand::Atom(fb), Operand::Integer(2)),
+                ],
+            }
+        );
+
+        // `is_record_accessible Fail Src Scope` (`ops.tab:1672-1678`): the scope atom
+        // `external` (or the current module).
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::is_record_accessible,
+                vec![
+                    Operand::Label(Label(9)),
+                    Operand::X(0),
+                    Operand::Atom(external),
+                ],
+            ))
+            .unwrap(),
+            Instr::IsRecordAccessible {
+                fail: Label(9),
+                src: Operand::X(0),
+                scope: Operand::Atom(external),
+            }
+        );
+
+        // `get_record_field Fail Src Id Field Dst` (`ops.tab:1680-1686`): a foreign
+        // record's `Id` is a `{Module,Name}` literal.
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::get_record_field,
+                vec![
+                    Operand::Label(crate::operand::NO_FAIL),
+                    Operand::X(0),
+                    Operand::Literal(1),
+                    Operand::Atom(fa),
+                    Operand::X(0),
+                ],
+            ))
+            .unwrap(),
+            Instr::GetRecordField {
+                fail: crate::operand::NO_FAIL,
+                src: Operand::X(0),
+                id: Operand::Literal(1),
+                field: Operand::Atom(fa),
+                dst: Operand::X(0),
+            }
+        );
+
+        // `get_record_elements_id Fail Id Src Elements` (opcode 192, OTP 30).
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::get_record_elements_id,
+                vec![
+                    Operand::Label(Label(4)),
+                    Operand::Atom(rec),
+                    Operand::Y(1),
+                    Operand::List(vec![Operand::Atom(fa), Operand::X(1)]),
+                ],
+            ))
+            .unwrap(),
+            Instr::GetRecordElementsId {
+                fail: Label(4),
+                id: Operand::Atom(rec),
+                src: Operand::Y(1),
+                fields: vec![(Operand::Atom(fa), Operand::X(1))],
+            }
+        );
+
+        // `update_record_id Fail Hint Id Src Dst Live Updates` (opcode 193, OTP 30).
+        assert_eq!(
+            lower_instr(&raw(
+                Opcode::update_record_id,
+                vec![
+                    Operand::Label(crate::operand::NO_FAIL),
+                    Operand::Atom(copy),
+                    Operand::Literal(2),
+                    Operand::X(0),
+                    Operand::X(0),
+                    Operand::Integer(2),
+                    Operand::List(vec![Operand::Atom(fa), Operand::Integer(7)]),
+                ],
+            ))
+            .unwrap(),
+            Instr::UpdateRecordId {
+                fail: crate::operand::NO_FAIL,
+                hint: Operand::Atom(copy),
+                id: Operand::Literal(2),
+                src: Operand::X(0),
+                dst: Operand::X(0),
+                live: 2,
+                updates: vec![(Operand::Atom(fa), Operand::Integer(7))],
+            }
+        );
+    }
+
+    #[test]
+    fn native_record_family_rejects_wrongly_typed_operands() {
+        let at = record_atoms();
+        let (rec, fa) = (at[0], at[2]);
+
+        // The failure operand is a label (`f`), never a register.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::is_native_record,
+                vec![
+                    Operand::X(0),
+                    Operand::X(1),
+                    Operand::Atom(rec),
+                    Operand::Atom(rec),
+                ],
+            )),
+            Err(BeamError::BadArg)
+        ));
+        // An odd-length record-element list cannot be split into pairs.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::get_record_elements,
+                vec![
+                    Operand::Label(Label(1)),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(fa), Operand::X(1), Operand::Atom(fa)]),
+                ],
+            )),
+            Err(BeamError::BadArg)
+        ));
+        // `Live` must be an unsigned integer, not a register.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::put_record,
+                vec![
+                    Operand::Label(Label(0)),
+                    Operand::Atom(rec),
+                    Operand::Nil,
+                    Operand::X(0),
+                    Operand::X(0),
+                    Operand::List(vec![Operand::Atom(fa), Operand::Integer(1)]),
+                ],
+            )),
+            Err(BeamError::BadArg)
+        ));
+        // The record elements must arrive as an argument list (`z,1`), not a register.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::get_record_elements_id,
+                vec![
+                    Operand::Label(Label(2)),
+                    Operand::Atom(rec),
+                    Operand::X(0),
+                    Operand::X(1),
+                ],
+            )),
+            Err(BeamError::BadArg)
+        ));
+        // A structurally short `update_record_id` is rejected like any arity mismatch.
+        assert!(matches!(
+            lower_instr(&raw(
+                Opcode::update_record_id,
+                vec![Operand::Label(Label(0)), Operand::Atom(rec)],
             )),
             Err(BeamError::BadArg)
         ));

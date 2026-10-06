@@ -116,10 +116,18 @@ Both are the *only* entry points; all intermediate types are public for inspecti
     `HasMapFields { fail, source, keys: Vec<Operand> }`,
     `PutMapAssoc { fail, source, dst, live, pairs }`, `PutMapExact { fail, source, dst, live, pairs }`.
   - **records** — `UpdateRecord { hint: Operand, size: u32, src, dst, updates: Vec<(Operand, Operand)> }`,
-    `IsAnyNativeRecord { fail: Label, src: Operand }` (the `erlang:is_record/1` guard, generic opcode
-    `186`: branches to `fail` iff `src` is **not** a native record — `emu/instrs.tab:1323`, operand shape
-    `f xy` in `emu/ops.tab:1634`; deliberately a new `Instr` variant rather than a `TestKind`, which the
-    engine matches exhaustively).
+    and the whole **OTP-29 native-record family** (generic opcodes 186-193; C ground truth
+    `erl_record.c`), one typed variant per source opcode carrying the file's raw decoded operands
+    (like the `bs_*` family): `IsAnyNativeRecord { fail: Label, src: Operand }` (the
+    `erlang:is_record/1` guard, 186 — `emu/instrs.tab:1323`, `f xy` in `emu/ops.tab:1634`;
+    deliberately a new `Instr` variant rather than a `TestKind`, which the engine matches
+    exhaustively), `IsNativeRecord { fail, src, module, name }` (187), `GetRecordElements { fail, src,
+    fields: Vec<(Operand, Operand)> }` (188), `PutRecord { fail, id, src, dst, live: u32,
+    updates: Vec<(Operand, Operand)> }` (189), `IsRecordAccessible { fail, src, scope }` (190),
+    `GetRecordField { fail, src, id, field, dst }` (191), `GetRecordElementsId { fail, id, src,
+    fields }` (192, added in OTP 30) and `UpdateRecordId { fail, hint, id, src, dst, live, updates }`
+    (193, added in OTP 30). `fields`/`updates` are the file's flattened `{Name,Register}` /
+    `{Name,Value}` lists split into pairs (`emu/ops.tab:1636-1686`; `lib/compiler/src/beam_disasm.erl:1402-1431`).
   - **exceptions** — `Badmatch { value }`, `CaseEnd { value }`, `IfEnd`, `Try { frame, fail: Label }`,
     `Catch { frame, fail }`, `TryCase { frame }`, `TryEnd { frame }`, `TryCaseEnd { value }`,
     `CatchEnd { frame }`, `Raise { trace, value }`, `Badrecord { value }`, `BuildStacktrace`, `RawRaise`.
@@ -388,12 +396,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - Cross-checks against the real system ERTS belong to the sibling `../tools/differential/` harness.
 
 ## Known Issues / Intentional M1 gaps
-- **Residual `Instr::Generic` opcodes.** The opcodes the loader deliberately does not model still lower
-  losslessly to `Instr::Generic`: the remaining **OTP-29 native-record family** (`is_native_record/4`,
-  `get_record_elements/3`, `put_record/6`, `is_record_accessible/3`, `get_record_field/5`,
-  `get_record_elements_id/4`, `update_record_id/7`), whose operands need record-descriptor modelling the
-  IR does not own yet (`is_any_native_record/2` **is** lowered, to `Instr::IsAnyNativeRecord`), and the
-  obsolete/transform-only `genop.tab` entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
+- **Residual `Instr::Generic` opcodes.** Every opcode the standard compiler emits for the families the
+  loader owns now lowers to a named variant (including the whole OTP-29 native-record family, 186-193);
+  the residual `Instr::Generic` fallback remains only for the obsolete/transform-only `genop.tab` entries
+  the compiler never emits (e.g. `is_constant/2`, `make_fun2/1`) and any opcode outside the modelled
+  vocabulary. It is a deliberate, lossless gap — never a wrong result.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 
@@ -424,7 +431,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/negative/real-module integration tests
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
-- `tests/native_record.rs` → real-module structural check that `is_any_native_record` lowers to `Instr::IsAnyNativeRecord` (never `Instr::Generic`) across the stdlib ebin; loud skip when `erl`/OTP is absent
+- `tests/native_record.rs` → real-module structural check of the OTP-29 native-record family (186-193): the `erl_eval` `is_any_native_record` positive control, a stdlib/kernel/compiler sweep asserting **no** family member lowers to `Instr::Generic`, and a system-`erlc`-compiled native-record module proving 186-191 lower typed; loud skip when `erl`/`erlc`/OTP is absent
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
