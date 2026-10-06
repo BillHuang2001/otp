@@ -637,12 +637,13 @@ mod tests {
 // Error handling: a well-formed term always hashes. The only *reachable* typed
 // failure is a [`FunKind::Local`] fun (a `make_fun3` closure), whose inlined
 // 2-word descriptor carries neither the module nor `old_uniq` that the C's
-// `ErlFunEntry` supplies — see [`crate::fun`]. Every other `Err` below is for a
-// forged/unknown term layout (unreachable through the safe API). `TermError` has
-// no dedicated "malformed term" variant and this crate may not add one from here,
-// so `TermError::BadFun` is used as the documented stand-in (reported upstream).
+// `ErlFunEntry` supplies — see [`crate::fun`]. That is reported as the dedicated
+// [`TermError::FunIdentityUnavailable`] (the term is fine; the identity is not
+// carried), never as a substituted value. Every other `Err` below is for a
+// forged/unknown term layout (unreachable through the safe API) and stays
+// [`TermError::BadFun`], whose meaning — "this is not a well-formed fun" — is
+// exactly right there.
 // ===========================================================================
-
 // `FUNNY_NUMBER1..15` (`erl_term_hashing.c:98-112`) — the primes just above 2^28
 // used by `make_hash`.
 const FN1: u32 = 268_440_163;
@@ -1138,8 +1139,10 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                             }
                             // `make_fun3`'s inlined descriptor is only
                             // `[uniq:u64][index:u32]` — no module, no `old_uniq`.
-                            // Never substitute a wrong value.
-                            FunKind::Local => return Err(TermError::BadFun),
+                            // The term is well-formed; the *identity* the C mixes
+                            // in simply is not carried. Never substitute a wrong
+                            // value.
+                            FunKind::Local => return Err(TermError::FunIdentityUnavailable),
                         }
                     }
                     BIN_REF_SUBTAG | HEAP_BITS_SUBTAG | SUB_BITS_SUBTAG => {
@@ -1528,7 +1531,7 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
                             .wrapping_add(atoms.hvalue(unsafe { fun_function(term)? }));
                     }
                     // As in `make_hash2`: a `make_fun3` fun lacks module/`old_uniq`.
-                    FunKind::Local => return Err(TermError::BadFun),
+                    FunKind::Local => return Err(TermError::FunIdentityUnavailable),
                 }
             }
             HOp::Pid | HOp::ExternalPid => {
@@ -1890,6 +1893,126 @@ mod exact_hash_tests {
         unsafe { heap.alloc_words(n).unwrap() }
     }
 
+    /// Oracle-pinned `make_hash2` / `make_hash` vectors, `(term, make_hash2,
+    /// make_hash)`.
+    ///
+    /// Every value was read out of the system ERTS and is asserted again against
+    /// the live oracle by
+    /// `tests/oracle.rs::oracle_agrees_on_make_hash2_and_make_hash`; pinning them
+    /// here keeps the contract testable on a host with no `erl` on `PATH`. The
+    /// corpus spans the paths that actually differ: the 28-bit small fast path,
+    /// atoms (incl. the empty atom), `nil`, tuples, byte- and non-byte lists,
+    /// improper lists, flat maps, bitstrings (empty / non-byte-aligned / a whole
+    /// 12-byte block), floats (incl. `+0.0`), multi-limb bignums, and an external
+    /// fun.
+    #[test]
+    fn make_hash2_and_make_hash_pin_the_oracle_vectors() {
+        use crate::bitstring::{heap_bits_size_words, write_heap_bits};
+        use crate::fun::{fun_words, write_fun_external};
+        use crate::thing::{big_size_words, write_big, write_float, FLOAT_SIZE_WORDS};
+        use crate::tuple::tuple0;
+
+        let mut atoms = AtomTable::new();
+        atoms.seed(["", "abc", "lists", "sort"]);
+        let empty_atom = make_atom(atoms.lookup("").unwrap());
+        let abc = make_atom(atoms.lookup("abc").unwrap());
+
+        let mut heap = Heap::new(256);
+        let t12 = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+        let c3 = heap.cons(make_small(3), NIL).unwrap();
+        let c23 = heap.cons(make_small(2), c3).unwrap();
+        let l123 = heap.cons(make_small(1), c23).unwrap();
+        let c99 = heap.cons(make_small(99), NIL).unwrap();
+        let c9899 = heap.cons(make_small(98), c99).unwrap();
+        let l_bytes = heap.cons(make_small(97), c9899).unwrap();
+        let c_imp_tail = heap.cons(make_small(2), make_small(3)).unwrap();
+        let l_imp = heap.cons(make_small(1), c_imp_tail).unwrap();
+
+        // SAFETY: every block below is allocated from `heap`, which outlives the
+        // test, with exactly the words the writer reserves.
+        let (map_empty, map_12) = unsafe {
+            let p = heap_alloc(&mut heap, map_words_capacity(0));
+            let map_empty = write_map(p, &[], &atoms).unwrap();
+            let p = heap_alloc(&mut heap, map_words_capacity(1));
+            let map_12 = write_map(p, &[(make_small(1), make_small(2))], &atoms).unwrap();
+            (map_empty, map_12)
+        };
+        // SAFETY: as above.
+        let (bits_empty, bits3, bin12) = unsafe {
+            let p = heap_alloc(&mut heap, heap_bits_size_words(0));
+            let bits_empty = write_heap_bits(p, &[], 0).unwrap();
+            let p = heap_alloc(&mut heap, heap_bits_size_words(3));
+            let bits3 = write_heap_bits(p, &[0x20], 3).unwrap();
+            let b12: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
+            let p = heap_alloc(&mut heap, heap_bits_size_words(96));
+            let bin12 = write_heap_bits(p, &b12, 96).unwrap();
+            (bits_empty, bits3, bin12)
+        };
+        // SAFETY: as above.
+        let (f_zero, f_pi) = unsafe {
+            let p = heap_alloc(&mut heap, FLOAT_SIZE_WORDS);
+            let f_zero = write_float(p, 0.0);
+            let p = heap_alloc(&mut heap, FLOAT_SIZE_WORDS);
+            let f_pi = write_float(p, 3.141_592_653_589_793);
+            (f_zero, f_pi)
+        };
+        // SAFETY: as above.
+        let (big_pos, big_neg) = unsafe {
+            let p = heap_alloc(&mut heap, big_size_words(2));
+            let big_pos = write_big(p, false, &[0, 1]); // 2^64
+            let p = heap_alloc(&mut heap, big_size_words(2));
+            let big_neg = write_big(p, true, &[0, 1]); // -2^64
+            (big_pos, big_neg)
+        };
+        // SAFETY: as above.
+        let fun_sort = unsafe {
+            let p = heap_alloc(&mut heap, fun_words(FunKind::External, 0));
+            write_fun_external(
+                p,
+                1,
+                atoms.lookup("lists").unwrap(),
+                atoms.lookup("sort").unwrap(),
+            )
+            .unwrap()
+        };
+
+        let vectors: [(Eterm, u32, u32); 25] = [
+            (make_small(0), 3_175_731_469, 0),
+            (make_small(1), 539_485_162, 2_788_898_427),
+            (make_small(-1), 1_117_813_597, 1_680_185_269),
+            (make_small(1 << 27), 2_562_491_755, 2_147_483_672),
+            (make_small(-(1 << 27)), 874_979_335, 2_147_489_128),
+            (make_small(MAX_SMALL), 1_638_133_000, 3_114_282_912),
+            (make_small(MIN_SMALL), 2_316_875_190, 2_147_489_128),
+            (empty_atom, 0, 0),
+            (abc, 26_499, 26_499),
+            (NIL, 3_468_870_702, 1),
+            (tuple0(), 221_703_996, 0),
+            (t12, 4_118_095_950, 3_114_748_239),
+            (l123, 4_186_538_188, 3_336_869_157),
+            (l_bytes, 519_996_486, 3_654_580_165),
+            (l_imp, 4_169_601_349, 265_598_414),
+            (map_empty, 844_985_373, 1_113_425_984),
+            (map_12, 1_248_490_261, 1_516_930_872),
+            (bits_empty, 147_926_629, 0),
+            (bits3, 3_965_351_140, 1_345_689_960),
+            (bin12, 3_273_225_850, 1_369_995_014),
+            (f_zero, 423_528_920, 0),
+            (f_pi, 764_465_415, 340_593_891),
+            (big_pos, 2_519_041_713, 2_788_898_427),
+            (big_neg, 2_563_594_619, 1_680_185_269),
+            (fun_sort, 2_047_717_521, 3_566_694_934),
+        ];
+
+        for (term, want2, want) in vectors {
+            assert_eq!(
+                make_hash2(term, &atoms).unwrap(),
+                want2,
+                "make_hash2({term:?})"
+            );
+            assert_eq!(make_hash(term, &atoms).unwrap(), want, "make_hash({term:?})");
+        }
+    }
     #[test]
     fn make_hash_pins_the_nil_small_and_atom_paths() {
         let t = atoms();
@@ -1930,16 +2053,36 @@ mod exact_hash_tests {
 
     #[test]
     fn block_hash_matches_the_jk_reference_shape() {
-        // `block_hash` with an empty block mixes `HCONST, HCONST, initval`.
+        // `block_hash` with an empty block never enters the loop, so it mixes the
+        // untouched `(HCONST, HCONST, initval)`; the length added to `c` is 0.
         assert_eq!(block_hash(&[], 0), mix32(HCONST, HCONST, 0));
-        // A 12-byte block runs exactly one loop iteration (no final adds).
+        assert_eq!(block_hash(&[], 0), 3_175_731_469);
+
+        // A 12-byte block runs exactly one loop iteration. The loop adds
+        // `le32(k[0..4])`, `le32(k[4..8])`, `le32(k[8..12])` to `a`/`b`/`c` and
+        // then `MIX`es them **inside the loop** (`block_hash_buffer`,
+        // `erl_term_hashing.c:457-472`), so the running state after the iteration is
+        // `mix3(HCONST+1, HCONST+2, initval+3)`. `block_hash_final_bytes`
+        // (`:474-501`) then **always** does `c += full_length` — even with no
+        // leftover bytes — before the final `MIX`.
         let b: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
-        let expect = mix3(
+        let (a, bb, c) = mix3(HCONST.wrapping_add(1), HCONST.wrapping_add(2), 3);
+        assert_eq!(block_hash(&b, 0), mix3(a, bb, c.wrapping_add(12)).2);
+        // Pin the raw value: dropping the in-loop `MIX` or the unconditional
+        // `c += full_length` would move it.
+        assert_eq!(block_hash(&b, 0), 598_152_079);
+
+        // An 11-byte block never enters the loop; its tail byte-adds are the
+        // fall-through `case 11 .. case 1` arms (`c += le32 = 3 << 8`, `b += 2`,
+        // `a += 1`) on top of `c += full_length (11)`.
+        let p: [u8; 11] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0];
+        let expect_p = mix3(
             HCONST.wrapping_add(1),
             HCONST.wrapping_add(2),
-            HCONST.wrapping_add(3),
+            11u32.wrapping_add(3 << 8),
         )
         .2;
-        assert_eq!(block_hash(&b, 0), expect);
+        assert_eq!(block_hash(&p, 0), expect_p);
+        assert_eq!(block_hash(&p, 0), 699_853_219);
     }
 }
