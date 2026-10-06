@@ -27,6 +27,7 @@ use beam_term::{cmp, is_small, make_atom, make_small, signed_value, Atom, Eterm,
 mod support;
 
 use support::{assert_atom, ModuleHost, SEED_ATOMS};
+
 /// The committed oracle fixture (produced by `erlc exceptions.erl`).
 const EXCEPTIONS_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
