@@ -1,4 +1,4 @@
-//! Integration tests for the **deep-list** contract of `io_lib:format/1,2`.
+//! Integration tests for the **deep-list** contract of `io_lib:format/2,3`.
 //!
 //! `io_lib:format` does not return a flat character list: a literal format
 //! character and every "small" control (`~s` of an **atom**, `~e`/`~f`/`~g`,
@@ -24,6 +24,7 @@
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, BifRegistry};
+use beam_common::BeamError;
 use beam_process::ProcessId;
 use beam_term::{AtomTable, Eterm};
 
@@ -694,4 +695,70 @@ fn field_padding_is_a_linked_tree() {
             E::I(108),
         ])]),
     );
+}
+
+/// `io_lib:format/3`'s `Options` list: the default/unlimited options reproduce
+/// `format/2`, an unknown option is ignored, and a *limiting* `chars_limit` is a
+/// typed error (the documented Milestone-1 gap) — never a wrong (unlimited)
+/// rendering. The list shape is the same as `format/2` (the oracle's `["42"]`).
+#[test]
+fn format_3_options_reproduce_or_reject_the_chars_limit() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["chars_limit"]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let format_term = byte_list(&mut ctx, b"~w");
+    let arg = int(&mut ctx, 42);
+    let args = ctx.list(&[arg]).expect("a short argument list fits");
+    let empty = ctx.list(&[]).expect("fits");
+    let reference = reg
+        .call("io_lib", "format", 2, &mut ctx, &[format_term, args])
+        .expect("io_lib:format/2 fits");
+    // `io_lib:format("~w", [42])` => `[[52,50]]`.
+    let want = build(&mut ctx, &E::L(vec![E::S("42")]));
+    assert!(beam_term::compare::eq(reference, want, ctx.atoms()));
+
+    // Empty options: `format/3` is `format/2`.
+    let got = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, empty])
+        .expect("io_lib:format/3 fits");
+    assert!(beam_term::compare::eq(got, reference, ctx.atoms()));
+
+    // An unknown option is ignored (the oracle only reads `chars_limit`).
+    let foo = atom(&mut ctx, "foo");
+    let unknown = ctx.list(&[foo]).expect("fits");
+    let got = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, unknown])
+        .expect("an unknown option is ignored");
+    assert!(beam_term::compare::eq(got, reference, ctx.atoms()));
+
+    // A limiting `chars_limit` is a typed error, not a wrong rendering.
+    let tag = atom(&mut ctx, "chars_limit");
+    let three = int(&mut ctx, 3);
+    let option = tuple(&mut ctx, &[tag, three]);
+    let limit = ctx.list(&[option]).expect("fits");
+    let err = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, limit])
+        .expect_err("a limiting chars_limit is unsupported");
+    assert!(
+        matches!(err, BeamError::Raise(_)),
+        "the limitation must be a typed raise, got {err:?}"
+    );
+
+    // A negative `chars_limit` is the oracle's default (no limit).
+    let neg = int(&mut ctx, -1);
+    let option = tuple(&mut ctx, &[tag, neg]);
+    let unlimited = ctx.list(&[option]).expect("fits");
+    let got = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, unlimited])
+        .expect("a negative chars_limit is the default");
+    assert!(beam_term::compare::eq(got, reference, ctx.atoms()));
+
+    // A non-list `Options` is `badarg`.
+    let err = reg
+        .call("io_lib", "format", 3, &mut ctx, &[format_term, args, foo])
+        .expect_err("a non-list Options is badarg");
+    assert!(matches!(err, BeamError::BadArg));
 }

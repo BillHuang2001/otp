@@ -1,4 +1,4 @@
-//! `io:format/1,2`, `io_lib:format/1,2` and the shared format-directive engine.
+//! `io:format/1,2`, `io_lib:format/2,3` and the shared format-directive engine.
 //!
 //! Implements the Milestone-1 `io`/`io_lib` subset (compatibility contract Part I
 //! §A.7). `Format` is a flat proper list of byte-sized small integers (`io_lib`
@@ -6,7 +6,7 @@
 //!
 //! * `io:format/1,2` write the rendered text to the context's [`OutputSink`]
 //!   ([`crate::context::BifContext::write_output`]) and return the atom `ok`.
-//! * `io_lib:format/1,2` return the rendering as the oracle's **deep list** and
+//! * `io_lib:format/2,3` return the rendering as the oracle's **deep list** and
 //!   write nothing: literal format characters and the "small" controls (`~s` of an
 //!   atom, `~e`/`~f`/`~g`, `~b`/`~B`, `~x`/`~X`, `~c`, `~~`, `~n`, `~i`) are
 //!   spliced flat as individual small integers, while the "non-small" controls
@@ -76,28 +76,36 @@
 //!   maximum length for `~w`/`~W` and an initial column for `~p`/`~P`.
 //! * Integer directives accept **small integers only** (`~b`/`~x`/`~c` of a bignum
 //!   is `badarg`); the oracle would print the full bignum. A documented gap.
+//! * **`io_lib:format/3` ignores unknown options but not `chars_limit`.** The only
+//!   option erts-17.1 recognises is `{chars_limit, N}`; other elements are ignored
+//!   (verified against the oracle). A *limiting* `chars_limit` (`N >= 0`) selects
+//!   `io_lib_pretty`'s "…"-eliding rendering, which Milestone-1 does not implement,
+//!   so it is rejected with a typed error (`error:unsupported_bif`) rather than
+//!   emitting a wrong (unlimited) line. A non-integer `N` is `badarg`, and a
+//!   non-list `Options` is `badarg`, exactly as in the oracle; a negative
+//!   `chars_limit` (the oracle's default, i.e. no limit) behaves like `format/2`.
 
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple,
+    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
-use crate::error::badarg;
+use crate::error::{badarg, unsupported_bif};
 use crate::print::{
     adjust_chunk, dup_chars, field_chunk, flatten, proper_list, string_field_chunk, term_chunk,
     Chunk, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
-/// Registers `io:format/1,2` and `io_lib:format/1,2`.
+/// Registers `io:format/1,2` and `io_lib:format/2,3`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("io", "format", 1, format_1);
     reg.register("io", "format", 2, format_2);
-    reg.register("io_lib", "format", 1, format_lib_1);
     reg.register("io_lib", "format", 2, format_lib_2);
+    reg.register("io_lib", "format", 3, format_lib_3);
 }
 
 /// `io:format(Format)` — writes `Format` with no arguments and returns `ok`.
@@ -110,14 +118,56 @@ fn format_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     io_format(ctx, args[0], Some(args[1]))
 }
 
-/// `io_lib:format(Format)` — returns the rendering of `Format` as an iolist.
-fn format_lib_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    io_lib_format(ctx, args[0], None)
-}
-
 /// `io_lib:format(Format, Args)` — returns the rendering as an iolist.
 fn format_lib_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     io_lib_format(ctx, args[0], Some(args[1]))
+}
+
+/// `io_lib:format(Format, Args, Options)` — the rendering as an iolist, with the
+/// oracle's `format_options()` (`[{chars_limit, N}]`).
+///
+/// Only the default/unlimited options are reproduced (see [`check_options`]).
+fn format_lib_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    check_options(ctx, args[2])?;
+    io_lib_format(ctx, args[0], Some(args[1]))
+}
+
+/// Validates `io_lib:format/3`'s `Options` list
+/// (`io_lib_format:get_option/3` over `lists:keyfind/3`).
+///
+/// `Options` must be a proper list (`badarg` otherwise, as in the oracle).
+/// Elements other than `{chars_limit, N}` are ignored — the oracle only reads that
+/// one key. A limiting `chars_limit` (`N >= 0`) would need `io_lib_pretty`'s
+/// "…"-eliding rendering, which Milestone-1 does not implement, so it is a typed
+/// error ([`unsupported_bif`]) rather than a wrong (unlimited) line; a negative
+/// `N` is the oracle's default (no limit) and is accepted.
+fn check_options(ctx: &BifContext<'_>, options: Eterm) -> Result<()> {
+    for option in proper_list(options).ok_or_else(badarg)? {
+        if let Some(limit) = chars_limit_option(ctx, option)? {
+            if limit >= 0 {
+                return Err(unsupported_bif());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// The `N` of a `{chars_limit, N}` element, `None` for any other element (which
+/// the oracle ignores). A `chars_limit` whose value is not a small integer is
+/// `badarg` (the oracle's `chars_limit` is an `integer()`).
+fn chars_limit_option(ctx: &BifContext<'_>, option: Eterm) -> Result<Option<i64>> {
+    if !is_tuple(option) || tuple_size(option) != 2 {
+        return Ok(None);
+    }
+    let tag = tuple_element(option, 0);
+    if !is_atom(tag) || ctx.atoms().name(atom_val(tag)) != Some("chars_limit") {
+        return Ok(None);
+    }
+    let value = tuple_element(option, 1);
+    if !is_small(value) {
+        return Err(badarg());
+    }
+    Ok(Some(signed_value(value)))
 }
 
 /// `io:format`: render, write the result, return `ok`.
@@ -909,14 +959,15 @@ fn round_digit(digit: u8, tail: String, carry: bool) -> (String, bool) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
-    use beam_common::BeamError;
+    use beam_common::{BeamError, ExitReason};
     use beam_process::ProcessId;
     use beam_term::{make_small, AtomTable, NIL};
 
     use crate::context::BytesSink;
 
-    const SEED: [&str; 13] = [
+    const SEED: [&str; 14] = [
         "true", "false", "ok", "hello", "a", "b", "c", "abc", "hi", "foo", "abcdefgh", "", "e",
+        "chars_limit",
     ];
 
     /// Runs `io:format` over a fresh context, returning the captured output and the
@@ -1500,7 +1551,7 @@ mod tests {
         atoms.seed(SEED);
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         let format_term = list_from_bytes(&mut ctx, b"");
-        let result = format_lib_1(&mut ctx, &[format_term]).expect("fits");
+        let result = format_lib_2(&mut ctx, &[format_term, NIL]).expect("fits");
         assert_eq!(result.raw(), NIL.raw());
 
         // `io_lib:format` writes nothing to the output sink.
@@ -1512,13 +1563,129 @@ mod tests {
             let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
                 .with_output(&mut sink);
             let format_term = list_from_bytes(&mut ctx, b"hi~n");
-            assert!(format_lib_1(&mut ctx, &[format_term]).is_ok());
+            assert!(format_lib_2(&mut ctx, &[format_term, NIL]).is_ok());
         }
         assert_eq!(sink.contents(), b"");
     }
 
+    /// The result of one `io_lib:format` run, materialized *before* the context's
+    /// heap is dropped (the returned `Eterm`s must not outlive it).
+    #[derive(Debug)]
+    enum Outcome {
+        Text(String),
+        Err(BeamError),
+    }
+
+    fn outcome(result: Result<Eterm>) -> Outcome {
+        match result {
+            Ok(term) => Outcome::Text(deep_text(term)),
+            Err(err) => Outcome::Err(err),
+        }
+    }
+
+    fn text(outcome: Outcome) -> String {
+        match outcome {
+            Outcome::Text(text) => text,
+            Outcome::Err(err) => panic!("expected a rendering, got {err:?}"),
+        }
+    }
+
+    /// Renders `format` with the small-int `args` under `build_options`, both
+    /// through `io_lib:format/3` and (as the reference) `io_lib:format/2`.
+    fn run_lib3(
+        format: &str,
+        args: &[i64],
+        build_options: impl Fn(&mut BifContext<'_>) -> Eterm,
+    ) -> (Outcome, Outcome) {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(SEED);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let format_term = list_from_bytes(&mut ctx, format.as_bytes());
+        let arg_elems: Vec<Eterm> = args.iter().map(|&v| ctx.int(v).expect("fits")).collect();
+        let args3 = ctx.list(&arg_elems).expect("fits");
+        let args2 = ctx.list(&arg_elems).expect("fits");
+        let options = build_options(&mut ctx);
+        let three = outcome(format_lib_3(&mut ctx, &[format_term, args3, options]));
+        let two = outcome(format_lib_2(&mut ctx, &[format_term, args2]));
+        (three, two)
+    }
+
+    fn chars_limit(ctx: &mut BifContext<'_>, limit: Eterm) -> Eterm {
+        let tag = ctx.atom("chars_limit").expect("seeded");
+        let option = ctx.tuple(&[tag, limit]).expect("fits");
+        ctx.list(&[option]).expect("fits")
+    }
+
+    fn option_empty_tuple(ctx: &mut BifContext<'_>) -> Eterm {
+        let empty = ctx.tuple(&[]).expect("fits");
+        ctx.list(&[empty]).expect("fits")
+    }
+
+    fn option_foo_atom(ctx: &mut BifContext<'_>) -> Eterm {
+        let foo = ctx.atom("foo").expect("seeded");
+        ctx.list(&[foo]).expect("fits")
+    }
+
+    fn option_chars_limit_neg(ctx: &mut BifContext<'_>) -> Eterm {
+        let neg = ctx.int(-1).expect("fits");
+        chars_limit(ctx, neg)
+    }
+
+    fn option_chars_limit_three(ctx: &mut BifContext<'_>) -> Eterm {
+        let three = ctx.int(3).expect("fits");
+        chars_limit(ctx, three)
+    }
+
+    fn option_chars_limit_atom(ctx: &mut BifContext<'_>) -> Eterm {
+        let value = ctx.atom("foo").expect("seeded");
+        chars_limit(ctx, value)
+    }
+
+    fn option_not_a_list(ctx: &mut BifContext<'_>) -> Eterm {
+        ctx.atom("foo").expect("seeded")
+    }
+
     #[test]
-    fn io_lib_format_1_and_2_agree_with_io_format() {
+    fn io_lib_format_3_options_are_validated() {
+        // Empty options reproduce `format/2` exactly.
+        let (three, two) = run_lib3("~w", &[42], |ctx| ctx.list(&[]).expect("fits"));
+        let reference = text(two);
+        assert_eq!(text(three), reference);
+        assert_eq!(reference, "42");
+
+        // Unknown options are ignored (the oracle only reads `chars_limit`).
+        for build in [option_empty_tuple, option_foo_atom] {
+            let (three, two) = run_lib3("~w", &[42], build);
+            assert_eq!(text(three), text(two), "an unknown option must be ignored");
+        }
+
+        // A negative `chars_limit` is the oracle's default (no limit).
+        let (three, two) = run_lib3("~w", &[42], option_chars_limit_neg);
+        assert_eq!(text(three), text(two));
+
+        // A limiting `chars_limit` is a typed error, never a wrong (unlimited) line.
+        let (three, _) = run_lib3("~w", &[42], option_chars_limit_three);
+        match three {
+            Outcome::Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.reason, ExitReason::atom("unsupported_bif"));
+            }
+            other => panic!("expected a typed unsupported-option error, got {other:?}"),
+        }
+
+        // A non-integer `chars_limit` value and a non-list `Options` are `badarg`.
+        let (three, _) = run_lib3("~w", &[42], option_chars_limit_atom);
+        assert!(matches!(three, Outcome::Err(BeamError::BadArg)));
+        let (three, _) = run_lib3("~w", &[42], option_not_a_list);
+        assert!(matches!(three, Outcome::Err(BeamError::BadArg)));
+
+        // `format/3` still renders directives normally.
+        let (three, _) = run_lib3("~b~n", &[255], |ctx| ctx.list(&[]).expect("fits"));
+        assert_eq!(text(three), "255\n");
+    }
+
+    #[test]
+    fn io_lib_format_2_agrees_with_io_format() {
         for format in ["~w", "~p", "~s", "~c", "~b", "~x", "~e", "~f", "~g", "~W", "~P"] {
             let (io_out, io_res) = run_io(format, |ctx| {
                 let a = ctx.atom("a").expect("seeded");
