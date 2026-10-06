@@ -158,6 +158,77 @@ fn hash_navigation_walks_every_key_once_and_rejects_an_absent_anchor() {
     }
 }
 
+/// The hash kinds navigate in an **unspecified internal order**: the ETS contract
+/// fixes *which* keys are reachable and how an absent anchor is rejected, never the
+/// order. What is contract — and is pinned here — is:
+///
+///   * `first`/`last` return a **present** key (never a bogus one) or
+///     `'$end_of_table'`;
+///   * the `first` + `next` walk visits every stored key exactly once, and `last`
+///     closes that same walk (`prev(first)` and `next(last)` are `'$end_of_table'`);
+///   * `next`/`prev` on an **absent** anchor key are `badarg` — the walk is anchored
+///     at a present entry.
+///
+/// Rationalised against the real `erl` (OTP 29 / erts-17.1): a 3-key `set` answers
+/// `first = last = 1` there, but that is the *internal* order, not a rule — so this
+/// test deliberately asserts nothing of the form `last == first`.
+#[test]
+fn hash_navigation_order_is_unspecified_but_every_returned_key_is_present() {
+    for kind in [TableKind::Set, TableKind::Bag, TableKind::DuplicateBag] {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(2048);
+        let mut t = new_table(kind);
+
+        const KEYS: i64 = 25;
+        for k in 0..KEYS {
+            t.insert(object(&mut heap, k, k * 10), &atoms).unwrap();
+        }
+        let present: Vec<Eterm> = (0..KEYS).map(make_small).collect();
+        let is_present = |key: Eterm| present.iter().any(|&p| eq(p, key, &atoms));
+
+        // A non-empty table has a first (present) key; an empty one does not
+        // (`'$end_of_table'`) — covered by the empty-table test above.
+        let first = t.first(&atoms).expect("a non-empty table has a first key");
+        assert!(is_present(first), "{kind:?}: first is a stored key");
+
+        // `first` + `next` visits every stored key exactly once.
+        let mut walk = Vec::new();
+        let mut cursor = Some(first);
+        while let Some(key) = cursor {
+            assert!(is_present(key), "{kind:?}: every walked key is stored");
+            assert!(
+                !walk.iter().any(|&seen| eq(seen, key, &atoms)),
+                "{kind:?}: each stored key is visited exactly once"
+            );
+            walk.push(key);
+            cursor = t.next(key, &atoms).unwrap();
+        }
+        assert_eq!(walk.len(), KEYS as usize, "{kind:?}: the walk covers every key");
+
+        // `last` closes the same order; the two ends are `'$end_of_table'`.
+        let last = t.last(&atoms).expect("a non-empty table has a last key");
+        assert!(is_present(last), "{kind:?}: last is a stored key");
+        assert!(
+            eq(last, *walk.last().unwrap(), &atoms),
+            "{kind:?}: last closes the walk"
+        );
+        assert_eq!(t.next(last, &atoms).unwrap(), None, "{kind:?}: next(last)");
+        assert_eq!(t.prev(first, &atoms).unwrap(), None, "{kind:?}: prev(first)");
+
+        // An absent anchor key is always `badarg`, whatever its value.
+        for absent in [make_small(-1), make_small(KEYS), make_small(999)] {
+            assert!(
+                matches!(t.next(absent, &atoms), Err(BeamError::BadArg)),
+                "{kind:?}: next on an absent key is badarg"
+            );
+            assert!(
+                matches!(t.prev(absent, &atoms), Err(BeamError::BadArg)),
+                "{kind:?}: prev on an absent key is badarg"
+            );
+        }
+    }
+}
+
 #[test]
 fn take_removes_and_returns_the_keys_objects_for_every_kind() {
     for kind in [

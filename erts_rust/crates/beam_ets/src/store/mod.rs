@@ -18,6 +18,12 @@
 //! themselves are released as a unit by [`TermStore::reset`] (which backs
 //! `delete_all_objects`) and by [`Drop`].
 //!
+//! [`TermStore::relinquish`] is the third disposition: an object is handed to the
+//! caller (`ets:take/2`). Its words stay valid and are never handed out again, but
+//! they stop counting toward [`TermStore::words`] — the arena cannot shrink, so the
+//! words remain held by their block until `reset`/`Drop`, the same lifetime every
+//! read result already has.
+//!
 //! This is the *only* module of the crate allowed to contain `unsafe` (raw term
 //! reads/writes) alongside the tuple-element accessor in [`crate::key`]; every
 //! `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding
@@ -216,6 +222,43 @@ impl TermStore {
         words
     }
 
+    /// Hands the storage of the object whose root [`copy`](TermStore::copy)
+    /// returned as `root` over to the caller — the "check out" behind `ets:take/2`.
+    ///
+    /// After this call the object is still **valid** for the store's lifetime (its
+    /// words are *not* returned to the free lists, so no later `copy` can overwrite
+    /// them), but it is no longer counted as table-owned storage: [`words`](TermStore::words)
+    /// drops by exactly its word count, so an object that has left the table stops
+    /// counting toward `ets:info(Tab, memory)`. The arena itself never shrinks, so the
+    /// words stay held by their block until [`reset`](TermStore::reset)/drop releases
+    /// it — the same lifetime guarantee every read result already has.
+    ///
+    /// This is the difference from [`free`](TermStore::free): `free` reclaims the words
+    /// for reuse by a later `copy` (which would then hand the caller's pointer out
+    /// again), whereas `relinquish` leaves them alone. A checked-out root must not be
+    /// passed back to `free` or `relinquish` — the second call is a no-op (the root is
+    /// no longer tracked) that returns `0`.
+    ///
+    /// Relinquishing a term this store never copied (an immediate, a foreign term, or
+    /// a root already freed/checked out) is a harmless no-op that returns `0`.
+    pub fn relinquish(&mut self, root: Eterm) -> usize {
+        let runs = match self.tracked.remove(&root) {
+            Some(runs) => runs,
+            None => return 0,
+        };
+        let mut words = 0;
+        for run in runs {
+            words += run.words;
+            self.live_words = self
+                .live_words
+                .checked_sub(run.words)
+                .expect("a checked-out run was counted live when it was handed out");
+            // Deliberately **not** `release`d: the words stay valid and are never
+            // handed out again, so a later `copy` cannot overwrite the caller's term.
+        }
+        words
+    }
+
     /// Releases **every** block this store owns through the allocator, so the
     /// memory it holds drops to ~0 — the storage side of `ets:delete_all_objects`.
     ///
@@ -240,8 +283,9 @@ impl TermStore {
 
     /// The number of words currently **live** in this store: handed out by
     /// [`copy`](TermStore::copy) and not yet returned by
-    /// [`free`](TermStore::free). It never counts a word twice and never
-    /// underflows.
+    /// [`free`](TermStore::free) or handed to a caller by
+    /// [`relinquish`](TermStore::relinquish). It never counts a word twice and
+    /// never underflows.
     pub fn words(&self) -> usize {
         self.live_words
     }

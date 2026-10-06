@@ -287,8 +287,12 @@ impl HashInterior {
 }
 
 impl Interior for HashInterior {
-    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<()> {
+    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
         let bi = self.bucket_index(key, atoms);
+        // Whether the interior now owns `object`. `set`/`duplicate_bag` always
+        // retain; only a `bag` can reject an *identical* object as a no-op, in which
+        // case the caller reclaims the rejected copy (see the trait doc).
+        let mut retained = true;
         match Self::entry_pos(&self.buckets[bi], key, atoms) {
             Some(pos) => {
                 let entry = &mut self.buckets[bi][pos];
@@ -303,7 +307,9 @@ impl Interior for HashInterior {
                     },
                     // `bag` keeps *distinct* objects: an identical object is a no-op.
                     TableKind::Bag => {
-                        if !entry.objs.iter().any(|o| eq(*o, object, atoms)) {
+                        if entry.objs.iter().any(|o| eq(*o, object, atoms)) {
+                            retained = false;
+                        } else {
                             entry.objs.push(object);
                             self.len += 1;
                         }
@@ -324,7 +330,7 @@ impl Interior for HashInterior {
             }
         }
         self.maybe_grow(atoms);
-        Ok(())
+        Ok(retained)
     }
 
     fn insert_new(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
@@ -973,5 +979,33 @@ mod tests {
         // and vector overhead only add to it).
         assert!(populated >= t.size());
         assert_eq!(t.size(), 200);
+    }
+
+    #[test]
+    fn insert_reports_whether_the_object_was_retained() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let k = make_small(7);
+
+        // `set`: a fresh insert and a replace both retain the object.
+        let mut set = HashInterior::new(TableKind::Set);
+        assert!(set.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
+        assert!(set.insert(k, object(&mut heap, 7, 2), &atoms).unwrap(), "a replace retains");
+
+        // `bag`: an identical object is rejected (`false`), a distinct one is kept.
+        let mut bag = HashInterior::new(TableKind::Bag);
+        assert!(bag.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
+        assert!(
+            !bag.insert(k, object(&mut heap, 7, 1), &atoms).unwrap(),
+            "an identical `bag` object is not retained"
+        );
+        assert!(bag.insert(k, object(&mut heap, 7, 2), &atoms).unwrap());
+        assert_eq!(bag.size(), 2);
+
+        // `duplicate_bag`: every object is retained, even an identical one.
+        let mut dup = HashInterior::new(TableKind::DuplicateBag);
+        assert!(dup.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
+        assert!(dup.insert(k, object(&mut heap, 7, 1), &atoms).unwrap());
+        assert_eq!(dup.size(), 2);
     }
 }

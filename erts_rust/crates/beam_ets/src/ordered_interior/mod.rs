@@ -114,9 +114,10 @@ impl OrderedSetInterior {
 }
 
 impl Interior for OrderedSetInterior {
-    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<()> {
+    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {
         self.tree.insert(key, object, atoms);
-        Ok(())
+        // A `set`-family insert always retains the object (an equal key replaces).
+        Ok(true)
     }
 
     fn insert_new(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool> {

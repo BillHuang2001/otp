@@ -61,8 +61,12 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `new(alloc: AllocRef) -> TermStore`, `with_default_allocator() -> TermStore`,
   `copy(&mut self, root: Eterm) -> Result<Eterm>` (deep-copies a term graph into table-owned memory;
   immediates copy by value; a rejected copy rolls back), `free(&mut self, root: Eterm) -> usize`
-  (reclaims one copied root's exact-word-size runs to per-size free lists for reuse), `reset()`
-  (releases every block), `words() -> usize` (live words), `blocks() -> usize`,
+  (reclaims one copied root's exact-word-size runs to per-size free lists for reuse),
+  `relinquish(&mut self, root: Eterm) -> usize` (the `ets:take/2` "check out": the object stays
+  **valid** — its runs are never handed out again — but stops counting toward `words()`; unlike
+  `free` it does **not** return the runs to the free lists), `reset()`
+  (releases every block), `words() -> usize` (live words: handed out by `copy` and not yet `free`d or
+  `relinquish`ed), `blocks() -> usize`,
   `memory() -> usize` (bytes held). `impl Drop` frees every block.
 - Deep-copy **supported subset**: immediates, cons/list cells, tuples, **flat maps**, and the
   *pointer-free* boxed leaves (float, bignum, internal ref, on-heap bitstring).
@@ -116,7 +120,7 @@ impl Table {
     pub fn last(&self, atoms: &AtomTable) -> Option<Eterm>;
     pub fn next(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
     pub fn prev(&self, key: Eterm, atoms: &AtomTable) -> Result<Option<Eterm>>;
-    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>>;
+    pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>>; // copies out + reclaims the stored originals
 
     // access control
     pub fn check_read(&self, requester: Option<OwnerId>) -> Result<()>;
@@ -136,7 +140,10 @@ impl Table {
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
   (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/
   `iter_objects`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
-  `update_counter`/`update_element`). `Table` stores `Box<dyn Interior>`. Generic defaults rebuild the
+  `update_counter`/`update_element`). `Table` stores `Box<dyn Interior>`. `insert` returns
+  `Result<bool>` — **whether the object was retained** — so `Table::insert` reclaims the deep copy it
+  made when the interior rejects it as a duplicate (`bag` is the only kind that can return `false`;
+  `set`/`ordered_set`/`duplicate_bag` always retain). Generic defaults rebuild the
   object on the caller's heap (what the B+-tree needs); the hash interior overrides the element
   updates with **destructive in-place writes**. Private — **not** part of the cross-crate API.
 
@@ -163,10 +170,13 @@ impl Table {
 ### `hash_interior.rs` — hash-indexed interior (`set`/`bag`/`duplicate_bag`)
 - `pub struct HashInterior`: buckets `Vec<Vec<Entry>>` (`Entry { key, objs: Vec<Eterm> }`), lookup by
   `term_hash(key) % buckets` then `eq`; doubles + rehashes past a load factor. `set` keeps ≤ 1 object
-  per key; `bag` rejects a duplicate *object* within a key via `eq`; `duplicate_bag` keeps a multiset.
+  per key; `bag` rejects a duplicate *object* within a key via `eq` (its `Interior::insert` returns
+  `false`, so the caller reclaims that rejected copy); `duplicate_bag` keeps a multiset.
   Public API for testing/reuse: `new(kind: TableKind)`, `take(key, atoms) -> Vec<Eterm>`,
   `update_counter(key, pos, incr, atoms) -> Result<Eterm>` (set/ordered_set semantics; in-place),
   `update_element(key, updates, atoms) -> Result<bool>`, `memory(atoms) -> usize`.
+  It implements `keys()` (bucket-scan order) but **not** `first_key`/`last_key`/`next_key`/`prev_key`,
+  so the trait defaults supply them (see Known Issues, navigation order).
 
 ### `ordered_interior/` — the K-ary B+-tree interior (`ordered_set`)
 - `mod.rs` — `pub struct OrderedSetInterior` (key-ordered B+-tree, see Design Decisions): `new()`,
@@ -258,12 +268,16 @@ impl Table {
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
-  split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse,
-  hash-interior ops, B+-tree invariants (incl. 10 000-key churn), select compile/execute, info.
-- Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`,
-  `ets_order.rs`, `ets_select.rs`, `ets_bag.rs`, `ets_info.rs`, `ets_nav.rs`, `ets_access.rs`,
-  `ets_update.rs`, sharing helpers from `tests/common/mod.rs`; plus `tests/select.rs` for the
-  match-spec subset. 42 ETS tests + 18 select tests.
+  split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
+  `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
+  (incl. the `insert`-retained-bool), B+-tree invariants (incl. 10 000-key churn), select
+  compile/execute, info. 84 unit tests.
+- Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
+  (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
+  duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs`, `ets_nav.rs` (incl. the
+  order-independent hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 53 ETS tests + 18 select
+  tests.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 61 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
@@ -283,18 +297,24 @@ impl Table {
 - **Bignum counters are a representation gap.** A bignum element/operand is valid in real ETS but
   unaddable here, and a sum outside the 60-bit small range (which real ETS promotes to a bignum)
   reports `BeamError::SystemLimit` rather than a wrong value.
-- **`take` does not reclaim.** The returned objects alias table storage and stay valid for the
-  table's lifetime, so `take` deliberately does not `free` them (a later `copy` could otherwise hand
-  the same words out again); their storage is released by `delete_all_objects`/table drop.
+- **`take` reclaims the stored objects but the returned copies are checked out, not counted.** Each
+  removed object is deep-copied out of the store and the table's own original is
+  `TermStore::free`d, so an `insert`+`take` churn does not grow `Table::memory()`. The returned copies
+  are `relinquish`ed: valid for the table's lifetime and never handed out again, but no longer counted
+  as table memory (matching real `ets:take/2`, whose objects leave the table). Their words stay held by
+  the store's block until `delete_all_objects`/drop, since the arena never shrinks.
 - **`ordered_set` `memory()` under-reports.** The `Interior::memory` default is 0, so
   `Table::memory()` for `ordered_set` counts only the term store, not the B+-tree node arena. The
   hash interior reports its honest bucket/entry allocation.
-- **Hash-interior `last`/`prev` are degenerate** (`last == first`, `prev == next`) — hash iteration
-  order is not part of the ETS contract and is unobservable; `ordered_set` navigation is exact.
-- **`bag` duplicate-insert retains one copy until `reset()`.** Inserting an object already present
-  under a `bag` key deep-copies it, then the interior rejects the duplicate; that copy is released
-  only by `delete_all_objects`/drop.
-- **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
+- **Hash-interior navigation order is unspecified (per the ETS contract).** `HashInterior` supplies the
+  bucket-scan `keys()` and relies on the `Interior` trait defaults for `first_key`/`last_key`/
+  `next_key`/`prev_key`, so `first`/`last` are the first/last keys of that internal order and
+  `next`/`prev` are its position-based successor/predecessor (`last != first` and `prev != next` in
+  general). Real `erl` answers `first == last` for a small hash table — a *different* internal order,
+  equally unspecified. Only the order is unspecified: every key the walk yields is a present key, the
+  `first`+`next` walk is a permutation of the stored keys, and `next`/`prev` on an **absent** anchor are
+  `badarg`. `ordered_set` navigation is exact (ascending `beam_term` order, absent keys read as range
+  bounds).- **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
 - **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
