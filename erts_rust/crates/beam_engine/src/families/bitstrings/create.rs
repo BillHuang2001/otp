@@ -45,7 +45,7 @@
 //! Not implemented (a precise typed [`crate::error::unsupported`]): an
 //! `append`/`private_append` segment that is not the first.
 //!
-//! # `BS_FAIL_INFO`: why a segment failure raises the bare atom `badarg`
+//! # `BS_FAIL_INFO`: why a segment failure raises a bare reason atom
 //!
 //! C's segment-failure macro `BS_FAIL_INFO(Fail, Reason, ErrorType, Value)`
 //! (`emu/bs_instrs.tab:347`) runs `erts_prepare_bs_construct_fail_info` and then
@@ -53,11 +53,12 @@
 //! the matching opcodes use. A live fail label is `$FAIL($Fail)`, a branch to it
 //! (the guard case); `{f,0}` ([`NO_FAIL`]) takes the `goto find_func_info` arm, a
 //! real raise whose reason is exactly the atom `BS_FAIL_INFO` left in
-//! `c_p->freason` — `badarg`, or `system_limit` from the size validation's
-//! `BS_FAIL_INFO_SYSTEM_LIMIT` (`:355`, `:424`/`:438`). The extended error info
-//! `erts_prepare_bs_construct_fail_info` records (`emu/beam_emu.c:725`) only
-//! decorates the *stacktrace*, so it is not modelled at M1: the reason is the bare
-//! atom. See [`fail_seg`] — this is why `bs_create_bin` must **not** reuse the
+//! `c_p->freason` — the bare `badarg` for every `i_bs_create_bin` call site, or
+//! `system_limit` from the size validation's `BS_FAIL_INFO_SYSTEM_LIMIT`
+//! (`:355`, `:424`/`:427`/`:438`). Both are modelled, as [`SegReason`]; the extended
+//! error info `erts_prepare_bs_construct_fail_info` records (`emu/beam_emu.c:725`)
+//! only decorates the *stacktrace*, so it is not modelled at M1: the reason is the
+//! bare atom. See [`fail_seg`] — this is why `bs_create_bin` must **not** reuse the
 //! matching side's [`super::fail_step`], whose `NO_FAIL` arm raises
 //! `{badmatch, Subject}`.
 use std::collections::BTreeMap;
@@ -172,16 +173,17 @@ fn assemble(
                         "bs_create_bin: integer segment size `all`",
                     ));
                 }
-                let Some(size) = segment_size(machine, ctx, size_op)? else {
-                    return fail_seg(machine, module, labels, fail);
+                let size = match segment_size(machine, ctx, size_op)? {
+                    SegSize::Small(n) => n,
+                    SegSize::Fail(reason) => return fail_seg(machine, module, labels, fail, reason),
                 };
                 // C's `$BS_SAFE_MUL(..., $BS_FAIL_INFO_SYSTEM_LIMIT, ...)`
-                // (`emu/bs_instrs.tab:424`): a size*unit overflow is `system_limit`,
-                // which M1 does not model — a typed error, never a wrong reason.
-                let Some(nbits) = size.checked_mul(unit) else {
-                    return Err(error::unsupported(
-                        "bs_create_bin: segment size overflow (system_limit)",
-                    ));
+                // (`emu/bs_instrs.tab:424`) plus the signed-size-fits check (`:425`):
+                // a `size*unit` overflow, or a product whose signed value does not fit
+                // in a word, is `system_limit` (`:427`).
+                let nbits = match seg_nbits(size, unit) {
+                    Ok(nbits) => nbits,
+                    Err(reason) => return fail_seg(machine, module, labels, fail, reason),
                 };
                 let value = read_value(machine, module, ctx, value_op)?;
                 if nbits > 64 {
@@ -194,7 +196,7 @@ fn assemble(
                     let Some(raw_value) = small_value(value) else {
                         // `erts_bs_put_integer_*` rejects a non-integer value
                         // (`erl_bits.c:926`) -> `BADARG`.
-                        return fail_seg(machine, module, labels, fail);
+                        return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                     };
                     if flags & BSF_LITTLE != 0 {
                         writer.push_uint_le(raw_value as u64, nbits);
@@ -209,29 +211,30 @@ fn assemble(
                 // The size loop's `is_not_bitstring(Src)` check
                 // (`emu/bs_instrs.tab:390`) fails **before** the size is even read.
                 let Some((bytes, src_bits)) = segment_source(machine, module, value_op, ctx)? else {
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 let nbits = if is_all(module, size_op) {
                     // `erts_bs_put_binary_all` (`erl_bits.c:1311`): a whole-tail
                     // segment must be a multiple of the segment's unit.
                     if unit != 1 && src_bits % unit != 0 {
-                        return fail_seg(machine, module, labels, fail);
+                        return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                     }
                     src_bits
                 } else {
-                    let Some(size) = segment_size(machine, ctx, size_op)? else {
-                        return fail_seg(machine, module, labels, fail);
+                    let size = match segment_size(machine, ctx, size_op)? {
+                        SegSize::Small(n) => n,
+                        SegSize::Fail(reason) => {
+                            return fail_seg(machine, module, labels, fail, reason);
+                        }
                     };
-                    // `$BS_SAFE_MUL` → `SYSTEM_LIMIT` (not modelled at M1).
-                    let Some(nbits) = size.checked_mul(unit) else {
-                        return Err(error::unsupported(
-                            "bs_create_bin: segment size overflow (system_limit)",
-                        ));
-                    };
-                    nbits
+                    // `$BS_SAFE_MUL` + the signed-size-fits check → `system_limit`.
+                    match seg_nbits(size, unit) {
+                        Ok(nbits) => nbits,
+                        Err(reason) => return fail_seg(machine, module, labels, fail, reason),
+                    }
                 };
                 if nbits > src_bits {
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
                 writer.push_bits_from(bytes, 0, nbits);
             }
@@ -256,22 +259,24 @@ fn assemble(
                     64
                 } else {
                     match segment_size(machine, ctx, size_op)? {
-                        Some(n) => match n.checked_mul(unit) {
+                        SegSize::Small(n) => match n.checked_mul(unit) {
                             Some(m) if m != 0 => m,
                             _ => 64,
                         },
-                        None => return fail_seg(machine, module, labels, fail),
+                        SegSize::Fail(reason) => {
+                            return fail_seg(machine, module, labels, fail, reason);
+                        }
                     }
                 };
                 // `erts_bs_put_float` (`erl_bits.c:1449`) returns a failure value for
                 // any width other than 16/32/64 (`c_p->fvalue = am_invalid`), and the
                 // caller still raises the bare atom `badarg`.
                 if !matches!(nbits, 16 | 32 | 64) {
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
                 let value = read_value(machine, module, ctx, value_op)?;
                 let Some(f) = float_source(value) else {
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 let bytes = put_float(f, nbits, flags & BSF_LITTLE != 0);
                 writer.push_bits_from(&bytes, 0, nbits);
@@ -290,7 +295,7 @@ fn assemble(
                 };
                 match encoded {
                     Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8),
-                    None => return fail_seg(machine, module, labels, fail),
+                    None => return fail_seg(machine, module, labels, fail, SegReason::BadArg),
                 }
             }
             // `append`/`private_append` (`BSC_APPEND`/`BSC_PRIVATE_APPEND`,
@@ -317,12 +322,12 @@ fn assemble(
                 let Some((_, src_bits)) = raw::heap_bits(value) else {
                     // `erts_bs_append_checked` (`erl_bits.c:1744`) rejects a
                     // non-bitstring accumulator with `BADARG`.
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 };
                 // `erts_bs_append_checked` (`erl_bits.c:1778`): the accumulator's
                 // bit size must be a multiple of the segment's unit.
                 if unit != 1 && src_bits % unit != 0 {
-                    return fail_seg(machine, module, labels, fail);
+                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
                 }
                 let bytes = raw::subject_bytes(value)?;
                 writer.push_bits_from(bytes, 0, src_bits);
@@ -339,13 +344,64 @@ fn assemble(
     Ok(Ok(writer.finish()))
 }
 
+/// The reason a `bs_create_bin` segment failure (`$BS_FAIL_INFO`) raises — exactly
+/// the atom C leaves in `c_p->freason`.
+///
+/// Every `i_bs_create_bin` call site reports the bare atom `badarg`
+/// (`emu/bs_instrs.tab:347`, `BADARG`), **except** the size validation, which
+/// reports `system_limit` via `BS_FAIL_INFO_SYSTEM_LIMIT` (`:355`): a `size*unit`
+/// multiply overflow (`:424`), a product whose signed value does not fit a word
+/// (`:427`), and a **positive** bignum size (`:438`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegReason {
+    /// The bare atom `badarg`.
+    BadArg,
+    /// The bare atom `system_limit`.
+    SystemLimit,
+}
+
+impl SegReason {
+    /// The BEAM atom name C leaves in `c_p->freason`.
+    fn atom_name(self) -> &'static str {
+        match self {
+            SegReason::BadArg => "badarg",
+            SegReason::SystemLimit => "system_limit",
+        }
+    }
+
+    /// The typed [`BeamError`] a raise falls back to when it cannot land — no live
+    /// catch frame, or a reason atom the running module cannot name.
+    fn typed(self) -> BeamError {
+        match self {
+            SegReason::BadArg => BeamError::BadArg,
+            SegReason::SystemLimit => BeamError::SystemLimit,
+        }
+    }
+}
+
+/// One bitstring segment's `size*unit` bit count, or the reason C reports.
+///
+/// The C size loop (`emu/bs_instrs.tab:424-428`) multiplies the (already validated,
+/// non-negative) size by the unit under `$BS_SAFE_MUL` and then rejects a product
+/// whose *signed* value does not fit in a word (`size >> (sizeof(Uint) * 8 - 1)`).
+/// Both are `$BS_FAIL_INFO_SYSTEM_LIMIT`.
+fn seg_nbits(size: usize, unit: usize) -> std::result::Result<usize, SegReason> {
+    match size.checked_mul(unit) {
+        // `(nbits as u64) >> 63 != 0` is C's `size >> (sizeof(Uint) * 8 - 1) != 0`
+        // on a 64-bit word: the signed size does not fit.
+        Some(nbits) if (nbits as u64) >> 63 == 0 => Ok(nbits),
+        _ => Err(SegReason::SystemLimit),
+    }
+}
+
 /// A `bs_create_bin` **segment failure** (a completed `Err(step)`).
 ///
-/// C's `$BS_FAIL_INFO($Fail, ...)` (`emu/bs_instrs.tab:347`) ends in
+/// C's `$BS_FAIL_INFO($Fail, Reason, ...)` (`emu/bs_instrs.tab:347`) ends in
 /// `$FAIL_HEAD_OR_BODY($Fail)` (`emu/macros.tab:266`): a live fail label is a branch
 /// (`$FAIL`), and `{f,0}` ([`NO_FAIL`]) takes the `goto find_func_info` arm — a real
-/// raise whose reason is the atom `BS_FAIL_INFO` left in `c_p->freason`, i.e. the
-/// bare `badarg` for every call site in `i_bs_create_bin`.
+/// raise whose reason is the atom `BS_FAIL_INFO` left in `c_p->freason`, the bare
+/// `badarg` for every call site in `i_bs_create_bin` except the size validation
+/// (which reports `system_limit`; see [`SegReason`]).
 ///
 /// This is why `bs_create_bin` must **not** reuse the matching side's
 /// [`super::fail_step`], whose `NO_FAIL` arm raises `{badmatch, Subject}`: the
@@ -356,73 +412,103 @@ fn fail_seg(
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
     fail: Label,
+    reason: SegReason,
 ) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
-    Ok(Err(seg_fail_step(machine, module, labels, fail)?))
+    Ok(Err(seg_fail_step(machine, module, labels, fail, reason)?))
 }
 
-/// [`fail_seg`]'s `Step` half: branch, or raise the bare atom `badarg`.
+/// [`fail_seg`]'s `Step` half: branch, or raise the segment failure's reason atom.
 fn seg_fail_step(
     machine: &mut Machine,
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
     fail: Label,
+    reason: SegReason,
 ) -> Result<Step> {
     if fail == NO_FAIL {
-        raise_badarg(machine, module)
+        raise_seg_fail(machine, module, reason)
     } else {
         goto_label(labels, fail)
     }
 }
 
-/// Raise class `error` with the bare atom `badarg` (C's `BADARG(Fail)` at
-/// `emu/macros.tab:280` followed by `find_func_info`), mirroring
-/// `families/funs.rs::raise_badarg`: the reason atom comes from the *running
-/// module's* atom table (the engine never invents an atom it cannot name), and the
-/// `error` class atom is installed when the module has it. With no live catch frame
-/// the raise cannot land and propagates as the typed [`BeamError::BadArg`].
+/// Raise class `error` with the bare reason atom (C's `BADARG(Fail)` /
+/// `SYSTEM_LIMIT(Fail)` at `emu/macros.tab:280` followed by `find_func_info`),
+/// mirroring `families/funs.rs::raise_badarg`: the reason atom comes from the
+/// *running module's* atom table (the engine never invents an atom it cannot name),
+/// and the `error` class atom is installed when the module has it. With no live catch
+/// frame — or a reason atom the module cannot name — the raise cannot land and
+/// propagates as the typed [`SegReason::typed`] error (`BadArg` / `SystemLimit`,
+/// whose `as_atom()` is exactly the atom the oracle raises).
 ///
 /// C also records the `{Segment, Op, ErrorType, Value}` extended error info
 /// (`erts_prepare_bs_construct_fail_info`, `emu/beam_emu.c:725`); that only
 /// decorates the *stacktrace* and is not modelled at M1.
-fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Step> {
+fn raise_seg_fail(machine: &mut Machine, module: &Module, reason: SegReason) -> Result<Step> {
     if machine.catch_frame_depth() == 0 {
-        return Err(BeamError::BadArg);
+        return Err(reason.typed());
     }
     let atom = module
         .atom_table
-        .lookup("badarg")
-        .ok_or(BeamError::BadArg)?;
+        .lookup(reason.atom_name())
+        .ok_or_else(|| reason.typed())?;
     if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
         machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
     }
     machine.throw_error(make_atom(atom))
 }
 
+/// The outcome of reading a *dynamic* segment size operand, mirroring the C size
+/// loop's validation (`emu/bs_instrs.tab:420-445`).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SegSize {
+    /// A non-negative small integer (the C `signed_size >= 0` arm, `:423`).
+    Small(usize),
+    /// A segment failure carrying the reason atom C leaves in `c_p->freason`.
+    Fail(SegReason),
+}
+
+/// Whether an integer term is negative (`big_sign` for a bignum).
+///
+/// [`beam_term::number_as_f64`] preserves a bignum's sign for every magnitude (the
+/// nearest double when representable, else `±f64::INFINITY`), so the sign test is
+/// exact; a small integer never reaches here (it takes the `is_small` arm).
+fn integer_is_negative(value: Eterm) -> bool {
+    beam_term::number_as_f64(value) < 0.0
+}
+
 /// Read a *dynamic* segment size operand, mirroring the C size loop's validation
 /// (`emu/bs_instrs.tab:420-445`).
 ///
-/// `Ok(Some(n))` is a non-negative small integer; `Ok(None)` is the C's
-/// `$BADARG($Fail)` arm — a negative value or a non-integer — and the caller takes
-/// the segment failure path. A **positive bignum** is the one case the C reports as
-/// `system_limit` (`emu/bs_instrs.tab:438`) rather than `badarg`; `system_limit` is
-/// not modelled at M1, so it stays a typed error rather than a wrong reason.
+/// `SegSize::Small(n)` is a non-negative small integer; `SegSize::Fail(reason)` is
+/// the `$BS_FAIL_INFO` reason the C reports — `badarg` for a negative size (`:431`),
+/// a **negative** bignum (`:440`) or a non-integer (`:444`), and `system_limit` for
+/// a **positive** bignum (`:438`).
 fn segment_size(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
     operand: &Operand,
-) -> Result<Option<usize>> {
+) -> Result<SegSize> {
     let value = read_operand(machine, ctx, operand)?;
     if beam_term::is_small(value) {
         let n = beam_term::signed_value(value);
-        return Ok(if n >= 0 { Some(n as usize) } else { None });
+        return Ok(if n >= 0 {
+            SegSize::Small(n as usize)
+        } else {
+            SegSize::Fail(SegReason::BadArg)
+        });
     }
     if predicates::is_integer(value) {
-        // An integer too large to be a small (a positive bignum -> `system_limit`).
-        return Err(error::unsupported(
-            "bs_create_bin: segment size is not a small integer (system_limit)",
-        ));
+        // An integer too large to be a small: a positive bignum is `system_limit`
+        // (`emu/bs_instrs.tab:438`), a negative one `badarg` (`:440`).
+        return Ok(SegSize::Fail(if integer_is_negative(value) {
+            SegReason::BadArg
+        } else {
+            SegReason::SystemLimit
+        }));
     }
-    Ok(None)
+    // Not an integer (`:444`).
+    Ok(SegSize::Fail(SegReason::BadArg))
 }
 
 /// The `i`-th segment operand, or a typed error when the list is truncated.
@@ -657,6 +743,7 @@ fn put_utf32(value: i64) -> Option<Vec<u8>> {
 mod tests {
     use super::*;
     use beam_common::BeamError;
+    use beam_term::{make_small, Atom};
 
     use crate::context::MinimalContext;
 
@@ -770,6 +857,145 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
+    }
+
+    // --- `seg_nbits` (the `$BS_SAFE_MUL` + signed-fit check) ---------------
+
+    #[test]
+    fn seg_nbits_multiplies_and_flags_a_word_overflow() {
+        assert_eq!(seg_nbits(8, 1), Ok(8));
+        assert_eq!(seg_nbits(0, 4096), Ok(0));
+        assert_eq!(seg_nbits(1 << 40, 8), Ok(1 << 43));
+        assert_eq!(seg_nbits((1 << 63) - 1, 1), Ok((1 << 63) - 1));
+        // A `size*unit` multiply that overflows a word (`:424`) ...
+        assert_eq!(seg_nbits(usize::MAX, 2), Err(SegReason::SystemLimit));
+        assert_eq!(seg_nbits(1 << 62, 4), Err(SegReason::SystemLimit));
+        // ... and a product that fits a word but not a *signed* one, i.e. with bit
+        // 63 set (`:425`-`:427`), are both `system_limit`.
+        assert_eq!(seg_nbits(1 << 63, 1), Err(SegReason::SystemLimit));
+        assert_eq!(seg_nbits(1 << 62, 2), Err(SegReason::SystemLimit));
+    }
+
+    // --- `segment_size` (the size-validation reasons) ----------------------
+
+    /// Read a dynamic size from `x(0)` holding `value`.
+    fn size_of(ctx: &mut MinimalContext, value: Eterm) -> SegSize {
+        let mut machine = Machine::new();
+        machine.set_x(0, value).expect("x0 in range");
+        segment_size(&machine, ctx, &Operand::X(0)).expect("segment_size")
+    }
+
+    #[test]
+    fn segment_size_accepts_a_non_negative_small() {
+        let mut ctx = MinimalContext::new();
+        assert_eq!(size_of(&mut ctx, make_small(8)), SegSize::Small(8));
+        assert_eq!(size_of(&mut ctx, make_small(0)), SegSize::Small(0));
+    }
+
+    #[test]
+    fn segment_size_rejects_a_negative_small_and_a_non_integer() {
+        let mut ctx = MinimalContext::new();
+        assert_eq!(
+            size_of(&mut ctx, make_small(-1)),
+            SegSize::Fail(SegReason::BadArg)
+        );
+        // `erl -noshell -eval 'io:format("~p~n",[try <<1:x/integer>> catch C:E -> {C,E} end]),halt().'`
+        // ⇒ `{error,badarg}` (`emu/bs_instrs.tab:444`).
+        assert_eq!(
+            size_of(&mut ctx, make_atom(Atom::from_raw(1))),
+            SegSize::Fail(SegReason::BadArg)
+        );
+    }
+
+    #[test]
+    fn segment_size_distinguishes_positive_and_negative_bignums() {
+        // Oracle, from a clean directory (no `-pa tests/fixtures/`):
+        //   X = <<1:4>>, <<X:(1 bsl 59)/binary>>      ⇒ {error,system_limit}
+        //   X = <<1:4>>, <<X:(-(1 bsl 59))/binary>>   ⇒ {error,badarg}
+        // 2^59 = MAX_SMALL + 1, so both sizes are bignums.
+        let mut ctx = MinimalContext::new();
+        let positive = crate::terms::make_integer(&mut ctx, 1i64 << 59).expect("bignum");
+        assert!(
+            !beam_term::is_small(positive),
+            "the fixture must exercise the bignum arm"
+        );
+        assert_eq!(
+            size_of(&mut ctx, positive),
+            SegSize::Fail(SegReason::SystemLimit)
+        );
+        let negative = crate::terms::make_integer(&mut ctx, -(1i64 << 59)).expect("bignum");
+        assert_eq!(
+            size_of(&mut ctx, negative),
+            SegSize::Fail(SegReason::BadArg)
+        );
+    }
+
+    // --- `raise_seg_fail` (the reason atom, branch vs raise) ---------------
+
+    /// A module whose atom table pins the reasons and the `error` class atom.
+    fn naming_module() -> Module {
+        let mut module = Module::default();
+        module.atom_table.intern("badarg");
+        module.atom_table.intern("system_limit");
+        module.atom_table.intern("error");
+        module
+    }
+
+    #[test]
+    fn seg_reason_names_and_typed_errors_match_the_oracle_atoms() {
+        assert_eq!(SegReason::BadArg.atom_name(), "badarg");
+        assert_eq!(SegReason::SystemLimit.atom_name(), "system_limit");
+        assert!(matches!(SegReason::BadArg.typed(), BeamError::BadArg));
+        assert!(matches!(
+            SegReason::SystemLimit.typed(),
+            BeamError::SystemLimit
+        ));
+        assert_eq!(BeamError::SystemLimit.as_atom(), Some("system_limit"));
+    }
+
+    #[test]
+    fn raise_seg_fail_without_a_catch_frame_is_the_typed_error() {
+        let mut machine = Machine::new();
+        let module = naming_module();
+        assert!(matches!(
+            raise_seg_fail(&mut machine, &module, SegReason::BadArg).unwrap_err(),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            raise_seg_fail(&mut machine, &module, SegReason::SystemLimit).unwrap_err(),
+            BeamError::SystemLimit
+        ));
+    }
+
+    #[test]
+    fn raise_seg_fail_lands_the_reason_atom_in_a_catch_frame() {
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("bottom frame");
+        machine
+            .push_catch_frame(crate::machine::CatchFrame::new(3, 7, 0));
+        let module = naming_module();
+        assert_eq!(
+            raise_seg_fail(&mut machine, &module, SegReason::SystemLimit).expect("lands"),
+            Step::Goto { func: 3, pc: 7 }
+        );
+        let reason = make_atom(module.atom_table.lookup("system_limit").expect("interned"));
+        assert_eq!(machine.x(1), Some(reason));
+    }
+
+    #[test]
+    fn raise_seg_fail_never_substitutes_an_atom_the_module_cannot_name() {
+        // `Module::default()` has an empty atom table: neither the reason atom nor
+        // `error` can be named, so the raise must fall back to the typed error
+        // rather than inventing a *different* atom.
+        let mut machine = Machine::new();
+        machine.push_frame(0).expect("bottom frame");
+        machine
+            .push_catch_frame(crate::machine::CatchFrame::new(3, 7, 0));
+        let module = Module::default();
+        assert!(matches!(
+            raise_seg_fail(&mut machine, &module, SegReason::SystemLimit).unwrap_err(),
+            BeamError::SystemLimit
+        ));
     }
 
     // --- `put_float` -------------------------------------------------------
