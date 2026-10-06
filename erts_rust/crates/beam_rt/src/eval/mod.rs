@@ -144,17 +144,12 @@ pub(crate) struct FunBody {
     env: Env,
 }
 
-/// The two kinds of fun this evaluator builds.
+/// The kind of fun this evaluator builds.
+///
+/// A `fun m:f/A` is **not** one of these: it is the real
+/// [`FunKind::External`](beam_codec::FunKind::External) term (see
+/// [`Evaluator::fun_ref`]), so only the local closure needs a stored body.
 enum FunKind {
-    /// `fun m:f/A` — apply `m:f` with the call's arguments.
-    Remote {
-        /// The target module.
-        module: String,
-        /// The target function.
-        function: String,
-        /// The target arity.
-        arity: u32,
-    },
     /// `fun (Params) -> Body end` — a closure over `env`.
     Local {
         /// The optional self-recursion name (`fun F(…) -> … end`).
@@ -898,8 +893,19 @@ impl Evaluator<'_, '_> {
     }
 
     /// Applies a fun value: one of this evaluator's closures, or a `.beam` fun.
+    ///
+    /// An **external** fun (`fun m:f/A`) is neither: it carries no `uniq`/`index`
+    /// descriptor — its whole identity is `module/function/arity` — so it must skip the
+    /// closure lookup (`terms::fun_uniq` rejects it with `BadArg`) and go straight to the
+    /// host's ordinary dispatch, which is what
+    /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) does for it.
     fn apply_value(&mut self, function: Eterm, args: &[Eterm]) -> EResult<Eterm> {
-        if terms::is_fun(function) {
+        if terms::is_fun(function)
+            && !matches!(
+                heap!(beam_codec::term::fun_kind_term(function)),
+                beam_codec::FunKind::External
+            )
+        {
             let uniq = heap!(terms::fun_uniq(function));
             let index = heap!(terms::fun_index(function)) as usize;
             if uniq == EVAL_FUN_UNIQ {
@@ -922,16 +928,6 @@ impl Evaluator<'_, '_> {
         args: &[Eterm],
     ) -> EResult<Eterm> {
         match &body.kind {
-            FunKind::Remote {
-                module,
-                function: name,
-                arity,
-            } => {
-                if args.len() != *arity as usize {
-                    return Err(Flow::Fatal(BeamError::BadArity));
-                }
-                self.call(module, name, args)
-            }
             FunKind::Local { name, clauses } => {
                 for clause in clauses {
                     if clause.params.len() != args.len() {
@@ -1265,16 +1261,23 @@ impl Evaluator<'_, '_> {
     }
 
     /// `fun Name/Arity` / `fun Mod:Name/Arity` — a local `fun f/A` is `erlang:f/A`.
+    ///
+    /// The result is the real [`FunKind::External`](beam_codec::FunKind::External) term
+    /// (the `EXPORT_EXT` encoding), **not** one of this evaluator's closures: `fun m:f/A`
+    /// captures no environment and its whole identity is `module/function/arity`, so the
+    /// term *is* the fun — `term_to_binary/1` encodes it as `EXPORT_EXT` and
+    /// [`RuntimeContext::apply_fun`](crate::context::RuntimeContext) applies it through the
+    /// ordinary dynamic call, exactly as the oracle does.
     fn fun_ref(&mut self, module: Option<&str>, name: &str, arity: u32) -> EResult<Eterm> {
-        let body = FunBody {
-            kind: FunKind::Remote {
-                module: module.unwrap_or("erlang").to_string(),
-                function: name.to_string(),
-                arity,
-            },
-            env: Env::new(),
-        };
-        self.register_fun(body, arity)
+        let module = self.atom(module.unwrap_or("erlang"));
+        let function = self.atom(name);
+        let heap = self.ctx.eval_heap();
+        Ok(heap!(beam_codec::term::make_fun_external(
+            heap,
+            arity as usize,
+            atom_val(module),
+            atom_val(function),
+        )))
     }
 
     /// `fun [(Name)](Params) -> Body … end`.
@@ -2096,6 +2099,35 @@ mod tests {
     }
 
     #[test]
+    fn an_exported_fun_is_the_real_export_ext_term() {
+        // `fun m:f/A` is not one of this evaluator's closures: it captures no environment,
+        // so the term **is** the fun — the real `EXPORT_EXT` encoding. `term_to_binary/1`
+        // therefore emits tag 113 + module `lists` + function `reverse` + arity 1, the
+        // differential `wire/export_ext_encode` golden (20 bytes).
+        assert_eq!(
+            bits("term_to_binary(fun lists:reverse/1)"),
+            (
+                vec![
+                    131, 113, 119, 5, 108, 105, 115, 116, 115, 119, 7, 114, 101, 118, 101, 114,
+                    115, 101, 97, 1,
+                ],
+                0,
+                20 * 8
+            )
+        );
+        // Applying it stays an ordinary dynamic call, so all three shapes work: a remote
+        // fun, the `erlang:apply/2` seam, an auto-imported `erlang` fun and the
+        // module-relative `fun Name/Arity` form.
+        assert_eq!(ints("(fun lists:reverse/1)([1,2,3])"), vec![3, 2, 1]);
+        assert_eq!(
+            ints("erlang:apply(fun lists:reverse/1, [[1,2,3]])"),
+            vec![3, 2, 1]
+        );
+        assert_eq!(ints("lists:map(fun erlang:abs/1, [-1,2])"), vec![1, 2]);
+        assert_eq!(ints("lists:map(fun length/1, [[1],[2,3]])"), vec![1, 2]);
+    }
+
+    #[test]
     fn comprehensions() {
         int("length([X * 2 || X <- [1,2,3]])", 3);
         int("lists:sum([X || X <- lists:seq(1, 5), X > 2])", 12);
@@ -2193,13 +2225,18 @@ mod tests {
 
     #[test]
     fn documented_gaps_are_typed_not_wrong() {
-        for expr in ["self() ! hello", "receive X -> X end"] {
-            let error = run(expr).expect_err(expr);
-            assert!(
-                error::unsupported_reason(&error).is_some(),
-                "{expr}: {error}"
-            );
-        }
+        // `self() ! hello` is **implemented**: the send reaches the running process's own
+        // mailbox, so the expression's value is the message term — the atom `hello`, exactly
+        // as the oracle's `self() ! hello` returns it.
+        atom("self() ! hello", "hello");
+        // A bare `receive` with nothing runnable to deliver a message is still a genuine
+        // capability gap (there is no host timer to block on in `-eval`), never a wrong
+        // result.
+        let error = run("receive X -> X end").expect_err("a bare receive is a gap");
+        assert!(
+            error::unsupported_reason(&error).is_some(),
+            "receive X -> X end: {error}"
+        );
     }
 
     /// Evaluates `expr` to a bitstring and copies out its `(bytes, offset_bits,
