@@ -487,6 +487,48 @@ fn mix(mut a: u32, mut b: u32, mut c: u32) -> u32 {
     c
 }
 
+/// [`mix`], returning the *mutated* `(a, b, c)`.
+///
+/// The C `MIX` macro (`erl_term_hashing.c:428-439`) mutates all three of its
+/// lvalues in place, and `block_hash_buffer`/`block_hash_final_bytes` keep the
+/// mutated `ctx->a`/`ctx->b` across iterations (the tail bytes are still added to
+/// them). [`mix`] can therefore not be used inside `block_hash`'s loop, which must
+/// carry `a`/`b` forward.
+#[inline]
+fn mix3(a: u32, b: u32, c: u32) -> (u32, u32, u32) {
+    let mut a = a;
+    let mut b = b;
+    let mut c = c;
+    a = a.wrapping_sub(b);
+    a = a.wrapping_sub(c);
+    a ^= c >> 13;
+    b = b.wrapping_sub(c);
+    b = b.wrapping_sub(a);
+    b ^= a << 8;
+    c = c.wrapping_sub(a);
+    c = c.wrapping_sub(b);
+    c ^= b >> 13;
+    a = a.wrapping_sub(b);
+    a = a.wrapping_sub(c);
+    a ^= c >> 12;
+    b = b.wrapping_sub(c);
+    b = b.wrapping_sub(a);
+    b ^= a << 16;
+    c = c.wrapping_sub(a);
+    c = c.wrapping_sub(b);
+    c ^= b >> 5;
+    a = a.wrapping_sub(b);
+    a = a.wrapping_sub(c);
+    a ^= c >> 3;
+    b = b.wrapping_sub(c);
+    b = b.wrapping_sub(a);
+    b ^= a << 10;
+    c = c.wrapping_sub(a);
+    c = c.wrapping_sub(b);
+    c ^= b >> 15;
+    (a, b, c)
+}
+
 /// `UINT32_HASH_2(Expr1, Expr2, AConst)` (`erl_term_hashing.c:894-900`): fold two
 /// words plus a constant into the accumulator through [`MIX`].
 #[inline]
