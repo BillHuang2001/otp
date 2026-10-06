@@ -292,7 +292,7 @@ A NIF `.so` leaves `enif_*` **undefined** and the dynamic linker binds them, at 
 - `src/driver/api.rs` → `ErlDrvApi` (`driver_*`/`erl_drv_*` function table)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
 - `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir`, `cc_available`, `compile_so`, `skip`, `TestHost`
-- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `entry.rs`, `host_seam.rs`)
+- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`) + `tests/fixtures/test_nif.c` (a real C NIF, compiled at test time with the system `cc` against the system `erl_nif.h`)
 
 ## Notes for Agents
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`,
