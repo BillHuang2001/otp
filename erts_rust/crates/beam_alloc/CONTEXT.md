@@ -257,10 +257,10 @@ count. The bit-exact *on-heap* term layout (`BinRef = [HEADER_BIN_REF, val, next
   (typically 4096) is rejected with `BeamError::BadArg`; super-aligned mappings are not implemented.
 - The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`) and the class
   count (`block::MAX_CLASS_COUNT`); a request beyond the encodable bound is rejected, never truncated.
-- The `erts_alloc`/`enif_alloc` C ABI shims (owned by `beam_abi`). The refcounted off-heap **binary**
-  object (`RefcBinary`) and the shared `RefCount` now live here; still out of scope are bit-level
-  `SubBits`/`Bitstring` handling and the on-heap `BinRef` layout (owned by `beam_term`) and the
-  generic MSO payload container (`beam_gc`).
+- This crate owns the refcounted off-heap **binary** object (`RefcBinary` in `src/binary.rs`) and the
+  shared `RefCount` (`src/refcount.rs`). Out of scope are the `erts_alloc`/`enif_alloc` C ABI shims
+  (owned by `beam_abi`), bit-level `SubBits`/`Bitstring` handling and the on-heap `BinRef` layout
+  (owned by `beam_term`), and the generic MSO payload container (`beam_gc`).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
