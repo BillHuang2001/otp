@@ -20,6 +20,7 @@
 //! `mso.rs`; `policy.rs`, `stats.rs` and the `Collector` driving logic are safe Rust.
 
 pub mod collector;
+pub mod config;
 pub mod copy;
 mod error; // pub(crate) helpers only — NOT public
 pub mod mso;
@@ -28,6 +29,7 @@ pub mod space;
 pub mod stats;
 
 pub use crate::collector::*;
+pub use crate::config::*;
 pub use crate::copy::*;
 pub use crate::mso::*;
 pub use crate::policy::*;
@@ -37,6 +39,7 @@ pub use crate::stats::*;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::collector::*;
+    pub use crate::config::*;
     pub use crate::copy::*;
     pub use crate::mso::*;
     pub use crate::policy::*;
