@@ -8,7 +8,7 @@
 //! - [`Instr::PutMapExact`] — update a map (failing on an unknown key)
 //!
 //! Map terms are read/built with the `crate::terms` map helpers
-//! (`map_entries` / `make_flatmap`); key matching uses `beam_term::cmp` (the exact
+//! (`map_entries` / `make_map`); key matching uses `beam_term::cmp` (the exact
 //! `=:=` ordering, i.e. `erts_cmp` with `exact=1`) so the engine never reimplements
 //! term ordering and maps keep their `=:=` key semantics (`1` and `1.0` are
 //! distinct keys).
@@ -16,8 +16,18 @@
 //! `map_entries` reads **both** frozen map layouts — a flat map and a hashmap
 //! (HAMT, walked node by node) — so the read instructions
 //! ([`Instr::GetMapElements`] / [`Instr::HasMapFields`]) handle a hashmap source
-//! with a plain `beam_term::cmp` scan and no hash function. *Building* a map is
-//! still flat-map-only (see the Milestone-1 limits below).
+//! with a plain `beam_term::cmp` scan and no hash function. *Building* a map goes
+//! through [`crate::terms::make_map`] (`beam_term::map::write_map`), which picks
+//! the frozen layout by size: a **flat** map at/below `MAP_SMALL_MAP_LIMIT` (32)
+//! distinct keys, a **hashmap** (HAMT) above it — exactly the oracle's choice, so a
+//! map grown past the limit by compiled code is a correct hashmap.
+//!
+//! # Why this file is long
+//!
+//! The family body is small; most of the file is a comprehensive in-module test
+//! suite covering every opcode variant, both map layouts (flat and HAMT, incl. the
+//! 32/33-key boundary), the failure paths and the dispatch contract. It stays one
+//! cohesive family module (one `exec` seam, its helpers and their tests).
 //!
 //! # Ground truth (read-only)
 //!
@@ -46,9 +56,11 @@
 //!   harmless (the clause matcher restarts at `fail`).
 //! * `HasMapFields { fail, source, keys }` — every key must be present, else jump
 //!   to `fail`. No writes.
-//! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** flat map =
+//! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** map =
 //!   `source` with each `(key, value)` inserted or overwritten, then write it to
-//!   `dst`. Maps are immutable, so the source is never mutated in place.
+//!   `dst`. Maps are immutable, so the source is never mutated in place. The result
+//!   is a flat map (≤ 32 distinct keys) or a hashmap above that, per the frozen
+//!   layout rules (see [`crate::terms::make_map`]).
 //! * `PutMapExact { fail, source, dst, live, pairs }` — as `PutMapAssoc`, but every
 //!   key must already exist; a missing key jumps to `fail` (or raises
 //!   `{badkey, Key}` when `fail` is [`NO_FAIL`], the ground-truth reason above).
@@ -59,23 +71,12 @@
 //!
 //! # Milestone-1 limits (all documented, never a wrong result)
 //!
-//! * **Construction is flat-map only.** [`Instr::PutMapAssoc`] /
-//!   [`Instr::PutMapExact`] build the updated map with `crate::terms::make_flatmap`,
-//!   which caps at 32 pairs. A map that would exceed the limit needs the **HAMT
-//!   builder** that no crate in the rewrite implements yet (`beam_term` — the
-//!   frozen-layout LCA — owns no HAMT builder, and the engine may not depend on
-//!   `beam_codec`), so the update yields a typed [`crate::error::unsupported`]
-//!   (`map > 32 pairs (no HAMT builder)`). Reading such a map is fine — only
-//!   *building* one is blocked. A source that *is* a hashmap but enumerates to at
-//!   most 32 pairs is updated into an equivalent flat map (identical map
-//!   semantics; the representation is not part of the map contract).
-//! * **Key order is not canonicalized.** [`crate::terms::map_entries`] preserves the
-//!   source's stored order and new keys are appended. ERTS keeps a flat map's keys
-//!   sorted by `erts_cmp_flatmap_keys` (atoms by their *global* atom index,
-//!   `erl_utils.h:267-272`), which the module-local atom model cannot reproduce;
-//!   the merge therefore yields the right *entries* in a possibly different byte
-//!   order. Lookups here are positional, so this only affects `term_to_binary`
-//!   byte-for-byte comparison, not map semantics.
+//! * **Atom key order follows the module-local atom table.** The frozen flat-map
+//!   key order (`erts_cmp_flatmap_keys`) sorts atoms by their *global* atom index
+//!   (`erl_utils.h:267-272`); this engine's atoms are module-local indices, so a
+//!   flat map's atom keys are sorted by *those*. Map lookups compare keys with
+//!   `beam_term::cmp`, never positionally, so this only affects `term_to_binary`
+//!   byte-for-byte comparison of atom-keyed maps, never map semantics.
 //! * A non-map `source` that the ground truth does not route to `fail` (e.g. a
 //!   `put_map_assoc` whose dropped fail label is always `NO_FAIL`) raises
 //!   `{badmap, Source}` rather than mis-reading the term.
@@ -185,7 +186,7 @@ pub(crate) fn exec(
                     None => merged.push((key, value)),
                 }
             }
-            let result = terms::make_flatmap(ctx, &merged)?;
+            let result = terms::make_map(ctx, &merged, &module.atom_table)?;
             write_operand(machine, dst, result)?;
             Ok(Some(Step::Next))
         }
@@ -215,7 +216,7 @@ pub(crate) fn exec(
                 let value = read_operand(machine, ctx, value_operand)?;
                 merged[index].1 = value;
             }
-            let result = terms::make_flatmap(ctx, &merged)?;
+            let result = terms::make_map(ctx, &merged, &module.atom_table)?;
             write_operand(machine, dst, result)?;
             Ok(Some(Step::Next))
         }
@@ -809,23 +810,168 @@ mod tests {
     }
 
     #[test]
-    fn put_map_assoc_over_the_flat_map_limit_is_unsupported() {
+    fn put_map_assoc_at_the_flat_map_limit_stays_flat() {
+        // 31 source keys plus one new key = exactly 32 distinct keys, still at the
+        // flat-map limit, so the update must stay a flat map.
         let mut fixture = Fixture::new(&[]);
-        // 32 distinct integer keys fill a flat map; a 33rd needs the HAMT builder.
-        let pairs: Vec<(Operand, Operand)> = (0..1)
-            .map(|i| (Operand::Integer(1000 + i), Operand::Integer(i)))
+        let (entry, _name) = assoc_function(
+            &mut fixture,
+            vec![(Operand::Integer(31), Operand::Integer(31))],
+        );
+        let module = fixture.finish();
+
+        let mut ctx = MinimalContext::new();
+        let source: Vec<(Eterm, Eterm)> = (0..31).map(|i| (make_small(i), make_small(i))).collect();
+        let source = terms::make_flatmap(&mut ctx, &source).unwrap();
+
+        let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+        let result = result.unwrap();
+        assert!(!terms::is_hashmap(result), "32 pairs is still a flat map");
+        assert_eq!(terms::map_entries(result).unwrap().len(), 32);
+        let entries = terms::map_entries(result).unwrap();
+        for i in 0..32i64 {
+            assert_eq!(
+                lookup(&entries, make_small(i), &module.atom_table),
+                Some(make_small(i)),
+                "key {i}"
+            );
+        }
+    }
+
+    #[test]
+    fn put_map_assoc_over_the_flat_map_limit_builds_a_hashmap() {
+        // A 32-key flat source plus a 33rd key must become a *hashmap*, exactly as
+        // the oracle builds it.
+        let mut fixture = Fixture::new(&[]);
+        let (entry, _name) = assoc_function(
+            &mut fixture,
+            vec![(Operand::Integer(1000), Operand::Integer(1000))],
+        );
+        let module = fixture.finish();
+
+        let mut ctx = MinimalContext::new();
+        let source: Vec<(Eterm, Eterm)> = (0..32).map(|i| (make_small(i), make_small(i))).collect();
+        let source = terms::make_flatmap(&mut ctx, &source).unwrap();
+
+        let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
+        let result = result.unwrap();
+        assert!(terms::is_hashmap(result), "33 pairs must build a hashmap");
+        assert_eq!(terms::map_entries(result).unwrap().len(), 33);
+        assert_eq!(
+            beam_term::map::map_size(result, &module.atom_table).unwrap(),
+            33
+        );
+        // Every key/value is retrievable through the frozen reader …
+        let entries = terms::map_entries(result).unwrap();
+        for i in 0..32i64 {
+            assert_eq!(
+                lookup(&entries, make_small(i), &module.atom_table),
+                Some(make_small(i)),
+                "key {i}"
+            );
+        }
+        assert_eq!(
+            lookup(&entries, make_small(1000), &module.atom_table),
+            Some(make_small(1000)),
+            "the key that forced the hashmap"
+        );
+        // … and through the `beam_term` HAMT lookup.
+        for i in 0..32i64 {
+            assert_eq!(
+                beam_term::map::map_get(result, make_small(i), &module.atom_table).unwrap(),
+                Some(make_small(i))
+            );
+        }
+        assert_eq!(
+            beam_term::map::map_get(result, make_small(1000), &module.atom_table).unwrap(),
+            Some(make_small(1000))
+        );
+    }
+
+    #[test]
+    fn put_map_assoc_with_33_pairs_on_an_empty_map_builds_a_hashmap() {
+        // A single `put_map_assoc` that associates 33 distinct keys: the compiled
+        // shape `#{...}#{...}` from a large map literal.
+        let mut fixture = Fixture::new(&[]);
+        let pairs: Vec<(Operand, Operand)> = (0..33i64)
+            .map(|i| (Operand::Integer(i * 7), Operand::Integer(i)))
             .collect();
         let (entry, _name) = assoc_function(&mut fixture, pairs);
         let module = fixture.finish();
 
         let mut ctx = MinimalContext::new();
-        let full: Vec<(Eterm, Eterm)> = (0..32).map(|i| (make_small(i), make_small(i))).collect();
-        let source = terms::make_flatmap(&mut ctx, &full).unwrap();
+        let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
 
-        let (result, _machine) = run(&mut ctx, &module, entry, &[source]);
-        assert!(matches!(result.unwrap_err(), BeamError::Raise(_)));
+        let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
+        let result = result.unwrap();
+        assert!(terms::is_hashmap(result));
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), 33);
+        for i in 0..33i64 {
+            assert_eq!(
+                lookup(&entries, make_small(i * 7), &module.atom_table),
+                Some(make_small(i)),
+                "key {}",
+                i * 7
+            );
+        }
     }
 
+    #[test]
+    fn put_map_assoc_growing_past_the_limit_enumerates_exactly_the_inserted_pairs() {
+        // `put_map_assoc` twice on a growing map, the second crossing the limit: the
+        // result must enumerate exactly the inserted pairs (as a set — the order is
+        // implementation-defined), matching keys with `beam_term::cmp`.
+        let mut fixture = Fixture::new(&[]);
+        let first: Vec<(Operand, Operand)> = (0..16i64)
+            .map(|i| (Operand::Integer(i), Operand::Integer(i * 2)))
+            .collect();
+        let second: Vec<(Operand, Operand)> = (16..40i64)
+            .map(|i| (Operand::Integer(i), Operand::Integer(i * 2)))
+            .collect();
+        // `f/1`: assoc 16 keys, then assoc 24 more (40 total ⇒ hashmap), return x(0).
+        let code = vec![
+            Instr::Label(Label(1)),
+            Instr::PutMapAssoc {
+                fail: NO_FAIL,
+                source: Operand::X(0),
+                dst: Operand::X(0),
+                live: 1,
+                pairs: first,
+            },
+            Instr::PutMapAssoc {
+                fail: NO_FAIL,
+                source: Operand::X(0),
+                dst: Operand::X(0),
+                live: 1,
+                pairs: second,
+            },
+            Instr::Return,
+        ];
+        let entry = fixture.add_function("f", 1, code);
+        let module = fixture.finish();
+
+        let mut ctx = MinimalContext::new();
+        let empty = terms::make_flatmap(&mut ctx, &[]).unwrap();
+        let (result, _machine) = run(&mut ctx, &module, entry, &[empty]);
+        let result = result.unwrap();
+        assert!(terms::is_hashmap(result));
+
+        let expected: Vec<(Eterm, Eterm)> = (0..40i64)
+            .map(|i| (make_small(i), make_small(i * 2)))
+            .collect();
+        let entries = terms::map_entries(result).unwrap();
+        assert_eq!(entries.len(), expected.len(), "exactly the inserted pairs");
+        // Compare as a set: every expected pair is present exactly once.
+        for (key, value) in &expected {
+            let found: Vec<&(Eterm, Eterm)> = entries
+                .iter()
+                .filter(|(candidate, _)| cmp(*candidate, *key, &module.atom_table).is_eq())
+                .collect();
+            assert_eq!(found.len(), 1, "key {key:?} appears exactly once");
+            assert!(cmp(found[0].1, *value, &module.atom_table).is_eq());
+        }
+    }
     // -- put_map_exact -------------------------------------------------------
 
     #[test]
