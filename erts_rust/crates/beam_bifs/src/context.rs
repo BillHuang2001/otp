@@ -283,7 +283,7 @@ pub trait NifLoader {
     /// # Errors
     ///
     /// A [`NifLoadError`] naming the failure; the BIF renders it as the oracle's
-    /// `{error, {Reason, Text}}` term (as an `error`-class raise — see `nif.rs`).
+    /// `{error, {Reason, Text}}` term (a normal return, not a raise — see `nif.rs`).
     fn load_nif(
         &mut self,
         module: &str,
