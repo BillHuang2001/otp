@@ -297,6 +297,33 @@ and forwards to `write_fun_external`/`write_fun_imported` (`src/term/fun.rs`).
     descriptor carries no module, no 16-byte `uniq` and no creator pid — so encoding one returns
     `error::unsupported_local_fun()` (see §Error surface), never a mis-encoded term.
 
+### Records (`RECORD_EXT` `67`)
+Native records (the OTP 29 `ErtsRecordDefinition`/`ErtsRecordInstance` terms produced by the
+`records:*` BIFs, distinct from classic tagged-tuple records) decode and encode through the
+**`beam_term::record`** layout — the term-layout owner (`../beam_term/CONTEXT.md`). Wire form
+(`external.c:4006-4036` encode, `:5257-5381` decode):
+
+```text
+[67][num_fields:4 BE][flags:1][module atom][name atom]
+[num_fields × key atom]                 # DECLARATION order
+[num_fields × value term]               # DECLARATION order
+```
+
+- `flags` is `0` (`is_exported == false`) or `1` (`true`); any other byte is `BadArg`.
+- Keys and values are both in **declaration** order. The instance/definition store keys/values in
+  ascending atom-index order, so the encoder maps declaration → sorted rank through `field_order`
+  (`erl_record.c:1072-1073`) and the decoder inverts it.
+- A duplicate key is `BadArg`; a field count whose definition arity overflows `MAX_ARITYVAL` is
+  `SystemLimit` (checked before any allocation); the record block is allocated only after every value
+  has decoded, so a malformed tail never leaves a half-built record.
+- Code: `src/term/record.rs` forwards to `beam_term::record` (`is_record`, `make_record`,
+  `record_block_words`, the `record_*` readers, `AM_TRUE`/`AM_FALSE`); `src/encode/record.rs`
+  (`Encoder::encode_record`) and `src/decode/record.rs` (`Decoder::decode_record`) are the wire halves.
+  `Encoder::encode` probes `is_record` **before** the boxed-family probes (a record header carries the
+  distinct `RECORD_SUBTAG`).
+- The cached definition `hash` (definition word 2) is `make_small(0)` — `beam_term` cannot reproduce
+  C's `make_hash2`; it is **not on the wire** (see §Known Issues).
+
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
 by `beam_term` (`src/thing.rs`, documented in `../beam_term/CONTEXT.md`); this crate's `src/term/`
