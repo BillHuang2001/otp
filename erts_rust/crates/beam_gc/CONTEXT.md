@@ -193,10 +193,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   and land the scan on a raw descriptor word (`index` for `Local`, `uniq` bytes for `Imported`),
   following it as a bogus term reference and corrupting the heap. Every fun offset/width comes from
   `beam_term::fun`; `copy.rs` defines none of its own.
-- **Only `copy.rs` has a fun-layout dependency.** `space.rs`, `collector.rs`, `policy.rs`, `stats.rs` and
-  `error.rs` deal in space geometry, collection policy, statistics and error construction and never
-  inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc comment about
-  off-heap liveness. None carries a fun-layout assumption, so only `copy.rs` needed the fix.
+- **Object sizing/walking is shared, not duplicated.** `copy.rs` exposes the word-level evacuation
+  primitives (`pub(crate)` `EvacDest`, `forward_slot`, `move_size`, `scan_step`, `for_each_ref`, `Target`)
+  and both the copying `Copier` and the mark-region `immix/` mark/evacuation phases consume them, so the
+  fun-layout sizing rules live in one place. `space.rs`, `collector.rs`, `policy.rs`, `stats.rs`,
+  `config.rs` and `error.rs` deal in space geometry, collection policy, statistics and error construction
+  and never inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc
+  comment about off-heap liveness.
 - **`xptr_tag` is not needed.** The C ORs the literal bit back in only for literal-area copies
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
