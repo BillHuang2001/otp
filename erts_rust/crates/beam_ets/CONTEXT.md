@@ -377,9 +377,14 @@ impl Table {
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
   `entries_emits_the_oracle_field_set_in_order`), `ets_nav.rs` (incl. the order-independent
-  hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 61 ETS tests + 18 select
-  tests.
+  hash-navigation contract), `ets_access.rs`, `ets_update.rs`, `ets_replace.rs` (the `select_replace`
+  semantics incl. the recorded static-vs-value key-check divergences), `ets_continuation.rs` (the
+  limit/continuation chaining, incl. a live-oracle cross-check), `match_spec_run.rs` (the
+  table-independent runner with oracle cross-checks), sharing helpers from `tests/common/mod.rs`; plus
+  `tests/select.rs` (25 tests) for the match-spec compiler + arithmetic. Per-binary counts at HEAD:
+  lib 91, `ets_replace` 40, `select` 25, `ets_update` 13, `match_spec_run` 13, `ets_basic` 12,
+  `ets_continuation` 11, `ets_info` 8, `ets_access` 7, `ets_nav` 7, `ets_bag` 6, `ets_select` 6,
+  `differential` 4, `ets_order` 2 → **245 tests, 0 failures** (with `BEAM_ETS_REQUIRE_ORACLE=1`).
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 77 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
