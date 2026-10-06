@@ -442,6 +442,14 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   the C decodes Erlang tuples in `io.c` — atom/tuple decoding of `{command, …}`/`{connect, …}` is the runtime's job.
 - **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of scope (as in
   `beam_abi`).
+- **Residual `open_port` divergences.** `open_port({spawn_executable, "/etc"}, [])` (a **directory**) opens a port
+  in the oracle (`ok`) but this crate's synchronous `Command::spawn` reports `eacces`; and
+  `open_port({spawn, ""}, [])` / `{spawn_executable, ""}` is `badarg` in the oracle (the runtime's name validation)
+  while the driver would map an empty name to `enoent`. Both are handoffs (an `access(X_OK)` precheck / `beam_rt`
+  name decoding), not yet closed.
+- **The `tcp_inet` driver is a floor.** The async-op queue, per-op `driver_set_timer` timeouts, the second-port
+  `accept`, IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` modes and DNS are absent; `recv` rejects a timeout/length
+  argument with `BadArg`. The verbs it does cover match the C's reply shapes (oracle-cross-checked).
 - **`src/port.rs` is ~1430 lines, ~590 of which are its in-module test suite** (source ≈ 845 lines, under the
   ~1000 baseline). A future split by responsibility (move `PortRegistry` + reactor glue to `registry.rs`, keeping
   `Port` in `port.rs`) is reasonable; the file is long only because the tests are comprehensive in-place.
