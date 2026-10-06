@@ -405,9 +405,14 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
   (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
-  internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
+  internal pids/ports. Funs are ordered structurally (`cmp_funs`, `src/fun.rs`): `Local` by
+  `(uniq, index)` then `num_free` then env element-wise; `External` by `(module, function, arity)`
+  and after any local kind; `Imported` by `(module, index, old_uniq)` then `num_free` then env; a
+  mixed `Local`/`Imported` pair leads with a kind rank (because the `Local` descriptor carries no
+  module — a documented deviation from the C, which leads with the entry's `module`/`old_uniq`).
+  The following classes use a **deterministic, panic-free fallback** rather than
   a structural comparison and must be extended if exact ordering is needed: external
-  pid/port/ref, funs, records and on-heap bin refs (ordered by class rank, then object
+  pid/port/ref, records and on-heap bin refs (ordered by class rank, then object
   arity, then raw term word); internal references (compared by raw payload words, not the decoded
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
