@@ -307,14 +307,21 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   proves the descriptor words are opaque**: it plants an `Imported` fun whose `uniq[0..8]` is a
   BOXED-tagged pointer into the from-space, so a scan that stepped `thing_arityval + 1` would follow that
   raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim.
-- **`immix_collector` / `any_collector` in-module tests + `tests/gen_immix_collector.rs` — the integrated
-  evidence.** The in-module tests build a graph through `young_mut()`, drive minors and majors, and check
-  the graph survives (root relocation, structure, values); they include the hard `major` cases — a
-  fullsweep-cadence major, a major that reclaims dead mature objects, a would-not-fit minor escalating to
-  a major, and a **young→mature reference surviving a major's in-place evacuation**. `tests/gen_immix_collector.rs`
-  drives the **same** corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public
-  API and asserts identical collection-kind sequences and an intact, relocated live graph for both, plus
-  that `from_config(&GcConfig::default())` selects the Copying path.
+- **`immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
+  — the integrated evidence.** The `immix/*` in-module tests cover block/line geometry, line-granular
+  allocation + hole reuse after a collection, mark/classify, `AllMarked` pinning, partial-block
+  evacuation, out-of-space-reference passthrough, and the accounting. The `immix_collector`/`any_collector`
+  in-module tests build a graph through `young_mut()`, drive minors and majors, and check the graph
+  survives (root relocation, structure, values) — including the hard major cases (fullsweep cadence, dead
+  mature objects reclaimed, a would-not-fit minor escalating to a major, a **young→mature reference
+  surviving a major's in-place evacuation**). `tests/gen_immix_collector.rs` and `tests/immix_parity.rs`
+  drive the SAME corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public API:
+  identical collection-kind sequences, an intact relocated live graph, and — in `immix_parity.rs` over the
+  full corpus (maps/funs/refc binaries) — one canonical structural walker that must agree for both.
+  `tests/immix_partial_block.rs` proves per-object reclamation and pinning (a `kept`-pinned object keeps
+  its address and a reference to it is left verbatim, not a spurious exhaustion). `tests/immix_measure.rs`
+  is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
+  select the Copying path.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
