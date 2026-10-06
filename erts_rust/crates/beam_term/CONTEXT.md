@@ -583,7 +583,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
-- **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
+- **`term_hash` is internal, not compatibility-pinned (`src/hashing/mod.rs`).** It guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
   over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
