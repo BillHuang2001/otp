@@ -100,8 +100,11 @@ is `decode`'s.
 ### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
-  `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
-  `finish_compressed(level: u8) -> Result<Vec<u8>>` (see below).
+  `with_atom_cache(&'a mut dyn AtomCacheWriter)` (installs the outbound atom cache — a cached atom is
+  then written as `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) ->
+  Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
+  `finish_compressed(level: u8) -> Result<Vec<u8>>` and `finish_local(hash: u32) -> Vec<u8>`
+  (see below).
 - `pub enum AtomEncoding { Utf8, Latin1 }` — default `Utf8`: emit `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`
   (exactly what `term_to_binary` emits). `Latin1` emits `SMALL_ATOM_EXT`/`ATOM_EXT` for nodes that did
   not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`).
