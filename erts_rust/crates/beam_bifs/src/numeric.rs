@@ -427,40 +427,58 @@ fn to_chars_general(value: f64) -> String {
 /// The shortest round-trip digits of a finite non-zero float and the decimal
 /// exponent of their leading digit (`0.1` ⇒ `("1", -1)`, `1200.0` ⇒ `("12", 3)`).
 ///
-/// Rust's `{:e}` gives the shortest digits but rounds an exact tie *up*;
-/// `std::to_chars` is Ryu-based and rounds such a tie to the **even** digit
-/// (`256317133176956.125` ⇒ `…12`, where `{:e}` says `…13`), so a tie is
-/// corrected here.
+/// Rust's `{:e}` already yields the shortest round-trip digits, so the digit
+/// *count* is right and only an exact tie can differ: it rounds such a tie
+/// *up*, while the oracle (Ryu) keeps the even candidate. A tie is therefore
+/// re-resolved here from the two candidates themselves.
 fn shortest_digits(value: f64) -> (String, i32) {
     // `{:e}` renders `d[.ddd]e<exp>` with the shortest round-trip digits.
     let rendered = format!("{value:e}");
     let (mantissa, exponent) = rendered
         .split_once('e')
         .expect("`{:e}` renders an exponent");
-    let mut digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
     let exponent = exponent.parse().expect("`{:e}` renders an integer exponent");
-    if tied_to_even(value, digits.len() as i32, exponent) {
-        // `{:e}` rounded the tie up, so its last digit is the larger of the two
-        // neighbours; the even one is kept (an already-even digit is unchanged).
-        let last = digits.pop().expect("a float has a digit");
-        let digit = last.to_digit(10).expect("a digit is decimal");
-        if digit % 2 == 1 {
-            digits.push(char::from_digit(digit - 1, 10).expect("a digit is decimal"));
-        } else {
-            digits.push(last);
-        }
+    let count = digits.len();
+    // No tie: `{:e}` rounded to the nearest of the two candidates, and so does
+    // the oracle.
+    let Some(lower_is_odd) = tie_parity(value, count as i32, exponent) else {
+        return (digits, exponent);
+    };
+    // The candidates are the two `count`-digit decimals around `value`, and
+    // `{:e}`'s digits are one of them: the lower one when it rounded down (the
+    // two then share a parity), the upper one when it rounded up.
+    let (lower, upper) = if lower_is_odd == !last_digit_is_even(&digits) {
+        (digits.clone(), neighbour(&digits, true))
+    } else {
+        (neighbour(&digits, false), digits.clone())
+    };
+    // The oracle writes the even candidate — but only while it parses back to
+    // `value`; below a power of two the lower one is outside the round-trip
+    // interval, and the upper one is then the only choice.
+    let (even, other) = if lower_is_odd {
+        (upper, lower)
+    } else {
+        (lower, upper)
+    };
+    if round_trips(value, &even, count, exponent) {
+        (even, exponent)
+    } else {
+        (other, exponent)
     }
-    (digits, exponent)
 }
 
-/// Whether `value`'s exact decimal expansion is precisely halfway between the
-/// two `digits`-long decimals around it — the case in which Ryu keeps the even
-/// last digit.
+/// The parity of the lower of the two `count`-digit decimals around `value`,
+/// when `value` sits exactly halfway between them — `None` when it does not,
+/// i.e. when there is no tie.
 ///
-/// `value` is a dyadic rational `significand / 2^scale`, and the tie means
-/// `2 * value * 10^(digits - 1 - exponent)` is an *odd* integer (Ryu's
-/// `d2d` tie test): the power of two left over must be exactly zero.
-fn tied_to_even(value: f64, digits: i32, exponent: i32) -> bool {
+/// `value` is the dyadic rational `significand / 2^scale`. A tie means
+/// `2 * value * 10^(count - 1 - exponent)` is an odd integer, which fixes the
+/// binary scale exactly (`trailing_zeros(significand) + shift == scale - 1`),
+/// and it makes the lower decimal `(odd * 5^shift - 1) / 2` with `odd` the odd
+/// part of `significand`. Since `5^shift % 4 == 1`, that lower decimal is odd
+/// exactly when `odd % 4 == 3`.
+fn tie_parity(value: f64, count: i32, exponent: i32) -> Option<bool> {
     let bits = value.to_bits();
     let biased = ((bits >> 52) & 0x7ff) as i32;
     let fraction = bits & 0x000f_ffff_ffff_ffff;
@@ -471,10 +489,59 @@ fn tied_to_even(value: f64, digits: i32, exponent: i32) -> bool {
     };
     if scale <= 0 {
         // An integral value has no fractional midpoint.
-        return false;
+        return None;
     }
-    let shift = digits - 1 - exponent;
-    shift >= 0 && significand.trailing_zeros() as i32 + shift == scale - 1
+    let shift = count - 1 - exponent;
+    if shift < 0 || significand.trailing_zeros() as i32 + shift != scale - 1 {
+        return None;
+    }
+    let odd = significand >> significand.trailing_zeros();
+    Some(odd % 4 == 3)
+}
+
+/// The `count`-digit decimal next to `digits` — its integer value `- 1`
+/// (`up == false`) or `+ 1`, with the borrow/carry propagated. A borrow out of a
+/// lone leading `1` (`100` ⇒ `099`) and a carry out of `9`s (`999` ⇒ `1000`)
+/// both stay the same decimal value under [`round_trips`], which parses the
+/// digits as a plain integer.
+fn neighbour(digits: &str, up: bool) -> String {
+    let mut bytes = digits.as_bytes().to_vec();
+    for at in (0..bytes.len()).rev() {
+        if up {
+            if bytes[at] < b'9' {
+                bytes[at] += 1;
+                return ascii(&bytes);
+            }
+            bytes[at] = b'0';
+        } else if bytes[at] > b'0' {
+            bytes[at] -= 1;
+            return ascii(&bytes);
+        } else {
+            bytes[at] = b'9';
+        }
+    }
+    if !up {
+        // Unreachable: a shortest-digit form never starts with `0`, so the
+        // borrow stops inside the string.
+        return ascii(&bytes);
+    }
+    let mut out = String::from("1");
+    out.push_str(&ascii(&bytes));
+    out
+}
+
+/// Whether the candidate `digits` of `count` digits (with the exponent of its
+/// leading digit) parses back to `value` — the oracle only writes a decimal
+/// inside `value`'s round-trip interval, and `f64::from_str` is correctly
+/// rounded, so it decides that membership exactly.
+fn round_trips(value: f64, digits: &str, count: usize, exponent: i32) -> bool {
+    let text = format!("{digits}e{}", i64::from(exponent) - (count as i64 - 1));
+    text.parse::<f64>() == Ok(value)
+}
+
+/// Whether the last decimal digit of `digits` is even.
+fn last_digit_is_even(digits: &str) -> bool {
+    matches!(digits.as_bytes().last(), Some(b'0' | b'2' | b'4' | b'6' | b'8'))
 }
 
 /// The `f` notation of `digits`/`exponent` (no sign, no trailing `.0`).
@@ -715,33 +782,151 @@ pub(crate) fn parse_float(text: &str) -> Result<f64> {
 }
 
 #[cfg(test)]
-mod tmp_tests {
-    use super::format_short;
+mod tests {
+    use super::{render_float, FloatFormat};
+
+    /// The `short` rendering of `value` — the `short` arm of [`render_float`],
+    /// which ignores the `decimals`/`compact` arguments of the other forms.
+    fn short(value: f64) -> String {
+        render_float(value, FloatFormat::Short, 20, false).expect("`short` always renders")
+    }
+
+    /// `erlang:float_to_list(F, [short])` on the system oracle (OTP 29.1.1 /
+    /// erts-17.1), each value as its IEEE-754 bit pattern. The table pins every
+    /// observable property of the form: the shortest round-trip digits, the
+    /// `f`/`e` notation switch, the mandatory `.0` of an integral significand,
+    /// the exponent spelling (`e10`, `e-5` — no `+`, no leading zero), the sign
+    /// of a negative zero, the 2^53 forced-scientific bound, and the exact-tie
+    /// rounding of `shortest_digits`.
+    const GOLDEN: &[(u64, &str)] = &[
+        (0x3ff0_0000_0000_0000, "1.0"),
+        (0xbff0_0000_0000_0000, "-1.0"),
+        (0x0000_0000_0000_0000, "0.0"),
+        (0x8000_0000_0000_0000, "-0.0"),
+        (0x4202_a05f_2000_0000, "1.0e10"),
+        (0x430c_6bf5_2634_0000, "1.0e15"),
+        (0x4341_c379_37e0_8000, "1.0e16"),
+        (0x4376_3457_85d8_a000, "1.0e17"),
+        (0x3f1a_36e2_eb1c_432d, "0.0001"),
+        (0x3ee4_f8b5_88e3_68f1, "1.0e-5"),
+        (0x3cd2_03af_9ee7_5616, "1.0e-15"),
+        (0x3c9c_d2b2_97d8_89bc, "1.0e-16"),
+        (0x3fb9_9999_9999_999a, "0.1"),
+        (0x3f1f_7510_4d55_1d69, "1.2e-4"),
+        (0x408f_4000_0000_0000, "1.0e3"),
+        (0x40f8_6a00_0000_0000, "1.0e5"),
+        (0x412e_8480_0000_0000, "1.0e6"),
+        (0x4092_c000_0000_0000, "1.2e3"),
+        (0x40c8_0600_0000_0000, "1.23e4"),
+        (0x419d_6f34_5400_0000, "123456789.0"),
+        (0x4132_d687_0000_0000, "1234567.0"),
+        (0x4132_d680_0000_0000, "1234560.0"),
+        (0x4167_8c29_c000_0000, "12345678.0"),
+        (0x4059_0000_0000_0000, "100.0"),
+        (0x3fd5_5555_5555_5555, "0.3333333333333333"),
+        (0x3fe5_5555_5555_5555, "0.6666666666666666"),
+        (0x3ff8_0000_0000_0000, "1.5"),
+        (0x4004_0000_0000_0000, "2.5"),
+        (0x3fe0_0000_0000_0000, "0.5"),
+        (0x4009_21fb_5444_2d18, "3.141592653589793"),
+        (0x7fef_ffff_ffff_ffff, "1.7976931348623157e308"),
+        (0xffef_ffff_ffff_ffff, "-1.7976931348623157e308"),
+        (0x0000_0000_0000_0001, "5.0e-324"),
+        (0x0010_0000_0000_0000, "2.2250738585072014e-308"),
+        (0x433f_ffff_ffff_ffff, "9007199254740991.0"),
+        (0x4340_0000_0000_0000, "9.007199254740992e15"),
+        (0x4340_0000_0000_0001, "9.007199254740994e15"),
+        (0x42ed_23cf_7588_0f84, "256317133176956.12"),
+        (0x4319_b79a_51d1_1385, "1809686960817377.2"),
+        (0x4301_d5e5_8fae_0be6, "627532067357052.8"),
+        (0xc31e_a6ee_a9b7_c403, "-2156948320284928.8"),
+        (0xc234_5815_9bde_fc00, "-87377157086.98438"),
+        (0x3e70_0000_0000_0000, "5.960464477539063e-8"),
+        (0xbe70_0000_0000_0000, "-5.960464477539063e-8"),
+        (0x40f0_0000_0000_0000, "65536.0"),
+        (0x40f0_0008_0000_0000, "65536.5"),
+        (0x4415_af1d_78b5_8c40, "1.0e20"),
+        (0x444b_1ae4_d6e2_ef50, "1.0e21"),
+        (0x4480_f0cf_064d_d592, "1.0e22"),
+        (0x44b5_2d02_c7e1_4af6, "1.0e23"),
+        (0x54b2_49ad_2594_c37d, "1.0e100"),
+    ];
 
     #[test]
-    fn tmp_short_golden_sweep() {
-        let Ok(path) = std::env::var("SHORT_GOLDEN") else {
-            return;
-        };
-        let text = std::fs::read_to_string(path).expect("golden file");
-        let mut checked = 0usize;
-        let mut bad = Vec::new();
-        for line in text.lines() {
-            let Some((bits, expected)) = line.split_once('|') else {
-                continue;
-            };
-            if bits.len() != 16 || !bits.bytes().all(|b| b.is_ascii_hexdigit()) {
-                continue;
-            }
-            let bits = u64::from_str_radix(bits, 16).expect("hex bits");
+    fn short_matches_the_oracle_golden_table() {
+        for &(bits, expected) in GOLDEN {
             let value = f64::from_bits(bits);
-            let got = format_short(value).expect("renders");
-            checked += 1;
-            if got != expected && bad.len() < 25 {
-                bad.push(format!("{value:?} => got {got:?} want {expected:?}"));
+            assert_eq!(short(value), expected, "{value:?}");
+        }
+    }
+
+    #[test]
+    fn short_is_the_shortest_round_trip_form() {
+        for &(bits, expected) in GOLDEN {
+            let value = f64::from_bits(bits);
+            assert_eq!(
+                expected.parse::<f64>().expect("a decimal"),
+                value,
+                "{expected} must parse back to {value:?}"
+            );
+        }
+    }
+
+    /// The verification the objective names: `float_to_list(1.0e10, [short])`
+    /// is exactly `"1.0e10"` — the notation is the *shorter* one after the
+    /// oracle's `.0` corrections, and the exponent carries neither a `+` nor a
+    /// leading zero.
+    #[test]
+    fn short_notation_and_exponent_spelling_match_the_oracle() {
+        assert_eq!(short(1.0e10), "1.0e10");
+        for value in [
+            1.0e3, 1.0e5, 1.0e10, 1.0e15, 1.0e-5, 1.0e-15, 1.0e100, 5.0e-324,
+        ] {
+            let rendered = short(value);
+            assert!(!rendered.contains('+'), "{rendered}");
+            if let Some((_, exponent)) = rendered.split_once('e') {
+                assert!(
+                    !exponent.starts_with('0') && !exponent.starts_with("-0"),
+                    "{rendered}"
+                );
             }
         }
-        eprintln!("checked {checked}");
-        assert!(bad.is_empty(), "{bad:#?}");
+        // The switch is on length, not on `%g`'s `-4..=precision` rule: `1.0e3`
+        // beats `1000`, but `1234567.0` stays fixed.
+        assert_eq!(short(1000.0), "1.0e3");
+        assert_eq!(short(1200.0), "1.2e3");
+        assert_eq!(short(12300.0), "1.23e4");
+        assert_eq!(short(123456.0), "123456.0");
+        assert_eq!(short(100000.0), "1.0e5");
+        assert_eq!(short(1234560.0), "1234560.0");
+        assert_eq!(short(1.0e-4), "0.0001");
+        assert_eq!(short(0.00012), "1.2e-4");
+        // An integral significand always keeps the decimal point.
+        assert_eq!(short(1.0), "1.0");
+        assert_eq!(short(0.0), "0.0");
+        assert_eq!(short(-0.0), "-0.0");
+    }
+
+    /// An exact decimal midpoint is resolved to the *even* candidate (`…125` ⇒
+    /// `…12`, where Rust's `{:e}` rounds up to `…13`) — but only while that
+    /// candidate is inside the round-trip interval. Just below a power of two the
+    /// lower candidate is not, so `2^-24` keeps the upper `…063`.
+    #[test]
+    fn short_resolves_exact_midpoints_like_the_oracle() {
+        assert_eq!(short(256317133176956.125), "256317133176956.12");
+        assert_eq!(short(627532067357052.75), "627532067357052.8");
+        assert_eq!(short(-2156948320284928.75), "-2156948320284928.8");
+        assert_eq!(short(1809686960817377.25), "1809686960817377.2");
+        assert_eq!(short(2f64.powi(-24)), "5.960464477539063e-8");
+        assert_eq!(short(-2f64.powi(-24)), "-5.960464477539063e-8");
+    }
+
+    /// At and above `2^53` the fixed form is forced to the scientific one (the
+    /// `MAX_FLOAT` bound `sys_double_to_chars_fast` shares).
+    #[test]
+    fn short_forces_scientific_at_two_pow_53() {
+        assert_eq!(short(9_007_199_254_740_991.0), "9007199254740991.0");
+        assert_eq!(short(9_007_199_254_740_992.0), "9.007199254740992e15");
+        assert_eq!(short(9_007_199_254_740_994.0), "9.007199254740994e15");
     }
 }
