@@ -482,7 +482,7 @@ fn nearest_line(module: &Module, func: u32, pc: u32) -> Option<LineEntry> {
 mod tests {
     use super::*;
     use crate::context::MinimalContext;
-    use beam_common::BeamError;
+    use beam_common::{BeamError, ExitReason};
     use beam_loader::{Function, HeapNeed};
     use beam_term::{cmp, make_small};
 
@@ -748,6 +748,88 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)));
         assert_eq!(machine.pending_exception(), None);
+    }
+
+    #[test]
+    fn an_uncaught_structured_raise_carries_its_live_reason_term() {
+        // An **uncaught** structured raise: `throw_with_trace` keeps the reason
+        // term-independently (`ExitReason::Structured`, so `as_atom()` stays `None`)
+        // but rides the live reason term out of the machine in the raise's
+        // `live_reason` slot, so a caller with a term representation recovers the
+        // exact compound reason.
+        for (instr, tag, value) in [
+            (
+                Instr::Badmatch {
+                    value: Operand::Integer(7),
+                },
+                "badmatch",
+                make_small(7),
+            ),
+            (
+                Instr::CaseEnd {
+                    value: Operand::Integer(2),
+                },
+                "case_clause",
+                make_small(2),
+            ),
+        ] {
+            let module = Fixture::new(&[tag]).finish();
+            let mut machine = Machine::new();
+            machine.push_frame(0).unwrap();
+            let mut ctx = MinimalContext::new();
+            let err = exec_one(&module, &instr, &mut machine, &mut ctx).unwrap_err();
+
+            let raise = match err {
+                BeamError::Raise(raise) => raise,
+                other => panic!("expected a typed raise, got {other:?}"),
+            };
+            assert_eq!(raise.reason, ExitReason::Structured);
+            assert_eq!(raise.reason.as_atom(), None);
+            let live = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied()
+                .expect("the live reason term rides along");
+            // The recovered term is exactly the `{Tag,Value}` the machine recorded as
+            // its pending exception — the term `erl` prints for the same raise.
+            assert_eq!(
+                machine.pending_exception().map(|(_, reason)| reason),
+                Some(live)
+            );
+            assert_reason_tuple(&mut ctx, &module, live, tag, value);
+        }
+    }
+
+    #[test]
+    fn a_caught_structured_raise_still_lands_in_the_handler() {
+        // Regression guard: a **live** catch frame is unchanged — the raise unwinds
+        // to the handler (`Step::Goto`) with `x(1)` = the expanded reason term, and
+        // no error escapes.
+        let module = Fixture::new(&["badmatch", "error"]).finish();
+        let mut machine = Machine::new();
+        machine.push_frame(0).unwrap();
+        machine.push_catch_frame(CatchFrame::new(3, 7, 0));
+        let mut ctx = MinimalContext::new();
+        let step = exec_one(
+            &module,
+            &Instr::Badmatch {
+                value: Operand::Integer(7),
+            },
+            &mut machine,
+            &mut ctx,
+        )
+        .expect("a live frame catches the raise")
+        .expect("the badmatch family claims the instruction");
+
+        assert_eq!(step, Step::Goto { func: 3, pc: 7 });
+        assert_eq!(machine.x(0), Some(Eterm::non_value()));
+        let reason = machine.x(1).expect("x(1) holds the landed reason");
+        assert_reason_tuple(&mut ctx, &module, reason, "badmatch", make_small(7));
+        assert_eq!(
+            machine.catch_frame_depth(),
+            1,
+            "the handler opcode pops the frame, not the raise"
+        );
     }
 
     // ------------------------------------------------------------------

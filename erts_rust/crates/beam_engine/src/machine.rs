@@ -11,7 +11,7 @@
 //! primitives here (`set_x`/`y`/`push_frame`/`pop_frame`/`pop_frame_checked`/
 //! `trim`/`continuation`) are its building blocks.
 
-use beam_common::{BeamError, ExceptionClass, ExitReason, Raise, Result};
+use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise, Result};
 use beam_loader::{Atom, Label, Module, SharedLiteralArea};
 use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 
@@ -793,10 +793,8 @@ impl Machine {
     /// A raise is *not* a bare `BeamError` — it is a control-flow decision:
     ///
     /// 1. The pending exception `(class, reason)` is recorded on the machine
-    ///    ([`Machine::pending_exception`]). `beam_common::BeamError` cannot carry a
-    ///    *compound* (tuple) reason — its [`ExitReason::Structured`] variant holds no
-    ///    term — so this field is where the live reason survives; it is also the
-    ///    class a later `raise` opcode re-raises with ([`Machine::pending_class`]).
+    ///    ([`Machine::pending_exception`]); it is also the class a later `raise`
+    ///    opcode re-raises with ([`Machine::pending_class`]).
     /// 2. If a catch frame is live ([`Machine::catch_frame_depth`] `> 0`) the
     ///    **innermost** one is consulted: the call-frame stack is unwound to
     ///    [`CatchFrame::frame_index`], the exception is landed in the handler
@@ -805,7 +803,11 @@ impl Machine {
     ///    **not** popped — the handler opcode that runs next pops it (see
     ///    [`CatchFrame`]).
     /// 3. If no catch frame is live the result is the typed
-    ///    `Err(BeamError::Raise(..))` the run propagates — **never a panic**.
+    ///    `Err(BeamError::Raise(..))` the run propagates — **never a panic**. The
+    ///    live reason *term* rides out of the machine in that raise's
+    ///    [`Raise::live_reason`] slot ([`LiveReason::new`], payload [`Eterm`]) while
+    ///    [`ExitReason::Structured`] keeps [`BeamError::as_atom`] answering `None`,
+    ///    so a caller with a term representation can recover the compound reason.
     ///
     /// A family body typically ends with `machine.throw(class, reason).map(Some)`
     /// (or, for a `{badmatch,V}`-style raise, [`Machine::throw_error`]).
@@ -818,7 +820,15 @@ impl Machine {
         self.pending_exception = Some((class, reason));
         let frame = match self.catch_frames.last() {
             Some(frame) => *frame,
-            None => return Err(BeamError::Raise(Raise::new(class, ExitReason::Structured))),
+            // An uncaught structured raise carries its live reason term out of the
+            // machine in the raise's `live_reason` slot; `ExitReason::Structured`
+            // keeps `as_atom()` at `None`.
+            None => {
+                return Err(BeamError::Raise(
+                    Raise::new(class, ExitReason::Structured)
+                        .with_live_reason(LiveReason::new(reason)),
+                ))
+            }
         };
         // The class atom is only needed when the raise actually lands; a missing
         // atom (absent from the module's atom table) is a typed error, and an

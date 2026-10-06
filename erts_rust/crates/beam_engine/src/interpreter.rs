@@ -456,7 +456,7 @@ impl Machine {
     /// single equivalent entry point is [`Machine::throw_error`].
     ///
     /// * **No live catch frame** ([`Machine::catch_frame_depth`] `== 0`) ⇒ the error
-    ///   propagates unchanged.
+    ///   propagates unchanged (unless it carries a live reason term — see below).
     /// * **A live catch frame** ⇒ the error's BEAM atom name
     ///   ([`BeamError::as_atom`]: `badarg`/`badarith`/`badarity`/`badmatch`/
     ///   `system_limit`/`out_of_memory`) is resolved in the running module's atom
@@ -464,19 +464,45 @@ impl Machine {
     ///   every BIF failure carries (`BADARG`/`BADARITH`/… are `EXTAG_ERROR`
     ///   reasons), which is what the handler's `catch error:Reason` clause sees.
     /// * An error the engine cannot name as a term propagates unchanged instead: a
-    ///   [`BeamError::Raise`] (its class/reason are carried term-independently and
-    ///   the reason may be [`beam_common::ExitReason::Structured`]), a variant with
-    ///   no BEAM atom ([`BeamError::TermNotFound`], [`BeamError::Io`]), or an atom
-    ///   the running module's atom table does not hold. Substituting a *different*
-    ///   atom would be a wrong result, so the caller's typed error is preferred —
-    ///   a documented Milestone-1 limit (the [`Module`] reaches the interpreter
-    ///   read-only, so a name the compiler never emitted cannot be interned here,
-    ///   unlike the C runtime's global atom table).
+    ///   [`BeamError::Raise`] **without** a live reason slot (its class/reason are
+    ///   carried term-independently and the reason may be
+    ///   [`beam_common::ExitReason::Structured`]), a variant with no BEAM atom
+    ///   ([`BeamError::TermNotFound`], [`BeamError::Io`]), or an atom the running
+    ///   module's atom table does not hold. Substituting a *different* atom would be
+    ///   a wrong result, so the caller's typed error is preferred — a documented
+    ///   Milestone-1 limit (the [`Module`] reaches the interpreter read-only, so a
+    ///   name the compiler never emitted cannot be interned here, unlike the C
+    ///   runtime's global atom table).
+    ///
+    /// A [`BeamError::Raise`] that **does** carry a live reason term
+    /// ([`beam_common::Raise::live_reason`], payload [`Eterm`]) is an exception
+    /// whose reason is a compound term — the shape [`beam_bifs`]-backed BIFs raise
+    /// (e.g. `{badmap,M}`/`{badkey,K}`/`{bad_generator,G}`). It is raised through
+    /// the one uniform entry point [`Machine::throw_with_trace`], exactly like an
+    /// instruction-level raise: with a live catch frame it lands in the handler
+    /// (`x(1) = reason`), and with none it propagates the term-carrying
+    /// `Err(BeamError::Raise(..))`. This reproduces C, where `handle_error` always
+    /// runs `next_catch` regardless of the reason's shape.
     ///
     /// Shared with the instruction families (e.g. `families::receive`'s `send`,
     /// which carries no fail label either), so the landing convention stays defined
     /// in exactly one place.
     pub(crate) fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
+        // A raise whose reason is a compound term lands (or propagates) with the
+        // term, mirroring C's `handle_error` → `next_catch` for every reason shape.
+        if let BeamError::Raise(raise) = &error {
+            if let Some(reason) = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+            {
+                let class = raise.class;
+                let reason = *reason;
+                if let Some(class_atom) = module.atom_table.lookup(class.as_str()) {
+                    self.set_class_atom(class, make_atom(class_atom));
+                }
+                return self.throw_with_trace(class, reason, NIL);
+            }
+        }
         if self.catch_frame_depth() == 0 || matches!(&error, BeamError::Raise(_)) {
             return Err(error);
         }

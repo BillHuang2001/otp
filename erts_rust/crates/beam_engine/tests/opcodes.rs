@@ -13,14 +13,14 @@
 use std::collections::BTreeMap;
 use std::sync::Arc;
 
-use beam_common::{BeamError, ExceptionClass};
-use beam_engine::{Machine, MinimalContext};
+use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise};
+use beam_engine::{terms, Machine, MinimalContext};
 use beam_loader::{
     Export, Function, HeapNeed, Import, ImportRef, Instr, Label, LiteralArea, Module, Opcode,
     Operand, TestKind, NO_FAIL,
 };
 use beam_term::{
-    is_small, make_arityval, make_atom, make_boxed, make_header, make_internal_pid,
+    cmp, is_small, make_arityval, make_atom, make_boxed, make_header, make_internal_pid,
     make_internal_port, make_pid_data, make_port_data, make_small, make_tuple, signed_value, Atom,
     Eterm, HEADER_FLONUM, HEAP_BITS_SUBTAG, MAP_SUBTAG, NIL, RECORD_SUBTAG, REF_SUBTAG,
 };
@@ -1899,7 +1899,263 @@ fn badarith(module: &Module) -> Eterm {
     )
 }
 
+// ---------------------------------------------------------------------------
+// BIF raises that carry a live reason *term* (`Raise::live_reason`)
+// ---------------------------------------------------------------------------
+//
+// `beam_bifs` raises a non-atom reason as `Err(BeamError::Raise(r))` with
+// `r.reason == ExitReason::Structured` and the reason term in the raise's
+// `live_reason` slot (`{badmap,M}`/`{badkey,K}`/`{bad_generator,G}`, `erlang:error/1`,
+// …). The engine's contract is: such a raise lands in a live catch frame, or
+// propagates carrying the same term — exactly like an instruction-level raise.
+
+/// Build the `{Tag, Element}` structured reason of `module` on `arena`'s heap.
+///
+/// `arena` is a context that must outlive the run: the term the caller compares
+/// against lives on it (the run's own context never allocates it).
+fn structured_reason(
+    arena: &mut MinimalContext,
+    module: &Module,
+    tag: &str,
+    elem: Eterm,
+) -> Eterm {
+    let tag = make_atom(module.atom_table.lookup(tag).expect("tag atom interned"));
+    terms::make_tuple(arena, &[tag, elem]).expect("build the reason tuple")
+}
+
+/// A BIF hook raising `term` as the live reason of an `error`-class
+/// `ExitReason::Structured` raise — the shape `beam_bifs`'s `raise_error_term`
+/// produces.
+fn term_raise_hook(
+    term: Eterm,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static {
+    move |_module, _function, _arity, _args| {
+        Err(BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(term)),
+        ))
+    }
+}
+
+/// Assert `result` is a structured raise whose live reason term structurally equals
+/// `expected`, and that its term-independent parts are unchanged (`reason` is
+/// `ExitReason::Structured`, so `as_atom()` stays `None`).
+fn assert_live_reason_raise(result: Result<Eterm, BeamError>, module: &Module, expected: Eterm) {
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.reason, ExitReason::Structured);
+            assert_eq!(raise.reason.as_atom(), None);
+            let live = raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied()
+                .expect("the live reason term rides along");
+            assert!(
+                cmp(live, expected, &module.atom_table).is_eq(),
+                "the recovered term does not equal the raised reason"
+            );
+        }
+        other => panic!("expected a live-reason structured raise, got {other:?}"),
+    }
+}
+
 #[test]
+fn a_bif_raise_carrying_a_term_propagates_it_uncaught() {
+    // No live catch frame: the term-carrying BIF raise propagates unchanged (as a
+    // term-carrying `Raise`), matching C's `handle_error` reaching no `next_catch`.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badmap", "error"],
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GcBif {
+                arity: 0,
+                bif: ImportRef(0),
+                fail: NO_FAIL,
+                live: 0,
+                args: Vec::new(),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    );
+    let mut arena = MinimalContext::new();
+    let expected = structured_reason(&mut arena, &module, "badmap", make_small(0));
+
+    let (result, machine) = run_hooked(&module, entry, &[], term_raise_hook(expected));
+    assert_eq!(machine.catch_frame_depth(), 0);
+    assert_live_reason_raise(result, &module, expected);
+}
+
+#[test]
+fn a_bif_raise_carrying_a_term_lands_in_a_live_catch_frame() {
+    // The same raise inside a live `try`: it must land in the handler with
+    // `x(1)` = the reason term (instead of escaping) — C runs `next_catch` for every
+    // reason shape.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badmap", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+    let mut arena = MinimalContext::new();
+    let expected = structured_reason(&mut arena, &module, "badmap", make_small(0));
+
+    let (result, machine) = run_hooked(&module, entry, &[], term_raise_hook(expected));
+    let value = result.expect("the term-carrying raise must land in the handler");
+    assert!(
+        cmp(value, expected, &module.atom_table).is_eq(),
+        "the handler returned the live reason term"
+    );
+    assert_eq!(
+        machine.x(1).map(|reason| cmp(reason, expected, &module.atom_table).is_eq()),
+        Some(true),
+        "x(1) holds the landed reason term"
+    );
+    assert_eq!(
+        machine.pending_exception().map(|(class, _)| class),
+        Some(ExceptionClass::Error)
+    );
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "the handler opcode pops the frame, not the raise"
+    );
+}
+
+#[test]
+fn a_raising_call_ext_carrying_a_term_lands_in_a_live_catch_frame() {
+    // `call_ext` is the other BIF entry (`beam_rt`'s `code:*`/`erlang:apply/3`
+    // route through it); it shares `raise_bif_error`.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 1)],
+        &["badkey", "error"],
+        try_wrapped(vec![Instr::CallExt {
+            arity: 1,
+            target: ImportRef(0),
+        }]),
+    );
+    let mut arena = MinimalContext::new();
+    let expected = structured_reason(&mut arena, &module, "badkey", make_small(9));
+
+    let (result, machine) = run_hooked(&module, entry, &[make_small(1)], term_raise_hook(expected));
+    let value = result.expect("the term-carrying raise must land in the handler");
+    assert!(cmp(value, expected, &module.atom_table).is_eq());
+    assert_eq!(
+        machine.x(1).map(|reason| cmp(reason, expected, &module.atom_table).is_eq()),
+        Some(true)
+    );
+}
+
+#[test]
+fn a_bif_raise_pins_the_badmap_badkey_and_bad_generator_terms() {
+    // `{badmap,M}`/`{badkey,K}`/`{bad_generator,G}` arrive via BIF raises (the
+    // sibling `beam_bifs` crate constructs the terms); the engine pins that a
+    // term-carrying raise propagates with *that* term for each tag.
+    for tag in ["badmap", "badkey", "bad_generator"] {
+        let (module, entry) = module_with(
+            &[("erlang", "boom", 0)],
+            &[tag, "error"],
+            vec![
+                Instr::Label(Label(1)),
+                Instr::GcBif {
+                    arity: 0,
+                    bif: ImportRef(0),
+                    fail: NO_FAIL,
+                    live: 0,
+                    args: Vec::new(),
+                    dst: Operand::X(0),
+                },
+                Instr::Return,
+            ],
+        );
+        let mut arena = MinimalContext::new();
+        let expected = structured_reason(&mut arena, &module, tag, make_small(1));
+        let (result, _machine) = run_hooked(&module, entry, &[], term_raise_hook(expected));
+        assert_live_reason_raise(result, &module, expected);
+    }
+}
+
+#[test]
+fn a_raise_without_a_live_reason_slot_still_propagates_unchanged() {
+    // Regression guard: an atom-reason `Raise` (no `live_reason` slot) is NOT
+    // recovered, so it propagates unchanged even with a live catch frame — the
+    // engine does not broaden beyond the live-term case.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["badarith", "error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+    let atom_raise = |_module: &str, _function: &str, _arity: u32, _args: &[Eterm]| {
+        Err(BeamError::Raise(Raise::error(ExitReason::atom(
+            "badarith",
+        ))))
+    };
+
+    let (result, machine) = run_hooked(&module, entry, &[], atom_raise);
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.reason.as_atom(), Some("badarith"));
+            assert!(raise.live_reason().is_none());
+        }
+        other => panic!("expected the raise to propagate unchanged, got {other:?}"),
+    }
+    assert_eq!(
+        machine.catch_frame_depth(),
+        1,
+        "the handler was never entered"
+    );
+}
+
+#[test]
+fn a_raise_whose_live_slot_is_not_a_term_still_propagates() {
+    // A foreign payload in the `live_reason` slot (not an `Eterm`) cannot be
+    // recovered as a reason term, so the raise propagates unchanged — never a panic,
+    // never a wrong landing.
+    let (module, entry) = module_with(
+        &[("erlang", "boom", 0)],
+        &["error"],
+        try_wrapped(vec![Instr::GcBif {
+            arity: 0,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 0,
+            args: Vec::new(),
+            dst: Operand::X(0),
+        }]),
+    );
+    let foreign = |_module: &str, _function: &str, _arity: u32, _args: &[Eterm]| {
+        Err(BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(7u64)),
+        ))
+    };
+
+    let (result, machine) = run_hooked(&module, entry, &[], foreign);
+    match result {
+        Err(BeamError::Raise(raise)) => {
+            assert_eq!(raise.reason, ExitReason::Structured);
+            assert!(raise.live_reason().is_some());
+            assert!(raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .is_none());
+        }
+        other => panic!("expected the raise to propagate unchanged, got {other:?}"),
+    }
+    assert_eq!(machine.catch_frame_depth(), 1);
+}#[test]
 fn a_raising_gc_bif_without_a_fail_label_lands_in_a_live_catch_frame() {
     // f() -> try erlang:boom() catch _ -> Reason end.
     // `gc_bif0 erlang:boom` with NO fail label: `badarith` must land at `Label(3)`.

@@ -17,7 +17,7 @@
 
 use std::collections::BTreeMap;
 
-use beam_common::{BeamError, ExceptionClass};
+use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{
     load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
@@ -283,6 +283,48 @@ fn raw_raises_propagate_as_typed_errors_with_the_live_reason() {
     assert!(matches!(result, Err(BeamError::Raise(_))));
     let (_, reason) = machine.pending_exception().expect("reason recorded");
     assert_eq!(reason, atom_term(&module, "if_clause"));
+}
+
+#[test]
+fn an_uncaught_raise_carries_the_reason_term_on_the_propagated_error() {
+    // The end-to-end (compiled-fixture) form of `throw_with_trace`'s live-reason
+    // contract: the `{case_clause,2}` / `{badmatch,no}` term the machine records as
+    // its pending exception also rides out of `run_export` in the propagated
+    // `BeamError::Raise`'s `live_reason` slot — the same reason the system `erl`
+    // prints for `exceptions:case_clause_raw(2)` / `exceptions:badmatch_raw(no)`
+    // (`erl -noshell -eval 'try exceptions:case_clause_raw(2) of _ -> ok catch
+    // C:R -> io:format("~p~n",[{C,R}]) end, halt().'` ⇒ `{error,{case_clause,2}}`).
+    let module = module();
+    let mut ctx = MinimalContext::new();
+
+    for (name, arg, tag) in [
+        ("case_clause_raw", make_small(2), "case_clause"),
+        ("badmatch_raw", atom_term(&module, "no"), "badmatch"),
+    ] {
+        let (result, machine) = run(&module, name, &[arg], &mut ctx);
+        let raise = match result {
+            Err(BeamError::Raise(raise)) => raise,
+            other => panic!("{name} must propagate a raise, got {other:?}"),
+        };
+        assert_eq!(raise.reason, ExitReason::Structured);
+        assert_eq!(raise.reason.as_atom(), None);
+        let live = raise
+            .live_reason()
+            .and_then(|live| live.downcast_ref::<Eterm>())
+            .copied()
+            .expect("the propagated raise carries the live reason term");
+        // The propagated term is exactly the machine's pending-exception reason …
+        assert_eq!(
+            machine.pending_exception().map(|(_, reason)| reason),
+            Some(live)
+        );
+        // … and it structurally equals the oracle's `{Tag,Value}`.
+        let expected = terms::make_tuple(&mut ctx, &[atom_term(&module, tag), arg]).unwrap();
+        assert!(
+            cmp(live, expected, &module.atom_table).is_eq(),
+            "{name}'s live reason must be {{{tag}, Value}}"
+        );
+    }
 }
 
 // ---------------------------------------------------------------------------
