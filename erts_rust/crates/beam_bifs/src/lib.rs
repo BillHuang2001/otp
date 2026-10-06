@@ -27,7 +27,7 @@
 //!   the public `error`/`exit`/`throw` raise builders.
 //! * `access` — the crate's **only** `unsafe` module: safe wrappers over
 //!   `beam_term`'s raw (header-dereferencing) term accessors.
-//! * the BIF modules (`arith`, `compare`, `type_test`, `term_ops`, `proc`,
+//! * the BIF modules (`arith`, `bool`, `compare`, `type_test`, `term_ops`, `proc`,
 //!   `port`, `reason`, `io`) — the Milestone-1 core BIF list, each registering its
 //!   implementations through its own `register` entry point.
 //! * [`ets`] — the [`TableRegistry`] bridge over `beam_ets::Table`; the table handle
@@ -40,6 +40,7 @@ mod arith;
 mod binary;
 mod binconv;
 mod bits;
+mod bool;
 mod compare;
 mod context;
 mod convert;

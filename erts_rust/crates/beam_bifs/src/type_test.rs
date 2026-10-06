@@ -3,10 +3,12 @@
 //! Ground truth (read-only): the `ubif erlang:is_*` roster in
 //! `../../erts/emulator/beam/bif.tab` (lines 331–344: `is_atom`, `is_list`,
 //! `is_tuple`, `is_float`, `is_integer`, `is_number`, `is_pid`, `is_port`,
-//! `is_reference`, `is_binary`, `is_function`) plus `is_bitstring`/`is_map`/
-//! `is_boolean`, and the implementations in
-//! `../../erts/emulator/beam/erl_bif_guard.c`. Every BIF here has arity 1 and
-//! returns a boolean.
+//! `is_reference`, `is_binary`, `is_function/1,2`, `is_record/2,3`, plus
+//! `is_record/1` at line 852) and the implementations in
+//! `../../erts/emulator/beam/erl_bif_op.c` (`is_function_2` line 232 /
+//! `erl_is_function` line 237, `is_record_1` line 279, `is_record_2` line 293,
+//! `is_record_3` line 325). The `is_*`/1 tests return a boolean and never fail;
+//! `is_function/2` and `is_record/2,3` have `badarg` cases (below).
 //!
 //! # Two rules the naive wrappers get wrong
 //!
@@ -19,12 +21,33 @@
 //! `is_binary/1` is a subset of `is_bitstring/1` (a bitstring whose size is a
 //! whole number of bytes), so `is_bitstring` delegates to the `beam_term`
 //! predicate directly and `is_binary` likewise.
+//!
+//! # The record tests (oracle-verified, OTP 29 / erts-17.1)
+//!
+//! * `is_record/1` is the **native-record** test (`RECORD_SUBTAG`), *not* a tuple
+//!   test: `erlang:is_record({a,b})` is `false`.
+//! * `is_record(Term, Tag)` is true iff `Tag` is an atom **and** `Term` is a tuple
+//!   of arity ≥ 1 whose first element is `Tag`. The `arity >= 1` guard is what
+//!   makes `erlang:is_record({}, a)` `false`; a non-atom `Tag` is `badarg`
+//!   (`erlang:is_record({a,b}, 1)` ⇒ `error:badarg`).
+//! * `is_record(Term, Tag, Size)`: for a small-integer `Size` the same test with
+//!   the *exact* tuple arity `Size` (so `erlang:is_record({}, a, 0)` is `false`,
+//!   while `erlang:is_record({a}, a, 1)` is `true`); for an atom `Size` it is the
+//!   native-record form.
+//!
+//! The native-record half of `is_record/2,3` (comparing `Tag`/`Size` against an
+//! `ErlRecordDefinition`) is a **documented Milestone-1 gap**: the record's
+//! name/size is not readable through this crate's safe term access, so a term that
+//! *is* a native record raises `error:unsupported_bif` rather than answering with a
+//! possibly wrong boolean (see the crate `CONTEXT.md`, Known Issues). No crate in
+//! the workspace can build a native record yet, so the branch is unreachable today.
 
 use beam_common::Result;
-use beam_term::{atom_val, Eterm};
+use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
+use crate::error;
 use crate::registry::BifRegistry;
 
 /// `erlang:is_atom/1`.
@@ -101,6 +124,108 @@ fn is_function(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.boolean(access::is_function(args[0]))
 }
 
+/// `erlang:is_function/2` — a fun whose arity is exactly the second argument.
+///
+/// `erl_is_function` (`erl_bif_op.c:237-267`): the arity argument must be a
+/// non-negative small integer, or a **positive** bignum; everything else —
+/// including a negative bignum, a float, an atom or a list — is `badarg`. A
+/// positive bignum is a valid arity no fun can have, so it answers `false` (the
+/// oracle: `erlang:is_function(fun() -> ok end, 1 bsl 64)` is `false`).
+fn is_function_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let arity_term = args[1];
+    if access::is_small(arity_term) {
+        let arity = signed_value(arity_term);
+        if arity < 0 {
+            return Err(error::badarg());
+        }
+        // A fun's arity fits 8 bits (`erl_term.h:403`), so an arity that does not
+        // fit a `u32` cannot match — and must not be truncated into one that does.
+        let matches = match u32::try_from(arity) {
+            Ok(wanted) => access::fun_arity(args[0]) == Some(wanted),
+            Err(_) => false,
+        };
+        return ctx.boolean(matches);
+    }
+    if access::is_big(arity_term) {
+        // The sign lives in the bignum header (`_BIG_SIGN_BIT`, `erl_term.h`).
+        let (negative, _) = beam_codec::term::big_parts(arity_term)?;
+        if negative {
+            return Err(error::badarg());
+        }
+        return ctx.boolean(false);
+    }
+    Err(error::badarg())
+}
+
+/// `erlang:is_record/1` — a native record (`RECORD_SUBTAG`), not a tuple.
+///
+/// `is_record_1` (`erl_bif_op.c:279-285`). Milestone-1 builds no native record, so
+/// this is `false` for every term this crate can construct — the same answer the
+/// oracle gives for `erlang:is_record({a,b})`.
+fn is_record_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    ctx.boolean(access::is_record(args[0]))
+}
+
+/// `erlang:is_record/2` — `Term` is a tuple of arity ≥ 1 whose first element is the
+/// atom `Tag`.
+///
+/// `is_record_2` (`erl_bif_op.c:293-315`). A non-atom `Tag` is `badarg`; a term
+/// that is not such a tuple is `false` — including the empty tuple `{}`, which is
+/// why the `arity >= 1` guard is present (`tuple_element(term, 0)` would otherwise
+/// read past a 0-arity tuple).
+fn is_record_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (term, tag) = (args[0], args[1]);
+    if !access::is_atom(tag) {
+        return Err(error::badarg());
+    }
+    if access::is_tuple(term)
+        && access::tuple_size(term) >= 1
+        && access::tuple_element(term, 0) == tag
+    {
+        return ctx.boolean(true);
+    }
+    if access::is_record(term) {
+        // A native record: the oracle compares `RECORD_DEF_P(...)->name` with `Tag`,
+        // which this crate cannot read — a typed error, never a wrong boolean.
+        return Err(error::unsupported_bif());
+    }
+    ctx.boolean(false)
+}
+
+/// `erlang:is_record/3` — `is_record/2` with an explicit size.
+///
+/// `is_record_3` (`erl_bif_op.c:325-350`): a non-atom `Tag` is `badarg`; an atom
+/// `Size` selects the native-record form (an atom tag/name pair); a small-integer
+/// `Size` selects the tuple form, which additionally requires the tuple's arity to
+/// be *exactly* `Size`. Any other `Size` (a float, a bignum, a list, …) is
+/// `badarg`.
+fn is_record_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (term, tag, size) = (args[0], args[1], args[2]);
+    if !access::is_atom(tag) {
+        return Err(error::badarg());
+    }
+    if access::is_atom(size) {
+        // The native-record form (`erl_is_native_record`): the size/name pair is not
+        // readable here, so a native record is a typed error rather than a wrong
+        // `false` (see the module docs). No workspace crate builds one yet.
+        if access::is_record(term) {
+            return Err(error::unsupported_bif());
+        }
+        return ctx.boolean(false);
+    }
+    if access::is_small(size) {
+        let wanted = signed_value(size);
+        // `wanted >= 1` first: `erlang:is_record({}, a, 0)` is `false` in the oracle,
+        // and it also bounds `tuple_element(term, 0)`.
+        let matches = wanted >= 1
+            && access::is_tuple(term)
+            && access::tuple_size(term) as i64 == wanted
+            && access::tuple_element(term, 0) == tag;
+        return ctx.boolean(matches);
+    }
+    Err(error::badarg())
+}
+
 /// Registers the `erlang` type-test BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "is_atom", 1, is_atom);
@@ -117,6 +242,10 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "is_map", 1, is_map);
     reg.register("erlang", "is_boolean", 1, is_boolean);
     reg.register("erlang", "is_function", 1, is_function);
+    reg.register("erlang", "is_function", 2, is_function_2);
+    reg.register("erlang", "is_record", 1, is_record_1);
+    reg.register("erlang", "is_record", 2, is_record_2);
+    reg.register("erlang", "is_record", 3, is_record_3);
 }
 
 #[cfg(test)]
@@ -128,7 +257,7 @@ mod tests {
 
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["true", "false", "ok", "a"]);
+        atoms.seed(["true", "false", "ok", "a", "b"]);
         atoms
     }
 
@@ -224,24 +353,152 @@ mod tests {
     fn register_installs_every_type_test() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
-        for name in [
-            "is_atom",
-            "is_list",
-            "is_tuple",
-            "is_float",
-            "is_integer",
-            "is_number",
-            "is_pid",
-            "is_port",
-            "is_reference",
-            "is_binary",
-            "is_bitstring",
-            "is_map",
-            "is_boolean",
-            "is_function",
+        for (name, arity) in [
+            ("is_atom", 1),
+            ("is_list", 1),
+            ("is_tuple", 1),
+            ("is_float", 1),
+            ("is_integer", 1),
+            ("is_number", 1),
+            ("is_pid", 1),
+            ("is_port", 1),
+            ("is_reference", 1),
+            ("is_binary", 1),
+            ("is_bitstring", 1),
+            ("is_map", 1),
+            ("is_boolean", 1),
+            ("is_function", 1),
+            ("is_function", 2),
+            ("is_record", 1),
+            ("is_record", 2),
+            ("is_record", 3),
         ] {
-            assert!(reg.contains("erlang", name, 1), "missing erlang:{name}/1");
+            assert!(
+                reg.contains("erlang", name, arity),
+                "missing erlang:{name}/{arity}"
+            );
         }
-        assert_eq!(reg.len(), 14);
+        assert_eq!(reg.len(), 18);
+    }
+
+    /// The words of a fun term: `[MAKE_FUN_HEADER(arity, 0, 0), uniq, index]`.
+    ///
+    /// The fun layout is `[thing_word, entry, env…]` (`erl_fun.h`, see
+    /// `beam_engine::terms::make_fun`) and its header (`erl_term.h:413-424`) packs
+    /// the arity at bit 8 and the environment size at bit 16; `is_function/2` reads
+    /// only the header.
+    fn fun_words(arity: usize) -> [Eterm; 3] {
+        [
+            Eterm::from_raw(beam_term::FUN_SUBTAG | (arity << 8)),
+            Eterm::from_raw(0), // uniq
+            Eterm::from_raw(0), // index
+        ]
+    }
+
+    #[test]
+    fn is_function_2_checks_the_exact_arity() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        let words = fun_words(2);
+        let fun = beam_term::make_boxed(words.as_ptr());
+
+        assert!(truth(
+            &atoms,
+            is_function_2(&mut ctx, &[fun, make_small(2)]).unwrap()
+        ));
+        assert!(!truth(
+            &atoms,
+            is_function_2(&mut ctx, &[fun, make_small(0)]).unwrap()
+        ));
+        assert!(!truth(
+            &atoms,
+            is_function_2(&mut ctx, &[fun, make_small(3)]).unwrap()
+        ));
+        // A non-fun is `false` for every valid arity.
+        assert!(!truth(
+            &atoms,
+            is_function_2(&mut ctx, &[make_small(1), make_small(2)]).unwrap()
+        ));
+        assert!(!truth(
+            &atoms,
+            is_function_2(&mut ctx, &[NIL, make_small(0)]).unwrap()
+        ));
+
+        // A negative small, a float, an atom and a list arity are `badarg`.
+        let float = ctx.make_float(0.0).expect("fits");
+        let a = beam_term::make_atom(atoms.lookup("a").unwrap());
+        for bad in [make_small(-1), float, a, NIL] {
+            assert!(
+                matches!(
+                    is_function_2(&mut ctx, &[fun, bad]),
+                    Err(beam_common::BeamError::BadArg)
+                ),
+                "is_function(Fun, {bad:?}) must be badarg"
+            );
+        }
+    }
+
+    #[test]
+    fn is_record_is_a_tuple_tag_test_not_a_native_record_test() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        let a = beam_term::make_atom(atoms.lookup("a").unwrap());
+        let b = beam_term::make_atom(atoms.lookup("b").unwrap());
+        let record = ctx.tuple(&[a, make_small(1)]).expect("fits"); // {a, 1}
+        let one = ctx.tuple(&[a]).expect("fits"); // {a}
+        let empty = ctx.tuple(&[]).expect("fits"); // {}
+
+        // `is_record/1` is the native-record test: a tuple is *not* a record.
+        assert!(!truth(&atoms, is_record_1(&mut ctx, &[record]).unwrap()));
+        assert!(!truth(&atoms, is_record_1(&mut ctx, &[a]).unwrap()));
+
+        // `is_record/2`: arity >= 1 and `element(1) =:= Tag`.
+        assert!(truth(&atoms, is_record_2(&mut ctx, &[record, a]).unwrap()));
+        assert!(truth(&atoms, is_record_2(&mut ctx, &[one, a]).unwrap()));
+        assert!(!truth(&atoms, is_record_2(&mut ctx, &[record, b]).unwrap()));
+        // The empty tuple has no first element (`erlang:is_record({}, a) = false`).
+        assert!(!truth(&atoms, is_record_2(&mut ctx, &[empty, a]).unwrap()));
+        assert!(!truth(
+            &atoms,
+            is_record_2(&mut ctx, &[make_small(1), a]).unwrap()
+        ));
+        // A non-atom tag is `badarg`.
+        assert!(matches!(
+            is_record_2(&mut ctx, &[record, make_small(1)]),
+            Err(beam_common::BeamError::BadArg)
+        ));
+
+        // `is_record/3`: exact size for a small-integer size.
+        assert!(truth(
+            &atoms,
+            is_record_3(&mut ctx, &[record, a, make_small(2)]).unwrap()
+        ));
+        assert!(!truth(
+            &atoms,
+            is_record_3(&mut ctx, &[record, a, make_small(1)]).unwrap()
+        ));
+        assert!(!truth(
+            &atoms,
+            is_record_3(&mut ctx, &[empty, a, make_small(0)]).unwrap()
+        ));
+        // An atom size is the native-record form: a tuple is `false`.
+        assert!(!truth(
+            &atoms,
+            is_record_3(&mut ctx, &[record, a, a]).unwrap()
+        ));
+        // A non-atom tag, and a size that is neither a small nor an atom, are `badarg`.
+        assert!(matches!(
+            is_record_3(&mut ctx, &[record, make_small(1), make_small(2)]),
+            Err(beam_common::BeamError::BadArg)
+        ));
+        let float = ctx.make_float(1.0).expect("fits");
+        assert!(matches!(
+            is_record_3(&mut ctx, &[record, a, float]),
+            Err(beam_common::BeamError::BadArg)
+        ));
     }
 }
