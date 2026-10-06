@@ -296,17 +296,35 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   readiness (observed through `Poller::len`); the reaped `exit_status` taken once through
   `PortRegistry::take_exit_status`; a port without the option never reporting one; an unknown id answering `BadArg`;
   `stop` killing **and** reaping a long-lived child (evidence via `/proc/<pid>` disappearing, guarded on procfs
-  being present); the `{fd, N}` form reading an adopted `pipe(2)` end with no child and leaving the descriptor open;
-  a failed spawn being a constructor error that registers nothing; `{cd, …}`/`{env, …}` reaching the child.
+  being present); the `{fd, N}` form reading an adopted `pipe(2)` end with no child and leaving the descriptor open
+  plus the **bidirectional** `{fd, N}` cases (write bytes into an adopted `pipe(2)` write end and read them from the
+  peer; one adopted `UnixStream::pair()` end carrying both directions); a child flooding 200 KiB to **stderr** still
+  delivering its stdout (stderr is discarded, so it can never block); a failed spawn being a constructor error that
+  registers nothing; an `erl` oracle cross-check of the failed-spawn reason atom (`enoent`/`eacces`/`enotdir`); and
+  `{cd, …}`/`{env, …}` reaching the child.
+- `tests/inet.rs` (integration, real loopback TCP): the `tcp_inet` port resolved through `DriverRegistry` round-trips
+  bytes both ways; a stalled write arms write readiness (a forged write-ready event schedules an OUTPUT task and
+  `execute_port_tasks` runs it); unknown verb ⇒ `BadArg`; and an `erl` (OTP 29.1.1 / erts-17.1) **oracle cross-check**
+  of the `INET_REQ_OPEN`/`BIND`/`LISTEN`/`TCP_REQ_SHUTDOWN`/`RECV`/`CLOSE` reply bytes (skips loudly without `erl`).
+- `tests/driver_seams.rs` (integration, real `PortRegistry`): a driver-declared deadline (`Driver::next_timeout`) is
+  armed and its `Driver::timeout` fires exactly once after it, never before; a `control` re-arms/clears the port
+  timer; `PortRegistry::{schedule_timeout,cancel_timeout}` (incl. re-pointing); `notify_port_exit` reaching the
+  driver once with the right `PortExitReason` and a later `close` still running `stop`.
 - In-module unit tests cover: `ByteQueue`; `Interest`/`Ready`/`Event`; `Poller` register/deregister + `WAKER_KEY` +
-  wakers; `Timeout`/`Timer`; `DriverRegistry` (both built-ins, dup rejection, missing-name `BadArg`); `PortState`
-  transitions; `PortRegistry` alloc/close/reuse + unknown-id `BadArg`; `FdDriver` (pipe round-trip, EOF, error
-  paths, `stop` deregistration, fd closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and
-  control; port-task ordering/reductions/dedupe; the failed-`start` teardown (`FailingStartDriver` double);
-  `SpawnDriver`/`build_command` (the four name forms, `{cd, …}`/`{env, …}` on the built `Command`, empty argv
-  `BadArg`, negative fd `BadArg`, the unknown-program constructor error, accessors, the real read path driven
-  through a hand-built `DriverContext` — bytes, latched EOF and the EOF deregistration — the once-only
-  `exit_status`, the `128 + signal` convention, and idempotent kill/reap).
+  wakers + the **regular-file fallback** (register/readiness + `poll(None)` promptness, the mio+fallback merge,
+  fallback `reregister`, independent fallback entries); `Timeout`/`Timer`; `DriverRegistry` (all three built-ins,
+  dup rejection, missing-name `BadArg`); `PortState` transitions; `PortRegistry` alloc/close/reuse + unknown-id
+  `BadArg`; `FdDriver` (pipe round-trip, EOF + the EOF de-registration, error paths, `stop` deregistration, fd
+  closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and control + a regular-file
+  open→read-to-EOF→close and a regular-file write; port-task ordering/reductions/dedupe + timer re-pointing
+  (`arm_timeout`); the two new driver-seam defaults (`Driver::next_timeout` → `None`, `Driver::port_exit` → `Ok`)
+  and the `PortExitReason` vocabulary; the errno→atom mapping (`error::errno_atom`/`spawn_failure`); the `tcp_inet`
+  verb/reply-shape helpers (packed-address decoding, `errno_name`, `from_socket` state, the full loopback round
+  trip); the failed-`start` teardown (`FailingStartDriver` double); `SpawnDriver`/`build_command` (the four name
+  forms, `{cd, …}`/`{env, …}` on the built `Command`, empty argv `BadArg`, negative fd `BadArg`, the
+  unknown-program constructor error, accessors, the real read path driven through a hand-built `DriverContext` —
+  bytes, latched EOF and the EOF deregistration — the once-only `exit_status`, the `128 + signal` convention, and
+  idempotent kill/reap).
 
 ## Design Decisions
 - **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker` and a correct
