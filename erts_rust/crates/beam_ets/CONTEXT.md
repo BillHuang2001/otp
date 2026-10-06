@@ -289,6 +289,17 @@ impl Table {
   by the runtime); threading `&AtomTable` matches `beam_term`'s `cmp`/`eq`/`term_hash` signatures.
 - **`size` counts objects, not keys.** For `bag`/`duplicate_bag` a key may hold many objects; `size`
   returns the object count (matching `ets:info(T, size)`), which differs from the entry count.
+- **The registered `name` and the `named_table` flag are independent.** `set_name` records the name
+  only; `set_named`/the `named_table` option sets the flag — mirroring the oracle
+  (`ets:new(myanon, [])` ⇒ `name => myanon` but `named_table => false`).
+- **A `private` table reports the concurrency flags as `false`.** The `TableOptions`
+  `write_concurrency()`/`read_concurrency()` getters (hence `concurrency()`) normalize to `false`
+  when `access == Private`, matching the oracle (`is_fine_locked && !DB_PRIVATE` in `erl_db.c`);
+  `compressed` is unaffected. Normalizing in the getters keeps `TableOptions`, `TableInfo` and the
+  bridge in agreement and makes the rule order-independent (access may be set before or after).
+- **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
+  mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
+  unchanged, as the oracle does.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
