@@ -311,6 +311,10 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `erl_bif_*.c`, `bif.tab`, `atom.names`). **Read it; never modify it.**
 - The system Erlang toolchain (OTP 29 / erts-17.1) is on `PATH` — `erlc`/`erl`/`escript` are usable
   for producing `.beam` fixtures and as the differential oracle.
+- **Differential-corpus coverage gap (for the `tools/differential` owner):** no case directly exercises the
+  native-record opcode family, and none exercises the structured raise reasons
+  (`case_clause`/`badmap`/`badkey`/`badrecord`/`badfield`); both are covered only by crate-level tests, so
+  the gate's `mismatch=0` is consistent with them but does not pin them.
 
 ## See Also
 - `../CONTEXT.md` → workspace root: the binding cross-crate contracts and routing table.
