@@ -163,14 +163,18 @@ fn x_offset(x: u32) -> i32 {
 ///
 /// The codegen records what it actually inlined here so the artifact
 /// ([`CompiledFunctions`]) can expose it: the highest natively addressed x-register
-/// (the driver's native-entry guard reads it) and the set of inlined `test` kinds
-/// (evidence that the fast path — not `jit_step_one` — ran).
+/// (the driver's native-entry guard reads it), the set of inlined `test` kinds and
+/// the set of inlined small-int `gc_bif` ops (evidence that the fast paths — not
+/// `jit_step_one` — ran).
 #[derive(Default)]
 struct CodegenReport {
     /// The highest x-register index any inlined instruction addresses natively.
     highest_native_register: Option<u32>,
     /// The `test` kinds inlined natively (deduped, in first-inlined order).
     inlined_tests: Vec<TestKind>,
+    /// The small-int `gc_bif` ops inlined natively (deduped, in first-inlined
+    /// order).
+    inlined_gc_bifs: Vec<SmallArith>,
 }
 
 impl CodegenReport {
@@ -186,6 +190,13 @@ impl CodegenReport {
     fn inlined_test(&mut self, kind: TestKind) {
         if !self.inlined_tests.contains(&kind) {
             self.inlined_tests.push(kind);
+        }
+    }
+
+    /// Record that a `gc_bif` of `op` was inlined natively.
+    fn inlined_gc_bif(&mut self, op: SmallArith) {
+        if !self.inlined_gc_bifs.contains(&op) {
+            self.inlined_gc_bifs.push(op);
         }
     }
 }
@@ -300,6 +311,16 @@ pub struct CompiledFunctions {
     ///
     /// [`inlined_test_kinds`]: CompiledFunctions::inlined_test_kinds
     inlined_tests: Vec<TestKind>,
+    /// The small-int `gc_bif` ops the tier inlined natively (deduped, in
+    /// first-inlined order).
+    ///
+    /// The same kind of artifact-level observation as [`inlined_tests`] — the
+    /// evidence that the arithmetic fast path was compiled (see
+    /// [`inlined_gc_bif_ops`]).
+    ///
+    /// [`inlined_tests`]: CompiledFunctions::inlined_tests
+    /// [`inlined_gc_bif_ops`]: CompiledFunctions::inlined_gc_bif_ops
+    inlined_gc_bifs: Vec<SmallArith>,
 }
 
 impl CompiledFunctions {
@@ -332,6 +353,19 @@ impl CompiledFunctions {
     /// silently deopting to `jit_step_one` (agreeing results alone would not).
     pub fn inlined_test_kinds(&self) -> &[TestKind] {
         &self.inlined_tests
+    }
+
+    /// The small-int `gc_bif` ops this artifact inlined natively, deduped and in
+    /// first-inlined order (empty when the tier inlined no `gc_bif`).
+    ///
+    /// Read-only introspection, the arithmetic counterpart of
+    /// [`inlined_test_kinds`](CompiledFunctions::inlined_test_kinds): it names
+    /// **which** of the two BIFs the compile took the inline fast path for, so a
+    /// test can prove the fast path ran instead of silently deopting to
+    /// `jit_step_one` (agreeing results alone would not). Each entry carries its
+    /// own [`name`](SmallArith::name).
+    pub fn inlined_gc_bif_ops(&self) -> &[SmallArith] {
+        &self.inlined_gc_bifs
     }
 }
 
@@ -467,6 +501,7 @@ fn compile_module(
         entry_pc,
         highest_native_register: report.highest_native_register,
         inlined_tests: report.inlined_tests,
+        inlined_gc_bifs: report.inlined_gc_bifs,
     })
 }
 
@@ -738,6 +773,7 @@ fn emit_pc(
         // is the BIF's exact semantics (including the `fail`-label / raise split).
         Some(gc_bif @ Instr::GcBif { .. }) => {
             if let Some(fast) = fast_arith(module, gc_bif) {
+                report.inlined_gc_bif(fast.op);
                 emit_inline_arith(
                     builder,
                     cfg,
@@ -991,12 +1027,29 @@ fn emit_inline_move(
 
 /// The two BIFs the inlined fast path lowers — `erlang:'+'/2` and `erlang:'-'/2`,
 /// and nothing else.
+///
+/// A [`CompiledFunctions`] artifact reports the ops it inlined through
+/// [`CompiledFunctions::inlined_gc_bif_ops`], so a test can prove that the fast
+/// path — rather than a fall-through to `jit_step_one` — was actually **compiled**
+/// into the artifact.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum SmallArith {
+pub enum SmallArith {
     /// `erlang:'+'/2`.
     Add,
     /// `erlang:'-'/2`.
     Sub,
+}
+
+impl SmallArith {
+    /// The BIF this op lowers, spelled `erlang:'+'/2` / `erlang:'-'/2` — exactly
+    /// the `module`/`function`/`arity` triple the interpreter's `GcBif` arm hands
+    /// to [`ExecutionContext::call_bif`](crate::ExecutionContext::call_bif).
+    pub fn name(&self) -> &'static str {
+        match self {
+            SmallArith::Add => "erlang:'+'/2",
+            SmallArith::Sub => "erlang:'-'/2",
+        }
+    }
 }
 
 /// `beam_term::TAG_IMMED1_MASK` as an `i64` — the low-nibble mask `is_small` tests
@@ -1008,7 +1061,9 @@ const SMALL_MASK: i64 = TAG_IMMED1_MASK as i64;
 const SMALL_TAG: i64 = TAG_IMMED1_SMALL as i64;
 
 /// The shift `make_small` applies (`beam_term::TAG_IMMED1_SIZE`).
-const SMALL_SHIFT: i64 = TAG_IMMED1_SIZE as i64;/// Where an inlined `gc_bif` reads one operand from.
+const SMALL_SHIFT: i64 = TAG_IMMED1_SIZE as i64;
+
+/// Where an inlined `gc_bif` reads one operand from.
 #[derive(Clone, Copy)]
 enum FastOperand {
     /// An x-register (`machine.x[n]`).
