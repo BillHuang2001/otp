@@ -592,6 +592,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/term/fun.rs` → the fun/export forwarding layer (inside the `unsafe` subtree):
   `make_fun_external`/`make_fun_imported`, the `fun_*_term` accessors, the `#[cfg(test)]`
   local-fun builder, and the `beam_term::fun` re-exports
+- `src/term/record.rs` → the native-record forwarding layer (inside the `unsafe` subtree):
+  `is_record`/`make_record` plus the `beam_term::record` `record_*` readers and `AM_*`/size constants
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
