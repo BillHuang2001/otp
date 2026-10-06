@@ -2013,4 +2013,88 @@ mod tests {
             );
         }
     }
+
+    /// Evaluates `expr` to a bitstring and copies out its `(bytes, offset_bits,
+    /// size_bits)`.
+    ///
+    /// A bitstring result is heap-allocated, so it cannot outlive the runtime (see
+    /// [`run`]); copying the bytes out is the printer-independent way to assert one.
+    /// The `~w`/`~p` printer rejects a **non-byte-aligned** bitstring (a `beam_bifs` gap
+    /// — see the crate `CONTEXT.md`), so printing could not be used here.
+    fn bits(expr: &str) -> (Vec<u8>, usize, usize) {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let value = eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr} failed: {error}"));
+        let (bytes, offset_bits, size_bits) = beam_codec::term::bitstring_bytes(value)
+            .unwrap_or_else(|_| panic!("{expr} did not produce a bitstring"));
+        (bytes.to_vec(), offset_bits, size_bits)
+    }
+
+    /// Evaluates `expr` to a list and returns its small-integer elements.
+    fn ints(expr: &str) -> Vec<i64> {
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let value = eval(&mut ctx, expr).unwrap_or_else(|error| panic!("{expr} failed: {error}"));
+        terms::list_elements(value)
+            .unwrap_or_else(|_| panic!("{expr} did not produce a list"))
+            .iter()
+            .map(|element| signed_value(*element))
+            .collect()
+    }
+
+    #[test]
+    fn binary_comprehensions_iterate_a_segment_at_a_time() {
+        // The differential `semantics/binary_comprehension` probe:
+        // `<< <<(X+1)>> || <<X>> <= <<1,2,3>> >>` is `<<2,3,4>>`.
+        assert_eq!(
+            bits("<< <<(X+1)>> || <<X>> <= <<1,2,3>> >>"),
+            (vec![2, 3, 4], 0, 24)
+        );
+        // A binary generator drives a *list* comprehension just as well.
+        assert_eq!(ints("[X || <<X>> <= <<1,2,3>>]"), vec![1, 2, 3]);
+        // A sized pattern consumes a fixed width per iteration: `<<0,1,0,2>>` yields the
+        // two 16-bit big-endian integers (the `semantics/…` sized-pattern form).
+        assert_eq!(ints("[X || <<X:16>> <= <<0,1,0,2>>]"), vec![1, 2]);
+        // A filter still applies to a binary generator.
+        assert_eq!(ints("[X || <<X>> <= <<1,2,3,4>>, X > 2]"), vec![3, 4]);
+    }
+
+    #[test]
+    fn non_byte_aligned_segments_materialize_a_bitstring() {
+        // The differential `semantics/bit_size_of_bitstring` probe.
+        int("bit_size(<<1:1>>)", 1);
+        assert_eq!(bits("<<1:1>>"), (vec![0x80], 0, 1));
+
+        // 12 bits do not fill a byte: `<<255:12>>` is the oracle's `<<15,15:4>>`.
+        int("bit_size(<<255:12>>)", 12);
+        assert_eq!(bits("<<255:12>>"), (vec![0x0F, 0xF0], 0, 12));
+
+        // `little` lays the value's bytes out least-significant first before the value
+        // is truncated to 12 bits: `<<255:12/little>>` is the oracle's `<<255,0:4>>`.
+        int("bit_size(<<255:12/little>>)", 12);
+        assert_eq!(bits("<<255:12/little>>"), (vec![0xFF, 0x00], 0, 12));
+    }
+
+    #[test]
+    fn adjacent_segments_share_one_bit_stream() {
+        // `1:1` then `2:7` fill exactly one byte (130).
+        assert_eq!(
+            bits("begin A = 1, B = 2, <<A:1,B:7>> end"),
+            (vec![130], 0, 8)
+        );
+        // A sized integer head leaves a bit offset that a following `binary` tail keeps:
+        // `5:3` then the byte 2 is the oracle's `<<160,2:3>>`.
+        assert_eq!(
+            bits("begin A = 5, N = 3, Rest = <<2>>, <<A:N, Rest/binary>> end"),
+            (vec![0xA0, 0x40], 0, 11)
+        );
+        // A sized `bits` head takes the first `N` bits of a bitstring value: `<<1:1>>`
+        // then the byte 2 is the oracle's `<<129,0:1>>`.
+        assert_eq!(
+            bits("begin A = <<1:1>>, N = 1, Rest = <<2>>, <<A:N/bits, Rest/binary>> end"),
+            (vec![0x81, 0x00], 0, 9)
+        );
+    }
 }

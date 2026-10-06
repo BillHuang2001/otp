@@ -303,6 +303,31 @@ fn evaluates_control_flow_like_the_oracle() {
     }
 }
 
+/// The two `semantics/*` corpus probes this pass closed — a binary comprehension and
+/// `bit_size/1` of a **non-byte-aligned** bitstring. Both were previously `unsupported`
+/// (the `-eval` grammar had no binary generator and could not enter a non-byte-aligned
+/// segment); they now AGREE with the oracle. Pinned here — invoking the **same** probe
+/// wrapper and argv the corpus builds — so the fix cannot silently regress, even where
+/// the oracle is unavailable.
+#[test]
+fn the_binary_segment_probes_agree_with_the_oracle() {
+    let cases: &[(&str, &str)] = &[
+        ("<< <<(X+1)>> || <<X>> <= <<1,2,3>> >>", "ok <<2,3,4>>"),
+        ("bit_size(<<1:1>>)", "ok 1"),
+    ];
+
+    for (expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{expr}: exit");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+}
+
 /// A `-eval` expression outside the grammar is a *capability gap* — exit 3 with exactly
 /// one `beam_rt: unsupported: …` line. `tests/cli.rs` asserts the shape; here it is
 /// re-asserted through the probe helper so the corpus cannot regress into a silent 0.
