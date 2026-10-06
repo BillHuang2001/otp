@@ -48,7 +48,12 @@
 //!   (most-significant first). The C compares the decoded `num[]` array; the
 //!   payload-word comparison is a deterministic proxy that is equivalent as long
 //!   as the platform ref layout is stable.
-//! * **External pid/port/ref, funs, records and on-heap bin refs** have a
+//! * **Funs** are compared structurally per [`cmp_funs`]: within a kind by the
+//!   inlined entry fields the descriptor carries, then `num_free`, then the
+//!   environment; `External` sorts after any local kind. The `Local` kind has no
+//!   `module`/`old_uniq` in its M1 descriptor and mixed `Local`/`Imported` pairs
+//!   lead with the kind rank — see [`cmp_funs`] for both documented deviations.
+//! * **External pid/port/ref, records and on-heap bin refs** have a
 //!   *deterministic fallback*: they are ordered by class first (which is exact),
 //!   then by object arity, then by the raw term word (a stable proxy). This never
 //!   panics but is not a faithful reproduction of the C's structural comparison
@@ -61,6 +66,7 @@ use crate::atom::AtomTable;
 use crate::bitstring::{bit_at, bitstring_parts, float_bits, float_value};
 use crate::boxed::{boxed_val, header_arity, is_float};
 use crate::eterm::Eterm;
+use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{
     atom_val, internal_pid_data, internal_port_data, is_atom, is_small, signed_value,
 };
@@ -166,6 +172,8 @@ fn cmp_impl(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
         TermClass::Nil => Ordering::Equal,
         // SAFETY: both operands are live maps.
         TermClass::Map => cmp_maps(a, b, atoms, exact),
+        // SAFETY: both operands are live funs.
+        TermClass::Fun => unsafe { cmp_funs(a, b, atoms, exact) },
         // Documented deterministic fallback (see the module `Known Issues`).
         _ => fallback_cmp(a, b),
     }
@@ -496,6 +504,162 @@ unsafe fn cmp_refs(a: Eterm, b: Eterm) -> Ordering {
     Ordering::Equal
 }
 
+/// The ascending kind rank of a fun, used as the leading key when two funs are
+/// of different kinds.
+///
+/// C orders `External` after any local fun (`utils.c:2207-2209`). C has only one
+/// local kind (its `NEW_FUN_EXT` fun is an ordinary `ErlFunThing` with an
+/// `ErlFunEntry` entry), so this crate additionally orders the M1
+/// [`FunKind::Local`] descriptor before the [`FunKind::Imported`] one — see
+/// [`cmp_funs`].
+const fn fun_kind_rank(kind: FunKind) -> u8 {
+    match kind {
+        FunKind::Local => 0,
+        FunKind::Imported => 1,
+        FunKind::External => 2,
+    }
+}
+
+/// Compare two funs — the `_TAG_HEADER_FUN` arm of `erts_cmp_compound`
+/// (`erts/emulator/beam/utils.c:2149-2210`).
+///
+/// The C compares the two funs' out-of-line entries:
+///
+/// * two local funs compare `(entry.module, entry.index, entry.old_uniq)`, then
+///   `num_free`, then the environment element-wise;
+/// * two external funs compare `(mfa.module, mfa.function, mfa.arity)`;
+/// * an external fun sorts after any local one.
+///
+/// This crate inlines the entry into the term (see [`crate::fun`]), so the
+/// per-kind keys are:
+///
+/// * [`FunKind::Local`] ⇒ `(uniq, index)`, then `num_free`, then the environment.
+///   **Documented deviation:** the M1 `Local` descriptor carries `uniq`/`index`
+///   only, so the C's `module`/`old_uniq` components are not available; `uniq` is
+///   the fun's identity, so it leads. The C's `old_uniq` has no counterpart here.
+/// * [`FunKind::Imported`] ⇒ `(module, index, old_uniq)`, then `num_free`, then
+///   the environment — exactly the C's field order (`index`/`old_uniq` compared
+///   unsigned; the C subtracts them as `int`s, which is unobservable for real
+///   lambda indices).
+/// * `External` ⇒ `(module, function, arity)`.
+///
+/// **Documented deviation for mixed `Local`/`Imported` pairs:** their descriptors
+/// have different shapes, so — *as far as the descriptor allows* — they are
+/// ordered by kind (`Local` first). Ordering them by `index` instead (the one
+/// field both carry) would make the relation intransitive (a `Local`, an
+/// `Imported` and another `Local` could each sort below the next in a cycle), so
+/// the kind is the leading key.
+///
+/// Arity is **not** compared for the two local kinds, mirroring the C: there the
+/// arity lives in the header but is pinned by the entry, so the C never compares
+/// it for a local fun. (For an external fun the C compares `mfa.arity`
+/// explicitly, and so does this function.)
+///
+/// # Safety
+///
+/// `a` and `b` must be live fun terms.
+unsafe fn cmp_funs(a: Eterm, b: Eterm, atoms: &AtomTable, exact: bool) -> Ordering {
+    let (pa, pb) = (boxed_val(a), boxed_val(b));
+    // SAFETY: the caller guarantees both operands are live funs, so word 0 of each
+    // is its (live) header word.
+    let (ha, hb) = unsafe { (*pa, *pb) };
+    let (ka, kb) = (fun_kind_of_header(ha), fun_kind_of_header(hb));
+    if ka != kb {
+        return fun_kind_rank(ka).cmp(&fun_kind_rank(kb));
+    }
+    match ka {
+        // The C's `Export` is canonical, so `(module, function, arity)` decides.
+        FunKind::External => {
+            // SAFETY: an external fun's descriptor words 1 and 2 hold its module and
+            // function atoms.
+            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, atoms, exact);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: as above — descriptor word 2.
+            let ord = cmp_impl(unsafe { *pa.add(2) }, unsafe { *pb.add(2) }, atoms, exact);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            fun_arity(ha).cmp(&fun_arity(hb))
+        }
+        // The inlined `(uniq, index)` descriptor stands in for the C entry.
+        FunKind::Local => {
+            // SAFETY: a local fun's descriptor words 1 and 2 hold `uniq` and `index`.
+            let (ua, ub) = unsafe { ((*pa.add(1)).raw(), (*pb.add(1)).raw()) };
+            let ord = ua.cmp(&ub);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: as above — descriptor word 2.
+            let (ia, ib) = unsafe { (((*pa.add(2)).raw() as u32), ((*pb.add(2)).raw() as u32)) };
+            let ord = ia.cmp(&ib);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: both operands are live local-kind funs (see the fn docs).
+            unsafe { cmp_fun_env(pa, pb, ha, hb, atoms, exact) }
+        }
+        // The C's local-fun entry fields the wire format also carries.
+        FunKind::Imported => {
+            // SAFETY: an imported fun's descriptor word 1 holds its module atom.
+            let ord = cmp_impl(unsafe { *pa.add(1) }, unsafe { *pb.add(1) }, atoms, exact);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: an imported fun's descriptor word 4 holds `index`.
+            let (ia, ib) = unsafe { (((*pa.add(4)).raw() as u32), ((*pb.add(4)).raw() as u32)) };
+            let ord = ia.cmp(&ib);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: an imported fun's descriptor word 6 holds `old_uniq`.
+            let (oa, ob) = unsafe { (((*pa.add(6)).raw() as u32), ((*pb.add(6)).raw() as u32)) };
+            let ord = oa.cmp(&ob);
+            if ord != Ordering::Equal {
+                return ord;
+            }
+            // SAFETY: both operands are live local-kind funs (see the fn docs).
+            unsafe { cmp_fun_env(pa, pb, ha, hb, atoms, exact) }
+        }
+    }
+}
+
+/// Compare two local-kind funs' environments: `num_free` first, then the
+/// `num_free` elements (the C's `term_array`, `utils.c:2181-2191`).
+///
+/// # Safety
+///
+/// `pa`/`pb` must be the header words of live local-kind funs `ha`/`hb`, and both
+/// funs' blocks must be live.
+unsafe fn cmp_fun_env(
+    pa: *mut Eterm,
+    pb: *mut Eterm,
+    ha: Eterm,
+    hb: Eterm,
+    atoms: &AtomTable,
+    exact: bool,
+) -> Ordering {
+    let (na, nb) = (fun_num_free(ha), fun_num_free(hb));
+    let ord = na.cmp(&nb);
+    if ord != Ordering::Equal {
+        return ord;
+    }
+    let (oa, ob) = (
+        1 + fun_desc_words(fun_kind_of_header(ha)),
+        1 + fun_desc_words(fun_kind_of_header(hb)),
+    );
+    for i in 0..na {
+        // SAFETY: environment word `i` of each live fun (both have `na` of them).
+        let (ea, eb) = unsafe { (*pa.add(oa + i), *pb.add(ob + i)) };
+        let ord = cmp_impl(ea, eb, atoms, exact);
+        if ord != Ordering::Equal {
+            return ord;
+        }
+    }
+    Ordering::Equal
+}
+
 /// The documented deterministic fallback for classes without a faithful
 /// layout-aware comparison: order by object arity, then by the raw term word.
 ///
@@ -512,14 +676,77 @@ fn fallback_cmp(a: Eterm, b: Eterm) -> Ordering {
 mod tests {
     use super::*;
     use crate::boxed::{make_boxed, make_header, HEADER_FLONUM};
+    use crate::fun::{fun_words, write_fun_external, write_fun_imported, write_fun_local, FunPid};
     use crate::heap::Heap;
     use crate::immediate::{make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data, make_small, NIL};
     use crate::tag::{HAMT_SUBTAG_HEAD_FLATMAP, HEAP_BITS_SUBTAG, REF_SUBTAG};
+    use crate::Atom;
 
     fn atoms() -> AtomTable {
         let mut t = AtomTable::new();
         t.seed(["a", "b", "c", "z"]);
         t
+    }
+
+    /// Build a [`FunKind::Local`] fun with `env` as its free variables.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must own the [`fun_words`]-sized block and stay alive (and unmoved)
+    /// for as long as the returned term is used.
+    unsafe fn local_fun(heap: &mut Heap, uniq: u64, index: u32, env: &[Eterm]) -> Eterm {
+        // SAFETY: the caller keeps the block alive; `write_fun_local` writes it all.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Local, env.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(Local, env.len())` words.
+        unsafe { write_fun_local(hp, 0, uniq, index, env).unwrap() }
+    }
+
+    /// Build a [`FunKind::External`] fun.
+    ///
+    /// # Safety
+    ///
+    /// As [`local_fun`].
+    unsafe fn external_fun(heap: &mut Heap, module: Atom, function: Atom, arity: usize) -> Eterm {
+        // SAFETY: the caller keeps the block alive.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::External, 0)).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(External, 0)` words.
+        unsafe { write_fun_external(hp, arity, module, function).unwrap() }
+    }
+
+    /// Build a [`FunKind::Imported`] fun with `env` as its free variables.
+    ///
+    /// # Safety
+    ///
+    /// As [`local_fun`].
+    unsafe fn imported_fun(
+        heap: &mut Heap,
+        module: Atom,
+        index: u32,
+        old_uniq: u32,
+        env: &[Eterm],
+    ) -> Eterm {
+        // SAFETY: the caller keeps the block alive.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Imported, env.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(Imported, env.len())` words.
+        unsafe {
+            write_fun_imported(
+                hp,
+                0,
+                module,
+                &[0u8; 16],
+                index,
+                0,
+                old_uniq,
+                FunPid {
+                    node: module,
+                    number: 0,
+                    serial: 0,
+                    creation: 0,
+                },
+                env,
+            )
+            .unwrap()
+        }
     }
 
     /// Build `#{Atom => Value}` as a flatmap (see `erl_map.h`).
@@ -728,9 +955,113 @@ mod tests {
     }
 
     #[test]
+    fn local_funs_compare_by_uniq_then_index_then_env() {
+        let a = atoms();
+        let mut heap = Heap::new(128);
+        // SAFETY: the heap owns every block built here.
+        let (l1, l2, l3, l4, l5, l1_copy) = unsafe {
+            (
+                local_fun(&mut heap, 1, 2, &[]),
+                local_fun(&mut heap, 5, 2, &[]),
+                local_fun(&mut heap, 1, 9, &[]),
+                local_fun(&mut heap, 1, 2, &[make_small(0)]),
+                local_fun(&mut heap, 1, 2, &[make_small(1)]),
+                local_fun(&mut heap, 1, 2, &[]),
+            )
+        };
+        assert_eq!(cmp(l1, l2, &a), Ordering::Less, "uniq decides");
+        assert_eq!(cmp(l1, l3, &a), Ordering::Less, "index decides");
+        assert_eq!(cmp(l1, l4, &a), Ordering::Less, "fewer free vars first");
+        assert_eq!(cmp(l4, l5, &a), Ordering::Less, "environment element-wise");
+        assert_eq!(cmp(l1, l1_copy, &a), Ordering::Equal);
+        assert!(eq(l1, l1_copy, &a));
+    }
+
+    #[test]
+    fn external_funs_compare_by_mfa_and_sort_after_local_kinds() {
+        let a = atoms();
+        let mut heap = Heap::new(128);
+        let m = a.lookup("a").unwrap();
+        let n = a.lookup("b").unwrap();
+        // SAFETY: the heap owns every block built here.
+        let (e1, e2, e3, e1_copy, l, i) = unsafe {
+            (
+                external_fun(&mut heap, m, n, 2),
+                external_fun(&mut heap, n, m, 2),
+                external_fun(&mut heap, m, n, 3),
+                external_fun(&mut heap, m, n, 2),
+                local_fun(&mut heap, 0, 0, &[]),
+                imported_fun(&mut heap, m, 0, 0, &[]),
+            )
+        };
+        assert_eq!(cmp(e1, e2, &a), Ordering::Less, "module decides");
+        assert_eq!(cmp(e1, e3, &a), Ordering::Less, "arity decides");
+        assert_eq!(cmp(e1, e1_copy, &a), Ordering::Equal);
+        assert_eq!(cmp(l, e1, &a), Ordering::Less, "external sorts after any local");
+        assert_eq!(cmp(i, e1, &a), Ordering::Less);
+        assert_eq!(cmp(e1, l, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn imported_funs_compare_by_module_index_old_uniq_then_env() {
+        let a = atoms();
+        let mut heap = Heap::new(128);
+        let m = a.lookup("a").unwrap();
+        let n = a.lookup("b").unwrap();
+        // SAFETY: the heap owns every block built here.
+        let (i1, i2, i3, i4, i5) = unsafe {
+            (
+                imported_fun(&mut heap, m, 1, 0, &[]),
+                imported_fun(&mut heap, n, 1, 0, &[]),
+                imported_fun(&mut heap, m, 2, 0, &[]),
+                imported_fun(&mut heap, m, 1, 7, &[]),
+                imported_fun(&mut heap, m, 1, 0, &[make_small(0)]),
+            )
+        };
+        assert_eq!(cmp(i1, i2, &a), Ordering::Less, "module decides");
+        assert_eq!(cmp(i1, i3, &a), Ordering::Less, "index decides");
+        assert_eq!(cmp(i1, i4, &a), Ordering::Less, "old_uniq decides");
+        assert_eq!(cmp(i1, i5, &a), Ordering::Less, "num_free decides");
+        // The M1 local descriptor sorts before the imported one.
+        // SAFETY: the heap owns the block.
+        let l = unsafe { local_fun(&mut heap, 0, 0, &[]) };
+        assert_eq!(cmp(l, i1, &a), Ordering::Less);
+        assert_eq!(cmp(i1, l, &a), Ordering::Greater);
+    }
+
+    #[test]
+    fn fun_ordering_is_total_over_mixed_kinds() {
+        // Leading with the kind is what keeps the order transitive: ordering a
+        // mixed Local/Imported pair by `index` alone could cycle.
+        let a = atoms();
+        let mut heap = Heap::new(128);
+        // SAFETY: the heap owns every block built here.
+        let (l_hi, l_lo, imp) = unsafe {
+            (
+                local_fun(&mut heap, 9, 2, &[]),
+                local_fun(&mut heap, 1, 5, &[]),
+                imported_fun(&mut heap, a.lookup("a").unwrap(), 2, 0, &[]),
+            )
+        };
+        let mut sorted = [l_hi, imp, l_lo];
+        sorted.sort_by(|x, y| cmp(*x, *y, &a));
+        assert_eq!(sorted, [l_lo, l_hi, imp]);
+        // The relation is antisymmetric across the kind boundary too.
+        assert_eq!(cmp(l_hi, imp, &a), Ordering::Less);
+        assert_eq!(cmp(imp, l_hi, &a), Ordering::Greater);
+    }
+
+    #[test]
     fn comparison_is_antisymmetric_over_samples() {
         let a = atoms();
         let mut heap = Heap::new(128);
+        // SAFETY: the heap owns every block built here.
+        let (fun_local, fun_ext) = unsafe {
+            (
+                local_fun(&mut heap, 3, 1, &[make_small(0)]),
+                external_fun(&mut heap, a.lookup("a").unwrap(), a.lookup("b").unwrap(), 1),
+            )
+        };
         let samples = vec![
             make_small(0),
             make_small(7),
@@ -738,6 +1069,8 @@ mod tests {
             NIL,
             heap.tuple(&[make_small(1)]).unwrap(),
             heap.cons(make_small(1), NIL).unwrap(),
+            fun_local,
+            fun_ext,
         ];
         for x in &samples {
             for y in &samples {
