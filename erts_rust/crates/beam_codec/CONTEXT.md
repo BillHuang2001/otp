@@ -277,6 +277,13 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `BeamError::Raise(Raise::error(ExitReason::atom(error::UNSUPPORTED_REASON)))`
   (`UNSUPPORTED_REASON = "unsupported_external_term"`, detectable with `error::is_unsupported`).
   **Never panic, never `unwrap()` runtime data, never silently truncate or mis-encode.**
+  <a id="error-surface"></a>
+  **Error surface (additive, `src/error.rs`).** A **local** fun has no faithful wire image and is
+  reported with its own reason atom, kept distinct from `UNSUPPORTED_REASON` so a caller can tell
+  "this fun kind has no wire form" from "this tag is not implemented yet":
+  `pub const LOCAL_FUN_REASON: &str = "unsupported_local_fun"`, `pub fn unsupported_local_fun() ->
+  BeamError` (raises it) and `pub fn is_unsupported_local_fun(&BeamError) -> bool`. `UNSUPPORTED_REASON`
+  / `unsupported` / `is_unsupported` are unchanged.
 - **Deps:** `beam_common`, `beam_term`, `beam_alloc`, `libc` plus `flate2` (zlib for
   `COMPRESSED`). `flate2` uses the pure-Rust `miniz_oxide` backend (`default-features = false,
   features = ["rust_backend"]`, no C toolchain, no network at build time beyond the crates.io fetch);
