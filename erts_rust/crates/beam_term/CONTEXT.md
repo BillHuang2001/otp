@@ -177,8 +177,10 @@ Two distinct surfaces live here:
 - `tests/oracle.rs::oracle_agrees_on_make_hash2_and_make_hash` is the live cross-check: one `Spec`
   description is materialized **both** as a `beam_term` term and as Erlang source text (~90 terms), and
   the four contract identities above are asserted for every one of them. 25 of the resulting vectors are
-  pinned offline in `hashing::exact_hash_tests::make_hash2_and_make_hash_pin_the_oracle_vectors`, so the
-  contract still has teeth without `erl` on `PATH`.
+  pinned offline in `hashing::make_hash::tests::make_hash2_and_make_hash_pin_the_oracle_vectors`, so the
+  contract still has teeth without `erl` on `PATH`. `hashing::common::tests::block_hash_matches_the_jk_reference_shape`
+  pins `block_hash` (including the C's unconditional `ctx->c += full_length`); the atom fast path is
+  pinned by `make_hash2(atom) == AtomTable::hvalue(atom)`.
 
 ### `ihash.rs` — the bit-exact `erts_map_hash`
 The **erlang map hash** (`erl_term_hashing.c:1955-2130`, `IHASH_*`/`make_internal_hash`):
