@@ -108,10 +108,13 @@
 //! error surfaces rather than an invented one), and a `gc_bif` whose BIF is outside
 //! the fast path's two (or one with an un-addressable operand).
 //!
-//! A block's *inline prefix* runs natively and the **first** non-inlinable
-//! instruction is handed to the helper, after which the block returns: this is the
-//! documented per-instruction deopt, and it is what gives the tier full opcode
-//! coverage with interpreter-identical semantics on day one.
+//! A helper-executed instruction does **not** end the block: after the helper has
+//! run exactly that instruction (`Step::Next`) the block refills its cached
+//! x-registers and carries on natively at the next instruction, so native coverage
+//! is whole-block. Only an outcome other than "advanced by one" (`Goto`/`Halt`/
+//! `Wait`/`Err`) returns to the driver with that word. This per-instruction deopt is
+//! what gives the tier full opcode coverage with interpreter-identical semantics on
+//! day one; see `emit` for the emitted sequence.
 //!
 //! # `unsafe`
 //!

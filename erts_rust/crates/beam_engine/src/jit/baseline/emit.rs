@@ -2,11 +2,13 @@
 //!
 //! The register allocator ([`allocate_registers`]) and the per-instruction
 //! lowering ([`emit_block`]) — the inline `move`/`swap`/`jump`/metadata set, the
-//! spill-across-blocks discipline ([`CACHE_REGISTERS`]) and the tier's one
-//! optimisation, the guarded small-int `erlang:'+'/2`/`'-'/2` fast path
-//! ([`try_inline_gc_bif`]). [`compile_module`] lowers every basic block of a
-//! module into the [`CompiledModule`] artifact. See `super` for the block ABI (in
-//! `runtime`) and the driver that runs the emitted code.
+//! deopt-and-continue sequence ([`emit_step_and_continue`]) that covers every
+//! instruction the block does not lower natively, the spill/fill discipline
+//! ([`CACHE_REGISTERS`]) and the tier's one optimisation, the guarded small-int
+//! `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]). [`compile_module`]
+//! lowers every basic block of a module into the [`CompiledModule`] artifact. See
+//! `super` for the block ABI (in `runtime`) and the driver that runs the emitted
+//! code.
 //!
 //! **Only [`CACHE_REGISTERS`]`.len()` x-registers are held in machine registers**;
 //! every other x-register a block names is addressed **directly in `machine.x`**
@@ -179,19 +181,25 @@ fn code_capacity_estimate(module: &Module) -> usize {
             .filter(|instr| matches!(instr, Instr::GcBif { .. }))
             .count();
     }
-    64 * blocks + INSTRUCTION_BYTES * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
+    128 * blocks + INSTRUCTION_BYTES * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
 }
 
 /// The code-size budget reserved for one instruction (see
-/// [`code_capacity_estimate`]) — comfortably above the largest lowering (a
-/// two-`machine.x`-operand `swap`: two loads, two stores and a constant).
-const INSTRUCTION_BYTES: usize = 32;
+/// [`code_capacity_estimate`]).
+///
+/// Every instruction the block does not lower natively is emitted as the full
+/// [`emit_step_and_continue`] sequence — the exit spill, the three helper arguments,
+/// the indirect call, the continuation check and the reload ([`Fill`]) — which is
+/// the largest per-instruction lowering the emitter produces (~150 bytes with five
+/// cached registers). Budgeting for the deopt form for *every* instruction also
+/// covers the inlined forms, which are smaller.
+const INSTRUCTION_BYTES: usize = 192;
 
 /// The code-size budget reserved for one `gc_bif` (see
 /// [`code_capacity_estimate`]): the guarded small-int fast path (~140 bytes with
 /// `machine.x` operand loads and a `machine.x` result store) plus the
-/// spill-and-`jit_step_one` fallback it branches to (~70 bytes).
-const FAST_PATH_BYTES: usize = 240;
+/// [`emit_step_and_continue`] fallback it branches to (~150 bytes).
+const FAST_PATH_BYTES: usize = 352;
 
 /// Pick the x-registers a block caches, in first-appearance order.
 ///
@@ -283,7 +291,14 @@ fn emit_block(
     let done: CodeLabel = buffer.label();
 
     // --- body ---------------------------------------------------------------
-    let mut fell_through = true;
+    //
+    // Every instruction of the block is covered: either it is lowered natively, or
+    // it is executed by one `jit_step_one` call after which the block **continues**
+    // natively at `pc + 1` whenever the helper advanced by exactly one instruction
+    // (`Step::Next`) — see [`emit_step_and_continue`]. Only a resolved `Jump`
+    // terminates the block early; a helper that produced any other outcome
+    // (`Goto`/`Halt`/`Wait`/`Err`) returns to the driver with that word.
+    let mut terminated = false;
     for (i, instr) in code[start..end].iter().enumerate() {
         let pc = (start + i) as u32;
         match instr {
@@ -299,9 +314,7 @@ fn emit_block(
             | Instr::DebugLine { .. } => {}
             Instr::Move { src, dst } => {
                 if !try_inline_move(buffer, src, dst, allocation, highest_touched)? {
-                    emit_helper(buffer, done, allocation, func, pc)?;
-                    fell_through = false;
-                    break;
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
             // `swap A B` exchanges two x-registers; a block normally caches fewer
@@ -309,9 +322,7 @@ fn emit_block(
             // is cheap to remove (a three-`mov` shuffle, register or memory).
             Instr::Swap { a, b } => {
                 if !try_inline_swap(buffer, a, b, allocation, highest_touched)? {
-                    emit_helper(buffer, done, allocation, func, pc)?;
-                    fell_through = false;
-                    break;
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
             // The one optimised BIF: the small-int `erlang:'+'/2`/`'-'/2`. When
@@ -320,9 +331,7 @@ fn emit_block(
             // could not cache) it is exactly the `_` arm below.
             Instr::GcBif { .. } => {
                 if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc, highest_touched)? {
-                    emit_helper(buffer, done, allocation, func, pc)?;
-                    fell_through = false;
-                    break;
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
             Instr::Jump { target } => match labels.get(target) {
@@ -330,27 +339,19 @@ fn emit_block(
                     spill(buffer, allocation)?;
                     buffer.mov_ri(Reg::Rax, encode_target(target_func, target_pc))?;
                     buffer.jmp(done)?;
-                    fell_through = false;
+                    terminated = true;
                     break;
                 }
                 // An undefined label keeps the interpreter's exact `unknown_label`
                 // error: hand the jump to the helper rather than inventing one.
-                None => {
-                    emit_helper(buffer, done, allocation, func, pc)?;
-                    fell_through = false;
-                    break;
-                }
+                None => emit_step_and_continue(buffer, done, allocation, func, pc)?,
             },
-            // Everything else: one interpreter step, then leave the block.
-            _ => {
-                emit_helper(buffer, done, allocation, func, pc)?;
-                fell_through = false;
-                break;
-            }
+            // Everything else: one interpreter step, then continue at `pc + 1`.
+            _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
         }
     }
 
-    if fell_through {
+    if !terminated {
         // The block ran off its end: hand the next address back to the driver.
         spill(buffer, allocation)?;
         buffer.mov_ri(Reg::Rax, encode_target(func, end as u32))?;
@@ -506,16 +507,20 @@ fn try_inline_swap(
     Ok(true)
 }
 
-/// Emit the spill-then-helper-then-exit sequence for instruction `(func, pc)`.
+/// Emit the spill-then-helper sequence for instruction `(func, pc)` — **without**
+/// the block exit, so the caller decides what to do with the helper's word.
 ///
 /// The spill comes **first**: the helper is the interpreter and reads `machine.x`,
 /// which must already hold the values the inline prefix produced. The `rt` slot is
 /// reloaded into `rdi` (the helper's first argument); the helper preserves the
-/// callee-saved registers, so the block's cached values survive it — but the block
-/// must **not** spill after the call: the helper legitimately wrote `machine.x`.
-fn emit_helper(
+/// callee-saved registers, so `rbx` (the `machine.x` base) survives it — but the
+/// block must **not** spill after the call: the helper legitimately wrote
+/// `machine.x`.
+///
+/// The helper's result word is left in `rax` (the block ABI's return register) for
+/// the caller's continuation check.
+fn emit_helper_call(
     buffer: &mut CodeBuffer,
-    done: CodeLabel,
     allocation: &Allocation,
     func: u32,
     pc: u32,
@@ -526,14 +531,60 @@ fn emit_helper(
     buffer.mov_ri(Reg::Rdx, i64::from(pc))?;
     let helper: StepHelper = jit_step_one;
     buffer.mov_ri(Reg::R11, helper as *const () as i64)?;
-    buffer.call_r(Reg::R11)?;
-    buffer.jmp(done)
+    buffer.call_r(Reg::R11)
+}
+
+/// Emit "execute instruction `(func, pc)` with one interpreter step, then **continue
+/// natively** when it advanced by exactly one instruction".
+///
+/// This is the tier's per-instruction deopt. `jit_step_one` maps its outcome onto
+/// the block ABI:
+///
+/// * `Step::Next` → `encode_target(func, pc + 1)` — the helper executed exactly the
+///   instruction at `pc` and the block can carry on at `pc + 1`, so the emitted code
+///   refills the cached x-registers (mandatory: the helper *is* the interpreter and
+///   wrote `machine.x`) and **falls through** to the next instruction's lowering;
+/// * any other word (`Goto`/`HALT`/`ERROR`, and the `Wait` → `blocked` error) → jump
+///   to the block epilogue with that word in `rax`, exactly as before.
+///
+/// Continuing in-block rather than leaving the block is what makes native coverage
+/// independent of where a block's first non-inlinable instruction sits: the
+/// surrounding instructions still run natively, and the driver's per-instruction
+/// entry lookup is paid once per block instead of once per instruction.
+fn emit_step_and_continue(
+    buffer: &mut CodeBuffer,
+    done: CodeLabel,
+    allocation: &Allocation,
+    func: u32,
+    pc: u32,
+) -> Result<()> {
+    emit_helper_call(buffer, allocation, func, pc)?;
+    // `rax` holds the helper's word; only "the next instruction" continues here.
+    buffer.mov_ri(Reg::R11, encode_target(func, pc + 1))?;
+    buffer.cmp_rr(Reg::Rax, Reg::R11)?;
+    buffer.jcc(Cond::Ne, done)?;
+    fill(buffer, allocation)
 }
 
 /// Write every cached x-register back into `machine.x` (`rbx` holds the base).
 fn spill(buffer: &mut CodeBuffer, allocation: &Allocation) -> Result<()> {
     for (x, reg) in &allocation.slots {
         buffer.mov_mr(Reg::Rbx, x_offset(*x), *reg)?;
+    }
+    Ok(())
+}
+
+/// Load every cached x-register out of `machine.x` (`rbx` holds the base).
+///
+/// The mandatory counterpart of [`spill`] after a helper call: the helper ran the
+/// interpreter on `machine.x`, so the block's cached values are stale — every one of
+/// them may have been changed (an instruction can write any x-register). Reloading
+/// **all** of them is the liveness model's conservative form: no per-register
+/// liveness is needed, and a register that was not actually touched is reloaded with
+/// the value it already holds.
+fn fill(buffer: &mut CodeBuffer, allocation: &Allocation) -> Result<()> {
+    for (x, reg) in &allocation.slots {
+        buffer.mov_rm(*reg, Reg::Rbx, x_offset(*x))?;
     }
     Ok(())
 }
@@ -836,7 +887,8 @@ fn load_into(
 ///                           ; otherwise `mov [rbx + dst*8], r11`
 ///   jmp  fast_done
 /// fallback:
-///   <spill cached x-registers; call jit_step_one; jmp the block epilogue>
+///   <the `emit_step_and_continue` sequence: spill, call `jit_step_one`, continue
+///    at `pc + 1` when the helper advanced by one, else exit to the driver>
 /// fast_done:
 ///   <emit the rest of the block>
 /// ```
@@ -920,9 +972,9 @@ fn try_inline_gc_bif(
     }
     buffer.jmp(fast_done)?;
 
-    // Rejected (or not lowered): one interpreter step, then leave the block.
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
     buffer.bind(fallback)?;
-    emit_helper(buffer, done, allocation, func, pc)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
     buffer.bind(fast_done)?;
     Ok(true)
 }
