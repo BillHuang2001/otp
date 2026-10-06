@@ -495,7 +495,9 @@ impl Table {
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, reads/navigation, `select_all`, metadata
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, constructors, metadata/ownership accessors, write ops (insert/delete), access checks, `select_all`, module wiring
+- `src/table/interior.rs` → the private `pub(crate) trait Interior` + `build_interior`
+- `src/table/read.rs` → the read/navigation `impl Table` (lookup/member/lookup_element*/first/last/next/prev/take/size/is_empty/tab2list/memory)
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
 - `src/table/ownership.rs` → `Heir`/`SetOpt` + the `ets:give_away/3` / `{heir, ...}` `setopts/2` semantics + the pid-gap docs
 - `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
