@@ -321,9 +321,10 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   callback — `FdDriver` reads/writes in an `EAGAIN`-terminated loop for exactly this reason. Readiness is only
   scheduled for directions the driver armed (`PortArms`), so a driver that never registers a direction never sees
   its events.
-- **Port tasks exist but nothing schedules them yet at runtime.** `PortRegistry::execute_port_tasks` runs a
-  round on demand; there is no port run queue, no per-iteration drive from a poll thread, and reductions are not
-  yet charged to a `beam_process` scheduler. `beam_rt` has not adopted `beam_io::PortRegistry`/`PortNotification`.
+- **This crate has no poll thread of its own.** `PortRegistry::execute_port_tasks` runs a round on demand; the
+  per-iteration drive (poll → `schedule_events`/`handle_events` → `execute_port_tasks`) and the reduction budget
+  live in the single-threaded `beam_rt` main loop (which owns the one long-lived `Poller`). There is no port run
+  queue or dedicated poll thread here.
 - **`FdDriver` is deliberately minimal.** Byte-stream only; line mode frames input but does **not** line-frame
   output (matching the emulator's line flag). No `inet`/`forker` drivers; no packet framing.
 - **`SpawnDriver` is the OS-child floor, not the whole `spawn` driver.** Decoding the `open_port/2` terms into a
