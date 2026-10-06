@@ -448,8 +448,10 @@ live system `erl` (via `erl -noshell -eval`) so a future implementation need not
 - `src/ordered_interior/iter.rs` → leaf-chain ordered iterator
 - `src/select/mod.rs` → `MatchSpec`/`MatchClause`/`SelectPredicate` + `compile`
 - `src/select/pattern.rs` → head patterns (`Pattern`)
-- `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`)
-- `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`) + `BodyKind`
+- `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`) + arithmetic (`ArithOp`/`ArithHook`/`DefaultArithHook`/`set_arith_hook`)
+- `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`/`select_replace`) + `BodyKind`
+- `src/select/run.rs` → table-independent `match_spec_run` (`ets:match_spec_run/2`)
+- `src/select/continuation.rs` → `MatchContinuation` + the limit/continuation forms (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/`match_object_continue`)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
