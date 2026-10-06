@@ -255,6 +255,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
 - `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver
+- `src/config.rs` → GC-strategy seam: `GcConfig` + `MatureKind::{Copying,Immix}` (default `Copying`; `Immix` = the measurement-gated GenImmix option, OFF by default). Additive producer-side config — `Collector` still always runs the copying path
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
 - `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
 - `src/stats.rs` → `GcStats`
