@@ -481,7 +481,7 @@ impl RuntimeContext<'_> {
     /// Writes `text` to the installed output sink (stdout when none is installed).
     fn write_output(&mut self, text: &str) -> Result<()> {
         use beam_bifs::OutputSink;
-        match self.output.as_deref_mut() {
+        match self.output.as_mut() {
             Some(sink) => sink.write_str(text),
             None => {
                 let mut sink = beam_bifs::StdoutSink;

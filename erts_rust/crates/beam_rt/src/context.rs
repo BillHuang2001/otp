@@ -54,6 +54,7 @@
 //! no GC in the engine yet (`../beam_engine` Known Issues). The production collector is
 //! Stage 4 (`beam_gc`), which will run *here* and may move terms.
 
+use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
@@ -66,6 +67,54 @@ use beam_term::{Atom, Eterm};
 use crate::error;
 use crate::port::RuntimePorts;
 use crate::runtime::Runtime;
+
+/// A cloneable, shared `io:format` destination.
+///
+/// A [`RuntimeContext`] must be able to hand the **same** sink to a nested context when
+/// a `fun`-taking BIF applies its fun (see [`FunBridge`]) while the outer call still
+/// holds it — but a borrowed `&mut dyn OutputSink` cannot be duplicated. The sink
+/// therefore lives behind an `Rc`-shared, interior-mutable cell: every context owns its
+/// own [`SharedSink`] *value* wrapping a clone of the same `Rc`, and the (single-threaded)
+/// writes are serialized by the `RefCell`, so there is no Rust aliasing — this crate is
+/// `#![deny(unsafe_code)]`.
+///
+/// The shared cell is a `dyn SinkCell` rather than a `RefCell<dyn OutputSink>` on purpose:
+/// it keeps `SharedSink<'a>` **covariant** in `'a`, so a nested context can reuse a sink
+/// borrowed for a *longer* lifetime — exactly what [`FunBridge::call_fun`] does when it
+/// reborrows the runtime for a short nested call.
+#[derive(Clone)]
+pub(crate) struct SharedSink<'a>(Rc<dyn SinkCell + 'a>);
+
+/// The interior-mutable cell behind a [`SharedSink`].
+///
+/// A trait (not a generic struct) so the object type carries the sink's lifetime — and
+/// nothing else — which is what makes [`SharedSink`] covariant in `'a` (a `RefCell` over a
+/// lifetime-parameterized type would be invariant).
+trait SinkCell {
+    /// Writes `s` through the borrowed sink.
+    fn write(&self, s: &str) -> Result<()>;
+}
+
+impl<'a> SinkCell for RefCell<&'a mut dyn OutputSink> {
+    fn write(&self, s: &str) -> Result<()> {
+        let mut sink = self.borrow_mut();
+        sink.write_str(s)
+    }
+}
+
+impl<'a> SharedSink<'a> {
+    /// Wraps a borrowed sink into a shared handle.
+    fn new(sink: &'a mut dyn OutputSink) -> SharedSink<'a> {
+        SharedSink(Rc::new(RefCell::new(sink)))
+    }
+}
+
+impl OutputSink for SharedSink<'_> {
+    fn write_str(&mut self, s: &str) -> Result<()> {
+        self.0.write(s)
+    }
+}
+
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
 ///
@@ -79,7 +128,10 @@ pub struct RuntimeContext<'a> {
     /// sibling module of this one and therefore needs explicit visibility.
     pub(crate) runtime: &'a mut Runtime,
     /// The `io:format`/`io:put_chars`/`display` destination; stdout when unset.
-    pub(crate) output: Option<&'a mut dyn OutputSink>,
+    ///
+    /// A **shared** handle (see [`SharedSink`]) so the *same* sink can be handed to a
+    /// nested context when a `fun`-taking BIF applies its fun ([`FunBridge`]).
+    pub(crate) output: Option<SharedSink<'a>>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -95,7 +147,7 @@ impl<'a> RuntimeContext<'a> {
     pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> RuntimeContext<'a> {
         RuntimeContext {
             runtime,
-            output: Some(sink),
+            output: Some(SharedSink::new(sink)),
         }
     }
 
@@ -162,14 +214,14 @@ impl<'a> RuntimeContext<'a> {
     /// [`BifContext`] therefore holds **no** borrow of the runtime: the registry, the
     /// atom table and the tables are cheap `Rc` clones (the atom handle dereferences to
     /// the shared table without borrowing the server), the heap comes from the BIF heap
-    /// pool, and the output sink is a disjoint field of this context. The only borrow of
-    /// the runtime is the bridge's.
+    /// pool, and the output sink is a shared [`SharedSink`] handle cloned out of this
+    /// context (see below). The only borrow of the runtime is the bridge's.
     ///
     /// A **nested** call (inside a fun a BIF applied) re-enters here through the bridge:
-    /// it takes its own heap, shares the atom table through another `Rc` handle, and
-    /// finds the tables already borrowed — so it runs without ETS (the `ets:*` BIFs raise
-    /// `unsupported_bif`, never a wrong result). Its output goes to the process's stdout,
-    /// because the outer call holds the sink.
+    /// it takes its own heap, shares the atom table through another `Rc` handle and shares
+    /// the caller's sink through a [`SharedSink`] clone, and — because the outer call did
+    /// **not** take the ETS cell (see [`Self::reentrancy_capable`]) — borrows the shared
+    /// tables and reaches the outer tables' `ets:*` operations.
     fn call_registered(
         &mut self,
         module: &str,
@@ -183,16 +235,35 @@ impl<'a> RuntimeContext<'a> {
         let atoms = self.runtime.code_server.atoms_handle();
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
-        let mut heap = self.runtime.take_bif_heap()?;        let self_pid = self.runtime.self_pid;
+        let mut heap = self.runtime.take_bif_heap()?;
+        let self_pid = self.runtime.self_pid;
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
         let result = {
             let RuntimeContext { runtime, output } = self;
-            // The tables are held for the duration of this call; a nested call finds them
-            // taken and runs without ETS rather than aliasing or panicking.
-            let mut tables = tables_handle.try_borrow_mut().ok();
-            let mut bridge = FunBridge { runtime };
+            // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
+            // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
+            // reach `ets:*`. Borrowing the shared `TableRegistry` for the whole call would
+            // leave its `RefCell` taken, so the nested `ets:*` could not borrow it. When an
+            // argument is a fun, therefore, do **not** install the tables — the cell stays
+            // free for the nested call. Nothing is lost: a BIF that takes a fun scans it
+            // with `lists`/`maps` logic and does not touch ETS itself (no M1 BIF both needs
+            // ETS *and* applies a fun argument).
+            let reentrant = Self::reentrancy_capable(args);
+            let mut tables = if reentrant {
+                None
+            } else {
+                // `try_borrow_mut` (never `borrow_mut`): an unexpected outer borrow must
+                // degrade to "no ETS", never panic.
+                tables_handle.try_borrow_mut().ok()
+            };
+            // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
+            // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`.
+            let mut bridge = FunBridge {
+                runtime,
+                output: output.clone(),
+            };
             // The port provider is another cheap handle: it holds the shared `Rc` port
             // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
             // really starts an OS process and `erlang:port_info/1,2` answers from the
@@ -201,7 +272,8 @@ impl<'a> RuntimeContext<'a> {
             let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                 .with_atom_interner(&mut pending)
                 .with_fun_caller(&mut bridge)
-                .with_port_hook(&mut ports);            if let Some(sink) = output.as_deref_mut() {
+                .with_port_hook(&mut ports);
+            if let Some(sink) = output.as_mut() {
                 context = context.with_output(sink);
             }
             if let Some(tables) = tables.as_deref_mut() {
@@ -218,6 +290,17 @@ impl<'a> RuntimeContext<'a> {
         self.runtime.put_bif_heap(heap);
         result
     }
+
+    /// Whether a call with `args` can re-enter the runtime by *applying a fun argument*.
+    ///
+    /// The `fun`-taking `lists`/`maps` BIFs (`lists:map/2`, `lists:foldl/3`, `maps:map/2`,
+    /// …) take the fun they apply as a **direct argument** and call it back through
+    /// [`FunBridge`]; a BIF with no fun argument never re-enters. [`Self::call_registered`]
+    /// uses this to decide whether it may hold the shared ETS cell for the call (see the
+    /// limitation documented there).
+    fn reentrancy_capable(args: &[Eterm]) -> bool {
+        args.iter().any(|arg| terms::is_fun(*arg))
+    }
 }
 
 /// The `beam_bifs` fun-calling seam: runs a fun term for a `fun`-taking BIF.
@@ -231,17 +314,29 @@ impl<'a> RuntimeContext<'a> {
 /// an `-eval` closure (`uniq` == [`crate::eval::EVAL_FUN_UNIQ`]) is applied through
 /// [`crate::eval::apply_eval_closure`], and every other fun is a `.beam` fun applied
 /// through `Machine::run_label` — exactly the semantics a direct `call_fun` opcode has.
+///
+/// It carries a clone of the caller's [`SharedSink`], so a nested `io:format` reaches the
+/// caller's sink rather than stdout. It carries **no** [`TableRegistry`] of its own: the
+/// outer call intentionally did not take the shared cell (see
+/// [`RuntimeContext::reentrancy_capable`]), so the nested context's own
+/// [`RuntimeContext::call_registered`] borrows it normally and `ets:*` inside the applied
+/// fun reaches the runtime's tables.
 struct FunBridge<'a> {
     /// The runtime the fun runs on.
     runtime: &'a mut Runtime,
+    /// The caller's shared output sink (stdout when unset), cloned from the outer context.
+    output: Option<SharedSink<'a>>,
 }
 
 impl FunCaller for FunBridge<'_> {
     fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
-        // A fresh nested context over the same runtime. It carries no output sink (the
-        // outer BIF call holds it), so a nested `io:format` writes to stdout — an honest
-        // Milestone-1 gap, never a wrong result.
-        let mut ctx = RuntimeContext::new(self.runtime);
+        // A fresh nested context over the same runtime, sharing the caller's output sink
+        // so a nested `io:format` reaches it. The ETS cell is left free by the outer call
+        // (it is re-entrancy-capable), so the nested `call_registered` borrows it normally.
+        let mut ctx = RuntimeContext {
+            runtime: self.runtime,
+            output: self.output.clone(),
+        };
         ctx.apply_fun(fun, args)
     }
 }
@@ -438,8 +533,10 @@ mod tests {
         let is_atom = ctx
             .call_bif("erlang", "is_atom", 1, &[a])
             .expect("is_atom(a)");
+        // `ctx` now owns a shared-sink handle (and therefore a destructor), so the runtime
+        // is reached through the context that borrows it rather than the outer binding.
         assert_eq!(
-            rt.atoms().name(atom_val(is_atom)),
+            ctx.runtime.atoms().name(atom_val(is_atom)),
             Some("true"),
             "the atom the BIF built resolves through the shared table"
         );
@@ -469,8 +566,10 @@ mod tests {
             .expect("binary_to_atom/1 interns a new name");
         // The atom the BIF built resolves through the one shared table: the name was
         // committed after the call, at exactly the index the interner predicted.
-        assert_eq!(rt.atoms().name(atom_val(atom)), Some(name));
-        assert_eq!(rt.atoms().len(), base + 1);
+        // (`ctx` holds a shared-sink handle with a destructor, so the runtime is reached
+        // through the context that borrows it.)
+        assert_eq!(ctx.runtime.atoms().name(atom_val(atom)), Some(name));
+        assert_eq!(ctx.runtime.atoms().len(), base + 1);
     }
 
     #[test]
@@ -501,6 +600,54 @@ mod tests {
         };
         assert_eq!(rt.atoms().name(atom_val(result)), Some("ok"));
         assert_eq!(sink.as_str(), "hi 7\n");
+    }
+
+    #[test]
+    fn ets_inside_an_applied_fun_reaches_the_outer_table() {
+        let mut rt = runtime();
+        // `lists:map/2` applies its fun argument through `FunBridge`; the `ets:*` calls
+        // inside that fun must reach the runtime's shared tables. Before `call_registered`
+        // stopped holding the ETS cell for a re-entrancy-capable call, the nested
+        // `ets:insert` raised `unsupported_bif` (the cell was already borrowed by the
+        // outer `lists:map/2` call), never a wrong result — but never a right one either.
+        let term = rt
+            .eval(
+                "begin T = ets:new(t, [set]), \
+                 lists:map(fun(X) -> ets:insert(T, {X, X*X}) end, [1,2,3]), \
+                 ets:lookup(T, 2) end",
+            )
+            .expect("ets:* inside a fun applied by lists:map/2");
+        let printed = rt.format_term(term, None).expect("~p renders the lookup");
+        assert_eq!(printed.trim_end(), "[{2,4}]");
+    }
+
+    #[test]
+    fn a_nested_io_format_reaches_the_callers_sink() {
+        let mut rt = runtime();
+        let mut sink = BytesSink::new();
+        {
+            let mut ctx = RuntimeContext::with_output(&mut rt, &mut sink);
+            // The `io:format/2` runs inside the fun `lists:map/2` applies; it must write to
+            // the caller's sink (shared through `SharedSink`), not to stdout.
+            crate::eval::eval(
+                &mut ctx,
+                "lists:map(fun(X) -> io:format(\"~w \", [X]) end, [1,2,3])",
+            )
+            .expect("io:format inside a fun applied by lists:map/2");
+        }
+        assert_eq!(sink.as_str(), "1 2 3 ");
+    }
+
+    #[test]
+    fn a_nested_call_without_a_fun_still_sees_the_outer_tables() {
+        let mut rt = runtime();
+        // The mirror case: a *non*-re-entrancy-capable BIF (`ets:new/2`, `ets:insert/2` here)
+        // is given the shared tables, and a fun it does not apply cannot observe them.
+        let term = rt
+            .eval("begin T = ets:new(t, [set]), ets:insert(T, {1, 11}), ets:lookup(T, 1) end")
+            .expect("a plain ets:* sequence");
+        let printed = rt.format_term(term, None).expect("~p renders the lookup");
+        assert_eq!(printed.trim_end(), "[{1,11}]");
     }
 
     #[test]
