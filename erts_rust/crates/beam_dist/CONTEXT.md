@@ -417,7 +417,7 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 2;
-  consumes `beam_codec`; adds the `connection` TCP adapter).
+  consumes `beam_codec`; adds the `connection` TCP adapter/listener and the non-blocking `driver`).
 - `../../CONTEXT.md` → workspace contracts (§1 A.5 distribution wire, §2 frozen term layout, §3 error
   strategy, §6 test gate).
 - `../../ERTS_RUST_REWRITE_EVALUATION.md` §A.5 — the distribution/ETF wire contract.
