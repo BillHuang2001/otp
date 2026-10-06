@@ -142,11 +142,17 @@ impl Table {
 
 ### `table/access.rs` — the access-enforcing view
 - `pub struct TableAccess<'a>` (from `Table::as_requester`) — rechecks `can_read`/`can_write` on
-  every op and raises `BeamError::BadArg` on a violation, exactly like `ets`.
-  `requester() -> Option<OwnerId>`, `insert`, `insert_new`, `lookup -> Result<Vec<Eterm>>`,
-  `member -> Result<bool>`, `lookup_element`, `delete`, `take -> Result<Vec<Eterm>>`,
-  `update_counter`, `update_counter_with`, `update_element`. The underlying `Table` methods stay
-  owner-level primitives (no access check).
+  every op and raises `BeamError::BadArg` on a violation, exactly like `ets`. It wraps the **whole**
+  observable `ets` surface: `requester() -> Option<OwnerId>`; write-checked `insert`, `insert_list`,
+  `insert_new`, `delete`, `delete_object`, `delete_all_objects`, `take -> Result<Vec<Eterm>>`,
+  `update_counter`, `update_counter_with`, `update_element`, `select_delete`, `match_delete`; and
+  read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
+  `lookup_element_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
+  -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
+  `is_empty -> Result<bool>`. `ordered_set` navigation needs no interior support — `first`/`last`/
+  `next`/`prev` are table-level, so the same read-checked wrappers cover them as for the hash kinds.
+  The underlying `Table` methods stay owner-level primitives (no access check). The matrix is
+  verified against the system `erl` (OTP 29 / erts-17.1).
 
 ### `table/update.rs` — `ets:update_counter`/`update_element` operand machinery
 - `pub(crate)` helpers shared with the hash interior: `counter_slot`, `add_counters`,
