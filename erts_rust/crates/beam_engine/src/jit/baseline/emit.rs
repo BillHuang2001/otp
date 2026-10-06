@@ -2,10 +2,11 @@
 //!
 //! The register allocator ([`allocate_registers`]) and the per-instruction
 //! lowering ([`emit_block`]) — the inline `move`/`swap`/`jump`/metadata set, the
+//! word-level `test` and exact-value `select_val` subsets, the
 //! deopt-and-continue sequence ([`emit_step_and_continue`]) that covers every
 //! instruction the block does not lower natively, the spill/fill discipline
-//! ([`CACHE_REGISTERS`]) and the tier's one optimisation, the guarded small-int
-//! `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]). [`compile_module`]
+//! ([`CACHE_REGISTERS`]) and the tier's one arithmetic optimisation, the guarded
+//! small-int `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]). [`compile_module`]
 //! lowers every basic block of a module into the [`CompiledModule`] artifact. See
 //! `super` for the block ABI (in `runtime`) and the driver that runs the emitted
 //! code.
@@ -312,8 +313,9 @@ fn allocate_registers_with_labels(
 /// register only counts when the emitted code would actually reference it: a `move`
 /// is counted only when [`try_inline_move`] lowers it, a `swap` only when both
 /// operands are addressable x-registers, a `test` only when [`test_plan`] claims it,
-/// and a `gc_bif` only when [`fast_arith`] does. Every other instruction
-/// contributes nothing because it stays on the helper.
+/// a `select_val` only when [`select_val_plan`] claims it (its sole register operand
+/// is the scrutinee), and a `gc_bif` only when [`fast_arith`] does. Every other
+/// instruction contributes nothing because it stays on the helper.
 fn cacheable_touches(
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
@@ -365,6 +367,15 @@ fn cacheable_touches(
                     touches.push(x);
                 }
                 if let Some(TestSrc::Reg(x)) = plan.rhs {
+                    touches.push(x);
+                }
+            }
+        }
+        // A `select_val`'s only runtime operand is the scrutinee (every case value is
+        // an immediate), and it is referenced exactly when the switch is inlined.
+        Instr::SelectVal { value, fail, pairs } => {
+            if let Some(plan) = select_val_plan(labels, value, *fail, pairs) {
+                if let TestSrc::Reg(x) = plan.scrutinee {
                     touches.push(x);
                 }
             }
@@ -482,6 +493,22 @@ fn emit_block(
                 )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
+            }
+            // The exact-value switch subset (see the section below): a chain of
+            // word compares against the immediate alternatives, each branching to its
+            // resolved target. Any other shape — a `NO_FAIL` switch, a non-immediate
+            // case value (a float/bignum/literal), an unresolved label, a `Y`/float/
+            // literal scrutinee — is the `_` arm.
+            //
+            // Unlike the `test` arm this instruction **always** transfers control
+            // (the interpreter returns a `Step::Goto` for every path), so the block
+            // ends here.
+            Instr::SelectVal { .. } => {
+                if try_inline_select_val(buffer, labels, instr, allocation, done, highest_touched)? {
+                    terminated = true;
+                    break;
+                }
+                emit_step_and_continue(buffer, done, allocation, func, pc)?;
             }
             // Everything else: one interpreter step, then continue at `pc + 1`.
             _ => emit_step_and_continue(buffer, done, allocation, func, pc)?,
@@ -1164,6 +1191,127 @@ fn try_inline_test(
     Ok(true)
 }
 
+// ---------------------------------------------------------------------------
+// The exact-value switch (`select_val`)
+// ---------------------------------------------------------------------------
+//
+// `select_val Value Fail {Value,Label}*` decides every compiled `case`/`receive`
+// arm whose patterns are literal constants — one of the most frequently executed
+// branching instructions after `test`. The interpreter
+// (`crate::interpreter`'s `Instr::SelectVal` arm) scans the alternatives in order
+// and takes the first whose candidate is **exactly** (`=:=`) equal to the scrutinee
+// (`cmp(a, b, ..).is_eq()`), falling through to `Fail` when none match (`NO_FAIL`
+// raises).
+//
+// The subset below is lowered natively and mirrors that scan branch for branch:
+//
+// * the scrutinee must be a value the tier can read word-exactly — an x-register
+//   inside `MAX_REGISTER`, or an immediate constant ([`TestSrc`]);
+// * **every** alternative must be an immediate constant — a small int (in the
+//   60-bit range), an atom, or `nil` — because `=:=` over immediates *is* a plain
+//   raw-word compare: distinct immediate classes have disjoint words (a small int's
+//   low nibble is `0xF`, an atom's low six bits are `0xB`, `nil` is `0x3B`), a boxed
+//   or list pointer can never collide with an immediate (its low bits are even), and
+//   `cmp` is the *exact* ordering (so a float/atom/bignum scrutinee is not `=:=` to
+//   an immediate unless the words coincide). A float, bignum, literal or register
+//   alternative deopts — a word compare would be wrong for those;
+// * the scrutinee and every alternative's target — the fail label included — must
+//   resolve (an unresolved label keeps the interpreter's exact `unknown_label`).
+//
+// A `NO_FAIL` switch raises on the no-match path (the helper does that exactly) and
+// deopts, as does any shape above the subset. The emitted code is a chain of
+// `cmp`/`jcc` — each match jumps to a small stub that spills the cached x-registers
+// and returns that alternative's `(func, pc)` — with the no-match path falling
+// through to the fail target's `(func, pc)`.
+
+/// The inlinable shape of a `select_val`, or `None` when the whole instruction must
+/// stay on the helper.
+struct SelectPlan {
+    /// The scrutinee's source.
+    scrutinee: TestSrc,
+    /// The `(constant word, resolved target)` alternatives, in source order.
+    cases: Vec<(i64, (u32, u32))>,
+    /// The resolved fail label's `(func, pc)`.
+    fail: (u32, u32),
+}
+
+/// The inlinable shape of a `select_val`, or `None` for any shape above the subset
+/// (a `NO_FAIL` switch, a non-immediate alternative, an unresolved label, a
+/// scrutinee the tier cannot read word-exactly). See the section comment above.
+fn select_val_plan(
+    labels: &BTreeMap<Label, (u32, u32)>,
+    value: &Operand,
+    fail: Label,
+    pairs: &[(Operand, Label)],
+) -> Option<SelectPlan> {
+    // A `NO_FAIL` switch *raises* when no alternative matches; the helper is exact.
+    if fail == NO_FAIL {
+        return None;
+    }
+    // An unresolved label keeps the interpreter's exact `unknown_label`.
+    let fail = *labels.get(&fail)?;
+    // The scrutinee must be an x-register in bound, or an immediate constant.
+    let scrutinee = test_src(value)?;
+    // Every alternative must be an immediate constant with a resolved target.
+    let mut cases = Vec::with_capacity(pairs.len());
+    for (candidate, label) in pairs {
+        let word = constant_word(candidate)?;
+        let target = *labels.get(label)?;
+        cases.push((word, target));
+    }
+    Some(SelectPlan {
+        scrutinee,
+        cases,
+        fail,
+    })
+}
+
+/// Lower an inlinable `select_val` natively, or report that the whole instruction
+/// must be handed to the helper.
+///
+/// Returns `false` **without having emitted a byte** for any shape
+/// [`select_val_plan`] refuses, so the caller falls back to exactly today's
+/// `jit_step_one`.
+fn try_inline_select_val(
+    buffer: &mut CodeBuffer,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+    allocation: &Allocation,
+    done: CodeLabel,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Instr::SelectVal { value, fail, pairs } = instr else {
+        return Ok(false);
+    };
+    let Some(plan) = select_val_plan(labels, value, *fail, pairs) else {
+        return Ok(false);
+    };
+
+    // --- the scrutinee ------------------------------------------------------
+    load_test_src(buffer, plan.scrutinee, TEST_A, allocation, highest_touched)?;
+
+    // --- one `cmp`/`jcc` per alternative (jump to the match's stub) ---------
+    let case_labels: Vec<CodeLabel> = (0..plan.cases.len()).map(|_| buffer.label()).collect();
+    for ((word, _), case_label) in plan.cases.iter().zip(&case_labels) {
+        buffer.mov_ri(TEST_T, *word)?;
+        buffer.cmp_rr(TEST_A, TEST_T)?;
+        buffer.jcc(Cond::E, *case_label)?;
+    }
+
+    // --- no alternative matched: return the fail label's `(func, pc)` -------
+    spill(buffer, allocation)?;
+    buffer.mov_ri(Reg::Rax, encode_target(plan.fail.0, plan.fail.1))?;
+    buffer.jmp(done)?;
+
+    // --- each alternative: return its target's `(func, pc)` -----------------
+    for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
+        buffer.bind(*case_label)?;
+        spill(buffer, allocation)?;
+        buffer.mov_ri(Reg::Rax, encode_target(target.0, target.1))?;
+        buffer.jmp(done)?;
+    }
+    Ok(true)
+}
 // ---------------------------------------------------------------------------
 // The small-int arithmetic fast path
 // ---------------------------------------------------------------------------

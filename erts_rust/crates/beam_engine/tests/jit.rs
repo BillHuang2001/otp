@@ -24,7 +24,9 @@ use beam_engine::{available_tiers, Machine, MinimalContext, Tier};
 use beam_loader::{
     load_file, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
-use beam_term::{is_small, make_atom, make_small, signed_value, Atom, Eterm, MAX_SMALL, MIN_SMALL};
+use beam_term::{
+    is_small, make_atom, make_small, signed_value, Atom, Eterm, MAX_SMALL, MIN_SMALL, NIL,
+};
 
 /// The `beam_loader` oracle fixture (reused, never copied).
 const SLICE_BEAM: &str = concat!(
