@@ -90,9 +90,30 @@ liveness maps.
     Result<DeliverOutcome>` — the no-off-heap convenience. `receive<F: FnMut(&Message)->bool>(&mut self,
     pred: F) -> Option<Message>` (delegates to `beam_message::receive`).
   - **GC:** `collector() -> &Collector`, `should_collect(need_words) -> bool`, `heap_used_words()`,
-    `collect(&mut self) -> Result<Collection>` (gather the root set = registers + mailbox payloads, run
-    the collector, scatter the roots back and rebuild the mailbox), `collect_if_needed(need) ->
-    Result<bool>`.
+    `collect(&mut self) -> Result<Collection>` (gather the root set = registers/stack + mailbox payloads
+    + the process dictionary + the saved BIF/NIF arguments, run the collector, then scatter each region
+    back in the same order and rebuild the mailbox), `collect_if_needed(need) -> Result<bool>`.
+### `dict.rs` — the per-process dictionary
+- `pub struct Dict` (`Default`) — the process dictionary backing `erlang:put/2`/`get/1`/`erase/1`.
+  - `new()`; `put(Key, Val) -> Option<Eterm>` (replace-in-place, last put wins; returns the replaced
+    value); `get(Key) -> Option<Eterm>`; `erase(Key) -> Option<Eterm>`; `erase_all() -> Vec<(Eterm,Eterm)>`;
+    `get_keys() -> Vec<Eterm>`; `get_keys_for_value(Val) -> Vec<Eterm>`; `len()`, `is_empty()`,
+    `entries() -> impl Iterator<Item = (Eterm, Eterm)> + '_`.
+  - **GC pair:** `gather_roots(&self, out: &mut Vec<Eterm>) -> usize` (appends each entry's key then
+    value; returns the offset at which its words begin); `scatter_roots(&mut self, roots: &[Eterm],
+    start)` (writes the relocated key/value words back; total/never-panic).
+  - **Semantics:** `Option::None` is the C `THE_NON_VALUE` (absent); the BIF layer maps it to the
+    `undefined` atom. Term-agnostic (no `AtomTable`): keys compare by raw `Eterm` word equality (exact
+    for immediates; structural equality of distinct-but-equal boxed keys is a follow-up). Holds terms
+    resident in THIS process's young heap (a `Process::collect` sub-rootset).
+### `fragments.rs` — saved BIF/NIF arguments
+- `pub struct SavedArgs` (`Default`) — the saved BIF/NIF argument root list (the C `ErlSaveCallArgs`).
+  - `new()`; `len()`, `is_empty()`, `clear()`; `push(Eterm)`; `pop() -> Option<Eterm>`;
+    `as_slice() -> &[Eterm]`; `as_mut_slice() -> &mut [Eterm]`.
+  - **GC pair:** `gather_roots(&self, out: &mut Vec<Eterm>) -> usize` / `scatter_roots(&mut self, roots:
+    &[Eterm], start)`, the LAST region `Process::collect` gathers/scatters.
+  - A real in-heap `ErlHeapFragment` type is absent from the frozen siblings (`beam_message`/`beam_gc`
+    own that follow-up); these args are a plain `Eterm` root list, not a duplicate fragment type.
 ### `run_queue.rs` — the ready queue
 - `pub struct RunQueue { ready: VecDeque<ProcessId> }` — a FIFO of runnable pids (M1: one normal
   priority queue; the C's max/high/normal/low queues are a documented follow-up).
