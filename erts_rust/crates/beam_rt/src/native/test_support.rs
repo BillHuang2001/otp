@@ -10,7 +10,7 @@
 
 use beam_bifs::NullSink;
 use beam_common::Result;
-use beam_engine::terms;
+use beam_engine::{terms, ExecutionContext};
 use beam_term::{make_atom, signed_value, Eterm};
 
 use crate::context::RuntimeContext;

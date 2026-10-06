@@ -31,9 +31,7 @@ use std::rc::Rc;
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
-use beam_process::{
-    MonitoredBy, Monitor, MonitorKind, MonitorRef, PortId, ProcessId, RefAllocator,
-};
+use beam_process::{MonitoredBy, Monitor, MonitorKind, MonitorRef, PortId, ProcessId};
 use beam_term::{atom_val, is_atom, Eterm};
 
 use crate::context::RuntimeContext;
@@ -270,7 +268,7 @@ impl RuntimeContext<'_> {
 
     /// `erlang:monitor(process, Target)` for the resolved target.
     fn monitor_process(&mut self, target: Eterm) -> Result<Eterm> {
-        let watcher = self.mailbox_pid;
+        let watcher = self.pid();
         let watched = self.monitor_target(target)?;
         let (reference, term) = self.mint_reference()?;
         if let Some(watched) = watched {
@@ -349,7 +347,7 @@ impl RuntimeContext<'_> {
     fn demonitor(&mut self, term: Eterm) -> Result<Eterm> {
         match self.runtime.references.get(&term) {
             Some(Some(reference)) => {
-                let watcher = self.mailbox_pid;
+                let watcher = self.pid();
                 let reference = *reference;
                 // The monitor is left on record, so demonitoring twice answers `true`, as
                 // the oracle's does.
@@ -368,28 +366,31 @@ impl RuntimeContext<'_> {
 ///
 /// [`PortRegistry`] exposes `contains`/`len` but no iterator (its live map is private, and
 /// `src/port.rs` is outside this change's scope), so the ids are recovered from the
-/// registry's own numbering: `PortTable::alloc` hands out the smallest free number and
-/// never shrinks its slot vector, so every open id is found by counting up from zero. The
-/// scan stops as soon as `len()` live ports have been seen, which makes [`PORT_SCAN_LIMIT`]
-/// a safety valve rather than a bound a real workload can reach.
+/// registry's own numbering: `PortTable::alloc` appends a fresh slot for each new port and
+/// never shrinks its slot vector, so every allocated id is found by counting up from zero.
+/// The scan is driven by `contains` (the **table**, i.e. an allocated slot) rather than by
+/// `len` (the **live map**): `open_port/2` calls `alloc` before `insert`, and the test
+/// floor allocates an id directly, so a port that is allocated but has no live entry is
+/// still a port `erlang:ports/0` must report. The scan stops at the first unallocated
+/// number, which is the recovery signal that the table's dense low prefix has ended;
+/// [`PORT_SCAN_LIMIT`] is a safety valve rather than a bound a real workload can reach.
+///
+/// One honest limitation: a slot released *below* a still-allocated higher slot leaves a
+/// one-number gap, and the scan stops at it, so such a higher port would not be reported
+/// until the gap is reused. `PortRegistry` exposes no slot-vector length to scan past the
+/// gap (it would need a new accessor in `src/port.rs`, outside this change's scope).
 fn open_port_ids(registry: &PortRegistry) -> Vec<PortId> {
-    let wanted = registry.len();
-    let mut ids = Vec::with_capacity(wanted);
+    let mut ids = Vec::new();
     let mut number = 0u64;
-    while ids.len() < wanted && number < PORT_SCAN_LIMIT {
+    while number < PORT_SCAN_LIMIT {
         let id = PortId::new(number);
-        if registry.contains(id) {
-            ids.push(id);
+        if !registry.contains(id) {
+            break;
         }
+        ids.push(id);
         number += 1;
     }
     ids
-}
-
-/// A reference allocator with no runtime behind it, for the unit tests' checks.
-#[cfg(test)]
-fn empty_refs() -> RefAllocator {
-    RefAllocator::new()
 }
 
 #[cfg(test)]
@@ -417,16 +418,6 @@ mod tests {
     /// The atom `name` of the floor's answer, resolved through the shared table.
     fn atom_name(runtime: &crate::Runtime, term: Eterm) -> Option<&str> {
         runtime.atom_name_of(term)
-    }
-
-    #[test]
-    fn the_test_ref_allocator_is_distinct_and_monotonic() {
-        // The helper exists only to document the id space the runtime shares; two fresh
-        // references must never compare equal.
-        let mut refs = empty_refs();
-        let (first, second) = (refs.next(), refs.next());
-        assert_ne!(first, second);
-        assert!(first.id() < second.id());
     }
 
     #[test]
@@ -692,8 +683,8 @@ mod tests {
         );
         // A registry holding one port reports exactly that one port term.
         let id = runtime
-            .ports_borrow_mut()
-            .expect("the port registry")
+            .ports
+            .borrow_mut()
             .alloc()
             .expect("a port id");
         let ports = call(&mut runtime, "erlang", "ports", &[]).expect("ports/0");

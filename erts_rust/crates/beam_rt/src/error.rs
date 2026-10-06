@@ -423,4 +423,32 @@ mod tests {
             .to_string()
             .contains("slice:add/2"));
     }
+
+    #[test]
+    fn known_unimplemented_bifs_are_capability_gaps_and_never_shadow_the_registry() {
+        // A curated entry is a documented capability gap, classified by the same
+        // convention as every other `unsupported*` raise (so the CLI exits 3), not the
+        // plain `is not a BIF` diagnostic a typo gets.
+        assert!(is_known_unimplemented_bif("spawn", 1));
+        assert!(unsupported_reason(&known_unimplemented_bif("spawn", 1)).is_some());
+        assert!(
+            unsupported_reason(&known_unimplemented_bif("spawn", 1))
+                .expect("a capability gap")
+                .contains("erlang:spawn/1")
+        );
+        // An arity that is not curated is not a known gap.
+        assert!(!is_known_unimplemented_bif("spawn", 0));
+        assert!(!is_known_unimplemented_bif("nope", 1));
+
+        // A name `beam_bifs` DOES own must never be on the list: the registry is
+        // consulted *before* the classification, so such an entry would be dead — and the
+        // list would be lying about the runtime's surface.
+        let registry = beam_bifs::default_registry();
+        for (module, function, arity) in registry.names() {
+            assert!(
+                !(module == "erlang" && is_known_unimplemented_bif(&function, arity)),
+                "erlang:{function}/{arity} is a registered BIF and must not be listed as unimplemented"
+            );
+        }
+    }
 }

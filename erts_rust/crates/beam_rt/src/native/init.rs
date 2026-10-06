@@ -107,6 +107,7 @@ mod tests {
 
     use super::*;
     use crate::native::test_support::{atom, call, runtime, string_of};
+    use crate::runtime::Runtime;
 
     #[test]
     fn get_argument_reports_occurrences_and_absent_flags() {
