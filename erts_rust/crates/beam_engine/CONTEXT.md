@@ -263,5 +263,5 @@ The remaining execution gaps the standard compiler emits for real OTP modules, p
 - `../../CONTEXT.md` §4 → the engine IR seam and the root-set contract (`x[0..live)` + whole stack, no liveness maps).
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §E/§F/§G → IR seam, interpreter/JIT trade-offs, tiering rationale.
 - `../beam_loader/CONTEXT.md` → the IR types (`Module`/`Function`/`Instr`/`Operand`/`TestKind`/`HeapNeed`/`LiteralArea`) and their exact meaning.
-- `../beam_term/CONTEXT.md` → `Eterm`, `make_small`/`make_atom`/`NIL`, `cmp`/`eq`/`cmp_arith`, `number::big_to_f64`, `map::write_map` (the engine's term API), and its §Handoffs (the shared structured-reason requirement).
+- `../beam_term/CONTEXT.md` → `Eterm`, `make_small`/`make_atom`/`NIL`, `cmp`/`eq`/`cmp_arith`, `number::big_to_f64`, `map::write_map` (the engine's term API).
 - `../beam_rt/` → the Stage-5 runtime that supplies the concrete `ExecutionContext`.
