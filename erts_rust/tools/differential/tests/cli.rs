@@ -29,6 +29,12 @@ impl Invocation {
 fn invoke(args: &[&str], envs: &[(&str, &str)]) -> Invocation {
     let mut command = Command::new(env!("CARGO_BIN_EXE_differential"));
     command.args(args).envs(envs.iter().copied());
+    // Point the child at a **worktree-local** temp dir instead of the ambient `$TMPDIR`: the
+    // child's own scratch (e.g. the `.beam` files `module_build` compiles for module-run cases)
+    // would otherwise land in the shared/volatile `$TMPDIR` this task exists to keep test
+    // fixtures out of (`common::scratch_root`). This makes the tests independent of `$TMPDIR`
+    // entirely — they pass even when it is missing or read-only.
+    command.env("TMPDIR", common::scratch_root());
     let output = command.output().expect("spawn the differential binary");
     Invocation {
         code: output.status.code(),
@@ -42,7 +48,10 @@ struct Scratch(PathBuf);
 
 impl Scratch {
     fn new(tag: &str) -> Scratch {
-        let dir = std::env::temp_dir().join(format!(
+        // Derived from the worktree-local scratch root, not the shared/volatile `$TMPDIR`
+        // (see `common::scratch_root`); only the program path differs, the tag + pid + thread
+        // id suffix keeps each scratch unique within the run.
+        let dir = common::scratch_root().join(format!(
             "differential-cli-{}-{:?}-{tag}",
             std::process::id(),
             std::thread::current().id()

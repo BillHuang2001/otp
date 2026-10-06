@@ -23,6 +23,27 @@
 
 use std::path::{Path, PathBuf};
 
+/// A **worktree-local** scratch root for the integration tests, created if needed.
+///
+/// Historically the tests used [`std::env::temp_dir`] (i.e. `$TMPDIR`, `/tmp`). That is the
+/// wrong place to keep test fixtures: it is a *shared* directory, and in a sandbox it can be
+/// cleaned or reused by a sibling worker/task between the moment a fixture is written and the
+/// moment it is read (this flaked once with a transient `ENOENT` when the child tried to
+/// `exec` a fake `$BEAM_RT` written under `$TMPDIR`). `CARGO_TARGET_TMPDIR` is Cargo's
+/// answer: a per-test-binary, per-worktree temp root (`<worktree>/erts_rust/target/tmp`),
+/// private to this build and not touched by anyone else.
+///
+/// It is a compile-time constant (`env!`), so the directory is known without any environment
+/// lookup at run time. Creation failure is **loud** (a panic with the offending path): a
+/// scratch root that cannot be created means the test cannot run honestly, never that it
+/// should silently pass.
+pub fn scratch_root() -> PathBuf {
+    let root = PathBuf::from(env!("CARGO_TARGET_TMPDIR"));
+    std::fs::create_dir_all(&root)
+        .unwrap_or_else(|err| panic!("cannot create the scratch root {}: {err}", root.display()));
+    root
+}
+
 /// The freshly built `beam_rt` sitting next to this crate's test binary, if it exists.
 ///
 /// Returned only when the file actually exists. The name uses
