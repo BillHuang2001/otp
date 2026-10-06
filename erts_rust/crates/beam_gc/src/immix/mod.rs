@@ -628,6 +628,13 @@ impl ImmixSpace {
         self.blocks[b].marked.get() & line_bit(l) != 0
     }
 
+    /// Whether the line is retained in place by the running collection: either a
+    /// **pinned** live object's own line, or a fresh **destination** line an evacuation
+    /// reserved (`reserve_for_copy`). Both survive [`finalize`](ImmixSpace::finalize).
+    fn line_kept(&self, b: usize, l: usize) -> bool {
+        self.blocks[b].kept.get() & line_bit(l) != 0
+    }
+
     /// The block's `AllMarked` / `Partial` / `Free` classification.
     fn block_state(&self, b: usize) -> BlockState {
         self.blocks[b].state.get()

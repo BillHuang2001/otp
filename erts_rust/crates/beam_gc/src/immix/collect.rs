@@ -96,12 +96,24 @@ impl EvacDest for ImmixSpace {
 impl ImmixSpace {
     /// Classifies the object named by a reference word.
     ///
-    /// `Target::Foreign` covers four different reasons to leave a reference alone, and in
+    /// `Target::Foreign` covers five different reasons to leave a reference alone, and in
     /// every one of them that is the correct answer: the pointer is outside the region (a
     /// literal, an off-heap MSO/binary, another space), it falls in an unallocated line
     /// (memory this collection already reclaimed), it falls in an unmarked line (a copy
-    /// this collection just made — already in its final position), or its block is
-    /// `AllMarked` (pinned by the full-block rule).
+    /// this collection just made — already in its final position), its block is
+    /// `AllMarked` (pinned by the full-block rule), or its line is in the `kept` bitmap.
+    ///
+    /// The `kept` test is what makes the *hole* pinning rule of
+    /// [`ImmixSpace::evacuate`] sound: an object that no hole could hold is retained in
+    /// place by [`ImmixSpace::add_kept`], so a reference to it must be left verbatim —
+    /// otherwise the fix-up pass would try to copy it a second time, find the same absence
+    /// of a hole, and fail an otherwise-satisfiable collection. A `kept` line cannot also
+    /// be a *to-be-evacuated* source: destinations are always unmarked holes, while every
+    /// object still pending evacuation sits on a marked line, and a live line is never a
+    /// destination. So a `kept` line is either a pinned source or an already-written
+    /// destination — both final positions — and treating it as `Foreign` is exact for
+    /// multi-line objects and cons cells alike (a reference always names the object's
+    /// first line, which is the line `add_kept` set).
     fn classify_ref(&self, ptr: *const Eterm, boxed: bool) -> Target {
         let Some((b, l)) = self.locate(ptr) else {
             return Target::Foreign;
@@ -109,6 +121,7 @@ impl ImmixSpace {
         if !self.line_allocated(b, l)
             || !self.line_marked(b, l)
             || self.block_state(b) == BlockState::AllMarked
+            || self.line_kept(b, l)
         {
             return Target::Foreign;
         }

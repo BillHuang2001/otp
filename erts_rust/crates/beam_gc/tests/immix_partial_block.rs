@@ -17,16 +17,14 @@
 //!    object's reference *into* an evacuated block still follows the copy;
 //! 3. the space is **immediately reusable** afterwards: the lines a collection freed are
 //!    handed straight back out to the mutator;
-//! 4. the *other* pinning rule — "no hole large enough" — currently fails; see
-//!    [`a_pinned_object_s_reference_is_evacuated_follows_the_copy`]-adjacent note and the
-//!    KNOWN DEFECT test at the end of this file (recorded, with the one-line fix, rather
-//!    than silently asserted around).
+//! 4. the *other* pinning rule — "no hole large enough" — retains the object in place: a
+//!    live object too large for any hole stays at its own address, its references are left
+//!    verbatim, and the collection still succeeds (see the last test in this file).
 //!
 //! `unsafe` below only dereferences pointers this test allocated itself (through the
 //! space's own `cons`/`tuple` builders) or that a collection just wrote; every block
 //! carries a `// SAFETY:` rationale.
 
-use beam_common::{AllocKind, BeamError};
 use beam_gc::prelude::{ImmixSpace, BLOCK_WORDS, LINES_PER_BLOCK, LINE_WORDS};
 use beam_term::prelude::{
     arityval, boxed_val, is_arity_value, is_list, list_val, make_small, signed_value, Eterm, NIL,
@@ -324,43 +322,38 @@ fn a_pinned_object_s_reference_is_evacuated_follows_the_copy() {
 }
 
 // ---------------------------------------------------------------------------
-// KNOWN DEFECT: the "no hole large enough" pinning rule
+// 4: the "no hole large enough" pinning rule
 // ---------------------------------------------------------------------------
 
-/// **KNOWLEDGE RECORDED, NOT BEHAVIOUR ENDORSED.**
+/// An object too large for any hole is **retained in place**, and references to it stay put.
 ///
 /// A 3-line object in a block whose remaining free lines are all isolated cannot be moved
 /// anywhere: the documented rule (`ImmixStats::objects_pinned`: "live objects left in place
-/// … because the space had no hole large enough") is to **retain it where it is** and
-/// evacuate the one-line objects around it into the one-line holes. The collection is
-/// perfectly satisfiable — the desired result is one pinned object (`objects_pinned` 1,
-/// `lines_pinned` 3, `words_pinned` 33), six evacuated ones, `blocks_reclaimed` 0, nine
-/// lines retained and therefore seven free lines (`words_reclaimed == 7 * LINE_WORDS`).
+/// … because the space had no hole large enough") is to retain it where it is and evacuate
+/// the one-line objects around it into the one-line holes. The collection is perfectly
+/// satisfiable: one pinned object (`objects_pinned` 1, `lines_pinned` 3, `words_pinned` 33),
+/// six evacuated ones, `blocks_reclaimed` 0, nine lines retained and therefore seven free
+/// lines (`words_reclaimed == 7 * LINE_WORDS`).
 ///
-/// It does not do that. `ImmixSpace::classify_ref` (`src/immix/collect.rs`) answers "must
-/// this reference be moved?" from the line's `allocated`/`marked` bits and the *block*
-/// state only; it never consults the `kept` bitmap that records "retained in place". A
-/// hole-pinned object therefore still classifies as `Live`, so `evacuate`'s final
-/// root-and-slot forwarding pass tries to copy it a second time, finds no hole (the very
-/// reason it was pinned) and fails the whole collection with the spurious
-/// `BeamError::Alloc(AllocFailure { kind: Heap, requested: 33 * 8 })` — after the walk has
-/// already written forwarding markers into the six objects it evacuated.
-///
-/// The fix belongs to `src/immix/collect.rs` (not to this evidence-only file): make
-/// `classify_ref` return `Target::Foreign` for a line in the `kept` bitmap, i.e. add
-/// `|| self.line_kept(b, l)` to the guard that already covers `!allocated`, `!marked` and
-/// `AllMarked`. This test then becomes a pinning test asserting the statistics written out
-/// above.
+/// For that to hold, `ImmixSpace::classify_ref` (`src/immix/collect.rs`) must answer "must
+/// this reference be moved?" from the `kept` bitmap that records "retained in place" *as
+/// well as* the line's `allocated`/`marked` bits and the block state: a pinned line
+/// classifies as `Target::Foreign`. Otherwise a hole-pinned object still classifies as
+/// `Live`, and `evacuate`'s final root-and-slot forwarding pass tries to copy it a second
+/// time, finds no hole (the very reason it was pinned) and fails the whole collection with
+/// a spurious `BeamError::Alloc(AllocFailure { kind: Heap, .. })` — after the walk has
+/// already written forwarding markers into the objects it evacuated.
 #[test]
-fn object_pinned_for_want_of_a_fitting_hole_reports_a_spurious_exhaustion() {
-    // One block, sixteen lines: a 32-element tuple spans lines 0..2, six live one-line
-    // tuples occupy lines 3,5,7,9,11,13 and lines 4,6,8,10,12,14,15 are dead — seven free
-    // lines, none of them part of a run of three.
+fn object_pinned_for_want_of_a_fitting_hole_is_retained_and_its_reference_is_left_verbatim() {
+    // One block, sixteen lines: a 32-element tuple spans lines 0..2; one live cons cell
+    // (holding the large tuple) and five live one-line tuples occupy lines 3,5,7,9,11,13,
+    // and lines 4,6,8,10,12,14,15 are dead — seven free lines, none of them part of a run
+    // of three.
     let mut s = space(BLOCK_WORDS);
 
     let elems: Vec<Eterm> = (0..32).map(|i| make_small(i as i64)).collect();
     let big = s.tuple(&elems).expect("large tuple"); // lines 0,1,2 — live
-    let l1 = s.tuple(&[make_small(1)]).expect("l1"); // line 3, live
+    let holder = s.cons(big, NIL).expect("holder"); // line 3, live — refers to `big`
     let _d1 = s.tuple(&[make_small(901)]).expect("d1"); // line 4, dead
     let l2 = s.tuple(&[make_small(2)]).expect("l2"); // line 5, live
     let _d2 = s.tuple(&[make_small(902)]).expect("d2"); // line 6, dead
@@ -376,40 +369,74 @@ fn object_pinned_for_want_of_a_fitting_hole_reports_a_spurious_exhaustion() {
 
     assert_eq!(s.used_lines(), LINES_PER_BLOCK, "the block is full");
     assert_eq!(s.free_lines(), 0);
-    // The marks are exactly the nine live lines (the three of the large tuple plus the six
-    // one-line tuples), so the block classifies as `Partial` — the large object is *not*
+    // The marks are exactly the nine live lines (three of the large tuple plus the six
+    // one-line objects), so the block classifies as `Partial` — the large object is *not*
     // saved by the full-block rule.
-    let mut roots: Vec<Eterm> = vec![big, l1, l2, l3, l4, l5, l6];
+    let mut roots: Vec<Eterm> = vec![big, holder, l2, l3, l4, l5, l6];
+    let before = roots.clone();
     s.mark(&roots, &[]).expect("mark");
     assert_eq!(s.counters().lines_marked, 9);
     assert_eq!(s.counters().blocks_partial, 1);
     assert_eq!(s.counters().blocks_all_marked, 0);
 
+    // The collection is satisfiable and must *succeed*: the large tuple is retained in
+    // place and the one-line objects around it are evacuated into the one-line holes.
     let mut promoted: [Eterm; 0] = [];
-    let err = s
-        .collect(&mut roots, &mut promoted)
-        .expect_err("the collection is satisfiable, so this is the defect");
+    let stats = s.collect(&mut roots, &mut promoted).expect("collect");
 
-    // The failure is the crate's typed, retryable heap exhaustion, raised for the 33-word
-    // (264-byte) copy of the object the walk had already decided to retain.
-    match err {
-        BeamError::Alloc(failure) => {
-            assert_eq!(failure.kind, AllocKind::Heap);
-            assert_eq!(failure.requested, 33 * 8, "a 32-element tuple is 33 words");
-        }
-        other => panic!("expected the spurious heap exhaustion, got {other:?}"),
-    }
-    // Nothing was corrupted at the point of failure: the pinned object still sits at its
-    // original address (the forwarding pass failed before touching the root), and the
-    // seven dead lines are still accounted as free-headroom candidates...
-    assert_eq!(roots[0].raw(), big.raw(), "the object was never moved");
-    // ... while the six evacuated objects' destination lines were already claimed, so the
-    // space is left part-way through the collection — which is why this is a defect and not
-    // a "please collect again and retry" signal.
+    // (a) The large tuple was pinned for want of a fitting hole, not evacuated: its own
+    // address is byte-identical before and after, and it is reported as pinned.
     assert_eq!(
-        s.counters().lines_marked,
-        9,
-        "the marks are unchanged (finalize never ran)"
+        roots[0].raw(),
+        big.raw(),
+        "the object pinned for want of a fitting hole stayed in place"
     );
-    assert_eq!(roots.len(), 7, "the roots were not rewritten");
+    assert_eq!(stats.objects_pinned, 1);
+    assert_eq!(stats.lines_pinned, 3);
+    assert_eq!(stats.words_pinned, 33, "a 32-element tuple is 33 words");
+    assert_eq!(tuple_to_smalls(roots[0]), (0..32i64).collect::<Vec<_>>());
+
+    // (b) Every live root still resolves inside the space, and the six one-line objects
+    // were evacuated into the holes (their addresses changed).
+    for (i, root) in roots.iter().enumerate() {
+        assert!(
+            s.contains_term(*root),
+            "root {i} must be resident in the space after the collection"
+        );
+    }
+    for i in 1..roots.len() {
+        assert_ne!(
+            before[i].raw(),
+            roots[i].raw(),
+            "one-line object {i} was evacuated into a fitting hole"
+        );
+    }
+    assert_eq!(stats.objects_evacuated, 6);
+    assert_eq!(stats.lines_evacuated, 6);
+    assert_eq!(
+        stats.blocks_reclaimed, 0,
+        "the block still holds the pinned object"
+    );
+
+    // (c) The evacuated holder's reference to the pinned object resolves to the pinned
+    // object's (unchanged) address — left verbatim, not copied a second time and not fatal.
+    // SAFETY: `roots[1]` is a live cons cell in this space.
+    unsafe {
+        assert_eq!(
+            *list_val(roots[1]),
+            roots[0],
+            "the reference to the pinned object is left verbatim"
+        );
+        assert_eq!(*list_val(roots[1]).add(1), NIL);
+    }
+    // The remaining one-line tuples kept their contents.
+    for (i, term) in roots[2..].iter().enumerate() {
+        assert_eq!(tuple_to_smalls(*term), vec![i as i64 + 2]);
+    }
+
+    // Nine lines survive (three for the pinned object + six destination lines), so seven of
+    // the block's sixteen lines are free again.
+    assert_eq!(s.used_lines(), 9);
+    assert_eq!(s.free_lines(), 7);
+    assert_eq!(stats.words_reclaimed, 7 * LINE_WORDS);
 }
