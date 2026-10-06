@@ -107,10 +107,10 @@
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
 //!   `system_limit` (the same documented gap as
 //!   [`crate::convert`]'s `integer_to_list`/`list_to_integer`).
-//! * **`float_to_binary/2` option `short` is unsupported** (`badarg`), exactly as
-//!   in [`crate::convert`]'s `float_to_list/2`: it selects Ryu's shortest
-//!   round-trip rendering, which the Stage-0 formatter does not implement.
-//! * **`binary_to_atom`/`binary_to_existing_atom` and `binary_to_term` need the
+//! * **`float_to_binary/2` option `short`** is the shortest round-trip
+//!   rendering, byte-identical to [`crate::convert`]'s `float_to_list/2` with
+//!   the same option (`float_to_binary(1.0e10, [short])` ⇒ `<<"1.0e10">>`); see
+//!   [`crate::numeric`] for the notation and exact-tie rules.//! * **`binary_to_atom`/`binary_to_existing_atom` and `binary_to_term` need the
 //!   [`AtomInterner`](crate::context::AtomInterner) hook to *create* an atom.**
 //!   The context only borrows the atom table immutably, so a name that is not
 //!   already interned reports
@@ -1564,11 +1564,22 @@ mod tests {
                 .expect("fits");
             assert_badarg(float_to_binary_2(ctx, &[float, both]));
             assert_badarg(float_to_binary_2(ctx, &[float, ctx.atom("a").expect("seeded")]));
-            // `short` selects Ryu's shortest rendering, which M1 does not implement
-            // (documented gap).
+            // `short` is the shortest round-trip rendering, byte-identical to
+            // `float_to_list/2` with the same option.
             let short = ctx.list(&[ctx.atom("short").expect("seeded")]).expect("fits");
-            assert_badarg(float_to_binary_2(ctx, &[float, short]));
-        });
+            for (value, expected) in [
+                (1.5f64, &b"1.5"[..]),
+                (1.0e10, b"1.0e10"),
+                (1.0e-4, b"0.0001"),
+                (123456789.0, b"123456789.0"),
+                (9_007_199_254_740_992.0, b"9.007199254740992e15"),
+                (f64::from_bits(0x3e70_0000_0000_0000), b"5.960464477539063e-8"),
+                (-0.0, b"-0.0"),
+            ] {
+                let number = ctx.make_float(value).expect("fits");
+                let term = float_to_binary_2(ctx, &[number, short]).expect("renders");
+                assert_eq!(&text(term), expected, "float_to_binary({value}, [short])");
+            }        });
     }
 
     #[test]

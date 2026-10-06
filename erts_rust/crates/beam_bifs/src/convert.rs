@@ -30,7 +30,11 @@
 //! * `list_to_float("1.5")` ⇒ `1.5`, `("1.5e3")` ⇒ `1500.0`, `("1,5")` ⇒ `1.5`
 //!   (the comma radix is accepted); `"1"`, `"1."`, `".5"`, `"1e3"`, `" 1.5"` and
 //!   an overflow such as `"1.0e309"` ⇒ `badarg`.
-//! * `min(1.0, 1)` ⇒ `1.0` and `max(1, 1.0)` ⇒ `1`: both use the arithmetic term
+//! * `float_to_list(F, [short])` ⇒ the oracle's shortest round-trip rendering:
+//!   `(1.0)` ⇒ `"1.0"`, `(1.0e10)` ⇒ `"1.0e10"`, `(1.0e-4)` ⇒ `"0.0001"`,
+//!   `(123456789.0)` ⇒ `"123456789.0"`, `(9007199254740992.0)` ⇒
+//!   `"9.007199254740992e15"`, `(-0.0)` ⇒ `"-0.0"` ([`crate::numeric`] pins the
+//!   notation, exponent-spelling and exact-tie rules).//! * `min(1.0, 1)` ⇒ `1.0` and `max(1, 1.0)` ⇒ `1`: both use the arithmetic term
 //!   order and return the *first* argument when the two compare equal
 //!   (`min(A,B) when A > B -> B; min(A,_) -> A.` in `erlang.erl`).
 //! * `round(1.5)` ⇒ `2`, `round(-1.5)` ⇒ `-2`, `round(2.5)` ⇒ `3` (halves away
@@ -50,11 +54,10 @@
 //!   as the oracle's does (`list_to_integer` of a 30-digit string, `round/1` of
 //!   `1.0e30`). Other integer-producing BIFs may still report
 //!   [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit).
-//! * **`float_to_list` option `short` is unsupported** (`badarg`): it selects
-//!   Ryu's shortest round-trip rendering. `{decimals, N}`, `{scientific, N}`
-//!   and `compact` are supported; the oracle's rendering buffer is 256 bytes, so
-//!   a rendering longer than 255 characters is `badarg` here exactly as there.
-//! * **`raise/3` carries atom reasons only.** `beam_common::ExitReason` encodes
+//! * **The rendering buffer bound is the oracle's.** `float_to_list/2` is
+//!   `badarg` for a rendering longer than the C's 255 characters *plus* its
+//!   terminating NUL — unreachable for the `short` form (24 characters at most)
+//!   and reachable only for an extreme `{decimals, N}`.//! * **`raise/3` carries atom reasons only.** `beam_common::ExitReason` encodes
 //!   an atom reason (named or `Atom(name)`) but no reason *term* (see
 //!   [`crate::reason`]); a non-atom reason is therefore reported as `badarg`
 //!   rather than raised. (erts-17.1 raises the term; the same representational
@@ -884,12 +887,37 @@ mod tests {
             let both = options(ctx, &[s5, d2]);
             assert_eq!(spell(float_to_list_2(ctx, &[value, both]).expect("ok")), "1.50");
 
-            // Unsupported/invalid options.
+            // `short` is the shortest round-trip form (the oracle's `[short]`).
             let short_opts = options(ctx, &[short]);
-            assert!(matches!(
-                float_to_list_2(ctx, &[value, short_opts]),
-                Err(BeamError::BadArg)
-            ));
+            for (value, expected) in [
+                (1.0f64, "1.0"),
+                (1.0e10, "1.0e10"),
+                (1.0e-4, "0.0001"),
+                (1000.0, "1.0e3"),
+                (123456789.0, "123456789.0"),
+                (9_007_199_254_740_992.0, "9.007199254740992e15"),
+                (0.0, "0.0"),
+                (-0.0, "-0.0"),
+                (1.0 / 3.0, "0.3333333333333333"),
+            ] {
+                let value_term = ctx.make_float(value).expect("fits");
+                let rendered = float_to_list_2(ctx, &[value_term, short_opts]).expect("renders");
+                assert_eq!(spell(rendered), expected, "float_to_list({value:?}, [short])");
+            }
+            // A later option still wins over `short`.
+            let d_two = decimals(ctx, 2);
+            let short_then_decimals = options(ctx, &[short, d_two]);
+            assert_eq!(
+                spell(float_to_list_2(ctx, &[value, short_then_decimals]).expect("ok")),
+                "1.50"
+            );
+            let s_one = scientific(ctx, 1);
+            let scientific_then_short = options(ctx, &[s_one, short]);
+            assert_eq!(
+                spell(float_to_list_2(ctx, &[value, scientific_then_short]).expect("ok")),
+                "1.5"
+            );
+            // Unsupported/invalid options.
             let unknown = options(ctx, &[beam_term::make_atom(atoms().lookup("a").expect("seeded"))]);
             assert!(matches!(
                 float_to_list_2(ctx, &[value, unknown]),
