@@ -300,7 +300,7 @@ impl Table {
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs`, `ets_nav.rs` (incl. the
   order-independent hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 53 ETS tests + 18 select
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 60 ETS tests + 18 select
   tests.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 61 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
