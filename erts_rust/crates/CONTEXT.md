@@ -243,6 +243,29 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
   `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
   by `beam_gc`.
+- **Term-carrying structured raise reasons landed (coordinated across three crates).** `beam_common::Raise`
+  gained an **opaque live-reason slot** — `pub live_reason: Option<LiveReason>`, `Raise::with_live_reason`/
+  `raise.live_reason()`, `LiveReason::new<T: Any + Send + Sync + 'static>` + `downcast_ref<T>()` — whose
+  payload convention is the **live reason term as a `beam_term::Eterm`**. `ExitReason` is unchanged
+  (`ExitReason::Structured` stays a unit variant, so `as_atom()` is still `None`; the slot is invisible to
+  `Debug`/`PartialEq`). `beam_engine` populates it on **every** raise (`Machine::throw_with_trace` attaches
+  the term on an uncaught raise; `Machine::raise_bif_error` now lands a BIF raise that carries a term in a
+  live catch frame, matching C's `handle_error` → `next_catch`). `beam_bifs` attaches the true reason term
+  instead of collapsing to a bare `badarg`: `{badmap,M}`, `{badkey,K}`, `{case_clause,V}`,
+  `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
+  `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). The one remaining
+  degradation is a tag atom that cannot be interned (no `AtomInterner` hook) ⇒ plain `badarg`.
+  **Consequences for sibling nodes:** `beam_term/CONTEXT.md` §Handoffs' "a structured reason carries no
+  term" entry can be pruned, and `beam_rt::runner::exit_reason` can replace its `<structured reason>`
+  placeholder by reading the slot.
+- **The OTP-29 native-record opcode family is fully modelled and executed.** `beam_loader` lowers all eight
+  members (`is_any_native_record/2`, `is_native_record/4`, `get_record_elements/3`, `put_record/6`,
+  `is_record_accessible/3`, `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`) to
+  typed `Instr` variants instead of `Instr::Generic`, and `beam_engine`'s records family
+  (`families/records/{mod,raw,tests}.rs`) executes them — branching to the fail label on exactly the
+  record-semantics failures the C branches on, and returning a typed `unsupported` only for a genuine
+  capability gap. Documented gap: `put_record/6`'s **create** form (`Src == nil`) is a typed `unsupported`
+  (the C resolves the definition through the code-server record table, which this runtime lacks).
 
 ## Known Structural Debt (candidates for the next pass)
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
