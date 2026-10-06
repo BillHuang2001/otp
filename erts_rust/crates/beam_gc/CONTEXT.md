@@ -15,7 +15,8 @@ Contracts honoured here (crate-layer `../CONTEXT.md`): the **root-set contract**
 + the whole stack, **no frame liveness maps**), the **frozen term layout** (§2 — *never* assume a
 different `Eterm` layout; build/inspect only through `beam_term`), and the **return-based error
 strategy** (§3). MMTk and Boehm are **rejected**; GenImmix is a **measurement-gated** mature-generation
-option and is **out of scope** (see Known Gaps).
+option — implemented (`immix/` + `immix_collector.rs`) and selectable through `GcConfig`/`AnyCollector`,
+but never on the default path (see Design Decisions).
 
 ## API Surface (the seam dependents design against)
 Re-exported at the crate root and via `beam_gc::prelude::*`.
