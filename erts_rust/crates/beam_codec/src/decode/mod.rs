@@ -8,9 +8,11 @@
 //!
 //! This module is safe Rust; the raw heap writes it needs live in
 //! [`crate::term`]. The fun/export tag arms' helpers live in the child [`fun`]
-//! module, as a second `impl` block on [`Decoder`].
+//! module and the native-record arm in the child [`record`] module, each as a second
+//! `impl` block on [`Decoder`].
 
 mod fun;
+mod record;
 
 use core::mem::size_of;
 use core::str;
@@ -23,7 +25,7 @@ use beam_term::prelude::{
 use beam_term::{AtomTable, Eterm};
 
 use crate::atom_cache::AtomCache;
-use crate::error::{bad_arg, system_limit, unsupported};
+use crate::error::{bad_arg, system_limit};
 use crate::reader::Reader;
 use crate::tag::{Tag, COMPRESSED_EXT, VERSION_MAGIC};
 
@@ -81,8 +83,8 @@ impl<'a> Decoder<'a> {
     /// transport wrapper, never a term), invalid UTF-8 in an atom name or an unset
     /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
     /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
-    /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
-    /// ([`Tag::Record`]) yields [`crate::error::unsupported`].
+    /// `BeamError::Alloc`. Every recognized tag is implemented, so this decoder never
+    /// reports [`crate::error::unsupported`].
     ///
     /// [`Tag::Local`] is **not a term tag**: it is the `term_to_binary/2 [local]`
     /// wrapper `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`. As the C does
@@ -362,14 +364,13 @@ impl<'a> Decoder<'a> {
             Tag::DistHeader => Err(bad_arg()),
 
             // ---------------------------------------------------------------
-            // Deliberately unsupported in M1 — never a wrong term
+            // Native records
             // ---------------------------------------------------------------
-            // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
-            // records encode as tuples). Recognized, implementation pending — blocked
-            // on a `beam_term` record layout (`ErtsRecordInstance`/
-            // `ErtsRecordDefinition`, `erl_record.h`), which the term-layout owner does
-            // not expose. Never a wrong term.
-            Tag::Record => Err(unsupported(tag)),
+            // `RECORD_EXT` (`67`): the legacy native-record term (ordinary Erlang
+            // records encode as tuples). Handled inside the shared walker, like the
+            // fun family, so a record nested in a tuple/list/map decodes as a
+            // sub-term; the interior block is `beam_term::record`'s.
+            Tag::Record => self.decode_record(heap, atoms),
         }
     }
 
@@ -606,7 +607,6 @@ mod tests {
     use beam_common::BeamError;
     use beam_term::prelude::{atom_val, is_list, is_nil, is_small, signed_value};
 
-    use crate::error::is_unsupported;
     use crate::term::{
         big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
         external_port_parts, external_ref_parts, flatmap_parts, float_value, tuple_arity,
@@ -648,11 +648,6 @@ mod tests {
             BeamError::SystemLimit => {}
             other => panic!("expected SystemLimit, got {other:?}"),
         }
-    }
-
-    fn assert_unsupported(bytes: &[u8]) {
-        let err = decode_err(bytes);
-        assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
     }
 
     /// The UTF-8 `"n1"` node atom, as it appears in an external identifier.
@@ -1164,9 +1159,9 @@ mod tests {
         assert_bad_arg(&[131, Tag::Fun.as_byte()]);
         assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
 
-        // `RECORD_EXT` is recognized but not implemented: reported, never guessed
-        // (blocked on a `beam_term` record layout, `erl_record.h` — see `Tag::Record`).
-        assert_unsupported(&[131, Tag::Record.as_byte()]);
+        // `RECORD_EXT` (67) is implemented now, so a bare tag byte is a *truncation*
+        // (the count, flags and fields are missing) — BadArg, never `unsupported`.
+        assert_bad_arg(&[131, Tag::Record.as_byte()]);
 
         // `LOCAL_EXT` (121) is honoured now as the `[local]` wrapper, so a bare tag
         // byte is a *truncation* (the 4-byte hash and the term are missing) — BadArg,

@@ -1,13 +1,13 @@
 //! Thin forwarding layer over [`beam_term::thing`], [`beam_term::fun`],
-//! [`beam_term::tuple`] and [`beam_term::list`], split into the local **bitstring
-//! word-layout shim** ([`binary`]) and the **fun / export forwarding layer**
-//! ([`fun`]).
+//! [`beam_term::record`], [`beam_term::tuple`] and [`beam_term::list`], split into the
+//! local **bitstring word-layout shim** ([`binary`]) and the **fun / export** ([`fun`])
+//! and **native-record** ([`record`]) forwarding layers.
 //!
 //! The frozen interior layout of a float, a bignum, a flat map, the external
-//! pid/port/ref blocks **and every kind of fun/export** is owned by [`beam_term`]
-//! (the lowest common ancestor for term operations — workspace `CONTEXT.md` §2,
-//! "No duplication across crates"). Every constructor and accessor here therefore
-//! only:
+//! pid/port/ref blocks, **every kind of fun/export** and a **native record**, is owned
+//! by [`beam_term`] (the lowest common ancestor for term operations — workspace
+//! `CONTEXT.md` §2, "No duplication across crates"). Every constructor and accessor
+//! here therefore only:
 //!
 //! 1. checks the documented bounds/type/validity preconditions, mapping a failure
 //!    to a [`beam_common::BeamError`], and
@@ -28,17 +28,17 @@
 //! a caller invariant and there is no safe way to read or write a heap word, so the
 //! crate-wide `#![deny(unsafe_code)]` is lifted for this module subtree alone
 //! (`#[allow(unsafe_code)]` on the `mod term;` declaration in `lib.rs`, which
-//! covers [`binary`] and [`fun`] too). The crate's entire `unsafe` surface is this
-//! single auditable subtree: the `beam_alloc` allocation calls, the `beam_term`
-//! forwarders, the bitstring shim and the minimal type/validity guards — each
-//! carrying a `// SAFETY:` rationale.
+//! covers [`binary`], [`fun`] and [`record`] too). The crate's entire `unsafe`
+//! surface is this single auditable subtree: the `beam_alloc` allocation calls, the
+//! `beam_term` forwarders, the bitstring shim and the minimal type/validity guards —
+//! each carrying a `// SAFETY:` rationale.
 //!
 //! Every error stays [`beam_common::Result`] (via [`crate::error`]); an accessor
 //! never panics and never exhibits undefined behaviour on a mismatched term.
 
 mod binary;
 mod fun;
-
+mod record;
 pub use binary::{
     bit_count_to_bytes, bitstring_bytes, bitstring_parts, bitstring_size_bits, make_binary,
     make_bitstring, BITSTRING_POINTER_FLAG_MASK,
@@ -54,7 +54,17 @@ pub use fun::{
 };
 #[cfg(test)]
 pub use fun::make_fun_local;
-
+/// The whole native-record forwarding layer ([`record`]): the record constructor,
+/// the instance/definition readers and the frozen sizing surface
+/// (`record_block_words`/`record_def_size_words`/`record_inst_size_words` plus the
+/// `AM_TRUE`/`AM_FALSE` atoms) re-exported from the layout owner
+/// (`beam_term::record`).
+pub use record::{
+    is_record, make_record, record_block_words, record_declaration_keys, record_def_size_words,
+    record_definition, record_definition_field_order, record_definition_is_exported,
+    record_definition_keys, record_definition_module, record_definition_name, record_field_count,
+    record_inst_size_words, record_values, AM_FALSE, AM_TRUE,
+};
 use core::mem::size_of;
 
 use beam_alloc::Heap;
