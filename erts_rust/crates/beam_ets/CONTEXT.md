@@ -364,9 +364,10 @@ impl Table {
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, navigation, `select_all`, metadata
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, reads/navigation, `select_all`, metadata
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
-- `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors)
+- `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
+- `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/hash_interior.rs` → `HashInterior` (bucket hash index) for `set`/`bag`/`duplicate_bag`
 - `src/ordered_interior/mod.rs` → `OrderedSetInterior` (B+-tree) for `ordered_set` + its `Interior` impl
 - `src/ordered_interior/node.rs` → node layout, `ORDER`/`MIN_OCCUPANCY`, `NodeStore` arena
