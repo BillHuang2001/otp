@@ -29,7 +29,8 @@ bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
 (see "Tag coverage" below); **no producible tag is `unsupported`** — `RECORD_EXT` (`67`) now decodes
 and encodes through `beam_term::record` (§Records) — `LOCAL_EXT` (`121`)
-is honoured as a top-level wrapper, the encoder emits `ATOM_CACHE_REF` (`82`) through the
+is honoured as a top-level wrapper, both **flat** and **hash-map** (`116`) terms encode in the map's
+stored order (§Map key encode order), the encoder emits `ATOM_CACHE_REF` (`82`) through the
 `AtomCacheWriter` hook, and `DIST_HEADER` (`68`) plus the obsolete `FUN` (`117`) / `NEW_CACHE` (`78`)
 tags are rejected as `BadArg` — never a wrong term. The `COMPRESSED` (`80`) encoder reproduces C's
 *shrink rule*: it emits the wrapper only when zlib beats the plain image, else the plain image
@@ -278,9 +279,10 @@ V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are
 ≤ 65535, else `108`), `108` (lists, including improper tails),
 `109 BINARY_EXT` / `77 BIT_BINARY_EXT` (both decode into an on-heap bitstring block, see
 `term/binary.rs`; encode emits `109` for a byte-aligned bitstring and `77` otherwise),
-`116` (**flat** maps of any pair count — encode emits the stored pair order faithfully; a hash-map
-(HAMT) term with more than 32 pairs is not encodable and reports `unsupported`, see §Map key encode
-order and `Known Issues`), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
+`116` (maps of any pair count — both a flat map (≤ 32 pairs) and a **hash map** (HAMT, > 32
+pairs) encode, in the map's **stored** order; the flat path reads the pairs via `flatmap_parts`,
+the hash path via `crate::term::map_pairs_storage_order` → `beam_term::map::map_pairs_storage_order`;
+see §Map key encode order), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
 whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, and
@@ -367,12 +369,15 @@ Native records (the OTP 29 `ErtsRecordDefinition`/`ErtsRecordInstance` terms pro
   C's `make_hash2`; it is **not on the wire** (see §Known Issues).
 
 ## Map key encode order
-`encode_map` (`src/encode/mod.rs`) is the sole `MAP_EXT` (`116`) emitter and it emits the map's
-**stored** pair order verbatim (interleaved `K1,V1,…,Kn,Vn`); it **never** sorts, reorders or
-deduplicates. This is the ERTS contract: the encoder walks a flat map's key/value arrays in storage
-order (`external.c:3746-3769`, `flatmap_get_keys`/`flatmap_get_values` + `ENC_MAP_PAIR`, no sort
-unless the `deterministic` dflag is set). Order is the **constructor's** job, applied *before* the
-term reaches the codec:
+`encode_map`/`encode_map_pairs` (`src/encode/mod.rs`) are the sole `MAP_EXT` (`116`) emitters and they
+emit the map's **stored** pair order verbatim (interleaved `K1,V1,…,Kn,Vn`); they **never** sort,
+reorder or deduplicate. This is the ERTS contract: the encoder walks the map's storage in order — a
+flat map's key/value arrays (`external.c:3746-3769`, `flatmap_get_keys`/`flatmap_get_values` +
+`ENC_MAP_PAIR`) or a hash map's HAMT node slots (`external.c:3779-3823`) — with no sort unless the
+`deterministic` dflag is set. The encoder obtains that order through
+`crate::term::map_pairs_storage_order` → [`beam_term::map::map_pairs_storage_order`], which returns
+a flat map's keys-tuple order and a hash map's HAMT traversal order. Order is the **constructor's**
+job, applied *before* the term reaches the codec:
 
 - A map built through the normal path is ordered by [`beam_term::map::write_map`] (used by
   `beam_engine`'s compiled `…_map` opcodes), which sorts ≤ [`beam_term::map::MAP_SMALL_MAP_LIMIT`]
@@ -381,8 +386,22 @@ term reaches the codec:
 - A flat map built directly on a heap (`beam_codec::term::make_flatmap`, `beam_term::thing::write_flatmap`)
   keeps the caller's pair order as-is.
 
+The `encode` dispatch reaches a map's pairs by two probes, in order: [`flatmap_parts`] (a flat map,
+≤ 32 pairs) → `encode_map`, then `map_pairs_storage_order` (a hash map) → `encode_map_pairs`. Each
+probe matches exactly one representation, so the flat path is untouched and byte-identical.
+
 Because encode→decode→encode is order-preserving, a decoded map re-encodes **byte-exactly** for
-non-atom keys — the property `tests/map_key_order.rs` pins.
+non-atom keys — the property `tests/map_key_order.rs` pins. (Our decoder always materializes a
+`MAP_EXT` as one flat map of any pair count, so even a decoded > 32-pair HAMT image re-encodes
+byte-exactly through the flat path.)
+
+**A locally built HAMT is not byte-comparable with ERTS's.** `beam_term`'s HAMT trie is driven by
+`term_hash`, **not** ERTS's `erts_map_hash` (`../beam_term/src/map.rs`), so a > 32-key map built by
+[`beam_term::map::write_map`] has a different node-slot order — and therefore different bytes — than
+ERTS's own image of the same map. The image is nonetheless **valid and ERTS-decodable** (asserted
+live by `tests/map_key_order.rs::oracle_accepts_our_hashmap_image`). Byte-level oracle agreement for
+> 32-key maps is only asserted through the decode(oracle image) → re-encode path with stable
+(integer) keys (`tests/map_key_order.rs::oracle_and_our_encoder_agree_for_integer_keyed_maps`).
 
 **Atom-keyed multi-key maps are not byte-comparable across implementations.** A flat map's atom keys
 sort by **atom-table index**, which depends on the order the atoms were first interned *during this
@@ -546,11 +565,15 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the codec preserves a flat map's stored pair order (a scrambled integer-keyed flatmap encodes in
   exactly that order — never sorted); a map built in ERTS `erts_cmp_flatmap_keys` order encodes to
   the pinned oracle golden `#{10=>1,2=>2,3=>3}` → `131,116,0,0,0,3,97,2,97,2,97,3,97,3,97,10,97,1`;
-  a **live** oracle cross-check over an integer-keyed corpus (decode the oracle's `MAP_EXT` bytes and
-  assert our re-encode is byte-exact); a live demonstration that atom-keyed `MAP_EXT` bytes depend on
-  per-VM-start atom interning order (two fresh VMs, same map, different bytes); and the HAMT (> 32
-  pairs) gap — a hash-map term is rejected by `flatmap_parts` and encoded as a typed `unsupported`.
-  The oracle-dependent cases skip loudly with a stderr note when no `erl` is found.
+  a **live** oracle cross-check over an integer-keyed corpus — including a > 32-key map, so the oracle
+  produces a real HAMT — (decode the oracle's `MAP_EXT` bytes and assert our re-encode is byte-exact);
+  a live demonstration that atom-keyed `MAP_EXT` bytes depend on per-VM-start atom interning order
+  (two fresh VMs, same map, different bytes); a `write_map`-built 40-key **hash-map** round-trip
+  (`hashmap_terms_encode_and_roundtrip`: encode succeeds, the decode re-encodes byte-exactly, content
+  is equal under `map_pairs`, and the wire order equals `map_pairs_storage_order` — never sorted); and
+  a live check that the oracle's `binary_to_term` accepts our hash-map image
+  (`oracle_accepts_our_hashmap_image`). The oracle-dependent cases skip loudly with a stderr note when
+  no `erl` is found.
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
@@ -617,22 +640,17 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   duplicates the `& !3usize` that `beam_term::compare::bitstring_parts` hardcodes. Promoting that
   reader to `beam_term::thing` (public) and adding a `write_bitstring` constructor would make the
   whole shim a thin forwarder.
-- **Only *flat* maps are encodable; a real HAMT term is not.** `encode` probes `flatmap_parts`,
-  which accepts only a flat map, so a **hash-map** term (built by `beam_term::map::write_map` for
-  more than [`beam_term::map::MAP_SMALL_MAP_LIMIT`] = 32 pairs) falls through to a typed
-  `error::unsupported` — never a wrong encoding (pinned by
-  `tests/map_key_order.rs::hashmap_terms_are_not_encodable`). A faithful HAMT encoder must walk the
-  trie in ERTS's **storage traversal order** (`external.c:3779-3823`: head-array slots in index
-  order, then head-bitmap/node-bitmap slots in index order, descending into sub-nodes and collision
-  tuples in place). `beam_term::map` exposes **no public accessor for that order** — only the
-  *sorted* `map_pairs` (and `map_pairs_flatmap_order`, which is `pub(crate)`) — and this node may
-  not add API to the sibling crate. The **exact public API `beam_term::map` would need** is an
-  ordered, storage-order pair accessor, e.g.
-  `pub fn map_pairs_storage_order(t: Eterm) -> TermResult<Vec<(Eterm, Eterm)>>`, returning the pairs
-  in the node-slot traversal order above (today's private `collect_slots`, `src/map.rs`). Even then
-  the wire order would not be byte-identical to ERTS's own HAMT output, because this crate's HAMT
-  bitmaps are built from `term_hash`, not `erts_map_hash` — the image would be valid and
-  ERTS-decodable, just not byte-equal (see `../beam_term/CONTEXT.md`).
+- **A hash-map (HAMT) term encodes, but its pair order is not ERTS's.** `encode` reads a > 32-pair
+  map's pairs through `crate::term::map_pairs_storage_order` → `beam_term::map::map_pairs_storage_order`
+  (the HAMT **node-slot traversal order**, `external.c:3779-3823`: head-array slots in index order,
+  then head-bitmap/node-bitmap slots in index order, descending into sub-nodes and collision tuples
+  in place) and emits them through the shared `MAP_EXT` emitter — the image is **valid and
+  ERTS-decodable** (asserted live by `tests/map_key_order.rs::oracle_accepts_our_hashmap_image`). It
+  is **not byte-identical** to ERTS's own image of the same map, because `beam_term`'s HAMT trie is
+  built from `term_hash`, not `erts_map_hash` (`../beam_term/src/map.rs`), so its slot order differs.
+  This is a `beam_term` hashing limitation, not a codec bug; byte-level oracle agreement for > 32-key
+  maps holds only through the decode(oracle image) → re-encode path with stable (integer) keys
+  (`tests/map_key_order.rs::oracle_and_our_encoder_agree_for_integer_keyed_maps`).
 - **Constructed flat maps may hold any pair count** (`src/term/mod.rs::make_flatmap`): `n <= 32`
   forwards to `beam_term::thing::write_flatmap`, above it the crate's own `write_large_flatmap`
   emits the byte-identical layout (pinned by `flatmap_layout_matches_beam_term`), so a flat map of
@@ -702,7 +720,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `Encoder::with_atom_cache` (attaches an `AtomCacheWriter` ⇒ cached atoms emit `ATOM_CACHE_REF`),
   `Encoder::set_minor_version`/`with_minor_version` + the private `AtomFlavour`/`latin1_bytes`
   flavour resolution, `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the
-  private fun-classification chain inside `Encoder::encode`
+  private fun-classification chain inside `Encoder::encode`; the map emitters
+  (`encode_map_header`/`encode_map`/`encode_map_pairs` — the last for the hash-map path, fed by
+  `map_pairs_storage_order`)
 - `src/encode/tests.rs` → the `encode` unit-test suite (`#[cfg(test)] mod tests;` — per-tag byte-exact
   assertions and the width-policy boundaries); also the `pub(crate)` encoder test helpers
   (`new_heap`, `assert_system_limit`) shared with `src/encode/fun.rs`
@@ -730,7 +750,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
   `beam_alloc::Heap` and forwards to `beam_term::thing` /
   `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier
-  construction and inspection; re-exports the `src/term/fun.rs` fun/export surface and the
+  construction and inspection, plus the `map_pairs_storage_order` forwarder to
+  `beam_term::map::map_pairs_storage_order` (stored-order pairs for the hash-map encode path);
+  re-exports the `src/term/fun.rs` fun/export surface and the
   `src/term/record.rs` native-record surface
 - `src/term/fun.rs` → the fun/export forwarding layer (inside the `unsafe` subtree):
   `make_fun_external`/`make_fun_imported`, the `fun_*_term` accessors, the `#[cfg(test)]`
@@ -742,7 +764,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` oracle vectors (incl. the `COMPRESSED` seed)
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases
 - `tests/minor_version.rs` → `{minor_version,N}` byte-exact goldens + live `erl` cross-check
-- `tests/map_key_order.rs` → the `MAP_EXT` key-order contract (see §Map key encode order)
+- `tests/map_key_order.rs` → the `MAP_EXT` key-order contract (see §Map key encode order): stored-order
+  preservation, the oracle golden, the live integer-keyed oracle cross-check (incl. a > 32-key map),
+  the atom-interning-order demonstration, and the hash-map round-trip + live `binary_to_term` check
 - `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode, both atom flavours
 - `tests/compressed_decode.rs` → the top-level `COMPRESSED` (`80`) decode contract + negatives
 - `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook (cached vs inline atom bytes)

@@ -30,7 +30,7 @@ use crate::tag::{
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
     external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, is_record,
-    tuple_arity, tuple_element,
+    map_pairs_storage_order, tuple_arity, tuple_element,
 };
 use crate::writer::Writer;
 
@@ -260,6 +260,13 @@ impl<'a> Encoder<'a> {
         }
         if let Ok((keys, values)) = flatmap_parts(term) {
             return self.encode_map(keys, values);
+        }
+        // A > 32-key map is a *hash map* (HAMT), which `flatmap_parts` rejects. Its pairs
+        // come back in the map's **stored** (HAMT traversal) order; emit them through the
+        // same MAP_EXT emitter. This probe matches only a genuine map, so it cannot shadow
+        // any term the flat path already handled (see §"Map key encode order").
+        if let Ok(pairs) = map_pairs_storage_order(term) {
+            return self.encode_map_pairs(&pairs);
         }
         if let Ok((node, number, serial, creation)) = external_pid_parts(term) {
             return self.encode_pid(node, number, serial, creation);
@@ -507,7 +514,10 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes a **flat** map of any pair count as `MAP_EXT`.
+    /// Encodes a map as `MAP_EXT` from its `(keys, values)` storage slices.
+    ///
+    /// A thin wrapper over [`encode_map_pairs`](Self::encode_map_pairs) for the flat-map
+    /// path, whose pairs arrive as two parallel slices.
     ///
     /// The pair order is emitted **as stored** (interleaved `K1,V1,…,Kn,Vn`): the codec
     /// preserves the map's order and deliberately does **not** sort or dedupe it. Order is
@@ -517,22 +527,41 @@ impl<'a> Encoder<'a> {
     /// sort without the `deterministic` dflag), so sorting here would corrupt a
     /// decode→re-encode round-trip. See the crate `CONTEXT.md`, §"Map key encode order".
     /// The pair count must fit the flatmap `arityval` (24-bit), else `SystemLimit`.
-    ///
-    /// Only *flat* maps reach this function: [`flatmap_parts`] rejects a hash-map (HAMT)
-    /// term, so a map of more than 32 pairs built by `beam_term::map::write_map` falls
-    /// through to a typed `unsupported` (never a wrong encoding) — see `Known Issues`.
     fn encode_map(&mut self, keys: &[Eterm], values: &[Eterm]) -> Result<()> {
-        let n = keys.len();
-        if n > MAX_ARITYVAL {
-            return Err(error::system_limit());
-        }
-        debug_assert_eq!(n, values.len(), "a flatmap's keys and values are paired");
-        self.buf.u8(MAP_EXT);
-        self.buf.u32be(n as u32);
-        for i in 0..n {
+        debug_assert_eq!(keys.len(), values.len(), "a flatmap's keys and values are paired");
+        self.encode_map_header(keys.len())?;
+        for i in 0..keys.len() {
             self.encode(keys[i])?;
             self.encode(values[i])?;
         }
+        Ok(())
+    }
+
+    /// Encodes a map as `MAP_EXT` from its `(key, value)` pairs, **in the given order**.
+    ///
+    /// Both the flat-map path ([`encode_map`](Self::encode_map)) and the hash-map path
+    /// (the [`map_pairs_storage_order`] probe in [`encode`](Self::encode)) funnel through
+    /// this emitter, so a flat and a hash map share one wire implementation. The pairs are
+    /// emitted verbatim (interleaved `K1,V1,…,Kn,Vn`) and never sorted, deduped or
+    /// reordered; the count must fit the `arityval` 24-bit field, else `SystemLimit`.
+    fn encode_map_pairs(&mut self, pairs: &[(Eterm, Eterm)]) -> Result<()> {
+        self.encode_map_header(pairs.len())?;
+        for (key, value) in pairs {
+            self.encode(*key)?;
+            self.encode(*value)?;
+        }
+        Ok(())
+    }
+
+    /// Writes the `MAP_EXT` tag and the big-endian pair count `n` (the shared map
+    /// prologue). `n > MAX_ARITYVAL` cannot be represented by the `arityval` header, so
+    /// it is a `SystemLimit`.
+    fn encode_map_header(&mut self, n: usize) -> Result<()> {
+        if n > MAX_ARITYVAL {
+            return Err(error::system_limit());
+        }
+        self.buf.u8(MAP_EXT);
+        self.buf.u32be(n as u32);
         Ok(())
     }
 

@@ -37,25 +37,34 @@
 //! consequently only meaningful for **non-atom** keys (or for an already-ordered
 //! flatmap), which is why the oracle cross-check below uses an **integer-keyed** corpus.
 //!
-//! ## The HAMT gap (assessed, not closed)
+//! ## Hash maps (> 32 pairs) are encoded too
 //!
-//! `encode` can only emit a flat map: [`beam_codec::term::flatmap_parts`] rejects a HAMT,
-//! so a > 32-pair hash-map term falls through to a typed `unsupported` (never a wrong
-//! encoding) — pinned by [`hashmap_terms_are_not_encodable`]. A faithful HAMT encoder
-//! needs to walk the trie in ERTS's **storage traversal order** (head-array slots in
-//! order, then head-bitmap/node-bitmap slots in index order, descending in place), but
-//! `beam_term::map` exposes **no public accessor for that order** (only the *sorted*
-//! [`beam_term::map::map_pairs`]). So this node does not implement it and does not add API
-//! to the sibling crate; the exact API needed is recorded in `CONTEXT.md`'s Known Issues.
+//! A map of more than 32 pairs is a **hash map** (HAMT), which
+//! [`beam_codec::term::flatmap_parts`] rejects. The encoder probes
+//! [`beam_codec::term::map_pairs_storage_order`] **after** the flat-map probe and emits
+//! the returned pairs through the same `MAP_EXT` emitter — in the map's *stored* order (a
+//! hash map's HAMT node-slot traversal order, head-array slots in order then
+//! head-bitmap/node-bitmap slots in index order, descending in place; `external.c:3779-3823`),
+//! never sorted. See [`hashmap_terms_encode_and_roundtrip`].
+//!
+//! **Byte-equality with ERTS is not asserted for locally built HAMTs.** `beam_term`'s HAMT
+//! trie is driven by `term_hash`, *not* ERTS's `erts_map_hash` (see `../beam_term/src/map.rs`),
+//! so the slot order — and thus the pair order and the bytes — of a map built by
+//! [`beam_term::map::write_map`] differ from ERTS's own for the same key set. The image is
+//! still **valid and ERTS-decodable** (asserted live by
+//! [`oracle_accepts_our_hashmap_image`]); byte-level oracle agreement for > 32-key maps is
+//! only asserted through the decode(oracle image) → re-encode path with stable (integer)
+//! keys ([`oracle_and_our_encoder_agree_for_integer_keyed_maps`]).
 
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use beam_alloc::Heap;
 
-use beam_codec::term::{flatmap_parts, make_flatmap};
-use beam_codec::{decode_term, encode_term, is_unsupported, MAP_EXT, VERSION_MAGIC};
+use beam_codec::term::{flatmap_parts, make_flatmap, map_pairs_storage_order};
+use beam_codec::{decode_term, encode_term, MAP_EXT, VERSION_MAGIC};
 
+use beam_term::map::map_pairs;
 use beam_term::prelude::{atom_val, cmp_flatmap_keys, make_small, AtomTable, Eterm};
 
 // ---------------------------------------------------------------------------
@@ -279,9 +288,10 @@ const INT_KEYED_CORPUS: &str = "[ term_to_binary(#{}) \
     , term_to_binary(#{42=>7}) \
     , term_to_binary(#{10=>1,2=>2,3=>3}) \
     , term_to_binary(#{5=>1,100=>2,7=>3,2=>4}) \
-    , term_to_binary(#{-3=>1,0=>2,1000000000000=>3}) ]";
+    , term_to_binary(#{-3=>1,0=>2,1000000000000=>3}) \
+    , term_to_binary(maps:from_list([{N, N*2} || N <- lists:seq(1,40)])) ]";
 
-const INT_KEYED_CORPUS_LEN: usize = 5;
+const INT_KEYED_CORPUS_LEN: usize = 6;
 
 #[test]
 fn oracle_and_our_encoder_agree_for_integer_keyed_maps() {
@@ -374,11 +384,11 @@ fn atom_keyed_map_bytes_depend_on_interning_order() {
 }
 
 // ---------------------------------------------------------------------------
-// 4. The HAMT (> 32 pairs) gap: not encodable, reported as `unsupported`.
+// 4. Hash maps (> 32 pairs) encode in HAMT storage order and round-trip.
 // ---------------------------------------------------------------------------
 
 #[test]
-fn hashmap_terms_are_not_encodable() {
+fn hashmap_terms_encode_and_roundtrip() {
     use beam_term::map::{map_words_capacity, write_map};
 
     // A 40-pair map built through the real HAMT builder is a *hash map*, not a flat map.
@@ -394,16 +404,93 @@ fn hashmap_terms_are_not_encodable() {
     // owned, writable words, the preconditions `write_map` documents.
     let map = unsafe { write_map(hp, &pairs, &atoms) }.unwrap();
 
-    // A hash map is not a flat map, so the codec cannot read it as pairs...
+    // A hash map is not a flat map, so the flat path cannot read it as pairs...
     assert!(
         flatmap_parts(map).is_err(),
         "a > 32-pair map is a HAMT, not a flat map"
     );
+    // ... but the storage-order reader sees every pair, in HAMT traversal order.
+    let stored = map_pairs_storage_order(map).expect("a HAMT has a storage-order pair list");
+    assert_eq!(stored.len(), 40, "the HAMT holds every pair");
 
-    // ... and `encode` falls through to a typed `unsupported` — never a wrong encoding.
-    let err = encode_term(map, &atoms).unwrap_err();
+    // (a) A hash map is now encodable (it used to be a typed `unsupported`).
+    let bytes = encode_term(map, &atoms).expect("a hash map is now encodable");
+    assert_eq!(bytes[0], VERSION_MAGIC);
+    assert_eq!(bytes[1], MAP_EXT);
+    assert_eq!(u32::from_be_bytes([bytes[2], bytes[3], bytes[4], bytes[5]]), 40);
+
+    // (b) Content equality: decode and compare in a representation-independent order
+    //     (`map_pairs` sorts by term order, so flat vs. hash representation is irrelevant).
+    let mut h2 = heap(4096);
+    let mut atoms2 = AtomTable::new();
+    let decoded =
+        decode_term(&bytes, &mut h2, &mut atoms2).expect("our own hash-map image must decode");
+    assert_eq!(
+        map_pairs(map, &atoms).unwrap(),
+        map_pairs(decoded, &atoms2).unwrap(),
+        "the decoded map must hold exactly the original's pairs (as a set)"
+    );
+
+    // (c) The wire carries the HAMT's *stored* order — we preserve it, we never sort.
+    //     (Our decoder materializes any MAP_EXT as one flat map, so its keys-tuple order
+    //     *is* the wire order.)
+    let wire = map_pairs_storage_order(decoded).unwrap();
+    assert_eq!(
+        wire, stored,
+        "MAP_EXT must carry the HAMT storage order, not a sorted order"
+    );
+    // ... and that order is NOT the sorted key order (1,2,…,40), proving no sort happened.
+    let sorted_keys: Vec<Eterm> = (1..=40).map(make_small).collect();
+    assert_ne!(
+        wire.iter().map(|(k, _)| *k).collect::<Vec<_>>(),
+        sorted_keys,
+        "the encoder must not sort HAMT pairs into key order"
+    );
+
+    // (d) Byte-stability: re-encoding the decoded image reproduces our bytes exactly.
+    assert_eq!(encode_term(decoded, &atoms2).unwrap(), bytes);
+}
+
+/// Feeds our `write_map`-built 40-key HAMT image to the live oracle's `binary_to_term/1`
+/// and asserts the oracle reconstructs a 40-key map with the expected content — proof that
+/// our HAMT traversal output is **valid wire** even though its byte order is not ERTS's own.
+#[test]
+fn oracle_accepts_our_hashmap_image() {
+    let Some(oracle) = oracle_or_skip("oracle_accepts_our_hashmap_image") else {
+        return;
+    };
+
+    use beam_term::map::{map_words_capacity, write_map};
+
+    let mut h = heap(4096);
+    let atoms = AtomTable::new();
+    let pairs: Vec<(Eterm, Eterm)> = (1..=40_i64)
+        .map(|n| (make_small(n), make_small(n * 2)))
+        .collect();
+    // SAFETY: as in `hashmap_terms_encode_and_roundtrip` — `hp` owns
+    // `map_words_capacity(40)` writable words, the documented `write_map` precondition.
+    let hp = unsafe { h.alloc_words(map_words_capacity(pairs.len())) }.unwrap();
+    // SAFETY: `hp` owns `map_words_capacity(40) >= map_words_capacity(n)` writable words.
+    let map = unsafe { write_map(hp, &pairs, &atoms) }.unwrap();
+    let image = encode_term(map, &atoms).unwrap();
+
+    // Hand the oracle our image as a binary literal; it must accept it as a 40-pair map
+    // with the expected content (each `=` is a match assertion that aborts the VM on
+    // mismatch, which `run_erl` surfaces as a failure).
+    let byte_list = image
+        .iter()
+        .map(|b| b.to_string())
+        .collect::<Vec<_>>()
+        .join(",");
+    let eval = format!(
+        "B = binary_to_term(<<{byte_list}>>), \
+         true = is_map(B), 40 = map_size(B), \
+         80 = maps:get(40, B), 2 = maps:get(1, B), \
+         io:format(\"ok~n\", [])"
+    );
+    let out = run_erl(&oracle, &eval);
     assert!(
-        is_unsupported(&err),
-        "encoding a HAMT map must be a typed `unsupported`, got {err:?}"
+        out.contains("ok"),
+        "the oracle must accept our hash-map image; got {out:?}"
     );
 }
