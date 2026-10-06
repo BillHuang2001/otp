@@ -105,8 +105,10 @@ impl Table {
     // reads
     pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;              // 0/1 for set/ordered_set
     pub fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;
-    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // badarg if absent
-    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>;
+    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // scalar; `unsupported` raise for bag/duplicate_bag
+    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>; // scalar; absent key ⇒ default, `unsupported` raise for multi kinds
+    pub fn lookup_element_all(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>>; // the Pos-th element of EVERY object under key (the multi kinds' list result)
+    pub fn lookup_element_all_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>>; // Ok(None) ⇒ caller yields `default`
     pub fn memory(&self) -> usize;                                                  // store words + interior words
     pub fn size(&self) -> usize;                                                    // objects (not keys) for bag/dup_bag
     pub fn is_empty(&self) -> bool;
