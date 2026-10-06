@@ -133,7 +133,9 @@ operators) and `<`/`>` between same-typed terms.
 - `pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool` — `cmp(a,b).is_eq()` (`=:=`).
 - `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
   arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
-  only for floats and mixed integer/float pairs).
+  only for floats and mixed integer/float pairs). A mixed integer/float pair is converted with
+  [`number::number_as_f64`](#numberrs--safe-numeric--f64-conversion) (single definition; the
+  former crate-private helper was removed).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
 ### `hashing.rs` — structural term hashing
