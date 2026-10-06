@@ -9,8 +9,9 @@
 //!   cases below, whose embedded module is compiled with the system `erlc` and run under
 //!   **both** runtimes;
 //! * the `records:*` **BIFs** (`records:create/4`, `records:update/4`,
-//!   `records:get_definition/2`, plus the `get`/`get_module`/`get_name`/`get_field_names`
-//!   introspection family), exercised by the [`CaseKind::Eval`] cases.
+//!   `records:get_definition/2`, `records:is_exported/1`, plus the
+//!   `get`/`get_module`/`get_name`/`get_field_names` introspection family), exercised by
+//!   the [`CaseKind::Eval`] cases.
 //!
 //! A native record compares as its **canonical ETF bytes** (`term_to_binary/1`, contract
 //! A.2 — the default [`Probe::TermToBinary`]), so the record-valued cases pin the whole
@@ -25,57 +26,81 @@
 //! `crates/beam_engine/CONTEXT.md`). The embedded module therefore obtains its record
 //! from the `records:create/4` **BIF** (the same module/name the compile-time
 //! `-record #rec{}` declares) and then uses ordinary record *syntax* on it, so the
-//! access/update/matching opcodes really do execute end to end:
+//! access/update/matching opcodes really do execute end to end.
 //!
-//! | function | native-record opcodes exercised |
+//! # Which native-record opcodes the embedded module executes
+//! The mapping below is read off the system `erlc`'s own disassembly (`erlc -S`), the only
+//! honest evidence for opcode reachability:
+//!
+//! | function | native-record opcodes executed |
 //! |---|---|
 //! | `fld_a/0`, `fld_b/0`, `total/0` | `get_record_field` (191) |
-//! | `upd_a/0`, `upd_total/0` | `is_any_native_record` (186), `is_native_record` (187), `put_record` update (189), `get_record_elements` (188) |
 //! | `guard/0` | `is_any_native_record` (186) |
-//! | `match_scale/0` | `get_record_elements` (188) (behind the `is_native_record` guard) |
+//! | `upd_a/0`, `upd_total/0` | `is_any_native_record` (186), `is_native_record` (187), `get_record_elements` (188), `put_record` update (189) |
+//! | `match_scale/0` | `is_any_native_record` (186), `is_native_record` (187), `get_record_elements` (188) |
+//! | `ext_fld/0` | `get_record_field` (191), keyed by an external `{nr_ext,ext}` record id |
+//! | `ext_acc/0` | `is_any_native_record` (186), `is_native_record` (187), `is_record_accessible` (190), `get_record_elements` (188) |
+//! | `ext_upd/0` | `is_any_native_record` (186), `is_native_record` (187), `is_record_accessible` (190), `put_record` (189), `get_record_field` (191) |
+//! | `def_fields/0` | no record opcode — reaches the `records:get_definition/2` BIF |
 //!
-//! The system `erlc` needs **no extra flag** for the native-record syntax (verified
-//! against `lib/compiler/test/native_record_SUITE.erl` and the plain `erlc -o …` used by
-//! `crate::module_build`), so this group adds no compiler option.
+//! Six of the eight family members (**186-191**) are therefore genuinely executed.
+//! `is_record_accessible` (190) is emitted for an **external** record, which the module
+//! reaches with `-import_record(nr_ext, [ext])` plus `#nr_ext:ext{}` syntax over a value
+//! built by `records:create(nr_ext, ext, …)` — no second compiled module is needed.
+//! Generic opcodes **192/193** (`get_record_elements_id`, `update_record_id`) are OTP-30
+//! instructions and stay unreachable: the installed OTP-29 `erlc` (`compiler-10.0.6`) has
+//! neither opcode anywhere in its own source, so nothing it compiles can emit them (their
+//! lowering is covered by the loader/engine unit tests).
 //!
-//! Two family members are not reachable from a compiled-module case: generic opcodes
-//! **192/193** (`get_record_elements_id`, `update_record_id`) were added in OTP 30 and the
-//! installed OTP-29 `erlc` cannot emit them (their lowering is covered by the loader/engine
-//! unit tests), and **`is_record_accessible`** is emitted only for an *external*
-//! (wildcard) record, which needs a cross-module `-import_record` fixture.
+//! The system `erlc` needs **no extra flag** for the native-record syntax or for
+//! `-import_record` (verified against `lib/compiler/test/native_record_SUITE.erl` and the
+//! plain `erlc -o …` used by `crate::module_build`), so this group adds no compiler option.
+//!
+//! `records:get_definition/2` is reached from `def_fields/0` inside the compiled module.
+//! The BIF only consults the code server's native-record table, which is populated when a
+//! module declaring `-record #rec{}` is **loaded**; an eval-side (`-eval`) positive case is
+//! therefore not constructible, because no module in the OTP-29 installation declares a
+//! native record (every `.beam` under the install has an empty `Recs` chunk). The lookup is
+//! reachable only from inside a loaded module.
 //!
 //! # Honest coverage (cases deliberately *not* in this group)
 //!
-//! Two observed divergences are **not** pinned here (each would be a `mismatch`, a real
-//! behavioral difference to hand off, not a capability gap):
+//! One observed divergence is **not** pinned here (it is a `mismatch`, a real behavioral
+//! difference to hand off, not a capability gap): a `{badfield, _}` reason at the wrong
+//! *shape*. `records:update(R, m, r, #{z => 1})` gives the oracle
+//! `error:{badfield,{{m,r},z}}` but the Rust runtime `error:{badfield,{m,r},z}` — the nested
+//! `{Module,Name}` tuple is flattened into the outer tuple — so any case would be a
+//! guaranteed mismatch.
 //!
-//! * `records:is_exported/1` returns the wrong atom under the Rust runtime (`linux`/
-//!   `unix` instead of `true`/`false`) — an atom-index mismatch at the runtime/BIF
-//!   boundary.
-//! * the *structured* reasons `{badrecord, _}` / `{badmap, _}` / `{badfield, _}` escape an
-//!   Erlang `try … catch` in the Rust runtime (they surface as the top-level
-//!   `beam_rt: error <structured reason>` line, exit 1, no `exception` stdout line),
-//!   where the oracle raises a catchable `error:{badrecord, _}`.
-//!
+//! The other structured reasons round-trip through the probe's `try … catch` with the
+//! oracle's exact shape and **do** agree, and are covered below: `{badrecord, {x,y}}` from
+//! `records:is_exported({x,y})` and `{badmap, badopts}` from a non-map options argument.
 //! The plain-atom `badarg` reasons (a duplicate field key, a malformed option map, an
-//! absent field, a non-record) **do** agree and are covered below.
+//! absent field, a non-record) and the `records:is_exported/1` boolean **do** agree too and
+//! are covered below.
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
 /// The embedded module the native-record [`CaseKind::Module`] cases compile and run.
 ///
 /// Every exported function returns an **integer** (the shape a module-run golden pins).
-/// `mk/0` builds the record through the `records:create/4` BIF (see the module docs for
-/// why it is not a compile-time `#rec{}` literal); the functions then use native-record
-/// *syntax* — field access, a field update and a `#rec{}` match — so the native-record
+/// `mk/0` builds the local record through the `records:create/4` BIF (see the module docs
+/// for why it is not a compile-time `#rec{}` literal) and `ext_mk/0` builds an *external*
+/// one; the functions then use native-record *syntax* — field access, a field update, a
+/// `#rec{}` match and an external `#nr_ext:ext{}` match/update — so the native-record
 /// opcodes execute under both runtimes.
 pub(crate) const NATIVE_RECORD_SOURCE: &str = r##"-module(nr_native).
--export([fld_a/0, fld_b/0, total/0, upd_a/0, upd_total/0, guard/0, match_scale/0]).
+-export([fld_a/0, fld_b/0, total/0, upd_a/0, upd_total/0, guard/0, match_scale/0,
+         ext_fld/0, ext_acc/0, ext_upd/0, def_fields/0]).
 
+-import_record(nr_ext, [ext]).
 -record #rec{a, b}.
 
 mk() ->
     records:create(nr_native, rec, [{a,1},{b,2}], #{is_exported=>true}).
+
+ext_mk() ->
+    records:create(nr_ext, ext, [{a,7},{b,8}], #{is_exported=>true}).
 
 fld_a() -> R = mk(), R#rec.a.
 fld_b() -> R = mk(), R#rec.b.
@@ -84,6 +109,10 @@ upd_a() -> R = mk(), R2 = R#rec{a = 9}, R2#rec.a.
 upd_total() -> R = mk(), R2 = R#rec{a = 9, b = 8}, R2#rec.a + R2#rec.b.
 guard() -> R = mk(), case is_record(R) of true -> 1; false -> 0 end.
 match_scale() -> R = mk(), #rec{a = A, b = B} = R, A * 10 + B.
+ext_fld() -> R = ext_mk(), R#nr_ext:ext.a.
+ext_acc() -> R = ext_mk(), #nr_ext:ext{a = A, b = B} = R, A * 10 + B.
+ext_upd() -> R = ext_mk(), R2 = R#nr_ext:ext{a = 5}, R2#nr_ext:ext.a.
+def_fields() -> {_, Fs} = records:get_definition(nr_native, rec), length(Fs).
 "##;
 
 /// Build one eval case.
@@ -303,6 +332,42 @@ pub(crate) fn group() -> Vec<Case> {
             0,
         ),
         eval(
+            "records/is_exported_true",
+            "records:is_exported/1 reports an exported record as the atom true",
+            introspection,
+            val,
+            "records:is_exported(records:create(m,r,[{a,1}],#{is_exported=>true}))",
+            "ok true",
+            0,
+        ),
+        eval(
+            "records/is_exported_false",
+            "records:is_exported/1 reports an unexported record as the atom false",
+            introspection,
+            val,
+            "records:is_exported(records:create(m,r,[{a,1}],#{is_exported=>false}))",
+            "ok false",
+            0,
+        ),
+        eval(
+            "records/is_exported_non_record_is_badrecord",
+            "records:is_exported/1 raises the structured {badrecord,Term} for a non-record",
+            error_semantics,
+            val,
+            "records:is_exported({x,y})",
+            "exception error {badrecord,{x,y}}",
+            1,
+        ),
+        eval(
+            "records/create_bad_options_is_badmap",
+            "records:create/4 raises the structured {badmap,Term} for a non-map options argument",
+            error_semantics,
+            val,
+            "records:create(m, r, [], badopts)",
+            "exception error {badmap,badopts}",
+            1,
+        ),
+        eval(
             "records/get_updated_field",
             "records:get/2 observes the value records:update/4 wrote",
             introspection,
@@ -404,6 +469,34 @@ pub(crate) fn group() -> Vec<Case> {
             "match_scale",
             "12",
         ),
+        module_case(
+            "records/module_native_record_external_get_field",
+            "get_record_field reads a field of an external record (an {nr_ext,ext} record id) under both runtimes",
+            "ext_fld",
+            "7",
+        ),
+        module_case(
+            "records/module_native_record_external_accessible_match",
+            "an #nr_ext:ext{} match of an external record (is_record_accessible + get_record_elements) agrees under both runtimes",
+            "ext_acc",
+            "78",
+        ),
+        module_case(
+            "records/module_native_record_external_update",
+            "an external record update (is_record_accessible + put_record + get_record_field) agrees under both runtimes",
+            "ext_upd",
+            "5",
+        ),
+        // Pinned capability gap: `records:get_definition/2` consults the code server's
+        // native-record table, which the Rust runtime does not implement, so it signals its
+        // documented `unsupported` reason and the Rust side exits 3 ⇒ `unsupported`, never a
+        // mismatch. The golden is the oracle's own answer for the record `nr_native` declares.
+        module_case(
+            "records/module_get_definition_declared_record",
+            "records:get_definition/2 of a record the running module declares (Rust: the code-table lookup is a pinned gap)",
+            "def_fields",
+            "2",
+        ),
     ]
 }
 
@@ -480,6 +573,7 @@ mod tests {
             "records:create(",
             "records:update(",
             "records:get_definition(",
+            "records:is_exported(",
         ] {
             assert!(
                 cases
@@ -496,7 +590,8 @@ mod tests {
                 CaseKind::Eval { .. } => None,
             })
             .collect();
-        // Field access, update, guard and match all execute the native-record opcodes.
+        // Field access, update, guard, match and the external-record paths all execute the
+        // native-record opcodes; `def_fields` reaches the get_definition BIF from a module.
         for expected in [
             "fld_a",
             "fld_b",
@@ -505,14 +600,18 @@ mod tests {
             "upd_total",
             "guard",
             "match_scale",
+            "ext_fld",
+            "ext_acc",
+            "ext_upd",
+            "def_fields",
         ] {
             assert!(
                 functions.contains(&expected),
                 "no module case runs {expected}"
             );
         }
-        // The pinned gap case must be the only `exception`-golden one whose value is not a
-        // plain-`badarg` language failure; it is the get_definition code-table lookup.
+        // The pinned gap cases must be the only `exception`-golden ones whose value is not a
+        // plain-`badarg` language failure; they are the get_definition code-table lookups.
         assert!(cases
             .iter()
             .any(|c| c.id == "records/get_definition_unknown_record"
@@ -526,5 +625,46 @@ mod tests {
         assert!(NATIVE_RECORD_SOURCE.contains("R#rec.a"));
         assert!(NATIVE_RECORD_SOURCE.contains("R#rec{a = 9}"));
         assert!(NATIVE_RECORD_SOURCE.contains("#rec{a = A, b = B} = R"));
+    }
+
+    #[test]
+    fn the_embedded_module_reaches_the_external_record_and_the_get_definition_bif() {
+        // `is_record_accessible` (190) needs an external record: the module imports the
+        // record from another module and uses `#nr_ext:ext{}` syntax on it.
+        assert!(NATIVE_RECORD_SOURCE.contains("-import_record(nr_ext, [ext])."));
+        assert!(NATIVE_RECORD_SOURCE.contains("R#nr_ext:ext.a"));
+        assert!(NATIVE_RECORD_SOURCE.contains("#nr_ext:ext{a = A, b = B} = R"));
+        assert!(NATIVE_RECORD_SOURCE.contains("R#nr_ext:ext{a = 5}"));
+        // The positive `records:get_definition/2` path is reached from inside the module
+        // (the BIF only consults the code server table of a *loaded* module).
+        assert!(NATIVE_RECORD_SOURCE.contains("records:get_definition(nr_native, rec)"));
+        assert!(group().iter().any(|c| matches!(
+            &c.kind,
+            CaseKind::Module(run) if run.function == "def_fields"
+        )));
+    }
+
+    #[test]
+    fn the_is_exported_boolean_and_the_structured_badrecord_badmap_reasons_are_pinned() {
+        // The Rust runtime used to answer `records:is_exported/1` with the wrong atom
+        // (`linux`/`unix`); it now agrees, and these cases hold that agreement.
+        let golden = |id: &str| {
+            group()
+                .into_iter()
+                .find(|c| c.id == id)
+                .unwrap_or_else(|| panic!("no case {id}"))
+                .golden
+                .stdout
+        };
+        assert_eq!(golden("records/is_exported_true"), Some("ok true"));
+        assert_eq!(golden("records/is_exported_false"), Some("ok false"));
+        assert_eq!(
+            golden("records/is_exported_non_record_is_badrecord"),
+            Some("exception error {badrecord,{x,y}}")
+        );
+        assert_eq!(
+            golden("records/create_bad_options_is_badmap"),
+            Some("exception error {badmap,badopts}")
+        );
     }
 }
