@@ -360,6 +360,36 @@ impl GenImmixCollector {
             CollectionKind::Minor => self.run_minor(roots)?,
             CollectionKind::Major => self.run_major(roots, needed, refs)?,
         };
+        self.accumulate(&stats, kind);
+        Ok(Collection { kind, stats })
+    }
+
+    /// Runs a **minor** collection: promote the nursery's live terms into the mature space.
+    ///
+    /// Checks up front that the mature space's free lines cover the promotion, so a
+    /// too-large minor is a typed heap exhaustion *before* a single word is copied (never a
+    /// half-forwarded heap); [`collect`](Self::collect) escalates to a major instead.
+    pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        let (needed, _refs) = scan_young(roots, &self.young, &self.mature)?;
+        if self.mature.free_lines() < needed {
+            return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
+        }
+        let stats = self.run_minor(roots)?;
+        self.accumulate(&stats, CollectionKind::Minor);
+        Ok(stats)
+    }
+
+    /// Runs a **major** collection: reclaim the mature generation in place, then promote
+    /// the nursery into it.
+    pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        let (needed, refs) = scan_young(roots, &self.young, &self.mature)?;
+        let stats = self.run_major(roots, needed, refs)?;
+        self.accumulate(&stats, CollectionKind::Major);
+        Ok(stats)
+    }
+
+    /// Folds one collection's [`GcStats`] into the collector's accumulated counters.
+    fn accumulate(&mut self, stats: &GcStats, kind: CollectionKind) {
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
@@ -367,7 +397,6 @@ impl GenImmixCollector {
             CollectionKind::Minor => self.stats.minor_collections += 1,
             CollectionKind::Major => self.stats.major_collections += 1,
         }
-        Ok(Collection { kind, stats })
     }
 
     /// Promotes the nursery's live terms into the mature space and resets the nursery.
@@ -439,6 +468,7 @@ mod tests {
     //! `unsafe` below only dereferences pointers this test allocated and wrote itself (or
     //! that a collection just wrote); every block carries a `// SAFETY:` rationale.
 
+    use beam_common::BeamError;
     use beam_term::prelude::{
         arityval, boxed_val, is_arity_value, is_atom, is_list, list_val, make_atom, make_small,
         signed_value, Atom, Eterm, NIL,
@@ -702,5 +732,66 @@ mod tests {
         );
         // SAFETY: `inner` is the live 1-element tuple; its element is the small integer.
         assert_eq!(signed_value(unsafe { *boxed_val(inner).add(1) }), 42);
+    }
+
+    #[test]
+    fn explicit_collect_minor_and_collect_major_drive_both_paths() {
+        let mut c = GenImmixCollector::from_policy(HeapPolicy::default()).expect("collector");
+        let (outer, atom) = build_graph(&mut c);
+
+        let mut roots = [outer];
+        let minor = c.collect_minor(&mut roots).expect("minor");
+        assert_eq!(c.stats().minor_collections, 1);
+        assert!(minor.words_copied > 0);
+        assert_graph_preserved(&c, roots[0], atom);
+
+        // An explicit major reclaims in place and promotes.
+        let extra = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(9)])
+            .expect("extra tuple");
+        let mut roots = [roots[0], extra];
+        let major = c.collect_major(&mut roots).expect("major");
+        assert_eq!(c.stats().major_collections, 1);
+        assert!(major.words_copied >= 2);
+        for root in roots {
+            assert!(c.mature().contains_term(root));
+        }
+        assert_graph_preserved(&c, roots[0], atom);
+    }
+
+    #[test]
+    fn collect_minor_reports_exhaustion_before_copying_anything() {
+        // A single-block mature space holds 16 lines.
+        let policy = HeapPolicy {
+            initial_mature_words: 1,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        // Fill the mature space with 12 live lines.
+        let heap = c.young_mut().heap_mut();
+        let mut first = Vec::new();
+        for i in 0..12i64 {
+            first.push(heap.cons(make_small(i), NIL).expect("cell"));
+        }
+        let mut roots = first.clone();
+        c.collect_minor(&mut roots).expect("first minor");
+        assert_eq!(c.mature().used_lines(), 12);
+
+        // An 8-line promotion cannot fit the 4 free lines: the typed error is raised before
+        // any word is copied, so the mature space is untouched (never half-forwarded).
+        let heap = c.young_mut().heap_mut();
+        let mut second = Vec::new();
+        for i in 0..8i64 {
+            second.push(heap.cons(make_small(i), NIL).expect("cell"));
+        }
+        let mut roots = second.clone();
+        let err = c.collect_minor(&mut roots).expect_err("must not fit");
+        assert!(matches!(err, BeamError::Alloc(_)), "got {err:?}");
+        assert_eq!(c.mature().used_lines(), 12, "nothing was copied");
+        assert_eq!(c.stats().minor_collections, 1, "the failed minor is not counted");
+        assert!(roots.iter().all(|r| c.young().contains_term(*r)));
     }
 }
