@@ -245,7 +245,11 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   wakers; `Timeout`/`Timer`; `DriverRegistry` (both built-ins, dup rejection, missing-name `BadArg`); `PortState`
   transitions; `PortRegistry` alloc/close/reuse + unknown-id `BadArg`; `FdDriver` (pipe round-trip, EOF, error
   paths, `stop` deregistration, fd closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and
-  control; port-task ordering/reductions/dedupe; the failed-`start` teardown (`FailingStartDriver` double).
+  control; port-task ordering/reductions/dedupe; the failed-`start` teardown (`FailingStartDriver` double);
+  `SpawnDriver`/`build_command` (the four name forms, `{cd, …}`/`{env, …}` on the built `Command`, empty argv
+  `BadArg`, negative fd `BadArg`, the unknown-program constructor error, accessors, the real read path driven
+  through a hand-built `DriverContext` — bytes, latched EOF and the EOF deregistration — the once-only
+  `exit_status`, the `128 + signal` convention, and idempotent kill/reap).
 
 ## Design Decisions
 - **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker` and a correct
