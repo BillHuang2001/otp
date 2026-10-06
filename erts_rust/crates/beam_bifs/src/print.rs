@@ -51,12 +51,15 @@
 //! and column 1 by default). [`pretty_chunk`] reproduces that break for a
 //! proper/improper list, a tagged/untagged tuple and a map each of whose elements
 //! renders single-line (the break separator `,`, the improper tail after `|`, a
-//! `tag_len + 2` indent after a tuple tag, a two-space indent after `#{`); for the
-//! forms it does not model — a nested container, an element too long to fit on a
-//! line of its own, a non-printable bitstring, a long tuple tag, a depth-limited
-//! `~P` — it raises `error:badarg` rather than emit a line the oracle would have
-//! broken differently. See the `crate::io` module docs for the precise rule, the
-//! term classes and the narrowest repro.
+//! `tag_len + 2` indent after a tuple tag, a two-space indent after `#{`), and for a
+//! **non-printable byte-aligned binary**, whose `integer_to_list/1` byte elements
+//! `pp_binary/7` packs `N = max(8, min(Ll - Col, M - 4))` per line. For the forms it
+//! does not model — a nested container, an element too long to fit on a line of its
+//! own, an all-printable binary (the oracle's string leaf), a non-byte-aligned
+//! bitstring, a long tuple tag, a depth-limited `~P` — it raises `error:badarg`
+//! rather than emit a line the oracle would have broken differently. See the
+//! `crate::io` module docs for the precise rule, the term classes and the narrowest
+//! repro.
 //!
 //! # Deviations from the oracle (documented)
 //!
@@ -305,8 +308,20 @@ pub(crate) fn pretty_chunk(
     column: usize,
 ) -> Result<Chunk> {
     let flat = term_chunk(ctx, term, printable, depth)?;
-    if !is_reflowable(term) || flat.flat_len() < line_length.saturating_sub(column) {
+    let ll = line_length as i64;
+    let col = column.max(1) as i64;
+    if !is_reflowable(term) || (flat.flat_len() as i64) < ll - col {
         return Ok(flat);
+    }
+    if bits::is_bitstring(term) {
+        // `io_lib_pretty` re-flows a non-printable binary through
+        // `print_length_binary` → `{{bin, S}}` → `pp_binary/7`. Only the
+        // unlimited-depth byte-aligned form is modelled (see `reflow_binary`); a
+        // depth-limited `~P` bitstring is a typed `badarg`.
+        if depth >= 0 {
+            return Err(badarg());
+        }
+        return reflow_binary(term, ll, col);
     }
     if depth >= 0 {
         return Err(badarg());
@@ -316,6 +331,87 @@ pub(crate) fn pretty_chunk(
         Some(chunk) => Ok(chunk),
         None => Err(badarg()),
     }
+}
+
+/// `io_lib:printable_character(C, latin1)`: `16#20..=16#7E`, `16#A0..=16#FF`, or
+/// one of `\t \n \r \v \b \f \e` (`io_lib.erl:1514-1523`).
+fn latin1_printable_char(c: u8) -> bool {
+    (0x20..=0x7E).contains(&c)
+        || (0xA0..=0xFF).contains(&c)
+        || matches!(c, 0x09 | 0x0A | 0x0D | 0x0B | 0x08 | 0x0C | 0x1B)
+}
+
+/// `io_lib_pretty`'s `{{bin, S}}` re-flow for a **non-printable byte-aligned**
+/// binary: `print_length_binary`'s `false` arm yields
+/// `io_lib:write_binary(Bin, D, T)`'s body, and `pp_binary/7` packs its
+/// `,`-separated `integer_to_list/1` byte elements as many per line as fit.
+///
+/// With unlimited depth (`~p`, `T = -1`) `printable_bin0/5` is `false` exactly
+/// when some byte is outside the latin1 printable set; an all-printable binary is
+/// instead the oracle's quoted-string leaf, which this re-flow does not model — it
+/// is refused rather than broken wrongly.
+///
+/// # Errors
+///
+/// `error:badarg` for an all-printable binary (the string-leaf form) or a
+/// non-byte-aligned bitstring (`bits::bytes`).
+fn reflow_binary(term: Eterm, ll: i64, col: i64) -> Result<Chunk> {
+    let bytes = bits::bytes(term)?;
+    if bytes.iter().all(|&b| latin1_printable_char(b)) {
+        return Err(badarg());
+    }
+    let mut body: Vec<Chunk> = Vec::with_capacity(bytes.len() * 2);
+    for (i, byte) in bytes.iter().enumerate() {
+        if i > 0 {
+            body.push(Chunk::Char(','));
+        }
+        body.push(Chunk::text(&byte.to_string()));
+    }
+    // The `{{bin, S}}` length is `iolist_size([<<, <<, Body, >>, >>])`.
+    let size = body.iter().map(|c| c.flat_len() as i64).sum::<i64>() + 4;
+    let ind = indent_chunk(2, &indent_base(col as usize));
+    Ok(pp_binary(&body, col + 2, ll, size, &ind))
+}
+
+/// `io_lib_pretty:pp_binary/7` — the `[LT, LT, S, GT, GT]` clause, with
+/// `N = max(8, min(Ll - Col, M - 4 - W) - LD)` (`W = LD = 0` here) and the
+/// continuation indent.
+fn pp_binary(body: &[Chunk], col: i64, ll: i64, m: i64, ind: &Chunk) -> Chunk {
+    let n = (ll - col).min(m - 4).max(8);
+    Chunk::List(vec![
+        Chunk::Char('<'),
+        Chunk::Char('<'),
+        pp_binary_body(body, n, n, ind),
+        Chunk::Char('>'),
+        Chunk::Char('>'),
+    ])
+}
+
+/// `io_lib_pretty:pp_binary/4` — emit the body's `[element, $,]` pairs (the comma
+/// counts towards the pair's width and is itself an output element), breaking onto
+/// a new line indented by `ind` when the pair does not fit and resetting the budget
+/// to `N0 - Len`; a final comma-less element is the catch-all clause.
+fn pp_binary_body(body: &[Chunk], n: i64, n0: i64, ind: &Chunk) -> Chunk {
+    let mut out: Vec<Chunk> = Vec::new();
+    let mut remaining = n;
+    let mut i = 0;
+    while i < body.len() {
+        let comma = body.get(i + 1);
+        let len = body[i].flat_len() as i64 + comma.map_or(0, |c| c.flat_len() as i64);
+        if remaining - len < 0 {
+            out.push(Chunk::Char('\n'));
+            out.push(ind.clone());
+            remaining = n0 - len;
+        } else {
+            remaining -= len;
+        }
+        out.push(body[i].clone());
+        if let Some(c) = comma {
+            out.push(c.clone());
+        }
+        i += 2;
+    }
+    Chunk::List(out)
 }
 
 /// The re-flow of a supported container, or `None` when the form is not modelled.

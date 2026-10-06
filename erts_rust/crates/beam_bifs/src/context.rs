@@ -11,11 +11,13 @@
 //!   in the Rust core, so identity is injected here;
 //! * the calling module's name, when the runtime knows it ([`BifContext::current_module`])
 //!   — the oracle derives a BIF's call site from it (`erlang:load_nif/2`);
-//! * seven **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//! * nine **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
 //!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
 //!   `fun`-taking `lists`/`maps` BIFs), a [`PortHook`] (`open_port/2` and the
 //!   port BIFs), a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
-//!   process-dictionary BIFs) and a [`NifLoader`] (`erlang:load_nif/2`).
+//!   process-dictionary BIFs) and a [`NifLoader`] (`erlang:load_nif/2`), plus a
+//!   [`RecordSource`] (`records:get_definition/2`) and a [`LocalNode`] (the
+//!   local node identity for encoding internal pid/port ids).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif BIFs report `unsupported_bif`.
@@ -292,6 +294,60 @@ pub trait NifLoader {
     ) -> core::result::Result<(), NifLoadError>;
 }
 
+/// One field of a loaded native-record definition (`Recs` chunk), name-resolved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordFieldView {
+    /// The field-name atom's name.
+    pub name: String,
+    /// The field's default value, or `None` when it has no default.
+    pub default: Option<Eterm>,
+}
+
+/// A loaded native-record definition, name-resolved (the shape
+/// `records:get_definition/2` renders).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecordDefinitionView {
+    /// Whether the record is exported from its module.
+    pub is_exported: bool,
+    /// Fields in declaration order.
+    pub fields: Vec<RecordFieldView>,
+}
+
+/// Supplies a loaded module's native-record definitions.
+///
+/// A native-record definition lives in the `Recs` chunk of a loaded
+/// [`beam_loader::Module`], whose atoms belong to the *loader's* atom table — not
+/// this context's. The concrete provider (the runtime's code server, which owns the
+/// loaded modules) therefore implements this hook and resolves the module's atom
+/// table for us, handing back a name-resolved [`RecordDefinitionView`]. With no hook
+/// installed, [`BifContext::record_definition`] answers `Ok(None)` — never a
+/// fabricated definition.
+pub trait RecordSource {
+    /// The `Recs`-chunk definition named `name` in the loaded module `module`,
+    /// or `Ok(None)` when no loaded module defines it.
+    ///
+    /// # Errors
+    ///
+    /// Reports a resolution failure as a [`BeamError`].
+    fn record_definition(&mut self, module: &str, name: &str)
+        -> Result<Option<RecordDefinitionView>>;
+}
+
+/// The runtime's local node identity for encoding internal pid/port ids: the
+/// node's name atom (interned in the context's atom table) and its creation.
+///
+/// `term_to_binary`/`binary_to_term` of an *internal* pid/port id need the local
+/// node's name atom and creation to emit a `NEW_PID_EXT`/`NEW_PORT_EXT` image. The
+/// identity is runtime state (the node's own name and creation), so it is injected
+/// through this hook; `beam_rt` supplies the concrete implementation. With no hook
+/// installed, [`BifContext::local_node`] falls back to the Milestone-1 runtime's
+/// fixed, non-distributed identity (`nonode@nohost`, creation 0) when that atom is
+/// interned here, and `None` otherwise.
+pub trait LocalNode {
+    /// The local node identity `(node_atom, creation)`, or `None` when unknown.
+    fn local_node(&mut self) -> Option<(Atom, u32)>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -306,6 +362,8 @@ pub struct BifContext<'a> {
     port: Option<&'a mut dyn PortHook>,
     dict: Option<&'a mut dyn DictHook>,
     nif_loader: Option<&'a mut dyn NifLoader>,
+    record_source: Option<&'a mut dyn RecordSource>,
+    local_node: Option<&'a mut dyn LocalNode>,
 }
 
 impl<'a> BifContext<'a> {
@@ -325,6 +383,8 @@ impl<'a> BifContext<'a> {
             port: None,
             dict: None,
             nif_loader: None,
+            record_source: None,
+            local_node: None,
         }
     }
 
@@ -374,6 +434,18 @@ impl<'a> BifContext<'a> {
     /// Installs the NIF-loading hook used by `erlang:load_nif/2`.
     pub fn with_nif_loader(mut self, loader: &'a mut dyn NifLoader) -> Self {
         self.nif_loader = Some(loader);
+        self
+    }
+
+    /// Installs the record-source hook used by `records:get_definition/2`.
+    pub fn with_record_source(mut self, source: &'a mut dyn RecordSource) -> Self {
+        self.record_source = Some(source);
+        self
+    }
+
+    /// Installs the local-node-identity hook used when encoding internal pid/port ids.
+    pub fn with_local_node(mut self, node: &'a mut dyn LocalNode) -> Self {
+        self.local_node = Some(node);
         self
     }
 
@@ -437,6 +509,40 @@ impl<'a> BifContext<'a> {
     /// invariance reason as [`BifContext::sender`].
     pub fn nif_loader(&mut self) -> Option<&mut (dyn NifLoader + 'a)> {
         self.nif_loader.as_deref_mut()
+    }
+
+    /// The `Recs`-chunk definition named `name` in the loaded module `module`.
+    ///
+    /// This is the seam behind `records:get_definition/2`: the runtime's code server
+    /// resolves the definition (name-resolved) from its loaded modules.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the hook's own failure. Returns `Ok(None)` when no
+    /// [`RecordSource`] hook is installed.
+    pub fn record_definition(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<RecordDefinitionView>> {
+        match self.record_source.as_deref_mut() {
+            Some(source) => source.record_definition(module, name),
+            None => Ok(None),
+        }
+    }
+
+    /// The local node identity `(node_atom, creation)`.
+    ///
+    /// With a [`LocalNode`] hook installed the hook answers. With none, this
+    /// falls back to the M1 runtime's fixed, non-distributed identity — the
+    /// `nonode@nohost` atom (exactly what `crate::convert`'s `node/0` answers)
+    /// with creation 0 — when that atom is interned in this context's atom
+    /// table, and `None` otherwise (internal ids then stay unencodable).
+    pub fn local_node(&mut self) -> Option<(Atom, u32)> {
+        if let Some(hook) = self.local_node.as_deref_mut() {
+            return hook.local_node();
+        }
+        self.atoms().lookup("nonode@nohost").map(|node| (node, 0))
     }
 
     /// The installed table registry, if any.
@@ -975,5 +1081,105 @@ mod tests {
         );
         assert_eq!(ctx.dict_erase(make_small(1)).expect("the hook answers"), Some(make_small(11)));
         assert_eq!(ctx.dict_erase(make_small(1)).expect("the hook answers"), None);
+    }
+
+    /// A minimal `RecordSource` test double: it answers one fixed definition for a
+    /// recognised `(module, name)` and `Ok(None)` for anything else.
+    struct StubRecords;
+
+    impl RecordSource for StubRecords {
+        fn record_definition(
+            &mut self,
+            module: &str,
+            name: &str,
+        ) -> Result<Option<RecordDefinitionView>> {
+            if module == "recs" && name == "person" {
+                Ok(Some(RecordDefinitionView {
+                    is_exported: true,
+                    fields: vec![
+                        RecordFieldView { name: "name".to_string(), default: Some(make_small(1)) },
+                        RecordFieldView { name: "age".to_string(), default: None },
+                    ],
+                }))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+
+    #[test]
+    fn record_definition_without_a_hook_is_none() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        assert_eq!(ctx.record_definition("recs", "person").expect("no hook is Ok"), None);
+    }
+
+    #[test]
+    fn record_definition_with_a_hook_delegates() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut source = StubRecords;
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_record_source(&mut source);
+
+        let definition = ctx
+            .record_definition("recs", "person")
+            .expect("the hook answers")
+            .expect("the definition exists");
+        assert!(definition.is_exported);
+        assert_eq!(
+            definition.fields,
+            vec![
+                RecordFieldView { name: "name".to_string(), default: Some(make_small(1)) },
+                RecordFieldView { name: "age".to_string(), default: None },
+            ]
+        );
+        assert_eq!(ctx.record_definition("recs", "unknown").expect("the hook answers"), None);
+    }
+
+    #[test]
+    fn local_node_without_a_hook_falls_back_to_nonode_at_nohost_when_seeded() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let mut atoms = seeded_atoms();
+        atoms.seed(["nonode@nohost"]);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        let expected = atoms.lookup("nonode@nohost").expect("seeded");
+        assert_eq!(ctx.local_node(), Some((expected, 0)));
+    }
+
+    #[test]
+    fn local_node_without_a_hook_is_none_when_the_atom_is_absent() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        assert_eq!(ctx.local_node(), None);
+    }
+
+    /// A minimal `LocalNode` test double answering a fixed identity (the node atom
+    /// `ok` and creation `7`).
+    struct StubNode {
+        node: Atom,
+    }
+
+    impl LocalNode for StubNode {
+        fn local_node(&mut self) -> Option<(Atom, u32)> {
+            Some((self.node, 7))
+        }
+    }
+
+    #[test]
+    fn local_node_with_a_hook_delegates() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let node = atoms.lookup("ok").expect("seeded");
+        let mut hook = StubNode { node };
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut hook);
+
+        assert_eq!(ctx.local_node(), Some((node, 7)));
     }
 }
