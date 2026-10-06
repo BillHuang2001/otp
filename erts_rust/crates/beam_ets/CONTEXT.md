@@ -139,8 +139,18 @@ impl Table {
     pub fn match_object(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
     pub fn match_(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
     pub fn match_delete(&mut self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
+    pub fn select_replace(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
+
+    // limit + continuation forms (see continuation.rs; `Option::None` ⇒ '$end_of_table')
+    pub fn select_limit(&self, spec: &MatchSpec, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn select_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_object_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_object_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
 }
 ```
+- `pub fn match_spec_run(list: Eterm, spec: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>` (from `run.rs`) — the table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
   (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
   `iter_objects`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
