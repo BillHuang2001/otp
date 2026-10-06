@@ -356,14 +356,6 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   and refc-binary entries, but `OffHeap::sweep(is_live)` only applies the caller's predicate — determining
   WHICH on-heap reference (a `BinRef` word, a fun magic ref, a sub-binary pointer) makes a registered
   off-heap object live is `beam_process`'s concern (Stage 5), not the collector's.
-- **Sizing oracle gap (upstream, `beam_term::size::size_object`).** It gates its hashmap branch on
-  `is_hashmap_header`, which only matches the two *head* node types, so an inner `HAMT_NODE_BITMAP`
-  node (and everything under it) is not counted — `size_object` of a 500-key map reports `4`. It also
-  reports a refc binary's `ErlSubBits` alone (5) rather than the C's `ERL_REFC_BITS_SIZE` (8). The real
-  C `size_object_x` (`copy.c:192-214,219-231`) handles all three node types and the BinRef case. This
-  crate's copier is unaffected (`move_size` uses `map_header_val`/`header_arity` and is exact — see
-  `tests/map_copy.rs`), which is why the tests measure a map's footprint directly rather than via
-  `size_object`. Fixing `size_object` is `beam_term`'s job.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
