@@ -42,23 +42,39 @@
 //! `private_append` reuse the same buffer (the engine's result is an ordinary,
 //! non-writable refc binary — which the next append simply seeds from).
 //!
-//! Not implemented (each a precise typed [`crate::error::unsupported`]): an
-//! `append`/`private_append` segment that is not the first, and an `integer` segment
-//! whose value is not an integer.
+//! Not implemented (a precise typed [`crate::error::unsupported`]): an
+//! `append`/`private_append` segment that is not the first.
+//!
+//! # `BS_FAIL_INFO`: why a segment failure raises the bare atom `badarg`
+//!
+//! C's segment-failure macro `BS_FAIL_INFO(Fail, Reason, ErrorType, Value)`
+//! (`emu/bs_instrs.tab:347`) runs `erts_prepare_bs_construct_fail_info` and then
+//! `$FAIL_HEAD_OR_BODY($Fail)` (`emu/macros.tab:266`) — **not** the bare `$FAIL`
+//! the matching opcodes use. A live fail label is `$FAIL($Fail)`, a branch to it
+//! (the guard case); `{f,0}` ([`NO_FAIL`]) takes the `goto find_func_info` arm, a
+//! real raise whose reason is exactly the atom `BS_FAIL_INFO` left in
+//! `c_p->freason` — `badarg`, or `system_limit` from the size validation's
+//! `BS_FAIL_INFO_SYSTEM_LIMIT` (`:355`, `:424`/`:438`). The extended error info
+//! `erts_prepare_bs_construct_fail_info` records (`emu/beam_emu.c:725`) only
+//! decorates the *stacktrace*, so it is not modelled at M1: the reason is the bare
+//! atom. See [`fail_seg`] — this is why `bs_create_bin` must **not** reuse the
+//! matching side's [`super::fail_step`], whose `NO_FAIL` arm raises
+//! `{badmatch, Subject}`.
 use std::collections::BTreeMap;
 
-use beam_common::Result;
-use beam_loader::{Instr, Label, Module, Operand};
-use beam_term::Eterm;
+use beam_common::{BeamError, ExceptionClass, Result};
+use beam_loader::{Instr, Label, Module, NO_FAIL, Operand};
+use beam_term::{make_atom, Eterm};
 
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
+use crate::predicates;
 use crate::Step;
 
 use super::{
-    decode_flags, fail_step, is_all, push_wide_int, raw, read_size, small_value, BitWriter,
+    decode_flags, goto_label, is_all, push_wide_int, raw, read_size, small_value, BitWriter,
     BSF_LITTLE,
 };
 
@@ -156,9 +172,16 @@ fn assemble(
                         "bs_create_bin: integer segment size `all`",
                     ));
                 }
-                let size = read_size(machine, ctx, size_op)?;
+                let Some(size) = segment_size(machine, ctx, size_op)? else {
+                    return fail_seg(machine, module, labels, fail);
+                };
+                // C's `$BS_SAFE_MUL(..., $BS_FAIL_INFO_SYSTEM_LIMIT, ...)`
+                // (`emu/bs_instrs.tab:424`): a size*unit overflow is `system_limit`,
+                // which M1 does not model — a typed error, never a wrong reason.
                 let Some(nbits) = size.checked_mul(unit) else {
-                    return fail_seg(machine, module, labels, fail, value_op, ctx);
+                    return Err(error::unsupported(
+                        "bs_create_bin: segment size overflow (system_limit)",
+                    ));
                 };
                 let value = read_value(machine, module, ctx, value_op)?;
                 if nbits > 64 {
@@ -169,9 +192,9 @@ fn assemble(
                     push_wide_int(&mut writer, value, nbits, flags & BSF_LITTLE != 0)?;
                 } else {
                     let Some(raw_value) = small_value(value) else {
-                        return Err(error::unsupported(
-                            "bs_create_bin: integer segment value is not a small integer",
-                        ));
+                        // `erts_bs_put_integer_*` rejects a non-integer value
+                        // (`erl_bits.c:926`) -> `BADARG`.
+                        return fail_seg(machine, module, labels, fail);
                     };
                     if flags & BSF_LITTLE != 0 {
                         writer.push_uint_le(raw_value as u64, nbits);
@@ -183,24 +206,35 @@ fn assemble(
             }
             // `binary Unit Fs Value Size` — append a bitstring operand's bytes.
             "binary" => {
-                let (bytes, src_bits) = segment_source(machine, module, value_op, ctx)?;
+                // The size loop's `is_not_bitstring(Src)` check
+                // (`emu/bs_instrs.tab:390`) fails **before** the size is even read.
+                let Some((bytes, src_bits)) = segment_source(machine, module, value_op, ctx)? else {
+                    return fail_seg(machine, module, labels, fail);
+                };
                 let nbits = if is_all(module, size_op) {
+                    // `erts_bs_put_binary_all` (`erl_bits.c:1311`): a whole-tail
+                    // segment must be a multiple of the segment's unit.
+                    if unit != 1 && src_bits % unit != 0 {
+                        return fail_seg(machine, module, labels, fail);
+                    }
                     src_bits
                 } else {
-                    let size = read_size(machine, ctx, size_op)?;
-                    match size.checked_mul(unit) {
-                        Some(nbits) => nbits,
-                        None => {
-                            return fail_seg(machine, module, labels, fail, value_op, ctx);
-                        }
-                    }
+                    let Some(size) = segment_size(machine, ctx, size_op)? else {
+                        return fail_seg(machine, module, labels, fail);
+                    };
+                    // `$BS_SAFE_MUL` → `SYSTEM_LIMIT` (not modelled at M1).
+                    let Some(nbits) = size.checked_mul(unit) else {
+                        return Err(error::unsupported(
+                            "bs_create_bin: segment size overflow (system_limit)",
+                        ));
+                    };
+                    nbits
                 };
                 if nbits > src_bits {
-                    return fail_seg(machine, module, labels, fail, value_op, ctx);
+                    return fail_seg(machine, module, labels, fail);
                 }
                 writer.push_bits_from(bytes, 0, nbits);
             }
-
             // `string Unit Fs Offset Size` — append a constant byte string from the
             // module's `StrT` table (`BS_LOAD_STRING_SRC`/`erts_bs_put_string`,
             // `bs_instrs.tab:627-633`, `erl_bits.c:1641`). The compiler emits the
@@ -221,21 +255,23 @@ fn assemble(
                 let nbits = if is_all(module, size_op) {
                     64
                 } else {
-                    match read_size(machine, ctx, size_op)?.checked_mul(unit) {
-                        Some(n) if n != 0 => n,
-                        _ => 64,
+                    match segment_size(machine, ctx, size_op)? {
+                        Some(n) => match n.checked_mul(unit) {
+                            Some(m) if m != 0 => m,
+                            _ => 64,
+                        },
+                        None => return fail_seg(machine, module, labels, fail),
                     }
                 };
+                // `erts_bs_put_float` (`erl_bits.c:1449`) returns a failure value for
+                // any width other than 16/32/64 (`c_p->fvalue = am_invalid`), and the
+                // caller still raises the bare atom `badarg`.
                 if !matches!(nbits, 16 | 32 | 64) {
-                    return Err(error::unsupported(
-                        "bs_create_bin: float segment size other than 16/32/64",
-                    ));
+                    return fail_seg(machine, module, labels, fail);
                 }
                 let value = read_value(machine, module, ctx, value_op)?;
                 let Some(f) = float_source(value) else {
-                    return Err(error::unsupported(
-                        "bs_create_bin: float segment value is not a float/small integer",
-                    ));
+                    return fail_seg(machine, module, labels, fail);
                 };
                 let bytes = put_float(f, nbits, flags & BSF_LITTLE != 0);
                 writer.push_bits_from(&bytes, 0, nbits);
@@ -254,10 +290,9 @@ fn assemble(
                 };
                 match encoded {
                     Some(bytes) => writer.push_bits_from(&bytes, 0, bytes.len() * 8),
-                    None => return fail_seg(machine, module, labels, fail, value_op, ctx),
+                    None => return fail_seg(machine, module, labels, fail),
                 }
             }
-
             // `append`/`private_append` (`BSC_APPEND`/`BSC_PRIVATE_APPEND`,
             // `bs_instrs.tab:541-569`). The compiler emits it as the **first**
             // segment only, with the accumulator in the value operand and the size
@@ -280,8 +315,15 @@ fn assemble(
                 }
                 let value = read_value(machine, module, ctx, value_op)?;
                 let Some((_, src_bits)) = raw::heap_bits(value) else {
-                    return fail_seg(machine, module, labels, fail, value_op, ctx);
+                    // `erts_bs_append_checked` (`erl_bits.c:1744`) rejects a
+                    // non-bitstring accumulator with `BADARG`.
+                    return fail_seg(machine, module, labels, fail);
                 };
+                // `erts_bs_append_checked` (`erl_bits.c:1778`): the accumulator's
+                // bit size must be a multiple of the segment's unit.
+                if unit != 1 && src_bits % unit != 0 {
+                    return fail_seg(machine, module, labels, fail);
+                }
                 let bytes = raw::subject_bytes(value)?;
                 writer.push_bits_from(bytes, 0, src_bits);
             }
@@ -297,20 +339,90 @@ fn assemble(
     Ok(Ok(writer.finish()))
 }
 
-/// Build the segment failure `Step` for `value_op` (a completed `Err(step)`).
+/// A `bs_create_bin` **segment failure** (a completed `Err(step)`).
+///
+/// C's `$BS_FAIL_INFO($Fail, ...)` (`emu/bs_instrs.tab:347`) ends in
+/// `$FAIL_HEAD_OR_BODY($Fail)` (`emu/macros.tab:266`): a live fail label is a branch
+/// (`$FAIL`), and `{f,0}` ([`NO_FAIL`]) takes the `goto find_func_info` arm — a real
+/// raise whose reason is the atom `BS_FAIL_INFO` left in `c_p->freason`, i.e. the
+/// bare `badarg` for every call site in `i_bs_create_bin`.
+///
+/// This is why `bs_create_bin` must **not** reuse the matching side's
+/// [`super::fail_step`], whose `NO_FAIL` arm raises `{badmatch, Subject}`: the
+/// matching opcodes branch on `$FAIL` only and never go through `BS_FAIL_INFO`.
 #[allow(clippy::type_complexity)]
 fn fail_seg(
     machine: &mut Machine,
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
     fail: Label,
-    value_op: &Operand,
-    ctx: &mut dyn ExecutionContext,
 ) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
-    let value = read_value(machine, module, ctx, value_op)?;
-    let step = fail_step(machine, module, labels, fail, value, ctx)?
-        .expect("fail_step yields a step");
-    Ok(Err(step))
+    Ok(Err(seg_fail_step(machine, module, labels, fail)?))
+}
+
+/// [`fail_seg`]'s `Step` half: branch, or raise the bare atom `badarg`.
+fn seg_fail_step(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    fail: Label,
+) -> Result<Step> {
+    if fail == NO_FAIL {
+        raise_badarg(machine, module)
+    } else {
+        goto_label(labels, fail)
+    }
+}
+
+/// Raise class `error` with the bare atom `badarg` (C's `BADARG(Fail)` at
+/// `emu/macros.tab:280` followed by `find_func_info`), mirroring
+/// `families/funs.rs::raise_badarg`: the reason atom comes from the *running
+/// module's* atom table (the engine never invents an atom it cannot name), and the
+/// `error` class atom is installed when the module has it. With no live catch frame
+/// the raise cannot land and propagates as the typed [`BeamError::BadArg`].
+///
+/// C also records the `{Segment, Op, ErrorType, Value}` extended error info
+/// (`erts_prepare_bs_construct_fail_info`, `emu/beam_emu.c:725`); that only
+/// decorates the *stacktrace* and is not modelled at M1.
+fn raise_badarg(machine: &mut Machine, module: &Module) -> Result<Step> {
+    if machine.catch_frame_depth() == 0 {
+        return Err(BeamError::BadArg);
+    }
+    let atom = module
+        .atom_table
+        .lookup("badarg")
+        .ok_or(BeamError::BadArg)?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(make_atom(atom))
+}
+
+/// Read a *dynamic* segment size operand, mirroring the C size loop's validation
+/// (`emu/bs_instrs.tab:420-445`).
+///
+/// `Ok(Some(n))` is a non-negative small integer; `Ok(None)` is the C's
+/// `$BADARG($Fail)` arm — a negative value or a non-integer — and the caller takes
+/// the segment failure path. A **positive bignum** is the one case the C reports as
+/// `system_limit` (`emu/bs_instrs.tab:438`) rather than `badarg`; `system_limit` is
+/// not modelled at M1, so it stays a typed error rather than a wrong reason.
+fn segment_size(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+) -> Result<Option<usize>> {
+    let value = read_operand(machine, ctx, operand)?;
+    if beam_term::is_small(value) {
+        let n = beam_term::signed_value(value);
+        return Ok(if n >= 0 { Some(n as usize) } else { None });
+    }
+    if predicates::is_integer(value) {
+        // An integer too large to be a small (a positive bignum -> `system_limit`).
+        return Err(error::unsupported(
+            "bs_create_bin: segment size is not a small integer (system_limit)",
+        ));
+    }
+    Ok(None)
 }
 
 /// The `i`-th segment operand, or a typed error when the list is truncated.
@@ -336,18 +448,21 @@ fn read_value(
     }
 }
 
-/// The byte slice and bit count a `binary` segment draws from.
+/// The byte slice and bit count a `binary` segment draws from, or `None` when the
+/// operand is not a bitstring — the C `is_not_bitstring(Src)` -> `$BS_FAIL_INFO(...,
+/// BADARG, am_type, Src)` arm (`emu/bs_instrs.tab:390`, `:650`).
 fn segment_source<'a>(
     machine: &Machine,
     module: &Module,
     operand: &Operand,
     ctx: &mut dyn ExecutionContext,
-) -> Result<(&'a [u8], usize)> {
+) -> Result<Option<(&'a [u8], usize)>> {
     let value = read_value(machine, module, ctx, operand)?;
-    let (_, bits) = raw::heap_bits(value)
-        .ok_or_else(|| error::unsupported("bs_create_bin: segment value is not a binary"))?;
+    let Some((_, bits)) = raw::heap_bits(value) else {
+        return Ok(None);
+    };
     let bytes = raw::subject_bytes(value)?;
-    Ok((bytes, bits))
+    Ok(Some((bytes, bits)))
 }
 
 /// The `StrT` bytes a `string` constant segment appends.
