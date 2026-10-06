@@ -608,7 +608,8 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   encode↔decode, atom-cache encode↔decode, no-cache control)
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
-  legacy-`FLOAT_EXT` decode vector and malformed-input typed-error cases
+  legacy-`FLOAT_EXT` decode vector, the malformed-input typed-error cases, and the oracle-gated
+  `oracle_accepts_our_new_fun_and_record_images` check
 - `../../erts/emulator/beam/external.c` / `external.h` → the authoritative encode/decode + tag values
   (read-only), incl. `binary2term_prepare` (`1744-1816`) for the `COMPRESSED` wrapper
 - `../../erts/emulator/beam/erl_zlib.c` / `erl_zlib.h` → the C zlib wrapper the stream form matches
