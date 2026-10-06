@@ -115,6 +115,12 @@ is `decode`'s.
   `decode(&mut self, &mut Heap, &mut AtomTable) -> Result<Eterm>`, `position()`, `remaining()`,
   `finish() -> Result<()>` (trailing bytes ⇒ `BadArg`).
 - Convenience: `pub fn decode_term(&[u8], &mut Heap, &mut AtomTable) -> Result<Eterm>`.
+- **Funs are decoded inside the walker.** The `decode` dispatch handles `Tag::Export` (`113`) and
+  `Tag::NewFun` (`112`) itself (private helpers `decode_export`, `decode_new_fun`, plus
+  `decode_small_u32` and the wire-direct `decode_creator_pid`), so a fun nested in a tuple/list/map
+  — e.g. a `.beam` `LitT` literal — decodes like any other sub-term. See §Fun encodings for the
+  field rules (arity small `>= 0`; `old_index`/`old_uniq` smalls; `num_free <= MAX_ARG`; the ignored
+  `size`; wire order = `env` order; creator pid read straight off the wire).
 - **`COMPRESSED` is a top-level-only wrapper.** `decode_term` detects `bytes.len() >= 6 &&
   bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT`, reads the 4-byte inner size, inflates and
   requires `decompressed.len() == size`, then decodes the inner body with `Decoder::new_body` +
