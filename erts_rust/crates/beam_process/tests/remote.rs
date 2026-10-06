@@ -254,7 +254,7 @@ fn demonitoring_a_remote_monitor_drops_it_and_routes() {
 
 #[test]
 fn send_exit_term_routes_remote_and_delegates_local() {
-    let (mut table, mut names, node) = fixture();
+    let (mut table, names, node) = fixture();
     let mut heap = Heap::new(64).expect("test heap");
     let (router, log) = recorder();
     table.set_dist_router(Box::new(router));
