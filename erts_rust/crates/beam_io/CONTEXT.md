@@ -158,8 +158,11 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub trait Driver` — `name() -> &str` (+ `flags()` default `empty()`); required `start(ctx)`,
   `output(ctx) -> Result<usize>`, `ready_input(ctx)`, `stop(ctx)`; defaulted `ready_output(ctx)` (= `output`),
   `control(ctx, command: &str, arg: &[u8]) -> Result<Vec<u8>>` (= `Ok(vec![])`), `timeout(ctx)` (= `Ok(())`),
-  and `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by
-  `SpawnDriver`).
+  `next_timeout() -> Option<Instant>` (= `None`; the driver's **declaration** of the next deadline it wants
+  `Driver::timeout` at — mirrored into the port's `TIMEOUT` task after each interaction, deadline-gated so it
+  never fires early), `port_exit(ctx, PortExitReason) -> Result<()>` (= `Ok(())`; the once-only, advisory
+  port-exit notification, distinct from the teardown `stop`), and
+  `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by `SpawnDriver`).
 - `pub type DriverFactory = fn() -> Result<Box<dyn Driver>>`.
 - `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`, `with_builtins()`
   (**registers both `"fd"` and `"efile"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
