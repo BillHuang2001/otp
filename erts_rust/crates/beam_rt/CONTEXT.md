@@ -54,6 +54,34 @@ impl Runtime {
     pub fn run_module(&mut self, module: &Module, function: &str, arity: u32, args: &[Eterm],
                       out: &mut dyn OutputSink) -> Result<Eterm>;
 
+    // --- spawning and scheduling (the single-threaded process runner) ---
+    /// Spawn a process whose entry point is `module:function/arity(args)` and make it
+    /// **runnable** (appended to the run queue). The module is resolved through the code
+    /// server (load on demand) exactly like `RuntimeContext::run_export`. The `x(0)` is
+    /// recorded and readable through [`Runtime::process_result`] once the process runs to
+    /// its `return` (a normally-returning process's *exit reason* is `normal`, not that
+    /// value — see `runner.rs`/Design Decisions).
+    pub fn spawn_process(&mut self, module: &str, function: &str, args: Vec<Eterm>) -> Result<ProcessId>;
+    /// Put a spawned process back on the run queue and mark it `Runnable` (idempotent —
+    /// an already-queued pid is a no-op; a pid with no engine is a typed error).
+    pub fn enqueue_process(&mut self, pid: ProcessId) -> Result<()>;
+    /// Run **one** scheduler slice (one process, once) — the step hook; `0`/`1` slices.
+    pub fn run_one_slice(&mut self) -> Result<u64>;
+    /// Run at most `max_slices` slices, returning how many ran.
+    pub fn run_slices(&mut self, max_slices: u64) -> Result<u64>;
+    /// Run the scheduler until the run queue empties, returning the slice count. A
+    /// process blocked on an empty `receive` simply stays `Waiting` (the loop never hangs);
+    /// a send made *inside* a slice wakes the receiver at the slice end (`resume_woken`),
+    /// so one call carries send→wake→resume through to completion.
+    pub fn run_scheduler(&mut self) -> Result<u64>;
+    /// The `x(0)` a spawned process returned, once it ran to its `return` (`None` if it is
+    /// still running, blocked, or finished by raising — see [`Runtime::process_exit`]).
+    pub fn process_result(&self, pid: ProcessId) -> Option<Eterm>;
+    /// The raise reason term a spawned process finished with, once it **raised**.
+    pub fn process_exit(&self, pid: ProcessId) -> Option<Eterm>;
+    /// The number of processes waiting in the scheduler's run queue.
+    pub fn run_queue_len(&self) -> usize;
+
     /// `system_info/1` (A.8) materialized as a term on the runtime scratch heap.
     pub fn system_info(&mut self, key: &str) -> Result<Eterm>;
     /// `system_info/1` as a heap-independent value (the testable source of truth).
@@ -64,7 +92,29 @@ impl Runtime {
 
     /// Print a term via the registered `io:format` `~p` printer (no second printer).
     pub fn format_term(&mut self, term: Eterm, module: Option<&Module>) -> Result<String>;
+
+    // ... plus the process-scheduler entry points listed above (spawn/enqueue/run/result accessors).
 }
+```
+
+### `runner.rs` — the `beam_process::ProcessRunner` (the scheduler's execution seam)
+```rust
+pub(crate) struct ProcessEntry { module: Arc<Module>, function: Atom, arity: u32 }   // what to run, with which args
+struct ProcessEngine { machine: Machine, entry: ProcessEntry, args: Vec<Eterm>, parked: Option<(u32,u32)> }
+#[derive(Default)]
+pub(crate) struct RunnerState { /* engines: HashMap<ProcessId,ProcessEngine>, results: HashMap<ProcessId,Eterm>, exits: HashMap<ProcessId,Eterm> */ }
+impl RunnerState { pub(crate) fn spawn(&mut self, pid, entry, args); pub(crate) fn contains(&self, pid) -> bool;
+                   pub(crate) fn result(&self, pid) -> Option<Eterm>; pub(crate) fn exit(&self, pid) -> Option<Eterm>; }
+pub(crate) struct RuntimeRunner<'a> { runtime: &'a mut Runtime, state: &'a mut RunnerState }
+impl beam_process::ProcessRunner for RuntimeRunner<'_> {
+    fn run(&mut self, pid: ProcessId, table: &mut ProcessTable, budget: u32) -> Result<beam_process::RunOutcome>;
+}
+// run(): takes the pid's ProcessEngine out of the map, builds `RuntimeContext::for_process(runtime, table, pid)`,
+//   then `run_export_outcome` (first run) or `resume_outcome` (a parked `receive`, same Machine — no reset).
+//   Mapping: Returned(v) → record `v` in `results`, return `RunOutcome::Exit(normal)`;
+//            Wait{func,pc} → store `parked`, set `ProcessState::Waiting` via `table.get_mut`, return `RunOutcome::Wait`;
+//            Err(e)        → record `exit_reason(e)` in `exits`, return `RunOutcome::Exit(<reason term>)` (never panic).
+//   `budget` is accepted for the seam but not enforced (no reduction pre-emption ⇒ `Yield` is never returned).
 ```
 
 ### `context.rs` — the concrete `ExecutionContext` (the glue)
@@ -184,6 +234,20 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue>;
 pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable,
                       self_pid: ProcessId, term: Eterm) -> Result<String>;
 ```
+
+## `code:` on the receive path — the native floor, not a live `code_server`
+`code:get_path/0`, `code:all_loaded/0`, `code:which/1` and `code:lib_dir/0,1` — and
+`init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0` — are answered **natively**
+by `src/native.rs`, **not** by a running `code_server` process. `beam_rt` deliberately ships **no**
+live `code_server.beam`: OTP's real one needs `erlang:monitor/2`+`demonitor`, `register`/`whereis`/
+`process_flag(trap_exit)`, `spawn_link`, a working `send`, a host **timer** for `after T`,
+`make_ref/0`, named-ETS resolution, `persistent_term:*`, `filename:*`, `erl_prim_loader:*` and
+`erlang:pre_loaded/0` — all outside this crate — and its *state* already lives in `CodeServer`. The
+three differential `boot/*` cases that touch `code:*` are **shape-only** (`is_list`/`is_atom`) and are
+already satisfied. The wire a future live server must reproduce is the `{code_call, From, Req}` →
+`{code_server, Reply}` message pair (the OTP `code_server:call/1` protocol; `beam_engine` currently
+rejects `code_server:call/1`'s `recv_marker_*`/`send` by opcode). **`src/native.rs`'s `code:*`
+behaviour must not change** — it keeps the currently-agreeing cases green.
 
 ## CLI subset (contract A.6 — the *exact* supported surface; anything else is *unsupported*, exit 3)
 | Switch | Meaning in `beam_rt` |
@@ -328,6 +392,26 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   without a heap and keeps the materialization in one place.
 * **`main.rs` is a thin shim** over `cli::run(argv)`; all logic lives in the library so it is unit- and
   integration-testable.
+* **The scheduler's borrow strategy: move the table (and the runner state) out of the `Runtime`.**
+  A pass needs `&mut Runtime` (BIF dispatch, atoms, heaps — what `RuntimeContext` borrows) **and**
+  `&mut ProcessTable` (the PCBs the scheduler runs, which `RuntimeContext::for_process` resolves each
+  mailbox/send against) at once. The table is a *field* of the runtime, so handing both out of one value
+  is impossible — and the crate is `#![deny(unsafe_code)]` and may not alias. `Runtime::run_pass`
+  therefore **moves** the `ProcessTable` and the `RunnerState` out (`take_processes`/`put_processes`, a
+  `std::mem::replace` with a fresh `ProcessTable::new(SignalAtoms::from_table(runtime.atoms_mut()))`),
+  runs the scheduler with those owned values, then puts both back whatever the outcome. The runner also
+  takes the pid's `Machine` **out of** its `HashMap` for the duration of the slice (a `HashMap` cannot
+  hand out a `&mut` value while its container is still reachable) and puts it back unless the process
+  finished. `Runtime::scheduler` persists across passes (it is not moved), so `run_one_slice` followed
+  by `run_scheduler` continues where the slice left off.
+* **A process's exit reason is not its return value.** BEAM terminates a normally-returning process
+  with `normal`, discarding `x(0)`; the runner therefore **records** each process's final `Returned`
+  value per pid in `RunnerState::results` (`Runtime::process_result`) and returns
+  `RunOutcome::Exit(normal)`. The value lives on the runtime's pointer-stable arena, which M1 never
+  resets, so it stays valid for the runtime's lifetime. A process that **raises** records the mapped
+  reason term in `RunnerState::exits` (`Runtime::process_exit`) and exits with that very term — the
+  failure is observable, never swallowed (`exit_reason` maps a `BeamError` to the error's own atom, then
+  a `Raise`'s owned atom, else interns its `Display` text).
 * **The `FunCaller` seam (`FunBridge`).** `beam_bifs` applies a user fun through `BifContext::call_fun`
   (default: `unsupported_bif`, i.e. every `fun`-taking `lists:*`/`maps:*` BIF raises until a caller is
   installed); `beam_rt` installs a `FunBridge` there. A `FunCaller` needs `&mut Runtime` while
@@ -407,6 +491,22 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   `a_nested_call_without_a_fun_still_sees_the_outer_tables` (the nested-BIF seams through the real call
   path); and `eval/mod.rs`'s bit-operator tests (small-int sanity for each of the six, a `1 bsl 70`
   bignum round-trip, a non-integer operand → `badarith`).
+* **`tests/mailbox.rs` — the nine engine `Mailbox` seam methods (round 1).** Drives `RuntimeContext`'s
+  `Mailbox` implementation over a real `beam_message::Queue`: enqueue/len/scan/cursor, the
+  `recv_marker_*` table, and that `send_message`'s `from` reflects the running pid — pinned against
+  `Runtime.mailboxes` per-pid scan/marker state surviving a blocked `receive`.
+* **`tests/scheduler.rs` — the two-process blocking + resume-on-send proof.** Reuses the committed
+  engine fixture `../beam_engine/tests/fixtures/recv.beam` (`wait/0` = `receive X -> X end`, `bomb/1` =
+  `Pid ! 42, ok`, `sel/0`, `scan/0`) by relative path (`concat!(env!("CARGO_MANIFEST_DIR"), …)`, never
+  copied), plus the added `tests/fixtures/sched.beam` (`send2(Pid,N) -> Pid ! 42, Pid ! {bar, N+7}, ok`).
+  Tests: spawn a `recv:wait/0` receiver + a `recv:bomb/1` sender seeded with `ProcessId::to_eterm`, run
+  the scheduler to completion, assert the receiver's `process_result` == `42` (block + resume end-to-end);
+  run the receiver FIRST (assert it is `ProcessState::Waiting` after that slice) then the sender, assert
+  the send wakes it; and a cross-process selective-receive case (`sched:send2/2`) where a non-matching
+  `42` head is skipped and the matching `{bar,7}` tail delivers `7`. Oracle values verified against the
+  system `erl`. **Caveat:** the whole fixtures directory must not be passed to the oracle as a single
+  `-pa` — it contains a `lists.beam` that shadows stdlib (the Rust loader resolves system stdlib
+  specially, so `Runtime::load_module(FIXTURE)` works).
 * **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` GREEN;
   the whole-workspace `build`/`test` must stay green.
 
@@ -424,8 +524,18 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   outside this crate** (the corpus probes read such a value through `bit_size/1`, so they are
   unaffected). The honest segment limits remain: a construction segment **or** a pattern segment wider
   than 64 bits is *unsupported*, and a value that needs a bignum is `system_limit`.
-* **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
-  no scheduler loop driving spawned processes yet (`beam_process` owns it).
+* **Scheduler is single-threaded; a few M1 process gaps.** `Runtime::spawn_process` +
+  `run_one_slice`/`run_slices`/`run_scheduler` run spawned processes and a blocked receiver **is**
+  resumed by a sender (send→wake→resume via `resume_woken`); the run loop is single-threaded (never a
+  thread). Remaining gaps, all honest: **no reduction pre-emption** (`budget` is not enforced; `Yield` is
+  never returned; a process runs to its next `return`/`wait`); a non-zero `receive ... after T` **suspends
+  (`Wait`) instead of timing out** (there is no host timer — a message never sent leaves the process
+  `Waiting`); **`erlang:make_ref/0` is absent**, so a `recv_marker_*` fixture (`recv:marked/0`) cannot run
+  end-to-end; and on the runner path a **capability gap is uncatchable** — a process raising
+  `badmatch`/`case_clause` terminates with the mapped reason (atom or `Display` text) rather than the real
+  term. `system_info(process_count)` still reflects the runtime's own process table entry.
+* **No live `code_server`.** `code:*` on the receive path is the native floor in `src/native.rs` (see the
+  `code:` section above), not a running `code_server` process.
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
   the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`) are typed
@@ -472,7 +582,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
 * `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; the `<=` binary-generator qualifier; a segment's `:Size` parsed in segment context so a following `/Type` is a specifier, not a division; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
-* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`)
+* `src/mailbox.rs` → `RuntimeContext`'s nine `beam_engine::Mailbox` seam methods over the running process's real `beam_message::Queue`, with per-pid scan/marker state in `Runtime.mailboxes: HashMap<ProcessId, MailboxState>` (the receive cursor + the `recv_marker_*` table); `MailboxState` + `Runtime::mailboxes` are the durable position a blocked `receive` resumes against
+* `src/runner.rs` → the `beam_process::ProcessRunner`: `ProcessEntry`, `ProcessEngine`, `RunnerState` (`engines`/`results`/`exits`), `RuntimeRunner` (implements `ProcessRunner::run` over `RuntimeContext::for_process`; first run `run_export_outcome`, resume `resume_outcome`; maps `Returned`→record+`Exit(normal)`, `Wait`→park+`ProcessState::Waiting`+`RunOutcome::Wait`, `Err`→`exit_reason` term+`Exit`); `exit_reason` maps a `BeamError` to an atom reason (never panics); module docs carry the borrow strategy + the "exit reason is not the return value" rule
+* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), the **scheduler API** (`spawn_process`/`enqueue_process`/`run_one_slice`/`run_slices`/`run_scheduler`/`process_result`/`process_exit`/`run_queue_len` + the private `run_pass`/`take_processes`/`put_processes` move-out dance), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`); fields `processes` (`pub(crate)`), `mailboxes`, `scheduler`, `runner_state`
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
