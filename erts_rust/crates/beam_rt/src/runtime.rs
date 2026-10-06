@@ -79,6 +79,14 @@ pub struct Runtime {
     pub(crate) arena: MinimalContext,
     /// The scratch heap for `system_info`/`format_term`, reset per call.
     pub(crate) info_heap: Heap,
+    /// The long-lived heap for terms the `-eval` evaluator must build on a
+    /// [`beam_alloc::Heap`] rather than the engine arena — today a non-byte-aligned
+    /// bitstring, which [`beam_codec::term::make_bitstring`] materializes.
+    ///
+    /// Like [`Runtime::bif_heaps`] it never moves its terms and Milestone-1 never
+    /// resets it (there is no GC), so a term built on it stays valid for the runtime's
+    /// lifetime.
+    pub(crate) eval_heap: Heap,
     /// The `ets:*` tables.
     ///
     /// Shared through an [`Rc`]`<`[`RefCell`]`>` so a BIF call can hold the registry for
@@ -139,6 +147,7 @@ impl Runtime {
             bif_heap_words: heap_words,
             arena: MinimalContext::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
+            eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
             self_pid,
             booted: false,

@@ -107,6 +107,17 @@ impl<'a> RuntimeContext<'a> {
         self.runtime.arena_available()
     }
 
+    /// The runtime's long-lived `-eval` heap.
+    ///
+    /// The evaluator builds a term here when the engine arena is not enough — a
+    /// non-byte-aligned bitstring, which [`beam_codec::term::make_bitstring`] writes
+    /// through a [`beam_alloc::Heap`]. That heap never moves its terms and
+    /// Milestone-1 never resets it, so the term stays valid for the runtime's
+    /// lifetime (see [`crate::runtime::Runtime::eval_heap`]).
+    pub(crate) fn eval_heap(&mut self) -> &mut beam_alloc::Heap {
+        &mut self.runtime.eval_heap
+    }
+
     /// Runs `module`'s exported `function/arity` with `args`, on this context.
     ///
     /// This is the direct entry point (no BIF/registry indirection): it is what

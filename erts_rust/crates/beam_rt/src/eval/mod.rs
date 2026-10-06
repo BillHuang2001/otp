@@ -166,8 +166,77 @@ enum CompOut {
     List(Vec<Eterm>),
     /// The map pairs.
     Map(Vec<(Eterm, Eterm)>),
-    /// The binary bytes.
-    Binary(Vec<u8>),
+    /// The binary comprehension's accumulated bits.
+    Bits(BitBuf),
+}
+
+/// A binary-construction buffer: the accumulated bits plus their count.
+///
+/// The bits are packed most-significant-bit first, exactly as Erlang's `<<…>>`
+/// construction lays them out, so a segment need not be byte-aligned. `bytes`
+/// always holds `ceil(bits / 8)` bytes, and the low bits of the last byte are left
+/// clear when the total is not a whole number of bytes (`make_bitstring` zeroes them
+/// too).
+#[derive(Default)]
+struct BitBuf {
+    /// The accumulated bits, MSB-first within each byte.
+    bytes: Vec<u8>,
+    /// The number of bits written (`bytes.len() * 8` minus any trailing padding).
+    bits: usize,
+}
+
+impl BitBuf {
+    /// Appends one bit.
+    fn push_bit(&mut self, bit: bool) {
+        let index = self.bits / 8;
+        if self.bits % 8 == 0 {
+            self.bytes.push(0);
+        }
+        if bit {
+            self.bytes[index] |= 0x80 >> (self.bits % 8);
+        }
+        self.bits += 1;
+    }
+
+    /// Appends the low `n_bits` bits of `value`, most significant first.
+    fn push_bits(&mut self, value: u64, n_bits: usize) {
+        for bit in (0..n_bits).rev() {
+            self.push_bit(value >> bit & 1 == 1);
+        }
+    }
+
+    /// Appends the little-endian encoding of the low `n_bits` bits of `value`.
+    ///
+    /// Erlang's `little` integer segment emits the least significant byte of the value
+    /// first and then the first `n_bits` bits of that byte sequence, so the value's
+    /// bytes are laid out in reverse and truncated to `n_bits` (`<<255:12/little>>` is
+    /// `<<255,0:4>>`).
+    fn push_bits_le(&mut self, value: u64, n_bits: usize) {
+        let n_bytes = n_bits.div_ceil(8);
+        let little = value.to_le_bytes();
+        self.push_bit_slice(&little[..n_bytes], 0, n_bits);
+    }
+
+    /// Appends one byte (eight bits, most significant first).
+    fn push_byte(&mut self, byte: u8) {
+        self.push_bits(u64::from(byte), 8);
+    }
+
+    /// Appends `n_bits` bits of `bytes` starting at bit `start` (MSB-first within
+    /// each byte).
+    fn push_bit_slice(&mut self, bytes: &[u8], start: usize, n_bits: usize) {
+        // Fast path: a byte-aligned slice onto a byte-aligned buffer is a copy.
+        if self.bits % 8 == 0 && start % 8 == 0 && n_bits % 8 == 0 {
+            let first = start / 8;
+            self.bytes.extend_from_slice(&bytes[first..first + n_bits / 8]);
+            self.bits += n_bits;
+            return;
+        }
+        for i in 0..n_bits {
+            let bit = bytes[(start + i) / 8] & (0x80 >> ((start + i) % 8)) != 0;
+            self.push_bit(bit);
+        }
+    }
 }
 
 /// Parses and evaluates `expr` against the runtime's BIF registry.
@@ -357,26 +426,41 @@ impl Evaluator<'_, '_> {
 
     /// `<<Seg, …>>`.
     fn binary(&mut self, segments: &[Seg], env: &mut Env) -> EResult<Eterm> {
-        let mut bytes = Vec::new();
+        let mut buf = BitBuf::default();
         for segment in segments {
-            self.append_segment(segment, env, &mut bytes)?;
+            self.append_segment(segment, env, &mut buf)?;
         }
-        Ok(heap!(terms::make_heap_binary(self.ctx, &bytes)))
+        self.materialize_bits(&buf)
     }
 
-    /// Appends one binary segment's bytes to `out`.
-    fn append_segment(&mut self, segment: &Seg, env: &mut Env, out: &mut Vec<u8>) -> EResult<()> {
+    /// Materializes accumulated bits: a byte-aligned result is a **binary**, a
+    /// non-byte-aligned one a **bitstring**.
+    ///
+    /// A byte-aligned binary goes on the engine arena ([`terms::make_heap_binary`]); a
+    /// non-byte-aligned bitstring is written by [`beam_codec::term::make_bitstring`] on
+    /// the runtime's long-lived [`eval_heap`](crate::context::RuntimeContext::eval_heap).
+    /// Both are pointer-stable, so the term stays valid for the runtime's lifetime.
+    fn materialize_bits(&mut self, buf: &BitBuf) -> EResult<Eterm> {
+        if buf.bits % 8 == 0 {
+            Ok(heap!(terms::make_heap_binary(self.ctx, &buf.bytes)))
+        } else {
+            let heap = self.ctx.eval_heap();
+            Ok(heap!(beam_codec::term::make_bitstring(
+                heap, &buf.bytes, buf.bits
+            )))
+        }
+    }
+
+    /// Appends one binary segment's bits to `out`.
+    fn append_segment(&mut self, segment: &Seg, env: &mut Env, out: &mut BitBuf) -> EResult<()> {
         let value = self.expr(&segment.value, env)?;
         match segment.kind {
             Some(SegKind::Utf8) => return self.push_utf8(value, out),
-            Some(SegKind::Binary) | Some(SegKind::Bytes) | Some(SegKind::Bitstring)
+            Some(SegKind::Binary)
+            | Some(SegKind::Bytes)
+            | Some(SegKind::Bitstring)
             | Some(SegKind::Bits) => {
-                let bytes = match terms::binary_bytes(value) {
-                    Ok(bytes) => bytes,
-                    Err(_) => return Err(self.raise(ExceptionClass::Error, "badarg")),
-                };
-                out.extend_from_slice(bytes);
-                return Ok(());
+                return self.push_bitstring_segment(segment, value, env, out)
             }
             Some(SegKind::Float) => {
                 return Err(Flow::Fatal(error::unsupported("float binary segments")))
@@ -390,12 +474,86 @@ impl Evaluator<'_, '_> {
         if segment.size.is_none() && segment.kind.is_none() {
             if let Ok(elements) = terms::list_elements(value) {
                 for element in elements {
-                    out.push(self.byte_of(element)?);
+                    out.push_byte(self.byte_of(element)?);
                 }
                 return Ok(());
             }
         }
         self.push_integer_segment(segment, value, env, out)
+    }
+
+    /// A `binary`/`bytes`/`bitstring`/`bits` segment: appends (part of) a bitstring value.
+    ///
+    /// `binary`/`bytes` require a byte-aligned value and default their unit to a byte;
+    /// `bitstring`/`bits` accept a bitstring of any length and default their unit to a
+    /// bit. An explicit `:Size` (times its `unit:`) is a bit count.
+    fn push_bitstring_segment(
+        &mut self,
+        segment: &Seg,
+        value: Eterm,
+        env: &mut Env,
+        out: &mut BitBuf,
+    ) -> EResult<()> {
+        let Ok((bytes, offset_bits, size_bits)) = beam_codec::term::bitstring_bytes(value) else {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        };
+        let in_bytes = matches!(segment.kind, Some(SegKind::Binary) | Some(SegKind::Bytes));
+        if in_bytes && (offset_bits % 8 != 0 || size_bits % 8 != 0) {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        }
+        // The default unit is a byte for `binary`/`bytes`, a bit otherwise; an explicit
+        // `unit:` replaces it, so the resolved size is always a bit count.
+        let wanted = match self.segment_size_bits(segment, env, if in_bytes { 8 } else { 1 })? {
+            Some(bits) => bits,
+            None => size_bits,
+        };
+        if wanted > size_bits {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        }
+        out.push_bit_slice(bytes, offset_bits, wanted);
+        Ok(())
+    }
+
+    /// Evaluates a bitstring-valued expression and appends **all** of its bits to `out`.
+    ///
+    /// This is the binary comprehension's template operation: `erl_eval` appends the
+    /// template's value as a bitstring once per iteration
+    /// (`eval_bc1/7`: `<<Acc/bitstring, V/bitstring>>`). A value that is not a bitstring
+    /// is `badarg`.
+    fn append_bitstring(&mut self, expr: &Expr, env: &mut Env, out: &mut BitBuf) -> EResult<()> {
+        let value = self.expr(expr, env)?;
+        let Ok((bytes, offset_bits, size_bits)) = beam_codec::term::bitstring_bytes(value) else {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        };
+        out.push_bit_slice(bytes, offset_bits, size_bits);
+        Ok(())
+    }
+    /// The explicit `:Size` of a segment as a **bit** count, or `None` when it has none.
+    ///
+    /// `default_unit` is the specifier's default unit in bits (1 for integer/`bits`,
+    /// 8 for `binary`/`bytes`); an explicit `unit:N` specifier overrides it.
+    fn segment_size_bits(
+        &mut self,
+        segment: &Seg,
+        env: &mut Env,
+        default_unit: u32,
+    ) -> EResult<Option<usize>> {
+        let Some(size) = &segment.size else {
+            return Ok(None);
+        };
+        let size = self.expr(size, env)?;
+        if !is_small(size) {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        }
+        let size = signed_value(size);
+        if size < 0 {
+            return Err(self.raise(ExceptionClass::Error, "badarg"));
+        }
+        let unit = u128::from(segment.unit.unwrap_or(default_unit));
+        let bits = (size as u128) * unit;
+        usize::try_from(bits)
+            .map(Some)
+            .map_err(|_| Flow::Fatal(error::unsupported("segment size overflow")))
     }
 
     /// A numeric segment: `Value[:Size][/integer-…]`.
@@ -404,58 +562,45 @@ impl Evaluator<'_, '_> {
         segment: &Seg,
         value: Eterm,
         env: &mut Env,
-        out: &mut Vec<u8>,
+        out: &mut BitBuf,
     ) -> EResult<()> {
         if !is_small(value) {
             return Err(self.raise(ExceptionClass::Error, "badarg"));
         }
         let number = signed_value(value);
-        let mut bits: u32 = 8;
-        if let Some(size) = &segment.size {
-            let size = self.expr(size, env)?;
-            if !is_small(size) {
-                return Err(self.raise(ExceptionClass::Error, "badarg"));
-            }
-            let size = u32::try_from(signed_value(size))
-                .map_err(|_| Flow::Fatal(error::unsupported("a negative segment size")))?;
-            bits = match segment.unit {
-                Some(unit) => size
-                    .checked_mul(unit)
-                    .ok_or_else(|| Flow::Fatal(error::unsupported("segment size overflow")))?,
-                None => size,
-            };
+        let bits = match self.segment_size_bits(segment, env, 1)? {
+            Some(bits) => bits,
+            None => 8,
+        };
+        // A zero-width segment contributes nothing (`<<1:0>>` is `<<>>`).
+        if bits == 0 {
+            return Ok(());
         }
-        if bits == 0 || bits > 64 || bits % 8 != 0 {
+        if bits > 64 {
+            // A segment wider than a machine word needs a bignum encoder (Stage 2):
+            // a documented Milestone-1 capability gap.
             return Err(Flow::Fatal(error::unsupported(
-                "a non-byte-aligned binary segment",
+                "an integer binary segment wider than 64 bits",
             )));
         }
-        let bytes = (bits / 8) as usize;
-        let signed = segment.signed.unwrap_or(false);
-        let fits = if signed {
-            let limit = 1i128 << (bits - 1);
-            (i128::from(number) >= -limit) && (i128::from(number) < limit)
+        // Erlang truncates the value to `bits` (two's complement), so `<<-1:8>>` is
+        // `<<255>>` and `<<300:8>>` is `<<44>>` — there is no range error here.
+        let mask = if bits == 64 {
+            u64::MAX
         } else {
-            number >= 0 && (u128::from(number as u64) < (1u128 << bits))
+            (1u64 << bits) - 1
         };
-        if !fits {
-            return Err(self.raise(ExceptionClass::Error, "badarg"));
-        }
-        let mut buffer = match segment.endian {
-            Some(ast::Endian::Little) => number.to_le_bytes().to_vec(),
-            _ => number.to_be_bytes().to_vec(),
-        };
-        if matches!(segment.endian, Some(ast::Endian::Little)) {
-            buffer.truncate(bytes);
+        let low = (number as u64) & mask;
+        if integer_segment_is_little(segment) {
+            out.push_bits_le(low, bits);
         } else {
-            buffer.drain(0..8 - bytes);
+            out.push_bits(low, bits);
         }
-        out.extend_from_slice(&buffer);
         Ok(())
     }
 
     /// Encodes `value` as UTF-8 and appends the bytes.
-    fn push_utf8(&mut self, value: Eterm, out: &mut Vec<u8>) -> EResult<()> {
+    fn push_utf8(&mut self, value: Eterm, out: &mut BitBuf) -> EResult<()> {
         if !is_small(value) {
             return Err(self.raise(ExceptionClass::Error, "badarg"));
         }
@@ -464,7 +609,9 @@ impl Evaluator<'_, '_> {
         let character = char::from_u32(code)
             .ok_or_else(|| self.raise(ExceptionClass::Error, "badarg"))?;
         let mut buffer = [0u8; 4];
-        out.extend_from_slice(character.encode_utf8(&mut buffer).as_bytes());
+        for byte in character.encode_utf8(&mut buffer).as_bytes() {
+            out.push_byte(*byte);
+        }
         Ok(())
     }
 
@@ -1012,13 +1159,13 @@ impl Evaluator<'_, '_> {
         let mut out = match template {
             CompTemplate::List(_) => CompOut::List(Vec::new()),
             CompTemplate::Map(..) => CompOut::Map(Vec::new()),
-            CompTemplate::Binary(_) => CompOut::Binary(Vec::new()),
+            CompTemplate::Binary(_) => CompOut::Bits(BitBuf::default()),
         };
         self.comp_collect(&template, quals, 0, env, &mut out)?;
         match out {
             CompOut::List(elements) => Ok(heap!(terms::make_list(self.ctx, &elements))),
             CompOut::Map(pairs) => Ok(heap!(terms::make_flatmap(self.ctx, &pairs))),
-            CompOut::Binary(bytes) => Ok(heap!(terms::make_heap_binary(self.ctx, &bytes))),
+            CompOut::Bits(buf) => self.materialize_bits(&buf),
         }
     }
 
@@ -1049,12 +1196,17 @@ impl Evaluator<'_, '_> {
                     Ok(())
                 }
                 CompTemplate::Binary(segments) => {
-                    let mut bytes = Vec::new();
-                    for segment in segments.iter() {
-                        self.append_segment(segment, env, &mut bytes)?;
-                    }
-                    if let CompOut::Binary(buffer) = out {
-                        buffer.extend_from_slice(&bytes);
+                    // A binary comprehension's template is the `<<…>>` *expression* that
+                    // follows the opening bracket (`erl_parse.yrl`:
+                    // `binary_comprehension -> '<<' expr_max '||' …`), and `erl_eval`
+                    // appends *its value* as a bitstring once per iteration
+                    // (`eval_bc1/7`: `<<Acc/bitstring, V/bitstring>>`). Our parser records
+                    // that expression as the comprehension's single segment, so evaluate
+                    // the segment's value and append it as a bitstring.
+                    if let Some(segment) = segments.first() {
+                        if let CompOut::Bits(buffer) = out {
+                            self.append_bitstring(&segment.value, env, buffer)?;
+                        }
                     }
                     Ok(())
                 }
@@ -1083,8 +1235,42 @@ impl Evaluator<'_, '_> {
                 }
                 Ok(())
             }
-            Qual::BinaryGenerator { .. } => {
-                Err(Flow::Fatal(error::unsupported("a binary generator")))
+            Qual::BinaryGenerator { pattern, source } => {
+                let Expr::Binary(segments) = pattern else {
+                    return Err(Flow::Fatal(error::message(
+                        "a binary generator needs a <<…>> pattern",
+                    )));
+                };
+                let source = self.expr(source, env)?;
+                let Ok((bytes, offset_bits, size_bits)) = beam_codec::term::bitstring_bytes(source)
+                else {
+                    // `erl` raises `{bad_generator, X}`; Milestone-1's term-free raise
+                    // carries the reason atom only (as `iterable` does for a list generator).
+                    return Err(self.raise(ExceptionClass::Error, "badarg"));
+                };
+                // The pattern may materialize terms (a `binary` sub-segment) on the heaps
+                // the source lives on, so own the payload rather than borrowing it.
+                let bytes = bytes.to_vec();
+                let mut consumed = 0usize;
+                while consumed < size_bits {
+                    let mut branch = env.clone();
+                    match self.match_binary_segments(
+                        segments,
+                        &bytes,
+                        offset_bits + consumed,
+                        size_bits - consumed,
+                        &mut branch,
+                    )? {
+                        // A match must advance; a zero-width match would spin forever, so
+                        // it terminates the generator (as a failing match does).
+                        Some(step) if step > 0 => {
+                            self.comp_collect(template, quals, index + 1, &mut branch, out)?;
+                            consumed += step;
+                        }
+                        _ => break,
+                    }
+                }
+                Ok(())
             }
         }
     }
@@ -1199,41 +1385,84 @@ impl Evaluator<'_, '_> {
         Ok(true)
     }
 
-    /// Matches a `<<…>>` pattern (byte-aligned segments only).
+    /// Matches a `<<…>>` pattern against a bitstring value, consuming it whole.
     fn match_binary(&mut self, segments: &[Seg], value: Eterm, env: &mut Env) -> EResult<bool> {
-        let Ok(bytes) = terms::binary_bytes(value) else {
+        let Ok((bytes, offset_bits, size_bits)) = beam_codec::term::bitstring_bytes(value) else {
             return Ok(false);
         };
-        let mut offset = 0usize;
+        // The pattern may build terms on the heaps the value lives on, so own the
+        // payload rather than holding the borrow across those allocations.
+        let bytes = bytes.to_vec();
+        match self.match_binary_segments(segments, &bytes, offset_bits, size_bits, env)? {
+            Some(consumed) => Ok(consumed == size_bits),
+            None => Ok(false),
+        }
+    }
+
+    /// Matches `<<Segments>>` against `available_bits` bits of `bytes` starting at bit
+    /// `offset_bits`.
+    ///
+    /// Returns the number of bits the pattern consumed, or `None` when a segment does
+    /// not match (including when not enough bits remain) — an Erlang pattern-match
+    /// failure, never an exception. Sized integer and `binary`/`bytes`/`bitstring`/
+    /// `bits` segments are supported; an unsized `binary`/`bitstring` segment takes the
+    /// remaining bits and must be last.
+    fn match_binary_segments(
+        &mut self,
+        segments: &[Seg],
+        bytes: &[u8],
+        offset_bits: usize,
+        available_bits: usize,
+        env: &mut Env,
+    ) -> EResult<Option<usize>> {
+        let mut consumed = 0usize;
         for (index, segment) in segments.iter().enumerate() {
-            if segment.size.is_some() || segment.unit.is_some() {
-                return Err(Flow::Fatal(error::unsupported(
-                    "a sized binary pattern segment",
-                )));
-            }
+            let remaining = available_bits - consumed;
             match segment.kind {
                 None | Some(SegKind::Integer) => {
-                    if offset >= bytes.len() {
-                        return Ok(false);
+                    let bits = match self.segment_size_bits(segment, env, 1)? {
+                        Some(bits) => bits,
+                        None => 8,
+                    };
+                    if bits > 64 {
+                        return Err(Flow::Fatal(error::unsupported(
+                            "an integer binary pattern segment wider than 64 bits",
+                        )));
                     }
-                    let byte = make_small(i64::from(bytes[offset]));
-                    offset += 1;
-                    if !self.match_pattern(&segment.value, byte, env)? {
-                        return Ok(false);
+                    if bits > remaining {
+                        return Ok(None);
                     }
+                    let term = self.integer_segment_term(bytes, offset_bits + consumed, bits, segment)?;
+                    if !self.match_pattern(&segment.value, term, env)? {
+                        return Ok(None);
+                    }
+                    consumed += bits;
                 }
                 Some(SegKind::Binary) | Some(SegKind::Bytes) | Some(SegKind::Bitstring)
                 | Some(SegKind::Bits) => {
-                    if index + 1 != segments.len() {
-                        return Err(Flow::Fatal(error::unsupported(
-                            "a non-final binary pattern segment",
-                        )));
+                    let in_bytes =
+                        matches!(segment.kind, Some(SegKind::Binary) | Some(SegKind::Bytes));
+                    let bits = match self
+                        .segment_size_bits(segment, env, if in_bytes { 8 } else { 1 })?
+                    {
+                        Some(bits) => bits,
+                        None => {
+                            if index + 1 != segments.len() {
+                                return Err(Flow::Fatal(error::unsupported(
+                                    "a non-final unsized binary pattern segment",
+                                )));
+                            }
+                            remaining
+                        }
+                    };
+                    if bits > remaining {
+                        return Ok(None);
                     }
-                    let rest = heap!(terms::make_heap_binary(self.ctx, &bytes[offset..]));
-                    offset = bytes.len();
-                    if !self.match_pattern(&segment.value, rest, env)? {
-                        return Ok(false);
+                    let sub = self.bit_slice_term(bytes, offset_bits + consumed, bits)?;
+                    if !self.match_pattern(&segment.value, sub, env)? {
+                        return Ok(None);
                     }
+                    consumed += bits;
                 }
                 _ => {
                     return Err(Flow::Fatal(error::unsupported(
@@ -1242,7 +1471,40 @@ impl Evaluator<'_, '_> {
                 }
             }
         }
-        Ok(offset == bytes.len())
+        Ok(Some(consumed))
+    }
+
+    /// The integer term an integer pattern segment of `bits` bits denotes.
+    ///
+    /// Truncation/extension follows the segment's `signed`/endianness specifiers; a
+    /// value beyond the small-integer range is a documented Milestone-1 gap (a bignum is
+    /// not built), reported as `system_limit` rather than a wrong term.
+    fn integer_segment_term(
+        &mut self,
+        bytes: &[u8],
+        start: usize,
+        bits: usize,
+        segment: &Seg,
+    ) -> EResult<Eterm> {
+        let raw = if integer_segment_is_little(segment) {
+            read_bits_le(bytes, start, bits)
+        } else {
+            read_bits_be(bytes, start, bits)
+        };
+        if segment.signed == Some(true) {
+            return self.small(sign_extend(raw, bits));
+        }
+        match i64::try_from(raw) {
+            Ok(value) => self.small(value),
+            Err(_) => Err(self.raise(ExceptionClass::Error, "system_limit")),
+        }
+    }
+
+    /// The bitstring term for `bits` bits of `bytes` starting at `start`.
+    fn bit_slice_term(&mut self, bytes: &[u8], start: usize, bits: usize) -> EResult<Eterm> {
+        let mut buf = BitBuf::default();
+        buf.push_bit_slice(bytes, start, bits);
+        self.materialize_bits(&buf)
     }
 
     /// Evaluates guards: outer alternatives are `;` (or), inner are `,` (and).
@@ -1424,6 +1686,58 @@ impl Evaluator<'_, '_> {
     fn atom(&mut self, name: &str) -> Eterm {
         make_atom(self.ctx.runtime.code_server.atoms_mut().intern(name))
     }
+}
+
+/// Whether an integer segment is stored least-significant byte first.
+///
+/// `little` and `native` both mean little-endian on the supported platforms (`native`
+/// tracks the machine order, which is little-endian on x86-64/aarch64); a missing or
+/// `big` specifier is big-endian.
+fn integer_segment_is_little(segment: &Seg) -> bool {
+    matches!(
+        segment.endian,
+        Some(ast::Endian::Little) | Some(ast::Endian::Native)
+    )
+}
+
+/// Reads `n` bits (`n <= 64`) starting at bit `start` as a **big-endian** unsigned
+/// integer (most significant bit first, `bytes` MSB-first within each byte).
+fn read_bits_be(bytes: &[u8], start: usize, n: usize) -> u64 {
+    let mut value = 0u64;
+    for i in 0..n {
+        let bit = bytes[(start + i) / 8] & (0x80 >> ((start + i) % 8)) != 0;
+        value = (value << 1) | u64::from(bit);
+    }
+    value
+}
+
+/// Reads `n` bits (`n <= 64`) starting at bit `start` as a **little-endian** unsigned
+/// integer: the bits are gathered MSB-first into `ceil(n / 8)` bytes, and those bytes
+/// are then interpreted least-significant byte first (the inverse of
+/// [`BitBuf::push_bits_le`]).
+fn read_bits_le(bytes: &[u8], start: usize, n: usize) -> u64 {
+    let n_bytes = n.div_ceil(8);
+    let mut gathered = [0u8; 8];
+    for i in 0..n {
+        let bit = bytes[(start + i) / 8] & (0x80 >> ((start + i) % 8)) != 0;
+        if bit {
+            gathered[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    let mut value = 0u64;
+    for &byte in gathered[..n_bytes].iter().rev() {
+        value = (value << 8) | u64::from(byte);
+    }
+    value
+}
+
+/// Sign-extends the low `n` bits (`n <= 64`) of `value`.
+fn sign_extend(value: u64, n: usize) -> i64 {
+    if n >= 64 {
+        return value as i64;
+    }
+    let shift = 64 - n;
+    ((value << shift) as i64) >> shift
 }
 
 /// The `erlang` BIF implementing a delegatable binary operator.

@@ -38,7 +38,7 @@ enum Tok {
 
 /// The multi-character operator/punctuation spellings, longest first.
 const PUNCT: &[&str] = &[
-    "=:=", "=/=", "->", "=>", ":=", "==", "=<", ">=", "<-", "++", "--", "<<", ">>", "||", "#{",
+    "=:=", "=/=", "->", "=>", ":=", "==", "=<", ">=", "<-", "<=", "++", "--", "<<", ">>", "||", "#{",
     "(", ")", "[", "]", "{", "}", ",", ";", ".", "|", "#", ":", "=", "<", ">", "+", "-", "*", "/",
     "!",
 ];
@@ -843,7 +843,7 @@ impl<'a> Parser<'a> {
                 source,
             });
         }
-        if self.eat_punct("=<") {
+        if self.eat_punct("<=") {
             let source = self.with_seg_off(|p| p.parse_expr(0))?;
             return Ok(Qual::BinaryGenerator {
                 pattern: first,
