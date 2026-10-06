@@ -762,9 +762,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
 ## Handoffs (owned by OTHER nodes)
-`differential suite` is at **`summary: total=285 agree=281 mismatch=0 unsupported=4 skipped=0`**.
+`differential suite` is at **`summary: total=333 agree=332 mismatch=0 unsupported=1 skipped=0`**.
 Remaining asks owned elsewhere:
-* **The 4 `unsupported` are the `wire/*` ETF-encode cases**, owned by `beam_codec`/`beam_dist`.
+* **The 1 `unsupported` is `wire/new_fun_ext_encode`** (a lambda's `NEW_FUN_EXT` image — see the Known-Issues entry above; no wrong encoding is emitted). Legacy `wire/*` encode/decode asks (`port_info/2` item shape, `PORT_EXT`/`V4_PORT_EXT`, `{minor_version,1}` atom encoding, map-key encode order, `compressed` decode, `string:to_integer/1`'s missing `erts_internal:list_to_integer/2`) live in `beam_codec`/`beam_bifs` and are outside this crate.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also
