@@ -54,14 +54,22 @@ File size **712 bytes**; `FOR1` form length **704** (= file_size − 8); form ty
 | 4 | `ImpT` | 52 | 4 imports |
 | 5 | `ExpT` | 64 | 5 exports |
 | 6 | `Meta` | 45 | skipped |
-| 7 | `LocT` | 16 | skipped (JIT-only) |
+| 7 | `LocT` | 16 | parsed (JIT-only local-function table, `ExpT` layout) |
 | 8 | `Attr` | 39 | raw attributes |
 | 9 | `CInf` | 27 | raw compile info (path-free) |
-| 10 | `Dbgi` | 66 | skipped (debug info) |
+| 10 | `Dbgi` | 66 | recognized id, payload unparsed (debug info) |
 | 11 | `Line` | 25 | line table |
 | 12 | `Type` | 30 | type table |
 
-Note `Dbgi` (debug info) is *not* `DbgB`; it is not a known chunk id and is skipped.
+Note `Dbgi` (debug info) is *not* the legacy `DbgB` chunk: `Dbgi` is a recognized id
+(`ChunkId::DBGI`) whose payload is deliberately left unparsed (debug info is tooling-only).
+
+### `LocT` — local-function table (JIT-only)
+Payload `00000001 00000005 00000003 00000006` = `i32 count` 1 followed by one
+`{ i32 function_atom, i32 arity, i32 label }` triple `{ 5, 3, 6 }`: the non-exported local
+`fib/3` (wire atom index 5) at entry label 6. Byte-for-byte an `ExpT` payload, so the loader
+parses it with the export-table reader (the C does the same); it is irrelevant to
+interpretation and surfaces only as `Module.locals`.
 
 ### `AtU8` — atoms
 `i32` count = **−10** ⇒ **long (tagged) lengths**; real count 10. Wire index 0 is the
@@ -216,15 +224,15 @@ Chunks in file order (id · payload size):
 | 6 | `FunT` | 28 | 1 lambda |
 | 7 | `LitT` | 84 | 3 literals |
 | 8 | `Meta` | 45 | skipped |
-| 9 | `LocT` | 16 | skipped (JIT-only) |
+| 9 | `LocT` | 16 | parsed (JIT-only local-function table, `ExpT` layout) |
 | 10 | `Attr` | 39 | raw attributes |
 | 11 | `CInf` | 27 | raw compile info (path-free) |
-| 12 | `Dbgi` | 66 | skipped (debug info) |
+| 12 | `Dbgi` | 66 | recognized id, payload unparsed (debug info) |
 | 13 | `Line` | 62 | line table |
 | 14 | `Type` | 43 | type table |
 
 Unlike `slice.beam`, this module carries **`FunT`** (the closure table) and a non-empty
-**`LitT`**. `Dbgi` (debug info) is again not a known chunk id and is skipped.
+**`LitT`**. `Dbgi` (debug info) is again a recognized id whose payload is left unparsed.
 
 ### `AtU8` — atoms
 `i32` count = **−32** ⇒ **long (tagged) lengths**; real count 32. Wire index 0 is the NIL

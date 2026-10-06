@@ -101,6 +101,25 @@ fn preserves_the_wire_atom_table() {
 }
 
 #[test]
+fn preserves_the_local_function_table() {
+    let module = load_fixture();
+
+    // `LocT` is byte-for-byte an `ExpT` layout: the module's single non-exported
+    // local `fib/3` at entry label 6 (the exported `fib/1` is separate, label 4).
+    assert_eq!(
+        module.locals,
+        vec![Export {
+            function: atom(&module, "fib"),
+            arity: 3,
+            label: Label(6),
+        }]
+    );
+    // The local is *not* an export: `fib/3` is absent from `ExpT`.
+    assert_eq!(module.export(atom(&module, "fib"), 3), None);
+    assert_eq!(module.export(atom(&module, "fib"), 1), Some(Label(4)));
+}
+
+#[test]
 fn preserves_the_export_and_import_tables_in_file_order() {
     let module = load_fixture();
 

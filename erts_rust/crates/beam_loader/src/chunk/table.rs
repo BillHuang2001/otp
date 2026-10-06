@@ -1,7 +1,10 @@
-//! The `ExpT` / `ImpT` / `FunT` tables: exports, imports and lambda descriptors.
+//! The `ExpT` / `LocT` / `ImpT` / `FunT` tables: exports, locals, imports and lambda
+//! descriptors.
 //!
 //! * `ExpT` — `i32 count` × `{ i32 function_atom, i32 arity, i32 label }`; the
 //!   label is the function **entry** label.
+//! * `LocT` — byte-for-byte the `ExpT` layout (see [`parse_locals`]); the JIT-only
+//!   local-function table.
 //! * `ImpT` — `i32 count` × `{ i32 module_atom, i32 function_atom, i32 arity }`.
 //! * `FunT` — `i32 count` × `{ i32 function_atom, i32 arity, i32 label, i32 index,
 //!   i32 num_free, i32 old_uniq }` (24-byte entries).
@@ -81,6 +84,23 @@ pub fn parse_exports(data: &[u8]) -> Result<Vec<RawExport>> {
         });
     }
     Ok(exports)
+}
+
+/// Parses a `LocT` chunk payload into its raw entries.
+///
+/// `LocT` is the JIT-only **local-function** table. The C reader parses it with the
+/// very same export-table reader (`parse_locals_chunk` calls `parse_export_table`,
+/// `beam_file.c`) and the compiler writes it with the identical shape
+/// (`chunk(<<"LocT">>, <<NumLocals:32>>, Loc)`, `beam_asm.erl:186`), so its payload
+/// is byte-for-byte an `ExpT` payload — `i32 count` ×
+/// `{ i32 function_atom, i32 arity, i32 label }`. This therefore *reuses*
+/// [`parse_exports`] rather than duplicating the reader.
+///
+/// As in `ExpT`, the label is the local function's **entry** label. The table is
+/// irrelevant to interpretation (the C keeps it only for `erts_jit_asm_dump`), but
+/// parsing it makes the chunk a recognized one instead of a silently skipped payload.
+pub fn parse_locals(data: &[u8]) -> Result<Vec<RawExport>> {
+    parse_exports(data)
 }
 
 /// Parses an `ImpT` chunk payload into its raw entries.
@@ -174,6 +194,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_locals_like_exports() {
+        // `LocT` is byte-for-byte an `ExpT` payload.
+        let data = triples(1, &[[5, 3, 6]]);
+        assert_eq!(
+            parse_locals(&data).unwrap(),
+            vec![RawExport {
+                function: 5,
+                arity: 3,
+                label: 6
+            }]
+        );
+    }
+
+    #[test]
     fn parses_imports() {
         // {module, function, arity} triples.
         let data = triples(2, &[[3, 4, 2], [3, 10, 1]]);
@@ -220,6 +254,7 @@ mod tests {
     fn zero_entries_is_allowed() {
         let zero = 0u32.to_be_bytes();
         assert!(parse_exports(&zero).unwrap().is_empty());
+        assert!(parse_locals(&zero).unwrap().is_empty());
         assert!(parse_imports(&zero).unwrap().is_empty());
         assert!(parse_funs(&zero).unwrap().is_empty());
     }
@@ -231,6 +266,7 @@ mod tests {
             parse_exports(&neg).unwrap_err(),
             BeamError::BadArg
         ));
+        assert!(matches!(parse_locals(&neg).unwrap_err(), BeamError::BadArg));
         assert!(matches!(
             parse_imports(&neg).unwrap_err(),
             BeamError::BadArg
@@ -244,6 +280,10 @@ mod tests {
         let data = 1u32.to_be_bytes();
         assert!(matches!(
             parse_exports(&data).unwrap_err(),
+            BeamError::BadArg
+        ));
+        assert!(matches!(
+            parse_locals(&data).unwrap_err(),
             BeamError::BadArg
         ));
         assert!(matches!(
