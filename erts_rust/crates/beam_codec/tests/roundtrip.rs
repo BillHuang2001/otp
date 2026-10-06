@@ -1499,6 +1499,51 @@ fn oracle_new_fun_image_round_trips() {
     }
 }
 
+/// Byte-exact oracle vector for the `erl_eval` lambda `fun() -> ok end` — the exact
+/// blob the differential case `wire/new_fun_ext_encode` compares. Generated with:
+/// `erl -noshell -eval 'io:format("~w~n",[term_to_binary(fun() -> ok end)])' -s init stop`.
+///
+/// It is `NEW_FUN_EXT` (`112`), total size 136, `arity` 0, module `erl_eval`,
+/// `index` 43, `num_free` 1, `old_index` a `SMALL_INTEGER_EXT` 43 and `old_uniq` an
+/// `INTEGER_EXT` `0x07C1297F` (130099583). The single environment element is
+/// `erl_eval`'s free-variable tree and the creator pid is the default
+/// `nonode@nohost` node (`0`/`0`/`0`).
+const ORACLE_NEW_FUN_EVAL: &[u8] = &[
+    131, 112, 0, 0, 0, 136, 0, 248, 37, 47, 246, 123, 244, 211, 6, 126, 138, 154, 65, 205, 61, 207,
+    38, 0, 0, 0, 43, 0, 0, 0, 1, 119, 8, 101, 114, 108, 95, 101, 118, 97, 108, 97, 43, 98, 7, 193,
+    41, 127, 88, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115, 116, 0, 0, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 104, 6, 97, 1, 106, 119, 4, 110, 111, 110, 101, 119, 4, 110, 111,
+    110, 101, 116, 0, 0, 0, 0, 108, 0, 0, 0, 1, 104, 5, 119, 6, 99, 108, 97, 117, 115, 101, 97, 1,
+    106, 106, 108, 0, 0, 0, 1, 104, 3, 119, 4, 97, 116, 111, 109, 97, 1, 119, 2, 111, 107, 106, 106,
+];
+
+#[test]
+fn oracle_eval_new_fun_image_round_trips() {
+    // `roundtrip_image` decodes the blob, re-encodes the decoded term and asserts the
+    // re-encoding equals the input **byte-for-byte** (then decodes once more and checks
+    // structural equality). An offline golden test: it never needs `erl`.
+    let (t2, _h2, a2) = roundtrip_image(ORACLE_NEW_FUN_EVAL, 1024);
+
+    assert_eq!(fun_kind_term(t2).unwrap(), FunKind::Imported);
+    assert_eq!(a2.name(fun_module(t2).unwrap()), Some("erl_eval"));
+    assert_eq!(fun_arity_term(t2).unwrap(), 0);
+    assert_eq!(fun_num_free_term(t2).unwrap(), 1);
+    assert_eq!(fun_index(t2).unwrap(), 43);
+    assert_eq!(fun_old_index(t2).unwrap(), 43);
+    assert_eq!(fun_old_uniq(t2).unwrap(), 0x07C1_297F);
+    assert_eq!(
+        fun_uniq_bytes(t2).unwrap(),
+        [248, 37, 47, 246, 123, 244, 211, 6, 126, 138, 154, 65, 205, 61, 207, 38]
+    );
+
+    let creator = fun_creator_pid(t2).unwrap();
+    assert_eq!(a2.name(creator.node), Some("nonode@nohost"));
+    assert_eq!((creator.number, creator.serial, creator.creation), (0, 0, 0));
+
+    // The one environment slot is `erl_eval`'s free-variable tree.
+    assert_eq!(fun_env(t2).unwrap().len(), 1);
+}
+
 // ---------------------------------------------------------------------------
 // Negative cases
 // ---------------------------------------------------------------------------
