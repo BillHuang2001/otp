@@ -98,14 +98,14 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access::{
-    float_value, is_atom, is_float, is_list, is_map, is_small, is_tuple, tuple_element, tuple_size,
+    float_value, is_atom, is_float, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, unsupported_bif};
 use crate::print::{
-    adjust_chunk, dup_chars, field_chunk, flatten, proper_list, string_field_chunk, term_chunk,
-    Chunk, UNLIMITED_DEPTH,
+    adjust_chunk, dup_chars, field_chunk, flatten, pretty_chunk, proper_list, string_field_chunk,
+    term_chunk, Chunk, UNLIMITED_DEPTH,
 };
 use crate::registry::BifRegistry;
 
@@ -735,8 +735,10 @@ fn byte_string(elems: &[Eterm]) -> Result<String> {
     Ok(out)
 }
 
-/// `io_lib_format:print/…` for `~p`/`~P`: the printable single-line rendering,
-/// guarded against the re-flow the oracle applies (see the module docs).
+/// `io_lib_format:print/…` for `~p`/`~P`: the printable rendering, re-flowed the
+/// way `io_lib_pretty` breaks a container across lines when it does not fit
+/// `line_length - column` (see [`crate::print::pretty_chunk`] and the module docs
+/// for the supported forms and the remaining gap).
 fn render_p(
     ctx: &mut BifContext<'_>,
     term: Eterm,
@@ -748,51 +750,10 @@ fn render_p(
         // A left-adjusted `~p`/`~P` has no clause in `io_lib_format`.
         return Err(badarg());
     }
-    let chunk = term_chunk(ctx, term, printable, depth)?;
     let line_length = spec.width.unwrap_or(80);
     let column = spec.precision.unwrap_or(1);
-    if reflowable(term) && chunk.flat_len() >= line_length.saturating_sub(column) {
-        // The oracle would break this across lines; we cannot reproduce that.
-        return Err(badarg());
-    }
-    Ok(chunk)
+    pretty_chunk(ctx, term, printable, depth, line_length, column)
 }
-
-/// Whether the oracle's `io_lib_pretty` may break `term` across lines (a tuple,
-/// map, non-printable list, or non-printable bitstring) rather than printing it
-/// flat like an atom, number, ref, printable string or printable binary.
-fn reflowable(term: Eterm) -> bool {
-    if is_tuple(term) || is_map(term) {
-        return true;
-    }
-    if bits::is_bitstring(term) {
-        return !binary_printable(term);
-    }
-    if is_list(term) {
-        return !list_printable(term);
-    }
-    false
-}
-
-/// Whether `term` is a non-empty proper list of small integers in `32..=126`
-/// (the printable-string rule of [`crate::print`]).
-fn list_printable(term: Eterm) -> bool {
-    match proper_list(term) {
-        Some(elems) if !elems.is_empty() => elems.iter().all(|&e| {
-            is_small(e) && (32..=126).contains(&signed_value(e))
-        }),
-        _ => false,
-    }
-}
-
-/// Whether `term` is a non-empty binary whose every byte is in `32..=126`.
-fn binary_printable(term: Eterm) -> bool {
-    match bits::bytes(term) {
-        Ok(bytes) if !bytes.is_empty() => bytes.iter().all(|&b| (32..=126).contains(&b)),
-        _ => false,
-    }
-}
-
 /// `io_lib_format:term/6` — the field-width / truncation rule for a term
 /// rendering (`~w`/`~W` and the integer directives).
 fn term_field(chunk: Chunk, spec: &Spec) -> Chunk {
@@ -1574,15 +1535,21 @@ mod tests {
     }
 
     #[test]
-    fn print_of_a_long_container_is_badarg_instead_of_misformatted() {
-        // The oracle would re-flow a 40-element list under `~p`; we reject rather
-        // than emit a single line the oracle would have broken.
-        let (_, result) = run_io("~p", |ctx| {
+    fn print_of_a_long_container_reflows_like_the_oracle() {
+        // The oracle breaks a 40-element list under `~p` at the 80-column default;
+        // erts-17.1 `io:format("~p",[lists:seq(0,39)])` is exactly:
+        //   [0,1,…,27,28,
+        //    29,…,39]
+        let (output, result) = run_io("~p", |ctx| {
             let elems: Vec<Eterm> = (0..40).map(|i| ctx.int(i).expect("fits")).collect();
             let list = ctx.list(&elems).expect("fits");
             one(ctx, list)
         });
-        assert!(matches!(result, Err(BeamError::BadArg)));
+        assert!(result.is_ok(), "re-flowed: {result:?}");
+        assert_eq!(
+            output,
+            "[0,1,2,3,4,5,6,7,8,9,10,11,12,13,14,15,16,17,18,19,20,21,22,23,24,25,26,27,28,\n 29,30,31,32,33,34,35,36,37,38,39]"
+        );
 
         // A short list is fine.
         let (output, result) = run_io("~p", |ctx| {
@@ -1599,6 +1566,15 @@ mod tests {
             one(ctx, a)
         });
         assert!(matches!(result, Err(BeamError::BadArg)));
+
+        // A non-printable bitstring re-flows through `pp_binary`, which this model
+        // does not reproduce: still the honest typed error.
+        let (_, result) = run_io("~p", |ctx| {
+            let bytes = crate::access::make_heap_bitstring(ctx.heap(), &[0u8; 100], 0)
+                .expect("fits");
+            one(ctx, bytes)
+        });
+        assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
     }
 
     // ---- io_lib:format ---------------------------------------------------------
