@@ -580,6 +580,7 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
+- `src/decode/record.rs` → the `RECORD_EXT` (`67`) decoder (`Decoder::decode_record` — see §Records)
 - `src/error.rs` → error constructors (`BadArg`/`SystemLimit` mapping), `unsupported`,
   `is_unsupported`, `UNSUPPORTED_REASON`, plus the local-fun surface (`unsupported_local_fun`,
   `is_unsupported_local_fun`, `LOCAL_FUN_REASON`)
