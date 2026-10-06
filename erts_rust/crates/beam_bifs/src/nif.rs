@@ -14,29 +14,27 @@
 //! `beam_rt` supplies. `Path` is decoded to a Rust `String` and `LoadInfo` is
 //! forwarded verbatim; the hook owns the shared-object suffix it appends.
 //!
-//! # A load failure carries the oracle's `{error, {Reason, Text}}` term
+//! # A load failure is a *returned* `{error, {Reason, Text}}`
 //!
-//! The oracle's plain-call stub *returns* `{error, {Reason, Text}}` (with `Reason`
-//! one of `load_failed`, `bad_lib`, `reload`, `load`, `upgrade`, `old_code`), which
-//! the calling module's NIF-init wrapper then raises. The
-//! [`NifLoadError`](crate::context::NifLoadError) enum names each reason; because a
-//! term-carrying *return* is not expressible through `beam_common::ExitReason`, this
-//! BIF raises the exact 2-tuple instead
-//! ([`error::raise_error_term`](crate::error::raise_error_term) — the term rides the
-//! `Raise::live_reason` slot), which is the same observable failure the oracle's
-//! wrapper produces.
+//! `erlang:load_nif/2` **returns** `{error, {Reason, Text}}` on failure — it does not
+//! raise (verified against the system-ERTS oracle: a direct call from a compiled
+//! module yields `{returned,{error,{load_failed, "Failed to load NIF library: …"}}}`).
+//! `Reason` is one of `load_failed`, `bad_lib`, `reload`, `load`, `upgrade`,
+//! `old_code` (named by the [`NifLoadError`](crate::context::NifLoadError) enum) and
+//! `Text` an Erlang string; the calling module's NIF-init wrapper is what turns it
+//! into a raise, if it chooses to.
 //!
 //! With no hook installed — or an unknown calling module — the BIF reports a typed
 //! `unsupported_bif` raise (workspace `CONTEXT.md` §3): never a fabricated `ok`,
 //! never a silently dropped load.
 
-use beam_common::{BeamError, Result};
+use beam_common::Result;
 use beam_term::{signed_value, Eterm};
 
 use crate::access;
 use crate::bits;
 use crate::context::{BifContext, NifLoadError};
-use crate::error::{badarg, raise_error_term, unsupported_bif};
+use crate::error::{badarg, unsupported_bif};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -45,8 +43,8 @@ use crate::registry::BifRegistry;
 /// `Path` may be a byte-sized character list or a binary; anything else is
 /// `badarg`. `LoadInfo` is forwarded to the hook unchanged. On success the atom
 /// `ok` is returned (the module's NIF init function has, by then, run inside the
-/// hook); on failure the oracle's `{error, {Reason, Text}}` term is raised (see the
-/// module docs).
+/// hook); on failure the oracle's `{error, {Reason, Text}}` term is *returned*
+/// (see the module docs).
 fn load_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // A non-string Path is `badarg` before the seam is consulted.
     let path = path_string(args[0])?;
@@ -66,7 +64,7 @@ fn load_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
     match outcome {
         Ok(()) => ctx.ok(),
-        Err(error) => Err(load_error(ctx, error)?),
+        Err(error) => load_error(ctx, error),
     }
 }
 
@@ -75,7 +73,7 @@ fn load_nif(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] for a non-list/non-binary term, a non-small-int list
+/// [`beam_common::BeamError::BadArg`] for a non-list/non-binary term, a non-small-int list
 /// element, an element outside `0..=255`, or bytes that are not UTF-8.
 fn path_string(term: Eterm) -> Result<String> {
     if bits::is_binary(term) {
@@ -94,17 +92,17 @@ fn path_string(term: Eterm) -> Result<String> {
 }
 
 /// The `{error, {Reason, Text}}` term for a load failure — the oracle's
-/// `load_nif_error` shape.
+/// `load_nif_error` shape, *returned* rather than raised.
 ///
 /// `Text` is an Erlang string (a proper list of the message's code points) and
 /// `Reason` the atom naming the [`NifLoadError`] variant.
 ///
 /// # Errors
 ///
-/// Propagates a heap-allocation failure, and [`BeamError::TermNotFound`] when a
+/// Propagates a heap-allocation failure, and [`beam_common::BeamError::TermNotFound`] when a
 /// reason/`error` atom is not interned and no `AtomInterner` hook is installed —
 /// never a substituted atom.
-fn load_error(ctx: &mut BifContext<'_>, error: NifLoadError) -> Result<BeamError> {
+fn load_error(ctx: &mut BifContext<'_>, error: NifLoadError) -> Result<Eterm> {
     let (reason, text) = match error {
         NifLoadError::LoadFailed(text) => ("load_failed", text),
         NifLoadError::BadLib(text) => ("bad_lib", text),
@@ -117,14 +115,14 @@ fn load_error(ctx: &mut BifContext<'_>, error: NifLoadError) -> Result<BeamError
     let reason = ctx.atom(reason)?;
     let text = text_string(ctx, &text)?;
     let inner = ctx.tuple(&[reason, text])?;
-    Ok(raise_error_term(ctx.tuple(&[tag, inner])?))
+    ctx.tuple(&[tag, inner])
 }
 
 /// The `Text` element: a proper list of the message's code points.
 ///
 /// # Errors
 ///
-/// Propagates a heap-allocation failure (or [`BeamError::SystemLimit`] for a code
+/// Propagates a heap-allocation failure (or [`beam_common::BeamError::SystemLimit`] for a code
 /// point beyond the 60-bit small range, which cannot occur for a Unicode scalar).
 fn text_string(ctx: &mut BifContext<'_>, text: &str) -> Result<Eterm> {
     let mut elems = Vec::with_capacity(text.chars().count());
@@ -143,7 +141,7 @@ pub(crate) fn register(registry: &mut BifRegistry) {
 mod tests {
     use super::*;
     use beam_alloc::Heap;
-    use beam_common::ExceptionClass;
+    use beam_common::{BeamError, ExceptionClass};
     use beam_process::ProcessId;
     use beam_term::{make_small, AtomTable, NIL};
 

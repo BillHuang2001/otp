@@ -9,14 +9,15 @@
 //! 1. a successful load returns the atom `ok` and forwards the calling module, the
 //!    decoded path and the untouched `LoadInfo`;
 //! 2. each [`NifLoadError`] variant renders the oracle's `{error, {Reason, Text}}`
-//!    term (the `Text` an Erlang string);
+//!    term (the `Text` an Erlang string) as a **returned** value — the oracle
+//!    returns it, it does not raise;
 //! 3. with no hook, or an unknown calling module, the BIF raises `unsupported_bif`
 //!    (never a fabricated `ok`, never a silently dropped load);
 //! 4. a non-string `Path` is `badarg` *before* the seam is consulted.
 //!
 //! Structural comparisons use `beam_term::compare`-free readers
 //! (`beam_codec::term::tuple_*`/`cons_*`), the same public API the sibling suites
-//! use; the reason term of a raise is recovered from the `Raise::live_reason` slot.
+//! use.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext, NifLoadError, NifLoader};
@@ -90,21 +91,6 @@ fn byte_list(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Eterm {
     ctx.list(&elems).expect("the list fits")
 }
 
-/// The reason term carried by an `error`-class raise (the `Raise::live_reason` slot).
-fn reason_term(err: BeamError) -> Eterm {
-    match err {
-        BeamError::Raise(raise) => {
-            assert_eq!(raise.class, ExceptionClass::Error);
-            *raise
-                .live_reason()
-                .expect("the reason term is attached")
-                .downcast_ref::<Eterm>()
-                .expect("the payload is the live reason term")
-        }
-        other => panic!("expected a raise, got {other:?}"),
-    }
-}
-
 /// A proper list of byte-sized small ints read back as a `String`.
 fn string_of(term: Eterm) -> String {
     let mut out = String::new();
@@ -128,6 +114,20 @@ fn assert_unsupported(result: beam_common::Result<Eterm>) {
         }
         other => panic!("expected an unsupported_bif raise, got {other:?}"),
     }
+}
+
+/// Assert that `term` is the oracle's `{error, {Reason, Text}}` term, with
+/// `reason_atom` the reason atom and `text` the char-list message.
+fn assert_error_term(atoms: &AtomTable, term: Eterm, reason_atom: &str, text: &str) {
+    assert_eq!(tuple_arity(term).expect("a tuple"), 2);
+    let tag = tuple_element(term, 0).expect("element 0");
+    assert_eq!(atoms.name(atom_val(tag)), Some("error"));
+    let inner = tuple_element(term, 1).expect("element 1");
+    assert_eq!(tuple_arity(inner).expect("a tuple"), 2);
+    let reason = tuple_element(inner, 0).expect("the reason");
+    assert_eq!(atoms.name(atom_val(reason)), Some(reason_atom));
+    let rendered = tuple_element(inner, 1).expect("the text");
+    assert_eq!(string_of(rendered), text);
 }
 
 #[test]
@@ -216,26 +216,17 @@ fn each_variant_renders_the_oracle_error_term() {
     for (error, reason_atom, text) in cases {
         let mut hook = MockNifLoader::new(vec![Err(error)]);
 
-        let err = {
+        let term = {
             let mut ctx = BifContext::new(&mut *heap, &atoms, ProcessId::new(1, 0))
                 .with_nif_loader(&mut hook)
                 .with_current_module("m");
             let path = byte_list(&mut ctx, b"nif.so");
             reg.call("erlang", "load_nif", 2, &mut ctx, &[path, NIL])
-                .expect_err("the load failed")
+                .expect("a load failure is returned, not raised")
         };
 
         // `{error, {Reason, Text}}`.
-        let term = reason_term(err);
-        assert_eq!(tuple_arity(term).expect("a tuple"), 2);
-        let tag = tuple_element(term, 0).expect("element 0");
-        assert_eq!(atoms.name(atom_val(tag)), Some("error"));
-        let inner = tuple_element(term, 1).expect("element 1");
-        assert_eq!(tuple_arity(inner).expect("a tuple"), 2);
-        let reason = tuple_element(inner, 0).expect("the reason");
-        assert_eq!(atoms.name(atom_val(reason)), Some(reason_atom));
-        let rendered = tuple_element(inner, 1).expect("the text");
-        assert_eq!(string_of(rendered), text);
+        assert_error_term(&atoms, term, reason_atom, text);
     }
 }
 
@@ -257,17 +248,10 @@ fn the_hook_result_can_change_between_calls() {
     assert_eq!(atoms.name(atom_val(first)), Some("ok"));
 
     let second_path = byte_list(&mut ctx, b"nif.so");
-    let second = reg.call("erlang", "load_nif", 2, &mut ctx, &[second_path, NIL]);
-    let term = reason_term(second.expect_err("the second load fails"));
-    let inner = tuple_element(term, 1).expect("element 1");
-    assert_eq!(
-        atoms.name(atom_val(tuple_element(inner, 0).expect("the reason"))),
-        Some("reload")
-    );
-    assert_eq!(
-        string_of(tuple_element(inner, 1).expect("the text")),
-        "again"
-    );
+    let second = reg
+        .call("erlang", "load_nif", 2, &mut ctx, &[second_path, NIL])
+        .expect("a load failure is returned, not raised");
+    assert_error_term(&atoms, second, "reload", "again");
     assert_eq!(hook.calls.len(), 2);
 }
 
