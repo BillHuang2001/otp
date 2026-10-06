@@ -42,6 +42,12 @@ pub enum TermError {
     /// fun at all, or to a fun of the wrong kind for that accessor (see
     /// [`crate::fun`]).
     BadFun,
+    /// A native-record layout helper or accessor was applied to a term that is not
+    /// a well-formed native record (an `ErtsRecordInstance` /
+    /// `ErtsRecordDefinition`), or a record construction argument was invalid:
+    /// a duplicate/non-atom field key or a field count beyond `MAX_ARITYVAL` (see
+    /// [`crate::record`]).
+    BadRecord,
 }
 
 impl fmt::Display for TermError {
@@ -55,6 +61,7 @@ impl fmt::Display for TermError {
             TermError::BadMap => "not a map",
             TermError::BadBitstring => "invalid bitstring byte count",
             TermError::BadFun => "not a fun",
+            TermError::BadRecord => "not a record",
         };
         f.write_str(msg)
     }
@@ -78,6 +85,7 @@ impl core::error::Error for TermError {}
 /// | `BadMap` | `BadArg` | `badarg` |
 /// | `BadBitstring` | `BadArg` | `badarg` |
 /// | `BadFun` | `BadArg` | `badarg` |
+/// | `BadRecord` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
         match error {
@@ -99,6 +107,9 @@ impl From<TermError> for BeamError {
             // A non-fun (or wrong-kind fun) reached a fun layout helper: an argument
             // failure.
             TermError::BadFun => BeamError::BadArg,
+            // A malformed native record reached a record layout helper, or a
+            // record-construction argument was invalid: an argument failure.
+            TermError::BadRecord => BeamError::BadArg,
         }
     }
 }
@@ -123,6 +134,7 @@ mod tests {
             "invalid bitstring byte count"
         );
         assert_eq!(TermError::BadFun.to_string(), "not a fun");
+        assert_eq!(TermError::BadRecord.to_string(), "not a record");
     }
 
     #[test]
@@ -169,6 +181,10 @@ mod tests {
             BeamError::BadArg
         ));
         assert!(matches!(BeamError::from(TermError::BadFun), BeamError::BadArg));
+        assert!(matches!(
+            BeamError::from(TermError::BadRecord),
+            BeamError::BadArg
+        ));
     }
 
     #[test]

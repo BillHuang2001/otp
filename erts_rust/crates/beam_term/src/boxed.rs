@@ -174,6 +174,21 @@ pub const fn is_sane_arity_value(x: Eterm) -> bool {
 }
 
 // ---------------------------------------------------------------------------
+// Record headers
+// ---------------------------------------------------------------------------
+
+/// `make_record_header(sz)` — the `RECORD_SUBTAG` twin of [`make_header`]
+/// (`erl_record.h:85-86`: `MAKE_RECORD_HEADER(FieldCount)` expands to
+/// `make_record_header(RECORD_INST_SIZE(FieldCount) - 1)`).
+///
+/// This is the header word of a native-record **instance** (see [`crate::record`]);
+/// unlike an [`make_arityval`] header it never doubles as a standalone term value.
+#[inline]
+pub const fn make_record_header(size: usize) -> Eterm {
+    make_header(size, RECORD_SUBTAG)
+}
+
+// ---------------------------------------------------------------------------
 // Thing layouts (only the sizes the sub-type tests need)
 // ---------------------------------------------------------------------------
 
