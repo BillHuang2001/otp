@@ -6,7 +6,7 @@
 //! `tests/slice.rs` uses (`erlang:'+'/2` and `erlang:'-'/2` over small integers).
 //!
 //! The second half is the evidence for the tier's inlined `Instr::Test` subset
-//! (`src/jit/cranelift.rs`): every newly inlined `TestKind` is pinned on **both** its
+//! (`src/jit/cranelift/`): every newly inlined `TestKind` is pinned on **both** its
 //! success and its failure side against the interpreter and an independently
 //! computed oracle, the *inline* path is proven to have been compiled (through the
 //! artifact's `inlined_test_kinds()` introspection — a test that silently fell
@@ -14,14 +14,24 @@
 //! operand) is exercised where only the shared helper can produce the answer.
 //!
 //! The third part is the evidence for the tier's other inlined instruction — the
-//! guarded small-int `erlang:'+'/2`/`'-'/2` `gc_bif` fast path — pinned the same way
+//! guarded small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` `gc_bif` fast path — pinned the same
+//! way
 //! and, in addition, **behaviourally**: the fixtures run against BIF floors that
 //! count their calls, so "the fast path computed this" (no call) and "the guard
 //! rejected this and the helper computed it" (exactly one call) are observable
 //! rather than inferred.
 //!
+//! The fourth part covers the tier's *shape* instructions (`src/jit/cranelift/`):
+//! `select_val` (the immediate-alternatives-only subset, unguarded), the guarded tuple
+//! reads (`get_tuple_element` / `select_tuple_arity`) and the guarded list reads
+//! (`get_list` / `get_hd` / `get_tl`). Every inlinable shape is pinned against the
+//! interpreter **and** an independently computed oracle, the artifact's
+//! `inlined_select_val_count()` / `inlined_tuple_read_kinds()` /
+//! `inlined_list_read_kinds()` prove the fast path was compiled, and each run-time or
+//! compile-time rejection is pinned to the interpreter's *exact* typed error.
+//!
 //! The whole file is `cfg`-ed out when the feature is off, so the default build
-//! neither compiles nor links any Cranelift code (see `src/jit/cranelift.rs`).
+//! neither compiles nor links any Cranelift code (see `src/jit/cranelift/`).
 #![cfg(feature = "jit-cranelift")]
 
 use std::sync::atomic::{AtomicUsize, Ordering};
@@ -174,7 +184,7 @@ fn select_and_jump_paths_match_the_interpreter() {
 #[test]
 fn the_inlined_subset_agrees_over_a_wide_input_range() {
     // The tier inlines the metadata no-ops, `move`, `jump` and the small-int
-    // `erlang:'+'/2`/`'-'/2` fast path, and routes everything else through the shared
+    // `erlang:'+'/2`/`'-'/2`/`'*'/2` fast path, and routes everything else through the shared
     // `jit_step_one` helper plus the pc-block CFG's continuation dispatch. Running the
     // same exports over many inputs exercises every one of those paths (the inlined
     // fast path, its guard's rejection/deopt, the cross-function call/return
@@ -264,7 +274,7 @@ fn run_export_of_the_backend_matches_run_with_tier() {
 }
 
 // ---------------------------------------------------------------------------
-// The inlined `test` subset (`src/jit/cranelift.rs`)
+// The inlined `test` subset (`src/jit/cranelift/`)
 // ---------------------------------------------------------------------------
 //
 // `Instr::Test` is the instruction family with the heaviest `jit_step_one` traffic,
@@ -966,10 +976,11 @@ fn a_no_fail_test_raises_through_the_helper_and_is_never_inlined() {
 }
 
 // ---------------------------------------------------------------------------
-// The inlined small-int `erlang:'+'/2` / `'-'/2` fast path (`src/jit/cranelift.rs`)
+// The inlined small-int `erlang:'+'/2` / `'-'/2` / `'*'/2` fast path
+// (`src/jit/cranelift/`)
 // ---------------------------------------------------------------------------
 //
-// A `gc_bif erlang:'+'/2`/`'-'/2` is the hot instruction of the compute-bound
+// A `gc_bif erlang:'+'/2`/`'-'/2`/`'*'/2` is the hot instruction of the compute-bound
 // workload (`jit_bench`'s `kernel/2`), so the tier lowers it natively for the shape
 // the **baseline** tier lowers (`jit/baseline/emit.rs::try_inline_gc_bif`): two
 // operands that are each an x-register or a small-int constant, and an x-register
@@ -1061,7 +1072,7 @@ fn marker_arith(
     if module != "erlang" || arity != 2 || args.len() != 2 {
         return Err(BeamError::BadArg);
     }
-    if function != "+" && function != "-" {
+    if function != "+" && function != "-" && function != "*" {
         return Err(BeamError::BadArg);
     }
     if !is_small(args[0]) || !is_small(args[1]) {
@@ -1233,7 +1244,7 @@ fn arith_module(name: &str, functions: &[ArithFn]) -> Module {
     module
 }
 
-/// The fast-path fixtures: every shape the tier inlines — the two BIFs, an
+/// The fast-path fixtures: every shape the tier inlines — the three BIFs, an
 /// x-register operand, a small-int constant operand on either side, and a
 /// destination that is not `x(0)`.
 fn arith_fixtures() -> Module {
@@ -1273,6 +1284,22 @@ fn arith_fixtures() -> Module {
                 ArithSpec::X(0),
             ),
             ArithFn::new(
+                "mul_regs",
+                2,
+                "erlang",
+                "*",
+                &[ArithSpec::X(0), ArithSpec::X(1)],
+                ArithSpec::X(0),
+            ),
+            ArithFn::new(
+                "mul_const",
+                1,
+                "erlang",
+                "*",
+                &[ArithSpec::X(0), ArithSpec::Int(6)],
+                ArithSpec::X(0),
+            ),
+            ArithFn::new(
                 "plus_dst_two",
                 2,
                 "erlang",
@@ -1293,10 +1320,10 @@ fn non_inlinable_arith_module() -> Module {
         "arith_helper",
         &[
             ArithFn::new(
-                "times",
+                "divide",
                 2,
                 "erlang",
-                "*",
+                "div",
                 &[ArithSpec::X(0), ArithSpec::X(1)],
                 ArithSpec::X(0),
             ),
@@ -1439,14 +1466,18 @@ fn the_tier_reports_which_gc_bifs_it_inlined() {
         .compile(&arith_fixtures())
         .expect("compile the arithmetic fixtures");
     let ops = compiled.inlined_gc_bif_ops();
-    for op in [SmallArith::Add, SmallArith::Sub] {
+    for op in [SmallArith::Add, SmallArith::Sub, SmallArith::Mul] {
         assert!(
             ops.contains(&op),
             "{} must take the inline path, got {ops:?}",
             op.name()
         );
     }
-    assert_eq!(ops.len(), 2, "only the two `+`/`-` ops are inlined: {ops:?}");
+    assert_eq!(
+        ops.len(),
+        3,
+        "only the three `+`/`-`/`*` ops are inlined: {ops:?}"
+    );
     // The inlined `gc_bif` addresses x-registers natively, and so does the `move` of
     // the `plus_dst_two` fixture, so the driver's native-entry bound guard must see
     // them (the same introspection the `test`/`move` fast paths report).
@@ -1772,7 +1803,7 @@ fn non_inlinable_gc_bif_shapes_stay_on_the_helper() {
         &backend,
         &compiled,
         &module,
-        "times",
+        "divide",
         2,
         &[make_small(6), make_small(7)],
         marker_arith,
@@ -1843,4 +1874,1070 @@ fn non_inlinable_gc_bif_shapes_stay_on_the_helper() {
         marker_arith,
     );
     assert!(matches!(got, Err(BeamError::BadArg)), "got {got:?}");
+}
+
+// ---------------------------------------------------------------------------
+// The inlined `'*'/2` fast path (`src/jit/cranelift/`)
+// ---------------------------------------------------------------------------
+//
+// `SmallArith::Mul` is the third BIF the small-int fast path lowers. The product is
+// computed with an `imul`/`smulhi` pair whose explicit overflow check
+// (`high_half == low_half >> 63`) is **ANDed into** the tagged-range guard, so a
+// wrapped 64-bit product can never slip past the range test — a rejection can only
+// ever deopt to the helper, whose interpreter step is the BIF's exact semantics. The
+// fixtures and the counting/marker floors are the same as for `+`/`-`, so "the fast
+// path computed this" (zero BIF calls) and "the guard rejected this and the helper
+// computed it" (exactly one call) are observable rather than inferred.
+
+#[test]
+fn the_inlined_mul_agrees_and_never_consults_the_bif_hook() {
+    let module = arith_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the arithmetic fixtures");
+    assert!(compiled.inlined_gc_bif_ops().contains(&SmallArith::Mul));
+
+    // In-range small products: the tagged word must be computed natively, so the
+    // counting floor must record *zero* calls.
+    for (a, b) in [
+        (6i64, 7i64),
+        (-6, 7),
+        (0, 12_345),
+        (1, -9_999),
+        (MAX_SMALL, 1),
+        (1_234, -5_678),
+        (MAX_SMALL, 0),
+    ] {
+        assert!(
+            small_result(a, b, "*").is_some(),
+            "{a} * {b} must be a small integer"
+        );
+        let args = [make_small(a), make_small(b)];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let got = run_compiled_hooked(
+            &backend,
+            &compiled,
+            &module,
+            "mul_regs",
+            2,
+            &args,
+            counting_marker_arith(Arc::clone(&calls)),
+        )
+        .unwrap_or_else(|err| panic!("mul_regs({a}, {b}) failed: {err:?}"));
+        assert_eq!(got, make_small(a * b), "mul_regs({a}, {b})");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "the fast path must compute {a} * {b} itself"
+        );
+    }
+
+    // The small-int-constant form (`mul_const` is `x0 * 6`).
+    for a in [1i64, 2, -3, 0, 1_000, MAX_SMALL / 6] {
+        let args = [make_small(a)];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let got = run_compiled_hooked(
+            &backend,
+            &compiled,
+            &module,
+            "mul_const",
+            1,
+            &args,
+            counting_marker_arith(Arc::clone(&calls)),
+        )
+        .unwrap_or_else(|err| panic!("mul_const({a}) failed: {err:?}"));
+        assert_eq!(got, make_small(a * 6), "mul_const({a})");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "mul_const({a}) must inline the product"
+        );
+    }
+}
+
+#[test]
+fn the_inlined_mul_deopts_on_overflow_and_non_small_operands() {
+    let module = arith_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the arithmetic fixtures");
+    assert!(compiled.inlined_gc_bif_ops().contains(&SmallArith::Mul));
+
+    // Products that leave the small range — including two that overflow a 64-bit word
+    // (whose *unchecked* `imul` would wrap) — must fail the guard's range/overflow test
+    // and fall back to the BIF floor, which answers the overflow marker.
+    for (a, b) in [
+        (MAX_SMALL, 2i64),
+        (MIN_SMALL, 2),
+        (MIN_SMALL, -1),
+        (1i64 << 40, 1i64 << 40),
+    ] {
+        assert!(
+            small_result(a, b, "*").is_none(),
+            "{a} * {b} is meant to leave the small range"
+        );
+        let args = [make_small(a), make_small(b)];
+
+        let interpreted =
+            run_hooked(Tier::Interpreter, &module, "mul_regs", 2, &args, marker_arith)
+                .unwrap_or_else(|err| panic!("interpreter mul_regs({a}, {b}) failed: {err:?}"));
+        assert_eq!(interpreted, make_small(OVERFLOW_MARKER));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let jitted = run_compiled_hooked(
+            &backend,
+            &compiled,
+            &module,
+            "mul_regs",
+            2,
+            &args,
+            counting_marker_arith(Arc::clone(&calls)),
+        )
+        .unwrap_or_else(|err| panic!("cranelift mul_regs({a}, {b}) failed: {err:?}"));
+        assert_eq!(jitted, interpreted, "mul_regs({a}, {b}) on the Cranelift tier");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the overflowing mul_regs({a}, {b}) must fall back to the BIF floor"
+        );
+    }
+
+    // A boxed / non-small operand (a float, a bignum, a non-`erlang` atom, `[]`): the
+    // operand guard rejects it before any arithmetic, so only the helper can reach the
+    // floor — and the floor's marker shows up in the returned value.
+    let mut arena = MinimalContext::new();
+    let float = terms::make_float(&mut arena, 4.0).expect("the arena allocates a float");
+    let bignum = terms::make_integer(&mut arena, i64::MAX).expect("the arena allocates a bignum");
+    let an_atom = make_atom(atom(&module, "erlang"));
+    for bad in [float, bignum, an_atom, NIL] {
+        let args = [bad, make_small(1)];
+
+        let interpreted =
+            run_hooked(Tier::Interpreter, &module, "mul_regs", 2, &args, marker_arith)
+                .unwrap_or_else(|err| panic!("interpreter mul_regs({bad:?}, 1) failed: {err:?}"));
+        assert_eq!(interpreted, make_small(NON_SMALL_MARKER));
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let jitted = run_compiled_hooked(
+            &backend,
+            &compiled,
+            &module,
+            "mul_regs",
+            2,
+            &args,
+            counting_marker_arith(Arc::clone(&calls)),
+        )
+        .unwrap_or_else(|err| panic!("cranelift mul_regs({bad:?}, 1) failed: {err:?}"));
+        assert_eq!(jitted, interpreted, "mul_regs({bad:?}, 1) on either tier");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the rejected operand must fall back to the BIF floor"
+        );
+    }
+
+    // The `0`/`1` identities are ordinary in-range products, so they stay on the fast
+    // path (zero calls).
+    for (a, b) in [(0i64, 777i64), (1, 777), (777, 0), (777, 1)] {
+        let args = [make_small(a), make_small(b)];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let got = run_compiled_hooked(
+            &backend,
+            &compiled,
+            &module,
+            "mul_regs",
+            2,
+            &args,
+            counting_marker_arith(Arc::clone(&calls)),
+        )
+        .unwrap_or_else(|err| panic!("mul_regs({a}, {b}) failed: {err:?}"));
+        assert_eq!(got, make_small(a * b), "mul_regs({a}, {b})");
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            0,
+            "mul_regs({a}, {b}) must inline the product"
+        );
+    }
+}
+
+#[test]
+fn the_inlined_mul_agrees_with_the_interpreter_over_a_wide_range() {
+    // The same dense differential sweep as the `+`/`-` fast path, over the same value
+    // set: every product that is a small integer must agree with the interpreter *and*
+    // with an independently computed oracle, and every product that is not (including
+    // the ones that overflow a 64-bit word) must be the floor's typed `BadArith` on
+    // every tier.
+    let module = arith_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the arithmetic fixtures");
+
+    let values = [
+        MIN_SMALL,
+        MIN_SMALL + 1,
+        -(1i64 << 30),
+        -16,
+        -1,
+        0,
+        1,
+        16,
+        1i64 << 30,
+        MAX_SMALL - 2,
+        MAX_SMALL,
+    ];
+    for a in values {
+        for b in values {
+            let args = [make_small(a), make_small(b)];
+            let got = agree_arith(
+                &backend,
+                &compiled,
+                &module,
+                "mul_regs",
+                2,
+                &args,
+                checked_arith,
+            );
+            match (got, small_result(a, b, "*")) {
+                (Ok(got), Some(expected)) => {
+                    assert_eq!(got, make_small(expected), "mul_regs({a}, {b})")
+                }
+                (Err(_), None) => {}
+                (got, expected) => panic!("mul_regs({a}, {b}): {got:?} vs {expected:?}"),
+            }
+        }
+    }
+
+    // The small-int-constant form, over the same value set.
+    for a in values {
+        let arg = [make_small(a)];
+        let got = agree_arith(&backend, &compiled, &module, "mul_const", 1, &arg, checked_arith);
+        match (got, small_result(a, 6, "*")) {
+            (Ok(got), Some(expected)) => assert_eq!(got, make_small(expected), "mul_const({a})"),
+            (Err(_), None) => {}
+            (got, expected) => panic!("mul_const({a}): {got:?} vs {expected:?}"),
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The inlined shape instructions (`select_val`, the tuple reads, the list reads)
+// (`src/jit/cranelift/`)
+// ---------------------------------------------------------------------------
+//
+// The other Phase-A additions lower one *shape* each, guarded at run time:
+//
+// * `select_val` — the immediate-alternatives-only subset, with **no** run-time guard
+//   (`=:=` over immediates *is* a raw-word compare; the immediate classes have disjoint
+//   words, so a boxed scrutinee can never collide with one). A `NO_FAIL` switch (which
+//   raises) or any non-immediate alternative deopts the whole instruction.
+// * `get_tuple_element` / `select_tuple_arity` — guard the source as an `arityval`
+//   header (`is_boxed` then the arity sub-tag), then read / switch on the arity; a
+//   non-tuple, a too-short tuple or a `NO_FAIL` arity switch deopts to the helper.
+// * `get_list` / `get_hd` / `get_tl` — guard the source as a cons cell
+//   (`(word & 0x2) == 0`; `[]` is not one), then read `CAR`/`CDR`; a non-cons deopts.
+//
+// Every deopt lands on the shared interpreter step, whose family raise (`{badmatch,
+// V}`) or typed error is the exact ground truth — so the deopt cases below agree with
+// the interpreter **including on the typed error**, never a fabricated value.
+
+/// The body of one hand-built shape fixture: the instructions after the entry label,
+/// with the four labels (`entry`, `a1`, `a2`, `fail`) available for branches. Only
+/// x-register / integer / `nil` operands are used (no imports, no ids).
+type ShapeBody = fn(Label, Label, Label, Label) -> Vec<Instr>;
+
+/// Build a hand-built module (the loader is not involved) whose exported functions are
+/// exactly `fixtures`, each shaped like [`test_module`]'s functions: a fresh entry
+/// label plus three fresh branch targets, the body appended after `label entry`.
+fn shape_module(name: &str, fixtures: &[(&'static str, u32, ShapeBody)]) -> Module {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern(name);
+    // A structured `{badmatch, V}` raise means the raising family resolves `badmatch`
+    // by name, so intern it up front.
+    module.atom_table.intern("badmatch");
+
+    let mut next_label = 1u32;
+    for &(fixture_name, arity, body) in fixtures {
+        let export = module.atom_table.intern(fixture_name);
+        let entry = Label(next_label);
+        let a1 = Label(next_label + 1);
+        let a2 = Label(next_label + 2);
+        let fail = Label(next_label + 3);
+        next_label += 4;
+
+        let mut code = vec![Instr::Label(entry)];
+        code.extend(body(entry, a1, a2, fail));
+        let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+        module.functions.push(Function {
+            func_label: entry,
+            entry_label: entry,
+            module: module.name,
+            name: export,
+            arity,
+            code,
+            blocks,
+            labels,
+        });
+        module.exports.push(Export {
+            function: export,
+            arity,
+            label: entry,
+        });
+    }
+    module
+}
+
+/// `move {integer,V} -> x0; return` — the answer of a fixture's terminal branch.
+fn shape_answer(value: i64) -> Vec<Instr> {
+    vec![
+        Instr::Move {
+            src: Operand::Integer(value),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+// -- tuple reads -------------------------------------------------------------
+
+/// `get_tuple_element x0 0 x0` — the element aliases the source register.
+fn tuple_elem0(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 0,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_tuple_element x0 1 x0`.
+fn tuple_elem1(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 1,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_tuple_element x0 9 x0` — an index past a short tuple is a run-time guard
+/// rejection, but a long-enough tuple takes the fast path.
+fn tuple_elem_oob(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetTupleElement {
+            source: Operand::X(0),
+            element: 9,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_tuple_element nil 0 x0` — a constant source is a compile-time shape rejection.
+fn tuple_elem_const_src(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetTupleElement {
+            source: Operand::Nil,
+            element: 0,
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `select_tuple_arity x0 fail {2 -> a1, 3 -> a2}`; `a1`/`a2` answer the arity, `fail`
+/// answers `0`.
+fn tuple_arity(_entry: Label, a1: Label, a2: Label, fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectTupleArity {
+        tuple: Operand::X(0),
+        fail,
+        destinations: vec![(Operand::Integer(2), a1), (Operand::Integer(3), a2)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(2));
+    code.push(Instr::Label(a2));
+    code.extend(shape_answer(3));
+    code.push(Instr::Label(fail));
+    code.extend(shape_answer(0));
+    code
+}
+
+/// `select_tuple_arity x0 NO_FAIL {2 -> a1}` — a `NO_FAIL` switch deopts as a whole
+/// (its no-match path raises `{badmatch, Tuple}`).
+fn tuple_arity_nofail(_entry: Label, a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectTupleArity {
+        tuple: Operand::X(0),
+        fail: NO_FAIL,
+        destinations: vec![(Operand::Integer(2), a1)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(2));
+    code
+}
+
+// -- list reads --------------------------------------------------------------
+
+/// `get_hd x0 x0`.
+fn list_hd(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetHd {
+            source: Operand::X(0),
+            head: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_tl x0 x0`.
+fn list_tl(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetTl {
+            source: Operand::X(0),
+            tail: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_list x0 x1 x2; move x1 -> x0` — split with distinct head/tail destinations.
+fn list_split_head(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::X(1),
+            tail: Operand::X(2),
+        },
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+/// `get_list x0 x1 x2; move x2 -> x0`.
+fn list_split_tail(_entry: Label, _a1: Label, _a2: Label, _fail: Label) -> Vec<Instr> {
+    vec![
+        Instr::GetList {
+            source: Operand::X(0),
+            head: Operand::X(1),
+            tail: Operand::X(2),
+        },
+        Instr::Move {
+            src: Operand::X(2),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]
+}
+
+// -- select_val --------------------------------------------------------------
+
+/// `select_val x0 fail {1 -> a1, 2 -> a2}`; `a1`/`a2` answer `10`/`20`, `fail`
+/// answers `0`.
+fn sel_int(_entry: Label, a1: Label, a2: Label, fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectVal {
+        value: Operand::X(0),
+        fail,
+        pairs: vec![(Operand::Integer(1), a1), (Operand::Integer(2), a2)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(10));
+    code.push(Instr::Label(a2));
+    code.extend(shape_answer(20));
+    code.push(Instr::Label(fail));
+    code.extend(shape_answer(0));
+    code
+}
+
+/// `select_val x0 fail {nil -> a1, 3 -> a2}`.
+fn sel_nil(_entry: Label, a1: Label, a2: Label, fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectVal {
+        value: Operand::X(0),
+        fail,
+        pairs: vec![(Operand::Nil, a1), (Operand::Integer(3), a2)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(10));
+    code.push(Instr::Label(a2));
+    code.extend(shape_answer(20));
+    code.push(Instr::Label(fail));
+    code.extend(shape_answer(0));
+    code
+}
+
+/// `select_val x0 NO_FAIL {1 -> a1, 2 -> a2}` — a `NO_FAIL` switch deopts as a whole.
+fn sel_nofail(_entry: Label, a1: Label, a2: Label, _fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectVal {
+        value: Operand::X(0),
+        fail: NO_FAIL,
+        pairs: vec![(Operand::Integer(1), a1), (Operand::Integer(2), a2)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(10));
+    code.push(Instr::Label(a2));
+    code.extend(shape_answer(20));
+    code
+}
+
+/// `select_val x0 fail {x1 -> a1}` — a **register** alternative needs a term compare,
+/// so the whole instruction deopts.
+fn sel_reg_alt(_entry: Label, a1: Label, _a2: Label, fail: Label) -> Vec<Instr> {
+    let mut code = vec![Instr::SelectVal {
+        value: Operand::X(0),
+        fail,
+        pairs: vec![(Operand::X(1), a1)],
+    }];
+    code.push(Instr::Label(a1));
+    code.extend(shape_answer(10));
+    code.push(Instr::Label(fail));
+    code.extend(shape_answer(0));
+    code
+}
+
+/// The fixture module for every Phase-A shape: the inlinable tuple/list/`select_val`
+/// shapes and one deopt shape per rejection clause.
+fn shape_fixtures() -> Module {
+    shape_module(
+        "shape",
+        &[
+            ("tuple_elem0", 1, tuple_elem0),
+            ("tuple_elem1", 1, tuple_elem1),
+            ("tuple_elem_oob", 1, tuple_elem_oob),
+            ("tuple_elem_const_src", 1, tuple_elem_const_src),
+            ("tuple_arity", 1, tuple_arity),
+            ("tuple_arity_nofail", 1, tuple_arity_nofail),
+            ("list_hd", 1, list_hd),
+            ("list_tl", 1, list_tl),
+            ("list_split_head", 1, list_split_head),
+            ("list_split_tail", 1, list_split_tail),
+            ("sel_int", 1, sel_int),
+            ("sel_nil", 1, sel_nil),
+            ("sel_nofail", 1, sel_nofail),
+            ("sel_reg_alt", 2, sel_reg_alt),
+        ],
+    )
+}
+
+/// Assert the interpreter and the Cranelift tier (through a caller-owned compiled
+/// artifact) produce the same outcome for `export/arity`, and — when `expected` is
+/// given — that the interpreter matches that independently computed oracle too. Returns
+/// the shared outcome.
+fn agree_shape(
+    backend: &CraneliftJit,
+    compiled: &CompiledFunctions,
+    module: &Module,
+    export: &str,
+    arity: u32,
+    args: &[Eterm],
+    expected: Option<Eterm>,
+) -> Result<Eterm, BeamError> {
+    let interpreted = run_module(
+        Tier::Interpreter,
+        module,
+        export,
+        arity,
+        args,
+        &mut MinimalContext::new(),
+    );
+    let cranelift = run_compiled(backend, compiled, module, export, arity, args);
+    assert_same(
+        &cranelift,
+        &interpreted,
+        &format!("cranelift {export}/{arity}"),
+    );
+    if let Some(expected) = expected {
+        match &interpreted {
+            Ok(value) => assert_eq!(
+                *value, expected,
+                "interpreter {export}/{arity} disagrees with the oracle"
+            ),
+            Err(err) => panic!("interpreter {export}/{arity} failed: {err:?}"),
+        }
+    }
+    interpreted
+}
+
+#[test]
+fn the_tier_reports_which_shape_instructions_it_inlined() {
+    // Artifact-level evidence that the shape fast paths — not `jit_step_one` — were
+    // *compiled*.
+    let module = shape_fixtures();
+    let compiled = CraneliftJit::new()
+        .compile(&module)
+        .expect("compile the shape fixtures");
+
+    // Exactly the two immediate-only, fail-labelled switches (`sel_int`, `sel_nil`)
+    // inline; `sel_nofail` and `sel_reg_alt` do not.
+    assert_eq!(
+        compiled.inlined_select_val_count(),
+        2,
+        "only the immediate-only, fail-labelled switches may inline"
+    );
+
+    let tuple_reads = compiled.inlined_tuple_read_kinds();
+    assert!(
+        tuple_reads.contains(&"get_tuple_element"),
+        "get_tuple_element must inline, got {tuple_reads:?}"
+    );
+    assert!(
+        tuple_reads.contains(&"select_tuple_arity"),
+        "select_tuple_arity must inline, got {tuple_reads:?}"
+    );
+
+    let list_reads = compiled.inlined_list_read_kinds();
+    for kind in ["get_list", "get_hd", "get_tl"] {
+        assert!(
+            list_reads.contains(&kind),
+            "{kind} must inline, got {list_reads:?}"
+        );
+    }
+
+    // A `NO_FAIL` select and a register-alternative select must stay on the helper:
+    // compile a module holding only that shape and observe no inlined select.
+    for (name, arity, body) in [
+        ("nofail", 1u32, sel_nofail as ShapeBody),
+        ("reg_alt", 2, sel_reg_alt as ShapeBody),
+    ] {
+        let only = shape_module("only", &[(name, arity, body)]);
+        let compiled = CraneliftJit::new()
+            .compile(&only)
+            .expect("compile the single-shape module");
+        assert_eq!(
+            compiled.inlined_select_val_count(),
+            0,
+            "{name} must not inline its `select_val`"
+        );
+    }
+
+    // Likewise a `NO_FAIL` `select_tuple_arity` and a constant-source
+    // `get_tuple_element` must stay on the helper.
+    for (name, body) in [
+        ("arity_nofail", tuple_arity_nofail as ShapeBody),
+        ("const_src", tuple_elem_const_src as ShapeBody),
+    ] {
+        let only = shape_module("only", &[(name, 1, body)]);
+        let compiled = CraneliftJit::new()
+            .compile(&only)
+            .expect("compile the single-shape module");
+        assert!(
+            compiled.inlined_tuple_read_kinds().is_empty(),
+            "{name} must not inline its tuple read, got {:?}",
+            compiled.inlined_tuple_read_kinds()
+        );
+    }
+}
+
+#[test]
+fn the_inlined_tuple_reads_agree_and_deopt_like_the_interpreter() {
+    let module = shape_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the shape fixtures");
+    assert!(compiled
+        .inlined_tuple_read_kinds()
+        .contains(&"get_tuple_element"));
+
+    // The boxed inputs live on an arena that outlives every run.
+    let mut arena = MinimalContext::new();
+    let pair =
+        terms::make_tuple(&mut arena, &[make_small(11), make_small(22)]).expect("arena tuple");
+    let triple = terms::make_tuple(&mut arena, &[make_small(7), make_small(8), make_small(9)])
+        .expect("arena tuple");
+    let single = terms::make_tuple(&mut arena, &[make_small(5)]).expect("arena tuple");
+
+    // Fast path: element 0 / element 1, both aliasing the source register.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem0",
+        1,
+        &[pair],
+        Some(make_small(11)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem1",
+        1,
+        &[pair],
+        Some(make_small(22)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem1",
+        1,
+        &[triple],
+        Some(make_small(8)),
+    );
+
+    // The arity switch: a match answers the arity, no match falls to the fail label.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_arity",
+        1,
+        &[pair],
+        Some(make_small(2)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_arity",
+        1,
+        &[triple],
+        Some(make_small(3)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_arity",
+        1,
+        &[single],
+        Some(make_small(0)),
+    );
+
+    // Deopt: `tuple_elem_oob` on a 2-tuple — the element index is out of range, the
+    // guard rejects, and the helper raises the family's exact `{badmatch, Tuple}`.
+    let got = agree_shape(&backend, &compiled, &module, "tuple_elem_oob", 1, &[pair], None);
+    assert!(
+        got.is_err(),
+        "an out-of-range element must be a typed error, got {got:?}"
+    );
+    // ... and the very same instruction *does* take the fast path for a long enough
+    // tuple.
+    let twelve: Vec<Eterm> = (0i64..12).map(make_small).collect();
+    let long = terms::make_tuple(&mut arena, &twelve).expect("arena tuple");
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem_oob",
+        1,
+        &[long],
+        Some(make_small(9)),
+    );
+
+    // Deopt: the source is a constant operand — the shape test rejects it at compile
+    // time and the helper raises `{badmatch, nil}`.
+    let got = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_elem_const_src",
+        1,
+        &[pair],
+        None,
+    );
+    assert!(
+        got.is_err(),
+        "a constant source must be a typed error, got {got:?}"
+    );
+
+    // Deopt: a non-tuple source — the guard rejects at run time.
+    for bad in [make_small(1), NIL] {
+        let got = agree_shape(&backend, &compiled, &module, "tuple_elem0", 1, &[bad], None);
+        assert!(
+            got.is_err(),
+            "tuple_elem0({bad:?}) must be a typed error, got {got:?}"
+        );
+        let got = agree_shape(&backend, &compiled, &module, "tuple_arity", 1, &[bad], None);
+        assert!(
+            got.is_err(),
+            "tuple_arity({bad:?}) must be a typed error, got {got:?}"
+        );
+    }
+
+    // The `NO_FAIL` arity switch deopts as a whole: a 2-tuple still matches through the
+    // helper, a 4-tuple raises `{badmatch, Tuple}`.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_arity_nofail",
+        1,
+        &[pair],
+        Some(make_small(2)),
+    );
+    let quad = terms::make_tuple(
+        &mut arena,
+        &[make_small(1), make_small(2), make_small(3), make_small(4)],
+    )
+    .expect("arena tuple");
+    let got = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "tuple_arity_nofail",
+        1,
+        &[quad],
+        None,
+    );
+    assert!(
+        got.is_err(),
+        "a NO_FAIL arity switch with no match must raise, got {got:?}"
+    );
+}
+
+#[test]
+fn the_inlined_list_reads_agree_and_deopt_like_the_interpreter() {
+    let module = shape_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the shape fixtures");
+    let list_reads = compiled.inlined_list_read_kinds();
+    for kind in ["get_list", "get_hd", "get_tl"] {
+        assert!(
+            list_reads.contains(&kind),
+            "{kind} must inline, got {list_reads:?}"
+        );
+    }
+
+    let mut arena = MinimalContext::new();
+    let tail = terms::make_cons(&mut arena, make_small(2), NIL).expect("arena cons");
+    let list = terms::make_cons(&mut arena, make_small(1), tail).expect("arena cons");
+    // `[1 | 9]` — an improper list is still a legal cons cell.
+    let improper = terms::make_cons(&mut arena, make_small(1), make_small(9)).expect("arena cons");
+
+    // Fast path: head/tail reads and the split forms.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "list_hd",
+        1,
+        &[list],
+        Some(make_small(1)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "list_tl",
+        1,
+        &[list],
+        Some(tail),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "list_tl",
+        1,
+        &[improper],
+        Some(make_small(9)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "list_split_head",
+        1,
+        &[list],
+        Some(make_small(1)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "list_split_tail",
+        1,
+        &[list],
+        Some(tail),
+    );
+
+    // Deopt: `[]`, an integer and a tuple are not cons cells, so the guard rejects and
+    // the helper raises the family's exact `{badmatch, Source}`.
+    let a_tuple = terms::make_tuple(&mut arena, &[make_small(1), make_small(2)]).expect("arena tuple");
+    for bad in [NIL, make_small(1), a_tuple] {
+        for export in ["list_hd", "list_tl", "list_split_head", "list_split_tail"] {
+            let got = agree_shape(&backend, &compiled, &module, export, 1, &[bad], None);
+            assert!(
+                got.is_err(),
+                "{export}({bad:?}) must be a typed error, got {got:?}"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_inlined_select_val_agrees_and_deopts_like_the_interpreter() {
+    let module = shape_fixtures();
+    let mut backend = CraneliftJit::new();
+    let compiled = backend
+        .compile(&module)
+        .expect("compile the shape fixtures");
+    assert_eq!(compiled.inlined_select_val_count(), 2);
+
+    // The integer switch: only `1`/`2` answer `10`/`20`, everything else falls to the
+    // fail label (`0`).
+    for value in [-1i64, 0, 1, 2, 3, MAX_SMALL, MIN_SMALL] {
+        let expected = match value {
+            1 => 10,
+            2 => 20,
+            _ => 0,
+        };
+        let _ = agree_shape(
+            &backend,
+            &compiled,
+            &module,
+            "sel_int",
+            1,
+            &[make_small(value)],
+            Some(make_small(expected)),
+        );
+    }
+
+    // The `nil` alternative is an immediate word compare too.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nil",
+        1,
+        &[NIL],
+        Some(make_small(10)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nil",
+        1,
+        &[make_small(3)],
+        Some(make_small(20)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nil",
+        1,
+        &[make_small(4)],
+        Some(make_small(0)),
+    );
+
+    // A boxed scrutinee's word can never collide with an immediate, so both switches
+    // take the fail label.
+    let mut arena = MinimalContext::new();
+    let float = terms::make_float(&mut arena, 1.0).expect("arena float");
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nil",
+        1,
+        &[float],
+        Some(make_small(0)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_int",
+        1,
+        &[float],
+        Some(make_small(0)),
+    );
+
+    // The inlined switch never consults the BIF floor (the fixture holds no `gc_bif`
+    // at all, so the counting floor must stay at zero under the Cranelift tier).
+    let calls = Arc::new(AtomicUsize::new(0));
+    let got = run_compiled_hooked(
+        &backend,
+        &compiled,
+        &module,
+        "sel_int",
+        1,
+        &[make_small(2)],
+        counting_marker_arith(Arc::clone(&calls)),
+    )
+    .expect("sel_int(2) via the Cranelift tier");
+    assert_eq!(got, make_small(20));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the inlined switch must not call the BIF floor"
+    );
+
+    // A `NO_FAIL` switch deopts as a whole: a match runs through the helper ...
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nofail",
+        1,
+        &[make_small(1)],
+        Some(make_small(10)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nofail",
+        1,
+        &[make_small(2)],
+        Some(make_small(20)),
+    );
+    // ... and no match raises the interpreter's typed error.
+    let got = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_nofail",
+        1,
+        &[make_small(7)],
+        None,
+    );
+    assert!(
+        got.is_err(),
+        "a NO_FAIL switch with no match must raise, got {got:?}"
+    );
+
+    // A register alternative deopts as a whole; the helper's exact (`cmp`) compare
+    // answers `10` for a match and `0` for a mismatch.
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_reg_alt",
+        2,
+        &[make_small(5), make_small(5)],
+        Some(make_small(10)),
+    );
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_reg_alt",
+        2,
+        &[make_small(5), make_small(6)],
+        Some(make_small(0)),
+    );
+    // A boxed scrutinee is `=:=` to the register's identical word.
+    let five_float = terms::make_float(&mut arena, 5.0).expect("arena float");
+    let _ = agree_shape(
+        &backend,
+        &compiled,
+        &module,
+        "sel_reg_alt",
+        2,
+        &[five_float, five_float],
+        Some(make_small(10)),
+    );
 }
