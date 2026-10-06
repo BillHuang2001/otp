@@ -449,33 +449,11 @@ impl Table {
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
 
-## Oracle reference: the missing `ets` ops (measured on OTP 29 / erts-17.1)
-Ground-truth observable behavior for the ops this crate does not yet implement, captured from the
-live system `erl` (via `erl -noshell -eval`) so a future implementation need not re-derive it.
-- **`ets:select_replace/2`** — supported on `set`, `ordered_set` **and `duplicate_bag`**; on `bag` it
-  is `badarg` (all three bag cases tested, incl. an identity body). Returns the **count of matched
-  (replaced) objects**. The body value is the replacement object and must be a **tuple** of arity
-  `>= keypos` whose `keypos` element **equals the matched object's original key**; a non-tuple value
-  (`[42]`, `['$1']`), an arity-`0` tuple, or a changed key ⇒ the whole call `badarg` (table
-  unchanged). Body `'$_'` replaces each object with itself and still counts. `{keypos,2}` keys must
-  likewise be preserved; the object may grow/shrink in other positions.
-- **`ets:select/3`, `ets:match/3`, `ets:match_object/3` (+ the `/1` continuations)** — limit `0` ⇒
-  `badarg`; limit `> 0` ⇒ `{Results, Continuation}` where `Continuation` is an **opaque internal
-  term** (a tuple carrying a table ref) while more objects remain, and the atom `'$end_of_table'`
-  once the traversal is complete (also when limit ≥ table size). `ets:select/1` / `match/1` /
-  `match_object/1` take a continuation and return `{Results, NewCont}` or `'$end_of_table'`. Empty
-  table: `/_2` ⇒ `[]`, `/_3` ⇒ `'$end_of_table'`.
-- **`ets:match/2`** compiles the pattern with an implicit body = the pattern's **variables in
-  numeric order** (`['$1','$2',…]`): `match(T,{1,'$1'})` on `{1,10}` ⇒ `[[10]]`,
-  `match(T,{1,10})` ⇒ `[[]]`. `match_object/*` returns whole objects.
-- **`ets:match_spec_run/2`** — runs the compiled spec against each list element in order, keeping the
-  per-element body value for matching elements (order preserved, non-matching dropped); semantically
-  `ets:select/2` on the list (a `set` select's own order is unspecified, so it may differ). The body
-  value is the **last** body element. `'$N'` matches/binds and a repeated head var (`{'$1','$1'}`)
-  enforces equality. In a **head** `'$_'`/`'$$'` are treated as the **literal atom** (never match a
-  non-atom); `'$_'` denotes the whole object **only in the body**, and `'$$'` in the body yields
-  `[WholeObject]`. A body tuple must use the `{{…}}` construction form — a plain tuple in the body is
-  `badarg`.
+## Oracle reference: the remaining missing `ets` ops (measured on OTP 29 / erts-17.1)
+Ground-truth observable behavior for the ops this crate still does not implement, captured from the
+live system `erl` (via `erl -noshell -eval`) so a future implementation need not re-derive it. (The
+oracle behavior of the now-implemented `select_replace`/`select/3`/`match_spec_run` family lives in
+the Design Decisions above and the corresponding `tests/` files.)
 - **`ets:match_spec_test/3`** (and `/2`) **do not exist in OTP 29** (`ets:module_info(exports)` has
   no `match_spec_test`) — the call raises `error:undef`.
 - **`ets:give_away/3`** — `true` on success (the new owner receives `{'ETS-TRANSFER', TabId(Ref),
