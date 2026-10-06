@@ -159,7 +159,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   Implements `Driver`: registers the read fd `READABLE` on `start`; `output`/`ready_output` drain `ctx.output()`
   to the write fd (`libc::write`, `EAGAIN` ⇒ keep queued + arm `WRITABLE`); `ready_input` reads into
   `ctx.input()` (`libc::read`, loops to `EAGAIN`, latches `read_eof` on `read(2)==0`, flushes a pending
-  partial line at EOF). `control` verbs: `line [decimal(N) | "line,<N>"]`, `noline`, `binary`, `text`,
+  partial line at EOF, then **de-registers the read fd** (`disarm_input`) so an exhausted — level-triggered
+  fallback — regular file stops producing events; the fd stays attached/owned, so a post-EOF `ready_input`
+  is still `Ok`). `control` verbs: `line [decimal(N) | "line,<N>"]`, `noline`, `binary`, `text`,
   `getopts` (reply `b"line,<N>"` / `b"binary"`); unknown ⇒ `BeamError::BadArg`.
 ### `drivers/line_buffer.rs`
 - `pub const DEFAULT_MAX_LINE_LEN: usize = 1024`. `pub struct LineBuffer`: `new(max_len)`, `max_len()`,
