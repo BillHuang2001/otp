@@ -428,6 +428,18 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   argument would not get tables — none exists in M1. Output sharing costs `RuntimeContext` a
   destructor (the `Rc`-backed `SharedSink`), so a caller that keeps a `RuntimeContext` alive cannot
   reuse the `Runtime` binding directly until it goes out of scope; read it through the context instead.
+* **Ports: spawned, registered and queryable — but not polled.** `erlang:open_port/2` really spawns
+  the OS process (`{spawn, Cmd}` through `/bin/sh -c`, `{spawn_executable, …}` directly, `{fd, N}` as a
+  descriptor port), allocates a `beam_process::PortId` and records the live port (real `os_pid`,
+  `connected`, stream type); `port_close/1` kills/reaps the child and releases the id; `port_info/1,2`
+  answer the seeded item vocabulary. Deliberate `port_info` deviations from erts-17.1 (never
+  fabricated): `id` is the port **term** (erts: a bare integer), `connected` is a **boolean** (erts:
+  the controlling pid) and `stream` is reported (erts reports `input`/`output` byte counters); `links`/
+  `monitors` are `[]` (truly empty here). **No fd polling:** the child's stdio is piped but never read,
+  so port output is **never delivered** to Erlang, `port_command/2` does not exist, and `connected`
+  flips only at `port_close/1` — `exit_status`/`eof` are recognized but inert (their only observable
+  form is a `{Port, …}` message), and a child that exits on its own is not reaped until `port_close/1`
+  or runtime exit. `os:cmd/1` remains the runtime-native host spawn, unchanged.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 
 ## Routing Table
