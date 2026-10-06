@@ -21,13 +21,13 @@ pub mod off_heap;
 
 pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
 pub use crate::mailbox::{receive, receive_ref, send};
-pub use crate::message::{Message, Queue};
+pub use crate::message::{Message, Queue, QueueCursor};
 pub use crate::off_heap::{MsoHandle, OffHeapTable};
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
     pub use crate::mailbox::{receive, receive_ref, send};
-    pub use crate::message::{Message, Queue};
+    pub use crate::message::{Message, Queue, QueueCursor};
     pub use crate::off_heap::{MsoHandle, OffHeapTable};
 }

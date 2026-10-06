@@ -52,6 +52,18 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `pub struct Queue` — the per-process FIFO message queue (a pure data structure; **no** scheduler
   coupling). `new()`/`Default`, `enqueue(Message)`, `dequeue() -> Option<Message>`,
   `peek() -> Option<&Message>`, `len()`, `is_empty()`, `clear()`, `iter() -> impl Iterator<Item=&Message>`.
+  - **positional scan cursor** (what the engine's candidate-by-candidate receive drives):
+    `cursor() -> QueueCursor` (first message), `cursor_at(position) -> QueueCursor`,
+    `position(QueueCursor) -> usize`, `message_at(QueueCursor) -> Option<&Message>`,
+    `advance(&mut QueueCursor)` (monotonic — saturates past the end), `remove_at(QueueCursor) -> Option<Message>`.
+    All bounds-safe (`VecDeque::get`/`remove`), so a past-the-end cursor or an empty queue yields
+    `None` — never a panic, never an index.
+  - `pub(crate) remove_index(index: usize) -> Option<Message>` — index-based removal used by
+    `mailbox::receive` (the public `remove_at` name belongs to the cursor API).
+- `pub struct QueueCursor` — `Copy`/`Clone`/`Debug`/`Default` (position 0)/`PartialEq`/`Eq`; a
+  **monotonic scan position** over a `Queue`, not a stable handle: `remove_at` shifts every later
+  position, so a cursor outstanding across a removal is stale and callers re-derive one via
+  `Queue::cursor()` (the engine does exactly this: remove the match, then reset to the first message).
 
 ### `mailbox.rs` — send / receive primitives (data level)
 - `pub fn send(from: Eterm, term: Eterm, to_heap: &mut Heap, to_queue: &mut Queue, ctx: &mut CopyContext<'_>) -> Result<()>`
@@ -135,7 +147,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 ## Test Strategy
 - In-module `#[cfg(test)] mod tests` per module: `layout` (per-object word counts + child-slot
   enumeration for tuple/record/fun/flatmap/off-heap container), `off_heap` (slot push/get/clone bumps
-  the refcount; `into_handles`), `message` (builder + accessors; `Queue` FIFO/`peek`/`len`/`clear`),
+  the refcount; `into_handles`), `message` (builder + accessors; `Queue` FIFO/`peek`/`len`/`clear`;
+  cursor start/`position`, FIFO `advance` saturating past the end, `remove_at` shifting the rest,
+  draining via a re-derived cursor, empty-queue past-the-end, `cursor_at`),
   `copy` (immediates shared; cons/tuple/record/nested copied; literal shared; off-heap container
   refcounted; exhaustion ⇒ `AllocKind::Message`).
 - **`tests/copy.rs` — the required copy correctness evidence:**
@@ -151,7 +165,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   5. **Heap exhaustion** — copying a graph larger than the destination heap returns
      `BeamError::Alloc(AllocKind::Message)` and never panics.
 - **`tests/queue.rs`** — `send` copies into the receiver heap + enqueues; FIFO order; `receive` selects
-  (and removes) the first matching message and leaves non-matching ones queued; `receive_ref` borrows.
+  (and removes) the first matching message and leaves non-matching ones queued; `receive_ref` borrows;
+  a cursor scans candidates (advance on a miss) and removes the match while the scanned-over messages
+  stay queued, then a fresh cursor resets to the first message.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
@@ -194,7 +210,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `src/mailbox.rs` → `send` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors (no new error type)
 - `tests/copy.rs` → copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion
-- `tests/queue.rs` → `send`/`receive` + FIFO queue integration
+- `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
 - `../../erts/emulator/beam/copy.c` → the authoritative copier (`copy_struct_x`/`size_object_x`/`erts_move_multi_frags`) (read-only)
 - `../../erts/emulator/beam/erl_message.h` / `erl_message.c` → the message envelope, `ErlHeapFragment`, queue layout (read-only)
 - `../../erts/emulator/beam/erl_gc.c` → the MSO/`OffHeap` sweep rule (`sweep_off_heap`) (read-only)

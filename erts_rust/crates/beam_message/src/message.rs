@@ -63,6 +63,23 @@ impl Message {
     }
 }
 
+/// A positional **scan cursor** over a [`Queue`].
+///
+/// The engine drives a receive **candidate by candidate** (peek the message at the scan position,
+/// advance the position on a failed match, remove the matched message, reset to the first message).
+/// A cursor is a **monotonic position**: it starts at the first message ([`Default`] = position `0`)
+/// and only ever moves forward ([`Queue::advance`]).
+///
+/// A cursor is deliberately **not** a stable handle. [`Queue::remove_at`] shifts the positions of
+/// every subsequent message down by one, so a cursor that is outstanding across a removal is
+/// **stale** (it now points one past the message it pointed at). Callers re-derive a fresh cursor
+/// with [`Queue::cursor`] after the queue changes structurally — which is exactly what the engine
+/// seam does: remove the matched message, then reset to the first message.
+#[derive(Copy, Clone, Debug, Default, PartialEq, Eq)]
+pub struct QueueCursor {
+    position: usize,
+}
+
 /// A per-process FIFO message queue.
 #[derive(Default)]
 pub struct Queue {
@@ -112,8 +129,54 @@ impl Queue {
         self.messages.iter()
     }
 
+    /// A fresh cursor at the first message (position `0`).
+    ///
+    /// On an empty queue that position is already past the end.
+    pub fn cursor(&self) -> QueueCursor {
+        QueueCursor::default()
+    }
+
+    /// A fresh cursor at `position`.
+    pub fn cursor_at(&self, position: usize) -> QueueCursor {
+        QueueCursor { position }
+    }
+
+    /// The cursor's position (index) in the queue.
+    ///
+    /// Never fails: a cursor past the end simply reports its (past-the-end) position.
+    pub fn position(&self, cursor: QueueCursor) -> usize {
+        cursor.position
+    }
+
+    /// The message at `cursor`, or `None` if the cursor is past the end (which is always the case
+    /// for a cursor over an empty queue).
+    ///
+    /// Never fails and never panics — the access is bounds-safe.
+    pub fn message_at(&self, cursor: QueueCursor) -> Option<&Message> {
+        self.messages.get(cursor.position)
+    }
+
+    /// Moves `cursor` past the current message.
+    ///
+    /// Saturating: once the cursor is at or beyond the last message it stays past the end (its
+    /// position does not grow beyond the queue length). Never panics and never overflows.
+    pub fn advance(&self, cursor: &mut QueueCursor) {
+        if cursor.position < self.messages.len() {
+            cursor.position += 1;
+        }
+    }
+
+    /// Removes and returns the message at `cursor`, or `None` if the cursor is past the end.
+    ///
+    /// **Every message after the removed one shifts down by one**, so a cursor at or after the
+    /// removal position is stale afterwards (see [`QueueCursor`]); re-derive one with
+    /// [`Queue::cursor`] before scanning again. Never fails and never panics.
+    pub fn remove_at(&mut self, cursor: QueueCursor) -> Option<Message> {
+        self.messages.remove(cursor.position)
+    }
+
     /// Removes and returns the message at `index` (used by selective receive).
-    pub(crate) fn remove_at(&mut self, index: usize) -> Option<Message> {
+    pub(crate) fn remove_index(&mut self, index: usize) -> Option<Message> {
         self.messages.remove(index)
     }
 }
@@ -122,7 +185,7 @@ impl Queue {
 mod tests {
     use beam_term::prelude::*;
 
-    use super::{Message, Queue};
+    use super::{Message, Queue, QueueCursor};
     fn message(value: i64) -> Message {
         Message::new(make_small(value), make_small(0))
     }
@@ -161,9 +224,9 @@ mod tests {
         );
 
         assert_eq!(queue.dequeue().map(|m| signed_value(m.payload())), Some(1));
-        assert_eq!(queue.remove_at(1).map(|m| signed_value(m.payload())), Some(3));
+        assert_eq!(queue.remove_index(1).map(|m| signed_value(m.payload())), Some(3));
         assert_eq!(queue.len(), 1);
-        assert!(queue.remove_at(5).is_none());
+        assert!(queue.remove_index(5).is_none());
 
         queue.clear();
         assert!(queue.is_empty());
@@ -173,5 +236,133 @@ mod tests {
     fn default_is_the_empty_queue() {
         let queue = Queue::default();
         assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn cursor_starts_at_the_first_message() {
+        let mut queue = Queue::new();
+        for value in [1, 2, 3] {
+            queue.enqueue(message(value));
+        }
+
+        let cursor = queue.cursor();
+        assert_eq!(queue.position(cursor), 0);
+        assert_eq!(queue.position(QueueCursor::default()), 0);
+        assert_eq!(
+            queue.message_at(cursor).map(|m| signed_value(m.payload())),
+            Some(1)
+        );
+    }
+
+    #[test]
+    fn cursor_over_an_empty_queue_is_past_the_end() {
+        let mut queue = Queue::new();
+
+        let cursor = queue.cursor();
+        assert_eq!(queue.position(cursor), 0);
+        assert!(queue.message_at(cursor).is_none());
+        assert!(queue.remove_at(cursor).is_none());
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn advance_walks_fifo_order_and_saturates_past_the_end() {
+        let mut queue = Queue::new();
+        for value in [10, 20, 30] {
+            queue.enqueue(message(value));
+        }
+
+        let mut cursor = queue.cursor();
+        let mut scanned = Vec::new();
+        for _ in 0..queue.len() {
+            scanned.push(signed_value(queue.message_at(cursor).expect("in range").payload()));
+            queue.advance(&mut cursor);
+        }
+        assert_eq!(scanned, vec![10, 20, 30], "messages are scanned in FIFO order");
+        assert_eq!(queue.position(cursor), 3, "one past the last message");
+        assert!(queue.message_at(cursor).is_none());
+
+        // Saturating: advancing further stays past the end instead of growing.
+        queue.advance(&mut cursor);
+        queue.advance(&mut cursor);
+        assert_eq!(queue.position(cursor), 3);
+        assert!(queue.message_at(cursor).is_none());
+    }
+
+    #[test]
+    fn cursor_at_positions_correctly() {
+        let mut queue = Queue::new();
+        for value in [1, 2, 3] {
+            queue.enqueue(message(value));
+        }
+
+        assert_eq!(queue.position(queue.cursor_at(0)), 0);
+        let cursor = queue.cursor_at(1);
+        assert_eq!(queue.position(cursor), 1);
+        assert_eq!(
+            queue.message_at(cursor).map(|m| signed_value(m.payload())),
+            Some(2)
+        );
+        assert_eq!(
+            queue.message_at(queue.cursor_at(2)).map(|m| signed_value(m.payload())),
+            Some(3)
+        );
+        assert!(queue.message_at(queue.cursor_at(3)).is_none());
+        assert!(queue.message_at(queue.cursor_at(99)).is_none());
+    }
+
+    #[test]
+    fn remove_at_removes_and_shifts_the_rest() {
+        let mut queue = Queue::new();
+        for value in [1, 2, 3, 4] {
+            queue.enqueue(message(value));
+        }
+
+        let removed = queue.remove_at(queue.cursor_at(1));
+        assert_eq!(removed.map(|m| signed_value(m.payload())), Some(2));
+        assert_eq!(
+            queue.iter().map(|m| signed_value(m.payload())).collect::<Vec<_>>(),
+            vec![1, 3, 4],
+            "the messages after the removed one shift down"
+        );
+        assert_eq!(queue.len(), 3);
+
+        // A past-the-end cursor removes nothing and leaves the queue unchanged.
+        assert!(queue.remove_at(queue.cursor_at(9)).is_none());
+        assert_eq!(queue.len(), 3);
+        assert_eq!(
+            queue.iter().map(|m| signed_value(m.payload())).collect::<Vec<_>>(),
+            vec![1, 3, 4]
+        );
+
+        // The head is removable through a fresh cursor.
+        let head = queue.cursor();
+        assert_eq!(
+            queue.remove_at(head).map(|m| signed_value(m.payload())),
+            Some(1)
+        );
+        assert_eq!(
+            queue.iter().map(|m| signed_value(m.payload())).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
+    }
+
+    #[test]
+    fn draining_with_remove_at_empties_the_queue() {
+        let mut queue = Queue::new();
+        for value in [1, 2, 3, 4] {
+            queue.enqueue(message(value));
+        }
+
+        let mut drained = Vec::new();
+        while !queue.is_empty() {
+            // Re-derive a fresh cursor for every removal — the engine's reset-to-first step.
+            let cursor = queue.cursor();
+            let removed = queue.remove_at(cursor).expect("a message while non-empty");
+            drained.push(signed_value(removed.payload()));
+        }
+        assert_eq!(drained, vec![1, 2, 3, 4]);
+        assert!(queue.is_empty());
+        assert!(queue.remove_at(queue.cursor()).is_none());
     }
 }
