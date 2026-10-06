@@ -14,6 +14,11 @@
 //! kinds of off-heap object, so a **refc binary** whose on-heap `BinRef` handle becomes
 //! garbage is reclaimed by the very same [`OffHeap::sweep`].
 //!
+//! The list exposes slot-indexed read access alongside the push-only writes: while
+//! [`OffHeap::push`] is fire-and-forget, [`OffHeap::insert`] returns the slot an entry was
+//! stored under, and [`OffHeap::get`]/[`OffHeap::iter`] read the entries back (by slot, or
+//! in slot order), so an on-heap reference that stores a slot number can resolve it.
+//!
 //! This module is safe Rust apart from two narrow `unsafe` blocks — the `NonNull` deref in
 //! [`MsoHandle`] and the `Box::from_raw` free in its `Drop` — each of which carries a
 //! `// SAFETY:` rationale (the handle owns a live, boxed [`Mso`] for its whole lifetime).
@@ -223,6 +228,29 @@ impl OffHeap {
     /// result of [`Mso::new`]) or a [`RefcBinary`].
     pub fn push(&mut self, entry: impl Into<OffHeapEntry>) {
         self.entries.push(entry.into());
+    }
+
+    /// Adds an off-heap object to the list and returns its slot.
+    ///
+    /// The returned slot is the index the on-heap off-heap-reference container stores in
+    /// its `val` word (mirroring `beam_message::OffHeapTable::push`), so the object is
+    /// resolvable again with [`get`](OffHeap::get). Slots are stable for the list's
+    /// lifetime: `insert` only ever appends and never reuses or reorders an existing slot.
+    /// (A [`sweep`](OffHeap::sweep) that releases an entry *does* compact the list, shifting
+    /// the surviving entries down.)
+    pub fn insert(&mut self, entry: impl Into<OffHeapEntry>) -> usize {
+        self.entries.push(entry.into());
+        self.entries.len() - 1
+    }
+
+    /// The entry at `slot`, or `None` when the slot is out of range.
+    pub fn get(&self, slot: usize) -> Option<&OffHeapEntry> {
+        self.entries.get(slot)
+    }
+
+    /// Iterates the entries in slot order.
+    pub fn iter(&self) -> impl Iterator<Item = &OffHeapEntry> {
+        self.entries.iter()
     }
 
     /// The number of off-heap objects held.
@@ -560,5 +588,133 @@ mod tests {
         drop(binary_observer);
         assert_eq!(alloc.stats().live_blocks, 0, "the last handle freed the payload");
         assert_eq!(alloc.stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn insert_returns_increasing_slots_and_interleaves_with_push() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut off_heap = OffHeap::new();
+
+        // `insert` returns the slot the entry was stored under, starting at 0.
+        assert_eq!(off_heap.insert(Mso::new(counter(&drops, 0), 10)), 0);
+        assert_eq!(off_heap.len(), 1);
+
+        // The legacy `push` stays fire-and-forget: its return type is still `()`.
+        let () = off_heap.push(Mso::new(counter(&drops, 1), 20));
+        assert_eq!(off_heap.len(), 2);
+
+        // Slots keep increasing across both inserters, and `len` tracks the total.
+        assert_eq!(off_heap.insert(Mso::new(counter(&drops, 2), 30)), 2);
+        let () = off_heap.push(Mso::new(counter(&drops, 3), 40));
+        assert_eq!(off_heap.insert(Mso::new(counter(&drops, 4), 50)), 4);
+        assert_eq!(off_heap.len(), 5);
+        assert_eq!(off_heap.overhead_bytes(), 10 + 20 + 30 + 40 + 50);
+    }
+
+    #[test]
+    fn get_returns_the_entry_at_a_slot_or_none_when_out_of_range() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut off_heap = OffHeap::new();
+        off_heap.insert(Mso::new(counter(&drops, 42), 12));
+        off_heap.insert(Mso::new(counter(&drops, 43), 24));
+
+        let first = off_heap.get(0).expect("slot 0 is present");
+        assert_eq!(first.overhead_bytes(), 12);
+        assert_eq!(
+            first
+                .as_mso()
+                .expect("an MSO entry")
+                .downcast_ref::<DropCounter>()
+                .map(|c| c.value),
+            Some(42)
+        );
+
+        let second = off_heap.get(1).expect("slot 1 is present");
+        assert_eq!(second.overhead_bytes(), 24);
+        assert_eq!(
+            second
+                .as_mso()
+                .expect("an MSO entry")
+                .downcast_ref::<DropCounter>()
+                .map(|c| c.value),
+            Some(43)
+        );
+
+        assert!(off_heap.get(2).is_none(), "just past the end");
+        assert!(off_heap.get(usize::MAX).is_none(), "far out of range");
+    }
+
+    #[test]
+    fn iter_yields_every_entry_in_slot_order() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut off_heap = OffHeap::new();
+        for (value, size) in [(0u32, 10usize), (1, 20), (2, 30), (3, 40)] {
+            off_heap.insert(Mso::new(counter(&drops, value), size));
+        }
+        // A `push` mixes in and must still land last (slot 4).
+        off_heap.push(Mso::new(counter(&drops, 4), 50));
+
+        let sizes: Vec<usize> = off_heap.iter().map(OffHeapEntry::overhead_bytes).collect();
+        assert_eq!(sizes, vec![10, 20, 30, 40, 50], "slot order is insertion order");
+        assert_eq!(off_heap.iter().count(), off_heap.len());
+    }
+
+    #[test]
+    fn mixed_entries_round_trip_through_insert_get_and_iter() {
+        let alloc = test_allocator("gc-mso-mixed-slots");
+        let drops = Arc::new(AtomicUsize::new(0));
+
+        let mut off_heap = OffHeap::new();
+        let mso_slot = off_heap.insert(Mso::new(counter(&drops, 5), 32));
+        let binary_slot = off_heap
+            .insert(RefcBinary::with_allocator(alloc, b"slot binary").expect("allocate"));
+        assert_eq!((mso_slot, binary_slot), (0, 1));
+
+        // Each slot resolves to the entry of the kind that was inserted there.
+        let mso = off_heap.get(mso_slot).expect("slot 0 is the MSO");
+        assert_eq!(
+            mso.as_mso()
+                .expect("an MSO entry")
+                .downcast_ref::<DropCounter>()
+                .map(|c| c.value),
+            Some(5)
+        );
+        assert!(mso.as_binary().is_none());
+        assert_eq!(
+            off_heap
+                .get(binary_slot)
+                .expect("slot 1 is the binary")
+                .as_binary()
+                .map(RefcBinary::as_bytes),
+            Some(&b"slot binary"[..])
+        );
+        assert!(off_heap.get(binary_slot).expect("present").as_mso().is_none());
+
+        // `iter` walks both kinds in slot order.
+        let is_mso: Vec<bool> = off_heap.iter().map(|e| e.as_mso().is_some()).collect();
+        assert_eq!(is_mso, vec![true, false]);
+        assert_eq!(off_heap.overhead_bytes(), 32 + b"slot binary".len());
+    }
+
+    #[test]
+    fn surviving_slots_stay_valid_after_a_retaining_sweep() {
+        let drops = Arc::new(AtomicUsize::new(0));
+        let mut off_heap = OffHeap::new();
+        for (value, size) in [(0u32, 10usize), (1, 20), (2, 30)] {
+            off_heap.insert(Mso::new(counter(&drops, value), size));
+        }
+
+        // A sweep that keeps every entry releases nothing, so nothing is removed and no
+        // compaction happens: each survivor is still reachable at its original slot.
+        assert_eq!(off_heap.sweep(|_| true), 0);
+        assert_eq!(off_heap.len(), 3);
+        for (slot, size) in [(0usize, 10usize), (1, 20), (2, 30)] {
+            let entry = off_heap.get(slot).expect("survivor at its original slot");
+            assert_eq!(entry.overhead_bytes(), size);
+        }
+        assert_eq!(drops.load(Ordering::SeqCst), 0);
+
+        // Interleaving an insert after the retaining sweep still appends: the next slot is 3.
+        assert_eq!(off_heap.insert(Mso::new(counter(&drops, 3), 40)), 3);
     }
 }
