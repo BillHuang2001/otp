@@ -1394,9 +1394,18 @@ mod tests {
         assert_eq!(text_of(fx.item(port, "name")), "/bin/sh");
         assert_eq!(fx.item(port, "stream"), fx.atom("binary"));
 
-        // `{fd, N}` registers a descriptor port with no OS process.
-        let name = fx.name("fd", make_small(2));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, 2}");
+        // `{fd, N}` registers a descriptor port with no OS process. The descriptor is a
+        // socketpair end the **test** owns and keeps open: `beam_io`'s driver adopts a
+        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
+        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
+        // accepts it, so the childless name form is exercised independently of the test
+        // harness's fds.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
         // `os_pid` is `undefined` for a port without an OS process — the oracle's answer.
         assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
         assert_eq!(fx.item(port, "connected"), fx.atom("true"));
@@ -1560,8 +1569,16 @@ mod tests {
     #[test]
     fn a_fd_port_has_no_child_stdin_to_write_to() {
         let mut fx = fixture();
-        let name = fx.name("fd", make_small(2));
-        let port = fx.hook.open_port(name, NIL).expect("{fd, 2}");
+        // A descriptor the **test** owns and keeps open: `beam_io`'s driver adopts a
+        // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
+        // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
+        // accepts it, so the gap is exercised independently of the test harness's fds.
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+        let (local, _peer) = UnixStream::pair().expect("a socketpair");
+        let fd = local.as_raw_fd();
+        let name = fx.name("fd", make_small(i64::from(fd)));
+        let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
         // A `{fd, N}` port owns no pipe of ours: writing to it is a typed capability gap,
         // never a write to some other descriptor and never a fabricated success. (The
         // `beam_io` registry would answer its own `badarg`; the gap is preserved here.)
