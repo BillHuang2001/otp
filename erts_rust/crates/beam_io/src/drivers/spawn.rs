@@ -55,10 +55,14 @@
 //!
 //! A short write (`EAGAIN`) leaves the remainder queued and **arms** write readiness by
 //! (re-)registering the stdin fd; a fully drained queue drops the registration again so the
-//! port cannot spin. `read(2) == 0` is end-of-file: EOF is latched, the descriptor is
+//! port cannot spin. A `{fd, N}` port is the exception: its one descriptor is registered with
+//! `Interest::BOTH`, so write readiness is permanently armed and neither arming nor disarming
+//! touches its registration. `read(2) == 0` is end-of-file: EOF is latched, the descriptor is
 //! deregistered and the driver stops reading it (further readiness is a no-op rather than an
-//! error). A write failure (a child that closed its stdin, hence `EPIPE`) is reported as the
-//! typed [`beam_common::BeamError::Io`] rather than silently discarding queued bytes.
+//! error; for `{fd, N}` the shared registration stays in place because it still serves the
+//! write direction). A write failure (a child that closed its stdin, hence `EPIPE`) is
+//! reported as the typed [`beam_common::BeamError::Io`] rather than silently discarding
+//! queued bytes.
 //!
 //! # Stream and descriptor ownership
 //!
@@ -69,10 +73,15 @@
 //! built-in [`crate::drivers::FdDriver`] carries it for the `{line, N}` option).
 //!
 //! The descriptors of a spawned child (`stdin`/`stdout`) belong to the driver and are closed
-//! on EOF/`stop`/`Drop`. The descriptor of a `{fd, N}` port belongs to the **Erlang side**:
-//! the driver deregisters it but never closes it, exactly as the reference implementation
-//! leaves an adopted descriptor alone. The child's stderr is piped (so the child never
-//! inherits the emulator's own captured output) but is never read.
+//! on EOF/`stop`/`Drop`. The child's **stderr is discarded** ([`Stdio::null`]): nothing it
+//! writes is delivered to the port (the oracle does not deliver a child's stderr either) and
+//! there is no pipe for it to fill, so a child that floods stderr can never block.
+//!
+//! The descriptor of a `{fd, N}` port belongs to the **Erlang side** and is *bidirectional*:
+//! the single adopted descriptor is registered **once** with [`Interest::BOTH`], so it is
+//! both the port's read stream and its write stream ([`crate::PortRegistry::port_command`]
+//! bytes go out through it). The driver deregisters it but never closes it, exactly as the
+//! reference implementation leaves an adopted descriptor alone.
 //!
 //! # Registration and the driver registry
 //!
@@ -210,13 +219,15 @@ pub struct SpawnOptions {
 /// Builds the [`Command`] a spec/options pair describes, or `None` for the `{fd, N}` form.
 ///
 /// This is the single place the argv vector, the shell-vs-direct choice, `{cd, Dir}`,
-/// `{env, …}` and the three **piped** standard streams are set up; the caller decides
-/// whether to start it (the driver's constructor does). It starts nothing itself, so it is
-/// directly unit-testable.
+/// `{env, …}` and the three standard streams are set up; the caller decides whether to start
+/// it (the driver's constructor does). It starts nothing itself, so it is directly
+/// unit-testable.
 ///
-/// The child's `stdin`, `stdout` and `stderr` are all pipes: `stdout` is the port's input
-/// stream, `stdin` is what [`crate::PortRegistry::port_command`] writes to, and stderr is
-/// held open (never read) so the child cannot inherit the emulator's own output.
+/// The child's `stdout` is a pipe (the port's input stream) and its `stdin` is a pipe (what
+/// [`crate::PortRegistry::port_command`] writes to). Its **stderr is discarded**
+/// ([`Stdio::null`]): a child's diagnostics are not port data — the oracle does not deliver
+/// them either — and, unlike a pipe, `/dev/null` can never fill, so a child that writes an
+/// unbounded amount to stderr cannot deadlock on a full pipe.
 ///
 /// # Errors
 ///
@@ -251,7 +262,10 @@ pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<
     command
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
+        // The child's stderr is **discarded**, not piped: a `Stdio::piped` stderr nobody
+        // drains is a ~64 KiB pipe that deadlocks any child writing more than that to it,
+        // and a child's stderr is not port data (the oracle does not deliver it either).
+        .stderr(Stdio::null());
     Ok(Some(command))
 }
 
@@ -302,6 +316,11 @@ pub struct SpawnDriver {
     /// Whether the driver owns (and must close) the descriptors. False for an adopted
     /// `{fd, N}` descriptor, which belongs to the Erlang side.
     own_fds: bool,
+    /// Whether one adopted `{fd, N}` descriptor serves **both** directions (so it is
+    /// registered once with [`Interest::BOTH`] and its read registration *is* its write
+    /// registration). Always false for a child port, whose read and write streams are two
+    /// distinct pipes.
+    duplex: bool,
     /// The OS process id; `None` for a `{fd, N}` port.
     os_pid: Option<u32>,
 }
@@ -334,7 +353,10 @@ impl SpawnDriver {
             return Ok(SpawnDriver {
                 command,
                 child: None,
-                stdin_fd: None,
+                // The single adopted descriptor serves **both** directions: it is the port's
+                // read stream and the stream `port_command` writes to (`start` registers it
+                // once with `Interest::BOTH`).
+                stdin_fd: Some(*fd),
                 stdout_fd: Some(*fd),
                 in_token: None,
                 out_token: None,
@@ -344,6 +366,7 @@ impl SpawnDriver {
                 exit_reported: false,
                 // The descriptor belongs to the Erlang side: deregistered, never closed.
                 own_fds: false,
+                duplex: true,
                 os_pid: None,
             });
         }
@@ -355,7 +378,8 @@ impl SpawnDriver {
         let os_pid = child.id();
         // Take both ends out of the child so the driver owns them as plain descriptors (the
         // same reason `FdDriver` owns its fds: the poller and the syscall wrappers work on
-        // raw descriptors). stderr stays inside the `Child`, held open but unread.
+        // raw descriptors). stderr was discarded by `build_command` (`Stdio::null`), so the
+        // `Child` holds no stderr pipe to drain.
         let stdin_fd = child.stdin.take().map(IntoRawFd::into_raw_fd);
         let stdout_fd = child.stdout.take().map(IntoRawFd::into_raw_fd);
         // Non-blocking must be in place before either descriptor reaches the poller.
@@ -386,6 +410,7 @@ impl SpawnDriver {
             exit_status: options.exit_status,
             exit_reported: false,
             own_fds: true,
+            duplex: false,
             os_pid: Some(os_pid),
         })
     }
@@ -461,7 +486,13 @@ impl SpawnDriver {
 
     /// Arms write readiness for `fd` — registering it the first time, re-registering it
     /// after that — so [`Driver::ready_output`] runs once the kernel buffer drains.
+    ///
+    /// A `{fd, N}` port needs nothing here: its single descriptor is already registered with
+    /// [`Interest::BOTH`] (see [`SpawnDriver::start`]), so write readiness never lapses.
     fn arm_output(&mut self, ctx: &mut DriverContext<'_>, fd: RawFd) -> Result<()> {
+        if self.duplex {
+            return Ok(());
+        }
         match self.out_token {
             Some(token) => ctx.reregister(fd, token, Interest::WRITABLE),
             None => {
@@ -472,7 +503,14 @@ impl SpawnDriver {
     }
 
     /// Drops the write registration, so no further writable events arrive.
+    ///
+    /// A `{fd, N}` port keeps its single `Interest::BOTH` registration in place: dropping it
+    /// would also drop the *read* direction, and an empty output queue already makes a
+    /// spurious `OUTPUT` task a no-op.
     fn disarm_output(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        if self.duplex {
+            return Ok(());
+        }
         if let Some(token) = self.out_token.take() {
             if let Some(fd) = self.stdin_fd {
                 ctx.deregister(fd, token)?;
@@ -486,12 +524,17 @@ impl SpawnDriver {
     ///
     /// Deregistering is what keeps the reactor from reporting a descriptor that can never
     /// become ready again; an adopted `{fd, N}` descriptor is left open (the Erlang side
-    /// owns it).
+    /// owns it) **and** left registered, because the one descriptor also serves the write
+    /// direction (see [`SpawnDriver::duplex`]): `read_eof` alone stops further reads, while
+    /// the shared `Interest::BOTH` registration keeps a stalled write flushable.
     ///
     /// # Errors
     ///
     /// [`beam_common::BeamError::Io`] when the poller rejects the deregistration.
     fn release_stdout(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
+        if self.duplex {
+            return Ok(());
+        }
         let (Some(token), Some(fd)) = (self.in_token.take(), self.stdout_fd.take()) else {
             return Ok(());
         };
@@ -502,17 +545,20 @@ impl SpawnDriver {
         result
     }
 
-    /// Drains the port's output queue into the child's stdin, returning the number of bytes
-    /// written.
+    /// Drains the port's output queue into the port's write stream, returning the number of
+    /// bytes written.
     ///
     /// A short write leaves the remainder queued and arms write readiness; a fully drained
-    /// queue drops the write registration again.
+    /// queue drops the write registration again (except for a `{fd, N}` port, whose single
+    /// registration is shared with the read direction — see [`SpawnDriver::disarm_output`]).
     ///
     /// # Errors
     ///
-    /// [`beam_common::BeamError::BadArg`] for a `{fd, N}` port (it owns no child stream);
-    /// [`beam_common::BeamError::Io`] when the write fails (a child that closed its stdin
-    /// yields `EPIPE` — a typed failure rather than silently discarded bytes).
+    /// [`beam_common::BeamError::BadArg`] when the driver holds no write descriptor at all (a
+    /// defensive guard: a live port always has one). [`beam_common::BeamError::Io`] when the
+    /// write fails — the operating system's `EBADF` for a `{fd, N}` descriptor opened
+    /// read-only, or `EPIPE` for a child that closed its stdin (a typed failure rather than
+    /// silently discarded bytes).
     fn write_pending(&mut self, ctx: &mut DriverContext<'_>) -> Result<usize> {
         let fd = self.stdin_fd.ok_or_else(error::badarg)?;
         let mut written = 0usize;
@@ -602,6 +648,17 @@ impl Driver for SpawnDriver {
     fn start(&mut self, ctx: &mut DriverContext<'_>) -> Result<()> {
         // Only the already-created descriptors are registered here; the child was started by
         // the constructor, so nothing can fail midway through a spawn.
+        if self.duplex {
+            // A `{fd, N}` port has a single descriptor serving both directions, so it gets a
+            // single poller membership with `Interest::BOTH` (registering it twice would be
+            // the poller's `EEXIST`). That one registration is the port's read readiness *and*
+            // its write readiness, which is why the duplex write/EOF paths never re-arm or
+            // deregister it.
+            if let Some(fd) = self.stdout_fd {
+                self.in_token = Some(ctx.register(fd, Interest::BOTH)?);
+            }
+            return Ok(());
+        }
         if let Some(fd) = self.stdout_fd {
             self.in_token = Some(ctx.register(fd, Interest::READABLE)?);
         }
