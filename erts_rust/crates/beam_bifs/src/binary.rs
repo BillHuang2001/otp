@@ -624,21 +624,33 @@ fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm>
 /// binary `iolist_to_binary/1` would build.
 ///
 /// Both the argument rules and the `badarg` cases are `iolist_to_binary/1`'s (a
-/// bare byte-aligned binary is accepted, a non-byte-aligned one is `badarg`).
-/// Milestone-1 computes the size by flattening, so a size that leaves the 60-bit
-/// small range cannot arise (the destination heap always bounds it).
+/// bare byte-aligned binary is accepted, a non-byte-aligned one is `badarg`). The
+/// result is a plain **integer**: a size past the 60-bit small range becomes the
+/// heap bignum the oracle's C `BUILD_INTEGER` produces, never a `system_limit`.
 fn iolist_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let root = args[0];
-    let size = if bits::is_bitstring(root) {
+    let size: u64 = if bits::is_bitstring(root) {
         let size_bits = bits::bit_size(root)?;
         if size_bits % 8 != 0 {
             return Err(badarg());
         }
-        size_bits / 8
+        size_bits as u64 / 8
     } else {
-        collect_byte_unit(root)?.len()
+        collect_byte_unit(root)?.len() as u64
     };
-    ctx.int(size as i64)
+    byte_count_term(ctx, size)
+}
+
+/// The integer term for a non-negative byte count: a small int while it fits,
+/// otherwise a heap bignum — both built by the shared `arith` promotion helpers
+/// ([`arith::int_from_i64`] folds, [`arith::int_from_mag`] takes the magnitude
+/// limbs little-endian), never by a local bignum construction.
+fn byte_count_term(ctx: &mut BifContext<'_>, size: u64) -> Result<Eterm> {
+    match i64::try_from(size) {
+        Ok(small) => arith::int_from_i64(ctx, small),
+        // A byte count above `i64::MAX`: one little-endian magnitude limb.
+        Err(_) => arith::int_from_mag(ctx, false, &[size]),
+    }
 }
 
 /// `list_to_bitstring(List)` (`erl_iolist.c:930`) — the `Unit = 1` variant of
@@ -1992,5 +2004,36 @@ mod tests {
             assert!(reg.contains("erlang", name, arity), "missing erlang:{name}/{arity}");
         }
         assert_eq!(reg.len(), 27);
+    }
+    #[test]
+    fn iolist_size_promotes_past_the_small_int_range() {
+        with_ctx(|ctx| {
+            // The oracle's ordinary results are unchanged small ints.
+            // `iolist_size([<<"ab">>,<<"cd">>])` ⇒ `4`, `iolist_size([1,2|<<3>>])` ⇒ `3`.
+            let ab = bin(ctx, b"ab");
+            let cd = bin(ctx, b"cd");
+            let nested = ctx.list(&[ab, cd]).expect("the list fits");
+            assert!(access::is_small(iolist_size_1(ctx, &[nested]).unwrap()));
+            assert_eq!(signed_value(iolist_size_1(ctx, &[nested]).unwrap()), 4);
+            let one_two = byte_list(ctx, &[1, 2]);
+            let three = bin(ctx, &[3]);
+            let improper = ctx.cons(one_two, three).expect("the cons fits");
+            assert_eq!(signed_value(iolist_size_1(ctx, &[improper]).unwrap()), 3);
+
+            // A size beyond the 60-bit small range is a heap **bignum**, not
+            // `system_limit` — the shared promotion path (`arith`). A >2^59-byte
+            // iolist is not constructible in a test, so the helper is exercised
+            // directly: the values are exact and oracle-verified as integers.
+            let big = byte_count_term(ctx, u64::MAX).unwrap();
+            assert!(!access::is_small(big), "a >60-bit size must be a bignum");
+            assert_eq!(crate::print::format_term(ctx, big, false).unwrap(), "18446744073709551615");
+            // One past the small-int maximum (`2^59 - 1`) stays representable.
+            let edge = byte_count_term(ctx, 1u64 << 59).unwrap();
+            assert_eq!(crate::print::format_term(ctx, edge, false).unwrap(), "576460752303423488");
+            // The small-range bound itself (`2^59 - 1`) is still a small int.
+            let last_small = byte_count_term(ctx, (1u64 << 59) - 1).unwrap();
+            assert!(access::is_small(last_small));
+            assert_eq!(signed_value(last_small), (1i64 << 59) - 1);
+        });
     }
 }
