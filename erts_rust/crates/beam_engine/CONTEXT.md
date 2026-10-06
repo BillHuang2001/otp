@@ -362,6 +362,7 @@ These are the remaining execution gaps the standard compiler emits for real OTP 
 - `../../erts/emulator/beam/erl_bits.c`, `../../erts/emulator/beam/erl_map.h` → bitstring and map (CHAMP/HAMT) ground truth (read-only)
 
 ## See Also
+- **Note on this file's size:** it is ~94 KB, over the ~64 KB per-file budget (already so before the current pass). The overlap to collapse on the next pass is the Routing Table's per-file prose, which restates the API Surface module descriptions (`terms.rs`, the `jit/*` entries, the `families/bitstrings/*` entries) — keep one line per file + this file's contract sections and push per-module detail down (these modules have no child nodes, so a `.agents/skills/` extraction is the alternative).
 - `../CONTEXT.md` → crate-layer contracts, the seam types, the Stage-1/Stage-5 DAG, wave table.
 - `../../CONTEXT.md` §4 → the engine IR seam and the root-set contract (`x[0..live)` + whole stack, no liveness maps).
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §E/§F/§G → IR seam, interpreter/JIT trade-offs, tiering rationale.
