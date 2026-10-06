@@ -71,7 +71,10 @@ MODULES =  \
 	beam_ssa_codegen \
 	beam_ssa_dead \
 	beam_ssa_destructive_update \
+	beam_ssa_fbip \
+	beam_ssa_fus \
 	beam_ssa_lint \
+	beam_ssa_loop_opt \
 	beam_ssa_opt \
 	beam_ssa_pp \
 	beam_ssa_pre_codegen \
