@@ -242,16 +242,39 @@ fn a_tagged_tuple_indents_by_the_tag_width() {
 }
 
 #[test]
-fn unsupported_reflow_forms_stay_a_typed_badarg() {
-    // A non-printable bitstring uses `io_lib_pretty:pp_binary`'s own packing, which
-    // this model does not reproduce.
+fn nonprintable_binary_reflow_matches_the_oracle() {
+    // `io_lib:format("~p", [list_to_binary(lists:duplicate(60, 0))])` (erts-17.1):
+    //     [[60,60,[[48],44,…,[48],44,10,[[32,32]],[48],…,[48]],62,62]]
+    // i.e. 38 byte elements on the first line, then `,` `\n` + the two-space
+    // continuation indent + the remaining 22.
     let reg = default_registry();
-    let (_out, result) = run_io(&reg, b"~p", |ctx, reg| {
-        let bytes = vec![0u8; 100];
+    let (out, result) = run_io(&reg, b"~p", |ctx, reg| binary(ctx, reg, &[0u8; 60]));
+    assert!(result.is_ok(), "{result:?}");
+    let want = format!("<<{},\n  {}>>", ["0"; 38].join(","), ["0"; 22].join(","));
+    assert_eq!(String::from_utf8(out).expect("ASCII"), want);
+
+    // `io_lib:format("~p", [list_to_binary(lists:seq(1, 60))])`:
+    //     <<1,…,28,\n  29,…,53,\n  54,…,60>>
+    // (multi-digit elements are wider, so the lines hold 28/25/7 elements).
+    let reg = default_registry();
+    let (out, result) = run_io(&reg, b"~p", |ctx, reg| {
+        let bytes: Vec<u8> = (1..=60).collect();
         binary(ctx, reg, &bytes)
     });
-    assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
+    assert!(result.is_ok(), "{result:?}");
+    let seg = |a: i32, b: i32| (a..=b).map(|n| n.to_string()).collect::<Vec<_>>().join(",");
+    let want = format!("<<{},\n  {},\n  {}>>", seg(1, 28), seg(29, 53), seg(54, 60));
+    assert_eq!(String::from_utf8(out).expect("ASCII"), want);
+}
 
+#[test]
+fn unsupported_reflow_forms_stay_a_typed_badarg() {
+    // An all-printable (latin1) binary is the oracle's quoted-string leaf
+    // (`io_lib:printable_bin0/5` is `{true, …}`), which this model does not
+    // reproduce — refused rather than packed.
+    let reg = default_registry();
+    let (_out, result) = run_io(&reg, b"~p", |ctx, reg| binary(ctx, reg, &[0xA0u8; 100]));
+    assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
     // A container holding another container is not modelled.
     let (_out, result) = run_io(&reg, b"~p", |ctx, _| {
         let inner = int_list(ctx, 1..=28);
