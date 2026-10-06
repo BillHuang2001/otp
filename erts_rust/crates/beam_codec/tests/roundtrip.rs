@@ -1024,22 +1024,28 @@ fn declared_inner_size(image: &[u8]) -> usize {
 }
 
 #[test]
-fn compressed_image_round_trips_a_small_term() {
+fn compressed_image_reverts_to_plain_for_a_small_term() {
+    // `{ok,17}` has an 8-byte body; zlib cannot fit it into `8 - 5 == 3` bytes, so
+    // `encode_term_compressed` reverts to the plain image — exactly what the C
+    // (`external.c:2276-2298`) and the oracle produce:
+    // `term_to_binary({ok,17}, [compressed]) == term_to_binary({ok,17})`.
     let mut atoms = AtomTable::new();
     let ok = make_atom(atoms.intern("ok"));
     let mut h = heap(64);
     let term = h.tuple(&[ok, make_small(17)]).unwrap();
 
-    let image = encode_term_compressed(term, &atoms, 6).unwrap();
     let body = encode_term_body(term, &atoms).unwrap();
-    assert_eq!(declared_inner_size(&image), body.len());
-    // The zlib stream carries exactly the term body (no version byte).
-    assert_eq!(decompress(&image[6..]).unwrap(), body);
-
-    let mut h2 = heap(64);
-    let mut a2 = AtomTable::new();
-    let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
-    assert_term_eq(term, &atoms, term2, &a2);
+    let plain = encode_term(term, &atoms).unwrap();
+    for level in 0..=9u8 {
+        let image = encode_term_compressed(term, &atoms, level).unwrap();
+        assert_eq!(image, plain, "level {level}: a small term must revert");
+        assert_eq!(&image[1..], &body[..]);
+        // The plain image still decodes back to the original term.
+        let mut h2 = heap(64);
+        let mut a2 = AtomTable::new();
+        let term2 = decode_term(&image, &mut h2, &mut a2).unwrap();
+        assert_term_eq(term, &atoms, term2, &a2);
+    }
 }
 
 #[test]
@@ -1110,18 +1116,30 @@ fn compressed_level_out_of_range_is_bad_arg() {
 }
 
 #[test]
-fn compressed_wrapper_bytes_are_well_formed_on_every_level() {
-    // A term where compression pays off at every level (0 stores, 9 best).
+fn compressed_image_is_a_wrapper_or_a_plain_revert_on_every_level() {
+    // A term where compression pays off at most levels, but not necessarily at level
+    // 0 (which stores rather than deflates).
     let mut atoms = AtomTable::new();
     let hello = make_atom(atoms.intern("hello"));
     let mut h = heap(4096);
     let term = list(&mut h, &[hello; 256], NIL);
     let body = encode_term_body(term, &atoms).unwrap();
+    let plain = encode_term(term, &atoms).unwrap();
 
     for level in 0..=9u8 {
         let image = encode_term_compressed(term, &atoms, level).unwrap();
-        assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
-        assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+        if image[1] == COMPRESSED_EXT {
+            // The wrapper only appears when the stream fits in `body_len - 5` bytes.
+            assert_eq!(declared_inner_size(&image), body.len(), "level {level}");
+            assert!(
+                image.len() <= plain.len(),
+                "level {level}: the wrapper shrinks the image"
+            );
+            assert_eq!(decompress(&image[6..]).unwrap(), body, "level {level}");
+        } else {
+            // Reverted: the plain image, byte-for-byte.
+            assert_eq!(image, plain, "level {level}: revert must be the plain image");
+        }
 
         let mut h2 = heap(4096);
         let mut a2 = AtomTable::new();
@@ -1508,11 +1526,6 @@ fn assert_system_limit(bytes: &[u8]) {
     );
 }
 
-fn assert_unsupported(bytes: &[u8]) {
-    let err = decode_err(bytes);
-    assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
-}
-
 #[test]
 fn truncation_at_every_offset_is_bad_arg() {
     // A `NEW_PID_EXT` image built here rather than pasted, to keep the byte offsets
@@ -1560,9 +1573,9 @@ fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
     assert_bad_arg(&[VERSION_MAGIC, 117]); // FUN_EXT
     assert_bad_arg(&[VERSION_MAGIC, 78]); // NEW_CACHE
 
-    // `RECORD_EXT` is recognized but not yet implemented: `unsupported`, never a wrong
-    // term (blocked on a `beam_term` record layout).
-    assert_unsupported(&[VERSION_MAGIC, 67]); // RECORD_EXT
+    // `RECORD_EXT` (67) is implemented now, so a bare tag byte is a *truncation* (the
+    // count, flags and fields are missing) — `BadArg`, never a wrong term.
+    assert_bad_arg(&[VERSION_MAGIC, 67]); // RECORD_EXT
 
     // `LOCAL_EXT` (121) is honoured now as the `term_to_binary/2 [local]` wrapper
     // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4][term]`, so a bare tag byte is a
