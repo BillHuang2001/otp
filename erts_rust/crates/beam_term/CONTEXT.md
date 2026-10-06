@@ -418,6 +418,15 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   raw words (`0xA8`/`0x124`), the `BinRef` word pin, the pinned 8-word combined pair
   (`[BinRef][ErlSubBits]`, root at `hp + 3`), windowed `refc_offset`/`refc_size`/`refc_bytes`, and
   `is_refc_binary` rejecting on-heap bitstrings, non-bin-ref sub-bitstrings, immediates and tuples.
+- `src/record.rs` carries its own suite pinning the raw record words (instance header `make_record_header(n+1)`,
+  definition `[0] == make_arityval(5+n)`, the module/name/is_exported words, keys sorted by `atom_val`,
+  values in sorted order) and the `field_order` index math (a declaration-order ≠ atom-order case,
+  `n == 0` empty record, `n` 1..3), plus every reader round-trip, `record_get` hit/miss,
+  `record_is_native`, duplicate/non-atom-key rejection and rejection of a tuple/immediate/map/definition.
+- `src/number.rs` carries its own suite for `big_to_f64`/`number_as_f64`: exact values with hand-computed
+  doubles (`2^60`, `2^64`, `2^100`, `-(2^70)`), the mantissa boundary and ties-to-even (`2^53+1 → 2^53`,
+  `2^53+3 → 2^53+4`), a case where the removed digit-by-digit accumulator was one ULP out, and the
+  `bitlen` 1024/1025 finite/overflow boundaries (cross-checked against the system `erl` `float/1`).
 - `tests/oracle.rs` — the crate-local **oracle cross-check**: spawns the system `erl`
   (`-noshell -eval`, text protocol — no ETF re-implementation, since dev-depending on `beam_codec`
   would cycle) and checks that `beam_term`'s map/bitstring *observables* agree with the real
