@@ -1,0 +1,706 @@
+//! [`GenImmixCollector`] — the **copying young nursery** paired with the GenImmix-style
+//! **mark-region mature space** ([`ImmixSpace`](crate::immix::ImmixSpace)).
+//!
+//! This is the integrated, config-selectable form of the Stage-4 GenImmix option: it
+//! replaces the copying collector's mature `HeapSpace` with the line/block-based
+//! [`ImmixSpace`] while keeping the nursery a plain barrier-free copying space. The two
+//! strategies share everything the workspace pins down — the frozen term layout, the
+//! flat root-slice contract, the shared word-level evacuation primitives of
+//! [`crate::copy`], and the off-heap/out-of-space rules — so the only difference is
+//! *where* the mature generation lives and *how* it is reclaimed.
+//!
+//! # The two collections
+//!
+//! * A **minor** promotes the nursery's live terms straight into the mature Immix space
+//!   (the same immediate-promotion rule as [`crate::Collector`]). Reclaiming the mature
+//!   generation is deferred, so a minor copies only what the nursery kept alive.
+//! * A **major** first reclaims the mature generation **in place**
+//!   ([`ImmixSpace::collect`]: mark, classify, evacuate `Partial` blocks, pin `AllMarked`
+//!   blocks, free recycled holes) and then promotes the nursery. See "Collection flow"
+//!   below for the exact ordering and why it is the sound one.
+//!
+//! # Barrier-free invariant
+//!
+//! A **mature object must never point at a young object** (that is what lets mature
+//! objects be left untouched by a minor). Promotion only ever moves young objects *into*
+//! the mature space, so the invariant holds after every collection. It also holds across
+//! the major's two phases because the promotion — which follows every young reference
+//! transitively — runs after the in-place mature reclaim, never the other way round
+//! without first resolving the nursery's references (see below).
+//!
+//! # Collection flow
+//!
+//! Both collections begin with [`scan_young`], a read-only walk of the live nursery graph
+//! reachable from `roots` that reports two things: the number of Immix **lines** copies of
+//! the live objects will occupy (`needed`), and every nursery reference word that points
+//! **into the mature space** (aligned `(slot, term)` pairs).
+//!
+//! * **Minor** ([`GenImmixCollector::run_minor`]): if `mature.free_lines() >= needed` the
+//!   nursery is promoted with [`promote`] and reset. `needed` is the exact line count, so
+//!   the check is never optimistic about the *total* room a promotion needs.
+//! * **Major** ([`GenImmixCollector::run_major`]):
+//!   1. **Reclaim mature in place.** The `(slot, term)` pairs are passed as `promoted`
+//!      roots to [`ImmixSpace::collect`], so every mature object merely *reachable through
+//!      the nursery* is treated as live and is not dropped. A mature object can only be
+//!      referenced from a young object (never the reverse), so without this the in-place
+//!      reclaim would free objects that the nursery still points at.
+//!   2. **Resolve the nursery's references.** [`ImmixSpace::collect`] may *evacuate* a
+//!      live object in a `Partial` block, so each recorded nursery slot is rewritten to
+//!      the object's final address (the `promoted` entries it was aligned with hold the
+//!      updated term). From here the nursery holds only final mature addresses.
+//!   3. **Promote the nursery.** Now that the nursery's mature references are final, the
+//!      promotion leaves them verbatim (`Foreign`) and cannot create a stale pointer.
+//!
+//! If, after a major has reclaimed the mature generation, the live nursery still does not
+//! fit (`free_lines() < needed`), the collector returns the typed heap-exhaustion
+//! [`BeamError`](beam_common::BeamError) — never a panic and never a half-forwarded heap.
+//!
+//! # Sharing with the copying engine
+//!
+//! [`promote`] is driven entirely by [`crate::copy`]'s `pub(crate)` primitives: object
+//! sizing is [`move_size`](crate::copy::move_size), reference enumeration is
+//! [`for_each_ref`](crate::copy::for_each_ref), and the whole in-place marker protocol is
+//! [`forward_slot`](crate::copy::forward_slot) over the [`EvacDest`](crate::copy::EvacDest)
+//! seam. The *one* decision that differs from a copying collection — *which* objects
+//! move — is this module's [`PromoteDest`]: it evacuates exactly the references that fall
+//! inside the nursery's [`FromSet`] and puts the copies in the mature Immix space.
+
+use std::collections::HashSet;
+
+use beam_alloc::AllocRef;
+use beam_common::Result;
+use beam_term::prelude::{is_boxed, is_header, is_list, is_non_value, ptr_val, Eterm};
+
+use crate::collector::{Collection, CollectionKind};
+use crate::config::GcConfig;
+use crate::copy::{for_each_ref, forward_slot, move_size, EvacDest, Target};
+use crate::error::heap_exhausted;
+use crate::immix::{lines_for, ImmixSpace, ImmixStats, LINE_WORDS};
+use crate::policy::HeapPolicy;
+use crate::space::{FromSet, HeapSpace};
+use crate::stats::GcStats;
+
+/// The [`EvacDest`] decision for a **promotion**: evacuate exactly the references into the
+/// nursery's [`FromSet`] and place the copies in the mark-region mature space.
+///
+/// A reference that is already inside the mature space (or a literal, or off-heap) is
+/// [`Target::Foreign`] and is left verbatim — the mature object is already in its final
+/// position (the nursery's mature references are resolved *before* a promotion ever runs).
+struct PromoteDest<'a> {
+    from: &'a FromSet,
+    to: &'a mut ImmixSpace,
+}
+
+impl EvacDest for PromoteDest<'_> {
+    unsafe fn classify_boxed(&self, ptr: *const Eterm) -> Target {
+        if !self.from.contains(ptr) {
+            // A mature object, a literal, off-heap memory or any other out-of-nursery
+            // address: never moved by a promotion.
+            return Target::Foreign;
+        }
+        // SAFETY: `ptr` is inside a live nursery object, so its header word is readable.
+        if is_header(unsafe { *ptr }) {
+            Target::Live
+        } else {
+            // `IS_MOVED_BOXED`: the header was overwritten with the new BOXED pointer.
+            Target::Forwarded
+        }
+    }
+
+    unsafe fn classify_cons(&self, ptr: *const Eterm) -> Target {
+        if !self.from.contains(ptr) {
+            return Target::Foreign;
+        }
+        // SAFETY: `ptr` is inside a live nursery cons cell, so its car word is readable.
+        if is_non_value(unsafe { *ptr }) {
+            Target::Forwarded
+        } else {
+            Target::Live
+        }
+    }
+
+    fn can_reserve(&self, words: usize) -> bool {
+        self.to.can_reserve(words)
+    }
+
+    unsafe fn reserve(&mut self, words: usize) -> Result<*mut Eterm> {
+        // SAFETY: the caller guarantees `words` fit (`can_reserve` just held); the Immix
+        // allocator hands out `words` exclusively-owned, line-aligned words. `kept` is not
+        // set because no mark-region collection is running while a promotion is in flight.
+        unsafe { self.to.alloc_words(words) }
+    }
+}
+
+/// Evacuates every live nursery object reachable from `roots` into `to`, updating `roots`
+/// in place, and returns the copy statistics.
+///
+/// The traversal is the Cheney worklist of the mark-region space's own evacuation: copying
+/// an object queues the addresses of its reference words, and each queued word is
+/// forwarded once, so a shared object is copied once and followed by a marker afterwards.
+/// Object sizes and reference enumeration come from the shared `copy` primitives.
+fn promote(from: &FromSet, to: &mut ImmixSpace, roots: &mut [Eterm]) -> Result<GcStats> {
+    let mut dest = PromoteDest { from, to };
+    let mut stats = GcStats::default();
+    let mut work: Vec<*mut Eterm> = Vec::new();
+
+    for root in roots.iter_mut() {
+        // SAFETY: `root` is a live, exclusively-borrowed term word of the caller's roots.
+        let copied = unsafe { forward_slot(&mut dest, root as *mut Eterm)? };
+        if copied > 0 {
+            stats.objects_copied += 1;
+            stats.words_copied += copied;
+            // SAFETY: `forward_slot` rewrote `root` to name the fresh copy of `copied`
+            // words it made in the mature space.
+            unsafe { enqueue_refs(&mut work, *root, copied)? };
+        }
+    }
+
+    while let Some(slot) = work.pop() {
+        // SAFETY: every queued address is a reference word inside a live nursery object
+        // (or inside a copy this promotion made); `forward_slot` reads it, copies the
+        // referenced nursery object and rewrites the word in place.
+        let copied = unsafe { forward_slot(&mut dest, slot)? };
+        if copied > 0 {
+            stats.objects_copied += 1;
+            stats.words_copied += copied;
+            // SAFETY: `slot` now names the copy of `copied` words just written.
+            unsafe { enqueue_refs(&mut work, *slot, copied)? };
+        }
+    }
+
+    Ok(stats)
+}
+
+/// Queues the address of every reference word of the live object `term` (of `total` words)
+/// for forwarding.
+///
+/// # Safety
+///
+/// `term` must be a BOXED or LIST term naming a live object of exactly `total` words, all
+/// readable. A cons cell has no header, but [`for_each_ref`] steps both of its words as
+/// terms, so the same primitive covers a cons cell (`total == 2`) and any boxed object.
+unsafe fn enqueue_refs(work: &mut Vec<*mut Eterm>, term: Eterm, total: usize) -> Result<()> {
+    // SAFETY: forwarded to the caller's guarantee.
+    unsafe {
+        for_each_ref(ptr_val(term), total, &mut |slot| {
+            work.push(slot);
+            Ok(())
+        })
+    }
+}
+
+/// The result of a nursery scan: the Immix lines a promotion needs, and every nursery
+/// reference word that points into the mature space (`(slot, term)` order-aligned).
+type YoungScan = (usize, Vec<(*mut Eterm, Eterm)>);
+
+/// Walks the live nursery graph reachable from `roots`, without copying anything.
+///
+/// Reports the number of Immix **lines** a promotion of that graph will occupy (`needed`)
+/// and each nursery reference word pointing **into** `mature` (kept order-aligned with the
+/// mature terms they hold). Worklist-based, so a deep list cannot grow the real stack; the
+/// graph is a DAG, so the visited set also keeps `needed` an exact object count.
+fn scan_young(roots: &[Eterm], young: &HeapSpace, mature: &ImmixSpace) -> Result<YoungScan> {
+    let mut seen: HashSet<usize> = HashSet::new();
+    let mut work: Vec<*mut Eterm> = Vec::new();
+    let mut needed = 0usize;
+    let mut refs: Vec<(*mut Eterm, Eterm)> = Vec::new();
+
+    for &root in roots {
+        seed_young(root, young, &mut seen, &mut work);
+    }
+
+    while let Some(obj) = work.pop() {
+        // SAFETY: `obj` is the first word of a live, reachable nursery object (seeded only
+        // through `young.contains`), so it is readable.
+        let first = unsafe { *obj };
+        // A cons cell has no header; its first word is the car, a term that never carries
+        // the `Header` primary tag (`beam_term::tag::is_header`), so the tag says the shape.
+        let is_cons = !is_header(first);
+        let total = if is_cons { 2 } else { move_size(first, obj) };
+        needed += lines_for(total);
+
+        // SAFETY: `obj` addresses a live nursery object of `total` words, all readable.
+        unsafe {
+            for_each_ref(obj, total, &mut |slot| {
+                // SAFETY: `for_each_ref` yields the address of a live reference word of a
+                // live nursery object, so reading it is covered by this block.
+                let term = *slot;
+                if is_boxed(term) || is_list(term) {
+                    let ptr = ptr_val(term) as *const Eterm;
+                    if young.contains(ptr) {
+                        if seen.insert(ptr as usize) {
+                            work.push(ptr as *mut Eterm);
+                        }
+                    } else if mature.contains(ptr) {
+                        refs.push((slot, term));
+                    }
+                }
+                Ok(())
+            })?;
+        }
+    }
+
+    Ok((needed, refs))
+}
+
+/// Seeds the worklist with `term` when it is a live nursery object.
+fn seed_young(
+    term: Eterm,
+    young: &HeapSpace,
+    seen: &mut HashSet<usize>,
+    work: &mut Vec<*mut Eterm>,
+) {
+    if is_boxed(term) || is_list(term) {
+        let ptr = ptr_val(term) as *const Eterm;
+        if young.contains(ptr) && seen.insert(ptr as usize) {
+            work.push(ptr as *mut Eterm);
+        }
+    }
+}
+
+/// A two-generation collector whose nursery is the copying [`HeapSpace`] and whose mature
+/// generation is the mark-region [`ImmixSpace`].
+///
+/// Selected by [`crate::config::MatureKind::Immix`]; the default configuration still
+/// resolves to the copying [`crate::Collector`] (see [`crate::AnyCollector`]). The public
+/// surface mirrors [`crate::Collector`] apart from [`mature`](Self::mature), which returns
+/// an [`ImmixSpace`] rather than a [`HeapSpace`].
+pub struct GenImmixCollector {
+    policy: HeapPolicy,
+    young: HeapSpace,
+    mature: ImmixSpace,
+    minor_since_major: u32,
+    stats: GcStats,
+    last_immix: Option<ImmixStats>,
+}
+
+impl GenImmixCollector {
+    /// Creates a collector for `config`, over the default allocator.
+    ///
+    /// The [`MatureKind`](crate::config::MatureKind) of `config` is **ignored**: this type
+    /// *is* the Immix-backed collector, so it always builds one over `config.policy()`.
+    /// Use [`crate::AnyCollector::from_config`] to dispatch on the configured strategy.
+    pub fn with_config(config: &GcConfig) -> Result<GenImmixCollector> {
+        Self::from_policy(config.policy().clone())
+    }
+
+    /// Creates an Immix-backed collector with `policy`, over the default allocator.
+    pub fn from_policy(policy: HeapPolicy) -> Result<GenImmixCollector> {
+        Self::with_allocator(beam_alloc::registry::default_allocator().clone(), policy)
+    }
+
+    /// Creates an Immix-backed collector with `policy`, backed by `alloc`.
+    pub fn with_allocator(alloc: AllocRef, policy: HeapPolicy) -> Result<GenImmixCollector> {
+        let young = HeapSpace::with_allocator(alloc.clone(), policy.initial_young_words)?;
+        let mature = ImmixSpace::with_allocator(alloc, policy.initial_mature_words)?;
+        Ok(GenImmixCollector {
+            policy,
+            young,
+            mature,
+            minor_since_major: 0,
+            stats: GcStats::default(),
+            last_immix: None,
+        })
+    }
+
+    /// The collector's heap-size policy.
+    pub fn policy(&self) -> &HeapPolicy {
+        &self.policy
+    }
+
+    /// The young (nursery) copying space.
+    pub fn young(&self) -> &HeapSpace {
+        &self.young
+    }
+
+    /// The young (nursery) space, mutably — where the mutator allocates.
+    pub fn young_mut(&mut self) -> &mut HeapSpace {
+        &mut self.young
+    }
+
+    /// The mature mark-region space.
+    pub fn mature(&self) -> &ImmixSpace {
+        &self.mature
+    }
+
+    /// The collector's accumulated statistics.
+    pub fn stats(&self) -> GcStats {
+        self.stats
+    }
+
+    /// The work the most recent **major** collection's in-place mature reclaim performed
+    /// (`None` until a major has run). Lets a caller read the mark-region accounting — the
+    /// objects evacuated vs pinned, the blocks reclaimed — that [`GcStats`] folds away.
+    pub fn last_immix_stats(&self) -> Option<ImmixStats> {
+        self.last_immix
+    }
+
+    /// Whether the nursery can no longer satisfy `need_words` more words — the same signal
+    /// [`crate::Collector`] uses (an exact-fit allocation still fits).
+    pub fn should_collect(&self, need_words: usize) -> bool {
+        self.young.available_words() < need_words
+    }
+
+    /// Runs a collection, picking minor vs major by policy and escalating a would-not-fit
+    /// minor to a major.
+    ///
+    /// A major is chosen when the fullsweep cadence is due *or* when a promotion of the
+    /// live nursery (`needed` lines) would not fit the mature space's free lines — the
+    /// escalation makes the major's in-place reclaim, rather than a doomed copy, the way
+    /// room is found.
+    pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
+        let (needed, refs) = scan_young(roots, &self.young, &self.mature)?;
+        let tight = self.mature.free_lines() < needed;
+        let kind = if self.minor_since_major >= self.policy.fullsweep_after || tight {
+            CollectionKind::Major
+        } else {
+            CollectionKind::Minor
+        };
+        let stats = match kind {
+            CollectionKind::Minor => self.run_minor(roots)?,
+            CollectionKind::Major => self.run_major(roots, needed, refs)?,
+        };
+        self.stats.words_copied += stats.words_copied;
+        self.stats.words_reclaimed += stats.words_reclaimed;
+        self.stats.objects_copied += stats.objects_copied;
+        match kind {
+            CollectionKind::Minor => self.stats.minor_collections += 1,
+            CollectionKind::Major => self.stats.major_collections += 1,
+        }
+        Ok(Collection { kind, stats })
+    }
+
+    /// Promotes the nursery's live terms into the mature space and resets the nursery.
+    ///
+    /// The caller has already checked that `mature.free_lines()` covers the promotion's
+    /// `needed` lines, so this never has to roll a half-finished copy back.
+    fn run_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        let mut from = FromSet::new();
+        from.add(&self.young);
+        let mut stats = promote(&from, &mut self.mature, roots)?;
+        // The nursery words that were not promoted were garbage: promotion is the whole of
+        // a minor's reclamation.
+        stats.words_reclaimed = self.young.used_words().saturating_sub(stats.words_copied);
+        self.young.reset();
+        self.minor_since_major += 1;
+        Ok(stats)
+    }
+
+    /// Reclaims the mature generation in place, then promotes the nursery into it.
+    ///
+    /// `needed` and `refs` come from the [`scan_young`] the caller ran before choosing the
+    /// collection, so the nursery is scanned exactly once per collection.
+    fn run_major(
+        &mut self,
+        roots: &mut [Eterm],
+        needed: usize,
+        refs: Vec<(*mut Eterm, Eterm)>,
+    ) -> Result<GcStats> {
+        // The nursery's mature references, as additional roots: a mature object reachable
+        // only through the live nursery must survive the in-place reclaim.
+        let mut promoted: Vec<Eterm> = refs.iter().map(|(_, term)| *term).collect();
+        let immix = self.mature.collect(roots, &mut promoted)?;
+        self.last_immix = Some(immix);
+
+        // `ImmixSpace::collect` may have evacuated these objects, so rewrite each nursery
+        // slot to the final address its (order-aligned) `promoted` entry now holds. The
+        // nursery itself was untouched by the mature reclaim, so the slots still address
+        // live reference words.
+        for ((slot, _), new) in refs.iter().zip(promoted.iter()) {
+            // SAFETY: `slot` addresses a live reference word of a reachable nursery object.
+            unsafe { **slot = *new };
+        }
+
+        if self.mature.free_lines() < needed {
+            // Even after reclaiming the mature generation the live nursery does not fit:
+            // a typed, retryable heap exhaustion, never a panic or a partial promotion.
+            return Err(heap_exhausted(needed.saturating_mul(LINE_WORDS)));
+        }
+
+        let mut from = FromSet::new();
+        from.add(&self.young);
+        let mut stats = promote(&from, &mut self.mature, roots)?;
+        let nursery_garbage = self.young.used_words().saturating_sub(stats.words_copied);
+        // Total words reclaimed: the mature generation's in-place reclaim plus the nursery
+        // words that died (they were never promoted).
+        stats.words_reclaimed = immix.words_reclaimed + nursery_garbage;
+        self.young.reset();
+        self.minor_since_major = 0;
+        Ok(stats)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! End-to-end tests of the integrated path: a term graph built through
+    //! [`GenImmixCollector::young_mut`], driven through several minors and a major, must
+    //! stay structurally intact with every root relocated into the mature Immix space.
+    //!
+    //! `unsafe` below only dereferences pointers this test allocated and wrote itself (or
+    //! that a collection just wrote); every block carries a `// SAFETY:` rationale.
+
+    use beam_term::prelude::{
+        arityval, boxed_val, is_arity_value, is_atom, is_list, list_val, make_atom, make_small,
+        signed_value, Atom, Eterm, NIL,
+    };
+
+    use super::*;
+
+    /// Walks a proper list of small integers, returning them in order.
+    fn list_to_smalls(mut term: Eterm) -> Vec<i64> {
+        let mut values = Vec::new();
+        while is_list(term) {
+            // SAFETY: `term` is a live cons cell (`is_list`), so both words are readable.
+            let cell = list_val(term);
+            values.push(signed_value(unsafe { *cell }));
+            term = unsafe { *cell.add(1) };
+        }
+        assert_eq!(term, NIL, "the list must be proper");
+        values
+    }
+
+    /// Builds `{atom, [1,2,3], {4,5}}` in the nursery; returns the outer term and the atom.
+    fn build_graph(c: &mut GenImmixCollector) -> (Eterm, Eterm) {
+        let heap = c.young_mut().heap_mut();
+        let atom = make_atom(Atom::from_raw(7));
+        let cell3 = heap.cons(make_small(3), NIL).expect("cons cell");
+        let cell2 = heap.cons(make_small(2), cell3).expect("cons cell");
+        let list = heap.cons(make_small(1), cell2).expect("cons cell");
+        let inner = heap
+            .tuple(&[make_small(4), make_small(5)])
+            .expect("inner tuple");
+        let outer = heap.tuple(&[atom, list, inner]).expect("outer tuple");
+        (outer, atom)
+    }
+
+    /// Asserts the graph reachable from `root` — resident in the mature space — has the
+    /// shape and leaf values of `{atom, [1,2,3], {4,5}}`.
+    fn assert_graph_preserved(c: &GenImmixCollector, root: Eterm, atom: Eterm) {
+        assert!(
+            c.mature().contains_term(root),
+            "the root must be resident in the mature space"
+        );
+        assert!(
+            !c.young().contains_term(root),
+            "the root must no longer be in the nursery"
+        );
+
+        // SAFETY: `root` is a live 3-element tuple in the mature space.
+        let header = unsafe { *boxed_val(root) };
+        assert!(is_arity_value(header));
+        assert_eq!(arityval(header), 3);
+
+        // SAFETY: elements 0..3 lie within the 3-element tuple just validated.
+        let e0 = unsafe { *boxed_val(root).add(1) };
+        let e1 = unsafe { *boxed_val(root).add(2) };
+        let e2 = unsafe { *boxed_val(root).add(3) };
+
+        assert!(is_atom(e0));
+        assert_eq!(e0, atom, "the atom leaf is unchanged");
+        assert!(is_list(e1));
+        assert!(c.mature().contains_term(e1), "the list is in mature");
+        assert_eq!(list_to_smalls(e1), vec![1, 2, 3]);
+
+        assert!(c.mature().contains_term(e2), "the inner tuple is in mature");
+        // SAFETY: `e2` is a live 2-element tuple in the mature space.
+        let inner_header = unsafe { *boxed_val(e2) };
+        assert!(is_arity_value(inner_header));
+        assert_eq!(arityval(inner_header), 2);
+        // SAFETY: elements 0..2 lie within that tuple.
+        assert_eq!(signed_value(unsafe { *boxed_val(e2).add(1) }), 4);
+        assert_eq!(signed_value(unsafe { *boxed_val(e2).add(2) }), 5);
+    }
+
+    #[test]
+    fn minor_promotes_into_immix_and_empties_the_nursery() {
+        let mut c = GenImmixCollector::from_policy(HeapPolicy::default()).expect("collector");
+        let (outer, atom) = build_graph(&mut c);
+
+        let available = c.young().available_words();
+        assert!(!c.should_collect(available), "an exact fit still fits");
+        assert!(c.should_collect(available + 1));
+
+        let mut roots = [outer];
+        let collection = c.collect(&mut roots).expect("collect");
+
+        assert_eq!(collection.kind, CollectionKind::Minor);
+        assert_eq!(c.young().used_words(), 0, "the nursery is emptied");
+        assert_eq!(collection.stats.words_copied, 13, "only the live words move");
+        assert_eq!(collection.stats.objects_copied, 5, "outer + inner + 3 cells");
+        assert_eq!(c.stats().minor_collections, 1);
+        assert_eq!(c.stats().major_collections, 0);
+
+        assert_graph_preserved(&c, roots[0], atom);
+    }
+
+    #[test]
+    fn fullsweep_after_forces_a_major_which_reclaims_in_place_then_promotes() {
+        let policy = HeapPolicy {
+            fullsweep_after: 1,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        let (first, atom) = build_graph(&mut c);
+        let mut roots = [first];
+        let one = c.collect(&mut roots).expect("first collect");
+        assert_eq!(one.kind, CollectionKind::Minor);
+        assert_eq!(c.stats().minor_collections, 1);
+
+        // Allocate again; keep the promoted root live too.
+        let extra = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(9)])
+            .expect("extra tuple");
+        let mut roots = [roots[0], extra];
+        let two = c.collect(&mut roots).expect("second collect");
+
+        assert_eq!(two.kind, CollectionKind::Major, "fullsweep_after = 1");
+        assert_eq!(c.stats().major_collections, 1);
+        assert_eq!(c.stats().minor_collections, 1, "no extra minor ran");
+        assert_eq!(c.young().used_words(), 0);
+        assert!(
+            c.last_immix_stats().is_some(),
+            "the mature reclaim is observable"
+        );
+
+        for root in roots {
+            assert!(c.mature().contains_term(root), "live data is in mature");
+        }
+        assert_graph_preserved(&c, roots[0], atom);
+
+        let extra_root = roots[1];
+        // SAFETY: `extra_root` is a live 1-element tuple in the mature space.
+        let extra_header = unsafe { *boxed_val(extra_root) };
+        assert!(is_arity_value(extra_header));
+        assert_eq!(arityval(extra_header), 1);
+        // SAFETY: element 0 lies within that tuple.
+        assert_eq!(signed_value(unsafe { *boxed_val(extra_root).add(1) }), 9);
+    }
+
+    #[test]
+    fn a_major_reclaims_dead_mature_objects() {
+        let policy = HeapPolicy {
+            fullsweep_after: 1,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        // Promote a 5-object graph, then drop it and promote a different one; the first
+        // graph must be reclaimed by the next major even though it sits in the mature space.
+        let (first, _atom) = build_graph(&mut c);
+        let mut roots = [first];
+        let one = c.collect(&mut roots).expect("promote the first graph");
+        assert_eq!(one.kind, CollectionKind::Minor);
+        assert!(c.mature().contains_term(roots[0]));
+        assert_eq!(c.mature().used_lines(), 5);
+
+        // A fresh, unrelated live leaf in the nursery; the first graph is now unreachable.
+        let leaf = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(1)])
+            .expect("leaf");
+        let mut roots = [leaf];
+        let collection = c.collect(&mut roots).expect("major");
+
+        assert_eq!(collection.kind, CollectionKind::Major, "fullsweep_after = 1");
+        // The old 5-object graph is gone; only the new leaf survives.
+        assert!(c.mature().contains_term(roots[0]));
+        assert_eq!(
+            c.mature().used_lines(),
+            1,
+            "the dead mature graph was reclaimed in place"
+        );
+        assert_eq!(c.mature().free_lines(), 15, "the reclaimed lines are reusable");
+    }
+
+    #[test]
+    fn a_minor_that_would_not_fit_escalates_to_a_major() {
+        // A mature space far smaller than the nursery cannot receive a whole promotion.
+        let policy = HeapPolicy {
+            initial_mature_words: 1, // one block: 16 lines
+            initial_young_words: 233,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        // Fill most of the mature space's 16 lines with garbage promoted once, then make
+        // the next nursery promotion bigger than what is left.
+        let heap = c.young_mut().heap_mut();
+        let mut first_roots: Vec<Eterm> = Vec::new();
+        for i in 0..12i64 {
+            first_roots.push(heap.cons(make_small(i), NIL).expect("cell"));
+        }
+        let mut roots = first_roots.clone();
+        let first = c.collect(&mut roots).expect("first promote");
+        assert_eq!(first.kind, CollectionKind::Minor);
+        assert_eq!(c.mature().used_lines(), 12);
+
+        // A new 8-object nursery graph was never reachable from the first roots, so it can
+        // only fit after the old 12 lines are reclaimed in place.
+        let heap = c.young_mut().heap_mut();
+        let mut live: Vec<Eterm> = Vec::new();
+        for i in 100..108i64 {
+            live.push(heap.cons(make_small(i), NIL).expect("cell"));
+        }
+        let mut roots = live.clone();
+        let second = c.collect(&mut roots).expect("escalated major");
+
+        assert_eq!(second.kind, CollectionKind::Major, "would-not-fit minor escalates");
+        assert_eq!(c.stats().major_collections, 1);
+        for root in roots {
+            assert!(c.mature().contains_term(root));
+        }
+        assert_eq!(c.mature().used_lines(), 8, "the dead graph was reclaimed");
+    }
+
+    #[test]
+    fn nursery_references_to_mature_objects_survive_a_major() {
+        // The hard case: a live nursery object points *back* into the mature space, and the
+        // major reclaim must both keep that mature object alive and rewrite the nursery's
+        // reference to its final (possibly evacuated) address.
+        let policy = HeapPolicy {
+            fullsweep_after: 1,
+            ..HeapPolicy::default()
+        };
+        let mut c = GenImmixCollector::from_policy(policy).expect("collector");
+
+        // Promote a mature object (a 1-element tuple); `roots[0]` is its mature address.
+        let leaf = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[make_small(42)])
+            .expect("leaf");
+        let mut roots = [leaf];
+        let one = c.collect(&mut roots).expect("promote the leaf");
+        assert_eq!(one.kind, CollectionKind::Minor);
+        let leaf_in_mature = roots[0];
+        assert!(c.mature().contains_term(leaf_in_mature));
+
+        // A young holder whose element 0 is the mature leaf — the young->mature edge a naive
+        // in-place reclaim would either drop or leave dangling.
+        let holder = c
+            .young_mut()
+            .heap_mut()
+            .tuple(&[leaf_in_mature])
+            .expect("holder");
+
+        let mut roots = [holder];
+        let collection = c.collect(&mut roots).expect("major");
+
+        assert_eq!(collection.kind, CollectionKind::Major, "fullsweep_after = 1");
+        let holder = roots[0];
+        assert!(c.mature().contains_term(holder), "the holder was promoted");
+
+        // SAFETY: `holder` is a live 1-element tuple in the mature space.
+        let inner = unsafe { *boxed_val(holder).add(1) };
+        assert!(
+            c.mature().contains_term(inner),
+            "the mature leaf survived the reclaim and the nursery reference was rewritten"
+        );
+        // SAFETY: `inner` is the live 1-element tuple; its element is the small integer.
+        assert_eq!(signed_value(unsafe { *boxed_val(inner).add(1) }), 42);
+    }
+}

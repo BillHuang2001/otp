@@ -1,0 +1,115 @@
+//! [`AnyCollector`] — the strategy-dispatching collector seam.
+//!
+//! A thin wrapper that lets a caller (and a test) drive the **same** corpus through either
+//! mature-generation strategy behind one API: [`crate::Collector`] for
+//! [`MatureKind::Copying`](crate::config::MatureKind::Copying) (the default, today's
+//! behaviour) and [`GenImmixCollector`] for
+//! [`MatureKind::Immix`](crate::config::MatureKind::Immix) (the measurement-gated
+//! mark-region option). [`AnyCollector::from_config`] is the dispatcher; the remaining
+//! methods forward to whichever strategy was selected.
+//!
+//! This module owns no collection logic — it exists so the two strategies stay
+//! interchangeable without either depending on the other.
+
+use beam_common::Result;
+use beam_term::prelude::Eterm;
+
+use crate::collector::{Collection, Collector};
+use crate::config::{GcConfig, MatureKind};
+use crate::immix_collector::GenImmixCollector;
+use crate::policy::HeapPolicy;
+use crate::space::HeapSpace;
+use crate::stats::GcStats;
+
+/// A collector whose mature-generation strategy is chosen at construction time.
+///
+/// Both variants share the [`Collection`]/[`crate::CollectionKind`] result type and the
+/// young-nursery accessors, so a caller that only needs "collect and inspect the young
+/// space" is strategy-agnostic.
+pub enum AnyCollector {
+    /// The copying mature space ([`crate::Collector`]).
+    Copying(Collector),
+    /// The mark-region mature space ([`GenImmixCollector`]).
+    Immix(GenImmixCollector),
+}
+
+impl AnyCollector {
+    /// Builds the collector `config` selects: [`MatureKind::Copying`] → [`Collector`]
+    /// (the default), [`MatureKind::Immix`] → [`GenImmixCollector`].
+    pub fn from_config(config: &GcConfig) -> Result<AnyCollector> {
+        match config.mature() {
+            MatureKind::Copying => Ok(AnyCollector::Copying(Collector::new(config.policy().clone())?)),
+            MatureKind::Immix => Ok(AnyCollector::Immix(GenImmixCollector::with_config(config)?)),
+        }
+    }
+
+    /// The `MatureKind` this collector was built for.
+    pub fn kind(&self) -> MatureKind {
+        match self {
+            AnyCollector::Copying(_) => MatureKind::Copying,
+            AnyCollector::Immix(_) => MatureKind::Immix,
+        }
+    }
+
+    /// The collector's heap-size policy.
+    pub fn policy(&self) -> &HeapPolicy {
+        match self {
+            AnyCollector::Copying(c) => c.policy(),
+            AnyCollector::Immix(c) => c.policy(),
+        }
+    }
+
+    /// The young (nursery) space.
+    pub fn young(&self) -> &HeapSpace {
+        match self {
+            AnyCollector::Copying(c) => c.young(),
+            AnyCollector::Immix(c) => c.young(),
+        }
+    }
+
+    /// The young (nursery) space, mutably — where the mutator allocates.
+    pub fn young_mut(&mut self) -> &mut HeapSpace {
+        match self {
+            AnyCollector::Copying(c) => c.young_mut(),
+            AnyCollector::Immix(c) => c.young_mut(),
+        }
+    }
+
+    /// The collector's accumulated statistics.
+    pub fn stats(&self) -> GcStats {
+        match self {
+            AnyCollector::Copying(c) => c.stats(),
+            AnyCollector::Immix(c) => c.stats(),
+        }
+    }
+
+    /// Runs a collection on the selected strategy.
+    pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
+        match self {
+            AnyCollector::Copying(c) => c.collect(roots),
+            AnyCollector::Immix(c) => c.collect(roots),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn default_config_selects_the_copying_path() {
+        let any = AnyCollector::from_config(&GcConfig::default()).expect("collector");
+        assert_eq!(any.kind(), MatureKind::Copying);
+        assert!(matches!(any, AnyCollector::Copying(_)));
+        assert_eq!(any.policy(), &HeapPolicy::default());
+    }
+
+    #[test]
+    fn immix_config_selects_the_immix_path() {
+        let config = GcConfig::immix(HeapPolicy::from_min_max(12, 0));
+        let any = AnyCollector::from_config(&config).expect("collector");
+        assert_eq!(any.kind(), MatureKind::Immix);
+        assert!(matches!(any, AnyCollector::Immix(_)));
+        assert_eq!(any.policy(), config.policy());
+    }
+}
