@@ -198,7 +198,7 @@ registry key (the M1 substitution for a real `tid()`).
 
 ## The implemented BIFs (286)
 `default_registry()` registers **286** distinct `(module, function, arity)` keys (count the
-`reg.register(` calls across `src/*.rs`; its `len()` is 286) — **182 real `bif.tab` BIFs + 104
+`reg.register(` calls across `src/*.rs`; its `len()` is 286) — **211 real `bif.tab` BIFs + 75
 `lists.erl`/`maps.erl`/`io.erl` stdlib fast-paths** (see the capability-gap audit below). Names and
 arities are verbatim from `bif.tab` / the stdlib export lists.
 
