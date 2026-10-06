@@ -19,6 +19,13 @@
 //! * A Rust runtime that *runs* but exits with [`UNSUPPORTED_EXIT_CODE`] (`3`) has hit a
 //!   documented **capability gap**; that side is classified `unsupported` (carrying its
 //!   `beam_rt: unsupported: …` stderr line), **not** a differing observable result.
+//! * A **probe-wrapped** case (an expression case) whose probe *caught* the runtime's
+//!   documented capability-gap raise is classified `unsupported` too: the probe prints the
+//!   caught raise as its single `exception <class> <reason>` stdout line and exits `1`, so
+//!   the gap would otherwise masquerade as a differing result. The detection
+//!   ([`caught_unsupported_reason`]) is deliberately narrow — only the runtime's documented
+//!   `unsupported` reason convention can trigger it — so a genuine Erlang reason (`badarg`,
+//!   `system_limit`, `'erlang:open_port/2 is not a BIF'`, …) stays an observation.
 //! * A case whose *oracle* disagrees with its own golden is **corpus drift** and is a
 //!   mismatch even when no Rust runtime exists — the corpus is self-testing.
 //!
@@ -133,6 +140,7 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 rust_argv: argv,
                 observables: Observables::All,
                 golden: Some(case.golden),
+                probe_wrapped: true,
             };
             execute(context, plan, None)
         }
@@ -154,6 +162,7 @@ pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
         rust_argv: argv,
         observables: Observables::All,
         golden: None,
+        probe_wrapped: true,
     };
     execute(&context, plan, None)
 }
@@ -203,7 +212,7 @@ fn execute(
     let oracle = SideResult::observed(oracle_observation);
 
     let rust = match &context.rust {
-        Some(spec) => classify_rust(runtime::run(spec, &plan.rust_argv)?),
+        Some(spec) => classify_rust(runtime::run(spec, &plan.rust_argv)?, plan.probe_wrapped),
         None => SideResult::unsupported(rust_unsupported_reason()),
     };
 
@@ -253,6 +262,7 @@ fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Re
         rust_argv: run.rust_argv(compiled.dir()),
         observables: Observables::StdoutAndExit,
         golden: Some(case.golden),
+        probe_wrapped: false,
     };
     execute(context, plan, Some(compiled))
 }
@@ -281,17 +291,103 @@ fn skipped_module_outcome(context: &RuntimeContext, case: &Case, run: &ModuleRun
     }
 }
 
+/// The prefix every documented capability-gap reason atom starts with — the runtime's
+/// convention (mirrors `crates/beam_rt/src/error.rs`'s `UNSUPPORTED_PREFIX`).
+const UNSUPPORTED_REASON_PREFIX: &str = "unsupported";
+
+/// The probe protocol's failure-line prefix (`exception <class> <reason>`).
+const PROBE_EXCEPTION_PREFIX: &str = "exception ";
+
 /// Classify a Rust-runtime observation.
 ///
-/// The documented exit-3 signal ([`runtime::UNSUPPORTED_EXIT_CODE`]) means the runtime hit
-/// a **capability gap**, so the side is recorded as [`SideResult::Unsupported`] carrying its
-/// stderr diagnostic — **not** as an observation that would diff against the oracle (which
-/// would wrongly be a `mismatch`). Every other exit status is a genuine observation.
-fn classify_rust(observation: runtime::Observation) -> SideResult {
+/// A **capability gap** is reported to the harness two ways and both mean
+/// [`SideResult::Unsupported`], never a differing observable result:
+///
+/// * the runtime exits with the documented [`runtime::UNSUPPORTED_EXIT_CODE`] (`3`) — the
+///   signal for a raise that escaped the program (e.g. a malformed `-eval`); the side then
+///   carries the runtime's `beam_rt: unsupported: …` stderr line; or
+/// * a **probe-wrapped** case whose probe *caught* the raise: the probe prints it as its
+///   single `exception <class> <reason>` stdout line and exits `1`, and `<reason>` follows
+///   the runtime's documented `unsupported` convention ([`caught_unsupported_reason`]).
+///
+/// `probe_wrapped` must be `true` only for the expression cases ([`CaseKind::Eval`] and
+/// [`compare_expr`]), whose stdout is the probe's self-terminating line; the module-run
+/// cases print `~w` of a result (a different shape), so the caught-signal detection is
+/// deliberately disabled for them. Every other exit status is a genuine observation.
+fn classify_rust(observation: runtime::Observation, probe_wrapped: bool) -> SideResult {
     if observation.exit_code == Some(runtime::UNSUPPORTED_EXIT_CODE) {
-        SideResult::unsupported(unsupported_reason(&observation))
-    } else {
-        SideResult::observed(observation)
+        return SideResult::unsupported(unsupported_reason(&observation));
+    }
+    if probe_wrapped {
+        if let Some(reason) = caught_unsupported_reason(&observation) {
+            return SideResult::unsupported(format!(
+                "beam_rt: unsupported (caught by the probe): {reason}"
+            ));
+        }
+    }
+    SideResult::observed(observation)
+}
+
+/// The documented capability-gap reason when the **probe caught** the runtime's raise.
+///
+/// An expression case wraps the expression in
+/// `try (EXPR) of V -> io:format("ok ~w~n", [V]), halt(0) catch C:R -> io:format("exception ~w ~w~n", [C, R]), halt(1) end.`
+/// so a raise inside the expression is *caught* and printed as exactly one stdout line
+/// `exception <class> <reason>` with exit status `1` — it never reaches the CLI's exit-3
+/// signal. This recognises the narrow, documented slice of that protocol that is a
+/// capability gap and returns the reason in the same stripped form the runtime uses:
+///
+/// * the exit status is `1`;
+/// * stdout is **exactly one** line, of the shape `exception <class> <reason>` with
+///   `<class>` one of `error`/`exit`/`throw`;
+/// * `<reason>`, after stripping one pair of surrounding `'…'` quotes, starts with the
+///   runtime's `unsupported` prefix and the remainder is empty or begins with `:`, `_` or
+///   whitespace; the returned reason is that remainder with the leading `:`/`_`/whitespace
+///   stripped — exactly `crates/beam_rt/src/error.rs::unsupported_reason`'s rule.
+///
+/// Everything else — a genuine Erlang reason such as `badarg`, `system_limit`,
+/// `function_clause`, or a free-form message like `'erlang:open_port/2 is not a BIF'` — is
+/// `None`. The detection is narrow by construction: it can only ever fire on the documented
+/// convention, so it can never fabricate a capability gap out of a real divergence.
+fn caught_unsupported_reason(observation: &runtime::Observation) -> Option<String> {
+    if observation.exit_code != Some(1) {
+        return None;
+    }
+    let stdout = std::str::from_utf8(&observation.stdout).ok()?;
+    // The probe's `~n` is mandatory, and the line must be the *only* one.
+    let line = stdout.strip_suffix('\n')?;
+    if line.contains('\n') || line.contains('\r') {
+        return None;
+    }
+    let rest = line.strip_prefix(PROBE_EXCEPTION_PREFIX)?;
+    let (class, reason) = rest.split_once(' ')?;
+    if !matches!(class, "error" | "exit" | "throw") {
+        return None;
+    }
+    let reason = strip_surrounding_quotes(reason);
+    let after_prefix = reason.strip_prefix(UNSUPPORTED_REASON_PREFIX)?;
+    let begins_with_marker = after_prefix.is_empty()
+        || after_prefix.starts_with(':')
+        || after_prefix.starts_with('_')
+        || after_prefix.starts_with(char::is_whitespace);
+    if !begins_with_marker {
+        return None;
+    }
+    Some(
+        after_prefix
+            .trim_start_matches(|c: char| c == ':' || c == '_' || c.is_whitespace())
+            .to_string(),
+    )
+}
+
+/// `s` with one pair of surrounding single quotes removed, if it has them.
+///
+/// The probe renders the reason with `~w`, so an atom that needs quoting arrives as
+/// `'unsupported_opcode: …'`; a bare atom (`badarg`) has no quotes to strip.
+fn strip_surrounding_quotes(s: &str) -> &str {
+    match s.strip_prefix('\'').and_then(|inner| inner.strip_suffix('\'')) {
+        Some(inner) => inner,
+        None => s,
     }
 }
 
@@ -321,6 +417,11 @@ struct RunPlan {
     rust_argv: Vec<String>,
     observables: Observables,
     golden: Option<Golden>,
+    /// Whether the Rust side's stdout is the self-terminating **probe** line
+    /// (`exception <class> <reason>` on failure), i.e. an expression case. Enables the
+    /// caught-capability-gap classification ([`classify_rust`]); `false` for module-run
+    /// cases, whose stdout is `~w` of a result.
+    probe_wrapped: bool,
 }
 
 /// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own
@@ -337,7 +438,10 @@ fn argv_for(eval: &str, extra_argv: &[&str], pa: &[String]) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::{argv_for, classify_rust, rust_unsupported_reason, unsupported_reason};
+    use super::{
+        argv_for, caught_unsupported_reason, classify_rust, rust_unsupported_reason,
+        unsupported_reason,
+    };
     use crate::compare::SideResult;
     use crate::corpus::{cases, find_case, probe_expr, CaseKind, Probe};
     use crate::runtime::{Observation, RuntimeId, RuntimeSource, RuntimeSpec, UNSUPPORTED_EXIT_CODE};
@@ -436,19 +540,22 @@ mod tests {
             b"",
             b"beam_rt: unsupported: cannot evaluate \"length([a,b,c])\"\n",
         );
-        let side = classify_rust(exit_three);
-        assert!(!side.is_observed(), "an exit-3 observation is not observed");
-        assert_eq!(
-            side.unsupported_reason(),
-            Some("beam_rt: unsupported: cannot evaluate \"length([a,b,c])\""),
-            "the reason carries the runtime's stderr line"
-        );
+        // The exit-3 signal is honoured regardless of the case kind.
+        for probe_wrapped in [false, true] {
+            let side = classify_rust(exit_three.clone(), probe_wrapped);
+            assert!(!side.is_observed(), "an exit-3 observation is not observed");
+            assert_eq!(
+                side.unsupported_reason(),
+                Some("beam_rt: unsupported: cannot evaluate \"length([a,b,c])\""),
+                "the reason carries the runtime's stderr line"
+            );
+        }
     }
 
     #[test]
     fn any_other_exit_status_is_a_genuine_observation() {
         for (exit_code, stdout) in [(0, b"5\n".as_slice()), (1, b"".as_slice())] {
-            let side = classify_rust(observation(exit_code, stdout, b""));
+            let side = classify_rust(observation(exit_code, stdout, b""), true);
             assert!(side.is_observed(), "exit {exit_code} is a real observation");
             assert_eq!(side.observation().expect("observed").exit_code, Some(exit_code));
         }
@@ -472,9 +579,122 @@ mod tests {
 
     #[test]
     fn an_unsupported_classification_is_never_agreement() {
-        // The unit-level guarantee behind the harness fix: an exit-3 side can only be
-        // `Unsupported` in the comparison, never `Agree`.
-        let side = classify_rust(observation(UNSUPPORTED_EXIT_CODE, b"", b"x\n"));
-        assert!(matches!(side, SideResult::Unsupported { .. }));
+        // The unit-level guarantee behind the harness fix: an `Unsupported` side (either the
+        // exit-3 signal or a probe-caught capability gap) can only be `Unsupported` in the
+        // comparison, never `Agree`.
+        let exit_three = classify_rust(observation(UNSUPPORTED_EXIT_CODE, b"", b"x\n"), false);
+        assert!(matches!(exit_three, SideResult::Unsupported { .. }));
+
+        let caught = classify_rust(
+            observation(1, b"exception error 'unsupported_opcode: nope'\n", b""),
+            true,
+        );
+        assert!(matches!(caught, SideResult::Unsupported { .. }));
+        assert!(!caught.is_observed());
+    }
+
+    /// The probe *caught* the runtime's documented capability-gap raise: the reason is
+    /// stripped exactly as the runtime's `unsupported_reason` does, and the side becomes
+    /// `Unsupported` — never a `mismatch`.
+    #[test]
+    fn a_probe_caught_capability_gap_is_classified_unsupported() {
+        // The engine's `unsupported_opcode: <what>` reason, quoted by the `~w` of the probe.
+        let side = classify_rust(
+            observation(
+                1,
+                b"exception error 'unsupported_opcode: widened opcode not yet executed'\n",
+                b"",
+            ),
+            true,
+        );
+        assert!(!side.is_observed(), "a capability gap is not an observation");
+        assert_eq!(
+            side.unsupported_reason(),
+            Some("beam_rt: unsupported (caught by the probe): opcode: widened opcode not yet executed"),
+            "the reason is stripped by the runtime's rule"
+        );
+
+        // The BIF registry's bare `unsupported_bif` atom (no surrounding quotes).
+        let side = classify_rust(
+            observation(1, b"exception error unsupported_bif\n", b""),
+            true,
+        );
+        assert_eq!(
+            side.unsupported_reason(),
+            Some("beam_rt: unsupported (caught by the probe): bif")
+        );
+    }
+
+    /// NARROWNESS IS THE CONTRACT: a genuine Erlang reason must stay an observation, so a
+    /// real divergence is never laundered into a capability gap.
+    #[test]
+    fn a_genuine_caught_reason_is_still_an_observation() {
+        for (stdout, what) in [
+            (b"exception error badarg\n".as_slice(), "badarg"),
+            (b"exception throw noproc\n".as_slice(), "a throw reason"),
+            (b"exception exit normal\n".as_slice(), "an exit reason"),
+            (b"exception error system_limit\n".as_slice(), "system_limit"),
+            (
+                b"exception error 'erlang:open_port/2 is not a BIF'\n".as_slice(),
+                "a free-form diagnostic",
+            ),
+            (
+                b"exception error 'cannot find init.beam in the code path'\n".as_slice(),
+                "a boot diagnostic",
+            ),
+            // A reason that merely *contains* the prefix is not the convention.
+            (
+                b"exception error 'not an unsupported thing'\n".as_slice(),
+                "the prefix in the middle",
+            ),
+        ] {
+            let side = classify_rust(observation(1, stdout, b""), true);
+            assert!(side.is_observed(), "{what} must stay an observation");
+            assert_eq!(side.unsupported_reason(), None, "{what}");
+        }
+    }
+
+    /// The detection is shape-strict: a two-line stdout, a non-probe stdout, a bad class, a
+    /// missing reason and a non-`1` exit are all observations.
+    #[test]
+    fn a_malformed_probe_line_is_not_a_capability_gap() {
+        for (exit_code, stdout, what) in [
+            (
+                1,
+                b"ok 1\nexception error 'unsupported_opcode: x'\n".as_slice(),
+                "a two-line stdout",
+            ),
+            (1, b"hello\n".as_slice(), "a non-probe stdout"),
+            (1, b"exception warning 'unsupported_opcode: x'\n".as_slice(), "a non-probe class"),
+            (1, b"exception error\n".as_slice(), "a missing reason"),
+            (0, b"exception error 'unsupported_opcode: x'\n".as_slice(), "a success exit"),
+            (1, b"exception error 'unsupported_opcode: x'".as_slice(), "no trailing newline"),
+        ] {
+            assert_eq!(
+                caught_unsupported_reason(&observation(exit_code, stdout, b"")),
+                None,
+                "{what} is not the probe failure protocol"
+            );
+            let side = classify_rust(observation(exit_code, stdout, b""), true);
+            assert!(side.is_observed(), "{what} stays an observation");
+        }
+    }
+
+    /// The caught-signal detection only fires for **probe-wrapped** cases; a module-run case
+    /// prints `~w` of a result, so a same-shaped stdout there is an ordinary observation.
+    #[test]
+    fn the_caught_signal_only_fires_for_probe_wrapped_cases() {
+        let observation = observation(1, b"exception error 'unsupported_opcode: x'\n", b"");
+        assert!(
+            matches!(
+                classify_rust(observation.clone(), true),
+                SideResult::Unsupported { .. }
+            ),
+            "a probe-wrapped case is classified"
+        );
+        assert!(
+            classify_rust(observation, false).is_observed(),
+            "a module-run case is never classified by the probe shape"
+        );
     }
 }
