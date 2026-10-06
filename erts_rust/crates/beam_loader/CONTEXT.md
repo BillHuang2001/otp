@@ -115,7 +115,11 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   - **maps** — `GetMapElements { fail, source, pairs: Vec<(Operand, Operand)> }`,
     `HasMapFields { fail, source, keys: Vec<Operand> }`,
     `PutMapAssoc { fail, source, dst, live, pairs }`, `PutMapExact { fail, source, dst, live, pairs }`.
-  - **records** — `UpdateRecord { hint: Operand, size: u32, src, dst, updates: Vec<(Operand, Operand)> }`.
+  - **records** — `UpdateRecord { hint: Operand, size: u32, src, dst, updates: Vec<(Operand, Operand)> }`,
+    `IsAnyNativeRecord { fail: Label, src: Operand }` (the `erlang:is_record/1` guard, generic opcode
+    `186`: branches to `fail` iff `src` is **not** a native record — `emu/instrs.tab:1323`, operand shape
+    `f xy` in `emu/ops.tab:1634`; deliberately a new `Instr` variant rather than a `TestKind`, which the
+    engine matches exhaustively).
   - **exceptions** — `Badmatch { value }`, `CaseEnd { value }`, `IfEnd`, `Try { frame, fail: Label }`,
     `Catch { frame, fail }`, `TryCase { frame }`, `TryEnd { frame }`, `TryCaseEnd { value }`,
     `CatchEnd { frame }`, `Raise { trace, value }`, `Badrecord { value }`, `BuildStacktrace`, `RawRaise`.
