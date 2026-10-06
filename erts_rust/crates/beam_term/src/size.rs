@@ -40,19 +40,16 @@
 use crate::bitstring::{heap_bits_size_words, sub_bits_parts};
 use crate::boxed::{
     boxed_val, header_arity, is_boxed, is_flatmap_header, map_header_val, thing_arityval,
-    ERL_FUN_SIZE, ERL_SUB_BITS_SIZE, HEADER_BIN_REF,
+    ERL_SUB_BITS_SIZE, HEADER_BIN_REF,
 };
 use crate::eterm::Eterm;
+use crate::fun::{fun_desc_words, fun_kind_of_header, fun_num_free, fun_words};
 use crate::immediate::is_immediate;
 use crate::list::{car, cdr, is_list};
 use crate::refc::ERL_REFC_BITS_SIZE;
 use crate::tag::{
     ARITYVAL_SUBTAG, FUN_SUBTAG, MAP_SUBTAG, RECORD_SUBTAG, SUB_BITS_SUBTAG, TAG_HEADER_MASK,
 };
-
-/// `FUN_HEADER_ENV_SIZE_OFFS` (`erl_fun.h`): the bit offset of a fun header's
-/// environment-size (`fun_num_free`) field.
-const FUN_HEADER_ENV_SIZE_OFFS: u32 = 16;
 
 /// The flat number of heap words the term graph `a` occupies.
 ///
@@ -98,12 +95,17 @@ pub fn size_object(a: Eterm) -> usize {
                     }
                 }
                 FUN_SUBTAG => {
-                    let num_free = ((header.raw() >> FUN_HEADER_ENV_SIZE_OFFS) & 0xFF) as usize;
-                    // ERL_FUN_SIZE does not include the environment.
-                    total += ERL_FUN_SIZE + num_free;
+                    // A fun block is `1 (header) + desc_words(kind) + num_free`
+                    // (see `crate::fun`): the M1 inlined descriptor replaces the C
+                    // `entry` pointer, so the env does **not** start at the C
+                    // `ERL_FUN_SIZE`. `fun_words` is that same expression.
+                    let kind = fun_kind_of_header(header);
+                    let num_free = fun_num_free(header);
+                    total += fun_words(kind, num_free);
+                    let env = 1 + fun_desc_words(kind);
                     for i in 0..num_free {
                         // SAFETY: environment word `i` is within the payload.
-                        let elem = unsafe { *p.add(ERL_FUN_SIZE + i) };
+                        let elem = unsafe { *p.add(env + i) };
                         if !is_immediate(elem) {
                             work.push(elem);
                         }
@@ -194,6 +196,7 @@ mod tests {
         map_header_type, HEADER_FLONUM,
     };
     use crate::heap::Heap;
+    use crate::fun::{write_fun_external, write_fun_imported, write_fun_local, FunKind, FunPid};
     use crate::immediate::{
         make_atom, make_internal_pid, make_internal_port, make_pid_data, make_port_data,
         make_small, NIL,
@@ -206,6 +209,7 @@ mod tests {
     };
     use crate::tuple::tuple0;
     use crate::AtomTable;
+    use crate::Atom;
 
     #[test]
     fn immediates_have_zero_size() {
@@ -251,6 +255,66 @@ mod tests {
     }
 
     #[test]
+    fn funs_are_header_plus_descriptor_plus_env() {
+        // A local fun is `1 (header) + 2 (uniq, index) + num_free`.
+        let mut heap = Heap::new(64);
+        let free = [make_small(1), make_small(2)];
+        // SAFETY: `fun_words` sizes the block exactly; the heap owns it.
+        let local = unsafe {
+            let hp = heap.alloc_words(fun_words(FunKind::Local, free.len())).unwrap();
+            write_fun_local(hp, 2, 0x1234, 5, &free).unwrap()
+        };
+        assert_eq!(size_object(local), 3 + 2);
+
+        // An exported (`EXPORT_EXT`) fun has no environment: `1 + 2`.
+        // SAFETY: `fun_words` sizes the block exactly; the heap owns it.
+        let external = unsafe {
+            let hp = heap.alloc_words(fun_words(FunKind::External, 0)).unwrap();
+            write_fun_external(hp, 2, Atom::from_raw(1), Atom::from_raw(2)).unwrap()
+        };
+        assert_eq!(size_object(external), 3);
+
+        // A wire fun is `1 (header) + 10 (descriptor) + num_free`.
+        for n in [0usize, 1, 3] {
+            let env = vec![make_small(9); n];
+            // SAFETY: `fun_words` sizes the block exactly; the heap owns it.
+            let imported = unsafe {
+                let hp = heap.alloc_words(fun_words(FunKind::Imported, n)).unwrap();
+                write_fun_imported(
+                    hp,
+                    0,
+                    Atom::from_raw(1),
+                    &[0u8; 16],
+                    1,
+                    2,
+                    3,
+                    FunPid {
+                        node: Atom::from_raw(2),
+                        number: 4,
+                        serial: 5,
+                        creation: 6,
+                    },
+                    &env,
+                )
+                .unwrap()
+            };
+            assert_eq!(size_object(imported), 11 + n, "{n} free variables");
+        }
+    }
+
+    #[test]
+    fn fun_environment_terms_are_counted() {
+        let mut heap = Heap::new(64);
+        let inner = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+        let free = [inner, make_small(0)];
+        // SAFETY: `fun_words` sizes the block exactly; the heap owns it.
+        let local = unsafe {
+            let hp = heap.alloc_words(fun_words(FunKind::Local, free.len())).unwrap();
+            write_fun_local(hp, 1, 1, 0, &free).unwrap()
+        };
+        // 5 words for the fun plus the 3-word tuple it closes over.
+        assert_eq!(size_object(local), 5 + 3);
+    }    #[test]
     fn boxed_leaf_objects_are_header_plus_payload() {
         // A 64-bit flonum is a 1-word thing => 2 words total.
         let float_words: [Eterm; 2] = [HEADER_FLONUM, Eterm::from_raw(0)];

@@ -20,7 +20,8 @@ use core::fmt;
 pub enum TermError {
     /// A value did not fit in a 60-bit BEAM small integer.
     SmallIntOutOfRange,
-    /// An arity exceeded `MAX_ARITYVAL`, or an element index was out of range.
+    /// An arity exceeded `MAX_ARITYVAL`, a fun header field exceeded
+    /// [`crate::fun::FUN_MAX_FIELD`] (255), or an element index was out of range.
     ArityOutOfRange,
     /// A term arena had no room left for the requested number of words.
     HeapExhausted,
@@ -37,6 +38,10 @@ pub enum TermError {
     /// count's bit count (`bytes.len() * 8`) overflowed `usize` (see
     /// [`crate::bitstring`]).
     BadBitstring,
+    /// A fun/export layout helper or accessor was applied to a term that is not a
+    /// fun at all, or to a fun of the wrong kind for that accessor (see
+    /// [`crate::fun`]).
+    BadFun,
 }
 
 impl fmt::Display for TermError {
@@ -49,6 +54,7 @@ impl fmt::Display for TermError {
             TermError::AtomIndexOutOfRange => "atom index out of range",
             TermError::BadMap => "not a map",
             TermError::BadBitstring => "invalid bitstring byte count",
+            TermError::BadFun => "not a fun",
         };
         f.write_str(msg)
     }
@@ -71,6 +77,7 @@ impl core::error::Error for TermError {}
 /// | `AtomIndexOutOfRange` | `SystemLimit` | `system_limit` |
 /// | `BadMap` | `BadArg` | `badarg` |
 /// | `BadBitstring` | `BadArg` | `badarg` |
+/// | `BadFun` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
         match error {
@@ -89,6 +96,9 @@ impl From<TermError> for BeamError {
             TermError::BadMap => BeamError::BadArg,
             // A bitstring built from an inconsistent byte count: an argument failure.
             TermError::BadBitstring => BeamError::BadArg,
+            // A non-fun (or wrong-kind fun) reached a fun layout helper: an argument
+            // failure.
+            TermError::BadFun => BeamError::BadArg,
         }
     }
 }
@@ -112,6 +122,7 @@ mod tests {
             TermError::BadBitstring.to_string(),
             "invalid bitstring byte count"
         );
+        assert_eq!(TermError::BadFun.to_string(), "not a fun");
     }
 
     #[test]
@@ -157,6 +168,7 @@ mod tests {
             BeamError::from(TermError::BadBitstring),
             BeamError::BadArg
         ));
+        assert!(matches!(BeamError::from(TermError::BadFun), BeamError::BadArg));
     }
 
     #[test]

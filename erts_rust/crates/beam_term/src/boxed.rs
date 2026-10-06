@@ -7,6 +7,7 @@
 
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
+use crate::fun::{FUN_HEADER_IMPORTED_OFFS, FUN_HEADER_KIND_OFFS};
 use crate::tag::{
     ARITYVAL_SUBTAG, BIG_TAG_MASK, BIN_REF_SUBTAG, BITSTRING_TAG_MASK, EXTERNAL_TAG_MASK,
     EXTERNAL_PID_SUBTAG, EXTERNAL_PORT_SUBTAG, EXTERNAL_REF_SUBTAG, FLOAT_SUBTAG, FUN_SUBTAG,
@@ -218,6 +219,40 @@ pub const fn is_hashmap_header(x: Eterm) -> bool {
 #[inline]
 pub const fn is_fun_header(x: Eterm) -> bool {
     (x.raw() & HEADER_SUBTAG_MASK) == FUN_SUBTAG
+}
+
+/// `is_external_fun(FunThing)` (`erl_fun.h:87-88`) — the fun header's external
+/// kind bit ([`FUN_HEADER_KIND_OFFS`], bit 24) is set.
+///
+/// Unlike the C macro (`!!(thing_word >> FUN_HEADER_KIND_OFFS)`, true for any bit
+/// at or above 24), this takes the bit alone, so a
+/// [`FunKind::Imported`](crate::fun::FunKind::Imported) header (bit 25) reads as
+/// non-external — exactly as a C reader of that word would classify it.
+///
+/// Takes a **header word**, not a term (like [`is_fun_header`]); use
+/// [`is_any_fun`] to test a term.
+#[inline]
+pub const fn is_external_fun(x: Eterm) -> bool {
+    (x.raw() >> FUN_HEADER_KIND_OFFS) & 1 != 0
+}
+
+/// `is_imported_fun(FunThing)` — the wire-imported kind bit
+/// ([`FUN_HEADER_IMPORTED_OFFS`], bit 25, this crate's extension) is set. Valid
+/// only while the external bit is clear; see [`crate::fun`].
+///
+/// Takes a **header word**, not a term.
+#[inline]
+pub const fn is_imported_fun(x: Eterm) -> bool {
+    (x.raw() >> FUN_HEADER_IMPORTED_OFFS) & 1 != 0
+}
+
+/// `is_local_fun(FunThing)` (`erl_fun.h:89-90`) — the fun header is neither a C
+/// external fun nor a wire-imported one.
+///
+/// Takes a **header word**, not a term.
+#[inline]
+pub const fn is_local_fun(x: Eterm) -> bool {
+    !is_external_fun(x) && !is_imported_fun(x)
 }
 
 /// `is_record_header(x)`.
@@ -521,6 +556,21 @@ mod tests {
         }
         assert!(!unsafe { is_float(make_small(1)) });
         assert!(!unsafe { is_float(NIL) });
+    }
+
+    #[test]
+    fn fun_header_kind_predicates() {
+        // MAKE_FUN_HEADER(arity, num_free, external) | imported bit (bit 25).
+        let local = Eterm::from_raw(FUN_SUBTAG | (2usize << 8) | (1usize << 16));
+        let external = Eterm::from_raw(FUN_SUBTAG | (2usize << 8) | (1usize << 24));
+        let imported = Eterm::from_raw(FUN_SUBTAG | (1usize << 25));
+        assert!(is_fun_header(local) && is_fun_header(external) && is_fun_header(imported));
+        assert!(is_local_fun(local));
+        assert!(!is_external_fun(local) && !is_imported_fun(local));
+        assert!(is_external_fun(external));
+        assert!(!is_local_fun(external) && !is_imported_fun(external));
+        assert!(is_imported_fun(imported));
+        assert!(!is_external_fun(imported) && !is_local_fun(imported));
     }
 
     #[test]
