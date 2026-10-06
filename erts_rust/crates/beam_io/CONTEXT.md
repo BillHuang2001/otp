@@ -140,6 +140,12 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   - `take_exit_status(id) -> Result<Option<i32>>` — the exit-status seam: takes the reaped status of the OS
     child behind `id` **once** (`Ok(None)` for an unknown id's driver with no child, a child that has not
     exited, or a status already reported; `BeamError::BadArg` for an unknown id).
+  - `schedule_timeout(id, deadline) -> Result<()>` / `cancel_timeout(id) -> Result<bool>` /
+    `next_deadline() -> Option<Instant>` — the runtime's explicit port-timer entry points (`next_deadline` is the
+    minimum over live drivers' `Driver::next_timeout`, for clamping a poll timeout); `BadArg` for an unknown id.
+  - `notify_port_exit(poller, id, reason: PortExitReason) -> Result<()>` — the port-exit notification channel:
+    invokes the driver's `Driver::port_exit` **at most once** per port (a repeat is a no-op), leaves the port live
+    with its registrations armed, and is independent of the later `close`/`stop`; `BadArg` for an unknown/released id.
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
 - `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the poller
