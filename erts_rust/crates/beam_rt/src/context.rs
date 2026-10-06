@@ -434,7 +434,7 @@ impl<'a> RuntimeContext<'a> {
             // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
             // really starts an OS process and `erlang:port_info/1,2` answers from the
             // runtime's own port table (see `crate::port`).
-            let mut ports = RuntimePorts::new(ports_handle, Rc::clone(&atoms));
+            let mut ports = RuntimePorts::new(ports_handle, Rc::clone(&atoms), self_pid);
             let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                 .with_atom_interner(&mut pending)
                 .with_fun_caller(&mut bridge)
