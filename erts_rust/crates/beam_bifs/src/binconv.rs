@@ -92,12 +92,17 @@
 //! * **`local`/`deterministic` (and `iovec`/`fragment`) options are not
 //!   supported** — `badarg`. A `LOCAL_EXT` image needs the node's local hash, which is
 //!   `beam_rt`'s/`beam_dist`'s state, not this crate's.
-//! * **`beam_codec` encodes only *external* pids/ports/refs.** An internal pid
-//!   (`self()`) is not representable, so `term_to_binary(self())` reports the
-//!   codec's `unsupported_external_term` error instead of the oracle's
-//!   `NEW_PID_EXT`. A decoded `NEW_PID_EXT` stays an external id, so
-//!   `binary_to_term` ∘ `term_to_binary` round-trips the wire term, not an
-//!   internal pid.//! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
+//! * **Internal pid/port ids need a resolvable local node.** `self()` and an
+//!   internal port are 60-bit `Eterm` immediates carrying no node identity, so
+//!   `term_to_binary` writes them as the oracle's `NEW_PID_EXT` (`88`) /
+//!   `V4_PORT_EXT` (`120`) only when the context can name its local node — the
+//!   [`LocalNode`](crate::context::LocalNode) hook, else the M1 runtime's fixed
+//!   `nonode@nohost`/creation-0 identity when that atom is interned (see
+//!   [`BifContext::local_node`]). With no resolvable local node an internal id
+//!   stays the codec's `unsupported_external_term` error, never a wrong image.
+//!   A decoded `NEW_PID_EXT` stays an *external* id, so `binary_to_term` ∘
+//!   `term_to_binary` round-trips the wire term, not an internal pid.
+//! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
 //!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
 //!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
 //!   `system_limit` (the same documented gap as
@@ -132,9 +137,7 @@
 //! [`crate::context`] documents for the hook.
 
 use beam_codec::compress::compress as zlib_compress;
-use beam_codec::{
-    decode_term, encode_term, Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC,
-};
+use beam_codec::{decode_term, Decoder, Encoder, MinorVersion, COMPRESSED_EXT, VERSION_MAGIC};
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm};
 
@@ -590,8 +593,19 @@ fn atom_from_binary(
 // ---------------------------------------------------------------------------
 
 /// `term_to_binary(Term)` — the `beam_codec` external term image.
+///
+/// The default `{minor_version, 2}` flavour with no compression, so the image is
+/// exactly [`T2bOptions::default`]'s; an internal pid/port id is encoded through the
+/// context's local node (see [`encode_body`]).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a malformed option list
+/// or an unknown/out-of-range option; the codec's errors otherwise (e.g.
+/// `unsupported_external_term` for an internal id with no resolvable local node, or a
+/// tag the codec cannot write).
 fn term_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let bytes = encode_term(args[0], ctx.atoms())?;
+    let bytes = encode_image(ctx, args[0], &T2bOptions::default())?;
     make_bin(ctx, &bytes)
 }
 
@@ -696,10 +710,13 @@ fn parse_term_to_binary_options(atoms: &AtomTable, opts: Eterm) -> Result<T2bOpt
 
 /// Encodes `term` as the `term_to_binary/2` image `options` select.
 ///
+/// Takes `ctx` mutably because the local-node identity is read through
+/// [`BifContext::local_node`] (see [`encode_body`]).
+///
 /// # Errors
 ///
 /// The encoder's and zlib's errors (see [`encode_body`]).
-fn encode_image(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
     let body = encode_body(ctx, term, options)?;
     match options.compression {
         None => Ok(plain_image(&body)),
@@ -719,13 +736,22 @@ fn encode_image(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Resu
 /// Because the flavour is threaded through the *encoder*, `compressed` (which deflates
 /// exactly these bytes) combines with any minor version.
 ///
+/// The context's local node identity is read **first** (it borrows `ctx` mutably) and
+/// installed on the encoder, so an internal pid/port id encodes as the oracle's
+/// `NEW_PID_EXT`/`V4_PORT_EXT`; with no resolvable local node the encoder leaves it
+/// unencodable (see [`BifContext::local_node`]).
+///
 /// # Errors
 ///
 /// The encoder's errors: `unsupported_external_term` for a tag the codec cannot write
-/// (an internal pid, an off-heap `BinRef`), `SystemLimit` for a value beyond a wire
-/// bound, and `error:unsupported_bif` for the local (`make_fun3`) fun that has no
-/// faithful wire image.
-fn encode_body(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+/// (an internal pid/port id with no resolvable local node, an off-heap `BinRef`),
+/// `SystemLimit` for a value beyond a wire bound, and `error:unsupported_bif` for the
+/// local (`make_fun3`) fun that has no faithful wire image.
+fn encode_body(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
+    // The local node identity borrows `ctx` mutably, and the encoder holds an
+    // immutable borrow of `ctx`'s atom table for its whole lifetime — so read the
+    // node first and install it afterwards.
+    let local = ctx.local_node();
     // The body carries no version byte; `Encoder::new_body` plus the selected
     // minor version reproduces `term_to_binary`'s tag set exactly.
     let minor_version = match options.minor_version {
@@ -734,6 +760,9 @@ fn encode_body(ctx: &BifContext<'_>, term: Eterm, options: &T2bOptions) -> Resul
         _ => MinorVersion::V2,
     };
     let mut encoder = Encoder::new_body(ctx.atoms()).with_minor_version(minor_version);
+    if let Some((node, creation)) = local {
+        encoder = encoder.with_local_node(node, creation);
+    }
     encoder.encode(term)?;
     Ok(encoder.finish())
 }
@@ -903,7 +932,7 @@ mod tests {
     use beam_alloc::Heap;
     use beam_codec::error::is_unsupported;
     use beam_codec::term::external_pid_parts;
-    use beam_process::ProcessId;
+    use beam_process::{PortId, ProcessId};
     use beam_term::AtomTable;
     use std::cell::RefCell;
     use std::rc::Rc;
@@ -2139,21 +2168,118 @@ mod tests {
         });
     }
 
-    #[test]
-    fn internal_pids_are_not_encodable() {
-        with_ctx(|ctx| {
-            // `self()` is an *internal* pid; the codec carries only the external
-            // wire forms, so encoding one reports `unsupported` rather than the
-            // oracle's `NEW_PID_EXT` (an open limitation, not a codec gap).
-            let self_pid = ctx.self_pid().to_eterm();
-            let err = term_to_binary_1(ctx, &[self_pid]).unwrap_err();
-            assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+    /// The oracle's `NEW_PID_EXT` (`88`) image for a pid on `nonode@nohost`: the node
+    /// as `SMALL_ATOM_UTF8_EXT` (`119`) then the 4-byte id, serial and creation —
+    /// byte-identical to
+    /// `erl -noshell -eval 'io:format("~w~n",[term_to_binary(list_to_pid("<0.1.0>"))])'`
+    /// for `(1, 0, 0)`.
+    fn pid_image(number: u32, serial: u32, creation: u32) -> Vec<u8> {
+        let mut image = vec![VERSION_MAGIC, 88, 119, 13];
+        image.extend_from_slice(b"nonode@nohost");
+        image.extend_from_slice(&number.to_be_bytes());
+        image.extend_from_slice(&serial.to_be_bytes());
+        image.extend_from_slice(&creation.to_be_bytes());
+        image
+    }
 
-            // A term that merely *contains* an internal pid fails the same way.
+    /// The oracle's `V4_PORT_EXT` (`120`) image for a port on `nonode@nohost`: the node
+    /// then the 8-byte id and 4-byte creation.
+    fn port_image(number: u64, creation: u32) -> Vec<u8> {
+        let mut image = vec![VERSION_MAGIC, 120, 119, 13];
+        image.extend_from_slice(b"nonode@nohost");
+        image.extend_from_slice(&number.to_be_bytes());
+        image.extend_from_slice(&creation.to_be_bytes());
+        image
+    }
+
+    #[test]
+    fn internal_pids_encode_via_the_local_node() {
+        with_ctx(|ctx| {
+            // `self()` is an *internal* pid (this harness's `ProcessId::new(1, 0)`);
+            // the default `nonode@nohost`/creation-0 fallback lets it encode as the
+            // oracle's `NEW_PID_EXT` rather than `unsupported_external_term`.
+            let self_pid = ctx.self_pid().to_eterm();
+            let image = text(term_to_binary_1(ctx, &[self_pid]).unwrap());
+            assert_eq!(image, pid_image(1, 0, 0));
+
+            // A pid nested inside a tuple encodes the same way, inside the tuple's
+            // `SMALL_TUPLE_EXT` (`104`) frame.
             let nested = ctx.tuple(&[self_pid]).expect("fits");
-            let err = term_to_binary_1(ctx, &[nested]).unwrap_err();
-            assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+            let nested_image = text(term_to_binary_1(ctx, &[nested]).unwrap());
+            let mut expected = vec![VERSION_MAGIC, 104, 1];
+            expected.extend_from_slice(&pid_image(1, 0, 0)[1..]);
+            assert_eq!(nested_image, expected);
+
+            // The `term_to_binary/2` option path threads the local node too (the tiny
+            // body makes `compressed` revert to the plain image, `external.c:2250-2301`).
+            let options = compressed_option(ctx);
+            let optioned = text(term_to_binary_2(ctx, &[self_pid, options]).unwrap());
+            assert_eq!(optioned, pid_image(1, 0, 0));
+
+            // The round trip decodes to an *external* pid carrying the same
+            // node/number/serial/creation (the wire form, not an internal id).
+            let back = binary_to_term_1(ctx, &[bin(&image)]).unwrap();
+            let (node, number, serial, creation) =
+                external_pid_parts(back).expect("an external pid");
+            assert_eq!(ctx.atoms().name(atom_val(node)), Some("nonode@nohost"));
+            assert_eq!((number, serial, creation), (1, 0, 0));
         });
+    }
+
+    /// A minimal [`LocalNode`](crate::context::LocalNode) test double answering a fixed
+    /// `(node, creation)`.
+    struct StubNode {
+        node: Atom,
+        creation: u32,
+    }
+
+    impl crate::context::LocalNode for StubNode {
+        fn local_node(&mut self) -> Option<(Atom, u32)> {
+            Some((self.node, self.creation))
+        }
+    }
+
+    #[test]
+    fn local_node_hook_supplies_the_creation_and_the_port_image() {
+        let mut heap = heap();
+        let atoms = table();
+        let node = atoms.lookup("nonode@nohost").expect("seeded");
+        let mut hook = StubNode {
+            node,
+            creation: 7,
+        };
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(5, 3)).with_local_node(&mut hook);
+
+        // The hook's creation (7) is threaded into the pid image, not the fallback's 0;
+        // the id and serial come from the pid immediate (`ProcessId::new(5, 3)`).
+        let pid = ctx.self_pid().to_eterm();
+        let image = text(term_to_binary_1(&mut ctx, &[pid]).unwrap());
+        assert_eq!(image, pid_image(5, 3, 7));
+
+        // An internal port encodes as the oracle's `V4_PORT_EXT` under the same node.
+        let port = PortId::new(3).to_eterm();
+        let image = text(term_to_binary_1(&mut ctx, &[port]).unwrap());
+        assert_eq!(image, port_image(3, 7));
+    }
+
+    #[test]
+    fn internal_pids_stay_unsupported_without_a_local_node() {
+        // A table that lacks `nonode@nohost` (and no `LocalNode` hook) leaves the
+        // internal id with no wire image — a typed `unsupported_external_term`, never a
+        // wrong image.
+        let mut heap = heap();
+        let mut atoms = AtomTable::new();
+        atoms.seed(["a", "b"].iter().copied());
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let self_pid = ctx.self_pid().to_eterm();
+        let err = term_to_binary_1(&mut ctx, &[self_pid]).unwrap_err();
+        assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
+
+        // A term that merely *contains* an internal pid fails the same way.
+        let nested = ctx.tuple(&[self_pid]).expect("fits");
+        let err = term_to_binary_1(&mut ctx, &[nested]).unwrap_err();
+        assert!(is_unsupported(&err), "expected unsupported, got {err:?}");
     }
 
     // -- registration -----------------------------------------------------
