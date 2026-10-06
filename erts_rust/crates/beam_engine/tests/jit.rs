@@ -621,3 +621,81 @@ fn a_non_small_operand_falls_back_to_the_interpreter_helper() {
         assert_eq!(format!("{jitted:?}"), format!("{interpreted:?}"));
     }
 }
+
+/// Compile `module` once, then run `function/arity` on **fresh machines** twice via
+/// [`JitBackend::run_compiled`] (no recompilation) and assert both runs yield
+/// `expected`; finally assert the provided one-shot [`JitBackend::run_export`]
+/// agrees. Generic over the backend so both native tiers are exercised the same way.
+fn compile_once_run_many<B: JitBackend>(
+    backend: &mut B,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    expected: Eterm,
+) {
+    let compiled = backend.compile(module).expect("compile the module");
+
+    for run in 0..2 {
+        let mut machine = Machine::new();
+        let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+        let got = backend
+            .run_compiled(&compiled, &mut machine, module, function, arity, args, &mut ctx)
+            .unwrap_or_else(|err| panic!("run_compiled, run {run}: {err:?}"));
+        assert_eq!(got, expected, "run {run} of the same artifact");
+    }
+
+    // A missing export on the compile-once path is a typed error, never a panic.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    assert!(
+        backend
+            .run_compiled(&compiled, &mut machine, module, Atom::MAX, 0, &[], &mut ctx)
+            .is_err(),
+        "a missing export must be a typed error on the compile-once path"
+    );
+
+    // The one-shot entry is `compile` + `run_compiled`: same observable result.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let one_shot = backend
+        .run_export(&mut machine, module, function, arity, args, &mut ctx)
+        .expect("run_export");
+    assert_eq!(one_shot, expected, "run_export must agree with run_compiled");
+}
+
+#[test]
+fn a_compiled_artifact_can_be_run_more_than_once() {
+    let module = slice_module();
+    let add = atom(&module, "add");
+    let fib = atom(&module, "fib");
+    let add_args = [make_small(2), make_small(3)];
+    let fib_args = [make_small(10)];
+
+    // The interpreter is the reference semantics.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let add_expected = machine
+        .run_export(&module, add, 2, &add_args, &mut ctx)
+        .expect("interpreter add/2");
+    assert_eq!(add_expected, make_small(5));
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let fib_expected = machine
+        .run_export(&module, fib, 1, &fib_args, &mut ctx)
+        .expect("interpreter fib/1");
+    assert_eq!(fib_expected, make_small(55));
+
+    compile_once_run_many(&mut BaselineJit::new(), &module, add, 2, &add_args, add_expected);
+    compile_once_run_many(&mut BaselineJit::new(), &module, fib, 1, &fib_args, fib_expected);
+
+    #[cfg(feature = "jit-cranelift")]
+    compile_once_run_many(
+        &mut beam_engine::jit::cranelift::CraneliftJit::new(),
+        &module,
+        add,
+        2,
+        &add_args,
+        add_expected,
+    );
+}

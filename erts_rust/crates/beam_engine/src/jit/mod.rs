@@ -121,10 +121,24 @@ impl Tier {
 
 /// A native execution tier for the typed IR.
 ///
-/// A backend owns whatever state compiling and running the IR needs (a code
-/// buffer, per-module caches, …), hence the `&mut self` receivers: [`compile`] may
-/// be called again for another module, and [`run_export`] may compile lazily on
-/// first use.
+/// A backend owns whatever state compiling the IR needs (a code buffer, per-module
+/// caches, …), hence the `&mut self` receiver on [`compile`] — it may be called
+/// again for another module and mutates that owned state.
+///
+/// # Compile once, run many
+///
+/// Compiling a [`Module`] and running it are **two separate operations**: [`compile`]
+/// produces this backend's [`Compiled`](JitBackend::Compiled) artifact, and
+/// [`run_compiled`](JitBackend::run_compiled) executes an export against an artifact
+/// the caller owns. A caller that runs the same module more than once should
+/// [`compile`] once and then call [`run_compiled`](JitBackend::run_compiled) as often
+/// as it likes — that is the whole point of the split, since compilation, not
+/// execution, dominates the cost of the naive path.
+///
+/// [`run_export`] is the one-shot convenience built on both: it compiles and
+/// immediately runs, and is a **provided** method with a single definition here so
+/// no backend can drift from it. A backend implements [`compile`] and
+/// [`run_compiled`](JitBackend::run_compiled) and gets the one-shot entry for free.
 ///
 /// The engine never picks a backend implicitly: [`available_tiers`] reports what is
 /// compiled in, [`Tier::is_available`] answers for one tier, and
@@ -134,6 +148,7 @@ impl Tier {
 /// *different* tier behind the caller's back.
 ///
 /// [`compile`]: JitBackend::compile
+/// [`run_compiled`]: JitBackend::run_compiled
 /// [`run_export`]: JitBackend::run_export
 pub trait JitBackend {
     /// The artifact [`compile`](JitBackend::compile) produces for one [`Module`].
@@ -160,7 +175,45 @@ pub trait JitBackend {
     /// either stay bounded or decline with a typed error, never stall the caller.
     fn compile(&mut self, module: &Module) -> Result<Self::Compiled>;
 
-    /// Run the exported `function/arity` on `machine`; yields `x(0)`.
+    /// Execute exported `function/arity` against an already-compiled artifact;
+    /// yields `x(0)`.
+    ///
+    /// This is the **compile-once / run-many** entry: `compiled` is the artifact
+    /// [`compile`](JitBackend::compile) produced for `module`, and the caller owns it
+    /// and keeps it alive for the call (the backend holds no per-run code state —
+    /// hence the shared `&self` receiver, which also lets one artifact be run against
+    /// several [`Machine`]s without recompiling).
+    ///
+    /// Setup and semantics are exactly [`run_export`](JitBackend::run_export)'s: the
+    /// machine is reset, `x[0..arity)` is seeded from `args`, the bottom frame is
+    /// pushed, the module's literals are bound, the export is resolved and the run
+    /// proceeds on this tier's native code with the per-instruction interpreter step
+    /// for everything the tier does not lower. Only the compilation is skipped.
+    ///
+    /// `compiled` must have been produced from the same `module` (label/function
+    /// indices are module-local); running a mismatched pair is a caller error, not a
+    /// diagnosable one, but never a panic — a missing export is still a typed error.
+    ///
+    /// Failure is return-based: a missing export, an unsupported instruction or a
+    /// raising BIF is an `Err`, never a panic.
+    fn run_compiled(
+        &self,
+        compiled: &Self::Compiled,
+        machine: &mut Machine,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm>;
+
+    /// Compile `module` and immediately run exported `function/arity`; yields `x(0)`.
+    ///
+    /// The one-shot convenience over [`compile`](JitBackend::compile) +
+    /// [`run_compiled`](JitBackend::run_compiled), provided here so every backend
+    /// behaves identically: a caller that will run the module again should call
+    /// those two directly and keep the artifact instead of recompiling on every
+    /// call.
     ///
     /// The backend owns the entry into its compiled code but borrows the engine's
     /// process state: `machine` supplies the register file / stack / frames and
@@ -175,7 +228,10 @@ pub trait JitBackend {
         arity: u32,
         args: &[Eterm],
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm>;
+    ) -> Result<Eterm> {
+        let compiled = self.compile(module)?;
+        self.run_compiled(&compiled, machine, module, function, arity, args, ctx)
+    }
 }
 
 /// The execution tiers compiled into this build.

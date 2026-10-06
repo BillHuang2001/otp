@@ -230,11 +230,13 @@ pub(crate) trait NativeCode {
 
 /// The native baseline tier.
 ///
-/// A zero-sized selector today: compilation is per [`JitBackend::run_export`] call
-/// (`run_with_tier` creates a fresh backend per run), and caching compiled modules
-/// across runs — like the inlining and the block register allocator's quality — is
-/// a *performance* concern deferred to a later task. This task is the mechanism and
-/// its correctness.
+/// A zero-sized selector: it holds no per-run code state, so the artifact it
+/// compiles ([`CompiledModule`]) is caller-owned and can be run any number of times
+/// through [`JitBackend::run_compiled`] without recompiling. The one-shot
+/// [`JitBackend::run_export`] (`run_with_tier` creates a fresh backend per run)
+/// compiles once and runs immediately; callers that run a module repeatedly use the
+/// two steps directly. Inlining quality and a cross-run code cache are *performance*
+/// concerns deferred to a later task — this is the mechanism and its correctness.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BaselineJit;
 
@@ -261,9 +263,16 @@ impl JitBackend for BaselineJit {
         compile_module(module)
     }
 
-    /// Compile `module` and run exported `function/arity` through the driver loop.
-    fn run_export(
-        &mut self,
+    /// Run exported `function/arity` through the driver loop on an already-compiled
+    /// artifact.
+    ///
+    /// The artifact is caller-owned and the backend holds no per-run code state, so
+    /// one [`CompiledModule`] can be run any number of times (on fresh machines)
+    /// without recompiling; [`JitBackend::run_export`] is the provided one-shot
+    /// convenience over `compile` + this.
+    fn run_compiled(
+        &self,
+        compiled: &CompiledModule,
         machine: &mut Machine,
         module: &Module,
         function: Atom,
@@ -271,8 +280,7 @@ impl JitBackend for BaselineJit {
         args: &[Eterm],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
-        let compiled = compile_module(module)?;
-        run_compiled(&compiled, machine, module, function, arity, args, ctx)
+        run_compiled(compiled, machine, module, function, arity, args, ctx)
     }
 }
 

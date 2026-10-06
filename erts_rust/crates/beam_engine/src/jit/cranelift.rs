@@ -98,11 +98,12 @@ type NativeFunc = extern "C" fn(i64) -> i64;
 
 /// The optional Cranelift hot tier.
 ///
-/// Compilation is per [`JitBackend::run_export`] call (`run_with_tier` creates a
-/// fresh backend per run), exactly like the baseline tier: a cross-run compiled
-/// module cache is a *performance* concern deferred to a later task. The backend
-/// owns the reusable [`FunctionBuilderContext`], which Cranelift requires as
-/// scratch space while lowering a function.
+/// The artifact it compiles ([`CompiledFunctions`]) is caller-owned, so a module can
+/// be compiled once and run many times through [`JitBackend::run_compiled`]; the
+/// one-shot [`JitBackend::run_export`] (`run_with_tier` creates a fresh backend per
+/// run) compiles and runs in one call. The backend owns the reusable
+/// [`FunctionBuilderContext`], which Cranelift requires as scratch space while
+/// lowering a function.
 pub struct CraneliftJit {
     /// Scratch space reused across the module's functions (Cranelift clears it
     /// after every [`FunctionBuilder`] completes).
@@ -140,9 +141,16 @@ impl JitBackend for CraneliftJit {
         compile_module(module, &mut self.builder_context)
     }
 
-    /// Compile `module` and run exported `function/arity` through the driver loop.
-    fn run_export(
-        &mut self,
+    /// Run exported `function/arity` through the driver loop on an already-compiled
+    /// artifact.
+    ///
+    /// The artifact ([`CompiledFunctions`]) is caller-owned and kept alive by the
+    /// caller for the call; the backend holds no per-run code state, so one artifact
+    /// can be run any number of times without recompiling. [`JitBackend::run_export`]
+    /// is the provided one-shot convenience over `compile` + this.
+    fn run_compiled(
+        &self,
+        compiled: &CompiledFunctions,
         machine: &mut Machine,
         module: &Module,
         function: Atom,
@@ -150,8 +158,7 @@ impl JitBackend for CraneliftJit {
         args: &[Eterm],
         ctx: &mut dyn ExecutionContext,
     ) -> Result<Eterm> {
-        let compiled = compile_module(module, &mut self.builder_context)?;
-        let code = CompiledEntries { compiled: &compiled };
+        let code = CompiledEntries { compiled };
         run_native(machine, module, function, arity, args, ctx, &code)
     }
 }
