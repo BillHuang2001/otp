@@ -422,7 +422,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `decode_term` requires `inflate` success **and** `decompressed.len() == size`, otherwise `BadArg`.
   Trailing bytes after the zlib stream are ignored, exactly as the C's `uncompress` does (the deflate
   stream is not self-delimiting). Encoding writes the wrapper **only** on the explicit
-  `*_compressed` entry points; it is never emitted by default.
+  `*_compressed` entry points, and then only when it *shrinks* the body: zlib is given a destination
+  cap of `body_len - 5` bytes (the C's rule, `external.c:2276-2298`) and the **plain** image is
+  emitted when the stream does not fit, so `encode_term` is never compressed and
+  `encode_term_compressed` matches the oracle's *choice* of wrapper vs plain byte-exactly.
 - **Compressed output is not byte-comparable with the oracle.** zlib (C) and `miniz_oxide` produce
   different — equally valid — deflate byte streams for the same input, so the `COMPRESSED`
   ground-truth vector pins the **decoder** and the **inner body** (which must equal our uncompressed
