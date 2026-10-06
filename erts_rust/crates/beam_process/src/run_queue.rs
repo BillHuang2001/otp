@@ -1,80 +1,216 @@
-//! The ready queue: [`RunQueue`].
+//! The ready queue: [`RunQueue`] and the four scheduling [`Priority`] levels.
 //!
-//! Milestone-1 keeps a single FIFO of runnable pids; the legacy C's max/high/normal/low
-//! priority queues (`erl_process.c`, `ErtsRunQueue`) and its lock-free threaded variants
-//! are a documented follow-up (see the crate `CONTEXT.md`, Known Issues).
+//! The run queue holds one FIFO per ERTS scheduling priority (`max`, `high`, `normal`,
+//! `low`) and [`RunQueue::dequeue`] always serves the highest-priority non-empty FIFO
+//! first, mirroring the legacy C `pick_next_process` (`erl_process.c`).
+//!
+//! # Fairness deviation from the legacy C
+//!
+//! The C keeps **MAX** and **HIGH** on dedicated physical queues but lets **NORMAL and LOW
+//! share one physical queue**; a LOW process carries a `schedule_count` (`RESCHEDULE_LOW =
+//! 8`, `erl_process.h`) that defers it to the tail of that shared queue up to eight times
+//! before it is picked, so LOW and NORMAL processes interleave. This crate deliberately
+//! approximates that with **four physically distinct FIFOs**: a LOW process therefore runs
+//! only once the MAX/HIGH/NORMAL queues are all empty and never interleaves with NORMAL
+//! processes inside a shared queue. That is a documented approximation — the observable
+//! difference is the interleaving ratio between LOW and NORMAL, not their relative
+//! precedence (LOW still runs last).
+//!
+//! The legacy C's lock-free threaded run-queue variants remain a documented follow-up (see
+//! the crate `CONTEXT.md`, Known Issues).
 
 use std::collections::VecDeque;
 
 use crate::pid::ProcessId;
 
+/// The four ERTS scheduling-priority levels (the legacy C `PRIORITY_*`).
+///
+/// The numeric order is the C encoding: a *lower* index is scheduled *first*, so the
+/// derived `Ord` gives `Max < High < Normal < Low` (do NOT read that as scheduling
+/// precedence — that ordering is what [`RunQueue`] implements by iterating [`Priority::LEVELS`]).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
+#[repr(u8)]
+pub enum Priority {
+    /// The `max` priority (`PRIORITY_MAX`) — scheduled first.
+    Max = 0,
+    /// The `high` priority (`PRIORITY_HIGH`).
+    High = 1,
+    /// The `normal` priority (`PRIORITY_NORMAL`) — the default.
+    Normal = 2,
+    /// The `low` priority (`PRIORITY_LOW`) — scheduled last.
+    Low = 3,
+}
+
+impl Priority {
+    /// The four levels in scheduling precedence order (highest first):
+    /// `[Max, High, Normal, Low]`.
+    pub const LEVELS: [Priority; 4] = [
+        Priority::Max,
+        Priority::High,
+        Priority::Normal,
+        Priority::Low,
+    ];
+
+    /// The C numeric value (`PRIORITY_MAX` = 0 … `PRIORITY_LOW` = 3).
+    pub const fn index(self) -> usize {
+        self as u8 as usize
+    }
+
+    /// The priority with C numeric value `index`, or `None` when out of range.
+    pub const fn from_index(index: u8) -> Option<Priority> {
+        match index {
+            0 => Some(Priority::Max),
+            1 => Some(Priority::High),
+            2 => Some(Priority::Normal),
+            3 => Some(Priority::Low),
+            _ => None,
+        }
+    }
+
+    /// The atom name of this priority (`"max" | "high" | "normal" | "low"`).
+    pub const fn name(self) -> &'static str {
+        match self {
+            Priority::Max => "max",
+            Priority::High => "high",
+            Priority::Normal => "normal",
+            Priority::Low => "low",
+        }
+    }
+
+    /// Parses the atom name of a priority (`"max" | "high" | "normal" | "low"`), or `None`.
+    pub fn from_name(name: &str) -> Option<Priority> {
+        match name {
+            "max" => Some(Priority::Max),
+            "high" => Some(Priority::High),
+            "normal" => Some(Priority::Normal),
+            "low" => Some(Priority::Low),
+            _ => None,
+        }
+    }
+}
+
+impl Default for Priority {
+    /// [`Priority::Normal`] — a freshly spawned process's priority.
+    fn default() -> Priority {
+        Priority::Normal
+    }
+}
+
 /// A FIFO of runnable process ids.
 ///
-/// The process itself is *not* stored here — the run queue holds pids and the scheduler
-/// looks the PCB up in the [`crate::ptab::ProcessTable`], so a single queue can never
-/// double-own a process.
+/// Internally this is one FIFO per [`Priority`] level; [`RunQueue::dequeue`] takes the front
+/// of the highest-priority non-empty queue. The process itself is *not* stored here — the
+/// run queue holds pids and the scheduler looks the PCB up in the
+/// [`crate::ptab::ProcessTable`], so a single queue can never double-own a process.
 pub struct RunQueue {
-    ready: VecDeque<ProcessId>,
+    /// One ready FIFO per priority, indexed by [`Priority::index`].
+    queues: [VecDeque<ProcessId>; 4],
 }
 
 impl RunQueue {
     /// An empty run queue.
     pub fn new() -> RunQueue {
         RunQueue {
-            ready: VecDeque::new(),
+            queues: [
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+                VecDeque::new(),
+            ],
         }
     }
 
-    /// Appends `pid` at the tail.
+    /// Appends `pid` at the tail of the **normal**-priority FIFO.
     pub fn enqueue(&mut self, pid: ProcessId) {
-        self.ready.push_back(pid);
+        self.enqueue_with_priority(pid, Priority::Normal);
     }
 
-    /// Removes and returns the pid at the head, if any.
+    /// Appends `pid` at the tail of the FIFO for `priority`.
+    pub fn enqueue_with_priority(&mut self, pid: ProcessId, priority: Priority) {
+        self.queues[priority.index()].push_back(pid);
+    }
+
+    /// Removes and returns the pid at the head of the highest-priority non-empty FIFO,
+    /// if any (MAX → HIGH → NORMAL → LOW).
     pub fn dequeue(&mut self) -> Option<ProcessId> {
-        self.ready.pop_front()
+        self.dequeue_with_priority().map(|(pid, _)| pid)
     }
 
-    /// The number of enqueued pids.
+    /// Removes and returns the pid at the head of the highest-priority non-empty FIFO
+    /// together with the [`Priority`] level it came from, if any.
+    pub fn dequeue_with_priority(&mut self) -> Option<(ProcessId, Priority)> {
+        for priority in Priority::LEVELS {
+            if let Some(pid) = self.queues[priority.index()].pop_front() {
+                return Some((pid, priority));
+            }
+        }
+        None
+    }
+
+    /// The total number of enqueued pids across all four levels.
     pub fn len(&self) -> usize {
-        self.ready.len()
+        self.queues.iter().map(VecDeque::len).sum()
     }
 
-    /// Whether the queue holds no pids.
+    /// The number of enqueued pids at `priority`.
+    pub fn len_at(&self, priority: Priority) -> usize {
+        self.queues[priority.index()].len()
+    }
+
+    /// Whether the queue holds no pids at any level.
     pub fn is_empty(&self) -> bool {
-        self.ready.is_empty()
+        self.queues.iter().all(VecDeque::is_empty)
     }
 
-    /// Whether `pid` is enqueued.
+    /// Whether `pid` is enqueued at any level.
     pub fn contains(&self, pid: ProcessId) -> bool {
-        self.ready.contains(&pid)
+        self.priority_of(pid).is_some()
     }
 
-    /// Removes `pid`, reporting whether it was present.
+    /// The level holding `pid`, or `None` when it is not enqueued.
+    pub fn priority_of(&self, pid: ProcessId) -> Option<Priority> {
+        Priority::LEVELS
+            .into_iter()
+            .find(|&priority| self.queues[priority.index()].contains(&pid))
+    }
+
+    /// Removes `pid` from whichever level holds it, reporting whether it was present.
     pub fn remove(&mut self, pid: ProcessId) -> bool {
-        match self.ready.iter().position(|&queued| queued == pid) {
-            Some(index) => {
-                self.ready.remove(index);
+        match self.priority_of(pid) {
+            Some(priority) => {
+                let queue = &mut self.queues[priority.index()];
+                if let Some(index) = queue.iter().position(|&queued| queued == pid) {
+                    queue.remove(index);
+                }
                 true
             }
             None => false,
         }
     }
 
-    /// Iterates the enqueued pids in FIFO order.
+    /// Iterates every enqueued pid in the order [`RunQueue::dequeue`] would return them
+    /// (MAX, then HIGH, then NORMAL, then LOW, FIFO within each level).
     pub fn iter(&self) -> impl Iterator<Item = ProcessId> + '_ {
-        self.ready.iter().copied()
+        self.queues.iter().flat_map(|queue| queue.iter().copied())
     }
 
-    /// Drops every enqueued pid.
+    /// Iterates the pids enqueued at `priority`, in FIFO order.
+    pub fn iter_at(&self, priority: Priority) -> impl Iterator<Item = ProcessId> + '_ {
+        self.queues[priority.index()].iter().copied()
+    }
+
+    /// Drops every enqueued pid, at every level.
     pub fn clear(&mut self) {
-        self.ready.clear();
+        for queue in &mut self.queues {
+            queue.clear();
+        }
     }
 }
 
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the FIFO order and the `contains`/`remove` membership operations.
+    //! Unit tests for the FIFO order, the four-level priority selection and the
+    //! `contains`/`remove` membership operations.
 
     use super::*;
 
@@ -88,6 +224,9 @@ mod tests {
         assert!(queue.is_empty());
         assert_eq!(queue.len(), 0);
         assert_eq!(queue.iter().count(), 0);
+        for priority in Priority::LEVELS {
+            assert_eq!(queue.len_at(priority), 0);
+        }
     }
 
     #[test]
@@ -122,5 +261,106 @@ mod tests {
         queue.clear();
         assert!(queue.is_empty());
         assert!(!queue.contains(pid(2)));
+    }
+
+    #[test]
+    fn enqueue_defaults_to_normal() {
+        let mut queue = RunQueue::new();
+        queue.enqueue(pid(1));
+        assert_eq!(queue.priority_of(pid(1)), Some(Priority::Normal));
+        assert_eq!(queue.len_at(Priority::Normal), 1);
+        assert_eq!(queue.len(), 1);
+    }
+
+    #[test]
+    fn dequeue_serves_the_highest_priority_first() {
+        let mut queue = RunQueue::new();
+        // Enqueue in "lowest precedence first" order to prove the level wins, not insertion.
+        queue.enqueue_with_priority(pid(1), Priority::Low);
+        queue.enqueue_with_priority(pid(2), Priority::Normal);
+        queue.enqueue_with_priority(pid(3), Priority::High);
+        queue.enqueue_with_priority(pid(4), Priority::Max);
+
+        assert_eq!(queue.dequeue_with_priority(), Some((pid(4), Priority::Max)));
+        assert_eq!(queue.dequeue_with_priority(), Some((pid(3), Priority::High)));
+        assert_eq!(
+            queue.dequeue_with_priority(),
+            Some((pid(2), Priority::Normal))
+        );
+        assert_eq!(queue.dequeue_with_priority(), Some((pid(1), Priority::Low)));
+        assert_eq!(queue.dequeue_with_priority(), None);
+    }
+
+    #[test]
+    fn fifo_within_each_level() {
+        let mut queue = RunQueue::new();
+        queue.enqueue_with_priority(pid(1), Priority::High);
+        queue.enqueue_with_priority(pid(2), Priority::High);
+        queue.enqueue_with_priority(pid(3), Priority::High);
+
+        assert_eq!(queue.len_at(Priority::High), 3);
+        assert_eq!(
+            queue.iter_at(Priority::High).collect::<Vec<_>>(),
+            vec![pid(1), pid(2), pid(3)]
+        );
+        assert_eq!(queue.dequeue(), Some(pid(1)));
+        assert_eq!(queue.dequeue(), Some(pid(2)));
+        assert_eq!(queue.dequeue(), Some(pid(3)));
+        assert!(queue.is_empty());
+    }
+
+    #[test]
+    fn iter_walks_every_level_in_scheduling_order() {
+        let mut queue = RunQueue::new();
+        queue.enqueue_with_priority(pid(1), Priority::Low);
+        queue.enqueue_with_priority(pid(2), Priority::Normal);
+        queue.enqueue_with_priority(pid(3), Priority::Normal);
+        queue.enqueue_with_priority(pid(4), Priority::Max);
+
+        assert_eq!(
+            queue.iter().collect::<Vec<_>>(),
+            vec![pid(4), pid(2), pid(3), pid(1)],
+            "MAX first, then NORMAL in FIFO order, then LOW"
+        );
+    }
+
+    #[test]
+    fn priority_of_and_remove_span_all_levels() {
+        let mut queue = RunQueue::new();
+        queue.enqueue_with_priority(pid(1), Priority::Max);
+        queue.enqueue_with_priority(pid(2), Priority::Normal);
+        queue.enqueue_with_priority(pid(3), Priority::Low);
+
+        assert_eq!(queue.priority_of(pid(1)), Some(Priority::Max));
+        assert_eq!(queue.priority_of(pid(2)), Some(Priority::Normal));
+        assert_eq!(queue.priority_of(pid(3)), Some(Priority::Low));
+        assert_eq!(queue.priority_of(pid(9)), None);
+
+        assert!(queue.remove(pid(1)));
+        assert!(queue.remove(pid(3)));
+        assert!(!queue.remove(pid(1)));
+        assert_eq!(queue.priority_of(pid(1)), None);
+        assert_eq!(queue.priority_of(pid(3)), None);
+        assert_eq!(queue.len(), 1);
+        assert_eq!(queue.iter().collect::<Vec<_>>(), vec![pid(2)]);
+
+        queue.clear();
+        assert!(queue.is_empty());
+        assert_eq!(queue.priority_of(pid(2)), None);
+    }
+
+    #[test]
+    fn priority_names_and_indices_round_trip() {
+        assert_eq!(Priority::default(), Priority::Normal);
+        assert_eq!(Priority::LEVELS, [Priority::Max, Priority::High, Priority::Normal, Priority::Low]);
+        for priority in Priority::LEVELS {
+            assert_eq!(Priority::from_index(priority.index() as u8), Some(priority));
+            assert_eq!(Priority::from_name(priority.name()), Some(priority));
+        }
+        assert_eq!(Priority::Max.index(), 0);
+        assert_eq!(Priority::Low.index(), 3);
+        assert_eq!(Priority::from_index(4), None);
+        assert_eq!(Priority::from_name("bogus"), None);
+        assert!(Priority::Max < Priority::Low, "Ord follows the C numeric encoding");
     }
 }
