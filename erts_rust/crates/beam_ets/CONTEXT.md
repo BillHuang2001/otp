@@ -291,7 +291,7 @@ impl Table {
   split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
   `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
   (incl. the `insert`-retained-bool), B+-tree invariants (incl. 10 000-key churn), select
-  compile/execute, info. 84 unit tests.
+  compile/execute, info. 91 unit tests.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs`, `ets_nav.rs` (incl. the
