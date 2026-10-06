@@ -419,9 +419,10 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
 - **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
-  exact bit values are not part of any contract. Maps hash structurally (their sorted pairs). Classes
-  lacking a layout-aware representation (funs, records, external pid/port/ref, bin refs) use an opaque
-  raw-word fallback, so their hash is not stable across processes/images.
+  exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
+  over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
+  kind-rank rules). Classes lacking a layout-aware representation (records, external pid/port/ref, bin
+  refs) use an opaque raw-word fallback, so their hash is not stable across processes/images.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
 - **Hash choices are internal (`src/map.rs`).** The HAMT trie is driven by `hashing::term_hash`, not
