@@ -44,6 +44,15 @@
 //! `beam_codec::term::make_binary`). The **wire** image is identical, which is what
 //! these vectors assert.
 //!
+//! ## Funs
+//!
+//! The fun tags `EXPORT_EXT` (`113`) and `NEW_FUN_EXT` (`112`) are pinned below too: an
+//! explicit `fun lists:reverse/1`, a genuine closure (`FUN_NEW_FTEST_MAKE3`, whose
+//! `uniq`/`old_uniq` are a hash of the *compiled* helper module, so the whole image
+//! must be regenerated with the local toolchain), and the `LitT` literal pools of the
+//! real `maps` and `gen_server` modules — the exact terms a loader must decode (with
+//! the fun nested inside a compound literal) before those modules can load.
+//!
 //! These tests never use `unsafe`; the crate's only `unsafe` lives in
 //! `beam_codec::term`. Panicking on mismatch is intended (a failure is a test
 //! failure).
@@ -52,14 +61,17 @@ use beam_alloc::Heap;
 use beam_codec::compress::decompress;
 use beam_codec::term::{
     big_parts, bitstring_bytes, bitstring_size_bits, cons_head, cons_tail, external_pid_parts,
-    external_ref_parts, flatmap_parts, float_value, tuple_arity, tuple_element,
+    external_ref_parts, flatmap_parts, float_value, fun_arity_term, fun_creator_pid, fun_env,
+    fun_function, fun_index, fun_kind_term, fun_module, fun_num_free_term, fun_old_index,
+    fun_old_uniq, fun_uniq_bytes, tuple_arity, tuple_element, FunKind, FunPid,
 };
 use beam_codec::{
     decode_term, encode_term, encode_term_body, encode_term_compressed, COMPRESSED_EXT,
     VERSION_MAGIC,
 };
 use beam_term::prelude::{
-    atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, AtomTable, Eterm, NIL,
+    atom_val, is_atom, is_list, is_nil, is_small, make_small, signed_value, Atom, AtomTable, Eterm,
+    NIL,
 };
 
 // ---------------------------------------------------------------------------
@@ -168,6 +180,184 @@ const COMPRESSED_DUP_500_HELLO: &[u8] = &[
     192, 210, 197, 29, 192, 53, 44, 146, 38, 169, 106, 247, 244, 57, 146, 45, 73, 146, 36, 73,
     250, 168, 245, 0, 145, 146, 3, 87,
 ];
+
+/// `fun lists:reverse/1` — an `EXPORT_EXT` (`113`) fun.
+///
+/// `erl -noshell -eval 'io:format("~w~n", [term_to_binary(fun lists:reverse/1)])' -s init stop`
+///
+/// Layout: `[113][module atom][function atom][arity]`.
+const FUN_EXPORT_LISTS_REVERSE: &[u8] = &[
+    131, 113, 119, 5, 108, 105, 115, 116, 115, 119, 7, 114, 101, 118, 101, 114, 115, 101, 97, 1,
+];
+
+/// `ftest:make3("aa","bb","cc")` — a genuine `NEW_FUN_EXT` (`112`) closure with
+/// three free variables.
+///
+/// The helper module's source (this is what the compiler hashes into the fun's
+/// `uniq`/`index`/`old_uniq` fields, so it must be recorded to regenerate the
+/// vector):
+///
+/// ```erlang
+/// -module(ftest).
+/// -export([make3/3, make1/1]).
+/// make3(A,B,C) -> fun() -> {A,B,C} end.
+/// make1(A) -> fun(Z) -> A+Z end.
+/// ```
+///
+/// Generate with:
+///
+/// ```text
+/// erlc ftest.erl
+/// erl -noshell -pa . -eval 'io:format("~w~n", [term_to_binary(ftest:make3("aa","bb","cc"))])' -s init stop
+/// ```
+///
+/// Layout: `[112][size:4 BE][arity:1][uniq:16][index:4 BE][num_free:4 BE]
+/// [module atom][old_index][old_uniq][creator pid (`NEW_PID_EXT` 88)][env…]`
+/// with `size = 4 + payload_len` and **env order = stream order**. Unlike the
+/// other vectors, `uniq`/`old_uniq` are a hash of the *compiled* `ftest.beam`, so
+/// they change when the compiler does — regenerate the whole image (the round trip
+/// is invisible to the codec, which simply forwards the wire fields).
+const FUN_NEW_FTEST_MAKE3: &[u8] = &[
+    131, 112, 0, 0, 0, 86, 0, 38, 119, 19, 142, 172, 206, 132, 125, 242, 218, 147, 83, 146, 36,
+    109, 42, 0, 0, 0, 0, 0, 0, 0, 3, 119, 5, 102, 116, 101, 115, 116, 97, 0, 98, 1, 51, 184,
+    156, 88, 119, 13, 110, 111, 110, 111, 100, 101, 64, 110, 111, 104, 111, 115, 116, 0,
+    0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 107, 0, 2, 97, 97, 107, 0, 2, 98, 98, 107, 0, 2, 99, 99,
+];
+
+/// The `LitT` literal pool of the real `maps` module — a genuine OTP `.beam`
+/// literal term, the exact shape a loader must decode before the module can load.
+///
+/// `erl -noshell -eval '{ok,{_,[{literals,L}]}} = beam_lib:chunks(code:which(maps),
+/// [literals]), io:format("~w~n",[term_to_binary(L)]), halt().'`
+///
+/// The pool is `[ {0, [{error_info, #{module => erl_stdlib_errors}}]}, {1, #{}},
+/// {2, fun maps:remove/2} ]` — a three-element list whose last element nests an
+/// `EXPORT_EXT` (`113`) fun, so decoding this module's literals exercises the fun
+/// path inside a compound term exactly as the loader does.
+const LITERALS_MAPS: &[u8] = &[
+    131, 108, 0, 0, 0, 3, 104, 2, 97, 0, 108, 0, 0, 0, 1, 104, 2, 119, 10, 101, 114, 114, 111, 114,
+    95, 105, 110, 102, 111, 116, 0, 0, 0, 1, 119, 6, 109, 111, 100, 117, 108, 101, 119, 17,
+    101, 114, 108, 95, 115, 116, 100, 108, 105, 98, 95, 101, 114, 114, 111, 114, 115, 106,
+    104, 2, 97, 1, 116, 0, 0, 0, 0, 104, 2, 97, 2, 113, 119, 4, 109, 97, 112, 115, 119, 6,
+    114, 101, 109, 111, 118, 101, 97, 2, 106,
+];
+
+/// The `LitT` literal pool of the real `gen_server` module — a larger pool (65
+/// elements) that nests four `EXPORT_EXT` (`113`) funs (`fun
+/// gen_server:format_log/1` and `/2`).
+///
+/// `erl -noshell -eval '{ok,{_,[{literals,L}]}} = beam_lib:chunks(code:which(gen_server),
+/// [literals]), io:format("~w~n",[term_to_binary(L)]), halt().'`
+const LITERALS_GEN_SERVER: &[u8] = &[
+    131, 108, 0, 0, 0, 65, 104, 2, 97, 0, 108, 0, 0, 0, 1, 119, 9, 110, 111, 99, 111, 110, 110, 101,
+    99, 116, 106, 104, 2, 97, 1, 108, 0, 0, 0, 1, 119, 5, 102, 108, 117, 115, 104, 106, 104,
+    2, 97, 2, 104, 2, 119, 4, 101, 120, 105, 116, 119, 6, 110, 111, 114, 109, 97, 108, 104,
+    2, 97, 3, 108, 0, 0, 0, 2, 104, 2, 119, 5, 97, 115, 121, 110, 99, 119, 4, 116, 114, 117,
+    101, 104, 2, 119, 4, 105, 110, 102, 111, 119, 5, 102, 97, 108, 115, 101, 106, 104, 2,
+    97, 4, 116, 0, 0, 0, 0, 104, 2, 97, 5, 104, 2, 119, 10, 103, 101, 110, 95, 115, 101, 114,
+    118, 101, 114, 119, 14, 110, 111, 95, 104, 97, 110, 100, 108, 101, 95, 105, 110, 102,
+    111, 104, 2, 97, 6, 116, 0, 0, 0, 3, 119, 12, 101, 114, 114, 111, 114, 95, 108, 111, 103,
+    103, 101, 114, 116, 0, 0, 0, 2, 119, 3, 116, 97, 103, 119, 11, 119, 97, 114, 110, 105,
+    110, 103, 95, 109, 115, 103, 119, 9, 114, 101, 112, 111, 114, 116, 95, 99, 98, 113, 119,
+    10, 103, 101, 110, 95, 115, 101, 114, 118, 101, 114, 119, 10, 102, 111, 114, 109, 97,
+    116, 95, 108, 111, 103, 97, 1, 119, 6, 100, 111, 109, 97, 105, 110, 108, 0, 0, 0, 1,
+    119, 3, 111, 116, 112, 106, 119, 9, 114, 101, 112, 111, 114, 116, 95, 99, 98, 113, 119,
+    10, 103, 101, 110, 95, 115, 101, 114, 118, 101, 114, 119, 10, 102, 111, 114, 109, 97,
+    116, 95, 108, 111, 103, 97, 2, 104, 2, 97, 7, 116, 0, 0, 0, 3, 119, 4, 108, 105, 110, 101,
+    98, 0, 0, 9, 137, 119, 4, 102, 105, 108, 101, 107, 0, 14, 103, 101, 110, 95, 115, 101,
+    114, 118, 101, 114, 46, 101, 114, 108, 119, 3, 109, 102, 97, 104, 3, 119, 10, 103, 101,
+    110, 95, 115, 101, 114, 118, 101, 114, 119, 15, 116, 114, 121, 95, 104, 97, 110, 100,
+    108, 101, 95, 105, 110, 102, 111, 97, 3, 104, 2, 97, 8, 104, 2, 119, 2, 111, 107, 119,
+    2, 111, 107, 104, 2, 97, 9, 108, 0, 0, 0, 1, 104, 2, 119, 3, 97, 98, 115, 119, 4, 116,
+    114, 117, 101, 106, 104, 2, 97, 10, 107, 0, 42, 42, 68, 66, 71, 42, 32, 126, 116, 112,
+    32, 115, 101, 110, 116, 32, 126, 116, 112, 32, 116, 111, 32, 126, 116, 119, 44, 32, 110,
+    101, 119, 32, 115, 116, 97, 116, 101, 32, 126, 116, 112, 126, 110, 104, 2, 97, 11, 107,
+    0, 25, 42, 68, 66, 71, 42, 32, 126, 116, 112, 32, 110, 101, 119, 32, 115, 116, 97, 116,
+    101, 32, 126, 116, 112, 126, 110, 104, 2, 97, 12, 107, 0, 33, 42, 68, 66, 71, 42, 32,
+    126, 116, 112, 32, 103, 111, 116, 32, 99, 97, 108, 108, 32, 126, 116, 112, 32, 102, 114,
+    111, 109, 32, 126, 116, 119, 126, 110, 104, 2, 97, 13, 107, 0, 24, 42, 68, 66, 71, 42,
+    32, 126, 116, 112, 32, 103, 111, 116, 32, 99, 97, 115, 116, 32, 126, 116, 112, 126, 110,
+    104, 2, 97, 14, 107, 0, 19, 42, 68, 66, 71, 42, 32, 126, 116, 112, 32, 103, 111, 116,
+    32, 126, 116, 112, 126, 110, 104, 2, 97, 15, 107, 0, 20, 42, 68, 66, 71, 42, 32, 126,
+    116, 112, 32, 100, 98, 103, 32, 32, 126, 116, 112, 126, 110, 104, 2, 97, 16, 104, 2,
+    119, 10, 103, 101, 110, 95, 115, 101, 114, 118, 101, 114, 119, 9, 116, 101, 114, 109, 105,
+    110, 97, 116, 101, 104, 2, 97, 17, 116, 0, 0, 0, 3, 119, 12, 101, 114, 114, 111, 114,
+    95, 108, 111, 103, 103, 101, 114, 116, 0, 0, 0, 2, 119, 3, 116, 97, 103, 119, 5, 101,
+    114, 114, 111, 114, 119, 9, 114, 101, 112, 111, 114, 116, 95, 99, 98, 113, 119, 10, 103,
+    101, 110, 95, 115, 101, 114, 118, 101, 114, 119, 10, 102, 111, 114, 109, 97, 116, 95,
+    108, 111, 103, 97, 1, 119, 6, 100, 111, 109, 97, 105, 110, 108, 0, 0, 0, 1, 119, 3, 111,
+    116, 112, 106, 119, 9, 114, 101, 112, 111, 114, 116, 95, 99, 98, 113, 119, 10, 103, 101,
+    110, 95, 115, 101, 114, 118, 101, 114, 119, 10, 102, 111, 114, 109, 97, 116, 95, 108,
+    111, 103, 97, 2, 104, 2, 97, 18, 116, 0, 0, 0, 3, 119, 4, 108, 105, 110, 101, 98, 0,
+    0, 10, 225, 119, 4, 102, 105, 108, 101, 107, 0, 14, 103, 101, 110, 95, 115, 101, 114, 118,
+    101, 114, 46, 101, 114, 108, 119, 3, 109, 102, 97, 104, 3, 119, 10, 103, 101, 110, 95,
+    115, 101, 114, 118, 101, 114, 119, 10, 101, 114, 114, 111, 114, 95, 105, 110, 102, 111,
+    97, 7, 104, 2, 97, 19, 108, 0, 0, 0, 2, 119, 18, 99, 117, 114, 114, 101, 110, 116, 95,
+    115, 116, 97, 99, 107, 116, 114, 97, 99, 101, 119, 15, 114, 101, 103, 105, 115, 116, 101,
+    114, 101, 100, 95, 110, 97, 109, 101, 106, 104, 2, 97, 20, 116, 0, 0, 0, 4, 119, 11,
+    99, 104, 97, 114, 115, 95, 108, 105, 109, 105, 116, 119, 9, 117, 110, 108, 105, 109, 105,
+    116, 101, 100, 119, 5, 100, 101, 112, 116, 104, 119, 9, 117, 110, 108, 105, 109, 105,
+    116, 101, 100, 119, 8, 101, 110, 99, 111, 100, 105, 110, 103, 119, 4, 117, 116, 102, 56,
+    119, 11, 115, 105, 110, 103, 108, 101, 95, 108, 105, 110, 101, 119, 5, 102, 97, 108, 115,
+    101, 104, 2, 97, 21, 107, 0, 9, 46, 32, 76, 97, 98, 101, 108, 58, 32, 104, 2, 97, 22,
+    108, 0, 0, 0, 1, 107, 0, 1, 46, 106, 104, 2, 97, 23, 107, 0, 9, 46, 32, 83, 116, 97, 116,
+    101, 58, 32, 104, 2, 97, 24, 107, 0, 16, 46, 32, 76, 97, 115, 116, 32, 109, 101, 115,
+    115, 97, 103, 101, 58, 32, 104, 2, 97, 25, 107, 0, 10, 46, 32, 82, 101, 97, 115, 111,
+    110, 58, 32, 104, 2, 97, 26, 107, 0, 12, 32, 116, 101, 114, 109, 105, 110, 97, 116, 105,
+    110, 103, 104, 2, 97, 27, 107, 0, 15, 71, 101, 110, 101, 114, 105, 99, 32, 115, 101, 114,
+    118, 101, 114, 32, 104, 2, 97, 28, 107, 0, 21, 46, 32, 85, 110, 104, 97, 110, 100, 108,
+    101, 100, 32, 109, 101, 115, 115, 97, 103, 101, 58, 32, 104, 2, 97, 29, 107, 0, 25, 85,
+    110, 100, 101, 102, 105, 110, 101, 100, 32, 104, 97, 110, 100, 108, 101, 95, 105, 110,
+    102, 111, 32, 105, 110, 32, 104, 2, 97, 30, 108, 0, 0, 0, 1, 107, 0, 2, 126, 110, 106,
+    104, 2, 97, 31, 107, 0, 20, 42, 42, 32, 80, 114, 111, 99, 101, 115, 115, 32, 108, 97,
+    98, 101, 108, 32, 61, 61, 32, 104, 2, 97, 32, 107, 0, 7, 44, 126, 110, 32, 32, 32, 32,
+    104, 2, 97, 33, 108, 0, 0, 0, 1, 107, 0, 3, 93, 126, 110, 106, 104, 2, 97, 34, 107, 0,
+    15, 42, 42, 32, 76, 111, 103, 32, 61, 61, 126, 110, 42, 42, 32, 91, 104, 2, 97, 35, 107,
+    0, 2, 126, 110, 104, 2, 97, 36, 107, 0, 35, 126, 110, 42, 42, 32, 82, 101, 97, 115, 111,
+    110, 32, 102, 111, 114, 32, 116, 101, 114, 109, 105, 110, 97, 116, 105, 111, 110, 32,
+    61, 61, 126, 110, 42, 42, 32, 104, 2, 97, 37, 107, 0, 26, 126, 110, 42, 42, 32, 87, 104,
+    101, 110, 32, 83, 101, 114, 118, 101, 114, 32, 115, 116, 97, 116, 101, 32, 61, 61, 32,
+    104, 2, 97, 38, 107, 0, 23, 42, 42, 32, 76, 97, 115, 116, 32, 109, 101, 115, 115, 97,
+    103, 101, 32, 105, 110, 32, 119, 97, 115, 32, 104, 2, 97, 39, 107, 0, 14, 32, 116, 101,
+    114, 109, 105, 110, 97, 116, 105, 110, 103, 32, 10, 104, 2, 97, 40, 107, 0, 18, 42, 42,
+    32, 71, 101, 110, 101, 114, 105, 99, 32, 115, 101, 114, 118, 101, 114, 32, 104, 2, 97,
+    41, 107, 0, 54, 42, 42, 32, 85, 110, 100, 101, 102, 105, 110, 101, 100, 32, 104, 97, 110,
+    100, 108, 101, 95, 105, 110, 102, 111, 32, 105, 110, 32, 126, 112, 126, 110, 42, 42,
+    32, 85, 110, 104, 97, 110, 100, 108, 101, 100, 32, 109, 101, 115, 115, 97, 103, 101, 58,
+    32, 104, 2, 97, 42, 104, 2, 106, 106, 104, 2, 97, 43, 107, 0, 6, 32, 76, 111, 103, 58,
+    32, 104, 2, 97, 44, 107, 0, 1, 46, 104, 2, 97, 45, 107, 0, 13, 32, 115, 116, 97, 99, 107,
+    116, 114, 97, 99, 101, 58, 32, 104, 2, 97, 46, 107, 0, 8, 32, 67, 108, 105, 101, 110,
+    116, 32, 104, 2, 97, 47, 107, 0, 34, 32, 67, 108, 105, 101, 110, 116, 32, 126, 48, 112,
+    32, 105, 115, 32, 114, 101, 109, 111, 116, 101, 32, 111, 110, 32, 110, 111, 100, 101,
+    32, 126, 48, 112, 46, 104, 2, 97, 48, 107, 0, 20, 32, 67, 108, 105, 101, 110, 116, 32,
+    126, 48, 112, 32, 105, 115, 32, 100, 101, 97, 100, 46, 104, 2, 97, 49, 107, 0, 3, 42,
+    42, 32, 104, 2, 97, 50, 107, 0, 13, 32, 115, 116, 97, 99, 107, 116, 114, 97, 99, 101, 126,
+    110, 104, 2, 97, 51, 107, 0, 10, 42, 42, 32, 67, 108, 105, 101, 110, 116, 32, 104, 2,
+    97, 52, 107, 0, 35, 42, 42, 32, 67, 108, 105, 101, 110, 116, 32, 126, 112, 32, 105, 115,
+    32, 114, 101, 109, 111, 116, 101, 32, 111, 110, 32, 110, 111, 100, 101, 32, 126, 112,
+    126, 110, 104, 2, 97, 53, 107, 0, 22, 42, 42, 32, 67, 108, 105, 101, 110, 116, 32, 126,
+    112, 32, 105, 115, 32, 100, 101, 97, 100, 126, 110, 104, 2, 97, 54, 107, 0, 1, 112, 104,
+    2, 97, 55, 107, 0, 1, 80, 104, 2, 97, 56, 107, 0, 1, 48, 104, 2, 97, 57, 107, 0, 1,
+    116, 104, 2, 97, 58, 107, 0, 25, 83, 116, 97, 116, 117, 115, 32, 102, 111, 114, 32, 103,
+    101, 110, 101, 114, 105, 99, 32, 115, 101, 114, 118, 101, 114, 104, 2, 97, 59, 107, 0,
+    5, 83, 116, 97, 116, 101, 104, 2, 97, 60, 107, 0, 13, 76, 111, 103, 103, 101, 100, 32,
+    101, 118, 101, 110, 116, 115, 104, 2, 97, 61, 107, 0, 6, 80, 97, 114, 101, 110, 116, 104,
+    2, 97, 62, 107, 0, 6, 83, 116, 97, 116, 117, 115, 104, 2, 97, 63, 108, 0, 0, 0, 6, 104,
+    2, 119, 11, 104, 97, 110, 100, 108, 101, 95, 105, 110, 102, 111, 97, 2, 104, 2, 119, 15,
+    104, 97, 110, 100, 108, 101, 95, 99, 111, 110, 116, 105, 110, 117, 101, 97, 2, 104, 2,
+    119, 9, 116, 101, 114, 109, 105, 110, 97, 116, 101, 97, 2, 104, 2, 119, 11, 99, 111, 100,
+    101, 95, 99, 104, 97, 110, 103, 101, 97, 3, 104, 2, 119, 13, 102, 111, 114, 109, 97,
+    116, 95, 115, 116, 97, 116, 117, 115, 97, 1, 104, 2, 119, 13, 102, 111, 114, 109, 97,
+    116, 95, 115, 116, 97, 116, 117, 115, 97, 2, 106, 104, 2, 97, 64, 108, 0, 0, 0, 9, 104,
+    2, 119, 4, 105, 110, 105, 116, 97, 1, 104, 2, 119, 11, 104, 97, 110, 100, 108, 101, 95,
+    99, 97, 108, 108, 97, 3, 104, 2, 119, 11, 104, 97, 110, 100, 108, 101, 95, 99, 97, 115,
+    116, 97, 2, 104, 2, 119, 11, 104, 97, 110, 100, 108, 101, 95, 105, 110, 102, 111, 97,
+    2, 104, 2, 119, 15, 104, 97, 110, 100, 108, 101, 95, 99, 111, 110, 116, 105, 110, 117,
+    101, 97, 2, 104, 2, 119, 9, 116, 101, 114, 109, 105, 110, 97, 116, 101, 97, 2, 104, 2,
+    119, 11, 99, 111, 100, 101, 95, 99, 104, 97, 110, 103, 101, 97, 3, 104, 2, 119, 13, 102,
+    111, 114, 109, 97, 116, 95, 115, 116, 97, 116, 117, 115, 97, 2, 104, 2, 119, 13, 102,
+    111, 114, 109, 97, 116, 95, 115, 116, 97, 116, 117, 115, 97, 1, 106, 106,
+];
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
@@ -194,6 +384,14 @@ fn atom_name(atoms: &AtomTable, term: Eterm) -> String {
     assert!(is_atom(term), "expected an atom, got {term:?}");
     atoms
         .name(atom_val(term))
+        .expect("a decoded atom is interned in the table")
+        .to_string()
+}
+
+/// The name of an already-resolved [`Atom`], e.g. one an accessor returned.
+fn interned_atom_name(atoms: &AtomTable, atom: Atom) -> String {
+    atoms
+        .name(atom)
         .expect("a decoded atom is interned in the table")
         .to_string()
 }
@@ -555,4 +753,142 @@ fn large_binary_round_trips_through_the_wire() {
     image.extend(1u8..=100);
     let (_heap, _atoms, term) = round_trip(&image);
     assert_eq!(bitstring_size_bits(term).unwrap(), 800);
+}
+
+// ---------------------------------------------------------------------------
+// Funs — oracle vectors (`EXPORT_EXT` `113` / `NEW_FUN_EXT` `112`)
+// ---------------------------------------------------------------------------
+
+/// Recursively collects every fun term reachable inside `term`, descending through
+/// tuples, cons spines and maps — the shape a `.beam` literal pool (`LitT`) has.
+fn collect_funs(term: Eterm, out: &mut Vec<Eterm>) {
+    if fun_kind_term(term).is_ok() {
+        out.push(term);
+        return;
+    }
+    // Walk a cons spine; the final (non-cons) tail is handled below.
+    let mut cursor = term;
+    while is_list(cursor) {
+        collect_funs(cons_head(cursor).unwrap(), out);
+        cursor = cons_tail(cursor).unwrap();
+    }
+    if let Ok(arity) = tuple_arity(cursor) {
+        for index in 0..arity {
+            collect_funs(tuple_element(cursor, index).unwrap(), out);
+        }
+    } else if let Ok((keys, values)) = flatmap_parts(cursor) {
+        for key in keys {
+            collect_funs(*key, out);
+        }
+        for value in values {
+            collect_funs(*value, out);
+        }
+    }
+}
+
+#[test]
+fn fun_export_lists_reverse_is_export_ext() {
+    // `fun lists:reverse/1` — `EXPORT_EXT` (`113`): `[module][function][arity]`.
+    let (_heap, atoms, term) = round_trip(FUN_EXPORT_LISTS_REVERSE);
+    assert_eq!(fun_kind_term(term).unwrap(), FunKind::External);
+    assert_eq!(fun_arity_term(term).unwrap(), 1);
+    assert_eq!(fun_num_free_term(term).unwrap(), 0);
+    assert_eq!(interned_atom_name(&atoms, fun_module(term).unwrap()), "lists");
+    assert_eq!(interned_atom_name(&atoms, fun_function(term).unwrap()), "reverse");
+    // An external fun carries none of the closure-only fields.
+    assert!(fun_env(term).unwrap().is_empty());
+    assert!(fun_index(term).is_err());
+    assert!(fun_creator_pid(term).is_err());
+}
+
+#[test]
+fn fun_new_ftest_make3_is_new_fun_ext() {
+    // `ftest:make3("aa","bb","cc")` — `NEW_FUN_EXT` (`112`): a real closure with
+    // three free variables. The env order on the wire is the env order (`env[k]` is
+    // the `k`-th stream element), so the three strings must come back in order.
+    let (_heap, mut atoms, term) = round_trip(FUN_NEW_FTEST_MAKE3);
+    assert_eq!(fun_kind_term(term).unwrap(), FunKind::Imported);
+    assert_eq!(fun_arity_term(term).unwrap(), 0);
+    assert_eq!(fun_num_free_term(term).unwrap(), 3);
+    assert_eq!(interned_atom_name(&atoms, fun_module(term).unwrap()), "ftest");
+    // An imported fun has no exported function name.
+    assert!(fun_function(term).is_err());
+    assert_eq!(fun_index(term).unwrap(), 0);
+    assert_eq!(fun_old_index(term).unwrap(), 0);
+    assert_eq!(fun_old_uniq(term).unwrap(), 0x0133_B89C);
+    // The 16-byte `uniq` is the compiled `ftest.beam`'s hash (see the const doc).
+    assert_eq!(
+        fun_uniq_bytes(term).unwrap(),
+        [
+            0x26, 0x77, 0x13, 0x8E, 0xAC, 0xCE, 0x84, 0x7D, 0xF2, 0xDA, 0x93, 0x53, 0x92, 0x24,
+            0x6D, 0x2A,
+        ]
+    );
+    let node = atoms.intern("nonode@nohost");
+    assert_eq!(
+        fun_creator_pid(term).unwrap(),
+        FunPid {
+            node,
+            number: 0,
+            serial: 0,
+            creation: 0,
+        }
+    );
+    let env = fun_env(term).unwrap();
+    assert_eq!(env.len(), 3);
+    for (slot, expected) in env.iter().zip([[97_i64, 97], [98, 98], [99, 99]]) {
+        assert_eq!(small_list(*slot), expected, "env order must follow the wire");
+    }
+}
+
+#[test]
+fn literals_maps_contains_a_nested_export_fun() {
+    // The `maps` module's real `LitT` literal pool — the exact shape a loader must
+    // decode before the module can load. Its last element nests `fun maps:remove/2`.
+    let (_heap, atoms, term) = round_trip(LITERALS_MAPS);
+    let (heads, tail) = spine(term);
+    assert!(is_nil(tail), "the literal pool is a proper list");
+    assert_eq!(heads.len(), 3);
+
+    // `{2, fun maps:remove/2}`.
+    let last = heads[2];
+    assert_eq!(tuple_arity(last).unwrap(), 2);
+    assert_eq!(small_value(tuple_element(last, 0).unwrap()), 2);
+    let fun = tuple_element(last, 1).unwrap();
+    assert_eq!(fun_kind_term(fun).unwrap(), FunKind::External);
+    assert_eq!(fun_arity_term(fun).unwrap(), 2);
+    assert_eq!(interned_atom_name(&atoms, fun_module(fun).unwrap()), "maps");
+    assert_eq!(interned_atom_name(&atoms, fun_function(fun).unwrap()), "remove");
+}
+
+#[test]
+fn literals_gen_server_decodes_with_its_export_funs() {
+    // The `gen_server` module's literal pool (65 elements) — a larger real-module
+    // case that nests four `EXPORT_EXT` funs. Its pool needs more than the default
+    // test heap, so it is decoded with a generously sized one.
+    let mut heap = Heap::new(1 << 16).expect("a 65536-word heap is available");
+    let mut atoms = AtomTable::new();
+    let term = decode_term(LITERALS_GEN_SERVER, &mut heap, &mut atoms)
+        .expect("a real module's literal pool must decode");
+    assert_eq!(
+        encode_term(term, &atoms).expect("a decoded literal pool re-encodes"),
+        LITERALS_GEN_SERVER,
+        "re-encoding must reproduce the oracle bytes exactly"
+    );
+
+    let (heads, tail) = spine(term);
+    assert!(is_nil(tail), "the literal pool is a proper list");
+    assert_eq!(heads.len(), 65);
+
+    let mut funs = Vec::new();
+    collect_funs(term, &mut funs);
+    let mut arities = Vec::new();
+    for &fun in &funs {
+        assert_eq!(fun_kind_term(fun).unwrap(), FunKind::External);
+        assert_eq!(interned_atom_name(&atoms, fun_module(fun).unwrap()), "gen_server");
+        assert_eq!(interned_atom_name(&atoms, fun_function(fun).unwrap()), "format_log");
+        arities.push(fun_arity_term(fun).unwrap());
+    }
+    assert_eq!(funs.len(), 4, "the pool nests four funs, arities {arities:?}");
+    assert!(arities.contains(&1) && arities.contains(&2));
 }
