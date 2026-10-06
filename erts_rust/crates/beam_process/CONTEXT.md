@@ -210,6 +210,8 @@ holds `Process` values directly.
     Option<Process>` (bumps the slot serial **and drops the pid from the wake list**); `remove(pid) ->
     Option<Process>`; `contains(pid) -> bool`; `len()`; `pids() ->
     impl Iterator<Item = ProcessId> + '_`
+  - **priority:** `set_priority(pid, priority: Priority) -> Result<()>` — delegates to
+    `Process::set_priority`; unknown pid ⇒ `TermNotFound`.
   - **message delivery:** `deliver(to: ProcessId, from: Eterm, term: Eterm, src_off_heap:
     &OffHeapTable) -> Result<DeliverOutcome>` — the table-level send: calls the target's
     `Process::deliver` and, on `Woke`, pushes `to` onto the wake list (unknown `to` ⇒ `TermNotFound`).
