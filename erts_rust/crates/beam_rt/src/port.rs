@@ -275,6 +275,18 @@ impl PortRegistry {
     pub fn is_empty(&self) -> bool {
         self.live.is_empty()
     }
+    /// The ids of the **live** ports, in port-number order.
+    ///
+    /// The live map holds exactly the ports `open_port/2` recorded, so it is the direct
+    /// source of truth for `erlang:ports/0` — reported here rather than recovered by
+    /// scanning `contains` upward from zero, which a slot released *below* a still-live
+    /// port would cut short. The numbers are sorted so the answer does not depend on the
+    /// map's iteration order.
+    pub fn ids(&self) -> Vec<PortId> {
+        let mut numbers: Vec<u64> = self.live.keys().copied().collect();
+        numbers.sort_unstable();
+        numbers.into_iter().map(PortId::new).collect()
+    }
 
     /// Records `live` as the port `id`.
     pub fn insert(&mut self, id: PortId, live: LivePort) {
@@ -1265,5 +1277,32 @@ mod tests {
         let registry = PortRegistry::new().expect("a port registry");
         assert!(registry.live.is_empty());
         assert!(!registry.contains(PortId::new(0)));
+        assert!(registry.is_empty());
+        assert!(registry.ids().is_empty());
+    }
+
+    #[test]
+    fn ids_reports_live_ports_across_a_released_lower_slot() {
+        let mut fx = fixture();
+        let first = {
+            let name = fx.spawn("true");
+            fx.hook.open_port(name, NIL).expect("first port")
+        };
+        let second = {
+            let name = fx.spawn("true");
+            fx.hook.open_port(name, NIL).expect("second port")
+        };
+        assert_eq!(
+            fx.registry.borrow().ids(),
+            vec![first, second],
+            "the live ports are reported in port-number order"
+        );
+
+        // Closing the *lower* port leaves a gap below the still-live higher one. The live
+        // map is the source of truth, so `ids` still reports the higher port (a
+        // scan-from-zero recovery would have stopped at the gap and missed it).
+        fx.hook.close_port(first).expect("closing the first port");
+        assert!(!fx.registry.borrow().contains(first));
+        assert_eq!(fx.registry.borrow().ids(), vec![second]);
     }
 }

@@ -36,10 +36,6 @@ use beam_term::{atom_val, is_atom, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::error;
-use crate::port::PortRegistry;
-
-/// The number of port ids [`open_port_ids`] probes before giving up (see there).
-const PORT_SCAN_LIMIT: u64 = 1 << 20;
 
 impl RuntimeContext<'_> {
     // -- erlang:make_ref/0 ----------------------------------------------------
@@ -129,7 +125,7 @@ impl RuntimeContext<'_> {
     pub(super) fn ports_0(&mut self) -> Result<Eterm> {
         let registry = Rc::clone(&self.runtime.ports);
         let ids = match registry.try_borrow() {
-            Ok(registry) => open_port_ids(&registry),
+            Ok(registry) => registry.ids(),
             Err(_) => {
                 return Err(error::unsupported(
                     "erlang:ports/0: the port registry is already borrowed",
@@ -360,37 +356,6 @@ impl RuntimeContext<'_> {
             None => Err(BeamError::BadArg),
         }
     }
-}
-
-/// The currently-open port ids, in port-number order.
-///
-/// [`PortRegistry`] exposes `contains`/`len` but no iterator (its live map is private, and
-/// `src/port.rs` is outside this change's scope), so the ids are recovered from the
-/// registry's own numbering: `PortTable::alloc` appends a fresh slot for each new port and
-/// never shrinks its slot vector, so every allocated id is found by counting up from zero.
-/// The scan is driven by `contains` (the **table**, i.e. an allocated slot) rather than by
-/// `len` (the **live map**): `open_port/2` calls `alloc` before `insert`, and the test
-/// floor allocates an id directly, so a port that is allocated but has no live entry is
-/// still a port `erlang:ports/0` must report. The scan stops at the first unallocated
-/// number, which is the recovery signal that the table's dense low prefix has ended;
-/// [`PORT_SCAN_LIMIT`] is a safety valve rather than a bound a real workload can reach.
-///
-/// One honest limitation: a slot released *below* a still-allocated higher slot leaves a
-/// one-number gap, and the scan stops at it, so such a higher port would not be reported
-/// until the gap is reused. `PortRegistry` exposes no slot-vector length to scan past the
-/// gap (it would need a new accessor in `src/port.rs`, outside this change's scope).
-fn open_port_ids(registry: &PortRegistry) -> Vec<PortId> {
-    let mut ids = Vec::new();
-    let mut number = 0u64;
-    while number < PORT_SCAN_LIMIT {
-        let id = PortId::new(number);
-        if !registry.contains(id) {
-            break;
-        }
-        ids.push(id);
-        number += 1;
-    }
-    ids
 }
 
 #[cfg(test)]
@@ -674,24 +639,28 @@ mod tests {
     }
 
     #[test]
-    fn ports_is_an_empty_list_without_open_ports() {
+    fn ports_reports_the_open_ports() {
         let mut runtime = runtime();
         let ports = call(&mut runtime, "erlang", "ports", &[]).expect("ports/0");
         assert!(
             terms::list_elements(ports).expect("a list").is_empty(),
             "the fresh runtime has opened no port"
         );
-        // A registry holding one port reports exactly that one port term.
-        let id = runtime
-            .ports
-            .borrow_mut()
-            .alloc()
-            .expect("a port id");
+        // A live port is reported as exactly its own port term. It is opened through the
+        // real provider — the same path `open_port/2` takes — so the registry's live map
+        // (the answer's source of truth) is populated the way production populates it.
+        let opened = runtime
+            .eval("open_port({spawn,\"true\"}, [])")
+            .expect("open_port/2 starts a real port");
+        assert!(
+            PortId::is_port(opened),
+            "open_port/2 yields an internal port: {opened:?}"
+        );
         let ports = call(&mut runtime, "erlang", "ports", &[]).expect("ports/0");
         assert_eq!(
             terms::list_elements(ports).expect("a list"),
-            vec![id.to_eterm()],
-            "the allocated port is reported"
+            vec![opened],
+            "the live port is reported"
         );
     }
 

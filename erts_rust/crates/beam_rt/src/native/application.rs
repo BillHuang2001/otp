@@ -1,6 +1,14 @@
 //! The `application:*` runtime-native floor: the runtime's **application configuration
 //! view** — the properties of the OTP applications this runtime consists of.
 //!
+//! This file holds two halves: the production floor — the `application:*` entries plus the
+//! `.app`-resource reader ([`parse_resource`]) they are answered from, roughly the first
+//! 700 lines — and its colocated `#[cfg(test)] mod tests` below. The file legitimately reads
+//! past the workspace's ~1000-line baseline because of that comprehensive colocated test
+//! module (every BIF's oracle shape, every resource-parser construct, and the quoted-atom /
+//! escape handling); the production half is well within the guideline and is not split
+//! further, since the parser and the entries that use it belong together.
+//!
 //! `application` is an OTP application module whose `.beam` (and the
 //! `application_controller`/`application_master` processes behind it) needs facilities
 //! outside Milestone-1: a live process/message machinery, a group leader, a `gen_server`
