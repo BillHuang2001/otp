@@ -23,7 +23,7 @@
 //! `unsafe` below only dereferences pointers this test allocated and wrote itself (or that a
 //! collection just wrote); every block carries a `// SAFETY:` rationale.
 
-use beam_alloc::{default_allocator, Heap, RefcBinary};
+use beam_alloc::{Heap, RefcBinary};
 use beam_gc::prelude::{AnyCollector, CollectionKind, GcConfig, HeapPolicy, MatureKind};
 use beam_term::prelude::{
     arityval, boxed_val, fun_arity, fun_creator_pid, fun_env, fun_function, fun_index,
@@ -491,7 +491,7 @@ fn both_strategies_produce_identical_observable_results() {
     assert!(last.contains("fun(Imported"), "the imported fun is in the graph");
     assert!(last.contains("refc["), "the refc binary is in the graph");
     assert!(
-        last.contains("i900"),
+        !last.contains("i900"),
         "the deliberate round-0 garbage was reclaimed, so it must NOT appear"
     );
 }
