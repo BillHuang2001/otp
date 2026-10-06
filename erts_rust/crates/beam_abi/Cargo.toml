@@ -8,6 +8,9 @@ description = "Layout-frozen NIF (enif_*) and driver (driver_*/erl_drv_*) C ABI 
 [dependencies]
 beam_common = { path = "../beam_common" }
 beam_term = { path = "../beam_term" }
+# Wave-0 sibling: the production bump heap the NIF host seam hands out
+# (`NifHost::heap`). Permitted within the wave-0 layer (no new external crate).
+beam_alloc = { path = "../beam_alloc" }
 libc.workspace = true
 
 [lints]
