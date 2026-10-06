@@ -78,18 +78,27 @@ impl<'a> RuntimeContext<'a> {
     pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
 }
 impl ExecutionContext for RuntimeContext<'_> {
-    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/init:get_argument/system_info)
+    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/system_info/
+    //             init:get_argument,init:get_arguments,init:get_plain_arguments/erlang:display/
+    //             os:cmd/code:get_path,code:all_loaded,code:which,code:lib_dir)
     //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` over
-    //             {heap, code_server atoms, self_pid, tables, output}); else if module == "erlang"
-    //             → `error::unknown_bif`; else seed the system code path
+    //             {heap, code_server atoms, self_pid, tables, output, PendingInterner}); else if
+    //             module == "erlang" → `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
-    // apply_fun → resolve the fun's module (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
+    // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
+    //             `eval::apply_eval_closure`; otherwise resolve the fun's module
+    //             (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
     //             `FunDescriptor { uniq, index }`) across `code_server.modules()`, then
     //             `Machine::new().run_label(...)`.
     // ensure_heap → Ok when `heap_available() >= heap_need`, else `BeamError::SystemLimit`
     //             (M1 has no GC — see Known Issues).
 }
 ```
+`call_bif` builds the `BifContext` with a **`PendingInterner`**: a BIF that must create a *new* atom
+(`binary_to_term`/`list_to_atom`/`binary_to_atom`) records the name; the runtime commits the recorded
+names into the **one shared table** in order after the BIF returns (their predicted indices are exact
+— interning is append-only and single-threaded). This is what makes a `binary_to_term`-decoded atom
+nameable by the printer/comparison — see Design Decisions.
 This is the **only** place the engine's seam meets the Stage-5 core; it keeps the Stage-1/Stage-5
 DAG acyclic (`../CONTEXT.md`).
 
