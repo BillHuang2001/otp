@@ -134,3 +134,48 @@ builds `{badmap, M}` and calls `erlang:error/1` (never reached for a map argumen
 itself. `get/1` on a map without both keys falls to its `case_end` fail label
 (`{case_clause, M}`). The map arguments are built by the engine's flat-map builder
 and keyed by the module's atom table, so the fixtures' key operands compare equal.
+
+## `bignum.beam` (`bignum.erl`) — `tests/bignum_compiled.rs`
+
+Integers outside the 60-bit immediate range, in two shapes.
+
+**Big integer literals as compiler operands.** Each zero-arity function compiles
+to `move {integer, V} {x,0}` + `return`, with `V` inline in the code stream; the
+engine must materialise it as an exact bignum (`terms::make_integer`).
+
+| export | value | oracle repr |
+|---|---|---|
+| `lit_2pow59/0` | `576460752303423488` (2^59) | bignum |
+| `lit_2pow59_plus1/0` | `576460752303423489` | bignum |
+| `lit_nines/0` | `999999999999999999` | bignum |
+| `lit_2pow61/0` | `2305843009213693952` (2^61) | bignum |
+| `lit_neg_2pow59/0` | `-576460752303423488` (MIN_SMALL) | small |
+| `lit_neg_nines/0` | `-999999999999999999` | bignum |
+| `lit_neg_2pow59_minus1/0` | `-576460752303423489` (MIN_SMALL - 1) | bignum |
+| `max_small/0` | `576460752303423487` (MAX_SMALL) | small |
+| `min_small/0` | `-576460752303423488` (MIN_SMALL) | small |
+
+**Runtime overflow** (the arguments make the expression unfoldable, so the
+arithmetic runs in the BIF):
+
+| export | Erlang | opcodes |
+|---|---|---|
+| `add/2` | `A + B.` | `gc_bif '+'` |
+| `sub/2` | `A - B.` | `gc_bif '-'` |
+| `mul/2` | `A * B.` | `gc_bif '*'` |
+| `add_to_big/1` | `576460752303423488 + X.` | `gc_bif '+'` with a bignum **operand** |
+| `big_minus/1` | `999999999999999999 - X.` | `gc_bif '-'` with a bignum operand |
+| `scale_big/1` | `2305843009213693952 * X.` | `gc_bif '*'` with a bignum operand |
+
+`add_to_big/1`/`big_minus/1`/`scale_big/1` are the case where a bignum the
+*engine* materialised from the code stream is handed to `call_bif`.
+
+There is deliberately **no constant-foldable overflow expression** in the fixture:
+`erlc` folds e.g. `123456789012345678 * 98` into a 9-byte operand, which
+`beam_loader` rejects with `system_limit` at load time.
+
+The test's expected values were derived with the oracle, e.g.
+`erl -noshell -eval 'io:format("~p~n",[bignum:mul(123456789012345678,123456789012345678)]),halt().'`
+(the values above the immediate range are asserted bit-exactly against
+`beam_term::big_parts`, and the representation — small vs bignum — is asserted
+too, matching ERTS' canonical choice).
