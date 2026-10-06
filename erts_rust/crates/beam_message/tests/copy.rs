@@ -212,3 +212,100 @@ fn out_of_range_off_heap_slot_is_a_bad_term() {
         other => panic!("expected BadArg for an out-of-range off-heap slot, got {other:?}"),
     }
 }
+
+/// Counts the inner (`MAP_HEADER_TAG_HAMT_NODE_BITMAP`) nodes reachable from the hash-map node
+/// `node`, iteratively, so a 40-key trie's subtrees are all inspected. Leaf cons cells are `LIST`
+/// words and collision tuples are `ARITYVAL` boxed terms (which hold only cells), so both are
+/// skipped — they can contain no further sub-node.
+fn count_inner_nodes(node: Eterm) -> usize {
+    let mut count = 0;
+    let mut stack = vec![node];
+    while let Some(term) = stack.pop() {
+        if !is_boxed(term) {
+            continue;
+        }
+        // SAFETY: `term` is boxed, so its header word is a live term word.
+        let head = unsafe { *boxed_val(term) };
+        if !is_map_header(head) {
+            continue;
+        }
+        let arity = header_arity(head);
+        let nslots = map_header_val(head).count_ones() as usize;
+        if map_header_type(head) as usize == MAP_HEADER_TAG_HAMT_NODE_BITMAP {
+            count += 1;
+        }
+        for i in 0..nslots {
+            // SAFETY: slot `i` of the node is within its payload.
+            let slot = unsafe { *boxed_val(term).add(1 + arity + i) };
+            stack.push(slot);
+        }
+    }
+    count
+}
+
+#[test]
+fn hash_map_over_32_keys_is_copied_as_a_whole_trie() {
+    let mut atoms = AtomTable::new();
+
+    // 40 distinct small-integer keys exceed `MAP_SMALL_MAP_LIMIT` (32), so `write_map` builds a
+    // genuine HAMT (hash map) rather than a flat map.
+    let pairs: Vec<(Eterm, Eterm)> = (0..40)
+        .map(|i| (make_small(i), make_small(i * 1000 + 7)))
+        .collect();
+
+    let mut src = Heap::new(map_words_capacity(40) + 16).expect("source heap");
+    // SAFETY: `alloc_words` returns `map_words_capacity(40)` exclusively-owned words, which
+    // `write_map` fills entirely.
+    let map = unsafe {
+        let hp = src.alloc_words(map_words_capacity(40)).expect("the map fits");
+        write_map(hp, &pairs, &atoms).expect("the 40-key map builds")
+    };
+
+    // SAFETY: `map` is a live boxed map term.
+    let src_head = unsafe { *boxed_val(map) };
+    assert!(is_map_header(src_head));
+    assert!(!is_flatmap_header(src_head), "40 > 32 keys => a hash map");
+
+    let mut dst = Heap::new(size_object(map) + 16).expect("destination heap");
+    let copy = copy_struct_simple(map, &mut dst).expect("the copy succeeds");
+
+    // Structural equality: the whole copied trie is `=:=` the original.
+    assert!(compare::eq(map, copy, &atoms), "the copy must be =:= the original");
+    // A genuine full copy: every trie node, collision tuple and leaf is copied.
+    assert_eq!(dst.used(), size_object(map), "the whole trie is copied");
+
+    // Well-formedness: same size, and every key resolves to its original value.
+    assert_eq!(map_size(copy, &atoms).expect("a well-formed map"), 40);
+    for (k, v) in &pairs {
+        assert_eq!(
+            map_get(copy, *k, &atoms).expect("a well-formed map"),
+            Some(*v),
+            "key {k:?} must resolve to {v:?}"
+        );
+    }
+
+    // The copy is a hash map with the same head kind as the source, and the trie really has
+    // sub-nodes (40 keys cannot fit in a single HAMT level).
+    // SAFETY: `copy` is a live boxed map term.
+    let copy_head = unsafe { *boxed_val(copy) };
+    assert!(!is_flatmap_header(copy_head), "still a hash map, not flattened");
+    assert_eq!(
+        map_header_type(copy_head),
+        map_header_type(src_head),
+        "the head kind is preserved"
+    );
+    assert!(
+        count_inner_nodes(copy) > 0,
+        "the copied trie must contain at least one sub-node"
+    );
+    assert_eq!(
+        count_inner_nodes(copy),
+        count_inner_nodes(map),
+        "every source sub-node is reproduced"
+    );
+
+    // A genuine *collision* node (two distinct keys with an identical 64-bit `term_hash`) is not
+    // reachable with distinct small-integer keys, so collision-node coverage is intentionally not
+    // forced here — a collision tuple is an ordinary `ARITYVAL` boxed term the copier already
+    // walks (see `layout::for_each_child_slot`'s `ARITYVAL_SUBTAG` arm).
+}

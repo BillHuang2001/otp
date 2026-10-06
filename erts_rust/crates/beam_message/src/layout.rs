@@ -1,7 +1,12 @@
-//! `pub(crate)` layout helpers: per-object word counts, off-heap-container identification and
-//! the off-heap reference encoding used by the copier.
+//! `pub(crate)` layout helpers: per-object word counts, per-object child-slot enumeration,
+//! off-heap-container identification and the off-heap reference encoding used by the copier.
 //!
-//! Ground truth: `copy.c`'s `move_boxed`/`size_object_x` and the frozen `BinRef` container thing
+//! Every boxed shape the copier can meet is sized and walked: transparent tuples/records, funs,
+//! flatmaps, **all three HAMT node kinds** (head-array, head-bitmap and inner node-bitmap) and the
+//! leaf things (float/bignum/ref/off-heap container/heap-sub bits/external pid/port/ref).
+//!
+//! Ground truth: `copy.c`'s `move_boxed`/`size_object_x` (the HAMT shape mirrors
+//! `size_object_x`, `copy.c:192-214`) and the frozen `BinRef` container thing
 //! `[HEADER_BIN_REF, val, next]` (`ERL_BIN_REF_SIZE = 3`, `beam_term::boxed`), where M1 stores
 //! the MSO slot in `val` and leaves `next` unused (see the crate `CONTEXT.md`, Design Decisions).
 //!
@@ -29,6 +34,9 @@ fn fun_num_free(header: Eterm) -> usize {
 /// count): this is what the incremental allocator inside `copy_struct` reserves per object.
 /// Ground truth: `copy.c`'s `move_boxed` (the `nelts + 1` sizing).
 ///
+/// All three HAMT node kinds are sized like `beam_gc::copy::move_size`/`beam_term::size_object`
+/// (`1 + header_arity + popcount(MAP_HEADER_VAL)`), not collapsed to a leaf.
+///
 /// `object` must point at the object's header word (i.e. `boxed_val(term)`); it is dereferenced
 /// only to read a flatmap's in-payload size word.
 pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
@@ -40,8 +48,18 @@ pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
             // SAFETY: `object` points at a live flatmap head; word 1 is its untagged size word.
             unsafe { *object.add(1) }.raw() + 3
         }
-        // Non-flatmap map heads (hashmaps) and every leaf thing (float, bignum, ref, off-heap
-        // container, heap/sub bits, external pid/port/ref): header + `arity` payload words.
+        MAP_SUBTAG => {
+            // Every other map header is a real HAMT node — a head-array, a head-bitmap or an
+            // inner node-bitmap — laid out as `[hdr][arity words][n slots]`, one slot per set
+            // occupancy bit. `header_arity` is `1` for the two head kinds (their extra `size`
+            // word) and `0` for an inner node, so the object is `1 + arity + popcount` words.
+            // Mirrors `beam_gc::copy::move_size` and `beam_term::size.rs`'s HAMT arm.
+            let arity = header_arity(header);
+            let nslots = map_header_val(header).count_ones() as usize;
+            1 + arity + nslots
+        }
+        // Every leaf thing (float, bignum, ref, off-heap container, heap/sub bits, external
+        // pid/port/ref): header + `arity` payload words.
         _ => thing_arityval(header) + 1,
     }
 }
@@ -51,7 +69,9 @@ pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
 ///
 /// Offsets are relative to the header word (offset 0). Objects whose payload holds no navigable
 /// on-heap child — a float's value, a bignum's limbs, a reference's words, an off-heap container's
-/// `val`/`next`, heap/sub-bit data and a (non-flatmap) hashmap head — yield no offsets.
+/// `val`/`next`, and heap/sub-bit data — yield no offsets. Every **HAMT node kind** (head-array,
+/// head-bitmap, inner node-bitmap) instead visits all of its slots: each slot is non-immediate (a
+/// leaf cons cell, a boxed sub-node pointer or a collision tuple), so the whole trie is reached.
 ///
 /// `object` must point at the object's header word; it is dereferenced only for a flatmap's size
 /// word.
@@ -78,6 +98,17 @@ pub(crate) fn for_each_child_slot(
             visit(2); // the keys tuple
             for offset in 3..3 + size {
                 visit(offset);
+            }
+        }
+        MAP_SUBTAG => {
+            // A HAMT node — head-array, head-bitmap or inner node-bitmap. Slots start at
+            // `1 + header_arity` (after the two head kinds' `size` word) and there is one per set
+            // occupancy bit. A collision node is an ordinary ARITYVAL boxed term, walked by the
+            // `ARITYVAL_SUBTAG` arm when the copier reaches it, so it needs no special case here.
+            let arity = header_arity(header);
+            let nslots = map_header_val(header).count_ones() as usize;
+            for i in 0..nslots {
+                visit(1 + arity + i);
             }
         }
         _ => {}
@@ -193,6 +224,43 @@ mod tests {
         let mut slots = Vec::new();
         for_each_child_slot(words[0], words.as_ptr(), |offset| slots.push(offset));
         assert_eq!(slots, vec![2, 3, 4]);
+    }
+
+    #[test]
+    fn object_words_of_hamt_nodes_is_header_arity_plus_slots() {
+        // Head-array: `[hdr][size][16 slots]` — 18 words (`map_header_val = 0xffff`).
+        let head_array = [make_map_header(MAP_HEADER_TAG_HAMT_HEAD_ARRAY, 1, 0xffff); 18];
+        assert!(is_map_header(head_array[0]) && !is_flatmap_header(head_array[0]));
+        assert_eq!(object_words(head_array[0], head_array.as_ptr()), 18);
+
+        // Head-bitmap with two set bits: `[hdr][size][slot][slot]` — `2 + nslots` words.
+        let head_bitmap = [make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, 0b0011); 4];
+        assert_eq!(object_words(head_bitmap[0], head_bitmap.as_ptr()), 2 + 2);
+
+        // Inner node-bitmap with three set bits: `[hdr][slot][slot][slot]` — `1 + nslots` words.
+        let inner = [make_map_header(MAP_HEADER_TAG_HAMT_NODE_BITMAP, 0, 0b1011); 4];
+        assert_eq!(object_words(inner[0], inner.as_ptr()), 1 + 3);
+    }
+
+    #[test]
+    fn child_slots_of_hamt_nodes_are_the_occupied_slots() {
+        // Head-array: one slot per word 2..18.
+        let head_array = [make_map_header(MAP_HEADER_TAG_HAMT_HEAD_ARRAY, 1, 0xffff); 18];
+        let mut slots = Vec::new();
+        for_each_child_slot(head_array[0], head_array.as_ptr(), |o| slots.push(o));
+        assert_eq!(slots, (2..18).collect::<Vec<_>>());
+
+        // Head-bitmap (two set bits): slots start after the head's `size` word.
+        let head_bitmap = [make_map_header(MAP_HEADER_TAG_HAMT_HEAD_BITMAP, 1, 0b0101); 4];
+        let mut slots = Vec::new();
+        for_each_child_slot(head_bitmap[0], head_bitmap.as_ptr(), |o| slots.push(o));
+        assert_eq!(slots, vec![2, 3]);
+
+        // Inner node-bitmap (three set bits): no `size` word, slots start at word 1.
+        let inner = [make_map_header(MAP_HEADER_TAG_HAMT_NODE_BITMAP, 0, 0b1011); 4];
+        let mut slots = Vec::new();
+        for_each_child_slot(inner[0], inner.as_ptr(), |o| slots.push(o));
+        assert_eq!(slots, vec![1, 2, 3]);
     }
 
     #[test]
