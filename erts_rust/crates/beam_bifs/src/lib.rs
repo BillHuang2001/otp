@@ -28,8 +28,8 @@
 //! * `access` — the crate's **only** `unsafe` module: safe wrappers over
 //!   `beam_term`'s raw (header-dereferencing) term accessors.
 //! * the BIF modules (`arith`, `bool`, `compare`, `type_test`, `term_ops`, `proc`,
-//!   `port`, `reason`, `io`) — the Milestone-1 core BIF list, each registering its
-//!   implementations through its own `register` entry point.
+//!   `port`, `reason`, `nif`, `io`) — the Milestone-1 core BIF list, each
+//!   registering its implementations through its own `register` entry point.
 //! * [`ets`] — the [`TableRegistry`] bridge over `beam_ets::Table`; the table handle
 //!   is an on-heap `Ref` thing (the M1 substitution for a real `tid()`).
 
@@ -51,6 +51,7 @@ mod io;
 mod lists;
 mod maps;
 mod math;
+mod nif;
 mod numeric;
 mod phash;
 mod port;
@@ -66,8 +67,8 @@ mod type_test;
 mod unicode;
 
 pub use crate::context::{
-    AtomInterner, BifContext, BytesSink, DictHook, FunCaller, NullSink, OutputSink, PortHook,
-    SendHook, StdoutSink,
+    AtomInterner, BifContext, BytesSink, DictHook, FunCaller, NifLoadError, NifLoader, NullSink,
+    OutputSink, PortHook, SendHook, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -83,6 +84,7 @@ pub mod prelude {
     pub use crate::{
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
-        DictHook, FunCaller, NullSink, OutputSink, PortHook, SendHook, StdoutSink, TableRegistry,
+        DictHook, FunCaller, NifLoadError, NifLoader, NullSink, OutputSink, PortHook, SendHook,
+        StdoutSink, TableRegistry,
     };
 }
