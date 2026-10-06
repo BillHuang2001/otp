@@ -45,6 +45,53 @@ impl DriverFlags {
     }
 }
 
+/// The readiness directions a driver has registered with the poller, as seen through its
+/// [`DriverContext`].
+///
+/// The poller keys **every** registration by the port number, so a `poller::Event` tells the
+/// reactor *which port* fired but not which of the port's descriptors (its read fd or its
+/// write fd) it was. The legacy C has no such ambiguity — each `ErlDrvEvent` carries its own
+/// task handle — so this type restores the missing information in Rust: the [`crate::Port`]
+/// owns one [`PortArms`] and the reactor consults it before scheduling a direction.
+///
+/// That is why a full-close event (`EPOLLHUP`, which `mio` reports as **both** `read_closed`
+/// and `write_closed`) does not schedule an `OUTPUT` task for a read-only port that never
+/// armed a write fd.
+#[derive(Clone, Debug, Default)]
+pub(crate) struct PortArms {
+    /// The live registrations, as `(token, interest)` pairs (a couple per port at most).
+    entries: Vec<(Token, Interest)>,
+}
+
+impl PortArms {
+    /// Records a new registration, or updates the interest of an existing one.
+    pub(crate) fn record(&mut self, token: Token, interest: Interest) {
+        match self.entries.iter_mut().find(|(armed, _)| *armed == token) {
+            Some(entry) => entry.1 = interest,
+            None => self.entries.push((token, interest)),
+        }
+    }
+
+    /// Forgets a registration that was removed.
+    pub(crate) fn forget(&mut self, token: Token) {
+        self.entries.retain(|(armed, _)| *armed != token);
+    }
+
+    /// Whether the driver has an armed registration that wants readability.
+    pub(crate) fn read_armed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, interest)| interest.is_readable())
+    }
+
+    /// Whether the driver has an armed registration that wants writability.
+    pub(crate) fn write_armed(&self) -> bool {
+        self.entries
+            .iter()
+            .any(|(_, interest)| interest.is_writable())
+    }
+}
+
 /// The driver's view of its port.
 ///
 /// This is the **only** way a driver reaches the poller or the port's byte queues. Poll
@@ -60,10 +107,13 @@ pub struct DriverContext<'a> {
     input: &'a mut ByteQueue,
     /// The port's output queue (bytes waiting to be written by the driver).
     output: &'a mut ByteQueue,
+    /// The registrations this driver holds, so the reactor knows which directions it can
+    /// serve (see [`PortArms`]).
+    arms: &'a mut PortArms,
 }
 
 impl<'a> DriverContext<'a> {
-    /// Builds a context for `port` over the given disjoint poller/queue borrows.
+    /// Builds a context for `port` over the given disjoint poller/queue/arming borrows.
     ///
     /// Called by [`crate::port::Port`] after it has destructured itself into disjoint
     /// fields, so the driver and its context borrow separate members of the `Port`.
@@ -72,12 +122,14 @@ impl<'a> DriverContext<'a> {
         poller: &'a mut Poller,
         input: &'a mut ByteQueue,
         output: &'a mut ByteQueue,
+        arms: &'a mut PortArms,
     ) -> DriverContext<'a> {
         DriverContext {
             port,
             poller,
             input,
             output,
+            arms,
         }
     }
 
@@ -95,7 +147,9 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the operating system rejects the registration.
     pub fn register(&mut self, fd: RawFd, interest: Interest) -> Result<Token> {
-        self.poller.register(fd, interest, self.port.number())
+        let token = self.poller.register(fd, interest, self.port.number())?;
+        self.arms.record(token, interest);
+        Ok(token)
     }
 
     /// Changes the interest mask of a registration made by this context.
@@ -104,7 +158,9 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the token is unknown or the re-registration fails.
     pub fn reregister(&mut self, fd: RawFd, token: Token, interest: Interest) -> Result<()> {
-        self.poller.reregister(fd, token, interest)
+        self.poller.reregister(fd, token, interest)?;
+        self.arms.record(token, interest);
+        Ok(())
     }
 
     /// Removes a registration made by this context.
@@ -113,7 +169,9 @@ impl<'a> DriverContext<'a> {
     ///
     /// Returns `BeamError::Io` when the token is unknown or the de-registration fails.
     pub fn deregister(&mut self, fd: RawFd, token: Token) -> Result<()> {
-        self.poller.deregister(fd, token)
+        self.poller.deregister(fd, token)?;
+        self.arms.forget(token);
+        Ok(())
     }
 
     /// The port's input queue, which the driver appends bytes it read to.
