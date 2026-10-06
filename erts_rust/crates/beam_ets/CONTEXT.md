@@ -341,6 +341,31 @@ impl Table {
 - **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
   mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
   unchanged, as the oracle does.
+- **`select_replace/2` is a two-phase value-validated rewrite.** Phase one evaluates and validates
+  every matching object's clause value (a tuple of arity ≥ keypos whose keypos element `eq`s the
+  matched object's key) *and* deep-copies it into table storage; phase two swaps the objects in. Any
+  invalid value aborts the whole call with `badarg` leaving the table unchanged. Returns the count of
+  replaced objects. `bag` ⇒ `badarg`. The C `db_match_keeps_key` check is **static** (it rejects a body
+  that is not syntactically `'$_'`/`{{ … }}`/`{const,{…}}`/`{element,KeyPos,'$_'}` even when nothing
+  matches); this crate validates the *value*, so an exotic multi-expression body diverges (Known
+  Issues).
+- **Match-spec arithmetic routes through the `ArithHook` seam, not a new crate edge.** `expr::eval`'s
+  signature is unchanged (a sibling task owns `exec.rs`); the hook is resolved inside `expr.rs` via a
+  `thread_local! { static ARITH_HOOK: RefCell<Option<Rc<dyn ArithHook>>> }` installed by
+  `set_arith_hook`. `DefaultArithHook` does checked i64 arithmetic (bignum/float/`/`/overflow ⇒ typed
+  `unsupported`, `div`/`rem` by zero ⇒ `badarg`); a real runtime installs a full bignum/float hook.
+  Keeps `beam_ets` (wave 1) free of a `beam_bifs` dependency; candidate to lift into `beam_term` later.
+- **Continuations are opaque owned values, not terms.** `MatchContinuation` carries table id +
+  compiled `MatchSpec` + limit + scan position (`Clone`+`Debug`+`PartialEq`) so `select_continue`
+  resumes from the saved position without re-compiling; `Option::None` is the crate's `'$end_of_table'`,
+  and the bridge renders the bare-atom vs `{Results,'$end_of_table'}` shape (Known Issues).
+- **`match_spec_run` accepts the raw spec.** The oracle requires `ets:match_spec_compile/1` first (a raw
+  clause list is `badarg`); this crate has no compiled-spec term, so `run.rs` compiles the raw term
+  directly — the bridge maps `ets:match_spec_compile/1` onto the compiled `MatchSpec` (Known Issues).
+- **A BODY runtime failure yields the atom `EXIT`; a GUARD failure skips the clause.** The C
+  `erl_db_util.c` sets `FAIL_TERM = am_EXIT` around body evaluation (`matchCatch`), so a raising
+  last-expression body yields `'EXIT'` and evaluation continues, while a guard error means the clause
+  does not match. Verified against `erl` (`[{{'_','_'},[],[{hd,5}]}]` ⇒ `['EXIT','EXIT']`).
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
