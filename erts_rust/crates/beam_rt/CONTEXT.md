@@ -318,6 +318,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   → `Eterm` materialization (`wordsize` int, `version` string-list), `PreloadedModules`, the
   evaluator (`2+3`→5, `2*3+4`→10, `(1+2)*3`→9, `case`/`catch`/`fun`/comprehension cases, malformed
   input → typed gap), CLI `+S/+P/-pa/-pz` mapping,
+  the evaluator's `FunCaller` path (`lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, i.e. a loaded
+  stdlib module applying an `-eval` closure) and `nif_error`'s live reason term (atom → atom; the tuple
+  `{nif_not_loaded,m,f,0}` printed verbatim),
   the native floor (`erlang:halt/0,1` records `Runtime::halt`, `init:get_argument` occurrences/absent),
   `error::unsupported_reason` (`Some` for `bad_eval`/`unsupported_opcode`/`unsupported_bif`, `None` for
   `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`.
