@@ -969,21 +969,26 @@ mod tests {
 
     #[test]
     fn a_boxed_element_is_deferred_with_the_presence_marker() {
-        // `{a, 1}`: element 0 (`a`) is not an immediate, so its presence marker is
-        // mixed and the element deferred; element 1 is the current term.
-        let mut heap = Heap::new(8);
-        let atom = make_atom(crate::atom::Atom::from_index(3));
+        // `{{7}, 1}`: element 0 (a tuple) is not an immediate, so its presence
+        // marker is mixed and the element deferred; element 1 is the current term.
+        // The deferred tuple is then popped and processed as a tuple.
+        let mut heap = Heap::new(16);
+        let inner = heap.tuple(&[make_small(7)]).expect("the inner tuple fits");
         let t = heap
-            .tuple(&[atom, make_small(1)])
+            .tuple(&[inner, make_small(1)])
             .expect("the tuple fits");
         let expected = {
             let mut h = IHash::new(0);
             h.mix_alpha(IHASH_TYPE_TUPLE);
             h.mix_beta(2);
+            // push_term on element 0 (a tuple): presence marker + defer.
             h.mix_alpha(IHASH_TYPE_ARRAY_ELEMENT);
+            // current term = element 1 (an immediate).
             h.mix_immediate((make_small(1)).raw() as u64);
-            // pop the deferred atom and hash it as an immediate.
-            h.mix_immediate(atom.raw() as u64);
+            // pop the deferred tuple and process it as a 1-tuple.
+            h.mix_alpha(IHASH_TYPE_TUPLE);
+            h.mix_beta(1);
+            h.mix_immediate((make_small(7)).raw() as u64);
             h.finish()
         };
         assert_eq!(erts_map_hash(t), expected);
@@ -991,7 +996,9 @@ mod tests {
 
     #[test]
     fn float_hashes_its_ieee_bits() {
-        let mut heap = Heap::new(8);
+        // Each float occupies `FLOAT_SIZE_WORDS` words and the bump arena is not
+        // reset, so reserve room for all six.
+        let mut heap = Heap::new(6 * crate::thing::FLOAT_SIZE_WORDS);
         for v in [0.0f64, -0.0, 1.0, 3.5, f64::MIN_POSITIVE, f64::MAX] {
             // SAFETY: 2 words are reserved for the float block.
             let t = unsafe {
