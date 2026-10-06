@@ -44,8 +44,8 @@ pub mod eval;
 pub mod format;
 pub mod info;
 mod native;
+pub mod port;
 pub mod runtime;
-
 pub use crate::boot::{boot_banner, PreloadedModules};
 pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE};
 pub use crate::codeserver::CodeServer;
@@ -56,8 +56,8 @@ pub use crate::context::RuntimeContext;
 pub use crate::eval::eval;
 pub use crate::format::{term_to_string, term_to_string_w};
 pub use crate::info::{system_info_value, InfoValue, SUPPORTED_KEYS};
+pub use crate::port::{PortName, PortRegistry, RuntimePorts, StreamType, PORT_INFO_ATOMS};
 pub use crate::runtime::Runtime;
-
 /// The conventional glob-import surface for downstream crates.
 ///
 /// `use beam_rt::prelude::*;` brings the runtime façade ([`Runtime`]), its code server
@@ -72,5 +72,5 @@ pub mod prelude {
     pub use crate::eval::eval;
     pub use crate::format::{term_to_string, term_to_string_w};
     pub use crate::info::{system_info_value, InfoValue};
-    pub use crate::runtime::Runtime;
-}
+    pub use crate::port::{PortRegistry, RuntimePorts};
+    pub use crate::runtime::Runtime;}

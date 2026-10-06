@@ -42,7 +42,7 @@ use crate::error;
 use crate::eval::FunBody;
 use crate::format;
 use crate::info::{self, InfoValue};
-
+use crate::port::PortRegistry;
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
 ///
 /// It is `reset()` at the start of every such call, so it only has to hold one
@@ -94,7 +94,15 @@ pub struct Runtime {
     /// applied by a BIF) finds it already borrowed and runs without ETS — the `ets:*` BIFs
     /// then raise `unsupported_bif`, never a wrong result.
     pub(crate) tables: Rc<RefCell<TableRegistry>>,
-    /// The pid code runs as (`erlang:self/0`).
+    /// The port table and the live ports behind `erlang:open_port/2`.
+    ///
+    /// Shared through an [`Rc`]`<`[`RefCell`]`>` for the same reason as
+    /// [`Runtime::tables`]: a BIF call holds it for the duration of its call without
+    /// borrowing the runtime, so the fun-caller bridge can borrow the runtime at the same
+    /// time (see [`crate::context::RuntimeContext::call_registered`]). A **nested** borrow
+    /// (a port operation re-entered from inside a port operation) is reported as a typed
+    /// capability gap rather than panicking.
+    pub(crate) ports: Rc<RefCell<PortRegistry>>,    /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
     /// Whether [`Runtime::boot`] has run.
     booted: bool,
@@ -149,7 +157,7 @@ impl Runtime {
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
             eval_heap: Heap::new(heap_words)?,
             tables: Rc::new(RefCell::new(TableRegistry::new())),
-            self_pid,
+            ports: Rc::new(RefCell::new(PortRegistry::new()?)),            self_pid,
             booted: false,
             halt: None,
             eval_closures: Vec::new(),

@@ -162,7 +162,13 @@ pub fn seed_core_atoms(atoms: &mut AtomTable) {
     for name in crate::info::INFO_ATOMS {
         atoms.intern(name);
     }
-    // The signal machinery interns its own names through this helper; doing it here
+    // The port surface ([`crate::port`]) resolves the atoms `port_info/1,2` can emit
+    // through this same table, so the whole vocabulary must be present for the same
+    // reason: a name that is missing would make the hook report `TermNotFound` instead of
+    // the item. `PORT_INFO_ATOMS` is that vocabulary's single source of truth.
+    for name in crate::port::PORT_INFO_ATOMS {
+        atoms.intern(name);
+    }    // The signal machinery interns its own names through this helper; doing it here
     // keeps the boot sequence in one place.
     beam_process::SignalAtoms::from_table(atoms);
 }
@@ -250,6 +256,20 @@ mod tests {
         }
     }
 
+    #[test]
+    fn seed_core_atoms_interns_the_whole_port_vocabulary() {
+        // The port provider (`crate::port`) resolves every `port_info/1,2` item atom
+        // through this table and reports `TermNotFound` for a name that is absent, so the
+        // boot seed must contain the whole `PORT_INFO_ATOMS` vocabulary.
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        for name in crate::port::PORT_INFO_ATOMS {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        for name in ["name", "id", "connected", "os_pid", "links", "monitors", "stream"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+    }
     #[test]
     fn banner_names_otp_and_erts() {
         let banner = boot_banner();

@@ -328,8 +328,62 @@ fn the_binary_segment_probes_agree_with_the_oracle() {
     }
 }
 
-/// A `-eval` expression outside the grammar is a *capability gap* — exit 3 with exactly
-/// one `beam_rt: unsupported: …` line. `tests/cli.rs` asserts the shape; here it is
+/// The A.4 driver probe the differential corpus carries
+/// (`driver/port_backed_by_spawn_driver`): `erlang:open_port/2` **really** starts an OS
+/// process through the `spawn` driver and yields a real internal port.
+///
+/// Pinned at the CLI boundary with the corpus's own argv and probe wrapper, so the
+/// **wiring** cannot silently regress: the shared `PortRegistry` on
+/// [`Runtime`](beam_rt::Runtime), the boot-seeded `port_info` atom vocabulary
+/// ([`PORT_INFO_ATOMS`](beam_rt::PORT_INFO_ATOMS), interned by
+/// [`seed_core_atoms`](beam_rt::boot::seed_core_atoms)) and the `PortHook` that
+/// `RuntimeContext::call_registered` installs are all on this path. The `src/port.rs`
+/// unit tests cover the provider in isolation; this covers it end to end.
+///
+/// The three `port_info/2` goldens that differ from erts are this crate's **documented**
+/// contract (`crate::port`): `connected` is a boolean where erts reports the controlling
+/// pid, and `links`/`monitors` are genuinely empty because nothing links or monitors a
+/// port yet.
+#[test]
+fn open_port_spawns_a_real_os_process() {
+    let cases: &[(&str, &str)] = &[
+        // The corpus's own A.4 probe — the gate case.
+        ("is_port(open_port({spawn,\"true\"},[]))", "ok true"),
+        // A real OS process: the port answers with a real integer `os_pid`.
+        (
+            "is_integer(erlang:port_info(open_port({spawn,\"true\"},[]), os_pid))",
+            "ok true",
+        ),
+        // The `port_info/1` item list is well formed …
+        (
+            "is_list(erlang:port_info(open_port({spawn,\"true\"},[])))",
+            "ok true",
+        ),
+        // … nothing links or monitors such a port …
+        ("erlang:port_info(open_port({spawn,\"true\"},[]), links)", "ok []"),
+        // … `list` is the default stream type and the port is connected …
+        ("erlang:port_info(open_port({spawn,\"true\"},[]), stream)", "ok list"),
+        (
+            "erlang:port_info(open_port({spawn,\"true\"},[]), connected)",
+            "ok true",
+        ),
+        // … and `port_close/1` kills and reaps the child, answering `ok`.
+        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok ok"),
+    ];
+
+    for (expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+}
+
+/// A `-eval` expression outside the grammar is a *capability gap* — exit 3 with exactly/// one `beam_rt: unsupported: …` line. `tests/cli.rs` asserts the shape; here it is
 /// re-asserted through the probe helper so the corpus cannot regress into a silent 0.
 #[test]
 fn an_unparseable_probe_is_unsupported_not_wrong() {
