@@ -166,7 +166,7 @@ Module pass `ssa_opt_bc_size` (`beam_ssa_opt.erl:317-321`). Computes the exact s
 - Core Erlang AST API & tools: `cerl`, `cerl_trees`, `cerl_clauses`, `core_lib`, `core_pp`, `core_scan`, `core_parse.yrl`, `core_lint`, `rec_env`
 - AST→Core and Core optimizers: `v3_core`, `sys_core_prepare`, `sys_core_fold`, `sys_core_fold_lists`, `cerl_inline`, `sys_core_inline`, `sys_core_alias`, `sys_core_bsm`
 - Core→SSA and SSA format: `beam_core_to_ssa`, `beam_ssa`, `beam_ssa.hrl`, `beam_ssa_lint`, `beam_ssa_pp`, `beam_ssa_check`
-- SSA optimization loop & sub-passes: `beam_ssa_opt` (six-phase driver), `beam_ssa_dead`, `beam_ssa_bc_size`, `beam_ssa_destructive_update`, `beam_ssa_alias`, `beam_ssa_ss`
+- SSA optimization loop & sub-passes: `beam_ssa_opt` (six-phase driver), `beam_ssa_dead`, `beam_ssa_bc_size`, `beam_ssa_destructive_update`, `beam_ssa_alias`, `beam_ssa_ss`, plus the opt-in `beam_ssa_loop_opt` (flag `loop_opt`), `beam_ssa_fus` (flag `fusion_opt`) and `beam_ssa_fbip` (flag `fbip_opt`)
 - SSA pass modules run from `compile.erl` `kernel_passes/0`: `beam_ssa_bool`, `beam_ssa_share`, `beam_ssa_recv`, `beam_ssa_bsm`, `beam_ssa_throw`
 - Type analysis: `beam_types`, `beam_types.hrl`, `beam_ssa_type`, `beam_call_types`, `beam_bounds`
 - SSA→codegen: `beam_ssa_pre_codegen`, `beam_ssa_codegen`
