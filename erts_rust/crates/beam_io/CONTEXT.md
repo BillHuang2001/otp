@@ -348,7 +348,7 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - **`src/port.rs` is ~1430 lines, ~590 of which are its in-module test suite** (source ≈ 845 lines, under the
   ~1000 baseline). A future split by responsibility (move `PortRegistry` + reactor glue to `registry.rs`, keeping
   `Port` in `port.rs`) is reasonable; the file is long only because the tests are comprehensive in-place.
-- **`src/drivers/spawn.rs` is ~995 lines, ~275 of which are its in-module test suite** (source ≈ 720 lines, still
+- **`src/drivers/spawn.rs` is 996 lines, ~275 of which are its in-module test suite** (source ≈ 720 lines, still
   under the ~1000 baseline). It holds the whole OS-child driver plus the term-free spec/`build_command`; if it
   grows, split the spec (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/`build_command`) into a sibling module and keep
   the driver in `spawn.rs`.
