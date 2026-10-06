@@ -68,6 +68,9 @@ impl Runtime {
     /// its `return` (a normally-returning process's *exit reason* is `normal`, not that
     /// value — see `runner.rs`/Design Decisions).
     pub fn spawn_process(&mut self, module: &str, function: &str, args: Vec<Eterm>) -> Result<ProcessId>;
+    /// Spawn a process whose entry point is a **fun** — a `.beam` fun term or an `-eval`
+    /// closure — and make it runnable (the `spawn/1` path; see `runner.rs`).
+    pub fn spawn_fun_process(&mut self, fun: Eterm, args: Vec<Eterm>) -> Result<ProcessId>;
     /// Put a spawned process back on the run queue and mark it `Runnable` (idempotent —
     /// an already-queued pid is a no-op; a pid with no engine is a typed error).
     pub fn enqueue_process(&mut self, pid: ProcessId) -> Result<()>;
