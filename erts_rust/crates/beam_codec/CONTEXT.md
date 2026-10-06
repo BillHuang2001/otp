@@ -246,9 +246,10 @@ wrapper — inflated in `decode_term`; encode emits it only through the explicit
 by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
 4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
 `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
-**Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
-result):** `67 RECORD` (native record — blocked on a `beam_term` record layout, see §Known Issues);
-plus any atom name not representable in the emitted encoding.
+**No recognized tag is left `unsupported`.** `RECORD_EXT` (`67`) decodes and encodes through
+`beam_term::record` (§Records). An `unsupported` outcome remains only for a *term kind* the wire
+cannot carry: an atom name not representable in the emitted encoding, and a `FunKind::Local` fun on
+**encode** (`error::unsupported_local_fun`, see §Error surface).
 **Tags rejected as malformed `BadArg`** (exactly as the C term decoder does): `68 DIST_HEADER` (a
 distribution-transport wrapper, never a term — `goto error`, `external.c:6464`; the `'D'` framing is
 `beam_dist`'s), `117 FUN` (removed in OTP 23, `external.c:6399-6404`) and `78 NEW_CACHE` (dead
