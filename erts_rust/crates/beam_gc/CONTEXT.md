@@ -320,9 +320,10 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
-- **GenImmix is implementable and integrated, not yet *justified*.** Per Part II §D/§H it stays
-  measurement-gated and off the default path (`MatureKind::Copying` is the default, so today's behaviour
-  is unchanged); the current `Immix` mature generation is the mark-region space described above.
+- **GenImmix is integrated and measured, but stays off the default path.** Per Part II §D/§H it is
+  measurement-gated: the movement win above is real on long-lived data, but line-granular internal
+  fragmentation means it is not a blanket win, so `MatureKind::Copying` remains the default (today's
+  behaviour unchanged). The `Immix` mature generation is the mark-region space described above.
 - **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
   every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
   but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
