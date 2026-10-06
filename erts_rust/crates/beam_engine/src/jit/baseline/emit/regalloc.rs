@@ -13,6 +13,7 @@ use beam_loader::{Instr, Label, Module};
 use crate::interpreter;
 use crate::machine::MAX_REGISTER;
 
+use super::aggregate::{get_hd_shape, get_list_shape, get_tl_shape};
 use super::arith::fast_arith;
 use super::operands::{constant_word, x_register};
 use super::select::select_val_plan;
@@ -24,7 +25,8 @@ use super::{Allocation, CACHE_REGISTERS};
 /// The block keeps the [`CACHE_REGISTERS`]`.len()` x-registers its native lowering
 /// **touches the most**: every cacheable instruction (a `move` whose shape
 /// [`super::r#move::try_inline_move`] lowers, a `swap` over two addressable x-registers, a `test`
-/// whose shape [`super::test::test_plan`] lowers, and a `gc_bif` [`fast_arith`] lowers)
+/// whose shape [`super::test::test_plan`] lowers, a `gc_bif` [`fast_arith`] lowers,
+/// and a `get_list`/`get_hd`/`get_tl` its `*_shape` lowers)
 /// contributes one *native touch* per x-register operand, and the registers with the
 /// highest touch counts are held resident — a usage-weighted approximation of
 /// "keep the longest live ranges in machine registers". Ties are broken by ascending
@@ -110,7 +112,9 @@ fn allocate_registers_with_labels(
 /// is counted only when [`super::r#move::try_inline_move`] lowers it, a `swap` only when both
 /// operands are addressable x-registers, a `test` only when [`super::test::test_plan`] claims it,
 /// a `select_val` only when [`super::select::select_val_plan`] claims it (its sole register operand
-/// is the scrutinee), and a `gc_bif` only when [`fast_arith`] does. Every other
+/// is the scrutinee), a `gc_bif` only when [`fast_arith`] does, and a
+/// `get_list`/`get_hd`/`get_tl` only when its `*_shape` claims it (its source and
+/// every destination count). Every other
 /// instruction contributes nothing because it stays on the helper.
 fn cacheable_touches(
     module: &Module,
@@ -151,6 +155,24 @@ fn cacheable_touches(
             }
             touches.push(a_x);
             touches.push(b_x);
+        }
+        // A cons-cell read is charged its source and every destination, and only when
+        // its `*_shape` claims it (a `Y` operand or an out-of-bound register keeps the
+        // whole instruction on the helper, which contributes no native touch).
+        Instr::GetList { source, head, tail } => {
+            if let Some(shape) = get_list_shape(source, head, tail) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::GetHd { source, head } => {
+            if let Some(shape) = get_hd_shape(source, head) {
+                touches.extend(shape.registers());
+            }
+        }
+        Instr::GetTl { source, tail } => {
+            if let Some(shape) = get_tl_shape(source, tail) {
+                touches.extend(shape.registers());
+            }
         }
         Instr::GcBif { .. } => {
             if let Some(fast) = fast_arith(module, instr) {

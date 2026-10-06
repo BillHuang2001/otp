@@ -5,11 +5,12 @@
 //! word-level `test` and exact-value `select_val` subsets, the
 //! deopt-and-continue sequence ([`emit_step_and_continue`]) that covers every
 //! instruction the block does not lower natively, the spill/fill discipline
-//! ([`CACHE_REGISTERS`]) and the tier's one arithmetic optimisation, the guarded
-//! small-int `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]). [`compile_module`]
-//! lowers every basic block of a module into the [`CompiledModule`] artifact. See
-//! `super` for the block ABI (in `runtime`) and the driver that runs the emitted
-//! code.
+//! ([`CACHE_REGISTERS`]), the tier's one arithmetic optimisation — the guarded
+//! small-int `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]) — and the
+//! guarded cons-cell readers ([`aggregate`]: `get_list`/`get_hd`/`get_tl`).
+//! [`compile_module`] lowers every basic block of a module into the
+//! [`CompiledModule`] artifact. See `super` for the block ABI (in `runtime`) and the
+//! driver that runs the emitted code.
 //!
 //! **Only [`CACHE_REGISTERS`]`.len()` x-registers are held in machine registers**;
 //! every other x-register a block names is addressed **directly in `machine.x`**
@@ -33,7 +34,8 @@
 //! [`emit_block`], the deopt-and-continue sequence and [`compile_module`]);
 //! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
-//! [`select`] the exact-value switch and [`arith`] the guarded small-int fast path.
+//! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path and
+//! [`aggregate`] the guarded cons-cell readers.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -47,6 +49,7 @@ use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg, DEFAULT_CAP
 use super::runtime::{encode_target, StepHelper, RUNTIME_XREGS_DISP};
 use super::{jit_step_one, CompiledModule};
 
+mod aggregate;
 mod arith;
 mod r#move;
 mod operands;
@@ -54,6 +57,7 @@ mod regalloc;
 mod select;
 mod test;
 
+use aggregate::{try_inline_get_hd, try_inline_get_list, try_inline_get_tl};
 use arith::try_inline_gc_bif;
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -223,25 +227,37 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// loads plus two stores (~28 bytes), so [`INSTRUCTION_BYTES`] is budgeted per
 /// instruction. A `gc_bif` costs either the helper call sequence (~50 bytes) or,
 /// when the small-int fast path lowers it, the whole guarded sequence plus its
-/// helper fallback ([`FAST_PATH_BYTES`]).
+/// helper fallback ([`FAST_PATH_BYTES`]); a `get_list`/`get_hd`/`get_tl` likewise
+/// costs its guarded sequence plus the helper fallback it may still branch to
+/// ([`LIST_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
-/// *every* `gc_bif`, whether or not the fast path claims it, and
-/// [`CodeBuffer::with_capacity`] rounds the total up to whole pages.
+/// *every* `gc_bif` and [`LIST_PATH_BYTES`] for every cons-cell read, whether or
+/// not the fast path claims it, and [`CodeBuffer::with_capacity`] rounds the total
+/// up to whole pages.
 fn code_capacity_estimate(module: &Module) -> usize {
     let mut instructions = 0usize;
     let mut blocks = 0usize;
     let mut gc_bifs = 0usize;
+    let mut list_reads = 0usize;
     for function in &module.functions {
         instructions += function.code.len();
         blocks += function.blocks.len();
-        gc_bifs += function
-            .code
-            .iter()
-            .filter(|instr| matches!(instr, Instr::GcBif { .. }))
-            .count();
+        for instr in &function.code {
+            match instr {
+                Instr::GcBif { .. } => gc_bifs += 1,
+                Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
+                    list_reads += 1
+                }
+                _ => {}
+            }
+        }
     }
-    128 * blocks + INSTRUCTION_BYTES * instructions + FAST_PATH_BYTES * gc_bifs + DEFAULT_CAPACITY
+    128 * blocks
+        + INSTRUCTION_BYTES * instructions
+        + FAST_PATH_BYTES * gc_bifs
+        + LIST_PATH_BYTES * list_reads
+        + DEFAULT_CAPACITY
 }
 
 /// The code-size budget reserved for one instruction (see
@@ -260,6 +276,14 @@ const INSTRUCTION_BYTES: usize = 192;
 /// `machine.x` operand loads and a `machine.x` result store) plus the
 /// [`emit_step_and_continue`] fallback it branches to (~150 bytes).
 const FAST_PATH_BYTES: usize = 352;
+
+/// The code-size budget reserved for one `get_list`/`get_hd`/`get_tl` (see
+/// [`code_capacity_estimate`]): the guarded cons-cell read — a mask/test/branch, the
+/// pointer computation and the CAR/CDR loads with their stores to cached or
+/// `machine.x` destinations (~90 bytes) — emitted *in front of* the
+/// [`emit_step_and_continue`] fallback it may still branch to, which the
+/// per-instruction [`INSTRUCTION_BYTES`] already budgets.
+const LIST_PATH_BYTES: usize = 128;
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
 ///
@@ -327,6 +351,54 @@ fn emit_block(
             // is cheap to remove (a three-`mov` shuffle, register or memory).
             Instr::Swap { a, b } => {
                 if !try_inline_swap(buffer, a, b, allocation, highest_touched)? {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            // The guarded cons-cell readers: `get_list`/`get_hd`/`get_tl` split a
+            // real cons cell natively (see [`aggregate`]). Any other shape — a `Y`
+            // operand, a register past `MAX_REGISTER` — is the `_` arm, and so is a
+            // **non-cons source**: the guard branches to the helper, whose
+            // interpreter step raises the exact `{badmatch, Source}`.
+            Instr::GetList { source, head, tail } => {
+                if !try_inline_get_list(
+                    buffer,
+                    source,
+                    head,
+                    tail,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            Instr::GetHd { source, head } => {
+                if !try_inline_get_hd(
+                    buffer,
+                    source,
+                    head,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            Instr::GetTl { source, tail } => {
+                if !try_inline_get_tl(
+                    buffer,
+                    source,
+                    tail,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }

@@ -25,7 +25,7 @@ use beam_loader::{
     load_file, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
 use beam_term::{
-    is_small, make_atom, make_small, signed_value, Atom, Eterm, MAX_SMALL, MIN_SMALL, NIL,
+    is_small, make_atom, make_small, signed_value, Atom, Eterm, Heap, MAX_SMALL, MIN_SMALL, NIL,
 };
 
 /// The `beam_loader` oracle fixture (reused, never copied).
@@ -1369,5 +1369,340 @@ fn the_inlined_select_val_fail_path_agrees_with_the_interpreter() {
     assert_eq!(
         agree_module(&module, "scrutinee", 0, &[]).expect("scrutinee/0"),
         NIL
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The guarded cons-cell readers (`get_list`/`get_hd`/`get_tl`)
+// ---------------------------------------------------------------------------
+
+/// The one-block list-read fixtures' shared shape: `read/1` reads the cons cell in
+/// `x(0)` and returns one of its halves in `x(0)`.
+///
+/// Every fixture interns `badmatch` so the deopt path raises the compound
+/// `{badmatch, Source}` reason (`crate::terms::badmatch_reason`) rather than the bare
+/// `BeamError::BadMatch`.
+fn split_head_module() -> Module {
+    arity_module("split_head", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(1),
+                tail: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — `get_list x0 x1 x2` with the **CDR** returned.
+fn split_tail_module() -> Module {
+    arity_module("split_tail", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(1),
+                tail: Operand::X(2),
+            },
+            Instr::Move {
+                src: Operand::X(2),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — `get_hd x0 x1` (the CAR).
+fn head_module() -> Module {
+    arity_module("list_head", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetHd {
+                source: Operand::X(0),
+                head: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — `get_tl x0 x1` (the CDR).
+fn tail_module() -> Module {
+    arity_module("list_tail", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetTl {
+                source: Operand::X(0),
+                tail: Operand::X(1),
+            },
+            Instr::Move {
+                src: Operand::X(1),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — `get_list x0 x0 x0`: the source and both destinations are the same
+/// register, so the return value pins the write order. The CAR is written first and
+/// the CDR second, exactly as the interpreter's `write(head)` / `write(tail)` pair
+/// does, so **the CDR** survives:
+///
+/// ```text
+///   get_list x0 x0 x0     ; x0 = CAR, then x0 = CDR
+///   return                ; the CDR
+/// ```
+fn alias_module() -> Module {
+    arity_module("list_alias", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetList {
+                source: Operand::X(0),
+                head: Operand::X(0),
+                tail: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — a list read whose source index lies **past `MAX_REGISTER`**: the tier
+/// refuses the shape (the emitted code may not read out of `machine.x`), so the whole
+/// instruction stays on the interpreter step, whose `read_operand` reports the
+/// faithful `bad_register`:
+///
+/// ```text
+///   get_list x<MAX_REGISTER> x1 x2   ; no addressable source -> deopt
+///   return
+/// ```
+fn out_of_bound_module() -> Module {
+    arity_module("list_out_of_bound", "read", 1, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetList {
+                source: Operand::X(beam_engine::MAX_REGISTER),
+                head: Operand::X(1),
+                tail: Operand::X(2),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/6` — a list read whose **source and one destination live in `machine.x`**:
+/// the sixth argument carries the cons cell in `x(5)`, and the `move` chain pads
+/// `x0..x4` past it in native touches (`x0=6`, `x1..x4=3`), so the allocator's five
+/// residents are `{x0..x4}` and `x5` is addressed directly in `machine.x`:
+///
+/// ```text
+///   x5 = <the cons cell>      ; the sixth argument
+///   move chain over x0..x4    ; the padding (x0 = 6 touches, x1..x4 = 3 each)
+///   get_list x5 x0 x5         ; CAR → x0 (cached), CDR → x5 (`machine.x`)
+///   x0 = x5                   ; the CDR, read back out of `machine.x`
+/// ```
+///
+/// Returns the CDR.
+fn list_memory_module() -> Module {
+    let mv = |src: u32, dst: u32| Instr::Move {
+        src: Operand::X(src),
+        dst: Operand::X(dst),
+    };
+    arity_module("list_memory", "read", 6, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            mv(0, 1),
+            mv(1, 2),
+            mv(2, 3),
+            mv(3, 4),
+            mv(4, 0),
+            mv(0, 1),
+            mv(2, 3),
+            mv(4, 0),
+            Instr::GetList {
+                source: Operand::X(5),
+                head: Operand::X(0),
+                tail: Operand::X(5),
+            },
+            mv(5, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+#[test]
+fn list_reads_match_the_interpreter_on_a_real_cons_cell() {
+    // A `[CAR | CDR]` cell of each interesting shape: a proper pair, a one-element
+    // list (whose CDR is `NIL`, not a cons cell — legal, because only the *source* is
+    // gated), and an improper list.
+    let mut heap = Heap::new(16);
+    let tail = heap.cons(make_small(2), NIL).expect("a cons cell");
+    let pair = heap.cons(make_small(1), tail).expect("a cons cell");
+    let single = heap.cons(make_small(7), NIL).expect("a cons cell");
+    let improper = heap
+        .cons(make_small(3), make_small(4))
+        .expect("a cons cell");
+
+    let cases = [
+        (split_head_module(), "get_list -> head", true),
+        (split_tail_module(), "get_list -> tail", false),
+        (head_module(), "get_hd", true),
+        (tail_module(), "get_tl", false),
+        (alias_module(), "get_list x0 x0 x0", false),
+    ];
+    for (module, what, returns_head) in cases {
+        for (list, car, cdr) in [
+            (pair, make_small(1), tail),
+            (single, make_small(7), NIL),
+            (improper, make_small(3), make_small(4)),
+        ] {
+            let expected = if returns_head { car } else { cdr };
+            assert_eq!(
+                agree_module(&module, "read", 1, &[list])
+                    .unwrap_or_else(|err| panic!("{what} on {list:?}: {err:?}")),
+                expected,
+                "{what} on {list:?} (CAR {car:?}, CDR {cdr:?})"
+            );
+        }
+    }
+}
+
+#[test]
+fn the_list_reads_are_inlined_and_cache_their_registers() {
+    // Structural evidence that the cons-cell reads are lowered natively: `x(2)` — the
+    // `get_list` tail destination — is named by no other inlinable instruction of
+    // `split_head/1`, so it appears in the allocator's resident set (and the block's
+    // native-register bound covers it) only because the read was inlined. A deopted
+    // instruction contributes no native touch at all.
+    let compiled = BaselineJit::new()
+        .compile(&split_head_module())
+        .expect("compile the get_list fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 2]);
+    assert_eq!(compiled.highest_cached_register(), Some(2));
+    assert_eq!(compiled.highest_native_register(), Some(2));
+}
+
+#[test]
+fn a_list_read_addressing_machine_x_agrees_with_the_interpreter() {
+    // `list_memory/6`'s residents are the five most-touched registers `{x0..x4}`, so
+    // both `x5` operands — the source **and** the tail destination — are read and
+    // written directly in `machine.x`.
+    let module = list_memory_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile the machine.x list-read fixture");
+    assert_eq!(
+        compiled.cached_registers(),
+        &[0u32, 1, 2, 3, 4],
+        "x5 must stay in machine.x for the direct-addressing path to be exercised"
+    );
+    assert_eq!(compiled.highest_cached_register(), Some(4));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+
+    let mut heap = Heap::new(16);
+    let tail = heap.cons(make_small(2), NIL).expect("a cons cell");
+    let list = heap.cons(make_small(1), tail).expect("a cons cell");
+    let args = [
+        make_small(0),
+        make_small(0),
+        make_small(0),
+        make_small(0),
+        make_small(0),
+        list,
+    ];
+    assert_eq!(
+        agree_module(&module, "read", 6, &args).expect("list_memory/6"),
+        tail,
+        "the CDR stored through machine.x must be the tail"
+    );
+}
+
+#[test]
+fn a_non_cons_source_deopts_and_agrees_with_the_interpreter() {
+    // The guard can only *reject*: `[]`, a small integer, an atom and a boxed term (a
+    // tuple) are not cons cells, so the block deopts to `jit_step_one`, whose
+    // interpreter step raises the exact `{badmatch, Source}`.
+    let mut heap = Heap::new(256);
+    let tuple = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+    for (module, what) in [
+        (split_head_module(), "get_list -> head"),
+        (split_tail_module(), "get_list -> tail"),
+        (head_module(), "get_hd"),
+        (tail_module(), "get_tl"),
+    ] {
+        let badmatch = atom(&module, "badmatch");
+        for source in [NIL, make_small(7), make_atom(atom(&module, "read")), tuple] {
+            // The two tiers agree, and the native tier's error is a raise — not the
+            // bare `BeamError::BadMatch` a missing `badmatch` atom would produce.
+            let jitted = agree_module(&module, "read", 1, &[source]);
+            assert!(
+                matches!(jitted, Err(BeamError::Raise(_))),
+                "{what} on {source:?}: expected the {{badmatch, Source}} raise, got {jitted:?}"
+            );
+
+            // ... and the raise carries the exact reason term, with the offending
+            // source in it. The context is kept alive here so the reason term's arena
+            // outlives the check.
+            let mut machine = Machine::new();
+            let mut ctx = MinimalContext::with_bif_hook(Box::new(checked_arith_hook));
+            let error = machine
+                .run_with_tier(
+                    &module,
+                    atom(&module, "read"),
+                    1,
+                    &[source],
+                    &mut ctx,
+                    Tier::BaselineJit,
+                )
+                .expect_err(&format!("{what} on {source:?} must raise"));
+            let reason = match &error {
+                BeamError::Raise(raise) => raise
+                    .live_reason()
+                    .and_then(|live| live.downcast_ref::<Eterm>().copied()),
+                _ => None,
+            }
+            .unwrap_or_else(|| panic!("{what} on {source:?}: no live reason term: {error:?}"));
+            let expected = heap
+                .tuple(&[make_atom(badmatch), source])
+                .expect("the expected {badmatch, Source} reason");
+            assert!(
+                beam_term::eq(reason, expected, &module.atom_table),
+                "{what} on {source:?}: the raise reason is not {{badmatch, Source}}"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_list_read_with_an_out_of_bound_register_deopts_and_agrees_with_the_interpreter() {
+    // A source register past `MAX_REGISTER` is not an addressable shape: the tier
+    // refuses it **without emitting a byte**, so the block emits the interpreter step
+    // for the whole instruction. The two tiers must agree on the faithful
+    // `bad_register` the interpreter's `read_operand` reports — never a read past the
+    // end of `machine.x`.
+    let module = out_of_bound_module();
+    let jitted = agree_module(&module, "read", 1, &[NIL]);
+    assert!(
+        matches!(jitted, Err(BeamError::BadArg)),
+        "expected the interpreter's `bad_register` for an out-of-bound source, got {jitted:?}"
     );
 }
