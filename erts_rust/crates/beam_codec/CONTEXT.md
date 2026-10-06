@@ -717,6 +717,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   plain path stays strict), `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl.
   `Tag::Export`/`Tag::NewFun`,
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
+- `src/decode/tests.rs` → the `decode` unit-test suite (`#[cfg(test)] mod tests;` — the seeded
+  `term_to_binary` vectors, the accessor-asserted term structure and the error mapping); also the
+  `pub(crate)` decoder test helpers (`decode`, `assert_bad_arg`, `assert_system_limit`) shared with
+  `src/decode/fun.rs`/`src/decode/record.rs`
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
 - `src/decode/record.rs` → the `RECORD_EXT` (`67`) decoder (`Decoder::decode_record` — see §Records)
