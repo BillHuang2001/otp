@@ -10,30 +10,30 @@
 //! # What the sweep proves
 //!
 //! * **Load breadth.** `beam_loader`'s full public pipeline (container → chunk →
-//!   decode → lower) parses most of a real OTP install — every module that loads
-//!   yields at least one function with a non-empty label map, or the test fails.
+//!   decode → lower) parses the *whole* of a real OTP install: **every** discovered
+//!   module loads and yields at least one function with a non-empty label map, or
+//!   the test fails.
 //! * **Execution breadth / mechanism breadth.** Real functions are *run*: recursion
 //!   and list building (`lists`), integer arithmetic and tuple access (`calendar`),
 //!   string handling and cross-module calls (`filename` → `lists`/`erlang`,
-//!   `string` → `unicode`, `ordsets` → `lists`), and tuple-backed structures
-//!   (`array`).
+//!   `string` → `unicode`, `ordsets` → `lists`), tuple-backed structures (`array`),
+//!   and functions of modules that only started loading once the fun-literal decode
+//!   landed (`maps`, `erl_scan`).
 //!
 //! # Skip-vs-assert policy (explicit)
 //!
-//! * **Load failures are surfaced, never swallowed.** The sweep enumerates every
-//!   `.beam`, asserts a loading floor, and prints the exact `(module, error)` for
-//!   every module that fails to load. The observed failure set must be a **subset**
-//!   of [`KNOWN_LOAD_FAILURES`] — a documented set of upstream
-//!   (`beam_loader`/`beam_codec`) gaps — and each observed error must match the
-//!   recorded cause. So the appearance of any *new* load failure (a regression),
-//!   or the same module failing for a *different* reason, fails the test, while a
-//!   listed module that starts loading simply drops off (also reported).
+//! * **Every discovered module must load — a load failure FAILS the test.** The
+//!   sweep enumerates every `.beam`, asserts a breadth floor, and requires that
+//!   **all** of them load. Any module that fails to load is printed loudly with its
+//!   exact typed error and *fails the test*; the failure is never swallowed and
+//!   never silently allowed. (A loading module must also yield at least one function
+//!   with a non-empty label map, or the test fails too.)
 //! * **Execution is curated and oracle-checked.** Every expected value in the
 //!   execution tests is the **real** system Erlang result, reproduced with
 //!   `erl -noshell -eval …` (the commands are quoted next to each assertion). No
 //!   expected value is guessed.
 //! * **A blocked mechanism is skipped LOUDLY.** Where a real function still needs
-//!   an unimplemented opcode/BIF, [`blocked_mechanisms_report_their_typed_error`]
+//!   an unimplemented BIF/mechanism, [`blocked_mechanisms_report_their_typed_error`]
 //!   prints `SKIP: <module>:<f>/<n> — <typed error>` **and asserts the exact typed
 //!   error**, so a later regression that turns a typed error into a *wrong result*
 //!   is caught. It is never a silent pass and never a fabricated expected value.
@@ -115,102 +115,14 @@ fn host(dirs: &[SweepDir]) -> ModuleHost {
 // 1. The broad LOAD sweep
 // ---------------------------------------------------------------------------
 
-/// Why a module is known not to load today. Every cause is an upstream
-/// (`beam_loader`/`beam_codec`) gap, not an engine one; the sweep still asserts
-/// the *observed* error matches, so a changed cause fails the test.
-#[derive(Clone, Copy, PartialEq, Eq, Debug)]
-enum LoadFailure {
-    /// An `EXPORT_EXT`/`NEW_FUN_EXT` (external fun) **literal**: `beam_codec`'s
-    /// `decode_term` deliberately does not decode fun/export tags.
-    FunLiteral,
-    /// `lower::build_module` rejects the module with `BadArg` while lowering its
-    /// instructions (the `LitT` area of these modules decodes cleanly, so the cause
-    /// is the instruction model / a structure check, not the literal area).
-    Lowering,
-    /// An **inline big-integer instruction operand** wider than 8 magnitude bytes
-    /// (`beam_loader` models no big-integer operand).
-    BigOperand,
-}
-
-/// The modules of this OTP install that the loader genuinely cannot load today,
-/// with the cause the sweep observes.
+/// Loads every `*.beam` in the sweep directories and proves that **all** of them
+/// load into a usable module — surfacing (and failing on) any load failure loudly.
 ///
-/// This is **data, not a pass**: the sweep prints every one by name and fails if
-/// *any module outside this set* fails to load (a regression) or if a listed
-/// module fails with a different error (a changed cause). A listed module that
-/// starts loading is reported and simply drops off.
-const KNOWN_LOAD_FAILURES: &[(&str, LoadFailure)] = &[
-    // stdlib — external-fun literals (`EXPORT_EXT`).
-    ("epp", LoadFailure::FunLiteral),
-    ("erl_pp", LoadFailure::FunLiteral),
-    ("erl_scan", LoadFailure::FunLiteral),
-    ("erl_stdlib_errors", LoadFailure::FunLiteral),
-    ("escript", LoadFailure::FunLiteral),
-    ("file_sorter", LoadFailure::FunLiteral),
-    ("gen_event", LoadFailure::FunLiteral),
-    ("gen_fsm", LoadFailure::FunLiteral),
-    ("gen_server", LoadFailure::FunLiteral),
-    ("gen_statem", LoadFailure::FunLiteral),
-    ("json", LoadFailure::FunLiteral),
-    ("maps", LoadFailure::FunLiteral),
-    ("proc_lib", LoadFailure::FunLiteral),
-    ("shell", LoadFailure::FunLiteral),
-    ("supervisor", LoadFailure::FunLiteral),
-    ("supervisor_bridge", LoadFailure::FunLiteral),
-    // stdlib — `BadArg` from `lower::build_module` (not the literal area).
-    ("dets_v9", LoadFailure::Lowering),
-    ("shell_docs", LoadFailure::Lowering),
-    // stdlib — inline big-integer instruction operand.
-    ("rand", LoadFailure::BigOperand),
-    // kernel — external-fun literals.
-    ("application_controller", LoadFailure::FunLiteral),
-    ("erl_kernel_errors", LoadFailure::FunLiteral),
-    ("error_logger", LoadFailure::FunLiteral),
-    ("group", LoadFailure::FunLiteral),
-    ("inet_epmd_dist", LoadFailure::FunLiteral),
-    ("inet_tcp_dist", LoadFailure::FunLiteral),
-    ("logger", LoadFailure::FunLiteral),
-    ("logger_formatter", LoadFailure::FunLiteral),
-    ("logger_h_common", LoadFailure::FunLiteral),
-    ("logger_proxy", LoadFailure::FunLiteral),
-    ("logger_server", LoadFailure::FunLiteral),
-    // kernel — inline big-integer instruction operands.
-    ("disk_log", LoadFailure::BigOperand),
-    ("net", LoadFailure::BigOperand),
-    ("net_kernel", LoadFailure::BigOperand),
-    // compiler — external-fun literals.
-    ("beam_call_types", LoadFailure::FunLiteral),
-    ("beam_doc", LoadFailure::FunLiteral),
-    ("beam_jump", LoadFailure::FunLiteral),
-    ("beam_ssa_alias", LoadFailure::FunLiteral),
-    ("beam_ssa_pre_codegen", LoadFailure::FunLiteral),
-    ("beam_ssa_ss", LoadFailure::FunLiteral),
-    ("compile", LoadFailure::FunLiteral),
-    ("sys_core_fold", LoadFailure::FunLiteral),
-];
-
-/// Classifies a load error into the [`LoadFailure`] cause the sweep records.
-fn classify(error: &BeamError) -> Option<LoadFailure> {
-    match error {
-        BeamError::BadArg => Some(LoadFailure::Lowering),
-        BeamError::SystemLimit => Some(LoadFailure::BigOperand),
-        other if format!("{other:?}").contains("unsupported_external_term") => {
-            Some(LoadFailure::FunLiteral)
-        }
-        _ => None,
-    }
-}
-
-/// The recorded cause for `module`, if it is a known load failure.
-fn known_failure(module: &str) -> Option<LoadFailure> {
-    KNOWN_LOAD_FAILURES
-        .iter()
-        .find(|(name, _)| *name == module)
-        .map(|(_, cause)| *cause)
-}
-
-/// Loads every `*.beam` in the sweep directories and proves each one that loads
-/// yields a usable module, while surfacing every load failure loudly.
+/// The load breadth is now complete: `beam_codec` decodes the whole fun-literal
+/// surface (`EXPORT_EXT`/`NEW_FUN_EXT`), the last blocker, so the sweep requires
+/// **every** discovered module to load (and to yield at least one labelled
+/// function). A regression is caught twice over: the exact failure is printed with
+/// its typed error *and* the test fails.
 #[test]
 fn sweep_loads_every_stdlib_and_kernel_beam() {
     if skip_if_unavailable() {
@@ -226,9 +138,7 @@ fn sweep_loads_every_stdlib_and_kernel_beam() {
     let mut total = 0usize;
     let mut loaded = 0usize;
     let mut failures: Vec<(String, BeamError)> = Vec::new();
-    let mut unexpected: Vec<(String, String)> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
-    let mut now_loading: Vec<&str> = Vec::new();
 
     for dir in &dirs {
         for module in &dir.modules {
@@ -237,15 +147,6 @@ fn sweep_loads_every_stdlib_and_kernel_beam() {
             match host.load_from_path(module, path) {
                 Ok(loaded_module) => {
                     loaded += 1;
-                    if known_failure(module).is_some() {
-                        now_loading.push(
-                            KNOWN_LOAD_FAILURES
-                                .iter()
-                                .find(|(name, _)| *name == module)
-                                .map(|(name, _)| *name)
-                                .unwrap_or("?"),
-                        );
-                    }
                     let has_function = !loaded_module.functions.is_empty();
                     let has_labels = loaded_module
                         .functions
@@ -256,18 +157,10 @@ fn sweep_loads_every_stdlib_and_kernel_beam() {
                     }
                 }
                 Err(error) => {
-                    // Surface every failure loudly, with the exact typed error.
+                    // Surface every failure loudly, with the exact typed error — and
+                    // fail: a module that does not load is a regression, never a pass.
                     println!("LOAD-FAIL {module}: {error:?}");
-                    match known_failure(module) {
-                        Some(cause) if classify(&error) == Some(cause) => {
-                            failures.push((module.clone(), error));
-                        }
-                        Some(cause) => unexpected.push((
-                            module.clone(),
-                            format!("known cause {cause:?}, but observed {error:?}"),
-                        )),
-                        None => unexpected.push((module.clone(), format!("{error:?}"))),
-                    }
+                    failures.push((module.clone(), error));
                 }
             }
         }
@@ -279,16 +172,6 @@ fn sweep_loads_every_stdlib_and_kernel_beam() {
         let _ = write!(report, " ({}={})", dir.app, dir.modules.len());
     }
     println!("{report}");
-    println!(
-        "SWEEP: {} known load failure(s) (documented upstream gaps):",
-        failures.len()
-    );
-    for (module, error) in &failures {
-        println!("  - {module}: {}", describe(error));
-    }
-    if !now_loading.is_empty() {
-        println!("SWEEP: these known-failure modules now load (drop them from the list): {now_loading:?}");
-    }
 
     // A broad real sweep must cover a large number of modules. The floor is well
     // below the real count (stdlib+kernel+compiler ≈ 260) so an OTP point release
@@ -298,34 +181,18 @@ fn sweep_loads_every_stdlib_and_kernel_beam() {
         total >= 150,
         "the sweep only found {total} `.beam` files — expected stdlib+kernel (≈200)"
     );
-    assert!(
-        loaded >= 150,
-        "only {loaded}/{total} modules loaded"
-    );
-    assert!(
-        unexpected.is_empty(),
-        "{} UNEXPECTED load failure(s) (a regression or a changed cause): {unexpected:?}",
-        unexpected.len()
+    assert_eq!(
+        loaded,
+        total,
+        "{} of {total} discovered modules failed to LOAD — every discovered module \
+         must load (the failures above carry their exact typed errors): {failures:?}",
+        failures.len()
     );
     assert!(
         empty.is_empty(),
         "{} module(s) loaded but yielded no labelled function: {empty:?}",
         empty.len()
     );
-}
-
-/// A one-line human summary of a typed load error.
-fn describe(error: &BeamError) -> String {
-    match error {
-        BeamError::BadArg => "BadArg (lower::build_module rejected the module)".to_string(),
-        BeamError::SystemLimit => {
-            "SystemLimit (inline big-integer instruction operand > 8 bytes)".to_string()
-        }
-        other if format!("{other:?}").contains("unsupported_external_term") => {
-            "unsupported_external_term (EXPORT_EXT/NEW_FUN_EXT literal)".to_string()
-        }
-        other => format!("{other:?}"),
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -661,13 +528,6 @@ fn sweep_dict_grows_past_the_expansion_threshold() {
 }
 
 // ---------------------------------------------------------------------------
-// 3. Blocked mechanisms (asserted loudly, never silently passed)
-// ---------------------------------------------------------------------------
-
-/// Real functions that a **documented** engine/codec gap still blocks. Each is
-/// printed and its exact typed error asserted, so a regression that turns the
-/// typed error into a *wrong result* is caught.
-// ---------------------------------------------------------------------------
 // 3. Off-heap (refc) binary construction: `bs_init_writable` + `private_append`
 // ---------------------------------------------------------------------------
 
@@ -716,45 +576,65 @@ fn sweep_base64_builds_an_off_heap_binary() {
     );
 }
 
+// ---------------------------------------------------------------------------
+// 4. Blocked mechanisms (asserted loudly, never silently passed)
+// ---------------------------------------------------------------------------
+
+/// Real functions that a **documented, still-open** gap blocks.
+///
+/// The property under test is: *the Rust runtime returns a typed [`BeamError`]
+/// where the oracle returns a correct value* — never a silently-wrong value. Each
+/// probe is printed with its exact typed error and that error is asserted, so a
+/// later regression that turns a typed error into a *wrong result* is caught.
+///
+/// The `maps` module itself now **loads**: the `EXPORT_EXT`/`NEW_FUN_EXT`
+/// fun-literal decode gap that used to block it (and, transitively, every
+/// map-using stdlib module) is closed. What is still blocked is the harness's BIF
+/// floor: the map-operation BIFs (`maps:put/3`, `maps:size/1`, `maps:get/2`, …)
+/// are `erlang` BIFs the harness does not serve, so any call that needs them is a
+/// typed `BadArg`.
 #[test]
 fn blocked_mechanisms_report_their_typed_error() {
-    if skip_if_unavailable() {        return;
+    if skip_if_unavailable() {
+        return;
     }
     let mut host = exec_host();
 
-    // ---- maps -------------------------------------------------------------
-    // The `maps` module cannot even LOAD: its literal area holds an external fun
-    // (`EXPORT_EXT`), which `beam_codec::decode_term` does not decode. Every
-    // map-using stdlib module (`sets`, `json`, …) is blocked transitively.
-    let err = host
-        .load("maps")
-        .expect_err("`maps` is a known load failure (EXPORT_EXT literal)");
-    println!("SKIP: maps (module load) — {err:?}");
-    assert!(
-        format!("{err:?}").contains("unsupported_external_term"),
-        "unexpected `maps` load error: {err:?}"
-    );
+    // ---- maps (loads now; its operations are still blocked) ---------------
+    // `maps` must load: its literal area holds an external fun that
+    // `beam_codec` now decodes (it used to fail with `unsupported_external_term`).
+    host.load("maps")
+        .expect("`maps` must now load (fun-literal decode)");
 
-    // oracle: sets:new() = #{}   (loading `sets` itself works; a *non-empty* set
-    // needs `maps`, so `sets:from_list/1` is the blocked case.)
-    let probe = int_list(&mut host, &[1, 2, 3]);
+    // `maps:from_list/1` is pure Erlang that folds with `maps:put/3` — a BIF the
+    // host floor does not serve — so the call is a typed `BadArg`, never a map.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:from_list([{k,1}])]),halt().'
+    //         #{k => 1}
+    let k = host.intern("k");
+    let pair = term_tuple(&mut host, &[k, make_small(1)]);
+    let pairs = support::term_list(&mut host, &[pair]);
     let err = host
-        .call("sets", "from_list", &[probe])
-        .expect_err("`sets:from_list/1` reaches `maps` and is blocked");
-    println!("SKIP: sets:from_list/1 — {err:?}");
+        .call("maps", "from_list", &[pairs])
+        .expect_err("`maps:from_list/1` needs the unserved `maps:put/3` BIF");
+    println!("SKIP: maps:from_list/1 — {err:?}");
     assert!(
-        format!("{err:?}").contains("unsupported_external_term"),
-        "unexpected `sets:from_list/1` error: {err:?}"
+        matches!(err, BeamError::BadArg),
+        "unexpected `maps:from_list/1` error: {err:?}"
     );
 
     // ---- binaries / bitstrings -------------------------------------------
     // `base64:encode/1` — the canonical `bs_init_writable` +
     // `bs_create_bin`/`private_append` builder — is no longer blocked; it is
-    // exercised positively by `sweep_base64_builds_an_off_heap_binary` below.
+    // exercised positively by `sweep_base64_builds_an_off_heap_binary` above.
     //
     // `unicode:characters_to_binary/1` is a `unicode` BIF the host floor does not
     // serve, so the real module's call fails as a typed `BadArg`.
-    let s = chars(&mut host, "hi");    let err = host
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[unicode:characters_to_binary("hi")]),halt().'
+    //         <<"hi">>
+    let s = chars(&mut host, "hi");
+    let err = host
         .call("unicode", "characters_to_binary", &[s])
         .expect_err("`unicode:characters_to_binary/1` is not in the host floor");
     println!("SKIP: unicode:characters_to_binary/1 — {err:?}");
@@ -762,6 +642,61 @@ fn blocked_mechanisms_report_their_typed_error() {
         matches!(err, BeamError::BadArg),
         "unexpected `unicode:characters_to_binary/1` error: {err:?}"
     );
+}
+
+// ---------------------------------------------------------------------------
+// 5. Execution evidence for modules the fun-literal decode unblocked
+// ---------------------------------------------------------------------------
+
+/// Modules that could not even **load** until `beam_codec` decoded the fun-literal
+/// tags (`EXPORT_EXT`/`NEW_FUN_EXT`) now load and their pure compiled functions
+/// *run*.
+///
+/// Both `maps` and `erl_scan` carry external-fun literals in their literal areas,
+/// so before the decode landed they failed to load at all; now they load and
+/// execute. (Most *map operations* are still host-BIF-floor-limited — see
+/// [`blocked_mechanisms_report_their_typed_error`] — which is why `maps:new/0`,
+/// i.e. `new() -> #{}`, is the exported `maps` function that is pure compiled code.)
+#[test]
+fn sweep_newly_loading_modules_execute() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = exec_host();
+
+    // `maps` must now load; it could not before the fun-literal decode.
+    host.load("maps").expect("`maps` must now load");
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:new()]),halt().'
+    //         #{}
+    let map = run(&mut host, "maps", "new", &[]);
+    let entries = terms::map_entries(map).expect("maps:new/0 must return a map");
+    assert!(
+        entries.is_empty(),
+        "maps:new/0 must be the empty map: {entries:?}"
+    );
+    let empty = terms::make_flatmap(&mut host, &[]).expect("build the oracle `#{}`");
+    assert_term(&host, map, empty);
+
+    // `erl_scan` likewise only loads because the fun-literal decode landed. Its
+    // exported `reserved_word/1` is pure Erlang
+    // (`case f_reserved_word(W) of true -> true; false -> lists:member(W,
+    // erl_features:keywords()) end`); the *reserved-word* branch is a ~40-clause
+    // compiled match that runs end to end here. (The non-reserved branch calls
+    // `erl_features:keywords/0` — a **preloaded** module the sweep host cannot
+    // load — so only reserved words are asserted.)
+    //
+    // oracle: erl -noshell -eval "io:format(\"~p~n\",[erl_scan:reserved_word('if')]),halt()."
+    //         true
+    let if_atom = host.intern("if");
+    let got = run(&mut host, "erl_scan", "reserved_word", &[if_atom]);
+    assert_atom(&host, got, "true");
+
+    // oracle: erl -noshell -eval "io:format(\"~p~n\",[erl_scan:reserved_word('end')]),halt()."
+    //         true
+    let end_atom = host.intern("end");
+    let got = run(&mut host, "erl_scan", "reserved_word", &[end_atom]);
+    assert_atom(&host, got, "true");
 }
 
 // ---------------------------------------------------------------------------
