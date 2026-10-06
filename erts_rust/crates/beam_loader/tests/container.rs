@@ -10,7 +10,7 @@
 //! OTP 29 / erts-17.1, with `beam_disasm:file/1` plus a byte decode). See the
 //! crate `CONTEXT.md` for the authoritative container/chunk wire formats.
 
-use beam_loader::chunk::{self, Chunks};
+use beam_loader::chunk::{self, table, Chunks};
 use beam_loader::container::{self, ChunkId};
 use beam_loader::ir::{CodeVersion, LineEntry, Type, TypeTable};
 
@@ -35,21 +35,22 @@ fn container_chunk_directory_is_the_oracle_sequence() {
     let bytes = fixture();
     let container = container::parse(&bytes).expect("container::parse");
 
-    // Ids and payload sizes, in file order. `Dbgi` (debug info) is *not* `DbgB`;
-    // it is not a known chunk id and is skipped (but still surfaces as a raw chunk).
+    // Ids and payload sizes, in file order. `Dbgi` (the compiler's debug-info chunk)
+    // is a *recognized* id now (`ChunkId::DBGI`), distinct from the legacy `DbgB`
+    // debug chunk; its payload is deliberately left unparsed.
     let expected: Vec<(ChunkId, usize)> = vec![
-        (ChunkId::ATOM, 64),          // AtU8
-        (ChunkId::CODE, 163),         // Code
-        (ChunkId::STRT, 0),           // StrT
-        (ChunkId::IMPT, 52),          // ImpT
-        (ChunkId::EXPT, 64),          // ExpT
-        (ChunkId::META, 45),          // Meta
-        (ChunkId::LOCT, 16),          // LocT
-        (ChunkId::ATTR, 39),          // Attr
-        (ChunkId::CINF, 27),          // CInf
-        (ChunkId::new(*b"Dbgi"), 66), // Dbgi (unknown id)
-        (ChunkId::LINE, 25),          // Line
-        (ChunkId::TYPE, 30),          // Type
+        (ChunkId::ATOM, 64),         // AtU8
+        (ChunkId::CODE, 163),        // Code
+        (ChunkId::STRT, 0),          // StrT
+        (ChunkId::IMPT, 52),         // ImpT
+        (ChunkId::EXPT, 64),         // ExpT
+        (ChunkId::META, 45),         // Meta
+        (ChunkId::LOCT, 16),         // LocT
+        (ChunkId::ATTR, 39),         // Attr
+        (ChunkId::CINF, 27),         // CInf
+        (ChunkId::DBGI, 66),         // Dbgi (recognized, payload unparsed)
+        (ChunkId::LINE, 25),         // Line
+        (ChunkId::TYPE, 30),         // Type
     ];
     let actual: Vec<(ChunkId, usize)> = container
         .chunks
@@ -206,6 +207,80 @@ fn type_table_matches_the_oracle() {
             fallback: false,
         }
     );
+}
+
+#[test]
+fn locals_table_is_parsed_from_the_loct_chunk() {
+    let bytes = fixture();
+    let chunks = parse_chunks(&bytes);
+
+    // `LocT` is byte-for-byte an `ExpT` payload: the single non-exported local
+    // `fib/3` (wire atom index 5) at entry label 6.
+    assert_eq!(
+        chunks.locals,
+        vec![table::RawExport {
+            function: 5,
+            arity: 3,
+            label: 6,
+        }]
+    );
+}
+
+#[test]
+fn a_container_without_a_loct_chunk_has_no_locals() {
+    // A minimal valid container: `AtU8` (one module-name atom) plus a bare `Code`
+    // header, and no `LocT` chunk — `chunks.locals` must be empty, not an error.
+    let mut body = Vec::new();
+    body.extend_from_slice(b"AtU8");
+    body.extend_from_slice(&6u32.to_be_bytes());
+    body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+    body.extend_from_slice(&[1u8, b'm', 0, 0]); // len 1, "m", 2 pad bytes
+    body.extend_from_slice(b"Code");
+    body.extend_from_slice(&20u32.to_be_bytes());
+    body.extend_from_slice(&16u32.to_be_bytes()); // head_size
+    body.extend_from_slice(&[0u8; 16]);
+    let mut image = Vec::new();
+    image.extend_from_slice(b"FOR1");
+    image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+    image.extend_from_slice(b"BEAM");
+    image.extend_from_slice(&body);
+
+    let container = container::parse(&image).expect("container::parse");
+    assert!(container.find(ChunkId::LOCT).is_none());
+    let chunks = chunk::parse(&container).expect("chunk::parse");
+    assert!(chunks.locals.is_empty());
+}
+
+#[test]
+fn the_debug_chunk_ids_are_distinct_and_recognized() {
+    // `DbgB` is the emulator's legacy debug chunk; `Dbgi` is the compiler's
+    // debug-info chunk. They are two different ids.
+    assert_eq!(ChunkId::DBGB.name(), *b"DbgB");
+    assert_eq!(ChunkId::DBGI.name(), *b"Dbgi");
+    assert_ne!(ChunkId::DBGB, ChunkId::DBGI);
+
+    let bytes = fixture();
+    let container = container::parse(&bytes).expect("container::parse");
+
+    // `Dbgi` is present in the fixture and is now matched by its *recognized* id...
+    let dbgi = container
+        .find(ChunkId::DBGI)
+        .expect("the fixture carries a Dbgi chunk");
+    assert_eq!(dbgi.data.len(), 66);
+    assert_eq!(
+        container
+            .chunks
+            .iter()
+            .filter(|c| c.id == ChunkId::DBGI)
+            .count(),
+        1
+    );
+    // ... while there is no legacy `DbgB` chunk in this file.
+    assert!(container.find(ChunkId::DBGB).is_none());
+
+    // The debug payload is deliberately not parsed: `chunk::parse` succeeds (the
+    // recognized id is simply ignored, exactly like `Meta`/`Recs`).
+    chunk::parse(&container).expect("chunk::parse ignores the Dbgi payload");
 }
 
 #[test]

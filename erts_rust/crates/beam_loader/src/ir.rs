@@ -236,6 +236,14 @@ pub struct Module {
     pub atom_table: beam_term::AtomTable,
     /// The `ExpT` exports.
     pub exports: Vec<Export>,
+    /// The `LocT` local-function table (one entry per non-exported local function).
+    ///
+    /// Byte-for-byte the `ExpT` layout, so the label is the local function's **entry**
+    /// label. The C keeps this table only for `erts_jit_asm_dump` (`beam_file.c:1684`)
+    /// and it is irrelevant to interpretation; it is exposed here as an *additive*
+    /// field so a loaded module still records that the chunk was recognized rather
+    /// than silently skipped.
+    pub locals: Vec<Export>,
     /// The `ImpT` imports (the single source of BIF identity).
     pub imports: Vec<Import>,
     /// The module's functions.
@@ -266,6 +274,7 @@ impl Default for Module {
             atoms: Vec::new(),
             atom_table: beam_term::AtomTable::new(),
             exports: Vec::new(),
+            locals: Vec::new(),
             imports: Vec::new(),
             functions: Vec::new(),
             funs: Vec::new(),

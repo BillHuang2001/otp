@@ -35,6 +35,11 @@ pub struct Chunks<'a> {
     pub code: Option<code::CodeHeader>,
     /// The `ExpT` export table.
     pub exports: Vec<table::RawExport>,
+    /// The `LocT` local-function table (JIT-only; byte-for-byte an `ExpT` layout).
+    ///
+    /// Irrelevant to interpretation, but parsed so the chunk is *recognized* rather
+    /// than silently skipped; see [`table::parse_locals`]. Empty when absent.
+    pub locals: Vec<table::RawExport>,
     /// The `ImpT` import table.
     pub imports: Vec<table::RawImport>,
     /// The `FunT` lambda descriptors, in file (fun-table index) order.
@@ -91,6 +96,13 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         Some(chunk) => table::parse_exports(chunk.data)?,
         None => Vec::new(),
     };
+    // `LocT` shares the `ExpT` layout; the C parses it with the same reader. It is
+    // the JIT-only local-function table, so the interpreter never consults it, but it
+    // is a *recognized* chunk (not silently skipped).
+    let locals = match chunks.find(ChunkId::LOCT) {
+        Some(chunk) => table::parse_locals(chunk.data)?,
+        None => Vec::new(),
+    };
     let funs = match chunks.find(ChunkId::FUNT) {
         Some(chunk) => table::parse_funs(chunk.data)?,
         None => Vec::new(),
@@ -119,6 +131,7 @@ pub fn parse<'a>(chunks: &Container<'a>) -> Result<Chunks<'a>> {
         atoms,
         code: Some(header),
         exports,
+        locals,
         imports,
         funs,
         line,
@@ -206,6 +219,17 @@ mod tests {
             vec![(9, 1, 14), (9, 0, 12), (7, 1, 9), (5, 1, 4), (2, 2, 2)]
         );
 
+        // `LocT` (the JIT-only local-function table): the single non-exported local
+        // `fib/3` (wire atom index 5) at entry label 6, as an `ExpT`-shaped triple.
+        assert_eq!(
+            chunks.locals,
+            vec![table::RawExport {
+                function: 5,
+                arity: 3,
+                label: 6
+            }]
+        );
+
         // Code header.
         let cv = chunks.code_version;
         assert_eq!(
@@ -281,6 +305,31 @@ mod tests {
         let container = crate::container::parse(&image).unwrap();
         let err = parse(&container).unwrap_err();
         assert!(matches!(err, BeamError::BadArg));
+    }
+
+    #[test]
+    fn missing_locals_chunk_yields_an_empty_table() {
+        // A minimal valid container: `AtU8` with the single module-name atom plus a
+        // bare `Code` header, and no `LocT` chunk at all.
+        let mut body = Vec::new();
+        body.extend_from_slice(b"AtU8");
+        body.extend_from_slice(&6u32.to_be_bytes());
+        body.extend_from_slice(&1u32.to_be_bytes()); // count = 1
+        body.extend_from_slice(&[1u8, b'm', 0, 0]); // len 1, "m", 2 pad bytes
+        body.extend_from_slice(b"Code");
+        body.extend_from_slice(&20u32.to_be_bytes());
+        body.extend_from_slice(&16u32.to_be_bytes()); // head_size
+        body.extend_from_slice(&[0u8; 16]); // format/max_opcode/labels/functions
+        let mut image = Vec::new();
+        image.extend_from_slice(b"FOR1");
+        image.extend_from_slice(&((4 + body.len()) as u32).to_be_bytes());
+        image.extend_from_slice(b"BEAM");
+        image.extend_from_slice(&body);
+
+        let container = crate::container::parse(&image).unwrap();
+        assert!(container.find(crate::container::ChunkId::LOCT).is_none());
+        let chunks = parse(&container).unwrap();
+        assert!(chunks.locals.is_empty());
     }
 
     #[test]
