@@ -224,8 +224,33 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   (set `O_NONBLOCK`, `EAGAIN` leaves the remainder queued and arms write readiness, a write failure is a typed
   `BeamError::Io`); `stop` and `Drop` kill + reap the child (an already-exited child is reaped via `try_wait`,
   no kill) and deregister/close every descriptor. Descriptors of a spawned child are owned and closed; an
-  adopted `{fd, N}` descriptor is deregistered but **never** closed (the Erlang side owns it), and stderr is
-  piped but never read.
+  adopted `{fd, N}` descriptor is **duplex** — the single descriptor is registered **once** with `Interest::BOTH`
+  and serves both the read stream and the stream `port_command` writes to — and is deregistered but **never**
+  closed (the Erlang side owns it). The child's **stderr is discarded** (`Stdio::null()`): it is not port data
+  and there is no pipe for it to fill. A failed **direct-exec** spawn (a missing program, `EACCES`, `ENOTDIR`, …)
+  is a `BeamError::Raise` carrying the errno atom (`enoent`/`eacces`/`enotdir`/…), matching the oracle; an
+  unmapped errno falls back to `BeamError::Io` (see `src/error.rs`).
+
+### `drivers/inet.rs` (the TCP `tcp_inet` socket driver floor)
+- `pub const DRIVER_NAME: &str = "tcp_inet"` — the name `port_info(Port, name)` reports and `prim_inet` opens;
+  `pub fn make_tcp_inet() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered by `with_builtins`).
+- `pub struct TcpInetDriver` (`name() == "tcp_inet"`) — a non-blocking TCP socket behind a port; `from_socket(fd)`
+  adopts a descriptor and probes its kernel state (`SO_ACCEPTCONN` ⇒ listening, `getpeername` ⇒ connected, else
+  open), like `inet_ctl_fdopen`; `connect_error() -> Option<i32>` exposes the late `SO_ERROR` outcome of a
+  non-blocking `connect`. `pub enum InetState` is the socket's state (unopened/open/listening/connected).
+- Control verbs (the C `INET_REQ_*`/`TCP_REQ_*` codes) and their reply bytes: `open` ⇒ `[1]`; `bind` ⇒
+  `[1] ++ port_be16`; `listen` ⇒ `[1]`; `accept` ⇒ `[1] ++ fd_be32` (bare `[1]` when nothing is pending,
+  `[0]einval` if not listening); `connect` ⇒ `[1]` (or `[0]exbadport`/`[0]eisconn`/`[0]einval`/`[0]++errno`);
+  `send`/`recv`/`shutdown` ⇒ `[1]` (or `[0]enotconn`); `close` ⇒ `[1]`. Operational failures are
+  `[0] ++ lowercase-errno-name` (`erl_errno_id`); malformed args and unknown verbs ⇒ `BeamError::BadArg`.
+  Packed addresses use `INET_AF_INET`/`ANY`/`LOOPBACK`.
+- Flow control mirrors `FdDriver`: `send(2)` with `MSG_NOSIGNAL`, `EAGAIN` leaves the remainder queued and arms
+  write readiness, a drained queue drops writability and applies a deferred `shutdown`; reads drain to `EAGAIN`
+  and latch EOF; `EINPROGRESS` arms write readiness.
+- **Deferred** (documented in the module): the second-port `accept` (this floor transfers the port and answers
+  `[1] ++ fd_be32` instead of the C's async id), the async-op queue, `driver_set_timer` timeouts,
+  `fdopen`/`sendfile`/`unrecv`/`getopts`/`setopts`/`getstats`/`getfd`/`ignorefd`, `recv`'s timeout/length,
+  IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` delivery modes, and DNS (literal addresses only).
 
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures ⇒ `BeamError::Io`,
