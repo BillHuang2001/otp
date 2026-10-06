@@ -1599,6 +1599,53 @@ mod tests {
     }
 
     #[test]
+    fn a_capability_gap_is_uncatchable() {
+        // `erlang:send/2` has no delivery hook in `-eval`, so it raises the
+        // `unsupported_bif` capability gap. A `try`/`catch` in the expression must
+        // NOT turn that into an apparent exception: it propagates out (classified by
+        // `unsupported_reason`) so the CLI exits 3 with `beam_rt: unsupported: …`.
+        for expr in [
+            "try erlang:send(self(), hello) catch _:_ -> 0 end",
+            "try (erlang:send(self(), hello)) of V -> V catch C:R -> ok end",
+        ] {
+            let error = run(expr).expect_err("a capability gap propagates");
+            assert!(
+                error::unsupported_reason(&error).is_some(),
+                "{expr}: {error}"
+            );
+        }
+    }
+
+    #[test]
+    fn genuine_raises_stay_catchable_alongside_the_uncatchable_gap() {
+        // The `unsupported*` convention is fatal, but a reason that merely *contains*
+        // `unsupported` — or any other genuine raise — is an ordinary, catchable error.
+        atom(
+            "try erlang:error(unsupported_thing) catch error:R -> R end",
+            "unsupported_thing",
+        );
+        int("try 1/0 catch error:R when R =:= badarith -> 9 end", 9);
+        int("try throw(x) catch throw:x -> 11 end", 11);
+    }
+
+    #[test]
+    fn a_loaded_module_applies_an_eval_closure() {
+        // `lists:map/2` (a loaded stdlib module) calls the `-eval` fun back through
+        // `RuntimeContext::apply_fun`; the runtime must resolve it from its closure
+        // store. The result is heap-allocated, so the runtime must outlive it.
+        let mut runtime = Runtime::new(RuntimeConfig::default()).expect("a runtime");
+        let mut sink = beam_bifs::NullSink;
+        let mut ctx = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let mapped = eval(&mut ctx, "lists:map(fun(X) -> X*X end, [1,2,3])")
+            .expect("lists:map/2 applies the eval fun");
+        let elements = terms::list_elements(mapped).expect("a list");
+        assert_eq!(elements.len(), 3);
+        assert_eq!(signed_value(elements[0]), 1);
+        assert_eq!(signed_value(elements[1]), 4);
+        assert_eq!(signed_value(elements[2]), 9);
+    }
+
+    #[test]
     fn malformed_expressions_are_capability_gaps() {
         for expr in ["1 +", "(", "case"] {
             let error = run(expr).expect_err(expr);

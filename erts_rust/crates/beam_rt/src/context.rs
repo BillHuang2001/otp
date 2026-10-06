@@ -381,6 +381,34 @@ mod tests {
     }
 
     #[test]
+    fn the_pending_interner_predicts_append_only_indices_and_dedups() {
+        let mut interner = PendingInterner::new(10);
+        assert_eq!(interner.intern("foo").raw(), 10);
+        assert_eq!(interner.intern("bar").raw(), 11);
+        // A duplicate within the same call reuses its predicted index.
+        assert_eq!(interner.intern("foo").raw(), 10);
+        assert_eq!(interner.intern("baz").raw(), 12);
+        assert_eq!(interner.into_pending(), vec!["foo", "bar", "baz"]);
+    }
+
+    #[test]
+    fn a_bif_interns_a_new_atom_into_the_shared_table() {
+        let mut rt = runtime();
+        let name = "a_fresh_atom_zzz";
+        assert!(rt.atoms().lookup(name).is_none(), "the name starts unknown");
+        let base = rt.atoms().len();
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let image = terms::make_heap_binary(&mut ctx, name.as_bytes()).expect("a binary");
+        let atom = ctx
+            .call_bif("erlang", "binary_to_atom", 1, &[image])
+            .expect("binary_to_atom/1 interns a new name");
+        // The atom the BIF built resolves through the one shared table: the name was
+        // committed after the call, at exactly the index the interner predicted.
+        assert_eq!(rt.atoms().name(atom_val(atom)), Some(name));
+        assert_eq!(rt.atoms().len(), base + 1);
+    }
+
+    #[test]
     fn an_unknown_erlang_bif_is_a_typed_error_not_a_panic() {
         let mut rt = runtime();
         let mut ctx = RuntimeContext::new(&mut rt);
