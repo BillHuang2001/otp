@@ -26,7 +26,7 @@
 
 use beam_alloc::Heap as OutHeap;
 use beam_common::{BeamError, Result as BeamResult};
-use beam_ets::{compile, MatchSpec, Table, TableId, TableKind, TableOptions};
+use beam_ets::{compile, MatchContinuation, MatchSpec, Table, TableId, TableKind, TableOptions};
 use beam_term::prelude::*;
 
 /// Words reserved for the arena the battery builds source objects and match
@@ -37,6 +37,7 @@ const OUT_WORDS: usize = 1 << 16;
 /// The object count of the `set_large` / `ordered_large` cases.
 const LARGE_N: i64 = 10001;
 
+mod continuation;
 mod counter;
 mod info;
 mod kind;
@@ -45,6 +46,7 @@ mod large;
 mod lookup;
 mod matchspec;
 mod navigation;
+mod replace;
 
 // ---------------------------------------------------------------------------
 // Canonical rendering (the port of the oracle's `r/1`, `t/1`, `l/1`, `srt/1`)
@@ -218,8 +220,37 @@ pub fn rendered(terms: &[Eterm], atoms: &AtomTable) -> Vec<String> {
 /// The oracle's `cap(fun() -> ets:insert(T, List) end)`: a successful list
 /// insert answers the atom `true`, so `Ok(())` renders as `ok:true`.
 pub fn cap_insert_list(result: BeamResult<()>) -> String {
+    cap_unit(result)
+}
+
+/// The oracle's `cap/1` for a call answering the atom `true` on success
+/// (`ets:insert/2` over a list, `ets:give_away/3`, `ets:setopts/2`).
+pub fn cap_unit(result: BeamResult<()>) -> String {
     match result {
         Ok(()) => "ok:true".to_string(),
+        Err(error) => cap_error(&error),
+    }
+}
+
+/// The oracle's `cap/1` for a call answering an integer count on success
+/// (`ets:select_replace/2`): the count, or the error class.
+pub fn cap_count(result: BeamResult<usize>) -> String {
+    match result {
+        Ok(count) => format!("ok:{count}"),
+        Err(error) => cap_error(&error),
+    }
+}
+
+/// The oracle's `cap/1` for a `select`/`match` `/3` or `/1` chunk: `ok:<in-order
+/// results>` on success, else the error class. The continuation the oracle hands
+/// back is an **opaque ref** and is never rendered, so only the materialized
+/// results are (`Option<MatchContinuation>` is deliberately ignored).
+pub fn cap_chunk(
+    result: BeamResult<(Vec<Eterm>, Option<MatchContinuation>)>,
+    atoms: &AtomTable,
+) -> String {
+    match result {
+        Ok((results, _)) => format!("ok:{}", list_of(&rendered(&results, atoms))),
         Err(error) => cap_error(&error),
     }
 }
@@ -432,6 +463,8 @@ pub fn rust_battery() -> Vec<(String, String)> {
     cases.extend(counter::counter_cases(&mut battery));
     cases.extend(lookup::lookup_cases(&mut battery));
     cases.extend(matchspec::matchspec_cases(&mut battery));
+    cases.extend(replace::replace_cases(&mut battery));
+    cases.extend(continuation::continuation_cases(&mut battery));
     cases.extend(info::info_cases(&mut battery));
     cases.extend(large::large_cases(&mut battery));
 

@@ -1,9 +1,13 @@
 //! The **`select` / `match`** case group: `select/2` with variables, wildcards,
 //! literals and guards (comparison, type test, `andalso`/`orelse`) and bodies
 //! (`'$_'`, `'$N'`, constants, `{{…}}` construction); `select_delete/2` +
-//! `select_count/2`; the `match` family; and malformed specs (`badarg`).
+//! `select_count/2`; the `match` family; malformed specs (`badarg`);
+//! `ets:match_spec_run/2` (bindings/whole-element/all-bindings bodies, a repeated
+//! head variable, multi-clause first-match-wins, an empty list and a non-list
+//! `badarg`); and the body-error `EXIT` semantics.
 
 use super::*;
+use beam_ets::match_spec_run;
 
 impl Battery {
     fn select_head_vars(&mut self) -> String {
@@ -368,6 +372,117 @@ impl Battery {
         list_of(&rendered)
     }
 
+    /// `ets:match_spec_run(List, ets:match_spec_compile([{head, [], body}]))` — the
+    /// oracle requires the spec already compiled by `ets:match_spec_compile/1`,
+    /// while this crate's [`match_spec_run`] takes the **raw** spec term.
+    fn run_on_list(&mut self, list: Eterm, head: Eterm, body: Eterm) -> Vec<Eterm> {
+        let spec = self.spec(head, NIL, body);
+        match_spec_run(list, spec, &self.atoms, &mut self.out).expect("match_spec_run")
+    }
+
+    /// `ets:match_spec_run/2` with the three body forms: `['$1']` (a bound
+    /// variable), `['$_']` (the whole element) and `['$$']` (every bound head
+    /// variable, ascending).
+    ///
+    /// The all-bindings atom is `'$$'` (two characters) — **not** the one-character
+    /// `'$'` an Erlang source literal `'$$'` lexes to — so the oracle program builds
+    /// it with `list_to_atom([36,36])` and this side interns the `"$$"` name.
+    fn match_spec_run_bindings(&mut self) -> String {
+        let objects = [self.object(1, 10), self.object(2, 20), self.object(3, 30)];
+        let list = self.list(&objects);
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let body_var = self.list(&[v1]);
+        let whole = self.atom("$_");
+        let body_whole = self.list(&[whole]);
+        let all_bindings = self.atom("$$");
+        let body_all = self.list(&[all_bindings]);
+
+        let vars = self.run_on_list(list, head, body_var);
+        let whole_objects = self.run_on_list(list, head, body_whole);
+        let bindings = self.run_on_list(list, head, body_all);
+        tuple_of(&[
+            self.inorder(&vars),
+            self.inorder(&whole_objects),
+            self.inorder(&bindings),
+        ])
+    }
+
+    /// A repeated head variable (`{'$1','$1'}`) enforces equality: only the equal
+    /// pairs survive.
+    fn match_spec_run_repeated_var(&mut self) -> String {
+        let objects = [self.object(1, 1), self.object(1, 2), self.object(2, 2)];
+        let list = self.list(&objects);
+        let v1 = self.atom("$1");
+        let head = self.tuple(&[v1, v1]);
+        let body = self.list(&[v1]);
+        let result = self.run_on_list(list, head, body);
+        self.inorder(&result)
+    }
+
+    /// Multiple clauses (the first match wins) plus an element no clause matches
+    /// (a bare `42` against a 2-tuple head) — dropped from the result.
+    fn match_spec_run_multi_clause(&mut self) -> String {
+        let objects = [
+            self.object(1, 10),
+            self.object(2, 20),
+            self.object(3, 30),
+            make_small(42),
+        ];
+        let list = self.list(&objects);
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let gt = self.atom(">");
+        let guard = self.tuple(&[gt, v2, make_small(15)]);
+        let guards = self.list(&[guard]);
+        let big = self.atom("big");
+        let small = self.atom("small");
+        let body_big = self.list(&[big]);
+        let body_small = self.list(&[small]);
+        let clause_big = self.clause(head, guards, body_big);
+        let clause_small = self.clause(head, NIL, body_small);
+        let spec = self.list(&[clause_big, clause_small]);
+        let result = match_spec_run(list, spec, &self.atoms, &mut self.out).expect("match_spec_run");
+        self.inorder(&result)
+    }
+
+    /// An empty list yields `[]`; a non-list first argument is `badarg`.
+    fn match_spec_run_empty_and_badarg(&mut self) -> String {
+        let v1 = self.atom("$1");
+        let v2 = self.atom("$2");
+        let head = self.tuple(&[v1, v2]);
+        let body = self.list(&[v1]);
+        let spec = self.spec(head, NIL, body);
+        let empty = match_spec_run(NIL, spec, &self.atoms, &mut self.out).expect("the empty run");
+        let badarg = cap_terms(
+            match_spec_run(make_small(1), spec, &self.atoms, &mut self.out),
+            &self.atoms,
+        );
+        tuple_of(&[self.inorder(&empty), badarg])
+    }
+
+    /// A raising body expression yields the atom `EXIT` (the C `FAIL_TERM`): a head
+    /// matching every 2-tuple with body `[{hd,5}]` selects `['EXIT','EXIT']`.
+    fn body_error_exit(&mut self) -> String {
+        // The runtime's global atom table always knows `EXIT` (the C `FAIL_TERM`),
+        // and the executor resolves a failed body against it by name; the battery's
+        // minimal table has to say so explicitly (like `true`/`false`).
+        let _exit = self.atom("EXIT");
+        let mut table = self.table(TableKind::OrderedSet, 1);
+        table.insert(self.object(1, 10), &self.atoms).expect("insert");
+        table.insert(self.object(2, 20), &self.atoms).expect("insert");
+        let wildcard = self.atom("_");
+        let head = self.tuple(&[wildcard, wildcard]);
+        let hd = self.atom("hd");
+        let call = self.tuple(&[hd, make_small(5)]);
+        let body = self.list(&[call]);
+        let spec_term = self.spec(head, NIL, body);
+        let selected = self.select(&table, spec_term);
+        self.inorder(&selected)
+    }
+
     /// The compiled spec is what the caller needs; this is the shared
     /// compile-and-run step of the simple select cases.
     fn select(&mut self, table: &Table, spec_term: Eterm) -> Vec<Eterm> {
@@ -412,6 +527,23 @@ pub(super) fn matchspec_cases(battery: &mut Battery) -> Vec<(String, String)> {
     ));
     cases.push(("match_family".into(), battery.match_family()));
     cases.push(("malformed_specs".into(), battery.malformed_specs()));
+    cases.push((
+        "match_spec_run_bindings".into(),
+        battery.match_spec_run_bindings(),
+    ));
+    cases.push((
+        "match_spec_run_repeated_var".into(),
+        battery.match_spec_run_repeated_var(),
+    ));
+    cases.push((
+        "match_spec_run_multi_clause".into(),
+        battery.match_spec_run_multi_clause(),
+    ));
+    cases.push((
+        "match_spec_run_empty_and_badarg".into(),
+        battery.match_spec_run_empty_and_badarg(),
+    ));
+    cases.push(("body_error_exit".into(), battery.body_error_exit()));
 
     cases
 }

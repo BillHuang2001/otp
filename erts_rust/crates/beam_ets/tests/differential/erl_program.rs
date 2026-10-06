@@ -124,12 +124,31 @@ battery() ->
     emit("match_family", match_family()),
     emit("malformed_specs", malformed_specs()),
 
+    emit("match_spec_run_bindings", match_spec_run_bindings()),
+    emit("match_spec_run_repeated_var", match_spec_run_repeated_var()),
+    emit("match_spec_run_multi_clause", match_spec_run_multi_clause()),
+    emit("match_spec_run_empty_and_badarg", match_spec_run_empty_and_badarg()),
+    emit("body_error_exit", body_error_exit()),
+    emit("select_replace_small_int", select_replace_small_int()),
+    emit("select_replace_arity1", select_replace_arity1()),
+    emit("select_replace_bag_badarg", select_replace_bag_badarg()),
+    emit("select_replace_changed_key_badarg", select_replace_changed_key_badarg()),
+    emit("select_replace_identity", select_replace_identity()),
+    emit("select_limit_chain", select_limit_chain()),
+    emit("match_limit_chain", match_limit_chain()),
+    emit("match_object_limit_chain", match_object_limit_chain()),
+    emit("select_limit_zero_badarg", select_limit_zero_badarg()),
+    emit("select_limit_empty_table", select_limit_empty_table()),
+
     emit("info_name_named_table", info_name_named_table()),
     emit("info_option_fields", info_option_fields()),
     emit("info_static_fields", info_static_fields()),
     emit("info_unknown_key", info_unknown_key()),
     emit("lookup_element_multi", lookup_element_multi()),
     emit("insert_list_atomic", insert_list_atomic()),
+
+    emit("ownership_give_away", ownership_give_away()),
+    emit("ownership_heir", ownership_heir()),
 
     emit("set_large", set_large()),
     emit("ordered_large", ordered_large()),
@@ -524,6 +543,174 @@ insert_list_atomic() ->
     R2 = cap(fun() -> ets:insert(T2, [{b, 2}, {c}]) end),
     L2 = srt(ets:tab2list(T2)),
     t([R1, L1, R2, L2]).
+
+%% --------------------- match_spec_run / select_replace / continuation ---------------------
+
+%% `ets:match_spec_run/2` requires the spec already compiled by
+%% `ets:match_spec_compile/1` (a raw clause list is `badarg` there).
+msc(S) -> ets:match_spec_compile(S).
+
+%% The all-bindings atom `'$$'` has two characters; written literally as `'$$'`
+%% the Erlang lexer reads the one-character atom `'$'`, so build it explicitly.
+msr_all_bindings() -> list_to_atom([36, 36]).
+
+match_spec_run_bindings() ->
+    L = [{1, 10}, {2, 20}, {3, 30}],
+    S1 = [{{'$1', '$2'}, [], ['$1']}],
+    S2 = [{{'$1', '$2'}, [], ['$_']}],
+    S3 = [{{'$1', '$2'}, [], [msr_all_bindings()]}],
+    t([inorder(ets:match_spec_run(L, msc(S1))),
+       inorder(ets:match_spec_run(L, msc(S2))),
+       inorder(ets:match_spec_run(L, msc(S3)))]).
+
+match_spec_run_repeated_var() ->
+    L = [{1, 1}, {1, 2}, {2, 2}],
+    S = [{{'$1', '$1'}, [], ['$1']}],
+    inorder(ets:match_spec_run(L, msc(S))).
+
+match_spec_run_multi_clause() ->
+    L = [{1, 10}, {2, 20}, {3, 30}, 42],
+    S = [{{'$1', '$2'}, [{'>', '$2', 15}], [big]},
+         {{'$1', '$2'}, [], [small]}],
+    inorder(ets:match_spec_run(L, msc(S))).
+
+match_spec_run_empty_and_badarg() ->
+    S = [{{'$1', '$2'}, [], ['$1']}],
+    E = ets:match_spec_run([], msc(S)),
+    B = cap(fun() -> ets:match_spec_run(foo, msc(S)) end),
+    t([inorder(E), B]).
+
+select_replace_small_int() ->
+    T = new(set),
+    [ets:insert(T, {K, K * 10}) || K <- [1, 2, 3]],
+    S = [{{'$1', '$2'}, [{'>', '$2', 10}], [{{'$1', {'*', '$2', 2}}}]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+select_replace_arity1() ->
+    T = new(set),
+    ets:insert(T, {1, a}), ets:insert(T, {2, b}),
+    S = [{{'$1', '$2'}, [], [{{'$1'}}]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+select_replace_bag_badarg() ->
+    T = new(bag),
+    ets:insert(T, {1, 10}),
+    S = [{{'$1', '$2'}, [], [{{'$1', '$2'}}]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+select_replace_changed_key_badarg() ->
+    T = new(set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], [{{99, '$2'}}]}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+select_replace_identity() ->
+    T = new(set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'$1', '$2'}, [], ['$_']}],
+    C = cap(fun() -> ets:select_replace(T, S) end),
+    t([C, srt(ets:tab2list(T))]).
+
+%% The 5-object `ordered_set` `{1,x}`..`{5,x}` the continuation cases chain over.
+chain_table() ->
+    T = new(ordered_set),
+    [ets:insert(T, {K, x}) || K <- [1, 2, 3, 4, 5]],
+    T.
+
+select_limit_chain() ->
+    T = chain_table(),
+    S = [{{'$1', '$2'}, [], ['$1']}],
+    inorder(chain_select(T, S, 2)).
+
+chain_select(T, S, Limit) ->
+    case ets:select(T, S, Limit) of
+        '$end_of_table' -> [];
+        {Rs, Cont} -> Rs ++ chain_select_cont(Cont)
+    end.
+
+chain_select_cont(Cont) ->
+    case ets:select(Cont) of
+        '$end_of_table' -> [];
+        {Rs, Cont2} -> Rs ++ chain_select_cont(Cont2)
+    end.
+
+match_limit_chain() ->
+    T = chain_table(),
+    inorder(chain_match(T, {'$1', '$2'}, 2)).
+
+chain_match(T, P, Limit) ->
+    case ets:match(T, P, Limit) of
+        '$end_of_table' -> [];
+        {Rs, Cont} -> Rs ++ chain_match_cont(Cont)
+    end.
+
+chain_match_cont(Cont) ->
+    case ets:match(Cont) of
+        '$end_of_table' -> [];
+        {Rs, Cont2} -> Rs ++ chain_match_cont(Cont2)
+    end.
+
+match_object_limit_chain() ->
+    T = chain_table(),
+    inorder(chain_mo(T, {'$1', '$2'}, 2)).
+
+chain_mo(T, P, Limit) ->
+    case ets:match_object(T, P, Limit) of
+        '$end_of_table' -> [];
+        {Rs, Cont} -> Rs ++ chain_mo_cont(Cont)
+    end.
+
+chain_mo_cont(Cont) ->
+    case ets:match_object(Cont) of
+        '$end_of_table' -> [];
+        {Rs, Cont2} -> Rs ++ chain_mo_cont(Cont2)
+    end.
+
+select_limit_zero_badarg() ->
+    T = chain_table(),
+    S = [{{'$1', '$2'}, [], ['$1']}],
+    cap(fun() -> ets:select(T, S, 0) end).
+
+select_limit_empty_table() ->
+    T = new(ordered_set),
+    S = [{{'$1', '$2'}, [], ['$1']}],
+    r(ets:select(T, S, 2)).
+
+body_error_exit() ->
+    T = new(ordered_set),
+    ets:insert(T, {1, 10}), ets:insert(T, {2, 20}),
+    S = [{{'_', '_'}, [], [{hd, 5}]}],
+    inorder(ets:select(T, S)).
+
+%% --------------------- ownership: give_away / heir ---------------------
+
+ownership_give_away() ->
+    Parent = self(),
+    Child = spawn(fun() -> receive {go, From} -> From ! ok; stop -> ok end end),
+    T1 = ets:new(diff, [set, public]),
+    R1 = cap(fun() -> ets:give_away(T1, Child, gift) end),
+    R2 = cap(fun() -> ets:give_away(T1, Parent, gift) end),
+    T2 = ets:new(diff, [set, public]),
+    R3 = cap(fun() -> ets:give_away(T2, self(), gift) end),
+    T3 = ets:new(diff, [set, public]),
+    R4 = cap(fun() -> ets:give_away(T3, not_a_pid, gift) end),
+    Child ! stop,
+    t([R1, R2, R3, R4]).
+
+ownership_heir() ->
+    Heir = spawn(fun() -> receive stop -> ok end end),
+    T = ets:new(diff, [set, public]),
+    H0 = r(ets:info(T, heir)),
+    S1 = cap(fun() -> ets:setopts(T, {heir, Heir, gift}) end),
+    S2 = cap(fun() -> ets:setopts(T, {heir, none}) end),
+    H1 = r(ets:info(T, heir)),
+    Hold = cap(fun() -> ets:info(T, holder) end),
+    Heir ! stop,
+    t([H0, S1, S2, H1, Hold]).
 
 %% --------------------- update_counter with bignums ---------------------
 
