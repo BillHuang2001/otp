@@ -29,6 +29,7 @@
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`flags`] | A.6 — CLI / configuration |
 //! | [`bifs`] | A.7 — BIF / OTP app surface |
+//! | [`ets`] | A.7 — ETS tables: the `ets:*` BIF surface the runtime serves |
 //! | [`system_info`] | A.8 — introspection |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
@@ -45,6 +46,7 @@ mod boot;
 mod driver;
 mod errors;
 mod etf;
+mod ets;
 mod flags;
 mod mexec;
 mod modules;
@@ -304,6 +306,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(driver::group());
     cases.extend(wire::group());
     cases.extend(bifs::group());
+    cases.extend(ets::group());
     cases.extend(system_info::group());
     cases.extend(boot::group());
     cases.extend(flags::group());
