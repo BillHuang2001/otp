@@ -76,7 +76,8 @@ pub use crate::timer::*;
 /// [`PortRegistry`], [`PortControl`], [`PortCommandOptions`]), the port-task machinery
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) the driver seam ([`Driver`], [`DriverContext`],
-/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`FdDriver`], [`EfileDriver`],
+/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`PortExitReason`], [`FdDriver`],
+/// [`EfileDriver`],
 /// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`],
 /// [`TcpInetDriver`], [`InetState`]) and the timer/queue helpers ([`Timeout`], [`Timer`],
 /// [`ByteQueue`]) into scope.

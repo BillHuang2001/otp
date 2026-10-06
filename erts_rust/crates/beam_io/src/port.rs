@@ -54,7 +54,7 @@ use std::time::Instant;
 use beam_common::Result;
 use beam_process::{PortId, PortTable};
 
-use crate::driver::{Driver, DriverContext, DriverRegistry, PortArms};
+use crate::driver::{Driver, DriverContext, DriverRegistry, PortArms, PortExitReason};
 use crate::error;
 use crate::poller::{Event, Poller};
 use crate::port_task::{
@@ -103,6 +103,9 @@ pub struct Port {
     /// Which readiness directions the driver has registered with the poller (see
     /// [`PortArms`]); the reactor only schedules a direction the driver can serve.
     arms: PortArms,
+    /// Set once a [`PortExitReason`] has been delivered to the driver, so
+    /// [`Port::notify_exit`] delivers the port-exit notification **at most once**.
+    exit_notified: bool,
 }
 
 impl Port {
@@ -119,6 +122,7 @@ impl Port {
             tasks: PortTaskQueue::new(),
             input_pending: false,
             arms: PortArms::default(),
+            exit_notified: false,
         }
     }
 
@@ -161,12 +165,16 @@ impl Port {
 
     /// Starts the port: builds a context and calls the driver's `start`.
     ///
+    /// The port's `TIMEOUT` task is then armed from [`Driver::next_timeout`] (see
+    /// [`Port::refresh_timeout`]), so a driver that declares a deadline in `start` gets its
+    /// timer.
+    ///
     /// # Errors
     ///
     /// Returns whatever the driver's `start` returns.
     pub fn open(&mut self, poller: &mut Poller) -> Result<()> {
         let id = self.id;
-        {
+        let result = {
             // Destructure first: the driver and its context borrow disjoint fields.
             let Port {
                 driver,
@@ -176,8 +184,10 @@ impl Port {
                 ..
             } = self;
             let mut ctx = DriverContext::new(id, poller, input, output, arms);
-            driver.start(&mut ctx)?;
-        }
+            driver.start(&mut ctx)
+        };
+        self.refresh_timeout();
+        result?;
         self.state = PortState::Open;
         Ok(())
     }
@@ -193,7 +203,9 @@ impl Port {
 
     /// Queues `data` for output and asks the driver to drain it.
     ///
-    /// Returns the number of bytes the driver actually wrote; the remainder stays queued.
+    /// Returns the number of bytes the driver actually wrote; the remainder stays queued. The
+    /// port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
+    /// [`Port::refresh_timeout`]).
     ///
     /// # Errors
     ///
@@ -201,15 +213,19 @@ impl Port {
     pub fn output(&mut self, poller: &mut Poller, data: &[u8]) -> Result<usize> {
         self.queue_output(data);
         let id = self.id;
-        let Port {
-            driver,
-            input,
-            output,
-            arms,
-            ..
-        } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
-        driver.output(&mut ctx)
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.output(&mut ctx)
+        };
+        self.refresh_timeout();
+        result
     }
 
     /// Schedules a task of `kind`, reporting whether it was newly scheduled.
@@ -223,6 +239,50 @@ impl Port {
     /// Schedules a [`PortTaskKind::Timeout`] task that may not run before `deadline`.
     pub fn schedule_timeout(&mut self, deadline: Instant) -> bool {
         self.tasks.enqueue_timeout(deadline)
+    }
+
+    /// Arms this port's `TIMEOUT` task at `deadline`, **replacing** any deadline already armed.
+    ///
+    /// This is the explicit counterpart of the automatic re-arm from [`Driver::next_timeout`]
+    /// (see [`Port::refresh_timeout`]), and the one place a caller can re-point the timer: it
+    /// always (re-)targets the port's single `TIMEOUT` task, unlike
+    /// [`Port::schedule_timeout`], which is a no-op while a timer is already pending. The task
+    /// still only runs once `deadline` has passed (see [`PortTaskQueue::pop_next`]).
+    pub fn arm_timeout(&mut self, deadline: Instant) {
+        self.tasks.arm_timeout(deadline);
+    }
+
+    /// Drops any pending `TIMEOUT` task, reporting whether one was pending.
+    ///
+    /// A later driver interaction re-derives the timer from [`Driver::next_timeout`], which
+    /// may re-arm it (see [`Port::refresh_timeout`]).
+    pub fn cancel_timeout(&mut self) -> bool {
+        self.tasks.remove(PortTaskKind::Timeout)
+    }
+
+    /// The deadline the driver currently wants its `timeout` callback at, if any.
+    ///
+    /// Reads [`Driver::next_timeout`] directly; the port's `TIMEOUT` task mirrors this value
+    /// after each driver interaction (see [`Port::refresh_timeout`]).
+    pub fn next_timeout(&self) -> Option<Instant> {
+        self.driver.next_timeout()
+    }
+
+    /// Re-arms (or clears) this port's `TIMEOUT` task from the driver's declared deadline.
+    ///
+    /// Called **after every driver interaction** (`start`/`output`/`ready_input`/
+    /// `ready_output`/`control`/`timeout`), so the `TIMEOUT` task always mirrors
+    /// [`Driver::next_timeout`]: a declared deadline arms (or re-points) the timer, and no
+    /// declared deadline clears it. The deadline is a lower bound — an armed task whose
+    /// deadline has not passed stays queued ([`PortTaskQueue::pop_next`]), so the driver's
+    /// `timeout` never runs early.
+    pub(crate) fn refresh_timeout(&mut self) {
+        match self.driver.next_timeout() {
+            Some(deadline) => self.tasks.arm_timeout(deadline),
+            None => {
+                self.tasks.remove(PortTaskKind::Timeout);
+            }
+        }
     }
 
     /// The number of tasks currently scheduled on this port.
@@ -294,74 +354,104 @@ impl Port {
 
     /// Dispatches read readiness to the driver's `ready_input`.
     ///
+    /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
+    /// [`Port::refresh_timeout`]).
+    ///
     /// # Errors
     ///
     /// Returns whatever the driver's `ready_input` returns.
     pub fn ready_input(&mut self, poller: &mut Poller) -> Result<()> {
         let id = self.id;
-        let Port {
-            driver,
-            input,
-            output,
-            arms,
-            ..
-        } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
-        driver.ready_input(&mut ctx)
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.ready_input(&mut ctx)
+        };
+        self.refresh_timeout();
+        result
     }
 
     /// Dispatches write readiness to the driver's `ready_output`.
+    ///
+    /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards (see
+    /// [`Port::refresh_timeout`]).
     ///
     /// # Errors
     ///
     /// Returns whatever the driver's `ready_output` returns.
     pub fn ready_output(&mut self, poller: &mut Poller) -> Result<usize> {
         let id = self.id;
-        let Port {
-            driver,
-            input,
-            output,
-            arms,
-            ..
-        } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
-        driver.ready_output(&mut ctx)
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.ready_output(&mut ctx)
+        };
+        self.refresh_timeout();
+        result
     }
 
     /// Dispatches a port-timer expiry to the driver's `timeout`.
+    ///
+    /// The port's `TIMEOUT` task is then re-armed from [`Driver::next_timeout`] (see
+    /// [`Port::refresh_timeout`]), so a driver re-arms its timer by declaring the next deadline
+    /// — no pending timer is left behind if it declares none.
     ///
     /// # Errors
     ///
     /// Returns whatever the driver's `timeout` returns.
     pub fn timeout(&mut self, poller: &mut Poller) -> Result<()> {
         let id = self.id;
-        let Port {
-            driver,
-            input,
-            output,
-            arms,
-            ..
-        } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
-        driver.timeout(&mut ctx)
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.timeout(&mut ctx)
+        };
+        self.refresh_timeout();
+        result
     }
 
     /// Delivers a port-control command to the driver and returns its reply bytes.
+    ///
+    /// The port's `TIMEOUT` task is re-armed from [`Driver::next_timeout`] afterwards, so a
+    /// driver that changes its timer in response to a control command (e.g. an idle timeout)
+    /// takes effect immediately (see [`Port::refresh_timeout`]).
     ///
     /// # Errors
     ///
     /// Returns whatever the driver's `control` returns.
     pub fn control(&mut self, poller: &mut Poller, command: &str, arg: &[u8]) -> Result<Vec<u8>> {
         let id = self.id;
-        let Port {
-            driver,
-            input,
-            output,
-            arms,
-            ..
-        } = self;
-        let mut ctx = DriverContext::new(id, poller, input, output, arms);
-        driver.control(&mut ctx, command, arg)
+        let result = {
+            let Port {
+                driver,
+                input,
+                output,
+                arms,
+                ..
+            } = self;
+            let mut ctx = DriverContext::new(id, poller, input, output, arms);
+            driver.control(&mut ctx, command, arg)
+        };
+        self.refresh_timeout();
+        result
     }
 
     /// Takes the reaped exit status of the OS child this port owns, once.
@@ -376,6 +466,38 @@ impl Port {
     /// Returns whatever the driver's `take_exit_status` returns.
     pub fn take_exit_status(&mut self) -> Result<Option<i32>> {
         self.driver.take_exit_status()
+    }
+
+    /// Tells the driver this port is exiting, **at most once**.
+    ///
+    /// Forwards `reason` to [`Driver::port_exit`] — the driver's advisory exit-notification
+    /// channel, distinct from the teardown [`Driver::stop`] — and records that it was
+    /// delivered, so a repeated call is a no-op that never reaches the driver again. The port
+    /// stays live and its registrations stay armed; a later [`Port::close`] then runs `stop`,
+    /// so the two are independent and a `port_exit` before a `stop` is well-defined.
+    ///
+    /// # Errors
+    ///
+    /// Returns whatever the driver's `port_exit` returns on the **first** call; a repeat never
+    /// calls the driver (it returns `Ok(())`), so the first call's outcome is the only one
+    /// observable.
+    pub fn notify_exit(&mut self, poller: &mut Poller, reason: PortExitReason) -> Result<()> {
+        if self.exit_notified {
+            return Ok(());
+        }
+        // Record the delivery before calling the driver so a failed notification is still
+        // delivered at most once (a repeat cannot re-run a driver callback with side effects).
+        self.exit_notified = true;
+        let id = self.id;
+        let Port {
+            driver,
+            input,
+            output,
+            arms,
+            ..
+        } = self;
+        let mut ctx = DriverContext::new(id, poller, input, output, arms);
+        driver.port_exit(&mut ctx, reason)
     }
 
     /// Stops the driver and marks the port [`PortState::Closed`].
@@ -490,7 +612,19 @@ impl PortCommandOptions {
 ///
 /// A `PortRegistry` is **not** `Send` or `Sync` (see the module docs, "Single-thread
 /// invariant"): it must be driven from one OS thread, and the [`PhantomData<Cell<()>>`]
-/// marker below makes that a compile-time property rather than a comment.
+/// marker below makes that a compile-time property rather than a comment. Both properties are
+/// pinned by the compile-fail doctests below, so making the registry thread-safe by accident
+/// breaks the build.
+///
+/// ```compile_fail
+/// fn assert_send<T: Send>() {}
+/// assert_send::<beam_io::PortRegistry>();
+/// ```
+///
+/// ```compile_fail
+/// fn assert_sync<T: Sync>() {}
+/// assert_sync::<beam_io::PortRegistry>();
+/// ```
 ///
 /// [`PhantomData<Cell<()>>`]: core::marker::PhantomData
 pub struct PortRegistry {
@@ -764,6 +898,78 @@ impl PortRegistry {
     pub fn take_exit_status(&mut self, id: PortId) -> Result<Option<i32>> {
         match self.ports.get_mut(&id.number()) {
             Some(port) => port.take_exit_status(),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Arms port `id`'s `TIMEOUT` task at `deadline`, replacing any deadline already armed.
+    ///
+    /// This is the runtime's explicit timer entry point and the driver-facing timer seam's
+    /// registry surface ([`Driver::next_timeout`] is the driver's own declaration, mirrored by
+    /// [`Port::refresh_timeout`]). The driver's `timeout` callback runs when the next task
+    /// round at or after `deadline` executes the timer — never before it, because
+    /// [`PortTaskQueue::pop_next`] withholds a not-yet-due `TIMEOUT` task. The next driver
+    /// interaction re-derives the deadline from the driver, so an explicit arm survives only
+    /// until the driver declares something different.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn schedule_timeout(&mut self, id: PortId, deadline: Instant) -> Result<()> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => {
+                port.arm_timeout(deadline);
+                Ok(())
+            }
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// Drops port `id`'s pending `TIMEOUT` task, reporting whether one was pending.
+    ///
+    /// The next driver interaction re-derives the timer from [`Driver::next_timeout`] (see
+    /// [`Port::refresh_timeout`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port.
+    pub fn cancel_timeout(&mut self, id: PortId) -> Result<bool> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => Ok(port.cancel_timeout()),
+            None => Err(error::badarg()),
+        }
+    }
+
+    /// The earliest deadline any live port's driver currently declares, if any.
+    ///
+    /// The runtime passes this to the poller's timeout (as an upper bound on how long it may
+    /// block) so a port timer fires even when no descriptor becomes ready; `None` means no
+    /// live driver declares a deadline (the runtime may then block indefinitely).
+    pub fn next_deadline(&self) -> Option<Instant> {
+        self.ports.values().filter_map(Port::next_timeout).min()
+    }
+
+    /// Notifies port `id`'s driver that the port is exiting, with `reason`.
+    ///
+    /// The runtime calls this on its port-exit path (its owner exited, or it is being closed)
+    /// **before** [`PortRegistry::close`], so the driver can observe the exit through
+    /// [`Driver::port_exit`] — a notification distinct from the teardown `stop` that `close`
+    /// runs. The notification is delivered **at most once** per port: a repeated call is a
+    /// no-op. The port stays live, so a `notify_port_exit` followed by a later
+    /// [`PortRegistry::close`] is well-defined.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::BadArg` when `id` is not a live port, or whatever the port's
+    /// driver returns from `port_exit` on the first call.
+    pub fn notify_port_exit(
+        &mut self,
+        poller: &mut Poller,
+        id: PortId,
+        reason: PortExitReason,
+    ) -> Result<()> {
+        match self.ports.get_mut(&id.number()) {
+            Some(port) => port.notify_exit(poller, reason),
             None => Err(error::badarg()),
         }
     }
