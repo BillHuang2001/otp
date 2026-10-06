@@ -148,6 +148,8 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
     with its registrations armed, and is independent of the later `close`/`stop`; `BadArg` for an unknown/released id.
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
+- `pub enum PortExitReason { Closed, OwnerExited, Normal }` (`Copy + Eq + Debug`) — the vocabulary of the
+  port-exit notification channel (see the defaulted `Driver::port_exit` and `PortRegistry::notify_port_exit`).
 - `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the poller
   or the queues**: `port() -> PortId`, `register(fd, interest) -> Result<Token>`,
   `reregister(fd, token, interest) -> Result<()>`, `deregister(fd, token) -> Result<()>`,
