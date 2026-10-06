@@ -62,7 +62,7 @@ use beam_bifs::{AtomInterner, BifContext, FunCaller, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
-use beam_message::Queue;
+use beam_message::{Message, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::{Atom, Eterm};
 
@@ -149,6 +149,17 @@ pub struct RuntimeContext<'a> {
     /// context must be able to resolve a mailbox against either source — see
     /// [`RuntimeContext::for_process`].
     mailbox_table: Option<&'a mut ProcessTable>,
+    /// Whether this context may advance the scheduler itself.
+    ///
+    /// The `-eval` evaluator's `receive` has no engine-level blocking: when a message is
+    /// missing it *pumps* the scheduler ([`Runtime::pump_scheduler`]) so a process
+    /// `erlang:spawn/1` started runs and can deliver. A context created by
+    /// [`RuntimeContext::for_process`] is itself **inside** a scheduler slice, so it must
+    /// never re-enter the scheduler (that would run a second process from within a slice);
+    /// it reports the typed capability gap instead.
+    ///
+    /// [`Runtime::pump_scheduler`]: crate::runtime::Runtime::pump_scheduler
+    may_pump_scheduler: bool,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -161,6 +172,7 @@ impl<'a> RuntimeContext<'a> {
             output: None,
             mailbox_pid,
             mailbox_table: None,
+            may_pump_scheduler: true,
         }
     }
 
@@ -172,6 +184,7 @@ impl<'a> RuntimeContext<'a> {
             output: Some(SharedSink::new(sink)),
             mailbox_pid,
             mailbox_table: None,
+            may_pump_scheduler: true,
         }
     }
 
@@ -200,6 +213,7 @@ impl<'a> RuntimeContext<'a> {
             output: None,
             mailbox_pid: pid,
             mailbox_table: Some(table),
+            may_pump_scheduler: false,
         }
     }
 
@@ -208,6 +222,14 @@ impl<'a> RuntimeContext<'a> {
         self.mailbox_pid
     }
 
+    /// Whether this context may advance the scheduler (see the field docs).
+    ///
+    /// A `false` answer means this context is itself running inside a scheduler slice, so
+    /// the evaluator's `receive` must report a capability gap rather than re-entering the
+    /// scheduler.
+    pub(crate) fn may_pump_scheduler(&self) -> bool {
+        self.may_pump_scheduler
+    }
     /// The process table a receive/send resolves against: the caller-supplied one when
     /// there is one, else the runtime's own.
     pub(crate) fn process_table_mut(&mut self) -> &mut ProcessTable {
@@ -244,6 +266,46 @@ impl<'a> RuntimeContext<'a> {
         Ok((process.mailbox_mut(), state))
     }
 
+    /// Whether this context owns the process table it resolves against.
+    ///
+    /// `true` for a context over the runtime's own table ([`RuntimeContext::new`],
+    /// [`RuntimeContext::with_output`]) and `false` for one built by
+    /// [`RuntimeContext::for_process`], whose table is owned by the scheduler pass. A
+    /// native `erlang:spawn/*` can only *append* to the runtime's own table (there is no
+    /// way to hand a spawned child to a pass that is already running), so a spawn from
+    /// inside a scheduler slice is the typed capability gap rather than a child that is
+    /// silently lost (see [`crate::native::process`]).
+    pub(crate) fn owns_process_table(&self) -> bool {
+        self.mailbox_table.is_none()
+    }
+
+    /// The payloads of the running process's mailbox, in FIFO order.
+    ///
+    /// This is the receive-seam **scan of the whole mailbox** the `-eval` evaluator needs
+    /// (the engine's compiled `receive` walks the mailbox itself through
+    /// `receive_next`/`receive_skip`, so it never needs this). The messages are *not*
+    /// removed: [`RuntimeContext::remove_mailbox_message`] does that with the BEAM's
+    /// `remove_message` ordering.
+    ///
+    /// A pid with no process is the typed [`crate::error::no_mailbox`] capability gap.
+    pub(crate) fn mailbox_messages(&mut self) -> Result<Vec<Eterm>> {
+        let (queue, _state) = self.mailbox_parts()?;
+        Ok(queue.iter().map(Message::payload).collect())
+    }
+
+    /// Removes the message at `index` from the running process's mailbox and repositions
+    /// the scan at the first message.
+    ///
+    /// `index` is a position in the FIFO order [`RuntimeContext::mailbox_messages`]
+    /// reports; an index past the end removes nothing (the same safe no-op the queue's own
+    /// `remove_at` implements for a past-the-end cursor).
+    pub(crate) fn remove_mailbox_message(&mut self, index: usize) -> Result<()> {
+        let (queue, state) = self.mailbox_parts()?;
+        let cursor = queue.cursor_at(index);
+        queue.remove_at(cursor);
+        state.reset(queue);
+        Ok(())
+    }
     /// Heap words still available to the running code.
     ///
     /// Milestone-1's arena is unbounded (no GC yet), so this reports
@@ -341,6 +403,7 @@ impl<'a> RuntimeContext<'a> {
                 output,
                 mailbox_pid,
                 mailbox_table,
+                may_pump_scheduler,
             } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
@@ -365,6 +428,7 @@ impl<'a> RuntimeContext<'a> {
                 output: output.clone(),
                 mailbox_pid: *mailbox_pid,
                 mailbox_table: mailbox_table.as_deref_mut(),
+                may_pump_scheduler: *may_pump_scheduler,
             };
             // The port provider is another cheap handle: it holds the shared `Rc` port
             // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
@@ -434,6 +498,9 @@ struct FunBridge<'a> {
     /// The outer call's externally supplied process table, if any (see
     /// [`RuntimeContext::for_process`]).
     mailbox_table: Option<&'a mut ProcessTable>,
+    /// The outer call's [`RuntimeContext::may_pump_scheduler`], inherited so the nested
+    /// context can pump the scheduler exactly when the caller could.
+    may_pump_scheduler: bool,
 }
 
 impl FunCaller for FunBridge<'_> {
@@ -442,12 +509,14 @@ impl FunCaller for FunBridge<'_> {
         // so a nested `io:format` reaches it. The ETS cell is left free by the outer call
         // (it is re-entrancy-capable), so the nested `call_registered` borrows it normally.
         // The mailbox identity (pid + table) is inherited, so a `receive` in the fun
-        // scans the same process's mailbox as the outer call.
+        // scans the same process's mailbox as the outer call, and the scheduler-pump
+        // permission is inherited with it.
         let mut ctx = RuntimeContext {
             runtime: self.runtime,
             output: self.output.clone(),
             mailbox_pid: self.mailbox_pid,
             mailbox_table: self.mailbox_table.as_deref_mut(),
+            may_pump_scheduler: self.may_pump_scheduler,
         };
         ctx.apply_fun(fun, args)
     }
@@ -575,6 +644,30 @@ impl ExecutionContext for RuntimeContext<'_> {
     fn apply_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
+        }
+        // An **external** fun (`fun m:f/A`, the `EXPORT_EXT` encoding) is not a closure at
+        // all: it carries no `uniq`/`index` descriptor, so `terms::fun_uniq` rejects it with
+        // `BadArg` and it must be recognised *before* that call. Its module/function/arity
+        // are its whole identity, so applying it is an ordinary dynamic call through the
+        // same dispatch every other call uses — the native floor, the registry, or a
+        // load-on-demand module export. That is what makes `term_to_binary(fun
+        // lists:reverse/1)` and `(fun lists:reverse/1)([1,2,3])` both work.
+        if matches!(
+            beam_codec::term::fun_kind_term(fun)?,
+            beam_codec::FunKind::External
+        ) {
+            let (module, function, arity) = {
+                let module_atom = beam_codec::term::fun_module(fun)?;
+                let function_atom = beam_codec::term::fun_function(fun)?;
+                let arity = beam_codec::term::fun_arity_term(fun)? as u32;
+                // Resolve the atoms to names while the shared table is borrowed, then
+                // release the borrow: `call_bif` needs `&mut self`.
+                let atoms = self.runtime.code_server.atoms();
+                let module = atoms.name(module_atom).ok_or(BeamError::BadArg)?;
+                let function = atoms.name(function_atom).ok_or(BeamError::BadArg)?;
+                (module.to_string(), function.to_string(), arity)
+            };
+            return self.call_bif(&module, &function, arity, args);
         }
         let uniq = terms::fun_uniq(fun)?;
         if uniq == crate::eval::EVAL_FUN_UNIQ {

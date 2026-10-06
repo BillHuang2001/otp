@@ -114,6 +114,15 @@ impl RuntimeContext<'_> {
                 Some(self.application_which_applications())
             }
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
+            ("erlang", "spawn", 1) => Some(self.spawn_1(args)),
+            ("erlang", "spawn", 2) => Some(self.spawn_2(args)),
+            ("erlang", "spawn", 3) => Some(self.spawn_3(args)),
+            ("erlang", "spawn_link", 1) => Some(self.spawn_link_1(args)),
+            ("erlang", "spawn_link", 2) => Some(self.spawn_link_2(args)),
+            ("erlang", "spawn_link", 3) => Some(self.spawn_link_3(args)),
+            ("erlang", "spawn_opt", 2) => Some(self.spawn_opt_2(args)),
+            ("erlang", "spawn_opt", 3) => Some(self.spawn_opt_3(args)),
+            ("erlang", "spawn_opt", 4) => Some(self.spawn_opt_4(args)),
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
             ("erlang", "demonitor", 2) => Some(self.demonitor_2(args)),

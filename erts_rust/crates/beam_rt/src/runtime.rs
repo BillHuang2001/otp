@@ -29,7 +29,7 @@ use std::rc::Rc;
 
 use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, MinimalContext};
 use beam_loader::Module;
 use beam_process::{

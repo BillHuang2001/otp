@@ -47,7 +47,7 @@ use std::collections::HashMap;
 use std::sync::Arc;
 
 use beam_common::{BeamError, Result};
-use beam_engine::{Machine, RunOutcome as EngineRunOutcome};
+use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
 use beam_loader::Module;
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
 use beam_term::{Atom, Eterm};
