@@ -223,16 +223,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("disconnect_node", 1),
     ("monitor_node", 2),
     ("monitor_node", 3),
-    // `port_command/2,3` is a **pending** entry: a parallel workstream implements it in
-    // the runtime's port provider. Until that work lands in this tree the name must stay
-    // listed, so the call is the typed capability gap `unsupported: …` (exit 3) rather
-    // than a plain `not a BIF` diagnostic — the differential harness counts the former as
-    // `unsupported` and the latter as a MISMATCH. The entry is dead weight, not a hazard,
-    // once the provider serves it: `is_known_unimplemented_bif` intersects this list with
-    // the live registry (and the native floor is consulted first), so an implemented
-    // `port_command` is never shadowed by it. Remove it when the provider lands.
-    ("port_command", 2),
-    ("port_command", 3),
     ("port_connect", 2),
     ("port_control", 3),
     ("port_call", 3),
@@ -515,12 +505,16 @@ mod tests {
                 "erlang:{function}/{arity} must no longer be a curated gap"
             );
         }
-        // `port_command/2,3` is deliberately still curated: a parallel workstream owns
-        // the implementation, and until it lands in this tree the call must remain the
-        // typed `unsupported:` gap (never the plain `not a BIF` diagnostic, which the
-        // harness counts as a mismatch).
-        assert!(listed_as_unimplemented("port_command", 2));
-        assert!(listed_as_unimplemented("port_command", 3));
+        // `port_command/2,3` is no longer curated either: the native floor serves it from
+        // `src/native/port.rs` (writing to the port child's stdin), so keeping it on the
+        // list would be dead weight — and answering it as a documented capability gap
+        // would be wrong.
+        for (function, arity) in [("port_command", 2u32), ("port_command", 3)] {
+            assert!(
+                !listed_as_unimplemented(function, arity),
+                "erlang:{function}/{arity} is served by the native floor and must not be a curated gap"
+            );
+        }
     }
 
     #[test]
