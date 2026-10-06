@@ -1,13 +1,15 @@
 //! Record instruction family.
 //!
-//! Owns the native record-update instruction (per `../beam_loader/CONTEXT.md`,
+//! Owns the native record instructions (per `../beam_loader/CONTEXT.md`,
 //! "The instruction vocabulary"):
 //! - [`Instr::UpdateRecord`] — copy a record tuple with fields replaced
+//! - [`Instr::IsAnyNativeRecord`] — the `is_record/1` native-record guard
 //!
 //! Ground truth (read-only): `emu/instrs.tab` `i_update_record_copy` (`:785`) /
-//! `i_update_record_in_place` (`:804`) / `i_update_record_continue` (`:836`), and
-//! the `update_record` transform + its generator in `emu/ops.tab:1611` and
-//! `emu/generators.tab:1028`.
+//! `i_update_record_in_place` (`:804`) / `i_update_record_continue` (`:836`) and
+//! `i_is_any_native_record` (`:1323`), the `update_record` transform + its
+//! generator in `emu/ops.tab:1611` and `emu/generators.tab:1028`, and the
+//! `is_any_native_record` shape in `emu/ops.tab:1634`.
 //!
 //! ## Semantics
 //! `UpdateRecord { hint, size, src, dst, updates }` is the OTP-26 `update_record`
@@ -41,16 +43,29 @@
 //! typed [`beam_common::BeamError`] (`error::unsupported`) — the same convention
 //! as `select_tuple_arity`'s non-tuple path. `read_operand`/`write_operand` and the
 //! `terms` readers/writers propagate their own typed errors.
+//!
+//! `is_any_native_record Fail Src` is the `is_record/1` guard
+//! (`emu/instrs.tab:1323`: `if (!is_record($Src)) $FAIL($Fail);`): the test
+//! **succeeds** (falls through to the next instruction) iff `Src` is a native
+//! record, and otherwise **branches to `Fail`**. `is_record(x)` is
+//! `is_boxed(x) && is_record_header(*boxed_val(x))` — the `RECORD` boxed subtag
+//! ([`crate::predicates::is_record`]); it is deliberately **not** a tuple test: a
+//! tuple's header carries the `ARITYVAL` subtag, so `is_record({a,b,c})` is
+//! `false`. A `NO_FAIL` label means the compiler promised the guard cannot fail; a
+//! failure there is a typed `error::unsupported` rather than a fall-through with a
+//! wrong result.
 
 use std::collections::BTreeMap;
 
 use beam_common::Result;
-use beam_loader::{Instr, Label, Module, Operand};
+use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
+use crate::interpreter::resolve;
 use crate::machine::Machine;
 use crate::operand::{read_operand, write_operand};
+use crate::predicates;
 use crate::terms;
 use crate::Step;
 
@@ -67,7 +82,7 @@ pub(crate) fn exec(
     pc: u32,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let _ = (module, labels, func, pc);
+    let _ = (module, func, pc);
     match instr {
         Instr::UpdateRecord {
             // The reuse hint is intentionally ignored: M1 never updates in place
@@ -107,6 +122,24 @@ pub(crate) fn exec(
             let result = terms::make_tuple(ctx, &elements)?;
             write_operand(machine, dst, result)?;
             Ok(Some(Step::Next))
+        }
+
+        // `is_any_native_record(Fail, Src) { if (!is_record($Src)) $FAIL($Fail); }`
+        // (`emu/instrs.tab:1323`): succeed (fall through) iff `Src` is a native
+        // record, else branch to `Fail`.
+        Instr::IsAnyNativeRecord { fail, src } => {
+            let source = read_operand(machine, ctx, src)?;
+            if predicates::is_record(source) {
+                Ok(Some(Step::Next))
+            } else if *fail == NO_FAIL {
+                // No failure label means the compiler promised the guard can never
+                // fail; it did, so report it rather than falling through with a
+                // wrong result.
+                Err(error::unsupported("is_any_native_record/no_fail"))
+            } else {
+                let (func, pc) = resolve(labels, *fail)?;
+                Ok(Some(Step::Goto { func, pc }))
+            }
         }
 
         _ => Ok(None),

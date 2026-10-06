@@ -19,7 +19,7 @@
 //! Family ownership (per `../beam_loader/CONTEXT.md`, "The instruction
 //! vocabulary"):
 //! - [`tuples`] — `PutTuple2`/`GetTupleElement`/`SelectTupleArity`
-//! - [`records`] — `UpdateRecord`
+//! - [`records`] — `UpdateRecord`/`IsAnyNativeRecord`
 //! - [`lists`] — `PutList`/`GetList`/`GetHd`/`GetTl`
 //! - [`funs`] — `MakeFun3`/`CallFun`/`CallFun2`/`Apply`/`ApplyLast`
 //! - [`exceptions`] — `Badmatch`/`CaseEnd`/`IfEnd`/`Raise`/`Try`/`Catch`/`TryCase`/`TryEnd`/`TryCaseEnd`/`CatchEnd`/`Badrecord`/`BuildStacktrace`/`RawRaise`
