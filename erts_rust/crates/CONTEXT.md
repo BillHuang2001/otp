@@ -148,9 +148,13 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `error::unsupported_local_fun` — its inlined descriptor carries no module, 16-byte `uniq` or creator
   pid, so a faithful image needs the module identity/MD5.
 - `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
-  `beam_term::{map,bitstring}`; it currently decodes >32-key maps as oversized flat maps — switch to
-  `map::write_map` (builder) + `map::map_pairs` (encode).
+  `beam_term::{map,bitstring}`. A >32-key (HAMT) map needs an image-preserving encode — adopt
+  `map::map_pairs_storage_order` (the map's stored pair order) + `map::write_map` (builder); today the
+  encode path falls through to a typed `unsupported`.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
+- `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) still emits the older 12-field subset; adopt
+  `beam_ets::TableInfo::entries`, which emits the oracle's full 15-field order (`heir`/`node`/
+  `decentralized_counters` included; `owner` still rendered as `undefined` — no pid term yet).
 - `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
   liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
   off-heap payloads).
