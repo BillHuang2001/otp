@@ -89,6 +89,21 @@ fn rust_runtime_available() -> bool {
     common::fresh_rust_runtime().is_some()
 }
 
+/// The **workspace-default** Rust runtime the child binary resolves when the test injects
+/// no `$BEAM_RT`: `<CARGO_MANIFEST_DIR>/../../target/{release,debug}/beam_rt` (release
+/// preferred), exactly as [`differential::runtime::resolve_rust_from`] computes it.
+///
+/// A child invocation only gets the fresh debug build when one was produced; otherwise the
+/// test injects nothing and the child falls back to this default, so this is what actually
+/// decides whether agreement is observable in the release-only build state (a
+/// `target/release/beam_rt` with no debug sibling). Resolution cannot fail here: with no
+/// `$BEAM_RT` value the only error is an underivable target dir, and `$CARGO_MANIFEST_DIR`
+/// is always a real crate directory.
+fn workspace_default_runtime() -> Option<differential::runtime::RuntimeSpec> {
+    differential::runtime::resolve_rust_from(None, std::path::Path::new(env!("CARGO_MANIFEST_DIR")))
+        .expect("resolving the workspace default cannot fail without a $BEAM_RT value")
+}
+
 /// The `$BEAM_RT` injection for a child invocation that would otherwise rely on **default**
 /// resolution: the freshly built debug runtime, or nothing when it was not built (the child
 /// then reports the Rust side as `unsupported` — honest, never a fabricated pass).
@@ -272,23 +287,55 @@ fn a_bad_oracle_or_rust_runtime_is_a_loud_env_error() {
 /// tolerated — it must never be widened to mask a genuine behavioral regression.
 const KNOWN_RUNTIME_GAPS: &[&str] = &[];
 
+/// The suite must report genuine module agreement (freshly compiled `.beam`s really execute
+/// under both runtimes) while surfacing the remaining capability gaps honestly — never a
+/// fabricated agreement, and never an unexpected `mismatch`.
+///
+/// Agreement is only observable when the child `differential` process actually has a Rust
+/// runtime **and** the system `erlc` exists. "Has a runtime" is decided exactly as the child
+/// decides it: the test injects the fresh debug build as `$BEAM_RT` when it exists, and
+/// otherwise injects nothing, so the child falls back to its workspace default
+/// (`target/{release,debug}/beam_rt`). Both are therefore consulted — a release-only build
+/// (the mandated `build --release …` then `test` workflow) still yields agreement, which is
+/// what the `agree == 0` branch guards against.
 #[test]
 fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
     if !oracle_available() {
         eprintln!("SKIP: oracle erl not available");
         return;
     }
-    // Agreement is only observable when both a Rust runtime and `erlc` exist. When they do
-    // not, the module-run cases degrade to `unsupported`/`skipped` (never a fabricated pass).
-    let agreement_possible = rust_runtime_available() && erlc_available();
+    // The child's effective runtime: the freshly built debug `beam_rt` (injected as
+    // `$BEAM_RT`) if one exists, else whatever its workspace-default resolution finds. This
+    // mirrors `runtime::resolve_rust_from` so the gate can never disagree with the child.
+    let fresh = common::fresh_rust_runtime();
+    let default_runtime = workspace_default_runtime();
+    let have_erlc = erlc_available();
+    let agreement_possible = (fresh.is_some() || default_runtime.is_some()) && have_erlc;
     if !agreement_possible {
-        eprintln!("NOTE: no usable (fresh beam_rt + erlc) pair — module agreement not exercised");
+        if !have_erlc {
+            eprintln!("NOTE: system erlc unavailable — module agreement not exercised");
+        } else if default_runtime.is_some() {
+            eprintln!(
+                "NOTE: fresh beam_rt absent, but the workspace default ({}) is present — the \
+                 child falls back to it and agreement IS exercised",
+                default_runtime
+                    .as_ref()
+                    .expect("checked to be Some")
+                    .program
+                    .display()
+            );
+        } else {
+            eprintln!(
+                "NOTE: no Rust runtime at all (no fresh build, no workspace default) — module \
+                 agreement not exercised"
+            );
+        }
     }
     let scratch = Scratch::new("suite");
     // Inject the freshly built debug `beam_rt`: the workspace default would prefer a
     // `target/release/beam_rt`, and a stale release artifact must never shadow the fresh
-    // build this test is meant to exercise.
-    let fresh = common::fresh_rust_runtime();
+    // build this test is meant to exercise (when no fresh build exists the injection is
+    // empty and the child uses that very workspace default).
     let env = fresh_beam_rt_env(&fresh);
 
     let lenient = invoke(&["suite", "--json", "--out", &scratch.arg()], &env);
@@ -356,6 +403,13 @@ fn the_suite_reports_module_agreement_and_expression_capability_gaps() {
             lenient.stdout
         );
     } else {
+        // Reached only when the child has *no* Rust runtime at all — neither a fresh debug
+        // build nor a workspace default (`target/{release,debug}/beam_rt`), or when `erlc`
+        // is missing (in which case the module-run cases are `skipped` and no `eval` case
+        // exercises the runtime either). Either way nothing may agree: an `agree` verdict
+        // requires a Rust observation, which cannot exist without a resolvable runtime.
+        // `tests/oracle.rs` pins the same invariant for a forced-absent runtime (it injects
+        // a nonexistent `$BEAM_RT` and asserts the Rust side is `unsupported`).
         assert_eq!(agree, 0, "nothing may agree without a usable Rust runtime");
     }
     // Every case is accounted for by exactly one verdict bucket, so this holds both today
