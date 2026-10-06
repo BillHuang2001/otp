@@ -82,6 +82,12 @@ impl<'a> RuntimeContext<'a> {
     /// valid for the runtime's lifetime).
     pub(crate) fn eval_heap(&mut self) -> &mut beam_alloc::Heap;
     pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
+
+    /// A context that runs **as `pid`**, resolving that process and its mailbox against the
+    /// caller-supplied `table` instead of the runtime's own `processes` — the scheduler-pass seam.
+    pub fn for_process(runtime: &'a mut Runtime, table: &'a mut ProcessTable, pid: ProcessId) -> RuntimeContext<'a>;
+    /// The pid this context runs as (the mailbox owner and what `erlang:self/0` reports).
+    pub fn pid(&self) -> ProcessId;
 }
 impl ExecutionContext for RuntimeContext<'_> {
     // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/system_info/
