@@ -473,11 +473,10 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
   - `tests/bignum.rs` (7) — exact integer arithmetic: the pinned `term_to_binary` image for
     `semantics/bignum_multiplication`, large `+`/`-`/`*`, `div`/`rem`, mixed small/big operands and
     conversion to f64, all pinned against `erl -noshell -eval`.
-  - `tests/bignum_promotion.rs` (6) — the generalized promotion: integer-producing BIFs that used to
-    overflow the 60-bit small range now return the oracle's exact bignum (`system_time`/`time_offset`,
-    `binary:decode_unsigned/1,2` any width, `round`/`trunc`/`ceil`/`floor`, `list_to_integer`/
-    `binary_to_integer`), and the bignum-accepting conversions (`integer_to_list`, `encode_unsigned`,
-    `float/1`), oracle-pinned.
+  - `tests/bignum_promotion.rs` (6) — the integer→bignum promotion: integer-producing BIFs return the
+    oracle's exact bignum (`system_time`/`time_offset`, `binary:decode_unsigned/1,2` any width,
+    `round`/`trunc`/`ceil`/`floor`, `list_to_integer`/`binary_to_integer`), and the bignum-accepting
+    conversions (`integer_to_list`, `encode_unsigned`, `float/1`), oracle-pinned.
   - `tests/function_clause.rs` (4) — the `lists.erl` no-clause failures raise `error:function_clause`
     (the bare atom reason), pinned against the oracle.
   - `tests/pure_bifs.rs` (12) — the newly registered pure BIFs `maps:take/2`, `maps:from_keys/2`,
