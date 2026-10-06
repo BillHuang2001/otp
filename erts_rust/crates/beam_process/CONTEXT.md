@@ -421,6 +421,8 @@ holds `Process` values directly.
 - `tests/messaging.rs` → send into a mailbox + selective receive + `DeliverOutcome` wake reporting
 - `tests/signals.rs` → link exit propagation (+ `trap_exit`) + monitor down-message
 - `tests/gc.rs` → safepoint GC over the process root set
+- `tests/dict.rs` → dictionary semantics + a structured dict term surviving `Process::collect`
+- `tests/fragments.rs` → saved args surviving `collect` + all sub-rootsets relocating in one collect
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
 - `../../erts/emulator/beam/erl_ptab.{c,h}` → process/port table + name registry (read-only)
 - `../../erts/emulator/beam/erl_monitor_link.c` → links/monitors (read-only)
