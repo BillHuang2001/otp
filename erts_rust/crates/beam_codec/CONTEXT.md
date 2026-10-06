@@ -146,6 +146,28 @@ allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapp
   `bitstring_parts(Eterm) -> Result<(*const u8, usize /*offset_bits*/, usize /*size_bits*/)>`,
   `bitstring_bytes(Eterm) -> Result<(&[u8], usize, usize)>`, `bitstring_size_bits`,
   `heap_bits_size_words`, `bit_count_to_bytes`;
+- **funs** (all layout owned by `beam_term::fun`; this module allocates + forwards, see §Fun
+  encodings):
+  - `make_fun_external(&mut Heap, arity, module: Atom, function: Atom) -> Result<Eterm>` — the
+    `EXPORT_EXT` `FunKind::External` block (`fun_words(FunKind::External, 0)` = 3 words);
+  - `make_fun_imported(&mut Heap, arity, module: Atom, uniq: &[u8;16], index: u32, old_index: u32,
+    old_uniq: u32, creator: FunPid, env: &[Eterm]) -> Result<Eterm>` — the `NEW_FUN_EXT`
+    `FunKind::Imported` block (`fun_words(FunKind::Imported, env.len())` = `1 + 10 + env.len()`
+    words); **`env[k]` is the `k`-th environment slot = the wire order**;
+  - accessors (each guards with `is_any_fun`/the kind-specific header predicate, maps a guard miss to
+    `BadArg`, then forwards to the `beam_term::fun` unsafe accessor): `fun_kind_term(Eterm) ->
+    Result<FunKind>`, `fun_arity_term(Eterm) -> Result<usize>`, `fun_num_free_term(Eterm) ->
+    Result<usize>`, `fun_module(Eterm) -> Result<Atom>`, `fun_function(Eterm) -> Result<Atom>`,
+    `fun_uniq_bytes(Eterm) -> Result<[u8;16]>`, `fun_index(Eterm) -> Result<u32>`,
+    `fun_old_index(Eterm) -> Result<u32>`, `fun_old_uniq(Eterm) -> Result<u32>`,
+    `fun_creator_pid(Eterm) -> Result<FunPid>`, `fun_env(Eterm) -> Result<&[Eterm]>`. The `_term`
+    suffix is **mandatory**: `beam_term::fun` already exports header-word-level `fun_kind`/
+    `fun_arity`/`fun_num_free`;
+  - re-exported verbatim from the layout owner: `pub use beam_term::fun::{fun_kind_of_header,
+    fun_words, FunKind, FunPid, FUN_MAX_FIELD, MAX_ARG}`;
+  - `#[cfg(test)] pub fn make_fun_local(...)` — a test-only builder (production local-fun creation
+    lives in `beam_engine::terms::make_fun`), so the encode path's rejection can be exercised with a
+    real `FunKind::Local` term;
 - `pub use beam_term::thing::MAX_REF_IDS` (`ERTS_MAX_REF_NUMBERS`), plus the tuple/tuple-element and
   list accessors the encoder needs.
 
