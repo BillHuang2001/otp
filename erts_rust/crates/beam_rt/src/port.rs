@@ -249,6 +249,16 @@ impl PortRegistry {
         self.table.contains(id)
     }
 
+    /// The number of **live** ports — the value `erlang:system_info(port_count)` reports.
+    pub fn len(&self) -> usize {
+        self.live.len()
+    }
+
+    /// Whether no port is open.
+    pub fn is_empty(&self) -> bool {
+        self.live.is_empty()
+    }
+
     /// Records `live` as the port `id`.
     pub fn insert(&mut self, id: PortId, live: LivePort) {
         self.live.insert(id.number(), live);
