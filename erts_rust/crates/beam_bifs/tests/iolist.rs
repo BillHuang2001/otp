@@ -21,8 +21,7 @@
 //!
 //! Bitstring arguments/results are built and read with the sibling **safe**
 //! `beam_codec::term` helpers (`make_binary`/`make_bitstring`/`bitstring_bytes`),
-//! because the crate's own bitstring helpers are private and its `~w` printer
-//! rejects a non-byte-aligned bitstring.
+//! because the crate's own bitstring helpers are private.
 
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, BifContext};
