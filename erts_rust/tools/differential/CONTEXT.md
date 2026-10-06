@@ -108,19 +108,24 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - **`erlc` compile results are memoized** in a process-local cache (`module_build`, keyed by erlc path + module + exact source). The corpus's module-run cases share only a couple of embedded sources, so this replaces dozens of `erlc` spawns with a handful while every case still gets its **own** temp dir and unchanged argv. The cache stores the compiled `.beam` **bytes**, not a `CompiledModule`, precisely so each `CompiledModule` keeps removing its own temp dir on drop (the contract `module_build`'s tests pin). A failed/absent compiler is never cached, so a compile failure stays a loud error on every call.
 
 ## Known Issues / Notes for Agents
-- **Today's Rust side is a partial runtime** (197-case corpus): the **module-run** cases `agree` (the Rust `run` action executes real `erlc`-compiled `.beam`s), and the **expression** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention. Current measured rollup: **194 agree · 1 mismatch · 2 unsupported · 0 skipped**, identical across 3 sequential + 2 concurrent suite runs (no flaky cases). Per-contract rollup (A.1–A.9):
+- **The Rust side is a partial runtime; today's gate is 0 mismatches** (285-case corpus): the **module-run** cases (embedded sources + the real-system-module `mexec` group) `agree`, and the **eval** cases `agree` where the `-eval` evaluator supports them — `beam_rt` has a real Erlang-expression evaluator and does **not** auto-print the result. A capability gap is `unsupported`, never a mismatch: either the raise escapes and the CLI exits `3` (`beam_rt: unsupported: …`), or (for a probe-wrapped case) the probe *catches* it and prints one `exception <class> <reason>` line whose reason follows the `unsupported` convention. Current rollup: **285 total · 275 agree · 0 mismatch · 10 unsupported · 0 skipped** (`gate.sh` → exit `3`). Per-contract rollup (A.1–A.9):
 
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
-| A.1 language semantics | 96 | 94 | 0 | 2 | 0 |
-| A.2 .beam binary/ETF bytes | 85 | 85 | 0 | 0 | 0 |
-| A.3 NIF C ABI | 3 | 3 | 0 | 0 | 0 |
-| A.4 driver C ABI | 2 | 1 | 1 | 0 | 0 |
-| A.5 distribution wire protocol | 9 | 9 | 0 | 0 | 0 |
+| A.1 language semantics | 96 | 96 | 0 | 0 | 0 |
+| A.2 .beam binary/ETF bytes | 115 | 115 | 0 | 0 | 0 |
+| A.3 NIF C ABI | 8 | 8 | 0 | 0 | 0 |
+| A.4 driver C ABI | 9 | 5 | 0 | 4 | 0 |
+| A.5 distribution wire protocol | 40 | 36 | 0 | 4 | 0 |
 | A.6 CLI flags and configuration | 6 | 6 | 0 | 0 | 0 |
-| A.7 OTP application contracts | 69 | 68 | 0 | 1 | 0 |
+| A.7 OTP application contracts | 99 | 99 | 0 | 0 | 0 |
 | A.8 introspection / system_info | 9 | 9 | 0 | 0 | 0 |
-| A.9 build and bootstrapping | 5 | 5 | 0 | 0 | 0 |
+| A.9 build and bootstrapping | 20 | 18 | 0 | 2 | 0 |
+- **The 10 `unsupported` cases (all honest capability gaps, none a mismatch):**
+  - **A.4 (4) — the port/driver seam:** `driver/port_backed_by_spawn_driver`, `driver/port_close_through_spawn_driver`, `driver/port_info_through_spawn_driver`, `driver/spawn_driver_port_stream_read` all hit `beam_rt: unsupported: bif` (exit `3`) because `open_port/2` / `port_info/2` / port streaming are not wired yet (`beam_bifs`/`beam_io` territory). Their goldens are the oracle's own output, so each flips to `agree` automatically once the port seam lands.
+  - **A.5 (4) — encode-side tags the codec encoder cannot yet emit:** `wire/export_ext_encode` (`EXPORT_EXT` 113), `wire/new_fun_ext_encode` (`NEW_FUN_EXT` 112), `wire/compressed_option_encode` + `wire/compressed_option_roundtrip` (`term_to_binary(T,[compressed])`, tag 80). Decode-side coverage of the same tags `agree`.
+  - **A.9 (2) — an opcode the engine rejects:** `boot/init_get_status_is_tuple` and `boot/root_dir_is_string` (`beam_rt: unsupported: opcode: …`).
+- **`--strict`** exits `1` while any `unsupported`/`skipped`/`mismatch` remains; `tests/cli.rs` pins that a lenient (`run`) invocation on an unsupported case stays exit `0`.
 - **The one remaining `mismatch`** — `driver/port_backed_by_spawn_driver` (A.4) — is a `beam_rt` runtime gap, not a harness problem: `open_port({spawn,"true"},[])` raises `'erlang:open_port/2 is not a BIF'` instead of yielding a real port. Because the reason is a plain Erlang term (not the runtime's `unsupported` convention), `harness::classify_rust` keeps it an *observation* → mismatch. It is pinned by the `KNOWN_RUNTIME_GAPS` allowlist in `tests/cli.rs` (an *unexpected* mismatch fails that test; the suite still exits `1` for it). Implementing `open_port/2`, or signalling the gap via exit `3` / the `unsupported` reason convention, would close the gate — `classify_rust` then turns it into `unsupported` automatically.
 - **The 2 `unsupported` cases are eval-grammar gaps (both A.1):** `semantics/binary_comprehension` (the `-eval` grammar rejects a binary-comprehension source: `unexpected Punct("=")`) and `semantics/bit_size_of_bitstring` (`a non-byte-aligned binary segment`). No `skipped` cases. `--strict` exits `1` while any `unsupported`/`skipped`/`mismatch` remains.
 - **What the driver requires of `beam_rt` for an expression case to reach `agree`.** The eval cases spawn `beam_rt -noshell <extra…> -eval <probe>` and compare **stdout + exit + stderr** against the oracle (module-run cases compare stdout + exit only). `erl -eval` does **not** echo the evaluated value — the probe prints the single `ok …` / `exception <class> <reason>` line itself via `io:format/2` and terminates with `halt/1`, so `beam_rt -eval` must likewise **not** auto-print the result (a second line breaks `Agree`), and must evaluate the whole `try (EXPR) of V -> … catch C:R -> … end.` wrapper (single-line, self-terminating). The module-run side instead uses `beam_rt run <file.beam> <mod>:<fun>/<arity> <args…>`, which must print `~w` of the result plus a trailing newline (the oracle prints the same via its `io:format("~w~n",…)`).
