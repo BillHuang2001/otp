@@ -210,7 +210,15 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 | `process_count` | `Int(rt.processes.len())` (the M1 process table) |
 | `os_type` | `Tuple("unix","linux")` (or `("win32","nt")`) |
 | `threads` | `Bool(true)` → atom `true`/`false` |
+| `emu_flavor` | `Atom(rt.config().emulator.flavor.as_str())` → `jit` by default (the baseline JIT), `emu` for a `Flavor::Emu` config |
+| `schedulers` | `Int` — an explicit `+S N` wins; `+S 0`/unset falls through to `available_parallelism()`; always `> 0` |
 | anything else | `Err(BeamError::BadArg)` — matches the oracle's `error:badarg` |
+
+`src/info.rs` also exports `INFO_ATOMS` — the complete atom vocabulary of the surface
+(`unix,linux,win32,nt,true,false,jit,emu`). `seed_core_atoms` (`src/boot.rs`) interns it, because
+`InfoValue::to_eterm` resolves atoms **through the runtime's atom table** and reports
+`BeamError::TermNotFound` rather than inventing a term — so a key whose value is an atom only agrees
+once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 
 ## Constraints
 * **Errors are return-based, workspace-wide** (`../CONTEXT.md` §3): every fallible API returns
