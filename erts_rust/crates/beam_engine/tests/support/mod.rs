@@ -314,9 +314,16 @@ impl ModuleHost {
     /// A `.beam` fun inlines only its `uniq` (per-module) and `index` (the
     /// module-level lambda index); together they identify the `FunT` descriptor
     /// [`FunDescriptor`] — and hence the defining module and entry label —
-    /// unambiguously. The closure body is entered with the free variables
-    /// **first** followed by the call arguments (a lambda's captured variables
-    /// are its leading parameters).
+    /// unambiguously.
+    ///
+    /// The register file is set up exactly as the C emulator's `call_fun` does
+    /// (`../../erts/emulator/beam/beam_common.c:1631-1633`,
+    /// `reg[i + arity] = funp->env[i]`): the **call arguments** occupy
+    /// `x(0..arity)` and the closure's **free variables** follow at
+    /// `x(arity..arity+num_free)` — arguments first, then captures. A lambda's
+    /// non-constant free variables are therefore its *trailing* compiled
+    /// parameters (`-f/1-fun-0-/3` reads its one argument from `x0` and its two
+    /// captures from `x1`/`x2`).
     fn apply_resolved(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
         if !terms::is_fun(fun) {
             return Err(BeamError::BadArg);
@@ -338,8 +345,8 @@ impl ModuleHost {
         }
         let (module, descriptor) = found.ok_or(BeamError::BadArg)?;
 
-        let mut combined = free;
-        combined.extend_from_slice(args);
+        let mut combined = args.to_vec();
+        combined.extend_from_slice(&free);
         if combined.len() != descriptor.arity as usize {
             return Err(BeamError::BadArity);
         }
@@ -481,6 +488,9 @@ impl ModuleHost {
             ("erlang", ">", 2) => Some(self.compare(args, Compare::Gt)),
             ("erlang", ">=", 2) => Some(self.compare(args, Compare::Ge)),
             ("erlang", "element", 2) => Some(element(args)),
+            // `setelement(Index, Tuple, Value)` — `dict` rebuilds its segment
+            // tuples with it (`on_bucket`/`put_bucket_s`).
+            ("erlang", "setelement", 3) => Some(self.setelement(args)),
             ("erlang", "tuple_size", 1) => Some(tuple_size(args)),
             ("erlang", "length", 1) => Some(length(args)),
             // `hd/1` — the head of a cons cell (`calendar`/`unicode` walk lists
@@ -721,6 +731,30 @@ impl ModuleHost {
     fn list_to_tuple(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let list = args.first().ok_or(BeamError::BadArg)?;
         let elements = terms::list_elements(*list)?;
+        terms::make_tuple(self, &elements)
+    }
+
+    /// `setelement(Index, Tuple, Value)` — a **new** tuple with the 1-based
+    /// `Index` replaced by `Value` (the source is copied, exactly as the real BIF
+    /// behaves). A non-integer index, an index outside `1..=tuple_size(Tuple)`, or
+    /// a non-tuple operand is a `badarg`.
+    fn setelement(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 3 || !is_small(args[0]) {
+            return Err(BeamError::BadArg);
+        }
+        let index = signed_value(args[0]);
+        let arity = terms::tuple_arity(args[1])?;
+        if index < 1 || index as usize > arity {
+            return Err(BeamError::BadArg);
+        }
+        let mut elements = Vec::with_capacity(arity);
+        for offset in 0..arity {
+            elements.push(if offset + 1 == index as usize {
+                args[2]
+            } else {
+                terms::tuple_element(args[1], offset)?
+            });
+        }
         terms::make_tuple(self, &elements)
     }
 

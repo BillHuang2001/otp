@@ -577,6 +577,98 @@ fn sweep_ordsets_calls_into_lists() {
     assert_int_list(&host, __v, &[1, 2, 3]);
 }
 
+/// `dict` — a **non-empty** dictionary, i.e. the closure path that carries
+/// **captured variables**.
+///
+/// `dict:store/3` hands `on_bucket/3` an anonymous fun that closes over both the
+/// key and the value (`fun (B0) -> store_bkt_val(Key, Val, B0) end`). Running it
+/// therefore exercises `make_fun3` **with** free variables plus `call_fun2`: the
+/// fun-application seam must place the call arguments in `x(0..arity)` and the
+/// closure's free variables at `x(arity..)` — the C `call_fun` order
+/// (`reg[i + arity] = funp->env[i]`, `../../erts/emulator/beam/beam_common.c:1631`).
+/// A fun with *no* free variables (the `lists:map` harness funs) can never catch
+/// a reversed order, so this is the covering case.
+#[test]
+fn sweep_dict_store_and_lookup() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = exec_host();
+
+    // oracle: dict:to_list(dict:store(a,1,dict:new())) = [{a,1}]
+    let d0 = run(&mut host, "dict", "new", &[]);
+    let a = host.intern("a");
+    let one = make_small(1);
+    let d1 = run(&mut host, "dict", "store", &[a, one, d0]);
+    let list = run(&mut host, "dict", "to_list", &[d1]);
+    let elements = terms::list_elements(list).expect("dict:to_list is a proper list");
+    assert_eq!(elements.len(), 1, "a one-key dict: {elements:?}");
+    let expected = term_tuple(&mut host, &[a, one]);
+    assert_term(&host, elements[0], expected);
+
+    // oracle: D2 = dict:store(b,2,D1) gives
+    //   dict:fetch(a,D2)=1, dict:fetch(b,D2)=2, dict:size(D2)=2,
+    //   dict:is_key(b,D2)=true, dict:find(zz,D2)=error
+    let b = host.intern("b");
+    let d2 = run(&mut host, "dict", "store", &[b, make_small(2), d1]);
+    let v = run(&mut host, "dict", "fetch", &[a, d2]);
+    assert_small(&host, v, 1);
+    let v = run(&mut host, "dict", "fetch", &[b, d2]);
+    assert_small(&host, v, 2);
+    let n = run(&mut host, "dict", "size", &[d2]);
+    assert_small(&host, n, 2);
+    let k = run(&mut host, "dict", "is_key", &[b, d2]);
+    assert_atom(&host, k, "true");
+    let zz = host.intern("zz");
+    let miss = run(&mut host, "dict", "find", &[zz, d2]);
+    assert_atom(&host, miss, "error");
+
+    // oracle: dict:fetch(a, dict:store(a,99,D2)) = 99 and dict:size(...) = 2
+    //   (an existing key is overwritten, not added).
+    let d3 = run(&mut host, "dict", "store", &[a, make_small(99), d2]);
+    let v = run(&mut host, "dict", "fetch", &[a, d3]);
+    assert_small(&host, v, 99);
+    let n = run(&mut host, "dict", "size", &[d3]);
+    assert_small(&host, n, 2);
+}
+
+/// `dict` — inserting past the expansion threshold, which drives the segment
+/// growth/rehash path (`maybe_expand/2` → `maybe_expand_segs`/`rehash/4`) as well
+/// as the same captured-variable closure.
+#[test]
+fn sweep_dict_grows_past_the_expansion_threshold() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = exec_host();
+
+    // oracle: storing K => K*10 for K = 1..=81 in a fresh dict gives
+    //   dict:size(D) = 81 and lists:sort(dict:to_list(D)) =
+    //   [{1,10},{2,20},…,{81,810}]
+    let mut dict = run(&mut host, "dict", "new", &[]);
+    for key in 1..=81i64 {
+        dict = run(
+            &mut host,
+            "dict",
+            "store",
+            &[make_small(key), make_small(key * 10), dict],
+        );
+    }
+    let n = run(&mut host, "dict", "size", &[dict]);
+    assert_small(&host, n, 81);
+
+    let list = run(&mut host, "dict", "to_list", &[dict]);
+    let sorted = run(&mut host, "lists", "sort", &[list]);
+    let elements = terms::list_elements(sorted).expect("a proper list");
+    assert_eq!(elements.len(), 81);
+    for (index, &pair) in elements.iter().enumerate() {
+        let key = index as i64 + 1;
+        assert_eq!(terms::tuple_arity(pair).ok(), Some(2), "pair {index}: {pair:?}");
+        assert_small(&host, terms::tuple_element(pair, 0).expect("key"), key);
+        assert_small(&host, terms::tuple_element(pair, 1).expect("value"), key * 10);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 3. Blocked mechanisms (asserted loudly, never silently passed)
 // ---------------------------------------------------------------------------
