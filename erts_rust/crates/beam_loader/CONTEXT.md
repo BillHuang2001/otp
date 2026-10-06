@@ -356,9 +356,12 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   index, a truncated operand varint, a `z` sub-tag `0`/unknown, a structurally wrong `HeapNeed` operand
   and a compressed `LitT` ⇒ each a typed `BeamError` (no panic).
 - **`tests/real_modules.rs`:** loads every `.beam` of the installed OTP `stdlib`/`kernel`/`compiler`
-  `ebin` dirs through the public pipeline, asserting a load floor while allowlisting the known failures
-  (a NEW failure fails the test; a module dropping off the allowlist is only reported). Loudly skips when
-  the system `erl`/OTP is unavailable.
+  `ebin` dirs through the public pipeline and asserts that every discovered module loads (zero failures
+  tolerated: any parse failure fails the test, and each is printed by name with its typed error), plus a
+  floor on the discovered module count. A second test walks the decoded `LitT` literals of the real
+  `maps` and `gen_server` modules and asserts the nested `EXPORT_EXT` funs resolve to their
+  `{module,function,arity}` (`fun maps:remove/2`, `gen_server:format_log/1,2`) — semantic evidence, not a
+  count. Loudly skips when the system `erl`/OTP is unavailable.
 - **`tests/widened_ir.rs`** also loads `tests/fixtures/bsalloc.beam` (the `bs_create_bin` `z,3` operand).
 - Unit tests live in-module (`#[cfg(test)]`) in every `src/` file.
 - **Gate (GREEN required):** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_loader`
@@ -373,14 +376,6 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`), whose operands need
   record-descriptor modelling the IR does not own yet, and the obsolete/transform-only `genop.tab`
   entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
-- **`EXPORT_EXT` / `NEW_FUN_EXT` fun literals are not decoded** (an upstream `beam_codec` limitation:
-  `decode_term` returns `unsupported_external_term`). They appear **nested** inside tuples/maps (e.g.
-  `{2, fun maps:remove/2}`, `#{report_cb => fun M:F/1}`), so a top-level-only workaround in `LiteralArea`
-  cannot reach them — the shared ETF walker in `beam_codec::decode` must. This is the dominant remaining
-  load blocker (~36 of 261 real OTP modules: `maps`, `gen_server`, `proc_lib`, `supervisor`, `logger*`,
-  `json`, `compile`, `shell_docs`, …). It needs a fun/export *term layout* that `beam_term` does not
-  currently own, so it is a coordinated cross-crate change (`beam_term` layout + `beam_codec` decode +
-  `beam_engine` consumption), not a `beam_loader` fix. `BINARY_EXT`/`BIT_BINARY_EXT` ARE already decoded.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 - **`LocT` (jit-only local table) is not parsed** (irrelevant to interpretation).
@@ -416,7 +411,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/coverage.erl` + `coverage.beam` → the widened-IR oracle fixture
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/negative/real-module integration tests
-- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (loud skip when `erl`/OTP is absent; allowlisted known failures)
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
