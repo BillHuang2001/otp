@@ -57,6 +57,7 @@ pub mod poller;
 pub mod port;
 pub mod port_task;
 pub mod queue;
+pub mod registry;
 pub mod timer;
 
 mod error; // `pub(crate)` constructors only — NOT public
