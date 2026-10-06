@@ -14,6 +14,10 @@
 //! arena backing `alloc_words`, so a heap term the engine builds (e.g. the
 //! unambiguous `{'EXIT',V}` tuple) is only valid while its context is alive — the
 //! tests below create the context explicitly and keep it in scope.
+//!
+//! This file proves the machinery on **one** committed fixture; `tests/exceptions_corpus.rs`
+//! (sibling) proves its **corpus reach** — the same raise opcodes executing on the real
+//! installed `stdlib`/`kernel`/`compiler` modules and producing the system `erl`'s reason.
 
 use std::collections::BTreeMap;
 
