@@ -410,7 +410,9 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/slice.erl` + `slice.beam` → the vertical-slice oracle fixture
 - `tests/fixtures/coverage.erl` + `coverage.beam` → the widened-IR oracle fixture
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
-- `tests/` → container/IR/widened-IR/negative integration tests
+- `tests/` → container/IR/widened-IR/negative/real-module integration tests
+- `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (loud skip when `erl`/OTP is absent; allowlisted known failures)
+- `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)
 - `../../lib/compiler/src/beam_asm.erl` → the compiler-side writer of the same format (read-only)
