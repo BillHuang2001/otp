@@ -1,6 +1,6 @@
 //! The `binary` module BIFs (`binary:at/2`, `part/2,3`, `copy/1,2`,
 //! `list_to_bin/1`, `bin_to_list/1,2,3`, `decode_unsigned/1,2`,
-//! `encode_unsigned/1,2`, `first/1`, `last/1`, `split/2,3`,
+//! `encode_unsigned/1,2`, `first/1`, `last/1`, `compile_pattern/1`, `split/2,3`,
 //! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
 //! `longest_common_suffix/1`) **and** the four `erlang` iolist/bitstring BIFs
 //! built on the same C machinery — `iolist_to_binary/1`, `iolist_size/1` and
@@ -19,11 +19,11 @@
 //! (`bif binary:at/2`, `bif binary:part/2 binary_binary_part_2`, `…`). Every
 //! value below is pinned against the OTP 29 / erts-17.1 oracle.
 //!
-//! The roster is exactly the `bif.tab` `binary` surface (minus the documented
-//! gaps): `compile_pattern/1`, `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
+//! The roster is the `bif.tab` `binary` surface: `compile_pattern/1`,
+//! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
 //! `longest_common_suffix/1`, `first/1`, `last/1`, `at/2`, `part/2,3`,
 //! `list_to_bin/1`, `copy/1,2`, `referenced_byte_size/1`, `encode_unsigned/1,2`,
-//! `decode_unsigned/1,2`, `split/2,3`.
+//! `decode_unsigned/1,2`, `split/2,3` (minus the documented gaps).
 //!
 //! Registers its BIFs through [`register`]; the shared heap-bitstring helpers live
 //! in [`crate::bits`] and the "is this a proper list?" rule in [`crate::print`].
@@ -82,6 +82,17 @@
 //! * `matches(<<"abcabcab">>, <<"ab">>)` ⇒ `[{0,2},{3,2},{6,2}]` (every
 //!   non-overlapping match, leftmost-longest); no match ⇒ `[]` (not `nomatch`).
 //!   An empty pattern and a non-list option ⇒ `badarg`.
+//! * `compile_pattern(Pattern)`: `Pattern` is a **non-empty byte-aligned binary**
+//!   or a **non-empty list** of them (an integer or a list of integers is
+//!   `badarg` in erts-17.1, despite older docs). **One** search string ⇒
+//!   `{bm, Ref}`; **more than one** ⇒ `{ac, Ref}` — the C `words == 1` test
+//!   (`am_bm`/`am_ac`). An empty binary, a non-byte-aligned binary, an empty
+//!   list, a non-binary element, an improper list and any other argument are
+//!   `badarg`. `match/2,3`, `matches/2,3` and `split/2,3` accept a compiled
+//!   `{bm,Ref}`/`{ac,Ref}` in place of the raw pattern with identical results; a
+//!   forged/unknown `Ref`, a `{bm, Ref}` whose `Ref` was compiled as `ac` (and
+//!   vice versa), and any other 2-tuple are `badarg` (`maybe_binary_match_compile`
+//!   + the magic-ref destructor check).
 //! * `longest_common_prefix([<<"abc">>,<<"abd">>])` ⇒ `2`,
 //!   `longest_common_suffix([<<"abc">>,<<"abd">>])` ⇒ `0`; an empty list, a
 //!   non-binary element and a non-list argument ⇒ `badarg`.
@@ -91,11 +102,18 @@
 //! * **The endian atom is `big` or `little` only.** The C BIFs compare against
 //!   `am_big`/`am_little`, so `native` is `badarg` in real erts-17.1 (verified)
 //!   even though `binary.erl`'s doc lists it; this crate matches the oracle.
-//! * **Compiled patterns (`binary:compile_pattern/1`) are unsupported.** A
-//!   `{bm, Ref}`/`{am, Ref}` pattern would need a magic-ref binary, which
-//!   Milestone-1 does not build, so it is `badarg` (`maybe_binary_match_compile`
-//!   rejects anything that is not a valid compiled pattern the same way).
-//!   `referenced_byte_size/1` is likewise not registered.
+//! * **Compiled patterns live in a process-global registry, never collected.**
+//!   `compile_pattern/1` mints a fresh `Ref` thing ([`access::make_ref_thing`];
+//!   the M1 substitution for the C magic-ref binary) and stores the compiled
+//!   alternatives in a module-local registry keyed by the ref's numeric id.
+//!   Real ERTS frees a compiled pattern when its magic ref is garbage-collected;
+//!   Milestone-1 has no off-heap magic ref and no GC for this registry, so an
+//!   entry lives for the process's lifetime (a bounded, monotonic leak). The
+//!   registry is process-global because [`BifContext`] exposes no seam for it —
+//!   see the module's `compiled_patterns` section.
+//! * **`referenced_byte_size/1` is not registered** (it needs the off-heap
+//!   `BinRef` of a sub-binary, which Milestone-1 does not build; every result is
+//!   a fresh on-heap binary).
 //! * **`decode_unsigned`/`encode_unsigned` span the full integer range.**
 //!   `decode_unsigned` accepts any width and promotes a value past the 60-bit
 //!   small range to a bignum (the oracle's behaviour); `encode_unsigned` accepts a
@@ -112,6 +130,9 @@
 //!   BIFs so the runtime can resolve the documented call set, with the
 //!   `binary.erl` wrapper's observable behaviour (verified against the oracle for
 //!   every case below). They are *not* `bif.tab` entries.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use beam_codec::term as codec_term;
 use beam_common::Result;
@@ -306,12 +327,26 @@ fn endian_of(ctx: &BifContext<'_>, term: Eterm) -> Result<Endian> {
     }
 }
 
-/// A search pattern: one or more alternative non-empty byte strings
-/// (`do_binary_match_compile`). Compiled `{bm, _}`/`{am, _}` patterns are
-/// unsupported (see the module docs).
-fn parse_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+/// The search alternatives of a `Pattern` argument, whether it is a raw pattern
+/// (a binary or a list of binaries) or a compiled `{bm, Ref}`/`{ac, Ref}` the
+/// oracle's `binary_match`/`binary_split` accept (C `maybe_binary_match_compile`).
+///
+/// The C dispatch is "a tuple is a compiled pattern, anything else goes through
+/// `do_binary_match_compile`", so a tuple that is not a valid compiled pattern is
+/// `badarg` — never re-interpreted as a raw pattern.
+fn parse_pattern(ctx: &BifContext<'_>, pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    if access::is_tuple(pattern) {
+        return lookup_compiled(ctx, pattern);
+    }
+    parse_raw_pattern(pattern)
+}
+
+/// A raw pattern: one or more alternative non-empty byte strings
+/// (`do_binary_match_compile`).
+fn parse_raw_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    // `bits::bytes` rejects a non-byte-aligned bitstring, matching the C
+    // `TAIL_BITS(size) != 0` check.
     if bits::is_bitstring(pattern) {
-        // A non-byte-aligned or empty pattern is `badarg`.
         let bytes = bits::bytes(pattern)?;
         if bytes.is_empty() {
             return Err(badarg());
@@ -331,6 +366,183 @@ fn parse_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
         alternatives.push(bytes);
     }
     Ok(alternatives)
+}
+
+// ---------------------------------------------------------------------------
+// Compiled patterns (`binary:compile_pattern/1`, `do_binary_match_compile` +
+// `maybe_binary_match_compile`)
+// ---------------------------------------------------------------------------
+
+/// The two compiled-pattern flavours `do_binary_match_compile` produces: `bm`
+/// (a single search string — the Boyer-Moore fast path, C `am_bm`) and `ac`
+/// (two or more search strings — the Aho-Corasick trie, C `am_ac`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternTag {
+    Bm,
+    Ac,
+}
+
+impl PatternTag {
+    /// The tag atom of the compiled `{Tag, Ref}` tuple.
+    fn atom(self) -> &'static str {
+        match self {
+            PatternTag::Bm => "bm",
+            PatternTag::Ac => "ac",
+        }
+    }
+}
+
+/// A compiled search pattern: its tag and the alternative non-empty byte strings
+/// (exactly the inputs the search primitives take, so nothing else needs to know
+/// a pattern was compiled).
+#[derive(Debug, Clone)]
+struct CompiledPattern {
+    tag: PatternTag,
+    alternatives: Vec<Vec<u8>>,
+}
+
+/// The process-global compiled-pattern registry.
+///
+/// # Why a module-local static
+///
+/// [`BifContext`] exposes no seam for compiled patterns, and `binary:compile_pattern/1`
+/// must return an opaque handle that a *later* BIF call (with a fresh context, and
+/// possibly a different process) resolves — precisely the object the C keeps alive
+/// through a magic-ref binary's refcount. Where the C uses a refcounted off-heap
+/// object, Milestone-1 (which has no off-heap magic ref and no per-object GC for
+/// one) uses a process-global registry keyed by the ref's numeric id. The crate
+/// already carries process-global state the same way (`time.rs`'s monotonic
+/// origin and unique-integer counter, `beam_ets`' table-id counter), so this adds
+/// no new pattern.
+///
+/// Ids start at [`ID_BASE`] so they can never collide with the small ids the
+/// `ets` table registry hands out ([`crate::ets`]) — both handle families share
+/// the `Ref` thing's single id word, and a disjoint range keeps a forged
+/// `{bm, Tid}` from resolving against an unrelated table.
+fn compiled_patterns() -> &'static Mutex<CompiledPatterns> {
+    static REGISTRY: OnceLock<Mutex<CompiledPatterns>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(CompiledPatterns::new()))
+}
+
+/// The first id a compiled pattern is assigned (see [`compiled_patterns`]).
+const ID_BASE: u64 = 1 << 32;
+
+/// The compiled patterns minted so far, keyed by the ref id that names them.
+#[derive(Debug)]
+struct CompiledPatterns {
+    next_id: u64,
+    entries: HashMap<u64, CompiledPattern>,
+}
+
+impl CompiledPatterns {
+    fn new() -> Self {
+        Self { next_id: ID_BASE, entries: HashMap::new() }
+    }
+}
+
+/// Locks the registry, recovering a poisoned mutex rather than panicking.
+///
+/// A panic in an unrelated BIF must not permanently disable compiled patterns:
+/// the registry holds no invariant a panic could break (ids are never reused and
+/// an entry is immutable once inserted), so the guard is recovered with
+/// [`PoisonError::into_inner`] — never a `unwrap`.
+fn lock_patterns() -> MutexGuard<'static, CompiledPatterns> {
+    compiled_patterns().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `compile_pattern/1`: builds the `{bm, Ref}`/`{ac, Ref}` handle
+/// (`binary_compile_pattern_1` over `do_binary_match_compile`).
+fn compile_pattern_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (tag, alternatives) = compile_pattern_arg(args[0])?;
+    intern_compiled(ctx, tag, alternatives)
+}
+
+/// Decodes `compile_pattern/1`'s argument into `(tag, alternatives)` — the C
+/// `do_binary_match_compile`, including its `words`/`characters` rules.
+///
+/// The tag is `bm` iff there is exactly **one** search string (`words == 1`);
+/// anything else that yields at least one string is `ac`. The cases the C sends
+/// to its `badarg` label are: a list element that is not a byte-aligned binary, a
+/// zero-length search string (`characters` never grows), an improper list, and an
+/// argument that is neither a list nor a bitstring (an integer, tuple, atom …,
+/// which leaves `characters == 0`).
+fn compile_pattern_arg(pattern: Eterm) -> Result<(PatternTag, Vec<Vec<u8>>)> {
+    if bits::is_bitstring(pattern) {
+        let bytes = bits::bytes(pattern)?;
+        if bytes.is_empty() {
+            return Err(badarg());
+        }
+        return Ok((PatternTag::Bm, vec![bytes]));
+    }
+    let items = proper_list(pattern).ok_or_else(badarg)?;
+    let mut alternatives = Vec::with_capacity(items.len());
+    for item in items {
+        let bytes = bits::bytes(item)?;
+        if bytes.is_empty() {
+            return Err(badarg());
+        }
+        alternatives.push(bytes);
+    }
+    match alternatives.len() {
+        0 => Err(badarg()),
+        1 => Ok((PatternTag::Bm, alternatives)),
+        _ => Ok((PatternTag::Ac, alternatives)),
+    }
+}
+
+/// Mints a fresh `Ref` thing and records `tag`/`alternatives` under its id,
+/// returning the `{Tag, Ref}` tuple the oracle returns.
+///
+/// The id is reserved (and the ref built) *before* the entry is inserted, so a
+/// pattern that fails to construct — an exhausted id space, a heap that cannot
+/// fit the ref — leaves no orphan entry, and a reserved-but-never-inserted id is
+/// simply skipped (ids are never reused).
+fn intern_compiled(
+    ctx: &mut BifContext<'_>,
+    tag: PatternTag,
+    alternatives: Vec<Vec<u8>>,
+) -> Result<Eterm> {
+    let id = {
+        let mut registry = lock_patterns();
+        let id = registry.next_id;
+        registry.next_id = id.checked_add(1).ok_or_else(system_limit)?;
+        id
+    };
+    let ref_term = access::make_ref_thing(ctx.heap(), id)?;
+    let tag_term = ctx.atom(tag.atom())?;
+    let handle = ctx.tuple(&[tag_term, ref_term])?;
+    lock_patterns().entries.insert(id, CompiledPattern { tag, alternatives });
+    Ok(handle)
+}
+
+/// Resolves a compiled `{Tag, Ref}` handle to its alternatives
+/// (`maybe_binary_match_compile`): the argument must be a `{Tag, Ref}` tuple with
+/// an atom tag, and `Ref` a live handle of the *matching* kind.
+///
+/// A `Ref` the registry does not know (a forged handle), a handle compiled with
+/// the other tag, a `Ref` that is not a ref thing at all, and any tuple that is
+/// not a `{bm|ac, _}` pair are all `badarg` — the oracle's `is_internal_magic_ref`
+/// + magic-ref-destructor check.
+fn lookup_compiled(ctx: &BifContext<'_>, pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    if access::tuple_size(pattern) != 2 {
+        return Err(badarg());
+    }
+    let tag_term = access::tuple_element(pattern, 0);
+    if !access::is_atom(tag_term) {
+        return Err(badarg());
+    }
+    let tag = match ctx.atoms().name(atom_val(tag_term)) {
+        Some("bm") => PatternTag::Bm,
+        Some("ac") => PatternTag::Ac,
+        _ => return Err(badarg()),
+    };
+    let ref_id = access::ref_thing_id(access::tuple_element(pattern, 1))?;
+    let registry = lock_patterns();
+    let compiled = registry.entries.get(&ref_id).ok_or_else(badarg)?;
+    if compiled.tag != tag {
+        return Err(badarg());
+    }
+    Ok(compiled.alternatives.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -903,7 +1115,7 @@ fn do_split(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let options = split_options(ctx, opts, bytes.len())?;
 
     if !options.global {
@@ -988,7 +1200,7 @@ fn do_match(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let (start, end) = match_options(ctx, opts, bytes.len())?;
     match find_first(&bytes, &alternatives, start, end) {
         Some((pos, len)) => {
@@ -1020,7 +1232,7 @@ fn do_matches(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let (start, end) = match_options(ctx, opts, bytes.len())?;
     let matches = find_all(&bytes, &alternatives, start, end);
     let mut elems = Vec::with_capacity(matches.len());
@@ -1098,6 +1310,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("binary", "encode_unsigned", 2, encode_unsigned_2);
     reg.register("binary", "first", 1, first_1);
     reg.register("binary", "last", 1, last_1);
+    reg.register("binary", "compile_pattern", 1, compile_pattern_1);
     reg.register("binary", "split", 2, split_2);
     reg.register("binary", "split", 3, split_3);
     reg.register("binary", "match", 2, match_2);
