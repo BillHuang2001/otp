@@ -58,6 +58,37 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     escalating a would-not-fit minor to a major
   - `collect_minor(&mut self, roots) -> Result<GcStats>`; `collect_major(&mut self, roots) -> Result<GcStats>`
 
+### `immix/mod.rs` + `immix/collect.rs` — the mark-region mature space (`ImmixSpace`)
+- `pub struct ImmixSpace` — line/block mark-region mature generation. Geometry: `LINE_WORDS` 16,
+  `LINES_PER_BLOCK` 16, `BLOCK_WORDS` 256. Line bitmaps per block (`allocated`/`marked`/`kept`),
+  `BlockState::{Free,Partial,AllMarked}`.
+  - `new(capacity_words)` / `with_allocator(alloc, capacity_words)`; `base`/`contains`/`contains_term`;
+    `capacity_words`/`block_count`/`line_count`/`used_lines`/`free_lines`/`used_words`/`available_words`;
+    `counters() -> ImmixCounters`; `reset()`
+  - `unsafe alloc_words(words) -> Result<*mut Eterm>` (line-aligned); `cons`/`tuple`; `can_reserve(words)`
+  - `mark(roots, promoted) -> Result<()>`; `collect(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm])
+    -> Result<ImmixStats>` — mark, classify, release, evacuate `Partial` blocks, pin `AllMarked`, finalize
+  - `impl EvacDest for ImmixSpace` — so the shared `copy.rs` forwarding protocol can evacuate *into* it
+- `pub struct ImmixStats` (`objects_evacuated`/`lines_evacuated`/`objects_pinned`/`lines_pinned`/
+  `blocks_reclaimed`/`words_reclaimed`/`words_pinned`) and `pub struct ImmixCounters`.
+
+### `immix_collector.rs` — `GenImmixCollector` (copying nursery + mark-region mature)
+- `pub struct GenImmixCollector` — pairs the copying young `HeapSpace` with an `ImmixSpace` mature.
+  - `with_config(&GcConfig) -> Result<GenImmixCollector>` (uses `cfg.policy()`; the `MatureKind` is
+    ignored — this type *is* the Immix collector); `from_policy(policy)`; `with_allocator(alloc, policy)`
+  - `policy() -> &HeapPolicy`; `young() -> &HeapSpace`; `young_mut() -> &mut HeapSpace`;
+    `mature() -> &ImmixSpace`; `stats() -> GcStats`; `last_immix_stats() -> Option<ImmixStats>`
+    (the most recent major's in-place reclaim accounting)
+  - `should_collect(need_words) -> bool`; `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>`
+    (reuses `Collection`/`CollectionKind`; no new variant)
+
+### `any_collector.rs` — the strategy-dispatching seam
+- `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }`
+  - `from_config(&GcConfig) -> Result<AnyCollector>` (`MatureKind::Copying` → `Collector`, the default;
+    `MatureKind::Immix` → `GenImmixCollector`); `kind() -> MatureKind`; `policy()`; `young()`;
+    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`
+  - thin forwarding only — lets a caller / test drive one corpus through either strategy.
+
 ### `policy.rs` — heap-size policy (the `erts_next_heap_size` analogue)
 - `pub struct HeapPolicy` — `min_heap_words`, `max_heap_words` (0 = unbounded), `fullsweep_after`
   (default 65535), `initial_young_words` (233), `initial_mature_words`, `need_reserve_words`;
