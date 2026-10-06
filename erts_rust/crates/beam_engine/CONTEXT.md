@@ -342,7 +342,7 @@ These are the remaining execution gaps the standard compiler emits for real OTP 
 - `src/families/bitstrings/raw.rs` → the bitstring family's `#[allow(unsafe_code)]` module: `ErlSubBits`/`ErlHeapBits` raw layouts, the refc-payload `make_binary`/`make_writable` builders, and the `>64`-bit bignum build/read helpers
 - `tests/stdlib_lists.rs` → the headline Milestone-1 evidence: runs real system stdlib `lists`/`ordsets`/`proplists` modules and the `stdlists_harness` fixture end to end
 - `tests/stdlib_more.rs` → the second real-stdlib evidence module (`orddict`/`queue`/`gb_trees`/`gb_sets`/`ordsets` + further `lists`/`proplists`) over `tests/support/mod.rs`
-- `tests/stdlib_sweep.rs` → the broad real-module sweep (261 stdlib/kernel/compiler `.beam`s loaded, load-failure set pinned, curated oracle-derived executions) — the current map of what real OTP code this engine can and cannot run
+- `tests/stdlib_sweep.rs` → the broad real-module sweep (all 261 stdlib/kernel/compiler `.beam`s load and are asserted to; curated oracle-derived executions incl. newly-loadable modules) — the current map of what real OTP code this engine can and cannot run
 - `HANDOFF_bs_init_writable.md` → the write-up of the `bs_init_writable` + `append`/`private_append` implementation (copy-rebuild), its honest divergences, and the `beam_engine → beam_alloc` escalation
 - `tests/support/mod.rs` → the multi-module test `ExecutionContext` (`ModuleHost`): one shared arena + one shared `AtomTable`, a runtime-located stdlib code path, the local BIF floor, external-module dispatch, and cross-module fun resolution
 - `tests/fixtures/stdlists_harness.{erl,beam}`, `tests/fixtures/stdlib_more_harness.{erl,beam}` → oracle-built harnesses forwarding into real stdlib
