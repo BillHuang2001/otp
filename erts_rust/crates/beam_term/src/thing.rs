@@ -128,8 +128,14 @@ pub const fn big_size_words(n_digits: usize) -> usize {
 /// `digits` are `ErtsDigit`s (`big.h:29`: `typedef Uint ErtsDigit`, exactly one
 /// machine word — `u64` on `ARCH_64`), **least significant first**; `negative`
 /// sets the header's `_BIG_SIGN_BIT`. Layout pinned to `erl_term.h:452-471` and
-/// `big.h:68-73,96-97`: `[make_pos_bignum_header(n-1) | make_neg_bignum_header(n-1),
+/// `big.h:68-73,96-97`: `[make_pos_bignum_header(n) | make_neg_bignum_header(n),
 /// d0 … d(n-1)]`, one digit per word, with the root word `make_boxed(hp)`.
+///
+/// The header arity field **is** the digit count `n` — the C reads it back
+/// directly (`big.h:70`: `BIG_ARITY(xp) = bignum_header_arity(*(xp))`), and every
+/// producer stores the count, not a count-minus-one (`big.c:2274-2277`
+/// `uint_to_big`: `make_pos_bignum_header(1)` for one digit; `big.c:3360`
+/// `arity = BIG_NEED_SIZE(xl)-1` = `xl` = the digit count).
 ///
 /// # Safety
 ///
@@ -148,10 +154,10 @@ pub unsafe fn write_big(hp: *mut Eterm, negative: bool, digits: &[u64]) -> Eterm
         POS_BIG_SUBTAG
     };
     // SAFETY: the caller reserved `1 + n` words. Word `0` receives the bignum header
-    // (arity `n - 1`) and words `1..=n` the digits in least-significant-first order
-    // (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`, `big.h:68`).
+    // (arity `n`, the digit count) and words `1..=n` the digits in
+    // least-significant-first order (`BIG_V(xp) = (ErtsDigit *)((xp) + 1)`, `big.h:68`).
     unsafe {
-        *hp = make_header(n - 1, subtag);
+        *hp = make_header(n, subtag);
         for (i, &digit) in digits.iter().enumerate() {
             *hp.add(1 + i) = Eterm::from_raw(digit as usize);
         }
@@ -175,8 +181,9 @@ pub unsafe fn big_parts<'a>(t: Eterm) -> (bool, &'a [u64]) {
     let p = boxed_val(t);
     // SAFETY: the caller guarantees `t` is a live bignum, so `p` is its header word.
     let hdr = unsafe { *p };
-    // The header arity is `n - 1` (`make_bignum_header(n-1)`, `erl_term.h:452-453`).
-    let n = arityval(hdr) + 1;
+    // The header arity **is** the digit count (`big.h:70`:
+    // `BIG_ARITY(xp) = bignum_header_arity(*(xp))`).
+    let n = arityval(hdr);
     // SAFETY: the header encodes the digit count `n` and `write_big` stored the `n`
     // one-word `ErtsDigit`s starting at word one of the block, so the slice is live
     // and in bounds; the caller keeps the owning heap alive for `'a`.
@@ -584,9 +591,9 @@ mod tests {
         unsafe {
             let p = boxed_val(term);
             assert_eq!(p, hp);
-            assert_eq!(*p, make_header(2, POS_BIG_SUBTAG));
+            assert_eq!(*p, make_header(3, POS_BIG_SUBTAG));
             assert!(is_bignum_header(*p));
-            assert_eq!(arityval(*p), digits.len() - 1);
+            assert_eq!(arityval(*p), digits.len());
             assert_eq!((*p).raw() & BIG_SIGN_BIT, 0, "a positive bignum has no sign bit");
             let stored = core::slice::from_raw_parts(p.add(1).cast::<u64>(), digits.len());
             assert_eq!(stored, &digits[..], "digits are stored least-significant-first");
@@ -611,7 +618,7 @@ mod tests {
         // single digit word.
         unsafe {
             let p = boxed_val(term);
-            assert_eq!(*p, make_header(0, NEG_BIG_SUBTAG));
+            assert_eq!(*p, make_header(1, NEG_BIG_SUBTAG));
             assert_ne!((*p).raw() & BIG_SIGN_BIT, 0, "the sign lives in the header");
             assert_eq!((*p.add(1)).raw() as u64, u64::MAX);
         }

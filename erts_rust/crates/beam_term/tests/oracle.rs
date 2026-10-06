@@ -12,7 +12,12 @@
 //!   [`MAP_SMALL_MAP_LIMIT`] (31/32/33 keys) and a 40-key hash map;
 //! * bitstring bit size (`bit_size/1`), the individual bits (`[X || <<X:1>> <= B]`)
 //!   and the full bytes (`[Y || <<Y:8>> <= B]`) for `<<1:3>>`, `<<11:4>>`, a
-//!   10-bit window, an arbitrary byte-aligned binary, and the empty bitstring.
+//!   10-bit window, an arbitrary byte-aligned binary, and the empty bitstring;
+//! * bignum equality / order (`=:=` / `<` / `>`), the arithmetic mixed
+//!   bignum / float comparison, and the object size (`erts_debug:flat_size/1`) for
+//!   positive and negative multi-limb [`write_big`] terms across the 2-/3-limb
+//!   boundary (the cases that expose the header-arity convention: the header arity
+//!   **is** the digit count, `big.h:70`).
 //!
 //! # Protocol
 //!
@@ -32,6 +37,7 @@
 //! return, never failing the suite. `cargo test -p beam_term` therefore stays
 //! green on hosts without a system Erlang.
 
+use std::cmp::Ordering;
 use std::process::Command;
 use std::sync::mpsc;
 use std::thread;
@@ -97,6 +103,15 @@ fn parse_int(s: &str) -> i64 {
     s.trim()
         .parse::<i64>()
         .unwrap_or_else(|e| panic!("expected an integer, got {:?}: {e}", s.trim()))
+}
+
+/// Parses a `true`/`false` printed by `~w` on a boolean.
+fn parse_bool(s: &str) -> bool {
+    match s.trim() {
+        "true" => true,
+        "false" => false,
+        other => panic!("expected an oracle boolean, got {other:?}"),
+    }
 }
 
 /// Parses an Erlang list printed with `~w` of integers and the atom `none` (used
@@ -185,6 +200,34 @@ fn build_heap_bits(bytes: &[u8], n_bits: usize) -> (Vec<Eterm>, Eterm) {
             i + 1,
         );
     }
+    (buf, t)
+}
+
+/// Builds a bignum from `digits` (least-significant-first `u64` limbs) into a
+/// sentinel-guarded buffer and returns the buffer plus the tagged root.
+fn build_big(negative: bool, digits: &[u64]) -> (Vec<Eterm>, Eterm) {
+    assert!(!digits.is_empty(), "a bignum needs at least one limb");
+    let words = big_size_words(digits.len());
+    let mut buf = vec![SENTINEL; words + 8];
+    // SAFETY: `buf` owns `words + 8 >= big_size_words(digits.len())` words;
+    // `write_big` writes exactly `big_size_words(digits.len())` of them.
+    let t = unsafe { write_big(buf.as_mut_ptr(), negative, digits) };
+    for (i, w) in buf[words..].iter().enumerate() {
+        assert_eq!(
+            *w,
+            SENTINEL,
+            "write_big overflowed big_size_words by {} words",
+            i + 1,
+        );
+    }
+    (buf, t)
+}
+
+/// Builds a boxed float into a sentinel-guarded buffer.
+fn build_float(value: f64) -> (Vec<Eterm>, Eterm) {
+    let mut buf = vec![SENTINEL; FLOAT_SIZE_WORDS + 8];
+    // SAFETY: `buf` owns `FLOAT_SIZE_WORDS + 8 >= FLOAT_SIZE_WORDS` words.
+    let t = unsafe { write_float(buf.as_mut_ptr(), value) };
     (buf, t)
 }
 
@@ -436,4 +479,163 @@ fn oracle_agrees_on_binary_contents() {
     assert_eq!(parse_int(fields[0]), n_bits as i64, "oracle bit_size");
     let expected: Vec<Option<i64>> = payload.iter().map(|b| Some(*b as i64)).collect();
     assert_eq!(parse_int_list(fields[1]), expected, "oracle binary contents");
+}
+
+// ---------------------------------------------------------------------------
+// Bignum
+// ---------------------------------------------------------------------------
+
+/// The bignum cases exercised against the oracle: `(Erlang literal, negative,
+/// limbs)`, limbs least-significant-first (`ErtsDigit`s, one `u64` each).
+///
+/// These are exactly the values that expose the header-arity convention: a
+/// bignum with `n` limbs is `big_size_words(n) == n + 1` words and its header
+/// arity **is** `n` (`big.h:70`), so `1 bsl 134` (3 limbs) must not compare equal
+/// to `63 bsl 128` (3 limbs, different MSB limb) even though the writer of an
+/// off-by-one layout would collapse them.
+const BIG_CASES: &[(&str, bool, &[u64])] = &[
+    ("(1 bsl 64)", false, &[0, 1]),          // 2 limbs, flat_size 3
+    ("(1 bsl 70)", false, &[0, 64]),         // 2 limbs, flat_size 3
+    ("(1 bsl 134)", false, &[0, 0, 64]),     // 3 limbs, flat_size 4
+    ("(63 bsl 128)", false, &[0, 0, 63]),    // 3 limbs, flat_size 4
+    ("-(1 bsl 100)", true, &[0, 68719476736]), // 2 limbs, flat_size 3
+    ("(1 bsl 128)", false, &[0, 0, 1]),      // 3 limbs, flat_size 4
+];
+
+/// `size_object` of every bignum case agrees with the oracle's
+/// `erts_debug:flat_size/1` (one header word plus one word per digit).
+#[test]
+fn oracle_agrees_on_bignum_flat_size() {
+    for (erl, negative, digits) in BIG_CASES {
+        let (_buf, t) = build_big(*negative, digits);
+
+        let expr = format!("io:format(\"~w\", [erts_debug:flat_size({erl})])");
+        let Some(out) = erl_stdout(&expr) else {
+            return;
+        };
+        assert_eq!(
+            size_object(t) as i64,
+            parse_int(&out),
+            "size_object vs erts_debug:flat_size({erl})",
+        );
+        assert_eq!(
+            size_object(t),
+            big_size_words(digits.len()),
+            "size_object({erl}) must be big_size_words({})",
+            digits.len(),
+        );
+    }
+}
+
+/// `eq` and `cmp` agree with the oracle's `=:=` / `<` / `>` for the pairs that
+/// distinguish the digit-count convention: a differing MSB limb on the same limb
+/// count, an equal value, and a sign difference.
+#[test]
+fn oracle_agrees_on_bignum_equality_and_order() {
+    let atoms = AtomTable::new();
+    let pairs = [
+        ("(1 bsl 134)", "(63 bsl 128)"), // differ only in the top limb -> not equal, A > B
+        ("(63 bsl 128)", "(1 bsl 134)"),
+        ("(1 bsl 70)", "(1 bsl 70)"),    // equal
+        ("(1 bsl 64)", "(1 bsl 128)"),   // 2 limbs vs 3 limbs -> A < B
+        ("-(1 bsl 100)", "(1 bsl 64)"),  // negative vs positive -> A < B
+        ("(1 bsl 128)", "(1 bsl 64)"),   // 3 limbs vs 2 limbs -> A > B
+    ];
+
+    // Map each literal back to its limbs so the Rust term is built from the same
+    // input as the oracle expression.
+    let build = |erl: &str| -> (Vec<Eterm>, Eterm) {
+        let (_, negative, digits) = BIG_CASES
+            .iter()
+            .find(|(e, _, _)| *e == erl)
+            .unwrap_or_else(|| panic!("no big case for {erl}"));
+        build_big(*negative, digits)
+    };
+
+    for (erl_a, erl_b) in pairs {
+        let (_ba, a) = build(erl_a);
+        let (_bb, b) = build(erl_b);
+
+        let expr = format!(
+            "io:format(\"~w|~w|~w\", \
+             [{erl_a} =:= {erl_b}, {erl_a} < {erl_b}, {erl_a} > {erl_b}])"
+        );
+        let Some(out) = erl_stdout(&expr) else {
+            return;
+        };
+        let fields = split_fields(&out);
+        assert_eq!(fields.len(), 3, "unexpected oracle output: {out:?}");
+        let (o_eq, o_lt, o_gt) = (
+            parse_bool(fields[0]),
+            parse_bool(fields[1]),
+            parse_bool(fields[2]),
+        );
+
+        assert_eq!(eq(a, b, &atoms), o_eq, "eq({erl_a}, {erl_b})");
+        let expected = if o_lt {
+            Ordering::Less
+        } else if o_gt {
+            Ordering::Greater
+        } else {
+            Ordering::Equal
+        };
+        assert_eq!(cmp(a, b, &atoms), expected, "cmp({erl_a}, {erl_b})");
+        assert_eq!(
+            cmp(b, a, &atoms),
+            expected.reverse(),
+            "cmp({erl_b}, {erl_a}) must reverse",
+        );
+    }
+}
+
+/// The arithmetic comparison of a bignum beyond `2^53` against a float uses the
+/// approximate `f64` value (`number_as_f64`); `(1 bsl 70) > 1.0` is `true`, which
+/// requires the top limb to be read.
+#[test]
+fn oracle_agrees_on_bignum_vs_float_arithmetic() {
+    let atoms = AtomTable::new();
+    let (_bb, big) = build_big(false, &[0, 64]); // 1 bsl 70
+    let (_bf, one) = build_float(1.0);
+
+    let Some(out) = erl_stdout("io:format(\"~w\", [(1 bsl 70) > 1.0])") else {
+        return;
+    };
+    let oracle = parse_bool(&out);
+    assert!(oracle, "sanity: the oracle reports (1 bsl 70) > 1.0");
+
+    assert_eq!(
+        cmp_arith(big, one, &atoms),
+        Ordering::Greater,
+        "cmp_arith(1 bsl 70, 1.0)",
+    );
+    assert_eq!(
+        cmp_arith(one, big, &atoms),
+        Ordering::Less,
+        "cmp_arith(1.0, 1 bsl 70)",
+    );
+}
+
+/// `term_hash` consistency (`eq(a, b) ⇒ term_hash(a) == term_hash(b)`) plus a
+/// regression guard: two bignums differing only in the **top** limb must hash
+/// differently (a hash that dropped the top limb would collide them).
+#[test]
+fn bignum_hash_sees_the_top_limb() {
+    let atoms = AtomTable::new();
+    let (_b1, same_a) = build_big(false, &[0, 0, 64]); // 1 bsl 134
+    let (_b2, same_b) = build_big(false, &[0, 0, 64]); // same value
+    let (_b3, diff) = build_big(false, &[0, 0, 63]); // 63 bsl 128, top limb differs
+
+    assert!(eq(same_a, same_b, &atoms), "same-value bignums are =:=");
+    assert_eq!(
+        term_hash(same_a, &atoms),
+        term_hash(same_b, &atoms),
+        "eq(a, b) must imply equal hashes",
+    );
+
+    assert!(!eq(same_a, diff, &atoms), "1 bsl 134 =/= 63 bsl 128");
+    assert_ne!(
+        term_hash(same_a, &atoms),
+        term_hash(diff, &atoms),
+        "bignums differing only in the top limb must hash differently",
+    );
 }
