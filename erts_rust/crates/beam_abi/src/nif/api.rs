@@ -669,7 +669,7 @@ impl ErlNifApi {
     /// Used by tests and by a runtime that has not yet wired up any function; the returned value is
     /// a valid `ErlNifApi` whose `size_of`/alignment match a fully populated one.
     #[allow(clippy::too_many_lines)]
-    pub fn empty() -> Self {
+    pub const fn empty() -> Self {
         Self {
             enif_priv_data: None,
             enif_alloc: None,
