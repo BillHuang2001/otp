@@ -333,7 +333,7 @@ These are the *only* remaining execution gaps the standard compiler emits for re
 - `src/families/maps.rs` → `GetMapElements`/`HasMapFields`/`PutMapAssoc`/`PutMapExact` (flatmap + hashmap sources; flatmap-only construction)
 - `src/families/bitstrings/mod.rs` → the `Bs*` dispatch + the shared failure/operand/bit-arithmetic helpers + the wide (>64-bit) integer helpers + `BitWriter`
 - `src/families/bitstrings/matching.rs` → match entry (`bs_start_match3/4`, `bs_match_string`), the fixed reads (`integer` incl. >64-bit bignums, `float`, `binary`, UTF-8/16/32 + skips), the position ops, and the `bs_match` command interpreter (incl. `=:=`)
-- `src/families/bitstrings/create.rs` → `bs_create_bin` segments: `integer` (any width), `binary`, `float`, `utf8`/`utf16`/`utf32` (+ the `bs_init_writable`/`append`/`string` gaps)
+- `src/families/bitstrings/create.rs` → `bs_create_bin` segments: `integer` (any width), `binary`, `float`, `utf8`/`utf16`/`utf32`, `string` (+ the `bs_init_writable`/`append`/`private_append` gap — see `HANDOFF_bs_init_writable.md`)
 - `src/families/bitstrings/raw.rs` → the bitstring family's `#[allow(unsafe_code)]` module: `ErlSubBits`/`ErlHeapBits` raw layouts + the `>64`-bit bignum build/read helpers
 - `tests/stdlib_lists.rs` → the headline Milestone-1 evidence: runs real system stdlib `lists`/`ordsets`/`proplists` modules and the `stdlists_harness` fixture end to end
 - `tests/stdlib_more.rs` → the second real-stdlib evidence module (`orddict`/`queue`/`gb_trees`/`gb_sets`/`ordsets` + further `lists`/`proplists`) over `tests/support/mod.rs`
