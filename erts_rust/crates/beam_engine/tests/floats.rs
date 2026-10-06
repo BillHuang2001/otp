@@ -15,9 +15,9 @@
 //! opcodes, never to a `gc_bif`.
 
 use beam_common::BeamError;
-use beam_engine::{terms, Machine, MinimalContext};
+use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{load_file, Module};
-use beam_term::{make_small, Atom, Eterm, NIL};
+use beam_term::{is_small, make_small, Atom, Eterm, NIL};
 
 /// The committed fixture (produced by `erlc floats.erl`; see `fixtures/README.md`).
 const FLOATS_BEAM: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/floats.beam");
@@ -137,6 +137,82 @@ fn scale_converts_the_integer_operand_beside_a_float() {
     let f = float(&mut ctx, 1.5);
     let result = run("scale", 2, &[i, f], &mut ctx).expect("scale(3, 1.5)");
     assert_eq!(terms::float_value(result).unwrap(), 4.5);
+}
+
+/// A bignum term with least-significant-first `u64` digits, owned by `ctx`'s arena.
+///
+/// Mirrors how the engine's own operand reader materialises a wide integer literal
+/// (the frozen `[header, d0..dn]` layout, written by `beam_term::write_big`).
+fn bignum(ctx: &mut MinimalContext, negative: bool, digits: &[u64]) -> Eterm {
+    let hp = ctx
+        .alloc_words(beam_term::big_size_words(digits.len()))
+        .expect("arena words for the bignum");
+    // SAFETY: `alloc_words` returned exactly `big_size_words(len)` writable words —
+    // the block `write_big` requires and fully writes — and `digits` is non-empty
+    // and normalised. The arena keeps them live for the whole run.
+    unsafe { beam_term::write_big(hp, negative, digits) }
+}
+
+#[test]
+fn fconv_of_a_representable_bignum_matches_the_oracle() {
+    // A bignum source (outside the 60-bit immediate range) converts through the
+    // faithful `big_to_double` port. Every expected value is the oracle's:
+    // `erl -noshell -pa "$TMPDIR/fixgen" -eval
+    // 'io:format("~.17e~n",[floats:conv(1 bsl 60)])'` ⇒ `1.1529215046068470e+18`,
+    // `floats:conv(1000000000000000000)` ⇒ `1.0000000000000000e+18`.
+    let cases: [(i64, f64); 3] = [
+        // 2^60 — exact.
+        (1i64 << 60, 2.0f64.powi(60)),
+        // 10^18 = 2^18 * 5^18 — exact.
+        (1_000_000_000_000_000_000, 1.0e18),
+        // 2^60 + 1 rounds down to the nearest double, 2^60.
+        ((1i64 << 60) + 1, 2.0f64.powi(60)),
+    ];
+    for (source_value, expected) in cases {
+        let mut ctx = MinimalContext::new();
+        let arg = terms::make_integer(&mut ctx, source_value).expect("the arena builds a bignum");
+        assert!(!is_small(arg), "{source_value} must be a bignum");
+        let result = run("conv", 1, &[arg], &mut ctx)
+            .unwrap_or_else(|e| panic!("conv({source_value}) failed: {e:?}"));
+        assert_eq!(
+            terms::float_value(result).expect("the result is a float"),
+            expected,
+            "conv({source_value})"
+        );
+    }
+}
+
+#[test]
+fn fconv_of_a_bignum_beside_a_float_matches_the_oracle() {
+    // `scale(I, F) when is_integer(I), is_float(F) -> I * F.` — the `fconv` on the
+    // integer argument runs with a *bignum* value (the guard `is_integer/1` accepts
+    // a bignum), so `scale/2` exercises the same conversion through real compiled
+    // code. `floats:scale(1 bsl 60, 1.0)` ⇒ `1.1529215046068470e+18`.
+    let mut ctx = MinimalContext::new();
+    let big = terms::make_integer(&mut ctx, 1i64 << 60).expect("the arena builds a bignum");
+    let one = float(&mut ctx, 1.0);
+    let result = run("scale", 2, &[big, one], &mut ctx).expect("scale(2^60, 1.0)");
+    assert_eq!(terms::float_value(result).unwrap(), 2.0f64.powi(60));
+}
+
+#[test]
+fn fconv_of_an_overwide_bignum_raises_badarith() {
+    // 2^1024 (17 limbs, bitlen 1025) is above the largest finite double, so
+    // `big_to_double` fails and `fconv` raises — the oracle's
+    // `floats:conv(1 bsl 1100)` ⇒ `error:badarith`.
+    let mut limbs = vec![0u64; 17];
+    limbs[16] = 1; // 2^1024
+    let mut ctx = MinimalContext::new();
+    let arg = bignum(&mut ctx, false, &limbs);
+    let err = run("conv", 1, &[arg], &mut ctx).expect_err("conv(2^1024)");
+    assert!(matches!(err, BeamError::BadArith), "got {err:?}");
+
+    // The guarded `scale/2` refuses it the same way (no fail label on `fconv`).
+    let mut ctx = MinimalContext::new();
+    let arg = bignum(&mut ctx, false, &limbs);
+    let one = float(&mut ctx, 1.0);
+    let err = run("scale", 2, &[arg, one], &mut ctx).expect_err("scale(2^1024, 1.0)");
+    assert!(matches!(err, BeamError::BadArith), "got {err:?}");
 }
 
 #[test]
