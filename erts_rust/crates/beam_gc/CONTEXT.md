@@ -41,6 +41,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `run(self, roots: &mut [Eterm]) -> Result<GcStats>` — `forward_roots` + `complete`.
 - `pub fn collect(from: &HeapSpace, to: &mut HeapSpace, roots: &mut [Eterm]) -> Result<GcStats>` — the
   primitive young-generation entry over a single from-space (objective §1).
+- Fun blocks are sized and scanned from `beam_term::fun`'s inlined-descriptor layout
+  (`1 + desc_words(kind) + num_free`, env at `fun_env_offset_header`), **never** via
+  `header_arity`/`thing_arityval` — see Design Decisions.
 
 ### `collector.rs` — the two-generation collector
 - `pub enum CollectionKind { Minor, Major }`
@@ -108,19 +111,41 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   scan phase mirrors the C `sweep()` switch verbatim: walking the to-space word by word, a `BOXED`/`LIST`
   word is a *reference* to forward, a **transparent** `HEADER` (arityval/record) is stepped over so its
   elements are scanned individually, any other **thing** header is skipped by `thing_arityval+1`
-  (opaque interior; fun `env[]` follows as separately-scanned words; map keys/values follow the size
-  word the same way), and `HEADER_SUB_BITS` forwards its `orig` field (`erl_gc.c:2328-2348`).
+  (opaque interior; map keys/values follow the size word the same way), and `HEADER_SUB_BITS` forwards
+  its `orig` field (`erl_gc.c:2328-2348`). A **fun** header is the one exception to the
+  `thing_arityval+1` step — see the fun bullet below.
+- **Funs are sized and scanned from the inlined-descriptor layout in `beam_term::fun`, *not*
+  `header_arity`/`thing_arityval`.** `beam_term::boxed::header_arity` (and therefore `thing_arityval`)
+  deliberately returns the C `ERL_FUN_SIZE - 1 == 1` for a fun — the old assumption that a fun block is
+  `[header][entry-pointer][env...]` with a single descriptor word. This runtime instead **inlines** the
+  C `entry` as descriptor words, so a fun block is `[header][desc_words(kind)][env[0..num_free]]`, where
+  `desc_words` = 2 (`Local`), 2 (`External`), 10 (`Imported`), and `env[i]` is at
+  `hp[1 + desc_words(kind) + i]`. The copier therefore never uses `header_arity` for a fun:
+  `move_size` sizes it as `1 + fun_desc_words(fun_kind_of_header(hdr)) + fun_num_free(hdr)` (==
+  `fun_block_words_header`, but computed infallibly since `is_fun_header(hdr)` already held), and the
+  Cheney scan advances a fun header by `fun_env_offset_header(hdr)` (== `1 + desc_words`, so the whole
+  descriptor is skipped opaquely) instead of `thing_arityval(hdr) + 1`, after which the word-by-word
+  loop scans exactly the `num_free` env words. Using `header_arity`/`thing_arityval` for a fun would
+  **under-size** the copy by `desc_words(kind) - 1` words (1 for `Local`/`External`, 9 for `Imported`)
+  and land the scan on a raw descriptor word (`index` for `Local`, `uniq` bytes for `Imported`),
+  following it as a bogus term reference and corrupting the heap. Every fun offset/width comes from
+  `beam_term::fun`; `copy.rs` defines none of its own.
+- **Only `copy.rs` has a fun-layout dependency.** `space.rs`, `collector.rs`, `policy.rs`, `stats.rs` and
+  `error.rs` deal in space geometry, collection policy, statistics and error construction and never
+  inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc comment about
+  off-heap liveness. None carries a fun-layout assumption, so only `copy.rs` needed the fix.
 - **`xptr_tag` is not needed.** The C ORs the literal bit back in only for literal-area copies
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
   test and is left verbatim — the C `erts_is_literal`/area-test rule (`erl_gc.c:2013,2292-2297`).
 - **Local object-size traversal; `beam_term` is not modified.** `copy.rs` computes only what the copier
-  needs — an *incremental, per-object* `move_size(header, ptr)`: the `nelts` of the C `move_boxed`
-  (`header_arity` plus the flatmap/HAMT/fun extras), read through `beam_term`'s public accessors
-  (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`, `is_fun_header`, …), which
-  the scan then walks word by word. It does **not** call `beam_term::size::size_object`: that is a
+  needs — an *incremental, per-object* `move_size(header, ptr)`: the `nelts` of the C `move_boxed`.
+  A **fun** is `1 + desc_words(kind) + num_free` (`fun_desc_words`/`fun_num_free`, see the fun bullet);
+  every other boxed object is `header_arity` plus the flatmap/HAMT extras, read through `beam_term`'s
+  public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`). The scan
+  then walks the block word by word. It does **not** call `beam_term::size::size_object`: that is a
   whole-graph size (it cannot size the single object the copier is looking at), and it under-reports
-  HAMT maps (see Known Gaps). The decision and the exact formula live here so no agent re-derives them.
+  HAMT maps (see Known Gaps). The decision and the exact formulas live here so no agent re-derives them.
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
@@ -183,6 +208,17 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   size accounting. The expected size is measured **independently** of any size heuristic: a `MARKER`
   is pre-written over the reservation and the map's contiguous footprint is recovered by scanning back
   (the copier's `to.used_words()` must equal it), while the pair's size is the frozen `ERL_REFC_BITS_SIZE`.
+- **`tests/fun_copy.rs` — the fun inlined-descriptor evidence.** Build `Local`, `External` and `Imported`
+  funs (with `beam_term::fun::{write_fun_local, write_fun_external, write_fun_imported}`), each reserved
+  to exactly `fun_words(kind, num_free)` words, plus deliberate garbage, then collect all three as roots.
+  Assert root relocation, that kind/arity/num_free/module/function/uniq/index/creator-pid all round-trip,
+  that boxed free variables are relocated into the to-space (checked from the copied `fun_env`), and that
+  `to.used_words()`/`words_copied` equal the exact layout-formula footprint (`1 + desc_words + num_free`
+  per fun plus the relocated compound env objects) — proving no under/over-sizing. A fourth test pins the
+  per-kind block size (`fun_words == fun_block_words == 1 + desc + num_free`) and **a dedicated test
+  proves the descriptor words are opaque**: it plants an `Imported` fun whose `uniq[0..8]` is a
+  BOXED-tagged pointer into the from-space, so a scan that stepped `thing_arityval + 1` would follow that
+  raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
@@ -227,6 +263,7 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `tests/generations.rs` → `Collector` minor/major/tenure/escalation integration
 - `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
 - `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
+- `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)
 - `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)

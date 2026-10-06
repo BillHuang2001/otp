@@ -6,27 +6,15 @@
 
 use beam_common::Result;
 use beam_term::prelude::{
-    boxed_val, header_arity, header_is_thing, is_flatmap_header, is_fun_header, is_header,
-    is_map_header, is_non_value, list_val, make_boxed, make_list, map_header_val, primary_tag,
-    thing_arityval, Eterm, PrimaryTag, HEADER_SUB_BITS, THE_NON_VALUE,
+    boxed_val, fun_desc_words, fun_env_offset_header, fun_kind_of_header, fun_num_free,
+    header_arity, header_is_thing, is_flatmap_header, is_fun_header, is_header, is_map_header,
+    is_non_value, list_val, make_boxed, make_list, map_header_val, primary_tag, thing_arityval,
+    Eterm, PrimaryTag, HEADER_SUB_BITS, THE_NON_VALUE,
 };
 
 use crate::error::heap_exhausted;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
-
-/// `FUN_HEADER_ENV_SIZE_OFFS` (`erl_term.h`: `_HEADER_ARITY_OFFS + 2 + 8`).
-///
-/// Defined locally: `beam_term` exposes `is_fun_header` but not this bit offset of the
-/// fun header's free-variable count (the `fun_num_free` field, `erl_fun.h:94`).
-const FUN_HEADER_ENV_SIZE_OFFS: u32 = 16;
-
-/// `fun_num_free(hdr)` — the number of free variables in a fun's environment
-/// (`erl_fun.h:94`).
-#[inline]
-fn fun_num_free(hdr: Eterm) -> usize {
-    ((hdr.raw() >> FUN_HEADER_ENV_SIZE_OFFS) & 0xFF) as usize
-}
 
 /// The Cheney copier: evacuates live terms from a [`FromSet`] into a [`HeapSpace`].
 ///
@@ -91,18 +79,36 @@ impl<'a> Copier<'a> {
                         // SAFETY: one word further along the to-space.
                         self.scan = unsafe { self.scan.add(1) };
                     } else {
-                        if gval == HEADER_SUB_BITS {
-                            // `ErlSubBits.orig` is word 4 of the object (`erl_bits.h`);
-                            // it holds the underlying bitstring as a boxed reference.
-                            // SAFETY: `scan` addresses a live `ErlSubBits` thing, so
-                            // word 4 is inside it.
-                            let orig = unsafe { self.scan.add(4) };
-                            // SAFETY: `orig` addresses the live `orig` word of the thing.
-                            unsafe { self.forward_slot(orig)? };
-                        }
-                        // SAFETY: a thing spans `thing_arityval(hdr) + 1` words, all of
-                        // which are inside the to-space.
-                        self.scan = unsafe { self.scan.add(thing_arityval(gval) + 1) };
+                        let step = if is_fun_header(gval) {
+                            // A fun block is `[header][desc_words(kind)][env[0..num_free]]`
+                            // with the C `entry` expanded into inlined descriptor words
+                            // (`beam_term::fun`). `thing_arityval(gval) + 1` is only 2 (the
+                            // C `ERL_FUN_SIZE`), which would land the scan on the *second*
+                            // descriptor word — a raw `index` for a `Local` fun, raw `uniq`
+                            // bytes for an `Imported` one — and follow that raw value as if
+                            // it were a term reference, corrupting the heap. Skip the whole
+                            // descriptor opaquely (`fun_env_offset_header == 1 + desc_words`)
+                            // so the word-by-word loop scans exactly the `num_free` env
+                            // words that follow.
+                            fun_env_offset_header(gval)?
+                        } else {
+                            if gval == HEADER_SUB_BITS {
+                                // `ErlSubBits.orig` is word 4 of the object (`erl_bits.h`);
+                                // it holds the underlying bitstring as a boxed reference.
+                                // SAFETY: `scan` addresses a live `ErlSubBits` thing, so
+                                // word 4 is inside it.
+                                let orig = unsafe { self.scan.add(4) };
+                                // SAFETY: `orig` addresses the live `orig` word of the thing.
+                                unsafe { self.forward_slot(orig)? };
+                            }
+                            // SAFETY: a thing spans `thing_arityval(hdr) + 1` words, all of
+                            // which are inside the to-space.
+                            thing_arityval(gval) + 1
+                        };
+                        // SAFETY: `step` words are exactly the header + descriptor + env of
+                        // a fun (or the header + payload of any other thing), all written
+                        // into the to-space, so the advanced position stays within it.
+                        self.scan = unsafe { self.scan.add(step) };
                     }
                 }
                 PrimaryTag::Immed1 => {
@@ -129,15 +135,26 @@ impl<'a> Copier<'a> {
     /// The total words (header word + payload) of the boxed object at `ptr`, whose
     /// header word is `hdr` — the `nelts + 1` of the C `move_boxed`.
     ///
-    /// `header_arity` already applies the map and fun special cases of
-    /// `_unchecked_header_arity`, so only the *extra* words of a flatmap's size word,
-    /// a hashmap's occupancy bitmap count and a fun's environment are added here.
+    /// A fun is sized explicitly from its inlined-descriptor layout
+    /// (`beam_term::fun`): `1 + desc_words(kind) + num_free`. `header_arity` is **not**
+    /// used for a fun because it deliberately carries the C `ERL_FUN_SIZE - 1 == 1`
+    /// value (the old single `entry`-pointer assumption), which would under-size the
+    /// copy by `desc_words(kind) - 1` words (1 for a `Local`/`External` fun, 9 for an
+    /// `Imported` one). For every other boxed object `header_arity` already applies the
+    /// map special case of `_unchecked_header_arity`, so only the *extra* words of a
+    /// flatmap's size word and a hashmap's occupancy bitmap count are added here.
     ///
     /// # Preconditions
     ///
     /// `ptr` must point at a live, boxed object of the from-space whose first word is
     /// `hdr`; it is dereferenced only for a flatmap's size word.
     fn move_size(hdr: Eterm, ptr: *const Eterm) -> usize {
+        if is_fun_header(hdr) {
+            // `fun_kind_of_header` is the infallible bit extraction and is valid
+            // because `is_fun_header(hdr)` just held; this avoids a `Result` on a path
+            // that cannot fail (never `unwrap` runtime data).
+            return 1 + fun_desc_words(fun_kind_of_header(hdr)) + fun_num_free(hdr);
+        }
         let mut nelts = header_arity(hdr);
         if is_map_header(hdr) {
             if is_flatmap_header(hdr) {
@@ -149,8 +166,6 @@ impl<'a> Copier<'a> {
                 // `hashmap_bitcount(MAP_HEADER_VAL(hdr))`: one occupied slot per set bit.
                 nelts += map_header_val(hdr).count_ones() as usize;
             }
-        } else if is_fun_header(hdr) {
-            nelts += fun_num_free(hdr);
         }
         nelts + 1
     }
