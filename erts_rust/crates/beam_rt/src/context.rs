@@ -337,6 +337,11 @@ impl<'a> RuntimeContext<'a> {
     /// not in the module's atom table or is not exported — exactly the raise the oracle
     /// produces for a call to a function the release does not have — plus any error the
     /// running code raises.
+    ///
+    /// A raise that escapes the module is passed through [`error::name_atom_raise`], so an
+    /// uncaught reason the engine can only carry as a *term* — the bare `function_clause`
+    /// of a failed function head, say — is still reported under its own atom name while
+    /// its live term is preserved (see that function).
     pub(crate) fn run_export(
         &mut self,
         module: &Module,
@@ -351,9 +356,10 @@ impl<'a> RuntimeContext<'a> {
         if module.export(function_atom, arity).is_none() {
             return Err(error::undef());
         }
-        Machine::new().run_export(module, function_atom, arity, args, self)
+        Machine::new()
+            .run_export(module, function_atom, arity, args, self)
+            .map_err(|err| error::name_atom_raise(err, self.runtime.atoms()))
     }
-
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
     /// runtime's shared state and this context's output sink.
     ///
