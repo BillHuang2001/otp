@@ -360,9 +360,8 @@ runtime owns the socket and does the syscalls; the driver only parses/serializes
   spawn/altact/payload-exit handling here — that is `beam_process`/`beam_rt` work, and the
   `ERTS_DIST_SPAWN_FLAG_*` / `ERTS_DOP_ALTACT_SIG_FLG_*` semantics (`dist.c:2590-2698`,
   `dist.c:3090-3146`) are documented, not interpreted.
-- **epmd over raw TCP is blocked in this sandbox** — verified via CLI (`epmd -names` works) but raw
-  `NAMES_REQ`/`PORT2_REQ` over a socket return empty. The `EpmdClient` codecs are exercised against
-  `MemoryTransport`; live epmd use is untested here. Use a fixed `inet_dist_listen_*` port instead.
+- **`ConnectionDriver` advances the receive atom cache only in `next_message`**, not `step` (see Design
+  Decisions): a runtime that never calls `next_message` will not make header/atom progress.
 - **Not yet consumed by `beam_rt`**: node startup (`-name`/`-sname`) does not yet wire this crate into
   the runtime binary. This crate is the value/connection layer only.
 
