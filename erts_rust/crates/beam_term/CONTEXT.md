@@ -275,11 +275,11 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - Word layout, `env[i]` at `hp[1 + desc_words(kind) + i]`, block = `1 + desc_words + num_free` words:
   `Local` = `[hdr][uniq:u64][index:u32][env…]`; `External` = `[hdr][module:Atom][function:Atom]`;
   `Imported` = `[hdr][module][uniq0..8][uniq8..16][index][old_index][old_uniq][pid_node][pid_number][pid_serial][pid_creation][env…]`.
-- `boxed.rs` gains header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
+- `boxed.rs` provides header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
 - `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
   (`Local` by `(uniq,index)` then `num_free` then env; `External` by `(module,function,arity)`;
   `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
-  fields `compare` compares — funs are no longer on an opaque fallback.
+  fields `compare` compares — funs are hashed structurally, not an opaque fallback.
 
 ### `record.rs` — native records (`ErtsRecordDefinition`/`ErtsRecordInstance`)
 The OTP 29 native-record term interior, owned here (the frozen-layout LCA) like [`fun.rs`]/[`refc.rs`].
