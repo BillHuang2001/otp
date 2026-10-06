@@ -115,6 +115,9 @@ pub(crate) fn exec(
                 .x(*arity)
                 .ok_or_else(|| error::bad_register(*arity))?;
             let args = register_args(machine, *arity)?;
+            // The engine passes the arguments in `x(0..arity)` and delegates the
+            // closure's free-variable layout (`x(arity..)`) to the context — see
+            // [`ExecutionContext::apply_fun`](crate::context::ExecutionContext::apply_fun).
             let result = ctx.apply_fun(fun, &args)?;
             machine.set_x(0, result)?;
             Ok(Some(Step::Next))
@@ -125,6 +128,8 @@ pub(crate) fn exec(
         Instr::CallFun2 { arity, func, .. } => {
             let fun = read_operand(machine, func)?;
             let args = register_args(machine, *arity)?;
+            // As for `call_fun`: arguments in `x(0..arity)`, captures laid out by
+            // the context (`ExecutionContext::apply_fun`).
             let result = ctx.apply_fun(fun, &args)?;
             machine.set_x(0, result)?;
             Ok(Some(Step::Next))

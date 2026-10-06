@@ -38,15 +38,6 @@
 //!   error**, so a later regression that turns a typed error into a *wrong result*
 //!   is caught. It is never a silent pass and never a fabricated expected value.
 //!
-//! # Known, deliberately-not-executed hazard
-//!
-//! `dict:store/3` (and therefore every non-empty `dict` operation) **does not
-//! terminate** under the current engine — it hangs rather than returning a typed
-//! error. It is reported here and in the task report, but deliberately **not
-//! executed** by any test (a hang would wedge the suite); see
-//! [`dict_store_is_known_to_hang`], which asserts nothing and only documents the
-//! finding.
-//!
 //! Ground truth is always the system `erl` (see `tests/fixtures/README.md`); the
 //! stdlib/kernel directories are located at **test time** and every test skips
 //! loudly when `erl`/the OTP install is unavailable.
@@ -731,23 +722,6 @@ fn blocked_mechanisms_report_their_typed_error() {
     assert!(
         matches!(err, BeamError::BadArg),
         "unexpected `unicode:characters_to_binary/1` error: {err:?}"
-    );
-}
-
-/// Documents a **non-termination hazard** found by the sweep.
-///
-/// `dict:new/0` runs fine, but `dict:store/3` (and therefore any non-empty `dict`
-/// operation) never returns under the current engine — it loops rather than
-/// raising. This test does **not** execute it (a hang would wedge the suite); it
-/// only records the finding so it is not lost.
-#[test]
-fn dict_store_is_known_to_hang() {
-    if skip_if_unavailable() {
-        return;
-    }
-    println!(
-        "KNOWN HAZARD: dict:store/3 does not terminate under the current engine \
-         (dict:new/0 returns fine). Deliberately not executed here."
     );
 }
 
