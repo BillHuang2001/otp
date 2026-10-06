@@ -36,6 +36,22 @@ fn poller() -> Poller {
     Poller::new().expect("a poll set")
 }
 
+/// Polls the reactor, retrying when a signal interrupts the wait.
+///
+/// Starting and reaping children makes `SIGCHLD` deliveries certain, and the test harness
+/// runs the cases below on parallel threads of one process, so an interrupted `epoll_wait`
+/// (`EINTR`, which [`Poller::poll`] surfaces as `BeamError::Io`) is a normal outcome here
+/// rather than a failure — the same reason the poll loop of a real runtime retries it.
+fn poll_events(poller: &mut Poller, timeout: Duration) -> Vec<Event> {
+    loop {
+        match poller.poll(Some(timeout)) {
+            Ok(events) => return events,
+            Err(BeamError::Io(err)) if err.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(err) => panic!("the poll succeeds: {err:?}"),
+        }
+    }
+}
+
 /// Polls and dispatches until `id` has received at least `want` input bytes, returning
 /// everything it received (bounded by a deadline).
 fn pump_input(
@@ -52,9 +68,7 @@ fn pump_input(
             "the reactor never delivered {want} bytes from the child (got {})",
             received.len()
         );
-        let events = poller
-            .poll(Some(Duration::from_millis(100)))
-            .expect("poll succeeds");
+        let events = poll_events(poller, Duration::from_millis(100));
         registry
             .handle_events(poller, &events)
             .expect("events dispatch");
@@ -80,9 +94,7 @@ fn pump_notifications(
             "no port notification delivered {want} bytes (got {})",
             received.len()
         );
-        let events = poller
-            .poll(Some(Duration::from_millis(100)))
-            .expect("poll succeeds");
+        let events = poll_events(poller, Duration::from_millis(100));
         registry.schedule_events(&events);
         let outcome = registry
             .execute_port_tasks(poller, DEFAULT_READINESS_RED_BUDGET)
@@ -109,9 +121,7 @@ fn pump_until(
         if done(registry, poller) {
             return true;
         }
-        let events = poller
-            .poll(Some(Duration::from_millis(100)))
-            .expect("poll succeeds");
+        let events = poll_events(poller, Duration::from_millis(100));
         registry
             .handle_events(poller, &events)
             .expect("events dispatch");
@@ -335,9 +345,7 @@ fn the_exit_status_of_a_reaped_child_is_taken_once() {
     let mut status = None;
     let deadline = Instant::now() + Duration::from_secs(5);
     while status.is_none() && Instant::now() < deadline {
-        let events = poller
-            .poll(Some(Duration::from_millis(50)))
-            .expect("poll succeeds");
+        let events = poll_events(&mut poller, Duration::from_millis(50));
         registry
             .handle_events(&mut poller, &events)
             .expect("events dispatch");
