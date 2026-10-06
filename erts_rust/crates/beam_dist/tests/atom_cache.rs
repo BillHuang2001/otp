@@ -18,9 +18,9 @@ use beam_dist::atom_cache::{
     apply_header, atom_to_cix, slot_index, OutboundAtomCache, ReceiveAtomCache, SegmentCache,
     ATOM_CACHE_SIZE, ENTRIES_PER_SEGMENT,
 };
-use beam_dist::control::{decode_control, ControlMessage};
+use beam_dist::control::{decode_control, encode_control_cached, ControlMessage};
 use beam_dist::dist_header::{AtomCacheRef, DistHeader};
-use beam_dist::flags::{Dop, DOP_SEND};
+use beam_dist::flags::{Dop, DOP_REG_SEND, DOP_SEND};
 use beam_dist::MemoryTransport;
 use beam_term::prelude::{make_atom, make_small};
 use beam_term::{Atom, AtomTable};
@@ -385,4 +385,60 @@ fn an_uncacheable_atom_is_emitted_inline_instead() {
     // full, so the caller must fall back to writing the atom text inline.
     assert_eq!(outbound.payload_ref_for(Atom::from_raw(255), &atoms), None);
     assert_eq!(outbound.len(), 255);
+}
+
+// ---------------------------------------------------------------------------
+// The encoder seam: `OutboundAtomCache` drives `encode_control_cached`.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn encode_control_cached_writes_the_refs_its_header_teaches() {
+    // The real `OutboundAtomCache`, installed on the encoder as the
+    // `beam_codec::AtomCacheWriter`, must produce a payload the header it yields
+    // resolves — i.e. `82, n` in the payload is header ref `n`.
+    let mut sender_atoms = AtomTable::new();
+    let from = make_atom(sender_atoms.intern("from"));
+    let cookie = make_atom(sender_atoms.intern("cookie"));
+    let to_name = make_atom(sender_atoms.intern("to_name"));
+
+    let mut outbound = OutboundAtomCache::new();
+    let body = encode_control_cached(
+        Dop::RegSend,
+        &[from, cookie, to_name],
+        &sender_atoms,
+        Some(&mut outbound),
+    )
+    .expect("encode with the outbound cache");
+    let header_bytes = encode_header(&outbound.take_header(), &sender_atoms);
+
+    // Every atom became an `ATOM_CACHE_REF` (`82`) + its sequential index; no atom
+    // text is left in the payload.
+    assert_eq!(
+        body,
+        vec![
+            SMALL_TUPLE_EXT,
+            4,
+            SMALL_INTEGER_EXT,
+            DOP_REG_SEND,
+            ATOM_CACHE_REF_EXT,
+            0,
+            ATOM_CACHE_REF_EXT,
+            1,
+            ATOM_CACHE_REF_EXT,
+            2,
+        ]
+    );
+
+    // The receiver's header refs and the payload indices agree.
+    let mut rx = Receiver::new();
+    let message = rx.receive(&header_bytes, &body).expect("the refs resolve");
+    assert_eq!(message.dop, Dop::RegSend);
+    assert_eq!(
+        message.terms,
+        vec![
+            make_atom(rx.atoms.lookup("from").unwrap()),
+            make_atom(rx.atoms.lookup("cookie").unwrap()),
+            make_atom(rx.atoms.lookup("to_name").unwrap()),
+        ]
+    );
 }

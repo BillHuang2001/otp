@@ -18,14 +18,15 @@ use std::thread;
 use std::time::Duration;
 
 use beam_alloc::Heap;
+use beam_codec::{AtomEncoding, ATOM_CACHE_REF_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT};
 use beam_common::BeamError;
 use beam_dist::connection::{Connection, TcpTransport};
-use beam_dist::dist_header::DIST_FRAG_HEADER;
+use beam_dist::dist_header::{DistHeader, DIST_FRAG_HEADER, DIST_HEADER};
 use beam_dist::flags::Dop;
 use beam_dist::fragment::DIST_FRAGMENT_SIZE;
 use beam_dist::transport::{Read, Write};
 use beam_dist::{check_mandatory, preferred_flags};
-use beam_term::prelude::{make_atom, make_small, Eterm, NIL};
+use beam_term::prelude::{atom_val, make_atom, make_small, Eterm, NIL};
 use beam_term::AtomTable;
 
 /// The shared cookie both ends authenticate with.
@@ -121,6 +122,17 @@ impl WireLog {
         self.0.lock().expect("wire log").iter().any(|b| {
             b.len() >= 2 && b[0] == beam_codec::VERSION_MAGIC && b[1] == DIST_FRAG_HEADER
         })
+    }
+
+    /// The recorded frame body that carries a `'D'` distribution header (an
+    /// established packet), if one was exchanged.
+    fn distribution_body(&self) -> Option<Vec<u8>> {
+        self.0
+            .lock()
+            .expect("wire log")
+            .iter()
+            .find(|b| b.len() >= 2 && b[0] == beam_codec::VERSION_MAGIC && b[1] == DIST_HEADER)
+            .cloned()
     }
 }
 
@@ -444,4 +456,111 @@ fn a_large_message_is_fragmented_on_the_wire_both_ways() {
     assert!(server_reads.saw_fragment_header(), "the server must receive 'E' fragments");
     assert!(server_writes.saw_fragment_header(), "the server must fragment its large reply");
     assert!(client_reads.saw_fragment_header(), "the client must receive 'E' fragments");
+}
+
+// ---------------------------------------------------------------------------
+// (g) The outbound atom cache: atoms cross as header refs + `82` payload bytes.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_outbound_atom_cache_round_trips_over_a_real_link() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+
+    let server_reads = WireLog::new();
+    let server_writes = WireLog::new();
+    let sr = server_reads.clone();
+    let sw = server_writes.clone();
+    let server = thread::spawn(move || -> beam_common::Result<Vec<String>> {
+        let (stream, _) = listener.accept().map_err(BeamError::Io)?;
+        let mut transport = TcpTransport::from_stream(stream);
+        transport.set_read_timeout(Some(TEST_TIMEOUT))?;
+        let mut conn = Connection::server(
+            SpyTransport { inner: transport, reads: sr, writes: sw },
+            SERVER_NAME,
+            COOKIE,
+            SERVER_CREATION,
+        )?;
+        let mut atoms = AtomTable::new();
+        let mut heap = Heap::new(4096).expect("server heap");
+        let got = conn.recv(&mut heap, &mut atoms)?;
+        assert_eq!(got.dop, Dop::RegSend);
+        // Resolve the control-argument atoms back to their names.
+        Ok(got
+            .terms
+            .iter()
+            .map(|term| atoms.name(atom_val(*term)).unwrap_or_default().to_string())
+            .collect())
+    });
+
+    // The client is spied on so the test can inspect the real wire image.
+    let client_reads = WireLog::new();
+    let client_writes = WireLog::new();
+    let mut client = Connection::client_with_creation(
+        SpyTransport {
+            inner: TcpTransport::connect(&addr.to_string()).expect("connect"),
+            reads: client_reads,
+            writes: client_writes.clone(),
+        },
+        CLIENT_NAME,
+        COOKIE,
+        42,
+    )
+    .expect("client handshake");
+
+    let mut atoms = AtomTable::new();
+    let from = make_atom(atoms.intern("from"));
+    let cookie = make_atom(atoms.intern("cookie"));
+    let to_name = make_atom(atoms.intern("to_name"));
+
+    client
+        .send_control(Dop::RegSend, &[from, cookie, to_name], &atoms)
+        .expect("send DOP_REG_SEND");
+
+    // The receiver resolves the payload's `82` refs through the header it applied.
+    let names = server.join().expect("server thread").expect("server side");
+    assert_eq!(names, vec!["from", "cookie", "to_name"]);
+
+    // ... and the wire really carried one `New` ref per atom and a `82, index`
+    // payload whose indices are the header ref positions.
+    let body = client_writes.distribution_body().expect("the client sent a 'D' header");
+    let mut scratch = AtomTable::new();
+    let (header, offset) = DistHeader::decode_tail(&body, 2, &mut scratch, AtomEncoding::Utf8)
+        .expect("decode the distribution header");
+    assert_eq!(header.refs.len(), 3, "one ref per atom");
+    assert!(header.refs.iter().all(beam_dist::dist_header::AtomCacheRef::is_new));
+    assert_eq!(
+        &body[offset..],
+        &[
+            SMALL_TUPLE_EXT,
+            4,
+            SMALL_INTEGER_EXT,
+            Dop::RegSend.as_u8(),
+            ATOM_CACHE_REF_EXT,
+            0,
+            ATOM_CACHE_REF_EXT,
+            1,
+            ATOM_CACHE_REF_EXT,
+            2,
+        ]
+    );
+}
+
+#[test]
+fn client_with_creation_advertises_its_creation_to_the_peer() {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind loopback");
+    let addr = listener.local_addr().expect("local_addr");
+    let server = spawn_server(listener);
+
+    let client = Connection::client_with_creation(
+        TcpTransport::connect(&addr.to_string()).expect("connect to server"),
+        CLIENT_NAME,
+        COOKIE,
+        42,
+    )
+    .expect("client handshake");
+    let server = joined(server);
+
+    assert_eq!(server.peer_creation(), 42, "the server sees the client's creation");
+    assert_eq!(client.peer_creation(), SERVER_CREATION, "and vice versa");
 }

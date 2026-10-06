@@ -24,16 +24,20 @@
 //!   by [`crate::auth`]. The nonce comes from [`gen_challenge`].
 //! * **Established packets** are a distribution header followed by the control
 //!   body. Because `DFLAG_DIST_HDR_ATOM_CACHE`/`DFLAG_FRAGMENTS` are negotiated,
-//!   every outbound message carries a [`DistHeader`] — currently always the empty
-//!   header ([`DistHeader::empty`] ⇒ the exact bytes `131, 68, 0`), because the
-//!   *outbound* atom cache is not wired up (`beam_codec` never emits
-//!   `ATOM_CACHE_REF`/`NEW_CACHE`; see [`crate::atom_cache`]). A payload larger
+//!   every outbound message carries a [`DistHeader`]. [`Connection::send_control`]
+//!   routes every atom the control body references through the connection's
+//!   outbound atom cache ([`crate::atom_cache::OutboundAtomCache`]): each atom is
+//!   written as `ATOM_CACHE_REF` (`82`) + its header position, and the matching
+//!   [`DistHeader`] — carrying one [`crate::dist_header::AtomCacheRef`] per atom,
+//!   `New` the first time the connection sends it and `Cached` afterwards — is
+//!   emitted ahead of the body. A message with no atoms therefore carries the empty
+//!   header ([`DistHeader::empty`] ⇒ the exact bytes `131, 68, 0`). A payload larger
 //!   than [`DIST_FRAGMENT_SIZE`] is split into `'E'`/`'F'` fragment frames
-//!   ([`crate::fragment`]) when `DFLAG_FRAGMENTS` is negotiated. On receive a
-//!   normal `'D'` header, an `'E'`/`'F'` fragment sequence, or the pass-through
-//!   form (a lone `PASS_THROUGH` byte before the term stream) is accepted; the
-//!   decoded header is applied to the receive atom cache so that payload
-//!   `ATOM_CACHE_REF`s resolve.
+//!   ([`crate::fragment`]) when `DFLAG_FRAGMENTS` is negotiated (the header tail
+//!   rides in the `'E'` frame). On receive a normal `'D'` header, an `'E'`/`'F'`
+//!   fragment sequence, or the pass-through form (a lone `PASS_THROUGH` byte before
+//!   the term stream) is accepted; the decoded header is applied to the receive atom
+//!   cache so that payload `ATOM_CACHE_REF`s resolve.
 //!
 //! # The message term — the real `{DOP_*, …}` tuple wire form
 //!
@@ -84,9 +88,9 @@ use beam_codec::AtomEncoding;
 use beam_common::{BeamError, Result};
 use beam_term::{AtomTable, Eterm};
 
-use crate::atom_cache::ReceiveAtomCache;
+use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
-use crate::control::{decode_control, encode_control, ControlMessage};
+use crate::control::{decode_control, encode_control_cached, ControlMessage};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -232,11 +236,14 @@ pub struct Handshake {
     pub buffered: Option<Vec<u8>>,
 }
 
-/// The creation a [`connect_client`] link advertises.
+/// The default creation a [`connect_client`] link advertises.
 ///
-/// This API has no local node container, so the client's own creation is `0`; the
-/// *peer's* creation is reported in [`Handshake::peer_creation`].
-const CLIENT_CREATION: u32 = 0;
+/// This API has no local node container, so the client's own creation defaults to
+/// `0`; the *peer's* creation is reported in [`Handshake::peer_creation`]. A peer
+/// that negotiated `DFLAG_BIG_CREATION` may reject creation `0`, so
+/// [`connect_client_with_creation`] / [`Connection::client_with_creation`] accept an
+/// explicit creation instead.
+pub const CLIENT_CREATION: u32 = 0;
 
 /// Writes one 2-byte-framed handshake message and flushes.
 fn send_handshake<T: Transport>(transport: &mut T, body: &[u8]) -> Result<()> {
@@ -280,8 +287,25 @@ fn status_error(status: &Status) -> BeamError {
 /// `t` carries the 2-byte-framed handshake messages. On success the link is
 /// established: the peer's `Complement` (if any) has been consumed and any extra
 /// frame is returned in [`Handshake::buffered`].
+///
+/// The client advertises [`CLIENT_CREATION`] as its own creation; use
+/// [`connect_client_with_creation`] to advertise an explicit one.
 pub fn connect_client<T: Transport>(t: &mut T, our_name: &[u8], cookie: &[u8]) -> Result<Handshake> {
     connect_client_with(t, our_name, cookie, gen_challenge())
+}
+
+/// [`connect_client`] advertising an explicit node `creation`.
+///
+/// A peer with `DFLAG_BIG_CREATION` may reject [`CLIENT_CREATION`] (`0`); this entry
+/// point sends the given `creation` in the `Name` frame instead. Everything else is
+/// identical to [`connect_client`].
+pub fn connect_client_with_creation<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    creation: u32,
+) -> Result<Handshake> {
+    connect_client_core(t, our_name, cookie, gen_challenge(), creation)
 }
 
 /// [`connect_client`] with an explicit challenge nonce (the testable core).
@@ -291,11 +315,23 @@ fn connect_client_with<T: Transport>(
     cookie: &[u8],
     our_challenge: u32,
 ) -> Result<Handshake> {
+    connect_client_core(t, our_name, cookie, our_challenge, CLIENT_CREATION)
+}
+
+/// The connect/challenge client handshake with both knobs explicit: the challenge
+/// nonce (`our_challenge`) and the advertised creation (`creation`).
+fn connect_client_core<T: Transport>(
+    t: &mut T,
+    our_name: &[u8],
+    cookie: &[u8],
+    our_challenge: u32,
+    creation: u32,
+) -> Result<Handshake> {
     let our_flags = preferred_flags();
 
     // 1. Name.
     let body = encode_handshake(|w| {
-        Name { flags: our_flags, creation: CLIENT_CREATION, name: our_name.to_vec() }.encode(w)
+        Name { flags: our_flags, creation, name: our_name.to_vec() }.encode(w)
     })?;
     send_handshake(t, &body)?;
 
@@ -428,6 +464,9 @@ pub struct Connection<T: Transport> {
     fragments: FragmentAssembler,
     /// Applies inbound distribution headers so payload atom-cache refs resolve.
     recv_cache: ReceiveAtomCache,
+    /// Classifies outbound atoms and yields the distribution header's refs, so
+    /// payload atoms are written as `ATOM_CACHE_REF` (`82`).
+    outbound: OutboundAtomCache,
     /// The next fragment sequence id (never `0`: a real ERTS receiver reads `0`
     /// as "not fragmented").
     next_seq_id: u64,
@@ -439,9 +478,25 @@ pub struct Connection<T: Transport> {
 
 impl<T: Transport> Connection<T> {
     /// Connects to a peer and completes the handshake (client role).
+    ///
+    /// The client advertises [`CLIENT_CREATION`] as its own creation; use
+    /// [`Connection::client_with_creation`] to advertise an explicit one.
     pub fn client(transport: T, name: &[u8], cookie: &[u8]) -> Result<Connection<T>> {
+        Connection::client_with_creation(transport, name, cookie, CLIENT_CREATION)
+    }
+
+    /// [`Connection::client`] advertising an explicit node `creation`.
+    ///
+    /// A peer with `DFLAG_BIG_CREATION` may reject [`CLIENT_CREATION`] (`0`); this
+    /// constructor sends `creation` in the `Name` frame instead.
+    pub fn client_with_creation(
+        transport: T,
+        name: &[u8],
+        cookie: &[u8],
+        creation: u32,
+    ) -> Result<Connection<T>> {
         let mut transport = transport;
-        let handshake = connect_client(&mut transport, name, cookie)?;
+        let handshake = connect_client_with_creation(&mut transport, name, cookie, creation)?;
         Ok(Connection::from_handshake(transport, handshake))
     }
 
@@ -465,6 +520,7 @@ impl<T: Transport> Connection<T> {
             handshake,
             fragments: FragmentAssembler::new(),
             recv_cache: ReceiveAtomCache::new(),
+            outbound: OutboundAtomCache::new(),
             next_seq_id: 1,
             pending,
             ticks_answered: 0,
@@ -519,7 +575,7 @@ impl<T: Transport> Connection<T> {
     /// message term last — see [`Connection::send_message`]). They are encoded on
     /// the wire as the real ETF tuple `{DOP_*, …}` (see the module docs).
     pub fn send_control(&mut self, dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<()> {
-        let control = encode_control(dop, terms, atoms)?;
+        let control = encode_control_cached(dop, terms, atoms, Some(&mut self.outbound))?;
         self.send_payload(&control, atoms)
     }
 
@@ -568,11 +624,16 @@ impl<T: Transport> Connection<T> {
 
     /// Records the outbound payload, prepending the distribution header and
     /// fragmenting when needed.
+    ///
+    /// The header is the one the outbound atom cache accumulated while the payload
+    /// was encoded ([`OutboundAtomCache::take_header`] — which also starts the next
+    /// message); it carries a ref for every atom the payload wrote as
+    /// `ATOM_CACHE_REF` (`82`). A payload that referenced no atoms yields the empty
+    /// header (`131, 68, 0`).
     fn send_payload(&mut self, control: &[u8], atoms: &AtomTable) -> Result<()> {
-        // Only the empty header is emitted: the outbound atom cache is not wired
-        // up, so the message never carries refs.
+        let header = self.outbound.take_header();
         let mut sink = crate::transport::MemoryTransport::new();
-        DistHeader::empty().encode(&mut sink, atoms, ATOM_ENCODING)?;
+        header.encode(&mut sink, atoms, ATOM_ENCODING)?;
         let header = sink.into_written();
 
         let fragment = self.negotiated().contains(DistFlags::from_bits(DFLAG_FRAGMENTS))
@@ -653,8 +714,10 @@ pub const MAX_ESTABLISHED_PACKET_BODY: usize = MAX_PACKET_BODY;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::control::encode_control;
+    use crate::dist_header::AtomCacheRef;
     use crate::transport::MemoryTransport;
-    use beam_codec::{Encoder, SMALL_TUPLE_EXT};
+    use beam_codec::{AtomEncoding, Encoder, ATOM_CACHE_REF_EXT, SMALL_TUPLE_EXT};
     use beam_term::prelude::{make_atom, make_small, NIL};
 
     const COOKIE: &[u8] = b"a-test-cookie";
@@ -738,6 +801,25 @@ mod tests {
         assert_eq!(reply.challenge, our_challenge);
         assert_eq!(reply.digest, gen_digest(COOKIE, peer_challenge));
         assert_eq!(output.input_remaining(), 0);
+    }
+
+    #[test]
+    fn connect_client_with_creation_advertises_the_creation() {
+        // A peer that answers the `Name` with `Status::Ok` only. The handshake then
+        // fails for lack of further input, but the `Name` frame written first is on
+        // the wire for inspection (the nonce is random, so a scripted `ChallengeAck`
+        // cannot be precomputed).
+        let mut transport = MemoryTransport::with_input(framed(
+            &encoded(|w| Status::Ok.encode(w)),
+            HANDSHAKE_FRAMING,
+        ));
+        let outcome = connect_client_with_creation(&mut transport, CLIENT, COOKIE, 42);
+        assert!(outcome.is_err(), "a truncated script cannot complete the handshake");
+
+        let mut output = MemoryTransport::with_input(transport.into_written());
+        let name = Name::decode(&read_handshake_frame(&mut output)).unwrap();
+        assert_eq!(name.creation, 42, "the requested creation is advertised");
+        assert_eq!(name, Name { flags: preferred_flags(), creation: 42, name: CLIENT.to_vec() });
     }
 
     #[test]
@@ -941,6 +1023,114 @@ mod tests {
         assert_eq!(body[4], 3, "`{{DOP_LINK, A, B}}` has three elements");
         assert_eq!(body[5], beam_codec::SMALL_INTEGER_EXT, "the opcode is a small-integer term");
         assert_eq!(body[6], Dop::Link.as_u8());
+    }
+
+    #[test]
+    fn an_atom_free_message_still_emits_the_empty_header() {
+        // No atom in the body => no atom-cache ref => the exact bytes `131, 'D', 0`.
+        let atoms = AtomTable::new();
+        let mut conn = connection(Vec::new());
+        conn.send_control(Dop::Link, &[make_small(1), make_small(2)], &atoms).unwrap();
+
+        let mut written = MemoryTransport::with_input(conn.into_inner().into_written());
+        let body = read_packet(&mut written, ESTABLISHED_FRAMING).unwrap();
+        assert_eq!(&body[..3], &[beam_codec::VERSION_MAGIC, DIST_HEADER, 0]);
+    }
+
+    #[test]
+    fn the_outbound_atom_cache_round_trips_header_and_payload() {
+        // Real atoms, interned in a real table.
+        let mut atoms = AtomTable::new();
+        let from = make_atom(atoms.intern("from"));
+        let cookie = make_atom(atoms.intern("cookie"));
+        let to_name = make_atom(atoms.intern("to_name"));
+
+        // Encode `{DOP_REG_SEND, From, Cookie, ToName}` and read the emitted packet.
+        let mut sender = connection(Vec::new());
+        sender.send_control(Dop::RegSend, &[from, cookie, to_name], &atoms).unwrap();
+        let mut reader = MemoryTransport::with_input(sender.into_inner().into_written());
+        let body = read_packet(&mut reader, ESTABLISHED_FRAMING).unwrap();
+
+        // The header teaches one `New` ref per atom, in payload order.
+        let mut header_atoms = AtomTable::new();
+        let (header, offset) =
+            DistHeader::decode_tail(&body, 2, &mut header_atoms, AtomEncoding::Utf8).unwrap();
+        assert_eq!(header.refs.len(), 3);
+        assert!(
+            header.refs.iter().all(AtomCacheRef::is_new),
+            "the first message teaches every atom"
+        );
+        let ref_name = |r: &AtomCacheRef| match r {
+            AtomCacheRef::New { atom, .. } => header_atoms.name(*atom).unwrap().to_string(),
+            AtomCacheRef::Cached { .. } => panic!("expected a New ref"),
+        };
+        assert_eq!(
+            header.refs.iter().map(ref_name).collect::<Vec<_>>(),
+            vec!["from", "cookie", "to_name"],
+        );
+
+        // The payload writes `82, index` for each atom: tuple arity 4 (opcode + 3 args).
+        let payload = &body[offset..];
+        assert_eq!(
+            payload,
+            &[
+                SMALL_TUPLE_EXT,
+                4,
+                beam_codec::SMALL_INTEGER_EXT,
+                Dop::RegSend.as_u8(),
+                ATOM_CACHE_REF_EXT,
+                0,
+                ATOM_CACHE_REF_EXT,
+                1,
+                ATOM_CACHE_REF_EXT,
+                2,
+            ]
+        );
+
+        // Feed the exact bytes into a receiving `Connection`: header refs and
+        // payload indices agree iff each `82, n` resolves to header ref `n`.
+        let mut receiver = connection(framed(&body, ESTABLISHED_FRAMING));
+        let mut heap = Heap::new(64).unwrap();
+        let mut rx_atoms = AtomTable::new();
+        let msg = receiver.recv(&mut heap, &mut rx_atoms).unwrap();
+        assert_eq!(msg.dop, Dop::RegSend);
+        assert_eq!(
+            msg.terms,
+            vec![
+                make_atom(rx_atoms.lookup("from").unwrap()),
+                make_atom(rx_atoms.lookup("cookie").unwrap()),
+                make_atom(rx_atoms.lookup("to_name").unwrap()),
+            ]
+        );
+    }
+
+    #[test]
+    fn a_second_message_re_uses_cached_refs() {
+        let mut atoms = AtomTable::new();
+        let from = make_atom(atoms.intern("from"));
+        let to = make_atom(atoms.intern("to"));
+
+        let mut conn = connection(Vec::new());
+        conn.send_control(Dop::Link, &[from, to], &atoms).unwrap();
+        conn.send_control(Dop::Link, &[from, to], &atoms).unwrap();
+        let mut reader = MemoryTransport::with_input(conn.into_inner().into_written());
+        let first = read_packet(&mut reader, ESTABLISHED_FRAMING).unwrap();
+        let second = read_packet(&mut reader, ESTABLISHED_FRAMING).unwrap();
+
+        let mut scratch = AtomTable::new();
+        let (h1, _) = DistHeader::decode_tail(&first, 2, &mut scratch, AtomEncoding::Utf8).unwrap();
+        let (h2, _) =
+            DistHeader::decode_tail(&second, 2, &mut scratch, AtomEncoding::Utf8).unwrap();
+        assert_eq!(h1.refs.len(), 2);
+        assert!(h1.refs.iter().all(AtomCacheRef::is_new));
+        // The persistent cache survived `take_header`: the second message re-uses it.
+        assert_eq!(h2.refs.len(), 2);
+        assert!(h2.refs.iter().all(|r| !r.is_new()), "the second message must be cached-only");
+        assert_eq!(
+            h2.refs.iter().map(|r| (r.segment(), r.index())).collect::<Vec<_>>(),
+            h1.refs.iter().map(|r| (r.segment(), r.index())).collect::<Vec<_>>(),
+            "the cached refs address the slots the first message installed",
+        );
     }
     #[test]
     fn recv_decodes_a_normal_distribution_header_packet() {
