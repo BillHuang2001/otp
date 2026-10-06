@@ -231,8 +231,8 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   every other boxed object is `header_arity` plus the flatmap/HAMT extras, read through `beam_term`'s
   public accessors (`header_arity`, `is_map_header`, `is_flatmap_header`, `map_header_val`). The scan
   then walks the block word by word. It does **not** call `beam_term::size::size_object`: that is a
-  whole-graph size (it cannot size the single object the copier is looking at), and it under-reports
-  HAMT maps (see Known Gaps). The decision and the exact formulas live here so no agent re-derives them.
+  whole-graph size (it cannot size the single object the copier is looking at). The decision and the
+  exact formulas live here so no agent re-derives them.
 - **Root set = a flat `&mut [Eterm]`.** The C scans the whole stack *word by word* with no frame
   metadata (a word is a term iff its primary tag is BOXED/LIST and it points into a swept area —
   `erl_gc.c:1677-1717`), so a flat slice of root words (live x registers + live stack cells) is
