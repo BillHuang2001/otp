@@ -138,7 +138,12 @@ operators) and `<`/`>` between same-typed terms.
   former crate-private helper was removed).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
-### `hashing.rs` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
+### `hashing/` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
+Split by responsibility: `mod.rs` (module docs + the internal structural hash `term_hash` + its tests),
+`common.rs` (the low-level primitives shared by both ERTS ports: `HCONST*`/`FN*`, `mix32`/`mix3`,
+`uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`,
+the work-stack item types — all `pub(super)`), `make_hash2.rs` (the `make_hash2` port +
+`compute_record_definition_hash`), and `make_hash.rs` (the `make_hash` port + `hash_binary_bytes`).
 Two distinct surfaces live here:
 
 - **The pinned contract: `make_hash2`/`make_hash`.** Bit-exact u32-wrapping ports of
