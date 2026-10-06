@@ -13,6 +13,20 @@
 //! `[...]`, `<<...>>`, `#{}`), and every nesting step consumes one level; a
 //! negative depth is unlimited (`~w` passes `-1`).
 //!
+//! [`crate::io`] renders every directive to a [`Chunk`] and materializes those for
+//! `io_lib:format` (the deep list) or flattens them for `io:format` (the text).
+//! [`format_term`] is a test-only text shortcut over the same renderer.
+//!
+//! # Nested chunks
+//!
+//! Rendering builds a tree of [`Chunk`]s mirroring the **exact nested-list
+//! structure** the oracle's `io_lib`/`io_lib_pretty` produce (`write1/4`,
+//! `write_tuple/6`, `write_tail/4`, `write_map/4`, `write_binary/2`): a container
+//! is `[open, [e1, sep, e2, …], close]`, each element its own sub-list, each
+//! separator an individual integer. [`format_term`]/[`format_term_depth`] flatten
+//! the tree to text; `crate::io` materializes it as the deep list `io_lib:format`
+//! returns.
+//!
 //! # The `~p` printable-string rule
 //!
 //! With `printable = true` (the `~p`/`~P` directives) a **non-empty proper list
@@ -71,19 +85,96 @@ use crate::error::badarg;
 /// The depth value that disables depth limiting — `io_lib` passes `-1` for `~w`.
 pub(crate) const UNLIMITED_DEPTH: i64 = -1;
 
+/// A fragment of a rendering: the exact nested character-list structure the
+/// oracle's `io_lib`/`io_lib_pretty` build.
+///
+/// An `io_lib` "chars" value is a list whose elements are either single
+/// characters (small integers) or further lists: `Char` is one such element and
+/// `List` a sub-list element. `io:format` flattens the tree to text, while
+/// `io_lib:format` materializes it as the corresponding nested term (see
+/// `crate::io`).
+#[derive(Clone)]
+pub(crate) enum Chunk {
+    /// One character element — a single small integer in the output list.
+    Char(char),
+    /// A sub-list element.
+    List(Vec<Chunk>),
+}
+
+impl Chunk {
+    /// A flat character list (`"abc"` ⇒ the one element `[a, b, c]`).
+    pub(crate) fn text(text: &str) -> Chunk {
+        Chunk::List(text.chars().map(Chunk::Char).collect())
+    }
+
+    /// Appends the flattened text to `out`.
+    pub(crate) fn flatten_into(&self, out: &mut String) {
+        match self {
+            Chunk::Char(c) => out.push(*c),
+            Chunk::List(items) => {
+                for item in items {
+                    item.flatten_into(out);
+                }
+            }
+        }
+    }
+
+    /// The flat character count (`io_lib:chars_length/1`).
+    pub(crate) fn flat_len(&self) -> usize {
+        match self {
+            Chunk::Char(_) => 1,
+            Chunk::List(items) => items.iter().map(Chunk::flat_len).sum(),
+        }
+    }
+
+    /// The element list of a `Chunk::List`.
+    fn into_items(self) -> Vec<Chunk> {
+        match self {
+            Chunk::List(items) => items,
+            char => vec![char],
+        }
+    }
+
+    /// The first `n` characters as one flat sub-list (`flat_trunc/3`).
+    fn flat_trunc(&self, n: usize) -> Chunk {
+        let mut text = String::new();
+        self.flatten_into(&mut text);
+        Chunk::List(text.chars().take(n).map(Chunk::Char).collect())
+    }
+}
+
+/// Flattens a chunk sequence to its text.
+pub(crate) fn flatten(chunks: &[Chunk]) -> String {
+    let mut out = String::new();
+    for chunk in chunks {
+        chunk.flatten_into(&mut out);
+    }
+    out
+}
+
 /// Renders `term` the way the `~w` (`printable = false`) or `~p`
-/// (`printable = true`) directive does, with no depth limit.
+/// (`printable = true`) directive does, with no depth limit — the **text** form.
+///
+/// Test-only: `crate::io` renders its directives to [`Chunk`]s and flattens those
+/// itself, so this text shortcut is used by the assertions of this module and of
+/// `crate::lists` alone.
 ///
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a term outside the
 /// Milestone-1 printable set (see the module docs), or an atom whose index is not
 /// interned in `ctx`'s atom table.
-pub(crate) fn format_term(ctx: &mut BifContext<'_>, term: Eterm, printable: bool) -> Result<String> {
+#[cfg(test)]
+pub(crate) fn format_term(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+) -> Result<String> {
     format_term_depth(ctx, term, printable, UNLIMITED_DEPTH)
 }
 
-/// Renders `term` with an `io_lib:write/2` **depth** limit (`~W`/`~P`).
+/// Renders `term` with an `io_lib:write/2` **depth** limit (`~W`/`~P`); see
+/// [`format_term`].
 ///
 /// A negative `depth` is unlimited (see [`UNLIMITED_DEPTH`]); `0` renders `...`
 /// and `1` elides a container's contents.
@@ -91,17 +182,30 @@ pub(crate) fn format_term(ctx: &mut BifContext<'_>, term: Eterm, printable: bool
 /// # Errors
 ///
 /// As [`format_term`].
+#[cfg(test)]
 pub(crate) fn format_term_depth(
     ctx: &mut BifContext<'_>,
     term: Eterm,
     printable: bool,
     depth: i64,
 ) -> Result<String> {
-    let mut out = String::new();
-    render(ctx.atoms(), term, printable, depth, &mut out)?;
-    Ok(out)
+    Ok(flatten(&[term_chunk(ctx, term, printable, depth)?]))
 }
 
+/// Renders `term` as one element chunk (`io_lib:write1/4`, or
+/// `io_lib_pretty:write/1` when `printable`, the `~p` string rule).
+///
+/// # Errors
+///
+/// As [`format_term`].
+pub(crate) fn term_chunk(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    printable: bool,
+    depth: i64,
+) -> Result<Chunk> {
+    render_chunk(ctx.atoms(), term, printable, depth)
+}
 /// Collects `term` into its element vector iff it is a proper list.
 ///
 /// `NIL` yields `Some(vec![])`; a cons chain ending in anything but `NIL`, or a
@@ -121,70 +225,58 @@ pub(crate) fn proper_list(term: Eterm) -> Option<Vec<Eterm>> {
     }
 }
 
-/// Appends the rendering of `term` to `out` (`io_lib:write1/4`).
-fn render(
-    atoms: &AtomTable,
-    term: Eterm,
-    printable: bool,
-    depth: i64,
-    out: &mut String,
-) -> Result<()> {
+/// Renders `term` as one element chunk (`io_lib:write1/4` for `~w`, or
+/// `io_lib_pretty:write/1` for `~p`).
+fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
     if depth == 0 {
-        out.push_str("...");
-        return Ok(());
+        return Ok(Chunk::text("..."));
     }
     if is_small(term) {
-        out.push_str(&signed_value(term).to_string());
-        return Ok(());
+        return Ok(Chunk::text(&signed_value(term).to_string()));
     }
     if is_big(term) {
-        out.push_str(&format_big(term)?);
-        return Ok(());
+        return Ok(Chunk::text(&format_big(term)?));
     }
     if is_nil(term) {
-        out.push_str("[]");
-        return Ok(());
+        return Ok(Chunk::text("[]"));
     }
     if is_list(term) {
         if depth == 1 {
-            out.push_str("[...]");
-            return Ok(());
+            return Ok(Chunk::text("[...]"));
         }
         if printable {
             if let Some(bytes) = printable_string(term) {
-                push_quoted(out, &bytes);
-                return Ok(());
+                return Ok(Chunk::text(&quoted_string(&bytes)));
             }
         }
-        return render_list(atoms, term, printable, depth, out);
+        return render_list_chunk(atoms, term, printable, depth);
     }
     if is_tuple(term) {
         let arity = tuple_size(term);
         if arity == 0 {
-            out.push_str("{}");
-            return Ok(());
+            return Ok(Chunk::text("{}"));
         }
         if depth == 1 {
-            out.push_str("{...}");
-            return Ok(());
+            return Ok(Chunk::text("{...}"));
         }
-        out.push('{');
-        render(atoms, tuple_element(term, 0), printable, depth - 1, out)?;
-        render_tuple_rest(atoms, term, 1, depth - 1, printable, out)?;
-        out.push('}');
-        return Ok(());
+        let mut body: Vec<Chunk> = Vec::with_capacity(arity);
+        body.push(render_chunk(atoms, tuple_element(term, 0), printable, depth - 1)?);
+        render_tuple_rest_chunk(atoms, term, 1, depth - 1, printable, &mut body)?;
+        return Ok(Chunk::List(vec![
+            Chunk::Char('{'),
+            Chunk::List(body),
+            Chunk::Char('}'),
+        ]));
     }
     if is_atom(term) {
         let name = atoms.name(atom_val(term)).ok_or_else(badarg)?;
-        out.push_str(&format_atom(name));
-        return Ok(());
+        return Ok(Chunk::text(&format_atom(name)));
     }
     if is_float(term) {
-        out.push_str(&format_float(float_value(term)));
-        return Ok(());
+        return Ok(Chunk::text(&format_float(float_value(term))));
     }
     if bits::is_binary(term) {
-        return render_binary(term, printable, depth, out);
+        return render_binary_chunk(term, printable, depth);
     }
     if bits::is_bitstring(term) {
         // A non-byte-aligned bitstring: `crate::bits::bytes` cannot read it (see
@@ -192,137 +284,154 @@ fn render(
         return Err(badarg());
     }
     if is_map(term) {
-        return render_map(atoms, term, printable, depth, out);
+        return render_map_chunk(atoms, term, printable, depth);
     }
     if is_internal_pid(term) {
-        out.push_str(&format!("<0.{}.{}>", pid_number(term), pid_serial(term)));
-        return Ok(());
+        return Ok(Chunk::text(&format!(
+            "<0.{}.{}>",
+            pid_number(term),
+            pid_serial(term)
+        )));
     }
     if is_internal_ref(term) {
-        out.push_str(&format_ref(term)?);
-        return Ok(());
+        return Ok(Chunk::text(&format_ref(term)?));
     }
     Err(badarg())
 }
-
-/// Appends a list rendering (`[e1,e2]` / `[e1|tail]`), the caller having already
-/// handled depth `0`/`1` and the `~p` printable-string rule.
-fn render_list(
+/// Renders a list (`[e1,e2]` / `[e1|tail]`), the caller having already handled
+/// depth `0`/`1` and the `~p` printable-string rule (`io_lib:write1/4`).
+fn render_list_chunk(
     atoms: &AtomTable,
     term: Eterm,
     printable: bool,
     depth: i64,
-    out: &mut String,
-) -> Result<()> {
-    out.push('[');
-    render(atoms, car(term), printable, depth - 1, out)?;
-    render_tail(atoms, cdr(term), printable, depth - 1, out)?;
-    out.push(']');
-    Ok(())
+) -> Result<Chunk> {
+    let mut body: Vec<Chunk> = Vec::new();
+    body.push(render_chunk(atoms, car(term), printable, depth - 1)?);
+    render_tail_chunk(atoms, cdr(term), printable, depth - 1, &mut body)?;
+    Ok(Chunk::List(vec![
+        Chunk::Char('['),
+        Chunk::List(body),
+        Chunk::Char(']'),
+    ]))
 }
 
 /// Appends a list tail (`""`, `,e…` or `|tail`, `io_lib:write_tail/4`); the
 /// closing `]` is the caller's.
-fn render_tail(
+fn render_tail_chunk(
     atoms: &AtomTable,
     term: Eterm,
     printable: bool,
     depth: i64,
-    out: &mut String,
+    out: &mut Vec<Chunk>,
 ) -> Result<()> {
     if is_nil(term) {
         return Ok(());
     }
     if depth == 1 {
-        out.push_str("|...");
+        // `[$| | "..."]` — the four characters are spliced individually.
+        out.extend(['|', '.', '.', '.'].map(Chunk::Char));
         return Ok(());
     }
     if is_list(term) {
-        out.push(',');
-        render(atoms, car(term), printable, depth - 1, out)?;
-        return render_tail(atoms, cdr(term), printable, depth - 1, out);
+        out.push(Chunk::Char(','));
+        out.push(render_chunk(atoms, car(term), printable, depth - 1)?);
+        return render_tail_chunk(atoms, cdr(term), printable, depth - 1, out);
     }
-    out.push('|');
-    render(atoms, term, printable, depth - 1, out)
+    out.push(Chunk::Char('|'));
+    out.push(render_chunk(atoms, term, printable, depth - 1)?);
+    Ok(())
 }
 
 /// Appends the remaining tuple elements (`,e…` / `,...`), `io_lib:write_tuple/6`.
-fn render_tuple_rest(
+fn render_tuple_rest_chunk(
     atoms: &AtomTable,
     term: Eterm,
     index: usize,
     depth: i64,
     printable: bool,
-    out: &mut String,
+    out: &mut Vec<Chunk>,
 ) -> Result<()> {
     if index >= tuple_size(term) {
         return Ok(());
     }
     if depth == 1 {
-        out.push_str(",...");
+        out.extend([',', '.', '.', '.'].map(Chunk::Char));
         return Ok(());
     }
-    out.push(',');
-    render(atoms, tuple_element(term, index), printable, depth - 1, out)?;
-    render_tuple_rest(atoms, term, index + 1, depth - 1, printable, out)
+    out.push(Chunk::Char(','));
+    out.push(render_chunk(atoms, tuple_element(term, index), printable, depth - 1)?);
+    render_tuple_rest_chunk(atoms, term, index + 1, depth - 1, printable, out)
 }
-
-/// Appends a flat-map rendering (`#{k => v,…}`), `io_lib:write_map/4`.
-fn render_map(
+/// Renders a flat map (`#{k => v,…}`), `io_lib:write_map/4` /
+/// `io_lib_pretty:write/1` (both build `[#, {, [pair, …, pair], }]`).
+fn render_map_chunk(
     atoms: &AtomTable,
     term: Eterm,
     printable: bool,
     depth: i64,
-    out: &mut String,
-) -> Result<()> {
+) -> Result<Chunk> {
     if depth == 1 {
-        out.push_str("#{}");
-        return Ok(());
+        return Ok(Chunk::text("#{}"));
     }
     let (keys, values) = flatmap_pairs(term)?;
     let mut pairs: Vec<(Eterm, Eterm)> = keys.into_iter().zip(values).collect();
-    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, atoms));
-    out.push_str("#{");
     if pairs.is_empty() {
-        out.push('}');
-        return Ok(());
+        return Ok(Chunk::text("#{}"));
     }
+    pairs.sort_by(|a, b| flatmap_key_cmp(a.0, b.0, atoms));
     let inner = depth - 1;
-    render(atoms, pairs[0].0, printable, inner, out)?;
-    out.push_str(" => ");
-    render(atoms, pairs[0].1, printable, inner, out)?;
-    render_map_body(atoms, &pairs, 1, inner, inner, printable, out)?;
-    out.push('}');
-    Ok(())
+    let mut body: Vec<Chunk> = Vec::new();
+    body.push(map_pair_chunk(atoms, pairs[0], printable, inner)?);
+    render_map_body_chunk(atoms, &pairs, 1, inner, inner, printable, &mut body)?;
+    Ok(Chunk::List(vec![
+        Chunk::Char('#'),
+        Chunk::Char('{'),
+        Chunk::List(body),
+        Chunk::Char('}'),
+    ]))
 }
 
-/// Appends the remaining map pairs (`,k => v…` / `,...`), `io_lib:write_map_body/5`.
+/// Appends the remaining map pairs (`,k => v…` / `,...`),
+/// `io_lib:write_map_body/5`.
 ///
 /// `depth` starts at the first pair's inner depth and decreases per pair; `inner`
 /// is the (fixed) depth every key and value is rendered at.
-fn render_map_body(
+fn render_map_body_chunk(
     atoms: &AtomTable,
     pairs: &[(Eterm, Eterm)],
     index: usize,
     depth: i64,
     inner: i64,
     printable: bool,
-    out: &mut String,
+    out: &mut Vec<Chunk>,
 ) -> Result<()> {
     if depth == 1 {
-        out.push_str(",...");
+        out.extend([',', '.', '.', '.'].map(Chunk::Char));
         return Ok(());
     }
     if index >= pairs.len() {
         return Ok(());
     }
-    out.push(',');
-    render(atoms, pairs[index].0, printable, inner, out)?;
-    out.push_str(" => ");
-    render(atoms, pairs[index].1, printable, inner, out)?;
-    render_map_body(atoms, pairs, index + 1, depth - 1, inner, printable, out)
+    out.push(Chunk::Char(','));
+    out.push(map_pair_chunk(atoms, pairs[index], printable, inner)?);
+    render_map_body_chunk(atoms, pairs, index + 1, depth - 1, inner, printable, out)
 }
 
+/// Renders one map pair (`io_lib:write_map_assoc/4`): `[Key, " => ", Value]` —
+/// the four ` => ` characters are one sub-list element.
+fn map_pair_chunk(
+    atoms: &AtomTable,
+    pair: (Eterm, Eterm),
+    printable: bool,
+    depth: i64,
+) -> Result<Chunk> {
+    Ok(Chunk::List(vec![
+        render_chunk(atoms, pair.0, printable, depth)?,
+        Chunk::text(" => "),
+        render_chunk(atoms, pair.1, printable, depth)?,
+    ]))
+}
 /// The oracle's flatmap internal key order (`erts_cmp_flatmap_keys`): two atoms by
 /// their raw term word (atom index order), anything else by the exact term order.
 fn flatmap_key_cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering {
@@ -333,38 +442,185 @@ fn flatmap_key_cmp(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering
     }
 }
 
-/// Appends a binary rendering (`<<97,98,99>>` / `<<"abc">>` / `<<...>>`).
-fn render_binary(term: Eterm, printable: bool, depth: i64, out: &mut String) -> Result<()> {
-    let bytes = bits::bytes(term)?;
-    if bytes.is_empty() {
-        out.push_str("<<>>");
-        return Ok(());
-    }
-    if depth != 1 {
-        if printable {
-            if printable_bytes(&bytes) {
-                out.push_str("<<");
-                push_quoted(out, &bytes);
-                out.push_str(">>");
-                return Ok(());
-            }
+/// `io_lib_format:chars/2` — a deeply nested `lists:duplicate/2`.
+///
+/// `chars(C, N)` is `[]`/`[C]`/`[C,C]`/`[C,C,C]` for `N` in `0..=3`, else `[S|S]`
+/// (`S` = `chars(C, N/2)`) for even `N` and `[C,S|S]` for odd `N`, so a long run
+/// is a *tree* of sub-lists, not a flat list.
+pub(crate) fn dup_chars(c: char, n: usize) -> Chunk {
+    match n {
+        0 => Chunk::List(Vec::new()),
+        1 => Chunk::List(vec![Chunk::Char(c)]),
+        2 => Chunk::List(vec![Chunk::Char(c), Chunk::Char(c)]),
+        3 => {
+            Chunk::List(vec![Chunk::Char(c), Chunk::Char(c), Chunk::Char(c)])
+        }
+        n if n % 2 == 0 => {
+            let half = dup_chars(c, n / 2);
+            let mut items = vec![half.clone()];
+            items.extend(half.into_items());
+            Chunk::List(items)
+        }
+        n => {
+            let half = dup_chars(c, n / 2);
+            let mut items = vec![Chunk::Char(c), half.clone()];
+            items.extend(half.into_items());
+            Chunk::List(items)
         }
     }
-    out.push_str("<<");
+}
+
+/// `io_lib_format:adjust/3` — `[Data|Pad]` (left) / `[Pad|Data]` (right), or the
+/// data unchanged when the pad is the empty list.
+pub(crate) fn adjust_chunk(data: Chunk, pad: Chunk, left: bool) -> Chunk {
+    let pad_items = pad.into_items();
+    if pad_items.is_empty() {
+        return data;
+    }
+    let data_items = data.into_items();
+    if left {
+        let mut items = vec![Chunk::List(data_items)];
+        items.extend(pad_items);
+        Chunk::List(items)
+    } else {
+        let mut items = vec![Chunk::List(pad_items)];
+        items.extend(data_items);
+        Chunk::List(items)
+    }
+}
+
+/// `io_lib_format:term/6` — the field-width / truncation rule as a chunk.
+pub(crate) fn field_chunk(
+    body: Chunk,
+    width: Option<usize>,
+    left: bool,
+    precision: Option<usize>,
+    pad: u8,
+) -> Chunk {
+    let (field, precision) = match (width, precision) {
+        (None, None) => return body,
+        (None, Some(p)) => (p, p),
+        (Some(f), None) => (f, f),
+        (Some(f), Some(p)) => (f, p),
+    };
+    let length = body.flat_len();
+    let effective = length.min(precision.min(field));
+    if length > effective {
+        adjust_chunk(
+            dup_chars('*', effective),
+            dup_chars(pad as char, field - effective),
+            left,
+        )
+    } else {
+        adjust_chunk(body, dup_chars(pad as char, field - length), left)
+    }
+}
+
+/// `io_lib_format:string/6` — the `~s` field rule as a chunk.
+pub(crate) fn string_field_chunk(
+    s: Chunk,
+    width: Option<usize>,
+    left: bool,
+    precision: Option<usize>,
+    pad: u8,
+) -> Result<Chunk> {
+    match (width, precision) {
+        (None, None) => Ok(s),
+        (Some(f), None) => Ok(string_field(s, f, left, pad)),
+        (None, Some(p)) => Ok(string_field(s, p, true, pad)),
+        (Some(f), Some(p)) if f >= p => {
+            let n = s.flat_len();
+            if f > p {
+                if n > p {
+                    Ok(adjust_chunk(
+                        s.flat_trunc(p),
+                        dup_chars(pad as char, f - p),
+                        left,
+                    ))
+                } else if n < p {
+                    // `[S | chars(Pad, P-N)]`.
+                    let mut items = vec![s];
+                    items.extend(dup_chars(pad as char, p - n).into_items());
+                    Ok(adjust_chunk(
+                        Chunk::List(items),
+                        dup_chars(pad as char, f - p),
+                        left,
+                    ))
+                } else {
+                    Ok(adjust_chunk(s, dup_chars(pad as char, f - p), left))
+                }
+            } else {
+                Ok(string_field(s, f, left, pad))
+            }
+        }
+        _ => Err(badarg()),
+    }
+}
+
+/// `io_lib_format:string_field/6`.
+fn string_field(s: Chunk, f: usize, left: bool, pad: u8) -> Chunk {
+    let n = s.flat_len();
+    if n > f {
+        s.flat_trunc(f)
+    } else if n < f {
+        adjust_chunk(s, dup_chars(pad as char, f - n), left)
+    } else {
+        s
+    }
+}
+/// Renders a binary (`io_lib:write_binary/2` for `~w`,
+/// `io_lib_pretty:write/1` for `~p`).
+///
+/// The `~w` form is `[<, <, [digits, 44, digits, …], >, >]` (each byte its own
+/// sub-list, the separators individual integers; `[<, <, [], >, >]` for an empty
+/// binary, `[<, <, ["..."], >, >]` at depth 1). The `~p` form keeps the string
+/// leaf flat: `<<>>` / `<<...>>` / `<<"…">>`.
+fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
+    let bytes = bits::bytes(term)?;
+    if printable {
+        if bytes.is_empty() {
+            return Ok(Chunk::text("<<>>"));
+        }
+        if depth == 1 {
+            return Ok(Chunk::text("<<...>>"));
+        }
+        if printable_bytes(&bytes) {
+            return Ok(Chunk::List(vec![
+                Chunk::Char('<'),
+                Chunk::Char('<'),
+                Chunk::text(&quoted_string(&bytes)),
+                Chunk::Char('>'),
+                Chunk::Char('>'),
+            ]));
+        }
+    } else if bytes.is_empty() {
+        return Ok(Chunk::List(vec![
+            Chunk::Char('<'),
+            Chunk::Char('<'),
+            Chunk::List(Vec::new()),
+            Chunk::Char('>'),
+            Chunk::Char('>'),
+        ]));
+    }
+    let mut body: Vec<Chunk> = Vec::new();
     if depth == 1 {
-        out.push_str("...");
+        body.push(Chunk::text("..."));
     } else {
         for (i, byte) in bytes.iter().enumerate() {
             if i != 0 {
-                out.push(',');
+                body.push(Chunk::Char(','));
             }
-            out.push_str(&byte.to_string());
+            body.push(Chunk::text(&byte.to_string()));
         }
     }
-    out.push_str(">>");
-    Ok(())
+    Ok(Chunk::List(vec![
+        Chunk::Char('<'),
+        Chunk::Char('<'),
+        Chunk::List(body),
+        Chunk::Char('>'),
+        Chunk::Char('>'),
+    ]))
 }
-
 /// The byte values of `term` iff it is a non-empty proper list of small integers
 /// in `32..=126` (the `~p` printable-string rule).
 fn printable_string(term: Eterm) -> Option<Vec<u8>> {
@@ -394,8 +650,9 @@ fn printable_bytes(bytes: &[u8]) -> bool {
     !bytes.is_empty() && bytes.iter().all(|&b| (32..=126).contains(&b))
 }
 
-/// Appends `bytes` as a double-quoted string, escaping `"` and `\`.
-fn push_quoted(out: &mut String, bytes: &[u8]) {
+/// Renders `bytes` as a double-quoted string, escaping `"` and `\`.
+fn quoted_string(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() + 2);
     out.push('"');
     for &byte in bytes {
         let ch = byte as char;
@@ -405,8 +662,8 @@ fn push_quoted(out: &mut String, bytes: &[u8]) {
         out.push(ch);
     }
     out.push('"');
+    out
 }
-
 /// Renders a bignum in decimal (`erts_big_to_string(wobj, 10, …)`).
 ///
 /// The digits are read with the safe [`beam_codec::term::big_parts`] wrapper (the
