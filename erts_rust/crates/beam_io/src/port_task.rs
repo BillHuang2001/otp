@@ -187,6 +187,22 @@ impl PortTaskQueue {
         })
     }
 
+    /// Arms the single [`PortTaskKind::Timeout`] task at `deadline`, **replacing** any
+    /// deadline already armed for it.
+    ///
+    /// Unlike [`PortTaskQueue::enqueue_timeout`] — a no-op when a timer is already pending —
+    /// this re-points the pending timer, which is what re-arming from a driver's *declared*
+    /// deadline ([`crate::Driver::next_timeout`]) needs: the driver's latest declaration wins
+    /// rather than being dropped because an older timer is still queued.
+    pub fn arm_timeout(&mut self, deadline: Instant) {
+        self.tasks.retain(|task| task.kind != PortTaskKind::Timeout);
+        let _armed = self.push(PortTask {
+            kind: PortTaskKind::Timeout,
+            deadline: Some(deadline),
+            seq: u64::MAX,
+        });
+    }
+
     /// The shared enqueue path: dedupe by kind, then stamp the sequence number.
     fn push(&mut self, mut task: PortTask) -> bool {
         if self.contains(task.kind) {
@@ -475,6 +491,39 @@ mod tests {
             PortTaskKind::Input
         );
         assert!(queue.contains(PortTaskKind::Timeout), "the timer stays queued");
+    }
+
+    #[test]
+    fn arm_timeout_replaces_a_pending_deadline() {
+        let mut queue = PortTaskQueue::new();
+        let now = Instant::now();
+        let first = now + Duration::from_secs(1);
+        let second = now + Duration::from_secs(60);
+
+        queue.arm_timeout(first);
+        assert_eq!(queue.len(), 1);
+        assert!(queue.pop_next(now).is_none(), "not due yet");
+
+        // Re-pointing the *same* pending timer is the case `enqueue_timeout` cannot express:
+        // it is a no-op while a timer is pending, whereas `arm_timeout` replaces the deadline.
+        assert!(
+            !queue.enqueue_timeout(second),
+            "enqueue_timeout dedupes by kind"
+        );
+        queue.arm_timeout(second);
+        assert_eq!(queue.len(), 1, "still exactly one timer");
+
+        // The replacement deadline is honoured: the superseded `first` deadline passing must
+        // not fire the timer.
+        assert!(queue.pop_next(first + Duration::from_millis(1)).is_none());
+        assert_eq!(queue.len(), 1);
+
+        let task = queue
+            .pop_next(second)
+            .expect("due at the replacement deadline");
+        assert_eq!(task.kind(), PortTaskKind::Timeout);
+        assert_eq!(task.deadline(), Some(second));
+        assert!(queue.is_empty());
     }
 
     #[test]

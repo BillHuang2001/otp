@@ -16,12 +16,31 @@
 
 use std::collections::HashMap;
 use std::os::unix::io::RawFd;
+use std::time::Instant;
 
 use beam_common::Result;
 use beam_process::PortId;
 
 use crate::poller::{Interest, Poller, Token};
 use crate::queue::ByteQueue;
+
+/// Why a port is exiting, as reported to a driver through [`Driver::port_exit`].
+///
+/// This is a small, closed vocabulary — deliberately *not* an Erlang term — because it is the
+/// driver-facing reason for a port's exit, distinct from whatever an observer of the port sees.
+/// The runtime picks the variant that matches its exit path; a driver that does not care
+/// inherits the no-op default of [`Driver::port_exit`].
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum PortExitReason {
+    /// The port was closed on request (the reserved `close` control op or
+    /// [`crate::PortRegistry::close`]).
+    Closed,
+    /// The port's owning process exited, taking the port down with it.
+    OwnerExited,
+    /// The port terminated normally — the driver itself decided the port is done (its stream
+    /// ended, its peer closed, …).
+    Normal,
+}
 
 /// A bitset of driver capability flags.
 ///
@@ -251,6 +270,32 @@ pub trait Driver {
         Ok(Vec::new())
     }
 
+    /// Declares the deadline at which this driver next wants [`Driver::timeout`] to run.
+    ///
+    /// This is the driver-facing **timer-arming seam**: a driver that needs a port timer (an
+    /// idle timeout, a retransmit timer, a poll deadline, …) returns the instant it wants to
+    /// be woken at, and the port mirrors it into its single `TIMEOUT`
+    /// [port task](crate::PortTaskKind). The default (`None`) declares no deadline, so the
+    /// built-in `fd`/`efile`/`spawn` drivers are unaffected.
+    ///
+    /// # Contract
+    ///
+    /// * The port calls this **after every driver interaction** — [`Driver::start`],
+    ///   [`Driver::output`], [`Driver::ready_input`], [`Driver::ready_output`],
+    ///   [`Driver::control`] and [`Driver::timeout`] — so the declaration is re-read whenever
+    ///   the driver's needs may have changed.
+    /// * `Some(deadline)` arms (or **re-points**) the port's `TIMEOUT` task at exactly
+    ///   `deadline`; `None` **clears** any pending timer. The declaration is therefore
+    ///   authoritative: return `Some` for as long as a timer is wanted, and `None` to stop it.
+    /// * The deadline is a **lower bound**: the port task queue never hands a `TIMEOUT` task
+    ///   out before its deadline has passed, so [`Driver::timeout`] never runs early. It may
+    ///   run later (the runtime drives the task round).
+    /// * A driver that wants to re-arm from within [`Driver::timeout`] simply returns the next
+    ///   deadline the next time this is called (which the port does right after that call).
+    fn next_timeout(&self) -> Option<Instant> {
+        None
+    }
+
     /// Handles the expiry of a port timer; the default does nothing.
     ///
     /// # Errors
@@ -275,6 +320,36 @@ pub trait Driver {
     /// Returns a `beam_common::BeamError` when the underlying wait fails.
     fn take_exit_status(&mut self) -> Result<Option<i32>> {
         Ok(None)
+    }
+
+    /// Tells the driver its port is exiting, **before** [`Driver::stop`] tears it down.
+    ///
+    /// This is the driver-facing **port-exit notification channel**: on its port-exit path
+    /// (owner exit, an explicit close, a normal stream end) the runtime calls
+    /// [`crate::PortRegistry::notify_port_exit`], which forwards `reason` here. It is
+    /// deliberately distinct from [`Driver::stop`]: `port_exit` is an *advisory notification*
+    /// the driver may use to interrupt in-flight work, flush a final message or unblock
+    /// waiters, whereas `stop` is the mandatory resource teardown. A driver that does not need
+    /// it inherits the no-op default (so the built-in drivers are unaffected).
+    ///
+    /// # Contract
+    ///
+    /// * Delivery is **at most once** per port (see
+    ///   [`crate::PortRegistry::notify_port_exit`]); the port is still live and its
+    ///   registrations are still armed when this runs.
+    /// * `port_exit` and `stop` are **independent and both well-defined**: a `port_exit`
+    ///   followed by a later `stop` (or a `stop` with no preceding `port_exit`) is legal, and
+    ///   neither implies the other. A driver must therefore tolerate `stop` running whether or
+    ///   not it saw a `port_exit`.
+    /// * This must not be used to release OS resources; that is `stop`'s job.
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when the driver's exit handling fails; the failure
+    /// is reported to the caller and does **not** prevent a subsequent `stop`.
+    fn port_exit(&mut self, ctx: &mut DriverContext<'_>, reason: PortExitReason) -> Result<()> {
+        let _ = (ctx, reason);
+        Ok(())
     }
 
     /// Shuts the driver down, releasing its OS resources.
@@ -364,8 +439,11 @@ impl DriverRegistry {
 
 #[cfg(test)]
 mod tests {
-    use super::{DriverFlags, DriverRegistry};
-    use beam_common::BeamError;
+    use super::{Driver, DriverContext, DriverFlags, DriverRegistry, PortArms, PortExitReason};
+    use crate::poller::Poller;
+    use crate::queue::ByteQueue;
+    use beam_common::{BeamError, Result};
+    use beam_process::PortId;
 
     #[test]
     fn driver_flags_are_a_bitset() {
@@ -412,5 +490,82 @@ mod tests {
         assert_eq!(registry.names(), vec!["fd"]);
         assert!(registry.register("other", super::make_fd));
         assert_eq!(registry.names(), vec!["fd", "other"]);
+    }
+
+    /// A driver overriding only the required methods, to pin the additive defaults of
+    /// [`Driver::next_timeout`] and [`Driver::port_exit`].
+    struct MinimalDriver;
+
+    impl Driver for MinimalDriver {
+        fn name(&self) -> &str {
+            "minimal"
+        }
+
+        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_timer_and_port_exit_seams_default_to_no_ops() {
+        let mut poller = Poller::new().expect("a poll set");
+        let mut input = ByteQueue::new();
+        let mut output = ByteQueue::new();
+        let mut arms = PortArms::default();
+        let mut driver = MinimalDriver;
+
+        // A driver that declares nothing wants no timer.
+        assert!(driver.next_timeout().is_none());
+
+        // The default `port_exit` accepts (and ignores) every reason.
+        let mut ctx = DriverContext::new(
+            PortId::new(0),
+            &mut poller,
+            &mut input,
+            &mut output,
+            &mut arms,
+        );
+        for reason in [
+            PortExitReason::Closed,
+            PortExitReason::OwnerExited,
+            PortExitReason::Normal,
+        ] {
+            assert!(driver.port_exit(&mut ctx, reason).is_ok());
+        }
+    }
+
+    #[test]
+    fn port_exit_reason_is_a_closed_copyable_vocabulary() {
+        let all = [
+            PortExitReason::Closed,
+            PortExitReason::OwnerExited,
+            PortExitReason::Normal,
+        ];
+        for (i, a) in all.iter().enumerate() {
+            for (j, b) in all.iter().enumerate() {
+                assert_eq!(a == b, i == j);
+            }
+            // `Copy`: a by-value use does not move out of the array.
+            let copied: PortExitReason = *a;
+            assert_eq!(copied, *a);
+            // `Debug` is implemented (the format starts with the variant name).
+            assert!(
+                format!("{a:?}").starts_with("Closed")
+                    || format!("{a:?}").starts_with("OwnerExited")
+                    || format!("{a:?}").starts_with("Normal")
+            );
+        }
     }
 }
