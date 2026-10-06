@@ -21,7 +21,9 @@ Per case, each runtime is observed and compared field-by-field:
 5. **exception class + reason** — surfaced because `erl -noshell -eval` prints **nothing** on an uncaught error; the harness always wraps the expression in `try … catch` (see *Probe protocol*).
 6. **selected `erlang:system_info/1` keys** — covered by corpus cases (contract A.8).
 
-A Rust-side observation whose exit code is `3` (`runtime::UNSUPPORTED_EXIT_CODE`) is a documented **capability gap**, not a difference: it is classified `SideResult::Unsupported` carrying its first non-empty stderr line, so an unimplemented feature is `unsupported`, never a `mismatch`.
+A Rust-side observation is a documented **capability gap**, not a difference, in either of two ways — both classified `SideResult::Unsupported`, so an unimplemented feature is `unsupported`, never a `mismatch`:
+1. its exit code is `3` (`runtime::UNSUPPORTED_EXIT_CODE`): the reason carries the runtime's first non-empty stderr line; or
+2. a **probe-wrapped** (eval) case's probe *caught* the raise: the probe prints it as its single `exception <class> <reason>` stdout line and exits `1`, and `<reason>` (after stripping one pair of surrounding `'…'` quotes) follows the runtime's documented `unsupported` reason convention — the reason is recorded as `beam_rt: unsupported (caught by the probe): <stripped>`, stripped exactly as `beam_rt`'s `unsupported_reason` does. Detection is deliberately narrow (`harness::caught_unsupported_reason`): only the documented `unsupported` prefix (with a following `:`/`_`/whitespace, or nothing) triggers it, so a genuine Erlang reason (`badarg`, `system_limit`, `function_clause`, `'erlang:open_port/2 is not a BIF'`, …) stays an observation → `mismatch`. The gate is explicit: `RunPlan::probe_wrapped` is `true` only for `CaseKind::Eval`/`compare_expr` and `false` for module-run cases (whose stdout is `~w` of a result).
 
 ## Probe protocol (binding)
 An **expression** case carries a plain Erlang expression, wrapped into a self-terminating probe:
