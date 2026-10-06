@@ -5,7 +5,7 @@
 //!
 //! * the workspace **error strategy** — [`BeamError`] / [`Result`], plus the
 //!   term-independent BEAM exception machinery ([`Raise`], [`ExitReason`],
-//!   [`ExceptionClass`], [`StackTrace`]). Failure is *return-based*: there is no
+//!   [`ExceptionClass`], [`StackTrace`], [`LiveReason`]). Failure is *return-based*: there is no
 //!   `setjmp`/`longjmp`, no panic-as-control-flow and no silent swallowing. The engine
 //!   turns a [`BeamError`] into the actual raise by storing the exception tag in `x(0)`;
 //! * the OTP/ERTS **version constants** ([`OTP_VERSION`], [`ERTS_VERSION`],

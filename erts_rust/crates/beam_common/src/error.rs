@@ -8,14 +8,16 @@
 //! in `x(0)`.
 //!
 //! Everything in this module is **term-independent** — `beam_common` must not
-//! depend on `beam_term`, so a structured (tuple/list/map) reason is carried
-//! out-of-band by the raising crate and is represented here only by
-//! [`ExitReason::Structured`].
+//! depend on `beam_term`. A structured (tuple/list/map) reason is therefore
+//! represented here by [`ExitReason::Structured`], and its live term is carried
+//! out-of-band across the boundary in the opaque [`Raise::live_reason`] slot.
 
+use std::any::Any;
 use std::borrow::Cow;
 use std::error::Error;
 use std::fmt;
 use std::io;
+use std::sync::Arc;
 
 /// The workspace result type: [`BeamError`] as the single error type.
 ///
@@ -222,9 +224,9 @@ impl ExceptionClass {
 /// The well-known atoms of the runtime are modelled as dedicated variants
 /// (compare against [`as_atom`](ExitReason::as_atom)); any other atom is carried as
 /// [`Atom`](ExitReason::Atom). Reasons that are not atoms at all (tuples, lists,
-/// maps, …) are represented by [`Structured`](ExitReason::Structured) — the live
-/// term is owned by the raising crate, because `beam_common` has no term
-/// dependency.
+/// maps, …) are represented by [`Structured`](ExitReason::Structured): this enum
+/// holds no term, but the live reason term is carried alongside it in the
+/// [`Raise::live_reason`] slot by the raising crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 #[non_exhaustive]
 pub enum ExitReason {
@@ -242,7 +244,8 @@ pub enum ExitReason {
     Aborted,
     /// Any other atom reason.
     Atom(AtomName),
-    /// A non-atom (structured) reason; the live term is held by the raising crate.
+    /// A non-atom (structured) reason; the live term is carried alongside it in
+    /// [`Raise::live_reason`], because `beam_common` has no term dependency.
     Structured,
 }
 
@@ -300,8 +303,65 @@ impl fmt::Display for ExitReason {
     }
 }
 
-/// A complete BEAM exception: class, reason and (optionally) a stacktrace.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// An opaque handle to the **live reason term** of a BEAM exception.
+///
+/// `beam_common` is a dependency sink and must not depend on `beam_term`, so the
+/// term-independent [`ExitReason`] cannot itself hold a structured reason
+/// ([`ExitReason::Structured`] is a unit variant). The raising crate therefore
+/// stores its live reason *term* in this handle and attaches it to the [`Raise`]
+/// with [`with_live_reason`](Raise::with_live_reason); consumers recover the term
+/// with [`downcast_ref`](LiveReason::downcast_ref).
+///
+/// # Convention
+///
+/// The payload is the raising crate's live reason term: a crate that has a term
+/// representation stores its reason term there, and a consumer recovers it with
+/// `downcast_ref::<Eterm>()`. `beam_common` deliberately names no term type — the
+/// `Eterm` above is the payload type chosen by the adopter, not a type this crate
+/// depends on.
+///
+/// The payload is **out-of-band metadata**: it is ignored by [`Raise`]'s
+/// `PartialEq`/`Eq` and is never inspected by its `Debug` implementation.
+///
+/// The handle is `Clone` + `Send` + `Sync` (the payload lives behind an [`Arc`]),
+/// so a raise carrying it can be propagated and shared across threads.
+#[derive(Clone)]
+pub struct LiveReason(Arc<dyn Any + Send + Sync>);
+
+impl LiveReason {
+    /// Wraps `value` as an opaque live reason payload.
+    pub fn new<T: Any + Send + Sync + 'static>(value: T) -> Self {
+        Self(Arc::new(value))
+    }
+
+    /// Borrows the payload as `T`, or `None` when the payload holds a different
+    /// type.
+    pub fn downcast_ref<T: Any>(&self) -> Option<&T> {
+        self.0.downcast_ref::<T>()
+    }
+
+    /// Borrows the payload as a `&dyn Any` for further inspection.
+    pub fn as_any(&self) -> &dyn Any {
+        self.0.as_ref()
+    }
+}
+
+impl fmt::Debug for LiveReason {
+    /// Renders the placeholder `<live reason>`; the payload is never printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str("<live reason>")
+    }
+}
+
+/// A complete BEAM exception: class, reason, stacktrace and — for a structured
+/// reason — the live reason term.
+///
+/// Equality and `Debug` cover only the observable parts ([`class`](Raise::class),
+/// [`reason`](Raise::reason), [`stacktrace`](Raise::stacktrace)): the
+/// [`live_reason`](Raise::live_reason) payload is out-of-band metadata that
+/// [`ExitReason`] cannot compare, so a raise carrying a live term compares equal to
+/// the same raise without it.
+#[derive(Clone)]
 pub struct Raise {
     /// The class of the exception.
     pub class: ExceptionClass,
@@ -309,15 +369,19 @@ pub struct Raise {
     pub reason: ExitReason,
     /// The stacktrace captured at the raise point (empty if unavailable).
     pub stacktrace: StackTrace,
+    /// The live reason term, when the reason is structured (see [`LiveReason`]).
+    pub live_reason: Option<LiveReason>,
 }
 
 impl Raise {
-    /// Creates a raise of `class` with `reason` and an empty stacktrace.
+    /// Creates a raise of `class` with `reason`, an empty stacktrace and no live
+    /// reason.
     pub fn new(class: ExceptionClass, reason: ExitReason) -> Self {
         Self {
             class,
             reason,
             stacktrace: StackTrace::new(),
+            live_reason: None,
         }
     }
 
@@ -341,7 +405,46 @@ impl Raise {
         self.stacktrace = stacktrace;
         self
     }
+
+    /// Attaches the live reason term, returning the updated raise (builder style).
+    pub fn with_live_reason(mut self, live_reason: LiveReason) -> Self {
+        self.live_reason = Some(live_reason);
+        self
+    }
+
+    /// The live reason term, when the raise carries one.
+    pub fn live_reason(&self) -> Option<&LiveReason> {
+        self.live_reason.as_ref()
+    }
 }
+
+impl fmt::Debug for Raise {
+    /// Prints the observable parts and the placeholder `<live reason>` for the
+    /// opaque slot; the payload is never dereferenced or printed.
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Raise")
+            .field("class", &self.class)
+            .field("reason", &self.reason)
+            .field("stacktrace", &self.stacktrace)
+            .field(
+                "live_reason",
+                &self.live_reason.as_ref().map(|_| "<live reason>"),
+            )
+            .finish()
+    }
+}
+
+impl PartialEq for Raise {
+    /// Compares only the observable parts; the opaque [`live_reason`](Raise::live_reason)
+    /// payload is ignored.
+    fn eq(&self, other: &Self) -> bool {
+        self.class == other.class
+            && self.reason == other.reason
+            && self.stacktrace == other.stacktrace
+    }
+}
+
+impl Eq for Raise {}
 
 impl fmt::Display for Raise {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -711,5 +814,104 @@ mod tests {
         let cow: AtomName = Cow::Borrowed("cow").into();
         assert_eq!(cow.as_str(), "cow");
         assert_eq!(cow, AtomName::new(Cow::Owned(String::from("cow"))));
+    }
+
+    #[test]
+    fn live_reason_round_trips_and_type_tests() {
+        let number = LiveReason::new(7u64);
+        assert_eq!(number.downcast_ref::<u64>(), Some(&7));
+        assert!(number.downcast_ref::<String>().is_none());
+        assert!(number.as_any().is::<u64>());
+
+        let text = LiveReason::new(String::from("case_clause"));
+        assert_eq!(
+            text.downcast_ref::<String>().map(String::as_str),
+            Some("case_clause")
+        );
+        assert!(text.downcast_ref::<u64>().is_none());
+        assert!(text.as_any().is::<String>());
+    }
+
+    #[test]
+    fn raise_carries_live_reason_and_clone_preserves_it() {
+        assert!(Raise::error(ExitReason::Structured).live_reason().is_none());
+
+        let raise = Raise::error(ExitReason::Structured)
+            .with_live_reason(LiveReason::new(String::from("case_clause")));
+        assert_eq!(
+            raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<String>())
+                .map(String::as_str),
+            Some("case_clause")
+        );
+
+        let clone = raise.clone();
+        assert_eq!(
+            clone
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<String>())
+                .map(String::as_str),
+            Some("case_clause")
+        );
+        // Cloning shares the payload rather than copying it.
+        assert_eq!(
+            raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<String>()),
+            clone
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<String>())
+        );
+    }
+
+    #[test]
+    fn raise_equality_ignores_live_reason_but_keeps_observable_parts() {
+        let plain = Raise::error(ExitReason::Structured);
+        let with_slot =
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(1u64));
+        let other_slot =
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(2u64));
+        assert_eq!(plain, with_slot);
+        assert_eq!(with_slot, other_slot);
+
+        // The class still distinguishes.
+        assert_ne!(
+            Raise::error(ExitReason::Structured),
+            Raise::throw(ExitReason::Structured)
+        );
+        // The reason still distinguishes.
+        assert_ne!(
+            Raise::error(ExitReason::Normal),
+            Raise::error(ExitReason::Shutdown)
+        );
+        // The stacktrace still distinguishes.
+        assert_ne!(
+            Raise::throw(ExitReason::atom("boom")),
+            Raise::throw(ExitReason::atom("boom")).with_stacktrace(sample_stacktrace())
+        );
+    }
+
+    #[test]
+    fn raise_debug_hides_the_live_reason_and_display_is_unchanged() {
+        assert_eq!(format!("{:?}", LiveReason::new(1u64)), "<live reason>");
+
+        let raise = Raise::error(ExitReason::Structured)
+            .with_live_reason(LiveReason::new(String::from("secret-payload")));
+        let debug = format!("{raise:?}");
+        assert!(!debug.contains("secret-payload"));
+        assert!(debug.contains("<live reason>"));
+        assert!(debug.contains("Structured"));
+        assert_eq!(raise.to_string(), "error <structured reason>");
+    }
+
+    #[test]
+    fn structured_raise_with_live_reason_keeps_atom_behavior() {
+        let raise = Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(42u64));
+        assert_eq!(raise.reason.as_atom(), None);
+        let error = BeamError::Raise(raise);
+        assert!(error.is_raise());
+        assert_eq!(error.as_atom(), None);
+        assert_eq!(error.to_string(), "error <structured reason>");
     }
 }
