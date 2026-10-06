@@ -391,11 +391,10 @@ bytes in two fresh `erl` processes (demonstrated live by
 cross-implementation comparison is thus meaningful only for **non-atom** keys or an already-ordered
 flatmap; the live oracle cross-check in that file uses an integer-keyed corpus for this reason.
 
-Sorting inside `beam_codec` would be **wrong**: it breaks the byte-exact fixture
+Sorting inside `beam_codec` would be **wrong** — do not add one: it breaks the byte-exact fixture
 `tests/ground_truth.rs::literals_gen_server_decodes_with_its_export_funs` (a real `gen_server`
 literal pool whose map wire order is not this crate's atom-table index order) and the live
-`tests/interop.rs` harness. Verified by a throwaway experiment that sorted in `encode_map` — both
-tests fail; the change was reverted.
+`tests/interop.rs` harness.
 
 ## Term-layout ownership
 The boxed interior layout of floats, bignums, flatmaps and the external pid/port/ref blocks is owned
@@ -582,6 +581,17 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   still the sibling `../tools/differential/` harness. The same file also holds the pure,
   oracle-independent checks: a hand-built legacy `FLOAT_EXT` decode vector and the malformed-input
   cases (truncated tag, lying/oversized length, invalid-UTF-8 atom ⇒ typed `BeamError`, never a panic).
+- `tests/minor_version.rs` — the `{minor_version,0|1|2}` byte-exact goldens: `ATOM_EXT`(100) for
+  Latin-1 names of any length and the `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT` fallback for a
+  non-Latin-1 name, the 31-byte `FLOAT_EXT`(99) payloads, the unchanged `V2` default, and a **live**
+  `erl` cross-check over a mixed corpus (loud stderr skip when no oracle). See §Minor-version flavours.
+- `tests/compressed_decode.rs` — the top-level `COMPRESSED`(80) decode contract: the in-tree oracle
+  seed, wrapper transparency on a hand-built image, bytes after the zlib stream **and** after the
+  inner term ignored, the strict plain path, and the negative cases (bare/nested `80` below the
+  6-byte minimum, wrong declared size, over-cap size, truncated/corrupt zlib, non-zlib payload).
+- `tests/record_roundtrip.rs` — byte-exact `RECORD_EXT`(67) decode→re-encode in declaration order,
+  in **both** atom flavours (UTF-8 and `SMALL_ATOM_EXT` Latin-1), allocation-only-after-values, and a
+  live oracle check that the system `erl` accepts and reproduces our record images.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_codec`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../tools/`.
