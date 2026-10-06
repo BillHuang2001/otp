@@ -228,7 +228,7 @@ pub(crate) enum FloatFormat {
     Fixed,
     /// `{scientific, N}`: `%.*e`.
     Scientific,
-    /// `short`: Ryu's shortest round-trip (unsupported, see the module docs).
+    /// `short`: the shortest round-trip rendering (see [`format_short`]).
     Short,
 }
 
@@ -379,12 +379,270 @@ fn format_fixed(value: f64, decimals: i64, compact: bool) -> Result<String> {
     Ok(out)
 }
 
+/// Renders `value` for the `short` option the way `sys_double_to_chars_short`
+/// (`../../erts/emulator/sys/common/erl_float_short.cpp`) does: the shortest
+/// decimal that round-trips, written as `std::to_chars` writes it and then
+/// rewritten by hand into the oracle's form.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a rendering the
+/// oracle's buffer cannot hold (`do_float_to_charbuf` converts `to_chars`'s zero
+/// return into `badarg`). An `f64` never comes close to 255 characters, so this
+/// mirrors the C's guard rather than a reachable limit.
+fn format_short(value: f64) -> Result<String> {
+    let out = shorter(to_chars_general(value).into_bytes());
+    if out.len() > FLOAT_BUF_CHARS {
+        return Err(badarg());
+    }
+    Ok(out)
+}
+
+/// The rendering `std::to_chars(first, last, value)` (the shortest round-trip
+/// overload) produces: `f` or `e`, whichever is **shorter**, with the sign, no
+/// trailing `.0`, a `+` on a positive exponent and at least two exponent digits
+/// (`erl_float_short.cpp:45-51`).
+///
+/// Rust's `{:e}` already yields the shortest round-trip digits, so only the
+/// notation choice and the digit placement are added. Zero has no digits and is
+/// `0` / `-0`.
+fn to_chars_general(value: f64) -> String {
+    let sign = if value.is_sign_negative() { "-" } else { "" };
+    if value == 0.0 {
+        return format!("{sign}0");
+    }
+    let (digits, exponent) = shortest_digits(value.abs());
+    let fixed = digits_fixed(&digits, exponent);
+    let scientific = digits_scientific(&digits, exponent);
+    // `erl_float_short.cpp:45-51` forces the scientific form at and above 2^53
+    // (the same bound `sys_double_to_chars_fast` calls `MAX_FLOAT`), because
+    // `std::to_chars`'s fixed form would then be exact only by accident.
+    if value.abs() >= FIXED_FAST_MAX || scientific.len() < fixed.len() {
+        format!("{sign}{scientific}")
+    } else {
+        format!("{sign}{fixed}")
+    }
+}
+
+/// The shortest round-trip digits of a finite non-zero float and the decimal
+/// exponent of their leading digit (`0.1` ⇒ `("1", -1)`, `1200.0` ⇒ `("12", 3)`).
+///
+/// Rust's `{:e}` gives the shortest digits but rounds an exact tie *up*;
+/// `std::to_chars` is Ryu-based and rounds such a tie to the **even** digit
+/// (`256317133176956.125` ⇒ `…12`, where `{:e}` says `…13`), so a tie is
+/// corrected here.
+fn shortest_digits(value: f64) -> (String, i32) {
+    // `{:e}` renders `d[.ddd]e<exp>` with the shortest round-trip digits.
+    let rendered = format!("{value:e}");
+    let (mantissa, exponent) = rendered
+        .split_once('e')
+        .expect("`{:e}` renders an exponent");
+    let mut digits: String = mantissa.chars().filter(|ch| *ch != '.').collect();
+    let exponent = exponent.parse().expect("`{:e}` renders an integer exponent");
+    if tied_to_even(value, digits.len() as i32, exponent) {
+        // `{:e}` rounded the tie up, so its last digit is the larger of the two
+        // neighbours; the even one is kept (an already-even digit is unchanged).
+        let last = digits.pop().expect("a float has a digit");
+        let digit = last.to_digit(10).expect("a digit is decimal");
+        if digit % 2 == 1 {
+            digits.push(char::from_digit(digit - 1, 10).expect("a digit is decimal"));
+        } else {
+            digits.push(last);
+        }
+    }
+    (digits, exponent)
+}
+
+/// Whether `value`'s exact decimal expansion is precisely halfway between the
+/// two `digits`-long decimals around it — the case in which Ryu keeps the even
+/// last digit.
+///
+/// `value` is a dyadic rational `significand / 2^scale`, and the tie means
+/// `2 * value * 10^(digits - 1 - exponent)` is an *odd* integer (Ryu's
+/// `d2d` tie test): the power of two left over must be exactly zero.
+fn tied_to_even(value: f64, digits: i32, exponent: i32) -> bool {
+    let bits = value.to_bits();
+    let biased = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & 0x000f_ffff_ffff_ffff;
+    let (significand, scale) = if biased == 0 {
+        (fraction, 1074)
+    } else {
+        ((1 << 52) | fraction, 1075 - biased)
+    };
+    if scale <= 0 {
+        // An integral value has no fractional midpoint.
+        return false;
+    }
+    let shift = digits - 1 - exponent;
+    shift >= 0 && significand.trailing_zeros() as i32 + shift == scale - 1
+}
+
+/// The `f` notation of `digits`/`exponent` (no sign, no trailing `.0`).
+fn digits_fixed(digits: &str, exponent: i32) -> String {
+    let count = digits.len() as i32;
+    let mut out = String::with_capacity(digits.len() + exponent.unsigned_abs() as usize + 2);
+    if exponent >= count - 1 {
+        out.push_str(digits);
+        for _ in 0..(exponent + 1 - count) {
+            out.push('0');
+        }
+    } else if exponent >= 0 {
+        let (head, tail) = digits.split_at((exponent + 1) as usize);
+        out.push_str(head);
+        out.push('.');
+        out.push_str(tail);
+    } else {
+        out.push_str("0.");
+        for _ in 0..(-exponent - 1) {
+            out.push('0');
+        }
+        out.push_str(digits);
+    }
+    out
+}
+
+/// The `e` notation of `digits`/`exponent` (no sign, `+` kept, at least two
+/// exponent digits).
+fn digits_scientific(digits: &str, exponent: i32) -> String {
+    let mut out = String::with_capacity(digits.len() + 6);
+    out.push_str(&digits[..1]);
+    if digits.len() > 1 {
+        out.push('.');
+        out.push_str(&digits[1..]);
+    }
+    out.push('e');
+    if exponent < 0 {
+        out.push('-');
+    } else {
+        out.push('+');
+    }
+    let magnitude = exponent.unsigned_abs().to_string();
+    for _ in magnitude.len()..2 {
+        out.push('0');
+    }
+    out.push_str(&magnitude);
+    out
+}
+
+/// A faithful port of `sys_double_to_chars_short`'s string post-processing
+/// (`../../erts/emulator/sys/common/erl_float_short.cpp:76-189`): it turns a
+/// `std::to_chars` rendering into the `short` form — `1` ⇒ `1.0`, `1e+04` ⇒
+/// `1.0e4`, `1e-04` ⇒ `0.0001`, `1.2e+05` ⇒ `1.2e5`, `1000` ⇒ `1.0e3` — and it
+/// may flip between the fixed and scientific notations because the two differ in
+/// length once the corrections are applied.
+fn shorter(mut buf: Vec<u8>) -> String {
+    let start = usize::from(buf.first() == Some(&b'-'));
+    let mut end = buf.len();
+
+    if end - start <= 4 {
+        return fixed_form(&buf, start, end);
+    }
+
+    // `std::to_chars` writes the exponent, if any, as the last four or five
+    // characters (`e+05` / `e+308`), so that is where the `e` is looked for.
+    let mut science = end - 4;
+    if buf[science] != b'e' {
+        science -= 1;
+        if buf[science] != b'e' {
+            return fixed_form(&buf, start, end);
+        }
+    }
+
+    // Scientific form.
+    if science == start + 1 {
+        if &buf[science + 1..science + 4] == b"-04" {
+            // `Xe-04` ⇒ `0.000X` — the one exponent the oracle spells out in
+            // fixed notation.
+            let digit = buf[start];
+            buf.resize(start + 6, b'0');
+            buf[start..start + 5].copy_from_slice(b"0.000");
+            buf[start + 5] = digit;
+            end = start + 6;
+            return ascii(&buf[..end]);
+        }
+        // A one-digit significand gains the `.0` the oracle requires.
+        buf.splice(science..science, [b'.', b'0']);
+        science += 2;
+        end += 2;
+    }
+
+    // `X.XXe+0Y` ⇒ `X.XXeY`: drop the `+`, and a leading zero of the exponent.
+    let sign = science + 1;
+    let mut at = sign + 1;
+    if buf[at] == b'0' {
+        at += 1;
+    }
+    let from = if buf[sign] == b'-' { sign + 1 } else { sign };
+    if at > from {
+        buf.drain(from..at);
+        end -= at - from;
+    }
+    ascii(&buf[..end])
+}
+
+/// The fixed-notation half of `sys_double_to_chars_short`'s post-processing
+/// (including the `goto fixed` taken when the rendering has no short exponent).
+/// Every index below is inside `buf`, which makes the C's `ASSERT`s into the
+/// guards kept here.
+fn fixed_form(buf: &[u8], start: usize, end: usize) -> String {
+    let len = end - start;
+    let trailing_zeros = len > 3
+        && buf[end - 1] == b'0'
+        && buf[end - 2] == b'0'
+        && (len < 11 || buf[end - 3] == b'0');
+    if trailing_zeros {
+        // A trailing-zero run becomes scientific: `1000` ⇒ `1.0e3`,
+        // `12300` ⇒ `1.23e4`, `12345670000` ⇒ `1.234567e10`.
+        let exponent = len - 1;
+        let mut last = end - 3;
+        while buf[last] == b'0' {
+            last -= 1;
+        }
+        // `if (end == p) end++` in the C: keep one zero as the decimal.
+        let tail = if last == start { 1 } else { last - start };
+        let mut out = ascii(&buf[..start]);
+        out.push(char::from(buf[start]));
+        out.push('.');
+        out.push_str(&ascii(&buf[start + 1..start + 1 + tail]));
+        out.push('e');
+        debug_assert!(exponent < 100, "an `f64` integer form has < 100 digits");
+        out.push_str(&exponent.to_string());
+        out
+    } else if len >= 7 && buf[start..start + 5] == *b"0.000" {
+        // `0.000XXX` ⇒ `X.XXe-4` (the C asserts `end - p >= 7` and
+        // `p[5] != '0'`; the shortest-digit forms that reach here satisfy both).
+        let mut out = Vec::from(&buf[start..end]);
+        let digit = out[5];
+        out[0] = digit;
+        out[1] = b'.';
+        out.copy_within(6.., 2);
+        out.truncate(len - 1);
+        let at = out.len() - 3;
+        out[at..].copy_from_slice(b"e-4");
+        let mut text = ascii(&buf[..start]);
+        text.push_str(&ascii(&out));
+        text
+    } else if !buf[start..end].contains(&b'.') {
+        // An integer gains the `.0` the oracle requires.
+        let mut out = ascii(&buf[..end]);
+        out.push_str(".0");
+        out
+    } else {
+        ascii(&buf[..end])
+    }
+}
+
+/// The text of a `std::to_chars` byte buffer — always ASCII.
+fn ascii(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| char::from(*byte)).collect()
+}
+
 /// Renders `value` for `float_to_list/2` / `float_to_binary/2`.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for the unsupported
-/// `short` format or a rendering the oracle's buffer cannot hold.
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a rendering the
+/// oracle's buffer cannot hold.
 pub(crate) fn render_float(
     value: f64,
     format: FloatFormat,
@@ -394,7 +652,7 @@ pub(crate) fn render_float(
     match format {
         FloatFormat::Legacy | FloatFormat::Scientific => format_scientific(value, decimals),
         FloatFormat::Fixed => format_fixed(value, decimals, compact),
-        FloatFormat::Short => Err(badarg()),
+        FloatFormat::Short => format_short(value),
     }
 }
 
@@ -454,4 +712,36 @@ pub(crate) fn parse_float(text: &str) -> Result<f64> {
         return Err(badarg());
     }
     Ok(value)
+}
+
+#[cfg(test)]
+mod tmp_tests {
+    use super::format_short;
+
+    #[test]
+    fn tmp_short_golden_sweep() {
+        let Ok(path) = std::env::var("SHORT_GOLDEN") else {
+            return;
+        };
+        let text = std::fs::read_to_string(path).expect("golden file");
+        let mut checked = 0usize;
+        let mut bad = Vec::new();
+        for line in text.lines() {
+            let Some((bits, expected)) = line.split_once('|') else {
+                continue;
+            };
+            if bits.len() != 16 || !bits.bytes().all(|b| b.is_ascii_hexdigit()) {
+                continue;
+            }
+            let bits = u64::from_str_radix(bits, 16).expect("hex bits");
+            let value = f64::from_bits(bits);
+            let got = format_short(value).expect("renders");
+            checked += 1;
+            if got != expected && bad.len() < 25 {
+                bad.push(format!("{value:?} => got {got:?} want {expected:?}"));
+            }
+        }
+        eprintln!("checked {checked}");
+        assert!(bad.is_empty(), "{bad:#?}");
+    }
 }
