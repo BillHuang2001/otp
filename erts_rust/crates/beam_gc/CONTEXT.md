@@ -168,6 +168,27 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   unchanged — the new collectors are pure additions.
 - **`AnyCollector` only forwards.** The strategy-dispatch seam carries no collection logic, so neither
   strategy depends on the other; a test drives one corpus through either behind `collect`/`young`/`stats`.
+### Measured (the GenImmix gate)
+`tests/immix_measure.rs` drives one long-lived workload (128 one-line long-lived tuples = 8 full Immix
+blocks; 24 transients promoted, 16 dropped / 8 kept; 300 nursery garbage tuples) through a forced
+fullsweep under both strategies and reports the crate's own counters (`cargo test -p beam_gc --test
+immix_measure -- --nocapture`):
+
+| metric | Copying (`Collector`) | Immix (`GenImmixCollector`) |
+|---|---|---|
+| objects copied / evacuated | 136 | 8 |
+| words copied / evacuated | 400 | 128 (8 lines) |
+| objects pinned (left in place) | — | 128 (384 words / 128 lines) |
+| blocks reclaimed | — | 1 |
+| mature words reclaimed | — | 256 (16 lines) |
+| resident mature footprint | 400 words | 2176 line-words |
+
+Both strategies find the same 136-object live mature set (`evacuated + pinned == copied`). The mark-region
+path **moves 8 objects / 128 words** where the copying path re-copies **136 objects / 400 words** — the
+pinning win is real on long-lived data, so the option clears its gate for that regime. Honest caveat:
+line-granular allocation costs internal fragmentation (400 live words occupy 2176 resident line-words
+here), so the measured win is **movement, not footprint** — exactly the trade-off Part II §D flags as
+needing per-workload measurement. The option therefore stays **OFF by default** (`MatureKind::Copying`).
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
