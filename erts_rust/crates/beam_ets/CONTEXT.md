@@ -409,18 +409,22 @@ impl Table {
   `ets_continuation.rs` (the limit/continuation chaining, incl. a live-oracle cross-check),
   `match_spec_run.rs` (the table-independent runner with oracle cross-checks), sharing helpers from
   `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec compiler + arithmetic.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 77 cases
-  (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 94 cases
+  (group files `tests/differential/battery/{kind,keypos,navigation,counter,lookup,matchspec,replace,
+  continuation,info,large}.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
   table ids/`memory`/pids/floats/binaries never rendered). Coverage: all 4 kinds × 8 core ops,
   `{keypos,2}`, ordered navigation, `update_counter/3,4` + `update_element`, `take`/`lookup_element`,
-  the select/match family with guards, malformed specs, >10 000-key tables, and an `info`/option
-  group (name vs `named_table`, the `ets:info/2` option fields incl. the `private` concurrency
-  flags and unknown-key `badarg`, the fixed `heir`/`node`/`decentralized_counters` fields, the
-  multi-kind `lookup_element` list, and atomic `insert_list`). `KNOWN_DIVERGENCES` is empty. Without
-  `erl` the live-oracle test skips; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure (use it
-  in CI).
+  the select/match family with guards, malformed specs, >10 000-key tables, an `info`/option group
+  (name vs `named_table`, the `ets:info/2` option fields incl. the `private` concurrency flags and
+  unknown-key `badarg`, the fixed `heir`/`node`/`decentralized_counters` fields, the multi-kind
+  `lookup_element` list, atomic `insert_list`, and the ownership `give_away`/`heir`/`holder` cases),
+  plus `match_spec_run` (bindings, repeated vars, multi-clause, empty/`badarg`, body `EXIT`),
+  `select_replace` (small-int rewrite, arity-1 result, `bag`/changed-key `badarg`, identity) and the
+  limit/continuation chains (`select`/`match`/`match_object` `/3`+`/1`, `limit 0` `badarg`, empty
+  table). `KNOWN_DIVERGENCES` is empty. Without `erl` the live-oracle test skips;
+  `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into a failure (use it in CI).
 - **Gates (GREEN required):**
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_ets` and
   `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`.
