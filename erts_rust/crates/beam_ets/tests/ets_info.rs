@@ -155,6 +155,82 @@ fn private_tables_report_the_concurrency_flags_as_false() {
     assert!(!t.info().read_concurrency);
 }
 
+/// The `ets:info/1` field set is the oracle's: **15** fields, in the oracle's
+/// order (verified against the system `erl`, OTP 29 / erts-17.1, which returns
+/// the reverse of the C `fields[]` array in `erl_db.c`), for every kind.
+///
+/// Three of them are fixed by the runtime shape rather than the table: `heir` is
+/// always `none`, `node` is always `nonode@nohost`, and `decentralized_counters`
+/// is `true` iff the table is an `ordered_set` with `write_concurrency` on (the
+/// CATREE path) and `false` otherwise.
+#[test]
+fn entries_emits_the_oracle_field_set_in_order() {
+    /// The 15 `ets:info/1` fields, in the oracle's order.
+    const ORACLE_FIELDS: [&str; 15] = [
+        "id",
+        "decentralized_counters",
+        "read_concurrency",
+        "write_concurrency",
+        "compressed",
+        "memory",
+        "owner",
+        "heir",
+        "name",
+        "size",
+        "node",
+        "named_table",
+        "type",
+        "keypos",
+        "protection",
+    ];
+
+    let mut atoms = AtomTable::new();
+    let set = new_table(TableKind::Set);
+    let entries = set.info().entries(&mut atoms);
+
+    assert_eq!(entries.len(), ORACLE_FIELDS.len(), "the field count");
+    let names: Vec<&str> = entries
+        .iter()
+        .map(|(atom, _)| atoms.name(*atom).expect("every field atom is interned"))
+        .collect();
+    assert_eq!(names, ORACLE_FIELDS, "the ets:info/1 field order");
+
+    // The three fields this crate fixes from the runtime shape, on a plain `set`.
+    assert_eq!(
+        info_entry(&entries, &atoms, "heir"),
+        Some(make_atom(atoms.lookup("none").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "node"),
+        Some(make_atom(atoms.lookup("nonode@nohost").unwrap()))
+    );
+    assert_eq!(
+        info_entry(&entries, &atoms, "decentralized_counters"),
+        Some(make_atom(atoms.lookup("false").unwrap()))
+    );
+
+    // `decentralized_counters` is the CATREE path: a public `ordered_set` with
+    // `write_concurrency` reports `true` …
+    let mut opts = TableOptions::new();
+    opts.set_kind(TableKind::OrderedSet)
+        .set_access(Access::Public)
+        .set_write_concurrency(true);
+    let ordered_wc = Table::new(TableId::next(), opts).unwrap();
+    let ordered_wc_entries = ordered_wc.info().entries(&mut atoms);
+    assert_eq!(
+        info_entry(&ordered_wc_entries, &atoms, "decentralized_counters"),
+        Some(make_atom(atoms.lookup("true").unwrap()))
+    );
+
+    // … while an `ordered_set` without it reports `false`.
+    let plain_ordered = new_table(TableKind::OrderedSet);
+    let plain_ordered_entries = plain_ordered.info().entries(&mut atoms);
+    assert_eq!(
+        info_entry(&plain_ordered_entries, &atoms, "decentralized_counters"),
+        Some(make_atom(atoms.lookup("false").unwrap()))
+    );
+}
+
 #[test]
 fn table_id_next_returns_distinct_increasing_ids() {
     let first = TableId::next();
