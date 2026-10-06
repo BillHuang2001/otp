@@ -21,8 +21,8 @@ Re-exported at the crate root and via `beam_rt::prelude::*`.
 ### `runtime.rs` — the façade
 ```rust
 pub struct Runtime { /* config, registry, code_server, processes, mailboxes, preloaded, bif_heaps, scheduler,
-                        runner_state, arena, info_heap, eval_heap, tables, ports, self_pid, booted, halt,
-                        refs, references, eval_closures */ }
+                        runner_state, arena, info_heap, eval_heap, tables, ports, nifs, self_pid, booted,
+                        halt, refs, references, eval_closures */ }
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime>;
