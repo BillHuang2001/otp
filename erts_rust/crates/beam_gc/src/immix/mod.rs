@@ -74,9 +74,11 @@
 //!
 //! A request larger than [`BLOCK_WORDS`] claims a run of whole blocks starting at a block
 //! boundary (the classic Immix large-object path, simplified to whole blocks). Because a
-//! live object's marks cover *all* of its lines, every block such an object touches is
-//! `AllMarked`, so a large object is always pinned and its interior is never mistaken for
-//! a sequence of objects.
+//! live object's marks cover *all* of its lines and it always starts on a block boundary,
+//! the **first** block it occupies is entirely covered by its marks and is therefore
+//! `AllMarked`; a large object is thus always pinned — even when a later block it reaches
+//! is only partially covered — and its interior is never mistaken for a sequence of
+//! objects.
 //!
 //! # Module layout
 //!

@@ -143,7 +143,15 @@ pub(crate) unsafe fn for_each_ref<F>(
 where
     F: FnMut(*mut Eterm) -> Result<()>,
 {
-    let mut i = 1usize;
+    // Word 0 is the object's header, and it is the header that decides the payload
+    // layout: a transparent arityval is stepped over so its elements are visited one by
+    // one, while a fun's inlined descriptor and a map's untagged size/occupancy words are
+    // opaque and jumped over as a whole. Starting at the header (exactly what the
+    // `complete()` region walk does when it meets an object's header word) is what makes
+    // this the *per-object* form of that walk; starting at word 1 would read a fun's raw
+    // descriptor word (`uniq`/`index`) as if it were a term reference and, worse, would
+    // never visit the fun's real environment words.
+    let mut i = 0usize;
     while i < total {
         // SAFETY: `i < total`, so this word is inside the live `total`-word object.
         let word = unsafe { *ptr.add(i) };
