@@ -14,19 +14,22 @@
 //! and the native-record half of `is_record/2,3`
 //! (`../../erts/emulator/beam/erl_bif_op.c:293-350`).
 //!
-//! # Structured reasons collapse to `badarg`
+//! # Structured reasons carry their term
 //!
 //! WHERE the oracle raises a *structured* reason — `{badrecord, Term}`,
-//! `{badfield, {{Module, Name}, Key}}`, `{badmap, Map}` — this crate reports
-//! `error::badarg()`. That is the documented `beam_common::ExitReason::Structured`
-//! "has no term" convention (see the crate `CONTEXT.md`): the reason's payload is
-//! not representable, so a fake atom is never invented. The plain `badarg` cases
-//! (`badarg` in the oracle) are reproduced exactly.
+//! `{badfield, {{Module, Name}, Key}}`, `{badmap, Map}` — this crate raises the same
+//! tuple as the live reason term of an
+//! [`ExitReason::Structured`](beam_common::ExitReason::Structured) raise
+//! ([`error::structured_error`]; the payload rides the opaque
+//! [`Raise::live_reason`](beam_common::Raise::live_reason) slot, because
+//! `beam_common::ExitReason` holds no term). The plain `badarg` cases (`badarg` in the
+//! oracle: a missing field key, `records:get_module/1`/`get_name/1` of a non-record,
+//! malformed `create/4` options/fields) are reproduced exactly.
 //!
 //! Every BIF here is registered under the `records` module from [`register`], which
 //! [`crate::registry::BifRegistry::with_core_bifs`] calls.
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::compare::eq;
 use beam_term::{atom_val, AtomTable, Eterm};
 
@@ -47,12 +50,41 @@ fn atom_name_is(ctx: &BifContext<'_>, t: Eterm, name: &str) -> bool {
 
 /// The definition term of `term`, requiring `term` to be a native record.
 ///
-/// The oracle's `badrecord`-for-a-non-record collapse is [`error::badarg`].
+/// Both callers (`records:get_module/1`, `records:get_name/1`) answer the oracle's
+/// atom `badarg` for a non-record, which is what this reports. The introspection BIFs
+/// that raise the structured `{badrecord, Term}` use
+/// [`definition_or_badrecord`] instead.
 fn definition_of(term: Eterm) -> Result<Eterm> {
     if !access::is_record(term) {
         return Err(error::badarg());
     }
     access::native_record_definition(term)
+}
+
+/// As [`definition_of`], but raises the oracle's structured `error:{badrecord, Term}`
+/// for a non-record (`records:get_field_names/1`, `records:is_exported/1`).
+///
+/// Pinned by the oracle:
+/// `erl -noshell -eval 'try records:get_field_names(5) catch C:R ->
+/// io:format("~p:~p~n",[C,R]) end, halt().'` ⇒ `error:{badrecord,5}`; the same for
+/// `records:is_exported(5)`.
+fn definition_or_badrecord(ctx: &mut BifContext<'_>, term: Eterm) -> Result<Eterm> {
+    if !access::is_record(term) {
+        return Err(error::structured_error(ctx, "badrecord", &[term])?);
+    }
+    access::native_record_definition(term)
+}
+
+/// The oracle's `error:{badfield, {{Module, Name}, Key}}` — the reason of an update or
+/// create whose field key names no field of the record (or, for `create/4`, is not an
+/// atom at all). Pinned by the oracle:
+/// `erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+/// try records:update(R,m,r,#{zz=>9}) catch C:E -> io:format("~p:~p~n",[C,E]) end,
+/// halt().'` ⇒ `error:{badfield,{{m,r},zz}}` (with the record's own module/name, even
+/// when the caller passed the `'_'` wildcard).
+fn badfield(ctx: &mut BifContext<'_>, module: Eterm, name: Eterm, key: Eterm) -> Result<BeamError> {
+    let identifier = ctx.tuple(&[module, name])?;
+    error::structured_error(ctx, "badfield", &[identifier, key])
 }
 
 /// `records:get/2` (`records_get_2`, `erl_record.c:1247-1274`): a native record
@@ -85,18 +117,18 @@ fn get_name(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `records:get_field_names/1` (`records_get_field_names_1`,
 /// `erl_record.c:1298-1326`): the field names in **declaration** order; a
-/// non-record is `badrecord` (collapsed to `badarg`).
+/// non-record is the structured `error:{badrecord, Term}`.
 fn get_field_names(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let def = definition_of(args[0])?;
+    let def = definition_or_badrecord(ctx, args[0])?;
     let keys = access::native_record_declaration_keys(def)?;
     ctx.list(&keys)
 }
 
 /// `records:is_exported/1` (`records_is_exported_1`, `erl_record.c:1328-1340`):
-/// the definition's stored `true`/`false` atom; a non-record is `badrecord`
-/// (collapsed to `badarg`).
-fn is_exported(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let def = definition_of(args[0])?;
+/// the definition's stored `true`/`false` atom; a non-record is the structured
+/// `error:{badrecord, Term}`.
+fn is_exported(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let def = definition_or_badrecord(ctx, args[0])?;
     access::native_record_definition_is_exported(def)
 }
 
@@ -140,18 +172,27 @@ fn field_pairs(fields: Eterm) -> Result<Vec<(Eterm, Eterm)>> {
 ///
 /// # Errors
 ///
-/// `badarg` for a malformed module/name/opts/fields argument (the oracle's
-/// `{badrecord, _}`/`{badmap, _}`/`{badfield, _}` reasons all collapse to
-/// `badarg`; the oracle's plain `badarg` cases are reproduced as `badarg`).
+/// The oracle's own reasons, in its own check order (verified with
+/// `erl -noshell -eval 'try records:create(...) catch C:E -> io:format("~p:~p~n",[C,E])
+/// end, halt().'`):
+///
+/// * `{badrecord, Name}` for a non-atom `Module` or `Name`
+///   (`records:create(1, 2, [], #{is_exported=>true})` ⇒ `error:{badrecord,2}`);
+/// * `{badmap, Opts}` for a non-map `Opts` — checked **before** `Fields`
+///   (`records:create(m, r, 5, 5)` ⇒ `error:{badmap,5}`);
+/// * `{badfield, {{Module, Name}, Key}}` for a field key that is not an atom —
+///   checked **before** the duplicate-key scan
+///   (`records:create(m, r, [{a,1},{a,2},{1,3}], #{is_exported=>true})`
+///   ⇒ `error:{badfield,{{m,r},1}}`);
+/// * the plain atom `badarg` for everything else the oracle reports as `badarg`
+///   (a malformed `Opts` map, a malformed `Fields` list, a duplicate key).
 fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (module, name, fields, opts) = (args[0], args[1], args[2], args[3]);
     if !access::is_atom(module) || !access::is_atom(name) {
-        // `{badrecord, Name}` (collapsed).
-        return Err(error::badarg());
+        return Err(error::structured_error(ctx, "badrecord", &[name])?);
     }
     if !access::is_map(opts) {
-        // `{badmap, Opts}` (collapsed).
-        return Err(error::badarg());
+        return Err(error::structured_error(ctx, "badmap", &[opts])?);
     }
     // A flat map is the only map shape this crate builds/reads (see the crate
     // `CONTEXT.md`); a >32-entry (hash) map also fails the exactly-1 check.
@@ -165,6 +206,13 @@ fn create(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         _ => return Err(error::badarg()),
     };
     let pairs = field_pairs(fields)?;
+    // A non-atom key is `{badfield, {{Module, Name}, Key}}` and is checked before
+    // `beam_term::write_record`'s duplicate scan, exactly as the C does.
+    for &(key, _) in &pairs {
+        if !access::is_atom(key) {
+            return Err(badfield(ctx, module, name, key)?);
+        }
+    }
     access::native_record_write(
         ctx.heap(),
         atom_val(module),
@@ -199,15 +247,26 @@ fn update_value<'a>(
 ///
 /// # Errors
 ///
-/// `badarg` for a non-record, a module/name mismatch, a non-map `Updates`, or an
-/// unknown update key (structured reasons collapse). A >32-entry (hash) update
-/// map is [`error::system_limit`] — a typed gap (this crate builds/reads only flat
-/// maps), never a wrong result.
+/// The oracle's own reasons (verified with
+/// `erl -noshell -eval 'R = records:create(m,r,[{a,1}],#{is_exported=>true}),
+/// try records:update(...) catch C:E -> io:format("~p:~p~n",[C,E]) end, halt().'`):
+///
+/// * `{badrecord, Record}` for a non-`Record` first argument;
+/// * `{badrecord, Name}` for a non-atom or mismatching `Module`/`Name`
+///   (`records:update(R, other, r, #{a=>9})` ⇒ `error:{badrecord,r}`);
+/// * `{badmap, Updates}` for a non-map `Updates`;
+/// * `{badfield, {{Module, Name}, Key}}` for an update key naming no field — with the
+///   **record's own** module/name, even when the caller passed the `'_'` wildcard
+///   (`records:update(R, '_', '_', #{zz=>9})` ⇒ `error:{badfield,{{m,r},zz}}`). Which
+///   key is reported for several bad keys follows the update map's stored order (OTP
+///   documents map order as unspecified).
+///
+/// A >32-entry (hash) update map is [`error::system_limit`] — a typed gap (this crate
+/// builds/reads only flat maps), never a wrong result.
 fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (rec, module, name, updates) = (args[0], args[1], args[2], args[3]);
     if !access::is_record(rec) {
-        // `{badrecord, Record}` (collapsed).
-        return Err(error::badarg());
+        return Err(error::structured_error(ctx, "badrecord", &[rec])?);
     }
     let def = access::native_record_definition(rec)?;
     let rec_module = access::native_record_definition_module(def)?;
@@ -217,18 +276,15 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // `Name == '_'` skips the module/name check entirely (`records_update_4`).
     if !atom_name_is(ctx, name, "_") {
         if !access::is_atom(module) || !access::is_atom(name) {
-            // `{badrecord, Name}` (collapsed).
-            return Err(error::badarg());
+            return Err(error::structured_error(ctx, "badrecord", &[name])?);
         }
         if rec_module != module || rec_name != name {
-            // A record module/name mismatch is `{badrecord, Name}` (collapsed).
-            return Err(error::badarg());
+            return Err(error::structured_error(ctx, "badrecord", &[name])?);
         }
     }
 
     if !access::is_map(updates) {
-        // `{badmap, Updates}` (collapsed).
-        return Err(error::badarg());
+        return Err(error::structured_error(ctx, "badmap", &[updates])?);
     }
     if access::is_hashmap(updates) {
         // >32 update keys: a hash map, which this crate neither builds nor reads
@@ -244,8 +300,7 @@ fn update(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let keys = access::native_record_declaration_keys(def)?;
     for &update_key in &update_keys {
         if !keys.iter().any(|&key| eq(update_key, key, ctx.atoms())) {
-            // `{badfield, {{Module, Name}, Key}}` (collapsed).
-            return Err(error::badarg());
+            return Err(badfield(ctx, rec_module, rec_name, update_key)?);
         }
     }
 

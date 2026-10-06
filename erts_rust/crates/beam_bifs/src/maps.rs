@@ -27,8 +27,8 @@
 //! * `fold(Fun, Init, Map)` is `Acc = Fun(Key, Value, Acc)`; `filter(Pred, Map)`
 //!   keeps the pairs whose predicate returns `true`; `foreach(Fun, Map)` is called
 //!   for its side effects and returns `ok`.
-//! * A predicate result that is not a `true`/`false` atom is `badarg` (the oracle
-//!   reports `case_clause`).
+//! * A predicate result that is not a `true`/`false` atom is the oracle's
+//!   `error:{case_clause, Value}` (see the structured-reason section below).
 //! * The traversal order is the map's **stored** order (OTP documents map order as
 //!   unspecified; see the section below), so a `fold` that accumulates into a list
 //!   may order that list differently from the oracle.
@@ -46,19 +46,26 @@
 //! the OTP 29 oracle: `maps:is_key(1, #{1.0 => a})` ⇒ `false`, while
 //! `maps:get(1.0, #{1.0 => a})` ⇒ `a`.
 //!
+//! # Structured reasons carry their term
+//!
+//! A missing key or a non-map operand raises the *structured* reasons the oracle
+//! raises — `error:{badkey, Key}` (`maps:get/2`, `erlang:map_get/2`, `maps:update/3`)
+//! and `error:{badmap, Map}` (every BIF here whose map argument is not a map) — as an
+//! [`ExitReason::Structured`](beam_common::ExitReason::Structured) raise whose live
+//! reason term is that tuple ([`crate::error::structured_error`]).
+//! `beam_common::ExitReason` is term-independent, so the tuple itself travels in the
+//! opaque [`Raise::live_reason`](beam_common::Raise::live_reason) slot; the raise's
+//! `reason` stays `Structured` and `BeamError::as_atom` answers `None`.
+//!
+//! All *other* failure shapes match the oracle's *atoms* exactly: e.g.
+//! `maps:from_list/1` really does raise the atom `badarg` for a non-list or a
+//! malformed pair, and that is reproduced exactly. At the pinning oracle
+//! (`erl -noshell -eval 'try maps:get(a,1) catch C:R -> io:format("~p:~p~n",[C,R]) end, halt().'`)
+//! ⇒ `error:{badmap,1}`, and
+//! `... try maps:get(a,#{}) ...` ⇒ `error:{badkey,a}`.
+//!
 //! # Milestone-1 deviations (documented, never a silently wrong result)
 //!
-//! * **Missing key / non-map operand ⇒ `badarg`**
-//!   ([`BeamError::BadArg`](beam_common::BeamError::BadArg)). Real
-//!   ERTS raises the *structured* reasons `error:{badkey, Key}` (`maps:get/2`,
-//!   `erlang:map_get/2`, `maps:update/3`) and `error:{badmap, Map}` (every BIF here
-//!   whose map argument is not a map). `beam_common::ExitReason` carries a
-//!   non-atom reason only as `ExitReason::Structured`, which holds **no term**
-//!   (`beam_common` has no `beam_term` dependency — see the module docs of
-//!   [`crate::reason`]), so Milestone-1 cannot reproduce those terms and reports
-//!   the atom `badarg` instead. All *other* failure shapes match the oracle: e.g.
-//!   `maps:from_list/1` really does raise the atom `badarg` for a non-list or a
-//!   malformed pair, and that is reproduced exactly.
 //! * **A map with more than 32 pairs is `system_limit`**
 //!   ([`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)).
 //!   Every Milestone-1 map is a *flat* map, and `beam_term::thing::write_flatmap`
@@ -89,7 +96,7 @@ use beam_term::{atom_val, compare, AtomTable, Eterm};
 
 use crate::access;
 use crate::context::BifContext;
-use crate::error::{badarg, system_limit};
+use crate::error::{badarg, structured_error, system_limit};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -108,13 +115,15 @@ const MAP_SMALL_MAP_LIMIT: usize = 32;
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `term` is not a map (the oracle raises the structured
-/// `{badmap, Term}`, which Milestone-1 reports as `badarg` — see the module docs);
+/// The oracle's structured `error:{badmap, Term}` — an
+/// [`ExitReason::Structured`](beam_common::ExitReason::Structured) raise carrying the
+/// `{badmap, Term}` tuple as its live reason term — when `term` is not a map
+/// (oracle: `maps:get(a, 1)` ⇒ `error:{badmap,1}`);
 /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when `term` is a hashmap (a >32-pair map, which the
 /// Milestone-1 flat-map layer cannot represent).
-fn map_parts(term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
+fn map_parts(ctx: &mut BifContext<'_>, term: Eterm) -> Result<(Vec<Eterm>, Vec<Eterm>)> {
     if !access::is_map(term) {
-        return Err(badarg());
+        return Err(structured_error(ctx, "badmap", &[term])?);
     }
     if !access::is_flatmap(term) {
         // Only flat maps and hashmaps are `is_map`; this is the hashmap case.
@@ -151,7 +160,7 @@ fn build_map(ctx: &mut BifContext<'_>, keys: &[Eterm], values: &[Eterm]) -> Resu
 /// This is both `maps:to_list/1`'s result and the Milestone-1 iterator value (see
 /// the module docs).
 fn pair_list_of(ctx: &mut BifContext<'_>, map: Eterm) -> Result<Eterm> {
-    let (keys, values) = map_parts(map)?;
+    let (keys, values) = map_parts(ctx, map)?;
     let mut pairs = Vec::with_capacity(keys.len());
     for (k, v) in keys.iter().zip(values.iter()) {
         pairs.push(ctx.tuple(&[*k, *v])?);
@@ -235,13 +244,17 @@ fn to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map, or `Key` is absent (the oracle
-/// raises `{badkey, Key}` — see the module docs).
+/// A structured raise when `Map` is not a map (`error:{badmap, Map}`) or `Key` is
+/// absent (`error:{badkey, Key}`) — the oracle's own reasons, carried as the live
+/// reason term of the [`ExitReason::Structured`](beam_common::ExitReason::Structured)
+/// raise. Pinned by the oracle:
+/// `erl -noshell -eval 'try maps:get(a,1) catch C:R -> io:format("~p:~p~n",[C,R]) end, halt().'`
+/// ⇒ `error:{badmap,1}`; the same with `maps:get(a,#{})` ⇒ `error:{badkey,a}`.
 fn get_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     match find_key(ctx.atoms(), &keys, args[0]) {
         Some(i) => Ok(values[i]),
-        None => Err(badarg()),
+        None => Err(structured_error(ctx, "badkey", &[args[0]])?),
     }
 }
 
@@ -249,9 +262,10 @@ fn get_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise).
 fn get_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     match find_key(ctx.atoms(), &keys, args[0]) {
         Some(i) => Ok(values[i]),
         None => Ok(args[2]),
@@ -262,10 +276,11 @@ fn get_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise); an absent `Key` is not an error.
 fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let found = {
-        let (keys, values) = map_parts(args[1])?;
+        let (keys, values) = map_parts(ctx, args[1])?;
         find_key(ctx.atoms(), &keys, args[0]).map(|i| values[i])
     };
     match found {
@@ -281,11 +296,12 @@ fn find_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map;
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise);
 /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when
 /// inserting a 33rd key needs a hashmap.
 fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (mut keys, mut values) = map_parts(args[2])?;
+    let (mut keys, mut values) = map_parts(ctx, args[2])?;
     match find_key(ctx.atoms(), &keys, args[0]) {
         Some(i) => values[i] = args[1],
         None => {
@@ -298,20 +314,23 @@ fn put_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:update/3` — a new map with `Key`'s value replaced by `Value`.
 ///
-/// Unlike `put/3` this does **not** insert: a missing `Key` is `badarg` (the oracle
-/// raises `{badkey, Key}` — see the module docs).
+/// Unlike `put/3` this does **not** insert: a missing `Key` is the oracle's
+/// `error:{badkey, Key}` (the live reason term of the structured raise). Pinned by the
+/// oracle: `erl -noshell -eval 'try maps:update(a,1,#{}) catch C:R ->
+/// io:format("~p:~p~n",[C,R]) end, halt().'` ⇒ `error:{badkey,a}`.
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map or `Key` is absent.
+/// A structured raise when `Map` is not a map (`error:{badmap, Map}`) or `Key` is absent
+/// (`error:{badkey, Key}`).
 fn update_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, mut values) = map_parts(args[2])?;
+    let (keys, mut values) = map_parts(ctx, args[2])?;
     match find_key(ctx.atoms(), &keys, args[0]) {
         Some(i) => {
             values[i] = args[1];
             build_map(ctx, &keys, &values)
         }
-        None => Err(badarg()),
+        None => Err(structured_error(ctx, "badkey", &[args[0]])?),
     }
 }
 
@@ -319,9 +338,10 @@ fn update_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise).
 fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let removed = find_key(ctx.atoms(), &keys, args[0]);
     let mut out_keys = Vec::with_capacity(keys.len());
     let mut out_values = Vec::with_capacity(values.len());
@@ -342,11 +362,11 @@ fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map (the oracle raises the structured
-/// `{badmap, Map}` — see the module docs); [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) can only
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise); [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) can only
 /// arise from a hashmap operand (defensive).
 fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let Some(i) = find_key(ctx.atoms(), &keys, args[0]) else {
         return ctx.atom("error");
     };
@@ -389,19 +409,19 @@ fn from_keys_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `maps:keys/1` — the map's keys, in stored order.
 fn keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(args[0])?;
+    let (keys, _) = map_parts(ctx, args[0])?;
     ctx.list(&keys)
 }
 
 /// `maps:values/1` — the map's values, in stored order.
 fn values_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (_, values) = map_parts(args[0])?;
+    let (_, values) = map_parts(ctx, args[0])?;
     ctx.list(&values)
 }
 
 /// `maps:size/1` and `erlang:map_size/1` — the number of pairs.
 fn size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(args[0])?;
+    let (keys, _) = map_parts(ctx, args[0])?;
     ctx.int(keys.len() as i64)
 }
 
@@ -409,9 +429,10 @@ fn size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map.
+/// The oracle's structured `error:{badmap, Map}` when `Map` is not a map (the live
+/// reason term of the raise).
 fn is_key_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (keys, _) = map_parts(args[1])?;
+    let (keys, _) = map_parts(ctx, args[1])?;
     let present = find_key(ctx.atoms(), &keys, args[0]).is_some();
     ctx.boolean(present)
 }
@@ -420,11 +441,12 @@ fn is_key_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when either argument is not a map;
+/// The oracle's structured `error:{badmap, Map}` naming whichever argument is not a map
+/// (the live reason term of the raise);
 /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when the union needs a hashmap (>32 pairs).
 fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let (mut keys, mut values) = map_parts(args[0])?;
-    let (keys2, values2) = map_parts(args[1])?;
+    let (mut keys, mut values) = map_parts(ctx, args[0])?;
+    let (keys2, values2) = map_parts(ctx, args[1])?;
     for (&k, &v) in keys2.iter().zip(values2.iter()) {
         match find_key(ctx.atoms(), &keys, k) {
             Some(i) => values[i] = v,
@@ -441,10 +463,11 @@ fn merge_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list or `Map` is not a map.
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's atom
+/// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
 fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let wanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let (out_keys, out_values) = selected_pairs(ctx.atoms(), &keys, &values, &wanted);
     build_map(ctx, &out_keys, &out_values)
 }
@@ -453,10 +476,11 @@ fn with_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list or `Map` is not a map.
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's atom
+/// `badarg`); the oracle's structured `error:{badmap, Map}` when `Map` is not a map.
 fn without_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unwanted = proper_list(args[0]).ok_or_else(badarg)?;
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let mut out_keys = Vec::new();
     let mut out_values = Vec::new();
     for (&k, &v) in keys.iter().zip(values.iter()) {
@@ -512,18 +536,22 @@ fn next_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // The `fun`-taking BIFs (via the `FunCaller` seam)
 // ---------------------------------------------------------------------------
 
-/// The boolean value of a `true`/`false` **atom** predicate result, else `badarg`.
+/// The boolean value of a `true`/`false` **atom** predicate result, else the oracle's
+/// `error:{case_clause, Value}`.
 ///
 /// `maps:filter/2` reads its predicate through the oracle's `case Pred(K, V) of
-/// true -> …; false -> … end`, so a non-boolean is an error and not a truthy value
-/// (the oracle reports `case_clause`; Milestone-1 reports `badarg`).
-fn predicate_holds(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
+/// true -> …; false -> … end`, so a non-boolean is an error and not a truthy value.
+/// The reason is the structured `{case_clause, Value}` (the live reason term of the
+/// raise). Pinned by the oracle:
+/// `erl -noshell -eval 'try maps:filter(fun(_,_) -> 5 end, #{a => 1}) catch C:R ->
+/// io:format("~p:~p~n",[C,R]) end, halt().'` ⇒ `error:{case_clause,5}`.
+fn predicate_holds(ctx: &mut BifContext<'_>, result: Eterm) -> Result<bool> {
     if is_atom_named(ctx, result, "true") {
         Ok(true)
     } else if is_atom_named(ctx, result, "false") {
         Ok(false)
     } else {
-        Err(badarg())
+        Err(structured_error(ctx, "case_clause", &[result])?)
     }
 }
 
@@ -534,7 +562,7 @@ fn predicate_holds(ctx: &BifContext<'_>, result: Eterm) -> Result<bool> {
 /// like every other map producer here.
 fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let mut mapped = Vec::with_capacity(values.len());
     for (&key, &value) in keys.iter().zip(values.iter()) {
         mapped.push(ctx.call_fun(fun, &[key, value])?);
@@ -546,7 +574,7 @@ fn map_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut acc = args[1];
-    let (keys, values) = map_parts(args[2])?;
+    let (keys, values) = map_parts(ctx, args[2])?;
     for (&key, &value) in keys.iter().zip(values.iter()) {
         acc = ctx.call_fun(fun, &[key, value, acc])?;
     }
@@ -556,7 +584,7 @@ fn fold_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `maps:filter(Pred, Map)` — the `{Key, Value}` pairs whose predicate is `true`.
 fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     let mut kept_keys = Vec::new();
     let mut kept_values = Vec::new();
     for (&key, &value) in keys.iter().zip(values.iter()) {
@@ -572,7 +600,7 @@ fn filter_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `maps:foreach(Fun, Map)` — `Fun(Key, Value)` for its side effects; `ok`.
 fn foreach_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let (keys, values) = map_parts(args[1])?;
+    let (keys, values) = map_parts(ctx, args[1])?;
     for (&key, &value) in keys.iter().zip(values.iter()) {
         ctx.call_fun(fun, &[key, value])?;
     }
@@ -627,7 +655,10 @@ mod tests {
 
     fn atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        atoms.seed(["true", "false", "ok", "error", "none", "a", "b", "c"]);
+        atoms.seed([
+            "true", "false", "ok", "error", "none", "a", "b", "c", "badmap", "badkey",
+            "case_clause",
+        ]);
         atoms
     }
 
@@ -636,6 +667,42 @@ mod tests {
         let atoms = atoms();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         f(&mut ctx)
+    }
+
+    /// Asserts that `result` is the oracle's `error:{Tag, Value}` **structured** raise:
+    /// the class is `error`, the reason is `ExitReason::Structured` (so
+    /// `BeamError::as_atom` is `None`) and the live reason term is the 2-tuple
+    /// `{Tag, Value}`.
+    #[track_caller]
+    fn assert_structured(
+        result: Result<Eterm>,
+        ctx: &BifContext<'_>,
+        tag: &str,
+        value: Eterm,
+    ) {
+        match result {
+            Err(BeamError::Raise(raise)) => {
+                assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+                assert_eq!(raise.reason, beam_common::ExitReason::Structured);
+                assert_eq!(raise.reason.as_atom(), None);
+                let term = *raise
+                    .live_reason()
+                    .expect("a structured reason carries its live term")
+                    .downcast_ref::<Eterm>()
+                    .expect("the payload is the live reason term");
+                assert_eq!(access::tuple_size(term), 2, "{tag} reason arity");
+                assert_eq!(
+                    access::tuple_element(term, 0),
+                    ctx.atom(tag).expect("a seeded tag atom"),
+                    "{tag} reason tag"
+                );
+                assert!(
+                    compare::eq(access::tuple_element(term, 1), value, ctx.atoms()),
+                    "{tag} reason value"
+                );
+            }
+            other => panic!("expected the structured {tag} raise, got {other:?}"),
+        }
     }
 
     /// A flat map with `pairs` on the context heap.
@@ -745,18 +812,22 @@ mod tests {
             let m = map(ctx, &[(one, two)]);
 
             assert_eq!(get_2(ctx, &[one, m]).unwrap(), two);
-            // A missing key is `badarg` (the oracle's `{badkey, 1}` — see module docs).
-            assert!(matches!(get_2(ctx, &[make_small(9), m]), Err(BeamError::BadArg)));
+            // A missing key is the oracle's `error:{badkey, 9}`.
+            //   erl -noshell -eval 'try maps:get(9,#{1=>2}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,9}
+            let miss = get_2(ctx, &[make_small(9), m]);
+            assert_structured(miss, ctx, "badkey", make_small(9));
             // `get/3` returns the default on a miss.
             assert_eq!(get_3(ctx, &[make_small(9), m, make_small(7)]).unwrap(), make_small(7));
             assert_eq!(get_3(ctx, &[one, m, make_small(7)]).unwrap(), two);
 
-            // A non-map second argument is `badarg`.
-            assert!(matches!(get_2(ctx, &[one, make_small(9)]), Err(BeamError::BadArg)));
-            assert!(matches!(
-                get_3(ctx, &[one, make_small(9), make_small(7)]),
-                Err(BeamError::BadArg)
-            ));
+            // A non-map second argument is the oracle's `error:{badmap, 9}`.
+            //   erl -noshell -eval 'try maps:get(1,9) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
+            let bad_map = get_2(ctx, &[one, make_small(9)]);
+            assert_structured(bad_map, ctx, "badmap", make_small(9));
+            let bad_map_3 = get_3(ctx, &[one, make_small(9), make_small(7)]);
+            assert_structured(bad_map_3, ctx, "badmap", make_small(9));
         });
     }
 
@@ -769,9 +840,13 @@ mod tests {
             let m = map(ctx, &[(float_one, a)]);
 
             assert_eq!(get_2(ctx, &[float_one, m]).unwrap(), a);
-            // `1` is not the key `1.0`.
-            assert!(matches!(get_2(ctx, &[one, m]), Err(BeamError::BadArg)));
-            assert!(matches!(update_3(ctx, &[one, a, m]), Err(BeamError::BadArg)));
+            // `1` is not the key `1.0`: both miss with the oracle's `error:{badkey, 1}`.
+            //   erl -noshell -eval 'try maps:update(1,a,#{1.0=>a}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,1}
+            let miss = get_2(ctx, &[one, m]);
+            assert_structured(miss, ctx, "badkey", one);
+            let miss_update = update_3(ctx, &[one, a, m]);
+            assert_structured(miss_update, ctx, "badkey", one);
             assert_eq!(is_key_2(ctx, &[one, m]).unwrap(), ctx.boolean(false).unwrap());
             assert_eq!(is_key_2(ctx, &[float_one, m]).unwrap(), ctx.boolean(true).unwrap());
             // `put(1, ...)` adds a second, distinct key.
@@ -795,7 +870,11 @@ mod tests {
             let miss = find_2(ctx, &[make_small(9), m]).unwrap();
             assert!(is_atom_named(ctx, miss, "error"));
 
-            assert!(matches!(find_2(ctx, &[one, make_small(9)]), Err(BeamError::BadArg)));
+            // A non-map operand is the oracle's `error:{badmap, 9}`.
+            //   erl -noshell -eval 'try maps:find(1,9) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
+            let bad_map = find_2(ctx, &[one, make_small(9)]);
+            assert_structured(bad_map, ctx, "badmap", make_small(9));
         });
     }
 
@@ -817,7 +896,11 @@ mod tests {
             assert_eq!(keys_of(inserted), vec![one, nine]);
             assert_eq!(values_of(inserted), vec![two, one]);
 
-            assert!(matches!(put_3(ctx, &[one, two, nine]), Err(BeamError::BadArg)));
+            // A non-map third argument is the oracle's `error:{badmap, 9}`.
+            //   erl -noshell -eval 'try maps:put(1,2,9) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
+            let bad_map = put_3(ctx, &[one, two, nine]);
+            assert_structured(bad_map, ctx, "badmap", nine);
         });
     }
 
@@ -833,9 +916,13 @@ mod tests {
             assert_eq!(keys_of(updated), vec![one]);
             assert_eq!(values_of(updated), vec![nine]);
 
-            // It does not insert: a missing key is `badarg`.
-            assert!(matches!(update_3(ctx, &[nine, one, m]), Err(BeamError::BadArg)));
-            assert!(matches!(update_3(ctx, &[one, one, nine]), Err(BeamError::BadArg)));
+            // It does not insert: a missing key is the oracle's `error:{badkey, 9}`.
+            //   erl -noshell -eval 'try maps:update(9,1,#{1=>2}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badkey,9}
+            let miss = update_3(ctx, &[nine, one, m]);
+            assert_structured(miss, ctx, "badkey", nine);
+            let bad_map = update_3(ctx, &[one, one, nine]);
+            assert_structured(bad_map, ctx, "badmap", nine);
         });
     }
 
@@ -855,7 +942,11 @@ mod tests {
             let absent = remove_2(ctx, &[make_small(7), m]).unwrap();
             assert_eq!(keys_of(absent), vec![one, nine]);
 
-            assert!(matches!(remove_2(ctx, &[one, nine]), Err(BeamError::BadArg)));
+            // A non-map second argument is the oracle's `error:{badmap, 9}`.
+            //   erl -noshell -eval 'try maps:remove(1,9) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,9}
+            let bad_map = remove_2(ctx, &[one, nine]);
+            assert_structured(bad_map, ctx, "badmap", nine);
         });
     }
 
@@ -877,12 +968,22 @@ mod tests {
             assert_eq!(is_key_2(ctx, &[one, m]).unwrap(), ctx.boolean(true).unwrap());
             assert_eq!(is_key_2(ctx, &[a, m]).unwrap(), ctx.boolean(false).unwrap());
 
+            // Every non-map operand is the oracle's `{badmap, Operand}`:
+            //   erl -noshell -eval 'lists:foreach(fun(F) -> try F() catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end end, [fun() -> maps:keys(1) end,
+            //     fun() -> maps:values(a) end, fun() -> maps:size(1) end,
+            //     fun() -> maps:is_key(1,1) end]), halt().'
+            //   =>  error:{badmap,1} / error:{badmap,a} / error:{badmap,1} / error:{badmap,1}
             for bad in [one, a] {
-                assert!(matches!(keys_1(ctx, &[bad]), Err(BeamError::BadArg)));
-                assert!(matches!(values_1(ctx, &[bad]), Err(BeamError::BadArg)));
-                assert!(matches!(size_1(ctx, &[bad]), Err(BeamError::BadArg)));
+                let keys = keys_1(ctx, &[bad]);
+                assert_structured(keys, ctx, "badmap", bad);
+                let values = values_1(ctx, &[bad]);
+                assert_structured(values, ctx, "badmap", bad);
+                let size = size_1(ctx, &[bad]);
+                assert_structured(size, ctx, "badmap", bad);
             }
-            assert!(matches!(is_key_2(ctx, &[one, one]), Err(BeamError::BadArg)));
+            let not_a_map = is_key_2(ctx, &[one, one]);
+            assert_structured(not_a_map, ctx, "badmap", one);
         });
     }
 
@@ -903,9 +1004,14 @@ mod tests {
             // `two`'s value comes from the second map.
             assert_eq!(values_of(merged), vec![a, a, b]);
 
-            // A non-map operand is `badarg`.
-            assert!(matches!(merge_2(ctx, &[m1, one]), Err(BeamError::BadArg)));
-            assert!(matches!(merge_2(ctx, &[one, m1]), Err(BeamError::BadArg)));
+            // A non-map operand is the oracle's `{badmap, Operand}` — naming whichever
+            // argument is not a map.
+            //   erl -noshell -eval 'try maps:merge(#{},1) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,1}
+            let bad_second = merge_2(ctx, &[m1, one]);
+            assert_structured(bad_second, ctx, "badmap", one);
+            let bad_first = merge_2(ctx, &[one, m1]);
+            assert_structured(bad_first, ctx, "badmap", one);
         });
     }
 
@@ -937,11 +1043,18 @@ mod tests {
             assert_eq!(keys_of(rest), vec![two]);
             assert_eq!(values_of(rest), vec![b]);
 
-            // Non-list key argument / non-map argument ⇒ `badarg`.
+            // A non-list key argument is the oracle's atom `badarg`; a non-map argument
+            // is its structured `{badmap, C}`.
+            //   erl -noshell -eval 'try maps:with(a,#{}) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'    =>  error:badarg
+            //   erl -noshell -eval 'try maps:with([],c) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'    =>  error:{badmap,c}
             assert!(matches!(with_2(ctx, &[c, m]), Err(BeamError::BadArg)));
             assert!(matches!(without_2(ctx, &[c, m]), Err(BeamError::BadArg)));
-            assert!(matches!(with_2(ctx, &[empty, c]), Err(BeamError::BadArg)));
-            assert!(matches!(without_2(ctx, &[empty, c]), Err(BeamError::BadArg)));
+            let bad_map = with_2(ctx, &[empty, c]);
+            assert_structured(bad_map, ctx, "badmap", c);
+            let bad_map = without_2(ctx, &[empty, c]);
+            assert_structured(bad_map, ctx, "badmap", c);
         });
     }
 
@@ -991,8 +1104,11 @@ mod tests {
             assert!(matches!(next_1(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
             let bad = ctx.list(&[make_small(1)]).unwrap();
             assert!(matches!(next_1(ctx, &[bad]), Err(BeamError::BadArg)));
-            // `iterator/1` of a non-map is `badarg`.
-            assert!(matches!(iterator_1(ctx, &[make_small(1)]), Err(BeamError::BadArg)));
+            // `iterator/1` of a non-map is the oracle's `{badmap, 1}`:
+            //   erl -noshell -eval 'try maps:iterator(1) catch C:R ->
+            //     io:format("~p:~p~n",[C,R]) end, halt().'  =>  error:{badmap,1}
+            let bad_map = iterator_1(ctx, &[make_small(1)]);
+            assert_structured(bad_map, ctx, "badmap", make_small(1));
         });
     }
 

@@ -18,22 +18,27 @@
 //! # The documented `Structured` gap
 //!
 //! [`ExitReason`] models the well-known atoms as dedicated variants and any other
-//! atom as `Atom(name)`, but a **non-atom** reason is `Structured` and *carries no
-//! term* — `beam_common` has no term dependency, so the live term stays owned by
-//! the term heap (the engine / `beam_rt` capture it at the raise site). The
-//! mapping is therefore lossy in exactly that one direction:
-//! [`reason_term_from_exit_reason`] rejects `Structured` with `badarg`. This is
-//! the handoff `../beam_process/CONTEXT.md` documents.
+//! atom as `Atom(name)`, but a **non-atom** reason is
+//! [`ExitReason::Structured`], which itself carries no term — `beam_common` has no
+//! term dependency. [`raise`] therefore attaches the argument term to the returned
+//! [`Raise`] through the opaque [`Raise::live_reason`](beam_common::Raise::live_reason)
+//! slot (its workspace convention: the payload **is** the live reason term). An
+//! **atom** reason keeps its exact `ExitReason` shape and carries **no** live slot.
+//!
+//! [`reason_term_from_exit_reason`] only ever sees an [`ExitReason`]; it still rejects
+//! `Structured` with `badarg`, because a caller that took the reason apart to an
+//! `ExitReason` has already dropped the term — the term now travels on the `Raise`
+//! returned by the raise BIFs. This is the handoff `../beam_process/CONTEXT.md` documents.
 //!
 //! Both [`exit_reason_from_term`] and [`reason_term_from_exit_reason`] are part of
 //! the crate's public API (re-exported from the crate root) — the documented
 //! `beam_process`/`beam_rt` handoff, not crate-internal helpers.
 
-use beam_common::{BeamError, ExitReason, Result};
+use beam_common::{BeamError, ExceptionClass, ExitReason, Result};
 use beam_term::{atom_val, make_atom, AtomTable, Eterm};
 
 use crate::context::BifContext;
-use crate::error::{raise_error, raise_exit, raise_throw};
+use crate::error::{self, raise_error, raise_exit, raise_throw};
 use crate::registry::BifRegistry;
 
 /// Maps a live reason **term** to an [`ExitReason`].
@@ -66,7 +71,10 @@ pub fn exit_reason_from_term(term: Eterm, atoms: &AtomTable) -> ExitReason {
 /// # Errors
 ///
 /// [`BeamError::BadArg`] for [`ExitReason::Structured`] (and any future
-/// non-exhaustive variant): it carries no term to reproduce (see the module docs).
+/// non-exhaustive variant): an `ExitReason` alone carries no term to reproduce, so a
+/// structured reason taken apart to an `ExitReason` is unrecoverable here — the term
+/// rides the [`Raise::live_reason`](beam_common::Raise::live_reason) slot of the raise
+/// the BIF returned (see [`raise`]).
 pub fn reason_term_from_exit_reason(
     reason: &ExitReason,
     atoms: &mut AtomTable,
@@ -83,36 +91,60 @@ pub fn reason_term_from_exit_reason(
     }
 }
 
+/// A raise of `class` with `term` as the reason term.
+///
+/// An **atom** reason (well-known or plain) maps to its exact [`ExitReason`] and
+/// carries no live slot. A **non-atom** reason is [`ExitReason::Structured`] and the
+/// argument term itself rides the [`Raise::live_reason`](beam_common::Raise::live_reason)
+/// slot, so the caller sees the real reason term (`{bad_generator,X}`, `[1,2]`, …).
+///
+/// Pinned by the oracle:
+/// `erl -noshell -eval 'try erlang:error({bad_generator,5}) catch C:R -> io:format("~p:~p~n",[C,R]) end, halt().'`
+/// ⇒ `error:{bad_generator,5}`; `erlang:throw(42)` ⇒ `throw:42`;
+/// `erlang:exit({shutdown,1})` ⇒ `exit:{shutdown,1}`.
+fn raise(class: ExceptionClass, term: Eterm, atoms: &AtomTable) -> BeamError {
+    let reason = exit_reason_from_term(term, atoms);
+    if reason == ExitReason::Structured {
+        return error::raise_term(class, term);
+    }
+    match class {
+        ExceptionClass::Exit => raise_exit(reason),
+        ExceptionClass::Throw => raise_throw(reason),
+        // `ExceptionClass` is `#[non_exhaustive]`; a known-atom reason under any
+        // other class is the `error` class.
+        _ => raise_error(reason),
+    }
+}
+
 /// `erlang:error/1`.
 fn error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_error(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
 /// `erlang:error/2` — the argument list is ignored in M1 (documented simplification).
 fn error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_error(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
 /// `erlang:exit/1`.
 fn exit_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_exit(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Exit, args[0], ctx.atoms()))
 }
 
 /// `erlang:throw/1`.
 fn throw_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_throw(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Throw, args[0], ctx.atoms()))
 }
 
 /// `erlang:nif_error/1` — a NIF raises `error` with its argument as the reason.
 ///
 /// The oracle (erts-17.1) raises the class `error` with the argument *unchanged*:
 /// `nif_error(foo)` is `error:foo`, `nif_error(undefined)` is `error:undefined`
-/// and `nif_error({nif_not_loaded,m,f,0})` is `error:{nif_not_loaded,m,f,0}`.
-/// The non-atom case is the documented [`ExitReason::Structured`] gap — the live
-/// term is preserved by the engine at the raise site (`beam_rt`'s term-carrying
-/// `Flow::Raise`), not by this BIF.
+/// and `nif_error({nif_not_loaded,m,f,0})` is `error:{nif_not_loaded,m,f,0}`. A
+/// non-atom argument rides the [`Raise::live_reason`](beam_common::Raise::live_reason)
+/// slot (see [`raise`]).
 fn nif_error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_error(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
 /// `erlang:nif_error/2` — as `nif_error/1`; the second argument is metadata.
@@ -122,7 +154,7 @@ fn nif_error_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// crash report prints) fall away: `nif_error(foo, [1,2])` is `error:foo` and
 /// `nif_error(true, [1,2])` is `error:true`.
 fn nif_error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    Err(raise_error(exit_reason_from_term(args[0], ctx.atoms())))
+    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
 /// Registers `erlang:error/1,2`, `exit/1`, `throw/1` and `nif_error/1,2`.
@@ -190,6 +222,25 @@ mod tests {
         }
     }
 
+    /// Runs a raise BIF and returns its `(class, reason, live reason term)`.
+    fn raise_of3(
+        f: fn(&mut BifContext<'_>, &[Eterm]) -> Result<Eterm>,
+        arg: Eterm,
+    ) -> (ExceptionClass, ExitReason, Option<Eterm>) {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        match f(&mut ctx, &[arg]) {
+            Err(BeamError::Raise(raise)) => {
+                let live = raise
+                    .live_reason()
+                    .and_then(|l| l.downcast_ref::<Eterm>().copied());
+                (raise.class, raise.reason, live)
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        }
+    }
+
     #[test]
     fn error_exit_and_throw_set_the_class() {
         let mut heap = Heap::new(16).unwrap();
@@ -231,14 +282,43 @@ mod tests {
     }
 
     #[test]
-    fn non_atom_reasons_are_structured() {
+    fn non_atom_reasons_are_structured_and_carry_their_term() {
+        // `erl -noshell -eval 'try erlang:throw(42) catch C:R ->
+        // io:format("~p:~p~n",[C,R]) end, halt().'` ⇒ `throw:42`.
         assert_eq!(
-            raise_of(throw_1, make_small(42)),
-            (ExceptionClass::Throw, ExitReason::Structured)
+            raise_of3(throw_1, make_small(42)),
+            (ExceptionClass::Throw, ExitReason::Structured, Some(make_small(42)))
+        );
+        // `erlang:error([])` ⇒ `error:[]`.
+        assert_eq!(
+            raise_of3(error_1, NIL),
+            (ExceptionClass::Error, ExitReason::Structured, Some(NIL))
+        );
+        // `erlang:exit({shutdown,1})` ⇒ `exit:{shutdown,1}`.
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let shutdown = ctx.atom("shutdown").unwrap();
+        let tuple = ctx.tuple(&[shutdown, make_small(1)]).unwrap();
+        assert_eq!(
+            raise_of3(exit_1, tuple),
+            (ExceptionClass::Exit, ExitReason::Structured, Some(tuple))
+        );
+    }
+
+    #[test]
+    fn atom_reasons_carry_no_live_term() {
+        let mut heap = Heap::new(16).unwrap();
+        let atoms = seeded();
+        let ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let hello = ctx.atom("hello").unwrap();
+        assert_eq!(
+            raise_of3(error_1, hello),
+            (ExceptionClass::Error, ExitReason::atom("hello"), None)
         );
         assert_eq!(
-            raise_of(error_1, NIL),
-            (ExceptionClass::Error, ExitReason::Structured)
+            raise_of3(exit_1, hello),
+            (ExceptionClass::Exit, ExitReason::atom("hello"), None)
         );
     }
 
