@@ -29,7 +29,7 @@
 //! register file does not cover it.
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::mem;
 
 use beam_common::Result;
@@ -123,7 +123,16 @@ impl Allocation {
 pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     let labels = interpreter::build_label_map(module);
     let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
-    let mut entries: HashMap<(u32, u32), *const u8> = HashMap::new();
+    // A flat `[func][pc]` table, not a `HashMap`: the driver's per-block lookup sits on
+    // the hot path of every cross-block jump — a `fib`-style loop re-enters the driver
+    // once per iteration — so SipHash on a `(u32, u32)` key is a measurable share of the
+    // run. Two indexed `Vec` loads replace it.
+    let mut entries: Vec<Vec<Option<*const u8>>> = module
+        .functions
+        .iter()
+        .map(|function| vec![None; function.code.len()])
+        .collect();
+    let mut block_count = 0usize;
     let mut cached_registers: Vec<u32> = Vec::new();
     let mut highest_cached_register: Option<u32> = None;
     let mut highest_native_register: Option<u32> = None;
@@ -163,7 +172,9 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             // start of a complete native function inside the buffer;
             // `offset + emitted < capacity` was enforced by every emission call.
             let entry = unsafe { buffer.code_ptr().add(offset) };
-            entries.insert((func, start as u32), entry);
+            // `start < end <= code.len()`, so the slot always exists.
+            entries[func_index][start] = Some(entry);
+            block_count += 1;
         }
     }
 
@@ -172,6 +183,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     Ok(CompiledModule {
         buffer,
         entries,
+        block_count,
         cached_registers,
         highest_cached_register,
         highest_native_register,

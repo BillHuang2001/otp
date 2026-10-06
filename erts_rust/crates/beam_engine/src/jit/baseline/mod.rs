@@ -129,7 +129,7 @@
 //! `// SAFETY:` rationale.
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::mem;
 
 use beam_common::Result;
@@ -247,8 +247,12 @@ impl JitBackend for BaselineJit {
 pub struct CompiledModule {
     /// The sealed code mapping every entry points into.
     buffer: CodeBuffer,
-    /// The start `(func, pc)` of each compiled block → its native entry point.
-    entries: HashMap<(u32, u32), *const u8>,
+    /// The native entry point of the block starting at `[func][pc]`, or `None` when
+    /// that address compiled no block. A flat index (not a `HashMap`) because the
+    /// driver probes it on every cross-block jump.
+    entries: Vec<Vec<Option<*const u8>>>,
+    /// The number of compiled blocks (`entries`' `Some` count).
+    block_count: usize,
     /// Every x-register any block caches in a machine register (sorted, deduped).
     cached_registers: Vec<u32>,
     /// The highest x-register index any block caches in a machine register.
@@ -267,12 +271,16 @@ impl CompiledModule {
     /// The native entry point of the block starting at `(func, pc)`, if one was
     /// compiled.
     pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
-        self.entries.get(&(func, pc)).copied()
+        self.entries
+            .get(func as usize)
+            .and_then(|row| row.get(pc as usize))
+            .copied()
+            .flatten()
     }
 
     /// The number of compiled blocks.
     pub fn block_count(&self) -> usize {
-        self.entries.len()
+        self.block_count
     }
 
     /// Every x-register any block holds in a machine register (sorted ascending,
