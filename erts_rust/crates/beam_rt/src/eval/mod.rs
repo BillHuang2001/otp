@@ -681,6 +681,20 @@ impl Evaluator<'_, '_> {
                     })
                 }
                 ("raise", 3) => return self.raise_3(&args),
+                ("nif_error", 1) | ("nif_error", 2) => {
+                    // `erlang:nif_error/1,2` raises `error` with its **first argument**
+                    // as the reason (the second is crash-report metadata, per
+                    // `nif_error_2` in `../../erts/emulator/beam/bif.c:1525`). A
+                    // compound reason is served here rather than by the registered BIF:
+                    // `beam_common::ExitReason` cannot carry a term, so the BIF's
+                    // structured reason would lose it. Keeping the live term preserves
+                    // the exact reason (`{nif_not_loaded,m,f,0}` stays that tuple).
+                    return Err(Flow::Raise {
+                        class: ExceptionClass::Error,
+                        reason: args[0],
+                        origin: None,
+                    });
+                }
                 ("apply", 2) => return self.apply_2(&args),
                 ("apply", 3) => return self.apply_3(&args),
                 _ => {}

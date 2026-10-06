@@ -22,6 +22,7 @@
 //! this a *multi-module* host (native floor → `beam_bifs` registry → load-on-demand
 //! external call) lives in [`RuntimeContext::call_bif`](crate::context).
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 
@@ -56,21 +57,35 @@ pub struct Runtime {
     /// The configuration this runtime was created with.
     config: RuntimeConfig,
     /// The BIF registry every `call_bif` is dispatched through.
-    pub(crate) registry: BifRegistry,
+    ///
+    /// Shared through an [`Rc`] so a `BifContext` can be dispatched against a cheap clone
+    /// that does not borrow the runtime (see [`crate::context::RuntimeContext::call_registered`]).
+    pub(crate) registry: Rc<BifRegistry>,
     /// The code server: the one shared atom table, the module cache, the code path.
     pub(crate) code_server: CodeServer,
     /// The process table (Milestone-1: the runtime's own single process).
     processes: ProcessTable,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
-    /// The process heap executed code allocates on; owned so results stay valid.
-    pub(crate) heap: Heap,
+    /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
+    /// puts it back (see [`Runtime::take_bif_heap`]). A `beam_alloc::Heap` never moves its
+    /// terms and is never reset in Milestone-1 (there is no GC), so a heap must outlive
+    /// every term built on it — reusing one heap for sequential calls keeps that free,
+    /// while a nested call (inside a fun a BIF applied) gets its own heap.
+    pub(crate) bif_heaps: Vec<Heap>,
+    /// The size in term words of a freshly created BIF heap.
+    pub(crate) bif_heap_words: usize,
     /// The pointer-stable arena serving the engine's `alloc_words` seam.
     pub(crate) arena: MinimalContext,
     /// The scratch heap for `system_info`/`format_term`, reset per call.
     pub(crate) info_heap: Heap,
     /// The `ets:*` tables.
-    pub(crate) tables: TableRegistry,
+    ///
+    /// Shared through an [`Rc`]`<`[`RefCell`]`>` so a BIF call can hold the registry for
+    /// the duration of its call without borrowing the runtime; a **nested** call (a fun
+    /// applied by a BIF) finds it already borrowed and runs without ETS — the `ets:*` BIFs
+    /// then raise `unsupported_bif`, never a wrong result.
+    pub(crate) tables: Rc<RefCell<TableRegistry>>,
     /// The pid code runs as (`erlang:self/0`).
     pub(crate) self_pid: ProcessId,
     /// Whether [`Runtime::boot`] has run.
@@ -116,14 +131,15 @@ impl Runtime {
         let heap_words = config.heap_words.max(MIN_HEAP_WORDS);
         Ok(Runtime {
             config,
-            registry: BifRegistry::with_core_bifs(),
+            registry: Rc::new(BifRegistry::with_core_bifs()),
             code_server,
             processes,
             preloaded: PreloadedModules::standard(),
-            heap: Heap::new(heap_words)?,
+            bif_heaps: vec![Heap::new(heap_words)?],
+            bif_heap_words: heap_words,
             arena: MinimalContext::new(),
             info_heap: Heap::new(INFO_HEAP_WORDS)?,
-            tables: TableRegistry::new(),
+            tables: Rc::new(RefCell::new(TableRegistry::new())),
             self_pid,
             booted: false,
             halt: None,
@@ -223,6 +239,29 @@ impl Runtime {
         self.arena.heap_available()
     }
 
+    /// Takes a heap for one BIF call out of the pool.
+    ///
+    /// The pool is a stack: a call takes a heap, runs, and puts it back
+    /// ([`Runtime::put_bif_heap`]). Reusing the same heap for sequential calls costs
+    /// nothing and keeps every term built on it valid (a `beam_alloc::Heap` never moves
+    /// its terms and Milestone-1 never resets one — there is no GC). A **nested** call (a
+    /// fun a BIF applied) finds the pool empty and gets a fresh heap, so the outer call's
+    /// heap is never aliased.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the fresh heap's allocation failure.
+    pub(crate) fn take_bif_heap(&mut self) -> Result<Heap> {
+        match self.bif_heaps.pop() {
+            Some(heap) => Ok(heap),
+            None => Heap::new(self.bif_heap_words),
+        }
+    }
+
+    /// Returns a heap taken by [`Runtime::take_bif_heap`] to the pool.
+    pub(crate) fn put_bif_heap(&mut self, heap: Heap) {
+        self.bif_heaps.push(heap);
+    }
     /// Allocates `n` raw heap words from the pointer-stable arena.
     ///
     /// # Errors
