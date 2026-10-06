@@ -324,7 +324,16 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   round on demand; there is no port run queue, no per-iteration drive from a poll thread, and reductions are not
   yet charged to a `beam_process` scheduler. `beam_rt` has not adopted `beam_io::PortRegistry`/`PortNotification`.
 - **`FdDriver` is deliberately minimal.** Byte-stream only; line mode frames input but does **not** line-frame
-  output (matching the emulator's line flag). No `inet`/`forker`/`spawn` drivers; no packet framing.
+  output (matching the emulator's line flag). No `inet`/`forker` drivers; no packet framing.
+- **`SpawnDriver` is the OS-child floor, not the whole `spawn` driver.** Decoding the `open_port/2` terms into a
+  [`SpawnSpec`](src/drivers/spawn.rs)/`SpawnOptions` (and synthesizing `{Port, {data, …}}`,
+  `{Port, {exit_status, …}}` and a `{Port, eof}` message from them) stays the runtime's job — this crate only
+  moves the bytes and kills/reaps the child. The child's stderr is piped (so it never inherits the emulator's own
+  output) but **never read**; the driver signals EOF only by latching its own state (`eof()`), it does not report
+  an event. Writing to a child that closed its stdin fails with a typed `BeamError::Io` (the queued remainder is
+  kept, never silently discarded), and `{fd, N}` is a **read-only** adoption — writing to it is `BadArg`, so a
+  descriptor port is not yet a bidirectional stream. Input is not line-framed (there is no `line` control verb):
+  the `binary`/`list` choice rides on `SpawnStream` for the runtime to apply.
 - **`EfileDriver` cannot open a regular file.** `mio`/epoll rejects `EPOLL_CTL_ADD` on regular files (`EPERM`), so
   `control("open", path)` fails with `BeamError::Io` for them; it works for the descriptors epoll supports
   (pipes/FIFOs/char devices/sockets). A real `efile`/`inet` needs a non-epoll readiness source (a dedicated
