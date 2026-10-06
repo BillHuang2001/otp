@@ -67,6 +67,25 @@ The embedded source is compiled at run time with the system `erlc` into a unique
 - **Compiler (`erlc`)** = `$ERLC` if set (must exist, else `Error::Env`), else `erlc` resolved on `PATH`. Missing ⇒ `Ok(None)`: the module-run cases are **skipped loudly** (`Verdict::Skipped`), never a silent pass.
 - Expression cases invoke both runtimes with the **same argv** (only the program path differs); module-run cases invoke them with per-side argv (see the probe protocol above).
 
+## gate.sh — the checkable compatibility gate
+`gate.sh` wraps `differential suite --strict` for CI. From the repo root it runs
+`erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_rt -p differential`, then
+`erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q -p differential -- suite --strict --json --out <tmpdir>`,
+and turns the report into a CI exit code:
+
+| Exit | Meaning |
+|------|---------|
+| `0`  | every executed case agreed |
+| `1`  | ≥1 **mismatch** — a real, observable behavioral divergence (including oracle-vs-its-own-golden corpus drift) |
+| `2`  | usage / environment error — missing oracle, build failure, or a report that could not be produced |
+| `3`  | no mismatch, but ≥1 **unsupported**/`skipped` capability gap remains |
+
+**Invariant:** an `unsupported` case (a capability gap the Rust runtime signals via its documented exit `3` / `beam_rt: unsupported: …` reason convention, or a missing `beam_rt`) is **never** reported as a mismatch. Exit `1` is reserved for a case whose runtime actually produced a *differing observable result*; a capability gap can only ever land in the `unsupported`/`skipped` buckets and therefore cause exit `3` (never exit `1`).
+
+The `1`-vs-`3` distinction is read **solely** from the report's **top-level `summary`** object (authoritative); the per-contract `by_contract` rollup — which also carries `mismatch` keys, at a deeper indent — is deliberately ignored. If the summary cannot be parsed, the gate **fails loud** (exit `1`) rather than risk a false pass (`0`).
+
+The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatch / `2` usage-env; a lenient `run` on an unsupported case stays `0`) — the `0/1/2/3` mapping belongs to the gate script only.
+
 ## Constraints
 - **Honest reporting:** a side that cannot run is `unsupported` / `skipped(<reason>)` — **never** `pass`, and oracle observations are **never** fabricated. A case whose *oracle* disagrees with its golden is itself a failure (corpus drift), surfaced as a mismatch — the harness is self-testing.
 - **No coupling to `crates/*` internals** (crate deps are `serde` + `serde_json` only). No `clap`; arg parsing is hand-rolled `std`. `unsafe` is **forbidden**.
