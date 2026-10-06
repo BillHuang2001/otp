@@ -159,12 +159,44 @@ impl Machine {
             // Neither carries operands nor touches machine state.
             Instr::Label(_)
             | Instr::Line(_)
-            | Instr::FuncInfo { .. }
             | Instr::IntCodeEnd
             | Instr::ExecutableLine { .. }
             | Instr::DebugLine { .. }
             | Instr::NifStart
             | Instr::OnLoad => Ok(Step::Next),
+            // `func_info Module Function Arity` — the failed-clause raise.
+            //
+            // A function's **callable** entry label is the label *after* `func_info`
+            // (`Export.label == Function::entry_label`, `../beam_loader/CONTEXT.md`),
+            // so a normal call never executes this instruction: the only way to reach
+            // it is a JUMP from a failed head-pattern/guard `fail` label. C
+            // (`i_func_info_IaaI`, `../../erts/emulator/beam/emu/beam_emu.c:578-583`)
+            // then unconditionally sets `c_p->freason = EXC_FUNCTION_CLAUSE` and
+            // `goto handle_error`: class `error`, reason the **bare atom**
+            // `function_clause` (the call arguments ride in the stacktrace, not in the
+            // reason — no `{function_clause, Args}` tuple). There is no first-entry or
+            // re-entry test in C. Treating it as a no-op instead would fall through to
+            // the entry label and re-run the clause tests forever — the
+            // `proplists:get_value(a, undefined)` hang.
+            Instr::FuncInfo { .. } => {
+                // Resolve the reason atom in the running module's atom table; a module
+                // that never mentions it cannot name the reason, so a missing atom is a
+                // typed `unsupported` (never a substituted, wrong atom).
+                let atom = module.atom_table.lookup("function_clause").ok_or_else(|| {
+                    error::unsupported("func_info: no 'function_clause' atom in the module")
+                })?;
+                let reason = make_atom(atom);
+                // Install the `error` class atom when the module has it; the throw
+                // consults it only when the raise actually lands. A module without it
+                // still propagates a typed `BeamError::Raise(..)` uncaught, and a
+                // landing fails with a typed `unsupported` — the `install_class_atom`
+                // contract (mirrors `families/exceptions.rs::raise_error_atom`).
+                if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str())
+                {
+                    self.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+                }
+                self.throw_error(reason)
+            }
             Instr::Move { src, dst } => {
                 let value = read_operand(self, ctx, src)?;
                 write_operand(self, dst, value)?;

@@ -29,9 +29,9 @@
 //! [`ExitReason::Atom`](beam_common::ExitReason::Atom) backed by an owned `String`
 //! (which every message here is).
 
-use beam_common::{BeamError, ExitReason, Raise};
 use beam_bifs::BifRegistry;
-
+use beam_common::{BeamError, ExitReason, Raise};
+use beam_term::{atom_val, is_atom, AtomTable, Eterm};
 /// The prefix every capability-gap reason atom starts with (see the module docs).
 pub(crate) const UNSUPPORTED_PREFIX: &str = "unsupported";
 
@@ -90,7 +90,7 @@ fn raise_reason(error: &BeamError) -> Option<&str> {
 /// CLI turns `Some(_)` into the `beam_rt: unsupported: <reason>` stderr line and exit
 /// code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED). A `None` means the error
 /// is a genuine runtime error or a usage error, classified by the caller as usual.
-pub(crate) fn unsupported_reason(error: &BeamError) -> Option<String> {
+pub fn unsupported_reason(error: &BeamError) -> Option<String> {
     let reason = raise_reason(error)?;
     let rest = reason.strip_prefix(UNSUPPORTED_PREFIX)?;
     Some(
@@ -99,7 +99,68 @@ pub(crate) fn unsupported_reason(error: &BeamError) -> Option<String> {
     )
 }
 
-/// A malformed value of a *recognized* switch (e.g. `+P x`).
+/// Recovers the **atom** reason of an uncaught raise that carries one as a *live term*.
+///
+/// The engine propagates a raise that escapes every catch frame term-independently: the
+/// reason is [`ExitReason::Structured`] and the live reason *term* rides out in the
+/// raise's [`Raise::live_reason`] slot (`beam_engine`'s `Machine::throw_with_trace`),
+/// which is what lets a genuinely compound reason (`{badkey, K}`, `{case_clause, V}`)
+/// survive a boundary that has no term type. For a reason that is a **bare atom** that
+/// placeholder simply carries less than the runtime knows — C raises the *atom*
+/// (`i_func_info_IaaI` sets `EXC_FUNCTION_CLAUSE` for `function_clause`) — and the name
+/// is recoverable from the live term through the shared atom table.
+///
+/// This function performs exactly that recovery, so an uncaught `function_clause` names
+/// itself (`BeamError::as_atom()` answers `Some("function_clause")` and
+/// [`Display`](std::fmt::Display) prints `error function_clause`) instead of the
+/// `<structured reason>` placeholder. The live reason term is **kept**, so catchability
+/// (a live catch frame lands the term) and every live-term consumer
+/// ([`crate::eval`], [`crate::runner`]) are unaffected.
+///
+/// Everything else is returned **unchanged**: a non-raise, a raise that already carries
+/// an atom reason, a raise with no live term, and a live term that is not an atom keep
+/// [`ExitReason::Structured`] (and `as_atom() == None`). A name the table does not hold is
+/// likewise left alone — never a substituted, wrong atom.
+///
+/// A recovered name that the runtime's own core seed ([`crate::boot::CORE_ATOMS`]) spells
+/// gets that **static** name, so [`BeamError::as_atom`] (which hands back a `&'static str`)
+/// names it too; a name only the live table knows keeps the owned form, where
+/// [`Display`](std::fmt::Display) still names it but `as_atom()` cannot.
+pub(crate) fn name_atom_raise(error: BeamError, atoms: &AtomTable) -> BeamError {
+    let mut raise = match error {
+        BeamError::Raise(raise) => raise,
+        other => return other,
+    };
+    if raise.reason.as_atom().is_some() {
+        return BeamError::Raise(raise);
+    }
+    let name = raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+        .filter(|term| is_atom(*term))
+        .and_then(|term| atoms.name(atom_val(term)))
+        .map(str::to_string);
+    if let Some(name) = name {
+        raise.reason = match static_core_atom(&name) {
+            Some(known) => ExitReason::atom(known),
+            None => ExitReason::atom(name),
+        };
+    }
+    BeamError::Raise(raise)
+}
+
+/// The `&'static str` spelling of `name`, when the runtime's core atom seed
+/// ([`crate::boot::CORE_ATOMS`]) holds that name.
+///
+/// The seed is the runtime's own fixed atom vocabulary, so its members are exactly the
+/// names that have a static spelling; anything else is known only to the live table.
+fn static_core_atom(name: &str) -> Option<&'static str> {
+    crate::boot::CORE_ATOMS
+        .iter()
+        .copied()
+        .find(|known| *known == name)
+}/// A malformed value of a *recognized* switch (e.g. `+P x`).
 pub(crate) fn bad_switch_value(switch: &str, value: &str) -> BeamError {
     message(format!("bad value {value:?} for switch {switch}"))
 }
@@ -142,19 +203,6 @@ pub(crate) fn unknown_module(module: &str) -> BeamError {
     message(format!("module {module:?} is not loaded"))
 }
 
-/// A function/arity that the module does not export.
-pub(crate) fn unknown_function(module: &str, function: &str, arity: u32) -> BeamError {
-    message(format!("{module}:{function}/{arity} is not exported"))
-}
-
-/// A call into the `erlang` namespace that is not a registered BIF.
-///
-/// `erlang` is the BIF namespace and never a loadable module, so an unknown
-/// `erlang:*` call is a diagnostic rather than a spurious module load.
-pub(crate) fn unknown_bif(module: &str, function: &str, arity: u32) -> BeamError {
-    message(format!("{module}:{function}/{arity} is not a BIF"))
-}
-
 /// A `run` argument outside the documented term grammar.
 pub(crate) fn bad_run_argument(argument: &str) -> BeamError {
     message(format!("{argument:?} is not a valid run argument"))
@@ -190,6 +238,37 @@ pub(crate) fn undef() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("undef")))
 }
 
+/// The live **structured reason term** carried by a raise, when it has one.
+///
+/// A reason that is not an atom travels out of band: `beam_common`'s
+/// [`ExitReason`] has no term variant, so such a raise is
+/// [`ExitReason::Structured`] and the reason *term* itself (`{badkey, K}`,
+/// `{badmap, M}`, `{case_clause, V}`, …) is the payload of
+/// [`Raise::live_reason`](beam_common::Raise::live_reason) — the
+/// `beam_bifs`/`beam_engine` convention, whose payload type is
+/// [`Eterm`]. This is the **single** place that recovers it, so every consumer
+/// (`crate::runner`'s `exit_reason`, the `run` diagnostic in `crate::cli`)
+/// downcasts the same way instead of repeating the incantation.
+///
+/// Returns `None` for anything that is not such a raise, **and** for a raise whose
+/// reason *is* an atom: an atom reason is the authoritative one (the oracle's
+/// `undef`, `badarg`, `unsupported_opcode: …`, …), so a term attached next to one
+/// must never shadow it. The gate reads [`ExitReason::as_atom`], which — unlike
+/// [`BeamError::as_atom`] — also sees atoms backed by an owned `String` (every
+/// message this module builds).
+pub(crate) fn live_reason_term(error: &BeamError) -> Option<Eterm> {
+    let BeamError::Raise(raise) = error else {
+        return None;
+    };
+    if raise.reason.as_atom().is_some() {
+        return None;
+    }
+    raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+}
+
 /// A receive-seam operation with no mailbox to serve it.
 ///
 /// The runtime always owns a process table holding the running process, so this is
@@ -203,9 +282,10 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
 /// The `erlang` BIFs that are **known** (they are part of the OTP `erlang` surface) but
 /// deliberately not implemented by Milestone-1.
 ///
-/// A call to one of these must never be reported as the *plain* diagnostic
-/// [`unknown_bif`] builds (`erlang:X/Y is not a BIF`): that would present a documented
-/// capability gap as a genuine runtime error. It is classified as *unsupported* instead
+/// A call to one of these must never be reported as the *plain* `erlang:X/Y is not a BIF`
+/// diagnostic a **genuinely unknown** `erlang` name gets (such a name now raises the bare
+/// [`undef`] the oracle does): that would present a documented capability gap as a genuine
+/// runtime error. It is classified as *unsupported* instead
 /// (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) — see
 /// [`known_unimplemented_bif`].
 ///
@@ -263,10 +343,7 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("seq_trace", 1),
     ("seq_trace", 2),
     ("get", 0),
-    ("get", 1),
-    ("put", 2),
     ("erase", 0),
-    ("erase", 1),
     ("apply", 1),
     ("function_exported", 2),
     ("function_exported", 3),
@@ -295,9 +372,9 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
 
 /// A **known** `erlang` BIF that Milestone-1 deliberately does not implement.
 ///
-/// Reporting it as [`unknown_bif`] would be indistinguishable from a typo (`erlang:nope/1`)
-/// and, worse, would classify a documented capability gap as a genuine runtime error. The
-/// reason atom therefore starts with `unsupported`, so
+/// Reporting it as the bare [`undef`] a typo (`erlang:nope/1`) gets would be
+/// indistinguishable from that typo and, worse, would classify a documented capability gap
+/// as a genuine runtime error. The reason atom therefore starts with `unsupported`, so
 /// [`unsupported_reason`](crate::error::unsupported_reason) recognises it and
 /// [`cli::run`](crate::cli::run) exits with
 /// [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED) — exactly like the `beam_engine`
@@ -357,6 +434,8 @@ pub(crate) fn unknown_process_entry(pid: beam_process::ProcessId) -> BeamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_common::{ExceptionClass, LiveReason};
+    use beam_term::{make_atom, make_small};
 
     #[test]
     fn message_errors_render_their_text() {
@@ -426,6 +505,31 @@ mod tests {
     }
 
     #[test]
+    fn the_live_reason_term_is_recovered_only_for_a_structured_reason() {
+        let term = beam_term::make_small(42);
+        // A raise whose reason is a non-atom carries the reason *term* in the
+        // live-reason slot (`ExitReason::Structured` + `LiveReason`).
+        let structured = BeamError::Raise(
+            Raise::error(ExitReason::Structured).with_live_reason(LiveReason::new(term)),
+        );
+        assert_eq!(live_reason_term(&structured), Some(term));
+        // … and one that carries no term at all has none to recover.
+        assert_eq!(
+            live_reason_term(&BeamError::Raise(Raise::error(ExitReason::Structured))),
+            None
+        );
+        // An **atom** reason is authoritative: a payload stored next to it must never
+        // shadow it (including an owned-`String` atom, invisible to `BeamError::as_atom`).
+        let atom = BeamError::Raise(
+            Raise::error(ExitReason::atom(String::from("badmatch")))
+                .with_live_reason(LiveReason::new(term)),
+        );
+        assert_eq!(live_reason_term(&atom), None);
+        // A non-raise carries no live reason at all.
+        assert_eq!(live_reason_term(&BeamError::BadArg), None);
+    }
+
+    #[test]
     fn a_halt_raise_carries_its_status_and_is_not_a_capability_gap() {
         for status in [0, 1, 42, 255] {
             let error = halt(status);
@@ -438,14 +542,111 @@ mod tests {
         assert_eq!(halt_status(&missing_value("-eval")), None);
     }
 
+    /// A raise carrying `term` as its (structured) live reason.
+    fn structured_raise(class: ExceptionClass, term: Eterm) -> BeamError {
+        BeamError::Raise(
+            Raise::new(class, ExitReason::Structured).with_live_reason(LiveReason::new(term)),
+        )
+    }
+
+    /// A seeded shared atom table (the boot seed is what makes a core name statically
+    /// spellable and nameable).
+    fn seeded_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        crate::boot::seed_core_atoms(&mut atoms);
+        atoms
+    }
+
+    #[test]
+    fn a_bare_atom_live_reason_is_recovered_as_an_atom_reason() {
+        // The engine's uncaught raise carries its reason term-independently
+        // (`ExitReason::Structured`) with the term in the live-reason slot; for the
+        // *bare atom* `function_clause` the name is recoverable, so the term-independent
+        // model must report it instead of the `<structured reason>` placeholder.
+        let atoms = seeded_atoms();
+        let term = make_atom(atoms.lookup("function_clause").expect("seeded"));
+        let error = structured_raise(ExceptionClass::Error, term);
+
+        let named = name_atom_raise(error, &atoms);
+        assert!(named.is_raise());
+        assert_eq!(named.as_atom(), Some("function_clause"));
+        assert_eq!(named.to_string(), "error function_clause");
+        assert_eq!(unsupported_reason(&named), None);
+        // The recovery is not a substitution: the live reason term survives verbatim, so
+        // landing in a catch frame still delivers the term itself.
+        let raise = named.into_raise().expect("a raise");
+        assert_eq!(raise.class, ExceptionClass::Error);
+        assert_eq!(raise.reason.as_atom(), Some("function_clause"));
+        assert_eq!(
+            raise.live_reason().and_then(|live| live.downcast_ref::<Eterm>()),
+            Some(&term)
+        );
+    }
+
+    #[test]
+    fn the_recovered_name_is_static_for_a_core_seed_atom() {
+        // `BeamError::as_atom` hands back a `&'static str`, so a recovered name that the
+        // runtime's own core seed spells is reported statically; a name only the live
+        // table knows keeps the owned form (Display still names it).
+        let atoms = seeded_atoms();
+        for name in ["function_clause", "exit", "throw", "normal"] {
+            let term = make_atom(atoms.lookup(name).expect("seeded"));
+            let named = name_atom_raise(structured_raise(ExceptionClass::Error, term), &atoms);
+            assert_eq!(named.as_atom(), Some(name), "{name}");
+        }
+        let local = make_atom(atoms.lookup("preloaded").expect("seeded"));
+        let named = name_atom_raise(structured_raise(ExceptionClass::Error, local), &atoms);
+        assert_eq!(named.as_atom(), Some("preloaded"));
+        // A name the seed does not carry and the table did not have: interned here, so it
+        // is nameable — just not statically.
+        let mut atoms = atoms;
+        let fresh = make_atom(atoms.intern("not_a_core_atom"));
+        let named = name_atom_raise(structured_raise(ExceptionClass::Error, fresh), &atoms);
+        assert_eq!(named.as_atom(), None);
+        assert_eq!(named.to_string(), "error not_a_core_atom");
+        assert_eq!(unsupported_reason(&named), None);
+    }
+
+    #[test]
+    fn a_non_atom_live_reason_keeps_the_structured_placeholder() {
+        // A live term that is not an atom (here a small int, standing in for a compound
+        // reason) is genuinely term-independent: the placeholder must stay
+        // (`as_atom()` is `None`) and the live term must be untouched.
+        let atoms = seeded_atoms();
+        let reason = make_small(1);
+        let named = name_atom_raise(structured_raise(ExceptionClass::Error, reason), &atoms);
+        assert_eq!(named.as_atom(), None);
+        assert_eq!(named.to_string(), "error <structured reason>");
+        assert_eq!(
+            named.into_raise().and_then(|raise| raise
+                .live_reason()
+                .and_then(|live| live.downcast_ref::<Eterm>())
+                .copied()),
+            Some(reason)
+        );
+    }
+    #[test]
+    fn raises_without_a_live_term_and_non_raises_are_unchanged() {
+        let atoms = seeded_atoms();
+        // A raise whose reason is already an atom: untouched.
+        let atom_raise = BeamError::Raise(Raise::error(ExitReason::atom("badmatch")));
+        let named = name_atom_raise(atom_raise, &atoms);
+        assert_eq!(named.as_atom(), Some("badmatch"));
+        // A structured raise with NO live term: untouched (nothing to recover from).
+        let bare = structured_raise(ExceptionClass::Error, make_small(1));
+        let bare = match bare {
+            BeamError::Raise(raise) => BeamError::Raise(Raise::new(raise.class, raise.reason)),
+            other => other,
+        };
+        assert_eq!(name_atom_raise(bare, &atoms).as_atom(), None);
+        // A non-raise is returned as-is.
+        assert!(matches!(
+            name_atom_raise(BeamError::SystemLimit, &atoms),
+            BeamError::SystemLimit
+        ));
+    }
     #[test]
     fn diagnostics_name_the_offending_item() {
-        assert!(unknown_function("slice", "add", 3)
-            .to_string()
-            .contains("slice:add/3"));
-        assert!(unknown_bif("erlang", "nope", 1)
-            .to_string()
-            .contains("erlang:nope/1"));
         assert!(bad_run_argument("1+").to_string().contains("1+"));
         assert!(bad_switch_value("+P", "x").to_string().contains("\"x\""));
         assert!(unexpected_argument("junk").to_string().contains("junk"));

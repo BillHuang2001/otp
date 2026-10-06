@@ -1,9 +1,8 @@
 # `beam_rt` test fixtures
 
-`mailbox.beam`, `sched.beam` and `port_recv.beam` are committed oracle
-fixtures: real `.beam` images produced by the **system Erlang** toolchain (OTP 29 /
-`erts-17.1`), which is also the differential oracle.
-
+`mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam` and
+`function_clause_fixture.beam` are committed oracle fixtures: real `.beam` images produced by
+the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
 * `mailbox.beam` is the receive/message end-to-end image — `tests/mailbox.rs` (the
   runtime slice) and the receive-seam unit tests in `src/context.rs` run it through the
   real `RuntimeContext`.
@@ -15,7 +14,16 @@ fixtures: real `.beam` images produced by the **system Erlang** toolchain (OTP 2
   spawn-driver port (`{spawn, "echo hi"}`) and then blocks in a compiled `receive` on its
   stream, so the only thing that can wake it is a `{Port, {data, Data}}` message the
   runtime's poller delivers into its mailbox — never a `send` from another process.
-
+* `raise_structured.beam` is the **structured-raise** image (`tests/structured_errors.rs`):
+  `badkey/0` and `badmap/0` raise the structured reasons `{badkey, nokey}` and
+  `{badmap, not_a_map}` from compiled code, so a spawned process that raises one exposes the
+  **real term** through `Runtime::process_exit`.
+* `function_clause_fixture.beam` is the **failed-head-clause** image
+  (`tests/function_clause.rs`): `f/1` has the single clause `f(a) -> ok.`, so `f(b)` matches
+  no clause and jumps to the function's `func_info` label. Its own atom table holds only
+  `function_clause_fixture`, `f`, `a`, `ok`, `module_info`, `erlang` and `get_module_info`
+  (`beam_lib:chunks/2`), so the reason atom `function_clause` can only come from the
+  runtime's boot seed — which is exactly the property the test pins.
 ## Regeneration
 
 All fixtures are compiled with `+deterministic`, which strips the embedded source path
@@ -44,9 +52,21 @@ mkdir -p "$SCRATCH/port_recvgen"
 cp port_recv.erl "$SCRATCH/port_recvgen/"
 ( cd "$SCRATCH/port_recvgen" && erlc +deterministic port_recv.erl )
 cp "$SCRATCH/port_recvgen/port_recv.beam" port_recv.beam
-```
 
-The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
+# raise_structured.beam (644 bytes)
+SCRATCH="$TMPDIR/beam_rt_raise_fix"
+mkdir -p "$SCRATCH/raisegen"
+cp raise_structured.erl "$SCRATCH/raisegen/"
+( cd "$SCRATCH/raisegen" && erlc +deterministic raise_structured.erl )
+cp "$SCRATCH/raisegen/raise_structured.beam" raise_structured.beam
+
+# function_clause_fixture.beam (548 bytes)
+SCRATCH="$TMPDIR/beam_rt_function_clause_fix"
+mkdir -p "$SCRATCH/fcgen"
+cp function_clause_fixture.erl "$SCRATCH/fcgen/"
+( cd "$SCRATCH/fcgen" && erlc +deterministic function_clause_fixture.erl )
+cp "$SCRATCH/fcgen/function_clause_fixture.beam" function_clause_fixture.beam
+```The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
 **force-added**: `git add -f sched.beam`.
 
 `sched.erl` (the input, also committed):
@@ -74,6 +94,15 @@ recv() ->
     end.
 ```
 
+`raise_structured.erl` (the input, also committed):
+
+```erlang
+-module(raise_structured).
+-export([badkey/0, badmap/0]).
+
+badkey() -> maps:get(nokey, #{}).
+badmap() -> map_get(a, not_a_map).
+```
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
@@ -87,8 +116,10 @@ re-derive them from the system `erl`, do **not** guess.
 | `sched:send2/2` | a receiver matching `{bar, X}` after `sched:send2(R, 0)` | `7` |
 | `sched:send2/2` | `sched:send2(R, N)` | returns `ok` |
 | `port_recv:recv/0` | `port_recv:recv()` | `<<"hi\n">>` |
-
-`selfsend/0` compiles to `bif self` + `send` + `loop_rec` + `remove_message` (with a
+| `raise_structured:badkey/0` | `try raise_structured:badkey() catch C:R -> {C,R} end` | `{error,{badkey,nokey}}` |
+| `raise_structured:badmap/0` | `try raise_structured:badmap() catch C:R -> {C,R} end` | `{error,{badmap,not_a_map}}` |
+| `function_clause_fixture:f/1` | `function_clause_fixture:f(a)` | `ok` |
+| `function_clause_fixture:f/1` | `try function_clause_fixture:f(b) catch C:R -> {C,R} end` | `{error,function_clause}` |`selfsend/0` compiles to `bif self` + `send` + `loop_rec` + `remove_message` (with a
 `wait` fail branch); `scan/0` additionally emits `loop_rec_end`, because `42` fails the
 `{bar, X}` test and the scan must advance to the second message. `wait/0` is a bare
 `loop_rec`/`wait` loop and therefore suspends on an empty mailbox. `send2/2` emits two

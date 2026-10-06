@@ -485,10 +485,11 @@ mod tests {
         let sum = call(&mut runtime, "erlang", "+", &[make_small(2), make_small(3)]).expect("+");
         assert_eq!(signed_value(sum), 5);
         // A native-shaped call the floor does not own (here: the wrong arity) falls
-        // through to the registry and fails there — never silently accepted.
+        // through to the registry and fails there — never silently accepted. The `erlang`
+        // namespace has no such name, so it raises the oracle's bare `error:undef`.
         let error = call(&mut runtime, "erlang", "display", &[make_small(1), make_small(2)])
             .expect_err("display/2 is no BIF");
-        assert!(error.to_string().contains("erlang:display/2"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
     }
 
     // -- os:cmd/1 -------------------------------------------------------------

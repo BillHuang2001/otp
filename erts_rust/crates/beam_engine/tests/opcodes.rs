@@ -14,7 +14,7 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 
 use beam_common::{BeamError, ExceptionClass, ExitReason, LiveReason, Raise};
-use beam_engine::{terms, Machine, MinimalContext};
+use beam_engine::{terms, Machine, MinimalContext, Tier};
 use beam_loader::{
     Export, Function, HeapNeed, Import, ImportRef, Instr, Label, LiteralArea, Module, Opcode,
     Operand, TestKind, NO_FAIL,
@@ -358,10 +358,222 @@ fn swap_exchanges_registers() {
 fn metadata_instructions_are_no_ops() {
     let mut fixture = Fixture::new();
     let module_atom = fixture.atom("m");
-    let function_atom = fixture.atom("f");
     let code = vec![
         Instr::Label(Label(1)),
         Instr::Line(0),
+        Instr::IntCodeEnd,
+        Instr::ExecutableLine {
+            location: 0,
+            index: 0,
+        },
+        Instr::DebugLine {
+            kind: Operand::Atom(module_atom),
+            location: 0,
+            index: 0,
+            live: 0,
+        },
+        Instr::NifStart,
+        Instr::OnLoad,
+        Instr::Move {
+            src: Operand::Integer(42),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let entry = fixture.add_function("f", 0, code);
+    let module = fixture.finish();
+    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(42)));
+}
+
+/// The interned atom term `name` of `module`.
+fn atom_of(module: &Module, name: &str) -> Eterm {
+    make_atom(module.atom_table.lookup(name).expect("atom interned"))
+}
+
+/// A failed function-clause guard must raise `function_clause`, not spin.
+///
+/// This is the exact shape `erlc` emits for `f(X) when is_atom(X) -> 1.`:
+///
+/// ```text
+/// Label(1)  func_info m f 1                 ; the clause guard's `fail` label
+/// Label(2)  test is_atom x(0) fail Label(1) ; the entry label (a normal call enters here)
+///           move 1 -> x(0)
+///           return
+/// ```
+///
+/// The callable entry label is the label *after* `func_info` (`Export.label ==
+/// Function::entry_label`), so a normal call never executes `func_info`; the only
+/// way to reach it is a failed guard jumping to its `fail` label. C
+/// (`i_func_info_IaaI`, `emu/beam_emu.c:578-583`) unconditionally raises
+/// `function_clause`. Before the fix the engine treated `func_info` as a no-op, so
+/// the jump fell through to the entry label and re-ran the guard forever — the
+/// `proplists:get_value(a, undefined)` hang. This test fails **fast** (a typed
+/// error, no timing/timeout dependency).
+#[test]
+fn func_info_raises_function_clause_when_a_clause_guard_fails() {
+    let module = func_info_module();
+    let fc = atom_of(&module, "function_clause");
+
+    // A matching argument passes the guard: the entry label is *after* `func_info`,
+    // so the raise never fires on the happy path.
+    assert_eq!(
+        run(&module, Label(2), &[atom_of(&module, "m")]).map_err(|_| ()),
+        Ok(make_small(1)),
+        "a matching clause must return normally, never raise"
+    );
+
+    // A failing guard jumps to `Label(1)` (the `func_info` label) and raises.
+    let (result, machine) = run_inspected(&module, Label(2), &[make_small(7)]);
+    let raise = match result {
+        Err(BeamError::Raise(raise)) => raise,
+        other => panic!("a failed clause guard must raise function_clause, got {other:?}"),
+    };
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, fc)),
+        "the reason is the *bare* atom `function_clause` (not a {{function_clause,Args}} tuple)"
+    );
+    assert_eq!(raise.class, ExceptionClass::Error);
+    assert_eq!(raise.reason, ExitReason::Structured);
+    assert_eq!(raise.reason.as_atom(), None);
+    let live = raise
+        .live_reason()
+        .and_then(|live| live.downcast_ref::<Eterm>())
+        .copied()
+        .expect("the propagated raise carries the live reason term");
+    assert_eq!(live, fc, "the live reason term is the `function_clause` atom");
+}
+
+/// The regression directly: entering at the `func_info` label itself raises, rather
+/// than falling through to the entry label and looping.
+#[test]
+fn entering_at_the_func_info_label_raises_function_clause() {
+    let module = func_info_module();
+    let (result, machine) = run_inspected(&module, Label(1), &[]);
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "entering at a func_info label must raise, got {result:?}"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, atom_of(&module, "function_clause")))
+    );
+}
+
+/// A live in-engine `try`/`catch` frame catches the `func_info` raise.
+#[test]
+fn function_clause_from_func_info_lands_in_a_live_catch_frame() {
+    // Label(1)  func_info m f 1
+    // Label(2)  try {f,4} x(9)
+    //           test is_atom x(0) fail Label(1)   ; the guard jumps to func_info
+    //           move 1 -> x(0)
+    //           return
+    // Label(4)  move x(1) -> x(0)                 ; catch handler returns the reason
+    //           return
+    let mut fixture = Fixture::new();
+    let module_atom = fixture.atom("m");
+    let function_atom = fixture.atom("f");
+    fixture.atom("function_clause");
+    fixture.atom("error");
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::FuncInfo {
+            module: module_atom,
+            function: function_atom,
+            arity: 1,
+        },
+        Instr::Label(Label(2)),
+        Instr::Try {
+            frame: Operand::X(9),
+            fail: Label(4),
+        },
+        Instr::Test {
+            kind: TestKind::IsAtom,
+            fail: Label(1),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+        Instr::Label(Label(4)),
+        Instr::Move {
+            src: Operand::X(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let _ = fixture.add_function("f", 1, code);
+    let module = fixture.finish();
+
+    let (result, machine) = run_inspected(&module, Label(2), &[make_small(7)]);
+    assert_eq!(
+        result.map_err(|_| ()),
+        Ok(atom_of(&module, "function_clause")),
+        "the handler returned the landed reason term"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, atom_of(&module, "function_clause")))
+    );
+}
+
+/// The baseline JIT must not inline `func_info` as a no-op: it deopts through
+/// `jit_step_one` to the interpreter arm, so a JIT'd run raises exactly like the
+/// interpreter instead of spinning on the entry label.
+#[test]
+fn the_baseline_jit_raises_function_clause_from_func_info() {
+    let module = func_info_module();
+    let function = module.atom_table.lookup("f").expect("f interned");
+
+    // The happy path still returns 1 (the entry label is *after* `func_info`).
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let ok = machine.run_with_tier(
+        &module,
+        function,
+        1,
+        &[atom_of(&module, "m")],
+        &mut ctx,
+        Tier::BaselineJit,
+    );
+    assert_eq!(
+        ok.map_err(|_| ()),
+        Ok(make_small(1)),
+        "a matching clause returns normally through the JIT"
+    );
+
+    // A failing guard jumps to the `func_info` label and raises.
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::new();
+    let result = machine.run_with_tier(
+        &module,
+        function,
+        1,
+        &[make_small(7)],
+        &mut ctx,
+        Tier::BaselineJit,
+    );
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "the baseline JIT must raise function_clause, got {result:?}"
+    );
+    assert_eq!(
+        machine.pending_exception(),
+        Some((ExceptionClass::Error, atom_of(&module, "function_clause")))
+    );
+}
+
+/// A module whose atom table lacks `function_clause` gets a typed `unsupported`
+/// (never a substituted, wrong atom).
+#[test]
+fn func_info_without_the_function_clause_atom_is_a_typed_unsupported() {
+    let mut fixture = Fixture::new();
+    let module_atom = fixture.atom("m");
+    let function_atom = fixture.atom("f");
+    let code = vec![
+        Instr::Label(Label(1)),
         Instr::FuncInfo {
             module: module_atom,
             function: function_atom,
@@ -372,12 +584,50 @@ fn metadata_instructions_are_no_ops() {
             src: Operand::Integer(42),
             dst: Operand::X(0),
         },
-        Instr::IntCodeEnd,
         Instr::Return,
     ];
-    let entry = fixture.add_function("f", 0, code);
+    let _ = fixture.add_function("f", 0, code);
     let module = fixture.finish();
-    assert_eq!(run(&module, entry, &[]).map_err(|_| ()), Ok(make_small(42)));
+    let (result, _) = run_inspected(&module, Label(1), &[]);
+    assert_unsupported(result, "func_info: no 'function_clause' atom in the module");
+}
+
+/// The `func_info` module used by the raise tests: `F(X) when is_atom(X) -> 1.`
+/// with the clause guard's `fail` label pointing at the `func_info` label.
+fn func_info_module() -> Module {
+    let mut fixture = Fixture::new();
+    let module_atom = fixture.atom("m");
+    let function_atom = fixture.atom("f");
+    fixture.atom("function_clause");
+    fixture.atom("error");
+    let code = vec![
+        Instr::Label(Label(1)),
+        Instr::FuncInfo {
+            module: module_atom,
+            function: function_atom,
+            arity: 1,
+        },
+        Instr::Label(Label(2)),
+        Instr::Test {
+            kind: TestKind::IsAtom,
+            fail: Label(1),
+            args: vec![Operand::X(0)],
+        },
+        Instr::Move {
+            src: Operand::Integer(1),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let _ = fixture.add_function("f", 1, code);
+    // Export `f/1` at its entry label (the label *after* `func_info`), exactly as
+    // the loader's `ExpT` resolves it — so the tier-selecting entries can run it.
+    fixture.module.exports.push(Export {
+        function: function_atom,
+        arity: 1,
+        label: Label(2),
+    });
+    fixture.finish()
 }
 
 // ---------------------------------------------------------------------------

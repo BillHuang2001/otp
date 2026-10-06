@@ -61,7 +61,7 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 /// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
 /// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
 ///
-/// Three groups:
+/// Four groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
 ///   and the boolean atoms (`unix`, `linux`, `win32`, `nt`, `true`, `false`);
@@ -70,7 +70,18 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 ///   `process`, `normal`, `kill`, `killed`), plus the module names of the boot surface;
 /// * the atoms the runtime-native `code:*` floor ([`crate::native`]) answers with —
 ///   `preloaded`/`non_existing` (`code:which/1`, `code:all_loaded/0`) and `bad_name`
-///   (the `{error, bad_name}` of `code:lib_dir/1`).
+///   (the `{error, bad_name}` of `code:lib_dir/1`);
+/// * the **exception reason/class** atoms the engine's `func_info` and
+///   `raise_bif_error` paths resolve from the *running module's* atom table at raise
+///   time: the bare reason `function_clause` (C: `i_func_info_IaaI` sets
+///   `EXC_FUNCTION_CLAUSE`; the call arguments ride in the stacktrace, not the reason)
+///   and the two remaining class names `exit`/`throw` (`error` is already in the core
+///   set above). Seeding them here is what lets a module that never mentions the name
+///   itself still raise the reason the oracle raises.
+///
+/// The three exception atoms are **appended last** on purpose: every index assigned
+/// before them must stay stable (module code and the positional-atom tests depend on
+/// the existing prefix), so this group may only ever be extended at the end.
 ///
 /// This is deliberately **not** the full `atom.names` ordering of the legacy emulator:
 /// positional atom indices for preloaded code are a documented Milestone-1 gap.
@@ -103,6 +114,12 @@ pub const CORE_ATOMS: &[&str] = &[
     "normal",
     "kill",
     "killed",
+    // Exception reason/class atoms resolved from the *module* table at raise time
+    // (the engine's `func_info`/`raise_bif_error` paths). Appended last so every
+    // index above is unchanged.
+    "function_clause",
+    "exit",
+    "throw",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -306,8 +323,47 @@ mod tests {
         for name in crate::port::PORT_INFO_ATOMS {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
-        for name in ["name", "id", "connected", "os_pid", "links", "monitors", "stream"] {
+        for name in ["name", "id", "connected", "os_pid", "links", "monitors", "input", "output"]
+        {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+    }
+    #[test]
+    fn seed_core_atoms_interns_the_exception_reason_and_class_atoms() {
+        // The engine's `func_info` arm resolves the failed-clause reason and the exception
+        // CLASS atom from the *running module's* atom table at raise time. A module that
+        // never mentions either name cannot name them itself (`function_clause_fixture.beam`
+        // holds only `function_clause_fixture`, `f`, `a`, `ok`, `module_info`, `erlang`,
+        // `get_module_info`), so the boot seed is the only source: without `function_clause`
+        // a failed function head was a typed `unsupported` capability gap instead of the
+        // oracle's `error:function_clause`.
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        for name in ["function_clause", "exit", "throw"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        // `error` is the class of every raise the two paths produce; it is part of the
+        // documented core set.
+        assert!(atoms.lookup("error").is_some(), "error must be seeded");
+        // The three new names are **appended**: every index the seed assigned before them is
+        // unchanged (module code and the positional-atom assumptions depend on the prefix),
+        // so a table seeded with the prefix alone must resolve those names identically.
+        let tail = CORE_ATOMS.len() - 3;
+        assert_eq!(
+            &CORE_ATOMS[tail..],
+            &["function_clause", "exit", "throw"],
+            "the exception atoms must be the last entries, in this order"
+        );
+        let mut prefix = AtomTable::new();
+        for name in &CORE_ATOMS[..tail] {
+            prefix.intern(name);
+        }
+        for name in &CORE_ATOMS[..tail] {
+            assert_eq!(
+                atoms.lookup(name),
+                prefix.lookup(name),
+                "{name} must keep the index it had before the exception atoms were appended"
+            );
         }
     }
     #[test]

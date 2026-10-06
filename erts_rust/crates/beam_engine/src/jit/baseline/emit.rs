@@ -288,9 +288,12 @@ fn emit_block(
         let pc = (start + i) as u32;
         match instr {
             // Metadata / no-ops (`ops.tab:103-108`): they never change control flow.
+            // `func_info` is **not** here: it is the failed-clause raise (see the
+            // interpreter's `Instr::FuncInfo` arm), so it must deopt through
+            // `jit_step_one` rather than be inlined as a no-op (which would fall
+            // through to the entry label and re-run the clause tests forever).
             Instr::Label(_)
             | Instr::Line(_)
-            | Instr::FuncInfo { .. }
             | Instr::IntCodeEnd
             | Instr::ExecutableLine { .. }
             | Instr::DebugLine { .. } => {}

@@ -535,7 +535,10 @@ impl Runtime {
     /// # Errors
     ///
     /// * the code server's not-found/malformed diagnostic for `module`;
-    /// * a diagnostic when `function/arity` is not exported by it;
+    /// * [`crate::error::undef`] (class `error`, bare reason atom `undef`) when
+    ///   `function/arity` is not exported by it — the same raise
+    ///   `RuntimeContext::run_export` produces for a call the release does not have
+    ///   (the module/function/arity live in the stacktrace, not the reason);
     /// * the process table's allocation failure.
     pub fn spawn_process(
         &mut self,
@@ -552,14 +555,13 @@ impl Runtime {
             let _ = self.find_module_file(module);
         }
         let loaded = self.code_server.load(module)?;
-        let name = loaded.atom_name(loaded.name).unwrap_or("<unnamed>").to_string();
         let arity = args.len() as u32;
         let function_atom = loaded
             .atom_table
             .lookup(function)
-            .ok_or_else(|| error::unknown_function(&name, function, arity))?;
+            .ok_or_else(error::undef)?;
         if loaded.export(function_atom, arity).is_none() {
-            return Err(error::unknown_function(&name, function, arity));
+            return Err(error::undef());
         }
         let pid = self.processes.spawn_default()?;
         self.runner_state.spawn(
@@ -1063,16 +1065,44 @@ mod tests {
     }
 
     #[test]
-    fn unknown_function_and_arity_are_diagnostics() {
+    fn a_missing_export_raises_undef() {
+        // `run_function`/`run_module` delegate the export lookup to
+        // `RuntimeContext::run_export`, which now raises the oracle's bare `error:undef`
+        // for a function the module does not have (see `crate::context::run_export`).
         let mut rt = runtime();
         let error = rt
             .run_function(SLICE_BEAM, "nope", 0, &[])
             .expect_err("not exported");
-        assert!(error.to_string().contains("slice:nope/0"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
         let error = rt
             .run_function(SLICE_BEAM, "add", 1, &[make_small(1)])
             .expect_err("wrong arity");
-        assert!(error.to_string().contains("slice:add/1"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
+    }
+
+    #[test]
+    fn a_spawn_of_a_missing_export_raises_undef() {
+        // `spawn_process` resolves the entry point exactly as `run_export` does, so a
+        // function the module does not export (or a wrong arity) is the same **bare**
+        // `error:undef` — never a message-bearing diagnostic and never a capability gap.
+        let mut rt = runtime();
+        rt.load_module(SLICE_BEAM).expect("load slice.beam");
+
+        let error = rt
+            .spawn_process("slice", "nope", vec![])
+            .expect_err("slice:nope/0 is not exported");
+        assert!(error.is_raise(), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
+        assert_eq!(error.to_string(), "error undef", "{error}");
+        // A genuine raise, not a Milestone-1 capability gap (so the CLI exits 1).
+        assert_eq!(error::unsupported_reason(&error), None, "{error}");
+
+        let error = rt
+            .spawn_process("slice", "add", vec![make_small(1)])
+            .expect_err("slice:add/1 is not exported");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
+
+        assert_eq!(rt.run_queue_len(), 0, "no failed spawn enqueued anything");
     }
 
     #[test]

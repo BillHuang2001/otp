@@ -13,6 +13,12 @@
 use std::path::Path;
 use std::process::{Command, Output};
 
+/// The committed structured-raise fixture: `badkey/0` = `maps:get(nokey, #{})`.
+const RAISE_STRUCTURED_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/raise_structured.beam"
+);
+
 /// The `beam_loader` oracle fixture (reused, never copied).
 const SLICE_BEAM: &str = concat!(
     env!("CARGO_MANIFEST_DIR"),
@@ -199,10 +205,51 @@ fn the_s_action_applies_with_atom_arguments_and_discards_the_result() {
 
 #[test]
 fn the_code_path_is_searched_for_the_module() {
-    // Without `-pa`, the module cannot be found: a runtime error, not a panic.
+    // Without `-pa`, the module cannot be found: the oracle's `error:undef`, a runtime
+    // error (exit 1), not a panic and not a usage error.
     let output = beam_rt(&["-s", "slice", "pick", "a"]);
     assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
     let message = stderr(&output);
-    assert!(message.contains("slice.beam"), "{message}");
+    assert!(message.contains("undef"), "{message}");
     assert!(!message.contains("Usage:"), "{message}");
+}
+
+/// `run` renders the **real** reason term of an uncaught structured raise.
+///
+/// `raise_structured:badkey/0` is `maps:get(nokey, #{})`, so the oracle's uncaught
+/// reason is `{badkey,nokey}`: the diagnostic must print that term, not the
+/// `Display` placeholder `<structured reason>` a term-free `beam_common::Raise` renders.
+#[test]
+fn run_prints_the_real_reason_of_a_structured_raise() {
+    let output = beam_rt(&[
+        "run",
+        RAISE_STRUCTURED_BEAM,
+        "raise_structured:badkey/0",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    assert!(stdout(&output).is_empty(), "stdout: {}", stdout(&output));
+    let message = stderr(&output);
+    assert_eq!(message, "beam_rt: error {badkey,nokey}\n", "{message}");
+    assert!(!message.contains("<structured reason>"), "{message}");
+    // A genuine runtime error, never a capability gap (exit 3) and no usage text.
+    assert!(!message.contains("unsupported"), "{message}");
+    assert!(!message.contains("Usage:"), "{message}");
+}
+
+/// An **atom**-reason raise is unchanged: the reason is the bare atom.
+///
+/// `raise_structured:nope/0` does not exist, so the raise is the oracle's `error:undef`
+/// (reason atom `undef`, the same bare atom the run path raises for a missing export):
+/// the diagnostic stays `error undef` — never a message and never the placeholder.
+#[test]
+fn run_keeps_an_atom_reason_a_bare_atom() {
+    let output = beam_rt(&[
+        "run",
+        RAISE_STRUCTURED_BEAM,
+        "raise_structured:nope/0",
+    ]);
+    assert_eq!(output.status.code(), Some(1), "stderr: {}", stderr(&output));
+    let message = stderr(&output);
+    assert_eq!(message, "beam_rt: error undef\n", "{message}");
+    assert!(!message.contains("<structured reason>"), "{message}");
 }

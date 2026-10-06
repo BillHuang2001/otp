@@ -50,8 +50,10 @@
 //!
 //! # What is real, and what is not (yet)
 //!
-//! **Real:** `open_port({spawn, Cmd}, _)` runs `Cmd` through `/bin/sh -c` (or, for an argv
-//! list, runs the program directly); `{spawn_executable, Path}` runs `Path` directly with
+//! **Real:** `open_port({spawn, Cmd}, _)` flattens `Cmd` to a command string and runs it
+//! through `/bin/sh -c` with an `exec` prefix (`/bin/sh -c "exec Cmd"` — the shell replaces
+//! itself with the command, exactly as the oracle does, so `{spawn,"echo a; echo b"}`
+//! produces only `"a\n"`); `{spawn_executable, Path}` runs `Path` directly with
 //! the `{args, …}` option; `{fd, N}` registers a descriptor port; the port gets a real
 //! [`PortId`] out of `beam_io`'s registry; `port_close/1` kills and reaps the child and
 //! returns the id to the table; `port_info/1,2` answers real items; and the child's stdout
@@ -71,17 +73,20 @@
 //! synthesized); and a `port_command/2,3` write to a `{fd, N}` port (which owns no child
 //! pipe) is a typed *unsupported* gap.
 //!
-//! # `port_info` items (and the deliberate deviations)
+//! # `port_info` items
 //!
-//! `port_info/1` answers `name`, `id`, `connected`, `os_pid`, `links`, `monitors` and
-//! `stream`. Three of those differ from what erts-17.1 reports, and the difference is
-//! deliberate (never a fabricated value, but not a bit-for-bit copy either):
+//! The pair list [`PortRegistry::info`] returns **is** the oracle's answer for both
+//! arities: `beam_bifs`'s `erlang:port_info/1` filters it down to the seven `/1` items and
+//! `erlang:port_info/2` searches it whole. In order:
 //!
-//! * `id` is the **port term** ([`PortId::to_eterm`]); the oracle reports a bare integer.
-//! * `connected` is the boolean `true`/`false`; the oracle reports the *controlling
-//!   process* (a pid) while a port is connected.
-//! * `stream` reflects the `binary`/`list` option, which the oracle does not report as an
-//!   item at all (it reports `input`/`output` byte counters instead).
+//! `{name, …}`, `{links, [Owner]}`, `{id, N}`, `{connected, Owner}`, `{input, 0}`,
+//! `{output, 0}`, `{os_pid, N|undefined}` and — the `/2`-only extra — `{monitors, []}`.
+//!
+//! `links` is the owner process as a one-element list and `connected` is that owner pid,
+//! matching erts-17.1 (nothing else links or monitors a port in Milestone-1). `input`/
+//! `output` are byte counters — always `0` (the runtime keeps no per-port totals). The
+//! oracle's own `stream` is **not** an item at all: `erlang:port_info(P, stream)` is
+//! `error:badarg`.
 //!
 //! A port the runtime no longer knows (closed, or never opened) answers with an **empty**
 //! pair list — which both `erlang:port_info/1` and `erlang:port_info/2` render as the atom
@@ -171,19 +176,55 @@ pub const PORT_INFO_ATOMS: &[&str] = &[
     "connected",
     "os_pid",
     "links",
+    "input",
+    "output",
     "monitors",
-    "stream",
-    // The `stream` values.
-    "binary",
-    "list",
     // The shape of a `monitors` entry.
     "process",
+];
+
+/// The option **atoms** an `open_port/2` call accepts — the oracle's strict whitelist
+/// (`erts/emulator/beam/erl_bif_port.c`).
+///
+/// Anything outside this list — including `list` (a list stream is already the default) — is
+/// [`BeamError::BadArg`], never silently ignored. Only `binary` and `exit_status` change the
+/// port here; the rest are recognized and accepted without effect.
+const PORT_OPTION_ATOMS: &[&str] = &[
+    "stream",
+    "use_stdio",
+    "stderr_to_stdout",
+    "line",
+    "nouse_stdio",
+    "binary",
+    "in",
+    "out",
+    "eof",
+    "hide",
+    "exit_status",
+    "overlapped_io",
+];
+
+/// The option **tuple tags** an `open_port/2` call accepts — the oracle's strict whitelist
+/// (`erts/emulator/beam/erl_bif_port.c`).
+///
+/// `cd`, `env` and `args` are honored; the rest are recognized and accepted without effect.
+/// A tag outside this list is [`BeamError::BadArg`].
+const PORT_OPTION_TUPLES: &[&str] = &[
+    "packet",
+    "line",
+    "env",
+    "args",
+    "arg0",
+    "cd",
+    "parallelism",
+    "busy_limits_port",
+    "busy_limits_msgq",
 ];
 
 /// Which `Name` the `open_port/2` call used — the driver that backs the port.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum PortName {
-    /// `{spawn, Cmd}`: run `Cmd` through `/bin/sh -c` (or, for an argv list, directly).
+    /// `{spawn, Cmd}`: flatten `Cmd` and run it through `/bin/sh -c "exec Cmd"`.
     Spawn,
     /// `{spawn_executable, Path}`: run `Path` directly with the `args` option.
     SpawnExecutable,
@@ -198,16 +239,6 @@ pub enum StreamType {
     Binary,
     /// `list` — the driver would deliver `{Port, {data, Str}}` (the `erl` default).
     List,
-}
-
-impl StreamType {
-    /// The atom `port_info(Port, stream)` answers with.
-    pub fn atom_name(self) -> &'static str {
-        match self {
-            StreamType::Binary => "binary",
-            StreamType::List => "list",
-        }
-    }
 }
 
 impl From<StreamType> for SpawnStream {
@@ -225,23 +256,23 @@ impl From<StreamType> for SpawnStream {
 ///
 /// `beam_io`'s port owns the child, the descriptors and the lifecycle; these are the Erlang
 /// side's facts: the `Name` the port was opened with, the OS pid the driver reported, the
-/// stream option, the `connected` answer, the `exit_status` flag and the process the port
-/// belongs to (which is where its stream/exit messages are delivered).
+/// stream option, the `exit_status` flag and the process the port belongs to (which is where
+/// its stream/exit messages are delivered, and which `port_info(Port, connected)`/`links`
+/// report).
 #[derive(Debug)]
 struct PortMeta {
     /// Which `Name` form opened the port.
     name: PortName,
-    /// The raw command line (a shell command, or an argv join) or path — the
-    /// `port_info(Port, name)` value.
+    /// The raw command line (a flattened shell command, or a path) — the
+    /// `port_info(Port, name)` value. The `exec` prefix the shell form runs with is **not**
+    /// part of it.
     command: String,
     /// The OS process id the driver reported **before** the port was registered; absent for
     /// a `{fd, N}` port.
     os_pid: Option<u32>,
-    /// The `binary`/`list` option.
+    /// The `binary`/`list` option (shapes the `{Port, {data, …}}` messages; no longer a
+    /// `port_info` item).
     stream: StreamType,
-    /// `port_info(Port, connected)`. Tracks the *port*, not the child: an independently
-    /// exited child does not flip this (see the module docs).
-    connected: bool,
     /// Whether the `exit_status` option was asked for.
     ///
     /// `beam_io`'s driver already hands the status out exactly once
@@ -249,13 +280,11 @@ struct PortMeta {
     /// guard — it is what [`PortRegistry::pump`] uses to skip the status check for a port
     /// that never asked for it.
     notify_exit: bool,
-    /// The processes linked to this port. Empty in Milestone-1: nothing links a port yet.
-    links: Vec<ProcessId>,
     /// The processes monitoring this port. Empty in Milestone-1: nothing monitors a port
     /// yet, and `beam_term` has no reference term to identify a monitor by.
     monitors: Vec<ProcessId>,
     /// The process the port belongs to — the recipient of its `{Port, {data, …}}` and
-    /// `{Port, {exit_status, …}}` messages.
+    /// `{Port, {exit_status, …}}` messages, and the value of its `connected`/`links` items.
     owner: ProcessId,
 }
 
@@ -531,13 +560,18 @@ impl PortRegistry {
         Ok(events)
     }
 
-    /// The `{Item, Value}` pairs of `port` — the `port_info/1` answer.
+    /// The `{Item, Value}` pairs of `port` — the `port_info/1,2` answer.
     ///
     /// Every item atom is resolved through `atoms` (the runtime's one shared table). A port
     /// the registry does not hold answers with an **empty** list — never a fabricated pair,
     /// and never `badarg`: the oracle's `erlang:port_info/1,2` answer `undefined` for a
     /// closed port, which is exactly what an empty list renders as through the wrapper
     /// (see the module docs and `RuntimeContext::port_info_closed_port`).
+    ///
+    /// The list is the oracle's answer for **both** arities: `beam_bifs`'s
+    /// `erlang:port_info/1` keeps the seven `/1` items and drops the final `monitors`
+    /// pair, while `erlang:port_info/2` searches them all. The order and the value shapes
+    /// are the ones erts-17.1 reports (see the module docs).
     ///
     /// # Errors
     ///
@@ -557,24 +591,34 @@ impl PortRegistry {
         // `self.meta` and `self.heap` are disjoint fields, so the immutable borrow of the
         // port and the mutable borrow of the arena coexist.
         let name = charlist(&mut self.heap, &meta.command)?;
-        let links = pid_list(&mut self.heap, &meta.links)?;
+        // The owning process is the port's only link (`[]`-shaped as `[Owner]`) and its
+        // `connected` value — both the oracle's answer while the port is live.
+        let owner = meta.owner.to_eterm();
+        let links = pid_list(&mut self.heap, &[meta.owner])?;
         let monitors = monitor_list(&mut self.heap, atoms, &meta.monitors)?;
+        // `id` is a **bare small integer** (the oracle's shape), not the port term.
+        let id = try_make_small(i64::try_from(port.number()).map_err(|_| BeamError::SystemLimit)?)
+            .map_err(|_| BeamError::SystemLimit)?;
+        // `input`/`output` are byte counters; the runtime keeps no per-port totals, so both
+        // are `0` — which is what the oracle reports right after `open_port`.
+        let input = make_small(0);
+        let output = make_small(0);
         let os_pid = match meta.os_pid {
             Some(pid) => try_make_small(i64::from(pid)).map_err(|_| BeamError::SystemLimit)?,
             // `port_info(Port, os_pid)` is `undefined` for a port without an OS process —
             // the oracle's own answer.
             None => item("undefined")?,
         };
-        let connected = item(if meta.connected { "true" } else { "false" })?;
-        let stream = item(meta.stream.atom_name())?;
         Ok(vec![
             (item("name")?, name),
-            (item("id")?, port.to_eterm()),
-            (item("connected")?, connected),
-            (item("os_pid")?, os_pid),
             (item("links")?, links),
+            (item("id")?, id),
+            (item("connected")?, owner),
+            (item("input")?, input),
+            (item("output")?, output),
+            (item("os_pid")?, os_pid),
+            // The `/2`-only extra item; `beam_bifs`'s `port_info/1` drops it.
             (item("monitors")?, monitors),
-            (item("stream")?, stream),
         ])
     }
 }
@@ -586,8 +630,6 @@ struct NameSpec {
     kind: PortName,
     /// The command line (or path) `port_info(Port, name)` reports.
     command: String,
-    /// The argv vector to run directly, when the name carried one (`{spawn, […]}`).
-    argv: Option<Vec<String>>,
     /// The adopted descriptor of a `{fd, N}` name.
     fd: Option<RawFd>,
     /// The inline option list of `{spawn_executable, Path, Opts}`, if given.
@@ -597,6 +639,12 @@ struct NameSpec {
 impl NameSpec {
     /// The term-free [`beam_io::SpawnSpec`] this validated name describes.
     ///
+    /// A `{spawn, Cmd}` port runs through the shell with an `exec` prefix (`/bin/sh -c
+    /// "exec Cmd"`): the oracle's `spawn` driver replaces the shell with the command, so
+    /// `{spawn,"echo a; echo b"}` produces only `"a\n"` and `{spawn,"exit 3"}` reports
+    /// `127`. `PortMeta::command` keeps the **raw** flattened command so
+    /// `port_info(Port, name)` still reports `"true"`/`"cat"`.
+    ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a `{fd, N}` name without a validated descriptor (a
@@ -604,8 +652,8 @@ impl NameSpec {
     fn spawn_spec(&self) -> Result<SpawnSpec> {
         match self.kind {
             PortName::Spawn => Ok(SpawnSpec::Spawn {
-                command: self.command.clone(),
-                argv: self.argv.clone(),
+                command: format!("exec {}", self.command),
+                argv: None,
             }),
             PortName::SpawnExecutable => Ok(SpawnSpec::SpawnExecutable {
                 path: self.command.clone(),
@@ -756,27 +804,21 @@ impl RuntimePorts {
         let tag = terms::tuple_element(name, 0)?;
         let tag = self.atom_name(tag).ok_or(BeamError::BadArg)?;
         match (tag, arity) {
-            ("spawn", 2) => {
-                let (command, argv) = self.command_spec(terms::tuple_element(name, 1)?)?;
-                Ok(NameSpec {
-                    kind: PortName::Spawn,
-                    command,
-                    argv,
-                    fd: None,
-                    inline_options: None,
-                })
-            }
+            ("spawn", 2) => Ok(NameSpec {
+                kind: PortName::Spawn,
+                command: self.command_spec(terms::tuple_element(name, 1)?)?,
+                fd: None,
+                inline_options: None,
+            }),
             ("spawn_executable", 2) => Ok(NameSpec {
                 kind: PortName::SpawnExecutable,
                 command: self.string_value(terms::tuple_element(name, 1)?)?,
-                argv: None,
                 fd: None,
                 inline_options: None,
             }),
             ("spawn_executable", 3) => Ok(NameSpec {
                 kind: PortName::SpawnExecutable,
                 command: self.string_value(terms::tuple_element(name, 1)?)?,
-                argv: None,
                 fd: None,
                 inline_options: Some(terms::tuple_element(name, 2)?),
             }),
@@ -791,7 +833,6 @@ impl RuntimePorts {
                 Ok(NameSpec {
                     kind: PortName::Fd,
                     command: format!("fd:{fd}"),
-                    argv: None,
                     fd: Some(fd),
                     inline_options: None,
                 })
@@ -800,75 +841,100 @@ impl RuntimePorts {
         }
     }
 
-    /// The command of a `{spawn, Cmd}` name: a shell command line, or an argv vector.
+    /// The command of a `{spawn, Cmd}` name, **flattened** to a single shell command line.
     ///
-    /// A char list / binary / atom is a command line the shell runs (`/bin/sh -c`). A list
-    /// whose elements are themselves strings/atoms is an argv vector, run directly — the
-    /// second form the real `spawn` driver accepts.
-    fn command_spec(&self, value: Eterm) -> Result<(String, Option<Vec<String>>)> {
-        if is_atom(value) || terms::binary_bytes(value).is_ok() {
-            return Ok((self.string_value(value)?, None));
+    /// The oracle has no argv form for `{spawn, …}`: whatever the value's shape — an atom, a
+    /// binary, a char list, or an iolist of those — it is flattened to one byte string and
+    /// run through the shell (`{spawn,["/bin/echo","hi"]}` is the command `/bin/echohi`, no
+    /// space inserted). The flattened command is what `port_info(Port, name)` reports.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a value that is not an atom/binary/char list/iolist, or
+    /// whose bytes are not UTF-8 (the command must be a `String`).
+    fn command_spec(&self, value: Eterm) -> Result<String> {
+        let mut bytes = Vec::new();
+        self.flatten_command(value, &mut bytes)?;
+        String::from_utf8(bytes).map_err(|_| BeamError::BadArg)
+    }
+
+    /// Appends the bytes of `value` — an atom, a binary, or a (possibly nested) list of
+    /// those — to `out`, recursively.
+    fn flatten_command(&self, value: Eterm, out: &mut Vec<u8>) -> Result<()> {
+        if let Some(name) = self.atom_name(value) {
+            out.extend_from_slice(name.as_bytes());
+            return Ok(());
         }
-        let elements = terms::list_elements(value)?;
-        if elements.iter().all(|element| is_small(*element)) {
-            // A string: the shell runs it.
-            return Ok((self.string_value(value)?, None));
+        if let Ok(bytes) = terms::binary_bytes(value) {
+            out.extend_from_slice(bytes);
+            return Ok(());
         }
-        let mut argv = Vec::with_capacity(elements.len());
-        for element in elements {
-            argv.push(self.string_value(element)?);
+        for element in terms::list_elements(value)? {
+            if is_small(element) {
+                out.push(u8::try_from(signed_value(element)).map_err(|_| BeamError::BadArg)?);
+            } else {
+                self.flatten_command(element, out)?;
+            }
         }
-        if argv.is_empty() {
-            return Err(BeamError::BadArg);
-        }
-        let display = argv.join(" ");
-        Ok((display, Some(argv)))
+        Ok(())
     }
 
     /// The validated option list of an `open_port/2` call.
     ///
-    /// `binary`/`list`, `{cd, Dir}`, `{env, [{Name, Value}]}`, `{args, [String]}` and
-    /// `exit_status` are honored. `eof` is **recognized and accepted but has no effect**
-    /// (see the module docs), and any other option — an unknown atom, or an unknown tuple —
-    /// is tolerated: the real `erl` validates a longer list than Milestone-1 needs, and
-    /// rejecting a driver option that simply has no effect here would be worse than
-    /// ignoring it.
+    /// A **strict whitelist**, matching the oracle (`erts/emulator/beam/erl_bif_port.c`):
+    /// any option the driver cannot accept is [`BeamError::BadArg`], never silently ignored.
+    /// The accepted option **atoms** are [`PORT_OPTION_ATOMS`] and the accepted option
+    /// **tuple tags** are [`PORT_OPTION_TUPLES`]; anything outside them — including the
+    /// `list` atom (a list stream is already the default) — is `badarg`.
     ///
-    /// A non-list `Options`, a non-atom/non-tuple option element, a recognized option with
-    /// a malformed value (`{cd, 5}`, `{args, foo}`) or the wrong arity is
-    /// [`BeamError::BadArg`] — those the drivers clearly cannot accept.
+    /// `binary` (the stream shape), `exit_status`, `{cd, Dir}`, `{env, [{Name, Value}]}` and
+    /// `{args, [String]}` are honored; every other whitelisted option is recognized and
+    /// accepted **without effect** here (`eof`, `stream`, `use_stdio`, `in`, `out`, `hide`,
+    /// `line`, `{packet, N}`, `{parallelism, Bool}`, …). A whitelisted tuple with the wrong
+    /// arity, or a recognized option with a malformed value (`{cd, 5}`, `{args, foo}`), is
+    /// [`BeamError::BadArg`] — the drivers cannot accept those.
     fn port_options(&self, options: Eterm) -> Result<PortOptions> {
         let mut parsed = PortOptions::default();
         for element in terms::list_elements(options)? {
             if is_atom(element) {
-                match self.atom_name(element) {
-                    Some("binary") => parsed.stream = Some(StreamType::Binary),
-                    Some("list") => parsed.stream = Some(StreamType::List),
+                let name = self.atom_name(element).ok_or(BeamError::BadArg)?;
+                // `list` and every other non-whitelisted atom (a driver option this runtime
+                // does not know) are rejected: the oracle's strict list has no tolerance.
+                if !PORT_OPTION_ATOMS.contains(&name) {
+                    return Err(BeamError::BadArg);
+                }
+                match name {
+                    "binary" => parsed.stream = Some(StreamType::Binary),
                     // The driver queues a `{Port, {exit_status, Status}}` message once the
                     // child has been reaped — the pump reports it.
-                    Some("exit_status") => parsed.exit_status = true,
-                    // Recognized, accepted, and without effect (see the module docs).
-                    Some("eof") => {}
-                    // Any other option atom is tolerated.
+                    "exit_status" => parsed.exit_status = true,
+                    // Whitelisted, accepted, without effect here (see the module docs).
                     _ => {}
                 }
                 continue;
             }
             let arity = terms::tuple_arity(element)?;
-            let tag = terms::tuple_element(element, 0)?;
-            match (self.atom_name(tag), arity) {
-                (Some("cd"), 2) => {
+            let tag = self.atom_name(terms::tuple_element(element, 0)?).ok_or(BeamError::BadArg)?;
+            // A tag outside the whitelist is not a usable option.
+            if !PORT_OPTION_TUPLES.contains(&tag) {
+                return Err(BeamError::BadArg);
+            }
+            // Every whitelisted tuple option is a 2-tuple (`{packet, N}`, `{cd, Dir}`, …); a
+            // whitelisted tag with the wrong arity is not a usable option.
+            if arity != 2 {
+                return Err(BeamError::BadArg);
+            }
+            match tag {
+                "cd" => {
                     parsed.cd = Some(self.string_value(terms::tuple_element(element, 1)?)?);
                 }
-                (Some("env"), 2) => {
+                "env" => {
                     parsed.env = self.env_list(terms::tuple_element(element, 1)?)?;
                 }
-                (Some("args"), 2) => {
+                "args" => {
                     parsed.args = self.arg_list(terms::tuple_element(element, 1)?)?;
                 }
-                // A recognized option with the wrong arity is not a usable option.
-                (Some("cd" | "env" | "args"), _) => return Err(BeamError::BadArg),
-                // An unknown tuple option is tolerated.
+                // Whitelisted, accepted, without effect here.
                 _ => {}
             }
         }
@@ -929,9 +995,7 @@ impl PortHook for RuntimePorts {
             command: spec.command,
             os_pid,
             stream,
-            connected: true,
             notify_exit: spawn_options.exit_status,
-            links: Vec::new(),
             monitors: Vec::new(),
             owner: self.owner,
         };
@@ -1194,18 +1258,40 @@ mod tests {
     }
 
     /// The vocabulary the tests build `Name`/`Options` terms out of, and the item atoms.
+    ///
+    /// The item atoms (`name`, `id`, `connected`, `os_pid`, `links`, `input`, `output`,
+    /// `monitors`) come from the boot seed; the option atoms do not, so the whole
+    /// `open_port/2` option whitelist is interned here too.
     const TEST_ATOMS: &[&str] = &[
         "spawn",
         "spawn_executable",
         "fd",
         "not_a_driver",
+        // The honored option tags.
         "cd",
         "env",
         "args",
-        "packet",
+        // The full option-atom whitelist and its rejected neighbours.
+        "stream",
+        "use_stdio",
+        "stderr_to_stdout",
+        "line",
+        "nouse_stdio",
+        "binary",
+        "list",
+        "in",
+        "out",
+        "eof",
         "hide",
-        "nope",
         "exit_status",
+        "overlapped_io",
+        // The option-tuple whitelist and its rejected neighbours.
+        "packet",
+        "arg0",
+        "parallelism",
+        "busy_limits_port",
+        "busy_limits_msgq",
+        "nope",
     ];
 
     fn fixture() -> Fixture {
@@ -1339,22 +1425,41 @@ mod tests {
         let os_pid = signed_value(fx.item(port, "os_pid"));
         assert!(os_pid > 0, "a spawned child has an os pid, got {os_pid}");
 
-        // Every item atom resolves through the shared table (never a fabricated index).
-        let pairs = fx.hook.port_info(port).expect("port_info/1");
-        assert_eq!(pairs.len(), 7);
-        for (key, _) in &pairs {
-            assert!(fx.atoms.name(atom_val(*key)).is_some(), "{key:?}");
-        }
-        assert_eq!(text_of(fx.item(port, "name")), "true");
-        assert_eq!(fx.item(port, "id"), port.to_eterm());
-        assert_eq!(fx.item(port, "connected"), fx.atom("true"));
-        assert_eq!(fx.item(port, "links"), NIL, "nothing links a port yet");
-        assert_eq!(fx.item(port, "monitors"), NIL, "nothing monitors a port yet");
+        // Every item atom resolves through the shared table (never a fabricated index), and
+        // the pair list is exactly the oracle's `/1` roster followed by the `/2`-only
+        // `monitors` — in the oracle's order.
+        let pairs = fx.hook.port_info(port).expect("port_info");
+        let keys: Vec<String> = pairs
+            .iter()
+            .map(|(key, _)| {
+                fx.atoms
+                    .name(atom_val(*key))
+                    .expect("an item atom resolves")
+                    .to_string()
+            })
+            .collect();
         assert_eq!(
-            fx.item(port, "stream"),
-            fx.atom("list"),
-            "`list` is the default stream type"
+            keys,
+            [
+                "name", "links", "id", "connected", "input", "output", "os_pid", "monitors"
+            ]
         );
+        assert_eq!(text_of(fx.item(port, "name")), "true");
+        // `id` is a bare small integer (the port number), **not** the port term.
+        assert_eq!(
+            fx.item(port, "id"),
+            make_small(i64::try_from(port.number()).expect("an id fits"))
+        );
+        // `links` is the owner as a one-element list and `connected` is that same owner pid.
+        let owner = OWNER.to_eterm();
+        assert_eq!(
+            terms::list_elements(fx.item(port, "links")).expect("links is a list"),
+            vec![owner]
+        );
+        assert_eq!(fx.item(port, "connected"), owner);
+        assert_eq!(fx.item(port, "input"), make_small(0), "a byte counter, 0 at open");
+        assert_eq!(fx.item(port, "output"), make_small(0), "a byte counter, 0 at open");
+        assert_eq!(fx.item(port, "monitors"), NIL, "nothing monitors a port yet");
     }
 
     #[test]
@@ -1365,16 +1470,15 @@ mod tests {
         let name = fx.name("spawn", fx.atom("not_a_driver"));
         let port = fx.hook.open_port(name, NIL).expect("{spawn, atom}");
         assert_eq!(text_of(fx.item(port, "name")), "not_a_driver");
-        // `{spawn, [Prog, Arg…]}` — an argv vector, run directly (`/bin/sh` is the one
-        // executable the runtime may assume: the `spawn` driver's shell command form needs
-        // it too).
+        // `{spawn, [Prog, Arg…]}` is **flattened** (concatenation, no separator) into a shell
+        // command line — the oracle has no argv form for `{spawn, …}`.
         let program = fx.string("/bin/sh");
         let dash_c = fx.string("-c");
         let command = fx.string("true");
         let argv = fx.list(&[program, dash_c, command]);
         let name = fx.name("spawn", argv);
         let port = fx.hook.open_port(name, NIL).expect("{spawn, argv}");
-        assert_eq!(text_of(fx.item(port, "name")), "/bin/sh -c true");
+        assert_eq!(text_of(fx.item(port, "name")), "/bin/sh-ctrue");
         // `{spawn_executable, Path}` honouring `{args, […]}` and a `binary` stream.
         let path = fx.string("/bin/sh");
         let name = fx.name("spawn_executable", path);
@@ -1392,7 +1496,16 @@ mod tests {
             .open_port(name, options)
             .expect("{spawn_executable, \"/bin/sh\"} with args");
         assert_eq!(text_of(fx.item(port, "name")), "/bin/sh");
-        assert_eq!(fx.item(port, "stream"), fx.atom("binary"));
+        // `stream` is no longer a `port_info` item: the honored `binary` option is asserted
+        // on the port's own metadata.
+        let stream = fx
+            .registry
+            .borrow()
+            .meta
+            .get(&port.number())
+            .expect("a live port")
+            .stream;
+        assert_eq!(stream, StreamType::Binary);
 
         // `{fd, N}` registers a descriptor port with no OS process. The descriptor is a
         // socketpair end the **test** owns and keeps open: `beam_io`'s driver adopts a
@@ -1406,9 +1519,10 @@ mod tests {
         let fd = local.as_raw_fd();
         let name = fx.name("fd", make_small(i64::from(fd)));
         let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
-        // `os_pid` is `undefined` for a port without an OS process — the oracle's answer.
+        // `os_pid` is `undefined` for a port without an OS process, while `connected` is
+        // still the owner pid — both the oracle's answers.
         assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
-        assert_eq!(fx.item(port, "connected"), fx.atom("true"));
+        assert_eq!(fx.item(port, "connected"), OWNER.to_eterm());
     }
 
     #[test]
@@ -1475,22 +1589,82 @@ mod tests {
     }
 
     #[test]
-    fn unknown_option_atoms_and_tuples_are_tolerated() {
+    fn whitelisted_option_atoms_and_tuples_are_accepted() {
         let mut fx = fixture();
-        let name = fx.spawn("true");
-        let unknown_atom = fx.atom("hide");
-        let unknown_tuple = {
+        // The whole accepted option-atom whitelist, every no-op here except `binary`.
+        let atoms = [
+            "stream",
+            "use_stdio",
+            "stderr_to_stdout",
+            "line",
+            "nouse_stdio",
+            "binary",
+            "in",
+            "out",
+            "eof",
+            "hide",
+            "exit_status",
+            "overlapped_io",
+        ];
+        let mut elements: Vec<Eterm> = Vec::new();
+        for name in atoms {
+            let atom = fx.atom(name);
+            elements.push(atom);
+        }
+        // A whitelisted tuple option is accepted too.
+        let packet = {
             let tag = fx.atom("packet");
             fx.heap.tuple(&[tag, make_small(4)]).expect("a packet option")
         };
-        let options = fx.list(&[unknown_atom, unknown_tuple]);
+        elements.push(packet);
+        let options = fx.list(&elements);
+        let name = fx.spawn("true");
         let port = fx
             .hook
             .open_port(name, options)
-            .expect("unknown options are tolerated, not rejected");
-        // Tolerating an option never changes what the port is.
+            .expect("whitelisted options are accepted");
+        // Accepting an option never changes what the port is (the `binary` atom is the one
+        // that *does* change the stream, exercised in the name-forms test).
         assert_eq!(text_of(fx.item(port, "name")), "true");
-        assert_eq!(fx.item(port, "stream"), fx.atom("list"));
+    }
+
+    #[test]
+    fn options_outside_the_whitelist_are_badarg() {
+        let mut fx = fixture();
+        // `list` is not an option (a list stream is the default).
+        let name = fx.spawn("true");
+        let list = fx.atom("list");
+        let options = fx.list(&[list]);
+        assert_badarg(fx.hook.open_port(name, options));
+        // An unknown option atom.
+        let name = fx.spawn("true");
+        let nope = fx.atom("nope");
+        let options = fx.list(&[nope]);
+        assert_badarg(fx.hook.open_port(name, options));
+        // An unknown option tuple.
+        let name = fx.spawn("true");
+        let bad_tuple = {
+            let tag = fx.atom("nope");
+            fx.heap.tuple(&[tag, make_small(1)]).expect("a nope option")
+        };
+        let options = fx.list(&[bad_tuple]);
+        assert_badarg(fx.hook.open_port(name, options));
+        // A whitelisted tuple whose tag is fine but whose arity is wrong.
+        let name = fx.spawn("true");
+        let bad_arity = {
+            let tag = fx.atom("packet");
+            fx.heap.tuple(&[tag]).expect("a packet option")
+        };
+        let options = fx.list(&[bad_arity]);
+        assert_badarg(fx.hook.open_port(name, options));
+        // A non-atom, non-tuple option element.
+        let name = fx.spawn("true");
+        let options = fx.list(&[make_small(1)]);
+        assert_badarg(fx.hook.open_port(name, options));
+        // Validation precedes allocation: none of the rejected calls consumed a port number.
+        let name = fx.spawn("true");
+        let port = fx.hook.open_port(name, NIL).expect("a valid port");
+        assert_eq!(port, PortId::new(0));
     }
 
     #[test]
@@ -1614,10 +1788,10 @@ mod tests {
             .open_port(name, NIL)
             .expect("{fd, N} adopts the descriptor");
 
-        // A descriptor port has no OS process of its own, is connected, and reports the
-        // `fd:<N>` rendering the reference implementation uses.
+        // A descriptor port has no OS process of its own, is connected to its owner, and
+        // reports the `fd:<N>` rendering the reference implementation uses.
         assert_eq!(fx.item(port, "os_pid"), fx.atom("undefined"));
-        assert_eq!(fx.item(port, "connected"), fx.atom("true"));
+        assert_eq!(fx.item(port, "connected"), OWNER.to_eterm());
         assert_eq!(text_of(fx.item(port, "name")), format!("fd:{fd}"));
         assert!(fx.registry.borrow().contains(port));
 
@@ -1645,7 +1819,11 @@ mod tests {
         let name = fx.spawn("true");
         let port = fx.hook.open_port(name, NIL).expect("open_port");
         assert!(fx.registry.borrow().is_live(port));
-        assert_eq!(fx.hook.port_info(port).expect("a live port").len(), 7);
+        assert_eq!(
+            fx.hook.port_info(port).expect("a live port").len(),
+            8,
+            "seven `/1` items plus the `/2`-only `monitors`"
+        );
         fx.hook.close_port(port).expect("port_close/1");
         assert!(!fx.registry.borrow().is_live(port));
         assert!(fx.hook.port_info(port).expect("no badarg").is_empty());

@@ -9,12 +9,14 @@
 //! * the [`AtomTable`] (atom construction never invents an index);
 //! * the calling process's [`ProcessId`] — there is no ambient "current process"
 //!   in the Rust core, so identity is injected here;
-//! * five **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//! * six **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
 //!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
-//!   `fun`-taking `lists`/`maps` BIFs) and a [`PortHook`] (`open_port/2` and the
-//!   port BIFs). `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies
-//!   the concrete implementations; an unset seam means `io:format` writes to stdout
-//!   and the `send`/`ets`/`call_fun`/port BIFs report `unsupported_bif`.
+//!   `fun`-taking `lists`/`maps` BIFs), a [`PortHook`] (`open_port/2` and the
+//!   port BIFs) and a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
+//!   process-dictionary BIFs). `beam_engine` depends only on `beam_loader`, so
+//!   `beam_rt` supplies the concrete implementations; an unset seam means
+//!   `io:format` writes to stdout and the `send`/`ets`/`call_fun`/port/dict BIFs
+//!   report `unsupported_bif`.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -179,6 +181,62 @@ pub trait PortHook {
     fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>>;
 }
 
+/// Reads and writes the calling process's **dictionary**.
+///
+/// The process dictionary is a per-process key/value store owned by
+/// [`beam_process::Dict`] and reached at the language level through the
+/// `erlang:put/2`, `erlang:get/1`, `erlang:erase/1`, `erlang:get_keys/0` and
+/// `erlang:get_keys/1` BIFs. The store is a genuine GC sub-rootset of *a*
+/// process, so a BIF must never reach into it directly — `beam_rt` supplies this
+/// hook over the calling process's real dictionary. Milestone-1 has no such
+/// provider, so those BIFs raise `unsupported_bif` when no hook is installed
+/// (never a silently fabricated value; workspace `CONTEXT.md` §3).
+///
+/// `None` from `put`/`get`/`erase` means **absent** and the BIF layer maps it to
+/// the atom `undefined` (the C's `THE_NON_VALUE`/`am_undefined`). Keys and values
+/// are stored by **raw `Eterm` word equality** — the [`beam_process::Dict`]
+/// contract; the hook is responsible for copying a key/value into the process
+/// heap before storing it.
+pub trait DictHook {
+    /// `put(Key, Value)` — stores `value` under `key`, returning the **replaced**
+    /// value (`None` when the key was absent).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn put(&mut self, key: Eterm, value: Eterm) -> Result<Option<Eterm>>;
+
+    /// `get(Key)` — the value stored under `key`, or `None` when absent.
+    ///
+    /// # Errors
+    ///
+    /// Reports a lookup failure as a [`BeamError`].
+    fn get(&mut self, key: Eterm) -> Result<Option<Eterm>>;
+
+    /// `erase(Key)` — removes `key`, returning the value that was stored under it
+    /// (`None` when absent).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn erase(&mut self, key: Eterm) -> Result<Option<Eterm>>;
+
+    /// `get_keys/0` — every key, in the store's order.
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get_keys(&mut self) -> Result<Vec<Eterm>>;
+
+    /// `get_keys(Value)` — every key whose value raw-equals `value`, in the
+    /// store's order.
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -190,6 +248,7 @@ pub struct BifContext<'a> {
     interner: Option<&'a mut dyn AtomInterner>,
     fun_caller: Option<&'a mut dyn FunCaller>,
     port: Option<&'a mut dyn PortHook>,
+    dict: Option<&'a mut dyn DictHook>,
 }
 
 impl<'a> BifContext<'a> {
@@ -206,6 +265,7 @@ impl<'a> BifContext<'a> {
             interner: None,
             fun_caller: None,
             port: None,
+            dict: None,
         }
     }
 
@@ -242,6 +302,13 @@ impl<'a> BifContext<'a> {
     /// Installs the port hook used by `open_port/2` and the port BIFs.
     pub fn with_port_hook(mut self, hook: &'a mut dyn PortHook) -> Self {
         self.port = Some(hook);
+        self
+    }
+
+    /// Installs the process-dictionary hook used by the `put/2`/`get/1`/`erase/1`
+    /// /`get_keys/*` BIFs.
+    pub fn with_dict_hook(mut self, hook: &'a mut dyn DictHook) -> Self {
+        self.dict = Some(hook);
         self
     }
 
@@ -343,6 +410,79 @@ impl<'a> BifContext<'a> {
     pub fn port_info(&mut self, port: PortId) -> Result<Vec<(Eterm, Eterm)>> {
         match self.port.as_deref_mut() {
             Some(hook) => hook.port_info(port),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Stores `value` under `key` in the process dictionary through the installed
+    /// [`DictHook`], returning the **replaced** value (`None` when the key was
+    /// absent) — the seam behind `erlang:put/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn dict_put(&mut self, key: Eterm, value: Eterm) -> Result<Option<Eterm>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.put(key, value),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The value stored under `key` in the process dictionary through the
+    /// installed [`DictHook`], or `None` when the key is absent — the seam behind
+    /// `erlang:get/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn dict_get(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.get(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Removes `key` from the process dictionary through the installed
+    /// [`DictHook`], returning the value that was stored under it (`None` when the
+    /// key was absent) — the seam behind `erlang:erase/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn dict_erase(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.erase(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every key of the process dictionary through the installed [`DictHook`] —
+    /// the seam behind `erlang:get_keys/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn dict_get_keys(&mut self) -> Result<Vec<Eterm>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.get_keys(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every key whose value raw-equals `value` through the installed
+    /// [`DictHook`] — the seam behind `erlang:get_keys/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn dict_get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.get_keys_for_value(value),
             None => Err(crate::error::unsupported_bif()),
         }
     }
@@ -650,5 +790,102 @@ mod tests {
             ctx.port_info(PortId::new(11)).expect("the hook answers"),
             vec![(make_small(1), make_small(2))]
         );
+    }
+
+    /// A minimal `DictHook` test double over an in-memory pair list: it stores
+    /// `(Key, Value)` pairs by raw `Eterm` equality (the `beam_process::Dict`
+    /// contract).
+    #[derive(Default)]
+    struct StubDict {
+        entries: Vec<(Eterm, Eterm)>,
+    }
+
+    impl DictHook for StubDict {
+        fn put(&mut self, key: Eterm, value: Eterm) -> Result<Option<Eterm>> {
+            match self.entries.iter().position(|&(stored, _)| stored == key) {
+                Some(index) => Ok(Some(core::mem::replace(&mut self.entries[index].1, value))),
+                None => {
+                    self.entries.push((key, value));
+                    Ok(None)
+                }
+            }
+        }
+
+        fn get(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+            Ok(self
+                .entries
+                .iter()
+                .find(|&&(stored, _)| stored == key)
+                .map(|&(_, value)| value))
+        }
+
+        fn erase(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+            match self.entries.iter().position(|&(stored, _)| stored == key) {
+                Some(index) => Ok(Some(self.entries.remove(index).1)),
+                None => Ok(None),
+            }
+        }
+
+        fn get_keys(&mut self) -> Result<Vec<Eterm>> {
+            Ok(self.entries.iter().map(|&(key, _)| key).collect())
+        }
+
+        fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
+            Ok(self
+                .entries
+                .iter()
+                .filter(|&&(_, stored)| stored == value)
+                .map(|&(key, _)| key)
+                .collect())
+        }
+    }
+
+    #[test]
+    fn dict_accessors_without_a_hook_are_a_typed_unsupported() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        for result in [
+            ctx.dict_put(make_small(1), make_small(2)).map(|_| ()),
+            ctx.dict_get(make_small(1)).map(|_| ()),
+            ctx.dict_erase(make_small(1)).map(|_| ()),
+            ctx.dict_get_keys().map(|_| ()),
+            ctx.dict_get_keys_for_value(make_small(2)).map(|_| ()),
+        ] {
+            match result {
+                Err(BeamError::Raise(raise)) => {
+                    assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+                    assert_eq!(raise.reason, beam_common::ExitReason::atom("unsupported_bif"));
+                }
+                other => panic!("expected an unsupported_bif raise, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dict_accessors_with_a_hook_delegate() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut hook = StubDict::default();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_dict_hook(&mut hook);
+
+        assert_eq!(ctx.dict_put(make_small(1), make_small(10)).expect("the hook answers"), None);
+        assert_eq!(
+            ctx.dict_put(make_small(1), make_small(11)).expect("the hook answers"),
+            Some(make_small(10))
+        );
+        assert_eq!(ctx.dict_get(make_small(1)).expect("the hook answers"), Some(make_small(11)));
+        assert_eq!(ctx.dict_get(make_small(2)).expect("the hook answers"), None);
+        assert_eq!(ctx.dict_get_keys().expect("the hook answers"), vec![make_small(1)]);
+
+        ctx.dict_put(make_small(2), make_small(11)).expect("the hook stores");
+        assert_eq!(
+            ctx.dict_get_keys_for_value(make_small(11)).expect("the hook answers"),
+            vec![make_small(1), make_small(2)]
+        );
+        assert_eq!(ctx.dict_erase(make_small(1)).expect("the hook answers"), Some(make_small(11)));
+        assert_eq!(ctx.dict_erase(make_small(1)).expect("the hook answers"), None);
     }
 }
