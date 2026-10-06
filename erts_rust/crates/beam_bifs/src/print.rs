@@ -44,21 +44,26 @@
 //! atom keys compare by their raw term word (i.e. by atom index / intern order),
 //! anything else by the exact term order (`beam_term::compare::cmp`).
 //!
+//! # `~p`/`~P` re-flow (`io_lib_pretty`)
+//!
+//! The oracle runs `io_lib_pretty`, which breaks a container across lines when its
+//! single-line rendering is at least `line_length - column` characters (80 columns
+//! and column 1 by default). [`pretty_chunk`] reproduces that break for a
+//! proper/improper list, a tagged/untagged tuple and a map each of whose elements
+//! renders single-line (the break separator `,`, the improper tail after `|`, a
+//! `tag_len + 2` indent after a tuple tag, a two-space indent after `#{`); for the
+//! forms it does not model — a nested container, an element too long to fit on a
+//! line of its own, a non-printable bitstring, a long tuple tag, a depth-limited
+//! `~P` — it raises `error:badarg` rather than emit a line the oracle would have
+//! broken differently. See the `crate::io` module docs for the precise rule, the
+//! term classes and the narrowest repro.
+//!
 //! # Deviations from the oracle (documented)
 //!
 //! * **Floats** use Rust's shortest round-trip with a `.0` appended when integral
 //!   (`1.0`, `1.5`, `0.1`, `3.14159`), not OTP's `float_to_list(F, [short])`:
 //!   large/small magnitudes differ (`1.0e10` renders `10000000000`, the oracle
 //!   `1.0e10`).
-//! * **The `~p` printer never line-breaks.** The oracle runs `io_lib_pretty`,
-//!   which reflows a container whose single-line rendering is at least
-//!   `line_length - column` characters (80 columns and column 1 by default) across
-//!   lines; this printer always emits the single-line form. [`crate::io`] enforces
-//!   that boundary: for a re-flowable class (tuple, map, non-printable list,
-//!   non-printable bitstring) whose rendering reaches the length it raises
-//!   `error:badarg` rather than emit a line the oracle would have broken — see the
-//!   `crate::io` module docs for the precise rule, the term classes and the
-//!   narrowest repro.
 //! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
 //!   — such atoms are not produced by Milestone-1.
 //! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
