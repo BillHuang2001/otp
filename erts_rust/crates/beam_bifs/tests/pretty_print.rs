@@ -255,8 +255,7 @@ fn unsupported_reflow_forms_stay_a_typed_badarg() {
     // A container holding another container is not modelled.
     let (_out, result) = run_io(&reg, b"~p", |ctx, _| {
         let inner = int_list(ctx, 1..=28);
-        let outer = ctx.list(&[inner, ctx.int(1).expect("fits")]).expect("fits");
-        outer
+        ctx.list(&[inner, ctx.int(1).expect("fits")]).expect("fits")
     });
     assert!(matches!(result, Err(BeamError::BadArg)), "{result:?}");
 
