@@ -84,7 +84,7 @@ fn is_false(atoms: &AtomTable, term: Eterm) -> bool {
     atoms.name(atom_val(term)) == Some("false")
 }
 
-fn is_raise_atom(err: &BeamError, reason: &str) -> bool {
+fn is_raise_atom(err: &BeamError, reason: &'static str) -> bool {
     matches!(err, BeamError::Raise(raise) if raise.reason == beam_common::ExitReason::atom(reason))
 }
 
@@ -501,8 +501,9 @@ fn info_reports_the_table_fields() {
         reg.call("ets", "info", 2, &mut ctx, &[handle, bogus]),
         Err(BeamError::BadArg)
     ));
+    let one = ctx.int(1).unwrap();
     assert!(matches!(
-        reg.call("ets", "info", 2, &mut ctx, &[handle, ctx.int(1).unwrap()]),
+        reg.call("ets", "info", 2, &mut ctx, &[handle, one]),
         Err(BeamError::BadArg)
     ));
 }
