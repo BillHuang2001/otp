@@ -216,8 +216,13 @@ tooling-only).
   `LineEntry { file, line }` (`beam_file.c:443-602`). `items[0]` is the undefined location `{0,0}`;
   `files[0]` is synthesized as `<module>.erl`.
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
-  `entries[0]` = "any"), then per entry `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
+  `entries[0]` = "any"), then per entry a `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
+  **Version 3** remaps each entry's two bytes `b0`/`b1` into the v4-convention word before the metadata
+  bits are tested (`beam_file.c:664-681`): `extra_bits = (b0 << 1) & 0xE0`, `upper = b0 & 0x0F`
+  (forced to `0x1F` when it is `0x0F`, so v3's 12-bit all-ones `0xFFF` maps to the v4 "any" `0x1FFF`),
+  `word = ((upper | extra_bits) << 8) | b1`. `Type::raw` therefore always holds the reconstructed
+  **v4-convention** word (`raw & 0x1FFF` = type union, `raw & 0xE000` = metadata flags) for both versions.
 - **`LitT`** — `u32 uncompressed_size` (`0` ⇒ the records follow verbatim; non-zero ⇒ the rest of the
   chunk is a zlib (RFC 1950) stream that inflates to exactly `uncompressed_size` bytes, which ARE the
   records), then `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes).
