@@ -316,6 +316,17 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   alternatives) use the `f` tag and are strict `Label`s. An `i` operand is sign-extended only in the
   explicit-count form (`read_tagged` `byte_count >= 2`); the 1-byte-tail form (values 16–0x7FF) is
   unsigned — matching `beam_file.c`.
+- **Wide integer instruction operands become synthesized literals.** A `u`/`i` operand whose magnitude
+  does not fit a machine word is the C `TAG_o` overflow state (`beam_file.c:207-237`); the decoder models
+  it as `Operand::BigInteger`, and `lower::build_module` appends a synthesized ETF bignum payload to the
+  module's literal set and rewrites the operand to `Operand::Literal`. This keeps `.beam`-wire concerns in
+  `beam_loader`, mirrors the C (`marshal_integer` → `beamfile_add_literal`) and needs no engine change
+  (the engine already resolves `Operand::Literal` via `Machine::literal`).
+- **The `bs_create_bin` allocation operand accepts both encodings.** The compiler hoists a block's heap
+  need into a preceding `bs_create_bin` (`beam_ssa_codegen.erl`, `need_heap_terminator`), so that `z`-op
+  operand can be a bare word count or a `z,3` allocation list. `lower_instr` decodes it through
+  `HeapNeed` (exactly as `test_heap`/`allocate` do), taking `HeapNeed::words()` for the `u32` field —
+  matching the C `marshal_allocation_list`, which always marshals any `z,3` to a single word total.
 
 ## Test Strategy
 - **Fixtures:** two committed oracle `.beam` files, both compiled from the checked-in `.erl` sources with
