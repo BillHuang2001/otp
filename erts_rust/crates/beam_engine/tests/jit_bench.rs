@@ -1,0 +1,554 @@
+//! Micro-benchmark: the interpreter against the native JIT tiers.
+//!
+//! The Milestone-1 JIT tiers are **mechanisms**, not optimisers (Part II §F):
+//! correctness first, performance work follows. This file is the honest
+//! measurement of where they stand today — it prints `ns/op` (and `ops/s`) per
+//! workload and tier, and asserts **only correctness** (every tier's result equals
+//! the interpreter's). It never asserts that a JIT is faster: that is
+//! environment-dependent and would be flaky; the printed numbers are the evidence.
+//!
+//! Two workloads, chosen to hit the two shapes the baseline tier treats
+//! differently:
+//!
+//! * **`fib(20)`** — the real `.beam` fixture's `fib/1`
+//!   (`beam_loader/tests/fixtures/slice.beam`, reused by relative path so there is
+//!   a single source of truth for the image), which is `fib(N) -> fib(N, 0, 1)`:
+//!   a *short* tail-recursive chain of `call`/`gc_bif`/`return` (about 21 calls),
+//!   so the driver loop's interpreter-step path and the per-run setup both count.
+//! * **`kernel/2`** — a hand-built synthetic module (the loader is not involved;
+//!   see `tests/opcodes.rs` for the same scaffolding pattern) whose body is a long
+//!   straight-line chain of `KERNEL_OPS` (256) chained `erlang:'+'/2` `gc_bif`s
+//!   accumulating on `x(0)`/`x(1)`, ending in `return`. This is exactly the shape
+//!   the baseline tier's inlined guarded small-int fast path (`try_inline_gc_bif`)
+//!   lowers to native machine code with no interpreter round-trip, and it is sized
+//!   so that execution — not the per-run setup — dominates the measurement.
+//!
+//! # Method — execution, not compilation
+//!
+//! For each `(workload, tier)`:
+//!
+//! 1. a native tier **compiles the module exactly once**, *outside* the timed
+//!    loop, using [`JitBackend::compile`] and keeping the resulting artifact;
+//! 2. one warm-up run (not timed);
+//! 3. `iterations` timed *executions* on a reused [`Machine`]:
+//!    [`JitBackend::run_compiled`] for a native tier (the compile-once / run-many
+//!    entry, so **no compilation is inside the timed loop**), and
+//!    [`Machine::run_export`] for the interpreter;
+//! 4. the elapsed wall-clock time from [`Instant`], divided by `iterations`.
+//!
+//! Every `run_*` entry `reset()`s the machine at the start of a run, so one machine
+//! can be reused across the whole loop (the timed cost is the call, not per-iteration
+//! `Machine` construction noise).
+//!
+//! **Honest caveat, printed with the numbers.** Neither native backend has a
+//! *cross-run code cache* yet (see `beam_engine/CONTEXT.md`, Known Issues): the cache
+//! is the caller's job, which is why this benchmark holds the artifact across the
+//! loop via [`JitBackend::run_compiled`]. The one-shot [`JitBackend::run_export`]
+//! — what `Machine::run_with_tier` uses — still recompiles on every call; its cost
+//! is *not* what the numbers below measure. Each native tier's one-time `compile`
+//! latency is measured and printed separately, and the timed loop **excludes**
+//! compilation. What remains in `ns/op` is per-run setup (`Machine::reset` of the
+//! register/float-register files plus the module-wide label-map build) plus the
+//! actual execution; for `fib(20)` that is thousands of instructions, for the
+//! kernel it is [`KERNEL_OPS`] inlined adds.
+//!
+//! Run with `--nocapture` to see the table.
+//!
+//! [`run_export`]: JitBackend::run_export
+//! [`run_compiled`]: JitBackend::run_compiled
+
+use std::collections::BTreeMap;
+use std::time::{Duration, Instant};
+
+use beam_common::BeamError;
+use beam_engine::jit::baseline::{BaselineJit, CompiledModule};
+#[cfg(feature = "jit-cranelift")]
+use beam_engine::jit::cranelift::{CompiledFunctions, CraneliftJit};
+use beam_engine::{available_tiers, JitBackend, Machine, MinimalContext, Tier};
+use beam_loader::{
+    load_file, Block, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
+};
+use beam_term::{is_small, make_small, signed_value, Atom, Eterm};
+
+/// The `beam_loader` oracle fixture (reused, never copied).
+const SLICE_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/../beam_loader/tests/fixtures/slice.beam"
+);
+
+/// The number of chained `erlang:'+'/2` `gc_bif`s in the synthetic kernel.
+///
+/// Large enough that the *execution* of the block (the inlined native arithmetic)
+/// dominates the per-run setup (`Machine::reset` + the label-map build), which is
+/// the point of the kernel workload: it measures compute, not call overhead.
+const KERNEL_OPS: usize = 256;
+
+/// The slice BIF hook: `erlang:'+'/2` and `erlang:'-'/2` over small integers.
+///
+/// The same implementation serves both workloads (the synthetic kernel imports
+/// `erlang:'+'/2`).
+fn arith_hook(
+    module: &str,
+    function: &str,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if module != "erlang" || arity != 2 || args.len() != 2 {
+        return Err(BeamError::BadArg);
+    }
+    if !is_small(args[0]) || !is_small(args[1]) {
+        return Err(BeamError::BadArith);
+    }
+    let (a, b) = (signed_value(args[0]), signed_value(args[1]));
+    match function {
+        "+" => Ok(make_small(a + b)),
+        "-" => Ok(make_small(a - b)),
+        _ => Err(BeamError::BadArg),
+    }
+}
+
+/// Resolve a name interned in the module's atom table.
+fn atom(module: &Module, name: &str) -> Atom {
+    module
+        .atom_table
+        .lookup(name)
+        .unwrap_or_else(|| panic!("atom {name:?} not interned in module"))
+}
+
+// ---------------------------------------------------------------------------
+// Workloads
+// ---------------------------------------------------------------------------
+
+/// Which workload is being timed (selects the iteration count).
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Kind {
+    /// `slice:fib/1` from the committed oracle fixture.
+    Fib,
+    /// The hand-built straight-line arithmetic kernel.
+    Kernel,
+}
+
+impl Kind {
+    /// The iteration count for this workload.
+    ///
+    /// Compilation is **outside** the timed loop now (each native tier compiles once,
+    /// up front, and only ever calls [`JitBackend::run_compiled`] afterwards), so
+    /// every tier gets the *same* count — there is no per-call compile for a tier to
+    /// amortise, and the counts only have to keep the whole file inside its ~1 s
+    /// budget while leaving each tier's timed loop long enough to be stable.
+    fn iterations(self) -> u32 {
+        match self {
+            // `fib/1` in the fixture is `fib(N) -> fib(N, 0, 1)`, i.e. a ~20-call
+            // tail-recursive chain — about 5 us per run, so per-run setup dominates.
+            Kind::Fib => 5_000,
+            // [`KERNEL_OPS`] chained inlined adds per run: a few microseconds on the
+            // interpreter, well under a microsecond on the baseline tier.
+            Kind::Kernel => 5_000,
+        }
+    }
+}
+
+/// A benchmark workload: a module, an exported `function/arity` and its arguments.
+struct Workload {
+    /// The human-readable label printed with the numbers.
+    label: String,
+    /// The workload shape (selects the iteration count).
+    kind: Kind,
+    /// The module holding the export.
+    module: Module,
+    /// The exported function's name atom (in `module`'s atom table).
+    function: Atom,
+    /// The exported arity.
+    arity: u32,
+    /// The call arguments.
+    args: Vec<Eterm>,
+}
+
+/// `slice:fib/1` over the committed oracle fixture.
+fn fib_workload() -> Workload {
+    let module = load_file(SLICE_BEAM).expect("load slice.beam");
+    let function = atom(&module, "fib");
+    Workload {
+        label: "slice:fib/1 (20)".to_string(),
+        kind: Kind::Fib,
+        module,
+        function,
+        arity: 1,
+        args: vec![make_small(20)],
+    }
+}
+
+/// The synthetic straight-line kernel: `kernel/2` is [`KERNEL_OPS`] chained
+/// `erlang:'+'/2` `gc_bif`s accumulating on `x(0)`/`x(1)`, then `return`.
+///
+/// The body deliberately stays inside the baseline tier's inlined fast path: the
+/// only BIF is small-int `'+'`, both operands and the destination are (cacheable)
+/// x-registers, so every instruction of the block is lowered to machine code and
+/// the driver loop never takes an interpreter step — except for the single trailing
+/// `return`, which is one helper call per run.
+///
+/// `Function::blocks` **must** be populated for that to happen: a native tier
+/// compiles blocks, so a function with an empty `blocks` list has no native entry
+/// point at all and the driver would take an interpreter step per instruction
+/// (measuring the deopt path, not the inlined arithmetic). The hand-built block is
+/// the faithful decomposition of this straight-line body: one block starting at the
+/// entry label and covering the whole function.
+///
+/// The chain accumulates on `x(0)`/`x(1)` from the `(0, 0)` fixed point. That is
+/// forced by the shape: an `erlang:'+'/2`-only dependency chain is monotone, so the
+/// Fibonacci-style growth a `(1, 1)` start produces leaves the 59-bit small-integer
+/// range after ~90 of the [`KERNEL_OPS`] ops (`make_small` would reject the result).
+/// Starting at zero keeps every intermediate value a small integer — which is
+/// exactly what the baseline tier's inlined fast path requires — while executing the
+/// same 256 chained BIFs over the same registers, each of which reads the previous
+/// one's result (a genuine serial dependency chain).
+fn kernel_workload() -> Workload {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("jit_bench_kernel");
+
+    let plus_module = module.atom_table.intern("erlang");
+    let plus_function = module.atom_table.intern("+");
+    module.imports.push(Import {
+        module: plus_module,
+        function: plus_function,
+        arity: 2,
+    });
+    let plus = ImportRef(0);
+
+    let kernel = module.atom_table.intern("kernel");
+    let entry = Label(1);
+    module.exports.push(Export {
+        function: kernel,
+        arity: 2,
+        label: entry,
+    });
+
+    let mut code = vec![Instr::Label(entry)];
+    for step in 0..KERNEL_OPS {
+        // `x0 = x0 + x1` then `x1 = x1 + x0`, alternating: a dependency chain that
+        // keeps both registers live across every operation.
+        let (args, dst) = if step % 2 == 0 {
+            (vec![Operand::X(0), Operand::X(1)], Operand::X(0))
+        } else {
+            (vec![Operand::X(1), Operand::X(0)], Operand::X(1))
+        };
+        code.push(Instr::GcBif {
+            arity: 2,
+            bif: plus,
+            fail: NO_FAIL,
+            live: 2,
+            args,
+            dst,
+        });
+    }
+    code.push(Instr::Return);
+
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+
+    // One block: the whole straight-line body, from the entry label to the end.
+    let blocks = vec![Block {
+        label: entry,
+        start: 0,
+        end: code.len(),
+    }];
+
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name: kernel,
+        arity: 2,
+        code,
+        blocks,
+        labels,
+    });
+
+    Workload {
+        label: format!("kernel/2 ({KERNEL_OPS} chained gc_bif '+'/2)"),
+        kind: Kind::Kernel,
+        module,
+        function: kernel,
+        arity: 2,
+        args: vec![make_small(0), make_small(0)],
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The native backends
+// ---------------------------------------------------------------------------
+
+/// A native [`JitBackend`] **with the workload already compiled into it**.
+///
+/// The enum exists to erase the two backends' distinct
+/// [`Compiled`](JitBackend::Compiled) associated types behind one holder, so the
+/// benchmark can compile once up front and only call
+/// [`JitBackend::run_compiled`] inside its timed loop — there is no `compile` call
+/// (and therefore no compilation) in the timed code path.
+enum NativeBackend {
+    /// The native baseline tier (always in the roster).
+    Baseline {
+        /// The (zero-sized) backend that owns the compilation.
+        backend: BaselineJit,
+        /// Its already-compiled artifact (executable code + block entries).
+        compiled: CompiledModule,
+    },
+    /// The optional Cranelift hot tier (feature-gated).
+    #[cfg(feature = "jit-cranelift")]
+    Cranelift {
+        /// The Cranelift backend that owns the compilation.
+        backend: CraneliftJit,
+        /// Its already-compiled artifact (the JIT module + native entries).
+        compiled: CompiledFunctions,
+    },
+}
+
+impl NativeBackend {
+    /// Build the tier's backend, compile `module` **once** and return both the
+    /// holder and the one-time compile latency.
+    ///
+    /// Only called for a tier [`Tier::is_available`] reports, so the interpreter —
+    /// which has nothing to compile — never reaches this function.
+    fn compile(tier: Tier, module: &Module) -> Result<(NativeBackend, Duration), BeamError> {
+        match tier {
+            Tier::BaselineJit => {
+                let mut backend = BaselineJit::new();
+                let start = Instant::now();
+                let compiled = backend.compile(module)?;
+                let compile = start.elapsed();
+                Ok((NativeBackend::Baseline { backend, compiled }, compile))
+            }
+            #[cfg(feature = "jit-cranelift")]
+            Tier::Cranelift => {
+                let mut backend = CraneliftJit::new();
+                let start = Instant::now();
+                let compiled = backend.compile(module)?;
+                let compile = start.elapsed();
+                Ok((NativeBackend::Cranelift { backend, compiled }, compile))
+            }
+            other => panic!("no native backend for tier {}", other.name()),
+        }
+    }
+
+    /// Run the exported `function/arity` against the **already-compiled** artifact
+    /// (no recompilation).
+    fn run_compiled(
+        &self,
+        machine: &mut Machine,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut MinimalContext,
+    ) -> Result<Eterm, BeamError> {
+        match self {
+            NativeBackend::Baseline { backend, compiled } => {
+                backend.run_compiled(compiled, machine, module, function, arity, args, ctx)
+            }
+            #[cfg(feature = "jit-cranelift")]
+            NativeBackend::Cranelift { backend, compiled } => {
+                backend.run_compiled(compiled, machine, module, function, arity, args, ctx)
+            }
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The timing harness
+// ---------------------------------------------------------------------------
+
+/// One `(workload, tier)` measurement.
+struct Measurement {
+    /// The timed tier.
+    tier: Tier,
+    /// The number of timed runs.
+    iterations: u32,
+    /// The total wall-clock time of the timed runs.
+    elapsed: Duration,
+    /// The **one-time** [`JitBackend::compile`] latency that produced the artifact
+    /// the timed loop ran against: `None` for the interpreter, `Some(compile)` for a
+    /// native tier. It is *excluded* from `elapsed` (compilation happens once,
+    /// before the warm-up), and is printed only so the reader can see what was
+    /// excluded.
+    compile: Option<Duration>,
+    /// The last run's result.
+    result: Eterm,
+}
+
+/// Warm up once, then time `iterations` executions of `workload` on `tier`.
+///
+/// A native tier compiles **once** here (timed separately, outside the loop) and
+/// then only ever calls [`JitBackend::run_compiled`].
+fn measure(tier: Tier, workload: &Workload) -> Measurement {
+    let iterations = workload.kind.iterations();
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+
+    // Every entry `reset()`s the machine at the start of a run, so one machine can
+    // be reused across the whole loop (the timed cost is the call, not the setup).
+    match tier {
+        Tier::Interpreter => {
+            machine
+                .run_export(
+                    &workload.module,
+                    workload.function,
+                    workload.arity,
+                    &workload.args,
+                    &mut ctx,
+                )
+                .expect("the workload must run on the interpreter");
+            let start = Instant::now();
+            let mut result = make_small(0);
+            for _ in 0..iterations {
+                result = machine
+                    .run_export(
+                        &workload.module,
+                        workload.function,
+                        workload.arity,
+                        &workload.args,
+                        &mut ctx,
+                    )
+                    .expect("the workload must run on the interpreter");
+            }
+            Measurement {
+                tier,
+                iterations,
+                elapsed: start.elapsed(),
+                compile: None,
+                result,
+            }
+        }
+        native => {
+            // The one compile this tier pays: measured once, *before* the warm-up so
+            // it is not in `elapsed`. (The very first compile in a process also pays
+            // a one-off `mmap`/`mprotect` of a fresh code buffer; that is part of
+            // the one-time cost being reported.)
+            let (backend, compile) = NativeBackend::compile(native, &workload.module)
+                .expect("the workload must compile on the native tier");
+
+            backend
+                .run_compiled(
+                    &mut machine,
+                    &workload.module,
+                    workload.function,
+                    workload.arity,
+                    &workload.args,
+                    &mut ctx,
+                )
+                .expect("the workload must run on the native tier");
+
+            let start = Instant::now();
+            let mut result = make_small(0);
+            for _ in 0..iterations {
+                result = backend
+                    .run_compiled(
+                        &mut machine,
+                        &workload.module,
+                        workload.function,
+                        workload.arity,
+                        &workload.args,
+                        &mut ctx,
+                    )
+                    .expect("the workload must run on the native tier");
+            }
+            Measurement {
+                tier,
+                iterations,
+                elapsed: start.elapsed(),
+                compile: Some(compile),
+                result,
+            }
+        }
+    }
+}
+
+/// Print one measurement line, plus the native tiers' one-time compile cost.
+fn report(measurement: &Measurement) {
+    let per_op = measurement.elapsed.as_secs_f64() / f64::from(measurement.iterations);
+    let per_op_ns = per_op * 1e9;
+    println!(
+        "jit_bench | tier={:<12} iterations={:<6} total={:>9.3} ms | {:>14.1} ns/op | {:>14.1} ops/s",
+        measurement.tier.name(),
+        measurement.iterations,
+        measurement.elapsed.as_secs_f64() * 1e3,
+        per_op_ns,
+        if per_op > 0.0 { 1.0 / per_op } else { f64::INFINITY },
+    );
+    if let Some(compile) = measurement.compile {
+        println!(
+            "jit_bench |   {}: one-time compile = {:.3} us (excluded from the timed loop; \
+             the loop is {} run_compiled calls against the artifact that compile produced)",
+            measurement.tier.name(),
+            compile.as_secs_f64() * 1e6,
+            measurement.iterations,
+        );
+    }
+}
+
+/// The tiers to benchmark: the interpreter plus every native tier this build has.
+fn benchmarked_tiers() -> Vec<Tier> {
+    let mut tiers = vec![Tier::Interpreter];
+    for tier in Tier::ALL {
+        if tier == Tier::Interpreter || !tier.is_available() {
+            continue;
+        }
+        // The Cranelift backend only exists with the feature; without it the tier is
+        // not in the roster anyway, so this only keeps `NativeBackend::compile` total.
+        #[cfg(not(feature = "jit-cranelift"))]
+        if tier == Tier::Cranelift {
+            continue;
+        }
+        tiers.push(tier);
+    }
+    tiers
+}
+
+/// Time `workload` on every available tier, assert tier agreement, print the table.
+fn bench_workload(workload: &Workload) {
+    let tiers = benchmarked_tiers();
+    println!(
+        "jit_bench | workload = {} | tiers = {:?}",
+        workload.label,
+        tiers.iter().map(Tier::name).collect::<Vec<_>>()
+    );
+
+    let mut reference: Option<Measurement> = None;
+    for tier in tiers {
+        assert!(
+            available_tiers().contains(&tier.name()),
+            "benchmarked tier {} must be in the build roster",
+            tier.name()
+        );
+        let measurement = measure(tier, workload);
+        report(&measurement);
+        match &reference {
+            None => reference = Some(measurement),
+            Some(expected) => assert_eq!(
+                measurement.result,
+                expected.result,
+                "tier {} disagrees with {} on {}",
+                tier.name(),
+                expected.tier.name(),
+                workload.label,
+            ),
+        }
+    }
+    println!();
+}
+
+#[test]
+fn interpreter_and_native_tiers_agree_and_report_timings() {
+    // One test (not two) so the two workload timings never run concurrently and
+    // contaminate each other; both workloads are still measured and asserted.
+    let fib = fib_workload();
+    let kernel = kernel_workload();
+    for workload in [&fib, &kernel] {
+        bench_workload(workload);
+    }
+}

@@ -17,6 +17,9 @@ cranelift-frontend = { workspace = true, optional = true }
 
 [features]
 default = []
+# Documented alias for the baseline tier: `"baseline-jit"` is part of every build's
+# tier roster (see `src/jit/mod.rs`), so this feature adds nothing — it is kept so
+# that existing `--features jit-beamasm` invocations keep working.
 jit-beamasm = []
 jit-cranelift = ["dep:cranelift-codegen", "dep:cranelift-module", "dep:cranelift-jit", "dep:cranelift-frontend"]
 

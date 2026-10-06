@@ -177,10 +177,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
   copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
-  changed): `From<TermError> for BeamError`; `compare`/`hashing`/`size` utilities (term ordering,
-  structural hash, `size_object`); `thing` — heap-agnostic off-heap term materialization
-  (float/big/flatmap/external pid/port/ref). Writers take a caller-provided `*mut Eterm`;
-  allocation stays in `beam_alloc`.
+  changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
+  (term ordering, structural hash, `size_object`); `thing` — heap-agnostic off-heap term
+  materialization (float/big/flatmap/external pid/port/ref), which `beam_codec::term` now forwards
+  to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
+- **Stage-1 baseline JIT mechanism shipped (`beam_engine`).** `src/jit/baseline/` implements the `JitBackend` seam: it lowers each typed-IR basic block to a real x86-64 `extern "C"` function (block ABI: return `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; ≤4 x-registers cached in `r12`–`r15` with an exit spill, `rbx` = x-register array base) and runs an export through a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. `Tier::BaselineJit` routes natively; `Tier::Interpreter` is unchanged. An optional Cranelift hot tier (`src/jit/cranelift.rs`) sits behind the `jit-cranelift` feature (default OFF). Correctness (interpreter-identical results) is the deliverable (`tests/jit.rs` + `tests/jit_coverage.rs`); deeper inlining and a cross-run code cache are later tasks.
+- **Foundation completion (maps >32 keys, refc binaries, public bit-string APIs).** `beam_term` gained `map` (flat-map ↔ HAMT, threshold 32, ERTS-shaped node interiors), `bitstring`, and `refc` modules; `beam_alloc` gained `RefCount` + off-heap `RefcBinary`; `beam_gc::OffHeapEntry::{Mso,Binary}`.
 - **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`;
   `RefCount` moved down into `beam_alloc` (the LCA) and re-exported by `beam_gc`.
 

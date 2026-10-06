@@ -18,6 +18,7 @@ use beam_term::{is_non_value, Eterm, NIL, THE_NON_VALUE};
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter;
+use crate::jit::Tier;
 use crate::Step;
 
 /// X-register file size (the `beam_emu.c` `MAX_REG` bound).
@@ -199,6 +200,46 @@ impl Machine {
         match module.export(function, arity) {
             Some(label) => self.run_label(module, label, arity, args, ctx),
             None => Err(error::unsupported("run_export: export not found")),
+        }
+    }
+
+    /// Run the exported `function/arity` on a selected execution tier; yields `x(0)`.
+    ///
+    /// The tier-selecting entry point of the engine ([`crate::jit::Tier`]): the
+    /// caller states which tier it wants and gets that tier's result or a typed
+    /// error — the engine never silently substitutes a different tier.
+    ///
+    /// * [`Tier::Interpreter`] — delegates to [`Machine::run_export`], which
+    ///   remains the **default interpreter entry** (unchanged; this method is a
+    ///   dispatcher, not a replacement).
+    /// * [`Tier::BaselineJit`] — the native baseline backend
+    ///   ([`crate::jit::baseline::BaselineJit`]): it compiles the module's basic
+    ///   blocks to x86-64 and runs the export through a driver loop that falls back
+    ///   to one interpreter step per un-lowered instruction.
+    /// * [`Tier::Cranelift`] — the optional Cranelift hot tier
+    ///   (`crate::jit::cranelift::CraneliftJit`), compiled in only with the
+    ///   `jit-cranelift` Cargo feature: it lowers each IR function into a native
+    ///   Cranelift function that loops over the function's control flow and delegates
+    ///   per-instruction semantics to the same interpreter-backed helper. With the
+    ///   feature off this is a typed [`unsupported`](crate::error::unsupported)
+    ///   error, never a panic and never a fallback to the interpreter.
+    pub fn run_with_tier(
+        &mut self,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+        tier: Tier,
+    ) -> Result<Eterm> {
+        match tier {
+            Tier::Interpreter => self.run_export(module, function, arity, args, ctx),
+            Tier::BaselineJit => {
+                use crate::jit::JitBackend;
+                let mut backend = crate::jit::baseline::BaselineJit::new();
+                backend.run_export(self, module, function, arity, args, ctx)
+            }
+            Tier::Cranelift => crate::jit::run_cranelift(self, module, function, arity, args, ctx),
         }
     }
 

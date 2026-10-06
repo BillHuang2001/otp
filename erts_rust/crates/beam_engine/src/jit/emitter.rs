@@ -1,0 +1,1121 @@
+//! x86-64 machine-code emitter and executable code buffer for the baseline JIT.
+//!
+//! This module is the low-level half of the `BaselineJit` tier (Part II §F): it
+//! turns calls like [`CodeBuffer::mov_rr`] / [`CodeBuffer::jcc`] into real x86-64
+//! instruction encodings, accumulates them in an executable mapping, resolves
+//! forward/backward [`Label`] references, and hands back a callable function
+//! pointer. It is a **standalone building block**: it knows nothing about the
+//! typed IR, the [`Machine`](crate::machine::Machine) or the tier seam — a later
+//! task lowers `beam_loader` IR onto this encoder. Nothing here is wired into the
+//! interpreter today.
+//!
+//! # W^X policy
+//!
+//! The buffer is created with `mmap(PROT_READ | PROT_WRITE)` and is flipped to
+//! `PROT_READ | PROT_EXEC` by [`CodeBuffer::seal`] with `mprotect`. The mapping is
+//! **never** writable and executable at the same time: while it is writable no
+//! instruction may be executed from it, and once it is executable it can no longer
+//! be patched (every emitting call after [`seal`](CodeBuffer::seal) is a typed
+//! error rather than a fault). This is the choice the design docs favour (Part II
+//! §F) and it means the emitter never has to build an RWX region.
+//!
+//! # Calling convention
+//!
+//! The emitter assumes the **System V AMD64** ABI, the convention Erlang/OTP and
+//! this workspace target on `x86_64-unknown-linux-gnu`: integer/pointer arguments
+//! in `rdi`, `rsi`, `rdx`, `rcx`, `r8`, `r9`, further arguments on the stack, the
+//! return value in `rax`, `rbx`/`rbp`/`r12`–`r15` callee-saved and the rest
+//! caller-saved. The emitter does not itself implement a prologue/epilogue or
+//! save callee-saved registers — that is the codegen layer's job; the unit tests
+//! below show the discipline (`push`/`pop` around a clobbered `r12`).
+//!
+//! # Supported instruction subset
+//!
+//! Exactly the subset the baseline JIT needs to (a) call a native block,
+//! (b) shuttle terms between the machine's x-register array and machine registers
+//! and (c) do native control flow. Every encoding is 64-bit-operand
+//! (`REX.W`) unless noted:
+//!
+//! * data movement — [`mov_rr`], [`mov_ri`] (`movabs`, full 64-bit immediate),
+//!   [`mov_rm`] (load `[base + disp32]`), [`mov_mr`] (store), [`lea`];
+//! * integer arithmetic/logic — [`add_rr`], [`sub_rr`], [`cmp_rr`], [`test_rr`],
+//!   [`and_rr`], [`or_rr`], [`xor_rr`];
+//! * stack — [`push_r`], [`pop_r`];
+//! * control flow — [`jmp`] (`rel32`), [`jcc`] (`rel32`), [`call_label`]
+//!   (`rel32`), [`call_r`] (indirect), [`ret`];
+//! * filler — [`nop`], [`int3`].
+//!
+//! Everything else (immediates in `mov r/m64, imm32`, memory-operand arithmetic,
+//! indexed addressing, the SSE/AVX space, `syscall`, …) is deliberately **absent**
+//! — an unencodable instruction must be added as a new, tested method rather than
+//! guessed at. The encoder does handle the encoding details a wider subset would
+//! trip over: the `REX.W` prefix plus the `REX.R`/`REX.B` extension bits for
+//! `r8`–`r15`, the `SIB` byte that an `rsp`/`r12` base (or would-be index) forces,
+//! and a uniform `mod=10` `disp32` that sidesteps the `rbp`/`r13` “`mod=00` means
+//! RIP-relative” special case.
+//!
+//! # Unsafe zone
+//!
+//! This is the crate's designated **JIT unsafe zone**: it owns the only
+//! executable-memory mapping and the only raw writes into it. The crate root keeps
+//! `#![deny(unsafe_code)]`; the module-local `#![allow(unsafe_code)]` below is the
+//! single new exception (alongside the pre-existing `predicates` and `terms`
+//! modules). Every `unsafe` block carries a `// SAFETY:` rationale.
+#![allow(unsafe_code)]
+
+use core::mem;
+use core::ptr;
+use core::sync::atomic::{AtomicU32, Ordering};
+
+use beam_common::{BeamError, Result};
+
+/// Source of the per-buffer identity that keeps [`Label`]s buffer-local.
+///
+/// Never zero (zero is reserved for a hypothetical "no buffer" label).
+static NEXT_BUFFER_NONCE: AtomicU32 = AtomicU32::new(1);
+/// Default capacity, in bytes, of a new [`CodeBuffer`] (64 KiB).
+///
+/// Large enough for a substantial block of generated code; the mapping is rounded
+/// up to a whole number of OS pages regardless.
+pub const DEFAULT_CAPACITY: usize = 64 * 1024;
+
+/// Page size assumed when `sysconf(_SC_PAGESIZE)` cannot tell us (4 KiB).
+const FALLBACK_PAGE_SIZE: usize = 4096;
+
+/// The machine's page size, or [`FALLBACK_PAGE_SIZE`] if it cannot be queried.
+fn page_size() -> usize {
+    // SAFETY: `sysconf` with `_SC_PAGESIZE` has no preconditions; it returns the
+    // page size or -1.
+    let value = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if value > 0 {
+        value as usize
+    } else {
+        FALLBACK_PAGE_SIZE
+    }
+}
+
+/// Rounds `n` up to a non-zero whole number of pages.
+fn round_up_to_page(n: usize) -> usize {
+    let page = page_size();
+    n.max(1).div_ceil(page) * page
+}
+
+/// One of the 16 x86-64 general-purpose registers.
+///
+/// The discriminant is the register's architectural encoding (0–15); the low three
+/// bits live in the `ModRM`/`SIB` bytes and the high bit becomes a `REX`
+/// extension bit. `rsp`/`r12` are numbered 4/12 and therefore carry the “`rm`/base
+/// field is `100` ⇒ a `SIB` byte follows” rule the encoder implements.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum Reg {
+    /// `rax` — accumulator, first integer return register.
+    Rax = 0,
+    /// `rcx` — fourth integer argument, the `count` register for shifts.
+    Rcx = 1,
+    /// `rdx` — third integer argument.
+    Rdx = 2,
+    /// `rbx` — callee-saved general register.
+    Rbx = 3,
+    /// `rsp` — stack pointer (never usable as an index; forces a `SIB` as a base).
+    Rsp = 4,
+    /// `rbp` — callee-saved frame pointer.
+    Rbp = 5,
+    /// `rsi` — second integer argument.
+    Rsi = 6,
+    /// `rdi` — first integer argument.
+    Rdi = 7,
+    /// `r8` — fifth integer argument.
+    R8 = 8,
+    /// `r9` — sixth integer argument.
+    R9 = 9,
+    /// `r10` — caller-saved scratch.
+    R10 = 10,
+    /// `r11` — caller-saved scratch.
+    R11 = 11,
+    /// `r12` — callee-saved (forces a `SIB` as a base).
+    R12 = 12,
+    /// `r13` — callee-saved (a base needs an explicit displacement).
+    R13 = 13,
+    /// `r14` — callee-saved.
+    R14 = 14,
+    /// `r15` — callee-saved.
+    R15 = 15,
+}
+
+impl Reg {
+    /// Every general-purpose register, in architectural encoding order.
+    pub const ALL: [Reg; 16] = [
+        Reg::Rax,
+        Reg::Rcx,
+        Reg::Rdx,
+        Reg::Rbx,
+        Reg::Rsp,
+        Reg::Rbp,
+        Reg::Rsi,
+        Reg::Rdi,
+        Reg::R8,
+        Reg::R9,
+        Reg::R10,
+        Reg::R11,
+        Reg::R12,
+        Reg::R13,
+        Reg::R14,
+        Reg::R15,
+    ];
+
+    /// The register's architectural encoding (0–15).
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A conditional-jump condition code (`Jcc`).
+///
+/// The discriminant is the x86-64 `tttn` condition encoding; `jcc` adds it to the
+/// `0x80` second opcode byte. The variants are named after the **signed** and
+/// **unsigned** interpretations the BEAM comparison ops want: `L`/`Ge`/`Le`/`G`
+/// for signed, `B`/`Ae`/`Be`/`A` for unsigned, plus the equality/parity/sign set.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+#[repr(u8)]
+pub enum Cond {
+    /// Overflow (`jo`).
+    O = 0x0,
+    /// No overflow (`jno`).
+    No = 0x1,
+    /// Below / carry (unsigned `<`, `jb`).
+    B = 0x2,
+    /// Above or equal / no carry (unsigned `>=`, `jae`).
+    Ae = 0x3,
+    /// Equal / zero (`je`).
+    E = 0x4,
+    /// Not equal / not zero (`jne`).
+    Ne = 0x5,
+    /// Below or equal (unsigned `<=`, `jbe`).
+    Be = 0x6,
+    /// Above (unsigned `>`, `ja`).
+    A = 0x7,
+    /// Sign (`js`).
+    S = 0x8,
+    /// No sign (`jns`).
+    Ns = 0x9,
+    /// Parity even (`jp`).
+    P = 0xA,
+    /// Parity odd (`jnp`).
+    Np = 0xB,
+    /// Less (signed `<`, `jl`).
+    L = 0xC,
+    /// Greater or equal (signed `>=`, `jge`).
+    Ge = 0xD,
+    /// Less or equal (signed `<=`, `jle`).
+    Le = 0xE,
+    /// Greater (signed `>`, `jg`).
+    G = 0xF,
+}
+
+impl Cond {
+    /// The condition's `tttn` encoding (0–15).
+    pub fn code(self) -> u8 {
+        self as u8
+    }
+}
+
+/// A code label inside one [`CodeBuffer`].
+///
+/// Labels are created by [`CodeBuffer::label`] and fixed to a position by
+/// [`CodeBuffer::bind`]. A label carries the identity of the buffer that created
+/// it, so passing one buffer's label to another is rejected with a typed error
+/// rather than silently patching an unrelated instruction.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Hash)]
+pub struct Label {
+    /// Index into the owning buffer's binding table.
+    id: u32,
+    /// Identity of the owning buffer.
+    nonce: u32,
+}
+/// A pending `rel32` reference to a not-yet-bound label.
+///
+/// `at` is the offset of the 4-byte displacement field inside the code buffer; the
+/// displacement is filled in when the label is bound (or immediately, when the
+/// label was already bound — a backward reference).
+#[derive(Clone, Copy, Debug)]
+struct Fixup {
+    label: Label,
+    at: usize,
+}
+
+/// An executable memory region that machine code is emitted into.
+///
+/// See the module documentation for the W^X policy and the calling convention.
+/// A buffer starts writable and non-executable; [`seal`](CodeBuffer::seal) flips
+/// it to readable+executable, after which [`as_fn_ptr`](CodeBuffer::as_fn_ptr)
+/// yields a callable pointer. The mapping is released with `munmap` in
+/// [`Drop`].
+///
+/// Every fallible operation returns [`beam_common::Result`]: a failed `mmap`/
+/// `mprotect` is a [`BeamError::Io`], a buffer whose fixed capacity is exhausted is
+/// a [`BeamError::SystemLimit`], and misuse (an unbound label at seal time, a
+/// foreign or doubly-bound label, emitting after sealing) is a
+/// [`BeamError::BadArg`]. Nothing here panics.
+pub struct CodeBuffer {
+    /// Start of the `mmap`ped region (page-aligned; never null while alive).
+    base: *mut u8,
+    /// Length of the mapping in bytes (a whole number of pages).
+    size: usize,
+    /// Number of bytes emitted so far.
+    len: usize,
+    /// Whether the region has been flipped to read+execute.
+    sealed: bool,
+    /// Identity handed to every [`Label`] this buffer creates.
+    nonce: u32,
+    /// Per-label bound offset, indexed by [`Label`].
+    labels: Vec<Option<usize>>,
+    /// Forward references awaiting their label's `bind`.
+    fixups: Vec<Fixup>,
+}
+
+impl CodeBuffer {
+    /// Creates a buffer with [`DEFAULT_CAPACITY`] bytes of code space.
+    pub fn new() -> Result<Self> {
+        Self::with_capacity(DEFAULT_CAPACITY)
+    }
+
+    /// Creates a buffer with at least `capacity` bytes of code space.
+    ///
+    /// The mapping is rounded up to a whole number of OS pages (and is always at
+    /// least one page).
+    pub fn with_capacity(capacity: usize) -> Result<Self> {
+        let size = round_up_to_page(capacity);
+        // SAFETY: an anonymous, private `mmap` has no preconditions beyond a
+        // non-zero length and valid flags; it either returns a fresh,
+        // exclusively-owned, page-aligned mapping or `MAP_FAILED`, handled below.
+        let mapped = unsafe {
+            libc::mmap(
+                ptr::null_mut(),
+                size,
+                libc::PROT_READ | libc::PROT_WRITE,
+                libc::MAP_PRIVATE | libc::MAP_ANONYMOUS,
+                -1,
+                0,
+            )
+        };
+        if mapped == libc::MAP_FAILED {
+            return Err(BeamError::Io(std::io::Error::last_os_error()));
+        }
+        Ok(CodeBuffer {
+            base: mapped.cast::<u8>(),
+            size,
+            len: 0,
+            sealed: false,
+            nonce: NEXT_BUFFER_NONCE.fetch_add(1, Ordering::Relaxed),
+            labels: Vec::new(),
+            fixups: Vec::new(),
+        })
+    }
+
+    /// The number of bytes emitted so far.
+    pub fn len(&self) -> usize {
+        self.len
+    }
+
+    /// Whether nothing has been emitted yet.
+    pub fn is_empty(&self) -> bool {
+        self.len == 0
+    }
+
+    /// The mapping's capacity in bytes (a whole number of pages).
+    pub fn capacity(&self) -> usize {
+        self.size
+    }
+
+    /// Whether the buffer has been flipped to read+execute.
+    pub fn is_sealed(&self) -> bool {
+        self.sealed
+    }
+
+    /// The address of the first emitted byte.
+    ///
+    /// Only meaningful in a process that has no [`CodeBuffer`] alive at the same
+    /// address; the pointer is valid until the buffer is dropped.
+    pub fn code_ptr(&self) -> *const u8 {
+        self.base
+    }
+
+    /// Reinterprets the start of the buffer as a callable function pointer of type
+    /// `F` (e.g. `extern "C" fn(i64, i64) -> i64`).
+    ///
+    /// The caller must have called [`seal`](CodeBuffer::seal) first — calling into
+    /// a still-writable (non-executable) mapping would fault — and must only call
+    /// `F` with arguments matching the ABI the emitted code expects (see the
+    /// module docs). This is a *safe* function only in the sense that the
+    /// transmute itself is; the soundness of the emitted code is the codegen
+    /// layer's contract. `F` must be a function-pointer type (a debug assertion
+    /// checks its width).
+    pub fn as_fn_ptr<F>(&self) -> F {
+        debug_assert_eq!(
+            mem::size_of::<F>(),
+            mem::size_of::<*const u8>(),
+            "as_fn_ptr requires a function-pointer type"
+        );
+        let code: *const u8 = self.base;
+        // SAFETY: `F` is a function-pointer type (asserted to be pointer-width
+        // above) and `code` is the base of the executable mapping, so both are the
+        // same size and the transmute reinterprets one pointer as the other.
+        unsafe { mem::transmute_copy(&code) }
+    }
+
+    /// Creates a fresh, unbound label in this buffer.
+    pub fn label(&mut self) -> Label {
+        let id = self.labels.len() as u32;
+        self.labels.push(None);
+        Label {
+            id,
+            nonce: self.nonce,
+        }
+    }
+    /// Binds `label` to the current end of the code stream, patching every pending
+    /// reference to it.
+    ///
+    /// Binding an already-bound label, or a label that does not belong to this
+    /// buffer, is a [`BeamError::BadArg`]; so is binding after
+    /// [`seal`](CodeBuffer::seal) (the mapping is no longer writable).
+    pub fn bind(&mut self, label: Label) -> Result<()> {
+        if self.sealed {
+            return Err(sealed_error());
+        }
+        let slot = self.label_slot(label)?;
+        if slot.is_some() {
+            return Err(BeamError::BadArg);
+        }
+        let target = self.len;
+        let index = label.id as usize;
+        self.labels[index] = Some(target);
+        // Patch the forward references this `bind` resolves; keep the rest.
+        let pending = mem::take(&mut self.fixups);
+        for fixup in pending {
+            if fixup.label == label {
+                let disp = rel32(target, fixup.at)?;
+                self.patch_i32(fixup.at, disp)?;
+            } else {
+                self.fixups.push(fixup);
+            }
+        }
+        Ok(())
+    }
+
+    /// Flips the mapping from read+write to read+execute (`mprotect`), making the
+    /// emitted code callable.
+    ///
+    /// Fails with [`BeamError::BadArg`] if any label is still unbound (the code is
+    /// incomplete) and with [`BeamError::Io`] if `mprotect` fails. Sealing an
+    /// already-sealed buffer is a successful no-op.
+    pub fn seal(&mut self) -> Result<()> {
+        if self.sealed {
+            return Ok(());
+        }
+        if self.labels.iter().any(Option::is_none) {
+            return Err(unbound_label_error());
+        }
+        // SAFETY: `base`/`size` are exactly the region returned by
+        // `with_capacity`'s `mmap`, `base` is page-aligned (mmap guarantee) and
+        // `size` is a whole number of pages, so the whole mapping may be
+        // re-protected as read+execute.
+        let rc = unsafe {
+            libc::mprotect(
+                self.base.cast(),
+                self.size,
+                libc::PROT_READ | libc::PROT_EXEC,
+            )
+        };
+        if rc != 0 {
+            return Err(BeamError::Io(std::io::Error::last_os_error()));
+        }
+        self.sealed = true;
+        Ok(())
+    }
+
+    // -- encoding primitives -------------------------------------------------
+
+    /// Reserves `n` more bytes, or reports why it cannot.
+    fn ensure(&self, n: usize) -> Result<()> {
+        if self.sealed {
+            return Err(sealed_error());
+        }
+        if self.len + n > self.size {
+            return Err(BeamError::SystemLimit);
+        }
+        Ok(())
+    }
+
+    /// Appends one byte.
+    fn emit_u8(&mut self, byte: u8) -> Result<()> {
+        self.emit_bytes(&[byte])
+    }
+
+    /// Appends `n` little-endian bytes.
+    fn emit_bytes(&mut self, bytes: &[u8]) -> Result<()> {
+        self.ensure(bytes.len())?;
+        // SAFETY: `ensure(n)` proved `len + n <= size` and that the mapping is
+        // writable, so the destination range is in-bounds; `bytes` is a distinct
+        // slice (a stack array or a caller-owned buffer), so the two ranges cannot
+        // overlap.
+        unsafe {
+            ptr::copy_nonoverlapping(bytes.as_ptr(), self.base.add(self.len), bytes.len());
+        }
+        self.len += bytes.len();
+        Ok(())
+    }
+
+    /// Appends a little-endian `i32`.
+    fn emit_i32(&mut self, value: i32) -> Result<()> {
+        self.emit_bytes(&value.to_le_bytes())
+    }
+
+    /// Appends a little-endian `i64`.
+    fn emit_i64(&mut self, value: i64) -> Result<()> {
+        self.emit_bytes(&value.to_le_bytes())
+    }
+
+    /// Overwrites the four bytes at `at` (a deferred `rel32` fixup).
+    fn patch_i32(&mut self, at: usize, value: i32) -> Result<()> {
+        if self.sealed || at + 4 > self.len {
+            return Err(BeamError::BadArg);
+        }
+        // SAFETY: `at + 4 <= len <= size` and the mapping is writable, so the
+        // destination is in-bounds; `write_unaligned` imposes no alignment
+        // requirement on a displacement field.
+        unsafe { ptr::write_unaligned(self.base.add(at).cast::<i32>(), value) };
+        Ok(())
+    }
+
+    /// Emits a `REX` prefix when one is needed (`REX.W` and/or an extension bit).
+    fn emit_rex(&mut self, w: bool, r: u8, x: u8, b: u8) -> Result<()> {
+        let rex = 0x40 | ((w as u8) << 3) | ((r & 1) << 2) | ((x & 1) << 1) | (b & 1);
+        if rex != 0x40 {
+            self.emit_u8(rex)?;
+        }
+        Ok(())
+    }
+
+    /// Emits `ModRM` (`mod=10`) plus a `SIB` byte when the base is `rsp`/`r12`.
+    ///
+    /// The displacement is always a `disp32`, which keeps the encoding uniform and
+    /// avoids the `mod=00`/`rbp`/`r13` RIP-relative special case.
+    fn emit_mem_modrm(&mut self, reg: Reg, base: Reg, disp: i32) -> Result<()> {
+        let base_low = base.code() & 0x7;
+        self.emit_u8(0x80 | ((reg.code() & 0x7) << 3) | base_low)?;
+        if base_low == 0b100 {
+            // `rm == 100` selects the SIB byte; `index == 100` means "no index",
+            // so only the base (and scale 0) is meaningful.
+            self.emit_u8(0x20 | base_low)?;
+        }
+        self.emit_i32(disp)
+    }
+
+    /// Emits a `rel32` field for `label`, patching it at once for a backward
+    /// reference and recording a [`Fixup`] for a forward one.
+    fn emit_rel32(&mut self, label: Label) -> Result<()> {
+        let at = self.len;
+        self.emit_i32(0)?;
+        match self.label_slot(label)? {
+            Some(target) => {
+                let disp = rel32(target, at)?;
+                self.patch_i32(at, disp)
+            }
+            None => {
+                self.fixups.push(Fixup { label, at });
+                Ok(())
+            }
+        }
+    }
+
+    /// Looks up `label`'s binding, rejecting a label from another buffer.
+    fn label_slot(&self, label: Label) -> Result<Option<usize>> {
+        if label.nonce != self.nonce {
+            return Err(BeamError::BadArg);
+        }
+        self.labels
+            .get(label.id as usize)
+            .copied()
+            .ok_or(BeamError::BadArg)
+    }
+    // -- data movement -------------------------------------------------------
+
+    /// `mov dst, src` (64-bit register to register).
+    pub fn mov_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rex(true, ext(src), 0, ext(dst))?;
+        self.emit_u8(0x89)?;
+        self.emit_u8(modrm_rr(src, dst))
+    }
+
+    /// `mov dst, imm` — the `movabs` form, carrying a full 64-bit immediate.
+    pub fn mov_ri(&mut self, dst: Reg, imm: i64) -> Result<()> {
+        self.emit_rex(true, 0, 0, ext(dst))?;
+        self.emit_u8(0xB8 + (dst.code() & 0x7))?;
+        self.emit_i64(imm)
+    }
+
+    /// `mov dst, [base + disp]` — a 64-bit load.
+    pub fn mov_rm(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_rex(true, ext(dst), 0, ext(base))?;
+        self.emit_u8(0x8B)?;
+        self.emit_mem_modrm(dst, base, disp)
+    }
+
+    /// `mov [base + disp], src` — a 64-bit store.
+    pub fn mov_mr(&mut self, base: Reg, disp: i32, src: Reg) -> Result<()> {
+        self.emit_rex(true, ext(src), 0, ext(base))?;
+        self.emit_u8(0x89)?;
+        self.emit_mem_modrm(src, base, disp)
+    }
+
+    /// `lea dst, [base + disp]` — the address of `base + disp`.
+    pub fn lea(&mut self, dst: Reg, base: Reg, disp: i32) -> Result<()> {
+        self.emit_rex(true, ext(dst), 0, ext(base))?;
+        self.emit_u8(0x8D)?;
+        self.emit_mem_modrm(dst, base, disp)
+    }
+
+    // -- integer arithmetic and logic ---------------------------------------
+
+    /// Emits a `ModRM`-register-form two-operand opcode (`dst` is `r/m`, `src` is
+    /// `reg`, `REX.W`).
+    fn emit_rr(&mut self, opcode: u8, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rex(true, ext(src), 0, ext(dst))?;
+        self.emit_u8(opcode)?;
+        self.emit_u8(modrm_rr(src, dst))
+    }
+
+    /// `add dst, src`.
+    pub fn add_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rr(0x01, dst, src)
+    }
+
+    /// `sub dst, src`.
+    pub fn sub_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rr(0x29, dst, src)
+    }
+
+    /// `cmp a, b` — sets the flags for `a - b` (no operand is written).
+    pub fn cmp_rr(&mut self, a: Reg, b: Reg) -> Result<()> {
+        self.emit_rr(0x39, a, b)
+    }
+
+    /// `test a, b` — sets the flags for `a & b` (no operand is written).
+    pub fn test_rr(&mut self, a: Reg, b: Reg) -> Result<()> {
+        self.emit_rr(0x85, a, b)
+    }
+
+    /// `and dst, src`.
+    pub fn and_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rr(0x21, dst, src)
+    }
+
+    /// `or dst, src`.
+    pub fn or_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rr(0x09, dst, src)
+    }
+
+    /// `xor dst, src`.
+    pub fn xor_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rr(0x31, dst, src)
+    }
+
+    // -- stack ---------------------------------------------------------------
+
+    /// `push reg`.
+    pub fn push_r(&mut self, reg: Reg) -> Result<()> {
+        if ext(reg) != 0 {
+            self.emit_u8(0x41)?;
+        }
+        self.emit_u8(0x50 + (reg.code() & 0x7))
+    }
+
+    /// `pop reg`.
+    pub fn pop_r(&mut self, reg: Reg) -> Result<()> {
+        if ext(reg) != 0 {
+            self.emit_u8(0x41)?;
+        }
+        self.emit_u8(0x58 + (reg.code() & 0x7))
+    }
+
+    // -- control flow --------------------------------------------------------
+
+    /// `jmp label` (`rel32`).
+    pub fn jmp(&mut self, label: Label) -> Result<()> {
+        self.emit_u8(0xE9)?;
+        self.emit_rel32(label)
+    }
+
+    /// `jcc label` (`rel32`) — jump when `cond` holds.
+    pub fn jcc(&mut self, cond: Cond, label: Label) -> Result<()> {
+        self.emit_u8(0x0F)?;
+        self.emit_u8(0x80 + cond.code())?;
+        self.emit_rel32(label)
+    }
+
+    /// `call label` (`rel32`, direct).
+    pub fn call_label(&mut self, label: Label) -> Result<()> {
+        self.emit_u8(0xE8)?;
+        self.emit_rel32(label)
+    }
+
+    /// `call reg` (indirect, through a register).
+    pub fn call_r(&mut self, reg: Reg) -> Result<()> {
+        if ext(reg) != 0 {
+            self.emit_u8(0x41)?;
+        }
+        self.emit_u8(0xFF)?;
+        self.emit_u8(0xC0 | (0x2 << 3) | (reg.code() & 0x7))
+    }
+
+    /// `ret`.
+    pub fn ret(&mut self) -> Result<()> {
+        self.emit_u8(0xC3)
+    }
+
+    // -- filler --------------------------------------------------------------
+
+    /// `nop`.
+    pub fn nop(&mut self) -> Result<()> {
+        self.emit_u8(0x90)
+    }
+
+    /// `int3` — a debugger breakpoint / trap.
+    pub fn int3(&mut self) -> Result<()> {
+        self.emit_u8(0xCC)
+    }
+}
+
+impl Drop for CodeBuffer {
+    fn drop(&mut self) {
+        if self.base.is_null() {
+            return;
+        }
+        // SAFETY: `base`/`size` are exactly the pair `with_capacity` mapped and
+        // this is the only place the mapping is unmapped (a `CodeBuffer` owns it
+        // exclusively and is consumed here), so `munmap` runs exactly once.
+        let rc = unsafe { libc::munmap(self.base.cast(), self.size) };
+        debug_assert_eq!(rc, 0, "munmap must succeed for a live code mapping");
+    }
+}
+
+/// The `REX` extension bit (high bit) of a register.
+fn ext(reg: Reg) -> u8 {
+    (reg.code() >> 3) & 1
+}
+
+/// A `ModRM` byte for the register-to-register form (`mod=11`).
+fn modrm_rr(reg: Reg, rm: Reg) -> u8 {
+    0xC0 | ((reg.code() & 0x7) << 3) | (rm.code() & 0x7)
+}
+
+/// The `rel32` displacement from a `rel32` field at `at` to `target`.
+///
+/// A `rel32` is measured from the end of the instruction, i.e. from `at + 4`.
+fn rel32(target: usize, at: usize) -> Result<i32> {
+    i32::try_from(target as i64 - (at as i64 + 4)).map_err(|_| BeamError::SystemLimit)
+}
+
+/// Emitting into a buffer that has already been sealed (and is no longer
+/// writable) is an API misuse.
+fn sealed_error() -> BeamError {
+    BeamError::BadArg
+}
+
+/// Sealing a buffer that still has an unbound label would yield incomplete code.
+fn unbound_label_error() -> BeamError {
+    BeamError::BadArg
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `extern "C" fn(i64, i64) -> i64` (System V: `rdi`, `rsi` → `rax`).
+    type BinOp = extern "C" fn(i64, i64) -> i64;
+
+    /// The raw permissions string (`rw-p`, `r-xp`, …) of the mapping containing
+    /// `addr`, read from `/proc/self/maps`; `None` if it cannot be determined
+    /// (e.g. a non-Linux host).
+    fn mapping_perms(addr: usize) -> Option<String> {
+        let maps = std::fs::read_to_string("/proc/self/maps").ok()?;
+        for line in maps.lines() {
+            let Some((range, rest)) = line.split_once(' ') else {
+                continue;
+            };
+            let Some((start, end)) = range.split_once('-') else {
+                continue;
+            };
+            let (Ok(start), Ok(end)) = (
+                usize::from_str_radix(start, 16),
+                usize::from_str_radix(end, 16),
+            ) else {
+                continue;
+            };
+            if start <= addr && addr < end {
+                return rest.split_whitespace().next().map(str::to_string);
+            }
+        }
+        None
+    }
+
+    #[test]
+    fn register_codes_are_the_architectural_encodings() {
+        for (i, reg) in Reg::ALL.into_iter().enumerate() {
+            assert_eq!(reg.code() as usize, i);
+        }
+        assert_eq!(Reg::Rsp.code(), 4);
+        assert_eq!(Reg::R12.code(), 12);
+        for cond in [Cond::E, Cond::Ne, Cond::L, Cond::Ge, Cond::Le, Cond::G] {
+            assert_eq!(cond.code() & 0b1111, cond.code());
+        }
+        assert_eq!(Cond::E.code(), 0x4);
+        assert_eq!(Cond::G.code(), 0xF);
+    }
+
+    #[test]
+    fn capacity_is_a_whole_number_of_pages() {
+        let buf = CodeBuffer::new().unwrap();
+        assert_eq!(buf.capacity() % page_size(), 0);
+        assert!(buf.capacity() >= DEFAULT_CAPACITY);
+        assert_eq!(buf.len(), 0);
+        assert!(buf.is_empty());
+        assert!(!buf.is_sealed());
+        // A requested zero capacity still yields one page.
+        let tiny = CodeBuffer::with_capacity(0).unwrap();
+        assert_eq!(tiny.capacity(), page_size());
+    }
+
+    #[test]
+    fn emits_add() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.add_rr(Reg::Rax, Reg::Rsi).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let add: BinOp = buf.as_fn_ptr();
+        assert_eq!(add(2, 3), 5);
+        assert_eq!(add(-4, 10), 6);
+        assert_eq!(add(0, 0), 0);
+        assert_eq!(add(i64::MIN, i64::MAX), -1);
+    }
+
+    #[test]
+    fn emits_writes_to_r8_and_r9() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::R8, Reg::Rdi).unwrap();
+        buf.mov_rr(Reg::R9, Reg::Rsi).unwrap();
+        buf.add_rr(Reg::R8, Reg::R9).unwrap();
+        buf.mov_rr(Reg::Rax, Reg::R8).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: BinOp = buf.as_fn_ptr();
+        assert_eq!(f(20, 22), 42);
+        assert_eq!(f(-1, -2), -3);
+    }
+
+    #[test]
+    fn emits_six_argument_sum_through_r8_and_r9() {
+        // The 5th and 6th integer arguments arrive in `r8`/`r9`, so this exercises
+        // `REX.R` on the source operands.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        for src in [Reg::Rsi, Reg::Rdx, Reg::Rcx, Reg::R8, Reg::R9] {
+            buf.add_rr(Reg::Rax, src).unwrap();
+        }
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let sum: extern "C" fn(i64, i64, i64, i64, i64, i64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(sum(1, 2, 3, 4, 5, 6), 21);
+        assert_eq!(sum(-1, -2, -3, -4, -5, -6), -21);
+    }
+
+    #[test]
+    fn emits_r12_base_which_forces_a_sib_byte() {
+        // `r12` is callee-saved, so it is preserved around the call; its use as an
+        // address base forces a `SIB` byte in the `mov_rm`/`mov_mr` encodings.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.push_r(Reg::R12).unwrap();
+        buf.mov_rr(Reg::R12, Reg::Rdi).unwrap();
+        buf.mov_rm(Reg::Rax, Reg::R12, 8).unwrap(); // rax = p[1]
+        buf.mov_rm(Reg::Rcx, Reg::R12, 0).unwrap(); // rcx = p[0]
+        buf.add_rr(Reg::Rax, Reg::Rcx).unwrap(); // rax = p[0] + p[1]
+        buf.mov_mr(Reg::R12, 16, Reg::Rax).unwrap(); // p[2] = sum
+        buf.pop_r(Reg::R12).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn(*mut i64) -> i64 = buf.as_fn_ptr();
+        let mut data = [20i64, 22, 0];
+        assert_eq!(f(data.as_mut_ptr()), 42);
+        assert_eq!(data, [20, 22, 42]);
+    }
+
+    #[test]
+    fn emits_rsp_base_which_forces_a_sib_byte() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_ri(Reg::Rcx, 32).unwrap();
+        buf.sub_rr(Reg::Rsp, Reg::Rcx).unwrap();
+        buf.mov_mr(Reg::Rsp, 0, Reg::Rdi).unwrap(); // [rsp] = a
+        buf.mov_rm(Reg::Rax, Reg::Rsp, 0).unwrap(); // rax = [rsp]
+        buf.mov_ri(Reg::Rdx, 5).unwrap();
+        buf.add_rr(Reg::Rax, Reg::Rdx).unwrap();
+        buf.mov_ri(Reg::Rcx, 32).unwrap();
+        buf.add_rr(Reg::Rsp, Reg::Rcx).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn(i64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(f(10), 15);
+        assert_eq!(f(-5), 0);
+    }
+
+    #[test]
+    fn emits_lea() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.lea(Reg::Rax, Reg::Rax, 8).unwrap(); // rax = &p[1]
+        buf.mov_rm(Reg::Rax, Reg::Rax, 0).unwrap(); // rax = p[1]
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn(*const i64) -> i64 = buf.as_fn_ptr();
+        let data = [10i64, 42];
+        assert_eq!(f(data.as_ptr()), 42);
+    }
+
+    #[test]
+    fn emits_conditional_branch_selecting_a_constant() {
+        // `max(a, b)`: keep `a` unless the signed comparison says `b` is greater.
+        let mut buf = CodeBuffer::new().unwrap();
+        let done = buf.label();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.cmp_rr(Reg::Rdi, Reg::Rsi).unwrap();
+        buf.jcc(Cond::Ge, done).unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rsi).unwrap();
+        buf.bind(done).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let max: BinOp = buf.as_fn_ptr();
+        assert_eq!(max(3, 7), 7);
+        assert_eq!(max(7, 3), 7);
+        assert_eq!(max(-5, -9), -5);
+        assert_eq!(max(4, 4), 4);
+    }
+
+    #[test]
+    fn emits_call_through_a_register() {
+        // The callee returns `a - b`; the caller forwards its own arguments
+        // (`rdi`/`rsi`) to it through `call rax`. `push rbx` keeps the stack
+        // 16-byte aligned across the call and preserves the callee-saved `rbx`.
+        let mut callee = CodeBuffer::new().unwrap();
+        callee.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        callee.sub_rr(Reg::Rax, Reg::Rsi).unwrap();
+        callee.ret().unwrap();
+        callee.seal().unwrap();
+        let callee_fn: BinOp = callee.as_fn_ptr();
+        let callee_addr = callee_fn as usize as i64;
+
+        let mut caller = CodeBuffer::new().unwrap();
+        caller.push_r(Reg::Rbx).unwrap();
+        caller.mov_ri(Reg::Rax, callee_addr).unwrap();
+        caller.call_r(Reg::Rax).unwrap();
+        caller.pop_r(Reg::Rbx).unwrap();
+        caller.ret().unwrap();
+        caller.seal().unwrap();
+
+        let call: BinOp = caller.as_fn_ptr();
+        assert_eq!(call(10, 4), 6);
+        assert_eq!(call(4, 10), -6);
+        // `callee` is still alive here: it must outlive every call through it.
+        assert!(callee.is_sealed());
+    }
+
+    #[test]
+    fn patches_a_forward_jump() {
+        // `mov rax, 1; jmp done; mov rax, 2; done: ret` must skip the second move.
+        let mut buf = CodeBuffer::new().unwrap();
+        let done = buf.label();
+        buf.mov_ri(Reg::Rax, 1).unwrap();
+        buf.jmp(done).unwrap();
+        buf.mov_ri(Reg::Rax, 2).unwrap();
+        buf.bind(done).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn() -> i64 = buf.as_fn_ptr();
+        assert_eq!(f(), 1);
+    }
+
+    #[test]
+    fn patches_a_forward_conditional_jump() {
+        // `mov rax, 10; mov rcx, 5; cmp rcx, rcx; je taken; mov rax, 7; taken: ret`
+        // — `cmp rcx, rcx` is equal, so the conditional jump is taken.
+        let mut buf = CodeBuffer::new().unwrap();
+        let taken = buf.label();
+        buf.mov_ri(Reg::Rax, 10).unwrap();
+        buf.mov_ri(Reg::Rcx, 5).unwrap();
+        buf.cmp_rr(Reg::Rcx, Reg::Rcx).unwrap();
+        buf.jcc(Cond::E, taken).unwrap();
+        buf.mov_ri(Reg::Rax, 7).unwrap();
+        buf.bind(taken).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn() -> i64 = buf.as_fn_ptr();
+        assert_eq!(f(), 10);
+    }
+
+    #[test]
+    fn patches_a_backward_jump() {
+        // Counts `n` down to zero, accumulating one per iteration:
+        // the `jmp loop` is a backward reference, patched the moment it is emitted.
+        let mut buf = CodeBuffer::new().unwrap();
+        let loop_top = buf.label();
+        let end = buf.label();
+        buf.mov_ri(Reg::Rax, 0).unwrap();
+        buf.mov_rr(Reg::Rcx, Reg::Rdi).unwrap();
+        buf.bind(loop_top).unwrap();
+        buf.test_rr(Reg::Rcx, Reg::Rcx).unwrap();
+        buf.jcc(Cond::E, end).unwrap();
+        buf.mov_ri(Reg::Rdx, 1).unwrap();
+        buf.sub_rr(Reg::Rcx, Reg::Rdx).unwrap();
+        buf.mov_ri(Reg::Rdx, 1).unwrap();
+        buf.add_rr(Reg::Rax, Reg::Rdx).unwrap();
+        buf.jmp(loop_top).unwrap();
+        buf.bind(end).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let countdown: extern "C" fn(i64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(countdown(5), 5);
+        assert_eq!(countdown(0), 0);
+        assert_eq!(countdown(100), 100);
+    }
+
+    #[test]
+    fn seals_w_a_forward_reference_correctly() {
+        // A `call` to a later label resolves at `bind` time.
+        let mut buf = CodeBuffer::new().unwrap();
+        let sub = buf.label();
+        buf.push_r(Reg::Rbx).unwrap();
+        buf.mov_ri(Reg::Rax, 1000).unwrap();
+        buf.call_label(sub).unwrap();
+        buf.pop_r(Reg::Rbx).unwrap();
+        buf.ret().unwrap();
+        buf.bind(sub).unwrap();
+        buf.mov_rr(Reg::Rcx, Reg::Rdi).unwrap();
+        buf.add_rr(Reg::Rax, Reg::Rcx).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn(i64) -> i64 = buf.as_fn_ptr();
+        assert_eq!(f(23), 1023);
+    }
+
+    #[test]
+    fn sealing_with_an_unbound_label_is_a_typed_error() {
+        let mut buf = CodeBuffer::new().unwrap();
+        let dangling = buf.label();
+        buf.jmp(dangling).unwrap();
+        assert!(matches!(buf.seal(), Err(BeamError::BadArg)));
+        // Binding it afterwards lets the buffer seal.
+        buf.bind(dangling).unwrap();
+        buf.ret().unwrap();
+        assert!(buf.seal().is_ok());
+    }
+
+    #[test]
+    fn emitting_after_sealing_is_a_typed_error() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+        assert!(matches!(buf.nop(), Err(BeamError::BadArg)));
+        assert!(matches!(buf.ret(), Err(BeamError::BadArg)));
+        // Sealing again is an idempotent success.
+        assert!(buf.seal().is_ok());
+    }
+
+    #[test]
+    fn seal_is_w_xor_x() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.ret().unwrap();
+        let addr = buf.code_ptr() as usize;
+
+        // Before sealing (where `/proc/self/maps` is available): writable, not
+        // executable.
+        if let Some(perms) = mapping_perms(addr) {
+            assert!(perms.starts_with("rw"), "unsealed perms were {perms:?}");
+            assert!(!perms.contains('x'), "unsealed perms were {perms:?}");
+        }
+
+        buf.seal().unwrap();
+
+        if let Some(perms) = mapping_perms(addr) {
+            assert!(perms.starts_with("r-x"), "sealed perms were {perms:?}");
+            assert!(!perms.contains('w'), "sealed perms were {perms:?}");
+        }
+    }
+
+    #[test]
+    fn exhausted_capacity_is_a_typed_error() {
+        let mut buf = CodeBuffer::with_capacity(0).unwrap();
+        let limit = buf.capacity();
+        let mut overflow = None;
+        for _ in 0..=limit {
+            if let Err(err) = buf.nop() {
+                overflow = Some(err);
+                break;
+            }
+        }
+        assert!(
+            matches!(overflow, Some(BeamError::SystemLimit)),
+            "a full code buffer must report `SystemLimit`"
+        );
+        assert_eq!(buf.len(), limit);
+    }
+
+    #[test]
+    fn labels_are_buffer_local_and_bound_once() {
+        let mut a = CodeBuffer::new().unwrap();
+        let mut b = CodeBuffer::new().unwrap();
+        let foreign = b.label();
+
+        let mine = a.label();
+        a.bind(mine).unwrap();
+        // Binding the same label twice is rejected.
+        assert!(matches!(a.bind(mine), Err(BeamError::BadArg)));
+        // A label from another buffer is not a valid target.
+        assert!(matches!(a.jmp(foreign), Err(BeamError::BadArg)));
+        assert!(matches!(a.bind(foreign), Err(BeamError::BadArg)));
+    }
+
+    #[test]
+    fn dropping_a_sealed_buffer_is_clean() {
+        // Repeatedly map, seal and release several executable buffers; a leaked or
+        // double-unmapped mapping would trip the `munmap` assertion in `Drop`.
+        for i in 0..16 {
+            let mut buf = CodeBuffer::new().unwrap();
+            buf.mov_ri(Reg::Rax, i).unwrap();
+            buf.ret().unwrap();
+            buf.seal().unwrap();
+            let f: extern "C" fn() -> i64 = buf.as_fn_ptr();
+            assert_eq!(f(), i);
+            drop(buf);
+        }
+    }
+
+    #[test]
+    fn int3_and_nop_emit_one_byte_each() {
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.nop().unwrap();
+        buf.int3().unwrap();
+        assert_eq!(buf.len(), 2);
+    }
+}
