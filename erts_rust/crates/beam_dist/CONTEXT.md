@@ -186,25 +186,59 @@ distribution header carries it).
   `beam_codec`.
 
 ### `src/epmd.rs` — `epmd` port-mapper client (safe)
-2-byte-BE-framed `ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES` codecs +
-`struct EpmdClient<T: Transport>` (`publish`/`port_please`/`names`).
-`NamesResp::encode` is lossy on per-node ports (only `epmd_port` + names are retained).
+2-byte-BE-framed **requests** (`ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES`) +
+`struct EpmdClient<T: Transport>` (`publish`/`port_please`/`names`). **Replies are NOT length-framed**
+(`epmd` writes the body straight to the socket) — the client reads them unframed/self-delimiting (see
+Design Decisions).
+- `EpmdClient<TcpTransport>::connect(addr) -> Result<EpmdClient<TcpTransport>>` and the free
+  `epmd::connect(addr)` — a real TCP client to `epmd` (sets `DEFAULT_READ_TIMEOUT` + `TCP_NODELAY`).
+- `epmd::lookup(name) -> Result<Port2Resp>` (raw) and `epmd::lookup_port(name) -> Result<u16>`
+  (`Port2Resp::Error` ⇒ `BeamError::Io(NotFound)`, never a silent `0`); both connect to
+  `EPMD_DEFAULT_ADDR` (`"127.0.0.1:4369"`, pinned to `EPMD_PORT`).
+- `NamesResp::encode` is lossy on per-node ports (only `epmd_port` + names are retained).
 
-### `src/connection.rs` — the connection-level API + `TcpStream` adapter (safe)
+### `src/connection.rs` — the blocking connection-level API + `TcpStream` adapter (safe)
 - `struct TcpTransport` (impls `Read`/`Write`); `connect(addr)` sets a read timeout + `TCP_NODELAY`;
   `from_stream`; `set_read_timeout`/`set_nodelay`/`stream`/`into_inner`; `DEFAULT_READ_TIMEOUT` (10 s).
+- `struct TcpListener` (wrapping `std::net::TcpListener`): `bind(addr)`/`local_addr`/`accept` (yields a
+  `TcpTransport` with the read timeout + `TCP_NODELAY`)/`set_nonblocking`/`into_inner` — the server side.
 - Handshake driver (2-byte framing): `connect_client(t, our_name, cookie) -> Result<Handshake>`,
   `connect_client_with_creation(t, our_name, cookie, creation) -> Result<Handshake>` and
   `accept_server(t, our_name, cookie, creation) -> Result<Handshake>`, where
   `struct Handshake { client_flags, server_flags, negotiated, peer_creation, peer_name, buffered }`.
   `pub const CLIENT_CREATION: u32 = 0` is the default client creation.
+- `connect_to_node(host, node_name, our_name, cookie) -> Result<Connection<TcpTransport>>` (+
+  `connect_to_node_with_creation`) — `epmd::lookup_port` → `TcpTransport::connect` → `Connection::client`.
 - Established link (4-byte framing): `struct Connection<T: Transport>` —
   `client(t, name, cookie)` / `client_with_creation(t, name, cookie, creation)` /
   `server(t, name, cookie, creation)`; `negotiated`/`client_flags`/`server_flags`/`peer_name`/
   `peer_creation`/`handshake`/`ticks_answered`/`into_inner`; `send_control(dop, terms, atoms)`,
   `send_message(from, to, msg, atoms)`, `send_tick()`, `recv(&mut Heap, &mut AtomTable) ->
-  Result<ControlMessage>`. `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an
-  `OutboundAtomCache` that `send_payload` drains via `take_header()`.
+  Result<ControlMessage>`; typed `DOP_*` helpers `send_reg_send(from, cookie, to_name, msg, atoms)` /
+  `send_link(from, to, atoms)` / `send_exit(from, to, reason, atoms)` /
+  `send_monitor_p(from, to, ref, atoms)` / `send_demonitor_p(from, to, ref, atoms)`.
+  `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an `OutboundAtomCache` that `send_payload` drains
+  via `take_header()`.
+
+### `src/driver.rs` — the non-blocking poll/step state machine (safe)
+`struct ConnectionDriver` + `enum DriverState { Handshaking, Established, Closed, Failed }` +
+`enum StepOutcome { WouldBlock, Handshaking, Established, Progress, Closed, Failed }`. **Byte-fed**: the
+runtime owns the socket and does the syscalls; the driver only parses/serializes.
+- `client(our_name, cookie, creation)` / `server(our_name, cookie, creation)` (+ `*_with_challenge`),
+  `is_client`.
+- `feed(&[u8])` / `feed_eof()` — appends socket bytes / signals a clean EOF.
+- `step() -> Result<StepOutcome>` — makes all possible progress (incremental 2-byte handshake, then
+  4-byte-framed established frames, tick replies, `'E'`/`'F'` reassembly); returns `WouldBlock` when
+  nothing more can be done.
+- `take_output() -> Vec<u8>` / `has_output()` — bytes the runtime must write to the socket.
+- `next_message(&mut Heap, &mut AtomTable) -> Result<Option<ControlMessage>>` — decodes the next queued
+  payload (applying the receive atom cache).
+- `send_control(dop, terms, atoms)` / `send_message(from, to, msg, atoms)` / `send_tick()` — encode +
+  envelope into the output buffer.
+- `state()` / `negotiated()` / `client_flags()` / `server_flags()` / `peer_name()` / `peer_creation()` /
+  `handshake()` / `ticks_answered()` / `is_eof()`.
+- Runtime drive loop: `read → feed → loop{step until WouldBlock} → take_output → write → while
+  next_message{ handle }`; `Closed`/`Failed` mean drop the link.
 
 ## Constraints
 - **Safe Rust only** — `#![deny(unsafe_code)]`. `TcpTransport` uses only `std::net`.
