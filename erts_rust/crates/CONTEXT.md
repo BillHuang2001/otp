@@ -189,7 +189,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
 - `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
-- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs
+- `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs; the **working host API** (`nif/enif.rs` — the `enif_*` function implementations over the `NifHost` seam), the **dynamic loader** (`nif/loader.rs` — `dlopen`/`dlsym` of a NIF shared object + `ErlNifEntry` validation + `NifLibrary::call`), and `nif/host.rs` (`NifHost`/`NifEnv`)
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
