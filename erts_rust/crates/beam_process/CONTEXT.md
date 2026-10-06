@@ -351,14 +351,17 @@ holds `Process` values directly.
   Immediates and literal-area terms are shared by `copy_struct`, so the common reasons pay nothing.
   This mirrors `Process::deliver`'s copy-then-enqueue pattern and is what makes `{'EXIT', …}`/
   `{'DOWN', …}` survive the recipient's next collection.
-- **GC root set = registers + mailbox payloads, gathered into a flat `&mut [Eterm]`.** `beam_gc`'s
-  collector takes a flat root slice (`x_reg_array[0..Live)` + stack, no frame maps). The mailbox holds
-  terms *in this process's heap*, so it is a sub-rootset (`beam_gc` explicitly delegates on-heap
-  message queues to `beam_process`). Since `beam_message::Message` has no payload setter, `Process::
-  collect` **drains the queue** (`Queue::dequeue`), appends each payload to the root buffer, runs the
-  collector, scatters the registers back, and **rebuilds** each `Message` from the relocated payload
-  (via the public `Message::new(..).with_token(..).with_off_heap(..)` builder). MSO handles are
-  off-heap and do not move. This uses only `beam_message`'s public API — no sibling crate is modified.
+- **GC root set = registers + mailbox payloads + dictionary + saved args, gathered into a flat `&mut
+  [Eterm]`.** `beam_gc`'s collector takes a flat root slice (`x_reg_array[0..Live)` + stack, no frame
+  maps). The mailbox, the process dictionary (`Dict`) and the saved BIF/NIF arguments (`SavedArgs`) all
+  hold terms *in this process's heap*, so each is a sub-rootset (`beam_gc` explicitly delegates on-heap
+  message queues to `beam_process`). `Process::collect` gathers them in a fixed order — registers/stack,
+  mailbox payloads, dictionary, saved args — runs the collector, then writes each region back in the
+  same order: since `beam_message::Message` has no payload setter the queue is **drained**
+  (`Queue::dequeue`), each payload appended to the root buffer, and each `Message` **rebuilt** from its
+  relocated payload (via the public `Message::new(..).with_token(..).with_off_heap(..)` builder); the
+  dict/saved-args regions are scattered back through their own `scatter_roots`. MSO handles are off-heap
+  and do not move. This uses only `beam_message`'s public API — no sibling crate is modified.
 - **Monitor references are on-heap `Ref` things built locally (`monitor.rs`).** `beam_term` has no
   `make_ref` in M1, so a monitor reference is represented as the frozen 4-word ref thing
   `[make_header(3, REF_SUBTAG), node(0), serial, id]` built with `beam_term`'s public `make_header`;
