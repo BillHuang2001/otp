@@ -641,6 +641,18 @@ impl EpmdClient<TcpTransport> {
     }
 }
 
+/// Connects to `epmd` at `addr` (a `host:port` pair; the well-known address is
+/// [`EPMD_DEFAULT_ADDR`]) and returns a client for the lookup protocol.
+///
+/// The free-function form of [`EpmdClient::connect`], mirroring the [`lookup`] and
+/// [`lookup_port`] helpers: callers that want the local `epmd` need not name the
+/// [`crate::connection::TcpTransport`] transport themselves. The returned client's
+/// lifetime is the connection's (and, for a [`publish`](EpmdClient::publish)ed
+/// node, its `epmd` registration's) lifetime — see [`EpmdClient::connect`].
+pub fn connect(addr: &str) -> Result<EpmdClient<TcpTransport>> {
+    EpmdClient::connect(addr)
+}
+
 /// Looks a node's registration up on the local `epmd` ([`EPMD_DEFAULT_ADDR`]),
 /// returning the raw [`Port2Resp`].
 ///
