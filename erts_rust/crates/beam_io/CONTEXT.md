@@ -117,7 +117,7 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `schedule_timeout(Instant) -> bool`, `arm_timeout(Instant)`, `cancel_timeout() -> bool`,
   `next_timeout() -> Option<Instant>`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
   `has_pending_task(PortTaskKind) -> bool`, `timeout(&mut Poller) -> Result<()>`.
-  Each `IDriver` interaction (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the
+  Each driver interaction (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the
   port timer from `Driver::next_timeout` through the internal `refresh_timeout`: `Some(d)` arms/**re-points** the
   single `TIMEOUT` task at `d`, `None` clears it (a driver's declaration is authoritative until its next interaction).
 - `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
