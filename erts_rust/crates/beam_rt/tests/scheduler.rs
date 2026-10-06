@@ -256,7 +256,8 @@ fn a_spawn_of_an_unexported_function_or_unknown_module_is_a_diagnostic() {
     let error = rt
         .spawn_process("no_such_module_at_all", "f", vec![])
         .expect_err("the module cannot be loaded");
-    assert!(error.to_string().contains("no_such_module_at_all"), "{error}");
+    // A missing module is the oracle's `exception error undef` (reason atom `undef`).
+    assert_eq!(error.as_atom(), Some("undef"), "{error}");
 
     assert_eq!(rt.run_queue_len(), 0, "no failed spawn enqueued anything");
 }

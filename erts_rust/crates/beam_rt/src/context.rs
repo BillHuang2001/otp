@@ -58,7 +58,7 @@ use std::cell::RefCell;
 use std::rc::Rc;
 use std::sync::Arc;
 
-use beam_bifs::{AtomInterner, BifContext, FunCaller, OutputSink};
+use beam_bifs::{AtomInterner, BifContext, DictHook, FunCaller, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
@@ -333,8 +333,10 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// # Errors
     ///
-    /// A diagnostic naming `module:function/arity` when the function is not in the
-    /// module's atom table or is not exported, plus any error the running code raises.
+    /// [`crate::error::undef`] (class `error`, reason atom `undef`) when the function is
+    /// not in the module's atom table or is not exported — exactly the raise the oracle
+    /// produces for a call to a function the release does not have — plus any error the
+    /// running code raises.
     pub(crate) fn run_export(
         &mut self,
         module: &Module,
@@ -342,13 +344,12 @@ impl<'a> RuntimeContext<'a> {
         arity: u32,
         args: &[Eterm],
     ) -> Result<Eterm> {
-        let name = module.atom_name(module.name).unwrap_or("<unnamed>");
         let function_atom = module
             .atom_table
             .lookup(function)
-            .ok_or_else(|| error::unknown_function(name, function, arity))?;
+            .ok_or_else(error::undef)?;
         if module.export(function_atom, arity).is_none() {
-            return Err(error::unknown_function(name, function, arity));
+            return Err(error::undef());
         }
         Machine::new().run_export(module, function_atom, arity, args, self)
     }
@@ -377,6 +378,17 @@ impl<'a> RuntimeContext<'a> {
     /// the caller's sink through a [`SharedSink`] clone, and — because the outer call did
     /// **not** take the ETS cell (see [`Self::reentrancy_capable`]) — borrows the shared
     /// tables and reaches the outer tables' `ets:*` operations.
+    ///
+    /// # The process-dictionary seam
+    ///
+    /// The five process-dictionary BIFs (`erlang:put/2`, `get/1`, `erase/1`,
+    /// `get_keys/0`, `get_keys/1`) need the **running process's** [`Dict`](beam_process::Dict)
+    /// — a `&mut ProcessTable`, which for an `-eval` context is
+    /// `&mut runtime.processes` and therefore cannot co-exist with [`FunBridge`]'s
+    /// `&mut Runtime`. [`Self::uses_dict`] gates them: such a call installs a
+    /// [`DictBridge`] (resolving the table the same way the mailbox/`self` seam does)
+    /// **instead of** the fun-caller bridge. No dict BIF applies a fun argument, so nothing
+    /// is lost (see [`DictBridge`]).
     fn call_registered(
         &mut self,
         module: &str,
@@ -397,6 +409,10 @@ impl<'a> RuntimeContext<'a> {
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
+        // Whether this is a process-dictionary BIF, which needs the running process's
+        // `Dict` (a `&mut ProcessTable`) rather than a fun-caller bridge — the two borrows
+        // cannot co-exist (see the method docs).
+        let uses_dict = Self::uses_dict(module, function, arity);
         let result = {
             let RuntimeContext {
                 runtime,
@@ -421,31 +437,58 @@ impl<'a> RuntimeContext<'a> {
                 // degrade to "no ETS", never panic.
                 tables_handle.try_borrow_mut().ok()
             };
-            // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
-            // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`.
-            let mut bridge = FunBridge {
-                runtime,
-                output: output.clone(),
-                mailbox_pid: *mailbox_pid,
-                mailbox_table: mailbox_table.as_deref_mut(),
-                may_pump_scheduler: *may_pump_scheduler,
-            };
-            // The port provider is another cheap handle: it holds the shared `Rc` port
-            // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
-            // really starts an OS process and `erlang:port_info/1,2` answers from the
-            // runtime's own port table (see `crate::port`).
+            // The port provider is a cheap handle shared by both branches: it holds the
+            // shared `Rc` port registry and a clone of the shared atom-table handle, so
+            // `erlang:open_port/2` really starts an OS process and `erlang:port_info/1,2`
+            // answers from the runtime's own port table (see `crate::port`).
             let mut ports = RuntimePorts::new(ports_handle, Rc::clone(&atoms), self_pid);
-            let mut context = BifContext::new(&mut heap, &atoms, self_pid)
-                .with_atom_interner(&mut pending)
-                .with_fun_caller(&mut bridge)
-                .with_port_hook(&mut ports);
-            if let Some(sink) = output.as_mut() {
-                context = context.with_output(sink);
+            if uses_dict {
+                // The running process's directory: resolve the table the same way the
+                // mailbox/`self` seam does — the caller-supplied table (a scheduler pass)
+                // when there is one, else the runtime's own process table (a `-eval`
+                // context). This borrow of `runtime` is the *only* one here, so it does not
+                // clash with anything (the fun-caller bridge is not built).
+                let table: &mut ProcessTable = match mailbox_table {
+                    Some(ref mut table) => &mut **table,
+                    None => &mut runtime.processes,
+                };
+                let mut dict = DictBridge {
+                    table,
+                    pid: self_pid,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_dict_hook(&mut dict)
+                    .with_port_hook(&mut ports);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
+            } else {
+                // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
+                // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`.
+                let mut bridge = FunBridge {
+                    runtime,
+                    output: output.clone(),
+                    mailbox_pid: *mailbox_pid,
+                    mailbox_table: mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: *may_pump_scheduler,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_fun_caller(&mut bridge)
+                    .with_port_hook(&mut ports);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             }
-            if let Some(tables) = tables.as_deref_mut() {
-                context = context.with_tables(tables);
-            }
-            registry.call(module, function, arity, &mut context, args)
         };
         // The BIF is done and every borrow released, so commit the names it interned:
         // each lands at the index the interner predicted, keeping the BIF's atom terms
@@ -455,6 +498,24 @@ impl<'a> RuntimeContext<'a> {
         }
         self.runtime.put_bif_heap(heap);
         result
+    }
+
+    /// Whether `(module, function, arity)` is one of the five process-dictionary BIFs that
+    /// must run against the calling process's [`Dict`](beam_process::Dict).
+    ///
+    /// These BIFs take a `&mut ProcessTable` (the running process), which cannot co-exist
+    /// with [`FunBridge`]'s `&mut Runtime` borrow — so [`Self::call_registered`] installs a
+    /// [`DictBridge`] for them **instead of** the fun-caller bridge. No dict BIF applies a
+    /// fun argument, so the fun-caller seam is never needed for one.
+    fn uses_dict(module: &str, function: &str, arity: u32) -> bool {
+        matches!(
+            (module, function, arity),
+            ("erlang", "put", 2)
+                | ("erlang", "get", 1)
+                | ("erlang", "erase", 1)
+                | ("erlang", "get_keys", 0)
+                | ("erlang", "get_keys", 1)
+        )
     }
 
     /// Whether a call with `args` can re-enter the runtime by *applying a fun argument*.
@@ -519,6 +580,68 @@ impl FunCaller for FunBridge<'_> {
             may_pump_scheduler: self.may_pump_scheduler,
         };
         ctx.apply_fun(fun, args)
+    }
+}
+
+/// The `beam_bifs` process-dictionary seam: the running process's [`Dict`](beam_process::Dict).
+///
+/// The five process-dictionary BIFs (`erlang:put/2`, `get/1`, `erase/1`, `get_keys/0`,
+/// `get_keys/1`) are plain Rust functions that cannot reach the calling process's dictionary
+/// themselves, so they call it through the `BifContext` `dict_*` operations — this
+/// is the concrete [`DictHook`] the runtime installs. It borrows the process table the
+/// running process lives in (the runtime's own for a `-eval` context, the caller-supplied
+/// one for a scheduler pass — see [`RuntimeContext::call_registered`]) and forwards each
+/// operation to that process's [`Dict`](beam_process::Dict).
+///
+/// A pid the table does not hold is the typed capability gap [`crate::error::no_mailbox`],
+/// never a panic — the same convention as the receive seam.
+///
+/// # Heap lifetime (the process-dictionary M1 decision)
+///
+/// The keys and values stored here are the argument [`Eterm`]s themselves. `beam_bifs`
+/// builds **nothing** on its pooled BIF heap for a store, and Milestone-1's
+/// [`beam_alloc::Heap`] pool and engine arena are pointer-stable and never reset (there is
+/// no GC — see the module docs), so a stored term cannot dangle. The stronger
+/// [`beam_process::Dict`] contract — every key/value *copied into the process's young heap*
+/// — is **not** reachable from `beam_rt`: `Process::copy_into_heap` is `pub(crate)` to
+/// `beam_process` (out of this crate's scope). Registering the term on the runtime's
+/// pointer-stable arena is therefore the Milestone-1 decision; a future pass that wires the
+/// collector up must make [`Dict`](beam_process::Dict) a genuine GC sub-rootset here.
+struct DictBridge<'a> {
+    /// The table the running process lives in.
+    table: &'a mut ProcessTable,
+    /// The running process's pid.
+    pid: ProcessId,
+}
+
+impl DictBridge<'_> {
+    /// The running process, or the typed capability gap when the table does not hold it.
+    fn process_mut(&mut self) -> Result<&mut beam_process::Process> {
+        self.table
+            .get_mut(self.pid)
+            .ok_or_else(|| error::no_mailbox(self.pid))
+    }
+}
+
+impl DictHook for DictBridge<'_> {
+    fn put(&mut self, key: Eterm, value: Eterm) -> Result<Option<Eterm>> {
+        Ok(self.process_mut()?.dict_mut().put(key, value))
+    }
+
+    fn get(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        Ok(self.process_mut()?.dict().get(key))
+    }
+
+    fn erase(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        Ok(self.process_mut()?.dict_mut().erase(key))
+    }
+
+    fn get_keys(&mut self) -> Result<Vec<Eterm>> {
+        Ok(self.process_mut()?.dict().get_keys())
+    }
+
+    fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
+        Ok(self.process_mut()?.dict().get_keys_for_value(value))
     }
 }
 
@@ -594,7 +717,9 @@ impl ExecutionContext for RuntimeContext<'_> {
             if error::is_known_unimplemented_bif(&self.runtime.registry, function, arity) {
                 return Err(error::known_unimplemented_bif(function, arity));
             }
-            return Err(error::unknown_bif(module, function, arity));
+            // A name the release does not have raises the bare `error:undef` the oracle does
+            // (never a fabricated value and never a capability gap — see `error::undef`).
+            return Err(error::undef());
         }
         // The code server adds the system library directories (stdlib, kernel) the first
         // time a module has to be resolved, so an external call reaches the real stdlib
@@ -878,14 +1003,15 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_erlang_bif_is_a_typed_error_not_a_panic() {
+    fn an_unknown_erlang_bif_raises_undef_not_a_panic() {
         let mut rt = runtime();
         let mut ctx = RuntimeContext::new(&mut rt);
-        // `erlang` is the BIF namespace, never a loadable module.
+        // `erlang` is the BIF namespace, never a loadable module: a name the release does
+        // not have raises the oracle's bare `error:undef`, never a fabricated value.
         let error = ctx
             .call_bif("erlang", "nope", 0, &[])
             .expect_err("not a BIF");
-        assert!(error.to_string().contains("erlang:nope/0"), "{error}");
+        assert_eq!(error.as_atom(), Some("undef"), "{error}");
         assert!(ctx
             .call_bif("erlang", "+", 2, &[make_small(1)])
             .is_err(), "wrong arity");

@@ -147,14 +147,6 @@ pub(crate) fn unknown_function(module: &str, function: &str, arity: u32) -> Beam
     message(format!("{module}:{function}/{arity} is not exported"))
 }
 
-/// A call into the `erlang` namespace that is not a registered BIF.
-///
-/// `erlang` is the BIF namespace and never a loadable module, so an unknown
-/// `erlang:*` call is a diagnostic rather than a spurious module load.
-pub(crate) fn unknown_bif(module: &str, function: &str, arity: u32) -> BeamError {
-    message(format!("{module}:{function}/{arity} is not a BIF"))
-}
-
 /// A `run` argument outside the documented term grammar.
 pub(crate) fn bad_run_argument(argument: &str) -> BeamError {
     message(format!("{argument:?} is not a valid run argument"))
@@ -203,9 +195,10 @@ pub(crate) fn no_mailbox(pid: beam_process::ProcessId) -> BeamError {
 /// The `erlang` BIFs that are **known** (they are part of the OTP `erlang` surface) but
 /// deliberately not implemented by Milestone-1.
 ///
-/// A call to one of these must never be reported as the *plain* diagnostic
-/// [`unknown_bif`] builds (`erlang:X/Y is not a BIF`): that would present a documented
-/// capability gap as a genuine runtime error. It is classified as *unsupported* instead
+/// A call to one of these must never be reported as the *plain* `erlang:X/Y is not a BIF`
+/// diagnostic a **genuinely unknown** `erlang` name gets (such a name now raises the bare
+/// [`undef`] the oracle does): that would present a documented capability gap as a genuine
+/// runtime error. It is classified as *unsupported* instead
 /// (exit code [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED)) — see
 /// [`known_unimplemented_bif`].
 ///
@@ -263,10 +256,7 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("seq_trace", 1),
     ("seq_trace", 2),
     ("get", 0),
-    ("get", 1),
-    ("put", 2),
     ("erase", 0),
-    ("erase", 1),
     ("apply", 1),
     ("function_exported", 2),
     ("function_exported", 3),
@@ -295,9 +285,9 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
 
 /// A **known** `erlang` BIF that Milestone-1 deliberately does not implement.
 ///
-/// Reporting it as [`unknown_bif`] would be indistinguishable from a typo (`erlang:nope/1`)
-/// and, worse, would classify a documented capability gap as a genuine runtime error. The
-/// reason atom therefore starts with `unsupported`, so
+/// Reporting it as the bare [`undef`] a typo (`erlang:nope/1`) gets would be
+/// indistinguishable from that typo and, worse, would classify a documented capability gap
+/// as a genuine runtime error. The reason atom therefore starts with `unsupported`, so
 /// [`unsupported_reason`](crate::error::unsupported_reason) recognises it and
 /// [`cli::run`](crate::cli::run) exits with
 /// [`EXIT_UNSUPPORTED`](crate::cli::EXIT_UNSUPPORTED) — exactly like the `beam_engine`
@@ -443,9 +433,6 @@ mod tests {
         assert!(unknown_function("slice", "add", 3)
             .to_string()
             .contains("slice:add/3"));
-        assert!(unknown_bif("erlang", "nope", 1)
-            .to_string()
-            .contains("erlang:nope/1"));
         assert!(bad_run_argument("1+").to_string().contains("1+"));
         assert!(bad_switch_value("+P", "x").to_string().contains("\"x\""));
         assert!(unexpected_argument("junk").to_string().contains("junk"));
