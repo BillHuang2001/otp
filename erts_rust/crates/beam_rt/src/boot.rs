@@ -306,7 +306,8 @@ mod tests {
         for name in crate::port::PORT_INFO_ATOMS {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
-        for name in ["name", "id", "connected", "os_pid", "links", "monitors", "stream"] {
+        for name in ["name", "id", "connected", "os_pid", "links", "monitors", "input", "output"]
+        {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
     }
