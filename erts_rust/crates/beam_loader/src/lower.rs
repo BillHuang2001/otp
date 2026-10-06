@@ -16,7 +16,7 @@
 //! `unwrap()`s file data.
 use std::sync::Arc;
 
-use beam_common::Result;
+use beam_common::{BeamError, Result};
 use beam_term::Atom;
 
 use crate::chunk::Chunks;
@@ -24,7 +24,7 @@ use crate::decode::RawInstr;
 use crate::error::bad_file;
 use crate::ir::{Export, Function, FunDescriptor, Import, Module};
 use crate::literal::LiteralArea;
-use crate::operand::Label;
+use crate::operand::{Label, Operand};
 
 mod group;
 mod instr;
@@ -77,6 +77,15 @@ pub fn build_module(
         });
     }
 
+    // The C loader turns a wide `i` operand into a bignum **static literal**
+    // (`marshal_integer` → `beamfile_add_literal`, `beam_file.c:2210-2220`) that the
+    // instruction references by literal index. Do the same here: each such operand is
+    // pointed at a literal appended after the file's own `LitT` entries. Nothing is
+    // copied and nothing is appended when the module has no wide operand.
+    let mut synthesized: Vec<Vec<u8>> = Vec::new();
+    let rewritten = rewrite_wide_integers(raw_instrs, chunks.literals.len(), &mut synthesized)?;
+    let raw_instrs: &[RawInstr] = rewritten.as_deref().unwrap_or(raw_instrs);
+
     let functions = group_functions(raw_instrs)?;
 
     // `FunT` carries wire atom indices; the fun-table index (`make_fun3`'s operand)
@@ -99,8 +108,17 @@ pub fn build_module(
 
     // The literals are decoded into terms here, through the module's own atom table
     // (so a literal's atoms share the module's identity), *before* that table is
-    // moved into the `Module`.
-    let literals = Arc::new(LiteralArea::decode(&chunks.literals, &mut atom_table)?);
+    // moved into the `Module`. The synthesized wide-integer literals share the arena
+    // and continue the index space (`rewrite_wide_integers` numbered them from
+    // `chunks.literals.len()`), exactly like the C's growing literal table.
+    let literals = if synthesized.is_empty() {
+        LiteralArea::decode(&chunks.literals, &mut atom_table)?
+    } else {
+        let mut payloads = chunks.literals.clone();
+        payloads.append(&mut synthesized);
+        LiteralArea::decode(&payloads, &mut atom_table)?
+    };
+    let literals = Arc::new(literals);
 
     Ok(Module {
         name,
@@ -136,6 +154,97 @@ fn atom_at(atoms: &[Atom], index: u32) -> Result<Atom> {
         .get(index as usize)
         .copied()
         .ok_or_else(|| bad_file("atom index out of range"))
+}
+
+/// Points every wide-integer operand of `instrs` at a synthesized static literal.
+///
+/// `base` is the number of the module's own `LitT` literals, so the synthesized ones
+/// are numbered `base`, `base + 1`, … in operand order — the same order in which
+/// their ETF payloads are appended to `synthesized`. A literal area decoded from
+/// `chunks.literals` followed by `synthesized` therefore resolves every rewritten
+/// [`Operand::Literal`] index.
+///
+/// Returns `None` — copying nothing — when the module has no wide-integer operand;
+/// a literal index that would not fit `u32` is [`BeamError::SystemLimit`].
+fn rewrite_wide_integers(
+    instrs: &[RawInstr],
+    base: usize,
+    synthesized: &mut Vec<Vec<u8>>,
+) -> Result<Option<Vec<RawInstr>>> {
+    let count: usize = instrs
+        .iter()
+        .map(|instr| instr.operands.iter().map(count_wide_integers).sum::<usize>())
+        .sum();
+    if count == 0 {
+        return Ok(None);
+    }
+    // `Operand::Literal` carries a `u32` index, so the extended literal count must fit.
+    if base.saturating_add(count) > u32::MAX as usize {
+        return Err(BeamError::SystemLimit);
+    }
+
+    let mut next = base as u32;
+    let mut rewritten = Vec::with_capacity(instrs.len());
+    for instr in instrs {
+        let mut instr = instr.clone();
+        for operand in &mut instr.operands {
+            rewrite_wide_integer(operand, &mut next, synthesized);
+        }
+        rewritten.push(instr);
+    }
+    Ok(Some(rewritten))
+}
+
+/// The number of wide-integer operands in `operand`, including an argument list's.
+fn count_wide_integers(operand: &Operand) -> usize {
+    match operand {
+        Operand::BigInteger { .. } => 1,
+        Operand::List(items) => items.iter().map(count_wide_integers).sum(),
+        _ => 0,
+    }
+}
+
+/// Replaces every wide-integer operand (recursively) with a synthesized
+/// [`Operand::Literal`] reference, appending its ETF payload to `synthesized`.
+fn rewrite_wide_integer(operand: &mut Operand, next: &mut u32, synthesized: &mut Vec<Vec<u8>>) {
+    match operand {
+        Operand::BigInteger {
+            negative,
+            magnitude,
+        } => {
+            synthesized.push(big_integer_payload(*negative, magnitude));
+            *operand = Operand::Literal(*next);
+            *next += 1;
+        }
+        Operand::List(items) => {
+            for item in items {
+                rewrite_wide_integer(item, next, synthesized);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The external-term payload of a synthesized bignum literal.
+///
+/// Layout pinned to the wire (`external.c`) and to the system `erl`'s own output:
+/// `VERSION_MAGIC`, the `SMALL_BIG_EXT`/`LARGE_BIG_EXT` tag, the **byte** count (1
+/// byte for `SMALL_BIG_EXT`, 4 big-endian bytes for `LARGE_BIG_EXT`), the sign byte
+/// (`0` positive, `1` negative) and then the magnitude **least significant byte
+/// first**.
+fn big_integer_payload(negative: bool, magnitude: &[u8]) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(magnitude.len() + 8);
+    payload.push(beam_codec::VERSION_MAGIC);
+    if magnitude.len() <= usize::from(u8::MAX) {
+        payload.push(beam_codec::SMALL_BIG_EXT);
+        payload.push(magnitude.len() as u8);
+    } else {
+        payload.push(beam_codec::LARGE_BIG_EXT);
+        payload.extend_from_slice(&(magnitude.len() as u32).to_be_bytes());
+    }
+    payload.push(u8::from(negative));
+    payload.extend(magnitude.iter().rev());
+    payload
 }
 
 #[cfg(test)]
@@ -1410,5 +1519,132 @@ mod tests {
         )
         .unwrap_err();
         assert!(matches!(err, BeamError::BadArg), "got {err:?}");
+    }
+
+    // ---- wide (big-integer) instruction operands -------------------------
+
+    #[test]
+    fn a_wide_integer_operand_becomes_a_synthesized_static_literal() {
+        // A `gc_bif` whose argument is the decoder's `Operand::BigInteger` form of
+        // `2^64 - 1` (8 magnitude bytes). The loader must point it at a static
+        // literal numbered *after* the module's own `LitT` entries (`base = 4`),
+        // exactly like the C's `marshal_integer` → `beamfile_add_literal`.
+        let instrs = vec![raw(
+            Opcode::is_eq_exact,
+            vec![Operand::BigInteger {
+                negative: false,
+                magnitude: vec![0xFF; 8],
+            }],
+        )];
+        let mut synthesized = Vec::new();
+        let rewritten = rewrite_wide_integers(&instrs, 4, &mut synthesized)
+            .unwrap()
+            .expect("a wide operand forces a rewrite");
+        assert_eq!(rewritten[0].operands, vec![Operand::Literal(4)]);
+        assert_eq!(
+            synthesized,
+            vec![vec![
+                beam_codec::VERSION_MAGIC,
+                beam_codec::SMALL_BIG_EXT,
+                8,
+                0,
+                255,
+                255,
+                255,
+                255,
+                255,
+                255,
+                255,
+                255,
+            ]]
+        );
+    }
+
+    #[test]
+    fn a_wide_integer_operand_becomes_a_static_literal_end_to_end() {
+        // A module with one own `LitT` literal (`0`) and one instruction carrying a
+        // wide operand; the synthesized literal continues the numbering (`base = 1`).
+        let stream = vec![
+            label(1),
+            func_info(Atom::MAX, Atom::MAX, 0),
+            label(2),
+            raw(
+                Opcode::allocate_zero,
+                vec![Operand::BigInteger {
+                    negative: false,
+                    magnitude: vec![0xFF; 8],
+                }],
+            ),
+            raw(Opcode::r#return, vec![]),
+        ];
+        let module = build_module(
+            &minimal_chunks(Vec::new(), vec![vec![131, 97, 0]]),
+            &stream,
+            beam_term::AtomTable::new(),
+        )
+        .unwrap();
+        assert_eq!(module.literals().len(), 2);
+        assert_eq!(
+            module.functions[0].code[3],
+            Instr::Generic {
+                op: Opcode::allocate_zero,
+                operands: vec![Operand::Literal(1)],
+                offset: 0,
+            }
+        );
+        // It resolves to the `2^64 - 1` bignum: positive, one machine digit.
+        let (negative, digits) = beam_codec::term::big_parts(module.literal(1).unwrap()).unwrap();
+        assert!(!negative);
+        assert_eq!(digits, [u64::MAX]);
+    }
+
+    #[test]
+    fn rewriting_wide_integers_is_a_no_op_without_one() {
+        let instrs = vec![raw(Opcode::r#move, vec![Operand::X(0), Operand::X(1)])];
+        let mut synthesized = Vec::new();
+        assert!(
+            rewrite_wide_integers(&instrs, 0, &mut synthesized)
+                .unwrap()
+                .is_none(),
+            "no wide operand must copy nothing"
+        );
+        assert!(synthesized.is_empty());
+    }
+
+    #[test]
+    fn a_wide_integer_inside_an_argument_list_is_rewritten() {
+        let instrs = vec![raw(
+            Opcode::gc_bif2,
+            vec![Operand::List(vec![
+                Operand::Integer(1),
+                Operand::BigInteger {
+                    negative: true,
+                    magnitude: vec![0xFF; 9],
+                },
+            ])],
+        )];
+        let mut synthesized = Vec::new();
+        let rewritten = rewrite_wide_integers(&instrs, 0, &mut synthesized)
+            .unwrap()
+            .expect("rewrite");
+        assert_eq!(
+            rewritten[0].operands,
+            vec![Operand::List(vec![Operand::Integer(1), Operand::Literal(0)])]
+        );
+        // `SMALL_BIG_EXT`, a 9-byte magnitude, sign 1 (`negative`), all `FF`.
+        assert_eq!(
+            synthesized,
+            vec![vec![131u8, 110, 9, 1, 255, 255, 255, 255, 255, 255, 255, 255, 255]]
+        );
+    }
+
+    #[test]
+    fn big_integer_payload_uses_the_large_form_for_a_wide_magnitude() {
+        let payload = big_integer_payload(true, &vec![0u8; 300]);
+        assert_eq!(payload[0], beam_codec::VERSION_MAGIC);
+        assert_eq!(payload[1], beam_codec::LARGE_BIG_EXT);
+        assert_eq!(&payload[2..6], &300u32.to_be_bytes());
+        assert_eq!(payload[6], 1, "negative sign byte");
+        assert_eq!(payload.len(), 7 + 300);
     }
 }
