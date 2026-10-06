@@ -526,12 +526,20 @@ impl<'a> Decoder<'a> {
 /// term is decoded: see [`decompress_wrapper`]. (It cannot be handled inside
 /// [`Decoder`] without changing its lifetimes, because the decompressed body is an
 /// owned buffer the borrowed `Decoder<'a>` cannot hold.)
+///
+/// **Bytes after a compressed image's inner term are ignored** (the plain path keeps
+/// its historical strict `finish()`). The C inflates the payload and then hands the
+/// *inflated buffer* to the ordinary term decoder, which — like `binary_to_term/1,2`
+/// itself — never requires that buffer to be fully consumed
+/// (`binary2term_prepare`, `external.c:1744-1816`, followed by `dec_term`; the
+/// `binary_to_term/2` `used` option exists precisely because trailing bytes are
+/// permitted). A `finish()` on the inflated body would make a compressed image
+/// *stricter* than the identical uncompressed image — an observable divergence from
+/// the oracle — so the wrapper stays transparent here.
 pub fn decode_term(bytes: &[u8], heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
     if let Some(body) = decompress_wrapper(bytes)? {
         let mut decoder = Decoder::new_body(&body);
-        let term = decoder.decode(heap, atoms)?;
-        decoder.finish()?;
-        return Ok(term);
+        return decoder.decode(heap, atoms);
     }
     let mut decoder = Decoder::new(bytes)?;
     let term = decoder.decode(heap, atoms)?;

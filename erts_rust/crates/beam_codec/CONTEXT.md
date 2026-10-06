@@ -157,7 +157,11 @@ is `decode`'s.
 - **`COMPRESSED` is a top-level-only wrapper.** `decode_term` detects `bytes.len() >= 6 &&
   bytes[0] == VERSION_MAGIC && bytes[1] == COMPRESSED_EXT`, reads the 4-byte inner size, inflates and
   requires `decompressed.len() == size`, then decodes the inner body with `Decoder::new_body` +
-  `finish()`. It is handled at the entry point rather than inside `Decoder` because the decompressed
+  `decode` — **without** a `finish()`, so bytes after the inner term are ignored exactly as the C
+  does (it hands the *inflated* buffer to the ordinary term decoder, which never requires full
+  consumption — `binary2term_prepare` `external.c:1744-1816`; `binary_to_term/2`'s `used` option
+  exists precisely because trailing bytes are permitted). The **plain** (non-compressed) path keeps
+  its historical strict `finish()`. It is handled at the entry point rather than inside `Decoder` because the decompressed
   body is an owned buffer a borrowed `Decoder<'a>` cannot hold. `Decoder::new`/`new_body` are otherwise
   unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
@@ -553,6 +557,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   the C's `dest_len > 32*1024*1024` guard (`external.c:1768`). A term that legitimately decompresses
   to more returns `BadArg`; the C falls back to computing the real size in that case. The cap exists
   to keep a hostile stream from driving an unbounded allocation.
+- **`decode_term`'s *plain* path is deliberately stricter than the oracle on trailing bytes** (it calls
+  `finish()`), whereas `binary_to_term/1,2` — which goes through `Decoder::decode` in `beam_bifs` — and
+  `decode_term`'s *compressed* path tolerate them. This is a crate-local convenience contract, not
+  observable through the BIF; both behaviours are pinned by `tests/compressed_decode.rs`.
 - **Compressed output is not byte-comparable with the oracle** for the *deflate bytes* (zlib (C) and
   `miniz_oxide` produce different, equally valid streams) — but whether a wrapper or the plain image is
   emitted **is** oracle-exact (the shrink rule above). See §Design Decisions.
@@ -587,8 +595,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
 - `src/encode/record.rs` → the `RECORD_EXT` (`67`) encoder (`Encoder::encode_record` — see §Records)
-- `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
-  `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`,
+- `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image; the inflated
+  body is decoded without a `finish()`, so bytes after the inner term are ignored like the C, while the
+  plain path stays strict), `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl.
+  `Tag::Export`/`Tag::NewFun`,
   the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
@@ -613,7 +623,17 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
   incl. the `COMPRESSED` wrapper/plain-revert round-trips and the oracle fun blobs (`EXPORT_EXT`,
   `NEW_FUN_EXT` incl. the `fun() -> ok end` `erl_eval` golden)
-- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pin
+- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pins in
+  **both** atom flavours (UTF-8 `119` and `AtomEncoding::Latin1` `115`) plus the
+  allocation-after-every-value-decodes check and a live oracle check (the system `erl` accepts both of
+  our images, decodes them to equal records and re-encodes them to our exact bytes — which also proves
+  the local `make_small(0)` cached definition hash is not on the wire)
+- `tests/compressed_decode.rs` → the top-level `COMPRESSED` (`80`) decode contract: the in-tree oracle
+  seed (`term_to_binary(lists:duplicate(500,hello),[compressed])`, declared inner size 3506), the
+  wrapper's transparency for a hand-built image, **bytes after the zlib stream and after the inner term
+  are ignored** (oracle-verified; the plain path stays strict), and the negative cases (wrong declared
+  size, declared size over the 32 MiB cap, truncated/corrupt zlib, non-zlib payload, a bare/nested
+  `80` below the 6-byte minimum, arbitrary tail bytes never panic)
 - `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
   streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
 - `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
