@@ -538,7 +538,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   hook trait (`intern`) `beam_dist` implements for outbound caching
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
 - `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
-  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`; the private
+  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`,
+  `Encoder::with_atom_cache` (attaches an `AtomCacheWriter` ⇒ cached atoms emit `ATOM_CACHE_REF`),
+  `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the private
   fun-classification chain inside `Encoder::encode`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
