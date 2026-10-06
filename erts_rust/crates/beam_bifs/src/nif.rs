@@ -97,6 +97,12 @@ fn path_string(term: Eterm) -> Result<String> {
 /// `Text` is an Erlang string (a proper list of the message's code points) and
 /// `Reason` the atom naming the [`NifLoadError`] variant.
 ///
+/// The `error` tag atom and the `Reason` atom are **interned on demand**
+/// ([`BifContext::intern_atom`]) — the oracle's `load_nif_error` builds them with
+/// `mkatom`/`atom_put` (`erl_nif.c:4479-4482`), so neither need be pre-seeded. An
+/// already-interned name resolves without the hook; a new one needs an
+/// `AtomInterner` (which `beam_rt` installs).
+///
 /// # Errors
 ///
 /// Propagates a heap-allocation failure, and [`beam_common::BeamError::TermNotFound`] when a
@@ -111,8 +117,8 @@ fn load_error(ctx: &mut BifContext<'_>, error: NifLoadError) -> Result<Eterm> {
         NifLoadError::Upgrade(text) => ("upgrade", text),
         NifLoadError::OldCode(text) => ("old_code", text),
     };
-    let tag = ctx.atom("error")?;
-    let reason = ctx.atom(reason)?;
+    let tag = ctx.intern_atom("error")?;
+    let reason = ctx.intern_atom(reason)?;
     let text = text_string(ctx, &text)?;
     let inner = ctx.tuple(&[reason, text])?;
     ctx.tuple(&[tag, inner])

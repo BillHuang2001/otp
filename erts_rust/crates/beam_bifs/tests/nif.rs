@@ -13,18 +13,25 @@
 //!    returns it, it does not raise;
 //! 3. with no hook, or an unknown calling module, the BIF raises `unsupported_bif`
 //!    (never a fabricated `ok`, never a silently dropped load);
-//! 4. a non-string `Path` is `badarg` *before* the seam is consulted.
+//! 4. a non-string `Path` is `badarg` *before* the seam is consulted;
+//! 5. the failure term's `error` tag and reason atoms are **interned on demand**
+//!    (the oracle's `mkatom`/`atom_put`, `erl_nif.c:4479-4482`): a reason atom
+//!    absent from the context table is created through the [`AtomInterner`] seam
+//!    rather than reported as a `TermNotFound`.
 //!
 //! Structural comparisons use `beam_term::compare`-free readers
 //! (`beam_codec::term::tuple_*`/`cons_*`), the same public API the sibling suites
 //! use.
 
+use std::cell::RefCell;
+use std::rc::Rc;
+
 use beam_alloc::Heap;
-use beam_bifs::{default_registry, BifContext, NifLoadError, NifLoader};
+use beam_bifs::{default_registry, AtomInterner, BifContext, NifLoadError, NifLoader};
 use beam_codec::term::{cons_head, cons_tail, tuple_arity, tuple_element};
 use beam_common::{BeamError, ExceptionClass, ExitReason};
 use beam_process::ProcessId;
-use beam_term::{atom_val, is_list, make_small, signed_value, AtomTable, Eterm, NIL};
+use beam_term::{atom_val, is_list, make_small, signed_value, Atom, AtomTable, Eterm, NIL};
 
 fn seeded_atoms() -> AtomTable {
     let mut atoms = AtomTable::new();
@@ -322,6 +329,63 @@ fn byte_list_raw(ctx: &mut BifContext<'_>, ints: &[i64]) -> Eterm {
         .map(|v| ctx.int(*v).expect("a small int"))
         .collect();
     ctx.list(&elems).expect("the list fits")
+}
+
+/// An [`AtomInterner`] over a **clone** of the table the context borrows.
+///
+/// The clone mirrors the context's indices for every already-interned name, so a
+/// name the hook creates gets exactly the index the context's own table would have
+/// assigned — the index coupling [`BifContext::intern_atom`] relies on.
+struct Interner {
+    table: Rc<RefCell<AtomTable>>,
+}
+
+impl AtomInterner for Interner {
+    fn intern(&mut self, name: &str) -> Atom {
+        self.table.borrow_mut().intern(name)
+    }
+}
+
+#[test]
+fn the_failure_atoms_are_interned_on_demand() {
+    let reg = default_registry();
+    let heap = leaked_heap();
+
+    // Only the well-known atoms: `error` and the reason atoms are **deliberately
+    // absent**, so the failure path must create them through the `AtomInterner`
+    // seam — the oracle's `mkatom`/`atom_put` (`erl_nif.c:4479-4482`).
+    let mut atoms = AtomTable::new();
+    atoms.seed(["true", "false", "ok"]);
+    let shared = Rc::new(RefCell::new(atoms.clone()));
+    let mut hook = MockNifLoader::new(vec![Err(NifLoadError::LoadFailed(
+        "cannot open nif.so".to_string(),
+    ))]);
+
+    let term = {
+        let mut interner = Interner {
+            table: Rc::clone(&shared),
+        };
+        let mut ctx = BifContext::new(&mut *heap, &atoms, ProcessId::new(1, 0))
+            .with_nif_loader(&mut hook)
+            .with_atom_interner(&mut interner)
+            .with_current_module("m");
+        let path = byte_list(&mut ctx, b"nif.so");
+        reg.call("erlang", "load_nif", 2, &mut ctx, &[path, NIL])
+            .expect("a load failure is returned, not raised")
+    };
+
+    // The `error` tag and the reason atom were created on demand rather than
+    // surfacing as a `TermNotFound`.
+    let table = shared.borrow();
+    assert!(
+        table.lookup("error").is_some(),
+        "the `error` tag atom was interned on demand"
+    );
+    assert!(
+        table.lookup("load_failed").is_some(),
+        "the reason atom was interned on demand"
+    );
+    assert_error_term(&table, term, "load_failed", "cannot open nif.so");
 }
 
 #[test]
