@@ -284,14 +284,18 @@ a **directory module**, split by responsibility:
 * `src/native/process.rs` — the `erlang` process/registry/reference entries: `make_ref/0`, the monitor
   pair `monitor/2` + `demonitor/1,2` (real, over `beam_process`'s monitor machinery and
   [`Runtime::refs_mut`](crate::Runtime::refs_mut)), `ports/0` (the live ports, via
-  `PortRegistry::ids`), `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`,
-  `unregister/1`, `module_loaded/1`.
+  `PortRegistry::ids`), `processes/0`, `pre_loaded/0` (the oracle's **exact** list *and* order, see
+  `src/boot.rs`), `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`.
+  `whereis(init)` answers the runtime's own root process — `Runtime::new` registers the name `init` on
+  that pid, the same pid `group_leader/0` reports (the oracle answers `<0.0.0>`).
 * `src/native/application.rs` — `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`,
   `loaded_applications/0`, `which_applications/0`, answered from a minimal native app view (the `.app`
   files resolved through the [`CodeServer`](crate::CodeServer) and a recursive-descent parser for the
   `.app` term text). **Honest deviation:** `application:get_all_env(kernel)` reports the `.app` file's
-  **declared** env only (the oracle's kernel-injected extras are not fabricated), and `erts` is
-  deliberately not reported loaded.
+  **declared** env only — the seven pairs `kernel.app` lists (oracle: nine; the two extra are `logger`
+  and `connect_all`, injected by kernel's own application start at run time, and are *not* fabricated
+  here). The declared pairs agree key-for-key; only their order differs (the oracle's is its
+  application controller's internal storage order). `erts` is deliberately not reported loaded.
 * `src/native/test_support.rs` — the shared test fixtures for the floor's unit tests.
 
 `beam_bifs` owns the *registry* surface (`bif.tab`: arithmetic, comparison, type tests, term ops,
