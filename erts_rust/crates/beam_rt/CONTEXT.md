@@ -282,13 +282,20 @@ a **directory module**, split by responsibility:
   (an `error:undef` raise — the release does not have the `/2`), `code:ensure_loaded/1`
   (→ `{module, Mod}` / `{error, nofile}`), `code:lib_dir/0,1`, `code:root_dir/0` (the parent of
   `lib_dir/0`, i.e. the installation root).
-* `src/native/process.rs` — the `erlang` process/registry/reference entries: `make_ref/0`, the monitor
+* `src/native/process.rs` — the `erlang` process/registry/reference entries: `self/0` (the **running**
+  pid — `RuntimeContext::pid()`, so a spawned process reports its own), `make_ref/0`, the monitor
   pair `monitor/2` + `demonitor/1,2` (real, over `beam_process`'s monitor machinery and
-  [`Runtime::refs_mut`](crate::Runtime::refs_mut)), `ports/0` (the live ports, via
+  [`Runtime::refs_mut`](crate::Runtime::refs_mut)), the **spawn family** `spawn/1,2,3`,
+  `spawn_link/1,2,3`, `spawn_opt/2,3,4` (a fun entry — an `-eval` closure or a `.beam` fun — or an
+  `M:F/A` export; see Design Decisions), `ports/0` (the live ports, via
   `PortRegistry::ids`), `processes/0`, `pre_loaded/0` (the oracle's **exact** list *and* order, see
   `src/boot.rs`), `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`.
   `whereis(init)` answers the runtime's own root process — `Runtime::new` registers the name `init` on
   that pid, the same pid `group_leader/0` reports (the oracle answers `<0.0.0>`).
+* `src/native/port.rs` — `erlang:port_command/2,3` (writes to the spawn child's `stdin`; a binary /
+  char list / nested iolist) and the `port_info/1,2` item mapping (an unknown/closed port is the atom
+  `undefined`, matching the oracle). The `{fd, N}` form is a typed capability gap. See the ports
+  Known-Issues entry for the exact deviations.
 * `src/native/application.rs` — `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`,
   `loaded_applications/0`, `which_applications/0`, answered from a minimal native app view (the `.app`
   files resolved through the [`CodeServer`](crate::CodeServer) and a recursive-descent parser for the
