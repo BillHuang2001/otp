@@ -16,6 +16,7 @@ pub mod emqx;
 pub mod erlc_compiler;
 pub mod khepri;
 pub mod plb;
+pub mod slice;
 pub mod tool;
 /// The workload ids that accept a `--repo <id>=<path>` override.
 pub const REPO_WORKLOADS: [&str; 5] = ["elixir_compiler", "plb", "cowboy", "khepri", "emqx"];
@@ -98,6 +99,7 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(cowboy::Cowboy),
         Box::new(khepri::Khepri),
         Box::new(emqx::Emqx),
+        Box::new(slice::Slice),
     ]
 }
 
@@ -171,7 +173,8 @@ mod tests {
                 "plb",
                 "cowboy",
                 "khepri",
-                "emqx"
+                "emqx",
+                "slice"
             ]
         );
     }
