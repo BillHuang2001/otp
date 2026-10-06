@@ -17,19 +17,58 @@ use std::process::Command;
 use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The `enif_*` symbols the structural check references (a representative slice of the
-/// NIF ABI: allocation, term construction/access, resource types, messaging, I/O,
-/// threads and synchronisation).
+/// NIF ABI: allocation, term construction/access, binaries, lists/maps, resources,
+/// comparison, string/term marshalling, messaging, monitors, I/O, threads and
+/// synchronisation). Every name is declared in `erl_nif_api_funcs.h`/`erl_nif.h`.
 const NIF_SYMBOLS: &[&str] = &[
+    // Allocation.
     "enif_alloc",
     "enif_free",
+    // Atoms, integers and type tests.
     "enif_make_atom",
     "enif_make_int",
     "enif_get_int",
+    "enif_make_int64",
+    "enif_get_int64",
+    "enif_make_uint64",
+    "enif_get_uint64",
+    "enif_make_double",
+    "enif_get_double",
     "enif_is_atom",
+    "enif_is_list",
+    "enif_is_map",
+    // Tuples.
     "enif_make_tuple",
     "enif_get_tuple",
-    "enif_priv_data",
+    // Binaries.
+    "enif_alloc_binary",
+    "enif_make_new_binary",
+    "enif_release_binary",
+    "enif_inspect_binary",
+    "enif_make_sub_binary",
+    "enif_make_resource_binary",
+    // Lists and maps.
+    "enif_make_list",
+    "enif_make_list_cell",
+    "enif_get_list_cell",
+    "enif_make_list_from_array",
+    "enif_make_map_put",
+    "enif_get_map_value",
+    "enif_make_map_from_arrays",
+    "enif_get_map_size",
+    // Comparison, references and resources.
+    "enif_is_identical",
+    "enif_compare",
+    "enif_make_ref",
+    "enif_make_resource",
     "enif_open_resource_type",
+    "enif_priv_data",
+    // Strings and the term<->binary codec.
+    "enif_make_string",
+    "enif_get_string",
+    "enif_term_to_binary",
+    "enif_binary_to_term",
+    // Messaging, monitors, I/O, threads and synchronisation.
     "enif_send",
     "enif_monitor_process",
     "enif_select",
@@ -42,34 +81,121 @@ const NIF_SYMBOLS: &[&str] = &[
 ];
 
 /// The `driver_*` / `erl_drv_*` symbols the structural check references (the driver ABI:
-/// allocation, output, select, atom/term marshalling, async jobs, threads/synchronisation).
+/// allocation, output, the port output queue, select/async, term marshalling, monitors,
+/// threads/synchronisation). Every name is declared in `erl_driver.h`.
 const DRIVER_SYMBOLS: &[&str] = &[
+    // Allocation.
     "driver_alloc",
     "driver_free",
+    "driver_alloc_binary",
+    "driver_binary_get_refc",
+    "driver_binary_inc_refc",
+    "driver_binary_dec_refc",
+    // Output and the port output queue.
     "driver_output",
+    "driver_output2",
+    "driver_output_binary",
+    "driver_outputv",
+    "driver_enq",
+    "driver_deq",
+    "driver_sizeq",
+    "driver_enq_bin",
+    "driver_peekq",
+    "driver_peekqv",
+    "driver_enqv",
+    // Select, async and termination.
     "driver_select",
-    "driver_mk_atom",
-    "driver_exit",
     "driver_async",
+    "driver_exit",
+    // Term marshalling and ports.
+    "driver_mk_atom",
+    "driver_mk_port",
+    "driver_output_term",
+    "erl_drv_output_term",
+    "erl_drv_send_term",
+    "driver_compare_monitors",
+    "erl_drv_busy_msgq_limits",
+    // Threads and synchronisation.
     "erl_drv_thread_create",
     "erl_drv_mutex_create",
+    "erl_drv_mutex_lock",
+    "erl_drv_mutex_unlock",
+    "erl_drv_mutex_destroy",
     "erl_drv_rwlock_create",
     "erl_drv_cond_create",
     "erl_drv_tsd_key_create",
-    "erl_drv_send_term",
-    "erl_drv_output_term",
 ];
 
 /// The frozen types the two ABIs expose (`ErlNifEnv` is opaque by design, so it is only
-/// referenced through a pointer).
+/// referenced through a pointer). A `sizeof` is asserted for every one.
 const ABI_TYPES: &[&str] = &[
     "ErlNifPid",
+    "ErlNifPort",
     "ErlNifBinary",
     "ErlNifFunc",
+    "ErlNifEntry",
     "ErlNifEnv",
+    "ErlNifResourceTypeInit",
+    "ErlNifMapIterator",
+    "ErlNifIOVec",
     "ErlDrvBinary",
     "ErlDrvEntry",
+    "ErlIOVec",
+    "ErlDrvMonitor",
+    "ErlDrvSysInfo",
+    "ErlDrvThreadOpts",
     "SysIOVec",
+];
+
+/// The frozen size/align/offset numbers of the two ABIs (`crates/beam_abi/src/layout.rs`
+/// is the Rust freeze) mirrored as C `_Static_assert`s. Every number below is one the
+/// in-tree headers can express (`sizeof`, `_Alignof`, `offsetof`), so a header change that
+/// breaks the C ABI becomes a **compile failure** in this check, not a silent drift.
+const ABI_STATIC_ASSERTS: &[&str] = &[
+    // The term seam: the NIF term is one machine word (contract A.3).
+    "_Static_assert(sizeof(ERL_NIF_TERM) == 8, \"ERL_NIF_TERM is one machine word\");",
+    "_Static_assert(_Alignof(ERL_NIF_TERM) == 8, \"ERL_NIF_TERM alignment\");",
+    // ErlNifFunc / ErlNifEntry.
+    "_Static_assert(sizeof(ErlNifFunc) == 32, \"ErlNifFunc size\");",
+    "_Static_assert(offsetof(ErlNifFunc, name) == 0, \"ErlNifFunc.name\");",
+    "_Static_assert(offsetof(ErlNifFunc, arity) == 8, \"ErlNifFunc.arity\");",
+    "_Static_assert(offsetof(ErlNifFunc, fptr) == 16, \"ErlNifFunc.fptr\");",
+    "_Static_assert(offsetof(ErlNifFunc, flags) == 24, \"ErlNifFunc.flags\");",
+    "_Static_assert(sizeof(ErlNifEntry) == 96, \"ErlNifEntry size\");",
+    "_Static_assert(offsetof(ErlNifEntry, funcs) == 24, \"ErlNifEntry.funcs\");",
+    "_Static_assert(offsetof(ErlNifEntry, sizeof_ErlNifResourceTypeInit) == 80, \"ErlNifEntry.sizeof_ErlNifResourceTypeInit\");",
+    "_Static_assert(offsetof(ErlNifEntry, min_erts) == 88, \"ErlNifEntry.min_erts\");",
+    // ErlNifBinary.
+    "_Static_assert(sizeof(ErlNifBinary) == 40, \"ErlNifBinary size\");",
+    "_Static_assert(offsetof(ErlNifBinary, data) == 8, \"ErlNifBinary.data\");",
+    "_Static_assert(offsetof(ErlNifBinary, ref_bin) == 16, \"ErlNifBinary.ref_bin\");",
+    "_Static_assert(offsetof(ErlNifBinary, __spare__) == 24, \"ErlNifBinary.__spare__\");",
+    // Pid/port handles.
+    "_Static_assert(sizeof(ErlNifPid) == 8, \"ErlNifPid size\");",
+    "_Static_assert(sizeof(ErlNifPort) == 8, \"ErlNifPort size\");",
+    // ErlNifResourceTypeInit.
+    "_Static_assert(sizeof(ErlNifResourceTypeInit) == 40, \"ErlNifResourceTypeInit size\");",
+    "_Static_assert(offsetof(ErlNifResourceTypeInit, dyncall) == 32, \"ErlNifResourceTypeInit.dyncall\");",
+    // ErlNifMapIterator / ErlNifIOVec.
+    "_Static_assert(sizeof(ErlNifMapIterator) == 56, \"ErlNifMapIterator size\");",
+    "_Static_assert(sizeof(ErlNifIOVec) == 424, \"ErlNifIOVec size\");",
+    // Shared structs (`erl_drv_nif.h`).
+    "_Static_assert(sizeof(ErlDrvSysInfo) == 56, \"ErlDrvSysInfo size\");",
+    "_Static_assert(offsetof(ErlDrvSysInfo, nif_major_version) == 40, \"ErlDrvSysInfo.nif_major_version\");",
+    "_Static_assert(offsetof(ErlDrvSysInfo, dirty_scheduler_support) == 48, \"ErlDrvSysInfo.dirty_scheduler_support\");",
+    "_Static_assert(sizeof(ErlDrvThreadOpts) == 4, \"ErlDrvThreadOpts size\");",
+    "_Static_assert(sizeof(ErlDrvMonitor) == 32, \"ErlDrvMonitor size\");",
+    "_Static_assert(_Alignof(ErlDrvMonitor) == 1, \"ErlDrvMonitor alignment\");",
+    "_Static_assert(sizeof(SysIOVec) == 16, \"SysIOVec size\");",
+    "_Static_assert(offsetof(SysIOVec, iov_len) == 8, \"SysIOVec.iov_len\");",
+    // Driver structs (`erl_driver.h`).
+    "_Static_assert(sizeof(ErlDrvBinary) == 16, \"ErlDrvBinary size\");",
+    "_Static_assert(offsetof(ErlDrvBinary, orig_bytes) == 8, \"ErlDrvBinary.orig_bytes\");",
+    "_Static_assert(sizeof(ErlIOVec) == 32, \"ErlIOVec size\");",
+    "_Static_assert(sizeof(ErlDrvEntry) == 176, \"ErlDrvEntry size\");",
+    "_Static_assert(offsetof(ErlDrvEntry, driver_name) == 48, \"ErlDrvEntry.driver_name\");",
+    "_Static_assert(offsetof(ErlDrvEntry, extended_marker) == 128, \"ErlDrvEntry.extended_marker\");",
+    "_Static_assert(offsetof(ErlDrvEntry, emergency_close) == 168, \"ErlDrvEntry.emergency_close\");",
 ];
 
 /// A scratch directory removed when the guard drops.
@@ -173,29 +299,47 @@ fn int_sizes_for(cc: &Path) -> Option<String> {
         ("LONG_LONG", "LONG_LONG"),
         ("VOID_P", "VOID_P"),
     ] {
-        let value = match key {
-            "CHAR" => sizes.get("CHAR").copied().unwrap_or(1),
-            _ => match sizes.get(key) {
-                Some(value) => *value,
-                None => {
-                    eprintln!("SKIP: the compiler does not define __SIZEOF_{key}__");
-                    return None;
-                }
-            },
+        let Some(value) = macro_size(&sizes, key) else {
+            eprintln!("SKIP: the compiler does not define __SIZEOF_{key}__");
+            return None;
         };
         header.push_str(&format!("#define SIZEOF_{defined} {value}\n"));
     }
     Some(header)
 }
 
+/// The byte size `configure` needs for the `SIZEOF_<key>` macro.
+///
+/// `configure` names these macros `SIZEOF_CHAR`/`SIZEOF_SHORT`/…/`SIZEOF_VOID_P`; the compiler's
+/// predefined `__SIZEOF_*__` macros use the same names **except** for the pointer, which GCC and
+/// Clang spell `__SIZEOF_POINTER__` (there is no `__SIZEOF_VOID_P__`). A `char` is one byte by
+/// definition. Without the pointer alias, discovery would always fail and the structural check
+/// could only ever skip.
+fn macro_size(sizes: &std::collections::BTreeMap<String, u32>, key: &str) -> Option<u32> {
+    match key {
+        "CHAR" => Some(sizes.get("CHAR").copied().unwrap_or(1)),
+        "VOID_P" => sizes
+            .get("VOID_P")
+            .or_else(|| sizes.get("POINTER"))
+            .copied(),
+        _ => sizes.get(key).copied(),
+    }
+}
+
 /// The C translation unit: it only **references** the ABI declarations (address-of, so no
-/// call is emitted) plus a few structural `sizeof` assertions.
+/// call is emitted) plus a set of structural `_Static_assert`s pinning the frozen layout.
 fn probe_source() -> String {
     let mut src = String::from(
         "/* Structural A.3/A.4 check: reference the frozen NIF/driver C ABI. */\n\
          #include <stddef.h>\n\
-         #include \"erl_nif.h\"\n\n",
+         #include \"erl_nif.h\"\n\
+         #include \"erl_driver.h\"\n\n",
     );
+    for assert in ABI_STATIC_ASSERTS {
+        src.push_str(assert);
+        src.push('\n');
+    }
+    src.push('\n');
     for symbol in NIF_SYMBOLS.iter().chain(DRIVER_SYMBOLS) {
         src.push_str(&format!(
             "static __typeof__(&{symbol}) abi_ref_{symbol} = &{symbol};\n"
@@ -242,12 +386,37 @@ fn compile_probe(cc: &Path, dir: &Path, source: &str) -> Result<(), String> {
     }
 }
 
+/// Prepare the structural check: a C compiler, a synthesized `erl_int_sizes_config.h` and a
+/// scratch directory. `None` means the check cannot run here — every failing prerequisite
+/// prints its own **loud** skip reason, so it never silently passes.
+fn check_env(tag: &str) -> Option<(PathBuf, TempDir)> {
+    let Some(cc) = resolve_cc() else {
+        eprintln!(
+            "SKIP: no C compiler ($CC / cc / gcc / clang) on PATH — \
+             cannot run the A.3/A.4 structural check"
+        );
+        return None;
+    };
+    let Some(int_sizes) = int_sizes_for(&cc) else {
+        eprintln!("SKIP: the target's integer sizes are not discoverable");
+        return None;
+    };
+    let dir = match TempDir::new(tag) {
+        Ok(dir) => dir,
+        Err(err) => {
+            eprintln!("SKIP: cannot create a scratch directory: {err}");
+            return None;
+        }
+    };
+    if let Err(err) = std::fs::write(dir.path().join("erl_int_sizes_config.h"), int_sizes) {
+        eprintln!("SKIP: cannot write the synthesized config header: {err}");
+        return None;
+    }
+    Some((cc, dir))
+}
+
 #[test]
 fn the_frozen_nif_and_driver_declarations_still_compile() {
-    let Some(cc) = resolve_cc() else {
-        eprintln!("SKIP: no C compiler ($CC / cc / gcc / clang) on PATH — cannot run the A.3/A.4 structural check");
-        return;
-    };
     let include = beam_include_dir();
     for header in ["erl_nif.h", "erl_driver.h"] {
         if !include.join(header).is_file() {
@@ -258,22 +427,9 @@ fn the_frozen_nif_and_driver_declarations_still_compile() {
             return;
         }
     }
-    let Some(int_sizes) = int_sizes_for(&cc) else {
-        eprintln!("SKIP: the target's integer sizes are not discoverable");
+    let Some((cc, dir)) = check_env("ok") else {
         return;
     };
-    let dir = match TempDir::new("ok") {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("SKIP: cannot create a scratch directory: {err}");
-            return;
-        }
-    };
-    if let Err(err) = std::fs::write(dir.path().join("erl_int_sizes_config.h"), int_sizes) {
-        eprintln!("SKIP: cannot write the synthesized config header: {err}");
-        return;
-    }
-
     match compile_probe(&cc, dir.path(), &probe_source()) {
         Ok(()) => {}
         Err(stderr) => panic!(
@@ -287,30 +443,30 @@ fn the_frozen_nif_and_driver_declarations_still_compile() {
 fn the_structural_check_rejects_a_missing_symbol() {
     // Self-testing: the check must actually fail when the ABI surface is broken, so a
     // renamed/removed symbol is a loud failure rather than a silent pass.
-    let Some(cc) = resolve_cc() else {
-        eprintln!("SKIP: no C compiler on PATH — cannot run the A.3/A.4 self-test");
+    let Some((cc, dir)) = check_env("bogus-symbol") else {
         return;
     };
-    let Some(int_sizes) = int_sizes_for(&cc) else {
-        eprintln!("SKIP: the target's integer sizes are not discoverable");
-        return;
-    };
-    let dir = match TempDir::new("bogus") {
-        Ok(dir) => dir,
-        Err(err) => {
-            eprintln!("SKIP: cannot create a scratch directory: {err}");
-            return;
-        }
-    };
-    if std::fs::write(dir.path().join("erl_int_sizes_config.h"), int_sizes).is_err() {
-        eprintln!("SKIP: cannot write the synthesized config header");
-        return;
-    }
     let bogus = "#include \"erl_nif.h\"\n\
                  static __typeof__(&enif_this_symbol_does_not_exist) bogus = \n\
                  &enif_this_symbol_does_not_exist;\n";
     assert!(
         compile_probe(&cc, dir.path(), bogus).is_err(),
         "the structural ABI check must fail on a symbol that does not exist"
+    );
+}
+
+#[test]
+fn the_structural_check_rejects_a_wrong_frozen_size() {
+    // Self-testing the size/align/offset freeze: a `_Static_assert` that disagrees with the
+    // header layout must fail the compile, so ABI drift is loud rather than silent (and the
+    // freeze cannot be quietly relaxed by deleting an assert).
+    let Some((cc, dir)) = check_env("bogus-size") else {
+        return;
+    };
+    let bogus = "#include \"erl_nif.h\"\n\
+                 _Static_assert(sizeof(ErlNifPid) == 999, \"the frozen ErlNifPid size is wrong\");\n";
+    assert!(
+        compile_probe(&cc, dir.path(), bogus).is_err(),
+        "the structural ABI check must fail on a frozen size that does not hold"
     );
 }
