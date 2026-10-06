@@ -45,8 +45,9 @@ use crate::tuple::{tuple_element, tuple_size};
 // `make_hash2` / `make_hash` support (see the section comment further down).
 use crate::boxed::{
     arityval, header_subtag, internal_ref_numbers, is_arity_value, is_boxed, make_boxed,
-    make_header, map_header_val, tuple_val, ERL_BIN_REF_SIZE,
+    make_header, map_header_val, ERL_BIN_REF_SIZE,
 };
+use crate::tuple::tuple_val;
 use crate::error::{TermError, TermResult};
 use crate::fun::{fun_env, fun_function, fun_index, fun_module, fun_old_uniq};
 use crate::immediate::{is_byte, is_small, pid_number, unsigned_value};
@@ -97,7 +98,7 @@ const TAG_FUN_EXTERNAL: u64 = 0x10;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
-fn mix(h: u64, word: u64) -> u64 {
+fn mix64(h: u64, word: u64) -> u64 {
     (h ^ word).wrapping_mul(FNV_PRIME)
 }
 
@@ -114,25 +115,25 @@ pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64 {
 fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
     // SAFETY: `class` only dereferences the header word of a live boxed term.
     match unsafe { class(t) } {
-        TermClass::Small => mix(mix(h, TAG_SMALL), signed_value(t) as u64),
-        TermClass::Big => unsafe { hash_big(t, mix(h, TAG_BIG)) },
+        TermClass::Small => mix64(mix64(h, TAG_SMALL), signed_value(t) as u64),
+        TermClass::Big => unsafe { hash_big(t, mix64(h, TAG_BIG)) },
         // SAFETY: `t` is a boxed float.
-        TermClass::Float => mix(mix(h, TAG_FLOAT), unsafe { float_bits(t) }),
-        TermClass::Atom => hash_atom(t, atoms, mix(h, TAG_ATOM)),
-        TermClass::Nil => mix(h, TAG_NIL),
+        TermClass::Float => mix64(mix64(h, TAG_FLOAT), unsafe { float_bits(t) }),
+        TermClass::Atom => hash_atom(t, atoms, mix64(h, TAG_ATOM)),
+        TermClass::Nil => mix64(h, TAG_NIL),
         // SAFETY: `t` is a cons cell / tuple.
-        TermClass::List => unsafe { hash_list(t, atoms, mix(h, TAG_LIST)) },
-        TermClass::Tuple => unsafe { hash_tuple(t, atoms, mix(h, TAG_TUPLE)) },
+        TermClass::List => unsafe { hash_list(t, atoms, mix64(h, TAG_LIST)) },
+        TermClass::Tuple => unsafe { hash_tuple(t, atoms, mix64(h, TAG_TUPLE)) },
         // SAFETY: `t` is a bitstring.
-        TermClass::Bitstring => unsafe { hash_bits(t, mix(h, TAG_BITS)) },
-        TermClass::Pid => mix(mix(h, TAG_PID), internal_pid_data(t)),
-        TermClass::Port => mix(mix(h, TAG_PORT), internal_port_data(t)),
+        TermClass::Bitstring => unsafe { hash_bits(t, mix64(h, TAG_BITS)) },
+        TermClass::Pid => mix64(mix64(h, TAG_PID), internal_pid_data(t)),
+        TermClass::Port => mix64(mix64(h, TAG_PORT), internal_port_data(t)),
         // SAFETY: `t` is a live map.
-        TermClass::Map => hash_map(t, atoms, mix(h, TAG_MAP)),
+        TermClass::Map => hash_map(t, atoms, mix64(h, TAG_MAP)),
         // SAFETY: `t` is a live fun.
         TermClass::Fun => unsafe { hash_fun(t, atoms, h) },
         // Refs plus every opaque class.
-        _ => unsafe { hash_words(t, mix(h, TAG_OPAQUE)) },
+        _ => unsafe { hash_words(t, mix64(h, TAG_OPAQUE)) },
     }
 }
 
@@ -158,31 +159,31 @@ unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
     let hdr = unsafe { *p };
     match fun_kind_of_header(hdr) {
         FunKind::Local => {
-            let mut h = mix(h, TAG_FUN_LOCAL);
+            let mut h = mix64(h, TAG_FUN_LOCAL);
             // SAFETY: a local fun's descriptor words 1 and 2 hold `uniq` and `index`.
-            h = mix(h, unsafe { (*p.add(1)).raw() } as u64);
-            h = mix(h, unsafe { (*p.add(2)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(1)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(2)).raw() } as u64);
             // SAFETY: `p` is the header word of the live local fun `hdr`.
             unsafe { hash_fun_env(p, hdr, atoms, h) }
         }
         FunKind::Imported => {
-            let mut h = mix(h, TAG_FUN_IMPORTED);
+            let mut h = mix64(h, TAG_FUN_IMPORTED);
             // SAFETY: an imported fun's descriptor word 1 holds its module atom.
             h = hash_term(unsafe { *p.add(1) }, atoms, h);
             // SAFETY: an imported fun's descriptor words 4 and 6 hold `index` and
             // `old_uniq`.
-            h = mix(h, unsafe { (*p.add(4)).raw() } as u64);
-            h = mix(h, unsafe { (*p.add(6)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(4)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(6)).raw() } as u64);
             // SAFETY: `p` is the header word of the live imported fun `hdr`.
             unsafe { hash_fun_env(p, hdr, atoms, h) }
         }
         FunKind::External => {
-            let mut h = mix(h, TAG_FUN_EXTERNAL);
+            let mut h = mix64(h, TAG_FUN_EXTERNAL);
             // SAFETY: an external fun's descriptor words 1 and 2 hold its module and
             // function atoms.
             h = hash_term(unsafe { *p.add(1) }, atoms, h);
             h = hash_term(unsafe { *p.add(2) }, atoms, h);
-            mix(h, fun_arity(hdr) as u64)
+            mix64(h, fun_arity(hdr) as u64)
         }
     }
 }
@@ -196,7 +197,7 @@ unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
 /// block (header + descriptor + `num_free` environment words) must be live.
 unsafe fn hash_fun_env(p: *mut Eterm, hdr: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     let num_free = fun_num_free(hdr);
-    h = mix(h, num_free as u64);
+    h = mix64(h, num_free as u64);
     let offset = 1 + fun_desc_words(fun_kind_of_header(hdr));
     for i in 0..num_free {
         // SAFETY: environment word `i` is within the fun's payload.
@@ -217,7 +218,7 @@ fn hash_map(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
         Ok(pairs) => pairs,
         Err(_) => return unsafe { hash_words(t, h) },
     };
-    h = mix(h, pairs.len() as u64);
+    h = mix64(h, pairs.len() as u64);
     for (key, value) in pairs {
         h = hash_term(key, atoms, h);
         h = hash_term(value, atoms, h);
@@ -232,11 +233,11 @@ fn hash_atom(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     match atoms.name(index) {
         Some(name) => {
             for &byte in name.as_bytes() {
-                h = mix(h, byte as u64);
+                h = mix64(h, byte as u64);
             }
-            mix(h, name.len() as u64)
+            mix64(h, name.len() as u64)
         }
-        None => mix(h, index.raw() as u64),
+        None => mix64(h, index.raw() as u64),
     }
 }
 
@@ -249,12 +250,12 @@ unsafe fn hash_big(t: Eterm, mut h: u64) -> u64 {
     // SAFETY: `t` is a boxed bignum.
     let p = boxed_val(t);
     let hdr = unsafe { *p };
-    h = mix(h, u64::from(hdr.raw() & BIG_SIGN_BIT != 0));
+    h = mix64(h, u64::from(hdr.raw() & BIG_SIGN_BIT != 0));
     let arity = header_arity(hdr);
-    h = mix(h, arity as u64);
+    h = mix64(h, arity as u64);
     for i in 0..arity {
         // SAFETY: limb `i` is within the bignum payload.
-        h = mix(h, unsafe { (*p.add(1 + i)).raw() } as u64);
+        h = mix64(h, unsafe { (*p.add(1 + i)).raw() } as u64);
     }
     h
 }
@@ -267,7 +268,7 @@ unsafe fn hash_big(t: Eterm, mut h: u64) -> u64 {
 unsafe fn hash_tuple(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     // SAFETY: `t` is a tuple.
     let arity = unsafe { tuple_size(t) };
-    h = mix(h, arity as u64);
+    h = mix64(h, arity as u64);
     for i in 0..arity {
         // SAFETY: `i < arity`.
         let elem = unsafe { tuple_element(t, i) };
@@ -293,12 +294,12 @@ unsafe fn hash_list(mut t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
         if is_list(tail) {
             t = tail;
         } else {
-            h = mix(h, TAG_LIST_TAIL);
+            h = mix64(h, TAG_LIST_TAIL);
             h = hash_term(tail, atoms, h);
             break;
         }
     }
-    mix(h, cells)
+    mix64(h, cells)
 }
 
 /// Hash a bitstring by bit size and (byte-normalised) contents.
@@ -309,7 +310,7 @@ unsafe fn hash_list(mut t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
 unsafe fn hash_bits(t: Eterm, mut h: u64) -> u64 {
     // SAFETY: `t` is a bitstring.
     let (base, offset, size) = unsafe { bitstring_parts(t) };
-    h = mix(h, size as u64);
+    h = mix64(h, size as u64);
     let bytes = size.div_ceil(8);
     for j in 0..bytes {
         let mut byte = 0u8;
@@ -322,7 +323,7 @@ unsafe fn hash_bits(t: Eterm, mut h: u64) -> u64 {
                 } << (7 - k);
             }
         }
-        h = mix(h, byte as u64);
+        h = mix64(h, byte as u64);
     }
     h
 }
@@ -340,7 +341,7 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
     let arity = thing_arityval(hdr);
     for i in 0..=arity {
         // SAFETY: word `i` is within the object.
-        h = mix(h, unsafe { (*p.add(i)).raw() } as u64);
+        h = mix64(h, unsafe { (*p.add(i)).raw() } as u64);
     }
     h
 }
@@ -692,7 +693,7 @@ const HASH_MAP_PAIR: Eterm = make_header(2, REF_SUBTAG);
 
 /// `MIX(a, b, c)` (Bob Jenkins, `erl_term_hashing.c:428-439`), returning `c`.
 #[inline]
-fn mix(a: u32, b: u32, c: u32) -> u32 {
+fn mix32(a: u32, b: u32, c: u32) -> u32 {
     mix3(a, b, c).2
 }
 
@@ -726,7 +727,7 @@ fn mix3(mut a: u32, mut b: u32, mut c: u32) -> (u32, u32, u32) {
 /// `UINT32_HASH_2(e1, e2, AConst)` (`erl_term_hashing.c:894-900`).
 #[inline]
 fn uint32_hash_2(hash: u32, e1: u32, e2: u32, k: u32) -> u32 {
-    mix(k.wrapping_add(e1), k.wrapping_add(e2), hash)
+    mix32(k.wrapping_add(e1), k.wrapping_add(e2), hash)
 }
 
 /// `UINT32_HASH(e, AConst)`.
@@ -1003,8 +1004,8 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                             if size == 0 {
                                 to_common = true;
                             } else {
-                                stack.push(hash_xor_pairs);
-                                stack.push(hash);
+                                stack.push(Eterm::from_raw(hash_xor_pairs as usize));
+                                stack.push(Eterm::from_raw(hash as usize));
                                 stack.push(HASH_MAP_TAIL);
                                 hash = 0;
                                 hash_xor_pairs = 0;
@@ -1031,8 +1032,8 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
                                 if size == 0 {
                                     empty = true;
                                 } else {
-                                    stack.push(hash_xor_pairs);
-                                    stack.push(hash);
+                                    stack.push(Eterm::from_raw(hash_xor_pairs as usize));
+                                    stack.push(Eterm::from_raw(hash as usize));
                                     stack.push(HASH_MAP_TAIL);
                                     hash = 0;
                                     hash_xor_pairs = 0;
@@ -1295,9 +1296,9 @@ fn make_hash2_from(term_arg: Eterm, hash_arg: u32, atoms: &AtomTable) -> TermRes
             match stack.pop() {
                 None => return Ok(hash),
                 Some(v) if v == HASH_MAP_TAIL => {
-                    hash = pop_term(&mut stack)?;
+                    hash = pop_term(&mut stack)?.raw() as u32;
                     hash = uint32_hash(hash, hash_xor_pairs, HCONST_19);
-                    hash_xor_pairs = pop_term(&mut stack)?;
+                    hash_xor_pairs = pop_term(&mut stack)?.raw() as u32;
                 }
                 Some(v) if v == HASH_MAP_PAIR => {
                     hash_xor_pairs ^= hash;
@@ -1558,7 +1559,7 @@ pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32> {
             HOp::Ref | HOp::ExternalRef => {
                 let first = if op == HOp::Ref {
                     // SAFETY: the tag says internal reference.
-                    unsafe { internal_ref_numbers(term) }[0]
+                    unsafe { internal_ref_numbers(term)[0] }
                 } else {
                     // SAFETY: the tag says external reference.
                     match unsafe { external_ref_parts(term) }.1.first() {
@@ -1930,7 +1931,7 @@ mod exact_hash_tests {
     #[test]
     fn block_hash_matches_the_jk_reference_shape() {
         // `block_hash` with an empty block mixes `HCONST, HCONST, initval`.
-        assert_eq!(block_hash(&[], 0), mix(HCONST, HCONST, 0));
+        assert_eq!(block_hash(&[], 0), mix32(HCONST, HCONST, 0));
         // A 12-byte block runs exactly one loop iteration (no final adds).
         let b: [u8; 12] = [1, 0, 0, 0, 2, 0, 0, 0, 3, 0, 0, 0];
         let expect = mix3(
