@@ -623,9 +623,16 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
 - **`binary:copy/2` cannot outgrow the destination heap** (a too-large result is `SystemLimit`); the
   same convention `convert::make_tuple` uses.
 - **The `~p` printer never line-breaks** (the oracle's `io_lib_pretty` re-flow is unimplemented);
-  `io:format` rejects a `~p`/`~P` whose single-line form would need re-flow. Binary/atom/sub-binary
-  edge cases: non-byte-aligned bitstrings are `BadArg` (no bit-level reader); quoted atoms are not
-  re-escaped; non-ASCII output is UTF-8, not raw latin1 (the ASCII subset is byte-exact).
+  `io:format` rejects a `~p`/`~P` whose single-line form would need re-flow.
+- **A non-byte-aligned bitstring is `BadArg`** at `src/print.rs:281-285` (the `is_bitstring` branch of
+  `render_chunk`, right after the `is_binary` branch; `render_binary_chunk` at `:578` handles only the
+  byte-aligned form). The reader surface is `bits::bit_size`/`bits::bytes` (`src/bits.rs`) over
+  `access::bitstring_bit_size`/`access::binary_bytes` (`src/access.rs:429`/`:448`); a bit-level reader
+  would wrap `beam_term::bitstring::{bit_at,bitstring_parts}` in `src/access.rs` (the only `unsafe`
+  module). Oracle rendering (full leading bytes, then the trailing `K` bits as `V:K`): `<<1:1>>`⇒
+  `<<1:1>>`, `<<5:3,3:2>>`⇒`<<23:5>>`, `<<1:9>>`⇒`<<0,1:1>>`, `<<255:12>>`⇒`<<15,15:4>>`,
+  `<<1:1,0:7>>`⇒`<<128>>` (byte-aligned ⇒ the normal binary form).
+- **Quoted atoms are not re-escaped**; non-ASCII output is UTF-8, not raw latin1 (ASCII byte-exact).
 - **`float_to_binary/3` does not exist** in erts-17.1, so it is not registered (deliberate — see
   Design Decisions).
 - **`list_to_integer/1,2` requires byte-sized list elements** (`0..=255`); erts truncates each element
