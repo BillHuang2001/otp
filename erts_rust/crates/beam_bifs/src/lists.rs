@@ -127,7 +127,7 @@ use crate::access::{
     car, cdr, is_atom, is_list, is_nil, is_small, is_tuple, tuple_element, tuple_size,
 };
 use crate::context::BifContext;
-use crate::error::{badarg, system_limit};
+use crate::error::{function_clause, badarg, system_limit};
 use crate::print::proper_list;
 use crate::registry::BifRegistry;
 
@@ -152,6 +152,13 @@ fn small_int(t: Eterm) -> Result<i64> {
     } else {
         Err(badarg())
     }
+}
+
+/// Like [`small_int`], but a non-integer argument is the oracle's
+/// `function_clause` (`nth`/`nthtail`/`sublist`/`seq`/`duplicate`/`keysort`
+/// have no clause for a non-integer index or length).
+fn small_int_clause(t: Eterm) -> Result<i64> {
+    small_int(t).map_err(|_| function_clause())
 }
 
 /// Builds the proper list `elems ++ tail` on the context heap.
@@ -309,7 +316,7 @@ fn take_while_prefix(
             return Ok((taken, NIL));
         }
         if !is_list(cur) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         let elem = car(cur);
         if !call_predicate(ctx, fun, &[elem])? {
@@ -432,6 +439,66 @@ fn keyfind(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
 }
 
+/// `keymember(Key, N, TupleList)` — `true` iff some tuple's `N`th element `==` `Key`.
+///
+/// The comparison and skip rules are exactly [`keyfind`]'s: arithmetic order, a
+/// non-tuple element is skipped and a tuple shorter than `N` never matches. `N`
+/// must be a small integer `>= 1` and the list proper, else `badarg` — but a match
+/// short-circuits **before** any improper tail is reached
+/// (`keymember(a, 1, [{a}|2])` ⇒ `true`).
+fn keymember(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let key = args[0];
+    let pos = small_int(args[1])?;
+    if pos < 1 {
+        return Err(badarg());
+    }
+    let pos = pos as usize;
+    let mut list = args[2];
+    while is_list(list) {
+        let elem = car(list);
+        list = cdr(list);
+        if is_tuple(elem) && pos <= tuple_size(elem) {
+            if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
+                return ctx.boolean(true);
+            }
+        }
+    }
+    if is_nil(list) {
+        ctx.boolean(false)
+    } else {
+        Err(badarg())
+    }
+}
+
+/// `keysearch(Key, N, TupleList)` — `{value, Tuple}` for the first tuple whose
+/// `N`th element `==` `Key`, else the atom `false`.
+///
+/// Same comparison, skip and short-circuit rules as [`keymember`]/[`keyfind`].
+fn keysearch(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let key = args[0];
+    let pos = small_int(args[1])?;
+    if pos < 1 {
+        return Err(badarg());
+    }
+    let pos = pos as usize;
+    let mut list = args[2];
+    while is_list(list) {
+        let elem = car(list);
+        list = cdr(list);
+        if is_tuple(elem) && pos <= tuple_size(elem) {
+            if cmp_arith(key, tuple_element(elem, pos - 1), ctx.atoms()) == Ordering::Equal {
+                let tag = ctx.atom("value")?;
+                return ctx.tuple(&[tag, elem]);
+            }
+        }
+    }
+    if is_nil(list) {
+        ctx.boolean(false)
+    } else {
+        Err(badarg())
+    }
+}
+
 // ---------------------------------------------------------------------------
 // lists:append/1,2
 // ---------------------------------------------------------------------------
@@ -441,7 +508,7 @@ fn keyfind(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `append([])` is `[]`, `append([E])` is `E` (whatever it is), and otherwise
 /// `H ++ append(T)` — so every element but the last must be a proper list.
 fn append1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let elems = proper_list(args[0]).ok_or_else(badarg)?;
+    let elems = proper_list(args[0]).ok_or_else(function_clause)?;
     let Some((last, front)) = elems.split_last() else {
         return Ok(NIL);
     };
@@ -514,20 +581,20 @@ fn minusminus_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `nth(N, List)` — the `N`th element (1-based) of `List`.
 fn nth(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let mut remaining = small_int(args[0])?;
+    let mut remaining = small_int_clause(args[0])?;
     if remaining < 1 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut cur = args[1];
     while remaining > 1 {
         if !is_list(cur) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         cur = cdr(cur);
         remaining -= 1;
     }
     if !is_list(cur) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     Ok(car(cur))
 }
@@ -537,22 +604,22 @@ fn nth(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `nthtail(0, L)` is `L` itself (so a non-list `L` is `badarg`), and the tail of
 /// the `N`th cell is returned verbatim — thus `nthtail(1, [1|2])` ⇒ `2`.
 fn nthtail(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let count = small_int(args[0])?;
+    let count = small_int_clause(args[0])?;
     if count < 0 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut cur = args[1];
     if count == 0 {
         return if erlang_is_list(cur) {
             Ok(cur)
         } else {
-            Err(badarg())
+            Err(function_clause())
         };
     }
     let mut remaining = count;
     while remaining > 0 {
         if !is_list(cur) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         cur = cdr(cur);
         remaining -= 1;
@@ -564,7 +631,7 @@ fn nthtail(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn last(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let mut cur = args[0];
     if !is_list(cur) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     loop {
         let rest = cdr(cur);
@@ -572,7 +639,7 @@ fn last(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             return Ok(car(cur));
         }
         if !is_list(rest) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         cur = rest;
     }
@@ -589,7 +656,7 @@ fn last(_ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `len` is reached is `badarg`.
 fn sublist_prefix(ctx: &mut BifContext<'_>, list: Eterm, len: i64) -> Result<Eterm> {
     if len < 0 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut prefix = Vec::new();
     let mut cur = list;
@@ -602,7 +669,7 @@ fn sublist_prefix(ctx: &mut BifContext<'_>, list: Eterm, len: i64) -> Result<Ete
         } else if is_nil(cur) {
             break;
         } else {
-            return Err(badarg());
+            return Err(function_clause());
         }
     }
     build_list(ctx, &prefix, NIL)
@@ -610,9 +677,9 @@ fn sublist_prefix(ctx: &mut BifContext<'_>, list: Eterm, len: i64) -> Result<Ete
 
 /// `sublist(List, Len)` — the first `Len` elements of `List`.
 fn sublist2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let len = small_int(args[1])?;
+    let len = small_int_clause(args[1])?;
     if !erlang_is_list(args[0]) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     sublist_prefix(ctx, args[0], len)
 }
@@ -622,17 +689,17 @@ fn sublist2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `Start` must be `>= 1` and `Len` `>= 0`; running off the end of the list is not
 /// an error (`sublist([1,2,3,4], 5, 2)` ⇒ `[]`).
 fn sublist3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let start = small_int(args[1])?;
-    let len = small_int(args[2])?;
+    let start = small_int_clause(args[1])?;
+    let len = small_int_clause(args[2])?;
     let mut cur = args[0];
     if start == 1 {
         if !erlang_is_list(cur) || len < 0 {
-            return Err(badarg());
+            return Err(function_clause());
         }
         return sublist_prefix(ctx, cur, len);
     }
     if start < 2 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     // Skip `Start - 1` cells; running out of list yields `[]`.
     let mut remaining = start;
@@ -641,13 +708,13 @@ fn sublist3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             return Ok(NIL);
         }
         if !is_list(cur) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         cur = cdr(cur);
         remaining -= 1;
     }
     if !erlang_is_list(cur) || len < 0 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     sublist_prefix(ctx, cur, len)
 }
@@ -658,12 +725,12 @@ fn sublist3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `seq(From, To)` — `[From, From+1, …, To]`.
 fn seq2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let first = small_int(args[0])?;
-    let last = small_int(args[1])?;
+    let first = small_int_clause(args[0])?;
+    let last = small_int_clause(args[1])?;
     // The guard is `From - 1 =< To`; `From` is a 60-bit small, so this cannot
     // overflow `i64`.
     if first - 1 > last {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut acc = NIL;
     let mut x = last;
@@ -745,7 +812,7 @@ fn flatten_leaves(root: Eterm) -> Result<Vec<Eterm>> {
             continue;
         }
         if !is_list(term) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         let head = car(term);
         // The tail is visited *after* the head, so push it first.
@@ -768,7 +835,7 @@ fn flatten1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `flatten(DeepList, Tail)` — as above, with the arbitrary `Tail` appended.
 fn flatten2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     if !erlang_is_list(args[0]) || !erlang_is_list(args[1]) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let leaves = flatten_leaves(args[0])?;
     build_list(ctx, &leaves, args[1])
@@ -799,7 +866,7 @@ fn sum(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         cur = cdr(cur);
     }
     if !is_nil(cur) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     Ok(acc)
 }
@@ -808,7 +875,7 @@ fn sum(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// extreme. `better(candidate, best)` decides whether the candidate replaces it.
 fn extreme(ctx: &mut BifContext<'_>, list: Eterm, better: fn(Ordering) -> bool) -> Result<Eterm> {
     if !is_list(list) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut best = car(list);
     let mut cur = cdr(list);
@@ -820,7 +887,7 @@ fn extreme(ctx: &mut BifContext<'_>, list: Eterm, better: fn(Ordering) -> bool) 
         cur = cdr(cur);
     }
     if !is_nil(cur) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     Ok(best)
 }
@@ -845,9 +912,9 @@ fn min(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (there is no separate `system_limit` guard, mirroring the engine's reset-and-
 /// retry contract for term allocation).
 fn duplicate(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let count = small_int(args[0])?;
+    let count = small_int_clause(args[0])?;
     if count < 0 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let mut acc = NIL;
     for _ in 0..count {
@@ -869,7 +936,7 @@ fn delete(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
             return build_list(ctx, &prefix, NIL);
         }
         if !is_list(cur) {
-            return Err(badarg());
+            return Err(function_clause());
         }
         let head = car(cur);
         if eq(head, item, ctx.atoms()) {
@@ -900,9 +967,9 @@ fn key_element(term: Eterm, n: usize) -> Result<Eterm> {
 /// key (so `keysort(2, [{b}])` ⇒ `[{b}]`), matching `lists.erl`'s single-element
 /// shortcut.
 fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let index = small_int(args[0])?;
+    let index = small_int_clause(args[0])?;
     if index < 1 {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let index = index as usize;
     let list = args[1];
@@ -925,14 +992,14 @@ fn keysort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// `sort(List)` — a stable sort in the arithmetic term order.
 fn sort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let elems = proper_list(args[0]).ok_or_else(badarg)?;
+    let elems = proper_list(args[0]).ok_or_else(function_clause)?;
     let sorted = sort_by_arith(ctx.atoms(), &elems);
     ctx.list(&sorted)
 }
 
 /// `usort(List)` — `sort/1` with arithmetically-equal neighbours collapsed.
 fn usort(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let elems = proper_list(args[0]).ok_or_else(badarg)?;
+    let elems = proper_list(args[0]).ok_or_else(function_clause)?;
     let sorted = sort_by_arith(ctx.atoms(), &elems);
     let mut unique: Vec<Eterm> = Vec::with_capacity(sorted.len());
     for &elem in &sorted {
@@ -964,7 +1031,7 @@ fn zip(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 right = cdr(right);
             }
             (false, false) if is_nil(left) && is_nil(right) => break,
-            _ => return Err(badarg()),
+            _ => return Err(function_clause()),
         }
     }
     ctx.list(&pairs)
@@ -979,13 +1046,13 @@ fn unzip(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         let elem = car(cur);
         cur = cdr(cur);
         if !is_tuple(elem) || tuple_size(elem) != 2 {
-            return Err(badarg());
+            return Err(function_clause());
         }
         firsts.push(tuple_element(elem, 0));
         seconds.push(tuple_element(elem, 1));
     }
     if !is_nil(cur) {
-        return Err(badarg());
+        return Err(function_clause());
     }
     let firsts = ctx.list(&firsts)?;
     let seconds = ctx.list(&seconds)?;
@@ -1016,7 +1083,7 @@ fn map2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `foreach(Fun, List)` — `Fun` called for its side effects, left to right; `ok`.
 fn foreach2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     for elem in elems {
         ctx.call_fun(fun, &[elem])?;
     }
@@ -1050,7 +1117,7 @@ fn foldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn foldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut acc = args[1];
-    for &elem in proper_list(args[2]).ok_or_else(badarg)?.iter().rev() {
+    for &elem in proper_list(args[2]).ok_or_else(function_clause)?.iter().rev() {
         acc = ctx.call_fun(fun, &[elem, acc])?;
     }
     Ok(acc)
@@ -1105,7 +1172,7 @@ fn any2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// (`List ++ Rest` is `badarg` in the oracle).
 fn flatmap2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut flat: Vec<Eterm> = Vec::new();
     for elem in elems {
         let result = ctx.call_fun(fun, &[elem])?;
@@ -1131,7 +1198,7 @@ fn dropwhile2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `partition(Pred, List)` — `{Satisfied, NotSatisfied}`, both order-preserving.
 fn partition2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let mut satisfied = Vec::new();
     let mut not_satisfied = Vec::new();
     for elem in elems {
@@ -1159,7 +1226,7 @@ fn splitwith2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut acc = args[1];
-    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = Vec::with_capacity(elems.len());
     for elem in elems {
         let (mapped_elem, next_acc) = map_fold_pair(ctx.call_fun(fun, &[elem, acc])?)?;
@@ -1176,7 +1243,7 @@ fn mapfoldl3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn mapfoldr3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let mut acc = args[1];
-    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = vec![NIL; elems.len()];
     for (index, &elem) in elems.iter().enumerate().rev() {
         let (mapped_elem, next_acc) = map_fold_pair(ctx.call_fun(fun, &[elem, acc])?)?;
@@ -1208,7 +1275,7 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
                 right = cdr(right);
             }
             (false, false) if is_nil(left) && is_nil(right) => break,
-            _ => return Err(badarg()),
+            _ => return Err(function_clause()),
         }
     }
     build_list(ctx, &zipped, NIL)
@@ -1217,7 +1284,7 @@ fn zipwith3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// `sort(Fun, List)` — a **stable** sort in the `Fun` (`=<`) order.
 fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
     ctx.list(&sorted)
 }
@@ -1226,7 +1293,7 @@ fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 /// elements collapsed to its first element.
 fn usort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
-    let elems = proper_list(args[1]).ok_or_else(badarg)?;
+    let elems = proper_list(args[1]).ok_or_else(function_clause)?;
     let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
     let mut unique: Vec<Eterm> = Vec::with_capacity(sorted.len());
     for elem in sorted {
@@ -1256,7 +1323,7 @@ fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
         return Err(badarg());
     }
     let index = index as usize;
-    let elems = proper_list(args[2]).ok_or_else(badarg)?;
+    let elems = proper_list(args[2]).ok_or_else(function_clause)?;
     let mut mapped = Vec::with_capacity(elems.len());
     for elem in elems {
         if !is_tuple(elem) || index > tuple_size(elem) {
@@ -1274,9 +1341,10 @@ fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// Registers the `lists` module BIFs.
 ///
-/// 43 `lists` keys: the three real `bif.tab` BIFs (`member/2`, `reverse/2`,
-/// `keyfind/3`), the pure-Erlang `lists.erl` functions as Rust fast paths, and
-/// the 18 `fun`-taking functions (which need the [`crate::FunCaller`] seam).
+/// 45 `lists` keys: the five real `bif.tab` BIFs (`member/2`, `reverse/2`,
+/// `keyfind/3`, `keymember/3`, `keysearch/3`), the pure-Erlang `lists.erl`
+/// functions as Rust fast paths, and the 18 `fun`-taking functions (which need the
+/// [`crate::FunCaller`] seam).
 ///
 /// Also registers the four **`erlang`** list operators — `'++'/2`, `'--'/2` and
 /// their `append/2`, `subtract/2` aliases (`bif.tab` `bif erlang:'++'/2
@@ -1292,6 +1360,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("lists", "reverse", 1, reverse1);
     reg.register("lists", "reverse", 2, reverse2);
     reg.register("lists", "keyfind", 3, keyfind);
+    reg.register("lists", "keymember", 3, keymember);
+    reg.register("lists", "keysearch", 3, keysearch);
     reg.register("lists", "append", 1, append1);
     reg.register("lists", "append", 2, append2);
     reg.register("lists", "nth", 2, nth);
