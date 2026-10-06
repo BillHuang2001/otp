@@ -252,28 +252,33 @@ fn assemble(
             }
 
             // `float Unit Fs Value Size` — write a 16/32/64-bit float
-            // (`erts_bs_put_float`, `erl_bits.c:1341`). `Size` is the bit count
-            // directly (already `size * unit`), defaulting to 64.
+            // (`erts_bs_put_float`, `erl_bits.c:1341`). The field width is
+            // `Size * Unit`, the **same** size arm `BSC_INTEGER`/`BSC_BINARY` share
+            // in C (`emu/bs_instrs.tab:415-417`): a `size*unit` overflow — or a
+            // product whose signed value does not fit a word — is `system_limit`,
+            // and a width other than 16/32/64 (including `Size == 0`) is `badarg`;
+            // see [`float_nbits`]. `Size` is the bit *count* the compiler emits
+            // with unit 1; the bare `<<F/float>>` form is emitted as the constant
+            // 64, never `all`, so the `all` arm is only reachable from a
+            // hand-built module (the compiler rejects `<<F/all/float>>` with a
+            // syntax error) and keeps the C default of 64 bits.
             "float" => {
                 let nbits = if is_all(module, size_op) {
                     64
                 } else {
-                    match segment_size(machine, ctx, size_op)? {
-                        SegSize::Small(n) => match n.checked_mul(unit) {
-                            Some(m) if m != 0 => m,
-                            _ => 64,
-                        },
+                    let size = match segment_size(machine, ctx, size_op)? {
+                        SegSize::Small(n) => n,
                         SegSize::Fail(reason) => {
+                            return fail_seg(machine, module, labels, fail, reason);
+                        }
+                    };
+                    match float_nbits(size, unit) {
+                        Ok(nbits) => nbits,
+                        Err(reason) => {
                             return fail_seg(machine, module, labels, fail, reason);
                         }
                     }
                 };
-                // `erts_bs_put_float` (`erl_bits.c:1449`) returns a failure value for
-                // any width other than 16/32/64 (`c_p->fvalue = am_invalid`), and the
-                // caller still raises the bare atom `badarg`.
-                if !matches!(nbits, 16 | 32 | 64) {
-                    return fail_seg(machine, module, labels, fail, SegReason::BadArg);
-                }
                 let value = read_value(machine, module, ctx, value_op)?;
                 let Some(f) = float_source(value) else {
                     return fail_seg(machine, module, labels, fail, SegReason::BadArg);
@@ -391,6 +396,34 @@ fn seg_nbits(size: usize, unit: usize) -> std::result::Result<usize, SegReason> 
         // on a 64-bit word: the signed size does not fit.
         Some(nbits) if (nbits as u64) >> 63 == 0 => Ok(nbits),
         _ => Err(SegReason::SystemLimit),
+    }
+}
+
+/// The bit width a `float` segment builds, or the reason its failure reports.
+///
+/// C's `i_bs_create_bin` **first pass** (`emu/bs_instrs.tab:415-428`) shares the
+/// `$BS_LOAD_UNIT`/`$BS_LOAD_SIZE`/`$BS_SAFE_MUL` arm with `BSC_INTEGER`/`BSC_BINARY`,
+/// so a `float` segment's width is `size * unit` where a multiply overflow — or a
+/// product whose *signed* value does not fit a word — is `$BS_FAIL_INFO_SYSTEM_LIMIT`
+/// (see [`seg_nbits`]). `erts_bs_put_float` (`erl_bits.c:1341`) then accepts **only**
+/// 16/32/64 bits and reports `c_p->fvalue = am_invalid` for every other width
+/// (`:1449`), which the construct loop raises as the bare `badarg` (`:661-667`).
+///
+/// That width rejection includes `size == 0` — which `erlc` *does* emit, with only a
+/// "bad float bit size" warning, for `<<F:0/float>>`:
+///
+/// ```text
+/// $ erl -noshell -eval 'io:format("~p~n",[try <<1.0:0/float>> catch C:E -> {C,E} end]),halt().'
+/// {error,badarg}
+/// ```
+///
+/// so the reason ordering is `system_limit` (from [`seg_nbits`]) *before* the width
+/// test, exactly as C's first pass runs before the construct phase. `Size == 0` never
+/// reaches the width test with an overflowed product: `0 * unit` cannot overflow.
+fn float_nbits(size: usize, unit: usize) -> std::result::Result<usize, SegReason> {
+    match seg_nbits(size, unit)? {
+        nbits if matches!(nbits, 16 | 32 | 64) => Ok(nbits),
+        _ => Err(SegReason::BadArg),
     }
 }
 
@@ -876,6 +909,67 @@ mod tests {
         assert_eq!(seg_nbits(1 << 62, 2), Err(SegReason::SystemLimit));
     }
 
+    // --- `float_nbits` (the `BSC_FLOAT` size arm + `erts_bs_put_float`) -----
+
+    #[test]
+    fn float_nbits_accepts_only_16_32_64() {
+        // `erts_bs_put_float` (`erl_bits.c:1341`) accepts exactly these three widths;
+        // `<<2.5:2/float-unit:8>>` is `16` (the size operand is 2, the unit 8), so the
+        // unit multiply has to happen here:
+        //   `erl -noshell -eval 'io:format("~w~n",[<<2.5:2/float-unit:8>>]),halt().'`
+        //   ⇒ `<<65,0>>` (= binary16 0x4100).
+        assert_eq!(float_nbits(16, 1), Ok(16));
+        assert_eq!(float_nbits(32, 1), Ok(32));
+        assert_eq!(float_nbits(64, 1), Ok(64));
+        assert_eq!(float_nbits(2, 8), Ok(16));
+        assert_eq!(float_nbits(4, 8), Ok(32));
+        assert_eq!(float_nbits(8, 8), Ok(64));
+    }
+
+    #[test]
+    fn float_nbits_treats_a_zero_size_as_the_badarg_width_failure() {
+        // `<<F:0/float>>` is emitted by `erlc` with only a "bad float bit size"
+        // warning; the oracle rejects it at run time with the bare `badarg`:
+        //   `erl -noshell -eval 'io:format("~p~n",[try <<1.0:0/float>> catch C:E -> {C,E} end]),halt().'`
+        //   ⇒ `{error,badarg}`
+        // The old `n.checked_mul(unit) { Some(m) if m != 0 => m, _ => 64 }` fallback
+        // silently turned this into a 64-bit float instead — a wrong result.
+        assert_eq!(float_nbits(0, 1), Err(SegReason::BadArg));
+        assert_eq!(float_nbits(0, 8), Err(SegReason::BadArg));
+        assert_eq!(float_nbits(0, usize::MAX), Err(SegReason::BadArg));
+    }
+
+    #[test]
+    fn float_nbits_rejects_every_width_other_than_16_32_64() {
+        // `<<1.0:8/float>>` / `<<1.0:24/float>>` / `<<1.0:1000000/float>>` are all
+        // `{error,badarg}` in the oracle (`erl_bits.c:1449`, `emu/bs_instrs.tab:664`),
+        // e.g.
+        //   `erl -noshell -eval 'io:format("~p~n",[try <<1.0:8/float>> catch C:E -> {C,E} end]),halt().'`
+        //   ⇒ `{error,badarg}`
+        for width in [1usize, 8, 15, 17, 24, 31, 33, 63, 65, 128, 1000000] {
+            assert_eq!(
+                float_nbits(width, 1),
+                Err(SegReason::BadArg),
+                "float_nbits({width}, 1)"
+            );
+        }
+    }
+
+    #[test]
+    fn float_nbits_reports_a_size_product_overflow_as_system_limit() {
+        // The `$BS_SAFE_MUL` arm (`emu/bs_instrs.tab:424`) plus the signed-fit check
+        // (`:425`) run **before** the width test, so an overflowing `size*unit` is
+        // `system_limit` and not `badarg`:
+        //   `erl -noshell -eval 'io:format("~p~n",[try <<1.0:(1 bsl 63)/float-unit:2>> catch C:E -> {C,E} end]),halt().'`
+        //   ⇒ `{error,system_limit}`
+        assert_eq!(float_nbits(usize::MAX, 2), Err(SegReason::SystemLimit));
+        assert_eq!(float_nbits(1 << 62, 4), Err(SegReason::SystemLimit));
+        assert_eq!(float_nbits(1 << 63, 1), Err(SegReason::SystemLimit));
+        assert_eq!(float_nbits(1 << 62, 2), Err(SegReason::SystemLimit));
+        // A 16/32/64 product is still accepted, so the overflow guard does not
+        // swallow the valid widths.
+        assert_eq!(float_nbits(16, 1), Ok(16));
+    }
     // --- `segment_size` (the size-validation reasons) ----------------------
 
     /// Read a dynamic size from `x(0)` holding `value`.
