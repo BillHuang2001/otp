@@ -29,16 +29,22 @@
 //! * `badrecord` → `{badrecord, V}` (a failed record match).
 //!
 //! A poisoned argument (`genesis_poison`, `7`, `[]` or `{}`) matches no clause of the
-//! target function, so the head-clause failure fires before any host call.
+//! target function, so the head-clause failure fires before any host call. A target may
+//! carry **one poison per argument** (the file's `POISONS` list), so the sweep also
+//! reaches the multi-argument exported functions the single-argument pass could not.
 //!
 //! # The corpus (`tests/fixtures/error_path_targets.txt`)
 //!
-//! One line per target: the call, the poison, the expected reason and the exact
+//! One line per target: the call, the poison arguments, the expected reason and the exact
 //! `erl -noshell -eval …` invocation that reproduces the expectation. Every expected
 //! value is the **real** system Erlang's (OTP 29 / erts-17.1); none was guessed and
-//! none came from the Rust engine. The file documents the deterministic capping rule
-//! and the un-capped sweep totals (633 `function_clause` + 99 tuple-reason agreeing
-//! calls). It is *data*: regenerate it, never hand-edit a value.
+//! none came from the Rust engine. A candidate was admitted only when a fresh oracle run
+//! raised the very reason recorded: candidates whose oracle run returned a *value*, or
+//! whose oracle reason differed from the engine's, were dropped. The file documents the
+//! deterministic capping rule and the un-capped sweep totals (633 `function_clause` + 99
+//! tuple-reason agreeing calls in the first, single-argument pass, over the 162 modules
+//! it reached; the arity-widened second pass added 53 targets over 51 further modules).
+//! It is *data*: regenerate it, never hand-edit a value.
 //!
 //! # Skip-vs-assert policy (explicit)
 //!
@@ -80,11 +86,11 @@ const POISON_ATOM: &str = "genesis_poison";
 /// The honest number of corpus modules whose error paths execute and agree with the
 /// oracle (the capping rule keeps at least one agreeing target per module, so this
 /// equals the number of distinct modules in the corpus that are *reached*).
-const MODULE_FLOOR: usize = 162;
+const MODULE_FLOOR: usize = 213;
 
-/// The honest number of target lines in [`TARGETS_TXT`] (170 expect-agree + 9
+/// The honest number of target lines in [`TARGETS_TXT`] (223 expect-agree + 9
 /// expect-skip). A shrunk corpus fails here rather than silently weakening the sweep.
-const TARGET_FLOOR: usize = 179;
+const TARGET_FLOOR: usize = 232;
 
 // ---------------------------------------------------------------------------
 // The corpus file: parsing
@@ -120,7 +126,8 @@ struct Target {
     module: String,
     function: String,
     arity: u32,
-    poison: Poison,
+    /// One poison per argument (the file's `POISONS` list; its length is the arity).
+    poisons: Vec<Poison>,
     expected: Expected,
     /// The quoted `erl -noshell -eval …` command backing the expectation (empty for
     /// an `unsupported` line, whose expectation is the engine's own gap).
@@ -205,14 +212,26 @@ fn parse_targets() -> Vec<Target> {
         let arity: u32 = arity
             .parse()
             .unwrap_or_else(|_| panic!("line {}: bad arity in {:?}", index + 1, tokens[0]));
-        let poison = parse_poison(tokens[1]).unwrap_or_else(|| {
-            panic!("line {}: unknown poison {:?}", index + 1, tokens[1])
-        });
+        let poisons: Vec<Poison> = tokens[1]
+            .split(',')
+            .map(|token| {
+                parse_poison(token)
+                    .unwrap_or_else(|| panic!("line {}: unknown poison {:?}", index + 1, token))
+            })
+            .collect();
+        assert_eq!(
+            poisons.len(),
+            arity as usize,
+            "line {}: {} poison(s) for arity {arity}: {:?}",
+            index + 1,
+            poisons.len(),
+            tokens[1]
+        );
         targets.push(Target {
             module: module.to_string(),
             function: function.to_string(),
             arity,
-            poison,
+            poisons,
             expected: parse_expected(tokens[3]),
             oracle,
         });
@@ -235,14 +254,14 @@ fn poison_term(host: &mut ModuleHost, poison: Poison) -> Eterm {
     }
 }
 
-/// The reason term `expected` names — a bare atom, or the 2-tuple `{tag, arg}` whose
-/// payload is the very argument the target was called with.
-fn expected_term(host: &mut ModuleHost, expected: &Expected, arg: Eterm) -> Eterm {
+/// The reason term `expected` names — a bare atom, or the 2-tuple `{tag, payload}` whose
+/// payload is the LAST poison the target was called with (the file's documented rule).
+fn expected_term(host: &mut ModuleHost, expected: &Expected, payload: Eterm) -> Eterm {
     match expected {
         Expected::Atom(name) => host.intern(name),
         Expected::Tuple(tag) => {
             let tag = host.intern(tag);
-            terms::make_tuple(host, &[tag, arg]).expect("build the {tag, arg} reason")
+            terms::make_tuple(host, &[tag, payload]).expect("build the {tag, arg} reason")
         }
         Expected::Unsupported => unreachable!("`unsupported` has no reason term"),
     }
@@ -306,8 +325,14 @@ fn corpus_error_paths_execute_and_agree_with_the_oracle() {
     let mut skip_lines: Vec<String> = Vec::new();
 
     for target in &targets {
-        let arg = poison_term(&mut host, target.poison);
-        let result = host.call(&target.module, &target.function, &[arg]);
+        let args: Vec<Eterm> = target
+            .poisons
+            .iter()
+            .map(|poison| poison_term(&mut host, *poison))
+            .collect();
+        // The `{tag, payload}` expectation's payload is the LAST poison (file rule).
+        let arg = *args.last().expect("every target has at least one argument");
+        let result = host.call(&target.module, &target.function, &args);
 
         match &target.expected {
             // A documented gap: a typed error is the expected outcome; a value is a
