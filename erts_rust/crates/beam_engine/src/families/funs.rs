@@ -96,7 +96,7 @@ pub(crate) fn exec(
             }
             let mut free = Vec::with_capacity(env.len());
             for operand in env {
-                free.push(read_operand(machine, operand)?);
+                free.push(read_operand(machine, ctx, operand)?);
             }
             // Header arity is the *closure* arity: total lambda arity minus the
             // captured free variables (`emu_load.c`, `emu/instrs.tab:565`).
@@ -126,7 +126,7 @@ pub(crate) fn exec(
         // `call_fun2 Tag Arity Func` — the fun is the `Func` operand, arguments in
         // `x(0..arity)`. The `Tag` hint (an atom or a fun-table index) is ignored.
         Instr::CallFun2 { arity, func, .. } => {
-            let fun = read_operand(machine, func)?;
+            let fun = read_operand(machine, ctx, func)?;
             let args = register_args(machine, *arity)?;
             // As for `call_fun`: arguments in `x(0..arity)`, captures laid out by
             // the context (`ExecutionContext::apply_fun`).

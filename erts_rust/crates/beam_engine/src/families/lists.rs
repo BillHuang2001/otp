@@ -52,15 +52,15 @@ pub(crate) fn exec(
     let _ = (labels, func, pc);
     match instr {
         Instr::PutList { head, tail, dst } => {
-            let h = read_operand(machine, head)?;
-            let t = read_operand(machine, tail)?;
+            let h = read_operand(machine, ctx, head)?;
+            let t = read_operand(machine, ctx, tail)?;
             let cons = terms::make_cons(ctx, h, t)?;
             write_operand(machine, dst, cons)?;
             Ok(Some(Step::Next))
         }
 
         Instr::GetList { source, head, tail } => {
-            let value = read_operand(machine, source)?;
+            let value = read_operand(machine, ctx, source)?;
             match (terms::cons_head(value), terms::cons_tail(value)) {
                 (Ok(h), Ok(t)) => {
                     write_operand(machine, head, h)?;
@@ -75,7 +75,7 @@ pub(crate) fn exec(
         }
 
         Instr::GetHd { source, head } => {
-            let value = read_operand(machine, source)?;
+            let value = read_operand(machine, ctx, source)?;
             match terms::cons_head(value) {
                 Ok(h) => {
                     write_operand(machine, head, h)?;
@@ -88,7 +88,7 @@ pub(crate) fn exec(
         }
 
         Instr::GetTl { source, tail } => {
-            let value = read_operand(machine, source)?;
+            let value = read_operand(machine, ctx, source)?;
             match terms::cons_tail(value) {
                 Ok(t) => {
                     write_operand(machine, tail, t)?;

@@ -117,13 +117,13 @@ pub(crate) fn exec(
             source,
             pairs,
         } => {
-            let map = read_operand(machine, source)?;
+            let map = read_operand(machine, ctx, source)?;
             if !predicates::is_map(map) {
                 return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let entries = terms::map_entries(map)?;
             for (key_operand, dst_operand) in pairs {
-                let key = read_operand(machine, key_operand)?;
+                let key = read_operand(machine, ctx, key_operand)?;
                 match lookup(&entries, key, &module.atom_table) {
                     Some(value) => write_operand(machine, dst_operand, value)?,
                     None => {
@@ -140,13 +140,13 @@ pub(crate) fn exec(
         }
 
         Instr::HasMapFields { fail, source, keys } => {
-            let map = read_operand(machine, source)?;
+            let map = read_operand(machine, ctx, source)?;
             if !predicates::is_map(map) {
                 return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let entries = terms::map_entries(map)?;
             for key_operand in keys {
-                let key = read_operand(machine, key_operand)?;
+                let key = read_operand(machine, ctx, key_operand)?;
                 if lookup(&entries, key, &module.atom_table).is_none() {
                     return jump_or_unsupported(
                         labels,
@@ -169,14 +169,14 @@ pub(crate) fn exec(
             // `live` is the C collector's GC-root count; M1 has no moving
             // collector (see the module docs), so the update cannot relocate terms.
             let _ = live;
-            let map = read_operand(machine, source)?;
+            let map = read_operand(machine, ctx, source)?;
             if !predicates::is_map(map) {
                 return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {
-                let key = read_operand(machine, key_operand)?;
-                let value = read_operand(machine, value_operand)?;
+                let key = read_operand(machine, ctx, key_operand)?;
+                let value = read_operand(machine, ctx, value_operand)?;
                 match position(&merged, key, &module.atom_table) {
                     // Overwrite the existing binding…
                     Some(index) => merged[index].1 = value,
@@ -199,20 +199,20 @@ pub(crate) fn exec(
         } => {
             // As `PutMapAssoc`: `live` is unused at M1.
             let _ = live;
-            let map = read_operand(machine, source)?;
+            let map = read_operand(machine, ctx, source)?;
             if !predicates::is_map(map) {
                 return fail_or_raise(machine, module, labels, ctx, *fail, "badmap", map).map(Some);
             }
             let mut merged = terms::map_entries(map)?;
             for (key_operand, value_operand) in pairs {
-                let key = read_operand(machine, key_operand)?;
+                let key = read_operand(machine, ctx, key_operand)?;
                 let Some(index) = position(&merged, key, &module.atom_table) else {
                     // Exact update on an absent key: `{badkey, Key}` on the
                     // no-fail-label path (`beam_common.c:2237-2268`).
                     return fail_or_raise(machine, module, labels, ctx, *fail, "badkey", key)
                         .map(Some);
                 };
-                let value = read_operand(machine, value_operand)?;
+                let value = read_operand(machine, ctx, value_operand)?;
                 merged[index].1 = value;
             }
             let result = terms::make_flatmap(ctx, &merged)?;

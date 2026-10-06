@@ -23,6 +23,7 @@ use std::collections::BTreeMap;
 use beam_common::Result;
 use beam_loader::{Label, Opcode, Operand, NO_FAIL};
 
+use crate::context::ExecutionContext;
 use crate::error;
 use crate::interpreter::resolve;
 use crate::machine::Machine;
@@ -41,9 +42,10 @@ pub(crate) fn exec(
     labels: &BTreeMap<Label, (u32, u32)>,
     op: Opcode,
     operands: &[Operand],
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
     match op {
-        Opcode::is_any_native_record => exec_is_any_native_record(machine, labels, operands),
+        Opcode::is_any_native_record => exec_is_any_native_record(machine, labels, operands, ctx),
         other => Err(error::unsupported(other.name())),
     }
 }
@@ -66,13 +68,14 @@ fn exec_is_any_native_record(
     machine: &Machine,
     labels: &BTreeMap<Label, (u32, u32)>,
     operands: &[Operand],
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<Step> {
     let fail = match operands.first() {
         Some(Operand::Label(label)) => *label,
         _ => return Err(error::unsupported("is_any_native_record: fail operand")),
     };
     let src = match operands.get(1) {
-        Some(operand) => read_operand(machine, operand)?,
+        Some(operand) => read_operand(machine, ctx, operand)?,
         None => return Err(error::unsupported("is_any_native_record: missing source")),
     };
     if predicates::is_record(src) {

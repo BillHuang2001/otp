@@ -155,19 +155,19 @@ impl Machine {
             | Instr::NifStart
             | Instr::OnLoad => Ok(Step::Next),
             Instr::Move { src, dst } => {
-                let value = read_operand(self, src)?;
+                let value = read_operand(self, ctx, src)?;
                 write_operand(self, dst, value)?;
                 Ok(Step::Next)
             }
             Instr::Swap { a, b } => {
-                let va = read_operand(self, a)?;
-                let vb = read_operand(self, b)?;
+                let va = read_operand(self, ctx, a)?;
+                let vb = read_operand(self, ctx, b)?;
                 write_operand(self, a, vb)?;
                 write_operand(self, b, va)?;
                 Ok(Step::Next)
             }
             Instr::Test { kind, fail, args } => {
-                if self.eval_test(module, *kind, args)? {
+                if self.eval_test(module, *kind, args, ctx)? {
                     Ok(Step::Next)
                 } else if *fail == NO_FAIL {
                     Err(error::unsupported("test/no_fail"))
@@ -177,10 +177,10 @@ impl Machine {
                 }
             }
             Instr::SelectVal { value, fail, pairs } => {
-                let scrutinee = read_operand(self, value)?;
+                let scrutinee = read_operand(self, ctx, value)?;
                 let mut target = None;
                 for (candidate, label) in pairs {
-                    let candidate_value = read_operand(self, candidate)?;
+                    let candidate_value = read_operand(self, ctx, candidate)?;
                     if cmp(scrutinee, candidate_value, &module.atom_table).is_eq() {
                         target = Some(*label);
                         break;
@@ -212,7 +212,7 @@ impl Machine {
                 let (module_name, function_name, arity) = import_target(module, *bif)?;
                 let mut arg_terms = Vec::with_capacity(args.len());
                 for arg in args {
-                    arg_terms.push(read_operand(self, arg)?);
+                    arg_terms.push(read_operand(self, ctx, arg)?);
                 }
                 match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
                     Ok(value) => {
@@ -258,7 +258,7 @@ impl Machine {
                 let (module_name, function_name, arity) = import_target(module, *bif)?;
                 let mut arg_terms = Vec::with_capacity(args.len());
                 for arg in args {
-                    arg_terms.push(read_operand(self, arg)?);
+                    arg_terms.push(read_operand(self, ctx, arg)?);
                 }
                 match ctx.call_bif(module_name, function_name, arity, &arg_terms) {
                     Ok(value) => {
@@ -377,7 +377,7 @@ impl Machine {
             // set is executed by [`crate::generic`] (currently only
             // `is_any_native_record`); everything else stays the documented
             // `unsupported(op.name())` typed error.
-            Instr::Generic { op, operands, .. } => crate::generic::exec(self, labels, *op, operands),
+            Instr::Generic { op, operands, .. } => crate::generic::exec(self, labels, *op, operands, ctx),
             // Every remaining IR variant is routed to the per-instruction-family
             // dispatch seam ([`crate::families`]). Each family is currently a stub
             // returning `Ok(None)`, so an instruction no family claims yields the
@@ -479,66 +479,72 @@ impl Machine {
     }
 
     /// Evaluate one `is_*`/`test_arity` test; `true` means the test *succeeds*.
-    fn eval_test(&self, module: &Module, kind: TestKind, args: &[Operand]) -> Result<bool> {
+    fn eval_test(
+        &self,
+        module: &Module,
+        kind: TestKind,
+        args: &[Operand],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<bool> {
         let atoms = &module.atom_table;
         match kind {
             TestKind::IsLt => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(cmp_arith(a, b, atoms).is_lt())
             }
             TestKind::IsGe => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(cmp_arith(a, b, atoms).is_ge())
             }
             TestKind::IsEq => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(cmp_arith(a, b, atoms).is_eq())
             }
             TestKind::IsNe => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(!cmp_arith(a, b, atoms).is_eq())
             }
             TestKind::IsEqExact => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(cmp(a, b, atoms).is_eq())
             }
             TestKind::IsNeExact => {
-                let (a, b) = self.test_pair(args)?;
+                let (a, b) = self.test_pair(args, ctx)?;
                 Ok(!cmp(a, b, atoms).is_eq())
             }
-            TestKind::IsInteger => Ok(predicates::is_integer(self.test_arg(args, 0)?)),
-            TestKind::IsFloat => Ok(predicates::is_float(self.test_arg(args, 0)?)),
-            TestKind::IsNumber => Ok(predicates::is_number(self.test_arg(args, 0)?)),
-            TestKind::IsAtom => Ok(is_atom(self.test_arg(args, 0)?)),
+            TestKind::IsInteger => Ok(predicates::is_integer(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsFloat => Ok(predicates::is_float(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsNumber => Ok(predicates::is_number(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsAtom => Ok(is_atom(self.test_arg(args, 0, ctx)?)),
             TestKind::IsPid => {
-                let v = self.test_arg(args, 0)?;
+                let v = self.test_arg(args, 0, ctx)?;
                 Ok(is_internal_pid(v) || predicates::is_external_pid(v))
             }
             TestKind::IsReference => {
-                let v = self.test_arg(args, 0)?;
+                let v = self.test_arg(args, 0, ctx)?;
                 Ok(predicates::is_internal_ref(v) || predicates::is_external_ref(v))
             }
             TestKind::IsPort => {
-                let v = self.test_arg(args, 0)?;
+                let v = self.test_arg(args, 0, ctx)?;
                 Ok(is_internal_port(v) || predicates::is_external_port(v))
             }
-            TestKind::IsNil => Ok(is_nil(self.test_arg(args, 0)?)),
-            TestKind::IsBinary => Ok(predicates::is_binary(self.test_arg(args, 0)?)),
-            TestKind::IsBitstr => Ok(predicates::is_bitstring(self.test_arg(args, 0)?)),
+            TestKind::IsNil => Ok(is_nil(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsBinary => Ok(predicates::is_binary(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsBitstr => Ok(predicates::is_bitstring(self.test_arg(args, 0, ctx)?)),
             TestKind::IsList => {
                 // `is_list` is true for `[]` *or* a cons cell.
-                let v = self.test_arg(args, 0)?;
+                let v = self.test_arg(args, 0, ctx)?;
                 Ok(is_nil(v) || is_not_nil_list(v))
             }
-            TestKind::IsNonemptyList => Ok(is_not_nil_list(self.test_arg(args, 0)?)),
-            TestKind::IsTuple => Ok(predicates::is_tuple(self.test_arg(args, 0)?)),
-            TestKind::IsMap => Ok(predicates::is_map(self.test_arg(args, 0)?)),
+            TestKind::IsNonemptyList => Ok(is_not_nil_list(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsTuple => Ok(predicates::is_tuple(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsMap => Ok(predicates::is_map(self.test_arg(args, 0, ctx)?)),
             TestKind::IsBoolean => {
                 // `is_boolean Fail Src` (`emu/instrs.tab:933`): `Src` is the atom
                 // `true` or `false`. Both are ordinary atoms, so compare against the
                 // module's atom table; a name absent from the table can never be the
                 // value, so a missing name is `false` (not an error).
-                let v = self.test_arg(args, 0)?;
+                let v = self.test_arg(args, 0, ctx)?;
                 if !is_atom(v) {
                     return Ok(false);
                 }
@@ -554,10 +560,10 @@ impl Machine {
             }
             // `is_function Fail Fun` and `is_function2 Fail Fun Arity` — reuse the
             // `terms` fun readers (`is_any_fun` / the fun-header arity field).
-            TestKind::IsFunction => Ok(crate::terms::is_fun(self.test_arg(args, 0)?)),
-            TestKind::IsFunction2 => self.eval_is_function2(args),
-            TestKind::IsTaggedTuple => self.eval_is_tagged_tuple(args),
-            TestKind::TestArity => self.eval_test_arity(args),
+            TestKind::IsFunction => Ok(crate::terms::is_fun(self.test_arg(args, 0, ctx)?)),
+            TestKind::IsFunction2 => self.eval_is_function2(args, ctx),
+            TestKind::IsTaggedTuple => self.eval_is_tagged_tuple(args, ctx),
+            TestKind::TestArity => self.eval_test_arity(args, ctx),
         }
     }
 
@@ -566,8 +572,8 @@ impl Machine {
     /// Operand order is the file's (`emu/ops.tab:831`, verified against the oracle:
     /// `{test,is_function2,{f,N},[Fun,{integer,Arity}]}`), i.e. `args[0]` = `Fun`,
     /// `args[1]` = `Arity` (an integer operand).
-    fn eval_is_function2(&self, args: &[Operand]) -> Result<bool> {
-        let value = self.test_arg(args, 0)?;
+    fn eval_is_function2(&self, args: &[Operand], ctx: &mut dyn ExecutionContext) -> Result<bool> {
+        let value = self.test_arg(args, 0, ctx)?;
         if !crate::terms::is_fun(value) {
             return Ok(false);
         }
@@ -586,8 +592,12 @@ impl Machine {
     /// `{test,is_tagged_tuple,{f,N},[{x,0},3,{atom,r}]}`), i.e. `args[0]` = `Src`,
     /// `args[1]` = `Arity` (an integer), `args[2]` = `Tag` (an atom) — the same layout
     /// `beam_loader::TestKind::IsTaggedTuple` documents.
-    fn eval_is_tagged_tuple(&self, args: &[Operand]) -> Result<bool> {
-        let value = self.test_arg(args, 0)?;
+    fn eval_is_tagged_tuple(
+        &self,
+        args: &[Operand],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<bool> {
+        let value = self.test_arg(args, 0, ctx)?;
         let arity = match args.get(1) {
             Some(Operand::Integer(arity)) => *arity,
             _ => return Err(error::unsupported("is_tagged_tuple: arity operand")),
@@ -600,14 +610,14 @@ impl Machine {
         if !predicates::is_tuple_arity(value, arity as usize) {
             return Ok(false);
         }
-        let tag = self.test_arg(args, 2)?;
+        let tag = self.test_arg(args, 2, ctx)?;
         // The first element of a tagged tuple is the (immediate) tag atom.
         Ok(crate::terms::tuple_element(value, 0)? == tag)
     }
 
     /// `test_arity Value Integer` — the value is a tuple of that arity.
-    fn eval_test_arity(&self, args: &[Operand]) -> Result<bool> {
-        let value = self.test_arg(args, 0)?;
+    fn eval_test_arity(&self, args: &[Operand], ctx: &mut dyn ExecutionContext) -> Result<bool> {
+        let value = self.test_arg(args, 0, ctx)?;
         match args.get(1) {
             Some(Operand::Integer(arity)) => {
                 if *arity < 0 || *arity > MAX_ARITYVAL as i64 {
@@ -621,16 +631,25 @@ impl Machine {
     }
 
     /// Read test argument `i`, or a typed error if the instruction has too few.
-    fn test_arg(&self, args: &[Operand], i: usize) -> Result<Eterm> {
+    fn test_arg(
+        &self,
+        args: &[Operand],
+        i: usize,
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
         match args.get(i) {
-            Some(operand) => read_operand(self, operand),
+            Some(operand) => read_operand(self, ctx, operand),
             None => Err(error::unsupported("test: missing argument")),
         }
     }
 
     /// Read the two arguments of a comparison test.
-    fn test_pair(&self, args: &[Operand]) -> Result<(Eterm, Eterm)> {
-        Ok((self.test_arg(args, 0)?, self.test_arg(args, 1)?))
+    fn test_pair(
+        &self,
+        args: &[Operand],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<(Eterm, Eterm)> {
+        Ok((self.test_arg(args, 0, ctx)?, self.test_arg(args, 1, ctx)?))
     }
 }
 
