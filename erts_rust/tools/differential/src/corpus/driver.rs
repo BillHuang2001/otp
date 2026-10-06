@@ -7,28 +7,40 @@
 //! reports itself as a port, answers `port_info/1` and its output can be read back into
 //! Erlang as a `{Port, {data, …}}` message.
 //!
-//! Some of these cases exercise the seam end to end (`os:cmd/1` runs a real external
-//! program through the `spawn` driver and reads its bytes back; a parsed port term is a
-//! port handle). Others drive `open_port/2` and its companions directly: the `spawn`
-//! driver starts a real OS process, so the port can be opened in `binary`/`list` mode,
-//! written to with `port_command/2`/`3`, read back as a `{Port, {data, …}}` message,
-//! described by `port_info/1` (a proplist of `{Item, Value}` pairs), closed with
-//! `port_close/1` and observed through the `exit_status`/`eof`/`stream` options. Where
-//! the Rust runtime has no wiring yet, the capability gap signals the runtime's
-//! `unsupported` convention (exit `3`) and the case is reported **`unsupported`** — never
-//! a fabricated `agree`, and never a `mismatch`. The goldens are always the oracle's own
-//! output, so the day the remaining seam lands these cases flip to `agree` on their own.
+//! Some cases exercise the seam end to end (`os:cmd/1` runs a real external program through
+//! the `spawn` driver and reads its bytes back; a parsed port term is a port handle). Others
+//! drive `open_port/2` and its companions directly: the `spawn`/`spawn_executable` drivers
+//! start a real OS process, so the port can be opened in `binary`/`list` mode, written to with
+//! `port_command/2`/`3`, read back as a `{Port, {data, …}}` message, described by `port_info/1`
+//! (a proplist of `{Item, Value}` pairs), closed with `port_close/1` and observed through the
+//! `exit_status`/`eof`/`stream`/`{cd,_}` options. Where the Rust runtime has no
+//! wiring yet the capability gap signals its `unsupported` convention (exit `3`) and the case
+//! is reported **`unsupported`** — never a fabricated `agree`, and never a `mismatch`.
 //!
-//! `port_info/2`'s *result* is not compared verbatim: erts-17.1 wraps the item as
-//! `{Item, Value}` whereas `beam_rt` returns the bare value (a documented deviation in
-//! `crates/beam_rt/src/port.rs`), so an exact comparison would be a `mismatch`. Those
-//! cases therefore **normalize** the pair away (`case Raw of {Key, Q} -> Q; Q -> Q end`)
-//! and assert only the unwrapped *shape* (`is_list`, `is_integer`, `> 0`). Everything else
-//! is asserted through the `port_info/1` proplist — `proplists:get_value/2` and
-//! `lists:keymember/3`, which agree — never by iterating an unstable map/proplist order.
-//! The full `port_info/1` item set is not identical either (the oracle also reports
-//! `input`/`output`, `beam_rt` `stream`/`monitors`), so the structural case filters to the
-//! core items both runtimes agree on.
+//! `port_info/2` agrees with erts exactly: both return the `{Item, Value}` pair (e.g.
+//! `{name, "true"}`) and expose the same `port_info/1` item set
+//! (`[connected, id, input, links, name, os_pid, output]`). The earlier cases still
+//! **normalize** the pair away (`case Raw of {Key, Q} -> Q; Q -> Q end`) and assert the
+//! unwrapped *shape* (`is_list`, `is_integer`, `> 0`); the newer cases pin the exact pair and
+//! key set. Volatile per-VM-start values (`os_pid`, the `id` number, the owner pid in `links`)
+//! are asserted as a *shape*/*count*, never verbatim — never by iterating an unstable order.
+//!
+//! **Current divergences (deliberately NOT cases — each would be a `mismatch`), verified
+//! against the live oracle:**
+//! - `open_port({spawn_executable, "<missing path>"}, …)` — the oracle raises
+//!   `error:enoent`; `beam_rt` writes a `beam_rt: io error: No such file or directory`
+//!   line to *stderr* and no `exception …` line to stdout (empty stdout, exit 1).
+//! - the `eof` option — the oracle delivers `{Port, eof}` once the child closes its output
+//!   (`open_port({spawn,"true"},[binary,eof])` ⇒ `eof`); `beam_rt` never delivers it.
+//! - the `{line, N}` option — the oracle emits `{eol, Line}` messages, `beam_rt` raw bytes.
+//! - `port_command(P, 42)` (a non-iodata payload) — the oracle raises `badarg`; `beam_rt`
+//!   accepts it and answers `true`.
+//! - `port_info(P, registered_name)` — the oracle answers `[]`; `beam_rt` raises `badarg`.
+//! - the raw `connected`/`links`/`id` item *values* — a `{spawn, …}` port carries the
+//!   owner's pid (which `beam_rt` cannot yet encode, so it reports `unsupported:
+//!   external_term`) plus a runtime-specific `id`/`os_pid`, so only shapes/counts are pinned.
+//! - `{spawn, Cmd}` for a non-executable `Cmd` — both go through a shell and both report exit
+//!   `127`, but only the oracle's shell emits its `not found` diagnostic on stderr.
 //!
 //! The structural half of A.4 (that a C translation unit referencing the `driver_*` /
 //! `erl_drv_*` declarations still compiles against the frozen headers) is asserted in
@@ -595,6 +607,190 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "driver/port_command3_force_option_is_notsup",
+            description: "port_command/3 with the force option is rejected notsup",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `[force]` is not supported by the spawn driver: erts answers `notsup` rather
+                // than taking the write, and `beam_rt` answers the same. The port must still be
+                // open — a write to a *closed* port is `badarg` on both sides first.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary,stream]), port_command(P, <<\"x\">>, [force]), port_close(P), ok end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error notsup"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_info2_name_wraps_item_and_value",
+            description: "port_info/2 returns the item wrapped in {Item, Value}, as erts does",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The exact pair is asserted (no shape normalization): erts and `beam_rt` both
+                // answer `{name, "true"}` — the item is *not* returned bare.
+                expr: "begin P = open_port({spawn,\"true\"},[]), erlang:port_info(P, name) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,4,110,97,109,101,107,0,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info_item_set_is_the_core_seven",
+            description: "port_info/1's full item set is identical to the oracle's",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The whole key set, sorted so the proplist order is not part of the contract.
+                expr: "lists:sort([K || {K,_} <- erlang:port_info(open_port({spawn,\"true\"},[]))])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,108,0,0,0,7,119,9,99,111,110,110,101,99,116,101,100,119,2,105,100,119,5,105,110,112,117,116,119,5,108,105,110,107,115,119,4,110,97,109,101,119,6,111,115,95,112,105,100,119,6,111,117,116,112,117,116,106>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info_links_holds_the_owner_pid",
+            description: "port_info/1's links item is a one-element list holding the owner",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The pid itself is volatile, so only the list shape and the *count* are pinned:
+                // the owner is linked, so exactly one entry must be present.
+                expr: "begin P = open_port({spawn,\"true\"},[]), L = proplists:get_value(links, erlang:port_info(P)), {is_list(L), length(L)} end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,4,116,114,117,101,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/open_port_list_option_is_badarg",
+            description: "open_port/2 rejects the list option for a spawn port with badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `list` is not a valid option: it raises badarg instead of opening list-mode.
+                expr: "open_port({spawn,\"cat\"},[list])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "driver/port_info2_missing_item_is_undefined",
+            description: "an absent item looked up in port_info/1 is undefined",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `proplists:get_value/2` over the port_info proplist answers `undefined` for a
+                // key the port does not carry (never a raise, never a hang).
+                expr: "begin P = open_port({spawn,\"true\"},[]), proplists:get_value(nosuchkey, erlang:port_info(P)) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_reads_program_output",
+            description: "a spawn_executable port reads the program's output bytes back",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `spawn_executable` takes an absolute program path plus an `{args, …}` list.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{args,[\"-c\",\"printf abc\"]}]), receive {P,{data,DD}} -> DD after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,3,97,98,99>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/spawn_executable_cd_option_takes_effect",
+            description: "the spawn_executable cd option changes the child's directory",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // `pwd` reports the directory the driver started the child in, so the `{cd, …}`
+                // option is observable, not merely accepted.
+                expr: "begin P = open_port({spawn_executable,\"/bin/sh\"},[binary,{cd,\"/tmp\"},{args,[\"-c\",\"pwd\"]}]), receive {P,{data,DD}} -> DD after 2000 -> no_data end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,5,47,116,109,112,10>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_command_iolist_write_read",
+            description: "port_command/2 accepts an iolist payload and the echo reads back",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                // The payload is an iolist (`[<<"ab">>, "cd"]`), flattened by the driver into the
+                // four bytes the child echoes back.
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), port_command(P, [<<\"ab\">>,\"cd\"]), receive {P,{data,DD}} -> DD after 2000 -> timeout end end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,4,97,98,99,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/ports_excludes_a_closed_port",
+            description: "erlang:ports/0 drops a port after it has been closed",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"true\"},[]), port_close(P), lists:member(P, erlang:ports()) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,5,102,97,108,115,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info2_after_close_is_undefined",
+            description: "port_info/2 on a closed spawn port is undefined",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"true\"},[]), port_close(P), erlang:port_info(P, name) end",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,9,117,110,100,101,102,105,110,101,100>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "driver/port_info_on_non_port_is_badarg",
+            description: "port_info/1 on a non-port raises badarg",
+            contracts: &[Contract::DriverAbi],
+            kind: CaseKind::Eval {
+                expr: "erlang:port_info(self())",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
     ]
 }
 
@@ -621,6 +817,18 @@ mod tests {
         "driver/port_info2_name_value_is_list",
         "driver/port_info2_os_pid_shape",
         "driver/port_info2_links_shape",
+        "driver/port_command3_force_option_is_notsup",
+        "driver/port_info2_name_wraps_item_and_value",
+        "driver/port_info_item_set_is_the_core_seven",
+        "driver/port_info_links_holds_the_owner_pid",
+        "driver/open_port_list_option_is_badarg",
+        "driver/port_info2_missing_item_is_undefined",
+        "driver/spawn_executable_reads_program_output",
+        "driver/spawn_executable_cd_option_takes_effect",
+        "driver/port_command_iolist_write_read",
+        "driver/ports_excludes_a_closed_port",
+        "driver/port_info2_after_close_is_undefined",
+        "driver/port_info_on_non_port_is_badarg",
     ];
 
     /// Identifier-ish tokens of an Erlang expression (so `Val` is one token, `=:=` is two).
@@ -721,5 +929,71 @@ mod tests {
         assert_eq!(zero.golden.stdout, Some("ok <<131,97,0>>"));
         let nonzero = find_case("driver/exit_status_option_nonzero").expect("case present");
         assert_eq!(nonzero.golden.stdout, Some("ok <<131,97,1>>"));
+    }
+
+    /// A case the oracle answers with an exception must carry that `exception …` line and
+    /// exit `1` (never `0`) — a mis-typed golden here would silently hide a divergence.
+    fn assert_raises(id: &str, reason: &str) {
+        let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+        assert_eq!(
+            case.golden.stdout,
+            Some(&*format!("exception error {reason}")),
+            "case {id}"
+        );
+        assert_eq!(
+            case.golden.exit_code, 1,
+            "case {id}: an exception must exit 1"
+        );
+    }
+
+    /// The goldens of the cases added to pin the port/driver divergences and the newly
+    /// agreeing surface (`port_info/2`'s `{Item, Value}` pair, the exact item set, the `links`
+    /// count, the spawn-executable read path/options and the `badarg` arg checks).
+    #[test]
+    fn new_port_surface_cases_pin_the_observed_goldens() {
+        assert_raises("driver/port_command3_force_option_is_notsup", "notsup");
+        assert_raises("driver/open_port_list_option_is_badarg", "badarg");
+        assert_raises("driver/port_info_on_non_port_is_badarg", "badarg");
+
+        let undefined = "ok <<131,119,9,117,110,100,101,102,105,110,101,100>>";
+        for (id, golden) in [
+            // `port_info/2` answers the same `{Item, Value}` pair as erts (not a bare value).
+            (
+                "driver/port_info2_name_wraps_item_and_value",
+                "ok <<131,104,2,119,4,110,97,109,101,107,0,4,116,114,117,101>>",
+            ),
+            // The whole `port_info/1` key set, sorted.
+            (
+                "driver/port_info_item_set_is_the_core_seven",
+                "ok <<131,108,0,0,0,7,119,9,99,111,110,110,101,99,116,101,100,119,2,105,100,119,5,105,110,112,117,116,119,5,108,105,110,107,115,119,4,110,97,109,101,119,6,111,115,95,112,105,100,119,6,111,117,116,112,117,116,106>>",
+            ),
+            // The `links` *count* is pinned; the owner pid (volatile) deliberately is not.
+            (
+                "driver/port_info_links_holds_the_owner_pid",
+                "ok <<131,104,2,119,4,116,114,117,101,97,1>>",
+            ),
+            ("driver/port_info2_missing_item_is_undefined", undefined),
+            ("driver/port_info2_after_close_is_undefined", undefined),
+            (
+                "driver/spawn_executable_reads_program_output",
+                "ok <<131,109,0,0,0,3,97,98,99>>",
+            ),
+            (
+                "driver/spawn_executable_cd_option_takes_effect",
+                "ok <<131,109,0,0,0,5,47,116,109,112,10>>",
+            ),
+            (
+                "driver/port_command_iolist_write_read",
+                "ok <<131,109,0,0,0,4,97,98,99,100>>",
+            ),
+            (
+                "driver/ports_excludes_a_closed_port",
+                "ok <<131,119,5,102,97,108,115,101>>",
+            ),
+        ] {
+            let case = find_case(id).unwrap_or_else(|| panic!("case {id} is not registered"));
+            assert_eq!(case.golden.stdout, Some(golden), "case {id}");
+            assert_eq!(case.golden.exit_code, 0, "case {id}");
+        }
     }
 }
