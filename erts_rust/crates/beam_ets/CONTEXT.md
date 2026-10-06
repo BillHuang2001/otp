@@ -143,8 +143,18 @@ impl Table {
     pub fn match_object(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
     pub fn match_(&self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>;
     pub fn match_delete(&mut self, pattern_term: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
+    pub fn select_replace(&mut self, spec: &MatchSpec, atoms: &AtomTable, heap: &mut Heap) -> Result<usize>;
+
+    // limit + continuation forms (see continuation.rs; `Option::None` ⇒ '$end_of_table')
+    pub fn select_limit(&self, spec: &MatchSpec, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn select_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_object_limit(&self, pattern_term: Eterm, limit: usize, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
+    pub fn match_object_continue(&self, cont: &MatchContinuation, atoms: &AtomTable, heap: &mut Heap) -> Result<(Vec<Eterm>, Option<MatchContinuation>)>;
 }
 ```
+- `pub fn match_spec_run(list: Eterm, spec: Eterm, atoms: &AtomTable, heap: &mut Heap) -> Result<Vec<Eterm>>` (from `run.rs`) — the table-independent `ets:match_spec_run/2` runner.
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
   (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
   `iter_objects`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
@@ -218,17 +228,35 @@ impl Table {
   `pub struct MatchClause { head, guard, body }`, `pub fn compile(spec: Eterm, atoms: &AtomTable) -> Result<MatchSpec>`;
   type aliases `MatchPattern`/`MatchElement` = `Pattern`, `MatchGuard`/`MatchBody`/`MatchBodyElement` = `Expr`.
 - `pattern.rs` — `pub enum Pattern` (nested tuple/list/improper patterns, quoted literals, `'_'`,
-  `'$N'` binds with repeat-occurrence equality, `'$_'`/`'$$'` which never match in a head).
-- `expr.rs` — `pub enum Expr`, `pub enum CmpOp`, `pub enum TypeTest`: the guard/body expression
-  language. Guards: `andalso`/`and`, `orelse`/`or`, `not`, `const`, bare truthiness; comparisons
-  `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=` (structural `cmp` for exact, `cmp_arith` for `==`-family);
-  type tests `is_atom/integer/float/number/tuple/list/binary/bitstring/map/pid/port/reference/function/boolean`;
-  guard BIFs `element/2`, `abs/1`, `size/1`, `hd/1`, `tl/1`, `length/1`, `self/0`. Bodies: sequences
-  (value = last expression), tuple/list construction, literals, `'$N'`, `'$_'`, `'$$'`. Guard truth
-  is an internal `Expr::Bool` (independent of whether `true`/`false` are interned).
-  Anything outside the recognised set ⇒ `compile`/`expr` `badarg` (Known Issues).
-- `exec.rs` — the `impl Table` block for the select family + `pub enum BodyKind`
-  (`WholeObject`/`AllBindings`/`LiteralTrue`) that reuses the compiler for `ets:match*`.
+  `'$N'` binds with repeat-occurrence equality; every other atom — including `'$_'`/`'$$'`, which are
+  special only in a *body* — is an exact `=:=` literal).
+- `expr.rs` — `pub enum Expr`, `pub enum CmpOp`, `pub enum TypeTest`, `pub enum ArithOp`: the
+  guard/body expression language. Guards: `andalso`/`and`, `orelse`/`or`, `not`, `const`, bare
+  truthiness; comparisons `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=` (structural `cmp` for exact,
+  `cmp_arith` for `==`-family); type tests `is_atom/integer/float/number/tuple/list/binary/bitstring/
+  map/pid/port/reference/function/boolean`; guard BIFs `element/2`, `abs/1`, `size/1`, `hd/1`, `tl/1`,
+  `length/1`, `self/0`. **Arithmetic** (`+ - * / div rem band bor bxor bsl bsr`, unary `+`/`-`) is
+  routed through the `pub trait ArithHook` seam (default methods) with `pub struct DefaultArithHook`
+  installed via a `thread_local` (`pub fn set_arith_hook`) so there is no crate edge to `beam_bifs`;
+  the default does checked small-int (i64) arithmetic — overflow/bignum/float/`/` ⇒ a typed
+  `unsupported`, `div`/`rem` by zero ⇒ `badarg`, a negative shift count reverses direction and `bsr`
+  saturates (the C `erts_shift`). Bodies: sequences (value = last expression), tuple/list
+  construction, literals, `'$N'`, `'$_'`, `'$$'`. Guard truth is an internal `Expr::Bool` (independent
+  of whether `true`/`false` are interned). Anything outside the recognised set ⇒ `compile`/`expr`
+  `badarg` (Known Issues).
+- `exec.rs` — the `impl Table` block for the select family (`select`/`select_delete`/`select_count`/
+  `match*`/`select_replace`) + `pub enum BodyKind` (`WholeObject`/`AllBindings`/`LiteralTrue`) that
+  reuses the compiler for `ets:match*`. `select_replace` is value-validated (the clause value must be
+  a tuple of arity ≥ keypos whose keypos element equals the matched key, else whole-call `badarg`),
+  supported on set/ordered_set/duplicate_bag (`bag` ⇒ `badarg`). A BODY runtime failure is replaced by
+  the atom `EXIT` and evaluation continues (the C `FAIL_TERM`); a GUARD failure skips the clause.
+- `run.rs` — `pub fn match_spec_run(list, spec, atoms, heap) -> Result<Vec<Eterm>>`: the
+  table-independent `ets:match_spec_run/2` runner (compiles the raw spec; the oracle requires
+  `ets:match_spec_compile/1` first — a `beam_bifs` bridge handoff).
+- `continuation.rs` — `pub struct MatchContinuation` (opaque: table id + compiled spec + limit +
+  position) and the limited forms `select_limit`/`select_continue`/`match_limit`/`match_continue`/
+  `match_object_limit`/`match_object_continue`, each returning `(Vec<Eterm>, Option<MatchContinuation>)`
+  (`None` ⇒ the oracle's `'$end_of_table'`).
 
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
@@ -339,6 +367,31 @@ impl Table {
 - **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
   mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
   unchanged, as the oracle does.
+- **`select_replace/2` is a two-phase value-validated rewrite.** Phase one evaluates and validates
+  every matching object's clause value (a tuple of arity ≥ keypos whose keypos element `eq`s the
+  matched object's key) *and* deep-copies it into table storage; phase two swaps the objects in. Any
+  invalid value aborts the whole call with `badarg` leaving the table unchanged. Returns the count of
+  replaced objects. `bag` ⇒ `badarg`. The C `db_match_keeps_key` check is **static** (it rejects a body
+  that is not syntactically `'$_'`/`{{ … }}`/`{const,{…}}`/`{element,KeyPos,'$_'}` even when nothing
+  matches); this crate validates the *value*, so an exotic multi-expression body diverges (Known
+  Issues).
+- **Match-spec arithmetic routes through the `ArithHook` seam, not a new crate edge.** `expr::eval`'s
+  signature is unchanged (a sibling task owns `exec.rs`); the hook is resolved inside `expr.rs` via a
+  `thread_local! { static ARITH_HOOK: RefCell<Option<Rc<dyn ArithHook>>> }` installed by
+  `set_arith_hook`. `DefaultArithHook` does checked i64 arithmetic (bignum/float/`/`/overflow ⇒ typed
+  `unsupported`, `div`/`rem` by zero ⇒ `badarg`); a real runtime installs a full bignum/float hook.
+  Keeps `beam_ets` (wave 1) free of a `beam_bifs` dependency; candidate to lift into `beam_term` later.
+- **Continuations are opaque owned values, not terms.** `MatchContinuation` carries table id +
+  compiled `MatchSpec` + limit + scan position (`Clone`+`Debug`+`PartialEq`) so `select_continue`
+  resumes from the saved position without re-compiling; `Option::None` is the crate's `'$end_of_table'`,
+  and the bridge renders the bare-atom vs `{Results,'$end_of_table'}` shape (Known Issues).
+- **`match_spec_run` accepts the raw spec.** The oracle requires `ets:match_spec_compile/1` first (a raw
+  clause list is `badarg`); this crate has no compiled-spec term, so `run.rs` compiles the raw term
+  directly — the bridge maps `ets:match_spec_compile/1` onto the compiled `MatchSpec` (Known Issues).
+- **A BODY runtime failure yields the atom `EXIT`; a GUARD failure skips the clause.** The C
+  `erl_db_util.c` sets `FAIL_TERM = am_EXIT` around body evaluation (`matchCatch`), so a raising
+  last-expression body yields `'EXIT'` and evaluation continues, while a guard error means the clause
+  does not match. Verified against `erl` (`[{{'_','_'},[],[{hd,5}]}]` ⇒ `['EXIT','EXIT']`).
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
@@ -351,9 +404,11 @@ impl Table {
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs` (incl.
   `entries_emits_the_oracle_field_set_in_order`), `ets_nav.rs` (incl. the order-independent
   hash-navigation contract), `ets_access.rs`, `ets_update.rs`, `ets_ownership.rs` (the
-  `give_away`/`setopts`/`heir` semantics + the pid-gap rendering), sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 68 ETS tests + 18 select
-  tests.
+  `give_away`/`setopts`/`heir` semantics + the pid-gap rendering), `ets_replace.rs` (the
+  `select_replace` semantics incl. the recorded static-vs-value key-check divergences),
+  `ets_continuation.rs` (the limit/continuation chaining, incl. a live-oracle cross-check),
+  `match_spec_run.rs` (the table-independent runner with oracle cross-checks), sharing helpers from
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec compiler + arithmetic.
 - **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 77 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
@@ -399,10 +454,18 @@ impl Table {
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
 - **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
-  `select/3` + `select_reverse/*`, `match/3`, `match_object/3` (limited), `foldl`/`foldr`,
-  `select_replace/2`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`, `table/1,2`, `slot/2`,
-  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1` do **not** exist in
-  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).
+  `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`,
+  `table/1,2`, `slot/2`, `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1`
+  do **not** exist in OTP 29, so their absence is correct — `ets:info(T, size)` is the supported
+  spelling). The `/3` limited forms are implemented but their opaque **continuation terms** and the
+  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's (see the handoff below).
+- **The `TableAccess` view does not cover the new operations.** `select_replace`, the limited forms
+  and `match_spec_run` are not yet exposed through `src/table/access.rs` (owned by another task), so an
+  access-checked caller cannot reach them.
+- **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
+  requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
+  this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
+  `ets:match_spec_compile/1` onto the compiled `MatchSpec`.
 - **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
   crate holds no global state, so it must not duplicate that registry).
@@ -410,37 +473,22 @@ impl Table {
   refs/sub-bitstrings cannot be copied into table storage (`insert` ⇒ `BadArg`).
 - **The match-spec compiler covers the common guard set**, not the full Erlang guard language
   (`map_get`, `float`/`trunc`/`round`, `list_to_tuple`, comprehensions in bodies, …); anything
-  outside the recognised set is `badarg`.
+  outside the recognised set is `badarg`. Match-spec **arithmetic** is covered by the default
+  `ArithHook` for small integers only: bignum/float operands and `/` (a float result) return a typed
+  `unsupported`; a real runtime installs a full hook via `set_arith_hook`.
+- **`select_replace/2`'s key check is value-based, not the C's static syntactic check.** The oracle
+  (`db_match_keeps_key`) rejects a body that is not syntactically `'$_'`/`{{ … }}`/`{const,{…}}`/
+  `{element,KeyPos,'$_'}` even when nothing matches; this crate accepts any body whose *value* keeps
+  the key, so it diverges on exotic multi-expression bodies (pinned by the `recorded_divergence_*`
+  tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
 
-## Oracle reference: the missing `ets` ops (measured on OTP 29 / erts-17.1)
-Ground-truth observable behavior for the ops this crate does not yet implement, captured from the
-live system `erl` (via `erl -noshell -eval`) so a future implementation need not re-derive it.
-- **`ets:select_replace/2`** — supported on `set`, `ordered_set` **and `duplicate_bag`**; on `bag` it
-  is `badarg` (all three bag cases tested, incl. an identity body). Returns the **count of matched
-  (replaced) objects**. The body value is the replacement object and must be a **tuple** of arity
-  `>= keypos` whose `keypos` element **equals the matched object's original key**; a non-tuple value
-  (`[42]`, `['$1']`), an arity-`0` tuple, or a changed key ⇒ the whole call `badarg` (table
-  unchanged). Body `'$_'` replaces each object with itself and still counts. `{keypos,2}` keys must
-  likewise be preserved; the object may grow/shrink in other positions.
-- **`ets:select/3`, `ets:match/3`, `ets:match_object/3` (+ the `/1` continuations)** — limit `0` ⇒
-  `badarg`; limit `> 0` ⇒ `{Results, Continuation}` where `Continuation` is an **opaque internal
-  term** (a tuple carrying a table ref) while more objects remain, and the atom `'$end_of_table'`
-  once the traversal is complete (also when limit ≥ table size). `ets:select/1` / `match/1` /
-  `match_object/1` take a continuation and return `{Results, NewCont}` or `'$end_of_table'`. Empty
-  table: `/_2` ⇒ `[]`, `/_3` ⇒ `'$end_of_table'`.
-- **`ets:match/2`** compiles the pattern with an implicit body = the pattern's **variables in
-  numeric order** (`['$1','$2',…]`): `match(T,{1,'$1'})` on `{1,10}` ⇒ `[[10]]`,
-  `match(T,{1,10})` ⇒ `[[]]`. `match_object/*` returns whole objects.
-- **`ets:match_spec_run/2`** — runs the compiled spec against each list element in order, keeping the
-  per-element body value for matching elements (order preserved, non-matching dropped); semantically
-  `ets:select/2` on the list (a `set` select's own order is unspecified, so it may differ). The body
-  value is the **last** body element. `'$N'` matches/binds and a repeated head var (`{'$1','$1'}`)
-  enforces equality. In a **head** `'$_'`/`'$$'` are treated as the **literal atom** (never match a
-  non-atom); `'$_'` denotes the whole object **only in the body**, and `'$$'` in the body yields
-  `[WholeObject]`. A body tuple must use the `{{…}}` construction form — a plain tuple in the body is
-  `badarg`.
+## Oracle reference: the remaining missing `ets` ops (measured on OTP 29 / erts-17.1)
+Ground-truth observable behavior for the ops this crate still does not implement, captured from the
+live system `erl` (via `erl -noshell -eval`) so a future implementation need not re-derive it. (The
+oracle behavior of the now-implemented `select_replace`/`select/3`/`match_spec_run` family lives in
+the Design Decisions above and the corresponding `tests/` files.)
 - **`ets:match_spec_test/3`** (and `/2`) **do not exist in OTP 29** (`ets:module_info(exports)` has
   no `match_spec_test`) — the call raises `error:undef`.
 - **`ets:give_away/3`** — `true` on success (the new owner receives `{'ETS-TRANSFER', TabId(Ref),
@@ -469,13 +517,16 @@ live system `erl` (via `erl -noshell -eval`) so a future implementation need not
 - `src/ordered_interior/iter.rs` → leaf-chain ordered iterator
 - `src/select/mod.rs` → `MatchSpec`/`MatchClause`/`SelectPredicate` + `compile`
 - `src/select/pattern.rs` → head patterns (`Pattern`)
-- `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`)
-- `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`) + `BodyKind`
+- `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`) + arithmetic (`ArithOp`/`ArithHook`/`DefaultArithHook`/`set_arith_hook`)
+- `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`/`select_replace`) + `BodyKind`
+- `src/select/run.rs` → table-independent `match_spec_run` (`ets:match_spec_run/2`)
+- `src/select/continuation.rs` → `MatchContinuation` + the limit/continuation forms (`select_limit`/`select_continue`/`match_limit`/`match_continue`/`match_object_limit`/`match_object_continue`)
 - `src/info.rs` → `TableInfo` + `entries` (the 15-field `ets:info` pairs, oracle order)
 - `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
-- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update)
-- `tests/select.rs` → the match-spec compiler integration tests
+- `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update/replace/continuation)
+- `tests/select.rs` → the match-spec compiler + arithmetic integration tests
+- `tests/match_spec_run.rs` → the table-independent `ets:match_spec_run/2` runner tests
 - `tests/differential.rs` + `tests/differential/{battery/*,erl_program.rs}` → the differential evidence suite vs the system `erl`
 - `../../erts/emulator/beam/erl_db.c` → the API + trap-loop semantics being mirrored (read-only)
 - `../../erts/emulator/beam/erl_db_hash.c` / `erl_db_tree.c` / `erl_db_util.c` → the interiors + key/match handling being mirrored (read-only)
