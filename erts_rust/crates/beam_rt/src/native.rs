@@ -17,13 +17,16 @@
 //! | `init:get_arguments/0` | the whole command line, in order, from `RuntimeConfig::init_args` |
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
+//! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
 //!
-//! The `init`/`code` calls are **preloaded-module surface** (contract A.7): the oracle
-//! serves them from `init.beam`/`code.beam`, but those modules are written against the
-//! process/message machinery Milestone-1 does not run, so this runtime answers them
-//! directly from its own state instead of loading a module it cannot execute. `os:cmd/1`
-//! is the same story for the spawn **driver** (contract A.4): the port machinery is a
-//! later stage, but the host is perfectly able to spawn a shell.
+//! The `init`/`code`/`application` calls are **preloaded-module surface** (contract
+//! A.7): the oracle serves them from `init.beam`/`code.beam`/`application.beam`, but
+//! those modules are written against the process/message machinery Milestone-1 does not
+//! run (for `application`, that is the `application_controller`/`application_master`
+//! process pair plus a group leader), so this runtime answers them directly from its own
+//! state instead of loading a module it cannot execute. `os:cmd/1` is the same story for
+//! the spawn **driver** (contract A.4): the port machinery is a later stage, but the host
+//! is perfectly able to spawn a shell.
 //!
 //! Every entry returns `Option<Result<Eterm>>`: `None` means "not a native BIF, fall
 //! through to the `beam_bifs` registry", `Some(result)` is the answer (which may be an
@@ -41,10 +44,12 @@
 //! # Module layout
 //!
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
-//! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`] and the
-//! `erlang:*` process/registry/reference entries in [`process`]. The submodules reach the
-//! shared helpers through `super` (they are `pub(super)`).
+//! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
+//! `erlang:*` process/registry/reference entries in [`process`] and the `application:*`
+//! entries in [`application`]. The submodules reach the shared helpers through `super`
+//! (they are `pub(super)`).
 
+mod application;
 mod code;
 mod init;
 mod process;
@@ -97,6 +102,17 @@ impl RuntimeContext<'_> {
             ("code", "lib_dir", 0) => Some(self.code_lib_dir_0()),
             ("code", "lib_dir", 1) => Some(self.code_lib_dir_1(args)),
             ("code", "root_dir", 0) => Some(self.code_root_dir()),
+            ("application", "get_env", 1) => Some(self.application_get_env_1()),
+            ("application", "get_env", 2) => Some(self.application_get_env_2(args)),
+            ("application", "get_env", 3) => Some(self.application_get_env_3(args)),
+            ("application", "get_all_env", 1) => Some(self.application_get_all_env_1(args)),
+            ("application", "get_key", 2) => Some(self.application_get_key_2(args)),
+            ("application", "loaded_applications", 0) => {
+                Some(self.application_loaded_applications())
+            }
+            ("application", "which_applications", 0) => {
+                Some(self.application_which_applications())
+            }
             ("erlang", "make_ref", 0) => Some(self.make_ref_0()),
             ("erlang", "monitor", 2) => Some(self.monitor_2(args)),
             ("erlang", "demonitor", 1) => Some(self.demonitor_1(args)),
