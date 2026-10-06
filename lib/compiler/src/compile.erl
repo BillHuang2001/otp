@@ -3252,8 +3252,13 @@ diffable_label_map([], _New, Map, Acc) ->
 -doc false.
 -spec options() -> 'ok'.
 options() ->
-    help(standard_passes()).
-
+    help(standard_passes()),
+    %% These opt-in SSA optimizations are consumed inside beam_ssa_opt
+    %% and are therefore not visible to help/1 through standard_passes/0.
+    %% List them explicitly so that they show up in --help.
+    help([{iff,loop_opt,  {ssa_opt_loop_opt,fun(_) -> ok end}},
+          {iff,fusion_opt,{ssa_opt_fus,     fun(_) -> ok end}},
+          {iff,fbip_opt,  {ssa_opt_fbip,    fun(_) -> ok end}}]).
 help([{delay,Ps}|T]) ->
     help(Ps),
     help(T);
