@@ -389,10 +389,18 @@ impl Table {
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
 - **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
-  `select/3` + `select_reverse/*`, `match/3`, `match_object/3` (limited), `foldl`/`foldr`,
-  `select_replace/2`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`, `table/1,2`, `slot/2`,
-  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1` do **not** exist in
-  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).
+  `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`,
+  `table/1,2`, `slot/2`, `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1`
+  do **not** exist in OTP 29, so their absence is correct — `ets:info(T, size)` is the supported
+  spelling). The `/3` limited forms are implemented but their opaque **continuation terms** and the
+  bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's (see the handoff below).
+- **The `TableAccess` view does not cover the new operations.** `select_replace`, the limited forms
+  and `match_spec_run` are not yet exposed through `src/table/access.rs` (owned by another task), so an
+  access-checked caller cannot reach them.
+- **`match_spec_run` accepts a RAW spec, unlike the oracle.** The oracle's `ets:match_spec_run/2`
+  requires a spec already compiled by `ets:match_spec_compile/1` (a raw clause list is `badarg`);
+  this crate has no compiled-spec *term*, so `run.rs` compiles the raw spec and the bridge must map
+  `ets:match_spec_compile/1` onto the compiled `MatchSpec`.
 - **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
   crate holds no global state, so it must not duplicate that registry).
