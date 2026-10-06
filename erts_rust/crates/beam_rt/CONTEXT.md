@@ -566,6 +566,7 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   form is a `{Port, …}` message), and a child that exits on its own is not reaped until `port_close/1`
   or runtime exit. `os:cmd/1` remains the runtime-native host spawn, unchanged.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
+* **No memory introspection.** The runtime exposes **no** way to observe allocated memory: `erlang:memory/0,1`, `erlang:process_info/1,2` and `erlang:statistics/1` are **not** registered BIFs (`beam_bifs` raises `… is not a BIF`, exit 1) and none of the twelve `system_info/1` keys reports memory (`SUPPORTED_KEYS`). The registered `ets:info(T, memory)` is the only memory number available.
 
 ## Routing Table
 * `src/lib.rs` → crate docs, `#![deny(unsafe_code)]`, module wiring, root re-exports, `prelude`
