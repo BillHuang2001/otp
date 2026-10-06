@@ -96,10 +96,11 @@
 //!   Milestone-1 does not build, so it is `badarg` (`maybe_binary_match_compile`
 //!   rejects anything that is not a valid compiled pattern the same way).
 //!   `referenced_byte_size/1` is likewise not registered.
-//! * **No bignums.** `decode_unsigned` of a value that leaves the 60-bit small
-//!   range reports [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit)
-//!   where real Erlang builds a bignum; `encode_unsigned` of a bignum is `badarg`
-//!   (Milestone-1 cannot hold one — see `../beam_term/CONTEXT.md`).
+//! * **`decode_unsigned`/`encode_unsigned` span the full integer range.**
+//!   `decode_unsigned` accepts any width and promotes a value past the 60-bit
+//!   small range to a bignum (the oracle's behaviour); `encode_unsigned` accepts a
+//!   bignum and emits its minimal byte image. Only a magnitude beyond the bignum
+//!   limb bound is `system_limit`.
 //! * **Sub-binaries are copied, not referenced.** `erts_binary_part` returns a
 //!   `SUB_BITS` sharing the source; Milestone-1 has no off-heap `BinRef`, so
 //!   every result is a fresh on-heap binary (`crate::bits::make_binary`).
@@ -117,6 +118,7 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
 use crate::access;
+use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, system_limit};
@@ -748,6 +750,12 @@ fn decode_unsigned_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
 
 /// `do_decode_unsigned`: the big/little-endian unsigned value, with the leading
 /// (respectively trailing) zero bytes stripped; an empty result is `0`.
+///
+/// The magnitude is assembled straight from the bytes (big-endian: fold the bytes
+/// most-significant first into little-endian limbs; little-endian: the same, byte
+/// order reversed), so *any* width is accepted and a value past the 60-bit small
+/// range becomes the bignum the oracle builds (`<<255 × 8>>` ⇒
+/// `18446744073709551615`, `<<1,0 × 8>>` ⇒ `18446744073709551616`).
 fn decode_unsigned(ctx: &mut BifContext<'_>, subject: Eterm, endian: Endian) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
     let mut significant: &[u8] = &bytes;
@@ -767,25 +775,23 @@ fn decode_unsigned(ctx: &mut BifContext<'_>, subject: Eterm, endian: Endian) -> 
     if significant.is_empty() {
         return ctx.int(0);
     }
-    // `sizeof(Uint)` is 8 on the supported targets; beyond that the oracle builds
-    // a bignum, which Milestone-1 cannot hold.
-    if significant.len() > 8 {
-        return Err(system_limit());
-    }
-    let mut value: u64 = 0;
+    let mut magnitude = vec![0u64; significant.len().div_ceil(8)];
     match endian {
+        // Most significant byte first: the byte `i` from the end is the `i`-th
+        // least-significant byte of the magnitude.
         Endian::Big => {
-            for &byte in significant {
-                value = (value << 8) | u64::from(byte);
+            for (i, &byte) in significant.iter().rev().enumerate() {
+                magnitude[i / 8] |= u64::from(byte) << (8 * (i % 8));
             }
         }
+        // Least significant byte first: byte `i` is the `i`-th least-significant.
         Endian::Little => {
-            for &byte in significant.iter().rev() {
-                value = (value << 8) | u64::from(byte);
+            for (i, &byte) in significant.iter().enumerate() {
+                magnitude[i / 8] |= u64::from(byte) << (8 * (i % 8));
             }
         }
     }
-    ctx.int(i64::try_from(value).map_err(|_| system_limit())?)
+    arith::int_from_mag(ctx, false, &magnitude)
 }
 
 /// `encode_unsigned(Integer)`.
@@ -801,23 +807,48 @@ fn encode_unsigned_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> 
 
 /// `do_encode_unsigned`: the minimal big/little-endian bytes of a non-negative
 /// integer (`0` ⇒ `<<0>>`).
+///
+/// A **bignum** is accepted (its limbs are read with
+/// [`beam_codec::term::big_parts`]) and emits its minimal byte image exactly as
+/// the oracle does (`encode_unsigned(18446744073709551616)` ⇒
+/// `<<1,0,0,0,0,0,0,0,0>>`). A negative value, a float and any other non-integer
+/// are `badarg`.
 fn encode_unsigned(ctx: &mut BifContext<'_>, value: Eterm, endian: Endian) -> Result<Eterm> {
-    // A bignum is the documented gap; anything that is not a non-negative small
-    // integer is `badarg`.
-    if !access::is_small(value) {
+    let big_endian: Vec<u8> = if access::is_small(value) {
+        let signed = signed_value(value);
+        if signed < 0 {
+            return Err(badarg());
+        }
+        let unsigned = signed as u64;
+        let width = byte_width(unsigned);
+        unsigned.to_be_bytes()[8 - width..].to_vec()
+    } else if access::is_big(value) {
+        let (negative, digits) = codec_term::big_parts(value)?;
+        if negative {
+            return Err(badarg());
+        }
+        // Least significant limb first: walk them in reverse for big-endian bytes.
+        let mut bytes = Vec::with_capacity(digits.len() * 8);
+        for limb in digits.iter().rev() {
+            bytes.extend_from_slice(&limb.to_be_bytes());
+        }
+        let skip = bytes.iter().position(|&b| b != 0).unwrap_or(bytes.len());
+        let bytes = bytes[skip..].to_vec();
+        if bytes.is_empty() {
+            return Err(badarg());
+        }
+        bytes
+    } else {
         return Err(badarg());
-    }
-    let signed = signed_value(value);
-    if signed < 0 {
-        return Err(badarg());
-    }
-    let value = signed as u64;
-    let width = byte_width(value);
-    let mut out = vec![0u8; width];
-    match endian {
-        Endian::Big => out.copy_from_slice(&value.to_be_bytes()[8 - width..]),
-        Endian::Little => out.copy_from_slice(&value.to_le_bytes()[..width]),
-    }
+    };
+    let out = match endian {
+        Endian::Big => big_endian,
+        Endian::Little => {
+            let mut little = big_endian;
+            little.reverse();
+            little
+        }
+    };
     bits::make_binary(ctx.heap(), &out)
 }
 

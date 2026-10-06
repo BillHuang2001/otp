@@ -35,16 +35,19 @@
 //! * `timestamp/0` splits `system_time/0` into `{MegaSecs, Secs, MicroSecs}`
 //!   exactly as `make_timestamp_value` does (`erl_time_sup.c:1907`).
 //!
-//! # The 60-bit small-integer limit (documented M1 gap)
+//! # Past the 60-bit small-integer range
 //!
-//! `beam_term` has no bignums, so a value outside the 60-bit small-integer range
-//! is reported as [`BeamError::SystemLimit`], never truncated. Real ERTS returns a
-//! *bignum* for the native-nanosecond `system_time/0`, `time_offset/0`,
-//! `system_time(nanosecond)` and `system_time(native)`: a nanosecond count since
-//! 1970 has exceeded the 60-bit range since 1988, so those four forms report
-//! `system_limit` in M1. The coarser units (`second`/`millisecond`/`microsecond`)
-//! and **every** `monotonic_time/1` form (a process-relative, hence small, value)
-//! work normally. This is a typed error, never a silently wrong result.
+//! A native-nanosecond count since 1970 has exceeded the 60-bit small-integer
+//! range (`2^59 - 1` ≈ 5.76·10^17 ns, i.e. 1988) for decades, so `system_time/0`,
+//! `system_time(nanosecond)`, `system_time(native)` and both `time_offset` forms
+//! return a **bignum**, exactly as real ERTS does — the value is materialized by
+//! [`crate::arith::int_from_i64`], which folds a value that fits back into a small
+//! integer and promotes otherwise. The coarser units
+//! (`second`/`millisecond`/`microsecond`) stay small in practice, and
+//! `monotonic_time/1` is a process-relative, hence small, value.
+//!
+//! [`BeamError::SystemLimit`] remains only for a clock before 1970 or a
+//! nanosecond count past `i64` (year ~2262) — never a truncated value.
 //!
 //! # `unique_integer`
 //!
@@ -70,6 +73,7 @@ use beam_common::{BeamError, Result};
 use beam_term::{atom_val, Eterm};
 
 use crate::access::is_atom;
+use crate::arith;
 use crate::context::BifContext;
 use crate::error::badarg;
 use crate::print::proper_list;
@@ -158,37 +162,37 @@ fn system_native() -> Result<i64> {
 
 /// `erlang:monotonic_time/0`.
 fn monotonic_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    ctx.int(monotonic_native())
+    arith::int_from_i64(ctx, monotonic_native())
 }
 
 /// `erlang:monotonic_time/1`.
 fn monotonic_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
-    ctx.int(convert_native(monotonic_native(), unit))
+    arith::int_from_i64(ctx, convert_native(monotonic_native(), unit))
 }
 
 /// `erlang:system_time/0`.
 fn system_time_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
-    ctx.int(system_native()?)
+    arith::int_from_i64(ctx, system_native()?)
 }
 
 /// `erlang:system_time/1`.
 fn system_time_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
-    ctx.int(convert_native(system_native()?, unit))
+    arith::int_from_i64(ctx, convert_native(system_native()?, unit))
 }
 
 /// `erlang:time_offset/0` — `system_time - monotonic_time` in native units.
 fn time_offset_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     let offset = system_native()? - monotonic_native();
-    ctx.int(offset)
+    arith::int_from_i64(ctx, offset)
 }
 
 /// `erlang:time_offset/1` — the `system_time - monotonic_time` offset, in `unit`.
 fn time_offset_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let unit = time_unit(ctx, args[0])?;
     let offset = system_native()? - monotonic_native();
-    ctx.int(convert_native(offset, unit))
+    arith::int_from_i64(ctx, convert_native(offset, unit))
 }
 
 /// `erlang:timestamp/0` — `{MegaSecs, Secs, MicroSecs}`, from `system_time/0`
@@ -411,22 +415,43 @@ mod tests {
     }
 
     #[test]
-    fn native_nanosecond_values_beyond_the_small_range_are_system_limit() {
+    fn native_nanosecond_values_promote_to_a_bignum() {
         let mut heap = heap();
         let atoms = seeded_atoms();
         let mut ctx = context(&mut heap, &atoms);
 
         // An epoch-nanosecond value exceeds the 60-bit small range for any date
-        // after 1988, so `system_time/0` (and `time_offset/0`) report
-        // `system_limit` — a typed error, never a truncated value.
-        match system_time_0(&mut ctx, &[]) {
-            Ok(term) => {
-                // Only reachable with a clock set before 1988.
-                assert!(crate::access::is_small(term));
-            }
-            Err(BeamError::SystemLimit) => {}
-            other => panic!("unexpected: {other:?}"),
-        }
+        // after 1988, so `system_time/0` (and `time_offset/0`) promote to a
+        // *bignum*, exactly as the oracle does — never a truncated value and never
+        // `system_limit`.
+        let term = system_time_0(&mut ctx, &[]).expect("system_time/0");
+        assert!(
+            !crate::access::is_small(term),
+            "a post-1988 epoch-nanosecond count must be a bignum"
+        );
+        let (negative, digits) = beam_codec::term::big_parts(term).expect("a bignum");
+        assert!(!negative, "system_time/0 must not be negative");
+        assert!(!digits.is_empty(), "a bignum has at least one limb");
+
+        // Its magnitude is a plausible epoch nanoseconds value (2020..2100).
+        let value = crate::arith::integer_to_f64(term).expect("round-trips to f64");
+        assert!(
+            (1_577_836_800_000_000_000.0..4_102_444_800_000_000_000.0).contains(&value),
+            "system_time/0 = {value} is not a plausible epoch value"
+        );
+
+        // `time_offset/0` is `system_time - monotonic_time`, so it is the same
+        // scale and likewise a bignum.
+        let offset = time_offset_0(&mut ctx, &[]).expect("time_offset/0");
+        assert!(
+            !crate::access::is_small(offset),
+            "time_offset/0 must be a bignum too"
+        );
+        let offset_value = crate::arith::integer_to_f64(offset).expect("round-trips to f64");
+        assert!(
+            (offset_value - value).abs() < 1.0e18,
+            "time_offset/0 = {offset_value} is not within a process-lifetime of {value}"
+        );
     }
 
     #[test]
