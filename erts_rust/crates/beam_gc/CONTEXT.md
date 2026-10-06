@@ -371,7 +371,7 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
 - `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`
 - `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
-- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
+- `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` — the slot-indexed off-heap list (`push`/`insert`/`get`/`iter`/`sweep`) over off-heap refcounted large objects **and** refc binaries
 - `src/stats.rs` → `GcStats`
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
