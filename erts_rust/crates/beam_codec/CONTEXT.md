@@ -459,10 +459,11 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   (boundary integers, nested/improper lists, tuples of every arity boundary, every atom tag, floats
   incl. ±0/±inf/NaN bit patterns, maps of 0/1/32 pairs, pids/ports/refs, bignums of 1/8/9/16/32/...
   `ErtsDigit`s), plus negative cases (truncation at every offset, bad tag, over-long atom, `LARGE_BIG`
-  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes). The `COMPRESSED` section round-trips a small
-  and a large compressible term through `encode_term_compressed`/`encode_term_body_compressed` →
-  `decode_term` at every level, and covers the negative cases (short header, lying size, corrupt
-  trailer, non-zlib payload, non-term inner body, truncation at every offset).
+  byte count beyond `BIG_ARITY_MAX * 8`, trailing bytes). The `COMPRESSED` section pins the shrink
+  rule (a small term reverts to the plain image at every level; a large compressible term emits the
+  wrapper) and round-trips both forms through `decode_term`, plus the negative cases (short header,
+  lying size, corrupt trailer, non-zlib payload, non-term inner body, truncation at every offset). It
+  also pins the oracle fun blobs (`EXPORT_EXT` and the `fun() -> ok end` `erl_eval` `NEW_FUN_EXT`).
 - `tests/ground_truth.rs` — **byte-exact ground-truth vectors** produced by the system oracle
   (OTP 29.1.1 / erts-17.1 on `PATH`). Regenerate with:
   `erl -noshell -eval 'io:format("~w~n", [term_to_binary(T)])' -s init stop` — one term per vector;
