@@ -155,8 +155,9 @@ impl ExecutionContext for RuntimeContext<'_> {
     //             module == "erlang" → `error::is_known_unimplemented_bif` ? `unsupported:` :
     //             `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
-    // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
-    //             `eval::apply_eval_closure`; otherwise resolve the fun's module
+    // apply_fun → an **external** fun (`fun M:F/A`, `EXPORT_EXT`) dispatches its module/function/arity
+    //             through `call_bif`; an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`)
+    //             goes to `eval::apply_eval_closure`; otherwise resolve the fun's module
     //             (`terms::is_fun/fun_uniq/fun_index/fun_free` + a matching
     //             `FunDescriptor { uniq, index }`) across `code_server.modules()`, then
     //             `Machine::new().run_label(...)`.
