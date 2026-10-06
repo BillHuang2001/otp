@@ -26,10 +26,10 @@
 //!   `ports/0` raise a plain Erlang reason that would be an observation, i.e. a mismatch,
 //!   while the encoder path that *is* reachable — `term_to_binary(self())` — is a clean
 //!   capability gap; see the crate report);
-//! * funs — `EXPORT_EXT` (113) (both its encode-side `unsupported` case and its
-//!   decode → re-encode round-trip) and `NEW_FUN_EXT` (112);
-//! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option, and
-//!   `{minor_version, 2}`;
+//! * funs/records — `EXPORT_EXT` (113) (encode and decode → re-encode round-trip),
+//!   `NEW_FUN_EXT` (112), and the nominal-record `RECORD_EXT` (67) (decode → re-encode);
+//! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option (both
+//!   directions), and `{minor_version, 0|1|2}`;
 //! * `ATOM_CACHE_REF` (82) — a blob carrying one is decoded with **no** atom-cache context,
 //!   which both runtimes refuse identically.
 //!
@@ -38,16 +38,17 @@
 //! `DFLAG_*` protocol), so they remain an honest, documented gap rather than a fabricated
 //! case.
 //!
-//! ## Honest capability gaps (documented here, not asserted as cases)
+//! ## Honest capability gaps (pinned as `unsupported`, never a mismatch)
 //!
-//! * The `compressed` (80) **encode** option and the free-standing encode of an
-//!   `EXPORT_EXT` (113) / `NEW_FUN_EXT` (112) fun are the Rust runtime's remaining A.5
-//!   *encode*-side gaps; the four `wire/*_encode*` cases pinning them report
-//!   `unsupported` (`beam_rt: unsupported: bif` / `unsupported: local_fun`), never a
-//!   mismatch.
-//! * Decoding a `compressed` (80) blob is not a case: the oracle decompresses while the
-//!   Rust runtime raises a plain `badarg` (an observation, i.e. a mismatch), so it is
-//!   reported rather than encoded as a case.
+//! * The free-standing encode of a `NEW_FUN_EXT` (112) fun is the Rust runtime's remaining
+//!   A.5 *encode*-side gap; `wire/new_fun_ext_encode` pins it as `unsupported` (`beam_rt:
+//!   unsupported: local_fun`), never a mismatch.
+//! * `term_to_binary/2` with `{minor_version, 0|1}` still needs the *legacy* `ATOM_EXT`
+//!   (100) / `FLOAT_EXT` (99) forms the Rust runtime's encoder does not produce, so the
+//!   `wire/minor_version_*_legacy_encode` cases that reach those tags report `unsupported`
+//!   (their goldens are the oracle's own bytes, so each flips to `agree` once the legacy
+//!   form lands). Decoding a `compressed` (80) blob **is** covered — by the
+//!   `wire/compressed_decode_*` cases.
 //! * `FUN_EXT` (115) is deliberately not a case: the reference decoder does not validate it
 //!   (even a truncated blob decodes to the empty atom `''`), so any golden would pin an
 //!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is
@@ -861,5 +862,138 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- `{minor_version, _}`: the wire dialect of the encode ---------------------
+        // `N < 2` needs the *legacy* `ATOM_EXT` (100) / `FLOAT_EXT` (99) forms the Rust
+        // encoder does not emit, so those cases are honest `unsupported` capability gaps (their
+        // goldens are the oracle's own bytes, so each flips to `agree` once the form lands).
+        Case {
+            id: "wire/minor_version_0_atom_legacy_encode",
+            description: "term_to_binary/2 with {minor_version,0} encodes an atom as the legacy ATOM_EXT (100)",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(hello, [{minor_version, 0}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,9,131,100,0,5,104,101,108,108,111>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/minor_version_1_atom_legacy_encode",
+            description: "term_to_binary/2 with {minor_version,1} still encodes an atom as the legacy ATOM_EXT (100)",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(hello, [{minor_version, 1}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,9,131,100,0,5,104,101,108,108,111>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/minor_version_0_float_legacy_encode",
+            description: "term_to_binary/2 with {minor_version,0} encodes a float as the legacy ASCII FLOAT_EXT (99)",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(1.5, [{minor_version, 0}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,109,0,0,0,33,131,99,49,46,53,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,48,101,43,48,48,0,0,0,0,0>>",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/minor_version_1_float_encode",
+            description: "term_to_binary/2 with {minor_version,1} encodes a float as NEW_FLOAT_EXT (70)",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(1.5, [{minor_version, 1}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,10,131,70,63,248,0,0,0,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        // -- `compressed` (80) DECODE -------------------------------------------------
+        Case {
+            id: "wire/compressed_decode_roundtrip_large",
+            description: "a large term round-trips through term_to_binary/2 with the compressed option and binary_to_term/1",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(lists:seq(1,1000), [compressed])) =:= lists:seq(1,1000)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/compressed_decode_trailing_bytes_ignored",
+            description: "a fixed COMPRESSED (80) blob whose inflated body carries trailing bytes after a complete term decodes to that term",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                // Compressed body = version-magic-stripped external {ok,42} ++ <<1,2,3,4,5>>.
+                expr: "binary_to_term(<<131,80,0,0,0,13,120,156,203,96,42,103,202,207,78,212,98,100,98,102,97,5,0,21,163,2,88>>)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,104,2,119,2,111,107,97,42>>"),
+                exit_code: 0,
+            },
+        },
+        // -- RECORD_EXT (67): the nominal-record instance form ------------------------
+        Case {
+            id: "wire/record_ext_roundtrip",
+            description: "a fixed RECORD_EXT (67) blob decodes to the record instance and re-encodes to identical bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(binary_to_term(<<131,67,0,0,0,2,0,119,5,109,121,109,111,100,119,6,112,101,114,115,111,110,119,4,110,97,109,101,119,3,97,103,101,119,3,106,111,101,97,21>>))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok <<131,109,0,0,0,40,131,67,0,0,0,2,0,119,5,109,121,109,111,100,119,6,112,101,114,115,111,110,119,4,110,97,109,101,119,3,97,103,101,119,3,106,111,101,97,21>>",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group;
+    use crate::corpus::Contract;
+
+    #[test]
+    fn new_wire_cases_are_registered_under_the_distribution_contract() {
+        let cases = group();
+        for id in [
+            "wire/minor_version_0_atom_legacy_encode",
+            "wire/minor_version_1_atom_legacy_encode",
+            "wire/minor_version_0_float_legacy_encode",
+            "wire/minor_version_1_float_encode",
+            "wire/compressed_decode_roundtrip_large",
+            "wire/compressed_decode_trailing_bytes_ignored",
+            "wire/record_ext_roundtrip",
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::Distribution], "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+        }
+    }
 }
