@@ -453,13 +453,14 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
 - **The `tcp_inet` driver is a floor.** The async-op queue, per-op `driver_set_timer` timeouts, the second-port
   `accept`, IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` modes and DNS are absent; `recv` rejects a timeout/length
   argument with `BadArg`. The verbs it does cover match the C's reply shapes (oracle-cross-checked).
-- **`src/port.rs` is ~1430 lines, ~590 of which are its in-module test suite** (source ≈ 845 lines, under the
-  ~1000 baseline). A future split by responsibility (move `PortRegistry` + reactor glue to `registry.rs`, keeping
-  `Port` in `port.rs`) is reasonable; the file is long only because the tests are comprehensive in-place.
-- **`src/drivers/spawn.rs` is 996 lines, ~275 of which are its in-module test suite** (source ≈ 720 lines, still
-  under the ~1000 baseline). It holds the whole OS-child driver plus the term-free spec/`build_command`; if it
-  grows, split the spec (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/`build_command`) into a sibling module and keep
-  the driver in `spawn.rs`.
+- **File sizes (source vs. in-module tests).** `src/port.rs` is 610 lines of source (the `Port` endpoint + its
+  `PortRegistry` re-export; no in-module tests) and `src/registry.rs` is 1080 (≈490 source + ≈590 tests) — both
+  sources are under the ~1000 baseline. `src/drivers/inet/mod.rs` is ≈991 source with its wire vocabulary in
+  `src/drivers/inet/wire.rs` (182). `src/drivers/spawn.rs` is 1071 (≈793 source + ≈278 tests) — over 1000 only
+  because of its in-module suite; if it grows, split the term-free spec (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/
+  `build_command`) into a sibling module and keep the driver in `spawn.rs`. The `tcp_inet` raw socket-syscall helpers
+  (`socket_fd`/`accept_socket`/`has_peer`/`local_port`/`is_listening`/`socket_error`/`shutdown_socket`/`close_fd`)
+  could move to a third inet sibling if that file grows past baseline.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
