@@ -282,6 +282,30 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   without a heap and keeps the materialization in one place.
 * **`main.rs` is a thin shim** over `cli::run(argv)`; all logic lives in the library so it is unit- and
   integration-testable.
+* **The `FunCaller` seam (`FunBridge`).** `beam_bifs` applies a user fun through `BifContext::call_fun`
+  (default: `unsupported_bif`, i.e. every `fun`-taking `lists:*`/`maps:*` BIF raises until a caller is
+  installed); `beam_rt` installs a `FunBridge` there. A `FunCaller` needs `&mut Runtime` while
+  `BifContext` still borrows runtime state — two `&mut` on one value is impossible — so **every**
+  `BifContext` resource is made a non-runtime-borrowing clone: `Rc<BifRegistry>`, an `Rc<AtomTable>`
+  atom handle (`CodeServer::atoms_handle`, copy-on-write on intern), an `Rc<RefCell<TableRegistry>>`,
+  a **pooled** `beam_alloc::Heap` (`take_bif_heap`/`put_bif_heap`, stack discipline — a nested call
+  takes a fresh heap) and the disjoint `output` field. That leaves `FunBridge` as the only
+  `&mut Runtime` borrow in `call_registered`. `FunBridge::call_fun` delegates to the **existing**
+  `RuntimeContext::apply_fun` (an `-eval` closure via `eval::apply_eval_closure`, a `.beam` fun via the
+  engine's `Machine::run_label`) — the evaluator is never re-implemented. This is what makes
+  `lists:map(fun(X) -> X*X end, [1,2,3])` → `[1,4,9]`, including a loaded module applying an `-eval`
+  fun (`eval::tests::a_loaded_module_applies_an_eval_closure`).
+* **Atom-table sharing is by handle (`Rc<AtomTable>`), interned copy-on-write.** `CodeServer` owns the
+  table in an `Rc`; `atoms_mut` is `Rc::make_mut` and `atoms_handle` a cheap `Rc` clone. A `BifContext`
+  can therefore name atoms without borrowing the runtime, and a commit after a BIF call that grew the
+  table clones it (COW) while preserving **every** existing index — safe because interning is
+  append-only and single-threaded.
+* **`nif_error` raises the live reason term.** `beam_bifs`' `erlang:nif_error/1,2` build a `Structured`
+  reason that carries no `Eterm`, which would print a generic placeholder. `src/eval/mod.rs` therefore
+  intercepts `nif_error/1,2` and raises `Flow::Raise { class: Error, reason: <the argument term> }`, so
+  the **exact** term survives (`nif_error(foo)` → `exception error foo`;
+  `nif_error({nif_not_loaded,m,f,0})` → the exact tuple) and the raise stays catchable. The same
+  term-carrying `Flow::Raise` path is used for `error`/`exit`/`throw` with a live reason.
 
 ## Test Strategy
 * **Unit tests** (`#[cfg(test)]` per module): CLI parsing (every supported switch + `init_args`
