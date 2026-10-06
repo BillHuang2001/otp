@@ -393,6 +393,7 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
+- `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
 - `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
