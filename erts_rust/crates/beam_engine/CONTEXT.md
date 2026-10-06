@@ -315,7 +315,7 @@ These are the remaining execution gaps the standard compiler emits for real OTP 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude` (`unsafe` allowances for `predicates`, `terms`, `families/bitstrings/raw`)
 - `src/context.rs` → the `ExecutionContext` seam trait + `BifHook`/`ApplyHook` + `MinimalContext` (BIF/apply hooks, unbounded heap, pointer-stable arena)
-- `src/machine.rs` → `Machine`: x-register file, FR file, Erlang stack, call frames, catch-frame stack, `run_export`/`run_label`, `Continuation`/`Frame`/`CatchFrame`, `resumption_addresses`, the `throw`/unwind/landing scaffolding
+- `src/machine.rs` → `Machine`: x-register file, FR file, Erlang stack, call frames, catch-frame stack, `run_export`/`run_label`, `Continuation`/`Frame`/`CatchFrame`, `resumption_addresses`, the `throw`/unwind/landing scaffolding, and the `refc_binaries` arena (`alloc_refc_binary`, never cleared by `reset`) backing off-heap bitstrings
 - `src/interpreter.rs` → the dispatch loop (`impl Machine`): one arm per core `Instr` variant (incl. the `NifStart`/`OnLoad` no-op markers), the module-wide label map, `eval_test` (every `TestKind`), `raise_bif_error`, the `crate::generic::exec` route for `Instr::Generic`, and the `families::dispatch` route
 - `src/generic.rs` → the residual `Instr::Generic` opcodes the loader does not model: `exec` (dispatches) and `exec_is_any_native_record` (the one Generic opcode the compiler emits); everything else keeps `error::unsupported(op.name())`
 - `src/step.rs` → the `Step` control-flow protocol (`Next`/`Goto`/`Done`)
