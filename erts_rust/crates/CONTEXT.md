@@ -242,11 +242,6 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   by `beam_gc`.
 
 ## Known Structural Debt (candidates for the next pass)
-- **Sibling `../tools/differential` has a stale assertion** (outside this node): its
-  `tests/cli.rs::the_suite_reports_module_agreement_and_expression_capability_gaps` still requires the
-  expression corpus to have a capability gap (`unsupported + skipped >= 1`). Now that the gate is
-  fully agreeing (197/197), that assertion is the single whole-workspace test failure. Relax/drop it in
-  the `../tools/` node (sibling — escalate).
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
   `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
   (Prevent-Duplication).
