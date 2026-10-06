@@ -470,11 +470,11 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
-- **`beam_codec` can now reproduce a map image byte-for-byte.** It currently returns a typed
-  `unsupported` for >32-key (HAMT) maps because it has no way to read the order the map stores its
-  pairs in; `map::map_pairs_storage_order` provides exactly that (flat map ⇒ keys-tuple order, hash
-  map ⇒ HAMT slot traversal order), so a `beam_codec` serializer can emit an existing map's image
-  without re-sorting it. Owner: `beam_codec` (outside this node).
+- **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
+  `unsupported` for >32-key (HAMT) maps because it cannot read the order the map stores its pairs in;
+  `map::map_pairs_storage_order` supplies exactly that (flat map ⇒ keys-tuple order, hash map ⇒ HAMT
+  slot traversal order), so a serializer can emit an existing map's image without re-sorting it.
+  Owner: `beam_codec` (outside this node).
 - **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
   `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
   `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a
