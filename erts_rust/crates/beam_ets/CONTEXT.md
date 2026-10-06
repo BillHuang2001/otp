@@ -158,7 +158,7 @@ impl Table {
   `insert_new`, `delete`, `delete_object`, `delete_all_objects`, `take -> Result<Vec<Eterm>>`,
   `update_counter`, `update_counter_with`, `update_element`, `select_delete`, `match_delete`; and
   read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
-  `lookup_element_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
+  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
   -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
   `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
   wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
