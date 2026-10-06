@@ -384,11 +384,10 @@ impl Machine {
                 Continuation::Halt => Ok(Step::Done),
                 Continuation::Address { func, pc } => Ok(Step::Goto { func, pc }),
             },
-            // An opcode the loader has no typed IR variant for: a small residual
-            // set is executed by [`crate::generic`] (currently only
-            // `is_any_native_record`); everything else stays the documented
-            // `unsupported(op.name())` typed error.
-            Instr::Generic { op, operands, .. } => crate::generic::exec(self, labels, *op, operands, ctx),
+            // An opcode the loader has no typed IR variant for: a residual
+            // [`crate::generic`] opcode is reported as the documented
+            // `unsupported(op.name())` typed error carrying its own `ops.tab` name.
+            Instr::Generic { op, .. } => crate::generic::exec(*op),
             // Every remaining IR variant is routed to the per-instruction-family
             // dispatch seam ([`crate::families`]). Each family is currently a stub
             // returning `Ok(None)`, so an instruction no family claims yields the
