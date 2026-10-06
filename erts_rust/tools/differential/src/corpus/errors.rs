@@ -424,6 +424,7 @@ pub(crate) fn group() -> Vec<Case> {
                 function: "head",
                 arity: 0,
                 args: &[],
+                nif: None,
             }),
             golden: Golden {
                 stdout: Some("1"),
@@ -440,6 +441,7 @@ pub(crate) fn group() -> Vec<Case> {
                 function: "guard",
                 arity: 0,
                 args: &[],
+                nif: None,
             }),
             golden: Golden {
                 stdout: Some("1"),
@@ -971,6 +973,7 @@ mod tests {
                     function,
                     arity: 0,
                     args: &[],
+                    nif: None,
                 },
                 "case {id}: the embedded module invocation"
             );

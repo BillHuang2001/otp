@@ -164,6 +164,7 @@ fn module_case(
             function,
             arity: 0,
             args: &[],
+            nif: None,
         }),
         golden: Golden {
             stdout: Some(golden),

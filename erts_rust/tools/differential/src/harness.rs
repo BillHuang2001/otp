@@ -10,6 +10,9 @@
 //! * Module-run cases ([`CaseKind::Module`]) hand **different** argv to the two runtimes
 //!   (the oracle's `-pa` + `-eval` vs. the Rust `run` action) and compare stdout + exit
 //!   status only (the Rust runtime's stderr boot banner is not a semantic difference).
+//!   A case may carry a C/NIF **fixture** (contract A.3): a real `.so` (or a decoy file) is
+//!   materialized next to the compiled `.beam`, so the module loads it through
+//!   `code:which(?MODULE)` and the argv stays exactly the same.
 //!
 //! * The **oracle** is mandatory: without it there is nothing to compare against, so a
 //!   missing oracle is a loud [`Error::Env`] (exit 2) — never a fabricated result.
@@ -242,17 +245,27 @@ fn execute(
     })
 }
 
-/// Run a module-run case: compile the embedded module, then compare the two runtimes.
+/// Run a module-run case: build the embedded module (plus any C/NIF fixture), then compare
+/// the two runtimes.
 ///
 /// The compile is memoized process-locally by `(erlc, module, source)` (see
 /// [`module_build::compile`]), so the corpus's handful of embedded sources is compiled once
 /// even though ~50 module-run cases each ask for it. Each case still gets its own temp dir
 /// (owning it through [`module_build::CompiledModule`]), so the per-case argv is unchanged.
+/// A case that carries a [`module_build::NifFixture`] (contract A.3) has its `.so` written
+/// into that same temp dir, where the module finds it through `code:which(?MODULE)` — neither
+/// runtime's argv changes.
+///
+/// A missing host tool (`erlc`, and `cc`/`erl_nif.h` for a C-compiled fixture) is a loud
+/// [`Verdict::Skipped`] with the resolver's reason: the case is never run, so it can never be
+/// reported as agreement.
 fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Result<CaseOutcome> {
-    let Some(erlc) = module_build::resolve_erlc()? else {
-        return Ok(skipped_module_outcome(context, case, run));
+    let compiled = match module_build::build(run.source, run.module, run.nif)? {
+        module_build::Build::Compiled(compiled) => compiled,
+        module_build::Build::Skipped(reason) => {
+            return Ok(skipped_module_outcome(context, case, run, reason));
+        }
     };
-    let compiled = module_build::compile(&erlc, run.source, run.module)?;
     let plan = RunPlan {
         case_id: case.id.to_string(),
         description: case.description.to_string(),
@@ -267,12 +280,17 @@ fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Re
     execute(context, plan, Some(compiled))
 }
 
-/// The outcome of a module-run case that could not be compiled (no `erlc` on the machine).
+/// The outcome of a module-run case that could not be built because a host tool is missing.
 ///
-/// Nothing was observed, so this is a loud [`Verdict::Skipped`] — never a pass and never
-/// agreement. It is non-fatal by default and fatal under `--strict`.
-fn skipped_module_outcome(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> CaseOutcome {
-    let side = SideResult::unsupported(module_build::MISSING_ERLC_REASON);
+/// Nothing was observed, so this is a loud [`Verdict::Skipped`] carrying `reason` — never a
+/// pass and never agreement. It is non-fatal by default and fatal under `--strict`.
+fn skipped_module_outcome(
+    context: &RuntimeContext,
+    case: &Case,
+    run: &ModuleRun,
+    reason: &'static str,
+) -> CaseOutcome {
+    let side = SideResult::unsupported(reason);
     CaseOutcome {
         case_id: case.id.to_string(),
         description: case.description.to_string(),
