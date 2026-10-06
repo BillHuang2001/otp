@@ -128,6 +128,14 @@ is `decode`'s.
   when explicitly requested — `encode_term` stays uncompressed. (C additionally reverts to the plain
   image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
   when compression is requested.)
+- **`LOCAL_EXT` wrapper** — `Encoder::finish_local(hash)` / `encode_term_local(Eterm, &AtomTable,
+  hash: u32)` emit `[VERSION_MAGIC][LOCAL_EXT (121)][hash:4 BE][body]`, the `term_to_binary/2 [local]`
+  image (`external.c:3305-3315`, hash patched at `:4046-4105`). `body` is the term image with the
+  version byte stripped (same normalization as `finish_compressed`). The 4-byte `hash` is the
+  Bob-Jenkins block hash of the body seeded with the node's `local_node_hash` — **node identity**,
+  owned by `beam_rt`/`beam_dist` — so the *caller* supplies it; the codec neither computes nor
+  verifies it. (A local **fun** — `make_fun3` — still has no wire form:
+  `error::unsupported_local_fun`, unchanged.)
 
 ### `src/decode/` — the `Decoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
