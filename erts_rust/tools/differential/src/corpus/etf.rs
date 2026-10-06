@@ -3,6 +3,30 @@
 //! These cases pin the *canonical* encoding a runtime must produce: `term_to_binary/1`
 //! output is compared byte-for-byte by the harness, so an alternative but legal encoder
 //! is not enough — the bytes must match the reference runtime exactly.
+//!
+//! The group also covers the External Term Format **encode** surface (the tags
+//! `beam_codec` emits). Two of those tags embed a per-VM-start value, so their image is
+//! **never** pinned byte-for-byte (a byte golden would drift the oracle's own output on the
+//! next VM start); only the stable leading **tag byte** is asserted:
+//!
+//! * a pid ⇒ `NEW_PID_EXT` (88),
+//! * an internal port ⇒ `V4_PORT_EXT` (120).
+//!
+//! The Rust runtime currently signals `beam_rt: unsupported: external_term` for an external
+//! (pid/port/ref) encode, so both cases classify `unsupported` (a capability gap, never a
+//! mismatch); their goldens are the oracle's own answers, so each flips to `agree`
+//! automatically once the gap closes.
+//!
+//! ## Known divergence (handoff — deliberately no case registered)
+//! A map with **more than 32 keys** (the large-map / hashmap image) cannot be pinned today:
+//! the Rust runtime cannot even *build* such a map — `maps:from_list/1` and repeated
+//! `maps:put/3` both raise `error:system_limit` once a map grows past 32 entries, where the
+//! oracle builds and encodes it. Observed for `maps:from_list([{N,N} || N <- lists:seq(1,33)])`:
+//! oracle ⇒ `ok <<131,116,0,0,0,33,…>>` (a 33-pair `MAP_EXT`), Rust ⇒ `exception error system_limit`.
+//! `system_limit` is a plain Erlang reason, not the runtime's documented `unsupported`
+//! convention, so registering the case would introduce a real **mismatch** — hence it is left
+//! out until the runtime's large-map representation lands. (The 32-key edge itself, still a
+//! flatmap, does `agree`.)
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -374,12 +398,139 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- encode surface: pids, ports, bitstrings, binaries, UTF-8 atoms -----------------
+        Case {
+            id: "etf/term_to_binary_new_pid_ext",
+            description: "term_to_binary/1 of a pid emits NEW_PID_EXT (88) as its leading tag byte",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary:at(term_to_binary(self()),1)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 88"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_v4_port_ext",
+            description: "term_to_binary/1 of an internal port emits V4_PORT_EXT (120) as its leading tag byte",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "begin P = open_port({spawn,\"cat\"},[binary]), Tag = binary:at(term_to_binary(P),1), port_close(P), Tag end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 120"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_bit_binary",
+            description: "a non-byte-aligned bitstring encodes as BIT_BINARY_EXT (77) with its unused-bit count",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "<<1:1>>",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,77,0,0,0,1,1,128>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_short_binary",
+            description: "a short binary encodes as BINARY_EXT (109) with a 32-bit length (no small-binary tag exists)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "<<\"hi\">>",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,2,104,105>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_binary_100_bytes",
+            description: "a 100-byte binary encodes as BINARY_EXT (109) with a 32-bit length of 100",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "list_to_binary(lists:duplicate(100,$a))",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,100,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97,97>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_utf8_latin1",
+            description: "a non-ASCII Latin-1-range atom (U+00E9) encodes as SMALL_ATOM_UTF8_EXT, not legacy ATOM_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "'\\x{e9}'",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,2,195,169>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_utf8_bmp",
+            description: "a BMP non-Latin-1 atom (U+20AC) encodes as SMALL_ATOM_UTF8_EXT with 3 UTF-8 bytes",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "'\\x{20ac}'",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,3,226,130,172>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_utf8_astral",
+            description: "an astral non-BMP atom (U+1F600) encodes as SMALL_ATOM_UTF8_EXT with 4 UTF-8 bytes",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "'\\x{1f600}'",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,240,159,152,128>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_utf8_mixed",
+            description: "a mixed ASCII + non-ASCII atom encodes as SMALL_ATOM_UTF8_EXT with the full UTF-8 byte length",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "'hello\\x{e9}world'",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,12,104,101,108,108,111,195,169,119,111,114,108,100>>"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
 #[cfg(test)]
 mod tests {
-    use super::group;
+    use super::{group, Golden};
     use crate::corpus::Contract;
 
     #[test]
@@ -397,5 +548,58 @@ mod tests {
             assert_eq!(case.golden.exit_code, 0, "{id}");
             assert!(case.golden.stdout.is_some_and(|s| !s.is_empty()), "{id}");
         }
+    }
+
+    #[test]
+    fn encode_surface_cases_pin_bytes_and_stable_shapes() {
+        let cases = group();
+
+        // Byte-image cases (default `Probe::TermToBinary`): the exact canonical encoding.
+        for (id, stdout) in [
+            ("etf/term_to_binary_bit_binary", "ok <<131,77,0,0,0,1,1,128>>"),
+            ("etf/term_to_binary_short_binary", "ok <<131,109,0,0,0,2,104,105>>"),
+            ("etf/term_to_binary_atom_utf8_latin1", "ok <<131,119,2,195,169>>"),
+            ("etf/term_to_binary_atom_utf8_bmp", "ok <<131,119,3,226,130,172>>"),
+            ("etf/term_to_binary_atom_utf8_astral", "ok <<131,119,4,240,159,152,128>>"),
+            (
+                "etf/term_to_binary_atom_utf8_mixed",
+                "ok <<131,119,12,104,101,108,108,111,195,169,119,111,114,108,100>>",
+            ),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "term_to_binary", "{id}");
+            assert_eq!(
+                case.golden,
+                Golden { stdout: Some(stdout), exit_code: 0 },
+                "{id}"
+            );
+        }
+
+        // Shape cases (`Probe::Value`): a per-VM-start pid/port image is reduced to its
+        // stable leading tag byte, so the golden cannot drift the oracle's own output.
+        for (id, stdout) in [
+            ("etf/term_to_binary_new_pid_ext", "ok 88"),
+            ("etf/term_to_binary_v4_port_ext", "ok 120"),
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "value", "{id}");
+            assert_eq!(
+                case.golden,
+                Golden { stdout: Some(stdout), exit_code: 0 },
+                "{id}"
+            );
+        }
+
+        // The 100-byte binary image is BINARY_EXT (109) with a 4-byte length of 100 and
+        // exactly 100 `$a` (97) bytes.
+        let case = cases
+            .iter()
+            .find(|c| c.id == "etf/term_to_binary_binary_100_bytes")
+            .expect("registered");
+        let golden = case.golden.stdout.expect("golden");
+        let expected = format!("ok <<131,109,0,0,0,100,{}>>", vec!["97"; 100].join(","));
+        assert_eq!(golden, expected);
     }
 }
