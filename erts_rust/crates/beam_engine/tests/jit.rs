@@ -708,7 +708,11 @@ fn a_compiled_artifact_can_be_run_more_than_once() {
 /// The number of x-registers the baseline block emitter holds in machine registers
 /// (`CACHE_REGISTERS`). Stated here as a literal so the tests below say which budget
 /// they are exceeding; the structural assertions verify the allocator agrees.
-const CACHE_BUDGET: u32 = 4;
+///
+/// The allocator is **usage-weighted**: a block caches the `CACHE_BUDGET` x-registers
+/// its inlinable instructions touch most often (ties broken by ascending register
+/// index) and addresses every other register it names directly in `machine.x`.
+const CACHE_BUDGET: u32 = 5;
 
 /// A hand-built module with a single exported `export/arity` whose whole body is one
 /// basic block (the loader is not involved). `imports` are the module's
@@ -752,10 +756,11 @@ fn block_module(
 }
 
 /// `spread/0` — one straight-line block that reads and writes **eight** x-registers,
-/// well past the four the emitter caches, so `x(4)`..`x(7)` live only in `machine.x`:
+/// well past the five the emitter caches, so the least-touched ones live only in
+/// `machine.x`:
 ///
 /// ```text
-///   x0=1 x1=2 x2=3 x3=4 x4=10     ; x4 is the first register past the cache budget
+///   x0=1 x1=2 x2=3 x3=4 x4=10     ; x4 is touched again and again below
 ///   x5 = x4                       ; `machine.x` → `machine.x`
 ///   x6 = x0 + x1          (= 3)   ; fast path with a `machine.x` destination
 ///   x4 = x6 + x3          (= 7)   ; fast path with `machine.x` operands and dst
@@ -809,19 +814,22 @@ fn spread_module() -> Module {
     )
 }
 
-/// `swaps/0` — one block exercising **every** cached/`machine.x` combination of
-/// `swap`, with `x(4)`/`x(5)` past the cache budget:
+/// `swaps/0` — one block exercising `swap` over six x-registers:
 ///
 /// ```text
 ///   x0=1 x1=2 x2=3 x3=4 x4=5 x5=6
-///   swap x0 x4     ; cached      <-> machine.x
-///   swap x4 x5     ; machine.x   <-> machine.x
-///   swap x0 x1     ; cached      <-> cached
-///   swap x4 x3     ; machine.x   <-> cached
+///   swap x0 x4
+///   swap x4 x5
+///   swap x0 x1
+///   swap x4 x3
 ///   x0 = x4
 /// ```
 ///
 /// Returns `4` (the value `x(3)` started with, carried through the last swap).
+///
+/// The usage-weighted allocator caches `{x0, x1, x3, x4, x5}` for this block, so every
+/// operand here lands in a machine register; the `machine.x` operand combinations of
+/// `swap` are covered by [`swaps_memory_module`].
 fn swaps_module() -> Module {
     let mv = |value: i64, x: u32| Instr::Move {
         src: Operand::Integer(value),
@@ -856,26 +864,193 @@ fn swaps_module() -> Module {
     )
 }
 
+/// `wide/0` — six x-registers whose touch counts make the allocator's usage-weighted
+/// choice **differ** from first-appearance order, so `x(5)` — a register a four-slot
+/// first-appearance allocator could never hold — becomes resident:
+///
+/// ```text
+///   x0=1 x1=2 x2=3 x3=4 x4=5      ; five initial moves (one touch each)
+///   x5 = x0 + x1                  ; x5 is first touched only here
+///   x5 = x0 + x2
+///   x5 = x0 + x3
+///   x0 = x5                       ; x0 becomes the most-touched register
+/// ```
+///
+/// Touch counts: `x0=5, x5=4, x1=2, x2=2, x3=2, x4=1`. The allocator keeps the top five
+/// — `{x0, x1, x2, x3, x5}` — and leaves `x4` (the least-touched register, index 4) in
+/// `machine.x`, even though its index is lower than the cached `x5`. Returns `5`.
+fn wide_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| Instr::GcBif {
+        arity: 2,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: dst.max(a).max(b) + 1,
+        args: vec![Operand::X(a), Operand::X(b)],
+        dst: Operand::X(dst),
+    };
+    block_module(
+        "wide",
+        "wide",
+        &[("erlang", "+", 2)],
+        vec![
+            Instr::Label(Label(1)),
+            mv(1, 0),
+            mv(2, 1),
+            mv(3, 2),
+            mv(4, 3),
+            mv(5, 4),
+            add(0, 1, 5),
+            add(0, 2, 5),
+            add(0, 3, 5),
+            Instr::Move {
+                src: Operand::X(5),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    )
+}
+
+/// `swaps_memory/0` — one block that exercises **every** cached/`machine.x` operand
+/// combination of `swap`, by making `x(5)`/`x(6)` the two least-touched registers:
+///
+/// ```text
+///   x0..x4 = 1..5, x5 = 6, x6 = 7
+///   <15 `+`/2 padding instructions>   ; x0..x4 each reach a touch count of 10
+///   swap x0 x5   ; cached       <-> machine.x
+///   swap x5 x6   ; machine.x    <-> machine.x
+///   swap x0 x1   ; cached       <-> cached
+///   swap x5 x3   ; machine.x    <-> cached
+///   x0 = x5
+/// ```
+///
+/// `x5` reaches only 5 touches and `x6` only 2, so the allocator's five residents are
+/// `{x0, x1, x2, x3, x4}` and both swap operands that must be read/written through
+/// `machine.x` really are. (The exact residents are pinned by
+/// `the_multi_register_blocks_cache_the_most_used_registers`.)
+fn swaps_memory_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| Instr::GcBif {
+        arity: 2,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: dst.max(a).max(b) + 1,
+        args: vec![Operand::X(a), Operand::X(b)],
+        dst: Operand::X(dst),
+    };
+    let swap = |a: u32, b: u32| Instr::Swap {
+        a: Operand::X(a),
+        b: Operand::X(b),
+    };
+
+    let mut code = vec![Instr::Label(Label(1))];
+    for x in 0..5 {
+        code.push(mv(i64::from(x) + 1, x));
+    }
+    code.push(mv(6, 5));
+    code.push(mv(7, 6));
+    // Pad x0..x4 so that the swap operands x5/x6 stay the two least-touched registers.
+    // Each of the five `+`/2 instructions touches three of x0..x4 once, so one round
+    // adds 3 touches to each; three rounds add 9, on top of the initial 1.
+    for _ in 0..3 {
+        for (a, b, dst) in [(0, 1, 2), (2, 3, 4), (4, 0, 1), (1, 2, 3), (3, 4, 0)] {
+            code.push(add(a, b, dst));
+        }
+    }
+    code.extend([
+        swap(0, 5),
+        swap(5, 6),
+        swap(0, 1),
+        swap(5, 3),
+        Instr::Move {
+            src: Operand::X(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    block_module(
+        "swaps_memory",
+        "swaps_memory",
+        &[("erlang", "+", 2)],
+        code,
+    )
+}
+
 #[test]
-fn the_multi_register_blocks_touch_registers_beyond_the_cache() {
-    // Structural evidence that the direct-`machine.x` path is what is under test: the
-    // allocator caches exactly the four budget registers and the block addresses
-    // x(7) (resp. x(5)) — far past them — without a machine register.
+fn the_multi_register_blocks_cache_the_most_used_registers() {
+    // Structural evidence for the usage-weighted allocator. The residents are the
+    // `CACHE_BUDGET` most-touched registers (ties by ascending index, slots ordered by
+    // first appearance), so a register the budget cannot hold is addressed directly in
+    // `machine.x` — no matter how low its index.
+    //
+    // `spread/0` touch counts: x4=5, x0=3, x5=3, x1=2, x3=2, x6=2, x7=2, x2=1.
     let compiled = BaselineJit::new()
         .compile(&spread_module())
         .expect("compile the spread fixture");
     assert_eq!(compiled.block_count(), 1);
-    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 3, 4, 5]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
     assert_eq!(compiled.highest_native_register(), Some(7));
     assert!(
         compiled.highest_native_register() > compiled.highest_cached_register(),
         "the block must touch registers the cache budget could not hold"
     );
 
+    // `swaps/0` touch counts: x4=5, x0=4, x1=2, x3=2, x5=2, x2=1 — residents
+    // {x0, x1, x3, x4, x5}; x2 stays in `machine.x`.
     let compiled = BaselineJit::new()
         .compile(&swaps_module())
         .expect("compile the swaps fixture");
-    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 3, 4, 5]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+
+    // `swaps_memory/0` pads x0..x4 to 10 touches each, so the residents are exactly
+    // {x0, x1, x2, x3, x4} and x5 (5 touches) / x6 (2 touches) are read and written
+    // through `machine.x` — which is what makes the swap combinations above real.
+    let compiled = BaselineJit::new()
+        .compile(&swaps_memory_module())
+        .expect("compile the swaps_memory fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 2, 3, 4]);
+    assert_eq!(compiled.highest_cached_register(), Some(4));
+    assert_eq!(compiled.highest_native_register(), Some(6));
+    assert!(
+        !compiled.cached_registers().contains(&5) && !compiled.cached_registers().contains(&6),
+        "x5/x6 must stay in machine.x for the swap combinations to be exercised"
+    );
+}
+
+#[test]
+fn the_widened_pool_caches_a_register_the_old_budget_could_not() {
+    // A concrete widening proof: `wide/0` names six x-registers and the allocator keeps
+    // five of them, including x5 — which the previous four-slot **first-appearance**
+    // allocator (cache x0..x3 as they appear, full after four) could never hold. It is
+    // precisely the fifth slot (the released `rbp`) that makes x5 resident.
+    let compiled = BaselineJit::new()
+        .compile(&wide_module())
+        .expect("compile the wide fixture");
+    assert_eq!(
+        compiled.cached_registers(),
+        &[0u32, 1, 2, 3, 5],
+        "the top five most-touched registers, x4 excluded"
+    );
+    assert_eq!(
+        compiled.cached_registers().len() as u32,
+        CACHE_BUDGET,
+        "the allocator fills the widened pool exactly"
+    );
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert!(
+        !compiled.cached_registers().contains(&4),
+        "x4 is the least-touched register and stays in machine.x"
+    );
     assert_eq!(compiled.highest_native_register(), Some(5));
 }
 
@@ -891,6 +1066,16 @@ fn multi_register_moves_and_arithmetic_agree_with_the_interpreter() {
         agree_module(&swaps, "swaps", 0, &[]).expect("swaps/0"),
         make_small(4)
     );
+    let wide = wide_module();
+    assert_eq!(
+        agree_module(&wide, "wide", 0, &[]).expect("wide/0"),
+        make_small(5)
+    );
+    // `swaps_memory/0`'s padding produces a value that depends on the arithmetic the
+    // fixture performs; the point of the case is the agreement of the two tiers over
+    // the `machine.x` swap combinations, so the exact value is not pinned.
+    let swaps_memory = swaps_memory_module();
+    agree_module(&swaps_memory, "swaps_memory", 0, &[]).expect("swaps_memory/0");
 }
 
 #[test]

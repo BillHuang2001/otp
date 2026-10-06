@@ -15,7 +15,11 @@
 //! (`[rbx + x*8]`, `rbx` = the array base the prologue loads from
 //! [`RUNTIME_XREGS_DISP`]) — the same slot the exit spill writes — so a block that
 //! touches more registers than the cache budget still runs natively instead of
-//! deopting. That is safe precisely because the cache membership is fixed for the
+//! deopting. The residents are the block's *most-used* registers, chosen by
+//! [`allocate_registers`] from the native touch counts of the block's inlinable
+//! instructions, so the registers with the longest live ranges are the ones kept in
+//! machine registers; the direct `machine.x` accesses are the fill/spill for the
+//! rest. That is safe precisely because the cache membership is fixed for the
 //! whole block ([`Allocation`]): an x-register is either *always* held in its
 //! machine register (and written back at every block exit) or *never* cached, so
 //! the two representations can never disagree. The highest x-register index a block
@@ -48,15 +52,26 @@ use super::{jit_step_one, CompiledModule};
 /// The callee-saved machine registers a block preserves across its prologue and
 /// epilogue (the Rust ABI requires them to survive the call).
 ///
-/// Five registers keep `rsp` 16-byte aligned at the helper call site: the entry
-/// `rsp ≡ 8 (mod 16)` (`call` pushed the return address), five 8-byte pushes bring
-/// it to `0 (mod 16)`, and the 16-byte `rt` slot the prologue reserves by `lea`
-/// keeps it there.
-pub(crate) const SAVED_REGISTERS: [Reg; 5] = [Reg::Rbx, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+/// Six registers keep `rsp` 16-byte aligned at the helper call site: the entry
+/// `rsp ≡ 8 (mod 16)` (`call` pushed the return address), six 8-byte pushes (48
+/// bytes, a multiple of 16) leave it at `8 (mod 16)`, and the 24-byte `rt` slot the
+/// prologue reserves by `lea` — a further `24 ≡ 8 (mod 16)` bytes — brings it to
+/// `0 (mod 16)`. (`rbp` is released from its conventional frame-pointer role to
+/// enlarge the cache below; the emitted addressing is uniformly `mod=10` `disp32`,
+/// so `rbp` is usable as a memory base with no RIP-relative special case — see
+/// [`crate::jit::emitter`].)
+pub(crate) const SAVED_REGISTERS: [Reg; 6] =
+    [Reg::Rbx, Reg::Rbp, Reg::R12, Reg::R13, Reg::R14, Reg::R15];
 
 /// The machine registers a block caches x-registers in — `rbx` is reserved for the
-/// machine base pointer, so four x-registers fit.
-pub(crate) const CACHE_REGISTERS: [Reg; 4] = [Reg::R12, Reg::R13, Reg::R14, Reg::R15];
+/// machine base pointer, so five x-registers fit (`rbp` included).
+///
+/// The assignment order is historical: the four established slots keep their
+/// `r12`–`r15` registers and the released `rbp` is appended as the fifth, so a
+/// register that was cacheable before the pool was widened stays in the same
+/// physical register and the slot↔register mapping is stable across the change.
+pub(crate) const CACHE_REGISTERS: [Reg; 5] =
+    [Reg::R12, Reg::R13, Reg::R14, Reg::R15, Reg::Rbp];
 
 /// The byte offset of the prologue-reserved `rt` slot from `rsp`.
 pub(crate) const RUNTIME_SLOT_DISP: i32 = 0;
@@ -108,6 +123,7 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     let labels = interpreter::build_label_map(module);
     let mut buffer = CodeBuffer::with_capacity(code_capacity_estimate(module))?;
     let mut entries: HashMap<(u32, u32), *const u8> = HashMap::new();
+    let mut cached_registers: Vec<u32> = Vec::new();
     let mut highest_cached_register: Option<u32> = None;
     let mut highest_native_register: Option<u32> = None;
 
@@ -125,6 +141,9 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
             let allocation = allocate_registers(module, code, start, end);
             for (x, _) in &allocation.slots {
                 touch(&mut highest_cached_register, *x);
+                if !cached_registers.contains(x) {
+                    cached_registers.push(*x);
+                }
             }
 
             let offset = buffer.len();
@@ -148,9 +167,11 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     }
 
     buffer.seal()?;
+    cached_registers.sort_unstable();
     Ok(CompiledModule {
         buffer,
         entries,
+        cached_registers,
         highest_cached_register,
         highest_native_register,
     })
@@ -201,59 +222,156 @@ const INSTRUCTION_BYTES: usize = 192;
 /// [`emit_step_and_continue`] fallback it branches to (~150 bytes).
 const FAST_PATH_BYTES: usize = 352;
 
-/// Pick the x-registers a block caches, in first-appearance order.
+/// Pick the x-registers a block caches.
 ///
-/// Only `move`s whose *shape* could be inlined contribute (`dst` an x-register and
-/// `src` an x-register or a constant), so the registers a block's actual inline
-/// prefix needs are collected before any register from a later, never-inlined
-/// instruction. A `gc_bif` the small-int arithmetic fast path can lower
-/// ([`fast_arith`]) contributes its operands and destination the same way, so the
-/// inline path always finds a register for each of them. A register index outside
-/// the engine's [`MAX_REGISTER`] bound is never cached: reading it would be out of
-/// bounds, whereas the interpreter step reports the faithful `bad_register` error.
+/// The block keeps the [`CACHE_REGISTERS`]`.len()` x-registers its native lowering
+/// **touches the most**: every cacheable instruction (a `move` whose shape
+/// [`try_inline_move`] lowers, a `swap` over two addressable x-registers, a `test`
+/// whose shape [`test_plan`] lowers, and a `gc_bif` [`fast_arith`] lowers)
+/// contributes one *native touch* per x-register operand, and the registers with the
+/// highest touch counts are held resident — a usage-weighted approximation of
+/// "keep the longest live ranges in machine registers". Ties are broken by ascending
+/// register index, so the choice is deterministic. Every register the budget cannot
+/// hold is read and written **directly in `machine.x`**, which is exactly the
+/// fill/spill an in-block eviction scheme would perform; the membership itself stays
+/// **fixed for the whole block** (the correctness contract — see the module docs).
+///
+/// A register index outside the engine's [`MAX_REGISTER`] bound never counts: the
+/// inline paths refuse such an operand (reading it would be out of bounds, whereas
+/// the interpreter step reports the faithful `bad_register`), so the allocator must
+/// not cache it either.
+///
+/// The slots are returned in the registers' **first-appearance** order, so the
+/// physical (`rbp`/`r12`–`r15`) assignment is deterministic; only the *selection* is
+/// usage-weighted.
 pub(crate) fn allocate_registers(
     module: &Module,
     code: &[Instr],
     start: usize,
     end: usize,
 ) -> Allocation {
-    let mut allocation = Allocation::default();
+    // The `test` shape needs the module-wide label map to know whether a fail label
+    // resolves; build it here (the driver builds the same map once per run, so this
+    // costs no more than an existing per-run step).
+    let labels = interpreter::build_label_map(module);
+    allocate_registers_with_labels(module, &labels, code, start, end)
+}
+
+/// [`allocate_registers`] against an already-built module-wide label map.
+fn allocate_registers_with_labels(
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    code: &[Instr],
+    start: usize,
+    end: usize,
+) -> Allocation {
+    let end = end.min(code.len());
+    let start = start.min(end);
+
+    // Native touch counts and the registers' first-appearance order.
+    let mut counts: BTreeMap<u32, u32> = BTreeMap::new();
+    let mut appearance: Vec<u32> = Vec::new();
     for instr in &code[start..end] {
-        if let Instr::Move { src, dst } = instr {
-            let Some(dst_x) = x_register(dst) else {
-                continue;
-            };
-            let src_x = x_register(src);
-            if src_x.is_none() && constant_word(src).is_none() {
+        for x in cacheable_touches(module, labels, instr) {
+            if x >= MAX_REGISTER {
                 continue;
             }
-            if let Some(n) = src_x {
-                push_slot(&mut allocation, n);
-            }
-            push_slot(&mut allocation, dst_x);
-        } else if let Some(fast) = fast_arith(module, instr) {
-            for x in fast.registers() {
-                push_slot(&mut allocation, x);
+            *counts.entry(x).or_insert(0) += 1;
+            if !appearance.contains(&x) {
+                appearance.push(x);
             }
         }
+    }
+
+    // Rank by descending touch count, ties by ascending register index, and keep the
+    // top `CACHE_REGISTERS.len()`.
+    let mut ranked: Vec<(u32, u32)> = counts.iter().map(|(x, count)| (*x, *count)).collect();
+    ranked.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+    let selected: Vec<u32> = ranked
+        .into_iter()
+        .take(CACHE_REGISTERS.len())
+        .map(|(x, _)| x)
+        .collect();
+
+    let mut allocation = Allocation::default();
+    for x in appearance {
+        if !selected.contains(&x) {
+            continue;
+        }
+        allocation
+            .slots
+            .push((x, CACHE_REGISTERS[allocation.slots.len()]));
     }
     allocation
 }
 
-/// Assign the next free cache register to `x`, if it is cacheable and still needed.
-fn push_slot(allocation: &mut Allocation, x: u32) {
-    if x >= MAX_REGISTER {
-        return;
+/// The x-registers one instruction's **native** lowering touches — the operands
+/// [`allocate_registers`] charges to the block's usage counts.
+///
+/// Each arm mirrors the inlining decision of the instruction's lowering, so a
+/// register only counts when the emitted code would actually reference it: a `move`
+/// is counted only when [`try_inline_move`] lowers it, a `swap` only when both
+/// operands are addressable x-registers, a `test` only when [`test_plan`] claims it,
+/// and a `gc_bif` only when [`fast_arith`] does. Every other instruction
+/// contributes nothing because it stays on the helper.
+fn cacheable_touches(
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+) -> Vec<u32> {
+    let mut touches = Vec::new();
+    match instr {
+        Instr::Move { src, dst } => {
+            let Some(dst_x) = x_register(dst) else {
+                return touches;
+            };
+            if dst_x >= MAX_REGISTER {
+                return touches;
+            }
+            match x_register(src) {
+                Some(src_x) => {
+                    if src_x >= MAX_REGISTER {
+                        return touches;
+                    }
+                    touches.push(src_x);
+                }
+                // A non-register source must be a constant word, else the move deopts.
+                None => {
+                    if constant_word(src).is_none() {
+                        return touches;
+                    }
+                }
+            }
+            touches.push(dst_x);
+        }
+        Instr::Swap { a, b } => {
+            let (Some(a_x), Some(b_x)) = (x_register(a), x_register(b)) else {
+                return touches;
+            };
+            if a_x >= MAX_REGISTER || b_x >= MAX_REGISTER {
+                return touches;
+            }
+            touches.push(a_x);
+            touches.push(b_x);
+        }
+        Instr::GcBif { .. } => {
+            if let Some(fast) = fast_arith(module, instr) {
+                touches.extend(fast.registers());
+            }
+        }
+        Instr::Test { kind, fail, args } => {
+            if let Some(plan) = test_plan(module, *kind, *fail, args, labels) {
+                if let TestSrc::Reg(x) = plan.lhs {
+                    touches.push(x);
+                }
+                if let Some(TestSrc::Reg(x)) = plan.rhs {
+                    touches.push(x);
+                }
+            }
+        }
+        _ => {}
     }
-    if allocation.slots.iter().any(|(n, _)| *n == x) {
-        return;
-    }
-    if allocation.slots.len() >= CACHE_REGISTERS.len() {
-        return;
-    }
-    allocation
-        .slots
-        .push((x, CACHE_REGISTERS[allocation.slots.len()]));
+    touches
 }
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
@@ -277,9 +395,9 @@ fn emit_block(
     for reg in SAVED_REGISTERS {
         buffer.push_r(reg)?;
     }
-    // Reserve the `rt` slot. `lea rsp, [rsp - 16]` is `sub rsp, 16` and keeps `rsp`
+    // Reserve the `rt` slot. `lea rsp, [rsp - 24]` is `sub rsp, 24` and keeps `rsp`
     // 16-byte aligned at the helper call site (see `SAVED_REGISTERS`).
-    buffer.lea(Reg::Rsp, Reg::Rsp, -16)?;
+    buffer.lea(Reg::Rsp, Reg::Rsp, -24)?;
     buffer.mov_mr(Reg::Rsp, RUNTIME_SLOT_DISP, Reg::Rdi)?;
     // rbx = rt->x_regs, the base of `machine.x` the cached slots are indexed from.
     buffer.mov_rm(Reg::Rbx, Reg::Rdi, RUNTIME_XREGS_DISP)?;
@@ -379,7 +497,7 @@ fn emit_block(
 
     // --- epilogue -----------------------------------------------------------
     buffer.bind(done)?;
-    buffer.lea(Reg::Rsp, Reg::Rsp, 16)?;
+    buffer.lea(Reg::Rsp, Reg::Rsp, 24)?;
     for reg in SAVED_REGISTERS.iter().rev() {
         buffer.pop_r(*reg)?;
     }

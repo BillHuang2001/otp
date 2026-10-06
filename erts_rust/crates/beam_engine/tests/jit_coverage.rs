@@ -53,7 +53,7 @@ const COVERAGE_BEAM: &str = concat!(
 /// The number of x-registers the baseline block emitter caches in machine
 /// registers (`CACHE_REGISTERS`), i.e. the budget past which a register is
 /// addressed directly in `machine.x`.
-const CACHE_BUDGET: u32 = 4;
+const CACHE_BUDGET: u32 = 5;
 
 /// Resolve a name interned in the module's atom table.
 fn atom(module: &Module, name: &str) -> Atom {
@@ -470,20 +470,21 @@ fn the_append_segment_agrees_on_both_tiers() {
 
 #[test]
 fn the_fixture_stays_within_the_cache_budget() {
-    // The baseline emitter holds `CACHE_BUDGET` x-registers in machine registers;
-    // every x-register a block names **beyond** that budget is addressed directly in
-    // `machine.x`, and the artifact records the highest index the driver's
-    // `native_ok` guard has to cover.
+    // The baseline emitter holds up to `CACHE_BUDGET` x-registers in machine
+    // registers, chosen by a **usage-weighted** allocator: the registers a block
+    // touches most often (ties by ascending index) become resident and everything
+    // else is addressed directly in `machine.x`. The artifact records both the
+    // resident set and the highest index the driver's `native_ok` guard has to cover.
     //
-    // This fixture — idiomatic output of the system `erlc` — turns out to stay
-    // exactly inside the budget: a block's inline prefix ends at the first
-    // instruction the emitter does not lower, so a wide register only ever reaches
-    // machine code when the whole block up to it was inlined. That makes this a real
-    // regression guard (a change to the allocator or the inline set that starts
-    // addressing more registers shows up here), and it is why the wide-block path
-    // itself is covered by `tests/jit.rs`
-    // (`the_multi_register_blocks_touch_registers_beyond_the_cache`), which builds
-    // the IR explicitly.
+    // This fixture — idiomatic output of the system `erlc` — turns out to name only
+    // x0..x3 in its inlined instructions, so `highest_native_register == 3` and the
+    // residents are exactly {x0, x1, x2, x3}: the fixture stays well inside the
+    // five-register budget, and `native == cached` (no register is addressed natively
+    // that the cache did not take). That makes this a real regression guard (a change
+    // to the inline set that starts addressing a register beyond x3, or an allocator
+    // change, shows up here), and it is why the wide-block path itself is covered by
+    // `tests/jit.rs` (`the_widened_pool_caches_a_register_the_old_budget_could_not`),
+    // which builds the IR explicitly.
     let module = load();
     let compiled = BaselineJit::new()
         .compile(&module)
@@ -494,7 +495,16 @@ fn the_fixture_stays_within_the_cache_budget() {
     let native = compiled
         .highest_native_register()
         .expect("the fixture must touch some registers natively");
-    assert_eq!(cached, CACHE_BUDGET - 1, "the allocator fills the budget");
+    assert_eq!(
+        compiled.cached_registers(),
+        &[0u32, 1, 2, 3],
+        "the fixture's residents are exactly x0..x3"
+    );
+    assert_eq!(cached, 3, "the allocator's residents are x0..x3");
+    assert!(
+        compiled.cached_registers().len() as u32 <= CACHE_BUDGET,
+        "the allocator never caches more registers than the budget"
+    );
     assert_eq!(
         native, cached,
         "coverage.beam is expected to stay inside the cache budget"
