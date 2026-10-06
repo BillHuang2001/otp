@@ -254,6 +254,20 @@ impl Table {
   is wired into `insert` (replace), `delete`, `delete_object` and `delete_all_objects` (`reset`).
   This is the A.1 copy boundary realized honestly — **not** a `beam_message::copy_struct` reuse (that
   crate is wave 2; `beam_ets` is wave 1 and cannot depend upward).
+- **`take` returns checked-out copies and reclaims the stored originals.** `Table::take` deep-copies
+  each removed object out of the store (`TermStore::copy`) and `TermStore::free`s the table's original,
+  then `relinquish`es each returned copy: the copy stays valid for the table's lifetime and its words
+  are never handed out again, but it stops counting toward `Table::memory()` — matching real
+  `ets:take/2`, whose objects leave the table. Relinquished words remain held by their block until
+  `delete_all_objects`/drop (the arena never shrinks). Copy-before-free is mandatory: freeing first
+  would let a later same-size `copy` reuse the words the caller now holds.
+- **Hash-kind navigation order is unspecified (a deliberate freedom, not a gap).** `HashInterior`
+  supplies the bucket-scan `keys()` and relies on the `Interior` trait defaults for
+  `first_key`/`last_key`/`next_key`/`prev_key`; real ETS likewise does not specify hash traversal order
+  (real `erl` returns `first` for `last` on a small set). Only the *order* is unspecified: every key a
+  walk yields is a present key, `first`+`next` is a permutation of the stored keys, and `next`/`prev`
+  on an **absent** anchor are `badarg`. `ordered_set` navigation is exact (ascending `beam_term` order;
+  absent keys read as range bounds).
 - **Access control mirrors `db_check_access`.** `can_read`/`can_write` treat `requester == owner` as
   full access and otherwise apply the `public`/`protected`/`private` matrix; `TableAccess` is the
   enforcing view while the raw `Table` ops stay owner-level primitives.
