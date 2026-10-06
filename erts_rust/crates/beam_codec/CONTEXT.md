@@ -126,7 +126,8 @@ is `decode`'s.
 ### `src/term/` — materialization layer (the ONLY `unsafe` subtree; see Design Decisions)
 `src/term/mod.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term materialization over
 `beam_alloc::Heap` that **forwards to** `beam_term::thing` (float/bignum/flatmap/external-identifier
-constructors + readers) and `beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons
+constructors + readers), `beam_term::fun` (the fun/export block) and
+`beam_term::{tuple_size, tuple_element, car, cdr}` (tuple/cons
 accessors); the boxed interior layout is owned by `beam_term` (workspace `CONTEXT.md` §2). It only
 allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapping a violation to
 `BeamError`), and calls the `beam_term` accessor:
