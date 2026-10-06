@@ -467,14 +467,15 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
 - `src/timer.rs` → `Timeout`, `Timer` (poll-deadline primitives)
 - `src/queue.rs` → `ByteQueue` (the port input/output byte buffers)
 - `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue` (incl. `arm_timeout`), reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome` (the `erts_port_task_execute` model)
-- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `PortRegistry` (port id + queues + task scheduling + driver dispatch), plus the driver-timer mirror surface (`Port::{arm_timeout,cancel_timeout,next_timeout,notify_exit}` + `PortRegistry::{schedule_timeout,cancel_timeout,next_deadline,notify_port_exit}`)
+- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET` (the port endpoint, its input/output queues, driver dispatch and the driver-timer mirror surface `Port::{arm_timeout,cancel_timeout,next_timeout,notify_exit}`); re-exports `PortRegistry`
+- `src/registry.rs` → `PortRegistry` (port-id allocation over `beam_process::PortTable` + the `HashMap<u64, Port>` of live ports + the reactor glue `handle_events`/`schedule_events`/`execute_port_tasks`/`port_command`/`port_control` + the timer/exit seams `schedule_timeout`/`cancel_timeout`/`next_deadline`/`notify_port_exit`)
 - `src/driver.rs` → `Driver` trait (incl. the defaulted `take_exit_status` exit-status seam, the `next_timeout` driver-declared timer seam and the `port_exit` port-exit notification seam), `PortExitReason`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms` (the driver seam)
 - `src/drivers/fd.rs` → `FdDriver` (the built-in fd/pipe byte-stream driver, incl. line/phase modes + `control` + EOF de-registration)
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN` (`{line, N}` framing)
 - `src/drivers/binary_io.rs` → `Phase`, `PhaseChange` (the text⇄binary phase-change protocol)
 - `src/drivers/efile.rs` → `EfileDriver`, `make_efile` (the built-in `efile` driver; serves regular files via the poller fallback)
 - `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver, incl. the errno-atom failed-spawn raise and the duplex `{fd, N}` form), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
-- `src/drivers/inet.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState`, the `INET_*`/`TCP_SHUT_*` codes and packed-address helpers (the TCP `inet` driver floor)
+- `src/drivers/inet/mod.rs` + `src/drivers/inet/wire.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState` (the driver state machine + socket syscalls) and the `INET_*`/`TCP_SHUT_*`/`INET_REP_*` codes + packed-address helpers + `errno_name` (the wire vocabulary)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
 - `src/error.rs` → `pub(crate)` error constructors + the errno→BEAM-atom mapping (`errno_atom`) and `spawn_failure` (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
