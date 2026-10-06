@@ -184,9 +184,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
-  erts_rust/Cargo.toml --workspace` is warning-free; per-crate suites are green (one pre-existing
-  failure lives outside this node's crates — see Known Structural Debt).
-- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
+  erts_rust/Cargo.toml --workspace` is warning-free and `cargo test --manifest-path
+  erts_rust/Cargo.toml --workspace` is fully green (every suite passes; no allowlisted failures).
+- **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
+  `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
+  installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
+  with no allowlist.- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
   supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
