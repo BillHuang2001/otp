@@ -174,9 +174,11 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - `src/harness.rs` → orchestration: `run_case`/`compare_expr`/`run_suite`, per-side argv planning, exit-3 classification, exit-code derivation
 - `src/report.rs` → JSON report schema (serde: `summary` + additive `by_contract` rollup; the `list` listing + optional `--by-contract` grouping) + writer + human rendering
 - `src/main.rs` → thin binary: parse args → dispatch → `process::exit(code)`
-- `tests/abi.rs` → A.3/A.4 structural C-ABI check: `-fsyntax-only`-compiles a tiny C TU referencing the `enif_*`/`driver_*`/`erl_drv_*` surface with a synthesized `erl_int_sizes_config.h` (skips loudly without a C compiler; no `crates/*` dependency)
+- `tests/abi.rs` → A.3/A.4 structural C-ABI check: `-fsyntax-only`-compiles a tiny C TU referencing the `enif_*`/`driver_*`/`erl_drv_*` surface and `_Static_assert`ing the frozen type sizes/offsets, with a synthesized `erl_int_sizes_config.h` (skips loudly without a C compiler; no `crates/*` dependency)
+- `tests/module_sweep.rs` → the broad real-module **execute** sweep (72 entries / 14 real system modules) — asserts `Agree`/`Unsupported`, never `Mismatch`; skips loudly without the oracle
 - `tests/oracle.rs` → oracle-backed integration tests (golden reproduction for eval + module cases, oracle-vs-oracle, missing Rust runtime)
 - `tests/cli.rs` → end-to-end binary tests (exit codes, `--help`, `--out` report, `list`, fake `$BEAM_RT` mismatch/unsupported, boot-banner-vs-real-stderr classification)
+- `gate.sh` → the CI gate wrapper over `suite --strict` implementing the `0/1/2/3` exit-code contract
 - `out/` → gitignored JSON report output (default `--out`)
 
 ## See Also
