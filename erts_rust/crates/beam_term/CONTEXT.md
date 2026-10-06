@@ -395,7 +395,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
 - **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `fun`, `map`,
-  `record`, `compare`, `hashing`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
+  `record`, `compare`, `hashing`, `ihash`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
 - **Pure tag math is `const fn`** where the body allows (`raw`, `from_raw`, `primary_tag`, tag tests,
