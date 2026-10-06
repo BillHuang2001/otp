@@ -63,8 +63,12 @@ pub mod corpus;
 pub mod error;
 pub mod harness;
 pub mod module_build;
+pub(crate) mod nif_build;
 pub mod report;
 pub mod runtime;
+
+#[cfg(test)]
+mod test_support;
 
 pub use compare::{
     compare_observations, compare_observations_with, verdict, verdict_with, FieldDiff, GoldenCheck,
