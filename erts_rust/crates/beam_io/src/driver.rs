@@ -312,13 +312,16 @@ impl DriverRegistry {
 
     /// A registry pre-populated with this crate's built-in drivers.
     ///
-    /// Milestone-1 registers two built-ins: `"fd"` ([`crate::drivers::FdDriver`], a byte-stream
-    /// driver over a pipe/fd) and `"efile"` ([`crate::drivers::EfileDriver`], the file driver —
-    /// an `FdDriver` plus the `efile` control family).
+    /// Milestone-1 registers three built-ins: `"fd"` ([`crate::drivers::FdDriver`], a byte-stream
+    /// driver over a pipe/fd), `"efile"` ([`crate::drivers::EfileDriver`], the file driver —
+    /// an `FdDriver` plus the `efile` control family), and `"tcp_inet"`
+    /// ([`crate::drivers::TcpInetDriver`], the TCP socket driver — the name the oracle reports
+    /// from `port_info(Port, name)` for a TCP port and the name `prim_inet` opens).
     pub fn with_builtins() -> DriverRegistry {
         let mut registry = DriverRegistry::new();
         registry.register("fd", make_fd);
         registry.register("efile", crate::drivers::make_efile);
+        registry.register("tcp_inet", crate::drivers::make_tcp_inet);
         registry
     }
 
@@ -386,13 +389,18 @@ mod tests {
         let registry = DriverRegistry::with_builtins();
         assert!(registry.contains("fd"));
         assert!(registry.contains("efile"));
-        assert_eq!(registry.names(), vec!["efile", "fd"]);
+        assert!(registry.contains("tcp_inet"));
+        assert_eq!(registry.names(), vec!["efile", "fd", "tcp_inet"]);
 
         let driver = registry.create("fd").expect("the fd driver exists");
         assert_eq!(driver.name(), "fd");
         assert!(driver.flags() == DriverFlags::empty());
         let efile = registry.create("efile").expect("the efile driver exists");
         assert_eq!(efile.name(), "efile");
+        let inet = registry
+            .create("tcp_inet")
+            .expect("the tcp_inet driver exists");
+        assert_eq!(inet.name(), "tcp_inet");
         assert!(matches!(registry.create("nope"), Err(BeamError::BadArg)));
     }
 

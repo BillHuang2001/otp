@@ -16,7 +16,8 @@
 //!    [`Driver`](driver::Driver) trait today, with the frozen C-ABI
 //!    (`beam_abi::driver`) bridge as documented future work, plus the built-in
 //!    byte-stream driver ([`drivers::FdDriver`], `"fd"`), the [`drivers::EfileDriver`]
-//!    (`"efile"`) built on it and the OS-child [`drivers::SpawnDriver`] (`"spawn"`).
+//!    (`"efile"`) built on it, the OS-child [`drivers::SpawnDriver`] (`"spawn"`) and the
+//!    TCP socket [`drivers::TcpInetDriver`] (`"tcp_inet"`).
 //!
 //! Supporting types: [`timer`] (poll deadlines), [`queue`] (the port byte buffers) and
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
@@ -25,11 +26,12 @@
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
-//! poller/reactor, ports, the driver seam and the built-in `"fd"`/`"efile"`/`"spawn"`
-//! drivers are real and covered by in-module unit tests plus the `tests/poller.rs` /
-//! `tests/port.rs` / `tests/port_task.rs` / `tests/spawn.rs` integration suites (real OS fds,
-//! end-to-end `pipe(2)` round-trip, real child processes, scheduled port tasks and the
-//! wake-through-`beam_process` path). The frozen C-ABI driver bridge and the port-task
+//! poller/reactor, ports, the driver seam and the built-in
+//! `"fd"`/`"efile"`/`"spawn"`/`"tcp_inet"` drivers are real and covered by in-module unit
+//! tests plus the `tests/poller.rs` / `tests/port.rs` / `tests/port_task.rs` / `tests/spawn.rs`
+//! / `tests/inet.rs` integration suites (real OS fds, end-to-end `pipe(2)` round-trip, real
+//! child processes, real loopback TCP connections with an `erl`-oracle reply cross-check,
+//! scheduled port tasks and the wake-through-`beam_process` path). The frozen C-ABI driver bridge and the port-task
 //! *scheduler* wiring (poll threads, port run queues) remain follow-ups —
 //! [`PortRegistry::execute_port_tasks`] is the drive point the runtime calls.
 //!
@@ -75,8 +77,9 @@ pub use crate::timer::*;
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) the driver seam ([`Driver`], [`DriverContext`],
 /// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`FdDriver`], [`EfileDriver`],
-/// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`]) and
-/// the timer/queue helpers ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
+/// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`],
+/// [`TcpInetDriver`], [`InetState`]) and the timer/queue helpers ([`Timeout`], [`Timer`],
+/// [`ByteQueue`]) into scope.
 pub mod prelude {
     pub use crate::driver::*;
     pub use crate::drivers::*;
