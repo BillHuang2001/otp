@@ -392,6 +392,15 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   scratch dir and runs it through `Runtime::run_function`: `lists:reverse/1` → `[3,2,1]`,
   `maps:get/2` on a map literal → `7`, and the on-demand stdlib module `ordsets`. It **skips loudly**
   (printing the reason) when the system toolchain/stdlib is unavailable, never silently passing.
+* **Ports, nested re-entrancy and bit operators.** `src/port.rs` unit tests (all three Name forms, the
+  options, `BadArg` rejection without consuming a port number, `close_port` kill/reap, unknown-port
+  `BadArg`, the seeded `port_info` vocabulary); `tests/eval.rs`'s `open_port_spawns_a_real_os_process`
+  (the exact `driver/port_backed_by_spawn_driver` probe + argv at the CLI boundary, a real `os_pid`, the
+  `port_info` pairs, `port_close/1`); `context.rs`'s
+  `ets_inside_an_applied_fun_reaches_the_outer_table`, `a_nested_io_format_reaches_the_callers_sink` and
+  `a_nested_call_without_a_fun_still_sees_the_outer_tables` (the nested-BIF seams through the real call
+  path); and `eval/mod.rs`'s bit-operator tests (small-int sanity for each of the six, a `1 bsl 70`
+  bignum round-trip, a non-integer operand → `badarith`).
 * **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` GREEN;
   the whole-workspace `build`/`test` must stay green.
 
