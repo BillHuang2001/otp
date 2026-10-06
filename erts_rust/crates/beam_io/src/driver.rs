@@ -261,6 +261,22 @@ pub trait Driver {
         Ok(())
     }
 
+    /// Takes the reaped exit status of the OS child this port owns, **once**.
+    ///
+    /// A driver that starts no child — the built-in [`crate::drivers::FdDriver`] and
+    /// [`crate::drivers::EfileDriver`] — never has one to report and inherits the default
+    /// (`Ok(None)`), so this capability is purely additive. `Ok(None)` also means "the child
+    /// has not exited yet" or "the status was already reported"; only
+    /// [`crate::drivers::SpawnDriver`] overrides it, for a port opened with the
+    /// `exit_status` option (surfaced as [`crate::PortRegistry::take_exit_status`]).
+    ///
+    /// # Errors
+    ///
+    /// Returns a `beam_common::BeamError` when the underlying wait fails.
+    fn take_exit_status(&mut self) -> Result<Option<i32>> {
+        Ok(None)
+    }
+
     /// Shuts the driver down, releasing its OS resources.
     ///
     /// # Errors

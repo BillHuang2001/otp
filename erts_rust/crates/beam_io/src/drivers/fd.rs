@@ -489,7 +489,10 @@ impl Drop for FdDriver {
 }
 
 /// Puts `fd` into non-blocking mode so no read or write can stall the reactor.
-fn set_nonblocking(fd: RawFd) -> Result<()> {
+///
+/// Shared with the sibling [`crate::drivers::spawn`] driver, which puts the two standard
+/// streams of the child it starts into non-blocking mode for the same reason.
+pub(crate) fn set_nonblocking(fd: RawFd) -> Result<()> {
     // SAFETY: `fd` is a descriptor this driver owns; `F_GETFL` reads the status flags
     // and takes no extra argument.
     let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };

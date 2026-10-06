@@ -14,8 +14,9 @@
 //!    `beam_process`'s port table; and
 //! 3. the **driver interface + built-in drivers** ([`driver`], [`drivers`]) — a Rust
 //!    [`Driver`](driver::Driver) trait today, with the frozen C-ABI
-//!    (`beam_abi::driver`) bridge as documented future work, plus one built-in
-//!    byte-stream driver ([`drivers::FdDriver`]).
+//!    (`beam_abi::driver`) bridge as documented future work, plus the built-in
+//!    byte-stream driver ([`drivers::FdDriver`], `"fd"`), the [`drivers::EfileDriver`]
+//!    (`"efile"`) built on it and the OS-child [`drivers::SpawnDriver`] (`"spawn"`).
 //!
 //! Supporting types: [`timer`] (poll deadlines), [`queue`] (the port byte buffers) and
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
@@ -24,13 +25,13 @@
 //! # Status
 //!
 //! Milestone-1 is implemented (see this crate's `CONTEXT.md`, Milestone-1 scope): the
-//! poller/reactor, ports, the driver seam and the single built-in `"fd"` driver are real
-//! and covered by in-module unit tests plus the `tests/poller.rs` / `tests/port.rs` /
-//! `tests/port_task.rs` integration suites (real OS fds, end-to-end `pipe(2)` round-trip,
-//! scheduled port tasks and the wake-through-`beam_process` path). The frozen C-ABI
-//! driver bridge and the port-task *scheduler* wiring (poll threads, port run queues)
-//! remain follow-ups — [`PortRegistry::execute_port_tasks`] is the drive point the runtime
-//! calls.
+//! poller/reactor, ports, the driver seam and the built-in `"fd"`/`"efile"`/`"spawn"`
+//! drivers are real and covered by in-module unit tests plus the `tests/poller.rs` /
+//! `tests/port.rs` / `tests/port_task.rs` / `tests/spawn.rs` integration suites (real OS fds,
+//! end-to-end `pipe(2)` round-trip, real child processes, scheduled port tasks and the
+//! wake-through-`beam_process` path). The frozen C-ABI driver bridge and the port-task
+//! *scheduler* wiring (poll threads, port run queues) remain follow-ups —
+//! [`PortRegistry::execute_port_tasks`] is the drive point the runtime calls.
 //!
 //! # Contracts
 //!
@@ -73,8 +74,9 @@ pub use crate::timer::*;
 /// [`PortRegistry`], [`PortControl`], [`PortCommandOptions`]), the port-task machinery
 /// ([`PortTaskKind`], [`PortTask`], [`PortTaskQueue`], [`PortNotification`],
 /// [`PortTaskOutcome`], [`Readiness`]) the driver seam ([`Driver`], [`DriverContext`],
-/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`FdDriver`]) and the
-/// timer/queue helpers ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
+/// [`DriverFlags`], [`DriverRegistry`], [`DriverFactory`], [`FdDriver`], [`EfileDriver`],
+/// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`]) and
+/// the timer/queue helpers ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
 pub mod prelude {
     pub use crate::driver::*;
     pub use crate::drivers::*;
