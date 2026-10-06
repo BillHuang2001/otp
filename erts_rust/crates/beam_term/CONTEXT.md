@@ -283,7 +283,7 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   else. `beam_common` is used for exactly one thing: the `From<TermError> for beam_common::BeamError`
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
-- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `map`,
+- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `fun`, `map`,
   `compare`, `hashing`, `bitstring`, `refc` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
