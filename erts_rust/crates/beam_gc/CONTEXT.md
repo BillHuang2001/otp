@@ -254,6 +254,12 @@ needing per-workload measurement. The option therefore stays **OFF by default** 
   primitive, **re-exported** here (no duplicate) — so a refc binary and an MSO share one implementation.
   The on-heap `BinRef`/`ErlSubBits` *handle term* itself is `beam_term`'s job; this crate owns the
   refcounted off-heap objects, the shared count, and the per-process list.
+- **`OffHeap` owns the slot↔object index; a copy boundary only reads it.** An on-heap off-heap reference
+  stores a *slot number* into the owning list, so that index association is a property of the list itself
+  and lives here (the LCA that owns the MSO model): `insert -> slot`, `get(slot)`, `iter()`. `push` stays
+  the slot-discarding append for callers that do not need the index. A slot is stable across `insert`s but
+  **not** across a `sweep` (it `retain`s, shifting later slots down), so a caller that keeps raw slot
+  numbers must re-resolve them after any sweep.
 
 ## Constraints
 - **Errors:** `beam_common::{Result, BeamError}` only. Heap exhaustion while copying a term is
