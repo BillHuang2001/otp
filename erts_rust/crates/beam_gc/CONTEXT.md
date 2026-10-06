@@ -80,7 +80,9 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
     `mature() -> &ImmixSpace`; `stats() -> GcStats`; `last_immix_stats() -> Option<ImmixStats>`
     (the most recent major's in-place reclaim accounting)
   - `should_collect(need_words) -> bool`; `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>`
-    (reuses `Collection`/`CollectionKind`; no new variant)
+    (reuses `Collection`/`CollectionKind`; no new variant) — plus `collect_minor`/`collect_major`
+    (`-> Result<GcStats>`) to force a specific collection (a too-large `collect_minor` reports the typed
+    heap exhaustion before copying anything)
 
 ### `any_collector.rs` — the strategy-dispatching seam
 - `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }`
