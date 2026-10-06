@@ -9,6 +9,7 @@
 
 pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
 pub use crate::dist_header::*;
+pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::*;
 pub use crate::flags::*;
 pub use crate::framing::{is_tick, read_packet, write_packet, write_tick, PacketHeaderSize};

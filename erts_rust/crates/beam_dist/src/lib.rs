@@ -33,6 +33,7 @@ pub mod auth;
 pub mod connection;
 pub mod control;
 pub mod dist_header;
+pub mod driver;
 pub mod epmd;
 pub mod flags;
 pub mod fragment;
@@ -43,6 +44,7 @@ pub mod transport;
 
 pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
 pub use crate::dist_header::{AtomCacheRef, DistFragment, DistHeader};
+pub use crate::driver::{ConnectionDriver, DriverState, StepOutcome};
 pub use crate::epmd::{Alive2Req, Alive2Resp, EpmdClient, NamesResp, Port2Req, Port2Resp};
 pub use crate::flags::{AltactSigFlags, DistFlags, DistSpawnFlags, Dop};
 pub use crate::framing::{
