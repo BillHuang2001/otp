@@ -9,9 +9,10 @@ links against Rust ERTS and behaves identically. This is the **link-time frozen-
 Part II §C — the struct layouts must never change; a mismatch here is an ABI break.
 
 This crate **declares types only**. It provides no `enif_*`/`erl_drv_*` *implementations* — those
-belong to the NIF/driver subsystem (`beam_rt`/`beam_bifs`/`beam_io`, later passes). What is frozen
-now is the *shape* of the boundary: the types, the layouts, the term transmute, and the
-function-pointer tables (`ErlNifApi`, `ErlDrvApi`) the runtime must implement and export.
+belong to the NIF/driver subsystem (this crate's own `nif::enif`/`nif::loader`, added in a later
+step, and `beam_rt`/`beam_bifs`/`beam_io`). What is frozen now is the *shape* of the boundary: the
+types, the layouts, the term transmute, the function-pointer tables (`ErlNifApi`, `ErlDrvApi`), and
+the **host seam** (`nif::host`) the `enif_*` layer will be implemented over.
 
 Ground truth (read-only, never modify): `../../erts/emulator/beam/erl_nif.h`,
 `erl_nif_api_funcs.h`, `erl_drv_nif.h`, `erl_driver.h`. These are the only stable ABI headers.
@@ -80,6 +81,20 @@ deviation, see Design Decisions). Fields are `Option<unsafe extern "C" fn ...>` 
 `ErlNapiUInt64`/`ErlNapiSInt64`/`ErlNapiUInt`/`ErlNapiSInt`, `SysIOVec`, `ErlDrvSysInfo`,
 `ErlDrvThreadOpts`, `ErlDirtyJobFlags`, `ErlNifSelectFlags`, `ErlDrvMonitor`, the `ERTS_NAPI_*` time
 constants, and `ERL_NIF_SELECT_*` / `ErlNifSelectFlags` selector bits.
+### The host seam (`nif::host`) — the runtime services behind the `enif_*` layer
+Not part of the C ABI; it is the *internal* boundary the future `enif_*` implementations are written
+against (so this crate keeps its "declaration layer" role and pulls in no ETF/scheduler code).
+- `pub trait NifHost` — `heap() -> &mut beam_alloc::Heap`, `intern_atom(&str) -> Option<Eterm>`,
+  `atom_name(Eterm) -> Option<String>`, plus **defaulted** `self_pid`, `term_to_binary`,
+  `binary_to_term`, `make_ref` (all `None` = unsupported). The ETF pair exists so `beam_abi` needs
+  **no** `beam_codec` dependency.
+- `pub struct NifEnv` — the concrete per-call environment behind the C-facing opaque
+  `*mut ErlNifEnv`: `new(&mut dyn NifHost)`, `host()`, `heap()`, `as_ptr()`,
+  `unsafe from_opaque(*mut ErlNifEnv) -> Option<&mut NifEnv>`, and the pending-exception slot
+  (`pending_exception`/`set_exception`/`clear`, the C `enif_raise_exception`/`enif_clear_env`
+  semantics). Re-exported at the crate root as `beam_abi::{NifEnv, NifHost}`.
+- `nif::enif` / `nif::loader` are **empty placeholders** (doc comments only) for the `enif_*` host
+  functions and the dynamic NIF loader / `ErlNifEntry` load contract — later steps.
 
 ## Frozen layout table (LP64, asserted at compile time in `layout.rs`)
 | type | size | align | asserted field offsets |
@@ -114,12 +129,17 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   `const _: () = assert!(core::mem::offset_of!(T, f) == N);` (both `core::mem` items are const and
   stable on the 1.80 toolchain — no external `static_assertions` dependency is added). A mismatch is
   a **compile error**, not a test failure.
-- **Dependencies:** `beam_common`, `beam_term`, `libc` only. `#[repr(transparent)]` on the term
-  aliases; `#[repr(C)]` on every ABI struct and enum-with-values.
+- **Dependencies:** `beam_common`, `beam_term`, **`beam_alloc`** (wave-0 sibling: the production bump
+  heap the host seam hands out via `NifHost::heap`), `libc`. No external crate beyond `libc`
+  (deliberately: **no `beam_codec`** — ETF goes through `NifHost`). `#[repr(transparent)]` on the
+  term aliases; `#[repr(C)]` on every ABI struct and enum-with-values.
+- **`build.rs` exists solely to link the test/bin links with `-Wl,--export-dynamic`**, so a loaded NIF
+  `.so` can resolve the runtime's `enif_*` dynamic symbols (see Design Decisions).
 - **`unsafe` discipline:** this crate declares FFI types, so `unsafe extern "C" fn` appears
-  throughout; every such declaration is documented, and every `unsafe` block (transmute/precondition
-  helpers, if any) carries a preceding `// SAFETY:` rationale. Function pointers are declared but
-  never *called* here — no call sites exist in this crate.
+  throughout; every such declaration is documented, and every `unsafe` block (term/pointer
+  transmutes, the `NifEnv` opaque-pointer recover path) carries a preceding `// SAFETY:` rationale.
+  `unsafe_op_in_unsafe_fn` stays clean (the deref in `NifEnv::from_opaque` is in an explicit block).
+  Function *pointers* are declared but never called here — no call sites exist in this crate.
 - **Nullability:** C function-pointer fields are `Option<unsafe extern "C" fn …>` (null-pointer
   optimized, same size/align as a raw pointer). Data pointers stay raw `*mut T`/`*const T`.
 - **Opaque handles** are `#[repr(C)] pub struct X { _private: [u8; 0] }` (incomplete C type), used
@@ -157,6 +177,18 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
 - **Target = LP64 only.** Windows-specific layout branches (`TWinDynNifCallbacks`, `ERL_SYS_DRV`
   `start` signature, `WinDynNifCallbacks`) are intentionally not modelled; the layout asserts make
   this explicit (they would fail on a non-LP64 target).
+- **`NifEnv` erases its host borrow's lifetime at construction.** `NifEnv::new(&mut dyn NifHost)` must
+  keep the spec's signature, but the C-facing env has no lifetime parameter — and `host as *mut dyn
+  NifHost` is rejected because a raw pointer to a trait object is invariant and defaults to `'static`
+  (raw-pointer *casts* may not extend a trait-object lifetime either, rust#141402). So `new` does one
+  documented `mem::transmute` of the layout-identical `&mut dyn NifHost` → `*mut dyn NifHost` (only
+  the erased lifetime is reinterpreted); the caller-owned borrow is reproduced exactly by `host`, and
+  the safety invariant ("keep the host alive while the env is used") is discharged by the same caller
+  contract as `from_opaque`. `NifEnv` is not `Clone`, so there is exactly one handle.
+- **The test link exports its dynamic symbols (`build.rs`).** A NIF `.so` resolves `enif_*` at load
+  time out of the loading process, so the test targets are linked with `-Wl,--export-dynamic`
+  (`cargo::rustc-link-arg-tests`). The `*-bins` counterpart is **not** emitted: this package has no
+  `[[bin]]` target and Cargo hard-errors on a `*-bins` instruction when there is none.
 
 ## Test Strategy
 - `tests/layout.rs` — re-asserts every size/align/offset from the frozen table at **runtime** (so a
@@ -172,11 +204,20 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
 - `tests/entry.rs` — build an `ErlNifFunc`/`ErlNifEntry` (the `nif_init` shape) with null callbacks,
   read back `major`/`minor`/`num_of_funcs`/`vm_variant`/`options`, and confirm the `#[repr(C)]` field
   order via `offset_of!` on a constructed value; likewise a `ErlDrvEntry` with all-null callbacks.
-- Per-module `#[cfg(test)]` unit tests only where they add value (constants); the substantive checks
-  live in `tests/`.
+- `tests/host_seam.rs` + `tests/common/mod.rs` — the host seam through the **public** API. `common/`
+  lives in a *subdirectory* so Cargo does not treat it as an integration-test target; test files pull
+  it in with `mod common;` (it starts with `#![allow(dead_code)]`, the same convention as
+  `beam_ets/tests/common/mod.rs`). It provides `erl_include_dir()`, `cc_available()`, `compile_so()`,
+  `skip()` and a `TestHost` (`beam_alloc::Heap` + `beam_term::atom::AtomTable`) implementing
+  `NifHost`. `host_seam.rs` also compiles a trivial `erl_nif.h`-including probe `.so`, proving the
+  include-directory resolution and the `cc -shared -fPIC` invocation work. **Skip loudly, never fail
+  silently**: a missing C compiler or `erl_nif.h` prints a `SKIP:` banner and returns.
+- In-module `#[cfg(test)]` unit tests cover the seam's unsafe surface: the
+  `as_ptr` → `from_opaque` round-trip (a set exception survives), `from_opaque(null) == None`, and
+  `clear()`.
 - Gate: `../scripts/cargo.sh test -p beam_abi` GREEN and `../scripts/cargo.sh build --workspace`
-  GREEN. Cross-checking behaviour against real ERTS is `../../tools/differential`'s job (sibling —
-  read-only, escalate writes to `..`).
+  GREEN (warning-free). Cross-checking behaviour against real ERTS is `../../tools/differential`'s job
+  (sibling — read-only, escalate writes to `..`).
 
 ## Oracle behavior: `erlang:load_nif/2` load-time contract
 Ground truth `../../erts/emulator/beam/erl_nif.c` (`erts_load_nif`, line 4729) — the checks that validate an `ErlNifEntry` (the very fields this crate declares), to be reproduced by the runtime. Verified empirically against the system OTP 29.1.1 / erts-17.1 (scratch NIF in `$TMPDIR`, read-only C).
@@ -208,15 +249,20 @@ Ground truth `../../erts/emulator/beam/erl_nif.c` (`erts_load_nif`, line 4729) �
 - (Note: in this Nix-packaged runtime `code:lib_dir(erts,include)` points at a non-existent path; the real header is `.../lib/erlang/erts-17.1/include/erl_nif.h`.)
 
 ## Routing Table
-- `src/lib.rs` → crate docs, module wiring, root re-exports, the ABI **version constants** (`ERL_NIF_*`, `ERL_DRV_EXTENDED_*`, `ERL_NIF_VM_VARIANT`, `ERL_NIF_MIN_ERTS_VERSION`)
+- `build.rs` → the link-flag build script: `-Wl,--export-dynamic` on the test targets (a NIF `.so` resolves `enif_*` out of the loading process); nothing else
+- `src/lib.rs` → crate docs, module wiring, root re-exports (`NifEnv`/`NifHost` included), the ABI **version constants** (`ERL_NIF_*`, `ERL_DRV_EXTENDED_*`, `ERL_NIF_VM_VARIANT`, `ERL_NIF_MIN_ERTS_VERSION`)
 - `src/common.rs` → `erl_drv_nif.h` shared types: integer typedefs, `SysIOVec`, `ErlDrvSysInfo`, `ErlDrvThreadOpts`, `ErlDirtyJobFlags`, `ErlNifSelectFlags` + `ERL_NIF_SELECT_*`, `ErlDrvMonitor`, time constants
 - `src/nif/term.rs` → `ERL_NIF_TERM`/`ERL_NIF_UINT`, `Eterm ↔ ERL_NIF_TERM` transmute seam
-- `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`)
+- `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`), incl. the opaque `ErlNifEnv`
 - `src/nif/api.rs` → `ErlNifApi` (176-entry `enif_*` function table; generated, header-ordered)
+- `src/nif/host.rs` → the host seam: `NifHost` (heap/atoms/pid/ETF/make_ref services) + `NifEnv` (per-call env behind the opaque `*mut ErlNifEnv`, exception slot, `as_ptr`/`from_opaque`)
+- `src/nif/enif.rs` → **placeholder** for the `enif_*` host functions (later step; doc comment only)
+- `src/nif/loader.rs` → **placeholder** for the dynamic NIF loader / `ErlNifEntry` load contract (later step; doc comment only)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`)
 - `src/driver/api.rs` → `ErlDrvApi` (`driver_*`/`erl_drv_*` function table)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
-- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `entry.rs`)
+- `tests/common/mod.rs` → shared test helpers (NOT a test target: a subdirectory module pulled in with `mod common;`): `erl_include_dir`, `cc_available`, `compile_so`, `skip`, `TestHost`
+- `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `entry.rs`, `host_seam.rs`)
 
 ## Notes for Agents
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`,
@@ -224,18 +270,25 @@ Ground truth `../../erts/emulator/beam/erl_nif.c` (`erts_load_nif`, line 4729) �
   exactly; the asserts are the enforcement. Cite the header line in a comment where a value is
   non-obvious.
 - `../../../erts/emulator/beam/global.h` line ~57 holds the real `struct enif_environment_t` body —
-  it is emulator-internal and must **not** be replicated: `ErlNifEnv` stays opaque here.
+  it is emulator-internal and must **not** be replicated: `ErlNifEnv` stays opaque here (its Rust
+  analogue for a live call is `nif::host::NifEnv`, reached only through `as_ptr`/`from_opaque`).
 - `erl_int_sizes_config.h` (included by `erl_drv_nif.h`) fixes `SIZEOF_LONG == 8` on this target,
   which is why the 4 `enif_*64` table entries are excluded from `ErlNifApi`.
 - Building: **never `cd`**; use `../scripts/cargo.sh build -p beam_abi` /
   `../scripts/cargo.sh test -p beam_abi` (the sandbox `$HOME` is read-only; the wrapper picks a
   writable `CARGO_HOME`).
-- Do not implement any `enif_*`/`erl_drv_*` *function body* — out of scope for this pass. Do not
-  touch `../../tools/`.
+- `tests/common/mod.rs` is invisible to `cargo test` unless some `tests/*.rs` says `mod common;` —
+  keep at least one includer (currently `host_seam.rs`) so it stays compiled; Cargo would in
+  particular *not* report a `tests/common/mod.rs` that fails to compile.
+- Do not implement any `enif_*`/`erl_drv_*` *function body* in this crate yet; `nif::enif`/`nif::loader`
+  stay doc-only placeholders. Do not touch `../../tools/`.
+- Adding a `cargo::rustc-link-arg-bins` instruction to `build.rs` **breaks the build** (no `[[bin]]`
+  target in this package).
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, layering waves (§0 places `beam_abi` in wave 0).
 - `../../CONTEXT.md` → workspace contracts: §1 (A.3 NIF C ABI, A.4 driver C ABI), §2 frozen term layout, §3 error strategy.
 - `../../../ERTS_RUST_REWRITE_EVALUATION.md` §A.3/A.4; `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §C (the frozen-header seam).
 - `../beam_term/` → the internal `Eterm` this crate transmutes to/from (`nif::term`).
+- `../beam_alloc/` → the production bump `Heap` the host seam hands out (`NifHost::heap`).
 - `../beam_rt/`, `../beam_bifs/`, `../beam_io/` → the future implementors of `ErlNifApi`/`ErlDrvApi`.

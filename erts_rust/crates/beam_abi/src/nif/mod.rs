@@ -7,7 +7,14 @@
 //! - [`term`] — `ERL_NIF_TERM` and the safe `Eterm <=> ERL_NIF_TERM` transmute seam.
 //! - [`types`] — the `#[repr(C)]` `ErlNif*` structs/enums/flags and function-type aliases.
 //! - [`api`] — `ErlNifApi`, the frozen `enif_*` function-pointer table (176 entries on LP64).
+//! - [`host`] — the host seam: [`host::NifHost`] (the runtime services behind the `enif_*`
+//!   implementations) and [`host::NifEnv`] (the concrete env behind the opaque `*mut ErlNifEnv`).
+//! - [`enif`] — the `enif_*` host functions (placeholder; added in a later step).
+//! - [`loader`] — the dynamic NIF loader / `ErlNifEntry` load contract (placeholder; later step).
 
 pub mod api;
+pub mod enif;
+pub mod host;
+pub mod loader;
 pub mod term;
 pub mod types;
