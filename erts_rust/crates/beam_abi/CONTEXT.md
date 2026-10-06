@@ -286,8 +286,8 @@ A NIF `.so` leaves `enif_*` **undefined** and the dynamic linker binds them, at 
 - `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`), incl. the opaque `ErlNifEnv`
 - `src/nif/api.rs` → `ErlNifApi` (176-entry `enif_*` function table; generated, header-ordered)
 - `src/nif/host.rs` → the host seam: `NifHost` (heap/atoms/pid/ETF/make_ref services) + `NifEnv` (per-call env behind the opaque `*mut ErlNifEnv`, exception slot, `as_ptr`/`from_opaque`)
-- `src/nif/enif.rs` → **placeholder** for the `enif_*` host functions (later step; doc comment only)
-- `src/nif/loader.rs` → **placeholder** for the dynamic NIF loader / `ErlNifEntry` load contract (later step; doc comment only)
+- `src/nif/enif.rs` → the implemented `enif_*` host functions + `enif_api_table()` / `#[used] static ENIF_API` (the frozen-surface table; keeps the `#[no_mangle]` symbols linked)
+- `src/nif/loader.rs` → the dynamic NIF loader: `NifLibrary`, `NifLoadError`/`NifCallError`, `load()` (dlopen/dlsym + oracle-order validation), `NifLibrary::call`, `Drop` (unload + dlclose)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`)
 - `src/driver/api.rs` → `ErlDrvApi` (`driver_*`/`erl_drv_*` function table)
 - `src/layout.rs` → the compile-time layout freeze (all `const _: () = assert!(...)` for the table above)
