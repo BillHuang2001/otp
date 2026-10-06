@@ -1,11 +1,76 @@
 //! Access enforcement: the protection matrix and a public table.
+//!
+//! The matrix itself is verified against the system `erl` (OTP 29 / erts-17.1):
+//! for a non-owner, a `protected` table admits every *read* but no *write*, a
+//! `private` table admits neither, and a `public` table admits both. The
+//! `TableAccess` view is exercised here for the whole observable `ets` surface —
+//! including the operations it only recently began to gate.
 
 mod common;
 
 use beam_common::BeamError;
-use beam_ets::{Access, OwnerId, Table, TableId, TableOptions};
+use beam_ets::{compile, Access, MatchSpec, OwnerId, Table, TableId, TableOptions};
 use beam_term::prelude::*;
 use common::*;
+
+/// Assert that a gated operation either succeeded (when `allowed`) or failed with
+/// exactly `BeamError::BadArg` (when `!allowed`) — never a wrong result.
+fn assert_gate<T>(result: beam_common::Result<T>, allowed: bool, msg: &str) {
+    match result {
+        Ok(_) => assert!(allowed, "{msg}: expected `badarg` but the op succeeded"),
+        Err(BeamError::BadArg) => assert!(!allowed, "{msg}: expected success but got `badarg`"),
+        Err(other) => panic!("{msg}: expected success/`badarg`, got {other:?}"),
+    }
+}
+
+/// The access matrix as real ETS applies it: whether `requester` may read/write a
+/// table with `access` owned by `owner`.
+fn expected(access: Access, owner: OwnerId, requester: Option<OwnerId>) -> (bool, bool) {
+    let is_owner = requester == Some(owner);
+    let read = match access {
+        Access::Public | Access::Protected => true,
+        Access::Private => is_owner,
+    };
+    let write = match access {
+        Access::Public => true,
+        Access::Protected | Access::Private => is_owner,
+    };
+    (read, write)
+}
+
+/// A table of `access` owned by `owner`, seeded by the owner with six objects
+/// `{K, K*100}` for `K ∈ {0, 10, 20, 30, 40, 50}`.
+fn seeded_table(access: Access, owner: OwnerId, heap: &mut Heap, atoms: &AtomTable) -> Table {
+    let mut opts = TableOptions::new();
+    opts.set_access(access);
+    let mut t = Table::new(TableId::next(), opts).unwrap();
+    t.set_owner(Some(owner));
+    // The owner may always write, whatever the mode.
+    {
+        let mut as_owner = t.as_requester(Some(owner));
+        for k in [0i64, 10, 20, 30, 40, 50] {
+            as_owner.insert(object(heap, k, k * 100), atoms).unwrap();
+        }
+    }
+    t
+}
+
+/// A compiled match-spec selecting every 2-tuple object with body `[true]`
+/// (the shape `ets:select_delete/2` needs to delete the matches).
+fn every_object_spec(heap: &mut Heap, atoms: &mut AtomTable) -> MatchSpec {
+    let underscore = interned_atom(atoms, "_");
+    let head = heap.tuple(&[underscore, underscore]).expect("test heap has room");
+    let body = proper_list(heap, &[interned_atom(atoms, "true")]);
+    let clause = heap.tuple(&[head, NIL, body]).expect("test heap has room");
+    let spec = proper_list(heap, &[clause]);
+    compile(spec, atoms).expect("a valid match spec")
+}
+
+/// The `{'_', '_'}` pattern term matching every 2-tuple object.
+fn wildcard_pattern(heap: &mut Heap, atoms: &mut AtomTable) -> Eterm {
+    heap.tuple(&[interned_atom(atoms, "_"), interned_atom(atoms, "_")])
+        .expect("test heap has room")
+}
 
 #[test]
 fn access_enforcement_follows_the_protection_matrix() {
@@ -141,4 +206,254 @@ fn a_public_table_is_open_to_every_requester() {
         Err(BeamError::BadArg)
     ));
     assert!(!t.member(make_small(2), &atoms));
+}
+
+/// Every newly write-gated operation obeys the matrix for the three requesters
+/// (owner / another process / none), across all three access modes.
+#[test]
+fn newly_wrapped_write_ops_follow_the_protection_matrix() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            let mut heap = Heap::new(4096);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let (_, allowed) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+            let spec = every_object_spec(&mut heap, &mut atoms);
+            let wildcard = wildcard_pattern(&mut heap, &mut atoms);
+            let seeded = t.size();
+
+            let mut view = t.as_requester(requester);
+
+            let list = [object(&mut heap, 1, 10), object(&mut heap, 2, 20)];
+            assert_gate(
+                view.insert_list(&list, &atoms),
+                allowed,
+                &format!("{tag} insert_list"),
+            );
+            assert_gate(
+                view.insert_new(object(&mut heap, 3, 30), &atoms),
+                allowed,
+                &format!("{tag} insert_new"),
+            );
+            assert_gate(
+                view.delete(make_small(0), &atoms),
+                allowed,
+                &format!("{tag} delete"),
+            );
+            assert_gate(
+                view.delete_object(object(&mut heap, 10, 1000), &atoms),
+                allowed,
+                &format!("{tag} delete_object"),
+            );
+            let mut bh = rebuild_heap();
+            assert_gate(
+                view.update_counter(make_small(20), make_small(1), &atoms, &mut bh),
+                allowed,
+                &format!("{tag} update_counter"),
+            );
+            let mut bh = rebuild_heap();
+            assert_gate(
+                view.update_element(make_small(30), &[(2, make_small(999))], &atoms, &mut bh),
+                allowed,
+                &format!("{tag} update_element"),
+            );
+            let mut bh = rebuild_heap();
+            assert_gate(
+                view.select_delete(&spec, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} select_delete"),
+            );
+            let mut bh = rebuild_heap();
+            assert_gate(
+                view.match_delete(wildcard, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} match_delete"),
+            );
+            assert_gate(
+                view.delete_all_objects(),
+                allowed,
+                &format!("{tag} delete_all_objects"),
+            );
+
+            drop(view);
+            if allowed {
+                // Every write went through (the seed objects were eventually
+                // deleted); nothing is left.
+                assert_eq!(t.size(), 0, "{tag}: writes should have applied");
+            } else {
+                // Not one denied write touched the table.
+                assert_eq!(t.size(), seeded, "{tag}: a denied write mutated the table");
+            }
+        }
+    }
+}
+
+/// Every newly read-gated operation obeys the matrix for the three requesters.
+#[test]
+fn newly_wrapped_read_ops_follow_the_protection_matrix() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let mut atoms = AtomTable::new();
+            let mut heap = Heap::new(4096);
+            let mut t = seeded_table(access, owner, &mut heap, &atoms);
+            let (allowed, _) = expected(access, owner, requester);
+            let tag = format!("{access:?}/{who}");
+            let spec = every_object_spec(&mut heap, &mut atoms);
+            let wildcard = wildcard_pattern(&mut heap, &mut atoms);
+
+            let view = t.as_requester(requester);
+            let mut bh = rebuild_heap();
+
+            assert_gate(
+                view.lookup(make_small(0), &atoms),
+                allowed,
+                &format!("{tag} lookup"),
+            );
+            assert_gate(
+                view.member(make_small(0), &atoms),
+                allowed,
+                &format!("{tag} member"),
+            );
+            assert_gate(
+                view.lookup_element(make_small(0), 1, &atoms),
+                allowed,
+                &format!("{tag} lookup_element"),
+            );
+            assert_gate(
+                view.lookup_element_or(make_small(0), 1, make_small(0), &atoms),
+                allowed,
+                &format!("{tag} lookup_element_or"),
+            );
+            assert_gate(
+                view.select(&spec, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} select"),
+            );
+            assert_gate(
+                view.select_count(&spec, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} select_count"),
+            );
+            assert_gate(
+                view.match_object(wildcard, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} match_object"),
+            );
+            assert_gate(
+                view.match_(wildcard, &atoms, &mut bh),
+                allowed,
+                &format!("{tag} match"),
+            );
+            assert_gate(view.first(&atoms), allowed, &format!("{tag} first"));
+            assert_gate(view.last(&atoms), allowed, &format!("{tag} last"));
+            assert_gate(
+                view.next(make_small(0), &atoms),
+                allowed,
+                &format!("{tag} next"),
+            );
+            assert_gate(
+                view.prev(make_small(0), &atoms),
+                allowed,
+                &format!("{tag} prev"),
+            );
+            assert_gate(view.tab2list(), allowed, &format!("{tag} tab2list"));
+            assert_gate(view.size(), allowed, &format!("{tag} size"));
+            assert_gate(view.is_empty(), allowed, &format!("{tag} is_empty"));
+        }
+    }
+}
+
+/// `ordered_set` navigation is table-level, so the read-checked wrappers cover it
+/// exactly like the hash kinds.
+#[test]
+fn ordered_set_navigation_is_access_checked() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let requesters = [("owner", Some(owner)), ("other", Some(other)), ("none", None)];
+
+    for access in [Access::Public, Access::Protected, Access::Private] {
+        for (who, requester) in requesters {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(512);
+            let mut opts = TableOptions::new();
+            opts.set_kind(beam_ets::TableKind::OrderedSet);
+            opts.set_access(access);
+            let mut t = Table::new(TableId::next(), opts).unwrap();
+            t.set_owner(Some(owner));
+            {
+                let mut as_owner = t.as_requester(Some(owner));
+                for k in [10i64, 20, 30] {
+                    as_owner.insert(object(&mut heap, k, k * 10), &atoms).unwrap();
+                }
+            }
+
+            let (read_ok, _) = expected(access, owner, requester);
+            let tag = format!("ordered_set {access:?}/{who}");
+            let view = t.as_requester(requester);
+
+            assert_gate(view.first(&atoms), read_ok, &format!("{tag} first"));
+            assert_gate(view.last(&atoms), read_ok, &format!("{tag} last"));
+            assert_gate(
+                view.next(make_small(10), &atoms),
+                read_ok,
+                &format!("{tag} next"),
+            );
+            assert_gate(
+                view.prev(make_small(30), &atoms),
+                read_ok,
+                &format!("{tag} prev"),
+            );
+
+            if read_ok {
+                // The navigation actually walks the ordered key set.
+                assert_eq!(view.first(&atoms).unwrap(), Some(make_small(10)));
+                assert_eq!(view.last(&atoms).unwrap(), Some(make_small(30)));
+                assert_eq!(view.next(make_small(10), &atoms).unwrap(), Some(make_small(20)));
+                assert_eq!(view.prev(make_small(30), &atoms).unwrap(), Some(make_small(20)));
+            }
+        }
+    }
+}
+
+/// A denied write is `badarg` — never a silent no-op reported as success — and it
+/// leaves the table byte-for-byte unchanged.
+#[test]
+fn a_denied_write_never_reports_success() {
+    let owner = OwnerId::new(1);
+    let other = OwnerId::new(2);
+    let mut atoms = AtomTable::new();
+    let mut heap = Heap::new(512);
+
+    let mut t = seeded_table(Access::Protected, owner, &mut heap, &atoms);
+    let before = t.size();
+    let spec = every_object_spec(&mut heap, &mut atoms);
+    let wildcard = wildcard_pattern(&mut heap, &mut atoms);
+
+    let mut view = t.as_requester(Some(other));
+    let mut bh = rebuild_heap();
+    assert!(matches!(
+        view.delete_all_objects(),
+        Err(BeamError::BadArg)
+    ));
+    assert!(matches!(
+        view.select_delete(&spec, &atoms, &mut bh),
+        Err(BeamError::BadArg)
+    ));
+    let mut bh = rebuild_heap();
+    assert!(matches!(
+        view.match_delete(wildcard, &atoms, &mut bh),
+        Err(BeamError::BadArg)
+    ));
+
+    drop(view);
+    assert_eq!(t.size(), before);
 }
