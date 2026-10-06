@@ -317,5 +317,85 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // -- the `{minor_version, _}` encode dialect / funs / integer-keyed maps -------
+        Case {
+            id: "etf/term_to_binary_minor_version_2_atom",
+            description: "term_to_binary/2 with {minor_version,2} keeps SMALL_ATOM_UTF8_EXT (119) for an atom",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(hello, [{minor_version, 2}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,8,131,119,5,104,101,108,108,111>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_minor_version_2_float",
+            description: "term_to_binary/2 with {minor_version,2} encodes a float as NEW_FLOAT_EXT (70)",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(1.5, [{minor_version, 2}])",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,10,131,70,63,248,0,0,0,0,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_export_fun",
+            description: "an exported function fun encodes as EXPORT_EXT (113): module, function, arity",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(fun lists:reverse/1)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,20,131,113,119,5,108,105,115,116,115,119,7,114,101,118,101,114,115,101,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_integer_key_map_order",
+            description: "a small integer-keyed map encodes as MAP_EXT with its keys in ascending order",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(#{1 => a, 2 => b, 3 => c})",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,109,0,0,0,21,131,116,0,0,0,3,97,1,119,1,97,97,2,119,1,98,97,3,119,1,99>>"),
+                exit_code: 0,
+            },
+        },
     ]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::group;
+    use crate::corpus::Contract;
+
+    #[test]
+    fn new_etf_cases_pin_canonical_term_to_binary_bytes() {
+        let cases = group();
+        for id in [
+            "etf/term_to_binary_minor_version_2_atom",
+            "etf/term_to_binary_minor_version_2_float",
+            "etf/term_to_binary_export_fun",
+            "etf/term_to_binary_integer_key_map_order",
+        ] {
+            let case = cases.iter().find(|c| c.id == id).expect("registered");
+            assert_eq!(case.contracts, &[Contract::BeamAsm], "{id}");
+            assert_eq!(case.kind_label(), "term_to_binary", "{id}");
+            assert_eq!(case.golden.exit_code, 0, "{id}");
+            assert!(case.golden.stdout.is_some_and(|s| !s.is_empty()), "{id}");
+        }
+    }
 }
