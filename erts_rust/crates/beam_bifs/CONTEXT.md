@@ -479,7 +479,7 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
     conversions (`integer_to_list`, `encode_unsigned`, `float/1`), oracle-pinned.
   - `tests/function_clause.rs` (4) — the `lists.erl` no-clause failures raise `error:function_clause`
     (the bare atom reason), pinned against the oracle.
-  - `tests/pure_bifs.rs` (12) — the newly registered pure BIFs `maps:take/2`, `maps:from_keys/2`,
+  - `tests/pure_bifs.rs` (12) — the pure BIFs `maps:take/2`, `maps:from_keys/2`,
     `lists:keymember/3`, `lists:keysearch/3`, `unicode:bin_is_7bit/1`, `io:printable_range/0`,
     `string:list_to_float/1` and `math:*`, oracle-pinned.
   - `tests/binary_to_term_atoms.rs` (4) — `binary_to_term` interns decoded atoms through the
