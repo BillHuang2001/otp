@@ -77,7 +77,7 @@ pub trait ExecutionContext {
 - `dispatch` tries the eight families in a fixed order — `tuples`, `records`, `lists`, `funs`, `exceptions`, `floats`, `maps`, `bitstrings` — and returns the first family's `Step`.
 - Each family exposes `pub(crate) fn exec(machine: &mut Machine, module: &Module, labels: &BTreeMap<Label, (u32, u32)>, instr: &Instr, func: u32, pc: u32, ctx: &mut dyn ExecutionContext) -> Result<Option<Step>>`.
 - `Ok(Some(step))` means "this family executed the instruction"; `Ok(None)` means "not this family's variant"; `Err` means the family raised.
-- When **no** family claims an instruction, `dispatch` returns `error::unsupported("widened opcode not yet executed")` — the same documented sentinel the loop emitted before the seam existed.
+- When **no** family claims an instruction, `dispatch` returns `error::unsupported("widened opcode not yet executed: <name>")` — the documented sentinel prefix the loop emitted before the seam existed plus the instruction's `ops.tab` spelling (`instr_name`: the receive/message family, `bif0`/`bif`, `init_yregs`, `executable_line`/`debug_line`, else the generic `instruction`), so an unclaimed opcode is diagnosable from the error alone.
 - The seam exists for **edit locality**: a family is implemented or extended entirely inside its own module, and adding a family is a one-line change in `families/mod.rs`.
 - The `families/` module docs list each family's owned variants; keep that list and this crate's Routing Table in sync when a family changes.
 
