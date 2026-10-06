@@ -243,9 +243,11 @@ flatmap/hashmap switchover is an *open* layout this crate deliberately collapses
 §Term-layout ownership), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
 whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
-`encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
-by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
+`encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, and
+only when zlib shrinks the body — otherwise the plain image is emitted, per the C shrink rule),
+`121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
 4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
+`67 RECORD_EXT` (native records — see §Records; the interior layout is `beam_term::record`'s),
 `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
 **No recognized tag is left `unsupported`.** `RECORD_EXT` (`67`) decodes and encodes through
 `beam_term::record` (§Records). An `unsupported` outcome remains only for a *term kind* the wire
