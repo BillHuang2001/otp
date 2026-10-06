@@ -22,6 +22,7 @@ use crate::link::Links;
 use crate::monitor::{MonitoredBy, Monitors};
 use crate::pid::ProcessId;
 use crate::registers::Registers;
+use crate::run_queue::Priority;
 
 /// The scheduler-visible state of a process.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
@@ -60,8 +61,8 @@ impl DeliverOutcome {
 /// The process's boolean flags, as a `u32` bitset newtype (no `bitflags` dependency).
 ///
 /// These are the flags the Milestone-1 core reads directly: `trap_exit`, `system`,
-/// `in_run_queue`, `garbage_collecting` and `active`. The legacy C `F_*` word is far
-/// wider; the rest is a follow-up.
+/// `in_run_queue`, `garbage_collecting`, `active` and `sensitive`. The legacy C `F_*` word
+/// is far wider; the rest is a follow-up.
 pub struct ProcessFlags {
     bits: u32,
 }
@@ -76,6 +77,8 @@ const FLAG_IN_RUN_QUEUE: u32 = 1 << 2;
 const FLAG_GARBAGE_COLLECTING: u32 = 1 << 3;
 /// The `active` flag bit.
 const FLAG_ACTIVE: u32 = 1 << 4;
+/// The `sensitive` flag bit (`process_flag(sensitive, Bool)`).
+const FLAG_SENSITIVE: u32 = 1 << 5;
 
 impl ProcessFlags {
     /// No flags set.
@@ -143,6 +146,19 @@ impl ProcessFlags {
         self.set(FLAG_ACTIVE, value);
     }
 
+    /// Whether the process is `sensitive` (`process_flag(sensitive, true)`).
+    ///
+    /// A sensitive process uses a pre-allocated heap fragment for temporary allocations so
+    /// that a failure can be reported without allocating more memory.
+    pub fn sensitive(&self) -> bool {
+        self.get(FLAG_SENSITIVE)
+    }
+
+    /// Sets the `sensitive` flag.
+    pub fn set_sensitive(&mut self, value: bool) {
+        self.set(FLAG_SENSITIVE, value);
+    }
+
     /// Reads one flag bit.
     fn get(&self, bit: u32) -> bool {
         self.bits & bit != 0
@@ -171,6 +187,12 @@ pub struct Process {
     state: ProcessState,
     /// Boolean flags.
     flags: ProcessFlags,
+    /// Scheduling priority (the legacy C `p->prio` / `PRIORITY_*`).
+    priority: Priority,
+    /// The legacy C `p->save_calls`: the number of most-recent calls kept for tracing. Only
+    /// the value/return-old-value contract of `process_flag(save_calls, N)` is modelled (see
+    /// [`Process::set_save_calls`]); the tracing subsystem itself is absent in M1.
+    save_calls: u16,
     /// The two-generation collector owning the young (mutator) and mature heaps.
     collector: Collector,
     /// The process's off-heap (MSO) handles.
@@ -215,6 +237,8 @@ impl Process {
             pid,
             state: ProcessState::Runnable,
             flags,
+            priority: Priority::Normal,
+            save_calls: 0,
             collector: Collector::new(policy)?,
             off_heap: OffHeapTable::new(),
             mailbox: Queue::new(),
@@ -280,6 +304,46 @@ impl Process {
     /// Sets the `trap_exit` flag.
     pub fn set_trap_exit(&mut self, value: bool) {
         self.flags.set_trap_exit(value);
+    }
+
+    /// This process's scheduling priority (`process_flag(priority, P)`).
+    pub fn priority(&self) -> Priority {
+        self.priority
+    }
+
+    /// Sets this process's scheduling priority.
+    ///
+    /// This is a pure field set: moving an **already-enqueued** process between run-queue
+    /// levels is the scheduler's job — the [`crate::scheduler::Scheduler`] reads
+    /// [`Process::priority`] when it requeues on a yield, so a demotion made during a slice
+    /// takes effect at the process's next requeue.
+    pub fn set_priority(&mut self, priority: Priority) {
+        self.priority = priority;
+    }
+
+    /// Whether this process is `sensitive` (`process_flag(sensitive, true)`).
+    pub fn is_sensitive(&self) -> bool {
+        self.flags.sensitive()
+    }
+
+    /// Sets the `sensitive` flag.
+    pub fn set_sensitive(&mut self, value: bool) {
+        self.flags.set_sensitive(value);
+    }
+
+    /// The value of the legacy C `p->save_calls` (`process_flag(save_calls, N)`).
+    pub fn save_calls(&self) -> u16 {
+        self.save_calls
+    }
+
+    /// Sets the `save_calls` count (`process_flag(save_calls, N)`).
+    ///
+    /// Only the *value* and the return-old-value contract of `process_flag(save_calls, N)`
+    /// are modelled here so `beam_bifs` can reproduce the C-faithful returned old value. The
+    /// *effect* — actually saving the process's last `N` calls for `seq_trace`/`dbg` — is NOT
+    /// modelled in M1 because the tracing subsystem is absent.
+    pub fn set_save_calls(&mut self, save_calls: u16) {
+        self.save_calls = save_calls;
     }
 
     /// Reductions consumed in the current time slice.
@@ -605,6 +669,49 @@ mod tests {
         let rebuilt = ProcessFlags::from_bits(0b1_1101);
         assert_eq!(rebuilt.bits(), flags.bits());
         assert!(rebuilt.trap_exit());
+    }
+
+    #[test]
+    fn sensitive_flag_round_trips() {
+        let mut flags = ProcessFlags::new();
+        assert!(!flags.sensitive());
+        flags.set_sensitive(true);
+        assert!(flags.sensitive());
+        assert_eq!(flags.bits(), FLAG_SENSITIVE);
+        flags.set_sensitive(false);
+        assert!(!flags.sensitive());
+        assert_eq!(flags.bits(), 0);
+    }
+
+    #[test]
+    fn default_priority_is_normal_and_round_trips() {
+        let mut process = Process::new(pid(11)).expect("the default heap allocates");
+        assert_eq!(process.priority(), Priority::Normal);
+        process.set_priority(Priority::Max);
+        assert_eq!(process.priority(), Priority::Max);
+        process.set_priority(Priority::Low);
+        assert_eq!(process.priority(), Priority::Low);
+    }
+
+    #[test]
+    fn sensitive_accessors_delegate_to_the_flags() {
+        let mut process = Process::new(pid(12)).expect("the default heap allocates");
+        assert!(!process.is_sensitive());
+        process.set_sensitive(true);
+        assert!(process.is_sensitive());
+        assert!(process.flags().sensitive());
+        process.set_sensitive(false);
+        assert!(!process.is_sensitive());
+    }
+
+    #[test]
+    fn save_calls_defaults_to_zero_and_round_trips() {
+        let mut process = Process::new(pid(13)).expect("the default heap allocates");
+        assert_eq!(process.save_calls(), 0);
+        process.set_save_calls(100);
+        assert_eq!(process.save_calls(), 100);
+        process.set_save_calls(0);
+        assert_eq!(process.save_calls(), 0);
     }
 
     #[test]

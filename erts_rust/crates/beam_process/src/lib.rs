@@ -20,9 +20,11 @@
 //!
 //! A **correct single-OS-thread** core: one [`Scheduler`], no thread pools, no dirty
 //! schedulers, no lock-free/threaded run queues and no cross-scheduler barrier beyond the
-//! documented single-scheduler [`ThreadProgress`] stub. Multi-scheduler balancing, the
-//! decoupled signal queue, priority run queues, the process dictionary and
-//! distribution-wide links/monitors are documented follow-ups (see the crate
+//! documented single-scheduler [`ThreadProgress`] stub. The run queue is served
+//! highest-priority first (max/high/normal/low — see [`RunQueue`]), though the C's shared
+//! NORMAL/LOW physical queue with the `schedule_count` deferral is approximated by four
+//! distinct FIFOs. Multi-scheduler balancing, the decoupled signal queue, the process
+//! dictionary and distribution-wide links/monitors are documented follow-ups (see the crate
 //! `CONTEXT.md`, Known Issues).
 //!
 //! # Contracts

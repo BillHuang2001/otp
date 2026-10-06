@@ -5,6 +5,14 @@
 //! queue, runs it for one reduction slice and interprets the outcome (requeue on yield,
 //! leave the queue on wait/suspend, terminate on exit).
 //!
+//! # Scheduling order
+//!
+//! The run queue is served **highest-priority first** (MAX → HIGH → NORMAL → LOW, FIFO
+//! within a level — see [`crate::run_queue::RunQueue`]). A process is requeued at **its own**
+//! current priority when it yields, so a `process_flag(priority, …)` demotion made during a
+//! slice takes effect at that process's next requeue, and a woken process resumes at its own
+//! priority too.
+//!
 //! # The engine seam
 //!
 //! The scheduler must not know how a process executes, so the execution engine is reached
@@ -38,7 +46,7 @@ use crate::pid::ProcessId;
 use crate::process::ProcessState;
 use crate::progress::ThreadProgress;
 use crate::ptab::ProcessTable;
-use crate::run_queue::RunQueue;
+use crate::run_queue::{Priority, RunQueue};
 
 /// The number of reductions a process runs before being pre-empted (the C
 /// `CONTEXT_REDS`).
@@ -110,11 +118,18 @@ impl Scheduler {
         &mut self.run_queue
     }
 
-    /// Makes `pid` runnable by appending it to the run queue.
+    /// Makes `pid` runnable by appending it to the run queue at **normal** priority.
+    ///
+    /// This is the ordinary spawn/requeue path; use [`Scheduler::enqueue_with_priority`] to
+    /// place a process on a non-normal level.
     pub fn enqueue(&mut self, pid: ProcessId) {
         self.run_queue.enqueue(pid);
     }
 
+    /// Makes `pid` runnable by appending it to the run queue at `priority`.
+    pub fn enqueue_with_priority(&mut self, pid: ProcessId, priority: Priority) {
+        self.run_queue.enqueue_with_priority(pid, priority);
+    }
     /// The thread-progress tracker.
     pub fn progress(&self) -> &ThreadProgress {
         &self.progress
@@ -161,12 +176,19 @@ impl Scheduler {
 
         match outcome {
             RunOutcome::Yield => {
-                // Still runnable: back to the tail of the queue (round-robin fairness).
-                if let Some(process) = table.get_mut(pid) {
-                    process.flags_mut().set_in_run_queue(true);
-                    process.set_state(ProcessState::Runnable);
-                }
-                self.run_queue.enqueue(pid);
+                // Still runnable: back to the tail of its own priority's queue. The priority
+                // is read *after* the slice, so a `process_flag(priority, …)` demotion the
+                // runner just performed is honored at this requeue (defaulting to normal when
+                // the process is gone).
+                let priority = table
+                    .get_mut(pid)
+                    .map(|process| {
+                        process.flags_mut().set_in_run_queue(true);
+                        process.set_state(ProcessState::Runnable);
+                        process.priority()
+                    })
+                    .unwrap_or_default();
+                self.run_queue.enqueue_with_priority(pid, priority);
             }
             // The runner owns the state transition for a waiting/suspended process; the
             // scheduler only takes it out of the ready queue.
@@ -190,7 +212,8 @@ impl Scheduler {
     /// A woken pid is enqueued only when it is still a **live** process whose state is
     /// `Runnable` and that is not already in a run queue — a process can be woken and then
     /// terminated (or re-blocked) within the same slice, and a `Yield` already requeued the
-    /// process that just ran, so its stale wake must not double-enqueue it.
+    /// process that just ran, so its stale wake must not double-enqueue it. A woken process
+    /// resumes at **its own** priority (not normal).
     ///
     /// This is the hook `beam_rt` calls after it sends to a blocked process **outside** a
     /// scheduler slice (`run_slice` calls it automatically at each slice's end). See the
@@ -207,10 +230,13 @@ impl Scheduler {
             if skip {
                 continue;
             }
-            if let Some(process) = table.get_mut(pid) {
+            let priority = if let Some(process) = table.get_mut(pid) {
                 process.flags_mut().set_in_run_queue(true);
-            }
-            self.run_queue.enqueue(pid);
+                process.priority()
+            } else {
+                Priority::default()
+            };
+            self.run_queue.enqueue_with_priority(pid, priority);
             resumed += 1;
         }
         resumed
