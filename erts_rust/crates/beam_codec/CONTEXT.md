@@ -474,18 +474,23 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `VERSION_MAGIC`
 - `src/tag.rs` → wire-frozen tag constants + `Tag` enum (`from_byte`/`as_byte`/`name`/`covered`)
 - `src/reader.rs` → `Reader<'a>`, the bounds-checked BE cursor (safe)
-- `src/writer.rs` → `Writer`, the growable byte sink (safe)
+- `src/writer.rs` → `Writer`, the growable byte sink (safe); crate-internal `patch_u32be` (the
+  `NEW_FUN_EXT` size-field patch)
 - `src/atom_cache.rs` → `AtomCache` (2048-slot distribution atom cache)
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
 - `src/encode.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
-  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`
+  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`; the private
+  `encode_fun`/`encode_fun_external`/`encode_fun_imported`
 - `src/decode.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
-  `decompress_wrapper`/`is_compressed_image`
-- `src/error.rs` → error constructors only (`BadArg`/`SystemLimit` mapping), `unsupported`,
-  `is_unsupported`, `UNSUPPORTED_REASON`
+  `decompress_wrapper`/`is_compressed_image`; the private fun helpers `decode_export`,
+  `decode_new_fun`, `decode_small_u32`, `decode_creator_pid`
+- `src/error.rs` → error constructors (`BadArg`/`SystemLimit` mapping), `unsupported`,
+  `is_unsupported`, `UNSUPPORTED_REASON`, plus the local-fun surface (`unsupported_local_fun`,
+  `is_unsupported_local_fun`, `LOCAL_FUN_REASON`)
 - `src/term/mod.rs` → **forwarding layer (inside the only `unsafe` subtree)**: allocates from
-  `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::{tuple_size, tuple_element,
-  car, cdr}` for float/bignum/flatmap/external-identifier construction and inspection
+  `beam_alloc::Heap` and forwards to `beam_term::thing` / `beam_term::fun` /
+  `beam_term::{tuple_size, tuple_element, car, cdr}` for float/bignum/flatmap/external-identifier and
+  fun/export construction and inspection
 - `src/term/binary.rs` → the local **bitstring word-layout shim** (`ErlHeapBits`/`ErlSubBits`
   constructors + readers); the crate's only non-forwarding layout code (owed to `beam_term::thing`)
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
