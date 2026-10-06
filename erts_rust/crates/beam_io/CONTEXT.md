@@ -195,6 +195,8 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub struct EfileDriver` (`name() == "efile"`) — delegates byte movement to a composed `FdDriver`:
   `unopened()`, `read_only(fd)`, `write_only(fd)`, `connected(read, write)`, `path() -> Option<&[u8]>`, `eof()`;
   `control` verbs `open <path>` / `close` / `path` / `eof` plus the delegated `line`/`noline`/`binary`/`text`/`getopts`.
+  `open` works on **regular files** (served by the poller's `poll(2)` fallback) as well as on the descriptors
+  epoll accepts (pipes/FIFOs/char devices/sockets); `write_only`/`connected` write regular files too.
   `pub fn make_efile() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered as the built-in `"efile"`).
 ### `drivers/spawn.rs` (the OS-child driver + its term-free spec)
 - `pub enum SpawnStream { Binary, List }` (`Default = List`) with `atom_name(&self) -> &'static str`
