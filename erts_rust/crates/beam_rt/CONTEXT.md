@@ -673,8 +673,11 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   `code:` section above), not a running `code_server` process.
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
-  the grammar is *unsupported* (exit 3); the M1 expression gaps (`!` send, a bare `receive`) are typed
-  errors in `src/eval/mod.rs`. A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
+  the grammar is *unsupported* (exit 3). The `!` **send operator** and a **bare `receive`** that drives
+  a spawned sender are supported; the remaining M1 expression gaps are a bare `receive` that never
+  receives a message (no sender is runnable ⇒ `unsupported: receive: no matching message arrived`), a
+  `receive` inside a spawned process, and `after infinity` — all typed errors in `src/eval/mod.rs`.
+  A capability gap (`unsupported_opcode:`/`unsupported_bif`/`bad_eval`)
   is **uncatchable**: it travels as `Flow::Fatal` (like `halt`) so a `try`/`catch` in the probe cannot
   turn it into an apparent exception, and the CLI exits 3. Real `erl`
   start-script processing, `-init_debug` and the rest are absent — and, like any unmodeled switch, are
