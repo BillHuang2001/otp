@@ -128,9 +128,10 @@ is `decode`'s.
   body (never containing the version byte). `Encoder::finish_compressed` strips a leading version byte
   written by `Encoder::new`; `encode_term_body_compressed` omits the wrapper's version byte for the
   dist/ETS body form (`[COMPRESSED_EXT][inner_size:4 BE][zlib body]`). The wrapper is emitted **only**
-  when explicitly requested — `encode_term` stays uncompressed. (C additionally reverts to the plain
-  image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
-  when compression is requested.)
+  when explicitly requested — `encode_term` stays uncompressed — and then only when zlib *shrinks* the
+  body: C's shrink rule (`external.c:2276-2298`) gives zlib a destination cap of `body_len - 5` bytes
+  (the 5-byte wrapper) and the **plain** image is emitted when the compressed stream does not fit, so
+  `encode_term_compressed([1,2,3], level)` is the plain `[131,107,0,3,1,2,3]`, exactly the oracle.
 - **`LOCAL_EXT` wrapper** — `Encoder::finish_local(hash)` / `encode_term_local(Eterm, &AtomTable,
   hash: u32)` emit `[VERSION_MAGIC][LOCAL_EXT (121)][hash:4 BE][body]`, the `term_to_binary/2 [local]`
   image (`external.c:3305-3315`, hash patched at `:4046-4105`). `body` is the term image with the
