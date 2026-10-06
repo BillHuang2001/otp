@@ -233,6 +233,118 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "bifs/lists_member_true",
+            description: "lists:member/2 is true for a present element",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:member(2, [1,2,3])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/lists_nth",
+            description: "lists:nth/2 indexes a list one-based",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "lists:nth(2, [10,20,30])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 20"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/maps_is_key",
+            description: "maps:is_key/2 is true for a present key",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "maps:is_key(a, #{a => 1})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/binary_part",
+            description: "binary:part/3 extracts a sub-binary",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "binary:part(<<1,2,3,4>>, 1, 2)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<2,3>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/setelement",
+            description: "setelement/3 replaces one tuple element and returns the tuple",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "setelement(2, {1,2,3}, 9)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {1,9,3}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/type_test_bifs",
+            description: "the is_*/1 type-test BIFs agree on their own literals",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "{is_atom(ok), is_integer(1), is_list([1]), is_binary(<<1>>), is_tuple({1}), is_map(#{})}",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {true,true,true,true,true,true}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/list_to_integer",
+            description: "list_to_integer/1 parses a base-10 digit list",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "list_to_integer(\"1234\")",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 1234"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "bifs/named_fun_apply",
+            description: "a named fun (`fun erlang:abs/1`) is a first-class value that applies",
+            contracts: &[Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "begin F = fun erlang:abs/1, F(-7) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 7"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "bifs/io_lib_format",
             description: "io_lib:format/2 returns the formatted text as a deep list",
             contracts: &[Contract::OtpApps],

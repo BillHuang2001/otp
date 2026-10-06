@@ -109,5 +109,47 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 1,
             },
         },
+        Case {
+            id: "errors/tl_of_empty_list",
+            description: "tl/1 of the empty list raises error:badarg",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "tl([])",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "errors/element_zero_index",
+            description: "element/2 with a zero index (one-based) raises error:badarg",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "element(0, {1,2})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
+        Case {
+            id: "errors/binary_to_integer_badarg",
+            description: "binary_to_integer/1 rejects a non-digit binary with error:badarg",
+            contracts: &[Contract::LanguageSemantics, Contract::OtpApps],
+            kind: CaseKind::Eval {
+                expr: "binary_to_integer(<<120>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("exception error badarg"),
+                exit_code: 1,
+            },
+        },
     ]
 }

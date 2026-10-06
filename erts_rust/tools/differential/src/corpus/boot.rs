@@ -68,5 +68,19 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "boot/erts_version_is_string",
+            description: "erlang:system_info(version) is a string (the erts version banner shape)",
+            contracts: &[Contract::Build],
+            kind: CaseKind::Eval {
+                expr: "is_list(erlang:system_info(version))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
     ]
 }

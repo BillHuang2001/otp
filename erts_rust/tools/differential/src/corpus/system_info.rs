@@ -95,6 +95,34 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         Case {
+            id: "system_info/logical_processors_is_integer",
+            description: "erlang:system_info(logical_processors) is an integer count",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "is_integer(erlang:system_info(logical_processors))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "system_info/system_architecture_is_string",
+            description: "erlang:system_info(system_architecture) is a string (value is machine-dependent)",
+            contracts: &[Contract::Introspection],
+            kind: CaseKind::Eval {
+                expr: "is_list(erlang:system_info(system_architecture))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok true"),
+                exit_code: 0,
+            },
+        },
+        Case {
             id: "system_info/unknown_key_is_badarg",
             description: "erlang:system_info/1 with an unknown key raises error:badarg",
             contracts: &[Contract::Introspection],

@@ -50,7 +50,10 @@ pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      \x20        fib/1, fact/2, sumto/1, gcd/2, ack/2, pow/2, collatz/1,\n\
      \x20        elem2_0/0, tsize0/0,\n\
      \x20        len0/0, sumlist0/0, nth2/1, revlen0/0, maxlist0/0, bsize0/0, decode0/0,\n\
-     \x20        msize0/0, mapget0/0, seqsum/1]).\n\
+     \x20        msize0/0, mapget0/0, seqsum/1,\n\
+     \x20        foldl_sum0/0, map_len0/0, append_len0/0, rev_head0/0, tuple_elem3_0/0,\n\
+     \x20        bin_at0/0, bit_size0/0, maps_get_k0/0, member10/0, seq_len0/0,\n\
+     \x20        lists_last0/0, int_to_list_len0/0, sum_range/2]).\n\
      add2(A,B) -> A+B.\n\
      sub2(A,B) -> A-B.\n\
      mul2(A,B) -> A*B.\n\
@@ -107,7 +110,21 @@ pub(crate) const DIFF_OPS_SOURCE: &str = "-module(diff_ops).\n\
      decode0() -> binary:decode_unsigned(<<1,2>>).\n\
      msize0() -> map_size(#{a => 1, b => 2}).\n\
      mapget0() -> maps:get(b, #{a => 1, b => 2}).\n\
-     seqsum(N) -> lists:sum(lists:seq(1, N)).\n";
+     seqsum(N) -> lists:sum(lists:seq(1, N)).\n\
+     foldl_sum0() -> lists:foldl(fun(X, A) -> X + A end, 0, [1,2,3,4]).\n\
+     map_len0() -> length(lists:map(fun(X) -> X * 2 end, [1,2,3])).\n\
+     append_len0() -> length([1,2] ++ [3,4]).\n\
+     rev_head0() -> hd(lists:reverse([1,2,3])).\n\
+     tuple_elem3_0() -> element(3, {a,b,42}).\n\
+     bin_at0() -> binary:at(<<10,20,30>>, 1).\n\
+     bit_size0() -> bit_size(<<1,2,3>>).\n\
+     maps_get_k0() -> maps:get(k, #{k => 9}).\n\
+     member10() -> case lists:member(2, [1,2,3]) of true -> 1; false -> 0 end.\n\
+     seq_len0() -> length(lists:seq(1, 10)).\n\
+     lists_last0() -> lists:last([1,2,3]).\n\
+     int_to_list_len0() -> length(integer_to_list(12345)).\n\
+     sum_range(A, B) when A > B -> 0;\n\
+     sum_range(A, B) -> A + sum_range(A + 1, B).\n";
 
 /// Build one module-run case.
 fn case(
@@ -611,6 +628,124 @@ pub(crate) fn group() -> Vec<Case> {
             1,
             &[5],
             "15",
+        ),
+        // --- A.1/A.7: higher-order stdlib calls and further term operations ------------
+        case(
+            "modules/bif_lists_foldl_fun",
+            "lists:foldl/3 with a reducing fun agrees on 1+2+3+4",
+            &[BeamAsm, OtpApps],
+            "foldl_sum0",
+            0,
+            &[],
+            "10",
+        ),
+        case(
+            "modules/bif_lists_map_fun_length",
+            "length/1 of lists:map/2 with a fun agrees",
+            &[BeamAsm, OtpApps],
+            "map_len0",
+            0,
+            &[],
+            "3",
+        ),
+        case(
+            "modules/list_append_length",
+            "list ++/2 concatenation agrees on the combined length",
+            &[BeamAsm, LanguageSemantics],
+            "append_len0",
+            0,
+            &[],
+            "4",
+        ),
+        case(
+            "modules/bif_lists_reverse_head",
+            "hd/1 of lists:reverse/1 agrees",
+            &[BeamAsm, OtpApps],
+            "rev_head0",
+            0,
+            &[],
+            "3",
+        ),
+        case(
+            "modules/tuple_element_third",
+            "element/2 reads the third element of a literal tuple",
+            &[BeamAsm, OtpApps],
+            "tuple_elem3_0",
+            0,
+            &[],
+            "42",
+        ),
+        case(
+            "modules/bif_binary_at_middle",
+            "binary:at/2 reads a middle byte of a literal binary",
+            &[BeamAsm, OtpApps],
+            "bin_at0",
+            0,
+            &[],
+            "20",
+        ),
+        case(
+            "modules/bif_bit_size",
+            "bit_size/1 of a 3-byte binary agrees on 24",
+            &[BeamAsm, OtpApps],
+            "bit_size0",
+            0,
+            &[],
+            "24",
+        ),
+        case(
+            "modules/bif_maps_get_key",
+            "maps:get/2 reads a literal map's key",
+            &[BeamAsm, OtpApps],
+            "maps_get_k0",
+            0,
+            &[],
+            "9",
+        ),
+        case(
+            "modules/bif_lists_member_case",
+            "lists:member/2 drives a compiled case expression",
+            &[BeamAsm, LanguageSemantics, OtpApps],
+            "member10",
+            0,
+            &[],
+            "1",
+        ),
+        case(
+            "modules/bif_lists_seq_length",
+            "length/1 of lists:seq/2 agrees on 1..10",
+            &[BeamAsm, OtpApps],
+            "seq_len0",
+            0,
+            &[],
+            "10",
+        ),
+        case(
+            "modules/bif_lists_last",
+            "lists:last/1 agrees on a literal list",
+            &[BeamAsm, OtpApps],
+            "lists_last0",
+            0,
+            &[],
+            "3",
+        ),
+        case(
+            "modules/bif_integer_to_list_length",
+            "length/1 of integer_to_list/1 agrees on 12345",
+            &[BeamAsm, OtpApps],
+            "int_to_list_len0",
+            0,
+            &[],
+            "5",
+        ),
+        case(
+            "modules/recursive_range_sum",
+            "a guarded recursive range sum agrees on 1..10",
+            &[BeamAsm, LanguageSemantics],
+            "sum_range",
+            2,
+            &[1, 10],
+            "55",
         ),
     ]
 }

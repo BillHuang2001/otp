@@ -460,5 +460,89 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "semantics/paren_overrides_precedence",
+            description: "parentheses override operator precedence: (2+3)*4 = 20",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "(2+3)*4",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,97,20>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/negate_integer_literal",
+            description: "unary minus applied to an integer literal is exact",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "-(3)",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,98,255,255,255,253>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/andalso_short_circuit",
+            description: "`andalso` is the short-circuit conjunction of booleans",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "true andalso false",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,5,102,97,108,115,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/tuple_order_second_element",
+            description: "tuple ordering compares the second element when the first ties",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "{1,2} < {1,3}",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/list_comprehension_filter",
+            description: "a list comprehension generator with a filter selects the evens",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "[X || X <- [1,2,3,4], X rem 2 =:= 0]",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok [2,4]"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "semantics/fun_two_arg_closure",
+            description: "a two-argument fun closes over its environment and applies it",
+            contracts: &[Contract::LanguageSemantics],
+            kind: CaseKind::Eval {
+                expr: "begin F = fun(A,B) -> A*B end, F(6,7) end",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
     ]
 }

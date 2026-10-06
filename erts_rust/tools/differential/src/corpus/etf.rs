@@ -233,5 +233,89 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "etf/term_to_binary_zero",
+            description: "integer 0 encodes as SMALL_INT_EXT with a zero byte",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "0",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,97,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_int65535",
+            description: "65535 is the largest 16-bit value, encoded as a 4-byte INT_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "65535",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,98,0,0,255,255>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_int65536",
+            description: "65536 overflows 16 bits and still encodes as a 4-byte INT_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "65536",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,98,0,1,0,0>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_true",
+            description: "the atom true encodes as SMALL_ATOM_UTF8_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "true",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,4,116,114,117,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/term_to_binary_atom_false",
+            description: "the atom false encodes as SMALL_ATOM_UTF8_EXT",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "false",
+                extra_argv: &[],
+                probe: Probe::TermToBinary,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,119,5,102,97,108,115,101>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "etf/roundtrip_map",
+            description: "binary_to_term/1 inverts term_to_binary/1 for a single-key map",
+            contracts: &[Contract::BeamAsm],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(term_to_binary(#{a => 1}))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok #{a => 1}"),
+                exit_code: 0,
+            },
+        },
     ]
 }

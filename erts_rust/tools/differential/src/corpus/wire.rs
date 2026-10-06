@@ -99,5 +99,47 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "wire/decode_reference_small_int_blob",
+            description: "an ETF SMALL_INT_EXT blob decodes to the integer it carries",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "binary_to_term(<<131,97,42>>)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 42"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/encode_map_matches_reference",
+            description: "encoding a map reproduces the reference MAP_EXT wire bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "term_to_binary(#{a => 1})",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok <<131,116,0,0,0,1,119,1,97,97,1>>"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "wire/encoded_atom_size",
+            description: "the reference encoding of the atom foo is 6 bytes",
+            contracts: &[Contract::Distribution],
+            kind: CaseKind::Eval {
+                expr: "byte_size(term_to_binary(foo))",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 6"),
+                exit_code: 0,
+            },
+        },
     ]
 }
