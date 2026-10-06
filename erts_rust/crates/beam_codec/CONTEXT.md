@@ -481,10 +481,18 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
   order is kept exactly.
-- Records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain unsupported: records
-  are a legacy native term (ordinary Erlang records encode as tuples), `LOCAL_EXT` needs local-node
-  identity, and the distribution header is `beam_dist`'s. The obsolete `FUN` (`117`) and `NEW_CACHE`
-  (`78`) tags are rejected as `BadArg`.
+- **Records (`67`) remain `unsupported` — blocked on a term-layer record layout.** The C decoder builds
+  a native record term (`external.c:5257-5381`) from `ErtsRecordInstance`/`ErtsRecordDefinition`
+  (`../../erts/emulator/beam/erl_record.h:43-95`, incl. `RECORD_INST_SIZE`/`RECORD_DEF_SIZE`); the
+  codec must not invent that interior, so implementing `67` requires a record-instance/definition
+  layout exposed by **`beam_term`** (the term-layout owner — `../beam_term/CONTEXT.md`). Ordinary
+  Erlang records encode as tuples and are unaffected. The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`)
+  tags are rejected as `BadArg`.
+- **`LOCAL_EXT` (`121`) decode does not verify the node hash.** The C verifies it only in the
+  `decoded_size` sizing pass (`external.c:6437-6512`) against a Bob-Jenkins hash seeded with the node's
+  `local_node_hash` (hostname/pid/time derived) — node identity, `beam_rt`/`beam_dist`'s. The codec
+  decodes the wrapper without verification (matching C `dec_term`, which also skips it) and takes the
+  4-byte hash from the caller on encode.
 - **Funs are supported except for encoding a `FunKind::Local` term.** `NEW_FUN_EXT`/`EXPORT_EXT`
   decode and encode byte-exactly; a local (`make_fun3`) fun has no faithful wire image (no module /
   16-byte `uniq` / creator pid in its inlined descriptor) so `encode` returns
