@@ -64,8 +64,8 @@ use beam_loader::Module;
 use beam_term::{Atom, Eterm};
 
 use crate::error;
+use crate::port::RuntimePorts;
 use crate::runtime::Runtime;
-
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
 ///
@@ -182,8 +182,8 @@ impl<'a> RuntimeContext<'a> {
         let registry = Rc::clone(&self.runtime.registry);
         let atoms = self.runtime.code_server.atoms_handle();
         let tables_handle = Rc::clone(&self.runtime.tables);
-        let mut heap = self.runtime.take_bif_heap()?;
-        let self_pid = self.runtime.self_pid;
+        let ports_handle = Rc::clone(&self.runtime.ports);
+        let mut heap = self.runtime.take_bif_heap()?;        let self_pid = self.runtime.self_pid;
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
@@ -193,10 +193,15 @@ impl<'a> RuntimeContext<'a> {
             // taken and runs without ETS rather than aliasing or panicking.
             let mut tables = tables_handle.try_borrow_mut().ok();
             let mut bridge = FunBridge { runtime };
+            // The port provider is another cheap handle: it holds the shared `Rc` port
+            // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
+            // really starts an OS process and `erlang:port_info/1,2` answers from the
+            // runtime's own port table (see `crate::port`).
+            let mut ports = RuntimePorts::new(ports_handle, Rc::clone(&atoms));
             let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                 .with_atom_interner(&mut pending)
-                .with_fun_caller(&mut bridge);
-            if let Some(sink) = output.as_deref_mut() {
+                .with_fun_caller(&mut bridge)
+                .with_port_hook(&mut ports);            if let Some(sink) = output.as_deref_mut() {
                 context = context.with_output(sink);
             }
             if let Some(tables) = tables.as_deref_mut() {
