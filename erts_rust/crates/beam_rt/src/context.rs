@@ -237,10 +237,14 @@ impl<'a> RuntimeContext<'a> {
             Some(ref mut table) => &mut **table,
             None => processes,
         };
-        let state = mailboxes.entry(pid).or_default();
+        // A pid with no process is the capability gap *before* any scan state is
+        // created for it, so a ghost pid never accumulates a stale entry.
         let process = table.get_mut(pid).ok_or_else(|| error::no_mailbox(pid))?;
+        let state = mailboxes.entry(pid).or_default();
         Ok((process.mailbox_mut(), state))
-    }    /// Heap words still available to the running code.
+    }
+
+    /// Heap words still available to the running code.
     ///
     /// Milestone-1's arena is unbounded (no GC yet), so this reports
     /// `usize::MAX` — see the module docs.
@@ -699,6 +703,7 @@ fn descriptor_of(
 #[cfg(test)]
 mod tests {
     use beam_bifs::{BifRegistry, BytesSink};
+    use beam_engine::RunOutcome;
     use beam_term::{atom_val, is_small, make_small, signed_value};
 
     use super::*;
@@ -881,5 +886,317 @@ mod tests {
         }
         assert!(!rt.registry.contains("erlang", "nope", 0));
         assert!(!core.contains("erlang", "nope", 0));
+    }
+
+    // -----------------------------------------------------------------------
+    // the receive/mailbox seam over the running process's real mailbox
+    // -----------------------------------------------------------------------
+
+    /// The committed mailbox fixture (regeneration recipe in `tests/fixtures/README.md`).
+    const MAILBOX_BEAM: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/mailbox.beam"
+    );
+
+    /// The fixture loaded as an owned image, so it outlives the borrowing context
+    /// (the receive-seam cases need `Machine::run_export_outcome`, which borrows both).
+    fn mailbox_fixture() -> Module {
+        beam_loader::load_file(MAILBOX_BEAM).expect("load mailbox.beam")
+    }
+
+    /// The fixture's pid term (the destination `self()` reports).
+    fn self_term(rt: &Runtime) -> Eterm {
+        rt.self_pid().to_eterm()
+    }
+
+    #[test]
+    fn send_message_resolves_the_target_and_rejects_a_non_pid() {
+        let mut rt = runtime();
+        let pid = self_term(&rt);
+        let mut ctx = RuntimeContext::new(&mut rt);
+
+        // A self-delivery is the `Enqueued` case (nothing is blocked).
+        ctx.send_message(pid, make_small(7)).expect("deliver to self");
+
+        // A non-pid destination is the typed `BadArg` — never a wrong delivery.
+        assert!(matches!(
+            ctx.send_message(make_small(7), make_small(7)),
+            Err(BeamError::BadArg)
+        ));
+
+        // The message is in the running process's mailbox.
+        let mailbox = ctx
+            .runtime
+            .processes
+            .get(ctx.runtime.self_pid)
+            .expect("the runtime process")
+            .mailbox();
+        assert_eq!(mailbox.len(), 1);
+        assert_eq!(mailbox.peek().expect("the delivered message").payload(), make_small(7));
+    }
+
+    #[test]
+    fn send_message_to_an_unknown_pid_is_the_tables_typed_error() {
+        let mut rt = runtime();
+        let mut ctx = RuntimeContext::new(&mut rt);
+        // A pid whose (number, serial) names no live process: the table's typed not-found.
+        let ghost = ProcessId::new(9999, 7).to_eterm();
+        let error = ctx
+            .send_message(ghost, make_small(1))
+            .expect_err("no such process");
+        assert!(
+            matches!(error, BeamError::TermNotFound),
+            "expected the table's typed not-found error, got {error:?}"
+        );
+    }
+
+    #[test]
+    fn receive_next_peeks_and_the_scan_operations_position_the_mailbox() {
+        let mut rt = runtime();
+        let pid = self_term(&rt);
+        let mut ctx = RuntimeContext::new(&mut rt);
+
+        // An empty mailbox is `Ok(None)` (not an error) — that is what makes the
+        // compiled code jump to the `wait` that blocks.
+        assert_eq!(ctx.receive_next().expect("empty mailbox"), None);
+
+        ctx.send_message(pid, make_small(1)).expect("first");
+        ctx.send_message(pid, make_small(2)).expect("second");
+
+        // `loop_rec` peeks: repeated calls yield the same candidate.
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+
+        // `loop_rec_end` advances past it.
+        ctx.receive_skip().unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(2)));
+
+        // `remove_message` unlinks the candidate and repositions at the first message.
+        ctx.receive_remove().unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+
+        // `timeout` resets the scan (already first here).
+        ctx.receive_reset().unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+    }
+
+    #[test]
+    fn remove_message_unlinks_only_the_matched_candidate() {
+        let mut rt = runtime();
+        let pid = self_term(&rt);
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message(pid, make_small(1)).unwrap();
+        ctx.send_message(pid, make_small(2)).unwrap();
+        ctx.send_message(pid, make_small(3)).unwrap();
+
+        ctx.receive_skip().unwrap(); // candidate `2`
+        ctx.receive_remove().unwrap();
+
+        let mailbox = ctx
+            .runtime
+            .processes
+            .get(ctx.runtime.self_pid)
+            .expect("the runtime process")
+            .mailbox();
+        let left: Vec<Eterm> = mailbox.iter().map(beam_message::Message::payload).collect();
+        assert_eq!(left, vec![make_small(1), make_small(3)]);
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+    }
+
+    #[test]
+    fn an_empty_mailbox_blocks_and_the_plain_entry_is_the_typed_blocked_error() {
+        // Mirrors the reference wait-on-an-empty-mailbox case: the engine reports `Wait`,
+        // and the non-blocking entry folds that into the documented typed error.
+        let image = mailbox_fixture();
+        let wait = image.atom_table.lookup("wait").expect("wait/0");
+        let mut rt = runtime();
+        let mut machine = Machine::new();
+
+        let outcome = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            machine
+                .run_export_outcome(&image, wait, 0, &[], &mut ctx)
+                .expect("wait/0")
+        };
+        assert!(
+            matches!(outcome, RunOutcome::Wait { .. }),
+            "an empty mailbox suspends the receive, got {outcome:?}"
+        );
+
+        // The non-blocking entry folds the suspension into the documented typed error.
+        let error = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.run_export(&image, "wait", 0, &[])
+                .expect_err("run_export is non-blocking")
+        };
+        assert_eq!(error.to_string(), beam_engine::blocked().to_string());
+    }
+
+    #[test]
+    fn a_suspended_receive_resumes_against_the_runtime_stored_scan_position() {
+        // The point of storing the scan state per pid: the resume happens through a
+        // **fresh context**, and it still finds the position where the receive blocked.
+        let image = mailbox_fixture();
+        let wait = image.atom_table.lookup("wait").expect("wait/0");
+        let mut rt = runtime();
+        let mut machine = Machine::new();
+
+        let outcome = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            machine
+                .run_export_outcome(&image, wait, 0, &[], &mut ctx)
+                .expect("wait/0")
+        };
+        let (func, pc) = match outcome {
+            RunOutcome::Wait { func, pc } => (func, pc),
+            other => panic!("expected a wait, got {other:?}"),
+        };
+
+        // Deliver a message to the runtime's own mailbox (a `receive` waiting on it).
+        let pid = rt.self_pid();
+        rt.processes
+            .deliver_simple(pid, pid.to_eterm(), make_small(42))
+            .expect("deliver");
+
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let resumed = machine
+            .resume_outcome(&image, func, pc, &mut ctx)
+            .expect("resume at the wait target");
+        assert_eq!(resumed, RunOutcome::Returned(make_small(42)));
+        let mailbox = ctx
+            .runtime
+            .processes
+            .get(ctx.runtime.self_pid)
+            .expect("the runtime process")
+            .mailbox();
+        assert!(
+            mailbox.is_empty(),
+            "the resumed receive removed the matched message"
+        );
+    }
+
+    #[test]
+    fn scan_skips_a_non_matching_head_and_keeps_it_queued() {
+        // Mirrors the reference `scan_skips_a_non_matching_head_before_matching`.
+        let image = mailbox_fixture();
+        let mut rt = runtime();
+        let result = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.run_export(&image, "scan", 0, &[]).expect("scan/0")
+        };
+        assert_eq!(result, make_small(7), "the second message matched");
+
+        let mailbox = rt
+            .processes
+            .get(rt.self_pid())
+            .expect("the runtime process")
+            .mailbox();
+        assert_eq!(mailbox.len(), 1, "only the matched message was removed");
+        assert_eq!(
+            mailbox.peek().expect("the scanned-past head").payload(),
+            make_small(42)
+        );
+    }
+
+    #[test]
+    fn a_marker_reserved_on_an_empty_queue_is_the_shared_undefined_atom() {
+        let mut rt = runtime();
+        // The atom `receive_marker_reserve` interns is the C `am_undefined`.
+        let undefined = rt.intern("undefined");
+        let mut ctx = RuntimeContext::new(&mut rt);
+
+        let marker = ctx.receive_marker_reserve().expect("reserve");
+        assert_eq!(marker, undefined, "an empty queue has no position to record");
+        assert!(!is_small(marker), "`undefined` is an atom, not a marker id");
+
+        // Binding it is a silent no-op, and using the reference cannot move the scan.
+        ctx.receive_marker_bind(marker, make_small(1)).unwrap();
+        ctx.receive_marker_use(make_small(1)).unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), None);
+    }
+
+    #[test]
+    fn the_marker_prologue_repositions_the_scan() {
+        // Mirrors the reference `the_mailbox_repositions_the_scan_at_a_marker`, driven
+        // through the real context (so it exercises `RuntimeContext::mailbox_parts`).
+        let mut rt = runtime();
+        let pid = self_term(&rt);
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.send_message(pid, make_small(1)).unwrap();
+
+        ctx.receive_skip().unwrap(); // scan past `1`
+        let marker = ctx.receive_marker_reserve().expect("reserve");
+        assert!(is_small(marker), "a recorded marker is a small integer");
+        ctx.receive_marker_bind(marker, make_small(999)).unwrap();
+
+        // A later message (self-delivered through the same context).
+        ctx.send_message(pid, make_small(2)).unwrap();
+
+        ctx.receive_reset().unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(1)));
+        ctx.receive_marker_use(make_small(999)).unwrap();
+        assert_eq!(
+            ctx.receive_next().unwrap(),
+            Some(make_small(2)),
+            "the marker moved the scan past the first message"
+        );
+
+        ctx.receive_marker_clear(make_small(999)).unwrap();
+        ctx.receive_reset().unwrap();
+        ctx.receive_marker_use(make_small(999)).unwrap();
+        assert_eq!(
+            ctx.receive_next().unwrap(),
+            Some(make_small(1)),
+            "a cleared marker no longer repositions the scan"
+        );
+    }
+
+    #[test]
+    fn for_process_resolves_the_mailbox_against_the_supplied_table() {
+        // The scheduler-pass seam: a context running a pid in a table it owns separately
+        // from the runtime, with the scan state still keyed by pid in the runtime.
+        let mut rt = runtime();
+        let mut table = beam_process::ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::prelude::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+        let undefined = rt.intern("undefined");
+
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        assert_eq!(ctx.pid(), pid);
+        // Empty: `Ok(None)` from the external table's process, `undefined` marker.
+        assert_eq!(ctx.receive_next().unwrap(), None);
+        assert_eq!(ctx.receive_marker_reserve().unwrap(), undefined);
+
+        // A self-delivery lands in the external table's process mailbox.
+        ctx.send_message(pid.to_eterm(), make_small(5)).unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), Some(make_small(5)));
+
+        // `erlang:self/0` reports the context's pid, not the runtime's own.
+        let self_term = ctx.call_bif("erlang", "self", 0, &[]).expect("self/0");
+        assert_eq!(self_term, pid.to_eterm());
+
+        // Drop the context to release its borrow of `table`, then inspect the mailbox.
+        drop(ctx);
+        assert_eq!(table.get(pid).expect("the process").mailbox().len(), 1);
+    }
+
+    #[test]
+    fn for_process_reports_a_missing_process_as_the_typed_capability_gap() {
+        let mut rt = runtime();
+        let mut table = beam_process::ProcessTable::new(beam_process::SignalAtoms::from_table(
+            &mut beam_term::prelude::AtomTable::new(),
+        ));
+        let pid = table.spawn_default().expect("spawn a process");
+
+        // Remove the process *before* building the context: a receive-seam call must be
+        // the typed `unsupported` capability gap, never a panic and never a wrong result.
+        table.take(pid).expect("take the process");
+        let mut ctx = RuntimeContext::for_process(&mut rt, &mut table, pid);
+        let error = ctx.receive_next().expect_err("no mailbox for the pid");
+        assert_eq!(
+            crate::error::unsupported_reason(&error).as_deref(),
+            Some(format!("receive: process {pid:?} has no mailbox").as_str())
+        );
     }
 }
