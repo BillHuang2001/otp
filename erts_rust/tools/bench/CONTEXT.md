@@ -38,11 +38,11 @@ preserving modes); `copy_files(files, dst)` copies an explicit file list. Worklo
 `ScratchDir`, build/run **there**, and let the `Drop` clean up. `--repo`/`$BENCH_<ID>_REPO` still select
 the *source* tree. Verified: source repos stay untouched (`git status` clean) after a run.
 
-### `beam_rt` is a STUB (caveat)
-The Rust runtime binary does not exist / is a placeholder today. It is resolved, then **self-checked**: a
-runtime is *supported* only if it can execute the canonical probe
-`-noshell -eval 'io:format("~p~n",[1+1]), halt().'` and print `2`. The stub fails this ⇒ every
-rust-runtime result is reported `skipped(runtime-unsupported)`, **never** a fake number.
+### `beam_rt` is a REAL runtime (self-checked)
+`beam_rt` is a working Rust runtime (real `-eval` evaluator, a global-atom `code:*`/`init:*` floor, native `os:cmd/1`); it is resolved from `$BEAM_RT` or the workspace-relative `../../target/{release,debug}/beam_rt`.
+A runtime is *supported* only if it can execute the canonical probe `-noshell -eval 'io:format("~p~n",[1+1]), halt().'` and print `2`.
+A resolved, probe-passing runtime reports `supported: true` (the reported version comes from `erlang:system_info(otp_release)`; `beam_rt` prints `30`), so a workload scheduled under `rust` **runs**.
+An unresolved or probe-failing runtime is honestly `skipped(runtime-unsupported)`, **never** a fake number.
 
 ## API Surface
 
@@ -86,7 +86,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 ### Built-in workloads
 | id | category | target repo / tool | today | skip reason(s) |
 |---|---|---|---|---|
-| `baseline` | startup | oracle `erl` | **runs** (sys) | rust ⇒ `runtime-unsupported` |
+| `baseline` | startup | oracle `erl` | **runs** (sys+rust) | `beam_rt` compute loop unimplemented (noted on the rust row, not skipped) |
 | `erlc_compiler` | compiler | `erlc` over OTP stdlib **+** Elixir `lib/elixir/src` `.erl` sources | **runs** (quick+full) | `erlc-absent`, `corpus-missing` |
 | `elixir_compiler` | compiler | system `elixirc` over a staged `.ex` corpus from the Elixir checkout | **runs** (quick+full) | `elixirc-absent`, `corpus-missing`, `repo-missing` |
 | `plb` | compute | `/home/bill/Source/Programming-Language-Benchmarks` (`dotnet` driver) | skipped | `dotnet-absent`, `repo-missing` |
@@ -124,7 +124,7 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   "profile": "quick",                       // "quick" | "full"
   "runtimes": [
     { "kind": "sys",  "program": "/nix/.../erl", "version": "29.1.1", "supported": true,  "notes": [] },
-    { "kind": "rust", "program": null,           "version": null,     "supported": false, "notes": ["beam_rt stub / not built"] }
+    { "kind": "rust", "program": ".../target/release/beam_rt", "version": "30", "supported": true, "notes": [] }
   ],
   "results": [
     {
@@ -196,8 +196,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   Never hardcode the worktree path.
 - Toolchain in this sandbox: `erl`/`erlc`/`escript`/`make`/`mix`/`elixir`/`curl`/`git`/`nix` **present**;
   `rebar3`, `dotnet`, `wrk`, `h2load`, `bombardier`, `ab`, `/usr/bin/time` **absent**. Network is
-  available (erlang.mk can git-fetch cowlib/ranch). Oracle is OTP 29.1.1 / erts-17.1. `../../target/`
-  is not built ⇒ `beam_rt` unresolved.
+  available (erlang.mk can git-fetch cowlib/ranch). Oracle is OTP 29.1.1 / erts-17.1. After
+  `scripts/cargo.sh build --release --workspace`, `../../target/release/beam_rt` is built ⇒ the `rust`
+  runtime resolves and passes the self-check (`supported: true`).
 - **`$BENCH_TRY_NIX`** (opt-in, default off): when set, `khepri`/`emqx`/`plb` may resolve `rebar3`/`dotnet`
   via `nix shell nixpkgs#<attr> --command …` instead of a PATH lookup. Without it, PATH-only ⇒ honest
   `skipped(<tool>-absent)`.
