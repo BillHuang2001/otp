@@ -1,9 +1,11 @@
-//! Integration tests for `erlang:phash/2` — the legacy ERTS `make_hash` hash.
+//! Integration tests for `erlang:phash/2` (the legacy ERTS `make_hash` term hash)
+//! and `erlang:phash2/1,2` (the `make_hash2` block hash).
 //!
 //! Every expectation below is **pinned against the system oracle**
 //! (`erl -noshell -eval 'io:format("~p~n",[erlang:phash(Term,Range)]),halt().'`,
-//! OTP 29 / erts-17.1). The differential values are *not* derivable from the term
-//! alone — that is the whole point of pinning them.
+//! OTP 29 / erts-17.1; the same values for a compiled literal-area copy). The
+//! differential values are *not* derivable from the term alone — that is the whole
+//! point of pinning them.
 //!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] plus the
 //! declared dependency crates (`beam_alloc` for the heap, `beam_codec::term` for
@@ -21,9 +23,9 @@ use beam_term::{signed_value, AtomTable, Eterm, NIL};
 
 /// The atom names the cases below use. Only interned names resolve, and the atom
 /// hash is computed from the name, so the table is seeded up front.
-const ATOMS: [&str; 19] = [
+const ATOMS: [&str; 20] = [
     "true", "abc", "hello", "node", "a", "x", "erlang", "abs", "lists", "map", "b", "c", "foo",
-    "bar", "h", "false", "is_exported", "rec", "k",
+    "bar", "h", "false", "is_exported", "rec", "k", "reverse",
 ];
 
 fn seeded_atoms() -> AtomTable {
@@ -538,25 +540,364 @@ fn invalid_ranges_are_badarg() {
 }
 
 // ---------------------------------------------------------------------------
-// Classes this crate cannot reproduce
+// `phash2/1,2` — the `make_hash2` hash
+// ---------------------------------------------------------------------------
+//
+// A *different* algorithm from `phash/2`: Bob Jenkins' `MIX` over a block hash
+// (`erl_term_hashing.c:427-521, 858-1601`), so its goldens are pinned on their own.
+// `phash2/1` is `hash & ((1 << 27) - 1)`; `phash2/2` is `hash rem Range` — no `+1`,
+// unlike `phash/2`.
+
+#[test]
+fn phash2_integers_match_the_oracle() {
+    run(|_reg, ctx| {
+        // Small integers inside `[-2^27, 2^27)` take the `SINT32_HASH` path; the four
+        // values around that boundary pin the `IS_SSMALL28` split that selects it.
+        for (value, expected) in [
+            (0i64, 88_723_725),
+            (1, 2_614_250),
+            (-1, 44_071_773),
+            (-5, 115_015_680),
+            (1_000_000, 109_607_396),
+            (134_217_727, 112_602_999),
+            (134_217_728, 12_354_923),
+            (-134_217_728, 69_672_967),
+            (-134_217_729, 76_739_502),
+            (268_435_456, 45_246_278),
+            (-268_435_457, 86_968_359),
+        ] {
+            let term = int_term(ctx, value);
+            assert_phash2(ctx, &[term], expected, &format!("phash2({value})"));
+        }
+
+        // Floats fold their normalised `(high, low)` word pair; `-0.0` is normalised
+        // to `+0.0`, so both zeros agree with the oracle.
+        for (value, expected) in [
+            (1.0f64, 77_147_068),
+            (0.0, 20_875_736),
+            (-0.0, 20_875_736),
+            (3.14, 107_830_559),
+        ] {
+            let term = ctx.make_float(value).expect("fits");
+            assert_phash2(ctx, &[term], expected, &format!("phash2({value})"));
+        }
+    });
+}
+
+#[test]
+fn phash2_containers_match_the_oracle() {
+    run(|_reg, ctx| {
+        let one = int_term(ctx, 1);
+        let two = int_term(ctx, 2);
+        let three = int_term(ctx, 3);
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let foo = ctx.atom("foo").expect("seeded");
+        let bar = ctx.atom("bar").expect("seeded");
+
+        // The arity is mixed in *before* the elements.
+        let empty_tuple = ctx.tuple(&[]).expect("fits");
+        assert_phash2(ctx, &[empty_tuple], 87_486_268, "phash2({})");
+
+        let pair = ctx.tuple(&[a, one]).expect("fits");
+        assert_phash2(ctx, &[pair], 72_425_156, "phash2({a,1})");
+
+        let six = ctx.tuple(&[a, b, c, one, two, three]).expect("fits");
+        assert_phash2(ctx, &[six], 23_473_964, "phash2({a,b,c,1,2,3})");
+
+        let nums = ctx.list(&[one, two, three]).expect("fits");
+        assert_phash2(ctx, &[nums], 25_788_620, "phash2([1,2,3])");
+        assert_phash2(ctx, &[NIL], 113_427_502, "phash2([])");
+
+        let atoms = ctx.list(&[a, b, c]).expect("fits");
+        assert_phash2(ctx, &[atoms], 29_271_916, "phash2([a,b,c])");
+
+        // An improper list: `cons(foo, bar)` is `[foo | bar]`.
+        let improper = ctx.cons(foo, bar).expect("fits");
+        assert_phash2(ctx, &[improper], 5_376_464, "phash2([foo|bar])");
+
+        // A byte list — the four-byte `HCONST_4` run fast path.
+        let hello = chars(ctx, "hello");
+        assert_phash2(ctx, &[hello], 81_920_127, r#"phash2("hello")"#);
+
+        let l12 = ctx.list(&[one, two]).expect("fits");
+        let l3 = ctx.list(&[three]).expect("fits");
+        let nested = ctx.list(&[l12, l3]).expect("fits");
+        assert_phash2(ctx, &[nested], 118_504_057, "phash2([[1,2],[3]])");
+
+        // A composite: a float, a list, a binary and an empty tuple.
+        let half = ctx.make_float(1.5).expect("fits");
+        let ab = ctx.list(&[a, b]).expect("fits");
+        let bin = make_binary(ctx.heap(), &[1, 2]).expect("fits");
+        let composite = ctx.tuple(&[half, ab, bin, empty_tuple]).expect("fits");
+        assert_phash2(
+            ctx,
+            &[composite],
+            56_771_977,
+            "phash2({1.5,[a,b],<<1,2>>,{}})",
+        );
+
+        assert_phash2(ctx, &[foo], 27_999, "phash2(foo)");
+
+        // The empty map: only the size mix applies.
+        let empty_map = make_flatmap(ctx.heap(), &[]).expect("fits");
+        assert_phash2(ctx, &[empty_map], 39_679_005, "phash2(#{})");
+    });
+}
+
+#[test]
+fn phash2_binaries_and_bitstrings_match_the_oracle() {
+    run(|_reg, ctx| {
+        let empty = make_binary(ctx.heap(), &[]).expect("fits");
+        assert_phash2(ctx, &[empty], 13_708_901, r#"phash2(<<>>)"#);
+
+        let ab = make_binary(ctx.heap(), b"ab").expect("fits");
+        assert_phash2(ctx, &[ab], 127_597_802, r#"phash2(<<"ab">>)"#);
+
+        let bin = make_binary(ctx.heap(), &[1, 2, 3]).expect("fits");
+        assert_phash2(ctx, &[bin], 6_479_071, r#"phash2(<<1,2,3>>)"#);
+
+        // Non-byte-aligned bitstrings: the trailing partial byte folds in with
+        // `HCONST_15` after the whole bytes went through `block_hash`.
+        let bits3 = make_bitstring(ctx.heap(), &[0b0010_0000], 3).expect("fits");
+        assert_phash2(ctx, &[bits3], 73_037_028, r#"phash2(<<1:3>>)"#);
+
+        // `<<5:3,3:2>>` is the five bits `10111` — `0b1011_1000` padded.
+        let bits5 = make_bitstring(ctx.heap(), &[0b1011_1000], 5).expect("fits");
+        assert_phash2(ctx, &[bits5], 126_763_390, r#"phash2(<<5:3,3:2>>)"#);
+
+        // `<<255:12>>` is `0b0000_1111_1111`: the byte `0x0F` plus four bits.
+        let bits12 = make_bitstring(ctx.heap(), &[0x0F, 0xF0], 12).expect("fits");
+        assert_phash2(ctx, &[bits12], 26_733_754, r#"phash2(<<255:12>>)"#);
+    });
+}
+
+#[test]
+fn phash2_maps_match_the_oracle() {
+    run(|_reg, ctx| {
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let one = int_term(ctx, 1);
+        let two = int_term(ctx, 2);
+        let three = int_term(ctx, 3);
+
+        let one_pair = make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        assert_phash2(ctx, &[one_pair], 59_617_982, "phash2(#{a => 1})");
+
+        let three_pairs =
+            make_flatmap(ctx.heap(), &[(a, one), (b, two), (c, three)]).expect("fits");
+        assert_phash2(
+            ctx,
+            &[three_pairs],
+            98_643_667,
+            "phash2(#{a => 1, b => 2, c => 3})",
+        );
+
+        // A nested map and list: each pair is hashed from an independent `0`
+        // accumulator and the pair hashes are xor-ed, so nesting recurses exactly as
+        // the C does — and the result is deliberately independent of pair order.
+        let inner = make_flatmap(ctx.heap(), &[(b, two)]).expect("fits");
+        let list = ctx.list(&[one, two, three]).expect("fits");
+        let nested = make_flatmap(ctx.heap(), &[(a, inner), (c, list)]).expect("fits");
+        assert_phash2(
+            ctx,
+            &[nested],
+            40_732_915,
+            "phash2(#{a => #{b => 2}, c => [1,2,3]})",
+        );
+
+        // A two-limb bignum and its negative — the `HCONST_10`/`HCONST_11` limb fold.
+        let big = make_big(ctx.heap(), false, &BIG_DIGITS).expect("fits");
+        assert_phash2(ctx, &[big], 132_143_600, "phash2(1234…890)");
+        let neg_big = make_big(ctx.heap(), true, &BIG_DIGITS).expect("fits");
+        assert_phash2(ctx, &[neg_big], 33_199_935, "phash2(-(1234…890))");
+    });
+}
+
+#[test]
+fn phash2_external_funs_match_the_oracle() {
+    run(|_reg, ctx| {
+        // `FUN_SUBTAG` external fun: `(arity, hvalue(module))` with `HCONST`, then
+        // `hvalue(function)` with `HCONST_14`.
+        let erlang = ctx.atoms().lookup("erlang").expect("seeded");
+        let abs = ctx.atoms().lookup("abs").expect("seeded");
+        let abs_fun = make_fun_external(ctx.heap(), 1, erlang, abs).expect("fits");
+        assert_phash2(ctx, &[abs_fun], 27_471_588, "phash2(fun erlang:abs/1)");
+
+        // A second external fun — a different module and function name, so both
+        // `hvalue` contributions and the arity differ from the first case.
+        let lists = ctx.atoms().lookup("lists").expect("seeded");
+        let reverse = ctx.atoms().lookup("reverse").expect("seeded");
+        let rev_fun = make_fun_external(ctx.heap(), 1, lists, reverse).expect("fits");
+        assert_phash2(ctx, &[rev_fun], 134_027_972, "phash2(fun lists:reverse/1)");
+    });
+}
+
+#[test]
+fn phash2_range_matches_the_oracle() {
+    run(|reg, ctx| {
+        let thousand = int_term(ctx, 1000);
+        let foo = ctx.atom("foo").expect("seeded");
+        let a = ctx.atom("a").expect("seeded");
+        let one = int_term(ctx, 1);
+        let two = int_term(ctx, 2);
+        let three = int_term(ctx, 3);
+
+        let pair = ctx.tuple(&[a, one]).expect("fits");
+        let list = ctx.list(&[one, two, three]).expect("fits");
+        let bin = make_binary(ctx.heap(), b"ab").expect("fits");
+        let map = make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        let empty_tuple = ctx.tuple(&[]).expect("fits");
+        let empty_map = make_flatmap(ctx.heap(), &[]).expect("fits");
+        let empty_bin = make_binary(ctx.heap(), &[]).expect("fits");
+        let million = int_term(ctx, 1_000_000);
+        let neg_five = int_term(ctx, -5);
+
+        assert_phash2_range(reg, ctx, foo, thousand, 999, "phash2(foo,1000)");
+        assert_phash2_range(reg, ctx, pair, thousand, 996, "phash2({a,1},1000)");
+        assert_phash2_range(reg, ctx, list, thousand, 188, "phash2([1,2,3],1000)");
+        assert_phash2_range(reg, ctx, bin, thousand, 530, r#"phash2(<<"ab">>,1000)"#);
+        assert_phash2_range(reg, ctx, map, thousand, 262, "phash2(#{a => 1},1000)");
+        assert_phash2_range(reg, ctx, million, thousand, 324, "phash2(1000000,1000)");
+        assert_phash2_range(reg, ctx, neg_five, thousand, 864, "phash2(-5,1000)");
+        assert_phash2_range(reg, ctx, NIL, thousand, 702, "phash2([],1000)");
+        assert_phash2_range(reg, ctx, empty_tuple, thousand, 996, "phash2({},1000)");
+        assert_phash2_range(reg, ctx, empty_map, thousand, 373, "phash2(#{},1000)");
+
+        // The `2^32 - 1` upper bound: `hash < Range`, so the result is the whole
+        // hash (`27999` — the same value `phash2/1` reduces from).
+        let seven = int_term(ctx, 7);
+        assert_phash2_range(reg, ctx, list, seven, 0, "phash2([1,2,3],7)");
+        let sixteen = int_term(ctx, 16);
+        assert_phash2_range(reg, ctx, foo, sixteen, 15, "phash2(foo,16)");
+        assert_phash2_range(reg, ctx, foo, one, 0, "phash2(foo,1)");
+        let max_range = int_term(ctx, 4_294_967_295);
+        assert_phash2_range(reg, ctx, foo, max_range, 27_999, "phash2(foo,2^32-1)");
+        let range_997 = int_term(ctx, 997);
+        assert_phash2_range(reg, ctx, empty_bin, range_997, 742, r#"phash2(<<>>,997)"#);
+    });
+}
+
+#[test]
+fn phash2_invalid_ranges_are_badarg() {
+    run(|reg, ctx| {
+        let one = int_term(ctx, 1);
+        let cases: Vec<(Eterm, &str)> = vec![
+            (int_term(ctx, 0), "0"),
+            (int_term(ctx, -1), "-1"),
+            (ctx.make_float(1.0).expect("fits"), "1.0"),
+            (ctx.atom("x").expect("seeded"), "x"),
+            (NIL, "[]"),
+            (int_term(ctx, 4_294_967_297), "2^32 + 1"),
+            (
+                make_big(ctx.heap(), false, &[0, 1]).expect("fits"),
+                "2^64",
+            ),
+            (
+                make_big(ctx.heap(), true, &[0, 1]).expect("fits"),
+                "-2^64",
+            ),
+        ];
+        for (range, what) in cases {
+            assert!(
+                matches!(
+                    reg.call("erlang", "phash2", 2, ctx, &[one, range]),
+                    Err(BeamError::BadArg)
+                ),
+                "phash2(1, {what}) must be badarg"
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The legacy `make_hash` branches that were closed with the `phash2` work
 // ---------------------------------------------------------------------------
 
 #[test]
-fn unreproducible_classes_raise_unsupported_bif() {
+fn phash_maps_and_funs_match_the_oracle() {
     run(|reg, ctx| {
-        let range = int_term(ctx, 1_000_000);
+        let range = int_term(ctx, 1_000_000_000);
+        let a = ctx.atom("a").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let c = ctx.atom("c").expect("seeded");
+        let one = int_term(ctx, 1);
+        let two = int_term(ctx, 2);
+        let three = int_term(ctx, 3);
 
-        // A map: `make_hash` delegates its MAP branch to `make_hash2`. Built through
-        // the registered `maps:from_list/1` (`BifContext` has no map constructor).
-        let key = ctx.atom("a").expect("seeded");
+        // The `MAP_DEF` rule delegates the map's whole contribution to the *other*
+        // hash: `h*F13 + F14 + make_hash2(map)`.
+        let one_pair = make_flatmap(ctx.heap(), &[(a, one)]).expect("fits");
+        assert_phash(
+            reg,
+            ctx,
+            one_pair,
+            range,
+            670_235_874,
+            "phash(#{a => 1},1000000000)",
+        );
+        let three_pairs =
+            make_flatmap(ctx.heap(), &[(a, one), (b, two), (c, three)]).expect("fits");
+        assert_phash(
+            reg,
+            ctx,
+            three_pairs,
+            range,
+            185_656_567,
+            "phash(#{a => 1, b => 2, c => 3},1000000000)",
+        );
+
+        // The external-fun rule: `h*F11 + arity; h*F1 + hvalue(module);
+        // h*F1 + hvalue(function)`.
+        let erlang = ctx.atoms().lookup("erlang").expect("seeded");
+        let abs = ctx.atoms().lookup("abs").expect("seeded");
+        let abs_fun = make_fun_external(ctx.heap(), 1, erlang, abs).expect("fits");
+        assert_phash(
+            reg,
+            ctx,
+            abs_fun,
+            range,
+            515_667_794,
+            "phash(fun erlang:abs/1,1000000000)",
+        );
+    });
+}
+
+// ---------------------------------------------------------------------------
+// The one class that still raises the typed `unsupported_bif`
+// ---------------------------------------------------------------------------
+
+#[test]
+fn records_still_raise_unsupported_bif() {
+    run(|reg, ctx| {
+        let key = ctx.atom("k").expect("seeded");
         let value = int_term(ctx, 1);
         let pair = ctx.tuple(&[key, value]).expect("fits");
-        let pairs = ctx.list(&[pair]).expect("fits");
-        let map = call(reg, ctx, "maps", "from_list", &[pairs]);
+        let fields = ctx.list(&[pair]).expect("fits");
+        let module = ctx.atom("rec").expect("seeded");
+        let name = ctx.atom("k").expect("seeded");
+        let opt_key = ctx.atom("is_exported").expect("seeded");
+        let opt_value = ctx.atom("false").expect("seeded");
+        let opts = make_flatmap(ctx.heap(), &[(opt_key, opt_value)]).expect("fits");
+        let rec = call(reg, ctx, "records", "create", &[module, name, fields, opts]);
+
+        // A native record's `make_hash2` identity is its definition's **cached**
+        // `make_hash2` hash (`erl_record.c` computes it at creation time), which this
+        // tree stores as `make_small(0)` — no faithful `u32` is available, so both
+        // hashes must raise the typed `unsupported_bif` rather than return a wrong
+        // number.
         assert_unsupported(
-            reg.call("erlang", "phash", 2, ctx, &[map, range])
-                .expect_err("a map must not hash"),
-            "phash(#{a => 1}, 1000000)",
+            reg.call("erlang", "phash2", 1, ctx, &[rec])
+                .expect_err("a record must not hash"),
+            "phash2(a record)",
+        );
+        let range = int_term(ctx, 1_000_000);
+        assert_unsupported(
+            reg.call("erlang", "phash", 2, ctx, &[rec, range])
+                .expect_err("a record must not hash"),
+            "phash(a record, 1000000)",
         );
     });
 }
@@ -575,29 +916,11 @@ fn phash_2_is_registered() {
 }
 
 #[test]
-fn phash2_is_a_typed_capability_gap_not_an_undef() {
-    // `phash2/1,2` are real `bif.tab` BIFs (`bif.tab:83-84`) whose `make_hash2`
-    // algorithm this crate does not reproduce. They are registered to raise the
-    // typed `unsupported_bif` (a documented capability gap the runtime reports as
-    // exit 3), never a plain `undef` that the oracle would answer differently.
+fn phash2_is_registered() {
+    // `bif.tab:83-84` — both arities are real BIFs, and both are implemented (no
+    // longer a registered capability gap).
     let reg = default_registry();
     assert!(reg.contains("erlang", "phash2", 1));
     assert!(reg.contains("erlang", "phash2", 2));
-    run(|reg, ctx| {
-        let arg = int_term(ctx, 42);
-        assert_unsupported(
-            reg.call("erlang", "phash2", 1, ctx, &[arg])
-                .expect_err("phash2/1 is a registered capability gap"),
-            "phash2/1",
-        );
-    });
-    run(|reg, ctx| {
-        let arg = int_term(ctx, 42);
-        let range = int_term(ctx, 16);
-        assert_unsupported(
-            reg.call("erlang", "phash2", 2, ctx, &[arg, range])
-                .expect_err("phash2/2 is a registered capability gap"),
-            "phash2/2",
-        );
-    });
+    assert!(!reg.contains("erlang", "phash2", 3));
 }
