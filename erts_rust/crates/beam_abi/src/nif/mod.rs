@@ -9,8 +9,10 @@
 //! - [`api`] — `ErlNifApi`, the frozen `enif_*` function-pointer table (176 entries on LP64).
 //! - [`host`] — the host seam: [`host::NifHost`] (the runtime services behind the `enif_*`
 //!   implementations) and [`host::NifEnv`] (the concrete env behind the opaque `*mut ErlNifEnv`).
-//! - [`enif`] — the `enif_*` host functions (placeholder; added in a later step).
-//! - [`loader`] — the dynamic NIF loader / `ErlNifEntry` load contract (placeholder; later step).
+//! - [`enif`] — the `enif_*` host functions (the Rust side of the NIF C ABI) and the populated
+//!   [`enif::enif_api_table`] they are published through.
+//! - [`loader`] — the dynamic NIF loader: `dlopen`/`dlsym`, the `ErlNifEntry` load-time contract,
+//!   and a callable [`loader::NifLibrary`].
 
 pub mod api;
 pub mod enif;
