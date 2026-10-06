@@ -35,9 +35,9 @@ tags are rejected as `BadArg` — never a wrong term. The `COMPRESSED` (`80`) en
 *shrink rule*: it emits the wrapper only when zlib beats the plain image, else the plain image
 (`external.c:2276-2298`).
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
-`#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
-`#[cfg(test)]` tests cover the wire, term and codec layers (`encode`/`decode` keep their unit-test
-suites in the sibling files `src/encode/tests.rs` / `src/decode/tests.rs`); `tests/roundtrip.rs` holds
+`#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. `#[cfg(test)] mod tests`
+suites cover the wire, term and codec layers (the `encode`/`decode` suites sit in the sibling files
+`src/encode/tests.rs` / `src/decode/tests.rs`); `tests/roundtrip.rs` holds
 the exhaustive encode→decode corpus plus the negative/truncation cases,
 `tests/ground_truth.rs` holds the byte-exact `term_to_binary` oracle vectors (each
 asserted in both directions), `tests/interop.rs` is a live **differential harness**
