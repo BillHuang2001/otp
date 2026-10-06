@@ -70,6 +70,12 @@ impl Tree {
         self.len
     }
 
+    /// An honest word count of the tree's node arena (the `ordered_set` interior
+    /// contribution to `ets:info(Tab, memory)`); delegated to the store.
+    pub(crate) fn memory(&self) -> usize {
+        self.store.memory()
+    }
+
     /// Walk the leaf chain left to right (ascending key order).
     pub(crate) fn iter(&self) -> LeafIter<'_> {
         LeafIter::new(&self.store, self.root)

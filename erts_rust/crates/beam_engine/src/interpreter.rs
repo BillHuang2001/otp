@@ -28,7 +28,7 @@ use beam_term::{
 use crate::context::ExecutionContext;
 use crate::error;
 use crate::families;
-use crate::machine::{Continuation, Machine};
+use crate::machine::{Continuation, Machine, RunOutcome};
 use crate::operand::{read_operand, write_operand};
 use crate::predicates;
 use crate::Step;
@@ -81,14 +81,22 @@ impl Machine {
     /// The direct-threaded dispatch loop over the Milestone-1 opcode subset.
     ///
     /// Entry point: function index `func` (into [`Module::functions`]) and code
-    /// offset `pc`; runs to the function's `return` and yields `x(0)`.
+    /// offset `pc`; runs until the function's `return` (yielding `x(0)` as
+    /// [`RunOutcome::Returned`]) or until a `receive` suspends the process on an
+    /// empty mailbox (yielding [`RunOutcome::Wait`], with the registers, the
+    /// Erlang stack and every call frame left exactly as the `wait` instruction
+    /// found them).
+    ///
+    /// It does **not** reset the machine: it only (re)binds the running module's
+    /// literal area and builds the label map, so [`Machine::resume_outcome`] can
+    /// re-enter a suspended process through it unchanged.
     pub(crate) fn run_loop(
         &mut self,
         module: &Module,
         func: u32,
         pc: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm> {
+    ) -> Result<RunOutcome> {
         // Bind the running module's literal area so the operand seam can resolve
         // `Operand::Literal(idx)` (the module is fixed for the whole run; see the
         // `Machine::literals` field docs). `reset()` cleared any previous binding.
@@ -109,6 +117,9 @@ impl Machine {
     /// * [`Step::Next`] — the instruction advances `pc` by 1 in the same function.
     /// * [`Step::Goto { func, pc }`] — it transfers control (jump/call/select/
     ///   test-fail/raise-landing/…): the returned `(func, pc)` is the next address.
+    /// * [`Step::Wait { func, pc }`] — it suspends the process in a `receive`: the
+    ///   returned `(func, pc)` is where the module resumes once a message arrives
+    ///   (see [`crate::RunOutcome::Wait`]).
     /// * [`Step::Done`] — it would finish the run (a `return`/`call_ext*` reaching
     ///   the bottom frame's [`Continuation::Halt`]); the caller turns this into
     ///   `x(0)` with [`Machine::finish`].
@@ -390,11 +401,13 @@ impl Machine {
     }
 
     /// The dispatch loop over a pre-built label map (shared by
-    /// [`Machine::run_loop`] and [`Machine::run_label`]).
+    /// [`Machine::run_loop`] and [`Machine::resume_outcome`]).
     ///
     /// A thin driver over [`Machine::step_instruction`]: it executes one
     /// instruction at a time and folds the returned [`Step`] into the running
-    /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`].
+    /// `(func, pc)`, finishing the run with `x(0)` on [`Step::Done`] and reporting a
+    /// suspension as [`RunOutcome::Wait`] on [`Step::Wait`] (leaving the machine
+    /// untouched so the host can re-enter at the reported address).
     pub(crate) fn run_loop_with_map(
         &mut self,
         module: &Module,
@@ -402,7 +415,7 @@ impl Machine {
         mut func: u32,
         mut pc: u32,
         ctx: &mut dyn ExecutionContext,
-    ) -> Result<Eterm> {
+    ) -> Result<RunOutcome> {
         loop {
             match self.step_instruction(module, labels, func, pc, ctx)? {
                 Step::Next => pc += 1,
@@ -410,7 +423,8 @@ impl Machine {
                     func = f;
                     pc = p;
                 }
-                Step::Done => return self.finish(),
+                Step::Wait { func: f, pc: p } => return Ok(RunOutcome::Wait { func: f, pc: p }),
+                Step::Done => return self.finish().map(RunOutcome::Returned),
             }
         }
     }
@@ -459,7 +473,11 @@ impl Machine {
     ///   a documented Milestone-1 limit (the [`Module`] reaches the interpreter
     ///   read-only, so a name the compiler never emitted cannot be interned here,
     ///   unlike the C runtime's global atom table).
-    fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
+    ///
+    /// Shared with the instruction families (e.g. `families::receive`'s `send`,
+    /// which carries no fail label either), so the landing convention stays defined
+    /// in exactly one place.
+    pub(crate) fn raise_bif_error(&mut self, module: &Module, error: BeamError) -> Result<Step> {
         if self.catch_frame_depth() == 0 || matches!(&error, BeamError::Raise(_)) {
             return Err(error);
         }

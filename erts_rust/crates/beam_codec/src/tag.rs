@@ -116,15 +116,26 @@ pub const FUN_EXT: u8 = 117;
 /// `NEW_PORT_EXT` (`89`) is decode-only.
 pub const V4_PORT_EXT: u8 = 120;
 
-/// `LOCAL_EXT` (`'y'`, `external.h:62`): a local (node-less) pid/port/reference.
+/// `LOCAL_EXT` (`'y'`, `external.h:62`): the `term_to_binary/2 [local]` wrapper
+/// `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`.
+///
+/// **Not a term of its own.** It is valid only as the outermost wrapper; the decoder
+/// honours it wherever it appears by consuming the 4-byte node hash and continuing
+/// with the following object (`external.c:5250-5254`). Hash verification lives in the
+/// C `decoded_size` sizing pass and needs the node's `local_node_hash` (node identity,
+/// owned by `beam_rt`/`beam_dist`), so it is not performed here.
 pub const LOCAL_EXT: u8 = 121;
 
 /// `ATOM_CACHE_REF` (`'R'`, `external.h:69`): a one-byte distribution atom-cache
 /// reference, resolved through [`crate::atom_cache::AtomCache`].
 pub const ATOM_CACHE_REF_EXT: u8 = 82;
 
-/// `DIST_HEADER` (`'D'`, `external.h:65`): the distribution header. Owned by
-/// `beam_dist`, which also fills the atom cache it carries.
+/// `DIST_HEADER` (`'D'`, `external.h:65`): the distribution header.
+///
+/// A distribution-**transport** wrapper, never a term: the C term decoder has no
+/// `case DIST_HEADER` and treats it as malformed (`goto error`, `external.c:6464`), so
+/// it is rejected as `BadArg`. The `'D'`/`'E'`/`'F'` framing (header, atom cache,
+/// fragment headers) is owned by `beam_dist` (`../beam_dist/src/dist_header.rs`).
 pub const DIST_HEADER_EXT: u8 = 68;
 
 /// `NEW_CACHE` (`'N'`, `external.h:80`): the extended distribution atom-cache
@@ -208,10 +219,17 @@ pub enum Tag {
     /// `V4_PORT_EXT` (`120`).
     V4Port,
     /// `LOCAL_EXT` (`121`).
+    ///
+    /// The `term_to_binary/2 [local]` wrapper — not a term of its own. The decoder
+    /// honours it by consuming the 4-byte node hash and continuing with the following
+    /// object. See [`Tag::covered`].
     Local,
     /// `ATOM_CACHE_REF` (`82`).
     AtomCacheRef,
     /// `DIST_HEADER` (`68`).
+    ///
+    /// A distribution-transport wrapper, never a term: rejected as malformed
+    /// (`BadArg`). The framing is `beam_dist`'s. See [`Tag::covered`].
     DistHeader,
     /// `NEW_CACHE` (`78`).
     NewCache,
@@ -351,14 +369,17 @@ impl Tag {
     /// `true` for the required core set (integers, floats, all four atom tags,
     /// references, ports — including the modern `V4_PORT_EXT` — pids, tuples, `NIL`,
     /// strings, lists, binaries/bitstrings, maps of any pair count, funs/export
-    /// literals, the distribution atom-cache reference, and `COMPRESSED` as a
-    /// top-level wrapper); `false` for everything the codec deliberately reports as
-    /// [`crate::error::unsupported`] (records, `LOCAL_EXT` and the distribution
-    /// header) **or** rejects as malformed ([`Tag::Fun`], [`Tag::NewCache`]).
+    /// literals, the distribution atom-cache reference, `COMPRESSED` as a top-level
+    /// wrapper, and `LOCAL_EXT` as the `[local]` wrapper); `false` for everything the
+    /// codec either rejects as malformed ([`Tag::Fun`], [`Tag::NewCache`], and the
+    /// distribution header [`Tag::DistHeader`], which is never a term) **or**
+    /// deliberately reports as [`crate::error::unsupported`] (records, [`Tag::Record`]).
     ///
     /// `COMPRESSED` (`80`) is reported as covered because the codec does honour it —
     /// but only as the outermost wrapper, immediately after the version byte
-    /// (`crate::decode::decode_term`); nested it is malformed input.
+    /// (`crate::decode::decode_term`); nested it is malformed input. `LOCAL_EXT`
+    /// (`121`) is covered as the top-level `[local]` wrapper, and is honoured inline
+    /// wherever it appears.
     ///
     /// `NEW_FUN_EXT`/`EXPORT_EXT` are covered: they decode to fun terms and encode
     /// back byte-exactly (see `crate::decode`/`crate::encode`).
@@ -395,6 +416,7 @@ impl Tag {
                 | Tag::Export
                 | Tag::AtomCacheRef
                 | Tag::Compressed
+                | Tag::Local
         )
     }
 }
@@ -438,7 +460,7 @@ mod tests {
         (Tag::Export, 113, "EXPORT_EXT", true),
         (Tag::Fun, 117, "FUN_EXT", false),
         (Tag::V4Port, 120, "V4_PORT_EXT", true),
-        (Tag::Local, 121, "LOCAL_EXT", false),
+        (Tag::Local, 121, "LOCAL_EXT", true),
         (Tag::AtomCacheRef, 82, "ATOM_CACHE_REF", true),
         (Tag::DistHeader, 68, "DIST_HEADER", false),
         (Tag::NewCache, 78, "NEW_CACHE", false),

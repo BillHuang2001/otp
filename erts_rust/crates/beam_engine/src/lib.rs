@@ -15,8 +15,11 @@
 //! interpreter is the reference tier and
 //! [`Machine::run_export`] remains its default entry point.
 //!
-//! The native backends are **not built yet**: `BaselineJit` currently routes to the
-//! interpreter (correct results, no codegen) and `Cranelift` is a typed
+//! The **native baseline tier is built** ([`jit::baseline`]): each basic block is
+//! lowered to a real x86-64 `extern "C"` function and an export runs through a
+//! driver loop that deopts to one interpreter step per instruction it does not
+//! lower natively. The **optional Cranelift hot tier is built too**, behind the
+//! default-off `jit-cranelift` feature; with the feature off `Cranelift` is a typed
 //! `unsupported` error rather than a silent fallback. [`jit::JitBackend`] is the
 //! trait those backends implement (`compile` a [`beam_loader::Module`] into their
 //! own artifact, `run_export` it on a [`Machine`]); Cranelift stays off the
@@ -28,10 +31,16 @@
 //!
 //! The engine depends only on `beam_loader` (+ `beam_term`/`beam_common`) — never
 //! on the Stage-5 runtime core. Everything the runtime must supply (BIF dispatch,
-//! heap/GC, process/stack limits) is abstracted behind the
+//! heap/GC, process/stack limits, the mailbox) is abstracted behind the
 //! [`ExecutionContext`] trait; `beam_rt` provides the concrete implementation.
 //! This keeps the Stage-1/Stage-5 DAG acyclic and lets the engine be tested with a
 //! minimal context.
+//!
+//! A `receive` that finds no message available **suspends** the process: the
+//! blocking-aware entries ([`Machine::run_export_outcome`]/
+//! [`Machine::resume_outcome`]) report it as [`RunOutcome::Wait`], while the plain
+//! [`Machine::run_export`]/[`Machine::run_label`] (and the native JIT tiers) fold
+//! it into the typed [`error::blocked`] error.
 //!
 //! ## Status
 //!
@@ -50,10 +59,11 @@
 //! boxed-term predicates (`unsafe fn` because they dereference a header word) and
 //! `terms` is the crate's single point of raw-heap term construction/reading
 //! behind the [`ExecutionContext::alloc_words`] seam — both allowed where they are
-//! declared below. Two more modules carry a module-local `#![allow(unsafe_code)]`:
-//! `families::bitstrings::raw` (the frozen bitstring layouts) and [`jit::emitter`]
-//! (the baseline JIT's x86-64 encoder and the crate's only executable-memory
-//! mapping — see that module for its W^X policy).
+//! declared below. A further set of modules carry a module-local
+//! `#![allow(unsafe_code)]`: `families::bitstrings::raw` (the frozen bitstring
+//! layouts), [`jit::emitter`] (the x86-64 encoder and the crate's only
+//! executable-memory mapping — see that module for its W^X policy), the baseline
+//! backend (`jit::baseline`), and the feature-gated `jit::cranelift`.
 #![deny(unsafe_code)]
 #![warn(missing_docs)]
 
@@ -70,19 +80,20 @@ mod predicates;
 mod step;
 #[allow(unsafe_code)]
 pub mod terms;
-pub use context::{ExecutionContext, MinimalContext};
-pub use error::{bad_register, unknown_label, unsupported};
+pub use context::{ExecutionContext, Mailbox, MinimalContext};
+pub use error::{bad_register, blocked, unknown_label, unsupported};
 pub use jit::{available_tiers, JitBackend, Tier, TierPolicy};
-pub use machine::{CatchFrame, Machine, MAX_REGISTER};
+pub use machine::{CatchFrame, Machine, RunOutcome, MAX_REGISTER};
 pub(crate) use step::Step;
 
 /// The conventional glob-import surface for downstream crates.
 ///
-/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam, the
-/// [`Machine`] core (with its register-file bound [`MAX_REGISTER`]) and the
+/// `use beam_engine::prelude::*;` brings the [`ExecutionContext`] seam and the
+/// mailbox seam [`Mailbox`], the [`Machine`] core (with its register-file bound
+/// [`MAX_REGISTER`] and the blocking-aware run outcome [`RunOutcome`]) and the
 /// execution-tier selector [`Tier`] (for [`Machine::run_with_tier`]) into scope.
 pub mod prelude {
-    pub use crate::context::{ExecutionContext, MinimalContext};
+    pub use crate::context::{ExecutionContext, Mailbox, MinimalContext};
     pub use crate::jit::Tier;
-    pub use crate::machine::{Machine, MAX_REGISTER};
+    pub use crate::machine::{Machine, RunOutcome, MAX_REGISTER};
 }

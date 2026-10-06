@@ -40,6 +40,23 @@ pub enum ProcessState {
     Terminated,
 }
 
+/// What a successful [`Process::deliver`] did with the recipient.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeliverOutcome {
+    /// The message was enqueued; the recipient was not blocked, so nothing else happened.
+    Enqueued,
+    /// The message was enqueued **and** the recipient was blocked (`Waiting`/`Suspended`):
+    /// it has been made `Runnable` so the scheduler can resume it.
+    Woke,
+}
+
+impl DeliverOutcome {
+    /// Whether the delivery woke a blocked recipient (i.e. this is [`DeliverOutcome::Woke`]).
+    pub fn woke(self) -> bool {
+        matches!(self, DeliverOutcome::Woke)
+    }
+}
+
 /// The process's boolean flags, as a `u32` bitset newtype (no `bitflags` dependency).
 ///
 /// These are the flags the Milestone-1 core reads directly: `trap_exit`, `system`,
@@ -225,6 +242,26 @@ impl Process {
         self.state = state;
     }
 
+    /// Makes this process runnable if it is currently blocked.
+    ///
+    /// A process is "blocked" when its state is [`ProcessState::Waiting`] (a `receive` that
+    /// found no matching message) or [`ProcessState::Suspended`] (an outside
+    /// `erlang:suspend_process/1`). Both are woken by an arriving message: `Waiting` is the
+    /// ordinary receive case and `Suspended` must still be seen to have a message so the
+    /// suspension can be lifted later — this crate keeps them symmetric rather than guessing
+    /// the historical C nuance.
+    ///
+    /// Returns `true` when the process was blocked and is now `Runnable`; `false` when it was
+    /// already runnable/running/exiting and nothing changed.
+    pub fn wake(&mut self) -> bool {
+        match self.state {
+            ProcessState::Waiting | ProcessState::Suspended => {
+                self.state = ProcessState::Runnable;
+                true
+            }
+            _ => false,
+        }
+    }
     /// The process's flags.
     pub fn flags(&self) -> &ProcessFlags {
         &self.flags
@@ -341,7 +378,9 @@ impl Process {
     }
 
     /// Copies `term` into this process's young heap — resolving off-heap references
-    /// against `src_off_heap` — and enqueues it as a message from `from`.
+    /// against `src_off_heap` — and enqueues it as a message from `from`. If the process was
+    /// blocked (`Waiting`/`Suspended`), it is woken and the returned [`DeliverOutcome`] is
+    /// [`DeliverOutcome::Woke`].
     ///
     /// Retries once after a collection when the young heap (or the message table) is
     /// exhausted: `AllocKind::Heap`/`AllocKind::Message` exhaustion is a *normal*
@@ -351,19 +390,29 @@ impl Process {
     ///
     /// Propagates the underlying `BeamError::Alloc` if the copy still does not fit after a
     /// collection.
-    pub fn deliver(&mut self, from: Eterm, term: Eterm, src_off_heap: &OffHeapTable) -> Result<()> {
+    pub fn deliver(
+        &mut self,
+        from: Eterm,
+        term: Eterm,
+        src_off_heap: &OffHeapTable,
+    ) -> Result<DeliverOutcome> {
         match self.copy_message(from, term, src_off_heap) {
-            Ok(()) => Ok(()),
+            Ok(()) => {}
             // A full young heap (or message table) is a normal condition: collect and
             // retry exactly once. Any other failure is propagated untouched.
             Err(BeamError::Alloc(failure))
                 if matches!(failure.kind, AllocKind::Heap | AllocKind::Message) =>
             {
                 self.collect()?;
-                self.copy_message(from, term, src_off_heap)
+                self.copy_message(from, term, src_off_heap)?;
             }
-            Err(error) => Err(error),
+            Err(error) => return Err(error),
         }
+        Ok(if self.wake() {
+            DeliverOutcome::Woke
+        } else {
+            DeliverOutcome::Enqueued
+        })
     }
 
     /// The no-off-heap convenience form of [`Process::deliver`].
@@ -372,13 +421,12 @@ impl Process {
     ///
     /// Propagates the underlying `BeamError::Alloc` if the copy still does not fit after a
     /// collection.
-    pub fn deliver_simple(&mut self, from: Eterm, term: Eterm) -> Result<()> {
+    pub fn deliver_simple(&mut self, from: Eterm, term: Eterm) -> Result<DeliverOutcome> {
         // An empty source table: nothing to resolve, so the copy shares immediates and
         // copies the rest verbatim.
         let no_off_heap = OffHeapTable::new();
         self.deliver(from, term, &no_off_heap)
     }
-
     /// Copies `term` — whose off-heap references are described by `src_off_heap` — into this
     /// process's own young heap, registering every referenced off-heap object in *this*
     /// process's off-heap table so it outlives the copy, and returns the copied term.

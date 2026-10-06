@@ -508,6 +508,30 @@ pub enum Instr {
         /// The `(index, value)` replacements, in file order.
         updates: Vec<(Operand, Operand)>,
     },
+    /// `is_any_native_record Fail Src` — the `erlang:is_record/1` guard (generic
+    /// opcode 186).
+    ///
+    /// Branches to `Fail` iff `Src` is **not** a native record: a boxed term whose
+    /// header carries the `RECORD` subtag (`is_record($Src)` in the C body
+    /// `erts/emulator/beam/emu/instrs.tab:1323`; operand shape `f xy` in
+    /// `erts/emulator/beam/emu/ops.tab:1634`). It is deliberately **not** a
+    /// [`TestKind`] — `beam_engine` matches `TestKind` exhaustively, so classifying
+    /// it there would break that surface, whereas a new `Instr` variant is additive.
+    ///
+    /// It is the only member of the OTP-29 native-record family the standard
+    /// compiler emits (sites in `erl_eval`/`io_lib`/`erl_types`/
+    /// `dialyzer_codeserver`/`dbg_ieval`). Its siblings (`is_native_record`,
+    /// `get_record_elements`, `put_record`, `is_record_accessible`,
+    /// `get_record_field`, `get_record_elements_id`, `update_record_id`) still lower
+    /// to [`Instr::Generic`]: they need record-descriptor modelling the IR does not
+    /// own yet.
+    IsAnyNativeRecord {
+        /// The failure label ([`crate::operand::NO_FAIL`] means "no explicit fail
+        /// target").
+        fail: Label,
+        /// The source x/y register holding the term to test.
+        src: Operand,
+    },
 
     // ---- exceptions --------------------------------------------------------
     /// `badmatch Value` — raise a `{badmatch,Value}` error.

@@ -130,12 +130,10 @@ fn memory_tracks_the_table_owned_storage() {
         let mut t = new_table(kind);
 
         let empty = t.memory();
-        // A `set` owns its bucket array, so an empty table is not zero words.
-        // (`ordered_set`'s B+-tree does not report its node storage yet — a
-        // documented gap — so its empty count may be zero.)
-        if kind == TableKind::Set {
-            assert!(empty > 0, "a hash interior owns its buckets");
-        }
+        // Both interiors report their index storage, so an empty table is not zero
+        // words: a `set` owns its bucket array and an `ordered_set` owns its root
+        // leaf (plus the B+-tree slot table).
+        assert!(empty > 0, "{kind:?} interior owns its index storage");
 
         for k in 0..50i64 {
             t.insert(object(&mut heap, k, k * 2), &atoms).unwrap();
@@ -177,6 +175,46 @@ fn memory_tracks_the_table_owned_storage() {
         assert!(t.memory() > 0, "{kind:?} memory after reuse");
         assert_eq!(t.size(), 1);
     }
+}
+
+#[test]
+fn ordered_set_memory_includes_the_node_arena() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(64 * 1024);
+    let mut t = new_table(TableKind::OrderedSet);
+
+    // The empty table owns its B+-tree root leaf and slot table, so it is not zero
+    // words — the node arena is counted even before any key exists.
+    let empty = t.memory();
+    assert!(empty > 0, "an empty ordered_set owns its B+-tree root leaf");
+    assert_eq!(t.info().memory, empty, "info agrees with memory()");
+
+    // A handful of keys: still a single root leaf, negligible node storage.
+    for k in 0..8i64 {
+        t.insert(object(&mut heap, k, k), &atoms).unwrap();
+    }
+    let few = t.memory();
+    assert!(few > empty, "inserting keys grows the memory count");
+
+    // Enough keys to force many node splits (branches + a level of leaves). The
+    // B+-tree node arena is now a large part of the table's memory.
+    for k in 8..4000i64 {
+        t.insert(object(&mut heap, k, k), &atoms).unwrap();
+    }
+    let many = t.memory();
+    assert_eq!(t.size(), 4000);
+
+    // `memory` strictly exceeds the term-store-only figure: each object is a
+    // `{Key, Value}` tuple of three store words (header + two elements), so the
+    // term store alone is `3 * size`; the node arena pushes the total above it.
+    assert!(
+        many > 3 * t.size(),
+        "node arena counted: {many} > 3 * {} (term store only)",
+        t.size()
+    );
+    // Never under-reports: at least one word per stored object.
+    assert!(many >= t.size(), "words ≥ objects: {many} >= {}", t.size());
+    assert_eq!(t.info().memory, many, "info agrees after the churn");
 }
 
 #[test]

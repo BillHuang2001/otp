@@ -36,7 +36,7 @@ pub fn send(
 /// Removes and returns the first queued message whose payload satisfies `pred`.
 pub fn receive<F: FnMut(&Message) -> bool>(queue: &mut Queue, mut pred: F) -> Option<Message> {
     let index = queue.iter().position(|message| pred(message))?;
-    queue.remove_at(index)
+    queue.remove_index(index)
 }
 
 /// Borrows the first queued message whose payload satisfies `pred`, without removing it.

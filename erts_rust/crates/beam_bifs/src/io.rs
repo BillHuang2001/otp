@@ -100,12 +100,27 @@ use crate::print::{
 };
 use crate::registry::BifRegistry;
 
-/// Registers `io:format/1,2` and `io_lib:format/2,3`.
+/// Registers `io:printable_range/0`, `io:format/1,2` and `io_lib:format/2,3`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("io", "format", 1, format_1);
     reg.register("io", "format", 2, format_2);
+    reg.register("io", "printable_range", 0, printable_range_0);
     reg.register("io_lib", "format", 2, format_lib_2);
     reg.register("io_lib", "format", 3, format_lib_3);
+}
+
+/// `io:printable_range/0` — the atom `latin1` or `unicode`, whichever the runtime
+/// was started with.
+///
+/// Reproduces the oracle's `io_printable_range_0` (`../../erts/emulator/beam/
+/// erl_unicode.c:2943-2948`), which returns `unicode` only when the printable
+/// character range is [`ERL_PRINTABLE_CHARACTERS_UNICODE`]. That range defaults to
+/// **`latin1`** and is upgraded to `unicode` only by the `+pc unicode` emulator
+/// flag (`erl_init.c:1379-1382`); Milestone-1 has no flag plumbing, so this returns
+/// the default `latin1` — exactly what the oracle reports without `+pc`
+/// (`erl -noshell -eval 'io:printable_range()'` ⇒ `latin1`).
+fn printable_range_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.atom("latin1")
 }
 
 /// `io:format(Format)` — writes `Format` with no arguments and returns `ok`.
@@ -1763,6 +1778,26 @@ mod tests {
                 "format {format} should be badarg"
             );
         }
+    }
+
+    #[test]
+    fn printable_range_is_latin1_by_default() {
+        // `io:printable_range/0` ⇒ `latin1`: the `ERL_PRINTABLE_CHARACTERS_LATIN1`
+        // default (`erl_init.c:1379-1382`), which only `+pc unicode` upgrades, and
+        // Milestone-1 has no flag plumbing — exactly what the oracle reports without
+        // `+pc` (`erl -noshell -eval 'io:printable_range().'`).
+        let mut heap = Heap::new(1024).expect("test heap");
+        let mut atoms = AtomTable::new();
+        // Both atoms are seeded, so a hard-coded `unicode` result could not pass by
+        // accident (an unseeded name would be `TermNotFound`, not a wrong answer).
+        atoms.seed(["latin1", "unicode"]);
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let result = printable_range_0(&mut ctx, &[]).expect("latin1 is seeded");
+        let latin1 = ctx.atom("latin1").expect("seeded");
+        let unicode = ctx.atom("unicode").expect("seeded");
+        assert_eq!(result, latin1);
+        assert_ne!(result, unicode);
+        assert!(crate::registry::default_registry().contains("io", "printable_range", 0));
     }
 
     #[test]

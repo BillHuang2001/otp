@@ -210,3 +210,88 @@ fn insert_rejects_malformed_objects_with_badarg() {
     assert!(matches!(t2.insert(one, &atoms), Err(BeamError::BadArg)));
     assert_eq!(t2.size(), 0);
 }
+
+#[test]
+fn take_returns_the_objects_and_reclaims_the_stored_ones() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+    let mut t = new_table(TableKind::Set);
+
+    // `take` returns a structurally equal object and removes the key.
+    let o = object(&mut heap, 1, 10);
+    t.insert(o, &atoms).unwrap();
+    assert_eq!(t.size(), 1);
+    let taken = t.take(make_small(1), &atoms).unwrap();
+    assert_eq!(taken.len(), 1);
+    assert!(
+        eq(taken[0], o, &atoms),
+        "take returns an object equal to the stored one"
+    );
+    assert!(!t.member(make_small(1), &atoms));
+    assert_eq!(t.size(), 0);
+    assert!(t.is_empty());
+
+    // An absent key (including a second `take` of the same key) is empty, not an
+    // error.
+    assert!(t.take(make_small(1), &atoms).unwrap().is_empty());
+    assert!(t.take(make_small(9), &atoms).unwrap().is_empty());
+
+    // Reclamation: `insert` + `take` of the same object must not grow the table's
+    // memory. Each removed object's storage is reclaimed after being copied out, so
+    // 1000 cycles cost no more than 10 (a leak would grow the figure linearly —
+    // ~3 words per cycle).
+    let churn = object(&mut heap, 2, 20);
+    for _ in 0..10 {
+        t.insert(churn, &atoms).unwrap();
+        assert_eq!(t.take(make_small(2), &atoms).unwrap().len(), 1);
+    }
+    let after_10 = t.memory();
+    for _ in 0..1000 {
+        t.insert(churn, &atoms).unwrap();
+        assert_eq!(t.take(make_small(2), &atoms).unwrap().len(), 1);
+    }
+    assert_eq!(
+        t.memory(),
+        after_10,
+        "take must reclaim the removed objects (no build-up under churn)"
+    );
+    assert_eq!(t.size(), 0);
+}
+
+#[test]
+fn a_taken_object_stays_valid_while_the_store_is_churned() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(4096);
+    let mut t = new_table(TableKind::Set);
+
+    // Take an object and hold on to it.
+    let expected = object(&mut heap, 1, 10);
+    t.insert(expected, &atoms).unwrap();
+    let captured = t.take(make_small(1), &atoms).unwrap().pop().unwrap();
+
+    // Churn the store hard enough to force free-list reuse of the same-sized runs:
+    // insert many, delete them all, then `insert`+`take` a same-size object 50 times.
+    // A returned taken object must never sit in reusable storage, so it must still
+    // read back exactly as it was handed out.
+    for k in 2..300i64 {
+        t.insert(object(&mut heap, k, k), &atoms).unwrap();
+    }
+    for k in 2..300i64 {
+        t.delete(make_small(k), &atoms).unwrap();
+    }
+    for _ in 0..50 {
+        t.insert(object(&mut heap, 5, 55), &atoms).unwrap();
+        assert_eq!(t.take(make_small(5), &atoms).unwrap().len(), 1);
+    }
+
+    // The captured copy is untouched.
+    assert!(
+        eq(captured, expected, &atoms),
+        "a taken object must not be overwritten by later store activity"
+    );
+    assert_eq!(
+        cmp(captured, expected, &atoms),
+        core::cmp::Ordering::Equal,
+        "the captured object still compares equal"
+    );
+}

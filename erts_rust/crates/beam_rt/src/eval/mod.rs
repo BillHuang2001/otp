@@ -8,11 +8,13 @@
 //!
 //! # Semantics inherited from the lower crates (nothing is re-implemented)
 //!
-//! * **Arithmetic and comparison are BIFs.** Every `+ - * / div rem` and every
-//!   `== /= =:= =/= < =< > >=` is dispatched through
+//! * **Arithmetic, comparison and the bit operators are BIFs.** Every
+//!   `+ - * / div rem` and every `== /= =:= =/= < =< > >=` is dispatched through
 //!   [`RuntimeContext::call_bif`](crate::context::RuntimeContext) to the
 //!   `beam_bifs` `erlang` registry, so the results *and* the error reasons
-//!   (`1/0` ⇒ `error:badarith`) are exactly the ones loaded code sees.
+//!   (`1/0` ⇒ `error:badarith`) are exactly the ones loaded code sees. The same
+//!   registry owns `band`/`bor`/`bxor`/`bnot`/`bsl`/`bsr`, so those six bit
+//!   operators inherit its arbitrary-precision (bignum) semantics for free.
 //! * **A call is a call.** A local `f(Args)` is an auto-imported
 //!   `erlang:f/Arity`; `m:f(Args)` is a remote call. Both go through
 //!   [`call_bif`](beam_engine::ExecutionContext::call_bif), which is also the
@@ -24,8 +26,8 @@
 //!
 //! The handful of operators the `beam_bifs` surface deliberately does not own —
 //! `and`/`or`/`xor`/`not`/`andalso`/`orelse` (Erlang *special forms* with
-//! short-circuit semantics), `++`/`--` and the bitwise family — are implemented
-//! here with the oracle's error behaviour (`not 5` ⇒ `error:badarg`).
+//! short-circuit semantics) and `++`/`--` — are implemented here with the
+//! oracle's error behaviour (`not 5` ⇒ `error:badarg`).
 //!
 //! # Exceptions
 //!
@@ -634,10 +636,7 @@ impl Evaluator<'_, '_> {
                 let boolean = self.boolean(value)?;
                 Ok(self.bool_term(!boolean))
             }
-            UnOp::Bnot => {
-                let integer = self.integer(value)?;
-                self.small(!integer)
-            }
+            UnOp::Bnot => self.call("erlang", "bnot", &[value]),
         }
     }
 
@@ -676,30 +675,21 @@ impl Evaluator<'_, '_> {
             BinOp::ListConcat => self.list_concat(lhs, rhs, env),
             BinOp::ListSubtract => self.list_subtract(lhs, rhs, env),
             BinOp::Band | BinOp::Bor | BinOp::Bxor | BinOp::Bsl | BinOp::Bsr => {
-                let left_value = self.expr(lhs, env)?;
-                let left = self.integer(left_value)?;
-                let right_value = self.expr(rhs, env)?;
-                let right = self.integer(right_value)?;
-                let result = match op {
-                    BinOp::Band => left & right,
-                    BinOp::Bor => left | right,
-                    BinOp::Bxor => left ^ right,
-                    BinOp::Bsl => {
-                        let shift = u32::try_from(right).ok().filter(|s| *s < 64);
-                        match shift.and_then(|shift| left.checked_shl(shift)) {
-                            Some(result) => result,
-                            None => return Err(self.raise(ExceptionClass::Error, "system_limit")),
-                        }
-                    }
-                    _ => {
-                        let shift = u32::try_from(right).ok().filter(|s| *s < 64);
-                        match shift {
-                            Some(shift) => left >> shift,
-                            None => return Err(self.raise(ExceptionClass::Error, "badarith")),
-                        }
-                    }
+                // The six bit operators are `erlang` BIFs (`beam_bifs/src/arith.rs`):
+                // dispatching to the registry gives their exact arbitrary-precision
+                // semantics — a bignum operand, or a shift that overflows a small
+                // integer, is handled there (`system_limit`/`badarith` come from the
+                // registry, never re-raised here).
+                let left = self.expr(lhs, env)?;
+                let right = self.expr(rhs, env)?;
+                let name = match op {
+                    BinOp::Band => "band",
+                    BinOp::Bor => "bor",
+                    BinOp::Bxor => "bxor",
+                    BinOp::Bsl => "bsl",
+                    _ => "bsr",
                 };
-                self.small(result)
+                self.call("erlang", name, &[left, right])
             }
             BinOp::Send => Err(Flow::Fatal(error::unsupported(
                 "the send operator '!' (no mailbox in -eval)",
@@ -1640,15 +1630,6 @@ impl Evaluator<'_, '_> {
         }
     }
 
-    /// `value` as a small integer, or `error:badarg`.
-    fn integer(&mut self, value: Eterm) -> EResult<i64> {
-        if is_small(value) {
-            Ok(signed_value(value))
-        } else {
-            Err(self.raise(ExceptionClass::Error, "badarg"))
-        }
-    }
-
     /// Whether `value` is the atom `true` (a guard that yields anything else
     /// fails rather than raising).
     fn is_true(&self, value: Eterm) -> bool {
@@ -1808,6 +1789,43 @@ mod tests {
         int("7 rem 2", 1);
         int("-3 + 1", -2);
         int("2 * -3", -6);
+    }
+
+    #[test]
+    fn bit_operators_go_through_the_registry() {
+        // The six bit operators are dispatched to `beam_bifs`' arbitrary-precision
+        // `erlang` BIFs (not computed locally), so a small-int result must still be
+        // exactly the oracle's.
+        int("5 band 3", 1);
+        int("5 bor 2", 7);
+        int("5 bxor 1", 4);
+        int("1 bsl 4", 16);
+        int("16 bsr 4", 1);
+        int("bnot 0", -1);
+        // Two's-complement semantics for a negative operand (`utils.c`/`erl_arith.c`).
+        int("bnot 5", -6);
+        int("-2 band 3", 2);
+        // A negative shift amount flips the direction (`erts_shift`).
+        int("1 bsl -4", 0);
+    }
+
+    #[test]
+    fn bit_operator_bignum_round_trip() {
+        // `1 bsl 70` is a bignum — only the registry's arbitrary-precision arithmetic
+        // produces it (the old local small-int path raised `system_limit`). Shifting
+        // back lands on the small integer `1`, so the intermediate bignum term must
+        // have survived the round trip through the BIF registry.
+        int("(1 bsl 70) bsr 70", 1);
+        // A bignum `band` a bignum stays exact and fits a small integer here.
+        int("((1 bsl 70) bor 3) band 3", 3);
+    }
+
+    #[test]
+    fn bit_operator_on_a_non_integer_is_badarith() {
+        // The registry owns the error reason: a float operand is `badarith`
+        // (`1.5 band 2`), exactly as the oracle raises it.
+        assert!(run("1.5 band 2").is_err(), "1.5 band 2 must fail");
+        assert!(run("bnot 1.0").is_err(), "bnot 1.0 must fail");
     }
 
     #[test]

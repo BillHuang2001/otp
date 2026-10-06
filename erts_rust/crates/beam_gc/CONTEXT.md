@@ -15,7 +15,8 @@ Contracts honoured here (crate-layer `../CONTEXT.md`): the **root-set contract**
 + the whole stack, **no frame liveness maps**), the **frozen term layout** (§2 — *never* assume a
 different `Eterm` layout; build/inspect only through `beam_term`), and the **return-based error
 strategy** (§3). MMTk and Boehm are **rejected**; GenImmix is a **measurement-gated** mature-generation
-option and is **out of scope** (see Known Gaps).
+option — implemented (`immix/` + `immix_collector.rs`) and selectable through `GcConfig`/`AnyCollector`,
+but never on the default path (see Design Decisions).
 
 ## API Surface (the seam dependents design against)
 Re-exported at the crate root and via `beam_gc::prelude::*`.
@@ -41,6 +42,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `run(self, roots: &mut [Eterm]) -> Result<GcStats>` — `forward_roots` + `complete`.
 - `pub fn collect(from: &HeapSpace, to: &mut HeapSpace, roots: &mut [Eterm]) -> Result<GcStats>` — the
   primitive young-generation entry over a single from-space (objective §1).
+- The shared `pub(crate)` evacuation primitives every other module builds on (so the word-level logic
+  lives in exactly one place): `Target` (`Foreign`/`Live`/`Forwarded`), the `EvacDest` trait (a
+  destination's `classify_boxed`/`classify_cons`/`can_reserve`/`reserve`), the generic
+  `forward_slot<D: EvacDest>`, `move_size`, `ScanStep`/`scan_step`, and `for_each_ref` (`for_each_ref`
+  walks from word 0 **including the header**, because the header selects the payload layout). `Copier`,
+  `immix/`, and `immix_collector`'s `PromoteDest` all consume them.
 - Fun blocks are sized and scanned from `beam_term::fun`'s inlined-descriptor layout
   (`1 + desc_words(kind) + num_free`, env at `fun_env_offset_header`), **never** via
   `header_arity`/`thing_arityval` — see Design Decisions.
@@ -56,6 +63,39 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   - `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>` — picks minor vs major (policy),
     escalating a would-not-fit minor to a major
   - `collect_minor(&mut self, roots) -> Result<GcStats>`; `collect_major(&mut self, roots) -> Result<GcStats>`
+
+### `immix/mod.rs` + `immix/collect.rs` — the mark-region mature space (`ImmixSpace`)
+- `pub struct ImmixSpace` — line/block mark-region mature generation. Geometry: `LINE_WORDS` 16,
+  `LINES_PER_BLOCK` 16, `BLOCK_WORDS` 256. Line bitmaps per block (`allocated`/`marked`/`kept`),
+  `BlockState::{Free,Partial,AllMarked}`.
+  - `new(capacity_words)` / `with_allocator(alloc, capacity_words)`; `base`/`contains`/`contains_term`;
+    `capacity_words`/`block_count`/`line_count`/`used_lines`/`free_lines`/`used_words`/`available_words`;
+    `counters() -> ImmixCounters`; `reset()`
+  - `unsafe alloc_words(words) -> Result<*mut Eterm>` (line-aligned); `cons`/`tuple`; `can_reserve(words)`
+  - `mark(roots, promoted) -> Result<()>`; `collect(&mut self, roots: &mut [Eterm], promoted: &mut [Eterm])
+    -> Result<ImmixStats>` — mark, classify, release, evacuate `Partial` blocks, pin `AllMarked`, finalize
+  - `impl EvacDest for ImmixSpace` — so the shared `copy.rs` forwarding protocol can evacuate *into* it
+- `pub struct ImmixStats` (`objects_evacuated`/`lines_evacuated`/`objects_pinned`/`lines_pinned`/
+  `blocks_reclaimed`/`words_reclaimed`/`words_pinned`) and `pub struct ImmixCounters`.
+
+### `immix_collector.rs` — `GenImmixCollector` (copying nursery + mark-region mature)
+- `pub struct GenImmixCollector` — pairs the copying young `HeapSpace` with an `ImmixSpace` mature.
+  - `with_config(&GcConfig) -> Result<GenImmixCollector>` (uses `cfg.policy()`; the `MatureKind` is
+    ignored — this type *is* the Immix collector); `from_policy(policy)`; `with_allocator(alloc, policy)`
+  - `policy() -> &HeapPolicy`; `young() -> &HeapSpace`; `young_mut() -> &mut HeapSpace`;
+    `mature() -> &ImmixSpace`; `stats() -> GcStats`; `last_immix_stats() -> Option<ImmixStats>`
+    (the most recent major's in-place reclaim accounting)
+  - `should_collect(need_words) -> bool`; `collect(&mut self, roots: &mut [Eterm]) -> Result<Collection>`
+    (reuses `Collection`/`CollectionKind`; no new variant) — plus `collect_minor`/`collect_major`
+    (`-> Result<GcStats>`) to force a specific collection (a too-large `collect_minor` reports the typed
+    heap exhaustion before copying anything)
+
+### `any_collector.rs` — the strategy-dispatching seam
+- `pub enum AnyCollector { Copying(Collector), Immix(GenImmixCollector) }`
+  - `from_config(&GcConfig) -> Result<AnyCollector>` (`MatureKind::Copying` → `Collector`, the default;
+    `MatureKind::Immix` → `GenImmixCollector`); `kind() -> MatureKind`; `policy()`; `young()`;
+    `young_mut() -> &mut HeapSpace`; `stats() -> GcStats`; `collect(&mut self, roots) -> Result<Collection>`
+  - thin forwarding only — lets a caller / test drive one corpus through either strategy.
 
 ### `policy.rs` — heap-size policy (the `erts_next_heap_size` analogue)
 - `pub struct HeapPolicy` — `min_heap_words`, `max_heap_words` (0 = unbounded), `fullsweep_after`
@@ -105,6 +145,50 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   escalates to a major, which allocates a fresh space sized from `size_after_fullsweep` *before*
   copying (the C's `heap_sizes`/`next_heap_size` estimate). A collection therefore never leaves the
   from-space half-forwarded.
+- **`GenImmixCollector` = the same copying nursery + a mark-region mature space; its major reclaims the
+  mature generation *first*.** Selected by `MatureKind::Immix` (`AnyCollector::from_config`). A **minor**
+  promotes the nursery's live terms into the `ImmixSpace` via the shared `copy.rs` forwarding protocol
+  over a private `PromoteDest` (`EvacDest` classifying against the nursery's `FromSet`, reserving from
+  `ImmixSpace::alloc_words`) — the barrier-free invariant holds because promotion only ever moves young
+  objects *into* mature. A **major** is the prescribed `ImmixSpace::collect`-then-promote order, made
+  sound for the young→mature edge (which the copying space also has, but which an in-place reclaim cannot
+  ignore): both collections first run a read-only `scan_young` that reports the promotion's exact **line**
+  count (`needed`) and every nursery reference word pointing into mature (`(slot, term)` pairs). The major
+  passes those terms as `promoted` roots to `ImmixSpace::collect` (so a mature object reachable only
+  through the live nursery survives), then rewrites each recorded nursery slot to the object's final
+  address (the aligned `promoted` entry `collect` updated), and only then promotes — by which point the
+  nursery's mature references are `Foreign` and final, so no stale pointer can be produced. If, after the
+  reclaim, `free_lines() < needed`, it returns `heap_exhausted` (no panic, no half-forwarded heap). Custom
+  `words_reclaimed = mature reclaim + nursery garbage`. Why reclaim-first rather than promote-first: it is
+  what lets a would-not-fit minor escalate to a major that *makes room*; promote-first would need the same
+  room the escalation is meant to create.
+- **`GenImmixCollector` ignores the `MatureKind` in `with_config`.** The type *is* the Immix-backed
+  collector, so `with_config` always builds one over `cfg.policy()`; `AnyCollector::from_config` is the
+  dispatcher that honours the configured strategy. `Collector` and every existing public signature are
+  unchanged — the new collectors are pure additions.
+- **`AnyCollector` only forwards.** The strategy-dispatch seam carries no collection logic, so neither
+  strategy depends on the other; a test drives one corpus through either behind `collect`/`young`/`stats`.
+### Measured (the GenImmix gate)
+`tests/immix_measure.rs` drives one long-lived workload (128 one-line long-lived tuples = 8 full Immix
+blocks; 24 transients promoted, 16 dropped / 8 kept; 300 nursery garbage tuples) through a forced
+fullsweep under both strategies and reports the crate's own counters (`cargo test -p beam_gc --test
+immix_measure -- --nocapture`):
+
+| metric | Copying (`Collector`) | Immix (`GenImmixCollector`) |
+|---|---|---|
+| objects copied / evacuated | 136 | 8 |
+| words copied / evacuated | 400 | 128 (8 lines) |
+| objects pinned (left in place) | — | 128 (384 words / 128 lines) |
+| blocks reclaimed | — | 1 |
+| mature words reclaimed | — | 256 (16 lines) |
+| resident mature footprint | 400 words | 2176 line-words |
+
+Both strategies find the same 136-object live mature set (`evacuated + pinned == copied`). The mark-region
+path **moves 8 objects / 128 words** where the copying path re-copies **136 objects / 400 words** — the
+pinning win is real on long-lived data, so the option clears its gate for that regime. Honest caveat:
+line-granular allocation costs internal fragmentation (400 live words occupy 2176 resident line-words
+here), so the measured win is **movement, not footprint** — exactly the trade-off Part II §D flags as
+needing per-workload measurement. The option therefore stays **OFF by default** (`MatureKind::Copying`).
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
@@ -130,10 +214,13 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   and land the scan on a raw descriptor word (`index` for `Local`, `uniq` bytes for `Imported`),
   following it as a bogus term reference and corrupting the heap. Every fun offset/width comes from
   `beam_term::fun`; `copy.rs` defines none of its own.
-- **Only `copy.rs` has a fun-layout dependency.** `space.rs`, `collector.rs`, `policy.rs`, `stats.rs` and
-  `error.rs` deal in space geometry, collection policy, statistics and error construction and never
-  inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc comment about
-  off-heap liveness. None carries a fun-layout assumption, so only `copy.rs` needed the fix.
+- **Object sizing/walking is shared, not duplicated.** `copy.rs` exposes the word-level evacuation
+  primitives (`pub(crate)` `EvacDest`, `forward_slot`, `move_size`, `scan_step`, `for_each_ref`, `Target`)
+  and both the copying `Copier` and the mark-region `immix/` mark/evacuation phases consume them, so the
+  fun-layout sizing rules live in one place. `space.rs`, `collector.rs`, `policy.rs`, `stats.rs`,
+  `config.rs` and `error.rs` deal in space geometry, collection policy, statistics and error construction
+  and never inspect a term's interior; `mso.rs` mentions "the magic reference of a fun" only in a doc
+  comment about off-heap liveness.
 - **`xptr_tag` is not needed.** The C ORs the literal bit back in only for literal-area copies
   (`copy.c:2109`); a GC collection copies only in-heap objects, so a copied pointer never carries the
   literal bit. Literal-tagged (and every other out-of-from-space) reference fails the `FromSet.contains`
@@ -170,11 +257,12 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   `BeamError::Alloc(AllocFailure::new(AllocKind::Heap, bytes))` (never panic, never a crate-local error
   enum, never `unwrap()` on runtime data). `beam_term::TermError` is reconciled to `BeamError` upstream,
   so `?` crosses the boundary.
-- **`unsafe` in production code is confined to `copy.rs`** (the word-level copier) and the two narrow
-  `NonNull`-deref / `Box::from_raw` blocks in `mso.rs`; every `unsafe fn` carries a `# Safety` section
-  and every `unsafe` block a preceding `// SAFETY:` rationale (`beam_common::safety`).
-  `unsafe_op_in_unsafe_fn` stays clean. `space.rs`, `policy.rs`, `stats.rs` and the `Collector` driving
-  logic are safe Rust (only their `#[cfg(test)]` sections call `unsafe alloc_words`).
+- **`unsafe` in production code is confined to the word-level code** — `copy.rs` (the Cheney copier) and
+  `immix/` (the mark-region space's line/mark/evacuation walks) — plus the two narrow `NonNull`-deref /
+  `Box::from_raw` blocks in `mso.rs`; every `unsafe fn` carries a `# Safety` section and every `unsafe`
+  block a preceding `// SAFETY:` rationale (`beam_common::safety`). `unsafe_op_in_unsafe_fn` stays clean.
+  `space.rs`, `policy.rs`, `stats.rs`, `config.rs` and the `Collector`/`GenImmixCollector`/`AnyCollector`
+  driving logic are safe Rust (only their `#[cfg(test)]` sections call `unsafe alloc_words`).
 - **Do NOT modify `beam_term` or `beam_alloc`** — build on their public APIs only. Do not touch
   `../../../erts/` (read-only ground truth) or `../../tools/`.
 - **Never break the frozen term layout or the barrier-free invariant** (a minor must not leave a
@@ -219,13 +307,40 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   proves the descriptor words are opaque**: it plants an `Imported` fun whose `uniq[0..8]` is a
   BOXED-tagged pointer into the from-space, so a scan that stepped `thing_arityval + 1` would follow that
   raw word and corrupt the term, while the correct `fun_env_offset_header` step leaves it verbatim.
+- **`immix/*` in-module tests + `tests/immix_{parity,partial_block,measure}.rs` + `tests/gen_immix_collector.rs`
+  — the integrated evidence.** The `immix/*` in-module tests cover block/line geometry, line-granular
+  allocation + hole reuse after a collection, mark/classify, `AllMarked` pinning, partial-block
+  evacuation, out-of-space-reference passthrough, and the accounting. The `immix_collector`/`any_collector`
+  in-module tests build a graph through `young_mut()`, drive minors and majors, and check the graph
+  survives (root relocation, structure, values) — including the hard major cases (fullsweep cadence, dead
+  mature objects reclaimed, a would-not-fit minor escalating to a major, a **young→mature reference
+  surviving a major's in-place evacuation**). `tests/gen_immix_collector.rs` and `tests/immix_parity.rs`
+  drive the SAME corpus through `AnyCollector::Copying` and `AnyCollector::Immix` behind the public API:
+  identical collection-kind sequences, an intact relocated live graph, and — in `immix_parity.rs` over the
+  full corpus (maps/funs/refc binaries) — one canonical structural walker that must agree for both.
+  `tests/immix_partial_block.rs` proves per-object reclamation and pinning (a `kept`-pinned object keeps
+  its address and a reference to it is left verbatim, not a spurious exhaustion). `tests/immix_measure.rs`
+  is the measured gate (table in Design Decisions §Measured). `from_config(&GcConfig::default())` must
+  select the Copying path.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_gc`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
-- **GenImmix / a mark-region mature generation** — measurement-gated per Part II §D; explicitly out of
-  scope. The `mature` generation is a plain copying space.
+- **GenImmix is integrated and measured, but stays off the default path.** Per Part II §D/§H it is
+  measurement-gated: the movement win above is real on long-lived data, but line-granular internal
+  fragmentation means it is not a blanket win, so `MatureKind::Copying` remains the default (today's
+  behaviour unchanged). The `Immix` mature generation is the mark-region space described above.
+- **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
+  every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
+  but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
+  rather than resizing the region (a `beam_rt`/policy decision, like the copying `Collector`'s fresh-space
+  sizing).
+- **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
+  `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
+  same after reclaiming. Line-granular allocation means an object needs a *contiguous* run of its lines,
+  so a pathologically fragmented mature space could still fail a per-object reservation mid-promotion —
+  the same fragmentation trade-off the space documents (`immix/mod.rs`, "line-granular allocation").
 - **The C `high_water` single-block layout, per-object tenuring (`GEN_GCS`/`MAX_GEN_GCS`) and the
   `F_NEED_FULLSWEEP` flag protocol** — replaced by the simpler two-space young/mature scheme above.
 - **Dirty-scheduler escape for long collections** (`ERTS_POTENTIALLY_LONG_GC_HSIZE`, `erl_gc.h:26`).
@@ -255,12 +370,21 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
 - `src/copy.rs` → the Cheney copy engine: `Copier`, `forward_roots`/`complete`, `move_size`/`move_*`, `collect`
 - `src/collector.rs` → two-generation `Collector`, `Collection`/`CollectionKind`, minor vs major driver
+- `src/config.rs` → GC-strategy seam: `GcConfig` + `MatureKind::{Copying,Immix}` (default `Copying`; `Immix` = the measurement-gated GenImmix option). `AnyCollector::from_config` is the dispatcher that honours it
+- `src/immix/mod.rs` → `ImmixSpace` geometry, block metadata, line-granular allocation, accounting views (`ImmixStats`/`ImmixCounters`)
+- `src/immix/collect.rs` → `ImmixSpace` mark/classify/evacuate/finalize phases + its `EvacDest` impl
+- `src/immix_collector.rs` → `GenImmixCollector` (copying nursery + mark-region mature), `PromoteDest`, `promote`, `scan_young`
+- `src/any_collector.rs` → `AnyCollector` strategy dispatch (`Copying`/`Immix`) over one API
 - `src/policy.rs` → `HeapPolicy`, the curated `heap_sizes` table, `next_heap_size`
 - `src/mso.rs` → re-exported `RefCount`, `Mso`, `MsoHandle`, `OffHeapEntry`, `OffHeap` (off-heap refcounted large objects **and** refc binaries)
 - `src/stats.rs` → `GcStats`
 - `src/error.rs` → `pub(crate)` GC allocation-failure constructors
 - `tests/copy_correctness.rs` → the copy-correctness evidence (structure preserved, roots updated, garbage dropped)
 - `tests/generations.rs` → `Collector` minor/major/tenure/escalation integration
+- `tests/gen_immix_collector.rs` → one corpus through `AnyCollector::Copying` and `AnyCollector::Immix` (parity of collection kinds, roots relocated, live graph intact); `from_config(default)` → Copying
+- `tests/immix_parity.rs` → the full corpus (nested tuples/lists/boxed leaves + garbage, flat & >32-key HAMT maps, local/external/imported funs, the refc-binary pair) through both strategies; one canonical structural walker must agree and every root must resolve in its own space
+- `tests/immix_partial_block.rs` → targeted per-object reclamation: interleaved live/dead objects; live survive + roots relocated; a `kept`-pinned object keeps its address and a reference to it is left verbatim (not a spurious exhaustion); freed lines reusable
+- `tests/immix_measure.rs` → the measured gate (copying copy cost vs Immix evacuated/pinned split), asserted + printed (table in Design Decisions §Measured)
 - `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
 - `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
 - `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)

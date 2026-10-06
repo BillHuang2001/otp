@@ -1,10 +1,11 @@
 //! The runtime seam: everything the engine needs from its host.
 //!
-//! [`ExecutionContext`] isolates BIF dispatch (`call_bif`) and heap management
-//! (`ensure_heap`) behind a trait, so the Stage-1 engine depends only on
-//! `beam_loader` and never on the Stage-5 runtime core (`../CONTEXT.md`, "The seam
-//! types"). `beam_rt` supplies the concrete implementation; [`MinimalContext`] is
-//! the test/embedding implementation (unbounded heap plus a pluggable BIF hook).
+//! [`ExecutionContext`] isolates BIF dispatch (`call_bif`), heap management
+//! (`ensure_heap`) and the **mailbox** (`send_message`/`receive_*`) behind a trait,
+//! so the Stage-1 engine depends only on `beam_loader` and never on the Stage-5
+//! runtime core (`../CONTEXT.md`, "The seam types"). `beam_rt` supplies the
+//! concrete implementation; [`MinimalContext`] is the test/embedding
+//! implementation (unbounded heap plus a pluggable BIF hook and mailbox).
 //!
 //! The same trait also exposes the hooks the term-building layer
 //! ([`crate::terms`]) and the call paths need: [`alloc_words`] hands out a stable
@@ -13,12 +14,79 @@
 //! `apply` path). All are added with default bodies, so an existing implementor
 //! keeps compiling unchanged.
 //!
+//! ## The mailbox / message-receive seam
+//!
+//! The `receive` opcode family ([`crate::families::receive`]) never looks at a
+//! message's *contents*: the compiled code's match tests decide whether the
+//! current candidate fits, and the family only ever **positions** the mailbox scan
+//! (`loop_rec`/`loop_rec_end`), **removes** the matched candidate
+//! (`remove_message`) or resets the position (`timeout`), plus the four
+//! `recv_marker_*` bookkeeping opcodes. That host interface is [`Mailbox`], and
+//! [`ExecutionContext`] carries one defaulted method per entry (each returning a
+//! typed [`crate::error::unsupported`] out of the box) so any implementor — the
+//! production `beam_rt` context, a test harness or [`MinimalContext`] — compiles
+//! unchanged and opts in only to what it can serve.
+//!
+//! A **receive marker** term is fully **opaque** to the engine: it is produced by
+//! [`receive_marker_reserve`](ExecutionContext::receive_marker_reserve), handed
+//! back verbatim by `recv_marker_bind`, and only a separate *reference* term is
+//! ever passed to `recv_marker_use`/`recv_marker_clear`. The engine stores such a
+//! marker in a register and never inspects, compares or hashes it.
+//!
+//! Installing a mailbox does **not** change the semantics of the non-blocking
+//! entries: they cannot suspend, so a `receive` that blocks still surfaces as the
+//! typed [`crate::error::blocked`] — the mailbox only decides *whether* the scan
+//! blocks, never what a blocking run reports.
+//!
 //! [`alloc_words`]: ExecutionContext::alloc_words
 //! [`apply`]: ExecutionContext::apply
 //! [`apply_fun`]: ExecutionContext::apply_fun
 
 use beam_common::Result;
 use beam_term::Eterm;
+
+/// The mailbox/message-receive seam: the receive opcode family's host interface.
+///
+/// One method per receive opcode group; `beam_engine` drives them at instruction
+/// boundaries and keeps no mailbox state of its own. The scan position is
+/// entirely the host's: the engine never learns *which* message is current, only
+/// the candidate [`receive_next`](Mailbox::receive_next) returns.
+///
+/// [`ExecutionContext`] exposes one defaulted method per entry below, so a host
+/// implements the mailbox either by overriding those methods directly or — like
+/// [`MinimalContext`] — by owning a `Box<dyn Mailbox>` and forwarding to it.
+pub trait Mailbox {
+    /// `send`: deliver `message` to the pid/port term `to`.
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()>;
+
+    /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)`
+    /// when the scan/mailbox is exhausted.
+    fn receive_next(&mut self) -> Result<Option<Eterm>>;
+
+    /// `loop_rec_end`: advance the scan position past the current candidate.
+    fn receive_skip(&mut self) -> Result<()>;
+
+    /// `remove_message`: unlink the currently-matched candidate and reposition the
+    /// scan at the first message.
+    fn receive_remove(&mut self) -> Result<()>;
+
+    /// `timeout`: reset the scan position to the first message.
+    fn receive_reset(&mut self) -> Result<()>;
+
+    /// `recv_marker_reserve`: an opaque marker term for the current scan position.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm>;
+
+    /// `recv_marker_bind`: bind the opaque `marker` to the (internal) reference
+    /// `reference`.
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()>;
+
+    /// `recv_marker_use`: set the scan position to the position `reference`'s
+    /// marker recorded.
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()>;
+
+    /// `recv_marker_clear`: release `reference`'s marker.
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()>;
+}
 
 /// Everything the engine needs from the runtime (BIF dispatch, heap/GC, limits).
 pub trait ExecutionContext {
@@ -105,6 +173,89 @@ pub trait ExecutionContext {
         let _ = (fun, args);
         Err(crate::error::unsupported("apply_fun"))
     }
+
+    /// `send`: deliver `message` to the pid/port term `to` (the `send` opcode).
+    ///
+    /// The default body is a typed [`crate::error::unsupported`] — a context with
+    /// no mailbox cannot send. On `Ok` the `send` opcode stores the **message
+    /// itself** in `x(0)` (C's `erl_send` returns the message, and
+    /// `Pid ! Msg` evaluates to `Msg`); on `Err` the `send` opcode has no fail
+    /// label, so the family raises it through the catch-aware path.
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        let _ = (to, message);
+        Err(crate::error::unsupported("send_message"))
+    }
+
+    /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)`
+    /// when the scan/mailbox is exhausted.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`]. The engine does
+    /// **not** match the candidate against the receive's patterns — the compiled
+    /// match tests that follow `loop_rec` do that; the family only moves the
+    /// candidate into the instruction's destination register.
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        Err(crate::error::unsupported("receive_next"))
+    }
+
+    /// `loop_rec_end`: advance the scan position past the current candidate.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_skip(&mut self) -> Result<()> {
+        Err(crate::error::unsupported("receive_skip"))
+    }
+
+    /// `remove_message`: unlink the currently-matched candidate and reposition the
+    /// scan at the first message.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_remove(&mut self) -> Result<()> {
+        Err(crate::error::unsupported("receive_remove"))
+    }
+
+    /// `timeout`: reset the scan position to the first message.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_reset(&mut self) -> Result<()> {
+        Err(crate::error::unsupported("receive_reset"))
+    }
+
+    /// `recv_marker_reserve`: an opaque marker term for the current scan position.
+    ///
+    /// The returned term is **opaque** to the engine (it is stored in a register
+    /// and only ever handed back through
+    /// [`receive_marker_bind`](ExecutionContext::receive_marker_bind)); the engine
+    /// never inspects, compares or hashes it. The default body is a typed
+    /// [`crate::error::unsupported`].
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        Err(crate::error::unsupported("receive_marker_reserve"))
+    }
+
+    /// `recv_marker_bind`: bind the opaque `marker` to the (internal) reference
+    /// `reference`.
+    ///
+    /// The engine passes both terms through verbatim and never inspects either.
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        let _ = (marker, reference);
+        Err(crate::error::unsupported("receive_marker_bind"))
+    }
+
+    /// `recv_marker_use`: set the scan position to the position `reference`'s
+    /// marker recorded.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        let _ = reference;
+        Err(crate::error::unsupported("receive_marker_use"))
+    }
+
+    /// `recv_marker_clear`: release `reference`'s marker.
+    ///
+    /// The default body is a typed [`crate::error::unsupported`].
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        let _ = reference;
+        Err(crate::error::unsupported("receive_marker_clear"))
+    }
 }
 
 /// A BIF hook: maps `(module, function, arity, args)` to a result.
@@ -131,10 +282,17 @@ pub type ApplyHook = Box<dyn FnMut(Eterm, &[Eterm]) -> Result<Eterm>>;
 /// [`set_apply_hook`](MinimalContext::set_apply_hook)) may additionally be installed
 /// to serve [`apply_fun`](ExecutionContext::apply_fun); without one it is a typed
 /// `unsupported`.
+///
+/// A **mailbox** ([`with_mailbox`](MinimalContext::with_mailbox) /
+/// [`set_mailbox`](MinimalContext::set_mailbox)) may be installed to serve the
+/// nine receive-seam methods; without one each stays the trait's typed
+/// `unsupported`.
 pub struct MinimalContext {
     hook: BifHook,
     /// An optional fun-application hook (the [`ExecutionContext::apply_fun`] body).
     apply_hook: Option<ApplyHook>,
+    /// An optional mailbox (the body of the nine receive-seam methods).
+    mailbox: Option<Box<dyn Mailbox>>,
     /// A pointer-stable arena backing [`ExecutionContext::alloc_words`].
     ///
     /// Each allocation is its own `Box<[Eterm]>`: growing the outer `Vec` moves
@@ -161,6 +319,7 @@ impl MinimalContext {
         MinimalContext {
             hook,
             apply_hook: None,
+            mailbox: None,
             arena: Vec::new(),
         }
     }
@@ -175,6 +334,15 @@ impl MinimalContext {
         ctx
     }
 
+    /// A context with the given mailbox and the default (rejecting) BIF hook.
+    ///
+    /// Combine with a BIF hook via [`set_bif_hook`](MinimalContext::set_bif_hook).
+    pub fn with_mailbox(mailbox: Box<dyn Mailbox>) -> MinimalContext {
+        let mut ctx = MinimalContext::new();
+        ctx.mailbox = Some(mailbox);
+        ctx
+    }
+
     /// Replace the BIF hook.
     pub fn set_bif_hook(&mut self, hook: BifHook) {
         self.hook = hook;
@@ -183,6 +351,27 @@ impl MinimalContext {
     /// Install (or replace) the fun-application hook.
     pub fn set_apply_hook(&mut self, hook: ApplyHook) {
         self.apply_hook = Some(hook);
+    }
+
+    /// Install (or replace) the mailbox.
+    pub fn set_mailbox(&mut self, mailbox: Box<dyn Mailbox>) {
+        self.mailbox = Some(mailbox);
+    }
+
+    /// Forward to the installed mailbox, or return the receive seam's typed
+    /// `unsupported` naming `method`.
+    ///
+    /// The single definition every receive-seam override below shares, so the
+    /// "no mailbox installed" contract stays byte-identical to the trait defaults.
+    fn mailbox_call<T>(
+        &mut self,
+        method: &str,
+        call: impl FnOnce(&mut dyn Mailbox) -> Result<T>,
+    ) -> Result<T> {
+        match self.mailbox.as_mut() {
+            Some(mailbox) => call(mailbox.as_mut()),
+            None => Err(crate::error::unsupported(method)),
+        }
     }
 }
 
@@ -246,6 +435,50 @@ impl ExecutionContext for MinimalContext {
                 Err(crate::error::unsupported("apply_fun"))
             }
         }
+    }
+
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        self.mailbox_call("send_message", |mailbox| mailbox.send_message(to, message))
+    }
+
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        self.mailbox_call("receive_next", |mailbox| mailbox.receive_next())
+    }
+
+    fn receive_skip(&mut self) -> Result<()> {
+        self.mailbox_call("receive_skip", |mailbox| mailbox.receive_skip())
+    }
+
+    fn receive_remove(&mut self) -> Result<()> {
+        self.mailbox_call("receive_remove", |mailbox| mailbox.receive_remove())
+    }
+
+    fn receive_reset(&mut self) -> Result<()> {
+        self.mailbox_call("receive_reset", |mailbox| mailbox.receive_reset())
+    }
+
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        self.mailbox_call("receive_marker_reserve", |mailbox| {
+            mailbox.receive_marker_reserve()
+        })
+    }
+
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        self.mailbox_call("receive_marker_bind", |mailbox| {
+            mailbox.receive_marker_bind(marker, reference)
+        })
+    }
+
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        self.mailbox_call("receive_marker_use", |mailbox| {
+            mailbox.receive_marker_use(reference)
+        })
+    }
+
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        self.mailbox_call("receive_marker_clear", |mailbox| {
+            mailbox.receive_marker_clear(reference)
+        })
     }
 }
 
@@ -358,5 +591,179 @@ mod tests {
             Ok(Eterm::nil())
         }));
         assert_eq!(ctx.apply("lists", "map", 2, &[]).unwrap(), Eterm::nil());
+    }
+
+    // ---- the mailbox / receive seam ---------------------------------------
+
+    /// The shared call log of a [`LoggingMailbox`].
+    type Log = std::rc::Rc<std::cell::RefCell<Vec<String>>>;
+
+    /// A mailbox that records every seam call as a string (so forwarding through
+    /// the context's boxed trait object is observable) and answers with fixed
+    /// results.
+    struct LoggingMailbox {
+        log: Log,
+        next: Option<Eterm>,
+    }
+
+    impl LoggingMailbox {
+        /// A mailbox logging to a fresh log, with no candidate available.
+        fn new() -> (Log, LoggingMailbox) {
+            let log: Log = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+            (std::rc::Rc::clone(&log), LoggingMailbox { log, next: None })
+        }
+
+        /// Record one call (`format!`ed, so argument passthrough is visible too).
+        fn record(&mut self, call: String) {
+            self.log.borrow_mut().push(call);
+        }
+    }
+
+    impl Mailbox for LoggingMailbox {
+        fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+            self.record(format!("send_message {to:?} {message:?}"));
+            Ok(())
+        }
+
+        fn receive_next(&mut self) -> Result<Option<Eterm>> {
+            self.record("receive_next".to_string());
+            Ok(self.next)
+        }
+
+        fn receive_skip(&mut self) -> Result<()> {
+            self.record("receive_skip".to_string());
+            Ok(())
+        }
+
+        fn receive_remove(&mut self) -> Result<()> {
+            self.record("receive_remove".to_string());
+            Ok(())
+        }
+
+        fn receive_reset(&mut self) -> Result<()> {
+            self.record("receive_reset".to_string());
+            Ok(())
+        }
+
+        fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+            self.record("receive_marker_reserve".to_string());
+            Ok(Eterm::from_raw(0xABCD))
+        }
+
+        fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+            self.record(format!("receive_marker_bind {marker:?} {reference:?}"));
+            Ok(())
+        }
+
+        fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+            self.record(format!("receive_marker_use {reference:?}"));
+            Ok(())
+        }
+
+        fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+            self.record(format!("receive_marker_clear {reference:?}"));
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn the_receive_seam_defaults_are_typed_unsupported_errors() {
+        // A context that overrides nothing (the `OnlyRequired` stub) gets all nine
+        // receive-seam methods as the trait's documented typed `unsupported`, so
+        // every existing implementor keeps compiling and behaves predictably.
+        let mut ctx = OnlyRequired;
+        let e = Eterm::from_raw(7);
+        assert!(matches!(
+            ctx.send_message(e, e).unwrap_err(),
+            beam_common::BeamError::Raise(_)
+        ));
+        assert!(ctx.receive_next().is_err());
+        assert!(ctx.receive_skip().is_err());
+        assert!(ctx.receive_remove().is_err());
+        assert!(ctx.receive_reset().is_err());
+        assert!(ctx.receive_marker_reserve().is_err());
+        assert!(ctx.receive_marker_bind(e, e).is_err());
+        assert!(ctx.receive_marker_use(e).is_err());
+        assert!(ctx.receive_marker_clear(e).is_err());
+    }
+
+    #[test]
+    fn minimal_context_without_a_mailbox_keeps_the_typed_unsupported_defaults() {
+        // The nine methods name themselves in the reason, exactly as the defaults do.
+        let mut ctx = MinimalContext::new();
+        let e = Eterm::from_raw(7);
+        for (reason, result) in [
+            ("send_message", ctx.send_message(e, e).err()),
+            ("receive_next", ctx.receive_next().err()),
+            ("receive_skip", ctx.receive_skip().err()),
+            ("receive_remove", ctx.receive_remove().err()),
+            ("receive_reset", ctx.receive_reset().err()),
+            ("receive_marker_reserve", ctx.receive_marker_reserve().err()),
+            ("receive_marker_bind", ctx.receive_marker_bind(e, e).err()),
+            ("receive_marker_use", ctx.receive_marker_use(e).err()),
+            ("receive_marker_clear", ctx.receive_marker_clear(e).err()),
+        ] {
+            match result.expect("no mailbox ⇒ typed error") {
+                beam_common::BeamError::Raise(raise) => assert_eq!(
+                    raise.reason.as_atom(),
+                    Some(format!("unsupported_opcode: {reason}").as_str()),
+                    "the error names the seam method"
+                ),
+                other => panic!("expected a typed raise for {reason}, got {other:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn minimal_context_forwards_every_receive_seam_call_to_the_installed_mailbox() {
+        let (log, mailbox) = LoggingMailbox::new();
+        let mut ctx = MinimalContext::with_mailbox(Box::new(mailbox));
+        let e = Eterm::from_raw(9);
+
+        ctx.send_message(e, e).unwrap();
+        assert_eq!(ctx.receive_next().unwrap(), None);
+        ctx.receive_skip().unwrap();
+        ctx.receive_remove().unwrap();
+        ctx.receive_reset().unwrap();
+        assert_eq!(
+            ctx.receive_marker_reserve().unwrap(),
+            Eterm::from_raw(0xABCD)
+        );
+        ctx.receive_marker_bind(Eterm::from_raw(1), Eterm::from_raw(2))
+            .unwrap();
+        ctx.receive_marker_use(Eterm::from_raw(3)).unwrap();
+        ctx.receive_marker_clear(Eterm::from_raw(4)).unwrap();
+
+        assert_eq!(
+            *log.borrow(),
+            vec![
+                format!("send_message {e:?} {e:?}"),
+                "receive_next".to_string(),
+                "receive_skip".to_string(),
+                "receive_remove".to_string(),
+                "receive_reset".to_string(),
+                "receive_marker_reserve".to_string(),
+                format!(
+                    "receive_marker_bind {:?} {:?}",
+                    Eterm::from_raw(1),
+                    Eterm::from_raw(2)
+                ),
+                format!("receive_marker_use {:?}", Eterm::from_raw(3)),
+                format!("receive_marker_clear {:?}", Eterm::from_raw(4)),
+            ]
+        );
+    }
+
+    #[test]
+    fn set_mailbox_replaces_the_previous_mailbox() {
+        // The first mailbox yields no candidate; after `set_mailbox` the second one
+        // yields a term — proof the replacement took effect.
+        let (_, first) = LoggingMailbox::new();
+        let (_, mut second) = LoggingMailbox::new();
+        second.next = Some(Eterm::from_raw(0x42));
+        let mut ctx = MinimalContext::with_mailbox(Box::new(first));
+        assert_eq!(ctx.receive_next().unwrap(), None);
+        ctx.set_mailbox(Box::new(second));
+        assert_eq!(ctx.receive_next().unwrap(), Some(Eterm::from_raw(0x42)));
     }
 }

@@ -57,10 +57,9 @@
 //!   exceeds an explicitly given field width rather than emit a mis-formatted line.
 //! * **Quoted atoms are not re-escaped** (a `'` inside a name is printed verbatim)
 //!   — such atoms are not produced by Milestone-1.
-//! * **Non-byte-aligned bitstrings are rejected** (`BeamError::BadArg`): the
-//!   oracle prints `<<X:L>>`, but `crate::bits::bytes` only reads a byte-aligned
-//!   binary and Milestone-1 has no bit-level reader. Every other term class is
-//!   rendered.
+//! * **Non-byte-aligned bitstrings** render as the oracle's `<<X:L>>` (whole leading
+//!   bytes, then the trailing `L` bits as `Value:L`), e.g. `<<1:1>>`, `<<23:5>>`,
+//!   `<<0,1:1>>`. The `~p` printable-string rule never applies to them.
 //! * **Internal refs** render as `#Ref<Channel.Node.Serial.Id>` with
 //!   `Channel`/`Node`/`Serial` always `0` in Milestone-1 (the frozen
 //!   `[header, node, serial, id]` thing of [`crate::access::make_ref_thing`]), so
@@ -74,9 +73,9 @@ use beam_common::Result;
 use beam_term::{atom_val, compare, pid_number, pid_serial, signed_value, AtomTable, Eterm};
 
 use crate::access::{
-    car, cdr, flatmap_pairs, float_value, is_atom, is_big, is_float, is_internal_pid,
-    is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple, ref_thing_id, tuple_element,
-    tuple_size,
+    bitstring_bit_size, bitstring_bits, car, cdr, flatmap_pairs, float_value, is_atom, is_big,
+    is_float, is_internal_pid, is_internal_ref, is_list, is_map, is_nil, is_small, is_tuple,
+    ref_thing_id, tuple_element, tuple_size,
 };
 use crate::bits;
 use crate::context::BifContext;
@@ -279,9 +278,7 @@ fn render_chunk(atoms: &AtomTable, term: Eterm, printable: bool, depth: i64) -> 
         return render_binary_chunk(term, printable, depth);
     }
     if bits::is_bitstring(term) {
-        // A non-byte-aligned bitstring: `crate::bits::bytes` cannot read it (see
-        // the module docs) — reject rather than guess.
-        return Err(badarg());
+        return render_bitstring_chunk(term, printable, depth);
     }
     if is_map(term) {
         return render_map_chunk(atoms, term, printable, depth);
@@ -621,6 +618,65 @@ fn render_binary_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk
         Chunk::Char('>'),
     ]))
 }
+
+/// Renders a **non-byte-aligned** bitstring (`io_lib:write_binary/2` /
+/// `io_lib_pretty:write/1`).
+///
+/// The oracle prints `<<` + the whole leading bytes as comma-separated decimals +
+/// (when bits remain) a comma and the trailing bit field `Value:BitCount` + `>>`;
+/// erts-17.1 renders e.g. `<<1:1>>` ⇒ `<<1:1>>`, `<<5:3,3:2>>` ⇒ `<<23:5>>`,
+/// `<<1:9>>` ⇒ `<<0,1:1>>`, `<<255:12>>` ⇒ `<<15,15:4>>`. The nested-list
+/// structure matches [`render_binary_chunk`]: the container is
+/// `[<, <, body, >, >]`, each rendered number its own sub-list and every `,`/`:`
+/// an individual integer.
+///
+/// A byte-aligned bitstring is never routed here (the binary branch of
+/// [`render_chunk`] handles it), but the delegation keeps the helper total. The
+/// `~p` printable-string rule does **not** apply — a non-byte-aligned bitstring is
+/// never a string — yet `~p`/`~P` still collapse a depth-1 (`<<...>>`) render
+/// exactly like a printable binary (the printable branch of
+/// [`render_binary_chunk`]).
+fn render_bitstring_chunk(term: Eterm, printable: bool, depth: i64) -> Result<Chunk> {
+    let bit_len = bitstring_bit_size(term)?;
+    if bit_len % 8 == 0 {
+        return render_binary_chunk(term, printable, depth);
+    }
+    if printable && depth == 1 {
+        // `io_lib_pretty` truncates a printable-bitstring render to the flat
+        // `<<...>>` (mirrors the depth-1 case of `render_binary_chunk`).
+        return Ok(Chunk::text("<<...>>"));
+    }
+    let data = bitstring_bits(term)?;
+    let full_bytes = bit_len / 8;
+    let trailing_bits = bit_len % 8;
+    let mut body: Vec<Chunk> = Vec::new();
+    if depth == 1 {
+        body.push(Chunk::text("..."));
+    } else {
+        for (i, byte) in data[..full_bytes].iter().enumerate() {
+            if i != 0 {
+                body.push(Chunk::Char(','));
+            }
+            body.push(Chunk::text(&byte.to_string()));
+        }
+        if full_bytes != 0 {
+            body.push(Chunk::Char(','));
+        }
+        // `data[full_bytes]` holds the trailing `trailing_bits` bits in its most
+        // significant positions (the packing is MSB-first), so shift them down.
+        let trailing_value = data[full_bytes] >> (8 - trailing_bits);
+        body.push(Chunk::text(&trailing_value.to_string()));
+        body.push(Chunk::Char(':'));
+        body.push(Chunk::text(&trailing_bits.to_string()));
+    }
+    Ok(Chunk::List(vec![
+        Chunk::Char('<'),
+        Chunk::Char('<'),
+        Chunk::List(body),
+        Chunk::Char('>'),
+        Chunk::Char('>'),
+    ]))
+}
 /// The byte values of `term` iff it is a non-empty proper list of small integers
 /// in `32..=126` (the `~p` printable-string rule).
 fn printable_string(term: Eterm) -> Option<Vec<u8>> {
@@ -911,6 +967,44 @@ mod tests {
             // `"`/`\` escape inside the `~p` string form.
             let esc = bits::make_binary(ctx.heap(), b"\"\\").expect("fits");
             assert_eq!(show(ctx, esc, true), "<<\"\\\"\\\\\">>");
+        });
+    }
+
+    #[test]
+    fn non_byte_aligned_bitstrings_render_in_the_oracle_form() {
+        with_ctx(|ctx| {
+            // All pinned to erts-17.1, e.g.
+            // `erl -noshell -eval 'io:format("~w~n",[<<1:1>>]).'`.
+            // `<<1:1>>` — one bit, no whole leading byte.
+            let one = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).expect("fits");
+            assert_eq!(show(ctx, one, false), "<<1:1>>");
+            assert_eq!(show(ctx, one, true), "<<1:1>>");
+            // `<<5:3,3:2>>` = `10111` ⇒ `<<23:5>>`.
+            let five = bits::make_bitstring(ctx.heap(), &[0b1011_1000], 5).expect("fits");
+            assert_eq!(show(ctx, five, false), "<<23:5>>");
+            // `<<1:9>>` — one whole leading byte then one trailing bit.
+            let nine = bits::make_bitstring(ctx.heap(), &[0x00, 0b1000_0000], 9).expect("fits");
+            assert_eq!(show(ctx, nine, false), "<<0,1:1>>");
+            // `<<255:12>>` = `00001111 1111` ⇒ `<<15,15:4>>`.
+            let twelve = bits::make_bitstring(ctx.heap(), &[0x0F, 0b1111_0000], 12).expect("fits");
+            assert_eq!(show(ctx, twelve, false), "<<15,15:4>>");
+            // `<<0:3>>` — every bit zero.
+            let zero = bits::make_bitstring(ctx.heap(), &[0], 3).expect("fits");
+            assert_eq!(show(ctx, zero, false), "<<0:3>>");
+
+            // Nested in a tuple and a list (oracle).
+            let a = ctx.atom("a").expect("seeded");
+            let tuple = ctx.tuple(&[one, a]).expect("fits");
+            assert_eq!(show(ctx, tuple, false), "{<<1:1>>,a}");
+            let two = ctx.int(2).expect("fits");
+            let list = ctx.list(&[one, two]).expect("fits");
+            assert_eq!(show(ctx, list, false), "[<<1:1>>,2]");
+
+            // Depth: `~W`/`~P` elide a bitstring's contents at depth 1.
+            assert_eq!(show_at(ctx, one, false, 1), "<<...>>");
+            assert_eq!(show_at(ctx, one, true, 1), "<<...>>");
+            assert_eq!(show_at(ctx, one, false, 0), "...");
+            assert_eq!(show_at(ctx, one, false, 2), "<<1:1>>");
         });
     }
 

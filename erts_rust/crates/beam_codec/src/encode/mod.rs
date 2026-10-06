@@ -14,12 +14,13 @@ use beam_common::Result;
 use beam_term::prelude::{atom_val, is_atom, is_list, is_nil, is_small, signed_value};
 use beam_term::{AtomTable, Eterm};
 
+use crate::atom_cache::AtomCacheWriter;
 use crate::error;
 use crate::tag::{
-    ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT, INTEGER_EXT,
-    LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, MAP_EXT, NEWER_REFERENCE_EXT, NEW_FLOAT_EXT,
-    NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT,
-    SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
+    ATOM_CACHE_REF_EXT, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT,
+    INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT,
+    NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT, SMALL_ATOM_UTF8_EXT,
+    SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT, Tag,
 };
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
@@ -64,6 +65,9 @@ pub struct Encoder<'a> {
     buf: Writer,
     /// The selected atom tag family.
     atom_encoding: AtomEncoding,
+    /// The outbound atom cache, when the caller installed one via
+    /// [`Encoder::with_atom_cache`]. `None` writes every atom inline.
+    atom_cache: Option<&'a mut dyn AtomCacheWriter>,
 }
 
 impl<'a> Encoder<'a> {
@@ -83,12 +87,30 @@ impl<'a> Encoder<'a> {
             atoms,
             buf: Writer::new(),
             atom_encoding: AtomEncoding::Utf8,
+            atom_cache: None,
         }
     }
 
     /// Selects the atom tag family; defaults to [`AtomEncoding::Utf8`].
     pub fn set_atom_encoding(&mut self, encoding: AtomEncoding) {
         self.atom_encoding = encoding;
+    }
+
+    /// Installs an outbound atom cache ([`AtomCacheWriter`]).
+    ///
+    /// From here on [`Encoder::encode`] consults the cache for **every** atom and,
+    /// when [`AtomCacheWriter::intern`] returns an index, writes
+    /// `[ATOM_CACHE_REF_EXT (82), index]` instead of the inline
+    /// `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT` form (the selected [`AtomEncoding`] is
+    /// likewise bypassed on the cached path). A [`None`] return falls through to the
+    /// existing inline encoding unchanged, so an atom the cache does not take is
+    /// byte-identical to an encoder without a cache.
+    ///
+    /// This is the send-side seam `beam_dist` drives (see [`AtomCacheWriter`] and
+    /// [`crate::atom_cache`]); the legacy `NEW_CACHE` (`78`) tag is never emitted.
+    pub fn with_atom_cache(mut self, cache: &'a mut dyn AtomCacheWriter) -> Encoder<'a> {
+        self.atom_cache = Some(cache);
+        self
     }
 
     /// Encodes `term`, appending it to the output.
@@ -206,8 +228,25 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes an atom in the selected [`AtomEncoding`].
+    /// Encodes an atom in the selected [`AtomEncoding`], or as `ATOM_CACHE_REF`
+    /// (`82`) when an outbound atom cache ([`Encoder::with_atom_cache`]) knows it.
     fn encode_atom(&mut self, term: Eterm) -> Result<()> {
+        // The cached path comes first (C `enc_atom`, `external.c:2877`): an atom the
+        // outbound cache knows is written as `[82, index]` and needs no name at all —
+        // the name travels in the distribution header. The `atoms` copy is taken
+        // before borrowing `self.atom_cache` so the two disjoint fields do not
+        // conflict.
+        let atoms = self.atoms;
+        let cached = match self.atom_cache.as_mut() {
+            Some(cache) => cache.intern(atom_val(term), atoms),
+            None => None,
+        };
+        if let Some(index) = cached {
+            self.buf.u8(ATOM_CACHE_REF_EXT);
+            self.buf.u8(index);
+            return Ok(());
+        }
+
         let name = self.atoms.name(atom_val(term)).ok_or_else(error::bad_arg)?;
         // OTP caps atom names at 255 *characters*, independent of the encoding.
         if name.chars().count() > ATOM_CHAR_MAX {
@@ -468,6 +507,40 @@ impl<'a> Encoder<'a> {
         out.bytes(&crate::compress::compress(body, level)?);
         Ok(out.into_vec())
     }
+
+    /// Consumes the encoder, wrapping the written term in a `LOCAL_EXT` (`121`)
+    /// `term_to_binary` image at `hash`.
+    ///
+    /// The result is `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]`, where `body` is
+    /// the bytes the encoder produced minus a leading
+    /// [`VERSION_MAGIC`](crate::VERSION_MAGIC) if [`Encoder::new`] wrote one (a term
+    /// body never starts with `131`, which is not a tag, so stripping it when present
+    /// is unambiguous — the same normalization [`Encoder::finish_compressed`]
+    /// performs). This is the wire layout `erlang:term_to_binary(Term, [local])`
+    /// produces: the C writes the tag plus four reserved bytes up front
+    /// (`external.c:3305-3315`) and patches the 4-byte hash at the end
+    /// (`external.c:4046-4105`).
+    ///
+    /// **The 4-byte `hash` is supplied by the caller.** The C derives it as the
+    /// Bob-Jenkins block hash of the term-body bytes seeded with the node's
+    /// `local_node_hash`; that node identity (hostname / pid / creation) is owned by
+    /// `beam_rt`/`beam_dist`, not by this codec, so the codec neither computes nor
+    /// verifies the hash — it writes the caller's value verbatim. A `LOCAL_EXT` term
+    /// is therefore only meaningful to a `binary_to_term` on the same node.
+    ///
+    /// This is **not** the local-fun path: a local (`make_fun3`) fun has no wire form
+    /// at all and still yields [`crate::error::unsupported_local_fun`].
+    pub fn finish_local(self, hash: u32) -> Vec<u8> {
+        let buf = self.buf.into_vec();
+        let body: &[u8] = buf.strip_prefix(&[crate::VERSION_MAGIC]).unwrap_or(&buf);
+
+        let mut out = Writer::with_capacity(body.len() + 6);
+        out.u8(crate::VERSION_MAGIC);
+        out.u8(LOCAL_EXT);
+        out.u32be(hash);
+        out.bytes(body);
+        out.into_vec()
+    }
 }
 
 /// Renders `ErtsDigit`s as base-256 magnitude bytes, least significant first —
@@ -602,6 +675,20 @@ pub fn encode_term_body_compressed(term: Eterm, atoms: &AtomTable, level: u8) ->
     // Drop the leading `VERSION_MAGIC`; everything else (tag, size, zlib stream) is
     // already the body form. `encode_term_compressed` guarantees the version byte.
     Ok(image[1..].to_vec())
+}
+
+/// Encodes `term` as a `LOCAL_EXT` (`121`) `term_to_binary` image:
+/// `[VERSION_MAGIC][LOCAL_EXT][hash:4 BE][body]`.
+///
+/// The body is [`encode_term_body`]'s bytes; the wrapper only prepends the version
+/// byte, the `LOCAL_EXT` tag and the caller-supplied `hash` (see
+/// [`Encoder::finish_local`] — node identity, hence the hash, is owned by the
+/// caller). Convenience over [`Encoder::new_body`] + [`Encoder::encode`] +
+/// [`Encoder::finish_local`], mirroring [`encode_term_compressed`].
+pub fn encode_term_local(term: Eterm, atoms: &AtomTable, hash: u32) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::new_body(atoms);
+    encoder.encode(term)?;
+    Ok(encoder.finish_local(hash))
 }
 
 #[cfg(test)]
@@ -1065,4 +1152,190 @@ mod tests {
         assert_eq!(encode_term_body(tuple, &atoms).unwrap(), expected);
     }
 
+    /// A test [`AtomCacheWriter`] that caches exactly the atoms in `cached` (in
+    /// order, starting at index `start`) and declines every other atom.
+    struct TestCache {
+        /// The atoms the cache accepts, in index order.
+        cached: Vec<Atom>,
+        /// The payload index assigned to `cached[0]`.
+        start: u8,
+        /// Every atom the encoder consulted, in order.
+        seen: Vec<Atom>,
+    }
+
+    impl TestCache {
+        fn new(cached: Vec<Atom>, start: u8) -> TestCache {
+            TestCache {
+                cached,
+                start,
+                seen: Vec::new(),
+            }
+        }
+    }
+
+    impl AtomCacheWriter for TestCache {
+        fn intern(&mut self, atom: Atom, _atoms: &AtomTable) -> Option<u8> {
+            self.seen.push(atom);
+            self.cached
+                .iter()
+                .position(|&cached| cached == atom)
+                .map(|slot| self.start + slot as u8)
+        }
+    }
+
+    #[test]
+    fn an_uncached_encoder_is_byte_identical_with_a_declining_cache() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let term = make_atom(ok);
+
+        let plain = encode_term_body(term, &atoms).unwrap();
+        assert_eq!(plain, vec![119, 2, 111, 107]);
+
+        // A cache that declines every atom must not move a single byte.
+        let mut cache = TestCache::new(Vec::new(), 0);
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(term).unwrap();
+        assert_eq!(encoder.finish(), plain);
+        // The cache *was* consulted (and recorded the atom) even though it declined.
+        assert_eq!(cache.seen, vec![ok]);
+    }
+
+    #[test]
+    fn a_cached_atom_writes_atom_cache_ref() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let mut cache = TestCache::new(vec![ok], 3);
+
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(make_atom(ok)).unwrap();
+        assert_eq!(encoder.finish(), vec![82, 3]);
+    }
+
+    #[test]
+    fn a_cache_miss_falls_through_to_the_inline_atom() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let other = atoms.intern("other");
+        // The cache only takes `other`, so `ok` is written inline.
+        let mut cache = TestCache::new(vec![other], 0);
+
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(make_atom(ok)).unwrap();
+        assert_eq!(encoder.finish(), vec![119, 2, 111, 107]);
+    }
+
+    #[test]
+    fn cache_indices_may_differ_per_atom() {
+        let mut atoms = AtomTable::new();
+        let a = atoms.intern("a");
+        let b = atoms.intern("b");
+        let mut cache = TestCache::new(vec![a, b], 10);
+
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(make_atom(a)).unwrap();
+        encoder.encode(make_atom(b)).unwrap();
+        assert_eq!(encoder.finish(), vec![82, 10, 82, 11]);
+    }
+
+    #[test]
+    fn nested_terms_cache_only_the_atoms_the_cache_takes() {
+        let mut atoms = AtomTable::new();
+        let cached = atoms.intern("cache_me");
+        let inline = atoms.intern("inline_me");
+        let mut heap = new_heap(64);
+        let tuple = heap
+            .tuple(&[make_atom(cached), make_small(1), make_atom(inline)])
+            .unwrap();
+        let mut cache = TestCache::new(vec![cached], 7);
+
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(tuple).unwrap();
+
+        let mut expected = vec![104u8, 3, 82, 7, 97, 1];
+        expected.extend_from_slice(&[119, 9]);
+        expected.extend_from_slice(b"inline_me");
+        assert_eq!(encoder.finish(), expected);
+        // The cache saw the inline atom too (it was consulted, it just declined).
+        assert_eq!(cache.seen, vec![cached, inline]);
+    }
+
+    #[test]
+    fn with_atom_cache_composes_with_the_version_byte_and_atom_encoding() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let term = make_atom(ok);
+
+        // Declining cache + Latin-1: identical to an encoder with neither.
+        let mut miss = TestCache::new(Vec::new(), 0);
+        let mut encoder = Encoder::new(&atoms).with_atom_cache(&mut miss);
+        encoder.set_atom_encoding(AtomEncoding::Latin1);
+        encoder.encode(term).unwrap();
+        assert_eq!(encoder.finish(), vec![131, 115, 2, 111, 107]);
+
+        // A hit replaces the atom with `[82, index]` (the version byte is untouched
+        // and the atom encoding is irrelevant on the cached path).
+        let mut hit = TestCache::new(vec![ok], 4);
+        let mut encoder = Encoder::new(&atoms).with_atom_cache(&mut hit);
+        encoder.set_atom_encoding(AtomEncoding::Latin1);
+        encoder.encode(term).unwrap();
+        assert_eq!(encoder.finish(), vec![131, 82, 4]);
+    }
+
+    #[test]
+    fn local_encoding_wraps_the_body_with_the_tag_and_hash() {
+        let atoms = AtomTable::new();
+        assert_eq!(
+            encode_term_local(make_small(17), &atoms, 0xAABB_CCDD).unwrap(),
+            vec![131, 121, 0xAA, 0xBB, 0xCC, 0xDD, 97, 17]
+        );
+    }
+
+    #[test]
+    fn local_encoding_only_prepends_the_wrapper() {
+        let mut atoms = AtomTable::new();
+        let a = atoms.intern("a");
+        let mut heap = new_heap(256);
+        let term = heap.tuple(&[make_atom(a), make_small(1)]).unwrap();
+
+        let body = encode_term_body(term, &atoms).unwrap();
+        let mut expected = vec![131u8, 121, 0x01, 0x02, 0x03, 0x04];
+        expected.extend_from_slice(&body);
+        assert_eq!(
+            encode_term_local(term, &atoms, 0x0102_0304).unwrap(),
+            expected
+        );
+    }
+
+    #[test]
+    fn encoder_new_and_new_body_produce_the_same_local_wrapper() {
+        let mut atoms = AtomTable::new();
+        let a = atoms.intern("a");
+        let mut heap = new_heap(64);
+        let list = heap.cons(make_atom(a), NIL).unwrap();
+
+        let body = encode_term_body(list, &atoms).unwrap();
+        let mut with_version = Encoder::new(&atoms);
+        with_version.encode(list).unwrap();
+        let mut without_version = Encoder::new_body(&atoms);
+        without_version.encode(list).unwrap();
+
+        // `Encoder::new`'s extra version byte is stripped, so both agree...
+        assert_eq!(with_version.finish_local(9), without_version.finish_local(9));
+        // ... and both are `[131, 121, hash] ++ body`.
+        let mut expected = vec![131u8, 121, 0, 0, 0, 9];
+        expected.extend_from_slice(&body);
+        assert_eq!(encode_term_local(list, &atoms, 9).unwrap(), expected);
+    }
+
+    #[test]
+    fn local_encoding_composes_with_the_atom_cache() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let mut cache = TestCache::new(vec![ok], 2);
+
+        let mut encoder = Encoder::new_body(&atoms).with_atom_cache(&mut cache);
+        encoder.encode(make_atom(ok)).unwrap();
+        assert_eq!(encoder.finish_local(1), vec![131, 121, 0, 0, 0, 1, 82, 2]);
+    }
 }

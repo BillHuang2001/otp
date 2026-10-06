@@ -90,7 +90,7 @@ use beam_term::{signed_value, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::access;
 use crate::context::BifContext;
-use crate::error::{badarith, system_limit};
+use crate::error::{badarg, badarith, system_limit};
 use crate::registry::BifRegistry;
 
 /// `BIG_ARITY_MAX` (`erl_term.h:465-469`, 64-bit `ARCH_64`): the largest bignum
@@ -165,6 +165,128 @@ fn int_term(ctx: &mut BifContext<'_>, value: &Big) -> Result<Eterm> {
         Some(small) => ctx.int(small),
         None => beam_codec::term::make_big(ctx.heap(), value.negative, &value.mag),
     }
+}
+
+// ---------------------------------------------------------------------------
+// The integer-promotion seam used by the non-arithmetic BIFs
+// ---------------------------------------------------------------------------
+//
+// Every integer-producing BIF outside this module routes its value through one of
+// the three helpers below instead of `BifContext::int` (which is `try_make_small`
+// and reports `system_limit` past the 60-bit range). That way a value the oracle
+// promotes — a nanosecond timestamp, a 9-byte `decode_unsigned`, a long decimal
+// string — becomes the same bignum here.
+
+/// Materializes an exact integer from a sign and a little-endian `u64` magnitude
+/// (`ErtsDigit`s, least significant first — the order
+/// [`beam_codec::term::make_big`] expects).
+///
+/// A value that fits the 60-bit range becomes a small integer and an all-zero
+/// magnitude is the small integer `0`; anything larger becomes the bignum the
+/// oracle would build (`big_norm`). Leading zero limbs are dropped.
+pub(crate) fn int_from_mag(ctx: &mut BifContext<'_>, negative: bool, mag: &[u64]) -> Result<Eterm> {
+    int_term(ctx, &Big::from_parts(negative, mag))
+}
+
+/// Materializes the exact integer term for `value` — [`int_from_mag`] for an
+/// `i64` (`system_time/0,1`, `time_offset/0,1` and the rounded float results).
+pub(crate) fn int_from_i64(ctx: &mut BifContext<'_>, value: i64) -> Result<Eterm> {
+    int_term(ctx, &Big::from_i64(value))
+}
+
+/// The exact integer term for a finitely-valued `f64` (the `round`/`trunc`/
+/// `ceil`/`floor` promotion).
+///
+/// The value is decomposed into its 53-bit mantissa and binary exponent, so a
+/// magnitude far beyond `i64` becomes the *exact* bignum the oracle returns
+/// (`round(1.0e300)`) rather than a saturated or truncated one. A fractional
+/// value is truncated toward zero (the caller has already applied its rounding
+/// operation, so the value is integral).
+pub(crate) fn int_from_f64(ctx: &mut BifContext<'_>, value: f64) -> Result<Eterm> {
+    let (negative, mag) = f64_int_parts(value);
+    int_term(ctx, &Big::from_parts(negative, &mag))
+}
+
+/// The `f64` nearest to an **integer** term, ties to even — the C `big_to_double`
+/// behind the oracle's `float/1`.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-integer *and*
+/// for a magnitude the oracle refuses too (`float(1 bsl 2000)` ⇒ `badarg`).
+pub(crate) fn integer_to_f64(term: Eterm) -> Result<f64> {
+    if access::is_small(term) {
+        return Ok(signed_value(term) as f64);
+    }
+    if access::is_big(term) {
+        let (negative, digits) = beam_codec::term::big_parts(term)?;
+        return Big::from_parts(negative, digits).to_f64().map_err(|_| badarg());
+    }
+    Err(badarg())
+}
+
+/// The sign and little-endian magnitude of `value`'s exact mathematical value
+/// (`±0.0` ⇒ a zero magnitude, hence the `false` sign).
+fn f64_int_parts(value: f64) -> (bool, Vec<u64>) {
+    let bits = value.to_bits();
+    let negative = (bits >> 63) != 0;
+    let raw_exponent = ((bits >> 52) & 0x7ff) as i32;
+    let fraction = bits & ((1u64 << 52) - 1);
+    // A subnormal (or zero) exponent field has no implicit leading bit; its value
+    // is `fraction * 2^-1074`. A normal number is `(2^52 + fraction) * 2^(e-1075)`.
+    let (mantissa, exponent) = if raw_exponent == 0 {
+        (fraction, -1074)
+    } else {
+        (fraction | (1u64 << 52), raw_exponent - 1075)
+    };
+    let mut mag = vec![mantissa];
+    if exponent >= 0 {
+        shift_mag_left(&mut mag, exponent as usize);
+    } else {
+        shift_mag_right(&mut mag, (-exponent) as usize);
+    }
+    trim(&mut mag);
+    (negative && !mag.is_empty(), mag)
+}
+
+/// `mag *= 2^bits`.
+fn shift_mag_left(mag: &mut Vec<u64>, bits: usize) {
+    if bits == 0 {
+        return;
+    }
+    let limb_shift = bits / 64;
+    let bit_shift = bits % 64;
+    let mut out = vec![0u64; mag.len() + limb_shift + 1];
+    for (i, &limb) in mag.iter().enumerate() {
+        let shifted = u128::from(limb) << bit_shift;
+        out[i + limb_shift] |= shifted as u64;
+        out[i + limb_shift + 1] |= (shifted >> 64) as u64;
+    }
+    *mag = out;
+}
+
+/// `mag >>= bits`, dropping every bit below the new least-significant position.
+fn shift_mag_right(mag: &mut Vec<u64>, bits: usize) {
+    if bits == 0 {
+        return;
+    }
+    let limb_shift = bits / 64;
+    if limb_shift >= mag.len() {
+        mag.clear();
+        return;
+    }
+    let bit_shift = bits % 64;
+    let mut out = Vec::with_capacity(mag.len() - limb_shift);
+    for i in limb_shift..mag.len() {
+        let mut limb = mag[i] >> bit_shift;
+        if bit_shift != 0 {
+            if let Some(&above) = mag.get(i + 1) {
+                limb |= above << (64 - bit_shift);
+            }
+        }
+        out.push(limb);
+    }
+    *mag = out;
 }
 
 /// `A + B`.

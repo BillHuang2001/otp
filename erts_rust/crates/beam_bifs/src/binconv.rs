@@ -82,10 +82,10 @@
 //!   `NEW_PID_EXT`. A decoded `NEW_PID_EXT` stays an external id, so
 //!   `binary_to_term` ∘ `term_to_binary` round-trips the wire term, not an
 //!   internal pid.
-//! * **No bignums.** `integer_to_binary/1,2` and `binary_to_integer/1,2` cover the
-//!   60-bit small range; an out-of-range value reports
-//!   [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) where the
-//!   oracle promotes to a bignum (the same documented gap as
+//! * **`integer_to_binary/1,2` and `binary_to_integer/1,2` promote to bignums.**
+//!   A value outside the 60-bit small range becomes an arbitrary-precision bignum
+//!   exactly as the oracle's does; only a magnitude past the bignum limb bound is
+//!   `system_limit` (the same documented gap as
 //!   [`crate::convert`]'s `integer_to_list`/`list_to_integer`).
 //! * **`float_to_binary/2` option `short` is unsupported** (`badarg`), exactly as
 //!   in [`crate::convert`]'s `float_to_list/2`: it selects Ryu's shortest
@@ -121,11 +121,12 @@ use beam_common::Result;
 use beam_term::{atom_val, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access;
+use crate::arith;
 use crate::bits;
 use crate::context::BifContext;
 use crate::error::{badarg, system_limit, unsupported_bif};
 use crate::numeric::{
-    base_arg, format_scientific, int_to_digits, parse_float, parse_float_options, parse_integer,
+    base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
 };
 use crate::print::proper_list;
@@ -347,16 +348,14 @@ fn binary_part_range(
 
 /// `integer_to_binary(Integer)` — base 10.
 fn integer_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = small_arg(args[0])?;
-    let rendered = int_to_digits(value, 10);
+    let rendered = integer_digits(args[0], 10)?;
     make_bin(ctx, rendered.as_bytes())
 }
 
 /// `integer_to_binary(Integer, Base)`.
 fn integer_to_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = small_arg(args[0])?;
     let base = base_arg(args[1])?;
-    let rendered = int_to_digits(value, base);
+    let rendered = integer_digits(args[0], base)?;
     make_bin(ctx, rendered.as_bytes())
 }
 
@@ -376,13 +375,13 @@ fn binary_to_integer_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm
 /// # Errors
 ///
 /// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-binary or a
-/// string that is not a base-`base` integer; [`BeamError::SystemLimit`] for a
-/// value outside the Milestone-1 small range.
+/// string that is not a base-`base` integer; `system_limit` only for a magnitude
+/// past the bignum limb bound (the oracle's own limit).
 fn integer_from_binary(ctx: &mut BifContext<'_>, input: Eterm, base: u32) -> Result<Eterm> {
     let data = bytes_arg(input)?;
     let text = core::str::from_utf8(&data).map_err(|_| badarg())?;
-    let value = parse_integer(text, base)?;
-    ctx.int(value)
+    let (negative, magnitude) = parse_integer(text, base)?;
+    arith::int_from_mag(ctx, negative, &magnitude)
 }
 
 // ---------------------------------------------------------------------------
@@ -1208,11 +1207,16 @@ mod tests {
             // A non-binary is `badarg`.
             let nil = ctx.list(&[]).expect("nil");
             assert_badarg(binary_to_integer_1(ctx, &[nil]));
-            // Beyond the 60-bit small range (real Erlang promotes to a bignum).
-            assert!(matches!(
-                binary_to_integer_1(ctx, &[bin(b"12345678901234567890")]),
-                Err(beam_common::BeamError::SystemLimit)
-            ));
+            // Beyond the 60-bit small range the value is the exact bignum the
+            // oracle builds.
+            let term = binary_to_integer_1(ctx, &[bin(b"12345678901234567890")]).expect("promotes");
+            assert!(access::is_big(term), "expected a bignum");
+            let (negative, digits) = beam_codec::term::big_parts(term).expect("a bignum");
+            assert!(!negative);
+            assert_eq!(
+                crate::numeric::mag_to_digits(negative, digits, 10),
+                "12345678901234567890"
+            );
         });
     }
 

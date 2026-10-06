@@ -44,10 +44,12 @@
 //!
 //! # Documented Milestone-1 gaps (never a silently wrong result)
 //!
-//! * **No bignums.** Integer values that leave the 60-bit small range report
-//!   [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) where real
-//!   Erlang promotes to a bignum (`list_to_integer` of a 30-digit string,
-//!   `round/1` of `1.0e30`).
+//! * **Integer values promote to bignums** for `integer_to_list/1,2`,
+//!   `list_to_integer/1,2`, `float/1` and `round`/`trunc`/`ceil`/`floor` — a value
+//!   outside the 60-bit small range becomes an arbitrary-precision bignum exactly
+//!   as the oracle's does (`list_to_integer` of a 30-digit string, `round/1` of
+//!   `1.0e30`). Other integer-producing BIFs may still report
+//!   [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit).
 //! * **`float_to_list` option `short` is unsupported** (`badarg`): it selects
 //!   Ryu's shortest round-trip rendering. `{decimals, N}`, `{scientific, N}`
 //!   and `compact` are supported; the oracle's rendering buffer is 256 bytes, so
@@ -72,10 +74,11 @@ use beam_term::compare::cmp_arith;
 use beam_term::{atom_val, signed_value, AtomTable, Eterm, NIL};
 
 use crate::access;
+use crate::arith;
 use crate::context::BifContext;
 use crate::error::{badarg, raise_error, raise_exit, raise_throw, system_limit};
 use crate::numeric::{
-    base_arg, format_scientific, int_to_digits, parse_float, parse_float_options, parse_integer,
+    base_arg, format_scientific, integer_digits, parse_float, parse_float_options, parse_integer,
     render_float, small_arg, DEFAULT_FLOAT_DECIMALS,
 };
 use crate::print::proper_list;
@@ -123,16 +126,14 @@ fn code_point_list(ctx: &mut BifContext<'_>, name: &str) -> Result<Eterm> {
 
 /// `integer_to_list(Integer)` — base 10.
 fn integer_to_list_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = small_arg(args[0])?;
-    let rendered = int_to_digits(value, 10);
+    let rendered = integer_digits(args[0], 10)?;
     ascii_list(ctx, &rendered)
 }
 
 /// `integer_to_list(Integer, Base)` for `2 =< Base =< 36`.
 fn integer_to_list_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = small_arg(args[0])?;
     let base = base_arg(args[1])?;
-    let rendered = int_to_digits(value, base);
+    let rendered = integer_digits(args[0], base)?;
     ascii_list(ctx, &rendered)
 }
 
@@ -160,8 +161,8 @@ fn list_to_integer(ctx: &mut BifContext<'_>, list: Eterm, base: u32) -> Result<E
         let byte = u8::try_from(signed_value(elem)).map_err(|_| badarg())?;
         text.push(char::from(byte));
     }
-    let value = parse_integer(&text, base)?;
-    ctx.int(value)
+    let (negative, magnitude) = parse_integer(&text, base)?;
+    arith::int_from_mag(ctx, negative, &magnitude)
 }
 
 // ---------------------------------------------------------------------------
@@ -296,71 +297,70 @@ fn max_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
 }
 
-/// The float value of a number argument.
+/// A rounded/truncated integer result, with `round` the rounding operation
+/// (`f64::round`/`f64::trunc`/`f64::ceil`/`f64::floor`).
 ///
-/// # Errors
+/// An **integer** argument is returned unchanged (the oracle's
+/// `round(576460752303423487)` ⇒ `576460752303423487`; going through `f64` would
+/// round it to `576460752303423488`). A float result within the 60-bit small
+/// range stays a small integer and anything larger becomes the exact bignum the
+/// oracle returns (`round(1.0e30)`), so the promotion reaches far past `i64`.
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-number.
-fn as_float(term: Eterm) -> Result<f64> {
-    if access::is_float(term) {
-        return Ok(access::float_value(term));
-    }
-    if access::is_small(term) {
-        return Ok(signed_value(term) as f64);
-    }
-    Err(badarg())
-}
-
-/// A rounded/truncated integer result.
-///
-/// `float` must be finite (an infinite or NaN float cannot exist in Erlang —
+/// The value must be finite (an infinite or NaN float cannot exist in Erlang —
 /// Milestone-1 arithmetic can still build one, and it is `badarg` here rather
 /// than a saturated, silently wrong integer).
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-finite value
-/// or a non-number argument; [`BeamError::SystemLimit`] when the result leaves
-/// the 60-bit small range (real Erlang returns a bignum).
-fn integer_result(ctx: &mut BifContext<'_>, term: Eterm, float: f64) -> Result<Eterm> {
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) for a non-finite float
+/// or a non-number argument.
+fn rounded_result(
+    ctx: &mut BifContext<'_>,
+    term: Eterm,
+    round: fn(f64) -> f64,
+) -> Result<Eterm> {
     if !access::is_number(term) {
         return Err(badarg());
     }
-    if !float.is_finite() {
+    if access::is_small(term) || access::is_big(term) {
+        return Ok(term);
+    }
+    let value = access::float_value(term);
+    if !value.is_finite() {
         return Err(badarg());
     }
-    ctx.int(float as i64)
+    arith::int_from_f64(ctx, round(value))
 }
 
 /// `round(Number)` — halves away from zero (`round(2.5)` is `3`).
 fn round_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = as_float(args[0])?;
-    integer_result(ctx, args[0], value.round())
+    rounded_result(ctx, args[0], f64::round)
 }
 
 /// `trunc(Number)` — toward zero (`trunc(-1.7)` is `-1`).
 fn trunc_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = as_float(args[0])?;
-    integer_result(ctx, args[0], value.trunc())
+    rounded_result(ctx, args[0], f64::trunc)
 }
 
 /// `ceil(Number)`.
 fn ceil_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = as_float(args[0])?;
-    integer_result(ctx, args[0], value.ceil())
+    rounded_result(ctx, args[0], f64::ceil)
 }
 
 /// `floor(Number)`.
 fn floor_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    let value = as_float(args[0])?;
-    integer_result(ctx, args[0], value.floor())
+    rounded_result(ctx, args[0], f64::floor)
 }
 
 /// `float(Number)` — an integer becomes a float; a float is returned as is.
+///
+/// An integer of arbitrary precision converts to the nearest `f64`, ties to even
+/// (the C `big_to_double`), and a magnitude the oracle refuses is `badarg`
+/// (`float(1 bsl 2000)`).
 fn float_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     match args[0] {
         term if access::is_float(term) => Ok(term),
-        term if access::is_small(term) => ctx.make_float(signed_value(term) as f64),
+        term if access::is_integer(term) => ctx.make_float(arith::integer_to_f64(term)?),
         _ => Err(badarg()),
     }
 }
@@ -752,12 +752,16 @@ mod tests {
                 list_to_integer_1(ctx, &[big]),
                 Err(BeamError::BadArg)
             ));
-            // A value past the small range: a bignum in real Erlang (documented).
+            // A value past the small range is the exact bignum the oracle builds.
             let huge = bytes(ctx, "99999999999999999999999999");
-            assert!(matches!(
-                list_to_integer_1(ctx, &[huge]),
-                Err(BeamError::SystemLimit)
-            ));
+            let term = list_to_integer_1(ctx, &[huge]).expect("promotes");
+            assert!(access::is_big(term), "expected a bignum");
+            let (negative, digits) = beam_codec::term::big_parts(term).expect("a bignum");
+            assert!(!negative);
+            assert_eq!(
+                crate::numeric::mag_to_digits(negative, digits, 10),
+                "99999999999999999999999999"
+            );
         });
     }
 
@@ -1173,9 +1177,36 @@ mod tests {
                 assert!(matches!(floor_1(ctx, &[bad]), Err(BeamError::BadArg)));
                 assert!(matches!(float_1(ctx, &[bad]), Err(BeamError::BadArg)));
             }
-            // A result past the small range is a limit (a bignum in real Erlang).
-            let huge = ctx.make_float(1.0e30).expect("fits");
-            assert!(matches!(round_1(ctx, &[huge]), Err(BeamError::SystemLimit)));
+            // A result past the small range is the exact bignum the oracle builds
+            // (`round(1.0e18)` ⇒ `1000000000000000000`, `round(1.0e30)` ⇒
+            // `1000000000000000019884624838656`).
+            for (value, expected) in [
+                (1.0e18f64, "1000000000000000000"),
+                (1.0e30, "1000000000000000019884624838656"),
+                (-1.0e30, "-1000000000000000019884624838656"),
+            ] {
+                let term = ctx.make_float(value).expect("fits");
+                for result in [
+                    round_1(ctx, &[term]).expect("round"),
+                    trunc_1(ctx, &[term]).expect("trunc"),
+                    ceil_1(ctx, &[term]).expect("ceil"),
+                    floor_1(ctx, &[term]).expect("floor"),
+                ] {
+                    assert!(access::is_big(result), "{value}: expected a bignum");
+                    let (negative, digits) =
+                        beam_codec::term::big_parts(result).expect("a bignum");
+                    assert_eq!(
+                        crate::numeric::mag_to_digits(negative, digits, 10),
+                        expected,
+                        "{value}"
+                    );
+                }
+            }
+            // A small integer past `2^53` is returned *unchanged*, not rounded
+            // through `f64` (`round(576460752303423487)` in the oracle).
+            let odd = ctx.int(576_460_752_303_423_487).expect("fits");
+            assert_eq!(round_1(ctx, &[odd]).expect("ok"), odd);
+            assert_eq!(trunc_1(ctx, &[odd]).expect("ok"), odd);
             // An infinite float (which Milestone-1 arithmetic can build) is never
             // turned into a saturated integer.
             let infinite = ctx.make_float(f64::INFINITY).expect("fits");

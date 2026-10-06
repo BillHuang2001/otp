@@ -45,17 +45,30 @@ This is the frozen public-API shape dependents design against; keep it stable.
 - `beam_loader` → the **typed block-structured IR** (`Module`, `Function`, `Block`, ops with
   safepoints/failure/branch/catch/line info) that `beam_engine` consumes — see `../CONTEXT.md` §4.
 - `beam_engine` → the execution loop + an **`ExecutionContext` trait** (BIF dispatch, term alloc,
-  process/stack state, trap/signal handling) so the engine depends only on `beam_loader` and the
-  concrete context is supplied by `beam_rt` (keeps the Stage-1/Stage-5 DAG acyclic).
+  process/stack state, trap/signal handling) plus a **`Mailbox` trait** — the receive/message seam
+  (`send_message`/`receive_next`/`receive_skip`/`receive_remove`/`receive_reset`/`receive_marker_*`,
+  every method **defaulted** to a typed `unsupported`) — so the engine depends only on
+  `beam_loader`/`beam_alloc` and the concrete context is supplied by `beam_rt` (keeps the
+  Stage-1/Stage-5 DAG acyclic). A receive that finds no message suspends through the engine's block
+  outcome (`RunOutcome { Returned, Wait }` + `run_export_outcome`/`run_label_outcome`/`resume_outcome`;
+  the plain `run_export` folds a suspend into the typed `error::blocked()`), which `beam_rt` maps onto
+  `beam_process`'s scheduler.
 - `beam_ets` → `Table` handle + set/ordered_set/hash ops.
 - `beam_gc` → per-process copying collector entry (`gc`/`collect`) + `OffHeap` refcount interface
   (`OffHeapEntry::{Mso, Binary}`); re-exports `beam_alloc::RefCount`.
-- `beam_message` → `copy_struct` (term movement across heaps) + send/receive envelope.
-- `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue, signals/links/monitors.
-- `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface.
+- `beam_message` → `copy_struct` (term movement across heaps) + the `Message` envelope + the `Queue`
+  FIFO with a resumable `QueueCursor` scan position (`cursor`/`message_at`/`advance`/`remove_at`) that
+  the receive seam drives.
+- `beam_process` → `Process`/`ProcessId`, `Scheduler`/run queue/`ProcessRunner`, signals/links/monitors;
+  **resume-on-send** (`Process::deliver -> DeliverOutcome` + `ProcessTable::drain_woken` /
+  `Scheduler::resume_woken`) wakes a receiver blocked in `receive`.
+- `beam_bifs` → `BifRegistry` + `BifFn` + the registry generated from the `bif.tab` surface, plus the
+  optional host seams `FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`.
 - `beam_io` → the poller/reactor (`mio`-backed) + `Port` + built-in-driver registry.
 - `beam_rt` → the runtime **binary**: boot sequence, CLI flags, `system_info`, and the concrete
-  `ExecutionContext` wiring engine + bifs + process; it owns the end-to-end vertical slice.
+  `ExecutionContext` wiring engine + bifs + process — including the `Mailbox` receive seam over the
+  process mailbox, a single-threaded `ProcessRunner`/scheduler loop, and the `beam_bifs::PortHook`
+  provider over a spawn driver; it owns the end-to-end vertical slice.
 
 ## Layering & dependency waves (design order — dependents design against a finished parent API)
 Determined by the Cargo workspace DAG; a crate may only use crates in earlier waves.
@@ -65,7 +78,7 @@ Determined by the Cargo workspace DAG; a crate may only use crates in earlier wa
 | 1 | `beam_codec`, `beam_ets`, `beam_gc` | wave 0 |
 | 2 | `beam_loader`, `beam_message`, `beam_dist` | wave 1 (`beam_codec`; `beam_message` also `beam_gc`, `beam_dist` also `beam_alloc`) |
 | 3 | `beam_process` | `beam_gc`, `beam_message`, `beam_alloc` |
-| 4 | `beam_engine` | `beam_loader` |
+| 4 | `beam_engine` | `beam_loader`, `beam_alloc` |
 | 5 | `beam_bifs`, `beam_io` | `beam_process` (+ codec/ets/gc) |
 | 6 | `beam_rt` | all |
 `beam_common` + `beam_term` (Stage-0 foundations) are the frozen dependency sinks — **consume, do
@@ -83,14 +96,14 @@ built first-class; other crates deliver their Stage-scoped core in parallel.
 | `beam_codec` | ETF encode/decode of the core tag set + `VERSION_MAGIC 131` round-trips |
 | `beam_dist` | `DFLAG_*`/`DOP_*` constants, handshake + control-message framing, `epmd` client |
 | `beam_loader` | chunk parse + BEAM disassembly + lowering to the typed block IR |
-| `beam_engine` | IR + direct-threaded interpreter over the generic-opcode subset + `ExecutionContext` |
+| `beam_engine` | IR + direct-threaded interpreter over the generic-opcode subset + `ExecutionContext` + the receive/message family over a `Mailbox` seam |
 | `beam_gc` | generational semi-space Cheney copy + MSO refcount |
-| `beam_message` | `copy_struct` + send/receive envelope |
-| `beam_process` | `Process`, run queue, scheduler loop, signals/links/monitors |
+| `beam_message` | `copy_struct` + send/receive envelope + the `QueueCursor` scan position |
+| `beam_process` | `Process`, run queue, scheduler loop, resume-on-send, signals/links/monitors |
 | `beam_bifs` | `BifRegistry` + core `erlang` BIFs (arith, comparison, type tests, term ops) + `io` floor |
 | `beam_ets` | `set` + `ordered_set` core ops (`new/insert/lookup/delete/select`) |
 | `beam_io` | `mio` poller/reactor + `Port` + one built-in driver |
-| `beam_rt` | boot/CLI/`system_info` + end-to-end vertical-slice integration test |
+| `beam_rt` | boot/CLI/`system_info` + the executor runner (send/receive) + the `PortHook` provider + end-to-end vertical-slice integration test |
 
 ## Term/heap foundation: maps · bitstrings · refc binaries (current state)
 The shared blockers that capped maps, bitstrings and large-binary memory efficiency are implemented.
@@ -141,6 +154,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
   liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
   off-heap payloads).
+- **A live `code_server` process is not yet on the receive path.** `beam_rt` serves `code:*` / `code_server`
+  requests from its native floor (`src/native.rs`), not from a registered `code_server` process, because
+  OTP's real `code_server.beam` needs host facilities outside `beam_rt` (a host timer for `after T`,
+  `erlang:make_ref/0`, `spawn_link`, `persistent_term`/`erl_prim_loader`, named-ETS resolution). The
+  `{call, From, Request}` → reply wire a future cross-crate live server must reproduce is documented in
+  `beam_rt/CONTEXT.md`; the three `boot/*` differential cases are shape-only and already agree.
 
 ## Constraints
 - **Keep the workspace green**: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml --workspace`
@@ -170,30 +189,40 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
-- `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` seam
+- `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` + `Mailbox` (receive/message) seams, the block/suspend outcome
 - `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
-- `beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
-- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors
-- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
+- `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
+- `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`)
+- `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`)
 - `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag), B-tree/CHAMP interiors
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, built-in drivers
-- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice
+- `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), and the `PortHook` provider
 - `../tools/differential/` → differential-test harness vs real ERTS (sibling — read-only, escalate writes to `..`)
 - `../tools/bench/` → benchmark driver for external targets + system-ERTS baseline (sibling — read-only, escalate writes to `..`)
 - `../../erts/emulator/beam/` → legacy C core: ground-truth behavior/ABI to reproduce (read-only reference)
 
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
-  erts_rust/Cargo.toml --workspace` is warning-free and `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace` is fully green (every suite passes; no allowlisted failures).
+  erts_rust/Cargo.toml --workspace` is warning-free. `cargo test --manifest-path
+  erts_rust/Cargo.toml --workspace` is green in every crate here; the only whole-workspace failure is
+  a stale assertion in the sibling `../tools/differential` (see Known Structural Debt).
 - **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
   `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
   installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
-  with no allowlist.- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
+  with no allowlist.
+- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
   supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
   fallback returns a typed error, never a wrong result).
+- **Receive/message execution path WORKS end-to-end.** `beam_engine` executes the whole receive family
+  (`send`/`loop_rec`/`loop_rec_end`/`wait`/`wait_timeout`/`timeout`/`remove_message`/`recv_marker_*`)
+  over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
+  scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
+  `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
+  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). The **differential gate is
+  197/197 agree** (the last `unsupported`, `driver/port_backed_by_spawn_driver`, is closed by the
+  installed `PortHook`, which spawns through a real spawn driver).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
@@ -205,10 +234,17 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   to (de-duplication). Writers take a caller-provided `*mut Eterm`; allocation stays in `beam_alloc`.
 - **Stage-1 baseline JIT mechanism shipped (`beam_engine`).** `src/jit/baseline/` implements the `JitBackend` seam: it lowers each typed-IR basic block to a real x86-64 `extern "C"` function (block ABI: return `(func<<32|pc)`, `HALT=-1`, `ERROR=-2`; ≤4 x-registers cached in `r12`–`r15` with an exit spill, `rbx` = x-register array base) and runs an export through a driver loop that deopts to the interpreter's own `step_instruction` for anything it does not inline. `Tier::BaselineJit` routes natively; `Tier::Interpreter` is unchanged. An optional Cranelift hot tier (`src/jit/cranelift.rs`) sits behind the `jit-cranelift` feature (default OFF). Correctness (interpreter-identical results) is the deliverable (`tests/jit.rs` + `tests/jit_coverage.rs`); deeper inlining and a cross-run code cache are later tasks.
 - **Foundation completion (maps >32 keys, refc binaries, public bit-string APIs).** `beam_term` gained `map` (flat-map ↔ HAMT, threshold 32, ERTS-shaped node interiors), `bitstring`, and `refc` modules; `beam_alloc` gained `RefCount` + off-heap `RefcBinary`; `beam_gc::OffHeapEntry::{Mso,Binary}`.
-- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`;
-  `RefCount` moved down into `beam_alloc` (the LCA) and re-exported by `beam_gc`.
+- **Dependency edges added** beyond the scaffold: `beam_message → beam_gc`, `beam_dist → beam_alloc`,
+  **`beam_engine → beam_alloc`** (wave 0 → wave 4, directionally legal — for the off-heap refc binaries
+  `bs_init_writable`/`append` hold); `RefCount` moved down into `beam_alloc` (the LCA) and re-exported
+  by `beam_gc`.
 
 ## Known Structural Debt (candidates for the next pass)
+- **Sibling `../tools/differential` has a stale assertion** (outside this node): its
+  `tests/cli.rs::the_suite_reports_module_agreement_and_expression_capability_gaps` still requires the
+  expression corpus to have a capability gap (`unsupported + skipped >= 1`). Now that the gate is
+  fully agreeing (197/197), that assertion is the single whole-workspace test failure. Relax/drop it in
+  the `../tools/` node (sibling — escalate).
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
   `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
   (Prevent-Duplication).
@@ -220,7 +256,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, the
   `beam_abi` frozen-header seam work, and the fun/export literal work (`beam_term::fun` layout;
   `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT` decode+encode with the `size`-field and env-order rules and the
-  `Local`-fun encode gap; `beam_gc` fun block sizing).
+  `Local`-fun encode gap; `beam_gc` fun block sizing). Also owed: the receive/message execution path
+  (`beam_engine` receive family + `Mailbox`/block-outcome seams; `beam_message::QueueCursor`;
+  `beam_process` resume-on-send; the `beam_rt` executor runner + `PortHook` provider).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`
@@ -228,10 +266,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   each writing a mapping (Prevent-Duplication). Purely additive; it is the "reconcile once
   `beam_common` lands" step `beam_term`'s own `CONTEXT.md` prescribes. (Needs a `../../CHANGE.md`
   note — flagged to the parent node, which owns the repo root.)
-- **Engine depends only on `beam_loader`** (as scaffolded). It therefore defines an
-  `ExecutionContext` trait for BIF dispatch / allocation / process state; `beam_rt` supplies the
-  concrete implementation over `beam_bifs`/`beam_process`. This keeps the Stage-1 engine independent
-  of the Stage-5 runtime core (acyclic DAG) and makes the engine testable with a minimal context.
+- **Engine depends only on `beam_loader`/`beam_alloc`.** It defines `ExecutionContext` (BIF dispatch /
+  allocation / process state) and `Mailbox` (receive/message) as traits; `beam_rt` supplies the concrete
+  implementations over `beam_bifs`/`beam_process`. This keeps the Stage-1 engine independent of the
+  Stage-5 runtime core (acyclic DAG) and makes the engine testable with a minimal context. A receive
+  that must block is reported by the engine's `RunOutcome` (not an error), so the runtime decides what
+  "block" means without the engine depending on the scheduler.
 - **Cranelift is an optional tier.** `beam_engine` must keep the interpreter working with the
   Cranelift backend behind a feature/stub so the build and the vertical slice do not depend on
   Cranelift codegen — the hot tier is measurement-gated (Part II §F), never on the critical path.

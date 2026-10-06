@@ -3,7 +3,7 @@
 
 use beam_alloc::Heap;
 use beam_message::off_heap::OffHeapTable;
-use beam_message::{receive, receive_ref, send, CopyContext, Queue};
+use beam_message::{receive, receive_ref, send, CopyContext, Queue, QueueCursor};
 use beam_term::prelude::*;
 use beam_term::compare;
 
@@ -144,4 +144,67 @@ fn send_attaches_the_referenced_off_heap_objects_to_the_message() {
         dst_off_heap.is_empty(),
         "send drained the destination table into the message"
     );
+}
+
+#[test]
+fn cursor_scans_candidates_and_removes_the_match() {
+    // The engine's receive path: scan candidate by candidate with a cursor, advance on a miss,
+    // remove the match, then reset to the first message.
+    let mut src = Heap::new(64).expect("source heap");
+    let from = make_small(0);
+
+    let mut to_heap = Heap::new(256).expect("receiver heap");
+    let mut queue = Queue::new();
+    let src_off_heap = OffHeapTable::new();
+    let mut dst_off_heap = OffHeapTable::new();
+    let mut ctx = CopyContext::new(&src_off_heap, &mut dst_off_heap);
+
+    for value in [10i64, 20, 30, 40] {
+        let term = build_list(&mut src, &[make_small(value)]);
+        send(from, term, &mut to_heap, &mut queue, &mut ctx).expect("the send succeeds");
+    }
+
+    assert_eq!(queue.len(), 4);
+    assert_eq!(queue.position(QueueCursor::default()), 0, "the default cursor is first");
+    assert_eq!(queue.position(queue.cursor()), 0);
+
+    // Walk the queue with a cursor until the matching payload is found.
+    let mut cursor = queue.cursor();
+    let mut match_cursor = None;
+    while let Some(message) = queue.message_at(cursor) {
+        if head(message.payload()) == 30 {
+            match_cursor = Some(cursor);
+            break;
+        }
+        queue.advance(&mut cursor);
+    }
+
+    let removed = queue.remove_at(match_cursor.expect("the match is queued"));
+    assert_eq!(removed.map(|m| head(m.payload())), Some(30));
+    assert_eq!(queue.len(), 3);
+    assert_eq!(
+        queue.iter().map(|m| head(m.payload())).collect::<Vec<_>>(),
+        vec![10, 20, 40],
+        "the scanned-over messages stay queued in front of the match"
+    );
+
+    // A cursor at/after the shrunken queue's end is past-the-end and removes nothing.
+    let stale = queue.cursor_at(3);
+    assert!(queue.message_at(stale).is_none());
+    assert!(queue.remove_at(stale).is_none());
+    assert_eq!(queue.len(), 3);
+
+    // Resetting to the first message (the engine's post-remove reset) sees the head again.
+    let fresh = queue.cursor();
+    assert_eq!(
+        queue.message_at(fresh).map(|m| head(m.payload())),
+        Some(10)
+    );
+
+    // A cursor over an empty queue is past-the-end.
+    queue.clear();
+    let empty = queue.cursor();
+    assert!(queue.message_at(empty).is_none());
+    assert!(queue.remove_at(empty).is_none());
+    assert!(queue.is_empty());
 }

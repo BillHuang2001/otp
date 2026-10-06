@@ -788,3 +788,39 @@
         assert_eq!(store.free(copied), 3);
         assert_eq!(store.words(), 0);
     }
+
+    /// `relinquish` hands an object's storage to the caller: the word count drops
+    /// (it is no longer table memory) but the object stays valid, and its words are
+    /// **never** handed out again — the difference from `free`.
+    #[test]
+    fn relinquish_checks_out_an_object_without_reusing_its_words() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(32);
+        let source = heap.tuple(&[make_small(1), make_small(2)]).unwrap();
+
+        let mut store = test_store();
+        let copied = store.copy(source).expect("a tuple is copyable");
+        assert_eq!(store.words(), 3);
+
+        // Checking out the object drops it from the live count …
+        assert_eq!(store.relinquish(copied), 3);
+        assert_eq!(store.words(), 0);
+
+        // … but does not free it: a second relinquish / a free are no-ops …
+        assert_eq!(store.relinquish(copied), 0);
+        assert_eq!(store.free(copied), 0);
+
+        // … and the object itself is untouched.
+        assert!(eq(copied, source, &atoms));
+
+        // The checked-out run is not reusable: a later same-size copy takes fresh
+        // words, so the object the caller holds can never be overwritten.
+        let other = heap.tuple(&[make_small(3), make_small(4)]).unwrap();
+        let second = store.copy(other).expect("a tuple is copyable");
+        assert_ne!(second, copied, "checked-out words are never handed out again");
+        assert!(
+            eq(copied, source, &atoms),
+            "the checked-out object survived the later copy"
+        );
+        assert_eq!(store.words(), 3, "only the new copy is live table storage");
+    }

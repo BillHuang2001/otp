@@ -77,12 +77,20 @@ impl<'a> Decoder<'a> {
     /// Decodes the next term into `heap`, interning its atoms into `atoms`.
     ///
     /// Malformed/truncated input, a bad tag, an obsolete tag the C also rejects
-    /// ([`Tag::Fun`], [`Tag::NewCache`]), invalid UTF-8 in an atom name or an unset
+    /// ([`Tag::Fun`], [`Tag::NewCache`]), a [`Tag::DistHeader`] (a distribution
+    /// transport wrapper, never a term), invalid UTF-8 in an atom name or an unset
     /// atom-cache slot yield `BeamError::BadArg`; a value beyond a wire bound yields
     /// `BeamError::SystemLimit`; heap exhaustion propagates from the heap as
     /// `BeamError::Alloc`; a recognized-but-not-yet-implemented tag
-    /// ([`Tag::Record`], [`Tag::Local`], [`Tag::DistHeader`]) yields
-    /// [`crate::error::unsupported`]. Funs decode for real: [`Tag::Export`] becomes
+    /// ([`Tag::Record`]) yields [`crate::error::unsupported`].
+    ///
+    /// [`Tag::Local`] is **not a term tag**: it is the `term_to_binary/2 [local]`
+    /// wrapper `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`. As the C does
+    /// (`external.c:5250-5254`), the 4-byte node hash is consumed and the *following*
+    /// term is decoded — whether the wrapper is the outermost object or appears
+    /// nested.
+    ///
+    /// Funs decode for real: [`Tag::Export`] becomes
     /// a [`FunKind::External`](crate::FunKind) fun and [`Tag::NewFun`] a
     /// [`FunKind::Imported`](crate::FunKind) one (see [`Decoder::decode_export`] and
     /// [`Decoder::decode_new_fun`]).
@@ -319,16 +327,49 @@ impl<'a> Decoder<'a> {
             Tag::NewFun => self.decode_new_fun(heap, atoms),
 
             // ---------------------------------------------------------------
+            // `LOCAL_EXT` — the `[local]` wrapper, not a term
+            // ---------------------------------------------------------------
+            // `LOCAL_EXT` (`121`) is the wrapper `term_to_binary/2` emits with the
+            // `[local]` option, never a term of its own:
+            // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<ordinary term>]`. The C
+            // `dec_term` consumes the 4-byte node hash and continues decoding the
+            // *next* object (`flags |= ERTS_DIST_EXT_INTERNAL_NC; ep += 4; goto
+            // continue_this_obj;`, `external.c:5250-5254`), materializing no term for
+            // the tag — so we do the same, whether the wrapper is top-level (via
+            // `Decoder::new`) or nested.
+            //
+            // Hash verification is intentionally **not** performed here: the C only
+            // checks it in the `decoded_size` sizing pass, against a Bob-Jenkins block
+            // hash seeded with the node's `local_node_hash` (`external.c:6437-6442`,
+            // `:6471-6512`). That seed is node-identity-owned (`beam_rt`/`beam_dist`),
+            // which this codec has none of, so `dec_term`'s skip-the-hash behaviour is
+            // faithful.
+            Tag::Local => {
+                let _node_hash = self.reader.bytes(4)?;
+                return self.decode(heap, atoms);
+            }
+
+            // ---------------------------------------------------------------
+            // Malformed tags — never a term
+            // ---------------------------------------------------------------
+            // `DIST_HEADER` (`68`) is a distribution-transport wrapper, never a term:
+            // the C term decoder has no `case DIST_HEADER` and falls into `default:
+            // goto error` (`external.c:6464`, `:5383`), so `binary_to_term(<<131,68,
+            // …>>)` is `badarg`. The whole `'D'`/`'E'`/`'F'` framing (dist header, atom
+            // cache, fragment headers) is owned by the sibling `beam_dist`
+            // (`../beam_dist/src/dist_header.rs`, `../beam_dist/src/connection.rs`);
+            // none of it is duplicated here.
+            Tag::DistHeader => Err(bad_arg()),
+
+            // ---------------------------------------------------------------
             // Deliberately unsupported in M1 — never a wrong term
             // ---------------------------------------------------------------
             // `RECORD_EXT` (`67`): the legacy native record term (ordinary Erlang
-            // records encode as tuples).
+            // records encode as tuples). Recognized, implementation pending — blocked
+            // on a `beam_term` record layout (`ErtsRecordInstance`/
+            // `ErtsRecordDefinition`, `erl_record.h`), which the term-layout owner does
+            // not expose. Never a wrong term.
             Tag::Record => Err(unsupported(tag)),
-            // `LOCAL_EXT` (`121`): needs local-node identity, which the codec has none
-            // of (owned by `beam_dist`/`beam_rt`).
-            Tag::Local => Err(unsupported(tag)),
-            // `DIST_HEADER` (`68`): owned by `beam_dist`, which frames it itself.
-            Tag::DistHeader => Err(unsupported(tag)),
         }
     }
 
@@ -1123,10 +1164,18 @@ mod tests {
         assert_bad_arg(&[131, Tag::Fun.as_byte()]);
         assert_bad_arg(&[131, Tag::NewCache.as_byte()]);
 
-        // Every recognized-but-not-yet-implemented tag is reported, not guessed.
-        for tag in [Tag::Record, Tag::Local, Tag::DistHeader] {
-            assert_unsupported(&[131, tag.as_byte()]);
-        }
+        // `RECORD_EXT` is recognized but not implemented: reported, never guessed
+        // (blocked on a `beam_term` record layout, `erl_record.h` — see `Tag::Record`).
+        assert_unsupported(&[131, Tag::Record.as_byte()]);
+
+        // `LOCAL_EXT` (121) is honoured now as the `[local]` wrapper, so a bare tag
+        // byte is a *truncation* (the 4-byte hash and the term are missing) — BadArg,
+        // never `unsupported`.
+        assert_bad_arg(&[131, Tag::Local.as_byte()]);
+
+        // `DIST_HEADER` (68) is a distribution-transport wrapper, never a term: the C
+        // term decoder rejects it as malformed, so it is BadArg, never `unsupported`.
+        assert_bad_arg(&[131, Tag::DistHeader.as_byte()]);
 
         // `NEW_FUN_EXT`/`EXPORT_EXT` are implemented now, so a bare tag byte is a
         // *truncation* (the C would also run off the end and error), never
@@ -1141,6 +1190,75 @@ mod tests {
         assert_bad_arg(&[131, 104, 1, 80]);
     }
 
+    // -----------------------------------------------------------------------
+    // `LOCAL_EXT` (121) — the `term_to_binary/2 [local]` wrapper (not a term tag)
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn local_ext_wrapper_consumes_hash_and_decodes_the_next_term() {
+        // `term_to_binary({ok,17}, [local])`:
+        // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`. The node hash is
+        // opaque to the decoder (verification needs the node's `local_node_hash`), so
+        // any 4 bytes must be accepted and skipped.
+        let mut image = vec![131u8, 121, 0xDE, 0xAD, 0xBE, 0xEF];
+        image.extend_from_slice(&[104, 2, 119, 2, 111, 107, 97, 17]); // {ok,17}
+
+        let (_h, atoms, term) = decode(&image);
+        assert_eq!(tuple_arity(term).unwrap(), 2);
+        assert_eq!(
+            atoms.name(atom_val(tuple_element(term, 0).unwrap())),
+            Some("ok")
+        );
+        assert_eq!(tuple_element(term, 1).unwrap(), make_small(17));
+
+        // The wrapper is honoured inline too: nested as a sub-term of a tuple, the
+        // 4-byte hash is consumed and the following object is the element (the C does
+        // the same with `goto continue_this_obj`).
+        let nested = [131u8, 104, 1, 121, 0, 0, 0, 0, 97, 7];
+        let (_h, _a, term) = decode(&nested);
+        assert_eq!(tuple_arity(term).unwrap(), 1);
+        assert_eq!(tuple_element(term, 0).unwrap(), make_small(7));
+    }
+
+    #[test]
+    fn local_ext_body_decoder_path() {
+        // A body (no version byte) that starts with the `[local]` wrapper.
+        let body = [121u8, 0xAA, 0xBB, 0xCC, 0xDD, 97, 5];
+        let mut heap = Heap::new(64).unwrap();
+        let mut atoms = AtomTable::new();
+        let mut decoder = Decoder::new_body(&body);
+        let term = decoder.decode(&mut heap, &mut atoms).unwrap();
+        assert_eq!(term, make_small(5));
+        assert_eq!(decoder.remaining(), 0);
+        decoder.finish().unwrap();
+    }
+
+    #[test]
+    fn local_ext_truncation_is_bad_arg() {
+        // The complete image `[VERSION_MAGIC][LOCAL_EXT][hash:4][{ok,17}]`.
+        let full = [131u8, 121, 0, 0, 0, 1, 104, 2, 119, 2, 111, 107, 97, 17];
+
+        // Truncation at *every* prefix is a typed BadArg, never a panic.
+        for len in 0..full.len() {
+            assert_bad_arg(&full[..len]);
+        }
+
+        // The specific boundaries the wrapper introduces: no hash, a partial hash and
+        // a full hash with no term following.
+        assert_bad_arg(&[131, 121]);
+        assert_bad_arg(&[131, 121, 0, 0, 0]);
+        assert_bad_arg(&[131, 121, 0, 0, 0, 0]);
+
+        // A body decoder sees the same truncations (no version byte to absorb).
+        for len in 0..(full.len() - 1) {
+            let body = &full[1..][..len];
+            let mut heap = Heap::new(64).unwrap();
+            let mut atoms = AtomTable::new();
+            let mut decoder = Decoder::new_body(body);
+            let err = decoder.decode(&mut heap, &mut atoms).unwrap_err();
+            assert!(matches!(err, BeamError::BadArg), "got {err:?} for {body:?}");
+        }
+    }
     // -----------------------------------------------------------------------
     // `COMPRESSED` (`80`) — the top-level zlib wrapper
     // -----------------------------------------------------------------------

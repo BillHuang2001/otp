@@ -68,6 +68,19 @@ pub fn build_module(
         });
     }
 
+    // `LocT` (the JIT-only local-function table) shares the `ExpT` layout, so it is
+    // mapped exactly like the exports — the label is the local function's entry label.
+    // The interpreter never consults it; it is carried so the recognized chunk is
+    // visible on the IR rather than silently dropped.
+    let mut locals = Vec::with_capacity(chunks.locals.len());
+    for raw in &chunks.locals {
+        locals.push(Export {
+            function: atom_at(&atoms, raw.function)?,
+            arity: raw.arity,
+            label: Label(raw.label),
+        });
+    }
+
     let mut imports = Vec::with_capacity(chunks.imports.len());
     for raw in &chunks.imports {
         imports.push(Import {
@@ -125,6 +138,7 @@ pub fn build_module(
         atoms,
         atom_table,
         exports,
+        locals,
         imports,
         functions,
         funs,
@@ -255,7 +269,7 @@ mod tests {
 
     use super::instr::lower_instr;
     use super::*;
-    use crate::chunk::table::RawFun;
+    use crate::chunk::table::{RawExport, RawFun};
     use crate::ir::{CodeVersion, ImportRef, Instr, TypeTable};
     use crate::opcode::Opcode;
     use crate::operand::{Operand, NO_FAIL};
@@ -1400,6 +1414,7 @@ mod tests {
             atoms: vec![String::new(), "m".to_string(), "f".to_string()],
             code: None,
             exports: Vec::new(),
+            locals: Vec::new(),
             imports: Vec::new(),
             funs,
             line: None,
@@ -1580,6 +1595,53 @@ mod tests {
         assert_eq!(module.atom_name(fun.function), Some("f"));
         assert_eq!((fun.arity, fun.label, fun.index, fun.num_free, fun.uniq), (1, Label(2), 0, 3, 7));
         assert_eq!(module.fun(1), None);
+    }
+
+    #[test]
+    fn a_module_without_a_locals_table_has_no_locals() {
+        // `minimal_chunks` carries no `LocT` entries, so the lowered module's
+        // local-function table is empty (it is an additive field, never `None`).
+        let module = build_module(
+            &minimal_chunks(Vec::new(), Vec::new()),
+            &minimal_stream(),
+            beam_term::AtomTable::new(),
+        )
+        .unwrap();
+        assert!(module.locals.is_empty());
+    }
+
+    #[test]
+    fn a_locals_entry_is_lowered_like_an_export() {
+        // A `LocT` entry maps its wire atom index through the atom table exactly like
+        // an `ExpT` entry; the label is the local function's entry label.
+        let chunks = Chunks {
+            locals: vec![RawExport {
+                function: 2, // atom "f"
+                arity: 3,
+                label: 2,
+            }],
+            ..minimal_chunks(Vec::new(), Vec::new())
+        };
+        let module = build_module(&chunks, &minimal_stream(), beam_term::AtomTable::new()).unwrap();
+        assert_eq!(module.locals.len(), 1);
+        let local = &module.locals[0];
+        assert_eq!(module.atom_name(local.function), Some("f"));
+        assert_eq!((local.arity, local.label), (3, Label(2)));
+    }
+
+    #[test]
+    fn a_locals_entry_with_an_out_of_range_atom_is_rejected() {
+        let chunks = Chunks {
+            locals: vec![RawExport {
+                function: 99, // beyond the three atoms of `minimal_chunks`
+                arity: 0,
+                label: 2,
+            }],
+            ..minimal_chunks(Vec::new(), Vec::new())
+        };
+        let err =
+            build_module(&chunks, &minimal_stream(), beam_term::AtomTable::new()).unwrap_err();
+        assert!(matches!(err, BeamError::BadArg));
     }
 
     #[test]

@@ -54,14 +54,31 @@ impl ChunkId {
     pub const CINF: ChunkId = ChunkId(*b"CInf");
     /// The line table chunk (`Line`).
     pub const LINE: ChunkId = ChunkId(*b"Line");
-    /// The JIT-only local table chunk (`LocT`); not parsed by the interpreter path.
+    /// The JIT-only local-function table chunk (`LocT`).
+    ///
+    /// Identical wire format to [`ChunkId::EXPT`]: the C reader parses it with the
+    /// same export-table reader (`parse_locals_chunk` → `parse_export_table`) and
+    /// keeps it only for `erts_jit_asm_dump` (`beam_file.c:1684`). It is irrelevant
+    /// to interpretation, but the loader recognizes and parses it rather than
+    /// silently skipping it (see [`crate::chunk::table::parse_locals`]).
     pub const LOCT: ChunkId = ChunkId(*b"LocT");
     /// The type-annotation chunk (`Type`).
     pub const TYPE: ChunkId = ChunkId(*b"Type");
     /// The metadata chunk (`Meta`).
     pub const META: ChunkId = ChunkId(*b"Meta");
-    /// The debug-info chunk (`DbgB`).
+    /// The legacy debug chunk (`DbgB`).
+    ///
+    /// This is the emulator's legacy debug chunk (`beam_file.c` chunk_iffs id 14),
+    /// *not* the compiler's debug-info chunk — that one is [`ChunkId::DBGI`]. Like
+    /// `Dbgi`, its payload is deliberately left unparsed.
     pub const DBGB: ChunkId = ChunkId(*b"DbgB");
+    /// The compiler's debug-info chunk (`Dbgi`).
+    ///
+    /// Debug information is tooling-only and irrelevant to the runtime, so
+    /// [`crate::chunk::parse`] deliberately does **not** parse its payload. The id
+    /// is still recognized so the chunk surfaces as a known id rather than an
+    /// "unknown chunk" that merely happened to be skipped.
+    pub const DBGI: ChunkId = ChunkId(*b"Dbgi");
     /// The (obsolete) native-record chunk (`Recs`).
     pub const RECS: ChunkId = ChunkId(*b"Recs");
 

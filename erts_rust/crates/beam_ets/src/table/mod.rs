@@ -91,8 +91,17 @@ impl OwnerId {
 /// ordering/hashing is delegated to `beam_term`.
 pub(crate) trait Interior {
     /// Insert `object` under `key`, applying the kind's duplicate rules
-    /// (replace for `set`/`ordered_set`).
-    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<()>;
+    /// (replace for `set`/`ordered_set`), and report whether the object was
+    /// **retained**.
+    ///
+    /// `true` means the interior stored `object` (or replaced the entry with it)
+    /// and now owns it; `false` means the interior rejected the object as a
+    /// duplicate no-op (`bag`), so it did **not** store it and the object is
+    /// unreferenced. The caller ([`Table::insert`]) reclaims a rejected copy from
+    /// the store, so a rejected duplicate never leaks storage. `set`/`ordered_set`
+    /// always retain (a replace keeps the *new* object) and `duplicate_bag` always
+    /// retains; only `bag` can answer `false`.
+    fn insert(&mut self, key: Eterm, object: Eterm, atoms: &AtomTable) -> Result<bool>;
 
     /// Insert `object` under `key` only if `key` is absent; returns whether the
     /// object was inserted.
@@ -125,8 +134,11 @@ pub(crate) trait Interior {
     /// Remove `key`'s entry and return **every** object stored under it (an empty
     /// vector when `key` is absent), mirroring `ets:take/2`.
     ///
-    /// The drop-in default locates the objects and then deletes the entry; the
-    /// hash interior overrides it with its one-pass removal.
+    /// The returned objects **alias table storage** (they are the interior's own
+    /// copies); [`Table::take`], the only caller through the public API, deep-copies
+    /// them out of the store and then reclaims these originals, so no returned pointer
+    /// is ever a reclaimed word. The drop-in default locates the objects and then
+    /// deletes the entry; the hash interior overrides it with its one-pass removal.
     fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
         let objects = self.lookup(key, atoms);
         if !objects.is_empty() {
@@ -185,8 +197,8 @@ pub(crate) trait Interior {
     /// index (`ets:info(Tab, memory)`'s interior contribution).
     ///
     /// The default is `0` — an interior that does not account for its index
-    /// storage contributes nothing; the hash interior reports its honest
-    /// bucket/entry allocation.
+    /// storage contributes nothing; the hash and `ordered_set` interiors report
+    /// their honest bucket/entry and B+-tree node-arena allocations respectively.
     fn memory(&self) -> usize {
         0
     }
@@ -215,7 +227,7 @@ pub(crate) trait Interior {
     ) -> Result<Eterm> {
         let object = self.lookup(key, atoms).into_iter().next().ok_or_else(badarg)?;
         let arity = object_arity(object)?;
-        let newcnt = add_counters(read_counter(object, pos)?, incr)?;
+        let newcnt = add_counters(read_counter(object, pos)?, incr, heap)?;
         let updated = replace_elements(object, arity, &[(pos, newcnt)], heap)?;
         self.insert(key, updated, atoms)?;
         Ok(newcnt)
@@ -382,7 +394,13 @@ impl Table {
         } else {
             self.interior.lookup(stored_key, atoms)
         };
-        self.interior.insert(stored_key, stored, atoms)?;
+        let retained = self.interior.insert(stored_key, stored, atoms)?;
+        if !retained {
+            // The interior rejected the copy as a duplicate no-op (a `bag` holding
+            // an identical object): no entry references it, so reclaim it instead of
+            // leaving it orphaned in the store.
+            self.store.free(stored);
+        }
         for old in replaced {
             self.store.free(old);
         }
@@ -396,7 +414,13 @@ impl Table {
         key_of(object, keypos)?;
         let stored = self.store.copy(object)?;
         let stored_key = key_of(stored, keypos)?;
-        self.interior.insert_new(stored_key, stored, atoms)
+        let inserted = self.interior.insert_new(stored_key, stored, atoms)?;
+        if !inserted {
+            // The key already exists, so the interior stored nothing: the copy is
+            // unreferenced and is reclaimed.
+            self.store.free(stored);
+        }
+        Ok(inserted)
     }
 
     /// Insert every object of `objects` (`ets:insert/2` over a list).
@@ -664,8 +688,7 @@ impl Table {
             if op.pos == keypos || op.pos == 0 || op.pos > arity {
                 return Err(badarg());
             }
-            // The addressed element must be an integer (and small — the bignum
-            // element is the documented representation gap).
+            // The addressed element must be an integer.
             read_counter(object, op.pos)?;
         }
 
@@ -688,7 +711,7 @@ impl Table {
                 .interior
                 .update_counter(key, op.pos, op.incr, atoms, heap)?;
             let value = match op.warp {
-                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold) => {
+                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold, atoms) => {
                     // The threshold rule replaces the counter outright; the hash
                     // override has no "write this value" entry point, so route it
                     // through `update_element` (same observable result).
@@ -801,14 +824,52 @@ impl Table {
     /// Remove `key`'s entry and return every object stored under it
     /// (`ets:take/2`); an absent key yields an empty vector.
     ///
-    /// The returned objects **alias table storage** and stay valid for the table's
-    /// lifetime: this call deliberately does **not** reclaim them
-    /// ([`TermStore::free`](crate::store::TermStore::free) would return their runs
-    /// to the store's free lists, where a later `copy` could hand the same words
-    /// out again). Their storage is released by
-    /// [`delete_all_objects`](Table::delete_all_objects)/table drop.
+    /// The removed objects are **handed to the caller**: each is deep-copied out of
+    /// table storage and the table's own original copy is reclaimed
+    /// ([`TermStore::free`](crate::store::TermStore::free)), so a churn of `insert` +
+    /// `take` does not grow the table's memory. The returned copies are
+    /// [`relinquish`](crate::store::TermStore::relinquish)ed: they stay valid for the
+    /// table's lifetime and their words are never reused (a later `copy` can never
+    /// hand the caller's term out again), but they no longer count as table memory —
+    /// exactly the real `ets:take/2`, where the objects move off the table.
+    ///
+    /// Every object is copied **before** any original is reclaimed: a copy reads its
+    /// original's words, which `free` would return to the store's free lists.
     pub fn take(&mut self, key: Eterm, atoms: &AtomTable) -> Result<Vec<Eterm>> {
-        self.interior.take(key, atoms)
+        let removed = self.interior.take(key, atoms)?;
+        if removed.is_empty() {
+            return Ok(Vec::new());
+        }
+        // Deep-copy every removed object out first (see the doc above).
+        let mut taken = Vec::with_capacity(removed.len());
+        for &original in &removed {
+            match self.store.copy(original) {
+                Ok(copy) => taken.push(copy),
+                Err(err) => {
+                    // The entry is gone either way, so nothing may stay counted:
+                    // reclaim the copies taken so far **and** every original before
+                    // reporting. (In practice unreachable — a table-owned object is
+                    // always a copy of a supported term — but the failure path must
+                    // not leak.)
+                    for copy in taken.drain(..) {
+                        self.store.free(copy);
+                    }
+                    for &original in &removed {
+                        self.store.free(original);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        // Hand the copies to the caller (no longer table memory, never reusable) and
+        // reclaim the table's own originals.
+        for &copy in &taken {
+            self.store.relinquish(copy);
+        }
+        for &original in &removed {
+            self.store.free(original);
+        }
+        Ok(taken)
     }
 
     /// Whether `requester` may **read** the table; an access violation is
@@ -881,4 +942,88 @@ impl Table {
         selected
     }
 
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_term::heap::Heap;
+
+    /// A `{Key, Value}` object (keypos 1) on `heap`.
+    fn object(heap: &mut Heap, key: i64, value: i64) -> Eterm {
+        heap.tuple(&[make_small(key), make_small(value)]).unwrap()
+    }
+
+    /// A fresh keypos-1 table of `kind`.
+    fn table(kind: TableKind) -> Table {
+        let mut opts = TableOptions::new();
+        opts.set_kind(kind);
+        Table::new(TableId::next(), opts).expect("a fresh table is constructible")
+    }
+
+    /// The interior reports a rejected `bag` duplicate, so `Table::insert` reclaims
+    /// the deep copy it just made: the store's live-word count does not grow.
+    #[test]
+    fn a_rejected_bag_duplicate_costs_no_store_words() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut t = table(TableKind::Bag);
+
+        t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+        let live = t.store.words();
+        assert!(live > 0, "the stored object owns store words");
+
+        for _ in 0..10 {
+            t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+        }
+        assert_eq!(
+            t.store.words(),
+            live,
+            "a rejected duplicate's copy must be reclaimed, not orphaned"
+        );
+        assert_eq!(t.size(), 1);
+    }
+
+    /// `insert_new` reclaims the deep copy it made when the key already exists.
+    #[test]
+    fn a_refused_insert_new_costs_no_store_words() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut t = table(TableKind::Set);
+
+        assert!(t.insert_new(object(&mut heap, 1, 10), &atoms).unwrap());
+        let live = t.store.words();
+
+        for _ in 0..10 {
+            assert!(!t.insert_new(object(&mut heap, 1, 20), &atoms).unwrap());
+        }
+        assert_eq!(t.store.words(), live, "a refused insert_new leaks no copy");
+        assert_eq!(t.size(), 1);
+    }
+
+    /// `take` reclaims the stored object (the store holds no live words afterwards)
+    /// and hands the caller a checked-out copy that stays valid.
+    #[test]
+    fn take_reclaims_the_stored_object_and_returns_a_checked_out_copy() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut t = table(TableKind::Set);
+
+        let source = object(&mut heap, 1, 10);
+        t.insert(source, &atoms).unwrap();
+        assert!(t.store.words() > 0);
+
+        let taken = t.take(make_small(1), &atoms).unwrap();
+        assert_eq!(taken.len(), 1);
+        assert_eq!(
+            t.store.words(),
+            0,
+            "the stored object is reclaimed; the returned copy is checked out"
+        );
+        assert_eq!(t.size(), 0);
+        assert!(
+            eq(taken[0], source, &atoms),
+            "the returned copy is structurally the removed object"
+        );
+    }
 }

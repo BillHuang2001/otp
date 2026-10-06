@@ -43,7 +43,7 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Instr::Allocate { stack_need, live }`.
 ### The IR (`src/ir.rs` + the re-exported `src/instr.rs`)
 - `pub struct Module { pub name: Atom, pub atoms: Vec<Atom>, pub atom_table: AtomTable,
-  pub exports: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
+  pub exports: Vec<Export>, pub locals: Vec<Export>, pub imports: Vec<Import>, pub functions: Vec<Function>,
   pub funs: Vec<FunDescriptor>, pub code_version: CodeVersion, pub types: TypeTable, pub line: LineTable,
   pub literals: Arc<LiteralArea>, pub strings: Vec<u8>, pub attributes: Option<Vec<u8>>,
   pub compile_info: Option<Vec<u8>> }`
@@ -55,6 +55,9 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   `Module` is `Clone` (cheap: `literals` is shared behind the `Arc`) and `Debug`, but it is **neither
   `Send` nor `Sync`** (see `src/literal.rs` / Design Decisions) — a loaded module stays on its loading thread.
 - `pub struct Export { pub function: Atom, pub arity: u32, pub label: Label }` — `label` = the function **entry label**.
+  `Module.locals` holds one `Export` per `LocT` entry (byte-for-byte the `ExpT` layout — the JIT-only
+  local-function table; the C keeps it only for `erts_jit_asm_dump`, `beam_file.c:1684`, so interpretation
+  ignores it, but the chunk is recognized and parsed rather than silently skipped).
 - `pub struct Import { pub module: Atom, pub function: Atom, pub arity: u32 }`
 - `pub struct Function { pub func_label: Label, pub entry_label: Label, pub module: Atom,
   pub name: Atom, pub arity: u32, pub code: Vec<Instr>, pub blocks: Vec<Block>,
@@ -112,7 +115,11 @@ Both are the *only* entry points; all intermediate types are public for inspecti
   - **maps** — `GetMapElements { fail, source, pairs: Vec<(Operand, Operand)> }`,
     `HasMapFields { fail, source, keys: Vec<Operand> }`,
     `PutMapAssoc { fail, source, dst, live, pairs }`, `PutMapExact { fail, source, dst, live, pairs }`.
-  - **records** — `UpdateRecord { hint: Operand, size: u32, src, dst, updates: Vec<(Operand, Operand)> }`.
+  - **records** — `UpdateRecord { hint: Operand, size: u32, src, dst, updates: Vec<(Operand, Operand)> }`,
+    `IsAnyNativeRecord { fail: Label, src: Operand }` (the `erlang:is_record/1` guard, generic opcode
+    `186`: branches to `fail` iff `src` is **not** a native record — `emu/instrs.tab:1323`, operand shape
+    `f xy` in `emu/ops.tab:1634`; deliberately a new `Instr` variant rather than a `TestKind`, which the
+    engine matches exhaustively).
   - **exceptions** — `Badmatch { value }`, `CaseEnd { value }`, `IfEnd`, `Try { frame, fail: Label }`,
     `Catch { frame, fail }`, `TryCase { frame }`, `TryEnd { frame }`, `TryCaseEnd { value }`,
     `CatchEnd { frame }`, `Raise { trace, value }`, `Badrecord { value }`, `BuildStacktrace`, `RawRaise`.
@@ -179,8 +186,10 @@ chunk entry * :  u8[4] chunk_id | u32 size | size bytes | (4 - size%4)%4 zero pa
 ```
 `"BEAM"` is the form type, **there is no `BEAM` chunk**. Chunks parse until EOF; unknown ids skipped;
 duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` (atoms), `Code`
-(instructions), `StrT`, `ImpT`, `ExpT`, `FunT`, `LitT`, `Attr`, `CInf`, `Line`, `LocT` (jit-only),
-`Type`, `Meta`, `DbgB`, `Recs`, obsolete `Atom`.
+(instructions), `StrT`, `ImpT`, `ExpT`, `LocT` (JIT-only locals), `FunT`, `LitT`, `Attr`, `CInf`,
+`Line`, `Type`, `Meta`, `DbgB` (legacy debug), `Dbgi` (compiler debug info), `Recs`, obsolete `Atom`.
+`DbgB`/`Dbgi` are *recognized* ids whose payloads are deliberately left unparsed (debug info is
+tooling-only).
 ### Per-chunk layouts (`src/chunk/`)
 - **`AtU8`** — `i32 count` (negative ⇒ "long" varint lengths, real count = `-count`); then per atom a
   length (varint if long, else `u8`) + UTF-8 bytes. **UTF-8, not Latin-1** (`beam_file.c:291`).
@@ -191,6 +200,9 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
   The stream ends at the `int_code_end/0` instruction (genop 3), not at size exhaustion
   (`beam_file.c:1527,2596`). Instruction = 1 opcode byte (`1..=max_opcode`) + `Opcode::arity` operands.
 - **`ExpT`** — `i32 count` × `{ i32 function_atom, i32 arity, i32 label }` (label = **entry** label).
+- **`LocT`** — byte-for-byte the `ExpT` layout (`table::parse_locals` reuses the export-table reader;
+  the C does the same: `parse_locals_chunk` → `parse_export_table`). The JIT-only local-function
+  table, parsed into `Module.locals`; irrelevant to interpretation.
 - **`ImpT`** — `i32 count` × `{ i32 module_atom, i32 function_atom, i32 arity }`.
 - **`FunT`** (lambdas) — `i32 count` × `{ i32 function_atom, i32 arity, i32 label, i32 index,
   i32 num_free, i32 old_uniq }` (24-byte entries). Parsed into `FunDescriptor`s on `Module.funs`
@@ -204,8 +216,13 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
   `LineEntry { file, line }` (`beam_file.c:443-602`). `items[0]` is the undefined location `{0,0}`;
   `files[0]` is synthesized as `<module>.erl`.
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
-  `entries[0]` = "any"), then per entry `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
+  `entries[0]` = "any"), then per entry a `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
+  **Version 3** remaps each entry's two bytes `b0`/`b1` into the v4-convention word before the metadata
+  bits are tested (`beam_file.c:664-681`): `extra_bits = (b0 << 1) & 0xE0`, `upper = b0 & 0x0F`
+  (forced to `0x1F` when it is `0x0F`, so v3's 12-bit all-ones `0xFFF` maps to the v4 "any" `0x1FFF`),
+  `word = ((upper | extra_bits) << 8) | b1`. `Type::raw` therefore always holds the reconstructed
+  **v4-convention** word (`raw & 0x1FFF` = type union, `raw & 0xE000` = metadata flags) for both versions.
 - **`LitT`** — `u32 uncompressed_size` (`0` ⇒ the records follow verbatim; non-zero ⇒ the rest of the
   chunk is a zlib (RFC 1950) stream that inflates to exactly `uncompressed_size` bytes, which ARE the
   records), then `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes).
@@ -213,8 +230,9 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
   `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
   into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
-- **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Recs`** — data-only; captured raw (`StrT` → bytes,
-  `Attr`/`CInf` → `Option<Vec<u8>>`). No parsing.
+- **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Dbgi` / `Recs`** — data-only; `StrT`/`Attr`/`CInf`
+  are captured raw (`StrT` → bytes, `Attr`/`CInf` → `Option<Vec<u8>>`); `Meta`/`DbgB`/`Dbgi`/`Recs`
+  are recognized ids whose payloads are deliberately **not** parsed (debug info is tooling-only).
 ### Operand tags (`src/operand.rs` + `src/decode.rs`) — the authoritative table
 Each operand = one *tag/length* byte then optional payload (`beam_file.c:167-240`). Tag = `byte & 0x07`
 (3 bits ⇒ a file carries only tags 0–7; tags 8–14 are loader-internal and **never appear in a file**):
@@ -371,19 +389,13 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 
 ## Known Issues / Intentional M1 gaps
 - **Residual `Instr::Generic` opcodes.** The opcodes the loader deliberately does not model still lower
-  losslessly to `Instr::Generic`: the **OTP-29 native-record family** (`is_any_native_record/2`,
-  `is_native_record/4`, `get_record_elements/3`, `put_record/6`, `is_record_accessible/3`,
-  `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`), whose operands need
-  record-descriptor modelling the IR does not own yet, and the obsolete/transform-only `genop.tab`
-  entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
+  losslessly to `Instr::Generic`: the remaining **OTP-29 native-record family** (`is_native_record/4`,
+  `get_record_elements/3`, `put_record/6`, `is_record_accessible/3`, `get_record_field/5`,
+  `get_record_elements_id/4`, `update_record_id/7`), whose operands need record-descriptor modelling the
+  IR does not own yet (`is_any_native_record/2` **is** lowered, to `Instr::IsAnyNativeRecord`), and the
+  obsolete/transform-only `genop.tab` entries (e.g. `is_constant/2`, `make_fun2/1`) the compiler never emits.
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
-- **`LocT` (jit-only local table) is not parsed** (irrelevant to interpretation).
-- **`Type` chunk version 3 (OTP 27/28) is parsed with version-4 bit positions** — the OTP 27/28 layout
-  shifts the metadata bits (`beam_file.c:654-687`) and is not re-mapped, so such a chunk yields plausible
-  but possibly wrong bounds. Version 4 (OTP 29+) is correct.
-- **`ChunkId::DBGB` names `"DbgB"`**, but the real debug-info chunk id is `"Dbgi"` (present in the
-  fixture); `Dbgi` is therefore treated as an unknown chunk and skipped — the desired behavior.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
@@ -392,11 +404,11 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `src/chunk/mod.rs` → chunk-parse dispatch + the assembled raw chunk set
 - `src/chunk/atom.rs` → `AtU8` parser (UTF-8, index 0 = NIL)
 - `src/chunk/code.rs` → `Code` chunk header (format/max_opcode/label_count/function_count)
-- `src/chunk/table.rs` → `ExpT` / `ImpT` / `FunT` parsers (raw entries)
+- `src/chunk/table.rs` → `ExpT` / `LocT` / `ImpT` / `FunT` parsers (raw entries; `parse_locals` reuses the export reader)
 - `src/chunk/line.rs` → `Line` table parser
 - `src/chunk/types.rs` → `Type` chunk parser (`TypeTable`)
 - `src/chunk/literal.rs` → `LitT` framing parser (raw ETF payloads; compressed ⇒ documented error)
-- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Recs` raw capture
+- `src/chunk/misc.rs` → `StrT` / `CInf` / `Attr` / `Meta` / `Recs` raw capture (`DbgB`/`Dbgi` unparsed)
 - `src/opcode.rs` → `Opcode` enum + name/number/arity roster (derived from `../../lib/compiler/src/genop.tab`)
 - `src/operand.rs` → `Operand`/`Reg`/`TypeIndex`/`AllocKind`/`HeapNeed` types
 - `src/decode.rs` → instruction-stream → `Vec<RawInstr>` (opcode + operands + byte offset) + the tagged-varint operand decoder
@@ -412,6 +424,7 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - `tests/fixtures/README.md` → regeneration commands + the full wire summary
 - `tests/` → container/IR/widened-IR/negative/real-module integration tests
 - `tests/real_modules.rs` → broad real-OTP `.beam` LOAD sweep (every discovered module must load; loud skip when `erl`/OTP is absent) + the nested fun-literal MFA check over `maps`/`gen_server`
+- `tests/native_record.rs` → real-module structural check that `is_any_native_record` lowers to `Instr::IsAnyNativeRecord` (never `Instr::Generic`) across the stdlib ebin; loud skip when `erl`/OTP is absent
 - `tests/fixtures/bsalloc.erl` + `bsalloc.beam` → oracle fixture exercising the `bs_create_bin` `z,3` allocation operand
 - `../../erts/emulator/beam/beam_file.c` → container + operand decoding + function grouping (read-only)
 - `../../lib/compiler/src/genop.tab` → the authoritative opcode roster (read-only)

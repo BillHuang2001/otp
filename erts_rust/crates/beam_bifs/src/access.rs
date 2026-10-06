@@ -465,6 +465,39 @@ pub(crate) fn binary_bytes(term: Eterm) -> Result<Vec<u8>> {
     Ok(unsafe { core::slice::from_raw_parts(data, nbytes) }.to_vec())
 }
 
+/// Copies the bit data of **any** bitstring (heap or sub, byte-aligned or not) out
+/// of the term.
+///
+/// Returns `ceil(bit_len / 8)` bytes, packed **MSB-first**: bit `i` of the
+/// bitstring (`0 <= i < bit_len`, counted from the most-significant bit of the
+/// first byte) is bit `7 - (i % 8)` of byte `i / 8`, exactly the packing
+/// [`make_heap_bitstring`] writes and `erl_bits.h` addresses. The bit length is
+/// [`bitstring_bit_size`]. This is the read half for the `<<X:L>>` render form
+/// (`crate::print`), which splits the bytes into the whole leading bytes plus the
+/// trailing `L = bit_len % 8` bits.
+///
+/// Unlike [`binary_bytes`], this accepts a **non-byte-aligned** bitstring (and an
+/// off-heap `SUB_BITS` thing): it reads bit by bit through the frozen
+/// `beam_term::bit_at` accessor, so it never follows a `BinRef`/match-context
+/// indirection and never touches unvalidated memory.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] when `term` is not a bitstring.
+pub(crate) fn bitstring_bits(term: Eterm) -> Result<Vec<u8>> {
+    let bit_len = bitstring_bit_size(term)?;
+    let mut out = vec![0u8; bit_len.div_ceil(8)];
+    for i in 0..bit_len {
+        // SAFETY: [`bitstring_bit_size`] confirmed `term` is a live bitstring and
+        // `i < bit_len` keeps bit `i` within its size, so `bit_at` reads an
+        // initialised bit of the (heap- or sub-)bitstring's storage.
+        if unsafe { beam_term::bit_at(term, i) } {
+            out[i / 8] |= 1u8 << (7 - (i % 8));
+        }
+    }
+    Ok(out)
+}
+
 // ---------------------------------------------------------------------------
 // Flat maps (`beam_term::thing` owns the layout)
 //
@@ -575,6 +608,30 @@ mod tests {
         assert!(is_list(list));
         assert_eq!(car(list), make_small(1));
         assert_eq!(cdr(list), NIL);
+    }
+
+    #[test]
+    fn bitstring_bits_re_packs_any_bitstring_msb_first() {
+        let mut heap = heap();
+        // `<<1:1>>` — one bit, in the MSB of the single data byte.
+        let one = make_heap_bitstring(&mut heap, &[0b1000_0000], 1).expect("fits");
+        assert_eq!(bitstring_bits(one).unwrap(), vec![0b1000_0000]);
+        // `<<5:3,3:2>>` = `10111` ⇒ the canonical MSB-first re-packing.
+        let five = make_heap_bitstring(&mut heap, &[0b1011_1000], 5).expect("fits");
+        assert_eq!(bitstring_bits(five).unwrap(), vec![0b1011_1000]);
+        // `<<1:9>>` — a whole leading byte then the trailing bit.
+        let nine = make_heap_bitstring(&mut heap, &[0x00, 0b1000_0000], 9).expect("fits");
+        assert_eq!(bitstring_bits(nine).unwrap(), vec![0x00, 0b1000_0000]);
+        // A byte-aligned binary re-packs to exactly its own bytes.
+        let bin = make_heap_bitstring(&mut heap, &[0xAB, 0xCD], 16).expect("fits");
+        assert_eq!(bitstring_bits(bin).unwrap(), vec![0xAB, 0xCD]);
+        // An empty binary yields no bytes.
+        let empty = make_heap_bitstring(&mut heap, &[], 0).expect("fits");
+        assert_eq!(bitstring_bits(empty).unwrap(), Vec::<u8>::new());
+        // A non-bitstring is rejected.
+        for term in [make_small(7), NIL] {
+            assert!(matches!(bitstring_bits(term), Err(BeamError::BadArg)));
+        }
     }
 
     #[test]

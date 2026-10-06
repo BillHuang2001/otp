@@ -32,6 +32,12 @@ pub(crate) fn system_limit() -> BeamError {
     BeamError::SystemLimit
 }
 
+/// `function_clause` — a `lists.erl`-style no-clause failure
+/// (`error:function_clause`; the arguments live in the stacktrace, not the reason).
+pub(crate) fn function_clause() -> BeamError {
+    BeamError::Raise(Raise::error(ExitReason::atom("function_clause")))
+}
+
 /// `undef` — the `(module, function, arity)` is not a registered BIF.
 pub(crate) fn undefined_bif() -> BeamError {
     BeamError::Raise(Raise::error(ExitReason::atom("undef")))

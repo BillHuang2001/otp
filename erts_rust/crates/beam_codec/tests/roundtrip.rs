@@ -1560,20 +1560,51 @@ fn obsolete_tags_are_bad_arg_and_unimplemented_tags_are_unsupported() {
     assert_bad_arg(&[VERSION_MAGIC, 117]); // FUN_EXT
     assert_bad_arg(&[VERSION_MAGIC, 78]); // NEW_CACHE
 
-    // Recognized-but-not-yet-implemented tags report `unsupported`, never a wrong term.
-    for &tag in &[
-        67u8, // RECORD_EXT
-        121,  // LOCAL_EXT
-        68,   // DIST_HEADER
-    ] {
-        assert_unsupported(&[VERSION_MAGIC, tag]);
-    }
+    // `RECORD_EXT` is recognized but not yet implemented: `unsupported`, never a wrong
+    // term (blocked on a `beam_term` record layout).
+    assert_unsupported(&[VERSION_MAGIC, 67]); // RECORD_EXT
+
+    // `LOCAL_EXT` (121) is honoured now as the `term_to_binary/2 [local]` wrapper
+    // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4][term]`, so a bare tag byte is a
+    // *truncation* — `BadArg`, never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 121]); // LOCAL_EXT
+
+    // `DIST_HEADER` (68) is a distribution-transport wrapper, never a term: the C term
+    // decoder rejects it as malformed, so it is `BadArg`, never `unsupported`.
+    assert_bad_arg(&[VERSION_MAGIC, 68]); // DIST_HEADER
 
     // `NEW_FUN_EXT` (112) and `EXPORT_EXT` (113) are implemented now, so a bare tag
     // byte is a *truncation* — `BadArg` (the C also errors running off the end) —
     // never `unsupported`.
     assert_bad_arg(&[VERSION_MAGIC, 112]); // NEW_FUN_EXT
     assert_bad_arg(&[VERSION_MAGIC, 113]); // EXPORT_EXT
+}
+
+#[test]
+fn local_ext_wrapper_decodes_the_next_term_and_dist_header_is_bad_arg() {
+    // A hand-built `term_to_binary({ok,17}, [local])`:
+    // `[VERSION_MAGIC][LOCAL_EXT][node-hash:4 BE][<term>]`. The 4-byte node hash is
+    // opaque here (verification needs the node's `local_node_hash`) and is skipped.
+    let mut image = vec![VERSION_MAGIC, 121, 0x12, 0x34, 0x56, 0x78];
+    image.extend_from_slice(&[104, 2, 119, 2, 111, 107, 97, 17]); // {ok,17}
+
+    let mut h = heap(64);
+    let mut a = AtomTable::new();
+    let term = decode_term(&image, &mut h, &mut a).unwrap();
+    assert_eq!(tuple_arity(term).unwrap(), 2);
+    assert_eq!(
+        a.name(atom_val(tuple_element(term, 0).unwrap())),
+        Some("ok")
+    );
+    assert_eq!(tuple_element(term, 1).unwrap(), make_small(17));
+
+    // A `LOCAL_EXT` missing its 4-byte node hash is a truncation.
+    assert_bad_arg(&[VERSION_MAGIC, 121, 0, 0, 0]);
+
+    // `DIST_HEADER` is never a term: the framing is `beam_dist`'s, and the term
+    // decoder rejects the tag as malformed.
+    assert_bad_arg(&[VERSION_MAGIC, 68]);
+    assert_bad_arg(&[VERSION_MAGIC, 68, 0, 0, 0, 1, 131]);
 }
 
 #[test]
@@ -1714,8 +1745,9 @@ fn new_fun_field_violations_are_typed_errors() {
         assert_bad_arg(&img);
     }
 
-    // The creator term must be a pid: a reference, a port, an atom, a tuple and the
-    // unsupported `LOCAL_EXT` tag are all rejected (the C accepts only `is_pid`).
+    // The creator term must be a pid: a reference, a port, a `LOCAL_EXT` (`121`, a
+    // wrapper rather than a pid), an atom and a tuple are all rejected (the C accepts
+    // only `is_pid`, and this codec reads the creator pid straight off the wire).
     for bad in [
         vec![NEWER_REFERENCE_EXT], // 90
         vec![NEW_PORT_EXT],        // 89

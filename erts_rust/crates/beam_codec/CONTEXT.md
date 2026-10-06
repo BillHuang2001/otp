@@ -27,17 +27,19 @@ loops, the `term` forwarding layer (thin wrappers over `beam_term::thing` for
 float/bignum/flatmap/external identifiers and over `beam_term::fun` for funs) plus the local
 bitstring word-layout shim
 (`term/binary.rs`), and the `error` constructors. The full **producible** tag set round-trips
-(see "Tag coverage" below); the still-unsupported tags (records, `LOCAL`, the
-distribution header) return `error::unsupported`, and the obsolete `FUN` (`117`) / `NEW_CACHE`
-(`78`) tags return `BadArg`, rather than a wrong term.
+(see "Tag coverage" below); the only still-`unsupported` tag is `RECORD` (`67`), `LOCAL_EXT` (`121`)
+is honoured as a top-level wrapper, the encoder emits `ATOM_CACHE_REF` (`82`) through the
+`AtomCacheWriter` hook, and `DIST_HEADER` (`68`) plus the obsolete `FUN` (`117`) / `NEW_CACHE` (`78`)
+tags are rejected as `BadArg` — never a wrong term.
 `src/lib.rs` carries only the permanent lints: `#![deny(unsafe_code)]`,
 `#![warn(missing_docs)]` and the single `#[allow(unsafe_code)] mod term;`. In-module
 `#[cfg(test)]` tests cover the wire, term and codec layers; `tests/roundtrip.rs` holds
 the exhaustive encode→decode corpus plus the negative/truncation cases,
 `tests/ground_truth.rs` holds the byte-exact `term_to_binary` oracle vectors (each
-asserted in both directions), and `tests/interop.rs` is a live **differential harness**
-that shells out to the system `erl` and compares our codec against it in both directions
-(see "Test Strategy").
+asserted in both directions), `tests/interop.rs` is a live **differential harness**
+that shells out to the system `erl` and compares our codec against it in both directions,
+and `tests/atom_cache_writer.rs` / `tests/wire_roundtrip.rs` cover the outbound atom-cache
+seam and the end-to-end `LOCAL_EXT` + atom-cache round trips (see "Test Strategy").
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_codec::prelude::*`.
@@ -69,12 +71,18 @@ Crate lints: `#![deny(unsafe_code)]` with exactly **one** `#[allow(unsafe_code)]
   bounds-checked (`pos + 4 <= len`; an out-of-range `pos` or a `pos + 4` overflow ⇒ `BadArg`), never
   panics, and never short-writes.
 
-### `src/atom_cache.rs` — distribution atom cache (`erl_ext_dist.md` §Distribution Header)
-`pub struct AtomCache` — 8 segments × 256 = 2048 slots: `new()`, `set(index: u8, atom)`,
-`get(index: u8) -> Option<Atom>`, `clear()`. The *distribution header* itself (`68`/`78`) is
-`beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
-through it (an unset index ⇒ `BadArg`). The encoder never *emits* `82` (as `term_to_binary` does
-not); byte `78` (`NEW_CACHE`) is dead in this OTP and is rejected as `BadArg`.
+### `src/atom_cache.rs` — the atom-cache seam: read (`AtomCache`) + write (`AtomCacheWriter`)
+- `pub struct AtomCache` (**read**): 8 segments × 256 = 2048 slots — `new()`, `set(index: u8, atom)`,
+  `get(index: u8) -> Option<Atom>`, `clear()`. The *distribution header* itself (`68`/`78`) is
+  `beam_dist`'s; `beam_dist` fills this cache and the `Decoder` resolves `ATOM_CACHE_REF` (`82`)
+  through it (an unset index ⇒ `BadArg`).
+- `pub trait AtomCacheWriter` (**write**): `fn intern(&mut self, atom: Atom, atoms: &AtomTable) ->
+  Option<u8>`. Installed on an `Encoder` with `Encoder::with_atom_cache`; on `Some(index)` the encoder
+  writes `ATOM_CACHE_REF` (`82`) + `index` in place of the inline atom tag, and on `None` (or with no
+  cache) writes the atom inline — exactly C `enc_atom` (`external.c:2877`, `get_iix_acache_map` first;
+  `-1` ⇒ inline). `beam_dist::OutboundAtomCache` is the concrete implementor; the persistent 8×256
+  classification lives in `beam_dist`. The encoder never emits byte `78` (`NEW_CACHE`, dead in this
+  OTP — rejected as `BadArg`).
 
 ### `src/compress.rs` — zlib plumbing for `COMPRESSED` (`80`)
 Safe Rust (`flate2` zlib wrappers; no `unsafe`). Owns only the RFC-1950 stream — the wrapper bytes
@@ -92,15 +100,19 @@ is `decode`'s.
 ### `src/encode/` — the `Encoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Encoder<'a>`: `new(&'a AtomTable)` (emits `VERSION_MAGIC` first),
   `new_body(&'a AtomTable)` (no version byte — dist payload / ETS), `set_atom_encoding(AtomEncoding)`,
-  `encode(Eterm) -> Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
-  `finish_compressed(level: u8) -> Result<Vec<u8>>` (see below).
+  `with_atom_cache(&'a mut dyn AtomCacheWriter)` (installs the outbound atom cache — a cached atom is
+  then written as `ATOM_CACHE_REF` (`82`) + index; see `src/atom_cache.rs`), `encode(Eterm) ->
+  Result<()>`, `as_bytes() -> &[u8]`, `len()`, `is_empty()`, `finish() -> Vec<u8>`,
+  `finish_compressed(level: u8) -> Result<Vec<u8>>` and `finish_local(hash: u32) -> Vec<u8>`
+  (see below).
 - `pub enum AtomEncoding { Utf8, Latin1 }` — default `Utf8`: emit `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`
   (exactly what `term_to_binary` emits). `Latin1` emits `SMALL_ATOM_EXT`/`ATOM_EXT` for nodes that did
   not negotiate `DFLAG_UTF8_ATOMS` (used by `beam_dist`).
 - Convenience (additive; the existing signatures are unchanged): `pub fn encode_term(Eterm, &AtomTable)`
   (with `131`) and `pub fn encode_term_body(Eterm, &AtomTable)` (without) — both **uncompressed** — plus
   the compressed pair `pub fn encode_term_compressed(Eterm, &AtomTable, level: u8)` and
-  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`.
+  `pub fn encode_term_body_compressed(Eterm, &AtomTable, level: u8)`, plus the `LOCAL_EXT` wrapper
+  `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)`.
 - **Funs are encoded through the classification chain.** `encode` guards the fun family with
   `is_any_fun` (via `fun_kind_term`) **before** the boxed-family probes (a fun header carries a
   distinct subtag, so the classification is exact) and routes to the `src/encode/fun.rs` helpers
@@ -116,6 +128,14 @@ is `decode`'s.
   when explicitly requested — `encode_term` stays uncompressed. (C additionally reverts to the plain
   image when zlib cannot shrink the term, `external.c:2284-2293`; this crate always emits the wrapper
   when compression is requested.)
+- **`LOCAL_EXT` wrapper** — `Encoder::finish_local(hash)` / `encode_term_local(Eterm, &AtomTable,
+  hash: u32)` emit `[VERSION_MAGIC][LOCAL_EXT (121)][hash:4 BE][body]`, the `term_to_binary/2 [local]`
+  image (`external.c:3305-3315`, hash patched at `:4046-4105`). `body` is the term image with the
+  version byte stripped (same normalization as `finish_compressed`). The 4-byte `hash` is the
+  Bob-Jenkins block hash of the body seeded with the node's `local_node_hash` — **node identity**,
+  owned by `beam_rt`/`beam_dist` — so the *caller* supplies it; the codec neither computes nor
+  verifies it. (A local **fun** — `make_fun3` — still has no wire form:
+  `error::unsupported_local_fun`, unchanged.)
 
 ### `src/decode/` — the `Decoder` seam (`mod.rs` + `fun.rs`)
 - `pub struct Decoder<'a>`: `new(&'a [u8]) -> Result<Decoder<'a>>` (requires and consumes
@@ -137,6 +157,15 @@ is `decode`'s.
   body is an owned buffer a borrowed `Decoder<'a>` cannot hold. `Decoder::new`/`new_body` are otherwise
   unchanged; a `Tag::Compressed` reached inside a term (nested, or as a bare tag below the 6-byte
   minimum) is malformed ⇒ `BadArg`, matching the C (`external.c:1759`), never `unsupported`.
+- **`LOCAL_EXT` (`121`) consumes its node hash and continues.** The `Tag::Local` arm reads the 4-byte
+  node hash and returns the *following* term (`external.c:5250-5254`: `ep += 4; goto
+  continue_this_obj`), so `[VERSION_MAGIC][121][hash:4][term]` decodes to `term` via `Decoder::new`
+  and the same holds at any nesting. A short read (missing hash or term) is `BadArg`. The hash is NOT
+  verified here — the C verifies it only in the `decoded_size` sizing pass (`external.c:6437-6512`)
+  against a hash seeded with the node's `local_node_hash` (`beam_rt`/`beam_dist`'s).
+- **`DIST_HEADER` (`68`) is malformed, not a term.** The C term decoder has no `case DIST_HEADER`
+  (`goto error`, `external.c:6464`), so a `68` byte is `BeamError::BadArg`; the `'D'`/`'E'`/`'F'`
+  framing is wholly `beam_dist`'s (`../beam_dist/src/dist_header.rs`) and is not duplicated here.
 
 ### `src/term/` — materialization layer (the ONLY `unsafe` subtree; see Design Decisions)
 `src/term/mod.rs` + `src/term/fun.rs` + `src/term/binary.rs`. Term inspection and boxed sub-term
@@ -193,7 +222,7 @@ allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapp
 `beam_term::thing` directly; this module keeps the codec-internal convenience seam and the guard
 constants only.
 
-## Tag coverage (M1)
+## Tag coverage (current)
 **Encode + decode + byte-exact round-trip** (the full producible set):
 `97, 98, 110, 111` (integers; a big that fits a 60-bit small decodes to a small, as in C),
 `99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`**, matching `term_to_binary`),
@@ -207,15 +236,20 @@ V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are
 `term/binary.rs`; encode emits `109` for a byte-aligned bitstring and `77` otherwise),
 `116` (maps of **any** pair count — every map is stored as a flatmap; the interior
 flatmap/hashmap switchover is an *open* layout this crate deliberately collapses, see
-§Term-layout ownership), `82` (atom cache refs, decode only), `80 COMPRESSED` (the top-level zlib
+§Term-layout ownership), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
+whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
-by default), `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
+by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
+4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
+`112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
 **Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
-result):** `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node identity), `68`
-(distribution header — `beam_dist`'s); plus any atom name not representable in the emitted encoding.
-**Obsolete tags rejected as `BadArg`** (as the C does): `117 FUN` (removed in OTP 23,
-`external.c:6399-6404`) and `78 NEW_CACHE` (dead `#if 0`, `external.h:77-81`).
+result):** `67 RECORD` (native record — blocked on a `beam_term` record layout, see §Known Issues);
+plus any atom name not representable in the emitted encoding.
+**Tags rejected as malformed `BadArg`** (exactly as the C term decoder does): `68 DIST_HEADER` (a
+distribution-transport wrapper, never a term — `goto error`, `external.c:6464`; the `'D'` framing is
+`beam_dist`'s), `117 FUN` (removed in OTP 23, `external.c:6399-6404`) and `78 NEW_CACHE` (dead
+`#if 0`, `external.h:77-81`).
 
 ### Fun encodings (`EXPORT_EXT` `113` / `NEW_FUN_EXT` `112`)
 Both fun tags are handled **inside the shared term walker** (`Decoder::decode`), so a fun nested in
@@ -271,6 +305,12 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 < 256, `LARGE_BIG_EXT` otherwise, and the wire bound is `BIG_ARITY_MAX * sizeof(ErtsDigit)` bytes
 (`external.c:6146`).
 - `VERSION_MAGIC` is **not** part of a distribution payload that follows a distribution header.
+- The `LOCAL_EXT` (`121`) 4-byte field is a **node hash the caller supplies**, not computed or
+  verified here: `Encoder::finish_local(hash)`/`encode_term_local(term, atoms, hash)` take it as an
+  argument and `decode` consumes it without checking (matching the C `dec_term`, `external.c:5250`).
+  The hash (`local_node_hash`) and any verification belong to the node-identity owner
+  (`beam_rt`/`beam_dist`); the C verifies it only in the sizing pass (`decoded_size`,
+  `external.c:6437-6512`). No node-identity type is in this crate's scope.
 
 ## Constraints
 - **Errors: `beam_common::{Result, BeamError}` only** — no crate-local error enum.
@@ -447,10 +487,18 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
   order is kept exactly.
-- Records (`67`), `LOCAL_EXT` (`121`) and the distribution header (`68`) remain unsupported: records
-  are a legacy native term (ordinary Erlang records encode as tuples), `LOCAL_EXT` needs local-node
-  identity, and the distribution header is `beam_dist`'s. The obsolete `FUN` (`117`) and `NEW_CACHE`
-  (`78`) tags are rejected as `BadArg`.
+- **Records (`67`) remain `unsupported` — blocked on a term-layer record layout.** The C decoder builds
+  a native record term (`external.c:5257-5381`) from `ErtsRecordInstance`/`ErtsRecordDefinition`
+  (`../../erts/emulator/beam/erl_record.h:43-95`, incl. `RECORD_INST_SIZE`/`RECORD_DEF_SIZE`); the
+  codec must not invent that interior, so implementing `67` requires a record-instance/definition
+  layout exposed by **`beam_term`** (the term-layout owner — `../beam_term/CONTEXT.md`). Ordinary
+  Erlang records encode as tuples and are unaffected. The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`)
+  tags are rejected as `BadArg`.
+- **`LOCAL_EXT` (`121`) decode does not verify the node hash.** The C verifies it only in the
+  `decoded_size` sizing pass (`external.c:6437-6512`) against a Bob-Jenkins hash seeded with the node's
+  `local_node_hash` (hostname/pid/time derived) — node identity, `beam_rt`/`beam_dist`'s. The codec
+  decodes the wrapper without verification (matching C `dec_term`, which also skips it) and takes the
+  4-byte hash from the caller on encode.
 - **Funs are supported except for encoding a `FunKind::Local` term.** `NEW_FUN_EXT`/`EXPORT_EXT`
   decode and encode byte-exactly; a local (`make_fun3`) fun has no faithful wire image (no module /
   16-byte `uniq` / creator pid in its inlined descriptor) so `encode` returns
@@ -486,15 +534,19 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `src/reader.rs` → `Reader<'a>`, the bounds-checked BE cursor (safe)
 - `src/writer.rs` → `Writer`, the growable byte sink (safe); crate-internal `patch_u32be` (the
   `NEW_FUN_EXT` size-field patch)
-- `src/atom_cache.rs` → `AtomCache` (2048-slot distribution atom cache)
+- `src/atom_cache.rs` → `AtomCache` (read, 2048-slot distribution atom cache) + the `AtomCacheWriter`
+  hook trait (`intern`) `beam_dist` implements for outbound caching
 - `src/compress.rs` → zlib plumbing for `COMPRESSED` (`compress`/`decompress`, level bounds, cap)
 - `src/encode/mod.rs` → `Encoder`, `AtomEncoding`, `encode_term`/`encode_term_body`,
-  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`; the private
+  `encode_term_compressed`/`encode_term_body_compressed`, `Encoder::finish_compressed`,
+  `Encoder::with_atom_cache` (attaches an `AtomCacheWriter` ⇒ cached atoms emit `ATOM_CACHE_REF`),
+  `Encoder::finish_local`/`encode_term_local` (the `LOCAL_EXT` wrapper); the private
   fun-classification chain inside `Encoder::encode`
 - `src/encode/fun.rs` → the fun encoders (`encode_fun`/`encode_fun_external`/`encode_fun_imported`)
   as a second `impl<'a> Encoder<'a>` block (`EXPORT_EXT`/`NEW_FUN_EXT` — see §Fun encodings)
 - `src/decode/mod.rs` → `Decoder`, `decode_term` (unwraps a top-level `COMPRESSED` image),
-  `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`)
+  `decompress_wrapper`/`is_compressed_image`; the `match tag` arms (incl. `Tag::Export`/`Tag::NewFun`,
+  the `Tag::Local` `LOCAL_EXT` wrapper, and `Tag::DistHeader` ⇒ `BadArg`)
 - `src/decode/fun.rs` → the fun decode helpers (`decode_export`, `decode_new_fun`,
   `decode_small_u32`, `decode_creator_pid`) as a second `impl<'a> Decoder<'a>` block
 - `src/error.rs` → error constructors (`BadArg`/`SystemLimit` mapping), `unsupported`,
@@ -513,6 +565,10 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   incl. the `COMPRESSED` seed
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
   incl. the `COMPRESSED` wrapper round-trips and negatives
+- `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
+  streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
+- `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
+  encode↔decode, atom-cache encode↔decode, no-cache control)
 - `tests/interop.rs` → **live differential harness** vs. the system `erl` oracle (two batched
   spawns: oracle→us structural round-trip, us→oracle `binary_to_term` agreement) + the pure
   legacy-`FLOAT_EXT` decode vector and malformed-input typed-error cases

@@ -51,12 +51,14 @@ impl BifRegistry {
         crate::convert::register(&mut reg);
         crate::lists::register(&mut reg);
         crate::maps::register(&mut reg);
+        crate::math::register(&mut reg);
         crate::binary::register(&mut reg);
         crate::binconv::register(&mut reg);
         crate::unicode::register(&mut reg);
         crate::time::register(&mut reg);
         crate::proc::register(&mut reg);
         crate::reason::register(&mut reg);
+        crate::string::register(&mut reg);
         crate::io::register(&mut reg);
         crate::ets::register(&mut reg);
         crate::port::register(&mut reg);
