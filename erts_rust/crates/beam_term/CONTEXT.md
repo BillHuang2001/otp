@@ -527,7 +527,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/number.rs` → safe numeric → `f64`: `big_to_f64` (faithful `big_to_double`) + `number_as_f64`
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
-- `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
+- `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`, returned by `make_hash`/`make_hash2` for a `make_fun3` `Local` fun) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs` and `map_hash.rs`)
 
