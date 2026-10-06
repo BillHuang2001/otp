@@ -379,10 +379,11 @@ mod tests {
         assert_eq!(atom_val(term), jit);
         assert_eq!(atoms.name(atom_val(term)), Some("jit"));
 
-        // Without the seed the atom cannot be resolved: an absent atom is reported, not
-        // silently replaced by some other atom.
+        // An atom the table does not hold cannot be resolved: an absent atom is reported,
+        // not silently replaced by some other atom. `seed_core_atoms` now interns the
+        // whole `INFO_ATOMS` vocabulary (see `crate::boot`), so a genuinely empty table is
+        // what exercises the absent-atom path.
         let mut unseeded = AtomTable::new();
-        seed_core_atoms(&mut unseeded);
         assert!(matches!(
             InfoValue::Atom("jit").to_eterm(&mut heap, &unseeded),
             Err(BeamError::TermNotFound)

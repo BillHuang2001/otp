@@ -49,7 +49,11 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
     "zlib",
 ];
 
-/// The atoms the runtime's global atom table is seeded with at construction.
+/// The core atoms the runtime's global atom table is seeded with at construction.
+///
+/// This is the *core* subset of the seed: [`seed_core_atoms`] also interns the whole
+/// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
+/// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
 ///
 /// Three groups:
 ///
@@ -141,12 +145,21 @@ impl PreloadedModules {
     }
 }
 
-/// Interns [`CORE_ATOMS`] (and the signal vocabulary of `beam_process`).
+/// Interns [`CORE_ATOMS`], the whole `system_info/1` atom vocabulary
+/// ([`crate::info::INFO_ATOMS`]) and the signal vocabulary of `beam_process`.
 ///
 /// Idempotent — [`AtomTable::intern`] returns the existing index for a name already
 /// present — so it is safe to call on a table that already has entries.
 pub fn seed_core_atoms(atoms: &mut AtomTable) {
     for name in CORE_ATOMS {
+        atoms.intern(name);
+    }
+    // The introspection surface ([`crate::info`]) materializes its atom-valued keys
+    // through this table, so every name it can emit must be present. `INFO_ATOMS` is the
+    // single source of truth for that vocabulary (the platform/boolean group overlaps
+    // `CORE_ATOMS`, and interning is idempotent), so derive the seed from it rather than
+    // repeating the names here.
+    for name in crate::info::INFO_ATOMS {
         atoms.intern(name);
     }
     // The signal machinery interns its own names through this helper; doing it here
@@ -215,6 +228,24 @@ mod tests {
         }
         // The runtime-native `code:*` floor's answer atoms.
         for name in ["preloaded", "non_existing", "bad_name"] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+    }
+
+    #[test]
+    fn seed_core_atoms_interns_the_whole_info_vocabulary() {
+        // The introspection surface (`crate::info`) resolves an `InfoValue::Atom` through
+        // this table and reports `TermNotFound` for a name that is absent, so the seed
+        // must contain every name `system_info/1` can emit. `INFO_ATOMS` is that list and
+        // the seed is derived from it, so deriving and asserting cannot drift apart; the
+        // flavor atom (`jit` for the JIT emulator, `emu` for the interpreter) is the one
+        // that used to fall through the seed.
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        for name in crate::info::INFO_ATOMS {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
+        }
+        for name in ["jit", "emu", "true", "false", "unix", "linux", "win32", "nt"] {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
     }
