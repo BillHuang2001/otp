@@ -260,9 +260,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `{badrecord,T}`, `{badfield,{{M,N},K}}`, and any **non-atom** `erlang:error/1,2`/`exit/1`/`throw/1`/
   `nif_error/1,2` argument (an atom reason stays `ExitReason::Atom` with no slot). The one remaining
   degradation is a tag atom that cannot be interned (no `AtomInterner` hook) ⇒ plain `badarg`.
-  **Consequences for sibling nodes:** `beam_term/CONTEXT.md` §Handoffs' "a structured reason carries no
-  term" entry can be pruned, and `beam_rt::runner::exit_reason` can replace its `<structured reason>`
-  placeholder by reading the slot.
+  **Handoff:** `beam_rt::runner::exit_reason` can replace its `<structured reason>` placeholder by
+  reading the live-reason slot.
 - **The OTP-29 native-record opcode family is fully modelled and executed.** `beam_loader` lowers all eight
   members (`is_any_native_record/2`, `is_native_record/4`, `get_record_elements/3`, `put_record/6`,
   `is_record_accessible/3`, `get_record_field/5`, `get_record_elements_id/4`, `update_record_id/7`) to
