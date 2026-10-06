@@ -89,8 +89,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `reductions()`, `is_ready_at(Instant) -> bool`.
 - `pub struct PortTaskQueue` — one pending task per kind (dedupe), ordered by kind priority then FIFO
   `seq`, with deadline gating for timeouts: `new()`, `enqueue(kind) -> bool`, `enqueue_timeout(deadline) -> bool`,
-  `len()`, `is_empty()`, `contains(kind)`, `next() -> Option<PortTaskKind>`, `pop_next(now) -> Option<PortTask>`,
-  `remove(kind) -> bool`, `clear()`.
+  `arm_timeout(deadline)` (re-points/replaces a pending `TIMEOUT` — distinct from the dedupe-by-kind
+  `enqueue_timeout`, which cannot re-point), `len()`, `is_empty()`, `contains(kind)`,
+  `next() -> Option<PortTaskKind>`, `pop_next(now) -> Option<PortTask>`, `remove(kind) -> bool`, `clear()`.
 - `pub struct Readiness { readable, writable, error, read_closed, write_closed }` (`Copy + Default + Eq + Debug`),
   with `read_ready()` (readable ‖ read_closed ‖ error), `write_ready()` (writable ‖ write_closed), `is_idle()`,
   and `impl From<Ready> for Readiness`.
