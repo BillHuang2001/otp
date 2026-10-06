@@ -279,8 +279,19 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
 - Cross-checks against the real system ERTS belong to `../tools/differential/`, not here.
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
-- **GenImmix / a mark-region mature generation** — measurement-gated per Part II §D; explicitly out of
-  scope. The `mature` generation is a plain copying space.
+- **GenImmix is implementable and integrated, not yet *justified*.** Per Part II §D/§H it stays
+  measurement-gated and off the default path (`MatureKind::Copying` is the default, so today's behaviour
+  is unchanged); the current `Immix` mature generation is the mark-region space described above.
+- **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
+  every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
+  but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
+  rather than resizing the region (a `beam_rt`/policy decision, like the copying `Collector`'s fresh-space
+  sizing).
+- **Promotion atomicity is guaranteed only on the *total* line budget.** A minor promotes only when
+  `mature.free_lines() >= needed` (the exact line count of the live nursery graph), and a major checks the
+  same after reclaiming. Line-granular allocation means an object needs a *contiguous* run of its lines,
+  so a pathologically fragmented mature space could still fail a per-object reservation mid-promotion —
+  the same fragmentation trade-off the space documents (`immix/mod.rs`, "line-granular allocation").
 - **The C `high_water` single-block layout, per-object tenuring (`GEN_GCS`/`MAX_GEN_GCS`) and the
   `F_NEED_FULLSWEEP` flag protocol** — replaced by the simpler two-space young/mature scheme above.
 - **Dirty-scheduler escape for long collections** (`ERTS_POTENTIALLY_LONG_GC_HSIZE`, `erl_gc.h:26`).
