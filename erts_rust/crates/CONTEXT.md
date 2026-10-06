@@ -204,8 +204,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
   erts_rust/Cargo.toml --workspace` is warning-free. `cargo test --manifest-path
-  erts_rust/Cargo.toml --workspace` is green in every crate here; the only whole-workspace failure is
-  a stale assertion in the sibling `../tools/differential` (see Known Structural Debt).
+  erts_rust/Cargo.toml --workspace --no-fail-fast` is fully green (3112 tests passing, 0 failures).
 - **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
   `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
   installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
@@ -220,9 +219,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   over the new `Mailbox` seam (the compiled `TestKind` machinery still does the matching); `beam_process`
   scheduling wakes a receiver blocked in `receive` on send; `beam_rt` runs a real `.beam` fixture with
   `send`/`receive` through the real runtime glue and a single-threaded scheduler (`self() ! X, receive
-  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). The **differential gate is
-  197/197 agree** (the last `unsupported`, `driver/port_backed_by_spawn_driver`, is closed by the
-  installed `PortHook`, which spawns through a real spawn driver).
+  Y -> Y end` → `X`; a blocked receiver resumed by a sender → `42`). Runtime port I/O is
+  polling-backed: `beam_rt` keeps the child's stdout, registers its fd with `beam_io`'s poller, reads it
+  and delivers `{Port,{data,Data}}` to the owning process (driven from the `-eval` `receive … after T`
+  path); `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
+  `total=285 agree=281 mismatch=0 unsupported=4`** — the 4 `unsupported` are the `wire/*` ETF-encode
+  cases (`beam_codec`-owned), and no case disagrees.
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
   bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
   `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
@@ -240,11 +242,6 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   by `beam_gc`.
 
 ## Known Structural Debt (candidates for the next pass)
-- **Sibling `../tools/differential` has a stale assertion** (outside this node): its
-  `tests/cli.rs::the_suite_reports_module_agreement_and_expression_capability_gaps` still requires the
-  expression corpus to have a capability gap (`unsupported + skipped >= 1`). Now that the gate is
-  fully agreeing (197/197), that assertion is the single whole-workspace test failure. Relax/drop it in
-  the `../tools/` node (sibling — escalate).
 - `beam_message::OffHeapTable` is an indexed read view needed by the copy boundary, while
   `beam_gc::OffHeap` (MSO + refc binaries) is push-only; the view should be absorbed into `beam_gc`
   (Prevent-Duplication).

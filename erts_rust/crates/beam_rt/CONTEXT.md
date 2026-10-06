@@ -31,7 +31,7 @@ Re-exported at the crate root and via `beam_rt::prelude::*`.
 
 ### `runtime.rs` — the façade
 ```rust
-pub struct Runtime { /* config, registry, atoms, processes, preloaded, heap, info_heap, tables, ports, self_pid, modules, booted */ }
+pub struct Runtime { /* config, registry, code_server, processes, mailboxes, preloaded, bif_heaps, scheduler, runner_state, arena, info_heap, eval_heap, tables, ports, self_pid, booted, halt, refs, references, eval_closures */ }
 
 impl Runtime {
     pub fn new(config: RuntimeConfig) -> Result<Runtime>;
@@ -46,6 +46,12 @@ impl Runtime {
     pub fn module(&self, name: &str) -> Option<&Module>;
     /// The preloaded-module registry skeleton (A.7).
     pub fn preloaded(&self) -> &PreloadedModules;
+    /// The runtime's **one** reference id space — the source of every `erlang:make_ref/0`
+    /// reference and every `erlang:monitor/2` reference. Kept separate from
+    /// `ProcessTable`'s own allocator so the two can never collide; a term minted here is
+    /// recorded in `Runtime::references` (the reference→monitor map `erlang:demonitor/1`
+    /// reads).
+    pub fn refs_mut(&mut self) -> &mut RefAllocator;
 
     /// THE SLICE (stdout): load `path` and run `function/arity`; returns `x(0)`.
     pub fn run_function(&mut self, path: impl AsRef<Path>, function: &str, arity: u32,
@@ -140,14 +146,14 @@ impl<'a> RuntimeContext<'a> {
     pub fn pid(&self) -> ProcessId;
 }
 impl ExecutionContext for RuntimeContext<'_> {
-    // call_bif  → RuntimeContext::try_native (halt/display/io:put_chars/apply/system_info/
-    //             init:get_argument,init:get_arguments,init:get_plain_arguments/erlang:display/
-    //             os:cmd/code:get_path,code:all_loaded,code:which,code:lib_dir)
+    // call_bif  → RuntimeContext::try_native (the runtime-native BIF floor — see the
+    //             `src/native/` section below for the full entry list)
     //             → `BifRegistry::contains` → `BifRegistry::call` (a `BifContext` seeded via
     //             `with_fun_caller(FunBridge)` and `with_port_hook(RuntimePorts)` over {pooled heap,
     //             code_server atom handle, self_pid, the tables (only for a call that cannot apply a
     //             fun argument), output, PendingInterner}); else if
-    //             module == "erlang" → `error::unknown_bif`; else seed the system code path
+    //             module == "erlang" → `error::is_known_unimplemented_bif` ? `unsupported:` :
+    //             `error::unknown_bif`; else seed the system code path
     //             (`Runtime::find_module_file`) then `code_server.load(module)` → `run_export`.
     // apply_fun → an `-eval` closure (`terms::fun_uniq == eval::EVAL_FUN_UNIQ`) goes to
     //             `eval::apply_eval_closure`; otherwise resolve the fun's module
@@ -171,27 +177,50 @@ DAG acyclic (`../CONTEXT.md`).
 
 ### `port.rs` — the `PortHook` provider (contract A.4)
 ```rust
-pub const PORT_INFO_ATOMS: &[&str];                                       // the `port_info/1` item vocabulary (seeded at boot)
-pub enum PortName { Spawn(String), SpawnExecutable(PathBuf), Fd(u32) }    // the accepted Name forms
-pub enum StreamType { List, Binary }                                      // `list` (default) / `binary`
-pub struct LivePort { /* child/reaped status, name, os_pid, connected, stream, links/monitors (empty) */ }
+pub const PORT_INFO_ATOMS: &[&str];                        // the `port_info/1` item vocabulary (seeded at boot)
+pub enum PortName { Spawn, SpawnExecutable, Fd }           // the accepted Name forms / backing driver
+pub enum StreamType { List, Binary }                       // `list` (default) / `binary`
+pub struct LivePort { /* driver name, command, child, stdout: Option<ChildStdout>, os_pid,
+                         connected, stream, links/monitors (empty) */ }
 pub struct PortRegistry { /* beam_process::PortTable + id → LivePort map + a per-registry scratch Heap */ }
 impl PortRegistry {
     pub fn new() -> Result<PortRegistry>;
     pub fn alloc(&mut self) -> Result<PortId>;
     pub fn release(&mut self, id: PortId);
     pub fn contains(&self, id: PortId) -> bool;
+    pub fn len(&self) -> usize;                            // the live-port count (`system_info(port_count)`)
+    pub fn is_empty(&self) -> bool;
+    pub fn ids(&self) -> Vec<PortId>;                      // the LIVE ports' ids, port-number order (`erlang:ports/0`)
     pub fn insert(&mut self, id: PortId, live: LivePort);
     pub fn remove(&mut self, id: PortId) -> Option<LivePort>;
 }
 pub struct RuntimePorts { /* Rc<RefCell<PortRegistry>> + Rc<AtomTable> handle */ }
 impl RuntimePorts { pub fn new(registry: Rc<RefCell<PortRegistry>>, atoms: Rc<AtomTable>) -> RuntimePorts; }
 // impl beam_bifs::PortHook for RuntimePorts — open_port/2, port_close/1, port_info/1,2
+
+impl RuntimeContext<'_> {
+    /// The port poller: registers every live port's stdout fd with a `beam_io::Poller`, waits up
+    /// to `timeout` for readiness, does ONE non-blocking `Read::read` per readable/EOF/error event,
+    /// and returns the `{PortId::to_eterm(), {data, Data}}` messages it produced (an Erlang binary
+    /// for a `binary` stream, else a char list). `Ok(vec![])` once the timeout elapses with no
+    /// readiness; EOF drops the stream handle so a later poll cannot spin on the closed fd.
+    pub(crate) fn poll_port_messages(&mut self, timeout: Duration) -> Result<Vec<Eterm>>;
+}
 ```
 `Runtime` owns the registry as an `Rc<RefCell<PortRegistry>>` (the same cheap-clone pattern as the ETS
 tables) and `call_registered` builds a `RuntimePorts` from that handle + the shared atom handle, so
 `erlang:open_port/2`/`port_close/1`/`port_info/1,2` reach a real OS process **without** a
-`&mut Runtime` borrow. The diff-harness `driver/port_backed_by_spawn_driver` case AGREEs.
+`&mut Runtime` borrow. The diff-harness `driver/port_backed_by_spawn_driver` and
+`driver/spawn_driver_port_stream_read` cases AGREE.
+
+The **port stream read** is closed end-to-end: a `spawn`/`spawn_executable` port keeps the child's
+`stdout` handle (`LivePort.stdout`), `RuntimeContext::poll_port_messages` reads it through a
+`beam_io::Poller`, and `src/eval/mod.rs`'s `receive … after T` polls for up to `T` ms and matches the
+produced messages against the receive clauses (falling back to the `after` body). The message's `data`
+atom is interned in the runtime's **one** shared table and the term is built on the runtime's
+pointer-stable arena, so it is nameable by the printer and matchable by a `receive` clause. A
+`binary`-stream read wider than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes is the honest typed *unsupported*
+gap (there is no off-heap ref-counted binary build path here yet).
 
 ### `config.rs` — parsed configuration
 ```rust
@@ -224,7 +253,7 @@ impl PreloadedModules { pub fn standard() -> PreloadedModules; pub fn is_preload
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_; pub fn len(&self) -> usize; pub fn is_empty(&self) -> bool; }
 
 // info.rs (A.8)
-pub const SUPPORTED_KEYS: &[&str];                              // the 12 answered keys
+pub const SUPPORTED_KEYS: &[&str];                              // the 13 answered keys
 pub const INFO_ATOMS: &[&str];                                  // the atom vocabulary the surface needs seeded
 pub enum InfoValue { Int(i64), Str(String), Atom(&'static str), Bool(bool), Tuple(&'static str, &'static str) }
 impl InfoValue { pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm>; }
@@ -235,19 +264,78 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
                       self_pid: ProcessId, term: Eterm) -> Result<String>;
 ```
 
-## `code:` on the receive path — the native floor, not a live `code_server`
-`code:get_path/0`, `code:all_loaded/0`, `code:which/1` and `code:lib_dir/0,1` — and
-`init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0` — are answered **natively**
-by `src/native.rs`, **not** by a running `code_server` process. `beam_rt` deliberately ships **no**
-live `code_server.beam`: OTP's real one needs `erlang:monitor/2`+`demonitor`, `register`/`whereis`/
-`process_flag(trap_exit)`, `spawn_link`, a working `send`, a host **timer** for `after T`,
-`make_ref/0`, named-ETS resolution, `persistent_term:*`, `filename:*`, `erl_prim_loader:*` and
-`erlang:pre_loaded/0` — all outside this crate — and its *state* already lives in `CodeServer`. The
+## The runtime-native BIF floor (`src/native/`)
+The floor is the set of BIFs that are really *runtime* operations — they read or write the runtime's
+own state (its process/port tables, code server, atom table, application view, parsed command line)
+and are therefore served **before** the `beam_bifs` registry, from `RuntimeContext::try_native`. It is
+a **directory module**, split by responsibility:
+
+* `src/native.rs` — the module docs, `try_native` itself (the `(module, function, arity)` dispatch
+  table) and the shared helpers (`string_list`/`atom_name`/`atom`/`charlist`/`render`/`write_output`/
+  `chars_to_string`), plus the `erlang`-core entries `halt/0,1`, `display/1`, `io:put_chars/1,2`,
+  `erlang:apply/2,3`, `erlang:system_info/1` and `os:cmd/1`.
+* `src/native/init.rs` — `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`,
+  `init:get_status/0` (→ `{starting, started}`, the terminal boot state).
+* `src/native/code.rs` — `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`
+  (→ `{file, Path}` / atom `preloaded` / atom `false`), `code:is_sticky/1` (boolean) and `code:is_sticky/2`
+  (an `error:undef` raise — the release does not have the `/2`), `code:ensure_loaded/1`
+  (→ `{module, Mod}` / `{error, nofile}`), `code:lib_dir/0,1`, `code:root_dir/0` (the parent of
+  `lib_dir/0`, i.e. the installation root).
+* `src/native/process.rs` — the `erlang` process/registry/reference entries: `make_ref/0`, the monitor
+  pair `monitor/2` + `demonitor/1,2` (real, over `beam_process`'s monitor machinery and
+  [`Runtime::refs_mut`](crate::Runtime::refs_mut)), `ports/0` (the live ports, via
+  `PortRegistry::ids`), `processes/0`, `pre_loaded/0` (the oracle's **exact** list *and* order, see
+  `src/boot.rs`), `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`.
+  `whereis(init)` answers the runtime's own root process — `Runtime::new` registers the name `init` on
+  that pid, the same pid `group_leader/0` reports (the oracle answers `<0.0.0>`).
+* `src/native/application.rs` — `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`,
+  `loaded_applications/0`, `which_applications/0`, answered from a minimal native app view (the `.app`
+  files resolved through the [`CodeServer`](crate::CodeServer) and a recursive-descent parser for the
+  `.app` term text). **Honest deviation:** `application:get_all_env(kernel)` reports the `.app` file's
+  **declared** env only — the seven pairs `kernel.app` lists (oracle: nine; the two extra are `logger`
+  and `connect_all`, injected by kernel's own application start at run time, and are *not* fabricated
+  here). The declared pairs agree key-for-key; only their order differs (the oracle's is its
+  application controller's internal storage order). `erts` is deliberately not reported loaded.
+* `src/native/test_support.rs` — the shared test fixtures for the floor's unit tests.
+
+`beam_bifs` owns the *registry* surface (`bif.tab`: arithmetic, comparison, type tests, term ops,
+`lists`/`maps`/`binary`, `io:format`, `ets`, …); a native entry must never duplicate one. A call the
+floor does not claim returns `None` and falls through to the registry unchanged (use
+`RuntimeContext::try_native`'s dispatch table, not the module list, as the source of truth for what is
+native).
+
+### `code:` is the native floor, not a live `code_server`
+`code:*`, `init:*` and `application:*` are **preloaded-module surface** (contract A.7): the oracle
+serves them from `init.beam`/`code.beam`/`application.beam`, but those modules are written against the
+process/message machinery Milestone-1 does not run (for `application` that is the
+`application_controller`/`application_master` process pair plus a group leader). `beam_rt` deliberately
+ships **no** live `code_server.beam`: OTP's real one needs `erlang:monitor/2`+`demonitor`,
+`register`/`whereis`/`process_flag(trap_exit)`, `spawn_link`, a working `send`, a host **timer** for
+`after T`, `make_ref/0`, named-ETS resolution, `persistent_term:*`, `filename:*`, `erl_prim_loader:*`
+and `erlang:pre_loaded/0` — all outside this crate — and its *state* already lives in `CodeServer`. The
 three differential `boot/*` cases that touch `code:*` are **shape-only** (`is_list`/`is_atom`) and are
 already satisfied. The wire a future live server must reproduce is the `{code_call, From, Req}` →
 `{code_server, Reply}` message pair (the OTP `code_server:call/1` protocol; `beam_engine` currently
-rejects `code_server:call/1`'s `recv_marker_*`/`send` by opcode). **`src/native.rs`'s `code:*`
+rejects `code_server:call/1`'s `recv_marker_*`/`send` by opcode). **`src/native/code.rs`'s `code:*`
 behaviour must not change** — it keeps the currently-agreeing cases green.
+
+### `erlang`-namespace fallback and the known-unimplemented list
+`RuntimeContext::call_bif` consults the floor, then the `beam_bifs` registry, and only then falls back
+to a diagnostic for the `erlang` namespace. That fallback first checks
+`error::is_known_unimplemented_bif(&registry, function, arity)`: a **known** OTP `erlang` BIF this
+runtime has not implemented raises the capability-gap `unsupported: erlang:X/Y …` (exit 3), never the
+plain `'erlang:X/Y is not a BIF'` a typo gets; a genuinely unknown name still falls through to
+`error::unknown_bif`. `error::undef()` is the sibling helper for a call that names a function the
+release does not have (`code:is_sticky/2`), raising the bare `error:undef` the oracle does.
+
+The **effective** gap set is the curated static list
+(`error::KNOWN_UNIMPLEMENTED_ERLANG_BIFS`, `error::listed_as_unimplemented`) **intersected with what the
+live registry does not own** — computed at use time, not baked in. So a later `beam_bifs` change that
+registers a name the list still carries can never shadow the registry or turn a served BIF into an
+`unsupported` gap (e.g. `erlang:phash/2` and `erlang:phash2/1,2` are registered by `beam_bifs` and are
+therefore **not** classified here). A registered name left in the static list is dead weight, not a
+hazard; the drift guard is
+`error::tests::the_effective_gap_set_never_shadows_the_registry`.
 
 ## CLI subset (contract A.6 — the *exact* supported surface; anything else is *unsupported*, exit 3)
 | Switch | Meaning in `beam_rt` |
@@ -335,6 +423,7 @@ heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the o
 | `wordsize` | `Int(size_of::<usize>())` → `8` |
 | `logical_processors` | `Int(available_parallelism)` |
 | `process_count` | `Int(rt.processes.len())` (the M1 process table) |
+| `port_count` | `Int` — the number of **live** ports (`PortRegistry::len`), the runtime's own port table |
 | `os_type` | `Tuple("unix","linux")` (or `("win32","nt")`) |
 | `threads` | `Bool(true)` → atom `true`/`false` |
 | `emu_flavor` | `Atom(rt.config().emulator.flavor.as_str())` → `jit` by default (the baseline JIT), `emu` for a `Flavor::Emu` config |
@@ -482,15 +571,32 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   scratch dir and runs it through `Runtime::run_function`: `lists:reverse/1` → `[3,2,1]`,
   `maps:get/2` on a map literal → `7`, and the on-demand stdlib module `ordsets`. It **skips loudly**
   (printing the reason) when the system toolchain/stdlib is unavailable, never silently passing.
-* **Ports, nested re-entrancy and bit operators.** `src/port.rs` unit tests (all three Name forms, the
-  options, `BadArg` rejection without consuming a port number, `close_port` kill/reap, unknown-port
-  `BadArg`, the seeded `port_info` vocabulary); `tests/eval.rs`'s `open_port_spawns_a_real_os_process`
+* **Ports, the port-stream read, nested re-entrancy and bit operators.** `src/port.rs` unit tests (all
+  three Name forms, the options, `BadArg` rejection without consuming a port number, `close_port`
+  kill/reap, unknown-port `BadArg`, the seeded `port_info` vocabulary, and `ids()` reporting a live
+  port across a released *lower* slot); `tests/eval.rs`'s `open_port_spawns_a_real_os_process`
   (the exact `driver/port_backed_by_spawn_driver` probe + argv at the CLI boundary, a real `os_pid`, the
-  `port_info` pairs, `port_close/1`); `context.rs`'s
+  `port_info` pairs, `port_close/1`) and
+  `a_spawn_driver_port_stream_is_read_back_as_a_data_message` (the `driver/spawn_driver_port_stream_read`
+  golden `ok <<104,105,10>>`, the `list` default, the bound-port match, the `after` fallback, and
+  `an_oversized_port_stream_binary_is_unsupported_not_wrong` — the >64-byte binary read is an honest
+  exit-3 capability gap); `tests/port_stream.rs` exercises the **same** read path structurally through
+  `Runtime::eval` (`{Port, {data, Data}}` with `Data` a binary / a char list / the `after` fallback);
+  `context.rs`'s
   `ets_inside_an_applied_fun_reaches_the_outer_table`, `a_nested_io_format_reaches_the_callers_sink` and
   `a_nested_call_without_a_fun_still_sees_the_outer_tables` (the nested-BIF seams through the real call
-  path); and `eval/mod.rs`'s bit-operator tests (small-int sanity for each of the six, a `1 bsl 70`
+  path); `eval/mod.rs`'s bit-operator tests (small-int sanity for each of the six, a `1 bsl 70`
   bignum round-trip, a non-integer operand → `badarith`).
+* **The runtime-native floor's unit tests** are colocated in `src/native/*.rs` (fixtures shared from
+  `src/native/test_support.rs`): the `erlang`-core entries, the `init:*` command-line surface and boot
+  status, every `code:*` entry (including `root_dir`/`is_loaded`/`is_sticky`/`ensure_loaded`), the
+  process/reference/monitor/registry entries (`make_ref` uniqueness, the monitor/demonitor matrix,
+  `ports`/`processes`/`pre_loaded`/`whereis`/`register`/`unregister`/`module_loaded`), and the
+  `application:*` entries plus the `.app`-resource parser (system-installation cases skip **loudly**
+  via `system_runtime`). `src/error.rs`'s tests pin the effective gap classifier: a curated entry is a
+  capability gap, and the **effective** gap set (the list intersected with the live registry's names)
+  is disjoint from the registry — the drift guard that makes a newly-registered `beam_bifs` BIF
+  impossible to shadow — plus the `undef` raise.
 * **`tests/mailbox.rs` — the nine engine `Mailbox` seam methods (round 1).** Drives `RuntimeContext`'s
   `Mailbox` implementation over a real `beam_message::Queue`: enqueue/len/scan/cursor, the
   `recv_marker_*` table, and that `send_message`'s `from` reflects the running pid — pinned against
@@ -508,7 +614,11 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   `-pa` — it contains a `lists.beam` that shadows stdlib (the Rust loader resolves system stdlib
   specially, so `Runtime::load_module(FIXTURE)` works).
 * **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_rt` GREEN;
-  the whole-workspace `build`/`test` must stay green.
+  the whole-workspace `build`/`test` must stay green. The compatibility gate itself is the sibling
+  `tools/differential` harness: build this crate in release
+  (`erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --release -p beam_rt`) then
+  run it (`erts_rust/scripts/cargo.sh run --manifest-path erts_rust/Cargo.toml -q --release -p
+  differential -- suite`).
 
 ## Known Issues / Intentional M1 gaps
 * **No interactive shell, no distribution, no node.** `-noshell` is the only mode; `-name`/`-sname`
@@ -517,24 +627,39 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   shared atom table is seeded with `CORE_ATOMS` + `INFO_ATOMS` (not the full `atom.names` ordering), so
   positional atom indices for preloaded code are not reproduced. The erts app's `ebin` **is** on the
   code path (`CodeServer::resolve_system_ebins`), so a preloaded module (`init`, `persistent_term`, …)
-  *can* be loaded from disk on demand; boot order and the registry are in place.
+  *can* be loaded from disk on demand; the registry (the oracle's **exact** `erlang:pre_loaded/0` list
+  *and* order) is in place.
+* **Answers that read *this* runtime's own state differ from the oracle by construction** — they are
+  not bugs and must not be "fixed" to match a run-time figure: `erlang:processes/0` (this runtime's own
+  table — its root process plus whatever `spawn_process` created, never the oracle's 40-odd background
+  processes), `erlang:ports/0` and `erlang:system_info(port_count)` (the live [`PortRegistry`], empty
+  until something opens a port), and `erlang:module_loaded/1` (the preloaded names + the modules this
+  runtime actually loaded). `erlang:whereis(init)` **does** agree: `Runtime::new` registers its root
+  process under the name `init`, the same pid `group_leader/0` reports (oracle: `<0.0.0>`).
+  `erlang:registered/0` is not implemented (it is on the known-unimplemented list).
 * **`-eval` results that are not byte-aligned cannot be *printed*.** Construction and `bit_size/1` are
   supported for a non-byte-aligned bitstring (`<<1:1>>`, `<<255:12/little>>`), but the registered
   `beam_bifs` `io:format` `~w`/`~p` printer rejects one with `badarg` — a **`beam_bifs` printer gap
   outside this crate** (the corpus probes read such a value through `bit_size/1`, so they are
   unaffected). The honest segment limits remain: a construction segment **or** a pattern segment wider
   than 64 bits is *unsupported*, and a value that needs a bignum is `system_limit`.
+* **The `beam_bifs` `~p` printer rejects a container wider than its ~80-column rendering limit.** The
+  term itself is correct, but printing it *inside a container* that does not fit one line fails:
+  `io:format("~p~n",[code:is_loaded(lists)])` → `beam_rt: badarg` (exit 1) where the oracle prints
+  `{file,"…/lists.beam"}` — another **`beam_bifs` printer gap outside this crate** (verified: a
+  `{file,"…"}` tuple renders fine up to ~60 columns and is `badarg` past ~80). It shows up on the
+  `code:*`-shaped native answers because they embed an installation path.
 * **Scheduler is single-threaded; a few M1 process gaps.** `Runtime::spawn_process` +
   `run_one_slice`/`run_slices`/`run_scheduler` run spawned processes and a blocked receiver **is**
   resumed by a sender (send→wake→resume via `resume_woken`); the run loop is single-threaded (never a
   thread). Remaining gaps, all honest: **no reduction pre-emption** (`budget` is not enforced; `Yield` is
   never returned; a process runs to its next `return`/`wait`); a non-zero `receive ... after T` **suspends
-  (`Wait`) instead of timing out** (there is no host timer — a message never sent leaves the process
-  `Waiting`); **`erlang:make_ref/0` is absent**, so a `recv_marker_*` fixture (`recv:marked/0`) cannot run
-  end-to-end; and on the runner path a **capability gap is uncatchable** — a process raising
+  (`Wait`) instead of timing out** on the *scheduler/runner* path (there is no host timer — a message
+  never sent leaves the process `Waiting`; only the `-eval` `receive … after T` path advances, by polling
+  ports — see Known Issues below); and on the runner path a **capability gap is uncatchable** — a process raising
   `badmatch`/`case_clause` terminates with the mapped reason (atom or `Display` text) rather than the real
   term. `system_info(process_count)` still reflects the runtime's own process table entry.
-* **No live `code_server`.** `code:*` on the receive path is the native floor in `src/native.rs` (see the
+* **No live `code_server`.** `code:*` on the receive path is the native floor in `src/native/code.rs` (see the
   `code:` section above), not a running `code_server` process.
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
   strings; `-eval` evaluates the expression subset and prints nothing). An `-eval` expression outside
@@ -553,43 +678,57 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   argument would not get tables — none exists in M1. Output sharing costs `RuntimeContext` a
   destructor (the `Rc`-backed `SharedSink`), so a caller that keeps a `RuntimeContext` alive cannot
   reuse the `Runtime` binding directly until it goes out of scope; read it through the context instead.
-* **Ports: spawned, registered and queryable — but not polled.** `erlang:open_port/2` really spawns
-  the OS process (`{spawn, Cmd}` through `/bin/sh -c`, `{spawn_executable, …}` directly, `{fd, N}` as a
-  descriptor port), allocates a `beam_process::PortId` and records the live port (real `os_pid`,
-  `connected`, stream type); `port_close/1` kills/reaps the child and releases the id; `port_info/1,2`
-  answer the seeded item vocabulary. Deliberate `port_info` deviations from erts-17.1 (never
-  fabricated): `id` is the port **term** (erts: a bare integer), `connected` is a **boolean** (erts:
-  the controlling pid) and `stream` is reported (erts reports `input`/`output` byte counters); `links`/
-  `monitors` are `[]` (truly empty here). **No fd polling:** the child's stdio is piped but never read,
-  so port output is **never delivered** to Erlang, `port_command/2` does not exist, and `connected`
-  flips only at `port_close/1` — `exit_status`/`eof` are recognized but inert (their only observable
-  form is a `{Port, …}` message), and a child that exits on its own is not reaped until `port_close/1`
-  or runtime exit. `os:cmd/1` remains the runtime-native host spawn, unchanged.
+* **Ports: spawned, registered, queryable, and stdout-polled on the `-eval` receive path.** `erlang:open_port/2`
+  really spawns the OS process (`{spawn, Cmd}` through `/bin/sh -c`, `{spawn_executable, …}` directly,
+  `{fd, N}` as a descriptor port), allocates a `beam_process::PortId` and records the live port (real
+  `os_pid`, `connected`, stream type, the child's `stdout` handle); `port_close/1` kills/reaps the child
+  and releases the id; `port_info/1,2` answer the seeded item vocabulary; `erlang:ports/0` reports the
+  live ports. Deliberate `port_info` deviations from erts-17.1 (never fabricated): `id` is the port
+  **term** (erts: a bare integer), `connected` is a **boolean** (erts: the controlling pid) and `stream`
+  is reported (erts reports `input`/`output` byte counters); `links`/`monitors` are `[]` (truly empty
+  here). **stdout is read back only on the `-eval` `receive … after T` path**
+  (`RuntimeContext::poll_port_messages`); the **scheduler/runner** path never polls, so a BEAM process
+  blocked in `receive` waiting for a `{Port, {data, …}}` message stays `Waiting` (nothing drives the
+  poller from the process mailbox). The read is **one** `Read::read` per readiness (one message per read,
+  not a stream coalesced per driver callback); **stdin and stderr are never read** (they are pipes, but
+  nothing consumes them); `port_command/2` does not exist (it is on the known-unimplemented list), so
+  nothing is ever written to the child's stdin; `connected` flips to `false` only at `port_close/1`,
+  not when the child exits by itself; `exit_status`/`eof` are recognized but inert (their only
+  observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
+  exits on its own is reaped only by `port_close/1` or at runtime exit. A `binary`-stream read wider
+  than 64 bytes is the typed *unsupported* gap (no off-heap ref-counted binary build path yet).
+  `os:cmd/1` remains the runtime-native host spawn, unchanged.
 * **Heap has no GC** (see Design Decisions) — a runaway allocation returns `SystemLimit`.
 * **No memory introspection.** The runtime exposes **no** way to observe allocated memory: `erlang:memory/0,1`, `erlang:process_info/1,2` and `erlang:statistics/1` are **not** registered BIFs (`beam_bifs` raises `… is not a BIF`, exit 1) and none of the twelve `system_info/1` keys reports memory (`SUPPORTED_KEYS`). The registered `ets:info(T, memory)` is the only memory number available.
 
 ## Routing Table
 * `src/lib.rs` → crate docs, `#![deny(unsafe_code)]`, module wiring, root re-exports, `prelude`
-* `src/error.rs` → `pub(crate)` `BeamError` constructors (missing value, unexpected argument, bad spec, arity mismatch, bad run argument, unknown module/function/info key/bif, unsupported, bad eval) + the halt helpers (`HALT_PREFIX`, `halt`/`halt_status`) + `unsupported_reason` (the single capability-gap classifier) — no crate-local error enum
+* `src/error.rs` → `pub(crate)` `BeamError` constructors (missing value, unexpected argument, bad spec, arity mismatch, bad run argument, unknown module/function/info key/bif, unsupported, bad eval, `undef`) + the halt helpers (`HALT_PREFIX`, `halt`/`halt_status`) + `unsupported_reason` (the single capability-gap classifier) + the curated `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` candidate list with `listed_as_unimplemented` and `is_known_unimplemented_bif(registry, …)` — the **effective** gap set, i.e. the list **intersected with what the live `BifRegistry` does not own**, so the static list and the registry can never drift — used by the `erlang`-namespace fallback — no crate-local error enum
 * `src/config.rs` → `RuntimeConfig`, `Action`, `ArgTerm`, `InitArgs`, `EmulatorConfig` alias, defaults/setters
 * `src/cli.rs` → `USAGE`, `parse` (the A.6 parser + the `run` argument grammar), `run` (the CLI driver + the four exit-code constants `EXIT_OK`/`EXIT_RUNTIME`/`EXIT_USAGE`/`EXIT_UNSUPPORTED`)
 * `src/codeserver.rs` → `CodeServer`: the **one** shared atom table (held as an `Rc<AtomTable>`, copy-on-write on intern — see Design Decisions) + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir`/`atoms_handle` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
-* `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed (also interns `info::INFO_ATOMS` and `port::PORT_INFO_ATOMS`) + the boot banner
-* `src/port.rs` → the A.4 `PortHook` provider: `PortRegistry` (a `beam_process::PortTable` + an id → `LivePort` map + a per-registry scratch `Heap`), `RuntimePorts` (the `beam_bifs::PortHook`: Name/Options parsing + validation → `BeamError::BadArg`, the spawn driver via `std::process::Command`, kill/reap on close, real `port_info` pairs), `PortName`/`StreamType`/`PORT_INFO_ATOMS`
+* `src/boot.rs` → `PreloadedModules` skeleton (A.7): `PRELOADED_MODULE_NAMES` is the oracle's **exact** `erlang:pre_loaded/0` list *and* order (`persistent_term` first … `erts_code_purger` last, verified against OTP 29/erts-17.1), which `pre_loaded/0` and `code:all_loaded/0` reproduce verbatim + the core-atom seed (also interns `info::INFO_ATOMS` and `port::PORT_INFO_ATOMS`) + the boot banner
+* `src/port.rs` → the A.4 `PortHook` provider: `PortRegistry` (a `beam_process::PortTable` + an id → `LivePort` map + a per-registry scratch `Heap`; `contains`/`len`/`is_empty`/`ids`), `LivePort` (which keeps the child's `stdout` handle so the stream can be read), `RuntimePorts` (the `beam_bifs::PortHook`: Name/Options parsing + validation → `BeamError::BadArg`, the spawn driver via `std::process::Command`, kill/reap on close, real `port_info` pairs), `RuntimeContext::poll_port_messages` (the `beam_io::Poller`-driven read that produces `{Port, {data, Data}}` messages), `PortName`/`StreamType`/`PORT_INFO_ATOMS`
 * `src/info.rs` → `SUPPORTED_KEYS`, `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `eval_heap` exposes the runtime's long-lived `-eval` heap a non-byte-aligned bitstring is materialized on; `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `SharedSink` — the cloneable `Rc<RefCell<..>>`-backed output handle a nested context shares; `reentrancy_capable` (installs the `TableRegistry` only for a call that cannot apply a fun argument, so `ets:*` inside a fun reaches the outer tables); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through; `call_registered` installs exactly these three `BifContext` seams (`AtomInterner`/`FunCaller`/`PortHook`) and **no** `SendHook`, so the `beam_bifs`-registered `erlang:send/2` / `erlang:'!'/2` raise `unsupported_bif` (message delivery is owned by a future `beam_process`/`beam_message` wiring)
-* `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`, `os:cmd/1`, `code:get_path/0`/`all_loaded/0`/`which/1`/`lib_dir/0,1` — always consulted before the registry)
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `eval_heap` exposes the runtime's long-lived `-eval` heap a non-byte-aligned bitstring is materialized on; `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `SharedSink` — the cloneable `Rc<RefCell<..>>`-backed output handle a nested context shares; `reentrancy_capable` (installs the `TableRegistry` only for a call that cannot apply a fun argument, so `ets:*` inside a fun reaches the outer tables); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through; `call_registered` installs exactly these three `BifContext` seams (`AtomInterner`/`FunCaller`/`PortHook`) and **no** `SendHook`, so the `beam_bifs`-registered `erlang:send/2` / `erlang:'!'/2` raise `unsupported_bif` (message delivery is owned by a future `beam_process`/`beam_message` wiring); its `erlang`-namespace fallback consults `error::is_known_unimplemented_bif` **after** the registry dispatch, so a known-but-unimplemented OTP `erlang` BIF is `unsupported:` (exit 3) rather than a plain `is not a BIF` diagnostic
+* `src/native.rs` → the runtime-native BIF floor: the module docs, `try_native` (the `(module, function, arity)` dispatch consulted **before** the registry) and the shared helpers; the `erlang`-core entries `halt/0,1`, `display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `os:cmd/1`; declares the submodules below
+* `src/native/init.rs` → the `init:*` entries (`get_argument/1`, `get_arguments/0`, `get_plain_arguments/0`, `get_status/0`)
+* `src/native/code.rs` → the `code:*` entries (`get_path/0`, `all_loaded/0`, `which/1`, `is_loaded/1`, `is_sticky/1,2`, `ensure_loaded/1`, `lib_dir/0,1`, `root_dir/0`) over the `CodeServer` state + the preloaded registry
+* `src/native/process.rs` → the `erlang` process/registry/reference entries (`make_ref/0`, `monitor/2`, `demonitor/1,2`, `ports/0`, `processes/0`, `pre_loaded/0`, `group_leader/0`, `whereis/1`, `register/2`, `unregister/1`, `module_loaded/1`) over `beam_process`'s tables + the runtime reference id space
+* `src/native/application.rs` → the `application:*` entries (`get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0`) over a minimal native app view (the `.app` files resolved through the `CodeServer` + a recursive-descent `.app` term-text parser). Its production half is ~700 lines; the file legitimately reads past the ~1000-line baseline because of the comprehensive colocated `#[cfg(test)] mod tests` (stated in the file header) — it is **not** restructured
+* `src/native/test_support.rs` → the floor's shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`)
 * `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; binary-comprehension evaluation (`Qual::BinaryGenerator`) and the bit-buffer construction (`BitBuf`/`materialize_bits`, byte-aligned → binary, else a bitstring on `eval_heap`); `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
 * `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; the `<=` binary-generator qualifier; a segment's `:Size` parsed in segment context so a following `/Type` is a specifier, not a division; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
 * `src/mailbox.rs` → `RuntimeContext`'s nine `beam_engine::Mailbox` seam methods over the running process's real `beam_message::Queue`, with per-pid scan/marker state in `Runtime.mailboxes: HashMap<ProcessId, MailboxState>` (the receive cursor + the `recv_marker_*` table); `MailboxState` + `Runtime::mailboxes` are the durable position a blocked `receive` resumes against
 * `src/runner.rs` → the `beam_process::ProcessRunner`: `ProcessEntry`, `ProcessEngine`, `RunnerState` (`engines`/`results`/`exits`), `RuntimeRunner` (implements `ProcessRunner::run` over `RuntimeContext::for_process`; first run `run_export_outcome`, resume `resume_outcome`; maps `Returned`→record+`Exit(normal)`, `Wait`→park+`ProcessState::Waiting`+`RunOutcome::Wait`, `Err`→`exit_reason` term+`Exit`); `exit_reason` maps a `BeamError` to an atom reason (never panics); module docs carry the borrow strategy + the "exit reason is not the return value" rule
-* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), the **scheduler API** (`spawn_process`/`enqueue_process`/`run_one_slice`/`run_slices`/`run_scheduler`/`process_result`/`process_exit`/`run_queue_len` + the private `run_pass`/`take_processes`/`put_processes` move-out dance), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`); fields `processes` (`pub(crate)`), `mailboxes`, `scheduler`, `runner_state`
+* `src/runtime.rs` → `Runtime`: boot-wiring (registers the `init` name on its own root process at construction, so `whereis(init)` / `group_leader/0` agree with the oracle), code server, module cache, `run_function`/`run_module`/`run_named` (the slice), the **scheduler API** (`spawn_process`/`enqueue_process`/`run_one_slice`/`run_slices`/`run_scheduler`/`process_result`/`process_exit`/`run_queue_len` + the private `run_pass`/`take_processes`/`put_processes` move-out dance), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`); `refs_mut` (the one `beam_process::RefAllocator` shared by `make_ref/0` and monitor/demonitor); fields `processes` (`pub(crate)`), `mailboxes`, `scheduler`, `runner_state`, `refs`, `references` (the reference→monitor map `demonitor/1` reads)
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
-* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the `driver/port_backed_by_spawn_driver` port probe (a real OS process, the `port_info` pairs, `port_close/1`), the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
+* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the `driver/port_backed_by_spawn_driver` port probe (a real OS process, the `port_info` pairs, `port_close/1`), the `driver/spawn_driver_port_stream_read` port-stream probe (the `ok <<104,105,10>>` golden, the `list` default, the bound-port match, the `after` fallback, the >64-byte binary read as an exit-3 capability gap), the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
+* `tests/port_stream.rs` → the port-stream read at the **library** boundary (`Runtime::eval`), asserting the `{Port, {data, Data}}` term structurally (binary payload, char-list payload, and the `after` fallback) rather than only through the printer
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
@@ -597,12 +736,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
 ## Handoffs (owned by OTHER nodes)
-`differential suite` is at **197 agree / 0 mismatch / 0 unsupported** (of 197) — the whole corpus
-agrees. Remaining asks owned elsewhere:
-* **`tools/differential` — a stale pin.** Its `tests/cli.rs` still asserts the expression corpus has a
-  capability gap (`unsupported + skipped >= 1`) and its `CONTEXT.md` still describes the (now closed)
-  `driver/port_backed_by_spawn_driver` mismatch, so that one workspace test fails against a fully
-  agreeing suite. The pin lives under `../../tools/` (read-only here) and is owed to that node.
+`differential suite` is at **`summary: total=285 agree=281 mismatch=0 unsupported=4 skipped=0`**.
+Remaining asks owned elsewhere:
+* **The 4 `unsupported` are the `wire/*` ETF-encode cases**, owned by `beam_codec`/`beam_dist`.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also

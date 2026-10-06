@@ -306,3 +306,122 @@ fn crate_constants() {
     assert_eq!(EPMD_PORT, 4369);
     assert_eq!(VERSION_MAGIC, 131);
 }
+
+// ---------------------------------------------------------------------------
+// 6. In-message flag fields (`ERTS_DIST_SPAWN_FLAG_*`, `ERTS_DOP_ALTACT_SIG_FLG_*`).
+// ---------------------------------------------------------------------------
+
+#[test]
+fn in_message_flag_field_values() {
+    // dist.h:185-192, verbatim.
+    assert_eq!(DIST_SPAWN_FLAG_LINK, 1 << 0);
+    assert_eq!(DIST_SPAWN_FLAG_MONITOR, 1 << 1);
+
+    assert_eq!(DOP_ALTACT_SIG_FLG_PRIO, 1 << 0);
+    assert_eq!(DOP_ALTACT_SIG_FLG_TOKEN, 1 << 1);
+    assert_eq!(DOP_ALTACT_SIG_FLG_ALIAS, 1 << 2);
+    assert_eq!(DOP_ALTACT_SIG_FLG_NAME, 1 << 3);
+    assert_eq!(DOP_ALTACT_SIG_FLG_EXIT, 1 << 4);
+}
+
+#[test]
+fn prio_and_link_share_bit_zero_but_are_distinct_namespaces() {
+    // Both `ERTS_DOP_ALTACT_SIG_FLG_PRIO` and `ERTS_DIST_SPAWN_FLAG_LINK` are
+    // `1 << 0`: the same numeric value means different things depending on the
+    // enclosing control opcode, so the two newtypes must not be interchangeable.
+    assert_eq!(DOP_ALTACT_SIG_FLG_PRIO, DIST_SPAWN_FLAG_LINK);
+    assert_eq!(AltactSigFlags::PRIO.bits(), 1 << 0);
+    assert_eq!(DistSpawnFlags::LINK.bits(), 1 << 0);
+    assert_eq!(AltactSigFlags::PRIO.bits(), DistSpawnFlags::LINK.bits());
+}
+
+#[test]
+fn altact_flags_cover_exactly_five_bits() {
+    // The five altact bits are contiguous `1 << 0 ..= 1 << 4` (`dist.h:188-192`).
+    assert_eq!(DOP_ALTACT_SIG_FLG_EXIT, 1 << 4);
+    let all = DOP_ALTACT_SIG_FLG_PRIO
+        | DOP_ALTACT_SIG_FLG_TOKEN
+        | DOP_ALTACT_SIG_FLG_ALIAS
+        | DOP_ALTACT_SIG_FLG_NAME
+        | DOP_ALTACT_SIG_FLG_EXIT;
+    assert_eq!(all, 0b1_1111);
+    assert!(all < (1 << 5), "altact flag field must fit a 5-bit width");
+}
+
+#[test]
+fn spawn_flags_set_operations() {
+    let mut flags = DistSpawnFlags::EMPTY;
+    assert_eq!(flags.bits(), 0);
+    assert!(!flags.contains(DistSpawnFlags::LINK));
+    // `EMPTY` is vacuously a subset of every flag word (same rule as `DistFlags`).
+    assert!(flags.contains(DistSpawnFlags::EMPTY));
+
+    flags.insert(DistSpawnFlags::LINK);
+    assert!(flags.contains(DistSpawnFlags::LINK));
+    assert!(!flags.contains(DistSpawnFlags::MONITOR));
+    assert_eq!(DistSpawnFlags::from_bits(flags.bits()), flags);
+
+    flags.insert(DistSpawnFlags::MONITOR);
+    assert!(flags.contains(DistSpawnFlags::LINK));
+    assert!(flags.contains(DistSpawnFlags::MONITOR));
+    assert_eq!(flags.bits(), DIST_SPAWN_FLAG_LINK | DIST_SPAWN_FLAG_MONITOR);
+
+    flags.remove(DistSpawnFlags::LINK);
+    assert!(!flags.contains(DistSpawnFlags::LINK));
+    assert!(flags.contains(DistSpawnFlags::MONITOR));
+
+    flags.remove(DistSpawnFlags::MONITOR);
+    assert_eq!(flags, DistSpawnFlags::EMPTY);
+    assert_eq!(flags.bits(), 0);
+}
+
+#[test]
+fn altact_flags_set_operations_and_independence() {
+    // `EXIT|TOKEN` contains both bits; neither bit alone contains the other.
+    let both = AltactSigFlags::from_bits(DOP_ALTACT_SIG_FLG_EXIT | DOP_ALTACT_SIG_FLG_TOKEN);
+    assert!(both.contains(AltactSigFlags::EXIT));
+    assert!(both.contains(AltactSigFlags::TOKEN));
+    assert!(!AltactSigFlags::EXIT.contains(AltactSigFlags::TOKEN));
+    assert!(!AltactSigFlags::TOKEN.contains(AltactSigFlags::EXIT));
+    assert_eq!(both.bits(), 0b1_0010);
+    assert_eq!(AltactSigFlags::from_bits(both.bits()), both);
+
+    // Incremental build-up and tear-down round-trips every bit.
+    let mut flags = AltactSigFlags::EMPTY;
+    assert_eq!(flags.bits(), 0);
+    flags.insert(AltactSigFlags::PRIO);
+    flags.insert(AltactSigFlags::ALIAS);
+    flags.insert(AltactSigFlags::NAME);
+    assert_eq!(flags.bits(), 1 | (1 << 2) | (1 << 3));
+    assert!(flags.contains(AltactSigFlags::PRIO));
+    assert!(!flags.contains(AltactSigFlags::EXIT));
+
+    flags.remove(AltactSigFlags::ALIAS);
+    assert!(!flags.contains(AltactSigFlags::ALIAS));
+    assert!(flags.contains(AltactSigFlags::NAME));
+    assert_eq!(AltactSigFlags::from_bits(flags.bits()), flags);
+}
+
+#[test]
+fn altact_flag_consts_are_independent_single_bits() {
+    let all = [
+        AltactSigFlags::PRIO,
+        AltactSigFlags::TOKEN,
+        AltactSigFlags::ALIAS,
+        AltactSigFlags::NAME,
+        AltactSigFlags::EXIT,
+    ];
+    for (i, a) in all.iter().enumerate() {
+        assert_eq!(a.bits().count_ones(), 1, "{a:?} must be a single bit");
+        for (j, b) in all.iter().enumerate() {
+            if i == j {
+                assert_eq!(*a, *b);
+            } else {
+                assert_ne!(a.bits(), b.bits(), "{a:?} and {b:?} must differ");
+                assert!(!a.contains(*b), "{a:?} must not contain {b:?}");
+            }
+        }
+    }
+    assert_eq!(AltactSigFlags::EMPTY.bits(), 0);
+    assert_eq!(DistSpawnFlags::EMPTY.bits(), 0);
+}

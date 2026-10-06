@@ -18,35 +18,41 @@
 use beam_common::{ERTS_VSN, ERTS_VERSION, OTP_VERSION};
 use beam_term::AtomTable;
 
-/// The standard preloaded modules of this release, in the emulator's boot order.
+/// The standard preloaded modules of this release, in `erlang:pre_loaded/0`'s order.
 ///
-/// The list mirrors `erts/preloaded/src/` of the legacy tree: the modules that exist in
-/// the emulator image itself and are therefore available before any `.beam` file is
-/// read. `erts_dirty_process_signal_handler` and `erts_literal_area_collector` are
-/// internal support modules of the same set.
+/// The set **and the order** mirror the oracle (OTP 29/erts-17.1,
+/// `erl -noshell -eval 'io:format("~w~n",[erlang:pre_loaded()]),halt(0).'`), which lists
+/// the modules that live in the emulator image itself — available before any `.beam` file
+/// is read. `erts_dirty_process_signal_handler`, `erts_trace_cleaner` and
+/// `erts_literal_area_collector` are internal support modules of the same set.
+///
+/// The order is the oracle's, so `erlang:pre_loaded/0`,
+/// [`PreloadedModules::names`] and `code:all_loaded/0` (which lists the preloaded names
+/// first) reproduce it verbatim; nothing here may be reordered without re-deriving the
+/// list from the oracle.
 pub const PRELOADED_MODULE_NAMES: &[&str] = &[
-    "erlang",
+    "persistent_term",
+    "counters",
+    "atomics",
+    "erts_dirty_process_signal_handler",
+    "erts_trace_cleaner",
+    "erts_literal_area_collector",
+    "erl_tracer",
     "erts_internal",
+    "erlang",
     "erl_prim_loader",
+    "prim_zip",
+    "prim_net",
+    "prim_socket",
+    "socket_registry",
+    "zlib",
+    "prim_file",
+    "prim_inet",
+    "prim_eval",
+    "prim_buffer",
     "init",
     "erl_init",
     "erts_code_purger",
-    "erts_dirty_process_signal_handler",
-    "erts_literal_area_collector",
-    "erts_trace_cleaner",
-    "atomics",
-    "counters",
-    "erl_tracer",
-    "persistent_term",
-    "prim_buffer",
-    "prim_eval",
-    "prim_file",
-    "prim_inet",
-    "prim_net",
-    "prim_socket",
-    "prim_zip",
-    "socket_registry",
-    "zlib",
 ];
 
 /// The core atoms the runtime's global atom table is seeded with at construction.
@@ -101,9 +107,9 @@ pub const CORE_ATOMS: &[&str] = &[
 
 /// The preloaded-module registry skeleton (contract A.7).
 ///
-/// A name set, in boot order; [`is_preloaded`](PreloadedModules::is_preloaded) is the
-/// question the loader/boot code asks, and [`names`](PreloadedModules::names) iterates
-/// the boot order.
+/// A name set, in `erlang:pre_loaded/0`'s order; [`is_preloaded`](PreloadedModules::is_preloaded)
+/// is the question the loader/boot code asks, and [`names`](PreloadedModules::names)
+/// iterates that order.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PreloadedModules {
     names: Vec<&'static str>,
@@ -129,7 +135,7 @@ impl PreloadedModules {
         self.names.contains(&name)
     }
 
-    /// The preloaded module names, in boot order.
+    /// The preloaded module names, in `erlang:pre_loaded/0`'s order.
     pub fn names(&self) -> impl Iterator<Item = &'static str> + '_ {
         self.names.iter().copied()
     }
@@ -210,13 +216,47 @@ mod tests {
     }
 
     #[test]
-    fn names_iterates_in_boot_order() {
+    fn names_iterates_in_pre_loaded_order() {
         let preloaded = PreloadedModules::standard();
         let names: Vec<&str> = preloaded.names().collect();
         assert_eq!(names.len(), preloaded.len());
-        assert_eq!(names[0], "erlang");
-        assert_eq!(names[1], "erts_internal");
         assert_eq!(names, PRELOADED_MODULE_NAMES);
+        // The exact oracle order (`erlang:pre_loaded/0`), head and tail.
+        assert_eq!(names[0], "persistent_term");
+        assert_eq!(names[1], "counters");
+        assert_eq!(names[8], "erlang");
+        assert_eq!(names[names.len() - 1], "erts_code_purger");
+    }
+
+    #[test]
+    fn the_pre_loaded_list_matches_the_oracle_exactly() {
+        // Pinned against `erl -noshell -eval 'io:format("~w~n",[erlang:pre_loaded()]),halt(0).'`
+        // (OTP 29/erts-17.1): set **and** order.
+        let expected = [
+            "persistent_term",
+            "counters",
+            "atomics",
+            "erts_dirty_process_signal_handler",
+            "erts_trace_cleaner",
+            "erts_literal_area_collector",
+            "erl_tracer",
+            "erts_internal",
+            "erlang",
+            "erl_prim_loader",
+            "prim_zip",
+            "prim_net",
+            "prim_socket",
+            "socket_registry",
+            "zlib",
+            "prim_file",
+            "prim_inet",
+            "prim_eval",
+            "prim_buffer",
+            "init",
+            "erl_init",
+            "erts_code_purger",
+        ];
+        assert_eq!(PRELOADED_MODULE_NAMES, expected);
     }
 
     #[test]

@@ -51,6 +51,7 @@ mod lists;
 mod maps;
 mod math;
 mod numeric;
+mod phash;
 mod port;
 mod print;
 mod proc;

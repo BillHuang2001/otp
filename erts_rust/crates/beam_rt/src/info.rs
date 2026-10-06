@@ -42,6 +42,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "wordsize",
     "logical_processors",
     "process_count",
+    "port_count",
     "os_type",
     "threads",
     "emu_flavor",
@@ -147,6 +148,7 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
         "wordsize" => Ok(InfoValue::Int(std::mem::size_of::<usize>() as i64)),
         "logical_processors" => Ok(InfoValue::Int(logical_processors())),
         "process_count" => Ok(InfoValue::Int(rt.processes().len() as i64)),
+        "port_count" => Ok(InfoValue::Int(port_count(rt)?)),
         "os_type" => Ok(os_type()),
         "threads" => Ok(InfoValue::Bool(true)),
         "emu_flavor" => Ok(emu_flavor(rt)),
@@ -196,6 +198,27 @@ fn logical_processors() -> i64 {
     match std::thread::available_parallelism() {
         Ok(count) => count.get() as i64,
         Err(_) => 1,
+    }
+}
+
+/// The number of **live ports** — the value the oracle's `port_count` reports.
+///
+/// The runtime's own [`PortRegistry`](crate::port::PortRegistry) is the single source of
+/// truth: a port counts once it is *live* (`RuntimePorts` inserts it), which is exactly
+/// when the oracle's own `port_count` rises. A fresh runtime has opened no port, so the
+/// honest answer is `0` (the oracle boots with its `standard_io` port already open, which
+/// this runtime has no counterpart for).
+///
+/// The registry is shared through an [`Rc`]`<`[`std::cell::RefCell`]`>` so a port BIF in
+/// flight can hold it without borrowing the runtime; a `RefCell` conflict is reported as
+/// the typed capability gap rather than panicking — the crate is `#![deny(unsafe_code)]`
+/// and the same rule `erlang:ports/0` follows.
+fn port_count(rt: &Runtime) -> Result<i64> {
+    match rt.ports.try_borrow() {
+        Ok(registry) => Ok(registry.len() as i64),
+        Err(_) => Err(error::unsupported(
+            "erlang:system_info(port_count): the port registry is already borrowed",
+        )),
     }
 }
 
@@ -265,7 +288,7 @@ mod tests {
             system_info_value(key, &rt)
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));
         }
-        assert_eq!(SUPPORTED_KEYS.len(), 12);
+        assert_eq!(SUPPORTED_KEYS.len(), 13);
     }
 
     #[test]
@@ -330,8 +353,7 @@ mod tests {
         assert!(matches!(
             system_info_value("logical_processors", &rt).expect("logical_processors"),
             InfoValue::Int(count) if count >= 1
-        ));
-        assert_eq!(
+        ));        assert_eq!(
             system_info_value("system_architecture", &rt).expect("system_architecture"),
             InfoValue::Str(system_architecture())
         );
@@ -341,6 +363,61 @@ mod tests {
                 "Erlang/OTP 30 [erts-17.1] [source] [{}-bit]",
                 std::mem::size_of::<usize>() * 8
             ))
+        );
+    }
+
+    #[test]
+    fn port_count_is_the_live_port_count() {
+        use beam_engine::{terms, ExecutionContext};
+
+        // A fresh runtime has opened no port (the oracle's own boot opens a
+        // `standard_io` port that this runtime has no counterpart for).
+        let mut rt = runtime();
+        assert_eq!(
+            system_info_value("port_count", &rt).expect("port_count"),
+            InfoValue::Int(0)
+        );
+
+        // Open a `{fd, 0}` descriptor port — a live port with **no** child process —
+        // through the real `erlang:open_port/2` path, and the count rises; closing it
+        // drops the count again, so the answer tracks the live port set exactly.
+        let port = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
+            let fd = context.atom("fd").expect("the `fd` atom");
+            let descriptor = beam_term::make_small(0);
+            let name = terms::make_tuple(&mut context, &[fd, descriptor]).expect("a {fd, N}");
+            let options = terms::make_list(&mut context, &[]).expect("[]");
+            context
+                .call_bif("erlang", "open_port", 2, &[name, options])
+                .expect("erlang:open_port/2")
+        };
+        assert_eq!(
+            system_info_value("port_count", &rt).expect("port_count"),
+            InfoValue::Int(1),
+            "the opened port is counted"
+        );
+        // `erlang:ports/0` reports exactly the same one port.
+        let ports = {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
+            context
+                .call_bif("erlang", "ports", 0, &[])
+                .expect("erlang:ports/0")
+        };
+        assert_eq!(terms::list_elements(ports).expect("a list"), vec![port]);
+
+        {
+            let mut sink = beam_bifs::NullSink;
+            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
+            context
+                .call_bif("erlang", "port_close", 1, &[port])
+                .expect("erlang:port_close/1");
+        }
+        assert_eq!(
+            system_info_value("port_count", &rt).expect("port_count"),
+            InfoValue::Int(0),
+            "a closed port is no longer counted"
         );
     }
 
@@ -427,8 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn schedulers_materializes_to_a_small_integer() {
-        let rt = runtime();
+    fn schedulers_materializes_to_a_small_integer() {        let rt = runtime();
         let value = system_info_value("schedulers", &rt).expect("schedulers");
         let mut heap = Heap::new(64).expect("test heap");
         let atoms = seeded_atoms();

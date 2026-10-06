@@ -41,10 +41,10 @@ pub mod handshake;
 pub mod prelude;
 pub mod transport;
 
-pub use crate::control::{decode_control, encode_control, ControlMessage};
+pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
 pub use crate::dist_header::{AtomCacheRef, DistFragment, DistHeader};
 pub use crate::epmd::{Alive2Req, Alive2Resp, EpmdClient, NamesResp, Port2Req, Port2Resp};
-pub use crate::flags::{DistFlags, Dop};
+pub use crate::flags::{AltactSigFlags, DistFlags, DistSpawnFlags, Dop};
 pub use crate::framing::{
     is_tick, read_length, read_packet, write_packet, write_tick, PacketHeaderSize, MAX_PACKET_BODY,
 };
@@ -56,7 +56,10 @@ pub use crate::transport::{MemoryTransport, Transport};
 
 pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache, SegmentCache};
 pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest, SystemChallengeSource};
-pub use crate::connection::{accept_server, connect_client, Connection, Handshake, TcpTransport};
+pub use crate::connection::{
+    accept_server, connect_client, connect_client_with_creation, Connection, Handshake,
+    TcpTransport, CLIENT_CREATION,
+};
 pub use crate::fragment::{
     Assembly, FragmentAssembler, FragmentCont, FragmentHeader, DIST_FRAGMENT_SIZE,
 };

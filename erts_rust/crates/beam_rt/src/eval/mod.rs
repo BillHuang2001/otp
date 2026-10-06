@@ -52,7 +52,10 @@
 //! # Known Milestone-1 gaps (typed errors, never wrong results)
 //!
 //! * `!` (send) — there is no mailbox in `-eval`, so it is a typed `unsupported`.
-//! * `receive` without an `after` clause — likewise (it would block forever).
+//! * `receive` without an `after` clause — likewise (it would block forever). A
+//!   `receive … after T` *does* run: its clauses are matched against the port messages
+//!   `RuntimeContext::poll_port_messages` polls from `open_port/2` streams within `T` ms,
+//!   and the `after` body is the fallback.
 //! * `catch Expr` yields `{'EXIT', Reason}` for the `error`/`exit` classes (the
 //!   oracle appends a stacktrace); M1 evaluates without one.
 //!
@@ -66,6 +69,7 @@ mod parse;
 
 use std::collections::HashMap;
 use std::rc::Rc;
+use std::time::Duration;
 
 use beam_common::{BeamError, ExceptionClass, Raise, Result};
 use beam_engine::{terms, ExecutionContext};
@@ -1064,12 +1068,29 @@ impl Evaluator<'_, '_> {
         })
     }
 
-    /// `receive … end` — best effort: there is no mailbox in `-eval`.
+    /// `receive … end`.
+    ///
+    /// `-eval` has no process mailbox, so a bare `receive` (no `after`) is an uncatchable
+    /// capability gap. A `receive … after T` does have a meaning, though: it is the shape
+    /// the runtime's port poller delivers into — `open_port({spawn, …}, …)` output arrives
+    /// as `{Port, {data, Data}}` messages. The clause is therefore matched against the
+    /// messages [`RuntimeContext::poll_port_messages`] produces within `T` milliseconds,
+    /// and the `after` body runs only when none matched (the `no_data` fallback preserved).
     fn receive(&mut self, receive: &ast::Receive, env: &mut Env) -> EResult<Eterm> {
         match &receive.after {
             Some((timeout, body)) => {
                 let mut timeout_env = env.clone();
-                self.expr(timeout, &mut timeout_env)?;
+                let value = self.expr(timeout, &mut timeout_env)?;
+                let millis = self.timeout_millis(value)?;
+                let messages = match self.ctx.poll_port_messages(Duration::from_millis(millis)) {
+                    Ok(messages) => messages,
+                    Err(err) => return Err(Flow::Fatal(err)),
+                };
+                for message in messages {
+                    if let Some(result) = self.match_clauses(&receive.clauses, message, env)? {
+                        return Ok(result);
+                    }
+                }
                 let mut body_env = env.clone();
                 self.exprs(body, &mut body_env)
             }
@@ -1077,6 +1098,30 @@ impl Evaluator<'_, '_> {
                 "receive without an after clause (no mailbox in -eval)",
             ))),
         }
+    }
+
+    /// A `receive … after T` timeout as a millisecond count.
+    ///
+    /// A negative value, a float or any other term is `error:badarg` (the oracle's own
+    /// reason for those). A value that is an integer but too wide to be a *small* integer (a
+    /// bignum) is also `badarg` — the evaluator has no safe bignum reader here and a
+    /// multi-quintillion-millisecond timeout is not representable anyway. The atom
+    /// `infinity` would block forever, which `-eval` (no mailbox) cannot do, so it is a
+    /// capability gap, not an error.
+    fn timeout_millis(&mut self, value: Eterm) -> EResult<u64> {
+        if is_small(value) {
+            let millis = signed_value(value);
+            if millis < 0 {
+                return Err(self.raise(ExceptionClass::Error, "badarg"));
+            }
+            return Ok(millis as u64);
+        }
+        if self.atom_name(value).as_deref() == Some("infinity") {
+            return Err(Flow::Fatal(error::unsupported(
+                "receive ... after infinity (no mailbox in -eval)",
+            )));
+        }
+        Err(self.raise(ExceptionClass::Error, "badarg"))
     }
 
     /// `catch Expr`.

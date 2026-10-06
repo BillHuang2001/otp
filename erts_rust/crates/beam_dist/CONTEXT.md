@@ -22,7 +22,8 @@ Dependents: `beam_rt` (node startup `-name`/`-sname`, `system_info(dist)`), `bea
 
 Ground truth (read-only, never modified):
 - `erts/emulator/beam/dist.h` — authoritative `DFLAG_*` (capability bits) + `enum dop` (control
-  opcodes) + the mandatory/default/rejectable flag sets; `ERTS_DIST_FRAGMENT_SIZE`/
+  opcodes) + the mandatory/default/rejectable flag sets + the `ERTS_DIST_SPAWN_FLAG_*` /
+  `ERTS_DOP_ALTACT_SIG_FLG_*` bit vocabularies; `ERTS_DIST_FRAGMENT_SIZE`/
   `ERTS_DIST_FRAGMENT_HEADER_SIZE`.
 - `erts/emulator/beam/dist.c` — control-message dispatch (`erts_dist_command`, the 1-based control
   tuple), fragment reassembly (`ERTS_PREP_DIST_EXT_FRAG_CONT`), `gen_digest` directions.
@@ -42,9 +43,24 @@ All byte values, tag bytes and field orders are **wire-frozen** (A.5): reproduce
 ## Status
 **Implemented.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte framing,
 handshake message codecs + MD5 authentication, the byte-exact distribution header, message
-fragmentation/reassembly, the distribution atom cache, the control-message codec, the `epmd` client,
-and a `Connection` API that drives a **live handshake + message exchange against a real `erl` node**.
-`cargo test -p beam_dist` is green and warning-free. The crate is safe Rust (`#![deny(unsafe_code)]`).
+fragmentation/reassembly, the **outbound and inbound distribution atom cache**, the control-message
+codec, the `epmd` client, and a `Connection` API that drives a **live handshake + message exchange
+against a real `erl` node**. `cargo test -p beam_dist` is green (241 tests) and warning-free. The
+crate is safe Rust (`#![deny(unsafe_code)]`).
+
+The **outbound atom-cache path is wired end-to-end**: `OutboundAtomCache` implements
+`beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder`
+per control message, and `Connection::send_payload` emits the real `OutboundAtomCache::take_header()`
+header (no longer the empty header) — so an atom-bearing message writes `ATOM_CACHE_REF` (`82`) +
+index on the payload and teaches/re-uses the refs in the header. An atom-free message still emits the
+exact `131, 68, 0` header. A `Connection` client creation is now settable
+(`connect_client_with_creation` / `Connection::client_with_creation`; the default stays
+`CLIENT_CREATION = 0`).
+
+The `DOP_*` **flag vocabularies** are complete: `DIST_SPAWN_FLAG_LINK`/`_MONITOR` and
+`DOP_ALTACT_SIG_FLG_PRIO`/`_TOKEN`/`_ALIAS`/`_NAME`/`_EXIT` (plus the `DistSpawnFlags`/`AltactSigFlags`
+typed helpers), value-pinned from `dist.h:185-192`. End-to-end spawn/altact handling remains out of
+scope (see Known Issues).
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_dist::prelude::*` (see `src/lib.rs`/`src/prelude.rs`).
@@ -64,6 +80,11 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
   /`DFLAG_DIST_DEFAULT`/…).
 - `Dop` opcodes: `pub const DOP_*: u8` + `enum Dop { … }` with `from_u8`, `as_u8`, `name`, `is_tt`,
   `arity` (control arguments **after** the opcode).
+- The **in-message flag vocabularies** (`dist.h:185-192`): `pub const DIST_SPAWN_FLAG_LINK`/`_MONITOR`
+  and `DOP_ALTACT_SIG_FLG_PRIO`/`_TOKEN`/`_ALIAS`/`_NAME`/`_EXIT` (`u32`) + the `DistSpawnFlags` /
+  `AltactSigFlags` newtypes (`EMPTY`, per-bit consts, `bits`/`from_bits`/`contains`/`insert`/`remove`).
+  These are the bit fields carried *inside* the `DOP_ALTACT_SIG_SEND` / `DOP_SPAWN_REPLY*` control
+  terms (`dist.c:2590-2698`, `dist.c:3090-3146`) — the vocabulary only.
 - Handshake/version tags (`NAME_TAG`, `CHALLENGE_TAG`, `STATUS_TAG`, `CHALLENGE_REPLY_TAG`,
   `CHALLENGE_ACK_TAG`, `COMPLEMENT_TAG`, `DIST_VER_HIGH`/`LOW`), epmd tags/node types.
 
@@ -124,6 +145,9 @@ Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT:
 - Send side: `struct OutboundAtomCache { new, ref_for, payload_index, payload_ref_for, header,
   take_header, advance_segment, clear, len, is_empty, persistent }` — classifies atoms `New`/`Cached`
   and yields `AtomCacheRef`s; `payload_ref_for` returns the payload bytes `[82, index]`.
+- **`impl beam_codec::AtomCacheWriter for OutboundAtomCache`** — `intern(atom, atoms)` = `ref_for`
+  (classification) + `payload_index`, i.e. the concrete hook `Encoder::with_atom_cache` calls. This is
+  what makes the encoder emit `[82, index]` for a cached atom instead of the inline atom name.
 
 ### `src/control.rs` — `DOP_*` control-message codec (safe, wire-exact)
 The control message is an ETF **tuple** `SMALL_TUPLE_EXT`/`LARGE_TUPLE_EXT + arity + element_1 …`,
@@ -132,9 +156,14 @@ trailing **Message** term follows the tuple in the same body. No leading `VERSIO
 distribution header carries it).
 - `struct ControlMessage { dop: Dop, terms: Vec<Eterm> }` (flattened: control args, then the trailing
   message when present).
-- `encode_control(dop, terms, atoms) -> Result<Vec<u8>>`; `decode_control(body, &mut Heap,
-  &mut AtomTable, Option<&AtomCache>) -> Result<ControlMessage>`. Unknown opcode / wrong arity /
-  malformed tuple ⇒ `BeamError::BadArg`. Term encoding is **only** `beam_codec`.
+- `encode_control_cached(dop, terms, atoms, Option<&mut dyn beam_codec::AtomCacheWriter>) ->
+  Result<Vec<u8>>`; `encode_control(dop, terms, atoms) -> Result<Vec<u8>>` (a thin wrapper over the
+  cache-less case). The opcode + control args + trailing message are encoded through **one**
+  `Encoder::new_body(atoms)` so a supplied cache sees every atom in payload order — which is exactly
+  the header ref order.
+- `decode_control(body, &mut Heap, &mut AtomTable, Option<&AtomCache>) -> Result<ControlMessage>`.
+  Unknown opcode / wrong arity / malformed tuple ⇒ `BeamError::BadArg`. Term encoding is **only**
+  `beam_codec`.
 
 ### `src/epmd.rs` — `epmd` port-mapper client (safe)
 2-byte-BE-framed `ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES` codecs +
@@ -144,14 +173,18 @@ distribution header carries it).
 ### `src/connection.rs` — the connection-level API + `TcpStream` adapter (safe)
 - `struct TcpTransport` (impls `Read`/`Write`); `connect(addr)` sets a read timeout + `TCP_NODELAY`;
   `from_stream`; `set_read_timeout`/`set_nodelay`/`stream`/`into_inner`; `DEFAULT_READ_TIMEOUT` (10 s).
-- Handshake driver (2-byte framing): `connect_client(t, our_name, cookie) -> Result<Handshake>` and
+- Handshake driver (2-byte framing): `connect_client(t, our_name, cookie) -> Result<Handshake>`,
+  `connect_client_with_creation(t, our_name, cookie, creation) -> Result<Handshake>` and
   `accept_server(t, our_name, cookie, creation) -> Result<Handshake>`, where
   `struct Handshake { client_flags, server_flags, negotiated, peer_creation, peer_name, buffered }`.
+  `pub const CLIENT_CREATION: u32 = 0` is the default client creation.
 - Established link (4-byte framing): `struct Connection<T: Transport>` —
-  `client(t, name, cookie)` / `server(t, name, cookie, creation)`; `negotiated`/`client_flags`/
-  `server_flags`/`peer_name`/`peer_creation`/`handshake`/`ticks_answered`/`into_inner`;
-  `send_control(dop, terms, atoms)`, `send_message(from, to, msg, atoms)`, `send_tick()`,
-  `recv(&mut Heap, &mut AtomTable) -> Result<ControlMessage>`. `MAX_ESTABLISHED_PACKET_BODY`.
+  `client(t, name, cookie)` / `client_with_creation(t, name, cookie, creation)` /
+  `server(t, name, cookie, creation)`; `negotiated`/`client_flags`/`server_flags`/`peer_name`/
+  `peer_creation`/`handshake`/`ticks_answered`/`into_inner`; `send_control(dop, terms, atoms)`,
+  `send_message(from, to, msg, atoms)`, `send_tick()`, `recv(&mut Heap, &mut AtomTable) ->
+  Result<ControlMessage>`. `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an
+  `OutboundAtomCache` that `send_payload` drains via `take_header()`.
 
 ## Constraints
 - **Safe Rust only** — `#![deny(unsafe_code)]`. `TcpTransport` uses only `std::net`.
@@ -163,25 +196,31 @@ distribution header carries it).
 - **No new external dependencies** (the in-tree MD5 replaces the `md-5` crate).
 - **Bounded allocation**: validate advertised lengths/buffered fragments against a ceiling before
   allocating; oversize ⇒ `SystemLimit`.
-- Files target ~1000 lines; split by responsibility (`connection.rs` is ~1000 incl. its in-module
-  tests). Licensing: Apache-2.0.
+- Files target ~1000 lines; split by responsibility. Licensing: Apache-2.0.
 
 ## Test Strategy
 - In-module `#[cfg(test)]` unit tests per module + `tests/` integration tests for cross-module seams.
 - **Gate:** `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_dist` green;
   plus `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
 - Coverage highlights:
-  - `tests/constants.rs` — exact-value pins for `DFLAG_*`/`DOP_*` and the handshake/epmd tags.
+  - `tests/constants.rs` — exact-value pins for `DFLAG_*`/`DOP_*`, the `DIST_SPAWN_FLAG_*` /
+    `DOP_ALTACT_SIG_FLG_*` vocabulary (incl. the shared bit 0 in distinct namespaces) and the
+    handshake/epmd tags.
   - `tests/auth.rs` + in-module — RFC 1321 KATs; `gen_digest` known answers derived from the system
     oracle (`erl -noshell -eval 'io:format("~s",[binary:encode_hex(erlang:md5(<<"COOKIE",...>>))])'`).
   - `tests/handshake.rs`/`framing.rs`/`control.rs`/`epmd.rs` — round-trips + byte-exact vectors +
-    negatives; `control.rs` pins the wire tuple bytes (`DOP_SEND` args `[1,2]` ⇒ `[104,3,97,2,97,1,97,2]`).
+    negatives; `control.rs` pins the wire tuple bytes (`DOP_SEND` args `[1,2]` ⇒ `[104,3,97,2,97,1,97,2]`)
+    and proves `encode_control_cached` is byte-identical to `encode_control` with no cache and writes
+    `[82, index]` with one.
   - `tests/fragment.rs` — byte-exact `'E'`/`'F'` prefixes, split/reassemble round-trips, negatives.
   - `tests/atom_cache.rs` — segment addressing, `New`/`Cached` classification, header apply, ref
-    resolution through `beam_codec`.
+    resolution through `beam_codec`, and `encode_control_cached` driven by a real `OutboundAtomCache`
+    (the header it yields resolves the payload the encoder wrote).
   - `tests/connection.rs` — hermetic loopback (real `TcpListener` on `127.0.0.1:0`, server on a
-    thread): both handshake roles, a `DOP_*` round-trip, a >`DIST_FRAGMENT_SIZE` message, a tick, and
-    a wrong-cookie failure that is not a hang. A spy transport asserts `'E'` frames really crossed.
+    thread): both handshake roles, a `DOP_*` round-trip, a >`DIST_FRAGMENT_SIZE` message, a tick, a
+    wrong-cookie failure that is not a hang, and the **outbound atom cache over a real link** (one
+    `New` ref per atom, `82 + index` payload, the peer resolves the names). A spy transport asserts
+    `'E'` frames really crossed.
   - `tests/live_interop.rs` — **live interop with a real `erl` node.** Starts
     `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P inet_dist_listen_max P` (P a free
     loopback port; epmd is NOT used — raw TCP to epmd is blocked in this sandbox), connects with
@@ -197,11 +236,18 @@ distribution header carries it).
 - **The digest is `md5(cookie ++ decimal(challenge))` — cookie first.** Ground truth: `dist_util.erl`
   `gen_digest/2` = `erlang:md5([atom_to_list(Cookie)|integer_to_list(Challenge)])` and `ei_connect.c`
   `gen_digest` = `md5(cookie)` then `sprintf("%u", challenge)`. The challenge is rendered as its
-  **unsigned decimal** string (no leading zeros / no length prefix / cookie has no NUL). (Note: the
-  completing objective phrased this as `md5(Challenge ++ Cookie)` — that is not the on-wire formula;
-  the C/Erlang ground truth wins and is what is implemented.)
+  **unsigned decimal** string (no leading zeros / no length prefix / cookie has no NUL).
 - **`DistFlags` newtype + raw `u64` consts** (ergonomic `contains`/bitops while value pins stay
-  `u64`); chosen over `bitflags` (no new dep).
+  `u64`); chosen over `bitflags` (no new dep). `DistSpawnFlags`/`AltactSigFlags` mirror the same shape
+  over `u32` (the in-term flag field width).
+- **The outbound atom cache is threaded through a single `Encoder` per control message.** The trait
+  hook lives in `beam_codec` (which must not depend on `beam_dist`); `encode_control_cached` builds
+  the whole tuple body — opcode, control args and the trailing message — through one
+  `Encoder::new_body(atoms).with_atom_cache(cache)`. Because the encoder interns atoms in payload
+  order and `OutboundAtomCache` assigns ref positions in the same order (ERTS `insert_acache_map`),
+  the payload's `82` index is exactly the header ref position. `send_payload` then drains the cache
+  with `take_header()` and writes the real header; the message-level ref list is consumed, the
+  persistent per-connection cache survives to serve `Cached` refs on later messages.
 - **`DistHeader::decode_tail` is shared** by the `'D'` and `'E'` (fragmented) decoders so the
   flag/ref/long-atoms logic is written once.
 - **Fragment wire layout.** `'E'`/`'F'` prefixes are `VERSION_MAGIC + tag + seq_id(8) + frag_id(8)`
@@ -219,40 +265,41 @@ distribution header carries it).
 - **The `connection` module deliberately opens a `TcpStream`.** The A.5 core stays transport-agnostic;
   the adapter is what makes the handshake + `DOP_*` layer usable end-to-end (contract A.5's "wire" is
   only demonstrable over a real socket). The runtime's production transport remains `beam_io`'s.
-- **Handshake framing is 2-byte; established framing is 4-byte.** The frame read after
-  `ChallengeAck` is treated as the OTP-23 `Complement` only when its tag is `'c'`; otherwise it is
-  buffered and delivered by the next `recv`.
+- **Handshake framing is 2-byte; established framing is 4-byte.** The frame read after `ChallengeAck`
+  is treated as the OTP-23 `Complement` only when its tag is `'c'`; otherwise it is buffered and
+  delivered by the next `recv`.
 - **`NamesResp::encode` is lossy** (per-node ports are not retained) — decoding (the client direction)
   is exact.
 
 ## Known Issues / Remaining Gaps
-- **Outbound payload `ATOM_CACHE_REF` emission is blocked on a sibling `beam_codec` change.**
-  `beam_dist` fully classifies/addresses outbound atoms and can produce the payload bytes
-  (`OutboundAtomCache::payload_ref_for` → `[82, index]`) and the header refs, but the **encoder** lives
-  in `beam_codec` (owned by another agent), whose `Encoder` still writes every atom inline. The
-  required hook (escalated to the parent node):
-  ```rust
-  // in beam_codec:
-  pub trait AtomCacheWriter { fn intern(&mut self, atom: Atom, atoms: &AtomTable) -> Option<u8>; }
-  impl<'a> Encoder<'a> { pub fn with_atom_cache(self, cache: &'a mut dyn AtomCacheWriter) -> Encoder<'a>; }
-  ```
-  With it, `Encoder::encode` writes `ATOM_CACHE_REF` (82) + the returned index for cached atoms instead
-  of `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`; `OutboundAtomCache` is the concrete `AtomCacheWriter`.
-  Tag `78` (`NEW_CACHE`) is not needed — ERTS's encoder never emits it (new atoms travel in the
-  header; the payload only ever writes `82`). The **receive** side is complete regardless.
-- **`Connection` advertises client creation `0`** (there is no local node container here). If a peer
-  rejects creation 0, a client-creation parameter must be added.
+- **Spawn/payload/altact control opcodes are recognised but not executed.** The full `DOP_*`
+  vocabulary and the in-term bit vocabularies (`DistSpawnFlags`/`AltactSigFlags`) are present, and
+  `DOP_ALTACT_SIG_SEND`'s variable arity is tolerated at decode, but there is **no** end-to-end
+  spawn/altact/payload-exit handling here — that is `beam_process`/`beam_rt` work, and the
+  `ERTS_DIST_SPAWN_FLAG_*` / `ERTS_DOP_ALTACT_SIG_FLG_*` semantics (`dist.c:2590-2698`,
+  `dist.c:3090-3146`) are documented, not interpreted.
 - **epmd over raw TCP is blocked in this sandbox** — verified via CLI (`epmd -names` works) but raw
   `NAMES_REQ`/`PORT2_REQ` over a socket return empty. The `EpmdClient` codecs are exercised against
   `MemoryTransport`; live epmd use is untested here. Use a fixed `inet_dist_listen_*` port instead.
-- **Spawn/payload/altact control opcodes** are recognised by value/name/arity but end-to-end handling
-  (and the `ERTS_DOP_ALTACT_SIG_FLG_*` / `ERTS_DIST_SPAWN_FLAG_*` bit vocabularies) is not implemented.
 - **Not yet consumed by `beam_rt`**: node startup (`-name`/`-sname`) does not yet wire this crate into
   the runtime binary. This crate is the value/connection layer only.
 
+## Notes for Agents
+- **`LOCAL_EXT` (`121`) now exists in the sibling `beam_codec`**: `Encoder::finish_local(hash: u32)`
+  and `pub fn encode_term_local(Eterm, &AtomTable, hash: u32)` emit
+  `[VERSION_MAGIC][LOCAL_EXT (121)][node-hash:4 BE][body]` with a **caller-supplied** node hash (the
+  codec neither computes nor verifies it), and the decoder consumes that wrapper. This is the
+  `DFLAG_LOCAL_EXT` short-circuit used for same-node ("local") distribution; `beam_dist` does **not**
+  currently need it (it is a `dist.c`-level local-delivery optimisation, not part of the remote wire),
+  so it is not wired in — reach for it if a local-link path is ever added.
+- The `Connection` API keeps the *additive* creation parameter additive: `connect_client` and
+  `Connection::client` are unchanged and delegate with `CLIENT_CREATION = 0`.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`, `DIST_VERSION`/`EPMD_PORT`
-- `src/flags.rs` → `DFLAG_*` + `DistFlags`, the `DOP_*` opcodes + `Dop`, flag sets, handshake/epmd tags
+- `src/flags.rs` → `DFLAG_*` + `DistFlags`, the `DOP_*` opcodes + `Dop`, flag sets, the in-term
+  `DIST_SPAWN_FLAG_*`/`DOP_ALTACT_SIG_FLG_*` vocabularies + `DistSpawnFlags`/`AltactSigFlags`,
+  handshake/epmd tags
 - `src/transport.rs` → the abstract `Read`/`Write`/`Transport` seam + `MemoryTransport` test double
 - `src/framing.rs` → 2-/4-byte packet-length framing, tick, `PacketHeaderSize`
 - `src/handshake.rs` → `Name`/`Status`/`Challenge`/`ChallengeReply`/`ChallengeAck`/`Complement`
@@ -261,9 +308,13 @@ distribution header carries it).
 - `src/dist_header.rs` → the `'D'` header (`N`/`Flags`/`LongAtoms`/`AtomCacheRef`) + the `'E'`
   fragmented-header decode (`FragmentedHeader`)
 - `src/fragment.rs` → `'E'`/`'F'` codecs, `split` (sender), `FragmentAssembler` (receiver)
-- `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`
-- `src/control.rs` → the `DOP_*` control-message tuple codec
-- `src/connection.rs` → `TcpTransport`, the handshake driver, `Connection`, `send_control`/`recv`
+- `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, and the
+  `beam_codec::AtomCacheWriter` impl on `OutboundAtomCache` (the outbound `intern` hook)
+- `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
+- `src/connection.rs` → `TcpTransport`, the handshake driver (client/server + creation), `Connection`
+  (owning the outbound atom cache), `send_control`/`send_message`/`recv`
+- `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
+  `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
 - `src/epmd.rs` → `epmd` request/response codecs + `EpmdClient` over `Transport`
 - `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection}.rs` → seams
 - `tests/live_interop.rs` → real-`erl` handshake + message exchange (the interop evidence)
@@ -280,7 +331,7 @@ distribution header carries it).
 - `../../CONTEXT.md` → workspace contracts (§1 A.5 distribution wire, §2 frozen term layout, §3 error
   strategy, §6 test gate).
 - `../../ERTS_RUST_REWRITE_EVALUATION.md` §A.5 — the distribution/ETF wire contract.
-- `../beam_codec/CONTEXT.md` → the ETF codec this crate reuses (owns all term encoding; the pending
-  `AtomCacheWriter` hook lives there).
+- `../beam_codec/CONTEXT.md` → the ETF codec this crate reuses (owns all term encoding and the
+  `AtomCacheWriter` hook / `LOCAL_EXT` wrapper this crate builds on).
 - `../beam_term/CONTEXT.md`, `../beam_alloc/CONTEXT.md` → the frozen foundations this crate builds on.
 - `../beam_rt/CONTEXT.md` → the runtime binary that will consume this crate for node startup.

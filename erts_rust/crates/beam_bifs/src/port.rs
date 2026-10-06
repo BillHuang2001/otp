@@ -61,12 +61,16 @@ fn open_port(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// The `erlang:port_close/1` BIF.
 ///
+/// Returns the atom `true` — the value the `erlang.erl` wrapper of
+/// `erts_internal:port_close/1` produces (the oracle's
+/// `erlang:port_close(open_port({spawn,"true"},[]))` ⇒ `true`), *not* `ok`.
+///
 /// A non-port argument is `badarg` *before* the seam is consulted, matching
 /// `erts_internal_port_close_1`.
 fn port_close(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let port = PortId::from_eterm(args[0])?;
     ctx.close_port(port)?;
-    ctx.ok()
+    ctx.boolean(true)
 }
 
 /// The `erlang:port_info/1` BIF: the hook's `{Item, Value}` pairs as a list.
@@ -264,8 +268,8 @@ mod tests {
             let mut ctx =
                 BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_port_hook(&mut hook);
 
-            let ok = port_close(&mut ctx, &[port]).expect("port_close");
-            assert_eq!(ctx.atoms().name(atom_val(ok)), Some("ok"));
+            let closed = port_close(&mut ctx, &[port]).expect("port_close");
+            assert_eq!(ctx.atoms().name(atom_val(closed)), Some("true"));
 
             let all = port_info_1(&mut ctx, &[port]).expect("port_info/1");
             let elems = proper_list(all).expect("a proper list");

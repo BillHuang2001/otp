@@ -38,6 +38,7 @@ const OUT_WORDS: usize = 1 << 16;
 const LARGE_N: i64 = 10001;
 
 mod counter;
+mod info;
 mod kind;
 mod keypos;
 mod large;
@@ -199,6 +200,30 @@ pub fn cap_bool(result: BeamResult<bool>) -> String {
     }
 }
 
+/// The oracle's `cap/1` for a term-*list* result — the multi-object kinds'
+/// `ets:lookup_element/3`, whose success is the element list in stored order.
+pub fn cap_terms(result: BeamResult<Vec<Eterm>>, atoms: &AtomTable) -> String {
+    match result {
+        Ok(terms) => format!("ok:{}", list_of(&rendered(&terms, atoms))),
+        Err(error) => cap_error(&error),
+    }
+}
+
+/// The rendered forms of `terms` in order — the shared body of the oracle's
+/// `r/1` (over a list), `srt/1` and `inorder/1`.
+pub fn rendered(terms: &[Eterm], atoms: &AtomTable) -> Vec<String> {
+    terms.iter().map(|t| render(*t, atoms)).collect()
+}
+
+/// The oracle's `cap(fun() -> ets:insert(T, List) end)`: a successful list
+/// insert answers the atom `true`, so `Ok(())` renders as `ok:true`.
+pub fn cap_insert_list(result: BeamResult<()>) -> String {
+    match result {
+        Ok(()) => "ok:true".to_string(),
+        Err(error) => cap_error(&error),
+    }
+}
+
 /// The BEAM error atom a failure raises — `badarg` renders bare, any other
 /// reason as `error:<reason>`, matching the oracle's `catch error:E`.
 fn cap_error(error: &BeamError) -> String {
@@ -311,15 +336,14 @@ impl Battery {
 
     /// The oracle's `srt/1`: the rendered terms, sorted (order-independent).
     fn srt(&self, terms: &[Eterm]) -> String {
-        let mut rendered: Vec<String> = terms.iter().map(|t| render(*t, &self.atoms)).collect();
-        rendered.sort();
-        list_of(&rendered)
+        let mut parts = rendered(terms, &self.atoms);
+        parts.sort();
+        list_of(&parts)
     }
 
     /// The oracle's `inorder/1`: the rendered terms in their stored order.
     fn inorder(&self, terms: &[Eterm]) -> String {
-        let rendered: Vec<String> = terms.iter().map(|t| render(*t, &self.atoms)).collect();
-        list_of(&rendered)
+        list_of(&rendered(terms, &self.atoms))
     }
 
     /// `'$end_of_table'` for an exhausted navigation, else the rendered key.
@@ -408,6 +432,7 @@ pub fn rust_battery() -> Vec<(String, String)> {
     cases.extend(counter::counter_cases(&mut battery));
     cases.extend(lookup::lookup_cases(&mut battery));
     cases.extend(matchspec::matchspec_cases(&mut battery));
+    cases.extend(info::info_cases(&mut battery));
     cases.extend(large::large_cases(&mut battery));
 
     cases

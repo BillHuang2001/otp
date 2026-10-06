@@ -178,6 +178,34 @@ impl TableAccess<'_> {
         self.table.lookup_element_or(key, pos, default, atoms)
     }
 
+    /// `ets:lookup_element/3` for a multi-object kind (`bag`/`duplicate_bag`),
+    /// whose result is the element *list*; requiring read access.
+    ///
+    /// See [`Table::lookup_element_all`].
+    pub fn lookup_element_all(
+        &self,
+        key: Eterm,
+        pos: usize,
+        atoms: &AtomTable,
+    ) -> Result<Vec<Eterm>> {
+        self.table.check_read(self.requester)?;
+        self.table.lookup_element_all(key, pos, atoms)
+    }
+
+    /// `ets:lookup_element/4` for a multi-object kind: `Ok(None)` for an absent
+    /// key (the caller yields `default`); requiring read access.
+    ///
+    /// See [`Table::lookup_element_all_or`].
+    pub fn lookup_element_all_or(
+        &self,
+        key: Eterm,
+        pos: usize,
+        default: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<Option<Vec<Eterm>>> {
+        self.table.check_read(self.requester)?;
+        self.table.lookup_element_all_or(key, pos, default, atoms)
+    }
     /// `ets:select/2`, requiring read access.
     pub fn select(
         &self,

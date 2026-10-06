@@ -558,6 +558,169 @@ impl Dop {
 }
 
 // ---------------------------------------------------------------------------
+// In-message flag fields (`ERTS_DIST_SPAWN_FLAG_*`, `ERTS_DOP_ALTACT_SIG_FLG_*`,
+// dist.h:185-192).
+//
+// These are *not* handshake capability bits — they never travel in the
+// `DFLAG_*` word. They are small integer flag fields carried *inside* two
+// control messages, reproduced bit-for-bit from the C macros (contract A.5):
+// - the `Flags` element of `DOP_ALTACT_SIG_SEND` (`dist.c:2590-2698`): the five
+//   `ERTS_DOP_ALTACT_SIG_FLG_*` bits (`dist.h:188-192`); the receiver reads the
+//   low bits of the (possibly bignum) flags integer and ignores the rest
+//   (`dist.c:2615-2617`);
+// - the `Flags` element of `DOP_SPAWN_REPLY`/`DOP_SPAWN_REPLY_TT`
+//   (`dist.c:3090-3146`): `ERTS_DIST_SPAWN_FLAG_LINK`/`_MONITOR`
+//   (`dist.h:185-186`), a small integer rejected when `>= 1 << 27`
+//   (`dist.c:3092-3093`).
+//
+// The two fields live in *distinct namespaces*: bit 0 is `PRIO` for altact and
+// `LINK` for spawn, so the same numeric value means different things depending
+// on the enclosing opcode.
+// ---------------------------------------------------------------------------
+
+/// `ERTS_DIST_SPAWN_FLAG_LINK` (`dist.h:185`) — a distributed spawn-link: the
+/// spawning process is linked to the new child (`dist.c:3102`/`3138`,
+/// `erl_process.c:13098`).
+pub const DIST_SPAWN_FLAG_LINK: u32 = 1 << 0;
+
+/// `ERTS_DIST_SPAWN_FLAG_MONITOR` (`dist.h:186`) — the spawning process
+/// monitors the new child (`dist.c:3100`, `erl_process.c:13100`).
+pub const DIST_SPAWN_FLAG_MONITOR: u32 = 1 << 1;
+
+/// `ERTS_DOP_ALTACT_SIG_FLG_PRIO` (`dist.h:188`) — a priority signal
+/// (`dist.c:2687`); combined with [`DOP_ALTACT_SIG_FLG_ALIAS`] it is the
+/// priority alias send (`dist.c:1646-1655`).
+pub const DOP_ALTACT_SIG_FLG_PRIO: u32 = 1 << 0;
+
+/// `ERTS_DOP_ALTACT_SIG_FLG_TOKEN` (`dist.h:189`) — the control message also
+/// carries a trailing trace token, i.e. a 5-tuple rather than a 4-tuple
+/// (`dist.c:2651-2658`); the receiver rewrites it to a `_TT` opcode
+/// (`external.c:6866`).
+pub const DOP_ALTACT_SIG_FLG_TOKEN: u32 = 1 << 1;
+
+/// `ERTS_DOP_ALTACT_SIG_FLG_ALIAS` (`dist.h:190`) — `To` is a process alias
+/// (a reference; `dist.c:2662-2666`).
+pub const DOP_ALTACT_SIG_FLG_ALIAS: u32 = 1 << 2;
+
+/// `ERTS_DOP_ALTACT_SIG_FLG_NAME` (`dist.h:191`) — `To` is a registered name
+/// (an atom; `dist.c:2667-2671`).
+pub const DOP_ALTACT_SIG_FLG_NAME: u32 = 1 << 3;
+
+/// `ERTS_DOP_ALTACT_SIG_FLG_EXIT` (`dist.h:192`) — the signal is an exit signal
+/// rather than a message signal (`dist.c:2689`).
+pub const DOP_ALTACT_SIG_FLG_EXIT: u32 = 1 << 4;
+
+/// The `Flags` field of a `DOP_SPAWN_REPLY`/`DOP_SPAWN_REPLY_TT` control
+/// message (`ERTS_DIST_SPAWN_FLAG_*`, `dist.h:185-186`).
+///
+/// The C receive path validates it as a small integer `< 1 << 27`
+/// (`dist.c:3092`) and reads the `LINK`/`MONITOR` bits; this newtype mirrors
+/// [`DistFlags`]'s set ergonomics without the handshake capability word's
+/// derived-set machinery.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct DistSpawnFlags(u32);
+
+impl DistSpawnFlags {
+    /// No spawn flags set.
+    pub const EMPTY: DistSpawnFlags = DistSpawnFlags(0);
+
+    /// [`DIST_SPAWN_FLAG_LINK`].
+    pub const LINK: DistSpawnFlags = DistSpawnFlags(DIST_SPAWN_FLAG_LINK);
+
+    /// [`DIST_SPAWN_FLAG_MONITOR`].
+    pub const MONITOR: DistSpawnFlags = DistSpawnFlags(DIST_SPAWN_FLAG_MONITOR);
+
+    /// The raw 32-bit flag word.
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Wraps a raw 32-bit flag word.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> DistSpawnFlags {
+        DistSpawnFlags(bits)
+    }
+
+    /// Returns `true` when **every** bit of `other` is set in `self`.
+    #[inline]
+    pub const fn contains(self, other: DistSpawnFlags) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Sets every bit of `other`.
+    #[inline]
+    pub fn insert(&mut self, other: DistSpawnFlags) {
+        self.0 |= other.0;
+    }
+
+    /// Clears every bit of `other`.
+    #[inline]
+    pub fn remove(&mut self, other: DistSpawnFlags) {
+        self.0 &= !other.0;
+    }
+}
+
+/// The `Flags` element of a `DOP_ALTACT_SIG_SEND` control message
+/// (`ERTS_DOP_ALTACT_SIG_FLG_*`, `dist.h:188-192`).
+///
+/// Five bits select the signal kind and shape (exit vs. message signal, alias
+/// vs. name vs. pid target, priority, and the presence of a trailing token);
+/// the C path tolerates wider flag integers and applies the same set operations.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug)]
+pub struct AltactSigFlags(u32);
+
+impl AltactSigFlags {
+    /// No altact flags set.
+    pub const EMPTY: AltactSigFlags = AltactSigFlags(0);
+
+    /// [`DOP_ALTACT_SIG_FLG_PRIO`].
+    pub const PRIO: AltactSigFlags = AltactSigFlags(DOP_ALTACT_SIG_FLG_PRIO);
+
+    /// [`DOP_ALTACT_SIG_FLG_TOKEN`].
+    pub const TOKEN: AltactSigFlags = AltactSigFlags(DOP_ALTACT_SIG_FLG_TOKEN);
+
+    /// [`DOP_ALTACT_SIG_FLG_ALIAS`].
+    pub const ALIAS: AltactSigFlags = AltactSigFlags(DOP_ALTACT_SIG_FLG_ALIAS);
+
+    /// [`DOP_ALTACT_SIG_FLG_NAME`].
+    pub const NAME: AltactSigFlags = AltactSigFlags(DOP_ALTACT_SIG_FLG_NAME);
+
+    /// [`DOP_ALTACT_SIG_FLG_EXIT`].
+    pub const EXIT: AltactSigFlags = AltactSigFlags(DOP_ALTACT_SIG_FLG_EXIT);
+
+    /// The raw 32-bit flag word.
+    #[inline]
+    pub const fn bits(self) -> u32 {
+        self.0
+    }
+
+    /// Wraps a raw 32-bit flag word.
+    #[inline]
+    pub const fn from_bits(bits: u32) -> AltactSigFlags {
+        AltactSigFlags(bits)
+    }
+
+    /// Returns `true` when **every** bit of `other` is set in `self`.
+    #[inline]
+    pub const fn contains(self, other: AltactSigFlags) -> bool {
+        (self.0 & other.0) == other.0
+    }
+
+    /// Sets every bit of `other`.
+    #[inline]
+    pub fn insert(&mut self, other: AltactSigFlags) {
+        self.0 |= other.0;
+    }
+
+    /// Clears every bit of `other`.
+    #[inline]
+    pub fn remove(&mut self, other: AltactSigFlags) {
+        self.0 &= !other.0;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // Handshake / version tags (ei_connect_int.h, ei_connect.c).
 // ---------------------------------------------------------------------------
 

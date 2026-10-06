@@ -164,13 +164,17 @@ pub struct TableOptions {
     access: Access,
     /// Whether `named_table` was requested.
     named: bool,
-    /// The explicitly registered name (`Some` iff named).
+    /// The registered name, if one was given. Recorded for every table (the
+    /// oracle's `ets:info/2` `name` always returns it), independent of the
+    /// `named_table` flag.
     name: Option<Atom>,
     /// Whether `compressed` was requested.
     compressed: bool,
-    /// Whether `write_concurrency` was requested.
+    /// Whether `write_concurrency` was requested. The **effective** value is
+    /// [`TableOptions::write_concurrency`] (a `private` table forces it off).
     write_concurrency: bool,
-    /// Whether `read_concurrency` was requested.
+    /// Whether `read_concurrency` was requested. The **effective** value is
+    /// [`TableOptions::read_concurrency`] (a `private` table forces it off).
     read_concurrency: bool,
 }
 
@@ -216,10 +220,15 @@ impl TableOptions {
         self
     }
 
-    /// Set the registered table name (implies a named table).
+    /// Record the registered table name.
+    ///
+    /// This records the name only; it does **not** by itself mark the table
+    /// `named_table` (that is [`set_named`](TableOptions::set_named)). The two
+    /// are independent, exactly as in the oracle: `ets:new(myanon, [])` reports
+    /// `name => myanon` but `named_table => false`, and only the `named_table`
+    /// option makes the name resolve to the table.
     pub fn set_name(&mut self, name: Atom) -> &mut Self {
         self.name = Some(name);
-        self.named = true;
         self
     }
 
@@ -271,20 +280,45 @@ impl TableOptions {
         self.compressed
     }
 
-    /// Whether `write_concurrency` was requested.
+    /// Whether `write_concurrency` is **in effect** for the table.
+    ///
+    /// A `private` table never gets concurrent writers: the oracle only sets the
+    /// fine-locked flag when the table is not `DB_PRIVATE`
+    /// (`if (is_fine_locked && !(status & DB_PRIVATE))`,
+    /// `../../erts/emulator/beam/erl_db.c`), so
+    /// `ets:new(t, [private, {write_concurrency, true}])` reports `false` (verified
+    /// against the system `erl`, OTP 29 / erts-17.1). The normalization lives in
+    /// this getter — not in [`Table::info`](crate::Table::info) — so the option set
+    /// and every reader of the flag agree, and it is **order-independent**: the
+    /// builder may be told the access mode or the flag first.
     pub fn write_concurrency(&self) -> bool {
-        self.write_concurrency
+        self.write_concurrency && !self.is_private()
     }
 
-    /// Whether `read_concurrency` was requested.
+    /// Whether `read_concurrency` is **in effect** for the table. Normalized like
+    /// [`write_concurrency`](TableOptions::write_concurrency): a `private` table
+    /// reports `false` even when the flag was requested.
     pub fn read_concurrency(&self) -> bool {
-        self.read_concurrency
+        self.read_concurrency && !self.is_private()
     }
 
-    /// The concurrency mode derived from the `read_concurrency` /
-    /// `write_concurrency` flags (both set ⇒ [`Concurrency::ReadWrite`]).
+    /// Whether this option set describes a `private` table.
+    ///
+    /// `private` is the one access mode the oracle treats specially: it forces the
+    /// concurrency flags off. `compressed` is **not** affected (a private
+    /// compressed table reports `compressed => true`), so it is deliberately left
+    /// out of the normalization.
+    fn is_private(&self) -> bool {
+        self.access == Access::Private
+    }
+
+    /// The concurrency mode in effect, derived from the normalized
+    /// [`read_concurrency`](TableOptions::read_concurrency) /
+    /// [`write_concurrency`](TableOptions::write_concurrency) flags (both set ⇒
+    /// [`Concurrency::ReadWrite`]; a `private` table is always
+    /// [`Concurrency::None`]).
     pub fn concurrency(&self) -> Concurrency {
-        match (self.read_concurrency, self.write_concurrency) {
+        match (self.read_concurrency(), self.write_concurrency()) {
             (true, true) => Concurrency::ReadWrite,
             (true, false) => Concurrency::Read,
             (false, true) => Concurrency::Write,
@@ -442,12 +476,19 @@ mod tests {
     }
 
     #[test]
-    fn set_name_implies_named() {
+    fn set_name_does_not_imply_named() {
+        // `name` and `named_table` are independent, as in the oracle:
+        // `ets:info(ets:new(n, []), named_table) =:= false` while `name` is `n`.
         let mut opts = TableOptions::new();
         assert!(!opts.is_named());
 
         let name = Atom::from_raw(7);
         opts.set_name(name);
+        assert!(!opts.is_named());
+        assert_eq!(opts.name(), Some(name));
+
+        // The `named_table` option is what sets the flag (`set_named`).
+        opts.set_named(true);
         assert!(opts.is_named());
         assert_eq!(opts.name(), Some(name));
     }
@@ -526,6 +567,47 @@ mod tests {
         assert_eq!(opts.concurrency(), Concurrency::None);
     }
 
+    /// A `private` table reports both concurrency flags as `false` however they
+    /// were requested — and whatever the order, since the rule is applied when the
+    /// flags are read. Verified against the system `erl` (OTP 29 / erts-17.1):
+    /// `ets:info(ets:new(t, [private, {write_concurrency,true},
+    /// {read_concurrency,true}]), write_concurrency) =:= false`.
+    #[test]
+    fn private_tables_force_the_concurrency_flags_off() {
+        for access in [Access::Public, Access::Protected] {
+            let mut opts = TableOptions::new();
+            opts.set_access(access)
+                .set_write_concurrency(true)
+                .set_read_concurrency(true);
+            assert!(opts.write_concurrency(), "{access:?} keeps write_concurrency");
+            assert!(opts.read_concurrency(), "{access:?} keeps read_concurrency");
+            assert_eq!(opts.concurrency(), Concurrency::ReadWrite);
+        }
+
+        // The flag may be set before or after the access mode: both orders agree.
+        let mut flag_first = TableOptions::new();
+        flag_first
+            .set_write_concurrency(true)
+            .set_read_concurrency(true)
+            .set_access(Access::Private);
+        let mut access_first = TableOptions::new();
+        access_first
+            .set_access(Access::Private)
+            .set_write_concurrency(true)
+            .set_read_concurrency(true);
+        for opts in [&flag_first, &access_first] {
+            assert!(!opts.write_concurrency());
+            assert!(!opts.read_concurrency());
+            assert_eq!(opts.concurrency(), Concurrency::None);
+        }
+
+        // `compressed` is **not** forced off by `private` (the oracle reports
+        // `compressed => true` for a private compressed table).
+        let mut compressed = TableOptions::new();
+        compressed.set_access(Access::Private).set_compressed(true);
+        assert!(compressed.is_compressed());
+        assert!(!compressed.write_concurrency());
+    }
     #[test]
     fn can_read_matrix() {
         let a = OwnerId::new(1);

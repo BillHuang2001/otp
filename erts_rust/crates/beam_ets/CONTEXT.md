@@ -43,7 +43,9 @@ Re-exported at the crate root and via `beam_ets::prelude::*`.
   `set_access`, `set_named(bool)`, `set_name(Atom)`, `set_compressed(bool)`,
   `set_write_concurrency(bool)`, `set_read_concurrency(bool)`; getters `kind()/keypos()/access()/
   is_named()/name() -> Option<Atom>/is_compressed()/write_concurrency()/read_concurrency()/
-  concurrency() -> Concurrency`; `impl Default`.
+  concurrency() -> Concurrency`; `impl Default`. `set_name` records the registered name **only** —
+  it does not set the `named_table` flag (that is `set_named`), mirroring the oracle where
+  `ets:new(myanon, [])` reports `name => myanon` but `named_table => false`.
 - `pub fn can_read(access: Access, owner: Option<OwnerId>, requester: Option<OwnerId>) -> bool` and
   `pub fn can_write(...) -> bool` — the access matrix (`requester == owner` ⇒ everything).
 
@@ -85,7 +87,7 @@ impl Table {
     // metadata
     pub fn id(&self) -> TableId;
     pub fn kind(&self) -> TableKind;
-    pub fn name(&self) -> Option<Atom>;      // Some iff named_table
+    pub fn name(&self) -> Option<Atom>;      // Some iff a name was recorded (independent of named_table)
     pub fn keypos(&self) -> usize;           // 1-based
     pub fn access(&self) -> Access;
     pub fn owner(&self) -> Option<OwnerId>;
@@ -95,7 +97,7 @@ impl Table {
     // writes (object = the whole tuple; key derived from keypos)
     pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
     pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool>; // false if key exists
-    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>;
+    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()>; // ATOMIC: validates the whole list first
     pub fn delete(&mut self, key: Eterm, atoms: &AtomTable) -> Result<()>;          // ets:delete/2 (by key)
     pub fn delete_object(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()>;
     pub fn delete_all_objects(&mut self);
@@ -103,8 +105,10 @@ impl Table {
     // reads
     pub fn lookup(&self, key: Eterm, atoms: &AtomTable) -> Vec<Eterm>;              // 0/1 for set/ordered_set
     pub fn member(&self, key: Eterm, atoms: &AtomTable) -> bool;
-    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // badarg if absent
-    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>;
+    pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>; // scalar; `unsupported` raise for bag/duplicate_bag
+    pub fn lookup_element_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Eterm>; // scalar; absent key ⇒ default, `unsupported` raise for multi kinds
+    pub fn lookup_element_all(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>>; // the Pos-th element of EVERY object under key (the multi kinds' list result)
+    pub fn lookup_element_all_or(&self, key: Eterm, pos: usize, default: Eterm, atoms: &AtomTable) -> Result<Option<Vec<Eterm>>>; // Ok(None) ⇒ caller yields `default`
     pub fn memory(&self) -> usize;                                                  // store words + interior words
     pub fn size(&self) -> usize;                                                    // objects (not keys) for bag/dup_bag
     pub fn is_empty(&self) -> bool;
@@ -138,7 +142,7 @@ impl Table {
 }
 ```
 - `pub(crate) trait Interior` — the internal dispatch seam implemented by the two interiors
-  (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`size`/
+  (`insert`/`insert_new`/`delete`/`delete_object`/`lookup`/`member`/`lookup_element`/`lookup_elements`/`size`/
   `iter_objects`/`keys`/`take`/`first_key`/`last_key`/`next_key`/`prev_key`/`memory`/
   `update_counter`/`update_element`). `Table` stores `Box<dyn Interior>`. `insert` returns
   `Result<bool>` — **whether the object was retained** — so `Table::insert` reclaims the deep copy it
@@ -154,7 +158,7 @@ impl Table {
   `insert_new`, `delete`, `delete_object`, `delete_all_objects`, `take -> Result<Vec<Eterm>>`,
   `update_counter`, `update_counter_with`, `update_element`, `select_delete`, `match_delete`; and
   read-checked `lookup -> Result<Vec<Eterm>>`, `member -> Result<bool>`, `lookup_element`,
-  `lookup_element_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
+  `lookup_element_or`, `lookup_element_all`, `lookup_element_all_or`, `select`, `select_count`, `match_object`, `match_`, `first`/`last`/`next`/`prev
   -> Result<Option<Eterm>>`, `tab2list -> Result<Vec<Eterm>>`, `size -> Result<usize>`,
   `is_empty -> Result<bool>`. `first`/`last`/`next`/`prev` are table-level, so the same read-checked
   wrappers cover every kind (`ordered_set`'s interior overrides the underlying `first_key`/`last_key`/
@@ -212,12 +216,17 @@ impl Table {
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
   Option<OwnerId>, named_table: bool, compressed: bool, write_concurrency: bool, read_concurrency: bool }`;
-  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — the `{Key, Value}` pairs
-  (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/`named_table`/…) the BIF layer
-  turns into the `ets:info/1` list. Heap-free.
+  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — a heap-free subset of the
+  `{Key, Value}` pairs (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/
+  `named_table`/…). The *observable* `ets:info/1` proplist is built by the sibling `beam_bifs`
+  bridge, not by this method; see Known Issues for the omitted fields.
 
 ### `error.rs` — failure constructors
-- `pub(crate) fn badarg() -> BeamError` (and siblings). No crate-local error enum.
+- `pub(crate) fn badarg() -> BeamError` — the `badarg` failures (bad object/`keypos`, absent element,
+  malformed spec, …).
+- `pub(crate) fn unsupported(what: &str) -> BeamError` — a `BeamError::Raise` (error class) with
+  reason atom `unsupported_ets: <what>`, for an operation the crate deliberately does not implement
+  (currently the scalar `lookup_element` on a multi kind). No crate-local error enum.
 
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. `badarg`-style failures ⇒ `BeamError::BadArg`;
@@ -281,26 +290,40 @@ impl Table {
   by the runtime); threading `&AtomTable` matches `beam_term`'s `cmp`/`eq`/`term_hash` signatures.
 - **`size` counts objects, not keys.** For `bag`/`duplicate_bag` a key may hold many objects; `size`
   returns the object count (matching `ets:info(T, size)`), which differs from the entry count.
+- **The registered `name` and the `named_table` flag are independent.** `set_name` records the name
+  only; `set_named`/the `named_table` option sets the flag — mirroring the oracle
+  (`ets:new(myanon, [])` ⇒ `name => myanon` but `named_table => false`).
+- **A `private` table reports the concurrency flags as `false`.** The `TableOptions`
+  `write_concurrency()`/`read_concurrency()` getters (hence `concurrency()`) normalize to `false`
+  when `access == Private`, matching the oracle (`is_fine_locked && !DB_PRIVATE` in `erl_db.c`);
+  `compressed` is unaffected. Normalizing in the getters keeps `TableOptions`, `TableInfo` and the
+  bridge in agreement and makes the rule order-independent (access may be set before or after).
+- **`insert_list` is atomic.** It validates *and deep-copies* every object before the first index
+  mutation, freeing the copies on failure — so a `badarg` anywhere in the list leaves the table
+  unchanged, as the oracle does.
 
 ## Test Strategy
 - Per-module `#[cfg(test)] mod tests` in each `src/` module (`store/tests.rs` holds `TermStore`'s,
   split out to keep `store/mod.rs` small): kind/options, key validation, store copy/free/reuse and
   `relinquish` (check-out), `Table`-level insert/take store-word accounting, hash-interior ops
   (incl. the `insert`-retained-bool), B+-tree invariants (incl. 10 000-key churn), select
-  compile/execute, info. 84 unit tests.
+  compile/execute, info. 91 unit tests.
 - Crate-level integration over the **public API only**, split by concern: `tests/ets_basic.rs`
   (incl. `take` reclamation + churn), `ets_order.rs`, `ets_select.rs`, `ets_bag.rs` (incl. the
   duplicate-insert / `insert_new` copy-leak checks), `ets_info.rs`, `ets_nav.rs` (incl. the
   order-independent hash-navigation contract), `ets_access.rs`, `ets_update.rs`, sharing helpers from
-  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 53 ETS tests + 18 select
+  `tests/common/mod.rs`; plus `tests/select.rs` for the match-spec subset. 60 ETS tests + 18 select
   tests.
-- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 61 cases
+- **Differential evidence suite** (the compatibility gate): `tests/differential.rs` drives 76 cases
   (`tests/differential/battery/*.rs`) identically under the **system `erl`** (OTP 29 / erts-17.1, the
   embedded program in `tests/differential/erl_program.rs`) and under `beam_ets`, comparing canonical
   renderings line-by-line (atoms/small ints/tuples/proper lists; order-insensitive values sorted;
   table ids/`memory`/pids/floats/binaries never rendered). Coverage: all 4 kinds × 8 core ops,
   `{keypos,2}`, ordered navigation, `update_counter/3,4` + `update_element`, `take`/`lookup_element`,
-  the select/match family with guards, malformed specs, and >10 000-key tables. `KNOWN_DIVERGENCES`
+  the select/match family with guards, malformed specs, >10 000-key tables, and an `info`/option
+  group (name vs `named_table`, the `ets:info/2` option fields incl. the `private` concurrency
+  flags and unknown-key `badarg`, the multi-kind `lookup_element` list, and atomic `insert_list`).
+  `KNOWN_DIVERGENCES`
   is empty. Without `erl` the live-oracle test skips; `BEAM_ETS_REQUIRE_ORACLE=1` turns the skip into
   a failure (use it in CI).
 - **Gates (GREEN required):**
@@ -312,7 +335,20 @@ impl Table {
 ## Known Issues (honest gaps — not full parity)
 - **`Concurrency` is advisory.** `read_concurrency`/`write_concurrency` are parsed and reported but
   there is no locking or per-reader table; a `Table` is single-threaded.
-- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
+- **`ets:info/1` field set is a subset.** `TableInfo::entries` emits 12 of the oracle's 15 fields —
+  it omits `heir`, `node` and `decentralized_counters`, and renders `owner` as `undefined` and `id`
+  as a small integer (M1 has no pid/node/ref terms). The observable `ets:info/1` proplist is produced
+  by the sibling `beam_bifs` bridge; `entries` is a heap-free convenience used by tests.
+- **Scalar `lookup_element` is unsupported for the multi kinds.** `Table::lookup_element`/
+  `lookup_element_or` raise `unsupported_ets` for `bag`/`duplicate_bag` (the oracle returns a *list*
+  there); the faithful form is `lookup_element_all`/`lookup_element_all_or`. **Handoff:** the
+  `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
+  build the list.
+- **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
+  `select/3` + `select_reverse/*`, `match/3`, `match_object/3` (limited), `foldl`/`foldr`,
+  `select_replace/2`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`, `table/1,2`, `slot/2`,
+  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1` do **not** exist in
+  OTP 29, so their absence is correct — `ets:info(T, size)` is the supported spelling).- **Named-table lookup-by-name is the runtime's job, not this crate's.** `Table` exposes `name()`/
   `is_named()` only; the name→table registry is the sibling `beam_bifs::ets::TableRegistry` (this
   crate holds no global state, so it must not duplicate that registry).
 - **Deep-copy is a subset.** Funs, hash-maps, records, external pid/port/ref and off-heap bin
@@ -329,9 +365,10 @@ impl Table {
 - `src/key.rs` → object/key validation (`key_of`, `is_valid_object`, `object_elements`)
 - `src/store/mod.rs` → `TermStore` (table-owned arena + copy/free/reuse) — the copy boundary
 - `src/store/tests.rs` → the `TermStore` unit-test module
-- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, navigation, `select_all`, metadata
+- `src/table/mod.rs` → `Table`/`TableId`/`OwnerId`, the `Interior` trait, op dispatch, reads/navigation, `select_all`, metadata
 - `src/table/access.rs` → `TableAccess` (access-enforcing view)
-- `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors)
+- `src/table/element.rs` → the table-level `ets:update_counter/3,4` + `ets:update_element/3` operations
+- `src/table/update.rs` → `update_counter`/`update_element` operand machinery (shared with the interiors and `element.rs`)
 - `src/hash_interior.rs` → `HashInterior` (bucket hash index) for `set`/`bag`/`duplicate_bag`
 - `src/ordered_interior/mod.rs` → `OrderedSetInterior` (B+-tree) for `ordered_set` + its `Interior` impl
 - `src/ordered_interior/node.rs` → node layout, `ORDER`/`MIN_OCCUPANCY`, `NodeStore` arena
@@ -342,7 +379,7 @@ impl Table {
 - `src/select/expr.rs` → guard/body expression language (`Expr`/`CmpOp`/`TypeTest`)
 - `src/select/exec.rs` → `impl Table` select family (`select`/`select_delete`/`select_count`/`match*`) + `BodyKind`
 - `src/info.rs` → `TableInfo` + `entries` (the `ets:info` pairs)
-- `src/error.rs` → `badarg`/failure constructors (no new error enum)
+- `src/error.rs` → `badarg`/`unsupported` failure constructors (no new error enum)
 - `tests/common/mod.rs` → shared integration-test helpers (one home, no duplication)
 - `tests/ets_*.rs` → public-API integration tests by concern (basic/order/select/bag/info/nav/access/update)
 - `tests/select.rs` → the match-spec compiler integration tests

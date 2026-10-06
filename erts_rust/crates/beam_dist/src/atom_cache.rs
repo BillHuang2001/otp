@@ -77,44 +77,39 @@
 //! `erts_encode_ext_dist_header_finalize`, and the decode-side `attab`), `external.h`
 //! and `erts/doc/guides/erl_ext_dist.md`.
 //!
-//! # Handoff: the `beam_codec` hook that finishes send-side ref emission
+//! # The `beam_codec` seam: `AtomCacheWriter`
 //!
-//! `beam_codec`'s `Encoder` currently never emits `ATOM_CACHE_REF` (`82`) — it
-//! always writes the atom text inline. Everything needed to *classify* an atom
-//! (`New` vs `Cached`) and to *address* it is implemented here; what is missing is
-//! the encoder's willingness to write `82 + index` instead of the atom name.
 //! `beam_codec` must not depend on `beam_dist` (the DAG is `beam_dist →
-//! beam_codec`), so the hook is a narrow trait that `beam_codec` owns and
-//! `beam_dist` implements:
+//! beam_codec`), so the send-side payload emission is a narrow trait that
+//! `beam_codec` owns — [`beam_codec::AtomCacheWriter`] — and [`OutboundAtomCache`]
+//! implements ([`intern`](beam_codec::AtomCacheWriter::intern)). The encoder
+//! installs it through
+//! [`Encoder::with_atom_cache`](beam_codec::Encoder::with_atom_cache); from
+//! then on every atom it writes is offered to
+//! [`intern`](beam_codec::AtomCacheWriter::intern) and, when that returns an index,
+//! is emitted as `ATOM_CACHE_REF` (`82`) + the one-byte index instead of the atom
+//! text (C `enc_atom`, `external.c:2877`: an inline atom only when the cache map
+//! yields no index).
 //!
-//! ```ignore
-//! // in beam_codec (new):
-//! /// Registers `atom` with the outbound cache for the message being encoded and
-//! /// returns its payload `ATOM_CACHE_REF` index, or `None` when the atom cannot
-//! /// be cached (write it inline instead, exactly as `enc_atom` does when
-//! /// `get_iix_acache_map` returns -1).
-//! pub trait AtomCacheWriter {
-//!     fn intern(&mut self, atom: Atom, atoms: &AtomTable) -> Option<u8>;
-//! }
+//! The encoder walks the message in payload order and `intern` gives each newly
+//! referenced atom the next sequential position, so those positions *are* the
+//! header's `AtomCacheReferenceIndex` order — the caller emits the matching
+//! [`DistHeader`] from [`take_header`](OutboundAtomCache::take_header) and a
+//! receiver resolves each `82 n` to header ref `n` (see [`apply_header`]).
 //!
-//! impl<'a> Encoder<'a> {
-//!     /// From here on `encode` writes `ATOM_CACHE_REF` (82) + the one-byte index
-//!     /// returned by `intern` for every atom, instead of
-//!     /// `SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`.
-//!     pub fn with_atom_cache(self, cache: &'a mut dyn AtomCacheWriter) -> Encoder<'a>;
-//! }
-//! ```
+//! [`OutboundAtomCache`]'s [`intern`](beam_codec::AtomCacheWriter::intern) performs
+//! the same classification as [`ref_for`](OutboundAtomCache::ref_for) and returns
+//! the bare [`payload_index`](OutboundAtomCache::payload_index). The
+//! [`ref_for`](OutboundAtomCache::ref_for)/[`payload_ref_for`](OutboundAtomCache::payload_ref_for)
+//! pair remains the manual API for callers that build the payload themselves. No
+//! other `beam_codec` change is needed: the *decoder* already resolves `82` through
+//! `Decoder::with_atom_cache`, and the `LongAtoms` / per-message budget / collision
+//! rules live here, not in the codec.
 //!
-//! [`OutboundAtomCache::ref_for`] + [`OutboundAtomCache::payload_index`] (or the
-//! one-call [`OutboundAtomCache::payload_ref_for`]) are the concrete `intern`
-//! implementation on this side. No other `beam_codec` change is needed: the
-//! *decoder* already resolves `82` through `Decoder::with_atom_cache`, and the
-//! `LongAtoms` / per-message budget / collision rules do not live in the codec.
-//!
-//! Note that the legacy `NEW_CACHE` / `NEW_ATOM_CACHE_REF` tag (`78`) is **not**
-//! required: `external.h` defines it (`#define NEW_CACHE 'N'`) but ERTS's encoder
-//! never emits it — new atoms travel in the distribution *header*, and the payload
-//! only ever writes `82`. Only `82` must be emitted.
+//! The legacy `NEW_CACHE` / `NEW_ATOM_CACHE_REF` tag (`78`) is **not** emitted:
+//! `external.h` defines it (`#define NEW_CACHE 'N'`) but ERTS's encoder never
+//! writes it — new atoms travel in the distribution *header*, and the payload only
+//! ever carries `82`.
 
 use std::collections::HashMap;
 
@@ -432,9 +427,10 @@ impl OutboundAtomCache {
     /// it — `[82, index]` — or `None` when the atom is not cacheable and must be
     /// written inline.
     ///
-    /// This is the send-side payload emission, gated behind this explicit API
-    /// until `beam_codec`'s encoder can perform it inline (see the module docs,
-    /// "Handoff"). The header must still be written from
+    /// This is the explicit form of the send-side payload emission, for a caller
+    /// that builds the payload itself; the [`beam_codec::AtomCacheWriter`] impl
+    /// below performs the same step inline while `beam_codec`'s encoder writes the
+    /// payload. The header must still be written from
     /// [`take_header`](Self::take_header) — the payload only carries the index.
     pub fn payload_ref_for(&mut self, atom: Atom, atoms: &AtomTable) -> Option<[u8; 2]> {
         self.ref_for(atom, atoms)?;
@@ -488,6 +484,29 @@ impl OutboundAtomCache {
     /// The persistent per-connection cache (`out_arr`).
     pub fn persistent(&self) -> &SegmentCache {
         &self.persistent
+    }
+}
+
+/// The concrete [`beam_codec::AtomCacheWriter`] for the outbound cache.
+///
+/// [`Encoder::with_atom_cache`](beam_codec::Encoder::with_atom_cache) installs it,
+/// making the encoder emit `ATOM_CACHE_REF` (`82`) + the returned index for every
+/// atom the message references instead of the inline atom text. It performs the
+/// exact classification of [`ref_for`](OutboundAtomCache::ref_for) — registering
+/// the ref (deciding [`New`](AtomCacheRef::New) vs [`Cached`](AtomCacheRef::Cached),
+/// enforcing the per-message ref budget and refusing a slot collision) — and then
+/// returns the resulting [`payload_index`](OutboundAtomCache::payload_index). A
+/// [`None`] return means "not cacheable — write the atom text inline", which is C's
+/// `get_iix_acache_map` returning `-1`.
+///
+/// The index it returns is the atom's position in
+/// [`header`](OutboundAtomCache::header)`().refs`, i.e. exactly the payload
+/// `AtomCacheReferenceIndex` a receiver resolves after applying that header. Because
+/// the encoder walks the payload in order, the positions are assigned in that order.
+impl beam_codec::AtomCacheWriter for OutboundAtomCache {
+    fn intern(&mut self, atom: Atom, atoms: &AtomTable) -> Option<u8> {
+        self.ref_for(atom, atoms)?;
+        self.payload_index(atom)
     }
 }
 
@@ -839,5 +858,62 @@ mod tests {
         outbound.clear();
         assert_eq!(outbound.ref_for(atom(42), &atoms).unwrap(), new);
         assert_eq!(outbound.persistent().occupied(), 1);
+    }
+
+    // -----------------------------------------------------------------------
+    // The `beam_codec::AtomCacheWriter` impl (`intern`)
+    // -----------------------------------------------------------------------
+
+    /// Calls [`beam_codec::AtomCacheWriter::intern`] without importing the trait.
+    fn intern(cache: &mut OutboundAtomCache, atom: Atom, atoms: &AtomTable) -> Option<u8> {
+        beam_codec::AtomCacheWriter::intern(cache, atom, atoms)
+    }
+
+    #[test]
+    fn intern_returns_the_ref_position_and_repeats_reuse_it() {
+        let atoms = AtomTable::new();
+        let mut outbound = OutboundAtomCache::new();
+
+        // The returned index is the ref's *position* in `header().refs`, in the
+        // order the encoder consults the cache (which is payload order).
+        assert_eq!(intern(&mut outbound, atom(5), &atoms), Some(0));
+        assert_eq!(intern(&mut outbound, atom(6), &atoms), Some(1));
+        // A repeated atom re-uses its original position.
+        assert_eq!(intern(&mut outbound, atom(5), &atoms), Some(0));
+        assert_eq!(outbound.len(), 2);
+
+        let header = outbound.header();
+        assert_eq!(header.refs.len(), 2);
+        assert_eq!(header.refs[0], AtomCacheRef::New { segment: 0, index: 5, atom: atom(5) });
+        assert_eq!(header.refs[1], AtomCacheRef::New { segment: 0, index: 6, atom: atom(6) });
+    }
+
+    #[test]
+    fn intern_refuses_a_slot_collision() {
+        let atoms = AtomTable::new();
+        let mut outbound = OutboundAtomCache::new();
+        // 0 and 2039 both hash to slot 0; the second cannot be cached in this message.
+        assert_eq!(intern(&mut outbound, atom(0), &atoms), Some(0));
+        assert_eq!(intern(&mut outbound, atom(2039), &atoms), None);
+        assert_eq!(outbound.len(), 1);
+        // The first atom keeps its position.
+        assert_eq!(intern(&mut outbound, atom(0), &atoms), Some(0));
+    }
+
+    #[test]
+    fn intern_stops_at_the_ref_budget() {
+        let atoms = AtomTable::new();
+        let mut outbound = OutboundAtomCache::new();
+        // 255 distinct atoms with distinct slots (raw 0..=254 hash to themselves)
+        // get positions 0..=254.
+        for raw in 0..MAX_ATOM_CACHE_REFS as u32 {
+            assert_eq!(intern(&mut outbound, atom(raw), &atoms), Some(raw as u8), "raw {raw}");
+        }
+        assert_eq!(outbound.len(), MAX_ATOM_CACHE_REFS);
+        // The 256th distinct atom cannot be cached; the caller writes it inline.
+        assert_eq!(intern(&mut outbound, atom(255), &atoms), None);
+        assert_eq!(outbound.len(), MAX_ATOM_CACHE_REFS);
+        // An atom already in the message is still returned.
+        assert_eq!(intern(&mut outbound, atom(0), &atoms), Some(0));
     }
 }

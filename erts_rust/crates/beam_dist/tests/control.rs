@@ -19,7 +19,7 @@ use beam_codec::{
     SMALL_TUPLE_EXT, VERSION_MAGIC,
 };
 use beam_common::BeamError;
-use beam_dist::control::{decode_control, encode_control};
+use beam_dist::control::{decode_control, encode_control, encode_control_cached};
 use beam_dist::flags::{Dop, DOP_REG_SEND, DOP_SEND};
 use beam_term::prelude::{make_atom, make_small, Eterm, NIL};
 use beam_term::{Atom, AtomTable};
@@ -573,4 +573,100 @@ fn atom_cache_ref_to_an_unset_slot_is_rejected() {
     let body = send_tuple_with_ref_to_slot_7();
     let result = decode_control(&body, &mut fixture.heap, &mut fixture.atoms, Some(&cache));
     assert!(matches!(result, Err(BeamError::BadArg)));
+}
+
+// ---------------------------------------------------------------------------
+// The outbound atom cache seam (`encode_control_cached`).
+// ---------------------------------------------------------------------------
+
+/// Records every atom the encoder offers, in order, and returns a fixed index for
+/// exactly one chosen atom (the rest are written inline).
+struct ChosenCache {
+    /// The one atom this cache accepts.
+    chosen: Atom,
+    /// The payload index returned for `chosen`.
+    index: u8,
+    /// Every atom the encoder consulted, in payload order.
+    seen: Vec<Atom>,
+}
+
+impl beam_codec::AtomCacheWriter for ChosenCache {
+    fn intern(&mut self, atom: Atom, _atoms: &AtomTable) -> Option<u8> {
+        self.seen.push(atom);
+        (atom == self.chosen).then_some(self.index)
+    }
+}
+
+#[test]
+fn encode_control_cached_without_a_cache_is_byte_identical() {
+    let mut fixture = Fixture::new();
+    let from = fixture.atom("from");
+    let to = fixture.atom("to_name");
+    let terms = [from, to];
+
+    let plain = encode_control(Dop::Link, &terms, &fixture.atoms).expect("encode_control");
+    let cached =
+        encode_control_cached(Dop::Link, &terms, &fixture.atoms, None).expect("no cache");
+    assert_eq!(plain, cached, "the `None` path is byte-identical to `encode_control`");
+}
+
+#[test]
+fn encode_control_cached_writes_a_cache_ref_for_a_cached_atom() {
+    let mut fixture = Fixture::new();
+    let cached_atom = fixture.intern("to_name");
+    let from_atom = fixture.intern("from");
+
+    let mut cache = ChosenCache { chosen: cached_atom, index: 7, seen: Vec::new() };
+    let body = encode_control_cached(
+        Dop::Link,
+        &[make_atom(from_atom), make_atom(cached_atom)],
+        &fixture.atoms,
+        Some(&mut cache),
+    )
+    .expect("encode_control_cached");
+
+    // The uncached atom is written inline; the cached one becomes `82, 7`.
+    let mut expected = vec![SMALL_TUPLE_EXT, 3, SMALL_INTEGER_EXT, Dop::Link.as_u8()];
+    expected.extend_from_slice(
+        &beam_codec::encode_term_body(make_atom(from_atom), &fixture.atoms).unwrap(),
+    );
+    expected.extend_from_slice(&[ATOM_CACHE_REF_EXT, 7]);
+    assert_eq!(body, expected);
+
+    // The cache was consulted for every atom, in payload order.
+    assert_eq!(cache.seen, vec![from_atom, cached_atom]);
+}
+
+#[test]
+fn encode_control_cached_reaches_the_trailing_message_term() {
+    let mut fixture = Fixture::new();
+    let msg_atom = fixture.intern("payload");
+
+    let mut cache = ChosenCache { chosen: msg_atom, index: 3, seen: Vec::new() };
+    let body = encode_control_cached(
+        Dop::Send,
+        &[make_small(1), make_small(2), make_atom(msg_atom)],
+        &fixture.atoms,
+        Some(&mut cache),
+    )
+    .expect("encode_control_cached");
+
+    // `{DOP_SEND, 1, 2}` has no atoms; the trailing message atom is the only one and
+    // it was cached as `82, 3`.
+    assert_eq!(
+        body,
+        vec![
+            SMALL_TUPLE_EXT,
+            3,
+            SMALL_INTEGER_EXT,
+            DOP_SEND,
+            SMALL_INTEGER_EXT,
+            1,
+            SMALL_INTEGER_EXT,
+            2,
+            ATOM_CACHE_REF_EXT,
+            3,
+        ]
+    );
+    assert_eq!(cache.seen, vec![msg_atom], "only the trailing message carries an atom");
 }

@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, fun, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, fun, record, number, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -133,7 +133,9 @@ operators) and `<`/`>` between same-typed terms.
 - `pub fn eq(a: Eterm, b: Eterm, atoms: &AtomTable) -> bool` — `cmp(a,b).is_eq()` (`=:=`).
 - `pub fn cmp_arith(a: Eterm, b: Eterm, atoms: &AtomTable) -> core::cmp::Ordering` — the
   arithmetic (`==`) order, reproducing `erts_cmp(a, b, exact=0, eq_only=0)` (differs from `cmp`
-  only for floats and mixed integer/float pairs).
+  only for floats and mixed integer/float pairs). A mixed integer/float pair is converted with
+  [`number::number_as_f64`](#numberrs--safe-numeric--f64-conversion) (single definition; the
+  former crate-private helper was removed).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
 ### `hashing.rs` — structural term hashing
@@ -276,6 +278,48 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
   fields `compare` compares — funs are no longer on an opaque fallback.
 
+### `record.rs` — native records (`ErtsRecordDefinition`/`ErtsRecordInstance`)
+The OTP 29 native-record term interior, owned here (the frozen-layout LCA) like [`fun.rs`]/[`refc.rs`].
+Ground truth `../../erts/emulator/beam/erl_record.h` + `erl_record.c` (`records_create_4`,
+`erts_canonical_record_def`, `records_get_2`, `records_get_field_names_1`, `records_is_exported_1`) and
+`external.c` (`RECORD_EXT`). A record is **two** boxed things:
+- **Instance** (`RECORD_INST_SIZE(n) == 2 + n` words), root `make_boxed(hp)`:
+  `[0] thing_word = make_record_header(n + 1)` (i.e. `make_header(n+1, RECORD_SUBTAG)`),
+  `[1] record_definition = make_boxed(def)` (a **tuple-tagged** pointer), `[2..2+n]` the field
+  **values in sorted-key order**. `record_field_count = header_arity - 1`.
+- **Definition** (`RECORD_DEF_SIZE(n) == 6 + n` words; its `thing_word` IS an arityval, so it reads as
+  a tuple via `tuple_val`): `[0] make_arityval(n + 5)`, `[1] field_order` (tuple
+  `[make_arityval(n)][rank…]`, `tuple0()` for `n == 0`), `[2] hash`, `[3] module`, `[4] name`,
+  `[5] is_exported` (the atom `true`/`false`), `[6..6+n]` the field **keys in ascending atom-index
+  order**. `field_order[declared_index]` = the field's rank in the sorted keys/values arrays (C
+  `order[fields[i].order] = make_small(i)`).
+- Construction block (exactly what `records_create_4` / the ETF decoder allocate):
+  `[field_order tuple (n+1, absent when n==0)][definition][instance]`.
+
+Public surface: size fns `RECORD_INST_FIXED_WORDS = 2` / `RECORD_DEF_FIXED_WORDS = 6` /
+`record_inst_size_words` / `record_def_size_words` / `record_block_words` (with `const _: () = assert!`
+pins); the heap-agnostic writer `unsafe write_record(hp, module, name, is_exported, fields, definition_hash)`
+(`fields` in declaration order; sorts keys by `atom_val`, builds `field_order`, stores values in sorted
+order; duplicate/non-atom keys and an arity overflow ⇒ `TermError::BadRecord`); and the readers
+(all `unsafe`, non-record/malformed ⇒ `BadRecord`): `record_field_count`, `record_definition`,
+`record_values`, `record_get(t, key, atoms) -> TermResult<Option<Eterm>>` (linear key scan via
+`compare::eq`), `record_is_native(t, module, name)`, `record_name_is(t, name)`, and the definition
+readers `record_definition_{field_count,module,name,is_exported,hash,keys,field_order}` plus
+`record_declaration_keys(def)`. `AM_TRUE`/`AM_FALSE` (= `Atom 1`/`0`, the `atom.names` order) are
+exported for the `is_exported` word; `boxed.rs` gained the one-line `make_record_header(size)`.
+
+### `number.rs` — safe numeric → `f64`
+The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
+`../../erts/emulator/beam/big.c:2412-2529` `big_to_double`; caller `emu/float_instrs.tab` `i_fconv`).
+- `pub fn big_to_f64(x: Eterm) -> Option<f64>` — a faithful `big_to_double`: `bitlen =
+  (limbs-1)*64 + msd_bits`, reject `bitlen > 1024`, take the top 54 bits and round to nearest
+  **ties-to-even**, scale by `2^exp`, apply the sign. `Some(d)` only for a finite representable
+  value; `None` for a non-bignum or an out-of-range magnitude (the C's `< 0`, which `i_fconv` turns
+  into `badarith`) — never a silently wrong value. This is the API `beam_engine`'s `Fconv` will adopt.
+- `pub fn number_as_f64(x: Eterm) -> f64` — total/panic-free: small → value, float → value, bignum →
+  `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. Used by
+  [`compare::cmp_arith`].
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
@@ -284,7 +328,7 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
 - **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `fun`, `map`,
-  `compare`, `hashing`, `bitstring`, `refc` (raw pointer deref). Every `unsafe fn` documents a
+  `record`, `compare`, `hashing`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
 - **Pure tag math is `const fn`** where the body allows (`raw`, `from_raw`, `primary_tag`, tag tests,
@@ -374,6 +418,15 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   raw words (`0xA8`/`0x124`), the `BinRef` word pin, the pinned 8-word combined pair
   (`[BinRef][ErlSubBits]`, root at `hp + 3`), windowed `refc_offset`/`refc_size`/`refc_bytes`, and
   `is_refc_binary` rejecting on-heap bitstrings, non-bin-ref sub-bitstrings, immediates and tuples.
+- `src/record.rs` carries its own suite pinning the raw record words (instance header `make_record_header(n+1)`,
+  definition `[0] == make_arityval(5+n)`, the module/name/is_exported words, keys sorted by `atom_val`,
+  values in sorted order) and the `field_order` index math (a declaration-order ≠ atom-order case,
+  `n == 0` empty record, `n` 1..3), plus every reader round-trip, `record_get` hit/miss,
+  `record_is_native`, duplicate/non-atom-key rejection and rejection of a tuple/immediate/map/definition.
+- `src/number.rs` carries its own suite for `big_to_f64`/`number_as_f64`: exact values with hand-computed
+  doubles (`2^60`, `2^64`, `2^100`, `-(2^70)`), the mantissa boundary and ties-to-even (`2^53+1 → 2^53`,
+  `2^53+3 → 2^53+4`), a case where the removed digit-by-digit accumulator was one ULP out, and the
+  `bitlen` 1024/1025 finite/overflow boundaries (cross-checked against the system `erl` `float/1`).
 - `tests/oracle.rs` — the crate-local **oracle cross-check**: spawns the system `erl`
   (`-noshell -eval`, text protocol — no ETF re-implementation, since dev-depending on `beam_codec`
   would cycle) and checks that `beam_term`'s map/bitstring *observables* agree with the real
@@ -405,11 +458,39 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
 - `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
+- `src/record.rs` → native records (`ErtsRecordDefinition`/`ErtsRecordInstance`): size fns, `write_record`, the `record_*` / `record_definition_*` readers (frozen record block; `erl_record.h`/`erl_record.c`)
+- `src/number.rs` → safe numeric → `f64`: `big_to_f64` (faithful `big_to_double`) + `number_as_f64`
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
 - `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
+
+## Handoffs (owned by other nodes — escalate writes to the parent)
+- **Structured exit/error reasons need a `beam_common` change — NOT fixable inside `beam_term` (owning node `../beam_common`).**
+  `ExitReason` carries a non-atom reason only as `Structured` with **no term** (`beam_common` must not
+  depend on `beam_term`, so it cannot hold an `Eterm`); the live term stays owned out-of-band by the
+  raising crate. Consequently `beam_bifs` collapses `{case_clause,X}`, `{bad_generator,X}`, `{badmap,M}`,
+  `{badkey,K}` and `badmatch` to `BeamError::BadArg`, and an *uncaught* structured raise reaches
+  `beam_rt` as a placeholder reason atom (`beam_rt::runner::exit_reason` interns `"<structured reason>"`).
+  The term-building primitives already exist here (`tuple`/`list`/`make_small`/`make_atom` — e.g.
+  `{badkey,K}` is a 2-tuple), so **no new `beam_term` API is required**; the missing piece is upstream.
+  **Required change:** give `Raise` (or `ExitReason`) an opaque live-reason slot that does not create a
+  `beam_term` dependency — e.g. a `Box<dyn Any + Send + Sync>` payload (or an equivalent documented
+  side-channel keyed by the `Raise`). **Adopters:** `beam_bifs` (build the reason term at the raise site
+  and attach it), `beam_engine` (`Machine::throw_with_trace` already keeps the live reason in
+  `pending_exception`; it must attach it to the propagated `BeamError::Raise`), `beam_rt`
+  (`runner::exit_reason` then uses the attached term instead of the `Display` fallback).
+  `function_clause` needs no term change: its reason is the bare atom (already
+  `ExitReason::atom("function_clause")`) and its *arguments* belong to the `StackTrace` in
+  `beam_common`, not this layer.
+- **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
+  `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
+  `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a
+  caller-supplied word (`write_record`'s `definition_hash`) because this crate's `hashing` is not
+  bit-exact to `make_hash2`, so `erlang:phash2/1` on a native record remains a hashing-module gap.
+  `compare`/`hashing`/`size` still treat records with their generic fallbacks (class-rank / opaque /
+  tuple-like); now that the interior is readable they can be made structural later.
 
 ## Known Issues
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
@@ -460,10 +541,13 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
   `cmp`/`eq`/`term_hash`/`size_object`/`AtomTable` access. A `#![deny(unsafe_code)]` consumer must
   deref `*boxed_val(t)` itself (unsafe) to reach into a tuple/list/map/float/binary; the header-word
   subtag tests (`header_subtag`, `BoxedTag::from_raw`, `is_*_header`) are safe but take a *header
-  word*, not a boxed term. The public map/bitstring/refc APIs added for siblings
+  word*, not a boxed term. The public map/bitstring/refc/record APIs added for siblings
   (`map::{write_map,map_get,map_pairs,map_put,map_remove}`, `bitstring::{bitstring_parts,bit_at,
-  float_bits,float_value,write_heap_bits,...}`, `refc::{bin_ref_parts,refc_bytes,...}`) are likewise
-  `unsafe`: callers carry a `// SAFETY:` rationale.
+  float_bits,float_value,write_heap_bits,...}`, `refc::{bin_ref_parts,refc_bytes,...}`,
+  `record::{write_record,record_get,record_is_native,record_definition_*}`) are likewise
+  `unsafe`: callers carry a `// SAFETY:` rationale. The one exception is
+  `number::{big_to_f64,number_as_f64}`, which are **safe** (a total, validated conversion — the crate's
+  `cmp`/`size_object` convention).
 - Interior layouts that are NOT externally pinned (list chunking, ETS tree shape) are open and
   documented at their own nodes. The map (flat-map + HAMT node) layout *is* owned here (`src/map.rs`)
   because `beam_gc` sizes it — keep it byte-compatible with the copier.

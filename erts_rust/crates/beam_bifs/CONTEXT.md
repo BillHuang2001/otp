@@ -43,7 +43,7 @@ pub struct BifRegistry { /* HashMap<(String, String, u32), BifFn> */ }
 
 impl BifRegistry {
     pub fn new() -> Self;
-    /// Every BIF the per-module `register` functions install (the 286-BIF roster below).
+    /// Every BIF the per-module `register` functions install (the 290-BIF roster below).
     pub fn with_core_bifs() -> Self;
     /// Returns the previous implementation if `(module, function, arity)` was already registered.
     pub fn register(&mut self, module: &str, function: &str, arity: u32, f: BifFn) -> Option<BifFn>;
@@ -196,13 +196,13 @@ The handle is an on-heap `Ref` thing built by `access::make_ref_thing`
 (`[make_header(3, REF_SUBTAG), 0, 0, id]`); `ref_thing_id` recovers its numeric id, which is the
 registry key (the M1 substitution for a real `tid()`).
 
-## The implemented BIFs (286)
-`default_registry()` registers **286** distinct `(module, function, arity)` keys (count the
-`reg.register(` calls across `src/*.rs`; its `len()` is 286) — **211 real `bif.tab` BIFs + 75
-`lists.erl`/`maps.erl`/`io.erl` stdlib fast-paths** (see the capability-gap audit below). Names and
-arities are verbatim from `bif.tab` / the stdlib export lists.
+## The implemented BIFs (290)
+`default_registry()` registers **290** distinct `(module, function, arity)` keys (count the
+`reg.register(` calls in the per-module `register` functions; its `len()` is 290) — **214 real
+`bif.tab` BIFs + 76 `lists.erl`/`maps.erl`/`io_lib.erl` stdlib fast-paths** (see the capability-gap
+audit below). Names and arities are verbatim from `bif.tab` / the stdlib export lists.
 
-Module `erlang` (135):
+Module `erlang` (138):
 - `arith.rs` (15): `"+"/2 "-"/2 "*"/2 "/"/2 "div"/2 "rem"/2 "abs"/1 "-"/1 "+"/1` — **exact integer
   arithmetic** — plus the six integer bit operators `"band"/2 "bor"/2 "bxor"/2 "bnot"/1 "bsl"/2
   "bsr"/2` (see below).
@@ -226,6 +226,9 @@ Module `erlang` (135):
 - `proc.rs` (3): `self/0 send/2 "!"/2`.
 - `reason.rs` (6): `error/1 error/2 exit/1 throw/1 nif_error/1,2`.
 - `port.rs` (6): `open_port/2 port_close/1 port_info/1,2 list_to_port/1 port_to_list/1`.
+- `phash.rs` (3): `"phash"/2` — the legacy `make_hash` term hash — plus `"phash2"/1,2` (real `bif.tab`
+  BIFs whose `make_hash2` algorithm M1 does not reproduce; registered as typed `unsupported_bif`
+  capability gaps). See below.
 
 Module `lists` (`lists.rs`, 45 of its 49): `member/2 reverse/1,2 keyfind/3 keymember/3 keysearch/3
 append/1,2 nth/2 nthtail/2 last/1 sublist/2,3 seq/2,3 flatten/1,2 sum/1 max/1 min/1 duplicate/2
@@ -253,8 +256,9 @@ BIF** (a prefix scanner returning `{Float, Rest}` or `{error, no_float}`/`{error
 Module `unicode` (`unicode.rs`, 6): `characters_to_binary/1,2,3 characters_to_list/1,2
 bin_is_7bit/1`.
 
-Module `io` (`io.rs`, 5): `io:format/1,2`, `io:printable_range/0` (the atom `latin1`, the oracle
-default without `+pc`), and `io_lib:format/2,3` (one shared directive engine).
+Module `io` (`io.rs`, 6): `io:format/1,2`, `io:printable_range/0` (the atom `latin1`, the oracle
+default without `+pc`), `io_lib:format/2,3` (one shared directive engine) and
+`io_lib:printable_list/1` (see below).
 
 Module `ets` (`ets.rs`, 22): `new/2 delete/1 delete_all_objects/1 info/1,2 tab2list/1 insert/2
 insert_new/2 lookup/2 lookup_element/3,4 member/2 take/2 delete/2 delete_object/2 first/1 last/1
@@ -318,6 +322,24 @@ float, …) is `error:badarg` — never a coerced `false`. `bif.tab` lists exact
 compiler lowers them to jumps, which is why the four above are "strict"). The BIFs decide the result
 from the two already-evaluated terms alone.
 
+## `erlang:phash/2` — the legacy `make_hash` (`phash.rs`)
+A faithful transcription of ERTS's **legacy** term hash — `make_hash`, **not** `phash2`'s `make_hash2`
+(`../../erts/emulator/beam/erl_term_hashing.c:114-425`; BIF wrapper `phash_2` in `bif.c:5370-5399`;
+`bif.tab:82`). A single `u32` accumulator starts at `0` and every step is a wrapping multiply/add, so
+`u32::wrapping_mul`/`wrapping_add` reproduce the C word arithmetic bit-exactly: `[]` ⇒ `h*F3+1`; an atom
+⇒ `h*F1 + hashpjw(name)` (`atom.c:82-105`, incl. the latin1 clutch); a small integer ⇒ a byte-wise step
+over `|v|`, then `h*(neg ? F4 : F3)`; a bignum ⇒ the same bytes of `|N|`; a float ⇒ `h*F6 + (low ^ high)`
+with `-0.0` normalised; a binary/bitstring ⇒ `hash_binary_bytes` (MSB-first) plus a partial-byte step
+with `F12`, then `h*F4 + byte_size`; a tuple ⇒ the elements then `h*F9 + arity`; a list ⇒ `h*F2 + byte`
+per byte-sized head, a full recursive hash otherwise, and exactly one `h*F8` at the terminating
+non-list tail (`[]` included — `is_list(NIL)` is **false**); a pid/port ⇒ the `UINT32_HASH_STEP` ladder
+(`F5`/`F11`/`F9`/`F6`/`F10`); an external fun ⇒ `h*F11 + arity`, then `F1`-steps of the module and
+function atoms. The result is `hash % Range + 1` (`Range = 0` ⇒ the whole `2^32` space ⇒ `hash + 1`); a
+non-integer `Range` is `badarg`. Pinned against the oracle: `phash(1,4)` ⇒ `4`,
+`phash(<<1,2,3>>,1000000)` ⇒ `692590`, plus atoms/tuples/lists/bignums/floats/bitstrings/external funs/
+improper lists. `phash2/1,2` is a *different* function (`make_hash2`, `MIX`-based): registered as a
+typed `unsupported_bif` capability gap — never a guessed number.
+
 ## List operators (`erlang:'++'/2`, `'--'/2`, `append/2`, `subtract/2` — `lists.rs`)
 `'++'/2` requires a **proper-list LEFT operand** (an improper left operand is `badarg`) and uses the
 RIGHT operand **verbatim** with no check at all, so `[1,2] ++ x` ⇒ `[1,2|x]` and `[] ++ x` ⇒ `x`
@@ -342,7 +364,8 @@ accessors `open_port`/`close_port`/`port_info`, which raise `unsupported_bif` wh
 installed (never a fabricated port id, never a silently dropped close).
 `open_port/2` forwards `Name`/`Options` to the hook and returns `PortId::to_eterm()` (the internal port
 immediate); `port_close/1` and `port_info/1,2` decode the argument with `PortId::from_eterm` **first**
-(a non-port ⇒ `BadArg`) and then delegate. `port_info/1` builds the hook's pairs into a list of
+(a non-port ⇒ `BadArg`) and then delegate. `port_close/1` returns the atom `true` on success — the
+oracle's `erlang.erl` wrapper over `erts_internal:port_close/1` — never `ok`. `port_info/1` builds the hook's pairs into a list of
 2-tuples; `port_info/2` returns the matching value or the atom `undefined` (a documented deviation
 from erts-17.1, which raises `badarg` for an unknown item). `list_to_port/1`/`port_to_list/1` are pure
 (`#Port<0.Num>`, node number `0` = `nonode@nohost`) and fully implemented.
@@ -376,6 +399,12 @@ The 18 `lists` and 4 `maps` functions above take a **fun** argument. A BIF canno
 - Control-sequence prefix: optional `-` (left adjust), decimal field width (or `*`), optional `.`
   precision (decimal or `*`), optional `.*` pad character, and the `t`/`l` modifiers.
 - `io:format/1,2` write to the context's `OutputSink` and return `ok`.
+- `io_lib:printable_list/1` is `true` iff the argument is a **proper list of printable latin1
+  characters** (`io_lib.erl:1514-1523,1602-1610`): a small int in `16#20..=16#7E` or `16#A0..=16#FF`, or
+  one of `\t \n \r \v \b \f \e`; `[]` ⇒ `true`; a non-list, an improper list or a non-integer element ⇒
+  `false`. The `unicode` arm does not exist here because `io:printable_range/0` reports `latin1` (no
+  `+pc` plumbing). Pinned: `printable_list([1,2,3])` ⇒ `false`, `printable_list("abc")` ⇒ `true`,
+  `[127]`/`[128]` ⇒ `false`, `[160]`/`[255]` ⇒ `true`, `[]` ⇒ `true`.
 - **`io_lib:format/2,3` return the oracle's DEEP list** — the top-level result is a list of the
   format's *segments*, each segment itself a chardata. Segmentation follows `io_lib_format.erl`:
   literal characters become individual small ints; the "small" controls (`~s` of an *atom* only,
@@ -434,7 +463,10 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
   cannot represent ⇒ `SystemLimit`.
 - **Never re-implement term order/size/hashing/construction.** Comparison ⇒ `beam_term::compare::{cmp,
   cmp_arith}`; term construction/inspection ⇒ `beam_term` accessors only (via `access.rs`);
-  allocation ⇒ `beam_alloc::Heap`.
+  allocation ⇒ `beam_alloc::Heap`. The one exception is the **legacy `erlang:phash/2` BIF**: it is an
+  externally-observable legacy hash that `beam_term` does not provide (its own `hashing::term_hash` is a
+  different, internal FNV hash), so `phash.rs` transcribes the C `make_hash` verbatim rather than
+  inventing a "structural hash".
 - **`unsafe` confinement.** The crate is `#![deny(unsafe_code)]`; `src/access.rs` is its **only**
   `#[allow(unsafe_code)]` module (the `beam_engine::predicates` convention). `unsafe_op_in_unsafe_fn`
   stays clean.
@@ -453,9 +485,9 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
 ## Test Strategy
 - Per-module `#[cfg(test)]` unit tests build a `BifContext` over a real `beam_alloc::Heap` + a seeded
   `beam_term::AtomTable` (the well-known atoms `true`, `false`, `ok`, …) and a `BytesSink`/`NullSink`
-  capture. `cargo test -p beam_bifs` runs **279** lib tests (units + in-module integration).
+  capture. `cargo test -p beam_bifs` runs **281** lib tests (units + in-module integration).
 - **`tests/` integration suite** (public API only — `beam_bifs::*` plus the declared dependency
-  crates); **134** tests across **18** files:
+  crates); **158** tests across **20** files:
   - `tests/registry.rs` (4) — the `BifRegistry` seam: `default_registry()` is a **superset** of the
     Milestone-1 core roster (`len() >= 54`; every core key present) with `names()` sorted and
     `entries().count() == len()`, a fresh registry is empty, `register` returns the replaced impl,
@@ -492,7 +524,14 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
   - `tests/list_ops.rs` (4) — the `erlang` list operators `'++'/2`/`'--'/2` and their
     `append/2`/`subtract/2` aliases (proper-left/verbatim-tail and exact-`=:=` semantics).
   - `tests/ports.rs` (7) — the port BIFs over a mock `PortHook` (the returned internal port, the
-    decode-first `badarg` contract, and the no-hook `unsupported_bif` contract).
+    decode-first `badarg` contract, `port_close/1` ⇒ `true`, and the no-hook `unsupported_bif`
+    contract).
+  - `tests/phash.rs` (13) — `erlang:phash/2` oracle-pinned across every supported term class (small
+    ints, atoms incl. the latin1 clutch, tuples, proper/improper lists, bignums, floats, bitstrings,
+    external funs), the `Range`/`badarg` contract, the map/record/local-fun `unsupported_bif` gaps and
+    the `phash2/1,2` capability-gap contract.
+  - `tests/printable_list.rs` (11) — `io_lib:printable_list/1` (the latin1 printable rule: `[]`,
+    control characters, `A0..FF`, and the non-printable/improper/non-integer cases), oracle-pinned.
   - `tests/lists_funs.rs` (18) / `tests/maps_funs.rs` (9) — the fun-taking BIFs driven through a mock
     `FunCaller` (order, accumulator threading, short-circuiting, `badarg` cases, and the
     `unsupported_bif` contract when no caller is installed).
@@ -513,13 +552,13 @@ leading bytes followed by the trailing `K` bits as `Value:K` — `<<1:1>>`⇒`<<
 ## Differential gate & handoffs (sibling nodes)
 Running `erts_rust/scripts/cargo.sh run -q --release --manifest-path erts_rust/Cargo.toml -p
 differential -- suite` currently reports:
-`summary: total=197 agree=194 mismatch=0 unsupported=3 skipped=0` — **zero mismatches**.
-The `beam_bifs`-owned cases **all AGREE**. The three remaining `unsupported` are owned by sibling nodes:
-- `semantics/binary_comprehension` (A.1) and `semantics/bit_size_of_bitstring` (A.1,A.7) — `beam_rt`
-  eval-grammar gaps, outside `beam_bifs`.
-- `driver/port_backed_by_spawn_driver` (A.4) — `unsupported` (`beam_rt: unsupported: bif`) because
-  `beam_rt` does not yet install a `PortHook`; the `beam_bifs`-side `open_port/2` BIF is registered
-  and resolves — only the runtime hook is missing.
+`summary: total=285 agree=278 mismatch=3 unsupported=4 skipped=0`.
+**Every `beam_bifs`-owned case AGREES** — including `driver/port_close_through_spawn_driver` (A.4),
+which pins `erlang:port_close/1` ⇒ `true`. Every remaining `mismatch`/`unsupported` case is a
+`beam_rt`-owned runtime gap, outside this crate: `driver/spawn_driver_port_stream_read`,
+`boot/init_get_status_is_tuple`, `boot/root_dir_is_string`, `driver/port_backed_by_spawn_driver`
+(no runtime `PortHook`), `semantics/binary_comprehension` and `semantics/bit_size_of_bitstring`
+(eval-grammar gaps).
 
 Current handoffs:
 - `beam_rt` must implement `PortHook` and install it on its `BifContext` via `with_port_hook`: open
@@ -588,6 +627,14 @@ Current handoffs:
   goes through the safe codec constructor (`beam_codec` depends downward on `beam_term`, so this adds
   no cycle). The shared `arith` helpers (`int_from_i64`/`int_from_mag`/`int_from_f64`) are the single
   promotion path for every integer-producing BIF.
+- **`erlang:port_close/1` returns `true`, not `ok`.** The oracle's `erlang:port_close/1` is a thin
+  wrapper over `erts_internal:port_close/1` and returns the atom `true`; returning `ok` was a real
+  disagreement with the oracle (caught by `driver/port_close_through_spawn_driver`). The BIF still
+  decodes the argument first (a non-port ⇒ `BadArg`) and still raises `unsupported_bif` with no
+  `PortHook` — it never fabricates or silently drops a close.
+- **`phash/2` reproduces the legacy `make_hash`, not a generic term hash.** It is the externally
+  observable ERTS hash an OTP application can call, so it must be bit-exact; `beam_term`'s internal
+  `hashing::term_hash` (FNV) is a different function and is deliberately not used.
 - **Comparison delegates to `beam_term`.** `==`/`/=` and `< > =< >=` use `cmp_arith` (arithmetic
   order); `=:=`/`=/=` and `erts_internal:cmp_term/2` use `cmp` (exact order) — the OTP semantics
   (`1 < 1.0` is false; `1 =:= 1.0` is false).
@@ -630,6 +677,13 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
   `is_record(R)`⇒`true`, `is_record(R,rec)`⇒`true` / `(R,other)`⇒`false`, and the native
   `is_record(R,Mod,Name)` compares the captured module **and** name. No workspace crate builds a
   native record yet, so the branch is unreachable today.
+- **`erlang:phash/2` raises `unsupported_bif` for maps, records, internal references and local/imported
+  funs.** `make_hash`'s map/record branches read `make_hash2`/record internals, an internal reference
+  reads through its node container, and a local/imported fun's C identity (`ErlFunEntry.module`/
+  `index`/`old_uniq`) is not carried by this tree's inlined fun descriptor (`beam_term::fun`). A typed
+  gap, never a guessed number (**owning nodes: `beam_term`/`beam_codec`**).
+- **`erlang:phash2/1,2` is a typed capability gap.** The real `bif.tab` BIFs are registered to raise
+  `unsupported_bif` (exit 3) because `make_hash2` is a different algorithm from `phash`'s `make_hash`.
 - **`math:atanh/1` is 1 ULP off the oracle** (Rust `f64::atanh` vs the oracle's C `atanh`); every
   other `math:*` unary is bit-exact. `erf`/`erfc` (computed in safe Rust) agree to ≤1/≤8 ULP of the
   oracle — bit-exactness would need glibc's fdlibm-derived `erf` (a deliberate non-goal).
@@ -705,11 +759,12 @@ Every gap below is a typed `BeamError`, never a silently wrong result. The recur
   does not depend on interning module/function ids.
 
 ### Capability-gap audit: registry vs installed OTP (evidence)
-Audited `default_registry()` (286 entries = **211 real `bif.tab` BIFs + 75 stdlib fast-paths**)
+Audited `default_registry()` (290 entries = **214 real `bif.tab` BIFs + 76 stdlib fast-paths**)
 against the imports of all **261** installed OTP 29 / erts-17.1 stdlib/kernel/compiler `.beam`
 modules (`beam_lib:chunks(F,[imports])`; stdlib-8.1 + kernel-11.0.4 + compiler-10.0.6).
-**181 real `bif.tab` BIFs referenced by those modules are NOT registered**, each resolving to
-`undefined_bif` — `erlang` 105, `erts_internal` 19, `ets` 17, `records` 7, `re` 6, `os` 6, `erl_ddll`
+**181 real `bif.tab` BIFs referenced by those modules are NOT implemented** (an absent key resolves to
+`undefined_bif`; `erlang:phash2/1,2` are present but raise `unsupported_bif`) — `erlang` 105,
+`erts_internal` 19, `ets` 17, `records` 7, `re` 6, `os` 6, `erl_ddll`
 5, `erts_debug` 5, `persistent_term` 5, and 1 each `atomics`/`binary`/`code`/`error_logger`/`file`/
 `net_kernel`.
 Most-referenced: `erlang:get_module_info/1,2` (261 — imported by every module), `process_flag/2`
@@ -728,8 +783,8 @@ function_exported/is_builtin`), and the rest of `ets:*` (beyond the 22 registere
 `characters_to_binary/2`, `characters_to_list/2`, `bin_is_7bit/1` — all three registered.
 
 ## Routing Table
-- `src/lib.rs` → crate docs, module wiring (incl. `bool`/`math`/`string`/`port`), root re-exports, `prelude`, `#![deny(unsafe_code)]`
-- `src/registry.rs` → `BifFn`, `BifRegistry` (register/lookup/call/names/entries), `with_core_bifs` (the 286-BIF roster incl. `bool`/`math`/`string`/`port`), `default_registry`
+- `src/lib.rs` → crate docs, module wiring (incl. `bool`/`math`/`string`/`phash`/`port`), root re-exports, `prelude`, `#![deny(unsafe_code)]`
+- `src/registry.rs` → `BifFn`, `BifRegistry` (register/lookup/call/names/entries), `with_core_bifs` (the 290-BIF roster incl. `bool`/`math`/`string`/`phash`/`port`), `default_registry`
 - `src/context.rs` → `BifContext` + the `OutputSink`/`SendHook`/`AtomInterner`/`FunCaller`/`PortHook` seams and the sink impls (`StdoutSink`/`NullSink`/`BytesSink`)
 - `src/error.rs` → `pub(crate)` failure constructors (`badarg`/`badarith`/`badarity`/`system_limit`/`undefined_bif`/`unsupported_bif`/`function_clause`) + the public `raise_error`/`raise_exit`/`raise_throw` builders
 - `src/access.rs` → the ONLY `#[allow(unsafe_code)]` module: term classification/structure/float wrappers, `fun_arity`/`is_record`, the M1 ref thing, heap-bitstring builders/readers (incl. `bitstring_bits`), flatmap accessors
@@ -748,9 +803,10 @@ function_exported/is_builtin`), and the rest of `ets:*` (beyond the 22 registere
 - `src/unicode.rs` → `unicode:characters_to_binary/1,2,3` + `characters_to_list/1,2` + `bin_is_7bit/1` (latin1 + utf8)
 - `src/time.rs` → `monotonic_time`/`system_time`/`time_offset`/`unique_integer`/`timestamp`
 - `src/proc.rs` → `self/0`, `send/2` (`"!"/2`)
-- `src/port.rs` → `open_port/2`, `port_close/1`, `port_info/1,2`, `list_to_port/1`, `port_to_list/1` over the `PortHook` seam
+- `src/port.rs` → `open_port/2`, `port_close/1` (⇒ `true`), `port_info/1,2`, `list_to_port/1`, `port_to_list/1` over the `PortHook` seam
+- `src/phash.rs` → `erlang:phash/2` (the legacy `make_hash`: the `u32` step, `hash_binary_bytes`, the `hashpjw` atom hash) + the `erlang:phash2/1,2` typed gaps
 - `src/reason.rs` → the `error`/`exit`/`throw`/`nif_error` BIFs + `ExitReason` ↔ reason-term mapping
-- `src/io.rs` → `io:format/1,2` + `io:printable_range/0` + `io_lib:format/2,3` + the directive engine + the segment tree behind the deep-list result
+- `src/io.rs` → `io:format/1,2` + `io:printable_range/0` + `io_lib:format/2,3` + `io_lib:printable_list/1` + the directive engine + the segment tree behind the deep-list result
 - `src/print.rs` → the `~w`/`~p`/`~W`/`~P` term printer (incl. the non-byte-aligned bitstring `render_bitstring_chunk`; registers no BIFs)
 - `src/bits.rs` → the safe on-heap bitstring/binary facade shared by `binary`/`unicode`/`term_ops`
 - `src/numeric.rs` → shared `pub(crate)` numeric helpers (arbitrary-precision `parse_integer`, int/float render, base/digit handling, `FloatFormat`/`parse_float_options`) used by `convert.rs`/`binconv.rs`
@@ -767,7 +823,9 @@ function_exported/is_builtin`), and the rest of `ets:*` (beyond the 22 registere
 - `tests/iolist.rs` → the `erlang` iolist/bitstring BIFs (`iolist_to_binary`/`iolist_size`/`list_to_bitstring`/`split_binary`)
 - `tests/bitstring_print.rs` → the non-byte-aligned bitstring `~w`/`~p` rendering
 - `tests/list_ops.rs` → the `erlang` list operators (`++`/`--`/`append`/`subtract`)
-- `tests/ports.rs` → the port BIFs over a mock `PortHook` (incl. the no-hook `unsupported_bif` contract)
+- `tests/ports.rs` → the port BIFs over a mock `PortHook` (incl. `port_close/1` ⇒ `true` and the no-hook `unsupported_bif` contract)
+- `tests/phash.rs` → `erlang:phash/2` oracle-pinned per term class + the map/record/fun gaps + the `phash2` gap contract
+- `tests/printable_list.rs` → `io_lib:printable_list/1` (the latin1 printable rule), oracle-pinned
 - `tests/lists_funs.rs` / `tests/maps_funs.rs` → the fun-taking BIFs over a mock `FunCaller`
 - `tests/io_lib.rs` → the `io_lib:format` deep-list segmentation (oracle-pinned)
 - `tests/io_ets.rs` → `io:format` exact bytes + a small `ets` round-trip

@@ -210,7 +210,7 @@ impl<'a> RuntimeContext<'a> {
 
     /// The process table a receive/send resolves against: the caller-supplied one when
     /// there is one, else the runtime's own.
-    fn process_table_mut(&mut self) -> &mut ProcessTable {
+    pub(crate) fn process_table_mut(&mut self) -> &mut ProcessTable {
         match self.mailbox_table {
             Some(ref mut table) => &mut **table,
             None => &mut self.runtime.processes,
@@ -519,6 +519,12 @@ impl ExecutionContext for RuntimeContext<'_> {
             return self.call_registered(module, function, arity, args);
         }
         if module == "erlang" {
+            // The **effective** gap set: the curated list intersected with what the live
+            // registry does not own, so a freshly-registered BIF can never be shadowed (see
+            // `error::is_known_unimplemented_bif`).
+            if error::is_known_unimplemented_bif(&self.runtime.registry, function, arity) {
+                return Err(error::known_unimplemented_bif(function, arity));
+            }
             return Err(error::unknown_bif(module, function, arity));
         }
         // The code server adds the system library directories (stdlib, kernel) the first

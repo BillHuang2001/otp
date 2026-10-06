@@ -367,8 +367,9 @@ fn open_port_spawns_a_real_os_process() {
             "erlang:port_info(open_port({spawn,\"true\"},[]), connected)",
             "ok true",
         ),
-        // … and `port_close/1` kills and reaps the child, answering `ok`.
-        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok ok"),
+        // … and `port_close/1` kills and reaps the child, answering `true` (the oracle's
+        // value: `erts_internal:port_close/1` returns the atom `true`, not `ok`).
+        ("erlang:port_close(open_port({spawn,\"true\"},[]))", "ok true"),
     ];
 
     for (expr, expected) in cases {
@@ -381,6 +382,102 @@ fn open_port_spawns_a_real_os_process() {
         assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
         assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
     }
+}
+
+/// The A.4 **port stream read** probe the differential corpus carries
+/// (`driver/spawn_driver_port_stream_read`): the `spawn` driver's stdout is polled and its
+/// bytes are delivered as a `{Port, {data, Data}}` message.
+///
+/// This pins the corpus golden exactly (`ok <<104,105,10>>` for `echo hi` on a `binary`
+/// stream), plus the boundary behaviours the same path owns: the `list` default delivers a
+/// char list, the bound port variable in a `receive` clause matches the message's port
+/// term, an `after` still fires the fallback when the child produces no output, and a
+/// `binary` stream wider than the on-heap limit is an honest *capability gap* (exit 3),
+/// never a disagreement with the oracle.
+#[test]
+fn a_spawn_driver_port_stream_is_read_back_as_a_data_message() {
+    let cases: &[(&str, &str)] = &[
+        // The corpus's own A.4 probe — the gate case (`echo hi` ⇒ `"hi\n"`).
+        (
+            "begin P = open_port({spawn,\"echo hi\"}, [binary]), \
+             receive {P,{data,D}} -> D after 500 -> no_data end end",
+            "ok <<104,105,10>>",
+        ),
+        // The `list` default delivers a char list, not a binary.
+        (
+            "begin P = open_port({spawn,\"echo hi\"}, []), \
+             receive {P,{data,D}} -> D after 500 -> no_data end end",
+            "ok [104,105,10]",
+        ),
+        // The message is exactly `{Port, {data, Data}}`; the clause's bound `P` matches the
+        // message's port term. A shape check the printer *can* render (it cannot print a
+        // bare port), verified against the system `erl`.
+        (
+            "begin P = open_port({spawn,\"echo hi\"}, [binary]), \
+             receive {P,{data,D}} -> {is_port(P), is_binary(D), D} \
+             after 500 -> no_data end end",
+            "ok {true,true,<<104,105,10>>}",
+        ),
+        // A child with no output still fires the `after` fallback (never a hang).
+        (
+            "begin P = open_port({spawn,\"true\"}, [binary]), \
+             receive {P,{data,D}} -> D after 200 -> no_data end end",
+            "ok no_data",
+        ),
+    ];
+
+    for (expr, expected) in cases {
+        let (stdout, exit, stderr) = probe(expr, &[], Kind::Value);
+        assert_eq!(
+            stdout,
+            format!("{expected}\n"),
+            "{expr}: stdout (stderr {stderr:?})"
+        );
+        assert_eq!(exit, 0, "{expr}: exit (stderr {stderr:?})");
+        assert!(stderr.is_empty(), "{expr}: stderr {stderr:?}");
+    }
+
+    // The message shape asserted structurally: `{Port, {data, <<"hi\n">>}}`.
+    let (stdout, exit, stderr) = probe(
+        "begin P = open_port({spawn,\"echo hi\"}, [binary]), \
+         receive M -> \
+         {is_tuple(M), tuple_size(M), element(1, M) =:= P, \
+          is_tuple(element(2, M)), element(1, element(2, M)), element(2, element(2, M))} \
+         after 500 -> no_data end end",
+        &[],
+        Kind::Value,
+    );
+    assert_eq!(exit, 0, "shape probe: exit (stderr {stderr:?})");
+    assert_eq!(
+        stdout,
+        "ok {true,2,true,true,data,<<104,105,10>>}\n",
+        "shape probe: stdout (stderr {stderr:?})"
+    );
+}
+
+/// A `binary`-stream read wider than the on-heap binary limit (64 bytes) is a typed
+/// *capability gap*: the CLI exits 3 with the honest `unsupported:` line, never a wrong
+/// result and never a disagreement with the oracle (which would print the binary).
+#[test]
+fn an_oversized_port_stream_binary_is_unsupported_not_wrong() {
+    let output = Command::new(env!("CARGO_BIN_EXE_beam_rt"))
+        .args([
+            "-noshell",
+            "-eval",
+            "try (begin P = open_port({spawn,\"head -c 100 /dev/zero\"}, [binary]), \
+             receive {P,{data,D}} -> D after 500 -> no_data end end) of V -> \
+             io:format(\"ok ~w~n\", [V]), halt(0) catch C:R -> \
+             io:format(\"exception ~w ~w~n\", [C, R]), halt(1) end.",
+        ])
+        .output()
+        .expect("spawning beam_rt failed");
+    assert_eq!(output.status.code(), Some(3), "stderr: {:?}", output.stderr);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.starts_with("beam_rt: unsupported: "),
+        "stderr: {stderr:?}"
+    );
+    assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
 }
 
 /// A `-eval` expression outside the grammar is a *capability gap* — exit 3 with exactly/// one `beam_rt: unsupported: …` line. `tests/cli.rs` asserts the shape; here it is

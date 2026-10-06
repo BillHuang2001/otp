@@ -7,7 +7,7 @@
 //! [`crate::transport::Read`] and [`crate::transport::Write`] are deliberately
 //! **not** glob-exported — they would shadow `std::io::{Read, Write}`.
 
-pub use crate::control::{decode_control, encode_control, ControlMessage};
+pub use crate::control::{decode_control, encode_control, encode_control_cached, ControlMessage};
 pub use crate::dist_header::*;
 pub use crate::epmd::*;
 pub use crate::flags::*;
@@ -17,7 +17,10 @@ pub use crate::transport::{MemoryTransport, Transport};
 
 pub use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 pub use crate::auth::{gen_challenge, gen_digest, md5, Md5Digest};
-pub use crate::connection::{accept_server, connect_client, Connection, TcpTransport};
+pub use crate::connection::{
+    accept_server, connect_client, connect_client_with_creation, Connection, TcpTransport,
+    CLIENT_CREATION,
+};
 pub use crate::fragment::{
     Assembly, FragmentAssembler, FragmentCont, FragmentHeader, DIST_FRAGMENT_SIZE,
 };

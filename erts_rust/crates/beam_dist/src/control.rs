@@ -62,18 +62,18 @@ fn carries_message(dop: Dop) -> bool {
     )
 }
 
-/// Appends the body-form ETF image of `term` (`Encoder::new_body`, no
-/// `VERSION_MAGIC`) to `body`.
-fn append_body_term(body: &mut Vec<u8>, term: Eterm, atoms: &AtomTable) -> Result<()> {
-    let mut encoder = Encoder::new_body(atoms);
-    encoder.encode(term)?;
-    body.extend_from_slice(&encoder.finish());
-    Ok(())
-}
-
 /// Encodes a control message into its on-wire **tuple form**: the ETF tuple
 /// `{DOP_*, …}` (the opcode as its first element) followed, for a message-carrying
 /// opcode, by the message term (`dist.c:2205`, `2468`).
+///
+/// This is [`encode_control_cached`] without an atom cache — every atom is written
+/// inline, so the result is byte-identical to that call with `cache = None`.
+pub fn encode_control(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<Vec<u8>> {
+    encode_control_cached(dop, terms, atoms, None)
+}
+
+/// Encodes a control message into its on-wire **tuple form**, optionally routing
+/// every atom through an outbound distribution atom cache.
 ///
 /// `terms` is the *flattened* shape [`ControlMessage`] carries: the [`Dop::arity`]
 /// control arguments and, when the opcode carries a message, the single trailing
@@ -88,9 +88,23 @@ fn append_body_term(body: &mut Vec<u8>, term: Eterm, atoms: &AtomTable) -> Resul
 /// distribution header carries the single `131` (`external.c:772`, `1231`).
 ///
 /// The arity is **not** validated here: like the C encoder, this function is
-/// caller-driven (the caller owns the `{DOP_*, …}` shape it is building); the
-/// arity check belongs to [`decode_control`].
-pub fn encode_control(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<Vec<u8>> {
+/// caller-driven (the caller owns the `{DOP_*, …}` shape it is building); the arity
+/// check belongs to [`decode_control`].
+///
+/// With `cache = Some(writer)` the opcode, every control argument and the trailing
+/// message are encoded through **one** [`Encoder`] that consults `writer` for every
+/// atom in **payload order**. Because ERTS assigns a ref's payload index
+/// sequentially as atoms are first encountered (`insert_acache_map`, `external.c`),
+/// that order *is* the header's `AtomCacheReferenceIndex` order: the returned bytes
+/// agree with the `DistHeader` the caller must emit alongside them
+/// (`beam_dist::OutboundAtomCache` is the concrete writer). Atoms the writer does
+/// not accept are written inline, exactly as before.
+pub fn encode_control_cached(
+    dop: Dop,
+    terms: &[Eterm],
+    atoms: &AtomTable,
+    cache: Option<&mut dyn beam_codec::AtomCacheWriter>,
+) -> Result<Vec<u8>> {
     let has_message = carries_message(dop) && terms.len() == dop.arity() + 1;
     let (control_terms, message) = if has_message {
         (&terms[..dop.arity()], Some(terms[dop.arity()]))
@@ -108,14 +122,22 @@ pub fn encode_control(dop: Dop, terms: &[Eterm], atoms: &AtomTable) -> Result<Ve
         body.push(SMALL_TUPLE_EXT);
         body.push(arity as u8);
     }
-    append_body_term(&mut body, make_small(i64::from(dop.as_u8())), atoms)?;
+
+    // One encoder over the whole body so the cache is consulted for every atom in
+    // payload order (opcode → control arguments → trailing message).
+    let mut encoder = Encoder::new_body(atoms);
+    if let Some(cache) = cache {
+        encoder = encoder.with_atom_cache(cache);
+    }
+    encoder.encode(make_small(i64::from(dop.as_u8())))?;
     for &term in control_terms {
-        append_body_term(&mut body, term, atoms)?;
+        encoder.encode(term)?;
     }
     // The `send` opcodes carry the message term after the control tuple.
     if let Some(message) = message {
-        append_body_term(&mut body, message, atoms)?;
+        encoder.encode(message)?;
     }
+    body.extend_from_slice(&encoder.finish());
     Ok(body)
 }
 

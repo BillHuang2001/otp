@@ -186,6 +186,71 @@ fn insert_list_inserts_every_object() {
     assert_eq!(t.size(), 3);
 }
 
+/// `ets:insert/2` over a list is **atomic**: the whole list is validated first,
+/// so one invalid element raises `badarg` and inserts none of the elements.
+///
+/// Verified against the system `erl` (OTP 29 / erts-17.1): with `{1,10}` in `T`,
+/// `ets:insert(T, [{2,20}, foo])` raises `badarg` and `ets:tab2list(T)` is still
+/// `[{1,10}]` — the valid element is not inserted either.
+#[test]
+fn insert_list_is_atomic_when_an_element_is_invalid() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+    let mut t = new_table(TableKind::Set);
+    t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+
+    // A valid element followed by a non-tuple: nothing is inserted.
+    let good = object(&mut heap, 2, 20);
+    assert!(matches!(
+        t.insert_list(&[good, make_small(9)], &atoms),
+        Err(BeamError::BadArg)
+    ));
+    assert!(!t.member(make_small(2), &atoms));
+    let only = t.tab2list();
+    assert_eq!(only.len(), 1);
+    assert!(eq(only[0], object(&mut heap, 1, 10), &atoms));
+
+    // ... and the invalid element first behaves the same way.
+    assert!(matches!(
+        t.insert_list(&[make_small(9), good], &atoms),
+        Err(BeamError::BadArg)
+    ));
+    assert_eq!(t.size(), 1);
+
+    // A list of valid objects still inserts all of them, so the failed calls left
+    // no half-applied state behind.
+    t.insert_list(&[good, object(&mut heap, 3, 30)], &atoms).unwrap();
+    assert_eq!(t.size(), 3);
+}
+
+/// The atomicity holds for a `{keypos, 2}` table too: an element shorter than
+/// `keypos` (`{b}` is a 1-tuple) makes the whole list `badarg`.
+///
+/// Verified against the system `erl` (OTP 29 / erts-17.1).
+#[test]
+fn insert_list_is_atomic_under_a_custom_keypos() {
+    let atoms = AtomTable::new();
+    let mut heap = Heap::new(256);
+    let mut opts = TableOptions::new();
+    opts.set_keypos(2).unwrap();
+    let mut t = Table::new(TableId::next(), opts).unwrap();
+
+    t.insert(tuple_of(&mut heap, &[make_small(1), make_small(10)]), &atoms)
+        .unwrap();
+
+    let valid = tuple_of(&mut heap, &[make_small(2), make_small(20)]);
+    let too_short = tuple_of(&mut heap, &[make_small(3)]);
+    assert!(matches!(
+        t.insert_list(&[valid, too_short], &atoms),
+        Err(BeamError::BadArg)
+    ));
+
+    // The key is element 2 here, so `{2,20}` would have been keyed by `20`.
+    assert_eq!(t.size(), 1);
+    assert!(t.member(make_small(10), &atoms));
+    assert!(!t.member(make_small(20), &atoms));
+}
+
 #[test]
 fn insert_rejects_malformed_objects_with_badarg() {
     let atoms = AtomTable::new();

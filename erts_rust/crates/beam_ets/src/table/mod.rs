@@ -15,7 +15,7 @@ use beam_alloc::AllocRef;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-use crate::error::badarg;
+use crate::error::{badarg, unsupported};
 use crate::hash_interior::HashInterior;
 use crate::info::TableInfo;
 use crate::key::{key_of, object_elements};
@@ -25,17 +25,25 @@ use crate::select::SelectPredicate;
 use crate::store::TermStore;
 
 mod access;
+mod element;
 mod update;
 
 pub use access::TableAccess;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
-use update::{build_list, decode_counter_ops, object_arity, read_counter, warp_fires};
+use update::{object_arity, read_counter};
 
 /// The process-global source of table identifiers (`ets:new/2` hands one out per
 /// table). Monotonic and never reused; the identifier itself is opaque to
 /// callers.
 static NEXT_TABLE_ID: AtomicU64 = AtomicU64::new(1);
 
+/// The `what` of the typed "unsupported" raise the **scalar**
+/// `ets:lookup_element/3,4` produces for a multi-object kind: the oracle's answer
+/// there is the element *list*, never a single element, so no scalar can be
+/// returned for it (see [`Table::lookup_element_all`]).
+const MULTI_ELEMENT_SCALAR: &str =
+    "ets:lookup_element/3,4 on bag/duplicate_bag (the result is a list; \
+     use lookup_element_all/3)";
 /// The runtime identifier of a table (`ets:new/2` returns one).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct TableId(u64);
@@ -123,6 +131,32 @@ pub(crate) trait Interior {
     /// `badarg` when `key` is absent.
     fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm>;
 
+    /// The `pos`-th element (0-based) of **every** object stored under `key`, in
+    /// this interior's stored order — `ets:lookup_element/3`'s result for a
+    /// multi-object kind (`bag`/`duplicate_bag`), where the oracle returns a
+    /// *list*.
+    ///
+    /// `badarg` when `key` is absent, and when **any** stored object's arity is at
+    /// most `pos` — the oracle fails the whole call, it does not skip the short
+    /// object (verified against the system `erl`, OTP 29 / erts-17.1). The
+    /// single-object kinds (`set`/`ordered_set`) store at most one object per key,
+    /// so their list has exactly one element.
+    ///
+    /// The default reads the objects through [`lookup`](Interior::lookup) and
+    /// projects each with [`key_of`] (which is what rejects a short object); an
+    /// interior may override it with a single-pass version.
+    fn lookup_elements(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Vec<Eterm>> {
+        let keypos = pos.checked_add(1).ok_or_else(badarg)?;
+        let objects = self.lookup(key, atoms);
+        if objects.is_empty() {
+            return Err(badarg());
+        }
+        let mut elements = Vec::with_capacity(objects.len());
+        for object in objects {
+            elements.push(key_of(object, keypos)?);
+        }
+        Ok(elements)
+    }
     /// The total number of stored objects (not keys, for the multi kinds).
     fn size(&self) -> usize;
 
@@ -331,7 +365,10 @@ impl Table {
         self.opts.kind()
     }
 
-    /// The registered table name, if any (`Some` iff named).
+    /// The registered table name, if any.
+    ///
+    /// Independent of `named_table`: a name is recorded for every table the
+    /// `ets:new/2` option parser named, whether or not `named_table` was given.
     pub fn name(&self) -> Option<Atom> {
         self.opts.name()
     }
@@ -376,15 +413,34 @@ impl Table {
 
     /// Insert `object` (the whole tuple; the key is derived from `keypos`).
     pub fn insert(&mut self, object: Eterm, atoms: &AtomTable) -> Result<()> {
-        let keypos = self.opts.keypos();
-        // Validate the caller's object before copying: a non-tuple / too-short
-        // object is `badarg` and allocates nothing.
-        key_of(object, keypos)?;
-        // Deep-copy into table-owned storage (the A.1 copy boundary), then derive
-        // the *stored* key from the copy so the interior never aliases a caller
-        // heap.
-        let stored = self.store.copy(object)?;
-        let stored_key = key_of(stored, keypos)?;
+        let stored = self.store_object(object)?;
+        self.insert_stored(stored, atoms)
+    }
+
+    /// Validate `object` against the table's `keypos` and deep-copy it into
+    /// table-owned storage (the A.1 copy boundary), returning the stored root.
+    ///
+    /// This is the whole fallible half of [`insert`](Table::insert): a non-tuple /
+    /// too-short object is `badarg` **before** anything is allocated, and an object
+    /// outside the store's supported subset (a fun, an external pid, …) rolls its
+    /// copy back. Neither the index nor the store is left changed on failure, which
+    /// is what lets [`insert_list`](Table::insert_list) validate a whole list
+    /// before mutating anything.
+    fn store_object(&mut self, object: Eterm) -> Result<Eterm> {
+        key_of(object, self.opts.keypos())?;
+        self.store.copy(object)
+    }
+
+    /// Insert an object that is **already** table-owned ([`store_object`]'s
+    /// result): derive the stored key, apply the kind's duplicate rules, and
+    /// reclaim whatever the insert replaced or rejected.
+    ///
+    /// Infallible for this crate's interiors (they answer with the retained flag,
+    /// never an error); it returns `Result` only because [`Interior::insert`] does.
+    ///
+    /// [`store_object`]: Table::store_object
+    fn insert_stored(&mut self, stored: Eterm, atoms: &AtomTable) -> Result<()> {
+        let stored_key = key_of(stored, self.opts.keypos())?;
         // A single-object kind (`set`/`ordered_set`) *replaces* the object stored
         // under an existing key. Look the replaced root up **before** the insert so
         // its storage can be reclaimed afterwards (the multi kinds only ever add,
@@ -407,6 +463,39 @@ impl Table {
         Ok(())
     }
 
+    /// Insert every object of `objects` (`ets:insert/2` over a list).
+    ///
+    /// **Atomic**, exactly like the oracle: `ets:insert(Tab, List)` validates the
+    /// whole list first, so if **any** element is not a valid object for the
+    /// table's `keypos` (a non-tuple, or a tuple shorter than `keypos`) the call is
+    /// `badarg` and **none** of the elements is inserted — not even the valid ones
+    /// that precede the bad one. Verified against the system `erl` (OTP 29 /
+    /// erts-17.1): with `{1,10}` in `T`, `ets:insert(T, [{2,20}, foo])` raises
+    /// `badarg` and `ets:tab2list(T)` is still `[{1,10}]`. An empty list inserts
+    /// nothing and succeeds.
+    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()> {
+        // Validate and copy every object **before** the first index mutation, so a
+        // bad element cannot leave a half-applied list behind.
+        let mut stored = Vec::with_capacity(objects.len());
+        for &object in objects {
+            match self.store_object(object) {
+                Ok(one) => stored.push(one),
+                Err(err) => {
+                    // Nothing has been inserted: release the copies made so far and
+                    // report, leaving the table exactly as it was.
+                    for one in stored {
+                        self.store.free(one);
+                    }
+                    return Err(err);
+                }
+            }
+        }
+        // Every object is valid and table-owned; insert them in list order.
+        for one in stored {
+            self.insert_stored(one, atoms)?;
+        }
+        Ok(())
+    }
     /// Insert `object` only if its key is absent; returns whether it was
     /// inserted (`false` when the key already exists).
     pub fn insert_new(&mut self, object: Eterm, atoms: &AtomTable) -> Result<bool> {
@@ -421,14 +510,6 @@ impl Table {
             self.store.free(stored);
         }
         Ok(inserted)
-    }
-
-    /// Insert every object of `objects` (`ets:insert/2` over a list).
-    pub fn insert_list(&mut self, objects: &[Eterm], atoms: &AtomTable) -> Result<()> {
-        for &object in objects {
-            self.insert(object, atoms)?;
-        }
-        Ok(())
     }
 
     /// Delete every object stored under `key` (`ets:delete/2`).
@@ -482,11 +563,31 @@ impl Table {
         self.interior.member(key, atoms)
     }
 
-    /// The `pos`-th element (1-based) of the single object stored under `key`;
+    /// The `pos`-th element (1-based) of the object stored under `key`;
     /// `badarg` when `key` is absent or `pos` is out of range.
+    ///
+    /// Only `set`/`ordered_set` — which store at most one object per key — have a
+    /// scalar answer. The multi kinds (`bag`/`duplicate_bag`) hold **several**
+    /// objects under one key and `ets:lookup_element/3` returns a *list* of their
+    /// `pos`-th elements; a scalar is therefore undefined for them, and this method
+    /// raises the crate's typed
+    /// [`unsupported`](crate::error::unsupported) instead of a wrong element. Use
+    /// [`lookup_element_all`](Table::lookup_element_all) for those kinds.
+    ///
+    /// The oracle's *failures* are still answered exactly: `pos == 0`, an absent
+    /// `key`, and a stored object whose arity is `< pos` are all `badarg`.
     pub fn lookup_element(&self, key: Eterm, pos: usize, atoms: &AtomTable) -> Result<Eterm> {
         // The public position is 1-based; `0` is `badarg` (mirroring `ets`).
         let pos = pos.checked_sub(1).ok_or_else(badarg)?;
+        if self.opts.kind().is_multi() {
+            // `lookup_elements` reproduces the oracle's `badarg`s (absent key, a
+            // short object); where the oracle has an answer it is the *list*, so a
+            // scalar would be a wrong result.
+            return self
+                .interior
+                .lookup_elements(key, pos, atoms)
+                .and_then(|_| Err(unsupported(MULTI_ELEMENT_SCALAR)));
+        }
         self.interior.lookup_element(key, pos, atoms)
     }
 
@@ -497,6 +598,11 @@ impl Table {
     /// `pos == 0` is `badarg` whatever the key; an **absent** key returns `default`
     /// even when `pos` is beyond the object's arity; a **present** key with a `pos`
     /// outside the object's arity is `badarg`.
+    ///
+    /// Like the `/3` form it is scalar, so for `bag`/`duplicate_bag` it raises the
+    /// typed [`unsupported`](crate::error::unsupported) for a present key (an absent
+    /// key still yields `default`); use
+    /// [`lookup_element_all_or`](Table::lookup_element_all_or) there.
     pub fn lookup_element_or(
         &self,
         key: Eterm,
@@ -506,272 +612,78 @@ impl Table {
     ) -> Result<Eterm> {
         // `pos` is validated before the key is consulted (mirroring `ets`).
         let pos = pos.checked_sub(1).ok_or_else(badarg)?;
-        if !self.interior.member(key, atoms) {
-            return Ok(default);
+        let present = self.interior.member(key, atoms);
+        match (self.opts.kind().is_multi(), present) {
+            // An absent key is `default` whatever the kind.
+            (_, false) => Ok(default),
+            // A present key on a multi kind: the oracle's answer is the element
+            // *list* (or `badarg` for an object too short to have `pos`).
+            (true, true) => self
+                .interior
+                .lookup_elements(key, pos, atoms)
+                .and_then(|_| Err(unsupported(MULTI_ELEMENT_SCALAR))),
+            (false, true) => self.interior.lookup_element(key, pos, atoms),
         }
-        self.interior.lookup_element(key, pos, atoms)
     }
 
+    /// `ets:lookup_element/3` for a multi-object kind (`bag`/`duplicate_bag`): the
+    /// `pos`-th element (1-based) of **every** object stored under `key`, in
+    /// stored order.
+    ///
+    /// Heap-free, like [`lookup`](Table::lookup): the returned elements read
+    /// table-owned storage (`Immediate` elements are copied by value), so no
+    /// allocation or host heap is involved. Mirrors the system `erl` (OTP 29 /
+    /// erts-17.1), where the multi kinds answer with a list: a key holding a single
+    /// object yields a one-element list, duplicates (`duplicate_bag`) are
+    /// preserved, an **absent** `key` is `badarg`, `pos == 0` is `badarg`, and one
+    /// object whose arity is `< pos` makes the **whole** call `badarg`.
+    ///
+    /// `set`/`ordered_set` store at most one object per key, so for them the vector
+    /// always holds exactly one element — the same element
+    /// [`lookup_element`](Table::lookup_element) returns.
+    pub fn lookup_element_all(
+        &self,
+        key: Eterm,
+        pos: usize,
+        atoms: &AtomTable,
+    ) -> Result<Vec<Eterm>> {
+        // The public position is 1-based; `0` is `badarg` (mirroring `ets`).
+        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
+        self.interior.lookup_elements(key, pos, atoms)
+    }
+
+    /// `ets:lookup_element/4` for a multi-object kind: exactly
+    /// [`lookup_element_all`](Table::lookup_element_all), except that an absent
+    /// `key` is reported as `Ok(None)` — the caller yields `default` — instead of
+    /// `badarg`.
+    ///
+    /// The split mirrors the oracle exactly: `pos == 0` is `badarg` **before** the
+    /// key is consulted, an absent key yields `default` whatever `pos`, and a
+    /// present key keeps every failure of
+    /// [`lookup_element_all`](Table::lookup_element_all). It is heap-free and
+    /// cannot build `default` itself, which is why the absent key is a `None`
+    /// rather than a term.
+    pub fn lookup_element_all_or(
+        &self,
+        key: Eterm,
+        pos: usize,
+        default: Eterm,
+        atoms: &AtomTable,
+    ) -> Result<Option<Vec<Eterm>>> {
+        // `pos` is validated before the key is consulted (mirroring `ets`).
+        let pos = pos.checked_sub(1).ok_or_else(badarg)?;
+        // `default` belongs to the caller: this method reports the absent key as
+        // `None` and the BIF layer substitutes the term.
+        let _ = default;
+        if !self.interior.member(key, atoms) {
+            return Ok(None);
+        }
+        Ok(Some(self.interior.lookup_elements(key, pos, atoms)?))
+    }
     /// The number of words allocated to the table (`ets:info(Tab, memory)`): the
     /// table-owned term storage plus the interior's own index storage.
     pub fn memory(&self) -> usize {
         self.store.words() + self.interior.memory()
-    }
-
-    // ----------------------------------------------------------- element updates
-
-    /// `ets:update_counter/3`: add `incr` to the element following the key
-    /// (`keypos + 1`) of the object stored under `key`, and return the new value.
-    ///
-    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
-    /// * only `set`/`ordered_set` hold counters — `bag`/`duplicate_bag` are
-    ///   `badarg`;
-    /// * an **absent** `key` is `badarg`: the `/3` form has no default object;
-    /// * a non-integer element or a non-integer increment is `badarg`.
-    ///
-    /// Despite the name, `update_op` may be any of the operands the BIF accepts
-    /// (`Incr`, `{Pos,Incr}`, `{Pos,Incr,Threshold,SetValue}` or a list of those);
-    /// a **list** operand yields a list result — exactly as `ets:update_counter/3`
-    /// is `ets:update_counter/4` without a default.
-    pub fn update_counter(
-        &mut self,
-        key: Eterm,
-        update_op: Eterm,
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<Eterm> {
-        self.do_update_counter(key, update_op, None, atoms, heap)
-    }
-
-    /// `ets:update_counter/4`: like [`update_counter`](Table::update_counter) but
-    /// with a `default` object used when `key` is absent.
-    ///
-    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
-    /// * `default` must be a tuple with an arity of at least `keypos`, and an
-    ///   invalid one is `badarg` even when `key` exists;
-    /// * `update_op` is an increment, a `{Pos,Incr}`, a
-    ///   `{Pos,Incr,Threshold,SetValue}`, or a list of those — only the list form
-    ///   returns a **list** of the new values, one per operation, in order;
-    /// * an absent `key` behaves as if the object `default` (with its key element
-    ///   replaced by `key`) were present, and it is deposited in the table — even
-    ///   when the operation list is empty;
-    /// * `pos == keypos`, an out-of-range `pos`, a non-integer element and a
-    ///   non-integer `Incr`/`Threshold`/`SetValue` are `badarg`;
-    /// * the threshold rule: an increment `>= 0` whose result would be `>` the
-    ///   threshold, or one `< 0` whose result would be `<` the threshold, makes
-    ///   the counter `SetValue`.
-    pub fn update_counter_with(
-        &mut self,
-        key: Eterm,
-        update_op: Eterm,
-        default: Eterm,
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<Eterm> {
-        self.do_update_counter(key, update_op, Some(default), atoms, heap)
-    }
-
-    /// `ets:update_element/3`: replace element `pos` (1-based) of the object
-    /// stored under `key` with each `Value` of `updates` (later entries win for a
-    /// repeated position), and return whether `key` was present.
-    ///
-    /// Mirrors the verified system `erl` (OTP 29 / erts-17.1):
-    /// * an **absent** `key` is `Ok(false)`, never an error — and it is answered
-    ///   **before** the spec is inspected, so a malformed spec on an absent key is
-    ///   still `Ok(false)`;
-    /// * `bag`/`duplicate_bag` are `badarg`;
-    /// * `pos == keypos`, `pos == 0` and `pos` beyond the object's arity are
-    ///   `badarg`, with nothing written (every position is validated first);
-    /// * an **empty** `updates` on a present key is `Ok(true)` and changes
-    ///   nothing.
-    ///
-    /// The `pos == keypos` rule is enforced here (the interiors do not carry
-    /// `keypos`); the interior rebuilds the object.
-    pub fn update_element(
-        &mut self,
-        key: Eterm,
-        updates: &[(usize, Eterm)],
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<bool> {
-        self.check_counter_kind()?;
-        let keypos = self.opts.keypos();
-        // The key is looked up *before* the spec is validated: `erl` answers
-        // `false` for an absent key whatever the spec says.
-        let replaced = match self.interior.lookup(key, atoms).into_iter().next() {
-            Some(object) => object,
-            None => return Ok(false),
-        };
-        let arity = object_arity(replaced)?;
-        for &(pos, _) in updates {
-            if pos == keypos || pos == 0 || pos > arity {
-                return Err(badarg());
-            }
-        }
-        let updated = self.interior.update_element(key, updates, atoms, heap)?;
-        if updated {
-            // The interior rebuilt the object on the caller's `heap`; make it
-            // table-owned (the A.1 copy boundary).
-            self.relocate_rebuilt_object(key, replaced, atoms)?;
-        }
-        Ok(updated)
-    }
-
-    /// The shared `set`/`ordered_set` guard of the `ets:update_*` element
-    /// operations: `bag`/`duplicate_bag` have no counters (`erl` raises `badarg`).
-    fn check_counter_kind(&self) -> Result<()> {
-        match self.opts.kind() {
-            TableKind::Set | TableKind::OrderedSet => Ok(()),
-            TableKind::Bag | TableKind::DuplicateBag => Err(badarg()),
-        }
-    }
-
-    /// The common body of `ets:update_counter/3` (`default = None`) and `/4`
-    /// (`default = Some`).
-    ///
-    /// The `default` object, when given, is validated before the key is consulted
-    /// — `erl` fails on an invalid default even when the key exists. Every
-    /// operation is validated before the first write, so a bad operation leaves
-    /// the table (including a not-yet-deposited default object) untouched.
-    ///
-    /// Verified against the system `erl` (OTP 29 / erts-17.1):
-    /// * `update_op` is `Incr | {Pos,Incr} | {Pos,Incr,Threshold,SetValue} |` a
-    ///   list of those; only the **list** operand yields a list result;
-    /// * with `default`, an absent key behaves as if the object `default` (with
-    ///   its key element replaced by `key`) were present — it is deposited in the
-    ///   table, even when the operation list is empty;
-    /// * the threshold rule: an increment `>= 0` whose result would be `>` the
-    ///   threshold, or one `< 0` whose result would be `<` the threshold, makes
-    ///   the counter `SetValue`.
-    fn do_update_counter(
-        &mut self,
-        key: Eterm,
-        update_op: Eterm,
-        default: Option<Eterm>,
-        atoms: &AtomTable,
-        heap: &mut beam_alloc::Heap,
-    ) -> Result<Eterm> {
-        self.check_counter_kind()?;
-        let keypos = self.opts.keypos();
-        // Validate the default object before consulting the key.
-        let default = match default {
-            Some(default) => {
-                let arity = object_arity(default)?;
-                if arity < keypos {
-                    return Err(badarg());
-                }
-                Some((default, arity))
-            }
-            None => None,
-        };
-        let (ops, list_result) = decode_counter_ops(update_op, keypos)?;
-
-        // The object to update: the stored one, or (the `/4` form only) the
-        // default with its key element replaced by `key`, built on `heap`.
-        let stored = self.interior.lookup(key, atoms).into_iter().next();
-        let (object, deposit) = match stored {
-            Some(object) => (object, false),
-            None => match default {
-                Some((default, arity)) => (
-                    replace_elements(default, arity, &[(keypos, key)], heap)?,
-                    true,
-                ),
-                // `/3` has no default object: an absent key is `badarg`.
-                None => return Err(badarg()),
-            },
-        };
-
-        // Validate every operation before the first write so the call is
-        // all-or-nothing on a bad operand.
-        let arity = object_arity(object)?;
-        for op in &ops {
-            if op.pos == keypos || op.pos == 0 || op.pos > arity {
-                return Err(badarg());
-            }
-            // The addressed element must be an integer.
-            read_counter(object, op.pos)?;
-        }
-
-        // Past this point the operations are applied; deposit the default object
-        // first when the key was absent.
-        let mut replaced = object;
-        if deposit {
-            self.insert(object, atoms)?;
-            replaced = self
-                .interior
-                .lookup(key, atoms)
-                .into_iter()
-                .next()
-                .ok_or_else(badarg)?;
-        }
-
-        let mut results = Vec::with_capacity(ops.len());
-        for op in &ops {
-            let value = self
-                .interior
-                .update_counter(key, op.pos, op.incr, atoms, heap)?;
-            let value = match op.warp {
-                Some((threshold, set_value)) if warp_fires(op.incr, value, threshold, atoms) => {
-                    // The threshold rule replaces the counter outright; the hash
-                    // override has no "write this value" entry point, so route it
-                    // through `update_element` (same observable result).
-                    self.interior
-                        .update_element(key, &[(op.pos, set_value)], atoms, heap)?;
-                    set_value
-                }
-                _ => value,
-            };
-            results.push(value);
-        }
-        // The last interior operation may have rebuilt the object on the caller's
-        // `heap`; reconcile the index with table-owned storage once.
-        self.relocate_rebuilt_object(key, replaced, atoms)?;
-
-        if list_result {
-            build_list(heap, &results)
-        } else {
-            // The scalar operands always decode to exactly one operation.
-            results.first().copied().ok_or_else(badarg)
-        }
-    }
-
-    /// Reconcile table-owned storage after an interior element update rebuilt the
-    /// object stored under `key` on the caller's `heap`.
-    ///
-    /// The A.1 copy boundary forbids the table from retaining a pointer into a
-    /// caller heap, so a rebuilt object is deep-copied into the table store, the
-    /// store copy replaces it in the index, and the table-owned object it replaced
-    /// is reclaimed. An **in-place** update (the hash index's `update_counter`)
-    /// leaves the stored root untouched, and then there is nothing to do.
-    fn relocate_rebuilt_object(
-        &mut self,
-        key: Eterm,
-        replaced: Eterm,
-        atoms: &AtomTable,
-    ) -> Result<()> {
-        let current = match self.interior.lookup(key, atoms).into_iter().next() {
-            Some(current) => current,
-            // The `set`/`ordered_set` kinds this path serves always keep exactly
-            // one object per key.
-            None => return Err(badarg()),
-        };
-        if current == replaced {
-            return Ok(());
-        }
-        match self.store.copy(current) {
-            Ok(stored) => {
-                self.interior.insert(key, stored, atoms)?;
-                self.store.free(replaced);
-                Ok(())
-            }
-            Err(err) => {
-                // The rebuilt object is not expressible in table storage (a fun,
-                // an external pid, …): put the table-owned object back rather than
-                // retain a caller-heap pointer, and report the failure.
-                self.interior.insert(key, replaced, atoms)?;
-                Err(err)
-            }
-        }
     }
 
     // --------------------------------------------------------------- navigation
@@ -947,11 +859,18 @@ impl Table {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use beam_common::BeamError;
     use beam_term::heap::Heap;
 
     /// A `{Key, Value}` object (keypos 1) on `heap`.
     fn object(heap: &mut Heap, key: i64, value: i64) -> Eterm {
         heap.tuple(&[make_small(key), make_small(value)]).unwrap()
+    }
+
+    /// A `{Key, Value, Tag}` object (keypos 1) on `heap`.
+    fn triple(heap: &mut Heap, key: i64, value: i64, tag: i64) -> Eterm {
+        heap.tuple(&[make_small(key), make_small(value), make_small(tag)])
+            .unwrap()
     }
 
     /// A fresh keypos-1 table of `kind`.
@@ -961,6 +880,18 @@ mod tests {
         Table::new(TableId::next(), opts).expect("a fresh table is constructible")
     }
 
+    /// `err` is the crate's typed "unsupported operation" raise (not a `badarg`),
+    /// and it names `needle`.
+    fn assert_unsupported_naming(err: BeamError, needle: &str) {
+        let raise = err.into_raise().expect("the unsupported marker is a raise");
+        let reason = raise.reason.as_atom().expect("the reason is an atom");
+        assert_eq!(raise.class, beam_common::ExceptionClass::Error);
+        assert_eq!(
+            reason,
+            format!("unsupported_ets: {needle}"),
+            "the raise names this crate's unsupported surface"
+        );
+    }
     /// The interior reports a rejected `bag` duplicate, so `Table::insert` reclaims
     /// the deep copy it just made: the store's live-word count does not grow.
     #[test]
@@ -1025,5 +956,208 @@ mod tests {
             eq(taken[0], source, &atoms),
             "the returned copy is structurally the removed object"
         );
+    }
+
+    /// `insert_list` validates the whole list **before** the first store write, so
+    /// an invalid element inserts none of the elements — including the valid ones
+    /// that precede it (verified `erl` behaviour).
+    #[test]
+    fn insert_list_validates_every_object_before_inserting_any() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut t = table(TableKind::Set);
+
+        let kept = object(&mut heap, 1, 10);
+        t.insert(kept, &atoms).unwrap();
+        let live = t.store.words();
+        let good = object(&mut heap, 2, 20);
+
+        // A non-tuple element after a valid one: nothing is inserted.
+        assert!(matches!(
+            t.insert_list(&[good, make_small(7)], &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(t.size(), 1, "only the pre-existing object survives");
+        assert!(!t.member(make_small(2), &atoms));
+        assert_eq!(
+            t.store.words(),
+            live,
+            "the valid element's copy must not be left in the store"
+        );
+
+        // The invalid element may also come first.
+        assert!(matches!(
+            t.insert_list(&[make_small(7), good], &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(t.size(), 1);
+        assert_eq!(t.store.words(), live);
+
+        // A valid list still inserts everything (the failure above left no residue).
+        t.insert_list(&[good, object(&mut heap, 3, 30)], &atoms).unwrap();
+        assert_eq!(t.size(), 3);
+    }
+
+    /// A `{keypos,2}` table rejects a list containing an element whose arity is
+    /// `< keypos` without inserting the valid elements either.
+    #[test]
+    fn insert_list_is_atomic_under_a_custom_keypos() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(64);
+        let mut opts = TableOptions::new();
+        opts.set_keypos(2).unwrap();
+        let mut t = Table::new(TableId::next(), opts).unwrap();
+
+        let kept = heap.tuple(&[make_small(1), make_small(10)]).unwrap();
+        t.insert(kept, &atoms).unwrap();
+        let live = t.store.words();
+
+        // `{b}` is a 1-tuple: arity 1 < keypos 2, so the whole list is `badarg`.
+        let good = heap.tuple(&[make_small(2), make_small(20)]).unwrap();
+        let short = heap.tuple(&[make_small(3)]).unwrap();
+        assert!(matches!(
+            t.insert_list(&[good, short], &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert_eq!(t.size(), 1);
+        assert!(t.member(make_small(10), &atoms));
+        assert!(!t.member(make_small(20), &atoms));
+        assert_eq!(t.store.words(), live);
+    }
+
+    /// The element projection of every object under a key, for all four kinds:
+    /// the list `ets:lookup_element/3` returns for `bag`/`duplicate_bag`, and the
+    /// one-element list the single-object kinds yield.
+    #[test]
+    fn lookup_element_all_projects_every_object_under_a_key() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(256);
+
+        let mut bag = table(TableKind::Bag);
+        bag.insert(triple(&mut heap, 1, 10, 100), &atoms).unwrap();
+        bag.insert(triple(&mut heap, 1, 20, 200), &atoms).unwrap();
+        let values = bag.lookup_element_all(make_small(1), 2, &atoms).unwrap();
+        assert!(values
+            .iter()
+            .zip([make_small(10), make_small(20)])
+            .all(|(got, want)| eq(*got, want, &atoms)));
+        let tags = bag.lookup_element_all(make_small(1), 3, &atoms).unwrap();
+        assert!(eq(tags[1], make_small(200), &atoms));
+
+        // A key element repeats once per object.
+        let keys = bag.lookup_element_all(make_small(1), 1, &atoms).unwrap();
+        assert_eq!(keys.len(), 2);
+        assert!(eq(keys[0], make_small(1), &atoms) && eq(keys[1], make_small(1), &atoms));
+
+        // `duplicate_bag` preserves identical objects (and so identical elements).
+        let mut dup = table(TableKind::DuplicateBag);
+        dup.insert(object(&mut heap, 5, 1), &atoms).unwrap();
+        dup.insert(object(&mut heap, 5, 1), &atoms).unwrap();
+        assert_eq!(dup.lookup_element_all(make_small(5), 2, &atoms).unwrap().len(), 2);
+
+        // The single-object kinds store at most one object per key.
+        for kind in [TableKind::Set, TableKind::OrderedSet] {
+            let mut t = table(kind);
+            t.insert(triple(&mut heap, 9, 10, 100), &atoms).unwrap();
+            let one = t.lookup_element_all(make_small(9), 2, &atoms).unwrap();
+            assert_eq!(one.len(), 1, "{kind:?} holds one object per key");
+            assert!(eq(one[0], t.lookup_element(make_small(9), 2, &atoms).unwrap(), &atoms));
+        }
+    }
+
+    /// The element-list projection's failures mirror the oracle: an absent key, a
+    /// `pos` of 0, and an object too short to have `pos` are all `badarg`.
+    #[test]
+    fn lookup_element_all_rejects_absent_keys_zero_and_short_objects() {
+        let atoms = AtomTable::new();
+        let mut heap = Heap::new(256);
+        let mut bag = table(TableKind::Bag);
+        bag.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+
+        assert!(matches!(
+            bag.lookup_element_all(make_small(1), 0, &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            bag.lookup_element_all(make_small(99), 2, &atoms),
+            Err(BeamError::BadArg)
+        ));
+        // `{1,10}` has arity 2, so position 3 is out of range for the whole call.
+        assert!(matches!(
+            bag.lookup_element_all(make_small(1), 3, &atoms),
+            Err(BeamError::BadArg)
+        ));
+
+        // `/4` reports the absent key as `None` (the caller yields `default`), but
+        // validates `pos` first and keeps a present key's `badarg`.
+        let default = make_small(-1);
+        assert_eq!(
+            bag.lookup_element_all_or(make_small(99), 9, default, &atoms).unwrap(),
+            None
+        );
+        assert!(matches!(
+            bag.lookup_element_all_or(make_small(99), 0, default, &atoms),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            bag.lookup_element_all_or(make_small(1), 3, default, &atoms),
+            Err(BeamError::BadArg)
+        ));
+        let present = bag
+            .lookup_element_all_or(make_small(1), 2, default, &atoms)
+            .unwrap()
+            .expect("a present key yields the elements");
+        assert_eq!(present.len(), 1);
+        assert!(eq(present[0], make_small(10), &atoms));
+    }
+
+    /// The scalar `lookup_element`/`lookup_element_or` are honest for the
+    /// multi-object kinds: they raise the crate's typed "unsupported" (never a
+    /// wrong scalar) while still answering the oracle's failures with `badarg`.
+    #[test]
+    fn scalar_lookup_element_is_unsupported_for_multi_kinds() {
+        for kind in [TableKind::Bag, TableKind::DuplicateBag] {
+            let atoms = AtomTable::new();
+            let mut heap = Heap::new(64);
+            let mut t = table(kind);
+            t.insert(object(&mut heap, 1, 10), &atoms).unwrap();
+            t.insert(object(&mut heap, 1, 20), &atoms).unwrap();
+
+            // A present key with an in-range position: the oracle returns a list.
+            assert_unsupported_naming(
+                t.lookup_element(make_small(1), 2, &atoms).unwrap_err(),
+                MULTI_ELEMENT_SCALAR,
+            );
+            // ... and the `/4` form of the same call.
+            assert_unsupported_naming(
+                t.lookup_element_or(make_small(1), 2, make_small(-1), &atoms)
+                    .unwrap_err(),
+                MULTI_ELEMENT_SCALAR,
+            );
+
+            // The oracle's failures stay `badarg`, not "unsupported".
+            assert!(matches!(
+                t.lookup_element(make_small(1), 0, &atoms),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                t.lookup_element(make_small(99), 2, &atoms),
+                Err(BeamError::BadArg)
+            ));
+            assert!(matches!(
+                t.lookup_element(make_small(1), 3, &atoms),
+                Err(BeamError::BadArg)
+            ));
+            // An absent key is `default` for `/4`, whatever the kind.
+            assert_eq!(
+                t.lookup_element_or(make_small(99), 9, make_small(-1), &atoms)
+                    .unwrap(),
+                make_small(-1)
+            );
+            assert!(matches!(
+                t.lookup_element_or(make_small(99), 0, make_small(-1), &atoms),
+                Err(BeamError::BadArg)
+            ));
+        }
     }
 }
