@@ -467,7 +467,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
-- `src/compare.rs`, `src/hashing.rs`, `src/size.rs` carry their own in-module `#[cfg(test)]` suites:
+- `src/compare.rs`, `src/hashing/` (the structural-hash suite + the `make_hash2`/`make_hash`
+  oracle-vector suites + `common`'s `block_hash` pin), `src/size.rs` carry their own in-module
+  `#[cfg(test)]` suites:
   ordering across every class pair (number < atom < ref < port < pid < tuple < map < nil < list <
   binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
   structural-hash equality for equal terms (and inequality for different terms), and `size_object`
