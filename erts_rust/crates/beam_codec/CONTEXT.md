@@ -433,6 +433,11 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oracle-exact (both implement the `body_len - 5` shrink rule above). Round-trip byte-stability is
   asserted among *our own* encode/decode; interoperability (the system `erl`'s `binary_to_term/1`
   accepting our wrapper and our uncompressed re-encoding) is asserted live by `tests/interop.rs`.
+- **A native record's layout is owned by `beam_term::record`; the codec only maps it to the wire.**
+  `RECORD_EXT` (`67`) is *not* a tuple: the encoder probes `is_record` before the tuple/boxed
+  families and forwards to `beam_term::record`, so the atom-index sort rule, `field_order` and the
+  declaration↔sorted inversion stay in the layout owner. The cached definition `hash` is not on the
+  wire, and `beam_term` cannot reproduce C's `make_hash2`, so the codec passes `make_small(0)`.
 - **The interop harness compares terms structurally, not by `beam_term::compare::eq`.** `eq`'s
   documented fallback for maps and external identifiers compares the raw term word (a heap address),
   so it would report two structurally-equal terms decoded into different heaps as unequal. The
