@@ -23,10 +23,11 @@
 //! 1. **inlines** the IR instruction and transfers control to a successor block —
 //!    the metadata no-ops fall through to `pc + 1`, an inlinable `move` writes the
 //!    destination x-register slot and falls through to `pc + 1`, an inlinable
-//!    small-int `gc_bif` falls through to `pc + 1` on its fast path, and a `jump`
-//!    whose label resolves **inside this IR function** jumps straight to the
-//!    label's `pc` (a `jump` into a *different* IR function returns the encoded
-//!    `(func, pc)` word to the driver); or
+//!    small-int `gc_bif` falls through to `pc + 1` on its fast path, an inlinable
+//!    `test` branches to its `fail` label (or falls through to `pc + 1` on
+//!    success), and a `jump` whose label resolves **inside this IR function**
+//!    jumps straight to the label's `pc` (a `jump` into a *different* IR function
+//!    returns the encoded `(func, pc)` word to the driver); or
 //! 2. calls the shared per-instruction helper
 //!    `jit_step_one(rt, FUNC_INDEX, pc)` — the **same** interpreter-backed helper
 //!    the baseline tier uses
@@ -64,11 +65,33 @@
 //!
 //! Everything outside the set above: `func_info` (the failed-clause raise, which
 //! must **not** be a no-op — see the interpreter's `Instr::FuncInfo` arm), `swap`,
-//! every call/return/frame instruction, every `test`/`select_*`, every BIF outside
-//! the two the fast path recognises, `move` with a `Y` (or other non-x) operand or
-//! an x-register index past the engine's `MAX_REGISTER` bound, and a `jump` to a
-//! label the module does not define (so the interpreter's exact `unknown_label`
-//! error surfaces). Each of those runs through `jit_step_one`.
+//! every call/return/frame instruction, every `test` shape outside
+//! [`inline_test`]'s provably-exact subset (see that function), `select_*`, every
+//! BIF outside the two the fast path recognises, `move` with a `Y` (or other
+//! non-x) operand or an x-register index past the engine's `MAX_REGISTER` bound,
+//! and a `jump` to a label the module does not define (so the interpreter's exact
+//! `unknown_label` error surfaces). Each of those runs through `jit_step_one`.
+//!
+//! # The inlined `test` subset
+//!
+//! `Instr::Test` is a large share of the helper traffic in real modules, so the
+//! tier inlines the shapes whose result is a **word compare** — provably identical
+//! to the interpreter's [`cmp_arith`](beam_term::cmp_arith)/[`cmp`](beam_term::cmp)
+//! — and deopts for every other shape:
+//!
+//! * the word-level type tests `is_nil`, `is_atom`, `is_list`, `is_nonempty_list`
+//!   and `is_boolean` (the last against the module's `true`/`false` atom words);
+//! * `is_lt`/`is_ge`/`is_eq`/`is_ne`/`is_eq_exact`/`is_ne_exact` when at least one
+//!   operand is a constant-immediate (a small int, an atom or `nil`) or, for the
+//!   non-exact kinds, both are x-registers — after guarding the register operand(s)
+//!   as untagged small ints (`(w & 0xF) == 0xF`) so the *tagged-word* signed order
+//!   is the interpreter's value/arithmetic order.
+//!
+//! `fail == NO_FAIL` (which *raises*), an unresolved fail label, a `Y`/float/literal
+//! operand, a bignum constant, two registers for the exact kinds, and every other
+//! `TestKind` (`is_integer`, `is_tuple`, `is_function2`, …) stay on `jit_step_one`.
+//! A failed small-int guard likewise deopts to the helper, so the fast path can only
+//! ever *replace* a result the interpreter would compute identically.
 //!
 //! # `unsafe`
 //!
@@ -83,10 +106,10 @@ use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::mem;
 
 use beam_common::Result;
-use beam_loader::{Atom, Function, Instr, Label, Module, Operand, Reg as RegRef};
+use beam_loader::{Atom, Function, Instr, Label, Module, Operand, Reg as RegRef, TestKind, NO_FAIL};
 use beam_term::{
     make_atom, make_small, Eterm, MAX_SMALL, MIN_SMALL, NIL, TAG_IMMED1_MASK, TAG_IMMED1_SIZE,
-    TAG_IMMED1_SMALL,
+    TAG_IMMED1_SMALL, TAG_IMMED2_ATOM, TAG_IMMED2_MASK, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK,
 };
 use cranelift_codegen::ir::condcodes::IntCC;
 use cranelift_codegen::ir::{
@@ -136,12 +159,35 @@ fn x_offset(x: u32) -> i32 {
     (x as i32) * (mem::size_of::<Eterm>() as i32)
 }
 
-/// Record that x-register `x` is touched natively at `[x_regs + x*8]`.
-fn touch(highest: &mut Option<u32>, x: u32) {
-    *highest = Some(match *highest {
-        Some(previous) => previous.max(x),
-        None => x,
-    });
+/// Compile-time observations about one module's generated code.
+///
+/// The codegen records what it actually inlined here so the artifact
+/// ([`CompiledFunctions`]) can expose it: the highest natively addressed x-register
+/// (the driver's native-entry guard reads it) and the set of inlined `test` kinds
+/// (evidence that the fast path — not `jit_step_one` — ran).
+#[derive(Default)]
+struct CodegenReport {
+    /// The highest x-register index any inlined instruction addresses natively.
+    highest_native_register: Option<u32>,
+    /// The `test` kinds inlined natively (deduped, in first-inlined order).
+    inlined_tests: Vec<TestKind>,
+}
+
+impl CodegenReport {
+    /// Record that x-register `x` is touched natively at `[x_regs + x*8]`.
+    fn touch(&mut self, x: u32) {
+        self.highest_native_register = Some(match self.highest_native_register {
+            Some(previous) => previous.max(x),
+            None => x,
+        });
+    }
+
+    /// Record that a `test` of `kind` was inlined natively.
+    fn inlined_test(&mut self, kind: TestKind) {
+        if !self.inlined_tests.contains(&kind) {
+            self.inlined_tests.push(kind);
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -239,11 +285,21 @@ pub struct CompiledFunctions {
     /// The highest x-register index any inlined instruction addresses directly in
     /// `machine.x`.
     ///
-    /// The inlined `move` fast path reads and writes `[x_regs + x*8]` **without a
-    /// bounds check**, so the driver refuses native entry when the running machine's
-    /// register file is not at least this long (see [`CompiledEntries::enter`]) —
-    /// the same belt-and-braces guard the baseline tier uses.
+    /// The inlined `move`/`test` fast paths read and write `[x_regs + x*8]`
+    /// **without a bounds check**, so the driver refuses native entry when the
+    /// running machine's register file is not at least this long (see
+    /// [`CompiledEntries::enter`]) — the same belt-and-braces guard the baseline
+    /// tier uses.
     highest_native_register: Option<u32>,
+    /// The `test` kinds the tier inlined natively (deduped, in first-inlined
+    /// order).
+    ///
+    /// An artifact-level observation, not a behaviour: it is what lets a test
+    /// assert that a `test` really took the **inline** path rather than silently
+    /// falling through to `jit_step_one` (see [`inlined_test_kinds`]).
+    ///
+    /// [`inlined_test_kinds`]: CompiledFunctions::inlined_test_kinds
+    inlined_tests: Vec<TestKind>,
 }
 
 impl CompiledFunctions {
@@ -266,6 +322,16 @@ impl CompiledFunctions {
     /// `machine.x`, if any instruction was inlined.
     pub fn highest_native_register(&self) -> Option<u32> {
         self.highest_native_register
+    }
+
+    /// The `test` kinds this artifact inlined natively, deduped and in
+    /// first-inlined order (empty when the tier inlined no `test`).
+    ///
+    /// Read-only introspection: it names **which** `TestKind`s the compile actually
+    /// took the inline path for, so a test can prove the fast path ran instead of
+    /// silently deopting to `jit_step_one` (agreeing results alone would not).
+    pub fn inlined_test_kinds(&self) -> &[TestKind] {
+        &self.inlined_tests
     }
 }
 
@@ -356,7 +422,7 @@ fn compile_module(
 
     let mut entry_pc: HashMap<u32, u32> = HashMap::new();
     let mut defined: Vec<(u32, FuncId)> = Vec::new();
-    let mut highest_native_register: Option<u32> = None;
+    let mut report = CodegenReport::default();
     for (index, function) in module.functions.iter().enumerate() {
         if function.code.is_empty() {
             continue;
@@ -380,8 +446,9 @@ fn compile_module(
             &labels,
             function,
             pc as u32,
-            &mut highest_native_register,
-        )?;        entry_pc.insert(func_index, pc as u32);
+            &mut report,
+        )?;
+        entry_pc.insert(func_index, pc as u32);
         defined.push((func_index, id));
     }
 
@@ -398,7 +465,8 @@ fn compile_module(
         _module: jit,
         entries,
         entry_pc,
-        highest_native_register,
+        highest_native_register: report.highest_native_register,
+        inlined_tests: report.inlined_tests,
     })
 }
 
@@ -413,9 +481,10 @@ fn emit_function(
     id: FuncId,
     module: &Module,
     func_index: u32,
-    labels: &BTreeMap<Label, (u32, u32)>,    function: &Function,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    function: &Function,
     entry_pc: u32,
-    highest_native_register: &mut Option<u32>,
+    report: &mut CodegenReport,
 ) -> Result<()> {
     let code = &function.code;
     let code_len = code.len();
@@ -472,8 +541,9 @@ fn emit_function(
                     helper,
                     rt,
                     this_func,
-                    highest_native_register,
-                );            }
+                    report,
+                );
+            }
             // The shared dispatch chain is filled once per function, after every
             // `pc` block reached so far (see `emit_dispatch_chain`).
             match cfg.dispatch {
@@ -607,9 +677,10 @@ fn emit_pc(
     helper: FuncRef,
     rt: Value,
     this_func: Value,
-    highest_native_register: &mut Option<u32>,
+    report: &mut CodegenReport,
 ) {
-    match code.get(pc as usize) {        // Metadata no-ops (`ops.tab:103-108`): they never change control flow, so the
+    match code.get(pc as usize) {
+        // Metadata no-ops (`ops.tab:103-108`): they never change control flow, so the
         // block falls through. `func_info` is **not** here: it is the failed-clause
         // raise (the interpreter's `Instr::FuncInfo` arm), so inlining it as a no-op
         // would fall through to the entry label and re-run the clause tests forever.
@@ -625,29 +696,41 @@ fn emit_pc(
         }
         Some(Instr::Move { src, dst }) => {
             if let Some((dst_x, source)) = inline_move(src, dst) {
-                emit_inline_move(builder, rt, dst_x, &source, highest_native_register);
+                emit_inline_move(builder, rt, dst_x, &source, report);
                 goto_or_leave(builder, cfg, code_len, func_index, pc + 1);
                 return;
             }
         }
         Some(Instr::Jump { target }) => {
-            if let Some(&(target_func, target_pc)) = labels.get(target) {
-                if target_func == func_index && (target_pc as usize) < code_len {
-                    let block = block_for(builder, cfg, target_pc);
-                    builder.ins().jump(block, &[]);
-                } else {
-                    // A jump into another IR function (or to an address this function
-                    // has no code for) leaves this native function: hand the encoded
-                    // `(func, pc)` word to the driver.
-                    let word = builder
-                        .ins()
-                        .iconst(types::I64, encode_target(target_func, target_pc));
-                    builder.ins().return_(&[word]);
-                }
+            if let Some(&resolved) = labels.get(target) {
+                emit_target_branch(builder, cfg, code_len, func_index, resolved);
                 return;
             }
             // An undefined label keeps the interpreter's exact `unknown_label` error:
             // hand the jump to the helper rather than inventing one.
+        }
+        // The inlined word-level `test` subset: the type tests and the provably-exact
+        // comparison shapes (see [`inline_test`]). Everything outside that subset, and
+        // every run-time guard failure inside it, deopts to the helper, whose
+        // interpreter step is the test's exact semantics (including the `fail`-label /
+        // raise split).
+        Some(Instr::Test { kind, fail, args }) => {
+            if let Some(plan) = inline_test(module, *kind, *fail, args, labels) {
+                report.inlined_test(*kind);
+                emit_inline_test(
+                    builder,
+                    cfg,
+                    pc,
+                    code_len,
+                    func_index,
+                    rt,
+                    &plan,
+                    helper,
+                    this_func,
+                    report,
+                );
+                return;
+            }
         }
         // The one BIF the tier inlines: the small-int `erlang:'+'/2`/`'-'/2` fast
         // path. It is a *shape* test (never a value test) — every mismatch, and every
@@ -665,13 +748,42 @@ fn emit_pc(
                     &fast,
                     helper,
                     this_func,
-                    highest_native_register,
-                );                return;
+                    report,
+                );
+                return;
             }
         }
         _ => {}
-    }    // Everything else: one interpreter step, then dispatch on the word it returned.
+    }
+    // Everything else: one interpreter step, then dispatch on the word it returned.
     emit_helper_dispatch(builder, cfg, pc, code_len, helper, rt, this_func);
+}
+
+/// Emit a branch to a resolved `(func, pc)` target: a native jump when it is an
+/// address **this** function has code for, else the encoded `(func, pc)` word back
+/// to the driver (which continues in that function, or takes the interpreter step).
+///
+/// This is the one place a `jump` and a `test`'s `fail` branch turn a resolved
+/// [`Label`] into control flow, so both stay bit-identical.
+fn emit_target_branch(
+    builder: &mut FunctionBuilder,
+    cfg: &mut Cfg,
+    code_len: usize,
+    func_index: u32,
+    target: (u32, u32),
+) {
+    let (target_func, target_pc) = target;
+    if target_func == func_index && (target_pc as usize) < code_len {
+        let block = block_for(builder, cfg, target_pc);
+        builder.ins().jump(block, &[]);
+    } else {
+        // A target in another IR function (or an address this function has no code
+        // for) leaves this native function: hand the encoded word to the driver.
+        let word = builder
+            .ins()
+            .iconst(types::I64, encode_target(target_func, target_pc));
+        builder.ins().return_(&[word]);
+    }
 }
 
 /// Emit the helper call for `(func_index, pc)` and transfer control on its result.
@@ -853,14 +965,14 @@ fn emit_inline_move(
     rt: Value,
     dst_x: u32,
     source: &MoveSource,
-    highest_native_register: &mut Option<u32>,
+    report: &mut CodegenReport,
 ) {
     let x_regs = builder
         .ins()
         .load(types::I64, MemFlags::trusted(), rt, XREGS_DISP);
     let value = match source {
         MoveSource::X(src_x) => {
-            touch(highest_native_register, *src_x);
+            report.touch(*src_x);
             builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), x_regs, x_offset(*src_x))
@@ -870,7 +982,7 @@ fn emit_inline_move(
     builder
         .ins()
         .store(MemFlags::trusted(), value, x_regs, x_offset(dst_x));
-    touch(highest_native_register, dst_x);
+    report.touch(dst_x);
 }
 
 // ---------------------------------------------------------------------------
@@ -996,12 +1108,13 @@ fn emit_inline_arith(
     fast: &FastArith,
     helper: FuncRef,
     this_func: Value,
-    highest_native_register: &mut Option<u32>,
-) {    let x_regs = builder
+    report: &mut CodegenReport,
+) {
+    let x_regs = builder
         .ins()
         .load(types::I64, MemFlags::trusted(), rt, XREGS_DISP);
-    let a = load_fast_operand(builder, x_regs, &fast.a, highest_native_register);
-    let b = load_fast_operand(builder, x_regs, &fast.b, highest_native_register);
+    let a = load_fast_operand(builder, x_regs, &fast.a, report);
+    let b = load_fast_operand(builder, x_regs, &fast.b, report);
 
     let tagged_a = builder.ins().band_imm(a, SMALL_MASK);
     let tagged_b = builder.ins().band_imm(b, SMALL_MASK);
@@ -1042,7 +1155,7 @@ fn emit_inline_arith(
     builder
         .ins()
         .store(MemFlags::trusted(), result, x_regs, x_offset(fast.dst_x));
-    touch(highest_native_register, fast.dst_x);
+    report.touch(fast.dst_x);
     goto_or_leave(builder, cfg, code_len, func_index, pc + 1);
 
     // Rejected: one interpreter step, the BIF's exact semantics.
@@ -1055,11 +1168,11 @@ fn load_fast_operand(
     builder: &mut FunctionBuilder,
     x_regs: Value,
     operand: &FastOperand,
-    highest_native_register: &mut Option<u32>,
+    report: &mut CodegenReport,
 ) -> Value {
     match operand {
         FastOperand::X(x) => {
-            touch(highest_native_register, *x);
+            report.touch(*x);
             builder
                 .ins()
                 .load(types::I64, MemFlags::trusted(), x_regs, x_offset(*x))
@@ -1103,6 +1216,436 @@ fn small_word(value: i64) -> Option<i64> {
     } else {
         None
     }
+}
+
+// ---------------------------------------------------------------------------
+// The inlined `test` subset
+// ---------------------------------------------------------------------------
+
+/// `beam_term::TAG_IMMED2_MASK` as an `i64` — the low-six-bits mask `is_atom` tests.
+const ATOM_MASK: i64 = TAG_IMMED2_MASK as i64;
+
+/// `beam_term::TAG_IMMED2_ATOM` as an `i64` — the atom immediate tag.
+const ATOM_TAG: i64 = TAG_IMMED2_ATOM as i64;
+
+/// The `is_not_list` mask `beam_term::list::is_not_list` uses —
+/// `TAG_PRIMARY_MASK - TAG_PRIMARY_LIST` (the C bit trick `x & 0x2`), so
+/// `(word & LIST_MASK) == 0` is exactly `is_list(word)`.
+const LIST_MASK: i64 = (TAG_PRIMARY_MASK - TAG_PRIMARY_LIST) as i64;
+
+/// The `NIL` raw word as an `i64` (`is_nil` is a whole-word equality test).
+const NIL_WORD: i64 = NIL.raw() as i64;
+
+/// A constant-immediate operand an inlined `test` compares against.
+#[derive(Clone, Copy)]
+enum TestConst {
+    /// A small-int constant's raw tagged `Eterm` word (`{integer,V}` / `{char,C}`
+    /// in the 60-bit range) — a *numeric* immediate.
+    Small(i64),
+    /// A non-numeric immediate constant's raw word — `{atom,A}` or `nil`.
+    Immediate(i64),
+}
+
+/// A `test` operand the inline path can read natively: an x-register slot or a
+/// constant-immediate word.
+#[derive(Clone, Copy)]
+enum CmpSrc {
+    /// An x-register (`machine.x[n]`).
+    Reg(u32),
+    /// A constant-immediate operand's raw word.
+    Const(TestConst),
+}
+
+/// Which of an inlined comparison's operands must be guarded as untagged small
+/// integers for the tagged-**word** compare to reproduce the interpreter's
+/// arithmetic ordering exactly.
+#[derive(Clone, Copy)]
+enum Guard {
+    /// No guard: the compare is already exact (at least one operand is a
+    /// constant-immediate, or both are small-int constants).
+    None,
+    /// The first operand must be an untagged small int.
+    Lhs,
+    /// The second operand must be an untagged small int.
+    Rhs,
+    /// Both operands must be untagged small ints.
+    Both,
+}
+
+/// A comparison `test` the tier inlines.
+struct ComparePlan {
+    /// The first operand's native source.
+    lhs: CmpSrc,
+    /// The second operand's native source.
+    rhs: CmpSrc,
+    /// The operands that must be guarded as small ints.
+    guard: Guard,
+    /// The condition on the two loaded words that means the test **succeeds**.
+    success: IntCC,
+    /// The resolved `(func, pc)` of the instruction's `fail` label.
+    fail: (u32, u32),
+}
+
+/// A word-level type `test` the tier inlines.
+struct TypePlan {
+    /// The tested operand's native source.
+    src: CmpSrc,
+    /// The predicate.
+    kind: TypeTest,
+    /// The resolved `(func, pc)` of the instruction's `fail` label.
+    fail: (u32, u32),
+}
+
+/// The word-level `is_*` tests the tier inlines (each a single-word predicate that
+/// never dereferences).
+#[derive(Clone, Copy)]
+enum TypeTest {
+    /// `is_nil` — the word is `NIL`.
+    Nil,
+    /// `is_atom` — the word carries the atom immediate tag.
+    Atom,
+    /// `is_list` — `is_nil(v) || is_not_nil_list(v)`.
+    List,
+    /// `is_nonempty_list` — a cons cell.
+    NonemptyList,
+    /// `is_boolean` — the word is the module's `true` or `false` atom.
+    Boolean {
+        /// The raw word of the module's `true` atom, when it is interned.
+        truthy: Option<i64>,
+        /// The raw word of the module's `false` atom, when it is interned.
+        falsy: Option<i64>,
+    },
+}
+
+/// A `test` the tier inlines natively.
+enum TestPlan {
+    /// A two-operand comparison.
+    Compare(ComparePlan),
+    /// A one-operand word-level type test.
+    Type(TypePlan),
+}
+
+/// The plan for an inlinable `test`, or `None` when the test stays on the helper.
+///
+/// Only **provably-exact** shapes are inlined (see the module docs); everything
+/// else — a `NO_FAIL` (`fail,0`) test, an unresolved fail label, a `Y`/float/literal
+/// operand, an out-of-range x-register, a bignum constant, two registers for the
+/// exact kinds, a boxed-term type test, `is_function2`/`is_tagged_tuple`/
+/// `test_arity` — returns `None`, so the helper runs the instruction with the
+/// interpreter's exact semantics (and the interpreter's exact typed error).
+fn inline_test(
+    module: &Module,
+    kind: TestKind,
+    fail: Label,
+    args: &[Operand],
+    labels: &BTreeMap<Label, (u32, u32)>,
+) -> Option<TestPlan> {
+    // A `NO_FAIL` test *raises* on failure (the interpreter's typed `test/no_fail`),
+    // so it is never inlined: the helper reproduces that exactly.
+    if fail == NO_FAIL {
+        return None;
+    }
+    // An unresolved fail label keeps the interpreter's exact `unknown_label` error,
+    // so the whole test stays on the helper.
+    let target = *labels.get(&fail)?;
+
+    let type_kind = match kind {
+        TestKind::IsNil => Some(TypeTest::Nil),
+        TestKind::IsAtom => Some(TypeTest::Atom),
+        TestKind::IsList => Some(TypeTest::List),
+        TestKind::IsNonemptyList => Some(TypeTest::NonemptyList),
+        // `is_boolean` compares against the module's own `true`/`false` atom words; a
+        // name the module never interned can never be the value, and contributes
+        // nothing (the interpreter's `.unwrap_or(false)`).
+        TestKind::IsBoolean => Some(TypeTest::Boolean {
+            truthy: module
+                .atom_table
+                .lookup("true")
+                .map(|atom| make_atom(atom).raw() as i64),
+            falsy: module
+                .atom_table
+                .lookup("false")
+                .map(|atom| make_atom(atom).raw() as i64),
+        }),
+        _ => None,
+    };
+    if let Some(kind) = type_kind {
+        let src = cmp_src(args.first()?)?;
+        return Some(TestPlan::Type(TypePlan {
+            src,
+            kind,
+            fail: target,
+        }));
+    }
+
+    let lhs = cmp_src(args.first()?)?;
+    let rhs = cmp_src(args.get(1)?)?;
+    let (guard, success) = compare_shape(kind, lhs, rhs)?;
+    Some(TestPlan::Compare(ComparePlan {
+        lhs,
+        rhs,
+        guard,
+        success,
+        fail: target,
+    }))
+}
+
+/// The native source of one `test` operand, or `None` when the operand needs the
+/// helper: a `Y` register, a float register, a literal, a bignum constant, an
+/// `Atom::MAX` placeholder, or an x-register index past the engine's
+/// [`MAX_REGISTER`] bound (whose exact `bad_register` error must surface).
+fn cmp_src(operand: &Operand) -> Option<CmpSrc> {
+    match x_register(operand) {
+        Some(x) if x < MAX_REGISTER => Some(CmpSrc::Reg(x)),
+        Some(_) => None,
+        None => test_const(operand).map(CmpSrc::Const),
+    }
+}
+
+/// The constant-immediate form of an operand, with its raw `Eterm` word: a
+/// small-int (`{integer,V}`/`{char,C}` in the 60-bit range), an atom, or `nil`.
+///
+/// A bignum `{integer,V}` constant (out of the small range), a literal, and every
+/// other operand kind return `None`, so they stay on the helper.
+fn test_const(operand: &Operand) -> Option<TestConst> {
+    match operand {
+        Operand::Integer(value) => small_word(*value).map(TestConst::Small),
+        Operand::Character(c) => small_word(i64::from(*c)).map(TestConst::Small),
+        Operand::Atom(atom) => Some(TestConst::Immediate(make_atom(*atom).raw() as i64)),
+        Operand::Nil => Some(TestConst::Immediate(NIL_WORD)),
+        _ => None,
+    }
+}
+
+/// The `(guard, success)` of an inlinable comparison, or `None` when the shape is
+/// not provably word-exact.
+fn compare_shape(kind: TestKind, lhs: CmpSrc, rhs: CmpSrc) -> Option<(Guard, IntCC)> {
+    match kind {
+        TestKind::IsEqExact | TestKind::IsNeExact => {
+            // Exact equality: an immediate constant can only be `=:=` to the very
+            // same immediate word (the immediate encodings are canonical, `cmp`'s
+            // `is_same` fast path), so a *word* compare is exact — **unless** both
+            // operands are registers, where two distinct boxed terms (equal floats,
+            // bignums, binaries, tuples, …) are `=:=` with different words.
+            if !matches!(lhs, CmpSrc::Const(_)) && !matches!(rhs, CmpSrc::Const(_)) {
+                return None;
+            }
+            let success = if kind == TestKind::IsEqExact {
+                IntCC::Equal
+            } else {
+                IntCC::NotEqual
+            };
+            Some((Guard::None, success))
+        }
+        TestKind::IsEq | TestKind::IsNe => {
+            let success = if kind == TestKind::IsEq {
+                IntCC::Equal
+            } else {
+                IntCC::NotEqual
+            };
+            Some((arith_guard(lhs, rhs)?, success))
+        }
+        TestKind::IsLt | TestKind::IsGe => {
+            let success = if kind == TestKind::IsLt {
+                IntCC::SignedLessThan
+            } else {
+                IntCC::SignedGreaterThanOrEqual
+            };
+            Some((order_guard(lhs, rhs)?, success))
+        }
+        _ => None,
+    }
+}
+
+/// The guard an **arithmetic** equality (`==`: `is_eq`/`is_ne`) needs for the word
+/// compare to reproduce `cmp_arith` exactly.
+///
+/// `==` is the only comparison where immediates are not self-sufficient: it treats
+/// `1` and `1.0` as equal (and `-0.0 == +0.0`), so a small-int constant needs its
+/// register counterpart guarded as a small int. An atom/`nil` immediate is never
+/// arithmetically equal to any other term, so it needs no guard; two constants need
+/// none either (a small-int and an atom/`nil` constant are never `==`).
+fn arith_guard(lhs: CmpSrc, rhs: CmpSrc) -> Option<Guard> {
+    match (lhs, rhs) {
+        // An atom/`nil` immediate is `==` only to the identical word.
+        (CmpSrc::Const(TestConst::Immediate(_)), _) | (_, CmpSrc::Const(TestConst::Immediate(_))) => {
+            Some(Guard::None)
+        }
+        (CmpSrc::Const(TestConst::Small(_)), CmpSrc::Const(TestConst::Small(_))) => Some(Guard::None),
+        (CmpSrc::Const(TestConst::Small(_)), CmpSrc::Reg(_)) => Some(Guard::Rhs),
+        (CmpSrc::Reg(_), CmpSrc::Const(TestConst::Small(_))) => Some(Guard::Lhs),
+        (CmpSrc::Reg(_), CmpSrc::Reg(_)) => Some(Guard::Both),
+    }
+}
+
+/// The guard an **ordering** compare (`<`, `>=`: `is_lt`/`is_ge`) needs.
+///
+/// `cmp_arith` orders numbers against floats by value and places numbers below the
+/// non-numeric classes, so only two small-int words are safe: the tagged-word
+/// *signed* order is the value order because `make_small(v) == v*16 + 15` is
+/// monotonic. A constant that is an atom/`nil` (or a bignum/literal operand) is not
+/// word-order exact, so those shapes stay on the helper.
+fn order_guard(lhs: CmpSrc, rhs: CmpSrc) -> Option<Guard> {
+    match (lhs, rhs) {
+        (CmpSrc::Const(TestConst::Small(_)), CmpSrc::Const(TestConst::Small(_))) => Some(Guard::None),
+        (CmpSrc::Const(TestConst::Small(_)), CmpSrc::Reg(_)) => Some(Guard::Rhs),
+        (CmpSrc::Reg(_), CmpSrc::Const(TestConst::Small(_))) => Some(Guard::Lhs),
+        (CmpSrc::Reg(_), CmpSrc::Reg(_)) => Some(Guard::Both),
+        _ => None,
+    }
+}
+
+/// Emit an inlined `test` at `pc`: load its operand word(s), (optionally) guard
+/// them as untagged small ints, branch on the resulting condition — falling through
+/// to `pc + 1` on success and to the resolved `fail` label otherwise — and deopt to
+/// the helper when the guard rejects an operand.
+#[allow(clippy::too_many_arguments)]
+fn emit_inline_test(
+    builder: &mut FunctionBuilder,
+    cfg: &mut Cfg,
+    pc: u32,
+    code_len: usize,
+    func_index: u32,
+    rt: Value,
+    plan: &TestPlan,
+    helper: FuncRef,
+    this_func: Value,
+    report: &mut CodegenReport,
+) {
+    let x_regs = builder
+        .ins()
+        .load(types::I64, MemFlags::trusted(), rt, XREGS_DISP);
+
+    // The success condition on the loaded word(s), plus the operands whose
+    // "is an untagged small int" guard the condition depends on.
+    let mut guarded: [Option<Value>; 2] = [None, None];
+    let (condition, fail) = match plan {
+        TestPlan::Type(plan) => {
+            let word = load_cmp_src(builder, x_regs, &plan.src, report);
+            (type_condition(builder, word, &plan.kind), plan.fail)
+        }
+        TestPlan::Compare(plan) => {
+            let lhs = load_cmp_src(builder, x_regs, &plan.lhs, report);
+            let rhs = load_cmp_src(builder, x_regs, &plan.rhs, report);
+            guarded = match plan.guard {
+                Guard::None => [None, None],
+                Guard::Lhs => [Some(lhs), None],
+                Guard::Rhs => [None, Some(rhs)],
+                Guard::Both => [Some(lhs), Some(rhs)],
+            };
+            (builder.ins().icmp(plan.success, lhs, rhs), plan.fail)
+        }
+    };
+
+    // A guarded operand that is not an untagged small int makes the word compare
+    // inexact (a float, bignum, atom, …), so the whole instruction deopts to the
+    // helper rather than fabricating a result from the tagged words.
+    let guard = guarded.into_iter().flatten().fold(None, |acc, value| {
+        let is_small = small_int_guard(builder, value);
+        Some(match acc {
+            Some(previous) => builder.ins().band(previous, is_small),
+            None => is_small,
+        })
+    });
+    let compare = builder.create_block();
+    let slow = guard.map(|_| builder.create_block());
+    match (guard, slow) {
+        (Some(guard), Some(slow)) => {
+            builder.ins().brif(guard, compare, &[], slow, &[]);
+        }
+        _ => {
+            builder.ins().jump(compare, &[]);
+        }
+    }
+
+    // The test's outcome: success falls through to `pc + 1`, failure jumps to the
+    // `fail` label (natively, or through the driver for a cross-function target).
+    builder.switch_to_block(compare);
+    let success = builder.create_block();
+    let fail_block = builder.create_block();
+    builder
+        .ins()
+        .brif(condition, success, &[], fail_block, &[]);
+    builder.switch_to_block(success);
+    goto_or_leave(builder, cfg, code_len, func_index, pc + 1);
+    builder.switch_to_block(fail_block);
+    emit_target_branch(builder, cfg, code_len, func_index, fail);
+
+    // A rejected guard: one interpreter step, the test's exact semantics.
+    if let Some(slow) = slow {
+        builder.switch_to_block(slow);
+        emit_helper_dispatch(builder, cfg, pc, code_len, helper, rt, this_func);
+    }
+}
+
+/// The success condition of a word-level type test, as a single boolean value.
+fn type_condition(builder: &mut FunctionBuilder, word: Value, kind: &TypeTest) -> Value {
+    match kind {
+        TypeTest::Nil => builder.ins().icmp_imm(IntCC::Equal, word, NIL_WORD),
+        TypeTest::Atom => {
+            let tag = builder.ins().band_imm(word, ATOM_MASK);
+            builder.ins().icmp_imm(IntCC::Equal, tag, ATOM_TAG)
+        }
+        TypeTest::NonemptyList => {
+            let tag = builder.ins().band_imm(word, LIST_MASK);
+            builder.ins().icmp_imm(IntCC::Equal, tag, 0)
+        }
+        TypeTest::List => {
+            // `is_nil(v) || is_not_nil_list(v)`: `NIL` is an immediate, not a cons
+            // cell, so the two halves are disjoint and both are needed.
+            let tag = builder.ins().band_imm(word, LIST_MASK);
+            let is_list = builder.ins().icmp_imm(IntCC::Equal, tag, 0);
+            let is_nil = builder.ins().icmp_imm(IntCC::Equal, word, NIL_WORD);
+            builder.ins().bor(is_list, is_nil)
+        }
+        TypeTest::Boolean { truthy, falsy } => {
+            // The interpreter's `is_atom(v) && (is_true || is_false)`. The `is_atom`
+            // half is implied by `v == atom_word` (an atom word carries the atom
+            // tag) and an absent name contributes nothing, so the OR alone is exact —
+            // with neither name interned the whole condition is the interpreter's
+            // `false`.
+            let mut condition: Option<Value> = None;
+            for &atom in [truthy, falsy].into_iter().flatten() {
+                let equal = builder.ins().icmp_imm(IntCC::Equal, word, atom);
+                condition = Some(match condition {
+                    Some(previous) => builder.ins().bor(previous, equal),
+                    None => equal,
+                });
+            }
+            match condition {
+                Some(condition) => condition,
+                None => builder.ins().iconst(types::I8, 0),
+            }
+        }
+    }
+}
+
+/// Load one `test` operand word: an `machine.x` slot (recording it as natively
+/// addressed) or a constant-immediate's raw word.
+fn load_cmp_src(
+    builder: &mut FunctionBuilder,
+    x_regs: Value,
+    src: &CmpSrc,
+    report: &mut CodegenReport,
+) -> Value {
+    match src {
+        CmpSrc::Reg(x) => {
+            report.touch(*x);
+            builder
+                .ins()
+                .load(types::I64, MemFlags::trusted(), x_regs, x_offset(*x))
+        }
+        CmpSrc::Const(TestConst::Small(word) | TestConst::Immediate(word)) => {
+            builder.ins().iconst(types::I64, *word)
+        }
+    }
+}
+
+/// The guard's "is an untagged small int" test for one operand —
+/// `(word & 0xF) == 0xF`, the same test the arithmetic fast path uses.
+fn small_int_guard(builder: &mut FunctionBuilder, value: Value) -> Value {
+    let masked = builder.ins().band_imm(value, SMALL_MASK);
+    builder.ins().icmp_imm(IntCC::Equal, masked, SMALL_TAG)
 }
 
 #[cfg(test)]
