@@ -69,7 +69,9 @@ impl Runtime {
 
 ### `context.rs` — the concrete `ExecutionContext` (the glue)
 ```rust
-pub struct RuntimeContext<'a> { /* runtime: &'a mut Runtime, output: Option<&'a mut dyn OutputSink> */ }
+pub struct RuntimeContext<'a> { /* runtime: &'a mut Runtime, output: Option<SharedSink<'a>> */ }
+// pub(crate) SharedSink<'a>: a cloneable, `Rc<RefCell<..>>`-shared output handle (stdout when None),
+// covariant in `'a` so a nested context can reuse the caller's sink.
 
 impl<'a> RuntimeContext<'a> {
     pub fn new(runtime: &'a mut Runtime) -> Self;
