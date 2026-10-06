@@ -206,11 +206,13 @@ duplicate ids → first wins; chunk order is not significant. Chunk ids: `AtU8` 
 - **`Type`** — `u32 version` (`4` current, `3` OTP 27/28; else fallback), `i32 count` (≥1,
   `entries[0]` = "any"), then per entry `u16 type_word` (+ optional `i64 lower`, `i64 upper`, `u8 unit-1`
   gated by `type_word` bits 13-15). Absent/incompatible ⇒ a single "any" fallback entry.
-- **`LitT`** — `u32 uncompressed_size` (`0` ⇒ payload stored verbatim; non-zero ⇒ zlib/deflate), then
-  `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes). `src/chunk/literal.rs`
+- **`LitT`** — `u32 uncompressed_size` (`0` ⇒ the records follow verbatim; non-zero ⇒ the rest of the
+  chunk is a zlib (RFC 1950) stream that inflates to exactly `uncompressed_size` bytes, which ARE the
+  records), then `i32 count` × `{ i32 ext_size, ext_size bytes }` (Erlang external-term bytes).
+  `src/chunk/literal.rs` handles **both** forms — the compressed form via the public
+  `beam_codec::compress::decompress`, rejecting a length that disagrees with `uncompressed_size` — and
   parses the **framing** only (raw ETF payloads); `src/literal::LiteralArea` then decodes each payload
-  into a term once at load time. The **compressed (`uncompressed_size != 0`) form is unsupported**
-  (no zlib dep) and returns a clear `BadArg`. Static literals are referenced by `Operand::Literal(idx)`.
+  into a term once at load time. Static literals are referenced by `Operand::Literal(idx)`.
 - **`StrT` / `CInf` / `Attr` / `Meta` / `DbgB` / `Recs`** — data-only; captured raw (`StrT` → bytes,
   `Attr`/`CInf` → `Option<Vec<u8>>`). No parsing.
 ### Operand tags (`src/operand.rs` + `src/decode.rs`) — the authoritative table
