@@ -222,7 +222,7 @@ allocates from `beam_alloc::Heap`, validates its type/bounds preconditions (mapp
 `beam_term::thing` directly; this module keeps the codec-internal convenience seam and the guard
 constants only.
 
-## Tag coverage (M1)
+## Tag coverage (current)
 **Encode + decode + byte-exact round-trip** (the full producible set):
 `97, 98, 110, 111` (integers; a big that fits a 60-bit small decodes to a small, as in C),
 `99 FLOAT_EXT` / `70 NEW_FLOAT_EXT` (decode both; **encode emits `70`**, matching `term_to_binary`),
