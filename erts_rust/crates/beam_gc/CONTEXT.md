@@ -137,6 +137,29 @@ Re-exported at the crate root and via `beam_gc::prelude::*`.
   escalates to a major, which allocates a fresh space sized from `size_after_fullsweep` *before*
   copying (the C's `heap_sizes`/`next_heap_size` estimate). A collection therefore never leaves the
   from-space half-forwarded.
+- **`GenImmixCollector` = the same copying nursery + a mark-region mature space; its major reclaims the
+  mature generation *first*.** Selected by `MatureKind::Immix` (`AnyCollector::from_config`). A **minor**
+  promotes the nursery's live terms into the `ImmixSpace` via the shared `copy.rs` forwarding protocol
+  over a private `PromoteDest` (`EvacDest` classifying against the nursery's `FromSet`, reserving from
+  `ImmixSpace::alloc_words`) — the barrier-free invariant holds because promotion only ever moves young
+  objects *into* mature. A **major** is the prescribed `ImmixSpace::collect`-then-promote order, made
+  sound for the young→mature edge (which the copying space also has, but which an in-place reclaim cannot
+  ignore): both collections first run a read-only `scan_young` that reports the promotion's exact **line**
+  count (`needed`) and every nursery reference word pointing into mature (`(slot, term)` pairs). The major
+  passes those terms as `promoted` roots to `ImmixSpace::collect` (so a mature object reachable only
+  through the live nursery survives), then rewrites each recorded nursery slot to the object's final
+  address (the aligned `promoted` entry `collect` updated), and only then promotes — by which point the
+  nursery's mature references are `Foreign` and final, so no stale pointer can be produced. If, after the
+  reclaim, `free_lines() < needed`, it returns `heap_exhausted` (no panic, no half-forwarded heap). Custom
+  `words_reclaimed = mature reclaim + nursery garbage`. Why reclaim-first rather than promote-first: it is
+  what lets a would-not-fit minor escalate to a major that *makes room*; promote-first would need the same
+  room the escalation is meant to create.
+- **`GenImmixCollector` ignores the `MatureKind` in `with_config`.** The type *is* the Immix-backed
+  collector, so `with_config` always builds one over `cfg.policy()`; `AnyCollector::from_config` is the
+  dispatcher that honours the configured strategy. `Collector` and every existing public signature are
+  unchanged — the new collectors are pure additions.
+- **`AnyCollector` only forwards.** The strategy-dispatch seam carries no collection logic, so neither
+  strategy depends on the other; a test drives one corpus through either behind `collect`/`young`/`stats`.
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
