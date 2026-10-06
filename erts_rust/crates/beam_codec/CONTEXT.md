@@ -491,13 +491,12 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   oversized-flatmap writer in `beam_term::thing` would let it forward too. Pair order is preserved
   as-is on the wire; duplicate keys are **not** detected (that needs term comparison) and the wire
   order is kept exactly.
-- **Records (`67`) remain `unsupported` — blocked on a term-layer record layout.** The C decoder builds
-  a native record term (`external.c:5257-5381`) from `ErtsRecordInstance`/`ErtsRecordDefinition`
-  (`../../erts/emulator/beam/erl_record.h:43-95`, incl. `RECORD_INST_SIZE`/`RECORD_DEF_SIZE`); the
-  codec must not invent that interior, so implementing `67` requires a record-instance/definition
-  layout exposed by **`beam_term`** (the term-layout owner — `../beam_term/CONTEXT.md`). Ordinary
-  Erlang records encode as tuples and are unaffected. The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`)
-  tags are rejected as `BadArg`.
+- **The decoded record's cached definition `hash` is `make_small(0)`, not C's `make_hash2`.** C stores
+  `make_hash2({module,name,is_exported,keys_declaration_order})` in definition word 2; `beam_term`
+  cannot reproduce `make_hash2` (its `hashing` is deliberately not bit-exact), so both
+  `crate::term::make_record` and the `RECORD_EXT` decoder pass `make_small(0)` unless a caller supplies
+  a value. The hash is **not on the wire**, so this is not wire-observable (round-trips are byte-exact).
+  The obsolete `FUN` (`117`) and `NEW_CACHE` (`78`) tags are rejected as `BadArg`.
 - **`LOCAL_EXT` (`121`) decode does not verify the node hash.** The C verifies it only in the
   `decoded_size` sizing pass (`external.c:6437-6512`) against a Bob-Jenkins hash seeded with the node's
   `local_node_hash` (hostname/pid/time derived) — node identity, `beam_rt`/`beam_dist`'s. The codec
