@@ -514,7 +514,10 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
 - `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
-- `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
+- `src/hashing/mod.rs` → module root: docs + the internal structural hash `term_hash` (+ tests); re-exports the public ERTS-hash API
+- `src/hashing/common.rs` → primitives shared by the two ERTS hash ports (`HCONST*`/`FN*`, `mix32`/`mix3`, `uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`, work-stack item types; `pub(super)`)
+- `src/hashing/make_hash2.rs` → the **bit-exact** ERTS `make_hash2` (`erlang:phash2/1,2`) + `compute_record_definition_hash` (fetch this value for a native record's `hash` word)
+- `src/hashing/make_hash.rs` → the **bit-exact** ERTS `make_hash` (`erlang:phash/2`) + `hash_binary_bytes`
 - `src/ihash.rs` → the **bit-exact** `erts_map_hash` / `make_internal_hash` port (`erl_term_hashing.c`): `erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers `swizzle_map_hash` (nibble reversal) and `hashmap_nibble` (level-`L` LSB nibble)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
