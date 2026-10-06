@@ -75,6 +75,10 @@ impl<'a> RuntimeContext<'a> {
     pub fn new(runtime: &'a mut Runtime) -> Self;
     pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> Self;
     pub fn heap_available(&self) -> usize;
+    /// The runtime's long-lived `-eval` heap (a non-byte-aligned bitstring is written
+    /// here by `beam_codec::term::make_bitstring`; never reset in M1, so the term is
+    /// valid for the runtime's lifetime).
+    pub(crate) fn eval_heap(&mut self) -> &mut beam_alloc::Heap;
     pub(crate) fn run_export(&mut self, module: &str, function: &str, arity: u32, args: &[Eterm]) -> Result<Eterm>;
 }
 impl ExecutionContext for RuntimeContext<'_> {
@@ -166,10 +170,14 @@ pub fn term_to_string(registry: &BifRegistry, heap: &mut Heap, atoms: &AtomTable
 
 * `-eval` grammar: the Erlang **expression** subset (`src/eval/{parse,ast,mod}.rs`) — literals in every
   base, lists/tuples/maps/binaries, the full operator set with Erlang precedence,
-  `case`/`if`/`begin`/`try`/`catch`/`receive`, `fun`s and comprehensions — evaluated by an
-  `erl_eval`-style tree-walk that dispatches arithmetic/comparison to the **`beam_bifs` `erlang`
-  registry** (semantics are never re-implemented). An expression outside the grammar is a **capability
-  gap** (see exit code 3 below), not a genuine error.
+  `case`/`if`/`begin`/`try`/`catch`/`receive`, `fun`s, and list/map/**binary** comprehensions
+  (including a **binary generator**, `<<Seg || <<X>> <= Bin>>`) — evaluated by an `erl_eval`-style
+  tree-walk that dispatches arithmetic/comparison to the **`beam_bifs` `erlang` registry** (semantics
+  are never re-implemented). Binary segments accumulate a bit buffer, so construction need not be
+  byte-aligned (`<<1:1>>`, `<<A:1,B:7>>`, `<<255:12/little>>`); a byte-aligned result is a **binary**,
+  a non-byte-aligned one a **bitstring** materialized by `beam_codec::term::make_bitstring` on the
+  runtime's long-lived `eval_heap` (`RuntimeContext::eval_heap`). An expression outside the grammar is
+  a **capability gap** (see exit code 3 below), not a genuine error.
 * **Every command-line flag is an init argument.** Each recognized switch *and* each unrecognized
   `-flag`/`+flag` (name = the flag with the leading `-`/`+` run removed; values = the following tokens
   that do not start with `-`/`+`) is recorded as an [`InitArgs`] occurrence — the source of
@@ -323,7 +331,13 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   `{nif_not_loaded,m,f,0}` printed verbatim),
   the native floor (`erlang:halt/0,1` records `Runtime::halt`, `init:get_argument` occurrences/absent),
   `error::unsupported_reason` (`Some` for `bad_eval`/`unsupported_opcode`/`unsupported_bif`, `None` for
-  `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`.
+  `missing_value`/`unexpected_argument`/`BadArg`/`SystemLimit`) and `error::halt_status`. The binary
+  surface is pinned separately: a **binary comprehension**
+  (`<< <<(X+1)>> || <<X>> <= <<1,2,3>> >>` → `<<2,3,4>>`), a binary generator driving a list
+  comprehension and a **sized pattern** (`[X || <<X:16>> <= <<0,1,0,2>>]` → `[1,2]`), and
+  **non-byte-aligned construction** asserted through `beam_codec::term::bitstring_bytes` (no printer
+  involved) — `<<1:1>>`, `<<255:12>>`, `<<255:12/little>>`, `<<A:1,B:7>>` and a sized `bits` head
+  before a `binary` tail.
 * **`tests/slice.rs` — the end-to-end library slice (the key evidence).** Loads the committed oracle
   fixture `../beam_loader/tests/fixtures/slice.beam` (reused by relative path via
   `concat!(env!("CARGO_MANIFEST_DIR"), …)` — a single source of truth, never copied) and asserts
@@ -343,8 +357,9 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   builds (`-noshell [extra…] -eval <probe>`), and asserts the **exact** stdout + exit status of each.
   This pins the corpus goldens without needing the oracle `erl` at run time, so a regression in the
   parser/evaluator/printer/exit-code path is caught even where `erl` is absent. Adds a control-flow
-  extras test (`case`/comprehension/`fun`/`element`/`abs`, goldens verified against system `erl`) and
-  an unsupported-classification check.
+  extras test (`case`/comprehension/`fun`/`element`/`abs`, goldens verified against system `erl`), a
+  probe for the two `semantics/*` **binary-segment** corpus cases (`semantics/binary_comprehension`,
+  `semantics/bit_size_of_bitstring`) and an unsupported-classification check.
 * **`tests/multimodule.rs` — the multi-module host.** Compiles a fixture with the system `erlc` into a
   scratch dir and runs it through `Runtime::run_function`: `lists:reverse/1` → `[3,2,1]`,
   `maps:get/2` on a map literal → `7`, and the on-demand stdlib module `ordsets`. It **skips loudly**
@@ -360,10 +375,12 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   positional atom indices for preloaded code are not reproduced. The erts app's `ebin` **is** on the
   code path (`CodeServer::resolve_system_ebins`), so a preloaded module (`init`, `persistent_term`, …)
   *can* be loaded from disk on demand; boot order and the registry are in place.
-* **`-eval` grammar gaps left as honest *unsupported*** (exit 3, never a wrong result):
-  entering a non-byte-aligned binary segment literal (e.g. `<<1:1>>`), and a binary comprehension
-  (`<< Seg || <<X>> <= Bin >>` — the parser raises on the generator). Both are classified by
-  `unsupported_reason`, not reported as exceptions.
+* **`-eval` results that are not byte-aligned cannot be *printed*.** Construction and `bit_size/1` are
+  supported for a non-byte-aligned bitstring (`<<1:1>>`, `<<255:12/little>>`), but the registered
+  `beam_bifs` `io:format` `~w`/`~p` printer rejects one with `badarg` — a **`beam_bifs` printer gap
+  outside this crate** (the corpus probes read such a value through `bit_size/1`, so they are
+  unaffected). The honest segment limits remain: a construction segment **or** a pattern segment wider
+  than 64 bits is *unsupported*, and a value that needs a bignum is `system_limit`.
 * **Single process.** `system_info(process_count)` reflects the single M1 process table entry; there is
   no scheduler loop driving spawned processes yet (`beam_process` owns it).
 * **`-eval`/`-s`/`-run` are documented subsets** (`-s` uses atoms + discards the result, `-run` uses
@@ -391,17 +408,17 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `src/codeserver.rs` → `CodeServer`: the **one** shared atom table (held as an `Rc<AtomTable>`, copy-on-write on intern — see Design Decisions) + module cache + code path + `load`/`load_path`/`load_bytes`/`add_system_paths`/`find_file`/`loaded_path`/`lib_root`/`app_dir`/`atoms_handle` (the load-on-demand host); `resolve_system_ebins` puts the stdlib, kernel **and erts** `ebin` dirs on the path (the erts app is where the preloaded modules' `.beam`s — `init`, `persistent_term`, … — live), all resolved at run time (never baked in)
 * `src/boot.rs` → `PreloadedModules` skeleton (A.7) + the core-atom seed (also interns `info::INFO_ATOMS`) + the boot banner
 * `src/info.rs` → `SUPPORTED_KEYS`, `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `InfoValue::to_eterm`
-* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through
+* `src/context.rs` → `RuntimeContext`: the concrete `ExecutionContext` glue (native floor → `beam_bifs` registry → load-on-demand export dispatch; `apply_fun` routes an `-eval` fun (`EVAL_FUN_UNIQ`) to `eval::apply_eval_closure`; heap check); `eval_heap` exposes the runtime's long-lived `-eval` heap a non-byte-aligned bitstring is materialized on; `PendingInterner` interns a BIF-built new atom into the one shared table (predicted index, committed after the call); `FunBridge` — the concrete `beam_bifs::FunCaller` the `fun`-taking `lists:*`/`maps:*` BIFs call back through
 * `src/native.rs` → the runtime-native floor (`erlang:halt/0,1`, `erlang:display/1`, `io:put_chars/1,2`, `erlang:apply/2,3`, `erlang:system_info/1`, `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`, `os:cmd/1`, `code:get_path/0`/`all_loaded/0`/`which/1`/`lib_dir/0,1` — always consulted before the registry)
-* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
+* `src/eval/mod.rs` → the `-eval` evaluator: an `erl_eval`-style tree-walk over the AST with its own `Flow` control signal (live raise reasons; `halt` **and** a capability gap are uncatchable), dispatching calls through `RuntimeContext`; binary-comprehension evaluation (`Qual::BinaryGenerator`) and the bit-buffer construction (`BitBuf`/`materialize_bits`, byte-aligned → binary, else a bitstring on `eval_heap`); `apply_eval_closure` runs a stored closure when a loaded module applies an `-eval` fun
 * `src/eval/ast.rs` → the `-eval` AST (`Expr`/`Clause`/`Try`/`Seg`/`Qual`/`MapField`/`BinOp`/`UnOp`)
-* `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; malformed input → `error::bad_eval`, exit 3)
+* `src/eval/parse.rs` → the `-eval` lexer + recursive-descent/Pratt parser (Erlang precedence; the `<=` binary-generator qualifier; a segment's `:Size` parsed in segment context so a following `/Type` is a specifier, not a division; malformed input → `error::bad_eval`, exit 3)
 * `src/format.rs` → `term_to_string`/`term_to_string_w` — drives the registered `io:format/2` `~p`/`~w` printer
-* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`, and `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`)
+* `src/runtime.rs` → `Runtime`: boot-wiring, code server, module cache, `run_function`/`run_module`/`run_named` (the slice), `materialize_args`, `system_info`, `eval`, `format_term`, `eval_closures` (the `-eval` fun store shared with `RuntimeContext::apply_fun`) and `eval_heap` (the long-lived heap a non-byte-aligned `-eval` bitstring is built on — see `RuntimeContext::eval_heap`)
 * `src/main.rs` → the thin executable shim over `cli::run`
 * `tests/slice.rs` → the end-to-end library vertical slice over the real `.beam` fixture
 * `tests/cli.rs` → the executable end-to-end (spawns `CARGO_BIN_EXE_beam_rt`)
-* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus control-flow extras and the unsupported-classification check
+* `tests/eval.rs` → the `-eval` end-to-end: all 17 differential `Eval` probes pinned to exact stdout + exit, plus the two `semantics/*` binary-segment probes, control-flow extras and the unsupported-classification check
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`, calls `lists:reverse/1` + `maps:get/2` + `io:format/2` + the on-demand stdlib `ordsets`; skips loudly without a system stdlib)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
@@ -409,16 +426,12 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
 * `../../erts/emulator/beam/erl_bif_info.c`, `../../erts/etc/common/erlexec.c`, `../../erts/emulator/sys/unix/sys.c`, `../../erts/emulator/beam/erl_init.c` → A.6/A.7/A.8 ground truth (read-only)
 
 ## Handoffs (the remaining non-agreeing cases are owned by OTHER nodes)
-`differential suite` is at **194 agree / 1 mismatch / 2 unsupported** (of 197). No non-agreeing case
-has its root cause in this node; recorded so the next pass routes directly:
+`differential suite` is at **196 agree / 1 mismatch / 0 unsupported** (of 197). The single remaining
+mismatch has its root cause in another node; recorded so the next pass routes directly:
 * `driver/port_backed_by_spawn_driver` (A.4) — `erlang:open_port/2` (`{spawn,"true"}`) is not a BIF, so
   the Rust side exits 1 `exception error 'erlang:open_port/2 is not a BIF'` where the oracle prints
   `ok true`. Ports are **`beam_bifs`**/**`beam_io`** territory (`beam_io` owns `Port` + built-in
   drivers).
-* `semantics/binary_comprehension` and `semantics/bit_size_of_bitstring` (A.1) — **by design** in this
-  node: the `-eval` grammar has no binary comprehension and cannot enter a non-byte-aligned binary
-  segment literal, so each is an honest exit-3 `beam_rt: unsupported: …` (see Known Issues), never a
-  wrong result.
 * **`beam_engine` — name the rejected opcode.** Kernel `code.beam`'s `code_server:call/1` executes `recv_marker_reserve/1` (also `recv_marker_bind`, `send`, `loop_rec`, `remove_message`), which no family claims; it falls to the generic `Err(error::unsupported("widened opcode not yet executed"))` at `beam_engine/src/families/mod.rs:93`, which does **not** name the instruction (`Instr::Generic` already does at `interpreter.rs:366`). The three `boot/*` cases that used to surface this now agree via the native `code:*` floor, so this is a diagnostic-quality ask, not a gate blocker.
 
 ## See Also

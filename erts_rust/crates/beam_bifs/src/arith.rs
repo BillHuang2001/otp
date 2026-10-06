@@ -1,13 +1,15 @@
-//! Arithmetic BIFs for `erlang`: `+`, `-`, `*`, `/`, `div`, `rem`, `abs` and the
-//! unary `-`/`+`.
+//! Arithmetic BIFs for `erlang`: `+`, `-`, `*`, `/`, `div`, `rem`, `abs`, the
+//! unary `-`/`+` and the integer bit operators `band`, `bor`, `bxor`, `bnot`,
+//! `bsl`, `bsr`.
 //!
 //! Ground truth (read-only): `../../erts/emulator/beam/erl_bif_op.c` (the operator
-//! BIFs and their guard variants), `erl_arith.c` (`erts_arith_*`) and `big.c`
-//! (`big_plus`/`big_minus`/`big_times`/`big_div`/`big_rem`/`big_to_double`), plus
+//! BIFs and their guard variants), `erl_arith.c` (`erts_arith_*`, `ers_shift`) and
+//! `big.c` (`big_plus`/`big_minus`/`big_times`/`big_div`/`big_rem`/`big_to_double`,
+//! `I_band`/`I_bor`/`I_bxor`/`I_bnot`/`I_lshift`), plus
 //! the `ubif erlang:'+'/2` … roster in `../../erts/emulator/beam/bif.tab`
 //! (lines 295–316: `'>' '>=' '<' '=<' '=:=' '==' '=/' '/=' '+' '-' '*' '/' 'div'
-//! 'rem' '-' '/'`). The names are registered *quoted*, exactly as `bif.tab`
-//! spells them.
+//! 'rem' '-' '/'` and, lines 309–314, `'bor' 'band' 'bxor' 'bsl' 'bsr' 'bnot'`).
+//! The names are registered *quoted*, exactly as `bif.tab` spells them.
 //!
 //! # The numeric tower: exact integers
 //!
@@ -43,9 +45,28 @@
 //! * `/`: *always* a float (`2/1` ⇒ `2.0`); both operands convert to `f64` and a
 //!   zero divisor is `badarith`.
 //!
+//! # The integer bit operators
+//!
+//! `band`/`bor`/`bxor`/`bnot` are **integer-only** (`1 band 1.0` ⇒ `badarith`) and
+//! arbitrary-precision in two's complement. Each [`Big`] operand is widened to a
+//! fixed-width two's-complement limb vector one limb wider than the wider
+//! magnitude (a negative value is `2^(64w) - mag` over those limbs), the limb
+//! operation runs, and the sign decided by the operation's own rule
+//! (`a.neg && b.neg` for `band`, `||` for `bor`, `^` for `bxor`, `!a.neg` for
+//! `bnot`) picks the conversion back — the same identities the C `I_band`/`I_bor`/
+//! `I_bxor`/`I_bnot` rely on (`big.c`). `band(255,15)` ⇒ `15`, `band(-2,3)` ⇒ `2`,
+//! `bor(-2,3)` ⇒ `-1`, `bxor(-2,3)` ⇒ `-3`, `bnot(5)` ⇒ `-6`, `bnot(-1)` ⇒ `0`.
+//!
+//! `bsl`/`bsr` follow `erts_shift` (`erl_arith.c:189-309`): a negative shift count
+//! flips the direction (`8 bsl -2` ⇒ `2`, `1 bsr -2` ⇒ `4`); `bsr` is an
+//! arithmetic, sign-extending (floor) right shift (`(-3) bsr 1` ⇒ `-2`,
+//! `(-255) bsr 100` ⇒ `-1`) while `bsl` preserves sign (`(-1) bsl 4` ⇒ `-16`) and
+//! may promote to a bignum (`1 bsl 70` ⇒ `1180591620717411303424`).
+//!
 //! Term *ordering* — including bignums — is [`beam_term::compare`]'s, used by
 //! [`crate::compare`]; this module only needs the magnitude comparison
-//! ([`cmp_mag`]) that its sign handling composes.
+//! ([`cmp_mag`]) that its sign handling composes, plus the two's-complement
+//! identities the sign of a bit operation is read from.
 //!
 //! # Documented limits
 //!
@@ -53,6 +74,14 @@
 //! [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) (reported by
 //! [`beam_codec::term::make_big`]) and a full destination heap is the allocator's
 //! error; neither is reachable from 60-bit operands.
+//!
+//! A **left** shift that would need more than `BIG_ARITY_MAX` limbs
+//! ([`BIG_MAX_BITS`] bits) is `system_limit` *before* anything is allocated
+//! (`1 bsl (1 bsl 70)` and `1 bsl 4194240` in the oracle; `1 bsl 4194239` and
+//! `(1 bsl 63) bsl 4194176` still succeed), and a shift count that does not fit a
+//! `usize` is either that same `system_limit` (left) or the C's `0`/`-1` (right) —
+//! `1 bsr (1 bsl 70)` ⇒ `0`, `(-1) bsr (1 bsl 70)` ⇒ `-1`. `0 bsl <any>` is `0`,
+//! never a limit error.
 
 use core::cmp::Ordering;
 
@@ -61,9 +90,19 @@ use beam_term::{signed_value, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::access;
 use crate::context::BifContext;
-use crate::error::badarith;
+use crate::error::{badarith, system_limit};
 use crate::registry::BifRegistry;
 
+/// `BIG_ARITY_MAX` (`erl_term.h:465-469`, 64-bit `ARCH_64`): the largest bignum
+/// digit count, i.e. the most `u64` limbs a materialized bignum may have.
+/// [`beam_codec`] carries its own copy of the same constant (it owns
+/// [`beam_codec::term::make_big`]); the shift bound needs it here so an oversized
+/// left shift is rejected *before* the limb vector is allocated.
+const BIG_ARITY_MAX: usize = (1 << 16) - 1;
+
+/// The largest bit length a bignum result may have (`BIG_ARITY_MAX` limbs) — the
+/// `system_limit` bound of `big_norm` (`big.c:3360`, `arity > BIG_ARITY_MAX`).
+const BIG_MAX_BITS: usize = BIG_ARITY_MAX * 64;
 /// A numeric operand, in one of the numeric tower's three classes.
 enum Num {
     /// An exact integer (a small integer or a bignum), widened to [`Big`].
@@ -208,6 +247,86 @@ fn identity(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
 }
 
+/// `A band B` — bitwise and of two integers, in two's complement
+/// (`band(255,15)` ⇒ `15`, `band(-2,3)` ⇒ `2`).
+fn band(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    int_term(ctx, &integer(args[0])?.band(&integer(args[1])?))
+}
+
+/// `A bor B` — bitwise or of two integers (`bor(-2,3)` ⇒ `-1`).
+fn bor(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    int_term(ctx, &integer(args[0])?.bor(&integer(args[1])?))
+}
+
+/// `A bxor B` — bitwise exclusive or of two integers (`bxor(-2,3)` ⇒ `-3`).
+fn bxor(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    int_term(ctx, &integer(args[0])?.bxor(&integer(args[1])?))
+}
+
+/// `bnot A` — bitwise complement of an integer, `-A - 1` (`bnot(5)` ⇒ `-6`,
+/// `bnot(-1)` ⇒ `0`).
+fn bnot(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    int_term(ctx, &integer(args[0])?.bit_not())
+}
+
+/// `A bsl B` — `A` shifted left by `B` bits; a negative `B` shifts right.
+fn bsl(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    shift(ctx, &integer(args[0])?, &integer(args[1])?, true)
+}
+
+/// `A bsr B` — `A` shifted right by `B` bits, sign-extending (floor division);
+/// a negative `B` shifts left.
+fn bsr(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    shift(ctx, &integer(args[0])?, &integer(args[1])?, false)
+}
+
+/// The `bsl`/`bsr` computation: `a` shifted by `b`, where `left` is the operator
+/// (`true` for `bsl`) — the C `erts_shift` (`erl_arith.c:189-309`).
+///
+/// A negative `b` flips the direction. A shift amount too large for a `usize` is
+/// the C's own short-circuit: a left shift of a non-zero operand is `system_limit`
+/// (`N bsl PositiveBigNum`), while a right shift discards every bit and yields `0`
+/// or `-1`. A zero left operand is returned unchanged (`0 bsl <huge>` ⇒ `0`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArith`](beam_common::BeamError::BadArith) is raised by the
+/// callers for a non-integer operand; a left shift needing more than
+/// [`BIG_MAX_BITS`] bits is
+/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit).
+fn shift(ctx: &mut BifContext<'_>, a: &Big, b: &Big, left: bool) -> Result<Eterm> {
+    let (b_negative, magnitude) = shift_amount(b);
+    // `A bsl -N == A bsr N` and `A bsr -N == A bsl N`.
+    let shift_left = left != b_negative;
+    if a.is_zero() {
+        // `0 bsl <any>` is `0`, however large the shift (`erts_shift` checks the
+        // zero operand before the size estimate).
+        return ctx.int(0);
+    }
+    match (shift_left, magnitude) {
+        // A left shift that does not even fit the shift amount cannot be
+        // represented (`erts_shift`'s `N bsl PositiveBigNum` arm).
+        (true, None) => Err(system_limit()),
+        // A right shift by an unrepresentably large amount keeps only the sign:
+        // `0` for a non-negative operand, `-1` for a negative one.
+        (false, None) => ctx.int(if a.negative { -1 } else { 0 }),
+        (true, Some(bits)) => int_term(ctx, &a.shl(bits)?),
+        (false, Some(bits)) => int_term(ctx, &a.shr(bits)),
+    }
+}
+
+/// The shift amount of `A bsl B`/`A bsr B`: `B`'s sign and magnitude, where a
+/// magnitude of `None` means "larger than any `usize`" (treated as infinite by
+/// [`shift`], which is exactly what the C's `MIN_SMALL`/`MAX_SMALL` collapse
+/// amounts to).
+fn shift_amount(b: &Big) -> (bool, Option<usize>) {
+    let magnitude = match b.mag.as_slice() {
+        [] => Some(0),
+        [limb] => usize::try_from(*limb).ok(),
+        _ => None,
+    };
+    (b.negative, magnitude)
+}
 /// Registers the `erlang` arithmetic BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "+", 2, add);
@@ -219,6 +338,12 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "abs", 1, abs);
     reg.register("erlang", "-", 1, negate);
     reg.register("erlang", "+", 1, identity);
+    reg.register("erlang", "band", 2, band);
+    reg.register("erlang", "bor", 2, bor);
+    reg.register("erlang", "bxor", 2, bxor);
+    reg.register("erlang", "bnot", 1, bnot);
+    reg.register("erlang", "bsl", 2, bsl);
+    reg.register("erlang", "bsr", 2, bsr);
 }
 
 // ---------------------------------------------------------------------------
@@ -353,6 +478,128 @@ impl Big {
         Big::new(false, self.mag.clone())
     }
 
+    /// The bitwise `and` of two integers, in two's complement (`band`).
+    ///
+    /// The result is negative exactly when both operands are (the infinite-precision
+    /// sign of the limb operation), which is what [`Big::from_twos`] needs to build
+    /// the magnitude back.
+    fn band(&self, other: &Big) -> Big {
+        bitwise(self, other, |a, b| a & b, self.negative && other.negative)
+    }
+
+    /// The bitwise `or` of two integers (`bor`); negative when either operand is.
+    fn bor(&self, other: &Big) -> Big {
+        bitwise(self, other, |a, b| a | b, self.negative || other.negative)
+    }
+
+    /// The bitwise `xor` of two integers (`bxor`); negative when exactly one
+    /// operand is.
+    fn bxor(&self, other: &Big) -> Big {
+        bitwise(self, other, |a, b| a ^ b, self.negative != other.negative)
+    }
+
+    /// The bitwise complement of an integer, `-self - 1` (`bnot`).
+    fn bit_not(&self) -> Big {
+        let width = self.mag.len() + 1;
+        let limbs: Vec<u64> = self.to_twos(width).iter().map(|limb| !limb).collect();
+        Big::from_twos(&limbs, !self.negative)
+    }
+
+    /// The two's-complement limbs of `self`, sign-extended to `width` limbs.
+    ///
+    /// A non-negative value fills above its magnitude with `0`; a negative one is
+    /// `2^(64*width) - mag`, i.e. the complement of the zero-extended magnitude
+    /// plus one (the carry out of the top limb is discarded — `width` is at least
+    /// one limb above the magnitude, so the sign extension is already correct).
+    fn to_twos(&self, width: usize) -> Vec<u64> {
+        debug_assert!(width > self.mag.len(), "`to_twos` widens by one limb");
+        let mut limbs = vec![0u64; width];
+        limbs[..self.mag.len()].copy_from_slice(&self.mag);
+        if self.negative {
+            negate_twos(&mut limbs);
+        }
+        limbs
+    }
+
+    /// The integer whose two's-complement limbs are `limbs`, with sign `negative`.
+    ///
+    /// The inverse of [`Big::to_twos`]: the magnitude of a negative value is the
+    /// negation of its two's-complement limbs. A caller that computes the sign by
+    /// the operation's own rule must therefore pass the sign the limb operation
+    /// produces, not the sign of either operand alone.
+    fn from_twos(limbs: &[u64], negative: bool) -> Big {
+        if !negative {
+            return Big::new(false, limbs.to_vec());
+        }
+        let mut mag = limbs.to_vec();
+        negate_twos(&mut mag);
+        Big::new(true, mag)
+    }
+
+    /// `self << bits`, sign-preserving (`bsl`).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when the
+    /// result would need more than [`BIG_MAX_BITS`] bits (more than
+    /// [`BIG_ARITY_MAX`] limbs) — the C `big_norm` arity bound, checked here before
+    /// the limb vector is allocated.
+    fn shl(&self, bits: usize) -> Result<Big> {
+        if bits == 0 || self.is_zero() {
+            return Ok(self.clone());
+        }
+        match bit_len(&self.mag).checked_add(bits) {
+            Some(total) if total <= BIG_MAX_BITS => {}
+            _ => return Err(system_limit()),
+        }
+        let limb_shift = bits / 64;
+        let bit_shift = bits % 64;
+        // One limb more than the shifted magnitude needs: the top input limb's carry
+        // goes there (it is zero when the top bits fit, and `Big::new` trims it).
+        let mut mag = vec![0u64; self.mag.len() + limb_shift + 1];
+        for (i, &limb) in self.mag.iter().enumerate() {
+            // `limb << bit_shift` needs 127 bits at most, so the `u128` carries the
+            // bits that belong to the next limb.
+            let shifted = u128::from(limb) << bit_shift;
+            mag[i + limb_shift] |= shifted as u64;
+            mag[i + limb_shift + 1] |= (shifted >> 64) as u64;
+        }
+        Ok(Big::new(self.negative, mag))
+    }
+
+    /// `self >> bits`, arithmetic (sign-extending, floor) — the C `I_lshift` right
+    /// shift (`big.c:2162-2218`), which rounds a negative value toward negative
+    /// infinity by rounding the magnitude up whenever a bit is shifted out.
+    fn shr(&self, bits: usize) -> Big {
+        if bits == 0 || self.is_zero() {
+            return self.clone();
+        }
+        let limb_shift = bits / 64;
+        let bit_shift = bits % 64;
+        if limb_shift >= self.mag.len() {
+            // Every magnitude bit is shifted out: `0`, or `-1` (`-1 bsr N == -1`).
+            return if self.negative {
+                Big::from_i64(-1)
+            } else {
+                Big::zero()
+            };
+        }
+        let mut mag = Vec::with_capacity(self.mag.len() - limb_shift);
+        for (i, &limb) in self.mag[limb_shift..].iter().enumerate() {
+            let mut out = limb >> bit_shift;
+            if bit_shift != 0 {
+                if let Some(&above) = self.mag.get(limb_shift + i + 1) {
+                    out |= above << (64 - bit_shift);
+                }
+            }
+            mag.push(out);
+        }
+        if self.negative && any_bits_below(&self.mag, bits) {
+            mag = add_mag(&mag, &[1]);
+        }
+        Big::new(self.negative, mag)
+    }
+
     /// The `f64` nearest to `self`, ties to even — the C `big_to_double`.
     ///
     /// # Errors
@@ -373,6 +620,44 @@ fn trim(mag: &mut Vec<u64>) {
     }
 }
 
+/// The number of significant bits in a canonical (trimmed) little-endian
+/// magnitude: `0` for zero, the top limb's position plus its bit width otherwise.
+fn bit_len(mag: &[u64]) -> usize {
+    match mag.last() {
+        None => 0,
+        Some(&top) => (mag.len() - 1) * 64 + (64 - top.leading_zeros() as usize),
+    }
+}
+
+/// The two's-complement negation of a fixed-width limb vector, in place
+/// (`!limbs + 1`); the carry out of the top limb is discarded.
+fn negate_twos(limbs: &mut [u64]) {
+    for limb in limbs.iter_mut() {
+        *limb = !*limb;
+    }
+    let mut carry = 1u128;
+    for limb in limbs.iter_mut() {
+        let total = u128::from(*limb) + carry;
+        *limb = total as u64;
+        carry = total >> 64;
+        if carry == 0 {
+            break;
+        }
+    }
+}
+
+/// The bitwise `op` of two integers in two's complement, with `sign` the result's
+/// sign (the operation's own sign rule — see [`Big::band`]).
+///
+/// Both operands are widened to one limb more than the wider magnitude, so the top
+/// limb is pure sign extension (`0` or all ones) and the limb `op` is exact.
+fn bitwise(a: &Big, b: &Big, op: impl Fn(u64, u64) -> u64, sign: bool) -> Big {
+    let width = a.mag.len().max(b.mag.len()) + 1;
+    let x = a.to_twos(width);
+    let y = b.to_twos(width);
+    let limbs: Vec<u64> = x.iter().zip(&y).map(|(&p, &q)| op(p, q)).collect();
+    Big::from_twos(&limbs, sign)
+}
 /// The ordering of two magnitudes (little-endian, no leading zeros).
 fn cmp_mag(a: &[u64], b: &[u64]) -> Ordering {
     if a.len() != b.len() {
@@ -633,12 +918,10 @@ fn subtract_product(window: &mut [u64], factor: u64, divisor: &[u64]) -> bool {
 /// `badarith` when the magnitude has more than 1024 bits (at least `2^1024`, above
 /// the largest finite double) or when rounding carries out of it.
 fn mag_to_f64(mag: &[u64]) -> Result<f64> {
-    let limbs = mag.len();
-    if limbs == 0 {
+    if mag.is_empty() {
         return Ok(0.0);
     }
-    let top_bits = 64 - mag[limbs - 1].leading_zeros() as usize;
-    let bit_len = (limbs - 1) * 64 + top_bits;
+    let bit_len = bit_len(mag);
     if bit_len > 1024 {
         return Err(badarith());
     }
@@ -1170,6 +1453,295 @@ mod tests {
         mag.iter().rev().fold(0u128, |acc, &limb| (acc << 64) | u128::from(limb))
     }
 
+    /// Asserts that a shift's result is exactly `(-1)^negative * magnitude`,
+    /// `magnitude` given as the `u128` the oracle prints. The result may be a small
+    /// integer (the fold-back) or a bignum, so the comparison goes through
+    /// [`value`].
+    fn assert_shift(label: &str, result: Result<Eterm>, negative: bool, magnitude: u128) {
+        let term = result.unwrap_or_else(|e| panic!("{label} failed: {e:?}"));
+        let magnitude = i128::try_from(magnitude).expect("the magnitude fits an i128");
+        let expected = if negative { -magnitude } else { magnitude };
+        assert_eq!(value(term), expected, "{label}");
+    }    #[test]
+    fn bitwise_operations_match_the_oracle() {
+        with_ctx(|ctx| {
+            // Pinned to `erl -noshell -eval` (OTP 29 / erts-17.1):
+            // `255 band 15` ⇒ 15, `-2 band 3` ⇒ 2, `-2 bor 3` ⇒ -1,
+            // `-2 bxor 3` ⇒ -3, `bnot 5` ⇒ -6, `bnot -1` ⇒ 0, `bnot 0` ⇒ -1.
+            assert_eq!(int(band(ctx, &[make_small(255), make_small(15)]).unwrap()), 15);
+            assert_eq!(int(band(ctx, &[make_small(-2), make_small(3)]).unwrap()), 2);
+            assert_eq!(int(bor(ctx, &[make_small(-2), make_small(3)]).unwrap()), -1);
+            assert_eq!(int(bxor(ctx, &[make_small(-2), make_small(3)]).unwrap()), -3);
+            assert_eq!(int(bnot(ctx, &[make_small(5)]).unwrap()), -6);
+            assert_eq!(int(bnot(ctx, &[make_small(-1)]).unwrap()), 0);
+            assert_eq!(int(bnot(ctx, &[make_small(0)]).unwrap()), -1);
+
+            // `-1 band -1` ⇒ -1, `0 bor 0` ⇒ 0, `-1 bxor -1` ⇒ 0.
+            assert_eq!(int(band(ctx, &[make_small(-1), make_small(-1)]).unwrap()), -1);
+            assert_eq!(int(bor(ctx, &[make_small(0), make_small(0)]).unwrap()), 0);
+            assert_eq!(int(bxor(ctx, &[make_small(-1), make_small(-1)]).unwrap()), 0);
+
+            // The same operators at two-limb width, against the oracle's exact
+            // values (all pinned through `erl`):
+            let two_to_70 = bsl(ctx, &[make_small(1), make_small(70)]).unwrap();
+            assert_eq!(parts(two_to_70), (false, vec![0, 64]));
+            let two_to_70_plus_1 = add(ctx, &[two_to_70, make_small(1)]).unwrap();
+            let minus_two_to_70 = bsl(ctx, &[make_small(-1), make_small(70)]).unwrap();
+            assert_eq!(parts(minus_two_to_70), (true, vec![0, 64]));
+
+            // `(1 bsl 70) band ((1 bsl 70)+1)` ⇒ 2^70 = 1180591620717411303424.
+            let and = band(ctx, &[two_to_70, two_to_70_plus_1]).unwrap();
+            assert_eq!(parts(and), (false, vec![0, 64]));
+            // `(1 bsl 70) bor 1` ⇒ 1180591620717411303425.
+            let or = bor(ctx, &[two_to_70, make_small(1)]).unwrap();
+            assert_eq!(parts(or), (false, vec![1, 64]));
+            // `-(1 bsl 70) bor 1` ⇒ -1180591620717411303423 = -(2^70 - 1): the low
+            // bit is set in the operand's two's complement, so the result is the
+            // operand plus one.
+            let or = bor(ctx, &[minus_two_to_70, make_small(1)]).unwrap();
+            assert_eq!(parts(or), (true, vec![u64::MAX, 63]));
+            // `-(1 bsl 70) bxor (1 bsl 70)` ⇒ -2361183241434822606848 = -(2^71).
+            let xor = bxor(ctx, &[minus_two_to_70, two_to_70]).unwrap();
+            assert_eq!(parts(xor), (true, vec![0, 128]));
+            // `-(1 bsl 70) band (1 bsl 70)` ⇒ 1180591620717411303424.
+            let and = band(ctx, &[minus_two_to_70, two_to_70]).unwrap();
+            assert_eq!(parts(and), (false, vec![0, 64]));
+            // `bnot (1 bsl 70)` ⇒ -1180591620717411303425; the complement of a
+            // negative operand is its magnitude minus one.
+            let complement = bnot(ctx, &[two_to_70]).unwrap();
+            assert_eq!(parts(complement), (true, vec![1, 64]));
+            let complement = bnot(ctx, &[minus_two_to_70]).unwrap();
+            assert_eq!(parts(complement), (false, vec![u64::MAX, 63]));
+            // `(((1 bsl 70) - 1) band 16#F0F0)` ⇒ 61680 (a small result: the bit
+            // operators fold back into the 60-bit range whenever they fit).
+            let low_bits = sub(ctx, &[two_to_70, make_small(1)]).unwrap();
+            let masked = band(ctx, &[low_bits, make_small(0xF0F0)]).unwrap();
+            assert_eq!(int(masked), 61680);
+            assert!(access::is_small(masked));
+        });
+    }
+
+    #[test]
+    fn bitwise_operations_agree_with_i128_arithmetic() {
+        with_ctx(|ctx| {
+            // Two's complement on `i128` is the same operation, so every pair of
+            // small/bignum operands (all within `2^70`) can be checked exactly.
+            let two_to_70: i128 = 1 << 70;
+            let operands: [(i128, Eterm); 7] = [
+                (0, make_small(0)),
+                (1, make_small(1)),
+                (-1, make_small(-1)),
+                (i128::from(MAX_SMALL), make_small(MAX_SMALL)),
+                (i128::from(MIN_SMALL), make_small(MIN_SMALL)),
+                (two_to_70, bignum(ctx, false, &[0, 64])),
+                (-two_to_70, bignum(ctx, true, &[0, 64])),
+            ];
+            for &(x, x_term) in &operands {
+                assert_eq!(value(bnot(ctx, &[x_term]).unwrap()), !x, "bnot {x}");
+                for &(y, y_term) in &operands {
+                    assert_eq!(value(band(ctx, &[x_term, y_term]).unwrap()), x & y, "{x} band {y}");
+                    assert_eq!(value(bor(ctx, &[x_term, y_term]).unwrap()), x | y, "{x} bor {y}");
+                    assert_eq!(value(bxor(ctx, &[x_term, y_term]).unwrap()), x ^ y, "{x} bxor {y}");
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn shifts_match_the_oracle() {
+        with_ctx(|ctx| {
+            // Pinned to `erl -noshell -eval`: `1 bsl 10` ⇒ 1024, `-1 bsl 4` ⇒ -16,
+            // `8 bsl -2` ⇒ 2, `255 bsr 4` ⇒ 15, `-1 bsr 4` ⇒ -1, `-3 bsr 1` ⇒ -2,
+            // `1 bsr -2` ⇒ 4, `255 bsr 100` ⇒ 0, `-255 bsr 100` ⇒ -1.
+            assert_eq!(int(bsl(ctx, &[make_small(1), make_small(10)]).unwrap()), 1024);
+            assert_eq!(int(bsl(ctx, &[make_small(-1), make_small(4)]).unwrap()), -16);
+            assert_eq!(int(bsl(ctx, &[make_small(8), make_small(-2)]).unwrap()), 2);
+            assert_eq!(int(bsr(ctx, &[make_small(255), make_small(4)]).unwrap()), 15);
+            assert_eq!(int(bsr(ctx, &[make_small(-1), make_small(4)]).unwrap()), -1);
+            assert_eq!(int(bsr(ctx, &[make_small(-3), make_small(1)]).unwrap()), -2);
+            assert_eq!(int(bsr(ctx, &[make_small(1), make_small(-2)]).unwrap()), 4);
+            assert_eq!(int(bsr(ctx, &[make_small(255), make_small(100)]).unwrap()), 0);
+            assert_eq!(int(bsr(ctx, &[make_small(-255), make_small(100)]).unwrap()), -1);
+            // The degenerate counts: `5 bsl 0` ⇒ 5, `5 bsr 0` ⇒ 5, `0 bsr 0` ⇒ 0.
+            assert_eq!(int(bsl(ctx, &[make_small(5), make_small(0)]).unwrap()), 5);
+            assert_eq!(int(bsr(ctx, &[make_small(5), make_small(0)]).unwrap()), 5);
+            assert_eq!(int(bsr(ctx, &[make_small(0), make_small(0)]).unwrap()), 0);
+
+            // `1 bsl 70` ⇒ 1180591620717411303424 (a bignum), and the big-value
+            // shifts pinned through the oracle:
+            // `(1 bsl 70) bsr 65` ⇒ 32, `(1 bsl 70) bsl 3` ⇒ 2^73,
+            // `(1 bsl 70) bsl -3` ⇒ 2^67, `(1 bsl 70) bsr -3` ⇒ 2^73,
+            // `-(1 bsl 70) bsl -3` ⇒ -(2^67), `-(1 bsl 70) bsr -3` ⇒ -(2^73),
+            // `-(1 bsl 70) bsr 69` ⇒ -2, `-(1 bsl 70) bsr 70` ⇒ -1,
+            // `-(1 bsl 70) bsr 100` ⇒ -1, `(1 bsl 70) bsr 100` ⇒ 0.
+            let two_to_70 = bsl(ctx, &[make_small(1), make_small(70)]).unwrap();
+            assert_eq!(parts(two_to_70), (false, vec![0, 64]));
+            let minus_two_to_70 = bsl(ctx, &[make_small(-1), make_small(70)]).unwrap();
+            assert_eq!(parts(minus_two_to_70), (true, vec![0, 64]));
+            let three = make_small(3);
+
+            assert_eq!(int(bsr(ctx, &[two_to_70, make_small(65)]).unwrap()), 32);
+            assert_shift("(1 bsl 70) bsl 3", bsl(ctx, &[two_to_70, three]), false, 1 << 73);
+            assert_shift(
+                "(1 bsl 70) bsl -3",
+                bsl(ctx, &[two_to_70, make_small(-3)]),
+                false,
+                1 << 67,
+            );
+            assert_shift(
+                "(1 bsl 70) bsr -3",
+                bsr(ctx, &[two_to_70, make_small(-3)]),
+                false,
+                1 << 73,
+            );
+            assert_shift(
+                "-(1 bsl 70) bsl -3",
+                bsl(ctx, &[minus_two_to_70, make_small(-3)]),
+                true,
+                1 << 67,
+            );
+            assert_shift(
+                "-(1 bsl 70) bsr -3",
+                bsr(ctx, &[minus_two_to_70, make_small(-3)]),
+                true,
+                1 << 73,
+            );
+            assert_shift(
+                "-(1 bsl 70) bsr 69",
+                bsr(ctx, &[minus_two_to_70, make_small(69)]),
+                true,
+                2,
+            );
+            assert_eq!(int(bsr(ctx, &[minus_two_to_70, make_small(70)]).unwrap()), -1);
+            assert_eq!(int(bsr(ctx, &[minus_two_to_70, make_small(100)]).unwrap()), -1);
+            assert_eq!(int(bsr(ctx, &[two_to_70, make_small(100)]).unwrap()), 0);
+
+            // A shift of a bignum whose low bits are set: the arithmetic right shift
+            // rounds a negative value toward negative infinity, so the discarded
+            // fraction adds one to the magnitude:
+            // `-((1 bsl 70) + 1) bsr 1` ⇒ -(2^69 + 1) = -590295810358705651713.
+            let odd = sub(ctx, &[minus_two_to_70, make_small(1)]).unwrap();
+            assert_eq!(parts(odd), (true, vec![1, 64]));
+            assert_shift(
+                "-((1 bsl 70) + 1) bsr 1",
+                bsr(ctx, &[odd, make_small(1)]),
+                true,
+                (1 << 69) + 1,
+            );
+            assert_eq!(int(bsr(ctx, &[odd, make_small(70)]).unwrap()), -2);
+            assert_eq!(int(bsr(ctx, &[odd, make_small(71)]).unwrap()), -1);
+
+            // `1 bsl 100000` succeeds (the mask check uses a 60-bit small constant
+            // for the digits, well below `BIG_ARITY_MAX`).
+            let wide = bsl(ctx, &[make_small(1), make_small(100_000)]).unwrap();
+            assert_eq!(parts(wide).1.len(), 1563, "100000 bits need 1563 limbs");
+        });
+    }
+
+    #[test]
+    fn shift_operands_must_be_integers() {
+        with_ctx(|ctx| {
+            let one_point_oh = ctx.make_float(1.0).unwrap();
+            let a = ctx.atom("a").unwrap();
+            // `1 bsl 1.0` and `1.0 bsr 2` are `badarith` in the oracle.
+            assert!(matches!(bsl(ctx, &[make_small(1), one_point_oh]), Err(BeamError::BadArith)));
+            assert!(matches!(bsr(ctx, &[one_point_oh, make_small(2)]), Err(BeamError::BadArith)));
+            assert!(matches!(bsl(ctx, &[a, make_small(2)]), Err(BeamError::BadArith)));
+            assert!(matches!(bsr(ctx, &[make_small(2), a]), Err(BeamError::BadArith)));
+            // The bitwise operators reject floats and non-numbers too.
+            assert!(matches!(band(ctx, &[one_point_oh, make_small(1)]), Err(BeamError::BadArith)));
+            assert!(matches!(band(ctx, &[make_small(1), one_point_oh]), Err(BeamError::BadArith)));
+            assert!(matches!(bor(ctx, &[one_point_oh, one_point_oh]), Err(BeamError::BadArith)));
+            assert!(matches!(bxor(ctx, &[make_small(1), a]), Err(BeamError::BadArith)));
+            assert!(matches!(bnot(ctx, &[one_point_oh]), Err(BeamError::BadArith)));
+            assert!(matches!(bnot(ctx, &[a]), Err(BeamError::BadArith)));
+        });
+    }
+
+    #[test]
+    fn shift_counts_beyond_the_bignum_limit() {
+        with_ctx(|ctx| {
+            // `1 bsl (1 bsl 70)` ⇒ `system_limit`: the shift amount does not fit a
+            // `usize` and the left operand is non-zero (the C `N bsl PositiveBigNum`
+            // arm). The rejection happens before any limb vector is allocated.
+            let huge_shift = bignum(ctx, false, &[0, 64]);
+            let big_operand = bignum(ctx, false, &[0, 64]);
+            let negative_operand = bignum(ctx, true, &[0, 64]);
+            assert!(matches!(bsl(ctx, &[make_small(1), huge_shift]), Err(BeamError::SystemLimit)));
+            assert!(matches!(bsl(ctx, &[big_operand, huge_shift]), Err(BeamError::SystemLimit)));
+            // `0 bsl (1 bsl 70)` ⇒ 0 — the C checks the zero operand first.
+            assert_eq!(int(bsl(ctx, &[make_small(0), huge_shift]).unwrap()), 0);
+            // `1 bsr (1 bsl 70)` ⇒ 0, `(-1) bsr (1 bsl 70)` ⇒ -1.
+            assert_eq!(int(bsr(ctx, &[make_small(1), huge_shift]).unwrap()), 0);
+            assert_eq!(int(bsr(ctx, &[make_small(-1), huge_shift]).unwrap()), -1);
+            assert_eq!(int(bsr(ctx, &[big_operand, huge_shift]).unwrap()), 0);
+            assert_eq!(int(bsr(ctx, &[negative_operand, huge_shift]).unwrap()), -1);
+
+            // A negative huge count flips the direction: a right shift of a non-zero
+            // operand by it is `system_limit` (`1 bsr -H`, `-1 bsr -H`), a left shift
+            // keeps only the sign (`1 bsl -H` ⇒ 0, `-1 bsl -H` ⇒ -1), and
+            // `0 bsl/-bsr <it>` is still `0`.
+            let minus_huge_shift = bignum(ctx, true, &[0, 64]);
+            assert_eq!(int(bsl(ctx, &[make_small(0), minus_huge_shift]).unwrap()), 0);
+            assert_eq!(int(bsl(ctx, &[make_small(1), minus_huge_shift]).unwrap()), 0);
+            assert_eq!(int(bsl(ctx, &[make_small(-1), minus_huge_shift]).unwrap()), -1);
+            assert_eq!(int(bsr(ctx, &[make_small(0), minus_huge_shift]).unwrap()), 0);
+            assert!(matches!(
+                bsr(ctx, &[make_small(1), minus_huge_shift]),
+                Err(BeamError::SystemLimit)
+            ));
+            assert!(matches!(
+                bsr(ctx, &[make_small(-1), minus_huge_shift]),
+                Err(BeamError::SystemLimit)
+            ));
+            // `-(1 bsl 70)` has a left operand beyond `usize` too, and the same
+            // direction flip applies to a bignum operand.
+            assert_eq!(int(bsl(ctx, &[negative_operand, minus_huge_shift]).unwrap()), -1);
+            assert!(matches!(
+                bsr(ctx, &[big_operand, minus_huge_shift]),
+                Err(BeamError::SystemLimit)
+            ));
+
+            // A count that reaches `BIG_MAX_BITS` (or past it) is rejected before the
+            // result is allocated: `bit_len(1) + 4194240 > BIG_MAX_BITS`.
+            let limit = i64::try_from(BIG_MAX_BITS).expect("the limit fits a small int");
+            assert!(matches!(
+                bsl(ctx, &[make_small(1), make_small(limit)]),
+                Err(BeamError::SystemLimit)
+            ));
+            assert!(matches!(
+                bsl(ctx, &[make_small(-1), make_small(limit)]),
+                Err(BeamError::SystemLimit)
+            ));
+        });
+    }
+
+    #[test]
+    fn two_complement_helpers_round_trip() {
+        // The `Big` two's-complement layer directly: `from_twos` undoes `to_twos`
+        // for every width, including the sign-extension corners (`-1`, `-2^64`).
+        let values = [
+            Big::zero(),
+            Big::from_i64(1),
+            Big::from_i64(-1),
+            Big::from_i64(i64::MAX),
+            Big::from_i64(i64::MIN),
+            Big::new(false, vec![0, 1]),
+            Big::new(true, vec![0, 1]),
+            Big::new(true, vec![u64::MAX, u64::MAX]),
+        ];
+        for value in &values {
+            for width in [value.mag.len() + 1, value.mag.len() + 3] {
+                let limbs = value.to_twos(width);
+                assert_eq!(limbs.len(), width);
+                assert_eq!(&Big::from_twos(&limbs, value.negative), value, "{value:?}");
+                // The top limb is pure sign extension.
+                let extension = if value.negative { u64::MAX } else { 0 };
+                assert_eq!(limbs[width - 1], extension, "{value:?}");
+            }
+        }
+    }
+
     #[test]
     fn register_installs_the_quoted_operator_names() {
         let mut reg = BifRegistry::new();
@@ -1184,9 +1756,15 @@ mod tests {
             ("abs", 1),
             ("-", 1),
             ("+", 1),
+            ("band", 2),
+            ("bor", 2),
+            ("bxor", 2),
+            ("bnot", 1),
+            ("bsl", 2),
+            ("bsr", 2),
         ] {
             assert!(reg.contains("erlang", name, arity), "missing erlang:{name}/{arity}");
         }
-        assert_eq!(reg.len(), 9);
+        assert_eq!(reg.len(), 15);
     }
 }

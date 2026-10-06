@@ -38,7 +38,7 @@ enum Tok {
 
 /// The multi-character operator/punctuation spellings, longest first.
 const PUNCT: &[&str] = &[
-    "=:=", "=/=", "->", "=>", ":=", "==", "=<", ">=", "<-", "++", "--", "<<", ">>", "||", "#{",
+    "=:=", "=/=", "->", "=>", ":=", "==", "=<", ">=", "<-", "<=", "++", "--", "<<", ">>", "||", "#{",
     "(", ")", "[", "]", "{", "}", ",", ";", ".", "|", "#", ":", "=", "<", ">", "+", "-", "*", "/",
     "!",
 ];
@@ -511,8 +511,27 @@ impl<'a> Parser<'a> {
 
     /// Runs `f` with the binary-segment flag cleared.
     fn with_seg_off<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.with_segment_flag(false, f)
+    }
+
+    /// Runs `f` with the binary-segment flag set.
+    ///
+    /// Inside a segment a `/` opens the type specifier rather than the division
+    /// operator (`binop_of` guards `FloatDiv` on the flag), so a segment's value **and**
+    /// its `:Size` are parsed with the flag set — `<<255:12/little>>` is the low 12 bits
+    /// of 255 laid out little-endian, not `12 / little`.
+    fn with_seg_on<T>(&mut self, f: impl FnOnce(&mut Self) -> Result<T>) -> Result<T> {
+        self.with_segment_flag(true, f)
+    }
+
+    /// Runs `f` with the binary-segment flag set to `flag`, restoring it afterwards.
+    fn with_segment_flag<T>(
+        &mut self,
+        flag: bool,
+        f: impl FnOnce(&mut Self) -> Result<T>,
+    ) -> Result<T> {
         let saved = self.in_segment;
-        self.in_segment = false;
+        self.in_segment = flag;
         let result = f(self);
         self.in_segment = saved;
         result
@@ -754,14 +773,10 @@ impl<'a> Parser<'a> {
 
     /// One binary segment.
     fn parse_segment(&mut self) -> Result<Seg> {
-        let saved = self.in_segment;
-        self.in_segment = true;
-        let value = self.parse_expr(0);
-        self.in_segment = saved;
-        let value = value?;
+        let value = self.with_seg_on(|p| p.parse_expr(0))?;
 
         let size = if self.eat_punct(":") {
-            Some(self.with_seg_off(|p| p.parse_expr(0))?)
+            Some(self.with_seg_on(|p| p.parse_expr(0))?)
         } else {
             None
         };
@@ -843,7 +858,7 @@ impl<'a> Parser<'a> {
                 source,
             });
         }
-        if self.eat_punct("=<") {
+        if self.eat_punct("<=") {
             let source = self.with_seg_off(|p| p.parse_expr(0))?;
             return Ok(Qual::BinaryGenerator {
                 pattern: first,
@@ -1247,6 +1262,40 @@ mod tests {
         assert!(matches!(parsed("[X || X <- L, X > 1]"), Expr::ListComp(..)));
         assert!(matches!(parsed("#{K => V || {K,V} <- L}"), Expr::MapComp(..)));
         assert!(matches!(parsed("<<X || X <- L>>"), Expr::BinComp(..)));
+    }
+
+    #[test]
+    fn a_binary_generator_uses_the_double_arrow() {
+        // A `<<…>>` comprehension with a `<=` qualifier is a *binary* comprehension
+        // whose qualifier is a binary generator.
+        let Expr::BinComp(_, quals) = parsed("<<X || X <= L>>") else {
+            panic!("`<<X || X <= L>>` must parse as a binary comprehension");
+        };
+        assert!(matches!(quals.as_slice(), [Qual::BinaryGenerator { .. }]));
+
+        // … while a list generator keeps `<-` (the flag must not have repurposed it).
+        let Expr::ListComp(_, quals) = parsed("[X || X <- L]") else {
+            panic!("`[X || X <- L]` must parse as a list comprehension");
+        };
+        assert!(matches!(quals.as_slice(), [Qual::Generator { .. }]));
+
+        // `<=` is the generator arrow, **not** a comparison: Erlang's "less than or
+        // equal" operator is `=<`, which must still parse to `BinOp::LtEq`.
+        assert!(matches!(parsed("A =< B"), Expr::Op(BinOp::LtEq, _, _)));
+    }
+
+    #[test]
+    fn a_segment_size_does_not_swallow_its_type_specifier() {
+        // A segment's size is an `expr_max`, so the `/` that follows it opens the type
+        // specifier rather than the division operator: the segment keeps both a 12-bit
+        // size and its `little` endianness. (Parsing the size as `12 / little` is what
+        // made `<<255:12/little>>` raise `badarith`.)
+        let Expr::Binary(segs) = parsed("<<255:12/little>>") else {
+            panic!("`<<255:12/little>>` must parse as a binary construction");
+        };
+        assert_eq!(segs.len(), 1);
+        assert_eq!(segs[0].size, Some(Expr::Int(12)));
+        assert!(segs[0].endian.is_some(), "the `little` specifier is kept");
     }
 
     #[test]

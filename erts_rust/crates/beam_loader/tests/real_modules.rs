@@ -10,29 +10,23 @@
 //!
 //! # What the sweep proves
 //!
-//! * **Load breadth.** The public loader pipeline parses most of a real OTP
+//! * **Load breadth.** The public loader pipeline parses an entire real OTP
 //!   install; a broken walk (a missing application, a directory-resolution bug) is
 //!   caught by a floor on the number of modules discovered.
-//! * **Failures are surfaced, never swallowed.** Every module that fails to load
-//!   is printed by name with its exact typed error.
+//! * **Every discovered module must load.** A single module failing to parse fails
+//!   the test — a load failure is a regression, never tolerated. Each failure is
+//!   still printed by name with its exact typed error before the test fails.
+//! * **Semantic decoding.** [`nested_fun_literals_decode_to_their_mfa`] loads two
+//!   real modules whose `LitT` pools nest `EXPORT_EXT` funs inside compound
+//!   literals, and asserts the decoded funs still carry their `{module, function,
+//!   arity}` identity — so the sweep proves *what* decoded, not merely *how many*.
 //!
 //! # Skip-vs-assert policy (explicit)
 //!
 //! * **A missing OTP install skips LOUDLY.** When `erl` is absent (or the
 //!   `stdlib`/`kernel` `ebin` directories cannot be located) the test prints
-//!   `SKIP: <reason>` and returns — it never fails in that case.
-//! * **Known load failures are an explicit allowlist.** [`KNOWN_LOAD_FAILURES`]
-//!   records the modules that do **not** load at this commit (upstream
-//!   `beam_loader`/`beam_codec` gaps — external-fun literals, an inline
-//!   big-integer operand, `lower::build_module` rejecting the instruction model).
-//!   The observed failure set must be a **subset** of it: a module failing that is
-//!   *not* listed fails the test (a regression), while a listed module that starts
-//!   loading is merely printed (never a failure) so the allowlist can shrink.
-//! * **The allowlist is expected to go stale.** Sibling executors are concurrently
-//!   closing the individual load gaps listed here, so a module dropping off the
-//!   list is normal — it is *reported*, never a failure. This mirrors
-//!   `beam_engine/tests/stdlib_sweep.rs` but is **load-only** (no execution) and
-//!   drives `beam_loader` directly.
+//!   `SKIP: <reason>` and returns — it never fails in that case. It never silently
+//!   passes without OTP.
 //!
 //! Ground truth is the system OTP install itself; the `ebin` directories are
 //! located at **test time** (see [`app_ebin`]).
@@ -50,67 +44,10 @@ use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
-// ---------------------------------------------------------------------------
-// The allowlist (data, not a pass)
-// ---------------------------------------------------------------------------
-
-/// The modules of this OTP install that the loader genuinely cannot load today.
-///
-/// This is **data, not a pass**: the sweep prints every one by name with its typed
-/// error, and fails if *any module outside this set* fails to load (a regression).
-/// A listed module that starts loading is reported and simply drops off — sibling
-/// executors are actively closing these gaps, so the list is expected to shrink.
-///
-/// The modules were recorded at this commit by running the sweep with an empty
-/// list and copying the printed `LOAD-FAIL` names. At this commit the install had
-/// 261 modules (stdlib 98, kernel 104, compiler 59) of which 220 load; the 41
-/// below do not.
-const KNOWN_LOAD_FAILURES: &[&str] = &[
-    // stdlib — 19 modules.
-    "dets_v9",
-    "epp",
-    "erl_pp",
-    "erl_scan",
-    "erl_stdlib_errors",
-    "escript",
-    "file_sorter",
-    "gen_event",
-    "gen_fsm",
-    "gen_server",
-    "gen_statem",
-    "json",
-    "maps",
-    "proc_lib",
-    "rand",
-    "shell",
-    "shell_docs",
-    "supervisor",
-    "supervisor_bridge",
-    // kernel — 14 modules.
-    "application_controller",
-    "disk_log",
-    "erl_kernel_errors",
-    "error_logger",
-    "group",
-    "inet_epmd_dist",
-    "inet_tcp_dist",
-    "logger",
-    "logger_formatter",
-    "logger_h_common",
-    "logger_proxy",
-    "logger_server",
-    "net",
-    "net_kernel",
-    // compiler — 8 modules.
-    "beam_call_types",
-    "beam_doc",
-    "beam_jump",
-    "beam_ssa_alias",
-    "beam_ssa_pre_codegen",
-    "beam_ssa_ss",
-    "compile",
-    "sys_core_fold",
-];
+use beam_codec::term::{cons_head, cons_tail, flatmap_parts, tuple_arity, tuple_element};
+use beam_codec::{fun_arity_term, fun_function, fun_kind_term, fun_module, FunKind};
+use beam_loader::Module;
+use beam_term::prelude::{is_list, Eterm};
 
 // ---------------------------------------------------------------------------
 // Locating the installed OTP `ebin` directories
@@ -230,8 +167,8 @@ fn sweep_dirs() -> Vec<SweepDir> {
 // ---------------------------------------------------------------------------
 
 /// Loads every `*.beam` in the sweep directories through [`beam_loader::load_file`]
-/// (the public pipeline) and proves each one that loads parses to a usable module,
-/// while surfacing every load failure loudly.
+/// (the public pipeline) and proves each one parses to a usable module. Every load
+/// failure is a hard test failure: a module that stops loading is a regression.
 #[test]
 fn loads_every_installed_otp_beam() {
     if let Some(reason) = skip_reason() {
@@ -248,9 +185,7 @@ fn loads_every_installed_otp_beam() {
     let mut total = 0usize;
     let mut loaded = 0usize;
     let mut failures: Vec<(String, String)> = Vec::new();
-    let mut unexpected: Vec<(String, String)> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
-    let mut now_loading: Vec<&str> = Vec::new();
 
     for dir in &dirs {
         for module in &dir.modules {
@@ -259,9 +194,6 @@ fn loads_every_installed_otp_beam() {
             match beam_loader::load_file(&path) {
                 Ok(loaded_module) => {
                     loaded += 1;
-                    if let Some(name) = KNOWN_LOAD_FAILURES.iter().find(|name| **name == module) {
-                        now_loading.push(name);
-                    }
                     // A successful load must have produced at least one function:
                     // an empty function list means the pipeline parsed the chunks
                     // but silently dropped the code — still a defect.
@@ -270,14 +202,11 @@ fn loads_every_installed_otp_beam() {
                     }
                 }
                 Err(error) => {
-                    // Surface every failure loudly, with the exact typed error.
+                    // Surface every failure loudly, with the exact typed error; the
+                    // assertion below then fails the test on any of them.
                     let message = format!("{error:?}");
                     println!("LOAD-FAIL {module}: {message}");
-                    if KNOWN_LOAD_FAILURES.contains(&module.as_str()) {
-                        failures.push((module.clone(), message));
-                    } else {
-                        unexpected.push((module.clone(), message));
-                    }
+                    failures.push((module.clone(), message));
                 }
             }
         }
@@ -289,18 +218,11 @@ fn loads_every_installed_otp_beam() {
         let _ = write!(report, " ({}={})", dir.app, dir.modules.len());
     }
     println!("{report}");
-    println!(
-        "SWEEP: {} known load failure(s) (documented upstream gaps):",
-        failures.len()
-    );
-    for (module, error) in &failures {
-        println!("  - {module}: {error}");
-    }
-    if !now_loading.is_empty() {
-        println!(
-            "SWEEP: these allowlisted modules now load (drop them from KNOWN_LOAD_FAILURES): \
-             {now_loading:?}"
-        );
+    if !failures.is_empty() {
+        println!("SWEEP: {} load failure(s):", failures.len());
+        for (module, error) in &failures {
+            println!("  - {module}: {error}");
+        }
     }
 
     // A broad real sweep must cover a large number of modules. The floor is well
@@ -312,13 +234,135 @@ fn loads_every_installed_otp_beam() {
         "the sweep only found {total} `.beam` files — expected stdlib+kernel (≈200)"
     );
     assert!(
+        loaded == total,
+        "{} of {total} installed `.beam` module(s) failed to load (a regression): {failures:?}",
+        total - loaded,
+    );
+    assert!(
         empty.is_empty(),
         "{} module(s) loaded but yielded no function: {empty:?}",
         empty.len()
     );
+}
+
+// ---------------------------------------------------------------------------
+// Semantic evidence: the nested fun literals decode to their real MFA
+// ---------------------------------------------------------------------------
+
+/// Recursively collects every fun term reachable inside `term`, descending through
+/// cons spines, tuples and flat maps — the shape a `.beam` literal pool (`LitT`)
+/// has. Mirrors the walker in `beam_codec/tests/ground_truth.rs`.
+fn collect_funs(term: Eterm, out: &mut Vec<Eterm>) {
+    if fun_kind_term(term).is_ok() {
+        out.push(term);
+        return;
+    }
+    // Walk a cons spine; the final (non-cons) tail is handled below.
+    let mut cursor = term;
+    while is_list(cursor) {
+        collect_funs(cons_head(cursor).expect("a cons cell has a head"), out);
+        cursor = cons_tail(cursor).expect("a cons cell has a tail");
+    }
+    if let Ok(arity) = tuple_arity(cursor) {
+        for index in 0..arity {
+            collect_funs(
+                tuple_element(cursor, index).expect("an in-range tuple element"),
+                out,
+            );
+        }
+    } else if let Ok((keys, values)) = flatmap_parts(cursor) {
+        for key in keys {
+            collect_funs(*key, out);
+        }
+        for value in values {
+            collect_funs(*value, out);
+        }
+    }
+}
+
+/// Every fun reachable inside a loaded module's decoded `LitT` literals.
+fn literal_funs(module: &Module) -> Vec<Eterm> {
+    let mut funs = Vec::new();
+    for &term in module.literals().terms() {
+        collect_funs(term, &mut funs);
+    }
+    funs
+}
+
+/// The `(module, function, arity)` names of a fun term, resolved through `module`'s
+/// own atom table (its literals were decoded with that same table, so the atoms
+/// resolve). `None` where the term does not carry that field.
+fn fun_mfa(module: &Module, fun: Eterm) -> (Option<&str>, Option<&str>, Option<usize>) {
+    (
+        fun_module(fun).ok().and_then(|atom| module.atom_name(atom)),
+        fun_function(fun).ok().and_then(|atom| module.atom_name(atom)),
+        fun_arity_term(fun).ok(),
+    )
+}
+
+/// Proves the previously-blocking fun-literal shape decodes **semantically**, not
+/// just by count: two real stdlib modules whose `LitT` pools nest `EXPORT_EXT` funs
+/// inside compound literals are loaded through the public pipeline, the nested funs
+/// are walked out of the decoded literals, and their `{module, function, arity}`
+/// identity is asserted (the oracle ground truth pinned in
+/// `beam_codec/tests/ground_truth.rs`).
+#[test]
+fn nested_fun_literals_decode_to_their_mfa() {
+    let Some(ebin) = app_ebin("stdlib") else {
+        eprintln!(
+            "SKIP: system Erlang/stdlib not found (need `erl` on PATH or $ERTS_STDLIB_DIR) — \
+             the fun-literal semantic check requires the installed OTP `.beam` files"
+        );
+        return;
+    };
+
+    // `maps`' literal pool nests `{2, fun maps:remove/2}` — an `EXPORT_EXT` fun
+    // inside a tuple inside a list.
+    let maps = beam_loader::load_file(ebin.join("maps.beam"))
+        .expect("maps.beam must load: its nested `fun maps:remove/2` literal must decode");
+    let maps_funs = literal_funs(&maps);
+    let remove = maps_funs
+        .iter()
+        .copied()
+        .find(|&fun| fun_mfa(&maps, fun) == (Some("maps"), Some("remove"), Some(2)))
+        .unwrap_or_else(|| {
+            let found: Vec<_> = maps_funs.iter().map(|&fun| fun_mfa(&maps, fun)).collect();
+            panic!("maps' literal pool must nest the external `fun maps:remove/2`; found {found:?}")
+        });
     assert!(
-        unexpected.is_empty(),
-        "{} UNEXPECTED load failure(s) (a regression): {unexpected:?}",
-        unexpected.len()
+        matches!(fun_kind_term(remove), Ok(FunKind::External)),
+        "the nested `maps:remove` literal must decode as an external (`EXPORT_EXT`) fun"
+    );
+
+    // `gen_server`'s (larger) pool nests four `fun gen_server:format_log/N` funs
+    // with arities 1 and 2, inside flat maps inside tuples/lists.
+    let gen_server = beam_loader::load_file(ebin.join("gen_server.beam")).expect(
+        "gen_server.beam must load: its nested `fun gen_server:format_log/N` literals must decode",
+    );
+    let gen_server_funs = literal_funs(&gen_server);
+    assert!(
+        gen_server_funs
+            .iter()
+            .all(|&fun| matches!(fun_kind_term(fun), Ok(FunKind::External))),
+        "gen_server's pool nests only external (`EXPORT_EXT`) funs"
+    );
+    let mut arities: Vec<usize> = gen_server_funs
+        .iter()
+        .map(|&fun| fun_mfa(&gen_server, fun))
+        .map(|(module, function, arity)| {
+            assert_eq!(
+                (module, function),
+                (Some("gen_server"), Some("format_log")),
+                "every nested gen_server fun is `gen_server:format_log/N`"
+            );
+            arity.expect("an external fun carries its arity")
+        })
+        .collect();
+    arities.sort_unstable();
+    arities.dedup();
+    assert_eq!(
+        arities,
+        vec![1, 2],
+        "gen_server's pool nests `format_log/1` and `format_log/2`"
     );
 }

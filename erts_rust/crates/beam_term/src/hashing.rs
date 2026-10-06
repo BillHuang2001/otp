@@ -21,18 +21,21 @@
 //!
 //! * The hash covers the structural classes the rewrite needs today
 //!   (`small`/`big`/`float`, atoms by name, tuples, lists, binaries/bitstrings,
-//!   `nil`, internal pids/ports/refs).
-//! * Classes without a faithful layout-aware representation (funs, maps,
-//!   records, external pid/port/ref, on-heap bin refs) use an **opaque object
+//!   `nil`, internal pids/ports/refs, funs).
+//! * **Funs** hash over exactly the fields [`crate::compare`] compares — see
+//!   [`hash_fun`] — so `eq` implies equal hashes for every fun kind.
+//! * Classes without a faithful layout-aware representation (maps, records,
+//!   external pid/port/ref, on-heap bin refs) use an **opaque object
 //!   fallback**: the object's raw words are mixed in. This is deterministic for
-//!   a given runtime image but, because a fun's entry/map node words are
-//!   pointers, the hash of such a term is not stable across processes/images.
+//!   a given runtime image but, because a map node's words are pointers, the
+//!   hash of such a term is not stable across processes/images.
 //!   It is only ever used as an *internal* hash, never compared against the C.
 
 use crate::atom::AtomTable;
 use crate::bitstring::{bitstring_parts, float_bits};
 use crate::boxed::{boxed_val, header_arity, thing_arityval};
 use crate::eterm::Eterm;
+use crate::fun::{fun_arity, fun_desc_words, fun_kind_of_header, fun_num_free, FunKind};
 use crate::immediate::{atom_val, internal_pid_data, internal_port_data, signed_value};
 use crate::list::{car, cdr, is_list};
 use crate::ops::{class, TermClass};
@@ -61,6 +64,11 @@ const TAG_OPAQUE: u64 = 0x0b;
 const TAG_LIST_TAIL: u64 = 0x0c;
 /// Map discriminator (structural, over the canonical flat-map key order).
 const TAG_MAP: u64 = 0x0d;
+/// Fun discriminators — one per [`FunKind`], so the three descriptor shapes can
+/// never collide.
+const TAG_FUN_LOCAL: u64 = 0x0e;
+const TAG_FUN_IMPORTED: u64 = 0x0f;
+const TAG_FUN_EXTERNAL: u64 = 0x10;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
@@ -96,9 +104,81 @@ fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
         TermClass::Port => mix(mix(h, TAG_PORT), internal_port_data(t)),
         // SAFETY: `t` is a live map.
         TermClass::Map => hash_map(t, atoms, mix(h, TAG_MAP)),
+        // SAFETY: `t` is a live fun.
+        TermClass::Fun => unsafe { hash_fun(t, atoms, h) },
         // Refs plus every opaque class.
         _ => unsafe { hash_words(t, mix(h, TAG_OPAQUE)) },
     }
+}
+
+/// Hash a fun over exactly the fields [`crate::compare::cmp`] compares, so `eq`
+/// implies equal hashes for every kind (see [`crate::fun`] and
+/// [`crate::compare::cmp`]):
+///
+/// * [`FunKind::Local`] ⇒ `(uniq, index)`, then `num_free`, then the environment.
+/// * [`FunKind::Imported`] ⇒ `(module, index, old_uniq)`, then `num_free`, then
+///   the environment.
+/// * [`FunKind::External`] ⇒ `(module, function, arity)`.
+///
+/// The fields the comparison ignores are deliberately not hashed — the fun arity
+/// for the two local kinds, and the imported `uniq`/`old_index`/creator pid — so
+/// two funs the comparison calls `=:=` always hash equal.
+///
+/// # Safety
+///
+/// `t` must be a live fun term.
+unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
+    let p = boxed_val(t);
+    // SAFETY: `t` is a live fun, so word 0 is its (live) header word.
+    let hdr = unsafe { *p };
+    match fun_kind_of_header(hdr) {
+        FunKind::Local => {
+            let mut h = mix(h, TAG_FUN_LOCAL);
+            // SAFETY: a local fun's descriptor words 1 and 2 hold `uniq` and `index`.
+            h = mix(h, unsafe { (*p.add(1)).raw() } as u64);
+            h = mix(h, unsafe { (*p.add(2)).raw() } as u64);
+            // SAFETY: `p` is the header word of the live local fun `hdr`.
+            unsafe { hash_fun_env(p, hdr, atoms, h) }
+        }
+        FunKind::Imported => {
+            let mut h = mix(h, TAG_FUN_IMPORTED);
+            // SAFETY: an imported fun's descriptor word 1 holds its module atom.
+            h = hash_term(unsafe { *p.add(1) }, atoms, h);
+            // SAFETY: an imported fun's descriptor words 4 and 6 hold `index` and
+            // `old_uniq`.
+            h = mix(h, unsafe { (*p.add(4)).raw() } as u64);
+            h = mix(h, unsafe { (*p.add(6)).raw() } as u64);
+            // SAFETY: `p` is the header word of the live imported fun `hdr`.
+            unsafe { hash_fun_env(p, hdr, atoms, h) }
+        }
+        FunKind::External => {
+            let mut h = mix(h, TAG_FUN_EXTERNAL);
+            // SAFETY: an external fun's descriptor words 1 and 2 hold its module and
+            // function atoms.
+            h = hash_term(unsafe { *p.add(1) }, atoms, h);
+            h = hash_term(unsafe { *p.add(2) }, atoms, h);
+            mix(h, fun_arity(hdr) as u64)
+        }
+    }
+}
+
+/// Hash a local-kind fun's environment: `num_free`, then the `num_free`
+/// elements — the same tail [`crate::compare::cmp`] walks.
+///
+/// # Safety
+///
+/// `p` must be the header word of the live local-kind fun `hdr`, whose whole
+/// block (header + descriptor + `num_free` environment words) must be live.
+unsafe fn hash_fun_env(p: *mut Eterm, hdr: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
+    let num_free = fun_num_free(hdr);
+    h = mix(h, num_free as u64);
+    let offset = 1 + fun_desc_words(fun_kind_of_header(hdr));
+    for i in 0..num_free {
+        // SAFETY: environment word `i` is within the fun's payload.
+        let elem = unsafe { *p.add(offset + i) };
+        h = hash_term(elem, atoms, h);
+    }
+    h
 }
 
 /// Hash a map structurally, over its pairs in the canonical flat-map key order
@@ -244,10 +324,72 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
 mod tests {
     use super::*;
     use crate::boxed::{make_boxed, make_header, HEADER_FLONUM};
+    use crate::fun::{fun_words, write_fun_external, write_fun_imported, write_fun_local, FunPid};
     use crate::heap::Heap;
     use crate::immediate::{make_atom, make_small, NIL};
     use crate::tag::HEAP_BITS_SUBTAG;
+    use crate::Atom;
 
+    /// Build a [`FunKind::Local`] fun.
+    ///
+    /// # Safety
+    ///
+    /// `heap` must own the [`fun_words`]-sized block and outlive the term.
+    unsafe fn local_fun(heap: &mut Heap, uniq: u64, index: u32, env: &[Eterm]) -> Eterm {
+        // SAFETY: the caller keeps the block alive; the writer fills it.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Local, env.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(Local, env.len())` words.
+        unsafe { write_fun_local(hp, 0, uniq, index, env).unwrap() }
+    }
+
+    /// Build a [`FunKind::External`] fun.
+    ///
+    /// # Safety
+    ///
+    /// As [`local_fun`].
+    unsafe fn external_fun(heap: &mut Heap, module: Atom, function: Atom, arity: usize) -> Eterm {
+        // SAFETY: the caller keeps the block alive.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::External, 0)).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(External, 0)` words.
+        unsafe { write_fun_external(hp, arity, module, function).unwrap() }
+    }
+
+    /// Build a [`FunKind::Imported`] fun.
+    ///
+    /// # Safety
+    ///
+    /// As [`local_fun`].
+    unsafe fn imported_fun(
+        heap: &mut Heap,
+        module: Atom,
+        index: u32,
+        old_uniq: u32,
+        uniq: [u8; 16],
+        env: &[Eterm],
+    ) -> Eterm {
+        // SAFETY: the caller keeps the block alive.
+        let hp = unsafe { heap.alloc_words(fun_words(FunKind::Imported, env.len())).unwrap() };
+        // SAFETY: `hp` addresses exactly `fun_words(Imported, env.len())` words.
+        unsafe {
+            write_fun_imported(
+                hp,
+                0,
+                module,
+                &uniq,
+                index,
+                0,
+                old_uniq,
+                FunPid {
+                    node: module,
+                    number: 0,
+                    serial: 0,
+                    creation: 0,
+                },
+                env,
+            )
+            .unwrap()
+        }
+    }
     fn atoms() -> AtomTable {
         let mut t = AtomTable::new();
         t.seed(["a", "b"]);
@@ -357,6 +499,92 @@ mod tests {
         };
         assert_eq!(term_hash(b1, &a), term_hash(b2, &a));
         assert_ne!(term_hash(b1, &a), term_hash(b3, &a));
+    }
+
+    #[test]
+    fn funs_hash_by_their_compared_fields() {
+        let a = atoms();
+        let mut heap = Heap::new(256);
+        let m = a.lookup("a").unwrap();
+        let n = a.lookup("b").unwrap();
+        // SAFETY: the heap owns every block built here.
+        let (l1, l1_copy, l_uniq, l_index, l_env, e1, e1_copy, e_arity, i1, i1_copy, i_index, i_uniq_bytes) =
+            unsafe {
+                (
+                    local_fun(&mut heap, 7, 3, &[]),
+                    local_fun(&mut heap, 7, 3, &[]),
+                    local_fun(&mut heap, 8, 3, &[]),
+                    local_fun(&mut heap, 7, 4, &[]),
+                    local_fun(&mut heap, 7, 3, &[make_small(1)]),
+                    external_fun(&mut heap, m, n, 2),
+                    external_fun(&mut heap, m, n, 2),
+                    external_fun(&mut heap, m, n, 3),
+                    imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
+                    imported_fun(&mut heap, m, 1, 0, [1u8; 16], &[]),
+                    imported_fun(&mut heap, m, 2, 0, [1u8; 16], &[]),
+                    // Only the `uniq` bytes differ: the comparison ignores them, so
+                    // the hash must too.
+                    imported_fun(&mut heap, m, 1, 0, [2u8; 16], &[]),
+                )
+            };
+
+        // Equal funs hash equal, for every kind.
+        assert_eq!(term_hash(l1, &a), term_hash(l1_copy, &a));
+        assert_eq!(term_hash(e1, &a), term_hash(e1_copy, &a));
+        assert_eq!(term_hash(i1, &a), term_hash(i1_copy, &a));
+        // ... including an imported fun that differs only in the ignored `uniq`.
+        assert!(crate::eq(i1, i_uniq_bytes, &a));
+        assert_eq!(term_hash(i1, &a), term_hash(i_uniq_bytes, &a));
+
+        // Structurally different funs hash differently.
+        let distinct = [
+            term_hash(l1, &a),
+            term_hash(l_uniq, &a),
+            term_hash(l_index, &a),
+            term_hash(l_env, &a),
+            term_hash(e1, &a),
+            term_hash(e_arity, &a),
+            term_hash(i1, &a),
+            term_hash(i_index, &a),
+        ];
+        let n = distinct.len();
+        let mut sorted = distinct.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), n, "expected distinct hashes: {distinct:?}");
+    }
+
+    #[test]
+    fn fun_hash_agrees_with_eq_across_every_pair() {
+        let a = atoms();
+        let mut heap = Heap::new(256);
+        let m = a.lookup("a").unwrap();
+        let n = a.lookup("b").unwrap();
+        // SAFETY: the heap owns every block built here.
+        let samples = unsafe {
+            vec![
+                local_fun(&mut heap, 1, 1, &[]),
+                local_fun(&mut heap, 1, 1, &[]),
+                local_fun(&mut heap, 2, 1, &[make_small(0)]),
+                external_fun(&mut heap, m, n, 1),
+                external_fun(&mut heap, m, n, 1),
+                external_fun(&mut heap, n, m, 1),
+                imported_fun(&mut heap, m, 1, 0, [0u8; 16], &[]),
+                imported_fun(&mut heap, m, 1, 0, [0u8; 16], &[]),
+                imported_fun(&mut heap, m, 1, 5, [0u8; 16], &[]),
+            ]
+        };
+        for x in &samples {
+            for y in &samples {
+                if crate::eq(*x, *y, &a) {
+                    assert_eq!(
+                        term_hash(*x, &a),
+                        term_hash(*y, &a),
+                        "eq terms must hash equal: {x:?} {y:?}"
+                    );
+                }
+            }
+        }
     }
 
     #[test]

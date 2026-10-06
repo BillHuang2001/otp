@@ -17,7 +17,7 @@ assume a different layout.**
 (both are one machine word). `beam_abi` will transmute between them; no other crate may redefine it.
 
 ### crate root (`src/lib.rs`)
-`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, error}` plus
+`pub mod {tag, eterm, immediate, atom, list, boxed, tuple, heap, literal, ops, compare, hashing, size, thing, bitstring, refc, map, fun, error}` plus
 `pub mod prelude` and flat `pub use` re-exports of every public item below, so downstream code can
 `use beam_term::prelude::*;`.
 
@@ -244,6 +244,38 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   `compare`/`hashing` use so a flat map and a hash map of the same pairs present identically).
 - Non-boxed / non-map terms yield `TermError::BadMap` (never a deref of an immediate).
 
+### `fun.rs` — the on-heap fun / export term layout
+The boxed closure term: a `make_fun3` local closure or an `EXPORT_EXT`/`NEW_FUN_EXT` literal
+(ground truth `../../erts/emulator/beam/erl_term.h:403-425`, `erl_fun.h:61-99`,
+`emu/instrs.tab:545-584`, `external.c:3966-4003/5006-5040/5102-5176`, `utils.c:2149-2210`).
+The header word is C-exact: bits 0..5 [`FUN_SUBTAG`] (`0x14`), bits 8..15 `arity`,
+bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
+[`FUN_HEADER_IMPORTED_OFFS`] (this crate's `NEW_FUN_EXT` marker).
+- Constants: `FUN_HEADER_ARITY_OFFS=8`, `FUN_HEADER_ENV_SIZE_OFFS=16`, `FUN_HEADER_KIND_OFFS=24`,
+  `FUN_HEADER_IMPORTED_OFFS=25`, `FUN_MAX_FIELD=0xFF`, `MAX_ARG=255`, `FUN_DESC_WORDS_LOCAL=2`,
+  `FUN_DESC_WORDS_EXTERNAL=2`, `FUN_DESC_WORDS_IMPORTED=10`.
+- `pub enum FunKind { Local, External, Imported }`; `pub struct FunPid { node: Atom, number, serial, creation: u32 }`.
+- Pure (no `unsafe`, take a *header word*) helpers: `make_fun_header(arity, num_free, kind) -> TermResult<Eterm>`,
+  `fun_kind_of_header(hdr) -> FunKind` (const), `fun_kind(hdr) -> TermResult<FunKind>`,
+  `fun_arity`/`fun_num_free` (const), `fun_desc_words(kind)`, `fun_words(kind, num_free)`,
+  `fun_desc_words_header`/`fun_env_offset_header`/`fun_block_words_header` (term→error on non-fun).
+- `pub fn fun_block_words(t: Eterm) -> TermResult<usize>` (boxed-fun required).
+- Heap-agnostic writers (`pub unsafe fn`, caller reserves `fun_words(kind, num_free)` words):
+  `write_fun_local(hp, arity, uniq: u64, index: u32, env: &[Eterm])`,
+  `write_fun_external(hp, arity, module: Atom, function: Atom)`,
+  `write_fun_imported(hp, arity, module: Atom, uniq: &[u8;16], index, old_index, old_uniq: u32, creator: FunPid, env: &[Eterm])`.
+- Accessors (`pub unsafe fn`, wrong-kind/non-fun ⇒ `TermError::BadFun`, never a panic):
+  `fun_uniq -> TermResult<u64>`, `fun_uniq_bytes -> TermResult<[u8;16]>`, `fun_index`/`fun_old_index`/`fun_old_uniq -> TermResult<u32>`,
+  `fun_module`/`fun_function -> TermResult<Atom>`, `fun_creator_pid -> TermResult<FunPid>`, `fun_env -> TermResult<&[Eterm]>`.
+- Word layout, `env[i]` at `hp[1 + desc_words(kind) + i]`, block = `1 + desc_words + num_free` words:
+  `Local` = `[hdr][uniq:u64][index:u32][env…]`; `External` = `[hdr][module:Atom][function:Atom]`;
+  `Imported` = `[hdr][module][uniq0..8][uniq8..16][index][old_index][old_uniq][pid_node][pid_number][pid_serial][pid_creation][env…]`.
+- `boxed.rs` gains header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
+- `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
+  (`Local` by `(uniq,index)` then `num_free` then env; `External` by `(module,function,arity)`;
+  `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
+  fields `compare` compares — funs are no longer on an opaque fallback.
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
@@ -251,7 +283,7 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
   else. `beam_common` is used for exactly one thing: the `From<TermError> for beam_common::BeamError`
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
-- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `map`,
+- **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `fun`, `map`,
   `compare`, `hashing`, `bitstring`, `refc` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
@@ -264,6 +296,16 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
 - **`Eterm` = `#[repr(transparent)]` newtype over `usize`**, not a raw `usize` alias: gives type
   safety, methods, and a documented ABI contract while remaining layout/pass-identical to
   `ERL_NIF_TERM` (Level-1 drop-in requires this — Part I §A.3).
+- **Fun descriptors inline the C `entry` pointer (an M1 substitution).** C decodes `EXPORT_EXT` to an
+  *external* fun (entry = the canonical `Export`) and `NEW_FUN_EXT` to a *local* fun (entry = an
+  out-of-line `ErlFunEntry`). This tree has no fun/export table, so the entry fields live *inside* the
+  term: `Local` = `[uniq:u64][index:u32]` (byte-identical to `beam_engine::terms::make_fun`),
+  `External` = `[module:Atom][function:Atom]`, `Imported` = the 10-word `ErlFunEntry` fields + the
+  creator-pid field set. Header bit 24 (`is_external`) is the C kind bit; bit 25
+  (`FUN_HEADER_IMPORTED_OFFS`, ours, valid only while bit 24 is clear) discriminates the two local
+  kinds, so a C reader's `is_external_fun` still sees a local fun. Carrying every wire field keeps
+  decode→encode byte-exact and lets `beam_engine`/`beam_rt` call the fun later (External ⇒
+  module+function+arity; Imported ⇒ module+index).
 - **Checked + unchecked constructors.** `make_small`/`make_arityval` are unchecked (they are the
   engine hot path, mirroring C), but `try_*` variants return `TermResult` for use at trusted
   boundaries (arithmetic BIFs, loader, `beam_alloc`) so range violations become errors, not silent
@@ -361,6 +403,7 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
 - `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
+- `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
 - `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
@@ -372,18 +415,24 @@ pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) 
 - **Comparison gaps (`src/compare.rs`).** `cmp`/`eq`/`cmp_arith` faithfully reproduce
   `erts_cmp_compound` for atoms (by name), numbers (small/big/float), tuples, lists, bitstrings, maps
   (flat *and* hash — size first, then the `(key,value)` sequence in flat-map key order) and
-  internal pids/ports. The following classes use a **deterministic, panic-free fallback** rather than
+  internal pids/ports. Funs are ordered structurally (`cmp_funs`, `src/fun.rs`): `Local` by
+  `(uniq, index)` then `num_free` then env element-wise; `External` by `(module, function, arity)`
+  and after any local kind; `Imported` by `(module, index, old_uniq)` then `num_free` then env; a
+  mixed `Local`/`Imported` pair leads with a kind rank (because the `Local` descriptor carries no
+  module — a documented deviation from the C, which leads with the entry's `module`/`old_uniq`).
+  The following classes use a **deterministic, panic-free fallback** rather than
   a structural comparison and must be extended if exact ordering is needed: external
-  pid/port/ref, funs, records and on-heap bin refs (ordered by class rank, then object
+  pid/port/ref, records and on-heap bin refs (ordered by class rank, then object
   arity, then raw term word); internal references (compared by raw payload words, not the decoded
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
 - **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
-  exact bit values are not part of any contract. Maps hash structurally (their sorted pairs). Classes
-  lacking a layout-aware representation (funs, records, external pid/port/ref, bin refs) use an opaque
-  raw-word fallback, so their hash is not stable across processes/images.
+  exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
+  over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
+  kind-rank rules). Classes lacking a layout-aware representation (records, external pid/port/ref, bin
+  refs) use an opaque raw-word fallback, so their hash is not stable across processes/images.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
 - **Hash choices are internal (`src/map.rs`).** The HAMT trie is driven by `hashing::term_hash`, not

@@ -114,7 +114,26 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   `beam_gc::OffHeap` and release it when the on-heap reference dies. Small binaries stay on-heap
   (`ErlHeapBits`).
 
+- **Funs / exports** (`beam_term::fun`) — the on-heap `ErlFunThing` interior, as heap-agnostic
+  writers/readers. Header word = `FUN_SUBTAG | arity<<8 | num_free<<16 | external<<24 | imported<<25`
+  (the first three fields are C's `MAKE_FUN_HEADER` encoding). Three kinds: `Local` (descriptor
+  `[uniq:u64][index:u32]` — what `beam_engine`'s `make_fun3` builds), `External` (`[module][function]`,
+  an `EXPORT_EXT` literal), `Imported` (10-word descriptor: module, 16-byte MD5, index, old_index,
+  old_uniq, creator pid — a `NEW_FUN_EXT` literal). `env` follows the descriptor; block =
+  `1 + desc_words(kind) + num_free`, with `desc_words` = 2 / 2 / 10. The C's out-of-line
+  `ErlFunEntry`/`Export` `entry` pointer is **inlined into the term** — the same documented M1
+  substitution as the external-pid `node` slot. `beam_gc` sizes/scans fun copies through
+  `fun_block_words`/`fun_env_offset`, and `compare`/`hashing` order/hash funs structurally per the C
+  (`utils.c:2149-2210`).
+
 ## Handoffs (owned by other nodes — NOT yet adopted)
+- **Fun literals materialize but cannot be *called*, and a runtime-made `Local` closure has no ETF
+  image.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
+  `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`, but fun application goes
+  through `beam_engine::ExecutionContext::apply_fun`, whose concrete implementation is `beam_rt`'s
+  (outside this node). Encoding a `Local` (`make_fun3`) fun returns the typed
+  `error::unsupported_local_fun` — its inlined descriptor carries no module, 16-byte `uniq` or creator
+  pid, so a faithful image needs the module identity/MD5.
 - `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
   `beam_term::{map,bitstring}`; it currently decodes >32-key maps as oversized flat maps — switch to
   `map::write_map` (builder) + `map::map_pairs` (encode).
@@ -145,14 +164,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 
 ## Routing Table
 - `beam_common/` → foundation: `BeamError`/`Result`, version constants, config/feature flags, logging, `unsafe` convention (frozen, Stage 0)
-- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc` (frozen, Stage 0)
+- `beam_term/` → frozen tagged term representation, immediates, boxed terms, atom table, literal areas; `map` (HAMT builder), `bitstring`, `refc`, `fun` (local/export/imported fun interior) (frozen, Stage 0)
 - `beam_alloc/` → allocators (`erts_alloc` replacement): carriers, size classes, process heap/bump allocator; `RefCount`, `RefcBinary` (off-heap refcounted binary)
 - `beam_abi/` → NIF C ABI (`enif_*`) + driver C ABI (`driver_*`/`erl_drv_*`), layout-frozen structs
 - `beam_codec/` → External Term Format (ETF) encode/decode, `VERSION_MAGIC 131`
 - `beam_dist/` → distribution protocol v6 (`DFLAG_*`/`DOP_*`), handshake, `epmd`
 - `beam_loader/` → `.beam` parsing, loader, `ops.tab` transforms, typed block-structured IR
 - `beam_engine/` → typed IR execution, direct-threaded interpreter, BeamAsm + Cranelift JIT tiers, `ExecutionContext` seam
-- `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4)
+- `beam_gc/` → per-process generational copying GC, `OffHeap` (MSO + refc binaries) sweep, heap sizing (Stage 4); copies fun blocks by the `beam_term::fun` descriptor layout
 - `beam_message/` → copy engine (`copy_struct`) + messaging (send/receive, fragments)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations
@@ -165,9 +184,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 
 ## Status (Milestone 1)
 - **All 15 crates architected, implemented and tested.** `cargo build --manifest-path
-  erts_rust/Cargo.toml --workspace` is warning-free; per-crate suites are green (one pre-existing
-  failure lives outside this node's crates — see Known Structural Debt).
-- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
+  erts_rust/Cargo.toml --workspace` is warning-free and `cargo test --manifest-path
+  erts_rust/Cargo.toml --workspace` is fully green (every suite passes; no allowlisted failures).
+- **Real-module LOAD coverage is complete for the installed OTP:** both `beam_loader`'s
+  `tests/real_modules.rs` and `beam_engine`'s `tests/stdlib_sweep.rs` assert that **all 261**
+  installed `stdlib`/`kernel`/`compiler` `.beam` modules load (stdlib=98, kernel=104, compiler=59),
+  with no allowlist.- **Vertical slice WORKS end-to-end**: `beam_loader` + `beam_engine` + `beam_rt` load a real `.beam`
   (fixture `beam_loader/tests/fixtures/slice.beam`, built with the system `erlc`) and execute it:
   `beam_rt run <slice.beam> slice:add/2 2 3` → `5`; `slice:fib/1 10` → `55`. The interpreter's
   supported opcode/operand subset is documented honestly in `beam_engine/CONTEXT.md` (the `Generic`
@@ -193,14 +215,12 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
-- Pre-existing test failure OUTSIDE this node (fails identically at the pre-work baseline):
-  `beam_bifs::binconv::tests::binary_terms_are_the_documented_codec_gap` — belongs to the
-  `beam_bifs`/`beam_codec` nodes.
 - Repo-root owned (outside this node): a stray tracked 2 MB `erl_crash.dump`; owed `../../CHANGE.md`
   entries for the `beam_term` foundation extensions (`map`/`bitstring`/`refc`), the `RefCount` move into
-  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, and the
-  `beam_abi` frozen-header seam work.
-
+  `beam_alloc` + the `RefcBinary` off-heap seam, `beam_gc::OffHeap` now owning refc binaries, the
+  `beam_abi` frozen-header seam work, and the fun/export literal work (`beam_term::fun` layout;
+  `beam_codec` `EXPORT_EXT`/`NEW_FUN_EXT` decode+encode with the `size`-field and env-order rules and the
+  `Local`-fun encode gap; `beam_gc` fun block sizing).
 ## Design Decisions
 - **Error interop is owned upstream, not duplicated.** `beam_term` already declares (but does not
   yet use) its `beam_common` dependency. The `From<beam_term::TermError> for beam_common::BeamError`

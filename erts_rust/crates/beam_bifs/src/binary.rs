@@ -2,7 +2,14 @@
 //! `list_to_bin/1`, `bin_to_list/1,2,3`, `decode_unsigned/1,2`,
 //! `encode_unsigned/1,2`, `first/1`, `last/1`, `split/2,3`,
 //! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
-//! `longest_common_suffix/1`).
+//! `longest_common_suffix/1`) **and** the four `erlang` iolist/bitstring BIFs
+//! built on the same C machinery — `iolist_to_binary/1`, `iolist_size/1` and
+//! `list_to_bitstring/1` (`../../erts/emulator/beam/erl_iolist.c`) plus
+//! `split_binary/2` (`../../erts/emulator/beam/binary.c:476`).
+//!
+//! Note the two distinct "split" BIFs: `binary:split/2,3` (a *pattern* split,
+//! returning a list) and `erlang:split_binary/2` (a *position* split, returning a
+//! `{Before, After}` tuple).
 //!
 //! Ground truth (read-only): [`../../erts/emulator/beam/erl_bif_binary.c`]
 //! (`binary_at_2`, `erts_binary_part`, `do_binary_copy`, `start_longest_common`,
@@ -39,7 +46,26 @@
 //! * `list_to_bin([1,[2,[3]]])` ⇒ `<<1,2,3>>`, `list_to_bin([<<1,2>>,3])` ⇒
 //!   `<<1,2,3>>`, `list_to_bin([])` ⇒ `<<>>`; a byte outside `0..=255`, a
 //!   non-byte-aligned binary leaf, an improper tail, a non-list *top level*
-//!   (`list_to_bin(<<1,2>>)` ⇒ `badarg`) ⇒ `badarg`.
+//!   (`list_to_bin(<<1,2>>)` ⇒ `badarg`) ⇒ `badarg`. An improper cons tail that is
+//!   a **bitstring** is a valid iolist (`list_to_bin([1|<<2>>])` ⇒ `<<1,2>>`, the
+//!   `erl_iolist.c` cons-tail rule).
+//! * `iolist_to_binary([<<"ab">>,[99],$d])` ⇒ `<<"abcd">>`,
+//!   `iolist_to_binary([1|<<2>>])` ⇒ `<<1,2>>`, `iolist_to_binary(<<1,2,3>>)` ⇒
+//!   `<<1,2,3>>` (a bare byte-aligned binary is accepted, unlike `list_to_bin/1`);
+//!   an out-of-range byte, a bare atom/integer, a non-byte-aligned bitstring leaf
+//!   (`[<<1:3>>]`) and a bare non-byte-aligned bitstring ⇒ `badarg`.
+//! * `iolist_size([<<"ab">>,[99]])` ⇒ `3`, `iolist_size([1,2|<<3>>])` ⇒ `3`,
+//!   `iolist_size(<<1,2,3>>)` ⇒ `3`; the same `badarg` set as `iolist_to_binary/1`.
+//! * `list_to_bitstring([<<1:3>>])` ⇒ `<<1:3>>`,
+//!   `list_to_bitstring([<<1:3>>,<<1:5>>])` ⇒ `<<"!">>`,
+//!   `list_to_bitstring([<<1:3>>,255])` ⇒ `<<63,7:3>>` (bit-level concatenation);
+//!   a non-list top level (`list_to_bitstring(<<1:3>>)`), a bad byte and a bad leaf
+//!   ⇒ `badarg`.
+//! * `split_binary(<<"abcd">>,2)` ⇒ `{<<"ab">>,<<"cd">>}`, `(_,0)` ⇒
+//!   `{<<>>, <the whole binary>}`, `(_, ByteSize)` ⇒ `{<the whole binary>, <<>>}`;
+//!   a non-binary subject, a non-integer/negative position and `Position >
+//!   byte_size(Binary)` ⇒ `badarg` (and the bound is `bit_size / 8`, so
+//!   `split_binary(<<1:9>>, 1)` ⇒ `{<<0>>, <<1:1>>}` while `(_, 2)` ⇒ `badarg`).
 //! * `decode_unsigned(<<>>)` ⇒ `0`, `(<<1,0>>)` ⇒ `256`, `(<<1,0>>, little)` ⇒ `1`,
 //!   `(<<0,0,1,0>>)` ⇒ `256` (leading zeros are stripped); a non-byte-aligned
 //!   bitstring or a non-binary ⇒ `badarg`.
@@ -86,6 +112,7 @@
 //!   `binary.erl` wrapper's observable behaviour (verified against the oracle for
 //!   every case below). They are *not* `bif.tab` entries.
 
+use beam_codec::term as codec_term;
 use beam_common::Result;
 use beam_term::{atom_val, signed_value, Eterm};
 
@@ -432,21 +459,98 @@ fn do_copy(ctx: &mut BifContext<'_>, subject: Eterm, count: u64) -> Result<Eterm
 fn list_to_bin_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     // `list_to_bitstring` requires a list at the top level: a bare binary is
     // `badarg` (`list_to_bin(<<1,2>>)` ⇒ `badarg`).
-    if !access::is_nil(args[0]) && !access::is_list(args[0]) {
-        return Err(badarg());
-    }
-    let mut out = Vec::new();
-    collect_iolist(args[0], &mut out)?;
-    bits::make_binary(ctx.heap(), &out)
+    let bytes = collect_byte_unit(args[0])?;
+    bits::make_binary(ctx.heap(), &bytes)
 }
 
-/// Flattens an iolist into `out` (an explicit work stack, so a deeply nested list
-/// cannot overflow the Rust stack).
+// ---------------------------------------------------------------------------
+// The `erlang` iolist family (`iolist_to_binary/1`, `iolist_size/1`,
+// `list_to_bitstring/1`) and `erlang:split_binary/2`
+// ---------------------------------------------------------------------------
+
+/// The unit of an iolist walk (`erl_iolist.c`'s `Unit`).
 ///
-/// A leaf must be a byte (`0..=255`) or a **byte-aligned** binary; a cons tail
-/// must itself be `[]` or a cons (an improper iolist is `badarg`, `[1|2]` ⇒
-/// `badarg`), and any other term is `badarg`.
-fn collect_iolist(root: Eterm, out: &mut Vec<u8>) -> Result<()> {
+/// * `Byte` (`Unit = 8`) — `erlang:iolist_to_binary/1` and
+///   `erlang:iolist_size/1`: every bitstring leaf must be **byte aligned** and the
+///   result is a binary.
+/// * `Bit` (`Unit = 1`) — `erlang:list_to_bitstring/1`: a leaf may be a bitstring
+///   of *any* bit size and the pieces are concatenated bit by bit.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Unit {
+    Byte,
+    Bit,
+}
+
+/// A growable MSB-first bit buffer.
+///
+/// The packed form is exactly what [`crate::bits::make_bitstring`] consumes: bit
+/// `i` is bit `7 - (i % 8)` of `bytes[i / 8]`, the bits after `len` in the final
+/// byte stay zero, and `bytes.len() == len.div_ceil(8)`.
+struct BitBuf {
+    bytes: Vec<u8>,
+    len: usize,
+}
+
+impl BitBuf {
+    fn new() -> Self {
+        Self { bytes: Vec::new(), len: 0 }
+    }
+
+    /// Appends one bit.
+    fn push(&mut self, bit: bool) {
+        if self.len % 8 == 0 {
+            self.bytes.push(0);
+        }
+        if bit {
+            let last = self.bytes.len() - 1;
+            self.bytes[last] |= 0x80 >> (self.len % 8);
+        }
+        self.len += 1;
+    }
+
+    /// Appends a whole byte (8 bits).
+    fn push_byte(&mut self, byte: u8) {
+        if self.len % 8 == 0 {
+            self.bytes.push(byte);
+            self.len += 8;
+        } else {
+            for shift in (0..8).rev() {
+                self.push((byte >> shift) & 1 == 1);
+            }
+        }
+    }
+
+    /// Appends the `size_bits` bits of `bytes` starting at bit `offset`.
+    ///
+    /// `bytes` is the storage **byte** slice and `offset` the bit offset into it
+    /// (the shape [`beam_codec::term::bitstring_bytes`] returns), so bit `i` of the
+    /// appended run is bit `7 - ((offset + i) % 8)` of `bytes[(offset + i) / 8]`.
+    fn push_bitstring(&mut self, bytes: &[u8], offset: usize, size_bits: usize) {
+        if offset % 8 == 0 && size_bits % 8 == 0 && self.len % 8 == 0 {
+            let first = offset / 8;
+            self.bytes.extend_from_slice(&bytes[first..first + size_bits / 8]);
+            self.len += size_bits;
+        } else {
+            for i in 0..size_bits {
+                let bit = offset + i;
+                self.push((bytes[bit / 8] >> (7 - (bit % 8))) & 1 == 1);
+            }
+        }
+    }
+}
+
+/// Flattens an iolist into `buf`, rejecting an invalid element with `badarg`.
+///
+/// The walk mirrors `erl_iolist.c`'s `generic_iolist_size`/`generic_iolist_copy`:
+/// a list element is a byte (`0..=255`), a bitstring, or a nested list; a cons
+/// **tail** may also be `[]`, a cons, or a bitstring (`[1|<<2>>]` is a valid
+/// iolist), and anything else is `badarg`. Under [`Unit::Byte`] a bitstring leaf
+/// whose bit size is not a whole number of bytes is `badarg`
+/// (`iolist_to_binary([<<1:3>>])`); under [`Unit::Bit`] any bit size is accepted.
+///
+/// The walk uses an explicit work stack, so a deeply nested list cannot overflow
+/// the Rust stack.
+fn collect_iolist_units(root: Eterm, unit: Unit, buf: &mut BitBuf) -> Result<()> {
     let mut stack = vec![root];
     while let Some(term) = stack.pop() {
         if access::is_nil(term) {
@@ -457,16 +561,20 @@ fn collect_iolist(root: Eterm, out: &mut Vec<u8>) -> Result<()> {
             if !(0..=255).contains(&byte) {
                 return Err(badarg());
             }
-            out.push(byte as u8);
+            buf.push_byte(byte as u8);
             continue;
         }
         if bits::is_bitstring(term) {
-            out.extend_from_slice(&bits::bytes(term)?);
+            if unit == Unit::Byte && bits::bit_size(term)? % 8 != 0 {
+                return Err(badarg());
+            }
+            let (bytes, offset, size_bits) = codec_term::bitstring_bytes(term)?;
+            buf.push_bitstring(bytes, offset, size_bits);
             continue;
         }
         if access::is_list(term) {
             let tail = access::cdr(term);
-            if !access::is_nil(tail) && !access::is_list(tail) {
+            if !access::is_nil(tail) && !access::is_list(tail) && !bits::is_bitstring(tail) {
                 return Err(badarg());
             }
             // Push the tail first so the head is processed next (LIFO).
@@ -477,6 +585,107 @@ fn collect_iolist(root: Eterm, out: &mut Vec<u8>) -> Result<()> {
         return Err(badarg());
     }
     Ok(())
+}
+
+/// Flattens a [`Unit::Byte`] iolist whose top level must be a list or `[]` — the
+/// shared body of `binary:list_to_bin/1` and `erlang:iolist_to_binary/1`.
+///
+/// Every element of a `Byte`-unit iolist is a whole number of bytes, so the packed
+/// buffer's bytes are the result's bytes verbatim.
+fn collect_byte_unit(root: Eterm) -> Result<Vec<u8>> {
+    if !access::is_nil(root) && !access::is_list(root) {
+        return Err(badarg());
+    }
+    let mut buf = BitBuf::new();
+    collect_iolist_units(root, Unit::Byte, &mut buf)?;
+    Ok(buf.bytes)
+}
+
+/// `iolist_to_binary(IoListOrBinary)` (`erl_iolist.c:916`).
+///
+/// Unlike `erlang:list_to_binary/1`, a **bare** byte-aligned binary is a valid
+/// argument (`iolist_to_binary(<<1,2,3>>)` ⇒ `<<1,2,3>>`); a bare *non-byte-aligned*
+/// bitstring is `badarg`.
+fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let root = args[0];
+    if bits::is_bitstring(root) {
+        if bits::bit_size(root)? % 8 != 0 {
+            return Err(badarg());
+        }
+        return Ok(root);
+    }
+    let bytes = collect_byte_unit(root)?;
+    bits::make_binary(ctx.heap(), &bytes)
+}
+
+/// `iolist_size(IoListOrBinary)` (`erl_iolist.c:1084`) — the byte size of the
+/// binary `iolist_to_binary/1` would build.
+///
+/// Both the argument rules and the `badarg` cases are `iolist_to_binary/1`'s (a
+/// bare byte-aligned binary is accepted, a non-byte-aligned one is `badarg`).
+/// Milestone-1 computes the size by flattening, so a size that leaves the 60-bit
+/// small range cannot arise (the destination heap always bounds it).
+fn iolist_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let root = args[0];
+    let size = if bits::is_bitstring(root) {
+        let size_bits = bits::bit_size(root)?;
+        if size_bits % 8 != 0 {
+            return Err(badarg());
+        }
+        size_bits / 8
+    } else {
+        collect_byte_unit(root)?.len()
+    };
+    ctx.int(size as i64)
+}
+
+/// `list_to_bitstring(List)` (`erl_iolist.c:930`) — the `Unit = 1` variant of
+/// `list_to_binary/1`: a leaf may be a bitstring of any bit size and the pieces are
+/// concatenated bit by bit (`list_to_bitstring([<<1:3>>, <<1:5>>])` ⇒ `<<"!">>`,
+/// `list_to_bitstring([<<1:3>>, 255])` ⇒ `<<63,7:3>>`).
+///
+/// The top level must be a list or `[]` (`list_to_bitstring(<<1:3>>)` ⇒ `badarg`),
+/// and an invalid leaf is `badarg` exactly as for the `Byte` unit.
+fn list_to_bitstring_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let root = args[0];
+    if !access::is_nil(root) && !access::is_list(root) {
+        return Err(badarg());
+    }
+    let mut buf = BitBuf::new();
+    collect_iolist_units(root, Unit::Bit, &mut buf)?;
+    bits::make_bitstring(ctx.heap(), &buf.bytes, buf.len)
+}
+
+/// `split_binary(Binary, Position)` (`binary.c:476`) — `{Before, After}` where
+/// `Before` holds the first `Position` bytes and `After` the remainder.
+///
+/// `Position` is a whole **byte** count and must satisfy
+/// `Position =< bit_size(Binary) / 8` (the C `term_to_Uint` + `size / 8` bound), so
+/// `Before` is always byte aligned while `After` may keep a trailing partial byte
+/// (`split_binary(<<1:9>>, 1)` ⇒ `{<<0>>, <<1:1>>}`). A non-bitstring subject, a
+/// non-integer/negative `Position` and an out-of-range `Position` are all `badarg`.
+fn split_binary_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    if !bits::is_bitstring(args[0]) {
+        return Err(badarg());
+    }
+    // `term_to_Uint`: a non-integer (a float, an atom, a binary, …) is `badarg`;
+    // a negative integer fails the conversion too.
+    let Some(split_at) = as_uint(args[1]) else {
+        return Err(badarg());
+    };
+    let size_bits = bits::bit_size(args[0])?;
+    if split_at > (size_bits / 8) as u64 {
+        return Err(badarg());
+    }
+    let split_bits = (split_at as usize) * 8;
+    let (bytes, offset, _) = codec_term::bitstring_bytes(args[0])?;
+    let mut before = BitBuf::new();
+    before.push_bitstring(bytes, offset, split_bits);
+    let mut after = BitBuf::new();
+    after.push_bitstring(bytes, offset + split_bits, size_bits - split_bits);
+    let before = bits::make_bitstring(ctx.heap(), &before.bytes, before.len)?;
+    let after = bits::make_bitstring(ctx.heap(), &after.bytes, after.len)?;
+    ctx.tuple(&[before, after])
 }
 
 /// Builds the list `[B0, B1, …]` of the bytes in `bytes`.
@@ -822,7 +1031,15 @@ fn common_edge(ctx: &mut BifContext<'_>, list: Eterm, from_end: bool) -> Result<
 }
 
 /// Registers the `binary` module BIFs.
+///
+/// Also registers the four **`erlang`** iolist/bitstring BIFs that belong to the
+/// same `erl_iolist.c`/`binary.c` machinery — `iolist_to_binary/1`,
+/// `iolist_size/1`, `list_to_bitstring/1` and `split_binary/2`.
 pub(crate) fn register(reg: &mut BifRegistry) {
+    reg.register("erlang", "iolist_to_binary", 1, iolist_to_binary_1);
+    reg.register("erlang", "iolist_size", 1, iolist_size_1);
+    reg.register("erlang", "list_to_bitstring", 1, list_to_bitstring_1);
+    reg.register("erlang", "split_binary", 2, split_binary_2);
     reg.register("binary", "at", 2, at);
     reg.register("binary", "part", 2, part_2);
     reg.register("binary", "part", 3, part_3);
@@ -1732,6 +1949,17 @@ mod tests {
         ] {
             assert!(reg.contains("binary", name, arity), "missing binary:{name}/{arity}");
         }
-        assert_eq!(reg.len(), 23);
+        // The `erlang` iolist/bitstring BIFs registered alongside the `binary`
+        // module (`bif.tab`: `bif erlang:iolist_to_binary/1`, `iolist_size/1`,
+        // `list_to_bitstring/1`, `split_binary/2`).
+        for (name, arity) in [
+            ("iolist_to_binary", 1),
+            ("iolist_size", 1),
+            ("list_to_bitstring", 1),
+            ("split_binary", 2),
+        ] {
+            assert!(reg.contains("erlang", name, arity), "missing erlang:{name}/{arity}");
+        }
+        assert_eq!(reg.len(), 27);
     }
 }
