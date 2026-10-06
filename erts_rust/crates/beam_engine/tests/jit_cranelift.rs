@@ -148,8 +148,48 @@ fn select_and_jump_paths_match_the_interpreter() {
 }
 
 #[test]
-fn a_raising_bif_propagates_the_same_typed_error() {
-    // `add/2`'s arithmetic BIF has no fail label, so a failure is a raise; the helper
+fn the_inlined_subset_agrees_over_a_wide_input_range() {
+    // The tier inlines the metadata no-ops, `move`, `jump` and the small-int
+    // `erlang:'+'/2`/`'-'/2` fast path, and routes everything else through the shared
+    // `jit_step_one` helper plus the pc-block CFG's continuation dispatch. Running the
+    // same exports over many inputs exercises every one of those paths (the inlined
+    // fast path, its guard's rejection/deopt, the cross-function call/return
+    // dispatch and the fall-through chain) and pins that none of them changes the
+    // observable result.
+    for a in -40i64..=40 {
+        for b in -40i64..=40 {
+            let args = [make_small(a), make_small(b)];
+            assert_eq!(
+                agree("add", 2, &args),
+                make_small(a + b),
+                "add({a}, {b}) on the inlined fast path"
+            );
+        }
+    }
+    // `fib/1` is the cross-function case: its native body `call`s into `fib/3` and
+    // `return`s through the frame's continuation, so the helper's `(func, pc)` word
+    // must resolve to the right block — or go back to the driver — every time.
+    for n in 0i64..=16 {
+        assert_eq!(agree("fib", 1, &[make_small(n)]), slice_fib(n), "fib({n})");
+    }
+}
+
+/// The oracle value of `fib(n)` (the `slice.beam` fixture's own recursion), used to
+/// pin the tier's agreement test against an independently computed value rather than
+/// only against the interpreter.
+fn slice_fib(n: i64) -> Eterm {
+    fn fib(n: i64) -> i64 {
+        if n < 2 {
+            n
+        } else {
+            fib(n - 1) + fib(n - 2)
+        }
+    }
+    make_small(fib(n))
+}
+
+#[test]
+fn a_raising_bif_propagates_the_same_typed_error() {    // `add/2`'s arithmetic BIF has no fail label, so a failure is a raise; the helper
     // returns the `ERROR` word and the driver must hand back exactly that error.
     let bad = beam_term::NIL;
     let interpreted = run_on_tier(Tier::Interpreter, "add", 2, &[bad, make_small(1)])
