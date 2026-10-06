@@ -105,7 +105,10 @@ fn binary_to_term_interns_atoms_inside_a_map() {
     let reg = default_registry();
     let mut heap = Heap::new(4096).expect("test heap");
     let atoms = seeded_atoms();
-    assert!(atoms.lookup("a").is_some(), "the premise: the map key is interned");
+    assert!(
+        atoms.lookup("a").is_some(),
+        "the premise: the map key is interned"
+    );
 
     let shared = Rc::new(RefCell::new(atoms.clone()));
     let term = {

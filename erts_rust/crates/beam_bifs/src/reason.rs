@@ -295,9 +295,7 @@ mod tests {
 
         let foo = ctx.atom("foo").expect("seeded");
         let tru = ctx.atom("true").expect("seeded");
-        let meta = ctx
-            .list(&[make_small(1), make_small(2)])
-            .expect("fits");
+        let meta = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
 
         // `erlang:nif_error(foo, [1,2])` ⇒ `error:foo`.
         assert_eq!(
