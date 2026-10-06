@@ -30,6 +30,13 @@ fn seeded_atoms() -> AtomTable {
         "cat",
         "spawn",
         "connected",
+        "links",
+        "id",
+        "input",
+        "output",
+        "os_pid",
+        "monitors",
+        "stream",
         "no_such_item",
     ]);
     atoms
@@ -145,13 +152,14 @@ fn port_close_returns_true_and_closes_the_hooks_port() {
 }
 
 #[test]
-fn port_info_1_is_the_pair_list_and_port_info_2_selects_or_falls_back_to_undefined() {
+fn port_info_1_is_the_pair_list_and_port_info_2_selects_or_is_badarg() {
     let reg = default_registry();
     let mut heap = Heap::new(4096).expect("test heap");
     let atoms = seeded_atoms();
     let port = PortId::new(7).to_eterm();
 
-    // The pair list the mock hook holds: `{name, "cat"}` and `{connected, 1}`.
+    // The pair list the mock hook holds: `{name, "cat"}` and `{connected, 1}`. Both
+    // keys are `/1` items, so `/1` keeps both.
     let info = {
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
         let name = ctx.atom("name").expect("seeded");
@@ -177,9 +185,7 @@ fn port_info_1_is_the_pair_list_and_port_info_2_selects_or_falls_back_to_undefin
             .expect("port_info/2");
 
         let nosuch = ctx.atom("no_such_item").expect("seeded");
-        let missing = reg
-            .call("erlang", "port_info", 2, &mut ctx, &[port, nosuch])
-            .expect("port_info/2");
+        let missing = reg.call("erlang", "port_info", 2, &mut ctx, &[port, nosuch]);
         (all, named, missing)
     };
 
@@ -197,8 +203,167 @@ fn port_info_1_is_the_pair_list_and_port_info_2_selects_or_falls_back_to_undefin
         assert!(beam_term::compare::eq(all, expected, ctx.atoms()));
     }
 
-    assert_eq!(atoms.name(atom_val(missing)), Some("undefined"));
-    assert!(is_list(named), "port_info/2 returns the matching value");
+    // `port_info/2` returns the 2-tuple `{Item, Value}`, not the bare value.
+    {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let name = ctx.atom("name").expect("seeded");
+        let cat = ctx.list(&[ctx.int(99).expect("fits")]).expect("fits");
+        let expected = ctx.tuple(&[name, cat]).expect("fits");
+        assert!(beam_term::compare::eq(named, expected, ctx.atoms()));
+        assert_eq!(beam_codec::term::tuple_arity(named).expect("a 2-tuple"), 2);
+    }
+
+    // An item matching no pair is `badarg` (never the atom `undefined`).
+    assert!(matches!(missing, Err(BeamError::BadArg)));
+}
+
+/// `erlang:port_info/1` reports **only** the seven `/1` items — `name`, `links`, `id`,
+/// `connected`, `input`, `output`, `os_pid` — dropping every `/2`-only extra
+/// (`monitors`), an item the oracle does not know (`stream`) and a non-atom key.
+#[test]
+fn port_info_1_keeps_only_the_seven_items() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let port = PortId::new(7).to_eterm();
+
+    // The hook's pair list in the oracle's `/1` order, then the three keys `/1` must
+    // drop.
+    let info = {
+        let ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let mut pairs = Vec::new();
+        for (i, item) in [
+            "name", "links", "id", "connected", "input", "output", "os_pid", "monitors",
+            "stream",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = ctx.atom(item).expect("seeded");
+            let value = ctx.int(i as i64 + 1).expect("fits");
+            pairs.push((key, value));
+        }
+        let one = ctx.int(1).expect("fits");
+        pairs.push((one, one));
+        pairs
+    };
+    let mut hook = MockPorts::new(info);
+
+    let all = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_port_hook(&mut hook);
+        reg.call("erlang", "port_info", 1, &mut ctx, &[port])
+            .expect("port_info/1")
+    };
+
+    // Exactly the seven `/1` items, in hook order.
+    {
+        let mut heap = Heap::new(65536).expect("test heap");
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let mut pairs = Vec::new();
+        for (i, item) in [
+            "name",
+            "links",
+            "id",
+            "connected",
+            "input",
+            "output",
+            "os_pid",
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let key = ctx.atom(item).expect("seeded");
+            let value = ctx.int(i as i64 + 1).expect("fits");
+            pairs.push(ctx.tuple(&[key, value]).expect("fits"));
+        }
+        let expected = ctx.list(&pairs).expect("fits");
+        assert!(
+            beam_term::compare::eq(all, expected, ctx.atoms()),
+            "port_info/1 must be exactly the seven /1 items"
+        );
+    }
+}
+
+/// `erlang:port_info/2` searches **every** hook pair (including the `/2`-only items
+/// `/1` filters out) and is `error:badarg` when nothing matches — for an unknown
+/// atom, for an item the oracle does not know, and for a non-atom item.
+#[test]
+fn port_info_2_searches_every_pair_and_is_badarg_when_nothing_matches() {
+    let reg = default_registry();
+    let mut heap = Heap::new(65536).expect("test heap");
+    let atoms = seeded_atoms();
+    let port = PortId::new(7).to_eterm();
+
+    // Two `/1` items and one `/2`-only item.
+    let info = {
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let name = ctx.atom("name").expect("seeded");
+        let cat = ctx.list(&[ctx.int(99).expect("fits")]).expect("fits");
+        let connected = ctx.atom("connected").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let monitors = ctx.atom("monitors").expect("seeded");
+        vec![(name, cat), (connected, one), (monitors, NIL)]
+    };
+    let mut hook = MockPorts::new(info);
+
+    let (monitors_pair, all) = {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_port_hook(&mut hook);
+
+        // A `/2`-only key is found by `/2` ...
+        let monitors = ctx.atom("monitors").expect("seeded");
+        let monitors_pair = reg
+            .call("erlang", "port_info", 2, &mut ctx, &[port, monitors])
+            .expect("port_info/2 monitors");
+        // ... but `/1` drops it.
+        let all = reg
+            .call("erlang", "port_info", 1, &mut ctx, &[port])
+            .expect("port_info/1");
+
+        // An item the oracle does not know, an unknown atom and a non-atom item are
+        // all `badarg` (the registry surfaces the BIF's `error:badarg`).
+        let stream = ctx.atom("stream").expect("seeded");
+        assert!(matches!(
+            reg.call("erlang", "port_info", 2, &mut ctx, &[port, stream]),
+            Err(BeamError::BadArg)
+        ));
+        let nosuch = ctx.atom("no_such_item").expect("seeded");
+        assert!(matches!(
+            reg.call("erlang", "port_info", 2, &mut ctx, &[port, nosuch]),
+            Err(BeamError::BadArg)
+        ));
+        let one = ctx.int(1).expect("fits");
+        assert!(matches!(
+            reg.call("erlang", "port_info", 2, &mut ctx, &[port, one]),
+            Err(BeamError::BadArg)
+        ));
+        (monitors_pair, all)
+    };
+
+    // `/2` of `monitors` is the 2-tuple `{monitors, []}`.
+    {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let monitors = ctx.atom("monitors").expect("seeded");
+        let expected = ctx.tuple(&[monitors, NIL]).expect("fits");
+        assert!(beam_term::compare::eq(monitors_pair, expected, ctx.atoms()));
+    }
+
+    // `/1` is `[{name, "cat"}, {connected, 1}]` — `monitors` is absent.
+    {
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let name = ctx.atom("name").expect("seeded");
+        let cat = ctx.list(&[ctx.int(99).expect("fits")]).expect("fits");
+        let connected = ctx.atom("connected").expect("seeded");
+        let one = ctx.int(1).expect("fits");
+        let pair_1 = ctx.tuple(&[name, cat]).expect("fits");
+        let pair_2 = ctx.tuple(&[connected, one]).expect("fits");
+        let expected = ctx.list(&[pair_1, pair_2]).expect("fits");
+        assert!(beam_term::compare::eq(all, expected, ctx.atoms()));
+    }
 }
 
 #[test]
