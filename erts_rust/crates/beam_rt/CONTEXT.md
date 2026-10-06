@@ -420,6 +420,7 @@ A capability gap is **uncatchable**: `src/eval/mod.rs`'s `flow_from_error` turns
 * `tests/port_wake.rs` → the **port → mailbox wake** proof (only the port poller, never an explicit `send`, drives `deliver_port_messages` + `resume_woken`)
 * `tests/fixtures/{mailbox,sched,port_recv}.{erl,beam}` → the committed system-`erlc` oracle fixtures + their regeneration recipe and oracle table (`fixtures/README.md`)
 * `tests/multimodule.rs` → the multi-module host test (compiles a fixture with the system `erlc`; skips loudly without a system stdlib)
+* `tests/nif.rs` → the NIF end-to-end test (contract A.3): compiles a real C NIF `.so` + two Erlang modules with the host `cc`/`erlc`, drives load/call/failure/reload through the built binary, and proves the `enif_*` dynamic symbol export with `nm -D` (skips loudly without a compiler/header/`erlc`/`nm`)
 * `../beam_engine/src/context.rs` → the `ExecutionContext` seam this crate implements (read it; do not change)
 * `../beam_bifs/` → the `BifRegistry`/`BifContext`/sinks this crate drives (read-only)
 * `../beam_loader/tests/fixtures/slice.beam` → the shared oracle fixture reused by the slice tests (read-only)
