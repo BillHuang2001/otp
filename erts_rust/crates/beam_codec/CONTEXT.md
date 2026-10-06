@@ -236,10 +236,13 @@ V4_PORT_EXT`** with the full 64-bit id, as the C encoder does — `102`/`89` are
 `term/binary.rs`; encode emits `109` for a byte-aligned bitstring and `77` otherwise),
 `116` (maps of **any** pair count — every map is stored as a flatmap; the interior
 flatmap/hashmap switchover is an *open* layout this crate deliberately collapses, see
-§Term-layout ownership), `82` (atom cache refs, decode only), `80 COMPRESSED` (the top-level zlib
+§Term-layout ownership), `82` (atom cache refs — decoded through an attached `AtomCache`; emitted
+whenever an `AtomCacheWriter` is attached), `80 COMPRESSED` (the top-level zlib
 wrapper — inflated in `decode_term`; encode emits it only through the explicit
 `encode_term_compressed`/`encode_term_body_compressed`/`Encoder::finish_compressed` entry points, never
-by default), `112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
+by default), `121 LOCAL_EXT` (the `term_to_binary/2 [local]` wrapper — decoded inline by consuming the
+4-byte node hash and continuing; encoded via `encode_term_local`/`Encoder::finish_local`),
+`112 NEW_FUN_EXT` / `113 EXPORT_EXT` (funs — see §Fun encodings).
 **Explicit, documented `unsupported` error (recognized tag, implementation pending — never a wrong
 result):** `67 RECORD` (legacy native record term), `121 LOCAL` (needs local-node identity), `68`
 (distribution header — `beam_dist`'s); plus any atom name not representable in the emitted encoding.
