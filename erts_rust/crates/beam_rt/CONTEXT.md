@@ -277,7 +277,8 @@ a **directory module**, split by responsibility:
 * `src/native/init.rs` — `init:get_argument/1`, `init:get_arguments/0`, `init:get_plain_arguments/0`,
   `init:get_status/0` (→ `{starting, started}`, the terminal boot state).
 * `src/native/code.rs` — `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`
-  (→ `{file, Path}` / atom `preloaded` / atom `false`), `code:is_sticky/1` (boolean) and `code:is_sticky/2`
+  (→ `{file, Path}` / atom `preloaded` / atom `false`; a module loaded from bytes with no recorded
+  path reports the empty string `""`, oracle-verified — never the atom `preloaded`), `code:is_sticky/1` (boolean) and `code:is_sticky/2`
   (an `error:undef` raise — the release does not have the `/2`), `code:ensure_loaded/1`
   (→ `{module, Mod}` / `{error, nofile}`), `code:lib_dir/0,1`, `code:root_dir/0` (the parent of
   `lib_dir/0`, i.e. the installation root).
@@ -691,10 +692,14 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   blocked in `receive` waiting for a `{Port, {data, …}}` message stays `Waiting` (nothing drives the
   poller from the process mailbox). The read is **one** `Read::read` per readiness (one message per read,
   not a stream coalesced per driver callback); **stdin and stderr are never read** (they are pipes, but
-  nothing consumes them); `port_command/2` does not exist (it is on the known-unimplemented list), so
-  nothing is ever written to the child's stdin; `connected` flips to `false` only at `port_close/1`,
-  not when the child exits by itself; `exit_status`/`eof` are recognized but inert (their only
-  observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
+  nothing consumes them); `erlang:port_command/2,3` writes to the child's stdin (captured as
+  `LivePort.stdin`, `PortRegistry::write_command`; `src/native/port.rs`), accepting a binary / char
+  list / nested iolist and returning `true`, `BadArg` for a non-port or an unknown/closed id — the
+  `{fd, N}` form is a typed capability gap; `connected` flips to `false` only at `port_close/1`,
+  not when the child exits by itself; the `exit_status` option is honored — `poll_port_messages`
+  reaps the child (`Child::try_wait`, sliced at `EXIT_STATUS_POLL_SLICE` = 25 ms) and emits one
+  `{Port, {exit_status, Status}}` message (`Status` = `code()` else `128 + signal()`); `eof` is still
+  inert (its only observable form is a `{Port, …}` message, which the poller does not synthesize); and a child that
   exits on its own is reaped only by `port_close/1` or at runtime exit. A `binary`-stream read wider
   than 64 bytes is the typed *unsupported* gap (no off-heap ref-counted binary build path yet).
   `os:cmd/1` remains the runtime-native host spawn, unchanged.
