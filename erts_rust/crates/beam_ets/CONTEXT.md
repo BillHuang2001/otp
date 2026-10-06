@@ -458,10 +458,11 @@ impl Table {
   `beam_bifs` `ets:lookup_element` bridge must route the multi kinds through `lookup_element_all` and
   build the list.
 - **Several `ets` operations are outside M1 scope** (all present in OTP 29): `update_element/4`,
-  `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `give_away/3`, `setopts/2`, `whereis/1`,
-  `table/1,2`, `slot/2`, `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1` and `ets:size/1`
-  do **not** exist in OTP 29, so their absence is correct — `ets:info(T, size)` is the supported
-  spelling). The `/3` limited forms are implemented but their opaque **continuation terms** and the
+  `select_reverse/*`, `foldl`/`foldr`, `rename/2`, `whereis/1`, `table/1,2`, `slot/2`,
+  `safe_fixtable/2`, `tab2file*`/`file2tab*`. (`ets:clear/1`, `ets:size/1` and
+  `ets:match_spec_test/2,3` do **not** exist in OTP 29 — calling `match_spec_test` raises
+  `error:undef` — so their absence is correct; `ets:info(T, size)` is the supported spelling of the
+  size query.) The `/3` limited forms are implemented but their opaque **continuation terms** and the
   bare-vs-`{Results,'$end_of_table'}` shaping are the `beam_bifs` bridge's (see the handoff below).
 - **The `TableAccess` view does not cover the new operations.** `select_replace`, the limited forms
   and `match_spec_run` are not yet exposed through `src/table/access.rs` (owned by another task), so an
