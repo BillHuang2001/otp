@@ -234,6 +234,11 @@ fn execute(
 }
 
 /// Run a module-run case: compile the embedded module, then compare the two runtimes.
+///
+/// The compile is memoized process-locally by `(erlc, module, source)` (see
+/// [`module_build::compile`]), so the corpus's handful of embedded sources is compiled once
+/// even though ~50 module-run cases each ask for it. Each case still gets its own temp dir
+/// (owning it through [`module_build::CompiledModule`]), so the per-case argv is unchanged.
 fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Result<CaseOutcome> {
     let Some(erlc) = module_build::resolve_erlc()? else {
         return Ok(skipped_module_outcome(context, case, run));

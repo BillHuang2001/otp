@@ -37,5 +37,63 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        Case {
+            id: "flags/bare_flag_has_no_value",
+            description: "a bare -flag with no argument is stored as an empty value list",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_bare_flag)",
+                extra_argv: &["-differential_bare_flag"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/absent_argument_is_error",
+            description: "an argument that was not passed is reported as the atom `error`",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(differential_absent_flag)",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok error"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/plain_arguments_are_empty",
+            description: "init:get_plain_arguments/0 excludes every modelled switch",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_plain_arguments()",
+                extra_argv: &[],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok []"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/pa_argument_is_stored",
+            description: "a -pa code-path switch is recorded verbatim for init:get_argument/1",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::Eval {
+                expr: "init:get_argument(pa)",
+                extra_argv: &["-pa", "/differential/xyz"],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[47,100,105,102,102,101,114,101,110,116,105,97,108,47,120,121,122]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
     ]
 }

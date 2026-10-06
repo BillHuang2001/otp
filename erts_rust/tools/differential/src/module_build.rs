@@ -10,11 +10,23 @@
 //! `$PATH`. When no `erlc` exists, [`resolve_erlc`] returns `Ok(None)`: the harness then
 //! **skips** the module-run case loudly (never a silent pass). A present `erlc` that fails
 //! to compile is a genuine tool failure (a loud error), not a skip.
+//!
+//! # Compile cache (iteration speed)
+//!
+//! The corpus compiles the *same* handful of embedded sources once per module-run case
+//! (~50 cases, 2 distinct sources), so [`compile`] memoizes the `erlc` output in a
+//! **process-local cache** keyed by `(erlc, module, source)`. A cache hit *materializes* a
+//! fresh per-case temp dir from the cached `.beam` bytes without spawning `erlc` again —
+//! the bytes, the argv and therefore every observable result are identical, only the
+//! redundant compiler process disappears. Each call still owns its own directory, removed
+//! by [`CompiledModule`]'s `Drop` exactly as before.
 
+use std::collections::HashMap;
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use crate::error::{Error, Result};
 use crate::runtime::{is_executable, output_with_retry};
@@ -97,24 +109,43 @@ impl Drop for CompiledModule {
 /// A missing `erlc` binary or a compile failure is a loud [`Error`] (the caller decides
 /// whether to run the case). On any failure the temp directory is removed before
 /// returning.
+///
+/// The `erlc` invocation is memoized process-locally by `(erlc, module, source)`: a repeat
+/// compile of the same source reuses the cached `.beam` bytes (see the module docs). The
+/// returned [`CompiledModule`] always names its **own** fresh temp dir and removes it on
+/// drop, whether it came from `erlc` or from the cache.
 pub fn compile(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule> {
-    let dir = unique_temp_dir(module);
-    let _ = std::fs::remove_dir_all(&dir);
-    std::fs::create_dir_all(&dir).map_err(|source| {
+    let key = CacheKey {
+        erlc: erlc.to_path_buf(),
+        module: module.to_string(),
+        source: source.to_string(),
+    };
+
+    if let Some(beam) = cached_beam(&key) {
+        return materialize(module, source, &beam);
+    }
+
+    let compiled = compile_with_erlc(erlc, source, module)?;
+    // Cache the artifact so the next case with the same source skips the compiler. A beam
+    // we cannot read afterwards cannot be run by either runtime either, so surface it loudly.
+    let beam = std::fs::read(compiled.beam()).map_err(|source| {
         Error::io(
-            format!("failed to create the module temp dir '{}'", dir.display()),
+            format!(
+                "failed to read the compiled beam '{}'",
+                compiled.beam().display()
+            ),
             source,
         )
     })?;
+    store_beam(key, beam);
+    Ok(compiled)
+}
 
+/// The uncached compile: run the real `erlc` into a fresh temp dir.
+fn compile_with_erlc(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule> {
+    let dir = fresh_temp_dir(module)?;
     let source_path = dir.join(format!("{module}.erl"));
-    if let Err(source) = std::fs::write(&source_path, source) {
-        let _ = std::fs::remove_dir_all(&dir);
-        return Err(Error::io(
-            format!("failed to write the module source '{}'", source_path.display()),
-            source,
-        ));
-    }
+    write_into_temp(&dir, &source_path, source.as_bytes())?;
 
     // `output_with_retry` absorbs the transient `ETXTBSY` fork/exec race: `erlc` may be a
     // freshly written wrapper script (e.g. a test stub), so a concurrent `fork()` in another
@@ -159,6 +190,81 @@ pub fn compile(erlc: &Path, source: &str, module: &str) -> Result<CompiledModule
     }
 
     Ok(CompiledModule { dir, beam })
+}
+
+/// A cache hit: write the *cached* `beam` bytes (plus the source, matching an `erlc`-built
+/// directory) into a fresh temp dir without spawning `erlc`.
+fn materialize(module: &str, source: &str, beam: &[u8]) -> Result<CompiledModule> {
+    let dir = fresh_temp_dir(module)?;
+    let source_path = dir.join(format!("{module}.erl"));
+    write_into_temp(&dir, &source_path, source.as_bytes())?;
+    let beam_path = dir.join(format!("{module}.beam"));
+    write_into_temp(&dir, &beam_path, beam)?;
+    Ok(CompiledModule {
+        dir,
+        beam: beam_path,
+    })
+}
+
+/// Create a fresh, empty temp dir for `module` (removing a stale one of the same name left
+/// by an earlier crashed run).
+fn fresh_temp_dir(module: &str) -> Result<PathBuf> {
+    let dir = unique_temp_dir(module);
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).map_err(|source| {
+        Error::io(
+            format!("failed to create the module temp dir '{}'", dir.display()),
+            source,
+        )
+    })?;
+    Ok(dir)
+}
+
+/// Write `bytes` to `path`; on failure remove the whole temp `dir` and fail loudly.
+fn write_into_temp(dir: &Path, path: &Path, bytes: &[u8]) -> Result<()> {
+    if let Err(source) = std::fs::write(path, bytes) {
+        let _ = std::fs::remove_dir_all(dir);
+        return Err(Error::io(
+            format!("failed to write '{}'", path.display()),
+            source,
+        ));
+    }
+    Ok(())
+}
+
+/// The identity of a compiled artifact: everything that determines its `.beam` bytes.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+struct CacheKey {
+    erlc: PathBuf,
+    module: String,
+    source: String,
+}
+
+/// The process-local compile cache: `(erlc, module, source) -> compiled `.beam` bytes.
+///
+/// It only ever short-circuits a redundant `erlc` spawn; the artifact handed to a case is
+/// still written into that case's own temp dir, so the cache cannot change what is observed.
+fn compile_cache() -> &'static Mutex<HashMap<CacheKey, Vec<u8>>> {
+    static CACHE: OnceLock<Mutex<HashMap<CacheKey, Vec<u8>>>> = OnceLock::new();
+    CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// The cache lock, recovering from a poisoned lock (only `HashMap` reads/inserts happen
+/// under it, so a recovered map is always consistent).
+fn cache_lock() -> MutexGuard<'static, HashMap<CacheKey, Vec<u8>>> {
+    compile_cache()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+/// A copy of the cached `.beam` bytes for `key`, or `None` on a miss.
+fn cached_beam(key: &CacheKey) -> Option<Vec<u8>> {
+    cache_lock().get(key).cloned()
+}
+
+/// Record the compiled `.beam` bytes for `key`.
+fn store_beam(key: CacheKey, beam: Vec<u8>) {
+    cache_lock().insert(key, beam);
 }
 
 /// A unique temporary directory name for one compiled module.
@@ -333,6 +439,106 @@ mod tests {
         assert!(dir.is_dir());
         drop(compiled);
         assert!(!dir.exists(), "the temp dir is removed on drop");
+    }
+
+    /// An `erlc` stub that writes the expected `.beam` and records every invocation (one
+    /// line per run) in `counter`.
+    fn counting_compiler(scratch: &Scratch, counter: &std::path::Path) -> PathBuf {
+        let body = format!(
+            "#!/bin/sh\necho x >> '{counter}'\nout=\nsrc=\n\
+             while [ $# -gt 0 ]; do case $1 in -o) shift; out=$1;; *) src=$1;; esac; shift; done\n\
+             base=$(basename \"$src\" .erl)\nprintf 'BEAM' > \"$out/$base.beam\"\n",
+            counter = counter.display()
+        );
+        scratch.executable("erlc", &body)
+    }
+
+    /// How many times the stub compiler above has run.
+    fn invocations(counter: &std::path::Path) -> usize {
+        std::fs::read_to_string(counter)
+            .map(|text| text.lines().count())
+            .unwrap_or(0)
+    }
+
+    #[test]
+    fn a_repeated_compile_reuses_the_cached_beam_without_reinvoking_erlc() {
+        let scratch = Scratch::new("cache");
+        let counter = scratch.dir.join("invocations");
+        let erlc = counting_compiler(&scratch, &counter);
+        let source = "-module(cached_probe).\n";
+
+        let first = compile(&erlc, source, "cached_probe").expect("first compile");
+        assert_eq!(invocations(&counter), 1, "the first compile runs erlc");
+        let first_dir = first.dir().to_path_buf();
+        let first_beam = std::fs::read(first.beam()).expect("read the beam");
+
+        // The same (erlc, module, source) triple is a cache hit: no second erlc process,
+        // but the case still gets its own freshly materialized directory.
+        let second = compile(&erlc, source, "cached_probe").expect("second compile");
+        assert_eq!(
+            invocations(&counter),
+            1,
+            "a repeated compile must not spawn erlc again"
+        );
+        assert_eq!(
+            std::fs::read(second.beam()).expect("read the beam"),
+            first_beam,
+            "the cached beam bytes are identical"
+        );
+        assert_ne!(first_dir, second.dir(), "each case keeps its own temp dir");
+        assert!(
+            second.dir().join("cached_probe.erl").is_file(),
+            "a materialized dir mirrors an erlc-built one (source + beam)"
+        );
+
+        // The key covers the source: a different source is a genuine cache miss.
+        compile(&erlc, "-module(cached_probe).\n%% v2\n", "cached_probe").expect("third compile");
+        assert_eq!(invocations(&counter), 2, "a different source recompiles");
+
+        // Every materialized dir is cleaned up on drop, exactly like an erlc-built one.
+        let second_dir = second.dir().to_path_buf();
+        drop(first);
+        drop(second);
+        assert!(!first_dir.exists(), "the first temp dir is removed on drop");
+        assert!(
+            !second_dir.exists(),
+            "the cached temp dir is removed on drop"
+        );
+    }
+
+    #[test]
+    fn concurrent_compiles_of_the_same_source_all_yield_a_usable_beam() {
+        // The cache is shared, so it must be safe to reach from several threads at once:
+        // every caller gets a valid, private temp dir and erlc never runs more than once
+        // per thread.
+        let scratch = Scratch::new("cache-threads");
+        let counter = scratch.dir.join("invocations");
+        let erlc = counting_compiler(&scratch, &counter);
+        let source = "-module(cached_threads).\n";
+
+        let results: Vec<_> = std::thread::scope(|scope| {
+            (0..4)
+                .map(|_| {
+                    let erlc = erlc.clone();
+                    let counter = counter.clone();
+                    scope.spawn(move || {
+                        let compiled = compile(&erlc, source, "cached_threads").expect("compile");
+                        assert!(compiled.beam().is_file());
+                        assert_eq!(std::fs::read(compiled.beam()).expect("read beam"), b"BEAM");
+                        drop(compiled);
+                        invocations(&counter)
+                    })
+                })
+                .collect::<Vec<_>>()
+                .into_iter()
+                .map(|handle| handle.join().expect("thread"))
+                .collect()
+        });
+
+        assert!(
+            results.iter().all(|&n| (1usize..=4).contains(&n)),
+            "erlc ran once per thread at most: {results:?}"
+        );
     }
 
     #[test]

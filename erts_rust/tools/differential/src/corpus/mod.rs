@@ -20,19 +20,36 @@
 //!
 //! | module | contract |
 //! |---|---|
+//! | [`terms`] | A.1 — language semantics (ordering, equality) |
+//! | [`semantics`] | A.1 — arithmetic, control flow, data structures, funs |
+//! | [`errors`] | A.1 — the exception classes (`error`/`exit`/`throw`) and reasons |
 //! | [`etf`] | A.2 — `.beam` binary / `term_to_binary` bytes |
-//! | [`terms`] | A.1 — language semantics (ordering, equality, exceptions) |
+//! | [`nif`] | A.3 — the observable `erlang:nif_error/1` NIF surface |
+//! | [`driver`] | A.4 — the observable port/`spawn`-driver surface |
+//! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
+//! | [`flags`] | A.6 — CLI / configuration |
 //! | [`bifs`] | A.7 — BIF / OTP app surface |
 //! | [`system_info`] | A.8 — introspection |
-//! | [`flags`] | A.6 — CLI / configuration |
-//! | [`modules`] | A.2 — a freshly `erlc`-compiled module run under both runtimes |
+//! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
+//! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
+//!
+//! A.3 and A.4 are only *partially* reachable through the black-box CLI (their corpus
+//! groups pin the observable raise/port surface), so the C-declaration half of both is
+//! asserted **structurally** in `tests/abi.rs`: a C translation unit that references the
+//! `enif_*` / `driver_*` / `erl_drv_*` declarations must still compile.
 
 mod bifs;
+mod boot;
+mod driver;
+mod errors;
 mod etf;
 mod flags;
 mod modules;
+mod nif;
+mod semantics;
 mod system_info;
 mod terms;
+mod wire;
 
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -276,8 +293,14 @@ fn build_corpus() -> Vec<Case> {
     let mut cases = Vec::new();
     cases.extend(etf::group());
     cases.extend(terms::group());
+    cases.extend(semantics::group());
+    cases.extend(errors::group());
+    cases.extend(nif::group());
+    cases.extend(driver::group());
+    cases.extend(wire::group());
     cases.extend(bifs::group());
     cases.extend(system_info::group());
+    cases.extend(boot::group());
     cases.extend(flags::group());
     cases.extend(modules::group());
     cases
@@ -349,8 +372,9 @@ mod tests {
                 contracts.insert(contract.id());
             }
         }
-        // The smoke corpus must exercise the contract groups it claims to (A.1/A.2/A.6/A.7/A.8).
-        for expected in ["A.1", "A.2", "A.6", "A.7", "A.8"] {
+        // The corpus must exercise every one of the nine contracts (A.1–A.9); A.4 is
+        // observed through the port/spawn-driver surface, the rest through their groups.
+        for expected in ["A.1", "A.2", "A.3", "A.4", "A.5", "A.6", "A.7", "A.8", "A.9"] {
             assert!(contracts.contains(expected), "no case covers {expected}");
         }
         assert_eq!(
@@ -455,7 +479,18 @@ mod tests {
             assert_eq!(case.kind_label(), "module-run");
             assert_eq!(case.expr(), None);
             assert!(case.extra_argv().is_empty());
-            assert_eq!(case.contracts, &[Contract::BeamAsm]);
+            assert!(
+                case.contracts.contains(&Contract::BeamAsm),
+                "case {}: a module-run case must evidence the .beam contract",
+                case.id
+            );
+            assert!(
+                case.contracts
+                    .iter()
+                    .all(|c| matches!(c, Contract::BeamAsm | Contract::LanguageSemantics | Contract::OtpApps)),
+                "case {}: a module-run case may only claim the contracts it evidences",
+                case.id
+            );
             assert!(
                 run.oracle_eval().contains(&format!("{}:{}(", run.module, run.function)),
                 "case {}: the oracle eval must apply the function",
@@ -496,8 +531,8 @@ mod tests {
             );
         }
         assert!(
-            module_cases >= 2,
-            "the corpus must carry at least two module-run agreement cases"
+            module_cases >= 20,
+            "the corpus must carry a broad set of module-run agreement cases (got {module_cases})"
         );
     }
 

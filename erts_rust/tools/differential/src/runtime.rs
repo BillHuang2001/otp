@@ -238,11 +238,21 @@ pub fn eval_argv_owned(expr: &str, extra: &[String]) -> Vec<String> {
 /// How many times a child spawn is attempted before a transient `ETXTBSY` is surfaced.
 ///
 /// The race is short-lived (it lasts only until the thread that is writing the script
-/// closes its descriptor), so a handful of attempts with a short backoff always suffices.
-const SPAWN_ATTEMPTS: u32 = 5;
+/// closes its descriptor), so a handful of attempts suffice. The bound matters: a
+/// *permanently* write-held file (or any other failure) is returned, loudly, after this
+/// many attempts — the retry can never spin forever or swallow an error.
+const SPAWN_ATTEMPTS: u32 = 6;
 
-/// How long to wait between `ETXTBSY` spawn attempts.
-const SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
+/// The first backoff before retrying a transient `ETXTBSY` spawn.
+const SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(5);
+
+/// The cap the `ETXTBSY` backoff grows to (it doubles after each attempt).
+///
+/// With [`SPAWN_ATTEMPTS`] `= 6` and a 5 ms first backoff, the total bounded window is
+/// `5 + 10 + 20 + 40 + 80 = 155 ms`: long enough that a writer held open by a *sibling*
+/// thread under heavy parallel load (a testing/pre-building process) has released it,
+/// short enough that a genuine, permanent failure is still surfaced promptly.
+const SPAWN_BACKOFF_MAX: std::time::Duration = std::time::Duration::from_millis(80);
 
 /// Spawn `cmd` and collect its output, retrying **only** the transient `ETXTBSY` race.
 ///
@@ -257,13 +267,19 @@ const SPAWN_BACKOFF: std::time::Duration = std::time::Duration::from_millis(10);
 /// closed its descriptor first. It is therefore *not* error swallowing: every non-`ETXTBSY`
 /// error, and the `ETXTBSY` that survives all [`SPAWN_ATTEMPTS`] attempts, is returned
 /// unchanged for the caller to surface loudly.
+///
+/// The backoff **doubles** after each attempt, capped at [`SPAWN_BACKOFF_MAX`], so the
+/// total wait (155 ms) comfortably outlasts a writer held open by a concurrent `fork()`
+/// under parallel test load while staying bounded.
 pub(crate) fn output_with_retry(cmd: &mut Command) -> std::io::Result<std::process::Output> {
     let mut attempt = 1;
+    let mut backoff = SPAWN_BACKOFF;
     loop {
         match cmd.output() {
             Ok(output) => return Ok(output),
             Err(err) if attempt < SPAWN_ATTEMPTS && is_transient_text_file_busy(&err) => {
-                std::thread::sleep(SPAWN_BACKOFF);
+                std::thread::sleep(backoff);
+                backoff = backoff.saturating_mul(2).min(SPAWN_BACKOFF_MAX);
                 attempt += 1;
             }
             Err(err) => return Err(err),
@@ -623,6 +639,38 @@ mod tests {
         drop(held);
         let output = output_with_retry(&mut cmd).expect("spawn once the writer closed");
         assert_eq!(output.stdout, b"out\n");
+    }
+
+    /// The retry must actually **recover** when the transient writer goes away.
+    ///
+    /// [`output_with_retry_is_bounded_on_etxtbsy_and_surfaces_it`] pins the "gives up
+    /// loudly" half; this pins the "succeeds once the race resolves" half, which is what
+    /// makes the suite deterministic under parallel load. The file is held open for
+    /// writing by *another thread* (mirroring a concurrent `fork()` inheriting a writer's
+    /// descriptor) and released while the spawn is already retrying, so on Linux the first
+    /// attempts deterministically fail with `ETXTBSY` and a later attempt succeeds.
+    #[cfg(unix)]
+    #[test]
+    fn output_with_retry_recovers_once_the_transient_writer_closes() {
+        let dir = Scratch::new("retry-recover");
+        let script = executable(&dir, "settle");
+        std::fs::write(&script, b"#!/bin/sh\necho out\nexit 0\n").expect("write script");
+
+        let held = std::fs::OpenOptions::new()
+            .write(true)
+            .open(&script)
+            .expect("open the script for writing");
+        let release = std::thread::spawn(move || {
+            // Released well within the 155 ms bounded retry window.
+            std::thread::sleep(std::time::Duration::from_millis(25));
+            drop(held);
+        });
+
+        let mut cmd = Command::new(&script);
+        let output = output_with_retry(&mut cmd)
+            .expect("the bounded retry must recover once the writer closes");
+        assert_eq!(output.stdout, b"out\n");
+        release.join().expect("writer thread");
     }
 
     #[test]

@@ -5,14 +5,68 @@
 //! own **golden** (an independent expectation that makes the corpus self-testing — a
 //! golden miss by the *oracle* is corpus drift, i.e. a real failure, never a skip).
 //!
-//! Stderr is compared too for the expression cases ([`Observables::All`]), where both
-//! runtimes are expected to be silent. It is deliberately **not** compared for the
-//! module-run cases ([`Observables::StdoutAndExit`]): the Rust runtime prints a boot
-//! banner to stderr while `erl` prints nothing, and that is not a semantic difference —
-//! only stdout and the exit status are.
+//! Stderr is compared too for the expression cases ([`Observables::All`]), but through a
+//! deliberately **narrow classifier**: only the Rust runtime's documented one-line
+//! start-up *boot banner* ([`is_runtime_banner_line`]) is treated as noise — it is a
+//! diagnostic of *this build*, not an observable of the program under test, and `erl`
+//! prints nothing there. Every other stderr byte stays significant, so a genuine
+//! diagnostic difference is still a [`Verdict::Mismatch`]: the classifier can only ever
+//! drop a known banner, never fabricate agreement. It is deliberately **not** used for
+//! the module-run cases ([`Observables::StdoutAndExit`]), which do not compare stderr at
+//! all.
 
 use crate::corpus::Golden;
 use crate::runtime::Observation;
+
+/// The literal prefix of the Rust runtime's start-up **boot banner** line.
+///
+/// `beam_rt` prints exactly one such line on stderr when it boots, e.g.
+/// `beam_rt erts-17.1 booted: 22 preloaded modules, 21 core atoms, 1 process`
+/// (see `crates/beam_rt/src/runtime.rs`). The oracle `erl` prints nothing there, so the
+/// banner is noise rather than a program observable.
+pub const BOOT_BANNER_PREFIX: &str = "beam_rt ";
+
+/// The marker that distinguishes the **boot banner** from any other `beam_rt …` stderr
+/// line. A line must start with [`BOOT_BANNER_PREFIX`] *and* carry this ` booted: ` marker
+/// to be ignored, which keeps the classifier narrow enough that an arbitrary `beam_rt …`
+/// diagnostic — and in particular the `beam_rt: unsupported: …` capability-gap line — is
+/// never mistaken for a banner.
+pub const BOOT_BANNER_MARKER: &str = " booted: ";
+
+/// Whether one line of child stderr is the Rust runtime's documented, non-semantic
+/// **boot banner**.
+///
+/// This is intentionally strict: it matches only `beam_rt <version> booted: …`. Any other
+/// line — a different `beam_rt …` message, the `beam_rt: unsupported: …` capability-gap
+/// signal, or anything the program itself wrote — is significant and a difference in it
+/// remains a [`Verdict::Mismatch`].
+pub fn is_runtime_banner_line(line: &str) -> bool {
+    line.starts_with(BOOT_BANNER_PREFIX) && line.contains(BOOT_BANNER_MARKER)
+}
+
+/// `stderr` with the documented boot-banner lines removed; everything else is verbatim.
+///
+/// Only lines for which [`is_runtime_banner_line`] holds are dropped. Every other byte —
+/// ordering, spacing, a missing trailing newline, a non-UTF-8 byte — is preserved, so
+/// comparing the returned buffers is still a real byte-level diff of everything that is
+/// *not* a known banner. Boiling this down to no more than "ignore the boot banner" is the
+/// whole point: it can never turn a real difference into agreement.
+pub fn significant_stderr(stderr: &[u8]) -> Vec<u8> {
+    let mut kept = Vec::with_capacity(stderr.len());
+    for line in stderr.split_inclusive(|&byte| byte == b'\n') {
+        // The banner is compared without its line terminator, so a `\r\n`-terminated line
+        // is still recognised on the (unlikely) Windows path.
+        let body = line.strip_suffix(b"\n").unwrap_or(line);
+        let body = body.strip_suffix(b"\r").unwrap_or(body);
+        let is_banner = std::str::from_utf8(body)
+            .map(is_runtime_banner_line)
+            .unwrap_or(false);
+        if !is_banner {
+            kept.extend_from_slice(line);
+        }
+    }
+    kept
+}
 
 /// What one runtime contributed to a comparison.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -161,8 +215,10 @@ impl serde::Serialize for Verdict {
 /// Which observables a comparison inspects.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Observables {
-    /// stdout, exit status **and** stderr — the expression cases, where both runtimes are
-    /// driven by the identical `-eval` argv.
+    /// stdout, exit status **and** (classified) stderr — the expression cases, where both
+    /// runtimes are driven by the identical `-eval` argv. The stderr comparison ignores
+    /// only the Rust runtime's documented boot banner ([`significant_stderr`]); every
+    /// other stderr difference is still a mismatch.
     All,
     /// stdout and exit status only — the module-run cases, where the Rust runtime's boot
     /// banner on stderr is not a semantic difference.
@@ -182,6 +238,12 @@ pub fn compare_observations(oracle: &Observation, rust: &Observation) -> Vec<Fie
 ///
 /// A [`FieldDiff`] is pushed for stdout, then the exit status, then (for
 /// [`Observables::All`]) stderr, so a report is stable and readable.
+///
+/// The stderr diff is taken on the **classified** stderr ([`significant_stderr`]): the
+/// Rust runtime's documented boot banner is dropped from both sides first, so it cannot
+/// turn a legitimate agreement into a diff while every other stderr byte is still compared
+/// exactly. The reported [`FieldDiff`] renders the classified buffers, so it shows the
+/// significant difference rather than the banner noise.
 pub fn compare_observations_with(
     oracle: &Observation,
     rust: &Observation,
@@ -202,12 +264,16 @@ pub fn compare_observations_with(
             render_exit_code(rust.exit_code),
         ));
     }
-    if observables == Observables::All && oracle.stderr != rust.stderr {
-        diffs.push(FieldDiff::new(
-            "stderr",
-            render_bytes(&oracle.stderr),
-            render_bytes(&rust.stderr),
-        ));
+    if observables == Observables::All {
+        let oracle_stderr = significant_stderr(&oracle.stderr);
+        let rust_stderr = significant_stderr(&rust.stderr);
+        if oracle_stderr != rust_stderr {
+            diffs.push(FieldDiff::new(
+                "stderr",
+                render_bytes(&oracle_stderr),
+                render_bytes(&rust_stderr),
+            ));
+        }
     }
     diffs
 }
@@ -325,8 +391,9 @@ pub fn hex_string(bytes: &[u8]) -> String {
 mod tests {
     use super::{
         check_golden, compare_observations, compare_observations_with, hex_string,
-        normalize_probe_stdout, render_bytes, render_exit_code, verdict, verdict_with, FieldDiff,
-        GoldenCheck, Observables, SideResult, Verdict,
+        is_runtime_banner_line, normalize_probe_stdout, render_bytes, render_exit_code,
+        significant_stderr, verdict, verdict_with, FieldDiff, GoldenCheck, Observables, SideResult,
+        Verdict,
     };
     use crate::corpus::Golden;
     use crate::runtime::{Observation, RuntimeId};
@@ -393,6 +460,178 @@ mod tests {
         let diffs = compare_observations(&oracle, &rust);
         assert_eq!(diffs.len(), 1);
         assert_eq!(diffs[0].field, "stderr");
+    }
+
+    #[test]
+    fn a_banner_only_stderr_difference_agrees_for_expression_cases() {
+        // The expression-case observables ([`Observables::All`]): `beam_rt` writes its
+        // one-line boot banner to stderr, `erl` writes nothing. That is not a semantic
+        // difference, so the case must AGREE with no diffs — otherwise a legitimate
+        // `-eval` agreement would flip to a mismatch purely because of the banner.
+        let oracle = observation(RuntimeId::Oracle, b"ok <<131,97,42>>\n", Some(0));
+        let mut rust = observation(RuntimeId::Rust, b"ok <<131,97,42>>\n", Some(0));
+        rust.stderr = b"beam_rt erts-17.1 booted: 22 preloaded modules\n".to_vec();
+        assert!(
+            compare_observations(&oracle, &rust).is_empty(),
+            "the boot banner must not produce a diff"
+        );
+        assert_eq!(
+            verdict(
+                &SideResult::observed(oracle),
+                &SideResult::observed(rust),
+                &GoldenCheck::not_asserted()
+            ),
+            Verdict::Agree
+        );
+    }
+
+    #[test]
+    fn a_banner_on_the_oracle_side_is_ignored_symmetrically() {
+        // The classifier is applied to both sides, so a stray banner on the oracle's
+        // stderr is also non-semantic (the oracle prints none today; this pins the rule).
+        let mut oracle = observation(RuntimeId::Oracle, b"5\n", Some(0));
+        oracle.stderr = b"beam_rt erts-17.1 booted: 1 preloaded modules\n".to_vec();
+        let rust = observation(RuntimeId::Rust, b"5\n", Some(0));
+        assert!(compare_observations(&oracle, &rust).is_empty());
+    }
+
+    #[test]
+    fn any_non_banner_stderr_line_is_still_a_mismatch() {
+        let oracle = observation(RuntimeId::Oracle, b"ok 1\n", Some(0));
+        let mut rust = observation(RuntimeId::Rust, b"ok 1\n", Some(0));
+        // A banner *plus* a genuine diagnostic: only the banner is dropped, so the
+        // surviving diagnostic is still a diff (and it is what the diff reports).
+        rust.stderr = b"beam_rt erts-17.1 booted: 22 preloaded modules\n".to_vec();
+        rust.stderr.extend_from_slice(b"evaluated 1 expression\n");
+        let diffs = compare_observations(&oracle, &rust);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].field, "stderr");
+        assert!(
+            diffs[0].rust.contains("evaluated 1 expression"),
+            "the significant line is reported: {:?}",
+            diffs[0]
+        );
+        assert!(
+            !diffs[0].rust.contains("booted"),
+            "the banner is not part of the reported diff: {:?}",
+            diffs[0]
+        );
+        assert_eq!(
+            verdict(
+                &SideResult::observed(oracle),
+                &SideResult::observed(rust),
+                &GoldenCheck::not_asserted()
+            ),
+            Verdict::Mismatch
+        );
+    }
+
+    #[test]
+    fn the_unsupported_capability_line_is_not_a_banner() {
+        // The `beam_rt: unsupported: …` capability-gap line must never be swallowed as
+        // banner noise — it is a real signal, matched only under the exit-3 rule.
+        assert!(!is_runtime_banner_line(
+            "beam_rt: unsupported: unknown switch \"--nope\""
+        ));
+        // A line that merely shares the prefix but lacks the boot marker is significant.
+        assert!(!is_runtime_banner_line("beam_rt loaded a module"));
+        assert!(!is_runtime_banner_line("beam_rt "));
+        // And the real banner (with its marker) is recognised.
+        assert!(is_runtime_banner_line(
+            "beam_rt erts-17.1 booted: 22 preloaded modules, 21 core atoms, 1 process"
+        ));
+
+        let oracle = observation(RuntimeId::Oracle, b"ok 1\n", Some(0));
+        let mut rust = observation(RuntimeId::Rust, b"ok 1\n", Some(0));
+        rust.stderr = b"beam_rt: unsupported: nope\n".to_vec();
+        assert_eq!(
+            compare_observations(&oracle, &rust).len(),
+            1,
+            "the unsupported line is a significant stderr difference"
+        );
+    }
+
+    #[test]
+    fn significant_stderr_drops_only_banner_lines_and_preserves_the_rest() {
+        assert!(significant_stderr(b"").is_empty());
+        assert!(
+            significant_stderr(b"beam_rt 1 booted: x\n").is_empty(),
+            "a lone banner is fully removed"
+        );
+        assert_eq!(
+            significant_stderr(b"beam_rt 1 booted: x\nkeep me\n"),
+            b"keep me\n"
+        );
+        assert_eq!(
+            significant_stderr(b"keep me\nbeam_rt 1 booted: x\n"),
+            b"keep me\n",
+            "trailing banners go too"
+        );
+        assert_eq!(
+            significant_stderr(b"kept line without newline"),
+            b"kept line without newline",
+            "a banner-less buffer is byte-identical"
+        );
+        assert_eq!(
+            significant_stderr(&[0xff, 0xfe, b'\n']),
+            &[0xff, 0xfe, b'\n'],
+            "non-UTF-8 stderr can never be a banner and is preserved"
+        );
+    }
+
+    #[test]
+    fn the_probe_etf_bytes_are_a_first_class_observable() {
+        // The probe prints `ok <term_to_binary(Result)>`; a single differing byte in the
+        // encoded term is a real difference, not banner noise, so it must be a mismatch.
+        let oracle = observation(RuntimeId::Oracle, b"ok <<131,97,42>>\n", Some(0));
+        let rust = observation(RuntimeId::Rust, b"ok <<131,97,43>>\n", Some(0));
+        let diffs = compare_observations(&oracle, &rust);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].field, "stdout");
+        assert!(diffs[0].oracle.contains("131,97,42"), "{:?}", diffs[0]);
+        assert!(diffs[0].rust.contains("131,97,43"), "{:?}", diffs[0]);
+    }
+
+    #[test]
+    fn the_probe_exception_class_and_reason_are_a_first_class_observable() {
+        // The probe prints `exception <class> <reason>` and exits 1 on an uncaught error,
+        // so both the class+reason text (arriving on stdout) and the exit status are
+        // compared — a differing class/reason is a mismatch.
+        let oracle = observation(RuntimeId::Oracle, b"exception error badarith\n", Some(1));
+        let same = observation(RuntimeId::Rust, b"exception error badarith\n", Some(1));
+        assert!(compare_observations(&oracle, &same).is_empty());
+
+        let different_reason = observation(RuntimeId::Rust, b"exception error badarg\n", Some(1));
+        let diffs = compare_observations(&oracle, &different_reason);
+        assert_eq!(diffs.len(), 1, "{diffs:?}");
+        assert_eq!(diffs[0].field, "stdout");
+
+        let different_class = observation(RuntimeId::Rust, b"exception exit normal\n", Some(1));
+        assert_eq!(compare_observations(&oracle, &different_class).len(), 1);
+
+        // Disagreeing on whether it raised at all shows up in both stdout and exit status.
+        let no_raise = observation(RuntimeId::Rust, b"ok <<131,97,42>>\n", Some(0));
+        let diffs = compare_observations(&oracle, &no_raise);
+        assert_eq!(diffs.len(), 2, "{diffs:?}");
+        assert!(diffs.iter().any(|d| d.field == "stdout"));
+        assert!(diffs.iter().any(|d| d.field == "exit_code"));
+    }
+
+    #[test]
+    fn the_golden_check_is_unaffected_by_stderr_classification() {
+        // The golden asserts stdout + exit code only; neither the banner nor any other
+        // stderr byte can sway it.
+        let mut oracle = observation(RuntimeId::Oracle, b"ok 3\n", Some(0));
+        oracle.stderr = b"beam_rt 1 booted: x\nsomething else\n".to_vec();
+        let check = check_golden(
+            &oracle,
+            &Golden {
+                stdout: Some("ok 3"),
+                exit_code: 0,
+            },
+        );
+        assert!(check.matched, "{:?}", check.diffs);
+        assert!(check.diffs.is_empty());
     }
 
     #[test]
@@ -498,22 +737,43 @@ mod tests {
     }
 
     #[test]
-    fn a_stdout_and_exit_verdict_ignores_a_stderr_only_difference() {
-        // The module-run case: identical stdout + exit status but a differing stderr (the
-        // Rust runtime's boot banner) must AGREE, not mismatch.
+    fn verdicts_ignore_the_banner_but_never_other_stderr() {
         let oracle = observation(RuntimeId::Oracle, b"5\n", Some(0));
-        let mut rust = observation(RuntimeId::Rust, b"5\n", Some(0));
-        rust.stderr = b"beam_rt erts-17.1 booted\n".to_vec();
+        let mut banner = observation(RuntimeId::Rust, b"5\n", Some(0));
+        banner.stderr = b"beam_rt erts-17.1 booted: 22 preloaded modules\n".to_vec();
         let golden = GoldenCheck::not_asserted();
+
+        // A banner-only difference agrees under *both* observable sets.
+        for observables in [Observables::All, Observables::StdoutAndExit] {
+            assert_eq!(
+                verdict_with(
+                    &SideResult::observed(oracle.clone()),
+                    &SideResult::observed(banner.clone()),
+                    &golden,
+                    observables
+                ),
+                Verdict::Agree,
+                "a banner-only difference must agree for {observables:?}"
+            );
+        }
+
+        // A banner plus a genuine diagnostic is still a mismatch under the full
+        // comparison, but the module-run observables never look at stderr at all.
+        let mut noise = observation(RuntimeId::Rust, b"5\n", Some(0));
+        noise.stderr = b"beam_rt erts-17.1 booted: 22 preloaded modules\nwarning: slow\n".to_vec();
         assert_eq!(
-            verdict(&SideResult::observed(oracle.clone()), &SideResult::observed(rust.clone()), &golden),
-            Verdict::Mismatch,
-            "the full comparison still flags the stderr difference"
+            verdict_with(
+                &SideResult::observed(oracle.clone()),
+                &SideResult::observed(noise.clone()),
+                &golden,
+                Observables::All
+            ),
+            Verdict::Mismatch
         );
         assert_eq!(
             verdict_with(
                 &SideResult::observed(oracle),
-                &SideResult::observed(rust),
+                &SideResult::observed(noise),
                 &golden,
                 Observables::StdoutAndExit
             ),
