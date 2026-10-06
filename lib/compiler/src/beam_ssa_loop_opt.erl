@@ -50,12 +50,15 @@
 %%%   calls and side-effecting instructions are never touched.
 %%% * Only instructions that are in ?SAFE_OPS are hoisted. ?SAFE_OPS is a
 %%%   whitelist of operations that are side-effect free AND can never raise
-%%%   for any operand values (constructors and type tests). This is stricter
-%%%   than `beam_ssa:no_side_effect/1', which is only a "can be omitted if
-%%%   the result is unused" predicate and returns true for instructions that
-%%%   can still fail (get_hd, get_tuple_element, ...). Hoisting an
-%%%   instruction that may raise would execute it on paths where it was not
-%%%   executed before, so those are deliberately excluded.
+%%%   for any operand values (today: tuple and cons construction). This is
+%%%   stricter than `beam_ssa:no_side_effect/1', which is only a "can be
+%%%   omitted if the result is unused" predicate and returns true for
+%%%   instructions that can still fail (get_hd, get_tuple_element, ...).
+%%%   Hoisting an instruction that may raise would execute it on paths where
+%%%   it was not executed before, so those are deliberately excluded. The
+%%%   whitelist is further restricted to instructions that also have a
+%%%   block-independent code generation rule; see the comment on ?SAFE_OPS
+%%%   below.
 %%% * Consequently arithmetic is NOT hoisted here: without type information
 %%%   (this pass runs before the SSA type pass) an operation such as `+'
 %%%   cannot be proven non-raising. This is a deliberate, documented limit.
@@ -88,7 +91,23 @@
 
 %% Operations that are side-effect free and that can never raise, for any
 %% operand values. Everything not listed here is left in the loop.
--define(SAFE_OPS, [put_list, put_tuple, is_nonempty_list, is_tagged_tuple]).
+%%
+%% Purity and non-raising are necessary but NOT sufficient: an instruction
+%% that is moved into the preheader leaves its original block, so it must
+%% also have a code generation rule that is valid *anywhere*. This excludes
+%% the fused type tests `is_tagged_tuple'/3 and `is_nonempty_list'/1
+%% (produced by `ssa_opt_record'/1 and by the list pattern builder), because
+%% `beam_ssa_codegen' only implements them as block-local tests that must be
+%% the last instruction of a block and be consumed immediately by that
+%% block's terminator (the `cg_block/3' clauses for is_tagged_tuple and
+%% is_nonempty_list). There is no standalone `cg_instr/3' clause for either,
+%% so hoisting one into a preheader makes code generation fail
+%% (`function_clause' in `cg_instr/3'), and the is_nonempty_list fallback
+%% additionally asserts the `was_bif_is_list' annotation that such an
+%% instruction does not have. Constructors, on the other hand, are ordinary
+%% value instructions (`cg_instr(put_list, ...)' / `cg_instr(put_tuple, ...)')
+%% and are safe to move.
+-define(SAFE_OPS, [put_list, put_tuple]).
 
 -spec opt({#opt_st{}, term()}) -> {#opt_st{}, term()}.
 opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
@@ -97,7 +116,8 @@ opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
     Linear = try
                  opt_linear(Linear0)
              catch
-                 _:_ -> Linear0
+                 _:_ ->
+                     Linear0
              end,
     {St#opt_st{ssa=Linear}, FuncDb};
 opt({St, FuncDb}) ->
