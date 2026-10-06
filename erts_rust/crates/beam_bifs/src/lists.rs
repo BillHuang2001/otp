@@ -72,6 +72,12 @@
 //! identical observable results. `keymember/3` and `keysearch/3` are the two real
 //! `lists` BIFs not in scope and are not registered (documented gap).
 //!
+//! The module also registers the four **list operators** of the `erlang` module —
+//! `'++'/2` and `'--'/2` (`bif erlang:'++'/2 ebif_plusplus_2`,
+//! `bif erlang:'--'/2 ebif_minusminus_2`) plus their `append/2` and `subtract/2`
+//! aliases, which are the *same* C functions (`erl_bif_lists.c`'s `append`/
+//! `subtract`) and therefore share one implementation each here.
+//!
 //! # Matching order — pinned against the OTP 29/erts-17.1 oracle
 //!
 //! The comparison order is *not* uniform across the module; each function was
@@ -457,6 +463,49 @@ fn append1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn append2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let elems = proper_list(args[0]).ok_or_else(badarg)?;
     build_list(ctx, &elems, args[1])
+}
+
+// ---------------------------------------------------------------------------
+// The `erlang` list operators: `'++'/2`, `'--'/2` and the `append/2`,
+// `subtract/2` aliases
+// ---------------------------------------------------------------------------
+
+/// `Lhs ++ Rhs` — `erlang:'++'/2`, and the same implementation is registered as
+/// the `erlang:append/2` alias (`bif.tab` and `erl_bif_lists.c:350` both route
+/// `append_2` to the very same `append` function).
+///
+/// `Lhs` must be a proper list, so an improper left operand is `badarg`
+/// (`[1|2] ++ [3]` ⇒ `badarg`). `Rhs` is the tail **verbatim** — no check at all
+/// — so `[1,2] ++ x` ⇒ `[1,2|x]` and `[] ++ x` ⇒ `x` (`erl_bif_lists.c:270`
+/// documents the `[]` case as intentional bug-compatibility).
+fn plusplus_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let elems = proper_list(args[0]).ok_or_else(badarg)?;
+    build_list(ctx, &elems, args[1])
+}
+
+/// `Lhs -- Rhs` — `erlang:'--'/2`, and the same implementation is registered as
+/// the `erlang:subtract/2` alias (`erl_bif_lists.c:1103`).
+///
+/// Removes from `Lhs` the **first** remaining occurrence of each element of `Rhs`
+/// (in `Rhs` order), preserving `Lhs` order; an element of `Rhs` with no match is
+/// ignored. Both operands must be proper lists (`[1|2] -- [1]` ⇒ `badarg`).
+///
+/// The match is **exact** (`=:=`): `erl_bif_lists.c` compares with `EQ` and its
+/// red-black-tree path with `CMP_TERM`, documented there as "there is no type
+/// coercion so the elements must match exactly". Verified against the oracle:
+/// `[1.0] -- [1]` ⇒ `[1.0]` and `[1] -- [1.0]` ⇒ `[1]` (not `[]`).
+fn minusminus_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let mut remaining = proper_list(args[0]).ok_or_else(badarg)?;
+    let remove = proper_list(args[1]).ok_or_else(badarg)?;
+    for item in remove {
+        if let Some(at) = remaining
+            .iter()
+            .position(|&elem| eq(elem, item, ctx.atoms()))
+        {
+            remaining.remove(at);
+        }
+    }
+    build_list(ctx, &remaining, NIL)
 }
 
 // ---------------------------------------------------------------------------
@@ -1225,10 +1274,20 @@ fn keymap3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 
 /// Registers the `lists` module BIFs.
 ///
-/// 43 keys: the three real `bif.tab` BIFs (`member/2`, `reverse/2`, `keyfind/3`),
-/// the pure-Erlang `lists.erl` functions as Rust fast paths, and the 18
-/// `fun`-taking functions (which need the [`crate::FunCaller`] seam).
+/// 43 `lists` keys: the three real `bif.tab` BIFs (`member/2`, `reverse/2`,
+/// `keyfind/3`), the pure-Erlang `lists.erl` functions as Rust fast paths, and
+/// the 18 `fun`-taking functions (which need the [`crate::FunCaller`] seam).
+///
+/// Also registers the four **`erlang`** list operators — `'++'/2`, `'--'/2` and
+/// their `append/2`, `subtract/2` aliases (`bif.tab` `bif erlang:'++'/2
+/// ebif_plusplus_2`, `bif erlang:'--'/2 ebif_minusminus_2`).
 pub(crate) fn register(reg: &mut BifRegistry) {
+    // The `erlang` list operators (`erl_bif_lists.c`; `append`/`subtract` are the
+    // same C functions as `++`/`--`, so the aliases share the implementation).
+    reg.register("erlang", "++", 2, plusplus_2);
+    reg.register("erlang", "append", 2, plusplus_2);
+    reg.register("erlang", "--", 2, minusminus_2);
+    reg.register("erlang", "subtract", 2, minusminus_2);
     reg.register("lists", "member", 2, member);
     reg.register("lists", "reverse", 1, reverse1);
     reg.register("lists", "reverse", 2, reverse2);
@@ -1926,7 +1985,96 @@ mod tests {
         for (name, arity) in expected {
             assert!(reg.contains("lists", name, arity), "missing lists:{name}/{arity}");
         }
-        assert_eq!(reg.len(), expected.len());
+        // The `erlang` list operators registered alongside the `lists` module.
+        for (name, arity) in [("++", 2), ("--", 2), ("append", 2), ("subtract", 2)] {
+            assert!(
+                reg.contains("erlang", name, arity),
+                "missing erlang:{name}/{arity}"
+            );
+        }
+        assert_eq!(reg.len(), expected.len() + 4);
+    }
+
+    #[test]
+    fn erlang_list_operators_concatenate_and_subtract() {
+        let mut reg = BifRegistry::new();
+        register(&mut reg);
+        with_ctx(|ctx| {
+            // `[1,2] ++ [3]` ⇒ `[1,2,3]`.
+            let lhs = ints(ctx, &[1, 2]);
+            let rhs = ints(ctx, &[3]);
+            let sum = reg
+                .call("erlang", "++", 2, ctx, &[lhs, rhs])
+                .expect("++/2");
+            let expected = ints(ctx, &[1, 2, 3]);
+            assert!(beam_term::compare::eq(sum, expected, ctx.atoms()));
+
+            // `append/2` is the same implementation.
+            let alias = reg
+                .call("erlang", "append", 2, ctx, &[lhs, rhs])
+                .expect("append/2");
+            assert!(beam_term::compare::eq(alias, sum, ctx.atoms()));
+
+            // `[1,2] ++ x` ⇒ `[1,2|x]`; `[] ++ x` ⇒ `x` (the oracle's documented
+            // `[]` special case).
+            let x = ctx.atom("x").unwrap();
+            let improper_tail = reg
+                .call("erlang", "++", 2, ctx, &[lhs, x])
+                .expect("++/2 with a non-list tail");
+            let expected = ctx.cons(ctx.int(2).unwrap(), x).unwrap();
+            let expected = ctx.cons(ctx.int(1).unwrap(), expected).unwrap();
+            assert!(beam_term::compare::eq(improper_tail, expected, ctx.atoms()));
+            let nil_concat = reg
+                .call("erlang", "++", 2, ctx, &[NIL, x])
+                .expect("[] ++ x");
+            assert!(beam_term::compare::eq(nil_concat, x, ctx.atoms()));
+
+            // A non-list or improper **left** operand is `badarg`.
+            let improper_left = ctx.cons(ctx.int(1).unwrap(), x).unwrap();
+            for bad in [x, improper_left] {
+                assert!(matches!(
+                    reg.call("erlang", "++", 2, ctx, &[bad, rhs]),
+                    Err(BeamError::BadArg)
+                ));
+            }
+
+            // `[1,2,3] -- [1]` ⇒ `[2,3]`.
+            let three = ints(ctx, &[1, 2, 3]);
+            let one = ints(ctx, &[1]);
+            let diff = reg
+                .call("erlang", "--", 2, ctx, &[three, one])
+                .expect("--/2");
+            let expected = ints(ctx, &[2, 3]);
+            assert!(beam_term::compare::eq(diff, expected, ctx.atoms()));
+
+            // `subtract/2` is the same implementation.
+            let alias = reg
+                .call("erlang", "subtract", 2, ctx, &[three, one])
+                .expect("subtract/2");
+            assert!(beam_term::compare::eq(alias, diff, ctx.atoms()));
+
+            // The match is exact (`=:=`): `1.0` does not remove `1` and vice versa.
+            let one_f = ctx.make_float(1.0).unwrap();
+            let floats = ctx.list(&[one_f]).unwrap();
+            let one = ints(ctx, &[1]);
+            let kept_float = reg
+                .call("erlang", "--", 2, ctx, &[floats, one])
+                .expect("--/2");
+            assert!(beam_term::compare::eq(kept_float, floats, ctx.atoms()));
+            let kept_int = reg
+                .call("erlang", "--", 2, ctx, &[one, floats])
+                .expect("--/2");
+            assert!(beam_term::compare::eq(kept_int, one, ctx.atoms()));
+
+            // A non-list operand on **either** side is `badarg`.
+            let improper = ctx.cons(ctx.int(1).unwrap(), x).unwrap();
+            for args in [[improper, one], [one, improper], [x, one], [one, x]] {
+                assert!(matches!(
+                    reg.call("erlang", "--", 2, ctx, &args),
+                    Err(BeamError::BadArg)
+                ));
+            }
+        });
     }
 
     #[test]

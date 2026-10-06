@@ -152,9 +152,9 @@ fn lookup_is_exact_on_module_function_and_arity() {
 
     assert!(reg.lookup("erlang", "+", 2).is_some());
     // A different arity (note `+`/1 *is* registered — unary plus), function or
-    // module is a miss.
+    // module is a miss. `++`/2 is registered (the list operators); `++`/3 is not.
     assert!(reg.lookup("erlang", "*", 1).is_none());
-    assert!(reg.lookup("erlang", "++", 2).is_none());
+    assert!(reg.lookup("erlang", "++", 3).is_none());
     assert!(reg.lookup("no_such_module", "+", 2).is_none());
     assert!(!reg.contains("erlang", "abs", 2));
 }
