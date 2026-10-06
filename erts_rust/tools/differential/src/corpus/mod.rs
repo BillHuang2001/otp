@@ -32,6 +32,7 @@
 //! | [`system_info`] | A.8 — introspection |
 //! | [`boot`] | A.9 — boot/version observability (asserted by shape) |
 //! | [`modules`] | A.2/A.1/A.7 — a freshly `erlc`-compiled module run under both runtimes |
+//! | [`mexec`] | A.2/A.7 — a *real* system stdlib/kernel module executed end to end |
 //!
 //! A.3 and A.4 are only *partially* reachable through the black-box CLI (their corpus
 //! groups pin the observable raise/port surface), so the C-declaration half of both is
@@ -44,6 +45,7 @@ mod driver;
 mod errors;
 mod etf;
 mod flags;
+mod mexec;
 mod modules;
 mod nif;
 mod semantics;
@@ -302,6 +304,7 @@ fn build_corpus() -> Vec<Case> {
     cases.extend(system_info::group());
     cases.extend(boot::group());
     cases.extend(flags::group());
+    cases.extend(mexec::group());
     cases.extend(modules::group());
     cases
 }
