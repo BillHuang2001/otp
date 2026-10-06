@@ -875,6 +875,27 @@ mod tests {
     }
 
     #[test]
+    fn emits_rbp_base_which_is_a_plain_disp32_not_rip_relative() {
+        // `rbp` is released from its frame-pointer role by the baseline JIT (it is one
+        // of its cache registers), so the encoder must also handle it as a memory
+        // *base*. The uniform `mod=10` `disp32` form sidesteps the `mod=00`/`rbp`
+        // "RIP-relative" special case, so `[rbp + disp]` reads a base+displacement
+        // instead of resolving a PC-relative address. `push`/`pop` around the use keep
+        // the Rust caller's `rbp` intact.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.push_r(Reg::Rbp).unwrap();
+        buf.mov_rr(Reg::Rbp, Reg::Rdi).unwrap(); // rbp = p
+        buf.mov_rm(Reg::Rax, Reg::Rbp, 8).unwrap(); // rax = p[1]  ([rbp + 8])
+        buf.pop_r(Reg::Rbp).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let f: extern "C" fn(*const i64) -> i64 = buf.as_fn_ptr();
+        let data = [10i64, 42];
+        assert_eq!(f(data.as_ptr()), 42);
+    }
+
+    #[test]
     fn emits_lea() {
         let mut buf = CodeBuffer::new().unwrap();
         buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();

@@ -24,7 +24,9 @@ use beam_engine::{available_tiers, Machine, MinimalContext, Tier};
 use beam_loader::{
     load_file, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
-use beam_term::{is_small, make_atom, make_small, signed_value, Atom, Eterm, MAX_SMALL, MIN_SMALL};
+use beam_term::{
+    is_small, make_atom, make_small, signed_value, Atom, Eterm, MAX_SMALL, MIN_SMALL, NIL,
+};
 
 /// The `beam_loader` oracle fixture (reused, never copied).
 const SLICE_BEAM: &str = concat!(
@@ -708,29 +710,40 @@ fn a_compiled_artifact_can_be_run_more_than_once() {
 /// The number of x-registers the baseline block emitter holds in machine registers
 /// (`CACHE_REGISTERS`). Stated here as a literal so the tests below say which budget
 /// they are exceeding; the structural assertions verify the allocator agrees.
-const CACHE_BUDGET: u32 = 4;
+///
+/// The allocator is **usage-weighted**: a block caches the `CACHE_BUDGET` x-registers
+/// its inlinable instructions touch most often (ties broken by ascending register
+/// index) and addresses every other register it names directly in `machine.x`.
+const CACHE_BUDGET: u32 = 5;
 
 /// A hand-built module with a single exported `export/arity` whose whole body is one
 /// basic block (the loader is not involved). `imports` are the module's
-/// `{module,function,arity}` imports, in `ImportRef` order.
-fn block_module(
+/// `{module,function,arity}` imports, in `ImportRef` order; `build_code` runs once the
+/// module name and imports are in place, so it can intern the atoms its instructions
+/// reference.
+fn arity_module<F>(
     name: &str,
     export: &str,
+    arity: u32,
     imports: &[(&str, &str, u32)],
-    code: Vec<Instr>,
-) -> Module {
+    build_code: F,
+) -> Module
+where
+    F: FnOnce(&mut Module) -> Vec<Instr>,
+{
     let mut module = Module::default();
     module.name = module.atom_table.intern(name);
-    for (module_name, function_name, arity) in imports {
+    for (module_name, function_name, import_arity) in imports {
         let import_module = module.atom_table.intern(module_name);
         let import_function = module.atom_table.intern(function_name);
         module.imports.push(Import {
             module: import_module,
             function: import_function,
-            arity: *arity,
+            arity: *import_arity,
         });
     }
     let function = module.atom_table.intern(export);
+    let code = build_code(&mut module);
     let label = Label(1);
     let (blocks, labels) = beam_loader::lower::build_blocks(&code);
     module.functions.push(Function {
@@ -738,24 +751,35 @@ fn block_module(
         entry_label: label,
         module: module.name,
         name: function,
-        arity: 0,
+        arity,
         code,
         blocks,
         labels,
     });
     module.exports.push(Export {
         function,
-        arity: 0,
+        arity,
         label,
     });
     module
 }
 
+/// [`arity_module`] with an arity-0 export — the shape most fixtures below take.
+fn block_module(
+    name: &str,
+    export: &str,
+    imports: &[(&str, &str, u32)],
+    code: Vec<Instr>,
+) -> Module {
+    arity_module(name, export, 0, imports, |_| code)
+}
+
 /// `spread/0` — one straight-line block that reads and writes **eight** x-registers,
-/// well past the four the emitter caches, so `x(4)`..`x(7)` live only in `machine.x`:
+/// well past the five the emitter caches, so the least-touched ones live only in
+/// `machine.x`:
 ///
 /// ```text
-///   x0=1 x1=2 x2=3 x3=4 x4=10     ; x4 is the first register past the cache budget
+///   x0=1 x1=2 x2=3 x3=4 x4=10     ; x4 is touched again and again below
 ///   x5 = x4                       ; `machine.x` → `machine.x`
 ///   x6 = x0 + x1          (= 3)   ; fast path with a `machine.x` destination
 ///   x4 = x6 + x3          (= 7)   ; fast path with `machine.x` operands and dst
@@ -809,19 +833,22 @@ fn spread_module() -> Module {
     )
 }
 
-/// `swaps/0` — one block exercising **every** cached/`machine.x` combination of
-/// `swap`, with `x(4)`/`x(5)` past the cache budget:
+/// `swaps/0` — one block exercising `swap` over six x-registers:
 ///
 /// ```text
 ///   x0=1 x1=2 x2=3 x3=4 x4=5 x5=6
-///   swap x0 x4     ; cached      <-> machine.x
-///   swap x4 x5     ; machine.x   <-> machine.x
-///   swap x0 x1     ; cached      <-> cached
-///   swap x4 x3     ; machine.x   <-> cached
+///   swap x0 x4
+///   swap x4 x5
+///   swap x0 x1
+///   swap x4 x3
 ///   x0 = x4
 /// ```
 ///
 /// Returns `4` (the value `x(3)` started with, carried through the last swap).
+///
+/// The usage-weighted allocator caches `{x0, x1, x3, x4, x5}` for this block, so every
+/// operand here lands in a machine register; the `machine.x` operand combinations of
+/// `swap` are covered by [`swaps_memory_module`].
 fn swaps_module() -> Module {
     let mv = |value: i64, x: u32| Instr::Move {
         src: Operand::Integer(value),
@@ -856,26 +883,193 @@ fn swaps_module() -> Module {
     )
 }
 
+/// `wide/0` — six x-registers whose touch counts make the allocator's usage-weighted
+/// choice **differ** from first-appearance order, so `x(5)` — a register a four-slot
+/// first-appearance allocator could never hold — becomes resident:
+///
+/// ```text
+///   x0=1 x1=2 x2=3 x3=4 x4=5      ; five initial moves (one touch each)
+///   x5 = x0 + x1                  ; x5 is first touched only here
+///   x5 = x0 + x2
+///   x5 = x0 + x3
+///   x0 = x5                       ; x0 becomes the most-touched register
+/// ```
+///
+/// Touch counts: `x0=5, x5=4, x1=2, x2=2, x3=2, x4=1`. The allocator keeps the top five
+/// — `{x0, x1, x2, x3, x5}` — and leaves `x4` (the least-touched register, index 4) in
+/// `machine.x`, even though its index is lower than the cached `x5`. Returns `5`.
+fn wide_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| Instr::GcBif {
+        arity: 2,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: dst.max(a).max(b) + 1,
+        args: vec![Operand::X(a), Operand::X(b)],
+        dst: Operand::X(dst),
+    };
+    block_module(
+        "wide",
+        "wide",
+        &[("erlang", "+", 2)],
+        vec![
+            Instr::Label(Label(1)),
+            mv(1, 0),
+            mv(2, 1),
+            mv(3, 2),
+            mv(4, 3),
+            mv(5, 4),
+            add(0, 1, 5),
+            add(0, 2, 5),
+            add(0, 3, 5),
+            Instr::Move {
+                src: Operand::X(5),
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ],
+    )
+}
+
+/// `swaps_memory/0` — one block that exercises **every** cached/`machine.x` operand
+/// combination of `swap`, by making `x(5)`/`x(6)` the two least-touched registers:
+///
+/// ```text
+///   x0..x4 = 1..5, x5 = 6, x6 = 7
+///   <15 `+`/2 padding instructions>   ; x0..x4 each reach a touch count of 10
+///   swap x0 x5   ; cached       <-> machine.x
+///   swap x5 x6   ; machine.x    <-> machine.x
+///   swap x0 x1   ; cached       <-> cached
+///   swap x5 x3   ; machine.x    <-> cached
+///   x0 = x5
+/// ```
+///
+/// `x5` reaches only 5 touches and `x6` only 2, so the allocator's five residents are
+/// `{x0, x1, x2, x3, x4}` and both swap operands that must be read/written through
+/// `machine.x` really are. (The exact residents are pinned by
+/// `the_multi_register_blocks_cache_the_most_used_registers`.)
+fn swaps_memory_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    let add = |a: u32, b: u32, dst: u32| Instr::GcBif {
+        arity: 2,
+        bif: ImportRef(0),
+        fail: NO_FAIL,
+        live: dst.max(a).max(b) + 1,
+        args: vec![Operand::X(a), Operand::X(b)],
+        dst: Operand::X(dst),
+    };
+    let swap = |a: u32, b: u32| Instr::Swap {
+        a: Operand::X(a),
+        b: Operand::X(b),
+    };
+
+    let mut code = vec![Instr::Label(Label(1))];
+    for x in 0..5 {
+        code.push(mv(i64::from(x) + 1, x));
+    }
+    code.push(mv(6, 5));
+    code.push(mv(7, 6));
+    // Pad x0..x4 so that the swap operands x5/x6 stay the two least-touched registers.
+    // Each of the five `+`/2 instructions touches three of x0..x4 once, so one round
+    // adds 3 touches to each; three rounds add 9, on top of the initial 1.
+    for _ in 0..3 {
+        for (a, b, dst) in [(0, 1, 2), (2, 3, 4), (4, 0, 1), (1, 2, 3), (3, 4, 0)] {
+            code.push(add(a, b, dst));
+        }
+    }
+    code.extend([
+        swap(0, 5),
+        swap(5, 6),
+        swap(0, 1),
+        swap(5, 3),
+        Instr::Move {
+            src: Operand::X(5),
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ]);
+    block_module(
+        "swaps_memory",
+        "swaps_memory",
+        &[("erlang", "+", 2)],
+        code,
+    )
+}
+
 #[test]
-fn the_multi_register_blocks_touch_registers_beyond_the_cache() {
-    // Structural evidence that the direct-`machine.x` path is what is under test: the
-    // allocator caches exactly the four budget registers and the block addresses
-    // x(7) (resp. x(5)) — far past them — without a machine register.
+fn the_multi_register_blocks_cache_the_most_used_registers() {
+    // Structural evidence for the usage-weighted allocator. The residents are the
+    // `CACHE_BUDGET` most-touched registers (ties by ascending index, slots ordered by
+    // first appearance), so a register the budget cannot hold is addressed directly in
+    // `machine.x` — no matter how low its index.
+    //
+    // `spread/0` touch counts: x4=5, x0=3, x5=3, x1=2, x3=2, x6=2, x7=2, x2=1.
     let compiled = BaselineJit::new()
         .compile(&spread_module())
         .expect("compile the spread fixture");
     assert_eq!(compiled.block_count(), 1);
-    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 3, 4, 5]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
     assert_eq!(compiled.highest_native_register(), Some(7));
     assert!(
         compiled.highest_native_register() > compiled.highest_cached_register(),
         "the block must touch registers the cache budget could not hold"
     );
 
+    // `swaps/0` touch counts: x4=5, x0=4, x1=2, x3=2, x5=2, x2=1 — residents
+    // {x0, x1, x3, x4, x5}; x2 stays in `machine.x`.
     let compiled = BaselineJit::new()
         .compile(&swaps_module())
         .expect("compile the swaps fixture");
-    assert_eq!(compiled.highest_cached_register(), Some(CACHE_BUDGET - 1));
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 3, 4, 5]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+
+    // `swaps_memory/0` pads x0..x4 to 10 touches each, so the residents are exactly
+    // {x0, x1, x2, x3, x4} and x5 (5 touches) / x6 (2 touches) are read and written
+    // through `machine.x` — which is what makes the swap combinations above real.
+    let compiled = BaselineJit::new()
+        .compile(&swaps_memory_module())
+        .expect("compile the swaps_memory fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1, 2, 3, 4]);
+    assert_eq!(compiled.highest_cached_register(), Some(4));
+    assert_eq!(compiled.highest_native_register(), Some(6));
+    assert!(
+        !compiled.cached_registers().contains(&5) && !compiled.cached_registers().contains(&6),
+        "x5/x6 must stay in machine.x for the swap combinations to be exercised"
+    );
+}
+
+#[test]
+fn the_widened_pool_caches_a_register_the_old_budget_could_not() {
+    // A concrete widening proof: `wide/0` names six x-registers and the allocator keeps
+    // five of them, including x5 — which the previous four-slot **first-appearance**
+    // allocator (cache x0..x3 as they appear, full after four) could never hold. It is
+    // precisely the fifth slot (the released `rbp`) that makes x5 resident.
+    let compiled = BaselineJit::new()
+        .compile(&wide_module())
+        .expect("compile the wide fixture");
+    assert_eq!(
+        compiled.cached_registers(),
+        &[0u32, 1, 2, 3, 5],
+        "the top five most-touched registers, x4 excluded"
+    );
+    assert_eq!(
+        compiled.cached_registers().len() as u32,
+        CACHE_BUDGET,
+        "the allocator fills the widened pool exactly"
+    );
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert!(
+        !compiled.cached_registers().contains(&4),
+        "x4 is the least-touched register and stays in machine.x"
+    );
     assert_eq!(compiled.highest_native_register(), Some(5));
 }
 
@@ -891,6 +1085,16 @@ fn multi_register_moves_and_arithmetic_agree_with_the_interpreter() {
         agree_module(&swaps, "swaps", 0, &[]).expect("swaps/0"),
         make_small(4)
     );
+    let wide = wide_module();
+    assert_eq!(
+        agree_module(&wide, "wide", 0, &[]).expect("wide/0"),
+        make_small(5)
+    );
+    // `swaps_memory/0`'s padding produces a value that depends on the arithmetic the
+    // fixture performs; the point of the case is the agreement of the two tiers over
+    // the `machine.x` swap combinations, so the exact value is not pinned.
+    let swaps_memory = swaps_memory_module();
+    agree_module(&swaps_memory, "swaps_memory", 0, &[]).expect("swaps_memory/0");
 }
 
 #[test]
@@ -978,4 +1182,192 @@ fn multi_register_blocks_agree_across_register_file_sizes() {
             }
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The exact-value switch (`select_val`)
+// ---------------------------------------------------------------------------
+
+/// `select/1` — a `select_val` on the argument with one case per immediate the tier
+/// inlines (a small int, another small int, an atom, and `nil`), plus a fail arm:
+///
+/// ```text
+///   select_val x0 L10 {1 -> L2; 2 -> L3; case_a -> L4; nil -> L5}
+///   L2: x0 = 100   L3: x0 = 200   L4: x0 = 300   L5: x0 = 400   L10: x0 = -1
+/// ```
+///
+/// (The case order matters: the interpreter takes the first match, exactly as the
+/// emitted `cmp`/`jcc` chain does.)
+fn select_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    arity_module("select", "select", 1, &[], |module| {
+        let case_a = module.atom_table.intern("case_a");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: Label(10),
+                pairs: vec![
+                    (Operand::Integer(1), Label(2)),
+                    (Operand::Integer(2), Label(3)),
+                    (Operand::Atom(case_a), Label(4)),
+                    (Operand::Nil, Label(5)),
+                ],
+            },
+            Instr::Label(Label(2)),
+            mv(100, 0),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            mv(200, 0),
+            Instr::Return,
+            Instr::Label(Label(4)),
+            mv(300, 0),
+            Instr::Return,
+            Instr::Label(Label(5)),
+            mv(400, 0),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            mv(-1, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+/// `select_big/1` — a `select_val` whose **first** case is a bignum constant (above
+/// the 60-bit immediate range), so a plain word compare cannot reproduce `=:=` and
+/// the whole switch must deopt to `jit_step_one`:
+///
+/// ```text
+///   select_val x0 L10 {<bignum MAX_SMALL+1> -> L2; 2 -> L3}
+///   L2: x0 = 100   L3: x0 = 200   L10: x0 = -1
+/// ```
+fn select_bignum_module() -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    arity_module("select_big", "select_big", 1, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(0),
+                fail: Label(10),
+                pairs: vec![
+                    (Operand::Integer(MAX_SMALL + 1), Label(2)),
+                    (Operand::Integer(2), Label(3)),
+                ],
+            },
+            Instr::Label(Label(2)),
+            mv(100, 0),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            mv(200, 0),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            mv(-1, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+/// `scrutinee/0` — the block's **only** register reference is a `select_val`'s
+/// scrutinee, so the allocator caches `x(5)` exactly when the switch is inlined (a
+/// deopted `select_val` contributes no native touch at all).
+fn scrutinee_module() -> Module {
+    arity_module("scrutinee", "scrutinee", 0, &[], |_| {
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectVal {
+                value: Operand::X(5),
+                fail: Label(10),
+                pairs: vec![(Operand::Integer(1), Label(2))],
+            },
+            Instr::Label(Label(2)),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            Instr::Return,
+        ]
+    })
+}
+
+#[test]
+fn a_select_val_inlines_and_caches_its_scrutinee() {
+    // Structural evidence that the switch is lowered natively: `x(5)` is named by no
+    // other inlinable instruction, so it appears in the allocator's resident set — and
+    // the block's native-register bound covers it — only because the `select_val` was
+    // inlined (a deopted instruction contributes no native touch).
+    let compiled = BaselineJit::new()
+        .compile(&scrutinee_module())
+        .expect("compile the select_val scrutinee fixture");
+    assert_eq!(compiled.cached_registers(), &[5u32]);
+    assert_eq!(compiled.highest_cached_register(), Some(5));
+    assert_eq!(compiled.highest_native_register(), Some(5));
+}
+
+#[test]
+fn select_val_matches_the_interpreter_on_every_case_and_the_fail_path() {
+    let module = select_module();
+
+    // Each inlined alternative, then the no-match path (which falls through to the fail
+    // label's target). `agree_module` asserts the two tiers produce the same value.
+    for (arg, expected) in [
+        (make_small(1), make_small(100)),
+        (make_small(2), make_small(200)),
+        (NIL, make_small(400)),
+        (make_small(99), make_small(-1)),
+        (make_small(-5), make_small(-1)),
+    ] {
+        assert_eq!(
+            agree_module(&module, "select", 1, &[arg]).expect("select/1"),
+            expected,
+            "select/1 on {arg:?}"
+        );
+    }
+
+    // The atom case: the argument is the very atom the case names (an atom is `=:=`
+    // only to the identical immediate word).
+    let case_a = module.atom_table.lookup("case_a").expect("case_a interned");
+    assert_eq!(
+        agree_module(&module, "select", 1, &[make_atom(case_a)]).expect("select/1"),
+        make_small(300)
+    );
+    // A different atom is not `=:=` to `case_a` — it falls through to the fail arm.
+    let other = module.atom_table.lookup("select").expect("select interned");
+    assert_eq!(
+        agree_module(&module, "select", 1, &[make_atom(other)]).expect("select/1"),
+        make_small(-1)
+    );
+}
+
+#[test]
+fn select_val_with_a_bignum_case_deopts_and_still_agrees() {
+    // A non-immediate case value keeps the whole switch on the interpreter step; the
+    // tiers must still agree (and the interpreter's result is the reference).
+    let module = select_bignum_module();
+    // `1` matches neither the bignum nor `2` -> the fail arm.
+    assert_eq!(
+        agree_module(&module, "select_big", 1, &[make_small(1)]).expect("select_big/1"),
+        make_small(-1)
+    );
+    // `2` matches the second (immediate) alternative even though the first cannot be
+    // compared by word.
+    assert_eq!(
+        agree_module(&module, "select_big", 1, &[make_small(2)]).expect("select_big/1"),
+        make_small(200)
+    );
+}
+
+#[test]
+fn the_inlined_select_val_fail_path_agrees_with_the_interpreter() {
+    // `scrutinee/0` takes its scrutinee from the (NIL-initialised) `x(5)`, matches no
+    // case, and returns through the fail arm — exercising the inlined switch's no-match
+    // path directly.
+    let module = scrutinee_module();
+    assert_eq!(
+        agree_module(&module, "scrutinee", 0, &[]).expect("scrutinee/0"),
+        NIL
+    );
 }
