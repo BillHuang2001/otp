@@ -362,6 +362,11 @@ holds `Process` values directly.
   relocated payload (via the public `Message::new(..).with_token(..).with_off_heap(..)` builder); the
   dict/saved-args regions are scattered back through their own `scatter_roots`. MSO handles are off-heap
   and do not move. This uses only `beam_message`'s public API — no sibling crate is modified.
+- **The process dictionary compares keys by raw `Eterm` word equality.** `Dict` is term-agnostic and has
+  no `AtomTable`, so exact equality holds for immediates and the same boxed object; structural equality
+  of two distinct-but-equal boxed keys (e.g. two separately built 2-tuples) needs `beam_term::compare::eq`
+  and is deliberately not a `Dict` dependency. The BIF layer supplies/copies values in and maps the
+  `None` (absent) result to the `undefined` atom.
 - **Monitor references are on-heap `Ref` things built locally (`monitor.rs`).** `beam_term` has no
   `make_ref` in M1, so a monitor reference is represented as the frozen 4-word ref thing
   `[make_header(3, REF_SUBTAG), node(0), serial, id]` built with `beam_term`'s public `make_header`;
