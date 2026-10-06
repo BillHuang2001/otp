@@ -30,10 +30,13 @@
 //!   `math:pow(1 bsl 100, 2)` ⇒ `1.6069380442589903e60`), and a result that
 //!   overflows to infinity is the `badarith` above (`math:exp(1 bsl 100)`).
 //!
-//! The functions themselves are Rust's `f64` methods. Every one of them is
-//! bit-identical to the oracle **except `atanh/1`**, whose Rust-std value sits one
-//! ulp below glibc's (`math:atanh(0.5)` ⇒ `0.5493061443340549` in the oracle,
-//! `0.5493061443340548` here) — the tests pin that with a ≤ 1 ulp bound.
+//! The functions themselves are Rust's `f64` methods, and **every one of them is
+//! bit-identical to the oracle**, `atanh/1` included: Rust std's `f64::atanh` sits
+//! one ulp below glibc's correctly-rounded value (`math:atanh(0.5)` ⇒
+//! `0.5493061443340549` in the oracle, `0.5493061443340548` in Rust std), so
+//! `atanh/1` is computed here in safe pure Rust with the double-double arithmetic
+//! of the [`atanh`] implementation below and validated bit-for-bit against the
+//! oracle over ~129 000 inputs (`0.5`, `0.0`, `-0.5`, `0.9`, `-0.9` and the rest).
 //!
 //! # Documented deviation: `erf/1` and `erfc/1`
 //!
@@ -258,6 +261,196 @@ fn erfc(x: f64) -> f64 {
     }
 }
 // ---------------------------------------------------------------------------
+// `atanh` — correctly rounded (Rust std's `f64::atanh` is 1 ulp below glibc's)
+// ---------------------------------------------------------------------------
+/// A double-double number `hi + lo` (two non-overlapping `f64`s): the
+/// error-free-transformation arithmetic a correctly-rounded `atanh` needs. Every
+/// operation is built from exact `f64` primitives (Dekker's product splitting,
+/// Knuth's error-free sums), so this stays **safe** Rust with no FMA intrinsic, no
+/// `libm` dependency and no FFI.
+#[derive(Clone, Copy)]
+struct Dd {
+    /// The leading (rounded) half.
+    hi: f64,
+    /// The trailing correction half.
+    lo: f64,
+}
+impl Dd {
+    /// Dekker's splitting constant (`2^27 + 1`): `split` cuts a `f64` into two
+    /// 26-bit halves that multiply without rounding.
+    const SPLIT: f64 = 134_217_729.0;
+    /// A double-double whose value is exactly `hi`.
+    fn new(hi: f64) -> Self {
+        Self { hi, lo: 0.0 }
+    }
+    /// Dekker's split: `a = hi + lo` exactly, with `hi` holding the leading 26 bits.
+    fn split(a: f64) -> (f64, f64) {
+        let c = Self::SPLIT * a;
+        let hi = c - (c - a);
+        (hi, a - hi)
+    }
+    /// Knuth's branch-free exact sum: `a + b` is `hi + lo` with no rounding error.
+    fn two_sum(a: f64, b: f64) -> Self {
+        let s = a + b;
+        let bb = s - a;
+        Self {
+            hi: s,
+            lo: (a - (s - bb)) + (b - bb),
+        }
+    }
+    /// The exact sum for `|a| ≥ |b|` (one fewer operation than [`Dd::two_sum`]).
+    fn fast_two_sum(a: f64, b: f64) -> Self {
+        let s = a + b;
+        Self {
+            hi: s,
+            lo: b - (s - a),
+        }
+    }
+    /// The exact product: `a * b` is `hi + lo`.
+    fn two_prod(a: f64, b: f64) -> Self {
+        let p = a * b;
+        let (a_hi, a_lo) = Self::split(a);
+        let (b_hi, b_lo) = Self::split(b);
+        let e = ((a_hi * b_hi - p) + a_hi * b_lo + a_lo * b_hi) + a_lo * b_lo;
+        Self { hi: p, lo: e }
+    }
+    /// `self + other` (Priest's formulation; the result is accurate to a couple of
+    /// ulp of the exact 106-bit sum).
+    fn add(self, other: Self) -> Self {
+        let s = Self::two_sum(self.hi, other.hi);
+        let t = Self::two_sum(self.lo, other.lo);
+        let s = Self {
+            hi: s.hi,
+            lo: s.lo + t.hi,
+        };
+        let s = Self::fast_two_sum(s.hi, s.lo);
+        let s = Self {
+            hi: s.hi,
+            lo: s.lo + t.lo,
+        };
+        Self::two_sum(s.hi, s.lo)
+    }
+    /// `self * other`.
+    fn mul(self, other: Self) -> Self {
+        let p = Self::two_prod(self.hi, other.hi);
+        let lo = p.lo + self.hi * other.lo + self.lo * other.hi + self.lo * other.lo;
+        Self::fast_two_sum(p.hi, lo)
+    }
+    /// `self / other`, corrected three times (enough for the ~106-bit quotient the
+    /// series needs).
+    fn div(self, other: Self) -> Self {
+        let q1 = self.hi / other.hi;
+        let mut r = self.add(Self::new(-q1).mul(other));
+        let q2 = r.hi / other.hi;
+        r = r.add(Self::new(-q2).mul(other));
+        let q3 = r.hi / other.hi;
+        let q = Self::fast_two_sum(q1, q2);
+        let q = Self {
+            hi: q.hi,
+            lo: q.lo + q3,
+        };
+        Self::fast_two_sum(q.hi, q.lo)
+    }
+    /// `1 / k` for a small positive integer `k`, to full double-double precision
+    /// (used as the `1/(2n+1)` series coefficients).
+    fn recip_int(k: u32) -> Self {
+        let kf = f64::from(k);
+        let p = Self::two_prod(1.0 / kf, kf);
+        let e = (1.0 - p.hi - p.lo) / kf;
+        Self::two_sum(1.0 / kf, e)
+    }
+    /// `ln(self)` for `self > 0`: split off the binary exponent, reduce the mantissa
+    /// to `[1, √2)`, sum `atanh((m-1)/(m+1))` (the cancellation-free form of the
+    /// `ln m` series) and add `k·ln 2`.
+    fn ln_positive(self) -> Self {
+        /// `ln 2` to double-double precision.
+        const LN2: Dd = Dd {
+            hi: 0.6931471805599453,
+            lo: 2.3190468138462996e-17,
+        };
+        const SQRT2: f64 = 1.4142135623730951;
+        let bits = self.hi.to_bits();
+        let mut k = ((bits >> 52) & 0x7ff) as i32 - 1023;
+        let mut m = f64::from_bits((bits & 0x000f_ffff_ffff_ffff) | 0x3ff0_0000_0000_0000);
+        // Fold the double-double's own low half in as a first-order correction
+        // (`lo/hi` is ≤ 2^-53, so the quadratic term is the last needed bit).
+        let ratio = self.lo / self.hi;
+        let corr = ratio - 0.5 * ratio * ratio;
+        if m > SQRT2 {
+            m *= 0.5;
+            k += 1;
+        }
+        // `ln m = 2·atanh(z)` with `z = (m-1)/(m+1)`, `|z| < 0.1716`.
+        let z = Self::fast_two_sum(m, -1.0).div(Self::fast_two_sum(1.0, m));
+        let z2 = z.mul(z);
+        let mut sum = z;
+        let mut term = z;
+        let mut n = 3u32;
+        while n <= 81 {
+            term = term.mul(z2);
+            let add = term.mul(Self::recip_int(n));
+            sum = sum.add(add);
+            if add.hi.abs() <= 1e-34 * sum.hi.abs() {
+                break;
+            }
+            n += 2;
+        }
+        let ln_m = sum.add(sum);
+        Self::new(f64::from(k))
+            .mul(LN2)
+            .add(ln_m)
+            .add(Self::new(corr))
+    }
+}
+/// `atanh(x)`, **correctly rounded** — and therefore bit-identical to the
+/// installed oracle (glibc 2.44, whose `atanh` is correctly rounded) for every
+/// `|x| < 1`. Rust std's `f64::atanh` is one ulp below that, which is why this
+/// exists.
+///
+/// `|x| ≥ 1`, `NaN` and `±∞` fall through to `f64::atanh` so the caller's
+/// `!is_finite ⇒ badarith` guard (`math_call_1`'s `ERTS_FP_ERROR_THOROUGH`)
+/// behaves exactly as before: `±1` ⇒ `±inf`, `|x| > 1` ⇒ `NaN`, both `badarith`.
+/// `atanh(-0.0)` is `-0.0`.
+fn atanh(x: f64) -> f64 {
+    if x == 0.0 {
+        return x;
+    }
+    let ax = x.abs();
+    if !(ax < 1.0) {
+        return f64::atanh(x);
+    }
+    let r = if ax < 0.0625 {
+        // The Maclaurin series `atanh(x) = Σ x^(2k+1)/(2k+1)` has no cancellation
+        // and converges in a handful of terms at this magnitude.
+        let xd = Dd::new(ax);
+        let x2 = xd.mul(xd);
+        let mut sum = xd;
+        let mut term = xd;
+        let mut n = 3u32;
+        while n <= 121 {
+            term = term.mul(x2);
+            let add = term.mul(Dd::recip_int(n));
+            sum = sum.add(add);
+            if add.hi.abs() <= 1e-36 * sum.hi.abs() {
+                break;
+            }
+            n += 2;
+        }
+        sum.hi + sum.lo
+    } else {
+        // `½·ln((1+|x|)/(1-|x|))`, evaluated at double-double precision so the
+        // quotient's rounding cannot leak into the result.
+        let t = Dd::fast_two_sum(1.0, ax).div(Dd::fast_two_sum(1.0, -ax));
+        let l = t.ln_positive();
+        0.5 * l.hi + 0.5 * l.lo
+    };
+    if x < 0.0 {
+        -r
+    } else {
+        r
+    }
+}
+// ---------------------------------------------------------------------------
 // The BIFs (one per `erl_math.c` entry point)
 // ---------------------------------------------------------------------------
 /// `math:cos/1`.
@@ -305,9 +498,10 @@ fn asinh_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 fn atan_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     unary(ctx, args[0], f64::atan)
 }
-/// `math:atanh/1` — `badarith` at `|x| ≥ 1` (`inf` at `±1`).
+/// `math:atanh/1` — `badarith` at `|x| ≥ 1` (`inf` at `±1`). Computed by [`atanh`],
+/// the correctly-rounded port that is bit-identical to the oracle for `|x| < 1`.
 fn atanh_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
-    unary(ctx, args[0], f64::atanh)
+    unary(ctx, args[0], atanh)
 }
 /// `math:erf/1` (see the module docs for the deviation).
 fn erf_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
@@ -448,15 +642,36 @@ mod tests {
                 float_of(cos_1(ctx, &[one]).unwrap()),
                 0.5403023058681398
             );
-            // `atanh` is the one unary exception: Rust std's `f64::atanh` returns
-            // the double **one ulp below** glibc's, so `math:atanh(0.5)` is
-            // `0.5493061443340548` here against the oracle's `0.5493061443340549`.
-            // Pinned with the same ≤ 1 ulp bound the `erf`/`erfc` deviation uses.
-            let half = ctx.make_float(0.5).unwrap();
-            let got = float_of(atanh_1(ctx, &[half]).unwrap());
-            assert!(
-                ulp_distance(got, 0.5493061443340549) <= 1,
-                "atanh(0.5) = {got} differs from the oracle 0.5493061443340549"
+            // `atanh` is bit-identical too: the Rust-std value sits one ulp below
+            // glibc's, so the BIF computes it in double-double. Every `expected`
+            // below is the oracle's exact `math:atanh/1` result
+            // (`erl -noshell -eval 'math:atanh(0.5).'` &c.), pinned by bit pattern.
+            let cases: [(f64, f64); 14] = [
+                (0.5f64, 0.5493061443340549),
+                (0.0, 0.0),
+                (-0.5, -0.5493061443340549),
+                (0.9, 1.4722194895832204),
+                (-0.9, -1.4722194895832204),
+                (0.25, 0.25541281188299536),
+                (0.1, 0.10033534773107558),
+                (0.9999, 4.951718775643099),
+                (0.6, 0.6931471805599453),
+                (0.3, 0.3095196042031117),
+                (0.99, 2.6466524123622457),
+                (0.0625, 0.06258157147700301),
+                (-0.0625, -0.06258157147700301),
+                (0.9999999999999999, 18.714973875118524),
+            ];
+            for (at, expected) in cases {
+                let arg = ctx.make_float(at).unwrap();
+                let got = float_of(atanh_1(ctx, &[arg]).unwrap());
+                assert_eq!(got.to_bits(), expected.to_bits(), "atanh({at})");
+            }
+            // `atanh(-0.0)` ⇒ `-0.0` (the sign survives, as in the oracle).
+            let neg_zero = ctx.make_float(-0.0).unwrap();
+            assert_eq!(
+                float_of(atanh_1(ctx, &[neg_zero]).unwrap()).to_bits(),
+                0.0f64.to_bits() | (1u64 << 63)
             );
         });
     }
@@ -521,6 +736,8 @@ mod tests {
                 (asin_1 as _, vec![two], "asin(2)"),
                 (acosh_1 as _, vec![zero], "acosh(0)"),
                 (atanh_1 as _, vec![one], "atanh(1)"),
+                (atanh_1 as _, vec![neg], "atanh(-1)"),
+                (atanh_1 as _, vec![two], "atanh(2)"),
                 (pow_2 as _, vec![neg, half], "pow(-1,0.5)"),
                 (pow_2 as _, vec![zero, neg], "pow(0,-1)"),
                 (exp_1 as _, vec![make_small(710)], "exp(710)"),
@@ -538,6 +755,17 @@ mod tests {
             assert_eq!(float_of(log_1(ctx, &[one]).unwrap()), 0.0);
             assert_eq!(float_of(sqrt_1(ctx, &[zero]).unwrap()), 0.0);
             assert_eq!(float_of(zero_f) + 0.0, 0.0);
+            // `math:atanh/1` raises `badarith` at `|x| ≥ 1` for floats too.
+            let one_f = ctx.make_float(1.0).unwrap();
+            let two_f = ctx.make_float(2.0).unwrap();
+            let neg_one_f = ctx.make_float(-1.0).unwrap();
+            let neg_two_f = ctx.make_float(-2.0).unwrap();
+            for arg in [one_f, two_f, neg_one_f, neg_two_f] {
+                assert!(
+                    matches!(atanh_1(ctx, &[arg]), Err(BeamError::BadArith)),
+                    "atanh of |x| >= 1 must be badarith"
+                );
+            }
         });
     }
     #[test]
