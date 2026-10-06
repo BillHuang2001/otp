@@ -1,46 +1,39 @@
-//! Bitstring term block (`ErlHeapBits` / `ErlSubBits`) — the **local** word-layout
-//! shim.
+//! Bitstring terms (`ErlHeapBits` / `ErlSubBits`): a **thin forwarding layer** over
+//! [`beam_term::bitstring`], the lowest common ancestor that owns the frozen
+//! bitstring block layout (crate-layer `CONTEXT.md` §2, "No duplication across
+//! crates").
 //!
-//! # Why this lives here (deliberate, temporary deviation)
+//! Nothing here re-derives a word offset, a tag or a mask:
 //!
-//! The frozen term layout is owned by `beam_term` (crate-layer `CONTEXT.md` §2,
-//! "No duplication across crates"). The bitstring block is the one boxed layout
-//! `beam_term` does **not** yet materialize — it exposes every primitive this shim
-//! needs (`HEAP_BITS_SUBTAG`, `SUB_BITS_SUBTAG`, `HEADER_SUB_BITS`, `make_header`,
-//! `make_boxed`, `boxed_val`, `is_bitstring`, `bitstring_size`) but no writer and no
-//! base/offset reader.
+//! * [`make_binary`] / [`make_bitstring`] size the block with
+//!   [`beam_term::bitstring::heap_bits_size_words`] and hand it to
+//!   [`beam_term::bitstring::write_heap_bits`], which writes the pinned
+//!   `[thing_word, n_bits, data…]` layout (zero-filled padding + cleared trailing
+//!   bits, so the term never carries the caller's garbage);
+//! * the readers ([`bitstring_parts`] / [`bitstring_size_bits`] /
+//!   [`bitstring_bytes`]) validate the term and then forward to
+//!   [`beam_term::bitstring::bitstring_parts`];
+//! * the sizing helpers (`bit_count_to_bytes` = `NBYTES(n_bits)`,
+//!   `heap_bits_size_words` = the `ErlHeapBits` block word count,
+//!   `BITSTRING_POINTER_FLAG_MASK` = the `base_flags` flag mask) are **re-exported**
+//!   from the owner, so every existing caller keeps its import path.
 //!
-//! `beam_codec`'s node may not write the sibling `beam_term`, so the (small) layout
-//! shim is implemented here instead of being added to `beam_term::thing`. It is
-//! built **only** from those public constants/primitives (no re-defined tag values),
-//! so the duplication is confined to the word arithmetic that `beam_term` will own
-//! once the binary constructor lands there.
+//! # The guard layer (the only logic this module still owns)
 //!
-//! TODO(extract to beam_term::thing): move `make_bitstring` / `bitstring_parts` /
-//! `bitstring_bytes` / `heap_bits_size_words` into `beam_term::thing` (next to
-//! `write_float`/`write_big`) and forward to them from here, exactly as this crate's
-//! float/bignum/flatmap/external-identifier helpers already do. Escalated to the
-//! parent node (it owns the crate-layer dependency graph).
+//! `beam_term`'s readers are `unsafe fn`s whose preconditions are *caller*
+//! invariants (they do not validate), so a term of the wrong kind or a corrupt block
+//! must become a typed [`beam_common::BeamError::BadArg`] here instead of reaching
+//! undefined behaviour (workspace `CONTEXT.md` §3). Rejected before the LCA reader is
+//! called:
 //!
-//! # The layout (ground truth `erts/emulator/beam/erl_bits.h:150-164`, `:59-77`)
+//! * a term that is not a bitstring at all;
+//! * an `ErlHeapBits` whose header arity disagrees with its `size` word;
+//! * an `ErlSubBits` whose `end` bit offset is below its `start` (the LCA reader
+//!   subtracts unconditionally).
 //!
-//! * `ErlHeapBits` = `[thing_word, n_bits, data…]` where
-//!   `thing_word = _make_header(heap_bits_size(n_bits) - 1, HEAP_BITS_SUBTAG)` and
-//!   `heap_bits_size(n_bits) = 2 + ceil(ceil(n_bits / 8) / sizeof(Eterm))`
-//!   (`heap_bin_size__(NBYTES(n_bits))`). The root is `make_bitstring(hp)` ==
-//!   `make_boxed(hp)`. The data words hold the payload bytes **little-endian**
-//!   (byte 0 at the lowest address of word 2 — a plain byte copy into `hp + 2`);
-//!   the unused trailing bits of the last byte are zero, and the padding bytes of
-//!   the trailing data word are zero as well (the C `memcpy` leaves them
-//!   uninitialised, which is harmless there but unrepresentable in safe Rust).
-//! * `ErlSubBits` = `[HEADER_SUB_BITS, base_flags, start, end, orig]`: `base_flags`
-//!   carries the base pointer with its low 2 bits used as flags
-//!   (`ERL_SUB_BITS_FLAG_MASK`, `erl_bits.h:95,124-125`), `start`/`end` are **bit**
-//!   offsets into that base and the size is `end - start`.
-//!
-//! Bit order is **MSB-first inside each byte**, exactly as the C copies it, so
-//! `<<1:3>>` is the single byte `0b0010_0000` with `n_bits = 3`; no bit shifting is
-//! required to materialize or read a bitstring — only a byte copy plus zero-fill.
+//! [`make_bitstring`] additionally requires `bytes` to be **exactly**
+//! `ceil(n_bits / 8)` bytes long, because `write_heap_bits` tolerates a longer slice
+//! and would silently drop the extra payload.
 //!
 //! # `unsafe` contract
 //!
@@ -51,62 +44,23 @@
 //! yields [`beam_common::BeamError::BadArg`] and a corrupt block is rejected by its
 //! self-describing header, never by undefined behaviour.
 
-use core::mem::size_of;
-
 use beam_alloc::Heap;
 use beam_common::Result;
-use beam_term::prelude::{
-    arityval, boxed_val, is_bitstring, make_boxed, make_header, Eterm, HEADER_SUB_BITS,
-    HEAP_BITS_SUBTAG,
+use beam_term::bitstring::{
+    bitstring_parts as beam_term_bitstring_parts, sub_bits_parts, write_heap_bits,
 };
+use beam_term::prelude::{arityval, boxed_val, is_bitstring, Eterm, HEADER_SUB_BITS};
 
 use crate::error;
 
-/// `ERL_SUB_BITS_FLAG_MASK` (`erl_bits.h:95`): the low two bits of an
-/// `ErlSubBits::base_flags` word carry the match-context / volatile flags, so the
-/// base pointer must be masked with `!ERL_SUB_BITS_FLAG_MASK` before use
-/// (`erl_sub_bits_get_base`, `erl_bits.h:124-125`).
-pub const BITSTRING_POINTER_FLAG_MASK: usize = 0x3;
-
-/// Number of bytes in one term word (`size_of::<Eterm>()`, 8 on the frozen
-/// `ARCH_64` layout).
-const WORD_BYTES: usize = size_of::<Eterm>();
-
-/// `ErlHeapBits` head size in words (`erl_bits.h:150-153`):
-/// `thing_word`, `size` — the data follows.
-const ERL_HEAP_BITS_HEAD_WORDS: usize = 2;
-
-/// Word index of `ErlSubBits::base_flags`.
-const SUB_BITS_BASE_WORD: usize = 1;
-/// Word index of `ErlSubBits::start`.
-const SUB_BITS_START_WORD: usize = 2;
-/// Word index of `ErlSubBits::end`.
-const SUB_BITS_END_WORD: usize = 3;
-
-/// `ceil(n / d)`, written with divisions only so it can never overflow (the
-/// `(n + d - 1) / d` form can wrap for a corrupt size word).
-#[inline]
-const fn ceil_div(n: usize, d: usize) -> usize {
-    n / d + ((n % d != 0) as usize)
-}
-
-/// `NBYTES(n_bits)` (`erl_bits.h:25`): the number of whole bytes a bit count
-/// occupies, i.e. `ceil(n_bits / 8)`. Overflow-free for every bit count.
-#[inline]
-pub const fn bit_count_to_bytes(n_bits: usize) -> usize {
-    ceil_div(n_bits, 8)
-}
-
-/// `heap_bits_size(num_bits)` (`erl_bits.h:157-164`): the word count of the
-/// `ErlHeapBits` block holding `n_bits` bits —
-/// `2 + ceil(ceil(n_bits / 8) / sizeof(Eterm))` (`heap_bin_size__(NBYTES(n))`).
-///
-/// Overflow-free for every bit count, so a corrupt `size` word is rejected by the
-/// header-arity check in [`bitstring_parts`] rather than wrapping.
-#[inline]
-pub const fn heap_bits_size_words(n_bits: usize) -> usize {
-    ERL_HEAP_BITS_HEAD_WORDS + ceil_div(bit_count_to_bytes(n_bits), WORD_BYTES)
-}
+/// The bit/word sizing helpers, **re-exported verbatim from the layout owner**
+/// ([`beam_term::bitstring`]): [`bit_count_to_bytes`] is `NBYTES(n_bits)`
+/// (`erl_bits.h:25`), [`heap_bits_size_words`] is the `ErlHeapBits` block word count
+/// (`erl_bits.h:156-164`) and [`BITSTRING_POINTER_FLAG_MASK`] is the mask of the
+/// `ErlSubBits::base_flags` flag bits (`erl_bits.h:95`).
+pub use beam_term::bitstring::{
+    bit_count_to_bytes, heap_bits_size_words, BITSTRING_POINTER_FLAG_MASK,
+};
 
 /// Materializes a **binary** (`n_bits = bytes.len() * 8`) on `heap`.
 ///
@@ -137,42 +91,30 @@ pub fn make_binary(heap: &mut Heap, bytes: &[u8]) -> Result<Eterm> {
 /// C decoder copies the trailing byte verbatim; equality/`term_to_binary` ignore
 /// those bits there, and zeroing them here makes our own round-trip canonical).
 ///
+/// The block is sized with [`heap_bits_size_words`] and written by
+/// [`beam_term::bitstring::write_heap_bits`], which owns the layout.
+///
 /// A `bytes` length that is not `ceil(n_bits / 8)` (in particular
-/// `n_bits > bytes.len() * 8`) yields `BeamError::BadArg`; so does a bit count whose
-/// block size would overflow.
+/// `n_bits > bytes.len() * 8`) yields `BeamError::BadArg` **before** anything is
+/// allocated; so does a block size that cannot be satisfied.
 pub fn make_bitstring(heap: &mut Heap, bytes: &[u8], n_bits: usize) -> Result<Eterm> {
-    let n_bytes = bit_count_to_bytes(n_bits);
-    if bytes.len() != n_bytes {
+    if bytes.len() != bit_count_to_bytes(n_bits) {
         return Err(error::bad_arg());
     }
     let words = heap_bits_size_words(n_bits);
     // SAFETY: `alloc_words` returned `words` exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(words)? };
-    // SAFETY: `hp` owns `words = 2 + ceil(n_bytes / WORD_BYTES)` words: word 0 is the
-    // header, word 1 the bit size and words `2..` the data — exactly the `ErlHeapBits`
-    // layout (`erl_bits.h:150-164`), so the header arity is `words - 1` and the root is
-    // `make_bitstring(hp) == make_boxed(hp)`. The data words are zeroed first (so the
-    // padding bytes of the trailing data word are initialised), then the `n_bytes`
-    // payload bytes are copied in little-endian (byte 0 at the lowest address of word
-    // 2), and finally the unused trailing bits of the last byte are cleared.
-    unsafe {
-        *hp = make_header(words - 1, HEAP_BITS_SUBTAG);
-        *hp.add(1) = Eterm::from_raw(n_bits);
-        let data = hp.add(ERL_HEAP_BITS_HEAD_WORDS).cast::<u8>();
-        let data_bytes = words * WORD_BYTES - ERL_HEAP_BITS_HEAD_WORDS * WORD_BYTES;
-        core::ptr::write_bytes(data, 0, data_bytes);
-        core::ptr::copy_nonoverlapping(bytes.as_ptr(), data, bytes.len());
-        let tail = n_bits % 8;
-        if tail != 0 {
-            *data.add(bytes.len() - 1) &= 0xFFu8 << (8 - tail);
-        }
-    }
-    Ok(make_boxed(hp))
+    // SAFETY: `hp` owns `heap_bits_size_words(n_bits)` words and `bytes` is exactly
+    // `ceil(n_bits / 8)` bytes long — the two preconditions `write_heap_bits`
+    // documents. The block stays live (and unmoved) on `heap` for as long as the
+    // returned term is used.
+    Ok(unsafe { write_heap_bits(hp, bytes, n_bits)? })
 }
 
 /// Splits a bitstring term into `(base, offset_bits, size_bits)`.
 ///
-/// Both bitstring representations are handled:
+/// Both bitstring representations are handled by
+/// [`beam_term::bitstring::bitstring_parts`], the layout owner:
 ///
 /// * `ErlHeapBits` — `base = boxed_val(t) + 2`, `offset_bits = 0`,
 ///   `size_bits` = the `size` word;
@@ -190,42 +132,35 @@ pub fn bitstring_parts(term: Eterm) -> Result<(*const u8, usize, usize)> {
     if !unsafe { is_bitstring(term) } {
         return Err(error::bad_arg());
     }
-    let p = boxed_val(term);
     // SAFETY: `is_bitstring` established that `term` is boxed with a live, initialised
     // header word, so reading that word is sound.
-    let header = unsafe { *p };
+    let header = unsafe { *boxed_val(term) };
     if header == HEADER_SUB_BITS {
         // `ErlSubBits`: the header value fixes the block at `ERL_SUB_BITS_SIZE` words,
         // so words 1..4 are live and initialised by the writer.
         // SAFETY: as above — the header identifies a full `ErlSubBits` block.
-        let (base_flags, start, end) = unsafe {
-            (
-                (*p.add(SUB_BITS_BASE_WORD)).raw(),
-                (*p.add(SUB_BITS_START_WORD)).raw(),
-                (*p.add(SUB_BITS_END_WORD)).raw(),
-            )
-        };
-        // A negative size is impossible in a well-formed term; reject rather than
-        // wrapping the subtraction.
-        let Some(size_bits) = end.checked_sub(start) else {
+        let (_base_flags, start, end, _orig) = unsafe { sub_bits_parts(term) };
+        // The LCA reader computes `end - start` unconditionally. A negative size is
+        // impossible in a well-formed term, so reject it here rather than let the
+        // subtraction wrap.
+        if end.raw() < start.raw() {
             return Err(error::bad_arg());
-        };
-        let base = base_flags & !BITSTRING_POINTER_FLAG_MASK;
-        Ok((base as *const u8, start, size_bits))
+        }
     } else {
         // `ErlHeapBits`: `[thing_word, size, data…]`. The header arity is
         // `heap_bits_size(size) - 1`; a mismatch means a corrupt/mismatched block.
-        // SAFETY: the header is a live term word.
-        let size_bits = unsafe { (*p.add(1)).raw() };
+        // SAFETY: the header is a live term word and word 1 is the size word of a
+        // 2-word-or-longer `ErlHeapBits` block (`erl_bits.h:150-164`).
+        let size_bits = unsafe { (*boxed_val(term).add(1)).raw() };
         if heap_bits_size_words(size_bits) != arityval(header) + 1 {
             return Err(error::bad_arg());
         }
-        // SAFETY: the arity check fixed the block at `2 + ceil(n_bytes/WORD_BYTES)`
-        // words, so word 2 (the first data byte) is inside it and stays live for as long
-        // as the caller keeps the owning heap alive.
-        let base = unsafe { p.add(ERL_HEAP_BITS_HEAD_WORDS).cast::<u8>() };
-        Ok((base, 0, size_bits))
     }
+    // SAFETY: `term` is a live bitstring and, for either representation, its block has
+    // just been validated (for a sub-bitstring, `end >= start`); the returned base
+    // borrows the term's storage, so the caller keeps the owning heap (or the
+    // underlying binary) alive and unmoved while it is used.
+    Ok(unsafe { beam_term_bitstring_parts(term) })
 }
 
 /// The bit size of a bitstring term.
@@ -265,12 +200,13 @@ pub fn bitstring_bytes<'a>(term: Eterm) -> Result<(&'a [u8], usize, usize)> {
 
 #[cfg(test)]
 mod tests {
-    //! Raw-word tests of the bitstring shim: the block layout is asserted word by
-    //! word against `erl_bits.h`, both representations are read back, and every
-    //! error path is checked to be `BadArg` with no panic.
+    //! Forwarding tests: the layout itself is asserted word by word in
+    //! `beam_term::bitstring`; here we pin that this layer delegates to it (the same
+    //! block, the same sizing) and that every guard turns a mismatched term into
+    //! `BadArg` with no panic.
 
     use beam_common::BeamError;
-    use beam_term::prelude::{make_small, NIL};
+    use beam_term::prelude::{make_boxed, make_header, make_small, HEAP_BITS_SUBTAG, NIL};
 
     use super::*;
 
@@ -279,7 +215,7 @@ mod tests {
         Heap::new(64).expect("the carrier allocator never fails for a tiny heap")
     }
 
-    /// Asserts a shim call failed with `BeamError::BadArg`.
+    /// Asserts a layer call failed with `BeamError::BadArg`.
     fn assert_bad_arg<T: core::fmt::Debug>(result: Result<T>) {
         match result {
             Err(BeamError::BadArg) => {}
@@ -288,21 +224,26 @@ mod tests {
     }
 
     #[test]
-    fn bit_count_and_block_size_match_erl_bits_h() {
-        assert_eq!(bit_count_to_bytes(0), 0);
-        assert_eq!(bit_count_to_bytes(1), 1);
-        assert_eq!(bit_count_to_bytes(8), 1);
-        assert_eq!(bit_count_to_bytes(9), 2);
-        assert_eq!(bit_count_to_bytes(64), 8);
-        assert_eq!(bit_count_to_bytes(65), 9);
-
-        // `heap_bits_size(n_bits) = 2 + ceil(ceil(n_bits/8)/8)`.
-        assert_eq!(heap_bits_size_words(0), 2);
-        assert_eq!(heap_bits_size_words(1), 3);
-        assert_eq!(heap_bits_size_words(64), 3);
-        assert_eq!(heap_bits_size_words(65), 4);
-        assert_eq!(heap_bits_size_words(512), 10);
-        // An absurd size word stays finite instead of wrapping or panicking.
+    fn sizing_helpers_are_the_beam_term_ones() {
+        for n in [0usize, 1, 7, 8, 9, 63, 64, 65, 512, 513, usize::MAX] {
+            assert_eq!(
+                bit_count_to_bytes(n),
+                beam_term::bitstring::bit_count_to_bytes(n),
+                "NBYTES({n})"
+            );
+            assert_eq!(
+                heap_bits_size_words(n),
+                beam_term::bitstring::heap_bits_size_words(n),
+                "heap_bits_size({n})"
+            );
+        }
+        assert_eq!(BITSTRING_POINTER_FLAG_MASK, 0x3);
+        assert_eq!(
+            heap_bits_size_words(512),
+            10,
+            "heap_bits_size(n) = 2 + ceil(NBYTES(n) / 8)"
+        );
+        // Overflow-free: an absurd size word stays finite instead of wrapping.
         assert!(heap_bits_size_words(usize::MAX) > heap_bits_size_words(512));
     }
 
@@ -366,7 +307,8 @@ mod tests {
         // `n_bits > bytes.len() * 8` — the classic lying bit count.
         assert_bad_arg(make_bitstring(&mut heap, &[0], 9));
         assert_bad_arg(make_bitstring(&mut heap, &[], 1));
-        // Too *many* bytes for the bit count is equally a contract violation.
+        // Too *many* bytes for the bit count is equally a contract violation
+        // (`write_heap_bits` would silently ignore the extra payload).
         assert_bad_arg(make_bitstring(&mut heap, &[0, 0], 3));
         assert_eq!(heap.used(), 0, "a rejected bitstring allocated nothing");
 
