@@ -216,9 +216,10 @@ impl Table {
 ### `info.rs` — introspection (`ets:info`)
 - `pub struct TableInfo { id, name: Option<Atom>, kind, keypos, access, size, memory, owner:
   Option<OwnerId>, named_table: bool, compressed: bool, write_concurrency: bool, read_concurrency: bool }`;
-  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — the `{Key, Value}` pairs
-  (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/`named_table`/…) the BIF layer
-  turns into the `ets:info/1` list. Heap-free.
+  `pub fn entries(&self, atoms: &mut AtomTable) -> Vec<(Atom, Eterm)>` — a heap-free subset of the
+  `{Key, Value}` pairs (`id`/`name`/`type`/`keypos`/`protection`/`size`/`memory`/`owner`/
+  `named_table`/…). The *observable* `ets:info/1` proplist is built by the sibling `beam_bifs`
+  bridge, not by this method; see Known Issues for the omitted fields.
 
 ### `error.rs` — failure constructors
 - `pub(crate) fn badarg() -> BeamError` — the `badarg` failures (bad object/`keypos`, absent element,
