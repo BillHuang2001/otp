@@ -27,7 +27,7 @@ use beam_term::prelude::{Atom, Eterm, PORT_DATA_SIZE};
 use crate::error;
 use crate::monitor::{Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator};
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
-use crate::process::{Process, ProcessState};
+use crate::process::{DeliverOutcome, Process, ProcessState};
 use crate::signal::{build_down_message, build_exit_message, exit_policy, ExitPolicy, ExitSignal, SignalAtoms};
 
 /// The outcome of applying an exit signal to a process.
@@ -160,6 +160,10 @@ pub struct ProcessTable {
     refs: RefAllocator,
     /// The well-known signal atoms.
     atoms: SignalAtoms,
+    /// The **wake list**: the pids of blocked processes that a delivery/signal has just made
+    /// runnable, so the single-threaded scheduler can absorb them (see
+    /// [`ProcessTable::drain_woken`] and `crate::scheduler::Scheduler::resume_woken`).
+    ready: Vec<ProcessId>,
 }
 
 impl ProcessTable {
@@ -171,9 +175,9 @@ impl ProcessTable {
             names: HashMap::new(),
             refs: RefAllocator::new(),
             atoms,
+            ready: Vec::new(),
         }
     }
-
     // --- allocation / lookup -------------------------------------------------
 
     /// Allocates a fresh pid, reusing a free slot with a bumped serial.
@@ -271,9 +275,10 @@ impl ProcessTable {
         // used to name this slot goes stale for good.
         slot.serial = slot.serial.wrapping_add(1);
         self.free.push(pid.number());
+        // A pid that is no longer live cannot be resumed: drop any pending wake for it.
+        self.ready.retain(|&woken| woken != pid);
         Some(process)
     }
-
     /// Removes the process named by `pid`.
     pub fn remove(&mut self, pid: ProcessId) -> Option<Process> {
         self.take(pid)
@@ -301,8 +306,72 @@ impl ProcessTable {
             .map(|(number, slot)| ProcessId::new(number as u64, slot.serial))
     }
 
-    // --- signals / links / monitors -----------------------------------------
+    // --- message delivery ----------------------------------------------------
 
+    /// Delivers `term` (with off-heap references resolved against `src_off_heap`) from `from`
+    /// into `to`'s mailbox, waking `to` when it was blocked.
+    ///
+    /// This is the table-level entry point a runner uses to send between processes: the wake
+    /// is recorded on the table's wake list and absorbed by
+    /// `crate::scheduler::Scheduler::resume_woken` at the end of the current slice, so a send
+    /// during a slice never lets `run_ready` exit with a freshly-woken process still queued.
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is unknown; propagates the copy engine's
+    /// `BeamError::Alloc` when the message still does not fit after a collection.
+    pub fn deliver(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        term: Eterm,
+        src_off_heap: &OffHeapTable,
+    ) -> Result<DeliverOutcome> {
+        let outcome = {
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Err(error::unknown_process());
+            };
+            recipient.deliver(from, term, src_off_heap)?
+        };
+        if outcome.woke() {
+            self.ready.push(to);
+        }
+        Ok(outcome)
+    }
+
+    /// The no-off-heap convenience form of [`ProcessTable::deliver`].
+    ///
+    /// # Errors
+    ///
+    /// Returns `BeamError::TermNotFound` when `to` is unknown; propagates the copy engine's
+    /// `BeamError::Alloc` when the message still does not fit after a collection.
+    pub fn deliver_simple(
+        &mut self,
+        to: ProcessId,
+        from: Eterm,
+        term: Eterm,
+    ) -> Result<DeliverOutcome> {
+        let no_off_heap = OffHeapTable::new();
+        self.deliver(to, from, term, &no_off_heap)
+    }
+
+    /// Returns — and clears — the pids of the blocked processes a delivery/signal has just
+    /// made runnable, in the order they were woken.
+    ///
+    /// `crate::scheduler::Scheduler::resume_woken` is the consumer; callers that send from
+    /// **outside** a scheduler slice call it (directly or via the scheduler) to learn which
+    /// processes to enqueue.
+    pub fn drain_woken(&mut self) -> Vec<ProcessId> {
+        core::mem::take(&mut self.ready)
+    }
+
+    /// The pids of the blocked processes a delivery/signal has just made runnable, without
+    /// clearing the wake list (see [`ProcessTable::drain_woken`]).
+    pub fn woken(&self) -> &[ProcessId] {
+        &self.ready
+    }
+
+    // --- signals / links / monitors -----------------------------------------
     /// Applies an exit signal to `target`, following [`crate::signal::exit_policy`].
     ///
     /// # Errors
@@ -334,8 +403,14 @@ impl ProcessTable {
                     let src = self.source_off_heap(target, signal.from, &fallback);
                     enqueue_exit_on(&mut recipient, &self.atoms, signal.from, signal.reason, src)
                 };
+                // A trapped `{'EXIT', …}` is a message too: wake a blocked target. The wake
+                // must be recorded before `insert` (which consumes `recipient`).
+                let woke = recipient.wake();
                 self.insert(recipient)?;
                 outcome?;
+                if woke {
+                    self.ready.push(target);
+                }
                 Ok(ExitEffect::Trapped)
             }
             ExitPolicy::Terminate(reason) => {
@@ -623,7 +698,8 @@ impl ProcessTable {
     }
 
     /// Enqueues `{'EXIT', from, reason}` into `to`'s mailbox, building it on `to`'s heap with
-    /// `reason` copied out of the heap described by `src_off_heap`.
+    /// `reason` copied out of the heap described by `src_off_heap`, and wakes `to` when it was
+    /// blocked.
     ///
     /// An unknown `to` is skipped: the caller is propagating a signal through the table and
     /// the target may have died earlier in the same propagation.
@@ -634,15 +710,23 @@ impl ProcessTable {
         reason: Eterm,
         src_off_heap: &OffHeapTable,
     ) -> Result<()> {
-        let atoms = &self.atoms;
-        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-            return Ok(());
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            enqueue_exit_on(recipient, atoms, from, reason, Some(src_off_heap))?;
+            recipient.wake()
         };
-        enqueue_exit_on(recipient, atoms, from, reason, Some(src_off_heap))
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
     }
 
     /// Enqueues `{'DOWN', reference, process, pid, reason}` into `to`'s mailbox, building it on
-    /// `to`'s heap with `reason` copied out of the heap described by `src_off_heap`.
+    /// `to`'s heap with `reason` copied out of the heap described by `src_off_heap`, and wakes
+    /// `to` when it was blocked.
     ///
     /// An unknown `to` is skipped (the watcher died earlier in the same propagation).
     fn enqueue_down_message(
@@ -653,21 +737,27 @@ impl ProcessTable {
         reason: Eterm,
         src_off_heap: &OffHeapTable,
     ) -> Result<()> {
-        let atoms = &self.atoms;
-        let Some(recipient) = lookup_mut(&mut self.slots, to) else {
-            return Ok(());
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let mut scratch = OffHeapTable::new();
+                let copied =
+                    copy_struct(reason, heap, &mut CopyContext::new(src_off_heap, &mut scratch))?;
+                let reference_term = reference.to_eterm(heap)?;
+                let term = build_down_message(heap, atoms, reference_term, pid, copied)?;
+                Ok((term, scratch.drain_handles()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, pid.to_eterm()).with_off_heap(off_heap));
+            recipient.wake()
         };
-        let (term, off_heap) = build_signal_term(recipient, |heap| {
-            let mut scratch = OffHeapTable::new();
-            let copied =
-                copy_struct(reason, heap, &mut CopyContext::new(src_off_heap, &mut scratch))?;
-            let reference_term = reference.to_eterm(heap)?;
-            let term = build_down_message(heap, atoms, reference_term, pid, copied)?;
-            Ok((term, scratch.drain_handles()))
-        })?;
-        recipient
-            .mailbox_mut()
-            .enqueue(Message::new(term, pid.to_eterm()).with_off_heap(off_heap));
+        if woke {
+            self.ready.push(to);
+        }
         Ok(())
     }
 }
@@ -841,6 +931,141 @@ mod tests {
             .bump_reductions(3);
         assert_eq!(table.get(pid).expect("still there").reductions(), 3);
         assert!(table.get(ProcessId::new(0, 7)).is_none());
+    }
+
+    #[test]
+    fn deliver_wakes_a_blocked_target_and_records_it_on_the_wake_list() {
+        let mut table = table();
+        let sender = table.spawn_default().expect("sender");
+        let receiver = table.spawn_default().expect("receiver");
+
+        // A runnable target is enqueued but not woken.
+        assert_eq!(
+            table
+                .deliver_simple(receiver, sender.to_eterm(), make_small(1))
+                .expect("the receiver is live"),
+            DeliverOutcome::Enqueued
+        );
+        assert!(table.woken().is_empty());
+
+        // A blocked target is woken and put on the wake list.
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_state(ProcessState::Waiting);
+        assert_eq!(
+            table
+                .deliver_simple(receiver, sender.to_eterm(), make_small(2))
+                .expect("the receiver is live"),
+            DeliverOutcome::Woke
+        );
+        assert_eq!(table.woken(), &[receiver]);
+        assert_eq!(
+            table.get(receiver).expect("the receiver is live").state(),
+            ProcessState::Runnable
+        );
+
+        // Draining returns and clears the list.
+        assert_eq!(table.drain_woken(), vec![receiver]);
+        assert!(table.woken().is_empty());
+
+        // Delivering to an unknown pid is an error.
+        assert!(matches!(
+            table.deliver_simple(ProcessId::new(999, 0), sender.to_eterm(), make_small(3)),
+            Err(BeamError::TermNotFound)
+        ));
+    }
+
+    #[test]
+    fn taking_a_woken_process_clears_its_pending_wake() {
+        let mut table = table();
+        let sender = table.spawn_default().expect("sender");
+        let receiver = table.spawn_default().expect("receiver");
+        table
+            .get_mut(receiver)
+            .expect("the receiver is live")
+            .set_state(ProcessState::Waiting);
+        table
+            .deliver_simple(receiver, sender.to_eterm(), make_small(1))
+            .expect("the receiver is live");
+        assert_eq!(table.woken(), &[receiver]);
+
+        // The process dies before it is resumed: its stale wake must be dropped.
+        table.remove(receiver).expect("the receiver is live");
+        assert!(table.woken().is_empty());
+    }
+
+    #[test]
+    fn a_trapped_exit_message_wakes_a_blocked_recipient() {
+        let (mut table, _names) = table_and_names();
+        let sender = table.spawn_default().expect("sender");
+        let receiver = table.spawn_default().expect("receiver");
+        table.get_mut(receiver).expect("receiver").set_trap_exit(true);
+        table
+            .get_mut(receiver)
+            .expect("receiver")
+            .set_state(ProcessState::Waiting);
+
+        assert_eq!(
+            table
+                .apply_exit_signal(
+                    receiver,
+                    ExitSignal {
+                        from: sender,
+                        reason: make_small(9),
+                    },
+                )
+                .expect("the receiver is live"),
+            ExitEffect::Trapped
+        );
+        assert_eq!(table.get(receiver).expect("receiver").mailbox().len(), 1);
+        assert_eq!(
+            table.get(receiver).expect("receiver").state(),
+            ProcessState::Runnable,
+            "the trapped exit message woke the receiver"
+        );
+        assert_eq!(table.woken(), &[receiver]);
+    }
+
+    #[test]
+    fn a_terminated_link_wakes_a_blocked_trapping_peer() {
+        let (mut table, _names) = table_and_names();
+        let a = table.spawn_default().expect("a");
+        let b = table.spawn_default().expect("b");
+        table.get_mut(b).expect("b").set_trap_exit(true);
+        table.link(a, b).expect("both pids are live");
+        table.get_mut(b).expect("b").set_state(ProcessState::Waiting);
+
+        table.terminate(a, make_small(7)).expect("a is live");
+        assert!(!table.contains(a));
+        assert_eq!(
+            table.get(b).expect("b").state(),
+            ProcessState::Runnable,
+            "the link exit message woke the trapping peer"
+        );
+        assert_eq!(table.woken(), &[b]);
+    }
+
+    #[test]
+    fn a_down_message_wakes_a_blocked_watcher() {
+        let (mut table, _names) = table_and_names();
+        let watcher = table.spawn_default().expect("watcher");
+        let target = table.spawn_default().expect("target");
+        table
+            .monitor(watcher, target, MonitorKind::Process)
+            .expect("both pids are live");
+        table
+            .get_mut(watcher)
+            .expect("watcher")
+            .set_state(ProcessState::Waiting);
+
+        table.terminate(target, make_small(3)).expect("target is live");
+        assert_eq!(
+            table.get(watcher).expect("watcher").state(),
+            ProcessState::Runnable,
+            "the down message woke the watcher"
+        );
+        assert_eq!(table.woken(), &[watcher]);
     }
 
     #[test]

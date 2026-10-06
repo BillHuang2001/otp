@@ -5,10 +5,14 @@
 //! recording [`ProcessRunner`] shows strict round-robin scheduling (each ready process runs
 //! one slice in enqueue order, requeued at the tail on `Yield`), with a `Wait` process
 //! leaving the queue and never being rerun.
+//!
+//! It also pins the **resume-on-send** contract: a message delivered to a blocked
+//! (`Waiting`) receiver wakes it, and the scheduler absorbs that wake at the end of the
+//! current slice so `run_ready` does not exit with a freshly-woken process still pending.
 
 use beam_common::Result;
 use beam_process::prelude::*;
-use beam_term::prelude::AtomTable;
+use beam_term::prelude::{make_small, signed_value, AtomTable, Eterm};
 
 /// An empty table with a fresh atom table behind its signal atoms.
 fn table() -> ProcessTable {
@@ -149,4 +153,205 @@ fn a_waiting_process_leaves_the_run_queue_and_is_not_rerun() {
         2
     );
     assert_eq!(runner.order, vec![a, b, a, a]);
+}
+
+/// A runner modelling two processes: `a` blocks on an empty receive until `b` sends it `42`.
+struct ResumeRunner {
+    a: ProcessId,
+    b: ProcessId,
+    a_runs: u32,
+    b_runs: u32,
+    received: Option<Eterm>,
+}
+
+impl ResumeRunner {
+    fn new(a: ProcessId, b: ProcessId) -> ResumeRunner {
+        ResumeRunner {
+            a,
+            b,
+            a_runs: 0,
+            b_runs: 0,
+            received: None,
+        }
+    }
+}
+
+impl ProcessRunner for ResumeRunner {
+    fn run(
+        &mut self,
+        pid: ProcessId,
+        table: &mut ProcessTable,
+        _budget: u32,
+    ) -> Result<RunOutcome> {
+        if pid == self.a {
+            self.a_runs += 1;
+            let process = table.get_mut(pid).expect("a is live");
+            match process.receive(|message| message.payload() == make_small(42)) {
+                Some(message) => {
+                    self.received = Some(message.payload());
+                    Ok(RunOutcome::Exit(make_small(0)))
+                }
+                None => {
+                    // Block on the empty receive: the runner owns the state transition.
+                    process.set_state(ProcessState::Waiting);
+                    Ok(RunOutcome::Wait)
+                }
+            }
+        } else if pid == self.b {
+            self.b_runs += 1;
+            // Send the wake-up message, then block `b` itself.
+            table
+                .deliver_simple(self.a, pid.to_eterm(), make_small(42))
+                .expect("a is live and the immediate always fits");
+            table
+                .get_mut(pid)
+                .expect("b is live")
+                .set_state(ProcessState::Waiting);
+            Ok(RunOutcome::Wait)
+        } else {
+            Ok(RunOutcome::Yield)
+        }
+    }
+}
+
+#[test]
+fn a_send_wakes_a_blocked_receiver_in_the_same_sweep() {
+    let mut table = table();
+    let mut scheduler = Scheduler::new();
+    let a = table.spawn_default().expect("a");
+    let b = table.spawn_default().expect("b");
+    scheduler.enqueue(a);
+    scheduler.enqueue(b);
+
+    let mut runner = ResumeRunner::new(a, b);
+
+    // Slice 1: `a` finds an empty mailbox and blocks (leaving the run queue).
+    assert_eq!(
+        scheduler
+            .run_ready(&mut table, &mut runner, Some(1))
+            .expect("the runner never fails"),
+        1
+    );
+    assert_eq!(
+        table.get(a).expect("a is live").state(),
+        ProcessState::Waiting
+    );
+    assert!(!scheduler.run_queue().contains(a));
+
+    // Slice 2: `b` sends to the blocked `a`, then blocks too. The wake is absorbed into the
+    // very same sweep, so `run_ready` does not exit with `a` still pending.
+    assert_eq!(
+        scheduler
+            .run_ready(&mut table, &mut runner, Some(1))
+            .expect("the runner never fails"),
+        1
+    );
+    assert_eq!(
+        table.get(a).expect("a is live").state(),
+        ProcessState::Runnable,
+        "the send woke `a`"
+    );
+    assert!(
+        scheduler.run_queue().contains(a),
+        "the same sweep re-enqueued `a`"
+    );
+
+    // Now `a` runs again, consumes the message and exits.
+    scheduler
+        .run_ready(&mut table, &mut runner, None)
+        .expect("the runner never fails");
+    assert_eq!(runner.received, Some(make_small(42)));
+    assert_eq!(runner.a_runs, 2, "`a` ran once to block and once to receive");
+    assert_eq!(runner.b_runs, 1);
+    assert!(!table.contains(a), "`a` exited after receiving");
+}
+
+/// A runner driving a two-process counter ping-pong to a fixed `limit`.
+///
+/// Each process receives the current counter, and — while it is below `limit` — forwards
+/// `value + 1` to its peer and blocks; the process that receives `limit` records it and exits.
+/// Every forward send wakes the peer, so the chain only continues because of resume-on-send.
+struct PingPong {
+    a: ProcessId,
+    b: ProcessId,
+    limit: i64,
+    final_value: Option<i64>,
+    runs: u32,
+}
+
+impl ProcessRunner for PingPong {
+    fn run(
+        &mut self,
+        pid: ProcessId,
+        table: &mut ProcessTable,
+        _budget: u32,
+    ) -> Result<RunOutcome> {
+        self.runs += 1;
+        let peer = if pid == self.a { self.b } else { self.a };
+
+        let value = {
+            let process = table.get_mut(pid).expect("the process is live");
+            match process.receive(|_| true) {
+                Some(message) => signed_value(message.payload()),
+                None => {
+                    // No work queued: block (the runner owns the state transition).
+                    process.set_state(ProcessState::Waiting);
+                    return Ok(RunOutcome::Wait);
+                }
+            }
+        };
+
+        if value < self.limit {
+            table
+                .deliver_simple(peer, pid.to_eterm(), make_small(value + 1))
+                .expect("the peer is live and small ints always fit");
+            table
+                .get_mut(pid)
+                .expect("the process is live")
+                .set_state(ProcessState::Waiting);
+            Ok(RunOutcome::Wait)
+        } else {
+            self.final_value = Some(value);
+            Ok(RunOutcome::Exit(make_small(0)))
+        }
+    }
+}
+
+#[test]
+fn two_processes_ping_pong_until_the_bound() {
+    let mut table = table();
+    let mut scheduler = Scheduler::new();
+    let a = table.spawn_default().expect("a");
+    let b = table.spawn_default().expect("b");
+    scheduler.enqueue(a);
+    scheduler.enqueue(b);
+
+    // Kick off: hand `a` the counter at zero (it is runnable, so no wake is produced).
+    table
+        .deliver_simple(a, b.to_eterm(), make_small(0))
+        .expect("a is live");
+
+    let mut runner = PingPong {
+        a,
+        b,
+        limit: 5,
+        final_value: None,
+        runs: 0,
+    };
+    let slices = scheduler
+        .run_ready(&mut table, &mut runner, None)
+        .expect("the runner never fails");
+
+    assert_eq!(runner.final_value, Some(5), "the counter reached the bound");
+    assert_eq!(slices, 6, "one slice per forward step, each ending in a block");
+    assert_eq!(runner.runs, 6);
+    assert!(
+        !table.contains(b),
+        "the process that received the bound exited"
+    );
+    // The peer is parked in `receive`, waiting for a message that never comes.
+    assert_eq!(
+        table.get(a).expect("a is live").state(),
+        ProcessState::Waiting
+    );
 }
