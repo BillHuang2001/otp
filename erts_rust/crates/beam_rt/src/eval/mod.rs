@@ -52,7 +52,10 @@
 //! # Known Milestone-1 gaps (typed errors, never wrong results)
 //!
 //! * `!` (send) — there is no mailbox in `-eval`, so it is a typed `unsupported`.
-//! * `receive` without an `after` clause — likewise (it would block forever).
+//! * `receive` without an `after` clause — likewise (it would block forever). A
+//!   `receive … after T` *does* run: its clauses are matched against the port messages
+//!   `RuntimeContext::poll_port_messages` polls from `open_port/2` streams within `T` ms,
+//!   and the `after` body is the fallback.
 //! * `catch Expr` yields `{'EXIT', Reason}` for the `error`/`exit` classes (the
 //!   oracle appends a stacktrace); M1 evaluates without one.
 //!
@@ -1099,9 +1102,12 @@ impl Evaluator<'_, '_> {
 
     /// A `receive … after T` timeout as a millisecond count.
     ///
-    /// A negative or non-integer value is `error:badarg` (the oracle's own reason). The
-    /// atom `infinity` would block forever, which `-eval` (no mailbox) cannot do, so it is
-    /// a capability gap, not an error.
+    /// A negative value, a float or any other term is `error:badarg` (the oracle's own
+    /// reason for those). A value that is an integer but too wide to be a *small* integer (a
+    /// bignum) is also `badarg` — the evaluator has no safe bignum reader here and a
+    /// multi-quintillion-millisecond timeout is not representable anyway. The atom
+    /// `infinity` would block forever, which `-eval` (no mailbox) cannot do, so it is a
+    /// capability gap, not an error.
     fn timeout_millis(&mut self, value: Eterm) -> EResult<u64> {
         if is_small(value) {
             let millis = signed_value(value);
