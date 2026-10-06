@@ -1,0 +1,428 @@
+//! The native **baseline JIT** tier: typed IR → x86-64 basic blocks + driver loop.
+//!
+//! This is the backend behind [`Tier::BaselineJit`](crate::jit::Tier::BaselineJit)
+//! and the first [`JitBackend`] the engine actually builds. It is the *mechanism*,
+//! not an optimiser: every basic block of the module is lowered into a real
+//! `extern "C"` native function, but only the cheapest instructions are emitted as
+//! machine code — everything else is executed by calling back into the
+//! interpreter's per-instruction step. The result is a genuine native execution
+//! path with **interpreter-identical semantics** (Part II §F: correctness first,
+//! the hot-tier optimisation follows in a later task).
+//!
+//! # The block ABI
+//!
+//! Each compiled basic block is
+//!
+//! ```text
+//! extern "C" fn(rt: *mut JitRuntime) -> i64
+//! ```
+//!
+//! It reads and writes the process state through `rt` and returns the **next
+//! control-flow target** as one `i64`:
+//!
+//! * `(func as i64) << 32 | (pc as i64)` — a normal continuation: keep executing at
+//!   code offset `pc` of the function at index `func` (see [`encode_target`]). The
+//!   encoding reserves the sign bit, so a valid target must satisfy
+//!   `func < 2^31` (every real module does).
+//! * [`HALT`] (`-1`) — the run finished; the driver yields `machine.finish()`
+//!   (`x(0)`).
+//! * [`ERROR`] (`-2`) — a raise (or any other typed error) was recorded in
+//!   `rt.error`; the driver returns it.
+//!
+//! The driver ([`run_compiled`]) decodes that word, looks the target up in the
+//! block-entry table and calls the next block, falling back to a single
+//! interpreter step for any address no block was compiled for.
+//!
+//! # The runtime block (`JitRuntime`)
+//!
+//! [`JitRuntime`] is the one argument a block receives: a `#[repr(C)]` bag of raw
+//! pointers at the live driver-owned objects plus the helper error slot. Generated
+//! code loads exactly two of its fields: `x_regs` (offset [`RUNTIME_XREGS_DISP`]) —
+//! the base of the machine's x-register array — and, through the helper scaffolding,
+//! nothing else; the remaining fields are read by the Rust-side [`jit_step_one`].
+//! `machine` (offset [`RUNTIME_MACHINE_DISP`]) is the [`Machine`] the helper needs;
+//! a block never touches it, because `[base + n*8]` addressing must be based on the
+//! **array** (`machine.x`), not on the address of the `Vec` field inside a
+//! non-`repr(C)` Rust struct.
+//!
+//! # Register allocation and spill-across-blocks
+//!
+//! A block caches up to [`CACHE_REGISTERS`]` .len()` x-registers in callee-saved
+//! machine registers (`r12`–`r15`); `rbx` is reserved for the machine base pointer
+//! (loaded once from `rt.machine`) and the `rt` argument itself lives in the 16-byte
+//! stack slot the prologue reserves. The prologue pushes every callee-saved register
+//! it touches (so the Rust caller's state is preserved), loads the cached
+//! x-registers out of `machine.x`, and the epilogue **spills them back at every
+//! block exit**. That is the whole liveness model: within a block the cached values
+//! live in registers, and at a block boundary they are always back in `machine.x`,
+//! so a helper call / GC / the next block sees the interpreter's exact root set
+//! (`x[0..live)` + the whole stack) with no per-frame liveness maps
+//! (`../../CONTEXT.md` §4).
+//!
+//! A block that references more than the cached budget simply does not inline those
+//! `move`s — the extras are executed by the helper, which is always correct. The
+//! allocation is computed by [`allocate_registers`] from the block's *shape*-
+//! inlinable `move`s, in first-appearance order, so a block's inline prefix always
+//! has the registers it wants.
+//!
+//! # What is inlined, what is helper-executed
+//!
+//! **Inlined** (emitted natively, no interpreter round-trip):
+//!
+//! * the metadata no-ops (`label`/`line`/`func_info`/`int_code_end`/
+//!   `executable_line`/`debug_line`) — nothing at all;
+//! * `move Src Dst` where `Dst` is an x-register (`x`/`tr`-annotated) **and**
+//!   `Src` is an x-register or a constant (`Integer`/`Character`/`Atom`/`Nil`) —
+//!   a `mov` between the allocated machine registers, or a `mov` of the raw `Eterm`
+//!   word (`make_small`/`make_atom`/`NIL`);
+//! * `jump Label` whose target resolves in the module-wide label map — the
+//!   `(func, pc)` pair is known at compile time, so it is a constant return word;
+//! * the **guarded small-int arithmetic fast path** for `gc_bif` of
+//!   `erlang:'+'/2` and `erlang:'-'/2`: the tagged-word arithmetic is emitted
+//!   natively behind a small-int guard + overflow + range check, and *any* case
+//!   the guard rejects (a non-small operand, an `i64` overflow, a result outside
+//!   `MIN_SMALL..=MAX_SMALL`) jumps straight to `jit_step_one`, which runs the
+//!   real BIF and produces the bignum/float/error result natively unreachable
+//!   here. This is the tier's one optimisation (`../../CONTEXT.md` §7); it is
+//!   conservative by construction — it can only ever produce a result the helper
+//!   would have produced — see [`try_inline_gc_bif`].
+//!
+//! **Helper-executed** (`jit_step_one`, literally the interpreter's
+//! [`Machine::step_instruction`](crate::Machine)): **every other instruction**, plus
+//! a `move` with an operand outside the cached set, a `jump` to a label the
+//! module does not define (so the interpreter's exact `unknown_label` error
+//! surfaces rather than an invented one), and a `gc_bif` with either an
+//! un-cacheable operand or a BIF outside the fast path's two (or a fast-path
+//! `gc_bif` whose registers the allocator's four-register budget could not
+//! cache).
+//!
+//! A block's *inline prefix* runs natively and the **first** non-inlinable
+//! instruction is handed to the helper, after which the block returns: this is the
+//! documented per-instruction deopt, and it is what gives the tier full opcode
+//! coverage with interpreter-identical semantics on day one.
+//!
+//! # `unsafe`
+//!
+//! This is a designated JIT unsafe zone: it reconstructs `&mut Machine` /
+//! `&mut dyn ExecutionContext` from [`JitRuntime`]'s raw pointers and calls into
+//! sealed executable memory. The crate root keeps `#![deny(unsafe_code)]`; the
+//! module-local `#![allow(unsafe_code)]` below is the second JIT exception
+//! (alongside [`crate::jit::emitter`]). Every `unsafe` block carries a
+//! `// SAFETY:` rationale.
+#![allow(unsafe_code)]
+
+use std::collections::{BTreeMap, HashMap};
+use std::mem;
+
+use beam_common::Result;
+use beam_loader::{Atom, Label, Module};
+use beam_term::Eterm;
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::interpreter;
+use crate::jit::emitter::CodeBuffer;
+use crate::jit::JitBackend;
+use crate::machine::Machine;
+use crate::Step;
+
+mod emit;
+mod runtime;
+
+#[cfg(test)]
+mod tests;
+
+// The block ABI lives in `runtime`; re-export its names here so every item path
+// outside this module (`crate::jit::baseline::…`) stays exactly what it was.
+pub(crate) use emit::compile_module;
+pub use runtime::{decode_target, encode_target, ERROR, HALT};
+pub(crate) use runtime::{jit_step_one, JitRuntime};
+
+use runtime::NativeBlock;
+// ---------------------------------------------------------------------------
+// The block ABI
+// ---------------------------------------------------------------------------
+
+/// A native tier's compiled-code lookup, consulted once per driver iteration by
+/// [`run_native`].
+///
+/// A tier implements this for whatever it compiled: [`run_native`] hands it the
+/// current `(func, pc)` and the live [`JitRuntime`], and the tier either runs that
+/// address natively — returning the block-ABI word the code produced — or returns
+/// `None`, which makes the driver take exactly one interpreter step. Returning
+/// `None` must not touch the runtime: it is the "this tier has no code here"
+/// answer, and it is what keeps an uncovered address on the interpreter's exact
+/// semantics.
+pub(crate) trait NativeCode {
+    /// Run `(func, pc)` natively if this tier compiled it for that address.
+    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64>;
+}
+
+// ---------------------------------------------------------------------------
+// The backend
+// ---------------------------------------------------------------------------
+
+/// The native baseline tier.
+///
+/// A zero-sized selector: it holds no per-run code state, so the artifact it
+/// compiles ([`CompiledModule`]) is caller-owned and can be run any number of times
+/// through [`JitBackend::run_compiled`] without recompiling. The one-shot
+/// [`JitBackend::run_export`] (`run_with_tier` creates a fresh backend per run)
+/// compiles once and runs immediately; callers that run a module repeatedly use the
+/// two steps directly. Inlining quality and a cross-run code cache are *performance*
+/// concerns deferred to a later task — this is the mechanism and its correctness.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct BaselineJit;
+
+impl BaselineJit {
+    /// A baseline backend ready to compile and run a module.
+    pub fn new() -> BaselineJit {
+        BaselineJit
+    }
+}
+
+impl JitBackend for BaselineJit {
+    type Compiled = CompiledModule;
+
+    fn name(&self) -> &'static str {
+        "baseline-jit"
+    }
+
+    fn available(&self) -> bool {
+        true
+    }
+
+    /// Compile every basic block of `module` into native code.
+    fn compile(&mut self, module: &Module) -> Result<CompiledModule> {
+        compile_module(module)
+    }
+
+    /// Run exported `function/arity` through the driver loop on an already-compiled
+    /// artifact.
+    ///
+    /// The artifact is caller-owned and the backend holds no per-run code state, so
+    /// one [`CompiledModule`] can be run any number of times (on fresh machines)
+    /// without recompiling; [`JitBackend::run_export`] is the provided one-shot
+    /// convenience over `compile` + this.
+    fn run_compiled(
+        &self,
+        compiled: &CompiledModule,
+        machine: &mut Machine,
+        module: &Module,
+        function: Atom,
+        arity: u32,
+        args: &[Eterm],
+        ctx: &mut dyn ExecutionContext,
+    ) -> Result<Eterm> {
+        run_compiled(compiled, machine, module, function, arity, args, ctx)
+    }
+}
+
+/// The artifact [`BaselineJit::compile`] produces: one sealed, executable
+/// [`CodeBuffer`] plus the `(func, pc)` → native-entry table.
+///
+/// The buffer is `mmap`ped read+write, filled, and flipped to read+execute by
+/// [`CodeBuffer::seal`] — never writable and executable at the same time (see
+/// [`crate::jit::emitter`]). The entries are raw pointers into that mapping, so a
+/// `CompiledModule` must outlive every call into it and is neither `Send` nor
+/// `Sync`.
+pub struct CompiledModule {
+    /// The sealed code mapping every entry points into.
+    buffer: CodeBuffer,
+    /// The start `(func, pc)` of each compiled block → its native entry point.
+    entries: HashMap<(u32, u32), *const u8>,
+    /// The highest x-register index any block caches in a machine register.
+    ///
+    /// The driver refuses to enter native code when the running machine's register
+    /// file is not at least this long (see [`run_compiled`]).
+    highest_cached_register: Option<u32>,
+}
+
+impl CompiledModule {
+    /// The native entry point of the block starting at `(func, pc)`, if one was
+    /// compiled.
+    pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
+        self.entries.get(&(func, pc)).copied()
+    }
+
+    /// The number of compiled blocks.
+    pub fn block_count(&self) -> usize {
+        self.entries.len()
+    }
+
+    /// The highest x-register index cached in a machine register by any block.
+    pub fn highest_cached_register(&self) -> Option<u32> {
+        self.highest_cached_register
+    }
+
+    /// The number of bytes of machine code emitted.
+    pub fn code_len(&self) -> usize {
+        self.buffer.len()
+    }
+
+    /// The `[start, end)` address range of the executable code mapping.
+    ///
+    /// Every entry [`CompiledModule::entry`] returns lies inside it.
+    pub fn code_address_range(&self) -> (usize, usize) {
+        let start = self.buffer.code_ptr() as usize;
+        (start, start + self.buffer.len())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The driver
+// ---------------------------------------------------------------------------
+
+/// Run exported `function/arity` through the compiled blocks.
+///
+/// The native lookup is the compiled block table: any compiled `(func, pc)` is
+/// entered, and every other address stays on the interpreter step. See
+/// [`run_native`] for the shared driver the two native tiers run on.
+fn run_compiled(
+    compiled: &CompiledModule,
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Eterm> {
+    // A block loads its cached x-registers out of `machine.x` without a bounds
+    // check, so a machine whose register file is shorter than the highest cached
+    // index cannot enter native code; such a run stays on the interpreter step.
+    let native_ok = match compiled.highest_cached_register {
+        Some(highest) => machine.x.len() > highest as usize,
+        None => true,
+    };
+    let code = BlockEntries {
+        compiled,
+        native_ok,
+    };
+    run_native(machine, module, function, arity, args, ctx, &code)
+}
+
+/// The baseline tier's [`NativeCode`]: any compiled basic block may be entered.
+struct BlockEntries<'a> {
+    /// The compiled block table the addresses are looked up in.
+    compiled: &'a CompiledModule,
+    /// Whether the running machine's register file covers every cached slot; when
+    /// it does not, no block may be entered (see [`run_compiled`]).
+    native_ok: bool,
+}
+
+impl NativeCode for BlockEntries<'_> {
+    fn enter(&self, rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> Option<i64> {
+        if !self.native_ok {
+            return None;
+        }
+        let block_entry = self.compiled.entry(func, pc)?;
+        // SAFETY: `block_entry` points just past the start of a complete native
+        // function emitted by `emit_block` with exactly the `NativeBlock` signature
+        // (`extern "C" fn(*mut JitRuntime) -> i64`), inside a buffer sealed
+        // read+execute by `compile_module`; `rt` is the live driver-owned runtime
+        // block the driver does not otherwise borrow during the call.
+        let block: NativeBlock = unsafe { mem::transmute(block_entry) };
+        Some(block(rt))
+    }
+}
+
+/// The driver loop both native tiers run on.
+///
+/// Mirrors [`Machine::run_label`](crate::Machine)'s setup (reset, seed
+/// `x[0..arity)` from `args`, push the bottom frame, bind the module's literal
+/// area, resolve the export label and build the module-wide label map), then
+/// loops:
+///
+/// * ask `code` (the tier's [`NativeCode`] lookup) whether `(func, pc)` can run
+///   natively; when it can, the returned block-ABI word is folded exactly like a
+///   block's return value — [`HALT`] finishes the run, [`ERROR`] propagates
+///   `rt.error`, a `(func, pc)` pair continues there;
+/// * otherwise take exactly one interpreter step
+///   ([`Machine::step_instruction`](crate::Machine)), identically to the
+///   interpreter's own loop.
+///
+/// The second path is not an emergency fallback: it is each tier's documented
+/// per-instruction deopt, and it is also what happens for every address the tier
+/// compiled no entry point for (and, for the baseline tier, when the running
+/// machine's register file is too small — see [`run_compiled`]).
+pub(crate) fn run_native(
+    machine: &mut Machine,
+    module: &Module,
+    function: Atom,
+    arity: u32,
+    args: &[Eterm],
+    ctx: &mut dyn ExecutionContext,
+    code: &dyn NativeCode,
+) -> Result<Eterm> {
+    let entry = module
+        .export(function, arity)
+        .ok_or_else(|| error::unsupported("jit: export not found"))?;
+
+    machine.reset();
+    let n = arity.min(args.len() as u32);
+    for (i, arg) in args.iter().take(n as usize).enumerate() {
+        machine.set_x(i as u32, *arg)?;
+    }
+    machine.push_frame(0)?;
+    machine.set_literals(module.literals.clone());
+    let labels = interpreter::build_label_map(module);
+    let (mut func, mut pc) = interpreter::resolve_label(module, entry)?;
+
+    // The objects the runtime's raw pointers refer to. `machine_ptr`/`ctx_ptr` are
+    // the same addresses the [`JitRuntime`] holds; all of them outlive the loop, and
+    // no `&mut` of the driver's aliases them while a native call is in flight.
+    let x_regs: *mut Eterm = machine.x.as_mut_ptr();
+    let machine_ptr: *mut Machine = &mut *machine;
+    let ctx_ptr = &mut *ctx as *mut dyn ExecutionContext;
+    let mut rt = JitRuntime {
+        machine: machine_ptr,
+        x_regs,
+        module: module as *const Module,
+        labels: &labels as *const BTreeMap<Label, (u32, u32)>,
+        ctx: ctx_ptr,
+        error: None,
+    };
+
+    loop {
+        if let Some(word) = code.enter(&mut rt, func, pc) {
+            if word == HALT {
+                // SAFETY: `machine_ptr` points at the live driver-owned `Machine`;
+                // no native code is running here.
+                return unsafe { (*machine_ptr).finish() };
+            }
+            if word == ERROR {
+                return Err(rt
+                    .error
+                    .take()
+                    .unwrap_or_else(|| error::unsupported("jit: helper error")));
+            }
+            match decode_target(word) {
+                Some((next_func, next_pc)) => {
+                    func = next_func;
+                    pc = next_pc;
+                    continue;
+                }
+                None => return Err(error::unsupported("jit: bad block target")),
+            }
+        }
+
+        // SAFETY: the native call returned, so no `&mut` derived from `rt` is alive;
+        // `machine_ptr`/`ctx_ptr` point at the driver's live, distinct objects
+        // (`Machine` and the `ExecutionContext`), never at each other.
+        let step = unsafe { (*machine_ptr).step_instruction(module, &labels, func, pc, &mut *ctx_ptr)? };
+        match step {
+            Step::Next => pc += 1,
+            Step::Goto {
+                func: next_func,
+                pc: next_pc,
+            } => {
+                func = next_func;
+                pc = next_pc;
+            }
+            Step::Done => {
+                // SAFETY: `machine_ptr` points at the live driver-owned `Machine`.
+                return unsafe { (*machine_ptr).finish() };
+            }
+        }
+    }
+}
