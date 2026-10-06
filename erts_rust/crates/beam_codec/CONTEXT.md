@@ -599,7 +599,9 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
 - `tests/ground_truth.rs` → byte-exact `term_to_binary` fixture vectors (oracle-regenerated),
   incl. the `COMPRESSED` seed
 - `tests/roundtrip.rs` → exhaustive encode→decode round-trips + negative/truncation cases,
-  incl. the `COMPRESSED` wrapper round-trips and negatives
+  incl. the `COMPRESSED` wrapper/plain-revert round-trips and the oracle fun blobs (`EXPORT_EXT`,
+  `NEW_FUN_EXT` incl. the `fun() -> ok end` `erl_eval` golden)
+- `tests/record_roundtrip.rs` → byte-exact `RECORD_EXT` decode→re-encode (declaration-order) pin
 - `tests/atom_cache_writer.rs` → the `AtomCacheWriter` hook: cached vs uncached `Encoder` byte
   streams (`ATOM_CACHE_REF` `82` emission, no `NEW_CACHE`)
 - `tests/wire_roundtrip.rs` → end-to-end wire round-trips crossing the new seams (`LOCAL_EXT`
