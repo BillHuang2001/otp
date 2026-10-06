@@ -8,11 +8,13 @@ legacy headers so that a NIF/driver `.so` or `.o` compiled against the *unmodifi
 links against Rust ERTS and behaves identically. This is the **link-time frozen-header seam** of
 Part II §C — the struct layouts must never change; a mismatch here is an ABI break.
 
-This crate **declares types only**. It provides no `enif_*`/`erl_drv_*` *implementations* — those
-belong to the NIF/driver subsystem (this crate's own `nif::enif`/`nif::loader`, added in a later
-step, and `beam_rt`/`beam_bifs`/`beam_io`). What is frozen now is the *shape* of the boundary: the
-types, the layouts, the term transmute, the function-pointer tables (`ErlNifApi`, `ErlDrvApi`), and
-the **host seam** (`nif::host`) the `enif_*` layer will be implemented over.
+The crate freezes the *shape* of the boundary (the types, the layouts, the term transmute, the
+function-pointer tables `ErlNifApi`/`ErlDrvApi`) **and implements the NIF host side**: the host seam
+(`nif::host`), a working subset of the `enif_*` C functions (`nif::enif`), and the dynamic NIF
+loader (`nif::loader` — `dlopen`/`dlsym` plus the oracle's `erlang:load_nif/2` validation order).
+The **driver** C ABI (A.4) is still declarations only. The remaining `enif_*` bodies (resources,
+threads, I/O queues, selects, monitors, distribution, `priv_data`) belong to
+`beam_rt`/`beam_bifs`/`beam_io`.
 
 Ground truth (read-only, never modify): `../../erts/emulator/beam/erl_nif.h`,
 `erl_nif_api_funcs.h`, `erl_drv_nif.h`, `erl_driver.h`. These are the only stable ABI headers.
