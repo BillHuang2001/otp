@@ -155,7 +155,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 - `import_target` resolves an `ImportRef` to `(module name, function name, arity)` through `Module::imports` + `Module::atom_name`.
 
 ### Instruction subset — **executed by the core loop**
-`Label`, `Line`, `FuncInfo`, `IntCodeEnd`, `ExecutableLine`, `DebugLine` (metadata/no-ops: they do not change control flow).
+`Label`, `Line`, `FuncInfo`, `IntCodeEnd`, `ExecutableLine`, `DebugLine`, `NifStart` (`nif_start`), `OnLoad` (`on_load`) — metadata/no-ops: they do not change control flow. `nif_start`/`on_load` are the compiler's markers at the head of a NIF stub / an `-on_load` function; the C emulator falls through both (`../../erts/emulator/beam/emu/ops.tab` lists them as bare opcodes with no body), so `Step::Next` is their exact semantics.
 `Move`, `Swap`, `InitYregs` (`init_yregs` writes `NIL` into the listed Y registers).
 `Test` (**all** `TestKind`s, see below), `SelectVal` (exact `=:=` match against each `(value, label)`, else `fail`, else a raise when `fail == NO_FAIL`).
 `Jump`, `Call`, `CallLast`, `CallOnly`, `CallExt`, `CallExtOnly`, `CallExtLast`, `Allocate`, `AllocateHeap`, `TestHeap`, `Deallocate`, `Trim`, `Return`.
