@@ -438,13 +438,6 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   `EPERM`) fails the open with `BeamError::Io`, because the reactor is edge-triggered and cannot serve a blocking
   descriptor. Input is not line-framed (there is no `line` control verb):
   the `binary`/`list` choice rides on `SpawnStream` for the runtime to apply.
-- **`EfileDriver` cannot open a regular file.** `mio`/epoll rejects `EPOLL_CTL_ADD` on regular files (`EPERM`), so
-  `control("open", path)` fails with `BeamError::Io` for them; it works for the descriptors epoll supports
-  (pipes/FIFOs/char devices/sockets). A real `efile`/`inet` needs a non-epoll readiness source (a dedicated
-  poll/thread pool, or `io_uring`) — this drops in behind `EfileDriver`'s interface.
-- **`DriverContext` seam gaps for future drivers.** An `efile`/`inet` driver needing timer deadlines or port-exit
-  notifications has no seam: `Driver::timeout` exists but nothing schedules it (`schedule_timeout` is only on
-  `Port`), and there is no port-exit notification channel to the driver.
 - **`port_control`/control atoms are not decoded here.** `port_control(op, &[u8])` takes a `&str` op + raw bytes;
   the C decodes Erlang tuples in `io.c` — atom/tuple decoding of `{command, …}`/`{connect, …}` is the runtime's job.
 - **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of scope (as in
