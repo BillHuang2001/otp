@@ -22,16 +22,17 @@ use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
 use beam_gc::HeapPolicy;
 use beam_message::{copy_struct, CopyContext, Message, MsoHandle, OffHeapTable};
-use beam_term::prelude::{Atom, Eterm, PORT_DATA_SIZE};
+use beam_term::prelude::{Atom, Eterm};
 
 use crate::error;
 use crate::monitor::{Monitor, MonitorKind, MonitorRef, MonitoredBy, RefAllocator};
 use crate::pid::{PortId, ProcessId, MAX_PROCESS_NUMBER};
+use crate::port::PortTable;
 use crate::process::{DeliverOutcome, Process, ProcessState};
 use crate::remote::{DistSignal, DistSignalRouter, PidTarget, RemoteMonitor, RemotePid};
 use crate::signal::{
-    build_down_message, build_down_message_remote, build_exit_message, build_exit_message_term,
-    exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
+    build_down_message, build_down_message_port, build_down_message_remote, build_exit_message,
+    build_exit_message_term, exit_policy, ExitPolicy, ExitSignal, SignalAtoms,
 };
 
 /// The outcome of applying an exit signal to a process.
@@ -1148,79 +1149,111 @@ impl ProcessTable {
         }
         Ok(())
     }
-}
 
-/// The minimal port-id table: allocation and ownership only.
-///
-/// Port *behaviour* (scheduling, port signals, port links/monitors) is `beam_io`'s; this is
-/// only the number table the legacy C keeps alongside the pid table.
-pub struct PortTable {
-    /// Number → whether the slot is in use.
-    slots: Vec<bool>,
-    /// Free slot numbers available for reuse.
-    free: Vec<u64>,
-}
+    // --- port close propagation ----------------------------------------------
 
-impl PortTable {
-    /// An empty port table.
-    pub fn new() -> PortTable {
-        PortTable {
-            slots: Vec::new(),
-            free: Vec::new(),
-        }
-    }
-
-    /// Allocates a fresh port id.
+    /// Reports that `port` has closed with `reason`: delivers
+    /// `{'DOWN', Ref, port, Port, Reason}` to every process monitoring the port (via
+    /// [`PortTable::close`]) and an `{'EXIT', Port, Reason}` signal to every process linked
+    /// to it.
+    ///
+    /// A linked process follows [`exit_policy`]: a trapping peer receives the `{'EXIT', …}`
+    /// message, a non-trapping one terminates with `reason` (cascading through its own links
+    /// and monitors), and a `normal` reason is ignored. A peer that already died is skipped.
     ///
     /// # Errors
     ///
-    /// Returns `BeamError::SystemLimit` when the port number space is exhausted.
-    pub fn alloc(&mut self) -> Result<PortId> {
-        if let Some(number) = self.free.pop() {
-            if let Some(slot) = self.slots.get_mut(number as usize) {
-                *slot = true;
-            }
-            return Ok(PortId::new(number));
-        }
-        let number = self.slots.len() as u64;
-        // The whole 60-bit immediate payload is the port number (`_PORT_DATA_SIZE`).
-        if number > (1u64 << PORT_DATA_SIZE) - 1 {
-            return Err(error::system_limit());
-        }
-        self.slots.push(true);
-        Ok(PortId::new(number))
-    }
+    /// Returns `BeamError::BadArg` when `port` is not allocated; propagates the message
+    /// builders' `BeamError::Alloc` (after a collection) and the cascading termination's
+    /// errors.
+    pub fn port_closed(&mut self, ports: &mut PortTable, port: PortId, reason: Eterm) -> Result<()> {
+        let closed = ports.close(port)?;
 
-    /// Releases `id`, returning its number to the free list.
-    pub fn release(&mut self, id: PortId) {
-        let number = id.number();
-        if let Some(slot) = self.slots.get_mut(number as usize) {
-            if *slot {
-                *slot = false;
-                self.free.push(number);
+        // 1. Monitors: every watcher is told the port is down.
+        for monitor in closed.monitors {
+            self.enqueue_port_down_message(monitor.watcher, monitor.reference, port, reason)?;
+        }
+
+        // 2. Links: each linked process either traps the exit or follows it.
+        for pid in closed.links {
+            let Some(peer) = self.get(pid) else {
+                // The peer died earlier.
+                continue;
+            };
+            let trapping = peer.is_trapping_exit();
+            match exit_policy(reason, trapping, &self.atoms) {
+                ExitPolicy::Ignore => {}
+                ExitPolicy::Trap => self.enqueue_port_exit_message(pid, port, reason)?,
+                ExitPolicy::Terminate(peer_reason) => self.terminate(pid, peer_reason)?,
             }
         }
+        Ok(())
     }
 
-    /// Whether `id` is currently allocated.
-    pub fn contains(&self, id: PortId) -> bool {
-        self.slots
-            .get(id.number() as usize)
-            .copied()
-            .unwrap_or(false)
+    /// Enqueues `{'DOWN', Ref, port, Port, Reason}` into `to`'s mailbox — built on `to`'s own
+    /// heap — and wakes `to` when it was blocked.
+    ///
+    /// An unknown `to` is skipped (the watcher died earlier).
+    fn enqueue_port_down_message(
+        &mut self,
+        to: ProcessId,
+        reference: MonitorRef,
+        port: PortId,
+        reason: Eterm,
+    ) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            let from = port.to_eterm();
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let reference_term = reference.to_eterm(heap)?;
+                let term = build_down_message_port(heap, atoms, reference_term, port, reason)?;
+                Ok((term, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
     }
 
-    /// The number of allocated ports.
-    pub fn len(&self) -> usize {
-        self.slots.iter().filter(|&&used| used).count()
+    /// Enqueues `{'EXIT', Port, Reason}` into `to`'s mailbox — built on `to`'s own heap — and
+    /// wakes `to` when it was blocked.
+    ///
+    /// An unknown `to` is skipped (the linked peer died earlier).
+    fn enqueue_port_exit_message(&mut self, to: ProcessId, port: PortId, reason: Eterm) -> Result<()> {
+        let woke = {
+            let atoms = &self.atoms;
+            let Some(recipient) = lookup_mut(&mut self.slots, to) else {
+                return Ok(());
+            };
+            let from = port.to_eterm();
+            let (term, off_heap) = build_signal_term(recipient, |heap| {
+                let term = build_exit_message_term(heap, atoms, from, reason)?;
+                Ok((term, Vec::<MsoHandle>::new()))
+            })?;
+            recipient
+                .mailbox_mut()
+                .enqueue(Message::new(term, from).with_off_heap(off_heap));
+            recipient.wake()
+        };
+        if woke {
+            self.ready.push(to);
+        }
+        Ok(())
     }
-}
-
-#[cfg(test)]
+}#[cfg(test)]
 mod tests {
     //! Unit tests for pid allocation/serial bumping/stale-pid rejection, the name
-    //! registry, link/unlink, the exit-signal outcomes, monitor/demonitor and the minimal
-    //! port table. The cascading link/monitor propagation is covered by `tests/signals.rs`.
+    //! registry, link/unlink, the exit-signal outcomes and monitor/demonitor. The cascading
+    //! link/monitor propagation is covered by `tests/signals.rs` and the port
+    //! ownership/link/monitor surface by `crate::port` and `tests/ports.rs`.
 
     use beam_term::prelude::{
         make_atom, make_small, tuple_element, tuple_size, AtomTable,
@@ -1651,31 +1684,5 @@ mod tests {
         table.register(name, pid2).expect("free again");
         table.remove(pid2);
         assert_eq!(table.registered().count(), 0);
-    }
-
-    #[test]
-    fn port_table_allocates_releases_and_reuses() {
-        let mut ports = PortTable::new();
-        assert_eq!(ports.len(), 0);
-
-        let a = ports.alloc().expect("room");
-        let b = ports.alloc().expect("room");
-        assert_ne!(a, b);
-        assert_eq!(ports.len(), 2);
-        assert!(ports.contains(a) && ports.contains(b));
-
-        ports.release(a);
-        assert!(!ports.contains(a));
-        assert_eq!(ports.len(), 1);
-
-        let reused = ports.alloc().expect("the freed number is reused");
-        assert_eq!(reused, a);
-        assert!(ports.contains(reused));
-        assert_eq!(ports.len(), 2);
-
-        // Releasing twice does not double-free.
-        ports.release(b);
-        ports.release(b);
-        assert_eq!(ports.len(), 1);
     }
 }

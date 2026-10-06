@@ -21,7 +21,7 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::{atom_val, is_atom, make_atom, Atom, AtomTable, Eterm};
 
-use crate::pid::ProcessId;
+use crate::pid::{PortId, ProcessId};
 use crate::remote::RemotePid;
 
 /// The well-known atom indices used to build signal messages.
@@ -255,6 +255,25 @@ pub fn build_down_message_remote(
     build_down_message_term(heap, atoms, reference, atoms.process(), target, reason)
 }
 
+/// Builds `{'DOWN', Reference, port, Port, Reason}` on `heap`.
+///
+/// The port analogue of [`build_down_message`]: the monitor tag slot carries the `port`
+/// atom rather than `process`, and the target is the port immediate (see
+/// `erts/emulator/beam/erl_monitor_link.c`).
+///
+/// # Errors
+///
+/// Propagates `BeamError::Alloc` when `heap` cannot fit the tuple.
+pub fn build_down_message_port(
+    heap: &mut Heap,
+    atoms: &SignalAtoms,
+    reference: Eterm,
+    port: PortId,
+    reason: Eterm,
+) -> Result<Eterm> {
+    build_down_message_term(heap, atoms, reference, atoms.port(), port.to_eterm(), reason)
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for the propagation table (`normal`/`kill`/other × trapping/not) and
@@ -380,6 +399,32 @@ mod tests {
             assert_eq!(tuple_element(message, 1), reference);
             assert_eq!(tuple_element(message, 2), make_atom(atoms.process()));
             assert_eq!(tuple_element(message, 3), pid.to_eterm());
+            assert_eq!(tuple_element(message, 4), reason);
+        }
+    }
+
+    #[test]
+    fn build_down_message_port_has_arity_five_and_the_port_tag() {
+        let f = fixture();
+        let atoms = &f.atoms;
+        let mut heap = Heap::new(16).expect("test heap");
+        let mut ref_heap = Heap::new(8).expect("test heap");
+        let reference = crate::monitor::RefAllocator::new()
+            .next()
+            .to_eterm(&mut ref_heap)
+            .expect("the ref fits");
+        let port = PortId::new(42);
+        let reason = atoms.normal_term();
+        let message =
+            build_down_message_port(&mut heap, atoms, reference, port, reason).expect("fits");
+
+        // SAFETY: `message` is a live tuple written by `Heap::tuple`.
+        unsafe {
+            assert_eq!(tuple_size(message), 5);
+            assert_eq!(tuple_element(message, 0), make_atom(atoms.down()));
+            assert_eq!(tuple_element(message, 1), reference);
+            assert_eq!(tuple_element(message, 2), make_atom(atoms.port()));
+            assert_eq!(tuple_element(message, 3), port.to_eterm());
             assert_eq!(tuple_element(message, 4), reason);
         }
     }

@@ -46,6 +46,7 @@
 pub mod link;
 pub mod monitor;
 pub mod pid;
+pub mod port;
 pub mod process;
 pub mod progress;
 pub mod ptab;
@@ -60,6 +61,7 @@ mod error; // pub(crate) constructors only — NOT public
 pub use crate::link::*;
 pub use crate::monitor::*;
 pub use crate::pid::*;
+pub use crate::port::*;
 pub use crate::process::*;
 pub use crate::progress::*;
 pub use crate::ptab::*;
@@ -74,6 +76,7 @@ pub mod prelude {
     pub use crate::link::*;
     pub use crate::monitor::*;
     pub use crate::pid::*;
+    pub use crate::port::*;
     pub use crate::process::*;
     pub use crate::progress::*;
     pub use crate::ptab::*;
