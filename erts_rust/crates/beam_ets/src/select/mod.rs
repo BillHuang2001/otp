@@ -93,7 +93,7 @@ mod run;
 
 pub use continuation::MatchContinuation;
 pub use exec::BodyKind;
-pub use expr::{CmpOp, Expr, TypeTest};
+pub use expr::{ArithHook, ArithOp, CmpOp, DefaultArithHook, Expr, TypeTest};
 pub use pattern::Pattern;
 pub use run::match_spec_run;
 
