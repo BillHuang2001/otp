@@ -7,6 +7,9 @@
 //! differential values are *not* derivable from the term alone — that is the whole
 //! point of pinning them.
 //!
+//! One case is `#[ignore]`d: it pins a binary payload of ≥ 12 bytes, which the
+//! current `block_hash` in `src/phash.rs` hashes wrongly (see its FIXME).
+//!
 //! The tests drive only the public API — [`BifRegistry`]/[`BifContext`] plus the
 //! declared dependency crates (`beam_alloc` for the heap, `beam_codec::term` for
 //! the binary/bitstring/bignum constructors).
@@ -903,9 +906,67 @@ fn records_still_raise_unsupported_bif() {
 }
 
 // ---------------------------------------------------------------------------
-// Registry
+// A pinned, currently-failing edge case (`#[ignore]`d — it documents a bug in
+// `src/phash.rs`, which this node does not own)
 // ---------------------------------------------------------------------------
 
+/// `phash2/1` of a binary payload of **12 bytes or more**, against the oracle.
+///
+/// FIXME(src/phash.rs): `block_hash`'s 12-byte unrolled loop is an incorrect
+/// translation of the C `MIX`. The C's `MIX` macro (`erl_term_hashing.c:428-439`)
+/// mutates `a`, `b` *and* `c` in place, and `block_hash` carries the mutated
+/// `ctx->a`/`ctx->b` into `block_hash_final_bytes` (which keeps adding the tail
+/// bytes to them). This crate's `mix(a, b, c) -> u32` returns only `c`, so after
+/// each 12-byte iteration the loop keeps the **pre-mix** `a`/`b` — every payload
+/// of ≥ 12 bytes therefore hashes to a wrong value. Payloads of < 12 bytes take
+/// the tail-only path and are correct, which is why the other cases here pass.
+///
+/// Verified against an independently compiled transcription of the C
+/// (`block_hash_setup`/`block_hash_buffer`/`block_hash_final_bytes`) for lengths
+/// 1, 2, 3, 11, 12, 13, 24, 25 — all agree with `erl`, while this crate's
+/// `block_hash` agrees only for the four lengths below 12.
+///
+/// The fix is to have `MIX` return `(a, b, c)` (e.g. a `mix3` helper alongside the
+/// existing `mix`) and use it both in the loop and for the final fold; that makes
+/// all eight lengths agree with the oracle. Remove this `#[ignore]` once it lands.
+#[test]
+#[ignore = "FIXME(src/phash.rs): block_hash drops the C MIX's in-place a/b updates, so \
+            payloads >= 12 bytes hash wrong (unowned by this node; drop this attribute \
+            once fixed)"]
+fn phash2_binaries_of_twelve_bytes_or_more_match_the_oracle() {
+    run(|_reg, ctx| {
+        // `payload[i] = (i * 7 + 3) mod 256`, so each length is distinguishable.
+        let payload12: &[u8] = &[3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80];
+        let payload13: &[u8] = &[3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87];
+        let payload24: &[u8] = &[
+            3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108, 115, 122, 129, 136,
+            143, 150, 157, 164,
+        ];
+        let payload25: &[u8] = &[
+            3, 10, 17, 24, 31, 38, 45, 52, 59, 66, 73, 80, 87, 94, 101, 108, 115, 122, 129, 136,
+            143, 150, 157, 164, 171,
+        ];
+
+        for (bytes, expected) in [
+            (payload12, 43_353_299u32),
+            (payload13, 101_390_983),
+            (payload24, 11_879_809),
+            (payload25, 19_225_834),
+        ] {
+            let bin = make_binary(ctx.heap(), bytes).expect("fits");
+            assert_phash2(
+                ctx,
+                &[bin],
+                i64::from(expected),
+                &format!("phash2(a {}-byte binary)", bytes.len()),
+            );
+        }
+    });
+}
+
+// ---------------------------------------------------------------------------
+// Registry
+// ---------------------------------------------------------------------------
 #[test]
 fn phash_2_is_registered() {
     let reg = default_registry();
