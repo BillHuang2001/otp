@@ -13,6 +13,21 @@
 //! runner implemented over the engine's `ExecutionContext`. That keeps the Stage-1/Stage-5
 //! DAG acyclic (see the crate `CONTEXT.md`, Design Decisions).
 //!
+//! # Resume-on-send: the `beam_rt` orchestration contract
+//!
+//! A single-threaded orchestrator (`beam_rt`) drives processes like this:
+//!
+//! * **spawn** ⇒ `let pid = table.spawn_default()?; scheduler.enqueue(pid);`
+//! * **a runner that blocks on an empty `receive`** must set the process state to
+//!   [`ProcessState::Waiting`] itself (via `table.get_mut(pid)`) *before* returning
+//!   [`RunOutcome::Wait`] — the scheduler deliberately does not guess the transition.
+//! * **send from inside a runner** ⇒ `table.deliver(_simple)(to, from, term)`; a send that
+//!   wakes a blocked receiver is absorbed by [`Scheduler::resume_woken`] at the end of the
+//!   slice, so the orchestrator need do nothing else.
+//! * **send from outside a slice** ⇒ after `table.deliver(_simple)(…)` call
+//!   `scheduler.resume_woken(&mut table)` so the woken receiver is enqueued.
+//! * **run** ⇒ `scheduler.run_ready(&mut table, &mut runner, None)`.
+//!
 //! Legacy C ground truth (read-only): `erts/emulator/beam/erl_process.c`
 //! (`scheduler_wait`/`schedule`), `erl_vm.h` (`CONTEXT_REDS`).
 
@@ -114,6 +129,11 @@ impl Scheduler {
     /// (`Wait`/`Suspend`) or terminate (`Exit`) it. Returns the pid that ran, or `None`
     /// when the run queue was empty.
     ///
+    /// After the outcome is applied the scheduler **absorbs the table's wake list**: a send
+    /// made during the slice that woke a blocked receiver is turned into a run-queue entry
+    /// (see [`Scheduler::resume_woken`]), so `run_ready` does not exit while a freshly-woken
+    /// process is still pending.
+    ///
     /// # Errors
     ///
     /// Propagates the runner's and the table's errors.
@@ -123,6 +143,10 @@ impl Scheduler {
         runner: &mut R,
     ) -> Result<Option<ProcessId>> {
         let Some(pid) = self.run_queue.dequeue() else {
+            // Nothing to run, but a wake produced by a send *outside* a slice (which the
+            // orchestrator may not have absorbed yet) must still be turned into a run-queue
+            // entry; absorbing here keeps a direct `run_slice` caller correct.
+            self.resume_woken(table);
             return Ok(None);
         };
 
@@ -153,9 +177,44 @@ impl Scheduler {
             }
         }
 
+        // Absorb every wake produced during the slice (a send to a blocked receiver, or a
+        // signal/trapped-`EXIT`/`{'DOWN'}` message) into this same sweep.
+        self.resume_woken(table);
+
         Ok(Some(pid))
     }
 
+    /// Turns the table's pending wakes (blocked processes a delivery/signal just made
+    /// runnable) into run-queue entries, returning how many processes were enqueued.
+    ///
+    /// A woken pid is enqueued only when it is still a **live** process whose state is
+    /// `Runnable` and that is not already in a run queue — a process can be woken and then
+    /// terminated (or re-blocked) within the same slice, and a `Yield` already requeued the
+    /// process that just ran, so its stale wake must not double-enqueue it.
+    ///
+    /// This is the hook `beam_rt` calls after it sends to a blocked process **outside** a
+    /// scheduler slice (`run_slice` calls it automatically at each slice's end). See the
+    /// crate `CONTEXT.md` for the full single-threaded orchestration contract.
+    pub fn resume_woken(&mut self, table: &mut ProcessTable) -> usize {
+        let mut resumed = 0;
+        for pid in table.drain_woken() {
+            let skip = match table.get(pid) {
+                Some(process) => {
+                    process.state() != ProcessState::Runnable || process.flags().in_run_queue()
+                }
+                None => true,
+            };
+            if skip {
+                continue;
+            }
+            if let Some(process) = table.get_mut(pid) {
+                process.flags_mut().set_in_run_queue(true);
+            }
+            self.run_queue.enqueue(pid);
+            resumed += 1;
+        }
+        resumed
+    }
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
     /// number of slices executed.
     ///

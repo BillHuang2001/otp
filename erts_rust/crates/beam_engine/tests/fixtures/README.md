@@ -179,3 +179,44 @@ The test's expected values were derived with the oracle, e.g.
 (the values above the immediate range are asserted bit-exactly against
 `beam_term::big_parts`, and the representation — small vs bignum — is asserted
 too, matching ERTS' canonical choice).
+
+## `recv.beam` (`recv.erl`) — `tests/receive.rs`
+
+The **receive/message** family: `send`, `loop_rec`, `loop_rec_end`, `wait`,
+`wait_timeout`, `timeout`, `remove_message` and the four `recv_marker_*` opcodes.
+Each export picks one shape the compiler emits for `receive` (verified with
+`beam_disasm:file/1`; the family itself only *positions* the mailbox scan — the
+`test`/`select_val` instructions after `loop_rec` do the pattern matching).
+
+| export | Erlang | opcodes exercised |
+|---|---|---|
+| `wait/0` | `receive X -> X end` | `loop_rec` → `remove_message` → `wait` |
+| `bomb/1` | `Pid ! 42, ok` | `send` |
+| `sel/0` | `receive foo -> a; Bar -> Bar end` | `loop_rec`, `test` (the literal clause), `remove_message`, `wait` |
+| `afterzero/0` | `receive _ -> got after 0 -> empty end` | `loop_rec` → `remove_message`; the empty path is a **direct jump to `timeout`** (a constant `after 0` is folded, so no `wait_timeout` is emitted) |
+| `scan/0` | `receive foo -> foo; {bar,X} -> X end` | `loop_rec` … `loop_rec_end` (a non-matching head is scanned past) |
+| `aftervar/1` | `receive foo -> foo after T -> empty end` | `loop_rec_end`, `wait_timeout` with a **runtime** `{y,0}` time operand, `timeout` |
+| `marked/0` | `Ref = make_ref(), self() ! {Ref,7}, receive {Ref,R} -> R end` | all four `recv_marker_reserve`/`_bind`/`_use`/`_clear` (+ `call_ext make_ref`, `bif self`, `send`) |
+
+Expected values (derived with the oracle — `erlc +deterministic recv.erl` in a
+neutral dir, then
+`erl -noshell -pa "$TMPDIR/fixgen" -eval '<expr>, halt().'`):
+
+| expression | value |
+|---|---|
+| `Self=self(), Self ! hello, recv:wait()` | `hello` |
+| `Self=self(), recv:bomb(Self), receive M -> M end` | `42` |
+| `Self=self(), Self ! 99, recv:sel()` | `99` |
+| `Self=self(), Self ! foo, recv:sel()` | `a` |
+| `recv:afterzero()` (empty mailbox) | `empty` |
+| `Self=self(), Self ! 42, Self ! {bar,7}, recv:scan()` | `7` |
+| `Self=self(), Self ! foo, recv:scan()` | `foo` |
+| `recv:aftervar(0)` (empty mailbox) | `empty` |
+| `Self=self(), Self ! foo, recv:aftervar(0)` | `foo` |
+| `recv:aftervar(5)` (empty mailbox) | `empty` (times out) |
+| `recv:marked()` | `7` |
+
+**Known gap.** Milestone 1 has no host timer, so `aftervar(5)` on an empty mailbox
+does **not** return `empty`: `wait_timeout` suspends and the run reports
+`RunOutcome::Wait` (the timer is the host's job). `tests/receive.rs` asserts that
+honest outcome instead of the oracle value; every other row matches the oracle.

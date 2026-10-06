@@ -122,6 +122,9 @@ pub(crate) const RUNTIME_XREGS_DISP: i32 =
 ///
 /// * [`Step::Next`] → `encode_target(func, pc + 1)`,
 /// * [`Step::Goto { func, pc }`] → `encode_target(func, pc)`,
+/// * [`Step::Wait { .. }`] → the typed [`crate::error::blocked`] error is stored in
+///   `rt.error` and [`ERROR`] is returned (the native tiers are **non-blocking**
+///   entries: a `receive` that finds no message cannot suspend them),
 /// * [`Step::Done`] → [`HALT`],
 /// * `Err(error)` → the error is stored in `rt.error` and [`ERROR`] is returned.
 pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u32) -> i64 {
@@ -147,6 +150,14 @@ pub(crate) extern "C" fn jit_step_one(rt: *mut JitRuntime<'_>, func: u32, pc: u3
     match machine.step_instruction(module, labels, func, pc, ctx) {
         Ok(Step::Next) => encode_target(func, pc + 1),
         Ok(Step::Goto { func, pc }) => encode_target(func, pc),
+        // The native tiers are non-blocking entries: a `receive` with no message
+        // available cannot suspend them, so the suspension surfaces as the same
+        // typed error the interpreter-only `run_export` reports (never a wrong
+        // result and never a silent continue).
+        Ok(Step::Wait { .. }) => {
+            runtime.error = Some(crate::error::blocked());
+            ERROR
+        }
         Ok(Step::Done) => HALT,
         Err(err) => {
             runtime.error = Some(err);

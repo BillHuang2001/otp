@@ -54,6 +54,10 @@ liveness maps.
     into `x[0..live)` and the stack.
 ### `process.rs` — the process control block
 - `pub enum ProcessState { Runnable, Running, Waiting, Suspended, Exiting, Terminated }` (`Copy + …`).
+- `pub enum DeliverOutcome { Enqueued, Woke }` (`Debug + Clone + Copy + PartialEq + Eq`) — what a
+  delivery did to the recipient: `Enqueued` = the recipient was not blocked; `Woke` = the recipient
+  was blocked (`Waiting`/`Suspended`) and has been made `Runnable`.
+  - `pub fn woke(self) -> bool` (true for `Woke`).
 - `pub struct ProcessFlags` — a `u32` bitset newtype (no `bitflags` dep): `trap_exit`, `system`,
   `in_run_queue`, `garbage_collecting`, `active`. `new()`, per-flag get/set, `bits()/from_bits()`.
 - `pub struct Process` — the PCB. Owns: `pid: ProcessId`, `state: ProcessState`, `flags: ProcessFlags`,
@@ -63,6 +67,8 @@ liveness maps.
   `exit_reason: Option<Eterm>`.
   - `new(pid) -> Result<Process>` (default `HeapPolicy`); `with_policy(pid, policy) -> Result<Process>`
   - `pid()`, `state()`, `set_state()`, `flags()/flags_mut()`, `is_trapping_exit()/set_trap_exit(bool)`
+  - `wake(&mut self) -> bool` — if `state` is `Waiting` or `Suspended`, set it to `Runnable` and return
+    `true`; otherwise return `false`. The blocked-recipient wake used by resume-on-send.
   - `reductions() -> u64`, `bump_reductions(n)`, `reset_reductions()`
   - `heap(&self) -> &beam_alloc::Heap`, `heap_mut(&mut self) -> &mut beam_alloc::Heap` (the **young**
     mutator heap, `collector.young_mut().heap_mut()`)
@@ -74,9 +80,10 @@ liveness maps.
   - `monitored_by() -> &[MonitoredBy]`, `monitored_by_mut() -> &mut Vec<MonitoredBy>`
   - `exit_reason() -> Option<Eterm>`, `set_exit_reason(Eterm)`
   - **message delivery:** `deliver(&mut self, from: Eterm, term: Eterm, src_off_heap: &OffHeapTable)
-    -> Result<()>` — copies `term` into the young heap and enqueues the `Message` (collect-and-retry
-    once on `AllocKind::Heap`/`Message` exhaustion). `deliver_simple(&mut self, from: Eterm, term:
-    Eterm) -> Result<()>` — the no-off-heap convenience. `receive<F: FnMut(&Message)->bool>(&mut self,
+    -> Result<DeliverOutcome>` — copies `term` into the young heap and enqueues the `Message`
+    (collect-and-retry once on `AllocKind::Heap`/`Message` exhaustion), then `wake()`s the process and
+    reports `Woke`/`Enqueued`. `deliver_simple(&mut self, from: Eterm, term: Eterm) ->
+    Result<DeliverOutcome>` — the no-off-heap convenience. `receive<F: FnMut(&Message)->bool>(&mut self,
     pred: F) -> Option<Message>` (delegates to `beam_message::receive`).
   - **GC:** `collector() -> &Collector`, `should_collect(need_words) -> bool`, `heap_used_words()`,
     `collect(&mut self) -> Result<Collection>` (gather the root set = registers + mailbox payloads, run
@@ -103,10 +110,29 @@ liveness maps.
   - `run_slice<R: ProcessRunner>(&mut self, table: &mut ProcessTable, runner: &mut R) ->
     Result<Option<ProcessId>>` — pop one pid, run it for one slice, then: `Yield` ⇒ requeue at the
     tail; `Wait`/`Suspend` ⇒ leave the run queue (state set by the runner); `Exit(reason)` ⇒
-    `table.terminate(pid, reason)` (propagation happens there).
+    `table.terminate(pid, reason)` (propagation happens there). **After the outcome** it absorbs the
+    table's wake list via `resume_woken` (and also on the empty-queue early return), so a send during
+    the slice that woke a blocked receiver is turned into a run-queue entry in the same sweep.
+  - `resume_woken(&mut self, table: &mut ProcessTable) -> usize` — drain `table.drain_woken()` and,
+    for each pid that is a still-live `Runnable` process not already in a run queue, set
+    `in_run_queue(true)` and enqueue it; return the number enqueued. Also the hook `beam_rt` calls
+    after a send made **outside** a slice (a woken-then-terminated/re-blocked process is skipped; the
+    `Yield` branch already requeued the process that just ran, so its stale wake is not double-counted).
   - `run_ready<R: ProcessRunner>(&mut self, table: &mut ProcessTable, runner: &mut R, max_slices:
     Option<u64>) -> Result<u64>` — run until the ready queue is empty (or `max_slices` slices run);
     returns the number of slices executed.
+
+### The single-threaded orchestration contract `beam_rt` must follow
+(`beam_rt` is the orchestrator; `Scheduler::resume_woken` is the only coupling.)
+- **spawn** ⇒ `let pid = table.spawn_default()?; scheduler.enqueue(pid);`
+- **a runner that blocks on an empty receive** must set the process state to `ProcessState::Waiting`
+  (via `table.get_mut(pid)`) itself **before** returning `RunOutcome::Wait` — the scheduler does not
+  guess the transition.
+- **send from inside a runner** ⇒ `table.deliver(_simple)(to, from, term)`; a send that wakes a
+  blocked receiver is absorbed by the scheduler at the end of the slice (nothing else to do).
+- **send from outside a slice** ⇒ after `table.deliver(_simple)(…)` call
+  `scheduler.resume_woken(&mut table)` so the woken receiver is enqueued.
+- **run** ⇒ `scheduler.run_ready(&mut table, &mut runner, None)`.
 ### `progress.rs` — thread progress (documented single-scheduler stub)
 - `pub struct ThreadProgress` — M1 no-op barrier under one scheduler: `new()`, `generation() ->
   u64`, `bump()` (advances the generation), `wait(u64)` (returns immediately — no other schedulers
@@ -148,19 +174,32 @@ liveness maps.
 The single place that mutates ≥2 processes (mirrors the C ptab lock domain); M1 single-threaded, so it
 holds `Process` values directly.
 - `pub struct ProcessTable { slots: Vec<Slot>, free: Vec<u64>, names: HashMap<Atom, ProcessId>,
-  refs: RefAllocator, atoms: SignalAtoms }` (`Slot { serial: u64, process: Option<Process> }`).
+  refs: RefAllocator, atoms: SignalAtoms, ready: Vec<ProcessId> }` (`Slot { serial: u64, process:
+  Option<Process> }`). `ready` is the **wake list**: the pids of blocked processes a
+  delivery/signal has just made runnable.
   - `new(atoms: SignalAtoms) -> ProcessTable`
   - **allocation / lookup:** `alloc_pid() -> Result<ProcessId>` (reuses a free slot, bumping its
     serial; returns `SystemLimit` when the number space is exhausted); `spawn(policy: HeapPolicy) ->
     Result<ProcessId>`; `spawn_default() -> Result<ProcessId>`; `insert(Process) -> Result<()>`;
     `get(pid) -> Option<&Process>`; `get_mut(pid) -> Option<&mut Process>`; `take(pid) ->
-    Option<Process>`; `remove(pid) -> Option<Process>`; `contains(pid) -> bool`; `len()`; `pids() ->
+    Option<Process>` (bumps the slot serial **and drops the pid from the wake list**); `remove(pid) ->
+    Option<Process>`; `contains(pid) -> bool`; `len()`; `pids() ->
     impl Iterator<Item = ProcessId> + '_`
+  - **message delivery:** `deliver(to: ProcessId, from: Eterm, term: Eterm, src_off_heap:
+    &OffHeapTable) -> Result<DeliverOutcome>` — the table-level send: calls the target's
+    `Process::deliver` and, on `Woke`, pushes `to` onto the wake list (unknown `to` ⇒ `TermNotFound`).
+    `deliver_simple(to, from, term) -> Result<DeliverOutcome>` — the no-off-heap form.
+    `drain_woken() -> Vec<ProcessId>` (return **and** clear the wake list); `woken() -> &[ProcessId]`
+    (read accessor).
   - **signals / links / monitors:** `apply_exit_signal(target, signal: ExitSignal) ->
     Result<ExitEffect>`; `link(a, b) -> Result<()>`; `unlink(a, b) -> Result<()>`; `send_exit(from,
     to, reason: Eterm) -> Result<()>` (the `exit/2` operation); `monitor(watcher, target, kind) ->
     Result<MonitorRef>`; `demonitor(watcher, reference) -> Result<bool>`; `terminate(pid, reason:
-    Eterm) -> Result<()>` (propagates to links + monitors, cascading through a worklist).
+    Eterm) -> Result<()>` (propagates to links + monitors, cascading through a worklist). Every signal
+    path that queues a message on a recipient — the `ExitPolicy::Trap` branch of `apply_exit_signal`,
+    `enqueue_exit_message` (link propagation) and `enqueue_down_message` (monitor `{'DOWN'}`) — also
+    calls `Process::wake` and pushes the recipient onto the wake list, so a blocked process resumes
+    when its signal message arrives (the `Terminate` branch needs no wake: `take` drops its stale wake).
   - **name registry:** `register(name: Atom, pid) -> Result<()>`; `unregister(name) -> Result<()>`;
     `whereis(name) -> Option<ProcessId>`; `registered() -> impl Iterator<Item = (Atom, ProcessId)> + '_`.
 - `pub enum ExitEffect { Terminated, Trapped, Ignored }` — the outcome of `apply_exit_signal`
@@ -193,8 +232,8 @@ holds `Process` values directly.
   `beam_message`, `libc`, `parking_lot`. Adding a dependency edge requires reporting to `../`.
   `beam_engine` is **NOT** a dependency (the `ProcessRunner` trait keeps the DAG acyclic).
 - Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
-  `src/ptab.rs` (the table + signal hub) is the only file slightly over that figure, and **only**
-  because of its comprehensive inline `#[cfg(test)]` module (≈740 lines of production code + ≈330
+  `src/ptab.rs` (the table + signal hub) is the only file over that figure, and **only**
+  because of its comprehensive inline `#[cfg(test)]` module (≈830 lines of production code + ≈460
   lines of tests) — it has one responsibility and deliberately stays whole; do not split it for size
   alone.
 ## Test Strategy
@@ -205,16 +244,24 @@ holds `Process` values directly.
   `monitor` (`RefAllocator` monotonic, `Monitors` push/remove/find, `MonitorRef::to_eterm` shape),
   `signal` (`exit_policy` table: normal/kill/other × trapping/not; `build_exit_message`/
   `build_down_message` arity + head atom), `progress` (generation bump), `ptab` (alloc/remove/reuse +
-  serial bump, `register`/`whereis`/`unregister`, stale-pid rejection).
+  serial bump, `register`/`whereis`/`unregister`, stale-pid rejection, `deliver`/`deliver_simple`
+  `Enqueued`-vs-`Woke` + the wake list, `take` clearing a pending wake, and the trap/link-`EXIT`/
+  `{'DOWN'}` signal paths waking a blocked recipient).
 - **`tests/` — the required integration evidence** (these pin the M1 guarantees named in the
   objective):
   1. `tests/scheduler.rs` — **pid allocation**: many spawns get distinct pids; a freed pid number is
      reused with a **bumped serial**; a stale pid no longer resolves. **Spawn + run-queue scheduling
      order**: a `ProcessRunner` that records execution order shows strict round-robin (each ready
      process runs one slice, in enqueue order, requeued at the tail on `Yield`); a `Wait` process
-     leaves the queue and is not rerun.
+     leaves the queue and is not rerun. **Resume-on-send**: a `ResumeRunner` shows a send to a blocked
+     (`Waiting`) receiver wakes it and the same slice's sweep re-enqueues it, so `a` runs a second time
+     and consumes the message; and a two-process counter **ping-pong** driven to a bound shows the
+     chain only continues because each forward send wakes its blocked peer, terminating with the
+     correct final counter.
   2. `tests/messaging.rs` — build a term in a sender's heap, `send` it into a receiver's mailbox, then
-     `Process::receive` returns a single matching message and leaves non-matching ones queued (FIFO).
+     `Process::receive` returns a single matching message and leaves non-matching ones queued (FIFO);
+     and delivering to a blocked process returns `DeliverOutcome::Woke` and flips it to `Runnable`
+     while a runnable process returns `Enqueued`.
   3. `tests/signals.rs` — **link propagation**: `A` links `B`, `A` terminates with a non-normal reason
      ⇒ `B` (not trapping) terminates with the same reason; and with `trap_exit` set ⇒ `B` survives and
      its mailbox holds `{'EXIT', A, Reason}`. **Monitor down-message**: `A` monitors `B`; `B`
@@ -241,6 +288,22 @@ holds `Process` values directly.
   signal queue (`ErtsSignalPrivQueues`) serviced at schedule-in. This is simpler and equally correct
   for the common cases; the decoupled queue (needed for multi-scheduler fairness, `process_info` of
   pending signals, and signal ordering vs. messages) is a documented follow-up.
+- **Resume-on-send: a wake list on the table + absorption by the scheduler.** A delivery (or a
+  signal message) to a blocked process must make it runnable, and the single-threaded scheduler must
+  not exit `run_ready` while a freshly-woken process is still pending. Rather than have every caller
+  re-enqueue (which would double-enqueue a process that the `Yield` branch already requeued), the
+  wake is *recorded* on the `ProcessTable` (`ready: Vec<ProcessId>`): `Process::deliver` returns
+  `DeliverOutcome::Woke`, the table-level `deliver`/signal builders push the pid onto `ready`, and
+  `Scheduler::run_slice` drains it via `resume_woken` at the end of **every** slice (and on the
+  empty-queue early return). `resume_woken` skips a pid that is no longer live, is not `Runnable`, or
+  is already `in_run_queue` — the last guard is what prevents the running process (requeued by
+  `Yield`) from being enqueued twice when it also appears on the wake list. A send made **outside** a
+  slice has no slice end to absorb it, so `beam_rt` calls `resume_woken` itself (the documented
+  contract above). Both `Waiting` and `Suspended` are woken by `Process::wake`: `Waiting` is the
+  ordinary empty-receive case, and waking a `Suspended` process keeps the two blocked states
+  symmetric (the message must still be seen; the suspension is lifted separately) rather than
+  guessing the historical C nuance — the C's `SUSPENDED`-vs-`suspend`-counter distinction is a
+  follow-up.
 - **`ProcessRunner` is the engine seam — `beam_engine` is not a dependency.** The scheduler must not
   know how a process executes. `beam_rt`/`beam_engine` implement `ProcessRunner` over the engine's
   `ExecutionContext`, so this crate stays at Stage-5 and the DAG stays acyclic (`beam_engine` →
@@ -314,17 +377,17 @@ holds `Process` values directly.
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/pid.rs` → `ProcessId`/`PortId` (bit-exact internal pid/port immediates) + id limits
 - `src/registers.rs` → `XRegs`, `Stack`, `Registers` (the root-set containers); `MAX_REG`/`MAX_ARG`
-- `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags`, message delivery + GC entry
+- `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags`, `DeliverOutcome`, `Process::wake`, message delivery + GC entry
 - `src/run_queue.rs` → `RunQueue` (the ready queue)
-- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam)
+- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `Scheduler::resume_woken` (wake absorption)
 - `src/progress.rs` → `ThreadProgress` (single-scheduler stub)
 - `src/signal.rs` → `SignalAtoms`, `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders
 - `src/link.rs` → `Links` (bidirectional link set)
 - `src/monitor.rs` → `MonitorRef`, `MonitorKind`, `Monitor`, `MonitoredBy`, `Monitors`, `RefAllocator`
-- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry + signal/link/monitor hub), `ExitEffect`, `PortTable`
+- `src/ptab.rs` → `ProcessTable` (pid alloc/lookup + name registry + signal/link/monitor hub + the wake list), `ExitEffect`, `PortTable`
 - `src/error.rs` → `pub(crate)` error constructors (no new error type)
-- `tests/scheduler.rs` → pid allocation + round-robin scheduling order
-- `tests/messaging.rs` → send into a mailbox + selective receive
+- `tests/scheduler.rs` → pid allocation + round-robin scheduling order + resume-on-send + counter ping-pong
+- `tests/messaging.rs` → send into a mailbox + selective receive + `DeliverOutcome` wake reporting
 - `tests/signals.rs` → link exit propagation (+ `trap_exit`) + monitor down-message
 - `tests/gc.rs` → safepoint GC over the process root set
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)

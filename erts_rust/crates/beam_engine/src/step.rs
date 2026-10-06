@@ -13,8 +13,9 @@
 /// The control-flow decision an instruction family returns to the dispatch loop.
 ///
 /// Produced by the `crate::families` bodies; consumed by the interpreter's
-/// `match families::dispatch(..)` in `crate::interpreter`.
-#[allow(dead_code)] // no family constructs a `Step` yet (every stub returns `Ok(None)`)
+/// `match families::dispatch(..)` in `crate::interpreter`, by the dispatch loop
+/// (`Machine::run_loop_with_map`) and by the baseline JIT's per-instruction
+/// helper (`crate::jit::baseline::jit_step_one`).
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum Step {
     /// Continue at `pc + 1` in the same function.
@@ -24,6 +25,20 @@ pub(crate) enum Step {
         /// The function index (into [`beam_loader::Module::functions`]).
         func: u32,
         /// The code offset within that function.
+        pc: u32,
+    },
+    /// Suspend the process in a `receive`: the module resumes at this address when
+    /// the wait is released by an arriving message.
+    ///
+    /// The dispatch loop reports it as [`crate::RunOutcome::Wait`] (leaving the
+    /// registers/frames untouched so the host can re-enter at the same address via
+    /// [`crate::Machine::resume_outcome`]); a **non-blocking** entry
+    /// ([`crate::Machine::run_export`] and the JIT backends' `run_export`) folds it
+    /// into the typed [`crate::error::blocked`] error instead.
+    Wait {
+        /// The function index (into [`beam_loader::Module::functions`]) to resume in.
+        func: u32,
+        /// The code offset within that function to resume at.
         pc: u32,
     },
     /// Finish the run, yielding `x(0)`.
