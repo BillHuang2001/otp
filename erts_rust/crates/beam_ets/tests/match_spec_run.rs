@@ -78,7 +78,10 @@ fn head_matches_the_element_itself_whatever_its_shape() {
     let spec = spec1(&mut heap, at(&atoms, "$1"), &[], &[body_element]);
 
     let tuple_element = tup(&mut heap, &[make_small(1), at(&atoms, "a")]);
-    let input = list(&mut heap, &[at(&atoms, "foo"), make_small(1), tuple_element]);
+    let input = list(
+        &mut heap,
+        &[at(&atoms, "foo"), make_small(1), tuple_element],
+    );
 
     let got = match_spec_run(input, spec, &atoms, &mut heap).expect("run");
 
@@ -128,7 +131,10 @@ fn head_dollar_underscore_never_matches_a_non_atom() {
     for head in ["$_", "$$"] {
         let spec = spec1(&mut heap, at(&atoms, head), &[], &[at(&atoms, "true")]);
         let tuple_element = tup(&mut heap, &[make_small(1), at(&atoms, "a")]);
-        let non_atoms = list(&mut heap, &[at(&atoms, "foo"), make_small(1), tuple_element]);
+        let non_atoms = list(
+            &mut heap,
+            &[at(&atoms, "foo"), make_small(1), tuple_element],
+        );
         let got = match_spec_run(non_atoms, spec, &atoms, &mut heap).expect("run");
         assert!(
             got.is_empty(),
