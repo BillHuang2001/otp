@@ -13,7 +13,9 @@ use beam_loader::{Instr, Label, Module};
 use crate::interpreter;
 use crate::machine::MAX_REGISTER;
 
-use super::aggregate::{get_hd_shape, get_list_shape, get_tl_shape};
+use super::aggregate::{
+    get_hd_shape, get_list_shape, get_tl_shape, get_tuple_element_shape, select_tuple_arity_plan,
+};
 use super::arith::fast_arith;
 use super::operands::{constant_word, x_register};
 use super::select::select_val_plan;
@@ -26,7 +28,9 @@ use super::{Allocation, CACHE_REGISTERS};
 /// **touches the most**: every cacheable instruction (a `move` whose shape
 /// [`super::r#move::try_inline_move`] lowers, a `swap` over two addressable x-registers, a `test`
 /// whose shape [`super::test::test_plan`] lowers, a `gc_bif` [`fast_arith`] lowers,
-/// and a `get_list`/`get_hd`/`get_tl` its `*_shape` lowers)
+/// a `get_list`/`get_hd`/`get_tl` its `*_shape` lowers, a `get_tuple_element` its
+/// [`get_tuple_element_shape`], and a `select_tuple_arity` its
+/// [`select_tuple_arity_plan`])
 /// contributes one *native touch* per x-register operand, and the registers with the
 /// highest touch counts are held resident — a usage-weighted approximation of
 /// "keep the longest live ranges in machine registers". Ties are broken by ascending
@@ -112,9 +116,12 @@ fn allocate_registers_with_labels(
 /// is counted only when [`super::r#move::try_inline_move`] lowers it, a `swap` only when both
 /// operands are addressable x-registers, a `test` only when [`super::test::test_plan`] claims it,
 /// a `select_val` only when [`super::select::select_val_plan`] claims it (its sole register operand
-/// is the scrutinee), a `gc_bif` only when [`fast_arith`] does, and a
+/// is the scrutinee), a `gc_bif` only when [`fast_arith`] does, a
 /// `get_list`/`get_hd`/`get_tl` only when its `*_shape` claims it (its source and
-/// every destination count). Every other
+/// every destination count), a `get_tuple_element` only when
+/// [`get_tuple_element_shape`] claims it (its source and destination count), and a
+/// `select_tuple_arity` only when [`select_tuple_arity_plan`] claims it (its source
+/// tuple counts). Every other
 /// instruction contributes nothing because it stays on the helper.
 fn cacheable_touches(
     module: &Module,
@@ -172,6 +179,30 @@ fn cacheable_touches(
         Instr::GetTl { source, tail } => {
             if let Some(shape) = get_tl_shape(source, tail) {
                 touches.extend(shape.registers());
+            }
+        }
+        // A tuple read is charged its source and its destination, and only when its
+        // shape is claimed (an un-addressable operand keeps the whole instruction on
+        // the helper, which contributes no native touch).
+        Instr::GetTupleElement {
+            source,
+            element,
+            dst,
+        } => {
+            if let Some(shape) = get_tuple_element_shape(source, *element, dst) {
+                touches.extend(shape.registers());
+            }
+        }
+        // An arity switch's only runtime operand is the scrutinee tuple — every
+        // alternative is an immediate — and it is referenced exactly when the switch
+        // is inlined.
+        Instr::SelectTupleArity {
+            tuple,
+            fail,
+            destinations,
+        } => {
+            if let Some(plan) = select_tuple_arity_plan(labels, tuple, *fail, destinations) {
+                touches.extend(plan.registers());
             }
         }
         Instr::GcBif { .. } => {

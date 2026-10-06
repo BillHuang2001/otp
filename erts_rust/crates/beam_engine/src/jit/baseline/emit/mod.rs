@@ -7,7 +7,9 @@
 //! instruction the block does not lower natively, the spill/fill discipline
 //! ([`CACHE_REGISTERS`]), the tier's one arithmetic optimisation — the guarded
 //! small-int `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]) — and the
-//! guarded cons-cell readers ([`aggregate`]: `get_list`/`get_hd`/`get_tl`).
+//! guarded aggregate readers ([`aggregate`]: the cons-cell readers
+//! `get_list`/`get_hd`/`get_tl` and the tuple readers `get_tuple_element` /
+//! `select_tuple_arity`).
 //! [`compile_module`] lowers every basic block of a module into the
 //! [`CompiledModule`] artifact. See `super` for the block ABI (in `runtime`) and the
 //! driver that runs the emitted code.
@@ -35,7 +37,7 @@
 //! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
 //! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path and
-//! [`aggregate`] the guarded cons-cell readers.
+//! [`aggregate`] the guarded cons-cell and tuple readers.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -57,7 +59,10 @@ mod regalloc;
 mod select;
 mod test;
 
-use aggregate::{try_inline_get_hd, try_inline_get_list, try_inline_get_tl};
+use aggregate::{
+    try_inline_get_hd, try_inline_get_list, try_inline_get_tl, try_inline_get_tuple_element,
+    try_inline_select_tuple_arity,
+};
 use arith::try_inline_gc_bif;
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
@@ -229,7 +234,9 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
 /// when the small-int fast path lowers it, the whole guarded sequence plus its
 /// helper fallback ([`FAST_PATH_BYTES`]); a `get_list`/`get_hd`/`get_tl` likewise
 /// costs its guarded sequence plus the helper fallback it may still branch to
-/// ([`LIST_PATH_BYTES`]).
+/// ([`LIST_PATH_BYTES`]), and a `get_tuple_element`/`select_tuple_arity` its own
+/// guarded sequence plus one spill-and-return stub per arity alternative
+/// ([`TUPLE_PATH_BYTES`]).
 /// Under-estimating would turn a large module into a `SystemLimit` compile error,
 /// so the estimate is deliberately loose — [`FAST_PATH_BYTES`] is budgeted for
 /// *every* `gc_bif` and [`LIST_PATH_BYTES`] for every cons-cell read, whether or
@@ -240,6 +247,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
     let mut blocks = 0usize;
     let mut gc_bifs = 0usize;
     let mut list_reads = 0usize;
+    let mut tuple_paths = 0usize;
     for function in &module.functions {
         instructions += function.code.len();
         blocks += function.blocks.len();
@@ -249,6 +257,10 @@ fn code_capacity_estimate(module: &Module) -> usize {
                 Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
                     list_reads += 1
                 }
+                Instr::GetTupleElement { .. } => tuple_paths += 1,
+                Instr::SelectTupleArity { destinations, .. } => {
+                    tuple_paths += 1 + destinations.len()
+                }
                 _ => {}
             }
         }
@@ -257,6 +269,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
         + INSTRUCTION_BYTES * instructions
         + FAST_PATH_BYTES * gc_bifs
         + LIST_PATH_BYTES * list_reads
+        + TUPLE_PATH_BYTES * tuple_paths
         + DEFAULT_CAPACITY
 }
 
@@ -284,6 +297,15 @@ const FAST_PATH_BYTES: usize = 352;
 /// [`emit_step_and_continue`] fallback it may still branch to, which the
 /// per-instruction [`INSTRUCTION_BYTES`] already budgets.
 const LIST_PATH_BYTES: usize = 128;
+
+/// The code-size budget reserved for one `get_tuple_element` — and one
+/// `select_tuple_arity` *alternative* (see [`code_capacity_estimate`]): the guarded
+/// header read (the boxed test, the pointer computation, the arityval test and the
+/// range compare, ~70 bytes) plus — for the arity switch — one `mov_ri`/`cmp`/`jcc`
+/// and its spill-and-return stub (~45 bytes each). It is emitted *in front of* the
+/// [`emit_step_and_continue`] fallback the guard may still branch to, which the
+/// per-instruction [`INSTRUCTION_BYTES`] already budgets.
+const TUPLE_PATH_BYTES: usize = 160;
 
 /// Emit one native function for `code[start..end]` (a basic block of `func`).
 ///
@@ -401,6 +423,57 @@ fn emit_block(
                 )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
+            }
+            // The guarded tuple readers: `get_tuple_element` reads one element of a
+            // real tuple natively and `select_tuple_arity` switches on its header
+            // word (see [`aggregate`]). Any shape that is not two (resp. one)
+            // in-bound x-registers is the `_` arm, and so is a **non-tuple source**:
+            // the guard branches to the helper, whose interpreter step raises the
+            // exact `{badmatch, Source}` — or reports the typed `unsupported` the
+            // arity switch uses for a non-tuple.
+            Instr::GetTupleElement {
+                source,
+                element,
+                dst,
+            } => {
+                if !try_inline_get_tuple_element(
+                    buffer,
+                    source,
+                    *element,
+                    dst,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            // Like the `select_val` arm below, this instruction **always** transfers
+            // control (the interpreter returns a `Step::Goto` for every path), so the
+            // block ends here when the switch is inlined.
+            Instr::SelectTupleArity {
+                tuple,
+                fail,
+                destinations,
+            } => {
+                if try_inline_select_tuple_arity(
+                    buffer,
+                    labels,
+                    tuple,
+                    *fail,
+                    destinations,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
+                    terminated = true;
+                    break;
+                }
+                emit_step_and_continue(buffer, done, allocation, func, pc)?;
             }
             // The one optimised BIF: the small-int `erlang:'+'/2`/`'-'/2`. When
             // the guarded fast path is emitted the block keeps going; otherwise

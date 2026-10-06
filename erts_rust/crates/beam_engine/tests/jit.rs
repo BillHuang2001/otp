@@ -1706,3 +1706,312 @@ fn a_list_read_with_an_out_of_bound_register_deopts_and_agrees_with_the_interpre
         "expected the interpreter's `bad_register` for an out-of-bound source, got {jitted:?}"
     );
 }
+
+// ---------------------------------------------------------------------------
+// The guarded tuple readers (`get_tuple_element`/`select_tuple_arity`)
+// ---------------------------------------------------------------------------
+
+/// `read/2` — `get_tuple_element x1 Element x0`: element `Element` of the tuple in
+/// `x(1)` is returned in `x(0)`. The second argument carries the tuple so that `x(1)`
+/// is named by no other inlinable instruction of the fixture.
+///
+/// Every fixture interns `badmatch` so the deopt path raises the compound
+/// `{badmatch, Source}` reason (`crate::terms::badmatch_reason`) rather than the bare
+/// `BeamError::BadMatch`.
+fn tuple_read_module(element: u32) -> Module {
+    arity_module("tuple_read", "read", 2, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetTupleElement {
+                source: Operand::X(1),
+                element,
+                dst: Operand::X(0),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/1` — a tuple read whose **destination index lies past `MAX_REGISTER`**: the
+/// tier refuses the shape (the emitted code may not write out of `machine.x`), so the
+/// whole instruction stays on the interpreter step, whose `write_operand` reports the
+/// faithful `bad_register`:
+///
+/// ```text
+///   get_tuple_element x0 0 x<MAX_REGISTER>   ; no addressable destination -> deopt
+///   return
+/// ```
+fn tuple_out_of_bound_module() -> Module {
+    arity_module("tuple_out_of_bound", "read", 1, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::GetTupleElement {
+                source: Operand::X(0),
+                element: 0,
+                dst: Operand::X(beam_engine::MAX_REGISTER),
+            },
+            Instr::Return,
+        ]
+    })
+}
+
+/// `read/2` — `select_tuple_arity x1 Fail {2 -> L2; 3 -> L3}`, the tuple's arity
+/// deciding which arm runs:
+///
+/// ```text
+///   select_tuple_arity x1 Fail {2 -> L2; 3 -> L3}
+///   L2: x0 = 100   L3: x0 = 200   L10: x0 = -1
+/// ```
+///
+/// (The alternative order matters: the interpreter takes the first match, exactly as
+/// the emitted `cmp`/`jcc` chain does.) `fail` is the no-match label — `NO_FAIL` gives
+/// the exhaustive switch, which *raises* `{badmatch, Tuple}` when no arity matches.
+fn arity_switch_module(name: &str, fail: Label) -> Module {
+    let mv = |value: i64, x: u32| Instr::Move {
+        src: Operand::Integer(value),
+        dst: Operand::X(x),
+    };
+    arity_module(name, "read", 2, &[], |module| {
+        module.atom_table.intern("badmatch");
+        vec![
+            Instr::Label(Label(1)),
+            Instr::SelectTupleArity {
+                tuple: Operand::X(1),
+                fail,
+                destinations: vec![
+                    (Operand::Integer(2), Label(2)),
+                    (Operand::Integer(3), Label(3)),
+                ],
+            },
+            Instr::Label(Label(2)),
+            mv(100, 0),
+            Instr::Return,
+            Instr::Label(Label(3)),
+            mv(200, 0),
+            Instr::Return,
+            Instr::Label(Label(10)),
+            mv(-1, 0),
+            Instr::Return,
+        ]
+    })
+}
+
+/// Assert the native tier's `read/2` on `source` raises the compound
+/// `{badmatch, Source}` reason the interpreter's deopt step builds, `expected` being
+/// that reason built in the caller's own heap (the raise's reason term lives in the
+/// run's context, so the comparison must happen while it is still alive). Also asserts
+/// the interpreter tier agrees — the same value *or* the same typed error.
+fn assert_badmatch_raise(module: &Module, what: &str, source: Eterm, expected: Eterm) {
+    let agreed = agree_module(module, "read", 2, &[NIL, source]);
+    assert!(
+        matches!(agreed, Err(BeamError::Raise(_))),
+        "{what} on {source:?}: both tiers must raise {{badmatch, Source}}, got {agreed:?}"
+    );
+
+    let mut machine = Machine::new();
+    let mut ctx = MinimalContext::with_bif_hook(Box::new(checked_arith_hook));
+    let error = machine
+        .run_with_tier(
+            module,
+            atom(module, "read"),
+            2,
+            &[NIL, source],
+            &mut ctx,
+            Tier::BaselineJit,
+        )
+        .expect_err("a rejected tuple read must raise");
+    let reason = match &error {
+        BeamError::Raise(raise) => raise
+            .live_reason()
+            .and_then(|live| live.downcast_ref::<Eterm>().copied()),
+        _ => None,
+    }
+    .unwrap_or_else(|| panic!("{what} on {source:?}: no live reason term: {error:?}"));
+    assert!(
+        beam_term::eq(reason, expected, &module.atom_table),
+        "{what} on {source:?}: the raise reason is not {{badmatch, Source}}"
+    );
+}
+
+#[test]
+fn tuple_reads_match_the_interpreter_on_real_tuples() {
+    // Every in-range element index of a 3-tuple, on the native tier and on the
+    // interpreter (the reference).
+    let mut heap = Heap::new(64);
+    let triple = heap
+        .tuple(&[make_small(10), make_small(20), make_small(30)])
+        .expect("a tuple term");
+    for (element, expected) in [
+        (0u32, make_small(10)),
+        (1, make_small(20)),
+        (2, make_small(30)),
+    ] {
+        let module = tuple_read_module(element);
+        assert_eq!(
+            agree_module(&module, "read", 2, &[NIL, triple])
+                .unwrap_or_else(|err| panic!("get_tuple_element x1 {element} x0: {err:?}")),
+            expected,
+            "element {element} of a 3-tuple"
+        );
+    }
+}
+
+#[test]
+fn an_out_of_range_tuple_element_deopts_and_agrees_with_the_interpreter() {
+    // The arity bound is the second half of the guard: an element index at/past the
+    // tuple's arity is rejected, and the helper raises the exact `{badmatch, Source}`.
+    let mut heap = Heap::new(64);
+    let empty = heap.tuple(&[]).expect("an arity-0 tuple");
+    let pair = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+
+    for (what, element, source) in [
+        ("element 0 of a 0-tuple", 0u32, empty),
+        ("element 2 of a 2-tuple", 2, pair),
+        ("element 5 of a 2-tuple", 5, pair),
+    ] {
+        let module = tuple_read_module(element);
+        let expected = heap
+            .tuple(&[make_atom(atom(&module, "badmatch")), source])
+            .expect("the expected {badmatch, Source} reason");
+        assert_badmatch_raise(&module, what, source, expected);
+    }
+}
+
+#[test]
+fn a_non_tuple_tuple_read_source_deopts_and_agrees_with_the_interpreter() {
+    // The other guard half: `NIL`, a small integer, an atom and a cons cell are not
+    // boxed arityvals, so the block deopts and the helper raises the exact
+    // `{badmatch, Source}`.
+    let mut heap = Heap::new(64);
+    let cons = heap.cons(make_small(1), NIL).expect("a cons cell");
+    let module = tuple_read_module(0);
+    let read = make_atom(atom(&module, "read"));
+
+    for source in [NIL, make_small(7), read, cons] {
+        let expected = heap
+            .tuple(&[make_atom(atom(&module, "badmatch")), source])
+            .expect("the expected {badmatch, Source} reason");
+        assert_badmatch_raise(&module, "non-tuple source", source, expected);
+    }
+}
+
+#[test]
+fn a_tuple_read_with_an_out_of_bound_destination_deopts_and_agrees_with_the_interpreter() {
+    // A destination past `MAX_REGISTER` is not an addressable shape: the tier refuses
+    // it **without emitting a byte**, so the block emits the interpreter step for the
+    // whole instruction — whose `write_operand` reports the faithful `bad_register`,
+    // never a write past the end of `machine.x`.
+    let mut heap = Heap::new(64);
+    let pair = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+    let module = tuple_out_of_bound_module();
+    let jitted = agree_module(&module, "read", 1, &[pair]);
+    assert!(
+        matches!(jitted, Err(BeamError::BadArg)),
+        "expected the interpreter's `bad_register` for an out-of-bound destination, got {jitted:?}"
+    );
+}
+
+#[test]
+fn the_tuple_read_is_inlined_and_caches_its_registers() {
+    // Structural evidence that the tuple read is lowered natively: `x(1)` — the
+    // source — is named by no other inlinable instruction of `tuple_read/2`, so it is
+    // in the allocator's resident set only because the read was inlined. A deopted
+    // instruction contributes no native touch at all.
+    let compiled = BaselineJit::new()
+        .compile(&tuple_read_module(1))
+        .expect("compile the get_tuple_element fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1]);
+    assert_eq!(compiled.highest_cached_register(), Some(1));
+    assert_eq!(compiled.highest_native_register(), Some(1));
+}
+
+#[test]
+fn arity_switches_match_the_interpreter_on_real_tuples() {
+    // Each alternative, and the fall-through to the fail label when no arity matches.
+    let mut heap = Heap::new(64);
+    let pair = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+    let triple = heap
+        .tuple(&[make_small(1), make_small(2), make_small(3)])
+        .expect("a tuple term");
+    let quad = heap
+        .tuple(&[make_small(1), make_small(2), make_small(3), make_small(4)])
+        .expect("a tuple term");
+
+    let module = arity_switch_module("select_arity", Label(10));
+    for (what, source, expected) in [
+        ("arity 2", pair, make_small(100)),
+        ("arity 3", triple, make_small(200)),
+        ("arity 4 falls through to fail", quad, make_small(-1)),
+    ] {
+        assert_eq!(
+            agree_module(&module, "read", 2, &[NIL, source])
+                .unwrap_or_else(|err| panic!("{what}: {err:?}")),
+            expected,
+            "{what}"
+        );
+    }
+}
+
+#[test]
+fn a_non_tuple_arity_switch_source_deopts_and_agrees_with_the_interpreter() {
+    // A non-tuple source is the interpreter's typed `unsupported` (the switch is only
+    // emitted behind an `is_tuple` test); the guard can only reject, so the helper's
+    // exact error is what both tiers must report.
+    let mut heap = Heap::new(64);
+    let cons = heap.cons(make_small(1), NIL).expect("a cons cell");
+    let module = arity_switch_module("select_arity", Label(10));
+    let scrutinee = make_atom(atom(&module, "read"));
+
+    for source in [NIL, make_small(7), scrutinee, cons] {
+        let agreed = agree_module(&module, "read", 2, &[NIL, source]);
+        assert!(
+            matches!(agreed, Err(BeamError::Raise(_))),
+            "expected the typed `select_tuple_arity` unsupported for {source:?}, got {agreed:?}"
+        );
+    }
+}
+
+#[test]
+fn a_no_fail_arity_switch_deopts_and_agrees_with_the_interpreter() {
+    // A `NO_FAIL` switch is refused by the plan (its no-match path *raises*
+    // `{badmatch, Tuple}`), so the whole instruction stays on the interpreter step —
+    // whose matching path must still agree, and whose no-match path must raise.
+    let mut heap = Heap::new(64);
+    let pair = heap
+        .tuple(&[make_small(1), make_small(2)])
+        .expect("a tuple term");
+    let quad = heap
+        .tuple(&[make_small(1), make_small(2), make_small(3), make_small(4)])
+        .expect("a tuple term");
+
+    let module = arity_switch_module("select_arity_no_fail", NO_FAIL);
+    assert_eq!(
+        agree_module(&module, "read", 2, &[NIL, pair]).expect("arity 2"),
+        make_small(100)
+    );
+    let raised = agree_module(&module, "read", 2, &[NIL, quad]);
+    assert!(
+        matches!(raised, Err(BeamError::Raise(_))),
+        "expected the exhaustive switch to raise {{badmatch, Tuple}}, got {raised:?}"
+    );
+}
+
+#[test]
+fn the_arity_switch_is_inlined_and_caches_its_registers() {
+    // As for the tuple read: `x(1)` is named by no other inlinable instruction, so it
+    // is resident only because the switch was lowered natively (its scrutinee is its
+    // one native touch).
+    let compiled = BaselineJit::new()
+        .compile(&arity_switch_module("select_arity", Label(10)))
+        .expect("compile the select_tuple_arity fixture");
+    assert_eq!(compiled.cached_registers(), &[0u32, 1]);
+    assert_eq!(compiled.highest_native_register(), Some(1));
+}

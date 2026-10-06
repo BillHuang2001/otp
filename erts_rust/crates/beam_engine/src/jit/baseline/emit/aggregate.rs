@@ -1,18 +1,25 @@
-//! The baseline JIT's guarded cons-cell readers: `get_list`/`get_hd`/`get_tl`
-//! behind a guard that can only ever *reject* (a non-cons source falls back to
-//! `jit_step_one`, which raises the interpreter's exact `{badmatch, Source}`).
+//! The baseline JIT's guarded aggregate readers: the cons-cell readers
+//! (`get_list`/`get_hd`/`get_tl`) and the tuple readers (`get_tuple_element`,
+//! `select_tuple_arity`) behind guards that can only ever *reject* (a non-cons or
+//! non-tuple source falls back to `jit_step_one`, which raises the interpreter's
+//! exact `{badmatch, Source}` or reports its typed `unsupported`).
 
+use std::collections::BTreeMap;
 use std::mem::size_of;
 
 use beam_common::Result;
-use beam_loader::Operand;
-use beam_term::{Eterm, CAR_OFFSET, CDR_OFFSET, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK, TAG_PTR_MASK};
+use beam_loader::{Label, Operand, NO_FAIL};
+use beam_term::{
+    Eterm, ARITYVAL_SUBTAG, CAR_OFFSET, CDR_OFFSET, HEADER_ARITY_OFFS, TAG_HEADER_MASK,
+    TAG_PRIMARY_BOXED, TAG_PRIMARY_LIST, TAG_PRIMARY_MASK, TAG_PTR_MASK,
+};
 
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
+use super::super::runtime::encode_target;
 use super::operands::{x_offset, x_register};
-use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::{emit_step_and_continue, spill, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // ---------------------------------------------------------------------------
 // The cons-cell readers
@@ -337,4 +344,370 @@ fn store_x(
             Ok(())
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// The tuple readers
+// ---------------------------------------------------------------------------
+//
+// `get_tuple_element` (`emu/instrs.tab` `i_get_tuple_element` `:416`) and
+// `select_tuple_arity` (`emu/select_instrs.tab` `i_select_tuple_arity` `:111`) read
+// a tuple's arityval header. The interpreter (`crate::families::tuples`) gates
+// `get_tuple_element` on `terms::tuple_arity(value)` with `element < arity` and
+// otherwise *raises* `{badmatch, Source}` through `terms::badmatch_reason`; an
+// `arity` switch requires a tuple (a non-tuple is the documented typed
+// `unsupported("select_tuple_arity: non-tuple")`), then takes the **first**
+// `(Integer(n), Label)` alternative with `n == arity`, else `Fail` — a `NO_FAIL`
+// switch raising `{badmatch, Tuple}`.
+//
+// The subset below is lowered natively and mirrors that branch for branch:
+//
+// * the source (and, for a tuple read, the destination) must be an x-register
+//   inside the engine's [`MAX_REGISTER`] bound — a `Y` operand is not something the
+//   tier can address, and a register index past the bound would read out of
+//   `machine.x` (the interpreter step reports the faithful `bad_register`);
+// * the guard is `beam_term::is_tuple`: the `is_boxed` bit trick
+//   `(word & (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED)) == 0`, the header pointer
+//   `word & !TAG_PTR_MASK` (`boxed_val`, the literal-area bit included), and
+//   `is_arity_value(hdr)` — `(hdr & TAG_HEADER_MASK) == ARITYVAL_SUBTAG`. That mask
+//   is six bits wide, so the guard is a `test`/`jne` on zero rather than the
+//   single-bit `cmp` the cons-cell readers use;
+// * the arity bound is a plain word compare: a valid arityval has its low
+//   `HEADER_ARITY_OFFS` (six) bits zero, so `element < arity` is exactly
+//   `hdr >= (element + 1) << HEADER_ARITY_OFFS` — a `mov_ri`/`cmp`/`jl`, with no
+//   shift encoder needed;
+// * element `i` is the word at `8 * (1 + i)` past the header word.
+//
+// ANY guard failure branches to the helper, whose interpreter step raises the exact
+// `{badmatch, Source}` (a non-tuple or an out-of-range element) or reports the typed
+// `unsupported` — the guard can only ever *reject*.
+
+/// `TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED` as an `i64` — the mask of the
+/// `is_not_boxed` bit trick (`beam_term::boxed::is_not_boxed`), which is `0x1`.
+const NOT_BOXED_MASK: i64 = (TAG_PRIMARY_MASK - TAG_PRIMARY_BOXED) as i64;
+
+/// `TAG_HEADER_MASK` as an `i64` — the six-bit mask `is_arity_value` tests a header
+/// word with.
+const HEADER_MASK: i64 = TAG_HEADER_MASK as i64;
+
+/// The byte offset of a tuple's header word (a boxed term points *at* it).
+const HEADER_DISP: i32 = 0;
+
+/// The third scratch register the tuple guards need, beside [`MOVE_SCRATCH`] and
+/// [`MOVE_SCRATCH_2`]: `is_arity_value` must keep the header word and its mask live
+/// at once, and — unlike the single-bit primary-tag tests — the six-bit mask cannot
+/// be folded into the word being tested.
+///
+/// It is caller-saved and used strictly inside one instruction's guard, so it never
+/// survives a helper call; the block's cache registers are untouched.
+const GUARD_SCRATCH: Reg = Reg::R8;
+
+/// The arityval header word of a tuple of arity `n` — `beam_term::make_arityval`
+/// (`(n << HEADER_ARITY_OFFS) + ARITYVAL_SUBTAG`). It is both the bound of a tuple
+/// read's range guard (`n = element + 1`) and the word an `arity` alternative
+/// compares against.
+fn arity_header(n: i64) -> i64 {
+    (n << HEADER_ARITY_OFFS) + ARITYVAL_SUBTAG as i64
+}
+
+/// The byte offset of element `element` inside a tuple, or `None` when it does not
+/// fit the emitter's `disp32` addressing (an arity that large cannot exist in a live
+/// tuple, so the whole instruction deopts rather than truncating the displacement).
+fn element_disp(element: u32) -> Option<i32> {
+    i32::try_from(size_of::<Eterm>() as i64 * (i64::from(element) + 1)).ok()
+}
+
+/// The x-register operands of a tuple read the tier lowers natively: the source
+/// tuple and the destination it writes.
+#[derive(Clone, Copy)]
+pub(super) struct TupleReadShape {
+    /// The `source` operand's x-register.
+    source: u32,
+    /// The `dst` operand's x-register.
+    dst: u32,
+    /// The byte offset of the read element from the header word.
+    element_disp: i32,
+}
+
+impl TupleReadShape {
+    /// The x-register indices the shape's native lowering touches, in emission
+    /// order (the source first, then the destination).
+    pub(super) fn registers(&self) -> Vec<u32> {
+        vec![self.source, self.dst]
+    }
+}
+
+/// The inlinable shape of a `get_tuple_element Source Element Dst`, or `None` when
+/// the whole instruction must stay on the helper.
+///
+/// The source and the destination must be x-registers inside [`MAX_REGISTER`], and
+/// the element's word offset must be addressable — see the section comment above.
+/// The element index itself is an immediate, so an out-of-range one is a guard
+/// rejection rather than a shape the tier refuses.
+pub(super) fn get_tuple_element_shape(
+    source: &Operand,
+    element: u32,
+    dst: &Operand,
+) -> Option<TupleReadShape> {
+    Some(TupleReadShape {
+        source: in_bound_x(source)?,
+        dst: in_bound_x(dst)?,
+        element_disp: element_disp(element)?,
+    })
+}
+
+/// Emit `get_tuple_element Source Element Dst` natively, or report that the block
+/// must helper it.
+///
+/// Returns `true` when the whole guarded sequence was emitted, leaving element
+/// `element` of the source tuple in `dst`. Returns `false` **without having emitted
+/// a byte** when the operands are not two in-bound x-registers
+/// ([`get_tuple_element_shape`]) — the caller then emits exactly today's
+/// `jit_step_one` step.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_inline_get_tuple_element(
+    buffer: &mut CodeBuffer,
+    source: &Operand,
+    element: u32,
+    dst: &Operand,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some(shape) = get_tuple_element_shape(source, element, dst) else {
+        return Ok(false);
+    };
+    emit_tuple_read(
+        buffer,
+        &shape,
+        element,
+        allocation,
+        done,
+        func,
+        pc,
+        highest_touched,
+    )?;
+    Ok(true)
+}
+
+/// The inlinable shape of a `select_tuple_arity` the tier lowers natively.
+pub(super) struct AritySwitchPlan {
+    /// The scrutinee tuple's x-register.
+    tuple: u32,
+    /// The `(arityval header word, resolved target)` alternatives, in source order.
+    cases: Vec<(i64, (u32, u32))>,
+    /// The resolved fail label's `(func, pc)`.
+    fail: (u32, u32),
+}
+
+impl AritySwitchPlan {
+    /// The x-register indices the plan's native lowering touches — the scrutinee is
+    /// its only runtime operand (every alternative is an immediate).
+    pub(super) fn registers(&self) -> Vec<u32> {
+        vec![self.tuple]
+    }
+}
+
+/// The inlinable shape of a `select_tuple_arity`, or `None` for any shape above the
+/// subset (see the section comment above): a `NO_FAIL` switch — which *raises* on
+/// the no-match path — an unresolved label, a non-x-register scrutinee, or an
+/// alternative that is not a non-negative `Integer` with a resolved label.
+pub(super) fn select_tuple_arity_plan(
+    labels: &BTreeMap<Label, (u32, u32)>,
+    tuple: &Operand,
+    fail: Label,
+    destinations: &[(Operand, Label)],
+) -> Option<AritySwitchPlan> {
+    // A `NO_FAIL` switch *raises* when no alternative matches; the helper is exact.
+    if fail == NO_FAIL {
+        return None;
+    }
+    // An unresolved label keeps the interpreter's exact `unknown_label`.
+    let fail = *labels.get(&fail)?;
+    let tuple = in_bound_x(tuple)?;
+    let mut cases = Vec::with_capacity(destinations.len());
+    for (candidate, label) in destinations {
+        let Operand::Integer(n) = candidate else {
+            return None;
+        };
+        if *n < 0 {
+            return None;
+        }
+        let target = *labels.get(label)?;
+        cases.push((arity_header(*n), target));
+    }
+    Some(AritySwitchPlan { tuple, cases, fail })
+}
+
+/// Emit `select_tuple_arity Tuple Fail {Arity,Label}*` natively, or report that the
+/// whole instruction must be handed to the helper.
+///
+/// Returns `false` **without having emitted a byte** for any shape
+/// [`select_tuple_arity_plan`] refuses, so the caller falls back to exactly today's
+/// `jit_step_one`. On success the emitted code **always** transfers control (every
+/// path returns a `(func, pc)` word), so the caller ends the block there.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn try_inline_select_tuple_arity(
+    buffer: &mut CodeBuffer,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    tuple: &Operand,
+    fail: Label,
+    destinations: &[(Operand, Label)],
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<bool> {
+    let Some(plan) = select_tuple_arity_plan(labels, tuple, fail, destinations) else {
+        return Ok(false);
+    };
+
+    let fallback: CodeLabel = buffer.label();
+    emit_tuple_header_guard(buffer, plan.tuple, allocation, fallback, highest_touched)?;
+
+    // One `cmp`/`jcc` per alternative, in source order — the interpreter takes the
+    // **first** alternative whose arity equals the tuple's, and a word compare on
+    // the arityval header is exactly that equality (a valid header's low six bits
+    // are zero, so two arities share a header word only when they are equal).
+    let case_labels: Vec<CodeLabel> = (0..plan.cases.len()).map(|_| buffer.label()).collect();
+    for ((word, _), case_label) in plan.cases.iter().zip(&case_labels) {
+        buffer.mov_ri(MOVE_SCRATCH_2, *word)?;
+        buffer.cmp_rr(GUARD_SCRATCH, MOVE_SCRATCH_2)?;
+        buffer.jcc(Cond::E, *case_label)?;
+    }
+
+    // --- no alternative matched: return the fail label's `(func, pc)` -------
+    spill(buffer, allocation)?;
+    buffer.mov_ri(Reg::Rax, encode_target(plan.fail.0, plan.fail.1))?;
+    buffer.jmp(done)?;
+
+    // --- each alternative: return its target's `(func, pc)` -----------------
+    for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
+        buffer.bind(*case_label)?;
+        spill(buffer, allocation)?;
+        buffer.mov_ri(Reg::Rax, encode_target(target.0, target.1))?;
+        buffer.jmp(done)?;
+    }
+
+    // Rejected (a non-tuple source): one interpreter step, whose typed
+    // `unsupported`/raise is exact.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    Ok(true)
+}
+
+/// Emit the `is_tuple` guard for x-register `source`: branch to `fallback` unless it
+/// holds a boxed term whose header word is an arityval, leaving that header word in
+/// [`GUARD_SCRATCH`].
+///
+/// The guard is `beam_term::is_tuple` exactly — `is_boxed`, the header pointer
+/// `word & !TAG_PTR_MASK`, then `is_arity_value(hdr)` (see the section comment
+/// above). It can only ever *reject*: `fallback` runs one interpreter step, whose
+/// typed error is the ground truth.
+fn emit_tuple_header_guard(
+    buffer: &mut CodeBuffer,
+    source: u32,
+    allocation: &Allocation,
+    fallback: CodeLabel,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    // `is_boxed(source)`: the masked word is `0` for a boxed term and the mask itself
+    // for everything else — `NIL`, a small int, an atom, a cons cell, … .
+    load_x(buffer, source, allocation, MOVE_SCRATCH, highest_touched)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, NOT_BOXED_MASK)?;
+    buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.cmp_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.jcc(Cond::E, fallback)?;
+
+    // The header pointer: reload the source word (the mask consumed it) and clear
+    // the pointer tag — `boxed_val(word)`.
+    load_x(buffer, source, allocation, MOVE_SCRATCH, highest_touched)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, POINTER_MASK)?;
+    buffer.and_rr(MOVE_SCRATCH, MOVE_SCRATCH_2)?;
+
+    // `is_arity_value(*ptr)`: the header's low `HEADER_ARITY_OFFS` bits must be the
+    // arityval subtag. `test` sets `ZF` for `(hdr & mask) == 0`, which is exactly
+    // "the subtag equals `ARITYVAL_SUBTAG`".
+    buffer.mov_rm(GUARD_SCRATCH, MOVE_SCRATCH, HEADER_DISP)?;
+    buffer.mov_ri(MOVE_SCRATCH_2, HEADER_MASK)?;
+    buffer.test_rr(GUARD_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.jcc(Cond::Ne, fallback)?;
+    Ok(())
+}
+
+/// Lower an inlinable tuple read (see the section comment above for why it is
+/// exact). The emitted shape:
+///
+/// ```text
+///   mov  r11, <source>      ; the source word: a cached register, or `[rbx + x*8]`
+///   mov  r10, NOT_BOXED_MASK; the `is_boxed` bit
+///   and  r11, r10
+///   cmp  r11, r10           ; the masked word is 0 (boxed) or the mask itself
+///   je   fallback           ; not boxed: the helper raises `{badmatch, Source}`
+///   mov  r11, <source>      ; reload (the mask consumed the word)
+///   mov  r10, POINTER_MASK
+///   and  r11, r10           ; r11 = the header word's address, `boxed_val(word)`
+///   mov  r8,  [r11 + 0]     ; the header word
+///   mov  r10, HEADER_MASK
+///   test r8,  r10           ; the low six bits must be the arityval subtag
+///   jne  fallback           ; not a tuple: the helper raises `{badmatch, Source}`
+///   mov  r10, <bound>       ; (element + 1) << HEADER_ARITY_OFFS
+///   cmp  r8,  r10           ; the tuple's arity minus `element + 1`
+///   jl   fallback           ; element >= arity: the helper raises `{badmatch, Source}`
+///   mov  r10, [r11 + 8*(1+element)]   ; the element word
+///   mov  <dst>, r10
+///   jmp  fast_done
+/// fallback:
+///   <the `emit_step_and_continue` sequence: spend one `jit_step_one` on the
+///    instruction — which either advances and lets the block carry on at
+///    `pc + 1`, or exits to the driver with the helper's word>
+/// fast_done:
+///   <emit the rest of the block>
+/// ```
+///
+/// The destination is written through its own representation — a cached register,
+/// or its `machine.x` slot (the very slot the exit spill would write) — and the
+/// source is read the same way, so the tier's liveness model is unchanged. The fast
+/// path never spills.
+fn emit_tuple_read(
+    buffer: &mut CodeBuffer,
+    shape: &TupleReadShape,
+    element: u32,
+    allocation: &Allocation,
+    done: CodeLabel,
+    func: u32,
+    pc: u32,
+    highest_touched: &mut Option<u32>,
+) -> Result<()> {
+    let fallback: CodeLabel = buffer.label();
+    let fast_done: CodeLabel = buffer.label();
+
+    emit_tuple_header_guard(buffer, shape.source, allocation, fallback, highest_touched)?;
+
+    // `element < arity`: the header word carries the arity above its subtag bits, so
+    // the bound is the arityval of `element + 1` and the test is a plain `cmp`. Both
+    // operands are non-negative, so the signed `jl` is the word order.
+    buffer.mov_ri(MOVE_SCRATCH_2, arity_header(i64::from(element) + 1))?;
+    buffer.cmp_rr(GUARD_SCRATCH, MOVE_SCRATCH_2)?;
+    buffer.jcc(Cond::L, fallback)?;
+
+    // The element word, `8 * (1 + element)` past the header word.
+    buffer.mov_rm(MOVE_SCRATCH_2, MOVE_SCRATCH, shape.element_disp)?;
+    store_x(
+        buffer,
+        shape.dst,
+        MOVE_SCRATCH_2,
+        allocation,
+        highest_touched,
+    )?;
+    buffer.jmp(fast_done)?;
+
+    // Rejected (or not lowered): one interpreter step, then continue at `pc + 1`.
+    buffer.bind(fallback)?;
+    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+    buffer.bind(fast_done)?;
+    Ok(())
 }
