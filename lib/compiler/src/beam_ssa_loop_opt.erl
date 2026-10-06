@@ -48,17 +48,22 @@
 %%%
 %%% * Only `#b_set{}' value instructions are considered; phis, terminators,
 %%%   calls and side-effecting instructions are never touched.
-%%% * Only instructions that are in ?SAFE_OPS are hoisted. ?SAFE_OPS is a
-%%%   whitelist of operations that are side-effect free AND can never raise
-%%%   for any operand values (today: tuple and cons construction). This is
+%%% * Only instructions on an explicit whitelist are hoisted: the
+%%%   constructors in ?SAFE_OPS and the tag tests in ?SAFE_BIFS. Both are
+%%%   side-effect free AND can never raise for any operand values. This is
 %%%   stricter than `beam_ssa:no_side_effect/1', which is only a "can be
 %%%   omitted if the result is unused" predicate and returns true for
 %%%   instructions that can still fail (get_hd, get_tuple_element, ...).
 %%%   Hoisting an instruction that may raise would execute it on paths where
 %%%   it was not executed before, so those are deliberately excluded. The
 %%%   whitelist is further restricted to instructions that also have a
-%%%   block-independent code generation rule; see the comment on ?SAFE_OPS
-%%%   below.
+%%%   block-independent code generation rule; see the comments on ?SAFE_OPS
+%%%   and ?SAFE_BIFS below.
+%%% * A tag test such as `is_reference/1' is the interesting case for this
+%%%   pass, because guard code inside a receive loop is the only place where
+%%%   a loop-invariant test reliably shows up in the CFG at this point (see
+%%%   below). The tests are constant-tag comparisons, so hoisting one out of
+%%%   the loop removes it from the hot path without changing any result.
 %%% * Consequently arithmetic is NOT hoisted here: without type information
 %%%   (this pass runs before the SSA type pass) an operation such as `+'
 %%%   cannot be proven non-raising. This is a deliberate, documented limit.
@@ -108,6 +113,33 @@
 %% value instructions (`cg_instr(put_list, ...)' / `cg_instr(put_tuple, ...)')
 %% and are safe to move.
 -define(SAFE_OPS, [put_list, put_tuple]).
+
+%% `{bif,Name}' value instructions that are additionally hoisted, listed as
+%% {Name,Arity} pairs. These are the Erlang tag tests. Each one is a plain
+%% tag comparison that is pure and cannot fail for any argument (see the
+%% `is_*_1'/1 functions in `erts/emulator/beam/erl_bif_op.c'), and each is
+%% declared as `ubif' in `erts/emulator/beam/bif.tab', so
+%% `{bif,Name,{f,0},Args,Dst}' is a valid *standalone* instruction
+%% (`beam_ssa_codegen:cg_block/3', fallback clause) as well as a block-local
+%% test. They are therefore movable into a preheader.
+%%
+%% The arity is part of the key, because the arity decides whether the
+%% instruction can raise:
+%%
+%% * `is_function/2' shares the name `is_function' with the safe
+%%   `is_function/1', but raises `badarg' unless the second argument is a
+%%   non-negative integer (`erl_is_function/3' in erl_bif_op.c); v3_core
+%%   even forces a call to it in a guard to be protected for that reason.
+%% * `is_record/2' and `is_record/3' (i.e. `{bif,is_record}' with two or
+%%   three operands) raise `badarg' unless the tag operand is an atom
+%%   (`is_record_2/3' in erl_bif_op.c).
+%%
+%% None of the raising arities are listed, so they stay in the loop.
+-define(SAFE_BIFS, [{is_atom,1}, {is_binary,1}, {is_bitstring,1},
+                    {is_boolean,1}, {is_float,1}, {is_function,1},
+                    {is_integer,1}, {is_list,1}, {is_map,1}, {is_number,1},
+                    {is_pid,1}, {is_port,1}, {is_reference,1},
+                    {is_tuple,1}]).
 
 -spec opt({#opt_st{}, term()}) -> {#opt_st{}, term()}.
 opt({#opt_st{ssa=Linear0}=St, FuncDb}) when is_list(Linear0) ->
@@ -370,9 +402,18 @@ split_is([S | Rest], Inv, Cnt, Keep, Hoist) ->
 hoistable(#b_set{op=phi}, _Inv) ->
     false;
 hoistable(#b_set{op=Op, args=Args}, Inv) ->
-    lists:member(Op, ?SAFE_OPS) andalso
+    safe_op(Op, length(Args)) andalso
         lists:all(fun(A) -> invariant_arg(A, Inv) end, Args).
 
+%% safe_op(Op, Arity) -> boolean().
+%%  Is an instruction with this operation (and this number of operands)
+%%  pure, non-raising and code-generatable outside its original block?
+safe_op(Op, _Arity) when is_atom(Op) ->
+    lists:member(Op, ?SAFE_OPS);
+safe_op({bif,Name}, Arity) ->
+    lists:member({Name, Arity}, ?SAFE_BIFS);
+safe_op(_Op, _Arity) ->
+    false.
 invariant_arg(#b_literal{}, _Inv) ->
     true;
 invariant_arg(#b_var{}=V, Inv) ->
