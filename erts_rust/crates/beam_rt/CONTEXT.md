@@ -593,8 +593,10 @@ once that atom is seeded. Add any new atom-valued key's atom to `INFO_ATOMS`.
   process/reference/monitor/registry entries (`make_ref` uniqueness, the monitor/demonitor matrix,
   `ports`/`processes`/`pre_loaded`/`whereis`/`register`/`unregister`/`module_loaded`), and the
   `application:*` entries plus the `.app`-resource parser (system-installation cases skip **loudly**
-  via `system_runtime`). `src/error.rs`'s tests pin `KNOWN_UNIMPLEMENTED_ERLANG_BIFS` (a curated entry
-  is a capability gap; **no** name `beam_bifs`' registry owns is on the list) and the `undef` raise.
+  via `system_runtime`). `src/error.rs`'s tests pin the effective gap classifier: a curated entry is a
+  capability gap, and the **effective** gap set (the list intersected with the live registry's names)
+  is disjoint from the registry — the drift guard that makes a newly-registered `beam_bifs` BIF
+  impossible to shadow — plus the `undef` raise.
 * **`tests/mailbox.rs` — the nine engine `Mailbox` seam methods (round 1).** Drives `RuntimeContext`'s
   `Mailbox` implementation over a real `beam_message::Queue`: enqueue/len/scan/cursor, the
   `recv_marker_*` table, and that `send_message`'s `from` reflects the running pid — pinned against
