@@ -6,7 +6,7 @@
 //! deopt-and-continue sequence ([`emit_step_and_continue`]) that covers every
 //! instruction the block does not lower natively, the spill/fill discipline
 //! ([`CACHE_REGISTERS`]), the tier's one arithmetic optimisation — the guarded
-//! small-int `erlang:'+'/2`/`'-'/2` fast path ([`try_inline_gc_bif`]) — and the
+//! small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` fast path ([`try_inline_gc_bif`]) — and the
 //! guarded aggregate readers ([`aggregate`]: the cons-cell readers
 //! `get_list`/`get_hd`/`get_tl` and the tuple readers `get_tuple_element` /
 //! `select_tuple_arity`).
@@ -286,9 +286,11 @@ const INSTRUCTION_BYTES: usize = 192;
 
 /// The code-size budget reserved for one `gc_bif` (see
 /// [`code_capacity_estimate`]): the guarded small-int fast path (~140 bytes with
-/// `machine.x` operand loads and a `machine.x` result store) plus the
-/// [`emit_step_and_continue`] fallback it branches to (~150 bytes).
-const FAST_PATH_BYTES: usize = 352;
+/// `machine.x` operand loads and a `machine.x` result store, ~150 for the
+/// `erlang:'*'/2` sequence, which adds the untag/re-tag shifts and a second
+/// constant compare) plus the [`emit_step_and_continue`] fallback it branches to
+/// (~150 bytes).
+const FAST_PATH_BYTES: usize = 384;
 
 /// The code-size budget reserved for one `get_list`/`get_hd`/`get_tl` (see
 /// [`code_capacity_estimate`]): the guarded cons-cell read — a mask/test/branch, the
@@ -475,8 +477,8 @@ fn emit_block(
                 }
                 emit_step_and_continue(buffer, done, allocation, func, pc)?;
             }
-            // The one optimised BIF: the small-int `erlang:'+'/2`/`'-'/2`. When
-            // the guarded fast path is emitted the block keeps going; otherwise
+            // The one optimised BIF family: the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2`.
+            // When the guarded fast path is emitted the block keeps going; otherwise
             // (any other BIF, an un-addressable operand, or a register the budget
             // could not cache) it is exactly the `_` arm below.
             Instr::GcBif { .. } => {

@@ -8,7 +8,7 @@
 //! loop; the interpreter is the reference semantics.
 //!
 //! The second half of the file is the evidence for the tier's one optimisation —
-//! the **guarded small-int arithmetic fast path** for `erlang:'+'/2`/`'-'/2`
+//! the **guarded small-int arithmetic fast path** for `erlang:'+'/2`/`'-'/2`/`'*'/2`
 //! (`src/jit/baseline/`): it proves the fast path produces exactly the
 //! interpreter's results across the small-int range (including the boundary cases
 //! that must fall back to `jit_step_one`), that it never consults the BIF hook,
@@ -42,7 +42,13 @@ fn atom(module: &Module, name: &str) -> Atom {
         .unwrap_or_else(|| panic!("atom {name:?} not interned in module"))
 }
 
-/// The slice BIF hook: `erlang:'+'/2` and `erlang:'-'/2` over small integers.
+/// The slice BIF hook: `erlang:'+'/2`, `erlang:'-'/2` and `erlang:'*'/2` over
+/// small integers.
+///
+/// It has no bignum arithmetic, so it is used only where the operands and the
+/// product stay in the small range; the multiplication wraps rather than panicking
+/// (the out-of-range cases are driven through [`checked_arith_hook`] or the
+/// sentinel hook in `the_times_fast_path_deopts_...`).
 fn arith_hook(
     module: &str,
     function: &str,
@@ -59,6 +65,7 @@ fn arith_hook(
     match function {
         "+" => Ok(make_small(a + b)),
         "-" => Ok(make_small(a - b)),
+        "*" => Ok(make_small(a.wrapping_mul(b))),
         _ => Err(BeamError::BadArg),
     }
 }
@@ -297,6 +304,7 @@ fn checked_arith_hook(
     let result = match function {
         "+" => a.checked_add(b),
         "-" => a.checked_sub(b),
+        "*" => a.checked_mul(b),
         _ => return Err(BeamError::BadArg),
     };
     match result {
@@ -311,6 +319,7 @@ fn small_result(a: i64, b: i64, op: char) -> Option<i64> {
     let result = match op {
         '+' => a.checked_add(b),
         '-' => a.checked_sub(b),
+        '*' => a.checked_mul(b),
         _ => return None,
     }?;
     (MIN_SMALL..=MAX_SMALL).contains(&result).then_some(result)
@@ -362,6 +371,53 @@ fn arith_module() -> Module {
             label,
         });
     }
+    module
+}
+
+/// The `erlang:'*'/2` counterpart of [`arith_module`]: the single export `times/2`
+/// as one basic block `[label, gc_bif '*'/2 [x(0), x(1)] -> x(0), return]`.
+///
+/// A separate fixture rather than a third function in [`arith_module`], so the
+/// existing plus/minus tests keep their exact two-block shape.
+fn mul_module() -> Module {
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("fastpath_mul");
+    let erlang = module.atom_table.intern("erlang");
+    let function = module.atom_table.intern("times");
+    module.imports.push(Import {
+        module: erlang,
+        function: module.atom_table.intern("*"),
+        arity: 2,
+    });
+    let label = Label(1);
+    let code = vec![
+        Instr::Label(label),
+        Instr::GcBif {
+            arity: 2,
+            bif: ImportRef(0),
+            fail: NO_FAIL,
+            live: 2,
+            args: vec![Operand::X(0), Operand::X(1)],
+            dst: Operand::X(0),
+        },
+        Instr::Return,
+    ];
+    let (blocks, labels) = beam_loader::lower::build_blocks(&code);
+    module.functions.push(Function {
+        func_label: label,
+        entry_label: label,
+        module: module.name,
+        name: function,
+        arity: 2,
+        code,
+        blocks,
+        labels,
+    });
+    module.exports.push(Export {
+        function,
+        arity: 2,
+        label,
+    });
     module
 }
 
@@ -504,6 +560,278 @@ fn arithmetic_fast_path_agrees_over_a_sweep_of_small_integers() {
                 }
             }
         }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// The small-int `erlang:'*'/2` fast path
+// ---------------------------------------------------------------------------
+
+/// The `'*'` deopt oracle: exactly the small-int product when it fits, else `NIL`
+/// as a sentinel. No multiplication of two small integers can legitimately produce
+/// `NIL`, so a run that returns it *proves* the guard rejected the instruction and
+/// the helper really consulted the BIF.
+fn sentinel_mul_hook(
+    module: &str,
+    function: &str,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    if module != "erlang" || function != "*" || arity != 2 || args.len() != 2 {
+        return Err(BeamError::BadArg);
+    }
+    if !is_small(args[0]) || !is_small(args[1]) {
+        return Err(BeamError::BadArith);
+    }
+    let (a, b) = (signed_value(args[0]), signed_value(args[1]));
+    match a.checked_mul(b) {
+        Some(product) if (MIN_SMALL..=MAX_SMALL).contains(&product) => Ok(make_small(product)),
+        _ => Ok(NIL),
+    }
+}
+
+/// [`sentinel_mul_hook`] plus a call counter (see [`counting_arith_hook`] for why
+/// the counter is per-call-site rather than a process-global `static`).
+fn counting_sentinel_mul_hook(
+    counter: Arc<AtomicUsize>,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static {
+    move |module, function, arity, args| {
+        counter.fetch_add(1, Ordering::SeqCst);
+        sentinel_mul_hook(module, function, arity, args)
+    }
+}
+
+#[test]
+fn arithmetic_fast_path_times_matches_the_interpreter_across_the_small_range() {
+    let module = mul_module();
+    // The cases drive every arm of the emitted `'*'` guard: products the fast path
+    // computes natively, products exactly at each end of the small range, and
+    // products just past each end (some still fitting the `i64` the untagged
+    // multiply works in, so only the **untagged** range check rejects them; others
+    // overflowing it, so the `imul` `jo` guard does).
+    let cases: [(i64, i64); 22] = [
+        (0, 0),
+        (2, 3),
+        (3, 2),
+        (-4, 10),
+        (10, -4),
+        (7, -20),
+        (-1, -1),
+        (15, 16),
+        (-65536, 65536),
+        (MAX_SMALL, 0),
+        (MIN_SMALL, 0),
+        (MAX_SMALL, 1), // exactly the upper boundary
+        (1, MAX_SMALL),
+        (MIN_SMALL, 1), // exactly the lower boundary
+        (MAX_SMALL, -1), // -(2^59 - 1) == MIN_SMALL + 1: still in range
+        (MAX_SMALL, 2),  // one past the upper boundary (fits i64)
+        (MIN_SMALL, 2),  // one past the lower boundary (fits i64)
+        (MIN_SMALL, -1), // 2^59 == MAX_SMALL + 1 (fits i64)
+        (1 << 30, 1 << 30), // 2^60 (fits i64)
+        (MAX_SMALL, MAX_SMALL), // overflows i64: the `imul` overflow guard
+        (MIN_SMALL, MIN_SMALL), // overflows i64
+        (MIN_SMALL, MAX_SMALL), // overflows i64
+    ];
+    for (a, b) in cases {
+        let args = [make_small(a), make_small(b)];
+        let result = agree_module(&module, "times", 2, &args);
+        match (result, small_result(a, b, '*')) {
+            (Ok(got), Some(expected)) => {
+                assert_eq!(got, make_small(expected), "times({a}, {b})");
+            }
+            (Err(error), None) => assert_eq!(
+                format!("{error:?}"),
+                format!("{:?}", BeamError::BadArith),
+                "times({a}, {b}) must be the out-of-range BadArith"
+            ),
+            (got, expected) => panic!("times({a}, {b}): {got:?} vs {expected:?}"),
+        }
+    }
+}
+
+#[test]
+fn arithmetic_fast_path_times_agrees_over_a_sweep_of_small_integers() {
+    // A denser differential sweep than the boundary list above: every pair from a
+    // value set clustered at `0`, at the 8-bit/kernel-ish magnitudes and at both
+    // ends of the small-int range must agree with the interpreter, and every
+    // in-range product must be exactly `make_small(a * b)`.
+    let module = mul_module();
+    let values = [
+        MIN_SMALL,
+        MIN_SMALL + 1,
+        MIN_SMALL + 2,
+        -(1 << 30),
+        -1001,
+        -16,
+        -15,
+        -1,
+        0,
+        1,
+        15,
+        16,
+        1001,
+        1 << 30,
+        MAX_SMALL - 2,
+        MAX_SMALL - 1,
+        MAX_SMALL,
+    ];
+    for a in values {
+        for b in values {
+            let args = [make_small(a), make_small(b)];
+            let result = agree_module(&module, "times", 2, &args);
+            match (result, small_result(a, b, '*')) {
+                (Ok(got), Some(expected)) => {
+                    assert_eq!(got, make_small(expected), "times({a}, {b})");
+                }
+                (Err(_), None) => {}
+                (got, expected) => panic!("times({a}, {b}): {got:?} vs {expected:?}"),
+            }
+        }
+    }
+}
+
+#[test]
+fn the_synthetic_times_fixture_compiles_and_bypasses_the_hook() {
+    // Structural evidence: `times/2` really does compile to a native block ...
+    let module = mul_module();
+    let compiled = BaselineJit::new()
+        .compile(&module)
+        .expect("compile the synthetic fixture");
+    assert_eq!(compiled.block_count(), 1, "one block for times/2");
+    assert!(
+        compiled.entry(0, 0).is_some(),
+        "times/2's block must be compiled"
+    );
+    assert!(compiled.code_len() > 0);
+
+    // ... and behavioural evidence: the compiled `gc_bif '*'/2` multiplies itself,
+    // so the BIF hook is never consulted.
+    let calls = Arc::new(AtomicUsize::new(0));
+    let got = run_module_tier(
+        Tier::BaselineJit,
+        &module,
+        "times",
+        2,
+        &[make_small(6), make_small(7)],
+        counting_arith_hook(Arc::clone(&calls)),
+    )
+    .expect("times(6, 7)");
+    assert_eq!(got, make_small(42));
+    assert_eq!(
+        calls.load(Ordering::SeqCst),
+        0,
+        "the fast path must not call the BIF"
+    );
+}
+
+#[test]
+fn the_times_fast_path_deopts_to_the_bif_when_the_product_is_out_of_range() {
+    let module = mul_module();
+
+    // In range: the native fast path computes the product and never consults the BIF.
+    let fast_calls = Arc::new(AtomicUsize::new(0));
+    let got = run_module_tier(
+        Tier::BaselineJit,
+        &module,
+        "times",
+        2,
+        &[make_small(6), make_small(7)],
+        counting_sentinel_mul_hook(Arc::clone(&fast_calls)),
+    )
+    .expect("times(6, 7)");
+    assert_eq!(got, make_small(42));
+    assert_eq!(
+        fast_calls.load(Ordering::SeqCst),
+        0,
+        "the in-range fast path must not call the BIF"
+    );
+
+    // Out of range: the guard must reject and the helper hand the instruction to the
+    // BIF, whose sentinel answer (`NIL`) neither the fast path nor a wrongly widened
+    // result could have produced. `MAX_SMALL * 2` is the discriminating case: its
+    // *tagged* word wraps to `-17`, which is inside `[MIN_SMALL_WORD, MAX_SMALL_WORD]`,
+    // so a tagged-word range check would have accepted it and returned a wrong small.
+    let cases = [
+        (MAX_SMALL, 2),         // 2^60 - 2: fits i64, out of the small range
+        (MIN_SMALL, 2),         // -2^60: the same shape at the other end
+        (MIN_SMALL, -1),        // 2^59 == MAX_SMALL + 1
+        (1 << 30, 1 << 30),     // 2^60
+        (1 << 30, -(1 << 30)),  // -2^60
+        (MAX_SMALL, MAX_SMALL), // overflows i64: the `imul` overflow guard
+        (MIN_SMALL, MIN_SMALL), // overflows i64
+        (MIN_SMALL, MAX_SMALL), // overflows i64
+    ];
+    for (a, b) in cases {
+        let args = [make_small(a), make_small(b)];
+        for tier in [Tier::Interpreter, Tier::BaselineJit] {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let got = run_module_tier(
+                tier,
+                &module,
+                "times",
+                2,
+                &args,
+                counting_sentinel_mul_hook(Arc::clone(&calls)),
+            )
+            .unwrap_or_else(|err| panic!("{tier:?} times({a}, {b}): {err:?}"));
+            assert_eq!(
+                got, NIL,
+                "{tier:?} times({a}, {b}) must be the BIF's sentinel answer"
+            );
+            assert_eq!(
+                calls.load(Ordering::SeqCst),
+                1,
+                "{tier:?} times({a}, {b}) must consult the BIF exactly once"
+            );
+        }
+    }
+}
+
+#[test]
+fn a_non_small_times_operand_falls_back_to_the_interpreter_helper() {
+    let module = mul_module();
+    let mut heap = Heap::new(4);
+    // SAFETY: `alloc_words(2)` hands out exactly the two-word `[HEADER_FLONUM, bits]`
+    // block `write_float` writes, and `heap` outlives every use of the term.
+    let float = unsafe {
+        let hp = heap.alloc_words(2).expect("a 2-word float block");
+        beam_term::write_float(hp, 6.0)
+    };
+    let atom_arg = make_atom(atom(&module, "erlang"));
+
+    // None of these is a small integer, so the guard rejects and the block deopts to
+    // `jit_step_one`: the hook raises `BadArith` and both tiers report it alike.
+    for bad in [NIL, atom_arg, float] {
+        let args = [bad, make_small(2)];
+
+        let interpreted_calls = Arc::new(AtomicUsize::new(0));
+        let interpreted = run_module_tier(
+            Tier::Interpreter,
+            &module,
+            "times",
+            2,
+            &args,
+            counting_arith_hook(Arc::clone(&interpreted_calls)),
+        );
+        assert_eq!(interpreted_calls.load(Ordering::SeqCst), 1);
+
+        let jitted_calls = Arc::new(AtomicUsize::new(0));
+        let jitted = run_module_tier(
+            Tier::BaselineJit,
+            &module,
+            "times",
+            2,
+            &args,
+            counting_arith_hook(Arc::clone(&jitted_calls)),
+        );
+        assert_eq!(
+            jitted_calls.load(Ordering::SeqCst),
+            1,
+            "the rejected guard must fall back to the BIF"
+        );
+        assert!(matches!(jitted, Err(BeamError::BadArith)), "got {jitted:?}");
+        assert_eq!(format!("{jitted:?}"), format!("{interpreted:?}"));
     }
 }
 

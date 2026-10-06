@@ -15,33 +15,43 @@ use super::{emit_step_and_continue, touch, Allocation};
 // The small-int arithmetic fast path
 // ---------------------------------------------------------------------------
 //
-// The tier's **one** bounded optimisation: `gc_bif` of `erlang:'+'/2` and
-// `erlang:'-'/2` over small integers, emitted natively behind a guard that can
-// only ever *reject* (falling back to `jit_step_one`). It cannot produce a value
-// the interpreter step would not have produced:
+// The tier's **one** bounded optimisation: `gc_bif` of `erlang:'+'/2`,
+// `erlang:'-'/2` and `erlang:'*'/2` over small integers, emitted natively behind
+// guards that can only ever *reject* (falling back to `jit_step_one`). It cannot
+// produce a value the interpreter step would not have produced:
 //
 // * the two operands must both be small integers — the same `is_small` the
 //   `operand`/`Test` seams use (`(word & 0xF) == 0xF`, `../../beam_term/src/immediate.rs`);
-// * the arithmetic is done on the tagged words, which is exact because
+// * `+`/`-` are done on the tagged words, which is exact because
 //   `make_small(v) == v * 16 + 15`, so `a_word + b_word - 15 == make_small(va+vb)`
 //   (`- 15` becomes `+ 15` for the subtraction form);
-// * any `i64` overflow of either step, and any result outside
-//   `[MIN_SMALL_WORD, MAX_SMALL_WORD]`, jumps to the helper, which calls the real
-//   BIF (`BeamError`/bignum/float path) — so a result that is not a small
-//   integer is never fabricated here.
+// * `*` cannot use that trick (the encoding is affine, not multiplicative), so it
+//   **untags** both operands with an arithmetic shift right by `SMALL_SHIFT`
+//   (exact for every small, negatives included: `word == v * 16 + 15` and
+//   `15 < 16`, so the floor of `word / 16` is exactly `v`), multiplies the
+//   untagged values, and re-tags with `p * 16 + 15`;
+// * any `i64` overflow of a step, and any result outside the small range, jumps to
+//   the helper, which calls the real BIF (`BeamError`/bignum/float path) — so a
+//   result that is not a small integer is never fabricated here. `+`/`-` range-check
+//   the *tagged* word (the encoding maps the value range onto
+//   `[MIN_SMALL_WORD, MAX_SMALL_WORD]` bijectively); `*` must range-check the
+//   **untagged** product, because `p * 16` silently wraps for `|p| >= 2^59` and can
+//   land back inside the valid tagged-word interval (a wrong result).
 //
 // Everything else (another BIF, another module, an operand that is not a cached
 // x-register or a small constant, a destination that is not a cached x-register)
 // keeps today's behaviour: one `jit_step_one` call.
 
-/// The two BIFs the fast path lowers — `erlang:'+'/2` and `erlang:'-'/2`, and
-/// nothing else.
+/// The three BIFs the fast path lowers — `erlang:'+'/2`, `erlang:'-'/2` and
+/// `erlang:'*'/2`, and nothing else.
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub(crate) enum SmallArith {
     /// `erlang:'+'/2`.
     Add,
     /// `erlang:'-'/2`.
     Sub,
+    /// `erlang:'*'/2`.
+    Mul,
 }
 
 /// `TAG_IMMED1_MASK` as an `i64` — the low-nibble mask `is_small` tests with.
@@ -123,8 +133,8 @@ impl FastArith<'_> {
 /// consults the register allocation, so [`super::regalloc::allocate_registers`] and [`super::emit_block`]
 /// agree on which `gc_bif`s the fast path targets).
 ///
-/// The shape is the small-int `erlang:'+'/2`/`'-'/2` of `args.len() == 2` whose
-/// every operand is a cacheable x-register or a small-int constant and whose
+/// The shape is the small-int `erlang:'+'/2`/`'-'/2`/`'*'/2` of `args.len() == 2`
+/// whose every operand is a cacheable x-register or a small-int constant and whose
 /// destination is a cacheable x-register.
 pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastArith<'a>> {
     let Instr::GcBif {
@@ -140,6 +150,7 @@ pub(crate) fn fast_arith<'a>(module: &Module, instr: &'a Instr) -> Option<FastAr
     let op = match function_name {
         "+" => SmallArith::Add,
         "-" => SmallArith::Sub,
+        "*" => SmallArith::Mul,
         _ => return None,
     };
     let dst_x = x_register(dst)?;
@@ -250,6 +261,7 @@ fn load_into(
 ///   mov  rcx, SMALL_MASK
 ///   mov  r10, rax ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; a is small?
 ///   mov  r10, r8  ; and r10, rcx ; cmp r10, rcx ; jne fallback   ; b is small?
+///   ; --- erlang:'+'/2 and erlang:'-'/2: tagged-word arithmetic ---
 ///   mov  r11, rax
 ///   add  r11, r8            ; sub for '-'
 ///   jo   fallback           ; not both representable as an i64 tagged word
@@ -258,6 +270,17 @@ fn load_into(
 ///   jo   fallback
 ///   mov  rcx, MIN_SMALL_WORD ; cmp r11, rcx ; jl fallback
 ///   mov  rcx, MAX_SMALL_WORD ; cmp r11, rcx ; jg fallback
+///   ; --- erlang:'*'/2: untag, multiply, range-check the product, re-tag ---
+///   sar  rax, SMALL_SHIFT   ; va = word >>a 4 (exact for every small)
+///   sar  r8,  SMALL_SHIFT   ; vb
+///   mov  r11, rax
+///   imul r11, r8            ; va * vb, `jo` on signed overflow
+///   jo   fallback
+///   mov  rcx, MIN_SMALL ; cmp r11, rcx ; jl fallback  ; the UNTAGGED product:
+///   mov  rcx, MAX_SMALL ; cmp r11, rcx ; jg fallback  ; `p * 16` wraps for large p
+///   shl  r11, SMALL_SHIFT   ; make_small(p) == p * 16 + 15, safe after the check
+///   mov  rcx, SMALL_TAG
+///   or   r11, rcx
 ///   mov  <dst>, r11         ; cached destination: its machine register;
 ///                           ; otherwise `mov [rbx + dst*8], r11`
 ///   jmp  fast_done
@@ -310,30 +333,68 @@ pub(super) fn try_inline_gc_bif(
         buffer.jcc(Cond::Ne, fallback)?;
     }
 
-    // Tagged-word arithmetic; an `i64` overflow of either step means the result
-    // is not representable as a tagged small word, so the helper computes it.
-    buffer.mov_rr(FAST_R, FAST_A)?;
+    // Compute the result word in `r11`.
     match fast.op {
-        SmallArith::Add => buffer.add_rr(FAST_R, FAST_B)?,
-        SmallArith::Sub => buffer.sub_rr(FAST_R, FAST_B)?,
-    }
-    buffer.jcc(Cond::O, fallback)?;
-    buffer.mov_ri(FAST_C, SMALL_TAG)?;
-    match fast.op {
-        SmallArith::Add => buffer.sub_rr(FAST_R, FAST_C)?,
-        SmallArith::Sub => buffer.add_rr(FAST_R, FAST_C)?,
-    }
-    buffer.jcc(Cond::O, fallback)?;
+        // `+`/`-`: tagged-word arithmetic; an `i64` overflow of either step means
+        // the result is not representable as a tagged small word, so the helper
+        // computes it.
+        SmallArith::Add | SmallArith::Sub => {
+            buffer.mov_rr(FAST_R, FAST_A)?;
+            if fast.op == SmallArith::Add {
+                buffer.add_rr(FAST_R, FAST_B)?;
+            } else {
+                buffer.sub_rr(FAST_R, FAST_B)?;
+            }
+            buffer.jcc(Cond::O, fallback)?;
+            buffer.mov_ri(FAST_C, SMALL_TAG)?;
+            if fast.op == SmallArith::Add {
+                buffer.sub_rr(FAST_R, FAST_C)?;
+            } else {
+                buffer.add_rr(FAST_R, FAST_C)?;
+            }
+            buffer.jcc(Cond::O, fallback)?;
 
-    // Range check: a tagged word is a valid small integer iff it lies in
-    // `[MIN_SMALL_WORD, MAX_SMALL_WORD]` (the encoding `v -> v*16 + 15` maps the
-    // value range onto that interval bijectively).
-    buffer.mov_ri(FAST_C, MIN_SMALL_WORD)?;
-    buffer.cmp_rr(FAST_R, FAST_C)?;
-    buffer.jcc(Cond::L, fallback)?;
-    buffer.mov_ri(FAST_C, MAX_SMALL_WORD)?;
-    buffer.cmp_rr(FAST_R, FAST_C)?;
-    buffer.jcc(Cond::G, fallback)?;
+            // Range check: a tagged word is a valid small integer iff it lies in
+            // `[MIN_SMALL_WORD, MAX_SMALL_WORD]` (the encoding `v -> v*16 + 15` maps
+            // the value range onto that interval bijectively).
+            buffer.mov_ri(FAST_C, MIN_SMALL_WORD)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::L, fallback)?;
+            buffer.mov_ri(FAST_C, MAX_SMALL_WORD)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::G, fallback)?;
+        }
+        // `*`: the tagged words cannot be multiplied directly (`make_small` is
+        // affine), so untag both with an **arithmetic** shift right — exact for
+        // every small, negatives included, because `word == v * 16 + 15` and
+        // `15 < 16` makes the floor of `word / 16` exactly `v`.
+        SmallArith::Mul => {
+            buffer.sar_ri(FAST_A, SMALL_SHIFT)?;
+            buffer.sar_ri(FAST_B, SMALL_SHIFT)?;
+            buffer.mov_rr(FAST_R, FAST_A)?;
+            buffer.imul_rr(FAST_R, FAST_B)?;
+            // A signed overflow means the product is not an `i64`, let alone a small.
+            buffer.jcc(Cond::O, fallback)?;
+
+            // Range check the **untagged** product. This is *not* interchangeable
+            // with the tagged-word check above: `p * 16` silently wraps for
+            // `|p| >= 2^59` and can land back inside `[MIN_SMALL_WORD, MAX_SMALL_WORD]`
+            // (e.g. `make_small(MAX_SMALL) * 2` tags to the word `-17`, which the
+            // tagged check would accept), so only the untagged value is aliasing-free.
+            buffer.mov_ri(FAST_C, MIN_SMALL)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::L, fallback)?;
+            buffer.mov_ri(FAST_C, MAX_SMALL)?;
+            buffer.cmp_rr(FAST_R, FAST_C)?;
+            buffer.jcc(Cond::G, fallback)?;
+
+            // Re-tag: `make_small(p) == p * 16 + 15`, with the shift now provably
+            // lossless (`|p| <= 2^59`).
+            buffer.shl_ri(FAST_R, SMALL_SHIFT)?;
+            buffer.mov_ri(FAST_C, SMALL_TAG)?;
+            buffer.or_rr(FAST_R, FAST_C)?;
+        }
+    }
 
     // Success: store the result — in the destination's cached register, or
     // straight into its `machine.x` slot when the budget could not cache it —

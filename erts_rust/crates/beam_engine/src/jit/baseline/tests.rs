@@ -238,7 +238,7 @@ fn tagged_word_arithmetic_reproduces_make_small() {
 }
 
 #[test]
-fn fast_arith_recognizes_only_the_two_small_int_bifs() {
+fn fast_arith_recognizes_only_the_three_small_int_bifs() {
     let (module, refs) = module_with_imports(&[
         ("erlang", "+", 2),
         ("erlang", "-", 2),
@@ -250,7 +250,7 @@ fn fast_arith_recognizes_only_the_two_small_int_bifs() {
     for (index, expected) in [
         (0usize, Some(SmallArith::Add)),
         (1, Some(SmallArith::Sub)),
-        (2, None),
+        (2, Some(SmallArith::Mul)),
         (3, None),
         (4, None),
     ] {
@@ -296,7 +296,7 @@ fn allocation_caches_the_fast_path_operands_and_destination() {
     assert_eq!(allocation.slot(2), Some(Reg::R13));
 
     // A `gc_bif` outside the fast path caches nothing.
-    let (module, refs) = module_with_imports(&[("erlang", "*", 2)]);
+    let (module, refs) = module_with_imports(&[("erlang", "div", 2)]);
     let code = vec![gc_bif(
         refs[0],
         vec![Operand::X(4), Operand::Integer(1)],

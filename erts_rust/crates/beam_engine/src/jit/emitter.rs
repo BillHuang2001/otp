@@ -621,6 +621,49 @@ impl CodeBuffer {
         self.emit_rr(0x31, dst, src)
     }
 
+    /// `imul dst, src` — the two-operand signed multiply (`dst = dst * src`).
+    ///
+    /// Sets `OF`/`CF` exactly when the low 64 bits are not the sign-extended exact
+    /// product, i.e. when the multiplication overflowed — the flag the arithmetic
+    /// fast path's `jo` guard reads.
+    ///
+    /// Unlike `add`/`sub`, the two-operand `imul`'s **destination** is the `ModRM`
+    /// `reg` field and its source the `r/m` field (`0F AF /r`, `IMUL r64, r/m64`),
+    /// so the operand order here is the reverse of [`Self::emit_rr`]'s.
+    pub fn imul_rr(&mut self, dst: Reg, src: Reg) -> Result<()> {
+        self.emit_rex(true, ext(dst), 0, ext(src))?;
+        self.emit_u8(0x0F)?;
+        self.emit_u8(0xAF)?;
+        self.emit_u8(modrm_rr(dst, src))
+    }
+
+    // -- shifts --------------------------------------------------------------
+
+    /// `sar dst, imm` — an arithmetic (sign-preserving) shift right.
+    pub fn sar_ri(&mut self, dst: Reg, imm: u32) -> Result<()> {
+        self.emit_shift_ri(7, dst, imm)
+    }
+
+    /// `shl dst, imm` — a logical shift left.
+    pub fn shl_ri(&mut self, dst: Reg, imm: u32) -> Result<()> {
+        self.emit_shift_ri(4, dst, imm)
+    }
+
+    /// Emits the `C1 /n ib` shift form: `REX.W`, the opcode, a `ModRM` whose `reg`
+    /// field is the shift kind (`4` = left, `7` = arithmetic right), and the 8-bit
+    /// count.
+    ///
+    /// Only this immediate form is supported: a count above `u8::MAX` would need
+    /// the `cl`-form (`D3 /n`), so it is rejected as an API misuse (`BadArg`)
+    /// rather than encoded.
+    fn emit_shift_ri(&mut self, op: u8, dst: Reg, imm: u32) -> Result<()> {
+        let imm = u8::try_from(imm).map_err(|_| BeamError::BadArg)?;
+        self.emit_rex(true, 0, 0, ext(dst))?;
+        self.emit_u8(0xC1)?;
+        self.emit_u8(0xC0 | ((op & 0x7) << 3) | (dst.code() & 0x7))?;
+        self.emit_u8(imm)
+    }
+
     // -- stack ---------------------------------------------------------------
 
     /// `push reg`.
@@ -800,6 +843,32 @@ mod tests {
         assert_eq!(add(-4, 10), 6);
         assert_eq!(add(0, 0), 0);
         assert_eq!(add(i64::MIN, i64::MAX), -1);
+    }
+
+    #[test]
+    fn emits_imul_sar_and_shl() {
+        // `g(a, b) = ((a * b) >>a 4) << 4` — the three encoders the `erlang:'*'/2`
+        // fast path's untag/multiply/re-tag sequence is built from.
+        let mut buf = CodeBuffer::new().unwrap();
+        buf.mov_rr(Reg::Rax, Reg::Rdi).unwrap();
+        buf.imul_rr(Reg::Rax, Reg::Rsi).unwrap();
+        buf.sar_ri(Reg::Rax, 4).unwrap();
+        buf.shl_ri(Reg::Rax, 4).unwrap();
+        buf.ret().unwrap();
+        buf.seal().unwrap();
+
+        let g: BinOp = buf.as_fn_ptr();
+        assert_eq!(g(6, 7), 32); // 42 >> 4 == 2, << 4 == 32
+        assert_eq!(g(-6, 7), -48); // -42 >>a 4 == -3 (sign-preserving), << 4 == -48
+        assert_eq!(g(0, -9), 0);
+        // The low 64 bits of a product that overflows are exact (and `imul` reports
+        // the overflow in `OF`); rejecting such a product is the fast path's guard's
+        // job, not the encoder's.
+        assert_eq!(g(i64::MAX, 2), -16); // (-2) >>a 4 == -1, << 4 == -16
+        // A shift count above the 8-bit immediate is refused, never mis-encoded.
+        let mut buf = CodeBuffer::new().unwrap();
+        assert!(buf.sar_ri(Reg::Rax, 256).is_err());
+        assert!(buf.shl_ri(Reg::Rax, u32::MAX).is_err());
     }
 
     #[test]
