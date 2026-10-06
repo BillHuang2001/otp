@@ -12,6 +12,7 @@
 //! unreachable from the public API.
 
 use core::cmp::Ordering;
+use core::mem::size_of;
 
 use beam_term::prelude::*;
 
@@ -301,6 +302,34 @@ impl NodeStore {
         self.slots[id.index()] = Some(node);
     }
 
+    /// An honest, non-negative word count of the arena's backing storage —
+    /// `ets:info(Tab, memory)`'s `ordered_set` interior contribution.
+    ///
+    /// Every array is measured at **capacity**, so the figure never under-reports
+    /// what is actually allocated and never decreases as nodes are inserted (the
+    /// slot table only grows, and a fresh slot reuses a retired id rather than
+    /// shrinking anything). Words are `Eterm`-sized; `slots`/`retired` hold
+    /// `Option<Node>`/`NodeId` elements, counted by their rounded-up word size.
+    pub(crate) fn memory(&self) -> usize {
+        let mut words = self.slots.capacity() * words_of::<Option<Node>>();
+        words += self.retired.capacity() * words_of::<NodeId>();
+        for slot in &self.slots {
+            match slot {
+                Some(Node::Leaf(leaf)) => {
+                    words += leaf.entries.capacity() * words_of::<Entry>();
+                }
+                Some(Node::Branch(branch)) => {
+                    words += branch.keys.capacity() * words_of::<Eterm>();
+                    words += branch.children.capacity() * words_of::<NodeId>();
+                }
+                // A slot taken for a split/merge is transiently empty; it owns no
+                // storage beyond the slot word already counted above.
+                None => {}
+            }
+        }
+        words
+    }
+
     /// The number of live nodes — reachable from the root or not. The test suite
     /// uses it to prove that a rebalance leaves no slot behind.
     #[cfg(test)]
@@ -344,4 +373,9 @@ pub(crate) fn child_index(branch: &BranchNode, key: Eterm, atoms: &AtomTable) ->
         .len()
         .checked_sub(1)
         .expect("a branch is never childless")
+}
+
+/// The number of `Eterm`-sized words a value of type `T` occupies (rounded up).
+fn words_of<T>() -> usize {
+    size_of::<T>().div_ceil(size_of::<Eterm>())
 }

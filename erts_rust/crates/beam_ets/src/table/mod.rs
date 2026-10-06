@@ -185,8 +185,8 @@ pub(crate) trait Interior {
     /// index (`ets:info(Tab, memory)`'s interior contribution).
     ///
     /// The default is `0` — an interior that does not account for its index
-    /// storage contributes nothing; the hash interior reports its honest
-    /// bucket/entry allocation.
+    /// storage contributes nothing; the hash and `ordered_set` interiors report
+    /// their honest bucket/entry and B+-tree node-arena allocations respectively.
     fn memory(&self) -> usize {
         0
     }
