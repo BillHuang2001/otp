@@ -62,9 +62,12 @@ use beam_bifs::{AtomInterner, BifContext, FunCaller, OutputSink};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
+use beam_message::Queue;
+use beam_process::{ProcessId, ProcessTable};
 use beam_term::{Atom, Eterm};
 
 use crate::error;
+use crate::mailbox::MailboxState;
 use crate::port::RuntimePorts;
 use crate::runtime::Runtime;
 
@@ -132,26 +135,112 @@ pub struct RuntimeContext<'a> {
     /// A **shared** handle (see [`SharedSink`]) so the *same* sink can be handed to a
     /// nested context when a `fun`-taking BIF applies its fun ([`FunBridge`]).
     pub(crate) output: Option<SharedSink<'a>>,
+    /// The process the context runs **as** — the mailbox owner, and the pid
+    /// `erlang:self/0` reports.
+    ///
+    /// It is the runtime's own [`self_pid`](Runtime::self_pid) unless the context was
+    /// built with [`RuntimeContext::for_process`].
+    mailbox_pid: ProcessId,
+    /// A **caller-supplied** process table to resolve that process against, if any.
+    ///
+    /// `None` means "use the runtime's own [`processes`](Runtime::processes)". The
+    /// scheduler pass runs a process whose `Process` lives in a `ProcessTable` it owns
+    /// separately from `&mut Runtime` (it cannot hand the same table to both), so the
+    /// context must be able to resolve a mailbox against either source — see
+    /// [`RuntimeContext::for_process`].
+    mailbox_table: Option<&'a mut ProcessTable>,
 }
 
 impl<'a> RuntimeContext<'a> {
-    /// A context over `runtime`, with the default (stdout) output sink.
+    /// A context over `runtime`, with the default (stdout) output sink, running as the
+    /// runtime's own process.
     pub fn new(runtime: &'a mut Runtime) -> RuntimeContext<'a> {
+        let mailbox_pid = runtime.self_pid;
         RuntimeContext {
             runtime,
             output: None,
+            mailbox_pid,
+            mailbox_table: None,
         }
     }
 
     /// A context over `runtime` whose program output goes to `sink`.
     pub fn with_output(runtime: &'a mut Runtime, sink: &'a mut dyn OutputSink) -> RuntimeContext<'a> {
+        let mailbox_pid = runtime.self_pid;
         RuntimeContext {
             runtime,
             output: Some(SharedSink::new(sink)),
+            mailbox_pid,
+            mailbox_table: None,
         }
     }
 
-    /// Heap words still available to the running code.
+    /// A context that runs **as `pid`**, resolving that process and its mailbox against
+    /// the caller-supplied `table` instead of the runtime's own
+    /// [`processes`](Runtime::processes).
+    ///
+    /// This is the seam the scheduler pass builds on: a `ProcessRunner` receives the
+    /// `ProcessTable` it schedules from separately from the `&mut Runtime` it needs for
+    /// BIF dispatch (it cannot lend the same table to both), so it constructs a context
+    /// this way. The mailbox **scan state** is unaffected — it always lives in
+    /// [`Runtime::mailboxes`](crate::runtime::Runtime), keyed by `pid`, because a
+    /// suspended receive must resume against exactly the position it stopped at.
+    ///
+    /// `table` must contain `pid`; a receive-seam call for a pid it does not hold is the
+    /// typed [`crate::error::no_mailbox`] capability gap, never a panic. A `send` through
+    /// such a context delivers into `table` (the table `pid` belongs to), so a target pid
+    /// living in a *different* table is reported as the table's typed not-found error.
+    pub fn for_process(
+        runtime: &'a mut Runtime,
+        table: &'a mut ProcessTable,
+        pid: ProcessId,
+    ) -> RuntimeContext<'a> {
+        RuntimeContext {
+            runtime,
+            output: None,
+            mailbox_pid: pid,
+            mailbox_table: Some(table),
+        }
+    }
+
+    /// The pid this context runs as (the mailbox owner and `erlang:self/0`).
+    pub fn pid(&self) -> ProcessId {
+        self.mailbox_pid
+    }
+
+    /// The process table a receive/send resolves against: the caller-supplied one when
+    /// there is one, else the runtime's own.
+    fn process_table_mut(&mut self) -> &mut ProcessTable {
+        match self.mailbox_table {
+            Some(ref mut table) => &mut **table,
+            None => &mut self.runtime.processes,
+        }
+    }
+
+    /// The running process's mailbox **message queue** and **scan state**, borrowed
+    /// together.
+    ///
+    /// The queue lives in the `Process` (in the caller-supplied table or the runtime's
+    /// own); the scan state lives in [`Runtime::mailboxes`](crate::runtime::Runtime).
+    /// They are disjoint, so both are handed out mutably at once. A pid with no process
+    /// is the typed [`crate::error::no_mailbox`] capability gap.
+    fn mailbox_parts(&mut self) -> Result<(&mut Queue, &mut MailboxState)> {
+        let pid = self.mailbox_pid;
+        let Runtime {
+            processes,
+            mailboxes,
+            ..
+        } = &mut *self.runtime;
+        // `table` and `mailboxes`/`processes` are disjoint places, so the borrows below
+        // do not conflict.
+        let table: &mut ProcessTable = match self.mailbox_table {
+            Some(ref mut table) => &mut **table,
+            None => processes,
+        };
+        let state = mailboxes.entry(pid).or_default();
+        let process = table.get_mut(pid).ok_or_else(|| error::no_mailbox(pid))?;
+        Ok((process.mailbox_mut(), state))
+    }    /// Heap words still available to the running code.
     ///
     /// Milestone-1's arena is unbounded (no GC yet), so this reports
     /// `usize::MAX` — see the module docs.
@@ -236,12 +325,19 @@ impl<'a> RuntimeContext<'a> {
         let tables_handle = Rc::clone(&self.runtime.tables);
         let ports_handle = Rc::clone(&self.runtime.ports);
         let mut heap = self.runtime.take_bif_heap()?;
-        let self_pid = self.runtime.self_pid;
+        // `self_pid` is the pid this context runs as: `erlang:self/0` reports it, and a
+        // `receive` in a fun a BIF applies resolves its mailbox against it.
+        let self_pid = self.mailbox_pid;
         // `base` is the shared table's length before the call: the index the first new
         // name gets, because nothing else interns while this single-threaded call runs.
         let mut pending = PendingInterner::new(atoms.len());
         let result = {
-            let RuntimeContext { runtime, output } = self;
+            let RuntimeContext {
+                runtime,
+                output,
+                mailbox_pid,
+                mailbox_table,
+            } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
             // reach `ets:*`. Borrowing the shared `TableRegistry` for the whole call would
@@ -263,6 +359,8 @@ impl<'a> RuntimeContext<'a> {
             let mut bridge = FunBridge {
                 runtime,
                 output: output.clone(),
+                mailbox_pid: *mailbox_pid,
+                mailbox_table: mailbox_table.as_deref_mut(),
             };
             // The port provider is another cheap handle: it holds the shared `Rc` port
             // registry and a clone of the shared atom-table handle, so `erlang:open_port/2`
@@ -326,6 +424,12 @@ struct FunBridge<'a> {
     runtime: &'a mut Runtime,
     /// The caller's shared output sink (stdout when unset), cloned from the outer context.
     output: Option<SharedSink<'a>>,
+    /// The pid the outer call runs as, so a `receive` inside the applied fun resolves
+    /// the *same* process's mailbox.
+    mailbox_pid: ProcessId,
+    /// The outer call's externally supplied process table, if any (see
+    /// [`RuntimeContext::for_process`]).
+    mailbox_table: Option<&'a mut ProcessTable>,
 }
 
 impl FunCaller for FunBridge<'_> {
@@ -333,9 +437,13 @@ impl FunCaller for FunBridge<'_> {
         // A fresh nested context over the same runtime, sharing the caller's output sink
         // so a nested `io:format` reaches it. The ETS cell is left free by the outer call
         // (it is re-entrancy-capable), so the nested `call_registered` borrows it normally.
+        // The mailbox identity (pid + table) is inherited, so a `receive` in the fun
+        // scans the same process's mailbox as the outer call.
         let mut ctx = RuntimeContext {
             runtime: self.runtime,
             output: self.output.clone(),
+            mailbox_pid: self.mailbox_pid,
+            mailbox_table: self.mailbox_table.as_deref_mut(),
         };
         ctx.apply_fun(fun, args)
     }
@@ -479,6 +587,99 @@ impl ExecutionContext for RuntimeContext<'_> {
             return Err(BeamError::BadArity);
         }
         Machine::new().run_label(&found, descriptor.label, descriptor.arity, &combined, self)
+    }
+
+    /// `send`: deliver `message` to the pid term `to`.
+    ///
+    /// `to` is resolved with [`ProcessId::from_eterm`] (a non-pid is [`BeamError::BadArg`])
+    /// and the message is copied into the recipient's heap and enqueued by
+    /// [`ProcessTable::deliver_simple`] (an unknown pid is the table's typed
+    /// `TermNotFound`). The sender is this context's pid, so `self() ! M` reaches the very
+    /// mailbox the following `receive` scans.
+    ///
+    /// A delivery that wakes a blocked recipient reports [`DeliverOutcome::Woke`]; the
+    /// wake is **recorded on the process table's wake list** (not lost) and a later
+    /// scheduler pass absorbs it by calling `Scheduler::resume_woken`. Milestone 1 has no
+    /// scheduler loop, so nothing enqueues the woken process here — which is why a
+    /// self-delivery is the `Enqueued` case this crate relies on.
+    ///
+    /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
+    fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
+        let to = ProcessId::from_eterm(to)?;
+        let from = self.mailbox_pid.to_eterm();
+        // `deliver_simple` pushes a woken recipient onto the table's wake list, so the
+        // wake survives for the scheduler pass; the outcome itself needs no action here.
+        let _outcome = self.process_table_mut().deliver_simple(to, from, message)?;
+        Ok(())
+    }
+
+    /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)` when
+    /// the scan/mailbox is exhausted.
+    ///
+    /// **Peeks**: the scan position does not move (the following `loop_rec_end` advances
+    /// it). Never `unsupported` while the running process exists — an empty mailbox is
+    /// simply `Ok(None)`, which makes the compiled code jump to the `wait` that blocks.
+    fn receive_next(&mut self) -> Result<Option<Eterm>> {
+        let (queue, state) = self.mailbox_parts()?;
+        Ok(state.next(queue))
+    }
+
+    /// `loop_rec_end`: advance the scan past the current candidate.
+    fn receive_skip(&mut self) -> Result<()> {
+        let (queue, state) = self.mailbox_parts()?;
+        state.skip(queue);
+        Ok(())
+    }
+
+    /// `remove_message`: unlink the matched candidate and reposition the scan at the
+    /// first message.
+    fn receive_remove(&mut self) -> Result<()> {
+        let (queue, state) = self.mailbox_parts()?;
+        state.remove(queue);
+        Ok(())
+    }
+
+    /// `timeout`: reset the scan position to the first message.
+    fn receive_reset(&mut self) -> Result<()> {
+        let (queue, state) = self.mailbox_parts()?;
+        state.reset(queue);
+        Ok(())
+    }
+
+    /// `recv_marker_reserve`: an opaque marker term for the current scan position.
+    ///
+    /// On an **empty** queue there is no position to record, so the C `am_undefined` is
+    /// returned instead — interned into the one shared atom table so the term is a real,
+    /// nameable atom (and, being non-small, makes the following `recv_marker_bind` a
+    /// no-op). Otherwise a fresh small-integer marker is returned.
+    fn receive_marker_reserve(&mut self) -> Result<Eterm> {
+        let undefined = self.runtime.intern("undefined");
+        let (queue, state) = self.mailbox_parts()?;
+        Ok(state.reserve(queue, undefined))
+    }
+
+    /// `recv_marker_bind`: bind the opaque `marker` to the (internal) reference.
+    ///
+    /// A non-small marker (the empty-queue `undefined`) is a silent no-op.
+    fn receive_marker_bind(&mut self, marker: Eterm, reference: Eterm) -> Result<()> {
+        let (_queue, state) = self.mailbox_parts()?;
+        state.bind(marker, reference);
+        Ok(())
+    }
+
+    /// `recv_marker_use`: set the scan position to the position `reference`'s marker
+    /// recorded (a no-op for an unknown reference).
+    fn receive_marker_use(&mut self, reference: Eterm) -> Result<()> {
+        let (queue, state) = self.mailbox_parts()?;
+        state.use_reference(queue, reference);
+        Ok(())
+    }
+
+    /// `recv_marker_clear`: release `reference`'s marker (a no-op for an unknown one).
+    fn receive_marker_clear(&mut self, reference: Eterm) -> Result<()> {
+        let (_queue, state) = self.mailbox_parts()?;
+        state.clear(reference);
+        Ok(())
     }
 }
 

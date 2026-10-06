@@ -17,6 +17,9 @@
 //! * [`cli`] — the A.6 parser ([`cli::parse`]), the usage text and the [`cli::run`] driver.
 //! * [`boot`] — the preloaded-module registry skeleton (A.7), the atom seed and the version banner.
 //! * [`info`] — `system_info/1` (A.8) as a heap-free [`InfoValue`] plus its materialization.
+//! * `mailbox` — the per-process receive scan state (`MailboxState`: the mailbox cursor
+//!   plus the `recv_marker_*` table) that [`Runtime`] keys by pid and
+//!   [`RuntimeContext`] drives the receive seam through.
 //! * [`eval`] — the `-eval` Erlang expression parser and `erl_eval`-style evaluator.
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
@@ -43,6 +46,7 @@ pub mod error;
 pub mod eval;
 pub mod format;
 pub mod info;
+mod mailbox;
 mod native;
 pub mod port;
 pub mod runtime;
