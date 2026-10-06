@@ -10,7 +10,7 @@ pub use crate::compress::{compress, decompress};
 pub use crate::decode::{decode_term, Decoder};
 pub use crate::encode::{
     encode_term, encode_term_body, encode_term_body_compressed, encode_term_compressed,
-    encode_term_local, AtomEncoding, Encoder,
+    encode_term_local, encode_term_with_minor_version, AtomEncoding, Encoder, MinorVersion,
 };
 pub use crate::error::{
     is_unsupported, is_unsupported_local_fun, unsupported, unsupported_local_fun, LOCAL_FUN_REASON,

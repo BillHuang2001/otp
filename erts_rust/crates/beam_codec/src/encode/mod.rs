@@ -4,11 +4,13 @@
 //! [`VERSION_MAGIC`](crate::VERSION_MAGIC)) and distribution payload/ETS bodies
 //! (without it) — the constructor decides which. Term inspection goes through
 //! [`crate::term`]; this module owns only the *bytes*. The fun/export encoders
-//! live in the child [`fun`] module and the native-record encoder in the child
-//! [`record`] module, each as a second `impl` block on [`Encoder`].
+//! live in the child [`fun`] module, the native-record encoder in the child
+//! [`record`] module and the `FLOAT_EXT` (minor_version 0) text formatter in the
+//! child [`float`] module, each as a second `impl` block or helper on [`Encoder`].
 //!
-//! This module is safe Rust, like its children [`fun`] and [`record`].
+//! This module is safe Rust, like its children [`fun`], [`record`] and [`float`].
 
+mod float;
 mod fun;
 mod record;
 
@@ -20,7 +22,7 @@ use crate::atom_cache::AtomCacheWriter;
 use crate::error;
 use crate::tag::{
     ATOM_CACHE_REF_EXT, ATOM_EXT, ATOM_UTF8_EXT, BINARY_EXT, BIT_BINARY_EXT, COMPRESSED_EXT,
-    INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT,
+    FLOAT_EXT, INTEGER_EXT, LARGE_BIG_EXT, LARGE_TUPLE_EXT, LIST_EXT, LOCAL_EXT, MAP_EXT,
     NEWER_REFERENCE_EXT, NEW_FLOAT_EXT, NEW_PID_EXT, NIL_EXT, SMALL_ATOM_EXT,
     SMALL_ATOM_UTF8_EXT, SMALL_BIG_EXT, SMALL_INTEGER_EXT, SMALL_TUPLE_EXT, STRING_EXT, V4_PORT_EXT,
     Tag,
@@ -57,6 +59,54 @@ pub enum AtomEncoding {
     Latin1,
 }
 
+/// The `term_to_binary/2` `{minor_version, N}` wire flavour.
+///
+/// `parse_t2b_opts` (`external.c:1501-1516`) maps the option onto a set of encoder
+/// dflags; this enum names the three resulting flavours. It is **independent of**
+/// [`AtomEncoding`] and only meaningful for `term_to_binary`-shaped output
+/// ([`Encoder::new`]); the [`Encoder::new_body`] distribution/ETS form keeps its
+/// own [`AtomEncoding`] seam.
+///
+/// The **default** is [`MinorVersion::V2`], so an [`Encoder`] built with
+/// [`Encoder::new`]/[`encode_term`] produces exactly the bytes it always did
+/// (UTF-8 atoms + `NEW_FLOAT_EXT`).
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, Default)]
+pub enum MinorVersion {
+    /// `{minor_version, 0}` — the pre-OTP-17 / BER-era flavour: `DFLAG_UTF8_ATOMS`
+    /// **and** `DFLAG_NEW_FLOATS` clear, so Latin-1 atoms are `ATOM_EXT` (`100`)
+    /// and floats are the 31-byte text `FLOAT_EXT` (`99`).
+    V0,
+    /// `{minor_version, 1}` — the OTP-17-era default: `DFLAG_UTF8_ATOMS` clear but
+    /// `DFLAG_NEW_FLOATS` set, so atoms are `ATOM_EXT` (`100`) and floats are the
+    /// modern `NEW_FLOAT_EXT` (`70`).
+    V1,
+    /// `{minor_version, 2}` — the modern default, identical to
+    /// `TERM_TO_BINARY_DFLAGS` (`dist.h:138-139`): UTF-8 atoms +
+    /// `NEW_FLOAT_EXT`. This is [`Encoder::new`]'s behaviour.
+    #[default]
+    V2,
+}
+
+/// The resolved atom-tag family for a given `(minor_version, atom_encoding)` pair —
+/// the crate-internal projection of the C `enc_atom` decision
+/// (`external.c:2906-2950`). Distinct from the public [`AtomEncoding`] because the
+/// `term_to_binary` Latin-1 form (all `ATOM_EXT`, UTF-8 fallback for a non-Latin-1
+/// name) is *not* the distribution [`AtomEncoding::Latin1`] form.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum AtomFlavour {
+    /// `SMALL_ATOM_UTF8_EXT`(`119`)/`ATOM_UTF8_EXT`(`118`) — `DFLAG_UTF8_ATOMS` set.
+    Utf8,
+    /// `SMALL_ATOM_EXT`(`115`)/`ATOM_EXT`(`100`) for a Latin-1 name, `unsupported`
+    /// for a non-Latin-1 one — `DFLAG_UTF8_ATOMS` clear, `DFLAG_SMALL_ATOM_TAGS` set
+    /// (the distribution [`AtomEncoding::Latin1`] flavour, unchanged).
+    Latin1SmallTags,
+    /// `ATOM_EXT`(`100`) for **every** Latin-1 name regardless of length, falling
+    /// back to the UTF-8 tags for a non-Latin-1 name — `DFLAG_UTF8_ATOMS` and
+    /// `DFLAG_SMALL_ATOM_TAGS` both clear (the `{minor_version,0|1}` flavour;
+    /// `external.c:2924`/`:2937`).
+    Latin1WideOnly,
+}
+
 /// Incremental external term format encoder.
 ///
 /// Holds a borrowed atom table (the sole source of atom names) and an output
@@ -68,6 +118,10 @@ pub struct Encoder<'a> {
     buf: Writer,
     /// The selected atom tag family.
     atom_encoding: AtomEncoding,
+    /// The `term_to_binary/2` wire flavour. [`MinorVersion::V2`] (the default)
+    /// defers to `atom_encoding` and emits `NEW_FLOAT_EXT`; the older flavours
+    /// override both (see [`MinorVersion`] and [`Encoder::set_minor_version`]).
+    minor_version: MinorVersion,
     /// The outbound atom cache, when the caller installed one via
     /// [`Encoder::with_atom_cache`]. `None` writes every atom inline.
     atom_cache: Option<&'a mut dyn AtomCacheWriter>,
@@ -90,13 +144,57 @@ impl<'a> Encoder<'a> {
             atoms,
             buf: Writer::new(),
             atom_encoding: AtomEncoding::Utf8,
+            minor_version: MinorVersion::V2,
             atom_cache: None,
         }
     }
 
     /// Selects the atom tag family; defaults to [`AtomEncoding::Utf8`].
+    ///
+    /// Ignored when a [`MinorVersion`] other than [`MinorVersion::V2`] is selected:
+    /// the `{minor_version,0|1}` flavours pin the atom tags themselves (see
+    /// [`Encoder::set_minor_version`]).
     pub fn set_atom_encoding(&mut self, encoding: AtomEncoding) {
         self.atom_encoding = encoding;
+    }
+
+    /// Selects the `term_to_binary/2` [`MinorVersion`] wire flavour.
+    ///
+    /// The default is [`MinorVersion::V2`], which reproduces today's bytes exactly
+    /// (`atom_encoding` respected, `NEW_FLOAT_EXT` floats). The older flavours
+    /// override the atom flavour and, for [`MinorVersion::V0`], the float form:
+    ///
+    /// | flavour | atoms | floats |
+    /// |---|---|---|
+    /// | [`MinorVersion::V0`] | `ATOM_EXT` (`100`) for Latin-1 names, UTF-8 tags otherwise | `FLOAT_EXT` (`99`, 31-byte text) |
+    /// | [`MinorVersion::V1`] | `ATOM_EXT` (`100`) for Latin-1 names, UTF-8 tags otherwise | `NEW_FLOAT_EXT` (`70`) |
+    /// | [`MinorVersion::V2`] | [`AtomEncoding`] (UTF-8 by default) | `NEW_FLOAT_EXT` (`70`) |
+    pub fn set_minor_version(&mut self, minor_version: MinorVersion) {
+        self.minor_version = minor_version;
+    }
+
+    /// Builder form of [`Encoder::set_minor_version`].
+    pub fn with_minor_version(mut self, minor_version: MinorVersion) -> Encoder<'a> {
+        self.minor_version = minor_version;
+        self
+    }
+
+    /// The atom-tag family in effect: [`AtomEncoding`] under [`MinorVersion::V2`],
+    /// the pinned `term_to_binary` Latin-1 form under `V0`/`V1`.
+    fn atom_flavour(&self) -> AtomFlavour {
+        match self.minor_version {
+            MinorVersion::V0 | MinorVersion::V1 => AtomFlavour::Latin1WideOnly,
+            MinorVersion::V2 => match self.atom_encoding {
+                AtomEncoding::Utf8 => AtomFlavour::Utf8,
+                AtomEncoding::Latin1 => AtomFlavour::Latin1SmallTags,
+            },
+        }
+    }
+
+    /// Whether floats are written as `NEW_FLOAT_EXT` (`70`); clear only under
+    /// [`MinorVersion::V0`] (`DFLAG_NEW_FLOATS`).
+    fn uses_new_floats(&self) -> bool {
+        !matches!(self.minor_version, MinorVersion::V0)
     }
 
     /// Installs an outbound atom cache ([`AtomCacheWriter`]).
@@ -155,9 +253,7 @@ impl<'a> Encoder<'a> {
             return self.encode_bignum(negative, digits);
         }
         if let Ok(value) = float_value(term) {
-            self.buf.u8(NEW_FLOAT_EXT);
-            self.buf.u64be(value.to_bits());
-            return Ok(());
+            return self.encode_float(value);
         }
         if let Ok(arity) = tuple_arity(term) {
             return self.encode_tuple(term, arity);
@@ -237,8 +333,26 @@ impl<'a> Encoder<'a> {
         Ok(())
     }
 
-    /// Encodes an atom in the selected [`AtomEncoding`], or as `ATOM_CACHE_REF`
-    /// (`82`) when an outbound atom cache ([`Encoder::with_atom_cache`]) knows it.
+    /// Encodes a float in the flavour's form: `NEW_FLOAT_EXT` (`70`) + 8 IEEE-754
+    /// bytes (the modern form, `DFLAG_NEW_FLOATS`), or — under
+    /// [`MinorVersion::V0`] — the legacy text `FLOAT_EXT` (`99`) with its fixed
+    /// 31-byte payload (`external.c:3825-3849`; see [`crate::encode`]'s child
+    /// [`float`] module).
+    fn encode_float(&mut self, value: f64) -> Result<()> {
+        if self.uses_new_floats() {
+            self.buf.u8(NEW_FLOAT_EXT);
+            self.buf.u64be(value.to_bits());
+        } else {
+            self.buf.u8(FLOAT_EXT);
+            self.buf.bytes(&float::format_float_ext(value)?);
+        }
+        Ok(())
+    }
+
+    /// Encodes an atom in the selected [`AtomEncoding`] (or the pinned
+    /// `{minor_version,0|1}` Latin-1 form, see [`Encoder::set_minor_version`]), or
+    /// as `ATOM_CACHE_REF` (`82`) when an outbound atom cache
+    /// ([`Encoder::with_atom_cache`]) knows it.
     fn encode_atom(&mut self, term: Eterm) -> Result<()> {
         // The cached path comes first (C `enc_atom`, `external.c:2877`): an atom the
         // outbound cache knows is written as `[82, index]` and needs no name at all —
@@ -261,43 +375,67 @@ impl<'a> Encoder<'a> {
         if name.chars().count() > ATOM_CHAR_MAX {
             return Err(error::system_limit());
         }
-        match self.atom_encoding {
-            AtomEncoding::Utf8 => {
-                let bytes = name.as_bytes();
-                if bytes.len() <= 255 {
-                    self.buf.u8(SMALL_ATOM_UTF8_EXT);
-                    self.buf.u8(bytes.len() as u8);
-                } else {
-                    // At most 255 characters × 4 UTF-8 bytes ≤ 1020, so the 16-bit
-                    // length always fits.
-                    self.buf.u8(ATOM_UTF8_EXT);
-                    self.buf.u16be(bytes.len() as u16);
-                }
-                self.buf.bytes(bytes);
-            }
-            AtomEncoding::Latin1 => {
-                // Latin-1 is one byte per code point and only covers `U+0000..=U+00FF`;
-                // a wider character cannot be represented, so it is reported as
-                // unsupported rather than mis-encoded.
-                let mut bytes = Vec::with_capacity(name.len());
-                for ch in name.chars() {
-                    let code = ch as u32;
-                    if code > 0xFF {
-                        return Err(error::unsupported(Tag::SmallAtom));
-                    }
-                    bytes.push(code as u8);
-                }
-                if bytes.len() <= 255 {
-                    self.buf.u8(SMALL_ATOM_EXT);
-                    self.buf.u8(bytes.len() as u8);
-                } else {
-                    self.buf.u8(ATOM_EXT);
-                    self.buf.u16be(bytes.len() as u16);
-                }
-                self.buf.bytes(&bytes);
-            }
+        match self.atom_flavour() {
+            AtomFlavour::Utf8 => self.write_atom_utf8(name),
+            AtomFlavour::Latin1SmallTags => self.write_atom_latin1_small_tags(name)?,
+            AtomFlavour::Latin1WideOnly => self.write_atom_latin1_wide_only(name),
         }
         Ok(())
+    }
+
+    /// Writes `name` as `SMALL_ATOM_UTF8_EXT`(`119`)/`ATOM_UTF8_EXT`(`118`) — the
+    /// `DFLAG_UTF8_ATOMS` branch of `enc_atom` (`external.c:2910-2922`).
+    fn write_atom_utf8(&mut self, name: &str) {
+        let bytes = name.as_bytes();
+        if bytes.len() <= 255 {
+            self.buf.u8(SMALL_ATOM_UTF8_EXT);
+            self.buf.u8(bytes.len() as u8);
+        } else {
+            // At most 255 characters × 4 UTF-8 bytes ≤ 1020, so the 16-bit
+            // length always fits.
+            self.buf.u8(ATOM_UTF8_EXT);
+            self.buf.u16be(bytes.len() as u16);
+        }
+        self.buf.bytes(bytes);
+    }
+
+    /// Writes `name` as `SMALL_ATOM_EXT`(`115`)/`ATOM_EXT`(`100`) Latin-1 bytes — the
+    /// `DFLAG_SMALL_ATOM_TAGS` distribution branch of `enc_atom`
+    /// (`external.c:2923-2935`), i.e. the public [`AtomEncoding::Latin1`] flavour.
+    ///
+    /// A name outside `U+0000..=U+00FF` has no Latin-1 image and is reported as
+    /// [`error::unsupported`] — this flavour is deliberately narrower than the C
+    /// (which would fall back to the UTF-8 tags); its consumers (`beam_dist`) rely
+    /// on that, so it is **unchanged**.
+    fn write_atom_latin1_small_tags(&mut self, name: &str) -> Result<()> {
+        let bytes = latin1_bytes(name).ok_or_else(|| error::unsupported(Tag::SmallAtom))?;
+        if bytes.len() <= 255 {
+            self.buf.u8(SMALL_ATOM_EXT);
+            self.buf.u8(bytes.len() as u8);
+        } else {
+            self.buf.u8(ATOM_EXT);
+            self.buf.u16be(bytes.len() as u16);
+        }
+        self.buf.bytes(&bytes);
+        Ok(())
+    }
+
+    /// Writes `name` in the `{minor_version,0|1}` Latin-1 form: `ATOM_EXT` (`100`)
+    /// for **every** Latin-1-representable name regardless of length (because
+    /// `DFLAG_SMALL_ATOM_TAGS` is clear, `external.c:2924`/`:2937`), falling back to
+    /// the UTF-8 tags (`SMALL_ATOM_UTF8_EXT`/`ATOM_UTF8_EXT`) when the name is not
+    /// Latin-1 (`external.c:2910`: `utf8_atoms || a->latin1_chars < 0`).
+    fn write_atom_latin1_wide_only(&mut self, name: &str) {
+        match latin1_bytes(name) {
+            Some(bytes) => {
+                self.buf.u8(ATOM_EXT);
+                // The name is ≤ 255 chars and Latin-1 is one byte per char, so the
+                // 16-bit length always fits.
+                self.buf.u16be(bytes.len() as u16);
+                self.buf.bytes(&bytes);
+            }
+            None => self.write_atom_utf8(name),
+        }
     }
 
     /// Encodes a cons list: a proper list of bytes (length ≤ 65535) becomes
@@ -609,6 +747,23 @@ fn strip_high_zero_bytes(digits: &[u8]) -> &[u8] {
     &digits[..end]
 }
 
+/// The Latin-1 (one byte per code point) image of `name`, or `None` when any code
+/// point is outside `U+0000..=U+00FF`.
+///
+/// Mirrors the C's precomputed `a->latin1_chars < 0` test (`external.c:2910`): a
+/// name is "Latin-1-representable" iff every character fits one ISO-8859-1 byte.
+fn latin1_bytes(name: &str) -> Option<Vec<u8>> {
+    let mut bytes = Vec::with_capacity(name.len());
+    for ch in name.chars() {
+        let code = ch as u32;
+        if code > 0xFF {
+            return None;
+        }
+        bytes.push(code as u8);
+    }
+    Some(bytes)
+}
+
 /// zlib-compresses `body`, returning the stream **only when the 5-byte
 /// `COMPRESSED` wrapper still shrinks the image** — the destination-capacity rule
 /// the C applies (`external.c:2276-2298`).
@@ -694,6 +849,24 @@ pub fn encode_term(term: Eterm, atoms: &AtomTable) -> Result<Vec<u8>> {
 /// [`Encoder::finish`].
 pub fn encode_term_body(term: Eterm, atoms: &AtomTable) -> Result<Vec<u8>> {
     let mut encoder = Encoder::new_body(atoms);
+    encoder.encode(term)?;
+    Ok(encoder.finish())
+}
+
+/// Encodes `term` as a `term_to_binary/2` image under the `{minor_version, N}`
+/// flavour `minor`: version byte plus term.
+///
+/// Convenience over [`Encoder::new`] + [`Encoder::set_minor_version`] +
+/// [`Encoder::encode`] + [`Encoder::finish`]. With [`MinorVersion::V2`] this is
+/// byte-identical to [`encode_term`]; [`MinorVersion::V1`] emits Latin-1
+/// `ATOM_EXT` (`100`) atoms, and [`MinorVersion::V0`] additionally emits the legacy
+/// 31-byte `FLOAT_EXT` (`99`) floats (see [`MinorVersion`]).
+pub fn encode_term_with_minor_version(
+    term: Eterm,
+    atoms: &AtomTable,
+    minor: MinorVersion,
+) -> Result<Vec<u8>> {
+    let mut encoder = Encoder::new(atoms).with_minor_version(minor);
     encoder.encode(term)?;
     Ok(encoder.finish())
 }
@@ -900,6 +1073,48 @@ mod tests {
         encoder.set_atom_encoding(AtomEncoding::Latin1);
         encoder.encode(make_atom(a)).unwrap();
         assert_eq!(encoder.finish(), vec![131, 115, 2, 111, 107]);
+    }
+
+    #[test]
+    fn minor_version_selects_the_atom_and_float_flavours() {
+        let mut atoms = AtomTable::new();
+        let ok = atoms.intern("ok");
+        let mut heap = new_heap(64);
+        let float = make_float(&mut heap, 3.14).unwrap();
+
+        // The default (V2) is unchanged: `SMALL_ATOM_UTF8_EXT` + `NEW_FLOAT_EXT`.
+        assert_eq!(
+            encode_term(make_atom(ok), &atoms).unwrap(),
+            vec![131, 119, 2, 111, 107]
+        );
+        assert_eq!(encode_term(float, &atoms).unwrap()[1], NEW_FLOAT_EXT);
+
+        // V1 pins `ATOM_EXT` but keeps `NEW_FLOAT_EXT`.
+        let mut encoder = Encoder::new(&atoms);
+        encoder.set_minor_version(MinorVersion::V1);
+        encoder.encode(make_atom(ok)).unwrap();
+        assert_eq!(encoder.finish(), vec![131, 100, 0, 2, 111, 107]);
+        let mut encoder = Encoder::new(&atoms).with_minor_version(MinorVersion::V1);
+        encoder.encode(float).unwrap();
+        assert_eq!(encoder.finish()[1], NEW_FLOAT_EXT);
+
+        // V0 additionally uses the 31-byte `FLOAT_EXT` text form.
+        let mut encoder = Encoder::new(&atoms).with_minor_version(MinorVersion::V0);
+        encoder.encode(float).unwrap();
+        let bytes = encoder.finish();
+        assert_eq!(bytes[1], FLOAT_EXT);
+        assert_eq!(bytes.len(), 2 + float::FLOAT_EXT_LEN);
+        assert_eq!(&bytes[2..], b"3.14000000000000012434e+00\0\0\0\0\0");
+
+        // The convenience entry point agrees with the builder.
+        assert_eq!(
+            encode_term_with_minor_version(make_atom(ok), &atoms, MinorVersion::V0).unwrap(),
+            vec![131, 100, 0, 2, 111, 107]
+        );
+        assert_eq!(
+            encode_term_with_minor_version(make_atom(ok), &atoms, MinorVersion::V2).unwrap(),
+            vec![131, 119, 2, 111, 107]
+        );
     }
 
     #[test]
