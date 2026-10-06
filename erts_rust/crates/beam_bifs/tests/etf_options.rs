@@ -17,9 +17,10 @@
 //! * `parse_t2b_opts`'s rejections (a non-list, an unknown option, an
 //!   out-of-range value);
 //! * `{minor_version, N}`: `2` is the default tag set (`NEW_FLOAT_EXT` +
-//!   UTF-8 atoms), `0`/`1` clear `DFLAG_UTF8_ATOMS` (and `0` also clears
-//!   `DFLAG_NEW_FLOATS`) — which the codec reproduces byte-for-byte for an
-//!   atom-/float-free term and *refuses* (typed `unsupported_bif`) otherwise;
+//!   UTF-8 atoms), `0`/`1` clear `DFLAG_UTF8_ATOMS` (Latin-1 `ATOM_EXT`, `100`)
+//!   and `0` also clears `DFLAG_NEW_FLOATS` (legacy 31-byte `FLOAT_EXT`, `99`)
+//!   — with a UTF-8-tag fallback for a name that is not Latin-1-representable
+//!   (`external.c:2906-2932`), and combined with `compressed`;
 //! * `binary_to_term/2`'s `used` count (which includes the `131` version byte)
 //!   and `safe` (which refuses an image that would create an atom).
 
@@ -29,7 +30,7 @@ use std::rc::Rc;
 use beam_alloc::Heap;
 use beam_bifs::{default_registry, AtomInterner, BifContext};
 use beam_codec::term as codec_term;
-use beam_common::{BeamError, ExitReason, Result};
+use beam_common::{BeamError, Result};
 use beam_process::ProcessId;
 use beam_term::{compare::eq, signed_value, Atom, AtomTable, Eterm, NIL};
 
@@ -115,19 +116,6 @@ fn assert_badarg(result: Result<Eterm>) {
         matches!(result, Err(BeamError::BadArg)),
         "expected badarg, got {result:?}"
     );
-}
-
-/// Asserts `result` is the `error:unsupported_bif` raise `{minor_version, 0|1}`
-/// reports for a term whose Latin-1/legacy-float image the codec cannot write.
-fn assert_unsupported_bif(result: Result<Eterm>) {
-    match result {
-        Err(BeamError::Raise(raise)) => assert_eq!(
-            raise.reason,
-            ExitReason::atom("unsupported_bif"),
-            "the capability-gap reason atom"
-        ),
-        other => panic!("expected unsupported_bif, got {other:?}"),
-    }
 }
 
 #[test]
@@ -231,15 +219,33 @@ fn term_to_binary_large_compressed_emits_compressed_ext() {
         "binary_to_term(term_to_binary(Big,[compressed])) must equal Big"
     );
 
-    // `{compressed, 9}` wraps the large body as well —
-    // erl ... 'C9 = term_to_binary(Big,[{compressed,9}]),
-    //          {binary:at(C9,0),binary:at(C9,1)}'  % {131,80}
-    let level9 = option_tuple(&mut ctx, "compressed", 9);
-    let image9 = bytes_of(
-        reg.call("erlang", "term_to_binary", 2, &mut ctx, &[big, level9])
-            .expect("a {compressed, 9} image"),
-    );
-    assert_eq!(&image9[..2], &[VERSION_MAGIC, COMPRESSED_EXT]);
+    // Every accepted level wraps the large body (no level is refused, and none
+    // reports a capability gap) — erl ... 'T = lists:duplicate(500,hello),
+    //   [io:format("L=~p head=~p~n",[L,binary:part(term_to_binary(T,[{compressed,L}]),0,2)])
+    //   || L <- lists:seq(1,9)], halt().'  % every L ⇒ head = {131,80}
+    for level in 1..=9i64 {
+        let options = option_tuple(&mut ctx, "compressed", level);
+        let image = bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[big, options])
+                .expect("a {compressed, Level} image"),
+        );
+        assert_eq!(
+            &image[..2],
+            &[VERSION_MAGIC, COMPRESSED_EXT],
+            "{{compressed, {level}}} must wrap the large body"
+        );
+        assert_eq!(
+            u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize,
+            plain.len() - 1,
+            "the size field is the body length (level {level})"
+        );
+        // The image round-trips to the very same term.
+        let blob = codec_term::make_binary(ctx.heap(), &image).expect("fits");
+        let back = reg
+            .call("erlang", "binary_to_term", 1, &mut ctx, &[blob])
+            .expect("binary_to_term of the COMPRESSED image");
+        assert!(eq(big, back, &atoms), "round-trip at level {level}");
+    }
 
     // `{compressed, 0}` stores without compressing, so the wrapper does not pay
     // off (`deflated.len() > body.len() - 5`): the image reverts to plain —
@@ -367,27 +373,210 @@ fn term_to_binary_minor_version_0_and_1_clear_the_utf8_atom_flag() {
         );
     }
 
-    // A term whose image would carry an atom is refused with a typed
-    // `unsupported_bif`: minor versions 0/1 clear `DFLAG_UTF8_ATOMS`, so the oracle
-    // writes the Latin-1 `ATOM_EXT` (100) which `beam_codec` cannot yet emit —
-    // erl ... 'term_to_binary(hello,[{minor_version,0}])'  % <<131,100,0,5,"hello">>
-    //          'term_to_binary([hello],[{minor_version,1}])'
-    //            % <<131,108,0,0,0,1,100,0,5,"hello",106>>
+    // Minor versions 0/1 clear `DFLAG_UTF8_ATOMS`, so the oracle writes the Latin-1
+    // `ATOM_EXT` (100) — erl ... 'term_to_binary(hello,[{minor_version,0}])'
+    //   % <<131,100,0,5,"hello">>
+    //   'term_to_binary([hello],[{minor_version,1}])'
+    //   % <<131,108,0,0,0,1,100,0,5,"hello",106>>
     let hello = ctx.atom("hello").expect("seeded");
+    let latin1_hello = vec![VERSION_MAGIC, 100, 0, 5, 104, 101, 108, 108, 111];
     for version in [0i64, 1] {
         let options = option_tuple(&mut ctx, "minor_version", version);
-        assert_unsupported_bif(reg.call("erlang", "term_to_binary", 2, &mut ctx, &[hello, options]));
+        assert_eq!(
+            bytes_of(
+                reg.call("erlang", "term_to_binary", 2, &mut ctx, &[hello, options])
+                    .expect("an atom-bearing term encodes for mv 0/1")
+            ),
+            latin1_hello,
+            "minor_version {version} on the atom `hello`"
+        );
     }
 
-    // ...including an atom nested inside a container.
+    // ...including an atom nested inside a container — the oracle's
+    // `term_to_binary([hello],[{minor_version,1}])`.
     let nested = ctx.list(&[hello]).expect("fits");
+    let latin1_nested = vec![
+        VERSION_MAGIC, 108, 0, 0, 0, 1, 100, 0, 5, 104, 101, 108, 108, 111, 106,
+    ];
     for version in [0i64, 1] {
         let options = option_tuple(&mut ctx, "minor_version", version);
-        assert_unsupported_bif(reg.call("erlang", "term_to_binary", 2, &mut ctx, &[nested, options]));
+        assert_eq!(
+            bytes_of(
+                reg.call("erlang", "term_to_binary", 2, &mut ctx, &[nested, options])
+                    .expect("a nested atom encodes for mv 0/1")
+            ),
+            latin1_nested,
+            "minor_version {version} on `[hello]`"
+        );
     }
 }
 
-/// An [`AtomInterner`](beam_bifs::AtomInterner) over a **clone** of the table the
+/// A **wide** (non-Latin-1) atom has no `ATOM_EXT` image, so the C `enc_atom` falls
+/// back to the UTF-8 tag family under `{minor_version, 0|1}` too
+/// (`external.c:2906-2932`) — an atom-bearing term is never refused.
+#[test]
+fn term_to_binary_minor_version_0_falls_back_to_utf8_for_a_wide_atom() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let mut atoms = seeded_atoms();
+    atoms.seed(["\u{03bb}"]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // erl -noshell -eval 'io:format("~w~n",[term_to_binary(list_to_atom([955]),
+    //   [{minor_version,0}])]),halt().'  % <<131,119,2,206,187>>
+    let wide = ctx.atom("\u{03bb}").expect("seeded");
+    for version in [0i64, 1, 2] {
+        let options = option_tuple(&mut ctx, "minor_version", version);
+        assert_eq!(
+            bytes_of(
+                reg.call("erlang", "term_to_binary", 2, &mut ctx, &[wide, options])
+                    .expect("a wide atom encodes for every minor version")
+            ),
+            vec![VERSION_MAGIC, 119, 2, 206, 187],
+            "minor_version {version} on the atom `λ`"
+        );
+    }
+}
+
+/// The `{minor_version, 0}` flavour clears `DFLAG_NEW_FLOATS` as well, so a float goes
+/// on the wire as the legacy 31-byte `FLOAT_EXT` (99) — the OTP-17-era form.
+#[test]
+fn term_to_binary_minor_version_0_writes_the_legacy_float_ext() {
+    let reg = default_registry();
+    let mut heap = Heap::new(4096).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let float = ctx.make_float(1.5).expect("fits");
+    // erl -noshell -eval 'io:format("~w~n",[term_to_binary(1.5,[{minor_version,0}])]),halt().'
+    //   % <<131,99,"1.50000000000000000000e+00",0,0,0,0,0>>
+    let mut expected = vec![VERSION_MAGIC, 99];
+    expected.extend_from_slice(b"1.50000000000000000000e+00");
+    expected.extend_from_slice(&[0u8; 5]);
+    let mv0 = option_tuple(&mut ctx, "minor_version", 0);
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[float, mv0])
+                .expect("term_to_binary(1.5,[{minor_version,0}])")
+        ),
+        expected
+    );
+
+    // A nested float takes the legacy form too —
+    // erl ... 'term_to_binary([1.5],[{minor_version,0}])'
+    //   % <<131,108,0,0,0,1,99,"1.50000000000000000000e+00",0,0,0,0,0,106>>
+    let list = ctx.list(&[float]).expect("fits");
+    let mut expected = vec![VERSION_MAGIC, 108, 0, 0, 0, 1, 99];
+    expected.extend_from_slice(b"1.50000000000000000000e+00");
+    expected.extend_from_slice(&[0u8; 5]);
+    expected.push(106);
+    let mv0 = option_tuple(&mut ctx, "minor_version", 0);
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[list, mv0])
+                .expect("term_to_binary([1.5],[{minor_version,0}])")
+        ),
+        expected
+    );
+
+    // The same float under minor version 1 keeps `NEW_FLOAT_EXT` —
+    // erl ... 'term_to_binary(1.5,[{minor_version,1}])'  % <<131,70,63,248,0,0,0,0,0,0>>
+    let mv1 = option_tuple(&mut ctx, "minor_version", 1);
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[float, mv1])
+                .expect("term_to_binary(1.5,[{minor_version,1}])")
+        ),
+        vec![VERSION_MAGIC, 70, 63, 248, 0, 0, 0, 0, 0, 0]
+    );
+
+    // `{minor_version, 2}` (the default) is the modern form too —
+    // erl ... 'term_to_binary(1.5,[{minor_version,2}]) =:= term_to_binary(1.5)' % true
+    let mv2 = option_tuple(&mut ctx, "minor_version", 2);
+    let default_image = bytes_of(
+        reg.call("erlang", "term_to_binary", 1, &mut ctx, &[float])
+            .expect("term_to_binary(1.5)"),
+    );
+    assert_eq!(
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[float, mv2])
+                .expect("term_to_binary(1.5,[{minor_version,2}])")
+        ),
+        default_image
+    );
+}
+
+/// A `{minor_version, N}` flavour combines with `compressed`: the *selected* flavour's
+/// body is what zlib deflates, so the 4-byte size field is that body's length.
+#[test]
+fn term_to_binary_minor_version_combines_with_compressed() {
+    let reg = default_registry();
+    let mut heap = Heap::new(1 << 20).expect("test heap");
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // A large, highly repetitive atom-bearing term — `lists:duplicate(500, hello)`.
+    let hello = ctx.atom("hello").expect("seeded");
+    let mut big = NIL;
+    for _ in 0..500 {
+        big = ctx.cons(hello, big).expect("fits");
+    }
+
+    // The plain body is 1 byte longer per atom under the Latin-1 flavour:
+    // erl -noshell -eval 'T = lists:duplicate(500,hello),
+    //   [io:format("mv~p plain=~p size_field=~p~n",[V, byte_size(term_to_binary(T,[{minor_version,V}])),
+    //   binary:decode_unsigned(binary:part(term_to_binary(T,[{minor_version,V},compressed]),2,4))])
+    //   || V <- [0,1,2]], halt().'
+    //   % mv0 plain=4007 size_field=4006 / mv1 plain=4007 size_field=4006
+    //   % mv2 plain=3507 size_field=3506
+    let flattened = |ctx: &mut BifContext<'_>, version: i64| -> Vec<u8> {
+        let options = option_tuple(ctx, "minor_version", version);
+        bytes_of(
+            reg.call("erlang", "term_to_binary", 2, ctx, &[big, options])
+                .expect("the plain flavour image"),
+        )
+    };
+    assert_eq!(flattened(&mut ctx, 0).len(), 4007, "mv0 plain image");
+    assert_eq!(flattened(&mut ctx, 1).len(), 4007, "mv1 plain image");
+    assert_eq!(flattened(&mut ctx, 2).len(), 3507, "mv2 plain image");
+
+    for version in [0i64, 1] {
+        // `[{minor_version, N}, compressed]` — both options in one flat list.
+        let pair = ctx
+            .tuple(&[
+                ctx.atom("minor_version").expect("seeded"),
+                ctx.int(version).expect("a small int fits"),
+            ])
+            .expect("fits");
+        let options = ctx
+            .list(&[pair, ctx.atom("compressed").expect("seeded")])
+            .expect("fits");
+        let image = bytes_of(
+            reg.call("erlang", "term_to_binary", 2, &mut ctx, &[big, options])
+                .expect("minor version + compressed"),
+        );
+        assert_eq!(image[0], VERSION_MAGIC, "VERSION_MAGIC (mv {version})");
+        assert_eq!(image[1], COMPRESSED_EXT, "COMPRESSED_EXT (mv {version})");
+        assert_eq!(
+            u32::from_be_bytes([image[2], image[3], image[4], image[5]]) as usize,
+            4006,
+            "the size field is the Latin-1 body length (mv {version})"
+        );
+
+        // The Latin-1 flavour is what was deflated: the honest premise is the plain
+        // image's `ATOM_EXT` (100) — `[131][108][count:4][100][len]["hello"]…`.
+        let plain = flattened(&mut ctx, version);
+        assert_eq!(plain[1], 108, "LIST_EXT");
+        assert_eq!(plain[6], 100, "ATOM_EXT (100) under minor version {version}");
+
+        // The image round-trips to the very same term.
+        let blob = codec_term::make_binary(ctx.heap(), &image).expect("fits");
+        let back = reg
+            .call("erlang", "binary_to_term", 1, &mut ctx, &[blob])
+            .expect("binary_to_term of a minor-version COMPRESSED image");
+        assert!(eq(big, back, &atoms), "the image round-trips (mv {version})");
+    }
+}/// An [`AtomInterner`](beam_bifs::AtomInterner) over a **clone** of the table the
 /// context borrows.
 ///
 /// This reproduces the index coupling `binary_to_term` relies on: the clone has
