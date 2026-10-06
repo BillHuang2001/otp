@@ -296,6 +296,16 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - **`Eterm` = `#[repr(transparent)]` newtype over `usize`**, not a raw `usize` alias: gives type
   safety, methods, and a documented ABI contract while remaining layout/pass-identical to
   `ERL_NIF_TERM` (Level-1 drop-in requires this — Part I §A.3).
+- **Fun descriptors inline the C `entry` pointer (an M1 substitution).** C decodes `EXPORT_EXT` to an
+  *external* fun (entry = the canonical `Export`) and `NEW_FUN_EXT` to a *local* fun (entry = an
+  out-of-line `ErlFunEntry`). This tree has no fun/export table, so the entry fields live *inside* the
+  term: `Local` = `[uniq:u64][index:u32]` (byte-identical to `beam_engine::terms::make_fun`),
+  `External` = `[module:Atom][function:Atom]`, `Imported` = the 10-word `ErlFunEntry` fields + the
+  creator-pid field set. Header bit 24 (`is_external`) is the C kind bit; bit 25
+  (`FUN_HEADER_IMPORTED_OFFS`, ours, valid only while bit 24 is clear) discriminates the two local
+  kinds, so a C reader's `is_external_fun` still sees a local fun. Carrying every wire field keeps
+  decode→encode byte-exact and lets `beam_engine`/`beam_rt` call the fun later (External ⇒
+  module+function+arity; Imported ⇒ module+index).
 - **Checked + unchecked constructors.** `make_small`/`make_arityval` are unchecked (they are the
   engine hot path, mirroring C), but `try_*` variants return `TermResult` for use at trusted
   boundaries (arithmetic BIFs, loader, `beam_alloc`) so range violations become errors, not silent
