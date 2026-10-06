@@ -136,8 +136,12 @@ pub(super) fn goto_label(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> 
 /// A register or a negative/oversized value cannot size a segment; the C
 /// `BS_GET_FIELD_SIZE` macro fails the match there, and this engine reports the
 /// same case as a typed [`crate::error::unsupported`] rather than guessing.
-pub(super) fn read_size(machine: &Machine, operand: &Operand) -> Result<usize> {
-    let value = read_operand(machine, operand)?;
+pub(super) fn read_size(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+) -> Result<usize> {
+    let value = read_operand(machine, ctx, operand)?;
     if beam_term::is_small(value) {
         let n = beam_term::signed_value(value);
         if n >= 0 {

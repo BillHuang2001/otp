@@ -62,7 +62,7 @@ pub(super) fn exec(
             live: _,
             dst,
         } => {
-            let subject = read_operand(machine, bin)?;
+            let subject = read_operand(machine, ctx, bin)?;
             match enter_match(ctx, subject)? {
                 Some(context) => {
                     write_operand(machine, dst, context)?;
@@ -79,7 +79,7 @@ pub(super) fn exec(
             dst,
         } => {
             let (fail_label, resume) = resolve_match4_fail(module, fail)?;
-            let subject = read_operand(machine, src)?;
+            let subject = read_operand(machine, ctx, src)?;
             if resume {
                 // `bs_start_match4 resume Ctx Dst` reduces to `move Ctx Dst`
                 // (`emu/ops.tab:1251-1252`): the source is already a match context,
@@ -104,15 +104,15 @@ pub(super) fn exec(
             dst,
             live: _,
         } => {
-            let (_, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_position")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_position")?;
             let snapshot = raw::make_ctx(ctx, orig, start, end)?;
             write_operand(machine, dst, snapshot)?;
             Ok(Some(Step::Next))
         }
 
         Instr::BsSetPosition { ctx: ctx_op, pos } => {
-            let (term, _, _, _) = read_ctx(machine, ctx_op, "bs_set_position")?;
-            let value = read_operand(machine, pos)?;
+            let (term, _, _, _) = read_ctx(machine, ctx, ctx_op, "bs_set_position")?;
+            let value = read_operand(machine, ctx, pos)?;
             let new_start = position_of(value)?;
             raw::set_ctx_start(term, new_start);
             Ok(Some(Step::Next))
@@ -125,7 +125,7 @@ pub(super) fn exec(
         } => {
             // `i_bs_get_tail` builds the remaining bits from `start` to `end` and
             // deliberately leaves the position unchanged.
-            let (_, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_tail")?;
+            let (_, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_tail")?;
             let nbits = end.saturating_sub(start);
             let bytes = raw::subject_bytes(orig)?;
             let out = extract_bits(bytes, start, nbits)?;
@@ -139,7 +139,7 @@ pub(super) fn exec(
             ctx: ctx_op,
             bits,
         } => {
-            let (term, _, start, end) = read_ctx(machine, ctx_op, "bs_test_tail2")?;
+            let (term, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_test_tail2")?;
             if end.saturating_sub(start) == *bits as usize {
                 Ok(Some(Step::Next))
             } else {
@@ -156,8 +156,8 @@ pub(super) fn exec(
             flags,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_integer2")?;
-            let size = read_size(machine, size)?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_integer2")?;
+            let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, term, ctx);
             };
@@ -179,12 +179,12 @@ pub(super) fn exec(
             flags: _,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_binary2")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_binary2")?;
             let remaining = end.saturating_sub(start);
             let nbits = if is_all(module, size) {
                 remaining
             } else {
-                let size = read_size(machine, size)?;
+                let size = read_size(machine, ctx, size)?;
                 match size.checked_mul(*unit as usize) {
                     Some(nbits) => nbits,
                     None => return fail_step(machine, module, labels, *fail, term, ctx),
@@ -208,8 +208,8 @@ pub(super) fn exec(
             unit,
             flags: _,
         } => {
-            let (term, _, start, end) = read_ctx(machine, ctx_op, "bs_skip_bits2")?;
-            let size = read_size(machine, size)?;
+            let (term, _, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_bits2")?;
+            let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, term, ctx);
             };
@@ -240,7 +240,7 @@ pub(super) fn exec(
             bits,
             offset,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_match_string")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_match_string")?;
             let size = *bits as usize;
             if end.saturating_sub(start) < size {
                 return fail_step(machine, module, labels, *fail, term, ctx);
@@ -270,8 +270,8 @@ pub(super) fn exec(
             flags,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_float2")?;
-            let size = read_size(machine, size)?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_float2")?;
+            let size = read_size(machine, ctx, size)?;
             let Some(nbits) = size.checked_mul(*unit as usize) else {
                 return fail_step(machine, module, labels, *fail, term, ctx);
             };
@@ -293,7 +293,7 @@ pub(super) fn exec(
             flags: _,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf8")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf8")?;
             let bytes = raw::subject_bytes(orig)?;
             match decode_utf8(bytes, start, end) {
                 Some((value, len)) => {
@@ -313,7 +313,7 @@ pub(super) fn exec(
             flags,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf16")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf16")?;
             let bytes = raw::subject_bytes(orig)?;
             match decode_utf16(bytes, start, end, *flags) {
                 Some((value, len)) => {
@@ -336,7 +336,7 @@ pub(super) fn exec(
             flags: _,
             dst,
         } => {
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_get_utf32")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_get_utf32")?;
             let bytes = raw::subject_bytes(orig)?;
             match decode_utf32(bytes, start, end) {
                 Some((value, len)) => {
@@ -363,7 +363,7 @@ pub(super) fn exec(
             flags,
         } => {
             let flags = *flags;
-            let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_skip_utf16")?;
+            let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_utf16")?;
             let bytes = raw::subject_bytes(orig)?;
             match decode_utf16(bytes, start, end, flags) {
                 Some((_, len)) => {
@@ -395,7 +395,7 @@ fn skip_utf(
     fail: Label,
     decode: fn(&[u8], usize, usize) -> Option<(u32, usize)>,
 ) -> Result<Option<Step>> {
-    let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_skip_utf")?;
+    let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_skip_utf")?;
     let bytes = raw::subject_bytes(orig)?;
     match decode(bytes, start, end) {
         Some((_, len)) => {
@@ -448,10 +448,11 @@ fn resolve_match4_fail(module: &Module, fail: &Operand) -> Result<(Label, bool)>
 /// Read a match-context operand, returning `(term, orig, start, end)`.
 fn read_ctx(
     machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
     operand: &Operand,
     what: &str,
 ) -> Result<(Eterm, Eterm, usize, usize)> {
-    let term = read_operand(machine, operand)?;
+    let term = read_operand(machine, ctx, operand)?;
     let (orig, start, end) = raw::ctx_parts(term)
         .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
     Ok((term, orig, start, end))
@@ -784,7 +785,7 @@ fn run_commands(
     commands: &[Operand],
     ctx: &mut dyn ExecutionContext,
 ) -> Result<Option<Step>> {
-    let (term, orig, start, end) = read_ctx(machine, ctx_op, "bs_match")?;
+    let (term, orig, start, end) = read_ctx(machine, ctx, ctx_op, "bs_match")?;
     let bytes = raw::subject_bytes(orig)?;
     let mut pos = start;
     let mut i = 0usize;
@@ -800,8 +801,8 @@ fn run_commands(
         match name {
             // `ensure_at_least Size Unit` (`generators.tab:1164`).
             "ensure_at_least" => {
-                let size = read_size(machine, cmd_at(commands, i + 1)?)?;
-                let unit = read_size(machine, cmd_at(commands, i + 2)?)?;
+                let size = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
+                let unit = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
                 if !ensure_at_least(end.saturating_sub(pos), size, unit) {
                     return fail_step(machine, module, labels, fail, term, ctx);
                 }
@@ -810,7 +811,7 @@ fn run_commands(
 
             // `ensure_exactly Stride` — `bs_test_tail_imm2` (`generators.tab:1210`).
             "ensure_exactly" => {
-                let stride = read_size(machine, cmd_at(commands, i + 1)?)?;
+                let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 if end.saturating_sub(pos) != stride {
                     return fail_step(machine, module, labels, fail, term, ctx);
                 }
@@ -819,7 +820,7 @@ fn run_commands(
 
             // `skip Stride` — advance without binding (`i_bs_skip`).
             "skip" => {
-                let stride = read_size(machine, cmd_at(commands, i + 1)?)?;
+                let stride = read_size(machine, ctx, cmd_at(commands, i + 1)?)?;
                 let Some(next) = pos.checked_add(stride) else {
                     return fail_step(machine, module, labels, fail, term, ctx);
                 };
@@ -833,8 +834,8 @@ fn run_commands(
             // `integer Live Flags Size Unit Dst` (`i_bs_get_fixed_integer`).
             "integer" => {
                 let flags = decode_flags(module, cmd_at(commands, i + 2)?)?;
-                let size = read_size(machine, cmd_at(commands, i + 3)?)?;
-                let unit = read_size(machine, cmd_at(commands, i + 4)?)?;
+                let size = read_size(machine, ctx, cmd_at(commands, i + 3)?)?;
+                let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
                 let dst = cmd_at(commands, i + 5)?;
                 let Some(nbits) = size.checked_mul(unit) else {
                     return fail_step(machine, module, labels, fail, term, ctx);
@@ -850,12 +851,12 @@ fn run_commands(
             // `binary Live Flags Size Unit Dst` (`i_bs_get_fixed_binary`).
             "binary" => {
                 let size_op = cmd_at(commands, i + 3)?;
-                let unit = read_size(machine, cmd_at(commands, i + 4)?)?;
+                let unit = read_size(machine, ctx, cmd_at(commands, i + 4)?)?;
                 let dst = cmd_at(commands, i + 5)?;
                 let nbits = if is_all(module, size_op) {
                     end.saturating_sub(pos)
                 } else {
-                    let size = read_size(machine, size_op)?;
+                    let size = read_size(machine, ctx, size_op)?;
                     match size.checked_mul(unit) {
                         Some(nbits) => nbits,
                         None => return fail_step(machine, module, labels, fail, term, ctx),
@@ -891,8 +892,8 @@ fn run_commands(
             // `'=:='` are just the non-alphanumeric-atom notation and are not part
             // of the name).
             "=:=" => {
-                let bits = read_size(machine, cmd_at(commands, i + 2)?)?;
-                let want_term = read_operand(machine, cmd_at(commands, i + 3)?)?;
+                let bits = read_size(machine, ctx, cmd_at(commands, i + 2)?)?;
+                let want_term = read_operand(machine, ctx, cmd_at(commands, i + 3)?)?;
                 let Some(want) = small_value(want_term) else {
                     return Err(error::unsupported("bs_match '=:=': non-integer value"));
                 };

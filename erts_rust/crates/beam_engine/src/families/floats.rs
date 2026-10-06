@@ -83,13 +83,13 @@ pub(crate) fn exec(
         // `fmove Src Dst` — FR ⇄ value register (and a float *literal* source).
         // Both directions are a single copy in the term-slot FR model.
         Instr::Fmove { src, dst } => {
-            let value = read_value(machine, module, src)?;
+            let value = read_value(machine, module, ctx, src)?;
             write_operand(machine, dst, value)?;
             Ok(Some(Step::Next))
         }
         // `fconv Src Dst` — integer/float → float register. No fail label.
         Instr::Fconv { src, dst } => {
-            let source = read_value(machine, module, src)?;
+            let source = read_value(machine, module, ctx, src)?;
             let value = match conv_to_float(ctx, source) {
                 Ok(value) => value,
                 // A non-numeric source is the `$BADARITH0` raise; `fconv` has no
@@ -170,7 +170,7 @@ pub(crate) fn exec(
         // no finiteness check: negating a finite float is always finite (and every
         // producer of a float value here rejects a non-finite result).
         Instr::Fnegate { fail, src, dst } => {
-            let source = read_value(machine, module, src)?;
+            let source = read_value(machine, module, ctx, src)?;
             let value = match float_value(source) {
                 Ok(x) => x,
                 Err(_) => return arithmetic_failure(machine, module, labels, *fail),
@@ -199,8 +199,8 @@ fn binary(
     ctx: &mut dyn ExecutionContext,
     op: fn(f64, f64) -> f64,
 ) -> Result<Option<Step>> {
-    let a = read_value(machine, module, lhs)?;
-    let b = read_value(machine, module, rhs)?;
+    let a = read_value(machine, module, ctx, lhs)?;
+    let b = read_value(machine, module, ctx, rhs)?;
     let (x, y) = match (float_value(a), float_value(b)) {
         (Ok(x), Ok(y)) => (x, y),
         // A non-float FR slot is the documented arithmetic failure. A structurally
@@ -300,12 +300,17 @@ fn conv_to_float(ctx: &mut dyn ExecutionContext, source: Eterm) -> Result<Eterm>
 /// `fmove {float,K} {fr,N}` source — the loader's IR documents `Fmove`'s source as
 /// "a float register, value register **or float literal**", and the value lives in
 /// the module's decoded literal area, which the shared seam does not resolve.
-fn read_value(machine: &Machine, module: &Module, operand: &Operand) -> Result<Eterm> {
+fn read_value(
+    machine: &Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+) -> Result<Eterm> {
     match operand {
         Operand::Literal(index) => module
             .literal(*index)
             .ok_or_else(|| error::unsupported("float: literal index out of range")),
-        other => read_operand(machine, other),
+        other => read_operand(machine, ctx, other),
     }
 }
 

@@ -56,7 +56,7 @@
 //! the responsibility deliberately stays in one file.
 use beam_common::{BeamError, Result};
 use beam_loader::Module;
-use beam_term::{make_atom, thing, Eterm};
+use beam_term::{make_atom, make_small, thing, Eterm, MAX_SMALL, MIN_SMALL};
 
 use crate::context::ExecutionContext;
 
@@ -203,6 +203,37 @@ pub fn make_float(ctx: &mut dyn ExecutionContext, value: f64) -> Result<Eterm> {
     // SAFETY: `alloc_words` returned exactly `FLOAT_SIZE_WORDS` writable words,
     // which `write_float` fully initialises.
     Ok(unsafe { thing::write_float(hp, value) })
+}
+
+/// Builds an integer term for `value`: a small int when it fits, an exact bignum
+/// otherwise.
+///
+/// `MIN_SMALL..=MAX_SMALL` (the 60-bit immediate range, `beam_term::immediate`) is
+/// materialised with [`beam_term::make_small`]. Anything outside it — reachable from
+/// real `erlc` output, whose `integer`/`character` operands may carry a value in
+/// `[2^59, 2^63)` — is written as an **exact bignum** with
+/// [`beam_term::thing::write_big`] (`BIG_NEED_SIZE(1) = 2` words: the header plus one
+/// `ErtsDigit`, with the sign in the header's `_BIG_SIGN_BIT`). A non-small `i64`
+/// always fits exactly one `u64` `ErtsDigit`, so the digit slice is normalised
+/// (non-empty, no leading zero) by construction.
+///
+/// The pointer is valid until the next [`ExecutionContext::ensure_heap`] call (the
+/// documented stability contract). This is the shared constructor
+/// [`crate::operand::read_operand`] uses, so a small-vs-bignum mismatch is
+/// impossible.
+pub fn make_integer(ctx: &mut dyn ExecutionContext, value: i64) -> Result<Eterm> {
+    if (MIN_SMALL..=MAX_SMALL).contains(&value) {
+        return Ok(make_small(value));
+    }
+    // `unsigned_abs` is total, including `i64::MIN`; a non-small value has a non-zero
+    // magnitude, so there is no leading zero digit to strip.
+    let digits = [value.unsigned_abs()];
+    let hp = ctx.alloc_words(beam_term::big_size_words(digits.len()))?;
+    // SAFETY: `alloc_words` returned exactly `big_size_words(1) = 2` exclusively-owned,
+    // writable words — the block `write_big` requires and fully writes (header + one
+    // `ErtsDigit`). The context owns the arena and keeps it live for as long as any
+    // term built from this pointer is used.
+    Ok(unsafe { thing::write_big(hp, value < 0, &digits) })
 }
 
 /// Builds a small *flat* map term from `pairs` (insertion order preserved).
@@ -1167,6 +1198,39 @@ mod tests {
         assert!(make_fun(&mut c, 256, 1, 1, &[]).is_err());
         let free = vec![make_small(0); 256];
         assert!(make_fun(&mut c, 1, 1, 1, &free).is_err());
+    }
+
+    // -- integers ----------------------------------------------------------
+
+    #[test]
+    fn make_integer_keeps_small_values_small() {
+        let mut c = ctx();
+        for v in [0i64, 1, -1, MAX_SMALL, MAX_SMALL - 1, MIN_SMALL, MIN_SMALL + 1] {
+            let t = make_integer(&mut c, v).unwrap();
+            assert!(beam_term::is_small(t), "{v} must stay a small int");
+            assert_eq!(beam_term::signed_value(t), v);
+        }
+    }
+
+    #[test]
+    fn make_integer_builds_an_exact_bignum_outside_the_small_range() {
+        let mut c = ctx();
+        let cases = [
+            (MAX_SMALL + 1, false),
+            (MIN_SMALL - 1, true),
+            (999_999_999_999_999_999, false),
+            (-999_999_999_999_999_999, true),
+            (i64::MAX, false),
+            (i64::MIN, true),
+        ];
+        for (v, negative) in cases {
+            let t = make_integer(&mut c, v).unwrap();
+            assert!(!beam_term::is_small(t), "{v} must not be a small int");
+            // SAFETY: `t` is a live bignum just written by `make_integer`.
+            let (neg, digits) = unsafe { beam_term::big_parts(t) };
+            assert_eq!(neg, negative, "{v}");
+            assert_eq!(digits, [v.unsigned_abs()], "{v}");
+        }
     }
 
     // -- binaries -------------------------------------------------------------

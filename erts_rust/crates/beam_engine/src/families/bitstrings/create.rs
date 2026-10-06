@@ -120,7 +120,7 @@ fn assemble(
             .ok_or_else(|| error::unsupported("bs_create_bin: unknown segment type atom"))?;
         // Each segment is `[Type, Index, Unit, Flags, Value, Size]`; the index is
         // ignored (it is only a compiler-side identifier).
-        let unit = read_size(machine, seg_at(segments, i + 2)?)?;
+        let unit = read_size(machine, ctx, seg_at(segments, i + 2)?)?;
         let flags = decode_flags(module, seg_at(segments, i + 3)?)?;
         let value_op = seg_at(segments, i + 4)?;
         let size_op = seg_at(segments, i + 5)?;
@@ -132,11 +132,11 @@ fn assemble(
                         "bs_create_bin: integer segment size `all`",
                     ));
                 }
-                let size = read_size(machine, size_op)?;
+                let size = read_size(machine, ctx, size_op)?;
                 let Some(nbits) = size.checked_mul(unit) else {
                     return fail_seg(machine, module, labels, fail, value_op, ctx);
                 };
-                let value = read_value(machine, module, value_op)?;
+                let value = read_value(machine, module, ctx, value_op)?;
                 if nbits > 64 {
                     // `fmt_big_be`/`fmt_big_le` (`erl_bits.c:724`/`:811`): a wide
                     // field of a small *or* a bignum value, both taken modulo
@@ -159,11 +159,11 @@ fn assemble(
             }
             // `binary Unit Fs Value Size` — append a bitstring operand's bytes.
             "binary" => {
-                let (bytes, src_bits) = segment_source(machine, module, value_op)?;
+                let (bytes, src_bits) = segment_source(machine, module, value_op, ctx)?;
                 let nbits = if is_all(module, size_op) {
                     src_bits
                 } else {
-                    let size = read_size(machine, size_op)?;
+                    let size = read_size(machine, ctx, size_op)?;
                     match size.checked_mul(unit) {
                         Some(nbits) => nbits,
                         None => {
@@ -186,7 +186,7 @@ fn assemble(
             // (`beam_ssa_codegen.erl:1976`); C computes `size * 8` bits and no
             // failure is possible here, so this segment never branches to `fail`.
             "string" => {
-                let bytes = string_source(module, value_op, size_op, machine)?;
+                let bytes = string_source(module, value_op, size_op, machine, ctx)?;
                 writer.push_bits_from(bytes, 0, bytes.len() * 8);
             }
 
@@ -197,7 +197,7 @@ fn assemble(
                 let nbits = if is_all(module, size_op) {
                     64
                 } else {
-                    match read_size(machine, size_op)?.checked_mul(unit) {
+                    match read_size(machine, ctx, size_op)?.checked_mul(unit) {
                         Some(n) if n != 0 => n,
                         _ => 64,
                     }
@@ -207,7 +207,7 @@ fn assemble(
                         "bs_create_bin: float segment size other than 16/32/64",
                     ));
                 }
-                let value = read_value(machine, module, value_op)?;
+                let value = read_value(machine, module, ctx, value_op)?;
                 let Some(f) = float_source(value) else {
                     return Err(error::unsupported(
                         "bs_create_bin: float segment value is not a float/small integer",
@@ -220,7 +220,7 @@ fn assemble(
             // `utf8`/`utf16`/`utf32` — the codepoint is variable-width; the
             // `Size`/`Unit` operands are not used (only the endianness flag is).
             "utf8" | "utf16" | "utf32" => {
-                let value = read_value(machine, module, value_op)?;
+                let value = read_value(machine, module, ctx, value_op)?;
                 let encoded = match (kind, small_value(value)) {
                     ("utf8", Some(v)) => put_utf8(v),
                     ("utf16", Some(v)) => put_utf16(v, flags & BSF_LITTLE != 0),
@@ -259,7 +259,7 @@ fn fail_seg(
     value_op: &Operand,
     ctx: &mut dyn ExecutionContext,
 ) -> Result<std::result::Result<(Vec<u8>, usize), Step>> {
-    let value = read_value(machine, module, value_op)?;
+    let value = read_value(machine, module, ctx, value_op)?;
     let step = fail_step(machine, module, labels, fail, value, ctx)?
         .expect("fail_step yields a step");
     Ok(Err(step))
@@ -274,12 +274,17 @@ fn seg_at(segments: &[Operand], index: usize) -> Result<&Operand> {
 
 /// Read a segment value operand: a `Literal` (a string constant) resolves through
 /// the module's literal area, everything else through the ordinary operand reader.
-fn read_value(machine: &Machine, module: &Module, operand: &Operand) -> Result<Eterm> {
+fn read_value(
+    machine: &Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+) -> Result<Eterm> {
     match operand {
         Operand::Literal(index) => module
             .literal(*index)
             .ok_or_else(|| error::unsupported("bs_create_bin: literal index out of range")),
-        _ => read_operand(machine, operand),
+        _ => read_operand(machine, ctx, operand),
     }
 }
 
@@ -288,8 +293,9 @@ fn segment_source<'a>(
     machine: &Machine,
     module: &Module,
     operand: &Operand,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<(&'a [u8], usize)> {
-    let value = read_value(machine, module, operand)?;
+    let value = read_value(machine, module, ctx, operand)?;
     let (_, bits) = raw::heap_bits(value)
         .ok_or_else(|| error::unsupported("bs_create_bin: segment value is not a binary"))?;
     let bytes = raw::subject_bytes(value)?;
@@ -311,6 +317,7 @@ fn string_source<'a>(
     value_op: &Operand,
     size_op: &Operand,
     machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
 ) -> Result<&'a [u8]> {
     let Operand::Integer(offset) = value_op else {
         return Err(error::unsupported(
@@ -320,7 +327,7 @@ fn string_source<'a>(
     if is_all(module, size_op) {
         return Err(error::unsupported("bs_create_bin: string segment size `all`"));
     }
-    let size = read_size(machine, size_op)?;
+    let size = read_size(machine, ctx, size_op)?;
     let start = usize::try_from(*offset)
         .map_err(|_| error::unsupported("bs_create_bin: negative StrT offset"))?;
     let end = start
@@ -488,6 +495,8 @@ mod tests {
     use super::*;
     use beam_common::BeamError;
 
+    use crate::context::MinimalContext;
+
     // --- `string_source` (the `StrT` constant segment) ---------------------
 
     /// The fixture's `StrT` table (`bsstring.beam`, from
@@ -504,12 +513,14 @@ mod tests {
     fn string_source_slices_the_strt_table() {
         let module = strt_module();
         let machine = Machine::new();
-        let slice = |offset: i64, size: i64| {
+        let mut ctx = MinimalContext::new();
+        let mut slice = |offset: i64, size: i64| {
             string_source(
                 &module,
                 &Operand::Integer(offset),
                 &Operand::Integer(size),
                 &machine,
+                &mut ctx,
             )
         };
         assert_eq!(slice(0, 2).unwrap(), b"ab");
@@ -524,9 +535,10 @@ mod tests {
     fn string_source_rejects_a_value_that_is_not_a_strt_offset() {
         let module = strt_module();
         let machine = Machine::new();
+        let mut ctx = MinimalContext::new();
         let size = Operand::Integer(2);
         for value in [Operand::Nil, Operand::Atom(module.name), Operand::X(0)] {
-            let err = string_source(&module, &value, &size, &machine).unwrap_err();
+            let err = string_source(&module, &value, &size, &machine, &mut ctx).unwrap_err();
             assert!(matches!(err, BeamError::Raise(_)), "{value:?}: got {err:?}");
         }
     }
@@ -536,7 +548,9 @@ mod tests {
         let mut module = strt_module();
         let all = Operand::Atom(module.atom_table.intern("all"));
         let machine = Machine::new();
-        let err = string_source(&module, &Operand::Integer(0), &all, &machine).unwrap_err();
+        let mut ctx = MinimalContext::new();
+        let err =
+            string_source(&module, &Operand::Integer(0), &all, &machine, &mut ctx).unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
     }
 
@@ -544,14 +558,25 @@ mod tests {
     fn string_source_rejects_a_negative_offset_and_a_bad_size() {
         let module = strt_module();
         let machine = Machine::new();
-        let err =
-            string_source(&module, &Operand::Integer(-1), &Operand::Integer(1), &machine)
-                .unwrap_err();
+        let mut ctx = MinimalContext::new();
+        let err = string_source(
+            &module,
+            &Operand::Integer(-1),
+            &Operand::Integer(1),
+            &machine,
+            &mut ctx,
+        )
+        .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
         // A negative size is not a byte count.
-        let err =
-            string_source(&module, &Operand::Integer(0), &Operand::Integer(-1), &machine)
-                .unwrap_err();
+        let err = string_source(
+            &module,
+            &Operand::Integer(0),
+            &Operand::Integer(-1),
+            &machine,
+            &mut ctx,
+        )
+        .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
     }
 
@@ -559,12 +584,18 @@ mod tests {
     fn string_source_rejects_a_slice_outside_the_table() {
         let module = strt_module();
         let machine = Machine::new();
+        let mut ctx = MinimalContext::new();
         // Offset 2 + size 2 runs past the end of a 3-byte table.
         let mut short = Module::default();
         short.strings = b"abc".to_vec();
-        let err =
-            string_source(&short, &Operand::Integer(2), &Operand::Integer(2), &machine)
-                .unwrap_err();
+        let err = string_source(
+            &short,
+            &Operand::Integer(2),
+            &Operand::Integer(2),
+            &machine,
+            &mut ctx,
+        )
+        .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");
         // A start past the end of the whole table is rejected too.
         let err = string_source(
@@ -572,6 +603,7 @@ mod tests {
             &Operand::Integer(999),
             &Operand::Integer(1),
             &machine,
+            &mut ctx,
         )
         .unwrap_err();
         assert!(matches!(err, BeamError::Raise(_)), "got {err:?}");

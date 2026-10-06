@@ -124,8 +124,8 @@ pub(crate) fn exec(
         // C's `i_raise` copies the reason + raw stacktrace but never touches
         // `freason`, so the class of the exception currently being handled is kept.
         Instr::Raise { trace, value } => {
-            let value = read_operand(machine, value)?;
-            let trace = read_operand(machine, trace)?;
+            let value = read_operand(machine, ctx, value)?;
+            let trace = read_operand(machine, ctx, trace)?;
             let class = machine.pending_class().ok_or_else(|| {
                 error::unsupported("exceptions: raise with no exception being handled")
             })?;
@@ -192,7 +192,7 @@ pub(crate) fn exec(
         // symbolic `[{M,F,A,Location}]` list (C:
         // `x(0) = build_stacktrace(c_p, x(0))`, `emu/instrs.tab:1247-1251`).
         Instr::BuildStacktrace => {
-            let raw = read_operand(machine, &Operand::X(0))?;
+            let raw = read_operand(machine, ctx, &Operand::X(0))?;
             // C's `get_trace_from_exc/1` returns NULL for a NIL exception, and
             // `build_stacktrace` then yields NIL (`beam_common.c:1219-1223`). The
             // M1 machine captures no stacktrace, so every caught exception lands
@@ -216,9 +216,9 @@ pub(crate) fn exec(
         // `catch C:R:S -> erlang:raise(C, R, S)` shape into
         // (`lib/compiler/src/sys_core_fold.erl:2441-2465`).
         Instr::RawRaise => {
-            let class_term = read_operand(machine, &Operand::X(0))?;
-            let value = read_operand(machine, &Operand::X(1))?;
-            let trace = read_operand(machine, &Operand::X(2))?;
+            let class_term = read_operand(machine, ctx, &Operand::X(0))?;
+            let value = read_operand(machine, ctx, &Operand::X(1))?;
+            let trace = read_operand(machine, ctx, &Operand::X(2))?;
             match classify_class(module, class_term) {
                 Some(class) => {
                     // The class atom is exactly the one we matched, so it is
@@ -262,7 +262,7 @@ fn raise_error_tuple(
     tag: &str,
     value: &Operand,
 ) -> Result<Option<Step>> {
-    let value = read_operand(machine, value)?;
+    let value = read_operand(machine, ctx, value)?;
     let tag_atom = module
         .atom_table
         .lookup(tag)

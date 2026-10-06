@@ -78,7 +78,7 @@ pub(crate) fn exec(
             dst,
             updates,
         } => {
-            let source = read_operand(machine, src)?;
+            let source = read_operand(machine, ctx, src)?;
             let arity = terms::tuple_arity(source)
                 .map_err(|_| error::unsupported("update_record: non-tuple source"))?;
             if arity != *size as usize {
@@ -101,7 +101,7 @@ pub(crate) fn exec(
                 if offset < 1 || offset as usize > arity {
                     return Err(error::unsupported("update_record: index out of range"));
                 }
-                elements[offset as usize - 1] = read_operand(machine, value)?;
+                elements[offset as usize - 1] = read_operand(machine, ctx, value)?;
             }
 
             let result = terms::make_tuple(ctx, &elements)?;

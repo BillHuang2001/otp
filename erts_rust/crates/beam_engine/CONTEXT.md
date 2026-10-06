@@ -174,7 +174,7 @@ Ownership model (documented at the module top): the context owns the heap, `allo
 - `X(n)`, `Y(n)` (bounds-checked; out of range → `error::bad_register`).
 - `Typed{reg, ty}` (read/write `reg`, ignore the type annotation).
 - `FloatReg(n)` (read/write the [`Machine`] FR file; out of range → `bad_register`).
-- `Integer(i)`/`Character(c)` (`make_small`), `Atom(a)` (`make_atom`), `Nil` (`NIL`).
+- `Integer(i)`/`Character(c)` (a small int when in range, an exact bignum otherwise — `terms::make_integer`), `Atom(a)` (`make_atom`), `Nil` (`NIL`).
 
 ### Operand subset — **NOT supported by the general reader/writer**
 - `Literal` (an index into the running module's decoded literal area) **is** read via `crate::operand::read_operand` (`Machine::literal`); only `Label`, `List` and `Allocation` are unsupported there → a typed `error::unsupported` from `read_operand`. `write_operand` rejects every non-register destination, `Literal` included (a literal has no addressable slot).

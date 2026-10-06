@@ -61,7 +61,7 @@ pub(crate) fn exec(
         Instr::PutTuple2 { dst, elements } => {
             let mut elems = Vec::with_capacity(elements.len());
             for operand in elements {
-                elems.push(read_operand(machine, operand)?);
+                elems.push(read_operand(machine, ctx, operand)?);
             }
             let tuple = terms::make_tuple(ctx, &elems)?;
             write_operand(machine, dst, tuple)?;
@@ -73,7 +73,7 @@ pub(crate) fn exec(
             element,
             dst,
         } => {
-            let value = read_operand(machine, source)?;
+            let value = read_operand(machine, ctx, source)?;
             match terms::tuple_arity(value) {
                 Ok(arity) if (*element as usize) < arity => {
                     let elem = terms::tuple_element(value, *element as usize)?;
@@ -92,7 +92,7 @@ pub(crate) fn exec(
             fail,
             destinations,
         } => {
-            let value = read_operand(machine, tuple)?;
+            let value = read_operand(machine, ctx, tuple)?;
             // The arity switch is only emitted behind an `is_tuple` test; a
             // non-tuple source is the documented typed-error gap.
             let arity = match terms::tuple_arity(value) {

@@ -390,13 +390,29 @@ pub(crate) fn x_register(operand: &Operand) -> Option<u32> {
 
 /// The raw `Eterm` word of a constant operand, as [`crate::operand::read_operand`]
 /// evaluates it (`make_small`/`make_atom`/`NIL`).
+///
+/// An `Integer`/`Character` outside the small-int range is `None`: the native tier
+/// only inlines immediates, so such a constant makes the block **deopt** to
+/// `jit_step_one`, whose interpreter step materialises the exact bignum through
+/// [`crate::terms::make_integer`]. `make_small` must never see an out-of-range value
+/// (it `debug_assert`s).
 pub(crate) fn constant_word(operand: &Operand) -> Option<i64> {
     match operand {
-        Operand::Integer(value) => Some(make_small(*value).raw() as i64),
-        Operand::Character(c) => Some(make_small(i64::from(*c)).raw() as i64),
+        Operand::Integer(value) => small_word(*value),
+        Operand::Character(c) => small_word(i64::from(*c)),
         Operand::Atom(atom) => Some(make_atom(*atom).raw() as i64),
         Operand::Nil => Some(NIL.raw() as i64),
         _ => None,
+    }
+}
+
+/// The raw `Eterm` word of a small-int constant, or `None` when `value` is outside
+/// the 60-bit immediate range (`beam_term::{MIN_SMALL, MAX_SMALL}`).
+fn small_word(value: i64) -> Option<i64> {
+    if (MIN_SMALL..=MAX_SMALL).contains(&value) {
+        Some(make_small(value).raw() as i64)
+    } else {
+        None
     }
 }
 
