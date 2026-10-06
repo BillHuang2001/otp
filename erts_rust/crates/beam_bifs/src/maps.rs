@@ -334,6 +334,59 @@ fn remove_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     build_map(ctx, &out_keys, &out_values)
 }
 
+/// `maps:take/2` — `{Value, MapWithoutKey}` when `Key` is present, else `error`.
+///
+/// The key match is exact (`=:=`), like every other key lookup here: the oracle
+/// gives `maps:take(1.0, #{1 => x})` ⇒ `error` (and `maps:take(1, #{1.0 => x})`
+/// ⇒ `error`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Map` is not a map (the oracle raises the structured
+/// `{badmap, Map}` — see the module docs); [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) can only
+/// arise from a hashmap operand (defensive).
+fn take_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (keys, values) = map_parts(args[1])?;
+    let Some(i) = find_key(ctx.atoms(), &keys, args[0]) else {
+        return ctx.atom("error");
+    };
+    let value = values[i];
+    let mut out_keys = Vec::with_capacity(keys.len());
+    let mut out_values = Vec::with_capacity(values.len());
+    for (j, (&k, &v)) in keys.iter().zip(values.iter()).enumerate() {
+        if j != i {
+            out_keys.push(k);
+            out_values.push(v);
+        }
+    }
+    let rest = build_map(ctx, &out_keys, &out_values)?;
+    ctx.tuple(&[value, rest])
+}
+
+/// `maps:from_keys/2` — a map with every key of the list `Keys` bound to `Value`.
+///
+/// A duplicate key collapses to one pair (`maps:from_keys([a,a], 2)` ⇒ `#{a => 2}`),
+/// and the empty list gives `#{}`. The keys may be any terms, and two keys that are
+/// *distinct* under `=:=` but equal under `==` stay separate
+/// (`maps:from_keys([1,1.0], v)` ⇒ `#{1 => v, 1.0 => v}`).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`](beam_common::BeamError::BadArg) when `Keys` is not a proper list (the oracle's `badarg`);
+/// [`BeamError::SystemLimit`](beam_common::BeamError::SystemLimit) when more than 32 *distinct* keys would need a
+/// hashmap (a Milestone-1 gap — see the module docs).
+fn from_keys_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let keys = proper_list(args[0]).ok_or_else(badarg)?;
+    let mut out_keys: Vec<Eterm> = Vec::new();
+    for key in keys {
+        if find_key(ctx.atoms(), &out_keys, key).is_none() {
+            out_keys.push(key);
+        }
+    }
+    let values = vec![args[1]; out_keys.len()];
+    build_map(ctx, &out_keys, &values)
+}
+
 /// `maps:keys/1` — the map's keys, in stored order.
 fn keys_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let (keys, _) = map_parts(args[0])?;
@@ -541,6 +594,8 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("maps", "put", 3, put_3);
     reg.register("maps", "update", 3, update_3);
     reg.register("maps", "remove", 2, remove_2);
+    reg.register("maps", "take", 2, take_2);
+    reg.register("maps", "from_keys", 2, from_keys_2);
     reg.register("maps", "keys", 1, keys_1);
     reg.register("maps", "values", 1, values_1);
     reg.register("maps", "size", 1, size_1);
@@ -998,6 +1053,8 @@ mod tests {
             ("maps", "put", 3),
             ("maps", "update", 3),
             ("maps", "remove", 2),
+            ("maps", "take", 2),
+            ("maps", "from_keys", 2),
             ("maps", "keys", 1),
             ("maps", "values", 1),
             ("maps", "size", 1),
@@ -1021,7 +1078,7 @@ mod tests {
                 "missing {module}:{name}/{arity}"
             );
         }
-        assert_eq!(reg.len(), 25);
+        assert_eq!(reg.len(), 27);
     }
 
     #[test]

@@ -100,12 +100,27 @@ use crate::print::{
 };
 use crate::registry::BifRegistry;
 
-/// Registers `io:format/1,2` and `io_lib:format/2,3`.
+/// Registers `io:printable_range/0`, `io:format/1,2` and `io_lib:format/2,3`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("io", "format", 1, format_1);
     reg.register("io", "format", 2, format_2);
+    reg.register("io", "printable_range", 0, printable_range_0);
     reg.register("io_lib", "format", 2, format_lib_2);
     reg.register("io_lib", "format", 3, format_lib_3);
+}
+
+/// `io:printable_range/0` — the atom `latin1` or `unicode`, whichever the runtime
+/// was started with.
+///
+/// Reproduces the oracle's `io_printable_range_0` (`../../erts/emulator/beam/
+/// erl_unicode.c:2943-2948`), which returns `unicode` only when the printable
+/// character range is [`ERL_PRINTABLE_CHARACTERS_UNICODE`]. That range defaults to
+/// **`latin1`** and is upgraded to `unicode` only by the `+pc unicode` emulator
+/// flag (`erl_init.c:1379-1382`); Milestone-1 has no flag plumbing, so this returns
+/// the default `latin1` — exactly what the oracle reports without `+pc`
+/// (`erl -noshell -eval 'io:printable_range()'` ⇒ `latin1`).
+fn printable_range_0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    ctx.atom("latin1")
 }
 
 /// `io:format(Format)` — writes `Format` with no arguments and returns `ok`.

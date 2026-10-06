@@ -1273,6 +1273,19 @@ fn characters_to_list_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eter
     ctl(ctx, args[0], in_enc)
 }
 
+/// `unicode:bin_is_7bit/1` — `true` iff `Bin` is a byte-aligned binary every byte
+/// of which is below `0x80`, and `false` for any other term.
+///
+/// Reproduces the oracle's `bin_is_7bit` exactly (`../../erts/emulator/beam/
+/// erl_unicode.c:888-909`): `erts_get_aligned_binary_bytes` returns `NULL` for a
+/// list, a non-byte-aligned bitstring and every non-binary, so those are `false`
+/// (`bin_is_7bit(<<1,2,127>>)` ⇒ `true`, `bin_is_7bit(<<1,128>>)` ⇒ `false`,
+/// `bin_is_7bit(<<1:1>>)` ⇒ `false`, `bin_is_7bit([1,2])` ⇒ `false`,
+/// `bin_is_7bit(5)` ⇒ `false`). Never raises — the argument is *not* validated.
+fn bin_is_7bit_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    ctx.boolean(bin_is_7bit(args[0]))
+}
+
 /// Registers the `unicode` module BIFs.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("unicode", "characters_to_binary", 1, characters_to_binary_1);
@@ -1280,6 +1293,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("unicode", "characters_to_binary", 3, characters_to_binary_3);
     reg.register("unicode", "characters_to_list", 1, characters_to_list_1);
     reg.register("unicode", "characters_to_list", 2, characters_to_list_2);
+    reg.register("unicode", "bin_is_7bit", 1, bin_is_7bit_1);
 }
 
 #[cfg(test)]
@@ -1292,7 +1306,9 @@ mod tests {
     use std::cell::RefCell;
 
     /// Every name the test tables are seeded with, in this order.
-    const NAMES: &[&str] = &["ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo"];
+    const NAMES: &[&str] = &[
+        "ok", "error", "incomplete", "latin1", "utf8", "unicode", "foo", "true", "false",
+    ];
 
     fn table() -> AtomTable {
         let mut atoms = AtomTable::new();
@@ -1642,7 +1658,7 @@ mod tests {
     }
 
     #[test]
-    fn registry_has_the_five_arities() {
+    fn registry_has_the_registered_arities() {
         let registry = crate::registry::default_registry();
         for (name, arity) in [
             ("characters_to_binary", 1),
@@ -1650,11 +1666,33 @@ mod tests {
             ("characters_to_binary", 3),
             ("characters_to_list", 1),
             ("characters_to_list", 2),
+            ("bin_is_7bit", 1),
         ] {
             assert!(
                 registry.contains("unicode", name, arity),
                 "unicode:{name}/{arity} must be registered"
             );
         }
+    }
+
+    #[test]
+    fn bin_is_7bit_matches_the_oracle() {
+        with_ctx(|ctx| {
+            // Oracle-pinned values (`erl -noshell -eval 'unicode:bin_is_7bit(…).'`).
+            assert_eq!(show(ctx, "bin_is_7bit", &[bin(&[1, 2, 127])]), "true");
+            assert_eq!(show(ctx, "bin_is_7bit", &[bin(&[1, 128])]), "false");
+            assert_eq!(show(ctx, "bin_is_7bit", &[bin(&[])]), "true");
+            assert_eq!(show(ctx, "bin_is_7bit", &[bin(&[0])]), "true");
+            assert_eq!(show(ctx, "bin_is_7bit", &[bin(&[255])]), "false");
+            // A non-byte-aligned bitstring is `false`.
+            assert_eq!(show(ctx, "bin_is_7bit", &[bitstring(&[0x80], 1)]), "false");
+            assert_eq!(show(ctx, "bin_is_7bit", &[bitstring(&[0x00, 0x80], 9)]), "false");
+            // Non-binary terms are `false`, never `badarg`.
+            let list = ctx.list(&[ctx.int(1).unwrap(), ctx.int(2).unwrap()]).unwrap();
+            assert_eq!(show(ctx, "bin_is_7bit", &[list]), "false");
+            assert_eq!(show(ctx, "bin_is_7bit", &[make_small(5)]), "false");
+            assert_eq!(show(ctx, "bin_is_7bit", &[enc(ctx, "ok")]), "false");
+            assert_eq!(show(ctx, "bin_is_7bit", &[ctx.make_float(1.0).unwrap()]), "false");
+        });
     }
 }
