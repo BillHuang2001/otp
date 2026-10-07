@@ -199,7 +199,9 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
 - `src/workloads/mod.rs` → submodule wiring; assembles the workload registry; shared repo/file helpers.
 - `src/workloads/tool.rs` → shared external-tool resolution (`command_for`, `nix_shell`, `nix_opt_in`, `REPO_SKIP_NAMES`).
 - `src/workloads/baseline.rs` · `erlc_compiler.rs` · `elixir_compiler.rs` · `plb.rs` · `cowboy.rs` ·
-  `khepri.rs` · `emqx.rs` · `slice.rs` → one file per workload (probe + run).
+  `khepri.rs` · `emqx.rs` · `slice.rs` · `foreign.rs` → one file per workload (probe + run).
+  `slice.rs` also exposes `pub(crate) resolve_erlc()` (the shared `$ERLC`/`PATH` lookup reused by
+  `foreign.rs`).
 - `tests/integration.rs` → hermetic synthetic-report round-trip + `compare` tests (no oracle needed).
 - `tests/oracle_smoke.rs` → `baseline` smoke test against the real oracle (no-op skip when unresolved).
 
