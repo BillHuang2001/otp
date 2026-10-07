@@ -287,6 +287,16 @@ impl ConnectionDriver {
     /// creation, with a fresh [`gen_challenge`] nonce.
     ///
     /// This mirrors [`crate::connection::Connection::server`].
+    ///
+    /// **`our_name` must be this node's full `node@host` name.** OTP's connecting
+    /// side matches the name inside the server's `'N'` challenge against the node
+    /// it dialled (`lib/kernel/src/dist_util.erl:recv_challenge_new/2`, which
+    /// compares `list_to_existing_atom(Ns)` with the target node); both
+    /// `send_name/4` and `send_challenge/2` put the full `node@host` on the wire.
+    /// A host-less (bare short) name is therefore refused by the peer, which shuts
+    /// the socket down — the caller sees that abort as a short read
+    /// ([`BeamError::BadArg`](beam_common::BeamError::BadArg)) on its next read.
+    /// See `tests/live_accept.rs`.
     pub fn server(our_name: &[u8], cookie: &[u8], creation: u32) -> ConnectionDriver {
         ConnectionDriver::server_with_challenge(our_name, cookie, creation, gen_challenge())
     }

@@ -439,8 +439,16 @@ fn connect_client_core<T: Transport>(
 /// Drives the **server** side of the connect/challenge handshake.
 ///
 /// `our_name`/`creation` identify this node and `cookie` is the shared secret.
-/// The server advertises [`preferred_flags`];
-/// an outbound `Complement` is sent when `DFLAG_HANDSHAKE_23` was negotiated.
+/// The server advertises [`preferred_flags`] and no `Complement` (that message
+/// answers only the legacy `'n'` name, which this crate does not speak).
+///
+/// **`our_name` must be this node's full `node@host` name.** OTP's connecting side
+/// compares the name inside the server's `'N'` challenge with the node it dialled
+/// (`lib/kernel/src/dist_util.erl:recv_challenge_new/2`) and aborts the socket
+/// otherwise; both `send_name/4` and `send_challenge/2` send the full
+/// `node@host`. A host-less name is seen by this side as a short read
+/// ([`BeamError::BadArg`]) once the peer shuts the link down. See
+/// `tests/live_accept.rs`.
 pub fn accept_server<T: Transport>(
     t: &mut T,
     our_name: &[u8],
