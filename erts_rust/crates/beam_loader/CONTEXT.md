@@ -478,6 +478,8 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
   it is a deliberate, lossless gap — never a wrong result. (The `Instr::Generic` doc comment in
   `src/instr.rs:1100-1105` still lists the native-record family as unmodelled; that is stale — 186-193
   all have typed variants.)
+- **Lowering is strictly 1:1 — no `ops.tab` transform / superinstruction combining.** `lower_instr` (`src/lower/instr.rs`) maps one decoded opcode to exactly one `Instr`; it does not expand multi-instruction sequences nor build the C loader's superinstructions (the C does that from `emu/ops.tab` in `beam_load.c`). A `.beam` file carries only generic opcodes, so this is an engine-side optimization the interpreter does not need — never a correctness gap.
+- **The `Instr::Generic` fallback is reached only from the single catch-all arm** (`src/lower/instr.rs:611-628`): every other arm either lowers to a named variant or returns a typed error on an operand-shape mismatch — no opcode lowers to `Generic` *conditionally*.
 - **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
   - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
     above the chunk's `max_opcode`; the C also refuses `max_opcode > MAX_GENERIC_OPCODE` (193) and
