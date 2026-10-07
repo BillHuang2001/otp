@@ -19,6 +19,7 @@
 use beam_common::{ERTS_VSN, ERTS_VERSION, OTP_VERSION};
 use beam_term::AtomTable;
 
+pub mod bootscript;
 mod preloaded;
 
 pub(crate) use preloaded::load_preloaded;

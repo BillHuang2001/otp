@@ -38,6 +38,7 @@ use beam_process::{
 };
 use beam_term::{atom_val, is_atom, make_atom, make_small, AtomTable, Eterm};
 
+use crate::boot::bootscript::{self, BootScript};
 use crate::boot::{self, PreloadedModules};
 use crate::codeserver::CodeServer;
 use crate::config::{ArgTerm, InitArgs, RuntimeConfig};
@@ -627,6 +628,63 @@ impl Runtime {
         }
     }
 
+    /// Loads a module **by name** from the code path into the shared cache (contract A.7).
+    ///
+    /// This is the boot script's `{primLoad, …}`/`{module, …}`/`{preLoaded, …}` loader: it
+    /// resolves `<name>.beam` through the code server's ordered path (and the system `ebin`
+    /// directories) and memoizes the result. Loading a module twice is a no-op.
+    ///
+    /// # Errors
+    ///
+    /// The code server's errors: the bare `error:undef` raise when `<name>.beam` is on no
+    /// code-path directory (never a silent skip), plus the loader's error for a malformed
+    /// image. See [`crate::codeserver::CodeServer::load`].
+    pub fn load_code_module(&mut self, name: &str) -> Result<()> {
+        self.code_server.load(name).map(|_| ())
+    }
+
+    /// Appends a boot script's `{path, [Dir]}` directory to the end of the code path.
+    ///
+    /// [`crate::boot::bootscript`] expands a leading `$ROOT` before calling this, so the
+    /// argument is an ordinary directory; a directory already present is not added twice.
+    pub fn add_code_path(&mut self, dir: impl Into<PathBuf>) {
+        self.code_server.add_path(dir);
+    }
+
+    /// Registers `pid` under the boot-script name `name` (a `{kernelProcess, Name, …}`
+    /// directive's registration half, contract A.7).
+    ///
+    /// The name is interned into the runtime's shared atom table, so a later
+    /// `erlang:whereis/1` resolves it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when `name` is already registered (the process table's
+    /// `name_taken` rule) — never a silent overwrite.
+    pub fn register_boot_process(&mut self, name: &str, pid: ProcessId) -> Result<()> {
+        let atom = self.code_server.atoms_mut().intern(name);
+        self.processes.register(atom, pid)
+    }
+
+    /// Reads the OTP **boot script** at `path` and executes it (contract A.7, part 2).
+    ///
+    /// The runtime boots first (the preloaded set and the system code path), the script is
+    /// parsed into its typed form ([`crate::boot::bootscript::read`]) and then executed in
+    /// instruction order ([`crate::boot::bootscript::execute`]). Execution stops at the
+    /// first directive that cannot run, returning its typed error — a real `start.boot`
+    /// loads every `primLoad` batch and then stops at the first directive M1 cannot run
+    /// (see the `bootscript` module docs). Nothing is printed.
+    ///
+    /// # Errors
+    ///
+    /// The read/parse errors of [`crate::boot::bootscript::read`] and the first directive's
+    /// error from [`crate::boot::bootscript::execute`].
+    pub fn boot_from_script(&mut self, path: impl AsRef<Path>) -> Result<BootScript> {
+        self.boot_if_needed()?;
+        let script = bootscript::read(path.as_ref())?;
+        bootscript::execute(self, &script)?;
+        Ok(script)
+    }
     /// **The slice.** Loads `path`, caches the module, runs `function/arity` with
     /// `args` and returns `x(0)`.
     ///
