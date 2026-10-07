@@ -18,6 +18,12 @@
 //! * One shared [`ThreadProgress`] barrier is bumped per safepoint; each scheduler registers a
 //!   [`crate::progress::ManagedThread`] and marks itself *inactive* while parked, so a safepoint
 //!   never waits on a sleeping scheduler.
+//! * The process-table lock is held for at most one **reduction quantum** (configurable with
+//!   [`SchedulerConfig::set_lock_quantum`], default
+//!   [`crate::scheduler::DEFAULT_LOCK_QUANTUM`]) — a slice is several quanta with the lock released
+//!   between them — so independent processes and cross-thread sends progress *inside* another
+//!   process's slice. Slice semantics (schedule-in, own budget, one requeue) are unchanged; only
+//!   the lock-hold duration is bounded.
 //! * The [`crate::timer::TimerService`] and the [`crate::dirty::DirtyPool`]s are owned here; their
 //!   sinks deliver into the shared table and then enqueue the woken pids through the injector.
 //!
@@ -82,6 +88,12 @@ use crate::ptab::ProcessTable;
 /// makes goes through [`SharedProcessTable::lock`], so the single-threaded table semantics
 /// (allocate, deliver, service signals, terminate) are unchanged — only *one* thread can be
 /// inside them at a time.
+///
+/// A worker holds this lock for at most one **reduction quantum** of a slice, never for a whole
+/// slice: a slice is run as `ceil(reductions_per_slice / lock_quantum)` quanta with the lock
+/// released between them (see `crate::smp::worker::run_locked_quanta`). That is the granularity
+/// that lets independent processes, cross-thread sends and timer/dirty completions make progress
+/// while another process's slice is still in progress.
 ///
 /// # `Send`/`Sync`
 ///
@@ -150,6 +162,9 @@ pub struct SchedulerConfig {
     schedulers: usize,
     /// Reductions per slice.
     reductions_per_slice: u32,
+    /// The maximum number of reductions a scheduler runs per process-table lock acquisition
+    /// (see [`crate::scheduler::DEFAULT_LOCK_QUANTUM`]). Clamped to at least 1.
+    lock_quantum: u32,
     /// Dirty-CPU worker threads.
     dirty_cpu: usize,
     /// Dirty-IO worker threads.
@@ -160,11 +175,12 @@ pub struct SchedulerConfig {
 
 impl SchedulerConfig {
     /// The default configuration: 1 scheduler, 0 dirty workers, timers on, the default reduction
-    /// budget.
+    /// budget and the default table-lock quantum.
     pub fn new() -> SchedulerConfig {
         SchedulerConfig {
             schedulers: 1,
             reductions_per_slice: crate::scheduler::DEFAULT_REDUCTIONS_PER_SLICE,
+            lock_quantum: crate::scheduler::DEFAULT_LOCK_QUANTUM,
             dirty_cpu: 0,
             dirty_io: 0,
             timers: true,
@@ -201,6 +217,23 @@ impl SchedulerConfig {
         self
     }
 
+    /// The maximum number of reductions a scheduler runs per process-table lock acquisition.
+    ///
+    /// A slice of `reductions_per_slice` reductions is run as `ceil(reductions_per_slice /
+    /// lock_quantum)` quanta, the table lock being released between them, so this bounds how long
+    /// one scheduler can hold the lock (and therefore how long an independent process or a
+    /// cross-thread send waits). A value `>= reductions_per_slice` reproduces the old
+    /// one-lock-acquisition-per-slice behavior.
+    pub fn lock_quantum(&self) -> u32 {
+        self.lock_quantum
+    }
+
+    /// Sets the per-lock-acquisition reduction quantum (clamped to at least 1 by
+    /// [`SchedulerPool::start`]).
+    pub fn set_lock_quantum(&mut self, n: u32) -> &mut Self {
+        self.lock_quantum = n;
+        self
+    }
     /// The configured number of dirty-CPU worker threads.
     pub fn dirty_cpu(&self) -> usize {
         self.dirty_cpu
@@ -246,7 +279,7 @@ mod tests {
     //! Unit tests for the configuration defaults and the shared-table wrapper.
 
     use super::*;
-    use crate::scheduler::DEFAULT_REDUCTIONS_PER_SLICE;
+    use crate::scheduler::{DEFAULT_LOCK_QUANTUM, DEFAULT_REDUCTIONS_PER_SLICE};
     use crate::signal::SignalAtoms;
     use beam_term::prelude::AtomTable;
 
@@ -259,6 +292,7 @@ mod tests {
         let config = SchedulerConfig::new();
         assert_eq!(config.schedulers(), 1);
         assert_eq!(config.reductions_per_slice(), DEFAULT_REDUCTIONS_PER_SLICE);
+        assert_eq!(config.lock_quantum(), DEFAULT_LOCK_QUANTUM);
         assert_eq!(config.dirty_cpu(), 0);
         assert_eq!(config.dirty_io(), 0);
         assert!(config.timers());
@@ -267,11 +301,13 @@ mod tests {
         let mut config = SchedulerConfig::with_schedulers(8);
         config
             .set_reductions_per_slice(64)
+            .set_lock_quantum(7)
             .set_dirty_cpu(2)
             .set_dirty_io(3)
             .set_timers(false);
         assert_eq!(config.schedulers(), 8);
         assert_eq!(config.reductions_per_slice(), 64);
+        assert_eq!(config.lock_quantum(), 7);
         assert_eq!(config.dirty_cpu(), 2);
         assert_eq!(config.dirty_io(), 3);
         assert!(!config.timers());

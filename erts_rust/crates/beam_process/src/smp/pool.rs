@@ -54,6 +54,9 @@ pub struct SchedulerPool<R: ProcessRunner + Send + 'static> {
     errors: Arc<Mutex<Option<BeamError>>>,
     /// The per-scheduler counters.
     counters: Arc<Vec<WorkerCounters>>,
+    /// The maximum number of reductions run per process-table lock acquisition (see
+    /// [`SchedulerPool::lock_quantum`]).
+    lock_quantum: u32,
     /// The scheduler thread handles, taken by [`SchedulerPool::join`].
     threads: Mutex<Vec<JoinHandle<()>>>,
     /// The pool's timer service (started only when the config enables timers).
@@ -83,6 +86,7 @@ impl<R: ProcessRunner + Send + 'static> SchedulerPool<R> {
         // A runtime asking for one scheduler MUST work: clamp 0 up to 1.
         let schedulers = config.schedulers().max(1);
         let reductions = config.reductions_per_slice();
+        let lock_quantum = config.lock_quantum().max(1);
 
         let table = SharedProcessTable::new(table);
         let queues = Arc::new(Queues::new(schedulers));
@@ -129,6 +133,7 @@ impl<R: ProcessRunner + Send + 'static> SchedulerPool<R> {
             let worker = Worker::new(
                 index,
                 reductions,
+                lock_quantum,
                 Arc::clone(&table),
                 Arc::clone(&queues),
                 Arc::clone(&signals),
@@ -160,6 +165,7 @@ impl<R: ProcessRunner + Send + 'static> SchedulerPool<R> {
             progress,
             errors,
             counters,
+            lock_quantum,
             threads: Mutex::new(threads),
             timer_service,
             dirty_pool,
@@ -170,6 +176,15 @@ impl<R: ProcessRunner + Send + 'static> SchedulerPool<R> {
     /// The number of scheduler threads in the pool (always at least 1).
     pub fn schedulers(&self) -> usize {
         self.counters.len()
+    }
+
+    /// The pool's per-lock-acquisition reduction quantum (clamped to at least 1).
+    ///
+    /// A scheduler holds the process-table lock for at most this many reductions of a slice, so it
+    /// also bounds how long an independent process or a cross-thread delivery waits behind a slice
+    /// in progress. Configure it with [`SchedulerConfig::set_lock_quantum`].
+    pub fn lock_quantum(&self) -> u32 {
+        self.lock_quantum
     }
 
     /// A clone of the shared thread-progress barrier.

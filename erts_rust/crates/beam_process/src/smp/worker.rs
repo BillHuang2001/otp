@@ -8,11 +8,19 @@
 //!
 //! # Locking discipline
 //!
-//! For each iteration the worker (1) dequeues a pid from a queue, (2) takes the process-table
-//! lock, runs the slice and lets the two helpers *buffer* every requeue into `buf` (they run
-//! while the table lock is held, so their `enqueue` closure must not touch a queue lock), (3)
+//! For each iteration the worker (1) dequeues a pid from a queue, (2) takes the process-table lock,
+//! runs a **quantum** of the slice and lets the two helpers *buffer* every requeue into `buf` (they
+//! run while the table lock is held, so their `enqueue` closure must not touch a queue lock), (3)
 //! drops the table lock, and only then (4) flushes `buf` into the local queue. The two lock
 //! families are therefore never held simultaneously.
+//!
+//! The table lock is **not** held for a whole slice: a slice of `reductions_per_slice` reductions is
+//! run as `ceil(reductions_per_slice / lock_quantum)` quanta, each under its own short lock
+//! acquisition ([`run_locked_quanta`]). That is what lets an independent process (or a cross-thread
+//! send / timer / dirty completion) make progress *inside* another process's slice instead of
+//! waiting for the whole slice; the slice semantics (schedule-in, own reduction budget, one requeue
+//! at the process's own priority) are unchanged, because the schedule-in/schedule-out halves are
+//! the frozen [`slice_begin`]/[`slice_end`] pair the single-threaded scheduler uses.
 //!
 //! The one deliberate exception is the park predicate: [`PoolSignals::park`] holds the signals
 //! mutex and re-checks the queue array (a queue lock) so an enqueue cannot be lost between the
@@ -24,13 +32,13 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use beam_common::BeamError;
+use beam_common::{BeamError, Result};
 use parking_lot::{Condvar, Mutex};
 
 use crate::pid::ProcessId;
 use crate::progress::ThreadProgress;
 use crate::run_queue::Priority;
-use crate::scheduler::{drain_woken_into, run_one, ProcessRunner};
+use crate::scheduler::{drain_woken_into, slice_begin, slice_end, ProcessRunner, RunOutcome};
 use crate::smp::queues::{Acquired, Queues};
 use crate::smp::stats::WorkerCounters;
 use crate::smp::SharedProcessTable;
@@ -160,6 +168,9 @@ pub(crate) struct Worker<R: ProcessRunner + Send + 'static> {
     index: usize,
     /// The per-slice reduction budget.
     reductions: u32,
+    /// The maximum number of reductions run per table-lock acquisition (see
+    /// [`crate::scheduler::DEFAULT_LOCK_QUANTUM`]).
+    lock_quantum: u32,
     /// The shared process table.
     table: Arc<SharedProcessTable>,
     /// The shared queue array.
@@ -181,6 +192,7 @@ impl<R: ProcessRunner + Send + 'static> Worker<R> {
     pub(crate) fn new(
         index: usize,
         reductions: u32,
+        lock_quantum: u32,
         table: Arc<SharedProcessTable>,
         queues: Arc<Queues>,
         signals: Arc<PoolSignals>,
@@ -192,6 +204,7 @@ impl<R: ProcessRunner + Send + 'static> Worker<R> {
         Worker {
             index,
             reductions,
+            lock_quantum,
             table,
             queues,
             signals,
@@ -222,20 +235,18 @@ impl<R: ProcessRunner + Send + 'static> Worker<R> {
                 Acquired::Pid(pid) => {
                     counter.set_active(true);
                     buf.clear();
-                    {
-                        // Hold the table lock only for the slice; every requeue the helpers make
-                        // is buffered here, never enqueued while this guard is held.
-                        let mut table = self.table.lock();
-                        if let Err(error) = run_one(
-                            pid,
-                            &mut table,
-                            &mut self.runner,
-                            self.reductions,
-                            |p, priority| buf.push((p, priority)),
-                        ) {
-                            record_error(&self.errors, error);
-                        }
-                        drain_woken_into(&mut table, |p, priority| buf.push((p, priority)));
+                    // Run the slice as several quanta, re-acquiring the table lock between them
+                    // (never a queue lock while it is held); every requeue the helpers make is
+                    // buffered in `buf`.
+                    if let Err(error) = run_locked_quanta(
+                        &self.table,
+                        pid,
+                        &mut self.runner,
+                        self.reductions,
+                        self.lock_quantum,
+                        |p, priority| buf.push((p, priority)),
+                    ) {
+                        record_error(&self.errors, error);
                     }
                     counter.record_slice();
                     // Requeue the yielded pid(s) *before* decrementing the in-flight count:
@@ -291,6 +302,80 @@ impl<R: ProcessRunner + Send + 'static> Worker<R> {
 
         managed.set_active(false);
         counter.set_active(false);
+    }
+}
+
+/// Runs one slice of the already-dequeued `pid` while holding the process-table lock for at most
+/// `quantum` reductions at a time.
+///
+/// The slice is [`slice_begin`] (schedule-in) → one runner call per quantum, each under its own
+/// lock acquisition → [`slice_end`] (schedule-out) with the final outcome. The process keeps its
+/// whole `budget` and stays out of the run queue for the entire slice; only the *lock* is released
+/// between quanta, so a delivery/signal/another scheduler's slice is serviced without waiting for
+/// the whole slice to finish.
+///
+/// Between two quanta the process is in no run queue, is still `Running` and is counted in-flight
+/// by its worker, so no other scheduler can pick it up (every wake-sweep guard requires the state
+/// to be `Runnable`). A peer may however **terminate** it (a link exit, an `exit/2`, a monitor on a
+/// dying peer) — its links/monitors are resolved under that same lock — so every quantum re-checks
+/// that the pid is still in the table and stops the slice when it is gone.
+///
+/// # Errors
+///
+/// Propagates the schedule-in/schedule-out, signal-servicing, runner and termination errors.
+fn run_locked_quanta<R, F>(
+    table: &SharedProcessTable,
+    pid: ProcessId,
+    runner: &mut R,
+    budget: u32,
+    quantum: u32,
+    mut enqueue: F,
+) -> Result<()>
+where
+    R: ProcessRunner,
+    F: FnMut(ProcessId, Priority),
+{
+    let quantum = quantum.max(1);
+    let mut remaining = budget.max(1);
+
+    // Schedule-in (mark the process executing + apply its queued signals), then absorb whatever
+    // wake the servicing produced. Nothing to run when the pid vanished or the signals killed it.
+    let ready = {
+        let mut guard = table.lock();
+        let ready = slice_begin(pid, &mut guard)?;
+        drain_woken_into(&mut guard, &mut enqueue);
+        ready
+    };
+    if !ready {
+        return Ok(());
+    }
+
+    loop {
+        let chunk = remaining.min(quantum);
+        let outcome = {
+            let mut guard = table.lock();
+            if !guard.contains(pid) {
+                // Terminated by a peer while the lock was released between quanta.
+                return Ok(());
+            }
+            let outcome = runner.run(pid, &mut guard, chunk)?;
+            drain_woken_into(&mut guard, &mut enqueue);
+            outcome
+        };
+
+        match outcome {
+            // Still inside the slice: run another quantum under a fresh lock acquisition.
+            RunOutcome::Yield if remaining > chunk => remaining -= chunk,
+            // The slice is over: apply the outcome (requeue at the process's own priority on a
+            // yield, leave the queue on wait/suspend, terminate on exit), then refresh the wake
+            // list one last time.
+            outcome => {
+                let mut guard = table.lock();
+                slice_end(pid, &mut guard, outcome, &mut enqueue)?;
+                drain_woken_into(&mut guard, &mut enqueue);
+                return Ok(());
+            }
+        }
     }
 }
 

@@ -52,6 +52,28 @@ use crate::run_queue::{Priority, RunQueue};
 /// `CONTEXT_REDS`).
 pub const DEFAULT_REDUCTIONS_PER_SLICE: u32 = 4000;
 
+/// The default maximum number of reductions a parked-table scheduler runs **while holding the
+/// process-table lock** (see [`crate::smp`]).
+///
+/// The SMP pool splits a slice's reduction budget into quanta of at most this many reductions and
+/// **releases the table lock between quanta**, so another process (or a cross-thread send / timer /
+/// dirty completion) can make progress *inside* another process's slice instead of waiting for the
+/// whole slice to finish. The slice semantics are unchanged — the process keeps its own 4000
+/// reduction budget, stays out of the run queue for the whole slice, and is requeued exactly once,
+/// at its own priority — only the duration of one lock hold is bounded.
+///
+/// A runner that exhausts the budget it is handed (the real execution engine) therefore behaves
+/// exactly as before; the only new nuance is that a runner returning `Yield` **before** spending
+/// its quantum is continued within the same slice instead of being requeued (the pool cannot
+/// observe how much of a quantum a runner consumed — see
+/// `crate::smp::worker::run_locked_quanta`).
+///
+/// The trade-off is the number of lock acquisitions per slice (a slice of
+/// [`DEFAULT_REDUCTIONS_PER_SLICE`] costs `ceil(4000 / 256) = 16` acquisitions instead of one): an
+/// uncontended `parking_lot` lock is a handful of instructions, so the cost is negligible next to
+/// the contention it removes.
+pub const DEFAULT_LOCK_QUANTUM: u32 = 256;
+
 /// What happened during one reduction slice.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RunOutcome {
@@ -227,8 +249,14 @@ impl Scheduler {
 /// Runs the already-dequeued process `pid` through one reduction slice and applies the
 /// outcome, calling `enqueue(pid, priority)` to requeue it on a yield.
 ///
-/// Returns `Ok(Some(outcome))`, or `Ok(None)` when servicing the process's pending
-/// signals terminated it (it never ran). Callers own slice accounting and the wake sweep.
+/// Returns `Ok(Some(outcome))`, or `Ok(None)` when there was nothing to run (the pid was
+/// terminated concurrently, or servicing its pending signals terminated it). Callers own slice
+/// accounting and the wake sweep.
+///
+/// The slice is [`slice_begin`] → one runner call for the whole `reductions` budget → [`slice_end`].
+/// The SMP pool instead runs [`slice_begin`], *several* runner calls (each under its own lock
+/// acquisition — see [`DEFAULT_LOCK_QUANTUM`]) and one [`slice_end`]; both fronts therefore share
+/// the exact slice semantics.
 ///
 /// # Parameters
 ///
@@ -254,10 +282,37 @@ where
     R: ProcessRunner,
     F: FnMut(ProcessId, Priority),
 {
+    if !slice_begin(pid, table)? {
+        return Ok(None);
+    }
+    let outcome = runner.run(pid, table, reductions)?;
+    slice_end(pid, table, outcome, &mut enqueue)?;
+    Ok(Some(outcome))
+}
+
+/// The **schedule-in** step of one slice: take `pid` off the run queue (it is executing now) and
+/// apply the signals queued for it (exit signals, monitor-DOWNs).
+///
+/// Returns `Ok(true)` when the process is ready to run and `Ok(false)` when there is nothing to
+/// run: the pid was concurrently terminated between the dequeue and this lock, or servicing its
+/// signals terminated it.
+///
+/// This is the process-table half of [`run_one`], factored out so the SMP pool can run a slice as
+/// several **quanta** (one lock acquisition each) without duplicating the slice semantics. The
+/// paired schedule-out half is [`slice_end`].
+///
+/// # Errors
+///
+/// Propagates the signal-servicing errors.
+pub(crate) fn slice_begin(pid: ProcessId, table: &mut ProcessTable) -> Result<bool> {
     // The process is off the queue and executing.
-    if let Some(process) = table.get_mut(pid) {
-        process.flags_mut().set_in_run_queue(false);
-        process.set_state(ProcessState::Running);
+    match table.get_mut(pid) {
+        Some(process) => {
+            process.flags_mut().set_in_run_queue(false);
+            process.set_state(ProcessState::Running);
+        }
+        // Terminated between the dequeue and this lock: nothing to run.
+        None => return Ok(false),
     }
 
     // Schedule-in: apply any signals queued for the process (exit signals, monitor-DOWNs)
@@ -265,12 +320,25 @@ where
     // executing (see the crate `CONTEXT.md`) finally lands. Servicing may terminate the
     // process, in which case there is nothing to run.
     table.service_signals(pid)?;
-    if !table.contains(pid) {
-        return Ok(None);
-    }
+    Ok(table.contains(pid))
+}
 
-    let outcome = runner.run(pid, table, reductions)?;
-
+/// The **schedule-out** step of one slice: apply `outcome`.
+///
+/// `enqueue(pid, priority)` is called only on [`RunOutcome::Yield`], with the process's priority
+/// read **after** the slice (so a `process_flag(priority, …)` the runner just performed is
+/// honored). A `Wait`/`Suspend` outcome leaves the queue (the runner owns the state transition)
+/// and an `Exit` terminates the process, propagating to its links and monitors.
+///
+/// # Errors
+///
+/// Propagates the termination errors.
+pub(crate) fn slice_end<F: FnMut(ProcessId, Priority)>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    outcome: RunOutcome,
+    mut enqueue: F,
+) -> Result<()> {
     match outcome {
         RunOutcome::Yield => {
             // Still runnable: back to the tail of its own priority's queue. The priority
@@ -295,8 +363,7 @@ where
             table.terminate(pid, reason)?;
         }
     }
-
-    Ok(Some(outcome))
+    Ok(())
 }
 
 /// Turns the table's pending wakes into run-queue entries via `enqueue`, returning how many

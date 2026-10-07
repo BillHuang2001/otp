@@ -92,6 +92,12 @@ fn wait_runner(counter: &Arc<AtomicUsize>) -> impl Fn(usize) -> WaitRunner + Sen
 // ---------------------------------------------------------------------------------------------
 
 /// Slices each process yields for before it blocks (test 1).
+///
+/// A `Yield` ends a **quantum**, not the slice: this runner consumes only a fraction of each
+/// quantum, so all `YIELDS + 1` invocations happen inside **one** slice (the pool would requeue it
+/// only after its 4000-reduction slice budget were spent). The per-pid invocation count therefore
+/// still pins the requeue/continue path, while `stats().slices` pins one popped-pid iteration per
+/// process.
 const YIELDS: u32 = 3;
 /// Processes spawned in test 1.
 const PROGRESS_PIDS: usize = 200;
@@ -199,7 +205,10 @@ fn two_hundred_processes_progress_on_one_scheduler() {
         total, expected,
         "each of the {PROGRESS_PIDS} processes ran yields+1 times"
     );
-    assert_eq!(slices, expected, "one recorded slice per run");
+    assert_eq!(
+        slices, PROGRESS_PIDS as u64,
+        "each process's whole (short) work fits in one slice: the yields are quanta of it"
+    );
 }
 
 #[test]
@@ -210,7 +219,10 @@ fn two_hundred_processes_progress_on_four_schedulers() {
         total, expected,
         "each of the {PROGRESS_PIDS} processes ran yields+1 times"
     );
-    assert_eq!(slices, expected, "one recorded slice per run");
+    assert_eq!(
+        slices, PROGRESS_PIDS as u64,
+        "each process's whole (short) work fits in one slice: the yields are quanta of it"
+    );
 }
 
 // ---------------------------------------------------------------------------------------------
