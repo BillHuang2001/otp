@@ -596,22 +596,12 @@ fn allocator_value(value: beam_alloc::stats::InfoValue) -> Result<InfoValue> {
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Shared fixtures for the `info` family modules' unit tests.
-    use beam_term::AtomTable;
-
-    use crate::boot::seed_core_atoms;
     use crate::config::RuntimeConfig;
     use crate::runtime::Runtime;
 
     /// A default runtime (`sleep`-free; nothing is executed).
     pub(crate) fn runtime() -> Runtime {
         Runtime::new(RuntimeConfig::default()).expect("the default runtime")
-    }
-
-    /// An atom table seeded with the full boot seed (which interns [`super::INFO_ATOMS`]).
-    pub(crate) fn seeded_atoms() -> AtomTable {
-        let mut atoms = AtomTable::new();
-        seed_core_atoms(&mut atoms);
-        atoms
     }
 }
 
