@@ -115,6 +115,8 @@ C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with th
 - `../native.rs` → the dispatch table + the `erlang`-core items and shared helpers (read for the
   served set; edit there to add an arm)
 - `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`) + its unit tests
+- `prim.rs` → the `prim_file` floor (`prim_file_call`) + its unit tests (the path encoder and the
+  `errno`→atom table)
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
 - `process.rs` / `memory.rs` / `port.rs` → the process/registry/reference, GC-introspection and
   port-write surfaces (contracts A.4/A.8)
