@@ -1,24 +1,27 @@
 //! GC-strategy configuration: [`GcConfig`] selects the mature-generation strategy on
-//! top of the heap-size [`HeapPolicy`].
+//! top of the heap-size [`HeapPolicy`], and [`MatureSelection`] says *how* it is selected —
+//! by the measurement-derived automatic rule (the default) or by an explicit user override.
 //!
-//! **The default is [`MatureKind::Copying`]** — the existing barrier-free Cheney
-//! copying mature space, i.e. exactly today's behaviour. [`MatureKind::Immix`] names
+//! **The default selection is [`MatureSelection::Auto`]**, so a `GcConfig::default()` asks
+//! the automatic rule ([`crate::selection`]) to pick between the copying mature space and
 //! the measurement-gated **GenImmix** mark-region mature generation
-//! (`../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D); it is an *option*, **OFF by default**,
-//! and per §D/§H it may only be adopted once measurements justify it. This module
-//! therefore changes no behaviour by itself: it is a purely additive seam that lets a
-//! caller state which mature strategy it wants.
+//! (`../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D) from the mature generation's size. For the
+//! default policy that rule resolves to [`MatureKind::Copying`](crate::config::MatureKind)
+//! (233 words, well under the break-even), so `GcConfig::default()` still reproduces today's
+//! collector exactly. [`MatureSelection::Explicit`] pins a strategy regardless of size.
 //!
 //! Scope: safe Rust, no term-layout knowledge, no dependency on the collector — only
-//! [`crate::policy::HeapPolicy`]. Nothing here is used by [`crate::Collector`] yet;
-//! the copying path remains the live one.
+//! [`crate::policy::HeapPolicy`] and the rule in [`crate::selection`]. The resolved decision
+//! is inspectable through [`GcConfig::mature_choice`].
 
 use crate::policy::HeapPolicy;
+use crate::selection::{resolve_mature, MatureChoice};
 
-/// Which mature-generation strategy a [`GcConfig`] selects.
+/// Which mature-generation strategy a configuration can select.
 ///
 /// The default is [`MatureKind::Copying`] (implemented explicitly, not via variant
-/// order).
+/// order). This is the *strategy*; whether it is chosen by the rule or pinned by the caller
+/// is [`MatureSelection`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum MatureKind {
     /// The **existing** barrier-free Cheney copying mature space: a minor collection
@@ -27,8 +30,8 @@ pub enum MatureKind {
     /// and default — behaviour of [`crate::Collector`].
     Copying,
     /// The **measurement-gated** GenImmix mark-region mature generation
-    /// (`../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D). Rejected from the critical path:
-    /// OFF by default, and only ever selectable once measurement justifies it (§H).
+    /// (`../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D). Selected automatically only for a
+    /// large, long-lived mature generation (see [`crate::selection`]); OFF by default.
     Immix,
 }
 
@@ -39,51 +42,92 @@ impl Default for MatureKind {
     }
 }
 
-/// The GC strategy: the heap-size [`HeapPolicy`] plus the [`MatureKind`] to use for
-/// the mature generation.
+/// How a [`GcConfig`] chooses between the two [`MatureKind`]s.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MatureSelection {
+    /// Let the **automatic rule** decide from the mature generation's configured size
+    /// ([`crate::selection::IMMIX_BREAK_EVEN_WORDS`]). The default.
+    Auto,
+    /// Use exactly this strategy whatever the heap size — an explicit user override that
+    /// beats the automatic rule in both directions.
+    Explicit(MatureKind),
+}
+
+impl MatureSelection {
+    /// An explicit selection of `kind`.
+    pub fn explicit(kind: MatureKind) -> MatureSelection {
+        MatureSelection::Explicit(kind)
+    }
+}
+
+impl Default for MatureSelection {
+    /// The selection used when none is requested: the automatic rule ([`Self::Auto`]).
+    fn default() -> Self {
+        MatureSelection::Auto
+    }
+}
+
+/// The GC strategy: the heap-size [`HeapPolicy`] plus the [`MatureSelection`] that decides
+/// the mature-generation strategy.
 ///
-/// Defaults to `HeapPolicy::default()` + [`MatureKind::Copying`], so a
-/// `GcConfig::default()` reproduces today's collector exactly.
+/// The default is `HeapPolicy::default()` + [`MatureSelection::Auto`], which resolves to
+/// [`MatureKind::Copying`] for that policy — i.e. a `GcConfig::default()` reproduces today's
+/// collector exactly.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GcConfig {
     /// The heap-size policy (growth/shrink bounds, fullsweep cadence, initial sizes).
     pub policy: HeapPolicy,
-    /// The mature-generation strategy. Copying unless explicitly requested otherwise.
-    pub mature: MatureKind,
+    /// How the mature-generation strategy is chosen: the automatic rule (`Auto`, the
+    /// default) or an explicit pin (`Explicit`).
+    pub selection: MatureSelection,
 }
 
 impl GcConfig {
-    /// A configuration using `policy` with the default (copying) mature generation.
+    /// A configuration using `policy` with the **default selection** — the automatic rule.
     ///
-    /// Same as [`GcConfig::copying`].
+    /// Same as [`GcConfig::auto`].
     pub fn new(policy: HeapPolicy) -> GcConfig {
-        GcConfig::copying(policy)
+        GcConfig::auto(policy)
     }
 
-    /// A configuration using `policy` with the **copying** mature generation (the
-    /// default, current behaviour).
+    /// A configuration using `policy` with the **automatic rule** deciding the mature
+    /// strategy from the mature generation's size.
+    pub fn auto(policy: HeapPolicy) -> GcConfig {
+        GcConfig {
+            policy,
+            selection: MatureSelection::Auto,
+        }
+    }
+
+    /// A configuration using `policy` with the **copying** mature generation **pinned**
+    /// (an explicit override of the automatic rule).
     pub fn copying(policy: HeapPolicy) -> GcConfig {
         GcConfig {
             policy,
-            mature: MatureKind::Copying,
+            selection: MatureSelection::Explicit(MatureKind::Copying),
         }
     }
 
-    /// A configuration using `policy` with the **GenImmix** mature generation
-    /// (measurement-gated; not on the default path).
+    /// A configuration using `policy` with the **GenImmix** mature generation **pinned**
+    /// (an explicit override of the automatic rule).
     pub fn immix(policy: HeapPolicy) -> GcConfig {
         GcConfig {
             policy,
-            mature: MatureKind::Immix,
+            selection: MatureSelection::Explicit(MatureKind::Immix),
         }
     }
 
-    /// Overrides the mature-generation strategy.
-    pub fn with_mature(self, kind: MatureKind) -> GcConfig {
+    /// Overrides how the mature-generation strategy is chosen.
+    pub fn with_selection(self, selection: MatureSelection) -> GcConfig {
         GcConfig {
             policy: self.policy,
-            mature: kind,
+            selection,
         }
+    }
+
+    /// Pins the mature-generation strategy, overriding the automatic rule.
+    pub fn with_mature(self, kind: MatureKind) -> GcConfig {
+        self.with_selection(MatureSelection::Explicit(kind))
     }
 
     /// The configured heap-size policy.
@@ -91,22 +135,36 @@ impl GcConfig {
         &self.policy
     }
 
-    /// The configured mature-generation strategy.
+    /// How the mature-generation strategy is chosen (the raw setting).
+    pub fn selection(&self) -> MatureSelection {
+        self.selection
+    }
+
+    /// The strategy this configuration **resolves to** — the caller's explicit pin when one
+    /// was set, otherwise the automatic rule's verdict on the configured mature generation.
     pub fn mature(&self) -> MatureKind {
-        self.mature
+        self.mature_choice().kind
+    }
+
+    /// The full resolved choice: the strategy, whether the rule or the caller chose it, the
+    /// mature generation's size and the rule's break-even. The inspectable form of the
+    /// decision.
+    pub fn mature_choice(&self) -> MatureChoice {
+        resolve_mature(self)
     }
 }
 
 impl Default for GcConfig {
-    /// The default configuration: `HeapPolicy::default()` + [`MatureKind::Copying`].
-    fn default() -> Self {
-        GcConfig::copying(HeapPolicy::default())
+    /// The default configuration: `HeapPolicy::default()` + the automatic selection, which
+    /// resolves to the copying path for that policy.
+    fn default() -> GcConfig {
+        GcConfig::new(HeapPolicy::default())
     }
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::selection::{MatureSource, IMMIX_BREAK_EVEN_WORDS};
 
     #[test]
     fn mature_kind_default_is_copying_explicitly() {
@@ -118,21 +176,45 @@ mod tests {
     }
 
     #[test]
-    fn gc_config_default_is_copying_with_the_default_policy() {
+    fn mature_selection_defaults_to_the_automatic_rule() {
+        assert_eq!(MatureSelection::default(), MatureSelection::Auto);
+        assert_ne!(
+            MatureSelection::default(),
+            MatureSelection::Explicit(MatureKind::Copying)
+        );
+    }
+
+    #[test]
+    fn gc_config_default_is_automatic_and_resolves_to_copying() {
         let config = GcConfig::default();
+        // The *selection* is the automatic rule ...
+        assert_eq!(config.selection(), MatureSelection::Auto);
+        assert_eq!(
+            config.mature_choice().source,
+            MatureSource::Automatic,
+            "the default asks the rule"
+        );
+        // ... which picks the copying path for the default (233-word) mature generation.
         assert_eq!(config.mature(), MatureKind::Copying);
         assert_eq!(config.policy(), &HeapPolicy::default());
         assert_eq!(config, GcConfig::new(HeapPolicy::default()));
     }
 
     #[test]
-    fn new_and_copying_agree_and_select_copying() {
+    fn new_is_auto_and_copying_pins_copying() {
         let policy = HeapPolicy::from_min_max(233, 100_000);
         let new = GcConfig::new(policy.clone());
+        let auto = GcConfig::auto(policy.clone());
         let copying = GcConfig::copying(policy.clone());
-        assert_eq!(new, copying);
+        assert_eq!(new, auto, "`new` is the automatic selection");
+        assert_ne!(new, copying, "`copying` pins the strategy");
         assert_eq!(new.mature(), MatureKind::Copying);
-        assert_eq!(copying.mature, MatureKind::Copying);
+        assert_eq!(copying.mature(), MatureKind::Copying);
+        assert_eq!(new.selection(), MatureSelection::Auto);
+        assert_eq!(
+            copying.selection(),
+            MatureSelection::Explicit(MatureKind::Copying)
+        );
         assert_eq!(new.policy, policy);
     }
 
@@ -141,14 +223,30 @@ mod tests {
         let policy = HeapPolicy::from_min_max(100, 1_000);
         let immix = GcConfig::immix(policy.clone());
         assert_eq!(immix.mature(), MatureKind::Immix);
-        assert_eq!(immix.mature, MatureKind::Immix);
+        assert_eq!(immix.selection(), MatureSelection::Explicit(MatureKind::Immix));
 
-        // The builder converts either starting point, and only the strategy changes.
+        // The builder converts either starting point; only the selection changes.
         let upgraded = GcConfig::copying(policy.clone()).with_mature(MatureKind::Immix);
         assert_eq!(upgraded, immix);
         let downgraded = immix.clone().with_mature(MatureKind::Copying);
         assert_eq!(downgraded, GcConfig::copying(policy.clone()));
         assert_eq!(downgraded.policy, policy);
+    }
+
+    #[test]
+    fn with_selection_overrides_the_automatic_rule() {
+        let big = HeapPolicy {
+            initial_mature_words: IMMIX_BREAK_EVEN_WORDS * 8,
+            ..HeapPolicy::default()
+        };
+        // The rule would pick Immix; pinning Copying must win, and be reported as an override.
+        let pinned = GcConfig::auto(big).with_selection(MatureSelection::Explicit(MatureKind::Copying));
+        assert_eq!(pinned.mature(), MatureKind::Copying);
+        assert!(pinned.mature_choice().is_override());
+        // Going back to automatic restores the rule's verdict.
+        let auto = pinned.with_selection(MatureSelection::Auto);
+        assert_eq!(auto.mature(), MatureKind::Immix);
+        assert!(!auto.mature_choice().is_override());
     }
 
     #[test]
@@ -171,7 +269,8 @@ mod tests {
         assert_eq!(config.policy.min_bin_vheap_words, 46_422);
         assert_eq!(config.policy.initial_young_words, 51);
         assert_eq!(config.policy.initial_mature_words, 90);
-        assert_eq!(config.policy.need_reserve_words, 128);    }
+        assert_eq!(config.policy.need_reserve_words, 128);
+    }
 
     #[test]
     fn clone_and_partial_eq_behave() {
@@ -180,15 +279,20 @@ mod tests {
         assert_eq!(config, copy);
         // The clone is independent: mutating it does not touch the original.
         let mut mutated = copy;
-        mutated.mature = MatureKind::Copying;
+        mutated.selection = MatureSelection::Explicit(MatureKind::Copying);
         assert_ne!(config, mutated);
-        assert_eq!(config.mature, MatureKind::Immix);
-        assert_eq!(mutated.mature, MatureKind::Copying);
+        assert_eq!(config.mature(), MatureKind::Immix);
+        assert_eq!(mutated.mature(), MatureKind::Copying);
 
         // Differing only in the strategy is still an inequality.
         assert_ne!(
             GcConfig::copying(HeapPolicy::default()),
             GcConfig::immix(HeapPolicy::default())
+        );
+        // The automatic selection differs from either pin, at the same policy.
+        assert_ne!(
+            GcConfig::auto(HeapPolicy::default()),
+            GcConfig::copying(HeapPolicy::default())
         );
         // As is differing only in the policy.
         assert_ne!(
@@ -204,5 +308,6 @@ mod tests {
         assert_eq!(kind.clone(), kind);
         assert_eq!(format!("{kind:?}"), "Immix");
         assert_eq!(format!("{:?}", MatureKind::Copying), "Copying");
+        assert_eq!(format!("{:?}", MatureKind::default()), "Copying");
     }
 }

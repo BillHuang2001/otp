@@ -11,9 +11,12 @@
 //! `x_reg_array[0..Live)` plus the whole stack, with **no frame liveness maps**.
 //! MMTk and Boehm are rejected; GenImmix is a measurement-gated mature-generation
 //! option only. [`GenImmixCollector`] is the integrated, config-selectable form of that
-//! option (copying nursery + mark-region mature), and [`AnyCollector`] dispatches between
+//! option (copying nursery + mark-region mature), [`AnyCollector`] dispatches between
 //! it and the default copying [`Collector`] on the configured
-//! [`MatureKind`](config::MatureKind).
+//! [`MatureKind`](config::MatureKind), and [`selection`] is the **measurement-derived
+//! automatic rule** that chooses between them from the mature generation's size — the
+//! default selection — with [`MatureSelection::Explicit`](config::MatureSelection::Explicit)
+//! as the user override.
 //!
 //! Implements the GC half of Part II §D and the Stage-4 row of Part II §H; the
 //! legacy `erts/emulator/beam/erl_gc.c` + `copy.c` are the ground-truth behaviour.
@@ -35,6 +38,7 @@ pub mod immix;
 pub mod immix_collector;
 pub mod mso;
 pub mod policy;
+pub mod selection;
 pub mod space;
 pub mod stats;
 
@@ -48,6 +52,7 @@ pub use crate::immix::*;
 pub use crate::immix_collector::*;
 pub use crate::mso::*;
 pub use crate::policy::*;
+pub use crate::selection::*;
 pub use crate::space::*;
 pub use crate::stats::*;
 
@@ -63,6 +68,7 @@ pub mod prelude {
     pub use crate::immix_collector::*;
     pub use crate::mso::*;
     pub use crate::policy::*;
+    pub use crate::selection::*;
     pub use crate::space::*;
     pub use crate::stats::*;
 }

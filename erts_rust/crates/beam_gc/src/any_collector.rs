@@ -2,11 +2,11 @@
 //!
 //! A thin wrapper that lets a caller (and a test) drive the **same** corpus through either
 //! mature-generation strategy behind one API: [`crate::Collector`] for
-//! [`MatureKind::Copying`](crate::config::MatureKind::Copying) (the default, today's
-//! behaviour) and [`GenImmixCollector`] for
-//! [`MatureKind::Immix`](crate::config::MatureKind::Immix) (the measurement-gated
-//! mark-region option). [`AnyCollector::from_config`] is the dispatcher; the remaining
-//! methods forward to whichever strategy was selected.
+//! [`MatureKind::Copying`](crate::config::MatureKind::Copying) and [`GenImmixCollector`] for
+//! [`MatureKind::Immix`](crate::config::MatureKind::Immix). [`AnyCollector::from_config`] is
+//! the dispatcher, and it dispatches on the configuration's **resolved** choice: an
+//! explicit pin, or the measurement-derived automatic rule of [`crate::selection`] (the
+//! default). The remaining methods forward to whichever strategy was selected.
 //!
 //! This module owns no collection logic — it exists so the two strategies stay
 //! interchangeable without either depending on the other.
@@ -19,6 +19,7 @@ use crate::config::{GcConfig, MatureKind};
 use crate::heap_info::HeapObservable;
 use crate::immix_collector::GenImmixCollector;
 use crate::policy::HeapPolicy;
+use crate::selection::MatureChoice;
 use crate::space::HeapSpace;
 use crate::stats::GcStats;
 /// A collector whose mature-generation strategy is chosen at construction time.
@@ -34,8 +35,11 @@ pub enum AnyCollector {
 }
 
 impl AnyCollector {
-    /// Builds the collector `config` selects: [`MatureKind::Copying`] → [`Collector`]
-    /// (the default), [`MatureKind::Immix`] → [`GenImmixCollector`].
+    /// Builds the collector `config` **resolves to**: [`GcConfig::mature`] picks
+    /// [`MatureKind::Copying`] → [`Collector`], [`MatureKind::Immix`] →
+    /// [`GenImmixCollector`]. That resolution is the caller's explicit pin when one was set
+    /// and otherwise the automatic rule's verdict on the configured mature generation
+    /// ([`crate::selection`]).
     pub fn from_config(config: &GcConfig) -> Result<AnyCollector> {
         match config.mature() {
             MatureKind::Copying => Ok(AnyCollector::Copying(Collector::new(config.policy().clone())?)),
@@ -51,6 +55,16 @@ impl AnyCollector {
         }
     }
 
+    /// The resolved mature-generation choice this collector runs, for inspection: the
+    /// strategy, whether it came from the automatic rule or an explicit override, and the
+    /// sizes the decision used.
+    ///
+    /// The `source` is recovered by comparing the resolved strategy with the rule's verdict
+    /// on the mature generation — see [`crate::selection::choice_for`]. Use
+    /// [`GcConfig::mature_choice`] when the exact source matters.
+    pub fn mature_choice(&self) -> MatureChoice {
+        crate::selection::choice_for(self.kind(), self.policy().initial_mature_words)
+    }
     /// The collector's heap-size policy.
     pub fn policy(&self) -> &HeapPolicy {
         match self {
@@ -158,6 +172,11 @@ mod tests {
         assert_eq!(any.kind(), MatureKind::Copying);
         assert!(matches!(any, AnyCollector::Copying(_)));
         assert_eq!(any.policy(), &HeapPolicy::default());
+        // The choice is observable on the built collector, and it names the rule.
+        let choice = any.mature_choice();
+        assert_eq!(choice.kind, MatureKind::Copying);
+        assert_eq!(choice.source, crate::selection::MatureSource::Automatic);
+        assert_eq!(choice.mature_words, 233);
     }
 
     #[test]
@@ -167,5 +186,22 @@ mod tests {
         assert_eq!(any.kind(), MatureKind::Immix);
         assert!(matches!(any, AnyCollector::Immix(_)));
         assert_eq!(any.policy(), config.policy());
+        // An explicit Immix pin under the break-even is reported as an override.
+        assert!(any.mature_choice().is_override());
+    }
+
+    #[test]
+    fn the_automatic_rule_selects_the_strategy_from_the_mature_size() {
+        let big = HeapPolicy {
+            initial_mature_words: crate::selection::IMMIX_BREAK_EVEN_WORDS,
+            ..HeapPolicy::default()
+        };
+        let any = AnyCollector::from_config(&GcConfig::auto(big)).expect("collector");
+        assert_eq!(any.kind(), MatureKind::Immix);
+        assert!(matches!(any, AnyCollector::Immix(_)));
+        assert_eq!(
+            any.mature_choice().source,
+            crate::selection::MatureSource::Automatic
+        );
     }
 }
