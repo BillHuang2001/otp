@@ -92,6 +92,8 @@ A **second** family is read outside `initial_argv_massage` — by the emulator's
 * the asymmetry is the oracle's: `+Q` **validates** (and rejects out-of-range), `ERL_MAX_PORTS` **clamps silently**.
 `parse` stays pure — it never reads an environment, so it always yields `ErlEnv::default()`; only `parse_with_env` fills `env_vars` (and performs the `+Q` routing).
 **Seam (sibling-owned):** the value becomes *observable* only once `../info.rs` gains a `port_limit` `system_info` key; until then it is preserved in `extra_emulator_flags`, not applied.
+
+## Init arguments (`init:get_argument/1`) — the exact recording rule
 The parser reproduces the oracle's split between emulator/`init` switches and flags:
 * A **`-`-switch** (recognized or not) is recorded as an `InitArgs` occurrence — the source of `init:get_argument/1`.
 * A **`+`-flag** is an **emulator** flag and is **not** recorded (the oracle's `init:get_argument('S'|'Q'|'K'|'A'|'P'|'sbt')` is the bare atom `error`).
