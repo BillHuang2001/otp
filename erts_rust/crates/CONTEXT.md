@@ -314,14 +314,17 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
-- `beam_bifs`'s `ets:info/1` bridge still emits its own 12-field subset instead of
-  `beam_ets::TableInfo::entries` (15 fields), and `records:get_definition/2` remains a typed
-  `unsupported_bif` (it needs the code-server `Recs`-chunk record table, unreachable from
-  `beam_loader`'s `Recs` id today).
-- `wire/new_fun_ext_encode` (encoding a runtime-made `Local` fun) stays `unsupported`; a faithful ETF
-  image needs the module identity/MD5 the inlined descriptor does not carry.
-- `open_port({spawn_executable, ...})` on a nonexistent path diverges: the oracle raises `error:enoent`
-  while `beam_io`'s `SpawnDriver` maps the spawn failure to `BeamError::Io` (a `beam_io`/`beam_rt` fix).
+- `beam_bifs`'s `ets:info/1` now emits the full 15-field oracle order (hand-reproduced, `owner`=`undefined`);
+  `records:get_definition/2` is now implemented via its `RecordSource` seam (no hook ⇒ the oracle's `badarg`).
+- `wire/new_fun_ext_encode` remains `unsupported` *in the gate* because `beam_rt` does not yet supply the
+  `Local`-fun identity; `beam_codec` itself encodes it byte-exactly given a `FunIdentity`.
+- `beam_message` `src/layout.rs` sizes/walks fun blocks with the legacy C `ERL_FUN_SIZE` convention (2-word
+  prefix, env at offset 2) instead of the frozen `beam_term::fun` layout (env at `1 + desc_words(kind)`), so
+  `copy_struct` mis-sizes/mis-fixes a fun crossing a copy boundary (e.g. a `make_fun3` closure in a message);
+  untested. Fix: route funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
+- `open_port` residual divergences (a nonexistent path now raises `error:enoent`, matching the oracle):
+  `{spawn_executable,<dir>}` ⇒ `eacces` vs oracle `ok`; empty `{spawn,""}`/`{spawn_executable,""}` ⇒ `enoent`
+  vs oracle `badarg`.
 - Repo-root owned (outside this node): owed `../../CHANGE.md` entries for the `beam_term` foundation
   extensions (`map`/`bitstring`/`refc`), the `RefCount` move into `beam_alloc` + the `RefcBinary`
   off-heap seam, `beam_gc::OffHeap` owning refc binaries, the `beam_abi` frozen-header seam work, the
