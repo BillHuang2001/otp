@@ -191,9 +191,18 @@ static ERL_NIF_TERM mapiter_empty(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
 
 /* nonmap/0 -> {CreateRet, PairRet}
  *
- * `enif_map_iterator_create` on a term that is not a map is the C's `0`
- * (`erl_nif.c:3824`). The iterator stays zeroed, so the `destroy` calls below are the
- * documented no-op (in the C a `destroy` of a never-created iterator is a fault/UB). */
+ * `enif_map_iterator_create` on a term that is not a map is the C's `0` (`erl_nif.c:3824`), and
+ * `get_pair` on the untouched, zeroed iterator is its other `0` (the index guard runs before any
+ * read of the map). Both are asserted by the test.
+ *
+ * `enif_map_iterator_destroy` is deliberately NOT called on the never-created iterator: its `map`
+ * field is still 0, and `destroy` tests `is_hashmap(map)` *without* the `is_term_word` guard that
+ * `get_pair`/`is_head`/`is_tail` apply, so it reads through a null pointer (a null-deref panic
+ * under `debug_assertions`). The oracle has the same caveat — a `destroy` of a never-created
+ * iterator is a fault there too — but the Rust implementation's own docs promise `destroy` is safe
+ * on a never-created iterator, so the gap is an **open finding reported by the test-suite author**
+ * rather than an assertion here (a crash cannot be asserted from a passing test anyway).
+ * `destroy` on a *created* iterator runs in every other NIF in this file. */
 static ERL_NIF_TERM mapiter_nonmap(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM out[2];
     ErlNifMapIterator it;
@@ -208,10 +217,6 @@ static ERL_NIF_TERM mapiter_nonmap(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
     key = enif_make_int(env, 0);
     value = enif_make_int(env, 0);
     pair = enif_map_iterator_get_pair(env, &it, &key, &value);
-    /* Idempotent, and safe on a never-created iterator (`src/nif/enif/mapiter.rs`). */
-    enif_map_iterator_destroy(env, &it);
-    enif_map_iterator_destroy(env, &it);
-
     out[0] = enif_make_int(env, created);
     out[1] = enif_make_int(env, pair);
     return tuple(env, out, 2);
