@@ -24,7 +24,14 @@ use super::update::{add_counters, object_arity, read_counter, replace_elements};
 /// the key from the object (`crate::key::key_of`) and passes both to the
 /// interior, so the two interiors can share one dispatch surface despite
 /// different shapes. All term ordering/hashing is delegated to `beam_term`.
-pub(crate) trait Interior {
+///
+/// The `Send + Sync` supertraits are what let a [`Table`](super::Table) — and so
+/// a [`SharedTable`](super::SharedTable) — be moved to and shared across OS
+/// threads: an interior holds only terms and node/bucket vectors, and every
+/// *mutating* operation takes `&mut self`, so an interior read through `&self`
+/// performs no writes. Both interiors are plain data structures over `Eterm`
+/// (a `usize` newtype), so the bound holds without any manual `unsafe` impl.
+pub(crate) trait Interior: Send + Sync {
     /// Insert `object` under `key`, applying the kind's duplicate rules
     /// (replace for `set`/`ordered_set`), and report whether the object was
     /// **retained**.

@@ -261,7 +261,9 @@ impl Table {
         match self.store.copy(current) {
             Ok(stored) => {
                 self.interior.insert(key, stored, atoms)?;
-                self.store.free(replaced);
+                // The object it replaced was in the table, so a fixed table defers
+                // its storage like any other removal.
+                self.free_object(replaced);
                 Ok(())
             }
             Err(err) => {

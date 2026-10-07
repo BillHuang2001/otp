@@ -6,7 +6,7 @@ use beam_common::Result;
 use beam_term::prelude::*;
 
 use super::{OwnerId, SetOpt, Table};
-use crate::select::MatchSpec;
+use crate::select::{MatchContinuation, MatchSpec};
 
 /// An access-enforcing view over a [`Table`] for a specific requester process.
 ///
@@ -144,6 +144,17 @@ impl TableAccess<'_> {
     ) -> Result<usize> {
         self.table.check_write(self.requester)?;
         self.table.match_delete(pattern_term, atoms, heap)
+    }
+
+    /// `ets:select_replace/2`, requiring write access (it rewrites the objects).
+    pub fn select_replace(
+        &mut self,
+        spec: &MatchSpec,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<usize> {
+        self.table.check_write(self.requester)?;
+        self.table.select_replace(spec, atoms, heap)
     }
 
     // -------------------------------------------------------------------- reads
@@ -292,6 +303,81 @@ impl TableAccess<'_> {
     pub fn is_empty(&self) -> Result<bool> {
         self.table.check_read(self.requester)?;
         Ok(self.table.is_empty())
+    }
+
+    // --------------------------------------------- limited / continuation forms
+    //
+    // The `/3` forms and their `/1` resumptions are all **reads**: they scan the
+    // table and build results, they never mutate it. They are therefore
+    // read-checked, like `select`/`match`.
+
+    /// `ets:select/3`, requiring read access. `Ok(None)` ⇒ `'$end_of_table'`.
+    pub fn select_limit(
+        &self,
+        spec: &MatchSpec,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_limit(spec, limit, atoms, heap)
+    }
+
+    /// `ets:select/1`, requiring read access.
+    pub fn select_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.select_continue(cont, atoms, heap)
+    }
+
+    /// `ets:match/3`, requiring read access.
+    pub fn match_limit(
+        &self,
+        pattern_term: Eterm,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.match_limit(pattern_term, limit, atoms, heap)
+    }
+
+    /// `ets:match/1`, requiring read access.
+    pub fn match_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.match_continue(cont, atoms, heap)
+    }
+
+    /// `ets:match_object/3`, requiring read access.
+    pub fn match_object_limit(
+        &self,
+        pattern_term: Eterm,
+        limit: usize,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.match_object_limit(pattern_term, limit, atoms, heap)
+    }
+
+    /// `ets:match_object/1`, requiring read access.
+    pub fn match_object_continue(
+        &self,
+        cont: &MatchContinuation,
+        atoms: &AtomTable,
+        heap: &mut Heap,
+    ) -> Result<(Vec<Eterm>, Option<MatchContinuation>)> {
+        self.table.check_read(self.requester)?;
+        self.table.match_object_continue(cont, atoms, heap)
     }
 
     // -------------------------------------------------------------- ownership

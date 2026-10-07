@@ -224,12 +224,14 @@ impl Table {
                     // reclaim the copies taken so far **and** every original before
                     // reporting. (In practice unreachable — a table-owned object is
                     // always a copy of a supported term — but the failure path must
-                    // not leak.)
+                    // not leak.) The copies were never table objects, so they are
+                    // released immediately; the originals were, so a fixed table
+                    // defers them like any other removal.
                     for copy in taken.drain(..) {
                         self.store.free(copy);
                     }
                     for &original in &removed {
-                        self.store.free(original);
+                        self.free_object(original);
                     }
                     return Err(err);
                 }
@@ -241,7 +243,7 @@ impl Table {
             self.store.relinquish(copy);
         }
         for &original in &removed {
-            self.store.free(original);
+            self.free_object(original);
         }
         Ok(taken)
     }

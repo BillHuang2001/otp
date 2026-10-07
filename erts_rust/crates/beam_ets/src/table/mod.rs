@@ -31,10 +31,12 @@ mod element;
 mod interior;
 mod ownership;
 mod read;
+mod shared;
 mod update;
 
 pub use access::TableAccess;
 pub use ownership::{Heir, SetOpt};
+pub use shared::SharedTable;
 pub(crate) use interior::Interior;
 use interior::build_interior;
 pub(crate) use update::{add_counters, counter_slot, replace_elements};
@@ -111,6 +113,15 @@ pub struct Table {
     store: TermStore,
     /// The interior index dispatching the table ops.
     interior: Box<dyn Interior>,
+    /// Whether the table is fixed for safe traversal
+    /// (`ets:safe_fixtable(Tab, true)`). While fixed, the storage of every
+    /// *deleted* object is held in [`Table::deferred_frees`] instead of being
+    /// handed back to the store, so a traversal that still holds a deleted key's
+    /// term never observes reclaimed (and possibly reused) words.
+    fixed: bool,
+    /// The roots deleted while [`Table::fixed`], whose storage is released when
+    /// the table is unfixed (or by `Drop`, through the store).
+    deferred_frees: Vec<Eterm>,
 }
 
 impl Table {
@@ -136,6 +147,8 @@ impl Table {
             heir: None,
             store,
             interior,
+            fixed: false,
+            deferred_frees: Vec::new(),
         })
     }
 
@@ -290,11 +303,15 @@ impl Table {
         if !retained {
             // The interior rejected the copy as a duplicate no-op (a `bag` holding
             // an identical object): no entry references it, so reclaim it instead of
-            // leaving it orphaned in the store.
+            // leaving it orphaned in the store. The copy was never *in* the table, so
+            // it is released even while the table is fixed — no traversal can hold it.
             self.store.free(stored);
         }
         for old in replaced {
-            self.store.free(old);
+            // The replaced object *was* in the table (and its stored key term may be
+            // the very term a fixed traversal is holding), so its storage is deferred
+            // while the table is fixed.
+            self.free_object(old);
         }
         Ok(())
     }
@@ -342,7 +359,7 @@ impl Table {
         let inserted = self.interior.insert_new(stored_key, stored, atoms)?;
         if !inserted {
             // The key already exists, so the interior stored nothing: the copy is
-            // unreferenced and is reclaimed.
+            // unreferenced (never a table object) and is reclaimed immediately.
             self.store.free(stored);
         }
         Ok(inserted)
@@ -356,7 +373,7 @@ impl Table {
         let removed = self.interior.lookup(key, atoms);
         self.interior.delete(key, atoms)?;
         for object in removed {
-            self.store.free(object);
+            self.free_object(object);
         }
         Ok(())
     }
@@ -375,18 +392,84 @@ impl Table {
             .collect();
         self.interior.delete_object(key, object, atoms)?;
         for stored in removed {
-            self.store.free(stored);
+            self.free_object(stored);
         }
         Ok(())
     }
 
     /// Delete every object in the table (`ets:delete_all_objects/1`).
     pub fn delete_all_objects(&mut self) {
-        // `reset` releases every block the store owns (so the per-object runs of
-        // the deleted objects go with them) and leaves the store immediately
+        if self.fixed {
+            // **Fixed-table semantics** (verified against the system `erl`, OTP 29 /
+            // erts-17.1): the objects leave the index — `ets:info(Tab, size)` is `0`
+            // — but their storage stays bundled with the arena a traversal is
+            // walking, so `ets:info(Tab, memory)` does *not* drop until the table is
+            // unfixed. Every stored object is therefore deferred (its storage stays
+            // live and is never handed out again) and the index is rebuilt empty.
+            let objects: Vec<Eterm> = self.interior.iter_objects().collect();
+            self.deferred_frees.extend(objects);
+            self.interior = build_interior(self.opts.kind());
+            return;
+        }
+        // Not fixed: `reset` releases every block the store owns (so the per-object
+        // runs of the deleted objects go with them) and leaves the store immediately
         // usable again; a fresh interior of the same kind is then empty.
         self.store.reset();
         self.interior = build_interior(self.opts.kind());
+    }
+
+    /// `ets:safe_fixtable/2`: set (or clear) the table's *fix* flag.
+    ///
+    /// While fixed, the storage of every object removed from the table is held
+    /// rather than reclaimed, so a traversal that began before the removal can keep
+    /// reading the deleted object's key term without ever seeing reclaimed (or
+    /// reused) words. Clearing the flag releases everything held, which is exactly
+    /// the oracle's observable memory step (verified: memory *rises* by the deleted
+    /// objects' storage while fixed and *falls* at
+    /// `ets:safe_fixtable(Tab, false)`).
+    ///
+    /// The `Bool` argument's type check (`badarg` for a non-boolean) is the BIF
+    /// layer's; this is the parsed effect. Like the oracle it is idempotent: fixing
+    /// an already-fixed table (or clearing an unfixed one) is a no-op.
+    pub fn set_fixation(&mut self, fixed: bool) {
+        if fixed == self.fixed {
+            return;
+        }
+        self.fixed = fixed;
+        if !fixed {
+            // Unfixing releases every held root's storage.
+            let held = core::mem::take(&mut self.deferred_frees);
+            for root in held {
+                self.store.free(root);
+            }
+        }
+    }
+
+    /// Whether the table is currently fixed (`ets:safe_fixtable/2`).
+    pub fn is_fixed(&self) -> bool {
+        self.fixed
+    }
+
+    /// How many removed objects' storage the table is currently holding because it
+    /// is fixed. Zero on an unfixed table; the count drops to zero at
+    /// [`set_fixation`](Table::set_fixation)`(false)`.
+    pub fn deferred_objects(&self) -> usize {
+        self.deferred_frees.len()
+    }
+
+    /// Release the table-owned storage of an object that has just been **removed**
+    /// from the table.
+    ///
+    /// Unfixed, this is an immediate [`TermStore::free`]. Fixed, the root's storage
+    /// is held in [`Table::deferred_frees`] until the table is unfixed, so a
+    /// traversal holding a term that lived inside the removed object cannot observe
+    /// reclaimed words.
+    fn free_object(&mut self, root: Eterm) {
+        if self.fixed {
+            self.deferred_frees.push(root);
+        } else {
+            self.store.free(root);
+        }
     }
 
     /// Whether `requester` may **read** the table; an access violation is

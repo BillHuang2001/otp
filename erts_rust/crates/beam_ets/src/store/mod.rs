@@ -104,6 +104,29 @@ fn block_layout(capacity: usize) -> Result<Layout> {
         .map_err(|_| BeamError::Alloc(AllocFailure::new(AllocKind::Other, capacity)))
 }
 
+/// Whether `term` is a literal this store may **share** (return as-is) rather than
+/// deep-copy.
+///
+/// ETS shares literals instead of duplicating them: the C sizes every copied term
+/// with `litopt`, which skips each literal outside the purge area
+/// (`copy.c:105`/`119`), and takes the same shortcut for the global empty tuple
+/// whatever the option (`copy.c:130-140`, `ERTS_GLOBAL_LIT_EMPTY_TUPLE`).
+///
+/// This store can only *prove* liveness for the **global empty tuple** — the one
+/// literal `beam_term::tuple::tuple0` backs by a leaked, never-reclaimed word.
+/// A literal built in a `beam_term::literal::LiteralArea` is deliberately **not**
+/// shared: that area can be dropped (the C guards exactly this with
+/// `in_literal_purge_area`), and this crate holds no handle that would keep it
+/// alive, so retaining such a pointer in table storage would be a dangling read.
+/// Those literals are deep-copied instead, which is always correct.
+fn is_shareable_literal(term: Eterm) -> bool {
+    // `is_literal` is a bare bit test that is only meaningful on a BOXED/LIST word;
+    // `copy_term` calls this only after ruling out the immediate and header tags,
+    // so `term` is one of those two. Testing it first keeps the (atomic) global
+    // lookup off the common path of every ordinary boxed/list subterm.
+    is_literal(term) && term == tuple0()
+}
+
 /// A per-table bump arena over table-owned term storage with per-object
 /// reclamation.
 ///
@@ -133,6 +156,25 @@ pub struct TermStore {
     /// copy consumed no words (an immediate) owns no storage and is not tracked.
     tracked: HashMap<Eterm, Vec<AllocSlice>>,
 }
+
+// SAFETY: a `TermStore` is a self-contained owner of term storage. Its blocks are
+// allocated through the `AllocRef` it holds, and `beam_alloc::Allocator` is
+// `Send + Sync + 'static` (see `allocator/trait.rs`), so the same store may be
+// moved to another thread (`Send`) and its blocks may be freed from one. The
+// `NonNull<Eterm>` block bases and the `tracked` map are plain data — no
+// thread-affine resource (no TLS handle, no file descriptor, no `Rc`) — so a move
+// simply reinterprets the same addresses on the destination thread.
+unsafe impl Send for TermStore {}
+
+// SAFETY: every `&self` method of `TermStore` (`words`/`blocks`/`memory`) only
+// *reads* the block vector's length/base/capacity bookkeeping; none of them
+// writes a word through a block pointer, and none has interior mutability. Every
+// method that hands out or writes storage (`copy`/`free`/`relinquish`/`reset`)
+// takes `&mut self`, so the borrow checker already serialises them. A shared
+// `&TermStore` therefore performs no data race, which is exactly `Sync`. The
+// term-layout writers that *do* write raw heap words (`term`, `copy`) live
+// elsewhere and are likewise confined to `&mut self` entry points.
+unsafe impl Sync for TermStore {}
 
 impl TermStore {
     /// A store allocating through `alloc`.
@@ -440,6 +482,16 @@ impl TermStore {
             // (this includes the debug `THE_NON_VALUE`). Reject it before any
             // dereference: the C `is_boxed` bit trick is true for this pattern too.
             return Err(crate::error::badarg());
+        }
+        if is_shareable_literal(term) {
+            // A `'static` global literal is **shared, not copied** — exactly what
+            // the C does for `ERTS_GLOBAL_LIT_EMPTY_TUPLE` (`copy.c:130-140`) and,
+            // more generally, for any literal with `litopt` that is not in the
+            // literal purge area (`copy.c:105`/`119`). The global empty tuple is the
+            // *only* literal whose liveness this crate can prove (it is one leaked,
+            // never-reclaimed word — see `beam_term::tuple::tuple0`), so it is the
+            // only one it shares. See [`is_shareable_literal`].
+            return Ok(term);
         }
         if is_list(term) {
             // SAFETY: a `TAG_PRIMARY_LIST` word is a live, 2-word `[CAR, CDR]` cell.
