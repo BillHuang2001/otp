@@ -14,6 +14,7 @@
 use libc::{c_char, c_int, c_void, size_t};
 
 use crate::common::ERTS_NAPI_TIME_ERROR;
+use crate::driver::api::ErlDrvApi;
 use crate::driver::types::{
     ErlDrvBinary, ErlDrvPort, ErlDrvSInt, ErlDrvSizeT, ErlDrvSysInfo, ErlDrvTermData, ErlDrvTime,
     ErlDrvTimeUnit,
@@ -453,6 +454,46 @@ pub unsafe extern "C" fn erl_drv_consume_timeslice(_port: ErlDrvPort, _percent: 
 #[no_mangle]
 pub unsafe extern "C" fn driver_mk_term_nil() -> ErlDrvTermData {
     driver_term_nil
+}
+
+// ---------------------------------------------------------------------------------------------
+// Table assembly (part 1 of the frozen `ErlDrvApi`)
+// ---------------------------------------------------------------------------------------------
+
+/// Populate the **host-free** slots of the frozen `ErlDrvApi` this file implements (part 1).
+///
+/// Called from [`super::DRIVER_API`]'s `populate` chain, so this file — not `mod.rs` — owns the
+/// `Some(…)` list for the functions it defines. Every field is `const`-assignable, so the whole
+/// chain folds at compile time.
+///
+/// Implements: `driver_alloc`/`driver_free`/`driver_realloc`,
+/// `driver_alloc_binary`/`driver_realloc_binary`/`driver_free_binary`, `driver_system_info`,
+/// `null_func`, `erl_errno_id`, `erl_drv_consume_timeslice`, the time trio
+/// (`erl_drv_monotonic_time`/`erl_drv_time_offset`/`erl_drv_convert_time_unit`), the
+/// `driver_dl_open`/`driver_dl_sym`/`driver_dl_close`/`driver_dl_error` quartet,
+/// `erl_drv_putenv`/`erl_drv_getenv` and `driver_mk_term_nil`.
+pub(super) const fn populate(mut api: ErlDrvApi) -> ErlDrvApi {
+    api.driver_alloc = Some(driver_alloc);
+    api.driver_free = Some(driver_free);
+    api.driver_realloc = Some(driver_realloc);
+    api.driver_alloc_binary = Some(driver_alloc_binary);
+    api.driver_realloc_binary = Some(driver_realloc_binary);
+    api.driver_free_binary = Some(driver_free_binary);
+    api.driver_system_info = Some(driver_system_info);
+    api.null_func = Some(null_func);
+    api.erl_errno_id = Some(erl_errno_id);
+    api.erl_drv_consume_timeslice = Some(erl_drv_consume_timeslice);
+    api.erl_drv_monotonic_time = Some(erl_drv_monotonic_time);
+    api.erl_drv_time_offset = Some(erl_drv_time_offset);
+    api.erl_drv_convert_time_unit = Some(erl_drv_convert_time_unit);
+    api.driver_dl_open = Some(driver_dl_open);
+    api.driver_dl_sym = Some(driver_dl_sym);
+    api.driver_dl_close = Some(driver_dl_close);
+    api.driver_dl_error = Some(driver_dl_error);
+    api.erl_drv_putenv = Some(erl_drv_putenv);
+    api.erl_drv_getenv = Some(erl_drv_getenv);
+    api.driver_mk_term_nil = Some(driver_mk_term_nil);
+    api
 }
 
 #[cfg(test)]

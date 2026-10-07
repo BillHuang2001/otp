@@ -22,12 +22,34 @@ use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 use beam_alloc::Heap;
 use beam_term::prelude::{self, Eterm, NIL};
 
+use crate::common::SysIOVec;
 use crate::driver::types::{
-    ErlDrvBinary, ErlDrvEvent, ErlDrvPort, ErlDrvPort_, ErlDrvTermData, ERL_DRV_ATOM,
-    ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_FLOAT, ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST,
-    ERL_DRV_NIL, ERL_DRV_PORT, ERL_DRV_STRING, ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT,
-    ERL_DRV_UINT64,
+    ErlDrvBinary, ErlDrvEvent, ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL, ErlDrvPort, ErlDrvPort_,
+    ErlDrvSInt, ErlDrvTermData, ERL_DRV_ATOM, ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_FLOAT,
+    ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST, ERL_DRV_NIL, ERL_DRV_PORT, ERL_DRV_STRING,
+    ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT, ERL_DRV_UINT64,
 };
+
+/// The reason a driver asks for its port to be closed — the C's whole `driver_failure*` family
+/// (`erts/emulator/beam/io.c`) collapsed into one seam hook ([`DriverHost::failure`]).
+///
+/// The four C entry points differ only in how the reason is expressed, so they model as variants
+/// rather than four hooks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PortFailure<'a> {
+    /// `driver_failure_eof(port)` — the connected process reached end of file.
+    Eof,
+    /// `driver_failure_atom(port, string)` — close with `string` as the reason atom.
+    ///
+    /// The C operand is a NUL-terminated `char *`; this seam carries the name as a `&str` and the
+    /// host interns it, exactly as [`DriverHost::intern_atom`] does for the `ERL_DRV_ATOM`
+    /// term-data operand.
+    Atom(&'a str),
+    /// `driver_failure_posix(port, error)` — close with `{error, <posix reason for the errno>}`.
+    Posix(c_int),
+    /// `driver_failure(port, error)` — close with `{error, <errno>}`.
+    Error(c_int),
+}
 
 /// Services the runtime provides to the `erl_drv_*` implementations of one port.
 pub trait DriverHost {
@@ -99,6 +121,212 @@ pub trait DriverHost {
     /// The pid that opened the port (`driver_caller`), or `None` (default: unsupported).
     fn caller_pid(&mut self, port: ErlDrvPort) -> Option<Eterm> {
         let _ = port;
+        None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Port queue — `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/`driver_peekq[v]`
+    //
+    // The C functions take an `ErlDrvPort`; here the host **is** the port's environment, so these
+    // new hooks take no port operand (the same "own port" convention the `lifecycle`/`pdl`/`queues`
+    // families are specified against). The existing hooks above keep their `ErlDrvPort` operand for
+    // signature stability.
+    // ---------------------------------------------------------------------------------------
+
+    /// Append `data` to the port's output queue (`driver_enq`/`driver_enq_bin`). `is_binary` says
+    /// whether the driver presented those bytes as an `ErlDrvBinary` window rather than a plain
+    /// buffer (the seam hands the host a byte slice either way). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn enq(&mut self, data: &[u8], is_binary: bool) -> c_int {
+        let _ = (data, is_binary);
+        -1
+    }
+
+    /// Prepend `data` to the port's output queue (`driver_pushq`/`driver_pushq_bin`). `is_binary` as
+    /// for [`enq`](DriverHost::enq). `0` = ok, `-1` = fail (default: unsupported).
+    fn pushq(&mut self, data: &[u8], is_binary: bool) -> c_int {
+        let _ = (data, is_binary);
+        -1
+    }
+
+    /// Drop up to `len` bytes from the head of the port's output queue (`driver_deq`). Returns the
+    /// number of bytes actually dropped, or `-1` (default: unsupported).
+    fn deq(&mut self, len: c_int) -> c_int {
+        let _ = len;
+        -1
+    }
+
+    /// The number of bytes queued on the port (`driver_sizeq`), or `-1` (default: unsupported).
+    fn sizeq(&mut self) -> c_int {
+        -1
+    }
+
+    /// A `SysIOVec` view of the head of the port's output queue (`driver_peekq`/`driver_peekqv`), or
+    /// `None` when unsupported or the queue is empty (default: unsupported).
+    ///
+    /// The C writes the vector length through a `int *` out-parameter and returns a pointer into the
+    /// port's own queue; returning an owned `Vec<SysIOVec>` is the safe, ownership-clean spelling of
+    /// the same information.
+    fn peekq(&mut self) -> Option<Vec<SysIOVec>> {
+        None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Port attributes / flags — `set_busy_port`/`set_port_control_flags`/`get_port_flags`
+    // ---------------------------------------------------------------------------------------
+
+    /// Set (`true`) or clear (`false`) the port's busy state (`set_busy_port`). `0` = ok, `-1` =
+    /// fail (default: unsupported).
+    fn set_busy_port(&mut self, busy: bool) -> c_int {
+        let _ = busy;
+        -1
+    }
+
+    /// Set the port's control `mode`/`flags` (`set_port_control_flags`; `mode` is the C macro's
+    /// first argument, `flags` the `PORT_CONTROL_FLAG_*` bit set). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn set_control_flags(&mut self, mode: c_int, flags: c_int) -> c_int {
+        let _ = (mode, flags);
+        -1
+    }
+
+    /// The port's flags (`get_port_flags`, the `PORT_FLAG_*` bit set), or `None` (default:
+    /// unsupported).
+    fn get_port_flags(&mut self) -> Option<c_int> {
+        None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Lifecycle & failures — `driver_failure*`/`driver_exit`/`erl_drv_busy_msgq_limits`/
+    // `erl_drv_init_ack`/`erl_drv_set_os_pid`/`driver_async_port_key`
+    // ---------------------------------------------------------------------------------------
+
+    /// Close the port with `reason` — the single hook behind the C's `driver_failure*` family.
+    /// `0` = ok, `-1` = fail (default: unsupported).
+    fn failure(&mut self, reason: PortFailure<'_>) -> c_int {
+        let _ = reason;
+        -1
+    }
+
+    /// Immediately terminate the port's connected process with exit `code` (`driver_exit`). `0` =
+    /// ok, `-1` = fail (default: unsupported).
+    fn port_exit(&mut self, code: c_int) -> c_int {
+        let _ = code;
+        -1
+    }
+
+    /// Set the port's busy-message-queue watermarks (`erl_drv_busy_msgq_limits`): the emulator
+    /// blocks the port on `high` queued messages and unblocks it on `low`. `0` = ok, `-1` = fail
+    /// (default: unsupported).
+    fn busy_msgq_limits(&mut self, low: c_int, high: c_int) -> c_int {
+        let _ = (low, high);
+        -1
+    }
+
+    /// Acknowledge an asynchronous port init (`erl_drv_init_ack`). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn init_ack(&mut self) -> c_int {
+        -1
+    }
+
+    /// Record the port's OS pid as `pid` for `port_info(_, os_pid)` (`erl_drv_set_os_pid`). `0` =
+    /// ok, `-1` = fail (default: unsupported).
+    fn set_os_pid(&mut self, pid: c_int) -> c_int {
+        let _ = pid;
+        -1
+    }
+
+    /// Write the port's async key into `key` (`driver_async_port_key`; the C returns it directly, a
+    /// `*mut c_uint` out-parameter keeps a failure reportable). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn async_port_key(&mut self, key: *mut c_uint) -> c_int {
+        let _ = key;
+        -1
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Monitors — `driver_monitor_process`/`driver_demonitor_process`/`driver_get_monitored_process`
+    // ---------------------------------------------------------------------------------------
+
+    /// Monitor the process `pid` (`driver_monitor_process`), returning the monitor holder the driver
+    /// later passes to [`demonitor_process`](DriverHost::demonitor_process) /
+    /// [`get_monitored_process`](DriverHost::get_monitored_process). `None` = unsupported (default).
+    fn monitor_process(&mut self, pid: Eterm) -> Option<ErlDrvMonitor> {
+        let _ = pid;
+        None
+    }
+
+    /// Cancel the monitor `mon` (`driver_demonitor_process`). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn demonitor_process(&mut self, mon: *const ErlDrvMonitor) -> c_int {
+        let _ = mon;
+        -1
+    }
+
+    /// The pid behind the monitor `mon` (`driver_get_monitored_process`), or `None` (default:
+    /// unsupported).
+    fn get_monitored_process(&mut self, mon: *const ErlDrvMonitor) -> Option<Eterm> {
+        let _ = mon;
+        None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Port data lock — `driver_pdl_*`
+    //
+    // The C models a PDL as an opaque `ErlDrvPDL` handle to a per-port refcounted lock object. The
+    // host owns the object (it must outlive the port) and hands the driver the same handle back on
+    // every call, so the seam passes `ErlDrvPDL` through unchanged — a `Vec<u8>` blob would not
+    // survive the round-trip and could not be identified per port.
+    // ---------------------------------------------------------------------------------------
+
+    /// Create (or return the existing) port data lock, as its opaque `ErlDrvPDL` handle
+    /// (`driver_pdl_create`); `None` = unsupported (default).
+    fn pdl_create(&mut self) -> Option<ErlDrvPDL> {
+        None
+    }
+
+    /// Take the port data lock `pdl` (`driver_pdl_lock`). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn pdl_lock(&mut self, pdl: ErlDrvPDL) -> c_int {
+        let _ = pdl;
+        -1
+    }
+
+    /// Release the port data lock `pdl` (`driver_pdl_unlock`). `0` = ok, `-1` = fail (default:
+    /// unsupported).
+    fn pdl_unlock(&mut self, pdl: ErlDrvPDL) -> c_int {
+        let _ = pdl;
+        -1
+    }
+
+    /// The port data lock's reference count (`driver_pdl_get_refc`), or `None` (default:
+    /// unsupported).
+    fn pdl_get_refc(&mut self, pdl: ErlDrvPDL) -> Option<ErlDrvSInt> {
+        let _ = pdl;
+        None
+    }
+
+    /// Increment the port data lock's reference count, returning the new value
+    /// (`driver_pdl_inc_refc`), or `None` (default: unsupported).
+    fn pdl_inc_refc(&mut self, pdl: ErlDrvPDL) -> Option<ErlDrvSInt> {
+        let _ = pdl;
+        None
+    }
+
+    /// Decrement the port data lock's reference count, returning the new value
+    /// (`driver_pdl_dec_refc`), or `None` (default: unsupported).
+    fn pdl_dec_refc(&mut self, pdl: ErlDrvPDL) -> Option<ErlDrvSInt> {
+        let _ = pdl;
+        None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Deprecated wall clock — `driver_get_now`
+    // ---------------------------------------------------------------------------------------
+
+    /// The wall-clock breakdown (`driver_get_now`, deprecated in the C), or `None` (default:
+    /// unsupported).
+    fn now(&mut self) -> Option<ErlDrvNowData> {
         None
     }
 }
@@ -685,5 +913,58 @@ mod tests {
         ] {
             assert_eq!(decode_term_spec(&mut env, spec), None, "spec {spec:?}");
         }
+    }
+
+    #[test]
+    fn the_new_family_hooks_default_to_unsupported() {
+        let mut host = TestDriverHost::new();
+
+        // Port queue: every hook reports failure / no data.
+        assert_eq!(host.enq(b"abc", false), -1);
+        assert_eq!(host.enq(b"abc", true), -1);
+        assert_eq!(host.pushq(b"abc", false), -1);
+        assert_eq!(host.pushq(b"abc", true), -1);
+        assert_eq!(host.deq(4), -1);
+        assert_eq!(host.sizeq(), -1);
+        assert!(host.peekq().is_none());
+
+        // Port attributes / flags.
+        assert_eq!(host.set_busy_port(true), -1);
+        assert_eq!(host.set_busy_port(false), -1);
+        assert_eq!(host.set_control_flags(0, 0), -1);
+        assert!(host.get_port_flags().is_none());
+
+        // Lifecycle & failures: each `driver_failure*` spelling lands on the same hook.
+        for reason in [
+            PortFailure::Eof,
+            PortFailure::Atom("enoent"),
+            PortFailure::Posix(libc::ENOENT),
+            PortFailure::Error(libc::EIO),
+        ] {
+            assert_eq!(host.failure(reason), -1);
+        }
+        assert_eq!(host.port_exit(1), -1);
+        assert_eq!(host.busy_msgq_limits(1, 8), -1);
+        assert_eq!(host.init_ack(), -1);
+        assert_eq!(host.set_os_pid(42), -1);
+        let mut key: c_uint = 7;
+        assert_eq!(host.async_port_key(&mut key), -1);
+        assert_eq!(key, 7, "an unsupported hook must not touch the out-parameter");
+
+        // Monitors.
+        assert!(host.monitor_process(NIL).is_none());
+        assert_eq!(host.demonitor_process(core::ptr::null()), -1);
+        assert!(host.get_monitored_process(core::ptr::null()).is_none());
+
+        // Port data lock.
+        assert!(host.pdl_create().is_none());
+        assert_eq!(host.pdl_lock(core::ptr::null_mut()), -1);
+        assert_eq!(host.pdl_unlock(core::ptr::null_mut()), -1);
+        assert!(host.pdl_get_refc(core::ptr::null_mut()).is_none());
+        assert!(host.pdl_inc_refc(core::ptr::null_mut()).is_none());
+        assert!(host.pdl_dec_refc(core::ptr::null_mut()).is_none());
+
+        // Deprecated wall clock.
+        assert!(host.now().is_none());
     }
 }
