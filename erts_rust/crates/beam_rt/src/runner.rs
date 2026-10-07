@@ -174,6 +174,33 @@ impl RunnerState {
         self.engines.contains_key(&pid)
     }
 
+    /// `pid`'s executing module and engine machine, when this runtime holds them.
+    ///
+    /// This is the read-only seam behind `erlang:process_info/2`'s **execution-position**
+    /// items (`current_function`/`current_location`/`current_stacktrace`/`initial_call`,
+    /// see [`crate::native::memory`]): a process's position lives in its
+    /// [`Machine`] — the
+    /// [`Machine::current_function`]-family accessors are the only builders of those
+    /// terms — and only this table knows which machine belongs to which pid.
+    ///
+    /// `None` for:
+    ///
+    /// * a pid this runtime never spawned an engine for (the root `-eval` process, a
+    ///   foreign pid);
+    /// * a **fun-bodied** process ([`ProcessEntry::Fun`]): its entry is a fun value, so
+    ///   there is no module to name the position's `M`/`F` atoms from — the position items
+    ///   are the honest capability gap there, never a fabricated module;
+    /// * the process whose machine the caller is *currently executing*: a scheduler pass
+    ///   must take that one engine **out** of this map to drive it (see the module docs),
+    ///   so it is simply absent while it runs.
+    pub(crate) fn engine_at(&self, pid: ProcessId) -> Option<(&Module, &Machine)> {
+        let engine = self.engines.get(&pid)?;
+        match &engine.entry {
+            ProcessEntry::Export { module, .. } => Some((module, &engine.machine)),
+            ProcessEntry::Fun { .. } => None,
+        }
+    }
+
     /// The `x(0)` `pid` returned, once it ran to its `return`.
     pub(crate) fn result(&self, pid: ProcessId) -> Option<Eterm> {
         self.results.get(&pid).copied()
@@ -380,7 +407,12 @@ impl ProcessRunner for RuntimeRunner<'_> {
         }
 
         let outcome = {
-            let mut ctx = RuntimeContext::for_process(&mut *self.runtime, table, pid);
+            // The context also gets the **engines** of this pass (`self.state`): it drives
+            // *this* process's machine (taken out of the map above), but a
+            // `process_info/2` execution-position item must be able to read every *other*
+            // scheduled process's position (see `crate::native::memory`).
+            let mut ctx =
+                RuntimeContext::for_process_with_engines(&mut *self.runtime, table, pid, self.state);
             // A BIF reached from this code must know its **call site**: the oracle derives
             // `erlang:load_nif/2`'s owning module from the call instruction, so a scheduled
             // process sets it exactly as `RuntimeContext::run_export` sets it for the

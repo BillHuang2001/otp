@@ -90,9 +90,10 @@ fn process_info_1_is_the_oracle_order_with_registered_name_first() {
     let pid = root_pid(&mut runtime);
     let reply = call(&mut runtime, "erlang", "process_info", &[pid]).expect("process_info/1");
     let keys = keys_of(&mut runtime, reply);
-    // The root process is registered as `init`, so `registered_name` is emitted (wrapped) first,
-    // and the two engine-derived items (`current_function`/`initial_call`) are honestly omitted
-    // as unsupported — leaving these 15, in the oracle's relative order (checked below).
+    // The root process is registered as `init`, so `registered_name` is emitted (wrapped)
+    // first. Its four engine-derived items are honestly omitted (the `-eval` root process has
+    // no engine — see the module docs) — leaving these 15, in the oracle's relative order
+    // (checked below).
     assert_eq!(
         keys,
         vec![
@@ -266,10 +267,6 @@ fn every_unsupported_item_raises_the_typed_capability_gap() {
     let mut runtime = runtime();
     let pid = root_pid(&mut runtime);
     for name in [
-        "current_function",
-        "current_location",
-        "current_stacktrace",
-        "initial_call",
         "catchlevel",
         "sequential_trace_token",
         "backtrace",
@@ -516,6 +513,30 @@ fn the_implemented_item_order_is_a_subsequence_of_the_oracles() {
     assert_eq!(
         ours.len(),
         oracle.len() - 2,
-        "only current_function/initial_call are omitted"
+        "the `-eval` root process has no engine, so its current_function/initial_call are \
+         omitted (see the module docs)"
     );
+}
+
+/// The four **execution-position** items are recognized (never `badarg`) and are the honest
+/// typed capability gap for the process with no readable position: the `-eval` root process
+/// making the call has no engine of its own (see the module docs).
+#[test]
+fn the_position_items_are_the_typed_capability_gap_for_the_callers_own_process() {
+    let mut runtime = runtime();
+    let pid = root_pid(&mut runtime);
+    for name in [
+        "current_function",
+        "initial_call",
+        "current_location",
+        "current_stacktrace",
+    ] {
+        let error = info(&mut runtime, pid, name).expect_err("no engine ⇒ capability gap");
+        let reason = crate::error::unsupported_reason(&error)
+            .unwrap_or_else(|| panic!("{name} must be a typed `unsupported` gap, got {error}"));
+        assert!(
+            reason.contains(name),
+            "the gap names the item it cannot answer: {reason}"
+        );
+    }
 }

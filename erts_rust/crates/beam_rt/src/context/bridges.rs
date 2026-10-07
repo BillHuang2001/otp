@@ -112,6 +112,9 @@ pub(super) struct FunBridge<'a> {
     /// The outer call's executing-module name, inherited so a nested call keeps the same
     /// call-site identity (see [`RuntimeContext::current_module`]).
     pub(super) current_module: Option<String>,
+    /// The outer call's [`RuntimeContext::engines`] view, inherited so a nested
+    /// `process_info/2` execution-position item still reads the pass's other processes.
+    pub(super) engines: Option<&'a crate::runner::RunnerState>,
 }
 
 impl FunCaller for FunBridge<'_> {
@@ -129,6 +132,7 @@ impl FunCaller for FunBridge<'_> {
             mailbox_table: self.mailbox_table.as_deref_mut(),
             may_pump_scheduler: self.may_pump_scheduler,
             current_module: self.current_module.clone(),
+            engines: self.engines,
         };
         ctx.apply_fun(fun, args)
     }
@@ -242,6 +246,8 @@ pub(super) struct SendBridge<'a> {
     pub(super) may_pump_scheduler: bool,
     /// The outer call's executing-module name (see [`RuntimeContext::current_module`]).
     pub(super) current_module: Option<String>,
+    /// The outer call's [`RuntimeContext::engines`] view (see [`FunBridge::engines`]).
+    pub(super) engines: Option<&'a crate::runner::RunnerState>,
 }
 
 impl SendBridge<'_> {
@@ -294,6 +300,7 @@ impl SendHook for SendBridge<'_> {
             mailbox_table: self.mailbox_table.as_deref_mut(),
             may_pump_scheduler: self.may_pump_scheduler,
             current_module: self.current_module.clone(),
+            engines: self.engines,
         };
         match ctx.send_message(target, term) {
             // No process for the pid: the C drops the message and reports success
@@ -667,7 +674,7 @@ pub(super) fn local_fun_identity(
 /// exercised at the derivation level by the oracle test below.
 ///
 /// [`LocalFunIdentity`]: beam_bifs::LocalFunIdentity
-pub(super) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
+pub(crate) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
     use beam_loader::container::{parse, ChunkId};
 
     let container = parse(beam)?;

@@ -23,9 +23,13 @@
 //! all 17 items, `{registered_name, Name}` first; for an **unregistered** one it **omits**
 //! `registered_name` and emits the remaining 16. (The C skips it because `always_wrap = 0`
 //! makes an unregistered `registered_name` the bare `[]`, which the multi-item loop treats as
-//! "no value": `erl_bif_info.c:1175`.) This runtime further omits the two engine-derived items
-//! it honestly cannot answer (`current_function`/`initial_call`), so its count is 2 fewer than
-//! the oracle's in each case (15 registered, 14 unregistered).
+//! "no value": `erl_bif_info.c:1175`.) An item this runtime cannot answer is **omitted** —
+//! the very mechanism the C uses to drop an unregistered `registered_name` — so a process
+//! whose execution position this runtime cannot read (the caller itself, the `-eval` root
+//! process, which has no engine at all) omits the two engine-derived keys `pi_1_keys[]` asks
+//! for, reporting 15 items (registered) / 14 (unregistered) where the oracle reports 17/16;
+//! a process the runtime really scheduled and parked reports all 17 (see
+//! [`RuntimeContext::position_value`]).
 //!
 //! # The failure modes (verified against OTP 29.1.1 / erts-17.1)
 //!
@@ -54,6 +58,9 @@
 //! | `error_handler` | the atom `error_handler` (an unchanging runtime default) |
 //! | `priority` | the scheduling priority atom |
 //! | `group_leader` | this runtime's root pid (what `erlang:group_leader/0` answers) |
+//! | `current_function` / `initial_call` | `{M, F, A}` of the function the process is in / was entered at — from the engine, see below |
+//! | `current_location` | `{M, F, A, [{file, File}, {line, L}]}` |
+//! | `current_stacktrace` | `[{M, F, A, Location}, …]`, innermost frame first |
 //! | `total_heap_size` / `heap_size` | this process's real heap capacities, in words |
 //! | `stack_size` | the Erlang stack's word count |
 //! | `reductions` | this process's real reduction counter |
@@ -74,8 +81,6 @@
 //!
 //! | item | why / what is needed |
 //! |---|---|
-//! | `current_function`, `current_location`, `current_stacktrace` | the executing code's function/pc: the engine `Machine` is moved **out** of the `Runtime` for the duration of a scheduler pass, so `RuntimeContext` cannot see it; the engine exposes no current-function/pc accessor either |
-//! | `initial_call` | no `$initial_call`/initial-MFA field exists on `beam_process::Process` (the M1 PCB models neither) |
 //! | `catchlevel` | the runtime has no catch-frame store reachable from here |
 //! | `sequential_trace_token`, `trace`-token family | no `seq_trace` subsystem |
 //! | `backtrace` | no binary backtrace (see `current_stacktrace`) |
@@ -83,6 +88,18 @@
 //! | `async_dist`, `priority_messages` | no such process flags in M1 |
 //! | `garbage_collection_info` | needs the collector's per-generation block detail beyond [`beam_gc::HeapInfo`] |
 //! | `binary` | no process registers off-heap refc binaries in its off-heap table yet (see the crate CONTEXT.md), and `beam_alloc::RefcBinary` exposes no refcount accessor for the `{Ptr,Size,Refc}` third field |
+//!
+//! The four **execution-position** items (`current_function`, `initial_call`,
+//! `current_location`, `current_stacktrace`) are therefore *conditionally* answerable rather
+//! than gaps: they are built by the engine's read-only [`Machine`] accessors out of the
+//! process's own entry module, which is what [`RuntimeContext::position_value`] reads
+//! through the [`engines`](RuntimeContext::engines) view of the runner state. They are served
+//! for a process this runtime scheduled and left parked — the case the oracle's values below
+//! are pinned against — and are omitted (`/1`) or the typed capability gap (`/2`) for a
+//! process with no readable position: the caller itself (a scheduler pass holds its machine
+//! while it runs, and the `-eval` root process has no machine at all), a fun-bodied process
+//! (its entry is a fun value: no module could name `M`/`F`), and any pid this runtime never
+//! scheduled.
 //!
 //! ## `garbage_collection`
 //!
@@ -130,7 +147,7 @@
 //!   `message_queue_data` process flag in M1 that could change it).
 
 use beam_common::{BeamError, Result};
-use beam_engine::terms;
+use beam_engine::{terms, Machine};
 use beam_gc::{HeapInfo, HeapObservable};
 use beam_process::{MonitorKind, ProcessId, ProcessState};
 use beam_term::{make_small, Eterm, NIL};
@@ -175,6 +192,10 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
     "error_handler",
     "priority",
     "group_leader",
+    "current_function",
+    "initial_call",
+    "current_location",
+    "current_stacktrace",
     "total_heap_size",
     "heap_size",
     "stack_size",
@@ -194,10 +215,6 @@ const IMPLEMENTED_ITEMS: &[&str] = &[
 /// The valid oracle item names this runtime cannot yet answer — a typed `unsupported`
 /// capability gap rather than a fabricated value or a false `badarg` (see the module docs).
 const UNSUPPORTED_ITEMS: &[&str] = &[
-    "current_function",
-    "current_location",
-    "current_stacktrace",
-    "initial_call",
     "catchlevel",
     "sequential_trace_token",
     "backtrace",
@@ -218,6 +235,16 @@ enum Item {
     DictionaryKey(Eterm),
 }
 
+/// The **execution-position** items — the ones served from the engine's read-only
+/// `Machine` accessors rather than from the runtime's own counters (see
+/// [`RuntimeContext::position_value`]).
+const POSITION_ITEMS: &[&str] = &[
+    "current_function",
+    "initial_call",
+    "current_location",
+    "current_stacktrace",
+];
+
 impl Item {
     /// The term the reply's `{Item, Value}` pair uses as its first element.
     fn key(&self, ctx: &mut RuntimeContext<'_>) -> Result<Eterm> {
@@ -236,6 +263,8 @@ impl Item {
 /// Copied rather than borrowed because the reply is built on the engine's heap afterwards,
 /// which needs `&mut` access to the runtime the process table lives in.
 struct Snapshot {
+    /// The pid these observables belong to (the execution-position items need it).
+    pid: ProcessId,
     /// The registered name, `None` when unregistered.
     registered_name: Option<String>,
     /// The scheduler state, as its oracle atom.
@@ -421,10 +450,50 @@ impl RuntimeContext<'_> {
     /// The typed capability gap for a valid item this runtime cannot answer.
     fn unsupported_item(&self, item: &Item) -> BeamError {
         match item {
+            Item::Atom(name) if POSITION_ITEMS.contains(&name.as_str()) => {
+                crate::error::unsupported(&format!(
+                    "process_info: {name} (this runtime holds no execution position for that \
+                     process: it is the caller, a fun-bodied process or an unscheduled pid)"
+                ))
+            }
             Item::Atom(name) => crate::error::unsupported(&format!(
                 "process_info: {name} (see beam_rt/src/native/memory/mod.rs for the missing accessor)"
             )),
             Item::DictionaryKey(_) => crate::error::unsupported("process_info: {dictionary,_}"),
+        }
+    }
+
+    /// The value of one **execution-position** item — where the process is executing.
+    ///
+    /// The terms come from [`Machine`]'s read-only accessors (`beam_engine`), the only
+    /// builders of those shapes; the module whose `M`/`F`/`A` atoms a position resolves in
+    /// is the process's **entry** module, and the engines of the current scheduler pass
+    /// (else the runtime's own) are what
+    /// [`RunnerState::engine_at`](crate::runner::RunnerState::engine_at) is read through.
+    ///
+    /// `Ok(None)` — the caller's honest "cannot answer", turned into an omission by
+    /// `process_info/1` and the typed capability gap by `process_info/2` — when this runtime
+    /// holds no execution position for `pid`: it is the **caller** (a scheduler pass moves
+    /// the executing process's machine out of the runner state while it runs, and the
+    /// `-eval` root process has no machine at all), a **fun-bodied** process (its entry is a
+    /// fun value, so no module could name `M`/`F` without inventing one), or a pid this
+    /// runtime never scheduled. A position the engine cannot resolve inside a module it
+    /// *does* have (a `func` index out of range) is its own typed error, propagated as-is —
+    /// never replaced by a plausible-looking term.
+    fn position_value(&mut self, name: &str, pid: ProcessId) -> Result<Option<Eterm>> {
+        let Some(engines) = self.engines() else {
+            return Ok(None);
+        };
+        let Some((module, machine)) = engines.engine_at(pid) else {
+            return Ok(None);
+        };
+        match name {
+            "current_function" => machine.current_function(module, self),
+            "initial_call" => machine.initial_call(module, self),
+            "current_location" => machine.current_location(module, self),
+            "current_stacktrace" => machine.current_stacktrace(module, self).map(Some),
+            // Unreachable: only the four names above are routed here.
+            _ => Ok(None),
         }
     }
 
@@ -448,6 +517,11 @@ impl RuntimeContext<'_> {
         let value = match name {
             // Handled by the callers (`item_value`/`process_info_1`).
             "registered_name" => return Ok(None),
+            // The execution-position items: the engine's read-only view of *where* the
+            // process is (see [`Self::position_value`]).
+            "current_function" | "initial_call" | "current_location" | "current_stacktrace" => {
+                return self.position_value(name, snapshot.pid)
+            }
             "status" => self.atom(snapshot.status)?,
             "message_queue_len" => make_small(snapshot.message_queue_len as i64),
             "messages" => terms::make_list(self, &snapshot.messages)?,
@@ -574,6 +648,7 @@ impl RuntimeContext<'_> {
             .find(|(_, registered)| *registered == pid)
             .and_then(|(name, _)| atoms.name(name).map(str::to_string));
         Some(Snapshot {
+            pid,
             registered_name,
             // This runtime is single-threaded, so exactly one process is executing at a time:
             // the one making this call **is** `running` (the oracle answers `running` for the

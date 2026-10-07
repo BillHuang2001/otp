@@ -77,6 +77,7 @@ use crate::error;
 use crate::mailbox::MailboxState;
 use crate::nif::NifHostImpl;
 use crate::port::RuntimePorts;
+use crate::runner::RunnerState;
 use crate::runtime::Runtime;
 
 pub(crate) use self::bridges::PendingInterner;
@@ -136,6 +137,21 @@ pub struct RuntimeContext<'a> {
     /// knows it, so it sets this for the duration of the call and restores the previous value
     /// afterwards; [`RuntimeContext::call_registered`] forwards it to the [`BifContext`].
     current_module: Option<String>,
+    /// The engines of the scheduler pass this context is a slice of, when it is one.
+    ///
+    /// `Some` exactly for a context built by
+    /// [`RuntimeContext::for_process_with_engines`] — the runner's slice. It is the
+    /// read-only half of the split borrow the pass performs: the runner holds the process
+    /// table and drives the executing process's engine (which it has taken **out** of the
+    /// map), while this context reads every *other* process's engine from here (see
+    /// [`crate::runner::RunnerState::engine_at`] and [`crate::native::memory`], the one
+    /// consumer — the `process_info/2` execution-position items).
+    ///
+    /// A context **outside** a pass ([`RuntimeContext::new`]/[`RuntimeContext::with_output`])
+    /// leaves it `None`: those engines are still in the runtime
+    /// ([`Runtime::runner_state`](crate::runtime::Runtime)), which such a context reads
+    /// directly.
+    engines: Option<&'a RunnerState>,
 }
 
 impl<'a> RuntimeContext<'a> {
@@ -150,6 +166,7 @@ impl<'a> RuntimeContext<'a> {
             mailbox_table: None,
             may_pump_scheduler: true,
             current_module: None,
+            engines: None,
         }
     }
 
@@ -163,6 +180,7 @@ impl<'a> RuntimeContext<'a> {
             mailbox_table: None,
             may_pump_scheduler: true,
             current_module: None,
+            engines: None,
         }
     }
 
@@ -193,7 +211,35 @@ impl<'a> RuntimeContext<'a> {
             mailbox_table: Some(table),
             may_pump_scheduler: false,
             current_module: None,
+            engines: None,
         }
+    }
+
+    /// [`RuntimeContext::for_process`] plus the **engines** of the pass it runs in — the
+    /// constructor the scheduler's runner uses (see the [`engines`](Self::engines) field).
+    ///
+    /// `engines` is the [`RunnerState`] the pass moved out of the runtime. The runner has
+    /// taken the *executing* process's engine out of it (it drives that machine), so this
+    /// view answers for every **other** live scheduled process.
+    pub(crate) fn for_process_with_engines(
+        runtime: &'a mut Runtime,
+        table: &'a mut ProcessTable,
+        pid: ProcessId,
+        engines: &'a RunnerState,
+    ) -> RuntimeContext<'a> {
+        RuntimeContext {
+            engines: Some(engines),
+            ..RuntimeContext::for_process(runtime, table, pid)
+        }
+    }
+
+    /// The engines of the scheduler pass this context is a slice of, if it is one.
+    ///
+    /// The value is `Copy`, so the caller gets the view without borrowing this context —
+    /// which matters, because the consumer builds its reply terms on `&mut self` while it
+    /// reads the machine (see [`crate::native::memory`]).
+    pub(crate) fn engines(&self) -> Option<&'a RunnerState> {
+        self.engines
     }
 
     /// The pid this context runs as (the mailbox owner and `erlang:self/0`).
@@ -529,6 +575,7 @@ impl<'a> RuntimeContext<'a> {
                 mailbox_table,
                 may_pump_scheduler,
                 current_module: _,
+                engines,
             } = self;
             // Re-entry happens only when the BIF *applies a fun argument* (the fun-taking
             // `lists:*`/`maps:*` BIFs): the applied fun can call back into the runtime and
@@ -638,6 +685,7 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
                     current_module: caller_module,
+                    engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
@@ -663,6 +711,7 @@ impl<'a> RuntimeContext<'a> {
                     mailbox_table: mailbox_table.as_deref_mut(),
                     may_pump_scheduler: *may_pump_scheduler,
                     current_module: caller_module,
+                    engines: *engines,
                 };
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
