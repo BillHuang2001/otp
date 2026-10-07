@@ -150,7 +150,7 @@ pub fn skip_reason() -> Option<String> {
 /// The runtime's **well-known atoms** — the C `error_atom[NUMBER_EXIT_CODES]`
 /// table (`../../erts/emulator/beam/beam_common.c:382-406`) plus the
 /// exception-*class* and auxiliary atoms the exceptions family resolves by name
-/// (`src/families/exceptions.rs`: `install_class_atom`, `catch_end`'s `'EXIT'`,
+/// (`src/families/exceptions/`: `install_class_atom`, `catch_end`'s `'EXIT'`,
 /// `build_stacktrace`'s `file`/`line`).
 ///
 /// A real runtime keeps these **globally interned**, so they are nameable from

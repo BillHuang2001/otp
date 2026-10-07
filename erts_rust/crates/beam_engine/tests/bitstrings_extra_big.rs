@@ -35,7 +35,7 @@
 //!
 //! 1. **Bignum results without `unsafe`.** A wide read may return a **bignum**, and
 //!    no *safe* bignum reader is reachable from an integration test: the library is
-//!    `#![deny(unsafe_code)]`, and only `terms.rs`/`families/bitstrings/raw.rs`
+//!    `#![deny(unsafe_code)]`, and only `terms/`/`families/bitstrings/raw.rs`
 //!    (both `pub(crate)`-visible) dereference heap words. The read assertions
 //!    therefore pin the value through the fixture's own `e256/1` segment, which
 //!    writes `value mod 2^256`:

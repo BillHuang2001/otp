@@ -1,0 +1,244 @@
+//! Map instruction family.
+//!
+//! Owns the map-access/update instructions (per `../beam_loader/CONTEXT.md`, "The
+//! instruction vocabulary"):
+//! - [`Instr::GetMapElements`] — fetch map elements (failing when a key is absent)
+//! - [`Instr::HasMapFields`] — test for the presence of map keys
+//! - [`Instr::PutMapAssoc`] — update/build a map (associating new keys)
+//! - [`Instr::PutMapExact`] — update a map (failing on an unknown key)
+//!
+//! Map terms are read/built with the `crate::terms` map helpers
+//! (`map_entries` / `make_map`); key matching uses `beam_term::cmp` (the exact
+//! `=:=` ordering, i.e. `erts_cmp` with `exact=1`) so the engine never reimplements
+//! term ordering and maps keep their `=:=` key semantics (`1` and `1.0` are
+//! distinct keys).
+//!
+//! `map_entries` reads **both** frozen map layouts — a flat map and a hashmap
+//! (HAMT, walked node by node) — so the read instructions
+//! ([`Instr::GetMapElements`] / [`Instr::HasMapFields`]) handle a hashmap source
+//! with a plain `beam_term::cmp` scan and no hash function. *Building* a map goes
+//! through [`crate::terms::make_map`] (`beam_term::map::write_map`), which picks
+//! the frozen layout by size: a **flat** map at/below `MAP_SMALL_MAP_LIMIT` (32)
+//! distinct keys, a **hashmap** (HAMT) above it — exactly the oracle's choice, so a
+//! map grown past the limit by compiled code is a correct hashmap.
+//!
+//! # Layout
+//!
+//! The work is split by responsibility: this file holds [`exec`] (the dispatch), the
+//! key-lookup helpers and the failure paths shared by both halves; [`read`] holds the
+//! read side (`get_map_elements` / `has_map_fields`); [`write`] holds the update side
+//! (`put_map_assoc` / `put_map_exact`). The comprehensive unit suite (every opcode
+//! variant, both map layouts incl. the 32/33-key boundary, the failure paths and the
+//! dispatch contract) lives in the sibling `tests` module.
+//!
+//! # Ground truth (read-only)
+//!
+//! * `emu/map_instrs.tab:49-122` — `i_get_map_element` / `i_get_map_elements`
+//!   (flatmap scan + hashmap `erts_hashmap_get`; a missing key is `$FAIL`).
+//! * `emu/map_instrs.tab:124-173` — `update_map_assoc` / `update_map_exact`
+//!   (`erts_gc_update_map_assoc` builds a *new* map; the exact variant fails when
+//!   the new key is not already present).
+//! * `beam_common.c:2237-2268` — `erts_gc_update_map_exact` sets
+//!   `p->freason = BADKEY` and `p->fvalue = key` before returning non-value, so the
+//!   observable failure reason is `{badkey, Key}` (verified against the oracle with
+//!   `maps:from_list([{b,1}])#{a := 2}` ⇒ `error:{badkey,a}`).
+//! * `beam/generators.tab:230-253` — `has_map_fields Fail Src Size Rest` lowers to
+//!   `get_map_elements` with `SCRATCH_X_REG` destinations: "every key must be
+//!   present, the value is discarded". Same failure set as `get_map_elements`.
+//! * `emu/ops.tab:1364-1424` — the transforms (`put_map_assoc` "can never fail and
+//!   does not need any failure label").
+//!
+//! # Semantics
+//!
+//! * `GetMapElements { fail, source, pairs }` — read `source`; if it is not a map
+//!   jump to `fail` (or raise `{badmap, Source}` when `fail` is
+//!   [`NO_FAIL`] — the reason the compiler's own `is_map` guard branch raises). For
+//!   each `(key, dst)` pair, look `key` up; **a missing key jumps to `fail`**,
+//!   otherwise the value is written to `dst`. Partial writes before a failure are
+//!   harmless (the clause matcher restarts at `fail`).
+//! * `HasMapFields { fail, source, keys }` — every key must be present, else jump
+//!   to `fail`. No writes.
+//! * `PutMapAssoc { fail, source, dst, live, pairs }` — build a **new** map =
+//!   `source` with each `(key, value)` inserted or overwritten, then write it to
+//!   `dst`. Maps are immutable, so the source is never mutated in place. The result
+//!   is a flat map (≤ 32 distinct keys) or a hashmap above that, per the frozen
+//!   layout rules (see [`crate::terms::make_map`]).
+//! * `PutMapExact { fail, source, dst, live, pairs }` — as `PutMapAssoc`, but every
+//!   key must already exist; a missing key jumps to `fail` (or raises
+//!   `{badkey, Key}` when `fail` is [`NO_FAIL`], the ground-truth reason above).
+//!
+//! `live` (the count of live X registers the C collector treats as GC roots across
+//! the update) is **unused at M1**: `MinimalContext` has no moving collector, so the
+//! update cannot relocate terms. It stays in the IR for the Stage-4 collector.
+//!
+//! # Milestone-1 limits (all documented, never a wrong result)
+//!
+//! * **Atom key order follows the module-local atom table.** The frozen flat-map
+//!   key order (`erts_cmp_flatmap_keys`) sorts atoms by their *global* atom index
+//!   (`erl_utils.h:267-272`); this engine's atoms are module-local indices, so a
+//!   flat map's atom keys are sorted by *those*. Map lookups compare keys with
+//!   `beam_term::cmp`, never positionally, so this only affects `term_to_binary`
+//!   byte-for-byte comparison of atom-keyed maps, never map semantics.
+//! * A non-map `source` that the ground truth does not route to `fail` (e.g. a
+//!   `put_map_assoc` whose dropped fail label is always `NO_FAIL`) raises
+//!   `{badmap, Source}` rather than mis-reading the term.
+//! * A **missing key with `fail == NO_FAIL`** has no ground truth (the compiler
+//!   always emits a fail label for the matching forms), so it is a documented typed
+//!   `error::unsupported` rather than an invented exception reason.
+
+mod read;
+#[cfg(test)]
+mod tests;
+mod write;
+
+use std::collections::BTreeMap;
+
+use beam_common::{ExceptionClass, Result};
+use beam_loader::{Instr, Label, Module, NO_FAIL};
+use beam_term::{cmp, make_atom, AtomTable, Eterm};
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::terms;
+use crate::Step;
+
+/// Execute a map-family instruction.
+///
+/// Returns `Ok(Some(step))` when `instr` is a map opcode this family executes,
+/// `Ok(None)` when `instr` is not this family's variant, and `Err` on a raise.
+pub(crate) fn exec(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    instr: &Instr,
+    func: u32,
+    pc: u32,
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Option<Step>> {
+    let _ = (func, pc);
+    match instr {
+        Instr::GetMapElements {
+            fail,
+            source,
+            pairs,
+        } => read::get_map_elements(machine, module, labels, ctx, *fail, source, pairs).map(Some),
+
+        Instr::HasMapFields { fail, source, keys } => {
+            read::has_map_fields(machine, module, labels, ctx, *fail, source, keys).map(Some)
+        }
+
+        Instr::PutMapAssoc {
+            fail,
+            source,
+            dst,
+            live,
+            pairs,
+        } => write::put_map_assoc(
+            machine, module, labels, ctx, *fail, source, dst, *live, pairs,
+        )
+        .map(Some),
+
+        Instr::PutMapExact {
+            fail,
+            source,
+            dst,
+            live,
+            pairs,
+        } => write::put_map_exact(
+            machine, module, labels, ctx, *fail, source, dst, *live, pairs,
+        )
+        .map(Some),
+
+        // Not this family's variant.
+        _ => Ok(None),
+    }
+}
+
+/// The value bound to `key` in `entries`, using exact key equality.
+///
+/// The comparison is delegated to `beam_term::cmp` (the exact `=:=` ordering) so
+/// map keys keep `erts_cmp`'s semantics — in particular `1` and `1.0` are distinct
+/// keys — and the engine never reimplements term ordering.
+fn lookup(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<Eterm> {
+    entries
+        .iter()
+        .find(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+        .map(|(_, value)| *value)
+}
+
+/// The index of `key`'s binding in `entries`, using exact key equality (for the
+/// in-place overwrite of the freshly built copy, never the shared source).
+fn position(entries: &[(Eterm, Eterm)], key: Eterm, atoms: &AtomTable) -> Option<usize> {
+    entries
+        .iter()
+        .position(|(candidate, _)| cmp(*candidate, key, atoms).is_eq())
+}
+
+/// Jump to `label` (the ground-truth failure path).
+fn goto(labels: &BTreeMap<Label, (u32, u32)>, label: Label) -> Result<Step> {
+    let (func, pc) = labels
+        .get(&label)
+        .copied()
+        .ok_or_else(|| error::unknown_label(label))?;
+    Ok(Step::Goto { func, pc })
+}
+
+/// The `{Tag,Value}`-with-a-fail-label failure path: jump to `fail`, or — when
+/// `fail` is [`NO_FAIL`] (no branch for this failure) — raise `{Tag,Value}` as a
+/// class-`error` exception.
+fn fail_or_raise(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    ctx: &mut dyn ExecutionContext,
+    fail: Label,
+    tag: &str,
+    value: Eterm,
+) -> Result<Step> {
+    if fail == NO_FAIL {
+        raise_error_tuple(machine, module, ctx, tag, value)
+    } else {
+        goto(labels, fail)
+    }
+}
+
+/// The fail-label-only failure path (a failure the ground truth never raises for):
+/// jump to `fail`, or report `what` as a documented typed error when `fail` is
+/// [`NO_FAIL`].
+fn jump_or_unsupported(
+    labels: &BTreeMap<Label, (u32, u32)>,
+    fail: Label,
+    what: &str,
+) -> Result<Step> {
+    if fail == NO_FAIL {
+        Err(error::unsupported(what))
+    } else {
+        goto(labels, fail)
+    }
+}
+
+/// Raise `{Tag,Value}` as a class-`error` exception (the `{badmap,Source}` /
+/// `{badkey,Key}` reasons).
+///
+/// The tag atom is resolved from the running module's atom table; a module that
+/// never mentions it cannot name the reason, so a missing atom is a documented
+/// typed `error::unsupported` (never a substituted, wrong atom). The `error` class
+/// atom is installed when the module has it, so a landing can place it in `x(3)`.
+fn raise_error_tuple(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    tag: &str,
+    value: Eterm,
+) -> Result<Step> {
+    let tag_atom = module
+        .atom_table
+        .lookup(tag)
+        .ok_or_else(|| error::unsupported(&format!("maps: no '{tag}' atom in the module")))?;
+    let reason = terms::make_tuple(ctx, &[make_atom(tag_atom), value])?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(reason)
+}

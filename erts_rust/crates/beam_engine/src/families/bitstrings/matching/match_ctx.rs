@@ -1,0 +1,83 @@
+//! Bitstring **match entry** and match-context handling.
+//!
+//! Owns `bs_start_match3`/`bs_start_match4` (`enter_match` plus its
+//! `no_fail`/`resume` fail-operand decode), the match-context operand reader
+//! (`read_ctx`) and the `bs_set_position` position decode (`position_of`).
+use beam_common::Result;
+use beam_loader::{Label, Module, Operand, NO_FAIL};
+use beam_term::Eterm;
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::operand::read_operand;
+
+use super::super::{raw, small_value};
+// ---------------------------------------------------------------------------
+// Match entry
+// ---------------------------------------------------------------------------
+/// Start (or resume) a match over `subject`, yielding the match context.
+///
+/// A heap binary becomes a fresh context at position 0 (`i_bs_start_match3`,
+/// `bs_instrs.tab:1199`); a term that is already an `ErlSubBits` is re-wrapped with
+/// its current position (the C `reuse` path). Anything else is a *match* failure
+/// (`None`), not an error.
+pub(crate) fn enter_match(ctx: &mut dyn ExecutionContext, subject: Eterm) -> Result<Option<Eterm>> {
+    if let Some((_, bits)) = raw::heap_bits(subject) {
+        return Ok(Some(raw::make_ctx(ctx, subject, 0, bits)?));
+    }
+    if let Some((orig, start, end)) = raw::ctx_parts(subject) {
+        return Ok(Some(raw::make_ctx(ctx, orig, start, end)?));
+    }
+    Ok(None)
+}
+/// Decode `bs_start_match4`'s `fail` operand: a label, or the atoms
+/// `no_fail`/`resume` (`emu/ops.tab:1243-1262`).
+pub(crate) fn resolve_match4_fail(module: &Module, fail: &Operand) -> Result<(Label, bool)> {
+    match fail {
+        Operand::Label(label) => Ok((*label, false)),
+        Operand::Atom(atom) => match module.atom_name(*atom) {
+            Some("no_fail") => Ok((NO_FAIL, false)),
+            Some("resume") => Ok((NO_FAIL, true)),
+            Some(other) => Err(error::unsupported(&format!(
+                "bs_start_match4: fail atom {other}"
+            ))),
+            None => Err(error::unsupported("bs_start_match4: unknown fail atom")),
+        },
+        _ => Err(error::unsupported(
+            "bs_start_match4: unsupported fail operand",
+        )),
+    }
+}
+/// Read a match-context operand, returning `(term, orig, start, end)`.
+pub(crate) fn read_ctx(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    operand: &Operand,
+    what: &str,
+) -> Result<(Eterm, Eterm, usize, usize)> {
+    let term = read_operand(machine, ctx, operand)?;
+    let (orig, start, end) = raw::ctx_parts(term)
+        .ok_or_else(|| error::unsupported(&format!("{what}: operand is not a match context")))?;
+    Ok((term, orig, start, end))
+}
+/// The bit position a `bs_set_position` operand denotes.
+///
+/// The engine's `bs_get_position` snapshots the whole context, so the ordinary
+/// input is another `ErlSubBits`; the C 64-bit lowering instead stores the raw
+/// position as a small integer (`bs_instrs.tab:1125-1129`), so that form is
+/// accepted too.
+pub(crate) fn position_of(value: Eterm) -> Result<usize> {
+    if let Some((_, start, _)) = raw::ctx_parts(value) {
+        return Ok(start);
+    }
+    if let Some(n) = small_value(value) {
+        if n >= 0 {
+            return Ok(n as usize);
+        }
+        return Err(error::unsupported("bs_set_position: negative bit position"));
+    }
+    Err(error::unsupported(
+        "bs_set_position: position is neither a context nor a small integer",
+    ))
+}
