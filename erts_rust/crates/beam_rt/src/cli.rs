@@ -20,6 +20,14 @@
 //! | `+hmax N` | maximum heap size, in words (`0` = unlimited) |
 //! | `+hmaxk B` / `+hmaxel B` / `+hmaxib B` | the `+hmax` kill / error-logger / shared-binary flags (`true`\|`false`) |
 //! | `-name N` / `-sname N` | distribution node name |
+//! | `-setcookie C` | distribution cookie (recorded as an init argument; sets `emulator.cookie`) |
+//! | `-config F` | config file, recorded as the init argument `config` |
+//! | `-boot F` | boot script, recorded as the init argument `boot` (consumed by the A.7 boot path) |
+//! | `-emu_flavor F` | emulator flavor: `emu` ⇒ interpreter, `jit`/`smp` ⇒ JIT (recorded) |
+//! | `+Q N` | maximum number of ports (`legacy`, or `1024..=134217727`) |
+//! | `+K true\|false` | kernel-poll switch |
+//! | `+sbt TYPE` | scheduler bind type (`u`/`db`/`s`/`ps`/`ts`/`tnnps`/`nnps`/`nnts`/`ns`) |
+//! | `-M*` / `+MM*` / `+MB*` | ERTS allocator flags (the `+M*` forms are validated; all preserved verbatim) |
 //! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
 //!
 //! # `ERL_*FLAGS`
@@ -30,20 +38,20 @@
 //! tokenized environment flag is indistinguishable from a command-line flag to
 //! `init:get_argument/1`. See [`parse_with_env`] and [`env`].
 //!
-//! # Unknown switches are init arguments, not errors
+//! # Init arguments (`init:get_argument/1`), exactly as the oracle
 //!
-//! A switch that is **not** in the table above is **not** a usage error: real `erl`
-//! hands every command-line flag to `init:get_argument/1` (verified:
-//! `erl -noshell --nope -eval 'halt(0).'` exits 0). So an unrecognized `-flag`/`+flag`
-//! is recorded as an init argument — its name the flag with the leading `-`/`+` run
-//! removed, its values the following tokens that do not themselves start with `-`/`+` —
-//! and parsing continues. Only a **stray positional argument** (a token that is neither
-//! a switch, nor part of an action) is a usage error.
+//! A switch that is **not** in the table above is **not** a usage error (real `erl`
+//! accepts unmodeled switches: `erl -noshell --nope -eval 'halt(0).'` exits 0), and
+//! only a **stray positional argument** is a usage error.
 //!
-//! Every *recognized* switch is recorded the same way ([`InitArgs`]), so a program can
-//! observe its own command line: `-noshell` is one valueless occurrence
+//! Which switches become **init arguments** follows the oracle exactly: a **`-`-switch**
+//! (recognized or not) is recorded, while a **`+`-flag** and the `-eval`/`-s`/`-run`
+//! Start instructions are consumed by the emulator/`init` and are **not** (the oracle's
+//! `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`; verified against
+//! OTP 29.1.1 / erts-17.1). So `-noshell` is one valueless occurrence
 //! (`init:get_argument(noshell)` ⇒ `{ok,[[]]}`) and `-pa /a -pa /b` is two occurrences
-//! (`{ok,[["/a"],["/b"]]}`).
+//! (`{ok,[["/a"],["/b"]]}`). The oracle additionally reports its own
+//! `root`/`bindir`/`progname`/`home` entries, which this runtime does not model.
 //!
 //! # The `run` argument grammar
 //!
@@ -109,7 +117,11 @@ Switches:
   +S N[:N]                  number of normal schedulers
   -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
-  +P N                      maximum number of processes
+  +P N                      maximum number of processes (legacy, or 1024..=134217727)
+  +Q N                      maximum number of ports (legacy, or 1024..=134217727)
+  +K true|false             kernel-poll switch
+  +sbt TYPE                 scheduler bind type (u|db|s|ps|ts|tnnps|nnps|nnts|ns)
+  -MNAME[=VALUE]            ERTS allocator flag (also +MM.../+MB...; preserved verbatim)
   +hms N                    minimum heap size, in words
   +hmbs N                   minimum binary virtual heap size, in words
   +hmax N                   maximum heap size, in words (0 = unlimited)
@@ -117,7 +129,15 @@ Switches:
   +hmaxel true|false        log an error report at +hmax (default true)
   +hmaxib true|false        count shared binaries towards +hmax (default false)
   -name N, -sname N         distribution node name
-  any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1)
+  -setcookie C              distribution cookie
+  -config FILE              configuration file (recorded as init:get_argument(config))
+  -boot FILE                boot script (recorded as init:get_argument(boot))
+  -emu_flavor emu|jit|smp   emulator flavor
+  any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1);
+                            a +FLAG is an emulator flag and is not an init argument
+
+Environment (merged into the command line, real erl's order):
+  ERL_OTP<ver>_FLAGS, ERL_AFLAGS, ERL_FLAGS, ERL_ZFLAGS
 
 Actions:
   run FILE MOD:FUNC/ARITY [ARG...]
@@ -166,9 +186,12 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
 
 /// Parses `args` (which **exclude** `argv[0]`) into a [`RuntimeConfig`].
 ///
-/// Every recognized switch is recorded, in order, as an [`InitArgs`] occurrence (the
-/// source of `init:get_argument/1`), as is every *unrecognized* `-flag`/`+flag` — real
-/// `erl` accepts unmodeled switches as init arguments, so they are never a usage error.
+/// A **`-`-switch** is recorded, in order, as an [`InitArgs`] occurrence (the source of
+/// `init:get_argument/1`) — as is an *unrecognized* `-flag`. A **`+`-flag**, and the
+/// `-eval`/`-s`/`-run` Start instructions, are consumed by the emulator/`init` and are
+/// **not** init arguments (verified against OTP 29.1.1 / erts-17.1, where
+/// `init:get_argument('S'|'Q'|eval|s|run)` is the bare atom `error`). An unmodeled
+/// switch is never a usage error.
 ///
 /// # Errors
 ///
@@ -405,18 +428,11 @@ impl Builder {
         self.emulator.extra_emulator_flags.push(value.to_string());
     }
 
-    /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
-    /// returns the index of the next switch — the real `erl` behaviour.
+    /// Applies a `+hmaxk`/`+hmaxel`/`+hmaxib` boolean value to the heap options.
     ///
-    /// Only an unrecognized **`-`flag** becomes an init argument: `erlexec` forwards
-    /// `-x` through `add_arg` (i.e. after the `--` separator, where `init` sees it),
-    /// while `+x` is rewritten to `-x` and passed as an **emulator** flag
-    /// (`erts/etc/common/erlexec.c:871-1102`). So `init:get_argument(Weird)` is
-    /// `{ok,[[]]}` for `-Weird` and the bare atom `error` for `+Weird` (verified against
-    /// OTP 29.1.1 / erts-17.1). Neither is a usage error: `erl -noshell +Weird -eval
-    /// 'halt(0).'` exits 0.
-    ///
-    /// `+hmaxk`/`+hmaxel`/`+hmaxib` boolean values are applied to the heap options.
+    /// Only the two literals `true`/`false` are accepted: the C compares the value with
+    /// exactly those strings and rejects anything else (`erl_init.c:1592-1624`, e.g.
+    /// `+hmaxk bogus` ⇒ `bad max heap kill bogus` + usage).
     fn set_max_heap_flag(&mut self, switch: &str, value: &str) -> Result<()> {
         let mut flags = self.heap.max_heap_flags();
         match (switch, value) {
@@ -432,11 +448,15 @@ impl Builder {
         Ok(())
     }
 
-    /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
-    /// returns the index of the next switch — the real `erl` behaviour.
+    /// Records an unrecognized `-flag` (and its values) as an init argument and returns
+    /// the index of the next switch — the real `erl` behaviour.
     ///
-    /// This is **not** an error: `erl -noshell --nope -eval 'halt(0).'` exits 0, so an
-    /// unmodeled switch is data, not a malformed invocation. The values are the
+    /// Only an unrecognized **`-`flag** becomes an init argument: `erlexec` forwards
+    /// `-x` through `add_arg` (where `init` sees it), while `+x` is rewritten to `-x` and
+    /// passed as an **emulator** flag (`erts/etc/common/erlexec.c:871-1102`). So
+    /// `init:get_argument(Weird)` is `{ok,[[]]}` for `-Weird` and the bare atom `error`
+    /// for `+Weird` (verified: OTP 29.1.1 / erts-17.1). Neither is a usage error:
+    /// `erl -noshell --nope +Weird -eval 'halt(0).'` exits 0. The values are the
     /// following tokens that do not themselves start with `-` or `+`.
     fn record_unmodeled(&mut self, args: &[String], index: usize) -> usize {
         let (values, next) = collect_tail(args, index + 1);
@@ -495,13 +515,6 @@ fn strip_trailing_dot(expr: &str) -> String {
 fn parse_u32(switch: &str, value: &str) -> Result<u32> {
     value
         .parse::<u32>()
-        .map_err(|_| error::bad_switch_value(switch, value))
-}
-
-/// Parses a `usize` switch value.
-fn parse_usize(switch: &str, value: &str) -> Result<usize> {
-    value
-        .parse::<usize>()
         .map_err(|_| error::bad_switch_value(switch, value))
 }
 
@@ -988,10 +1001,9 @@ mod tests {
         let config = parsed(&["-noshell", "-eval", "(1+2)*3"]);
         assert_eq!(config.action, Action::Eval("(1+2)*3".to_string()));
         assert!(parse_args(&["-eval"]).is_err(), "-eval needs a value");
-        assert_eq!(
-            config.init_args.get("eval"),
-            Some(vec![&["(1+2)*3".to_string()][..]])
-        );
+        // `-eval` is a Start instruction, not an init argument: the oracle's
+        // `init:get_argument(eval)` is `error`.
+        assert_eq!(config.init_args.get("eval"), None);
     }
 
     #[test]
@@ -1005,11 +1017,8 @@ mod tests {
             parsed(&["-eval", "2+3.."]).action,
             Action::Eval("2+3.".to_string())
         );
-        // The recorded init argument is the raw token.
-        assert_eq!(
-            parsed(&["-eval", "2+3."]).init_args.get("eval"),
-            Some(vec![&["2+3.".to_string()][..]])
-        );
+        // `-eval` is a Start instruction, so it is not an init argument.
+        assert_eq!(parsed(&["-eval", "2+3."]).init_args.get("eval"), None);
     }
 
     #[test]
@@ -1040,18 +1049,21 @@ mod tests {
     fn emulator_switches_are_mapped() {
         let config = parsed(&["+S", "4"]);
         assert_eq!(config.emulator.schedulers, Some(4));
-        assert_eq!(config.init_args.get("S"), Some(vec![&["4".to_string()][..]]));
+        // A `+`-flag is an emulator flag, never an init argument.
+        assert_eq!(config.init_args.get("S"), None);
         let config = parsed(&["+S", "8:4"]);
         assert_eq!(config.emulator.schedulers, Some(8));
-        let config = parsed(&["+P", "1000"]);
-        assert_eq!(config.emulator.max_processes, Some(1000));
+        let config = parsed(&["+P", "1024"]);
+        assert_eq!(config.emulator.max_processes, Some(1024));
+        // `+P` is bounded by `[ERTS_MIN_PROCESSES=1024, ERTS_MAX_PROCESSES]`.
+        assert!(parse_args(&["+P", "1000"]).is_err());
         let config = parsed(&["+A", "16"]);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
         assert_eq!(config.emulator.schedulers, None);
-        assert_eq!(config.init_args.get("A"), Some(vec![&["16".to_string()][..]]));
+        assert_eq!(config.init_args.get("A"), None);
         assert!(parse_args(&["+S", "x"]).is_err());
         assert!(parse_args(&["+S", "1:x"]).is_err());
         assert!(parse_args(&["+P", "-1"]).is_err());
@@ -1068,31 +1080,25 @@ mod tests {
     ///   → min_bin_vheap_size 6772, min_heap_size 1598
     /// ```
     ///
-    /// The values are recorded as init arguments like every other switch of this runtime
-    /// (real `erl` does *not* report them — `erl +hms 1000 … -eval
-    /// 'init:get_argument(hms)'` ⇒ `error`, since they are emulator flags consumed by
-    /// `erlexec`; this runtime records every switch, as it already does for `+S`/`+P`).
+    /// `+hms`/`+hmbs` are emulator flags: real `erl` does *not* report them
+    /// (`erl +hms 1000 … -eval 'init:get_argument(hms)'` ⇒ `error`), and neither does
+    /// this runtime — no `+`-flag is an init argument.
     #[test]
-    fn heap_size_switches_are_parsed_and_recorded() {
+    fn heap_size_switches_are_parsed() {
         let config = parsed(&["+hms", "1000", "+hmbs", "5000"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
         assert_eq!(config.heap_options().policy().min_bin_vheap_words, 6772);
-        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
-        assert_eq!(config.init_args.get("hmbs"), Some(vec![&["5000".to_string()][..]]));
+        assert_eq!(config.init_args.get("hms"), None);
+        assert_eq!(config.init_args.get("hmbs"), None);
         // A recognized heap switch is modelled, so it is *not* a verbatim extra flag
-        // (unlike `+A`) — but it is still an init argument, and every other switch is left
-        // exactly as it was.
+        // (unlike `+A`) — and, like every `+`-flag, it is not an init argument.
         assert!(config.emulator.extra_emulator_flags.is_empty());
         assert_eq!(config.heap_words, DEFAULT_HEAP_WORDS);
         assert_eq!(config.action, Action::Boot);
 
-        // The last occurrence wins, and both are recorded in order.
+        // The last occurrence wins.
         let config = parsed(&["+hms", "100", "+hms", "234"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 376);
-        assert_eq!(
-            config.init_args.get("hms"),
-            Some(vec![&["100".to_string()][..], &["234".to_string()][..]])
-        );
         // `+hms 0`, a negative and a non-numeric value are all rejected — the emulator
         // rejects anything `<= 0` (`erl_init.c:1554-1567`) or non-numeric (`atoi`).
         for args in [
@@ -1119,7 +1125,7 @@ mod tests {
     ///   → #{error_logger=>false,include_shared_binaries=>true,kill=>false,size=>1000}
     /// ```
     #[test]
-    fn max_heap_switches_are_parsed_and_recorded() {
+    fn max_heap_switches_are_parsed() {
         let config = parsed(&[
             "+hmax",
             "1000000",
@@ -1141,16 +1147,11 @@ mod tests {
         );
         assert_eq!(
             config.init_args.get("hmax"),
-            Some(vec![&["1000000".to_string()][..]])
+            None,
+            "a `+`-flag is never an init argument"
         );
-        assert_eq!(
-            config.init_args.get("hmaxk"),
-            Some(vec![&["false".to_string()][..]])
-        );
-        assert_eq!(
-            config.init_args.get("hmaxib"),
-            Some(vec![&["true".to_string()][..]])
-        );
+        assert_eq!(config.init_args.get("hmaxk"), None);
+        assert_eq!(config.init_args.get("hmaxib"), None);
         // `+hmax 0` is the emulator's own "no limit" value.
         assert_eq!(parsed(&["+hmax", "0"]).heap_options().policy().max_heap_words, 0);
         // A negative, a non-numeric or an out-of-range value is rejected (the C bounds it
@@ -1170,23 +1171,20 @@ mod tests {
         }
     }
 
-    /// Unmodeled flags keep their old behaviour when a modelled heap switch sits next to
-    /// them: recorded as init arguments (and, for `+A`, preserved verbatim), with parsing
-    /// continuing onto the next switch.
+    /// Unmodeled flags keep their behaviour when a modelled heap switch sits next to
+    /// them: a `+`-flag is accepted (and, for `+A`, preserved verbatim) but is not an init
+    /// argument, and parsing continues onto the next switch.
     #[test]
     fn unmodeled_flags_are_unaffected_by_the_heap_switches() {
         let config = parsed(&["+hms", "1000", "+zzz", "1", "2", "+A", "16"]);
         assert_eq!(config.heap_options().policy().min_heap_words, 1598);
-        assert_eq!(
-            config.init_args.get("zzz"),
-            Some(vec![&["1".to_string(), "2".to_string()][..]])
-        );
+        assert_eq!(config.init_args.get("zzz"), None);
         assert_eq!(
             config.emulator.extra_emulator_flags,
             vec!["+A".to_string(), "16".to_string()]
         );
-        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
-        // An unrecognized flag on its own still boots (recorded, not a usage error).
+        assert_eq!(config.init_args.get("hms"), None);
+        // An unrecognized flag on its own still boots (accepted, not a usage error).
         assert_eq!(parsed(&["+Weird"]).heap_options(), &HeapOptions::default());
     }
 
@@ -1245,15 +1243,8 @@ mod tests {
             }
         );
         assert_eq!(config.emulator.schedulers, Some(2));
-        assert_eq!(
-            config.init_args.get("s"),
-            Some(vec![&[
-                "init".to_string(),
-                "stop".to_string(),
-                "a".to_string(),
-                "b".to_string()
-            ][..]])
-        );
+        // `-s` is a Start instruction, not an init argument.
+        assert_eq!(config.init_args.get("s"), None);
 
         let config = parsed(&["-s", "init", "stop"]);
         assert_eq!(
@@ -1280,7 +1271,8 @@ mod tests {
             }
         );
         assert_eq!(config.emulator.schedulers, Some(2));
-        assert_eq!(config.init_args.get("run").map(|found| found.len()), Some(1));
+        // `-run` is a Start instruction, not an init argument.
+        assert_eq!(config.init_args.get("run"), None);
         assert!(parse_args(&["-run", "init"]).is_err(), "-run needs a function");
         assert!(parse_args(&["-run"]).is_err());
     }
@@ -1423,8 +1415,10 @@ mod tests {
         assert_eq!(config.action, Action::Boot);
         assert_eq!(config.init_args.get("nope"), Some(vec![&[][..]]));
 
+        // A `+`-flag is an emulator flag: accepted, but invisible to
+        // `init:get_argument/1` (the oracle reports `error`).
         let config = parsed(&["+Weird"]);
-        assert!(config.init_args.get("Weird").is_some());
+        assert_eq!(config.init_args.get("Weird"), None);
 
         let config = parsed(&["-emu_flavor", "emu"]);
         assert_eq!(
