@@ -399,9 +399,9 @@ pub(super) enum CmpSrc {
 
 /// Which of an inlined comparison's operands must be guarded as untagged small
 /// integers for the tagged-**word** compare to reproduce the interpreter's
-/// arithmetic ordering exactly.
+/// exact / arithmetic ordering exactly.
 #[derive(Clone, Copy)]
-enum Guard {
+pub(super) enum Guard {
     /// No guard: the compare is already exact (at least one operand is a
     /// constant-immediate, or both are small-int constants).
     None,
@@ -470,10 +470,10 @@ pub(super) enum TestPlan {
 ///
 /// Only **provably-exact** shapes are inlined (see the module docs); everything
 /// else — a `NO_FAIL` (`fail,0`) test, an unresolved fail label, a `Y`/float/literal
-/// operand, an out-of-range x-register, a bignum constant, two registers for the
-/// exact kinds, a boxed-term type test, `is_function2`/`is_tagged_tuple`/
-/// `test_arity` — returns `None`, so the helper runs the instruction with the
-/// interpreter's exact semantics (and the interpreter's exact typed error).
+/// operand, an out-of-range x-register, a bignum constant, a boxed-term type test,
+/// `is_function2`/`is_tagged_tuple`/`test_arity` — returns `None`, so the helper runs
+/// the instruction with the interpreter's exact semantics (and the interpreter's
+/// exact typed error).
 pub(super) fn inline_test(
     module: &Module,
     kind: TestKind,
@@ -563,20 +563,26 @@ fn test_const(operand: &Operand) -> Option<TestConst> {
 fn compare_shape(kind: TestKind, lhs: CmpSrc, rhs: CmpSrc) -> Option<(Guard, IntCC)> {
     match kind {
         TestKind::IsEqExact | TestKind::IsNeExact => {
-            // Exact equality: an immediate constant can only be `=:=` to the very
-            // same immediate word (the immediate encodings are canonical, `cmp`'s
-            // `is_same` fast path), so a *word* compare is exact — **unless** both
-            // operands are registers, where two distinct boxed terms (equal floats,
-            // bignums, binaries, tuples, …) are `=:=` with different words.
-            if !matches!(lhs, CmpSrc::Const(_)) && !matches!(rhs, CmpSrc::Const(_)) {
-                return None;
-            }
             let success = if kind == TestKind::IsEqExact {
                 IntCC::Equal
             } else {
                 IntCC::NotEqual
             };
-            Some((Guard::None, success))
+            match (lhs, rhs) {
+                // Two runtime values: guard **both** as untagged small ints, after
+                // which a plain word compare *is* `=:=` — `make_small(v) == v*16 + 15`
+                // is injective and `cmp`'s raw-word fast path is exact. Two distinct
+                // boxed terms (equal floats, bignums, binaries, tuples, …) share no
+                // word, but neither is a small, so the guard sends them to the helper
+                // (which compares `cmp`'s own way) rather than fabricating a
+                // word-compare answer. This is exactly the baseline tier's
+                // `emit/test.rs::compare_shape` rule.
+                (CmpSrc::Reg(_), CmpSrc::Reg(_)) => Some((Guard::Both, success)),
+                // At least one operand is a constant-immediate (a small int, an atom
+                // or `nil`), which is `=:=` only to the identical word, so a plain
+                // word compare is already exact.
+                _ => Some((Guard::None, success)),
+            }
         }
         TestKind::IsEq | TestKind::IsNe => {
             let success = if kind == TestKind::IsEq {
@@ -784,7 +790,7 @@ pub(super) fn load_cmp_src(
 
 /// The guard's "is an untagged small int" test for one operand —
 /// `(word & 0xF) == 0xF`, the same test the arithmetic fast path uses.
-fn small_int_guard(builder: &mut FunctionBuilder, value: Value) -> Value {
+pub(super) fn small_int_guard(builder: &mut FunctionBuilder, value: Value) -> Value {
     let masked = builder.ins().band_imm(value, SMALL_MASK);
     builder.ins().icmp_imm(IntCC::Equal, masked, SMALL_TAG)
 }

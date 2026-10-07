@@ -31,13 +31,27 @@
 //! [`run_compiled`](super::run_compiled) can refuse native entry to a machine whose
 //! register file does not cover it.
 //!
+//! **Direct block-to-block linking.** A taken branch to a successor basic block
+//! that this compilation emitted does not return its `(func, pc)` word to the
+//! driver: [`Linker::emit_exit`] tears down the current block's frame (spilling the
+//! cached x-registers first — the tier's whole liveness/root-set model) and jumps
+//! **straight to the successor block's native entry**, whose own prologue rebuilds
+//! its frame. `compile_module` reserves one entry label per block *before* emitting
+//! any code, so a forward branch is an ordinary `rel32` fixup resolved at `bind`
+//! time — never a post-`seal` patch, so the W^X policy is unchanged. Every
+//! continuation that is **not** a compiled block's entry (an address inside a
+//! block, an empty block, an unresolved label, a function's end) keeps the
+//! documented deopt: spill, materialise the `encode_target` word in `rax`, and jump
+//! to the block epilogue for the driver to decode.
+//!
 //! The emitter is split by responsibility across this directory: this file owns the
 //! compiled-block shape (the register-file constants, the allocation artifact,
 //! [`emit_block`], the deopt-and-continue sequence and [`compile_module`]);
 //! [`regalloc`] the register allocator, [`operands`] the operand/constant readers,
 //! [`r#move`] the inline `move`/`swap`, [`test`] the word-level `test` subset,
-//! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path and
-//! [`aggregate`] the guarded cons-cell and tuple readers.
+//! [`select`] the exact-value switch, [`arith`] the guarded small-int fast path,
+//! [`link`] the direct block-to-block linker and [`aggregate`] the guarded cons-cell
+//! and tuple readers.
 #![allow(unsafe_code)]
 
 use std::collections::BTreeMap;
@@ -53,6 +67,8 @@ use super::{jit_step_one, CompiledModule};
 
 mod aggregate;
 mod arith;
+mod compare;
+mod link;
 mod r#move;
 mod operands;
 mod regalloc;
@@ -64,6 +80,8 @@ use aggregate::{
     try_inline_select_tuple_arity,
 };
 use arith::try_inline_gc_bif;
+use compare::try_inline_comparison;
+use link::{emit_frame_teardown, Linker};
 use operands::x_offset;
 use r#move::{try_inline_move, try_inline_swap};
 use select::try_inline_select_val;
@@ -172,6 +190,25 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
     let mut highest_cached_register: Option<u32> = None;
     let mut highest_native_register: Option<u32> = None;
 
+    // Reserve one entry label per non-empty compiled block **before** emitting any
+    // code, so a branch to a successor block — usually a forward reference, e.g. a
+    // `jump` to a block emitted later or a `fail` label — is resolved by the
+    // buffer's ordinary `rel32` fixup machinery at `bind` time, before `seal` flips
+    // the mapping to read+execute. Each label is bound at its block's entry offset
+    // below, exactly where the driver's `entries` slot points.
+    let mut block_labels: BTreeMap<(u32, u32), CodeLabel> = BTreeMap::new();
+    for (func_index, function) in module.functions.iter().enumerate() {
+        let code = &function.code;
+        for block in &function.blocks {
+            let start = block.start;
+            let end = block.end.min(code.len());
+            if start >= end {
+                continue;
+            }
+            block_labels.insert((func_index as u32, start as u32), buffer.label());
+        }
+    }
+
     for (func_index, function) in module.functions.iter().enumerate() {
         let func = func_index as u32;
         let code = &function.code;
@@ -191,11 +228,16 @@ pub(crate) fn compile_module(module: &Module) -> Result<CompiledModule> {
                 }
             }
 
+            // Bind this block's reserved entry label to the offset it is about to be
+            // emitted at (the slot `entries[func_index][start]` will point at). The
+            // key always exists: it was reserved for exactly these non-empty blocks.
+            buffer.bind(block_labels[&(func, start as u32)])?;
             let offset = buffer.len();
             emit_block(
                 &mut buffer,
                 module,
                 &labels,
+                &block_labels,
                 func,
                 code,
                 start,
@@ -246,6 +288,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
     let mut instructions = 0usize;
     let mut blocks = 0usize;
     let mut gc_bifs = 0usize;
+    let mut cmp_bifs = 0usize;
     let mut list_reads = 0usize;
     let mut tuple_paths = 0usize;
     for function in &module.functions {
@@ -253,7 +296,11 @@ fn code_capacity_estimate(module: &Module) -> usize {
         blocks += function.blocks.len();
         for instr in &function.code {
             match instr {
-                Instr::GcBif { .. } => gc_bifs += 1,
+                Instr::Bif { .. } => cmp_bifs += 1,
+                Instr::GcBif { .. } => {
+                    gc_bifs += 1;
+                    cmp_bifs += 1;
+                }
                 Instr::GetList { .. } | Instr::GetHd { .. } | Instr::GetTl { .. } => {
                     list_reads += 1
                 }
@@ -268,6 +315,7 @@ fn code_capacity_estimate(module: &Module) -> usize {
     128 * blocks
         + INSTRUCTION_BYTES * instructions
         + FAST_PATH_BYTES * gc_bifs
+        + COMPARE_PATH_BYTES * cmp_bifs
         + LIST_PATH_BYTES * list_reads
         + TUPLE_PATH_BYTES * tuple_paths
         + DEFAULT_CAPACITY
@@ -291,6 +339,15 @@ const INSTRUCTION_BYTES: usize = 192;
 /// constant compare) plus the [`emit_step_and_continue`] fallback it branches to
 /// (~150 bytes).
 const FAST_PATH_BYTES: usize = 384;
+
+/// The code-size budget reserved for one comparison BIF (see
+/// [`code_capacity_estimate`]): the two operand loads (~20 bytes), the two small-int
+/// guards with their mask materialisation (~40), the compare/branch (~10), both
+/// `true`/`false` materialisations with their skip jumps (~45) and the
+/// [`emit_step_and_continue`] fallback it branches to (~150, also covered by the
+/// per-instruction [`INSTRUCTION_BYTES`]). Deliberately loose: under-estimating
+/// would turn a large module into a `SystemLimit` compile error.
+const COMPARE_PATH_BYTES: usize = 256;
 
 /// The code-size budget reserved for one `get_list`/`get_hd`/`get_tl` (see
 /// [`code_capacity_estimate`]): the guarded cons-cell read — a mask/test/branch, the
@@ -319,6 +376,7 @@ fn emit_block(
     buffer: &mut CodeBuffer,
     module: &Module,
     labels: &BTreeMap<Label, (u32, u32)>,
+    block_labels: &BTreeMap<(u32, u32), CodeLabel>,
     func: u32,
     code: &[Instr],
     start: usize,
@@ -342,6 +400,9 @@ fn emit_block(
     }
 
     let done: CodeLabel = buffer.label();
+    // The direct block-to-block linker: a taken branch to a compiled successor's
+    // entry leaves this block's frame and jumps straight there (see [`link`]).
+    let linker = Linker::new(block_labels);
 
     // --- body ---------------------------------------------------------------
     //
@@ -463,6 +524,7 @@ fn emit_block(
                 if try_inline_select_tuple_arity(
                     buffer,
                     labels,
+                    &linker,
                     tuple,
                     *fail,
                     destinations,
@@ -482,15 +544,53 @@ fn emit_block(
             // (any other BIF, an un-addressable operand, or a register the budget
             // could not cache) it is exactly the `_` arm below.
             Instr::GcBif { .. } => {
-                if !try_inline_gc_bif(buffer, module, instr, allocation, done, func, pc, highest_touched)? {
+                let inlined = try_inline_gc_bif(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? || try_inline_comparison(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )?;
+                if !inlined {
+                    emit_step_and_continue(buffer, done, allocation, func, pc)?;
+                }
+            }
+            // The comparison BIFs (`erlang`'s `=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`),
+            // which the compiler emits as a **non-collecting** `bif` (see [`compare`]).
+            // Any other BIF, an un-addressable operand, or a module without both
+            // `true`/`false` interned is the `_` arm below.
+            Instr::Bif { .. } => {
+                if !try_inline_comparison(
+                    buffer,
+                    module,
+                    instr,
+                    allocation,
+                    done,
+                    func,
+                    pc,
+                    highest_touched,
+                )? {
                     emit_step_and_continue(buffer, done, allocation, func, pc)?;
                 }
             }
             Instr::Jump { target } => match labels.get(target) {
                 Some(&(target_func, target_pc)) => {
-                    spill(buffer, allocation)?;
-                    buffer.mov_ri(Reg::Rax, encode_target(target_func, target_pc))?;
-                    buffer.jmp(done)?;
+                    // A compiled successor is entered **directly** (the linker tears
+                    // this block's frame down and jumps to its entry); anything else
+                    // returns the `(func, pc)` word to the driver exactly as before.
+                    linker.emit_exit(buffer, allocation, done, target_func, target_pc)?;
                     terminated = true;
                     break;
                 }
@@ -507,6 +607,7 @@ fn emit_block(
                     buffer,
                     module,
                     labels,
+                    &linker,
                     instr,
                     allocation,
                     done,
@@ -527,7 +628,15 @@ fn emit_block(
             // (the interpreter returns a `Step::Goto` for every path), so the block
             // ends here.
             Instr::SelectVal { .. } => {
-                if try_inline_select_val(buffer, labels, instr, allocation, done, highest_touched)? {
+                if try_inline_select_val(
+                    buffer,
+                    labels,
+                    &linker,
+                    instr,
+                    allocation,
+                    done,
+                    highest_touched,
+                )? {
                     terminated = true;
                     break;
                 }
@@ -539,18 +648,19 @@ fn emit_block(
     }
 
     if !terminated {
-        // The block ran off its end: hand the next address back to the driver.
-        spill(buffer, allocation)?;
-        buffer.mov_ri(Reg::Rax, encode_target(func, end as u32))?;
-        buffer.jmp(done)?;
+        // The block ran off its end: hand the next address back to the driver — or,
+        // when the following block starts exactly there, jump straight into it.
+        linker.emit_exit(buffer, allocation, done, func, end as u32)?;
     }
 
     // --- epilogue -----------------------------------------------------------
+    //
+    // The shared exit every deopt path jumps to (a helper that produced a
+    // non-`Next` outcome, a returned `fail`/case target word). Those paths have
+    // already spilled the cached x-registers, so the epilogue only leaves the
+    // frame — the exact inverse of the prologue.
     buffer.bind(done)?;
-    buffer.lea(Reg::Rsp, Reg::Rsp, 24)?;
-    for reg in SAVED_REGISTERS.iter().rev() {
-        buffer.pop_r(*reg)?;
-    }
+    emit_frame_teardown(buffer)?;
     buffer.ret()
 }
 

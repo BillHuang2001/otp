@@ -185,10 +185,12 @@ pub(crate) trait NativeCode {
 /// A zero-sized selector: it holds no per-run code state, so the artifact it
 /// compiles ([`CompiledModule`]) is caller-owned and can be run any number of times
 /// through [`JitBackend::run_compiled`] without recompiling. The one-shot
-/// [`JitBackend::run_export`] (`run_with_tier` creates a fresh backend per run)
-/// compiles once and runs immediately; callers that run a module repeatedly use the
-/// two steps directly. Inlining quality and a cross-run code cache are *performance*
-/// concerns deferred to a later task — this is the mechanism and its correctness.
+/// [`JitBackend::run_export`] compiles once and runs immediately; a caller that runs
+/// a module repeatedly either uses the two steps directly with a caller-held artifact
+/// or goes through [`Machine::run_with_tier`](crate::Machine::run_with_tier), which
+/// reuses the per-thread cross-run cache ([`crate::jit::cache`]) so an identical
+/// second run does not recompile. Inlining quality is *performance* work deferred to a
+/// later task — this is the mechanism and its correctness.
 #[derive(Clone, Copy, Debug, Default)]
 pub struct BaselineJit;
 
@@ -327,7 +329,7 @@ impl CompiledModule {
 /// The native lookup is the compiled block table: any compiled `(func, pc)` is
 /// entered, and every other address stays on the interpreter step. See
 /// [`run_native`] for the shared driver the two native tiers run on.
-fn run_compiled(
+pub(crate) fn run_compiled(
     compiled: &CompiledModule,
     machine: &mut Machine,
     module: &Module,

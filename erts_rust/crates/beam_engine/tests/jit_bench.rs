@@ -7,9 +7,10 @@
 //! the interpreter's). It never asserts that a JIT is faster: that is
 //! environment-dependent and would be flaky; the printed numbers are the evidence.
 //!
-//! Four workloads: the first three hit the three shapes the baseline tier's
+//! Five workloads: the first three hit the three shapes the baseline tier's
 //! arithmetic/register story treats differently, the fourth the **aggregate reads**
-//! it inlines in the same round.
+//! it inlines in the same round, and the fifth the **comparison BIFs** the same round
+//! also lowered.
 //!
 //! * **`fib(20)`** — the real `.beam` fixture's `fib/1`
 //!   (`beam_loader/tests/fixtures/slice.beam`, reused by relative path so there is
@@ -39,6 +40,15 @@
 //!   builders stay on the interpreter step) and every read result is fed into the
 //!   multiply chain, so the timed loop is dominated by the new inlines rather than by
 //!   the aggregate construction, the BIF machinery or the per-run setup.
+//! * **`cmp/2`** — the same synthetic style, but a straight-line body of
+//!   [`CMP_OPS`] rounds of the eight `erlang` comparison operators
+//!   (`=:=`/`=/=`/`==`/`/=`/`<`/`=<`/`>`/`>=`), every one of them a **non-collecting**
+//!   `bif` over two small-int x-registers with an x-register destination — the shape
+//!   the comparison fast path lowers natively (see `src/jit/baseline/emit/compare.rs`
+//!   and `src/jit/cranelift/compare.rs`). Both operands are `x`-register *runtime*
+//!   values, so the inlined run-time small-int guard is exercised too. Left on the
+//!   helper each comparison costs a full `jit_step_one` round-trip, which is exactly
+//!   what this workload is here to measure.
 //!
 //! # Method — execution, not compilation
 //!
@@ -68,7 +78,8 @@
 //! register/float-register files plus the module-wide label-map build) plus the
 //! actual execution; for `fib(20)` that is thousands of instructions, for the
 //! kernel it is [`KERNEL_OPS`] inlined adds, for the aggregate kernel it is
-//! [`AGGR_STEPS`] steps of the inlined aggregate reads plus `'*'`.
+//! [`AGGR_STEPS`] steps of the inlined aggregate reads plus `'*'`, and for the
+//! comparison kernel it is [`CMP_OPS`] rounds of inlined comparison BIFs.
 //!
 //! Run with `--nocapture` to see the table.
 //!
@@ -79,6 +90,7 @@ use std::collections::BTreeMap;
 use std::time::{Duration, Instant};
 
 use beam_common::BeamError;
+use beam_engine::context::BifHook;
 use beam_engine::jit::baseline::{BaselineJit, CompiledModule};
 #[cfg(feature = "jit-cranelift")]
 use beam_engine::jit::cranelift::{CompiledFunctions, CraneliftJit};
@@ -86,7 +98,7 @@ use beam_engine::{available_tiers, JitBackend, Machine, MinimalContext, Tier};
 use beam_loader::{
     load_file, Block, Export, Function, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
-use beam_term::{is_small, make_small, signed_value, Atom, Eterm};
+use beam_term::{is_small, make_atom, make_small, signed_value, Atom, Eterm};
 
 /// The `beam_loader` oracle fixture (reused, never copied).
 const SLICE_BEAM: &str = concat!(
@@ -115,6 +127,49 @@ const WIDE_OPS: usize = 256;
 /// `get_list`/`get_hd`/`get_tl` trio, one `get_tuple_element` and two
 /// `gc_bif '*'/2` fast-path multiplies each.
 const AGGR_STEPS: usize = 128;
+
+/// The number of rounds the comparison kernel walks its eight operators — eight
+/// comparison BIFs per round, so this many times eight comparisons per run.
+///
+/// Each round is eight `erlang` comparison BIFs over the same three small-int
+/// x-registers — the exact shape the baseline and Cranelift tiers now lower natively
+/// (`src/jit/baseline/emit/compare.rs`, `src/jit/cranelift/compare.rs`). Every one of
+/// them would otherwise cost a full `jit_step_one` helper round-trip (see
+/// [`compare_workload`]), so a body long enough for execution to dominate the per-run
+/// setup is what makes this workload measure the inlines rather than the driver.
+const CMP_OPS: usize = 64;
+
+/// The eight `erlang` comparison operators the comparison kernel chains, in the order
+/// it walks them — one per round (the operator is looked up in each module's import
+/// table by name, so the order here only decides the round's shape).
+const CMP_OPERATORS: [&str; 8] = ["=:=", "=/=", "==", "/=", "<", "=<", ">", ">="];
+
+/// The index of `"<"` in [`CMP_OPERATORS`] — the operator of the trailing comparison
+/// that fixes the comparison kernel's exported result (see [`compare_workload`]).
+const CMP_LT: usize = 4;
+
+/// The x-registers the comparison kernel compares, and the values they hold:
+/// `10`, `20` and `3`.
+///
+/// All three are **small integers for the whole run** (nothing writes them again), so
+/// every comparison's inlined run-time guard passes and the timed loop stays on the
+/// native fast path instead of deopting to the helper. Register pairs rotate over
+/// these three (see [`compare_workload`]) so the rounds produce a mix of `true` and
+/// `false` results rather than a constant.
+const CMP_REGISTERS: [u32; 3] = [0, 1, 2];
+
+/// The values [`CMP_REGISTERS`] hold: `x(0)`/`x(1)` arrive as the call arguments,
+/// `x(2)` is seeded by the body itself.
+const CMP_ARGS: [i64; 2] = [10, 20];
+
+/// The value the body seeds `x(2)` with.
+const CMP_SEED: i64 = 3;
+
+/// The three x-registers the comparison results are written to, cycled over the
+/// rounds. None of them is ever read back as an operand (a comparison result is an
+/// atom, and the kernel's operands must stay small integers), so the chain never
+/// feeds a boolean forward.
+const CMP_DESTINATIONS: [u32; 3] = [3, 4, 5];
 
 /// The slice BIF hook: `erlang:'+'/2`, `erlang:'-'/2` and `erlang:'*'/2` over
 /// small integers.
@@ -145,6 +200,42 @@ fn arith_hook(
     }
 }
 
+/// The eight `erlang` comparison operators, answered for two small-int operands.
+///
+/// The comparison kernel's every operand is a small integer (it never feeds a
+/// boolean result forward), so the exact (`=:=`/`=/=`) and arithmetic
+/// (`==`/`/=`/`<`/`=<`/`>`/`>=`) orders coincide with the plain integer comparison
+/// used here — the same value the tiers' inlined single `cmp`/`jcc` produces. `None`
+/// means "not one of the eight, or not the small-int shape this kernel runs" and lets
+/// the hook fall through to [`arith_hook`], whose error is loud rather than a
+/// fabricated boolean.
+fn compare_hook(
+    module: &str,
+    function: &str,
+    arity: u32,
+    args: &[Eterm],
+    truthy: Eterm,
+    falsy: Eterm,
+) -> Option<Result<Eterm, BeamError>> {
+    if module != "erlang" || arity != 2 || args.len() != 2 {
+        return None;
+    }
+    if !is_small(args[0]) || !is_small(args[1]) {
+        return None;
+    }
+    let (a, b) = (signed_value(args[0]), signed_value(args[1]));
+    let result = match function {
+        "=:=" | "==" => a == b,
+        "=/=" | "/=" => a != b,
+        "<" => a < b,
+        "=<" => a <= b,
+        ">" => a > b,
+        ">=" => a >= b,
+        _ => return None,
+    };
+    Some(Ok(if result { truthy } else { falsy }))
+}
+
 /// Resolve a name interned in the module's atom table.
 fn atom(module: &Module, name: &str) -> Atom {
     module
@@ -168,6 +259,8 @@ enum Kind {
     Wide,
     /// The hand-built straight-line kernel of the inlined aggregate reads.
     Aggr,
+    /// The hand-built straight-line kernel of the inlined comparison BIFs.
+    Cmp,
 }
 
 impl Kind {
@@ -193,6 +286,10 @@ impl Kind {
             // reads plus two `'*'` multiplies) — roughly three times the wide body per
             // run, so a smaller count keeps the whole file inside its ~1 s budget.
             Kind::Aggr => 2_500,
+            // [`CMP_OPS`] rounds of eight comparison BIFs each: 512 comparisons per
+            // run, which the interpreter pays a helper round-trip (and a `Box`ed hook
+            // call) for and a native tier lowers to a compare and a branch each.
+            Kind::Cmp => 2_500,
         }
     }
 }
@@ -211,6 +308,38 @@ struct Workload {
     arity: u32,
     /// The call arguments.
     args: Vec<Eterm>,
+}
+
+impl Workload {
+    /// The BIF hook this workload's runs need — the pluggable body of the
+    /// interpreter's `ctx.call_bif`.
+    ///
+    /// Every arithmetic workload uses [`arith_hook`] verbatim (the native tiers'
+    /// inlined fast paths never consult the hook, so it is the interpreter tier and
+    /// every rejected operand that goes through it). The comparison kernel needs one
+    /// thing more: the result of a comparison is the module's **own** `true`/`false`
+    /// atom word, and an atom index only means something inside the [`AtomTable`] it
+    /// was interned in (each workload here owns a private table), so the boolean can
+    /// only be built from *this* module's table. The closure captures the two words
+    /// the kernel's module defines and answers the eight operators with them, falling
+    /// through to [`arith_hook`] for every other BIF.
+    ///
+    /// [`AtomTable`]: beam_term::AtomTable
+    fn bif_hook(&self) -> BifHook {
+        if self.kind != Kind::Cmp {
+            return Box::new(arith_hook);
+        }
+        let truthy = self.module.atom_table.lookup("true").map(make_atom);
+        let falsy = self.module.atom_table.lookup("false").map(make_atom);
+        Box::new(move |module, function, arity, args| {
+            if let (Some(truthy), Some(falsy)) = (truthy, falsy) {
+                if let Some(result) = compare_hook(module, function, arity, args, truthy, falsy) {
+                    return result;
+                }
+            }
+            arith_hook(module, function, arity, args)
+        })
+    }
 }
 
 /// `slice:fib/1` over the committed oracle fixture.
@@ -586,10 +715,164 @@ fn aggregate_workload() -> Workload {
     }
 }
 
+/// The synthetic **comparison** kernel: `cmp/2` is a straight-line body of
+/// [`CMP_OPS`] rounds of the eight `erlang` comparison operators, i.e. inside each
+/// round one comparison per operator, over the three small-int x-registers seeded
+/// with [`CMP_ARGS`] / [`CMP_SEED`]:
+///
+/// ```text
+///   x2 = 3                           ; move   (inlined; x0 = 10, x1 = 20 arrive as args)
+///   x3 = x0 =:= x1                   ; bif    (inlined comparison fast path)
+///   x4 = x1 =/= x2                   ; bif    (inlined)
+///   x5 = x2 ==  x0                   ; bif    (inlined)
+///   x3 = x0 /=  x1                   ; bif    (inlined)
+///   x4 = x1 <   x2                   ; bif    (inlined)
+///   x5 = x2 =<  x0                   ; bif    (inlined)
+///   x3 = x0 >   x1                   ; bif    (inlined)
+///   x4 = x1 >=  x2                   ; bif    (inlined)
+///   ... repeated [`CMP_OPS`] times,
+///   x0 = x2 < x1                     ; the export's result — 3 < 20, i.e. `true`
+///   return
+/// ```
+///
+/// This is the shape the baseline tier's and Cranelift tier's comparison fast paths
+/// claim (`src/jit/baseline/emit/compare.rs`, `src/jit/cranelift/compare.rs`): a
+/// **non-collecting** `bif` (`Instr::Bif`, which is how the compiler emits these
+/// operators) whose two operands are x-registers and whose destination is an
+/// x-register. Both operands are *runtime* values, so the fast path's inlined small-int
+/// guard runs on every one of them; the interpreter, by contrast, pays a full dispatch
+/// step (an argument `Vec` plus a `Box`ed hook call) for each of them — and a native
+/// tier that failed to inline one would pay a `jit_step_one` round-trip — which is the
+/// difference this workload is here to measure.
+///
+/// Two invariants keep the measurement on the inlined path, and both are by
+/// construction rather than by hope:
+///
+/// * every **operand** register (`x(0)`..`x(2)`) holds a small integer for the whole
+///   run (nothing ever writes them again), so no guard ever rejects; and
+/// * every **result** goes to one of [`CMP_DESTINATIONS`] (`x(3)`..`x(5)`), which are
+///   never read as operands — a comparison result is an atom, and feeding one forward
+///   would leave the small-int shape the fast path requires.
+///
+/// The operator/operand pairing (`x(k)` against `x(k+1)`, cyclically) is chosen so the
+/// rounds produce a mix of `true` and `false` results rather than a constant, while the
+/// trailing comparison's `true` is what the export returns — so the benchmark's
+/// correctness assertion sees a real comparison result (the module's own `true` atom),
+/// not a trivially-agreeing accumulator.
+///
+/// The body is one basic block, exactly like [`kernel_workload`]: a function with an
+/// empty `blocks` list has no native entry point at all.
+fn compare_workload() -> Workload {
+    assert_eq!(
+        CMP_OPERATORS[CMP_LT], "<",
+        "CMP_LT must index the `<` operator the trailing comparison uses"
+    );
+
+    let mut module = Module::default();
+    module.name = module.atom_table.intern("jit_bench_compare");
+    // The comparison fast paths materialize the **module's own** `true`/`false` atom
+    // words and refuse to inline a comparison when either is absent (they never
+    // fabricate an atom), so both must be interned — and the interpreter's hook needs
+    // them for the same reason (see `Workload::bif_hook`).
+    module.atom_table.intern("true");
+    module.atom_table.intern("false");
+
+    let erlang = module.atom_table.intern("erlang");
+    let mut operators = Vec::with_capacity(CMP_OPERATORS.len());
+    for name in CMP_OPERATORS {
+        let function = module.atom_table.intern(name);
+        operators.push(ImportRef(module.imports.len() as u32));
+        module.imports.push(Import {
+            module: erlang,
+            function,
+            arity: 2,
+        });
+    }
+
+    let cmp = module.atom_table.intern("cmp");
+    let entry = Label(1);
+    module.exports.push(Export {
+        function: cmp,
+        arity: 2,
+        label: entry,
+    });
+
+    let mut code = vec![Instr::Label(entry)];
+    // `x(0)`/`x(1)` arrive as the call arguments; `x(2)` is seeded here.
+    code.push(Instr::Move {
+        src: Operand::Integer(CMP_SEED),
+        dst: Operand::X(CMP_REGISTERS[2]),
+    });
+    for _ in 0..CMP_OPS {
+        for (index, operator) in operators.iter().enumerate() {
+            let lhs = CMP_REGISTERS[index % CMP_REGISTERS.len()];
+            let rhs = CMP_REGISTERS[(index + 1) % CMP_REGISTERS.len()];
+            let dst = CMP_DESTINATIONS[index % CMP_DESTINATIONS.len()];
+            code.push(Instr::Bif {
+                arity: 2,
+                bif: *operator,
+                fail: NO_FAIL,
+                args: vec![Operand::X(lhs), Operand::X(rhs)],
+                dst: Operand::X(dst),
+            });
+        }
+    }
+    // The export's result: `x(2)` (3) `<` `x(1)` (20) is `true`. Writing `x(0)` is
+    // safe here and only here — it is an operand register, but this is the last
+    // instruction before the `return`.
+    code.push(Instr::Bif {
+        arity: 2,
+        bif: operators[CMP_LT],
+        fail: NO_FAIL,
+        args: vec![Operand::X(CMP_REGISTERS[2]), Operand::X(CMP_REGISTERS[1])],
+        dst: Operand::X(0),
+    });
+    code.push(Instr::Return);
+
+    let labels: BTreeMap<Label, usize> = code
+        .iter()
+        .enumerate()
+        .filter_map(|(index, instr)| match instr {
+            Instr::Label(label) => Some((*label, index)),
+            _ => None,
+        })
+        .collect();
+
+    // One block: the whole straight-line body, from the entry label to the end.
+    let blocks = vec![Block {
+        label: entry,
+        start: 0,
+        end: code.len(),
+    }];
+
+    module.functions.push(Function {
+        func_label: entry,
+        entry_label: entry,
+        module: module.name,
+        name: cmp,
+        arity: 2,
+        code,
+        blocks,
+        labels,
+    });
+
+    Workload {
+        label: format!(
+            "cmp/2 ({CMP_OPS} rounds of the eight comparison BIFs over \
+             {} small-int x-registers)",
+            CMP_REGISTERS.len()
+        ),
+        kind: Kind::Cmp,
+        module,
+        function: cmp,
+        arity: 2,
+        args: vec![make_small(CMP_ARGS[0]), make_small(CMP_ARGS[1])],
+    }
+}
+
 // ---------------------------------------------------------------------------
 // The native backends
 // ---------------------------------------------------------------------------
-
 /// A native [`JitBackend`] **with the workload already compiled into it**.
 ///
 /// The enum exists to erase the two backends' distinct
@@ -694,7 +977,7 @@ struct Measurement {
 fn measure(tier: Tier, workload: &Workload) -> Measurement {
     let iterations = workload.kind.iterations();
     let mut machine = Machine::new();
-    let mut ctx = MinimalContext::with_bif_hook(Box::new(arith_hook));
+    let mut ctx = MinimalContext::with_bif_hook(workload.bif_hook());
 
     // Every entry `reset()`s the machine at the start of a run, so one machine can
     // be reused across the whole loop (the timed cost is the call, not the setup).
@@ -856,6 +1139,7 @@ fn interpreter_and_native_tiers_agree_and_report_timings() {
     let kernel = kernel_workload();
     let wide = wide_workload();
     let aggr = aggregate_workload();
+    let cmp = compare_workload();
     // The aggregate kernel's shape is pinned: `x(0)` arrives as `1` and every
     // multiplier the reads produce is `1`, so the interpreter's reference result is
     // exactly `1` (a taken fail arm would make it `-1`, and a non-small operand would
@@ -865,7 +1149,16 @@ fn interpreter_and_native_tiers_agree_and_report_timings() {
         make_small(1),
         "the aggregate kernel's reference result must be the bounded accumulator"
     );
-    for workload in [&fib, &kernel, &wide, &aggr] {
+    // The comparison kernel's shape is pinned the same way: its trailing comparison is
+    // `x(2)` (3) `<` `x(1)` (20), so the interpreter's reference result must be the
+    // module's own `true` atom — a wrong operand order, a wrong operator, or a
+    // fabricated boolean would not be.
+    assert_eq!(
+        measure(Tier::Interpreter, &cmp).result,
+        make_atom(atom(&cmp.module, "true")),
+        "the comparison kernel's reference result must be the module's `true` atom"
+    );
+    for workload in [&fib, &kernel, &wide, &aggr, &cmp] {
         bench_workload(workload);
     }
 }

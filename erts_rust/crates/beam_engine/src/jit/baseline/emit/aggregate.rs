@@ -17,9 +17,9 @@ use beam_term::{
 use crate::jit::emitter::{CodeBuffer, Cond, Label as CodeLabel, Reg};
 use crate::machine::MAX_REGISTER;
 
-use super::super::runtime::encode_target;
+use super::link::Linker;
 use super::operands::{x_offset, x_register};
-use super::{emit_step_and_continue, spill, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
+use super::{emit_step_and_continue, touch, Allocation, MOVE_SCRATCH, MOVE_SCRATCH_2};
 
 // ---------------------------------------------------------------------------
 // The cons-cell readers
@@ -552,6 +552,7 @@ pub(super) fn select_tuple_arity_plan(
 pub(super) fn try_inline_select_tuple_arity(
     buffer: &mut CodeBuffer,
     labels: &BTreeMap<Label, (u32, u32)>,
+    linker: &Linker<'_>,
     tuple: &Operand,
     fail: Label,
     destinations: &[(Operand, Label)],
@@ -579,17 +580,13 @@ pub(super) fn try_inline_select_tuple_arity(
         buffer.jcc(Cond::E, *case_label)?;
     }
 
-    // --- no alternative matched: return the fail label's `(func, pc)` -------
-    spill(buffer, allocation)?;
-    buffer.mov_ri(Reg::Rax, encode_target(plan.fail.0, plan.fail.1))?;
-    buffer.jmp(done)?;
+    // --- no alternative matched: branch to the fail label -------------------
+    linker.emit_exit(buffer, allocation, done, plan.fail.0, plan.fail.1)?;
 
-    // --- each alternative: return its target's `(func, pc)` -----------------
+    // --- each alternative: branch to its target ----------------------------
     for ((_, target), case_label) in plan.cases.iter().zip(&case_labels) {
         buffer.bind(*case_label)?;
-        spill(buffer, allocation)?;
-        buffer.mov_ri(Reg::Rax, encode_target(target.0, target.1))?;
-        buffer.jmp(done)?;
+        linker.emit_exit(buffer, allocation, done, target.0, target.1)?;
     }
 
     // Rejected (a non-tuple source): one interpreter step, whose typed

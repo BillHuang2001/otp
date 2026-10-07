@@ -1,0 +1,109 @@
+//! Raise helpers of the exception family: the reason-term constructors, the
+//! class-atom installation and the class classification [`super::exec`] and its
+//! opcode bodies share.
+//!
+//! Split out of [`super`] (the family's `exec` dispatch) by responsibility; the C
+//! ground truth and every edge case are documented on each item below and in
+//! [`super`]'s module docs.
+
+use beam_common::{ExceptionClass, Result};
+use beam_loader::{Module, Operand};
+use beam_term::{make_atom, Eterm};
+
+use crate::context::ExecutionContext;
+use crate::error;
+use crate::machine::Machine;
+use crate::operand::read_operand;
+use crate::terms;
+use crate::Step;
+
+// ---------------------------------------------------------------------------
+// Reason construction + class installation
+// ---------------------------------------------------------------------------
+
+/// Raise a `{Tag,Value}` `error` exception (the `badmatch`/`case_end`/
+/// `try_case_end`/`badrecord` expansion).
+///
+/// The tag atom is resolved from the running module's atom table; a module that
+/// never mentions it cannot name the reason, so a missing atom is a typed
+/// `unsupported` (never a wrong atom). The `error` class atom is installed when
+/// the module has it (see [`install_class_atom`]); an uncaught raise therefore
+/// still propagates as a proper `Err(BeamError::Raise(..))`.
+pub(super) fn raise_error_tuple(
+    machine: &mut Machine,
+    module: &Module,
+    ctx: &mut dyn ExecutionContext,
+    tag: &str,
+    value: &Operand,
+) -> Result<Option<Step>> {
+    let value = read_operand(machine, ctx, value)?;
+    let tag_atom = module
+        .atom_table
+        .lookup(tag)
+        .ok_or_else(|| error::unsupported(&format!("exceptions: no '{tag}' atom in the module")))?;
+    let reason = terms::make_tuple(ctx, &[make_atom(tag_atom), value])?;
+    let _ = install_class_atom(machine, module, ExceptionClass::Error);
+    machine.throw_error(reason).map(Some)
+}
+
+/// Raise a bare-atom `error` exception (`if_end` ⇒ the atom `if_clause`).
+pub(super) fn raise_error_atom(
+    machine: &mut Machine,
+    module: &Module,
+    tag: &str,
+) -> Result<Option<Step>> {
+    let atom = module
+        .atom_table
+        .lookup(tag)
+        .ok_or_else(|| error::unsupported(&format!("exceptions: no '{tag}' atom in the module")))?;
+    let reason = make_atom(atom);
+    let _ = install_class_atom(machine, module, ExceptionClass::Error);
+    machine.throw_error(reason).map(Some)
+}
+
+/// Install `class`'s atom from the module atom table into the machine.
+///
+/// Returns the atom term on success; when the atom is absent from the module
+/// atom table the machine keeps its previous (or unset) value and a typed
+/// `unsupported` is returned. Callers that must not spend the error (a raise
+/// landing decides lazily) ignore it; a `throw` with no installed atom then fails
+/// with the same typed error at landing time, rather than substituting a
+/// different, wrong atom.
+pub(super) fn install_class_atom(
+    machine: &mut Machine,
+    module: &Module,
+    class: ExceptionClass,
+) -> Result<Eterm> {
+    match module.atom_table.lookup(class.as_str()) {
+        Some(atom) => {
+            let term = make_atom(atom);
+            machine.set_class_atom(class, term);
+            Ok(term)
+        }
+        None => Err(error::unsupported(&format!(
+            "exceptions: no '{}' atom for the exception class in the module",
+            class.as_str()
+        ))),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Class classification (`raw_raise`'s class protocol)
+// ---------------------------------------------------------------------------
+
+/// The BEAM exception `class` the atom `class_term` names, if any.
+///
+/// C compares against its global `am_error`/`am_exit`/`am_throw`
+/// (`../../erts/emulator/beam/beam_common.c:1161-1176`); the engine's atoms are
+/// module-local, so the names are resolved through the running module's atom
+/// table. Any other term — including a non-atom — is *not* a class, which is
+/// exactly what makes `raw_raise` take its `badarg` fall-through.
+pub(super) fn classify_class(module: &Module, class_term: Eterm) -> Option<ExceptionClass> {
+    [
+        ExceptionClass::Error,
+        ExceptionClass::Exit,
+        ExceptionClass::Throw,
+    ]
+    .into_iter()
+    .find(|class| module.atom_table.lookup(class.as_str()).map(make_atom) == Some(class_term))
+}

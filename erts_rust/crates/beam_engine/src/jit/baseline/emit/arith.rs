@@ -189,7 +189,7 @@ fn small_constant(operand: &Operand) -> Option<i64> {
 /// the fast path must classify a BIF by exactly the strings the interpreter's
 /// `GcBif` arm hands to [`ExecutionContext::call_bif`], or it would lower a call
 /// the interpreter routes somewhere else.
-fn import_names<'m>(module: &'m Module, target: ImportRef) -> Option<(&'m str, &'m str, u32)> {
+pub(super) fn import_names<'m>(module: &'m Module, target: ImportRef) -> Option<(&'m str, &'m str, u32)> {
     let import = module.imports.get(target.0 as usize)?;
     let module_name = module.atom_name(import.module)?;
     let function_name = module.atom_name(import.function)?;
