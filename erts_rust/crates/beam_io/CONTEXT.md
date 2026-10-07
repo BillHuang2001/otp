@@ -411,6 +411,18 @@ lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
   `output→output/outputv`, `ready_input→ready_input`, `ready_output→ready_output`, `control→control`,
   `timeout→timeout`, `stop→stop`, `driver_select` ⇒ `DriverContext::register`), changing no
   `Driver`/`Port`/`PortRegistry` signature.
+- **The four driver-registry slots: two are served process-globally, `driver_lock_driver` per-port, `driver_create_port` refuses.**
+  `add_driver_entry`/`remove_driver_entry` act on the process-global `DriverTable`, so they reach a host only through
+  `beam_abi::with_current_host` — the thread-local `DriverPort` publishes around every callback (`call`, plus
+  `poll_async`'s `async_free` branch) and outside one the slots answer the C's `-1`/`0`. `driver_lock_driver`
+  consults the port's **own** driver (the C's `prt->drv_ptr->handle`), never a name lookup: a `DriverPort` is always
+  a `dlopen`ed driver, so it answers `0` (the global table is touched only to honour its `locked` flag), while a
+  bare/statically linked host answers the C's `-1`. `driver_create_port` answers the C's single failure sentinel
+  `ERTS_INVALID_ERL_DRV_PORT` for two independent reasons — a driver callback already holds a `&mut` into the port
+  registry, so re-entering `PortRegistry::open` would be an unsound aliasing `&mut` (a fresh `open` inserts into the
+  port map and could invalidate the live `&mut Port`), and a new port needs a `Box<dyn PortHost>` that only
+  `beam_rt` can supply. The sentinel is the C's own answer for a request that cannot be honoured — no port is ever
+  fabricated.
 - **The host layer is one boxed `AbiHost` behind a stable pointer; the live port is reached through an installed
   `DriverContext`.** A `DriverHost` method runs **inside** a driver callback, where the port exists only as that
   borrowed context; with no context installed every port-touching method fails gracefully (`-1`/`None`/no-op)
