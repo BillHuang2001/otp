@@ -70,12 +70,17 @@
 //!
 //! # Deliberately not implemented (see the crate `CONTEXT.md`)
 //!
-//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here; the
-//! `*_lookup` navigation forms and the ownership verbs (`rename`/
-//! `safe_fixtable`/`give_away`/`setopts`/`whereis`/`give_away`) are out of M1
-//! scope; and access-control/ownership enforcement is a documented M1
-//! simplification (the [`Table`] primitives are owner-level and do not consult the
-//! access mode).
+//! `ets:foldl/3`/`foldr/3` need the `FunCaller` seam and are not wired up here; and
+//! access-control/ownership enforcement is a documented M1 simplification (the
+//! [`Table`] primitives are owner-level and do not consult the access mode). The
+//! verbs that cannot be made oracle-faithful over the frozen [`Table`] API —
+//! `ets:rename/2` (needs a name setter), `ets:select_reverse/1,2,3` (needs a
+//! reverse scan) and the pid-coupled ownership verbs `ets:give_away/3` /
+//! `ets:setopts/2` — stay unregistered in the child module [`extra`], which
+//! documents each gap.
+//!
+//! The verbs that *are* faithful live there too: `ets:safe_fixtable/2`,
+//! `ets:whereis/1`, `ets:update_element/4` and `ets:is_compiled_ms/1`.
 
 use std::collections::HashMap;
 
@@ -84,7 +89,7 @@ use beam_common::Result;
 use beam_ets::{
     compile, key_of, Access, MatchContinuation, Table, TableId, TableInfo, TableKind, TableOptions,
 };
-use beam_term::{atom_val, make_atom, signed_value, AtomTable, Eterm};
+use beam_term::{atom_val, make_atom, signed_value, Atom, AtomTable, Eterm};
 
 use crate::access::{
     is_atom, is_list, is_nil, is_small, is_tuple, make_ref_thing, ref_thing_id, tuple_element,
@@ -106,6 +111,14 @@ mod matches;
 /// It shares this module's handle contract and [`TableRegistry`]'s compiled-spec
 /// map, so it is a child of `ets` (declared here, not in `src/lib.rs`).
 mod specs;
+/// The remaining faithful `ets:*` verbs (`ets:safe_fixtable/2`, `ets:whereis/1`,
+/// `ets:update_element/4`, `ets:is_compiled_ms/1`).
+///
+/// They share this module's handle contract, [`TableRegistry`] and helpers
+/// (`take_table`/`restore_table`/`parse_updates`), so they are a child of `ets`
+/// (declared here, not in `src/lib.rs`). The verbs that stay unregistered, and
+/// why, are documented there.
+mod extra;
 /// The navigation terminator (`ets:first/1` … `ets:prev/2` at the end of the
 /// iteration order). The atom's *name* is `$end_of_table` (the printname of
 /// `atom.names`' `EOT='$end_of_table'`).
@@ -163,6 +176,18 @@ struct Continuation {
 #[derive(Default)]
 pub struct TableRegistry {
     tables: HashMap<u64, Table>,
+    /// The `named_table` name registry — the oracle's *meta name table*: the name
+    /// atom of every table created with the `named_table` option, mapped to its
+    /// handle.
+    ///
+    /// [`new_2`] populates it (rejecting a name that is already taken, as the
+    /// oracle's duplicate `ets:new(Name, [named_table])` is `badarg`), [`delete_1`]
+    /// clears the entry of a deleted named table, and `ets:whereis/1` plus the
+    /// name-atom table argument the verbs accept (see [`extra`]) read it. A table
+    /// created *without* `named_table` only records a `name` field
+    /// ([`Table::name`]) and never appears here — exactly as in the oracle, where
+    /// `ets:whereis(Name)` is `undefined` for such a table.
+    names: HashMap<Atom, u64>,
     /// The live `ets:select/3` continuations, keyed by the numeric id of the
     /// continuation ref thing handed to Erlang.
     continuations: HashMap<u64, Continuation>,
@@ -182,6 +207,7 @@ impl TableRegistry {
     pub fn new() -> TableRegistry {
         TableRegistry {
             tables: HashMap::new(),
+            names: HashMap::new(),
             continuations: HashMap::new(),
             next_continuation: CONTINUATION_ID_BASE,
             specs: HashMap::new(),
@@ -231,6 +257,35 @@ impl TableRegistry {
         self.tables.is_empty()
     }
 
+    /// Registers `name` as the handle of a table created with the `named_table`
+    /// option, returning `false` (and changing nothing) when the name is already
+    /// taken.
+    ///
+    /// A taken name makes `ets:new(Name, [named_table])` `badarg` in the oracle —
+    /// the C `ets_new_2` fails when `insert_named_tab` finds the name — which keeps
+    /// the name→handle mapping unambiguous for `ets:whereis/1`.
+    pub fn insert_name(&mut self, name: Atom, handle: u64) -> bool {
+        if self.names.contains_key(&name) {
+            return false;
+        }
+        self.names.insert(name, handle);
+        true
+    }
+
+    /// The handle of the `named_table` registered under `name`, if any (`None` is
+    /// the oracle's `undefined`).
+    pub fn lookup_name(&self, name: Atom) -> Option<u64> {
+        self.names.get(&name).copied()
+    }
+
+    /// Removes `name` from the name registry, returning the handle it named.
+    ///
+    /// A deleted table leaves the oracle's meta name table (`remove_named_tab`),
+    /// so its name is then free — `ets:whereis(Name)` is `undefined` and a fresh
+    /// `ets:new(Name, [named_table])` succeeds.
+    pub fn remove_name(&mut self, name: Atom) -> Option<u64> {
+        self.names.remove(&name)
+    }
     /// Registers `state` as a live continuation of the table stored under
     /// `table`, returning the fresh continuation id (the id of the ref thing the
     /// `ets:select` BIFs hand to Erlang).
@@ -278,6 +333,12 @@ impl TableRegistry {
     pub fn spec_raw(&self, handle: u64) -> Option<Eterm> {
         self.specs.get(&handle).copied()
     }
+
+    /// Whether `handle` names a live compiled match spec (a `handle` produced by
+    /// [`TableRegistry::insert_spec`]) — the `ets:is_compiled_ms/1` predicate.
+    pub fn contains_spec(&self, handle: u64) -> bool {
+        self.specs.contains_key(&handle)
+    }
 }
 
 /// Registers the implemented `ets:*` BIFs (see the module docs for the scope).
@@ -318,11 +379,19 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     matches::register(reg);
     // The compiled match-spec family (child module `specs`).
     specs::register(reg);
+    // The remaining faithful verbs (child module `extra`): the fix flag, the
+    // name registry (`whereis`), `update_element/4` and `is_compiled_ms/1`.
+    extra::register(reg);
 }
 
 // --------------------------------------------------------------- creation
 
 /// `ets:new(Name, Options)` — creates a table and returns its handle.
+///
+/// A `named_table` whose name is already registered is `badarg` (the oracle's
+/// `ets_new_2` fails when the meta name table already holds the name); every other
+/// table records its name field only and takes part in no registry, matching
+/// `ets:whereis/1`'s `undefined` for it.
 fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let name = args[0];
     if !is_atom(name) {
@@ -331,11 +400,22 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let mut options = TableOptions::new();
     options.set_name(atom_val(name));
     parse_options(ctx.atoms(), args[1], &mut options)?;
+    // Read the name metadata before the options move into the table.
+    let named = options.is_named();
+    let table_name = options.name();
 
     let id = TableId::next();
     let table = Table::new(id, options)?;
     {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        if named {
+            // A `named_table` always carries the `Name` argument this call parsed
+            // (see `parse_options`), so a missing one is a malformed option set.
+            let table_name = table_name.ok_or_else(badarg)?;
+            if !tables.insert_name(table_name, id.raw()) {
+                return Err(badarg());
+            }
+        }
         tables.insert(id.raw(), table);
     }
     make_ref_thing(ctx.heap(), id.raw())
@@ -344,14 +424,24 @@ fn new_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
 // ------------------------------------------------------------- whole-table
 
 /// `ets:delete(Tab)` — deletes the whole table and returns `true`.
+///
+/// A deleted `named_table` also leaves the name registry (the oracle's
+/// `remove_named_tab`), so its name becomes free and `ets:whereis/1` on it is
+/// `undefined` again.
 fn delete_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let handle = ref_thing_id(args[0])?;
-    let existed = {
+    let removed = {
         let tables = ctx.tables().ok_or_else(unsupported_bif)?;
-        tables.remove(handle).is_some()
+        tables.remove(handle)
     };
-    if !existed {
+    let Some(table) = removed else {
         return Err(badarg());
+    };
+    if table.info().named_table {
+        if let Some(name) = table.name() {
+            let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+            tables.remove_name(name);
+        }
     }
     ctx.boolean(true)
 }
