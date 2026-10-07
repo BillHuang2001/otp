@@ -507,7 +507,14 @@ lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
   same atom built by running code — a silently wrong result. `beam_rt` owns the shared `beam_term::atom::AtomTable`
   (`beam_engine`'s `ExecutionContext`/`beam_bifs`' `AtomInterner`), so it supplies `PortHost` (interning into it,
   and `connected_pid`/`caller_pid`/`send_term` over the process/message path).
-- **Deferred `ErlDrvApi` slots (handoff to `beam_abi`).** These `erl_driver.h` slots are `None` in `beam_abi`'s
+- **`ErlDrvApi` slots that are served vs. still deferred (handoff to `beam_abi`).** The four
+  **driver-registry** slots are served: `add_driver_entry`/`remove_driver_entry` delegate to this crate's
+  process-global [`DriverTable`](src/abi/table.rs) through [`AbiHost`](src/abi/host.rs),
+  `driver_lock_driver` answers `0` for a port whose identity is a `dlopen`ed driver (the C consults the port's own
+  driver, not `driver_list`) and the C's `-1` for a bare/statically linked host, and `driver_create_port` answers
+  `ERTS_INVALID_ERL_DRV_PORT` — the C's single failure value, never a fabricated port (a driver callback already
+  holds a `&mut` into the port registry, and a new port would need a `Box<dyn PortHost>` only `beam_rt` can
+  supply). The remaining slots below are `None` in `beam_abi`'s
   `DRIVER_API` because `beam_abi`'s `DriverHost` seam has no method for them; each group lists the `DriverHost`
   methods `beam_abi` must add before the slot can be implemented:
   - **port queues** — `driver_vec_to_buf` + the `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/
