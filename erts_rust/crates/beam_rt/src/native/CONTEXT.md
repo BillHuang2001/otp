@@ -93,8 +93,9 @@ for an unregistered `registered_name`), so the list is a genuine, shorter-by-con
   **466** (this collector pre-allocates a 233-word mature generation). The real figure is reported
   deliberately — inventing 233 would be a lie.
 - **`memory`** is this runtime's own byte total (smaller than the oracle's, because the heap is).
-- **`status`** reflects *this* scheduler's `ProcessState` (a process parked in `receive` is
-  `waiting`, matching the oracle).
+- **`status`**: the calling process is `running` (this runtime is single-threaded, so exactly one
+  process executes at a time — the oracle's answer for the caller); every other process carries its
+  own `ProcessState` (a process parked in `receive` is `waiting`, matching the oracle).
 - **`group_leader`** is this runtime's root pid (the real, live pid `erlang:group_leader/0` answers),
   not the oracle's `<0.70.0>` io process.
 - **`reductions`** is this process's real counter (the absolute value differs — the code differs).
