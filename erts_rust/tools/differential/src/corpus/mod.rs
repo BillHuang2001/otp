@@ -3,11 +3,14 @@
 //! A case carries a [`Golden`] expectation of the oracle's observable output, plus a
 //! [`CaseKind`] that says how the two runtimes are driven. The golden makes the corpus
 //! self-testing: the oracle must reproduce it (if it stops, that is corpus drift — a real
-//! failure, not a skip). There are two kinds of case:
+//! failure, not a skip). There are three kinds of case:
 //!
 //! * [`CaseKind::Eval`] — a plain Erlang **expression** plus a [`Probe`]; both runtimes get
 //!   the *same* `-eval` argv. These exercise the compatibility surface an expression can
 //!   reach (ETF, semantics, BIFs, `system_info`, CLI flags).
+//! * [`CaseKind::EvalEnv`] — the same, but each runtime is additionally spawned with an
+//!   explicit environment, so the `ERL_*FLAGS` merge (contract A.6) is pinnable against the
+//!   oracle.
 //! * [`CaseKind::Module`] — a tiny embedded Erlang module is compiled with the system
 //!   `erlc` and one exported function is applied. The two runtimes get *different* argv
 //!   (the oracle's `-pa` + `-eval` versus the Rust runtime's `run` action), and only
@@ -192,6 +195,27 @@ pub enum CaseKind {
         /// How the expression is wrapped into a self-terminating probe.
         probe: Probe,
     },
+    /// An **environment-variable** expression case (contract A.6): exactly like
+    /// [`CaseKind::Eval`] (identical `-eval` argv for both runtimes), except each runtime
+    /// is additionally spawned with an explicit environment, so the `ERL_*FLAGS` merge —
+    /// `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]` — can
+    /// be pinned against the oracle end to end.
+    ///
+    /// It is a separate variant (rather than an `env` field on [`CaseKind::Eval`]) so the
+    /// hundreds of existing expression cases stay untouched; every case that does not pin
+    /// the merge reports an empty [`Case::env`].
+    EvalEnv {
+        /// The plain Erlang expression to evaluate.
+        expr: &'static str,
+        /// Extra argv inserted before `-eval` — the "command line" of the A.6 merge, so it
+        /// sits *after* `ERL_AFLAGS` and *before* `ERL_FLAGS`/`ERL_ZFLAGS`.
+        extra_argv: &'static [&'static str],
+        /// The `(name, value)` variables the runtime is spawned with, set **on top of** the
+        /// inherited environment (which is never cleared).
+        env: &'static [(&'static str, &'static str)],
+        /// How the expression is wrapped into a self-terminating probe.
+        probe: Probe,
+    },
     /// A module-run case: `erlc` compiles an embedded module and one exported function is
     /// applied. The two runtimes receive **different** argv — the oracle's
     /// `-noshell -pa <dir> -eval …` versus the Rust runtime's
@@ -287,7 +311,9 @@ impl Case {
     /// runtime is invoked through its `run` action instead — see [`CaseKind::Module`]).
     pub fn eval(&self) -> String {
         match &self.kind {
-            CaseKind::Eval { expr, probe, .. } => probe_expr(expr, *probe),
+            CaseKind::Eval { expr, probe, .. } | CaseKind::EvalEnv { expr, probe, .. } => {
+                probe_expr(expr, *probe)
+            }
             CaseKind::Module(run) => run.oracle_eval(),
         }
     }
@@ -296,7 +322,7 @@ impl Case {
     /// `"module-run"` for module cases.
     pub fn kind_label(&self) -> &'static str {
         match &self.kind {
-            CaseKind::Eval { probe, .. } => probe.as_str(),
+            CaseKind::Eval { probe, .. } | CaseKind::EvalEnv { probe, .. } => probe.as_str(),
             CaseKind::Module(_) => "module-run",
         }
     }
@@ -304,7 +330,7 @@ impl Case {
     /// The plain Erlang expression (`None` for a module-run case).
     pub fn expr(&self) -> Option<&'static str> {
         match &self.kind {
-            CaseKind::Eval { expr, .. } => Some(expr),
+            CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => Some(expr),
             CaseKind::Module(_) => None,
         }
     }
@@ -312,8 +338,17 @@ impl Case {
     /// The extra eval argv (`&[]` for a module-run case).
     pub fn extra_argv(&self) -> &'static [&'static str] {
         match &self.kind {
-            CaseKind::Eval { extra_argv, .. } => extra_argv,
+            CaseKind::Eval { extra_argv, .. } | CaseKind::EvalEnv { extra_argv, .. } => extra_argv,
             CaseKind::Module(_) => &[],
+        }
+    }
+
+    /// The explicit environment the runtimes are spawned with (`&[]` for every case that
+    /// does not pin the `ERL_*FLAGS` merge — see [`CaseKind::EvalEnv`]).
+    pub fn env(&self) -> &'static [(&'static str, &'static str)] {
+        match &self.kind {
+            CaseKind::EvalEnv { env, .. } => env,
+            CaseKind::Eval { .. } | CaseKind::Module(_) => &[],
         }
     }
 
@@ -435,6 +470,40 @@ mod tests {
     }
 
     #[test]
+    fn environment_cases_are_well_formed_and_never_carry_an_empty_env() {
+        let mut env_cases = 0;
+        for case in cases() {
+            match &case.kind {
+                CaseKind::EvalEnv { env, .. } => {
+                    env_cases += 1;
+                    assert!(
+                        !env.is_empty(),
+                        "case {}: an environment case must set at least one variable",
+                        case.id
+                    );
+                    assert_eq!(
+                        case.env(),
+                        *env,
+                        "case {}: the env accessor agrees",
+                        case.id
+                    );
+                }
+                CaseKind::Eval { .. } | CaseKind::Module(_) => {
+                    assert!(
+                        case.env().is_empty(),
+                        "case {}: only an EvalEnv case may set an environment",
+                        case.id
+                    );
+                }
+            }
+        }
+        assert!(
+            env_cases > 0,
+            "the corpus must carry environment-variable (`ERL_*FLAGS`) cases"
+        );
+    }
+
+    #[test]
     fn every_case_has_a_non_empty_golden_stdout() {
         for case in cases() {
             let golden = case
@@ -448,7 +517,7 @@ mod tests {
                 case.id
             );
             match &case.kind {
-                CaseKind::Eval { expr, .. } => {
+                CaseKind::Eval { expr, .. } | CaseKind::EvalEnv { expr, .. } => {
                     assert!(
                         golden.starts_with("ok ") || golden.starts_with("exception "),
                         "case {}: unexpected golden shape {golden:?}",

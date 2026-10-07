@@ -7,6 +7,9 @@
 //!
 //! * Expression cases ([`CaseKind::Eval`]) hand **one** argv to both runtimes (`beam_rt` is
 //!   a drop-in `erl` for them, contract A.6) and compare stdout + exit status + stderr.
+//! * Environment-variable expression cases ([`CaseKind::EvalEnv`]) are the same, except both
+//!   runtimes are additionally spawned with the case's explicit environment
+//!   ([`runtime::run_with_env`]), so the `ERL_*FLAGS` merge is pinnable.
 //! * Module-run cases ([`CaseKind::Module`]) hand **different** argv to the two runtimes
 //!   (the oracle's `-pa` + `-eval` vs. the Rust `run` action) and compare stdout + exit
 //!   status only (the Rust runtime's stderr boot banner is not a semantic difference).
@@ -144,6 +147,32 @@ pub fn run_case_in(context: &RuntimeContext, case: &Case) -> Result<CaseOutcome>
                 observables: Observables::All,
                 golden: Some(case.golden),
                 probe_wrapped: true,
+                env: &[],
+            };
+            execute(context, plan, None)
+        }
+        CaseKind::EvalEnv {
+            expr,
+            extra_argv,
+            env,
+            probe,
+        } => {
+            // An environment-variable expression case: the argv is the same drop-in `erl`
+            // shape as `CaseKind::Eval`, but both runtimes are additionally spawned with the
+            // case's explicit environment, so the `ERL_*FLAGS` merge is pinned end to end.
+            let eval = corpus::probe_expr(expr, *probe);
+            let argv = argv_for(&eval, extra_argv, &[]);
+            let plan = RunPlan {
+                case_id: case.id.to_string(),
+                description: case.description.to_string(),
+                contracts: case.contracts.to_vec(),
+                eval,
+                oracle_argv: argv.clone(),
+                rust_argv: argv,
+                observables: Observables::All,
+                golden: Some(case.golden),
+                probe_wrapped: true,
+                env: *env,
             };
             execute(context, plan, None)
         }
@@ -166,6 +195,7 @@ pub fn compare_expr(expr: &str, pa: &[String]) -> Result<CaseOutcome> {
         observables: Observables::All,
         golden: None,
         probe_wrapped: true,
+        env: &[],
     };
     execute(&context, plan, None)
 }
@@ -207,7 +237,7 @@ fn execute(
     plan: RunPlan,
     _module_guard: Option<module_build::CompiledModule>,
 ) -> Result<CaseOutcome> {
-    let oracle_observation = runtime::run(&context.oracle, &plan.oracle_argv)?;
+    let oracle_observation = runtime::run_with_env(&context.oracle, &plan.oracle_argv, plan.env)?;
     let golden_check = match &plan.golden {
         Some(golden) => check_golden(&oracle_observation, golden),
         None => GoldenCheck::not_asserted(),
@@ -215,7 +245,10 @@ fn execute(
     let oracle = SideResult::observed(oracle_observation);
 
     let rust = match &context.rust {
-        Some(spec) => classify_rust(runtime::run(spec, &plan.rust_argv)?, plan.probe_wrapped),
+        Some(spec) => classify_rust(
+            runtime::run_with_env(spec, &plan.rust_argv, plan.env)?,
+            plan.probe_wrapped,
+        ),
         None => SideResult::unsupported(rust_unsupported_reason()),
     };
 
@@ -276,6 +309,7 @@ fn run_module_case(context: &RuntimeContext, case: &Case, run: &ModuleRun) -> Re
         observables: Observables::StdoutAndExit,
         golden: Some(case.golden),
         probe_wrapped: false,
+        env: &[],
     };
     execute(context, plan, Some(compiled))
 }
@@ -328,10 +362,11 @@ const PROBE_EXCEPTION_PREFIX: &str = "exception ";
 ///   single `exception <class> <reason>` stdout line and exits `1`, and `<reason>` follows
 ///   the runtime's documented `unsupported` convention ([`caught_unsupported_reason`]).
 ///
-/// `probe_wrapped` must be `true` only for the expression cases ([`CaseKind::Eval`] and
-/// [`compare_expr`]), whose stdout is the probe's self-terminating line; the module-run
-/// cases print `~w` of a result (a different shape), so the caught-signal detection is
-/// deliberately disabled for them. Every other exit status is a genuine observation.
+/// `probe_wrapped` must be `true` only for the expression cases ([`CaseKind::Eval`],
+/// [`CaseKind::EvalEnv`] and [`compare_expr`]), whose stdout is the probe's self-terminating
+/// line; the module-run cases print `~w` of a result (a different shape), so the
+/// caught-signal detection is deliberately disabled for them. Every other exit status is a
+/// genuine observation.
 fn classify_rust(observation: runtime::Observation, probe_wrapped: bool) -> SideResult {
     if observation.exit_code == Some(runtime::UNSUPPORTED_EXIT_CODE) {
         return SideResult::unsupported(unsupported_reason(&observation));
@@ -440,6 +475,10 @@ struct RunPlan {
     /// caught-capability-gap classification ([`classify_rust`]); `false` for module-run
     /// cases, whose stdout is `~w` of a result.
     probe_wrapped: bool,
+    /// The explicit environment both runtimes are spawned with (the `ERL_*FLAGS` merge;
+    /// `&[]` for every case that does not pin it). See
+    /// [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv).
+    env: &'static [(&'static str, &'static str)],
 }
 
 /// Build the argv an expression case gets: any `-pa <dir>` code paths, the case's own

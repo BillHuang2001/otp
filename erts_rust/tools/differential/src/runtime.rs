@@ -22,7 +22,10 @@
 //! argv with `stdin` closed, and records the observed stdout/stderr/exit status. The two
 //! runtimes receive **identical** argv for the expression corpus cases but **different**
 //! argv for the module-run cases (the oracle's `-eval` versus the Rust `run` action), so
-//! each [`Observation`] records the argv it was actually spawned with.
+//! each [`Observation`] records the argv it was actually spawned with. An environment
+//! case ([`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv)) additionally spawns both
+//! runtimes with an explicit environment ([`run_with_env`]), so their `ERL_*FLAGS` merge is
+//! what is compared.
 
 use std::ffi::OsString;
 use std::path::{Path, PathBuf};
@@ -319,13 +322,34 @@ fn is_transient_text_file_busy(err: &std::io::Error) -> bool {
     false
 }
 
-/// Spawn `spec.program` with `argv`, with `stdin` closed, and capture its output.
+/// Spawn `spec.program` with `argv` and the inherited environment, with `stdin` closed,
+/// and capture its output.
 pub fn run(spec: &RuntimeSpec, argv: &[String]) -> Result<Observation> {
+    run_with_env(spec, argv, &[])
+}
+
+/// [`run`] with an explicit child **environment** (contract A.6).
+///
+/// Each `(name, value)` is set on the child *in addition to* the inherited environment —
+/// the harness never clears it, so the runtime's own resolution (`$PATH`, `$TMPDIR`, …)
+/// stays undisturbed. This is how an `ERL_*FLAGS` corpus case (a
+/// [`CaseKind::EvalEnv`](crate::corpus::CaseKind::EvalEnv)) pins the environment-variable
+/// merge — `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]`
+/// — against the oracle: both runtimes are spawned with the identical argv **and** the
+/// identical environment, so only their behavior can differ.
+pub fn run_with_env(
+    spec: &RuntimeSpec,
+    argv: &[String],
+    env: &[(&str, &str)],
+) -> Result<Observation> {
     let mut cmd = Command::new(&spec.program);
     cmd.args(argv)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    for (name, value) in env {
+        cmd.env(name, value);
+    }
     let output = output_with_retry(&mut cmd).map_err(|source| {
         Error::io(
             format!(
@@ -391,7 +415,8 @@ pub(crate) fn is_executable(path: &Path) -> bool {
 mod tests {
     use super::{
         eval_argv, eval_argv_owned, is_transient_text_file_busy, output_with_retry,
-        resolve_oracle_from, resolve_rust_from, run, RuntimeId, RuntimeSource, RuntimeSpec,
+        resolve_oracle_from, resolve_rust_from, run, run_with_env, RuntimeId, RuntimeSource,
+        RuntimeSpec,
     };
     use crate::error::Error;
     use std::ffi::OsString;
@@ -442,6 +467,38 @@ mod tests {
             std::fs::set_permissions(&path, perms).expect("chmod");
         }
         path
+    }
+
+    #[test]
+    fn run_with_env_sets_the_child_environment_and_keeps_the_inherited_one() {
+        // A short-lived `sh` is the portable way to observe the child environment: it
+        // prints the variable the harness set, and an empty line when it is unset.
+        #[cfg(unix)]
+        {
+            let spec = RuntimeSpec {
+                id: RuntimeId::Rust,
+                program: PathBuf::from("sh"),
+                source: RuntimeSource::Path,
+            };
+            let argv = vec![
+                "-c".to_string(),
+                String::from("printf %s \"$DIFFERENTIAL_RUN_ENV_PROBE\""),
+            ];
+            let with_env =
+                run_with_env(&spec, &argv, &[("DIFFERENTIAL_RUN_ENV_PROBE", "hello-env")])
+                    .expect("spawn sh with the probe variable");
+            assert_eq!(with_env.exit_code, Some(0));
+            assert_eq!(with_env.stdout, b"hello-env");
+            assert_eq!(
+                with_env.argv, argv,
+                "the observed argv is recorded verbatim"
+            );
+
+            // `run` is `run_with_env(…, &[])`: the variable is unset, so the shell prints
+            // nothing — the inherited environment is otherwise untouched.
+            let without_env = run(&spec, &argv).expect("spawn sh without the probe variable");
+            assert_eq!(without_env.stdout, b"");
+        }
     }
 
     #[test]
