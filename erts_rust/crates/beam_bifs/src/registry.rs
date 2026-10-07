@@ -73,6 +73,9 @@ impl BifRegistry {
         crate::term_conv::register(&mut reg);
         crate::erts_internal::register(&mut reg);
         crate::modinfo::register(&mut reg);
+        crate::match_spec::register(&mut reg);
+        crate::packet::register(&mut reg);
+        crate::proc_reg::register(&mut reg);
         reg
     }
 
