@@ -28,9 +28,11 @@ pub mod any_collector;
 pub mod collector;
 pub mod config;
 pub mod copy;
+mod error; // pub(crate) helpers only — NOT public
+pub mod fragment;
+pub mod heap_info;
 pub mod immix;
 pub mod immix_collector;
-mod error; // pub(crate) helpers only — NOT public
 pub mod mso;
 pub mod policy;
 pub mod space;
@@ -40,6 +42,10 @@ pub use crate::any_collector::*;
 pub use crate::collector::*;
 pub use crate::config::*;
 pub use crate::copy::*;
+#[allow(unused_imports)] // populated by the heap-sizing / fragment work
+pub use crate::fragment::*;
+#[allow(unused_imports)] // populated by the heap-sizing work
+pub use crate::heap_info::*;
 pub use crate::immix::*;
 pub use crate::immix_collector::*;
 pub use crate::mso::*;
@@ -53,6 +59,10 @@ pub mod prelude {
     pub use crate::collector::*;
     pub use crate::config::*;
     pub use crate::copy::*;
+    #[allow(unused_imports)] // populated by the heap-sizing / fragment work
+    pub use crate::fragment::*;
+    #[allow(unused_imports)] // populated by the heap-sizing work
+    pub use crate::heap_info::*;
     pub use crate::immix::*;
     pub use crate::immix_collector::*;
     pub use crate::mso::*;
