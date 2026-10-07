@@ -505,7 +505,10 @@ fn the_new_configuration_switches_reach_init_get_argument_like_the_oracle() {
         }
         // Sanity: the probe really answered `{ok,[…]}` (not a swallow-everything `error`).
         if !stdout(&rust).starts_with("ok {ok,[[") {
-            failures.push(format!("{flag}: unexpected probe output {:?}", stdout(&rust)));
+            failures.push(format!(
+                "{flag}: unexpected probe output {:?}",
+                stdout(&rust)
+            ));
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));

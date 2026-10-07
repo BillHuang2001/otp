@@ -566,7 +566,10 @@ mod tests {
     #[test]
     fn max_ports_accepts_legacy_and_the_oracle_range() {
         for value in ["1024", "134217727", "legacy"] {
-            assert!(parse_max_ports("+Q", value).is_ok(), "{value:?} must be accepted");
+            assert!(
+                parse_max_ports("+Q", value).is_ok(),
+                "{value:?} must be accepted"
+            );
         }
         for value in [
             "1000",
@@ -580,7 +583,10 @@ mod tests {
             // (a documented divergence — the oracle accepts `+Q 1024abc` as 1024).
             "1024abc",
         ] {
-            assert!(parse_max_ports("+Q", value).is_err(), "{value:?} must be rejected");
+            assert!(
+                parse_max_ports("+Q", value).is_err(),
+                "{value:?} must be rejected"
+            );
         }
     }
 
@@ -591,7 +597,10 @@ mod tests {
     /// (`bad number of processes <v>` + usage).
     #[test]
     fn max_processes_accepts_legacy_and_the_oracle_range() {
-        assert_eq!(parse_max_processes("+P", "1024").expect("valid"), Some(1024));
+        assert_eq!(
+            parse_max_processes("+P", "1024").expect("valid"),
+            Some(1024)
+        );
         assert_eq!(
             parse_max_processes("+P", "134217727").expect("valid"),
             Some(134_217_727)
@@ -644,9 +653,9 @@ mod tests {
     /// what makes [`Flavor::Emu`] reachable.
     #[test]
     fn emu_flavor_selects_the_documented_values() {
-        let flavor = |value: &str| {
+        fn flavor(value: &str) -> beam_common::Flavor {
             parse_emu_flavor("-emu_flavor", value).expect("a documented flavor")
-        };
+        }
         assert_eq!(flavor("emu"), beam_common::Flavor::Emu);
         assert_eq!(flavor("jit"), beam_common::Flavor::Jit);
         assert_eq!(flavor("smp"), beam_common::Flavor::Jit);
@@ -658,7 +667,9 @@ mod tests {
     /// The `-M*`/`+M*` recognition (`erlexec.c:1009-1028`).
     #[test]
     fn is_allocator_switch_recognizes_both_prefixes() {
-        for argument in ["-M", "+M", "-Mfoo", "+Mfoo", "-Mea", "+Mea", "+MMscs", "+MBas"] {
+        for argument in [
+            "-M", "+M", "-Mfoo", "+Mfoo", "-Mea", "+Mea", "+MMscs", "+MBas",
+        ] {
             assert!(is_allocator_switch(argument), "{argument:?}");
         }
         for argument in ["-m", "+m", "-eval", "+S", "M", "-", "--M", "-+M", ""] {
@@ -765,10 +776,19 @@ mod tests {
         }
         // The same values are accepted where the capability *is* allowed: a normal
         // alloc-util allocator (`B`) may be disabled / migrated.
-        assert_eq!(parse_allocator("+MBe", &args(&["+MBe", "false"]), 0).expect("allowed"), 2);
-        assert_eq!(parse_allocator("+MBcp", &args(&["+MBcp", "B"]), 0).expect("allowed"), 2);
+        assert_eq!(
+            parse_allocator("+MBe", &args(&["+MBe", "false"]), 0).expect("allowed"),
+            2
+        );
+        assert_eq!(
+            parse_allocator("+MBcp", &args(&["+MBcp", "B"]), 0).expect("allowed"),
+            2
+        );
         // … and `-Mu*` bypasses the gates (`u_switch = 1`).
-        assert_eq!(parse_allocator("+Mue", &args(&["+Mue", "false"]), 0).expect("allowed"), 2);
+        assert_eq!(
+            parse_allocator("+Mue", &args(&["+Mue", "false"]), 0).expect("allowed"),
+            2
+        );
     }
 
     /// The per-token value reader (`erl_alloc.c:get_value`, 1115-1131): the text after
