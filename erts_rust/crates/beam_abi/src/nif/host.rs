@@ -207,6 +207,25 @@ pub trait NifHost {
         let _ = term;
         None
     }
+
+    /// Resolve a resource term owned by **another** NIF module and call that type's `dyncall`
+    /// (C `enif_dynamic_resource_call`), returning the C result code (`0` = the call was made).
+    /// `env` is the live calling environment, `module`/`name` the atoms identifying the target
+    /// resource type, `resource` the resource term and `call_data` the opaque callback argument.
+    /// Default: unsupported (`None`), which the caller turns into the C's failure code `1`. A
+    /// resource term this crate itself minted is handled before this hook is consulted (see
+    /// [`super::enif::resources`]), so the hook is only reached for foreign types.
+    fn dynamic_resource_call(
+        &mut self,
+        env: *mut ErlNifEnv,
+        module: Eterm,
+        name: Eterm,
+        resource: Eterm,
+        call_data: *mut c_void,
+    ) -> Option<c_int> {
+        let _ = (env, module, name, resource, call_data);
+        None
+    }
 }
 
 /// The concrete per-call NIF environment behind the C-facing opaque `*mut ErlNifEnv`.
