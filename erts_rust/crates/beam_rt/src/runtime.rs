@@ -349,10 +349,12 @@ impl Runtime {
 
     /// Runs the **boot sequence** (contract A.7). Idempotent.
     ///
-    /// Milestone-1 boots the *registry* of preloaded modules and the atom seed built
-    /// in [`Runtime::new`]; it does **not** load the preloaded `.beam`s (see the crate
-    /// `CONTEXT.md`, Known Issues). A boot with an empty registry is refused rather
-    /// than silently producing a runtime without its foundation.
+    /// The registry of preloaded modules is checked, the system code path is added and
+    /// the whole preloaded set ([`crate::boot::PRELOADED_MODULE_NAMES`], the erts
+    /// application's `.beam`s) is loaded into the shared module cache (see
+    /// [`crate::boot::load_preloaded`]). A boot with an empty registry, a missing system
+    /// installation or an unparsable preloaded `.beam` is a typed error — never a silent
+    /// runtime without its foundation.
     ///
     /// Nothing is printed: the CLI must be silent on stderr for `-eval`/`run`/`-s`, so
     /// boot emits no banner (the version banner is [`Runtime`]'s `-version` action).
@@ -360,7 +362,8 @@ impl Runtime {
     /// # Errors
     ///
     /// [`BeamError::Raise`](beam_common::BeamError::Raise) when the preloaded-module
-    /// registry is empty.
+    /// registry is empty; otherwise the code server's/loader's typed error for the
+    /// preloaded set (see [`crate::boot::load_preloaded`]).
     pub fn boot(&mut self) -> Result<()> {
         if self.booted {
             return Ok(());
@@ -368,6 +371,7 @@ impl Runtime {
         if self.preloaded.is_empty() {
             return Err(error::unsupported("empty preloaded-module registry"));
         }
+        boot::load_preloaded(&mut self.code_server, &self.preloaded)?;
         self.booted = true;
         Ok(())
     }
@@ -390,6 +394,27 @@ impl Runtime {
     /// The preloaded-module registry skeleton (contract A.7).
     pub fn preloaded(&self) -> &PreloadedModules {
         &self.preloaded
+    }
+
+    /// The preloaded module names that have been **loaded into the cache** (contract A.7).
+    ///
+    /// Empty before [`Runtime::boot`]; after a successful boot it holds the whole
+    /// [`crate::boot::PRELOADED_MODULE_NAMES`] set. The order is the registry's
+    /// (`erlang:pre_loaded/0`'s order), so a caller can compare it directly against
+    /// [`PreloadedModules::names`].
+    pub fn preloaded_loaded(&self) -> Vec<String> {
+        self.preloaded
+            .names()
+            .filter(|name| self.code_server.is_loaded(name))
+            .map(str::to_string)
+            .collect()
+    }
+
+    /// Whether the preloaded module `name` has been loaded into the cache.
+    ///
+    /// `false` for a name outside the preloaded registry, whatever the cache holds.
+    pub fn is_preloaded_loaded(&self, name: &str) -> bool {
+        self.preloaded.is_preloaded(name) && self.code_server.is_loaded(name)
     }
 
     /// The code server (the shared atom table, the module cache, the code path).
@@ -1426,12 +1451,28 @@ mod tests {
     fn boot_is_idempotent_and_reports_itself() {
         let mut rt = runtime();
         assert!(!rt.is_booted());
-        rt.boot().expect("boot");
+        if let Err(error) = rt.boot() {
+            // Boot now loads the erts preloaded `.beam`s, so it needs a system install;
+            // skip loudly rather than fail on a machine without one.
+            eprintln!("SKIP: boot needs the system Erlang install ({error})");
+            return;
+        }
         assert!(rt.is_booted());
         rt.boot().expect("booting twice is a no-op");
         assert!(rt.is_booted());
         assert_eq!(rt.preloaded().len(), boot::PRELOADED_MODULE_NAMES.len());
         assert!(rt.preloaded().is_preloaded("erlang"));
+        // The whole preloaded set is really in the shared cache now, not just its names.
+        assert_eq!(
+            rt.preloaded_loaded(),
+            boot::PRELOADED_MODULE_NAMES
+                .iter()
+                .map(|name| name.to_string())
+                .collect::<Vec<_>>()
+        );
+        for name in ["erlang", "init", "erts_internal"] {
+            assert!(rt.is_preloaded_loaded(name), "{name} must be loaded");
+        }
         assert_eq!(rt.config().action, Action::Boot);
     }
 

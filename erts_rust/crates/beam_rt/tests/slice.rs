@@ -35,9 +35,16 @@ fn run_function_loads_runs_and_caches_a_real_beam() {
         .expect("slice:add/2");
     assert_eq!(sum, make_small(5));
 
-    // The module was loaded (and cached) by `run_function`.
+    // The module was loaded (and cached) by `run_function`. The boot that `run_function`
+    // performs first also loads the whole preloaded set into the cache (contract A.7),
+    // so the *non-preloaded* cached set is exactly `slice`.
     assert!(rt.is_booted());
-    assert_eq!(rt.loaded_modules(), vec!["slice".to_string()]);
+    let loaded: Vec<String> = rt
+        .loaded_modules()
+        .into_iter()
+        .filter(|name| !rt.preloaded().is_preloaded(name))
+        .collect();
+    assert_eq!(loaded, vec!["slice".to_string()]);
     let module = rt.module("slice").expect("cached");
     assert_eq!(module.atom_name(module.name), Some("slice"));
     assert!(module.export(module.atom_table.lookup("add").expect("add"), 2).is_some());
