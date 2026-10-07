@@ -24,7 +24,8 @@
 //!   [`ProcessHook`] (the process/name/global-state queries — `whereis/1`,
 //!   `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
 //!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
-//!   `group_leader/0`).
+//!   `group_leader/0`), a [`PersistentTerm`] (the node-global persistent-term store
+//!   behind the seven `persistent_term:*` BIFs).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
@@ -271,6 +272,79 @@ pub trait DictHook {
     }
 }
 
+/// Reads and writes the node-global **persistent-term** store.
+///
+/// Persistent terms are a *node-global* key/value store — unlike the process
+/// dictionary they are shared by every process — held outside every process heap in
+/// their own literal area (`the_hash_table`, `erl_bif_persistent.c:187`) and
+/// updated under a table-wide permission lock with thread-progress hand-off. That
+/// machinery belongs to the Stage-5 runtime (`beam_rt`), so the seven
+/// `persistent_term:get/0`, `get/1`, `get/2`, `put/2`, `put_new/2`, `erase/1` and
+/// `info/0` BIFs route every operation through this hook; `beam_rt` supplies the
+/// concrete implementation. With no hook installed **every** one of them reports a
+/// typed `unsupported_bif` capability gap — never `[]`, never `undefined`, never
+/// `ok` and never a made-up count (workspace `CONTEXT.md` §3).
+///
+/// The BIF layer owns the rendering (the `{Key, Value}` 2-tuples of `get/0`, the
+/// `#{count, memory}` map of `info/0`, the `true`/`false` of `erase/1`) and the
+/// oracle's two `badarg` cases, which are *store* outcomes reported here: an absent
+/// key for `get/1` ([`PersistentTerm::get`] answers `None`) and a `put_new/2` onto a
+/// key already holding a different value ([`PersistentTerm::put`] answers `false`).
+pub trait PersistentTerm {
+    /// `get(Key)` — the value stored under `key`, or `None` when the key is absent
+    /// (the BIF then raises `badarg` for `get/1`, or yields the default for
+    /// `get/2`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get(&mut self, key: Eterm) -> Result<Option<Eterm>>;
+
+    /// `put(Key, Value)` / `put_new(Key, Value)` — stores `value` under `key`.
+    ///
+    /// `only_if_new` is `false` for `persistent_term:put/2` and `true` for
+    /// `persistent_term:put_new/2` (the C's `new` flag,
+    /// `erl_bif_persistent.c:642,730`). Returns `true` on success — the store was
+    /// updated, **or** `key` already held a value raw-equal to `value` (a no-op
+    /// `ok`, `:726-729`) — and `false` for the one failure the oracle raises
+    /// `badarg` for: `put_new` of a key that already holds a *different* value
+    /// (`:730-733`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn put(&mut self, key: Eterm, value: Eterm, only_if_new: bool) -> Result<bool>;
+
+    /// `erase(Key)` — erases `key`, returning whether it was present
+    /// (`persistent_term_erase_1:417`; `true` at `:539`, `false` at `:548`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn erase(&mut self, key: Eterm) -> Result<bool>;
+
+    /// `get/0` — every stored `{Key, Value}` pair, in the store's own order.
+    ///
+    /// The order is a hash-table walk and is **not** observable; this layer
+    /// preserves whatever the hook supplies and never pins it (`do_get_all:830`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>>;
+
+    /// `info/0` — the runtime's bookkeeping `(count, memory)` in bytes: the number
+    /// of stored entries and the byte total of the table plus its literal areas
+    /// (`do_info:929-978`).
+    ///
+    /// These are pure runtime accounting figures with no BIF-visible derivation, so
+    /// they must come from the hook; this layer never invents them.
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn info(&mut self) -> Result<(u64, u64)>;
+}
 /// The structured failure of a NIF-load attempt.
 ///
 /// The host ([`NifLoader`]) reports *why* a load failed; the `erlang:load_nif/2`
@@ -646,6 +720,7 @@ pub struct BifContext<'a> {
     fun_caller: Option<&'a mut dyn FunCaller>,
     port: Option<&'a mut dyn PortHook>,
     dict: Option<&'a mut dyn DictHook>,
+    persistent_term: Option<&'a mut dyn PersistentTerm>,
     nif_loader: Option<&'a mut dyn NifLoader>,
     record_source: Option<&'a mut dyn RecordSource>,
     local_node: Option<&'a mut dyn LocalNode>,
@@ -670,6 +745,7 @@ impl<'a> BifContext<'a> {
             fun_caller: None,
             port: None,
             dict: None,
+            persistent_term: None,
             nif_loader: None,
             record_source: None,
             local_node: None,
@@ -719,6 +795,13 @@ impl<'a> BifContext<'a> {
     /// /`get_keys/*` BIFs.
     pub fn with_dict_hook(mut self, hook: &'a mut dyn DictHook) -> Self {
         self.dict = Some(hook);
+        self
+    }
+
+    /// Installs the node-global persistent-term store used by the
+    /// `persistent_term:get/0,1,2`/`put/2`/`put_new/2`/`erase/1`/`info/0` BIFs.
+    pub fn with_persistent_term(mut self, hook: &'a mut dyn PersistentTerm) -> Self {
+        self.persistent_term = Some(hook);
         self
     }
 
@@ -1217,6 +1300,89 @@ impl<'a> BifContext<'a> {
     pub fn dict_erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
         match self.dict.as_deref_mut() {
             Some(hook) => hook.erase_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The value stored under `key` in the node-global persistent-term store
+    /// through the installed [`PersistentTerm`] hook, or `None` when the key is
+    /// absent — the seam behind `persistent_term:get/1,2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_get(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.get(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Stores `value` under `key` in the node-global persistent-term store through
+    /// the installed [`PersistentTerm`] hook, returning whether the store accepted
+    /// the update (`false` is the oracle's `badarg` for a `put_new` collision) —
+    /// the seam behind `persistent_term:put/2` and `put_new/2`.
+    ///
+    /// `only_if_new` is `false` for `put/2` and `true` for `put_new/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_put(
+        &mut self,
+        key: Eterm,
+        value: Eterm,
+        only_if_new: bool,
+    ) -> Result<bool> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.put(key, value, only_if_new),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Erases `key` from the node-global persistent-term store through the
+    /// installed [`PersistentTerm`] hook, returning whether it was present — the
+    /// seam behind `persistent_term:erase/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_erase(&mut self, key: Eterm) -> Result<bool> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.erase(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every `{Key, Value}` pair of the node-global persistent-term store through
+    /// the installed [`PersistentTerm`] hook, in the hook's order — the seam behind
+    /// `persistent_term:get/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.get_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The node-global persistent-term store's `(count, memory)` bookkeeping
+    /// through the installed [`PersistentTerm`] hook — the seam behind
+    /// `persistent_term:info/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_info(&mut self) -> Result<(u64, u64)> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.info(),
             None => Err(crate::error::unsupported_bif()),
         }
     }
