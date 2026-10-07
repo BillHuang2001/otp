@@ -425,6 +425,7 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `tests/` → crate-level integration tests (`layout.rs`, `term_abi.rs`, `api_surface.rs`, `entry.rs`, `host_seam.rs`, `enif.rs`, `loader.rs`, `nif_end_to_end.rs`, `driver_end_to_end.rs`) + `tests/fixtures/test_nif.c` (a real C NIF) and `tests/fixtures/test_driver.c` (a real C driver), both compiled at test time with the system `cc` against the system OTP headers
 
 ## Notes for Agents
+- **The crate-level module doc in `src/lib.rs` is stale.** It still claims "The crate **declares types only** — no `enif_*`/`erl_drv_*` function bodies live here (those belong to the NIF/driver subsystem in a later pass)." The bodies DO live here: `src/nif/enif.rs` (80 `enif_*` fns), `src/driver/drv/{mem,port}.rs` (37 `driver_*`/`erl_drv_*` fns). Trust this `CONTEXT.md` and the code over that paragraph.
 - **Read the legacy headers before touching a layout**: `../../erts/emulator/beam/erl_nif.h`,
   `erl_nif_api_funcs.h`, `erl_drv_nif.h`, `erl_driver.h`. Field order and integer widths must match
   exactly; the asserts are the enforcement. Cite the header line in a comment where a value is

@@ -94,6 +94,7 @@ Re-exported at the crate root (`beam_common::…`); modules are private except `
 - Build/test from the repo root with an explicit manifest path (do not rely on `cd`):
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_common`.
 - Public API changes here ripple through every crate: keep additions additive and justified.
+- `libc` is declared in `Cargo.toml` (intended for ABI-sized integer aliases) but is currently referenced by no source file — it is a manifest-only dependency today.
 
 ## Routing Table
 - `src/error.rs` → `BeamError`/`Result` + term-independent exception machinery (`Raise`, `ExitReason`, …)

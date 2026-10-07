@@ -468,11 +468,25 @@ in `Operand::Typed`. If the `Type` table is a fallback (absent/stripped) the tag
 - Cross-checks against the real system ERTS belong to the sibling `../tools/differential/` harness.
 
 ## Known Issues / Intentional M1 gaps
-- **Residual `Instr::Generic` opcodes.** Every opcode the standard compiler emits for the families the
-  loader owns now lowers to a named variant (including the whole OTP-29 native-record family, 186-193);
-  the residual `Instr::Generic` fallback remains only for the obsolete/transform-only `genop.tab` entries
-  the compiler never emits (e.g. `is_constant/2`, `make_fun2/1`) and any opcode outside the modelled
-  vocabulary. It is a deliberate, lossless gap — never a wrong result.
+- **Residual `Instr::Generic` opcodes — 133 of 193 typed, 60 Generic.** 108 opcodes lower to a named
+  `Instr` mapping (`src/lower/instr.rs`) and the 25 `is_*`/`test_arity` opcodes to `Instr::Test`, so 133
+  of the 193 `genop.tab` opcodes are typed; the other 60 keep `Instr::Generic`. 59 of those are the
+  `-`-prefixed obsolete/transform-only entries the compiler never emits (`is_constant/2`, `make_fun2/1`,
+  `allocate_zero/2`, the legacy `bs_*` forms, …); the 60th is **`set_tuple_element/3` (opcode 67)** — a
+  non-obsolete `genop.tab` entry that is also never emitted (the compiler emits `put_tuple2`).
+  `tests/generic_census.rs` pins the observed residual set (the installed compiler emits none of them);
+  it is a deliberate, lossless gap — never a wrong result. (The `Instr::Generic` doc comment in
+  `src/instr.rs:1100-1105` still lists the native-record family as unmodelled; that is stale — 186-193
+  all have typed variants.)
+- **Contract A.2 divergences from the C loader (`beam_load.c`/`beam_file.c`), both currently unenforced:**
+  - **No `max_opcode` sanity bound.** `decode_stream` (`src/decode.rs:229`) only rejects an opcode *byte*
+    above the chunk's `max_opcode`; the C also refuses `max_opcode > MAX_GENERIC_OPCODE` (193) and
+    `max_opcode < genop_swap_2` (169, "OTP 22 or earlier") at `beam_load.c:189-197`. A header declaring
+    `max_opcode = 200` (or `< 169`) is accepted here as long as every emitted byte is a valid roster
+    opcode; `tests/negative.rs:131-146` exercises exactly this.
+  - **No module MD5/checksum.** The C builds `beam->checksum` as an MD5 over `AtU8`+`Code`+`StrT`+`ImpT`+
+    `ExpT`+`FunT` (each `OldUniq` zeroed)+`LitT`+`Meta`+`Recs`+`DbgB` at load (`beam_file.c:1751-1830`);
+    the loader computes no checksum (no `checksum`/`md5` symbol anywhere in `src/`).
 - **Atoms are interned into a fresh per-module `AtomTable`**, not a shared `atom.names`-seeded table;
   positional/global atom identity for preloaded modules is a `beam_rt` concern.
 

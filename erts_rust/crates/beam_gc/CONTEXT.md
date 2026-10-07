@@ -367,12 +367,16 @@ whole-region scan.)
 - Licensing Apache-2.0; deps `beam_common`, `beam_term`, `beam_alloc`, `libc` only.
 
 ## Test Strategy
-- In-module `#[cfg(test)] mod tests` per module: `space` (geometry/range tests/`reset`/`from_heap`
-  round-trip), `copy` (forward of immediates/cons/boxed/nested tuples/lists; forwarding markers;
-  out-of-from-space left verbatim), `policy` (table shape: 12, 38, … 233; `next_heap_size` offset 0/1;
-  growth/shrink decisions), `mso` (refcount `inc`/`dec`/`dec_and_test`; `MsoHandle` clone/drop runs the
-  destructor exactly once; `OffHeapEntry` accessor dispatch; `OffHeap::sweep` releases dead handles, frees
-  a swept `RefcBinary`'s payload exactly once, and sweeps a mixed Mso+Binary list selectively).
+- In-module `#[cfg(test)] mod tests` live in `space` (geometry/range tests/`reset`/`from_heap`
+  round-trip), `policy` (table shape: 12, 38, … 233; `next_heap_size` offset 0/1; growth/shrink
+  decisions), `mso` (refcount `inc`/`dec`/`dec_and_test`; `MsoHandle` clone/drop runs the destructor
+  exactly once; `OffHeapEntry` accessor dispatch; `OffHeap::sweep` releases dead handles, frees a swept
+  `RefcBinary`'s payload exactly once, and sweeps a mixed Mso+Binary list selectively), `heap_info`,
+  `config`, `any_collector`, `fragment`, `immix_collector`, and `immix/tests.rs`.
+  **`copy.rs` and `collector.rs` carry no in-module tests**: the copier's word-level behaviour
+  (immediates/cons/boxed/nested tuples/lists, forwarding markers, out-of-from-space left verbatim) is
+  pinned by the integration test `tests/copy_correctness.rs`, and the two-generation driver by
+  `tests/generations.rs` / `tests/gc_pressure*.rs`.
 - **`tests/copy_correctness.rs` — the required copy-correctness evidence.** Build a real term graph in
   a `HeapSpace` (nested tuples + cons lists + boxed leaves, plus deliberate garbage), place tagged
   pointers to live objects into a root slice, run `collect`/`Copier`, then assert: (1) **structural
@@ -446,7 +450,10 @@ whole-region scan.)
 ## Known Gaps (intentionally NOT covered in Milestone-1)
 - **GenImmix is integrated and measured, but stays off the default path** (decision + numbers in Design
   Decisions §Measured): it wins on copying work only, and only on a large long-lived mature generation,
-  while losing on footprint and (there) pause. `MatureKind::Copying` remains the default.
+  while losing on footprint and (there) pause. `MatureKind::Copying` remains the default. The option is
+  reachable only through `AnyCollector::from_config` / `GenImmixCollector` inside this crate and its
+  tests — no runtime consumer selects `MatureKind::Immix` yet (`beam_process` owns a concrete
+  `Collector`; `beam_rt`/`beam_bifs` use neither `AnyCollector` nor `HeapInfo`).
 - **The Immix region is fixed-size and never grows.** `ImmixSpace` wraps a `beam_alloc::Heap` and, like
   every semi-space here, grows by GC *replacement* rather than reallocation. A major reclaims in place,
   but if the live nursery still does not fit afterwards the collector returns a typed heap exhaustion
