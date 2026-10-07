@@ -1,5 +1,6 @@
 #![allow(dead_code)]
-//! Shared helpers for the `beam_abi` integration tests, plus the test-flavoured [`NifHost`].
+//! Shared helpers for the `beam_abi` integration tests, plus the test-flavoured [`NifHost`] and
+//! [`TestDriverHost`].
 //!
 //! This module lives in a **subdirectory** of `tests/` on purpose: Cargo treats every
 //! `tests/*.rs` file as its own integration-test binary, but a `tests/<dir>/mod.rs` is *not* a
@@ -13,26 +14,33 @@
 //!
 //! # Skip-vs-fail policy (explicit)
 //!
-//! The NIF `.so` compilation helpers depend on host facilities that a bare container may lack: a C
-//! compiler and the system `erl_nif.h`. When either is missing [`compile_so`] returns `None` and
-//! prints a **loud** [`skip`] banner; the calling test must then return early. A skip is printed,
-//! never silent.
+//! The shared-object compilation helpers depend on host facilities that a bare container may lack:
+//! a C compiler and the system OTP include directory (which holds `erl_nif.h` *and*
+//! `erl_driver.h`). When either is missing [`compile_so`] returns `None` and prints a **loud**
+//! [`skip`] banner; the calling test must then return early. A skip is printed, never silent.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::atomic::{AtomicUsize, Ordering};
 
+use beam_abi::DriverHost;
+use beam_abi::driver::types::{ErlDrvEvent, ErlDrvPort};
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{atom_val, is_atom, make_atom, Eterm};
+use libc::{c_int, c_long, c_uint, c_ulong, c_void};
 
-/// The header the include-directory search keys on.
+/// The header the include-directory search keys on. `erl_driver.h` (used by the driver fixtures)
+/// ships in the **same** directory, so one probe resolves the include directory for both ABIs.
 const HEADER: &str = "erl_nif.h";
 
 // ---------------------------------------------------------------------------------------------
-// Locating the system `erl_nif.h` include directory
+// Locating the system OTP include directory (`erl_nif.h` + `erl_driver.h`)
 // ---------------------------------------------------------------------------------------------
 
-/// Locate the system `erl_nif.h` include directory, robustly; `None` if unavailable.
+/// Locate the system OTP include directory, robustly; `None` if unavailable.
+///
+/// The directory holds both `erl_nif.h` (keyed on below) and `erl_driver.h`, so the NIF and driver
+/// fixtures share this one resolution.
 ///
 /// Resolution order (the first directory that actually contains a readable `erl_nif.h` wins):
 ///
@@ -148,7 +156,7 @@ fn search_root(root: &Path) -> Option<PathBuf> {
 }
 
 // ---------------------------------------------------------------------------------------------
-// Compiling a NIF shared object
+// Compiling a NIF / driver shared object
 // ---------------------------------------------------------------------------------------------
 
 /// Is a C compiler available? (uses `$CC` if set, else `"cc"`)
@@ -168,15 +176,15 @@ fn cc() -> String {
 /// Compile C `source` (file stem `stem`) into a shared object in a fresh scratch dir.
 ///
 /// Returns `None` (the caller must then [`skip`] LOUDLY) when there is no C compiler, no locatable
-/// `erl_nif.h`, or the compiler fails; the compiler's stderr is printed to aid debugging. Every
-/// failure path returns `None` — this never panics.
+/// OTP include directory (`erl_nif.h`/`erl_driver.h`), or the compiler fails; the compiler's stderr
+/// is printed to aid debugging. Every failure path returns `None` — this never panics.
 ///
 /// The command is `cc -shared -fPIC -I<include> -o <out.so> <src.c>`, run in a unique scratch
 /// directory under [`std::env::temp_dir`] (named from the stem, the process id and a global
 /// counter, so parallel test binaries do not collide).
 pub fn compile_so(stem: &str, source: &str) -> Option<PathBuf> {
     let Some(include) = erl_include_dir() else {
-        skip(&format!("{stem}: no erl_nif.h include directory found"));
+        skip(&format!("{stem}: no OTP include directory (erl_nif.h/erl_driver.h) found"));
         return None;
     };
     if !cc_available() {
@@ -286,5 +294,172 @@ impl beam_abi::NifHost for TestHost {
             return None;
         }
         self.atoms.name(atom_val(atom)).map(str::to_string)
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// A recording `DriverHost` for tests
+// ---------------------------------------------------------------------------------------------
+
+/// A [`beam_abi::DriverHost`] for tests that records every service call a driver makes.
+///
+/// Like [`TestHost`] it owns the arena the seam hands out (a [`beam_alloc::Heap`] and an
+/// [`AtomTable`] for the term-data path); it additionally records the output/term traffic and the
+/// select/timer/async calls, so a test can assert **exactly** what a real driver `.so` drove through
+/// the exported `driver_*` functions.
+pub struct TestDriverHost {
+    heap: beam_alloc::Heap,
+    atoms: AtomTable,
+    /// Every [`DriverHost::output`] byte string, in call order.
+    outputs: Vec<Vec<u8>>,
+    /// Every [`DriverHost::send_term`] call: `(destination, term)`.
+    sent: Vec<(Option<Eterm>, Eterm)>,
+    /// Every [`DriverHost::select`] call: `(mode, on)`.
+    selects: Vec<(c_int, c_int)>,
+    /// Every [`DriverHost::set_timer`] duration, in call order.
+    timers: Vec<c_ulong>,
+    /// The number of [`DriverHost::cancel_timer`] calls.
+    cancels: usize,
+    /// The number of [`DriverHost::r#async`] calls.
+    asyncs: usize,
+    /// The value [`DriverHost::read_timer`] reports (`None` = no timer pending).
+    timer_left: Option<c_ulong>,
+    /// The value [`DriverHost::connected_pid`] reports.
+    connected: Option<Eterm>,
+    /// The value [`DriverHost::caller_pid`] reports.
+    caller: Option<Eterm>,
+}
+
+impl TestDriverHost {
+    /// A host with a comfortably sized heap and an empty atom table.
+    pub fn new() -> Self {
+        TestDriverHost {
+            heap: beam_alloc::Heap::new(4096).expect("a test heap is allocatable"),
+            atoms: AtomTable::new(),
+            outputs: Vec::new(),
+            sent: Vec::new(),
+            selects: Vec::new(),
+            timers: Vec::new(),
+            cancels: 0,
+            asyncs: 0,
+            timer_left: None,
+            connected: None,
+            caller: None,
+        }
+    }
+
+    /// Intern `name` and return the atom term.
+    pub fn atom(&mut self, name: &str) -> Eterm {
+        make_atom(self.atoms.intern(name))
+    }
+
+    /// Mutable access to the atom table (for reverse lookups in assertions).
+    pub fn atoms(&self) -> &AtomTable {
+        &self.atoms
+    }
+
+    /// Every recorded [`DriverHost::output`] payload, in call order.
+    pub fn outputs(&self) -> &[Vec<u8>] {
+        &self.outputs
+    }
+
+    /// Every recorded [`DriverHost::send_term`] call: `(destination, term)`.
+    pub fn sent(&self) -> &[(Option<Eterm>, Eterm)] {
+        &self.sent
+    }
+
+    /// Every recorded [`DriverHost::select`] call: `(mode, on)`.
+    pub fn selects(&self) -> &[(c_int, c_int)] {
+        &self.selects
+    }
+
+    /// Every recorded [`DriverHost::set_timer`] duration, in call order.
+    pub fn timers(&self) -> &[c_ulong] {
+        &self.timers
+    }
+
+    /// The number of [`DriverHost::cancel_timer`] calls.
+    pub fn cancels(&self) -> usize {
+        self.cancels
+    }
+
+    /// The number of [`DriverHost::r#async`] calls.
+    pub fn asyncs(&self) -> usize {
+        self.asyncs
+    }
+
+    /// Set the value [`DriverHost::read_timer`] reports.
+    pub fn set_timer_left(&mut self, ms: Option<c_ulong>) {
+        self.timer_left = ms;
+    }
+
+    /// Set the value [`DriverHost::connected_pid`] returns.
+    pub fn set_connected(&mut self, pid: Option<Eterm>) {
+        self.connected = pid;
+    }
+
+    /// Set the value [`DriverHost::caller_pid`] returns.
+    pub fn set_caller(&mut self, pid: Option<Eterm>) {
+        self.caller = pid;
+    }
+}
+
+impl DriverHost for TestDriverHost {
+    fn heap(&mut self) -> &mut beam_alloc::Heap {
+        &mut self.heap
+    }
+
+    /// The atom table is unbounded, so interning always succeeds.
+    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+        Some(make_atom(self.atoms.intern(name)))
+    }
+
+    fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
+        self.outputs.push(data.to_vec());
+        0
+    }
+
+    fn send_term(&mut self, _port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int {
+        self.sent.push((to, term));
+        0
+    }
+
+    fn select(&mut self, _port: ErlDrvPort, _event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
+        self.selects.push((mode, on));
+        0
+    }
+
+    fn set_timer(&mut self, _port: ErlDrvPort, ms: c_ulong) -> c_int {
+        self.timers.push(ms);
+        0
+    }
+
+    fn cancel_timer(&mut self, _port: ErlDrvPort) -> c_int {
+        self.cancels += 1;
+        0
+    }
+
+    fn read_timer(&mut self, _port: ErlDrvPort) -> Option<c_ulong> {
+        self.timer_left
+    }
+
+    fn r#async(
+        &mut self,
+        _port: ErlDrvPort,
+        _key: *mut c_uint,
+        _invoke: Option<unsafe extern "C" fn(*mut c_void)>,
+        _data: *mut c_void,
+        _free: Option<unsafe extern "C" fn(*mut c_void)>,
+    ) -> c_long {
+        self.asyncs += 1;
+        0
+    }
+
+    fn connected_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
+        self.connected
+    }
+
+    fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
+        self.caller
     }
 }
