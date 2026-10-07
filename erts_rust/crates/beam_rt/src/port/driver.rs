@@ -56,6 +56,7 @@ use libc::c_int;
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
 use beam_abi::driver::types::ErlDrvPort;
 use beam_abi::{DriverEnv, DriverHost};
+use beam_common::BeamError;
 use beam_alloc::Heap;
 use beam_bifs::AtomInterner;
 use beam_process::ProcessId;

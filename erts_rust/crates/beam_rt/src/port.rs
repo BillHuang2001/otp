@@ -772,6 +772,10 @@ impl NameSpec {
             PortName::Fd => Ok(SpawnSpec::Fd {
                 fd: self.fd.ok_or(BeamError::BadArg)?,
             }),
+            // A `{spawn_driver, Name}` port is backed by a **C driver**, not by the spawn
+            // driver: `open_port` registers a `driver::DriverPortAdapter` for it and never asks
+            // for a spawn spec, so reaching this is a programming error.
+            PortName::SpawnDriver => Err(BeamError::BadArg),
         }
     }
 }
@@ -1129,7 +1133,7 @@ impl PortHook for RuntimePorts {
                 self.owner,
             );
             let adapter =
-                driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command)
+                driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
                     .map_err(|_| BeamError::BadArg)?;
             let meta = PortMeta {
                 command: spec.command,
