@@ -16,11 +16,11 @@ use beam_term::prelude::Eterm;
 
 use crate::collector::{Collection, Collector};
 use crate::config::{GcConfig, MatureKind};
+use crate::heap_info::HeapObservable;
 use crate::immix_collector::GenImmixCollector;
 use crate::policy::HeapPolicy;
 use crate::space::HeapSpace;
 use crate::stats::GcStats;
-
 /// A collector whose mature-generation strategy is chosen at construction time.
 ///
 /// Both variants share the [`Collection`]/[`crate::CollectionKind`] result type and the
@@ -83,6 +83,20 @@ impl AnyCollector {
         }
     }
 
+    /// The number of minor collections run since the last fullsweep (the C `GEN_GCS`),
+    /// forwarded from whichever strategy was selected.
+    pub fn minor_gcs(&self) -> u32 {
+        match self {
+            AnyCollector::Copying(c) => c.minor_gcs(),
+            AnyCollector::Immix(c) => c.minor_gcs(),
+        }
+    }
+
+    /// The `garbage_collection` observables of the selected strategy.
+    pub fn heap_info(&self) -> crate::heap_info::HeapInfo {
+        crate::heap_info::HeapInfo::of(self)
+    }
+
     /// Runs a collection on the selected strategy.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
         match self {
@@ -90,8 +104,50 @@ impl AnyCollector {
             AnyCollector::Immix(c) => c.collect(roots),
         }
     }
+
+    /// Forces a **minor** collection on the selected strategy (escalation is bypassed).
+    pub fn collect_minor(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        match self {
+            AnyCollector::Copying(c) => c.collect_minor(roots),
+            AnyCollector::Immix(c) => c.collect_minor(roots),
+        }
+    }
+
+    /// Forces a **major** (fullsweep) collection on the selected strategy.
+    pub fn collect_major(&mut self, roots: &mut [Eterm]) -> Result<GcStats> {
+        match self {
+            AnyCollector::Copying(c) => c.collect_major(roots),
+            AnyCollector::Immix(c) => c.collect_major(roots),
+        }
+    }
 }
 
+impl HeapObservable for AnyCollector {
+    fn minor_gcs(&self) -> u32 {
+        match self {
+            AnyCollector::Copying(c) => c.minor_gcs(),
+            AnyCollector::Immix(c) => c.minor_gcs(),
+        }
+    }
+
+    fn heap_size_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.heap_size_words(),
+            AnyCollector::Immix(c) => c.heap_size_words(),
+        }
+    }
+
+    fn total_heap_size_words(&self) -> usize {
+        match self {
+            AnyCollector::Copying(c) => c.total_heap_size_words(),
+            AnyCollector::Immix(c) => c.total_heap_size_words(),
+        }
+    }
+
+    fn heap_policy(&self) -> &HeapPolicy {
+        self.policy()
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
