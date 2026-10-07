@@ -3,301 +3,313 @@
 ## Intent
 Owns the **allocation layer** of the Rust ERTS rewrite: the carrier-based multi-block allocator
 framework (`erts_alloc` + `erl_alloc_util.c` equivalent), the size classes, the process-wide
-allocator registry, and the **per-process heap / bump allocator** the copy engine (`beam_message`)
-and the collector (`beam_gc`) construct terms in. It is the **lowest common ancestor for
-allocation**: `beam_codec`, `beam_ets`, `beam_gc`, `beam_message` and `beam_process` all depend
-downward on it (Stage 0 foundations, Part II §H; §D "the current collector … per-process heaps").
+allocator registry, the full allocation-*type* inventory, the mmap-backed **mseg** segment allocator,
+the per-allocator **carrier policy** (`+M<alloc><opt>` thresholds) and the **per-process heap / bump
+allocator** the copy engine (`beam_message`) and the collector (`beam_gc`) construct terms in.
 
-Three responsibilities, deliberately in one node:
+It is the **lowest common ancestor for allocation**: `beam_codec`, `beam_ets`, `beam_gc`,
+`beam_message` and `beam_process` all depend downward on it (Stage-0 foundations, Part II §H; §D).
+Wave 0 — it may depend only on `beam_common` / `beam_term`.
+
+Responsibilities (deliberately one node):
 1. **Byte allocation** for anything off the process heap — ETS nodes, code, binaries, carriers
-   themselves (`Allocator`/`AllocRef`) — mirroring `erts_alloc(type, size)` / `erts_realloc` /
-   `erts_free` and the carrier framework of `../../erts/emulator/beam/erl_alloc_util.c`.
-2. **Term allocation** within a fixed per-process heap (`Heap`) — the *production* version of the
-   minimal `beam_term::heap::Heap` test arena, with identical geometry (`hp`/`hend`, never
-   reallocates) but backed by a real allocator and growing by *replacement* (GC), not reallocation.
-3. **Refcounted off-heap objects** — the shared atomic reference count (`RefCount`, `refcount.rs`,
-   the workspace's one `erts_refc_*` implementation) and the reference-counted off-heap byte buffer
-   built on it (`RefcBinary`, `binary.rs`, the `binary_alloc` analogue), whose lifetime the copy
-   engine and term layer rely on. `RefCount` lives here because `beam_alloc` is the lowest common
-   ancestor that both `beam_gc` (MSO payloads) and the binary users depend on.
+   (`Allocator`/`AllocRef`) — mirroring `erts_alloc(type, size)` / `erts_realloc` / `erts_free` and
+   the carrier framework of `../../erts/emulator/beam/erl_alloc_util.c`.
+2. **Term allocation** within a fixed per-process heap (`Heap`) — the *production* bump arena with
+   the geometry of `beam_term::heap::Heap` but never reallocating; growth is by *replacement* (GC),
+   not reallocation.
+3. **Refcounted off-heap objects** — the shared atomic `RefCount` (`erts_refc_*` semantics) and the
+   refcounted off-heap byte buffer `RefcBinary` built on it.
+4. **The `erts_alloc` inventory and its tuning/statistics surface** — the parsed
+   `erl_alloc.types` table (`types`), the `erts_alloc:info/0`-shaped reporting (`stats`), and the
+   `+M<alloc><opt>` carrier policy (`policy`).
 
-Ground truth = legacy C (`../../erts/emulator/beam/erl_alloc.h`, `erl_alloc.c`,
-`erl_alloc_util.{c,h}`, `erl_goodfit_alloc.c`/`erl_bestfit_alloc.c`/`erl_afit_alloc.c`/
-`erl_ao_first*_alloc.c`, `erl_alloc.types`). Read it; never modify it.
+Ground truth = legacy C (`../../erts/emulator/beam/erl_alloc.h`, `erl_alloc.c`, `erl_alloc_util.{c,h}`,
+`erl_alloc.types`, `erl_mseg.c`, `erl_goodfit_alloc.c`/`erl_bestfit_alloc.c`/`erl_afit_alloc.c`). Read
+it; never modify it.
 
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_alloc::prelude::*`. The **frozen seam** for dependents is
-`allocator`, `heap`, `size_class`, `registry`, `stats`, `refcount`, `binary`;
-`block`/`carrier`/`free_list`/`strategy` are implementation modules (public for testing/reuse, not
-part of the cross-crate contract).
+`allocator`, `heap`, `size_class`, `registry`, `stats`, `types`, `refcount`, `binary`, `policy`;
+`block`/`carrier`/`free_list`/`mbc`/`strategy`/`mseg` are implementation modules (public for
+testing/reuse, **not** part of the cross-crate contract).
 
-### `allocator.rs` — the `Allocator` seam
-- `pub trait Allocator: Send + Sync + 'static`
-  - `fn alloc(&self, layout: core::alloc::Layout) -> Result<NonNull<u8>>`
-  - `fn realloc(&self, ptr: NonNull<u8>, old_layout: Layout, new_size: usize) -> Result<NonNull<u8>>`
-  - `unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout)` (`# Safety`: `ptr` must come from
-    `alloc`/`realloc` on *this* allocator with `layout`)
-  - `fn stats(&self) -> AllocStats`; `fn name(&self) -> &str`
-  - provided (object-safe, non-generic): `fn alloc_bytes(&self, size: usize) -> Result<NonNull<u8>>`
-    (default alignment), `fn alloc_zeroed(&self, layout: Layout) -> Result<NonNull<u8>>`
-- `pub type AllocRef = Arc<dyn Allocator>;` — the cheaply-cloneable shared handle dependents hold.
-- `pub struct AllocatorConfig` — builder: `name`, `strategy`, `carrier_size` (default 1 MiB),
-  `classes: SizeClasses`, `max_footprint` (optional cap for tests), `zeroed_carriers`.
-  `AllocatorConfig::default()` / `::builder()` + setters.
-- `pub struct CarrierAllocator` — the concrete carrier-backed multi-block allocator.
-  `CarrierAllocator::new(config: AllocatorConfig) -> Result<CarrierAllocator>`; `impl Allocator`;
-  `share(self) -> AllocRef`; `carrier_count()/carrier_bytes()` (redundant with `stats`).
-- `pub const WORD_ALIGN: usize = 8;` (`align_of::<Eterm>()`), `pub const MIN_ALIGN: usize = 16;`
-  (`UNIT_SIZE`).
+### `allocator` — the `Allocator` seam (facade + submodules)
+Module layout: `allocator.rs` (facade: docs, `WORD_ALIGN`/`MIN_ALIGN`, `AllocRef`, re-exports),
+`allocator/trait.rs` (`Allocator`), `allocator/config.rs` (`AllocatorConfig`/builder),
+`allocator/state.rs` (`AllocatorState`), `allocator/core.rs` (`CarrierAllocator`), `allocator/tests*.rs`.
+- `pub trait Allocator: Send + Sync + 'static` (object-safe; `alloc`/`realloc`/`dealloc`/`stats`/`name`
+  + provided `alloc_bytes`, `alloc_zeroed`) — the untyped base.
+- `pub type AllocRef = Arc<dyn Allocator>;` — the cheaply-clonable shared handle.
+- **Typed / sized entry points (interposition-friendly, `erts_alloc`-shaped).** Provided on the trait
+  so every implementor gets them; defaulted implementations forward to the untyped methods:
+  `alloc_typed(TypeId, Layout)`, `realloc_typed(TypeId, ptr, old_layout, new_size)`,
+  `dealloc_typed(TypeId, ptr, Layout)`, `alloc_unsized(TypeId, size)` (recovers the alignment on
+  free — the legacy `erts_alloc(type,size)`/`erts_free(type,ptr)` pair), `dealloc_unsized(TypeId, ptr)`,
+  `type_stats(TypeId) -> TypeStats`, `allocator_info() -> AllocatorInfo`.
+- `pub struct AllocatorConfig` — builder: `name`, `strategy`, **`policy: CarrierPolicy`**, `carrier_size`
+  (default 1 MiB), `classes: SizeClasses`, `max_footprint`, `zeroed_carriers`. `AllocatorConfig::builder()`.
+- `pub struct CarrierAllocator` — the concrete carrier-backed allocator. `new(config)`, `share()`,
+  `carrier_count()`, `carrier_bytes()`, `impl Allocator`.
+- `pub const WORD_ALIGN: usize = 8;` (`align_of::<Eterm>()`), `pub const MIN_ALIGN: usize = UNIT_SIZE;`.
 
-### `size_class.rs` — size classes
-- `pub struct SizeClasses` — an ascending table of byte-size classes (each a multiple of
-  `UNIT_SIZE`), plus a `large_threshold`.
-  `SizeClasses::new(classes: impl IntoIterator<Item = usize>, large_threshold: usize) -> Result<SizeClasses>`
-  (validates ascending, non-zero, `UNIT_SIZE` multiples, last ≥ threshold),
-  `SizeClasses::default_small_block() -> SizeClasses` (16 … 1 KiB geometric — the M1 default),
-  `class_for(size) -> Option<usize>` (`Some(ix)` for sizes ≤ `large_threshold`, else `None` ⇒
-  dedicated carrier), `class_size(ix) -> Option<usize>`, `max_class()`, `large_threshold()`,
-  `len()`, `is_empty()`, `iter()`.
+### `types` — the full `erts_alloc.types` inventory (243 types)
+A hand-maintained **source table** transcribed from `../../erts/emulator/beam/erl_alloc.types` (the
+file is legitimately long: it *is* the data). Exposes:
+- `pub enum AllocatorId` (12: systemA/temp/sl/std/ll/eheap/ets/binary/literal/fix/driver/test — `ALL`,
+  `as_str`, `index`); `pub use crate::types::AllocatorId as AllocType;` (backwards-compat alias).
+- `pub enum ClassId` (6: mseg/sys_alloc/sys_fix_alloc/ets_alloc/sl_alloc/fix_alloc — `ALL`, `as_str`, `index`).
+- `pub struct TypeFlags(u32)` — `MSEG`, `SUPER_ALIGNED`, `FIXED_SIZE`, `HEAP`, `SBC`, `MBC` (`union`,
+  `contains`, `intersects`, `from_bits_truncate`, const `for_allocator(AllocatorId)`).
+- `pub struct TypeEntry` (`name`, `allocator`, `class`, `flags`, `alloc_size`).
+- `pub const ALLOC_TYPES: [TypeEntry; TYPE_COUNT]`, `pub const TYPE_COUNT`, `pub const EXPECTED_TYPE_COUNT: usize = 243`;
+  `TypeId` (`index`/`entry`/`name`/`allocator`/`class`/`flags`/`from_index`/`from_name`),
+  `pub fn type_by_name`, `pub fn types_for_allocator`.
 
-### `registry.rs` — process-wide allocator registry (`erts_allctrs` equivalent)
-- `pub enum AllocType { System, Temporary, ShortLived, Standard, LongLived, EHeap, Ets, Literal,
-  Binary, Driver, FixedSize, Test }` — curated from the `allocator` set of
-  `../../erts/emulator/beam/erl_alloc.types`. `as_str()`, `index()`, `ALL`.
-- `pub fn allocator(ty: AllocType) -> &'static AllocRef` — lazily-initialised, one
-  `CarrierAllocator` per type (M1 uses one default `AllocatorConfig` for all types).
-- `pub fn default_allocator() -> &'static AllocRef` (= `allocator(AllocType::Standard)`).
-- `pub fn all_stats() -> Vec<(AllocType, AllocStats)>`.
+### `registry` — process-wide allocator registry (`erts_allctrs` equivalent)
+- `pub use crate::types::AllocatorId as AllocType;`
+- `pub fn allocator(ty: AllocType) -> &'static AllocRef` — lazily-initialised, one `CarrierAllocator`
+  per type; `default_allocator()`, `all_stats() -> Vec<(AllocType, AllocStats)>`.
+- `pub fn alloc_util_allocators() -> Vec<&'static str>` — the `system_info(alloc_util_allocators)`
+  list; `pub fn types_for(AllocatorId) -> Vec<TypeId>`.
 
-### `heap.rs` — the per-process bump heap (`Heap`)
-Fixed-capacity bump arena over a carrier-provided block; same geometry as `beam_term::heap::Heap`
-but the production allocator. **Never reallocates** (handed-out pointers stay valid for the heap's
-lifetime); heap growth is by allocating a *new* larger heap and copying (done by `beam_gc`).
-- `Heap::new(capacity_words: usize) -> Result<Heap>` (uses `default_allocator()`)
-- `Heap::with_allocator(alloc: AllocRef, capacity_words: usize) -> Result<Heap>`
-- `capacity() -> usize` (words), `used()`, `available()`, `peak_used()`, `reset()`,
-  `hp() -> *mut Eterm`, `hend() -> *mut Eterm`, `allocator() -> &AllocRef`
-- `unsafe fn alloc_words(&mut self, n: usize) -> Result<*mut Eterm>` (uninitialised, contiguous)
-- `unsafe fn alloc_tuple(&mut self, n: usize) -> Result<*mut Eterm>` (writes the arityval header)
-- `cons(&mut self, car: Eterm, cdr: Eterm) -> Result<Eterm>`
-- `tuple(&mut self, elems: &[Eterm]) -> Result<Eterm>`
-- `impl Drop` → returns the backing block to the allocator.
+### `size_class` — size classes (sbc/mbc ladders)
+`SizeClasses` (ascending, `UNIT_SIZE`-multiples). Constructors: `new(classes, large_threshold)`,
+`default_small_block()`, `default_sbcs()`, `default_mbcs()`, `default_legacy()`. Accessors:
+`class_for`, `class_size`, `max_class`, `large_threshold`, `is_small`, `sbc_threshold`, `mbc_threshold`,
+`sbc_classes`, `mbc_classes`, `len`, `is_empty`, `iter`. Constants `SBC_THRESHOLD_DEFAULT = 512 KiB`,
+`SMALLEST_MBC_SIZE_DEFAULT = 1 MiB`, `MBC_THRESHOLD_DEFAULT = 10 MiB`.
 
-### `stats.rs` — instrumentation
-- `pub struct AllocStats` (`Clone + Copy + Default + PartialEq + Eq + Debug`): `alloc_calls`,
-  `free_calls`, `realloc_calls`, `live_blocks: u64`, `live_bytes`, `peak_live_bytes`,
-  `carriers: u64`, `carrier_bytes`, `peak_carrier_bytes`.
-- `pub(crate) struct Counters` — the non-atomic counters behind the allocator mutex that produce
-  `AllocStats`.
+### `policy` — legacy carrier policy (`+M<alloc><opt>`)
+`CarrierPolicy` with all **12** legacy options, in the oracle's item order
+`sbct asbcst rsbcst rsbcmt mmmbc mmsbc lmbcs smbcs acful acul acnl acfml`:
+`PolicyOptionKind::ALL`, `CARRIER_POOL_THRESHOLDS`, `UTILIZATION_LIMITS`; `for_allocator(AllocatorId)`
++ the per-allocator const presets (`ALLCTR_INIT`, `TEMP_ALLOC`, `SL_ALLOC`, `STD_ALLOC`, `LL_ALLOC`,
+`EHEAP_ALLOC`, `ETS_ALLOC`, `FIX_ALLOC`, `BINARY_ALLOC`, `DRIVER_ALLOC`, `LITERAL_ALLOC`, `TEST_ALLOC`);
+`get`/`set`/`set_option`/`with_option` (invalid input ⇒ `BeamError::BadArg`); derived accessors
+`small_block_carrier_threshold()` (= `sbct`), `single_block_carrier_cap()`, `multi_block_carrier_cap()`,
+`minimum_multi_block_carrier_size()`, `maximum_multi_block_carrier_size()`,
+`effective_largest_mbc_size()`, `uses_single_block_carrier(size)`, `is_unlimited`. `UNLIMITED = usize::MAX`.
 
-### `strategy.rs` — strategy selector (A.6 config fidelity)
-- `pub enum Strategy { FirstFit, GoodFit, BestFit, AFirstFit }` (mirrors `ErtsAlcStrat_t`).
-  M1 implements the **segregated first-fit** family; `FirstFit` is the implemented behaviour and the
-  other variants currently select it too (plugin seam reserved — see Design Decisions).
+### `stats` — instrumentation (`erts_alloc:info`-shaped)
+The file also carries a large in-module test module (in-module because the counter internals are only
+exercisable there).
+- `pub struct TypeStats { blocks, bytes, peak_bytes }` + `pub type TypeCounters = TypeStats`.
+- `pub const STATS_TYPE_SLOTS: usize = 512;` (invariant `types::TYPE_COUNT <= STATS_TYPE_SLOTS`).
+- `pub struct MsegStats { segments, peak_segments, bytes, peak_bytes, cached, reused, mapped_segments,
+  mapped_bytes, peak_mapped_bytes, unmaps, calls }` — built from the **process-global**
+  `crate::carrier::mseg().stats()` via `impl From<MsegInfo> for MsegStats` (a *live view*, not zeros).
+- `pub struct AllocStats { alloc_calls, free_calls, realloc_calls, live_blocks, live_bytes,
+  peak_live_bytes, carriers, carrier_bytes, peak_carrier_bytes, sbc_carriers, mbc_carriers, mseg,
+  types: [TypeCounters; STATS_TYPE_SLOTS] }` — `Copy` (inline type table ⇒ ~12 KiB snapshot; taken by
+  introspection, never on the fast path). `AllocStats::type_stats(slot)` is bounds-safe.
+- `pub struct AllocatorInfoItem { key, value }`, `pub enum InfoValue`,
+  `pub struct AllocatorInfo` — `from_stats(name, &AllocStats)`, `push_policy(&CarrierPolicy)` (the 12
+  legacy items in oracle order), `push_type(name, TypeStats)`.
 
-### `refcount.rs` — the shared atomic reference count (`RefCount`)
-The workspace's one refcount primitive (`erts_refc_*` semantics). Safe Rust; the only interior
-mutability is the `AtomicUsize`, so `RefCount` is `Send + Sync`.
-- `#[repr(transparent)] pub struct RefCount { count: AtomicUsize }`
-- `pub const fn new(initial: usize) -> RefCount`
-- `pub fn count(&self) -> usize` — `load(Ordering::Acquire)`
-- `pub fn inc(&self) -> usize` — `fetch_add(1, AcqRel) + 1`
-- `pub fn dec(&self) -> usize` — `fetch_sub(1, AcqRel) - 1`
-- `pub fn dec_and_test(&self, min: usize) -> bool` — `fetch_sub(1, AcqRel) - 1 <= min` (the caller
-  that sees `true` must destroy the object; with `min == 0` that is exactly the last reference).
-- `impl Debug` — prints the current count.
-This is the **single** refcount type for the workspace: `beam_gc` exposes its own `RefCount` today and
-is expected to re-export this one (`pub use beam_alloc::RefCount;`) in a follow-up pass, so the same
-type is shared rather than duplicated across crates.
+### `heap` — the per-process bump heap (`Heap`)
+Fixed-capacity bump arena over a carrier-provided block; **never reallocates** (handed-out pointers
+stay valid; growth is a new heap + copy by `beam_gc`). `new(capacity_words)`,
+`with_allocator(alloc, capacity_words)`, `capacity`, `used`, `available`, `peak_used`, `reset`,
+`hp`, `hend`, `allocator`, `unsafe alloc_words`, `unsafe alloc_tuple`, `cons`, `tuple`, `Drop`
+returns the block. Exhaustion ⇒ `BeamError::Alloc(AllocKind::Heap)` (= "collect", not fatal OOM).
 
-### `binary.rs` — off-heap refcounted large binary (`RefcBinary`, `binary_alloc` analogue)
-The **allocation / ownership bookkeeping** half of the reference-counted binary feature: an
-immutable, refcounted, off-heap byte buffer plus the small control header that carries its reference
-count. The bit-exact *on-heap* term layout (`BinRef = [HEADER_BIN_REF, val, next]`, `SubBits`, the
-`ERL_ONHEAP_BINARY_LIMIT`/`ERL_ONHEAP_BITS_LIMIT` thresholds) is owned by `beam_term`; the
-**off-heap interior here is private** — it never crosses the ABI or the ETF wire.
-- `pub struct RefcBinary { /* private: AllocRef + base NonNull<u8> + len */ }`
-- `pub fn new(bytes: &[u8]) -> beam_common::Result<RefcBinary>` — copies `bytes` off-heap through
-  `allocator(AllocType::Binary)`; the reference count starts at **1**.
-- `pub fn with_allocator(alloc: AllocRef, bytes: &[u8]) -> beam_common::Result<RefcBinary>` — same,
-  but on a caller-supplied allocator (tests / injection).
-- `pub fn len(&self) -> usize`; `pub fn is_empty(&self) -> bool`; `pub fn as_bytes(&self) -> &[u8]`.
-- `pub fn refcount(&self) -> usize` — the current atomic count.
-- `pub fn data_ptr(&self) -> *mut u8` — a pointer to the **first payload byte** (the value stored in
-  the on-heap `BinRef.val` word); `UNIT_SIZE`-aligned; see the `data_ptr` contract below.
-- `impl Clone` — bumps the refcount (`RefCount::inc`) and shares the same buffer (no byte copy).
-- `impl Drop` — `RefCount::dec_and_test(0)`; the **last** handle frees the buffer **exactly once**,
-  through the **same** `AllocRef` and the **exact** `Layout` used in `new`/`with_allocator`.
-- `unsafe impl Send` — see Design Decisions (thread-safety contract). `Sync` is deliberately **not**
-  implemented (the on-heap `BinRef` ownership model is single-threaded per process).
-- **Off-heap layout (private):** a `#[repr(C)]` control header `BinaryHeader { refc: RefCount, len:
-  usize }` (= `UNIT_SIZE` = 16 B, asserted at compile time) sits immediately **before** the payload in
-  one allocation of `HEADER_SIZE + len` bytes at `MIN_ALIGN`; `data_ptr = base + HEADER_SIZE`.
-- **`data_ptr` contract:** the header is **not** part of what `data_ptr` exposes, so consumers treat
-  the pointer as a raw byte pointer to the binary data (`as_bytes().as_ptr() == data_ptr()`).
-- **Sizes 0 … 1 MiB** work (slab path ≤ the 1 KiB threshold, dedicated single-block carrier above;
-  `len == 0` is a valid, non-dereferenced, `UNIT_SIZE`-aligned `data_ptr`). Allocation failure maps
-  to `BeamError::Alloc(AllocFailure::new(AllocKind::LargeObject, requested))` — the first use of
-  `AllocKind::LargeObject`.
+### `refcount` — the shared atomic reference count (`erts_refc_*`)
+`#[repr(transparent)] pub struct RefCount { count: AtomicUsize }` — `new`, `count`, `inc`, `dec`,
+`dec_and_test(min)`. Safe Rust; `Send + Sync`. The **single** refcount primitive for the workspace;
+`beam_gc` re-exports this one rather than defining its own.
+
+### `binary` — off-heap refcounted large binary (`RefcBinary`)
+- `pub struct RefcBinary` — `new(bytes)`, `with_allocator(alloc, bytes)`, `len`, `is_empty`,
+  `as_bytes`, `refcount`, `data_ptr`. `Clone` bumps the refcount; last `Drop` frees once through the
+  **same `AllocRef` + exact `Layout`**.
+- Allocates through **`alloc_typed(TypeId::from_name("BINARY"), layout)`** / `dealloc_typed(...)`, so
+  payload bytes are attributed to the **`BINARY`** type of the **binary_alloc** allocator in the
+  per-type stats (`binary_alloc` is pinned to exactly `["BINARY","DRV_BINARY"]`). The public API is
+  unchanged. Private `#[repr(C)] BinaryHeader { refc, len }` sits immediately before the payload
+  (`data_ptr` = first payload byte; `data_ptr - HEADER_SIZE` recovers the base). `Send` but not `Sync`.
+
+### `mseg` — the mmap-backed segment allocator (`erl_mseg.c`)
+Facade + submodules `mseg/{mapping,header,config,state,allocator}.rs`.
+- Constants: `MSEG_VERSION = "0.9"`, `MSEG_HEADER_SIZE = 64`, `MAX_CACHE_SIZE = 30`,
+  `SUPER_ALIGN_BITS = 14`, `SUPER_ALIGNED_SIZE = 1<<14`; `page_size()`, `is_super_aligned(addr)`.
+- `pub enum SegmentKind { SingleBlock, MultiBlock }` (`as_str` = `"sbc"`/`"mbc"`).
+- `MsegConfig` + `MsegConfigBuilder` (`max_carriers`, `max_sbc_carriers`, `max_mbc_carriers`, `cache`;
+  `mcs` clamped to `MAX_CACHE_SIZE`); `MsegCalls`; `MsegInfo`; `Segment`; `MsegAllocator`
+  (mmap-backed, reuse cache, `+MM` limits/counters).
+
+## Carrier / size-class machinery
+All mutation is serialised through one `parking_lot::Mutex`. Carriers come from the OS (`mmap`) via
+`mseg`, page-aligned. **Routing** (`CarrierAllocator::alloc_impl`):
+- `size <= classes.large_threshold() && align <= UNIT_SIZE` → **`alloc_small`** (slab / MBC-class).
+- `align > UNIT_SIZE || policy.uses_single_block_carrier(size)` (i.e. `size >= sbct`, default 512 KiB)
+  → **`alloc_large`** (dedicated **SBC**, unmapped on free).
+- otherwise → **`alloc_mid`** (shared variable-size **MBC** pool — split on demand, coalesce on free).
+- **Slab.** Each multi-block carrier is dedicated to one class, subdivided into equal blocks (each
+  preceded by a 2-word `BlockHdr`) threaded on that class's intrusive `FreeList`; a new carrier is
+  mapped when the class list runs dry. Drains retain the carrier (documented retention policy).
+- **MBC (`mbc.rs`).** `MbcCarrier` = variable-size carrier with **boundary tags** (legacy
+  `SET_BLK_SZ_FTR`): `FLAG_PREV_FREE = 1<<7` + a trailing footer word holding the predecessor's size.
+  `unsafe fn dealloc` coalesces previous-then-next; `split-on-alloc` keeps a minimum residue;
+  `into_carrier()`, `is_fully_free()`, `free_bytes()`, `live_bytes()`, `allocated_blocks()`,
+  `largest_free()`. `MBC_CLASS = 0`, `MIN_MBC_BLOCK_SIZE = 48` (MBC-local; slab `MIN_FREE_BLOCK_SIZE = 32`).
+  Only fully-free MBC carriers are released. The pool scan is a linear first-fit over `AllocatorState::mbcs`.
+- **`free_list.rs`** — per-class intrusive free lists with variable-size buckets (`insert`/`take_fit`/
+  `remove`/`refile`/`largest_free`), good-fit depth `MAX_FIT_SEARCH = 3`, in-block links
+  (`payload+0 = next, payload+8 = prev`). Carries a large in-module test module (the structure is only
+  exercisable in-module).
+- **`block.rs`** — the 2-word `BlockHdr` (`bhdr` packs flags/size/class/payload-offset; `carrier` word
+  gives O(1) block→carrier recovery) and `BlockFlags` (`is_free`/`is_large`/`last_in_carrier`/`is_sbc`/
+  `is_mbc`/`is_mseg`/`is_fixed_size`/`is_super_aligned`/`is_prev_free`). `ALL_FLAGS == 0b0111_1111`.
+- **`strategy.rs`** — `Strategy { FirstFit, GoodFit, BestFit, AFirstFit }` (the `ErtsAlcStrat_t` surface;
+  `legacy_value`/`legacy_name`/`option_name`/`from_legacy_value`/`from_option_name`/`default_for_allocator`/
+  `supports_carrier_migration`). M1 implements the segregated first-fit family; the other variants
+  currently select it too (plugin seam reserved).
+
+## Performance (micro-benchmark `tests/hot_path.rs`)
+`... test -p beam_alloc [--release] --test hot_path -- --nocapture` (release numbers recorded here):
+- size-class lookup — `default_small_block` **3.58 ns/op** (lookup share 2.22), `default_legacy` **5.55 ns/op**
+  (share 4.20).
+- alloc+free hot path — 1 live × 64 B **871.14 ns/op**; 256 live × 64 B **616.16 ns/op**;
+  256 live over 7 classes **3031.34 ns/op**.
+- bulk mixed rounds 0/1/2 = **1062 / 4290 / 4283 ns/op** per alloc+free pair (65536 blocks, 256 sizes).
+- The alloc+free numbers are **memory/syscall-bound, not CPU-bound** (release ≈ debug; the 1-class vs
+  7-class spread tracks fresh-carrier page faults). The 1029→4311 bulk jump is legacy-faithful:
+  `get_next_mbc_size` clamps fresh MBC sizes to `>= smbcs` (1 MiB), so a 6 KiB mid request legitimately
+  gets a 1 MiB carrier. Do not chase these as "regressions".
+- Steady state / no leak: `leak summary: 4 cycles x 28 blocks, steady state at peak_carrier_bytes=2555920
+  across 7 carriers (458752 bytes)`.
 
 ## Constraints
 - **Errors:** only `beam_common::{Result, BeamError}`. No crate-local error enum, no `panic!` on OOM
-  (return `Err(BeamError::Alloc(AllocFailure::new(kind, requested)))`), no `unwrap()` on runtime
-  data. Allocation classes map to `AllocKind`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`,
-  large off-heap objects ⇒ `LargeObject`, else `Other`. Invalid alignment/`Layout` ⇒
-  `BeamError::BadArg`.
-- **`unsafe` confinement:** `unsafe` is allowed **only** in `block`, `carrier`, `free_list`,
-  `allocator`, `heap` and `binary` (raw memory). Every `unsafe fn` carries a `# Safety` section and
-  every `unsafe` block a preceding `// SAFETY:` rationale (`../beam_common/src/safety.rs` convention).
-  `size_class`, `registry`, `stats`, `strategy`, `refcount`, `error` must be safe Rust.
-  `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
-- **Carriers come from the OS via `libc::mmap`** (anonymous, private) and are `munmap`'d on free/drop
-  — the carrier *is* the OS-level block (legacy `erts_mmap`/mseg). `mmap` failure ⇒
-  `AllocFailure{kind: Carrier}`. Page-aligned carriers are relied on for block→carrier recovery.
-- **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — and
-  nothing else. `beam_term` is needed only for the `Eterm` word in `heap`; `libc` only for `mmap`.
-  Adding a dependency edge requires reporting to the crate-layer node (`../`).
-- **`Heap` is fixed-capacity by contract** — it must never reallocate (that would move live terms
-  and break the term/ABI/inspection contracts, workspace §2). Exhaustion is a *normal* condition.
-- Files target ~1000 lines; one responsibility per file.
+  (`AllocFailure{kind, requested}`: carriers ⇒ `Carrier`, process/slab heaps ⇒ `Heap`, large off-heap
+  ⇒ `LargeObject`, else `Other`; invalid alignment/`Layout` ⇒ `BadArg`), no `unwrap()` on runtime data.
+- **`unsafe` confinement:** allowed only in `block`, `carrier`, `free_list`, `allocator` (incl. its
+  `core`/`state` submodules), `mbc`, `mseg`, `heap`, `binary`. Every `unsafe fn` has a `# Safety`
+  section and every `unsafe` block a `// SAFETY:` rationale. `size_class`, `registry`, `stats`,
+  `strategy`, `policy`, `refcount`, `error` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
+- **Carriers come from the OS via `mseg` (mmap)**, are page-aligned, and `munmap`'d on free/drop.
+- **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — nothing
+  else. Adding a dependency edge requires reporting to `../`.
+- **`Heap` is fixed-capacity by contract** — never reallocate (workspace §2).
+- Files target ~1000 lines; split by responsibility. Legitimately long files are documented here:
+  `types.rs` is the `erl_alloc.types` **data table**; `free_list.rs`/`stats.rs`/`types.rs` are long
+  mainly because each carries a large in-module test module for internals only exercisable there.
 - Licensing Apache-2.0.
 
 ## Design Decisions
-- **Slab-per-size-class carrier framework (M1), not the full variable-block engine.** Legacy packs
-  arbitrary-size blocks into one carrier and coalesces, with pluggable strategies
-  (`goodfit`/`bestfit`/`afit`/`firstfit`) over `erl_alloc_util.c`. M1 implements the carrier
-  framework + **one** strategy: each multi-block carrier is dedicated to a single size class and
-  subdivided into equal blocks kept on an intrusive free list (classic segregated/slab fit); sizes
-  above `SizeClasses::large_threshold()` get a **dedicated single-block carrier** returned to the OS
-  on free (the legacy SBC path). This is a documented subset — correct and testable — not a claim of
-  strategy parity. `Strategy` exists for the A.6 config surface; the plugin trait is reserved.
-- **Every block is preceded by a 2-word `BlockHeader`** `[bhdr: u64][carrier: *mut Carrier]`
-  (`block.rs`), exactly as legacy `Block_t` precedes each payload: `bhdr` packs block size, payload
-  offset (padding for `align > UNIT_SIZE`), size-class index and flags; `carrier` gives O(1)
-  block→carrier recovery without super-alignment. Header size = `UNIT_SIZE` (16 B), so payloads are
-  `UNIT_SIZE`-aligned by construction (satisfies `align_of::<Eterm>() == 8`). `bhdr` uses fixed bit
-  fields — flags 8b, class 12b (`block::CLASS_NONE` = no class), payload offset 12b and block size
-  32b, both in `UNIT_SIZE` units — which bounds the largest encodable block (`block::MAX_BLOCK_SIZE`).
-- **`AllocRef = Arc<dyn Allocator>`, not a borrow.** Dependents (e.g. a `beam_ets` table) need to
-  outlive the call that created them and sometimes share one allocator across threads; a
-  cheaply-clonable `Arc` handle does that without a lifetime parameter on every structure.
-- **One thread-safe (`ts`) allocator instance per `AllocType`.** The legacy `ts`/`tspec`/`tpref`
-  (thread-specific / thread-preferred) and per-scheduler instances, plus the delayed-dealloc queue
-  and thread-progress barrier, are **not** in M1 (see Known Gaps); a single `parking_lot` mutex per
-  allocator is the M1 concurrency model.
-- **`Heap` exhaustion maps to `BeamError::Alloc(AllocFailure::new(AllocKind::Heap, bytes))`.** The
-  instruction set offers no "heap full / need GC" variant and the binding rule forbids a
-  crate-local error enum. The engine/GC layer treats an `AllocKind::Heap` failure *from
-  `Heap::alloc_words`/`alloc_tuple`* as the signal to collect and retry — exactly how the C VM's
-  bump-pointer overflow triggers GC rather than a fatal OOM. Flagged to the parent (which owns
-  `beam_common`): if a dedicated `BeamError::HeapExhausted` is ever added upstream, this mapping
-  becomes a one-line change here.
-- **`beam_term::heap::Heap` is a test arena; this crate's `Heap` is production.** `beam_term`'s heap
-  is backed by a `Box<[MaybeUninit<Eterm>]>` and returns `TermResult`; it exists only so
-  `beam_term` unit tests can build terms. Dependent crates must use **this** `Heap` (production,
-  allocator-backed, returns `beam_common::Result`). The `beam_term` arena is **not** re-exported.
-- **`libc::mmap` for carriers, `munmap` on free/drop.** Gives page-aligned, huge-page-eligible
-  carriers and a clean `Carrier` identity (`mmap` base = carrier base). Slab carriers are cached per
-  size class (reused across frees) and retained for the allocator's lifetime, unmapped only when the
-  allocator is dropped (`Drop for AllocatorState`); a dedicated large-block carrier is unmapped
-  immediately on `dealloc` (the header's `carrier` word gives O(1) block→carrier recovery). A simple,
-  honest retention policy (no `madvise`/shrink in M1).
-- **The refcount lives here, not in `beam_gc`.** `RefCount` is the single `erts_refc_*` primitive for
-  the whole workspace; the crate-layer contract forbids duplicating a type across crates, and
-  `beam_alloc` is the lowest common ancestor that both `beam_gc` (the MSO payload container) and the
-  binary/term users depend on. `beam_gc`'s own `RefCount` is expected to be replaced by a re-export
-  of this one (`pub use beam_alloc::RefCount;`) in a follow-up pass, preserving `beam_gc`'s API.
-- **`RefcBinary` keeps its control header *before* the payload, so `data_ptr` is a raw first byte.**
-  One allocation of `HEADER_SIZE + len` bytes at `MIN_ALIGN` holds `[BinaryHeader][payload]`, with
-  `data_ptr = base + HEADER_SIZE`. The header is `#[repr(C)] { refc: RefCount, len: usize }`, exactly
-  `UNIT_SIZE` (16 B, compile-time asserted), so the payload stays `UNIT_SIZE`-aligned and `Drop`
-  recovers `base` deterministically as `data_ptr - HEADER_SIZE` for the exact `Layout` used at
-  construction — no side table, no double free, no leak. The header is deliberately **not** exposed by
-  `data_ptr`: the on-heap `BinRef.val` word must be a raw pointer to the first data byte (the same
-  pointer the copy engine and `beam_term`'s byte access use), so the refcount/length bookkeeping stays
-  private to this crate. The off-heap interior never crosses the NIF/driver ABI or the ETF wire.
-- **`RefcBinary` is `Send`, deliberately not `Sync`.** The only shared mutable state is the atomic
-  `RefCount` and the payload is written once at construction and never mutated, so moving a handle
-  across threads cannot race (the `AllocRef` handle is `Send + Sync` by the `Allocator` contract).
-  `Sync` is withheld because the on-heap `BinRef` ownership model is single-threaded per process; a
-  future need for shared `&RefcBinary` across threads is a considered, separate decision.
+- **Slab-per-size-class carrier framework + a real variable-size MBC pool.** Slab carriers are
+  segregated (one class each, equal blocks, intrusive free list); sizes at/above `sbct` get a dedicated
+  single-block carrier returned to the OS on free; the middle band shares coalescing variable-size MBC
+  carriers (`mbc.rs`). This is a documented subset — the variable-block engine's pluggable
+  `goodfit`/`bestfit`/`afit` strategies are still collapsed to first-fit (plugin seam reserved).
+- **MBC interior layout = boundary tags**, not a side structure: pure address geometry, zero extra
+  allocation, O(1) predecessor lookup; cost is one word per *free* block. `FLAG_PREV_FREE` sits outside
+  `ALL_FLAGS`, so it cannot disturb the slab path.
+- **`AllocRef = Arc<dyn Allocator>`, not a borrow** — dependents outlive the creating call and share
+  across threads without a lifetime.
+- **The MBC free path reads `header.size` *before* `MbcCarrier::dealloc`** (coalescing rewrites the
+  header), so accounting owes the block's own size, never the merged extent; the MBC lookup is keyed by
+  exact carrier base (never by `class`, since `MBC_CLASS == 0` is also a valid slab class index).
+- **Over-aligned large blocks zero their alignment padding.** `dealloc_unsized` probes candidate
+  alignments smallest-first; a reused (unzeroed) segment could otherwise resurrect a stale plausible
+  header in the padding. Zero bytes never pass the header-plausibility check.
+- **`AllocStats::mseg` is a live view of the process-global `mseg` counters**, not a per-allocator
+  local copy (there is one segment allocator per process, as in `erl_mseg.c`).
+- **One thread-safe allocator instance per `AllocType`**, one `parking_lot` mutex each; the legacy
+  `ts`/`tspec`/`tpref`, per-scheduler instances and the delayed-dealloc queue are not in M1.
+- **`beam_term::heap::Heap` is a test arena; this crate's `Heap` is production** (allocator-backed,
+  `beam_common::Result`). The `beam_term` arena is not re-exported.
+- **The refcount lives here, not in `beam_gc`.** `RefCount` is the single `erts_refc_*` primitive; the
+  crate-layer contract forbids duplicating a type, and `beam_alloc` is the LCA.
 
 ## Test Strategy
-- In-module `#[cfg(test)] mod tests`: `size_class` (lookup boundaries, validation rejects),
-  `block` (header encode/decode round-trip, size/offset/class/flags, alignment padding), `carrier`
-  (subdivision count, free-list push/pop, exhaustion), `allocator` (alloc/dealloc/realloc round
-  trips; alignment assertions for align 8/16/64/…; thousands of mixed-size allocations forcing
-  multiple carriers; dedicated-carrier path for large sizes; stats deltas; the `max_footprint` cap ⇒
-  `AllocKind::Carrier` error; a `Heap` over a real `CarrierAllocator`), `heap` (cons/tuple/alloc_words/alloc_tuple/reset/peak, pointer stability
-  and non-reallocation, exhaustion → `AllocKind::Heap` error and no words consumed, `Drop` returns
-  the block), `refcount` (inc/dec/count, `dec_and_test` at the zero and non-zero `min` boundaries, and
-  a concurrent inc/dec race where exactly one thread wins the last reference), `binary`
-  (`RefcBinary` content round-trip for lengths 0/1/63/64/65/1024/1 MiB, the `data_ptr` first-byte and
-  alignment contract, clone/drop refcount accounting, final-drop-frees-exactly-once with no leak via
-  `stats` deltas, the `AllocKind::LargeObject` OOM path, cross-thread handle movement, and varied-size
-  dealloc exercise).
-- `tests/allocator.rs`, `tests/heap.rs` — cross-module integration over the *public* API only.
-- Prefer property-style loops over boundary ranges; assert **no leak** (drops free every carrier) so
-  a Miri / leak-check run is meaningful (recommended in CI, not required by M1).
-- Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility
-  gate), not to this crate.
-- Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_alloc`
-  and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
+- In-module `#[cfg(test)] mod tests` for the raw-memory internals (`block`, `free_list`, `mbc`,
+  `mseg`, `carrier`, `allocator::{core,state}`, `stats`) — these use heap memory and are only
+  exercisable in-module. Cross-module behaviour is tested through the **public** API.
+- Integration: `tests/allocator.rs` (alloc/dealloc/realloc round trips, alignment, dedicated-carrier
+  path, stats deltas, `max_footprint` cap, typed/unsized entry points, `allocator_info`), `tests/heap.rs`
+  (`cons`/`tuple`/`alloc_words`/`alloc_tuple`/`reset`/peak, pointer stability, `Drop`), `tests/hot_path.rs`
+  (the micro-benchmark + a steady-state/no-leak test).
+- A **leak/steady-state** test drives alloc/free cycles and asserts the carrier/free-block counters
+  return to baseline (no leak on the tested paths).
+- Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
+  -p beam_alloc --no-fail-fast` → **227 lib + 18 + 13 + 4 = 262 tests, 0 failures**; and
+  `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace` is warning-free.
+- Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
 
 ## Known Gaps (intentionally NOT covered in Milestone-1)
 - Thread-specific / thread-preferred allocators (`tspec`/`tpref`), per-scheduler instances, and the
   delayed-dealloc queue + thread-progress barrier for cross-scheduler frees.
+- The variable-block engine's **strategy plugins** (`goodfit`/`bestfit`/`afit`) — `Strategy` selects
+  but all variants fall to first-fit. The legacy `mbcgs` carrier-pool **size-growth ladder** is not
+  modelled (the MBC pool scan is a linear first-fit).
 - Carrier pools / carrier migration between allocator instances; `madvise`/carrier shrinking.
-- The variable-block engine with coalescing and the `goodfit`/`bestfit`/`afit` strategy plugins.
-- `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned
-  permanents.
-- Runtime option parsing (`+MMscs`, `+Mea`, …) — M1 exposes `AllocatorConfig`, not the A.6 CLI
-  surface (owned by `beam_rt`).
-- Allocation alignment is capped at the OS page size: a request with `align > os_page_size()`
-  (typically 4096) is rejected with `BeamError::BadArg`; super-aligned mappings are not implemented.
-- The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`) and the class
-  count (`block::MAX_CLASS_COUNT`); a request beyond the encodable bound is rejected, never truncated.
-- This crate owns the refcounted off-heap **binary** object (`RefcBinary` in `src/binary.rs`) and the
-  shared `RefCount` (`src/refcount.rs`). Out of scope are the `erts_alloc`/`enif_alloc` C ABI shims
-  (owned by `beam_abi`), bit-level `SubBits`/`Bitstring` handling and the on-heap `BinRef` layout
-  (owned by `beam_term`), and the generic MSO payload container (`beam_gc`).
+- `fix` (fixed-size type) allocators and `erts_alloc_permanent_aligned` cache-line-aligned permanents.
+- Runtime option parsing (`+MMscs`, `+Mea`, …) — `AllocatorConfig`/`CarrierPolicy` expose the knobs,
+  but the A.6 CLI surface is owned by `beam_rt`.
+- Allocation alignment is capped at the OS page size; super-aligned mappings are not carried through
+  end-to-end (the `mseg` super-align constant/`is_super_aligned` predicate exist, the caller does not
+  request them yet). The packed `bhdr` word bounds the largest encodable block (`block::MAX_BLOCK_SIZE`).
+- `erts_alloc`/`enif_alloc` **C ABI shims** are out of scope (owned by `beam_abi`); bit-level
+  `SubBits`/`Bitstring` and the on-heap `BinRef` layout are out of scope (owned by `beam_term`).
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
-- `src/allocator.rs` → `Allocator` trait, `AllocRef`, `AllocatorConfig`, `CarrierAllocator`
-- `src/size_class.rs` → `SizeClasses` (size classes + large threshold)
-- `src/registry.rs` → `AllocType` + lazily-initialised process-wide allocators (`erts_allctrs` equiv)
+- `src/allocator.rs` → facade: `WORD_ALIGN`/`MIN_ALIGN`, `AllocRef`, module wiring, re-exports
+- `src/allocator/trait.rs` → the `Allocator` trait (incl. the typed/unsized/`allocator_info` methods)
+- `src/allocator/config.rs` → `AllocatorConfig` + `AllocatorConfigBuilder`
+- `src/allocator/state.rs` → `AllocatorState` (carriers, MBC pool, free lists, counters) + `Drop`
+- `src/allocator/core.rs` → `CarrierAllocator`: routing (`alloc_small`/`alloc_mid`/`alloc_large`),
+  `locate`/`plausible`, `realloc_impl`, `mbc_size`, `impl Allocator`
+- `src/allocator/tests*.rs` → the allocator's in-module test module (basic/typed/unsized_free/info)
+- `src/types.rs` → `erl_alloc.types` inventory: `AllocatorId`/`ClassId`/`TypeId`/`TypeFlags`/
+  `ALLOC_TYPES`/`TYPE_COUNT`/`EXPECTED_TYPE_COUNT`, `type_by_name`/`types_for_allocator`
+- `src/registry.rs` → `AllocType` + lazily-initialised process-wide allocators; `alloc_util_allocators`
+- `src/size_class.rs` → `SizeClasses` (sbc/mbc ladders + thresholds)
+- `src/policy.rs` → `CarrierPolicy`/`PolicyOptionKind` (the 12 `+M<alloc><opt>` options)
+- `src/stats.rs` → `AllocStats`/`TypeStats`/`MsegStats`/`AllocatorInfo`/`InfoValue`/`STATS_TYPE_SLOTS`
 - `src/heap.rs` → the per-process bump `Heap` (`alloc_words`/`cons`/`tuple`/`reset`)
-- `src/refcount.rs` → `RefCount`: the shared atomic reference count (`erts_refc_*` semantics; safe Rust)
-- `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (`binary_alloc` analogue; raw memory)
-- `src/stats.rs` → `AllocStats` + internal `Counters`
-- `src/block.rs` → block layout constants + `BlockHeader` encode/decode (implementation module)
-- `src/carrier.rs` → `Carrier` (mmap-backed block, subdivision into equal class blocks) (implementation module)
-- `src/free_list.rs` → segregated free-list / slab management (implementation module)
+- `src/refcount.rs` → `RefCount`: the shared atomic reference count
+- `src/binary.rs` → `RefcBinary`: off-heap refcounted large binaries (attributed to the `BINARY` type)
+- `src/block.rs` → block layout constants + `BlockHdr`/`BlockFlags` (implementation module)
+- `src/carrier.rs` → `Carrier` (mseg-backed block, subdivision into equal class blocks) + the
+  process-global `mseg()` handle
+- `src/free_list.rs` → per-class intrusive free lists + variable-size buckets (implementation module)
+- `src/mbc.rs` → `MbcCarrier`: variable-size coalescing carrier with boundary tags (implementation module)
 - `src/strategy.rs` → `Strategy` selector (implementation module; A.6 config fidelity)
+- `src/mseg.rs` → facade for the mmap segment allocator; `src/mseg/{mapping,header,config,state,allocator}.rs`
 - `src/error.rs` → `pub(crate)` allocation-failure constructors (no new error enum)
-- `tests/` → crate-level integration tests (`allocator.rs`, `heap.rs`)
+- `tests/` → crate-level integration tests (`allocator.rs`, `heap.rs`, `hot_path.rs`)
 - `../../erts/emulator/beam/erl_alloc_util.c` → legacy carrier framework being mirrored (read-only)
-- `../../erts/emulator/beam/erl_alloc.types` → allocator/type/class inventory (read-only source data)
+- `../../erts/emulator/beam/erl_alloc.types` → the type/class/allocator inventory source (read-only)
+- `../../erts/emulator/beam/erl_mseg.c` → legacy segment allocator being mirrored (read-only)
 
 ## Notes for Agents
-- **The build command needs the manifest path.** `../scripts/cargo.sh build -p beam_alloc` fails
+- **The build command needs the manifest path.** `erts_rust/scripts/cargo.sh build -p beam_alloc` fails
   (no `Cargo.toml` at the repo root); use
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml -p beam_alloc`
-  (workspace: `... --manifest-path erts_rust/Cargo.toml --workspace`). Sandbox `$HOME` is read-only,
-  so always go through the wrapper. Never `cd`; never touch `../tools/`.
-- Read `../../erts/emulator/beam/erl_alloc_util.h` for the `Block_t`/`Carrier_t`/`Allctr_t` layout
-  and `erl_alloc_util.c` for the alloc/free/realloc flow before changing block or carrier code.
-- `AllocKind::Heap` from `Heap::alloc_words` means "collect", not "fatal OOM" — see Design Decisions.
-- Interior layouts (carrier size, class spacing, retention policy, and the `RefcBinary` off-heap
-  header) are **not** externally pinned; only the seam in
-  `allocator.rs`/`heap.rs`/`size_class.rs`/`registry.rs`/`stats.rs`/`refcount.rs`/`binary.rs` is
-  frozen, and of `binary.rs` only the public signatures plus the `data_ptr` first-byte contract are
-  observable.
+  (workspace: `... --manifest-path erts_rust/Cargo.toml --workspace`). Sandbox `$HOME` is read-only, so
+  always go through the wrapper. Never `cd`; never touch `../tools/`.
+- Read `../../erts/emulator/beam/erl_alloc_util.h` for the `Block_t`/`Carrier_t`/`Allctr_t` layout and
+  `erl_alloc_util.c` for the alloc/free/realloc flow before changing block or carrier code.
+- `AllocKind::Heap` from `Heap::alloc_words` means "collect", not "fatal OOM" (see Design Decisions).
+- Interior layouts (carrier size, class spacing, retention policy, the `RefcBinary` off-heap header)
+  are **not** externally pinned; only the seam in `allocator`/`heap`/`size_class`/`registry`/`stats`/
+  `types`/`refcount`/`binary`/`policy` is frozen.
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 0).
 - `../../CONTEXT.md` → workspace contracts (§2 frozen term layout, §3 error strategy, §6 test gate).
-- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D ("Memory management in Rust") and §H Stage 0/3.
-- `../beam_term/CONTEXT.md` → the frozen term representation this heap stores; `heap.rs` relationship.
+- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §D (memory management) and §H Stage 0/3.
+- `../beam_term/CONTEXT.md` → the frozen term representation this heap stores.
 - `../beam_gc/`, `../beam_message/`, `../beam_ets/`, `../beam_process/` → primary dependents.
+
+## Handoffs (owned by other nodes — NOT adopted here)
+- **`beam_rt` `system_info` wiring:** `system_info(alloc_util_allocators)`,
+  `system_info({allocator,A})` and `erts_alloc:info/0` can consume
+  `registry::alloc_util_allocators()` + `AllocatorInfo::from_stats(...)`/`push_policy(...)`/
+  `push_type(...)` — the shapes are in place but not yet wired in `beam_rt`.
+- **`../../CHANGE.md` entries owed to the repo-root owner:** the type-table inventory, the mseg layer,
+  the typed allocator surface, the stats layer, the MBC/coalescing wiring, and the `policy.rs` thresholds.
+- **`beam_gc`:** expected to replace its own `RefCount` with `pub use beam_alloc::RefCount;`.
