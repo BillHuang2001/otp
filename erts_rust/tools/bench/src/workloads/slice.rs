@@ -262,7 +262,10 @@ fn fixture_path() -> PathBuf {
 }
 
 /// Resolves `erlc`: `$ERLC` when set (and existing), else `erlc` on `PATH`.
-fn resolve_erlc() -> Option<PathBuf> {
+///
+/// Shared with the `foreign` workload (the other workload that compiles real `.erl`
+/// sources), so the two agree on the toolchain lookup exactly.
+pub(crate) fn resolve_erlc() -> Option<PathBuf> {
     match std::env::var_os("ERLC") {
         Some(value) if !value.is_empty() => {
             let path = PathBuf::from(value);

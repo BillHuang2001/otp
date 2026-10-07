@@ -14,6 +14,7 @@ pub mod cowboy;
 pub mod elixir_compiler;
 pub mod emqx;
 pub mod erlc_compiler;
+pub mod foreign;
 pub mod khepri;
 pub mod plb;
 pub mod slice;
@@ -100,6 +101,7 @@ pub fn registry() -> Vec<Box<dyn Workload>> {
         Box::new(khepri::Khepri),
         Box::new(emqx::Emqx),
         Box::new(slice::Slice),
+        Box::new(foreign::Foreign),
     ]
 }
 
@@ -174,7 +176,8 @@ mod tests {
                 "cowboy",
                 "khepri",
                 "emqx",
-                "slice"
+                "slice",
+                "foreign"
             ]
         );
     }

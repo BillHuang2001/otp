@@ -3,9 +3,10 @@
 //! dependency on any Erlang runtime.
 
 use bench::compare::compare_labeled;
-use bench::metrics::{Category, Metric, Status};
+use bench::metrics::{Category, Metric, Runtimes, Status};
 use bench::report::{Profile, Report, WorkloadResult, SCHEMA_VERSION};
 use bench::runtime::{RuntimeInfo, RuntimeKind};
+use bench::workload;
 
 fn report(results: Vec<WorkloadResult>, profile: Profile) -> Report {
     let info = RuntimeInfo {
@@ -101,4 +102,38 @@ fn comparison_flags_presence_and_status_changes() {
         .rows
         .iter()
         .any(|r| r.note.as_deref() == Some("status ok -> skipped")));
+}
+
+/// Regression guard for the **cross-runtime measurement** contract: the driver must be
+/// able to measure the Rust runtime on *real foreign target-project code*, not only the
+/// system ERTS. The `foreign` workload is the one that runs the same real Cowboy/EMQX
+/// `.beam` under *both* runtimes, so it must stay `Runtimes::Both` (schedulable under the
+/// `rust` runtime) and keep declaring the contracts it exercises. If it is ever flipped
+/// back to `SysOnly` or removed, this fails loudly — no silent loss of Rust coverage.
+#[test]
+fn a_real_foreign_workload_is_measured_under_both_runtimes() {
+    let foreign = workload::find("foreign").expect("the `foreign` workload must be registered");
+
+    assert!(
+        matches!(foreign.runtimes(), Runtimes::Both),
+        "`foreign` must run under both runtimes, got {:?}",
+        foreign.runtimes()
+    );
+    assert!(foreign.runtimes().allows(RuntimeKind::Rust));
+    assert!(foreign.runtimes().allows(RuntimeKind::Sys));
+
+    // Real `.beam` modules (A.2) executing real Erlang semantics (A.1).
+    assert!(foreign.contracts().contains(&"A.1"), "contracts: {:?}", foreign.contracts());
+    assert!(foreign.contracts().contains(&"A.2"), "contracts: {:?}", foreign.contracts());
+
+    // At least one registered workload must be Rust-schedulable, and `foreign` is it.
+    let rust_capable: Vec<&str> = workload::registry()
+        .iter()
+        .filter(|w| w.runtimes().allows(RuntimeKind::Rust))
+        .map(|w| w.id())
+        .collect();
+    assert!(
+        rust_capable.contains(&"foreign"),
+        "the rust-schedulable workload set must include `foreign`; got {rust_capable:?}"
+    );
 }
