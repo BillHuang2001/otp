@@ -55,7 +55,7 @@ use crate::terms;
 ///
 /// The *order* is C's: `build_stacktrace` prepends the current function last
 /// (`beam_common.c:1278-1288`), so the list runs innermost frame first.
-pub(super) fn symbolic_stacktrace(
+pub(crate) fn symbolic_stacktrace(
     machine: &Machine,
     module: &Module,
     ctx: &mut dyn ExecutionContext,
@@ -74,7 +74,12 @@ pub(super) fn symbolic_stacktrace(
 /// One `{Module,Function,Arity,Location}` stacktrace item for the function at
 /// index `func`, located at code offset `pc` (C's `erts_build_mfa_item`,
 /// `../../erts/emulator/beam/utils.c:3430-3457`).
-fn stacktrace_item(
+///
+/// Shared with the engine's read-only execution-position introspection
+/// ([`Machine::current_location`](crate::machine::Machine::current_location)),
+/// whose `process_info(P, current_location)` value is exactly this
+/// `{M,F,A,Location}` tuple.
+pub(crate) fn stacktrace_item(
     module: &Module,
     ctx: &mut dyn ExecutionContext,
     func: u32,

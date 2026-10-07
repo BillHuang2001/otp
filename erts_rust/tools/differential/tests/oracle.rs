@@ -13,7 +13,7 @@ use differential::corpus::{find_case, CaseKind};
 use differential::harness::{run_case, run_case_in, RuntimeContext};
 use differential::module_build;
 use differential::runtime::{
-    eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, RuntimeSpec,
+    eval_argv, resolve_oracle, resolve_rust, resolve_rust_from, run, run_with_env, RuntimeSpec,
 };
 
 mod common;
@@ -166,16 +166,21 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
         return;
     };
     let mut checked = 0;
+    let mut checked_env = 0;
     for case in differential::corpus::cases() {
         // Module-run cases are compiled and checked separately (see below).
-        let CaseKind::Eval { .. } = case.kind else {
+        if matches!(case.kind, CaseKind::Module(_)) {
             continue;
-        };
+        }
         checked += 1;
         let argv = eval_argv(&case.eval(), case.extra_argv());
-        let observation = run(&oracle, &argv).unwrap_or_else(|error| {
-            panic!("case {}: failed to run the oracle: {error}", case.id)
-        });
+        // An environment-variable case (A.6) is spawned with its explicit environment, so
+        // the `ERL_*FLAGS` merge is part of what the oracle must reproduce here too.
+        if !case.env().is_empty() {
+            checked_env += 1;
+        }
+        let observation = run_with_env(&oracle, &argv, case.env())
+            .unwrap_or_else(|error| panic!("case {}: failed to run the oracle: {error}", case.id));
         let golden = check_golden(&observation, &case.golden);
         assert!(
             golden.matched,
@@ -192,6 +197,10 @@ fn every_eval_corpus_case_matches_its_oracle_golden() {
         );
     }
     assert!(checked > 0, "the corpus must contain expression cases");
+    assert!(
+        checked_env > 0,
+        "the corpus must carry ERL_*FLAGS environment cases"
+    );
 }
 
 /// Every module-run case must reproduce its golden under the oracle too: the embedded

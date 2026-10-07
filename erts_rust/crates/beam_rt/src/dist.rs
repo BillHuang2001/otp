@@ -46,7 +46,9 @@
 //! * **`-sname`/`-name` are derived from the configured name.** A value
 //!   containing `@` is a long name (used verbatim, as the oracle registers it); a
 //!   bare value is a short name, so the node name is `<value>@<hostname>` and the
-//!   `epmd` name is `<value>`. (`inet:gethostname/0`'s host is read from
+//!   `epmd` name is `<value>`. What goes on the **wire** is always the full
+//!   `node@host` (see [`NodeName`]) — a bare advertised name is refused by a real
+//!   peer. (`inet:gethostname/0`'s host is read from
 //!   `/proc/sys/kernel/hostname`, falling back to `$HOSTNAME`.)
 //! * **Inbound control messages are not delivered.** A link's decoded
 //!   `DOP_*` messages stay queued in the driver (Phase 2 delivers them into the
@@ -83,16 +85,23 @@ const MAX_ACCEPTS_PER_PUMP: usize = 8;
 ///
 /// * `full` — the name this node *is* (`node@host`); what
 ///   `erlang:node/0` reports for a live node.
-/// * `advertised` — the name put on the wire in `Name`/`Challenge`: the full name
-///   for a long node (`-name`), the **short** name for a short node (`-sname`) —
-///   exactly what OTP sends (`erl_dist_protocol.md`).
+/// * `advertised` — the name put on the wire in `Name`/`Challenge`: **always** the
+///   full `node@host`, for a long node (`-name`) *and* a short node (`-sname`) —
+///   exactly what OTP sends. OTP's connecting side validates the name inside the
+///   server's `'N'`/challenge message with `list_to_existing_atom(Ns)` and compares
+///   it against the node it dialled, which is always the full `node@host`
+///   (`dist_util.erl`'s `recv_challenge_new/2`; both `send_name/4` and
+///   `send_challenge/2` put `atom_to_binary(Node)` on the wire). A bare short name
+///   is therefore refused: the peer aborts the socket mid-handshake and the
+///   accepting side observes a short read.
 /// * `epmd` — the name `epmd` is told and a `PORT2_REQ` looks up: the short name
 ///   for a short node, the full name verbatim for a long node.
 #[derive(Clone, PartialEq, Eq, Debug)]
 pub struct NodeName {
     /// The full `node@host` name.
     full: String,
-    /// The name advertised in the `'N'`/`'s'` handshake messages.
+    /// The name advertised in the `'N'`/`'s'` handshake messages: the full
+    /// `node@host` name (short names are *not* advertised bare).
     advertised: Vec<u8>,
     /// The name registered with `epmd`.
     epmd: Vec<u8>,
@@ -104,7 +113,9 @@ impl NodeName {
     /// Splits a configured `-name`/`-sname` value into its wire forms.
     ///
     /// A value containing `@` is a long name (verbatim); a bare value is a short
-    /// name, whose host part is this host's name (`inet:gethostname/0`).
+    /// name, whose host part is this host's name (`inet:gethostname/0`). The
+    /// **advertised** form is the full `node@host` name in both cases (only
+    /// `epmd` is told the short name of a short node) — see [`NodeName`].
     pub fn parse(configured: &str) -> NodeName {
         if configured.contains('@') {
             NodeName {
@@ -116,8 +127,8 @@ impl NodeName {
         } else {
             let full = format!("{configured}@{}", local_hostname());
             NodeName {
+                advertised: full.as_bytes().to_vec(),
                 full,
-                advertised: configured.as_bytes().to_vec(),
                 epmd: configured.as_bytes().to_vec(),
                 short: true,
             }
@@ -129,7 +140,8 @@ impl NodeName {
         &self.full
     }
 
-    /// The name advertised in the handshake (`short` for a `-sname` node).
+    /// The name advertised in the handshake: the **full** `node@host` name, for a
+    /// long node (`-name`) and a short node (`-sname`) alike.
     pub fn advertised(&self) -> &[u8] {
         &self.advertised
     }
@@ -352,7 +364,8 @@ impl DistNode {
         self.name.full()
     }
 
-    /// The name advertised in the handshake (the short name for a `-sname` node).
+    /// The name advertised in the handshake: the full `node@host` name, for a
+    /// `-sname` node as well as a `-name` node.
     pub fn advertised_name(&self) -> &[u8] {
         self.name.advertised()
     }
@@ -569,3 +582,35 @@ pub fn resolve_cookie(init_args: &crate::config::InitArgs) -> Vec<u8> {
 /// started without a cookie is reachable only by a peer that agrees on the same
 /// default (a wrong cookie simply fails the handshake — never a false success).
 const DEFAULT_COOKIE: &[u8] = b"nocookie";
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A short (`-sname`) node advertises the **full** `node@host` on the wire while
+    /// telling `epmd` the short name: OTP's connecting side compares the challenge
+    /// name against the node it dialled (`dist_util.erl`'s `recv_challenge_new/2`),
+    /// so a bare advertised name makes a real peer abort the socket.
+    #[test]
+    fn a_short_name_advertises_the_full_node_name() {
+        let name = NodeName::parse("mynode");
+        assert!(name.is_short());
+        assert_eq!(name.full(), format!("mynode@{}", local_hostname()));
+        assert_eq!(
+            name.advertised(),
+            name.full().as_bytes(),
+            "the advertised name is the full `node@host`, never the bare short name"
+        );
+        assert_eq!(name.epmd(), b"mynode", "epmd is told the short name");
+    }
+
+    /// A long (`-name`) node advertises and registers its name verbatim.
+    #[test]
+    fn a_long_name_advertises_and_registers_verbatim() {
+        let name = NodeName::parse("mynode@some.host.example");
+        assert!(!name.is_short());
+        assert_eq!(name.full(), "mynode@some.host.example");
+        assert_eq!(name.advertised(), b"mynode@some.host.example");
+        assert_eq!(name.epmd(), b"mynode@some.host.example");
+    }
+}

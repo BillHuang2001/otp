@@ -29,6 +29,10 @@
 //! * `run` — the run entries ([`Machine::run_export`]/[`Machine::run_label`]/
 //!   [`Machine::run_with_tier`]), their blocking-aware `*_outcome` counterparts and
 //!   [`RunOutcome`].
+//! * `location` — the read-only execution-position introspection
+//!   ([`Machine::current_code`]/[`Machine::entry_call`] and the derived
+//!   [`Machine::current_function`]/[`Machine::initial_call`]/
+//!   [`Machine::current_location`]/[`Machine::current_stacktrace`]).
 //! * `tests` — this module's unit tests, which exercise every part together.
 
 use beam_common::{ExceptionClass, Result};
@@ -44,6 +48,7 @@ use self::catch::UNRESOLVED_CLASS_ATOMS;
 
 mod catch;
 mod frames;
+mod location;
 mod registers;
 mod run;
 /// Process-state core: x-register file, Erlang stack and call-frame stack.
@@ -121,6 +126,33 @@ pub struct Machine {
     /// a host may consume the returned `Eterm` afterwards), so a reset must not free
     /// a payload a caller can still read.
     pub(crate) refc_binaries: Vec<beam_alloc::RefcBinary>,
+    /// The code address the machine is currently executing, or was most recently
+    /// **suspended** at: `(function index, code offset)`.
+    ///
+    /// Updated by [`Machine::step_instruction`](crate::machine::Machine) — the
+    /// single choke point every *interpreted* instruction passes through (the
+    /// interpreter's dispatch loop and the native tiers' per-instruction deopt
+    /// helper both go through it) — and cleared by
+    /// [`Machine::reset`](crate::machine::Machine::reset). `None` before the
+    /// machine has interpreted anything.
+    ///
+    /// This is the engine's read-only "saved instruction pointer": the input to
+    /// the execution-position introspection ([`Machine::current_code`], and the
+    /// derived [`Machine::current_function`]/[`Machine::current_location`]/
+    /// [`Machine::current_stacktrace`]). Every **blocking** instruction
+    /// (`wait`/`wait_timeout`) is interpreted rather than inlined by a native
+    /// tier, so the recorded address is exact at every suspension point; a
+    /// natively-executed JIT block does not update it, so mid-block it is the
+    /// *last interpreted* instruction (documented, never invented).
+    pub(crate) current_code: Option<(u32, u32)>,
+    /// The `(function index, arity)` this run was **entered** at — the engine's
+    /// analogue of ERTS's `$initial_call`.
+    ///
+    /// Recorded once per run by [`Machine::run_loop`](crate::machine::Machine)
+    /// (the first function entered after a [`Machine::reset`](crate::machine::Machine::reset),
+    /// which clears it) and read back by [`Machine::initial_call`]. `None` before
+    /// any run.
+    pub(crate) entry_call: Option<(u32, u32)>,
 }
 
 impl Machine {
@@ -142,6 +174,8 @@ impl Machine {
             max_register,
             literals: None,
             refc_binaries: Vec::new(),
+            current_code: None,
+            entry_call: None,
         };
         machine.reset();
         machine

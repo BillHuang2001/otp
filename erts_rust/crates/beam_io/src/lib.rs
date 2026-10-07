@@ -20,7 +20,9 @@
 //!    [`abi`] module is the frozen-C-ABI bridge (contract A.4): [`abi::DriverPort`] adapts a
 //!    `beam_abi::driver::loader::DriverLibrary` to [`Driver`](driver::Driver), [`abi::AbiHost`]
 //!    implements `beam_abi::driver::host::DriverHost` over this crate's poller/queues/timer,
-//!    and [`abi::PortHost`] is the one runtime hook `beam_io` cannot fill (atom interning).
+//!    [`abi::DriverTable`] is the process-global driver registry (the C's `driver_list`) plus
+//!    its port-creation service, and [`abi::PortHost`] is the one runtime hook `beam_io`
+//!    cannot fill (atom interning).
 //!
 //! Supporting types: [`timer`] (poll deadlines), [`queue`] (the port byte buffers) and
 //! [`port_task`] (per-port task scheduling: the ERTS port-task queue, its reduction costs
@@ -89,8 +91,8 @@ pub use crate::timer::*;
 /// [`SpawnDriver`], [`SpawnSpec`], [`SpawnOptions`], [`SpawnStream`], [`build_command`],
 /// [`TcpInetDriver`], [`InetState`]), the driver C-ABI host layer ([`DriverPort`],
 /// [`PortHost`], [`AbiHost`], [`LocalAtomPortHost`], [`DriverState`], [`AsyncJobs`],
-/// [`make_loaded`]) and the timer/queue helpers ([`Timeout`], [`Timer`],
-/// [`ByteQueue`]) into scope.
+/// [`make_loaded`], [`DriverTable`], [`RegisteredDriver`]) and the timer/queue helpers
+/// ([`Timeout`], [`Timer`], [`ByteQueue`]) into scope.
 pub mod prelude {
     pub use crate::abi::*;
     pub use crate::driver::*;

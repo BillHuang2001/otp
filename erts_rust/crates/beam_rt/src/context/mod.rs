@@ -407,6 +407,28 @@ impl<'a> RuntimeContext<'a> {
         self.current_module = previous;
         result
     }
+
+    /// Records the module whose **code** this context is about to execute — the BIF call
+    /// site, for the duration of one entry.
+    ///
+    /// [`RuntimeContext::run_export`] sets `current_module` itself for the single-pass path;
+    /// a scheduled process runs its entry through the engine's blocking-aware
+    /// [`Machine::run_export_outcome`](beam_engine::Machine::run_export_outcome) instead, so
+    /// [`crate::runner`]'s process slice sets it here. The point is that a BIF which needs
+    /// its call site — `erlang:load_nif/2` (whose owning module the oracle derives from the
+    /// call instruction), the `records` source bridge — behaves identically whether the
+    /// export ran in one pass or as a scheduled process.
+    ///
+    /// A module whose atom table cannot name itself records the empty name, exactly as
+    /// [`RuntimeContext::run_export`]'s `unwrap_or_default` does — never a guessed one.
+    pub(crate) fn enter_module(&mut self, module: &Module) {
+        self.current_module = Some(
+            module
+                .atom_name(module.name)
+                .unwrap_or_default()
+                .to_string(),
+        );
+    }
     /// Dispatches a `beam_bifs`-registered BIF over a [`BifContext`] built from the
     /// runtime's shared state and this context's output sink.
     ///

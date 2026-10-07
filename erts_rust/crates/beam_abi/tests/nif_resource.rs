@@ -33,7 +33,10 @@
 
 mod common;
 
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
+use std::process::Command;
+use std::rc::Rc;
 
 use beam_abi::nif::enif::enif_api_table;
 use beam_abi::nif::enif::resources::enif_get_resource;
@@ -43,7 +46,8 @@ use beam_abi::NifEnv;
 use beam_alloc::Heap;
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{
-    self, atom_val, is_atom, make_atom, make_boxed, make_header, make_small, Eterm, NIL,
+    self, atom_val, is_atom, make_atom, make_boxed, make_header, make_internal_pid, make_pid_data,
+    make_small, Eterm, NIL,
 };
 use beam_term::REF_SUBTAG;
 use libc::c_void;
@@ -57,23 +61,39 @@ const FIXTURE_C: &str = include_str!("fixtures/nif_resource.c");
 // A `NifHost` that can mint resource terms (`make_ref`)
 // ---------------------------------------------------------------------------------------------
 
-/// A test host: a bump heap, an atom table, and a `make_ref` implementation.
+/// A test host: a bump heap, an atom table, a process identity, and a liveness answer.
 ///
-/// `tests/common/mod.rs::TestHost` is deliberately minimal (no `make_ref`), so the resource test
-/// supplies its own host here — minting an internal-ref thing for each `enif_make_resource` call, so
-/// every resource term is a distinct, resolvable word (as on the oracle).
+/// `tests/common/mod.rs::TestHost` is deliberately minimal (no `self_pid`, no `is_process_alive`), so
+/// the resource test supplies its own host here. The resource *term* no longer comes from this host —
+/// `enif_make_resource` mints it in `src/nif/enif/resources.rs` (the `make_ref` hook below is what
+/// `enif_make_ref` alone would use, and is kept so the host is a faithful stand-in).
+///
+/// `live` is shared with the test because the host is mutably borrowed by the [`NifEnv`] for the
+/// whole test, so the test cannot set it on the host directly.
 struct ResourceHost {
     heap: Heap,
     atoms: AtomTable,
     next_ref: usize,
+    /// The pid `NifHost::self_pid` reports (the calling process).
+    self_pid: Eterm,
+    /// The pids `NifHost::is_process_alive` reports as alive (the "other" processes).
+    live: Rc<RefCell<Vec<Eterm>>>,
 }
 
 impl ResourceHost {
+    /// A host with a process identity and no live "other" processes.
     fn new() -> ResourceHost {
+        ResourceHost::with_processes(Vec::new())
+    }
+
+    /// A host whose calling process is an internal pid and which reports `live` as alive.
+    fn with_processes(live: Vec<Eterm>) -> ResourceHost {
         ResourceHost {
             heap: Heap::new(4096).expect("a small test heap is allocatable"),
             atoms: AtomTable::new(),
             next_ref: 0,
+            self_pid: make_internal_pid(make_pid_data(0, 1)),
+            live: Rc::new(RefCell::new(live)),
         }
     }
 }
@@ -94,7 +114,12 @@ impl beam_abi::NifHost for ResourceHost {
         self.atoms.name(atom_val(atom)).map(str::to_string)
     }
 
-    /// Mint a fresh internal reference — the term `enif_make_resource` records as a resource handle.
+    /// The calling process — what `enif_self` and the self case of `enif_is_process_alive` need.
+    fn self_pid(&mut self) -> Option<Eterm> {
+        Some(self.self_pid)
+    }
+
+    /// Mint a fresh internal reference (what `enif_make_ref` uses).
     fn make_ref(&mut self) -> Option<Eterm> {
         let id = self.next_ref;
         self.next_ref += 1;
@@ -109,6 +134,11 @@ impl beam_abi::NifHost for ResourceHost {
             *p.add(3) = make_small(id as i64); // a distinct id per call
         }
         Some(make_boxed(p as *const Eterm))
+    }
+
+    /// The only answer this host can give for an *other* process.
+    fn is_process_alive(&mut self, pid: Eterm) -> Option<bool> {
+        Some(self.live.borrow().contains(&pid))
     }
 }
 

@@ -189,16 +189,15 @@ pub const EXIT_UNSUPPORTED: i32 = 3;
 ///
 /// `ERL_MAX_PORTS` is the one member of that family with a modelled effect: the emulator
 /// `atoi`s it and clamps it into `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]` (`erl_init.c:1341`).
-/// This runtime has no `port_limit` [`system_info`](crate::info) key yet, so the clamped
-/// value is routed into the **same channel the `+Q` switch already uses** —
-/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) — and only
-/// when the merged command line carries **no** `+Q` of its own. A command-line or
-/// `ERL_FLAGS` `+Q` therefore wins outright, exactly as in the oracle, where
-/// `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both observe a
-/// `port_limit` of 4096.
-///
-/// The value becomes *observable* only once `crate::info` gains a `port_limit` key (a
-/// sibling's surface); until then it is preserved, not applied.
+/// The clamped value requests a port table exactly as `+Q N` does, so it is applied
+/// **twice** — as a `+Q` entry of
+/// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) (nothing is
+/// lost from the emulator-flag surface) and as the
+/// [`max_ports`](RuntimeConfig::max_ports) request the runtime reports through
+/// `system_info(port_limit)` — and only when the merged command line carries **no** `+Q`
+/// of its own. A command-line or `ERL_FLAGS` `+Q` therefore wins outright, exactly as in
+/// the oracle, where `ERL_MAX_PORTS=2048 erl +Q 4096` and `ERL_FLAGS='+Q 4096' erl` both
+/// observe a `port_limit` of 4096.
 ///
 /// [`parse`] itself never reads the process environment: the differential harness and the
 /// unit tests call it directly, and [`run`] calls this function with [`ProcessEnv`].
@@ -212,10 +211,12 @@ pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
     let env_vars = vars::from_env(env);
     // `ERL_MAX_PORTS` acts exactly like a `+Q` the command line does not already carry
     // (the oracle: any `+Q` in the merged argv overrides the variable). The two tokens go
-    // into `extra_emulator_flags` through the same primitive `+Q` uses.
+    // into `extra_emulator_flags` through the same primitive `+Q` uses, and the value
+    // itself becomes the configuration's port-table request.
     if let Some(max_ports) = env_vars.max_ports {
         if !vars::has_plus_q_switch(&merged) {
             preserve_emulator_flag(&mut config.emulator, "+Q", &max_ports.to_string());
+            config.max_ports = Some(max_ports);
         }
     }
     config.env = env_vars;
@@ -245,6 +246,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         pa: Vec::new(),
         pz: Vec::new(),
         heap: HeapOptions::new(),
+        max_ports: None,
         init_args: InitArgs::new(),
         action: Action::Boot,
     };
@@ -310,7 +312,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "+Q" => {
                 let value = value_of(args, index, "+Q")?;
-                flags::parse_max_ports("+Q", &value)?;
+                builder.max_ports = flags::parse_max_ports("+Q", &value)?;
                 builder.preserve("+Q", &value);
                 index += 2;
             }
@@ -385,6 +387,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         code_paths,
         heap_words: DEFAULT_HEAP_WORDS,
         heap: builder.heap,
+        max_ports: builder.max_ports,
         init_args: builder.init_args,
         action: builder.action,
         // The environment family is read only by `parse_with_env`; the pure `parse` sees
@@ -403,6 +406,8 @@ struct Builder {
     pz: Vec<PathBuf>,
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) being assembled.
     heap: HeapOptions,
+    /// The requested port-table size (`+Q N`; `None` for the default table or `legacy`).
+    max_ports: Option<usize>,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
     init_args: InitArgs,
     /// The selected action.
@@ -937,6 +942,14 @@ fn apply(runtime: &mut Runtime, module: &str, function: &str, args: &[Eterm]) ->
 
 /// The `run File Mod:Func/Arity [Args…]` action: run and **print** the result.
 ///
+/// The export is driven through [`Runtime::run_scheduled`], which runs it as a real
+/// scheduled process and pumps the **full** scheduler (processes, ports, timers,
+/// distribution) until it terminates — so a workload that blocks (a driver/port echo
+/// round-trip, say) is resumed by a later pass instead of dying on a single-pass
+/// [`beam_engine::blocked`](beam_engine::blocked). A workload that never terminates is
+/// reported honestly when [`Runtime::RUN_DEADLINE`] expires, and one blocked with nothing
+/// able to wake it keeps the single-pass path's immediate answer (see that method).
+///
 /// The result is rendered with `~w~n` — exactly what the oracle's
 /// `io:format("~w~n",[V])` produces — and the loaded module's name must be the one the
 /// spec named (a mismatch means the file is not the requested module).
@@ -952,7 +965,7 @@ fn run_file(
     args: &[ArgTerm],
 ) -> Result<()> {
     let terms = runtime.materialize_args(args)?;
-    let result = match runtime.run_function(file, function, arity, &terms) {
+    let result = match runtime.run_scheduled(file, function, arity, &terms) {
         Ok(result) => result,
         Err(error) => return Err(reported_reason(runtime, error)),
     };
@@ -1577,15 +1590,30 @@ mod tests {
     /// validate it — `erl_check_io.c:2467`).
     #[test]
     fn limit_switches_are_validated_preserved_and_never_init_arguments() {
-        // `+Q` — preserved only: nothing about the runtime changes.
-        for value in ["1024", "134217727", "legacy"] {
+        // `+Q` — preserved verbatim *and* modelled as the port-table request the runtime
+        // reports through `system_info(port_limit)`.
+        for value in ["1024", "134217727"] {
             let config = parsed(&["+Q", value]);
             assert_eq!(
                 config.emulator.extra_emulator_flags,
                 vec!["+Q".to_string(), value.to_string()]
             );
+            assert_eq!(
+                config.max_ports,
+                Some(value.parse::<usize>().expect("a decimal switch value")),
+                "+Q {value}"
+            );
             assert_eq!(config.init_args.get("Q"), None);
         }
+        // `+Q legacy` selects the emulator's default table: no request at all.
+        let config = parsed(&["+Q", "legacy"]);
+        assert_eq!(
+            config.emulator.extra_emulator_flags,
+            vec!["+Q".to_string(), "legacy".to_string()]
+        );
+        assert_eq!(config.max_ports, None);
+        // Without `+Q` there is no request either.
+        assert_eq!(parsed(&[]).max_ports, None);
         for value in ["1000", "0", "1023", "134217728", "abc", "1024abc", ""] {
             let error = parse_args(&["+Q", value]).expect_err("a bad +Q value");
             assert_eq!(error::unsupported_reason(&error), None, "{value:?}");

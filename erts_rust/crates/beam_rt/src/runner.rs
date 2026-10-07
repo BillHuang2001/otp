@@ -133,6 +133,16 @@ pub(crate) struct RunnerState {
     results: HashMap<ProcessId, Eterm>,
     /// The exit reason term of every process that finished by raising.
     exits: HashMap<ProcessId, Eterm>,
+    /// The **original** [`BeamError`] of every process that finished by raising.
+    ///
+    /// [`RunnerState::exits`] keeps only the reason *term* — what the process table
+    /// propagates and [`Runtime::process_exit`](crate::runtime::Runtime::process_exit)
+    /// exposes. A raise's **class** (`error`/`exit`/`throw`) and its `unsupported`
+    /// classification live only on the error itself, so it is kept here too: the CLI's
+    /// `run` action recovers it with
+    /// [`Runtime::take_process_error`](crate::runtime::Runtime::take_process_error), which
+    /// makes the pumped, scheduler-driven path classify exactly like the single-pass one.
+    errors: HashMap<ProcessId, BeamError>,
 }
 
 impl RunnerState {
@@ -172,6 +182,16 @@ impl RunnerState {
     /// The raise reason `pid` finished with, once it failed.
     pub(crate) fn exit(&self, pid: ProcessId) -> Option<Eterm> {
         self.exits.get(&pid).copied()
+    }
+
+    /// Takes the **original** error `pid` failed with, once it failed.
+    ///
+    /// The reason *term* ([`RunnerState::exit`]) is what a process's exit propagates; the
+    /// error itself is what carries the raise class and the `unsupported` classification,
+    /// so the caller that must reproduce the CLI's diagnostics takes it here (see the field
+    /// docs). Taking consumes it: the first caller gets it, later ones get `None`.
+    pub(crate) fn take_error(&mut self, pid: ProcessId) -> Option<BeamError> {
+        self.errors.remove(&pid)
     }
 }
 
@@ -361,6 +381,13 @@ impl ProcessRunner for RuntimeRunner<'_> {
 
         let outcome = {
             let mut ctx = RuntimeContext::for_process(&mut *self.runtime, table, pid);
+            // A BIF reached from this code must know its **call site**: the oracle derives
+            // `erlang:load_nif/2`'s owning module from the call instruction, so a scheduled
+            // process sets it exactly as `RuntimeContext::run_export` sets it for the
+            // single-pass path (see [`RuntimeContext::enter_module`]).
+            if let ProcessEntry::Export { module, .. } = &engine.entry {
+                ctx.enter_module(module);
+            }
             match engine.parked {
                 // A resume continues the SAME machine: the registers, the Erlang stack and
                 // the frames of the suspended `receive` must survive, so this deliberately
@@ -438,6 +465,10 @@ impl ProcessRunner for RuntimeRunner<'_> {
             Err(error) => {
                 let reason = exit_reason(self.runtime, &error);
                 self.state.exits.insert(pid, reason);
+                // Keep the original error as well: the reason *term* above is what the exit
+                // propagates, but only the error carries the raise class and the
+                // `unsupported` classification the CLI keys off (see `RunnerState::errors`).
+                self.state.errors.insert(pid, error);
                 Ok(RunOutcome::Exit(reason))
             }
         }

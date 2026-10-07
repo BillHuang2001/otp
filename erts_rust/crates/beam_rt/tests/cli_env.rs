@@ -17,9 +17,12 @@
 //! ```
 //!
 //! `ERL_MAX_PORTS` is the one member with a modelled effect: the emulator `atoi`s it,
-//! clamps it into `[1024, 134217727]` and uses it as the port-table size (this runtime
-//! routes the clamped value into the `+Q` channel instead, because it has no `port_limit`
-//! `system_info` key yet). The oracle's observable is `erlang:system_info(port_limit)`:
+//! clamps it into `[1024, 134217727]` and uses it as the port-table size. This runtime
+//! records the clamped value as the configuration's port-table request
+//! (`config.max_ports`, the same field `+Q N` sets) **and** routes it into the `+Q`
+//! channel `extra_emulator_flags` for the emulator-flag surface; `crate::info`'s
+//! `port_limit` then applies the emulator's power-of-two table sizing. The oracle's
+//! observable is `erlang:system_info(port_limit)`:
 //!
 //! ```text
 //! ERL_MAX_PORTS=1         → 1024        ERL_MAX_PORTS=2000      → 2048
@@ -29,9 +32,10 @@
 //! ERL_FLAGS='+Q 4096' erl               → 4096   (also through the `*FLAGS` merge)
 //! ```
 //!
-//! The `2000 → 2048` step is the port-table power-of-two sizing, an emulator concern the
-//! parser deliberately does not model; the `1 → 1024` and `999999999 → 134217727` steps
-//! are the clamp it does.
+//! The `2000 → 2048` step is the port-table power-of-two sizing (applied by `info`);
+//! the `1 → 1024` and `999999999 → 134217727` steps are the clamp this parser does.
+//! The end-to-end `port_limit` comparison against the oracle lives in
+//! `tests/system_info_oracle.rs`.
 
 use std::collections::HashMap;
 use std::process::{Command, Output};
@@ -91,6 +95,13 @@ fn erl_max_ports_is_atoi_clamped_and_routed_into_the_plus_q_channel() {
             Some(clamped.parse::<usize>().expect("a decimal clamp result")),
             "ERL_MAX_PORTS={value}"
         );
+        // … and the clamped value *is* the runtime's port-table request (the power-of-two
+        // table sizing on top of it is applied by `info`'s `port_limit`).
+        assert_eq!(
+            config.max_ports,
+            Some(clamped.parse::<usize>().expect("a decimal clamp result")),
+            "ERL_MAX_PORTS={value}"
+        );
         // None of these variables is an `init` argument: verified against the oracle,
         // where `init:get_argument(max_ports)` is the bare atom `error`.
         assert!(config.init_args.is_empty(), "ERL_MAX_PORTS={value}");
@@ -105,6 +116,8 @@ fn an_unset_erl_max_ports_injects_nothing() {
     let config = parse_env(&[], &[]);
     assert!(extra_flags(&config).is_empty());
     assert_eq!(config.env_vars(), &ErlEnv::default());
+    // … and no port-table request is made, so `port_limit` stays the default table.
+    assert_eq!(config.max_ports, None);
 }
 
 /// A `+Q` **anywhere in the merged argv** overrides `ERL_MAX_PORTS` — including one that
@@ -117,8 +130,10 @@ fn a_command_line_plus_q_overrides_erl_max_ports() {
         extra_flags(&config),
         vec!["+Q".to_string(), "4096".to_string()]
     );
-    // … and the variable is still reported verbatim (clamped).
+    // … and the variable is still reported verbatim (clamped), while the request is
+    // whatever the winning `+Q` asked for.
     assert_eq!(config.env_vars().max_ports, Some(2048));
+    assert_eq!(config.max_ports, Some(4096));
 
     // Through `ERL_FLAGS` (appended after the command line by the merge).
     let config = parse_env(&[], &[("ERL_MAX_PORTS", "2048"), ("ERL_FLAGS", "+Q 4096")]);
@@ -126,6 +141,7 @@ fn a_command_line_plus_q_overrides_erl_max_ports() {
         extra_flags(&config),
         vec!["+Q".to_string(), "4096".to_string()]
     );
+    assert_eq!(config.max_ports, Some(4096));
 
     // Through `ERL_AFLAGS` (prepended before the command line by the merge).
     let config = parse_env(&[], &[("ERL_MAX_PORTS", "2048"), ("ERL_AFLAGS", "+Q 3000")]);
@@ -133,13 +149,16 @@ fn a_command_line_plus_q_overrides_erl_max_ports() {
         extra_flags(&config),
         vec!["+Q".to_string(), "3000".to_string()]
     );
+    assert_eq!(config.max_ports, Some(3000));
 
-    // The `legacy` spelling counts as a `+Q` too, so the variable does not add a second.
+    // The `legacy` spelling counts as a `+Q` too, so the variable does not add a second —
+    // and `legacy` is the emulator's default table.
     let config = parse_env(&["+Q", "legacy"], &[("ERL_MAX_PORTS", "2048")]);
     assert_eq!(
         extra_flags(&config),
         vec!["+Q".to_string(), "legacy".to_string()]
     );
+    assert_eq!(config.max_ports, None);
 }
 
 /// `parse` is **pure**: it must never read the process environment, so no `ERL_MAX_PORTS`
@@ -319,9 +338,9 @@ fn the_oracle_agrees_with_the_documented_port_limit_ground_truth() {
     }
 }
 
-/// `beam_rt`'s own clamped value for the same cases: the `+Q` the runtime would send is
-/// the variable clamped into the emulator's range (the power-of-two table step excluded,
-/// and a command-line `+Q` still winning).
+/// `beam_rt`'s own clamped value for the same cases: the request the runtime records is
+/// the variable clamped into the emulator's range (the power-of-two table step is applied
+/// by `info`'s `port_limit`, and a command-line `+Q` still wins).
 #[test]
 fn beam_rt_clamps_erl_max_ports_into_the_emulator_range() {
     for (value, expected) in [
@@ -338,6 +357,11 @@ fn beam_rt_clamps_erl_max_ports_into_the_emulator_range() {
             vec!["+Q".to_string(), expected.to_string()],
             "ERL_MAX_PORTS={value}"
         );
+        assert_eq!(
+            config.max_ports,
+            Some(expected.parse::<usize>().expect("a decimal clamp result")),
+            "ERL_MAX_PORTS={value}"
+        );
     }
     // … while an explicit `+Q` is left untouched (`ERL_MAX_PORTS` never overrides it).
     let config = parse_env(&["+Q", "4096"], &[("ERL_MAX_PORTS", "2048")]);
@@ -345,6 +369,7 @@ fn beam_rt_clamps_erl_max_ports_into_the_emulator_range() {
         extra_flags(&config),
         vec!["+Q".to_string(), "4096".to_string()]
     );
+    assert_eq!(config.max_ports, Some(4096));
 }
 
 /// The whole family is invisible to `init:get_argument/1` — the library reports no

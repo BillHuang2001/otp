@@ -16,6 +16,14 @@
 //! pinned here; forms that diverge (e.g. plain arguments after `-extra`/`--`, which the
 //! oracle treats as `init:get_plain_arguments/0` while this runtime rejects them) are
 //! documented handoffs instead of cases.
+//!
+//! The `flags/env_*` cases drive the *environment half* of the same contract through
+//! [`CaseKind::EvalEnv`](super::CaseKind::EvalEnv): `erl` merges
+//! `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]` into the
+//! argv before `init` sees it, so both runtimes are spawned with the same argv **and** the
+//! same environment and the merged switches are observed through the `-eval` probe just
+//! like command-line ones. `ERL_OTP<sysver>_FLAGS` is unpinnable (see the crate CONTEXT
+//! *Known Issues*).
 
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
@@ -369,6 +377,129 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
+        // --- environment variables (`ERL_*FLAGS`): the merge, pinned end to end -----------
+        // `erl` merges `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS]
+        // [ERL_ZFLAGS]` into the argv *before* `init` ever sees it (erlexec.c
+        // `initial_argv_massage`), so a tokenized environment switch is indistinguishable
+        // from a command-line one. Both runtimes are spawned with the **same** argv *and*
+        // the **same** environment (see `CaseKind::EvalEnv`), so only their merge can
+        // differ. `ERL_OTP<sysver>_FLAGS` is deliberately **not** pinned: the oracle here is
+        // OTP 29 (it reads `ERL_OTP29_FLAGS`) while this runtime targets OTP 30
+        // (`ERL_OTP30_FLAGS`), so an exact assertion on either name would be a guaranteed
+        // false mismatch. Every golden below is the live oracle's output (OTP 29.1.1).
+        Case {
+            id: "flags/env_erl_aflags_is_merged",
+            description: "an ERL_AFLAGS switch is merged into the argv before the -eval probe observes it",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[("ERL_AFLAGS", "-differential_env_flag ajuda")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[97,106,117,100,97]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_is_merged",
+            description: "an ERL_FLAGS switch is merged into the argv and observed by the -eval probe",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "-differential_env_flag envhelp")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[101,110,118,104,101,108,112]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_tokenizes_a_quoted_value",
+            description: "an ERL_FLAGS quoted token reaches the -eval probe as one value with the quotes stripped",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_env_flag)",
+                extra_argv: &[],
+                env: &[("ERL_FLAGS", "-differential_env_flag \"two words\"")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[116,119,111,32,119,111,114,100,115]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_precedence_aflags_cmdline_flags",
+            description: "the merge order is [ERL_AFLAGS] [command line] [ERL_FLAGS], pinned by the -eval-visible occurrence order",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_order)",
+                extra_argv: &["-differential_order", "cmdline"],
+                env: &[
+                    ("ERL_AFLAGS", "-differential_order aflag"),
+                    ("ERL_FLAGS", "-differential_order fflag"),
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some(
+                    "ok {ok,[[[97,102,108,97,103]],[[99,109,100,108,105,110,101]],[[102,102,108,97,103]]]}",
+                ),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_precedes_erl_zflags",
+            description: "ERL_FLAGS is merged before ERL_ZFLAGS, both appended after the command line",
+            contracts: &[Contract::Cli],
+            kind: CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_order)",
+                extra_argv: &[],
+                env: &[
+                    ("ERL_FLAGS", "-differential_order fflag"),
+                    ("ERL_ZFLAGS", "-differential_order zflag"),
+                ],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok {ok,[[[102,102,108,97,103]],[[122,102,108,97,103]]]}"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_cmdline_overrides_erl_aflags",
+            description: "a later command-line +P overrides the earlier ERL_AFLAGS +P (the effective process_limit)",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(process_limit)",
+                extra_argv: &["+P", "2048"],
+                env: &[("ERL_AFLAGS", "+P 8192")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 2048"),
+                exit_code: 0,
+            },
+        },
+        Case {
+            id: "flags/env_erl_flags_overrides_cmdline",
+            description: "a later ERL_FLAGS +P overrides the earlier command-line +P (the effective process_limit)",
+            contracts: &[Contract::Cli, Contract::Introspection],
+            kind: CaseKind::EvalEnv {
+                expr: "erlang:system_info(process_limit)",
+                extra_argv: &["+P", "2048"],
+                env: &[("ERL_FLAGS", "+P 8192")],
+                probe: Probe::Value,
+            },
+            golden: Golden {
+                stdout: Some("ok 8192"),
+                exit_code: 0,
+            },
+        },
     ]
 }
 
@@ -410,13 +541,12 @@ mod tests {
                 "case {} has no description",
                 case.id
             );
-            let CaseKind::Eval {
-                expr,
-                extra_argv,
-                probe,
-            } = case.kind
-            else {
-                panic!("case {}: an A.6 case must be an eval case", case.id);
+            let (expr, probe) = match case.kind {
+                CaseKind::Eval { expr, probe, .. } => (expr, probe),
+                CaseKind::EvalEnv { expr, probe, .. } => (expr, probe),
+                CaseKind::Module(_) => {
+                    panic!("case {}: an A.6 case must be an eval case", case.id)
+                }
             };
             assert_eq!(probe, Probe::Value, "case {}", case.id);
             assert!(
@@ -436,12 +566,71 @@ mod tests {
                     || golden == "ok error"
                     || golden == "ok []"
                     || golden == "ok 2048"
+                    || golden == "ok 8192"
                     || golden == "ok true"
                     || golden == "ok unbound",
                 "case {}: unexpected golden {golden:?}",
                 case.id
             );
-            let _ = extra_argv;
+            // An environment-variable case pins the `ERL_*FLAGS` merge, so it must declare a
+            // non-empty environment drawn from the documented variable set.
+            for (name, value) in case.env() {
+                assert!(
+                    matches!(*name, "ERL_AFLAGS" | "ERL_FLAGS" | "ERL_ZFLAGS"),
+                    "case {}: unexpected environment variable {name}",
+                    case.id
+                );
+                assert!(!value.is_empty(), "case {}: empty {name}", case.id);
+            }
+        }
+    }
+
+    /// The `ERL_*FLAGS` precedence chain is pinned by the environment-variable cases: the
+    /// merge order and the "later source wins" effect are both oracle-derived.
+    #[test]
+    fn environment_cases_pin_the_erl_flags_precedence_chain() {
+        let find = |id: &str| group().into_iter().find(|c| c.id == id).expect("case");
+
+        // The merge order `[ERL_AFLAGS] [command line] [ERL_FLAGS]` is visible as the
+        // occurrence order, and `ERL_FLAGS` before `ERL_ZFLAGS` as the trailing pair.
+        let order = find("flags/env_precedence_aflags_cmdline_flags");
+        assert_eq!(
+            order.kind,
+            CaseKind::EvalEnv {
+                expr: "init:get_argument(differential_order)",
+                extra_argv: &["-differential_order", "cmdline"],
+                env: &[
+                    ("ERL_AFLAGS", "-differential_order aflag"),
+                    ("ERL_FLAGS", "-differential_order fflag"),
+                ],
+                probe: Probe::Value,
+            }
+        );
+        assert_eq!(
+            order.golden.stdout,
+            Some("ok {ok,[[[97,102,108,97,103]],[[99,109,100,108,105,110,101]],[[102,102,108,97,103]]]}")
+        );
+
+        // A single-valued switch (`+P` → `process_limit`) proves the later source wins: the
+        // command line overrides `ERL_AFLAGS`, and `ERL_FLAGS` overrides the command line.
+        assert_eq!(
+            find("flags/env_cmdline_overrides_erl_aflags").golden.stdout,
+            Some("ok 2048")
+        );
+        assert_eq!(
+            find("flags/env_erl_flags_overrides_cmdline").golden.stdout,
+            Some("ok 8192")
+        );
+
+        // Every environment case is an `EvalEnv`; no plain `Eval` case sneaks an env in.
+        for case in group() {
+            let has_env = !case.env().is_empty();
+            assert_eq!(
+                has_env,
+                matches!(case.kind, CaseKind::EvalEnv { .. }),
+                "case {}: env case/non-env case mismatch",
+                case.id
+            );
         }
     }
 

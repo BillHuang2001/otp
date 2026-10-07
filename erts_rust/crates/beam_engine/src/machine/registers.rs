@@ -86,6 +86,11 @@ impl Machine {
         // Likewise the literal area: it belongs to the module being run and is
         // re-bound by `run_loop`.
         self.literals = None;
+        // The execution-position introspection belongs to the run that is starting:
+        // `step_instruction` re-records `current_code` and `run_loop` re-records
+        // `entry_call` (the `$initial_call` analogue).
+        self.current_code = None;
+        self.entry_call = None;
     }
 }
 

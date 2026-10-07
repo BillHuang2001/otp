@@ -81,7 +81,7 @@ use raise::{classify_class, install_class_atom, raise_error_atom, raise_error_tu
 use stacktrace::symbolic_stacktrace;
 
 mod raise;
-mod stacktrace;
+pub(crate) mod stacktrace;
 
 #[cfg(test)]
 mod tests;

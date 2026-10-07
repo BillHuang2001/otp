@@ -325,6 +325,16 @@ pub struct RuntimeConfig {
     /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) the runtime reports
     /// through its GC introspection (contract A.6 → A.8).
     pub heap: HeapOptions,
+    /// The **requested** port-table size: `Some(N)` when the merged command line carries
+    /// `+Q N`, or — when it carries no `+Q` — the clamped `ERL_MAX_PORTS` value.
+    ///
+    /// `None` is the emulator's default table (what a bare invocation and `+Q legacy`
+    /// select). The value is exactly what the request was (already inside
+    /// `[ERTS_MIN_PORTS, ERTS_MAX_PORTS]`; the `ERL_MAX_PORTS` path clamps in
+    /// [`crate::cli::vars`], the `+Q` path rejects out-of-range values outright). The
+    /// emulator's **power-of-two table sizing** on top of it is applied where the value
+    /// becomes observable: [`crate::info`]'s `port_limit`.
+    pub max_ports: Option<usize>,
     /// The parsed init arguments (contract A.6; the source of `init:get_argument/1`).
     pub init_args: InitArgs,
     /// The action to perform.
@@ -334,21 +344,24 @@ pub struct RuntimeConfig {
     /// `ERL_CRASH_DUMP_SECONDS`, `ERL_ROOTDIR`, `ERL_MAX_ETS_TABLES` and
     /// `ERL_FULLSWEEP_AFTER`. Empty for the **pure** [`crate::cli::parse`] — only
     /// [`crate::cli::parse_with_env`] reads an environment, and it is where
-    /// `ERL_MAX_PORTS` is turned into a `+Q` entry of
-    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags).
+    /// `ERL_MAX_PORTS` is applied (both as a `+Q` entry of
+    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags) and as
+    /// the [`max_ports`](Self::max_ports) request).
     pub env: ErlEnv,
 }
 
 impl Default for RuntimeConfig {
     /// The defaults of a bare `beam_rt` invocation: a `jit` emulator, an empty code
     /// path, a [`DEFAULT_HEAP_WORDS`]-word heap, the emulator's heap-size defaults, no
-    /// init arguments, [`Action::Boot`] and no environment variables.
+    /// init arguments, [`Action::Boot`], no port-table request and no environment
+    /// variables.
     fn default() -> Self {
         RuntimeConfig {
             emulator: EmulatorConfig::default(),
             code_paths: Vec::new(),
             heap_words: DEFAULT_HEAP_WORDS,
             heap: HeapOptions::default(),
+            max_ports: None,
             init_args: InitArgs::default(),
             action: Boot,
             env: ErlEnv::default(),
@@ -416,6 +429,12 @@ impl RuntimeConfig {
         self
     }
 
+    /// Sets the requested port-table size (`+Q N`, or a clamped `ERL_MAX_PORTS`).
+    pub fn with_max_ports(mut self, max_ports: usize) -> Self {
+        self.max_ports = Some(max_ports);
+        self
+    }
+
     /// Sets the distribution node name (`-name`/`-sname`).
     pub fn with_node_name(mut self, node_name: impl Into<String>) -> Self {
         self.emulator.node_name = Some(node_name.into());
@@ -463,6 +482,7 @@ mod tests {
         assert!(config.code_paths.is_empty());
         assert_eq!(config.heap_words, DEFAULT_HEAP_WORDS);
         assert_eq!(config.heap, HeapOptions::default());
+        assert_eq!(config.max_ports, None);
         assert!(config.init_args.is_empty());
         assert_eq!(config.action, Action::Boot);
         assert_eq!(config.env_vars(), &ErlEnv::default());

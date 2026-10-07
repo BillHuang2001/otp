@@ -35,26 +35,36 @@
 //!   resource term of that exact type, and returns `0` (leaving `*objp` untouched) for a term of
 //!   another resource type, for a plain term, or for a non-term word.
 //!
-//! # Documented substitutions (this crate has no ERTS magic-ref term, no GC and no module identity)
+//! # Documented substitutions (this crate has no `ERTS_MAGIC_REF` tag, no GC and no module identity)
 //!
-//! 1. **The resource term.** `beam_term` has no "magic reference" term, so a resource term is the
-//!    term produced by the host's [`NifHost::make_ref`] hook, recorded in the registry as
-//!    *term word → (type, object)*. `enif_get_resource` then resolves that mapping (and checks the
-//!    type), which is exactly the observable contract. Measured on the oracle: two
-//!    `enif_make_resource` calls for one object yield two *distinct* terms — so minting a fresh ref per
-//!    call is faithful, not an approximation. A host that does not implement `make_ref` cannot mint a
-//!    resource term; like `enif_make_ref`, the call then raises `badarg`.
+//! 1. **The resource term is minted here, on the host heap.** `beam_term` has no magic-reference
+//!    tag, so a resource term is an ordinary **internal reference** built by this file — the same
+//!    `[hdr|REF_SUBTAG][node][serial][id]` block `beam_rt`'s own `erlang:make_ref/0` builds — with a
+//!    distinct id per call, recorded in the registry as *term word → (type, object)*.
+//!    `enif_get_resource` then resolves that mapping (and checks the type), which is exactly the
+//!    observable contract. Measured on the oracle: two `enif_make_resource` calls for one object
+//!    yield two *distinct* terms that both print as `#Ref<0.…>`, so a fresh reference per call is
+//!    faithful, not an approximation. Minting it **here** rather than through the host's
+//!    [`NifHost::make_ref`] hook is what makes the round trip work on a host whose hook default is
+//!    `None` — the real runtime (`beam_rt`) is exactly such a host, and with the hook-based mint the
+//!    whole NIF call died with `badarg` at `enif_make_resource`.
 //! 2. **A resource-binary term is also a resource handle.** Measured: `enif_get_resource` on the term
 //!    returned by `enif_make_resource_binary` yields `1` and the resource object. So the term built
 //!    here is registered as well. (Its *bytes* are copied onto the heap; the C zero-copies the
 //!    caller's buffer into a refc binary. The bytes are the same; only the aliasing differs.)
-//! 3. **Liveness.** An entry records the object but does **not** hold a reference: this crate has no
-//!    GC and therefore no "term died" signal, so a reference taken by `enif_make_resource` could never
-//!    be dropped and the destructor would never run. Consequence, and the honest limit of this
+//! 3. **Liveness, and the destructor's timing.** An entry records the object but does **not** hold a
+//!    reference: this crate has no GC and therefore no "term died" signal, so a reference taken by
+//!    `enif_make_resource` could never be dropped. Consequence, and the honest limit of this
 //!    substitution: `enif_release_resource` down to zero frees the object *immediately* and
 //!    invalidates every term that designated it — `enif_get_resource` then returns `0` for a stale
 //!    term, which is exactly the documented behaviour of a stale resource term, only reached earlier
-//!    than the C reaches it (the C keeps the object alive until the term is garbage-collected).
+//!    than the C reaches it (the C keeps the object alive while a resource term does).
+//!    The destructor itself is **run synchronously** on the release that takes the reference count to
+//!    zero — exactly once per object, never while a `keep` is outstanding, and never for a `NULL`
+//!    release. Measured on the oracle, the C's destructor is *asynchronous*: after a release to zero
+//!    `dtor_count` still reads `0` and only reads `1` a moment later (the object is decoupled and
+//!    freed off the releasing thread). The **count and ordering** of destructor invocations is
+//!    therefore the same as the oracle's; the *timing* is deterministic here instead of GC-driven.
 //! 4. **The type's identity is its name.** The C keys a resource type by `(module, name)` and takes
 //!    the module from the calling module instance (`env->mod_nif->mod->module`); `enif_open_resource_type`
 //!    additionally *asserts* `module_str == NULL`. The env handed to a `load`/NIF call here carries no
@@ -637,11 +647,51 @@ pub unsafe extern "C" fn enif_sizeof_resource(obj: *mut c_void) -> size_t {
 // Turning an object into a term (and back)
 // ---------------------------------------------------------------------------------------------
 
+/// The words of the internal-reference block [`mint_resource_ref`] writes: the header plus three
+/// payload words (`node`, `serial`, `id`) — the same shape `beam_rt`'s `erlang:make_ref/0` and the
+/// monitor references use, so the term prints as the oracle's `#Ref<0.…>`.
+const RESOURCE_REF_PAYLOAD_WORDS: usize = 3;
+
+/// The next resource-reference id.
+///
+/// A process-wide monotonic counter, exactly like the C's reference id space: two
+/// `enif_make_resource` calls never mint the same id, so the two terms stay distinct (`#Ref<…>`
+/// answers differ), which is what the oracle does (measured).
+fn next_resource_ref_id() -> i64 {
+    static NEXT: AtomicUsize = AtomicUsize::new(1);
+    NEXT.fetch_add(1, Ordering::Relaxed) as i64
+}
+
+/// Build the on-heap internal reference that designates a resource object (the C's magic ref).
+///
+/// The block is `[make_header(3, REF_SUBTAG), node, serial, id]` on the host heap, with `node` and
+/// `serial` zero (Milestone 1 has one node and one id space) and a fresh monotonic `id`. Returns
+/// `None` only when the host heap cannot fit the four words.
+fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
+    // SAFETY: `alloc` hands out exactly `RESOURCE_REF_PAYLOAD_WORDS + 1` exclusively-owned,
+    // writable words from the host heap; every one is written below, before the pointer escapes.
+    let p = unsafe { alloc(e, RESOURCE_REF_PAYLOAD_WORDS + 1) }?;
+    // SAFETY: `p` addresses the four words just handed out (see above).
+    unsafe {
+        *p = prelude::make_header(
+            RESOURCE_REF_PAYLOAD_WORDS,
+            beam_term::REF_SUBTAG,
+        );
+        *p.add(1) = prelude::make_small(0); // node: the local node
+        *p.add(2) = prelude::make_small(0); // serial: one id space in M1
+        *p.add(3) = prelude::make_small(next_resource_ref_id());
+    }
+    Some(prelude::make_boxed(p as *const Eterm))
+}
+
 /// `ERL_NIF_TERM enif_make_resource(ErlNifEnv* env, void* obj);`
 ///
-/// Mints the resource term through the host's [`NifHost::make_ref`] hook and records it in the
-/// registry (module docs, substitution 1). The C returns a fresh magic ref per call (measured: two
-/// calls for one object yield two distinct terms), so minting a fresh ref is faithful.
+/// Mints the resource term **here** — a fresh internal reference built on the host heap by
+/// [`mint_resource_ref`] — and records it in the registry (module docs, substitution 1). The C
+/// returns a fresh magic ref per call (measured: two calls for one object yield two distinct terms),
+/// so minting a fresh reference is faithful. The host's `make_ref` hook is deliberately **not** used:
+/// it is `None` by default, and the real runtime leaves it at that default, which made this whole
+/// call raise `badarg` there.
 ///
 /// # Safety
 ///
@@ -654,18 +704,17 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     if obj.is_null() {
         return bare_badarg();
     }
-    match e.host().make_ref() {
-        Some(reference) => {
-            // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
-            let ty = unsafe { (*header_ptr(obj)).ty };
-            with_registry(|r| {
-                r.bind_term(reference.raw(), ResourceRef { ty, obj });
-            });
-            n(reference)
-        }
-        // No magic-ref term this host can mint: raise `badarg`, exactly as `enif_make_ref` does.
-        None => unsafe { enif_make_badarg(env) },
-    }
+    let Some(reference) = mint_resource_ref(e) else {
+        // The host heap cannot fit a four-word reference term; fail loudly rather than minting a
+        // term that would not designate anything.
+        return bare_badarg();
+    };
+    // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
+    let ty = unsafe { (*header_ptr(obj)).ty };
+    with_registry(|r| {
+        r.bind_term(reference.raw(), ResourceRef { ty, obj });
+    });
+    n(reference)
 }
 
 /// `ERL_NIF_TERM enif_make_resource_binary(ErlNifEnv* env, void* obj, const void* data, size_t size);`

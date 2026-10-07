@@ -2,10 +2,12 @@
 //!
 //! For a given corpus case the harness runs the **real system ERTS** (the *oracle*) and
 //! the **Rust runtime** (`beam_rt`), then compares the **observable results**. There are
-//! two kinds of case ([`CaseKind`]):
+//! three kinds of case ([`CaseKind`]):
 //!
 //! * expression cases evaluate the *same* self-terminating probe under both runtimes and
 //!   compare stdout + exit status + stderr, and the case's own golden (contracts A.2/A.8).
+//! * environment-variable expression cases (`EvalEnv`) are expression cases that spawn each
+//!   runtime with an explicit environment, so the `ERL_*FLAGS` merge is pinnable (A.6).
 //! * module-run cases compile a tiny embedded Erlang module with the system `erlc` and
 //!   compare the value the two runtimes produce from a real `.beam` (stdout + exit status).
 //!
