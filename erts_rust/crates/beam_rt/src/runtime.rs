@@ -74,6 +74,31 @@ const MIN_HEAP_WORDS: usize = 1_024;
 /// never stall the evaluator indefinitely.
 const TIMER_PUMP_SLICE: Duration = Duration::from_millis(100);
 
+/// How long [`Runtime::run_scheduled`] (the CLI's `run` action) pumps the scheduler for a
+/// process that has not terminated.
+///
+/// `run` drives the **full** scheduler — the run queue, the port poller/drivers, the timer
+/// heap and the distribution half — because a workload is free to block and be resumed by a
+/// later pass (a driver/port echo round-trip, say). A workload that never terminates (an
+/// endless `receive … after T` loop, an unsolvable `receive`) would otherwise hang the
+/// executable, so the pump is bounded by this wall-clock deadline and reports the honest
+/// diagnostic "the process did not terminate" when it expires — never a wrong value.
+///
+/// Sixty seconds is far longer than any fixture this runtime runs and far shorter than a
+/// user would tolerate. The deadline is a **safety net**, not the normal path: a process
+/// blocked with nothing left that could wake it stops immediately (see
+/// [`Runtime::run_scheduled`]), so a bare `wait` keeps its fast, honest answer.
+pub const RUN_DEADLINE: Duration = Duration::from_secs(60);
+
+/// How many scheduler slices one [`Runtime::run_scheduled`] pump step may run before the
+/// wall-clock deadline is checked again.
+///
+/// Control must never be handed to a single unbounded pass: a process that keeps re-arming a
+/// `receive … after T` deadline would keep `run_scheduler` (`TimerWait::Deadline`) busy
+/// forever, so the deadline would never be reached. Every step is therefore bounded by this
+/// slice budget and the deadline is tested between steps.
+const RUN_STEP_SLICES: u64 = 1_000;
+
 /// How long one scheduler pass may sleep waiting for the next timer deadline.
 ///
 /// This is the timer counterpart of the port half's poll clamp: the loop never *spins*, it
@@ -951,6 +976,129 @@ impl Runtime {
     /// continues.
     pub fn run_scheduler(&mut self) -> Result<u64> {
         self.run_pass(None)
+    }
+
+    /// **The CLI's `run` action.** Loads `path`, spawns `function/arity` as a real process
+    /// and pumps the runtime's full scheduler until it terminates.
+    ///
+    /// This is [`Runtime::run_function`] made blocking-safe. `run_function` performs a
+    /// **single** engine pass, so a workload that suspends — a `receive` waiting for a
+    /// `{Port, {data, …}}` message from a driver, say — has nothing to resume it and reports
+    /// [`beam_engine::blocked`]. Here the export runs as an ordinary scheduled process
+    /// ([`Runtime::spawn_process`] reuses this very `.beam`, so no code-path search
+    /// happens) and the loop advances the scheduler — the run queue, the port
+    /// poller/drivers, the timer heap and the distribution half (see
+    /// [`Runtime::scheduler_pass`]) — so a later pass delivers the port's reply, wakes the
+    /// receiver and carries it to its `return`.
+    ///
+    /// The loop ends when the process
+    ///
+    /// * **returned** — its `x(0)` is returned (recorded by the runner and stable for the
+    ///   runtime's lifetime);
+    /// * **raised** — the **original** [`BeamError`] is returned, so the CLI classifies the
+    ///   raise (its class, its `unsupported` marker) exactly as the single-pass path did
+    ///   (see [`Runtime::take_process_error`]);
+    /// * is **blocked with nothing left that could wake it** — the run queue drained, no live
+    ///   port and no pending timer deadline — reported with the very
+    ///   [`beam_engine::blocked`] diagnostic the single-pass path reports, so a bare `wait`
+    ///   keeps its immediate, honest answer instead of spinning out the deadline; or
+    /// * **outlived [`RUN_DEADLINE`]** — an honest "did not terminate" diagnostic.
+    ///
+    /// Every step is **bounded** ([`RUN_STEP_SLICES`] slices, and a wait of at most
+    /// [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE)), so the pump never busy-spins at
+    /// 100 % CPU and the wall-clock deadline is always reached.
+    ///
+    /// # Errors
+    ///
+    /// The code server's error for `path`, [`crate::error::undef`] when `function/arity` is
+    /// not exported by it, whatever the running code raises, and the two honest diagnostics
+    /// described above.
+    pub fn run_scheduled(
+        &mut self,
+        path: impl AsRef<Path>,
+        function: &str,
+        arity: u32,
+        args: &[Eterm],
+    ) -> Result<Eterm> {
+        self.boot_if_needed()?;
+        // Load first: the module is cached under its **own** name, which is the name
+        // `spawn_process` resolves (a hit skips the code-path search entirely).
+        let module = self.code_server.load_path(path)?;
+        let name = module
+            .atom_name(module.name)
+            .ok_or_else(|| error::unknown_module("<unnamed .beam>"))?
+            .to_string();
+        // `spawn_process` derives the arity from the arguments it seeds into `x(0..arity)`;
+        // the CLI grammar guarantees the two agree, so a mismatch here is a caller bug and
+        // is reported rather than silently running a different function.
+        if args.len() != arity as usize {
+            return Err(error::message(format!(
+                "run: {}:{function}/{arity} given {} argument(s)",
+                name,
+                args.len()
+            )));
+        }
+        let pid = self.spawn_process(&name, function, args.to_vec())?;
+        let deadline = Instant::now() + RUN_DEADLINE;
+        loop {
+            if let Some(value) = self.process_result(pid) {
+                return Ok(value);
+            }
+            if let Some(error) = self.take_process_error(pid) {
+                return Err(error);
+            }
+            if Instant::now() >= deadline {
+                return Err(error::message(format!(
+                    "run: {}:{function}/{arity} did not terminate within {} ms",
+                    name,
+                    RUN_DEADLINE.as_millis()
+                )));
+            }
+            let (ran, delivered) = self.scheduler_pass(
+                Some(RUN_STEP_SLICES),
+                false,
+                TimerWait::AtMost(crate::port::PORT_POLL_SLICE),
+            )?;
+            // Nothing ran, nothing was delivered and nothing is left that could produce a
+            // wake: stop with the same honest diagnostic the single-pass path reports rather
+            // than spinning out the deadline.
+            if ran == 0 && delivered == 0 && self.is_quiescent() {
+                return Err(beam_engine::blocked());
+            }
+        }
+    }
+
+    /// The error a process spawned with [`Runtime::spawn_process`] raised, once it has
+    /// **failed**.
+    ///
+    /// [`Runtime::process_exit`] exposes only the reason *term*; this is the original
+    /// [`BeamError`], which additionally carries the raise class and the `unsupported`
+    /// classification [`crate::cli`] classifies by (see [`crate::runner::RunnerState`]).
+    /// Taking it consumes it, so the first caller gets it and later ones get `None`.
+    pub(crate) fn take_process_error(&mut self, pid: ProcessId) -> Option<BeamError> {
+        self.runner_state.take_error(pid)
+    }
+
+    /// Whether the scheduler has nothing left that could wake a blocked process: an empty
+    /// run queue, no live port and no pending timer deadline.
+    ///
+    /// This is the pump's quiescence test ([`Runtime::run_scheduled`]): when it holds, no
+    /// process can run, no port can deliver and no timer can fire, so a blocked process
+    /// would block forever and the honest answer is [`beam_engine::blocked`].
+    ///
+    /// A port table that cannot be borrowed (a nested borrow) is reported as **not**
+    /// quiescent: the pump then keeps stepping rather than declaring a stall it cannot
+    /// substantiate.
+    fn is_quiescent(&mut self) -> bool {
+        if self.run_queue_len() != 0 {
+            return false;
+        }
+        match self.ports.try_borrow() {
+            Ok(registry) if !registry.is_empty() => return false,
+            Err(_) => return false,
+            Ok(_) => {}
+        }
+        self.timers.next_deadline().is_none()
     }
 
     /// The `x(0)` a process spawned with [`Runtime::spawn_process`] returned, once it has

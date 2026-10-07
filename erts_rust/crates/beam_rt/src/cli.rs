@@ -942,6 +942,14 @@ fn apply(runtime: &mut Runtime, module: &str, function: &str, args: &[Eterm]) ->
 
 /// The `run File Mod:Func/Arity [Args…]` action: run and **print** the result.
 ///
+/// The export is driven through [`Runtime::run_scheduled`], which runs it as a real
+/// scheduled process and pumps the **full** scheduler (processes, ports, timers,
+/// distribution) until it terminates — so a workload that blocks (a driver/port echo
+/// round-trip, say) is resumed by a later pass instead of dying on a single-pass
+/// [`beam_engine::blocked`](beam_engine::blocked). A workload that never terminates is
+/// reported honestly when [`Runtime::RUN_DEADLINE`] expires, and one blocked with nothing
+/// able to wake it keeps the single-pass path's immediate answer (see that method).
+///
 /// The result is rendered with `~w~n` — exactly what the oracle's
 /// `io:format("~w~n",[V])` produces — and the loaded module's name must be the one the
 /// spec named (a mismatch means the file is not the requested module).
@@ -957,7 +965,7 @@ fn run_file(
     args: &[ArgTerm],
 ) -> Result<()> {
     let terms = runtime.materialize_args(args)?;
-    let result = match runtime.run_function(file, function, arity, &terms) {
+    let result = match runtime.run_scheduled(file, function, arity, &terms) {
         Ok(result) => result,
         Err(error) => return Err(reported_reason(runtime, error)),
     };
