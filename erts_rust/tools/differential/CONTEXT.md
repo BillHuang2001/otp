@@ -204,7 +204,7 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 - `src/lib.rs` → crate docs, module wiring, public re-exports (the public API surface)
 - `src/error.rs` → `Error` (`Usage`/`Env`/`Io`) + `Result` + exit-code mapping
 - `src/cli.rs` → `Command` (incl. `list --by-contract`), hand-rolled `parse`, `--help`/usage text
-- `src/runtime.rs` → runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target, release-before-debug), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, `output_with_retry` (bounded transient-`ETXTBSY` spawn retry) + process spawn
+- `src/runtime.rs` → runtime resolution (`$ERTS_ORACLE`/`erl`, `$BEAM_RT`/target, release-before-debug), `UNSUPPORTED_EXIT_CODE`, `Observation`, argv build, `run`/`run_with_env` (per-case environment for the `ERL_*FLAGS` cases), `output_with_retry` (bounded transient-`ETXTBSY` spawn retry) + process spawn
 - `src/module_build.rs` → **Erlang** half of a module-run case: `erlc` resolution (`$ERLC`/`$PATH`), embedded-module compilation into a temp dir (`CompiledModule`), the temp-dir helpers, a process-local `erlc` compile cache; re-exports the C/NIF build surface
 - `src/nif_build.rs` → **C/NIF** half (crate-private): `$CC`/`cc` resolution (with `MISSING_CC_REASON`), the `erl_nif.h` include-dir locator (with `MISSING_ERL_NIF_REASON`), `NifFixture` (a `cc`-built `.so` from an embedded C source, or a text file named `<name>.so`), `build(source,module,nif) -> Build::{Compiled,Skipped}`, the memoized `.so` compile
 - `src/compare.rs` → observable diff (`Observables`), classified stderr (`is_runtime_banner_line`/`significant_stderr`), golden check, `Verdict` (`verdict`/`verdict_with`)
