@@ -100,7 +100,7 @@ The floor is the BIFs that are really *runtime* operations — they read/write t
 | `-s Mod Func [Args...]` | apply `Mod:Func(a, b, …)` (Arguments are **atoms**); the result is **discarded**; exit 0 on success |
 | `-run Mod Func [Args...]` | same, but Arguments are plain **strings** (Erlang char lists); result **discarded** |
 | `-pa Dir` / `-pz Dir` | add `Dir` to the code path (before / after `-pz` dirs) |
-| `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number); M1 runs single-threaded |
+| `+S N[:N]` | normal scheduler count → `emulator.schedulers` (first number) |
 | `-smp enable\|disable\|auto` | select the scheduler model; recorded as an init argument (M1 runs single-threaded) |
 | `+A N` | async-thread pool size → preserved verbatim in `emulator.extra_emulator_flags` |
 | `+P N` | max process count → `emulator.max_processes` |
@@ -184,7 +184,7 @@ Unsupported is emitted for a `-eval` expression outside the grammar (`src/eval/p
 * **Heap has no GC** — a runaway allocation returns `SystemLimit`.
 * **No whole-system memory introspection.** `erlang:memory/0,1` and `erlang:statistics/1` are **not** registered BIFs (exit 1); the memory numbers it *does* answer are `process_info/2`'s heap items, `system_info(allocated_areas)` / `{allocator, A}` and `ets:info(T, memory)`.
 
-* **The heap switches are modelled; some rejection details are not.** `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → `min_heap_size` 1598, `+hmbs 5000` → `min_bin_vheap_size` 6772) and `+hmax*` the `max_heap_size` map; a malformed value is exit 2 (`USAGE`) where the oracle exits 1 (`bad heap size`), the oracle's `atoi`/`ErtsStrToSint` laxness is not reproduced, and this runtime records every switch as an init argument where real `erl` records none.
+* **The heap switches are modelled; some rejection details are not.** `+hms`/`+hmbs` set a `beam_gc::HeapPolicy` rounded through the growth table (`+hms 1000` → 1598), `+hmax*` the `max_heap_size` map; a malformed value is exit 2 where the oracle exits 1, and the oracle's `atoi`/`ErtsStrToSint` laxness is not reproduced.
 
 ## Notes for Agents
 * **Read `../CONTEXT.md` and the two `../../ERTS_RUST_REWRITE_*.md` design docs before changing the glue**; this crate is where the Stage-1 engine meets the Stage-5 core.
