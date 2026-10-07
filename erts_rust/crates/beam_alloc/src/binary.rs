@@ -14,6 +14,12 @@
 //! the [`RefcBinary::data_ptr`] first-byte contract is observable, and that contract
 //! is precisely "the pointer value stored in the on-heap `BinRef.val` word").
 //!
+//! The payload allocation is accounted the way the legacy VM accounts it: it is
+//! attributed to the `BINARY` allocation type of the registry's `binary_alloc`
+//! instance, so it shows up in that allocator's per-type breakdown (the
+//! `allocator`/`binary_alloc` section of the `system_info` report) rather than only
+//! in the aggregate counters. See the private `payload_type` helper.
+//!
 //! # Ownership and thread-safety
 //!
 //! A [`RefcBinary`] is a handle to a shared, immutable buffer. Construction starts
@@ -31,6 +37,7 @@
 use core::alloc::Layout;
 use core::ptr::NonNull;
 use core::slice;
+use std::sync::LazyLock;
 
 use beam_common::{BeamError, Result};
 
@@ -39,6 +46,7 @@ use crate::block::UNIT_SIZE;
 use crate::error;
 use crate::refcount::RefCount;
 use crate::registry::{allocator, AllocType};
+use crate::types::TypeId;
 
 /// The control header stored immediately before the payload bytes.
 ///
@@ -63,6 +71,32 @@ const HEADER_SIZE: usize = core::mem::size_of::<BinaryHeader>();
 // lands on the allocator's minimum-alignment boundary and no padding bytes are left
 // in an unspecified state.
 const _: () = assert!(HEADER_SIZE == UNIT_SIZE);
+
+/// The allocation type a [`RefcBinary`] payload is attributed to.
+///
+/// The registry's `binary_alloc` instance ([`AllocType::Binary`], i.e.
+/// [`AllocatorId::Binary`](crate::types::AllocatorId::Binary)) has exactly **two**
+/// types bound to it: `BINARY` and `DRV_BINARY`. The legacy C allocates a *normal*
+/// (non-driver) off-heap binary payload with `ERTS_ALC_T_BINARY`
+/// (`erts_bin_nrml_alloc`, `../../erts/emulator/beam/erl_binary.h:306`) — the
+/// `type BINARY BINARY BINARIES binary` row of
+/// `../../erts/emulator/beam/erl_alloc.types` — so that is the type chosen here. Its
+/// sibling `DRV_BINARY` (`ERTS_ALC_T_DRV_BINARY`) is deliberately *not* used: the C
+/// reserves it for driver-owned binaries (`BIN_FLAG_DRV`, see `erts_bin_realloc_fnf`).
+///
+/// One function decides the type for the whole module, so the allocation in
+/// [`RefcBinary::with_allocator`] and the matching release in
+/// [`Drop for RefcBinary`](RefcBinary) can never disagree. The `LazyLock` resolves the
+/// lookup once (the type inventory is a compiled-in constant table, so a miss is an
+/// unreachable build invariant, and caching keeps the linear table scan off the
+/// per-allocation path).
+fn payload_type() -> TypeId {
+    static PAYLOAD_TYPE: LazyLock<TypeId> = LazyLock::new(|| {
+        TypeId::from_name("BINARY")
+            .expect("the `BINARY` allocation type is part of the compiled-in type inventory")
+    });
+    *PAYLOAD_TYPE
+}
 
 /// An immutable, reference-counted, off-heap byte buffer.
 ///
@@ -100,7 +134,9 @@ impl RefcBinary {
     ///
     /// The reference count starts at 1. Every clone of the result (and, eventually,
     /// the final drop) uses *this* allocator and the *same* layout, so the caller may
-    /// supply an injected allocator for tests.
+    /// supply an injected allocator for tests. The payload is obtained through the
+    /// typed allocation API (`alloc_typed`), attributed to the `BINARY` allocation type
+    /// (see the private `payload_type` helper).
     pub fn with_allocator(alloc: AllocRef, bytes: &[u8]) -> Result<RefcBinary> {
         let len = bytes.len();
         let total = HEADER_SIZE
@@ -111,7 +147,11 @@ impl RefcBinary {
         // Map *any* allocation failure onto the `LargeObject` class: to the workspace,
         // a `RefcBinary` payload is an off-heap large object, regardless of whether the
         // allocator served it from a slab or a dedicated carrier.
-        let base = match alloc.alloc(layout) {
+        // Attribute the payload to its allocation type (`BINARY` of the `binary_alloc`
+        // allocator — see `payload_type`), so the per-type breakdown sees these bytes
+        // and not just the aggregate counters. On an allocator that does not track
+        // types the trait's default forwards to the untyped `alloc`.
+        let base = match alloc.alloc_typed(payload_type(), layout) {
             Ok(ptr) => ptr,
             Err(BeamError::Alloc(_)) => return Err(error::large_object_failure(total)),
             Err(other) => return Err(other),
@@ -212,10 +252,12 @@ impl Drop for RefcBinary {
         let layout = Layout::from_size_align(HEADER_SIZE + self.len, MIN_ALIGN)
             .expect("RefcBinary layout is valid: it was accepted by with_allocator");
         // SAFETY: `base`/`layout` are exactly the pointer and layout `with_allocator`
-        // obtained from `self.alloc`, the count just reached 0 so no other handle
-        // references the buffer, and it is not used after this call. This is the sole
-        // free, through the same allocator the buffer was allocated from.
-        unsafe { self.alloc.dealloc(self.base, layout) };
+        // obtained from `self.alloc` through `alloc_typed(payload_type(), ..)`, the
+        // count just reached 0 so no other handle references the buffer, and it is not
+        // used after this call. This is the sole free, through the same allocator the
+        // buffer was allocated from and with the same allocation type, so the per-type
+        // and aggregate counters are unwound together.
+        unsafe { self.alloc.dealloc_typed(payload_type(), self.base, layout) };
     }
 }
 
@@ -223,6 +265,8 @@ impl Drop for RefcBinary {
 mod tests {
     use super::*;
     use crate::allocator::{AllocatorConfig, CarrierAllocator};
+    use crate::size_class::SizeClasses;
+    use crate::types::{types_for_allocator, AllocatorId};
     use beam_common::AllocKind;
 
     /// An `AllocRef` on a real carrier allocator with a small carrier, so tests reach
@@ -431,5 +475,137 @@ mod tests {
         worker.join().expect("worker thread must not panic");
         assert_eq!(binary.refcount(), 1);
         assert_eq!(binary.as_bytes(), b"shared");
+    }
+
+    /// The one place that decides the payload's allocation type must name the legacy
+    /// `ERTS_ALC_T_BINARY` type — the `BINARY` row of `binary_alloc` (i.e.
+    /// `AllocatorId::Binary`), **not** its `DRV_BINARY` sibling (which the C reserves
+    /// for driver-owned binaries).
+    #[test]
+    fn payload_type_is_the_binary_alloc_binary_type() {
+        let ty = payload_type();
+        assert_eq!(ty.name(), "BINARY");
+        assert_eq!(ty.allocator(), AllocatorId::Binary);
+
+        // `binary_alloc` has exactly these two types; the doc comment on `payload_type`
+        // justifies picking `BINARY` of the pair.
+        let mut on_binary_alloc: Vec<&str> =
+            types_for_allocator(AllocatorId::Binary).map(|t| t.name()).collect();
+        on_binary_alloc.sort_unstable();
+        assert_eq!(on_binary_alloc, ["BINARY", "DRV_BINARY"]);
+    }
+
+    /// A payload is attributed to the chosen type's slot: allocating raises it, and the
+    /// last handle dropping unwinds it — in lockstep with the aggregate totals.
+    #[test]
+    fn payload_is_attributed_to_the_binary_type_slot() {
+        let alloc = test_allocator("typed-attribution");
+        let ty = payload_type();
+        let drv = TypeId::from_name("DRV_BINARY").expect("DRV_BINARY is declared");
+
+        let base_slot = alloc.type_stats(ty);
+        let base_stats = alloc.stats();
+
+        let data = pattern(200);
+        let binary = RefcBinary::with_allocator(alloc.clone(), &data).expect("allocate");
+
+        let slot = alloc.type_stats(ty);
+        assert_eq!(slot.blocks, base_slot.blocks + 1, "one live block of type BINARY");
+        let stats = alloc.stats();
+        assert_eq!(
+            stats.live_blocks,
+            base_stats.live_blocks + 1,
+            "the aggregate sees the same single block"
+        );
+
+        // The allocator records the *whole in-band block* it handed out — its own
+        // 16-byte block header plus the class-rounded payload (the payload here is
+        // HEADER_SIZE + 200 = 216 bytes, which the default table rounds up to 256) — so
+        // the attributed bytes are that block size, not the raw `HEADER_SIZE + len`.
+        let classes = SizeClasses::default_small_block();
+        let class = classes
+            .class_for(HEADER_SIZE + data.len())
+            .expect("216 bytes is within the small-block range");
+        let block_size = UNIT_SIZE + classes.class_size(class).expect("a known class");
+        assert_eq!(
+            slot.bytes,
+            base_slot.bytes + block_size,
+            "the type slot carries the allocator's block size"
+        );
+        assert!(block_size >= HEADER_SIZE + data.len(), "the block covers header + payload");
+        // Per-type and aggregate attribution agree exactly (no double counting, no gap).
+        assert_eq!(
+            slot.bytes - base_slot.bytes,
+            stats.live_bytes - base_stats.live_bytes,
+            "per-type bytes must equal the aggregate delta"
+        );
+        assert_eq!(stats.live_blocks, slot.blocks);
+        assert_eq!(stats.live_bytes, slot.bytes);
+        assert_eq!(slot.bytes % UNIT_SIZE, 0, "the recorded block size is unit-aligned");
+
+        // A clone shares the block, so nothing is counted twice ...
+        let clone = binary.clone();
+        assert_eq!(alloc.type_stats(ty).blocks, slot.blocks, "a clone adds no block");
+        assert_eq!(alloc.type_stats(ty).bytes, slot.bytes, "a clone adds no bytes");
+        // ... and the sibling `DRV_BINARY` slot is never touched.
+        assert_eq!(alloc.type_stats(drv).blocks, 0);
+        assert_eq!(alloc.type_stats(drv).bytes, 0);
+
+        drop(binary);
+        assert_eq!(
+            alloc.type_stats(ty).blocks,
+            slot.blocks,
+            "a surviving clone keeps the block live"
+        );
+        drop(clone);
+
+        // The last handle releases the block: the type slot and the aggregate both
+        // return to their baseline.
+        let end_slot = alloc.type_stats(ty);
+        assert_eq!(end_slot.blocks, base_slot.blocks);
+        assert_eq!(end_slot.bytes, base_slot.bytes);
+        let end_stats = alloc.stats();
+        assert_eq!(end_stats.live_blocks, base_stats.live_blocks);
+        assert_eq!(end_stats.live_bytes, base_stats.live_bytes);
+    }
+
+    /// An alloc/free cycle over slab and dedicated-carrier sizes leaves neither the
+    /// per-type slot nor the aggregate totals above their baseline (no leak).
+    #[test]
+    fn repeated_binary_cycles_leave_no_per_type_or_aggregate_leak() {
+        let alloc = test_allocator("typed-noleak");
+        let ty = payload_type();
+        let base_slot = alloc.type_stats(ty);
+        let base_stats = alloc.stats();
+
+        // 0…1024 straddle the class/slab boundaries; 1025 and 100_000 take the
+        // dedicated single-block-carrier path.
+        for &len in &[0usize, 1, 17, 64, 65, 200, 1000, 1024, 1025, 4096, 100_000] {
+            let data = pattern(len);
+            let binary =
+                RefcBinary::with_allocator(alloc.clone(), &data).expect("allocate");
+
+            let slot = alloc.type_stats(ty);
+            assert_eq!(slot.blocks, base_slot.blocks + 1, "len {len}");
+            assert!(slot.bytes >= base_slot.bytes + HEADER_SIZE + len, "len {len}");
+            assert_eq!(
+                slot.bytes - base_slot.bytes,
+                alloc.stats().live_bytes - base_stats.live_bytes,
+                "per-type delta == aggregate delta for len {len}"
+            );
+
+            let clone = binary.clone();
+            assert_eq!(alloc.type_stats(ty).blocks, slot.blocks, "len {len}");
+            drop(binary);
+            drop(clone);
+
+            let freed = alloc.type_stats(ty);
+            assert_eq!(freed.blocks, base_slot.blocks, "len {len}: no leaked block");
+            assert_eq!(freed.bytes, base_slot.bytes, "len {len}: no leaked bytes");
+        }
+
+        let end_stats = alloc.stats();
+        assert_eq!(end_stats.live_blocks, base_stats.live_blocks);
+        assert_eq!(end_stats.live_bytes, base_stats.live_bytes);
     }
 }
