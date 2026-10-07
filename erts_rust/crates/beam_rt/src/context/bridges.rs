@@ -598,6 +598,7 @@ pub(super) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
 mod tests {
     use std::path::{Path, PathBuf};
     use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
 
     use beam_term::prelude::make_small;
     use beam_term::Eterm;
@@ -641,8 +642,8 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
             skip_loudly("no usable `erl` and/or `erlc`");
             return;
         };
-        let dir = compile_fixture(&erlc);
-        let lines = run_oracle(&oracle, &dir);
+        let dir = compile_fixture(&erlc, "compiled_module_local_fun");
+        let lines = run_oracle(&oracle, dir.path());
         assert_eq!(
             lines.len(),
             4,
@@ -708,7 +709,7 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
             skip_loudly("no usable `erl` and/or `erlc`");
             return;
         };
-        let dir = compile_fixture(&erlc);
+        let dir = compile_fixture(&erlc, "a_fun_from_another_module");
         let mut runtime = Runtime::with_defaults().expect("the default runtime");
         let term = runtime
             .run_function(dir.join("lfun.beam"), "mk0", 0, &[])
@@ -797,9 +798,51 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
         eprintln!();
     }
 
-    /// Compiles the fixture into a per-process temp dir and returns that dir.
-    fn compile_fixture(erlc: &Path) -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("beam_rt_local_fun_{}", std::process::id()));
+    /// Monotonic per-call sequence number making each fixture scratch directory unique even
+    /// within one process (the two tests run in parallel threads of the same test binary).
+    static FIXTURE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// A compiled-fixture scratch directory that removes itself on drop, so the per-call
+    /// unique directories never accumulate in the temp dir.
+    struct FixtureDir {
+        path: PathBuf,
+    }
+
+    impl FixtureDir {
+        /// The directory itself (e.g. for `erlc -o` / the oracle's `-pa`).
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// A path inside the directory (e.g. the compiled `.beam`).
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            // Best effort, but never silent: a leftover scratch dir must not fail the test,
+            // yet a cleanup failure is reported rather than swallowed.
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                eprintln!(
+                    "warning: could not remove the fixture scratch dir {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    /// Compiles the fixture into a scratch directory unique **per call** — keyed by the
+    /// fixture name, the process id and an atomic counter — and returns it. The previous
+    /// scheme keyed the directory by process id alone, so the two tests sharing `lfun.erl` /
+    /// `lfun.beam` raced when the lib tests ran in parallel.
+    fn compile_fixture(erlc: &Path, fixture: &str) -> FixtureDir {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "beam_rt_local_fun_{fixture}_{}_{seq}",
+            std::process::id()
+        ));
         std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
         let src = dir.join("lfun.erl");
         std::fs::write(&src, LFUN_SRC).expect("the fixture source is writable");
@@ -817,7 +860,7 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
             output.status.code(),
             String::from_utf8_lossy(&output.stderr)
         );
-        dir
+        FixtureDir { path: dir }
     }
 
     /// Runs the oracle probe against the compiled fixture and returns its stdout lines.
