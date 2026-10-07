@@ -117,8 +117,10 @@
 //!   the number is a property of *this* runtime's heap, and inventing `233` would be a lie.
 //! * `memory`: this runtime's own byte total (`(total_heap_size + stack_size) * 8` plus the
 //!   off-heap overhead), which is smaller than the oracle's because this heap is smaller.
-//! * `status` reflects *this* scheduler's [`ProcessState`]; a process our runner has parked
-//!   in `receive` is `waiting`, exactly the oracle's answer for a blocked process.
+//! * `status`: this runtime is single-threaded, so the process making the call is `running`
+//!   (the oracle's answer for the caller) and every other live process carries its own
+//!   [`ProcessState`] (a process our runner has parked in `receive` is `waiting`, exactly the
+//!   oracle's answer for a blocked process).
 //! * `group_leader` is this runtime's root pid — the same real, live pid
 //!   `erlang:group_leader/0` answers — not the oracle's `<0.70.0>` io process.
 //! * `reductions` is *this* process's real counter, whose absolute value differs from the
@@ -573,7 +575,14 @@ impl RuntimeContext<'_> {
             .and_then(|(name, _)| atoms.name(name).map(str::to_string));
         Some(Snapshot {
             registered_name,
-            status: status_atom(process.state()),
+            // This runtime is single-threaded, so exactly one process is executing at a time:
+            // the one making this call **is** `running` (the oracle answers `running` for the
+            // caller), while every other live process carries its own scheduler state.
+            status: if pid == self.pid() {
+                "running"
+            } else {
+                status_atom(process.state())
+            },
             message_queue_len: process.mailbox().len(),
             messages: process.mailbox().iter().map(|m| m.payload()).collect(),
             links: process.links().iter().map(ProcessId::to_eterm).collect(),
