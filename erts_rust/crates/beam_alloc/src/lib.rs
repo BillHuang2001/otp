@@ -24,9 +24,9 @@
 //!
 //! The cross-crate contract is [`allocator`], [`heap`], [`size_class`],
 //! [`registry`], [`stats`] and [`types`] (the `erts_alloc` allocator/class/type
-//! inventory); [`block`], [`carrier`], [`free_list`], [`strategy`] and [`mseg`]
-//! are implementation modules (public for testing and reuse, but not part of the
-//! contract). Errors are always `beam_common::{Result, BeamError}` — this crate
+//! inventory); [`block`], [`carrier`], [`free_list`], [`mbc`], [`strategy`] and
+//! [`mseg`] are implementation modules (public for testing and reuse, but not part of
+//! the contract). Errors are always `beam_common::{Result, BeamError}` — this crate
 //! adds no error type of its own.
 //!
 //! [`Eterm`]: beam_term::prelude::Eterm
@@ -34,6 +34,7 @@
 pub mod block;
 pub mod carrier;
 pub mod free_list;
+pub mod mbc;
 pub mod size_class;
 pub mod strategy;
 pub mod stats;

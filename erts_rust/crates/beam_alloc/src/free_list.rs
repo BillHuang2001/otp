@@ -79,10 +79,12 @@
 //! # Adoption
 //!
 //! [`FreeList::push`]/[`FreeList::pop`]/[`FreeList::reserve`] are what `carrier.rs`
-//! and `allocator.rs` call today. The variable-size half
-//! ([`FreeList::take_fit`]/[`FreeList::remove`]/[`FreeList::refile`]) is the seam the
-//! free-block coalescing pass adopts, so until that lands it carries a
-//! `#[allow(dead_code)]` (the API is deliberately in place and fully tested here).
+//! and `allocator.rs` call today. The variable-size half —
+//! [`FreeList::take_fit`] (the good-fit search) and [`FreeList::remove`] (unlink one
+//! known block) — is what the variable-size multi-block-carrier sub-allocator
+//! (`crate::mbc`) drives to split a request out of a big free block and to coalesce
+//! physically adjacent free blocks. [`FreeList::refile`] is not used yet, so it alone
+//! still carries an `#[allow(dead_code)]`.
 //!
 //! This file runs a little past the crate's ~1000-line guideline: the implementation
 //! is ~620 lines and the rest is the test module that *is* the correctness evidence
@@ -343,7 +345,6 @@ impl FreeList {
     ///
     /// `class` must be a valid class index and every block filed on it must be an
     /// intact free block (as [`FreeList::insert`]/[`FreeList::push`] require).
-    #[allow(dead_code)] // adopted by the allocator's coalescing pass (see "Adoption")
     pub(crate) unsafe fn take_fit(&mut self, class: usize, size: usize) -> Option<*mut u8> {
         let list = *self.classes.get(class)?;
         if list.head.is_null() || list.max_size < size {
@@ -415,7 +416,6 @@ impl FreeList {
     ///
     /// `payload` must be either a free block currently on `class`'s list or a pointer
     /// that is not a node of any free list at all.
-    #[allow(dead_code)] // adopted by the allocator's coalescing pass (see "Adoption")
     pub(crate) unsafe fn remove(&mut self, class: usize, payload: *mut u8) -> bool {
         if payload.is_null() || class >= self.classes.len() {
             return false;

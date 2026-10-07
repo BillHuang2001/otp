@@ -31,8 +31,8 @@
 //!
 //! # The flag bits
 //!
-//! The flag byte is **7 of its 8 bits used** (bit 7 stays free for a future bit),
-//! so the field width is unchanged and the whole `flags` byte still round-trips
+//! The flag byte uses all **8** of its bits (7 taxonomy bits plus one block-state
+//! bit), so the field width is unchanged and the whole `flags` byte still round-trips
 //! losslessly. The bits model the legacy `Block_t`/`bhdr` block taxonomy
 //! (`erts/emulator/beam/erl_alloc_util.h`): the legacy header steals the bits below
 //! the alignment (`INV_UNIT_MASK`, i.e. the low 4 bits of a 16-byte-`Unit_t` word)
@@ -49,10 +49,16 @@
 //! | 4 | `is_mseg` | carrier sourced from the `mseg` allocator |
 //! | 5 | `is_fixed_size` | `fix_alloc` (`ERTS_ALC_A_FIXED_SIZE`) block |
 //! | 6 | `is_super_aligned` | super-aligned carrier (`ERTS_HAVE_MSEG_SUPER_ALIGNED`) |
-//! | 7 | — free — | |
+//! | 7 | `prev_free` | previous block is free (`PREV_FREE_BLK_HDR_FLG`) |
 //!
-//! [`ALL_FLAGS`] is the union of every bit this module defines; the allocator's
+//! [`ALL_FLAGS`] is the union of the block-*taxonomy* bits above; the allocator's
 //! header plausibility check rejects a header whose flag byte has any other bit set.
+//! Bit 7 is deliberately **not** part of that union: it is a *block-state* bit
+//! ([`BlockFlags::is_prev_free`]) that only the variable-size multi-block-carrier path
+//! (`crate::mbc`) sets, mirroring the legacy `PREV_FREE_BLK_HDR_FLG`, which likewise
+//! sits beside — not inside — the legacy `SBC_BLK_HDR_FLG` carrier-kind combination.
+//! Keeping it out of the union leaves the taxonomy and its compile-time assertion
+//! below unchanged.
 //!
 //! `unsafe` is confined to the marked functions below; every `unsafe fn` has a
 //! `# Safety` section and every `unsafe` block a `// SAFETY:` rationale
@@ -100,6 +106,19 @@ const FLAG_FIXED_SIZE: u8 = 1 << 5;
 /// The block lives in a super-aligned carrier (`ERTS_HAVE_MSEG_SUPER_ALIGNED` /
 /// `ERTS_SUPER_ALIGN_BITS`, `erl_alloc_util.h:323-349`).
 const FLAG_SUPER_ALIGNED: u8 = 1 << 6;
+
+/// The block's physically previous neighbour is free, so that neighbour's **size**
+/// lives in the one-word footer at the end of the neighbour's block rather than in a
+/// header this block can reach.
+///
+/// Mirrors the legacy `PREV_FREE_BLK_HDR_FLG` (`erl_alloc_util.h:408`), which is what
+/// lets a block find its predecessor (`PREV_BLK`) after free-block coalescing. Only
+/// the variable-size multi-block-carrier path (`crate::mbc`) sets it; the equal-block
+/// slab path never does.
+///
+/// It is a *block-state* bit, not a taxonomy bit, and is deliberately kept out of
+/// [`ALL_FLAGS`] (see the module docs).
+const FLAG_PREV_FREE: u8 = 1 << 7;
 
 /// Every flag bit this module defines; a header whose flag byte has any other bit
 /// set is corrupt (used by the allocator's header plausibility check).
@@ -276,6 +295,29 @@ impl BlockFlags {
         self.0 &= !FLAG_SUPER_ALIGNED;
     }
 
+    /// Whether the block's physically previous neighbour is free.
+    ///
+    /// Only meaningful for a variable-size multi-block-carrier block (`crate::mbc`);
+    /// when set, the previous block's size is the footer word immediately before this
+    /// block, so `previous_block = block - footer`.
+    pub const fn is_prev_free(self) -> bool {
+        self.0 & FLAG_PREV_FREE != 0
+    }
+
+    /// Marks the block's physically previous neighbour as free.
+    pub const fn set_prev_free(&mut self) {
+        self.0 |= FLAG_PREV_FREE;
+    }
+
+    /// Clears the previous-neighbour-free marker (the previous block is allocated).
+    pub const fn clear_prev_free(&mut self) {
+        self.0 &= !FLAG_PREV_FREE;
+    }
+
+    /// Clears the last-in-carrier marker.
+    pub const fn clear_last_in_carrier(&mut self) {
+        self.0 &= !FLAG_LAST_IN_CARRIER;
+    }
     /// Every flag bit this module defines ([`ALL_FLAGS`]).
     pub const fn all() -> BlockFlags {
         BlockFlags(ALL_FLAGS)
@@ -674,5 +716,40 @@ mod tests {
         flags.set_last_in_carrier();
         assert_eq!(flags.bits(), FLAG_LARGE | FLAG_LAST_IN_CARRIER);
         assert_eq!(BlockFlags::from_bits(flags.bits()), flags);
+    }
+
+    #[test]
+    fn prev_free_is_a_block_state_bit_kept_out_of_the_taxonomy_union() {
+        let mut flags = BlockFlags::empty();
+        assert!(!flags.is_prev_free());
+        flags.set_prev_free();
+        assert!(flags.is_prev_free());
+        assert_eq!(flags.bits(), FLAG_PREV_FREE);
+        // It is a *state* bit, so it is not part of the taxonomy union the allocator's
+        // plausibility check accepts and a header carrying it reports unknown bits.
+        assert_eq!(flags.bits() & ALL_FLAGS, 0);
+        assert!(flags.has_unknown_bits());
+        assert!(!BlockFlags::all().is_prev_free());
+        // Like every other flag bit it round-trips through the header encoding.
+        let mut buf = scratch();
+        let hdr = BlockHdr {
+            size: 16 + 48,
+            payload_offset: 0,
+            class: 0,
+            carrier: core::ptr::null_mut(),
+            flags: BlockFlags::all().bits() | FLAG_PREV_FREE,
+        };
+        // SAFETY: `buf` is 16-aligned and header-sized.
+        unsafe { BlockHeader::store(buf.0.as_mut_ptr(), hdr) };
+        // SAFETY: just stored.
+        let loaded = unsafe { BlockHeader::load(buf.0.as_mut_ptr()) };
+        assert!(BlockFlags::from_bits(loaded.flags).is_prev_free());
+        flags.clear_prev_free();
+        assert!(!flags.is_prev_free());
+        // `last_in_carrier` gained the clear half its `set_` counterpart implies.
+        let mut flags = BlockFlags::all();
+        flags.clear_last_in_carrier();
+        assert!(!flags.last_in_carrier());
+        assert!(flags.is_free() && flags.is_sbc() && flags.is_mseg());
     }
 }
