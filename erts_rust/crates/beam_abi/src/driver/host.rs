@@ -16,6 +16,11 @@
 //! [`NifEnv::from_opaque`](crate::nif::host::NifEnv::from_opaque). `unsafe` is confined to
 //! [`DriverEnv::host`], [`DriverEnv::from_port`] and [`decode_term_spec`]'s operand readers, each
 //! documented with a `# Safety` section / `// SAFETY:` rationale (workspace `CONTEXT.md` §3).
+//!
+//! Two frozen slots carry **no** port operand — `add_driver_entry`/`remove_driver_entry` take only
+//! an `ErlDrvEntry *` (`io.c:7640`, `io.c:7698`) — so there is no [`DriverEnv`] to recover a host
+//! from. [`with_current_host`] (re-exported here from [`crate::driver::current_host`]) is the scoped
+//! publication the runtime wraps those entry points in, so they can reach a [`DriverHost`].
 
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
@@ -24,11 +29,16 @@ use beam_term::prelude::{self, Eterm, NIL};
 
 use crate::common::SysIOVec;
 use crate::driver::types::{
-    ErlDrvBinary, ErlDrvEvent, ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL, ErlDrvPort, ErlDrvPort_,
-    ErlDrvSInt, ErlDrvTermData, ERL_DRV_ATOM, ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_FLOAT,
-    ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST, ERL_DRV_NIL, ERL_DRV_PORT, ERL_DRV_STRING,
-    ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT, ERL_DRV_UINT64,
+    ErlDrvBinary, ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvMonitor, ErlDrvNowData, ErlDrvPDL,
+    ErlDrvPort, ErlDrvPort_, ErlDrvSInt, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_ATOM,
+    ERL_DRV_BINARY, ERL_DRV_BUF2BINARY, ERL_DRV_FLOAT, ERL_DRV_INT, ERL_DRV_INT64, ERL_DRV_LIST,
+    ERL_DRV_NIL, ERL_DRV_PORT, ERL_DRV_STRING, ERL_DRV_STRING_CONS, ERL_DRV_TUPLE, ERL_DRV_UINT,
+    ERL_DRV_UINT64,
 };
+
+// Re-exported so the runtime reaches the publication through the same module as the seam it belongs
+// to (`beam_abi::driver::host::with_current_host`); `current_host` documents the mechanism.
+pub use crate::driver::current_host::with_current_host;
 
 /// The reason a driver asks for its port to be closed — the C's whole `driver_failure*` family
 /// (`erts/emulator/beam/io.c`) collapsed into one seam hook ([`DriverHost::failure`]).
@@ -328,6 +338,71 @@ pub trait DriverHost {
     /// unsupported).
     fn now(&mut self) -> Option<ErlDrvNowData> {
         None
+    }
+
+    // ---------------------------------------------------------------------------------------
+    // Driver registry & port creation — `add_driver_entry`/`remove_driver_entry`/
+    // `driver_lock_driver`/`driver_create_port`
+    //
+    // These four reach **process-global** runtime structure (the emulator's driver list, a loaded
+    // driver's shared-object handle, the port table) rather than one port's term services. Every one
+    // is defaulted to the C's own failure value, so a host that does not model the service answers
+    // exactly as the C does for a request it cannot honour — never a fabricated success.
+    // ---------------------------------------------------------------------------------------
+
+    /// Make the statically linked driver entry `de` known to the emulator — the `void add_driver_entry(ErlDrvEntry *drv)`
+    /// wrapper (`io.c:7640`) over `int erts_add_driver_entry(de, handle, driver_list_locked, taint)`
+    /// (`io.c:7650`), which records `de` in the global `driver_list` and runs `init_driver` on it.
+    ///
+    /// `0` = recorded, non-zero = `init_driver` refused the entry, `-1` = unsupported (default).
+    /// The C wrapper **discards** this result on purpose ("the init is not allowed to fail when
+    /// drivers are added by drivers", `io.c:7642-7645`), so a caller sees nothing through the C ABI;
+    /// it is a value here only so the refusal is modelable at all.
+    fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        let _ = de;
+        -1
+    }
+
+    /// Remove the driver entry `de` from the emulator's global `driver_list`
+    /// (`int remove_driver_entry(ErlDrvEntry *drv)`, `io.c:7698`).
+    ///
+    /// `1` = removed, `0` = no such entry (the default: unsupported), `-1` = `de` names a
+    /// **dynamically** loaded driver (`dp->handle != NULL`, "not allowed for dynamic drivers",
+    /// `io.c:7709-7713`).
+    fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        let _ = de;
+        0
+    }
+
+    /// Lock the driver behind `port`'s **own** loaded shared object for the rest of the machine's
+    /// lifetime (`int driver_lock_driver(ErlDrvPort ix)`, `io.c:7324`).
+    ///
+    /// `0` = locked; `-1` = unsupported (default) or the port's driver has no `dlopen` handle — a
+    /// statically linked driver (`(dh = prt->drv_ptr->handle) == NULL`, `io.c:7337`). The C consults
+    /// `prt->drv_ptr->handle` (the handle of the *port's own* driver, `io.c:7337`), **not** a lookup
+    /// by name in any global table.
+    fn lock_driver(&mut self, port: ErlDrvPort) -> c_int {
+        let _ = port;
+        -1
+    }
+
+    /// Create a new port owned by the emitting driver — `ErlDrvPort driver_create_port(ErlDrvPort
+    /// creator_port_ix, ErlDrvTermData pid, char *name, ErlDrvData drv_data)` (`io.c:787`): `name`
+    /// selects the driver to instantiate, `pid` becomes the new port's owner/caller and `drv_data`
+    /// its driver-private data.
+    ///
+    /// Returns the new port handle, or the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`]
+    /// (pointer `-1`, `erl_port.h:67`) — which is the C's answer for **every** failure and hence the
+    /// default here.
+    fn create_port(
+        &mut self,
+        creator: ErlDrvPort,
+        connected: ErlDrvTermData,
+        name: *mut c_char,
+        drv_data: ErlDrvData,
+    ) -> ErlDrvPort {
+        let _ = (creator, connected, name, drv_data);
+        ERTS_INVALID_ERL_DRV_PORT
     }
 }
 

@@ -11,7 +11,7 @@
 //! `ErlNifApi`/`ErlDrvApi` function tables) **and implements both host sides**: the `enif_*` bodies
 //! live in [`nif::enif`] (one file per family — all `176` LP64 slots populated, the seven
 //! C-variadic ones through the `csrc/nif_variadic.c` shim that `build.rs` compiles when a C
-//! compiler is available) and the `driver_*`/`erl_drv_*` bodies in [`driver::drv`] (`104` of `111`
+//! compiler is available) and the `driver_*`/`erl_drv_*` bodies in [`driver::drv`] (`108` of `111`
 //! slots). Each side also has a `dlopen`-based loader ([`nif::loader`], [`driver::loader`]).
 //!
 //! Layouts are pinned by compile-time assertions in [`layout`]; a mismatch is a compile error.
@@ -82,6 +82,7 @@ pub const ERL_DRV_MIN_REQUIRED_MAJOR_VERSION_ON_LOAD: c_int = 2;
 
 pub use crate::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM, ERL_NIF_UINT};
 pub use crate::nif::host::{NifEnv, NifHost};
+pub use crate::driver::current_host::with_current_host;
 pub use crate::driver::host::{DriverEnv, DriverHost};
 pub use beam_term::Eterm;
 

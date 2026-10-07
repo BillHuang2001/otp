@@ -23,20 +23,24 @@
 //! * `port` — **part 2, port/host-dependent**: the functions whose `ErlDrvPort` operand **is** the
 //!   pointer [`DriverEnv::as_port`] hands out ([`DriverEnv::from_port`] recovers it), plus their
 //!   `populate` step;
-//! * `lifecycle`, `queues`, `threads` — **not-yet-implemented families**: each owns the slot list
-//!   for one group of the C surface and contributes a (currently no-op) `populate` step, so a later
-//!   workstream can wire that family without editing this file;
+//! * `lifecycle`, `queues`, `threads` — **implemented**: each owns one group of the C surface (port
+//!   lifecycle/attributes, the port queue, the `erl_drv_*` thread family) and contributes its own
+//!   `populate` step;
 //! * `pdl` — **implemented**: the port data lock, the driver monitors, the deprecated
 //!   `driver_get_now` wall clock, and the (deliberately `None`) binary refcount trio — see that
 //!   file's header for the semantics and the documented deviations.
+//! * `registry` — **implemented**: the four slots that reach structure outside one port —
+//!   `add_driver_entry`/`remove_driver_entry` (which reach their host through the thread-local
+//!   [`with_current_host`](crate::driver::current_host::with_current_host) publication, since they
+//!   carry no port operand) and `driver_lock_driver`/`driver_create_port` — see that file's header.
 //!
 //! # Table assembly
 //!
 //! [`DRIVER_API`] starts from the all-`None` [`EMPTY_DRIVER_API`] and is threaded through the
 //! `const fn populate` of every file above, innermost-first
-//! (`lifecycle → pdl → queues → threads → mem → port`). Each file is therefore the single owner of
-//! the `Some(…)` list for the slots it implements; the whole chain is `const`, so it folds at
-//! compile time and the frozen table's *shape* is unchanged.
+//! (`port → mem → threads → queues → pdl → lifecycle → registry`). Each file is therefore the single
+//! owner of the `Some(…)` list for the slots it implements; the whole chain is `const`, so it folds
+//! at compile time and the frozen table's *shape* is unchanged.
 //!
 //! # Scope: part 1 (host-free) and part 2 (port/host-dependent)
 //!
@@ -65,23 +69,24 @@
 //! Each of them returns the C failure code (`-1`) for a null port, a malformed spec or a
 //! host-reported failure — never a crash, never a wrong result.
 //!
-//! Everything else stays `None` (it needs runtime structure this seam does not expose):
+//! Everything else is populated by the family that owns it:
 //!
 //! * **port queues** — `driver_vec_to_buf` and the `driver_enq`/`driver_pushq`/`driver_deq`/
-//!   `driver_sizeq`/`driver_peekq*`/`driver_enqv`/`driver_pushqv` family.
-//! * **port lifecycle & attributes** — `driver_create_port`, `add_driver_entry`,
-//!   `remove_driver_entry`, `driver_lock_driver`, `erl_drv_init_ack`, `erl_drv_set_os_pid`,
-//!   `erl_drv_busy_msgq_limits`, the `driver_failure*`/`driver_exit` family, `set_busy_port`,
-//!   `set_port_control_flags`, `get_port_flags`.
-//! * **async thread pool** — `driver_async_port_key` (the "fair" async key is derived from the
-//!   port's id term, which this seam has no representation for).
+//!   `driver_sizeq`/`driver_peekq*`/`driver_enqv`/`driver_pushqv` family (the `queues` file);
+//! * **port lifecycle & attributes** — `add_driver_entry`, `remove_driver_entry`,
+//!   `driver_lock_driver`, `driver_create_port` (the `registry` file), `erl_drv_init_ack`,
+//!   `erl_drv_set_os_pid`, `erl_drv_busy_msgq_limits`, the `driver_failure*`/`driver_exit` family,
+//!   `set_busy_port`, `set_port_control_flags`, `get_port_flags` (the `lifecycle` file);
+//! * **async thread pool** — `driver_async_port_key` (the `lifecycle` file; the "fair" async key
+//!   comes from the host, which owns the port's id term);
 //! * **threads** — the whole `erl_drv_mutex_*`/`erl_drv_cond_*`/`erl_drv_rwlock_*`/`erl_drv_tsd_*`/
-//!   `erl_drv_thread_*`/`erl_drv_*_name` family.
+//!   `erl_drv_thread_*`/`erl_drv_*_name` family (the `threads` file).
 //!
-//! The **binary refcount trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) is `None` too, and
-//! deliberately: the frozen [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly `{ orig_size, orig_bytes }` (16 bytes,
-//! asserted in [`crate::driver::types`]) — there is no refcount word, so there is nothing to report
-//! or adjust, and the emulator's private `Binary` header is not part of this ABI.
+//! The **binary refcount trio** (`driver_binary_get_refc`/`inc_refc`/`dec_refc`) — the only slots
+//! left `None` — is deliberately so: the frozen
+//! [`ErlDrvBinary`](crate::driver::types::ErlDrvBinary) layout is exactly `{ orig_size, orig_bytes }`
+//! (16 bytes, asserted in [`crate::driver::types`]) — there is no refcount word, so there is nothing
+//! to report or adjust, and the emulator's private `Binary` header is not part of this ABI.
 //!
 //! # Documented deviations from the oracle
 //!
@@ -130,6 +135,7 @@ mod mem;
 mod pdl;
 mod port;
 mod queues;
+mod registry;
 mod threads;
 
 use beam_term::prelude::NIL;
@@ -202,13 +208,15 @@ const EMPTY_DRIVER_API: ErlDrvApi = unsafe { core::mem::zeroed() };
 ///
 /// The table is assembled by a `const fn` `populate` chain: **each file owns the `Some(…)` list for
 /// the slots it implements** (`mem` the host-free group, `port` the port/host-dependent group, and
-/// the `lifecycle`/`pdl`/`queues`/`threads` family stubs the not-yet-implemented groups), so a later
-/// workstream can wire a family without ever editing this file. The chain starts from the all-`None`
-/// [`EMPTY_DRIVER_API`], and every step is `const`, so it folds entirely at compile time.
+/// the `lifecycle`/`pdl`/`queues`/`threads`/`registry` family files the group each one owns), so a
+/// later workstream can wire a family without ever editing this file. The chain starts from the
+/// all-`None` [`EMPTY_DRIVER_API`], and every step is `const`, so it folds entirely at compile time.
 #[used]
-static DRIVER_API: ErlDrvApi = lifecycle::populate(pdl::populate(queues::populate(
-    threads::populate(mem::populate(port::populate(EMPTY_DRIVER_API))),
-)));
+static DRIVER_API: ErlDrvApi = registry::populate(
+    lifecycle::populate(pdl::populate(queues::populate(threads::populate(mem::populate(
+        port::populate(EMPTY_DRIVER_API),
+    ))))),
+);
 
 /// The populated `driver_*` / `erl_drv_*` table (see [`DRIVER_API`]).
 pub fn driver_api_table() -> &'static ErlDrvApi {
@@ -303,18 +311,21 @@ mod tests {
             t.driver_peekq.is_some(),
             t.driver_enqv.is_some(),
             t.driver_pushqv.is_some(),
+            // Part 4: the driver registry / port creation family (`registry`).
+            t.add_driver_entry.is_some(),
+            t.remove_driver_entry.is_some(),
+            t.driver_lock_driver.is_some(),
+            t.driver_create_port.is_some(),
         ];
         assert!(
             populated.iter().all(|&p| p),
             "every implemented slot must be populated: {populated:?}"
         );
 
-        // The families that need runtime structure this seam does not expose stay `None`
-        // (`driver_create_port` needs a real port registry; the binary-refcount trio has no
-        // refcount word in the frozen `ErlDrvBinary` layout). Which of the other slots are still
-        // `None` is deliberately NOT asserted here — it changes as families land, and each
-        // family's own test pins its own slots. See `CONTEXT.md` for the current status.
-        assert!(t.driver_create_port.is_none());
+        // The only slots this seam leaves `None` are the binary-refcount trio: the frozen
+        // `ErlDrvBinary` layout has no refcount word. Which of the other slots are still `None` is
+        // deliberately NOT asserted here — it changes as families land, and each family's own test
+        // pins its own slots. See `CONTEXT.md` for the current status.
         assert!(t.driver_binary_get_refc.is_none());
         assert!(t.driver_binary_inc_refc.is_none());
         assert!(t.driver_binary_dec_refc.is_none());
