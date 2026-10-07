@@ -387,22 +387,41 @@ mod tests {
     use libc::c_int;
     use std::sync::atomic::{AtomicUsize, Ordering};
 
-    static INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
-    static INIT_RESULT: AtomicUsize = AtomicUsize::new(0);
+    // Each *counted* `init` callback is used by exactly one test and owns its own counter, so the
+    // (parallel) tests cannot clobber one another's bookkeeping; a single shared pair was racy.
+    static COUNTED_INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
+    static FAIL_INIT_CALLS: AtomicUsize = AtomicUsize::new(0);
 
-    /// The static entry's `int init(void)` callback.
-    unsafe extern "C" fn counting_init() -> c_int {
-        INIT_CALLS.fetch_add(1, Ordering::SeqCst);
-        INIT_RESULT.load(Ordering::SeqCst) as c_int
+    /// A successful `int init(void)` that counts its calls (owned by one test).
+    unsafe extern "C" fn counted_init() -> c_int {
+        COUNTED_INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+        0
     }
 
-    /// A statically linked entry named `name` (a `'static` NUL-terminated C string).
-    fn static_entry(name: *const u8) -> ErlDrvEntry {
+    /// A successful `int init(void)` that counts nothing (the shared default).
+    unsafe extern "C" fn noop_init() -> c_int {
+        0
+    }
+
+    /// An `int init(void)` that always refuses the registration (owned by one test).
+    unsafe extern "C" fn failing_init() -> c_int {
+        FAIL_INIT_CALLS.fetch_add(1, Ordering::SeqCst);
+        3
+    }
+
+    /// A statically linked entry named `name` (a `'static` NUL-terminated C string) whose `init`
+    /// is `init`.
+    fn entry_with(name: *const u8, init: unsafe extern "C" fn() -> c_int) -> ErlDrvEntry {
         ErlDrvEntry {
-            init: Some(counting_init),
+            init: Some(init),
             driver_name: name as *mut libc::c_char,
             ..ErlDrvEntry::default()
         }
+    }
+
+    /// A statically linked entry named `name` with a successful, uncounted `init`.
+    fn static_entry(name: *const u8) -> ErlDrvEntry {
+        entry_with(name, noop_init)
     }
 
     const DRIVER_A: &[u8] = b"table_test_a\0";
@@ -410,15 +429,14 @@ mod tests {
 
     #[test]
     fn add_entry_runs_init_and_records_the_name() {
-        INIT_CALLS.store(0, Ordering::SeqCst);
-        INIT_RESULT.store(0, Ordering::SeqCst);
+        COUNTED_INIT_CALLS.store(0, Ordering::SeqCst);
         let table = DriverTable::new();
-        let mut entry = static_entry(DRIVER_A.as_ptr());
+        let mut entry = entry_with(DRIVER_A.as_ptr(), counted_init);
 
         // SAFETY: `entry` is a live local `ErlDrvEntry` with a `'static` name for the duration
         // of the table's use.
         assert!(unsafe { table.add_entry(&mut entry) }.is_ok());
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1, "init runs once");
+        assert_eq!(COUNTED_INIT_CALLS.load(Ordering::SeqCst), 1, "init runs once");
         assert_eq!(table.names(), vec!["table_test_a".to_string()]);
 
         let registered: RegisteredDriver = table.lookup("table_test_a").expect("a registration");
@@ -447,25 +465,22 @@ mod tests {
 
     #[test]
     fn a_non_zero_init_refuses_the_registration() {
-        INIT_CALLS.store(0, Ordering::SeqCst);
-        INIT_RESULT.store(3, Ordering::SeqCst);
+        FAIL_INIT_CALLS.store(0, Ordering::SeqCst);
         let table = DriverTable::new();
-        let mut entry = static_entry(DRIVER_B.as_ptr());
+        let mut entry = entry_with(DRIVER_B.as_ptr(), failing_init);
 
         // SAFETY: `entry` is live and named.
         let err = unsafe { table.add_entry(&mut entry) }.expect_err("init rejected the entry");
         assert_eq!(err.as_atom(), Some("driver_init_failed"));
-        assert_eq!(INIT_CALLS.load(Ordering::SeqCst), 1, "init was still called");
+        assert_eq!(FAIL_INIT_CALLS.load(Ordering::SeqCst), 1, "init was still called");
         assert!(
             table.is_empty(),
             "a refused entry is not recorded (the C removes it again)"
         );
-        INIT_RESULT.store(0, Ordering::SeqCst);
     }
 
     #[test]
     fn a_static_driver_cannot_be_locked_and_is_removed_by_pointer() {
-        INIT_CALLS.store(0, Ordering::SeqCst);
         let table = DriverTable::new();
         let mut entry = static_entry(DRIVER_A.as_ptr());
         // SAFETY: `entry` is live and named.

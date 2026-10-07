@@ -27,27 +27,46 @@
 //! `driver_set_timer` deadline, and the `driver_async` job set. It survives individual callbacks,
 //! exactly as the C's per-port `ErlDrvEvent` list and port timer do.
 //!
+//! A host may additionally carry its port's **registered driver identity** (the driver name and
+//! whether the port was built from a `dlopen`ed object). It is what `driver_lock_driver` needs:
+//! the C consults the port's *own* driver (`prt->drv_ptr->handle`), not a name lookup. A host
+//! built with [`AbiHost::new`] has no identity and answers the C's statically-linked case.
+//!
+//! # The process-global driver registry
+//!
+//! Four of the frozen `ErlDrvApi` slots act on structure **outside** one port — the emulator's
+//! process-global `driver_list` and the creation of a brand-new port. [`AbiHost`] is the host
+//! those slots delegate to: it forwards `add_driver_entry`/`remove_driver_entry`/
+//! `driver_lock_driver` to the process-global [`DriverTable`](crate::abi::DriverTable), and
+//! answers `driver_create_port` with the C's invalid-port sentinel (a driver callback here already
+//! holds a `&mut` into the port registry, so re-entering it would alias — see the method docs).
+//!
 //! # `unsafe`
 //!
 //! This is an explicitly-marked `unsafe` module (workspace `../CONTEXT.md` §3): it re-enters a
-//! borrowed [`DriverContext`](crate::driver::DriverContext) from a raw pointer and calls a
-//! driver-supplied `async_free`. Both blocks carry a `// SAFETY:` rationale.
+//! borrowed [`DriverContext`](crate::driver::DriverContext) from a raw pointer, records a driver's
+//! own static entry in the global table and calls a driver-supplied `async_free`. Every block
+//! carries a `// SAFETY:` rationale.
 
 use std::cell::Cell;
 use std::collections::BTreeMap;
 use std::os::unix::io::RawFd;
 use std::time::{Duration, Instant};
 
-use libc::{c_int, c_long, c_uint, c_ulong, c_void};
+use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
 use beam_abi::driver::host::DriverHost;
-use beam_abi::driver::types::{ErlDrvEvent, ErlDrvPort, ERL_DRV_READ, ERL_DRV_WRITE};
+use beam_abi::driver::types::{
+    ErlDrvData, ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ErlDrvTermData, ERTS_INVALID_ERL_DRV_PORT,
+    ERL_DRV_READ, ERL_DRV_WRITE,
+};
 use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{make_atom, Eterm};
 
 use crate::abi::job::AsyncJobs;
+use crate::abi::DriverTable;
 use crate::driver::DriverContext;
 use crate::poller::{Interest, Token};
 
@@ -226,6 +245,19 @@ impl DriverState {
     }
 }
 
+/// The registered driver identity of the port an [`AbiHost`] belongs to.
+///
+/// The C reaches the same two facts as `prt->drv_ptr->name` and `prt->drv_ptr->handle != NULL`;
+/// they are what `driver_lock_driver` (which consults the port's *own* driver) needs. A host built
+/// without one models a port whose driver has no `dlopen` handle — the C's statically-linked case.
+struct DriverIdentity {
+    /// The name the driver's `ErlDrvEntry` declares (`dp->name`).
+    name: String,
+    /// Whether the port was built from a **dynamically loaded** object (`dp->handle != NULL`),
+    /// i.e. from an [`Arc<DriverLibrary>`](beam_abi::driver::loader::DriverLibrary).
+    loaded: bool,
+}
+
 /// The [`DriverHost`](beam_abi::driver::host::DriverHost) implementation for one driver port.
 ///
 /// Owns everything the C-facing surface needs — the [`PortHost`], the driver's term heap, the
@@ -239,13 +271,20 @@ pub struct AbiHost {
     heap: Heap,
     /// The port's persistent C-ABI state (see [`DriverState`]).
     state: DriverState,
+    /// The port's registered driver identity, or `None` for a bare host (see [`DriverIdentity`]).
+    driver: Option<DriverIdentity>,
     /// The [`DriverContext`](crate::driver::DriverContext) installed for the duration of one
     /// driver callback, or null outside a callback. See [`AbiHost::with_ctx`].
     ctx: Cell<*mut c_void>,
 }
 
 impl AbiHost {
-    /// Build a host over `port_host`, with a fresh [`DRIVER_HEAP_WORDS`]-word term heap.
+    /// Build a host over `port_host` with **no** driver identity, and a fresh
+    /// [`DRIVER_HEAP_WORDS`]-word term heap.
+    ///
+    /// With no identity the host answers `driver_lock_driver` with the C's statically-linked `-1`
+    /// (see [`DriverHost::lock_driver`]): it is the right host for a driver whose `.so` handle is
+    /// unknown. [`AbiHost::for_driver`] supplies one.
     ///
     /// # Errors
     ///
@@ -255,10 +294,37 @@ impl AbiHost {
             port_host,
             heap: Heap::new(DRIVER_HEAP_WORDS)?,
             state: DriverState::new(),
+            driver: None,
             ctx: Cell::new(core::ptr::null_mut()),
         })
     }
 
+    /// Build a host over `port_host` that carries the port's registered driver `name` and whether
+    /// the port was built from a **dynamically loaded** object.
+    ///
+    /// This is what a port opened from a `dlopen`ed driver uses (see
+    /// [`DriverPort::from_library`](super::port::DriverPort::from_library)), so
+    /// `driver_lock_driver` answers the C's `0` for it.
+    ///
+    /// # Errors
+    ///
+    /// As [`AbiHost::new`].
+    pub fn for_driver(
+        port_host: Box<dyn PortHost>,
+        name: impl Into<String>,
+        loaded: bool,
+    ) -> Result<AbiHost> {
+        Ok(AbiHost::new(port_host)?.with_driver(name, loaded))
+    }
+
+    /// Records the port's registered driver `name` and whether it was dynamically loaded.
+    pub fn with_driver(mut self, name: impl Into<String>, loaded: bool) -> AbiHost {
+        self.driver = Some(DriverIdentity {
+            name: name.into(),
+            loaded,
+        });
+        self
+    }
     /// Records `ctx` as the live port context for the driver callback about to run.
     ///
     /// The caller **must** pair this with [`AbiHost::clear`] before the context goes out of scope —
@@ -455,13 +521,92 @@ impl DriverHost for AbiHost {
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         self.port_host.caller_pid()
     }
+
+    /// `add_driver_entry`: record the statically linked driver entry `de` in the process-global
+    /// [`DriverTable`] (the C's `driver_list`), running its `init` first (`io.c:7640-7645`).
+    ///
+    /// `0` = recorded, `1` = the entry's `init` refused it. The C's `void` wrapper **discards**
+    /// the underlying `erts_add_driver_entry` result on purpose ("the init is not allowed to fail
+    /// when drivers are added by drivers", `io.c:7642-7645`), so the refusal is a value here only
+    /// so it stays distinguishable from the trait default's `-1` ("no current host").
+    fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        // SAFETY: `de` is the driver's own static `ErlDrvEntry`, live (its code mapped, its name
+        // readable) for as long as it is registered — exactly the contract `driver_init` gives the
+        // C and `DriverTable::add_entry` documents. The pointer is never dereferenced here.
+        match unsafe { DriverTable::global().add_entry(de) } {
+            Ok(()) => 0,
+            Err(_) => 1,
+        }
+    }
+
+    /// `remove_driver_entry`: remove `de` from the process-global [`DriverTable`] (the C's
+    /// `driver_list`), answering the C's `1` removed / `0` not listed / `-1` dynamic-driver case.
+    ///
+    /// The table's own answer is forwarded unchanged: it compares entries by address only, so it
+    /// needs no `// SAFETY:` contract on `de`, and a dynamic registration's refusal is its business
+    /// to report.
+    fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        DriverTable::global().remove_entry(de)
+    }
+
+    /// `driver_lock_driver`: lock the port's **own** driver in the machine for good
+    /// (`io.c:7324`).
+    ///
+    /// The C consults `prt->drv_ptr->handle` — the *port's own* driver, never a lookup by name —
+    /// and answers `-1` when that handle is null (`io.c:7337`, a statically linked driver) and `0`
+    /// otherwise. A [`DriverPort`](super::port::DriverPort) is **always** built from an
+    /// [`Arc<DriverLibrary>`](beam_abi::driver::loader::DriverLibrary), i.e. dynamically loaded,
+    /// so a host carrying such an identity answers `0`; a bare host (no identity) is the C's
+    /// statically-linked case and answers `-1`.
+    ///
+    /// The process-global [`DriverTable`] is consulted only to honour and record its `locked` flag
+    /// when a registration for the name exists; the answer does **not** depend on it. That matters
+    /// because the runtime never registers its loaded drivers in the global table (the C likewise
+    /// consults the port, not the list), so a table lookup must never turn a dynamically loaded
+    /// port into `-1`.
+    fn lock_driver(&mut self, _port: ErlDrvPort) -> c_int {
+        match &self.driver {
+            Some(identity) if identity.loaded => {
+                let _ = DriverTable::global().lock_driver(&identity.name);
+                0
+            }
+            _ => -1,
+        }
+    }
+
+    /// `driver_create_port`: create a new port owned by the emitting driver (`io.c:786`).
+    ///
+    /// Always the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`] — the C's single failure
+    /// answer for a request that cannot be honoured (never a fabricated port). Two independent
+    /// reasons, either of which alone forces it:
+    ///
+    /// 1. [`DriverTable::create_port`] needs a live `&mut PortRegistry` and `&mut Poller`, but
+    ///    every driver callback here runs **inside** a [`PortRegistry`](crate::PortRegistry)
+    ///    method that already holds a `&mut` into the registry's port map (the `&mut Port` the
+    ///    callback was dispatched through). Re-entering `PortRegistry::open` with `&mut self`
+    ///    would alias that borrow, and because `open` **inserts** into the map it can even
+    ///    invalidate the live `&mut Port` — undefined behaviour, not merely a missing feature.
+    /// 2. The new port also needs its own `Box<dyn PortHost>`, which only `beam_rt` can supply
+    ///    (the real `PortHost` lives outside this crate) and which no defaulted hook hands over.
+    fn create_port(
+        &mut self,
+        _creator: ErlDrvPort,
+        _connected: ErlDrvTermData,
+        _name: *mut c_char,
+        _drv_data: ErlDrvData,
+    ) -> ErlDrvPort {
+        ERTS_INVALID_ERL_DRV_PORT
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::{interest_from_mode, AbiHost, LocalAtomPortHost, PortHost};
     use beam_abi::driver::host::DriverHost;
-    use beam_abi::driver::types::{ErlDrvEvent, ErlDrvEvent_, ERL_DRV_READ, ERL_DRV_WRITE};
+    use beam_abi::driver::types::{
+        ErlDrvEntry, ErlDrvEvent, ErlDrvEvent_, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ,
+        ERL_DRV_WRITE,
+    };
     use beam_process::PortId;
     use beam_term::prelude::{is_atom, make_atom, AtomTable};
     use libc::c_int;
@@ -471,6 +616,7 @@ mod tests {
     use std::thread::sleep;
     use std::time::Duration;
 
+    use crate::abi::DriverTable;
     use crate::driver::PortArms;
     use crate::poller::{Interest, Poller};
     use crate::queue::ByteQueue;
@@ -755,5 +901,166 @@ mod tests {
             host.send_term(core::ptr::null_mut(), None, beam_term::prelude::NIL),
             -1
         );
+    }
+
+    // -------------------------------------------------------------------------------------------
+    // The process-global driver-registry hooks
+    // -------------------------------------------------------------------------------------------
+
+    /// A statically named `ErlDrvEntry` with no `init` — the shape `add_driver_entry` records.
+    ///
+    /// A distinct `'static` name per test keeps the shared process-global [`DriverTable`] from
+    /// letting two parallel tests see each other's registrations (cargo runs them concurrently).
+    fn named_entry(name: *const u8) -> ErlDrvEntry {
+        ErlDrvEntry {
+            driver_name: name as *mut libc::c_char,
+            ..ErlDrvEntry::default()
+        }
+    }
+
+    #[test]
+    fn add_and_remove_driver_entry_reach_the_process_global_table() {
+        const NAME: &[u8] = b"host_test_registry\0";
+        let mut host = new_host();
+        let mut entry = named_entry(NAME.as_ptr());
+
+        // `remove_driver_entry` of an address the table has never seen is the C's `0`.
+        assert_eq!(
+            DriverHost::remove_driver_entry(&mut host, &mut entry),
+            0,
+            "an unregistered entry is the C's 0 (not found)"
+        );
+
+        // `add_driver_entry` records it in the process-global table and answers `0`.
+        assert_eq!(
+            DriverHost::add_driver_entry(&mut host, &mut entry),
+            0,
+            "recording the entry is the C's void-wrapper success"
+        );
+        assert_eq!(
+            DriverTable::global()
+                .lookup("host_test_registry")
+                .map(|driver| driver.entry),
+            Some(&mut entry as *mut ErlDrvEntry),
+            "the entry reached the process-global table"
+        );
+
+        // Removing the same pointer answers the C's `1`, and a second removal reports `0`.
+        assert_eq!(
+            DriverHost::remove_driver_entry(&mut host, &mut entry),
+            1,
+            "removed"
+        );
+        assert!(DriverTable::global().lookup("host_test_registry").is_none());
+        assert_eq!(
+            DriverHost::remove_driver_entry(&mut host, &mut entry),
+            0,
+            "not found any more"
+        );
+    }
+
+    #[test]
+    fn lock_driver_reports_the_ports_own_driver_handle() {
+        // A bare host carries no driver identity: the C's statically-linked case (`handle == NULL`).
+        let mut bare = new_host();
+        assert_eq!(
+            DriverHost::lock_driver(&mut bare, core::ptr::null_mut()),
+            -1,
+            "a host with no driver identity answers the C's -1"
+        );
+
+        // A host carrying a dynamically loaded identity answers `0` even though the name is not
+        // registered in the process-global table — the C consults the port's own driver, never
+        // `driver_list`.
+        let mut loaded =
+            AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "lock_driver_probe", true)
+                .expect("a driver heap");
+        assert_eq!(
+            DriverHost::lock_driver(&mut loaded, core::ptr::null_mut()),
+            0,
+            "a loaded driver locks regardless of any global registration"
+        );
+
+        // An identity that is statically linked is still the C's `-1`.
+        let mut statically =
+            AbiHost::for_driver(Box::new(LocalAtomPortHost::new()), "lock_driver_probe", false)
+                .expect("a driver heap");
+        assert_eq!(
+            DriverHost::lock_driver(&mut statically, core::ptr::null_mut()),
+            -1,
+            "a statically linked driver has no handle to lock"
+        );
+    }
+
+    #[test]
+    fn create_port_is_the_invalid_port_sentinel() {
+        let mut host = new_host();
+        let name = c"host_driver";
+        assert_eq!(
+            DriverHost::create_port(
+                &mut host,
+                core::ptr::null_mut(),
+                1,
+                name.as_ptr() as *mut libc::c_char,
+                core::ptr::null_mut(),
+            ),
+            ERTS_INVALID_ERL_DRV_PORT,
+            "a request the host cannot honour answers the C's single failure value"
+        );
+    }
+
+    /// The two **no-port** slots reach a host **only** inside a `beam_abi::with_current_host`
+    /// scope — the thread-local publication the adapter installs around every driver callback.
+    #[test]
+    fn the_no_port_slots_reach_the_host_only_inside_a_publication() {
+        const NAME: &[u8] = b"host_test_publication\0";
+        let table = DriverTable::global();
+        let api = beam_abi::driver::drv::driver_api_table();
+        let add = api.add_driver_entry.expect("the slot is populated");
+        let remove = api.remove_driver_entry.expect("the slot is populated");
+
+        let mut host = new_host();
+        let mut entry = named_entry(NAME.as_ptr());
+
+        // Outside any publication there is no current host: the slots answer the C's failure
+        // values without touching anything.
+        // SAFETY: `entry` is a live `ErlDrvEntry` for this test's whole body; the pointer is only
+        // forwarded to a host, and there is none.
+        unsafe { add(&mut entry) };
+        assert!(
+            table.lookup("host_test_publication").is_none(),
+            "with no published host nothing is recorded"
+        );
+        // SAFETY: as above.
+        assert_eq!(
+            unsafe { remove(&mut entry) },
+            0,
+            "with no published host the removal is the C's 0"
+        );
+
+        // Inside the publication the port's own host handles the request.
+        beam_abi::with_current_host(&mut host, || {
+            // SAFETY: `entry` is live; the published host records its address.
+            unsafe { add(&mut entry) };
+            assert!(
+                table.lookup("host_test_publication").is_some(),
+                "the published host recorded the entry"
+            );
+        });
+        assert!(
+            table.lookup("host_test_publication").is_some(),
+            "the registration outlives the publication"
+        );
+
+        // The publication is gone again, so the entry can only be removed inside one.
+        beam_abi::with_current_host(&mut host, || {
+            // SAFETY: `entry` is live; the published host removes its address.
+            assert_eq!(
+                unsafe { remove(&mut entry) },
+                1,
+                "the published host removes the entry"
+            );
+        });
+        assert!(table.lookup("host_test_publication").is_none());
     }
 }
