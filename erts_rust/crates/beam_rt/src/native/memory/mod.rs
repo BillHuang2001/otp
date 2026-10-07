@@ -639,8 +639,12 @@ impl RuntimeContext<'_> {
     }
 
     /// `pid`'s observables, or `None` when the process table has no such process.
+    ///
+    /// The table read is [`RuntimeContext::process_table`] — the *pass* table when this
+    /// context is a scheduler slice (the runtime's own table is an empty placeholder then),
+    /// so a process probing **another** scheduled process sees it.
     fn snapshot(&self, pid: ProcessId) -> Option<Snapshot> {
-        let table = self.runtime.processes();
+        let table = self.process_table();
         let process = table.get(pid)?;
         let atoms = self.runtime.code_server.atoms();
         let registered_name = table

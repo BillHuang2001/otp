@@ -21,6 +21,7 @@
 //! | `erts_internal:term_type/1` | `erl_map.c:3336-3417` | `1`→`fixnum`, `a`→`atom`, `{x}`→`tuple`, `#{a=>1}`→`flatmap`, `self()`→`pid`, `1.0`→`hfloat`, `[]`→`nil`, `[1,2]`→`list`, `fun erts_internal:term_type/1`→`export`, `1 bsl 100`→`bignum`, `<a wire external pid/port/reference>`→`external_pid`/`external_port`/`external_reference` |
 //! | `erts_internal:get_dflags/0` | `dist.c:5566-5592` | `{erts_dflags,468283523004,17230663572,468283523004,8396866,8192}` — the same fixed record on a non-distributed and on a `-sname` node |
 //! | `erts_internal:beamfile_chunk/2` | `beam_bif_load.c:165-201` | `byte_size(beamfile_chunk(element(2,code:get_object_code(lists)),"Code"))`→`30110`; `"Nope"`→`undefined`; `"code"`→`undefined`; `5`/`"Code"`→`error:badarg` |
+//! | `erts_internal:beamfile_module_md5/1` | `beam_bif_load.c:203-229` | `beamfile_module_md5(element(2,code:get_object_code(slice)))`→`<<2,133,170,13,173,204,31,130,161,1,140,211,209,13,116,36>>`; `<<"garbage">>`→`undefined`; `5`→`error:badarg` |
 //! | `erts_internal:map_to_tuple_keys/1` | `erl_map.c:3318-3328` | `#{a=>1,b=>2,c=>3}`→a keys tuple; `#{}`→`{}`; a hashmap→`badarg`; `[1,2]`→`error:{badmap,[1,2]}` |
 //! | `erts_internal:binary_to_integer/2` | `big.c:4186-4232` (`chars_to_integer`) | `<<"ff">>,16`→`255`; `<<"-ff">>,16`→`-255`; `<<>>,10`→`badarg`; `<<"10">>,37`→`badarg`; 19 digits→`big` |
 //! | `erts_internal:list_to_integer/2` | `big.c:4234-4355` | `"10",10`→`{10,[]}`; `"12ab",10`→`{12,"ab"}`; `[]`→`no_integer`; `foo`→`not_a_list`; 18 nines→`big` |
@@ -64,13 +65,15 @@
 //! microstate accounting, code purge, tracing, atomics/counters resources, the
 //! system-task protocol, …).
 //!
-//! `erts_internal:beamfile_module_md5/1` (`beam_bif_load.c:205-229`) is deliberately
-//! still unclaimed: the digest is the one `crate::context::bridges::module_md5`
-//! already computes for the `NEW_FUN_EXT` identity, but that helper is `pub(super)`
-//! to the `context` module and its body is a real chunk-layout digest (the `FunT`
-//! 24-byte record walk with `OldUniq` forced to zero, `beam_file.c:1751-1829`), not a
-//! lookup of a stored checksum — re-deriving it here would duplicate that parsing, and
-//! this file may not change the helper's visibility.
+//! `erts_internal:beamfile_module_md5/1` (`beam_bif_load.c:203-229`) returns the module
+//! checksum as a **bare 16-byte binary** (the C's `erts_new_binary_from_data(sizeof
+//! beam.checksum, beam.checksum)`), or the atom `undefined` for an image `beamfile_read`
+//! cannot parse — *not* `beam_lib:md5/1`'s `{ok, {Module, Md5}}` wrapper, which is the
+//! Erlang-side shape. The digest is the one [`crate::context::module_md5`] already computes
+//! for the `NEW_FUN_EXT` identity (the `FunT` 24-byte record walk with `OldUniq` forced to
+//! zero, `beam_file.c:1751-1829`), so this BIF reuses it rather than re-deriving the
+//! chunk-layout parse. The image is read from the argument **binary**, never the loaded
+//! module.
 
 use beam_common::{BeamError, ExitReason, LiveReason, Raise, Result};
 use beam_engine::terms;
@@ -221,6 +224,7 @@ impl RuntimeContext<'_> {
             ("term_type", 1) => Some(self.erts_term_type(args)),
             ("get_dflags", 0) => Some(self.erts_get_dflags()),
             ("beamfile_chunk", 2) => Some(self.erts_beamfile_chunk(args)),
+            ("beamfile_module_md5", 1) => Some(self.erts_beamfile_module_md5(args)),
             ("map_to_tuple_keys", 1) => Some(self.erts_map_to_tuple_keys(args)),
             ("binary_to_integer", 2) => Some(self.erts_binary_to_integer(args)),
             ("list_to_integer", 2) => Some(self.erts_list_to_integer(args)),
@@ -392,8 +396,40 @@ impl RuntimeContext<'_> {
         }
     }
 
-    // -- erts_internal:no_aux_work_threads/0 ---------------------------------
+    // -- erts_internal:beamfile_module_md5/1 --------------------------------
 
+    /// `erts_internal:beamfile_module_md5/1` — the module checksum of a `.beam` image
+    /// (`beam_bif_load.c:203-229`).
+    ///
+    /// The C reads the whole image with `beamfile_read` and, on success, returns
+    /// `erts_new_binary_from_data(sizeof beam.checksum, beam.checksum)` — a **bare**
+    /// 16-byte binary; on any read failure it returns the atom `undefined`. This is *not*
+    /// `beam_lib:md5/1`'s `{ok, {Module, Md5}}` wrapper (that is Erlang-side sugar over
+    /// this BIF plus `module_info`), and the oracle confirms the bare-binary shape:
+    /// `erts_internal:beamfile_module_md5(element(2, code:get_object_code(slice)))` ⇒
+    /// `<<2,133,170,13,173,204,31,130,161,1,140,211,209,13,116,36>>`.
+    ///
+    /// The checksum itself is [`crate::context::module_md5`] — the same chunk-layout digest
+    /// the `NEW_FUN_EXT` identity uses (`beam_file.c:1751-1829`), *not* a stored value.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the first argument is not a byte-aligned binary — the C's
+    /// `erts_get_aligned_binary_bytes` `BADARG`. An image the digest cannot parse (a
+    /// malformed container, or a `FunT` chunk that is not `4 + 24n` bytes) is the C's
+    /// `beamfile_read != SUCCESS` case and answers the atom `undefined`, never an error.
+    fn erts_beamfile_module_md5(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let binary = *args.first().ok_or(BeamError::BadArg)?;
+        let bytes = terms::binary_bytes(binary).map_err(|_| BeamError::BadArg)?;
+        match crate::context::module_md5(bytes) {
+            // The digest on the runtime's pointer-stable `-eval` heap: the same
+            // `beam_codec::term::make_binary` writer `beamfile_chunk/2` uses.
+            Ok(md5) => beam_codec::term::make_binary(self.eval_heap(), &md5),
+            Err(_) => self.atom("undefined"),
+        }
+    }
+
+    // -- erts_internal:no_aux_work_threads/0 ---------------------------------
     /// `erts_internal:no_aux_work_threads/0` — the auxiliary work-thread count
     /// (`erl_process.c:9234-9237`, set at `:6219-6223`).
     ///
@@ -1535,6 +1571,69 @@ mod tests {
         let last = erts(&mut runtime, "beamfile_chunk", &[duplicated, test])
             .expect("the duplicated chunk");
         assert_eq!(terms::binary_bytes(last).expect("a binary"), [9, 9]);
+    }
+
+    // -- erts_internal:beamfile_module_md5/1 ----------------------------------
+
+    /// Oracle: `erts_internal:beamfile_module_md5(element(2,
+    /// code:get_object_code(slice)))` ⇒ `<<2,133,170,13,173,204,31,130,161,1,140,211,209,
+    /// 13,116,36>>` — the module checksum as a **bare** 16-byte binary (the C's
+    /// `erts_new_binary_from_data`; `beam_lib:md5/1`'s `{ok,{Module,Md5}}` wrapper is the
+    /// Erlang-side shape, not this BIF's).
+    #[test]
+    fn beamfile_module_md5_answers_the_bare_checksum_binary_of_a_real_beam() {
+        let bytes = std::fs::read(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_loader/tests/fixtures/slice.beam"
+        ))
+        .expect("the slice fixture");
+        let mut runtime = runtime();
+        let beam = big_binary(&mut runtime, &bytes);
+
+        let md5 = erts(&mut runtime, "beamfile_module_md5", &[beam]).expect("the checksum");
+        assert_eq!(
+            terms::binary_bytes(md5).expect("a binary"),
+            [2, 133, 170, 13, 173, 204, 31, 130, 161, 1, 140, 211, 209, 13, 116, 36],
+        );
+    }
+
+    /// Oracle: an image `beamfile_read` cannot parse answers `undefined` — `<<"garbage">>`,
+    /// a well-formed `FOR1` whose form type is not `BEAM`, and a `FunT` chunk that is not
+    /// `4 + 24n` bytes (`BEAMFILE_READ_CORRUPT_LAMBDA_TABLE`). A non-binary first argument
+    /// raises `error:badarg` (`erts_get_aligned_binary_bytes`).
+    #[test]
+    fn beamfile_module_md5_answers_undefined_for_unreadable_images_and_rejects_non_binaries() {
+        let mut runtime = runtime();
+
+        let garbage = big_binary(&mut runtime, b"garbage");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_module_md5", &[garbage]),
+            "undefined"
+        );
+
+        let non_beam = big_binary(&mut runtime, b"FOR1\x00\x00\x00\x04NOPE");
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_module_md5", &[non_beam]),
+            "undefined"
+        );
+
+        // A short `FunT` payload: a *parseable* container whose digest is the corrupt-lambda
+        // read failure — the C's `beamfile_read != SUCCESS` ⇒ `undefined`, **not** a raise.
+        let corrupt = big_binary(&mut runtime, &iff_image(&[(b"FunT", &[0, 0, 0, 1, 1, 2, 3])]));
+        assert_eq!(
+            ok_name(&mut runtime, "beamfile_module_md5", &[corrupt]),
+            "undefined"
+        );
+
+        for bad in [make_small(5), atom(&mut runtime, "foo")] {
+            assert!(
+                matches!(
+                    erts(&mut runtime, "beamfile_module_md5", &[bad]),
+                    Err(BeamError::BadArg)
+                ),
+                "{bad:?}"
+            );
+        }
     }
 
     // -- erts_internal:no_aux_work_threads/0 ----------------------------------

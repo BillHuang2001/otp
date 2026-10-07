@@ -80,7 +80,7 @@ use crate::port::RuntimePorts;
 use crate::runner::RunnerState;
 use crate::runtime::Runtime;
 
-pub(crate) use self::bridges::PendingInterner;
+pub(crate) use self::bridges::{module_md5, PendingInterner};
 use self::bridges::{
     descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
     SharedSink,
@@ -261,6 +261,22 @@ impl<'a> RuntimeContext<'a> {
         match self.mailbox_table {
             Some(ref mut table) => &mut **table,
             None => &mut self.runtime.processes,
+        }
+    }
+
+    /// The read-only twin of [`RuntimeContext::process_table_mut`]: the table a pid is
+    /// resolved against — the caller-supplied pass table when this context is a scheduler
+    /// slice, else the runtime's own.
+    ///
+    /// A scheduler pass **moves** the process table out of the runtime
+    /// ([`Runtime::take_processes`](crate::runtime::Runtime); the runtime keeps an empty
+    /// placeholder), so a read that went to `runtime.processes()` unconditionally would see
+    /// no process at all while code runs. The pass table is the one holding the live
+    /// processes, and it is what `process_info/2`'s snapshot must read.
+    pub(crate) fn process_table(&self) -> &ProcessTable {
+        match &self.mailbox_table {
+            Some(table) => &**table,
+            None => self.runtime.processes(),
         }
     }
 
