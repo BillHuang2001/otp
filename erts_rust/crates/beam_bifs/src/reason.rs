@@ -126,6 +126,43 @@ fn error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
+/// `erlang:error/3` — as `error/1` with the argument list and `error_info`
+/// options folded into the **stacktrace** only.
+///
+/// The reason is the **first** argument, unchanged, for both shapes the C
+/// produces (`error_3`, `../../erts/emulator/beam/bif.c:1462`). `Args` and
+/// `Options` never become the reason and are **not validated**:
+///
+/// - the C scans `Options` for a run of `{error_info, Map}` 2-tuples and, on
+///   anything else (a non-list, an improper list, an empty list, an illegal
+///   element, a non-map `error_info`), silently falls back to the `error/2`
+///   shape — no `badarg`;
+/// - `Args` is stored verbatim, whatever its shape.
+///
+/// Either way the caught value is `CAR(fvalue)` = the first argument
+/// (`beam_common.c:478-490`, `EXC_ERROR_2`/`EXC_ERROR_3`), so all of this is
+/// unobservable in the reason and the BIF degenerates to `error/1`. Oracle
+/// probes (erts-17.1, compiled module):
+///
+/// ```text
+/// erlang:error(foo, [1,2], [])                 ⇒ error:foo
+/// erlang:error({bad,x}, [1,2], [])             ⇒ error:{bad,x}
+/// erlang:error(foo, [], [{error_info, #{}}])   ⇒ error:foo
+/// erlang:error(foo, notalist, [])              ⇒ error:foo
+/// erlang:error(foo, [], notalist)              ⇒ error:foo
+/// erlang:error(foo, [], [{bogus,1}])           ⇒ error:foo
+/// erlang:error(foo, [], [bogus])               ⇒ error:foo
+/// erlang:error(foo, [], [{error_info, bogus}]) ⇒ error:foo
+/// ```
+///
+/// They also pin `error/3`'s **non-atom** behaviour: like `error/1`, a non-atom
+/// reason rides the [`Raise::live_reason`](beam_common::Raise::live_reason) slot
+/// (see [`raise`]) — `error({bad,x}, [1,2], [])` reports `error:{bad,x}`, not
+/// `error:structured`.
+fn error_3(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
+}
+
 /// `erlang:exit/1`.
 fn exit_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Exit, args[0], ctx.atoms()))
@@ -157,10 +194,11 @@ fn nif_error_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     Err(raise(ExceptionClass::Error, args[0], ctx.atoms()))
 }
 
-/// Registers `erlang:error/1,2`, `exit/1`, `throw/1` and `nif_error/1,2`.
+/// Registers `erlang:error/1,2,3`, `exit/1`, `throw/1` and `nif_error/1,2`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "error", 1, error_1);
     reg.register("erlang", "error", 2, error_2);
+    reg.register("erlang", "error", 3, error_3);
     reg.register("erlang", "exit", 1, exit_1);
     reg.register("erlang", "throw", 1, throw_1);
     reg.register("erlang", "nif_error", 1, nif_error_1);
@@ -278,6 +316,64 @@ mod tests {
         assert_eq!(
             raise_of(exit_1, shutdown),
             (ExceptionClass::Exit, ExitReason::Shutdown)
+        );
+    }
+
+    #[test]
+    fn error_3_raises_the_first_argument_as_the_reason() {
+        // Oracle (erts-17.1, compiled module): `error_3`
+        // (`../../erts/emulator/beam/bif.c:1462`) stores `{Reason, Args}` or
+        // `{Reason, Args, ErrorInfo}`; `Args`/`Options` are never validated and
+        // the caught reason is always the first argument.
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = seeded();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let foo = ctx.atom("foo").expect("seeded");
+        let shutdown = ctx.atom("shutdown").expect("seeded");
+        let args = ctx.list(&[make_small(1), make_small(2)]).expect("fits");
+        // A 2-tuple: neither a proper option list nor a list item — the C
+        // breaks out of its scan and falls back to the `error/2` shape.
+        let tuple = ctx.tuple(&[foo, make_small(1)]).expect("fits");
+
+        let classify = |result: Result<Eterm>| match result {
+            Err(BeamError::Raise(raise)) => {
+                let live = raise
+                    .live_reason()
+                    .and_then(|l| l.downcast_ref::<Eterm>().copied());
+                (raise.class, raise.reason, live)
+            }
+            other => panic!("expected a raise, got {other:?}"),
+        };
+
+        // `erlang:error(foo, [1,2], [])` ⇒ `error:foo`.
+        assert_eq!(
+            classify(error_3(&mut ctx, &[foo, args, NIL])),
+            (ExceptionClass::Error, ExitReason::atom("foo"), None)
+        );
+        // A non-list `Args` ⇒ still `error:foo` (never `badarg`).
+        assert_eq!(
+            classify(error_3(&mut ctx, &[foo, make_small(7), NIL])),
+            (ExceptionClass::Error, ExitReason::atom("foo"), None)
+        );
+        // A non-list `Options` ⇒ still `error:foo`.
+        assert_eq!(
+            classify(error_3(&mut ctx, &[foo, NIL, make_small(7)])),
+            (ExceptionClass::Error, ExitReason::atom("foo"), None)
+        );
+        // A malformed option list (improper / bogus element) ⇒ still `error:foo`.
+        assert_eq!(
+            classify(error_3(&mut ctx, &[foo, NIL, tuple])),
+            (ExceptionClass::Error, ExitReason::atom("foo"), None)
+        );
+        // A non-atom reason rides the live slot, exactly as `error/1`.
+        assert_eq!(
+            classify(error_3(&mut ctx, &[tuple, args, NIL])),
+            (ExceptionClass::Error, ExitReason::Structured, Some(tuple))
+        );
+        // A well-known atom keeps its `ExitReason` variant and no live slot.
+        assert_eq!(
+            classify(error_3(&mut ctx, &[shutdown, NIL, NIL])),
+            (ExceptionClass::Error, ExitReason::Shutdown, None)
         );
     }
 
@@ -451,10 +547,11 @@ mod tests {
         register(&mut reg);
         assert!(reg.contains("erlang", "error", 1));
         assert!(reg.contains("erlang", "error", 2));
+        assert!(reg.contains("erlang", "error", 3));
         assert!(reg.contains("erlang", "exit", 1));
         assert!(reg.contains("erlang", "throw", 1));
         assert!(reg.contains("erlang", "nif_error", 1));
         assert!(reg.contains("erlang", "nif_error", 2));
-        assert_eq!(reg.len(), 6);
+        assert_eq!(reg.len(), 7);
     }
 }
