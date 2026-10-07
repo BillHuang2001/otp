@@ -15,7 +15,8 @@
 //! This module root owns only the shared helpers, the submodule wiring and the assembled table. The
 //! implementations live one file per responsibility, and each of those files also owns a
 //! `pub(super) const fn populate` that fills in **its own** slots — so a later workstream extends a
-//! family by editing that family's file, never this one:
+//! family by editing that family's file, never this one. `ENIF_API` chains the families
+//! innermost→outermost:
 //!
 //! | file | `enif_*` family |
 //! |---|---|
@@ -26,28 +27,29 @@
 //! | [`pred`] | `enif_is_*`, `enif_compare`, `enif_is_identical`, `enif_hash`, `enif_term_size`, `enif_term_type` |
 //! | [`proc`] | pid/port/self accessors and the atom-cache queries |
 //! | [`exception`] | `enif_make_badarg`, `enif_raise_exception`, `enif_has_pending_exception`, `enif_clear_env` |
+//! | [`threads`] | mutex/cond/rwlock/tsd/thread (a thin facade over [`crate::sync`]) |
+//! | [`ioq`] | the I/O queue and I/O vector family |
+//! | [`mapiter`] | the `enif_map_iterator_*` family |
+//! | [`time`] | time, env, system info, unique integers, timeslice, `dl*` |
+//! | [`resources`] | the resource-type family |
+//! | [`select`] | `enif_select` / `enif_select_x` |
+//! | [`process`] | monitors, send, port command, whereis, `enif_schedule_nif` |
+//! | [`envs`] | `enif_free_env` / `enif_make_copy` / `enif_priv_data` |
+//! | [`variadic`] | the seven C-variadic slots (C shim behind `cfg(beam_abi_variadic_shim)`) |
 //!
-//! # Families declared but not yet populated
+//! # The one slot left `None`
 //!
-//! [`threads`], [`ioq`], [`mapiter`], [`time`], [`resources`], [`select`], [`process`], [`envs`] and
-//! [`variadic`] are **pre-created stubs**: each documents exactly the slots it will own, and its
-//! `populate` is a no-op. The runtime subsystems that own them (`beam_rt`/`beam_bifs`/`beam_io`) are
-//! not wired to this crate yet, so every slot they own stays `None`.
+//! `enif_alloc_env` is deliberately `None` (see [`envs`]): it takes **no argument**, so there is no
+//! handle to reach a [`super::host::NifHost`] through, and a crate-owned env could not intern atoms
+//! into the runtime's atom table (it would hand back a *wrong term*). A NIF that calls it fails
+//! **loudly** at `dlopen(RTLD_NOW)` with `undefined symbol: enif_alloc_env`.
 //!
-//! # Functions that stay `None` — and why
-//!
-//! Stable Rust cannot give a body to a **C-variadic** function (a `...` in a `fn` *definition* is a
-//! nightly-only feature). These six table slots are therefore left `None`:
-//!
-//! | slot | same need covered by |
-//! |---|---|
-//! | `enif_make_tuple` | `enif_make_tuple_from_array` |
-//! | `enif_make_list` | `enif_make_list_from_array` |
-//! | `enif_set_option` | (no non-variadic equivalent; unused on this runtime) |
-//! | `enif_fprintf` / `enif_snprintf` / `enif_vfprintf` / `enif_vsnprintf` | (formatting helpers) |
-//!
-//! `enif_make_existing_atom` / `enif_make_existing_atom_len` are **not** variadic; they belong to
-//! [`make`] and are still to be implemented.
+//! The seven **C-variadic** slots (`enif_make_tuple`, `enif_make_list`, `enif_set_option`,
+//! `enif_fprintf`, `enif_snprintf`, `enif_vfprintf`, `enif_vsnprintf`) cannot be defined in stable
+//! Rust (`...` in a `fn` *definition* is nightly-only, rust-lang/rust#44930), so [`variadic`] defines
+//! them in the C shim `csrc/nif_variadic.c`, which handles the `va_list` and forwards straight back
+//! into this crate's `#[no_mangle]` helpers. `build.rs` sets the cfg only when it could compile the
+//! shim; **without a C compiler those seven slots stay `None`**.
 //!
 //! # Honest limitations (never a wrong result)
 //!
@@ -59,7 +61,10 @@
 //! * **Map operations** use an empty `AtomTable` for the same reason; they are exact whenever the
 //!   key terms are not atoms (the overwhelmingly common NIF case, where the key is a term the NIF
 //!   was handed).
-//! * **Map iteration** is not implemented (hash-map iteration needs a dynamic work stack).
+//! * **No scheduler threads.** [`enif_thread_type`] reports only [`crate::sync`]'s answer —
+//!   `ERL_NIF_THR_UNDEFINED` for a foreign thread, `ERL_NIF_THR_OTHER` for a created one — and an
+//!   unnamed handle's `*_name` accessor returns `NULL` where the C returns the static string
+//!   `"unknown"`.
 //! * [`enif_make_binary`] builds an **on-heap** binary (off-heap refcounted binaries are a
 //!   `beam_alloc` concern not yet exposed here); [`enif_inspect_binary`] refuses a *bit*-offset base
 //!   instead of fabricating an unaligned pointer.

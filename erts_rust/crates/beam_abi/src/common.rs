@@ -82,7 +82,12 @@ pub struct ErlDrvSysInfo {
 #[repr(C)]
 #[derive(Copy, Clone, Debug)]
 pub struct ErlDrvThreadOpts {
-    /// Suggested stack size in bytes (0 = default).
+    /// Suggested stack size in **kilowords** (`-1` = the platform default).
+    ///
+    /// `erl_driver.md` (*ErlDrvThreadOpts*): "A suggestion, in kilowords, on how large a stack".
+    /// The C conversion is `ETHR_KW2B` = `KW * sizeof(void *) * 1024` (`ethread.h`), and `-1` is the
+    /// "use the platform default" sentinel the C stores when no suggestion is made
+    /// (`erl_drv_thread.c:591`).
     pub suggested_stack_size: c_int,
 }
 
