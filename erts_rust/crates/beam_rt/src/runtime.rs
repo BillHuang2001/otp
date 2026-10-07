@@ -2185,4 +2185,66 @@ mod tests {
         );
         assert!(rt.processes().get(receiver).is_some(), "it is still parked");
     }
+
+    // -- the CLI `run` action (`run_scheduled`) -------------------------------
+
+    /// A non-blocking export returns exactly what the single-pass `run_function` returns:
+    /// the result is recorded by the runner and handed back unchanged, so the CLI prints it
+    /// byte-identically (`run slice.beam slice:add/2 2 3` → `5`).
+    #[test]
+    fn run_scheduled_returns_a_non_blocking_export_unchanged() {
+        let mut rt = runtime();
+        let sum = rt
+            .run_scheduled(SLICE_BEAM, "add", 2, &[make_small(2), make_small(3)])
+            .expect("add/2 through the scheduler");
+        assert_eq!(signed_value(sum), 5);
+        let fib = rt
+            .run_scheduled(SLICE_BEAM, "fib", 1, &[make_small(10)])
+            .expect("fib/1 through the scheduler");
+        assert_eq!(signed_value(fib), 55);
+    }
+
+    /// A canonical `run` invocation — the file's own name is what the process is spawned as,
+    /// so the already-loaded module is reused (no code-path search) and the export is the one
+    /// the caller named.
+    #[test]
+    fn run_scheduled_spawns_the_file_s_own_module() {
+        let mut rt = runtime();
+        let module = rt.load_module(SLICE_BEAM).expect("load slice.beam");
+        let a = make_atom(module.atom_table.lookup("a").expect("a is interned"));
+        let picked = rt
+            .run_scheduled(SLICE_BEAM, "pick", 1, &[a])
+            .expect("pick(a) through the scheduler");
+        assert_eq!(signed_value(picked), 1);
+    }
+
+    /// A blocked export with nothing left that could wake it (empty run queue, no live port,
+    /// no pending timer) stops **immediately** with the single-pass `beam_engine::blocked`
+    /// diagnostic — never spun out to `RUN_DEADLINE`, never a wrong value. This is what keeps
+    /// `recv:wait/0` fast.
+    #[test]
+    fn run_scheduled_reports_a_quiescent_stall_immediately() {
+        let mut rt = runtime();
+        let started = Instant::now();
+        let error = rt
+            .run_scheduled(RECV_BEAM, "wait", 0, &[])
+            .expect_err("nothing can wake the receiver");
+        assert_eq!(error.to_string(), beam_engine::blocked().to_string(), "{error}");
+        assert!(
+            started.elapsed() < RUN_DEADLINE,
+            "a quiescent stall is reported at once, not after the deadline (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// An argument count that disagrees with the named arity is a caller bug, reported rather
+    /// than silently running a different function.
+    #[test]
+    fn run_scheduled_rejects_an_arity_mismatch() {
+        let mut rt = runtime();
+        let error = rt
+            .run_scheduled(SLICE_BEAM, "add", 3, &[make_small(1), make_small(2)])
+            .expect_err("two arguments for add/3");
+        assert!(error.to_string().contains("given 2 argument(s)"), "{error}");
+    }
 }
