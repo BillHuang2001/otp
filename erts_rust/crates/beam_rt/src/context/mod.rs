@@ -78,7 +78,8 @@ use crate::runtime::Runtime;
 
 pub(crate) use self::bridges::PendingInterner;
 use self::bridges::{
-    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SharedSink,
+    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
+    SharedSink,
 };
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
@@ -467,6 +468,10 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is `records:get_definition/2`, which needs the record-source bridge
         // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
         let uses_record_source = Self::uses_record_source(module, function, arity);
+        // Whether this is `erlang:send/2`/`erlang:'!'/2`, which need the message-delivery
+        // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
+        // the two cannot co-exist — see [`SendBridge`]).
+        let uses_send_hook = Self::uses_send_hook(module, function, arity);
         // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
         // distribution), read from the shared table *before* it is borrowed by the context.
         // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
@@ -579,6 +584,32 @@ impl<'a> RuntimeContext<'a> {
                     context = context.with_tables(tables);
                 }
                 registry.call(module, function, arity, &mut context, args)
+            } else if uses_send_hook {
+                // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
+                // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
+                // path, so nothing about delivery is re-implemented), making it mutually
+                // exclusive with the fun-caller/dict/NIF/record arms. A `send` applies no fun
+                // argument and touches no dictionary, so nothing is lost.
+                let mut bridge = SendBridge {
+                    runtime,
+                    output: output.clone(),
+                    mailbox_pid: *mailbox_pid,
+                    mailbox_table: mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: *may_pump_scheduler,
+                    current_module: caller_module,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_sender(&mut bridge)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -648,7 +679,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge needs `&mut Runtime` to store the loaded library, so it cannot co-exist with
     /// [`FunBridge`]'s `&mut Runtime` borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the three. `load_nif/2` takes no fun
+    /// [`Self::call_registered`] installs exactly one of the five. `load_nif/2` takes no fun
     /// argument and no dictionary, so nothing is lost.
     fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
         matches!((module, function, arity), ("erlang", "load_nif", 2))
@@ -659,10 +690,32 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge borrows the code server's module map (`&Runtime`), so it cannot co-exist
     /// with [`FunBridge`]'s `&mut Runtime` or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the four. `get_definition/2` takes no
+    /// [`Self::call_registered`] installs exactly one of the five. `get_definition/2` takes no
     /// fun argument and no dictionary, so nothing is lost.
     fn uses_record_source(module: &str, function: &str, arity: u32) -> bool {
         matches!((module, function, arity), ("records", "get_definition", 2))
+    }
+
+    /// Whether `(module, function, arity)` is a message-sending BIF that must run against the
+    /// [`SendBridge`] (the delivery seam).
+    ///
+    /// `erlang:send/2` and `erlang:'!'/2` are the *same* `beam_bifs` implementation, which
+    /// delivers through the [`SendHook`](beam_bifs::SendHook) (`beam_bifs/src/proc.rs`) — it
+    /// cannot reach a mailbox itself (workspace `CONTEXT.md` §3: an uninstalled hook raises
+    /// `unsupported_bif` rather than dropping the message). The bridge borrows the whole
+    /// `Runtime` (it delegates to [`RuntimeContext::send_message`]), so it cannot co-exist with
+    /// [`FunBridge`]'s borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
+    /// [`Self::call_registered`] installs exactly one of the five. A `send` applies no fun
+    /// argument and touches no dictionary, so nothing is lost.
+    ///
+    /// The compiled `Dest ! Msg` operator does **not** come through here: the BEAM compiler
+    /// emits the `send` instruction, served by
+    /// [`ExecutionContext::send_message`](beam_engine::ExecutionContext::send_message)
+    /// directly. This predicate is for the `erlang:send/2`/`erlang:'!'/2` *BIF call* — which is
+    /// what `erlang:send(Pid, Msg)` compiles to, and what the `-eval` evaluator dispatches for
+    /// the same call.
+    fn uses_send_hook(module: &str, function: &str, arity: u32) -> bool {
+        matches!((module, function, arity), ("erlang", "send", 2) | ("erlang", "!", 2))
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
