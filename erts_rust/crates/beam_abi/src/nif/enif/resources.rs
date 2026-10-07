@@ -26,14 +26,17 @@
 //!   `tried == TAKEOVER`.
 //! * **A real refcounted allocation.** `enif_alloc_resource` `malloc`s one block: a 32-byte,
 //!   16-byte-aligned header (refcount + type pointer + payload size) followed by the zeroed payload.
-//!   `enif_keep_resource`/`enif_release_resource` are atomic refcount operations and the last release
-//!   runs the type's `dtor` with a live environment and frees the block. `enif_sizeof_resource`
-//!   returns the payload size the block was allocated with (measured: `13` for `enif_alloc_resource(…,
-//!   13)`, and also `13` for a type carrying a `down` callback, whose C path returns the recorded
-//!   *user* data size).
+//!   `enif_keep_resource`/`enif_release_resource` are atomic refcount operations; **an exporting call
+//!   (`enif_make_resource` / `enif_make_resource_binary`) takes a reference for the term it mints**
+//!   — exactly the reference the C's magic reference holds — and the last release runs the type's
+//!   `dtor` with a live environment and frees the block. `enif_sizeof_resource` returns the payload
+//!   size the block was allocated with (measured: `13` for `enif_alloc_resource(…, 13)`, and also `13`
+//!   for a type carrying a `down` callback, whose C path returns the recorded *user* data size).
 //! * **`enif_get_resource` matches the measured oracle:** it writes `*objp` and returns `1` only for a
 //!   resource term of that exact type, and returns `0` (leaving `*objp` untouched) for a term of
-//!   another resource type, for a plain term, or for a non-term word.
+//!   another resource type, for a plain term, or for a non-term word. Because a resource term holds a
+//!   reference (point 3 below), a term that was released by its NIF still resolves — exactly as on the
+//!   oracle.
 //!
 //! # Documented substitutions (this crate has no `ERTS_MAGIC_REF` tag, no GC and no module identity)
 //!
@@ -52,19 +55,29 @@
 //!    returned by `enif_make_resource_binary` yields `1` and the resource object. So the term built
 //!    here is registered as well. (Its *bytes* are copied onto the heap; the C zero-copies the
 //!    caller's buffer into a refc binary. The bytes are the same; only the aliasing differs.)
-//! 3. **Liveness, and the destructor's timing.** An entry records the object but does **not** hold a
-//!    reference: this crate has no GC and therefore no "term died" signal, so a reference taken by
-//!    `enif_make_resource` could never be dropped. Consequence, and the honest limit of this
-//!    substitution: `enif_release_resource` down to zero frees the object *immediately* and
-//!    invalidates every term that designated it — `enif_get_resource` then returns `0` for a stale
-//!    term, which is exactly the documented behaviour of a stale resource term, only reached earlier
-//!    than the C reaches it (the C keeps the object alive while a resource term does).
+//! 3. **Liveness: a resource TERM holds its own reference; the destructor's timing.** An exporting
+//!    call (`enif_make_resource` / `enif_make_resource_binary`) takes **one extra reference** on the
+//!    object for the term it returns — exactly the reference the C's magic reference holds
+//!    (`erl_nif.c` `erts_bld_resource_ref` → `erts_mk_magic_ref` → `erts_bin_inc_refc`). A
+//!    released-but-term-wrapped object therefore stays alive and `enif_get_resource` keeps resolving
+//!    it to a live payload. Measured on the oracle: `alloc → enif_make_resource → release →
+//!    enif_get_resource` reads back the `42` the NIF wrote (and the same for the
+//!    `enif_make_resource_binary` path), where a runtime that frees at refcount zero would hand the
+//!    NIF a dangling pointer.
+//!    **The documented deviation from C:** the C drops that reference when the term is
+//!    garbage-collected; this crate has no GC and no "term died" signal, so the term's reference is
+//!    **never dropped**. An object that has ever been exposed as a resource term is therefore
+//!    retained — block and payload — for the process lifetime, and its `dtor` does not run. That is a
+//!    bounded, deliberate leak, and it is the *only* sound choice available: the alternative (freeing
+//!    at refcount zero) makes `enif_get_resource` hand a NIF a freed pointer, i.e. a *wrong value*,
+//!    which this crate never does. An object that no term holds is released and destroyed normally.
 //!    The destructor itself is **run synchronously** on the release that takes the reference count to
 //!    zero — exactly once per object, never while a `keep` is outstanding, and never for a `NULL`
 //!    release. Measured on the oracle, the C's destructor is *asynchronous*: after a release to zero
 //!    `dtor_count` still reads `0` and only reads `1` a moment later (the object is decoupled and
-//!    freed off the releasing thread). The **count and ordering** of destructor invocations is
-//!    therefore the same as the oracle's; the *timing* is deterministic here instead of GC-driven.
+//!    freed off the releasing thread — a misc aux-work thread). The **count and ordering** of
+//!    destructor invocations is therefore the same as the oracle's; only the *timing* differs (it is
+//!    deterministic here, GC/aux-work-driven there).
 //! 4. **The type's identity is its name.** The C keys a resource type by `(module, name)` and takes
 //!    the module from the calling module instance (`env->mod_nif->mod->module`); `enif_open_resource_type`
 //!    additionally *asserts* `module_str == NULL`. The env handed to a `load`/NIF call here carries no
@@ -258,8 +271,14 @@ impl Registry {
         self.terms.get(&word).copied()
     }
 
-    /// Drop every term binding to `obj` — called as the object is destroyed, so a stale term resolves
-    /// to nothing instead of a dangling payload pointer.
+    /// Drop every term binding to `obj` — called as the object is destroyed, so a term that still
+    /// designates it resolves to nothing instead of a dangling payload pointer.
+    ///
+    /// An object exported as a resource term holds its own reference (module docs, point 3), so a
+    /// normal alloc/export/release sequence never reaches here with bindings outstanding; this fires
+    /// for a caller-error over-release (one release more than the object has references), which the C
+    /// leaves undefined. Cleaning the bindings keeps that caller error from becoming a dangling
+    /// pointer in the Rust runtime.
     fn forget_object(&mut self, obj: *mut c_void) {
         self.terms.retain(|_, r| r.obj != obj);
     }
@@ -547,33 +566,51 @@ pub unsafe extern "C" fn enif_alloc_resource(
     }
 }
 
+/// Take one extra reference on a live resource object — the `erts_bin_inc_refc` increment that
+/// `enif_keep_resource` and every exporting call (`enif_make_resource` /
+/// `enif_make_resource_binary`, via the C's `erts_bld_resource_ref`) perform.
+///
+/// # Safety
+///
+/// `obj` must be a live payload pointer from [`enif_alloc_resource`] with a non-zero reference count.
+#[inline]
+unsafe fn retain_object(obj: *mut c_void) {
+    // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it
+    // and lies in the same live block (caller contract).
+    let header = unsafe { header_ptr(obj) };
+    // SAFETY: `header` points at a live block whose count is non-zero (caller contract).
+    unsafe { (*header).refcount.fetch_add(1, Ordering::Relaxed) };
+}
+
 /// `void enif_keep_resource(void* obj);`
 ///
 /// # Safety
 ///
-/// `obj` must be a live payload pointer from [`enif_alloc_resource`] (or null, which is ignored).
+/// `obj` must be a live payload pointer from [`enif_alloc_resource`] (or null, which is ignored —
+/// the C would dereference it).
 #[no_mangle]
 pub unsafe extern "C" fn enif_keep_resource(obj: *mut c_void) {
     if obj.is_null() {
         return;
     }
-    // SAFETY: `obj` is a payload pointer, so its header is the `RESOURCE_HEADER_SIZE` bytes before it.
-    let header = unsafe { header_ptr(obj) };
-    // SAFETY: `header` points at a live block whose count is non-zero.
-    unsafe { (*header).refcount.fetch_add(1, Ordering::Relaxed) };
+    // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract); null
+    // was handled above.
+    unsafe { retain_object(obj) };
 }
 
 /// `void enif_release_resource(void* obj);`
 ///
 /// Drops one reference; the release that reaches zero runs the type's `dtor` (with a live environment
-/// built from the type's host) and frees the block.
+/// built from the type's host) and frees the block. An object that has been exported as a resource
+/// term holds one more reference (see the module docs, point 3), so releasing the allocator's
+/// reference leaves it alive — exactly as on the oracle.
 ///
 /// # Safety
 ///
 /// `obj` must be a payload pointer from [`enif_alloc_resource`] with an outstanding reference (or
-/// null, which is ignored). A release without a matching alloc/keep — in particular a double release
-/// of the same pointer — is a caller error and is **not** defended against, exactly as in the C
-/// (`erl_nif.c:3170` asserts the count is non-zero).
+/// null, which is ignored — the C would dereference it). A release without a matching alloc/keep —
+/// in particular a double release of the same pointer — is a caller error and is **not** defended
+/// against, exactly as in the C (`erl_nif.c:3170` asserts the count is non-zero).
 #[no_mangle]
 pub unsafe extern "C" fn enif_release_resource(obj: *mut c_void) {
     if obj.is_null() {
@@ -693,6 +730,10 @@ fn mint_resource_ref(e: &mut NifEnv) -> Option<Eterm> {
 /// it is `None` by default, and the real runtime leaves it at that default, which made this whole
 /// call raise `badarg` there.
 ///
+/// The minted term takes **its own reference** on `obj` (the C's `erts_bld_resource_ref` →
+/// `erts_mk_magic_ref`), so a later `enif_release_resource` of the allocator's reference does not free
+/// the block while the term is observable (module docs, point 3).
+///
 /// # Safety
 ///
 /// `env` must be a live env; `obj` must be a live payload pointer from [`enif_alloc_resource`].
@@ -706,7 +747,8 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     }
     let Some(reference) = mint_resource_ref(e) else {
         // The host heap cannot fit a four-word reference term; fail loudly rather than minting a
-        // term that would not designate anything.
+        // term that would not designate anything. (No reference is taken, so the caller's single
+        // release still frees the block — the term was never created.)
         return bare_badarg();
     };
     // SAFETY: `obj` is a payload pointer, so its header is in the same live block.
@@ -714,6 +756,10 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
     with_registry(|r| {
         r.bind_term(reference.raw(), ResourceRef { ty, obj });
     });
+    // The term now owns a reference — the reference the C's magic ref holds. It is never released
+    // (there is no GC to collect the term); see the module docs, point 3.
+    // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
+    unsafe { retain_object(obj) };
     n(reference)
 }
 
@@ -722,7 +768,10 @@ pub unsafe extern "C" fn enif_make_resource(env: *mut ErlNifEnv, obj: *mut c_voi
 /// Builds an **on-heap** binary holding a copy of `data[0..size]` and records the term as a resource
 /// handle of `obj` — the oracle returns `1` from `enif_get_resource` on such a term (measured). The
 /// documented C contract that `data` must stay readable until the destructor runs is therefore
-/// *relaxed* here (the bytes are copied); the bytes a NIF observes are identical.
+/// *relaxed* here (the bytes are copied); the bytes a NIF observes are identical. Like
+/// [`enif_make_resource`], the minted term takes its own reference on `obj` (the C's magic binary
+/// does; measured on the oracle: `alloc → enif_make_resource_binary → release → enif_get_resource`
+/// still resolves, with no destructor run).
 ///
 /// # Safety
 ///
@@ -764,6 +813,9 @@ pub unsafe extern "C" fn enif_make_resource_binary(
     with_registry(|r| {
         r.bind_term(term.raw(), ResourceRef { ty, obj });
     });
+    // The term owns a reference, exactly as for `enif_make_resource` (module docs, point 3).
+    // SAFETY: `obj` is a live payload pointer with an outstanding reference (caller contract).
+    unsafe { retain_object(obj) };
     n(term)
 }
 
@@ -870,6 +922,126 @@ pub unsafe extern "C" fn enif_dynamic_resource_call(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A minimal [`NifHost`] for the retention test: a bump heap plus an atom table.
+    struct RetainHost {
+        heap: beam_alloc::Heap,
+        atoms: beam_term::atom::AtomTable,
+    }
+
+    impl NifHost for RetainHost {
+        fn heap(&mut self) -> &mut beam_alloc::Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(prelude::make_atom(self.atoms.intern(name)))
+        }
+
+        fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+            if !prelude::is_atom(atom) {
+                return None;
+            }
+            self.atoms.name(prelude::atom_val(atom)).map(str::to_string)
+        }
+    }
+
+    /// **The A.3 divergence this file fixes.** `alloc → enif_make_resource → enif_release_resource →
+    /// enif_get_resource` must still resolve to the live payload. The minted term takes its own
+    /// reference (exactly the C magic ref's reference), so releasing the allocator's reference must
+    /// **not** free the block. Oracle: `{1, 42}`; a refcount-zero-free runtime: `{0, -1}`.
+    #[test]
+    fn a_resource_term_keeps_the_object_alive_after_release() {
+        use std::ffi::CString;
+
+        let mut host = RetainHost {
+            heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
+            atoms: beam_term::atom::AtomTable::new(),
+        };
+        let mut env = NifEnv::new(&mut host);
+        let name = CString::new("retain_rt").expect("no interior NUL");
+        let mut tried = ErlNifResourceFlags::from_bits(0);
+        // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
+        let ty = unsafe {
+            enif_open_resource_type(
+                env.as_ptr(),
+                core::ptr::null(),
+                name.as_ptr(),
+                None,
+                ErlNifResourceFlags::CREATE,
+                &mut tried,
+            )
+        };
+        assert!(!ty.is_null(), "the type must open");
+
+        // SAFETY: `ty` came from the open call above.
+        let obj = unsafe { enif_alloc_resource(ty, 4) };
+        assert!(!obj.is_null(), "the allocation must succeed");
+        // SAFETY: `obj` is a live 4-byte payload; the first byte is in bounds.
+        unsafe { *(obj as *mut u8) = 42 };
+
+        // SAFETY: `env` is live; `obj` is a live payload pointer.
+        let term = unsafe { enif_make_resource(env.as_ptr(), obj) };
+        // Drop the single allocator reference; the term's own reference must keep the block alive.
+        // SAFETY: `obj` still has an outstanding reference (the term's).
+        unsafe { enif_release_resource(obj) };
+
+        let mut got: *mut c_void = core::ptr::null_mut();
+        // SAFETY: `env` is live; `term` is the resource term just minted; `got` is a live local.
+        let matched = unsafe { enif_get_resource(env.as_ptr(), term, ty, &mut got) };
+        assert_eq!(
+            matched, 1,
+            "a released-but-term-wrapped resource term must keep resolving"
+        );
+        assert_eq!(got, obj, "it must resolve to the same payload pointer");
+        // SAFETY: `got == obj` is the live 4-byte payload written above.
+        assert_eq!(unsafe { *(got as *const u8) }, 42, "and the payload is intact");
+    }
+
+    /// An object that is **never** exported as a term is still destroyed on its last release, and its
+    /// destructor runs (the documented synchronous timing).
+    #[test]
+    fn an_object_with_no_term_is_destroyed_on_release() {
+        use std::ffi::CString;
+        use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+
+        static DTOR_RUNS: AtomicUsize = AtomicUsize::new(0);
+        unsafe extern "C" fn counting_dtor(_: *mut ErlNifEnv, _: *mut c_void) {
+            DTOR_RUNS.fetch_add(1, AtomicOrdering::Relaxed);
+        }
+
+        let mut host = RetainHost {
+            heap: beam_alloc::Heap::new(4096).expect("a small test heap is allocatable"),
+            atoms: beam_term::atom::AtomTable::new(),
+        };
+        let mut env = NifEnv::new(&mut host);
+        let name = CString::new("no_term_rt").expect("no interior NUL");
+        let mut tried = ErlNifResourceFlags::from_bits(0);
+        // SAFETY: `env` is live; `name` is NUL-terminated; `tried` is a live local.
+        let ty = unsafe {
+            enif_open_resource_type(
+                env.as_ptr(),
+                core::ptr::null(),
+                name.as_ptr(),
+                Some(counting_dtor),
+                ErlNifResourceFlags::CREATE,
+                &mut tried,
+            )
+        };
+        assert!(!ty.is_null());
+
+        let before = DTOR_RUNS.load(AtomicOrdering::Relaxed);
+        // SAFETY: `ty` came from the open call above.
+        let obj = unsafe { enif_alloc_resource(ty, 1) };
+        assert!(!obj.is_null());
+        // SAFETY: the destructor must run synchronously on the last release of an unexported object.
+        unsafe { enif_release_resource(obj) };
+        assert_eq!(
+            DTOR_RUNS.load(AtomicOrdering::Relaxed) - before,
+            1,
+            "the destructor runs exactly once on the release that reaches zero"
+        );
+    }
 
     #[test]
     fn header_layout_is_the_documented_block_shape() {
