@@ -96,6 +96,7 @@ Runner rule: every selected **(workload × runtime)** pair yields **exactly one*
 | `khepri` | gc | `/home/bill/Source/khepri` (`rebar3 eunit`, in a scratch copy) | **runs** (with `$BENCH_TRY_NIX`) | `rebar3-absent`, `repo-missing` |
 | `emqx` | messaging | `/home/bill/Source/emqx` (`rebar3 compile`, in a scratch copy) | skipped | `rebar3-absent`, `not-a-rebar3-project`, `repo-missing` |
 | `slice` | compute | committed `slice.beam` fixture + 6 `erlc`-compiled stdlib wrappers, run under **each scheduled runtime** | **runs** (sys+rust) | `erlc-absent`, `fixture-missing`, `runtime-unsupported` |
+| `foreign` | compute | **real Cowboy + EMQX modules** (`cowboy_bstr.erl`, `emqx_base62.erl`) compiled with the system `erlc`, run under **both** runtimes | **runs** (sys+rust) | `erlc-absent`, `sources-missing`, `runtime-unsupported` |
 
 - `baseline` (always-on): N runs of `<erl> -noshell -eval 'halt().'` ⇒ startup-latency `Summary`
   (p50/p99), plus a fixed in-VM compute loop (`-eval` summing 1..1_000_000) ⇒ wall time + throughput, so
