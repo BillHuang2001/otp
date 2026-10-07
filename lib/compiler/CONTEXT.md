@@ -54,6 +54,7 @@ All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass
 - Common Test suites live in `test/` (no `TEST_NEEDS_RELEASE`): `make test` there builds an `Emakefile` and runs CT against the in-tree compiler.
 - Central strategy is optimization-correctness: base feature suites are cloned by the Makefile into suffixed suites (`_no_opt`, `_no_ssa_opt`, `_no_copt`, `_inline`, `_cover`, `_dialyzer`, `_r29`, …) that re-run the same code under different optimizer option sets.
 - Pass-specific suites (`beam_ssa_SUITE`, `beam_types_SUITE`, `beam_jump_SUITE`, `core_fold_SUITE`, `beam_validator_SUITE`, …), plus `random_code_SUITE` and `property_test/` (PropEr/EQC) for randomized compilation.
+- The opt-in Stage 2 passes have dedicated suites (`beam_ssa_loop_opt_SUITE`, `beam_ssa_fus_SUITE`, `beam_ssa_fbip_SUITE`, all in `test/Makefile` `MODULES`); each compiles its own probe modules and needs a `compiler` built with the matching pass module.
 - `beam_validator` rejects malformed assembly; `beam_ssa_check` consumes `%%` directives in test data to assert SSA annotations.
 - `scripts/smoke` is a manual, release-time end-to-end check (builds Elixir + Mix projects) — not part of CI/CT.
 
