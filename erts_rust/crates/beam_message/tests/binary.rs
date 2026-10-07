@@ -1,0 +1,197 @@
+//! Integration tests for proper binary/bitstring copy.
+//!
+//! Covers the required evidence of the crate `CONTEXT.md` `Test Strategy`:
+//!
+//! 1. an **off-heap refc binary** (the 8-word `[BinRef(3)][ErlSubBits(5)]` pair whose root is the
+//!    `ErlSubBits`) is copied by **sharing its payload** — the source `RefcBinary` handle is
+//!    refcounted into the destination off-heap table, the copied `BinRef.val` is the *same* payload
+//!    pointer, and the copied `ErlSubBits.orig` is fixed up to the copied `BinRef`,
+//! 2. dropping the destination table returns the source refcount,
+//! 3. an on-heap small binary (`ErlHeapBits`) is copied **by value** (opaque interior).
+
+use beam_alloc::{Heap, RefcBinary};
+use beam_message::off_heap::OffHeapTable;
+use beam_message::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
+use beam_term::prelude::*;
+
+/// A 200-byte payload whose bytes are position-dependent, so a partial or shifted copy is visible.
+fn payload() -> Vec<u8> {
+    (0..200usize).map(|i| ((i * 7) % 251) as u8).collect()
+}
+
+/// Writes the on-heap refc-binary pair for `data_ptr`/`len` and returns the tagged root (the
+/// `ErlSubBits`).
+///
+/// # Safety
+///
+/// `heap` must have 8 spare words and `data_ptr` must be a live, 4-byte-aligned payload of `len`
+/// bytes that outlives the returned term.
+unsafe fn refc_binary_term(heap: &mut Heap, data_ptr: *mut u8, len: usize) -> Eterm {
+    // SAFETY: the caller keeps the payload alive; `data_ptr` is `UNIT_SIZE`-aligned (`data_ptr` is
+    // `base + HEADER_SIZE` with `HEADER_SIZE == UNIT_SIZE`), satisfying the flag-bit assert.
+    unsafe {
+        let hp = heap.alloc_words(ERL_REFC_BITS_SIZE).expect("the pair fits");
+        write_refc_binary(
+            hp,
+            data_ptr as *mut Eterm,
+            core::ptr::null_mut(),
+            data_ptr,
+            0,
+            len * 8,
+        )
+    }
+}
+
+#[test]
+fn a_refc_binary_shares_its_payload_with_the_destination() {
+    let bytes = payload();
+    let source_binary = RefcBinary::new(&bytes).expect("the payload allocates");
+    let data_ptr = source_binary.data_ptr();
+    assert_eq!(source_binary.refcount(), 1);
+
+    // The source process's on-heap term and its off-heap handle.
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `source_binary` outlives `original` and `data_ptr` is `UNIT_SIZE`-aligned.
+    let original = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+    let mut src_off = OffHeapTable::new();
+    src_off.push_binary(source_binary);
+    assert_eq!(src_off.binaries()[0].refcount(), 1, "the source holds one handle");
+
+    assert!(unsafe { is_refc_binary(original) });
+    assert_eq!(
+        size_of_copy(original),
+        ERL_REFC_BITS_SIZE,
+        "the preflight sizes the whole 8-word pair"
+    );
+
+    let mut dst = Heap::new(64).expect("destination heap");
+    let mut dst_off = OffHeapTable::new();
+    let copy = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        copy_struct(original, &mut dst, &mut ctx).expect("the copy succeeds")
+    };
+
+    // Exactly ONE destination binary, refcount 2 (source + destination), same payload pointer.
+    assert_eq!(dst_off.binaries().len(), 1);
+    let held = &dst_off.binaries()[0];
+    assert_eq!(held.data_ptr(), data_ptr, "the payload is shared, not deep-copied");
+    assert_eq!(held.as_bytes(), &bytes[..]);
+    assert_eq!(held.refcount(), 2, "one reference for the source, one for the destination");
+    assert_eq!(src_off.binaries()[0].refcount(), 2);
+
+    // The copied pair is a well-formed refc binary over the same payload.
+    assert!(unsafe { is_refc_binary(copy) });
+    assert_ne!(copy.raw(), original.raw(), "a real on-heap copy of the pair");
+    assert_eq!(dst.used(), ERL_REFC_BITS_SIZE, "the whole 8-word pair is materialised");
+    assert_eq!(unsafe { refc_bytes(copy) }, &bytes[..]);
+    assert_eq!(unsafe { refc_offset(copy) }, 0);
+    assert_eq!(unsafe { refc_size(copy) }, bytes.len() * 8);
+
+    // The copied `BinRef.val` is the *source* payload pointer and `orig` reaches the copied
+    // `BinRef` — the fix-up a leaf treatment of the `ErlSubBits` would leave dangling.
+    // SAFETY: `copy` is a live refc binary, so its `BinRef` sits `ERL_BIN_REF_SIZE` words below.
+    let copied_bin_ref = unsafe { boxed_val(copy).sub(ERL_BIN_REF_SIZE) };
+    // SAFETY: `copied_bin_ref` is the copied `BinRef` head, so word 1 is its `val`.
+    assert_eq!(unsafe { (*copied_bin_ref.add(1)).raw() }, data_ptr as usize);
+    // SAFETY: `copy` is the `ErlSubBits`, so word 4 is its `orig`.
+    assert_eq!(
+        unsafe { (*boxed_val(copy).add(4)).raw() },
+        make_boxed(copied_bin_ref).raw(),
+        "orig must reach the *copied* BinRef"
+    );
+
+    // Dropping the destination table releases only its own reference.
+    drop(dst_off);
+    assert_eq!(
+        src_off.binaries()[0].refcount(),
+        1,
+        "the source's handle is left behind"
+    );
+}
+
+#[test]
+fn two_occurrences_of_a_refc_binary_share_one_payload() {
+    let bytes = payload();
+    let mut src_off = OffHeapTable::new();
+    src_off.push_binary(RefcBinary::new(&bytes).expect("the payload allocates"));
+    let data_ptr = src_off.binaries()[0].data_ptr();
+
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `src_off` owns the payload, which outlives `pair`.
+    let term = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+    let pair = src.tuple(&[term, term]).expect("the tuple fits");
+
+    let mut dst = Heap::new(64).expect("destination heap");
+    let mut dst_off = OffHeapTable::new();
+    let copy = {
+        let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+        copy_struct(pair, &mut dst, &mut ctx).expect("the copy succeeds")
+    };
+
+    // The flat copy produces two on-heap pairs over the SAME shared payload: two handles.
+    assert_eq!(dst_off.binaries().len(), 2);
+    for binary in dst_off.binaries() {
+        assert_eq!(binary.data_ptr(), data_ptr);
+        assert_eq!(binary.as_bytes(), &bytes[..]);
+    }
+    assert_eq!(src_off.binaries()[0].refcount(), 3, "source + two destination handles");
+
+    // Both copied elements are well-formed refc binaries, at distinct addresses.
+    // SAFETY: `copy` is a live 2-tuple.
+    let (first, second) = unsafe { (tuple_element(copy, 0), tuple_element(copy, 1)) };
+    assert!(unsafe { is_refc_binary(first) } && unsafe { is_refc_binary(second) });
+    assert_ne!(first.raw(), second.raw());
+    assert_eq!(unsafe { refc_bytes(first) }, &bytes[..]);
+    assert_eq!(unsafe { refc_bytes(second) }, &bytes[..]);
+}
+
+#[test]
+fn an_on_heap_small_binary_is_copied_by_value() {
+    let bytes = [0xDEu8, 0xAD, 0xBE, 0xEF];
+    let bits = bytes.len() * 8;
+    let words = heap_bits_size_words(bits);
+
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `heap_bits_size_words(32)` words hold the `ErlHeapBits`, and the 4-byte payload fits.
+    let original = unsafe {
+        let hp = src.alloc_words(words).expect("the heap binary fits");
+        write_heap_bits(hp, &bytes, bits).expect("the payload fits the reserved words")
+    };
+    assert!(!unsafe { is_refc_binary(original) }, "a small binary stays on-heap");
+    assert_eq!(size_of_copy(original), words);
+
+    let mut dst = Heap::new(64).expect("destination heap");
+    let copy = copy_struct_simple(original, &mut dst).expect("the copy succeeds");
+
+    assert_eq!(dst.used(), words, "the heap binary is copied verbatim, interior opaque");
+    // SAFETY: both terms are live `ErlHeapBits` of the same shape.
+    assert_ne!(boxed_val(original), boxed_val(copy), "a real copy, not a shared pointer");
+    let (base, start, size) = unsafe { bitstring_parts(copy) };
+    assert_eq!((start, size), (0, bits));
+    // SAFETY: the copied payload spans bits `0..bits`, i.e. `ceil(bits/8)` live bytes at `base`.
+    let copied_bytes = unsafe { core::slice::from_raw_parts(base, bits.div_ceil(8)) };
+    assert_eq!(copied_bytes, &bytes[..]);
+}
+
+#[test]
+fn a_refc_binary_with_no_owning_handle_is_a_bad_term() {
+    let bytes = payload();
+    let source_binary = RefcBinary::new(&bytes).expect("the payload allocates");
+    let data_ptr = source_binary.data_ptr();
+
+    let mut src = Heap::new(64).expect("source heap");
+    // SAFETY: `source_binary` is alive (it is dropped at the end of the test), so the pair is live.
+    let original = unsafe { refc_binary_term(&mut src, data_ptr, bytes.len()) };
+
+    // The source off-heap table does NOT hold the handle: the graph is malformed, not silently
+    // deep-copied.
+    let src_off = OffHeapTable::new();
+    let mut dst = Heap::new(64).expect("destination heap");
+    let mut dst_off = OffHeapTable::new();
+    let mut ctx = CopyContext::new(&src_off, &mut dst_off);
+    match copy_struct(original, &mut dst, &mut ctx) {
+        Err(beam_common::BeamError::BadArg) => {}
+        other => panic!("expected BadArg for an unresolved refc payload, got {other:?}"),
+    }
+    assert!(dst_off.binaries().is_empty());
+}

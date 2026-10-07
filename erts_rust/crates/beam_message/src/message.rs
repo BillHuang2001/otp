@@ -1,14 +1,17 @@
 //! The message envelope ([`Message`]) and the per-process FIFO message queue ([`Queue`]).
 //!
 //! `Message` mirrors the legacy C `ErtsMessage` fields `m[0]`/`m[1]`/`m[2]`
-//! (`ERL_MESSAGE_TERM`/`_TOKEN`/`_FROM`) plus the off-heap objects the payload owns. `Queue` is a
-//! **pure data structure**: waiting, the save queue, signal ordering and priority handling are
-//! `beam_process`'s, not this crate's.
+//! (`ERL_MESSAGE_TERM`/`_TOKEN`/`_FROM`) plus the off-heap objects the payload owns: the MSO
+//! handles of its off-heap references, the refc binaries whose payloads it shares, and the
+//! external-thing node references it holds. `Queue` is a **pure data structure**: waiting, the
+//! save queue, signal ordering and priority handling are `beam_process`'s, not this crate's.
 
 use std::collections::VecDeque;
 
+use beam_alloc::RefcBinary;
 use beam_term::prelude::*;
 
+use crate::node::NodeEntry;
 use crate::off_heap::MsoHandle;
 
 /// A copied message: the payload term, the sender identity and the off-heap objects it owns.
@@ -17,6 +20,8 @@ pub struct Message {
     from: Eterm,
     token: Eterm,
     off_heap: Vec<MsoHandle>,
+    binaries: Vec<RefcBinary>,
+    nodes: Vec<NodeEntry>,
 }
 
 impl Message {
@@ -27,6 +32,8 @@ impl Message {
             from,
             token: NIL,
             off_heap: Vec::new(),
+            binaries: Vec::new(),
+            nodes: Vec::new(),
         }
     }
 
@@ -39,6 +46,20 @@ impl Message {
     /// Sets the off-heap objects the payload owns (they were refcounted during the copy).
     pub fn with_off_heap(mut self, off_heap: Vec<MsoHandle>) -> Message {
         self.off_heap = off_heap;
+        self
+    }
+
+    /// Sets the refc binaries whose off-heap payloads the message shares (they were refcounted
+    /// during the copy).
+    pub fn with_binaries(mut self, binaries: Vec<RefcBinary>) -> Message {
+        self.binaries = binaries;
+        self
+    }
+
+    /// Sets the external-thing node references the payload holds (they were refcounted during the
+    /// copy).
+    pub fn with_nodes(mut self, nodes: Vec<NodeEntry>) -> Message {
+        self.nodes = nodes;
         self
     }
 
@@ -60,6 +81,16 @@ impl Message {
     /// The off-heap objects the payload owns.
     pub fn off_heap(&self) -> &[MsoHandle] {
         &self.off_heap
+    }
+
+    /// The refc binaries whose off-heap payloads the payload owns.
+    pub fn binaries(&self) -> &[RefcBinary] {
+        &self.binaries
+    }
+
+    /// The external-thing node references the payload holds.
+    pub fn nodes(&self) -> &[NodeEntry] {
+        &self.nodes
     }
 }
 
@@ -199,10 +230,30 @@ mod tests {
         assert_eq!(message.from(), from);
         assert_eq!(message.token(), NIL);
         assert!(message.off_heap().is_empty());
+        assert!(message.binaries().is_empty());
+        assert!(message.nodes().is_empty());
 
         let message = message.with_token(make_small(1));
         assert_eq!(message.token(), make_small(1));
         assert_eq!(message.payload(), payload);
+    }
+
+    #[test]
+    fn the_binary_and_node_lists_travel_with_the_message() {
+        use crate::node::NodeEntry;
+        use beam_alloc::RefcBinary;
+
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+
+        let message = Message::new(make_small(1), make_small(0))
+            .with_binaries(vec![RefcBinary::new(&[9, 9, 9]).expect("the payload allocates")])
+            .with_nodes(vec![NodeEntry::new(node, 2)]);
+        assert_eq!(message.binaries().len(), 1);
+        assert_eq!(message.binaries()[0].as_bytes(), &[9, 9, 9]);
+        assert_eq!(message.nodes().len(), 1);
+        assert_eq!(message.nodes()[0].node().raw(), node.raw());
+        assert_eq!(message.nodes()[0].creation(), 2);
     }
 
     #[test]

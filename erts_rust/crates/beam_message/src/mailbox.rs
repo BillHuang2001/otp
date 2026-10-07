@@ -15,11 +15,12 @@ use crate::message::{Message, Queue};
 /// Copies `term` into the receiver's heap `to_heap`, collects the off-heap objects it
 /// references, builds the [`Message`] and enqueues it on `to_queue`.
 ///
-/// `ctx`'s **destination** off-heap table *is* the message's off-heap list: `copy_struct`
-/// refcounts every referenced off-heap object into it, and `send` drains it into the message (see
-/// the crate `CONTEXT.md`, Design Decisions). It is expected to start empty for each send,
-/// mirroring the C per-message `off_heap`; a non-empty table would attach its pre-existing handles
-/// to this message.
+/// `ctx`'s **destination** off-heap table *is* the message's off-heap ownership: `copy_struct`
+/// refcounts every referenced off-heap object into it (MSO handles), refcounts every shared refc
+/// binary into its binary list and registers every external-thing node, and `send` drains all
+/// three into the message (see the crate `CONTEXT.md`, Design Decisions). The destination table is
+/// expected to start empty for each send, mirroring the C per-message `off_heap`; a non-empty
+/// table would attach its pre-existing objects to this message.
 pub fn send(
     from: Eterm,
     term: Eterm,
@@ -28,8 +29,15 @@ pub fn send(
     ctx: &mut CopyContext<'_>,
 ) -> Result<()> {
     let payload = copy_struct(term, to_heap, ctx)?;
+    let binaries = ctx.dst_off_heap_mut().drain_binaries();
+    let nodes = ctx.dst_off_heap_mut().drain_nodes();
     let off_heap = ctx.dst_off_heap_mut().drain_handles();
-    to_queue.enqueue(Message::new(payload, from).with_off_heap(off_heap));
+    to_queue.enqueue(
+        Message::new(payload, from)
+            .with_off_heap(off_heap)
+            .with_binaries(binaries)
+            .with_nodes(nodes),
+    );
     Ok(())
 }
 

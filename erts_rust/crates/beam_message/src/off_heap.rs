@@ -18,19 +18,42 @@
 //! which never reuses or reorders a slot. It **never** calls [`beam_gc::OffHeap::sweep`] —
 //! that operation compacts the list and shifts the surviving slots down. Off-heap
 //! reclamation is the collector's concern (`beam_gc`), not this view's.
+//!
+//! # Binaries and nodes
+//!
+//! Two further off-heap categories ride along with a copied message and are tracked
+//! **beside** the MSO list, so the MSO-typed accessors above keep their exact meaning:
+//!
+//! * **Refc binaries** ([`RefcBinary`], the payload of an on-heap `BinRef`/`ErlSubBits`
+//!   pair) — [`push_binary`](OffHeapTable::push_binary)/[`binary_at`](OffHeapTable::binary_at)/
+//!   [`binary_by_data_ptr`](OffHeapTable::binary_by_data_ptr)/[`drain_binaries`](OffHeapTable::drain_binaries).
+//!   The copy engine **shares** the payload (refcount++) rather than deep-copying it
+//!   (`copy.c:836` `erts_refc_inc(&from_br->val->intern.refc, 2)`).
+//! * **Nodes** ([`NodeEntry`], the refcounted `(node, creation)` identity of an external
+//!   pid/port/reference) — [`push_node`](OffHeapTable::push_node)/[`nodes`](OffHeapTable::nodes)/
+//!   [`drain_nodes`](OffHeapTable::drain_nodes), mirroring `erts_ref_node_entry`.
+
+use beam_alloc::RefcBinary;
+
+use crate::node::NodeEntry;
 
 pub use beam_gc::MsoHandle;
 
-/// A slot-indexed table of off-heap (MSO) handles.
+/// A slot-indexed table of off-heap objects: MSO handles, refc binaries and node
+/// references.
 ///
-/// The slot of a handle is the value the on-heap off-heap-reference container stores in its
-/// `val` word; `push` returns it. Slots are stable for the table's lifetime (they are never
-/// reused or compacted) — see the module docs: this table deliberately never sweeps.
+/// The slot of an **MSO** handle is the value the on-heap off-heap-reference container
+/// stores in its `val` word; `push` returns it. Slots are stable for the table's lifetime
+/// (they are never reused or compacted) — see the module docs: this table deliberately
+/// never sweeps.
 ///
-/// Storage is delegated to [`beam_gc::OffHeap`] (the workspace's single owner of the
-/// off-heap list); this type only adds the MSO-typed access the copy boundary needs.
+/// MSO storage is delegated to [`beam_gc::OffHeap`] (the workspace's single owner of the
+/// off-heap list); this type adds the MSO-typed access the copy boundary needs, plus the
+/// refc-binary and node lists that travel with a message.
 pub struct OffHeapTable {
     inner: beam_gc::OffHeap,
+    binaries: Vec<RefcBinary>,
+    nodes: Vec<NodeEntry>,
 }
 
 impl Default for OffHeapTable {
@@ -42,11 +65,25 @@ impl Default for OffHeapTable {
     }
 }
 
+impl Drop for OffHeapTable {
+    /// Releases every node reference this table registered (`erts_deref_node_entry`).
+    ///
+    /// The MSO and refc-binary lists need no release step: their handles decrement their own
+    /// refcounts as they drop (`beam_gc`/`beam_alloc`).
+    fn drop(&mut self) {
+        for entry in &self.nodes {
+            entry.release_all();
+        }
+    }
+}
+
 impl OffHeapTable {
     /// An empty off-heap table.
     pub fn new() -> OffHeapTable {
         OffHeapTable {
             inner: beam_gc::OffHeap::new(),
+            binaries: Vec::new(),
+            nodes: Vec::new(),
         }
     }
 
@@ -86,10 +123,12 @@ impl OffHeapTable {
             .filter_map(beam_gc::OffHeapEntry::as_mso)
     }
 
-    /// The apparent (Erlang-visible) size of the referenced objects, in bytes.
+    /// The apparent (Erlang-visible) size of the referenced **MSO** objects, in bytes.
     ///
-    /// Delegates to [`beam_gc::OffHeap::overhead_bytes`]; since this view holds only MSO
-    /// entries, it is the sum of [`MsoHandle::apparent_size`] over the slots.
+    /// Delegates to [`beam_gc::OffHeap::overhead_bytes`]; since the MSO list holds only MSO
+    /// entries, it is the sum of [`MsoHandle::apparent_size`] over the slots. The refc
+    /// binaries tracked alongside are *not* counted here — see
+    /// [`binaries`](OffHeapTable::binaries).
     pub fn overhead_bytes(&self) -> usize {
         self.inner.overhead_bytes()
     }
@@ -123,6 +162,96 @@ impl OffHeapTable {
             .filter_map(beam_gc::OffHeapEntry::as_mso)
             .cloned()
             .collect()
+    }
+
+    /// The raw off-heap entry at `slot`, or `None` when the slot is out of range.
+    ///
+    /// The untyped companion of [`get`](OffHeapTable::get): it exposes the underlying
+    /// [`beam_gc::OffHeapEntry`] whether it is an MSO or a binary.
+    pub fn get_entry(&self, slot: usize) -> Option<&beam_gc::OffHeapEntry> {
+        self.inner.get(slot)
+    }
+
+    // -- refc binaries ------------------------------------------------------
+
+    /// Adds the refc binary `binary` and returns its slot.
+    ///
+    /// The table **owns** the handle; the caller normally passes a clone of the source
+    /// process's handle (refcount++), so the shared payload outlives neither side.
+    pub fn push_binary(&mut self, binary: RefcBinary) -> usize {
+        self.binaries.push(binary);
+        self.binaries.len() - 1
+    }
+
+    /// The refc binary at `slot`, cloned (**bumping its refcount**), or `None` when the
+    /// slot is out of range.
+    pub fn binary_at(&self, slot: usize) -> Option<RefcBinary> {
+        self.binaries.get(slot).cloned()
+    }
+
+    /// The refc binary whose payload starts at `data_ptr`, cloned (**bumping its
+    /// refcount**), or `None` when no held binary has that data pointer.
+    ///
+    /// This resolves an on-heap `BinRef.val` (the frozen contract: the *first payload
+    /// byte*, [`RefcBinary::data_ptr`]) back to its owning handle — the lookup the copy
+    /// engine needs to share, rather than deep-copy, the payload.
+    pub fn binary_by_data_ptr(&self, data_ptr: *const u8) -> Option<RefcBinary> {
+        self.binaries
+            .iter()
+            .find(|binary| binary.data_ptr().cast_const() == data_ptr)
+            .cloned()
+    }
+
+    /// The held refc binaries, in slot order.
+    pub fn binaries(&self) -> &[RefcBinary] {
+        &self.binaries
+    }
+
+    /// Removes and returns every held refc binary, leaving that list empty.
+    ///
+    /// `send` uses this to hand the copied message its binary list (see the crate
+    /// `CONTEXT.md`, Design Decisions): the destination table built up by `copy_struct`
+    /// *is* the message's off-heap ownership, and is expected to start empty for each send.
+    pub fn drain_binaries(&mut self) -> Vec<RefcBinary> {
+        core::mem::take(&mut self.binaries)
+    }
+
+    // -- external-thing nodes ----------------------------------------------
+
+    /// The node entry for `(node, creation)`, or `None` when this table tracks no such node.
+    pub fn node_by_identity(&self, node: beam_term::prelude::Eterm, creation: u32) -> Option<&NodeEntry> {
+        self.nodes
+            .iter()
+            .find(|entry| entry.identity_eq(node, creation))
+    }
+
+    /// Registers one reference to a node in this table's node list and returns its slot.
+    ///
+    /// One entry per **distinct** node (`erts_ref_node_entry`, `copy.c:882`): an already
+    /// present `(node, creation)` keeps its single list entry and has this new reference
+    /// counted onto it, so a term holding two references to the same node leaves one entry
+    /// whose [`refcount`](NodeEntry::refcount) is `2`. A new node stores `entry`; the count
+    /// it carries is the first reference.
+    pub fn push_node(&mut self, entry: NodeEntry) -> usize {
+        if let Some(slot) = self.nodes.iter().position(|held| held.same_node(&entry)) {
+            self.nodes[slot].add_reference();
+            return slot;
+        }
+        self.nodes.push(entry);
+        self.nodes.len() - 1
+    }
+
+    /// The node entries this table tracks, in slot order.
+    pub fn nodes(&self) -> &[NodeEntry] {
+        &self.nodes
+    }
+
+    /// Removes and returns every node entry, leaving the node list empty.
+    ///
+    /// `send` uses this to hand the copied message its node references, mirroring the
+    /// off-heap list ([`drain_handles`](OffHeapTable::drain_handles)).
+    pub fn drain_nodes(&mut self) -> Vec<NodeEntry> {
+        core::mem::take(&mut self.nodes)
     }
 }
 
@@ -204,5 +333,72 @@ mod tests {
         assert_eq!(table.get(0).and_then(|h| h.downcast_ref::<u32>()), Some(&9));
         assert!(table.get(1).is_none());
         assert_eq!(table.overhead_bytes(), 8);
+    }
+
+    #[test]
+    fn binaries_are_tracked_beside_the_mso_list() {
+        let mut table = OffHeapTable::new();
+        let binary = RefcBinary::new(&[1, 2, 3, 4]).expect("the payload allocates");
+        let data_ptr = binary.data_ptr();
+
+        assert_eq!(table.push_binary(binary.clone()), 0);
+        assert_eq!(table.binaries().len(), 1);
+        // The MSO-typed views (and the MSO slot space) never see a binary.
+        assert!(table.is_empty());
+        assert!(table.get_entry(0).is_none());
+        assert_eq!(table.binary_at(0).map(|b| b.as_bytes().to_vec()), Some(vec![1, 2, 3, 4]));
+        assert!(table.binary_at(1).is_none());
+
+        let resolved = table.binary_by_data_ptr(data_ptr).expect("the payload is held");
+        assert_eq!(resolved.as_bytes(), &[1, 2, 3, 4]);
+        assert!(table.binary_by_data_ptr(core::ptr::null()).is_none());
+
+        let drained = table.drain_binaries();
+        assert_eq!(drained.len(), 1);
+        assert!(table.binaries().is_empty());
+        drop(drained);
+    }
+
+    #[test]
+    fn push_node_dedups_by_identity_and_counts_references() {
+        use crate::node::NodeEntry;
+        use beam_term::prelude::*;
+
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+
+        let mut table = OffHeapTable::new();
+        assert_eq!(table.push_node(NodeEntry::new(node, 3)), 0);
+        assert_eq!(table.push_node(NodeEntry::new(node, 3)), 0, "one entry per distinct node");
+        assert_eq!(table.nodes().len(), 1);
+        assert_eq!(table.nodes()[0].refcount(), 2, "one reference per push");
+
+        // A different creation is a different node.
+        assert_eq!(table.push_node(NodeEntry::new(node, 4)), 1);
+        assert_eq!(table.nodes().len(), 2);
+        assert!(table.node_by_identity(node, 3).is_some());
+        assert!(table.node_by_identity(node, 9).is_none());
+
+        let drained = table.drain_nodes();
+        assert_eq!(drained.len(), 2);
+        assert!(table.nodes().is_empty());
+    }
+
+    #[test]
+    fn dropping_the_table_releases_its_node_references() {
+        use crate::node::NodeEntry;
+        use beam_term::prelude::*;
+
+        let mut atoms = AtomTable::new();
+        let node = make_atom(atoms.intern("nonode@nohost"));
+
+        let mut table = OffHeapTable::new();
+        table.push_node(NodeEntry::new(node, 1));
+        table.push_node(NodeEntry::new(node, 1));
+        let held = table.nodes()[0].handle();
+        assert_eq!(held.refcount(), 2);
+
+        drop(table);
+        assert_eq!(held.refcount(), 0, "the table released both references");
     }
 }
