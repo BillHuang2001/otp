@@ -71,7 +71,7 @@ Public: `PORT_INFO_ATOMS` (incl. `registered_name`), `PortName{Spawn,SpawnExecut
 `build.rs` emits `cargo::rustc-link-arg-bins=-Wl,--export-dynamic` **and** `…-tests=…`, and `NifRegistry::new` anchors `beam_abi`'s `enif_*` codegen unit — together they publish the `enif_*` symbols a real NIF's `dlopen(RTLD_NOW)` needs (proof: `tests/nif.rs::the_binary_exports_the_enif_symbols_a_nif_imports`, via `nm -D`). **Typed gap:** the host leaves `term_to_binary`/`binary_to_term`/`make_ref` at the `NifHost` defaults (`None`).
 
 ### `config.rs`, `cli.rs`, `boot.rs`, `info.rs`, `format.rs`
-`config.rs`: `EmulatorConfig = beam_common::config::RuntimeConfig`; `RuntimeConfig{emulator, code_paths, heap_words, action, init_args}` with `Action{Boot,Version,Eval,String,Apply,Run,RunFile}`, `ArgTerm{Int,Atom,Str,List}` and `InitArgs` (ordered flag → occurrences). `cli.rs`: `USAGE`, `EXIT_OK/EXIT_RUNTIME/EXIT_USAGE/EXIT_UNSUPPORTED` (= 0/1/2/3), `parse(&[String])` (excludes argv[0]), `run(Vec<String>) -> i32`. `boot.rs` (A.7): `PreloadedModules`. `info.rs` (A.8): `SUPPORTED_KEYS` (16 atom keys), `INFO_ATOMS`, `InfoValue` + `to_eterm(heap, atoms)`, `system_info_value(key, rt)`, `allocator_report(name)`/`effective_policy(base)`. `format.rs`: `term_to_string`/`term_to_string_w` (drives `io:format/2`).
+`config.rs`: `EmulatorConfig = beam_common::config::RuntimeConfig`; `RuntimeConfig{emulator, code_paths, heap_words, action, init_args}` with `Action{Boot,Version,Eval,String,Apply,Run,RunFile}`, `ArgTerm{Int,Atom,Str,List}` and `InitArgs` (ordered flag → occurrences). `cli.rs`: `USAGE`, `EXIT_OK/EXIT_RUNTIME/EXIT_USAGE/EXIT_UNSUPPORTED` (= 0/1/2/3), `parse(&[String])` (excludes argv[0]), `run(Vec<String>) -> i32`. `boot.rs` (A.7): `PreloadedModules`. `info/` (A.8): `SUPPORTED_KEYS` (62 atom keys) + `UNSUPPORTED_KEYS` (19), `INFO_ATOMS`, `InfoValue` + `to_eterm(heap, atoms)`, `system_info_value(key, rt)`, `allocator_report(name)`/`effective_policy(base)` (see `src/info/CONTEXT.md`). `format.rs`: `term_to_string`/`term_to_string_w` (drives `io:format/2`).
 
 ## The runtime-native BIF floor (`src/native/`)
 The floor is the BIFs that are really *runtime* operations — they read/write the runtime's own state (process/port tables, code server, atom table, application view, parsed command line, timer heap) — served **before** the `beam_bifs` registry from `RuntimeContext::try_native` (a directory module; `try_native`'s dispatch table is the source of truth for what is native):
@@ -123,34 +123,14 @@ Unsupported is emitted for a `-eval` expression outside the grammar (`src/eval/p
 **Structured raise reasons render as the real term.** A raise may carry an opaque live reason whose payload is an `Eterm` (the `beam_common::Raise` convention); `src/error.rs::live_reason_term` recovers it and renders it through `format_term_w` — used by `runner.rs::exit_reason`, `cli.rs::run_file` and `context/mod.rs::run_export` (`name_atom_raise`, which recovers a bare-atom reason so it is still classified by name). So `beam_rt run <m>.beam m:badkey/0` → `beam_rt: error {badkey,nokey}` (exit 1), never a placeholder.
 
 ## `system_info/1` keys (contract A.8)
-`InfoValue` is the heap-free source of truth; `Runtime::system_info` materializes it on the scratch heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the oracle returns them (`system_info(version)` → `"17.1"`). An unknown key — atom or tuple — is `Err(BeamError::BadArg)`, the oracle's `error:badarg`.
-| Key | Value |
-|---|---|
-| `version` | `Str` — `"17.1"` (`beam_common::version::ERTS_VERSION`) |
-| `otp_release` | `Str` — `"30"` (the major of `OTP_VERSION`) |
-| `system_architecture` | `Str` — the target triple from `std::env::consts` |
-| `system_version` | `Str` — `"Erlang/OTP {major} [erts-{erts}] [source] [{bits}-bit]"` |
-| `nif_version` | `Str` — `"2.18"` from `beam_abi::{ERL_NIF_MAJOR_VERSION,ERL_NIF_MINOR_VERSION}` |
-| `wordsize` | `Int` — `8` |
-| `logical_processors` | `Int` — `available_parallelism()` |
-| `process_count` | `Int` — the M1 process table's length |
-| `port_count` | `Int` — the **live** ports (`PortRegistry::len`) |
-| `os_type` | `Tuple` — `{unix,linux}` (or `{win32,nt}`) |
-| `threads` | `Bool` — atom `true`/`false` |
-| `emu_flavor` | `Atom` — `jit` by default (the baseline JIT), `emu` for `Flavor::Emu` |
-| `schedulers` | `Int` — an explicit `+S N` wins, else `available_parallelism()`; always `> 0` |
-| `alloc_util_allocators` | `List` — the ten alloc-util allocator names from `beam_alloc::registry::alloc_util_allocators()`, in the oracle's order |
-| `allocated_areas` | `List` — the oracle's 19 items in order; every value **derived from this runtime's own state** (`atom_space` is the 3-tuple `{atom_space,B,B}`, the table items count live entries, items with no counterpart are `0`) |
-| `garbage_collection` | `List` — the 4 emulator-wide knobs `[{max_heap_size,0},{min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535}]`; `max_heap_size` is the **bare integer** here, unlike the `process_info/2` flag map |
-| `{allocator, A}` (a **tuple** key) | `List` of `{Key,Value}` rows — `beam_alloc::stats::AllocatorInfo::from_stats` over a live `registry::all_stats()` snapshot; `A` outside the ten names ⇒ `badarg` |
-`INFO_ATOMS` (`src/info.rs`) is the surface's complete atom vocabulary — the `os_type`/`threads`/`emu_flavor` values, the ten allocator names, the 19 `allocated_areas` item names, the `{allocator,…}` row names, the `garbage_collection` item names and the `process_info/2` item names + `undefined`; `seed_core_atoms` interns it, because `InfoValue::to_eterm` resolves through the runtime's atom table and reports `TermNotFound` rather than inventing a term. Add any new atom-valued key's atom to `INFO_ATOMS`.
-
+`InfoValue` is the heap-free source of truth; `Runtime::system_info` materializes it on the scratch heap. Strings are Erlang **strings** (lists of char small-ints) exactly as the oracle returns them. The surface answers **62** atom keys plus the `{allocator, A}` tuple key, and returns the oracle's `error:badarg` for any other key; the 19 oracle-accepted keys naming facilities this runtime does not have (the dist wire state, the time-correction service, CPU-topology detection, the C-compiler/3PP identification, the code-loading dumps, the logger pid, the host C allocator, the poll-set introspection) raise the honest `unsupported` capability gap, never a fabricated value.
+**The per-key catalog — the implemented/unsupported/badarg classification, the self-derived-vs-oracle-equal split, the atom discipline and the oracle-comparison test — lives in [`src/info/CONTEXT.md`](src/info/CONTEXT.md).** `src/info.rs` is a thin parent (`InfoValue` + `to_eterm`, `SUPPORTED_KEYS`/`UNSUPPORTED_KEYS`, `INFO_ATOMS`, the `system_info_value` dispatcher, `allocator_report`) and the per-key logic lives in `src/info/{system,limits,schedulers,memory,unsupported}.rs`.
 ## Constraints
 * **Errors are return-based, workspace-wide** (`../CONTEXT.md` §3): every fallible API returns `beam_common::Result`. **No crate-local error enum**, **no `panic!`/`unwrap()` on runtime data**, **no silent swallowing**. CLI diagnostics are `BeamError::Raise(Raise::error(ExitReason::atom(msg)))`.
 * **`unsafe`-free.** The whole crate is `#![deny(unsafe_code)]`; the glue uses only the safe peripheries of the lower crates (`Heap::cons/tuple`, `AtomTable::intern`, `BifRegistry::call`).
 * **Call down, never duplicate.** The `~p` printer is **not** re-implemented — `format.rs` drives the registered `io:format/2` BIF.
 * **Frozen term layout** (`../CONTEXT.md` §2): terms are built/inspected only through `beam_term`.
-* **Files ~1000 lines**, split by responsibility; `#![warn(missing_docs)]`, every public item documented. Pre-existing oversize (not restructured): `src/port.rs` (~2453 lines; production half ~1470) and `src/info.rs` (~1261; production half ~610, the rest its per-key test module).
+* **Files ~1000 lines**, split by responsibility; `#![warn(missing_docs)]`, every public item documented. Pre-existing oversize (not restructured): `src/port.rs` (~2453 lines; production half ~1470).
 
 ## Design Decisions
 * **One shared atom table (the code server's).** `CodeServer` owns **one** `Rc<AtomTable>` (copy-on-write on intern); every module it loads is interned into it and `call_bif` hands `BifContext` that same table — so an atom a BIF builds is an index the engine compares and the printer names, for **every** loaded module. Indices are insertion-ordered and never renumber.
@@ -209,7 +189,8 @@ Unsupported is emitted for a `-eval` expression outside the grammar (`src/eval/p
 * `src/port.rs` → the A.4 `PortHook` provider + the `{spawn_driver, Name}` routing (see the API + Known-Issues sections): `PortRegistry` (incl. `take_driver_outputs`/`driver_lookup`), `RuntimePorts`, `deliver_port_messages`, the `-eval` `poll_port_messages`/`port_data_message`/`port_exit_message` trio, `PortName`/`StreamType`/`PORT_INFO_ATOMS` (incl. `registered_name`)/`PORT_POLL_SLICE`
 * `src/port/driver.rs` → the driver C ABI host (A.4): `DriverPort` (the concrete `beam_abi::DriverHost`, incl. the recorded `SelectRequest`s and the `DriverControl` deadline the `beam_io` poller is driven from), `Driver`/`load_driver`, `DriverPortAdapter` (the `beam_io::Driver` port lifecycle over a loaded C driver, incl. `ready_input`/`ready_output`/`timeout`/`next_timeout`)
 * `src/dist.rs` → the distributed node (A.5 phase 1): `DistNode`/`DistConnection`/`NodeName`/`resolve_cookie` (see the API + Known-Issues sections)
-* `src/info.rs` → `SUPPORTED_KEYS` (16 atom keys), `INFO_ATOMS`, `InfoValue`, `system_info_value` (A.8 keys), `to_eterm`, `allocator_report`, `effective_policy`
+* `src/info.rs` + `src/info/` → the A.8 introspection surface: the thin parent (`SUPPORTED_KEYS` (62)/`UNSUPPORTED_KEYS` (19), `INFO_ATOMS`, `InfoValue`, `system_info_value`, `to_eterm`, `allocator_report`, `effective_policy`) over the family children `src/info/{system,limits,schedulers,memory,unsupported}.rs` — see [`src/info/CONTEXT.md`](src/info/CONTEXT.md) for the per-key catalog
+* `tests/system_info_oracle.rs` → the A.8 oracle comparison (shape + value vs the real system `erl`; skips loudly without a toolchain)
 * `src/context/` → the concrete `ExecutionContext` glue: `mod.rs` (`RuntimeContext`, the `ExecutionContext` impl, `call_registered`, `send_fragmented_message`, the `uses_*` predicates incl. `uses_send_hook`), `bridges.rs` (the bridges `SharedSink`/`FunBridge`/`DictBridge`/`NifBridge`/`RecordBridge`/`SendBridge`/`NodeIdentity`/`PendingInterner` + the local-fun identity helpers), `tests.rs`
 * `src/timers.rs` → the runtime-local deadline min-heap (`Timers`/`TimerTarget`/`TimerAction::{Deliver,Resume}`/`TimerHandle`/`FiredTimer`) behind `send_after/3` **and** finite `receive … after T` (`schedule_resume`/`cancel_handle`), advanced only by the scheduler loop
 * `src/nif.rs` / `build.rs` → the live NIF libraries (A.3) and the `--export-dynamic` link arg (see the NIF section)
