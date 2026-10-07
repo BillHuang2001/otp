@@ -291,13 +291,12 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN**, and
-`... build --workspace` **GREEN, warning-free**. Current: **232 tests, 0 failures** (1 ignored doc-test) — `170`
+`... build --workspace` **GREEN, warning-free**. Current: **231 tests, 0 failures** (1 ignored doc-test) — `170`
 lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
 `drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`, `abi/{host,port,table}`) + `tests/abi_driver.rs` `8` +
 `tests/poller.rs` `8` + `tests/port.rs` `4` + `tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs`
 `3` + `tests/driver_seams.rs` `5` + `tests/fixture_builds.rs` `4` + `tests/driver_table.rs` `5` + `2` doctests (the
-`!Send`/`!Sync` compile-fail
-pins on `PortRegistry`).
+`!Send`/`!Sync` compile-fail pins on `PortRegistry`).
 - `tests/fixture_builds.rs` — builds the `cc`-compiled `tests/fixtures/host_driver.c` and asserts a real
   `beam_abi::driver::loader::load`; a missing object is a typed load error; missing `cc`/`erl_nif.h` SKIPs loudly.
 - `tests/driver_table.rs` — **the process-global registry, end-to-end over the real fixture**: `add_loaded` (the
@@ -501,14 +500,16 @@ pins on `PortRegistry`).
   - **port queues** — `driver_vec_to_buf` + the `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/
     `driver_peekq*`/`driver_enqv`/`driver_pushqv` family. Needs a port-queue group: `enq`, `enq_bin`, `pushq`,
     `pushq_bin`, `deq`, `sizeq`, `peekq`, `peekqv`, `enqv`, `pushqv`, `vec_to_buf`.
-  - **port lifecycle & attributes** — `driver_create_port`, `add_driver_entry`, `remove_driver_entry`,
-    `driver_lock_driver`, `erl_drv_init_ack`, `erl_drv_set_os_pid`, `erl_drv_busy_msgq_limits`, the
+  - **port lifecycle & attributes** — `erl_drv_init_ack`, `erl_drv_set_os_pid`, `erl_drv_busy_msgq_limits`, the
     `driver_failure*`/`driver_exit` family, `set_busy_port`, `set_port_control_flags`, `get_port_flags`,
     `driver_async_port_key`, `driver_get_now` (deprecated), `driver_binary_get_refc`/`inc_refc`/`dec_refc`. Needs
-    `create_port`, `add_driver_entry`, `remove_driver_entry`, `lock_driver`, `init_ack`, `set_os_pid`,
-    `busy_msgq_limits`, `failure_eof`/`failure_atom`/`failure_posix`/`failure`, `exit`, `set_busy_port`,
-    `set_port_control_flags`, `get_port_flags`, `async_port_key`, `get_now`, `binary_get_refc`/`binary_inc_refc`/
-    `binary_dec_refc`.
+    `init_ack`, `set_os_pid`, `busy_msgq_limits`, `failure_eof`/`failure_atom`/`failure_posix`/`failure`, `exit`,
+    `set_busy_port`, `set_port_control_flags`, `get_port_flags`, `async_port_key`, `get_now`,
+    `binary_get_refc`/`binary_inc_refc`/`binary_dec_refc`.
+  - **`driver_create_port` / `add_driver_entry` / `remove_driver_entry` / `driver_lock_driver` are SERVED by this
+    crate** ([`DriverTable`](src/abi/table.rs): `add_entry`/`add_loaded`/`remove_entry`/`lock_driver`/`create_port`)
+    but the `ErlDrvApi` slots stay `None` until `beam_abi` adds the four wiring hooks — see the exact signatures in
+    `src/abi/mod.rs`. `beam_abi` must not be edited from this node.
   - **monitors & port data lock** — the `driver_monitor_*` family needs `monitor_process`/`demonitor_process`/
     `get_monitored_process`/`compare_monitors`; the whole `driver_pdl_*` family needs a port-data-lock accessor
     group.
