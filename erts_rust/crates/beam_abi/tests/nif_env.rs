@@ -22,7 +22,7 @@
 //! * `enif_make_copy` — `make_copy(dst_env, src_term, NULL)` (`erl_nif.c:1194-1197`). With no copy
 //!   engine behind the `NifHost::make_copy` hook this crate answers `THE_NON_VALUE` (raw 0) — never
 //!   a term aliasing the source env's memory.
-//! * `enif_alloc_env` — `erts_alloc(ERTS_ALC_T_NIF, …)` + `setup_nif_env` (`erl_nif.c:669-675`).
+//! * `enif_alloc_env` — `erts_alloc_fnf(ERTS_ALC_T_NIF, …)` + `setup_nif_env` (`erl_nif.c:669-675`).
 //!   This crate delegates the allocation to `NifHost::alloc_env` on the host of the **current NIF
 //!   call** (the thread-local stack `NifEnv::new` publishes and `NifEnv`'s `Drop` withdraws), so a
 //!   supporting host's own pointer comes back verbatim, and a host without support — or a call made

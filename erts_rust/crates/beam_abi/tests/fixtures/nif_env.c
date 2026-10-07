@@ -37,6 +37,7 @@
 /* A non-null stand-in for the resource handle (the `obj` operand of enif_select).
  * This layer never dereferences it; the runtime would turn it into a resource. */
 static int priv_marker;
+
 /* The library's `load` callback: it stores the module's private data pointer,
  * which is what `enif_priv_data` reports in real ERTS. */
 static void* nif_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)

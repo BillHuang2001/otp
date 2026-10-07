@@ -324,8 +324,8 @@ impl NifEnv {
     ///
     /// The env also **publishes `host` as the current NIF-call host on this thread** (removed again
     /// by `Drop`) — the mechanism `enif_alloc_env` uses to reach a host from an entry point that
-    /// takes no argument (see [`with_current_host`]). Constructing one is therefore reserved for a
-    /// real call env: it is what "this thread is inside a NIF call" means to this crate.
+    /// takes no argument (see `with_current_host` below). Constructing one is therefore reserved for
+    /// a real call env: it is what "this thread is inside a NIF call" means to this crate.
     pub fn new(host: &mut dyn NifHost) -> NifEnv {
         // SAFETY: the only thing reinterpreted here is the erased trait-object lifetime. The
         // C-facing env has no lifetime parameter (`struct enif_environment_t` is plain C), so the

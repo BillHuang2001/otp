@@ -8,7 +8,7 @@
 //!
 //! | function | C body | reproduced here |
 //! |---|---|---|
-//! | `enif_alloc_env` | `erts_alloc(ERTS_ALC_T_NIF, sizeof(ErlNifEnv))` + `setup_nif_env(msg_env, NULL, NULL)` (`:669-675`) | delegates to [`NifHost::alloc_env`] on the host of the **current NIF call** — see "How `enif_alloc_env` finds its host" below |
+//! | `enif_alloc_env` | `erts_alloc_fnf(ERTS_ALC_T_NIF, sizeof(struct enif_msg_environment_t))` + `setup_nif_env(msg_env, NULL, NULL)` (`:669-675`) | delegates to [`NifHost::alloc_env`] on the host of the **current NIF call** — see "How `enif_alloc_env` finds its host" below |
 //! | `enif_free_env` | `enif_clear_env(env); erts_free(ERTS_ALC_T_NIF, env);` (`:676-680`) | delegates to [`NifHost::free_env`] — the host owns every env it allocated ([`NifHost::alloc_env`]) |
 //! | `enif_make_copy` | `make_copy(dst_env, src_term, NULL)` — `size_object` + `copy_struct` onto `dst_env`'s heap (`:1194-1197`, `:843-858`) | delegates to [`NifHost::make_copy`]; when the hook is unsupported it answers `THE_NON_VALUE` |
 //! | `enif_priv_data` | `env->mod_nif->priv_data` (`:609-612`) | delegates to [`NifHost::priv_data`] — the pointer the library's `load` callback produced (the loader keeps it in [`crate::nif::loader::NifLibrary::priv_data`]) |
@@ -84,12 +84,13 @@ pub(super) const fn populate(mut api: ErlNifApi) -> ErlNifApi {
 
 /// `ErlNifEnv* enif_alloc_env(void);`
 ///
-/// The C allocates the env itself (`erts_alloc(ERTS_ALC_T_NIF, …)` + `setup_nif_env`,
-/// `erl_nif.c:669-675`); here the allocation and ownership belong to the runtime, i.e. to
-/// [`NifHost::alloc_env`] — the same hook [`enif_free_env`] hands the pointer back to. Since this
-/// entry point takes **no argument**, it cannot name a host itself: it reaches the host of the NIF
-/// call the calling thread is inside through the thread-local current-host stack `NifEnv::new`
-/// publishes and `NifEnv`'s `Drop` withdraws (`crate::nif::host`), and forwards to the hook.
+/// The C allocates a message environment itself (`erts_alloc_fnf(ERTS_ALC_T_NIF, …)` +
+/// `setup_nif_env(msg_env, NULL, NULL)`, `erl_nif.c:669-675`); here the allocation and ownership
+/// belong to the runtime, i.e. to [`NifHost::alloc_env`] — the same hook [`enif_free_env`] hands the
+/// pointer back to. Since this entry point takes **no argument**, it cannot name a host itself: it
+/// reaches the host of the NIF call the calling thread is inside through the thread-local
+/// current-host stack `NifEnv::new` publishes and `NifEnv`'s `Drop` withdraws
+/// (`crate::nif::host`), and forwards to the hook.
 ///
 /// `NULL` is answered when the thread is not inside a NIF call (no live env, so no host to delegate
 /// to) and for a host that does not support message envs (the trait default) — never a crate-owned
@@ -195,7 +196,7 @@ mod tests {
     use crate::nif::types::ErlNifEnv;
     use beam_alloc::Heap;
     use beam_term::atom::AtomTable;
-    use beam_term::prelude::{is_small, make_small, Eterm};
+    use beam_term::prelude::{is_atom, is_small, make_small, Eterm};
 
     /// The slots this file populates are all four of the extra-environment family.
     #[test]
@@ -257,6 +258,53 @@ mod tests {
         fn alloc_env(&mut self) -> Option<*mut ErlNifEnv> {
             self.env
         }
+    }
+
+    /// The pointer `enif_alloc_env` answers really is the env a supporting host handed out: it is
+    /// recoverable as a `NifEnv` and the host behind it works (its atom table is reachable), which is
+    /// the whole point of delegating instead of allocating a crate-owned env.
+    ///
+    /// A host cannot *build* a genuine `NifEnv` for itself through this crate's public API (the
+    /// constructor wants a `&mut dyn NifHost`, which `fn alloc_env(&mut self)` cannot hand itself), so
+    /// this test builds one in the test body over a second host and has the current host hand out
+    /// that pointer.
+    #[test]
+    fn alloc_env_hands_out_a_genuinely_usable_env() {
+        let mut msg_host = AllocEnvHost::new(None);
+        let mut msg_env = NifEnv::new(&mut msg_host);
+        let msg_ptr = msg_env.as_ptr();
+
+        let mut call_host = AllocEnvHost::new(Some(msg_ptr));
+        let call_env = NifEnv::new(&mut call_host);
+
+        // SAFETY: `call_env` is live, so this reaches `call_host`.
+        let p = unsafe { enif_alloc_env() };
+        assert_eq!(p, msg_ptr, "the host's own pointer comes back verbatim");
+
+        // It really is a `NifEnv`: recover it and use the host behind it.
+        {
+            // SAFETY: `p` came from `NifEnv::as_ptr` on `msg_env`, which is alive here.
+            let recovered = unsafe { NifEnv::from_opaque(p) }.expect("non-null");
+            assert_eq!(recovered.pending_exception(), None, "a message env starts clean");
+            let atom = recovered
+                .host()
+                .intern_atom("msg_env_atom")
+                .expect("the recovered host interns");
+            assert!(is_atom(atom));
+            assert_eq!(
+                recovered.host().atom_name(atom).as_deref(),
+                Some("msg_env_atom"),
+                "the recovered env is usable, atoms included"
+            );
+        }
+
+        // Out-of-order teardown: the first-published env goes first, and only its own entry leaves.
+        drop(msg_env);
+        // SAFETY: `call_env` is still live, so its host is still current.
+        assert_eq!(unsafe { enif_alloc_env() }, msg_ptr);
+        drop(call_env);
+        // SAFETY: no env is live on this thread any more.
+        assert!(unsafe { enif_alloc_env() }.is_null());
     }
 
     /// Outside a NIF call there is no current host, so the answer is `NULL` — never a fabricated
