@@ -13,10 +13,10 @@ use beam_common::Result;
 use beam_term::prelude::Eterm;
 
 use crate::copy::Copier;
+use crate::heap_info::HeapObservable;
 use crate::policy::HeapPolicy;
 use crate::space::{FromSet, HeapSpace};
 use crate::stats::GcStats;
-
 /// Which collection a [`Collector`] ran.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CollectionKind {
@@ -88,6 +88,12 @@ impl Collector {
         self.stats
     }
 
+    /// The number of minor collections run since the last fullsweep — the C `GEN_GCS`, and
+    /// the value the `garbage_collection` item reports as `minor_gcs`.
+    pub fn minor_gcs(&self) -> u32 {
+        self.minor_since_major
+    }
+
     /// Whether the nursery can no longer satisfy `need_words` more words.
     pub fn should_collect(&self, need_words: usize) -> bool {
         self.young.available_words() < need_words
@@ -96,7 +102,7 @@ impl Collector {
     /// Runs a collection, picking minor vs major by policy and escalating a
     /// would-not-fit minor to a major.
     pub fn collect(&mut self, roots: &mut [Eterm]) -> Result<Collection> {
-        let kind = if self.minor_since_major >= self.policy.fullsweep_after
+        let kind = if self.policy.fullsweep_due(self.minor_since_major)
             || self.mature.available_words() < self.young.used_words()
         {
             CollectionKind::Major
@@ -117,12 +123,16 @@ impl Collector {
         // The destination must fit the whole nursery up front (immediate promotion, no
         // partial-copy rollback); `collect` escalates to a major when it would not.
         let stats = Copier::new(&from, &mut self.mature).run(roots)?;
+        let used = self.young.used_words();
         self.young.reset();
         self.minor_since_major += 1;
         self.stats.words_copied += stats.words_copied;
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.minor_collections += 1;
+        // The nursery is empty again: size it for the next round (the C's minor-time
+        // young-heap resize, `erl_gc.c:1493`).
+        self.resize_nursery(used)?;
         Ok(stats)
     }
 
@@ -131,10 +141,14 @@ impl Collector {
         let mut from = FromSet::new();
         from.add(&self.young);
         from.add(&self.mature);
-        let live = self.young.used_words() + self.mature.used_words();
+        let used = self.young.used_words();
+        let live = used + self.mature.used_words();
+        // Size the fresh space from the heap policy: grow, shrink or keep the current
+        // mature capacity (`HeapPolicy::mature_after_fullsweep`, the C
+        // `adjust_after_fullsweep`).
         let size = self
             .policy
-            .size_after_fullsweep(live, self.policy.need_reserve_words);
+            .mature_after_fullsweep(self.mature.capacity_words(), live, 0);
         let alloc = self.young.allocator().clone();
         // Sized up front so the copy always fits — a collection never leaves the
         // from-space half-forwarded.
@@ -147,6 +161,43 @@ impl Collector {
         self.stats.words_reclaimed += stats.words_reclaimed;
         self.stats.objects_copied += stats.objects_copied;
         self.stats.major_collections += 1;
+        self.resize_nursery(used)?;
         Ok(stats)
+    }
+
+    /// Sizes the (now empty) nursery for the next round from the heap-size policy — the
+    /// C's `next_heap_size(p, stack_size + MAX(size_before, need), 0)` applied to the
+    /// nursery (`erl_gc.c:1493`). A nursery that filled up grows, one left mostly empty
+    /// shrinks, and one in between keeps its size; the space is only replaced when the
+    /// target differs, so a steady-state workload pays nothing.
+    fn resize_nursery(&mut self, used_words: usize) -> Result<()> {
+        let capacity = self.young.capacity_words();
+        let target = self.policy.young_after_collection(capacity, used_words);
+        if target != capacity {
+            let alloc = self.young.allocator().clone();
+            self.young = HeapSpace::with_allocator(alloc, target)?;
+        }
+        Ok(())
+    }
+}
+
+impl HeapObservable for Collector {
+    /// Minors since the last fullsweep.
+    fn minor_gcs(&self) -> u32 {
+        self.minor_since_major
+    }
+
+    /// The nursery (the "heap" in the C sense) capacity, in words.
+    fn heap_size_words(&self) -> usize {
+        self.young.capacity_words()
+    }
+
+    /// The nursery plus the mature generation (the C's `heap_sz + old heap`), in words.
+    fn total_heap_size_words(&self) -> usize {
+        self.young.capacity_words() + self.mature.capacity_words()
+    }
+
+    fn heap_policy(&self) -> &HeapPolicy {
+        &self.policy
     }
 }
