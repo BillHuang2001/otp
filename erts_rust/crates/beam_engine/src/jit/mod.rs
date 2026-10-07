@@ -66,11 +66,13 @@ use crate::context::ExecutionContext;
 use crate::Machine;
 
 pub mod baseline;
+pub mod cache;
 #[cfg(feature = "jit-cranelift")]
 pub mod cranelift;
 pub mod emitter;
 pub mod tiering;
 
+pub use cache::CodeCache;
 pub use tiering::{TierPolicy, DEFAULT_BASELINE_THRESHOLD, DEFAULT_HOT_THRESHOLD};
 
 /// An execution tier of the typed IR.

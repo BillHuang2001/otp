@@ -312,7 +312,9 @@ impl Machine {
     /// * [`Tier::BaselineJit`] — the native baseline backend
     ///   ([`crate::jit::baseline::BaselineJit`]): it compiles the module's basic
     ///   blocks to x86-64 and runs the export through a driver loop that falls back
-    ///   to one interpreter step per un-lowered instruction.
+    ///   to one interpreter step per un-lowered instruction. The compilation is
+    ///   **cached** across calls ([`crate::jit::cache`]): a module compiled once is
+    ///   reused by every later run of this tier on the same thread, with no recompile.
     /// * [`Tier::Cranelift`] — the optional Cranelift hot tier
     ///   (`crate::jit::cranelift::CraneliftJit`), compiled in only with the
     ///   `jit-cranelift` Cargo feature: it lowers each IR function into a native
@@ -332,9 +334,9 @@ impl Machine {
         match tier {
             Tier::Interpreter => self.run_export(module, function, arity, args, ctx),
             Tier::BaselineJit => {
-                use crate::jit::JitBackend;
-                let mut backend = crate::jit::baseline::BaselineJit::new();
-                backend.run_export(self, module, function, arity, args, ctx)
+                // Reuse the per-thread compiled-block cache: a module compiled once is
+                // not recompiled on a later run of the same tier (see `jit::cache`).
+                crate::jit::cache::run_baseline_cached(self, module, function, arity, args, ctx)
             }
             Tier::Cranelift => crate::jit::run_cranelift(self, module, function, arity, args, ctx),
         }
