@@ -29,6 +29,31 @@
 //! The second header word holds the owning carrier's base address, which is what
 //! makes block→carrier recovery O(1) without super-aligning the payload.
 //!
+//! # The flag bits
+//!
+//! The flag byte is **7 of its 8 bits used** (bit 7 stays free for a future bit),
+//! so the field width is unchanged and the whole `flags` byte still round-trips
+//! losslessly. The bits model the legacy `Block_t`/`bhdr` block taxonomy
+//! (`erts/emulator/beam/erl_alloc_util.h`): the legacy header steals the bits below
+//! the alignment (`INV_UNIT_MASK`, i.e. the low 4 bits of a 16-byte-`Unit_t` word)
+//! plus the highest word bit for its flags (`BLK_FLG_MASK`), and derives the
+//! single-/multi-block carrier kind from a flag combination
+//! (`IS_SBC_BLK`/`IS_MBC_BLK`, `SBC_BLK_HDR_FLG`).
+//!
+//! | Bit | [`BlockFlags`] | Legacy anchor |
+//! |---|---|---|
+//! | 0 | `is_free` | free-block marker (`THIS_FREE_BLK_HDR_FLG`) |
+//! | 1 | `is_large` | dedicated (single-block) carrier block |
+//! | 2 | `last_in_carrier` | `LAST_BLK_HDR_FLG` |
+//! | 3 | `is_sbc` / `is_mbc` | `IS_SBC_BLK` / `IS_MBC_BLK` carrier kind |
+//! | 4 | `is_mseg` | carrier sourced from the `mseg` allocator |
+//! | 5 | `is_fixed_size` | `fix_alloc` (`ERTS_ALC_A_FIXED_SIZE`) block |
+//! | 6 | `is_super_aligned` | super-aligned carrier (`ERTS_HAVE_MSEG_SUPER_ALIGNED`) |
+//! | 7 | — free — | |
+//!
+//! [`ALL_FLAGS`] is the union of every bit this module defines; the allocator's
+//! header plausibility check rejects a header whose flag byte has any other bit set.
+//!
 //! `unsafe` is confined to the marked functions below; every `unsafe fn` has a
 //! `# Safety` section and every `unsafe` block a `// SAFETY:` rationale
 //! (`beam_common::safety`).
@@ -56,10 +81,39 @@ const FLAG_FREE: u8 = 1 << 0;
 const FLAG_LARGE: u8 = 1 << 1;
 /// The block is the last one in its carrier.
 const FLAG_LAST_IN_CARRIER: u8 = 1 << 2;
+/// The block belongs to a **single-block carrier** (SBC): its carrier holds this
+/// one block only. When clear the block belongs to a **multi-block carrier**
+/// (MBC), which is subdivided into many equal (or variable) blocks.
+///
+/// Mirrors the legacy `IS_SBC_BLK`/`IS_MBC_BLK` predicate pair
+/// (`erl_alloc_util.h:424-425`), which distinguishes the two carrier kinds from a
+/// flag combination (`SBC_BLK_HDR_FLG`). This crate models the same distinction
+/// with one dedicated bit plus its read-only complement.
+const FLAG_SBC: u8 = 1 << 3;
+/// The block's carrier was obtained from the memory-segment (`mseg`) allocator
+/// (`Allctr_t::mseg_alloc`, `erl_alloc_util.h:81`) rather than the raw system
+/// allocator.
+const FLAG_MSEG: u8 = 1 << 4;
+/// The block was handed out by a fixed-size allocator (`fix_alloc`,
+/// `ERTS_ALC_A_FIXED_SIZE`), i.e. every block of its carrier has the same size.
+const FLAG_FIXED_SIZE: u8 = 1 << 5;
+/// The block lives in a super-aligned carrier (`ERTS_HAVE_MSEG_SUPER_ALIGNED` /
+/// `ERTS_SUPER_ALIGN_BITS`, `erl_alloc_util.h:323-349`).
+const FLAG_SUPER_ALIGNED: u8 = 1 << 6;
 
 /// Every flag bit this module defines; a header whose flag byte has any other bit
 /// set is corrupt (used by the allocator's header plausibility check).
-pub const ALL_FLAGS: u8 = FLAG_FREE | FLAG_LARGE | FLAG_LAST_IN_CARRIER;
+///
+/// The 7 defined bits fit the 8-bit flag byte with one bit to spare, so the field
+/// width is deliberately left at 8 bits (see the module docs).
+pub const ALL_FLAGS: u8 =
+    FLAG_FREE | FLAG_LARGE | FLAG_LAST_IN_CARRIER | FLAG_SBC | FLAG_MSEG | FLAG_FIXED_SIZE
+        | FLAG_SUPER_ALIGNED;
+
+// `ALL_FLAGS` must account for exactly the seven bits defined above (`0b0111_1111`),
+// so adding a bit without extending the union (or vice versa) fails to compile.
+const _: () = assert!(ALL_FLAGS == 0b0111_1111);
+const _: () = assert!(ALL_FLAGS.count_ones() == 7);
 
 /// The `class` sentinel of a block that has no size class: a block carved from a
 /// dedicated (large) carrier.
@@ -146,6 +200,90 @@ impl BlockFlags {
     /// Marks the block as the last one in its carrier.
     pub const fn set_last_in_carrier(&mut self) {
         self.0 |= FLAG_LAST_IN_CARRIER;
+    }
+
+    /// Whether the block belongs to a single-block carrier (SBC).
+    pub const fn is_sbc(self) -> bool {
+        self.0 & FLAG_SBC != 0
+    }
+
+    /// Marks the block as a single-block-carrier (SBC) block.
+    pub const fn set_sbc(&mut self) {
+        self.0 |= FLAG_SBC;
+    }
+
+    /// Clears the single-block-carrier bit (the block is a multi-block-carrier
+    /// block).
+    pub const fn clear_sbc(&mut self) {
+        self.0 &= !FLAG_SBC;
+    }
+
+    /// Whether the block belongs to a multi-block carrier (MBC).
+    ///
+    /// The complement of [`BlockFlags::is_sbc`], exactly as the legacy
+    /// `IS_MBC_BLK` is `!IS_SBC_BLK`.
+    pub const fn is_mbc(self) -> bool {
+        !self.is_sbc()
+    }
+
+    /// Marks the block as a multi-block-carrier (MBC) block.
+    pub const fn set_mbc(&mut self) {
+        self.clear_sbc();
+    }
+
+    /// Whether the block's carrier came from the `mseg` allocator.
+    pub const fn is_mseg(self) -> bool {
+        self.0 & FLAG_MSEG != 0
+    }
+
+    /// Marks the block's carrier as `mseg`-backed.
+    pub const fn set_mseg(&mut self) {
+        self.0 |= FLAG_MSEG;
+    }
+
+    /// Clears the `mseg`-backed bit.
+    pub const fn clear_mseg(&mut self) {
+        self.0 &= !FLAG_MSEG;
+    }
+
+    /// Whether the block was handed out by a fixed-size allocator.
+    pub const fn is_fixed_size(self) -> bool {
+        self.0 & FLAG_FIXED_SIZE != 0
+    }
+
+    /// Marks the block as fixed-size.
+    pub const fn set_fixed_size(&mut self) {
+        self.0 |= FLAG_FIXED_SIZE;
+    }
+
+    /// Clears the fixed-size bit.
+    pub const fn clear_fixed_size(&mut self) {
+        self.0 &= !FLAG_FIXED_SIZE;
+    }
+
+    /// Whether the block lives in a super-aligned carrier.
+    pub const fn is_super_aligned(self) -> bool {
+        self.0 & FLAG_SUPER_ALIGNED != 0
+    }
+
+    /// Marks the block as super-aligned.
+    pub const fn set_super_aligned(&mut self) {
+        self.0 |= FLAG_SUPER_ALIGNED;
+    }
+
+    /// Clears the super-aligned bit.
+    pub const fn clear_super_aligned(&mut self) {
+        self.0 &= !FLAG_SUPER_ALIGNED;
+    }
+
+    /// Every flag bit this module defines ([`ALL_FLAGS`]).
+    pub const fn all() -> BlockFlags {
+        BlockFlags(ALL_FLAGS)
+    }
+
+    /// Whether any bit outside [`ALL_FLAGS`] is set (a corrupt flag byte).
+    pub const fn has_unknown_bits(self) -> bool {
+        self.0 & !ALL_FLAGS != 0
     }
 }
 
@@ -354,7 +492,138 @@ mod tests {
             let loaded = unsafe { BlockHeader::load(buf.0.as_mut_ptr()) };
             assert_eq!(loaded.flags, bits);
         }
-        assert_eq!(ALL_FLAGS, 0b111);
+        assert_eq!(ALL_FLAGS, 0b0111_1111);
+    }
+
+    /// The single-bit flag constants, in bit order, plus their meaning.
+    fn every_flag_bit() -> [(u8, &'static str); 7] {
+        [
+            (FLAG_FREE, "free"),
+            (FLAG_LARGE, "large"),
+            (FLAG_LAST_IN_CARRIER, "last_in_carrier"),
+            (FLAG_SBC, "sbc"),
+            (FLAG_MSEG, "mseg"),
+            (FLAG_FIXED_SIZE, "fixed_size"),
+            (FLAG_SUPER_ALIGNED, "super_aligned"),
+        ]
+    }
+
+    #[test]
+    fn every_defined_bit_is_a_distinct_power_of_two_and_is_covered_by_all_flags() {
+        let bits = every_flag_bit();
+        let mut union = 0u8;
+        for (bit, name) in bits {
+            assert_eq!(bit.count_ones(), 1, "flag {name} must be a single bit");
+            assert_eq!(union & bit, 0, "flag {name} collides with an earlier bit");
+            union |= bit;
+            // ALL_FLAGS covers every bit this module defines.
+            assert_eq!(ALL_FLAGS & bit, bit, "ALL_FLAGS misses {name}");
+        }
+        assert_eq!(union, ALL_FLAGS, "ALL_FLAGS must be exactly the union");
+        assert_eq!(BlockFlags::all().bits(), ALL_FLAGS);
+        // The flag byte has room: 7 of 8 bits are used, so it still fits a `u8`
+        // (the most-significant bit of the byte stays free).
+        assert_eq!(ALL_FLAGS.count_ones(), 7);
+        assert_eq!(ALL_FLAGS.leading_zeros(), 1);
+    }
+
+    #[test]
+    fn new_flag_bits_round_trip_through_the_header() {
+        let mut buf = scratch();
+        for (bit, name) in every_flag_bit() {
+            let mut flags = BlockFlags::empty();
+            // Set exactly one bit at a time (raw, so bits unset by accessors are
+            // exercised too) and check the packed header preserves it.
+            let hdr = BlockHdr {
+                size: 64,
+                payload_offset: 0,
+                class: 1,
+                carrier: core::ptr::null_mut(),
+                flags: bit,
+            };
+            // SAFETY: `buf` is 16-aligned and header-sized.
+            unsafe { BlockHeader::store(buf.0.as_mut_ptr(), hdr) };
+            // SAFETY: just stored.
+            let loaded = unsafe { BlockHeader::load(buf.0.as_mut_ptr()) };
+            assert_eq!(loaded.flags, bit, "{name} must round-trip");
+            // ... and the accessor sees it.
+            flags.0 = loaded.flags;
+            assert!(!flags.has_unknown_bits(), "{name} must be a known bit");
+        }
+    }
+
+    #[test]
+    fn new_flag_accessors() {
+        let mut flags = BlockFlags::empty();
+        // SBC / MBC are complements.
+        assert!(flags.is_mbc());
+        assert!(!flags.is_sbc());
+        flags.set_sbc();
+        assert!(flags.is_sbc());
+        assert!(!flags.is_mbc());
+        flags.set_mbc();
+        assert!(flags.is_mbc());
+        flags.set_sbc();
+        flags.clear_sbc();
+        assert!(flags.is_mbc());
+        // mseg.
+        assert!(!flags.is_mseg());
+        flags.set_mseg();
+        assert!(flags.is_mseg());
+        flags.clear_mseg();
+        assert!(!flags.is_mseg());
+        // fixed-size.
+        assert!(!flags.is_fixed_size());
+        flags.set_fixed_size();
+        assert!(flags.is_fixed_size());
+        flags.clear_fixed_size();
+        assert!(!flags.is_fixed_size());
+        // super-aligned.
+        assert!(!flags.is_super_aligned());
+        flags.set_super_aligned();
+        assert!(flags.is_super_aligned());
+        flags.clear_super_aligned();
+        assert!(!flags.is_super_aligned());
+    }
+
+    #[test]
+    fn the_full_flag_set_survives_the_header_encoding() {
+        let mut buf = scratch();
+        let mut flags = BlockFlags::all();
+        // `all()` is exactly every bit; make sure the whole byte round-trips.
+        assert_eq!(flags.bits(), ALL_FLAGS);
+        let hdr = BlockHdr {
+            size: 16 + 256,
+            payload_offset: 0,
+            class: 0,
+            carrier: core::ptr::null_mut(),
+            flags: flags.bits(),
+        };
+        // SAFETY: `buf` is 16-aligned and header-sized.
+        unsafe { BlockHeader::store(buf.0.as_mut_ptr(), hdr) };
+        // SAFETY: just stored.
+        let loaded = unsafe { BlockHeader::load(buf.0.as_mut_ptr()) };
+        flags.0 = loaded.flags;
+        assert_eq!(loaded.flags, ALL_FLAGS);
+        assert!(flags.is_free());
+        assert!(flags.is_large());
+        assert!(flags.last_in_carrier());
+        assert!(flags.is_sbc());
+        assert!(flags.is_mseg());
+        assert!(flags.is_fixed_size());
+        assert!(flags.is_super_aligned());
+        assert!(!flags.has_unknown_bits());
+    }
+
+    #[test]
+    fn unknown_flag_bits_are_rejected() {
+        assert!(!BlockFlags::empty().has_unknown_bits());
+        assert!(!BlockFlags::all().has_unknown_bits());
+        // Bit 7 is the one bit the taxonomy leaves free.
+        assert!(BlockFlags::from_bits(0x80).has_unknown_bits());
+        assert!(BlockFlags::from_bits(0xff).has_unknown_bits());
+        // A known bit plus an unknown one is still unknown.
+        assert!(BlockFlags::from_bits(ALL_FLAGS | 0x80).has_unknown_bits());
     }
 
     #[test]
