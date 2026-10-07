@@ -261,7 +261,7 @@ Written by every `run`/`baseline`; consumed by `compare`. Durations/latencies in
   `... test --workspace` GREEN, plus a demonstrated `run --quick` producing real numbers for
   `baseline`/`erlc_compiler`/`elixir_compiler`/`cowboy` and honest `skipped(reason)` rows for the rest.
 
-## Measured (quick profile — refreshed 2026-10-06 on commit `3f08453fef`)
+## Measured (quick profile — refreshed on the `foreign`-workload change; see `git log` for the commit)
 Real numbers from two `--quick` runs on the build host. Artifacts: `out/milestone.json`
 (`bench run --quick --runtime all`) and `out/nix-targets.json`
 (`BENCH_TRY_NIX=1 bench run --quick --runtime sys --workloads khepri,emqx`). A single host and a
