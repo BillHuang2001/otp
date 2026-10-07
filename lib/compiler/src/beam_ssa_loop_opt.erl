@@ -134,6 +134,15 @@
 %%%
 %%% NOT IMPLEMENTED (see the report / CONTEXT.md)
 %%%
+%%% REACH LIMITATION (measured): at this pipeline point the CFG of ordinary
+%%% Erlang code contains no optimizable loop -- a self-recursive function is
+%%% still a tail `call' (no back edge) and a `receive' loop's header carries
+%%% no phis. The pass therefore rewrites nothing on real modules: compiling
+%%% `lib/stdlib/src' with and without `+loop_opt' yields byte-identical
+%%% generated code, only the `compile_info' chunk records the option. The
+%%% loop/IV/strength-reduction transforms above are consequently validated on
+%%% hand-built SSA driven directly through `beam_ssa_loop_opt:opt/1'.
+%%%
 %%% * Unrolling. A sound unroller needs an exact trip count. The pass runs in
 %%%   the prologue phase, i.e. before the SSA type analysis, so neither
 %%%   `#t_integer{elements=...}' nor `beam_bounds' information is available;
