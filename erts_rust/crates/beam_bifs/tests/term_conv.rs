@@ -1,0 +1,913 @@
+//! Integration tests for the `term_conv` BIFs —
+//! `erlang:bitstring_to_list/1`, `erlang:delete_element/2`,
+//! `erlang:insert_element/3`, `erlang:iolist_to_iovec/1`, `erlang:is_integer/3`,
+//! `erlang:display/1`, `erlang:display_string/2` and
+//! `binary:referenced_byte_size/1` — driven through
+//! [`BifRegistry::call`](beam_bifs::BifRegistry::call) (the crate's public seam).
+//!
+//! Every expectation is pinned to the OTP 29 / erts-17.1 oracle; the probe is
+//! quoted at the assertion. One test re-runs the shared goldens under the live
+//! system `erl` and **skips loudly** when the oracle is unavailable.
+//!
+//! Bitstring arguments/results are built and read with the sibling **safe**
+//! `beam_codec::term` helpers, because the crate's own bitstring helpers are
+//! private. All term construction goes through the `BifContext`, so its heap
+//! borrow stays unique.
+
+use std::process::Command;
+
+use beam_alloc::Heap;
+use beam_bifs::{default_registry, BifContext, BifRegistry, BytesSink};
+use beam_codec::term as codec_term;
+use beam_common::BeamError;
+use beam_process::ProcessId;
+use beam_term::{atom_val, compare::eq, is_small, signed_value, AtomTable, Eterm, NIL};
+
+fn seeded_atoms() -> AtomTable {
+    let mut atoms = AtomTable::new();
+    atoms.seed([
+        "true", "false", "ok", "a", "b", "c", "x", "stdout", "stderr", "stdin", "bogus",
+    ]);
+    atoms
+}
+
+fn heap() -> Heap {
+    Heap::new(16 * 1024).expect("test heap")
+}
+
+/// Calls the registered BIF `module:name/arity`.
+fn call(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    module: &str,
+    name: &str,
+    arity: u32,
+    args: &[Eterm],
+) -> Result<Eterm, BeamError> {
+    reg.call(module, name, arity, ctx, args)
+}
+
+/// A small integer on the context heap.
+fn small(ctx: &mut BifContext<'_>, v: i64) -> Eterm {
+    ctx.int(v).expect("a small int fits")
+}
+
+/// A byte-aligned binary on the context heap.
+fn bin(ctx: &mut BifContext<'_>, bytes: &[u8]) -> Eterm {
+    codec_term::make_binary(ctx.heap(), bytes).expect("the binary fits")
+}
+
+/// A `size_bits`-wide bitstring on the context heap.
+fn bitstr(ctx: &mut BifContext<'_>, bytes: &[u8], size_bits: usize) -> Eterm {
+    codec_term::make_bitstring(ctx.heap(), bytes, size_bits).expect("the bitstring fits")
+}
+
+/// The proper list `[v0, v1, …]` of the small integers `values`.
+fn ints(ctx: &mut BifContext<'_>, values: &[i64]) -> Eterm {
+    let elems: Vec<Eterm> = values.iter().map(|&v| ctx.int(v).expect("fits")).collect();
+    ctx.list(&elems).expect("the list fits")
+}
+
+/// The small-integer elements of a proper list result, stopping at the first
+/// non-integer element (so a list ending in a trailing bitstring still reads).
+fn int_elements(list: Eterm) -> Vec<i64> {
+    let mut out = Vec::new();
+    let mut cur = list;
+    while let Ok(head) = codec_term::cons_head(cur) {
+        if !is_small(head) {
+            break;
+        }
+        out.push(signed_value(head));
+        cur = codec_term::cons_tail(cur).expect("a cons");
+    }
+    out
+}
+
+/// The `(packed bytes, bit length)` of a bitstring term, canonicalized so a
+/// non-zero source bit offset cannot hide.
+fn bits_of(term: Eterm) -> (Vec<u8>, usize) {
+    let (bytes, offset, size_bits) =
+        codec_term::bitstring_bytes(term).expect("the result is a bitstring");
+    let mut packed = vec![0u8; size_bits.div_ceil(8)];
+    for i in 0..size_bits {
+        let bit = offset + i;
+        if (bytes[bit / 8] >> (7 - (bit % 8))) & 1 == 1 {
+            packed[i / 8] |= 0x80 >> (i % 8);
+        }
+    }
+    (packed, size_bits)
+}
+
+/// The `true`/`false` atom a BIF returned, as a `bool`.
+fn as_bool(atoms: &AtomTable, term: Eterm) -> bool {
+    match atoms.name(atom_val(term)) {
+        Some("true") => true,
+        Some("false") => false,
+        other => panic!("expected a boolean, got {other:?}"),
+    }
+}
+
+/// Runs one `-eval` statement under the system `erl`; `None` (with a loud
+/// message) when the oracle is unavailable, so the cross-check skips instead of
+/// failing.
+fn oracle_eval(statement: &str) -> Option<String> {
+    match Command::new("erl")
+        .args(["-noshell", "-eval", statement])
+        .output()
+    {
+        Ok(out) if out.status.success() => Some(String::from_utf8_lossy(&out.stdout).into_owned()),
+        Ok(out) => {
+            eprintln!(
+                "SKIP: the oracle `erl` failed ({}); stderr: {}",
+                out.status,
+                String::from_utf8_lossy(&out.stderr)
+            );
+            None
+        }
+        Err(err) => {
+            eprintln!("SKIP: no `erl` oracle on PATH ({err})");
+            None
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// bitstring_to_list/1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn bitstring_to_list_of_a_whole_byte_binary() {
+    // ORACLE: `erlang:bitstring_to_list(<<1,2,3>>)` => `[1,2,3]`;
+    //         `erlang:bitstring_to_list(<<>>)` => `[]`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let three = bin(&mut ctx, &[1, 2, 3]);
+    let list =
+        call(&reg, &mut ctx, "erlang", "bitstring_to_list", 1, &[three]).expect("a bitstring");
+    assert_eq!(int_elements(list), vec![1, 2, 3]);
+
+    let empty = bin(&mut ctx, &[]);
+    let list =
+        call(&reg, &mut ctx, "erlang", "bitstring_to_list", 1, &[empty]).expect("a bitstring");
+    assert!(eq(list, NIL, &atoms), "an empty bitstring is the empty list");
+}
+
+#[test]
+fn bitstring_to_list_keeps_the_trailing_bits_as_a_bitstring() {
+    // ORACLE: `erlang:bitstring_to_list(<<1,2,3:4>>)` => `[1,2,<<3:4>>]`;
+    //         `erlang:bitstring_to_list(<<1:9>>)` => `[0,<<1:1>>]`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    // `<<1,2,3:4>>`: two whole bytes then the 4-bit remainder `0011`.
+    let partial = bitstr(&mut ctx, &[1, 2, 0b0011_0000], 20);
+    let list =
+        call(&reg, &mut ctx, "erlang", "bitstring_to_list", 1, &[partial]).expect("a bitstring");
+    assert_eq!(int_elements(list), vec![1, 2]);
+    let tail = codec_term::cons_tail(list).expect("a cons");
+    let last = codec_term::cons_head(codec_term::cons_tail(tail).expect("a cons"))
+        .expect("the trailing element");
+    assert_eq!(bits_of(last), (vec![0b0011_0000], 4));
+
+    // `<<1:9>>`: one whole byte (0) then the 1-bit remainder (1).
+    let nine = bitstr(&mut ctx, &[0, 0b1000_0000], 9);
+    let list =
+        call(&reg, &mut ctx, "erlang", "bitstring_to_list", 1, &[nine]).expect("a bitstring");
+    assert_eq!(int_elements(list), vec![0]);
+    let last = codec_term::cons_head(codec_term::cons_tail(list).expect("a cons"))
+        .expect("the trailing element");
+    assert_eq!(bits_of(last), (vec![0b1000_0000], 1));
+}
+
+#[test]
+fn bitstring_to_list_rejects_non_bitstrings() {
+    // ORACLE: `erlang:bitstring_to_list([1,2])` and `(5)`/`(a)` are all `badarg`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let list = ints(&mut ctx, &[1, 2]);
+    let a = ctx.atom("a").expect("seeded");
+    let five = small(&mut ctx, 5);
+    let tuple = ctx.tuple(&[five]).expect("fits");
+    for term in [list, five, a, tuple, NIL] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "bitstring_to_list", 1, &[term]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// delete_element/2 and insert_element/3
+// ---------------------------------------------------------------------------
+
+#[test]
+fn delete_element_removes_the_indexed_element() {
+    // ORACLE: `erlang:delete_element(1,{a,b,c})` => `{b,c}`;
+    //         `erlang:delete_element(3,{a,b,c})` => `{a,b}`;
+    //         `erlang:delete_element(1,{a})` => `{}`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let c = ctx.atom("c").expect("seeded");
+    let tuple = ctx.tuple(&[a, b, c]).expect("fits");
+
+    let one = small(&mut ctx, 1);
+    let dropped = call(&reg, &mut ctx, "erlang", "delete_element", 2, &[one, tuple])
+        .expect("a tuple");
+    assert_eq!(codec_term::tuple_arity(dropped).expect("a tuple"), 2);
+    assert_eq!(codec_term::tuple_element(dropped, 0).expect("0"), b);
+    assert_eq!(codec_term::tuple_element(dropped, 1).expect("1"), c);
+
+    let three = small(&mut ctx, 3);
+    let dropped = call(&reg, &mut ctx, "erlang", "delete_element", 2, &[three, tuple])
+        .expect("a tuple");
+    assert_eq!(codec_term::tuple_element(dropped, 1).expect("1"), b);
+
+    let one_tuple = ctx.tuple(&[a]).expect("fits");
+    let emptied = call(
+        &reg,
+        &mut ctx,
+        "erlang",
+        "delete_element",
+        2,
+        &[one, one_tuple],
+    )
+    .expect("a tuple");
+    assert_eq!(codec_term::tuple_arity(emptied).expect("a tuple"), 0);
+}
+
+#[test]
+fn insert_element_accepts_one_past_the_last_position() {
+    // ORACLE: `erlang:insert_element(1,{a,b},x)` => `{x,a,b}`;
+    //         `erlang:insert_element(3,{a,b},x)` => `{a,b,x}`;
+    //         `erlang:insert_element(1,{},x)` => `{x}`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let x = ctx.atom("x").expect("seeded");
+    let tuple = ctx.tuple(&[a, b]).expect("fits");
+
+    let one = small(&mut ctx, 1);
+    let inserted = call(
+        &reg,
+        &mut ctx,
+        "erlang",
+        "insert_element",
+        3,
+        &[one, tuple, x],
+    )
+    .expect("a tuple");
+    assert_eq!(codec_term::tuple_arity(inserted).expect("a tuple"), 3);
+    assert_eq!(codec_term::tuple_element(inserted, 0).expect("0"), x);
+    assert_eq!(codec_term::tuple_element(inserted, 1).expect("1"), a);
+    assert_eq!(codec_term::tuple_element(inserted, 2).expect("2"), b);
+
+    let three = small(&mut ctx, 3);
+    let inserted = call(
+        &reg,
+        &mut ctx,
+        "erlang",
+        "insert_element",
+        3,
+        &[three, tuple, x],
+    )
+    .expect("a tuple");
+    assert_eq!(codec_term::tuple_element(inserted, 2).expect("2"), x);
+
+    let empty = ctx.tuple(&[]).expect("fits");
+    let inserted = call(
+        &reg,
+        &mut ctx,
+        "erlang",
+        "insert_element",
+        3,
+        &[one, empty, x],
+    )
+    .expect("a tuple");
+    assert_eq!(codec_term::tuple_arity(inserted).expect("a tuple"), 1);
+    assert_eq!(codec_term::tuple_element(inserted, 0).expect("0"), x);
+}
+
+#[test]
+fn delete_and_insert_element_reject_bad_indexes_and_non_tuples() {
+    // ORACLE: index `0`, an index past the bound (`4` on `{a,b,c}` for delete,
+    // `4` on `{a,b}` for insert), a non-integer index, a non-tuple and the empty
+    // tuple (for delete) are all `badarg`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a = ctx.atom("a").expect("seeded");
+    let b = ctx.atom("b").expect("seeded");
+    let two_tuple = ctx.tuple(&[a, b]).expect("fits");
+    let three_tuple = ctx.tuple(&[a, b, a]).expect("fits");
+    let empty = ctx.tuple(&[]).expect("fits");
+    let float = ctx.make_float(1.0).expect("fits");
+
+    let zero = small(&mut ctx, 0);
+    let one = small(&mut ctx, 1);
+    let three = small(&mut ctx, 3);
+    let four = small(&mut ctx, 4);
+
+    for index in [zero, four, float, a] {
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "erlang",
+                "delete_element",
+                2,
+                &[index, three_tuple]
+            ),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "erlang",
+                "insert_element",
+                3,
+                &[index, two_tuple, a]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+    // Index 3 is past the end of the 2-tuple for delete and insert.
+    assert!(matches!(
+        call(
+            &reg,
+            &mut ctx,
+            "erlang",
+            "delete_element",
+            2,
+            &[three, two_tuple]
+        ),
+        Err(BeamError::BadArg)
+    ));
+    // The empty tuple has no deletable element.
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "delete_element", 2, &[one, empty]),
+        Err(BeamError::BadArg)
+    ));
+    // Non-tuples.
+    let seven = small(&mut ctx, 7);
+    for term in [NIL, seven] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "delete_element", 2, &[one, term]),
+            Err(BeamError::BadArg)
+        ));
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "erlang",
+                "insert_element",
+                3,
+                &[one, term, a]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// binary:referenced_byte_size/1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn referenced_byte_size_is_the_byte_size() {
+    // ORACLE: `binary:referenced_byte_size(list_to_binary([1,2,3]))` => `3`;
+    //         `binary:referenced_byte_size(binary:copy(<<1>>,100))` => `100`;
+    //         `binary:referenced_byte_size(binary:copy(<<1>>,100000))` => `100000`.
+    // This runtime keeps every binary whole on the heap (there is no off-heap
+    // `BinRef`/`SubBits` producer), so the referenced size is the byte size —
+    // the C's `br == NULL` branch.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    for n in [0usize, 3, 64, 65, 100, 1000] {
+        let payload = vec![1u8; n];
+        let binary = bin(&mut ctx, &payload);
+        let size = call(
+            &reg,
+            &mut ctx,
+            "binary",
+            "referenced_byte_size",
+            1,
+            &[binary],
+        )
+        .expect("a bitstring");
+        assert_eq!(signed_value(size), n as i64, "a {n}-byte binary");
+    }
+
+    // A partial trailing byte truncates, exactly like `erlang:size/1`.
+    // ORACLE (runtime-built): `binary:referenced_byte_size(<<255:12>>)` truncates.
+    let twelve = bitstr(&mut ctx, &[0xFF, 0xF0], 12);
+    let size = call(
+        &reg,
+        &mut ctx,
+        "binary",
+        "referenced_byte_size",
+        1,
+        &[twelve],
+    )
+    .expect("a bitstring");
+    assert_eq!(signed_value(size), 1);
+
+    // ORACLE: `binary:referenced_byte_size([1,2])` and `(4)` are `badarg`.
+    let list = ints(&mut ctx, &[1, 2]);
+    let four = small(&mut ctx, 4);
+    for term in [list, four, NIL] {
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "binary",
+                "referenced_byte_size",
+                1,
+                &[term]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// iolist_to_iovec/1
+// ---------------------------------------------------------------------------
+
+#[test]
+fn iolist_to_iovec_merges_the_copied_components() {
+    // ORACLE: `erlang:iolist_to_iovec([1,2,<<"ab">>,[3,[<<"c">>]],<<"de">>])`
+    //   => `[<<1,2,97,98,3,99,100,101>>]` — every copied component merges.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let ab = bin(&mut ctx, b"ab");
+    let de = bin(&mut ctx, b"de");
+    let c = bin(&mut ctx, b"c");
+    let inner = ctx.list(&[c]).expect("fits");
+    let three = small(&mut ctx, 3);
+    let nested = ctx.list(&[three, inner]).expect("fits");
+    let one = small(&mut ctx, 1);
+    let two = small(&mut ctx, 2);
+    let iolist = ctx.list(&[one, two, ab, nested, de]).expect("fits");
+
+    let iovec =
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[iolist]).expect("an iolist");
+    assert_eq!(
+        int_elements(iovec).len(),
+        1,
+        "the copied run merges into one binary"
+    );
+    let merged = codec_term::cons_head(iovec).expect("one element");
+    assert_eq!(bits_of(merged), (vec![1, 2, 97, 98, 3, 99, 100, 101], 64));
+}
+
+#[test]
+fn iolist_to_iovec_empty_forms_are_the_empty_list() {
+    // ORACLE: `iolist_to_iovec([])`, `(<<>>)`, `([<<>>])` and `([<<>>,<<>>])` all
+    //   => `[]` (never `[<<>>]`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let empty = bin(&mut ctx, &[]);
+    let one_empty = ctx.list(&[empty]).expect("fits");
+    let two_empty = ctx.list(&[empty, empty]).expect("fits");
+    for input in [NIL, empty, one_empty, two_empty] {
+        let result = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[input])
+            .expect("a valid iolist");
+        assert!(eq(result, NIL, &atoms), "an empty iovec is the empty list");
+    }
+}
+
+#[test]
+fn iolist_to_iovec_accepts_a_bare_binary_and_a_bitstring_tail() {
+    // ORACLE: `iolist_to_iovec(<<"abc">>)` => `[<<"abc">>]`;
+    //         `iolist_to_iovec([1|<<2>>])` => `[<<1,2>>]`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let abc = bin(&mut ctx, b"abc");
+    let iovec =
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[abc]).expect("a binary");
+    assert_eq!(int_elements(iovec).len(), 1);
+    let only = codec_term::cons_head(iovec).expect("one element");
+    assert_eq!(bits_of(only), (b"abc".to_vec(), 24));
+
+    let two = bin(&mut ctx, &[2]);
+    let one = small(&mut ctx, 1);
+    let improper = ctx.cons(one, two).expect("fits");
+    let iovec = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[improper])
+        .expect("a bitstring tail");
+    assert_eq!(int_elements(iovec).len(), 1);
+    let merged = codec_term::cons_head(iovec).expect("one element");
+    assert_eq!(bits_of(merged), (vec![1, 2], 16));
+}
+
+#[test]
+fn iolist_to_iovec_borrows_a_component_over_the_copy_threshold() {
+    // ORACLE (`IOL_SHOULD_COPY`, `erl_iolist.c:39`; threshold
+    // `ERL_ONHEAP_BITS_LIMIT * 8` = 512 bytes):
+    //   `iolist_to_iovec([binary:copy(<<7>>,512), binary:copy(<<8>>,512)])`
+    //     => one 1024-byte binary (copied and merged);
+    //   `iolist_to_iovec([binary:copy(<<7>>,513), binary:copy(<<7>>,513)])`
+    //     => two 513-byte binaries (borrowed, kept in their own slots);
+    //   `iolist_to_iovec([B513,1,2])` => `[B513,<<1,2>>]`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let a512 = bin(&mut ctx, &vec![7u8; 512]);
+    let b512 = bin(&mut ctx, &vec![8u8; 512]);
+    let at_limit = ctx.list(&[a512, b512]).expect("fits");
+    let iovec =
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[at_limit]).expect("an iolist");
+    assert_eq!(int_elements(iovec).len(), 1);
+    let merged = codec_term::cons_head(iovec).expect("one element");
+    assert_eq!(bits_of(merged).1, 1024 * 8);
+
+    let b513 = bin(&mut ctx, &vec![7u8; 513]);
+    let b513_again = bin(&mut ctx, &vec![7u8; 513]);
+    let over = ctx.list(&[b513, b513_again]).expect("fits");
+    let iovec = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[over]).expect("an iolist");
+    assert_eq!(
+        int_elements(iovec).len(),
+        2,
+        "a borrowed component keeps its slot"
+    );
+    let first = codec_term::cons_head(iovec).expect("first");
+    assert_eq!(bits_of(first).1, 513 * 8);
+
+    let one = small(&mut ctx, 1);
+    let two = small(&mut ctx, 2);
+    let mixed = ctx.list(&[b513, one, two]).expect("fits");
+    let iovec = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[mixed]).expect("an iolist");
+    let first = codec_term::cons_head(iovec).expect("first");
+    assert_eq!(bits_of(first).1, 513 * 8);
+    let rest = codec_term::cons_tail(iovec).expect("a cons");
+    let second = codec_term::cons_head(rest).expect("second");
+    assert_eq!(bits_of(second), (vec![1, 2], 16));
+    let tail = codec_term::cons_tail(rest).expect("a cons");
+    assert!(eq(tail, NIL, &atoms), "the iovec is exactly two elements");
+}
+
+#[test]
+fn iolist_to_iovec_rejects_bad_arguments() {
+    // ORACLE: a bare integer (`iolist_to_iovec(5)`), a non-byte element (`[300]`,
+    // `[-1]`), a non-integer element (`[a]`), an improper list (`[1|2]`) and a
+    // **non-byte-aligned** bitstring anywhere in the list (`[<<1:4>>,<<2:4>>]`,
+    // `[1,<<2:4>>]`) are all `badarg`.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let five = small(&mut ctx, 5);
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[five]),
+        Err(BeamError::BadArg)
+    ));
+
+    let a = ctx.atom("a").expect("seeded");
+    let three_hundred = small(&mut ctx, 300);
+    let minus_one = small(&mut ctx, -1);
+    for elem in [three_hundred, minus_one, a] {
+        let list = ctx.list(&[elem]).expect("fits");
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[list]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    let one = small(&mut ctx, 1);
+    let two = small(&mut ctx, 2);
+    let improper = ctx.cons(one, two).expect("fits");
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[improper]),
+        Err(BeamError::BadArg)
+    ));
+
+    // Four bits is half a byte: rejected even though the pair would total a byte.
+    let odd = bitstr(&mut ctx, &[0b0001_0000], 4);
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[odd]),
+        Err(BeamError::BadArg)
+    ));
+    let even = bitstr(&mut ctx, &[0b0010_0000], 4);
+    let pair = ctx.list(&[odd, even]).expect("fits");
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[pair]),
+        Err(BeamError::BadArg)
+    ));
+
+    let three = bin(&mut ctx, &[1, 2, 3]);
+    let mixed = ctx.list(&[three, odd]).expect("fits");
+    assert!(matches!(
+        call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[mixed]),
+        Err(BeamError::BadArg)
+    ));
+}
+
+// ---------------------------------------------------------------------------
+// is_integer/3
+// ---------------------------------------------------------------------------
+
+#[test]
+fn is_integer_3_is_the_oracle_range_guard() {
+    // ORACLE: `is_integer(5,1,10)` => `true`; `is_integer(5,10,1)` => `false`;
+    //   `is_integer(5,-100,-100)` => `false`; `is_integer(5,1.0,10)`,
+    //   `is_integer(5,1,10.0)` and `is_integer(5,1,inf)` => `badarg`;
+    //   `is_integer(a,1,10)` => `false` (the bounds are checked first).
+    let reg = default_registry();
+    let mut heap = heap();
+    let mut atoms = seeded_atoms();
+    atoms.seed(["inf"]);
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+    let five = small(&mut ctx, 5);
+    let one = small(&mut ctx, 1);
+    let ten = small(&mut ctx, 10);
+    let minus = small(&mut ctx, -100);
+    let inf = ctx.atom("inf").expect("seeded");
+    let a = ctx.atom("a").expect("seeded");
+    let float = ctx.make_float(1.0).expect("fits");
+
+    let guard = |ctx: &mut BifContext<'_>, args: &[Eterm]| {
+        call(&reg, ctx, "erlang", "is_integer", 3, args)
+    };
+
+    for (args, expected) in [
+        (vec![five, one, ten], true),
+        (vec![five, ten, one], false),
+        (vec![five, minus, minus], false),
+        // Inclusive bounds.
+        (vec![five, five, ten], true),
+        (vec![five, one, five], true),
+        // A non-integer term is `false`, never an error.
+        (vec![a, one, ten], false),
+    ] {
+        let result = guard(&mut ctx, &args).expect("integer bounds");
+        assert_eq!(as_bool(&atoms, result), expected, "is_integer({args:?})");
+    }
+
+    for bad in [(float, ten), (one, float), (one, inf)] {
+        assert!(matches!(
+            guard(&mut ctx, &[five, bad.0, bad.1]),
+            Err(BeamError::BadArg)
+        ));
+        // The bounds are validated first: a non-integer `Term` does not mask them.
+        assert!(matches!(
+            guard(&mut ctx, &[a, bad.0, bad.1]),
+            Err(BeamError::BadArg)
+        ));
+    }
+}
+
+// ---------------------------------------------------------------------------
+// display/1 and display_string/2
+// ---------------------------------------------------------------------------
+
+#[test]
+fn display_writes_the_p_rendering_with_a_crlf_terminator() {
+    // ORACLE (`erl -noshell -eval 'erlang:display(…).'`, `| od -c`):
+    //   `erlang:display(<<"a b">>)`  => `<<"a b">>\r\n`
+    //   `erlang:display([97,98])`    => `"ab"\r\n`
+    //   `erlang:display("ström")`    => `"ström"\r\n`; the oracle writes the raw
+    //     latin-1 byte `0xF6`, this runtime's printer emits UTF-8 (`0xC3 0xB6`) —
+    //     the documented non-ASCII printer divergence (ASCII is byte-exact).
+    //   `erlang:display({1,2})`      => `{1,2}\r\n`
+    // — each call returns `true`. The `\r\n` is the C's `erts_printf`
+    // `write_f_add_cr` newline conversion (`erl_printf.c:135`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+
+        let binary = bin(&mut ctx, b"a b");
+        let result = call(&reg, &mut ctx, "erlang", "display", 1, &[binary]).expect("renderable");
+        assert!(as_bool(&atoms, result), "display/1 returns true");
+
+        let ab = ints(&mut ctx, &[97, 98]);
+        call(&reg, &mut ctx, "erlang", "display", 1, &[ab]).expect("renderable");
+
+        let strom = ints(&mut ctx, &[115, 116, 114, 246, 109]);
+        call(&reg, &mut ctx, "erlang", "display", 1, &[strom]).expect("renderable");
+
+        let one = small(&mut ctx, 1);
+        let two = small(&mut ctx, 2);
+        let tuple = ctx.tuple(&[one, two]).expect("fits");
+        call(&reg, &mut ctx, "erlang", "display", 1, &[tuple]).expect("renderable");
+    }
+    assert_eq!(
+        sink.contents(),
+        b"<<\"a b\">>\r\n\"ab\"\r\n\"str\xC3\xB6m\"\r\n{1,2}\r\n".to_vec()
+    );
+}
+
+#[test]
+fn display_string_writes_utf8_or_raw_bytes_to_stdout() {
+    // ORACLE (`erl -noshell -eval 'erlang:display_string(stdout, …)'`, `| od -c`):
+    //   `[97,98,99]`    => `abc`        (a charlist is encoded as UTF-8)
+    //   `[]`            => nothing
+    //   `<<"bin">>`     => `bin`        (a binary is written byte for byte)
+    //   `[246]`         => `0xC3 0xB6`  (U+00F6)
+    //   `[16#10FFFF]`   => `0xF4 0x8F 0xBF 0xBF`
+    // — each call returns `true` and no line terminator is added.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    {
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+        let stdout = ctx.atom("stdout").expect("seeded");
+
+        let payload = ints(&mut ctx, &[97, 98, 99]);
+        display_string(&reg, &mut ctx, &atoms, stdout, payload);
+        display_string(&reg, &mut ctx, &atoms, stdout, NIL);
+        let binary = bin(&mut ctx, b"bin");
+        display_string(&reg, &mut ctx, &atoms, stdout, binary);
+        let umlaut = ints(&mut ctx, &[246]);
+        display_string(&reg, &mut ctx, &atoms, stdout, umlaut);
+        let max = ints(&mut ctx, &[0x10FFFF]);
+        display_string(&reg, &mut ctx, &atoms, stdout, max);
+    }
+    assert_eq!(sink.contents(), b"abcbin\xC3\xB6\xF4\x8F\xBF\xBF".to_vec());
+}
+
+/// Calls `display_string/2` and asserts the oracle's `true` result.
+fn display_string(
+    reg: &BifRegistry,
+    ctx: &mut BifContext<'_>,
+    atoms: &AtomTable,
+    stream: Eterm,
+    payload: Eterm,
+) {
+    let result = call(reg, ctx, "erlang", "display_string", 2, &[stream, payload])
+        .expect("writable");
+    assert!(as_bool(atoms, result), "display_string/2 returns true");
+}
+
+#[test]
+fn display_string_rejects_bad_streams_and_payloads() {
+    // ORACLE: a stream that is not an atom (`display_string("stdout","q")`) or is
+    // an atom other than `stdout`/`stderr`/`stdin` (`display_string(bogus,"q")`) is
+    // `badarg`; so is a payload that is not a charlist or a binary
+    // (`display_string(stdout,5)`, `display_string(stdout,[<<1,1>>])` — a binary
+    // inside a list — and a non-byte-aligned binary `display_string(stdout,<<1:1>>)`);
+    // so is an invalid code point (`[16#D800]`, `[16#110000]`, `[-1]`) and an
+    // improper list (`[1|2]`).
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+    let stdout = ctx.atom("stdout").expect("seeded");
+    let bogus = ctx.atom("bogus").expect("seeded");
+    let charlist = ints(&mut ctx, &[115, 116, 100, 111, 117, 116]);
+
+    for stream in [NIL, bogus, charlist] {
+        assert!(matches!(
+            call(&reg, &mut ctx, "erlang", "display_string", 2, &[stream, NIL]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    let a = ctx.atom("a").expect("seeded");
+    let five = small(&mut ctx, 5);
+    let two = small(&mut ctx, 2);
+    let improper = ctx.cons(five, two).expect("fits");
+    let byte = bin(&mut ctx, &[1]);
+    let bin_in_list = ctx.list(&[byte]).expect("fits");
+    let odd = bitstr(&mut ctx, &[0b1000_0000], 1);
+    for payload in [five, a, improper, bin_in_list, odd] {
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "erlang",
+                "display_string",
+                2,
+                &[stdout, payload]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    for cp in [0x11_0000i64, 0xD800, -1] {
+        let payload = ints(&mut ctx, &[cp]);
+        assert!(matches!(
+            call(
+                &reg,
+                &mut ctx,
+                "erlang",
+                "display_string",
+                2,
+                &[stdout, payload]
+            ),
+            Err(BeamError::BadArg)
+        ));
+    }
+    assert!(sink.contents().is_empty(), "nothing may be written");
+}
+
+#[test]
+fn display_string_reports_the_unmodelled_streams_and_binary_payloads() {
+    // `stderr`/`stdin` have no seam (the only output sink is the string-valued one
+    // `io:format` uses) and a binary payload that is not valid UTF-8 cannot ride a
+    // `&str` sink: both are the typed `error:unsupported_bif`, never a write to the
+    // wrong stream or a lossy substitution.
+    let reg = default_registry();
+    let mut heap = heap();
+    let atoms = seeded_atoms();
+    let mut sink = BytesSink::new();
+    let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_output(&mut sink);
+
+    for name in ["stderr", "stdin"] {
+        let stream = ctx.atom(name).expect("seeded");
+        let err = call(&reg, &mut ctx, "erlang", "display_string", 2, &[stream, NIL])
+            .expect_err("no sink for this stream");
+        assert!(
+            format!("{err:?}").contains("unsupported") || format!("{err:?}").contains("Unsupported"),
+            "expected the typed unsupported_bif, got {err:?}"
+        );
+    }
+
+    let stdout = ctx.atom("stdout").expect("seeded");
+    let raw = bin(&mut ctx, &[0xFF, 0x00]);
+    assert!(call(&reg, &mut ctx, "erlang", "display_string", 2, &[stdout, raw]).is_err());
+    assert!(
+        sink.contents().is_empty(),
+        "nothing may be written for a rejected payload"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Live oracle cross-check
+// ---------------------------------------------------------------------------
+
+/// The goldens the other tests assert, re-run under the live system `erl`.
+///
+/// One statement per invocation is the most robust shape, so the whole block is a
+/// single `-eval` with `io:format` calls; the oracle's stdout must match exactly.
+/// Skips loudly when `erl` is unavailable.
+#[test]
+fn the_shared_goldens_match_the_live_oracle() {
+    let statement = concat!(
+        "io:format(\"~w~n\",[erlang:bitstring_to_list(<<1,2,3:4>>)]),",
+        "io:format(\"~w~n\",[erlang:delete_element(2,{a,b,c})]),",
+        "io:format(\"~w~n\",[erlang:insert_element(3,{a,b},x)]),",
+        "io:format(\"~w~n\",[binary:referenced_byte_size(binary:copy(<<1>>,65))]),",
+        "io:format(\"~w~n\",[erlang:iolist_to_iovec([1,2,<<\"ab\">>])]),",
+        "io:format(\"~w~n\",[erlang:is_integer(5,1,10)]),",
+        "io:format(\"~w~n\",[try erlang:is_integer(5,1,10.0) catch error:R -> R end]),",
+        "halt()."
+    );
+    let Some(stdout) = oracle_eval(statement) else {
+        return;
+    };
+    assert_eq!(
+        stdout,
+        concat!(
+            "[1,2,<<3:4>>]\n",
+            "{a,c}\n",
+            "{a,b,x}\n",
+            "65\n",
+            "[<<1,2,97,98>>]\n",
+            "true\n",
+            "badarg\n",
+        ),
+        "the live oracle disagrees with this test file's goldens"
+    );
+}
