@@ -79,6 +79,7 @@ pub const ERL_DRV_MIN_REQUIRED_MAJOR_VERSION_ON_LOAD: c_int = 2;
 
 pub use crate::nif::term::{eterm_from_nif, nif_from_eterm, ERL_NIF_TERM, ERL_NIF_UINT};
 pub use crate::nif::host::{NifEnv, NifHost};
+pub use crate::driver::host::{DriverEnv, DriverHost};
 pub use beam_term::Eterm;
 
 pub use crate::common::{
