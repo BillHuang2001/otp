@@ -220,8 +220,9 @@ impl Driver {
 /// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`PendingInterner`]
 /// a *new* atom is recorded on, and answers the port queries with the owning [`ProcessId`].
 ///
-/// See the module docs for the phase-1 scope: the output / term-data / pid services are
-/// implemented, the select / timer / async services keep the seam's "unsupported" defaults.
+/// See the module docs for the current scope: the output / term-data / pid services and the
+/// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
+/// `control` keep the seam's typed defaults.
 pub struct DriverPort {
     /// The term arena the term-data decoder allocates on.
     ///
@@ -1026,7 +1027,8 @@ mod tests {
         assert_eq!(host.connected_pid(std::ptr::null_mut()), Some(owner));
         assert_eq!(host.caller_pid(std::ptr::null_mut()), Some(owner));
 
-        // The select/timer/async services are the "unsupported" defaults in phase 1.
+        // A host no port lifecycle claimed reports a timer request as unapplied (the C's `-1`);
+        // `async` keeps the seam's typed default for the same reason.
         assert_eq!(host.set_timer(std::ptr::null_mut(), 100), -1);
         assert_eq!(host.cancel_timer(std::ptr::null_mut()), -1);
         assert_eq!(host.read_timer(std::ptr::null_mut()), None);
