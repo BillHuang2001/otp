@@ -135,7 +135,7 @@ static ErlDrvSSizeT qd_case2(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     ErlDrvPort p = st->port;
     ErlDrvBinary *bin;
     ErlDrvBinary *binv[1];
-    SysIOVec iov2[1];
+    SysIOVec iov2[1], iov3[1], iov4[1];
     ErlIOVec ev, ev2;
     int c1, c2, eb, pb, zero, enqv, pushqv;
     ErlDrvSizeT size1, size2, size_mid, size3, r4, rbig, rzero;
@@ -172,20 +172,26 @@ static ErlDrvSSizeT qd_case2(qd_state *st, char **rbuf, ErlDrvSizeT rlen) {
     enqv = driver_enqv(p, &ev, 2);
     size_mid = driver_sizeq(p);
 
-    /* `driver_pushqv` with skip = 4 over a FRESH vector: "ef" (2 bytes) prepended. */
+    /* `driver_pushqv` with skip = 4 over a FRESH vector (`iov3`, never handed to a `*_v` call
+     * before): "ef" (2 bytes) prepended. */
+    iov3[0].iov_base = (char *) "abcdef";
+    iov3[0].iov_len = 6;
     ev2.vsize = 1;
     ev2.size = 6;
-    ev2.iov = iov2;
+    ev2.iov = iov3;
     ev2.binv = binv;
     pushqv = driver_pushqv(p, &ev2, 4);
     size3 = driver_sizeq(p);
 
     /* `driver_vec_to_buf`: truncation (`len` < the vector), saturation (the vector runs out first)
-     * and `len == 0`. A fresh vector, so the C's in-place `skip` cannot influence it. */
+     * and `len == 0`. A vector that no `*_v` call ever saw (`iov4`), so the C's in-place `skip`
+     * cannot turn it into a shorter vector first. */
+    iov4[0].iov_base = (char *) "abcdef";
+    iov4[0].iov_len = 6;
     memset(&ev2, 0, sizeof(ev2));
     ev2.vsize = 1;
     ev2.size = 6;
-    ev2.iov = iov2;
+    ev2.iov = iov4;
     ev2.binv = binv;
 
     memset(buf, 0, sizeof(buf));
