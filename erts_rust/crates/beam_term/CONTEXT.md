@@ -507,6 +507,14 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
   `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
   3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
+- `tests/number_oracle.rs` — the crate-local live-`erl` cross-check of `number::big_to_f64`/
+  `number_as_f64`: it materializes a large corpus of bignums (`write_big` limbs) both as `beam_term`
+  terms and as Erlang integer literals, has the oracle convert each with `float/1`, and compares the
+  resulting IEEE-754 bit patterns (text protocol: raw 64-bit bits, or the atom `overflow` when
+  `float/1` refuses). Corpus = a systematic bit-length sweep `1..=1100` (top-bit / all-ones /
+  pseudo-random, both signs) + randomised multi-limb values + curated rounding-boundary vectors;
+  `ERL_TIMEOUT = 60s`; skips loudly when `erl` is absent. The bignum *observables* (equality/order/
+  `flat_size`) are cross-checked separately in `tests/oracle.rs`.
 - `tests/map_hash.rs` — the crate-local oracle cross-check for the **HAMT pair-storage order**:
   it pins two verified literal vectors (60 small-int keys `#{K => K*2}`; 40 binary keys
   `#{<<N>> => N}`) as expected lists, and compares `map_pairs_storage_order` against
