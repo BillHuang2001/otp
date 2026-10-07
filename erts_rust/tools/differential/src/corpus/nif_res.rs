@@ -27,8 +27,8 @@
 //! pinned cases: the oracle and the Rust runtime both answer `42` for the round trip and `1`
 //! for self-liveness (re-verified against the live oracle, OTP 29.1.1 / erts-17.1).
 //!
-//! One verified divergence is reported here rather than pinned (it is a plain value, so it
-//! would be a mismatch):
+//! Two verified divergences are reported here rather than pinned (both are plain values, so
+//! they would be mismatches):
 //!
 //! * a resource's **destructor** is **asynchronous** in the oracle: `erts` schedules it on a
 //!   misc aux-work thread (`nif_resource_dtor_prologue` → `erts_schedule_misc_aux_work`,
@@ -38,6 +38,14 @@
 //!   within the NIF call on the oracle side, so no case pins it. (The related
 //!   `enif_monitor_process` follow-up is likewise unpinnable: both runtimes answer `0` because
 //!   the monitor is not established, so it would pin no behaviour.)
+//! * the **term keeps the object alive past the native release** in the oracle: for
+//!   `alloc → enif_make_resource → enif_release_resource → enif_get_resource` the oracle still
+//!   answers `42` (the documented C contract: "the call to `enif_release_resource` can occur
+//!   immediately after obtaining the term … the resource object is deallocated when the term
+//!   is garbage collected"), while the Rust runtime destroys the block when the native count
+//!   reaches zero and forgets the term binding, so `enif_get_resource` returns `0`.
+//!   `nif_res/resource_make_get_roundtrip` therefore reads the payload **before** releasing
+//!   the native reference, which is where the two runtimes agree.
 //!
 //! # Skip policy (inherited from [`super::nif_so`])
 //!
