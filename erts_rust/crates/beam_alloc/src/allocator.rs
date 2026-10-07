@@ -814,7 +814,9 @@ impl CarrierAllocator {
 
     /// The large path: a dedicated single-block carrier for a request larger than
     /// the threshold or more aligned than [`MIN_ALIGN`], recording the allocation for
-    /// `ty`.
+    /// `ty`. The alignment padding in front of the payload is zeroed, so a segment
+    /// reused from the `mseg` cache cannot leave a previous owner's bytes where the
+    /// unsized-dealloc probe would read a candidate block header.
     fn alloc_large(
         &self,
         state: &mut AllocatorState,
@@ -856,6 +858,32 @@ impl CarrierAllocator {
         // SAFETY: `base` is the start of the mapping this block owns, is
         // `UNIT_SIZE`-aligned, and the header occupies its first 16 bytes only.
         unsafe { BlockHeader::store(base, header) };
+        if payload_offset > 0 {
+            // Zero the alignment padding between the block header and the payload.
+            //
+            // `dealloc_unsized` locates a block's header by *probing* candidate
+            // alignments and returning on the **first** plausibility match. For an
+            // over-aligned block every candidate below the real alignment reads its
+            // 16-byte header from `[base + BLOCK_HEADER_SIZE, payload)` — the padding
+            // this allocator never writes. Carriers come from the process-wide segment
+            // (`mseg`) reuse cache, which hands a released segment back at the *same*
+            // address *unzeroed*, so a previous owner's block header (e.g. a size-80
+            // slab block of another allocator) can survive in this padding. The probe's
+            // first candidate (`align = MIN_ALIGN`, offset 0) would then decode that
+            // stale-but-plausible header, "free" the live payload through it (wrong
+            // byte accounting, a live payload pushed onto a size-class free list) and
+            // leave the real dedicated carrier mapped. Zeroed padding can never pass
+            // `plausible_header` (a zero header has `size == 0 < BLOCK_HEADER_SIZE`),
+            // so only the real header at `base` can ever match.
+            //
+            // SAFETY: the padding is the `payload_offset` bytes starting at
+            // `base + BLOCK_HEADER_SIZE`, entirely inside the `block_size`-byte mapping
+            // this block owns and disjoint from both the 16-byte header (which starts at
+            // `base`) and the payload (which starts at `base + BLOCK_HEADER_SIZE +
+            // payload_offset`); it is never handed to the caller and never written
+            // again for the block's lifetime.
+            unsafe { core::ptr::write_bytes(base.add(BLOCK_HEADER_SIZE), 0, payload_offset) };
+        }
         state.note_alloc_for(ty, block_size);
         // SAFETY: the payload starts `BLOCK_HEADER_SIZE + payload_offset` bytes into a
         // mapping of `block_size >=` that plus `size` bytes, so it is in-bounds; it is
@@ -1664,6 +1692,132 @@ mod tests {
         assert_eq!(stats.sbc_carriers, 0);
         assert_eq!(stats.mbc_carriers, 1);
         assert_eq!(stats.carriers, stats.sbc_carriers + stats.mbc_carriers);
+        assert_eq!(alloc.type_stats(ty).blocks, 0);
+        assert_eq!(alloc.type_stats(ty).bytes, 0);
+    }
+
+    #[test]
+    fn over_aligned_large_blocks_leave_their_alignment_padding_zeroed() {
+        let alloc = allocator();
+        let ty = type_id("HEAP");
+        // `mseg`'s reuse cache hands a released segment back at the *same* address and
+        // does not zero it, so the padding in front of an over-aligned payload can hold
+        // a previous owner's block header unless `alloc_large` clears it. A stale but
+        // plausible header there would be matched by the first candidate of the
+        // unsized-dealloc probe — see
+        // `a_reused_segment_cannot_resurrect_a_stale_header_in_the_padding` for the
+        // end-to-end sequence.
+        for align in [32usize, 64, 256, 4096] {
+            let l = layout(2000, align);
+            let ptr = alloc.alloc_typed(ty, l).expect("alloc");
+            let payload = ptr.as_ptr();
+            assert_eq!(payload as usize % align, 0, "align {align}");
+            // The payload sits `BLOCK_HEADER_SIZE + padding_for(align)` bytes after the
+            // block start, which is exactly `align` bytes after it.
+            let base = payload.wrapping_sub(align);
+            let padding = align - BLOCK_HEADER_SIZE;
+            assert_eq!(padding, padding_for(align), "align {align}");
+            // SAFETY: the padding is `padding_for(align)` bytes inside the live
+            // dedicated carrier this block owns, between its own header and its
+            // payload; it is neither handed to the caller nor overlapped by anything.
+            let bytes =
+                unsafe { core::slice::from_raw_parts(base.add(BLOCK_HEADER_SIZE), padding) };
+            assert!(
+                bytes.iter().all(|&b| b == 0),
+                "align {align}: the alignment padding must be zeroed"
+            );
+            // The probe's first candidate (`MIN_ALIGN`, payload offset 0) reads exactly
+            // at `payload - MIN_ALIGN`; it must no longer look like one of our headers.
+            assert!(
+                !plausible_header_at(payload.wrapping_sub(MIN_ALIGN), padding_for(MIN_ALIGN)),
+                "align {align}: the padding must not decode as a block header"
+            );
+            // ... and the probe still finds the real header, so the block frees fully.
+            // SAFETY: the live typed allocation, freed exactly once without a layout.
+            unsafe { alloc.dealloc_unsized(ty, ptr) };
+            assert_eq!(alloc.stats().live_blocks, 0, "align {align}");
+            assert_eq!(alloc.stats().live_bytes, 0, "align {align}");
+        }
+        let stats = alloc.stats();
+        assert_eq!(stats.sbc_carriers, 0);
+        assert_eq!(stats.carriers, stats.sbc_carriers + stats.mbc_carriers);
+    }
+
+    #[test]
+    fn a_reused_segment_cannot_resurrect_a_stale_header_in_the_padding() {
+        let alloc = allocator();
+        let ty = type_id("HEAP");
+        let l = layout(2000, 256);
+
+        // A previous owner of the segment leaves a plausible-looking block header at
+        // exactly the position the unsized-dealloc probe reads first for its
+        // `MIN_ALIGN` candidate (`payload - MIN_ALIGN`). `mseg`'s reuse cache does not
+        // zero the segment it hands back, so only the allocator's own padding zeroing
+        // can remove it.
+        let first = alloc.alloc_typed(ty, l).expect("first alloc");
+        let base = first.as_ptr().wrapping_sub(256);
+        let stale = BlockHdr {
+            size: 80,
+            payload_offset: 0,
+            class: 0,
+            carrier: base.cast::<c_void>(),
+            flags: {
+                let mut flags = BlockFlags::empty();
+                flags.set_free();
+                flags.bits()
+            },
+        };
+        // SAFETY: `first` is a live over-aligned block, so `payload - MIN_ALIGN` lies
+        // inside its own alignment padding — allocator-internal memory that is never
+        // handed out, so no live payload is overwritten.
+        unsafe { BlockHeader::store(first.as_ptr().wrapping_sub(MIN_ALIGN), stale) };
+        assert!(
+            plausible_header_at(
+                first.as_ptr().wrapping_sub(MIN_ALIGN),
+                padding_for(MIN_ALIGN)
+            ),
+            "the planted header must be one the probe would accept"
+        );
+
+        // Freeing with the correct layout hands the poisoned segment to the reuse cache.
+        // SAFETY: the live typed allocation, freed exactly once with its own layout.
+        unsafe { alloc.dealloc_typed(ty, first, l) };
+        assert_eq!(alloc.stats().live_bytes, 0);
+
+        // The next allocation of the same size is the cache's best (smallest fitting)
+        // candidate, so it usually gets that very segment back, stale bytes and all.
+        // `mseg` is a process-wide singleton shared with the concurrently running
+        // tests, so the segment may have been taken by another test in between; that
+        // case is reported and *not* asserted (the invariant test above is the
+        // deterministic guarantee), so this test never fails merely because the cache
+        // was not reused.
+        let second = alloc.alloc_typed(ty, l).expect("second alloc");
+        if second.as_ptr() == first.as_ptr() {
+            assert!(
+                !plausible_header_at(
+                    second.as_ptr().wrapping_sub(MIN_ALIGN),
+                    padding_for(MIN_ALIGN)
+                ),
+                "the reused segment's stale header must have been cleared"
+            );
+        } else {
+            eprintln!(
+                "beam_alloc: mseg did not reuse the released segment ({:p} -> {:p}); \
+                 skipping the reuse assertion",
+                first.as_ptr(),
+                second.as_ptr()
+            );
+        }
+
+        // Whichever segment the block landed on, the unsized free must recover every
+        // byte (with the stale header gone it matches the real header at the block
+        // start, the only candidate left).
+        // SAFETY: the live typed allocation, freed exactly once without a layout.
+        unsafe { alloc.dealloc_unsized(ty, second) };
+        let stats = alloc.stats();
+        assert_eq!(stats.live_bytes, 0);
+        assert_eq!(stats.live_blocks, 0);
+        assert_eq!(stats.sbc_carriers, 0);
         assert_eq!(alloc.type_stats(ty).blocks, 0);
         assert_eq!(alloc.type_stats(ty).bytes, 0);
     }

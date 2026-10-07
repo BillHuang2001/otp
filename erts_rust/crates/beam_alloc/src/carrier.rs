@@ -35,7 +35,9 @@
 //! wrote. The allocator never relies on carrier memory being zeroed: it writes every
 //! block header it later reads ([`Carrier::subdivide_into`] for slabs, the large path
 //! in `crate::allocator` for dedicated blocks) and `alloc_zeroed` zeroes its payload
-//! explicitly.
+//! explicitly. The large path additionally zeroes the *alignment padding* between the
+//! header and the payload, because that is where the unsized-dealloc probe looks for a
+//! candidate header and stale bytes there would be indistinguishable from one of ours.
 //!
 //! `unsafe` is confined to this module's marked functions.
 
