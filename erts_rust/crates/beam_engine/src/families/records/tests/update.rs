@@ -4,8 +4,13 @@
 //! Both lower to `i_update_native_record` (`emu/ops.tab:1653`/`:1689`): the
 //! instance is rebuilt with the listed fields replaced, every update value is
 //! read before `dst` is written, and the `Id`/`Hint` operands are discarded. The
-//! create form of `put_record` (`Src = nil`) needs the code server's record table
-//! and is therefore a documented capability gap.
+//! create form of `put_record` (`Src = nil`) resolves the definition out of the
+//! running module's own `Recs` table; an id naming **another** module's record (or
+//! a name the module does not define) stays a documented typed `unsupported`.
+//!
+//! The create form's semantics get the full structural coverage (defaults,
+//! overrides, `badfield`/`novalue`) in the integration suite `tests/records.rs`,
+//! which can load the committed `records_fixture.beam` and read its definitions.
 
 use std::collections::BTreeMap;
 
@@ -137,11 +142,11 @@ fn put_record_with_no_fail_is_a_capability_gap() {
 }
 
 #[test]
-fn put_record_create_form_is_a_documented_capability_gap() {
+fn put_record_create_with_an_unknown_record_name_is_a_typed_error() {
     // `Src = nil` is the *create* form (`emu/ops.tab:1648` →
-    // `i_create_native_record`), which resolves the compile-time record definition
-    // through the code server's record table — a facility this runtime does not
-    // have, so the family reports it rather than guessing a definition.
+    // `i_create_native_record`). The definition comes from the running module's own
+    // `Recs` table (see `tests/records.rs` for its full semantics); a name the
+    // module does not define is reported rather than guessed.
     let mut fx = Fixture::new();
     let mut ctx = MinimalContext::new();
     let (m, r, a) = (fx.atom("m"), fx.atom("r"), fx.atom("a"));
@@ -164,7 +169,41 @@ fn put_record_create_form_is_a_documented_capability_gap() {
     let _ = m;
     assert_eq!(
         reason,
-        "unsupported_opcode: put_record: create (record definition table unavailable)"
+        "unsupported_opcode: put_record: create: the module defines no record named 'r'"
+    );
+}
+
+#[test]
+fn put_record_create_for_another_module_is_a_typed_error() {
+    // A `{Module,Name}` id whose module is not the running one needs the code
+    // server's record table (`erts_record_find_entry`) or a `code:ensure_loaded/1`
+    // trap (`erl_create_native_record_jit`) — a facility this runtime does not have,
+    // so it is reported rather than guessed.
+    let mut fx = Fixture::new();
+    let mut ctx = MinimalContext::new();
+    let (r, a, other) = (fx.atom("r"), fx.atom("a"), fx.atom("other"));
+    // `{other, r}` in X(1); the create form's `dst` is X(0).
+    let id = terms::make_tuple(&mut ctx, &[make_atom(other), make_atom(r)]).unwrap();
+    let mut machine = Machine::with_max_register(4);
+    machine.set_x(1, id).unwrap();
+
+    let reason = unsupported_reason(run(
+        fx.module(),
+        &BTreeMap::new(),
+        &mut machine,
+        &Instr::PutRecord {
+            fail: NO_FAIL,
+            id: Operand::X(1),
+            src: Operand::Nil,
+            dst: Operand::X(0),
+            live: 0,
+            updates: vec![(Operand::Atom(a), Operand::Integer(1))],
+        },
+        &mut ctx,
+    ));
+    assert_eq!(
+        reason,
+        "unsupported_opcode: put_record: create: no record definition table for another module"
     );
 }
 

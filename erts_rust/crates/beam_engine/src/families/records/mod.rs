@@ -78,10 +78,13 @@
 //! - [`Instr::PutRecord`] — the *update* form (`Src` a register,
 //!   `i_update_native_record`) copies the instance with the listed fields replaced;
 //!   the *create* form (`Src` is the literal `nil`,
-//!   `emu/ops.tab:1648` → `i_create_native_record`) is a documented capability gap
-//!   (see the failure model below). `emu/ops.tab:1653-1655` discards the `Id` on
-//!   the update path (`put_record Fail=j _Id Src=xy … => i_update_native_record`):
-//!   the record's identity comes from the source instance's own definition.
+//!   `emu/ops.tab:1648` → `i_create_native_record`, the compiler's *local* case
+//!   `put_record Fail Name=a nil …` → `create_local_record` →
+//!   `i_create_local_native_record`) builds a fresh instance from the running
+//!   module's own `Recs` definition (create-form semantics are documented in
+//!   [`create_native_record`]). `emu/ops.tab:1653-1655` discards the `Id` on the
+//!   update path (`put_record Fail=j _Id Src=xy … => i_update_native_record`): the
+//!   record's identity comes from the source instance's own definition.
 //! - [`Instr::UpdateRecordId`] — the OTP-30 `update_record_id`, which
 //!   `emu/ops.tab:1689-1691` lowers to the *same* `i_update_native_record` with
 //!   `Hint` and `Id` discarded (`Fail=j _Hint _Id Src Dst Live Size Updates`), so
@@ -119,11 +122,15 @@
 //!   `error::unsupported("<instr>/no_fail")` — never a fall-through with a wrong
 //!   result, and never a fabricated BEAM exception reason.
 //! * A genuine **capability gap** ⇒ a typed `error::unsupported("<instr>: <what>")`.
-//!   The one such gap here is the *create* form of [`Instr::PutRecord`]: the C
-//!   resolves the record's compile-time definition through the code server's record
-//!   table (`erts_record_find_entry`, `erl_record.c:102-170`), which this runtime
-//!   does not have; the *update* form needs no table, because the source instance
-//!   carries its own definition (see the crate `CONTEXT.md`, "Known Issues").
+//!   The one such gap here is the *create* form of [`Instr::PutRecord`] with an
+//!   `Id` naming **another module's** record: the C resolves such a definition
+//!   through the code server's record table (`erts_record_find_entry`,
+//!   `erl_record.c:102-170`) or traps to `code:ensure_loaded/1`
+//!   (`erl_create_native_record_jit`, `erl_record.c:412`), which this runtime does
+//!   not have. A record defined in the running module needs no table — its `Recs`
+//!   definition is right there — and the *update* form needs none either, because
+//!   the source instance carries its own definition (see the crate `CONTEXT.md`,
+//!   "Known Issues").
 //! * `update_record`'s tagged-tuple form is only emitted behind an
 //!   `is_tagged_tuple` test of the same fail label, so the C opcode reads the tuple
 //!   unchecked; a source that is not a tuple, a `size`/arity mismatch, a non-integer
@@ -137,9 +144,9 @@ mod tests;
 
 use std::collections::BTreeMap;
 
-use beam_common::Result;
-use beam_loader::{Instr, Label, Module, Operand, NO_FAIL};
-use beam_term::{Atom, Eterm};
+use beam_common::{ExceptionClass, Result};
+use beam_loader::{Instr, Label, Module, Operand, RecordDefinition, NO_FAIL};
+use beam_term::{make_atom, make_small, Atom, Eterm, NIL};
 
 use crate::context::ExecutionContext;
 use crate::error;
@@ -274,20 +281,30 @@ pub(crate) fn exec(
         )?)),
 
         // `put_record Fail Id Src Dst Live Updates` (`emu/ops.tab:1648-1655`):
-        // `Src = nil` is the *create* form (`i_create_native_record`), any other
-        // `Src` is the *update* form (`i_update_native_record`, `Id` discarded).
+        // `Src = nil` is the *create* form (`i_create_native_record`, and for an
+        // atom `Id` the compiler's local `put_record Fail Name=a nil …` →
+        // `create_local_record` transform), any other `Src` is the *update* form
+        // (`i_update_native_record`, `Id` discarded).
         Instr::PutRecord {
             fail,
-            id: _,
+            id,
             src,
             dst,
             live: _,
             updates,
         } => {
             if matches!(src, Operand::Nil) {
-                return Err(error::unsupported(
-                    "put_record: create (record definition table unavailable)",
-                ));
+                return Ok(Some(create_native_record(
+                    machine,
+                    labels,
+                    module,
+                    "put_record",
+                    *fail,
+                    id,
+                    dst,
+                    updates,
+                    ctx,
+                )?));
             }
             Ok(Some(update_native_record(
                 machine,
@@ -431,14 +448,18 @@ enum RecordId {
 }
 
 /// Resolve an `Id` operand to the record identity it denotes
-/// (`get_record_field Fail Src Id Field Dst`, `emu/ops.tab:1680-1694`).
+/// (`get_record_field Fail Src Id Field Dst`, `emu/ops.tab:1680-1694`, and the
+/// create form's `put_record Fail Id nil …`).
 ///
 /// The same operand carries both C forms: the transform sends an atom `Id` to
-/// `i_get_local_record_field` and any other `Id` to `i_get_record_field`.
+/// `i_get_local_record_field` (or, for create, to the local
+/// `create_local_record`) and any other `Id` to the two `i_*_record_field` /
+/// `i_create_native_record` forms.
 fn read_record_id(
     machine: &Machine,
     ctx: &mut dyn ExecutionContext,
     operand: &Operand,
+    instruction: &str,
 ) -> Result<RecordId> {
     let term = read_operand(machine, ctx, operand)?;
     if beam_term::is_atom(term) {
@@ -454,9 +475,9 @@ fn read_record_id(
             });
         }
     }
-    Err(error::unsupported(
-        "get_record_field: record id is neither an atom nor a {Module,Name} pair",
-    ))
+    Err(error::unsupported(&format!(
+        "{instruction}: record id is neither an atom nor a {{Module,Name}} pair"
+    )))
 }
 
 /// `get_record_elements` / `get_record_elements_id` (`emu/instrs.tab:1347-1356`)
@@ -518,7 +539,7 @@ fn get_record_field(
         // `is_not_record(src)` ⇒ `badrecord` ⇒ `$FAIL_HEAD_OR_BODY`.
         return fail_step(labels, fail, instruction);
     }
-    match read_record_id(machine, ctx, id)? {
+    match read_record_id(machine, ctx, id, instruction)? {
         RecordId::Local(name) => {
             // `if (name != am_Underscore && defp->name != name) goto badrecord;`
             if module.atom_name(name) != Some(UNDERSCORE) && !raw::record_name_is(source, name) {
@@ -545,6 +566,264 @@ fn get_record_field(
         // The C's `badfield` after scanning every key.
         None => fail_step(labels, fail, instruction),
     }
+}
+
+/// `i_create_local_native_record` (`emu/instrs.tab:1354-1369`) — the **create**
+/// form of `put_record` (`Src` is the literal `nil`, `emu/ops.tab:1648`).
+///
+/// Reproduces `erl_create_local_native_record` (`erl_record.c:254-353`) branch for
+/// branch, on the running module's own `Recs` definition
+/// ([`beam_loader::Module::records`]) rather than on C's load-time `def_literal`
+/// (`beam_file.c:1077-1300`, which this loader does not materialize — the loader
+/// exposes the same data structurally instead):
+///
+/// * the definition's fields are walked in **ascending key order** (`defp->keys[i]`,
+///   the atom-index order `beam_term::record::write_record` uses), matched against
+///   the next entry of the ascending-sorted update list (`ops.tab:1648`'s
+///   `map_key_sort`);
+/// * a field the update names takes the update value and consumes the entry;
+/// * a field the update does not name takes its **default**; a field whose default
+///   is the *absent* sentinel (`-record #r{f}` — the file's `u,0`,
+///   [`beam_loader::RecordField::default`] `== None`) stores `NIL` and, only when
+///   no earlier `no_value` error is already pending, remembers its key as the
+///   delayed error field — so only the **first** such field is remembered
+///   (`erl_record.c:318-326`);
+/// * after the walk an **unconsumed** update entry (its key is not a field of the
+///   definition) is the `badfield` error, which **outranks** `no_value`, and the
+///   error field is that unconsumed key (`erl_record.c:331-337`).
+///
+/// Success writes the fresh instance to `Dst`; an error takes the instruction's
+/// failure path ([`create_failure`]).
+///
+/// # The record's identity (`Id`)
+///
+/// Only a record **defined in the running module** is creatable. C reads the
+/// definition out of the `Recs`-derived load-time literal for the local form and,
+/// for a foreign `{Module,Name}` id, out of the code server's record table
+/// (`erts_record_find_entry`), potentially trapping to `code:ensure_loaded/1` for a
+/// not-yet-loaded module (`erl_create_native_record_jit`, `erl_record.c:412-500`).
+/// This runtime has no record table, so an `Id` naming another module stays a typed
+/// `error::unsupported` — never a guessed definition. Two `Id` shapes are accepted:
+/// an **atom** (the running module's own record) and a **`{Module,Name}` pair**
+/// whose `Module` **is** the running module (the same record, reached through the
+/// generic form). A `Module` the caller's own module does not define is a typed
+/// `unsupported` too, since the compiler only emits an `Id` its record table can
+/// resolve.
+fn create_native_record(
+    machine: &mut Machine,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    module: &Module,
+    instruction: &str,
+    fail: Label,
+    id: &Operand,
+    dst: &Operand,
+    updates: &[(Operand, Operand)],
+    ctx: &mut dyn ExecutionContext,
+) -> Result<Step> {
+    let definition = local_definition(machine, ctx, module, id, instruction)?;
+    let fields = &definition.fields;
+
+    // Ascending key order — `defp->keys[i]`, the same atom-index order
+    // `beam_term::record::write_record` sorts the block's keys into.
+    let mut order: Vec<usize> = (0..fields.len()).collect();
+    order.sort_by_key(|&index| fields[index].name);
+
+    // The update list in the ascending order `ops.tab:1648`'s `map_key_sort`
+    // guarantees. Reading each field-name operand here (before any value operand)
+    // mirrors the C, which receives the field names as resolved `a` operands.
+    let mut sorted: Vec<(Atom, &Operand)> = Vec::with_capacity(updates.len());
+    for (field, value) in updates {
+        sorted.push((read_atom(machine, ctx, field, instruction)?, value));
+    }
+    sorted.sort_by_key(|&(key, _)| key);
+
+    // `values[declaration index]` — the block is built in declaration order and
+    // `write_record` re-sorts it exactly as the C's `qsort` does.
+    let mut values: Vec<Eterm> = vec![NIL; fields.len()];
+    let mut absent: Option<Atom> = None;
+    let mut position = 0usize;
+    for &index in &order {
+        let field = fields[index];
+        if position < sorted.len() && sorted[position].0 == field.name {
+            // `GetSource(new_p[1], *hp)` — the value is read only once its field
+            // resolved, exactly as the C skips the other branch.
+            values[index] = read_operand(machine, ctx, sorted[position].1)?;
+            position += 1;
+            continue;
+        }
+        match field.default {
+            Some(value) => values[index] = value,
+            None => {
+                // `if (is_value(res)) { p->fvalue = defp->keys[i]; … }`
+                absent = absent.or(Some(field.name));
+                values[index] = NIL;
+            }
+        }
+    }
+
+    // `badfield` outranks `no_value` (`erl_record.c:331-337`): the entry that was
+    // never consumed is `new_p`, which the walk above left at the first one.
+    if position < sorted.len() {
+        return create_failure(
+            machine,
+            module,
+            labels,
+            ctx,
+            instruction,
+            fail,
+            BADFIELD,
+            definition,
+            sorted[position].0,
+        );
+    }
+    if let Some(field) = absent {
+        return create_failure(
+            machine,
+            module,
+            labels,
+            ctx,
+            instruction,
+            fail,
+            NOVALUE,
+            definition,
+            field,
+        );
+    }
+
+    let fields: Vec<(Eterm, Eterm)> = fields
+        .iter()
+        .zip(&values)
+        .map(|(field, value)| (make_atom(field.name), *value))
+        .collect();
+    let record = write_local_record(ctx, module, definition, &fields)?;
+    write_operand(machine, dst, record)?;
+    Ok(Step::Next)
+}
+
+/// The atom `badfield` (`am_badfield`, `EXC_BADFIELD`, `error.h:172` /
+/// `error_atom[21]`, `atom.names:127`).
+const BADFIELD: &str = "badfield";
+
+/// The atom `novalue` (`am_novalue`, `EXC_NOVALUE`, `error.h:174` /
+/// `error_atom[22]`, `atom.names:539`).
+const NOVALUE: &str = "novalue";
+
+/// The running module's own record definition an `Id` operand names, or a typed
+/// `error::unsupported` for an id this runtime cannot resolve (another module's
+/// record — see [`create_native_record`] — or a name the module does not define).
+fn local_definition<'a>(
+    machine: &Machine,
+    ctx: &mut dyn ExecutionContext,
+    module: &'a Module,
+    id: &Operand,
+    instruction: &str,
+) -> Result<&'a RecordDefinition> {
+    let name = match read_record_id(machine, ctx, id, instruction)? {
+        RecordId::Local(name) => name,
+        RecordId::Foreign { module: owner, name } => {
+            if owner != module.name {
+                return Err(error::unsupported(&format!(
+                    "{instruction}: create: no record definition table for another module"
+                )));
+            }
+            name
+        }
+    };
+    module.record(name).ok_or_else(|| {
+        let name = module.atom_name(name).unwrap_or("<unnamed atom>");
+        error::unsupported(&format!(
+            "{instruction}: create: the module defines no record named '{name}'"
+        ))
+    })
+}
+
+/// The create form's failure path.
+///
+/// A live `fail` label is the C's `$FAIL($Fail)` branch (the record error is
+/// discarded); [`NO_FAIL`] is the C's `goto find_func_info`, which raises
+/// `{Tag, {{Module,Name}, Field}}` — the C builds `TUPLE2(TUPLE2(Module, Name),
+/// Field)` into `p->fvalue` (`erl_record.c:339-351`) and `expand_error_value`
+/// (`beam_common.c:754-768`) wraps it with `error_atom[r]`, i.e. `badfield`
+/// (`EXC_BADFIELD` = index 21) or `novalue` (`EXC_NOVALUE` = index 22), as a
+/// **class `error`** exception.
+///
+/// The tag atom is resolved from the running module's atom table; a module that
+/// never mentions it cannot name the reason, so a missing atom is a documented
+/// typed `error::unsupported` (never a substituted, wrong atom) — the same
+/// convention the maps family's `{badmap,_}`/`{badkey,_}` reasons follow.
+fn create_failure(
+    machine: &mut Machine,
+    module: &Module,
+    labels: &BTreeMap<Label, (u32, u32)>,
+    ctx: &mut dyn ExecutionContext,
+    instruction: &str,
+    fail: Label,
+    tag: &str,
+    definition: &RecordDefinition,
+    field: Atom,
+) -> Result<Step> {
+    if fail != NO_FAIL {
+        return fail_step(labels, fail, instruction);
+    }
+    let owner = terms::make_tuple(ctx, &[make_atom(module.name), make_atom(definition.name)])?;
+    let value = terms::make_tuple(ctx, &[owner, make_atom(field)])?;
+    let tag = module.atom_table.lookup(tag).ok_or_else(|| {
+        error::unsupported(&format!(
+            "{instruction}: create: no '{tag}' atom in the module"
+        ))
+    })?;
+    let reason = terms::make_tuple(ctx, &[make_atom(tag), value])?;
+    if let Some(class_atom) = module.atom_table.lookup(ExceptionClass::Error.as_str()) {
+        machine.set_class_atom(ExceptionClass::Error, make_atom(class_atom));
+    }
+    machine.throw_error(reason)
+}
+
+/// Build a fresh native-record instance from the running module's record
+/// `definition` — the `erl_create_local_native_record` result.
+///
+/// `fields` are the `(key atom term, value)` pairs in **declaration** order, the
+/// shape [`raw::write_record`] takes.
+///
+/// The definition's cached hash is a word of the very block it describes, so the
+/// block is written once with a `0` placeholder to obtain a *valid* definition
+/// term, the hash is computed from it (it reads only the module, the name, the
+/// `is_exported` flag and the declaration-ordered keys — never the hash word), and
+/// the **same block** is written again with the real hash. The value
+/// (`make_hash2({Module,Name,IsExported,Keys})`, `beam_file.c:1240-1256`) is
+/// observable — `erlang:phash2/1` of a record mixes definition word 2
+/// (`beam_term::hashing::make_hash2`) — so it must never be a placeholder; it is
+/// computed by the bit-exact `beam_term::hashing::compute_record_definition_hash`.
+fn write_local_record(
+    ctx: &mut dyn ExecutionContext,
+    module: &Module,
+    definition: &RecordDefinition,
+    fields: &[(Eterm, Eterm)],
+) -> Result<Eterm> {
+    let hp = ctx.alloc_words(beam_term::record_block_words(fields.len()))?;
+    let (owner, name, exported) = (module.name, definition.name, definition.is_exported);
+    // `hp` owns `record_block_words(fields.len())` exclusively-owned, writable words
+    // and `fields` are the declaration-order `(key, value)` pairs `write_record`
+    // documents. `0` is the placeholder for the cached definition hash, which cannot
+    // exist before the block does.
+    let instance = raw::write_record(hp, owner, name, exported, fields, make_small(0))?;
+    let definition_term = raw::record_definition(instance)
+        .ok_or_else(|| error::unsupported("put_record: create: malformed record block"))?;
+    let hash = beam_term::hashing::compute_record_definition_hash(
+        definition_term,
+        &module.atom_table,
+    )?;
+    // The same block at `hp` — nothing allocated it away in between (neither
+    // `record_definition` nor `compute_record_definition_hash` allocates) — and the
+    // same inputs, plus the real cached definition hash; every word is rewritten.
+    raw::write_record(
+        hp,
+        owner,
+        name,
+        exported,
+        fields,
+        make_small(hash as i64),
+    )
 }
 
 /// `i_update_native_record` (`emu/instrs.tab:1418-1431`) — copy the native record
