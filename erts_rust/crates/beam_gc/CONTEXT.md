@@ -245,26 +245,38 @@ A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every proce
   unchanged), mirroring the C `erts_copy_one_frag` `OH_OVERHEAD` hand-off. The collector still never walks an
   off-heap payload (liveness stays the caller's concern).
 ### Measured (the GenImmix gate)
-`tests/immix_measure.rs` drives one long-lived workload (128 one-line long-lived tuples = 8 full Immix
-blocks; 24 transients promoted, 16 dropped / 8 kept; 300 nursery garbage tuples) through a forced
-fullsweep under both strategies and reports the crate's own counters (`cargo test -p beam_gc --test
-immix_measure -- --nocapture`):
+`tests/immix_measure.rs` is the original single (favourable) workload — 128 long-lived one-line tuples (8
+full Immix blocks) plus 16 dropped / 8 kept transients and 300 nursery garbage tuples, forced fullsweep:
+copying re-copies **136 objects / 400 words** vs Immix **moves 8 objects / 128 words and pins 128**
+(384 words) — a real movement win, at a footprint cost (400 live words → 2176 resident line-words).
 
-| metric | Copying (`Collector`) | Immix (`GenImmixCollector`) |
-|---|---|---|
-| objects copied / evacuated | 136 | 8 |
-| words copied / evacuated | 400 | 128 (8 lines) |
-| objects pinned (left in place) | — | 128 (384 words / 128 lines) |
-| blocks reclaimed | — | 1 |
-| mature words reclaimed | — | 256 (16 lines) |
-| resident mature footprint | 400 words | 2176 line-words |
+`tests/immix_workloads.rs` generalises it to three shapes through both strategies (`-- --nocapture`):
 
-Both strategies find the same 136-object live mature set (`evacuated + pinned == copied`). The mark-region
-path **moves 8 objects / 128 words** where the copying path re-copies **136 objects / 400 words** — the
-pinning win is real on long-lived data, so the option clears its gate for that regime. Honest caveat:
-line-granular allocation costs internal fragmentation (400 live words occupy 2176 resident line-words
-here), so the measured win is **movement, not footprint** — exactly the trade-off Part II §D flags as
-needing per-workload measurement. The option therefore stays **OFF by default** (`MatureKind::Copying`).
+| workload (forced fullsweep) | strategy | objects moved | words moved | resident mature | pause (median) |
+|---|---|---|---|---|---|
+| long-lived shared subterm | Copying | 129 | 639 | 639 words | 8–10 µs |
+| | Immix | **0** (129 pinned) | **0** | 2304 line-words | 11–12 µs |
+| garbage-heavy small live set | Copying | 10 | **20** | **20 words** | 3–5 µs |
+| | Immix | 10 | 160 | 160 line-words | **2–3 µs** |
+| large heap + promotion pressure | Copying | 633 | 1824 | **1824 words** | **19–27 µs** |
+| | Immix | **121** | **288** | 10128 line-words | 47–55 µs |
+
+Both strategies find the **same** live set (`evacuated + pinned == copied`) and reclaim identical garbage.
+
+**Decision — `MatureKind::Copying` remains the default; GenImmix is an opt-in large-heap regime.** GenImmix
+wins on the one axis it was designed for — copying work on long-lived data (0 moved vs 129; 5.2× fewer
+objects / 6.3× fewer words under large-heap promotion pressure) — but every win is paired with a loss:
+(a) **footprint** 3.6–8× (line-granular internal fragmentation: 20 live words occupy 160 line-words on the
+garbage-heavy shape); (b) **pause** worse wherever it saves work (2.4× on the large heap — the reclaim walks
+the whole root set and every line of the region, and the major walks the nursery twice: `scan_young` then
+promotion); (c) an outright loss on the common small-heap/high-churn shape (8× the moved volume for the same
+10 objects). **Documented threshold:** Immix pays off only on a *large, long-lived* mature generation
+(roughly ≥ 8 full blocks of long-lived data, i.e. thousands of live words) in a memory-unconstrained process;
+below that, and for high-churn or memory-tight processes, the copying space wins on both footprint and pause
+and stays the default. This matches Part II §D ("worse for small heaps"). Pause numbers are an in-process
+median over 5 forced fullsweeps — a direction-of-magnitude signal, not a benchmark; every *assertion* is on
+the deterministic counts. (Immix's own reclaim could be sped up by removing the double nursery walk and the
+whole-region scan.)
 - **In-place Cheney forwarding, exactly as C.** A boxed object's **header word is overwritten** with
   the new BOXED-tagged pointer (`IS_MOVED_BOXED = !is_header`, `erl_gc.h:36`); a cons cell's car is set
   to `THE_NON_VALUE` and its cdr to the new LIST pointer (`IS_MOVED_CONS`, `erl_gc.h:37,42-55`). The
