@@ -1,13 +1,15 @@
 # `beam_process` — Processes, Scheduler, Run Queues, Signals
 ## Intent
 Owns the **OS-thread-level concurrency plumbing** of the Rust ERTS rewrite (Stage 5, Part II §H): the
-per-process control block (PCB), the four-level run queue, the cooperative scheduler loop, thread
-progress, the **exit-signal / link / monitor** machinery (the decoupled per-process signal queue plus
-its signal-message builders), the process table (`ptab`) with the local name registry, the **port-id
-table with its ownership/link/monitor surface**, and the local records for **remote (distributed)
-links/monitors**. It is what makes Erlang **processes** real: isolation, `spawn`, links, monitors and
-exit propagation — the process half of workspace `../CONTEXT.md` §1 **A.1** (process isolation / link /
-monitor / exit semantics).
+per-process control block (PCB), the four-level run queue, the cooperative scheduler loop, the
+**multi-scheduler (SMP) pool** (`SchedulerPool`: N scheduler threads over one shared table,
+per-scheduler run queues with work stealing, the cross-scheduler `ThreadProgress` barrier, the
+high-level `TimerService` and the two `DirtyPool`s), the **exit-signal / link / monitor** machinery
+(the decoupled per-process signal queue plus its signal-message builders), the process table (`ptab`)
+with the local name registry, the **port-id table with its ownership/link/monitor surface**, and the
+local records for **remote (distributed) links/monitors**. It is what makes Erlang **processes** real:
+isolation, `spawn`, links, monitors and exit propagation — the process half of workspace
+`../CONTEXT.md` §1 **A.1** (process isolation / link / monitor / exit semantics).
 It is consumed by `beam_bifs` (spawn/send/receive/`erlang:process_info`/`monitor`/`link` BIFs),
 `beam_io` (ports + the process side of I/O completion) and `beam_rt` (boot/CLI/`system_info`).
 It **drives** `beam_gc` (collector + MSO) at safepoints and **uses** `beam_message` (`Queue` mailbox
@@ -15,18 +17,25 @@ It **drives** `beam_gc` (collector + MSO) at safepoints and **uses** `beam_messa
 Legacy C ground truth (read-only): `../../erts/emulator/beam/erl_process.{c,h}` (PCB, scheduler, run
 queues), `erl_proc_sig_queue.c` (signal queue), `erl_monitor_link.c` (links/monitors),
 `erl_ptab.{c,h}` (process/port table + name registry), `erl_process_dict.c`, `erl_vm.h`
-(`MAX_REG`/`MAX_ARG`).
+(`MAX_REG`/`MAX_ARG`), `erl_thr_progress.c` (the thread-progress barrier), `erl_hl_timer.c` (the
+high-level timer wheel) and `erl_nfunc_sched.c` (the NIF→dirty-scheduler trampoline).
 ## Milestone-1 scope (what "implemented" means for THIS pass)
-A **correct SINGLE-OS-THREAD** core — one scheduler (`Scheduler`), no thread pools, no
-dirty schedulers, no lock-free/threaded run queues, no thread-progress barrier beyond a documented
-single-threaded stub. Multi-scheduler balancing and real `ThreadProgress` are a documented
-follow-up (see Known Issues). "Correct" means: the pid table, the **four-level** run-queue
+The crate has **two scheduler fronts**: the Milestone-1 single-threaded `Scheduler` loop (whose slice
+semantics are frozen and unchanged) and the SMP `SchedulerPool` that runs `N` scheduler threads over
+one shared table. Both execute the **same** slice logic — the pool reuses it through the shared
+`run_one`/`drain_woken_into` helpers, so the SMP change adds *concurrency*, not a second scheduler
+implementation. "Correct" means: the pid table, the **four-level** run-queue
 scheduling order (max/high/normal/low), message delivery, the **decoupled per-process signal
 queue** (exit signals + monitor-DOWNs, applied at schedule-in or eagerly for a non-running
 receiver), the process dictionary and saved-argument sub-rootsets, the **port ownership/link/monitor**
 surface, **remote (distributed) links/monitors** routed through the `DistSignalRouter` seam, and a
 safepoint GC over the process root set all behave per the C semantics for the common cases, and are
 covered by tests.
+Still **not** modelled: lock-free/threaded run queues, scheduler balancing and the
+`+S`/`+SDcpu`/`+SDio` flag parsing, per-process **parallel** execution (the pool holds the table lock
+for a whole slice, so exactly one process runs at a time across all schedulers), dirty-job term
+plumbing (a `DirtyJob` carries no live heap data), and heap-resident timer messages (a timer message
+must be thread-valid — an immediate or a literal-area term).
 ## API Surface (FROZEN — dependents route here)
 Re-exported at the crate root and via `beam_process::prelude::*`.
 ### `pid.rs` — process/port identity (bit-exact with `beam_term::immediate`)
@@ -140,6 +149,9 @@ liveness maps.
     `len_at(Priority)`; `is_empty()`; `contains(pid) -> bool`; `priority_of(pid) -> Option<Priority>`;
     `remove(pid) -> bool`; `iter() -> impl Iterator<Item = ProcessId> + '_` (dequeue order);
     `iter_at(Priority) -> impl Iterator<Item = ProcessId> + '_`; `clear()`.
+  - `split_off_half(&mut self) -> Vec<ProcessId>` — removes up to half of the queue's pids (highest
+    priority first, in `dequeue` order) so a work-stealing victim keeps at least half; a queue of 0 or
+    1 pids yields an empty `Vec`. The victim half of the SMP steal.
   - **Fairness deviation (documented):** the C keeps MAX/HIGH on dedicated queues but lets **NORMAL
     and LOW share one physical queue**, deferring LOW by a `schedule_count` (`RESCHEDULE_LOW = 8`,
     `erl_process.h`). This crate uses **four physically distinct FIFOs**, so a LOW process runs only
@@ -177,6 +189,12 @@ liveness maps.
   - `run_ready<R: ProcessRunner>(&mut self, table: &mut ProcessTable, runner: &mut R, max_slices:
     Option<u64>) -> Result<u64>` — run until the ready queue is empty (or `max_slices` slices run);
     returns the number of slices executed.
+- **Shared slice helpers (the SMP reuse seam).** `pub(crate) fn run_one<R, F>(pid, table, runner,
+  reductions, enqueue: F) -> Result<Option<RunOutcome>>` and `pub(crate) fn drain_woken_into<F>(table,
+  enqueue: F) -> usize` hold the slice semantics (`run_slice`/`resume_woken` delegate to them). The
+  SMP pool calls the same helpers with a closure that **buffers** requeues instead of touching a queue
+  (see `src/smp/`), so both scheduler fronts run identical slice logic. `Scheduler`'s public API and
+  behaviour are unchanged.
 
 ### The single-threaded orchestration contract `beam_rt` must follow
 (`beam_rt` is the orchestrator; `Scheduler::resume_woken` is the only coupling.)
@@ -189,11 +207,74 @@ liveness maps.
 - **send from outside a slice** ⇒ after `table.deliver(_simple)(…)` call
   `scheduler.resume_woken(&mut table)` so the woken receiver is enqueued.
 - **run** ⇒ `scheduler.run_ready(&mut table, &mut runner, None)`.
-### `progress.rs` — thread progress (documented single-scheduler stub)
-- `pub struct ThreadProgress` — M1 no-op barrier under one scheduler: `new()`, `generation() ->
-  u64`, `bump()` (advances the generation), `wait(u64)` (returns immediately — no other schedulers
-  exist). The seam `beam_io`/`beam_bifs` need for "wait until all schedulers have seen generation N";
-  the real cross-scheduler barrier is a documented follow-up.
+### `smp/` — the multi-scheduler (SMP) pool
+The SMP counterpart of `Scheduler`: `N` scheduler threads over one shared process table. Re-exported at
+the crate root (`beam_process::{SchedulerPool, SchedulerConfig, SchedulerStats, SchedulerStat}`). The
+five files:
+- `smp/mod.rs` — the module docs (**incl. the BINDING locking discipline**) plus:
+  - `pub struct SchedulerConfig` (`Debug + Clone + Copy + PartialEq + Eq + Default`) — default
+    (`new()`): **1** scheduler, 0 dirty workers, timers on, `DEFAULT_REDUCTIONS_PER_SLICE`; chainable
+    setters `set_schedulers`/`set_reductions_per_slice`/`set_dirty_cpu`/`set_dirty_io`/`set_timers`
+    (each returning `&mut Self`) + the matching getters; `with_schedulers(n)`.
+  - `pub struct SharedProcessTable { inner: Mutex<ProcessTable> }` — the table behind one
+    `parking_lot::Mutex`; `new(ProcessTable) -> Arc<Self>`, `lock() -> MutexGuard<'_, ProcessTable>`,
+    `try_lock() -> Option<MutexGuard<'_>>`. Carries two **documented `unsafe impl Send`/`unsafe impl
+    Sync`** (`ProcessTable` is `!Send` — it owns off-heap `beam_gc::MsoHandle`s holding a `NonNull`;
+    every access is serialised by the inner mutex). A **HANDOFF** — the durable fix belongs upstream in
+    `beam_gc::MsoHandle`/`beam_alloc::RefcBinary`.
+- `smp/queues.rs` — `pub(crate) struct Queues`: a shared **injector** `Mutex<RunQueue>` + one
+  `Mutex<RunQueue>` per scheduler index + the shared `InFlight` counter; `acquire(index)` tries own
+  queue → injector → round-robin **steal of half** a peer's queue (`RunQueue::split_off_half`),
+  returning `Acquired::{Pid, Stolen, Idle}`; length queries (`injector_len`/`local_len`/`local_lengths`/
+  `total_len`) and the idle predicates `has_takeable_work(index)` / `is_idle()` (`total_len() == 0 &&
+  inflight == 0`).
+- `smp/worker.rs` — the scheduler-thread loop (`Worker::run`): each iteration updates thread progress,
+  acquires work (own → injector → steal), runs one slice via the shared `run_one`/`drain_woken_into`
+  helpers with requeues **buffered** in a worker-local `buf`, and flushes `buf` to the local queue only
+  after the table guard drops. Plus `pub(crate) PoolSignals` (work/idle condvars + a stop flag; the park
+  predicate is re-checked under the signals mutex so a wakeup cannot be lost) and `record_error`.
+- `smp/stats.rs` — `pub struct SchedulerStats { schedulers, run_queue_len, slices, steals, active,
+  dirty_cpu_pending, dirty_io_pending, timers_pending }` and `pub struct SchedulerStat { index,
+  run_queue_len, slices, steals, active }` + the internal `WorkerCounters`/`InFlight` atomics.
+- `smp/pool.rs` — `pub struct SchedulerPool<R: ProcessRunner + Send + 'static>`:
+  `start(config, table, make_runner) -> Result<Self>`; `schedulers`, `progress`, `table`,
+  `timer_service`, `dirty_pool`, `spawn_default`, `spawn(policy)`, `enqueue`/`enqueue_with_priority`,
+  `deliver_simple`, `send_after`, `submit_dirty`, `stats`, `scheduler_stats`, `run_queue_len`,
+  `run_queue_lengths`, `wait_idle(Option<Duration>)`, `safepoint`, `take_error`, `shutdown`, `join`;
+  the `TimerSink`/`DirtyCompletionSink` impls. **Lifecycle:** `schedulers() == 0` is **clamped to 1**;
+  `shutdown()` abandons any still-queued pids (the processes stay in the table); `join(self)` = stop +
+  join scheduler threads + timer-service shutdown/join + `Arc::try_unwrap` the dirty pool and join it
+  (falling back to `shutdown()` when a caller still holds a clone).
+### `timer.rs` — the high-level timer service
+- `pub struct TimerService` — one background thread over a deadline min-heap (the `erlang:send_after/3`,
+  `start_timer/3` and `receive ... after T` plumbing): `new()`, `start(Arc<dyn TimerSink>)` (idempotent),
+  `send_after(Duration, ProcessId, Eterm) -> TimerRef`, `cancel(TimerRef) -> bool`, `pending()`,
+  `next_deadline() -> Option<Instant>`, `is_running()`, `shutdown()` (terminal), `join()`.
+- `pub struct TimerRef { id, generation }` (`Copy`); `id()`/`generation()`. `pub trait TimerSink: Send +
+  Sync { fn timer_fired(&self, target: ProcessId, message: Eterm); }` — the seam the pool implements.
+- **Message contract:** the stored message must be **thread-valid** — an immediate (small int/atom/pid)
+  or a literal-area/interned term; a term resident in a per-process heap is a caller contract violation
+  (would need an off-heap handle, a documented follow-up).
+### `dirty.rs` — the two dirty scheduler pools
+- `pub enum DirtyKind { Cpu, Io }` (`ALL`, `name()` = `"dirty_cpu_scheduler"`/`"dirty_io_scheduler"`);
+  `pub enum DirtyOutcome { Done, Reschedule(ProcessId), Deliver { target, message } }` — routing data the
+  normal scheduler acts on (`Reschedule` re-enters the pid; `Deliver` delivers and wakes).
+- `pub type DirtyJob = Box<dyn FnOnce() -> DirtyOutcome + Send + 'static>` — a plain closure carrying
+  **no** live heap data. `pub trait DirtyCompletionSink: Send + Sync { fn dirty_completed(&self,
+  DirtyOutcome); }` — implemented by the pool.
+- `pub struct DirtyPool` — `start(cpu, io)`, `set_sink(Arc<dyn DirtyCompletionSink>)`,
+  `cpu_schedulers()`/`io_schedulers()`/`schedulers(kind)`, `submit(kind, job)`, `pending(kind)`,
+  `shutdown()`, `join()`. A kind with **0 workers buffers** jobs (never drops on submit, discards at
+  join); a panicking job does not kill the pool.
+### `progress.rs` — thread progress (the cross-scheduler barrier)
+- `pub struct ThreadProgress` — the real barrier (cheap to clone; every clone shares the generation,
+  managed-thread registry and blocking counter): `new()`, `generation()`, `bump() -> u64`, `wait(u64)`
+  (blocks until every **active** managed thread confirmed the generation), `safepoint() -> u64`
+  (`bump`+`wait`), `managed_thread() -> ManagedThread`, `managed_count()`, `set_waker(Arc<dyn Fn() +
+  Send + Sync>)`, `is_blocking()`/`block()`/`unblock()`/`blocking_count()`.
+- `pub struct ManagedThread` — the per-thread slot a scheduler registers: `progress()`, `update()`
+  (confirm the current generation), `is_active()`/`set_active(bool)` (an inactive/parked thread is
+  already at a safepoint and is excluded from the wait), `id()`.
 ### `signal.rs` — exit signals, reasons and signal-message builders
 - `pub struct SignalAtoms { exit: Atom, down: Atom, process: Atom, port: Atom, normal: Atom, kill:
   Atom, killed: Atom }` — the well-known atom indices used to build signal messages.
@@ -360,11 +441,14 @@ re-export keeps `beam_process::PortTable` resolving here.
   upstream, so `?` crosses the boundary.
 - **`unsafe` is confined** to the modules that touch raw words: `signal.rs`/`monitor.rs` message
   builders and `remote.rs` (reading/writing the external-pid thing through `beam_term`'s `unsafe`
-  predicates, building tuple/ref words through `beam_alloc::Heap::alloc_words`). Every
+  predicates, building tuple/ref words through `beam_alloc::Heap::alloc_words`), plus `src/smp/mod.rs`
+  (the two documented `unsafe impl Send`/`unsafe impl Sync for SharedProcessTable`). Every
   `unsafe fn` carries a `# Safety` section and every `unsafe` block a preceding `// SAFETY:` rationale
   (`../beam_common/src/safety.rs` convention). `unsafe_op_in_unsafe_fn` stays clean. `pid.rs`,
   `registers.rs`, `run_queue.rs`, `link.rs`, `monitor.rs` set logic, `ptab.rs` bookkeeping,
-  `signal_queue.rs`, `port.rs` and `progress.rs` must be safe Rust.
+  `signal_queue.rs`, `port.rs` and `progress.rs` must be safe Rust. The SMP pool's `unsafe` is limited
+  **to those two impls** — `queues.rs`/`worker.rs`/`stats.rs`/`pool.rs` and `timer.rs`/`dirty.rs` are
+  safe Rust (synchronisation is `parking_lot` mutexes/condvars + atomics).
 - **Never assume a different term layout** — build/inspect terms only through `beam_term`'s public
   accessors + `beam_alloc::Heap`'s builders. Pid/port immediates are bit-exact with
   `beam_term::immediate` (`make_internal_pid`/`pid_number`/`pid_serial`).
@@ -375,7 +459,8 @@ re-export keeps `beam_process::PortTable` resolving here.
 - **Deps (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `beam_alloc`, `beam_gc`,
   `beam_message`, `libc`, `parking_lot`. Adding a dependency edge requires reporting to `../`.
   `beam_engine` is **NOT** a dependency (the `ProcessRunner` trait keeps the DAG acyclic).
-- Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0.
+- Files target ~1000 lines; one responsibility per file. Licensing Apache-2.0. The `src/smp/*` files,
+  `src/timer.rs` and `src/dirty.rs` are each well under that figure.
   `src/ptab.rs` (the table + signal hub) is the only file over that figure: ~1535 lines of production
   code + ~450 lines of tests (~1990 total). It deliberately stays whole because the signal/link/monitor
   servicing is tightly coupled to `ProcessTable`'s private fields (`slots`/`atoms`/`refs`/`ready`), which
@@ -445,10 +530,40 @@ re-export keeps `beam_process::PortTable` resolving here.
   10. `tests/fragments.rs` — terms saved only through `Process::saved_args` surviving `Process::collect`,
      and one collection relocating registers, stack, mailbox payloads, dictionary values and saved
      arguments **together**.
+  11. `tests/smp.rs` (11 tests) — **the required SMP evidence**: (a) N processes progress on M
+     schedulers for M ∈ {1, 4} (200 pids each); (b) **work stealing** — a driver wakes 128 blocked
+     receivers into one worker's local queue and a parked peer **steals half** (the pool `steals` total
+     and the per-scheduler sum are compared at the same frozen value); (c) a **timer** fires into a
+     blocked receiver; (d) `deliver_simple` wakes a blocked receiver; (e) a dirty `Reschedule` round trip
+     re-runs the pid; (f) lifecycle/observables (`stats`/`scheduler_stats` one entry per scheduler,
+     `run_queue_len` non-zero while a gated runner pins the single worker, `shutdown`+`join` returns
+     without hanging); (g) a one-scheduler config runs to completion.
+  12. `tests/timers.rs` — the `TimerService` contract: a timer fires into the sink with the exact target
+     and message, deadline order (equal deadlines in insertion order), `cancel` prevents firing and is
+     idempotent, `pending`/`next_deadline` track schedule/cancel/fire, a timer scheduled before `start`
+     fires once started, and `shutdown`/`join` stops the thread.
+  13. `tests/dirty.rs` — jobs run on **dirty worker threads** and every completion is routed; a
+     `Reschedule`/`Deliver` outcome is routed verbatim; `pending` rises and drains; `N` workers run `N`
+     jobs concurrently (a `Barrier` proves it); shutdown/join + submit-after-shutdown; a `0`-worker pool
+     buffers (never drops, never panics) and discards at join; a sink installed after submit receives the
+     completion; a panicking job does not kill the pool; and a **repeated `DirtyPool::start(1, 0)` +
+     `join()` loop** guarding the shutdown-wakeup invariant.
+  14. `tests/progress.rs` — the cross-scheduler barrier: `wait` returns only after every active managed
+     thread reaches the generation, returns immediately when already at it, an inactive thread is
+     excluded (and reactivation re-includes it), concurrent `bump`s produce every generation once,
+     `block`/`unblock` nest without underflow, `safepoint` never blocks on the caller's own slot, `wait`
+     invokes the registered waker, and a clone shares the registry/generation/blocking state.
+- **Anti-flakiness (the SMP/timer/dirty/progress suites).** Every assertion is forced by
+  **synchronization**, never `std::thread::sleep`: `mpsc` channels + `recv_timeout` carry the
+  completion signals, `std::sync::Barrier`/gates coordinate concurrency, and
+  `SchedulerPool::wait_idle(Some(timeout))` is the pool's converging idle wait (it also requires the
+  in-flight count to be zero, so counters read after it are exact). A wedged pool fails with a clear
+  timeout instead of hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml
-  --workspace`. Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never
-  touch `../../tools/`.
+  --workspace`. Current total: **220 tests, 0 failures** (131 in-module unit + 88 across the 15
+  `tests/` files + 1 doctest). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never
+  `cd`, never touch `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
   not here.
 ## Design Decisions
@@ -537,13 +652,48 @@ re-export keeps `beam_process::PortTable` resolving here.
 - **`Process` owns a `beam_gc::Collector`, not raw `Heap`s.** The young space is the mutator heap
   (`heap_mut()`), the mature space is a GC target; `should_collect`/`collect` delegate policy to
   `beam_gc::HeapPolicy`. No heap logic is reimplemented here.
-- **`load`/`libc`/`parking_lot` are declared but unused in the M1 core** (`libc`/`parking_lot` are for
-  the deferred multi-scheduler/threaded run queues); the single-threaded core uses neither. Keep the
-  edges (they are the documented multi-scheduler dependencies) but do not invent threads in M1.
+- **`parking_lot` is the synchronisation primitive; `libc` remains unused.** The SMP pool, the timer
+  service and the dirty pools use `parking_lot::{Mutex, Condvar}` (plus std atomics), and
+  `progress.rs` uses `parking_lot::{Mutex, Condvar}` for the barrier. `libc` is declared but unused in
+  the core; it stays the documented dependency of the deferred OS-level threading work.
+- **The SMP pool reuses the frozen slice (`run_one`/`drain_woken_into`).** Concurrency is added
+  *around* the slice, never inside it: `Worker::run` calls the same `pub(crate)` helpers the
+  single-threaded `Scheduler` uses, so a process executes identically under either front. The only
+  difference is the requeue closure the worker passes — it **buffers** requeues into a local `Vec`
+  instead of touching a queue (see the locking discipline).
+- **The coarse per-slice table lock + the locking discipline.** The pool keeps one
+  `Mutex<ProcessTable>` (`SharedProcessTable`) and holds it for a whole slice, so — across all
+  schedulers — exactly one process runs at a time (no intra-process parallelism yet). Three lock
+  families coexist (queue locks, the table lock, the signals mutex) under the **BINDING** order
+  documented in `src/smp/mod.rs`: never hold a queue lock while taking the table lock and vice-versa;
+  requeues produced while the table guard is held are buffered in `buf` and flushed to the local queue
+  **only after** the guard drops; the one nested acquisition is *signals mutex → queue lock* inside
+  `PoolSignals::park`/`wait_for_idle` (the reverse never happens).
+- **`SharedProcessTable`'s `unsafe impl Send/Sync` is a contained handoff.** `ProcessTable` is
+  `!Send` because it owns off-heap `beam_gc::MsoHandle`s whose payload pointer is a `NonNull`. The
+  two `unsafe impl`s assert that confining every access to the inner `parking_lot::Mutex` makes moving
+  and sharing the wrapper sound; they are the crate's only `unsafe` in the SMP layer. The durable fix
+  belongs upstream (make `beam_gc::MsoHandle`/`beam_alloc::RefcBinary` `Send`), which this crate must
+  not change — hence a handoff, not a redesign.
+- **Non-flaky `wait_idle` via an in-flight counter.** The pool reports idle only when every queue is
+  empty **and** the shared `InFlight` count is zero. A pop increments `InFlight` *inside* the same
+  critical section that dequeues the pid (so an idle observer cannot slip into the gap), and a worker
+  flushes its local `buf` batch **before** calling `finish_slice` (which decrements the counter) — the
+  order is load-bearing: flushing after would leave a window where the queues are empty and the count
+  is zero while a yielded pid still sits only in `buf`.
+- **Loss-free park/notify.** A worker re-checks the queue predicate **under the signals mutex**
+  immediately before `Condvar::wait`, and every notifier takes the same mutex before signalling, so a
+  wake-up cannot be lost between the "nothing to do" decision and the sleep. The mutex→queue-lock
+  order is consistent everywhere (a notifier releases its queue lock before signalling), so the
+  hierarchy cannot deadlock.
 ## Known Issues (intentionally NOT covered in Milestone-1)
-- **Multi-scheduler / SMP**: no scheduler threads, thread pools, dirty schedulers, scheduler balancing,
-  or lock-free run queues. `ThreadProgress` is a documented single-scheduler stub; the real
-  cross-scheduler barrier (and the delayed-dealloc coupling with `beam_alloc`) is a follow-up.
+- **Multi-scheduler / SMP (remaining gaps)**: lock-free/threaded run queues, scheduler **balancing**,
+  and the `+S`/`+SDcpu`/`+SDio` flag parsing are not modelled. The pool holds the table lock for a whole
+  slice, so a process **does not run in parallel** across schedulers (one runs at a time). Dirty-job
+  **term plumbing** is absent (a `DirtyJob` carries no live heap data) and a timer message must be
+  thread-valid (no heap-resident terms). `ThreadProgress` implements the barrier but has **no**
+  delayed-dealloc coupling with `beam_alloc`, and **port tasks are not load-balanced** across
+  schedulers.
 - **The signal queue is not cross-ordered with the mailbox.** A trapped `{'EXIT', …}`/`{'DOWN', …}`
   becomes a mailbox message only when the queued signal is *applied*, so an ordinary send already in
   the mailbox can be seen before it; remote (external-pid) and port signals bypass the queue entirely
@@ -580,9 +730,16 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `src/process.rs` → `Process` (PCB), `ProcessState`, `ProcessFlags` (incl. `sensitive`), `DeliverOutcome`, `Process::wake`, the priority/`save_calls` accessors, message delivery + GC entry + the dict/saved-args/signal sub-rootsets
 - `src/dict.rs` → `Dict` (process dictionary: put/get/erase/get_keys + GC gather/scatter)
 - `src/fragments.rs` → `SavedArgs` (saved BIF/NIF argument roots + GC gather/scatter)
-- `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note)
-- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `resume_woken` (wake absorption), the schedule-in signal servicing
-- `src/progress.rs` → `ThreadProgress` (single-scheduler stub)
+- `src/run_queue.rs` → `Priority` (max/high/normal/low) + `RunQueue` (four per-priority FIFOs + the LOW/NORMAL fairness-deviation note + `split_off_half` for work stealing)
+- `src/scheduler.rs` → `Scheduler`, `RunOutcome`, `ProcessRunner` (the engine seam), `enqueue_with_priority`, `resume_woken` (wake absorption), the schedule-in signal servicing, and the shared `pub(crate)` slice helpers `run_one`/`drain_woken_into` (reused by the SMP pool)
+- `src/smp/mod.rs` → the SMP module docs (incl. the BINDING locking discipline), `SchedulerConfig`, `SharedProcessTable` (with the two documented `unsafe impl Send/Sync`)
+- `src/smp/queues.rs` → `Queues` (shared injector + per-scheduler local queues + `InFlight`; `Acquired`; the own→injector→steal acquisition + length/idle predicates)
+- `src/smp/worker.rs` → `Worker` (the scheduler-thread loop) + `PoolSignals` (work/idle condvars + stop; loss-free park) + `record_error`
+- `src/smp/stats.rs` → `SchedulerStats`, `SchedulerStat` (public snapshots) + the internal `WorkerCounters`/`InFlight` atomics
+- `src/smp/pool.rs` → `SchedulerPool` (start/spawn/enqueue/deliver/timer/dirty/stats/idle/safepoint/shutdown/join + the `TimerSink`/`DirtyCompletionSink` impls and the lifecycle rules)
+- `src/timer.rs` → `TimerService` (one thread over a deadline min-heap), `TimerRef`, `TimerSink` (the high-level `send_after`/`cancel` service)
+- `src/dirty.rs` → `DirtyPool`, `DirtyKind`, `DirtyOutcome`, `DirtyJob`, `DirtyCompletionSink` (the dirty-CPU + dirty-IO worker pools)
+- `src/progress.rs` → `ThreadProgress` (the cross-scheduler barrier), `ManagedThread` (the per-thread progress slot)
 - `src/signal.rs` → `SignalAtoms` (incl. `port`), `ExitSignal`, `ReasonClass`, `ExitPolicy`/`exit_policy`, the signal-message builders (exit + `process`/`port`/remote `DOWN`)
 - `src/signal_queue.rs` → `SignalQueue` + `PendingSignal`/`PendingSignalKind` (the decoupled pending-signal queue + its GC gather/scatter)
 - `src/link.rs` → `Links` (bidirectional link set)
@@ -601,7 +758,13 @@ re-export keeps `beam_process::PortTable` resolving here.
 - `tests/pending_signals.rs` → deferred-vs-eager signal application + FIFO order + a structured reason surviving `collect`
 - `tests/ports.rs` → `PortTable` ownership/link/monitor round-trips + `ProcessTable::port_closed`
 - `tests/remote.rs` → external-pid link/monitor recording + the `DistSignalRouter` seam + `node_down`
+- `tests/smp.rs` → the `SchedulerPool`: N-on-M-scheduler progress, work stealing, a timer/dirty/send wake, and the lifecycle/observables (non-flaky via `recv_timeout`/gates/`wait_idle`)
+- `tests/timers.rs` → `TimerService`: fire-into-sink, deadline/insertion order, cancel, `pending`/`next_deadline`, pre-start scheduling, shutdown/join
+- `tests/dirty.rs` → `DirtyPool`: dirty-worker execution + verbatim completion routing, `pending`, N-job concurrency, lifecycle, 0-worker buffering, sink-after-submit, panicking job, and the repeated start/join regression
+- `tests/progress.rs` → the `ThreadProgress` barrier: wait-until-generation, inactive-thread exclusion, concurrent bumps, block/unblock nesting, own-slot non-blocking, the waker, clone sharing
 - `../../erts/emulator/beam/erl_process.{c,h}` → PCB, scheduler, run queues (read-only ground truth)
+- `../../erts/emulator/beam/erl_thr_progress.c` → the thread-progress barrier ground truth (read-only)
+- `../../erts/emulator/beam/erl_hl_timer.c` → the high-level timer wheel ground truth (read-only)
 - `../../erts/emulator/beam/erl_ptab.{c,h}` → process/port table + name registry (read-only)
 - `../../erts/emulator/beam/erl_monitor_link.c` → links/monitors (read-only)
 - `../../erts/emulator/beam/erl_proc_sig_queue.c` → the signal-queue ground truth the decoupled pending-signal queue reproduces (read-only)
@@ -611,6 +774,14 @@ re-export keeps `beam_process::PortTable` resolving here.
 - Read `../CONTEXT.md` (crate-layer contracts, the `Process`/`Scheduler` seam) and
   `../../CONTEXT.md` §1 A.1/§3/§5 before changing this crate. Ground truth is the legacy C listed
   above — **read it; never modify it.**
+- The **SMP pool lives in `src/smp/`** and must follow the **locking discipline** documented in
+  `src/smp/mod.rs` (never hold a queue lock while taking the table lock and vice-versa; buffer requeues
+  while the table guard is held; the only nested order is *signals mutex → queue lock*). It reuses the
+  frozen `run_one`/`drain_woken_into` slice helpers — do **not** re-implement slice logic in a worker.
+- `ProcessTable` is `!Send` (off-heap `beam_gc::MsoHandle` `NonNull` payloads), so moving it into the
+  pool needs `SharedProcessTable`'s two `unsafe impl Send/Sync` — they are the **contained workaround**
+  (all access is serialised by the inner mutex), pending an upstream `beam_gc`/`beam_alloc` fix that
+  makes the off-heap handles `Send`. Do not widen this `unsafe`.
 - Build/test with the manifest path: `erts_rust/scripts/cargo.sh test --manifest-path
   erts_rust/Cargo.toml -p beam_process` (sandbox `$HOME` is read-only — always the wrapper). Never
   `cd`; never touch `../../tools/`.
