@@ -10,6 +10,11 @@
 //!
 //! The host-free half lives in [`super::mem`]; the shared [`env_for`](super::env_for) helper, the
 //! `driver_term_nil` data symbol, the module docs and the populated table live in [`super`].
+//!
+//! This is the largest of the three files, and legitimately so: the C's port/host-dependent half is
+//! the bigger half, and the bulk of the file is its tests (the port-pointer recovery, the term-data
+//! round-trips through the populated table, and the output/select/timer host traffic), not the
+//! functions themselves.
 
 use libc::{c_char, c_int, c_long, c_uint, c_ulong, c_void};
 
