@@ -114,6 +114,159 @@ pub fn app_ebin(app: &str) -> Option<PathBuf> {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Locating the WHOLE installed OTP (every application, generically)
+// ---------------------------------------------------------------------------
+
+/// The root `lib` directory of the running Erlang installation — the directory
+/// that holds the versioned application directories (`stdlib-8.1`,
+/// `kernel-11.0.4`, …), i.e. exactly what `code:lib_dir/0` returns.
+///
+/// Resolution order:
+/// 1. `$ERTS_LIB_DIR` (the lib *root* itself);
+/// 2. `erl -noshell -eval 'io:format("~s",[code:lib_dir()]),halt().'`.
+///
+/// `None` when neither yields an existing directory; a caller that gets `None`
+/// must **skip loudly** (never fail) — see [`skip_reason`].
+pub fn otp_lib_root() -> Option<PathBuf> {
+    if let Ok(dir) = env::var("ERTS_LIB_DIR") {
+        let dir = PathBuf::from(dir);
+        return dir.is_dir().then_some(dir);
+    }
+    let output = Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\",[code:lib_dir()]),halt().",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let dir = PathBuf::from(String::from_utf8(output.stdout).ok()?.trim());
+    dir.is_dir().then_some(dir)
+}
+
+/// One installed application's `ebin` directory together with the sorted
+/// basenames of the `*.beam` modules it holds.
+pub struct AppEbin {
+    /// The application *directory* name as installed, e.g. `stdlib-8.1` (or the
+    /// bare name when the directory carries no version suffix).
+    pub app: String,
+    /// The `<app>/ebin` directory holding the modules.
+    pub dir: PathBuf,
+    /// The sorted `*.beam` module basenames (without the extension).
+    pub modules: Vec<String>,
+}
+
+/// Every installed OTP application's `ebin` directory — with its sorted `.beam`
+/// module basenames — discovered **generically** under [`otp_lib_root`]: each
+/// direct child directory of the lib root that contains an `ebin` with at least
+/// one `.beam` becomes one entry. **No application name or path is hardcoded**,
+/// so an OTP install that gains/renames/removes an application is walked as-is.
+///
+/// Entries are returned sorted by application directory name, so the order is
+/// stable across runs. A directory without a readable `ebin` (or with no
+/// `.beam` at all, e.g. `erl_interface`) is skipped. `None` means the lib root
+/// itself could not be located (the caller skips loudly).
+pub fn all_otp_ebins() -> Option<Vec<AppEbin>> {
+    let root = otp_lib_root()?;
+    let mut app_dirs: Vec<PathBuf> = std::fs::read_dir(&root)
+        .ok()?
+        .filter_map(|entry| entry.ok())
+        .map(|entry| entry.path())
+        .filter(|path| path.is_dir())
+        .collect();
+    app_dirs.sort();
+
+    let mut apps: Vec<AppEbin> = Vec::new();
+    for app_dir in app_dirs {
+        let ebin = app_dir.join("ebin");
+        let mut modules: Vec<String> = std::fs::read_dir(&ebin)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().map(|ext| ext == "beam").unwrap_or(false))
+            .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+            .collect();
+        if modules.is_empty() {
+            continue;
+        }
+        modules.sort();
+        let app = app_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        apps.push(AppEbin {
+            app,
+            dir: ebin,
+            modules,
+        });
+    }
+    Some(apps)
+}
+
+/// One `.beam` file anywhere under the installed OTP lib root.
+pub struct BeamFile {
+    /// The owning application *directory* name as installed (e.g. `stdlib-8.1`).
+    pub app: String,
+    /// The `.beam` file stem (the module name the loader will see).
+    pub module: String,
+    /// The full path of the `.beam` file.
+    pub path: PathBuf,
+}
+
+/// **Every** `*.beam` file anywhere under the installed OTP lib root, discovered
+/// generically by walking each application directory recursively — the `ebin`
+/// modules as well as any compiled `.beam` a distribution ships elsewhere under
+/// the app (documentation examples, `proper_ext`, …). No application name, path
+/// or module is hardcoded.
+///
+/// Entries are returned sorted by `(app, module)` so the order is stable across
+/// runs. `None` means the lib root itself could not be located (the caller skips
+/// loudly).
+pub fn all_otp_beams() -> Option<Vec<BeamFile>> {
+    let root = otp_lib_root()?;
+    let mut beams: Vec<BeamFile> = Vec::new();
+    for entry in std::fs::read_dir(&root).ok()?.filter_map(|entry| entry.ok()) {
+        let app_dir = entry.path();
+        if !app_dir.is_dir() {
+            continue;
+        }
+        let app = app_dir
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        // An iterative depth-first walk (no recursion bound, no external crate).
+        let mut stack = vec![app_dir];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.filter_map(|entry| entry.ok()) {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().map(|ext| ext == "beam").unwrap_or(false) {
+                    let module = path
+                        .file_stem()
+                        .map(|stem| stem.to_string_lossy().into_owned())
+                        .unwrap_or_default();
+                    beams.push(BeamFile {
+                        app: app.clone(),
+                        module,
+                        path,
+                    });
+                }
+            }
+        }
+    }
+    beams.sort_by(|a, b| a.app.cmp(&b.app).then_with(|| a.module.cmp(&b.module)));
+    Some(beams)
+}
+
 /// True when `dir` is a directory that contains at least one `*.beam` file — the
 /// signal [`app_ebin`] uses to accept a candidate `ebin` directory.
 fn has_beams(dir: &std::path::Path) -> bool {
@@ -486,6 +639,12 @@ impl ExecutionContext for ModuleHost {
         // namespace, never a loadable module, so an unknown `erlang` BIF is a
         // typed error rather than a spurious module load.
         if module == "erlang" {
+            // Diagnostic: a blocked target is often blocked by one unserved
+            // `erlang` BIF deep inside a module. Set `ERTS_TRACE_UNSERVED_BIF=1`
+            // to print the exact BIF that stopped the run.
+            if env::var_os("ERTS_TRACE_UNSERVED_BIF").is_some() {
+                eprintln!("unserved BIF: erlang:{function}/{arity}");
+            }
             return Err(BeamError::BadArg);
         }
         let module = self.load(module)?;
@@ -1158,6 +1317,18 @@ fn hd(args: &[Eterm]) -> Result<Eterm> {
 pub fn int_list(host: &mut ModuleHost, values: &[i64]) -> Eterm {
     let elements: Vec<Eterm> = values.iter().map(|&v| make_small(v)).collect();
     terms::make_list(host, &elements).expect("build an int list")
+}
+
+/// An Erlang string (a list of character code points) as a term.
+pub fn chars(host: &mut ModuleHost, text: &str) -> Eterm {
+    let codes: Vec<i64> = text.chars().map(|c| i64::from(c as u32)).collect();
+    int_list(host, &codes)
+}
+
+/// Asserts `got` is the Erlang string `want` (a list of character code points).
+pub fn assert_str(host: &ModuleHost, got: Eterm, want: &str) {
+    let codes: Vec<i64> = want.chars().map(|c| i64::from(c as u32)).collect();
+    assert_int_list(host, got, &codes);
 }
 
 /// Asserts `got` is the proper list of the small integers `want`, comparing with

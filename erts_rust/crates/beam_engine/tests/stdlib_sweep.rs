@@ -46,7 +46,6 @@
 
 mod support;
 
-use std::fmt::Write as _;
 use std::path::PathBuf;
 
 use beam_common::BeamError;
@@ -64,14 +63,42 @@ use support::{
 /// One application `ebin` directory to sweep, with its application name and the
 /// sorted `*.beam` module basenames it holds.
 struct SweepDir {
-    app: &'static str,
+    app: String,
     dir: PathBuf,
     modules: Vec<String>,
 }
 
-/// The installed-OTP applications swept: `stdlib` and `kernel` are required;
-/// `compiler` is swept too when present (extra evidence, never a failure).
+/// The **whole installed OTP** swept: every application directory under the
+/// runtime's lib root (`code:lib_dir/0`), discovered generically by
+/// [`support::all_otp_ebins`] — no application name or path is hardcoded.
+///
+/// The discovery order is re-ordered so `stdlib` is first (the execution host's
+/// primary `ebin`), then `kernel`, then `compiler`, then every remaining
+/// application in its discovered (alphabetical) order. When the generic lib-root
+/// discovery is unavailable the original `stdlib`/`kernel`/`compiler`-by-name
+/// walk is used as a fallback, so the sweep never silently degrades to nothing.
 fn sweep_dirs() -> Vec<SweepDir> {
+    if let Some(apps) = support::all_otp_ebins() {
+        let mut dirs: Vec<SweepDir> = apps
+            .into_iter()
+            .map(|app| SweepDir {
+                app: app.app,
+                dir: app.dir,
+                modules: app.modules,
+            })
+            .collect();
+        // `sort_by_key` is stable, so the discovered (alphabetical) order is kept
+        // within each group while stdlib/kernel/compiler are pulled to the front.
+        dirs.sort_by_key(|dir| match bare_app(&dir.app) {
+            "stdlib" => 0,
+            "kernel" => 1,
+            "compiler" => 2,
+            _ => 3,
+        });
+        return dirs;
+    }
+
+    // Fallback: locate the three historically swept applications by name.
     let mut dirs = Vec::new();
     for app in ["stdlib", "kernel", "compiler"] {
         let Some(dir) = app_ebin(app) else {
@@ -86,9 +113,19 @@ fn sweep_dirs() -> Vec<SweepDir> {
             .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
             .collect();
         modules.sort();
-        dirs.push(SweepDir { app, dir, modules });
+        dirs.push(SweepDir {
+            app: app.to_string(),
+            dir,
+            modules,
+        });
     }
     dirs
+}
+
+/// The bare application name without its version suffix (`stdlib-8.1` →
+/// `stdlib`), for ordering the sweep groups.
+fn bare_app(app: &str) -> &str {
+    app.split('-').next().unwrap_or(app)
 }
 
 /// Skips the calling test (loudly) when the oracle OTP install is unavailable;
@@ -117,71 +154,97 @@ fn host(dirs: &[SweepDir]) -> ModuleHost {
 // 1. The broad LOAD sweep
 // ---------------------------------------------------------------------------
 
-/// Loads every `*.beam` in the sweep directories and proves that **all** of them
-/// load into a usable module — surfacing (and failing on) any load failure loudly.
+/// Loads **every `*.beam` of the whole installed OTP** — every application
+/// discovered generically under the runtime's lib root (`code:lib_dir/0`), and
+/// every `.beam` file each application ships (its `ebin` modules plus any
+/// compiled examples under it) — and proves that **all** of them load into a
+/// usable module, surfacing (and failing on) any load failure loudly.
 ///
-/// The load breadth is now complete: `beam_codec` decodes the whole fun-literal
-/// surface (`EXPORT_EXT`/`NEW_FUN_EXT`), the last blocker, so the sweep requires
+/// The load breadth is complete: `beam_codec` decodes the whole term surface
+/// (incl. the `EXPORT_EXT`/`NEW_FUN_EXT` fun literals), so the sweep requires
 /// **every** discovered module to load (and to yield at least one labelled
-/// function). A regression is caught twice over: the exact failure is printed with
-/// its typed error *and* the test fails.
+/// function). A regression is caught twice over: the exact failure is printed
+/// with its typed error *and* the test fails — never skipped, never allowlisted.
 #[test]
-fn sweep_loads_every_stdlib_and_kernel_beam() {
+fn sweep_loads_every_installed_beam() {
     if skip_if_unavailable() {
         return;
     }
-    let dirs = sweep_dirs();
+    // Prefer the generic whole-OTP walk; fall back to the (ebin-only) sweep
+    // directories so the test still runs when the lib-root discovery is
+    // unavailable but `code:lib_dir/1` works.
+    let beams: Vec<support::BeamFile> = match support::all_otp_beams() {
+        Some(beams) => beams,
+        None => sweep_dirs()
+            .into_iter()
+            .flat_map(|dir| {
+                dir.modules
+                    .into_iter()
+                    .map(move |module| support::BeamFile {
+                        path: dir.dir.join(format!("{module}.beam")),
+                        app: dir.app.clone(),
+                        module,
+                    })
+            })
+            .collect(),
+    };
     assert!(
-        !dirs.is_empty(),
-        "the sweep found no OTP `ebin` directories to load"
+        !beams.is_empty(),
+        "the sweep found no OTP `.beam` files to load"
     );
-    let mut host = host(&dirs);
+    let mut host = exec_host();
 
     let mut total = 0usize;
     let mut loaded = 0usize;
     let mut failures: Vec<(String, BeamError)> = Vec::new();
     let mut empty: Vec<String> = Vec::new();
+    let mut apps: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
 
-    for dir in &dirs {
-        for module in &dir.modules {
-            total += 1;
-            let path = dir.dir.join(format!("{module}.beam"));
-            match host.load_from_path(module, path) {
-                Ok(loaded_module) => {
-                    loaded += 1;
-                    let has_function = !loaded_module.functions.is_empty();
-                    let has_labels = loaded_module
-                        .functions
-                        .iter()
-                        .any(|function| !function.labels.is_empty());
-                    if !has_function || !has_labels {
-                        empty.push(format!("{}:{}", dir.app, module));
-                    }
+    for beam in &beams {
+        total += 1;
+        apps.insert(beam.app.clone());
+        // Key by the full path so two same-named modules can never mask one
+        // another (a memoized key would silently skip reading the second file).
+        let key = beam.path.to_string_lossy().into_owned();
+        match host.load_from_path(&key, &beam.path) {
+            Ok(loaded_module) => {
+                loaded += 1;
+                let has_function = !loaded_module.functions.is_empty();
+                let has_labels = loaded_module
+                    .functions
+                    .iter()
+                    .any(|function| !function.labels.is_empty());
+                if !has_function || !has_labels {
+                    empty.push(format!("{}/{}", beam.app, beam.module));
                 }
-                Err(error) => {
-                    // Surface every failure loudly, with the exact typed error — and
-                    // fail: a module that does not load is a regression, never a pass.
-                    println!("LOAD-FAIL {module}: {error:?}");
-                    failures.push((module.clone(), error));
-                }
+            }
+            Err(error) => {
+                // Surface every failure loudly, with the exact typed error — and
+                // fail: a module that does not load is a regression, never a pass.
+                println!("LOAD-FAIL {}/{}: {error:?}", beam.app, beam.module);
+                failures.push((format!("{}/{}", beam.app, beam.module), error));
             }
         }
     }
 
-    let mut report = String::new();
-    let _ = write!(report, "SWEEP: loaded {loaded}/{total} modules");
-    for dir in &dirs {
-        let _ = write!(report, " ({}={})", dir.app, dir.modules.len());
-    }
-    println!("{report}");
+    println!(
+        "SWEEP: loaded {loaded}/{total} `.beam` files over {} applications",
+        apps.len()
+    );
 
-    // A broad real sweep must cover a large number of modules. The floor is well
-    // below the real count (stdlib+kernel+compiler ≈ 260) so an OTP point release
-    // adding/removing a few modules does not break it, but a broken walk (or a
-    // missing application) does.
+    // A broad sweep of the *whole* installed OTP must cover a large number of
+    // modules. The floor is well below the real count (≈1366 modules over ≈35
+    // apps here) so an OTP point release adding/removing a few modules does not
+    // break it, but a broken walk (or a missing application) does.
     assert!(
-        total >= 150,
-        "the sweep only found {total} `.beam` files — expected stdlib+kernel (≈200)"
+        total >= 1000,
+        "the sweep only found {total} `.beam` files — expected the whole installed \
+         OTP (≈1366 over ≈35 applications)"
+    );
+    assert!(
+        apps.len() >= 20,
+        "the sweep only covered {} applications — expected the whole installed OTP (≈35)",
+        apps.len()
     );
     assert_eq!(
         loaded,
