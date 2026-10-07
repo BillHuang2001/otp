@@ -25,10 +25,6 @@
 //! | `erl_drv_init_ack` | `io.c:2932` | implemented |
 //! | `erl_drv_set_os_pid` | `io.c:2970` | implemented |
 //! | `driver_async_port_key` | `erl_async.c:518` | implemented |
-//! | `add_driver_entry` | `io.c:7640` | **`None`** — no process-global driver-table seam |
-//! | `remove_driver_entry` | `io.c:7698` | **`None`** — as above |
-//! | `driver_lock_driver` | `io.c:7324` | **`None`** — no driver-handle seam |
-//! | `driver_create_port` | `io.c:789` | **`None`** — needs the runtime's port registry |
 //!
 //! # The implemented family
 //!
@@ -62,35 +58,12 @@
 //! exactly as the C reports a port it cannot resolve: a driver following the documented `< 0` idiom
 //! sees identical behaviour.
 //!
-//! # The four slots that stay `None`
+//! # Slots owned elsewhere
 //!
-//! `add_driver_entry`, `remove_driver_entry`, `driver_lock_driver` and `driver_create_port` need
-//! **process-global runtime structure** that the *per-port* `DriverHost` seam does not expose, so
-//! they stay `None` (a driver that reaches one gets the C's failure behaviour, never a crash):
-//!
-//! * `add_driver_entry`/`remove_driver_entry` (`io.c:7640`, `io.c:7698`) insert/remove a
-//!   **statically linked** driver in the emulator's global `driver_list`, and `add` additionally
-//!   runs the entry's `init` callback through `init_driver`. That list is what `open_port` and the
-//!   load-time validation consult, and `remove_driver_entry` distinguishes a **dynamically loaded**
-//!   driver (`dp->handle != NULL` → `-1`, *"Not allowed for dynamic drivers"*) from a static one
-//!   (`1` removed / `0` not found). A `Mutex<Vec<*mut ErlDrvEntry>>` kept *in this crate* would
-//!   neither run `init_driver` nor be reachable by the runtime that must consult it — the
-//!   `DriverHost` seam is per-port and this module is private to `drv`, so nothing outside could
-//!   read such a list. It would model state no code can observe, which is **not** an honest model,
-//!   so the slots stay `None`. The hook they would need is a process-global driver-table service on
-//!   [`DriverHost`](crate::driver::host::DriverHost) (e.g.
-//!   `fn register_driver(&mut self, de: *mut ErlDrvEntry) -> c_int` plus an `unregister_driver`
-//!   returning the C's `-1`/`0`/`1`), which `../host.rs` does not provide.
-//! * `driver_lock_driver` (`io.c:7324`) locks the **shared object** behind the port's driver forever
-//!   (`erts_ddll_lock_driver(prt->drv_ptr->handle, …)`); it returns `-1` when the driver has no
-//!   `DE_Handle` (a statically linked driver, `io.c:7337`) and `0` after locking. This seam knows
-//!   nothing about a port's driver or its handle (`DriverEnv` has no `drv_ptr`), so neither the lock
-//!   nor the `-1`/`0` distinction can be reproduced. Missing hook:
-//!   `fn lock_driver(&mut self) -> c_int`.
-//! * `driver_create_port` (`io.c:789`) builds a **new live port** plus its driver instance (a port
-//!   table entry, a link to the connected process, an OS-level driver instance) and so needs the
-//!   runtime's port registry, which lives in `beam_io`/`beam_rt` — not in this declaration crate.
-//!   Missing hook: a port-creation service on [`DriverHost`](crate::driver::host::DriverHost).
+//! `add_driver_entry`, `remove_driver_entry`, `driver_lock_driver` and `driver_create_port` — the
+//! four slots that act on the emulator's **process-global** driver list and on port creation instead
+//! of one port's term services — live in the sibling [`registry`](super::registry) file, which
+//! documents their C semantics and the thread-local host publication the two entry-list slots use.
 //!
 //! # Documented deviations from the oracle
 //!
@@ -545,8 +518,7 @@ pub unsafe extern "C" fn driver_async_port_key(port: ErlDrvPort) -> c_uint {
 /// Populate this family's slots of the frozen [`ErlDrvApi`].
 ///
 /// Called from [`super::DRIVER_API`]'s `populate` chain, so this file — not `mod.rs` — owns the
-/// `Some(…)` list for the functions it defines. The four members of the family that need
-/// process-global runtime structure (see the module header) stay `None` deliberately.
+/// `Some(…)` list for the functions it defines.
 pub(super) const fn populate(mut api: ErlDrvApi) -> ErlDrvApi {
     api.erl_drv_busy_msgq_limits = Some(erl_drv_busy_msgq_limits);
     api.driver_failure_eof = Some(driver_failure_eof);

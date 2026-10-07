@@ -8,13 +8,18 @@
 //! - [`host`] — the driver host seam: `DriverHost` (the runtime services behind the `erl_drv_*`
 //!   implementations) and `DriverEnv` (the concrete env behind the opaque `ErlDrvPort` a runtime
 //!   passes to driver callbacks), plus the term-data-array decoder.
+//! - [`current_host`] — the thread-local publication (`with_current_host`) that lets the frozen slots
+//!   with **no** port operand (`add_driver_entry`/`remove_driver_entry`) reach a `DriverHost`.
 //! - [`drv`] — the implemented `driver_*`/`erl_drv_*` host functions and the populated
 //!   `driver_api_table()` they are published through.
 //! - [`loader`] — the dynamic driver loader: `dlopen`/`dlsym`, the `ErlDrvEntry` load contract,
 //!   and `DriverLibrary`.
 
 pub mod api;
+pub mod current_host;
 pub mod drv;
 pub mod host;
 pub mod loader;
 pub mod types;
+
+pub use current_host::with_current_host;

@@ -30,6 +30,12 @@
 //! family-local recording [`DriverHost`], so "the port is really closed in a live emulator" is a
 //! `beam_rt` concern, out of this crate's scope.
 //!
+//! This file additionally drives the four **driver-registry / port-creation** slots (`registry.rs`:
+//! `add_driver_entry`, `remove_driver_entry`, `driver_lock_driver`, `driver_create_port`) through the
+//! frozen table's *function pointers* — with the same recording host and the scoped
+//! `with_current_host` publication the two entry-list slots need — because those slots reach the
+//! runtime's process-global state rather than one port's term services.
+//!
 //! # Skip-vs-fail policy
 //!
 //! Building the fixture needs a C compiler and the system OTP include directory (which holds
@@ -45,8 +51,8 @@ use std::process::Command;
 use beam_abi::driver::drv::driver_api_table;
 use beam_abi::driver::host::PortFailure;
 use beam_abi::driver::loader::{load, DriverLibrary};
-use beam_abi::driver::types::{ErlDrvData, ErlDrvPort, ErlDrvSizeT};
-use beam_abi::{DriverEnv, DriverHost};
+use beam_abi::driver::types::{ErlDrvData, ErlDrvEntry, ErlDrvPort, ErlDrvSizeT, ErlDrvTermData};
+use beam_abi::{with_current_host, DriverEnv, DriverHost};
 use beam_term::atom::AtomTable;
 use beam_term::prelude::{make_atom, Eterm};
 use libc::{c_char, c_int, c_uint};
@@ -187,6 +193,16 @@ struct LifecycleTestHost {
     os_pids: Vec<c_int>,
     /// The key `async_port_key` writes.
     key: c_uint,
+    /// Every `add_driver_entry` operand (the `registry` family).
+    added: Vec<*mut ErlDrvEntry>,
+    /// Every `remove_driver_entry` operand.
+    removed: Vec<*mut ErlDrvEntry>,
+    /// Every `lock_driver` port operand.
+    locked: Vec<ErlDrvPort>,
+    /// Every `create_port` request as `(creator, connected, name, drv_data)`.
+    created: Vec<(ErlDrvPort, ErlDrvTermData, *mut c_char, ErlDrvData)>,
+    /// The handle `create_port` hands back (a distinctive non-null value).
+    created_port: ErlDrvPort,
 }
 
 impl LifecycleTestHost {
@@ -203,6 +219,11 @@ impl LifecycleTestHost {
             acks: 0,
             os_pids: Vec::new(),
             key: 0x4c_1f_e,
+            added: Vec::new(),
+            removed: Vec::new(),
+            locked: Vec::new(),
+            created: Vec::new(),
+            created_port: 0x5a5a_isize as ErlDrvPort,
         }
     }
 }
@@ -275,6 +296,32 @@ impl DriverHost for LifecycleTestHost {
         unsafe { *key = self.key };
         0
     }
+
+    fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        self.added.push(de);
+        0
+    }
+
+    fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        self.removed.push(de);
+        1
+    }
+
+    fn lock_driver(&mut self, port: ErlDrvPort) -> c_int {
+        self.locked.push(port);
+        0
+    }
+
+    fn create_port(
+        &mut self,
+        creator: ErlDrvPort,
+        connected: ErlDrvTermData,
+        name: *mut c_char,
+        drv_data: ErlDrvData,
+    ) -> ErlDrvPort {
+        self.created.push((creator, connected, name, drv_data));
+        self.created_port
+    }
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -321,6 +368,86 @@ fn the_family_slots_are_populated_in_the_frozen_table() {
         ("driver_async_port_key", table.driver_async_port_key.is_some()),
     ] {
         assert!(populated, "{name} must be populated");
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// The driver-registry / port-creation family (the `registry` file), driven through the table
+// ---------------------------------------------------------------------------------------------
+
+/// The invalid-port sentinel (`ERTS_INVALID_ERL_DRV_PORT`, `erts/emulator/beam/erl_port.h:67`).
+const INVALID_PORT: isize = -1;
+
+#[test]
+fn the_registry_slots_are_populated_in_the_frozen_table() {
+    let table = driver_api_table();
+    for (name, populated) in [
+        ("add_driver_entry", table.add_driver_entry.is_some()),
+        ("remove_driver_entry", table.remove_driver_entry.is_some()),
+        ("driver_lock_driver", table.driver_lock_driver.is_some()),
+        ("driver_create_port", table.driver_create_port.is_some()),
+    ] {
+        assert!(populated, "{name} must be populated");
+    }
+}
+
+/// The four slots driven through the frozen table's *function pointers* — the ABI path a driver
+/// takes — with a real recording host behind them.
+#[test]
+fn the_registry_slots_drive_the_host_through_the_frozen_table() {
+    let table = driver_api_table();
+    let mut host = LifecycleTestHost::new();
+
+    // A dangling `ErlDrvEntry*`: the entry-list slots only forward it, so any dereference would be a
+    // use-after-free the test would fault on rather than pass.
+    let de = core::ptr::NonNull::<ErlDrvEntry>::dangling().as_ptr();
+    let add = table.add_driver_entry.expect("populated");
+    let remove = table.remove_driver_entry.expect("populated");
+
+    // The two entry-list slots carry no port operand, so the host comes from the scoped publication.
+    with_current_host(&mut host, || {
+        // SAFETY: the slots forward the entry pointer to the host; it is never dereferenced here.
+        unsafe {
+            add(de); // the C's `void` wrapper: its result is deliberately discarded
+            assert_eq!(remove(de), 1, "'1' = removed");
+        }
+    });
+    assert_eq!(host.added, vec![de]);
+    assert_eq!(host.removed, vec![de]);
+
+    // Outside any publication the slots answer the C's values without touching the operand.
+    // SAFETY: as above.
+    assert_eq!(unsafe { remove(de) }, 0, "no current host => `0` (no such entry)");
+
+    // The two port-carrying slots recover the port's own env.
+    let mut env = DriverEnv::new(&mut host);
+    let port = env.as_port();
+    let name = c"lifecycle";
+    let lock = table.driver_lock_driver.expect("populated");
+    let create = table.driver_create_port.expect("populated");
+    // SAFETY: `port` came from `DriverEnv::as_port` on a live env; `name` is NUL-terminated.
+    let created = unsafe { create(port, 7, name.as_ptr() as *mut c_char, core::ptr::null_mut()) };
+    // SAFETY: `port` is live.
+    let locked = unsafe { lock(port) };
+    assert_eq!(locked, 0, "the host locked the port's own driver");
+    assert_eq!(created, host.created_port);
+    assert_eq!(host.locked, vec![port]);
+    assert_eq!(host.created.len(), 1);
+    assert_eq!(host.created[0].0, port);
+
+    // A null creator port is the sentinel, never a dereference (`erl_port.h:67`).
+    // SAFETY: a null port is `env_for`'s documented `None`; `name` is NUL-terminated.
+    unsafe {
+        assert_eq!(lock(core::ptr::null_mut()), -1);
+        assert_eq!(
+            create(
+                core::ptr::null_mut(),
+                7,
+                name.as_ptr() as *mut c_char,
+                core::ptr::null_mut()
+            ) as isize,
+            INVALID_PORT
+        );
     }
 }
 
