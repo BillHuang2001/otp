@@ -82,8 +82,8 @@ mod unicode;
 
 pub use crate::context::{
     AtomInterner, BifContext, BytesSink, DictHook, FunCaller, LocalFunIdentity, LocalNode,
-    ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PortHook, RecordDefinitionView,
-    RecordFieldView, RecordSource, SendHook, StdoutSink,
+    ModuleInfo, NifLoadError, NifLoader, NullSink, OutputSink, PortHook, ProcessHook,
+    RecordDefinitionView, RecordFieldView, RecordSource, SendHook, StdoutSink,
 };
 pub use crate::error::{raise_error, raise_exit, raise_throw};
 pub use crate::ets::TableRegistry;
@@ -100,7 +100,7 @@ pub mod prelude {
         default_registry, exit_reason_from_term, raise_error, raise_exit, raise_throw,
         reason_term_from_exit_reason, AtomInterner, BifContext, BifFn, BifRegistry, BytesSink,
         DictHook, FunCaller, LocalFunIdentity, LocalNode, ModuleInfo, NifLoadError, NifLoader,
-        NullSink, OutputSink, PortHook, RecordDefinitionView, RecordFieldView, RecordSource,
-        SendHook, StdoutSink, TableRegistry,
+        NullSink, OutputSink, PortHook, ProcessHook, RecordDefinitionView, RecordFieldView,
+        RecordSource, SendHook, StdoutSink, TableRegistry,
     };
 }
