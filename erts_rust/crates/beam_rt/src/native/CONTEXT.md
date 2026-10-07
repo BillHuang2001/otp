@@ -3,12 +3,13 @@
 ## Intent
 The BIFs that are really **runtime** operations: they read/write this runtime's own state
 (process table, port registry, code server, atom table, application view, parsed command line,
-timer heap) and are therefore served *before* the `beam_bifs` registry is consulted. They exist
-because `beam_bifs` owns the static `bif.tab` surface (arithmetic, comparison, term ops,
-`lists`/`maps`/`binary`, `io:format`, `ets`, `records`, …) while a handful of names need the
-host — and because `init:*`/`code:*`/`application:*`/`erts_internal:*` are **preloaded-module
-surface** (contract A.7) whose real `.beam` implementations are written against process/message
-machinery Milestone-1 does not run.
+timer heap, the module container loader) and are therefore served *before* the `beam_bifs`
+registry is consulted. They exist because `beam_bifs` owns the static `bif.tab` surface
+(arithmetic, comparison, term ops, `lists`/`maps`/`binary`, `io:format`, `ets`, `records`, …)
+while a handful of names need the host — and because
+`init:*`/`code:*`/`application:*`/`erts_internal:*` are **preloaded-module surface** (contract
+A.7) whose real `.beam` implementations are written against process/message machinery
+Milestone-1 does not run.
 
 The floor is a *fall-through* layer: every entry returns `Option<Result<Eterm>>`; `None` means
 "not a native BIF", and the caller (`RuntimeContext::call_bif`, `../context/mod.rs`) then tries
@@ -19,8 +20,9 @@ does not claim is never answered with a fabricated value.
 ### The dispatch (owned by `../native.rs`, not this node)
 `RuntimeContext::try_native(module, function, arity, args) -> Option<Result<Eterm>>` — one match
 arm per native call (and exactly **one** for the whole `erts_internal` namespace:
-`("erts_internal", _, _) => self.erts_internal_call(function, arity, args)`). The arm is the
-source of truth for what is native; each submodule below owns the per-function bodies. Files:
+`("erts_internal", _, _) => self.erts_internal_call(function, arity, args)`, and one for
+`prim_file`). The arm is the source of truth for what is native; each submodule below owns the
+per-function bodies. Files:
 
 | Module | Serves |
 |---|---|
@@ -31,8 +33,8 @@ source of truth for what is native; each submodule below owns the per-function b
 | `memory/` | `erlang:process_info/1,2` — the full per-process introspection surface (see below) |
 | `port.rs` | `erlang:port_command/2,3` and the closed-port half of `erlang:port_info/1,2` (the `PortHook` seam cannot express those) |
 | `application.rs` | `application:get_env/1,2,3`, `get_all_env/1`, `get_key/2`, `loaded_applications/0`, `which_applications/0` over a minimal native `.app` view |
-| `erts_internal.rs` | the `erts_internal` floor — see below |
-| `prim.rs` | the `prim_file` floor (`get_cwd/0,1`, `read_file/1`) — see below |
+| `erts_internal.rs` | the `erts_internal` floor (13 BIFs) — see below |
+| `prim.rs` | the `prim_file` floor (11 entries) — see below |
 | `test_support.rs` | the shared test fixtures (`runtime`/`system_runtime`/`call`/`atom`/`chars`/`string_of`) |
 
 ### `erlang:process_info/1,2` (contract A.8) — `memory/mod.rs` (+ `memory/tests.rs`)
@@ -131,21 +133,34 @@ claim so it falls through to the registry.
 
 | BIF | Ground truth | Behaviour (oracle-verified, OTP 29.1.1 / erts-17.1) |
 |---|---|---|
-| `term_type/1` | `erl_map.c:3336-3417` | `fixnum`, `atom`, `tuple`, `flatmap`, `hashmap`, `pid`, `port`, `nil`, `catch`, `list`, `hfloat`, `fun`, `export`, `sub_binary` |
+| `term_type/1` | `erl_map.c:3336-3417` | the C's family name: `fixnum`, `atom`, `tuple`, `flatmap`, `hashmap`, `pid`, `port`, `nil`, `catch`, `list`, `hfloat`, `fun`, `export`, `sub_binary`, `bignum`, `external_pid`, `external_port`, `external_reference` |
+| `get_dflags/0` | `dist.c:5566-5592` | the fixed flag record `{erts_dflags,468283523004,17230663572,468283523004,8396866,8192}` — identical on a non-distributed node and on a `-sname` node; two slots exceed 2^32 (wide fixnums), and the term's `term_to_binary/1` image is byte-exact to the oracle's |
+| `beamfile_chunk/2` | `beam_bif_load.c:165-201` | a named `.beam` chunk's payload as a **binary**; `undefined` for an absent or zero-length chunk or an unparseable container (a duplicate tag resolves to the **last** occurrence — `read_beam_chunks`, `beam_file.c:1556-1581`); `badarg` for a non-binary first arg or a name that is not a list of small ints. Chunk ids are the 4-byte ASCII tags, **case-sensitive**. Read through the public `beam_loader::container`, never hand-rolled parsing |
 | `map_to_tuple_keys/1` | `erl_map.c:3318-3328` | a **flat** map's keys tuple (atom keys in atom-index order); a hashmap ⇒ `badarg`; a non-map ⇒ `error:{badmap,Term}` (structured, live reason term) |
 | `binary_to_integer/2` | `big.c:4186-4232` | the C's *value* atoms: a small int, `big`, or `badarg` |
 | `list_to_integer/2` | `big.c:4234-4355` | `{Value, Rest}`, or `no_integer`/`not_a_list`/`badarg`/`big` |
 | `time_unit/0`, `perf_counter_unit/0` | `erl_time_sup.c:2537-2539` | `1000000000` |
 | `get_creation/0` | `dist.c:5594-5604` | `undefined` on a non-distributed node, else the creation integer |
 | `is_process_alive/1` | `erl_bif_info.c:4069` | `true`/`false` for an internal pid; `badarg` otherwise |
+| `no_aux_work_threads/0` | `erl_process.c:9234-9237` (value set `:6219-6223`) | this runtime's scheduler count `+ 1` (no dirty-allocator instances are modelled). **Divergence:** the count is *this* runtime's own (`crate::info::schedulers_count` — `+S N` else the logical-processor count), so the answer is oracle-exact for every explicit `+S N` and differs from the oracle's default by construction, exactly like `system_info(schedulers)` |
 | `processes_next/1` | `bif.c:4111-4120` | `{NextIndex, [Pid]}` / `{Limit, []}`; `badarg` past the limit. **Divergence:** index-addressed over *this* table, one pid per call (the C ptab is paginated) |
 | `term_to_string/1` | `bif.c:4160-4189` | the `~w` rendering as a string, one line, no newline |
 | `term_to_string/2` | `bif.c:4160-4189` | the `undefined` limit form is exact; a **numeric** limit is a typed `unsupported` (the `~P` depth directive is not exposed by `../format.rs`); a limit `<= 1` or a non-integer/non-`undefined` limit is `badarg` |
 
-Documented divergences (deterministic, never a wrong value): `term_type/1` reports every
-byte-aligned binary as `sub_binary`, and returns a typed `unsupported` for the boxed families the
-*safe* `beam_term` API cannot name (bignum, reference, external pid/port/ref, non-byte-aligned
-bitstring) where the oracle names them.
+Documented divergences (deterministic, never a wrong value):
+- `term_type/1` reports every byte-aligned binary as `sub_binary`: the real
+  `heap_binary`/`sub_binary`/`refc_binary` split is the boxed **header subtag**
+  (`erl_map.c:3368-3376`), and the only predicates that read it are `unsafe`
+  (`beam_term::boxed`), which this crate's `#![deny(unsafe_code)]` forbids. A **typed
+  `unsupported`** stays for the boxed families the *safe* API cannot name at all — an internal
+  `reference` and a non-byte-aligned bitstring.
+- `no_aux_work_threads/0` derives from this runtime's own scheduler count (see the table), and
+  `processes_next/1` is index-addressed over *this* table.
+- `beamfile_module_md5/1` is **not** served: its derivation (`beam_bif_load.c:205-229`) is the
+  bespoke chunk-layout digest already implemented at `crate::context::bridges::module_md5`
+  (`pub(super)`, outside this node). Serving it needs only that function's visibility raised to
+  `pub(crate)` — no re-derivation here (that would duplicate `beam_term`-level parsing the crate
+  keeps in one place).
 
 ### `prim.rs` — the served `prim_file` BIFs (contract A.7, the `prim_*` preloaded modules)
 `RuntimeContext::prim_file_call(function, arity, args) -> Option<Result<Eterm>>`. `prim_file` is a
@@ -157,7 +172,21 @@ system (`std::fs`/`std::env`) — "primitive" is exactly what this layer is for.
 |---|---|---|
 | `get_cwd/0` | `prim_file.erl:787` → `get_cwd_nif` → `efile_get_cwd` (`unix_prim_file.c:1050`, `getcwd(3)`), decoded by `internal_native2name` | `{ok, Cwd}` with `Cwd` a **string** (char list); a native path that is not valid UTF-8 is the C's `{ok,{error,warning}}` (`erl_unicode.c:2774-2789`, warning type `warning`); an `errno` ⇒ `{error, Reason}` |
 | `get_cwd/1` | `prim_file.erl:771-778` (pure Erlang clauses) | `[Letter,$:]` (`A`–`Z`/`a`–`z`) ⇒ `{error,enotsup}` (Unix `efile_get_device_cwd` is a constant `ENOTSUP`, `unix_prim_file.c:1042`); any other cons cell (incl. an **improper** list — the `[_|_]` clause) ⇒ `{error,einval}`; anything else ⇒ `{error,badarg}` |
-| `read_file/1` | `prim_file.erl:564-570` → `read_file_nif`; the path through `encode_path` = `internal_name2native` (`erl_unicode.c:2629`) | `{ok, Binary}`; `enoent`/`eisdir`/`enotdir`/`eloop`/`eacces`/… via `errno`; a **bad path** ⇒ the **value** `{error,badarg}` (the wrapper's `try … catch error:badarg`, never a raise) |
+| `read_file/1` | `prim_file.erl:564-570` → `read_file_nif` | `{ok, Binary}`; `enoent`/`eisdir`/`enotdir`/`eloop`/`eacces`/… via `errno`; a **bad path** ⇒ the **value** `{error,badarg}` |
+| `delete/1` | `prim_file.erl:804-809` → `efile_del_file` = `unlink(2)` (`unix_prim_file.c:991-1002`) | `ok`; else `{error, Reason}`; the C remaps `EISDIR`→**`EPERM`** (`:993-996`); a bad path ⇒ `{error,badarg}` |
+| `rename/2` | `prim_file.erl:811-816` → `efile_rename` = `rename(2)` (`unix_prim_file.c:945-961`) | `ok`; the C remaps `ENOTEMPTY`→**`EEXIST`** and an old path of exactly `/`→**`EINVAL`** (`:947-955`); `EXDEV` passes through; either arg bad ⇒ `{error,badarg}` |
+| `make_dir/1` | `prim_file.erl:817-822` → `efile_make_dir` = `mkdir(2)`, mode `0777` (`unix_prim_file.c:979-989`) | `ok`; an existing file *or* directory ⇒ `{error,eexist}`; a missing parent ⇒ `{error,enoent}`; a non-directory parent ⇒ `{error,enotdir}` |
+| `del_dir/1` | `prim_file.erl:823-828` → `efile_del_dir` = `rmdir(2)` (`unix_prim_file.c:1004-1032`) | `ok`; the C remaps `ENOTEMPTY`→**`EEXIST`** and then, when the target names the process's own directory by `st_ino`/`st_dev` (`stat(".")`), **`EINVAL`** — so deleting a non-empty **cwd** is `einval`, not `eexist` |
+| `read_link/1` | `prim_file.erl:590-606` → `efile_read_link` = `readlink(2)` (`unix_prim_file.c:859-895`), decoded by `translate_raw_name/2` | a valid UTF-8 target ⇒ `{ok, Target}` (a **string**; a dangling link still answers its target); a non-UTF-8 raw target, or a path that is not a link ⇒ `{error,einval}`; `enoent` for a missing path |
+| `make_link/2` | `prim_file.erl:829-834` → `efile_make_hard_link` = `link(2)` (`unix_prim_file.c:963-969`) | `ok`; an existing link name ⇒ `{error,eexist}`; a missing source ⇒ `{error,enoent}`; bad path ⇒ `{error,badarg}` |
+| `make_symlink/2` | `prim_file.erl:835-840` → `efile_make_soft_link` = `symlink(2)` (`unix_prim_file.c:971-977`) | `ok` (the target need not exist); an existing link name ⇒ `{error,eexist}`; bad path ⇒ `{error,badarg}` |
+| `altname/1` | `prim_file.erl:842-848`; on Unix `efile_altname` is a constant `ENOTSUP` (`unix_prim_file.c:1085-1090`) | `{error,enotsup}` for every valid path (it does **not** return its argument); a bad path ⇒ `{error,badarg}` |
+
+Every path-only entry is a direct NIF call wrapped by
+`try … catch error:badarg -> {error,badarg}` in `prim_file.erl`, so a **bad path is always the
+*value* `{error,badarg}`, never a raise**; the C's errno REMAPs (`EISDIR`→`EPERM`,
+`ENOTEMPTY`→`EEXIST`, the old-`/` and non-empty-cwd `EINVAL` cases) are reproduced explicitly — an
+omitted remap is a real divergence.
 
 The path contract (reproduced from `encode_path/1`): a **binary** (its bytes verbatim; a NUL ⇒
 badarg) or an **iolist** of code points — nested lists flattened, a nested **binary** ⇒ badarg
@@ -165,16 +194,18 @@ badarg) or an **iolist** of code points — nested lists flattened, a nested **b
 encoding. An atom ⇒ badarg (`erl_unicode.c:2645`); a NUL, a code point that is not a Unicode scalar
 value (`:2306-2354`), a non-integer element, or an improper tail ⇒ badarg. The walk is iterative
 with an explicit stack (mirroring the C's `ESTACK`), so nesting depth cannot exhaust the Rust stack.
-The file contents are built by `beam_codec::term::make_binary` on the pointer-stable `eval_heap`
-(no 64-byte limit, unlike `beam_engine::terms::make_heap_binary`); the `errno`→atom mapping is the
-C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with the C's own
-`errno_<n>` form (`:47`) for an errno outside the table.
+A path built from a **file's raw bytes** (`read_file`'s result, `read_link`'s target) goes through
+`beam_codec::term::make_binary` on the pointer-stable `eval_heap` (no 64-byte limit, unlike
+`beam_engine::terms::make_heap_binary`). The `errno`→atom mapping is the C's
+(`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with the C's own `errno_<n>`
+form (`:47`) for an errno outside the table.
 
 ## Constraints
 - **`#![deny(unsafe_code)]`** — the crate-wide rule covers this whole floor. Terms are built and
   read only through `beam_engine::terms` (heap-seam builders/readers), `beam_codec::term`
-  (`&mut beam_alloc::Heap` materializers) and `beam_term`; the parent's `render` drives the
-  registered `io:format/2` printer rather than a private one.
+  (`&mut beam_alloc::Heap` materializers), `beam_loader::container` (read-only container parsing)
+  and `beam_term`; the parent's `render` drives the registered `io:format/2` printer rather than a
+  private one.
 - **Return-based errors** (workspace `../CONTEXT.md` §3): `Option<Result<Eterm>>`, never a
   crate-local error enum, never `panic!`/`unwrap()` on runtime data, never a silent swallow. A
   "value atom" answer the C *returns* (`badarg`, `big`, `no_integer`, `not_a_list`) is `Ok(atom)`.
@@ -183,9 +214,11 @@ C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with th
   (`unsupported: …`, CLI exit 3) and anything else as the bare `error:undef`.
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
-- **Files ~1000 lines** (pre-existing oversize: `application.rs`, `process.rs`; `erts_internal.rs`
-  is ~600 production lines plus its unit-test module), split by responsibility; every public item
-  documented.
+- **Files ~1000 lines of production code** (pre-existing oversize: `application.rs`, `process.rs`).
+  `erts_internal.rs` (~1737 total / ~786 production) and `prim.rs` (~1261 / ~623) are mostly
+  comprehensive test modules; each has one responsibility and is kept single-file because the
+  routing table names it — split if a second responsibility appears. Split by responsibility;
+  every public item documented.
 
 ## Test Strategy
 - **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
@@ -197,9 +230,11 @@ C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with th
 - **Oracle values** are quoted in each test's doc comment and were re-verified against the system
   `erl` (`erl -noshell -eval '…'`, OTP 29.1.1 / erts-17.1). Where the runtime answers a typed
   capability gap the oracle answers a value, the test pins the `unsupported` outcome with a
-  `// documented divergence:` comment.
-- Test fixtures skip **loudly** (`system_runtime()`) when no system Erlang is available; the
-  `erts_internal` suite needs none.
+  `// documented divergence:` comment. `get_dflags/0` is pinned by byte-comparing the built term's
+  `term_to_binary/1` image against the oracle's; `prim.rs`'s file-system entries run against a real
+  per-test scratch dir (the file's `scratch_dir` helper, which clears any leftover first).
+- Test fixtures that need a real `.beam` or the system Erlang skip **loudly**
+  (`system_runtime()` / the file-local `lists_beam()`); the arithmetic/`term_type` suites need none.
 - Cross-crate integration (CLI/exit codes, the preloaded `boot/*` corpus, `-eval`) is pinned by the
   `../tests/` suites, not here.
 
@@ -207,30 +242,37 @@ C's (`erl_errno_str.c:1229` + `errno_name`: the POSIX name lower-cased), with th
 - `../native.rs` → the dispatch table + the `erlang`-core items and shared helpers (read for the
   served set; edit there to add an arm)
 - `memory/` → `erlang:process_info/1,2` (this file's detailed surface) + `memory/tests.rs`
-- `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`) + its unit tests
-- `prim.rs` → the `prim_file` floor (`prim_file_call`) + its unit tests (the path encoder and the
-  `errno`→atom table)
+- `erts_internal.rs` → the `erts_internal` floor (`erts_internal_call`): `term_type/1`,
+  `get_dflags/0`, `beamfile_chunk/2`, `map_to_tuple_keys/1`, `binary_to_integer/2`,
+  `list_to_integer/2`, `time_unit/0`, `perf_counter_unit/0`, `get_creation/0`,
+  `is_process_alive/1`, `no_aux_work_threads/0`, `processes_next/1`, `term_to_string/1,2` + its
+  unit tests
+- `prim.rs` → the `prim_file` floor (`prim_file_call`) + its unit tests: the path contract
+  (`encode_path`/`collect_path`), the `errno`→atom table, and the served entries `get_cwd/0,1`,
+  `read_file/1`, `delete/1`, `rename/2`, `make_dir/1`, `del_dir/1`, `read_link/1`, `make_link/2`,
+  `make_symlink/2`, `altname/1`
 - `init.rs` / `code.rs` / `application.rs` → the preloaded-module surfaces (contract A.7)
 - `process.rs` / `port.rs` → the process/registry/reference and port-write surfaces (contracts A.4/A.8)
 - `test_support.rs` → the shared fixtures
 - `../context/mod.rs` → `RuntimeContext::call_bif` / `try_native`'s caller and the host seams
+- `../context/bridges.rs` → `module_md5` (the `.beam` MD5 digest `beamfile_module_md5/1` needs, currently `pub(super)`)
 - `../runtime.rs`, `../codeserver.rs`, `../boot.rs`, `../port.rs`, `../timers.rs`, `../dist.rs` →
   the runtime state these BIFs read (owned elsewhere)
 - `../error.rs` → `unsupported`/`undef`/`halt`/`live_reason_term` and the known-unimplemented list
 - `../../../../erts/emulator/beam/` → legacy C ground truth (read-only)
 
 ## Not implemented — the `erts_internal` / `prim_*` BIFs left falling through
-Every name not in the table above answers `None` from `erts_internal_call`, so the call falls
-through to the `beam_bifs` registry and then to a real `erts_internal` module load (`erts` `ebin`
-is on the code path) — an honest failure, never a fabricated value. Grouped by the machinery each
+Every name not in a table above answers `None` from `erts_internal_call`/`prim_file_call`, so the
+call falls through to the `beam_bifs` registry and then to a real module load (the `erts` `ebin` is
+on the code path) — an honest failure, never a fabricated value. Grouped by the machinery each
 needs:
 
 - **Distribution / `net_kernel` (A.5 phase 2):** `abort_pending_connection/2`,
   `await_port_send_result/3`, `create_dist_channel/3`, `dist_ctrl_put_data/2`,
-  `dist_spawn_init/1`, `dist_spawn_request/4`, `dynamic_node_name/0,1`, `get_dflags/0`,
-  `new_connection/1`, `spawn_request/4`, `spawn_init/1`. Needs the distribution controller
-  protocol, a live node identity feeding `erlang:node/0`, connection/channel multiplexing, remote
-  spawn, and the `-connect_all`/`+zdbbl` configuration surface.
+  `dist_spawn_init/1`, `dist_spawn_request/4`, `dynamic_node_name/0,1`, `new_connection/1`,
+  `spawn_request/4`, `spawn_init/1`. Needs the distribution controller protocol, a live node
+  identity feeding `erlang:node/0`, connection/channel multiplexing, remote spawn, and the
+  `-connect_all`/`+zdbbl` configuration surface.
 - **Tracing / breakpoints (`dbg`):** `breakpoint/4`, `notify_breakpoint_hit/3`, `trace/3,4`,
   `trace_info/3`, `trace_pattern/3,4`, `trace_session_create/3`, `trace_session_destroy/1`. Needs
   the trace/breakpoint machinery, the match-spec compiler and per-process trace flags (plus a
@@ -243,10 +285,11 @@ needs:
 - **System tasks / system monitors:** `request_system_task/3,4`, `spawn_system_process/3`,
   `system_check/1`, `gather_system_check_result/1`, `is_system_process/1`, `system_monitor/1,3`.
   Needs the system-task protocol between `init`/the application controller and side-effect-free
-  system processes, plus the monitor subscription set.
-- **Code purge / literal areas / module loading:** `check_dirty_process_code/2`,
-  `check_process_code/1,3`, `is_process_executing_dirty/1`, `purge_module/2`,
-  `prepare_loading/2`, `beamfile_chunk/2`, `beamfile_module_md5/1`,
+  system processes, plus the monitor subscription set. (`is_system_process/1` additionally needs
+  `beam_rt` to flag its root/`init` process as a system process — `beam_rt` never calls
+  `beam_process::ProcessFlags::set_system`, so answering it now would be wrong for `init`.)
+- **Code purge / literal areas:** `check_dirty_process_code/2`, `check_process_code/1,3`,
+  `is_process_executing_dirty/1`, `purge_module/2`, `prepare_loading/2`,
   `set_code_and_literal_cleaner_prio/1`, `wait_release_literal_area_switch/1`,
   `dirty_process_handle_signals/1`. Needs the code server's purge protocol (scanning every
   process's stack for references to a module's code) and the literal-area release handshake.
@@ -259,35 +302,54 @@ needs:
 - **Process & scheduler control/introspection:** `garbage_collect/1`, `group_leader/2,3`,
   `process_display/2`, `process_flag/3`, `suspend_process/2`, `is_process_alive/2`,
   `await_result/1`, `flush_monitor_messages/3`, `'@flush_monitor_messages_refopt'/0`. Needs
-  GC-on-demand, suspend/resume signalling, and the `{Ref, Result}` await protocol.
-- **Map internals:** `map_hashmap_children/1`, `map_next/3`. Needs the HAMT iteration protocol
-  behind `maps:iterator/2` ordered traversal.
+  GC-on-demand, suspend/resume signalling, and the `{Ref, Result}` await protocol. (`process_display/2`
+  additionally needs a process **stack dump**, which the engine exposes no accessor for;
+  `flush_monitor_messages/3` and `'@flush_monitor_messages_refopt'/0` are **pure Erlang** receive
+  loops, not BIFs at all — they are not floor candidates.)
+- **Map internals:** `map_hashmap_children/1`, `map_next/3`. Needs a HAMT **walker** and the
+  4-bits-per-level path encoder (`erts_debug:size/1`'s iterator) — `beam_term::map`'s public API is
+  `map_pairs`/`map_size`/`map_get` only, with no interior-children or path accessor, so these can be
+  served only after that LCA crate grows one.
 - **Allocation/IO introspection & misc:** `gather_alloc_histograms/1`, `gather_carrier_info/1`,
-  `gather_io_bytes/2`, `no_aux_work_threads/0`, `get_internal_state_blocked/1`, `crasher/6`.
-  Needs the `erts_alloc` carrier/histogram readers, the async-thread pool, and the
-  crash-dump/internals-dump path. (`module_info/0,1` is the ordinary compiler-generated surface.)
+  `gather_io_bytes/2`, `get_internal_state_blocked/1`, `crasher/6`. Needs the `erts_alloc`
+  carrier/histogram readers, the async-thread pool, and the crash-dump/internals-dump path.
+  (`erts_internal:beamfile_module_md5/1` is covered above; `module_info/0,1` is the ordinary
+  compiler-generated surface.)
 - **The port-BIF family** (`open_port/2`, `port_call/3`, `port_close/1`, `port_command/3`,
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
   counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
   entries stay unclaimed (the preloaded wrapper is irrelevant to M1 callers).
-- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` serves
-  (`get_cwd/0,1`, `read_file/1`) is now on the floor; **every other** `prim_file` entry
-  (`open`/`read`/`write`/`pread`/`pwrite`/`position`/`stat`/`readdir`/links/permissions/…) and all
-  of `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`,
-  `prim_eval` are **Not implemented** and still fall through to a real preloaded-`.beam` load (they
-  ship in the `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry
-  then needs the matching host. `list_dir/1` is deliberately **not** claimed by `prim.rs`: its
-  entries come back in `readdir(3)` order, which the oracle does not sort and this runtime cannot
-  pin. `prim_zip:splitter/3` is likewise unclaimed — it is pure Erlang over iolists (not a runtime
-  primitive) whose error paths this floor does not reproduce. The remaining machinery: the open
-  file-descriptor resource (open/read/write/pread/pwrite/seek/stat/readdir/links/permissions), the
-  socket/NIF resource machinery (`prim_socket`, `prim_net`, `prim_inet`), zlib (`prim_zip`), a
-  binary-buffer resource (`prim_buffer`), the boot loader protocol (`erl_prim_loader`), and the
-  `prim_eval` iteration protocol. M1's own file/socket/OS floor is deliberately minimal
-  (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and is not a `prim_*` implementation.
+- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` serves (the 11 entries in
+  its table) is on the floor; **every other** `prim_file` entry and all of `erl_prim_loader`,
+  `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval` are **Not
+  implemented** and still fall through to a real preloaded-`.beam` load (they ship in the `erts`
+  `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the matching
+  host. Two families are deliberately unclaimed:
+  * the **open-file / fd** entries — `open`/`read`/`write`/`position`/`pread`/`pwrite`/`allocate`/
+    `truncate`/`sync`/`datasync`/`advise`/`read_handle_info`/`copy/3`/`write_file/2` (the last a pure
+    Erlang composition) — all need the `#file_descriptor{}` resource machinery (and M1 has no
+    `open`; a non-fd argument raises the wrapper's uncaught `function_clause`, which is not modelled);
+  * **`read_file_info/1,2` / `read_link_info/1,2`** — the `#file_info{}` tuple is fillable from
+    `std::fs::Metadata`/`MetadataExt` for every field **except** `access` (the C calls `access(2)`,
+    absent from safe `std::` and the crate is `deny(unsafe_code)`), and the *default* time type is
+    `local`, needing a TZ conversion the runtime does not have. Only `[{time,posix}]` (and
+    `[{time,universal}]` by pure arithmetic) would be exact — deferring the whole family keeps the
+    default form from answering a wrong value.
+  * `list_dir/1` is **not** claimed: its entries come back in `readdir(3)` order, which the oracle
+    does not sort and this runtime cannot pin. `prim_zip:splitter/3` is likewise unclaimed — pure
+    Erlang over iolists (not a runtime primitive) whose error paths this floor does not reproduce.
+  * Remaining machinery: the socket/NIF resource machinery (`prim_socket`, `prim_net`,
+    `prim_inet`), zlib (`prim_zip`), a binary-buffer resource (`prim_buffer`), the boot loader
+    protocol (`erl_prim_loader`), and the `prim_eval` iteration protocol. M1's own file/socket/OS
+    floor is deliberately minimal (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and
+    is not a `prim_*` implementation.
 
 ## See Also
 - `../../CONTEXT.md` → the crate façade, the CLI/`system_info` surfaces, and the A.8 contract.
 - `../beam_gc`, `../beam_process`, `../beam_message` → the state this floor reads.
 - `../../../../erts/emulator/beam/erl_bif_info.c` → the C ground truth (`pi_1_keys[]`,
   `process_info_2`'s forms, the `always_wrap`/`nil`-skip rules).
+- `../../../../erts/emulator/beam/erl_map.c` → `term_type/1`'s family table; `dist.c` →
+  `get_dflags/0`/`get_creation/0`; `beam_bif_load.c` → `beamfile_chunk/2`.
+- `../../../../erts/emulator/nifs/` → `prim_file`'s C NIFs (`{common,unix}/prim_file_nif.c`,
+  `unix/unix_prim_file.c`) and `../../../../erts/preloaded/src/prim_file.erl` → the wrappers.
