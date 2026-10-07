@@ -639,12 +639,6 @@ impl ExecutionContext for ModuleHost {
         // namespace, never a loadable module, so an unknown `erlang` BIF is a
         // typed error rather than a spurious module load.
         if module == "erlang" {
-            // Diagnostic: a blocked target is often blocked by one unserved
-            // `erlang` BIF deep inside a module. Set `ERTS_TRACE_UNSERVED_BIF=1`
-            // to print the exact BIF that stopped the run.
-            if env::var_os("ERTS_TRACE_UNSERVED_BIF").is_some() {
-                eprintln!("unserved BIF: erlang:{function}/{arity}");
-            }
             return Err(BeamError::BadArg);
         }
         let module = self.load(module)?;
@@ -743,7 +737,97 @@ fn number(term: Eterm) -> Option<Number> {
     terms::float_value(term).ok().map(Number::Float)
 }
 
-impl ModuleHost {
+// ---------------------------------------------------------------------------
+// The `erlang:is_*/1` term-classification predicates
+// ---------------------------------------------------------------------------
+
+/// The `erlang` type-test guards the floor serves directly.
+///
+/// `beam_term`'s boxed-term predicates dereference a term's header word and are
+/// `unsafe` for exactly that reason: each is sound only on a *live* machine word.
+/// Every argument routed here is such a word — an X-register/Y-slot value or a
+/// BIF result the machine already holds, never an unvalidated raw word — so the
+/// dereference is sound (the same argument `beam_engine::predicates` rests on).
+///
+/// Semantics mirror `beam_bifs::type_test` / `erl_bif_op.c` precisely:
+/// `is_list([])` is `true` (a cons cell *or* `[]`), and `is_pid`/`is_port`/
+/// `is_reference` accept the internal *and* external forms (`erlang:is_pid/1` is
+/// true for an external pid too).
+mod guard {
+    use beam_term::Eterm;
+
+    /// `is_list(x)` — a cons cell *or* `[]` (`[]` is `NIL`, not a cons cell).
+    pub(super) fn is_list(x: Eterm) -> bool {
+        beam_term::is_nil(x) || beam_term::is_list(x)
+    }
+
+    /// `is_integer(x)` — a small integer or a bignum.
+    pub(super) fn is_integer(x: Eterm) -> bool {
+        // SAFETY: `x` is a live machine word; `is_integer` never dereferences an
+        // immediate and, when `x` is boxed, only reads the term's header word.
+        unsafe { beam_term::is_integer(x) }
+    }
+
+    /// `is_number(x)` — an integer or a float.
+    pub(super) fn is_number(x: Eterm) -> bool {
+        // SAFETY: as [`is_integer`].
+        unsafe { beam_term::is_number(x) }
+    }
+
+    /// `is_float(x)` — a boxed float (`HEADER_FLONUM`).
+    pub(super) fn is_float(x: Eterm) -> bool {
+        // SAFETY: `x` is a live machine word; `is_float` checks `is_boxed` before
+        // dereferencing the header.
+        unsafe { beam_term::is_float(x) }
+    }
+
+    /// `is_tuple(x)`.
+    pub(super) fn is_tuple(x: Eterm) -> bool {
+        // SAFETY: as [`is_float`].
+        unsafe { beam_term::is_tuple(x) }
+    }
+
+    /// `is_map(x)`.
+    pub(super) fn is_map(x: Eterm) -> bool {
+        // SAFETY: as [`is_float`].
+        unsafe { beam_term::is_map(x) }
+    }
+
+    /// `is_binary(x)` — a bitstring whose size is a whole number of bytes.
+    pub(super) fn is_binary(x: Eterm) -> bool {
+        // SAFETY: as [`is_float`].
+        unsafe { beam_term::is_binary(x) }
+    }
+
+    /// `is_bitstring(x)`.
+    pub(super) fn is_bitstring(x: Eterm) -> bool {
+        // SAFETY: as [`is_float`].
+        unsafe { beam_term::is_bitstring(x) }
+    }
+
+    /// `is_pid(x)` — an internal or external pid.
+    pub(super) fn is_pid(x: Eterm) -> bool {
+        beam_term::is_internal_pid(x) || {
+            // SAFETY: as [`is_float`].
+            unsafe { beam_term::is_external_pid(x) }
+        }
+    }
+
+    /// `is_port(x)` — an internal or external port.
+    pub(super) fn is_port(x: Eterm) -> bool {
+        beam_term::is_internal_port(x) || {
+            // SAFETY: as [`is_float`].
+            unsafe { beam_term::is_external_port(x) }
+        }
+    }
+
+    /// `is_reference(x)` — an internal or external reference.
+    pub(super) fn is_reference(x: Eterm) -> bool {
+        // SAFETY: as [`is_float`]. Both forms are boxed, so both dereference a
+        // live header word.
+        unsafe { beam_term::is_internal_ref(x) || beam_term::is_external_ref(x) }
+    }
+}impl ModuleHost {
     /// The built-in BIF floor this host serves directly; `None` means "not a
     /// local BIF" (an external module call).
     fn try_local_bif(
@@ -817,6 +901,26 @@ impl ModuleHost {
             // two heights with `max/2`.
             ("erlang", "max", 2) => Some(self.max_min(args, true)),
             ("erlang", "min", 2) => Some(self.max_min(args, false)),
+            // The `erlang:is_*/1` type-test guards. A compiled guard usually
+            // lowers to a `test` opcode (the engine's `TestKind`), but a guard the
+            // compiler emits as a call — or a direct `erlang:is_*` call — reaches
+            // the floor here; the results mirror `erl_bif_op.c` exactly.
+            ("erlang", "is_atom", 1) => Some(Ok(self.boolean(is_atom(args[0])))),
+            ("erlang", "is_binary", 1) => Some(Ok(self.boolean(guard::is_binary(args[0])))),
+            ("erlang", "is_bitstring", 1) => Some(Ok(self.boolean(guard::is_bitstring(args[0])))),
+            ("erlang", "is_float", 1) => Some(Ok(self.boolean(guard::is_float(args[0])))),
+            ("erlang", "is_function", 1) => Some(Ok(self.boolean(terms::is_fun(args[0])))),
+            ("erlang", "is_integer", 1) => Some(Ok(self.boolean(guard::is_integer(args[0])))),
+            ("erlang", "is_list", 1) => Some(Ok(self.boolean(guard::is_list(args[0])))),
+            ("erlang", "is_map", 1) => Some(Ok(self.boolean(guard::is_map(args[0])))),
+            ("erlang", "is_number", 1) => Some(Ok(self.boolean(guard::is_number(args[0])))),
+            ("erlang", "is_pid", 1) => Some(Ok(self.boolean(guard::is_pid(args[0])))),
+            ("erlang", "is_port", 1) => Some(Ok(self.boolean(guard::is_port(args[0])))),
+            ("erlang", "is_reference", 1) => Some(Ok(self.boolean(guard::is_reference(args[0])))),
+            ("erlang", "is_tuple", 1) => Some(Ok(self.boolean(guard::is_tuple(args[0])))),
+            // `integer_to_list/1` — the base-10 character list of an integer;
+            // `io_lib:write/1` renders an integer term with it.
+            ("erlang", "integer_to_list", 1) => Some(self.integer_to_list(args)),
             // `lists:reverse/2` is a NIF in `lists.beam` (its `.beam` body is
             // `erlang:nif_error(undef)`), reached from `lists:reverse/1` for a
             // list of three or more elements.
@@ -824,6 +928,9 @@ impl ModuleHost {
             // `lists:member/2` is likewise a `lists` NIF (exact `=:=` membership);
             // `queue:member/2` forwards to it.
             ("lists", "member", 2) => Some(self.list_member(args)),
+            // `lists:keyfind/3` is a `lists` NIF too (`erl_bif_lists.c:keyfind`);
+            // `io_lib_format:get_option/3` looks a format option up with it.
+            ("lists", "keyfind", 3) => Some(self.keyfind(args)),
             // These raise on the invalid-argument paths the tests deliberately
             // avoid; a typed error is the correct outward behavior.
             ("erlang", "error", 1) | ("erlang", "error", 2) | ("erlang", "error", 3) => {
@@ -1006,7 +1113,40 @@ impl ModuleHost {
         Ok(self.boolean(found))
     }
 
-    /// `X rem Y` — the integer remainder. The result carries the *dividend's* sign
+    /// `lists:keyfind(Key, N, TupleList)` — the first tuple in `TupleList` whose
+    /// `N`-th element equals `Key`, else the atom `false`
+    /// (`erl_bif_lists.c:1301`). The comparison is arithmetic equality (`==`, the
+    /// BIF's `CMP_EQ`), so `1` matches `1.0`. A `N` below `1`, a non-integer `N`,
+    /// or an improper list is a `badarg`.
+    fn keyfind(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 3 {
+            return Err(BeamError::BadArg);
+        }
+        let (key, position) = (args[0], args[1]);
+        if !is_small(position) || signed_value(position) < 1 {
+            return Err(BeamError::BadArg);
+        }
+        let index = signed_value(position) as usize;
+        let mut cursor = args[2];
+        loop {
+            if beam_term::is_nil(cursor) {
+                return Ok(self.boolean(false));
+            }
+            if !beam_term::is_list(cursor) {
+                return Err(BeamError::BadArg);
+            }
+            let element = terms::cons_head(cursor)?;
+            if let Ok(arity) = terms::tuple_arity(element) {
+                if index <= arity {
+                    let field = terms::tuple_element(element, index - 1)?;
+                    if cmp_arith(key, field, &self.atoms).is_eq() {
+                        return Ok(element);
+                    }
+                }
+            }
+            cursor = terms::cons_tail(cursor)?;
+        }
+    }    /// `X rem Y` — the integer remainder. The result carries the *dividend's* sign
     /// (Rust's `%` truncates toward zero, exactly as Erlang's `rem` does, so
     /// `-7 rem 2` is `-1`). `rem(X, 0)` and any non-integer operand is a
     /// `badarith`, matching the real BIF.
@@ -1074,7 +1214,22 @@ impl ModuleHost {
         terms::make_list(self, &chars)
     }
 
-    /// `tuple_to_list(Tuple)` — the tuple's elements as a list. A non-tuple is a
+    /// `integer_to_list(Integer)` — the base-10 character list of a **small**
+    /// integer (`io_lib:write/1` renders an integer term with it). A non-integer
+    /// operand is a `badarg`; a bignum is a typed `badarg` too, since this host
+    /// builds no bignums (a wrong result is never produced).
+    fn integer_to_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let integer = args.first().copied().ok_or(BeamError::BadArg)?;
+        if !is_small(integer) {
+            return Err(BeamError::BadArg);
+        }
+        let chars: Vec<Eterm> = signed_value(integer)
+            .to_string()
+            .bytes()
+            .map(|byte| make_small(i64::from(byte)))
+            .collect();
+        terms::make_list(self, &chars)
+    }    /// `tuple_to_list(Tuple)` — the tuple's elements as a list. A non-tuple is a
     /// `badarg`.
     fn tuple_to_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
         let tuple = args.first().copied().ok_or(BeamError::BadArg)?;
