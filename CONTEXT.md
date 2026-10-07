@@ -31,7 +31,7 @@ Monorepo for Erlang/OTP (release `30.0-rc0` per `OTP_VERSION`; ERTS runtime vers
 
 ## Routing Table
 - `erts_rust/` → Rust ERTS rewrite (Cargo workspace): the new BEAM runtime implementation (term/GC/engine/BIFs/ETS/IO/dist/ABI), the differential-test harness, and the external benchmark driver; follows the staged plan (Stage 0–6)
-- `erts/` → Erlang Runtime System (BEAM emulator/JIT, epmd, preloaded modules, runtime C libs, exported headers, launcher, system tests); legacy C/C++ tree retained as the rewrite's differential oracle + `FLAVOR=emu` bootstrap fallback
+- `erts/` → Erlang Runtime System (BEAM emulator/JIT, epmd, preloaded modules, runtime C libs, exported headers, launcher, system tests); legacy C/C++ tree retained as the rewrite's reference source + installable headers + `FLAVOR=emu` bootstrap fallback. NOTE: the Rust rewrite's differential/benchmark ORACLE is the system `erl`/`erlc` on `$PATH` (`$ERTS_ORACLE`/`$ERLC` override), NOT a built in-tree emulator — `erts_rust/` consumes only `erts/emulator/beam/{erl_nif.h,erl_driver.h}` text/headers, never `beam.smp`
 - `lib/` → OTP applications (35 apps: kernel, stdlib, compiler, crypto, ssl, ssh, mnesia, common_test, …)
 - `make/` → shared build-system makefile fragments and autoconf helpers (`make/autoconf/`)
 - `scripts/` → build/release/CI helper scripts and the git `pre-push` hook
