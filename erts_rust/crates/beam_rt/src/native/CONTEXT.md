@@ -70,8 +70,9 @@ bitstring) where the oracle names them.
   (`unsupported: …`, CLI exit 3) and anything else as the bare `error:undef`.
 - **`code:*` is the native floor, not a live `code_server`** — `code.rs`'s behaviour must not
   change (see `../CONTEXT.md`; OTP's real `code_server.beam` needs facilities outside this crate).
-- **Files ~1000 lines** (pre-existing oversize: `application.rs`, `code.rs`, `process.rs`,
-  `erts_internal.rs`), split by responsibility; every public item documented.
+- **Files ~1000 lines** (pre-existing oversize: `application.rs`, `process.rs`; `erts_internal.rs`
+  is ~600 production lines plus its unit-test module), split by responsibility; every public item
+  documented.
 
 ## Test Strategy
 - **Unit tests** colocated per module (`#[cfg(test)] mod tests`), driving the floor through the
