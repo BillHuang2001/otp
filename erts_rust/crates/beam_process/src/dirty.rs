@@ -211,7 +211,15 @@ impl Queue {
     }
 
     /// Asks every worker to exit once the queue is drained, waking the idle ones.
+    ///
+    /// The `jobs` lock is held across the store + notify (see the body) so the wake-up cannot be
+    /// lost and [`DirtyPool::join`] cannot hang.
     fn request_shutdown(&self) {
+        // Take the `jobs` lock so this cannot race a worker that has just read `shutdown` as
+        // false and is about to register on the condvar: the worker holds `jobs` until `wait`
+        // atomically releases it, so once we hold the lock any waiter is already registered and
+        // the notify below cannot be lost.
+        let _jobs = self.jobs.lock();
         self.shutdown.store(true, Ordering::Release);
         self.available.notify_all();
     }

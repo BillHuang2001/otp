@@ -238,11 +238,18 @@ impl<R: ProcessRunner + Send + 'static> Worker<R> {
                         drain_woken_into(&mut table, |p, priority| buf.push((p, priority)));
                     }
                     counter.record_slice();
-                    self.queues.finish_slice();
+                    // Requeue the yielded pid(s) *before* decrementing the in-flight count:
+                    // `finish_slice` lowers the shared in-flight counter, so flushing `buf` after
+                    // it would leave a window where the queues are empty AND in-flight is zero,
+                    // letting `Queues::is_idle()` report idle while a yielded pid is still only in
+                    // `buf`. Enqueueing first keeps the pid counted in-flight, so `is_idle` (which
+                    // requires both the queue length and the in-flight count to be zero) can never
+                    // report idle in that gap.
                     if !buf.is_empty() {
                         self.queues.enqueue_local_batch(self.index, &buf);
                         self.signals.notify_work();
                     }
+                    self.queues.finish_slice();
                     counter.set_active(false);
                     self.signals.notify_idle();
                 }

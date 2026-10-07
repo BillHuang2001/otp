@@ -392,3 +392,19 @@ fn default_pool_has_one_worker_of_each_kind() {
     assert_eq!(pool.schedulers(DirtyKind::Io), 1);
     pool.join();
 }
+
+/// Regression: `Queue::request_shutdown` must take the `jobs` lock so its notification cannot be
+/// lost to a worker that has just read `shutdown` as false and is about to park. Before the fix
+/// the worker could sleep forever and `DirtyPool::join` would hang; repeating a start-with-idle-
+/// workers + `join` cycle drives that interleaving often enough to catch a regression.
+///
+/// No `thread::sleep` is used. `join` blocks until every worker has exited, so if the wake-up is
+/// lost this test hangs rather than passing — which is exactly the failure mode being guarded
+/// against.
+#[test]
+fn repeated_start_join_does_not_lose_the_shutdown_wakeup() {
+    for _ in 0..2_000 {
+        let pool = DirtyPool::start(1, 0);
+        pool.join();
+    }
+}

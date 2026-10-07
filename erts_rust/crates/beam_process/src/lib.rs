@@ -18,16 +18,21 @@
 //!
 //! # Milestone-1 scope
 //!
-//! A **correct single-OS-thread** core: one [`Scheduler`], no thread pools, no dirty
-//! schedulers, no lock-free/threaded run queues and no cross-scheduler barrier beyond the
-//! documented single-scheduler [`ThreadProgress`] stub. The run queue is served
-//! highest-priority first (max/high/normal/low — see [`RunQueue`]), though the C's shared
-//! NORMAL/LOW physical queue with the `schedule_count` deferral is approximated by four
-//! distinct FIFOs. Exit/link/monitor signals are **decoupled**: they are queued on the
-//! receiver ([`SignalQueue`]) and applied at schedule-in (or eagerly, for a receiver that is
-//! not currently executing — see [`ProcessTable::service_signals`]). Multi-scheduler balancing
-//! and distribution-wide links/monitors are documented follow-ups (see the crate `CONTEXT.md`,
-//! Known Issues).
+//! The crate provides two scheduler fronts. [`Scheduler`] is the Milestone-1
+//! **single-OS-thread** loop: one run queue served highest-priority first (max/high/normal/low —
+//! see [`RunQueue`]), though the C's shared NORMAL/LOW physical queue with the `schedule_count`
+//! deferral is approximated by four distinct FIFOs. Alongside it, the SMP module
+//! ([`crate::smp::SchedulerPool`]) runs **N scheduler threads** over a shared
+//! [`SharedProcessTable`], with per-scheduler run queues plus work stealing, the
+//! [`ThreadProgress`] cross-scheduler barrier, and the [`TimerService`] and dirty pools
+//! ([`DirtyPool`]). [`SharedProcessTable`] is `!Send` (it owns off-heap `MsoHandle`s), so the SMP
+//! module carries a **documented handoff** — the two `unsafe impl Send`/`unsafe impl Sync` on
+//! [`SharedProcessTable`] (see [`crate::smp`]); the durable fix belongs in `beam_gc`/`beam_alloc`.
+//! Exit/link/monitor signals are **decoupled** on both fronts: they are queued on the receiver
+//! ([`SignalQueue`]) and applied at schedule-in (or eagerly, for a receiver that is not currently
+//! executing — see [`ProcessTable::service_signals`]). Multi-scheduler balancing refinements and
+//! distribution-wide links/monitors are documented follow-ups (see the crate `CONTEXT.md`, Known
+//! Issues).
 //!
 //! # Contracts
 //!
