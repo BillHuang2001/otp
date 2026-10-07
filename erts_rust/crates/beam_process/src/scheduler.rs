@@ -165,50 +165,12 @@ impl Scheduler {
             return Ok(None);
         };
 
-        // The process is off the queue and executing.
-        if let Some(process) = table.get_mut(pid) {
-            process.flags_mut().set_in_run_queue(false);
-            process.set_state(ProcessState::Running);
-        }
-
-        // Schedule-in: apply any signals queued for the process (exit signals, monitor-DOWNs)
-        // before it runs — this is where a signal that was deferred because the process was
-        // executing (see the crate `CONTEXT.md`) finally lands. Servicing may terminate the
-        // process, in which case there is nothing to run.
-        table.service_signals(pid)?;
-        if !table.contains(pid) {
-            self.slices = self.slices.wrapping_add(1);
-            self.resume_woken(table);
-            return Ok(Some(pid));
-        }
-
-        let outcome = runner.run(pid, table, self.reductions_per_slice)?;
+        // Read the budget into a local *before* the closure below borrows the run queue.
+        let reductions = self.reductions_per_slice;
+        run_one(pid, table, runner, reductions, |pid, priority| {
+            self.run_queue.enqueue_with_priority(pid, priority)
+        })?;
         self.slices = self.slices.wrapping_add(1);
-
-        match outcome {
-            RunOutcome::Yield => {
-                // Still runnable: back to the tail of its own priority's queue. The priority
-                // is read *after* the slice, so a `process_flag(priority, …)` demotion the
-                // runner just performed is honored at this requeue (defaulting to normal when
-                // the process is gone).
-                let priority = table
-                    .get_mut(pid)
-                    .map(|process| {
-                        process.flags_mut().set_in_run_queue(true);
-                        process.set_state(ProcessState::Runnable);
-                        process.priority()
-                    })
-                    .unwrap_or_default();
-                self.run_queue.enqueue_with_priority(pid, priority);
-            }
-            // The runner owns the state transition for a waiting/suspended process; the
-            // scheduler only takes it out of the ready queue.
-            RunOutcome::Wait | RunOutcome::Suspend => {}
-            RunOutcome::Exit(reason) => {
-                // Termination propagates to the process's links and monitors.
-                table.terminate(pid, reason)?;
-            }
-        }
 
         // Absorb every wake produced during the slice (a send to a blocked receiver, or a
         // signal/trapped-`EXIT`/`{'DOWN'}` message) into this same sweep.
@@ -230,27 +192,9 @@ impl Scheduler {
     /// scheduler slice (`run_slice` calls it automatically at each slice's end). See the
     /// crate `CONTEXT.md` for the full single-threaded orchestration contract.
     pub fn resume_woken(&mut self, table: &mut ProcessTable) -> usize {
-        let mut resumed = 0;
-        for pid in table.drain_woken() {
-            let skip = match table.get(pid) {
-                Some(process) => {
-                    process.state() != ProcessState::Runnable || process.flags().in_run_queue()
-                }
-                None => true,
-            };
-            if skip {
-                continue;
-            }
-            let priority = if let Some(process) = table.get_mut(pid) {
-                process.flags_mut().set_in_run_queue(true);
-                process.priority()
-            } else {
-                Priority::default()
-            };
-            self.run_queue.enqueue_with_priority(pid, priority);
-            resumed += 1;
-        }
-        resumed
+        drain_woken_into(table, |pid, priority| {
+            self.run_queue.enqueue_with_priority(pid, priority)
+        })
     }
     /// Runs slices until the run queue empties (or `max_slices` have run), returning the
     /// number of slices executed.
@@ -278,6 +222,119 @@ impl Scheduler {
         }
         Ok(executed)
     }
+}
+
+/// Runs the already-dequeued process `pid` through one reduction slice and applies the
+/// outcome, calling `enqueue(pid, priority)` to requeue it on a yield.
+///
+/// Returns `Ok(Some(outcome))`, or `Ok(None)` when servicing the process's pending
+/// signals terminated it (it never ran). Callers own slice accounting and the wake sweep.
+///
+/// # Parameters
+///
+/// * `pid` — the process to run; it must already have been dequeued.
+/// * `table` — the process table (the PCB plus links/monitors/signals live here).
+/// * `runner` — the execution-engine seam that runs the process for `reductions`.
+/// * `reductions` — the per-slice reduction budget.
+/// * `enqueue` — the requeue callback, invoked only on [`RunOutcome::Yield`] with the
+///   process's priority **read after** the slice (so a `process_flag(priority, …)` the
+///   runner just performed is honored, defaulting to normal when the process is gone).
+///
+/// # Errors
+///
+/// Propagates the signal-servicing, runner and termination errors.
+pub(crate) fn run_one<R, F>(
+    pid: ProcessId,
+    table: &mut ProcessTable,
+    runner: &mut R,
+    reductions: u32,
+    mut enqueue: F,
+) -> Result<Option<RunOutcome>>
+where
+    R: ProcessRunner,
+    F: FnMut(ProcessId, Priority),
+{
+    // The process is off the queue and executing.
+    if let Some(process) = table.get_mut(pid) {
+        process.flags_mut().set_in_run_queue(false);
+        process.set_state(ProcessState::Running);
+    }
+
+    // Schedule-in: apply any signals queued for the process (exit signals, monitor-DOWNs)
+    // before it runs — this is where a signal that was deferred because the process was
+    // executing (see the crate `CONTEXT.md`) finally lands. Servicing may terminate the
+    // process, in which case there is nothing to run.
+    table.service_signals(pid)?;
+    if !table.contains(pid) {
+        return Ok(None);
+    }
+
+    let outcome = runner.run(pid, table, reductions)?;
+
+    match outcome {
+        RunOutcome::Yield => {
+            // Still runnable: back to the tail of its own priority's queue. The priority
+            // is read *after* the slice, so a `process_flag(priority, …)` demotion the
+            // runner just performed is honored at this requeue (defaulting to normal when
+            // the process is gone).
+            let priority = table
+                .get_mut(pid)
+                .map(|process| {
+                    process.flags_mut().set_in_run_queue(true);
+                    process.set_state(ProcessState::Runnable);
+                    process.priority()
+                })
+                .unwrap_or_default();
+            enqueue(pid, priority);
+        }
+        // The runner owns the state transition for a waiting/suspended process; the
+        // scheduler only takes it out of the ready queue.
+        RunOutcome::Wait | RunOutcome::Suspend => {}
+        RunOutcome::Exit(reason) => {
+            // Termination propagates to the process's links and monitors.
+            table.terminate(pid, reason)?;
+        }
+    }
+
+    Ok(Some(outcome))
+}
+
+/// Turns the table's pending wakes into run-queue entries via `enqueue`, returning how many
+/// were enqueued. A woken pid is enqueued only when it is a live `Runnable` process not
+/// already `in_run_queue` — a process can be woken and then terminated (or re-blocked)
+/// within the same slice, and a `Yield` already requeued the process that just ran, so its
+/// stale wake must not double-enqueue it. A woken process resumes at **its own** priority
+/// (not normal).
+///
+/// # Parameters
+///
+/// * `table` — the process table whose wake list drives this sweep.
+/// * `enqueue` — the run-queue insertion callback (`pid`, `priority`).
+pub(crate) fn drain_woken_into<F: FnMut(ProcessId, Priority)>(
+    table: &mut ProcessTable,
+    mut enqueue: F,
+) -> usize {
+    let mut resumed = 0;
+    for pid in table.drain_woken() {
+        let skip = match table.get(pid) {
+            Some(process) => {
+                process.state() != ProcessState::Runnable || process.flags().in_run_queue()
+            }
+            None => true,
+        };
+        if skip {
+            continue;
+        }
+        let priority = if let Some(process) = table.get_mut(pid) {
+            process.flags_mut().set_in_run_queue(true);
+            process.priority()
+        } else {
+            Priority::default()
+        };
+        enqueue(pid, priority);
+        resumed += 1;
+    }
+    resumed
 }
 
 #[cfg(test)]

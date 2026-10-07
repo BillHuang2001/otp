@@ -199,6 +199,26 @@ impl RunQueue {
         self.queues[priority.index()].iter().copied()
     }
 
+    /// Removes and returns up to half of this queue's pids (so a work-stealing victim keeps at
+    /// least half), serving the highest priority first. The returned pids are in the order
+    /// [`RunQueue::dequeue`] would have returned them. A queue of 0 or 1 pids yields an empty
+    /// `Vec`.
+    ///
+    /// This is intended as the victim half of a multi-scheduler work-stealing steal: the
+    /// returned pids can be handed to another scheduler's run queue, and the remainder stays
+    /// here for the victim to serve.
+    pub fn split_off_half(&mut self) -> Vec<ProcessId> {
+        // `take <= len`, so the `dequeue`s below cannot run dry; the `Some` guard is the
+        // total, never-panicking form of an invariant that holds by construction.
+        let take = self.len() / 2;
+        let mut stolen = Vec::with_capacity(take);
+        for _ in 0..take {
+            if let Some(pid) = self.dequeue() {
+                stolen.push(pid);
+            }
+        }
+        stolen
+    }
     /// Drops every enqueued pid, at every level.
     pub fn clear(&mut self) {
         for queue in &mut self.queues {
@@ -347,6 +367,53 @@ mod tests {
         queue.clear();
         assert!(queue.is_empty());
         assert_eq!(queue.priority_of(pid(2)), None);
+    }
+
+    #[test]
+    fn split_off_half_keeps_at_least_half() {
+        // An empty queue has nothing to steal and is unchanged.
+        let mut empty = RunQueue::new();
+        assert!(empty.split_off_half().is_empty());
+        assert!(empty.is_empty());
+
+        // A single-pid queue is not split — the victim keeps its only process.
+        let mut single = RunQueue::new();
+        single.enqueue(pid(1));
+        assert!(single.split_off_half().is_empty());
+        assert_eq!(single.iter().collect::<Vec<_>>(), vec![pid(1)]);
+
+        // Four pids on a uniform priority: two are stolen (FIFO, as `dequeue` serves them)
+        // and two stay; the total is preserved.
+        let mut four = RunQueue::new();
+        for number in 1..=4 {
+            four.enqueue(pid(number));
+        }
+        let stolen = four.split_off_half();
+        assert_eq!(stolen, vec![pid(1), pid(2)]);
+        assert_eq!(four.iter().collect::<Vec<_>>(), vec![pid(3), pid(4)]);
+        assert_eq!(stolen.len() + four.len(), 4, "the total is preserved");
+
+        // Five pids: half rounds down, so two are stolen and three stay.
+        let mut five = RunQueue::new();
+        for number in 1..=5 {
+            five.enqueue(pid(number));
+        }
+        let stolen = five.split_off_half();
+        assert_eq!(stolen, vec![pid(1), pid(2)]);
+        assert_eq!(
+            five.iter().collect::<Vec<_>>(),
+            vec![pid(3), pid(4), pid(5)]
+        );
+        assert_eq!(stolen.len() + five.len(), 5);
+
+        // A mixed-priority queue steals the highest-precedence pids first.
+        let mut mixed = RunQueue::new();
+        mixed.enqueue_with_priority(pid(1), Priority::Low);
+        mixed.enqueue_with_priority(pid(2), Priority::Normal);
+        mixed.enqueue_with_priority(pid(3), Priority::Max);
+        mixed.enqueue_with_priority(pid(4), Priority::Normal);
+        assert_eq!(mixed.split_off_half(), vec![pid(3), pid(2)]);
+        assert_eq!(mixed.iter().collect::<Vec<_>>(), vec![pid(4), pid(1)]);
     }
 
     #[test]
