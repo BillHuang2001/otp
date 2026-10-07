@@ -9,14 +9,24 @@
 //!   runtime: the peer is started with `net_kernel:connect_node/1`, which is real
 //!   OTP resolving this node through `epmd` and performing the v6 handshake as the
 //!   connecting side, and the runtime's own link reaches
-//!   `DistConnection::is_established()` with the peer's node name — skipped
-//!   **loudly** when the system toolchain is absent.
+//!   `DistConnection::is_established()` with the peer's full `node@host` name,
+//!   while the peer reports `true` — skipped **loudly** when the system toolchain
+//!   is absent.
+//!
+//! The handshake only completes because the node advertises its **full**
+//! `node@host` name on the wire: OTP's connecting side validates the name in the
+//! server's `'N'`/challenge message against the node it dialled
+//! (`dist_util.erl`'s `recv_challenge_new/2`), so a bare `-sname` advertised bare
+//! is aborted mid-handshake (the proof on the protocol side is
+//! `beam_dist/tests/live_accept.rs::a_bare_advertised_name_is_aborted_by_the_real_peer`).
 //!
 //! Phase 1 deliberately stops at `Established`: what a link carries afterwards
 //! (`DOP_REG_SEND`/`DOP_SEND` into a mailbox) is Phase 2, so these tests assert the
 //! handshake, the peer identity and the registration — never a delivered payload.
 
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
+use std::sync::mpsc::{self, Receiver, RecvTimeoutError};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -83,24 +93,59 @@ fn node_runtime(name: &str, cookie: &str) -> Runtime {
 /// the `'N'` handshake against the runtime's listener.
 struct Peer {
     child: Child,
+    /// The peer's stdout, completed when the reader thread sees EOF (the peer
+    /// halts on its own) or when the peer is killed.
+    stdout: Receiver<String>,
 }
 
 impl Peer {
     /// Spawns `erl -sname peer -setcookie cookie` asking `net_kernel` to connect to
-    /// `target` (a full `node@host` name). The peer stays alive; drop kills it.
+    /// `target` (a full `node@host` name). The peer prints the `~p` of its
+    /// `net_kernel:connect_node/1` result and then stays alive for two seconds
+    /// before halting, so the link is not torn down before this side observed it.
+    /// Drop kills it.
     fn connect(name: &str, cookie: &str, target: &str) -> std::io::Result<Peer> {
-        let eval = format!("net_kernel:connect_node('{target}'), halt().", target = target);
-        let child = Command::new("erl")
+        let eval = format!(
+            "T = net_kernel:connect_node('{target}'), \
+             io:format(\"~p\",[T]), \
+             timer:sleep(2000), \
+             halt().",
+            target = target
+        );
+        let mut child = Command::new("erl")
             .arg("-sname")
             .arg(name)
             .arg("-setcookie")
             .arg(cookie)
             .args(["-noshell", "-eval", &eval])
             .stdin(Stdio::null())
-            .stdout(Stdio::null())
+            .stdout(Stdio::piped())
             .stderr(Stdio::null())
             .spawn()?;
-        Ok(Peer { child })
+        let mut stdout = child.stdout.take().expect("the peer's stdout is piped");
+        // A detached reader: the peer's output is complete at EOF, which happens
+        // when the peer halts by itself (or when Drop kills it).
+        let (tx, rx) = mpsc::channel();
+        thread::spawn(move || {
+            let mut text = String::new();
+            let _ = stdout.read_to_string(&mut text);
+            let _ = tx.send(text);
+        });
+        Ok(Peer {
+            child,
+            stdout: rx,
+        })
+    }
+
+    /// The peer's stdout, bounded by `timeout` (the peer halts on its own after
+    /// two seconds, so this never waits longer than that unless `erl` hangs).
+    fn stdout_within(&self, timeout: Duration) -> Option<String> {
+        match self.stdout.recv_timeout(timeout) {
+            Ok(text) => Some(text),
+            Err(RecvTimeoutError::Timeout) => None,
+            // The reader thread is gone without sending: the pipe is broken.
+            Err(RecvTimeoutError::Disconnected) => Some(String::new()),
+        }
     }
 }
 
@@ -159,7 +204,8 @@ fn a_sname_node_binds_a_listener_and_registers_with_epmd() {
 }
 
 /// A **real system `erl`** resolves this node through `epmd` and handshakes with
-/// it: the runtime's link reaches `Established` and recorded the peer's name.
+/// it: the runtime's link reaches `Established` and recorded the peer's name, and
+/// the peer's own `net_kernel:connect_node/1` answers `true`.
 #[test]
 fn a_real_erl_peer_completes_the_handshake_against_the_node() {
     if !erl_available() {
@@ -175,7 +221,7 @@ fn a_real_erl_peer_completes_the_handshake_against_the_node() {
         return;
     };
     let name = unique("h");
-    let peer = unique("p");
+    let peer_name = unique("p");
     let cookie = unique("k");
     let mut runtime = node_runtime(&name, &cookie);
     runtime.run_one_slice().expect("a scheduler pass");
@@ -185,8 +231,10 @@ fn a_real_erl_peer_completes_the_handshake_against_the_node() {
         .to_string();
     assert_eq!(target, format!("{name}@{host}"));
 
-    let _peer = Peer::connect(&peer, &cookie, &target).expect("the peer node starts");
+    let peer = Peer::connect(&peer_name, &cookie, &target).expect("the peer node starts");
 
+    // The link must reach `Established` with the connecting peer's name while the
+    // peer is still alive (it stays up for two seconds after connecting).
     let deadline = Instant::now() + PEER_TIMEOUT;
     let mut established = None;
     while Instant::now() < deadline {
@@ -209,33 +257,33 @@ fn a_real_erl_peer_completes_the_handshake_against_the_node() {
         "the node is published to epmd (a peer can resolve it): {:?}",
         node.registration_error()
     );
-    match established {
-        Some(peer_name) => assert_eq!(
-            peer_name.as_deref(),
-            Some(peer.as_str()),
-            "the connecting peer's short name is what the 'N' message carried"
-        ),
-        None => {
-            // `DistNode::pump` retires a link the driver rejected, recording why: a
-            // `last_link_error` here proves a **real** system `erl` resolved this
-            // node through `epmd` and its inbound distribution connection was
-            // accepted by this runtime's listener. Completing the `'N'` handshake
-            // against a real OTP 29 peer is the known Phase-1 gap (see the crate
-            // `CONTEXT.md`): the server driver rejects the peer's handshake message
-            // with a typed `badarg`.
-            assert!(
-                node.last_link_error().is_some(),
-                "a real erl peer resolved {target} through epmd and connected \
-                 (links={}, last_link_error={:?})",
-                node.connections().len(),
-                node.last_link_error()
-            );
-            eprintln!(
-                "KNOWN PHASE-1 GAP: an inbound connection from a real `erl` peer was \
-                 accepted and then retired by the handshake driver: {:?} — the 'N' \
-                 handshake against a real OTP peer does not complete yet",
-                node.last_link_error()
-            );
-        }
-    }
+    let Some(established_name) = established else {
+        panic!(
+            "a real erl peer resolved {target} through epmd but the 'N' handshake did not \
+             complete within {PEER_TIMEOUT:?} (links={}, last_link_error={:?})",
+            node.connections().len(),
+            node.last_link_error(),
+        );
+    };
+    // The `'N'` message carries the peer's own **full** `node@host` name (OTP's
+    // `send_name/4` puts `atom_to_binary(Node)` on the wire), not a bare short name:
+    // the same rule this node now follows for its own advertised name.
+    assert_eq!(
+        established_name.as_deref(),
+        Some(format!("{peer_name}@{host}").as_str()),
+        "the connecting peer's node name is what the 'N' message carried"
+    );
+
+    // The peer's own verdict: a real OTP node considers the distribution link up.
+    // It prints the `~p` of `net_kernel:connect_node/1` and halts (bounded).
+    let printed = peer
+        .stdout_within(PEER_TIMEOUT)
+        .expect("the peer prints its connect result and exits");
+    assert_eq!(
+        printed.trim(),
+        "true",
+        "a real erl node connected to {target} (peer printed {printed:?}, \
+         last_link_error={:?})",
+        node.last_link_error(),
+    );
 }
