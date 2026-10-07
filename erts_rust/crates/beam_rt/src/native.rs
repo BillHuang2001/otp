@@ -19,6 +19,7 @@
 //! | `os:cmd/1` | runs a command through `/bin/sh` and returns its stdout — the host's own process spawn |
 //! | `code:get_path/0`, `code:all_loaded/0`, `code:which/1`, `code:is_loaded/1`, `code:is_sticky/1,2`, `code:ensure_loaded/1`, `code:lib_dir/0,1`, `code:root_dir/0` | read the runtime's own [`CodeServer`](crate::CodeServer) state (the code path, the loaded/preloaded module set, the installation) |
 //! | `application:get_env/1,2,3`, `application:get_all_env/1`, `application:get_key/2`, `application:loaded_applications/0`, `application:which_applications/0` | read the runtime's own **application-config view** — the `.app` resource files of the OTP applications its code path resolves |
+//! | `prim_file:get_cwd/0,1`, `prim_file:read_file/1` | the file-system **primitives** `file.erl` delegates to: they are the host's own `getcwd`/`open`+`read` (`std::env`/`std::fs`), which only the host can perform |
 //!
 //! The `init`/`code`/`application` calls are **preloaded-module surface** (contract
 //! A.7): the oracle serves them from `init.beam`/`code.beam`/`application.beam`, but
@@ -46,15 +47,17 @@
 //!
 //! The floor is split by responsibility: the `erlang`-core items and the shared helpers live
 //! in this module; the `init:*` entries in [`init`], the `code:*` entries in [`code`], the
-//! `erlang:*` process/registry/reference entries in [`process`] and the `application:*`
-//! entries in [`application`]. The submodules reach the shared helpers through `super`
-//! (they are `pub(super)`).
+//! `erlang:*` process/registry/reference entries in [`process`], the `application:*`
+//! entries in [`application`] and the `prim_file:*` primitives in [`prim`]. The submodules
+//! reach the shared helpers through `super` (they are `pub(super)`).
 
 mod application;
 mod code;
+mod erts_internal;
 mod init;
 mod memory;
 mod port;
+mod prim;
 mod process;
 #[cfg(test)]
 mod test_support;
@@ -151,6 +154,17 @@ impl RuntimeContext<'_> {
             ("erlang", "register", 2) => Some(self.register_2(args)),
             ("erlang", "unregister", 1) => Some(self.unregister_1(args)),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The `erts_internal` internal-BIF floor (contract A.7). One arm; the
+            // per-function dispatch lives in [`erts_internal`], which answers `None`
+            // for anything it does not serve — so `erts_internal:cmp_term/2`, owned
+            // by `beam_bifs`, still falls through to the registry.
+            ("erts_internal", _, _) => self.erts_internal_call(function, arity, args),
+            // The `prim_file` preloaded-module floor (contract A.7): the file-system
+            // primitives `file.erl` delegates to. One arm; the per-function dispatch lives
+            // in [`prim`], which answers `None` for everything it does not serve — so an
+            // unclaimed entry still falls through to the preloaded `.beam` (an honest
+            // `erlang:nif_error(undef)`).
+            ("prim_file", _, _) => self.prim_file_call(function, arity, args),
             _ => None,
         }
     }

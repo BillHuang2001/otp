@@ -4,10 +4,11 @@
 //! Compatibility contract **A.7** requires the *OTP application contracts* that the
 //! runtime itself provides: the preloaded modules (the modules that are loaded before
 //! any other code, straight out of the emulator image) and the `erlang`/`erts_internal`/
-//! `prim_*` surfaces. Milestone-1 ships the **name registry** of the standard preloaded
-//! set (`erts/preloaded/src/*.erl` of the legacy tree) and the **boot order** hook —
-//! [`crate::runtime::Runtime::boot`] — but does *not* yet load the preloaded `.beam`s
-//! (see the crate `CONTEXT.md`, Known Issues).
+//! `prim_*` surfaces. The **name registry** of the standard preloaded set
+//! ([`PRELOADED_MODULE_NAMES`], `erts/preloaded/src/*.erl` of the legacy tree) and the
+//! **boot sequence** hook — [`crate::runtime::Runtime::boot`] — are here; the boot hook
+//! now also loads the matching `.beam` files into the shared module cache for real, see
+//! the `preloaded` submodule.
 //!
 //! The core-atom seed is the second half: [`Runtime`](crate::runtime::Runtime) owns a
 //! **global atom table** used by `system_info/1` and the `~p` printer, and every atom
@@ -17,6 +18,11 @@
 
 use beam_common::{ERTS_VSN, ERTS_VERSION, OTP_VERSION};
 use beam_term::AtomTable;
+
+pub mod bootscript;
+mod preloaded;
+
+pub(crate) use preloaded::load_preloaded;
 
 /// The standard preloaded modules of this release, in `erlang:pre_loaded/0`'s order.
 ///
