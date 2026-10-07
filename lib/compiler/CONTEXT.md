@@ -41,7 +41,8 @@ All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass
 
 ## Known Issues
 - A node with `time`/`eprof`/`tprof` options exposes internal pass timing via the process dictionary (`compile__pass_times`) — debugging aid only.
-- There is NO per-pass budget/watchdog: a runaway pass is bounded only by hard caps (`?MAX_REPETITIONS`=16 in `beam_ssa_opt`/`beam_ssa_alias`, `?SS_DEPTH_LIMIT`=30 in `beam_ssa_ss`, `beam_ssa_dead`'s 64-var cap). `time`/`eprof`/`tprof` only measure, they do not bound.
+- Besides the per-pass hard caps (`?MAX_REPETITIONS`=16 in `beam_ssa_opt`/`beam_ssa_alias`, `?SS_DEPTH_LIMIT`=30 in `beam_ssa_ss`, `beam_ssa_dead`'s 64-var cap) there is now an **opt-in wall-clock bound** for the SSA optimization phases: `ssa_opt_budget` / `{ssa_opt_budget,Millis}` (cumulative budget for `beam_ssa_opt`, default 5000 ms), `ssa_opt_watchdog` / `{ssa_opt_watchdog,Millis}` (upper bound on a single sub-pass, default 1000 ms) and `ssa_opt_gates` (enable the eligibility gates and statistics without a bound). All three are OFF by default and, when off, the pass funs are not wrapped at all, so the default output is byte-for-byte unchanged. Implementing module: `src/beam_ssa_opt_budget.erl`.
+- `time`/`eprof`/`tprof` only measure; the new budget/watchdog is what actually bounds (an exhausted budget stops the fixpoint and skips the remaining skippable sub-passes; a fired watchdog kills the sub-pass and treats it as "did nothing"). Passes that change the SSA representation or its block granularity (`ssa_opt_split_blocks`, `ssa_opt_linearize`, `ssa_opt_blockify`) and `ssa_opt_type_finish` — whose output the code generator depends on — are never skipped.
 
 ## Notes for Agents
 - To add or change an optimization: find the owning pass module and its position in the relevant `*_passes/0` builder in `compile.erl`; toggleable passes are wrapped in `{unless,no_<x>_opt,…}` and their flag handled in `expand_opt/2`.
