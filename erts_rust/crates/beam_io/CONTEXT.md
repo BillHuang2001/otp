@@ -304,9 +304,10 @@ the only place in this crate that holds raw `ErlDrv*` pointers and calls foreign
 
 ## Test Strategy
 Gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io` **GREEN**, and
-`... build --workspace` **GREEN, warning-free**. Current: **231 tests, 0 failures** (1 ignored doc-test) — `170`
+`... build --workspace` **GREEN, warning-free**. Current: **236 tests, 0 failures** (1 ignored doc-test) — `174`
 lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
 `drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`, `abi/{host,port,table}`) + `tests/abi_driver.rs` `8` +
+`tests/driver_registry_slots.rs` `1` +
 `tests/poller.rs` `8` + `tests/port.rs` `4` + `tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs`
 `3` + `tests/driver_seams.rs` `5` + `tests/fixture_builds.rs` `4` + `tests/driver_table.rs` `5` + `2` doctests (the
 `!Send`/`!Sync` compile-fail pins on `PortRegistry`).
