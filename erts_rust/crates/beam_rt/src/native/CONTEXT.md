@@ -178,14 +178,18 @@ needs:
   `port_connect/2`, `port_control/3`, `port_info/1,2`) is **not** claimed *here*: the `erlang:*`
   counterparts are served by `../port.rs` + `beam_bifs`' `PortHook` seam. `erts_internal`'s own
   entries stay unclaimed (the preloaded wrapper is irrelevant to M1 callers).
-- **`prim_*` preloaded driver modules:** `erl_prim_loader`, `prim_file`, `prim_inet`,
-  `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`, `prim_eval`. These are preloaded modules
-  whose BIFs are `-nifs()`-registered C code in the emulator, not `erts_internal` calls, so the
-  floor cannot claim them. A call falls through to a real preloaded-`.beam` load (they ship in the
-  `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry then needs the
-  matching host: the OS file-system resource machinery (`prim_file`: open/read/write/pread/pwrite/
-  seek/stat/readdir/links/permissions), the socket/NIF resource machinery (`prim_socket`,
-  `prim_net`, `prim_inet`), zlib (`prim_zip`), a binary-buffer resource (`prim_buffer`), the boot
-  loader protocol (`erl_prim_loader`), and the `prim_eval` iteration protocol. M1's own file/
-  socket/OS floor is deliberately minimal (`os:cmd/1`, `beam_io`'s spawn driver, the port write
-  stream) and is not a `prim_*` implementation.
+- **`prim_*` preloaded driver modules:** the `prim_file` subset `prim.rs` serves
+  (`get_cwd/0,1`, `read_file/1`) is now on the floor; **every other** `prim_file` entry
+  (`open`/`read`/`write`/`pread`/`pwrite`/`position`/`stat`/`readdir`/links/permissions/…) and all
+  of `erl_prim_loader`, `prim_inet`, `prim_socket`, `prim_net`, `prim_zip`, `prim_buffer`,
+  `prim_eval` are **Not implemented** and still fall through to a real preloaded-`.beam` load (they
+  ship in the `erts` `ebin`, which is on the code path) whose `-nifs()`/`erlang:load_nif` entry
+  then needs the matching host. `list_dir/1` is deliberately **not** claimed by `prim.rs`: its
+  entries come back in `readdir(3)` order, which the oracle does not sort and this runtime cannot
+  pin. `prim_zip:splitter/3` is likewise unclaimed — it is pure Erlang over iolists (not a runtime
+  primitive) whose error paths this floor does not reproduce. The remaining machinery: the open
+  file-descriptor resource (open/read/write/pread/pwrite/seek/stat/readdir/links/permissions), the
+  socket/NIF resource machinery (`prim_socket`, `prim_net`, `prim_inet`), zlib (`prim_zip`), a
+  binary-buffer resource (`prim_buffer`), the boot loader protocol (`erl_prim_loader`), and the
+  `prim_eval` iteration protocol. M1's own file/socket/OS floor is deliberately minimal
+  (`os:cmd/1`, `beam_io`'s spawn driver, the port write stream) and is not a `prim_*` implementation.
