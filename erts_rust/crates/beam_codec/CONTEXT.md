@@ -621,6 +621,14 @@ digit, the leading digit's significant bytes only; `SMALL_BIG_EXT` carries the b
   `term_to_binary` of a runtime large binary is byte-exact (pinned by `tests/internal_ids.rs`).
   Decoding a large binary off-heap would be an interior-ownership change (a `beam_alloc::RefcBinary`
   the `Heap` would retain) with no observable wire effect; it is not done yet.
+- **Two source doc-comments still claim "no refc binary yet" and are stale.** `src/term/binary.rs`
+  (the `make_binary` "Divergence from ERTS" note) and the `Encoder::encode` fallback comment near
+  `src/encode/mod.rs:320` ("in practice an off-heap `BinRef` block, which the Stage-0 foundations
+  cannot build") describe a pre-refc state. The code and tests are authoritative: an off-heap refc
+  binary (`ErlSubBits`-over-`BinRef`) IS recognized by `is_bitstring` and encodes as
+  `BINARY_EXT`/`BIT_BINARY_EXT` through the same `bitstring_bytes` path
+  (`tests/internal_ids.rs::refc_binary_encodes_as_binary_ext`); only *decode* always materializes
+  on-heap. Trust the code/tests, not those two comments.
 - **A hash-map (HAMT) term encodes, but its pair order is not ERTS's.** `encode` reads a > 32-pair
   map's pairs through `crate::term::map_pairs_storage_order` → `beam_term::map::map_pairs_storage_order`
   (the HAMT **node-slot traversal order**, `external.c:3779-3823`: head-array slots in index order,
