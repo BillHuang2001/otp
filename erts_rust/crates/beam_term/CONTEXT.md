@@ -555,7 +555,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`, returned by `make_hash`/`make_hash2` for a `make_fun3` `Local` fun) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs` and `map_hash.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs` and `number_oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
