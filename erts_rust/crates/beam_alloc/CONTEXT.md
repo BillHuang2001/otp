@@ -192,9 +192,11 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — nothing
   else. Adding a dependency edge requires reporting to `../`.
 - **`Heap` is fixed-capacity by contract** — never reallocate (workspace §2).
-- Files target ~1000 lines; split by responsibility. Legitimately long files are documented here:
-  `types.rs` is the `erl_alloc.types` **data table**; `free_list.rs`/`stats.rs`/`types.rs` are long
-  mainly because each carries a large in-module test module for internals only exercisable there.
+- Files target ~1000 lines; split by responsibility. The one long file is `types.rs` (≈730 lines):
+  it *is* the `erl_alloc.types` **data table** (its invariants are only reviewable with the whole
+  table in one place). Every other source file is comfortably under ~1000 lines; the raw-memory
+  modules keep their correctness-evidence tests in a sibling `tests` submodule
+  (`free_list/tests.rs`, `stats/tests.rs`, `types/tests.rs`, `allocator/tests*.rs`, `mseg/tests.rs`).
 - Licensing Apache-2.0.
 
 ## Design Decisions
