@@ -59,9 +59,9 @@ Runs under `unless,no_copt` inside a `{delay,…}`, in order: `core_old_inliner`
 - External type format: `beam_types:encode_ext/1` / `decode_ext/1` / `convert_ext/2` emit a compact `Type` chunk (version `?BEAM_TYPES_VERSION` in `beam_types.hrl`) consumed by the erts JIT; encoded in `beam_dict`/`beam_asm`, decoded by `beam_disasm`.
 
 ## Loop, fusion, specialization & plug-in point
-- **No general loop optimizations exist**: no loop-invariant code motion, unrolling, loop strength reduction, or induction-variable optimization. The two "strength reduction" comments are local peepholes (`live_opt_is/3` ~`beam_ssa_opt.erl:1767`; `reduce_try` ~`:1920`). `beam_ssa:is_loop_header/1` (`beam_ssa.erl:397`) is receive-only (`peek_message`/`wait_timeout`).
+- **Loop optimizations are opt-in only**: `beam_ssa_loop_opt.erl` (flag `loop_opt`) does loop recognition + LICM of non-raising tag tests/constructors into a preheader; there is still NO unrolling, loop strength reduction, or induction-variable optimization. The two "strength reduction" comments are local peepholes (`live_opt_is/3` ~`beam_ssa_opt.erl:1767`; `reduce_try` ~`:1920`). `beam_ssa:is_loop_header/1` (`beam_ssa.erl:397`) is receive-only (`peek_message`/`wait_timeout`).
 - Loop-shaped infrastructure that DOES exist: `beam_ssa:rpo/1,2`, `linearize/1`, `dominators/2`, `dominators_from_predecessors/2`, `common_dominators/3`, `predecessors/1`, `successors/1` — a new loop pass must build its own loop recognition on these.
-- Existing fusion — all block-local peepholes in `beam_ssa_opt.erl`; none fuses mixed ops or crosses blocks:
+- Existing fusion — the opt-in `beam_ssa_fus.erl` (flag `fusion_opt`) fuses a `has_map_field` test + `get_map_element` extraction across a block edge; the remaining fusions are block-local peepholes in `beam_ssa_opt.erl` and none of those fuses mixed ops or crosses blocks:
   - `merge_updates_bs` (~`:525`): merge consecutive `update_record` on the same record; folds `put_tuple`+`update_record`.
   - `update_tuple_opt` (~`:1081`): merge a chain of `setelement/3` into one `update_tuple` pseudo-instruction (undone by `ssa_opt_deoptimize_update_tuple` ~`:3953`, re-expanded in `beam_ssa_pre_codegen:expand_update_tuple`).
   - CSE `combine_put_maps` (~`:1392`): merge a `put_map` whose source is a preceding assoc `put_map`.

@@ -507,6 +507,14 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
   `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
   3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
+- `tests/number_oracle.rs` — the crate-local live-`erl` cross-check of `number::big_to_f64`/
+  `number_as_f64`: it materializes a large corpus of bignums (`write_big` limbs) both as `beam_term`
+  terms and as Erlang integer literals, has the oracle convert each with `float/1`, and compares the
+  resulting IEEE-754 bit patterns (text protocol: raw 64-bit bits, or the atom `overflow` when
+  `float/1` refuses). Corpus = a systematic bit-length sweep `1..=1100` (top-bit / all-ones /
+  pseudo-random, both signs) + randomised multi-limb values + curated rounding-boundary vectors;
+  `ERL_TIMEOUT = 60s`; skips loudly when `erl` is absent. The bignum *observables* (equality/order/
+  `flat_size`) are cross-checked separately in `tests/oracle.rs`.
 - `tests/map_hash.rs` — the crate-local oracle cross-check for the **HAMT pair-storage order**:
   it pins two verified literal vectors (60 small-int keys `#{K => K*2}`; 40 binary keys
   `#{<<N>> => N}`) as expected lists, and compares `map_pairs_storage_order` against
@@ -547,7 +555,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
 - `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`, returned by `make_hash`/`make_hash2` for a `make_fun3` `Local` fun) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs` and `map_hash.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs`, `map_hash.rs` and `number_oracle.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed

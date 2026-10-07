@@ -192,9 +192,10 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - **Dependencies (fixed by `Cargo.toml`):** `beam_common`, `beam_term`, `libc`, `parking_lot` — nothing
   else. Adding a dependency edge requires reporting to `../`.
 - **`Heap` is fixed-capacity by contract** — never reallocate (workspace §2).
-- Files target ~1000 lines; split by responsibility. The one long file is `types.rs` (≈730 lines):
-  it *is* the `erl_alloc.types` **data table** (its invariants are only reviewable with the whole
-  table in one place). Every other source file is comfortably under ~1000 lines; the raw-memory
+- Files target ~1000 lines; split by responsibility. Two files exceed it: `types.rs` (~727 lines) *is* the
+  `erl_alloc.types` **data table** (its invariants are only reviewable with the whole table in one place),
+  and `policy.rs` (~1370 lines, of which ~550 are its in-module test module) documents all 12 `+M<alloc><opt>`
+  options against the C ground truth. The raw-memory
   modules keep their correctness-evidence tests in a sibling `tests` submodule
   (`free_list/tests.rs`, `stats/tests.rs`, `types/tests.rs`, `allocator/tests*.rs`, `mseg/tests.rs`).
 - Licensing Apache-2.0.
@@ -236,7 +237,8 @@ All mutation is serialised through one `parking_lot::Mutex`. Carriers come from 
 - A **leak/steady-state** test drives alloc/free cycles and asserts the carrier/free-block counters
   return to baseline (no leak on the tested paths).
 - Gate (GREEN required, current): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml
-  -p beam_alloc --no-fail-fast` → **227 lib + 18 + 13 + 4 = 262 tests, 0 failures**; and
+  -p beam_alloc --no-fail-fast` → **227 lib + 18 (`tests/allocator.rs`) + 13 (`tests/heap.rs`) + 5
+  (`tests/hot_path.rs`) = 263 tests, 0 failures**; and
   `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace` is warning-free.
 - Cross-checks against the real system ERTS belong to `../tools/differential/` (the compatibility gate).
 

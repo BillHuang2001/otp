@@ -488,6 +488,11 @@ impl Table {
   tests in `tests/ets_replace.rs`). Wherever the oracle accepts, the results agree.
 - **`ets:slot`-style iteration and `tab2file`/`file2tab` are not implemented** (out of scope for this
   pass); `tab2list` plus `first`/`next` cover enumeration.
+- **The `lib.rs` doc line and `Cargo.toml` description say "CHAMP interiors" — inaccurate.** The hash
+  interior is a **chained bucket array** (`src/hash_interior.rs`: `Vec<Vec<Entry>>`, 8 buckets doubling
+  past a 3/4 load factor), *not* a CHAMP/HAMT. The only hash-trie layout in the rewrite is
+  `beam_term::map`'s HAMT (for map *terms*, not ETS). The interior shape is unpinned (crate-layer §2),
+  so this is a doc-string error, not a contract violation — but the doc string must not be trusted.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`

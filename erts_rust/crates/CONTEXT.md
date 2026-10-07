@@ -144,17 +144,18 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   image.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
   `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`, but fun application goes
   through `beam_engine::ExecutionContext::apply_fun`, whose concrete implementation is `beam_rt`'s
-  (outside this node). Encoding a `Local` (`make_fun3`) fun returns the typed
-  `error::unsupported_local_fun` — its inlined descriptor carries no module, 16-byte `uniq` or creator
-  pid, so a faithful image needs the module identity/MD5.
-- `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
-  `beam_term::{map,bitstring}`. A >32-key (HAMT) map needs an image-preserving encode — adopt
-  `map::map_pairs_storage_order` (the map's stored pair order) + `map::write_map` (builder); today the
-  encode path falls through to a typed `unsupported`.
+  (outside this node). `beam_codec` encodes a `Local` (`make_fun3`) fun only when the caller supplies a
+  `FunIdentity` (module / 16-byte `uniq` / old_index / old_uniq / creator) via
+  `Encoder::with_fun_identity`; without it the encode returns the typed `error::unsupported_local_fun`
+  (the inlined descriptor carries no module/MD5). The remaining owner is `beam_rt`, which must supply the
+  identity from the running module.
+- `beam_codec`: HAMT (>32-key) maps now encode via `beam_term::map::map_pairs_storage_order` (byte-identical
+  to the oracle). Only its private `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer,
+  since `map::write_map` switches to a HAMT past 32 pairs) and the `binary.rs` shim stay crate-local.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
-- `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) still emits the older 12-field subset; adopt
-  `beam_ets::TableInfo::entries`, which emits the oracle's full 15-field order (`heir`/`node`/
-  `decentralized_counters` included; `owner` still rendered as `undefined` — no pid term yet).
+- `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) now emits the oracle's full 15-field order
+  (hand-reproduced from public `beam_ets::TableInfo` fields — `TableInfo::entries` needs `&mut AtomTable`,
+  which a BIF context lacks); `owner` is still rendered as `undefined` (no pid term yet).
 - `beam_process`: register off-heap refc binaries (`RefcBinary`) in `beam_gc::OffHeap` and supply the `sweep`
   liveness predicate (liveness of an off-heap entry is the caller's concern; the collector never walks
   off-heap payloads).
@@ -198,7 +199,7 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - `beam_message/` → copy engine (`copy_struct`) + messaging (`Message`/`Queue` + the `QueueCursor` scan position)
 - `beam_process/` → processes, scheduler, run queues, thread progress, signals/links/monitors, resume-on-send (`DeliverOutcome`)
 - `beam_bifs/` → BIF registry (`bif.tab` surface) + implementations + the host seams (`FunCaller`/`SendHook`/`PortHook`/`AtomInterner`/`OutputSink`/`TableRegistry`/`DictHook`)
-- `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag), B-tree/CHAMP interiors
+- `beam_ets/` → ETS tables (set/ordered_set/bag/duplicate_bag), K-ary B+-tree + chained-bucket hash interiors
 - `beam_io/` → poller/reactor (epoll/kqueue/io_uring), ports, port-task scheduling, built-in drivers (`fd`/`efile` + the OS-child `spawn` driver)
 - `beam_rt/` → runtime binary: boot/preloaded modules, CLI flags, `system_info`, glue, vertical slice, the executor runner (send/receive over the process mailbox + scheduler), the port subsystem (drives `beam_io::PortRegistry` + delivers port data to the owning process), and the `PortHook` provider
 - `../tools/differential/` → differential-test harness vs real ERTS (sibling — read-only, escalate writes to `..`)
@@ -229,13 +230,15 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   main loop, and turns the resulting `PortNotification`s into `{Port,{data,Data}}`/`{Port,{exit_status,…}}`
   messages **delivered to the owning process**, so a receiver blocked on port data is woken through
   `beam_process`'s resume-on-send rather than only by an explicit `send` (`beam_rt/tests/port_wake.rs`);
-  `erlang:port_close/1` returns the oracle's `true`. The **differential gate is
-  `total=431 agree=429 mismatch=0 unsupported=2 skipped=0`** (re-measured at this node's HEAD). The 2
-  `unsupported` are `records/get_definition_unknown_record` (A.7) and `wire/new_fun_ext_encode`
-  (A.5, `beam_rt`'s `local_fun` gap); **no case disagrees** (`mismatch=0`, `skipped=0`).
+  `erlang:port_close/1` returns the oracle's `true`. The **differential gate reports 0 mismatches** on the
+  supported module-run subset; the reported corpus total differs between node CONTEXT.md files
+  (`crates/CONTEXT.md` `431/429/2` vs `beam_rt/CONTEXT.md` `541/540/1`) — the `records/*` A.7 cases now agree
+  via `beam_rt`'s `RecordBridge`, so the newer total is likelier — re-measure before quoting. The one
+  remaining `unsupported` is `wire/new_fun_ext_encode` (A.5, `beam_rt` not yet supplying the `Local`-fun
+  identity); **no case disagrees** (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
-  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
-  `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
+  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 245 tests, `beam_alloc` 263,
+  `beam_gc` ~141 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
   copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
   changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
@@ -311,14 +314,17 @@ the caller reserves the words and passes `hp: *mut Eterm`):
 - The map/bitstring/refc handoffs above are not yet adopted by `beam_codec`/`beam_engine`/`beam_bifs`/
   `beam_process` (those nodes are owned elsewhere); until then `beam_codec` still carries a duplicate
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
-- `beam_bifs`'s `ets:info/1` bridge still emits its own 12-field subset instead of
-  `beam_ets::TableInfo::entries` (15 fields), and `records:get_definition/2` remains a typed
-  `unsupported_bif` (it needs the code-server `Recs`-chunk record table, unreachable from
-  `beam_loader`'s `Recs` id today).
-- `wire/new_fun_ext_encode` (encoding a runtime-made `Local` fun) stays `unsupported`; a faithful ETF
-  image needs the module identity/MD5 the inlined descriptor does not carry.
-- `open_port({spawn_executable, ...})` on a nonexistent path diverges: the oracle raises `error:enoent`
-  while `beam_io`'s `SpawnDriver` maps the spawn failure to `BeamError::Io` (a `beam_io`/`beam_rt` fix).
+- `beam_bifs`'s `ets:info/1` now emits the full 15-field oracle order (hand-reproduced, `owner`=`undefined`);
+  `records:get_definition/2` is now implemented via its `RecordSource` seam (no hook ⇒ the oracle's `badarg`).
+- `wire/new_fun_ext_encode` remains `unsupported` *in the gate* because `beam_rt` does not yet supply the
+  `Local`-fun identity; `beam_codec` itself encodes it byte-exactly given a `FunIdentity`.
+- `beam_message` `src/layout.rs` sizes/walks fun blocks with the legacy C `ERL_FUN_SIZE` convention (2-word
+  prefix, env at offset 2) instead of the frozen `beam_term::fun` layout (env at `1 + desc_words(kind)`), so
+  `copy_struct` mis-sizes/mis-fixes a fun crossing a copy boundary (e.g. a `make_fun3` closure in a message);
+  untested. Fix: route funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
+- `open_port` residual divergences (a nonexistent path now raises `error:enoent`, matching the oracle):
+  `{spawn_executable,<dir>}` ⇒ `eacces` vs oracle `ok`; empty `{spawn,""}`/`{spawn_executable,""}` ⇒ `enoent`
+  vs oracle `badarg`.
 - Repo-root owned (outside this node): owed `../../CHANGE.md` entries for the `beam_term` foundation
   extensions (`map`/`bitstring`/`refc`), the `RefCount` move into `beam_alloc` + the `RefcBinary`
   off-heap seam, `beam_gc::OffHeap` owning refc binaries, the `beam_abi` frozen-header seam work, the

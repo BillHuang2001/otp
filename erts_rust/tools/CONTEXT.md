@@ -14,12 +14,12 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 - `differential run <case-id> [--json] [--out <dir>]` — run one built-in conformance case both ways; print the comparison.
 - `differential compare <expr> [--pa <dir>] [--json] [--out <dir>]` — ad-hoc: evaluate an Erlang expression under both runtimes and compare.
 - `differential suite [--strict] [--json] [--out <dir>]` — run the built-in conformance corpus.
-- `differential list [--json]` — list corpus case ids + the compatibility contract each covers.
+- `differential list [--by-contract] [--json] [--out <dir>]` — list corpus case ids + the compatibility contract each covers (`--by-contract` adds a per-contract case-count rollup).
 - Exit codes: `0` all executed cases agreed (skips/unsupported reported, not fatal); `1` ≥1 **mismatch**; `2` usage/env error. `--strict` escalates `unsupported`/`skipped` to a failure exit.
 
 ### `bench`
 - `bench list [--json]` — list workloads + their prerequisite-probe status.
-- `bench run [--quick|--full] [--workloads <ids>] [--runtime <sys|rust|all>] [--out <dir>] [--json]` — run workloads, write results JSON.
+- `bench run [--quick|--full] [--workloads <ids,csv>] [--runtime <sys|rust|all>] [--out <dir>] [--out-file <path>] [--repo <id>=<path>] [--json] [--verbose]` — run workloads, write results JSON.
 - `bench baseline [--quick]` — measure the system-ERTS baseline only.
 - `bench compare <a.json> <b.json> [--json]` — diff two result sets.
 - Exit codes: `0` run completed (per-workload `skipped(reason)` is not fatal); `2` usage/env error. A workload that *errors* is recorded `failed` in JSON.
@@ -51,6 +51,9 @@ Both crates ship a **library + a binary**: the library exists so `cargo test` ca
 ## Notes for Agents
 - Build/test via the committed wrapper (read-only `$HOME`): from this dir `../scripts/cargo.sh test -p differential` / `../scripts/cargo.sh test -p bench`; from the repo root add `--manifest-path erts_rust/Cargo.toml`. The cache is shared across worktrees; known deps (`serde`, `serde_json`, `libc`) resolve offline — avoid adding new crates.
 - Oracle is the system Erlang on `PATH` (OTP 29.1.1 / erts-17.1). Verified: `erl -noshell -eval 'io:format("~w~n",[term_to_binary({ok,42})]), halt().'` → `<<131,104,2,119,2,111,107,97,42>>`.
+- **Oracle = the system `erl`, never the in-tree `erts/` C build** (`differential/src/runtime.rs::resolve_oracle`: `$ERTS_ORACLE` else `erl` scanned on `$PATH`).
+- **Gate coverage depth (verified against code):** all nine contracts A.1–A.9 have corpus cases, but three are shallow — A.4 (driver C ABI) is observed only through the *port/spawn surface* and a structural C-ABI compile check (`tests/abi.rs`), A.5 (distribution) only through the *ETF wire codec* (no live handshake / `DOP_*` framing), and A.9 (build) only through *boot/version observability* (no actual self-hosted build). The genuine end-to-end agreement core is the module-run groups (`modules`/`mexec`/`nif_so`/`records`).
+- **`bench` target gaps in this sandbox:** `plb` (Benchmarks-Game, needs `dotnet`) and `emqx` (no root `rebar.config` — it is a `make`/`mix` project) are wired but report honest `skipped(<reason>)`; `khepri` needs `rebar3`, available only via the opt-in `$BENCH_TRY_NIX`.
 
 ## See Also
 - `../CONTEXT.md` §6 (test strategy) and §"Notes for Agents" — the differential gate and the external targets.

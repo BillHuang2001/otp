@@ -26,6 +26,13 @@ Current version floor `COMPILER_VSN = 10.0.6` (see `vsn.mk`); release-wide mappi
 - Each pass is a module exporting `module/2` (old-behavior-style `beam_*`/`sys_core_*`), and pass state is the private `#compile{}` record.
 - Type information lives in the SSA layer (`beam_types` lattice + `beam_ssa_type`/`beam_call_types`), replacing the old Core-only type passes; features are version-gated via `+r29`/-feature flags (`expand_opt/2`).
 
+## Stage 2 opt-in passes (loop opts / fusion / FBIP)
+The Rust-rewrite "Stage 2" compiler workstream (root `ERTS_RUST_REWRITE_DEEPDIVE.md` §E/§H) adds three **opt-in, default-OFF** SSA passes here, each with its own CT suite.
+All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass lists); `options/0` merely advertises their flags in `--help` (`compile.erl:3259-3261`).
+- `src/beam_ssa_loop_opt.erl` — loop recognition (natural loops from back edges + dominators) + **loop-invariant code motion** (LICM) of pure non-raising tag-test BIFs (`?SAFE_BIFS`) and constructors (`?SAFE_OPS` = `put_list`/`put_tuple`) hoisted into a preheader; `?MAX_HOIST`=64. NO unrolling (deferred, documented `:79-86`), NO arithmetic hoisting (it runs before the SSA type pass), NO strength reduction / induction-variable analysis. Enabled by the `loop_opt` option, appended to `prologue_passes/1` (`beam_ssa_opt.erl:315-323`); kill via `no_ssa_opt_loop_opt` (auto-derived) or `no_ssa_opt`.
+- `src/beam_ssa_fus.erl` — **map-lookup fusion**: a redundant `has_map_field` test + `get_map_element` extraction of the same key on the success edge collapse to one lookup, only when the map operand is type-proven a map. Enabled by `fusion_opt`, appended to `repeated_passes/1` (`beam_ssa_opt.erl:355-359`); kill via `no_ssa_opt_fus`. Multi-key lookup and tuple-element chain fusion are deliberately NOT implemented (no SSA op exists).
+- `src/beam_ssa_fbip.erl` — **FBIP**: rewrites a *copying* `update_record` to the `inplace` hint when the source is provably fresh (a `put_tuple`/`put_tuple2`, an allocating `bs_create_bin`/`bs_init_writable`, a `call` to a local fresh-returning function, an already-`inplace` `update_record`, or an all-fresh `phi`), uniquely owned (single use, not a function argument) and positioned so the update runs at most once per allocation. Covers tuples/records (+ writable binaries as source); STILL no in-place reuse for lists/maps. Enabled by `fbip_opt`: `beam_ssa_opt:late_epilogue_passes/1` records the flag in the process dictionary (`put('$fbip_opt',…)` `:385`) and `beam_ssa_destructive_update:opt/2` invokes it after the regular alias/destructive transforms (`:154-163`).
+
 ## Dependencies
 - Compile-time: `kernel`, `stdlib` only.
 - Runtime only: `crypto` (encrypting/decrypting the `debug_info` chunk via `beam_lib:get_crypto_key/1` + `crypto:crypto_one_time/6`) — hence `DIA_PLT_APPS=crypto` in `Makefile`.
@@ -34,6 +41,7 @@ Current version floor `COMPILER_VSN = 10.0.6` (see `vsn.mk`); release-wide mappi
 
 ## Known Issues
 - A node with `time`/`eprof`/`tprof` options exposes internal pass timing via the process dictionary (`compile__pass_times`) — debugging aid only.
+- There is NO per-pass budget/watchdog: a runaway pass is bounded only by hard caps (`?MAX_REPETITIONS`=16 in `beam_ssa_opt`/`beam_ssa_alias`, `?SS_DEPTH_LIMIT`=30 in `beam_ssa_ss`, `beam_ssa_dead`'s 64-var cap). `time`/`eprof`/`tprof` only measure, they do not bound.
 
 ## Notes for Agents
 - To add or change an optimization: find the owning pass module and its position in the relevant `*_passes/0` builder in `compile.erl`; toggleable passes are wrapped in `{unless,no_<x>_opt,…}` and their flag handled in `expand_opt/2`.
@@ -46,11 +54,12 @@ Current version floor `COMPILER_VSN = 10.0.6` (see `vsn.mk`); release-wide mappi
 - Common Test suites live in `test/` (no `TEST_NEEDS_RELEASE`): `make test` there builds an `Emakefile` and runs CT against the in-tree compiler.
 - Central strategy is optimization-correctness: base feature suites are cloned by the Makefile into suffixed suites (`_no_opt`, `_no_ssa_opt`, `_no_copt`, `_inline`, `_cover`, `_dialyzer`, `_r29`, …) that re-run the same code under different optimizer option sets.
 - Pass-specific suites (`beam_ssa_SUITE`, `beam_types_SUITE`, `beam_jump_SUITE`, `core_fold_SUITE`, `beam_validator_SUITE`, …), plus `random_code_SUITE` and `property_test/` (PropEr/EQC) for randomized compilation.
+- The opt-in Stage 2 passes have dedicated suites (`beam_ssa_loop_opt_SUITE`, `beam_ssa_fus_SUITE`, `beam_ssa_fbip_SUITE`, all in `test/Makefile` `MODULES`); each compiles its own probe modules and needs a `compiler` built with the matching pass module.
 - `beam_validator` rejects malformed assembly; `beam_ssa_check` consumes `%%` directives in test data to assert SSA annotations.
 - `scripts/smoke` is a manual, release-time end-to-end check (builds Elixir + Mix projects) — not part of CI/CT.
 
 ## Routing Table
-- `src/` → all compiler sources: `compile` API + pass pipeline, Core Erlang (`v3_core`/`cerl*`/`sys_core_*`), BEAM SSA (`beam_core_to_ssa`/`beam_ssa*`/`beam_types`), codegen & assembly (`beam_ssa_codegen`/`beam_asm`/`beam_a`/`beam_block`/`beam_jump`/`beam_validator`/`beam_disasm`), generated `beam_opcodes`/`core_parse`
+- `src/` → all compiler sources: `compile` API + pass pipeline, Core Erlang (`v3_core`/`cerl*`/`sys_core_*`), BEAM SSA (`beam_core_to_ssa`/`beam_ssa*`/`beam_types`), codegen & assembly (`beam_ssa_codegen`/`beam_asm`/`beam_a`/`beam_block`/`beam_jump`/`beam_validator`/`beam_disasm`), generated `beam_opcodes`/`core_parse`; also the opt-in Stage 2 passes `beam_ssa_loop_opt` (`loop_opt`), `beam_ssa_fus` (`fusion_opt`), `beam_ssa_fbip` (`fbip_opt`)
 - `test/` → Common Test suites (feature suites, cloned option-set suites, pass suites, property tests, fixture data dirs)
 - `doc/` → ExDoc build config (`docs.exs`), `Makefile` (via `make/doc.mk`), and `notes.md` (app release notes)
 - `internal_doc/` → contributor-facing internals docs: `beam_ssa.md` (SSA invariants), `ssa_checks.md` (SSA checkers), `cerl-notes.md`
@@ -64,3 +73,4 @@ Current version floor `COMPILER_VSN = 10.0.6` (see `vsn.mk`); release-wide mappi
 ## See Also
 - `../CONTEXT.md` — OTP application layout conventions; `../Makefile` — build order (`ERTS_APPLICATIONS`).
 - `../dialyzer/`, `../syntax_tools/`, `../eunit/` — primary consumers of the `compile`/`cerl` APIs.
+- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §E/§H — source of the Stage 2 compiler mandate (loop opts → fusion → FBIP, opt-in flags, per-pass budget, bootstrap benchmark); `../../erts_rust/CONTEXT.md` §"Stage 2" routes here.
