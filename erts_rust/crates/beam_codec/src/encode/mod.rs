@@ -33,7 +33,7 @@ use crate::tag::{
 use crate::term::{
     big_parts, bit_count_to_bytes, bitstring_bytes, cons_head, cons_tail, external_pid_parts,
     external_port_parts, external_ref_parts, flatmap_parts, float_value, fun_kind_term, is_record,
-    map_pairs_storage_order, tuple_arity, tuple_element,
+    map_pairs_storage_order, tuple_arity, tuple_element, FunPid,
 };
 use crate::writer::Writer;
 
@@ -110,6 +110,56 @@ enum AtomFlavour {
     Latin1WideOnly,
 }
 
+/// The identity of a [`FunKind::Local`](crate::term::FunKind) fun that its **term
+/// layout does not carry** but the `NEW_FUN_EXT` (`112`) wire form requires.
+///
+/// A `make_fun3` closure (`beam_engine`/`beam_rt`) inlines only its engine-internal
+/// descriptor (`[uniq: u64][index: u32]`); it stores **no** module atom, no 16-byte
+/// module MD5, no `old_index`/`old_uniq` and no creator pid. The C encoder
+/// (`external.c:3966-3993`) resolves those fields through the fun's `ErlFunEntry`
+/// (the running module's lambda table), which only the runtime knows — so they are
+/// an **optional caller input**, supplied through [`Encoder::with_fun_identity`].
+/// The codec never invents them: without one a local fun stays
+/// [`crate::error::unsupported_local_fun`] (classify-don't-lie).
+///
+/// The field meanings mirror `ErlFunEntry` (`erts/emulator/beam/erl_fun.h:31-59`):
+/// `module`/`uniq` identify the compiled module, `old_index`/`old_uniq` are its
+/// legacy lambda identity, and `creator` is the pid the C encoder writes — for a
+/// local fun that is always `erts_init_process_id` (the `init` process), **not** the
+/// fun's own creator (`external.c:3989`).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub struct FunIdentity {
+    /// The module the closure was compiled in (`ErlFunEntry.module`).
+    pub module: Atom,
+    /// The module's 16-byte MD5 (`ErlFunEntry.uniq`).
+    pub uniq: [u8; 16],
+    /// The legacy lambda index (`ErlFunEntry.old_index`).
+    pub old_index: u32,
+    /// The legacy lambda unique number (`ErlFunEntry.old_uniq`).
+    pub old_uniq: u32,
+    /// The creator pid written to the wire — `erts_init_process_id` for a local fun.
+    pub creator: FunPid,
+}
+
+impl FunIdentity {
+    /// Builds a fun identity from its five wire fields.
+    pub fn new(
+        module: Atom,
+        uniq: [u8; 16],
+        old_index: u32,
+        old_uniq: u32,
+        creator: FunPid,
+    ) -> FunIdentity {
+        FunIdentity {
+            module,
+            uniq,
+            old_index,
+            old_uniq,
+            creator,
+        }
+    }
+}
+
 /// Incremental external term format encoder.
 ///
 /// Holds a borrowed atom table (the sole source of atom names) and an output
@@ -133,6 +183,11 @@ pub struct Encoder<'a> {
     /// is owned by the runtime, so it is an optional input; without it an internal
     /// id has no wire image.
     local_node: Option<(Atom, u32)>,
+    /// The fun identity supplied by the caller via [`Encoder::with_fun_identity`],
+    /// used to encode a [`FunKind::Local`](crate::term::FunKind) fun as
+    /// `NEW_FUN_EXT`. `None` — the default — keeps such a fun
+    /// [`crate::error::unsupported_local_fun`] (the identity cannot be invented).
+    fun_identity: Option<FunIdentity>,
 }
 
 impl<'a> Encoder<'a> {
@@ -155,6 +210,7 @@ impl<'a> Encoder<'a> {
             minor_version: MinorVersion::V2,
             atom_cache: None,
             local_node: None,
+            fun_identity: None,
         }
     }
 
@@ -232,13 +288,34 @@ impl<'a> Encoder<'a> {
         self
     }
 
+    /// Supplies the module identity needed to encode a
+    /// [`FunKind::Local`](crate::term::FunKind) fun (`make_fun3` closure) as
+    /// `NEW_FUN_EXT` (`112`).
+    ///
+    /// A local fun's term layout stores only its engine-internal descriptor and so
+    /// carries none of the wire fields `NEW_FUN_EXT` needs; [`FunIdentity`] is the
+    /// runtime's module identity (`beam_engine`/`beam_rt`). With it installed, the
+    /// encoder emits a **faithful** `NEW_FUN_EXT` built from the *term's*
+    /// arity/index/`num_free`/environment plus the *supplied* module/`uniq`/
+    /// `old_index`/`old_uniq`/creator — byte-identical to the C encoder's local-fun
+    /// path (`external.c:3966-3993`). Without it a local fun stays
+    /// [`crate::error::unsupported_local_fun`] (never a wrong image).
+    ///
+    /// The default is `None`, so every existing signature and every un-flavoured
+    /// [`encode_term`] is byte-for-byte unchanged.
+    pub fn with_fun_identity(mut self, identity: FunIdentity) -> Self {
+        self.fun_identity = Some(identity);
+        self
+    }
+
     /// Encodes `term`, appending it to the output.
     ///
     /// A tag the M1 term layer does not support yields
-    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun — which has no
-    /// faithful wire image — yields [`crate::error::unsupported_local_fun`]; a value
-    /// beyond a wire bound yields `BeamError::SystemLimit`. The encoder never
-    /// silently mis-encodes.
+    /// [`crate::error::unsupported`]; a local (`make_fun3`) fun **without** a
+    /// [`FunIdentity`] installed via [`Encoder::with_fun_identity`] yields
+    /// [`crate::error::unsupported_local_fun`] (its wire fields are not derivable
+    /// from the term); a value beyond a wire bound yields `BeamError::SystemLimit`.
+    /// The encoder never silently mis-encodes.
     pub fn encode(&mut self, term: Eterm) -> Result<()> {
         // Classification order is deliberate (see the crate `CONTEXT.md`,
         // "`src/encode.rs`"): immediates first, then each boxed family through its
