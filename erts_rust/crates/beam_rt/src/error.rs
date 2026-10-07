@@ -317,7 +317,6 @@ pub(crate) const KNOWN_UNIMPLEMENTED_ERLANG_BIFS: &[(&str, u32)] = &[
     ("process_flag", 2),
     ("process_flag", 3),
     ("process_info", 1),
-    ("process_info", 2),
     ("process_display", 2),
     ("suspend_process", 1),
     ("resume_process", 1),
