@@ -1472,4 +1472,408 @@ mod tests {
         unsafe { alloc.dealloc(bogus, layout(64, 16)) };
         assert_eq!(alloc.stats(), AllocStats::default());
     }
+
+    // -- Typed (interposition) surface ---------------------------------------------
+
+    /// The [`TypeId`] named `name` (every name used here is one of the 243 active
+    /// types).
+    fn type_id(name: &str) -> TypeId {
+        TypeId::from_name(name).unwrap_or_else(|| panic!("type {name} must be active"))
+    }
+
+    /// A minimal implementor that overrides **nothing** of the typed surface, so every
+    /// typed call exercises a trait default; it counts the `alloc`s that reach it and
+    /// forwards everything to an inner [`CarrierAllocator`].
+    struct Forwarding {
+        inner: AllocRef,
+        allocs: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Allocator for Forwarding {
+        fn alloc(&self, layout: Layout) -> Result<NonNull<u8>> {
+            self.allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.inner.alloc(layout)
+        }
+
+        fn realloc(
+            &self,
+            ptr: NonNull<u8>,
+            old_layout: Layout,
+            new_size: usize,
+        ) -> Result<NonNull<u8>> {
+            self.inner.realloc(ptr, old_layout, new_size)
+        }
+
+        unsafe fn dealloc(&self, ptr: NonNull<u8>, layout: Layout) {
+            // SAFETY: forwarded unchanged from the caller.
+            unsafe { self.inner.dealloc(ptr, layout) };
+        }
+
+        fn stats(&self) -> AllocStats {
+            self.inner.stats()
+        }
+
+        fn name(&self) -> &str {
+            "forwarding"
+        }
+    }
+
+    #[test]
+    fn the_type_attributed_allocations_land_in_their_own_slot() {
+        let alloc = allocator();
+        let heap = type_id("HEAP");
+        let msg = type_id("MSG");
+        let untouched = type_id("ATOM");
+        assert_ne!(heap, msg);
+
+        let l = layout(64, 16);
+        let a = alloc.alloc_typed(heap, l).expect("typed heap alloc");
+        let b = alloc.alloc_typed(msg, l).expect("typed msg alloc");
+        let stats = alloc.stats();
+        assert_eq!(stats.alloc_calls, 2);
+        assert_eq!(stats.live_blocks, 2);
+
+        let heap_stats = alloc.type_stats(heap);
+        let msg_stats = alloc.type_stats(msg);
+        assert_eq!(heap_stats.blocks, 1);
+        assert_eq!(msg_stats.blocks, 1);
+        // Both requests are the same size class, so each type holds exactly one block
+        // and the two slots add up to the allocator's live total.
+        assert_eq!(heap_stats.bytes, msg_stats.bytes);
+        assert_eq!(heap_stats.bytes + msg_stats.bytes, stats.live_bytes);
+        assert_eq!(heap_stats.peak_bytes, heap_stats.bytes);
+        // A type nobody allocated for stays at zero.
+        assert_eq!(alloc.type_stats(untouched), TypeStats::default());
+
+        // An *untyped* allocation is aggregate-only: it must not be charged to `heap`.
+        let plain = alloc.alloc(l).expect("untyped alloc");
+        assert_eq!(alloc.type_stats(heap).blocks, 1);
+        assert_eq!(alloc.type_stats(heap).bytes, heap_stats.bytes);
+        assert_eq!(alloc.stats().live_blocks, 3);
+        // SAFETY: live allocation, freed exactly once, untyped as it was allocated.
+        unsafe { alloc.dealloc(plain, l) };
+
+        // SAFETY: both live typed allocations, freed exactly once each with the layout
+        // they were allocated with.
+        unsafe { alloc.dealloc_typed(heap, a, l) };
+        // SAFETY: as above.
+        unsafe { alloc.dealloc_typed(msg, b, l) };
+        let after = alloc.stats();
+        assert_eq!(after.live_blocks, 0);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.free_calls, 3);
+        assert_eq!(alloc.type_stats(heap).blocks, 0);
+        assert_eq!(alloc.type_stats(heap).bytes, 0);
+        assert_eq!(alloc.type_stats(msg).blocks, 0);
+        assert_eq!(alloc.type_stats(msg).bytes, 0);
+        // The per-type high-water mark survives the free.
+        assert_eq!(alloc.type_stats(heap).peak_bytes, heap_stats.bytes);
+        assert_eq!(alloc.type_stats(untouched), TypeStats::default());
+    }
+
+    #[test]
+    fn realloc_typed_keeps_the_attribution_on_the_same_type() {
+        let alloc = allocator();
+        let msg = type_id("MSG");
+        let other = type_id("HEAP");
+        let l = layout(64, 16);
+        let ptr = alloc.alloc_typed(msg, l).expect("alloc");
+
+        // Shrinking within the block's capacity does not move it, so neither the block
+        // nor its attribution changes.
+        let same = alloc.realloc_typed(msg, ptr, l, 32).expect("shrink in place");
+        assert_eq!(same, ptr);
+        assert_eq!(alloc.type_stats(msg).blocks, 1);
+        assert_eq!(alloc.stats().realloc_calls, 1);
+
+        // Growing past the capacity moves the block through a real typed alloc + free,
+        // both attributed to `msg`.
+        let grown = alloc.realloc_typed(msg, ptr, l, 4097).expect("grow");
+        assert_ne!(grown.as_ptr(), ptr.as_ptr());
+        let stats = alloc.stats();
+        assert_eq!(stats.realloc_calls, 2);
+        assert_eq!(stats.live_blocks, 1);
+        assert_eq!(stats.sbc_carriers, 1, "the grown block owns a dedicated carrier");
+        assert_eq!(alloc.type_stats(msg).blocks, 1);
+        assert_eq!(alloc.type_stats(msg).bytes, stats.live_bytes);
+        assert_eq!(alloc.type_stats(other), TypeStats::default());
+
+        // SAFETY: the live grown block, freed exactly once with its layout.
+        unsafe { alloc.dealloc_typed(msg, grown, layout(4097, 16)) };
+        assert_eq!(alloc.stats().live_bytes, 0);
+        assert_eq!(alloc.type_stats(msg).blocks, 0);
+        assert_eq!(alloc.type_stats(msg).bytes, 0);
+    }
+
+    #[test]
+    fn alloc_unsized_round_trips_at_the_minimum_alignment() {
+        let alloc = allocator();
+        let ty = type_id("MSG");
+        for size in [0usize, 1, 63, 64, 65, 1024, 4097] {
+            let ptr = alloc.alloc_unsized(ty, size).expect("alloc_unsized");
+            assert_eq!(ptr.as_ptr() as usize % MIN_ALIGN, 0, "size {size}");
+            if size > 0 {
+                // SAFETY: `size` writable bytes in a live allocation.
+                unsafe { core::ptr::write_bytes(ptr.as_ptr(), 0xAB, size) };
+            }
+            assert_eq!(alloc.type_stats(ty).blocks, 1);
+            let before = alloc.stats();
+            assert_eq!(before.live_blocks, 1);
+            // SAFETY: the live typed allocation, freed exactly once without a layout.
+            unsafe { alloc.dealloc_unsized(ty, ptr) };
+            let after = alloc.stats();
+            assert_eq!(after.live_blocks, 0, "size {size}");
+            assert_eq!(after.live_bytes, 0, "size {size}");
+            // The slot's block/byte counters return to zero; the high-water mark is
+            // the per-type history and is kept.
+            assert_eq!(alloc.type_stats(ty).blocks, 0, "size {size}");
+            assert_eq!(alloc.type_stats(ty).bytes, 0, "size {size}");
+            assert!(alloc.type_stats(ty).peak_bytes > 0, "size {size}");
+        }
+        let stats = alloc.stats();
+        assert_eq!(stats.live_bytes, 0);
+        // The over-threshold last request owned a dedicated carrier that went back to
+        // the OS; the slab carriers the smaller requests mapped stay (M1 policy).
+        assert_eq!(stats.sbc_carriers, 0);
+        assert_eq!(stats.carriers, stats.sbc_carriers + stats.mbc_carriers);
+    }
+
+    #[test]
+    fn dealloc_unsized_recovers_every_supported_alignment() {
+        let alloc = allocator();
+        let ty = type_id("HEAP");
+        // Over-aligned requests take the large (dedicated single-block carrier) path,
+        // whose payload offset differs per alignment; the plain size takes the slab
+        // path (offset zero).
+        for align in [16usize, 32, 64, 256, 4096] {
+            let l = layout(2000, align);
+            let ptr = alloc.alloc_typed(ty, l).expect("alloc");
+            assert_eq!(ptr.as_ptr() as usize % align, 0, "align {align}");
+            // SAFETY: the live typed allocation, freed exactly once without a layout.
+            unsafe { alloc.dealloc_unsized(ty, ptr) };
+            assert_eq!(alloc.stats().live_blocks, 0, "align {align}");
+        }
+        let l = layout(64, 16);
+        let slab = alloc.alloc_typed(ty, l).expect("slab alloc");
+        // SAFETY: as above.
+        unsafe { alloc.dealloc_unsized(ty, slab) };
+        let stats = alloc.stats();
+        assert_eq!(stats.live_bytes, 0);
+        // Every dedicated carrier went back to the OS; only the slab carrier the last
+        // (multi-block) allocation mapped is retained.
+        assert_eq!(stats.sbc_carriers, 0);
+        assert_eq!(stats.mbc_carriers, 1);
+        assert_eq!(stats.carriers, stats.sbc_carriers + stats.mbc_carriers);
+        assert_eq!(alloc.type_stats(ty).blocks, 0);
+        assert_eq!(alloc.type_stats(ty).bytes, 0);
+    }
+
+    #[test]
+    fn dealloc_unsized_leaves_a_foreign_pointer_alone() {
+        let alloc = allocator();
+        let ty = type_id("MSG");
+        let live = alloc.alloc_typed(ty, layout(64, 16)).expect("alloc");
+        // A zeroed buffer big enough that even the widest probe reads inside it: the
+        // pointer sits 32 KiB in, and the probe reaches at most `os_page_size()` below.
+        let buffer = vec![0u8; 64 * 1024];
+        let bogus = NonNull::new(unsafe { buffer.as_ptr().add(32 * 1024) as *mut u8 })
+            .expect("non-null");
+        let before = alloc.stats();
+        // SAFETY: `bogus` is not a block this allocator handed out; the call must
+        // detect that (every candidate header is zeroed, hence no size) and leave the
+        // allocator's state untouched.
+        unsafe { alloc.dealloc_unsized(ty, bogus) };
+        assert_eq!(alloc.stats(), before);
+        assert_eq!(alloc.type_stats(ty).blocks, 1);
+        // SAFETY: the live typed allocation, freed exactly once.
+        unsafe { alloc.dealloc_unsized(ty, live) };
+        assert_eq!(alloc.stats().live_bytes, 0);
+    }
+
+    #[test]
+    fn the_dealloc_probe_is_bounded_and_uses_distinct_payload_offsets() {
+        let aligns: Vec<usize> = probe_alignments().collect();
+        assert_eq!(aligns.first().copied(), Some(MIN_ALIGN));
+        assert_eq!(aligns.last().copied(), Some(os_page_size()));
+        // Exactly one candidate per payload offset: 1 + log2(page / UNIT_SIZE).
+        assert_eq!(
+            aligns.len(),
+            1 + (os_page_size() / MIN_ALIGN).ilog2() as usize
+        );
+        assert!(aligns.len() <= 1 + 16, "the probe stays small");
+        assert!(aligns.iter().all(|a| a.is_power_of_two() && *a <= os_page_size()));
+        assert!(aligns.windows(2).all(|w| w[1] == w[0] * 2));
+        let offsets: Vec<usize> = aligns.iter().map(|a| padding_for(*a)).collect();
+        let mut unique = offsets.clone();
+        unique.sort_unstable();
+        unique.dedup();
+        assert_eq!(
+            unique.len(),
+            offsets.len(),
+            "payload offsets must be pairwise distinct"
+        );
+    }
+
+    #[test]
+    fn carriers_split_into_sbc_and_mbc_and_the_totals_agree() {
+        let alloc = allocator();
+        let ty = type_id("MSG");
+        let baseline = alloc.stats();
+        assert_eq!(baseline.carriers, baseline.sbc_carriers + baseline.mbc_carriers);
+
+        // A slab request maps one multi-block carrier.
+        let small = alloc.alloc_typed(ty, layout(64, 16)).expect("slab alloc");
+        let after_slab = alloc.stats();
+        assert_eq!(after_slab.mbc_carriers, baseline.mbc_carriers + 1);
+        assert_eq!(after_slab.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after_slab.carriers, baseline.carriers + 1);
+        assert_eq!(
+            after_slab.carriers,
+            after_slab.sbc_carriers + after_slab.mbc_carriers
+        );
+        assert!(after_slab.carrier_bytes > baseline.carrier_bytes);
+
+        // A request past the size-class threshold maps a dedicated single-block
+        // carrier.
+        let large = alloc.alloc_typed(ty, layout(4097, 16)).expect("large alloc");
+        let after_large = alloc.stats();
+        assert_eq!(after_large.sbc_carriers, baseline.sbc_carriers + 1);
+        assert_eq!(after_large.mbc_carriers, after_slab.mbc_carriers);
+        assert_eq!(after_large.carriers, after_slab.carriers + 1);
+        assert_eq!(
+            after_large.carriers,
+            after_large.sbc_carriers + after_large.mbc_carriers
+        );
+        let peak = after_large.peak_carrier_bytes;
+        assert!(peak >= after_large.carrier_bytes);
+
+        // Freeing it releases exactly the single-block carrier (the slab carrier is
+        // retained, the M1 policy), and the aggregate follows the split.
+        // SAFETY: the live large typed allocation, freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, large, layout(4097, 16)) };
+        let after_free = alloc.stats();
+        assert_eq!(after_free.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after_free.mbc_carriers, baseline.mbc_carriers + 1);
+        assert_eq!(after_free.carriers, baseline.carriers + 1);
+        assert_eq!(
+            after_free.carriers,
+            after_free.sbc_carriers + after_free.mbc_carriers
+        );
+        assert!(after_free.carrier_bytes < after_large.carrier_bytes);
+        assert_eq!(after_free.peak_carrier_bytes, peak);
+
+        // SAFETY: the remaining live typed allocation, freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, small, layout(64, 16)) };
+        let done = alloc.stats();
+        // The slab carrier is retained even once fully free (the M1 policy), so only
+        // the split invariant is testable here.
+        assert_eq!(done.mbc_carriers, baseline.mbc_carriers + 1);
+        assert_eq!(done.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(done.carriers, baseline.carriers + 1);
+        assert_eq!(done.carriers, done.sbc_carriers + done.mbc_carriers);
+    }
+
+    #[test]
+    fn allocator_info_lists_the_rows_of_every_type_bound_to_the_allocator() {
+        use crate::stats::InfoValue;
+
+        let config = AllocatorConfig::builder()
+            .name(AllocatorId::EHeap.as_str())
+            .carrier_size(64 * 1024)
+            .build();
+        let alloc = CarrierAllocator::new(config).expect("allocator");
+        let heap = type_id("HEAP");
+        let l = layout(64, 16);
+        let ptr = alloc.alloc_typed(heap, l).expect("alloc");
+
+        let info = alloc.allocator_info();
+        assert_eq!(info.name, "eheap_alloc");
+        let bound = crate::types::types_for_allocator(AllocatorId::EHeap).count();
+        assert_eq!(info.items.len(), 13 + 4 * bound);
+        assert_eq!(info.items[0].key, "blocks");
+
+        // Every type bound to `eheap_alloc` gets a four-item row set; exactly the one
+        // that was allocated for is non-zero.
+        let mut non_zero = 0usize;
+        let mut seen_heap = false;
+        for row in info.items[13..].chunks_exact(4) {
+            assert_eq!(row[0].key, "type");
+            assert_eq!(row[1].key, "type blocks");
+            assert_eq!(row[2].key, "type bytes");
+            assert_eq!(row[3].key, "type peak_bytes");
+            let InfoValue::Text(name) = row[0].value else {
+                panic!("the type header must be text");
+            };
+            let expected = alloc.type_stats(type_id(name));
+            assert_eq!(row[1].value, InfoValue::U64(expected.blocks), "{name}");
+            assert_eq!(row[2].value, InfoValue::Usize(expected.bytes), "{name}");
+            assert_eq!(row[3].value, InfoValue::Usize(expected.peak_bytes), "{name}");
+            if expected.blocks > 0 {
+                non_zero += 1;
+                assert_eq!(name, "HEAP");
+                seen_heap = true;
+            }
+        }
+        assert!(seen_heap, "the allocated-for type must appear");
+        assert_eq!(non_zero, 1, "only the allocated-for type is charged");
+
+        // SAFETY: the live typed allocation, freed exactly once.
+        unsafe { alloc.dealloc_typed(heap, ptr, l) };
+    }
+
+    #[test]
+    fn a_directly_constructed_allocator_reports_no_type_rows() {
+        let alloc = allocator();
+        let info = alloc.allocator_info();
+        // The configured name is not a declared `AllocatorId`, so there is no type
+        // listing to add — and the per-allocator items are still complete.
+        assert_eq!(info.name, "test");
+        assert_eq!(info.items.len(), 13);
+        assert_eq!(info.items[0].key, "blocks");
+        assert_eq!(info.items[2].key, "carriers");
+        assert_eq!(info.items[4].key, "sbcs carriers");
+        assert_eq!(info.items[5].key, "mbcs carriers");
+    }
+
+    #[test]
+    fn the_typed_defaults_forward_to_the_untyped_methods() {
+        let inner = allocator().share();
+        let subject = Forwarding {
+            inner,
+            allocs: std::sync::atomic::AtomicUsize::new(0),
+        };
+        assert_eq!(subject.name(), "forwarding");
+        let ty = type_id("MSG");
+        let l = layout(64, 16);
+
+        // `alloc_unsized` -> `alloc_bytes` -> `alloc`.
+        let ptr = subject.alloc_unsized(ty, 64).expect("alloc_unsized");
+        assert_eq!(
+            subject.allocs.load(std::sync::atomic::Ordering::Relaxed),
+            1,
+            "the default must forward to `alloc`"
+        );
+        // A default that records no type data reports the zero value.
+        assert_eq!(subject.type_stats(ty), TypeStats::default());
+        // ... and a default report carries the per-allocator items only.
+        let info = subject.allocator_info();
+        assert_eq!(info.name, "forwarding");
+        assert_eq!(info.items.len(), 13);
+
+        // The default `dealloc_unsized` probe recognises the block through its in-band
+        // header and forwards to `dealloc`.
+        // SAFETY: the live allocation, freed exactly once through the default.
+        unsafe { subject.dealloc_unsized(ty, ptr) };
+        assert_eq!(subject.stats().live_bytes, 0);
+        assert_eq!(subject.stats().live_blocks, 0);
+
+        // `alloc_typed`/`realloc_typed`/`dealloc_typed` forward too.
+        let typed = subject.alloc_typed(ty, l).expect("alloc_typed");
+        let grown = subject
+            .realloc_typed(ty, typed, l, 128)
+            .expect("realloc_typed");
+        // SAFETY: the live (possibly moved) allocation, freed exactly once.
+        unsafe { subject.dealloc_typed(ty, grown, layout(128, 16)) };
+        assert_eq!(subject.stats().live_bytes, 0);
+    }
 }
