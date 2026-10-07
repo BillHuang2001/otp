@@ -298,16 +298,28 @@ fn kv_for_raw(boxed: *mut HashPairs, idx: usize) -> *mut ERL_NIF_TERM {
 ///
 /// # Safety
 ///
-/// `iter` must be a live iterator previously positioned by [`enif_map_iterator_create`]; after the
-/// call its hash-arm cache (if any) is released and must not be used.
+/// `iter` must be null, or point at a live, exclusively-borrowed iterator (a zeroed *never created*
+/// one is fine, as is a second call on an already destroyed one — both are a no-op). After the call
+/// its hash-arm cache (if any) is released and must not be used.
 #[no_mangle]
 pub unsafe extern "C" fn enif_map_iterator_destroy(env: *mut ErlNifEnv, iter: *mut ErlNifMapIterator) {
     let _ = env;
     let Some(it) = (unsafe { iter_mut(iter) }) else {
         return;
     };
-    // SAFETY: `it.map` is the caller's iterator field (a term word for a created iterator).
-    if !(unsafe { prelude::is_hashmap(t(it.map)) }) {
+    // SAFETY: `it.map` is the caller's iterator field.
+    let m = t(it.map);
+    // The same live-term guard the sibling paths apply (`iter_is_flat`, `create`): an all-zero
+    // (never created / already released) or hand-built iterator holds a non-term `map` word, and the
+    // C's `is_boxed` bit trick classifies the raw word `0` as *boxed*, so an unguarded `is_hashmap`
+    // would dereference a null pointer (the `ASSERT(is_flatmap(iter->map))` at `erl_nif.c:3838` in
+    // the C). A non-term map owns no cache, so there is nothing to release — this keeps `destroy`
+    // idempotent and safe on a never-created iterator, as the module docs promise.
+    if !is_term_word(m) {
+        return;
+    }
+    // SAFETY: `m` is a term word (checked above) belonging to the caller's iterator.
+    if !(unsafe { prelude::is_hashmap(m) }) {
         // The flat arm owns nothing — the C's `ASSERT(is_flatmap(iter->map))` (`erl_nif.c:3838`).
         return;
     }

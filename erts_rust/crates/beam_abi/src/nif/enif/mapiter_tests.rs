@@ -216,6 +216,139 @@ fn key() -> ERL_NIF_TERM {
     ERL_NIF_TERM::default()
 }
 
+/// An **all-zero** iterator — exactly the state `memset(&it, 0, sizeof(it))` leaves the C fixture's
+/// stack local in (and the state a never-touched NIF stack local is in). Note that
+/// `ErlNifMapIterator::default()` is *not* this: `ERL_NIF_TERM::default()` is `NIL` (an immediate, so
+/// the pre-fix `destroy` took the flat arm and only the `map == 0` word provoked the null read).
+fn zeroed_iter() -> ErlNifMapIterator {
+    // SAFETY: all-bits-zero is a valid `ErlNifMapIterator` — every field is an integer or a raw
+    // pointer (map/size/idx are `ERL_NIF_TERM` = one machine word; both union arms are pairs of raw
+    // pointers; `__spare__` is raw pointers). Nothing is dereferenced by the `memcpy`.
+    unsafe { core::mem::zeroed() }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Regression: `destroy` on a never-created (or already destroyed) iterator — the null-deref bug
+// ---------------------------------------------------------------------------------------------
+//
+// `enif_map_iterator_destroy` used to test `is_hashmap(it.map)` *without* the `is_term_word` guard
+// the sibling read paths apply (`iter_is_flat`, `create`). The C's `is_boxed` bit trick (`erl_term.h`)
+// classifies the primary tag `0` as *boxed*, so an all-zero iterator (`map == 0`, what `memset`/a NIF
+// stack local starts as) made `is_hashmap` read the header through a **null pointer**: an abort under
+// `debug_assertions` and UB in release. `create` on a non-map leaves `it.map` untouched, so the same
+// path was reachable from a NIF that created the iterator on a non-map too. The module docs promise
+// `destroy` is idempotent, so all of these must be safe no-ops.
+
+#[test]
+fn destroy_on_a_never_created_iterator_is_a_safe_noop() {
+    let mut iter = zeroed_iter();
+    assert_eq!(
+        iter.map.raw(),
+        0,
+        "the all-zero struct a NIF stack local starts as (`memset` in the C fixture)"
+    );
+    // SAFETY: `iter` is a live, unaliased, zeroed iterator; `destroy` tolerates a non-term `map`
+    // (nothing was created, so there is no cache to release).
+    unsafe {
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        // ...and it stays a no-op on every subsequent call (the documented idempotency).
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        // The rest of the family keeps working on the same iterator: the read paths guard the map
+        // too (`iter_is_flat` rejects the non-term word), so it falls to the hash arm, where the C's
+        // own predicates are `idx == 0` for head and `idx > size` for tail.
+        assert_eq!(enif_map_iterator_is_head(null_mut(), &mut iter), 1);
+        assert_eq!(enif_map_iterator_is_tail(null_mut(), &mut iter), 0);
+        assert_eq!(
+            enif_map_iterator_get_pair(null_mut(), &mut iter, &mut key(), &mut key()),
+            0
+        );
+        // A `create` that *refuses* (a non-map) leaves `it.map` untouched, so the very same
+        // never-created state is what a refused `create` hands back to `destroy`.
+        assert_eq!(
+            enif_map_iterator_create(
+                null_mut(),
+                nif_from_eterm(make_small(7)),
+                &mut iter,
+                ErlNifMapIteratorEntry::First
+            ),
+            0
+        );
+        assert_eq!(iter.map.raw(), 0);
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        // A null iterator is the other tolerated operand (`iter_mut` returns `None`).
+        enif_map_iterator_destroy(null_mut(), null_mut());
+        // A default-constructed (`map == NIL`) iterator is a further never-created shape.
+        let mut nil_iter = fresh_iter();
+        enif_map_iterator_destroy(null_mut(), &mut nil_iter);
+        enif_map_iterator_destroy(null_mut(), &mut nil_iter);
+    }
+}
+
+#[test]
+fn destroy_tolerates_a_hand_built_non_term_map_word() {
+    // The C's `DEBUG` `destroy` writes `iter->map = THE_NON_VALUE` and leaves the cache dangling; a
+    // reader of such a struct (or merely an uninitialised one) reaches `destroy` with a non-term map
+    // word that is *not* zero. `is_term_word` rejects it — pre-fix its primary tag `HEADER` was still
+    // classified as boxed and dereferenced at that garbage address.
+    //
+    // `make_header(0, FLOAT_SUBTAG)` is exactly `THE_NON_VALUE` in a debug build
+    // (`beam_term::ops::THE_NON_VALUE` is zero in release), and is spelled out here so the case is
+    // a non-zero non-term word under *both* profiles.
+    let non_term = nif_from_eterm(prelude::make_header(0, prelude::FLOAT_SUBTAG));
+    let mut iter = fresh_iter();
+    iter.map = non_term;
+    assert_ne!(iter.map.raw(), 0, "the hand-built word is a non-zero non-term");
+    // SAFETY: `iter` is live and unaliased; `destroy` tolerates a non-term `map`.
+    unsafe {
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+    }
+    // The word is left alone (there is nothing to release, exactly as for the flat arm).
+    assert_eq!(iter.map, non_term);
+}
+
+#[test]
+fn destroy_releases_the_hash_cache_exactly_once() {
+    let mut arena = Arena::new(1 << 20);
+    let hash = arena.map(MAP_SMALL_MAP_LIMIT + 8);
+    let flat = arena.map(4);
+    let mut iter = fresh_iter();
+    // SAFETY: `iter` is live and unaliased.
+    unsafe {
+        // The hash arm owns the `Box<HashPairs>` cache: the first `destroy` releases it (and nulls
+        // the handle *first*), the second must not free it again (a double free in the C).
+        assert_eq!(
+            enif_map_iterator_create(
+                null_mut(),
+                nif_from_eterm(hash),
+                &mut iter,
+                ErlNifMapIteratorEntry::First
+            ),
+            1
+        );
+        assert!(!iter.u.hash.wstack.is_null());
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        assert!(
+            iter.u.hash.wstack.is_null(),
+            "the handle is nulled before the cache is released"
+        );
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        // The flat arm owns nothing at all: every `destroy` is a no-op.
+        assert_eq!(
+            enif_map_iterator_create(
+                null_mut(),
+                nif_from_eterm(flat),
+                &mut iter,
+                ErlNifMapIteratorEntry::First
+            ),
+            1
+        );
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+        enif_map_iterator_destroy(null_mut(), &mut iter);
+    }
+}
 #[test]
 fn next_and_prev_report_the_c_counters() {
     let mut arena = Arena::new(1024);
