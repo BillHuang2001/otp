@@ -511,7 +511,7 @@ fn for_process_reports_a_missing_process_as_the_typed_capability_gap() {
 
 #[test]
 fn the_record_source_predicate_selects_only_its_own_bif() {
-    // Exactly one of the four mutually exclusive bridges is installed per call, so the
+    // Exactly one of the five mutually exclusive bridges is installed per call, so the
     // predicates must be pairwise disjoint for the name each one claims.
     assert!(RuntimeContext::uses_record_source(
         "records",
@@ -524,6 +524,7 @@ fn the_record_source_predicate_selects_only_its_own_bif() {
         ("recs", "get_definition", 2),
         ("erlang", "load_nif", 2),
         ("erlang", "get", 1),
+        ("erlang", "send", 2),
     ] {
         assert!(
             !RuntimeContext::uses_record_source(module, function, arity),
@@ -541,6 +542,41 @@ fn the_record_source_predicate_selects_only_its_own_bif() {
         "get_definition",
         2
     ));
+}
+
+#[test]
+fn the_send_predicate_selects_only_the_message_sending_bifs() {
+    // The fifth bridge (`SendBridge`, the delivery seam) is installed for the two names
+    // `beam_bifs` registers under **one** implementation — `erlang:send/2` and
+    // `erlang:'!'/2` (`../beam_bifs/src/proc.rs`) — and nothing else.
+    assert!(RuntimeContext::uses_send_hook("erlang", "send", 2));
+    assert!(RuntimeContext::uses_send_hook("erlang", "!", 2));
+    for (module, function, arity) in [
+        ("erlang", "send", 1),
+        ("erlang", "send", 3),
+        ("erlang", "send_after", 3),
+        ("erlang", "send_nosuspend", 2),
+        ("erlang", "self", 0),
+        ("erlang", "!", 1),
+        ("erlang", "!", 3),
+        ("lists", "send", 2),
+        ("erlang", "get", 1),
+        ("erlang", "load_nif", 2),
+        ("records", "get_definition", 2),
+    ] {
+        assert!(
+            !RuntimeContext::uses_send_hook(module, function, arity),
+            "{module}:{function}/{arity}"
+        );
+    }
+    // Pairwise disjoint with the other four arms: `send/2` needs the delivery bridge (it
+    // borrows the whole runtime) and neither a dictionary, a NIF loader, a record source
+    // nor the fun caller.
+    for (function, arity) in [("send", 2), ("!", 2)] {
+        assert!(!RuntimeContext::uses_dict("erlang", function, arity));
+        assert!(!RuntimeContext::uses_nif_loader("erlang", function, arity));
+        assert!(!RuntimeContext::uses_record_source("erlang", function, arity));
+    }
 }
 
 #[test]

@@ -63,10 +63,10 @@ use std::sync::Arc;
 
 use beam_abi::nif::loader::NifCallError;
 use beam_bifs::{BifContext, OutputSink};
-use beam_common::{BeamError, Result};
+use beam_common::{AllocKind, BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
-use beam_message::{Message, Queue};
+use beam_message::{Fragments, HeapFragment, Message, OffHeapTable, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::Eterm;
 
@@ -78,7 +78,8 @@ use crate::runtime::Runtime;
 
 pub(crate) use self::bridges::PendingInterner;
 use self::bridges::{
-    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SharedSink,
+    descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
+    SharedSink,
 };
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
@@ -220,6 +221,62 @@ impl<'a> RuntimeContext<'a> {
     /// own); the scan state lives in [`Runtime::mailboxes`](crate::runtime::Runtime).
     /// They are disjoint, so both are handed out mutably at once. A pid with no process
     /// is the typed [`crate::error::no_mailbox`] capability gap.
+    /// Delivers `message` into `to`'s mailbox through the **heap-fragment** model — the
+    /// sender half of the C `erts_try_alloc_message_on_heap`/`new_message_buffer` path
+    /// (`erl_message.c:622-691`), reached when the receiver's own heap cannot hold the
+    /// payload (`../../erts/emulator/beam/erl_message.c`).
+    ///
+    /// The payload is copied into a fresh [`HeapFragment`] sized to hold all of it, the
+    /// fragment is pushed onto a [`Fragments`] chain, and the enqueued [`Message`] owns
+    /// that chain, so its [`payload`](Message::payload) has a stable home the receiver's
+    /// heap is not involved in. The off-heap objects the payload references are refcounted
+    /// into the **fragment's** table (a fresh [`OffHeapTable`] as the copy's source — the
+    /// same empty source [`beam_process`]'s own delivery uses), so the fragment owns them.
+    ///
+    /// The recipient is woken exactly as the ordinary path wakes it, except that the wake
+    /// cannot go through the process table's wake list (that list is filled by
+    /// `ProcessTable::deliver`, which this path deliberately bypasses): it is recorded on
+    /// [`Runtime::note_fragment_wake`] instead, and
+    /// [`Runtime::scheduler_pass`](crate::runtime::Runtime) absorbs it into the real run
+    /// queue at the same points it absorbs the table's own wake list.
+    ///
+    /// # Why this is not `beam_message::send_fragmented`
+    ///
+    /// `send_fragmented` wants the receiver's **heap** *and* its **mailbox** at the same
+    /// time, but [`beam_process::Process`] exposes them only through two `&mut self`
+    /// accessors ([`heap_mut`](beam_process::Process::heap_mut) /
+    /// [`mailbox_mut`](beam_process::Process::mailbox_mut)) — no split borrow — so the two
+    /// cannot be handed out of `beam_rt` together. This method therefore composes the same
+    /// public [`beam_message`] fragment primitives the function itself composes (the
+    /// message is already known not to fit, so its preflight attempt is redundant anyway);
+    /// see the crate `CONTEXT.md` handoff for the seam that would let it be deleted.
+    fn send_fragmented_message(&mut self, to: ProcessId, from: Eterm, message: Eterm) -> Result<()> {
+        // A fragment sized to hold the whole payload (the C sizes `new_message_buffer` the
+        // same way). `size_object` is > 0 for any payload that failed the preflight.
+        let mut fragment = HeapFragment::new(beam_term::size_object(message))?;
+        // An empty source off-heap table: the sender's term carries no off-heap slot this
+        // runtime can resolve (the engine seam hands over only the term), exactly as
+        // `deliver_simple` assumes.
+        let source = OffHeapTable::new();
+        let root = fragment.copy_root(message, &source)?;
+        let mut fragments = Fragments::new();
+        fragments.push(fragment);
+        let woken = {
+            let process = self
+                .process_table_mut()
+                .get_mut(to)
+                .ok_or(BeamError::TermNotFound)?;
+            process
+                .mailbox_mut()
+                .enqueue(Message::new(root, from).with_fragments(fragments));
+            process.wake()
+        };
+        if woken {
+            self.runtime.note_fragment_wake(to);
+        }
+        Ok(())
+    }
+
     fn mailbox_parts(&mut self) -> Result<(&mut Queue, &mut MailboxState)> {
         let pid = self.mailbox_pid;
         let Runtime {
@@ -273,10 +330,13 @@ impl<'a> RuntimeContext<'a> {
     /// `index` is a position in the FIFO order [`RuntimeContext::mailbox_messages`]
     /// reports; an index past the end removes nothing (the same safe no-op the queue's own
     /// `remove_at` implements for a past-the-end cursor).
+    ///
+    /// The removal goes through [`MailboxState::remove_at`], so a message whose payload
+    /// lives in a heap fragment keeps it alive (`MailboxState::remove` explains why).
     pub(crate) fn remove_mailbox_message(&mut self, index: usize) -> Result<()> {
         let (queue, state) = self.mailbox_parts()?;
         let cursor = queue.cursor_at(index);
-        queue.remove_at(cursor);
+        state.remove_at(queue, cursor);
         state.reset(queue);
         Ok(())
     }
@@ -408,6 +468,10 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is `records:get_definition/2`, which needs the record-source bridge
         // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
         let uses_record_source = Self::uses_record_source(module, function, arity);
+        // Whether this is `erlang:send/2`/`erlang:'!'/2`, which need the message-delivery
+        // bridge (a fifth arm: it borrows the whole `Runtime` like the fun-caller bridge, and
+        // the two cannot co-exist — see [`SendBridge`]).
+        let uses_send_hook = Self::uses_send_hook(module, function, arity);
         // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
         // distribution), read from the shared table *before* it is borrowed by the context.
         // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
@@ -520,6 +584,32 @@ impl<'a> RuntimeContext<'a> {
                     context = context.with_tables(tables);
                 }
                 registry.call(module, function, arity, &mut context, args)
+            } else if uses_send_hook {
+                // `erlang:send/2`/`erlang:'!'/2` (`SendBridge`): the delivery bridge borrows the
+                // whole `Runtime` (it delegates to the existing `RuntimeContext::send_message`
+                // path, so nothing about delivery is re-implemented), making it mutually
+                // exclusive with the fun-caller/dict/NIF/record arms. A `send` applies no fun
+                // argument and touches no dictionary, so nothing is lost.
+                let mut bridge = SendBridge {
+                    runtime,
+                    output: output.clone(),
+                    mailbox_pid: *mailbox_pid,
+                    mailbox_table: mailbox_table.as_deref_mut(),
+                    may_pump_scheduler: *may_pump_scheduler,
+                    current_module: caller_module,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_sender(&mut bridge)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
             } else {
                 // The bridge gets its own clone of the shared sink, so a `fun` a BIF applies
                 // writes to the caller's sink (not stdout) — see `SharedSink`/`FunBridge`. It
@@ -589,7 +679,7 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge needs `&mut Runtime` to store the loaded library, so it cannot co-exist with
     /// [`FunBridge`]'s `&mut Runtime` borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the three. `load_nif/2` takes no fun
+    /// [`Self::call_registered`] installs exactly one of the five. `load_nif/2` takes no fun
     /// argument and no dictionary, so nothing is lost.
     fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
         matches!((module, function, arity), ("erlang", "load_nif", 2))
@@ -600,10 +690,32 @@ impl<'a> RuntimeContext<'a> {
     ///
     /// The bridge borrows the code server's module map (`&Runtime`), so it cannot co-exist
     /// with [`FunBridge`]'s `&mut Runtime` or [`DictBridge`]'s `&mut ProcessTable` borrow —
-    /// [`Self::call_registered`] installs exactly one of the four. `get_definition/2` takes no
+    /// [`Self::call_registered`] installs exactly one of the five. `get_definition/2` takes no
     /// fun argument and no dictionary, so nothing is lost.
     fn uses_record_source(module: &str, function: &str, arity: u32) -> bool {
         matches!((module, function, arity), ("records", "get_definition", 2))
+    }
+
+    /// Whether `(module, function, arity)` is a message-sending BIF that must run against the
+    /// [`SendBridge`] (the delivery seam).
+    ///
+    /// `erlang:send/2` and `erlang:'!'/2` are the *same* `beam_bifs` implementation, which
+    /// delivers through the [`SendHook`](beam_bifs::SendHook) (`beam_bifs/src/proc.rs`) — it
+    /// cannot reach a mailbox itself (workspace `CONTEXT.md` §3: an uninstalled hook raises
+    /// `unsupported_bif` rather than dropping the message). The bridge borrows the whole
+    /// `Runtime` (it delegates to [`RuntimeContext::send_message`]), so it cannot co-exist with
+    /// [`FunBridge`]'s borrow or [`DictBridge`]'s `&mut ProcessTable` borrow —
+    /// [`Self::call_registered`] installs exactly one of the five. A `send` applies no fun
+    /// argument and touches no dictionary, so nothing is lost.
+    ///
+    /// The compiled `Dest ! Msg` operator does **not** come through here: the BEAM compiler
+    /// emits the `send` instruction, served by
+    /// [`ExecutionContext::send_message`](beam_engine::ExecutionContext::send_message)
+    /// directly. This predicate is for the `erlang:send/2`/`erlang:'!'/2` *BIF call* — which is
+    /// what `erlang:send(Pid, Msg)` compiles to, and what the `-eval` evaluator dispatches for
+    /// the same call.
+    fn uses_send_hook(module: &str, function: &str, arity: u32) -> bool {
+        matches!((module, function, arity), ("erlang", "send", 2) | ("erlang", "!", 2))
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
@@ -806,14 +918,27 @@ impl ExecutionContext for RuntimeContext<'_> {
     /// scheduler loop, so nothing enqueues the woken process here — which is why a
     /// self-delivery is the `Enqueued` case this crate relies on.
     ///
+    /// **A payload the recipient's heap cannot hold does not fail**: the copy engine
+    /// preflights the receiver's young heap and reports
+    /// [`Alloc(AllocKind::Message)`](beam_common::BeamError::Alloc) for a message larger
+    /// than it, exactly as the C `erts_try_alloc_message_on_heap` does. That case is
+    /// retried through the **heap-fragment** model ([`Self::send_fragmented_message`]),
+    /// which is how the real system delivers a large message at all. Any other failure is
+    /// propagated untouched, and the ordinary (small-payload) path is unchanged.
+    ///
     /// [`DeliverOutcome::Woke`]: beam_process::DeliverOutcome::Woke
     fn send_message(&mut self, to: Eterm, message: Eterm) -> Result<()> {
         let to = ProcessId::from_eterm(to)?;
         let from = self.mailbox_pid.to_eterm();
         // `deliver_simple` pushes a woken recipient onto the table's wake list, so the
         // wake survives for the scheduler pass; the outcome itself needs no action here.
-        let _outcome = self.process_table_mut().deliver_simple(to, from, message)?;
-        Ok(())
+        match self.process_table_mut().deliver_simple(to, from, message) {
+            Ok(_outcome) => Ok(()),
+            Err(BeamError::Alloc(failure)) if failure.kind == AllocKind::Message => {
+                self.send_fragmented_message(to, from, message)
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// `loop_rec`: the candidate at the current mailbox scan position, `Ok(None)` when

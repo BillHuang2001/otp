@@ -2203,13 +2203,13 @@ mod tests {
 
     #[test]
     fn a_capability_gap_is_uncatchable() {
-        // `erlang:send/2` has no delivery hook in `-eval`, so it raises the
-        // `unsupported_bif` capability gap. A `try`/`catch` in the expression must
-        // NOT turn that into an apparent exception: it propagates out (classified by
+        // `erlang:statistics/1` is a known-but-unimplemented BIF, so it raises the
+        // `unsupported` capability gap. A `try`/`catch` in the expression must NOT turn
+        // that into an apparent exception: it propagates out (classified by
         // `unsupported_reason`) so the CLI exits 3 with `beam_rt: unsupported: …`.
         for expr in [
-            "try erlang:send(self(), hello) catch _:_ -> 0 end",
-            "try (erlang:send(self(), hello)) of V -> V catch C:R -> ok end",
+            "try erlang:statistics(wall_clock) catch _:_ -> 0 end",
+            "try (erlang:statistics(wall_clock)) of V -> V catch C:R -> ok end",
         ] {
             let error = run(expr).expect_err("a capability gap propagates");
             assert!(
@@ -2217,6 +2217,14 @@ mod tests {
                 "{expr}: {error}"
             );
         }
+
+        // `erlang:send/2` by contrast is **served** now that the runtime installs the
+        // delivery hook (`context::bridges::SendBridge`), so it is an ordinary, catchable
+        // send: `erlang:send(self(), hello), receive X -> X end` ⇒ `hello`.
+        atom(
+            "begin erlang:send(self(), hello), receive X -> X end end",
+            "hello",
+        );
     }
 
     #[test]

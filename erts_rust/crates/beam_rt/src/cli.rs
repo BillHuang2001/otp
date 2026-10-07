@@ -12,8 +12,13 @@
 //! | `-pa Dir` | add `Dir` to the code path (searched **before** `-pz` directories) |
 //! | `-pz Dir` | add `Dir` to the code path (searched after) |
 //! | `+S N[:N]` | normal scheduler count (the first number) |
+//! | `-smp enable\|disable\|auto` | SMP scheduler model (only `disable` changes behaviour) |
 //! | `+A N` | async-thread pool size, preserved verbatim in `extra_emulator_flags` |
 //! | `+P N` | maximum number of processes |
+//! | `+hms N` | minimum heap size, in words (rounded through the growth table) |
+//! | `+hmbs N` | minimum binary virtual heap size, in words (likewise rounded) |
+//! | `+hmax N` | maximum heap size, in words (`0` = unlimited) |
+//! | `+hmaxk B` / `+hmaxel B` / `+hmaxib B` | the `+hmax` kill / error-logger / shared-binary flags (`true`\|`false`) |
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
 //!
@@ -68,10 +73,12 @@
 use std::path::{Path, PathBuf};
 
 use beam_common::{BeamError, Result};
-use beam_term::Eterm;
+use beam_term::{Eterm, MAX_SMALL};
 
 use crate::boot;
-use crate::config::{Action, ArgTerm, EmulatorConfig, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS};
+use crate::config::{
+    Action, ArgTerm, EmulatorConfig, HeapOptions, InitArgs, RuntimeConfig, DEFAULT_HEAP_WORDS,
+};
 use crate::error;
 use crate::runtime::Runtime;
 
@@ -88,8 +95,15 @@ Switches:
   -pa DIR                   add DIR to the code path (searched before -pz dirs)
   -pz DIR                   add DIR to the code path (searched after -pa dirs)
   +S N[:N]                  number of normal schedulers
+  -smp enable|disable|auto  SMP scheduler model (only 'disable' changes behaviour)
   +A N                      async-thread pool size (preserved verbatim)
   +P N                      maximum number of processes
+  +hms N                    minimum heap size, in words
+  +hmbs N                   minimum binary virtual heap size, in words
+  +hmax N                   maximum heap size, in words (0 = unlimited)
+  +hmaxk true|false         kill the process at +hmax (default true)
+  +hmaxel true|false        log an error report at +hmax (default true)
+  +hmaxib true|false        count shared binaries towards +hmax (default false)
   -name N, -sname N         distribution node name
   any other -FLAG [VALUE...] is recorded as an init argument (init:get_argument/1)
 
@@ -139,6 +153,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         emulator: EmulatorConfig::default(),
         pa: Vec::new(),
         pz: Vec::new(),
+        heap: HeapOptions::new(),
         init_args: InitArgs::new(),
         action: Action::Boot,
     };
@@ -185,6 +200,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.record(argument, vec![value]);
                 index += 2;
             }
+            "-smp" => index = parse_smp_switch(args, index, &mut builder),
             "+A" => {
                 let value = value_of(args, index, "+A")?;
                 // The async-thread pool is not modelled by the runtime core; it is
@@ -201,6 +217,34 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.record(argument, vec![value]);
                 index += 2;
             }
+            "+hms" => {
+                let value = value_of(args, index, "+hms")?;
+                builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
+            "+hmbs" => {
+                let value = value_of(args, index, "+hmbs")?;
+                builder
+                    .heap
+                    .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
+            "+hmax" => {
+                let value = value_of(args, index, "+hmax")?;
+                builder
+                    .heap
+                    .set_max_heap_words(parse_max_heap_size(&value)?);
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
+            "+hmaxk" | "+hmaxel" | "+hmaxib" => {
+                let value = value_of(args, index, argument)?;
+                builder.set_max_heap_flag(argument, &value)?;
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
             "-s" => index = builder.parse_apply(args, index, "-s")?,
             "-run" => index = builder.parse_apply(args, index, "-run")?,
             "run" => index = parse_run_file(args, index, &mut builder)?,
@@ -213,6 +257,7 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
         emulator: builder.emulator,
         code_paths,
         heap_words: DEFAULT_HEAP_WORDS,
+        heap: builder.heap,
         init_args: builder.init_args,
         action: builder.action,
     })
@@ -226,6 +271,8 @@ struct Builder {
     pa: Vec<PathBuf>,
     /// `-pz` directories, in order.
     pz: Vec<PathBuf>,
+    /// The heap-size emulator options (`+hms`/`+hmbs`/`+hmax*`) being assembled.
+    heap: HeapOptions,
     /// Every command-line flag, in order (the `init:get_argument/1` source).
     init_args: InitArgs,
     /// The selected action.
@@ -277,6 +324,29 @@ impl Builder {
             }
         };
         Ok(next)
+    }
+
+    /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
+    /// returns the index of the next switch — the real `erl` behaviour.
+    ///
+    /// Applies a `+hmaxk`/`+hmaxel`/`+hmaxib` boolean value to the heap options.
+    ///
+    /// Only the two literals `true`/`false` are accepted: the C compares the value with
+    /// exactly those strings and rejects anything else (`erl_init.c:1592-1624`, e.g.
+    /// `+hmaxk bogus` ⇒ `bad max heap kill bogus` + usage).
+    fn set_max_heap_flag(&mut self, switch: &str, value: &str) -> Result<()> {
+        let mut flags = self.heap.max_heap_flags();
+        match (switch, value) {
+            ("+hmaxk", "true") => flags.kill = true,
+            ("+hmaxk", "false") => flags.kill = false,
+            ("+hmaxel", "true") => flags.error_logger = true,
+            ("+hmaxel", "false") => flags.error_logger = false,
+            ("+hmaxib", "true") => flags.include_shared_binaries = true,
+            ("+hmaxib", "false") => flags.include_shared_binaries = false,
+            _ => return Err(error::bad_switch_value(switch, value)),
+        }
+        self.heap.set_max_heap_flags(flags);
+        Ok(())
     }
 
     /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
@@ -348,6 +418,41 @@ fn parse_usize(switch: &str, value: &str) -> Result<usize> {
         .map_err(|_| error::bad_switch_value(switch, value))
 }
 
+/// Parses a `+hms` / `+hmbs` heap-size value: a **positive** decimal word count.
+///
+/// Mirrors the emulator's own check: the C parses with `atoi` and rejects any value
+/// `<= 0` (`erl_init.c:1554-1567`) — verified against the oracle, where `+hms 0` and
+/// `+hms abc` both fail (the emulator prints `bad heap size <value>` and its usage text,
+/// exiting 1). `beam_rt` reports its uniform malformed-value diagnostic instead (a usage
+/// error: exit 2 + [`USAGE`]). One documented divergence: `atoi` truncates a trailing
+/// suffix, so the oracle accepts `+hms 100abc` as 100, while this parser rejects it.
+fn parse_heap_words(switch: &str, value: &str) -> Result<usize> {
+    match value.parse::<usize>() {
+        Ok(words) if words > 0 => Ok(words),
+        _ => Err(error::bad_switch_value(switch, value)),
+    }
+}
+
+/// Parses a `+hmax` value: a non-negative decimal word count no larger than
+/// [`MAX_SMALL`], which is exactly the emulator's acceptance range
+/// (`erl_init.c:1626-1633`: `hMaxSize < 0 || hMaxSize > MAX_SMALL` is
+/// `bad max heap size <value>`; `+hmax 0` — the default — means *unlimited*).
+///
+/// Verified against the oracle: `+hmax 0` is accepted (unlimited),
+/// `+hmax -1` and `+hmax 1000000000000000000000` are rejected. Divergences, both in the
+/// *rejection* direction: the C parses with `ErtsStrToSint` and tests only the numeric
+/// result, so it silently accepts `+hmax abc` as 0 and `+hmax 12abc` as 12, where this
+/// parser rejects both. The C's parse-time "max must not be below the *current* min"
+/// check (`erl_init.c:1634-1639`) is **not** modelled: it is order-dependent
+/// (`+hmax 500 +hms 1000 +hmax 200` fails, `+hms 2000 +hmax 1000` does not) and only
+/// rejects an invocation.
+fn parse_max_heap_size(value: &str) -> Result<usize> {
+    match value.parse::<i64>() {
+        Ok(words) if (0..=MAX_SMALL).contains(&words) => Ok(words as usize),
+        _ => Err(error::bad_switch_value("+hmax", value)),
+    }
+}
+
 /// Parses the `+S N[:N]` value, taking the normal-scheduler count (the first number).
 ///
 /// Both components must be numbers (and there may be at most one `:`): a malformed
@@ -362,6 +467,50 @@ fn parse_schedulers(value: &str) -> Result<u32> {
         return Err(error::bad_switch_value("+S", value));
     }
     Ok(normal)
+}
+
+/// Parses the `-smp` switch, returning the index of the next switch.
+///
+/// `-smp` selects the runtime's scheduler model: `disable` turns SMP off
+/// ([`FeatureFlags::smp`](beam_common::FeatureFlags::smp) becomes `false`), while
+/// `enable`/`auto` leave it on (the default). The value is **optional** and any other
+/// value is accepted and recorded but changes nothing — this matches the oracle, which
+/// accepts `-smp` (with or without a value) and ignores every value but `disable`
+/// (`erl -noshell -smp bogus -eval 'halt().'` exits 0). The one documented divergence is
+/// `-smp disable`: real `erl` rejects it outright (`Argument '-smp disable' not supported.
+/// Use "+S 1" instead.`) whereas this runtime accepts it as the honest "SMP off" request.
+///
+/// The switch is recorded as an init argument exactly like every other switch, so a
+/// program can still observe its own command line (`init:get_argument(smp)`).
+fn parse_smp_switch(args: &[String], index: usize, builder: &mut Builder) -> usize {
+    let value = match args.get(index + 1) {
+        Some(candidate) if !is_switch(candidate) => Some(candidate.clone()),
+        _ => None,
+    };
+    let has_value = value.is_some();
+    if let Some(value) = &value {
+        if let Some(enabled) = parse_smp(value) {
+            builder.emulator.features = builder.emulator.features.with_smp(enabled);
+        }
+    }
+    builder.record("-smp", value.into_iter().collect());
+    if has_value {
+        index + 2
+    } else {
+        index + 1
+    }
+}
+
+/// The [`FeatureFlags::smp`](beam_common::FeatureFlags::smp) an `-smp` *value* selects, or
+/// `None` for a value that is not one of the three documented ones (which changes nothing).
+///
+/// `enable` and `auto` both mean "SMP on" (the default); `disable` means "SMP off".
+fn parse_smp(value: &str) -> Option<bool> {
+    match value {
+        "enable" | "auto" => Some(true),
+        "disable" => Some(false),
+        _ => None,
+    }
 }
 
 /// Parses `run File Mod:Func/Arity [Arg…]`, returning the index past the last argument.
@@ -703,6 +852,7 @@ fn reported_reason(runtime: &mut Runtime, error: BeamError) -> BeamError {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::MaxHeapFlags;
 
     fn parse_args(args: &[&str]) -> Result<RuntimeConfig> {
         let owned: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
@@ -820,6 +970,167 @@ mod tests {
         assert!(parse_args(&["+P", "-1"]).is_err());
         assert!(parse_args(&["+A", "many"]).is_err());
         assert!(parse_args(&["+S"]).is_err());
+    }
+
+    /// The `+hms`/`+hmbs` heap options, pinned against the oracle (OTP 29.1.1 /
+    /// erts-17.1):
+    ///
+    /// ```text
+    /// erl +hms 1000 +hmbs 5000 -noshell \
+    ///     -eval 'io:format("~p~n",[process_info(self(),garbage_collection)]), halt().'
+    ///   → min_bin_vheap_size 6772, min_heap_size 1598
+    /// ```
+    ///
+    /// The values are recorded as init arguments like every other switch of this runtime
+    /// (real `erl` does *not* report them — `erl +hms 1000 … -eval
+    /// 'init:get_argument(hms)'` ⇒ `error`, since they are emulator flags consumed by
+    /// `erlexec`; this runtime records every switch, as it already does for `+S`/`+P`).
+    #[test]
+    fn heap_size_switches_are_parsed_and_recorded() {
+        let config = parsed(&["+hms", "1000", "+hmbs", "5000"]);
+        assert_eq!(config.heap_options().policy().min_heap_words, 1598);
+        assert_eq!(config.heap_options().policy().min_bin_vheap_words, 6772);
+        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
+        assert_eq!(config.init_args.get("hmbs"), Some(vec![&["5000".to_string()][..]]));
+        // A recognized heap switch is modelled, so it is *not* a verbatim extra flag
+        // (unlike `+A`) — but it is still an init argument, and every other switch is left
+        // exactly as it was.
+        assert!(config.emulator.extra_emulator_flags.is_empty());
+        assert_eq!(config.heap_words, DEFAULT_HEAP_WORDS);
+        assert_eq!(config.action, Action::Boot);
+
+        // The last occurrence wins, and both are recorded in order.
+        let config = parsed(&["+hms", "100", "+hms", "234"]);
+        assert_eq!(config.heap_options().policy().min_heap_words, 376);
+        assert_eq!(
+            config.init_args.get("hms"),
+            Some(vec![&["100".to_string()][..], &["234".to_string()][..]])
+        );
+        // `+hms 0`, a negative and a non-numeric value are all rejected — the emulator
+        // rejects anything `<= 0` (`erl_init.c:1554-1567`) or non-numeric (`atoi`).
+        for args in [
+            &["+hms", "0"][..],
+            &["+hms", "abc"][..],
+            &["+hms", "-5"][..],
+            &["+hms"][..],
+            &["+hmbs", "0"][..],
+            &["+hmbs", "abc"][..],
+            &["+hmbs"][..],
+        ] {
+            let error = parse_args(args).expect_err("a malformed heap switch is a usage error");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// The `+hmax*` family, pinned against the oracle (OTP 29.1.1 / erts-17.1):
+    ///
+    /// ```text
+    /// erl +hmax 1000000 -noshell \
+    ///     -eval 'io:format("~p~n",[erlang:system_info(garbage_collection)]), halt().'
+    ///   → [{max_heap_size,1000000},…]
+    /// erl +hmax 1000000 +hmaxk false +hmaxel false +hmaxib true -noshell -eval …
+    ///   → #{error_logger=>false,include_shared_binaries=>true,kill=>false,size=>1000}
+    /// ```
+    #[test]
+    fn max_heap_switches_are_parsed_and_recorded() {
+        let config = parsed(&[
+            "+hmax",
+            "1000000",
+            "+hmaxk",
+            "false",
+            "+hmaxel",
+            "false",
+            "+hmaxib",
+            "true",
+        ]);
+        assert_eq!(config.heap_options().policy().max_heap_words, 1_000_000);
+        assert_eq!(
+            config.heap_options().max_heap_flags(),
+            MaxHeapFlags {
+                kill: false,
+                error_logger: false,
+                include_shared_binaries: true,
+            }
+        );
+        assert_eq!(
+            config.init_args.get("hmax"),
+            Some(vec![&["1000000".to_string()][..]])
+        );
+        assert_eq!(
+            config.init_args.get("hmaxk"),
+            Some(vec![&["false".to_string()][..]])
+        );
+        assert_eq!(
+            config.init_args.get("hmaxib"),
+            Some(vec![&["true".to_string()][..]])
+        );
+        // `+hmax 0` is the emulator's own "no limit" value.
+        assert_eq!(parsed(&["+hmax", "0"]).heap_options().policy().max_heap_words, 0);
+        // A negative, a non-numeric or an out-of-range value is rejected (the C bounds it
+        // by `0..=MAX_SMALL`, `erl_init.c:1626-1633`), as is a non-boolean flag value
+        // (`erl_init.c:1592-1624`).
+        for args in [
+            &["+hmax", "-1"][..],
+            &["+hmax", "abc"][..],
+            &["+hmax", "1000000000000000000000"][..],
+            &["+hmax"][..],
+            &["+hmaxk", "bogus"][..],
+            &["+hmaxel", "1"][..],
+            &["+hmaxib"][..],
+        ] {
+            let error = parse_args(args).expect_err("a malformed max-heap switch is a usage error");
+            assert_eq!(error::unsupported_reason(&error), None, "{args:?}");
+        }
+    }
+
+    /// Unmodeled flags keep their old behaviour when a modelled heap switch sits next to
+    /// them: recorded as init arguments (and, for `+A`, preserved verbatim), with parsing
+    /// continuing onto the next switch.
+    #[test]
+    fn unmodeled_flags_are_unaffected_by_the_heap_switches() {
+        let config = parsed(&["+hms", "1000", "+zzz", "1", "2", "+A", "16"]);
+        assert_eq!(config.heap_options().policy().min_heap_words, 1598);
+        assert_eq!(
+            config.init_args.get("zzz"),
+            Some(vec![&["1".to_string(), "2".to_string()][..]])
+        );
+        assert_eq!(
+            config.emulator.extra_emulator_flags,
+            vec!["+A".to_string(), "16".to_string()]
+        );
+        assert_eq!(config.init_args.get("hms"), Some(vec![&["1000".to_string()][..]]));
+        // An unrecognized flag on its own still boots (recorded, not a usage error).
+        assert_eq!(parsed(&["+Weird"]).heap_options(), &HeapOptions::default());
+    }
+
+    #[test]
+    fn smp_switch_selects_the_scheduler_model() {
+        // `disable` turns SMP off; it is still recorded as an init argument.
+        let config = parsed(&["-smp", "disable"]);
+        assert!(!config.emulator.features.smp, "disable turns SMP off");
+        assert_eq!(
+            config.init_args.get("smp"),
+            Some(vec![&["disable".to_string()][..]])
+        );
+        // `enable`/`auto` are the default (SMP on).
+        assert!(parsed(&["-smp", "enable"]).emulator.features.smp);
+        assert!(parsed(&["-smp", "auto"]).emulator.features.smp);
+        // A value the runtime does not model is accepted and recorded but changes nothing
+        // (the oracle's leniency: `erl -noshell -smp bogus -eval 'halt().'` exits 0).
+        let config = parsed(&["-smp", "bogus"]);
+        assert!(config.emulator.features.smp, "an unknown value is a no-op");
+        assert_eq!(
+            config.init_args.get("smp"),
+            Some(vec![&["bogus".to_string()][..]])
+        );
+        // A valueless `-smp` is accepted too (recorded with no values).
+        let config = parsed(&["-smp"]);
+        assert!(config.emulator.features.smp);
+        assert_eq!(config.init_args.get("smp"), Some(vec![&[][..]]));
+        // `-smp` consumes only its value: the following switch still parses.
+        let config = parsed(&["-smp", "disable", "+S", "2"]);
+        assert!(!config.emulator.features.smp);
+        assert_eq!(config.emulator.schedulers, Some(2));
     }
 
     #[test]

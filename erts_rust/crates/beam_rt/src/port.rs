@@ -120,6 +120,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+pub mod driver;
 use beam_alloc::Heap;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
@@ -185,6 +186,8 @@ pub const PORT_INFO_ATOMS: &[&str] = &[
     "input",
     "output",
     "monitors",
+    // A `/2`-only item whose unregistered value (`[]`) the native floor answers itself.
+    "registered_name",
     // The shape of a `monitors` entry.
     "process",
 ];
@@ -234,6 +237,8 @@ pub enum PortName {
     Spawn,
     /// `{spawn_executable, Path}`: run `Path` directly with the `args` option.
     SpawnExecutable,
+    /// `{spawn_driver, Name}`: a **C driver** (contract A.4) loaded from `Name` — no OS child.
+    SpawnDriver,
     /// `{fd, N}`: a descriptor the Erlang side already owns.
     Fd,
 }
@@ -291,6 +296,13 @@ struct PortMeta {
     /// The process the port belongs to — the recipient of its `{Port, {data, …}}` and
     /// `{Port, {exit_status, …}}` messages, and the value of its `connected`/`links` items.
     owner: ProcessId,
+    /// Which `Name` form opened the port.
+    ///
+    /// The two message producers route on it: a `{spawn_driver, Name}` port's bytes come from the
+    /// C driver's `output` callback (queued on the port's input queue by
+    /// [`driver::DriverPortAdapter`]) and are drained by [`PortRegistry::take_driver_outputs`],
+    /// while every other port's come from its registered descriptor through the port-task round.
+    kind: PortName,
 }
 
 /// A message a live port has produced: the child's stream bytes, or its reaped exit status.
@@ -357,8 +369,14 @@ impl PortRegistry {
     ///
     /// Propagates the poll set's and the arena's allocation failures.
     pub fn new() -> Result<PortRegistry> {
-        Ok(PortRegistry {
-            poller: Poller::new()?,
+        // The driver C ABI (contract A.4) is a **link-time** seam, exactly like the NIF ABI: a
+        // loaded driver `.so` leaves its `driver_*`/`erl_drv_*` imports undefined and resolves them
+        // out of the loading process's dynamic symbol table. `-Wl,--export-dynamic` (see
+        // `build.rs`) publishes the symbols; this `black_box` reference is what anchors
+        // `beam_abi`'s driver codegen unit in the link so there *are* symbols to publish. Without
+        // it, a `dlopen(RTLD_NOW)` of a real driver would fail on an unresolved symbol.
+        let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
+        Ok(PortRegistry {            poller: Poller::new()?,
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
@@ -416,6 +434,19 @@ impl PortRegistry {
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
         if !self.meta.contains_key(&id.number()) {
             return Err(BeamError::BadArg);
+        }
+        // A **C driver** port has no child pipe: `port_command` *is* the driver's own `output`
+        // callback. `beam_io::PortRegistry::output` runs it inline, and the bytes the driver
+        // answers with through `driver_output` are queued as this port's input for the next
+        // [`PortRegistry::pump`] — see [`PortRegistry::take_driver_outputs`].
+        if self
+            .meta
+            .get(&id.number())
+            .map(|meta| meta.kind == PortName::SpawnDriver)
+            .unwrap_or(false)
+        {
+            self.registry.output(&mut self.poller, id, bytes)?;
+            return Ok(());
         }
         self.registry
             .port_command(&mut self.poller, id, bytes, PortCommandOptions::EMPTY)?;
@@ -511,6 +542,9 @@ impl PortRegistry {
     /// error a port's driver raises while a scheduled task runs.
     fn pump(&mut self, timeout: Duration) -> Result<Vec<PortEvent>> {
         let mut events = self.take_due_exit_statuses()?;
+        // The driver ports' bytes may already be queued (a `port_command` on a driver port ran
+        // the driver's `output` callback inline), so they are harvested before any wait too.
+        events.extend(self.take_driver_outputs());
         if self.registry.is_empty() {
             return Ok(events);
         }
@@ -558,11 +592,53 @@ impl PortRegistry {
                     PortNotification::Closed { .. } => {}
                 }
             }
+            events.extend(self.take_driver_outputs());
             events.extend(self.take_due_exit_statuses()?);
             if !events.is_empty() || Instant::now() >= deadline {
                 return Ok(events);
             }
         }
+    }
+
+    /// The `{Port, {data, Data}}` events the **C driver** ports have produced.
+    ///
+    /// A driver port's bytes are what the driver's `output` callback answered with through
+    /// `driver_output`; [`driver::DriverPortAdapter`] queues them on the port's input queue, and
+    /// this drains it. A `spawn`/`fd` port's input queue is drained by the port-task round instead
+    /// ([`beam_io::Port::take_input_notification`], whose `INPUT` task its registered descriptor
+    /// makes run), so the two never report the same bytes.
+    ///
+    /// # Errors
+    ///
+    /// None: a port that has gone away (closed while the bytes were queued) has no recipient and
+    /// its bytes are dropped, exactly as the task round drops a notification for a closed port.
+    fn take_driver_outputs(&mut self) -> Vec<PortEvent> {
+        let numbers: Vec<u64> = self
+            .meta
+            .iter()
+            .filter(|(_, meta)| meta.kind == PortName::SpawnDriver)
+            .map(|(number, _)| *number)
+            .collect();
+        let mut events = Vec::new();
+        for number in numbers {
+            let port = PortId::new(number);
+            let bytes = match self.registry.get_mut(port) {
+                Some(live) => live.drain_input(),
+                None => Vec::new(),
+            };
+            if bytes.is_empty() {
+                continue;
+            }
+            if let Some(meta) = self.meta.get(&number) {
+                events.push(PortEvent::Data {
+                    port,
+                    bytes,
+                    stream: meta.stream,
+                    owner: meta.owner,
+                });
+            }
+        }
+        events
     }
 
     /// The `{Port, {exit_status, Status}}` events that are due now.
@@ -698,6 +774,10 @@ impl NameSpec {
             PortName::Fd => Ok(SpawnSpec::Fd {
                 fd: self.fd.ok_or(BeamError::BadArg)?,
             }),
+            // A `{spawn_driver, Name}` port is backed by a **C driver**, not by the spawn
+            // driver: `open_port` registers a `driver::DriverPortAdapter` for it and never asks
+            // for a spawn spec, so reaching this is a programming error.
+            PortName::SpawnDriver => Err(BeamError::BadArg),
         }
     }
 }
@@ -869,6 +949,20 @@ impl RuntimePorts {
                     inline_options: Some(terms::tuple_element(name, 2)?),
                 })
             }
+            ("spawn_driver", 2) => {
+                // The `Name` is flattened like `{spawn, …}`'s (an atom, a binary or a
+                // (possibly nested) char list); anything else is `badarg`. The driver is
+                // looked up under the prefix up to the first space — the C's own rule
+                // (`io.c` walks the name to the first blank before matching `driver_name`),
+                // which is also how a name can carry arguments for the driver.
+                let command = self.command_spec(terms::tuple_element(name, 1)?)?;
+                Ok(NameSpec {
+                    kind: PortName::SpawnDriver,
+                    command: checked_name(command)?,
+                    fd: None,
+                    inline_options: None,
+                })
+            }
             ("fd", 2) => {
                 let descriptor = terms::tuple_element(name, 1)?;
                 // A descriptor is a non-negative integer; anything else the driver cannot
@@ -1028,6 +1122,35 @@ impl PortHook for RuntimePorts {
         // before anything is registered anywhere, so a failure here cannot leak an id; the
         // OS pid the driver reports is what `port_info(Port, os_pid)` answers.
         let stream = resolved.stream();
+        if spec.kind == PortName::SpawnDriver {
+            // A **C driver** (contract A.4) port: the driver is `dlopen`ed and registered as the
+            // port's driver, so `port_command` reaches its `output` callback and its
+            // `driver_output` bytes reach the owner. An unknown driver name is the oracle's own
+            // `error:badarg` (`io.c`'s `ERTS_OPEN_DRIVER_RET(NULL, -3, BADARG)`), never a
+            // fabricated port and never a silent no-op.
+            let (candidates, driver_name) = driver_lookup(&spec.command);
+            let host = driver::DriverPort::new(
+                Heap::new(PORT_HEAP_WORDS)?,
+                Rc::clone(&self.atoms),
+                self.owner,
+            );
+            let adapter =
+                driver::DriverPortAdapter::load(&candidates, &driver_name, host, spec.command.clone())
+                    .map_err(|_| BeamError::BadArg)?;
+            let meta = PortMeta {
+                command: spec.command,
+                // A driver port owns no OS child; `port_info(Port, os_pid)` is `undefined`.
+                os_pid: None,
+                stream,
+                // Nothing to reap, so no `{Port, {exit_status, …}}` is ever synthesized.
+                notify_exit: false,
+                monitors: Vec::new(),
+                owner: self.owner,
+                kind: PortName::SpawnDriver,
+            };
+            let mut registry = self.registry_mut()?;
+            return registry.register(Box::new(adapter), meta);
+        }
         let spawn_options = SpawnOptions {
             stream: stream.into(),
             cd: resolved.cd,
@@ -1044,6 +1167,7 @@ impl PortHook for RuntimePorts {
             notify_exit: spawn_options.exit_status,
             monitors: Vec::new(),
             owner: self.owner,
+            kind: spec.kind,
         };
         // The registry stays borrowed across `register`: starting a port cannot re-enter a
         // port operation, and a nested borrow is a typed error rather than a panic.
@@ -1238,6 +1362,44 @@ impl RuntimeContext<'_> {
         let inner = terms::make_tuple(self, &[tag, make_small(i64::from(status))])?;
         terms::make_tuple(self, &[port.to_eterm(), inner])
     }
+}
+
+/// The driver search a `{spawn_driver, Name}` name performs: the candidate object paths to try
+/// and the driver name the loaded entry must declare.
+///
+/// The C looks the name's prefix up to the first space up in its **loaded-driver list**
+/// (`io.c:599-622`: it walks the name to the first blank, then compares it against each
+/// `ErlDrvEntry::driver_name`); the `Name` itself is never a path, so the file must already be
+/// loaded by `erl_ddll:load_driver/3`/`erlang:load_driver/2`. This runtime has no such BIF yet, so
+/// the name doubles as the *search* — a documented Milestone-1 extension:
+///
+/// * a name that contains `/` is taken as the object's path, and the driver name validated against
+///   the entry is the path's file stem with the platform suffix removed (`…/t` and `…/t.so` both
+///   name the driver `t`). This is what lets a driver outside the loader's search path be reached;
+/// * a bare name is tried as itself, as `<name>.so` and as `./<name>` (the runtime's own
+///   directory), with `<name>` as the driver name — the C's answer for a name in its search path.
+///
+/// `load_driver` appends the platform's shared-object suffix to a candidate that does not already
+/// carry it, so the `<name>` candidate resolves `<name>.so`. A name that reaches no object, or an
+/// object whose entry declares another name, is [`BeamError::BadArg`] at the call site — the oracle's
+/// own reason for an unknown driver.
+fn driver_lookup(name: &str) -> (Vec<String>, String) {
+    // The C's own truncation: the driver is the name up to the first blank (`io.c`).
+    let path = name.split(' ').next().unwrap_or(name);
+    let mut candidates = vec![path.to_string(), format!("{path}.so")];
+    let driver_name = if path.contains('/') {
+        let base = std::path::Path::new(path)
+            .file_name()
+            .and_then(|stem| stem.to_str())
+            .unwrap_or(path);
+        base.strip_suffix(".so").unwrap_or(base).to_string()
+    } else {
+        // `dlopen` searches the loader's path for a name without a slash, never the current
+        // directory, so the runtime's own directory is an explicit candidate.
+        candidates.push(format!("./{path}"));
+        path.to_string()
+    };
+    (candidates, driver_name)
 }
 
 /// The validated **non-empty** command/path a `{spawn, Cmd}`/`{spawn_executable, Path}` name
@@ -1484,6 +1646,7 @@ mod tests {
     fn test_meta(command: &str) -> PortMeta {
         PortMeta {
             command: command.to_string(),
+            kind: PortName::Spawn,
             os_pid: None,
             stream: StreamType::List,
             notify_exit: false,

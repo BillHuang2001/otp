@@ -2,26 +2,26 @@
 //!
 //! The engine's [`ExecutionContext`](super::RuntimeContext) dispatch is plain Rust, so a few
 //! `beam_bifs` BIF families cannot run themselves: they need to apply a fun ([`FunBridge`]),
-//! reach the running process's dictionary ([`DictBridge`]), `dlopen` a NIF ([`NifBridge`]) or
-//! read a loaded module's record definitions ([`RecordBridge`]). Each bridge borrows a
-//! different slice of the runtime and therefore cannot co-exist with the others, so
-//! `call_registered` installs exactly one per call. [`SharedSink`] is the shared, cloneable
-//! `io:format` destination every context (outer and nested) writes through, and
-//! [`PendingInterner`] is the deferred, predicted-index atom interner (see the parent
-//! module docs for the full rationale).
+//! reach the running process's dictionary ([`DictBridge`]), `dlopen` a NIF ([`NifBridge`]),
+//! read a loaded module's record definitions ([`RecordBridge`]) or deliver a message
+//! ([`SendBridge`]). Each bridge borrows a different slice of the runtime and therefore cannot
+//! co-exist with the others, so `call_registered` installs exactly one per call. [`SharedSink`]
+//! is the shared, cloneable `io:format` destination every context (outer and nested) writes
+//! through, and [`PendingInterner`] is the deferred, predicted-index atom interner (see the
+//! parent module docs for the full rationale).
 
 use std::cell::RefCell;
 use std::rc::Rc;
 
 use beam_bifs::{
     AtomInterner, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
-    RecordFieldView, RecordSource,
+    RecordFieldView, RecordSource, SendHook,
 };
 use beam_common::{BeamError, Result};
 use beam_engine::ExecutionContext;
 use beam_loader::Module;
-use beam_process::{ProcessId, ProcessTable};
-use beam_term::{Atom, AtomTable, Eterm};
+use beam_process::{PortId, ProcessId, ProcessTable};
+use beam_term::{atom_val, is_atom, Atom, AtomTable, Eterm};
 
 use crate::codeserver::CodeServer;
 use crate::error;
@@ -194,6 +194,135 @@ impl DictHook for DictBridge<'_> {
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
         Ok(self.process_mut()?.dict().get_keys_for_value(value))
     }
+}
+
+/// The `beam_bifs` message-delivery seam: `erlang:send/2` and `erlang:'!'/2`.
+///
+/// `erlang:send/2` is a plain Rust function that cannot reach the destination process's
+/// mailbox itself, so it routes every delivery through the [`SendHook`] — this is the concrete
+/// provider the runtime installs. It borrows the whole runtime (exactly like [`FunBridge`]) and
+/// delegates to the runtime's **existing** send path,
+/// [`RuntimeContext::send_message`](super::RuntimeContext::send_message), so a BIF delivery is
+/// the delivery the compiled `send` instruction performs: the payload is resolved, copied into
+/// the recipient's heap and enqueued, and a payload too large for that heap falls back to the
+/// heap-fragment model. **Nothing about delivery is re-implemented here.**
+///
+/// # Destination semantics (the C `do_send`, `bif.c:2469-2674`)
+///
+/// * An **internal pid** — whether or not a process currently exists for it. The C looks the
+///   pid up and reports *success* without delivering when `erts_proc_lookup_raw` finds nothing
+///   (`bif.c:2478-2480`), so a send to a dead or never-created pid **succeeds silently**.
+///   [`send_message`](ExecutionContext::send_message) reports that case as
+///   [`BeamError::TermNotFound`], which this bridge folds back into the oracle's success —
+///   that is the oracle's semantics, not a swallowed failure.
+/// * A **registered name** (an atom) — resolved through [`ProcessTable::whereis`], the same
+///   "name → id" resolution the C does with `erts_whereis_name_to_id` (`bif.c:2507`), and the
+///   message is delivered to the registered process. A name that is *not* registered is the
+///   oracle's `error:badarg` (`bif.c:2536`, `SEND_BADARG`).
+/// * A destination the oracle accepts but this runtime cannot serve yet is an honest typed
+///   **capability gap** rather than a fabricated value:
+///   * a **port** (`erlang:send(Port, Data)`, `bif.c:2551-2613`) needs the port subsystem's
+///     write path;
+///   * a **`{Name, Node}`** tuple (`bif.c:2614-2667`) is a distributed send (contract A.5).
+/// * Anything else (`42`, a list, a 3-element tuple, …) is the oracle's `error:badarg` (the
+///   C's final `else` arm, `bif.c:2668-2674` and the tuple shape checks at `bif.c:2617-2621`).
+pub(super) struct SendBridge<'a> {
+    /// The runtime the delivery runs on.
+    pub(super) runtime: &'a mut Runtime,
+    /// The sender's pid: the `from` of every delivery (the C's `p->common.id`), so
+    /// `erlang:send(self(), M)` reaches the very mailbox the following `receive` scans.
+    pub(super) mailbox_pid: ProcessId,
+    /// The outer call's process table, if any — a scheduler pass supplies one, a `-eval`
+    /// context resolves against the runtime's own (see [`RuntimeContext::for_process`]).
+    pub(super) mailbox_table: Option<&'a mut ProcessTable>,
+    /// The caller's shared output sink, cloned from the outer context like [`FunBridge`]'s.
+    pub(super) output: Option<SharedSink<'a>>,
+    /// The outer call's scheduler-pump permission (a `send` never pumps the scheduler, but
+    /// the nested context is built with the caller's identity intact).
+    pub(super) may_pump_scheduler: bool,
+    /// The outer call's executing-module name (see [`RuntimeContext::current_module`]).
+    pub(super) current_module: Option<String>,
+}
+
+impl SendBridge<'_> {
+    /// Resolves a `send` destination term to the internal pid term to deliver to.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for the destinations the oracle rejects with `badarg`; a typed
+    /// capability gap ([`crate::error::unsupported`]) for the ones it accepts but this
+    /// runtime cannot serve yet (see the struct docs).
+    fn resolve(&self, to: Eterm) -> Result<Eterm> {
+        if ProcessId::is_process(to) {
+            return Ok(to);
+        }
+        if is_atom(to) {
+            let table: &ProcessTable = match self.mailbox_table {
+                Some(ref table) => table,
+                None => &self.runtime.processes,
+            };
+            return match table.whereis(atom_val(to)) {
+                Some(pid) => Ok(pid.to_eterm()),
+                // An atom name no process is registered under: the oracle's only failing
+                // (correctly typed) destination (`bif.c:2536`).
+                None => Err(BeamError::BadArg),
+            };
+        }
+        if PortId::from_eterm(to).is_ok() {
+            return Err(error::unsupported(
+                "erlang:send/2 to a port: the port write path is not wired",
+            ));
+        }
+        if let Some((name, node)) = two_atom_tuple(self.runtime.code_server.atoms(), to) {
+            return Err(error::unsupported(&format!(
+                "erlang:send/2 to {name}@{node}: distributed send is not implemented"
+            )));
+        }
+        Err(BeamError::BadArg)
+    }
+}
+
+impl SendHook for SendBridge<'_> {
+    fn send(&mut self, to: Eterm, term: Eterm) -> Result<()> {
+        let target = self.resolve(to)?;
+        // The nested context inherits the sender's identity (pid + table) so the delivery
+        // runs exactly as the compiled `send` instruction's does.
+        let mut ctx = RuntimeContext {
+            runtime: self.runtime,
+            output: self.output.clone(),
+            mailbox_pid: self.mailbox_pid,
+            mailbox_table: self.mailbox_table.as_deref_mut(),
+            may_pump_scheduler: self.may_pump_scheduler,
+            current_module: self.current_module.clone(),
+        };
+        match ctx.send_message(target, term) {
+            // No process for the pid: the C drops the message and reports success
+            // (`bif.c:2478-2480`); the table's typed not-found is that same case.
+            Err(BeamError::TermNotFound) => Ok(()),
+            delivered => delivered,
+        }
+    }
+}
+
+/// The `{Name, Node}` pair of an atom/atom 2-tuple destination, if `to` is one.
+///
+/// The C only treats a 2-tuple of **atoms** as a remote send (`bif.c:2614-2621`); every other
+/// tuple shape is `SEND_BADARG`. Milestone-1 has no distributed send, so this only feeds the
+/// capability-gap message. A non-2-tuple, a non-tuple, or a tuple with a non-atom element
+/// yields `None` (which the caller turns into `badarg`, the oracle's reason). The two atoms are
+/// resolved to their names through the shared table, so the diagnostic names the destination.
+fn two_atom_tuple(atoms: &AtomTable, to: Eterm) -> Option<(String, String)> {
+    if beam_engine::terms::tuple_arity(to).ok()? != 2 {
+        return None;
+    }
+    let name = beam_engine::terms::tuple_element(to, 0).ok()?;
+    let node = beam_engine::terms::tuple_element(to, 1).ok()?;
+    if !is_atom(name) || !is_atom(node) {
+        return None;
+    }
+    let name = atoms.name(atom_val(name))?.to_string();
+    let node = atoms.name(atom_val(node))?.to_string();
+    Some((name, node))
 }
 
 /// The `beam_bifs` NIF-loading seam: `dlopen`s a NIF library and registers it with the runtime.
@@ -417,15 +546,500 @@ impl AtomInterner for PendingInterner {
     }
 }
 
+/// The `FunT` position of the lambda descriptor `(uniq, index)` in `module`, if it
+/// defines one.
+///
+/// The position **is** the lambda's `old_index`: the C loader passes the lambda-table
+/// loop index to `erts_fun_entry_put` as its `old_index` argument
+/// (`emu_load.c:645-651`), so the `FunT` slot is the identity the `NEW_FUN_EXT` wire
+/// form carries. `uniq` here is the term's own identity word — the descriptor's
+/// `old_uniq` — and `index` its `FunT` `index` field (see [`FunDescriptor`]).
+///
+/// [`FunDescriptor`]: beam_loader::FunDescriptor
+pub(super) fn descriptor_position(module: &Module, uniq: u64, index: u32) -> Option<usize> {
+    module
+        .funs()
+        .iter()
+        .position(|descriptor| u64::from(descriptor.uniq) == uniq && descriptor.index == index)
+}
+
 /// The `FunDescriptor` of the lambda `(uniq, index)` in `module`, if it defines one.
 pub(super) fn descriptor_of(
     module: &Module,
     uniq: u64,
     index: u32,
 ) -> Option<beam_loader::FunDescriptor> {
-    module
-        .funs()
-        .iter()
-        .find(|descriptor| u64::from(descriptor.uniq) == uniq && descriptor.index == index)
-        .copied()
+    descriptor_position(module, uniq, index).map(|position| module.funs()[position])
+}
+
+/// The `NEW_FUN_EXT` (`112`) **identity** of a compiled module's `FunKind::Local` fun.
+///
+/// A `make_fun3` closure's term layout inlines only its engine-internal descriptor
+/// (`[uniq: u64][index: u32]`, `beam_term::fun`): it carries **no** module atom, no
+/// 16-byte module MD5, no `old_index`/`old_uniq` and no creator pid, so `beam_codec`
+/// cannot encode one as `NEW_FUN_EXT` on its own — it reports the typed
+/// `unsupported_local_fun` rather than invent them. The C encoder
+/// (`external.c:3966-3993`, the `is_local_fun(funp)` branch) resolves those fields
+/// through the fun's `ErlFunEntry` — the running module's lambda table — which only the
+/// runtime knows. This derives them from the **loaded module** and the fun term:
+///
+/// * `module` — the module's name atom, resolved in the caller's (shared) atom table;
+/// * `old_index` — the descriptor's [`descriptor_position`] in the module's `FunT`
+///   table (`emu_load.c:645-651` passes the loop index `i` as `old_index`);
+/// * `old_uniq` — the `FunT` entry's `old_uniq` field ([`FunDescriptor::uniq`]), which is
+///   the very word the compiler stores in the fun term's own `uniq` slot;
+/// * `creator` — **always** the init process, `erts_init_process_id` (`<0.0.0>`;
+///   `external.c:3989` writes it unconditionally), never the fun's creating process.
+///
+/// The other two inputs are not derivable from the `Module` IR alone and are therefore
+/// caller-supplied, so this function needs no I/O and no `.beam` reader of its own:
+/// `md5` is the module's 16-byte checksum (`ErlFunEntry.uniq`) — [`module_md5`] computes
+/// it from the `.beam` image — and `node` is the local node's name atom.
+///
+/// Returns `Ok(None)` when `module` defines no lambda matching the term's own
+/// `(uniq, index)` descriptor — a typed "not this module's fun", never a fabricated
+/// identity.
+///
+/// **Derivation ready, production wiring pending.** The only `beam_codec::Encoder`
+/// construction point in the running system is `beam_bifs`' `term_to_binary` encoder
+/// (`binconv.rs::encode_body`), which has no seam to receive this identity yet — see the
+/// crate report's `beam_bifs` handoff. Until that seam lands the function is exercised by
+/// the oracle test below (hence the `dead_code` allowance).
+///
+/// [`FunDescriptor::uniq`]: beam_loader::FunDescriptor::uniq
+#[allow(dead_code)]
+pub(super) fn local_fun_identity(
+    module: &Module,
+    module_atom: Atom,
+    term: Eterm,
+    md5: [u8; 16],
+    node: Atom,
+) -> Result<Option<beam_codec::FunIdentity>> {
+    // The term's own identity words: `uniq` is the `FunT` entry's `old_uniq`, `index` its
+    // `FunT` index (`make_fun3` builds exactly those; `families/funs.rs`).
+    let uniq = beam_engine::terms::fun_uniq(term)?;
+    let index = beam_engine::terms::fun_index(term)?;
+    let Some(position) = descriptor_position(module, uniq, index) else {
+        return Ok(None);
+    };
+    // `FunT` is a `Vec` of descriptors, so its length fits a `u32` (the wire field's width).
+    let old_index = u32::try_from(position).map_err(|_| BeamError::SystemLimit)?;
+    let old_uniq = module.funs()[position].uniq;
+    Ok(Some(beam_codec::FunIdentity::new(
+        module_atom,
+        md5,
+        old_index,
+        old_uniq,
+        // `erts_init_process_id` — the fixed `<0.0.0>`: number 0, serial 0, creation 0.
+        beam_codec::FunPid {
+            node,
+            number: 0,
+            serial: 0,
+            creation: 0,
+        },
+    )))
+}
+
+/// The module **checksum** — the 16-byte MD5 a `NEW_FUN_EXT` fun identity carries as
+/// `uniq` — of a `.beam` image, computed exactly as the loader does
+/// (`beam_file.c:1749-1836`).
+///
+/// It is a running MD5 over a **fixed subset** of the container, in this order:
+/// `AtU8 ++ Code ++ StrT ++ ImpT ++ ExpT ++ FunT' ++ LitT ++ Meta ++ Recs ++ DbgB`.
+/// `Line`/`LocT`/`Attr`/`CInf`/`Atom`/`Type` are deliberately excluded, and an absent (or
+/// empty) chunk simply contributes nothing. `FunT` is the one special case: its 4-byte
+/// entry count is digested as-is, and then each 24-byte entry contributes its first 20
+/// bytes with the trailing 4-byte `OldUniq` field **zeroed** — that field is a superseded,
+/// endian-dependent hash and must not perturb the checksum.
+///
+/// `beam_loader::container::parse` is public and exposes each chunk's unpadded payload, so
+/// this digests the loaded `.beam`'s own byte stream — the same bytes the oracle's
+/// `beam_lib:md5/1` hashes (proven by the oracle test below).
+///
+/// # Errors
+///
+/// `BeamError::BadArg` for an image whose container does not parse, and for a `FunT` chunk
+/// that is not `4 + 24n` bytes (`BEAMFILE_READ_CORRUPT_LAMBDA_TABLE`).
+///
+/// Unused in production until the `beam_bifs` fun-identity seam lands (see
+/// [`local_fun_identity`]); exercised today by the oracle test below.
+#[allow(dead_code)]
+pub(super) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
+    use beam_loader::container::{parse, ChunkId};
+
+    let container = parse(beam)?;
+    // A missing chunk is the empty slice, exactly like the C's zero-initialized `chunks`
+    // (`iff_init`/`read_beam_chunks` leave an absent chunk at size 0), which contributes
+    // nothing to the digest.
+    let chunk = |id: ChunkId| -> &[u8] {
+        container
+            .find(id)
+            .map(|chunk| chunk.data)
+            .unwrap_or_default()
+    };
+
+    let mut digest_input = Vec::new();
+    for id in [ChunkId::ATOM, ChunkId::CODE, ChunkId::STRT, ChunkId::IMPT, ChunkId::EXPT] {
+        digest_input.extend_from_slice(chunk(id));
+    }
+    let lambdas = chunk(ChunkId::FUNT);
+    if !lambdas.is_empty() {
+        // The C only walks the lambda table when it is non-empty, and every entry it
+        // consumes is a whole 24-byte record; a shorter chunk is the corrupt-lambda-table
+        // error rather than a silently short digest.
+        let Some(count) = lambdas.get(..4) else {
+            return Err(BeamError::BadArg);
+        };
+        digest_input.extend_from_slice(count);
+        let mut rest = &lambdas[4..];
+        while let Some(entry) = rest.get(..24) {
+            // `[function:u32][arity:u32][index:u32][num_free:u32]` are digested…
+            digest_input.extend_from_slice(&entry[..20]);
+            // …and the entry's trailing `OldUniq` is forced to zero.
+            digest_input.extend_from_slice(&[0u8; 4]);
+            rest = &rest[24..];
+        }
+        if !rest.is_empty() {
+            return Err(BeamError::BadArg);
+        }
+    }
+    for id in [ChunkId::LITT, ChunkId::META, ChunkId::RECS, ChunkId::DBGB] {
+        digest_input.extend_from_slice(chunk(id));
+    }
+    Ok(beam_dist::md5(&digest_input))
+}
+
+/// Oracle proofs for the `NEW_FUN_EXT` (`112`) local-fun identity derivation.
+///
+/// [`local_fun_identity`] resolves the four fields a `make_fun3` closure's term does not
+/// carry (`module`/`old_index`/`old_uniq`/`creator`) and [`module_md5`] the fifth (`uniq`,
+/// the module checksum). This test drives the **real** path end to end: the system `erlc`
+/// compiles a fixture module, `beam_rt` loads its `.beam` and executes a fun-returning
+/// function (so the term is a genuine `make_fun3` `FunKind::Local`), the identity is
+/// derived from the loaded module, and the encoded image is asserted **byte-identical** to
+/// the system `erl` oracle's `term_to_binary/1`. It skips **loudly** when no `erl`/`erlc`
+/// is available — never a silent pass.
+///
+/// The test covers `num_free` 0/1/2 (and therefore `arity` 0/1) and three distinct `FunT`
+/// positions, so the `(uniq, index)` → `old_index` lookup is exercised where the three
+/// funs share one `old_uniq` and differ only by index.
+#[cfg(test)]
+mod tests {
+    use std::path::{Path, PathBuf};
+    use std::process::{Command, Stdio};
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    use beam_term::prelude::make_small;
+    use beam_term::Eterm;
+
+    use super::{local_fun_identity, module_md5};
+    use crate::runtime::Runtime;
+
+    /// The fixture module compiled by `erlc` for the oracle test — the same one
+    /// `beam_codec/tests/local_fun_encode.rs` uses: `mk/1` captures one free variable,
+    /// `mk2/2` two and `mk0/0` none.
+    const LFUN_SRC: &str = "\
+-module(lfun).
+-export([mk/1, mk2/2, mk0/0]).
+mk(X) -> fun(Y) -> X + Y end.
+mk2(A, B) -> fun() -> {A, B} end.
+mk0() -> fun() -> ok end.
+";
+
+    /// The oracle probe: build the three funs in [`cases`] order and print one hex line per
+    /// image — the module checksum first, then each `term_to_binary(F)`. The checksum comes
+    /// from `beam_lib:md5/1` (the oracle's own definition of the module MD5), so it pins
+    /// [`module_md5`] independently of the encoder.
+    const ORACLE_EVAL: &str = "Fs = [lfun:mk(7), lfun:mk2(1,2), lfun:mk0()], \
+{ok,{lfun,Md5}} = beam_lib:md5(code:which(lfun)), \
+io:format(\"~s~n\", [binary:encode_hex(Md5)]), \
+lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F))]) end, Fs)";
+
+    /// The three fixture functions, in the oracle probe's order, with the arguments the
+    /// oracle passes them.
+    fn cases() -> [(&'static str, u32, Vec<Eterm>); 3] {
+        [
+            ("mk", 1, vec![make_small(7)]),
+            ("mk2", 2, vec![make_small(1), make_small(2)]),
+            ("mk0", 0, Vec::new()),
+        ]
+    }
+
+    #[test]
+    fn compiled_module_local_fun_encodes_byte_exactly_like_the_oracle() {
+        let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+            skip_loudly("no usable `erl` and/or `erlc`");
+            return;
+        };
+        let dir = compile_fixture(&erlc, "compiled_module_local_fun");
+        let lines = run_oracle(&oracle, dir.path());
+        assert_eq!(
+            lines.len(),
+            4,
+            "the oracle must print the checksum then three fun images, got {lines:?}"
+        );
+
+        // (1) The module checksum: our derivation from the `.beam` bytes must agree with
+        //     `beam_lib:md5/1` byte-for-byte.
+        let oracle_md5 = decode_hex(&lines[0]);
+        assert_eq!(oracle_md5.len(), 16, "a module checksum is 16 bytes");
+        let beam = std::fs::read(dir.join("lfun.beam")).expect("the fixture .beam");
+        let md5 = module_md5(&beam).expect("the fixture's module checksum");
+        assert_eq!(
+            md5.as_slice(),
+            oracle_md5.as_slice(),
+            "module_md5 must equal beam_lib:md5 (ours {}, oracle {})",
+            hex(&md5),
+            hex(&oracle_md5)
+        );
+
+        // (2) The runtime's own `make_fun3` term, encoded with the derived identity, must
+        //     reproduce the oracle's `term_to_binary/1` exactly.
+        let images: Vec<Vec<u8>> = lines[1..].iter().map(|line| decode_hex(line)).collect();
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        for (case, (function, arity, args)) in cases().into_iter().enumerate() {
+            let term = runtime
+                .run_function(dir.join("lfun.beam"), function, arity, &args)
+                .unwrap_or_else(|e| panic!("lfun:{function}/{arity} did not run: {e:?}"));
+            let atoms = runtime.code_server().atoms();
+            let module = runtime
+                .code_server()
+                .module("lfun")
+                .expect("the fixture is cached under its own name");
+            let node = atoms
+                .lookup("nonode@nohost")
+                .expect("the node atom is seeded at boot");
+            let identity = local_fun_identity(module, module.name, term, md5, node)
+                .unwrap_or_else(|e| panic!("lfun:{function}/{arity} identity: {e:?}"))
+                .unwrap_or_else(|| {
+                    panic!("lfun:{function}/{arity} must resolve to an lfun lambda")
+                });
+            let mut encoder = beam_codec::Encoder::new(atoms).with_fun_identity(identity);
+            encoder
+                .encode(term)
+                .unwrap_or_else(|e| panic!("lfun:{function}/{arity} did not encode: {e:?}"));
+            let produced = encoder.as_bytes();
+            assert_eq!(
+                produced,
+                images[case].as_slice(),
+                "case {case} (lfun:{function}/{arity}): our NEW_FUN_EXT must be\n  \
+                 ours:   {}\n  oracle: {}\n  our identity: {identity:?}",
+                hex(produced),
+                hex(&images[case])
+            );
+        }
+    }
+
+    /// A fun from **another** module has no `FunT` position in this one, so the derivation
+    /// reports "not this module's fun" rather than inventing an identity.
+    #[test]
+    fn a_fun_from_another_module_has_no_identity_here() {
+        let (Some(_oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
+            skip_loudly("no usable `erl` and/or `erlc`");
+            return;
+        };
+        let dir = compile_fixture(&erlc, "a_fun_from_another_module");
+        let mut runtime = Runtime::with_defaults().expect("the default runtime");
+        let term = runtime
+            .run_function(dir.join("lfun.beam"), "mk0", 0, &[])
+            .expect("lfun:mk0/0 runs");
+        // A *different* module: `lists` is a real compiled module with its own lambda
+        // table, so it is the honest counter-example.
+        let Some(path) = runtime.find_module_file("lists") else {
+            skip_loudly("the system stdlib `lists.beam` is not resolvable");
+            return;
+        };
+        runtime.load_module(path).expect("`lists` loads");
+        let atoms = runtime.code_server().atoms();
+        let other = runtime
+            .code_server()
+            .module("lists")
+            .expect("`lists` is cached under its own name");
+        let node = atoms.lookup("nonode@nohost").expect("the node atom");
+        let identity = local_fun_identity(other, other.name, term, [0u8; 16], node)
+            .expect("the lookup itself succeeds");
+        assert!(
+            identity.is_none(),
+            "an lfun closure must not resolve against `lists`' lambda table (got {identity:?})"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Oracle resolution, fixture compilation and process plumbing
+    // (mirrors tests/nif.rs / tests/records.rs)
+    // ---------------------------------------------------------------------
+
+    /// Whether `p` is an existing executable file.
+    fn is_executable(p: &Path) -> bool {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            match std::fs::metadata(p) {
+                Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
+                Err(_) => false,
+            }
+        }
+        #[cfg(not(unix))]
+        {
+            p.is_file()
+        }
+    }
+
+    /// The first `name` on `$PATH` that is an executable file.
+    fn find_on_path(name: &str) -> Option<PathBuf> {
+        let path = std::env::var_os("PATH")?;
+        std::env::split_paths(&path)
+            .filter(|dir| !dir.as_os_str().is_empty())
+            .map(|dir| dir.join(name))
+            .find(|candidate| is_executable(candidate))
+    }
+
+    /// Resolve the oracle the way `tools/differential` does: `$ERTS_ORACLE` if executable,
+    /// else `erl` on `$PATH`.
+    fn resolve_oracle() -> Option<PathBuf> {
+        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
+            let program = PathBuf::from(&value);
+            return is_executable(&program).then_some(program);
+        }
+        find_on_path("erl")
+    }
+
+    /// The compiler: a sibling of the oracle first (the same installation), then `$PATH`.
+    fn resolve_erlc() -> Option<PathBuf> {
+        if let Some(oracle) = resolve_oracle() {
+            if let Some(dir) = oracle.parent() {
+                let candidate = dir.join("erlc");
+                if is_executable(&candidate) {
+                    return Some(candidate);
+                }
+            }
+        }
+        find_on_path("erlc")
+    }
+
+    /// Prints the loud skip banner — a missing toolchain is never a silent pass.
+    fn skip_loudly(why: &str) {
+        eprintln!();
+        eprintln!("=============== beam_rt local_fun_encode SKIPPED ===============");
+        eprintln!("{why}: the compiled-module NEW_FUN_EXT proof cannot run.");
+        eprintln!("Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
+        eprintln!("===============================================================");
+        eprintln!();
+    }
+
+    /// Monotonic per-call sequence number making each fixture scratch directory unique even
+    /// within one process (the two tests run in parallel threads of the same test binary).
+    static FIXTURE_SEQ: AtomicUsize = AtomicUsize::new(0);
+
+    /// A compiled-fixture scratch directory that removes itself on drop, so the per-call
+    /// unique directories never accumulate in the temp dir.
+    struct FixtureDir {
+        path: PathBuf,
+    }
+
+    impl FixtureDir {
+        /// The directory itself (e.g. for `erlc -o` / the oracle's `-pa`).
+        fn path(&self) -> &Path {
+            &self.path
+        }
+
+        /// A path inside the directory (e.g. the compiled `.beam`).
+        fn join(&self, name: &str) -> PathBuf {
+            self.path.join(name)
+        }
+    }
+
+    impl Drop for FixtureDir {
+        fn drop(&mut self) {
+            // Best effort, but never silent: a leftover scratch dir must not fail the test,
+            // yet a cleanup failure is reported rather than swallowed.
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                eprintln!(
+                    "warning: could not remove the fixture scratch dir {}: {e}",
+                    self.path.display()
+                );
+            }
+        }
+    }
+
+    /// Compiles the fixture into a scratch directory unique **per call** — keyed by the
+    /// fixture name, the process id and an atomic counter — and returns it. The previous
+    /// scheme keyed the directory by process id alone, so the two tests sharing `lfun.erl` /
+    /// `lfun.beam` raced when the lib tests ran in parallel.
+    fn compile_fixture(erlc: &Path, fixture: &str) -> FixtureDir {
+        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
+        let dir = std::env::temp_dir().join(format!(
+            "beam_rt_local_fun_{fixture}_{}_{seq}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
+        let src = dir.join("lfun.erl");
+        std::fs::write(&src, LFUN_SRC).expect("the fixture source is writable");
+        let output = Command::new(erlc)
+            .arg("-o")
+            .arg(&dir)
+            .arg(&src)
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn erlc '{}': {e}", erlc.display()));
+        assert!(
+            output.status.success(),
+            "erlc '{}' failed with {:?}\n--- stderr ---\n{}",
+            erlc.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        FixtureDir { path: dir }
+    }
+
+    /// Runs the oracle probe against the compiled fixture and returns its stdout lines.
+    fn run_oracle(oracle: &Path, code_dir: &Path) -> Vec<String> {
+        let output = Command::new(oracle)
+            .arg("-noshell")
+            .arg("-pa")
+            .arg(code_dir)
+            .arg("-eval")
+            .arg(ORACLE_EVAL)
+            .arg("-s")
+            .arg("init")
+            .arg("stop")
+            .stdin(Stdio::null())
+            .output()
+            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
+        assert!(
+            output.status.success(),
+            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}\n--- eval ---\n{ORACLE_EVAL}",
+            oracle.display(),
+            output.status.code(),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stdout = String::from_utf8(output.stdout)
+            .unwrap_or_else(|e| panic!("the oracle printed non-UTF-8 to stdout: {e}"));
+        stdout
+            .lines()
+            .map(|line| line.trim().to_lowercase())
+            .filter(|line| !line.is_empty())
+            .collect()
+    }
+
+    /// Decodes an even-length hex line into bytes.
+    fn decode_hex(line: &str) -> Vec<u8> {
+        assert!(
+            line.chars().all(|c| c.is_ascii_hexdigit()),
+            "not a hex line: {line:?}"
+        );
+        assert_eq!(line.len() % 2, 0, "odd-length hex line: {line:?}");
+        (0..line.len())
+            .step_by(2)
+            .map(|i| {
+                u8::from_str_radix(&line[i..i + 2], 16)
+                    .unwrap_or_else(|e| panic!("bad hex pair in {line:?}: {e}"))
+            })
+            .collect()
+    }
+
+    /// An uppercase hex rendering of `bytes` for diagnostics.
+    fn hex(bytes: &[u8]) -> String {
+        bytes.iter().map(|b| format!("{b:02X}")).collect()
+    }
 }

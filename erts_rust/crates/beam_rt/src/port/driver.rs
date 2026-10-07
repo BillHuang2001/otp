@@ -1,0 +1,1068 @@
+//! The **driver C ABI host** (contract **A.4**, phase 1): load a real C `.so` driver and drive it.
+//!
+//! `beam_abi::driver` freezes the *shape* of the driver ABI — the `ErlDrvEntry` struct, the
+//! `driver_*` / `erl_drv_*` function table ([`beam_abi::driver::api::ErlDrvApi`]) and the
+//! `#[no_mangle]` host functions ([`beam_abi::driver::drv`]) — and owns the `dlopen` loader
+//! ([`beam_abi::driver::loader`]). Those host functions cannot do their job alone:
+//! `driver_output` must hand its bytes to *this* runtime, `erl_drv_output_term` must build its
+//! term on *this* runtime's heap and intern its atoms in *this* runtime's table, and
+//! `driver_connected` must answer with *this* runtime's pid. [`DriverPort`] is that host — the
+//! concrete [`beam_abi::DriverHost`] behind the opaque `*mut ErlDrvPort_` a driver callback
+//! receives.
+//!
+//! # The port handle is the environment pointer
+//!
+//! [`beam_abi::DriverEnv`] is the per-port environment; its `as_port` pointer **is** the
+//! `ErlDrvPort` a driver callback gets, and `beam_abi`'s host functions recover it with
+//! `DriverEnv::from_port`. `DriverEnv::new` erases the borrow of the host into a raw pointer (a
+//! documented `mem::transmute` inside `beam_abi`), so the caller must keep the host alive **and in
+//! place** for as long as the environment (and every port handle derived from it) is used.
+//! [`DriverPortAdapter::start`] is the one place that invariant is stated for this crate: the host
+//! lives in a `Box` that never moves, and the environment is itself `Box`ed **before** its handle is
+//! taken, because the handle *is* the environment's own address — a driver may keep it in its
+//! private state for the port's whole life (the A.4 fixture does exactly that).
+//!
+//! # What phase 1 proves
+//!
+//! A real C driver `.so`, compiled against the system `erl_driver.h`, is `dlopen`ed, validated and
+//! driven: the driver's `start` callback allocates its private state through the runtime's
+//! `driver_alloc`, its `output` callback echoes through `driver_output`, and the bytes land in
+//! [`DriverPort::outputs`]. [`DriverPortAdapter`] then routes those bytes end to end: a
+//! `{spawn_driver, Name}` port queued from Erlang reaches the driver's `output` callback through
+//! `port_command`, and the echo comes back to the owner as `{Port, {data, Data}}`. The driver's
+//! `driver_*` imports are left **undefined** by the linker and
+//! bind at `dlopen(RTLD_NOW)` out of the loading process's **dynamic symbol table**
+//! (`build.rs`'s `-Wl,--export-dynamic`, anchored by
+//! [`PortRegistry::new`](crate::port::PortRegistry::new)'s `black_box` reference to
+//! [`beam_abi::driver::drv::driver_api_table`]). `tests/driver.rs` pins the mechanism with
+//! `nm -D` / `readelf --dyn-syms` and the end-to-end delivery.
+//!
+//! # The event and timer surface (phase 2)
+//!
+//! A driver's own event and timer requests are **real**, not captured:
+//!
+//! * `driver_select(port, (ErlDrvEvent)fd, mode, on)` registers `fd` with the runtime's **one**
+//!   [`beam_io::Poller`] — the same poll set every port's descriptors live in — through the port's
+//!   [`beam_io::DriverContext`]. Readiness then schedules the port's `INPUT`/`OUTPUT` task, which
+//!   runs the driver's own `ready_input`/`ready_output` callback with the very descriptor the C
+//!   passes there (`erl_check_io.c:1886`: `(ErlDrvEvent) state->fd`).
+//! * `driver_set_timer(port, ms)` arms the port's `TIMEOUT` task by declaring a deadline through
+//!   [`beam_io::Driver::next_timeout`], which the port mirrors after **every** driver interaction
+//!   (`beam_io::Port::refresh_timeout`). The runtime's poll round is clamped by that deadline
+//!   (`beam_io::PortRegistry::next_deadline`), so the driver's `timeout` callback fires **at** its
+//!   deadline. `driver_read_timer` reports the remaining milliseconds and `driver_cancel_timer`
+//!   drops the deadline — with the C's own return codes.
+//!
+//! The host function a C driver calls has no way to reach the port lifecycle that owns the poller
+//! (the `DriverHost` seam is frozen and the opaque `ErlDrvPort` is the *only* thing a callback
+//! receives), so the two share one [`DriverControl`]: a callback records what it asked for and the
+//! adapter applies it as soon as the callback returns — exactly the pattern
+//! [`DriverPort::take_outputs`] already uses for `driver_output` bytes. A host that no port
+//! lifecycle has claimed (a bare [`Driver`] driven by a test) therefore answers the C's failure
+//! code rather than recording a request nobody would ever apply.
+//!
+//! # What is NOT wired yet (the typed gaps)
+//!
+//! * **`driver_async` / `driver_async_cancel`.** `Runtime` is `!Send` (it owns `Rc`/`RefCell`
+//!   tables, a `dlopen`ed library registry and pointer-stable term arenas), so a worker thread
+//!   cannot call back into it and there is no async pool to schedule on. The C's *in-band* path
+//!   (no pool ⇒ invoke in the caller, then `ready_async`, then `async_free` unless `ready_async`
+//!   is present — `erl_async.c:604-613`) needs the driver's private state and entry, which the
+//!   frozen [`DriverHost`] seam does not give the host. It is reported as the C's own failure code
+//!   (`-1`) rather than faked.
+//! * **`driver_control`** (the driver's `control` callback behind `port_control/3`). It is
+//!   reachable only from the port lifecycle, and its reply protocol (`rbuf`/`rlen`, plus the
+//!   `driver_free_buf` rule for a driver-allocated reply) is not modelled here.
+//! * **`driver_send_term` is captured, not delivered.** The decoded term is recorded in
+//!   [`DriverPort::sent`]; turning it into a port message to the owner needs a term-carrying port
+//!   notification the port machinery does not have (a port's input queue is bytes).
+//! * **`ERL_DRV_USE` / `stop_select`** is accepted but never fires: a deselected event is
+//!   deregistered from the poll set, yet the driver's `stop_select` callback is not run.
+
+use std::cell::RefCell;
+use std::rc::Rc;
+use std::time::{Duration, Instant};
+
+use libc::{c_int, c_ulong};
+
+use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
+use beam_abi::driver::types::{ErlDrvEvent, ErlDrvPort, ERL_DRV_READ, ERL_DRV_WRITE};
+use beam_abi::{DriverEnv, DriverHost};
+use beam_common::BeamError;
+use beam_alloc::Heap;
+use beam_bifs::AtomInterner;
+use beam_io::{DriverContext, Interest, Token};
+use beam_process::ProcessId;
+use beam_term::{make_atom, AtomTable, Eterm};
+
+use crate::context::PendingInterner;
+
+/// One `driver_select` request a driver callback made through [`DriverHost::select`].
+///
+/// The C acts on it immediately; here it is *recorded* and applied by the port lifecycle as soon
+/// as the callback returns (see the module docs). `fd` is the `ErlDrvEvent` the C passes — the
+/// descriptor itself, exactly as `erl_check_io.c` reads it back out of the event.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct SelectRequest {
+    /// The descriptor the driver selected (or deselected).
+    fd: c_int,
+    /// The `ERL_DRV_READ`/`ERL_DRV_WRITE` (and, unhandled, `ERL_DRV_USE`) mode bits.
+    mode: c_int,
+    /// Non-zero to select, zero to deselect (`driver_select`'s `on` argument).
+    on: c_int,
+}
+
+/// The armed readiness directions of one registration, per descriptor.
+///
+/// [`Interest`] has no "nothing armed" value, so the two directions are tracked as plain booleans
+/// and converted to an [`Interest`] only when something is (still) armed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+struct Armed {
+    /// Whether the descriptor is armed for readability.
+    read: bool,
+    /// Whether the descriptor is armed for writability.
+    write: bool,
+}
+
+impl Armed {
+    /// The `Interest` mask for the armed directions, or `None` when both were deselected.
+    fn interest(self) -> Option<Interest> {
+        match (self.read, self.write) {
+            (true, true) => Some(Interest::BOTH),
+            (true, false) => Some(Interest::READABLE),
+            (false, true) => Some(Interest::WRITABLE),
+            (false, false) => None,
+        }
+    }
+
+    /// This set with `mode`'s directions turned on (`on`) or off.
+    fn with(mut self, mode: c_int, on: bool) -> Armed {
+        for (bit, side) in [
+            (ERL_DRV_READ, &mut self.read),
+            (ERL_DRV_WRITE, &mut self.write),
+        ] {
+            if mode & bit != 0 {
+                *side = on;
+            }
+        }
+        self
+    }
+}
+
+/// The per-port state a [`DriverPort`] host and its [`DriverPortAdapter`] lifecycle share.
+///
+/// One host is one port, so there is exactly one of these per port and no identity matching is
+/// needed: a request recorded here belongs to this port by construction. The `Rc<RefCell<..>>` is
+/// the channel (the host function has no other way to reach the lifecycle), which is why neither
+/// side may hold a borrow **across** a driver callback — the callback is what calls back in.
+#[derive(Debug, Default)]
+struct DriverControl {
+    /// Whether a port lifecycle claimed this host ([`DriverPortAdapter::load`]). Until then a
+    /// select/timer request has nobody to apply it and is refused with the C's failure code.
+    attached: bool,
+    /// Whether the driver's entry declares a `timeout` callback — the C's precondition for
+    /// `driver_set_timer` succeeding (`io.c:6918`: `-1` when `entry->timeout == NULL`).
+    timer_capable: bool,
+    /// The deadline the port's timer is currently armed at (`None` = no timer pending).
+    deadline: Option<Instant>,
+    /// The `driver_select` requests recorded since the lifecycle last applied them.
+    selects: Vec<SelectRequest>,
+}
+
+/// One loaded driver and the host its callbacks run against.
+///
+/// The field order is deliberate, mirroring `crate::nif`'s `NifEntry`: the loaded library drops
+/// **before** the host, so the driver's `finish` callback (run from [`DriverLibrary`]'s `Drop`)
+/// still sees a live host if it calls a `driver_*` function.
+pub struct Driver {
+    /// The `dlopen`ed library (its `Drop` runs `finish` then `dlclose`s).
+    library: DriverLibrary,
+    /// The host every callback of this driver draws its runtime services from.
+    ///
+    /// Boxed so the [`DriverEnv`] pointer handed to the driver stays valid: the host must not move
+    /// while a callback holds a port handle derived from it.
+    host: Box<DriverPort>,
+}
+
+impl Driver {
+    /// Pairs `library` with the `host` its callbacks will run against.
+    pub fn new(library: DriverLibrary, host: DriverPort) -> Driver {
+        Driver {
+            library,
+            host: Box::new(host),
+        }
+    }
+
+    /// The loaded library (the `ErlDrvEntry` plus its `start`/`output`/`control`/`stop` wrappers).
+    pub fn library(&self) -> &DriverLibrary {
+        &self.library
+    }
+
+    /// The host shared by every callback of this driver, for the driver's whole lifetime.
+    pub fn host(&self) -> &DriverPort {
+        &self.host
+    }
+
+    /// The host, mutably (the caller building the environment).
+    pub fn host_mut(&mut self) -> &mut DriverPort {
+        &mut self.host
+    }
+
+    /// The driver name the entry declares (`ErlDrvEntry::driver_name`).
+    pub fn name(&self) -> String {
+        self.library.name()
+    }
+}
+
+/// A driver host for one port: the runtime services the `driver_*` / `erl_drv_*` functions need.
+///
+/// It owns a private term arena (the heap the term-data decoder builds its terms on), holds a
+/// handle to the runtime's **one shared** [`AtomTable`] plus the deferred-commit [`PendingInterner`]
+/// a *new* atom is recorded on, and answers the port queries with the owning [`ProcessId`].
+///
+/// See the module docs for the current scope: the output / term-data / pid services and the
+/// recorded `driver_select` / timer requests are implemented; `driver_async` and the custom
+/// `control` keep the seam's typed defaults.
+pub struct DriverPort {
+    /// The term arena the term-data decoder allocates on.
+    ///
+    /// Runtime-lifetime and **never reset**: an `erl_drv_output_term` result is a term — a pointer —
+    /// and the driver may hold it after the callback returns (the same rule as
+    /// [`crate::port::PortRegistry`]'s `port_info` arena).
+    heap: Heap,
+    /// A handle to the runtime's shared atom table, used to resolve (never to mint *through*) an
+    /// existing atom.
+    atoms: Rc<AtomTable>,
+    /// The deferred-commit interner a **new** atom is recorded on (see
+    /// [`DriverPort::commit_atoms`]).
+    interner: PendingInterner,
+    /// The process the port belongs to — what `driver_connected` / `driver_caller` report.
+    owner: ProcessId,
+    /// Every `driver_output` / `erl_drv_output` payload, in call order.
+    outputs: Vec<Vec<u8>>,
+    /// Every decoded term handed to `send_term` (`erl_drv_output_term` / `erl_drv_send_term`),
+    /// with the destination (`None` = the port owner).
+    sent: Vec<(Option<Eterm>, Eterm)>,
+    /// The event/timer state shared with the port lifecycle that owns this host (see
+    /// [`DriverControl`]).
+    control: Rc<RefCell<DriverControl>>,
+}
+
+impl DriverPort {
+    /// A host over `heap`, resolving/interning atoms against `atoms`, running as `owner`.
+    pub fn new(heap: Heap, atoms: Rc<AtomTable>, owner: ProcessId) -> DriverPort {
+        let interner = PendingInterner::new(atoms.len());
+        DriverPort {
+            heap,
+            atoms,
+            interner,
+            owner,
+            outputs: Vec::new(),
+            sent: Vec::new(),
+            control: Rc::new(RefCell::new(DriverControl::default())),
+        }
+    }
+
+    /// The event/timer state this host shares with its port lifecycle.
+    ///
+    /// [`DriverPortAdapter::load`] takes this handle so the driver's `driver_select` and
+    /// `driver_set_timer` requests reach the poller and the port's `TIMEOUT` task (see the module
+    /// docs). A host nobody claims keeps answering the C's failure code for both.
+    fn control(&self) -> Rc<RefCell<DriverControl>> {
+        Rc::clone(&self.control)
+    }
+    /// The process the port belongs to.
+    pub fn owner(&self) -> ProcessId {
+        self.owner
+    }
+
+    /// Every captured `driver_output` payload, in call order.
+    pub fn outputs(&self) -> &[Vec<u8>] {
+        &self.outputs
+    }
+
+    /// Every decoded term a `*_output_term` / `*_send_term` call delivered: `(destination, term)`.
+    pub fn sent(&self) -> &[(Option<Eterm>, Eterm)] {
+        &self.sent
+    }
+
+    /// Takes every captured `driver_output` / `erl_drv_output` payload out, in call order.
+    ///
+    /// The port lifecycle drains them after each driver interaction
+    /// ([`DriverPortAdapter::output`]) and queues them as the port's input; the
+    /// [`DriverPort::outputs`] accessor is the accumulate-only view the unit tests read.
+    pub fn take_outputs(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.outputs)
+    }
+
+    /// The name of `term` when it is an atom the shared table **already** holds.
+    ///
+    /// A name recorded on the pending interner is not resolvable until
+    /// [`DriverPort::commit_atoms`] lands it, so this answers `None` for it — the honest answer,
+    /// never a guessed name.
+    pub fn atom_name(&self, term: Eterm) -> Option<&str> {
+        if !beam_term::is_atom(term) {
+            return None;
+        }
+        self.atoms.name(beam_term::atom_val(term))
+    }
+
+    /// Interns the names recorded by [`DriverHost::intern_atom`] into `atoms`, in order.
+    ///
+    /// The same deferred-commit rule as the NIF host (`crate::nif`'s `NifHostImpl`): the runtime's
+    /// atom table is held immutably while a driver callback runs, so a *new* name is given its
+    /// predicted index straight away and only materialised **after** the borrow is released. The
+    /// caller must pass the **same** table the host's `atoms` handle refers to.
+    pub fn commit_atoms(&self, atoms: &mut AtomTable) {
+        self.interner.commit(atoms);
+    }
+
+    /// Builds the one per-port environment for this driver.
+    ///
+    /// The returned [`DriverEnv`] must stay alive — and must not be moved — for as long as any
+    /// `ErlDrvPort` derived from it is used (the `ErlDrvPort` **is** the environment's own address;
+    /// see the module docs). One host is one port and the host is not shared, so exactly one
+    /// environment is meaningful; nothing stops a second call, but the two would define the same
+    /// port.
+    pub fn environment(&mut self) -> DriverEnv {
+        DriverEnv::new(self)
+    }
+
+    /// Takes the term arena back out (a host is consumed once its driver is unloaded).
+    pub fn into_heap(self) -> Heap {
+        self.heap
+    }
+}
+
+impl DriverHost for DriverPort {
+    /// The term arena the term-data decoder allocates on.
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    /// An existing atom keeps the shared table's index; a new one is recorded on the pending
+    /// interner at its predicted index (committed later by [`DriverPort::commit_atoms`]).
+    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+        if let Some(atom) = self.atoms.lookup(name) {
+            return Some(make_atom(atom));
+        }
+        Some(make_atom(self.interner.intern(name)))
+    }
+
+    /// Records the port's request to watch `event` (`driver_select`); the port lifecycle applies
+    /// it as soon as this callback returns (see the module docs).
+    ///
+    /// `0` means "recorded", `-1` the C's failure code: a host no port lifecycle has claimed, and
+    /// an `event` that is not a descriptor at all (a 64-bit handle cannot be an fd). The
+    /// registration itself happens right after the callback, so a poller-level refusal cannot be
+    /// reported here — it surfaces as the port operation's own error instead (never silently).
+    fn select(&mut self, _port: ErlDrvPort, event: ErlDrvEvent, mode: c_int, on: c_int) -> c_int {
+        let Ok(fd) = c_int::try_from(event as isize) else {
+            return -1;
+        };
+        let Ok(mut control) = self.control.try_borrow_mut() else {
+            return -1;
+        };
+        if !control.attached {
+            return -1;
+        }
+        control.selects.push(SelectRequest { fd, mode, on });
+        0
+    }
+
+    /// Arms the port's timer at `ms` from now (`driver_set_timer`).
+    ///
+    /// `0`/`-1` are the C's own codes: a port whose entry declares no `timeout` callback answers
+    /// `-1` (`io.c:6918`), as does a host no lifecycle has claimed. The call *is* synchronous: the
+    /// deadline is stored here and the port picks it up as this callback returns.
+    fn set_timer(&mut self, _port: ErlDrvPort, ms: c_ulong) -> c_int {
+        let Some(deadline) = Instant::now().checked_add(Duration::from_millis(ms)) else {
+            // A delay that does not fit an `Instant` cannot be a deadline: the C's failure code is
+            // the honest answer (never a silently dropped timer).
+            return -1;
+        };
+        let Ok(mut control) = self.control.try_borrow_mut() else {
+            return -1;
+        };
+        if !control.attached || !control.timer_capable {
+            return -1;
+        }
+        control.deadline = Some(deadline);
+        0
+    }
+
+    /// Drops the port's pending timer (`driver_cancel_timer`) — `0`, or the C's `-1` for a host no
+    /// lifecycle has claimed.
+    fn cancel_timer(&mut self, _port: ErlDrvPort) -> c_int {
+        let Ok(mut control) = self.control.try_borrow_mut() else {
+            return -1;
+        };
+        if !control.attached {
+            return -1;
+        }
+        control.deadline = None;
+        0
+    }
+
+    /// The remaining milliseconds of the port's timer (`driver_read_timer`).
+    ///
+    /// The C answers `0` with the remaining time for *any* live port (`io.c:6930-6946`, its
+    /// `erts_read_port_timer` is `0` when nothing is pending), so `None` — the seam's `-1` — is
+    /// reserved for a host no lifecycle has claimed.
+    fn read_timer(&mut self, _port: ErlDrvPort) -> Option<c_ulong> {
+        let control = self.control.try_borrow().ok()?;
+        if !control.attached {
+            return None;
+        }
+        let remaining = match control.deadline {
+            Some(deadline) => deadline.saturating_duration_since(Instant::now()).as_millis(),
+            None => 0,
+        };
+        Some(c_ulong::try_from(remaining).unwrap_or(c_ulong::MAX))
+    }
+
+    /// Captures the port's output bytes (`driver_output` / `erl_drv_output`). Always succeeds: the
+    /// bytes are the driver's own and a capture cannot fail.
+    fn output(&mut self, _port: ErlDrvPort, data: &[u8]) -> c_int {
+        self.outputs.push(data.to_vec());
+        0
+    }
+    /// Captures the decoded term (`erl_drv_output_term` / `erl_drv_send_term`). Delivery to the
+    /// owner's mailbox is the port lifecycle's job (a phase-1 gap, see the module docs).
+    fn send_term(&mut self, _port: ErlDrvPort, to: Option<Eterm>, term: Eterm) -> c_int {
+        self.sent.push((to, term));
+        0
+    }
+
+    /// `driver_connected`: the port's owning process (this runtime's own pid term).
+    fn connected_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
+        Some(self.owner.to_eterm())
+    }
+
+    /// `driver_caller`: the process that opened the port. One [`DriverPort`] is one port opened by
+    /// one process, so this is the same pid [`DriverPort::connected_pid`] answers with.
+    fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
+        Some(self.owner.to_eterm())
+    }
+}
+
+/// Loads the driver shared object for `name`, trying each of `candidates` in order.
+///
+/// The candidate spellings are the caller's (typically the driver name as written in
+/// `open_port({spawn_driver, Name}, …)`, then the explicit `<Name>.so`); the `dlopen` loader appends
+/// the platform's shared-object suffix when a candidate does not already carry it
+/// (`beam_abi::driver::loader::load`), so `["t", "t.so"]` resolves `<dir>/t.so` on the first and the
+/// second attempt alike, and `["/abs/t"]` resolves `/abs/t.so`.
+///
+/// A failure is the loader's own typed [`DriverLoadError`] (its [`DriverLoadError::reason_atom`] is
+/// the oracle's `{error, Reason}` atom) — never a fabricated success and never a panic. The **last**
+/// candidate's error is the one reported, since it is the one that names the path actually meant.
+pub fn load_driver(
+    candidates: &[String],
+    name: &str,
+) -> std::result::Result<DriverLibrary, DriverLoadError> {
+    let mut last: Option<DriverLoadError> = None;
+    for candidate in candidates {
+        match loader::load(candidate, name) {
+            Ok(library) => return Ok(library),
+            Err(error) => last = Some(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| {
+        DriverLoadError::NoDriverInit(format!("no candidate paths to load driver '{name}' from"))
+    }))
+}
+
+/// The **port lifecycle** the A.4 host alone lacks: a [`beam_io::Driver`] over a loaded C driver.
+///
+/// [`DriverPort`] is the host behind the `ErlDrvPort` a driver callback receives; this type owns
+/// the driver itself and drives its `ErlDrvEntry` callbacks the way the runtime's port machinery
+/// asks for them ([`beam_io::Driver`]). It is what `open_port({spawn_driver, Name}, _)` registers:
+/// `beam_io::PortRegistry::open` boxes it, calls [`beam_io::Driver::start`] (⇒ the driver's `start`
+/// callback) and, at close, [`beam_io::Driver::stop`] (⇒ the driver's `stop` callback) followed by
+/// the `Driver` drop (`finish` + `dlclose`).
+///
+/// # Output is the driver's own callback, not a pipe
+///
+/// A `spawn`-driver port writes to the child's stdin; a *C driver* port has no child, so
+/// [`beam_io::Driver::output`] hands the bytes to the driver's `output` callback instead. The
+/// bytes the driver answers with through `driver_output` are captured by [`DriverPort`] and are
+/// then queued on the port's **input** queue — which is exactly what the port hands up to Erlang
+/// as `{Port, {data, Data}}` (see `crate::port::PortRegistry::pump`). Nothing here builds a term:
+/// the message is the runtime's, this type only moves bytes.
+///
+/// # Typed gaps (documented, never a fabricated success)
+///
+/// * `driver_async` keeps the [`beam_abi::DriverHost`] default (`-1`): see the module docs — there
+///   is no async pool, and the C's in-band path needs the entry and the driver's private state,
+///   which the frozen host seam does not hand the host function.
+/// * `driver_control` (the entry's `control` callback behind `port_control/3`) is not routed here
+///   yet, so [`beam_io::Driver::control`]'s default (no reply bytes) is used.
+/// * `driver_send_term`'s term is captured in [`DriverPort::sent`], never delivered: a port's
+///   notification channel carries bytes, not terms.
+/// * `ERL_DRV_USE` is accepted but its `stop_select` callback never fires.
+/// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
+///   `{Port, {exit_status, …}}` message is ever synthesized for it.
+pub struct DriverPortAdapter {
+    /// The loaded library **and** the host its callbacks run against (one `Box`, so the host never
+    /// moves while an `ErlDrvPort` derived from its environment is in use).
+    ///
+    /// `None` after [`DriverPortAdapter::stop`]: the entry's `stop` runs at most once.
+    driver: Option<Driver>,
+    /// The per-port environment the `ErlDrvPort` handed to the driver **is** (see the module docs).
+    ///
+    /// **Boxed, and that is load-bearing:** [`DriverEnv::as_port`] hands the driver the
+    /// environment's *own address*, so the environment must not move while the driver holds the
+    /// port handle (which it may, for as long as the port lives — the fixture even stores it in its
+    /// private state). A `Box` is allocated before `as_port` runs and only ever moves as a pointer,
+    /// so the handle stays valid for the port's whole life.
+    env: Option<Box<DriverEnv>>,
+    /// The private state the driver's `start` returned — what every later callback receives.
+    state: beam_abi::driver::types::ErlDrvData,
+    /// The driver name this port was loaded as.
+    name: String,
+    /// The command string handed to the driver's `start` callback (the `open_port/2` `Name`).
+    command: String,
+    /// The event/timer state shared with the host (see [`DriverControl`]).
+    control: Rc<RefCell<DriverControl>>,
+    /// The descriptors this port has registered with the poller, in selection order.
+    ///
+    /// One port shares a single poller key, so the event identity the C carries per registration
+    /// (`erl_check_io.c`'s `ErtsDrvEventState`) is not available from a `beam_io` port task. It is
+    /// rebuilt here from the driver's own selections, which is exact while a port has **one**
+    /// registration per direction — the single-fd case every `driver_select` user in this runtime
+    /// has today (see [`DriverPortAdapter::armed_event`]).
+    selected: Vec<Selection>,
+}
+
+/// One descriptor a driver selected, with the directions it armed.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Selection {
+    /// The descriptor the driver selected.
+    fd: c_int,
+    /// The directions armed for it.
+    armed: Armed,
+    /// The poller token, needed to re-register or deregister it.
+    token: Token,
+}
+
+impl DriverPortAdapter {
+    /// Loads the driver shared object for `name` from `candidates` and pairs it with `host`.
+    ///
+    /// The driver's `start` callback is **not** run here: [`beam_io::Driver::start`] runs it once
+    /// the port has an id, which is where the `ErlDrvPort` comes from. The host is claimed here,
+    /// which is what makes its `driver_select`/`driver_set_timer` requests applyable at all.
+    ///
+    /// # Errors
+    ///
+    /// The loader's own typed [`DriverLoadError`] (its [`DriverLoadError::reason_atom`] is the
+    /// oracle's `{error, Reason}` atom) — never a fabricated library and never a panic.
+    pub fn load(
+        candidates: &[String],
+        name: &str,
+        host: DriverPort,
+        command: String,
+    ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
+        let library = load_driver(candidates, name)?;
+        let control = host.control();
+        {
+            let mut state = control.borrow_mut();
+            state.attached = true;
+            // The C's precondition for `driver_set_timer` succeeding: an entry without a `timeout`
+            // callback has no timer at all (`io.c:6918`).
+            state.timer_capable = library.entry().timeout.is_some();
+        }
+        Ok(DriverPortAdapter {
+            driver: Some(Driver::new(library, host)),
+            env: None,
+            state: std::ptr::null_mut(),
+            name: name.to_string(),
+            command,
+            control,
+            selected: Vec::new(),
+        })
+    }
+
+    /// The driver name this port was loaded as.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The private state the driver's `start` returned (null before `start`).
+    pub fn state(&self) -> beam_abi::driver::types::ErlDrvData {
+        self.state
+    }
+
+    /// The descriptors this port has currently selected, as `(fd, read, write)` triples.
+    ///
+    /// Diagnostic: the driver's own `driver_select` state, as the poll set holds it.
+    pub fn selected(&self) -> Vec<(c_int, bool, bool)> {
+        self.selected
+            .iter()
+            .map(|selection| (selection.fd, selection.armed.read, selection.armed.write))
+            .collect()
+    }
+    /// Moves whatever the driver's just-finished callback asked of its port into the port itself:
+    /// the `driver_select` requests are applied to the poll set and the `driver_output` payloads
+    /// queued as the port's input (which is what reaches Erlang as `{Port, {data, Data}}`).
+    ///
+    /// Called right after **every** driver interaction, so a request is never left unapplied.
+    fn settle(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
+        self.collect_outputs(ctx);
+        self.apply_selects(ctx)
+    }
+
+    /// Queues every captured `driver_output` / `erl_drv_output` payload as this port's input.
+    fn collect_outputs(&mut self, ctx: &mut DriverContext<'_>) {
+        let Some(driver) = self.driver.as_mut() else {
+            return;
+        };
+        for chunk in driver.host_mut().take_outputs() {
+            ctx.input().push(&chunk);
+        }
+    }
+
+    /// Applies every `driver_select` request recorded during the last callback.
+    fn apply_selects(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
+        let requests = match self.control.try_borrow_mut() {
+            Ok(mut control) => std::mem::take(&mut control.selects),
+            // A nested borrow means a driver callback is still between the two of us; that cannot
+            // happen here (no borrow is held across a callback) so it is a capability gap, never a
+            // panic, and the requests stay recorded for the next round.
+            Err(_) => return Err(crate::error::unsupported("the driver port state is in use")),
+        };
+        for request in requests {
+            self.apply_select(ctx, request)?;
+        }
+        Ok(())
+    }
+
+    /// Applies one `driver_select` request to the poll set.
+    ///
+    /// The C's rule is per `(event, direction)`: `on` arms the `ERL_DRV_READ`/`ERL_DRV_WRITE`
+    /// directions named by `mode`, `!on` clears them, and the event is deregistered once no
+    /// direction is left (`erl_check_io.c:987`).
+    fn apply_select(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        request: SelectRequest,
+    ) -> beam_common::Result<()> {
+        let index = self.selected.iter().position(|s| s.fd == request.fd);
+        let current = index.map_or_else(Armed::default, |i| self.selected[i].armed);
+        let next = current.with(request.mode, request.on != 0);
+        match (index, next.interest()) {
+            // Nothing was armed and nothing becomes armed: a no-op (`ERL_DRV_USE` on its own, or a
+            // deselect of a direction this port never held).
+            (None, None) => Ok(()),
+            // Still armed: re-register with the new direction mask.
+            (Some(i), Some(interest)) => {
+                let token = self.selected[i].token;
+                ctx.reregister(request.fd, token, interest)?;
+                self.selected[i].armed = next;
+                Ok(())
+            }
+            // The last direction went away: drop the registration.
+            (Some(i), None) => {
+                let token = self.selected[i].token;
+                ctx.deregister(request.fd, token)?;
+                self.selected.remove(i);
+                Ok(())
+            }
+            // A new descriptor.
+            (None, Some(interest)) => {
+                let token = ctx.register(request.fd, interest)?;
+                self.selected.push(Selection {
+                    fd: request.fd,
+                    armed: next,
+                    token,
+                });
+                Ok(())
+            }
+        }
+    }
+
+    /// The descriptor to hand the driver's `ready_input`/`ready_output` for `read`.
+    ///
+    /// The C passes the **descriptor** the poller reported (`(ErlDrvEvent) state->fd`,
+    /// `erl_check_io.c:1886`). A `beam_io` port task carries no such identity — every registration
+    /// of a port shares the port's poller key — so the descriptor is recovered from the driver's
+    /// own selections: exact for the one-registration-per-direction case, and a typed capability
+    /// gap (never a wrong descriptor) when a driver has armed several.
+    fn armed_event(&self, read: bool) -> beam_common::Result<Option<c_int>> {
+        let mut armed = self
+            .selected
+            .iter()
+            .filter(|selection| {
+                if read {
+                    selection.armed.read
+                } else {
+                    selection.armed.write
+                }
+            })
+            .map(|selection| selection.fd);
+        let first = armed.next();
+        if armed.next().is_some() {
+            return Err(crate::error::unsupported(
+                "a driver that selected more than one event per direction",
+            ));
+        }
+        Ok(first)
+    }
+
+    /// Runs the driver's `ready_input`/`ready_output` for the descriptor the poller reported.
+    ///
+    /// An entry that declares no callback for the direction is the C's own no-op *plus* deselect
+    /// (`io.c:7523-7538`: `no_ready_input_callback` logs and deselects the event), so the
+    /// registration is dropped rather than spinning on a readiness nothing consumes.
+    fn dispatch_ready(
+        &mut self,
+        ctx: &mut DriverContext<'_>,
+        read: bool,
+    ) -> beam_common::Result<()> {
+        let Some(fd) = self.armed_event(read)? else {
+            // No registration for this direction: the task is spurious (a `port_command`-driven
+            // OUTPUT task, say) and there is nothing to dispatch.
+            return Ok(());
+        };
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        let event = fd as isize as ErlDrvEvent;
+        let called = if read {
+            driver.library().ready_input(self.state, event)
+        } else {
+            driver.library().ready_output(self.state, event)
+        };
+        match called {
+            Ok(()) => {}
+            // The entry has no callback for this direction: the C's `no_ready_*_callback`.
+            Err(error) if error.is_absent() => {
+                self.apply_select(
+                    ctx,
+                    SelectRequest {
+                        fd,
+                        mode: ERL_DRV_READ | ERL_DRV_WRITE,
+                        on: 0,
+                    },
+                )?;
+            }
+            Err(error) => return Err(driver_call_error(error)),
+        }
+        self.settle(ctx)
+    }
+
+    /// Clears the port's pending timer.
+    ///
+    /// It is cleared **before** the driver's `timeout` callback runs, the way the C does it
+    /// (`erts_port_task_handle_timeout` clears the port's timer state and only then invokes
+    /// `entry->timeout`): a `timeout` callback that re-arms with `driver_set_timer` therefore
+    /// really wins, which is the only way a port timer can repeat itself.
+    fn clear_timeout(&self) {
+        if let Ok(mut control) = self.control.try_borrow_mut() {
+            control.deadline = None;
+        }
+    }
+
+    /// Deregisters every descriptor this port selected, so a stopped port leaves nothing behind in
+    /// the poll set.
+    fn release_selections(&mut self, ctx: &mut DriverContext<'_>) -> beam_common::Result<()> {
+        let selections = std::mem::take(&mut self.selected);
+        let mut first_error = None;
+        for selection in selections {
+            if let Err(error) = ctx.deregister(selection.fd, selection.token) {
+                first_error = first_error.or(Some(error));
+            }
+        }
+        match first_error {
+            Some(error) => Err(error),
+            None => Ok(()),
+        }
+    }
+}
+/// Maps a driver-callback failure onto the runtime's error type.
+fn driver_call_error(error: loader::DriverCallError) -> BeamError {
+    BeamError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("driver callback failed: {error}"),
+    ))
+}
+
+impl beam_io::Driver for DriverPortAdapter {
+    /// The driver's own `ErlDrvEntry::driver_name`.
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Runs the driver's `start` callback with this port's handle.
+    ///
+    /// The environment is built here and kept for the port's life (the handle **is** the
+    /// environment's address). The returned [`ErlDrvData`](beam_abi::driver::types::ErlDrvData) is
+    /// the driver's private state; the C failure signals (`ERL_DRV_ERROR_GENERAL` −1,
+    /// `…_ERRNO` −2, `…_BADARG` −3) are reported as a typed failure rather than stored as a state.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has already been torn down or the command carries an
+    /// interior NUL byte, and [`BeamError::Io`] when the driver's `start` reports a failure code.
+    fn start(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        // `DriverEnv::as_port` returns the environment's own address, so the environment must be
+        // allocated **before** the handle is taken and must not move afterwards: a `Box` is stable,
+        // and the driver's `start` may keep the handle in its private state (the A.4 fixture does).
+        // `DriverEnv` carries no lifetime, so the `&mut` borrow of the host ends with this call;
+        // the environment (and so the handle) stays valid because the host lives in a `Box` that
+        // never moves.
+        let mut env = Box::new(driver.host_mut().environment());
+        let port = env.as_port();
+        self.env = Some(env);
+        let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
+        let data = driver
+            .library()
+            .start(port, command.as_ptr() as *mut std::os::raw::c_char)
+            .map_err(driver_call_error)?;
+        if (data as isize) < 0 {
+            // The C's failure codes are negative; a driver that refuses the port must not become a
+            // port with a bogus state pointer.
+            return Err(BeamError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("driver '{}' refused the port (start returned {})", self.name, data as isize),
+            )));
+        }
+        self.state = data;
+        // Anything the driver's `start` asked of its port (a `driver_select`, a
+        // `driver_set_timer`) is applied now: the registration reaches the poll set and the
+        // deadline reaches the port's `TIMEOUT` task (`Port::open` re-arms the timer from
+        // `Driver::next_timeout` right after this returns).
+        self.settle(ctx)
+    }
+
+    /// Hands the port's queued bytes to the driver's `output` callback and queues whatever the
+    /// driver answers with through `driver_output` as this port's **input**.
+    ///
+    /// An entry without an `output` callback is the C's own no-op (`io.c`'s `no_output_callback`),
+    /// so its absence is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has been torn down, and [`BeamError::Io`] when the
+    /// `output` callback reports a failure.
+    fn output(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
+        // Copy first: the queue is cleared below and the callback takes a raw pointer into the
+        // buffer, so the slice must outlive the borrow of the context.
+        let bytes = ctx.output().front().to_vec();
+        if !bytes.is_empty() {
+            ctx.output().clear();
+            let Some(driver) = self.driver.as_mut() else {
+                return Err(BeamError::BadArg);
+            };
+            match driver.library().output(
+                self.state,
+                bytes.as_ptr() as *mut std::os::raw::c_char,
+                bytes.len(),
+            ) {
+                Ok(()) => {}
+                Err(error) if error.is_absent() => {}
+                Err(error) => return Err(driver_call_error(error)),
+            }
+        }
+        // The driver may have answered with `driver_output` bytes (they are this port's *input*,
+        // which the next task round hands up as `{Port, {data, Data}}`) and may have asked for a
+        // new event or timer; both are applied here.
+        self.settle(ctx)?;
+        Ok(bytes.len())
+    }
+
+    /// Runs the driver's `ready_input` for the descriptor the poller found readable.
+    ///
+    /// Only reached when the driver itself armed that descriptor with `driver_select`; an entry
+    /// without a `ready_input` callback is the C's `no_ready_input_callback` (a log *and* a
+    /// deselect), which [`DriverPortAdapter::dispatch_ready`] reproduces.
+    fn ready_input(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        self.dispatch_ready(ctx, true)
+    }
+
+    /// Runs the driver's `ready_output` when it armed a writable descriptor, else drains the
+    /// output queue through [`beam_io::Driver::output`].
+    ///
+    /// The trait default is `output`, which is what a `port_command`-driven `OUTPUT` task needs
+    /// for a driver with no write registration. A driver that *did* arm a descriptor for
+    /// writability wants its own `ready_output` instead (the C never calls `output` from the poll
+    /// path), so that is what runs — and the queue is left for the driver to drain.
+    fn ready_output(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
+        if self.armed_event(false)?.is_some() {
+            self.dispatch_ready(ctx, false)?;
+            return Ok(0);
+        }
+        self.output(ctx)
+    }
+
+    /// Runs the driver's `timeout` callback for a fired port timer.
+    ///
+    /// The pending deadline is cleared **first** (the C's own order), so a callback that re-arms
+    /// with `driver_set_timer` decides the next deadline — and one that does not leaves the port
+    /// with no timer at all (`Port::timeout` re-reads [`beam_io::Driver::next_timeout`] as this
+    /// returns).
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has been torn down, and [`BeamError::Io`] when the
+    /// `timeout` callback reports a failure.
+    fn timeout(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        self.clear_timeout();
+        let result = match self.driver.as_mut() {
+            Some(driver) => match driver.library().timeout(self.state) {
+                Ok(()) => Ok(()),
+                Err(error) if error.is_absent() => Ok(()),
+                Err(error) => Err(driver_call_error(error)),
+            },
+            None => Err(BeamError::BadArg),
+        };
+        self.settle(ctx)?;
+        result
+    }
+
+    /// The deadline the driver last asked for with `driver_set_timer`, if any.
+    ///
+    /// This is the timer-arming seam: the port mirrors it into its `TIMEOUT` task after every
+    /// driver interaction (`beam_io::Port::refresh_timeout`) and clamps its poll round by it
+    /// (`beam_io::PortRegistry::next_deadline`), so a declared deadline really fires the driver's
+    /// `timeout` callback at that instant.
+    fn next_timeout(&self) -> Option<Instant> {
+        self.control
+            .try_borrow()
+            .ok()
+            .and_then(|control| control.deadline)
+    }
+
+    /// Runs the driver's `stop` callback and **unloads** the driver (its `finish` then `dlclose`).
+    ///
+    /// An entry without a `stop` callback is the C's own no-op (`io.c`), so its absence is not a
+    /// failure. The environment (and so the port handle the driver may have kept in its private
+    /// state) outlives the `stop` callback — the C's port struct is still live while `stop` runs —
+    /// and is dropped only afterwards. Every descriptor the port selected is deregistered as it
+    /// leaves, and a `driver_select`/`driver_set_timer` the teardown recorded is dropped with it.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::Io`] when the driver's `stop` callback reports a failure; the library is
+    /// unloaded either way, and a failed deregistration is surfaced when `stop` succeeded.
+    fn stop(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.take() else {
+            return Ok(());
+        };
+        let result = match driver.library().stop(self.state) {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_absent() => Ok(()),
+            Err(error) => Err(driver_call_error(error)),
+        };
+        if let Ok(mut control) = self.control.try_borrow_mut() {
+            control.selects.clear();
+            control.deadline = None;
+        }
+        let released = self.release_selections(ctx);
+        // The environment goes now: the port handle the driver held is dead the moment `stop`
+        // returned, exactly as the C's `ErlDrvPort` is.
+        self.env = None;
+        // `driver` drops here: `DriverLibrary::Drop` runs the entry's `finish` and `dlclose`s, and
+        // the boxed host goes with it.
+        result.and(released)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_term::{atom_val, is_atom, Atom};
+
+    /// A host over `atoms`, running as pid 1, with a small arena.
+    fn host(atoms: &Rc<AtomTable>) -> DriverPort {
+        DriverPort::new(
+            Heap::new(256).expect("a test heap"),
+            Rc::clone(atoms),
+            ProcessId::new(1, 0),
+        )
+    }
+
+    #[test]
+    fn a_known_atom_keeps_the_shared_index_and_a_new_one_is_predicted() {
+        let mut table = AtomTable::new();
+        let known = table.intern("known");
+        let atoms = Rc::new(table);
+        let mut host = host(&atoms);
+
+        // An existing atom keeps the shared table's index.
+        assert_eq!(host.intern_atom("known"), Some(make_atom(known)));
+
+        // A new name is predicted at `base + 0` (nothing else interning in between) and is not
+        // resolvable until the caller commits it.
+        let fresh = host.intern_atom("fresh").expect("interning always answers");
+        assert!(is_atom(fresh));
+        assert_eq!(atom_val(fresh), Atom::from_raw(atoms.len() as u32));
+        assert_eq!(atoms.name(atom_val(fresh)), None);
+
+        // A second call for the same name reuses the predicted index.
+        assert_eq!(host.intern_atom("fresh"), Some(fresh));
+
+        // Committing lands the name at exactly the predicted index.
+        let mut committed = (*atoms).clone();
+        host.commit_atoms(&mut committed);
+        assert_eq!(committed.name(atom_val(fresh)), Some("fresh"));
+        // ...and the handle's own table still does not see it: it is the caller's job to commit
+        // into the *live* table (see `DriverPort::commit_atoms`).
+        assert_eq!(atoms.name(atom_val(fresh)), None);
+    }
+
+    #[test]
+    fn the_host_captures_output_and_answers_the_port_queries() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+        assert_eq!(host.output(std::ptr::null_mut(), b"hi"), 0);
+        assert_eq!(host.outputs(), &[b"hi".to_vec()]);
+        assert!(host.sent().is_empty());
+
+        // The owner answers both `driver_*` pid queries with this runtime's pid term.
+        let owner = host.owner().to_eterm();
+        assert_eq!(host.connected_pid(std::ptr::null_mut()), Some(owner));
+        assert_eq!(host.caller_pid(std::ptr::null_mut()), Some(owner));
+
+        // A host no port lifecycle claimed reports a timer request as unapplied (the C's `-1`);
+        // `async` keeps the seam's typed default for the same reason.
+        assert_eq!(host.set_timer(std::ptr::null_mut(), 100), -1);
+        assert_eq!(host.cancel_timer(std::ptr::null_mut()), -1);
+        assert_eq!(host.read_timer(std::ptr::null_mut()), None);
+        assert_eq!(
+            host.r#async(
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+                None,
+                std::ptr::null_mut(),
+                None
+            ),
+            -1
+        );
+    }
+
+    #[test]
+    fn load_driver_reports_the_last_candidates_error() {
+        let error = load_driver(&["/nonexistent/beam-rt-driver-test".to_string()], "t")
+            .expect_err("a nonexistent object cannot load");
+        assert_eq!(error.reason_atom(), "unspecified_error");
+        assert!(error.text().contains("beam-rt-driver-test"), "{error:?}");
+    }
+
+    /// An empty candidate list is still a typed failure, never a panic.
+    #[test]
+    fn load_driver_rejects_an_empty_candidate_list() {
+        let error = load_driver(&[], "t").expect_err("nothing to load");
+        assert_eq!(error.reason_atom(), "no_driver_init");
+    }
+
+    #[test]
+    fn the_host_hands_its_heap_back() {
+        let atoms = Rc::new(AtomTable::new());
+        let host = host(&atoms);
+        assert!(host.into_heap().available() > 0, "the arena survives the host");
+    }
+}

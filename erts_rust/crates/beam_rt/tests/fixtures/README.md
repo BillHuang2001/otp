@@ -1,8 +1,9 @@
 # `beam_rt` test fixtures
 
-`mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam` and
-`function_clause_fixture.beam` are committed oracle fixtures: real `.beam` images produced by
-the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differential oracle.
+`mailbox.beam`, `sched.beam`, `port_recv.beam`, `raise_structured.beam`,
+`function_clause_fixture.beam` and `recv_after.beam` are committed oracle fixtures: real
+`.beam` images produced by the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is
+also the differential oracle.
 * `mailbox.beam` is the receive/message end-to-end image — `tests/mailbox.rs` (the
   runtime slice) and the receive-seam unit tests in `src/context.rs` run it through the
   real `RuntimeContext`.
@@ -24,12 +25,68 @@ the **system Erlang** toolchain (OTP 29 / `erts-17.1`), which is also the differ
   `function_clause_fixture`, `f`, `a`, `ok`, `module_info`, `erlang` and `get_module_info`
   (`beam_lib:chunks/2`), so the reason atom `function_clause` can only come from the
   runtime's boot seed — which is exactly the property the test pins.
+* `recv_after.beam` is the **finite `receive … after T`** image (the receive-deadline tests in
+  `src/runtime.rs` and `src/runner.rs`): `after20/0` and `after2000/0` park on an empty mailbox
+  and time out, `afterzero/0` (`after 0`) never suspends, `self_send/0` matches the message
+  already queued and never arms a deadline, and `wait_forever/0` (`after infinity`) parks. It
+  pins the five opcode shapes the runtime deadline path is read from (`wait_timeout` +
+  `timeout`, the compiler-folded `after 0`, a matched queued message, a message that **cancels**
+  an armed deadline, and a bare `wait`).
+
+## Driver fixtures (never committed — compiled at test time)
+
+`event_driver.c` and `event_driver.erl` are the **driver event/timer** pair for
+`tests/driver.rs::a_driver_select_and_a_driver_timer_both_reach_the_owner` (contract A.4):
+
+* `event_driver.c` is a real driver shared object: `start` arms `driver_select` on the read end of
+  an internal `pipe(2)` and a `driver_set_timer` deadline, `output` writes one byte to the write end
+  (making the selected descriptor readable), `ready_input` drains that byte and answers
+  `driver_output("R")`, and `timeout` answers `driver_output("T")`. Its entry's `driver_name` is
+  `event`, so the compiled object's stem must be `event` (the name `{spawn_driver, Path}` derives
+  from the path — see `beam_rt::port::driver_lookup`).
+* `event_driver.erl` (`recv/0`) opens that port with `{spawn_driver, "{path}"}`, `port_command`s it
+  one byte, and collects the two `{Port, {data, Data}}` messages — each `receive` bounded by
+  `after 5000`, so a missing byte shows up as the atom `timeout` in its position.
+
+Neither is committed in compiled form, because **both** embed the scratch directory the test builds
+in: the test replaces the `.erl`'s `{path}` placeholder with the compiled `.so`'s path (known only
+then) and compiles the result. The C side is compiled with `$CC` (or `cc`) against the host
+`erl_driver.h`; the Erlang side with the system `erlc`. Both halves are skipped **loudly** (and the
+test returns) when a tool is missing, so a tree without the host toolchain never silently passes.
+
+The Erlang half must never be *committed* as a `.beam` with an absolute path baked in; the test-time
+artifact lives under `$TMPDIR` and can be checked with:
+
+```sh
+strings "$TMPDIR"/beam_rt_driver_events_*/event_driver.beam | rg 'workers|/home/'
+```
+
+(no output = nothing about the checkout leaked). The `.so` and `.beam` the test compiles are removed
+again by the test itself (`Fixture::cleanup`).
+
+Oracle values (the fixture is valid against the real system, verified with the same `.so`):
+
+```sh
+INC=$(erl -noshell -eval 'io:format("~s",[code:lib_dir(erts,include)])' -s init stop)
+cc -shared -fPIC -I"$INC" -o "$TMPDIR/event.so" event_driver.c
+erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "event"),
+    P = open_port({spawn_driver, "event"}, [binary]),
+    true = port_command(P, <<"go">>),
+    A = receive {P,{data,D1}} -> D1 after 5000 -> timeout end,
+    B = receive {P,{data,D2}} -> D2 after 5000 -> timeout end,
+    io:format("~p ~p~n",[A,B]), halt(0).'
+# <<"R">> <<"T">>
+```
+
+so `ready_input`'s byte is `<<"R">>`, `timeout`'s is `<<"T">>`, and the runtime's own answer is
+asserted against exactly that pair.
+
 ## Regeneration
 
-All fixtures are compiled with `+deterministic`, which strips the embedded source path
-from the `CInf` (compile info) and `Dbgi` (debug info) chunks — the committed `.beam`
-is therefore **path-free**. Compile from a neutral scratch dir under `$TMPDIR` so
-nothing about the local checkout is recorded:
+`mailbox`, `sched`, `port_recv`, `raise_structured` and `function_clause_fixture` are compiled
+with `+deterministic`, which strips the embedded source path from the `CInf` (compile info) and
+`Dbgi` (debug info) chunks — the committed `.beam` is therefore **path-free**. Compile from a
+neutral scratch dir under `$TMPDIR` so nothing about the local checkout is recorded:
 
 ```sh
 # mailbox.beam (740 bytes)
@@ -66,7 +123,18 @@ mkdir -p "$SCRATCH/fcgen"
 cp function_clause_fixture.erl "$SCRATCH/fcgen/"
 ( cd "$SCRATCH/fcgen" && erlc +deterministic function_clause_fixture.erl )
 cp "$SCRATCH/fcgen/function_clause_fixture.beam" function_clause_fixture.beam
-```The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
+
+# recv_after.beam (824 bytes) — same deterministic scratch-dir recipe
+SCRATCH="$TMPDIR/beam_rt_recv_after_fix"
+rm -rf "$SCRATCH"; mkdir -p "$SCRATCH/gen"
+cp recv_after.erl "$SCRATCH/gen/"
+( cd "$SCRATCH/gen" && erlc +deterministic recv_after.erl )
+cp "$SCRATCH/gen/recv_after.beam" recv_after.beam
+```
+Every fixture is built with `+deterministic` in a `$TMPDIR` scratch dir, so no
+absolute checkout path is embedded in any committed `.beam`.
+
+The repo-root `.gitignore` ignores `*.beam` globally, so a (re)built fixture must be
 **force-added**: `git add -f sched.beam`.
 
 `sched.erl` (the input, also committed):
@@ -103,6 +171,20 @@ recv() ->
 badkey() -> maps:get(nokey, #{}).
 badmap() -> map_get(a, not_a_map).
 ```
+
+`recv_after.erl` (the input, also committed):
+
+```erlang
+-module(recv_after).
+-export([after20/0, after2000/0, afterzero/0, self_send/0, wait_forever/0]).
+
+after20()     -> receive X -> X after 20     -> timeout end.
+after2000()   -> receive X -> X after 2000   -> timeout end.
+afterzero()   -> receive X -> X after 0      -> timeout end.
+self_send()   -> self() ! hello,
+                 receive X -> X after 2000   -> timeout end.
+wait_forever()-> receive X -> X after infinity -> timeout end.
+```
 Any byte change in a fixture invalidates the expected values in the tests that load it;
 re-derive them from the system `erl`, do **not** guess.
 
@@ -119,12 +201,27 @@ re-derive them from the system `erl`, do **not** guess.
 | `raise_structured:badkey/0` | `try raise_structured:badkey() catch C:R -> {C,R} end` | `{error,{badkey,nokey}}` |
 | `raise_structured:badmap/0` | `try raise_structured:badmap() catch C:R -> {C,R} end` | `{error,{badmap,not_a_map}}` |
 | `function_clause_fixture:f/1` | `function_clause_fixture:f(a)` | `ok` |
-| `function_clause_fixture:f/1` | `try function_clause_fixture:f(b) catch C:R -> {C,R} end` | `{error,function_clause}` |`selfsend/0` compiles to `bif self` + `send` + `loop_rec` + `remove_message` (with a
+| `function_clause_fixture:f/1` | `try function_clause_fixture:f(b) catch C:R -> {C,R} end` | `{error,function_clause}` |
+| `recv_after:after20/0` | `recv_after:after20()` | `timeout` (after ≈ 20 ms) |
+| `recv_after:afterzero/0` | `recv_after:afterzero()` | `timeout` (no suspend) |
+| `recv_after:self_send/0` | `recv_after:self_send()` | `hello` |
+| `recv_after:after2000/0` | a receiver matching nothing, then a `hello` send | `hello` (the send **cancels** the deadline); with no send it is `timeout` |
+| `recv_after:wait_forever/0` | `spawn(recv_after, wait_forever, [])` | parks indefinitely (`after infinity` ⇒ bare `wait`) |`selfsend/0` compiles to `bif self` + `send` + `loop_rec` + `remove_message` (with a
 `wait` fail branch); `scan/0` additionally emits `loop_rec_end`, because `42` fails the
 `{bar, X}` test and the scan must advance to the second message. `wait/0` is a bare
 `loop_rec`/`wait` loop and therefore suspends on an empty mailbox. `send2/2` emits two
 `send`s and builds `{bar, N + 7}` from the **run-time** argument `N` (an ordinary
 `copy_struct` across two processes, not a folded literal).
+
+`recv_after`'s exports pin the finite-`after` shapes: `after20/0`/`after2000/0` compile to a
+`wait_timeout` carrying the literal `{integer,T}` followed by `timeout` (the shape
+`src/runner.rs::parked_receive_timeout` recovers the deadline from), `afterzero/0` folds the
+`after 0` away so an empty mailbox falls straight to `timeout`, `self_send/0` matches the
+queued message and never arms a deadline, and `wait_forever/0` (`after infinity`) is a bare
+`wait`. Only the two literal-timeout exports are read here; a **variable** `after T` compiles
+to the same `wait_timeout` with a Y-register operand, which the runner cannot read today (see
+`CONTEXT.md`'s Known Issues). The fixture is driven by the receive-deadline tests in
+`src/runtime.rs` (the scheduler path) and `src/runner.rs` (the parked-timeout bookkeeping).
 
 `marked/0`-style exports that would drive the `recv_marker_*` prologue are deliberately
 **not** in either fixture: the prologue is emitted for a receive that matches on a

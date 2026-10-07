@@ -10,12 +10,15 @@
 //! | Call | Why it is runtime-native |
 //! |---|---|
 //! | `erlang:port_command/2,3` | writing to the port's write stream is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the write handle |
-//! | `erlang:port_info/1,2` on a port the runtime does not hold | the answer is the atom `undefined` (see below), which a `PortHook` returning `{Item, Value}` pairs cannot express |
+//! | `erlang:port_info/1,2` | two answers a `PortHook` returning `{Item, Value}` pairs cannot express: `undefined` for a port the runtime does not hold, and the bare `[]` for a live, **unregistered** port's `registered_name` item |
 //!
 //! # `port_command/2,3`
 //!
-//! `Data` is Erlang **iodata**: a binary, a char list, or a nested iolist of
-//! integers/binaries (`io_lib:format/2` output is the common case). It is written to the
+//! `Data` is Erlang **iodata** (`binary() | iolist()`) — a binary, a char list, or a nested
+//! iolist of integers/binaries (`io_lib:format/2` output is the common case). A bare integer
+//! is **not** iodata: `iolist_to_binary(42)` is `badarg` in the oracle, and so is
+//! `port_command(P, 42)`, even though `42` is a valid *element* (`port_command(P, [42])` is
+//! `true`). It is written to the
 //! port's write stream — the child's stdin for a `spawn`/`spawn_executable` port, and the
 //! **adopted, duplex descriptor** for a `{fd, N}` port (the oracle writes to the descriptor
 //! for a `{fd, N}` port too) — which is what makes `open_port({spawn,"cat"},[])` echo its
@@ -32,27 +35,35 @@
 //! (closed, or never opened), and non-iodata are [`BeamError::BadArg`] — the oracle's own
 //! reason.
 //!
-//! # `port_info/1,2` on a closed port
+//! # `port_info/1,2`
 //!
-//! The oracle answers `undefined` for a port that is no longer live — `erlang.erl`'s own
-//! wrapper maps erts's empty item list to `undefined` for both arities. `beam_bifs` builds
-//! `port_info/1` from the hook's pairs as a plain list (an empty pair list is `[]`, not
-//! `undefined`), so the native floor **claims only that case**: a live port returns `None`
-//! here and falls through to the registry unchanged, where `beam_bifs`'s own `port_info/1`
-//! and `port_info/2` (including its `undefined`-for-an-unknown-*item* rule) serve it. No
-//! item vocabulary or `=:=` lookup is duplicated.
+//! The floor claims exactly two answers that `beam_bifs`'s `{Item, Value}` pair list cannot
+//! express:
+//!
+//! * a port the runtime does **not** hold (closed, or never opened) is the atom
+//!   `undefined` — the oracle's answer for both arities, where `beam_bifs` would build `[]`
+//!   from the empty pair list for `/1` and `badarg` for `/2`;
+//! * the `/2` item `registered_name` on a **live** port is the bare **empty list** `[]` when
+//!   the port is unregistered — the oracle's own value (`erlang.erl` passes
+//!   `erts_internal:port_info/2`'s `[]` straight through), which a `{registered_name, _}`
+//!   pair cannot carry. `beam_rt` keeps no port registrations (`erlang:register/2` registers
+//!   pids only), so a live port is always unregistered here.
+//!
+//! Everything else falls through to the registry unchanged: a **live** port's other items
+//! are `beam_bifs`'s own `port_info/1`/`port_info/2` (including its `badarg`-for-an-unknown-
+//! *item* rule and its `=:=` lookup), so no other item vocabulary is duplicated.
 
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_process::PortId;
-use beam_term::{is_small, signed_value, Eterm};
+use beam_term::{is_small, signed_value, Eterm, NIL};
 
 use crate::context::RuntimeContext;
 use crate::error;
 
 impl RuntimeContext<'_> {
     /// The single entry the [`try_native`](RuntimeContext::try_native) dispatch arm added
-    /// for the port surface calls: `erlang:port_command/2,3` and the closed-port half of
+    /// for the port surface calls: `erlang:port_command/2,3` and the native half of
     /// `erlang:port_info/1,2`.
     ///
     /// Anything this floor does not claim — every other `(function, arity)` of the two
@@ -67,7 +78,7 @@ impl RuntimeContext<'_> {
         match (function, arity) {
             ("port_command", 2) => Some(self.port_command(args, false)),
             ("port_command", 3) => Some(self.port_command(args, true)),
-            ("port_info", 1) | ("port_info", 2) => self.port_info_closed_port(args),
+            ("port_info", 1) | ("port_info", 2) => self.port_info_native(args),
             _ => None,
         }
     }
@@ -156,30 +167,44 @@ impl RuntimeContext<'_> {
         }
         Ok(force)
     }
-    /// `erlang:port_info/1,2` for a port the runtime does **not** hold: `Some(Ok(undefined))`
-    /// — the oracle's answer for a closed port.
+    /// The native half of `erlang:port_info/1,2`: `undefined` for a port the runtime does
+    /// not hold, and the bare `[]` for a **live** port's `registered_name` item.
     ///
     /// `None` (fall through to `beam_bifs`) when the argument is not a port term at all (the
-    /// registry's own `badarg` is the oracle's answer there) and when the port **is** live
-    /// (its item list is the registry's).
-    pub(super) fn port_info_closed_port(&mut self, args: &[Eterm]) -> Option<Result<Eterm>> {
+    /// registry's own `badarg` is the oracle's answer there), and — for a **live** port —
+    /// for every item except `registered_name` (whose `{Item, Value}` pair list answers
+    /// them).
+    pub(super) fn port_info_native(&mut self, args: &[Eterm]) -> Option<Result<Eterm>> {
         let port = args.first().copied().and_then(|term| PortId::from_eterm(term).ok())?;
         let live = {
             let registry = self.runtime.ports.try_borrow().ok()?;
             registry.is_live(port)
         };
-        if live {
-            return None;
+        if !live {
+            // A closed/unknown port is `undefined` for **both** arities, whatever the item.
+            return Some(self.atom("undefined"));
         }
-        Some(self.atom("undefined"))
+        // A **live** port: the floor owns exactly the `registered_name` item. `beam_rt` keeps
+        // no port registrations (`erlang:register/2` registers pids only), so the port is
+        // unregistered and the oracle's answer is the bare empty list `[]` — deliberately
+        // **not** a `{registered_name, _}` pair, which is what `beam_bifs`'s pair search
+        // would build. Every other item falls through unchanged.
+        if args.len() == 2 && self.atom_name(args[1]).as_deref() == Some("registered_name") {
+            return Some(Ok(NIL));
+        }
+        None
     }
 
-    /// Collects `term` as Erlang **iodata** into `out`: a byte-sized small integer, a binary,
-    /// or a (possibly nested) list of those.
+    /// Collects `term` as Erlang **iodata** into `out`: a binary, or a (possibly nested)
+    /// list of byte-sized integers/binaries.
     ///
     /// This is `iolist_to_binary/1`'s acceptance rule, restricted to what the port stream
-    /// can carry: a non-integer, an out-of-range integer, an improper tail and a non-iodata
-    /// term are all [`BeamError::BadArg`]. Unlike the printer helper `chars_to_string` (a
+    /// can carry: a non-integer *element*, an out-of-range element integer, an improper tail
+    /// and a non-iodata term are all [`BeamError::BadArg`]. The **top level** must be a
+    /// binary or a list — a bare integer is deliberately rejected, because Erlang's `iodata()`
+    /// is `binary() | iolist()` (`iolist_to_binary(42)` and `port_command(P, 42)` are both
+    /// `badarg` in the oracle), even though `42` is a valid *element*
+    /// (`port_command(P, [42])` is `true`). Unlike the printer helper `chars_to_string` (a
     /// `String`, so bytes must be UTF-8), the port stream is a **byte** stream: a binary of
     /// arbitrary bytes goes through untouched, so a `port_command` of `<<255,0,1>>` writes
     /// exactly those three bytes.
@@ -188,7 +213,25 @@ impl RuntimeContext<'_> {
     ///
     /// [`BeamError::BadArg`] for a term that is not iodata.
     fn iodata_bytes(&self, term: Eterm, out: &mut Vec<u8>) -> Result<()> {
+        self.iolist_bytes(term, out, true)
+    }
+
+    /// Collects one iodata *element* into `out`: a byte-sized small integer, a binary, or a
+    /// (possibly nested) list of those.
+    ///
+    /// `top_level` distinguishes the outermost call from a list element: a bare integer is
+    /// only iodata as an element (`iodata()` is `binary() | iolist()`, never an integer), so
+    /// the outermost integer is [`BeamError::BadArg`] while an element integer is a byte.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] for a term that is not iodata.
+    fn iolist_bytes(&self, term: Eterm, out: &mut Vec<u8>, top_level: bool) -> Result<()> {
         if is_small(term) {
+            if top_level {
+                // `iodata() = binary() | iolist()`: a bare integer is not iodata.
+                return Err(BeamError::BadArg);
+            }
             out.push(u8::try_from(signed_value(term)).map_err(|_| BeamError::BadArg)?);
             return Ok(());
         }
@@ -198,7 +241,7 @@ impl RuntimeContext<'_> {
         }
         if let Ok(elements) = terms::list_elements(term) {
             for element in elements {
-                self.iodata_bytes(element, out)?;
+                self.iolist_bytes(element, out, false)?;
             }
             return Ok(());
         }
@@ -450,13 +493,35 @@ mod tests {
                 args.push(make_small(1));
             }
             let answer = context
-                .port_info_closed_port(&args)
+                .port_info_native(&args)
                 .unwrap_or_else(|| panic!("port_info/{arity} must claim an unknown port"))
                 .expect("the atom undefined");
             assert_eq!(context.atom_name(answer).as_deref(), Some("undefined"));
         }
         // A non-port argument falls through (the registry's `badarg` is the oracle's answer).
-        assert!(context.port_info_closed_port(&[make_small(1)]).is_none());
+        assert!(context.port_info_native(&[make_small(1)]).is_none());
+    }
+
+    /// A **live** port's `registered_name` item is the bare empty list `[]` — the oracle's
+    /// value for an unregistered port (`erlang.erl` passes `erts_internal:port_info/2`'s `[]`
+    /// through unchanged). `beam_rt` keeps no port registrations, so a live port is always
+    /// unregistered here; every other item falls through to `beam_bifs`.
+    #[test]
+    fn port_info_registered_name_on_a_live_port_is_the_empty_list() {
+        let mut runtime = runtime();
+        let port = live_port(&mut runtime);
+        let registered_name = atom(&mut runtime, "registered_name");
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let answer = context
+            .port_info_native(&[port.to_eterm(), registered_name])
+            .expect("a live port's registered_name is claimed")
+            .expect("the empty list");
+        assert_eq!(answer, NIL, "the bare empty list, not a {{registered_name,_}} pair");
+        // A different item on a live port falls through (the pair list answers it), and so
+        // does `port_info/1` (whose seven-item roster never includes `registered_name`).
+        assert!(context.port_info_native(&[port.to_eterm(), make_small(1)]).is_none());
+        assert!(context.port_info_native(&[port.to_eterm()]).is_none());
     }
 
     #[test]
@@ -489,20 +554,51 @@ mod tests {
         assert!(out.is_empty());
     }
 
+    /// A bare top-level integer is **not** iodata (`iodata() = binary() | iolist()`), so
+    /// `port_command(P, 42)` is `badarg`; the same integer as a list **element** is a byte.
+    /// The oracle: `iolist_to_binary(42)` ⇒ `badarg`, `iolist_to_binary([42])` ⇒ `<<"*">>`.
     #[test]
-    fn iodata_rejects_non_iodata_and_out_of_range_integers() {
+    fn iodata_rejects_a_bare_integer_but_accepts_it_as_an_element() {
         let mut runtime = runtime();
         let mut sink = NullSink;
         let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
         let mut out = Vec::new();
-        // An atom, and a small integer that is not a byte.
+        assert!(matches!(
+            context.iodata_bytes(make_small(42), &mut out),
+            Err(BeamError::BadArg)
+        ));
+
+        // `[42]`: accepted as a byte, and `42` decodes to the byte `b"*"`.
+        let one = terms::make_list(&mut context, &[make_small(42)]).expect("a one-element list");
+        let mut out = Vec::new();
+        context.iodata_bytes(one, &mut out).expect("[42] is iodata");
+        assert_eq!(out, b"*");
+    }
+
+    #[test]
+    fn iodata_rejects_non_iodata_and_out_of_range_elements() {
+        let mut runtime = runtime();
+        let mut sink = NullSink;
+        let mut context = RuntimeContext::with_output(&mut runtime, &mut sink);
+        let mut out = Vec::new();
+        // An atom is neither a binary nor a list.
         let bad = context.atom("not_iodata").expect("an atom");
         assert!(matches!(
             context.iodata_bytes(bad, &mut out),
             Err(BeamError::BadArg)
         ));
+        // An **element** integer outside `0..=255` is `badarg` (the oracle's `[256]`).
+        let out_of_range =
+            terms::make_list(&mut context, &[make_small(256)]).expect("a one-element list");
         assert!(matches!(
-            context.iodata_bytes(make_small(256), &mut out),
+            context.iodata_bytes(out_of_range, &mut out),
+            Err(BeamError::BadArg)
+        ));
+        // An improper tail is not an iolist either.
+        let improper = terms::make_cons(&mut context, make_small(1), make_small(2))
+            .expect("an improper list");
+        assert!(matches!(
+            context.iodata_bytes(improper, &mut out),
             Err(BeamError::BadArg)
         ));
     }
