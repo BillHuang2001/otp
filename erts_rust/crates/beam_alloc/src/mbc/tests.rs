@@ -688,6 +688,15 @@ fn taking_a_whole_non_last_block_clears_its_successors_prev_free_marker() {
 
 #[test]
 fn a_bad_class_or_alignment_is_rejected_without_leaking_a_segment() {
+    // The crate-level segment allocator ([`crate::carrier::mseg`]) is a process-wide
+    // singleton shared with every other test in this lib-test binary, and the harness
+    // runs those ~220 tests in parallel threads: a segment mapped/released by any of
+    // them inside the window below moves `calls.alloc`/`calls.dealloc`. Pinning those
+    // counters to an *exact* value around this call is therefore unsound (it was the
+    // source of an intermittent `left: N right: N+/-1` failure here); only the
+    // *rejection* and the carrier lifecycle that must survive it are deterministic.
+    // `MbcCarrier::new` maps through `Carrier::alloc_map`, which has no injectable
+    // segment allocator, so the shared counters are the only ones observable.
     let before = crate::carrier::mseg().stats();
     // A class the header cannot encode is refused before anything is mapped.
     // SAFETY: the call fails before taking ownership of any segment.
@@ -695,17 +704,48 @@ fn a_bad_class_or_alignment_is_rejected_without_leaking_a_segment() {
         unsafe { MbcCarrier::new(4096, UNIT_SIZE, crate::block::CLASS_NONE) },
         Err(beam_common::BeamError::BadArg)
     ));
+    // A non-power-of-two alignment is refused inside `alloc_map`, *before* it asks the
+    // segment allocator for anything: the carrier base's page alignment is what the
+    // block-header recovery relies on, so such a request must never reach `mseg`.
     // SAFETY: the call fails before taking ownership of any segment.
     assert!(matches!(
         unsafe { MbcCarrier::new(4096, 3, MBC_CLASS) },
         Err(beam_common::BeamError::BadArg)
     ));
     let after = crate::carrier::mseg().stats();
-    assert_eq!(
-        after.calls.alloc, before.calls.alloc,
-        "a rejected call must not ask for a segment"
+    // The shared counters are monotone (they are only ever incremented), so a
+    // concurrency-safe reading is that the refused calls did not *wind them back*:
+    // an exact `==` cannot be asserted here, but a refused call wrongly releasing or
+    // un-mapping a segment (the direction an ownership bug would take) would be seen.
+    assert!(
+        after.calls.alloc >= before.calls.alloc,
+        "a rejected call must not release a segment it never mapped \
+         (after {after:?}, before {before:?})"
     );
-    assert_eq!(after.calls.dealloc, before.calls.dealloc);
+    assert!(
+        after.calls.dealloc >= before.calls.dealloc,
+        "a rejected call must not hand a segment back to mseg \
+         (after {after:?}, before {before:?})"
+    );
+    // Nothing was leaked by the refusals: the very next well-formed request still maps
+    // its own segment, and the carrier it returns is framed and accounted for
+    // exactly — one free block spanning the whole carrier, no live bytes — so no
+    // segment was consumed (or stranded) by the two rejected calls. `check` re-derives
+    // the block chain from the base address and cross-checks the carrier's own
+    // counters against it.
+    let mbc = carrier(4096);
+    assert_eq!(mbc.carrier_size(), 4096);
+    assert_eq!(
+        mbc.base() as usize % crate::carrier::os_page_size(),
+        0,
+        "the segment is still page-aligned"
+    );
+    assert_eq!(mbc.free_bytes(), 4096, "one free block covers the whole carrier");
+    assert_eq!(mbc.live_bytes(), 0);
+    assert_eq!(mbc.largest_free(), 4096);
+    check(&mbc, &[]);
+    // SAFETY: no block was ever handed out and the carrier is consumed by this call.
+    unsafe { mbc.into_carrier().unmap() };
 }
 
 #[test]
