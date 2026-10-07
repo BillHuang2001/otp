@@ -1,0 +1,262 @@
+//! End-to-end proof of the NIF **resource family** (workspace contract **A.3**): a real C NIF shared
+//! object — `tests/fixtures/nif_resource.c`, compiled with the system `cc` against the system
+//! `erl_nif.h` — is `dlopen`ed and driven through `beam_abi`'s own loader, and its observable
+//! behaviour is asserted from Rust.
+//!
+//! # Why this is load-bearing
+//!
+//! The fixture's `enif_open_resource_type` / `enif_alloc_resource` / `enif_make_resource` … calls are
+//! left **undefined** in the `.so`; the loading test binary binds them out of its dynamic symbol
+//! table (`build.rs` emits `-Wl,--export-dynamic` for the test targets, and
+//! `enif_api_table()` is touched below to keep the `enif_*`-carrying codegen unit in the link). So a
+//! successful `dlopen(RTLD_NOW)` proves the eleven resource slots really exist as exported symbols,
+//! and the assertions prove they behave.
+//!
+//! # Module identity, keys and liveness (documented substitutions)
+//!
+//! The resource-term representation is a `NifHost::make_ref` term recorded in a process-global
+//! registry (`src/nif/enif/resources.rs` docs). Consequences visible in this test — and asserted as
+//! such, with the oracle's value called out:
+//!
+//! * a created type is visible immediately, so re-opening an existing name reports
+//!   `ERL_NIF_RT_TAKEOVER` (the `*tried` value agrees with the oracle; the oracle additionally
+//!   refuses any open outside a `load` callback, returning `NULL`);
+//! * the type is keyed by *name* only, so `enif_dynamic_resource_call` ignores the module atom;
+//! * `enif_release_resource` to zero frees immediately, so a stale term stops resolving at that
+//!   point (the oracle keeps it alive until GC).
+//!
+//! # Skip-vs-fail policy
+//!
+//! Compiling the fixture needs a C compiler and the system `erl_nif.h`. When either is missing the
+//! test prints a loud `SKIP:` banner (via `compile_so`) and returns; when the toolchain is present,
+//! every assertion is hard.
+
+mod common;
+
+use std::path::{Path, PathBuf};
+
+use beam_abi::nif::enif::enif_api_table;
+use beam_abi::nif::enif::resources::enif_get_resource;
+use beam_abi::nif::loader::load;
+use beam_abi::nif::term::nif_from_eterm;
+use beam_abi::NifEnv;
+use beam_alloc::Heap;
+use beam_term::atom::AtomTable;
+use beam_term::prelude::{
+    self, atom_val, is_atom, make_atom, make_boxed, make_header, make_small, Eterm, NIL,
+};
+use beam_term::REF_SUBTAG;
+use libc::c_void;
+
+use common::{compile_so, skip};
+
+/// The committed C fixture (a real NIF module; see the file header for the A.3 rationale).
+const FIXTURE_C: &str = include_str!("fixtures/nif_resource.c");
+
+// ---------------------------------------------------------------------------------------------
+// A `NifHost` that can mint resource terms (`make_ref`)
+// ---------------------------------------------------------------------------------------------
+
+/// A test host: a bump heap, an atom table, and a `make_ref` implementation.
+///
+/// `tests/common/mod.rs::TestHost` is deliberately minimal (no `make_ref`), so the resource test
+/// supplies its own host here — minting an internal-ref thing for each `enif_make_resource` call, so
+/// every resource term is a distinct, resolvable word (as on the oracle).
+struct ResourceHost {
+    heap: Heap,
+    atoms: AtomTable,
+    next_ref: usize,
+}
+
+impl ResourceHost {
+    fn new() -> ResourceHost {
+        ResourceHost {
+            heap: Heap::new(4096).expect("a small test heap is allocatable"),
+            atoms: AtomTable::new(),
+            next_ref: 0,
+        }
+    }
+}
+
+impl beam_abi::NifHost for ResourceHost {
+    fn heap(&mut self) -> &mut Heap {
+        &mut self.heap
+    }
+
+    fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+        Some(make_atom(self.atoms.intern(name)))
+    }
+
+    fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+        if !is_atom(atom) {
+            return None;
+        }
+        self.atoms.name(atom_val(atom)).map(str::to_string)
+    }
+
+    /// Mint a fresh internal reference — the term `enif_make_resource` records as a resource handle.
+    fn make_ref(&mut self) -> Option<Eterm> {
+        let id = self.next_ref;
+        self.next_ref += 1;
+        // SAFETY: `alloc_words` hands out four exclusively-owned, writable words.
+        let p = unsafe { self.heap.alloc_words(4) }.ok()?;
+        // SAFETY: `p` addresses the four words just handed out; every one is written before the
+        // pointer escapes this block.
+        unsafe {
+            *p = make_header(3, REF_SUBTAG);
+            *p.add(1) = make_small(0); // node: the local node
+            *p.add(2) = make_small(0); // serial
+            *p.add(3) = make_small(id as i64); // a distinct id per call
+        }
+        Some(make_boxed(p as *const Eterm))
+    }
+}
+
+// ---------------------------------------------------------------------------------------------
+// Decoding a result tuple of small integers
+// ---------------------------------------------------------------------------------------------
+
+/// The integer value of a small-int term.
+fn as_int(t: Eterm) -> i64 {
+    assert!(
+        prelude::is_small(t),
+        "every element of a fixture result tuple is a small integer; got raw {:#x}",
+        t.raw()
+    );
+    prelude::signed_value(t)
+}
+
+/// Decode a tuple of small integers into a `Vec<i64>`.
+fn tuple_ints(t: Eterm) -> Vec<i64> {
+    // SAFETY: `t` is a well-formed tuple produced by the fixture.
+    let n = unsafe { prelude::tuple_size(t) };
+    (0..n)
+        .map(|i| {
+            // SAFETY: `i < n == tuple_size(t)`, so the element is in bounds.
+            as_int(unsafe { prelude::tuple_element(t, i) })
+        })
+        .collect()
+}
+
+// ---------------------------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------------------------
+
+/// `None` (after a loud skip) when the compiled `.so` path is not valid UTF-8.
+fn so_path(so: &Path) -> Option<String> {
+    match so.to_str() {
+        Some(path) => Some(path.to_string()),
+        None => {
+            skip("compiled .so path is not valid UTF-8");
+            None
+        }
+    }
+}
+
+/// Compile the committed fixture; `None` (after a loud skip) when the toolchain is absent.
+fn compile_fixture() -> Option<PathBuf> {
+    compile_so("nif_resource", FIXTURE_C)
+}
+
+// ---------------------------------------------------------------------------------------------
+// A cc-independent unit check of the resource term contract
+// ---------------------------------------------------------------------------------------------
+
+/// `enif_get_resource` with a `NULL` type never matches — and never dereferences the term.
+#[test]
+fn a_null_resource_type_never_matches() {
+    let mut host = ResourceHost::new();
+    let mut env = NifEnv::new(&mut host);
+    let mut objp: *mut c_void = std::ptr::null_mut();
+    let term = nif_from_eterm(make_small(1));
+    // SAFETY: `env` is live; a null `type` is explicitly handled by the implementation; `objp` is a
+    // live local.
+    let matched = unsafe { enif_get_resource(env.as_ptr(), term, std::ptr::null_mut(), &mut objp) };
+    assert_eq!(matched, 0);
+    assert!(objp.is_null(), "*objp must be left untouched");
+}
+
+// ---------------------------------------------------------------------------------------------
+// End-to-end: load a real NIF `.so` and drive its resource family
+// ---------------------------------------------------------------------------------------------
+
+#[test]
+fn resource_family_end_to_end() {
+    // Touching the table keeps the `enif_*`-carrying codegen unit in the link, so the `.so`'s
+    // imports resolve and `dlopen(RTLD_NOW)` can succeed. (No slot is asserted on: the table grows
+    // as other families land.)
+    std::hint::black_box(enif_api_table());
+
+    let Some(so) = compile_fixture() else { return };
+    let Some(path) = so_path(&so) else { return };
+
+    let mut host = ResourceHost::new();
+    // The host outlives the library (drop order), which is what the library's `unload` callback and
+    // the types' captured host pointer require.
+    let lib = load(&path, "nif_resource", &mut host, NIL)
+        .expect("a real NIF library must load: its enif_* imports resolve from the test binary");
+    let mut env = NifEnv::new(&mut host);
+
+    // --- the three open functions and the `*tried` contract -------------------------------
+    let status = lib.call(&mut env, "load_status", 0, &[]).expect("load_status/0");
+    assert_eq!(
+        tuple_ints(status),
+        vec![
+            1, /* tried_main          == ERL_NIF_RT_CREATE  */
+            2, /* tried_absent        == ERL_NIF_RT_TAKEOVER */
+            1, /* absent open returned NULL */
+            1, /* tried_x             == ERL_NIF_RT_CREATE  */
+            1, /* tried_dy            == ERL_NIF_RT_CREATE  */
+            1, 1, 1, /* the three types are non-NULL */
+        ]
+    );
+
+    // Re-opening an existing name with TAKEOVER only: `*tried` agrees with the oracle; the
+    // non-NULL-ness does not (there is no load-session boundary here — see the module docs).
+    let reopened = lib.call(&mut env, "reopen_main", 0, &[]).expect("reopen_main/0");
+    assert_eq!(tuple_ints(reopened), vec![1, 2]);
+
+    // Re-opening an existing name with CREATE only: not taken over, so NULL and `*tried == flags`.
+    // This agrees with the oracle.
+    let created = lib
+        .call(&mut env, "create_only_existing", 0, &[])
+        .expect("create_only_existing/0");
+    assert_eq!(tuple_ints(created), vec![0, 1]);
+
+    // --- allocate / size / term / inspect / keep / release / dtor -------------------------
+    let rt = lib.call(&mut env, "roundtrip", 0, &[]).expect("roundtrip/0");
+    assert_eq!(
+        tuple_ints(rt),
+        vec![
+            13, /* enif_sizeof_resource == the payload size                     */
+            1,  /* enif_get_resource wrote the same payload pointer             */
+            1,  /* ... *objp untouched on a type mismatch                       */
+            1,  /* the resource-binary term also resolves to the payload        */
+            1,  /* ... and its bytes are the four given bytes                   */
+            0,  /* keep/release balanced: the destructor has NOT run            */
+            1,  /* the last release ran the destructor exactly once             */
+            0x40, /* ... and it received the payload (first byte 0x40)         */
+            0,  /* the now-stale term no longer resolves (freed immediately)    */
+            1, 0, 0, 0, 1, /* r_same, r_wrongtype, r_int, r_binary, r_resbin    */
+            9,  /* a type carrying a `down` callback also reports its payload    */
+            1,  /* res_x's destructor ran on its last release                    */
+        ]
+    );
+
+    // --- enif_dynamic_resource_call -------------------------------------------------------
+    let dynr = lib.call(&mut env, "dyn_call", 0, &[]).expect("dyn_call/0");
+    assert_eq!(
+        tuple_ints(dynr),
+        vec![
+            0,    /* the call was made                                            */
+            4242, /* ... and the dyncall wrote through call_data                  */
+            1,    /* unknown type name                                            */
+            1,    /* a non-resource term                                          */
+            1,    /* matching name but the type has no dyncall                    */
+            1,    /* a dyncall-bearing name but a resource of another type        */
+            0,    /* the module atom is ignored (documented substitution); the
+                   * oracle returns non-zero for a module mismatch             */
+            2,    /* dyncall ran for the two matching calls                       */
+        ]
+    );
+}

@@ -31,6 +31,7 @@ pub mod common;
 pub mod driver;
 pub mod layout;
 pub mod nif;
+pub mod sync;
 
 // ---------------------------------------------------------------------------------------------
 // ABI version constants (`erl_nif.h`, `erl_driver.h`)
