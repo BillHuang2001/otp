@@ -146,9 +146,9 @@ The binary's own `run`/`suite` exit codes are unchanged (`0` agree / `1` mismatc
 | Contract | total | agree | mismatch | unsupported | skipped |
 |---|---|---|---|---|---|
 | A.1 | 154 | 154 | 0 | 0 | 0 |
-| A.2 | 170 | 170 | 0 | 0 | 0 |
-| A.3 | 31 | 31 | 0 | 0 | 0 |
-| A.4 | 61 | 61 | 0 | 0 | 0 |
+| A.2 | 174 | 171 | 0 | 3 | 0 |
+| A.3 | 32 | 31 | 0 | 1 | 0 |
+| A.4 | 64 | 62 | 0 | 2 | 0 |
 | A.5 | 64 | 63 | 0 | 1 | 0 |
 | A.6 | 37 | 37 | 0 | 0 | 0 |
 | A.7 | 246 | 246 | 0 | 0 | 0 |
