@@ -36,6 +36,8 @@ pub mod free_list;
 pub mod size_class;
 pub mod strategy;
 pub mod stats;
+pub mod types;
+pub mod mseg;
 pub mod allocator;
 pub mod registry;
 pub mod heap;
