@@ -579,8 +579,12 @@ fn depth_limited_renderings_reflow_like_the_oracle() {
         );
     }
 
-    // `~p {ok,lists:seq(1,30)}` — a tagged tuple whose tag indent (4) is inherited
-    // by the nested list's own `indent(1, …)`, so the continuation is 5 wide.
+    // `~p list_to_tuple([ok|lists:seq(1,30)])` — a tagged tuple whose tag `ok` sets
+    // `TagInd = Tlen + 2 = 4`, so the wrapped elements are indented 4 columns
+    // (`pp_tag_tuple/10`) and the 28th element starts the second line
+    // (`erl -noshell -eval 'io:format("~p~n",[lists:flatten(io_lib:format("~p",[list_to_tuple([ok|lists:seq(1,30)])]))]).'`):
+    //   {ok,1,…,27,
+    //      28,29,30}
     let (out, result) = run_io(&reg, b"~p", |ctx, _| {
         let ok = ctx.atom("ok").expect("seeded");
         let mut elems = vec![ok];
@@ -591,7 +595,7 @@ fn depth_limited_renderings_reflow_like_the_oracle() {
     let seq: Vec<String> = (1..=30).map(|i| i.to_string()).collect();
     assert_eq!(
         String::from_utf8(out).expect("ASCII"),
-        format!("{{ok,[{}],\n     {}]}}", seq[..27].join(","), seq[27..].join(","))
+        format!("{{ok,{},\n    {}}}", seq[..27].join(","), seq[27..].join(","))
     );
 }
 
