@@ -167,6 +167,15 @@ impl DriverPort {
         &self.sent
     }
 
+    /// Takes every captured `driver_output` / `erl_drv_output` payload out, in call order.
+    ///
+    /// The port lifecycle drains them after each driver interaction
+    /// ([`DriverPortAdapter::output`]) and queues them as the port's input; the
+    /// [`DriverPort::outputs`] accessor is the accumulate-only view the unit tests read.
+    pub fn take_outputs(&mut self) -> Vec<Vec<u8>> {
+        std::mem::take(&mut self.outputs)
+    }
+
     /// The name of `term` when it is an atom the shared table **already** holds.
     ///
     /// A name recorded on the pending interner is not resolvable until
@@ -272,6 +281,210 @@ pub fn load_driver(
     Err(last.unwrap_or_else(|| {
         DriverLoadError::NoDriverInit(format!("no candidate paths to load driver '{name}' from"))
     }))
+}
+
+/// The **port lifecycle** the A.4 host alone lacks: a [`beam_io::Driver`] over a loaded C driver.
+///
+/// [`DriverPort`] is the host behind the `ErlDrvPort` a driver callback receives; this type owns
+/// the driver itself and drives its `ErlDrvEntry` callbacks the way the runtime's port machinery
+/// asks for them ([`beam_io::Driver`]). It is what `open_port({spawn_driver, Name}, _)` registers:
+/// `beam_io::PortRegistry::open` boxes it, calls [`beam_io::Driver::start`] (⇒ the driver's `start`
+/// callback) and, at close, [`beam_io::Driver::stop`] (⇒ the driver's `stop` callback) followed by
+/// the `Driver` drop (`finish` + `dlclose`).
+///
+/// # Output is the driver's own callback, not a pipe
+///
+/// A `spawn`-driver port writes to the child's stdin; a *C driver* port has no child, so
+/// [`beam_io::Driver::output`] hands the bytes to the driver's `output` callback instead. The
+/// bytes the driver answers with through `driver_output` are captured by [`DriverPort`] and are
+/// then queued on the port's **input** queue — which is exactly what the port hands up to Erlang
+/// as `{Port, {data, Data}}` (see `crate::port::PortRegistry::pump`). Nothing here builds a term:
+/// the message is the runtime's, this type only moves bytes.
+///
+/// # Typed gaps (documented, never a fabricated success)
+///
+/// * `driver_select`/`set_timer`/`cancel_timer`/`read_timer`/`driver_async` keep the
+///   [`beam_abi::DriverHost`] defaults (`-1`/`None`), so a driver that asks for a select handle or
+///   a timer is told "unsupported" — there is no fd to register (a driver port here owns no OS
+///   descriptor of its own) and the runtime has no timer wheel wired into the host.
+/// * `port_control/3` reaches the driver's `control` only in a later increment; the
+///   [`beam_io::Driver::control`] default is used today (no reply bytes).
+/// * `take_exit_status` is always `Ok(None)`: a driver port owns no child to reap, so no
+///   `{Port, {exit_status, …}}` message is ever synthesized for it.
+pub struct DriverPortAdapter {
+    /// The loaded library **and** the host its callbacks run against (one `Box`, so the host never
+    /// moves while an `ErlDrvPort` derived from its environment is in use).
+    ///
+    /// `None` after [`DriverPortAdapter::stop`]: the entry's `stop` runs at most once.
+    driver: Option<Driver>,
+    /// The per-port environment the `ErlDrvPort` handed to the driver **is** (see the module docs).
+    ///
+    /// Held for the port's whole life: it must not be dropped (or moved) while the driver holds
+    /// the port handle, which it may do for as long as the port lives.
+    env: Option<DriverEnv>,
+    /// The private state the driver's `start` returned — what every later callback receives.
+    state: beam_abi::driver::types::ErlDrvData,
+    /// The driver name this port was loaded as.
+    name: String,
+    /// The command string handed to the driver's `start` callback (the `open_port/2` `Name`).
+    command: String,
+}
+
+impl DriverPortAdapter {
+    /// Loads the driver shared object for `name` from `candidates` and pairs it with `host`.
+    ///
+    /// The driver's `start` callback is **not** run here: [`beam_io::Driver::start`] runs it once
+    /// the port has an id, which is where the `ErlDrvPort` comes from.
+    ///
+    /// # Errors
+    ///
+    /// The loader's own typed [`DriverLoadError`] (its [`DriverLoadError::reason_atom`] is the
+    /// oracle's `{error, Reason}` atom) — never a fabricated library and never a panic.
+    pub fn load(
+        candidates: &[String],
+        name: &str,
+        host: DriverPort,
+        command: String,
+    ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
+        let library = load_driver(candidates, name)?;
+        Ok(DriverPortAdapter {
+            driver: Some(Driver::new(library, host)),
+            env: None,
+            state: std::ptr::null_mut(),
+            name: name.to_string(),
+            command,
+        })
+    }
+
+    /// The driver name this port was loaded as.
+    pub fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// The private state the driver's `start` returned (null before `start`).
+    pub fn state(&self) -> beam_abi::driver::types::ErlDrvData {
+        self.state
+    }
+}
+
+/// Maps a driver-callback failure onto the runtime's error type.
+fn driver_call_error(error: loader::DriverCallError) -> BeamError {
+    BeamError::Io(std::io::Error::new(
+        std::io::ErrorKind::Other,
+        format!("driver callback failed: {error}"),
+    ))
+}
+
+impl beam_io::Driver for DriverPortAdapter {
+    /// The driver's own `ErlDrvEntry::driver_name`.
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    /// Runs the driver's `start` callback with this port's handle.
+    ///
+    /// The environment is built here and kept for the port's life (the handle **is** the
+    /// environment's address). The returned [`ErlDrvData`](beam_abi::driver::types::ErlDrvData) is
+    /// the driver's private state; the C failure signals (`ERL_DRV_ERROR_GENERAL` −1,
+    /// `…_ERRNO` −2, `…_BADARG` −3) are reported as a typed failure rather than stored as a state.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has already been torn down or the command carries an
+    /// interior NUL byte, and [`BeamError::Io`] when the driver's `start` reports a failure code.
+    fn start(&mut self, _ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        // `DriverEnv` carries no lifetime, so the `&mut` borrow of the host ends with this call;
+        // the environment (and so the handle) stays valid because the host lives in a `Box` that
+        // never moves.
+        let mut env = driver.host_mut().environment();
+        let port = env.as_port();
+        self.env = Some(env);
+        let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
+        let data = driver
+            .library()
+            .start(port, command.as_ptr() as *mut std::os::raw::c_char)
+            .map_err(driver_call_error)?;
+        if (data as isize) < 0 {
+            // The C's failure codes are negative; a driver that refuses the port must not become a
+            // port with a bogus state pointer.
+            return Err(BeamError::Io(std::io::Error::new(
+                std::io::ErrorKind::Other,
+                format!("driver '{}' refused the port (start returned {})", self.name, data as isize),
+            )));
+        }
+        self.state = data;
+        Ok(())
+    }
+
+    /// Hands the port's queued bytes to the driver's `output` callback and queues whatever the
+    /// driver answers with through `driver_output` as this port's **input**.
+    ///
+    /// An entry without an `output` callback is the C's own no-op (`io.c`'s `no_output_callback`),
+    /// so its absence is not a failure.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::BadArg`] when the driver has been torn down, and [`BeamError::Io`] when the
+    /// `output` callback reports a failure.
+    fn output(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<usize> {
+        // Copy first: the queue is cleared below and the callback takes a raw pointer into the
+        // buffer, so the slice must outlive the borrow of the context.
+        let bytes = ctx.output().front().to_vec();
+        if bytes.is_empty() {
+            return Ok(0);
+        }
+        ctx.output().clear();
+        let Some(driver) = self.driver.as_mut() else {
+            return Err(BeamError::BadArg);
+        };
+        match driver.library().output(
+            self.state,
+            bytes.as_ptr() as *mut std::os::raw::c_char,
+            bytes.len(),
+        ) {
+            Ok(()) => {}
+            Err(error) if error.is_absent() => {}
+            Err(error) => return Err(driver_call_error(error)),
+        }
+        // `driver_output` payloads are the port's *input*: the next task round hands them up as
+        // `{Port, {data, Data}}` (see the type docs).
+        for chunk in driver.host_mut().take_outputs() {
+            ctx.input().push(&chunk);
+        }
+        Ok(bytes.len())
+    }
+
+    /// A C driver port registers no fd with the poller, so input readiness never arrives.
+    fn ready_input(&mut self, _ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        Ok(())
+    }
+
+    /// Runs the driver's `stop` callback and **unloads** the driver (its `finish` then `dlclose`).
+    ///
+    /// An entry without a `stop` callback is the C's own no-op (`io.c`), so its absence is not a
+    /// failure. The environment is dropped first: nothing may hold the port handle afterwards.
+    ///
+    /// # Errors
+    ///
+    /// [`BeamError::Io`] when the driver's `stop` callback reports a failure; the library is
+    /// unloaded either way.
+    fn stop(&mut self, _ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
+        let Some(driver) = self.driver.take() else {
+            return Ok(());
+        };
+        self.env = None;
+        let result = match driver.library().stop(self.state) {
+            Ok(()) => Ok(()),
+            Err(error) if error.is_absent() => Ok(()),
+            Err(error) => Err(driver_call_error(error)),
+        };
+        // `driver` drops here: `DriverLibrary::Drop` runs the entry's `finish` and `dlclose`s, and
+        // the boxed host goes with it.
+        result
+    }
 }
 
 #[cfg(test)]
