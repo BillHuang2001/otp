@@ -225,6 +225,25 @@ A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every proce
   unchanged — the new collectors are pure additions.
 - **`AnyCollector` only forwards.** The strategy-dispatch seam carries no collection logic, so neither
   strategy depends on the other; a test drives one corpus through either behind `collect`/`young`/`stats`.
+- **Heap sizing is ERTS-shaped and applied at every collection.** `HeapPolicy` carries the C minimums
+  (`min_heap_words`, `min_bin_vheap_words`) and the `fullsweep_after` cadence; `from_spawn_opts` reproduces
+  the C `spawn_opt` rounding through `erts_next_heap_size(x, 0)`. `Collector::collect` picks the collection
+  with `fullsweep_due`, a minor re-sizes the (now empty) nursery from `young_after_collection`, and a
+  fullsweep sizes the fresh mature space from `mature_after_fullsweep` — both re-using the existing
+  `should_grow` (`3*cap < 4*need`) / `should_shrink` (`cap > 4*need && cap > min`) rules, floored by
+  `min_heap_words` and clamped by `max_heap_words`. The C's minor-time young resize is
+  `next_heap_size(stack + MAX(size_before, need), 0)` with `size_before` the **pre-collection usage**
+  (`erl_gc.c:1493`), so a nursery a round left mostly empty **shrinks** — the rule the pressure tests
+  depend on (a test that must keep a large nursery alive raises `min_heap_words`).
+- **Fragments are collector-side and additive — "materialize then collect".** A `HeapFragment` is a bump
+  region outside every process space plus its own `OffHeap`. The collector cannot relocate a term it does
+  not own, so `FragmentRoots::materialize` / `FragmentChain::copy_roots_into` first copy fragment-resident
+  terms into the process heap (a process-space destination, so the flat `&mut [Eterm]` root-slice contract
+  can then relocate them normally), after which `gather_roots` → `collect` → `scatter_roots` is an ordinary
+  collection. `copy_term` **shares** off-heap payloads (the fragment keeps ownership) while
+  `copy_term_into`/`copy_roots_into` **transfer** them (clone + release the fragment's ref ⇒ net refcount
+  unchanged), mirroring the C `erts_copy_one_frag` `OH_OVERHEAD` hand-off. The collector still never walks an
+  off-heap payload (liveness stays the caller's concern).
 ### Measured (the GenImmix gate)
 `tests/immix_measure.rs` drives one long-lived workload (128 one-line long-lived tuples = 8 full Immix
 blocks; 24 transients promoted, 16 dropped / 8 kept; 300 nursery garbage tuples) through a forced
