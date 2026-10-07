@@ -91,6 +91,7 @@ use crate::error;
 use crate::runtime::Runtime;
 
 mod env;
+mod flags;
 pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
 
 /// The usage text, printed on a usage (exit 2) error.
@@ -201,7 +202,10 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
             }
             "-eval" => {
                 let expr = value_of(args, index, "-eval")?;
-                builder.record(argument, vec![expr.clone()]);
+                // `-eval` is a **Start instruction**, not an init argument: the oracle
+                // consumes it in `init`'s `parse_boot_args/1`, so
+                // `init:get_argument(eval)` is the bare atom `error` (verified against
+                // OTP 29.1.1 / erts-17.1).
                 builder.action = Action::Eval(strip_trailing_dot(&expr));
                 index += 2;
             }
@@ -223,10 +227,50 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder.emulator.node_name = Some(value);
                 index += 2;
             }
+            "-setcookie" => {
+                let value = value_of(args, index, "-setcookie")?;
+                builder.record(argument, vec![value.clone()]);
+                builder.emulator.cookie = Some(value);
+                index += 2;
+            }
+            "-config" | "-boot" => {
+                let value = value_of(args, index, argument)?;
+                builder.record(argument, vec![value]);
+                index += 2;
+            }
+            "-emu_flavor" => {
+                let value = value_of(args, index, "-emu_flavor")?;
+                builder.record(argument, vec![value.clone()]);
+                let flavor = flags::parse_emu_flavor("-emu_flavor", &value)?;
+                builder.emulator.features =
+                    beam_common::FeatureFlags::for_flavor(flavor);
+                builder.emulator.flavor = flavor;
+                index += 2;
+            }
+            "+Q" => {
+                let value = value_of(args, index, "+Q")?;
+                flags::parse_max_ports("+Q", &value)?;
+                builder.preserve("+Q", &value);
+                index += 2;
+            }
+            "+K" => {
+                let value = value_of(args, index, "+K")?;
+                flags::parse_kernel_poll("+K", &value)?;
+                builder.preserve("+K", &value);
+                index += 2;
+            }
+            "+sbt" => {
+                let value = value_of(args, index, "+sbt")?;
+                flags::parse_sbt("+sbt", &value)?;
+                builder.preserve("+sbt", &value);
+                index += 2;
+            }
+            other if flags::is_allocator_switch(other) => {
+                index = flags::parse_allocator(&args[index], args, index)?;
+            }
             "+S" => {
                 let value = value_of(args, index, "+S")?;
                 builder.emulator.schedulers = Some(parse_schedulers(&value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "-smp" => index = parse_smp_switch(args, index, &mut builder),
@@ -235,21 +279,17 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 // The async-thread pool is not modelled by the runtime core; it is
                 // preserved **verbatim** so nothing is lost (the A.6 skeleton contract).
                 parse_u32("+A", &value)?;
-                builder.emulator.extra_emulator_flags.push("+A".to_string());
-                builder.emulator.extra_emulator_flags.push(value.clone());
-                builder.record(argument, vec![value]);
+                builder.preserve("+A", &value);
                 index += 2;
             }
             "+P" => {
                 let value = value_of(args, index, "+P")?;
-                builder.emulator.max_processes = Some(parse_usize("+P", &value)?);
-                builder.record(argument, vec![value]);
+                builder.emulator.max_processes = flags::parse_max_processes("+P", &value)?;
                 index += 2;
             }
             "+hms" => {
                 let value = value_of(args, index, "+hms")?;
                 builder.heap.set_min_heap_words(parse_heap_words("+hms", &value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmbs" => {
@@ -257,7 +297,6 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder
                     .heap
                     .set_min_bin_vheap_words(parse_heap_words("+hmbs", &value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmax" => {
@@ -265,13 +304,11 @@ pub fn parse(args: &[String]) -> Result<RuntimeConfig> {
                 builder
                     .heap
                     .set_max_heap_words(parse_max_heap_size(&value)?);
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "+hmaxk" | "+hmaxel" | "+hmaxib" => {
                 let value = value_of(args, index, argument)?;
                 builder.set_max_heap_flag(argument, &value)?;
-                builder.record(argument, vec![value]);
                 index += 2;
             }
             "-s" => index = builder.parse_apply(args, index, "-s")?,
@@ -336,9 +373,10 @@ impl Builder {
             .cloned()
             .ok_or_else(|| error::missing_value(switch))?;
         let (arguments, next) = collect_tail(args, index + 3);
-        let mut values = vec![module.clone(), function.clone()];
-        values.extend(arguments.iter().cloned());
-        self.record(switch, values);
+        // `-s`/`-run` are **Start instructions**, not init arguments: `init` consumes
+        // them in `parse_boot_args/1`, so `init:get_argument(s|run)` is the bare atom
+        // `error` (verified against OTP 29.1.1 / erts-17.1).
+        let _ = &arguments;
         self.action = if switch == "-s" {
             Action::Apply {
                 module,
@@ -355,14 +393,30 @@ impl Builder {
         Ok(next)
     }
 
+    /// Preserves an emulator switch and its value **verbatim** in
+    /// [`extra_emulator_flags`](beam_common::RuntimeConfig::extra_emulator_flags), so
+    /// an unmodeled emulator flag is not lost (the A.6 skeleton contract).
+    ///
+    /// It is deliberately **not** recorded as an init argument: every `+`-flag is an
+    /// emulator flag in the oracle, so `init:get_argument('Q'|'K'|'sbt'|'MMscs')` is the
+    /// bare atom `error` (verified against OTP 29.1.1 / erts-17.1).
+    fn preserve(&mut self, switch: &str, value: &str) {
+        self.emulator.extra_emulator_flags.push(switch.to_string());
+        self.emulator.extra_emulator_flags.push(value.to_string());
+    }
+
     /// Records an unrecognized `-flag`/`+flag` and its values as an init argument and
     /// returns the index of the next switch — the real `erl` behaviour.
     ///
-    /// Applies a `+hmaxk`/`+hmaxel`/`+hmaxib` boolean value to the heap options.
+    /// Only an unrecognized **`-`flag** becomes an init argument: `erlexec` forwards
+    /// `-x` through `add_arg` (i.e. after the `--` separator, where `init` sees it),
+    /// while `+x` is rewritten to `-x` and passed as an **emulator** flag
+    /// (`erts/etc/common/erlexec.c:871-1102`). So `init:get_argument(Weird)` is
+    /// `{ok,[[]]}` for `-Weird` and the bare atom `error` for `+Weird` (verified against
+    /// OTP 29.1.1 / erts-17.1). Neither is a usage error: `erl -noshell +Weird -eval
+    /// 'halt(0).'` exits 0.
     ///
-    /// Only the two literals `true`/`false` are accepted: the C compares the value with
-    /// exactly those strings and rejects anything else (`erl_init.c:1592-1624`, e.g.
-    /// `+hmaxk bogus` ⇒ `bad max heap kill bogus` + usage).
+    /// `+hmaxk`/`+hmaxel`/`+hmaxib` boolean values are applied to the heap options.
     fn set_max_heap_flag(&mut self, switch: &str, value: &str) -> Result<()> {
         let mut flags = self.heap.max_heap_flags();
         match (switch, value) {
@@ -386,7 +440,11 @@ impl Builder {
     /// following tokens that do not themselves start with `-` or `+`.
     fn record_unmodeled(&mut self, args: &[String], index: usize) -> usize {
         let (values, next) = collect_tail(args, index + 1);
-        self.record(&args[index], values);
+        // Only an unrecognized `-flag` is an init argument; a `+flag` is an emulator flag
+        // and is invisible to `init:get_argument/1` (see the method's docs).
+        if args[index].starts_with('-') {
+            self.record(&args[index], values);
+        }
         next
     }
 }
