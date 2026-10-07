@@ -2,14 +2,27 @@
 //!
 //! Owned slots: `enif_make_int`, `enif_make_uint`, `enif_make_long`, `enif_make_ulong`,
 //! `enif_make_double`, `enif_make_atom`, `enif_make_atom_len`, `enif_make_new_atom`,
-//! `enif_make_new_atom_len`, `enif_make_list_cell`, `enif_make_string`, `enif_make_string_len`,
-//! `enif_make_ref`, `enif_make_tuple_from_array`, `enif_make_list_from_array`,
-//! `enif_make_reverse_list`.
+//! `enif_make_new_atom_len`, `enif_make_existing_atom`, `enif_make_existing_atom_len`,
+//! `enif_make_list_cell`, `enif_make_string`, `enif_make_string_len`, `enif_make_ref`,
+//! `enif_make_tuple_from_array`, `enif_make_list_from_array`, `enif_make_reverse_list`.
 //!
 //! `enif_make_int64`/`enif_make_uint64` are also implemented here, but on LP64 the header `#define`s
 //! them onto their `long`/`ulong` siblings, so they are free symbols rather than `ErlNifApi` slots.
-//! `enif_make_existing_atom`/`enif_make_existing_atom_len` (non-variadic) belong here too and are
-//! still to be implemented.
+//!
+//! # `enif_make_existing_atom(_len)` — the lookup-only atom constructors
+//!
+//! The C (`erts/emulator/beam/erl_nif.c:2116-2136`) is a thin wrapper over
+//! `erts_atom_get` (`atom.c:383-435`), whose `res = i < 0 ? 0 : (*ap = make_atom(i), 1)` is the
+//! contract this file reproduces exactly: **1 and `*atom` written on a hit, 0 and `*atom` left
+//! untouched on a miss** — it never creates the atom. The lookup goes through the
+//! [`NifHost::existing_atom`] hook, which answers `None` when the runtime's atom table does not
+//! already hold the name.
+//!
+//! Documented substitution: the C rejects an over-long name up front (`len > MAX_ATOM_CHARACTERS`
+//! for LATIN1, `len > MAX_ATOM_SZ_LIMIT` for UTF8 — `atom.c:392/402/416`). Here the host's atom
+//! table *is* the atom namespace, so an over-long name simply is not in it and the hook answers
+//! `None` — the same `0`, reached one step later. Only a store that would silently truncate a name
+//! would need the explicit cap.
 
 use super::*;
 
@@ -28,6 +41,8 @@ pub(super) const fn populate(mut api: ErlNifApi) -> ErlNifApi {
     api.enif_make_atom_len = Some(enif_make_atom_len);
     api.enif_make_new_atom = Some(enif_make_new_atom);
     api.enif_make_new_atom_len = Some(enif_make_new_atom_len);
+    api.enif_make_existing_atom = Some(enif_make_existing_atom);
+    api.enif_make_existing_atom_len = Some(enif_make_existing_atom_len);
     api.enif_make_list_cell = Some(enif_make_list_cell);
     api.enif_make_string = Some(enif_make_string);
     api.enif_make_string_len = Some(enif_make_string_len);
@@ -288,6 +303,83 @@ pub unsafe extern "C" fn enif_make_new_atom_len(
     }
 }
 
+/// `int enif_make_existing_atom(ErlNifEnv *env, const char *name, ERL_NIF_TERM *atom, ErlNifCharEncoding encoding);`
+///
+/// The lookup-only atom constructor: **1** with `*atom` written when the runtime already holds the
+/// atom, **0** with `*atom` left **untouched** otherwise (C `erts_atom_get`, `atom.c:431`). The name
+/// is NUL-terminated.
+///
+/// # Safety
+///
+/// `env` must be null or a live env; `name` must be null or NUL-terminated; `atom` must be null or
+/// writable.
+#[no_mangle]
+pub unsafe extern "C" fn enif_make_existing_atom(
+    env: *mut crate::nif::types::ErlNifEnv,
+    name: *const c_char,
+    atom: *mut ERL_NIF_TERM,
+    encoding: ErlNifCharEncoding,
+) -> c_int {
+    let Some(e) = (unsafe { env_mut(env) }) else {
+        return 0;
+    };
+    let Some(bytes) = (unsafe { cstr(name) }) else {
+        return 0;
+    };
+    existing_atom_out(e, bytes, atom, encoding)
+}
+
+/// `int enif_make_existing_atom_len(ErlNifEnv *env, const char *name, size_t len, ERL_NIF_TERM *atom, ErlNifCharEncoding encoding);`
+///
+/// As [`enif_make_existing_atom`], with an explicit length: `name` is **not** NUL-terminated and
+/// exactly `len` bytes are examined.
+///
+/// # Safety
+///
+/// `env` must be null or a live env; `name` must point at `len` readable bytes; `atom` must be null
+/// or writable.
+#[no_mangle]
+pub unsafe extern "C" fn enif_make_existing_atom_len(
+    env: *mut crate::nif::types::ErlNifEnv,
+    name: *const c_char,
+    len: size_t,
+    atom: *mut ERL_NIF_TERM,
+    encoding: ErlNifCharEncoding,
+) -> c_int {
+    let Some(e) = (unsafe { env_mut(env) }) else {
+        return 0;
+    };
+    let Some(bytes) = (unsafe { cbuf(name, len) }) else {
+        return 0;
+    };
+    existing_atom_out(e, bytes, atom, encoding)
+}
+
+/// The shared body of the two lookup-only atom constructors (see the module docs).
+///
+/// A `NULL` `atom` out-pointer is answered `0` where the C would `*ap = …` through it and fault; a
+/// name the host's atom table does not already hold is answered `0` with `*atom` left alone, exactly
+/// like the C's `i < 0 ? 0 : (*ap = …, 1)`.
+fn existing_atom_out(
+    env: &mut NifEnv,
+    bytes: &[u8],
+    atom: *mut ERL_NIF_TERM,
+    encoding: ErlNifCharEncoding,
+) -> c_int {
+    if atom.is_null() {
+        return 0;
+    }
+    match decode_name(bytes, encoding).and_then(|s| env.host().existing_atom(&s)) {
+        // SAFETY: `atom` is non-null (just checked) and valid for one write (caller contract).
+        Some(term) => {
+            unsafe { atom.write(n(term)) };
+            1
+        }
+        // Not interned: the C leaves `*atom` untouched (`atom.c:431`).
+        None => 0,
+    }
+}
+
 /// `ERL_NIF_TERM enif_make_tuple_from_array(ErlNifEnv*, const ERL_NIF_TERM arr[], unsigned cnt);`
 ///
 /// # Safety
@@ -499,5 +591,207 @@ pub unsafe extern "C" fn enif_make_ref(env: *mut crate::nif::types::ErlNifEnv) -
         Some(reference) => n(reference),
         // SAFETY: `e` is a live env.
         None => unsafe { enif_make_badarg(env) },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use std::ffi::CString;
+
+    use crate::nif::host::{NifEnv, NifHost};
+    use beam_alloc::Heap;
+    use beam_term::atom::AtomTable;
+
+    /// A host whose `existing_atom` hook is a **pure lookup** into its atom table — the crate's
+    /// stand-in for `erts_atom_get` (which never creates the atom).
+    struct TestHost {
+        heap: Heap,
+        atoms: AtomTable,
+    }
+
+    impl TestHost {
+        fn new() -> TestHost {
+            TestHost {
+                heap: Heap::new(256).expect("a small test heap is allocatable"),
+                atoms: AtomTable::new(),
+            }
+        }
+    }
+
+    impl NifHost for TestHost {
+        fn heap(&mut self) -> &mut Heap {
+            &mut self.heap
+        }
+
+        fn intern_atom(&mut self, name: &str) -> Option<Eterm> {
+            Some(prelude::make_atom(self.atoms.intern(name)))
+        }
+
+        fn atom_name(&mut self, atom: Eterm) -> Option<String> {
+            if !prelude::is_atom(atom) {
+                return None;
+            }
+            self.atoms.name(prelude::atom_val(atom)).map(str::to_string)
+        }
+
+        fn existing_atom(&mut self, name: &str) -> Option<Eterm> {
+            // Lookup only — never interns, exactly like the C's `erts_atom_get`.
+            self.atoms.lookup(name).map(prelude::make_atom)
+        }
+    }
+
+    /// The two slots this file adds are populated (checked on a local table, not the assembled one).
+    #[test]
+    fn populate_fills_the_two_existing_atom_slots() {
+        let api = populate(ErlNifApi::empty());
+        assert!(api.enif_make_existing_atom.is_some());
+        assert!(api.enif_make_existing_atom_len.is_some());
+    }
+
+    /// A hit writes `*atom` and answers 1 (the interned term comes back).
+    #[test]
+    fn a_hit_returns_1_and_writes_the_atom() {
+        let mut host = TestHost::new();
+        let expected = host.intern_atom("hello").expect("interns");
+        let name = CString::new("hello").unwrap();
+        let mut env = NifEnv::new(&mut host);
+        let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
+        // SAFETY: `env` is live, `name` is NUL-terminated and `out` is writable.
+        let code = unsafe {
+            enif_make_existing_atom(
+                env.as_ptr(),
+                name.as_ptr() as *const c_char,
+                &mut out,
+                ErlNifCharEncoding::Latin1,
+            )
+        };
+        assert_eq!(code, 1);
+        assert_eq!(out, n(expected), "the existing atom is written out");
+    }
+
+    /// A miss answers 0 and leaves `*atom` **untouched** (the C's `erts_atom_get` contract).
+    #[test]
+    fn a_miss_returns_0_and_leaves_the_out_pointer_untouched() {
+        let mut host = TestHost::new();
+        let name = CString::new("nope_not_interned").unwrap();
+        let mut env = NifEnv::new(&mut host);
+        let sentinel = ERL_NIF_TERM::from_raw(0xdead_beef);
+        let mut out = sentinel;
+        // SAFETY: as above.
+        let code = unsafe {
+            enif_make_existing_atom(
+                env.as_ptr(),
+                name.as_ptr() as *const c_char,
+                &mut out,
+                ErlNifCharEncoding::Latin1,
+            )
+        };
+        assert_eq!(code, 0);
+        assert_eq!(out, sentinel, "a miss never writes the out pointer");
+        // ...and the miss did not create the atom either.
+        assert!(host.atoms.lookup("nope_not_interned").is_none());
+    }
+
+    /// The `_len` variant honours the explicit length: the name is **not** NUL-terminated.
+    #[test]
+    fn the_len_variant_honours_the_explicit_length() {
+        let mut host = TestHost::new();
+        let expected = host.intern_atom("hello").expect("interns");
+        // `helloX`: an explicit length of 5 must look up `hello`, not `helloX`.
+        let bytes = b"helloX";
+        let mut env = NifEnv::new(&mut host);
+        let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
+        // SAFETY: `bytes` has 5 readable bytes and `out` is writable.
+        let code = unsafe {
+            enif_make_existing_atom_len(
+                env.as_ptr(),
+                bytes.as_ptr() as *const c_char,
+                5,
+                &mut out,
+                ErlNifCharEncoding::Latin1,
+            )
+        };
+        assert_eq!(code, 1);
+        assert_eq!(out, n(expected));
+        // A length that names nothing still answers 0.
+        let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
+        // SAFETY: as above (all 6 bytes are readable).
+        let code = unsafe {
+            enif_make_existing_atom_len(
+                env.as_ptr(),
+                bytes.as_ptr() as *const c_char,
+                6,
+                &mut out,
+                ErlNifCharEncoding::Latin1,
+            )
+        };
+        assert_eq!(code, 0, "`helloX` is not interned");
+    }
+
+    /// The encoding is honoured for lookup too: LATIN1 byte `0xe9` is the atom `é`.
+    #[test]
+    fn the_encoding_is_honoured() {
+        let mut host = TestHost::new();
+        let expected = host.intern_atom("é").expect("interns");
+        let latin1 = [0xe9u8];
+        let mut env = NifEnv::new(&mut host);
+        let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
+        // SAFETY: `latin1` has one readable byte and `out` is writable.
+        let code = unsafe {
+            enif_make_existing_atom_len(
+                env.as_ptr(),
+                latin1.as_ptr() as *const c_char,
+                1,
+                &mut out,
+                ErlNifCharEncoding::Latin1,
+            )
+        };
+        assert_eq!(code, 1);
+        assert_eq!(out, n(expected));
+    }
+
+    /// A null env, name or out-pointer is answered 0 (the C would fault on all three).
+    #[test]
+    fn null_arguments_are_refused_with_0() {
+        let name = CString::new("hello").unwrap();
+        let mut host = TestHost::new();
+        let mut env = NifEnv::new(&mut host);
+        let mut out = ERL_NIF_TERM::from_raw(0xdead_beef);
+        // SAFETY: every null case is explicitly allowed by the contract.
+        unsafe {
+            assert_eq!(
+                enif_make_existing_atom(
+                    core::ptr::null_mut(),
+                    name.as_ptr() as *const c_char,
+                    &mut out,
+                    ErlNifCharEncoding::Latin1,
+                ),
+                0,
+                "null env"
+            );
+            assert_eq!(
+                enif_make_existing_atom(
+                    env.as_ptr(),
+                    core::ptr::null(),
+                    &mut out,
+                    ErlNifCharEncoding::Latin1,
+                ),
+                0,
+                "null name"
+            );
+            assert_eq!(
+                enif_make_existing_atom(
+                    env.as_ptr(),
+                    name.as_ptr() as *const c_char,
+                    core::ptr::null_mut(),
+                    ErlNifCharEncoding::Latin1,
+                ),
+                0,
+                "null out pointer"
+            );
+        }
+        assert_eq!(out.raw(), 0xdead_beef, "nothing wrote through the pointer");
     }
 }
