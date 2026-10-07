@@ -504,7 +504,11 @@ whole-region scan.)
 - `tests/map_copy.rs` → flat-map + HAMT-map (a 500-key deep trie, incl. a hand-built collision node) survive a collection; the copied map is sized exactly to its independently-measured footprint
 - `tests/refc_binary_copy.rs` → the 8-word `[BinRef][ErlSubBits]` refc-binary pair survives a collection (the `orig` back-pointer is forwarded to the copied `BinRef`, off-heap pointer left verbatim)
 - `tests/fun_copy.rs` → `Local`/`External`/`Imported` funs (with compound free variables) survive a collection: metadata + env round-trip, the block is sized exactly to `1 + desc_words + num_free`, and the descriptor words are proven opaque (a descriptor aliasing a from-space pointer must NOT be followed)
-- `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`) (read-only)
+- `tests/heap_sizing.rs` → the growth/shrink policy + `fullsweep_after` counter + `HeapInfo` derivation + the system-`erl` oracle cross-check
+- `tests/gc_pressure.rs` / `tests/gc_pressure_structures.rs` / `tests/gc_pressure_offheap.rs` → threshold pressure, HAMT promotion, shared/cyclic graphs, dead refc binaries, fun-env refc binaries (through both strategies)
+- `tests/fragments.rs` → fragment→heap copy-in (shared/cross-fragment graphs, off-heap transfer + no leak) and the rootset contract
+- `tests/immix_workloads.rs` → the multi-workload copying-vs-Immix measurement (Design Decisions §Measured)
+- `../../../erts/emulator/beam/erl_gc.c` → the collector being mirrored (`move_boxed`/`move_cons`/`sweep`/`do_minor`/`full_sweep_heaps`/`adjust_after_fullsweep`) (read-only)
 - `../../../erts/emulator/beam/copy.c` → term traversal reference (`size_object_x`/`copy_struct_x`) (read-only)
 - `../../erts/emulator/beam/erl_gc.h` → forwarding macros (`IS_MOVED_*`, `follow_moved`, `ErtsInYoungGen`) (read-only)
 
