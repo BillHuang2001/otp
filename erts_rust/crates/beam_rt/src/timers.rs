@@ -1,4 +1,5 @@
-//! Runtime-local timer deadlines — the queue behind `erlang:send_after/3`.
+//! Runtime-local timer deadlines — the queue behind `erlang:send_after/3` and a finite
+//! `receive … after T`.
 //!
 //! A [`Timers`] value is a **min-heap of absolute deadlines** owned by the
 //! [`Runtime`](crate::Runtime) and advanced **only** by the scheduler loop
@@ -6,6 +7,9 @@
 //! [`scheduler_pass`](crate::runtime)): the loop fires every deadline that has passed and,
 //! when nothing else can run, sleeps until the earliest one — exactly the way the same loop
 //! clamps its wait to the port poller's next deadline.
+//!
+//! A deadline carries a [`TimerAction`]: a `send_after` message to deliver, or a
+//! **receive timeout** that resumes a parked process at its `after` clause with no message.
 //!
 //! # Why a runtime-local heap and not `beam_process::TimerService`
 //!
@@ -50,18 +54,45 @@ pub(crate) enum TimerTarget {
     Name(Atom),
 }
 
-/// One timer that has reached its deadline and left the heap.
+/// What a timer does when its deadline passes.
 ///
-/// The payload is the `Eterm` the caller passed to `erlang:send_after/3`; it is only ever
-/// *delivered* (never dereferenced) by this module.
+/// The heap carries both runtime deadlines in one structure because they are the same
+/// thing — an absolute time at which a blocked process becomes runnable:
+///
+/// * [`TimerAction::Deliver`] — the `erlang:send_after/3` message, delivered into the
+///   target's mailbox (and the target's own `receive` scan decides whether it fits);
+/// * [`TimerAction::Resume`] — a finite `receive … after T` deadline: the parked process
+///   resumes at the **timed-out** path with **no** message delivered, so the `after`
+///   clause runs (C `wait.execute`: on timeout "control will be transferred to the
+///   `timeout` instruction following the `wait_timeout` instruction",
+///   `../../erts/emulator/beam/emu/msg_instrs.tab:356-366`).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum TimerAction {
+    /// Deliver `message` to `target`.
+    Deliver {
+        /// The process (or registered name) to deliver to.
+        target: TimerTarget,
+        /// The sender handed to the delivery (the process that scheduled the timer).
+        from: Eterm,
+        /// The message to deliver.
+        message: Eterm,
+    },
+    /// Resume the process parked in a `receive` with a finite timeout.
+    Resume {
+        /// The parked process.
+        pid: ProcessId,
+        /// The function index of the timed-out path to resume at.
+        func: u32,
+        /// The code offset of the timed-out path to resume at.
+        pc: u32,
+    },
+}
+
+/// One timer that has reached its deadline and left the heap.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct FiredTimer {
-    /// The process (or registered name) to deliver to.
-    pub(crate) target: TimerTarget,
-    /// The sender handed to the delivery (the process that scheduled the timer).
-    pub(crate) from: Eterm,
-    /// The message to deliver.
-    pub(crate) message: Eterm,
+    /// What the deadline requires of the scheduler.
+    pub(crate) action: TimerAction,
 }
 
 /// An opaque identity for a pending timer within one [`Timers`] heap.
@@ -109,17 +140,24 @@ struct Pending {
     /// The absolute deadline (the heap entry's key, kept here too so a cancellation can
     /// answer the remaining time without scanning the heap).
     deadline: Instant,
-    /// The process/name the message is delivered to.
-    target: TimerTarget,
-    /// The sender recorded on the delivery.
-    from: Eterm,
-    /// The message to deliver.
-    message: Eterm,
+    /// What the deadline requires of the scheduler.
+    action: TimerAction,
     /// The `#Ref<>` term `erlang:send_after/3` returned to the caller — the handle
     /// `erlang:cancel_timer/1` takes, and the reason a fired reference is still recognised
     /// as a timer reference (see [`Timers::cancel`]).
-    reference: Eterm,
+    ///
+    /// `None` for a runtime-internal deadline (a receive timeout) that no caller-visible
+    /// term addresses: it is cancelled by its [`TimerHandle`], never by `cancel_timer/1`.
+    reference: Option<Eterm>,
 }
+
+/// A handle to a runtime-internal deadline that no `#Ref<>` term addresses — a receiver's
+/// finite `receive … after T` timeout.
+///
+/// [`Timers::schedule_resume`] mints one and [`Timers::cancel_handle`] consumes it when the
+/// receiver is woken by a real message first (so the deadline cannot also fire).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub(crate) struct TimerHandle(u64);
 
 /// The runtime's pending timer deadlines.
 ///
@@ -162,23 +200,67 @@ impl Timers {
         message: Eterm,
         reference: Eterm,
     ) {
+        let deadline = deadline_after(Instant::now(), delay);
+        let id = self.insert(
+            deadline,
+            TimerAction::Deliver {
+                target,
+                from,
+                message,
+            },
+            Some(reference),
+        );
+        self.refs.insert(reference, Some(id));
+    }
+
+    /// Schedules a **receive timeout**: on expiry the parked process `pid` resumes at
+    /// `(func, pc)` — the timed-out path — with no message delivered.
+    ///
+    /// Returns the [`TimerHandle`] the runtime cancels with [`Timers::cancel_handle`] when a
+    /// message wakes the receiver before the deadline (so a receive that gets a message does
+    /// not also fire its timeout).
+    pub(crate) fn schedule_resume(
+        &mut self,
+        delay: Duration,
+        pid: ProcessId,
+        func: u32,
+        pc: u32,
+    ) -> TimerHandle {
+        let deadline = deadline_after(Instant::now(), delay);
+        let id = self.insert(deadline, TimerAction::Resume { pid, func, pc }, None);
+        TimerHandle(id.0)
+    }
+
+    /// Cancels the pending deadline `handle` identifies, answering whether it was still
+    /// pending (and therefore will not fire).
+    ///
+    /// A no-op — `false` — for a deadline that already fired or was already cancelled, so a
+    /// receiver that lost the race to its own timeout cancels nothing.
+    pub(crate) fn cancel_handle(&mut self, handle: TimerHandle) -> bool {
+        // The heap entry stays in place as a tombstone and is dropped lazily.
+        self.pending.remove(&TimerId(handle.0)).is_some()
+    }
+
+    /// Records one live timer and returns its identity.
+    ///
+    /// `reference` is the caller-visible `#Ref<>` handle when there is one (an
+    /// `erlang:send_after/3` timer), `None` for a runtime-internal deadline; it is the
+    /// caller's job to index it in [`Timers::refs`].
+    fn insert(&mut self, deadline: Instant, action: TimerAction, reference: Option<Eterm>) -> TimerId {
         let id = TimerId(self.next_id);
         self.next_id = self.next_id.wrapping_add(1);
         let seq = self.next_seq;
         self.next_seq = self.next_seq.wrapping_add(1);
-        let deadline = deadline_after(Instant::now(), delay);
         self.heap.push(HeapEntry { deadline, seq, id });
         self.pending.insert(
             id,
             Pending {
                 deadline,
-                target,
-                from,
-                message,
+                action,
                 reference,
             },
         );
-        self.refs.insert(reference, Some(id));
+        id
     }
 
     /// Whether `reference` is a timer reference **this** heap minted (pending, fired or
@@ -231,13 +313,13 @@ impl Timers {
             let Some(pending) = self.pending.remove(&entry.id) else {
                 continue; // a tombstone that was not at the head when we pruned
             };
-            // The reference is no longer cancellable, but it stays *known* so a later
-            // `cancel_timer/1` answers the oracle's `false` instead of `badarg`.
-            self.refs.insert(pending.reference, None);
+            // A caller-visible reference is no longer cancellable, but it stays *known* so
+            // a later `cancel_timer/1` answers the oracle's `false` instead of `badarg`.
+            if let Some(reference) = pending.reference {
+                self.refs.insert(reference, None);
+            }
             fired.push(FiredTimer {
-                target: pending.target,
-                from: pending.from,
-                message: pending.message,
+                action: pending.action,
             });
         }
         fired
@@ -301,6 +383,14 @@ mod tests {
         reference
     }
 
+    /// The `(target, message)` of a fired **delivery** deadline; panics on a resume one.
+    fn delivered(timer: &FiredTimer) -> (TimerTarget, i64) {
+        match timer.action {
+            TimerAction::Deliver { target, message, .. } => (target, signed_value(message)),
+            other => panic!("expected a delivery, got {other:?}"),
+        }
+    }
+
     #[test]
     fn heap_orders_by_deadline_then_insertion_sequence() {
         let base = Instant::now();
@@ -338,8 +428,11 @@ mod tests {
         // A deadline in the past is due immediately.
         let fired = timers.take_due(Instant::now());
         assert_eq!(fired.len(), 1);
-        assert_eq!(fired[0].target, TimerTarget::Pid(pid(1)));
-        assert_eq!(signed_value(fired[0].message), 1);
+        assert_eq!(
+            delivered(&fired[0]),
+            (TimerTarget::Pid(pid(1)), 1),
+            "the delivered target and message"
+        );
         assert_eq!(timers.pending_count(), 0);
         assert_eq!(timers.next_deadline(), None, "it is gone from the heap");
         assert!(
@@ -358,10 +451,7 @@ mod tests {
         schedule(&mut timers, 3_600_000, 3);
 
         let fired = timers.take_due(Instant::now());
-        let messages: Vec<i64> = fired
-            .iter()
-            .map(|timer| signed_value(timer.message))
-            .collect();
+        let messages: Vec<i64> = fired.iter().map(|timer| delivered(timer).1).collect();
         assert_eq!(messages, vec![1, 2], "equal deadlines keep insertion order");
         assert_eq!(timers.pending_count(), 1, "the far timer is still pending");
         assert!(timers.next_deadline().is_some());
@@ -415,5 +505,47 @@ mod tests {
         schedule(&mut timers, u64::MAX, 1);
         assert_eq!(timers.pending_count(), 1);
         assert!(timers.next_deadline().is_some());
+    }
+
+    #[test]
+    fn a_receive_deadline_fires_a_resume_and_is_not_a_timer_reference() {
+        // A receive timeout is a runtime-internal deadline: its action is a `Resume` at the
+        // timed-out path, and it mints **no** caller-visible timer reference (so
+        // `cancel_timer/1` can never reach it).
+        let mut timers = Timers::new();
+        let _handle = timers.schedule_resume(Duration::from_millis(0), pid(4), 2, 11);
+        assert_eq!(timers.pending_count(), 1);
+        assert!(timers.next_deadline().is_some());
+        // No reference term addresses it: `is_timer_ref` is false for any term.
+        assert!(!timers.is_timer_ref(reference(4)));
+        assert_eq!(timers.cancel(reference(4)), None);
+
+        let fired = timers.take_due(Instant::now());
+        assert_eq!(fired.len(), 1);
+        assert!(matches!(
+            fired[0].action,
+            TimerAction::Resume {
+                pid: p,
+                func: 2,
+                pc: 11
+            } if p == pid(4)
+        ));
+        assert_eq!(timers.pending_count(), 0, "it fires exactly once");
+    }
+
+    #[test]
+    fn cancel_handle_removes_a_pending_receive_deadline() {
+        // The message-wake path: the receiver got a message before the deadline, so the
+        // runtime cancels the deadline by its handle and it can never fire.
+        let mut timers = Timers::new();
+        let handle = timers.schedule_resume(Duration::from_millis(1_000), pid(5), 0, 3);
+        assert!(timers.cancel_handle(handle), "it was pending");
+        assert_eq!(timers.pending_count(), 0);
+        assert_eq!(timers.next_deadline(), None, "the cancelled head is pruned");
+        // Cancelling twice, and cancelling a fired handle, both answer `false`.
+        assert!(!timers.cancel_handle(handle));
+        let other = timers.schedule_resume(Duration::from_millis(0), pid(6), 0, 4);
+        assert_eq!(timers.take_due(Instant::now()).len(), 1, "it fired");
+        assert!(!timers.cancel_handle(other), "a fired deadline is not cancellable");
     }
 }
