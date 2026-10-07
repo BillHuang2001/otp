@@ -37,11 +37,11 @@ const DECLARED_UBIF: usize = 73;
 const DECLARED_HBIF: usize = 7;
 
 /// The pinned census of the registry against the table (see `CONTEXT.md`).
-const IMPLEMENTED_DECLARED: usize = 241;
-const MISSING_DECLARED: usize = 315;
+const IMPLEMENTED_DECLARED: usize = 334;
+const MISSING_DECLARED: usize = 222;
 const FAST_PATHS: usize = 79;
 /// The registry size (declared-and-implemented + fast paths).
-const REGISTRY_SIZE: usize = 320;
+const REGISTRY_SIZE: usize = 413;
 
 #[test]
 fn the_committed_table_has_a_pinned_shape() {
