@@ -61,7 +61,7 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 /// `system_info/1` atom vocabulary ([`crate::info::INFO_ATOMS`]) and the
 /// `beam_process` signal names, so this list is deliberately not exhaustive on its own.
 ///
-/// Four groups:
+/// Five groups:
 ///
 /// * the atoms `system_info/1` can materialize — the `os_type` pair of both platforms
 ///   and the boolean atoms (`unix`, `linux`, `win32`, `nt`, `true`, `false`);
@@ -77,11 +77,18 @@ pub const PRELOADED_MODULE_NAMES: &[&str] = &[
 ///   `EXC_FUNCTION_CLAUSE`; the call arguments ride in the stacktrace, not the reason)
 ///   and the two remaining class names `exit`/`throw` (`error` is already in the core
 ///   set above). Seeding them here is what lets a module that never mentions the name
-///   itself still raise the reason the oracle raises.
+///   itself still raise the reason the oracle raises;
+/// * the C runtime's **globally interned** vocabulary: the `error_atom` table
+///   (`erts/emulator/beam/beam_common.c:382-406`), the stacktrace auxiliaries
+///   `file`/`line`, the node-name atom `nonode@nohost` (the local-node identity
+///   [`crate::context`] installs so `term_to_binary/1` can encode an internal
+///   pid/port id) and the `bm`/`ac` compiled-pattern tags of `beam_bifs::binary`.
+///   Real ERTS interns these up front; a raise, a catch and a printer can therefore
+///   name them even when the raising module never wrote the name.
 ///
-/// The three exception atoms are **appended last** on purpose: every index assigned
-/// before them must stay stable (module code and the positional-atom tests depend on
-/// the existing prefix), so this group may only ever be extended at the end.
+/// Everything after the first three groups is **appended last** on purpose: every index
+/// assigned before it must stay stable (module code and the positional-atom tests depend
+/// on the existing prefix), so the groups may only ever be extended at the end.
 ///
 /// This is deliberately **not** the full `atom.names` ordering of the legacy emulator:
 /// positional atom indices for preloaded code are a documented Milestone-1 gap.
@@ -115,11 +122,44 @@ pub const CORE_ATOMS: &[&str] = &[
     "kill",
     "killed",
     // Exception reason/class atoms resolved from the *module* table at raise time
-    // (the engine's `func_info`/`raise_bif_error` paths). Appended last so every
-    // index above is unchanged.
+    // (the engine's `func_info`/`raise_bif_error` paths), plus the whole global
+    // reason vocabulary of the C runtime's `error_atom` table
+    // (`erts/emulator/beam/beam_common.c:382-406`). Appended last so every index
+    // above is unchanged.
     "function_clause",
     "exit",
     "throw",
+    // The `error_atom` table.
+    "internal_error",
+    "badarg",
+    "badarith",
+    "badmatch",
+    "case_clause",
+    "if_clause",
+    "undef",
+    "badfun",
+    "badarity",
+    "timeout_value",
+    "noproc",
+    "notalive",
+    "system_limit",
+    "try_clause",
+    "notsup",
+    "badmap",
+    "badkey",
+    "badrecord",
+    "badfield",
+    "novalue",
+    // Stacktrace auxiliary atoms: the `file`/`line` of a `{M,F,A,Location}` frame.
+    "file",
+    "line",
+    // The runtime's node-name atom — the local-node identity
+    // [`crate::context`] installs so `term_to_binary/1` can encode an internal pid
+    // as `NEW_PID_EXT` — and the two compiled-pattern tag atoms of the `binary`
+    // module (`{bm, Ref}`/`{ac, Ref}`, `beam_bifs::binary`).
+    "nonode@nohost",
+    "bm",
+    "ac",
 ];
 
 /// The preloaded-module registry skeleton (contract A.7).
@@ -337,33 +377,108 @@ mod tests {
         // `get_module_info`), so the boot seed is the only source: without `function_clause`
         // a failed function head was a typed `unsupported` capability gap instead of the
         // oracle's `error:function_clause`.
+        //
+        // The same is true of the whole C `error_atom` table (`beam_common.c:382-406`),
+        // which real ERTS interns up front, plus the stacktrace auxiliaries `file`/`line`
+        // and the node-name atom `nonode@nohost` (`term_to_binary/1` of an internal pid
+        // needs it to emit `NEW_PID_EXT`) and the `bm`/`ac` pattern tags.
+        let tail = [
+            "function_clause",
+            "exit",
+            "throw",
+            "internal_error",
+            "badarg",
+            "badarith",
+            "badmatch",
+            "case_clause",
+            "if_clause",
+            "undef",
+            "badfun",
+            "badarity",
+            "timeout_value",
+            "noproc",
+            "notalive",
+            "system_limit",
+            "try_clause",
+            "notsup",
+            "badmap",
+            "badkey",
+            "badrecord",
+            "badfield",
+            "novalue",
+            "file",
+            "line",
+            "nonode@nohost",
+            "bm",
+            "ac",
+        ];
         let mut atoms = AtomTable::new();
         seed_core_atoms(&mut atoms);
-        for name in ["function_clause", "exit", "throw"] {
+        for name in tail {
             assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
         // `error` is the class of every raise the two paths produce; it is part of the
         // documented core set.
         assert!(atoms.lookup("error").is_some(), "error must be seeded");
-        // The three new names are **appended**: every index the seed assigned before them is
-        // unchanged (module code and the positional-atom assumptions depend on the prefix),
-        // so a table seeded with the prefix alone must resolve those names identically.
-        let tail = CORE_ATOMS.len() - 3;
+        // The group is **appended**: every index the seed assigned before it is unchanged
+        // (module code and the positional-atom assumptions depend on the prefix), so a
+        // table seeded with the prefix alone must resolve those names identically.
+        let split = CORE_ATOMS.len() - tail.len();
         assert_eq!(
-            &CORE_ATOMS[tail..],
-            &["function_clause", "exit", "throw"],
-            "the exception atoms must be the last entries, in this order"
+            &CORE_ATOMS[split..],
+            &tail,
+            "the appended group must be the last entries, in this order"
         );
         let mut prefix = AtomTable::new();
-        for name in &CORE_ATOMS[..tail] {
+        for name in &CORE_ATOMS[..split] {
             prefix.intern(name);
         }
-        for name in &CORE_ATOMS[..tail] {
+        for name in &CORE_ATOMS[..split] {
             assert_eq!(
                 atoms.lookup(name),
                 prefix.lookup(name),
-                "{name} must keep the index it had before the exception atoms were appended"
+                "{name} must keep the index it had before the appended group"
             );
+        }
+    }
+    #[test]
+    fn seed_core_atoms_interns_the_global_reason_vocabulary() {
+        // The engine resolves a raise's reason atom from the *running module's* atom
+        // table and never substitutes a different atom, so a module that does not mention
+        // `badmatch`/`case_clause`/… itself can only raise it because the boot seed holds
+        // the name — exactly what real ERTS's global `error_atom` table provides. The
+        // `beam_bifs` `records:get_definition/2` path and `term_to_binary/1`'s internal
+        // pid/port encoding depend on the same seed (`nonode@nohost`).
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        for name in [
+            "internal_error",
+            "badarg",
+            "badarith",
+            "badmatch",
+            "case_clause",
+            "if_clause",
+            "undef",
+            "badfun",
+            "badarity",
+            "timeout_value",
+            "noproc",
+            "notalive",
+            "system_limit",
+            "try_clause",
+            "notsup",
+            "badmap",
+            "badkey",
+            "badrecord",
+            "badfield",
+            "novalue",
+            "file",
+            "line",
+            "nonode@nohost",
+            "bm",
+            "ac",
+        ] {
+            assert!(atoms.lookup(name).is_some(), "{name} must be seeded");
         }
     }
     #[test]
