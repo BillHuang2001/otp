@@ -9,10 +9,38 @@
 //! `erlang:system_info/1` returns in the oracle (erts-17.1): `version` is `"17.1"`,
 //! i.e. `[49,55,46,49]`.
 //!
-//! # The supported key set
+//! # Key families (the module split)
 //!
-//! [`SUPPORTED_KEYS`] is the complete list; **any other key is `badarg`**, which is
-//! what the oracle raises (`erlang:system_info(nonsense)` ⇒ `error:badarg`).
+//! The key surface is large, so this parent keeps only the materialization core —
+//! [`InfoValue`], [`InfoValue::to_eterm`], the shared helpers, [`INFO_ATOMS`] and the
+//! [`system_info_value`] dispatcher — and delegates the per-key logic to child
+//! modules, each exposing `pub(crate) fn try_value(key, rt) -> Option<Result<InfoValue>>`
+//! (`None` means "not my key"):
+//!
+//! | module | keys |
+//! |---|---|
+//! | [`system`] | build/host identity constants (`version`, `nif_version`, `os_type`, `emu_type`, …) |
+//! | [`limits`] | counts read from this runtime's live tables plus the emulator limits (`atom_count`, `process_count`, `port_limit`, …) |
+//! | [`schedulers`] | processor/scheduler/multi-scheduling keys |
+//! | [`memory`] | GC/heap policy keys, `allocated_areas`, `alloc_util_allocators`, `garbage_collection` |
+//! | [`unsupported`] | the oracle's keys for facilities this runtime does not have — an honest capability gap |
+//!
+//! # Implemented vs unsupported vs badarg
+//!
+//! Three disjoint key sets (documented per key in the family modules and in `CONTEXT.md`):
+//!
+//! * [`SUPPORTED_KEYS`] — answered with the oracle's exact value *shape*. Some are
+//!   genuine constants of this build/host; others are **self-derived** from this
+//!   runtime's own live tables (`process_count`, `atom_count`, `allocated_areas`, …) and
+//!   are therefore correct-but-smaller than the oracle's run-time figure.
+//! * [`UNSUPPORTED_KEYS`] — the oracle accepts the key but it describes a facility this
+//!   runtime genuinely does not have (a live dist wire state, the time-correction
+//!   service, CPU-topology detection, the C-compiler/3PP identification, the code-loading
+//!   dumps, the logger pid, …). Each returns a raise whose reason atom starts with
+//!   `unsupported` ([`crate::error::unsupported`]) so a `-eval` caller sees the exit-3
+//!   capability gap — **never** a fabricated value or a hardcoded oracle number.
+//! * every other key — `badarg`, exactly what the oracle raises for a key it does not
+//!   accept (`erlang:system_info(nonsense)` ⇒ `error:badarg`).
 //!
 //! # Atom-valued keys need a seeded atom table
 //!
@@ -23,41 +51,131 @@
 //! name-keyed, and the boot core seed ([`crate::boot::CORE_ATOMS`]) already interns part
 //! of it, so seeding both is safe.
 
-use beam_abi::{ERL_NIF_MAJOR_VERSION, ERL_NIF_MINOR_VERSION};
 use beam_alloc::Heap;
-use beam_common::ERTS_VERSION;
 use beam_common::{BeamError, Result};
 use beam_term::{make_atom, try_make_small, AtomTable, Eterm, NIL};
 
 use crate::error;
 use crate::runtime::Runtime;
 
-/// The keys [`system_info_value`] answers — the A.8 subset this runtime supports.
+mod limits;
+mod memory;
+mod schedulers;
+mod system;
+mod unsupported;
+
+/// The keys [`system_info_value`] answers — every key whose value this runtime can give
+/// in the oracle's exact shape. Some are constants of this build/host, others are
+/// **self-derived** from this runtime's own tables (see the module docs).
 ///
 /// The list holds **atom** keys only; the one tuple key the oracle accepts that this
 /// runtime answers, `{allocator, A}`, is handled by the tuple path in
 /// [`crate::native`]'s `system_info/1` (it is dispatched to [`allocator_report`]).
 pub const SUPPORTED_KEYS: &[&str] = &[
+    // -- `system`: build/host identity (see [`system`]) --
     "version",
     "otp_release",
     "system_architecture",
     "system_version",
     "nif_version",
+    "driver_version",
     "wordsize",
-    "logical_processors",
-    "process_count",
-    "port_count",
-    "os_type",
-    "threads",
     "emu_flavor",
+    "emu_type",
+    "machine",
+    "threads",
+    "smp_support",
+    "async_dist",
+    "os_type",
+    "os_version",
+    "break_ignored",
+    "debug_compiled",
+    "dynamic_trace",
+    "dynamic_trace_probes",
+    "modified_timing_level",
+    "update_cpu_info",
+    "trace_control_word",
+    "port_parallelism",
+    "kernel_poll",
+    "halt_flush_timeout",
+    "creation",
+    // -- `limits`: counts and emulator limits (see [`limits`]) --
+    "atom_count",
+    "atom_limit",
+    "process_count",
+    "process_limit",
+    "port_count",
+    "port_limit",
+    "ets_count",
+    "ets_limit",
+    "outstanding_system_requests_limit",
+    "dist_buf_busy_limit",
+    "delayed_node_table_gc",
+    // -- `schedulers`: processor/scheduler keys (see [`schedulers`]) --
+    "logical_processors",
+    "logical_processors_available",
+    "logical_processors_online",
     "schedulers",
+    "schedulers_online",
+    "scheduler_id",
+    "dirty_cpu_schedulers",
+    "dirty_cpu_schedulers_online",
+    "dirty_io_schedulers",
+    "scheduler_bind_type",
+    "scheduler_bindings",
+    "multi_scheduling",
+    "multi_scheduling_blockers",
+    "normal_multi_scheduling_blockers",
+    "thread_pool_size",
+    // -- `memory`: GC/heap + allocator keys (see [`memory`]) --
+    "min_heap_size",
+    "min_bin_vheap_size",
+    "max_heap_size",
+    "fullsweep_after",
+    "heap_sizes",
+    "heap_type",
+    "message_queue_data",
+    "garbage_collection",
     "alloc_util_allocators",
     "allocated_areas",
-    "garbage_collection",
+];
+
+/// The keys the oracle accepts but this runtime answers with an honest **capability
+/// gap** — a raise whose reason atom starts with `unsupported`.
+///
+/// Every key here names an emulator facility this runtime does not have (see the
+/// [`unsupported`] module for the per-key rationale). The value is *never* fabricated:
+/// reporting an oracle number for a facility that does not exist would be a lie about a
+/// different emulator.
+pub const UNSUPPORTED_KEYS: &[&str] = &[
+    // The host C allocator identification (`{glibc, …}`) — no C allocator to identify.
+    "allocator",
+    // A live distribution node's wire state.
+    "dist",
+    "dist_ctrl",
+    // The time-correction service and its clocks.
+    "time_offset",
+    "time_correction",
+    "time_warp_mode",
+    "tolerant_timeofday",
+    "start_time",
+    "end_time",
+    "os_monotonic_time_source",
+    "os_system_time_source",
+    // CPU-topology *detection*, poll-set introspection, C-compiler/3PP identification.
+    "cpu_topology",
+    "check_io",
+    "c_compiler_used",
+    "embedded_3pps",
+    // The logger process, and the code-loading self-description dumps.
+    "system_logger",
+    "info",
+    "procs",
+    "loaded",
 ];
 
 /// The **complete** atom vocabulary of this surface — every name [`system_info_value`]
-/// can answer as an [`InfoValue::Atom`] (or nested inside one of its list/tuple
+/// can answer as an [`InfoValue::Atom`] (or nested inside one of its list/tuple/map
 /// variants), and every name [`crate::native`]'s `process_info/2` can emit.
 ///
 /// [`InfoValue::to_eterm`] resolves an [`InfoValue::Atom`] through the runtime's own
@@ -71,7 +189,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
 /// with the core set is harmless, and **appending** to this list keeps every index the
 /// core seed assigned before it unchanged.
 pub const INFO_ATOMS: &[&str] = &[
-    // `os_type` (`{unix,linux}` / `{win32,nt}`) and `threads` (`true` / `false`).
+    // `os_type` (`{unix,linux}` / `{win32,nt}`) and `threads`/`*_support` (`true` / `false`).
     "unix", "linux", "win32", "nt", "true", "false",
     // `emu_flavor` (`jit` for the JIT emulator, `emu` for the plain interpreter).
     "jit", "emu",
@@ -133,7 +251,8 @@ pub const INFO_ATOMS: &[&str] = &[
     "min_heap_size",
     "fullsweep_after",
     "minor_gcs",
-    // The `max_heap_size` process-flag map (`process_info(Pid, garbage_collection)`).
+    // The `max_heap_size` process-flag map (`process_info(Pid, garbage_collection)`) and
+    // the `system_info(max_heap_size)` map, in the oracle's key order.
     "error_logger",
     "include_shared_binaries",
     "kill",
@@ -142,16 +261,32 @@ pub const INFO_ATOMS: &[&str] = &[
     "heap_size",
     "total_heap_size",
     "undefined",
+    // `emu_type` (`opt` for an optimized build, `debug` for a debug build) and the
+    // constant atom-valued keys: `dynamic_trace` (`none`), `modified_timing_level`
+    // (`undefined`), `update_cpu_info` (`unchanged`), `halt_flush_timeout` (`infinity`),
+    // `scheduler_bind_type` (`unbound`), `multi_scheduling` (`enabled`/`disabled`),
+    // `heap_type` (`private`) and `message_queue_data` (`on_heap`).
+    "opt",
+    "debug",
+    "none",
+    "unchanged",
+    "infinity",
+    "unbound",
+    "enabled",
+    "disabled",
+    "private",
+    "on_heap",
 ];
 
 /// A `system_info/1` value, independent of any heap.
 ///
-/// The first five variants are the scalar shapes; [`InfoValue::List`] and
-/// [`InfoValue::Tupled`] are the generic containers the richer keys
-/// (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
-/// `garbage_collection`) are built from — a `{Key, Value}` row is
+/// The first five variants are the scalar shapes; [`InfoValue::List`],
+/// [`InfoValue::Tupled`] and [`InfoValue::Map`] are the generic containers the richer
+/// keys (`alloc_util_allocators`, `allocated_areas`, `{allocator, A}`,
+/// `garbage_collection`, `max_heap_size`) are built from — a `{Key, Value}` row is
 /// `Tupled(vec![Atom(key), value])`, so the oracle's proplists and its mixed-arity
-/// tuples (`{atom_space, Bytes, Bytes}`) are both expressible.
+/// tuples (`{atom_space, Bytes, Bytes}`) are both expressible, and `Map` covers the one
+/// map-shaped key (`max_heap_size`).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum InfoValue {
     /// A small integer (materialized as a small-int immediate).
@@ -168,6 +303,12 @@ pub enum InfoValue {
     List(Vec<InfoValue>),
     /// A tuple of arbitrary arity, in order.
     Tupled(Vec<InfoValue>),
+    /// A map of `(key, value)` pairs, materialized as an Erlang map.
+    ///
+    /// The only map-shaped key is `max_heap_size`; it is a small flat map, built through
+    /// [`beam_codec::term::make_flatmap`] (the safe heap writer) so this crate stays
+    /// `unsafe`-free.
+    Map(Vec<(InfoValue, InfoValue)>),
 }
 
 impl InfoValue {
@@ -180,7 +321,7 @@ impl InfoValue {
     /// * [`BeamError::TermNotFound`] when an atom this value names is not interned in
     ///   `atoms` — never an invented atom. A runtime materializing this crate's keys
     ///   seeds [`INFO_ATOMS`], which covers every atom the surface can emit;
-    /// * the heap's allocation failure for a string, a list or a tuple.
+    /// * the heap's allocation failure for a string, a list, a tuple or a map.
     pub fn to_eterm(&self, heap: &mut Heap, atoms: &AtomTable) -> Result<Eterm> {
         match self {
             InfoValue::Int(value) => try_make_small(*value).map_err(|_| BeamError::SystemLimit),
@@ -218,6 +359,13 @@ impl InfoValue {
                 }
                 heap.tuple(&terms)
             }
+            InfoValue::Map(pairs) => {
+                let mut terms = Vec::with_capacity(pairs.len());
+                for (key, value) in pairs {
+                    terms.push((key.to_eterm(heap, atoms)?, value.to_eterm(heap, atoms)?));
+                }
+                beam_codec::term::make_flatmap(heap, &terms)
+            }
         }
     }
 }
@@ -239,55 +387,134 @@ fn atom_term(atoms: &AtomTable, name: &str) -> Result<Eterm> {
 ///
 /// # Errors
 ///
-/// [`BeamError::BadArg`] for any key outside [`SUPPORTED_KEYS`] — the oracle's reason.
+/// * [`BeamError::BadArg`] for any key outside [`SUPPORTED_KEYS`]/[`UNSUPPORTED_KEYS`] —
+///   the oracle's reason for a key it does not accept;
+/// * the [`crate::error::unsupported`] capability gap for a key of [`UNSUPPORTED_KEYS`]
+///   (a facility this runtime does not have);
+/// * the materialization errors of [`allocator_report`] and the live-table reads.
 pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
-    match key {
-        "version" => Ok(InfoValue::Str(ERTS_VERSION.to_string())),
-        "otp_release" => Ok(InfoValue::Str(beam_common::otp_version().major.to_string())),
-        "system_architecture" => Ok(InfoValue::Str(system_architecture())),
-        "system_version" => Ok(InfoValue::Str(format!(
-            "Erlang/OTP {} [erts-{ERTS_VERSION}] [source] [{}-bit]",
-            beam_common::otp_version().major,
-            std::mem::size_of::<usize>() * 8,
-        ))),
-        "nif_version" => Ok(InfoValue::Str(format!(
-            "{ERL_NIF_MAJOR_VERSION}.{ERL_NIF_MINOR_VERSION}"
-        ))),
-        "wordsize" => Ok(InfoValue::Int(std::mem::size_of::<usize>() as i64)),
-        "logical_processors" => Ok(InfoValue::Int(logical_processors())),
-        "process_count" => Ok(InfoValue::Int(rt.processes().len() as i64)),
-        "port_count" => Ok(InfoValue::Int(port_count(rt)?)),
-        "os_type" => Ok(os_type()),
-        "threads" => Ok(InfoValue::Bool(true)),
-        "emu_flavor" => Ok(emu_flavor(rt)),
-        "schedulers" => Ok(InfoValue::Int(schedulers(rt))),
-        "alloc_util_allocators" => Ok(alloc_util_allocators()),
-        "allocated_areas" => allocated_areas(rt),
-        "garbage_collection" => Ok(garbage_collection(rt)),
-        other => Err(error::unknown_info_key(other)),
+    if let Some(result) = system::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = limits::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = schedulers::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = memory::try_value(key, rt) {
+        return result;
+    }
+    if let Some(result) = unsupported::try_value(key, rt) {
+        return result;
+    }
+    Err(error::unknown_info_key(key))
+}
+
+// -- shared helpers used by the family modules ----------------------------------------
+
+/// A `{Key, Value}` row of an `InfoValue` proplist.
+pub(crate) fn row(key: &'static str, value: i64) -> InfoValue {
+    InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(value)])
+}
+
+/// `value` as an `i64`, saturating at the small-integer range's practical bound.
+///
+/// Used only for footprint/count figures where the operand is far inside the range on
+/// any real machine (a table length, a size in bytes, the growth table).
+pub(crate) fn usize_to_int(value: usize) -> i64 {
+    i64::try_from(value).unwrap_or(i64::MAX)
+}
+
+/// `value` as an [`InfoValue::Int`], or [`BeamError::SystemLimit`] when it cannot be a
+/// small integer.
+pub(crate) fn usize_to_int_result(value: usize) -> Result<InfoValue> {
+    i64::try_from(value)
+        .map(InfoValue::Int)
+        .map_err(|_| BeamError::SystemLimit)
+}
+
+/// The number of logical processors, best-effort.
+///
+/// `system_info/1` must always answer, so a platform that cannot report the count
+/// (rather than an error) falls back to `1` — documented rather than swallowed.
+pub(crate) fn logical_processors() -> i64 {
+    match std::thread::available_parallelism() {
+        Ok(count) => count.get() as i64,
+        Err(_) => 1,
     }
 }
 
-// -- the allocator/GC introspection keys (`beam_alloc` / `beam_gc` adoption) -----------
+/// The number of **normal schedulers**, as the oracle reports it.
+///
+/// An explicit `+S N` wins. `+S 0` means "auto" in real ERTS (`erl +S 0` reports the
+/// online processor count), so it falls through to the machine's parallelism as well —
+/// the same answer the oracle gives without `+S`. The count is always `> 0`: the
+/// scheduler *loop* is Stage-5 work (`beam_process`), but a count of `0` schedulers
+/// would be a lie about a runtime that executes code.
+pub(crate) fn schedulers_count(rt: &Runtime) -> i64 {
+    match rt.config().emulator.schedulers {
+        Some(count) if count > 0 => i64::from(count),
+        _ => logical_processors(),
+    }
+}
 
-/// `system_info(alloc_util_allocators)` — the *alloc-util* allocator names.
+/// The number of **live ports** — the value the oracle's `port_count` reports.
 ///
-/// Verified against the oracle (OTP 29 / erts-17.1):
-/// `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(alloc_util_allocators)]).'`
-/// prints `[temp_alloc,sl_alloc,std_alloc,ll_alloc,eheap_alloc,ets_alloc,fix_alloc,
-/// literal_alloc,binary_alloc,driver_alloc]` — which is exactly
-/// [`beam_alloc::registry::alloc_util_allocators`] (the C
-/// `erts_alloc_util_allocators`, `erl_alloc.c:2789`, i.e. every [`AllocatorId`] but
-/// `sys_alloc` — the raw system allocator — and `test_alloc`), in the same order.
+/// The runtime's own [`PortRegistry`](crate::port::PortRegistry) is the single source of
+/// truth: a port counts once it is *live* (`RuntimePorts` inserts it), which is exactly
+/// when the oracle's own `port_count` rises. A fresh runtime has opened no port, so the
+/// honest answer is `0` (the oracle boots with its `standard_io` port already open, which
+/// this runtime has no counterpart for).
 ///
-/// [`AllocatorId`]: beam_alloc::types::AllocatorId
-fn alloc_util_allocators() -> InfoValue {
-    InfoValue::List(
-        beam_alloc::registry::alloc_util_allocators()
-            .into_iter()
-            .map(InfoValue::Atom)
-            .collect(),
-    )
+/// That divergence is **deliberate and must not be "fixed"** to match a run-time figure:
+/// like `erlang:ports/0`, this key reports *this* runtime's table, not the oracle's (see
+/// the same note in [`crate::port`]).
+pub(crate) fn live_ports(rt: &Runtime) -> Result<i64> {
+    match rt.ports.try_borrow() {
+        Ok(registry) => Ok(registry.len() as i64),
+        Err(_) => Err(error::unsupported(
+            "erlang:system_info(port_count): the port registry is already borrowed",
+        )),
+    }
+}
+
+/// The number of live ETS tables, or the typed capability gap when the shared table
+/// registry is already borrowed.
+pub(crate) fn live_tables(rt: &Runtime) -> Result<i64> {
+    match rt.tables.try_borrow() {
+        Ok(tables) => Ok(tables.len() as i64),
+        Err(_) => Err(error::unsupported(
+            "erlang:system_info(ets_count): the ETS table registry is already borrowed",
+        )),
+    }
+}
+
+/// The Erlang `{OsFamily,OsName}` pair of the host.
+pub(crate) fn os_type() -> InfoValue {
+    if cfg!(target_os = "windows") {
+        InfoValue::Tuple("win32", "nt")
+    } else {
+        InfoValue::Tuple("unix", "linux")
+    }
+}
+
+/// The target triple of this build, best-effort.
+///
+/// `std` exposes the architecture and the operating system but not the vendor, so the
+/// known targets are spelled out and anything else falls back to
+/// `"<arch>-unknown-<os>"`. This is introspection only; the build itself never depends
+/// on it.
+pub(crate) fn system_architecture() -> String {
+    let arch = std::env::consts::ARCH;
+    let os = std::env::consts::OS;
+    match (arch, os) {
+        ("x86_64", "linux") => "x86_64-pc-linux-gnu".to_string(),
+        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
+        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
+        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
+        _ => format!("{arch}-unknown-{os}"),
+    }
 }
 
 /// The **effective** heap policy this runtime reports: the emulator's heap-size options
@@ -303,127 +530,10 @@ fn alloc_util_allocators() -> InfoValue {
 /// a collector's policy) matches the C, where `min_heap_size`/`min_bin_vheap_size` are
 /// seeded per process from the emulator defaults.
 pub(crate) fn effective_policy(rt: &Runtime) -> beam_gc::HeapPolicy {
-    rt.config().heap_options().policy().clone()
+    rt.config().heap.policy().clone()
 }
 
-/// `system_info(garbage_collection)` — the emulator-wide GC policy knobs.
-///
-/// Verified against the oracle (OTP 29.1.1 / erts-17.1): `[{max_heap_size,0},
-/// {min_bin_vheap_size,46422},{min_heap_size,233},{fullsweep_after,65535}]`, and an
-/// invocation with `+hms 1000 +hmbs 5000` ⇒ `[{max_heap_size,0},
-/// {min_bin_vheap_size,6772},{min_heap_size,1598},{fullsweep_after,65535}]`. Note that
-/// `max_heap_size` is the **bare integer** here, unlike the flag *map*
-/// `process_info(Pid, garbage_collection)` reports.
-///
-/// The values are the emulator's heap-size options ([`effective_policy`]), i.e. the same
-/// figures the per-process item reports for a process with no explicit heap options — the
-/// four keys [`beam_gc::GARBAGE_COLLECTION_KEYS`] names minus `minor_gcs`, which is a
-/// per-process counter with no emulator-wide counterpart.
-fn garbage_collection(rt: &Runtime) -> InfoValue {
-    // `HeapInfo` owns the oracle's item order; the sizes are irrelevant for this key.
-    let info = beam_gc::HeapInfo::new(&effective_policy(rt), 0, 0, 0);
-    let items = info.items();
-    InfoValue::List(
-        items[..4]
-            .iter()
-            .map(|(key, value)| row(key, usize_to_int(*value)))
-            .collect(),
-    )
-}
-
-/// `system_info(allocated_areas)` — the runtime's own allocation-area footprints, in the
-/// oracle's 19-item order and arity.
-///
-/// Verified against the oracle (OTP 29 / erts-17.1), which emits exactly these names in
-/// this order (the C `erts_allocated_areas`, `erl_alloc.c:2580-2699`):
-/// `sys_misc`, `static`, `atom_space` (a **three**-element tuple), `atom_table`,
-/// `module_table`, `export_table`, `export_list`, `register_table`, `fun_table`,
-/// `fun_list`, `module_refs`, `loaded_code`, `dist_table`, `node_table`, `bif_timer`,
-/// `process_table`, `port_table`, `ets_misc`, `external_alloc`.
-///
-/// The oracle's *values* are run-dependent byte counts of a completely different
-/// emulator, so none of them can be mirrored. Every value here is instead **derived from
-/// state this runtime actually has** — never a hardcoded oracle figure, which would be a
-/// lie about a different process:
-///
-/// | item | value |
-/// |---|---|
-/// | `atom_space` | `{atom_space, B, B}`, `B` = the atom table's index slots |
-/// | `atom_table` | `B` |
-/// | `module_table`, `loaded_code` | one slot per **loaded** code module |
-/// | `register_table` | one slot per locally **registered** name |
-/// | `process_table` | one slot per **live** process |
-/// | `port_table` | one slot per **live** port |
-/// | `ets_misc` | one slot per **live** ETS table |
-/// | every other item | `0` |
-///
-/// A "slot" is [`std::mem::size_of::<usize>`] bytes — the word the runtime's own tables
-/// spend per entry — so the figures are a real (if coarse) lower bound on this runtime's
-/// footprint, in the byte unit the oracle uses. The `0` items are the ones this runtime
-/// has **no counterpart** for (no `export`/BIF-timer/`fun` table, no distribution or node
-/// table, no external port-driver allocator), and a `0` is honest where an invented
-/// figure would not be.
-fn allocated_areas(rt: &Runtime) -> Result<InfoValue> {
-    let slot = std::mem::size_of::<usize>() as i64;
-    let atoms = slot * rt.code_server.atoms().len() as i64;
-    let modules = slot * rt.loaded_modules().len() as i64;
-    let registered = slot * rt.processes().registered().count() as i64;
-    let processes = slot * rt.processes().len() as i64;
-    let ports = slot * live_ports(rt)?;
-    let tables = slot * live_tables(rt)?;
-    Ok(InfoValue::List(vec![
-        row("sys_misc", 0),
-        row("static", 0),
-        InfoValue::Tupled(vec![
-            InfoValue::Atom("atom_space"),
-            InfoValue::Int(atoms),
-            InfoValue::Int(atoms),
-        ]),
-        row("atom_table", atoms),
-        row("module_table", modules),
-        row("export_table", 0),
-        row("export_list", 0),
-        row("register_table", registered),
-        row("fun_table", 0),
-        row("fun_list", 0),
-        row("module_refs", 0),
-        row("loaded_code", modules),
-        row("dist_table", 0),
-        row("node_table", 0),
-        row("bif_timer", 0),
-        row("process_table", processes),
-        row("port_table", ports),
-        row("ets_misc", tables),
-        row("external_alloc", 0),
-    ]))
-}
-
-/// A `{Key, Value}` row of an `InfoValue` proplist.
-fn row(key: &'static str, value: i64) -> InfoValue {
-    InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(value)])
-}
-
-/// The number of live ports, or the typed capability gap when the shared port registry is
-/// already borrowed (the same rule [`port_count`] follows — never a panic).
-fn live_ports(rt: &Runtime) -> Result<i64> {
-    match rt.ports.try_borrow() {
-        Ok(registry) => Ok(registry.len() as i64),
-        Err(_) => Err(error::unsupported(
-            "erlang:system_info(allocated_areas): the port registry is already borrowed",
-        )),
-    }
-}
-
-/// The number of live ETS tables, or the typed capability gap when the shared table
-/// registry is already borrowed.
-fn live_tables(rt: &Runtime) -> Result<i64> {
-    match rt.tables.try_borrow() {
-        Ok(tables) => Ok(tables.len() as i64),
-        Err(_) => Err(error::unsupported(
-            "erlang:system_info(allocated_areas): the ETS table registry is already borrowed",
-        )),
-    }
-}
+// -- `{allocator, A}` -----------------------------------------------------------------
 
 /// `system_info({allocator, A})` — the measured counters of the alloc-util allocator `A`,
 /// as a list of `{Key, Value}` rows.
@@ -483,115 +593,25 @@ fn allocator_value(value: beam_alloc::stats::InfoValue) -> Result<InfoValue> {
     }
 }
 
-/// `value` as an [`InfoValue::Int`], or [`BeamError::SystemLimit`] when it cannot be a
-/// small integer.
-fn usize_to_int_result(value: usize) -> Result<InfoValue> {
-    i64::try_from(value)
-        .map(InfoValue::Int)
-        .map_err(|_| BeamError::SystemLimit)
-}
+#[cfg(test)]
+pub(crate) mod test_support {
+    //! Shared fixtures for the `info` family modules' unit tests.
+    use beam_term::AtomTable;
 
-/// `value` as an `i64`, saturating at the small-integer range's practical bound.
-///
-/// Used only for the table-footprint figures of [`allocated_areas`], where the operand is
-/// a table length times the word size — far inside the range on any real machine.
-fn usize_to_int(value: usize) -> i64 {
-    i64::try_from(value).unwrap_or(i64::MAX)
-}
+    use crate::boot::seed_core_atoms;
+    use crate::config::RuntimeConfig;
+    use crate::runtime::Runtime;
 
-/// The execution-engine flavor of this runtime, as the oracle reports it.
-///
-/// Real ERTS answers the atom `jit` for the JIT emulator and `emu` for the plain
-/// interpreter. This runtime ships the Stage-1 baseline JIT (`beam_engine`'s
-/// `jit::baseline`; workspace `CONTEXT.md` §4) and its emulator configuration defaults
-/// to [`Flavor::Jit`](beam_common::config::Flavor::Jit), so
-/// `erlang:system_info(emu_flavor)` is the atom `jit` — exactly what the oracle
-/// (OTP 29 / erts-17.1) returns.
-///
-/// The value is **derived from the parsed configuration** rather than hardcoded, so an
-/// `-emu_flavor emu` invocation answers `emu` as soon as the CLI maps that switch onto
-/// the emulator configuration (Milestone-1 records `-emu_flavor` as an init argument
-/// only, so the flavor stays at its `jit` default).
-///
-/// The answer is an atom, so the runtime's atom table must hold it — see [`INFO_ATOMS`].
-fn emu_flavor(rt: &Runtime) -> InfoValue {
-    InfoValue::Atom(rt.config().emulator.flavor.as_str())
-}
-
-/// The number of **normal schedulers**, as the oracle reports it.
-///
-/// An explicit `+S N` wins. `+S 0` means "auto" in real ERTS (`erl +S 0` reports the
-/// online processor count), so it falls through to the machine's parallelism as well —
-/// the same answer the oracle gives without `+S`. The count is always `> 0`: the
-/// scheduler *loop* is Stage-5 work (`beam_process`), but a count of `0` schedulers
-/// would be a lie about a runtime that executes code.
-fn schedulers(rt: &Runtime) -> i64 {
-    match rt.config().emulator.schedulers {
-        Some(count) if count > 0 => i64::from(count),
-        _ => logical_processors(),
+    /// A default runtime (`sleep`-free; nothing is executed).
+    pub(crate) fn runtime() -> Runtime {
+        Runtime::new(RuntimeConfig::default()).expect("the default runtime")
     }
-}
 
-/// The number of logical processors, best-effort.
-///
-/// `system_info/1` must always answer, so a platform that cannot report the count
-/// (rather than an error) falls back to `1` — documented rather than swallowed.
-fn logical_processors() -> i64 {
-    match std::thread::available_parallelism() {
-        Ok(count) => count.get() as i64,
-        Err(_) => 1,
-    }
-}
-
-/// The number of **live ports** — the value the oracle's `port_count` reports.
-///
-/// The runtime's own [`PortRegistry`](crate::port::PortRegistry) is the single source of
-/// truth: a port counts once it is *live* (`RuntimePorts` inserts it), which is exactly
-/// when the oracle's own `port_count` rises. A fresh runtime has opened no port, so the
-/// honest answer is `0` (the oracle boots with its `standard_io` port already open, which
-/// this runtime has no counterpart for).
-///
-/// That divergence is **deliberate and must not be "fixed"** to match a run-time figure:
-/// like `erlang:ports/0`, this key reports *this* runtime's table, not the oracle's (see
-/// the same note in [`crate::port`]).
-///
-/// The registry is shared through an [`Rc`]`<`[`std::cell::RefCell`]`>` so a port BIF in
-/// flight can hold it without borrowing the runtime; a `RefCell` conflict is reported as
-/// the typed capability gap rather than panicking — the crate is `#![deny(unsafe_code)]`
-/// and the same rule `erlang:ports/0` follows.
-fn port_count(rt: &Runtime) -> Result<i64> {
-    match rt.ports.try_borrow() {
-        Ok(registry) => Ok(registry.len() as i64),
-        Err(_) => Err(error::unsupported(
-            "erlang:system_info(port_count): the port registry is already borrowed",
-        )),
-    }
-}
-
-/// The Erlang `{OsFamily,OsName}` pair of the host.
-fn os_type() -> InfoValue {
-    if cfg!(target_os = "windows") {
-        InfoValue::Tuple("win32", "nt")
-    } else {
-        InfoValue::Tuple("unix", "linux")
-    }
-}
-
-/// The target triple of this build, best-effort.
-///
-/// `std` exposes the architecture and the operating system but not the vendor, so the
-/// known targets are spelled out and anything else falls back to
-/// `"<arch>-unknown-<os>"`. This is introspection only; the build itself never depends
-/// on it.
-fn system_architecture() -> String {
-    let arch = std::env::consts::ARCH;
-    let os = std::env::consts::OS;
-    match (arch, os) {
-        ("x86_64", "linux") => "x86_64-pc-linux-gnu".to_string(),
-        ("aarch64", "linux") => "aarch64-unknown-linux-gnu".to_string(),
-        ("x86_64", "macos") => "x86_64-apple-darwin".to_string(),
-        ("aarch64", "macos") => "aarch64-apple-darwin".to_string(),
-        _ => format!("{arch}-unknown-{os}"),
+    /// An atom table seeded with the full boot seed (which interns [`super::INFO_ATOMS`]).
+    pub(crate) fn seeded_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        seed_core_atoms(&mut atoms);
+        atoms
     }
 }
 
@@ -603,8 +623,8 @@ mod tests {
     use beam_process::ProcessId;
     use beam_term::{atom_val, eq, is_atom, is_small, signed_value};
 
-    use crate::boot::seed_core_atoms;
     use crate::config::RuntimeConfig;
+    use crate::runtime::Runtime;
 
     fn runtime() -> Runtime {
         Runtime::new(RuntimeConfig::default()).expect("the default runtime")
@@ -612,7 +632,7 @@ mod tests {
 
     fn seeded_atoms() -> AtomTable {
         let mut atoms = AtomTable::new();
-        seed_core_atoms(&mut atoms);
+        crate::boot::seed_core_atoms(&mut atoms);
         atoms
     }
 
@@ -634,7 +654,34 @@ mod tests {
             system_info_value(key, &rt)
                 .unwrap_or_else(|error| panic!("system_info({key}) failed: {error}"));
         }
-        assert_eq!(SUPPORTED_KEYS.len(), 16);
+        // The surface is the union of the family modules; keep the count pinned so a key
+        // dropped from a family is caught.
+        assert_eq!(SUPPORTED_KEYS.len(), 62);
+        let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), SUPPORTED_KEYS.len(), "no duplicate keys");
+        for key in UNSUPPORTED_KEYS {
+            assert!(!SUPPORTED_KEYS.contains(key), "{key} cannot be both");
+        }
+    }
+
+    #[test]
+    fn every_unsupported_key_reports_a_capability_gap() {
+        let rt = runtime();
+        for key in UNSUPPORTED_KEYS {
+            let error = system_info_value(key, &rt)
+                .expect_err(&format!("system_info({key}) must be a capability gap"));
+            assert!(
+                crate::error::unsupported_reason(&error).is_some(),
+                "system_info({key}) must classify as unsupported, got {error:?}"
+            );
+        }
+        let mut sorted: Vec<&str> = UNSUPPORTED_KEYS.to_vec();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(sorted.len(), UNSUPPORTED_KEYS.len(), "no duplicate keys");
+        assert_eq!(sorted.len(), 19);
     }
 
     #[test]
@@ -643,7 +690,7 @@ mod tests {
         // table: seeding exactly this list must materialize **every** supported key (the
         // oracle's `system_info/1` never returns an unrepresentable value).
         let rt = runtime();
-        let mut heap = Heap::new(1_024).expect("test heap");
+        let mut heap = Heap::new(8_192).expect("test heap");
         let mut atoms = AtomTable::new();
         atoms.seed(INFO_ATOMS.iter().copied());
         for key in SUPPORTED_KEYS {
@@ -666,212 +713,6 @@ mod tests {
     }
 
     #[test]
-    fn version_keys_and_numbers() {
-        let rt = runtime();
-        assert_eq!(
-            system_info_value("version", &rt).expect("version"),
-            InfoValue::Str("17.1".to_string())
-        );
-        assert_eq!(
-            system_info_value("otp_release", &rt).expect("otp_release"),
-            InfoValue::Str("30".to_string())
-        );
-        assert_eq!(
-            system_info_value("wordsize", &rt).expect("wordsize"),
-            InfoValue::Int(std::mem::size_of::<usize>() as i64)
-        );
-        assert_eq!(
-            system_info_value("nif_version", &rt).expect("nif_version"),
-            InfoValue::Str("2.18".to_string())
-        );
-        assert_eq!(
-            system_info_value("threads", &rt).expect("threads"),
-            InfoValue::Bool(true)
-        );
-        assert_eq!(
-            system_info_value("os_type", &rt).expect("os_type"),
-            InfoValue::Tuple("unix", "linux")
-        );
-        assert!(matches!(
-            system_info_value("process_count", &rt).expect("process_count"),
-            InfoValue::Int(count) if count >= 1
-        ));
-        assert!(matches!(
-            system_info_value("logical_processors", &rt).expect("logical_processors"),
-            InfoValue::Int(count) if count >= 1
-        ));        assert_eq!(
-            system_info_value("system_architecture", &rt).expect("system_architecture"),
-            InfoValue::Str(system_architecture())
-        );
-        assert_eq!(
-            system_info_value("system_version", &rt).expect("system_version"),
-            InfoValue::Str(format!(
-                "Erlang/OTP 30 [erts-17.1] [source] [{}-bit]",
-                std::mem::size_of::<usize>() * 8
-            ))
-        );
-    }
-
-    #[test]
-    fn port_count_is_the_live_port_count() {
-        use beam_engine::{terms, ExecutionContext};
-
-        // A fresh runtime has opened no port (the oracle's own boot opens a
-        // `standard_io` port that this runtime has no counterpart for).
-        let mut rt = runtime();
-        assert_eq!(
-            system_info_value("port_count", &rt).expect("port_count"),
-            InfoValue::Int(0)
-        );
-
-        // Open a real `{spawn, "true"}` port through `erlang:open_port/2`: the count rises
-        // while it is live and drops once it is closed, so the answer tracks the live port
-        // set exactly. (The childless `{fd, N}` form needs a descriptor the caller owns —
-        // adopting an *inherited* one is refused here by `fcntl` with `EPERM`; it is
-        // covered instead by `port::tests::a_fd_port_adopts_a_caller_owned_descriptor`.)
-        let port = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
-            let spawn = context.atom("spawn").expect("the `spawn` atom");
-            let command = {
-                let bytes = beam_engine::terms::make_list(
-                    &mut context,
-                    &"true"
-                        .bytes()
-                        .map(|b| beam_term::make_small(i64::from(b)))
-                        .collect::<Vec<_>>(),
-                )
-                .expect("the command string");
-                bytes
-            };
-            let name = terms::make_tuple(&mut context, &[spawn, command]).expect("a {spawn, Cmd}");
-            let options = terms::make_list(&mut context, &[]).expect("[]");
-            context
-                .call_bif("erlang", "open_port", 2, &[name, options])
-                .expect("erlang:open_port/2")
-        };
-        assert_eq!(
-            system_info_value("port_count", &rt).expect("port_count"),
-            InfoValue::Int(1),
-            "the opened port is counted"
-        );
-        // `erlang:ports/0` reports exactly the same one port.
-        let ports = {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
-            context
-                .call_bif("erlang", "ports", 0, &[])
-                .expect("erlang:ports/0")
-        };
-        assert_eq!(terms::list_elements(ports).expect("a list"), vec![port]);
-
-        {
-            let mut sink = beam_bifs::NullSink;
-            let mut context = crate::context::RuntimeContext::with_output(&mut rt, &mut sink);
-            context
-                .call_bif("erlang", "port_close", 1, &[port])
-                .expect("erlang:port_close/1");
-        }
-        assert_eq!(
-            system_info_value("port_count", &rt).expect("port_count"),
-            InfoValue::Int(0),
-            "a closed port is no longer counted"
-        );
-    }
-
-    #[test]
-    fn emu_flavor_is_the_configured_flavor_atom() {
-        // The oracle (OTP 29 / erts-17.1) answers `jit` for its JIT emulator; the Rust
-        // runtime ships the Stage-1 baseline JIT and defaults to `Flavor::Jit`, so it
-        // answers the same atom.
-        let rt = runtime();
-        assert_eq!(
-            system_info_value("emu_flavor", &rt).expect("emu_flavor"),
-            InfoValue::Atom("jit")
-        );
-
-        // The value follows the emulator configuration instead of being hardcoded, so a
-        // runtime configured with `-emu_flavor emu` reports `emu` (the oracle's other
-        // legal answer) rather than a stale `jit`.
-        let mut config = RuntimeConfig::default();
-        config.emulator = config.emulator.with_flavor(beam_common::Flavor::Emu);
-        let emu = Runtime::new(config).expect("a runtime for the emu flavor");
-        assert_eq!(
-            system_info_value("emu_flavor", &emu).expect("emu_flavor"),
-            InfoValue::Atom("emu")
-        );
-    }
-
-    #[test]
-    fn emu_flavor_materializes_to_the_flavor_atom() {
-        let mut heap = Heap::new(64).expect("test heap");
-        let mut atoms = seeded_atoms();
-        let jit = atoms.intern("jit");
-        let term = InfoValue::Atom("jit")
-            .to_eterm(&mut heap, &atoms)
-            .expect("the jit atom");
-        assert!(is_atom(term));
-        assert_eq!(atom_val(term), jit);
-        assert_eq!(atoms.name(atom_val(term)), Some("jit"));
-
-        // An atom the table does not hold cannot be resolved: an absent atom is reported,
-        // not silently replaced by some other atom. `seed_core_atoms` now interns the
-        // whole `INFO_ATOMS` vocabulary (see `crate::boot`), so a genuinely empty table is
-        // what exercises the absent-atom path.
-        let mut unseeded = AtomTable::new();
-        assert!(matches!(
-            InfoValue::Atom("jit").to_eterm(&mut heap, &unseeded),
-            Err(BeamError::TermNotFound)
-        ));
-        unseeded.seed(INFO_ATOMS.iter().copied());
-        assert!(is_atom(
-            InfoValue::Atom("jit")
-                .to_eterm(&mut heap, &unseeded)
-                .expect("seeded from INFO_ATOMS")
-        ));
-    }
-
-    #[test]
-    fn schedulers_is_the_configured_or_online_count() {
-        // The oracle reports an integer > 0 (its online schedulers = logical processors).
-        let rt = runtime();
-        let count = match system_info_value("schedulers", &rt).expect("schedulers") {
-            InfoValue::Int(count) => count,
-            other => panic!("schedulers must be an integer, got {other:?}"),
-        };
-        assert!(
-            count > 0,
-            "a runtime has at least one scheduler, got {count}"
-        );
-
-        // An explicit `+S N` wins (`erl +S 3` reports 3).
-        let configured =
-            Runtime::new(RuntimeConfig::default().with_schedulers(3)).expect("a runtime with +S 3");
-        assert_eq!(
-            system_info_value("schedulers", &configured).expect("schedulers"),
-            InfoValue::Int(3)
-        );
-
-        // `+S 0` means "auto" in real ERTS, so it must not be reported as 0.
-        let auto =
-            Runtime::new(RuntimeConfig::default().with_schedulers(0)).expect("a runtime with +S 0");
-        assert!(matches!(
-            system_info_value("schedulers", &auto).expect("schedulers"),
-            InfoValue::Int(count) if count > 0
-        ));
-    }
-
-    #[test]
-    fn schedulers_materializes_to_a_small_integer() {        let rt = runtime();
-        let value = system_info_value("schedulers", &rt).expect("schedulers");
-        let mut heap = Heap::new(64).expect("test heap");
-        let atoms = seeded_atoms();
-        let term = value.to_eterm(&mut heap, &atoms).expect("materialize");
-        assert!(is_small(term));
-        assert!(signed_value(term) > 0);
-    }
-
-    #[test]
     fn unknown_key_is_badarg() {
         let rt = runtime();
         assert!(matches!(
@@ -886,8 +727,39 @@ mod tests {
     }
 
     #[test]
+    fn oracle_rejected_keys_stay_badarg() {
+        // The oracle raises `error:badarg` for these (verified against OTP 29.1.1 /
+        // erts-17.1), so this runtime must not invent an answer for them.
+        let rt = runtime();
+        for key in [
+            "allocator_sizes",
+            "beam_jit_available",
+            "c_library_version",
+            "export_count",
+            "export_limit",
+            "module_count",
+            "module_limit",
+            "net_ticktime",
+            "node",
+            "pure",
+            "busy_limits",
+            "catchlevel",
+            "safe_string_hash",
+            "memory",
+            "run_queue",
+            "total_run_queue_lengths",
+            "wall_clock",
+        ] {
+            assert!(
+                matches!(system_info_value(key, &rt), Err(BeamError::BadArg)),
+                "system_info({key}) must be badarg"
+            );
+        }
+    }
+
+    #[test]
     fn to_eterm_materializes_every_variant() {
-        let mut heap = Heap::new(256).expect("test heap");
+        let mut heap = Heap::new(512).expect("test heap");
         let atoms = seeded_atoms();
 
         let int = InfoValue::Int(8).to_eterm(&mut heap, &atoms).expect("int");
@@ -928,6 +800,25 @@ mod tests {
     }
 
     #[test]
+    fn the_map_variant_materializes_to_a_real_map() {
+        let mut heap = Heap::new(512).expect("test heap");
+        let atoms = seeded_atoms();
+        let value = InfoValue::Map(vec![
+            (InfoValue::Atom("size"), InfoValue::Int(0)),
+            (InfoValue::Atom("kill"), InfoValue::Bool(true)),
+        ]);
+        let term = value.to_eterm(&mut heap, &atoms).expect("a map");
+        let entries = beam_engine::terms::map_entries(term).expect("a map term");
+        assert_eq!(entries.len(), 2);
+        assert!(entries
+            .iter()
+            .any(|(k, v)| atoms.name(atom_val(*k)) == Some("size") && *v == beam_term::make_small(0)));
+        assert!(entries
+            .iter()
+            .any(|(k, v)| atoms.name(atom_val(*k)) == Some("kill") && is_atom(*v)));
+    }
+
+    #[test]
     fn to_eterm_reports_a_missing_atom() {
         let mut heap = Heap::new(64).expect("test heap");
         let atoms = AtomTable::new();
@@ -937,6 +828,11 @@ mod tests {
         ));
         assert!(matches!(
             InfoValue::Tuple("unix", "linux").to_eterm(&mut heap, &atoms),
+            Err(BeamError::TermNotFound)
+        ));
+        assert!(matches!(
+            InfoValue::Map(vec![(InfoValue::Atom("unix"), InfoValue::Int(1))])
+                .to_eterm(&mut heap, &atoms),
             Err(BeamError::TermNotFound)
         ));
     }
@@ -972,221 +868,6 @@ mod tests {
         )
         .expect("the printer renders it");
         assert_eq!(rendered, "\"17.1\"\n");
-    }
-
-    #[test]
-    fn alloc_util_allocators_matches_the_oracle_list() {
-        // Pinned against the oracle (OTP 29 / erts-17.1):
-        // `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(alloc_util_allocators)]).'`
-        // — set **and** order.
-        let rt = runtime();
-        let value = system_info_value("alloc_util_allocators", &rt).expect("alloc_util_allocators");
-        let names: Vec<&str> = match &value {
-            InfoValue::List(elements) => elements
-                .iter()
-                .map(|element| match element {
-                    InfoValue::Atom(name) => *name,
-                    other => panic!("an allocator name must be an atom, got {other:?}"),
-                })
-                .collect(),
-            other => panic!("alloc_util_allocators must be a list, got {other:?}"),
-        };
-        assert_eq!(
-            names,
-            [
-                "temp_alloc",
-                "sl_alloc",
-                "std_alloc",
-                "ll_alloc",
-                "eheap_alloc",
-                "ets_alloc",
-                "fix_alloc",
-                "literal_alloc",
-                "binary_alloc",
-                "driver_alloc",
-            ]
-        );
-    }
-
-    #[test]
-    fn allocators_is_badarg_like_the_oracle() {
-        // Verified: `erlang:system_info(allocators)` raises `error:badarg` in OTP 29 /
-        // erts-17.1, so this runtime must not answer it either.
-        let rt = runtime();
-        assert!(matches!(
-            system_info_value("allocators", &rt),
-            Err(BeamError::BadArg)
-        ));
-    }
-
-    #[test]
-    fn allocated_areas_has_the_oracle_names_arities_and_derivations() {
-        // The oracle's 19 items, in order (`erts_allocated_areas`,
-        // `erl_alloc.c:2580-2699`), with `atom_space` as its three-element tuple.
-        let rt = runtime();
-        let value = system_info_value("allocated_areas", &rt).expect("allocated_areas");
-        let rows = match &value {
-            InfoValue::List(rows) => rows,
-            other => panic!("allocated_areas must be a list, got {other:?}"),
-        };
-        let expected = [
-            "sys_misc",
-            "static",
-            "atom_space",
-            "atom_table",
-            "module_table",
-            "export_table",
-            "export_list",
-            "register_table",
-            "fun_table",
-            "fun_list",
-            "module_refs",
-            "loaded_code",
-            "dist_table",
-            "node_table",
-            "bif_timer",
-            "process_table",
-            "port_table",
-            "ets_misc",
-            "external_alloc",
-        ];
-        let pairs: Vec<(String, Vec<i64>)> = rows
-            .iter()
-            .map(|row| match row {
-                InfoValue::Tupled(fields) => {
-                    let name = match &fields[0] {
-                        InfoValue::Atom(name) => (*name).to_string(),
-                        other => panic!("a row's first field must be an atom, got {other:?}"),
-                    };
-                    let values = fields[1..]
-                        .iter()
-                        .map(|field| match field {
-                            InfoValue::Int(value) => *value,
-                            other => panic!("{name}'s value must be an integer, got {other:?}"),
-                        })
-                        .collect();
-                    (name, values)
-                }
-                other => panic!("a row must be a tuple, got {other:?}"),
-            })
-            .collect();
-        let names: Vec<&str> = pairs.iter().map(|(name, _)| name.as_str()).collect();
-        assert_eq!(names, expected);
-        assert_eq!(pairs[2].1.len(), 2, "atom_space carries a value and a peak");
-
-        // The measured items reflect *this* runtime's own state (never a hardcoded oracle
-        // figure): the atom table always holds the boot seed and the runtime always has
-        // its root process, while the items with no counterpart are honestly `0`.
-        let value_of = |name: &str| -> i64 {
-            pairs
-                .iter()
-                .find(|(key, _)| key == name)
-                .unwrap_or_else(|| panic!("{name} must be present"))
-                .1[0]
-        };
-        assert!(value_of("atom_table") > 0, "the atom table holds the core seed");
-        assert!(value_of("process_table") > 0, "the runtime has its root process");
-        for absent in [
-            "bif_timer",
-            "dist_table",
-            "node_table",
-            "external_alloc",
-            "export_table",
-            "fun_table",
-        ] {
-            assert_eq!(value_of(absent), 0, "{absent} has no counterpart here");
-        }
-    }
-
-    #[test]
-    fn garbage_collection_matches_the_oracle_list() {
-        // Pinned against the oracle (OTP 29 / erts-17.1):
-        // `erl -noshell -eval 'io:format("~p~n",[erlang:system_info(garbage_collection)]).'`
-        // prints `[{max_heap_size,0},{min_bin_vheap_size,46422},{min_heap_size,233},
-        // {fullsweep_after,65535}]` — `max_heap_size` is the **bare integer** here, and
-        // none of the values is hardcoded: they come from `beam_gc`'s growth table.
-        let rt = runtime();
-        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
-        let expected = [
-            ("max_heap_size", 0_i64),
-            ("min_bin_vheap_size", 46_422),
-            ("min_heap_size", 233),
-            ("fullsweep_after", 65_535),
-        ];
-        let rows = match &value {
-            InfoValue::List(rows) => rows,
-            other => panic!("garbage_collection must be a list, got {other:?}"),
-        };
-        assert_eq!(rows.len(), expected.len());
-        for (row, (key, expected_value)) in rows.iter().zip(expected) {
-            assert_eq!(
-                *row,
-                InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(expected_value)])
-            );
-        }
-    }
-
-    /// The emulator-wide GC knobs follow the configured heap options, pinned against the
-    /// oracle (OTP 29.1.1 / erts-17.1):
-    ///
-    /// ```text
-    /// erl +hms 1000 +hmbs 5000 -noshell \
-    ///     -eval 'io:format("~p~n",[erlang:system_info(garbage_collection)]), halt().'
-    ///   → [{max_heap_size,0},{min_bin_vheap_size,6772},{min_heap_size,1598},
-    ///      {fullsweep_after,65535}]
-    /// ```
-    ///
-    /// The *values* are `beam_gc`'s growth-table figures, not literals from the oracle.
-    #[test]
-    fn garbage_collection_follows_the_configured_heap_options() {
-        let argv: Vec<String> = ["+hms", "1000", "+hmbs", "5000"]
-            .iter()
-            .map(|arg| arg.to_string())
-            .collect();
-        let config = crate::cli::parse(&argv).expect("+hms 1000 +hmbs 5000 parses");
-        let rt = Runtime::new(config).expect("a runtime with the configured heap options");
-        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
-        let expected = [
-            ("max_heap_size", 0_i64),
-            ("min_bin_vheap_size", 6772),
-            ("min_heap_size", 1598),
-            ("fullsweep_after", 65_535),
-        ];
-        let rows = match &value {
-            InfoValue::List(rows) => rows,
-            other => panic!("garbage_collection must be a list, got {other:?}"),
-        };
-        assert_eq!(rows.len(), expected.len());
-        for (row, (key, expected_value)) in rows.iter().zip(expected) {
-            assert_eq!(
-                *row,
-                InfoValue::Tupled(vec![InfoValue::Atom(key), InfoValue::Int(expected_value)]),
-                "{key}"
-            );
-        }
-        // … and `+hmax` is the bare integer the oracle reports for `max_heap_size`.
-        let argv: Vec<String> = ["+hmax", "1000000"].iter().map(|arg| arg.to_string()).collect();
-        let config = crate::cli::parse(&argv).expect("+hmax 1000000 parses");
-        let rt = Runtime::new(config).expect("a runtime with +hmax");
-        let value = system_info_value("garbage_collection", &rt).expect("garbage_collection");
-        assert_eq!(
-            value,
-            InfoValue::List(vec![
-                InfoValue::Tupled(vec![
-                    InfoValue::Atom("max_heap_size"),
-                    InfoValue::Int(1_000_000)
-                ]),
-                InfoValue::Tupled(vec![
-                    InfoValue::Atom("min_bin_vheap_size"),
-                    InfoValue::Int(46_422)
-                ]),
-                InfoValue::Tupled(vec![InfoValue::Atom("min_heap_size"), InfoValue::Int(233)]),
-                InfoValue::Tupled(vec![
-                    InfoValue::Atom("fullsweep_after"),
-                    InfoValue::Int(65_535)
-                ]),
-            ])
-        );
     }
 
     #[test]
