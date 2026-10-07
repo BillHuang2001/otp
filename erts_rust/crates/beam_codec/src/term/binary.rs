@@ -10,6 +10,10 @@
 //!   [`beam_term::bitstring::write_heap_bits`], which writes the pinned
 //!   `[thing_word, n_bits, data…]` layout (zero-filled padding + cleared trailing
 //!   bits, so the term never carries the caller's garbage);
+//! * [`make_refc_binary`] writes the **off-heap** representation instead: it takes the
+//!   payload from an [`OffHeapBinaries`] host and hands the block — and the host's
+//!   pointer — to [`beam_term::refc::write_refc_binary`], so the frozen
+//!   `[BinRef][ErlSubBits]` layout is never re-derived here either;
 //! * the readers ([`bitstring_parts`] / [`bitstring_size_bits`] /
 //!   [`bitstring_bytes`]) validate the term and then forward to
 //!   [`beam_term::bitstring::bitstring_parts`];
@@ -33,7 +37,11 @@
 //!
 //! [`make_bitstring`] additionally requires `bytes` to be **exactly**
 //! `ceil(n_bits / 8)` bytes long, because `write_heap_bits` tolerates a longer slice
-//! and would silently drop the extra payload.
+//! and would silently drop the extra payload. [`make_refc_binary`] guards the other
+//! direction: a `bytes` slice too short for the requested bit window, an overflowing
+//! window, and a host pointer that is null or misaligned (which would corrupt
+//! `ErlSubBits::base_flags`) are all rejected with `BadArg` before any word is
+//! written.
 //!
 //! # `unsafe` contract
 //!
@@ -50,8 +58,10 @@ use beam_term::bitstring::{
     bitstring_parts as beam_term_bitstring_parts, sub_bits_parts, write_heap_bits,
 };
 use beam_term::prelude::{arityval, boxed_val, is_bitstring, Eterm, HEADER_SUB_BITS};
+use beam_term::refc::{write_refc_binary, ERL_REFC_BITS_SIZE};
 
 use crate::error;
+use crate::off_heap::OffHeapBinaries;
 
 /// The bit/word sizing helpers, **re-exported verbatim from the layout owner**
 /// ([`beam_term::bitstring`]): [`bit_count_to_bytes`] is `NBYTES(n_bits)`
@@ -64,15 +74,17 @@ pub use beam_term::bitstring::{
 
 /// Materializes a **binary** (`n_bits = bytes.len() * 8`) on `heap`.
 ///
-/// # Divergence from ERTS (documented)
+/// # On-heap vs off-heap
 ///
-/// ERTS stores a binary larger than `ERL_ONHEAP_BINARY_LIMIT` (64 bytes) as an
-/// off-heap ref-counted `Binary` behind a `BinRef`+`ErlSubBits` pair. This crate
-/// has no refc binary yet (owned by `beam_alloc`/`beam_gc`), so **every** binary is
-/// materialized as an on-heap `ErlHeapBits` block, whatever its size. The
-/// selection is an open *interior* policy — no externally pinned layout/ABI depends
-/// on it — and the observable term (`is_binary/1`, `byte_size/1`, contents) is
-/// identical. See the crate `CONTEXT.md`, "Known Issues".
+/// This always materializes an on-heap `ErlHeapBits` block, whatever the size. ERTS
+/// instead stores a binary larger than `ERL_ONHEAP_BINARY_LIMIT` (64 bytes) as an
+/// off-heap ref-counted payload behind an on-heap `BinRef`+`ErlSubBits` pair; here
+/// that representation is produced by [`make_refc_binary`], which the decoder selects
+/// when an [`OffHeapBinaries`] host is installed. The choice is an *interior* policy —
+/// no externally pinned layout/ABI depends on it — and the observable term
+/// (`is_binary/1`, `byte_size/1`, contents) is identical either way, as is the ETF
+/// image: the encoder reads both representations through [`bitstring_bytes`] (see
+/// `../../CONTEXT.md`, "Known Issues").
 pub fn make_binary(heap: &mut Heap, bytes: &[u8]) -> Result<Eterm> {
     // A byte count of `usize::MAX / 8` could not be held in memory anyway; report it
     // rather than wrapping.
@@ -109,6 +121,72 @@ pub fn make_bitstring(heap: &mut Heap, bytes: &[u8], n_bits: usize) -> Result<Et
     // documents. The block stays live (and unmoved) on `heap` for as long as the
     // returned term is used.
     Ok(unsafe { write_heap_bits(hp, bytes, n_bits)? })
+}
+
+/// Materializes a bitstring whose payload lives **off-heap**: the
+/// `[BinRef][ErlSubBits]` pair ERTS builds for a bitstring larger than
+/// [`ERL_ONHEAP_BITS_LIMIT`](beam_term::refc::ERL_ONHEAP_BITS_LIMIT).
+///
+/// `host` copies `bytes` into a fresh off-heap refcounted payload and hands back the
+/// value of the `BinRef.val` word (a pointer to the payload's first data byte); the
+/// host keeps the payload alive (see [`OffHeapBinaries`]). The on-heap block is then
+/// written by [`beam_term::refc::write_refc_binary`], the frozen layout owner — this
+/// function re-derives no word offset. `offset_bits`/`size_bits` are the window into
+/// the payload (the decoder uses `0`/`size_in_bits`, a full binary), and `next` — the
+/// ERTS MSO off-heap **chain link** — is left null: nothing in this workspace walks
+/// the chain (`beam_term::size` and `beam_gc` only size/copy the 8 on-heap words), so
+/// the host's store is the ownership record, as the C's `MSO` list is not reproduced
+/// here.
+///
+/// A `bytes` slice shorter than `ceil((offset_bits + size_bits) / 8)` bytes, an
+/// `offset_bits + size_bits` overflow, a null or misaligned payload pointer from the
+/// host, or a heap that cannot hold the 8-word pair yields `BeamError` — nothing is
+/// left half-written. (`write_refc_binary` requires the payload base to be
+/// word-aligned, because the low bits of `ErlSubBits::base_flags` are flags; a
+/// non-conforming host is rejected here rather than corrupting the base pointer.)
+pub fn make_refc_binary(
+    heap: &mut Heap,
+    host: &mut dyn OffHeapBinaries,
+    bytes: &[u8],
+    offset_bits: usize,
+    size_bits: usize,
+) -> Result<Eterm> {
+    let end_bit = offset_bits
+        .checked_add(size_bits)
+        .ok_or_else(error::bad_arg)?;
+    if bytes.len() < bit_count_to_bytes(end_bit) {
+        return Err(error::bad_arg());
+    }
+    // The payload is the host's: it copies `bytes` and owns the result.
+    let val = host.alloc_refc_payload(bytes)?;
+    // The payload's first byte becomes the `ErlSubBits` base, so it must be non-null
+    // and word-aligned. `beam_alloc::RefcBinary::data_ptr` guarantees both; a host
+    // that violates the contract is rejected rather than allowed to set flag bits in
+    // (or null out) the base pointer.
+    if val.is_null() || (val as usize) & BITSTRING_POINTER_FLAG_MASK != 0 {
+        return Err(error::bad_arg());
+    }
+    // Only once the payload exists is the on-heap pair allocated, so a failed payload
+    // allocation leaves the heap untouched.
+    // SAFETY: `alloc_words` returned `ERL_REFC_BITS_SIZE` exclusively-owned, writable
+    // words.
+    let hp = unsafe { heap.alloc_words(ERL_REFC_BITS_SIZE)? };
+    // SAFETY: `hp` owns the 8 words the `[BinRef][ErlSubBits]` pair occupies — the
+    // layout `write_refc_binary` documents. `val` is a non-null, word-aligned pointer
+    // to the host's payload (kept alive by the host for as long as the term), which
+    // the guard above checked, and `base = val` means the window starts at the
+    // payload's first data byte covering the `offset_bits + size_bits` bits the
+    // `bytes` length check above guarantees exist. `next = null` is a valid chain link.
+    Ok(unsafe {
+        write_refc_binary(
+            hp,
+            val,
+            core::ptr::null_mut(),
+            val as *const u8,
+            offset_bits,
+            size_bits,
+        )
+    })
 }
 
 /// Splits a bitstring term into `(base, offset_bits, size_bits)`.

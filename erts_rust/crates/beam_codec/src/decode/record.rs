@@ -46,11 +46,11 @@ impl<'a> Decoder<'a> {
     /// `MAX_ARITYVAL` is `BeamError::SystemLimit` (checked before any allocation); a
     /// duplicate key is `BadArg`.
     ///
-    /// **Cached definition hash (documented deviation):** C stores
-    /// `make_hash2({module,name,is_exported,keys})` in the definition (not on the
-    /// wire). [`beam_term::record`] cannot reproduce `make_hash2`, so the small
-    /// integer `0` is passed as `definition_hash` — the same deviation
-    /// [`crate::term::make_record`] documents. It is not wire-observable.
+    /// **Cached definition hash.** The definition's word 2 carries
+    /// `make_hash2({module,name,is_exported,keys-in-declaration-order})` — exactly what
+    /// C stores (not on the wire) — computed by [`crate::term::make_record`] from the
+    /// decoded keys and the supplied `atoms` table. It is not wire-observable, but it
+    /// *is* part of the record's `erlang:phash2/1`, so it must be the real value.
     pub(super) fn decode_record(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Eterm> {
         let num_fields = self.reader.u32be()? as usize;
         let is_exported = match self.reader.u8()? {
@@ -87,7 +87,14 @@ impl<'a> Decoder<'a> {
 
         // The block is allocated (and written) last, after every value is
         // materialized; `make_record` maps a duplicate key to `BadArg`.
-        make_record(heap, atom_val(module), atom_val(name), is_exported, &fields)
+        make_record(
+            heap,
+            atoms,
+            atom_val(module),
+            atom_val(name),
+            is_exported,
+            &fields,
+        )
     }
 }
 
@@ -172,6 +179,20 @@ mod tests {
         let decl = record_declaration_keys(def).unwrap();
         assert_eq!(atoms.name(atom_val(decl[0])), Some("b"));
         assert_eq!(atoms.name(atom_val(decl[1])), Some("a"));
+
+        // A decoded record carries the **real** cached definition hash —
+        // `make_hash2({module, name, is_exported, keys-in-declaration-order})` — and
+        // not the old `0` placeholder. The hash is not on the wire, so it is computed
+        // from what the wire carried; its observable consequence is that
+        // `make_hash2` of the decoded record (which mixes definition word 2) is the C
+        // value for this fixture. (`record_definition_hash` is not on this module's
+        // safe surface; the term-layer test
+        // `make_record_stores_the_real_definition_hash` reads the word itself.)
+        assert_eq!(
+            beam_term::hashing::make_hash2(term, &atoms).unwrap(),
+            2_292_018_936,
+            "the decoded record must carry its real cached definition hash"
+        );
     }
 
     #[test]

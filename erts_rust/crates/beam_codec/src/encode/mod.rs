@@ -396,10 +396,10 @@ impl<'a> Encoder<'a> {
                 return self.encode_internal_port(local_node, port_number(term), creation);
             }
         }
-        // Anything else is not representable by the M1 term layer (in practice an
-        // off-heap `BinRef` block, which the Stage-0 foundations cannot build):
-        // report it explicitly rather than emit a wrong encoding. Tests never reach
-        // this path.
+        // Anything else is not a term the encoder can represent: report it explicitly
+        // rather than emit a wrong encoding. A bitstring in *either* representation —
+        // the on-heap `ErlHeapBits` block and the off-heap refc `BinRef` pair — is
+        // handled above through `bitstring_bytes`, so this path is never a bitstring.
         Err(error::unsupported(Tag::Binary))
     }
 

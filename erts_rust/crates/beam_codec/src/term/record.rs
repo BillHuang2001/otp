@@ -26,8 +26,10 @@
 
 use beam_alloc::Heap;
 use beam_common::Result;
+use beam_term::hashing::compute_record_definition_hash;
 use beam_term::prelude::{make_small, Atom, Eterm};
 use beam_term::record;
+use beam_term::AtomTable;
 
 /// The atoms `true`/`false` a record's `is_exported` flag stores — the standard
 /// `atom.names` indices `AM_FALSE`/`AM_TRUE` (`beam_term::record`).
@@ -49,6 +51,9 @@ pub fn is_record(term: Eterm) -> bool {
 
 /// Materializes a native record on `heap`.
 ///
+/// `atoms` resolves the atom hash values the cached definition hash mixes (see
+/// below) — normally the table the block's keys/module/name were interned in.
+///
 /// `fields` are `(key-atom-term, value)` pairs in **declaration** order; the block
 /// written by [`beam_term::record::write_record`] sorts the keys by atom index and
 /// records the declaration→sorted rank in `field_order`.
@@ -57,15 +62,26 @@ pub fn is_record(term: Eterm) -> bool {
 /// overflow `MAX_ARITYVAL` yields `BeamError::BadArg` (via `TermError::BadRecord`),
 /// never a corrupt block.
 ///
-/// **Cached definition hash (documented deviation):** C stores
-/// `make_hash2({module,name,is_exported,keys})` at definition word 2. `beam_term`
-/// cannot reproduce `make_hash2` (its [`beam_term::hashing`] is explicitly not
-/// bit-exact), so the small integer `0` is stored instead. The hash is **not** on the
-/// wire — the ETF decoder computes it from the decoded keys — so this is not
-/// wire-observable; a caller that needs `phash2` compatibility must supply the C
-/// value (this forwarding layer does not expose that escape hatch).
+/// **Cached definition hash.** Definition word 2 carries
+/// `make_hash2({module, name, is_exported, keys-in-declaration-order})` — exactly the
+/// value C's `records_create_4` stores (`erl_record.c:1041-1046`) — computed here by
+/// [`beam_term::hashing::compute_record_definition_hash`] (the bit-exact `make_hash2`
+/// port). It is **not** on the ETF wire, but it *is* observable: `erlang:phash2/1` of a
+/// record mixes definition word 2 (see [`beam_term::hashing::make_hash2`]), so it must
+/// be the real value.
+///
+/// **Breaking the circularity.** `write_record` takes the hash as an explicit
+/// [`Eterm`] because the value is a cached word of the very block it writes and so
+/// cannot be known before the block exists. The block is therefore written once with
+/// the placeholder `0` to obtain a *valid* definition term, the hash is computed from
+/// that definition (`compute_record_definition_hash` reads only the module, the name,
+/// the `is_exported` flag and the declaration-ordered keys — never the hash word), and
+/// the **same block** is written a second time with the real hash. Both calls write
+/// every word of the block from the same inputs, so the second call is the complete,
+/// correct block.
 pub fn make_record(
     heap: &mut Heap,
+    atoms: &AtomTable,
     module: Atom,
     name: Atom,
     is_exported: bool,
@@ -75,9 +91,18 @@ pub fn make_record(
     // exclusively-owned, writable words.
     let hp = unsafe { heap.alloc_words(record_block_words(fields.len()))? };
     // SAFETY: `hp` owns exactly those words and `fields` are the declaration-order
-    // `(key, value)` pairs `write_record` documents. The definition hash is the
-    // documented deviation above.
-    Ok(unsafe { record::write_record(hp, module, name, is_exported, fields, make_small(0))? })
+    // `(key, value)` pairs `write_record` documents. `0` is the placeholder for the
+    // cached definition hash, which cannot exist before the block does.
+    let inst = unsafe { record::write_record(hp, module, name, is_exported, fields, make_small(0))? };
+    // SAFETY: `inst` is the live instance `write_record` just built at `hp`, so its
+    // definition word points at a well-formed definition block.
+    let def = unsafe { record::record_definition(inst)? };
+    let hash = compute_record_definition_hash(def, atoms)?;
+    // SAFETY: same block, same caller-guaranteed inputs as the first call, plus the
+    // real cached definition hash; every word of the block is rewritten.
+    Ok(unsafe {
+        record::write_record(hp, module, name, is_exported, fields, make_small(hash as i64))?
+    })
 }
 
 /// The number of fields of a native-record instance term.
@@ -167,7 +192,7 @@ mod tests {
     //! we only check that the forwarding layer allocates the quoted number of words,
     //! round-trips every reader and maps a malformed term to `BeamError::BadArg`.
 
-    use beam_term::prelude::{atom_val, make_atom, make_small, AtomTable, NIL};
+    use beam_term::prelude::{atom_val, make_atom, make_small, unsigned_value, AtomTable, NIL};
 
     use super::*;
 
@@ -193,7 +218,7 @@ mod tests {
             (make_atom(b), make_small(22)),
             (make_atom(a), make_small(11)),
         ];
-        let rec = make_record(&mut heap, m, r, true, &fields).unwrap();
+        let rec = make_record(&mut heap, &t, m, r, true, &fields).unwrap();
 
         assert_eq!(heap.used(), record_block_words(2), "the quoted block is used");
         assert!(is_record(rec));
@@ -223,6 +248,44 @@ mod tests {
     }
 
     #[test]
+    fn make_record_stores_the_real_definition_hash() {
+        // Definition word 2 is the cached hash `make_hash2({module, name,
+        // is_exported, keys-in-declaration-order})` (`erl_record.c:1041-1046`) —
+        // *not* the `0` placeholder — and the value is observable downstream
+        // (`make_hash2` mixes it into a record's `erlang:phash2/1`).
+        let t = atoms();
+        let m = t.lookup("m").unwrap();
+        let r = t.lookup("r").unwrap();
+        let a = t.lookup("a").unwrap();
+        let b = t.lookup("b").unwrap();
+
+        let mut heap = Heap::new(record_block_words(2)).expect("a sized heap");
+        // Declared [(b, 22), (a, 11)] — the declaration order the hash covers.
+        let fields = [
+            (make_atom(b), make_small(22)),
+            (make_atom(a), make_small(11)),
+        ];
+        let rec = make_record(&mut heap, &t, m, r, false, &fields).unwrap();
+
+        let def = record_definition(rec).unwrap();
+        let computed = compute_record_definition_hash(def, &t).unwrap();
+        // SAFETY: `def` points into the record block this test owns and keeps alive.
+        let stored = unsafe { record::record_definition_hash(def) }.unwrap();
+        assert_eq!(
+            stored,
+            make_small(computed as i64),
+            "definition word 2 must carry the computed cached hash"
+        );
+        assert_ne!(stored, make_small(0), "the `0` placeholder is gone");
+        // `u32` always fits a small integer, so the hash is stored inline.
+        assert_eq!(unsigned_value(stored) as u32, computed);
+        // The pinned value: the system `erl`'s
+        // `phash2({m, r, false, b, a}, 1 bsl 32)` (cross-checked live in
+        // `tests/record_roundtrip.rs`).
+        assert_eq!(computed, 760411670);
+    }
+
+    #[test]
     fn readers_reject_non_records() {
         let t = atoms();
         let m = t.lookup("m").unwrap();
@@ -245,7 +308,7 @@ mod tests {
         let mut heap = Heap::new(record_block_words(2)).expect("a sized heap");
         let dup = [(make_atom(m), make_small(1)), (make_atom(m), make_small(2))];
         assert!(matches!(
-            make_record(&mut heap, m, r, false, &dup),
+            make_record(&mut heap, &t, m, r, false, &dup),
             Err(beam_common::BeamError::BadArg)
         ));
 
@@ -253,7 +316,7 @@ mod tests {
         let mut heap = Heap::new(record_block_words(1)).expect("a sized heap");
         let bad_key = [(make_small(1), make_small(2))];
         assert!(matches!(
-            make_record(&mut heap, m, r, false, &bad_key),
+            make_record(&mut heap, &t, m, r, false, &bad_key),
             Err(beam_common::BeamError::BadArg)
         ));
     }
