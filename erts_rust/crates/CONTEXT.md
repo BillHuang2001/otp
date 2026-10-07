@@ -144,13 +144,14 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   image.** `beam_codec` decodes `EXPORT_EXT`/`NEW_FUN_EXT` into carriable terms readable through
   `fun_kind_term`/`fun_module`/`fun_function`/`fun_arity_term`/`fun_env`, but fun application goes
   through `beam_engine::ExecutionContext::apply_fun`, whose concrete implementation is `beam_rt`'s
-  (outside this node). Encoding a `Local` (`make_fun3`) fun returns the typed
-  `error::unsupported_local_fun` — its inlined descriptor carries no module, 16-byte `uniq` or creator
-  pid, so a faithful image needs the module identity/MD5.
-- `beam_codec`: its private `write_large_flatmap` / `MAP_SMALL_MAP_LIMIT` / `binary.rs` shims duplicate
-  `beam_term::{map,bitstring}`. A >32-key (HAMT) map needs an image-preserving encode — adopt
-  `map::map_pairs_storage_order` (the map's stored pair order) + `map::write_map` (builder); today the
-  encode path falls through to a typed `unsupported`.
+  (outside this node). `beam_codec` encodes a `Local` (`make_fun3`) fun only when the caller supplies a
+  `FunIdentity` (module / 16-byte `uniq` / old_index / old_uniq / creator) via
+  `Encoder::with_fun_identity`; without it the encode returns the typed `error::unsupported_local_fun`
+  (the inlined descriptor carries no module/MD5). The remaining owner is `beam_rt`, which must supply the
+  identity from the running module.
+- `beam_codec`: HAMT (>32-key) maps now encode via `beam_term::map::map_pairs_storage_order` (byte-identical
+  to the oracle). Only its private `write_large_flatmap` (an oversized *flat*-map writer with no LCA producer,
+  since `map::write_map` switches to a HAMT past 32 pairs) and the `binary.rs` shim stay crate-local.
 - `beam_engine` / `beam_bifs`: `maps:*` on large maps via `map::{map_get,map_size,map_pairs,map_put,map_remove}`.
 - `beam_bifs`: its `ets:info/1` bridge (`src/ets.rs`) still emits the older 12-field subset; adopt
   `beam_ets::TableInfo::entries`, which emits the oracle's full 15-field order (`heir`/`node`/
