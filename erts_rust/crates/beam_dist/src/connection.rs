@@ -91,6 +91,7 @@ use beam_term::{AtomTable, Eterm};
 use crate::atom_cache::{OutboundAtomCache, ReceiveAtomCache};
 use crate::auth::{gen_challenge, gen_digest, verify};
 use crate::control::{decode_control, encode_control_cached, ControlMessage};
+use crate::delivery::{Delivery, Dispatched, InboundSink};
 use crate::dist_header::{DistHeader, DIST_HEADER};
 use crate::flags::{DistFlags, Dop, DFLAG_FRAGMENTS, DFLAG_SEND_SENDER};
 use crate::fragment::{split, Assembly, FragmentAssembler, DIST_FRAGMENT_SIZE};
@@ -790,6 +791,33 @@ impl<T: Transport> Connection<T> {
         decode_control(payload, heap, atoms, Some(self.recv_cache.table()))
     }
 
+    /// Receives one control message and **classifies** it for local delivery.
+    ///
+    /// This is [`recv`](Self::recv) followed by [`Delivery::classify`] — the
+    /// semantic view a runtime routes (the blocking counterpart of
+    /// [`crate::driver::ConnectionDriver::next_delivery`]).
+    pub fn recv_delivery(&mut self, heap: &mut Heap, atoms: &mut AtomTable) -> Result<Delivery> {
+        let message = self.recv(heap, atoms)?;
+        Delivery::classify(&message)
+    }
+
+    /// Receives one control message, classifies it and **routes** it through
+    /// `sink`, returning the classified [`Delivery`] and the [`DeliveryOutcome`]
+    /// the sink reported (the blocking counterpart of
+    /// [`crate::driver::ConnectionDriver::dispatch_inbound`]).
+    ///
+    /// A classification failure (a message-carrying opcode with no trailing
+    /// message) is returned as `Err` and the link state is unaffected.
+    pub fn dispatch_inbound(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &mut AtomTable,
+        sink: &mut dyn InboundSink,
+    ) -> Result<Dispatched> {
+        let delivery = self.recv_delivery(heap, atoms)?;
+        let outcome = sink.deliver(&delivery)?;
+        Ok(Dispatched { delivery, outcome })
+    }
     /// Records the outbound payload, prepending the distribution header and
     /// fragmenting when needed.
     ///
