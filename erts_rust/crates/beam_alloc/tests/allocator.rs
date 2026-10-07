@@ -62,6 +62,21 @@ fn small_allocator(name: &str) -> CarrierAllocator {
     CarrierAllocator::new(config).expect("allocator construction maps nothing")
 }
 
+/// The allocator-**owned** counters of `stats`: the snapshot with its
+/// [`AllocStats::mseg`] block left exactly as *this* snapshot has it, so the result is
+/// comparable against the all-zero [`AllocStats::default()`].
+///
+/// `mseg` is deliberately not an allocator-local counter — it is a live view of the
+/// process-global segment allocator (see `beam_alloc::MsegStats`), which every test in
+/// this binary run moves, and they run in parallel. Comparing two *independent* readings
+/// of it (e.g. a fresh snapshot against a fresh `default()`) would therefore be a race;
+/// comparing one snapshot against itself, as here, is not.
+fn owned_counters(stats: AllocStats) -> AllocStats {
+    AllocStats {
+        mseg: stats.mseg,
+        ..AllocStats::default()
+    }
+}
 #[test]
 fn alloc_dealloc_round_trips_across_the_size_spectrum() {
     let alloc = small_allocator("spectrum");
@@ -337,9 +352,10 @@ fn realloc_preserves_the_payload_when_growing_and_shrinking() {
 #[test]
 fn stats_track_allocations_frees_and_carriers() {
     let alloc = small_allocator("stats");
+    let baseline = alloc.stats();
     assert_eq!(
-        alloc.stats(),
-        AllocStats::default(),
+        baseline,
+        owned_counters(baseline),
         "a fresh allocator maps nothing"
     );
 
@@ -658,7 +674,7 @@ fn dropping_an_allocator_releases_every_carrier_it_mapped() {
 fn mid_size_blocks_share_one_variable_size_carrier_until_it_is_fully_free() {
     let alloc = small_allocator("shared");
     let baseline = alloc.stats();
-    assert_eq!(baseline, AllocStats::default());
+    assert_eq!(baseline, owned_counters(baseline));
     // 2000 bytes is above the size-class ladder and far below `sbct` (512 KiB), so every
     // one of these requests may share a carrier: they are carved out of one pooled
     // variable-size multi-block carrier (the legacy `mb_alloc`).

@@ -277,8 +277,11 @@ pub trait Allocator: Send + Sync + 'static {
     ///
     /// Returns the per-allocator item list of
     /// [`AllocatorInfo::from_stats`](crate::stats::AllocatorInfo::from_stats) over
-    /// [`stats`](Allocator::stats). The default adds no per-type rows; an allocator
-    /// that keeps a per-type table overrides this to append one
+    /// [`stats`](Allocator::stats). The default adds no policy items and no per-type
+    /// rows, because the trait carries neither the configured `+M<alloc><opt>` policy nor
+    /// a per-type table; an allocator that has them (this crate's [`CarrierAllocator`])
+    /// overrides this to append the option items
+    /// ([`push_policy`](crate::stats::AllocatorInfo::push_policy)) and one
     /// [`push_type`](crate::stats::AllocatorInfo::push_type) row set per allocation
     /// type bound to it.
     ///
@@ -1374,6 +1377,13 @@ impl Allocator for CarrierAllocator {
     fn allocator_info(&self) -> AllocatorInfo {
         let stats = self.stats();
         let mut info = AllocatorInfo::from_stats(report_name(self.name()), &stats);
+        // The legacy `=allocator:<name>` section reports the allocator's option items
+        // (`option sbct: 524288`, the `options` proplist of
+        // `erlang:system_info({allocator, A})`) before its per-type rows. They describe
+        // the configured policy (`+M<alloc><opt>`), not the counters — see
+        // `AllocatorInfo::push_policy` for which of them this implementation really
+        // honours.
+        info.push_policy(self.config.policy());
         // A registry allocator is named after its `AllocatorId`, which is what tells it
         // which allocation types are bound to it; a directly-constructed allocator has
         // no id and reports only its per-allocator items.
@@ -1397,9 +1407,19 @@ impl Allocator for CarrierAllocator {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::policy::PolicyOptionKind;
+    use crate::stats::InfoValue;
 
     fn layout(size: usize, align: usize) -> Layout {
         Layout::from_size_align(size, align).expect("test layout")
+    }
+
+    /// The value of a report item, by key — how a consumer reads the item list.
+    fn lookup(info: &AllocatorInfo, key: &str) -> Option<InfoValue> {
+        info.items
+            .iter()
+            .find(|i| i.key == key)
+            .map(|i| i.value)
     }
 
     fn allocator() -> CarrierAllocator {
@@ -1409,7 +1429,6 @@ mod tests {
             .build();
         CarrierAllocator::new(config).expect("allocator")
     }
-
     #[test]
     fn alignment_padding_is_a_function_of_the_alignment() {
         assert_eq!(padding_for(1), 0);
@@ -1485,7 +1504,18 @@ mod tests {
     fn alloc_dealloc_round_trip_returns_the_counters_to_zero() {
         let alloc = allocator();
         let baseline = alloc.stats();
-        assert_eq!(baseline, AllocStats::default());
+        // A freshly constructed allocator owns no counters. The `mseg` block is the one
+        // exception: it is the *live view* of the process-global segment allocator (see
+        // `MsegStats`), which every other test in this binary moves at will, so it is
+        // compared against itself rather than against the all-zero `Default`.
+        assert_eq!(
+            baseline,
+            AllocStats {
+                mseg: baseline.mseg,
+                ..AllocStats::default()
+            },
+            "a fresh allocator owns nothing (bar the process-global mseg view)"
+        );
         let l = layout(100, 16);
         let ptr = alloc.alloc(l).expect("alloc");
         let live = alloc.stats();
@@ -1741,8 +1771,17 @@ mod tests {
             alloc.realloc(bogus, foreign, 4096),
             Err(beam_common::BeamError::BadArg)
         ));
-        // Whatever happened, no live block was created and nothing was freed.
-        assert_eq!(alloc.stats(), AllocStats::default());
+        // Whatever happened, no live block was created and nothing was freed. (The `mseg`
+        // block is the process-global segment-allocator view, which parallel tests in this
+        // binary move, so it is held out of the comparison.)
+        let after = alloc.stats();
+        assert_eq!(
+            after,
+            AllocStats {
+                mseg: after.mseg,
+                ..AllocStats::default()
+            }
+        );
     }
 
     #[test]
@@ -1852,7 +1891,17 @@ mod tests {
         // SAFETY: the pointer is not one this allocator handed out; the call must
         // detect that and leave the allocator's state untouched.
         unsafe { alloc.dealloc(bogus, layout(64, 16)) };
-        assert_eq!(alloc.stats(), AllocStats::default());
+        // The allocator's own counters are untouched. The `mseg` block is the
+        // process-global segment-allocator view — shared with the other tests in this
+        // binary — so it is compared against itself.
+        let after = alloc.stats();
+        assert_eq!(
+            after,
+            AllocStats {
+                mseg: after.mseg,
+                ..AllocStats::default()
+            }
+        );
     }
 
     // -- Typed (interposition) surface ---------------------------------------------
@@ -2203,7 +2252,20 @@ mod tests {
         // detect that (every candidate header is zeroed, hence no size) and leave the
         // allocator's state untouched.
         unsafe { alloc.dealloc_unsized(ty, bogus) };
-        assert_eq!(alloc.stats(), before);
+        // Every allocator-owned counter is untouched. The `mseg` block is held out of the
+        // comparison: it is the *live view* of the process-global segment allocator (see
+        // `MsegStats`), and the other tests in this binary — which run in parallel — map
+        // and unmap segments while this one runs, so `before` and `after` are two
+        // independent global readings.
+        let after = alloc.stats();
+        assert_eq!(
+            after,
+            AllocStats {
+                mseg: after.mseg,
+                ..before
+            },
+            "a foreign pointer leaves the allocator's own counters alone"
+        );
         assert_eq!(alloc.type_stats(ty).blocks, 1);
         // SAFETY: the live typed allocation, freed exactly once.
         unsafe { alloc.dealloc_unsized(ty, live) };
@@ -2497,7 +2559,6 @@ mod tests {
     }
     #[test]
     fn allocator_info_lists_the_rows_of_every_type_bound_to_the_allocator() {
-        use crate::stats::InfoValue;
 
         let config = AllocatorConfig::builder()
             .name(AllocatorId::EHeap.as_str())
@@ -2511,14 +2572,18 @@ mod tests {
         let info = alloc.allocator_info();
         assert_eq!(info.name, "eheap_alloc");
         let bound = crate::types::types_for_allocator(AllocatorId::EHeap).count();
-        assert_eq!(info.items.len(), 13 + 4 * bound);
+        // The counter items, then the policy items, then the per-type rows.
+        let policy_items = PolicyOptionKind::ALL.len();
+        assert_eq!(info.items.len(), 13 + policy_items + 4 * bound);
         assert_eq!(info.items[0].key, "blocks");
+        assert_eq!(info.items[13].key, "sbct", "the policy items follow the counters");
 
         // Every type bound to `eheap_alloc` gets a four-item row set; exactly the one
         // that was allocated for is non-zero.
+        let rows = &info.items[13 + policy_items..];
         let mut non_zero = 0usize;
         let mut seen_heap = false;
-        for row in info.items[13..].chunks_exact(4) {
+        for row in rows.chunks_exact(4) {
             assert_eq!(row[0].key, "type");
             assert_eq!(row[1].key, "type blocks");
             assert_eq!(row[2].key, "type bytes");
@@ -2548,17 +2613,149 @@ mod tests {
     }
 
     #[test]
-    fn a_directly_constructed_allocator_reports_no_type_rows() {
+    fn allocator_info_reports_every_policy_item_of_the_configured_allocator() {
+
+        // A registry-named allocator (`test_alloc`), so the report is the one the oracle
+        // prints for that name, with a hand-picked non-default policy: everything asserted
+        // below must come from *this* configuration.
+        let policy = CarrierPolicy::default()
+            .with_option("sbct", 256)
+            .expect("KiB")
+            .with_option("rsbcmt", 22)
+            .expect("percent")
+            .with_option("mmmbc", 33)
+            .expect("amount")
+            .with_option("mmsbc", 44)
+            .expect("amount")
+            .with_option("acul", 66)
+            .expect("percent");
+        let config = AllocatorConfig::builder()
+            .name(AllocatorId::Test.as_str())
+            .carrier_size(64 * 1024)
+            .policy(policy)
+            .build();
+        let alloc = CarrierAllocator::new(config).expect("allocator");
+
+        let info = alloc.allocator_info();
+        assert_eq!(info.name, "test_alloc");
+        let option_keys: Vec<&str> = info
+            .items
+            .iter()
+            .map(|i| i.key)
+            .filter(|key| PolicyOptionKind::from_option_name(key).is_some())
+            .collect();
+        // Every option of the policy, in the oracle's order (OTP 29 / erts-17.1 prints
+        // `mmmbc` before `mmsbc` and `acful` before `acul`, and both before `acnl`).
+        assert_eq!(
+            option_keys,
+            vec![
+                "sbct", "asbcst", "rsbcst", "rsbcmt", "mmmbc", "mmsbc", "lmbcs", "smbcs", "acful",
+                "acul", "acnl", "acfml",
+            ]
+        );
+        // ... each carrying the configured value, in the oracle's unit: bytes for a
+        // byte-valued option, the bare number for a percentage or an amount.
+        assert_eq!(
+            lookup(&info, "sbct"),
+            Some(InfoValue::Usize(256 * 1024)),
+            "sbct is configured in KiB and stored/reported in bytes"
+        );
+        assert_eq!(lookup(&info, "rsbcmt"), Some(InfoValue::U64(22)));
+        assert_eq!(lookup(&info, "mmmbc"), Some(InfoValue::U64(33)));
+        assert_eq!(lookup(&info, "mmsbc"), Some(InfoValue::U64(44)));
+        assert_eq!(lookup(&info, "acul"), Some(InfoValue::U64(66)));
+        // The untouched options report their configured (here: default) values, not zero.
+        assert_eq!(lookup(&info, "lmbcs"), Some(InfoValue::Usize(policy.lmbcs)));
+        assert_eq!(lookup(&info, "acnl"), Some(InfoValue::U64(policy.acnl as u64)));
+        assert_ne!(lookup(&info, "lmbcs"), Some(InfoValue::Usize(0)));
+    }
+
+    #[test]
+    fn a_directly_constructed_allocator_reports_no_type_rows_but_its_policy() {
         let alloc = allocator();
         let info = alloc.allocator_info();
         // The configured name is not a declared `AllocatorId`, so there is no type
-        // listing to add — and the per-allocator items are still complete.
+        // listing to add — the counter and policy items are still complete.
         assert_eq!(info.name, "test");
-        assert_eq!(info.items.len(), 13);
+        assert_eq!(info.items.len(), 13 + PolicyOptionKind::ALL.len());
         assert_eq!(info.items[0].key, "blocks");
         assert_eq!(info.items[2].key, "carriers");
         assert_eq!(info.items[4].key, "sbcs carriers");
         assert_eq!(info.items[5].key, "mbcs carriers");
+        assert_eq!(info.items[12].key, "mseg unmaps");
+        assert_eq!(
+            info.items.last().map(|i| i.key),
+            Some("acfml"),
+            "the policy items close the report"
+        );
+    }
+
+    #[test]
+    fn a_snapshot_reports_the_process_global_mseg_counters_not_a_local_zero() {
+        // The segment allocator is process-global and this crate has exactly one, shared
+        // by every allocator **and by every test in this binary** (the harness runs them
+        // in parallel). No assertion here may therefore compare two independent global
+        // readings for equality; the monotone counters are bracketed between two readings
+        // taken around the snapshot, and the live ones are only bounded from below.
+        let before = crate::carrier::mseg().stats();
+
+        let config = AllocatorConfig::builder()
+            .name("mseg_view")
+            .carrier_size(64 * 1024)
+            .build();
+        let alloc = CarrierAllocator::new(config).expect("allocator");
+        let l = layout(64, MIN_ALIGN);
+        let ptr = alloc.alloc(l).expect("alloc maps a slab carrier");
+
+        let stats = alloc.stats();
+        let after = crate::carrier::mseg().stats();
+        let mseg = stats.mseg;
+
+        // This allocator's own mapping is live right now, so the shared segment
+        // allocator certainly holds at least it: `>=` is exact and concurrency-safe.
+        assert!(
+            mseg.segments >= 1,
+            "the snapshot must show the live segment, not the never-moving local zero"
+        );
+        assert!(mseg.bytes >= 64 * 1024, "and its bytes: got {}", mseg.bytes);
+        assert!(mseg.mapped_segments >= 1);
+        assert!(mseg.mapped_bytes >= 64 * 1024);
+        assert!(
+            mseg.calls.create >= before.calls.create + 1,
+            "mapping a carrier creates at least this test's own segment"
+        );
+        // Bracketed (monotone) counters.
+        assert!(before.watermark <= mseg.peak_segments);
+        assert!(mseg.peak_segments <= after.watermark);
+        assert!(before.max_bytes_ever <= mseg.peak_bytes);
+        assert!(mseg.peak_bytes <= after.max_bytes_ever);
+        assert!(before.peak_mapped_bytes <= mseg.peak_mapped_bytes);
+        assert!(mseg.peak_mapped_bytes <= after.peak_mapped_bytes);
+        assert!(before.cache_hits <= mseg.reused);
+        assert!(mseg.reused <= after.cache_hits);
+        assert!(before.calls.alloc <= mseg.calls.alloc);
+        assert!(mseg.calls.alloc <= after.calls.alloc);
+
+        // A second, *fresh* allocator that has mapped nothing of its own reports the very
+        // same shared pool — the mseg block is not per-allocator bookkeeping.
+        let other = CarrierAllocator::new(
+            AllocatorConfig::builder()
+                .name("mseg_view_other")
+                .carrier_size(64 * 1024)
+                .build(),
+        )
+        .expect("allocator");
+        assert_eq!(other.stats().live_bytes, 0, "it allocated nothing itself");
+        assert!(
+            other.stats().mseg.segments >= 1,
+            "a fresh allocator still sees the process-global segments"
+        );
+
+        // SAFETY: the live allocation, freed exactly once.
+        unsafe { alloc.dealloc(ptr, l) };
+        // The released slab carrier is retained by this allocator (the M1 retention
+        // policy), so the segment stays handed out; nothing to assert about the exit
+        // state here beyond the snapshot having been consistent above.
     }
 
     #[test]
