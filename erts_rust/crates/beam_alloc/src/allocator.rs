@@ -6,10 +6,12 @@
 //! through an [`AllocRef`] and never touch carriers, blocks or free lists directly,
 //! so the carrier framework can evolve behind this interface.
 //!
-//! # The carrier model (Milestone 1)
+//! # The carrier model
 //!
 //! All mutation is serialised through one [`parking_lot::Mutex`]. Carriers come from
-//! the OS (`mmap`) and are page-aligned; there are two allocation paths:
+//! the OS (`mmap`) and are page-aligned; there are three allocation paths, split the
+//! way the legacy `mb_alloc`/`sb_alloc` split them — "this request may share a
+//! carrier" versus "this request gets a carrier of its own":
 //!
 //! * **Small / slab.** A request at or below [`SizeClasses::large_threshold`] whose
 //!   alignment is at most [`MIN_ALIGN`] is served from its size class. Each
@@ -17,8 +19,21 @@
 //!   (each preceded by a [`crate::block::BlockHdr`]) and threaded on that class's
 //!   intrusive free list. When a class's list runs dry a new carrier is mapped;
 //!   drained carriers are retained (a documented M1 retention policy).
-//! * **Large / dedicated.** Anything larger (or more aligned) gets a dedicated
-//!   single-block carrier that is `munmap`ed again when the block is freed.
+//! * **Mid / variable-size multi-block carrier.** A request above the size-class
+//!   ladder, no more aligned than [`MIN_ALIGN`] and *below* the single-block-carrier
+//!   threshold ([`CarrierPolicy::small_block_carrier_threshold`], `+M<alloc>sbct`,
+//!   512 KiB by default) is carved out of a [`crate::mbc::MbcCarrier`]: a carrier
+//!   whose free space is split on demand and whose blocks coalesce again on free. The
+//!   allocator keeps a pool of them, so many mid-size requests share one carrier
+//!   (the legacy `mb_alloc`). A carrier that has coalesced back into one free block
+//!   spanning it is released to the segment allocator.
+//! * **Large / dedicated.** A request at or above the single-block-carrier threshold,
+//!   or one more aligned than [`MIN_ALIGN`], gets a dedicated single-block carrier
+//!   released again when the block is freed (the legacy `sb_alloc`).
+//!
+//! Which request takes which path is the configurable carrier policy
+//! ([`AllocatorConfig::policy`], the legacy `+M<alloc><opt>` options); it defaults to
+//! [`CarrierPolicy::default`].
 //!
 //! Because carriers are page-aligned and alignments above the page size are
 //! rejected, a block's alignment padding is a function of the requested alignment
@@ -49,6 +64,8 @@ use crate::block::{
 use crate::carrier::{os_page_size, round_up_unit, Carrier};
 use crate::error;
 use crate::free_list::FreeList;
+use crate::mbc::{MbcCarrier, MBC_CLASS};
+use crate::policy::CarrierPolicy;
 use crate::size_class::SizeClasses;
 use crate::stats::{AllocStats, AllocatorInfo, Counters, TypeStats};
 use crate::strategy::Strategy;
@@ -280,12 +297,12 @@ pub trait Allocator: Send + Sync + 'static {
 pub struct AllocatorConfig {
     name: String,
     strategy: Strategy,
+    policy: CarrierPolicy,
     carrier_size: usize,
     classes: SizeClasses,
     max_footprint: Option<usize>,
     zeroed_carriers: bool,
 }
-
 impl AllocatorConfig {
     /// The default carrier size (1 MiB).
     pub const DEFAULT_CARRIER_SIZE: usize = 1024 * 1024;
@@ -307,6 +324,11 @@ impl AllocatorConfig {
         self.strategy
     }
 
+    /// The legacy carrier policy this allocator routes and sizes carriers by
+    /// (`+M<alloc><opt>`: `sbct`, `smbcs`/`lmbcs`, `mmmbc`, …).
+    pub fn policy(&self) -> &CarrierPolicy {
+        &self.policy
+    }
     /// The carrier size in bytes.
     pub fn carrier_size(&self) -> usize {
         self.carrier_size
@@ -333,6 +355,7 @@ impl Default for AllocatorConfig {
         AllocatorConfig {
             name: String::from("beam_alloc"),
             strategy: Strategy::FirstFit,
+            policy: CarrierPolicy::default(),
             carrier_size: AllocatorConfig::DEFAULT_CARRIER_SIZE,
             classes: SizeClasses::default_small_block(),
             max_footprint: None,
@@ -340,7 +363,6 @@ impl Default for AllocatorConfig {
         }
     }
 }
-
 /// Builder for [`AllocatorConfig`]; obtain it from [`AllocatorConfig::builder`].
 #[derive(Clone, Debug)]
 pub struct AllocatorConfigBuilder {
@@ -360,6 +382,12 @@ impl AllocatorConfigBuilder {
         self
     }
 
+    /// Sets the legacy carrier policy (`+M<alloc><opt>` carrier thresholds/limits)
+    /// that decides which requests share a carrier and how big a fresh one is.
+    pub fn policy(mut self, policy: CarrierPolicy) -> Self {
+        self.config.policy = policy;
+        self
+    }
     /// Sets the carrier size in bytes.
     pub fn carrier_size(mut self, bytes: usize) -> Self {
         self.config.carrier_size = bytes;
@@ -427,6 +455,22 @@ fn probe_alignments() -> impl Iterator<Item = usize> {
     })
 }
 
+/// The `prev_free` block-*state* bit ([`BlockFlags::set_prev_free`]), read through
+/// `block.rs`'s public accessor pair rather than re-declaring the literal here.
+///
+/// It is deliberately **outside** [`ALL_FLAGS`] (see `crate::block`'s module docs):
+/// "my physical predecessor is free" is a per-block *state*, not block taxonomy. The
+/// variable-size multi-block carrier path (`crate::mbc`) sets it on a **live** block
+/// whenever that block's predecessor is free (it is what lets the block find the
+/// predecessor's footer), so [`plausible_header`] has to tolerate it — otherwise
+/// `Self::locate` would refuse to recognise a legitimately live mid-size block and
+/// [`Allocator::dealloc`] would refuse to free it, leaking it.
+const PREV_FREE_BIT: u8 = {
+    let mut flags = BlockFlags::empty();
+    flags.set_prev_free();
+    flags.bits()
+};
+
 /// Whether `header` looks like one this crate's carrier allocator wrote for a payload
 /// at padding `offset`.
 fn plausible_header(header: &BlockHdr, offset: usize) -> bool {
@@ -435,11 +479,15 @@ fn plausible_header(header: &BlockHdr, offset: usize) -> bool {
         && header.size >= BLOCK_HEADER_SIZE + offset
         && header.size <= MAX_BLOCK_SIZE
         && header.payload_offset == offset
-        && header.flags & !ALL_FLAGS == 0
+        // Exactly one flag bit beyond the taxonomy union is tolerated: `prev_free`,
+        // the block-state bit a live variable-size-carrier block carries when its
+        // predecessor is free (see [`PREV_FREE_BIT`]). This widens acceptance by
+        // exactly that one bit and leaves [`ALL_FLAGS`] (and its compile-time
+        // assertion) untouched.
+        && header.flags & !(ALL_FLAGS | PREV_FREE_BIT) == 0
         && (header.class == CLASS_NONE) == flags.is_large()
         && (header.class == CLASS_NONE || usize::from(header.class) < MAX_CLASS_COUNT)
 }
-
 /// The module-level form of the header plausibility check, reading the header word at
 /// `block_start`.
 ///
@@ -503,6 +551,19 @@ struct AllocatorState {
     by_base: HashMap<usize, usize>,
     /// The per-size-class free-block lists.
     free_lists: FreeList,
+    /// The pooled **variable-size** multi-block carriers ([`MbcCarrier`]) that serve
+    /// requests above the size-class ladder and below the policy's single-block-carrier
+    /// threshold. Boxed so a block's recorded carrier base stays stable across later
+    /// pool insertions (never store a pointer into a growing `Vec`).
+    mbcs: Vec<Box<MbcCarrier>>,
+    /// `variable-size carrier base -> index in `mbcs``, for the O(1) dispatch key the
+    /// free path needs.
+    ///
+    /// This exact-base lookup is the **only** correct discriminator between the two
+    /// multi-block pools: a variable-size carrier's blocks record `class == MBC_CLASS`,
+    /// which is also a valid size-class index, so the class word cannot tell them
+    /// apart.
+    mbc_by_base: HashMap<usize, usize>,
     /// Instrumentation counters.
     counters: Counters,
     /// Total bytes held in mapped carriers (the footprint that `max_footprint`
@@ -524,6 +585,57 @@ impl AllocatorState {
         self.by_base.get(&base).copied()
     }
 
+    /// Installs the variable-size multi-block carrier `mbc` in the pool and returns its
+    /// index.
+    fn insert_mbc(&mut self, mbc: MbcCarrier) -> usize {
+        let index = self.mbcs.len();
+        self.mbc_by_base.insert(mbc.base() as usize, index);
+        self.mbcs.push(Box::new(mbc));
+        index
+    }
+
+    /// The index of the pooled variable-size carrier whose base address is `base`.
+    fn mbc_index(&self, base: usize) -> Option<usize> {
+        self.mbc_by_base.get(&base).copied()
+    }
+
+    /// Removes and returns the pooled variable-size carrier whose base address is
+    /// `base`.
+    fn take_mbc(&mut self, base: usize) -> Option<Box<MbcCarrier>> {
+        let index = self.mbc_by_base.remove(&base)?;
+        if index >= self.mbcs.len() {
+            return None;
+        }
+        let removed = self.mbcs.swap_remove(index);
+        debug_assert_eq!(removed.base() as usize, base, "MBC index table out of sync");
+        if index < self.mbcs.len() {
+            // `swap_remove` moved the last carrier into `index`; fix its record.
+            let moved_base = self.mbcs[index].base() as usize;
+            self.mbc_by_base.insert(moved_base, index);
+        }
+        Some(removed)
+    }
+
+    /// Carves a block with at least `size` payload bytes out of one of the pooled
+    /// variable-size carriers, or `None` when none of them has a big-enough free block.
+    ///
+    /// The scan is linear in the pool size and takes the **first** carrier that fits.
+    /// The legacy instead keeps its carriers on the `mbcgs` size ladder and walks that
+    /// ladder (`mbc_alloc` → `get_free_block`); modelling the ladder (and its
+    /// grow-a-carrier policy) is a documented gap. With one shared 1 MiB carrier
+    /// serving many mid-size requests the pool stays tiny in practice.
+    fn take_mbc_fit(&mut self, size: usize) -> Option<*mut u8> {
+        for mbc in self.mbcs.iter_mut() {
+            // SAFETY: every pooled carrier is exclusively owned by this state (it is
+            // only reachable through this pool) and the block it hands back is not
+            // reachable from anywhere else; the caller releases it exactly once,
+            // through the same carrier, from the free path.
+            if let Some(payload) = unsafe { mbc.alloc(size) } {
+                return Some(payload);
+            }
+        }
+        None
+    }
     /// Removes and returns the carrier whose base address is `base`.
     fn take_carrier(&mut self, base: usize) -> Option<Box<Carrier>> {
         let index = self.by_base.remove(&base)?;
@@ -565,12 +677,15 @@ impl AllocatorState {
     }
 
     /// Records a multi-block carrier of `bytes` returned to the OS.
-    #[allow(dead_code)]
+    ///
+    /// A slab carrier is retained for the allocator's lifetime (the M1 policy), so the
+    /// only live caller is the free path releasing a pooled **variable-size**
+    /// multi-block carrier once every block of it has coalesced back into one free
+    /// block.
     fn note_mbc_carrier_down(&mut self, bytes: usize) {
         self.counters.note_mbc_carrier_down(bytes);
         self.mapped_bytes = self.mapped_bytes.saturating_sub(bytes);
     }
-
     /// Records a successful allocation of `bytes`, attributing it to `ty` when the
     /// caller asked for per-type accounting.
     ///
@@ -638,6 +753,16 @@ impl AllocatorState {
 
 impl Drop for AllocatorState {
     fn drop(&mut self) {
+        for mbc in self.mbcs.drain(..) {
+            // SAFETY: as for `carriers` below — this state exclusively owns every
+            // carrier it mapped and is being dropped, so no block is used afterwards;
+            // each variable-size carrier's segment is released exactly once here
+            // (through the same `Carrier::unmap` the slab/dedicated carriers go
+            // through).
+            let carrier = (*mbc).into_carrier();
+            unsafe { carrier.unmap() };
+        }
+        self.mbc_by_base.clear();
         for carrier in self.carriers.drain(..) {
             let carrier = *carrier;
             // SAFETY: this state exclusively owns every carrier it mapped and is
@@ -648,7 +773,6 @@ impl Drop for AllocatorState {
         self.by_base.clear();
     }
 }
-
 /// The concrete carrier-backed multi-block allocator.
 ///
 /// Construction maps no memory; carriers are mapped lazily on the first allocation.
@@ -812,11 +936,12 @@ impl CarrierAllocator {
         carriers[index].subdivide_into(class, block_size, free_lists)
     }
 
-    /// The large path: a dedicated single-block carrier for a request larger than
-    /// the threshold or more aligned than [`MIN_ALIGN`], recording the allocation for
-    /// `ty`. The alignment padding in front of the payload is zeroed, so a segment
-    /// reused from the `mseg` cache cannot leave a previous owner's bytes where the
-    /// unsized-dealloc probe would read a candidate block header.
+    /// The large path: a dedicated single-block carrier for a request at or above the
+    /// single-block-carrier threshold (`+M<alloc>sbct`) or more aligned than
+    /// [`MIN_ALIGN`], recording the allocation for `ty`. The alignment padding in front
+    /// of the payload is zeroed, so a segment reused from the `mseg` cache cannot leave
+    /// a previous owner's bytes where the unsized-dealloc probe would read a candidate
+    /// block header.
     fn alloc_large(
         &self,
         state: &mut AllocatorState,
@@ -898,6 +1023,19 @@ impl CarrierAllocator {
     /// `ty` is `None` for the untyped entry point (aggregate accounting only) and
     /// `Some(..)` when the caller asked for per-type attribution; the chosen branch
     /// records the allocation exactly once.
+    ///
+    /// # Routing (the legacy `mb_alloc` / `sb_alloc` split)
+    ///
+    /// | request | path |
+    /// |---|---|
+    /// | `size <= classes.large_threshold()` and `align <= UNIT_SIZE` | [`alloc_small`](Self::alloc_small): the segregated per-class slab carrier |
+    /// | `align > UNIT_SIZE` **or** `size >= policy.small_block_carrier_threshold()` | [`alloc_large`](Self::alloc_large): a dedicated single-block carrier |
+    /// | anything else (above the ladder, below `sbct`, `MIN_ALIGN`-aligned) | [`alloc_mid`](Self::alloc_mid): a shared variable-size multi-block carrier |
+    ///
+    /// The first test comes first on purpose: a small, weakly-aligned request is a slab
+    /// request even when it is also below `sbct`. Over-aligned requests can never share
+    /// a carrier (a carrier's alignment is its *base*'s), and requests at or above
+    /// `sbct` are the ones the legacy deliberately gives a carrier of their own.
     fn alloc_impl(&self, layout: Layout, ty: Option<TypeId>) -> Result<NonNull<u8>> {
         let size = layout.size();
         let align = layout.align();
@@ -907,11 +1045,100 @@ impl CarrierAllocator {
         let mut state = self.state.lock();
         if size <= self.config.classes.large_threshold() && align <= UNIT_SIZE {
             self.alloc_small(&mut state, size, ty)
-        } else {
+        } else if align > UNIT_SIZE || self.config.policy.uses_single_block_carrier(size) {
             self.alloc_large(&mut state, size, align, ty)
+        } else {
+            self.alloc_mid(&mut state, size, ty)
         }
     }
 
+    /// The mid path: serves `size` bytes out of a **variable-size** multi-block carrier
+    /// (the legacy `mb_alloc`), recording the allocation for `ty`.
+    ///
+    /// Reached for a request above the size-class ladder, below the policy's
+    /// single-block-carrier threshold and no more aligned than [`MIN_ALIGN`] — the
+    /// requests that may share a carrier with their neighbours. A pooled carrier that
+    /// can serve the request is reused first; only when none of them can is a fresh
+    /// [`MbcCarrier`] mapped (and pooled for the next request).
+    fn alloc_mid(
+        &self,
+        state: &mut AllocatorState,
+        size: usize,
+        ty: Option<TypeId>,
+    ) -> Result<NonNull<u8>> {
+        if let Some(payload) = state.take_mbc_fit(size) {
+            // SAFETY: `take_mbc_fit` returned the payload of a block carved out of a
+            // pooled carrier, so its header (written by `crate::mbc`) sits
+            // `BLOCK_HEADER_SIZE` below it and records the block's **total** size — the
+            // exact extent the block accounts for, which may exceed `size` (the split
+            // rule hands out the whole block when the residue would be unusable).
+            let block_size = unsafe { FreeList::block_size(payload) };
+            state.note_alloc_for(ty, block_size);
+            // SAFETY: the payload lies inside a live carrier mapping and is non-null
+            // (it derives from a successful `mmap` base).
+            return Ok(unsafe { NonNull::new_unchecked(payload) });
+        }
+
+        let carrier_size = self.mbc_size(size);
+        if carrier_size > MAX_BLOCK_SIZE {
+            return Err(error::carrier_failure(size));
+        }
+        let cap = self.config.policy.multi_block_carrier_cap();
+        if !CarrierPolicy::is_unlimited(cap) && state.mbcs.len() >= cap {
+            // `+M<alloc>mmmbc`: the policy caps the number of `mseg_alloc` multi-block
+            // carriers. The legacy would fall back to `sys_alloc` beyond it; this crate
+            // has no second segment source, so the request fails with the legacy's
+            // carrier failure instead of over-mapping.
+            return Err(error::carrier_failure(carrier_size));
+        }
+        self.check_footprint(state, carrier_size)?;
+        // SAFETY: `alloc_map` (inside `MbcCarrier::new`) hands back exclusive ownership
+        // of a fresh segment; the carrier releases it exactly once, through
+        // `into_carrier`/`Drop`. `MIN_ALIGN` is a valid carrier alignment and
+        // `MBC_CLASS` is validated before anything is mapped.
+        let mut mbc = unsafe { MbcCarrier::new(carrier_size, MIN_ALIGN, MBC_CLASS)? };
+        // A fresh carrier is a single free block spanning it and `carrier_size` is at
+        // least the block the request needs (see `mbc_size`), so this cannot fail; it is
+        // still handled as a typed failure rather than an `unwrap` (never a panic). On
+        // failure `mbc` is dropped, handing its segment straight back.
+        let Some(payload) = (unsafe { mbc.alloc(size) }) else {
+            return Err(error::carrier_failure(carrier_size));
+        };
+        // SAFETY: as for the pooled case above — the block's header is immediately below
+        // the payload and records the block's own total size.
+        let block_size = unsafe { FreeList::block_size(payload) };
+        state.note_mbc_carrier_up(mbc.carrier_size());
+        state.insert_mbc(mbc);
+        state.note_alloc_for(ty, block_size);
+        // SAFETY: the payload lies inside the carrier just mapped and is non-null.
+        Ok(unsafe { NonNull::new_unchecked(payload) })
+    }
+
+    /// The size a fresh variable-size multi-block carrier is mapped with for a request
+    /// of `size` bytes.
+    ///
+    /// The preferred size is the configured [`AllocatorConfig::carrier_size`]
+    /// (`+M<alloc>mmbcs`) clamped into the policy's `smbcs`..`lmbcs` range
+    /// ([`CarrierPolicy::minimum_multi_block_carrier_size`] /
+    /// [`CarrierPolicy::effective_largest_mbc_size`]), so with the defaults a 1 MiB
+    /// carrier serves many mid-size blocks; a request *larger* than that preferred size
+    /// sizes the carrier to the request instead, rounded up to [`UNIT_SIZE`].
+    ///
+    /// The result is never below the block the request needs (`size` plus the block
+    /// header — the `UMEMSZ2BLKSZ` rule `crate::mbc::MbcCarrier` applies internally),
+    /// because a fresh carrier holds one free block spanning it: a request at least as
+    /// large as the preferred size would otherwise get a carrier one header short of
+    /// serving it. The legacy instead grows carriers along its `mbcgs` ladder, which
+    /// this crate does not model.
+    fn mbc_size(&self, size: usize) -> usize {
+        let policy = &self.config.policy;
+        let preferred = self.config.carrier_size.clamp(
+            policy.minimum_multi_block_carrier_size(),
+            policy.effective_largest_mbc_size(),
+        );
+        round_up_unit(size.max(preferred))
+            .max(round_up_unit(size.saturating_add(BLOCK_HEADER_SIZE)))
+    }
     /// The shared reallocation path behind [`Allocator::realloc`] and
     /// [`Allocator::realloc_typed`]; `ty` selects the accounting of the alloc + free
     /// pair a growing move performs.
@@ -958,6 +1185,23 @@ impl CarrierAllocator {
     /// The shared free path behind [`Allocator::dealloc`] and
     /// [`Allocator::dealloc_typed`].
     ///
+    /// # Dispatch order
+    ///
+    /// Once the header is located, the block's owning carrier decides the path, and the
+    /// **variable-size multi-block pool is checked first**:
+    ///
+    /// 1. **Variable-size multi-block carrier** — the header's recorded carrier base is
+    ///    in [`AllocatorState::mbc_index`]. This lookup has to come first: a
+    ///    variable-size carrier's blocks record `class == MBC_CLASS` (0), which is also
+    ///    a valid *size-class* index, so the class word cannot discriminate between the
+    ///    two multi-block pools. The key is the exact base address, and a base address
+    ///    belongs to exactly one mapping, so a slab or dedicated block can never be
+    ///    found here and a variable-size block can never fall through to the slab path.
+    /// 2. **Dedicated single-block carrier** (`flags.is_large()`): the whole mapping is
+    ///    handed back (`take_carrier` + `unmap`).
+    /// 3. **Slab carrier**: the block goes back on its size class's free list (with the
+    ///    existing class-range and registered-carrier checks).
+    ///
     /// # Safety
     ///
     /// Same contract as [`Allocator::dealloc`]: `ptr` must be a live allocation of
@@ -972,6 +1216,39 @@ impl CarrierAllocator {
         };
         let flags = BlockFlags::from_bits(header.flags);
         let mut state = self.state.lock();
+
+        // -- 1. The variable-size multi-block carrier pool --------------------------
+        if let Some(index) = state.mbc_index(header.carrier as usize) {
+            // The block's **own** size, read *before* the free: releasing it rewrites
+            // the block's header (and possibly its predecessor's) while coalescing, so
+            // this is the only point at which the released block's extent is still
+            // recoverable — and the block's own size, never the merged one, is what the
+            // accounting owes.
+            let block_size = header.size;
+            // SAFETY: `locate` found a plausible header at `payload - BLOCK_HEADER_SIZE`
+            // whose carrier word names this exact pooled carrier, so `payload` is a live
+            // block of it; the caller's contract says it is released exactly once.
+            unsafe { state.mbcs[index].dealloc(payload) };
+            state.note_free_for(ty, block_size);
+            if state.mbcs[index].is_fully_free() {
+                // Every block has coalesced back into one free block spanning the
+                // carrier — the legacy `is_first_blk && is_last_blk` arm of `mbc_free`.
+                // Destroying it is the *only* carrier release modelled: the legacy's
+                // partial abandonment (`acul`/`rsbcmt`, which needs live-block
+                // relocation) is not implemented.
+                if let Some(mbc) = state.take_mbc(header.carrier as usize) {
+                    let carrier = (*mbc).into_carrier();
+                    state.note_mbc_carrier_down(carrier.size());
+                    // SAFETY: the caller is done with `payload`, the carrier holds no
+                    // live block (it is fully free), and it was just removed from the
+                    // pool, so its segment is released exactly once here.
+                    unsafe { carrier.unmap() };
+                }
+            }
+            return;
+        }
+
+        // -- 2. A dedicated single-block carrier -----------------------------------
         if flags.is_large() {
             match state.take_carrier(block_start as usize) {
                 Some(carrier) => {
@@ -990,6 +1267,7 @@ impl CarrierAllocator {
             }
             return;
         }
+        // -- 3. A slab block -------------------------------------------------------
         let class = usize::from(header.class);
         if class >= self.config.classes.len() {
             beam_common::beam_debug!("beam_alloc: block carries an out-of-range size class");
@@ -1058,8 +1336,8 @@ impl Allocator for CarrierAllocator {
     }
 
     fn alloc_unsized(&self, ty: TypeId, size: usize) -> Result<NonNull<u8>> {
-        let layout = Layout::from_size_align(size, MIN_ALIGN)
-            .map_err(|_| error::bad_align(MIN_ALIGN))?;
+        let layout =
+            Layout::from_size_align(size, MIN_ALIGN).map_err(|_| error::bad_align(MIN_ALIGN))?;
         self.alloc_impl(layout, Some(ty))
     }
 
@@ -1165,10 +1443,20 @@ mod tests {
         let mut too_small = good;
         too_small.size = 8;
         assert!(!CarrierAllocator::plausible(&too_small, 0));
-        // Unknown flag bits.
-        let mut bad_flags = good;
-        bad_flags.flags = 0x80;
-        assert!(!CarrierAllocator::plausible(&bad_flags, 0));
+        // The `prev_free` block-*state* bit (bit 7) is tolerated, because a **live**
+        // block of a variable-size multi-block carrier carries it whenever its
+        // predecessor is free; refusing it here would make `locate` skip such a block
+        // and `dealloc` leak it. That accounts for all eight bits of the flag byte, so
+        // the "unknown bit" case that used to be asserted here no longer exists — the
+        // tolerated mask is exactly one bit wider than the taxonomy union.
+        let mut prev_free = good;
+        prev_free.flags |= PREV_FREE_BIT;
+        assert!(CarrierAllocator::plausible(&prev_free, 0));
+        assert_eq!(
+            ALL_FLAGS | PREV_FREE_BIT,
+            0xFF,
+            "one bit beyond the taxonomy"
+        );
         // Large flag without the `CLASS_NONE` class and vice versa.
         let mut mismatched = good;
         mismatched.class = CLASS_NONE;
@@ -1180,6 +1468,19 @@ mod tests {
         assert!(!CarrierAllocator::plausible(&mismatched, 0));
     }
 
+    #[test]
+    fn the_prev_free_bit_is_read_from_the_block_flag_accessors() {
+        // `PREV_FREE_BIT` is `BlockFlags::set_prev_free`'s bit, obtained through the
+        // public accessor pair rather than re-declared here, and it is outside the
+        // taxonomy union (which `block.rs` pins at `0b0111_1111`).
+        assert_eq!(PREV_FREE_BIT, 1 << 7);
+        assert_eq!(ALL_FLAGS & PREV_FREE_BIT, 0);
+        let mut flags = BlockFlags::empty();
+        flags.set_prev_free();
+        assert_eq!(flags.bits(), PREV_FREE_BIT);
+        flags.clear_prev_free();
+        assert_eq!(flags.bits(), 0);
+    }
     #[test]
     fn alloc_dealloc_round_trip_returns_the_counters_to_zero() {
         let alloc = allocator();
@@ -1208,14 +1509,20 @@ mod tests {
     }
 
     #[test]
-    fn large_blocks_get_dedicated_carriers_and_release_them() {
+    fn blocks_at_the_sbct_get_dedicated_carriers_and_release_them() {
         let alloc = allocator();
         let baseline = alloc.stats();
-        let l = layout(4097, 16);
+        // The dedicate-vs-share boundary is the policy's single-block-carrier threshold
+        // (`+M<alloc>sbct`), *not* the size-class ladder: at or above it a request gets a
+        // carrier of its own (the legacy `sb_alloc`).
+        let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+        let l = layout(sbct, 16);
         let first = alloc.alloc(l).expect("alloc");
         let second = alloc.alloc(l).expect("alloc");
         assert_ne!(first.as_ptr(), second.as_ptr());
         let live = alloc.stats();
+        assert_eq!(live.sbc_carriers, baseline.sbc_carriers + 2);
+        assert_eq!(live.mbc_carriers, baseline.mbc_carriers);
         assert_eq!(live.carriers, baseline.carriers + 2);
         assert_eq!(live.live_blocks, 2);
         assert!(live.carrier_bytes > baseline.carrier_bytes);
@@ -1229,12 +1536,59 @@ mod tests {
         }
         let after = alloc.stats();
         assert_eq!(after.carriers, baseline.carriers);
+        assert_eq!(after.sbc_carriers, baseline.sbc_carriers);
         assert_eq!(after.carrier_bytes, baseline.carrier_bytes);
         assert_eq!(after.live_bytes, 0);
         assert_eq!(after.live_blocks, 0);
         assert_eq!(after.free_calls, 2);
     }
 
+    #[test]
+    fn mid_size_blocks_share_one_variable_size_carrier_until_the_last_one_is_freed() {
+        let alloc = allocator();
+        let baseline = alloc.stats();
+        // Above the size-class ladder, below `sbct`, `MIN_ALIGN`-aligned: the request may
+        // share a carrier, so it is carved out of a pooled variable-size multi-block
+        // carrier (the legacy `mb_alloc`) instead of getting one of its own.
+        let l = layout(4097, 16);
+        let first = alloc.alloc(l).expect("alloc");
+        let after_first = alloc.stats();
+        assert_eq!(
+            after_first.sbc_carriers, baseline.sbc_carriers,
+            "a mid request must not map a dedicated single-block carrier"
+        );
+        assert_eq!(after_first.mbc_carriers, baseline.mbc_carriers + 1);
+        let footprint = after_first.carrier_bytes;
+        let mut rest = Vec::new();
+        for _ in 0..64 {
+            rest.push(alloc.alloc(l).expect("alloc"));
+        }
+        let shared = alloc.stats();
+        assert_eq!(
+            shared.mbc_carriers,
+            baseline.mbc_carriers + 1,
+            "one carrier serves every mid request"
+        );
+        assert_eq!(shared.carrier_bytes, footprint, "the footprint stays flat");
+        assert_eq!(shared.live_blocks, 65);
+
+        // Freeing every block coalesces the carrier back into one free block spanning it,
+        // and that is what releases the segment.
+        // SAFETY: every pointer is a live allocation of this allocator, freed once.
+        unsafe { alloc.dealloc(first, l) };
+        for ptr in rest {
+            // SAFETY: as above.
+            unsafe { alloc.dealloc(ptr, l) };
+        }
+        let after = alloc.stats();
+        assert_eq!(after.live_blocks, 0);
+        assert_eq!(after.live_bytes, 0);
+        assert_eq!(after.mbc_carriers, baseline.mbc_carriers);
+        assert_eq!(after.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after.carriers, baseline.carriers);
+        assert_eq!(after.carrier_bytes, baseline.carrier_bytes);
+        assert_eq!(after.free_calls, 65);
+    }
     #[test]
     fn unaligned_large_blocks_keep_their_padding_in_the_header() {
         let alloc = allocator();
@@ -1519,7 +1873,8 @@ mod tests {
 
     impl Allocator for Forwarding {
         fn alloc(&self, layout: Layout) -> Result<NonNull<u8>> {
-            self.allocs.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            self.allocs
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             self.inner.alloc(layout)
         }
 
@@ -1609,23 +1964,33 @@ mod tests {
 
         // Shrinking within the block's capacity does not move it, so neither the block
         // nor its attribution changes.
-        let same = alloc.realloc_typed(msg, ptr, l, 32).expect("shrink in place");
+        let same = alloc
+            .realloc_typed(msg, ptr, l, 32)
+            .expect("shrink in place");
         assert_eq!(same, ptr);
         assert_eq!(alloc.type_stats(msg).blocks, 1);
         assert_eq!(alloc.stats().realloc_calls, 1);
 
         // Growing past the capacity moves the block through a real typed alloc + free,
-        // both attributed to `msg`.
+        // both attributed to `msg`. 4097 bytes is above the size-class ladder and below
+        // the policy's single-block-carrier threshold, so the new block is carved out of
+        // a pooled variable-size multi-block carrier — no dedicated carrier is mapped.
         let grown = alloc.realloc_typed(msg, ptr, l, 4097).expect("grow");
         assert_ne!(grown.as_ptr(), ptr.as_ptr());
         let stats = alloc.stats();
         assert_eq!(stats.realloc_calls, 2);
         assert_eq!(stats.live_blocks, 1);
-        assert_eq!(stats.sbc_carriers, 1, "the grown block owns a dedicated carrier");
+        assert_eq!(
+            stats.sbc_carriers, 0,
+            "a mid-size block shares a variable-size carrier instead of owning one"
+        );
+        assert_eq!(
+            stats.mbc_carriers, 2,
+            "the slab carrier the first request mapped plus the variable-size one"
+        );
         assert_eq!(alloc.type_stats(msg).blocks, 1);
         assert_eq!(alloc.type_stats(msg).bytes, stats.live_bytes);
         assert_eq!(alloc.type_stats(other), TypeStats::default());
-
         // SAFETY: the live grown block, freed exactly once with its layout.
         unsafe { alloc.dealloc_typed(msg, grown, layout(4097, 16)) };
         assert_eq!(alloc.stats().live_bytes, 0);
@@ -1660,19 +2025,20 @@ mod tests {
         }
         let stats = alloc.stats();
         assert_eq!(stats.live_bytes, 0);
-        // The over-threshold last request owned a dedicated carrier that went back to
-        // the OS; the slab carriers the smaller requests mapped stay (M1 policy).
+        // The over-ladder last request shared a variable-size carrier that coalesced back
+        // and was released with its last block; the slab carriers the smaller requests
+        // mapped stay (M1 policy).
         assert_eq!(stats.sbc_carriers, 0);
         assert_eq!(stats.carriers, stats.sbc_carriers + stats.mbc_carriers);
     }
-
     #[test]
     fn dealloc_unsized_recovers_every_supported_alignment() {
         let alloc = allocator();
         let ty = type_id("HEAP");
         // Over-aligned requests take the large (dedicated single-block carrier) path,
-        // whose payload offset differs per alignment; the plain size takes the slab
-        // path (offset zero).
+        // whose payload offset differs per alignment; the `MIN_ALIGN`-aligned 2000-byte
+        // request takes the mid path (a shared variable-size carrier, offset zero), and
+        // the 64-byte one the slab path (offset zero as well).
         for align in [16usize, 32, 64, 256, 4096] {
             let l = layout(2000, align);
             let ptr = alloc.alloc_typed(ty, l).expect("alloc");
@@ -1830,8 +2196,8 @@ mod tests {
         // A zeroed buffer big enough that even the widest probe reads inside it: the
         // pointer sits 32 KiB in, and the probe reaches at most `os_page_size()` below.
         let buffer = vec![0u8; 64 * 1024];
-        let bogus = NonNull::new(unsafe { buffer.as_ptr().add(32 * 1024) as *mut u8 })
-            .expect("non-null");
+        let bogus =
+            NonNull::new(unsafe { buffer.as_ptr().add(32 * 1024) as *mut u8 }).expect("non-null");
         let before = alloc.stats();
         // SAFETY: `bogus` is not a block this allocator handed out; the call must
         // detect that (every candidate header is zeroed, hence no size) and leave the
@@ -1855,7 +2221,9 @@ mod tests {
             1 + (os_page_size() / MIN_ALIGN).ilog2() as usize
         );
         assert!(aligns.len() <= 1 + 16, "the probe stays small");
-        assert!(aligns.iter().all(|a| a.is_power_of_two() && *a <= os_page_size()));
+        assert!(aligns
+            .iter()
+            .all(|a| a.is_power_of_two() && *a <= os_page_size()));
         assert!(aligns.windows(2).all(|w| w[1] == w[0] * 2));
         let offsets: Vec<usize> = aligns.iter().map(|a| padding_for(*a)).collect();
         let mut unique = offsets.clone();
@@ -1873,7 +2241,10 @@ mod tests {
         let alloc = allocator();
         let ty = type_id("MSG");
         let baseline = alloc.stats();
-        assert_eq!(baseline.carriers, baseline.sbc_carriers + baseline.mbc_carriers);
+        assert_eq!(
+            baseline.carriers,
+            baseline.sbc_carriers + baseline.mbc_carriers
+        );
 
         // A slab request maps one multi-block carrier.
         let small = alloc.alloc_typed(ty, layout(64, 16)).expect("slab alloc");
@@ -1887,13 +2258,28 @@ mod tests {
         );
         assert!(after_slab.carrier_bytes > baseline.carrier_bytes);
 
-        // A request past the size-class threshold maps a dedicated single-block
-        // carrier.
-        let large = alloc.alloc_typed(ty, layout(4097, 16)).expect("large alloc");
+        // A request above the ladder and below the single-block-carrier threshold shares
+        // a new **variable-size** multi-block carrier: it is still no dedicated carrier.
+        let mid = alloc.alloc_typed(ty, layout(4097, 16)).expect("mid alloc");
+        let after_mid = alloc.stats();
+        assert_eq!(after_mid.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after_mid.mbc_carriers, after_slab.mbc_carriers + 1);
+        assert_eq!(after_mid.carriers, after_slab.carriers + 1);
+        assert_eq!(
+            after_mid.carriers,
+            after_mid.sbc_carriers + after_mid.mbc_carriers
+        );
+
+        // A request at or above the policy's single-block-carrier threshold maps a
+        // dedicated single-block carrier.
+        let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+        let large = alloc
+            .alloc_typed(ty, layout(sbct, 16))
+            .expect("large alloc");
         let after_large = alloc.stats();
         assert_eq!(after_large.sbc_carriers, baseline.sbc_carriers + 1);
-        assert_eq!(after_large.mbc_carriers, after_slab.mbc_carriers);
-        assert_eq!(after_large.carriers, after_slab.carriers + 1);
+        assert_eq!(after_large.mbc_carriers, after_mid.mbc_carriers);
+        assert_eq!(after_large.carriers, after_mid.carriers + 1);
         assert_eq!(
             after_large.carriers,
             after_large.sbc_carriers + after_large.mbc_carriers
@@ -1901,20 +2287,32 @@ mod tests {
         let peak = after_large.peak_carrier_bytes;
         assert!(peak >= after_large.carrier_bytes);
 
-        // Freeing it releases exactly the single-block carrier (the slab carrier is
-        // retained, the M1 policy), and the aggregate follows the split.
+        // Freeing the dedicated block releases exactly the single-block carrier (the slab
+        // carrier is retained, the M1 policy), and the aggregate follows the split.
         // SAFETY: the live large typed allocation, freed exactly once.
-        unsafe { alloc.dealloc_typed(ty, large, layout(4097, 16)) };
-        let after_free = alloc.stats();
-        assert_eq!(after_free.sbc_carriers, baseline.sbc_carriers);
-        assert_eq!(after_free.mbc_carriers, baseline.mbc_carriers + 1);
-        assert_eq!(after_free.carriers, baseline.carriers + 1);
+        unsafe { alloc.dealloc_typed(ty, large, layout(sbct, 16)) };
+        let after_large_free = alloc.stats();
+        assert_eq!(after_large_free.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after_large_free.mbc_carriers, after_mid.mbc_carriers);
+        assert_eq!(after_large_free.carriers, after_mid.carriers);
         assert_eq!(
-            after_free.carriers,
-            after_free.sbc_carriers + after_free.mbc_carriers
+            after_large_free.carriers,
+            after_large_free.sbc_carriers + after_large_free.mbc_carriers
         );
-        assert!(after_free.carrier_bytes < after_large.carrier_bytes);
-        assert_eq!(after_free.peak_carrier_bytes, peak);
+        assert!(after_large_free.carrier_bytes < after_large.carrier_bytes);
+        assert_eq!(after_large_free.peak_carrier_bytes, peak);
+
+        // The variable-size carrier goes back too, once its last block has coalesced —
+        // that release is the `note_mbc_carrier_down` bookkeeping.
+        // SAFETY: the live mid typed allocation, freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, mid, layout(4097, 16)) };
+        let after_mid_free = alloc.stats();
+        assert_eq!(after_mid_free.mbc_carriers, after_slab.mbc_carriers);
+        assert_eq!(after_mid_free.carriers, after_slab.carriers);
+        assert_eq!(
+            after_mid_free.carriers,
+            after_mid_free.sbc_carriers + after_mid_free.mbc_carriers
+        );
 
         // SAFETY: the remaining live typed allocation, freed exactly once.
         unsafe { alloc.dealloc_typed(ty, small, layout(64, 16)) };
@@ -1925,8 +2323,172 @@ mod tests {
         assert_eq!(done.sbc_carriers, baseline.sbc_carriers);
         assert_eq!(done.carriers, baseline.carriers + 1);
         assert_eq!(done.carriers, done.sbc_carriers + done.mbc_carriers);
+        assert_eq!(done.live_blocks, 0);
+        assert_eq!(done.live_bytes, 0);
     }
 
+    #[test]
+    fn the_policy_thresholds_route_every_request_to_the_right_carrier_kind() {
+        let alloc = allocator();
+        let ty = type_id("MSG");
+        let sbct = CarrierPolicy::default().small_block_carrier_threshold();
+        let baseline = alloc.stats();
+
+        // At the size-class ladder: a slab block, from a multi-block carrier dedicated to
+        // its class.
+        let slab = alloc.alloc_typed(ty, layout(1024, 16)).expect("slab");
+        let after_slab = alloc.stats();
+        assert_eq!(after_slab.mbc_carriers, baseline.mbc_carriers + 1);
+        assert_eq!(after_slab.sbc_carriers, baseline.sbc_carriers);
+
+        // One byte past the ladder, still below `sbct`: a **shared** variable-size
+        // carrier, not a dedicated one. (`mbc_carriers` counts the slab *and* the
+        // variable-size multi-block carriers; only `sbc_carriers` can tell a dedicated
+        // carrier apart.)
+        let mid = alloc.alloc_typed(ty, layout(1025, 16)).expect("mid");
+        let after_mid = alloc.stats();
+        assert_eq!(after_mid.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(after_mid.mbc_carriers, after_slab.mbc_carriers + 1);
+        assert_eq!(after_mid.carriers, after_slab.carriers + 1);
+
+        // `sbct` itself is the boundary: at it the request gets a carrier of its own.
+        let large = alloc.alloc_typed(ty, layout(sbct, 16)).expect("large");
+        let after_large = alloc.stats();
+        assert_eq!(after_large.sbc_carriers, baseline.sbc_carriers + 1);
+        assert_eq!(after_large.mbc_carriers, after_mid.mbc_carriers);
+
+        // Over-alignment wins over size: a request more aligned than `MIN_ALIGN` can
+        // never share a carrier (a carrier's alignment is its base's), so even a small
+        // one gets a dedicated single-block carrier.
+        let aligned = alloc.alloc_typed(ty, layout(64, 32)).expect("aligned");
+        let after_aligned = alloc.stats();
+        assert_eq!(after_aligned.sbc_carriers, baseline.sbc_carriers + 2);
+        assert_eq!(after_aligned.mbc_carriers, after_mid.mbc_carriers);
+
+        // Every path frees back through its own bookkeeping.
+        // SAFETY: each pointer is live and freed exactly once with its own layout.
+        unsafe {
+            alloc.dealloc_typed(ty, slab, layout(1024, 16));
+            alloc.dealloc_typed(ty, mid, layout(1025, 16));
+            alloc.dealloc_typed(ty, large, layout(sbct, 16));
+            alloc.dealloc_typed(ty, aligned, layout(64, 32));
+        }
+        let done = alloc.stats();
+        assert_eq!(done.live_blocks, 0);
+        assert_eq!(done.live_bytes, 0);
+        assert_eq!(done.sbc_carriers, baseline.sbc_carriers);
+        assert_eq!(
+            done.mbc_carriers,
+            baseline.mbc_carriers + 1,
+            "only the slab carrier is retained; both dedicated carriers and the \
+             variable-size one went back to the OS"
+        );
+        assert_eq!(done.carriers, baseline.carriers + 1);
+        assert_eq!(done.carriers, done.sbc_carriers + done.mbc_carriers);
+        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+    }
+
+    #[test]
+    fn dealloc_accounts_for_the_released_mid_blocks_own_size_not_the_coalesced_extent() {
+        let alloc = allocator();
+        let ty = type_id("HEAP");
+        let l = layout(2000, MIN_ALIGN);
+        let first = alloc.alloc_typed(ty, l).expect("first");
+        let middle = alloc.alloc_typed(ty, l).expect("middle");
+        let last = alloc.alloc_typed(ty, l).expect("last");
+        // A mid request is accounted for the block its header records: the request
+        // rounded up to `UNIT_SIZE` plus the block header.
+        // SAFETY: `middle` is a live block of a pooled variable-size carrier, so its
+        // header sits `BLOCK_HEADER_SIZE` below its payload.
+        let own = unsafe { FreeList::block_size(middle.as_ptr()) };
+        assert_eq!(own, BLOCK_HEADER_SIZE + 2000);
+        assert_eq!(alloc.stats().live_bytes, 3 * own);
+        assert_eq!(alloc.type_stats(ty).bytes, 3 * own);
+
+        // Free the middle block *after* its predecessor, so the two coalesce: the
+        // accounting must still owe exactly the middle block's own size.
+        // SAFETY: `first` is live and freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, first, l) };
+        assert_eq!(alloc.stats().live_bytes, 2 * own);
+        // SAFETY: `middle` is live and freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, middle, l) };
+        // SAFETY: the merged free block starts where `first`'s block did, so its header
+        // is the one `crate::mbc` rewrote while coalescing.
+        let merged = unsafe { FreeList::block_size(first.as_ptr()) };
+        assert_eq!(merged, 2 * own, "the two blocks coalesced into one");
+        assert_eq!(
+            alloc.stats().live_bytes,
+            own,
+            "the accounting owes the released block's own size, never the merged extent"
+        );
+        assert_eq!(alloc.type_stats(ty).bytes, own);
+
+        // The last free coalesces the whole carrier and releases it.
+        // SAFETY: `last` is live and freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, last, l) };
+        let done = alloc.stats();
+        assert_eq!(done.live_blocks, 0);
+        assert_eq!(done.live_bytes, 0);
+        assert_eq!(done.carriers, 0);
+        assert_eq!(done.sbc_carriers, 0);
+        assert_eq!(done.mbc_carriers, 0);
+        assert_eq!(done.carrier_bytes, 0);
+        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+    }
+
+    #[test]
+    fn a_live_mid_block_with_a_free_predecessor_is_still_recognised_by_the_unsized_probe() {
+        let alloc = allocator();
+        let ty = type_id("MSG");
+        let l = layout(2000, MIN_ALIGN);
+        let first = alloc.alloc_typed(ty, l).expect("first");
+        let second = alloc.alloc_typed(ty, l).expect("second");
+        let third = alloc.alloc_typed(ty, l).expect("third");
+        // SAFETY: `second` is a live block, so its header sits below its payload.
+        let own = unsafe { FreeList::block_size(second.as_ptr()) };
+
+        // Releasing the first block leaves `second` **live** with a free predecessor, so
+        // its own header carries the `prev_free` block-*state* bit (bit 7), which is
+        // outside `block::ALL_FLAGS`. `plausible_header` has to tolerate that bit:
+        // refusing it would make the unsized probe skip a legitimately live block (and
+        // `dealloc` refuse it too), leaking it.
+        // SAFETY: `first` is live and freed exactly once.
+        unsafe { alloc.dealloc_typed(ty, first, l) };
+        // SAFETY: `second` is live, so its header is readable at its block start.
+        let header = unsafe { BlockHeader::load(second.as_ptr().sub(BLOCK_HEADER_SIZE)) };
+        let flags = BlockFlags::from_bits(header.flags);
+        assert!(
+            flags.is_prev_free(),
+            "the block-state bit must be set for this test to exercise the hazard"
+        );
+        assert_eq!(header.flags & ALL_FLAGS, 0, "and it is no taxonomy bit");
+
+        // The probe's first candidate is the block's own (offset-0) header, so the block
+        // is freed — and coalesces with the free predecessor.
+        // SAFETY: `second` is live and freed exactly once.
+        unsafe { alloc.dealloc_unsized(ty, second) };
+        let after = alloc.stats();
+        assert_eq!(after.live_blocks, 1);
+        assert_eq!(
+            after.live_bytes, own,
+            "the released block was accounted for by its own size"
+        );
+        assert_eq!(alloc.type_stats(ty).bytes, own);
+
+        // SAFETY: `third` is live and freed exactly once.
+        unsafe { alloc.dealloc_unsized(ty, third) };
+        let done = alloc.stats();
+        assert_eq!(done.live_blocks, 0);
+        assert_eq!(done.live_bytes, 0);
+        assert_eq!(
+            done.carriers, 0,
+            "the whole carrier coalesced and went back"
+        );
+        assert_eq!(done.sbc_carriers, 0);
+        assert_eq!(done.mbc_carriers, 0);
+        assert_eq!(done.carrier_bytes, 0);
+        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+    }
     #[test]
     fn allocator_info_lists_the_rows_of_every_type_bound_to_the_allocator() {
         use crate::stats::InfoValue;
@@ -1961,7 +2523,11 @@ mod tests {
             let expected = alloc.type_stats(type_id(name));
             assert_eq!(row[1].value, InfoValue::U64(expected.blocks), "{name}");
             assert_eq!(row[2].value, InfoValue::Usize(expected.bytes), "{name}");
-            assert_eq!(row[3].value, InfoValue::Usize(expected.peak_bytes), "{name}");
+            assert_eq!(
+                row[3].value,
+                InfoValue::Usize(expected.peak_bytes),
+                "{name}"
+            );
             if expected.blocks > 0 {
                 non_zero += 1;
                 assert_eq!(name, "HEAP");
