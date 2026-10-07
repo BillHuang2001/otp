@@ -241,6 +241,28 @@ pub trait DictHook {
     ///
     /// Reports a store failure as a [`BeamError`].
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>>;
+
+    /// `get/0` — every `{Key, Value}` pair in the store, in the store's order.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to a typed `unsupported_bif` capability gap: a hook written
+    /// before this method existed must keep compiling, and the BIF reports the
+    /// gap rather than inventing an empty dictionary.
+    fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Err(crate::error::unsupported_bif())
+    }
+
+    /// `erase/0` — empties the store, returning every `{Key, Value}` pair it
+    /// held, in the store's order.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to a typed `unsupported_bif` capability gap (see
+    /// [`DictHook::get_all`]).
+    fn erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Err(crate::error::unsupported_bif())
+    }
 }
 
 /// The structured failure of a NIF-load attempt.
@@ -376,6 +398,33 @@ pub trait LocalFunIdentity {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>>;
 }
 
+/// Supplies the loaded-module information `erlang:get_module_info/1,2` renders.
+///
+/// A module's introspection data (`exports`, `attributes`, `compile`, `md5`,
+/// `native`, …) lives with the *loaded* `beam_loader::Module` owned by the
+/// runtime's code server — Stage-5 state that no BIF can reach. The concrete
+/// provider there implements this hook and builds the requested item's term on
+/// the caller's heap; the BIF layer itself owns only the argument decoding and
+/// the oracle's `badarg` for an unknown module/item. With no hook installed,
+/// [`BifContext::module_info`] reports a typed `unsupported_bif` capability gap
+/// — never a fabricated or empty value (workspace `CONTEXT.md` §3).
+pub trait ModuleInfo {
+    /// The value of `item` for `module`, built on `heap`, or `Ok(None)` when the
+    /// module or item is unknown (the BIF then raises `badarg`, as the oracle
+    /// does).
+    ///
+    /// # Errors
+    ///
+    /// Reports a resolution/allocation failure as a [`BeamError`].
+    fn module_info(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        module: &str,
+        item: &str,
+    ) -> Result<Option<Eterm>>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -393,6 +442,7 @@ pub struct BifContext<'a> {
     record_source: Option<&'a mut dyn RecordSource>,
     local_node: Option<&'a mut dyn LocalNode>,
     fun_identity: Option<&'a mut dyn LocalFunIdentity>,
+    module_info: Option<&'a mut dyn ModuleInfo>,
 }
 
 impl<'a> BifContext<'a> {
@@ -415,6 +465,7 @@ impl<'a> BifContext<'a> {
             record_source: None,
             local_node: None,
             fun_identity: None,
+            module_info: None,
         }
     }
 
@@ -483,6 +534,13 @@ impl<'a> BifContext<'a> {
     /// (`make_fun3`) fun with `term_to_binary`.
     pub fn with_local_fun_identity(mut self, hook: &'a mut dyn LocalFunIdentity) -> Self {
         self.fun_identity = Some(hook);
+        self
+    }
+
+    /// Installs the loaded-module-information hook used by
+    /// `erlang:get_module_info/1,2`.
+    pub fn with_module_info(mut self, source: &'a mut dyn ModuleInfo) -> Self {
+        self.module_info = Some(source);
         self
     }
 
@@ -596,6 +654,23 @@ impl<'a> BifContext<'a> {
         match self.fun_identity.as_deref_mut() {
             Some(hook) => hook.local_fun_identity(term),
             None => Ok(None),
+        }
+    }
+
+    /// The loaded module `module`'s introspection item `item`, built on the
+    /// context heap — the seam behind `erlang:get_module_info/1,2`.
+    ///
+    /// `Ok(None)` means the module or the item is unknown (the BIF renders the
+    /// oracle's `badarg`).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no
+    /// [`ModuleInfo`] hook; otherwise propagates the hook's own failure.
+    pub fn module_info(&mut self, module: &str, item: &str) -> Result<Option<Eterm>> {
+        match self.module_info.as_deref_mut() {
+            Some(hook) => hook.module_info(self.heap, self.atoms, module, item),
+            None => Err(crate::error::unsupported_bif()),
         }
     }
 
@@ -731,6 +806,37 @@ impl<'a> BifContext<'a> {
     pub fn dict_get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
         match self.dict.as_deref_mut() {
             Some(hook) => hook.get_keys_for_value(value),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every `{Key, Value}` pair of the process dictionary through the installed
+    /// [`DictHook`] — the seam behind `erlang:get/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook (or its
+    /// hook leaves [`DictHook::get_all`] at its default); otherwise propagates
+    /// the hook's own failure.
+    pub fn dict_get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.get_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Empties the process dictionary through the installed [`DictHook`],
+    /// returning every `{Key, Value}` pair it held — the seam behind
+    /// `erlang:erase/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook (or its
+    /// hook leaves [`DictHook::erase_all`] at its default); otherwise propagates
+    /// the hook's own failure.
+    pub fn dict_erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.erase_all(),
             None => Err(crate::error::unsupported_bif()),
         }
     }
