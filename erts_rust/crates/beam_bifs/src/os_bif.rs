@@ -671,10 +671,16 @@ mod tests {
         let atoms = seeded_atoms();
         let mut ctx = context(&mut heap, &atoms);
 
-        let seconds = os_unit(&mut ctx, ctx.atom("seconds").unwrap()).expect("seconds");
-        let milli = os_unit(&mut ctx, ctx.atom("milli_seconds").unwrap()).expect("ms");
-        let native = os_unit(&mut ctx, ctx.atom("native").unwrap()).expect("native");
-        let perf = os_unit(&mut ctx, ctx.atom("perf_counter").unwrap()).expect("perf");
+        // The constructor calls are hoisted: an inline `ctx.atom(..)` argument
+        // to an explicit `&mut ctx` reborrow is not a two-phase borrow.
+        let seconds_unit = ctx.atom("seconds").unwrap();
+        let seconds = os_unit(&mut ctx, seconds_unit).expect("seconds");
+        let milli_unit = ctx.atom("milli_seconds").unwrap();
+        let milli = os_unit(&mut ctx, milli_unit).expect("ms");
+        let native_unit = ctx.atom("native").unwrap();
+        let native = os_unit(&mut ctx, native_unit).expect("native");
+        let perf_unit = ctx.atom("perf_counter").unwrap();
+        let perf = os_unit(&mut ctx, perf_unit).expect("perf");
         assert_eq!(seconds.per_second, 1);
         assert_eq!(milli.per_second, 1_000);
         assert_eq!(native.per_second, 1_000_000_000);
@@ -684,12 +690,14 @@ mod tests {
         assert_eq!(seconds.convert(1_500_000_000), 1);
 
         // A positive integer is a unit; zero/negative/non-integer are `badarg`.
-        assert_eq!(os_unit(&mut ctx, ctx.int(1000).unwrap()).expect("1000").per_second, 1_000);
+        let thousand = ctx.int(1000).unwrap();
+        assert_eq!(os_unit(&mut ctx, thousand).expect("1000").per_second, 1_000);
         for bad in [ctx.int(0).unwrap(), ctx.int(-1).unwrap(), ctx.atom("fortnight").unwrap()] {
             assert!(matches!(os_unit(&mut ctx, bad), Err(BeamError::BadArg)));
         }
         // A float is `badarg`; a bignum is a typed unsupported.
-        assert!(matches!(os_unit(&mut ctx, ctx.make_float(1.0).unwrap()), Err(BeamError::BadArg)));
+        let one_float = ctx.make_float(1.0).unwrap();
+        assert!(matches!(os_unit(&mut ctx, one_float), Err(BeamError::BadArg)));
         let big = {
             let limbs = [0u64, 1u64]; // 2^64, far past the 60-bit small range
             arith::int_from_mag(&mut ctx, false, &limbs).expect("a bignum")
@@ -697,7 +705,8 @@ mod tests {
         assert!(matches!(os_unit(&mut ctx, big), Err(BeamError::Raise(_))));
 
         // The huge-unit result promotes to a bignum.
-        let huge = os_unit(&mut ctx, ctx.int(1_000_000_000_000).unwrap()).expect("1e12");
+        let twelve = ctx.int(1_000_000_000_000).unwrap();
+        let huge = os_unit(&mut ctx, twelve).expect("1e12");
         let value = huge.convert(1_700_000_000_000_000_000);
         assert!(value > i64::MAX as i128);
         let promoted = int_from_i128(&mut ctx, value).expect("promotes");
@@ -709,7 +718,16 @@ mod tests {
 
     #[test]
     fn env_round_trip_and_badarg_shapes() {
-        let mut heap = heap();
+        // `os:env/0` renders the **whole ambient environment** (the same
+        // `std::env::vars_os()` set [`env_table`] imports) as char lists:
+        // roughly two heap words per byte, plus a 2-tuple and a cons cell per
+        // entry. That is far past the small default test heap, so size this
+        // heap from the live environment instead of a fixed guess.
+        let (env_bytes, env_entries) =
+            std::env::vars_os().fold((0usize, 0usize), |(bytes, entries), (k, v)| {
+                (bytes + k.len() + v.len(), entries + 1)
+            });
+        let mut heap = Heap::new(2 * env_bytes + 8 * env_entries + 4096).expect("test heap");
         let atoms = seeded_atoms();
         let mut ctx = context(&mut heap, &atoms);
 

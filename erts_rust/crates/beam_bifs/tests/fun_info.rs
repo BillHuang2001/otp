@@ -80,11 +80,15 @@ fn seeded_atoms() -> AtomTable {
         "name",
         "md5",
         "nargs",
+        "id",
+        "calls",
+        // The empty atom `''` is a valid (non-item) atom name.
+        "",
     ]);
     atoms
 }
 
-fn ctx<'a>(heap: &'a mut Heap, atoms: &'a AtomTable) -> BifContext<'a> {
+fn make_ctx<'a>(heap: &'a mut Heap, atoms: &'a AtomTable) -> BifContext<'a> {
     BifContext::new(heap, atoms, ProcessId::new(1, 0))
 }
 
@@ -121,23 +125,35 @@ fn pair_value(
     elem(reg, ctx, term, 2)
 }
 
-fn call(
-    reg: &BifRegistry,
-    ctx: &mut BifContext<'_>,
-    name: &str,
-    args: &[Eterm],
-) -> Result<Eterm> {
+fn call(reg: &BifRegistry, ctx: &mut BifContext<'_>, name: &str, args: &[Eterm]) -> Result<Eterm> {
     let arity = args.len() as u32;
     reg.call("erlang", name, arity, ctx, args)
 }
 
+/// Structural term equality: `assert_eq!` on a boxed `Eterm` compares by
+/// *address*, so two separately built but identical terms (e.g. two
+/// `{lists,reverse,1}` tuples) are never equal that way. This is the oracle's
+/// `=:=` (`beam_term::compare::eq`).
+fn assert_eq_term(atoms: &AtomTable, got: Eterm, expected: Eterm, what: &str) {
+    assert!(
+        beam_term::compare::eq(got, expected, atoms),
+        "{what}: the returned term is not the expected one"
+    );
+}
+
+/// Asserts the call failed with the crate's typed `unsupported_bif` raise (the
+/// documented gap for the local-fun identity items), never a wrong value and
+/// never some other failure. `BeamError` has no `Unsupported` variant: the
+/// typed gap is a `Raise` whose reason atom is `unsupported_bif`.
+fn assert_unsupported_bif(result: Result<Eterm>, what: &str) {
+    match result {
+        Err(ref err) if err.as_atom() == Some("unsupported_bif") => {}
+        other => panic!("{what}: expected unsupported_bif, got {other:?}"),
+    }
+}
+
 /// `fun_info(F, Item)` with the item interned from `item`.
-fn fun_info(
-    reg: &BifRegistry,
-    ctx: &mut BifContext<'_>,
-    fun: Eterm,
-    item: &str,
-) -> Result<Eterm> {
+fn fun_info(reg: &BifRegistry, ctx: &mut BifContext<'_>, fun: Eterm, item: &str) -> Result<Eterm> {
     let item = ctx.atom(item).expect("seeded item atom");
     call(reg, ctx, "fun_info", &[fun, item])
 }
@@ -187,7 +203,7 @@ fn imported_fun(
 ) -> Eterm {
     let module = ctx.atom(module).expect("seeded module");
     let creator = FunPid {
-        node: ctx.atom("nonode@nohost").expect("seeded node"),
+        node: atom_val(ctx.atom("nonode@nohost").expect("seeded node")),
         number: 1,
         serial: 2,
         creation: 3,
@@ -215,66 +231,40 @@ fn fun_info_2_external_items_match_the_oracle() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let fun = external_fun(&mut ctx, 1, "lists", "reverse");
 
     // Oracle: `fun_info(fun lists:reverse/1, type)` = {type,external}.
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "type").expect("type"),
-        "type",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "type").expect("type");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "type");
     assert_eq!(atom_name(&atoms, value), "external");
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "module").expect("module"),
-        "module",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "module").expect("module");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "module");
     assert_eq!(atom_name(&atoms, value), "lists");
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "name").expect("name"),
-        "name",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "name").expect("name");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "name");
     assert_eq!(atom_name(&atoms, value), "reverse");
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "arity").expect("arity"),
-        "arity",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "arity").expect("arity");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
     assert_eq!(signed_value(value), 1);
 
     // `{env,[]}`.
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "env").expect("env"),
-        "env",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "env").expect("env");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "env");
     assert_eq!(value, NIL, "an external fun has no environment");
 
     // `{refc,undefined}` and the four never-set identity items, all `undefined`.
     for item in ["refc", "new_index", "new_uniq", "index", "uniq"] {
-        let value = pair_value(
-            &reg,
-            &mut ctx,
-            &atoms,
-            fun_info(&reg, &mut ctx, fun, item).expect(item),
-            item,
+        let info = fun_info(&reg, &mut ctx, fun, item).expect(item);
+        let value = pair_value(&reg, &mut ctx, &atoms, info, item);
+        assert_eq!(
+            atom_name(&atoms, value),
+            "undefined",
+            "{item} of an external fun"
         );
-        assert_eq!(atom_name(&atoms, value), "undefined", "{item} of an external fun");
     }
 }
 
@@ -287,61 +277,41 @@ fn fun_info_2_local_kind_independent_items_match_the_oracle() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let seven = ctx.int(7).expect("7 fits");
     let (_storage, fun) = local_fun(1, 85002344, 1, &[seven]);
 
     // Oracle (fiprobe:mk(7)): {type,local}, {arity,1}, {env,[7]}, {refc,1}.
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "type").expect("type"),
-        "type",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "type").expect("type");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "type");
     assert_eq!(atom_name(&atoms, value), "local");
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "arity").expect("arity"),
-        "arity",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "arity").expect("arity");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
     assert_eq!(signed_value(value), 1);
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "refc").expect("refc"),
-        "refc",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "refc").expect("refc");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "refc");
     assert_eq!(signed_value(value), 1);
 
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "env").expect("env"),
-        "env",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "env").expect("env");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "env");
     assert_eq!(
         reg.call("erlang", "length", 1, &mut ctx, &[value])
             .expect("length/1"),
         make_small(1)
     );
-    assert_eq!(signed_value(elem(&reg, &mut ctx, value, 1)), 7);
+    // The environment is the *list* `[7]`, so its single free variable is the
+    // list's head.
+    let head = reg
+        .call("erlang", "hd", 1, &mut ctx, &[value])
+        .expect("hd/1 of the env list");
+    assert_eq!(signed_value(head), 7);
 
     // A closure with no free variables reports `{env,[]}` (fiprobe:mk/0).
     let (_storage0, fun0) = local_fun(1, 85002344, 0, &[]);
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun0, "env").expect("env"),
-        "env",
-    );
+    let info = fun_info(&reg, &mut ctx, fun0, "env").expect("env");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "env");
     assert_eq!(value, NIL);
 }
 
@@ -350,7 +320,7 @@ fn fun_info_2_local_identity_items_are_the_documented_typed_gap() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let (_storage, fun) = local_fun(1, 85002344, 1, &[]);
 
     // The oracle answers `{module,fiprobe}`, `{name,'-mk/1-fun-0-'}`,
@@ -358,12 +328,9 @@ fn fun_info_2_local_identity_items_are_the_documented_typed_gap() {
     // M1 inlined descriptor carries none of those `ErlFunEntry` fields, so the
     // honest answer is a typed gap — never a fabricated module/MD5/index.
     for item in ["module", "name", "new_index", "new_uniq", "index", "uniq"] {
-        assert!(
-            matches!(
-                fun_info(&reg, &mut ctx, fun, item),
-                Err(BeamError::Unsupported { .. })
-            ),
-            "fun_info(LocalFun, {item}) must be the typed unsupported gap"
+        assert_unsupported_bif(
+            fun_info(&reg, &mut ctx, fun, item),
+            &format!("fun_info(LocalFun, {item})"),
         );
     }
 }
@@ -373,45 +340,27 @@ fn fun_info_2_imported_fun_is_a_local_fun_with_the_identity_items_gapped() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let uniq = [1u8; 16];
     let fun = imported_fun(&mut ctx, 1, "fiprobe", &uniq, 1, 1, 85002344, &[]);
 
     // A `NEW_FUN_EXT`-decoded fun is a *local* fun in the C
     // (`MAKE_FUN_HEADER(arity, num_free, 0)`, `external.c:5127`), so the oracle
     // reports `{type,local}` and `{refc,1}` for it.
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "type").expect("type"),
-        "type",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "type").expect("type");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "type");
     assert_eq!(atom_name(&atoms, value), "local");
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "refc").expect("refc"),
-        "refc",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "refc").expect("refc");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "refc");
     assert_eq!(signed_value(value), 1);
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, fun, "arity").expect("arity"),
-        "arity",
-    );
+    let info = fun_info(&reg, &mut ctx, fun, "arity").expect("arity");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
     assert_eq!(signed_value(value), 1);
 
     for item in ["module", "name", "new_index", "new_uniq", "index", "uniq"] {
-        assert!(
-            matches!(
-                fun_info(&reg, &mut ctx, fun, item),
-                Err(BeamError::Unsupported { .. })
-            ),
-            "fun_info(ImportedFun, {item}) must be the typed unsupported gap"
+        assert_unsupported_bif(
+            fun_info(&reg, &mut ctx, fun, item),
+            &format!("fun_info(ImportedFun, {item})"),
         );
     }
 }
@@ -425,30 +374,19 @@ fn fun_info_2_unknown_items_and_non_atoms_are_badarg() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let fun = external_fun(&mut ctx, 1, "lists", "reverse");
 
     // Oracle: `function` is *not* a `fun_info` item (`badarg`), and neither are
-    // the other OTP-30/`~p` spellings.
+    // the other OTP-30/`~p` spellings, nor the empty atom `''` (probed with
+    // `erl -noshell -eval 'erlang:fun_info(fun lists:reverse/1, '')'` ⇒
+    // `error:badarg`). Every name below is seeded, so each resolves to a real
+    // atom term.
     for item in ["function", "md5", "nargs", "foo", "id", "calls", ""] {
-        let item_term = ctx.intern_atom(item).unwrap_or_else(|_| {
-            // The empty atom name is seeded only when the table has it.
-            ctx.atom("ok").expect("seeded")
-        });
-        let item_term = if item.is_empty() {
-            // `''` — seed it on the fly through the raw atom index path: build it
-            // by interning; without an interner it is absent, and a missing name
-            // is `badarg` anyway, so any *other* atom is a valid substitute only
-            // if it is not an item. Use `md5` for the empty case instead.
-            ctx.atom("md5").expect("seeded")
-        } else {
-            item_term
-        };
+        let item_term = ctx.atom(item).expect("seeded item atom");
+        let result = call(&reg, &mut ctx, "fun_info", &[fun, item_term]);
         assert!(
-            matches!(
-                call(&reg, &mut ctx, "fun_info", &[fun, item_term]),
-                Err(BeamError::BadArg)
-            ),
+            matches!(result, Err(BeamError::BadArg)),
             "fun_info(F, {item}) must be badarg"
         );
     }
@@ -473,7 +411,7 @@ fn fun_info_2_a_non_fun_is_badarg() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let item = ctx.atom("type").expect("seeded");
     let tuple = ctx.tuple(&[item]).expect("fits");
 
@@ -493,7 +431,7 @@ fn fun_info_2_reuses_the_item_argument_as_element_one() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let fun = external_fun(&mut ctx, 1, "lists", "reverse");
     let item = ctx.atom("type").expect("seeded");
 
@@ -511,7 +449,7 @@ fn fun_info_mfa_1_matches_the_oracle() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
 
     // Oracle: `fun_info_mfa(fun lists:reverse/1)` = {lists,reverse,1}.
     let fun = external_fun(&mut ctx, 1, "lists", "reverse");
@@ -529,20 +467,18 @@ fn fun_info_mfa_1_matches_the_oracle() {
     assert_eq!(signed_value(elem(&reg, &mut ctx, result, 3)), 1);
 
     // A `make_fun/3` external fun is the same term (oracle: `=:=` is true).
-    let made = call(
-        &reg,
-        &mut ctx,
-        "make_fun",
-        &[
-            ctx.atom("lists").expect("seeded"),
-            ctx.atom("reverse").expect("seeded"),
-            make_small(1),
-        ],
-    )
-    .expect("make_fun/3");
-    assert_eq!(
-        call(&reg, &mut ctx, "fun_info_mfa", &[made]).expect("mfa"),
-        result
+    let (m, f) = (
+        ctx.atom("lists").expect("seeded"),
+        ctx.atom("reverse").expect("seeded"),
+    );
+    let made = call(&reg, &mut ctx, "make_fun", &[m, f, make_small(1)]).expect("make_fun/3");
+    // ... whose `fun_info_mfa/1` is the same `{lists,reverse,1}` (oracle: `=:=`).
+    let made_mfa = call(&reg, &mut ctx, "fun_info_mfa", &[made]).expect("mfa");
+    assert_eq_term(
+        &atoms,
+        made_mfa,
+        result,
+        "fun_info_mfa/1 of a make_fun/3 fun",
     );
 
     // A non-fun is `badarg`; a local fun is the documented typed gap.
@@ -553,10 +489,10 @@ fn fun_info_mfa_1_matches_the_oracle() {
         ));
     }
     let (_storage, local) = local_fun(1, 85002344, 1, &[]);
-    assert!(matches!(
+    assert_unsupported_bif(
         call(&reg, &mut ctx, "fun_info_mfa", &[local]),
-        Err(BeamError::Unsupported { .. })
-    ));
+        "fun_info_mfa/1 of a local fun",
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -588,7 +524,7 @@ fn fun_to_list_1_external_matches_the_oracle() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let fun = external_fun(&mut ctx, 1, "lists", "reverse");
 
     // Oracle: erlang:fun_to_list(fun lists:reverse/1) = "fun lists:reverse/1".
@@ -597,17 +533,11 @@ fn fun_to_list_1_external_matches_the_oracle() {
 
     // ... and an arity-0 fun (oracle: make_fun(lists,reverse,0) ⇒
     // "fun lists:reverse/0").
-    let zero = call(
-        &reg,
-        &mut ctx,
-        "make_fun",
-        &[
-            ctx.atom("lists").expect("seeded"),
-            ctx.atom("reverse").expect("seeded"),
-            make_small(0),
-        ],
-    )
-    .expect("make_fun/3");
+    let (m, f) = (
+        ctx.atom("lists").expect("seeded"),
+        ctx.atom("reverse").expect("seeded"),
+    );
+    let zero = call(&reg, &mut ctx, "make_fun", &[m, f, make_small(0)]).expect("make_fun/3");
     let text = call(&reg, &mut ctx, "fun_to_list", &[zero]).expect("fun_to_list");
     assert_eq!(list_to_string(&reg, &mut ctx, text), "fun lists:reverse/0");
 }
@@ -618,7 +548,7 @@ fn fun_to_list_1_quotes_atoms_like_the_c_printer() {
     let mut atoms = seeded_atoms();
     atoms.seed(["a-esc", "with@at", "'a\\'b'"]);
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
 
     // The C `FUN_DEF` printer uses `print_atom_name`, whose `IS_ALNUM` excludes
     // `@` — so `nonode@nohost` is quoted here even though `io_lib:format("~p",…)`
@@ -644,16 +574,16 @@ fn fun_to_list_1_gaps_a_local_fun_and_badargs_a_non_fun() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
 
     // The oracle renders a local fun as `#Fun<Module.OldIndex.OldUniq>` (e.g.
     // "#Fun<fiprobe.1.85002344>") — a triple the inlined descriptor cannot
     // supply, so this is the documented typed gap rather than a wrong string.
     let (_storage, local) = local_fun(1, 85002344, 1, &[]);
-    assert!(matches!(
+    assert_unsupported_bif(
         call(&reg, &mut ctx, "fun_to_list", &[local]),
-        Err(BeamError::Unsupported { .. })
-    ));
+        "fun_to_list/1 of a local fun",
+    );
 
     for non_fun in [make_small(42), NIL] {
         assert!(matches!(
@@ -672,48 +602,46 @@ fn make_fun_3_matches_the_oracle() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let lists = ctx.atom("lists").expect("seeded");
     let reverse = ctx.atom("reverse").expect("seeded");
 
-    let made = call(&reg, &mut ctx, "make_fun", &[lists, reverse, make_small(1)]).expect("make_fun");
+    let made =
+        call(&reg, &mut ctx, "make_fun", &[lists, reverse, make_small(1)]).expect("make_fun");
 
     // Oracle: `erlang:make_fun(lists,reverse,1)` =:= `fun lists:reverse/1` — in
-    // this layout both are the same 3-word `EXPORT_EXT` block.
+    // this layout both are the same 3-word `EXPORT_EXT` block. (`assert_eq!` on a
+    // boxed `Eterm` compares *addresses*, so the comparison is structural, i.e.
+    // the oracle's `=:=`.)
     let literal = external_fun(&mut ctx, 1, "lists", "reverse");
-    assert_eq!(made, literal);
+    assert_eq_term(&atoms, made, literal, "make_fun/3 vs the export lambda");
 
     // Oracle: `{type,external}`, `{name,reverse}`, `{module,lists}`, `{arity,1}`.
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, made, "type").expect("type"),
-        "type",
-    );
+    let info = fun_info(&reg, &mut ctx, made, "type").expect("type");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "type");
     assert_eq!(atom_name(&atoms, value), "external");
-    let value = pair_value(
-        &reg,
-        &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, made, "name").expect("name"),
-        "name",
-    );
+    let info = fun_info(&reg, &mut ctx, made, "name").expect("name");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "name");
     assert_eq!(atom_name(&atoms, value), "reverse");
 
     // Oracle: the maximum arity 255 is accepted, 256 is `badarg` (`bif.c:4486`).
-    let max = call(&reg, &mut ctx, "make_fun", &[lists, reverse, make_small(255)])
-        .expect("255 is a valid arity");
-    let value = pair_value(
+    let max = call(
         &reg,
         &mut ctx,
-        &atoms,
-        fun_info(&reg, &mut ctx, max, "arity").expect("arity"),
-        "arity",
-    );
+        "make_fun",
+        &[lists, reverse, make_small(255)],
+    )
+    .expect("255 is a valid arity");
+    let info = fun_info(&reg, &mut ctx, max, "arity").expect("arity");
+    let value = pair_value(&reg, &mut ctx, &atoms, info, "arity");
     assert_eq!(signed_value(value), 255);
     assert!(matches!(
-        call(&reg, &mut ctx, "make_fun", &[lists, reverse, make_small(256)]),
+        call(
+            &reg,
+            &mut ctx,
+            "make_fun",
+            &[lists, reverse, make_small(256)]
+        ),
         Err(BeamError::BadArg)
     ));
 
@@ -722,25 +650,15 @@ fn make_fun_3_matches_the_oracle() {
     let mut atoms2 = atoms;
     atoms2.seed(["no_such_mod", "no_such_fun"]);
     let mut heap2 = Heap::new(4096).expect("test heap");
-    let mut ctx2 = ctx(&mut heap2, &atoms2);
-    let made = call(
-        &reg,
-        &mut ctx2,
-        "make_fun",
-        &[
-            ctx2.atom("no_such_mod").expect("seeded"),
-            ctx2.atom("no_such_fun").expect("seeded"),
-            make_small(1),
-        ],
-    )
-    .expect("no existence check");
-    let value = pair_value(
-        &reg,
-        &mut ctx2,
-        &atoms2,
-        fun_info(&reg, &mut ctx2, made, "module").expect("module"),
-        "module",
+    let mut ctx2 = make_ctx(&mut heap2, &atoms2);
+    let (m2, f2) = (
+        ctx2.atom("no_such_mod").expect("seeded"),
+        ctx2.atom("no_such_fun").expect("seeded"),
     );
+    let made =
+        call(&reg, &mut ctx2, "make_fun", &[m2, f2, make_small(1)]).expect("no existence check");
+    let info = fun_info(&reg, &mut ctx2, made, "module").expect("module");
+    let value = pair_value(&reg, &mut ctx2, &atoms2, info, "module");
     assert_eq!(atom_name(&atoms2, value), "no_such_mod");
 }
 
@@ -749,7 +667,7 @@ fn make_fun_3_badargs() {
     let reg = default_registry();
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
     let lists = ctx.atom("lists").expect("seeded");
     let reverse = ctx.atom("reverse").expect("seeded");
 
@@ -759,11 +677,11 @@ fn make_fun_3_badargs() {
     let float = ctx.make_float(1.0).expect("fits");
     let list = ctx.list(&[make_small(49)]).expect("fits");
     let bads: [(Eterm, Eterm, Eterm); 8] = [
-        (one, reverse, one),           // make_fun(1, reverse, 1)
-        (lists, one, one),             // make_fun(lists, 1, 1)
-        (lists, reverse, float),       // make_fun(lists, reverse, 1.0)
-        (lists, reverse, list),        // make_fun(lists, reverse, "1")
-        (lists, reverse, NIL),         // make_fun(lists, reverse, [])
+        (one, reverse, one),     // make_fun(1, reverse, 1)
+        (lists, one, one),       // make_fun(lists, 1, 1)
+        (lists, reverse, float), // make_fun(lists, reverse, 1.0)
+        (lists, reverse, list),  // make_fun(lists, reverse, "1")
+        (lists, reverse, NIL),   // make_fun(lists, reverse, [])
         (lists, reverse, make_small(-1)),
         (lists, reverse, make_small(256)),
         (lists, reverse, make_small(1_000_000)),
@@ -820,7 +738,7 @@ fn the_fun_info_bifs_are_registered() {
 fn the_three_fun_kinds_are_distinguished() {
     let atoms = seeded_atoms();
     let mut heap = Heap::new(4096).expect("test heap");
-    let mut ctx = ctx(&mut heap, &atoms);
+    let mut ctx = make_ctx(&mut heap, &atoms);
 
     let external = external_fun(&mut ctx, 1, "lists", "reverse");
     assert_eq!(
