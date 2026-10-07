@@ -59,7 +59,10 @@ use std::rc::Rc;
 use std::sync::Arc;
 
 use beam_abi::nif::loader::NifCallError;
-use beam_bifs::{AtomInterner, BifContext, DictHook, FunCaller, OutputSink};
+use beam_bifs::{
+    AtomInterner, BifContext, DictHook, FunCaller, LocalNode, OutputSink, RecordDefinitionView,
+    RecordFieldView, RecordSource,
+};
 use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine};
 use beam_loader::Module;
@@ -67,6 +70,7 @@ use beam_message::{Message, Queue};
 use beam_process::{ProcessId, ProcessTable};
 use beam_term::{Atom, AtomTable, Eterm};
 
+use crate::codeserver::CodeServer;
 use crate::error;
 use crate::mailbox::MailboxState;
 use crate::nif::{NifEntry, NifHostImpl};
@@ -444,6 +448,16 @@ impl<'a> RuntimeContext<'a> {
         // Whether this is `erlang:load_nif/2`, which needs the NIF-loading bridge (also a
         // `&mut Runtime` borrow, and therefore a third mutually exclusive arm).
         let uses_nif_loader = Self::uses_nif_loader(module, function, arity);
+        // Whether this is `records:get_definition/2`, which needs the record-source bridge
+        // (a `&CodeServer` borrow, and therefore a fourth mutually exclusive arm).
+        let uses_record_source = Self::uses_record_source(module, function, arity);
+        // The local-node identity: `nonode@nohost` with creation 0 (the M1 runtime has no
+        // distribution), read from the shared table *before* it is borrowed by the context.
+        // Both fields are `Copy`, so this hook needs no runtime borrow at all and every arm
+        // below can install it (see [`NodeIdentity`]).
+        let mut local_node = NodeIdentity {
+            node: atoms.lookup("nonode@nohost"),
+        };
         // The caller's module name, cloned out *before* `self` is destructured: it outlives
         // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
         // the owner), and it is forwarded to both the NIF bridge and the nested fun bridge.
@@ -495,7 +509,8 @@ impl<'a> RuntimeContext<'a> {
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
-                    .with_port_hook(&mut ports);
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -519,7 +534,28 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_nif_loader(&mut bridge)
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
-                    .with_port_hook(&mut ports);
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
+                if let Some(sink) = output.as_mut() {
+                    context = context.with_output(sink);
+                }
+                if let Some(tables) = tables.as_deref_mut() {
+                    context = context.with_tables(tables);
+                }
+                registry.call(module, function, arity, &mut context, args)
+            } else if uses_record_source {
+                // `records:get_definition/2` answers from the *loaded module's* `Recs` chunk,
+                // which lives in the code server's module map — a `&CodeServer` borrow, so it
+                // is its own mutually exclusive arm (see [`RecordBridge`]). The BIF applies no
+                // fun argument and touches no dictionary, so nothing is lost.
+                let mut source = RecordBridge {
+                    code_server: &runtime.code_server,
+                };
+                let mut context = BifContext::new(&mut heap, &atoms, self_pid)
+                    .with_atom_interner(&mut pending)
+                    .with_record_source(&mut source)
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -542,7 +578,8 @@ impl<'a> RuntimeContext<'a> {
                 let mut context = BifContext::new(&mut heap, &atoms, self_pid)
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
-                    .with_port_hook(&mut ports);
+                    .with_port_hook(&mut ports)
+                    .with_local_node(&mut local_node);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -599,6 +636,17 @@ impl<'a> RuntimeContext<'a> {
     /// argument and no dictionary, so nothing is lost.
     fn uses_nif_loader(module: &str, function: &str, arity: u32) -> bool {
         matches!((module, function, arity), ("erlang", "load_nif", 2))
+    }
+
+    /// Whether `(module, function, arity)` is `records:get_definition/2`, which must run
+    /// against the [`RecordBridge`] (the record-source seam).
+    ///
+    /// The bridge borrows the code server's module map (`&Runtime`), so it cannot co-exist
+    /// with [`FunBridge`]'s `&mut Runtime` or [`DictBridge`]'s `&mut ProcessTable` borrow —
+    /// [`Self::call_registered`] installs exactly one of the four. `get_definition/2` takes no
+    /// fun argument and no dictionary, so nothing is lost.
+    fn uses_record_source(module: &str, function: &str, arity: u32) -> bool {
+        matches!((module, function, arity), ("records", "get_definition", 2))
     }
 
     /// Dispatches a **NIF** call without touching the runtime's ordinary dispatch.
@@ -836,6 +884,92 @@ impl beam_bifs::NifLoader for NifBridge<'_> {
             .borrow_mut()
             .insert(module.to_string(), NifEntry::new(lib, host));
         Ok(())
+    }
+}
+
+/// The `beam_bifs` record-source seam: the loaded module's `Recs`-chunk definitions.
+///
+/// `records:get_definition/2` asks the runtime's code server for a compiled module's
+/// native-record definitions (C: the code server's record table, populated from a `.beam`'s
+/// `Recs` chunk at load time — `erts_record_put`, `erl_record.c:173-178`). The definitions
+/// live in the [`Module`]'s [`RecordDefinition`](beam_loader::RecordDefinition) list, whose
+/// record/field names are atoms of the **module's own** atom table — not of this call's
+/// `BifContext` table. This bridge therefore resolves the module by name in the code server
+/// and **name-resolves** each definition through that table, so the BIF never has to know
+/// the loader's layout (see `beam_bifs::RecordSource`).
+///
+/// A module that is not loaded, or that defines no such record, answers `Ok(None)` — the
+/// BIF then raises the oracle's plain `badarg` (`records_get_definition_2`,
+/// `erl_record.c:1342-1403`; the code server's lookup `erts_record_find_entry` returns
+/// `NULL` and the BIF raises `badarg`). A field atom the module's own table cannot resolve
+/// is a typed [`BeamError::TermNotFound`] — never a fabricated name.
+///
+/// It borrows only the [`CodeServer`] (a `&Runtime` read), so it cannot co-exist with
+/// [`FunBridge`]'s `&mut Runtime` or the other bridges —
+/// [`RuntimeContext::call_registered`] installs exactly one of them.
+struct RecordBridge<'a> {
+    /// The code server holding the loaded modules.
+    code_server: &'a CodeServer,
+}
+
+impl RecordSource for RecordBridge<'_> {
+    fn record_definition(
+        &mut self,
+        module: &str,
+        name: &str,
+    ) -> Result<Option<RecordDefinitionView>> {
+        let Some(module) = self.code_server.module(module) else {
+            // Not loaded (or not a module name at all): no definition exists, which the
+            // BIF reports as the oracle's `badarg`.
+            return Ok(None);
+        };
+        let Some(record) = module.record_by_name(name) else {
+            return Ok(None);
+        };
+        let mut fields = Vec::with_capacity(record.fields.len());
+        for field in &record.fields {
+            // The field name is an atom of the module's own atom table (the loader interns
+            // the module's `AtU8` names there — `beam_loader::lower::build_module`), so it
+            // resolves by construction; a name it cannot resolve is a typed error.
+            let name = module
+                .atom_table
+                .name(field.name)
+                .ok_or(BeamError::TermNotFound)?
+                .to_string();
+            fields.push(RecordFieldView {
+                name,
+                default: field.default,
+            });
+        }
+        Ok(Some(RecordDefinitionView {
+            is_exported: record.is_exported,
+            fields,
+        }))
+    }
+}
+
+/// The `beam_bifs` local-node-identity seam: this runtime's fixed, non-distributed identity.
+///
+/// `term_to_binary/1` of an **internal** pid/port id needs the local node's name atom and
+/// creation to emit `NEW_PID_EXT` (`88`)/`V4_PORT_EXT` (`120`). Milestone 1 has no
+/// distribution, so the identity is the fixed `nonode@nohost` with creation `0` — the same
+/// identity `beam_bifs`' own [`BifContext::local_node`] fallback answers for the runtime's
+/// node (see `crate::native`). Making it explicit here means the identity does not depend on
+/// the fallback's atom being present.
+///
+/// Both fields are `Copy` (the atom is resolved once, from the shared table, before the
+/// context borrows it), so the hook needs **no** runtime borrow and can be installed in
+/// every [`RuntimeContext::call_registered`] arm.
+struct NodeIdentity {
+    /// The node-name atom, resolved from the shared table at the start of the call.
+    node: Option<Atom>,
+}
+
+impl LocalNode for NodeIdentity {
+    fn local_node(&mut self) -> Option<(Atom, u32)> {
+        // Creation `0`: the value of an undistributed node (the C's `erts_creation` of a
+        // node that never connected anywhere).
+        self.node.map(|node| (node, 0))
     }
 }
 
@@ -1659,5 +1793,67 @@ mod tests {
             crate::error::unsupported_reason(&error).as_deref(),
             Some(format!("receive: process {pid:?} has no mailbox").as_str())
         );
+    }
+
+    #[test]
+    fn the_record_source_predicate_selects_only_its_own_bif() {
+        // Exactly one of the four mutually exclusive bridges is installed per call, so the
+        // predicates must be pairwise disjoint for the name each one claims.
+        assert!(RuntimeContext::uses_record_source(
+            "records",
+            "get_definition",
+            2
+        ));
+        for (module, function, arity) in [
+            ("records", "get", 2),
+            ("records", "get_definition", 1),
+            ("recs", "get_definition", 2),
+            ("erlang", "load_nif", 2),
+            ("erlang", "get", 1),
+        ] {
+            assert!(
+                !RuntimeContext::uses_record_source(module, function, arity),
+                "{module}:{function}/{arity}"
+            );
+        }
+        assert!(RuntimeContext::uses_record_source(
+            "records",
+            "get_definition",
+            2
+        ) && !RuntimeContext::uses_nif_loader("records", "get_definition", 2));
+    }
+
+    #[test]
+    fn the_local_node_identity_is_nonode_at_nohost_with_creation_zero() {
+        // The runtime's boot seed interns the node-name atom, so the identity resolves and
+        // `term_to_binary/1` of an internal pid can emit `NEW_PID_EXT` (88).
+        let rt = runtime();
+        let expected = rt.atoms().lookup("nonode@nohost").expect("seeded at boot");
+        let mut identity = NodeIdentity {
+            node: rt.atoms().lookup("nonode@nohost"),
+        };
+        assert_eq!(identity.local_node(), Some((expected, 0)));
+
+        // A table without the atom answers `None` — an unencodable id, never a
+        // fabricated node.
+        let mut identity = NodeIdentity { node: None };
+        assert_eq!(identity.local_node(), None);
+    }
+
+    #[test]
+    fn term_to_binary_of_an_internal_pid_is_a_new_pid_ext() {
+        // End to end through the real dispatch: the `LocalNode` hook installed by
+        // `call_registered` turns the runtime's own pid into the oracle's `NEW_PID_EXT`
+        // (`88`) image. Oracle: `binary:at(term_to_binary(self()),1)` ⇒ `88`.
+        let mut rt = runtime();
+        let pid = rt.self_pid();
+        let mut ctx = RuntimeContext::new(&mut rt);
+        let image = ctx
+            .call_bif("erlang", "term_to_binary", 1, &[pid.to_eterm()])
+            .expect("term_to_binary(self())");
+        let tag = ctx
+            .call_bif("binary", "at", 2, &[image, make_small(1)])
+            .expect("binary:at/2");
+        assert_eq!(signed_value(tag), 88);
     }
 }
