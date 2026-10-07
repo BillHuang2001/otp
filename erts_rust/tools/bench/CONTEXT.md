@@ -319,9 +319,39 @@ i.e. the gap is startup-only, not execution. This is a real `beam_rt` behavior, 
 | `cowboy` | ✅ | **122 183 req/s** (p50 0.0628 ms, p99 0.1560 ms) | 244 564 req, 0 errors, build 40 442 ms, peak RSS ≈ 151 MB |
 | `elixir_compiler` | ✅ | **3.52 files/s** (2 184 loc/s) | 11 079 ms, 39 `.beam` from 25 `.ex` (batch failed → per-file fallback), compiler-startup 254 ms, peak RSS ≈ 194 MB |
 | `erlc_compiler` | ✅ | **9.75 files/s** (7 557 loc/s) | 6 153 ms, 60 files (OTP stdlib + Elixir), peak RSS ≈ 128 MB |
-| `khepri` | ✅ | `rebar3 eunit` **80 370 ms** | peak RSS ≈ 348 MB (nix `rebar3` 3.27.1) |
+| `khepri` | ✅ | `rebar3 eunit` **77 340 ms** | peak RSS ≈ 357.6 MB (nix `rebar3` 3.27.1, `BENCH_TRY_NIX=1`) |
 | `emqx` | ⛔ | `skipped(not-a-rebar3-project)` | EMQX builds via `make`/`mix`; no root `rebar.config`, so `rebar3 compile` would be a silent no-op |
-| `plb` | ⛔ | `skipped(dotnet-absent)` | `dotnet` absent and its nix fallback is not enabled |
+| `plb` | ⛔ | `skipped(dotnet-absent)` | `dotnet` is absent from `PATH` **and** from the Nix store (0 built outputs); its `nixpkgs#dotnet-sdk` fallback is deliberately not enabled (large SDK). PLB *does* carry Elixir `.ex` algorithm sources (`bench/algorithm/*/1.ex`, e.g. `helloworld`, `pidigits`, `spectral-norm`), so a future dotnet-free `elixir`/escript path is possible — **not implemented** (would be a new workload, and the Rust runtime has no Elixir front end). |
+
+### `foreign` — the same real Cowboy/EMQX modules under *both* runtimes
+
+`bench run --quick --runtime all --workloads foreign --out-file out/foreign-bench.json`
+(artifact `out/foreign-bench.json`; n=3 samples/case; oracle `erl` OTP 29.1.1, Rust `beam_rt` release,
+version `30`). Per-call figures are the startup-corrected median-of-mean marginal
+`ns = (mean wall@N − mean wall@0)/N`; `N_sys` is 200 000 (400 000 for `decode`), `N_rust` is 150–2 000.
+All four cases printed the **same** stdout under both runtimes (`result == N × per_call`).
+
+| case (real foreign function) | sys ns/call | rust ns/call | ratio | sys startup p50 | rust startup p50 |
+|---|---|---|---|---|---|
+| `bstr_to_lower` (`cowboy_bstr:to_lower/1`) | 437.79 | 268 618.72 | ≈ 613× | 136.93 ms | 151.82 ms |
+| `bstr_capitalize_token` (`cowboy_bstr:capitalize_token/1`) | 301.47 | 264 450.03 | ≈ 877× | 132.56 ms | 158.01 ms |
+| `emqx_base62_encode` (`emqx_base62:encode/1`) | 175.74 | 2 092 849.08 | ≈ 11 909× | 131.63 ms | 136.77 ms |
+| `emqx_base62_decode` (`emqx_base62:decode/1`) | 297.14 | 2 740 413.18 | ≈ 9 223× | 140.43 ms | 145.23 ms |
+
+Whole-workload `peak_memory_bytes`: sys ≈ **70.9 MB**, rust ≈ **28.8 MB**. The two runtimes have
+**comparable process startup** here (≈ 130–160 ms both — the oracle's VM boot vs the Rust runtime's
+one-time `erl` code-path resolution; see the `ERTS_STDLIB_DIR` note below). The per-call gap is
+**execution**, not startup: the Rust runtime is today a tree-walking interpreter, so a single foreign
+function call costs microseconds where the JITed BEAM spends hundreds of nanoseconds. This is a real,
+reproducible result on real target-project code — reproduced within a few percent across consecutive
+`--quick` runs (see the runbook) — **not** a harness artifact.
+
+> **`ERTS_STDLIB_DIR` note (a real `beam_rt` behavior, verified):** the Rust runtime resolves the
+> system code path by spawning `erl` once per process, so a startup run costs ≈ 150 ms instead of the
+> ≈ 20 ms it costs with `ERTS_STDLIB_DIR=<code:lib_dir(stdlib)>` pre-set (verified: `N=0` startup
+> 147 ms → 21 ms; the `lower` loop at `N=2000` 52.5 s → 0.58 s). `bench` does **not** set it — the
+> harness is a pure driver/observer and never mutates the runtime's environment beyond argv — and the
+> effect is confined to the `_startup_ms` metric, which the per-call metric cancels.
 
 ## See Also
 - `../CONTEXT.md` → the `tools/` node's binding shared conventions (runtime resolution, exit codes, JSON, `out/`).
