@@ -2,8 +2,8 @@
 ## Intent
 Owns the **copy half of the process memory model**: moving a term graph between two process heaps
 (`copy_struct`, plus the sharing-preserving `copy_struct_shared`) and the data-level messaging
-primitives built on it — the `Message` envelope, the per-process FIFO message **queue**, and
-`send`/`receive`. Implements Part II §C/§D (the messaging/ETS copy boundary: *immutability bounds what may be shared; everything else is copied*) and the Stage-3 row of Part II §H.
+primitives built on it — the `Message` envelope, the per-process FIFO message **queue**,
+`send`/`receive`, and the **message-fragment model** (`HeapFragment`/`Fragments`) that homes a payload too large for the receiver's heap. Implements Part II §C/§D (the messaging/ETS copy boundary: *immutability bounds what may be shared; everything else is copied*) and the Stage-3 row of Part II §H.
 Sibling responsibilities (NOT here): the **collector** and the per-process heap (`beam_gc`,
 `beam_alloc`); the **scheduler / selective-receive waiting / save queue / signal ordering**
 (`beam_process`); the `send`/`receive` **BIF surface and pattern matcher** (`beam_bifs`); the
@@ -11,7 +11,8 @@ Sibling responsibilities (NOT here): the **collector** and the per-process heap 
 Ground truth = the legacy C `erts/emulator/beam/copy.c` (`copy_struct_x` — the authoritative
 iterative copier; `size_object_x`; `copy_shared_calculate`/`copy_shared_perform_x`;
 `erts_move_multi_frags`), `erl_message.c`/`erl_message.h` (the `ErtsMessage` envelope,
-`ErlHeapFragment`, the message queue), `erl_gc.c` (the `OffHeap`/MSO sweep rule) and
+`ErlHeapFragment`, the message queue, `erts_try_alloc_message_on_heap`/`new_message_buffer`/
+`erts_link_mbuf_to_proc`), `erl_gc.c` (the `OffHeap`/MSO sweep rule and `erts_copy_one_frag`) and
 `erl_node_tables.h` (`erts_ref_node_entry`/`erts_deref_node_entry`). Read the C; never modify it.
 ## Inheritance (binding)
 Obeys the crate-layer `../CONTEXT.md` contracts verbatim: frozen term layout (§2 — construct/inspect
@@ -54,15 +55,44 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   in-place markers are replaced by that map, leaving the source heap untouched.
   The preflight is `beam_term::size_object(term)` — the **flat** word count, a safe upper bound — so a
   destination heap is sized exactly as for `copy_struct`; the saving is in the words actually written.
+### `fragment.rs` — the message-fragment model (`ErlHeapFragment`/`ErtsMessage` analogue)
+- `pub struct HeapFragment` — a bump-allocated heap region plus its off-heap objects and its roots,
+  mirroring the C `ErlHeapFragment` (`{ next; off_heap; alloc_size; used_size; mem[1]; }`).
+  - `new(capacity_words)` / `with_allocator(alloc, capacity_words)`
+  - `heap() -> &Heap` / `heap_mut() -> &mut Heap` (the `mem[1..alloc_size]` region)
+  - `off_heap() -> &OffHeapTable` / `off_heap_mut() -> &mut OffHeapTable` (the fragment's `off_heap`)
+  - `used()` / `capacity()` / `available()` (the region's `used_size` / `alloc_size` / head-room)
+  - `off_heap_overhead_bytes()` — the administrative overhead of the MSO objects (the C `ErlOffHeap.overhead`)
+  - `copy_root(term: Eterm, src: &OffHeapTable) -> Result<Eterm>` — copies `term` from a process whose
+    off-heap table is `src` into the fragment's heap, refcounts its off-heap references into the
+    **fragment's** table (fresh slots), records the result as a root and returns it (the C
+    `new_message_buffer` + copy step of `erts_try_alloc_message_on_heap`)
+  - `push_root(Eterm)`, `roots() -> &[Eterm]` (the payload roots, `m[0]` pointing into `mem`)
+  - `contains(term) -> bool` — whether the term's object lives in this fragment's region
+- `pub struct Fragments` — an ordered chain of `HeapFragment`s (the C `ErlHeapFragment.next` chain):
+  `new()`/`Default`, `is_empty()`, `len()`, `push(HeapFragment)`, `iter()`/`iter_mut()`,
+  `total_used_words()` (the process message-buffer accounting — `used_size` summed) and
+  `off_heap_overhead_bytes()`.
+  - `move_into(dst: &mut Heap, dst_off_heap: &mut OffHeapTable) -> Result<Vec<Eterm>>` — the move
+    entry point (the `erts_move_multi_frags`/`erts_copy_one_frag` analogue): for each fragment in
+    order it copies each root with `copy_struct` (the fragment's off-heap table as source,
+    `dst_off_heap` as destination), so the moved term references **fresh** slots in `dst_off_heap`,
+    and then releases the fragment's own off-heap references (ownership handed to the destination).
+    Refc binaries and MSO objects move as **handles** (same `RefcBinary::data_ptr`, refcount
+    incremented, never deep-copied); roots come back in chain order. One-shot.
 ### `message.rs` — the envelope and the queue
 - `pub struct Message` — the copied payload plus sender identity and the off-heap objects it owns.
-  - `Message::new(payload: Eterm, from: Eterm) -> Message` (token = `NIL`, no off-heap objects)
+  - `Message::new(payload: Eterm, from: Eterm) -> Message` (token = `NIL`, no off-heap objects, no fragments)
   - builder: `with_token(Eterm)`, `with_off_heap(Vec<MsoHandle>)`, `with_binaries(Vec<RefcBinary>)`,
-    `with_nodes(Vec<NodeEntry>)`
+    `with_nodes(Vec<NodeEntry>)`, `with_fragments(Fragments)`
   - accessors: `payload() -> Eterm`, `from() -> Eterm`, `token() -> Eterm`,
-    `off_heap() -> &[MsoHandle]`, `binaries() -> &[RefcBinary]`, `nodes() -> &[NodeEntry]`
+    `off_heap() -> &[MsoHandle]`, `binaries() -> &[RefcBinary]`, `nodes() -> &[NodeEntry]`,
+    `fragments() -> Option<&Fragments>`, `fragments_mut() -> Option<&mut Fragments>`
   - mirrors C `ERL_MESSAGE_TERM`/`_TOKEN`/`_FROM` (`m[0]`/`m[1]`/`m[2]`) + the message's `off_heap`, and
     carries the two categories `beam_message` tracks beside it (refc binaries, node references).
+  - a payload that fits the receiver heap lives **in that heap** with no fragments and its off-heap
+    objects in `off_heap`/`binaries`/`nodes`; a payload too large lives in the message's `Fragments`
+    (the `data.heap_frag`/`hfrag` of `ErtsMessage`) and `payload()` points into them.
 - `pub struct Queue` — the per-process FIFO message queue (a pure data structure; **no** scheduler
   coupling). `new()`/`Default`, `enqueue(Message)`, `dequeue() -> Option<Message>`,
   `peek() -> Option<&Message>`, `len()`, `is_empty()`, `clear()`, `iter() -> impl Iterator<Item=&Message>`.
@@ -84,6 +114,17 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `Message`: `drain_binaries()` → `with_binaries`, `drain_nodes()` → `with_nodes`,
   `drain_handles()` → `with_off_heap`. This is the copy-into-the-receiver's-heap half of the C
   `erts_queue_message`/`copy_struct` path; the scheduler signalling half is `beam_process`.
+  A payload that does **not** fit fails with `BeamError::Alloc(AllocKind::Message)` and leaves
+  `to_heap` and the destination table untouched (the copier preflights capacity).
+- `pub fn send_fragmented(from, term, to_heap, to_queue, ctx, fragment_capacity_words: usize) -> Result<()>`
+  — like `send`, but a payload that does not fit the receiver's heap is copied into a
+  `HeapFragment` instead of failing (the C `erts_try_alloc_message_on_heap`/`new_message_buffer`
+  sender). Only `BeamError::Alloc(AllocKind::Message)` triggers the fragment path (any other failure
+  is propagated unchanged); the fragment is sized to hold the whole payload, `term` is copied into
+  its heap with a `CopyContext` whose source is `ctx`'s off-heap table and whose destination is the
+  **fragment's** off-heap table (so the fragment owns the payload's off-heap objects), and the
+  enqueued `Message` points into the fragment and owns the `Fragments`. `ctx`'s own destination
+  off-heap table is **not** used on the fragment path (a fragment carries its own `off_heap`, as C does).
 - `pub fn receive<F: FnMut(&Message) -> bool>(queue: &mut Queue, pred: F) -> Option<Message>` —
   **remove and return** the first queued message whose payload satisfies `pred` (selective receive
   skeleton). Waiting, `after` timeouts, the save queue and signal ordering live in `beam_process`.
@@ -129,8 +170,8 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   out-of-range MSO slot, or a refc binary whose payload no held handle owns ⇒ `BeamError::BadArg`.
 - **`unsafe` is confined to `copy.rs`** (raw word read/write in the copy loop) and the narrow
   `layout.rs` accessors; every `unsafe fn` carries a `# Safety` section and every `unsafe` block a
-  preceding `// SAFETY:` rationale. `share.rs`, `off_heap.rs`, `message.rs`, `mailbox.rs`, `node.rs`,
-  `error.rs` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
+  preceding `// SAFETY:` rationale. `share.rs`, `fragment.rs`, `off_heap.rs`, `message.rs`,
+  `mailbox.rs`, `node.rs`, `error.rs` are safe Rust. `unsafe_op_in_unsafe_fn` stays clean.
 - **Never assume a different `Eterm` layout** — read headers/words through `beam_term` accessors.
   The frozen word layouts (cons `[CAR,CDR]`, header words, `BinRef [thing_word,val,next]`, the
   `[BinRef(3)][ErlSubBits(5)]` refc pair, `ExternalThing [header,node,next,data]`) are the contract;
@@ -199,6 +240,22 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   destination table as `ctx`'s destination and then drains all three categories into the `Message`,
   mirroring how C links copied BinRefs / external things into the `ErlHeapFragment.off_heap` so the
   receiving process's GC can sweep them.
+- **The message-fragment move is a copy + release, not the C's in-place move markers.** A fragment's
+  payload holds its off-heap references as **slot indices** into the owning table (the M1 encoding),
+  so `Fragments::move_into` cannot relink an object list the way the C `erts_move_multi_frags` does
+  (C terms hold raw pointers to the objects, so only in-place move markers are needed). Instead it
+  copies each root with `copy_struct` (the fragment's table → `dst_off_heap`), which re-registers —
+  refcounts — every referenced object under a **fresh** destination slot, and then releases the
+  fragment's own references. The **net refcount is unchanged by the move** (one increment from the
+  copy, one decrement from the release), exactly as the C relink leaves it, so the ownership transfer
+  is faithful even though the mechanism (copy + release) differs. `send_fragmented` is the C
+  `erts_try_alloc_message_on_heap` sender: it tries the receiver-heap copy first and fragments only on
+  `AllocKind::Message`; the fragment (sized to the whole payload, C `new_message_buffer(sz)`) then
+  owns the off-heap objects while the message lives.
+- **The fragment's backing `Heap` never reallocates, so a root's address is stable across a move of
+  `Fragments`.** The envelope holds `Fragments` by value, but the heap's region is a separate,
+  never-moving allocation, so `Message::payload` (which points into the region) stays valid as the
+  `Message` — and therefore the `Fragments` — is moved around.
 - **A refc binary whose payload no held handle owns is a malformed graph ⇒ `BeamError::BadArg`.**
   The M1 encoding has no other way to recover the handle (there is no `Binary*` back-pointer), and a
   silent deep copy would be a wrong result.
@@ -219,7 +276,9 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   the count; identity is node + creation), `copy` (immediates shared; cons/tuple/record/nested copied;
   literal shared; off-heap container refcounted; exhaustion ⇒ `AllocKind::Message`),
   `share` (a repeated tuple is materialised once; a distinct-subterm graph copies to the flat size;
-  immediates unchanged).
+  immediates unchanged), `fragment` (a fresh fragment's geometry; `copy_root` fills/records/contains;
+  the chain's shape and summed `used` words; `move_into` copying a root onto the destination heap and
+  transferring an off-heap object).
 - `tests/copy.rs` — the flat-copy correctness evidence: nested-graph equality, a `100_000`-element
   deep list (no stack overflow), literal sharing by identity, MSO refcount + slot rewrite, heap
   exhaustion ⇒ `AllocKind::Message`, and a 40-key HAMT map copied as a whole trie.
@@ -240,6 +299,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   `external_*_parts`), one node entry per distinct node, two references to the same node ⇒ one entry
   with refcount 2, port and reference nodes registered separately, and dropping the destination
   releasing the node. `compare::eq` is deliberately **not** used (see Known Issues).
+- `tests/fragments.rs` — the message-fragment evidence: a payload larger than the receiver heap makes
+  plain `send` fail with `AllocKind::Message` (leaving `to_heap.used() == 0`) while `send_fragmented`
+  enqueues a structurally-equal payload that points into the fragment (`HeapFragment::contains`) and
+  differs from the source address and the receiver heap; `move_into` copies the payload onto the
+  receiver heap (address inside it) and transfers the fragment's off-heap MSO object into the
+  destination table (source + destination, the fragment released); a two-fragment chain moves both
+  roots back in order; a fragmented 256-byte `RefcBinary` moves the **handle** (same `data_ptr`, bytes
+  unchanged, refcount 2 = source + receiver, the pair `ERL_REFC_BITS_SIZE` on the receiver heap); and
+  fragment accounting (`used`/`capacity`/`total_used_words`, the receiver heap staying empty).
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
@@ -264,10 +332,17 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - **`copy_struct_shared` preflights the *flat* word count.** It is a safe upper bound, so a caller sizes
   the destination heap as for `copy_struct`; the memory saving is in the words written, not in the
   accepted capacity.
-- **Fragmented messages (`ErlHeapFragment`, `erts_move_multi_frags`) are a documented follow-up.**
-  Large messages that do not fit a process heap fragment stream across buffers in C; M1 assumes the
-  destination heap can hold the copy (exhaustion ⇒ `AllocKind::Message`). `Fragments`/`HeapFragment`
-  land when `beam_process`'s heap management and the binary layer exist.
+- **The fragment model is not yet wired into a runtime.** `HeapFragment`/`Fragments`/`send_fragmented`
+  exist, but `beam_rt`/`beam_process` still call `send` (exhaustion ⇒ `AllocKind::Message`); a runtime
+  must adopt `send_fragmented`, hold a received message's `Fragments` as its message-buffer model and
+  later `move_into` the process heap.
+- **A fragment holds the whole payload; there is no automatic multi-fragment split.** The C streams an
+  oversized message across a chain of `new_message_buffer` fragments; here one fragment is sized to the
+  whole payload (`fragment_capacity_words.max(size_object(term))`) and the chain is built by the caller
+  (`Fragments::push`). A size-bounded split is `beam_process`'s heap-management concern.
+- **`Fragments::move_into` moves by copy + release, not the C's in-place move markers.** It re-copies
+  each root to fresh destination slots and then releases the fragment's own references; the net
+  refcount is unchanged (see Design Decisions), but the mechanism differs and the move is one-shot.
 - **Scheduler coupling is absent by design.** `Queue` is a pure FIFO; selective-receive waiting,
   `after`, the save queue, signal/priority ordering and the message-queue length semantics of
   `ErtsSignalPrivQueues` are `beam_process`'s.
@@ -275,22 +350,26 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   machinery that fills it is `beam_dist`/`beam_rt`.
 - **The binary/node lists are carried but not yet consumed.** `beam_process`/`beam_rt` must own a
   received message's `binaries()`/`nodes()` (they are the receiving process's off-heap references) —
-  today nothing sweeps them, the `Message`'s own `Drop` releases them.
+  today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
+  leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
+  `Fragments::move_into` hands them to the destination table.
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`)
+- `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`); the `ErlHeapFragment` message-buffer model
 - `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
-- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists) + `Queue` FIFO
-- `src/mailbox.rs` → `send` / `receive` / `receive_ref` data-level primitives
+- `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO
+- `src/mailbox.rs` → `send` / `send_fragmented` / `receive` / `receive_ref` data-level primitives
 - `src/error.rs` → `pub(crate)` copy-failure constructors (no new error type)
 - `tests/copy.rs` → flat-copy correctness: nested-graph equality, deep list, literal sharing, MSO refcount, exhaustion, HAMT trie
 - `tests/share.rs` → sharing-preserving evidence: N-fold subterm, structural equality, no-sharing size, shared MSO identity
 - `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
+- `tests/fragments.rs` → the fragment-model evidence: `send` vs `send_fragmented`, `move_into` (payload onto the receiver heap + off-heap transfer), the multi-fragment chain, refc-binary handle move, accounting
 - `../../erts/emulator/beam/copy.c` → the authoritative copier (`copy_struct_x`/`size_object_x`/`copy_shared_*`/`erts_move_multi_frags`) (read-only)
 - `../../erts/emulator/beam/erl_message.h` / `erl_message.c` → the message envelope, `ErlHeapFragment`, queue layout (read-only)
 - `../../erts/emulator/beam/erl_node_tables.h` → `erts_ref_node_entry`/`erts_deref_node_entry` (read-only)

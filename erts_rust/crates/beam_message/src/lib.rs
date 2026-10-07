@@ -11,11 +11,12 @@
 //! behaviour.
 //!
 //! `unsafe` is confined to `copy.rs` (the raw word read/write of the copy loop) and the narrow
-//! `layout.rs` accessors; `share.rs`, `message.rs`, `mailbox.rs`, `off_heap.rs`, `node.rs` and
-//! `error.rs` are safe Rust.
+//! `layout.rs` accessors; `share.rs`, `fragment.rs`, `message.rs`, `mailbox.rs`, `off_heap.rs`,
+//! `node.rs` and `error.rs` are safe Rust.
 
 pub mod copy;
 mod error; // pub(crate) copy-failure constructors — NOT public
+pub mod fragment;
 mod layout; // pub(crate) layout helpers — NOT part of the public API
 pub mod mailbox;
 pub mod message;
@@ -24,7 +25,8 @@ pub mod off_heap;
 mod share;
 
 pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
-pub use crate::mailbox::{receive, receive_ref, send};
+pub use crate::fragment::{Fragments, HeapFragment};
+pub use crate::mailbox::{receive, receive_ref, send, send_fragmented};
 pub use crate::message::{Message, Queue, QueueCursor};
 pub use crate::node::NodeEntry;
 pub use crate::off_heap::{MsoHandle, OffHeapTable};
@@ -33,7 +35,8 @@ pub use crate::share::copy_struct_shared;
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
     pub use crate::copy::{copy_struct, copy_struct_simple, size_of_copy, CopyContext};
-    pub use crate::mailbox::{receive, receive_ref, send};
+    pub use crate::fragment::{Fragments, HeapFragment};
+    pub use crate::mailbox::{receive, receive_ref, send, send_fragmented};
     pub use crate::message::{Message, Queue, QueueCursor};
     pub use crate::node::NodeEntry;
     pub use crate::off_heap::{MsoHandle, OffHeapTable};
