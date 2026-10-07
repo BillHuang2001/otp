@@ -22,6 +22,8 @@
 //!   [`RuntimeContext`] drives the receive seam through.
 //! * `runner` — the `beam_process::ProcessRunner` behind the scheduler: the engine state
 //!   and recorded outcomes of every process [`Runtime::spawn_process`] created.
+//! * `timers` — the runtime's **pending timer deadlines** (`erlang:send_after/3`), a
+//!   min-heap advanced only by the scheduler loop (`run_scheduler`/`pump_scheduler`).
 //! * [`eval`] — the `-eval` Erlang expression parser and `erl_eval`-style evaluator.
 //! * [`format`] — term printing, which drives the registered `io:format/2` `~p`/`~w` printer.
 //! * [`native`] — the runtime-native BIF floor (`halt`, `display`, `io:put_chars`,
@@ -54,6 +56,7 @@ mod nif;
 pub mod port;
 pub mod runtime;
 mod runner;
+mod timers;
 pub use crate::boot::{boot_banner, PreloadedModules};
 pub use crate::cli::{parse, run, EXIT_OK, EXIT_RUNTIME, EXIT_UNSUPPORTED, EXIT_USAGE, USAGE};
 pub use crate::codeserver::CodeServer;

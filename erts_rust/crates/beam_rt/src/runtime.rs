@@ -26,6 +26,7 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::{Duration, Instant};
 
 use beam_alloc::Heap;
 use beam_bifs::{BifRegistry, OutputSink, TableRegistry};
@@ -49,6 +50,7 @@ use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState, RuntimeRunner};
+use crate::timers::{TimerTarget, Timers};
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
 ///
 /// It is `reset()` at the start of every such call, so it only has to hold one
@@ -58,6 +60,47 @@ const INFO_HEAP_WORDS: usize = 4_096;
 /// The smallest process heap a runtime accepts (`heap_words` is floored at this).
 const MIN_HEAP_WORDS: usize = 1_024;
 
+/// The longest [`Runtime::pump_scheduler`] (the `-eval` receive pump) may sleep waiting for
+/// the next timer deadline.
+///
+/// The scheduler entry points that own the whole pass — [`Runtime::run_scheduler`] and
+/// [`Runtime::run_slices`] — wait for the earliest deadline (see [`TimerWait`]); the `-eval`
+/// pump is a *bounded* step called from inside a running expression, so it waits at most
+/// this long per call and reports `0` (nothing happened) when no deadline became due. A
+/// `receive` that really wants to wait for a timer therefore sees it within a pump slice —
+/// the delays a `send_after`-driven probe uses are far below it — while the pump itself can
+/// never stall the evaluator indefinitely.
+const TIMER_PUMP_SLICE: Duration = Duration::from_millis(100);
+
+/// How long one scheduler pass may sleep waiting for the next timer deadline.
+///
+/// This is the timer counterpart of the port half's poll clamp: the loop never *spins*, it
+/// sleeps exactly as long as the earliest deadline requires — and only when it has nothing
+/// else to do.
+#[derive(Clone, Copy)]
+enum TimerWait {
+    /// Never sleep: a **bounded** pass ([`Runtime::run_slices`]/[`Runtime::run_one_slice`])
+    /// only fires deadlines that have already passed, so a step stays a step.
+    Never,
+    /// Sleep until the earliest pending deadline, however far away — the unbounded
+    /// [`Runtime::run_scheduler`]. Termination is guaranteed: every wait is preceded by the
+    /// removal of the deadline it waited for, so the heap strictly shrinks.
+    Deadline,
+    /// Sleep at most this long, once per pass — the bounded `-eval` pump
+    /// ([`Runtime::pump_scheduler`], see [`TIMER_PUMP_SLICE`]).
+    AtMost(Duration),
+}
+
+impl TimerWait {
+    /// Whether the pass may sleep one more time, having already slept `waits` times.
+    const fn allows(&self, waits: u32) -> bool {
+        match self {
+            TimerWait::Never => false,
+            TimerWait::Deadline => true,
+            TimerWait::AtMost(_) => waits == 0,
+        }
+    }
+}
 /// The Rust ERTS runtime.
 pub struct Runtime {
     /// The configuration this runtime was created with.
@@ -182,6 +225,16 @@ pub struct Runtime {
     /// the body here; the store is append-only, so an index is stable for the runtime's
     /// lifetime.
     pub(crate) eval_closures: Vec<Rc<FunBody>>,
+    /// The pending **timer deadlines** (`erlang:send_after/3`).
+    ///
+    /// A min-heap of absolute deadlines that only the scheduler loop advances: a pass fires
+    /// every deadline that has passed (delivering the message into the target's mailbox and
+    /// waking it through the normal resume-on-send path) and, with nothing else to do, sleeps
+    /// until the earliest one — the timer counterpart of the port half's poll clamp. See
+    /// [`crate::timers`] for why this is a runtime-local heap rather than
+    /// `beam_process::TimerService` (that wheel is driven by a thread, and the runtime is not
+    /// `Send`).
+    pub(crate) timers: Timers,
 }
 
 impl Runtime {
@@ -247,6 +300,7 @@ impl Runtime {
             refs: RefAllocator::new(),
             references: HashMap::new(),
             eval_closures: Vec::new(),
+            timers: Timers::new(),
         })
     }
 
@@ -348,6 +402,13 @@ impl Runtime {
         &mut self.refs
     }
 
+    /// The runtime's pending timer deadlines (`erlang:send_after/3`).
+    ///
+    /// Scheduling and cancellation are the only operations the BIF floor needs; the
+    /// deadlines themselves are fired by the scheduler loop (see [`Runtime::scheduler_pass`]).
+    pub(crate) fn timers_mut(&mut self) -> &mut Timers {
+        &mut self.timers
+    }
     /// Takes a heap for one BIF call out of the pool.
     ///
     /// The pool is a stack: a call takes a heap, runs, and puts it back
@@ -661,7 +722,8 @@ impl Runtime {
     /// * the port poller's/driver's failures and a nested borrow of the port table (a typed
     ///   capability gap).
     pub(crate) fn pump_scheduler(&mut self, max_slices: u64) -> Result<u64> {
-        let (ran, delivered) = self.scheduler_pass(Some(max_slices), true)?;
+        let (ran, delivered) =
+            self.scheduler_pass(Some(max_slices), true, TimerWait::AtMost(TIMER_PUMP_SLICE))?;
         Ok(ran + delivered as u64)
     }
 
@@ -818,11 +880,20 @@ impl Runtime {
     ///
     /// As [`Runtime::scheduler_pass`].
     fn run_pass(&mut self, max_slices: Option<u64>) -> Result<u64> {
-        self.scheduler_pass(max_slices, false).map(|(ran, _)| ran)
+        // A bounded pass is a *step*: it fires deadlines that have already passed but never
+        // sleeps on one. The unbounded pass owns the runtime until it is quiescent, so it
+        // waits for the earliest deadline (a process blocked on a `receive` that only a timer
+        // can answer is resumed by it — exactly as a port wakes one).
+        let wait = match max_slices {
+            Some(_) => TimerWait::Never,
+            None => TimerWait::Deadline,
+        };
+        self.scheduler_pass(max_slices, false, wait)
+            .map(|(ran, _)| ran)
     }
 
-    /// Runs a scheduler pass **and drives the port poller**: the shared body of every
-    /// `run_*` entry and of [`Runtime::pump_scheduler`].
+    /// Runs a scheduler pass **and drives the port poller and the timer heap**: the shared
+    /// body of every `run_*` entry and of [`Runtime::pump_scheduler`].
     ///
     /// The move-out dance is [`Runtime::run_pass`]'s (the runner needs `&mut Runtime` while
     /// the scheduler needs `&mut ProcessTable`). On top of it this adds the runtime's
@@ -839,28 +910,34 @@ impl Runtime {
     ///    enqueues the woken process ([`Scheduler::resume_woken`]) and the loop runs the
     ///    scheduler again — until nothing is delivered and the queue is empty.
     ///
-    /// A round therefore either runs a slice or delivers a port message; when neither
-    /// happens the pass is quiescent and the loop ends (never a busy spin — the poll itself
-    /// is bounded by [`PORT_POLL_SLICE`](crate::port::PORT_POLL_SLICE)).
+    /// and its **timer half** — [`Runtime::fire_due_timers`] delivers every
+    /// `erlang:send_after/3` message whose deadline has passed into the target's mailbox
+    /// (the same deliver+wake+`resume_woken` path a port message takes). When nothing ran
+    /// and nothing was delivered, the pass consults `wait` ([`TimerWait`]) and sleeps until
+    /// the earliest pending deadline instead of ending — so a receiver a *timer* has to wake
+    /// is resumed on the very same pass. A pass with no pending deadline, or one that is not
+    /// allowed to wait, ends exactly as before.
     ///
     /// `resume_first` absorbs the table's pending wake list **before** the first slice — the
     /// behaviour [`Runtime::pump_scheduler`] needs (a send made *outside* a scheduler slice
     /// must be enqueued), which [`Runtime::run_pass`] does not do (its `run_ready` absorbs
     /// wakes at each slice's end anyway).
     ///
-    /// Returns `(slices that ran, port messages delivered)`.
+    /// Returns `(slices that ran, port/timer messages delivered)`.
     ///
     /// # Errors
     ///
     /// * a typed diagnostic when an enqueued pid has no registered engine;
     /// * the process table's errors while terminating a process or delivering a message
-    ///   between processes;
+    ///   between processes (including a timer's message that does not fit the receiver's
+    ///   heap);
     /// * the port poller's/driver's failures; a nested borrow of the port table is a typed
     ///   capability gap rather than a panic.
     fn scheduler_pass(
         &mut self,
         max_slices: Option<u64>,
         resume_first: bool,
+        wait: TimerWait,
     ) -> Result<(u64, usize)> {
         self.boot_if_needed()?;
         let mut table = self.take_processes();
@@ -876,6 +953,7 @@ impl Runtime {
         self.absorb_fragment_wakes(&mut table, &mut scheduler);
         let mut ran: u64 = 0;
         let mut delivered: usize = 0;
+        let mut waits: u32 = 0;
         let outcome: Result<()> = loop {
             // `run_ready` also stops once its own budget is spent; the loop's budget counts
             // every slice across the rounds, so a bounded pass never overshoots.
@@ -898,9 +976,7 @@ impl Runtime {
             // The port half: with a live port, read what it produced and deliver it into
             // the owning process's mailbox (which may wake a blocked receiver).
             match self.deliver_port_messages(&mut table, crate::port::PORT_POLL_SLICE) {
-                // Nothing left to do: no port produced a message and no fragment delivery
-                // woke anything.
-                Ok(0) if woke == 0 => break Ok(()),
+                Err(err) => break Err(err),
                 // A fragment wake was absorbed above, so go round again and run it.
                 Ok(0) => {}
                 Ok(count) => {
@@ -908,8 +984,35 @@ impl Runtime {
                     // The delivery may have woken a blocked receiver: absorb the wake list so
                     // the next round runs it.
                     scheduler.resume_woken(&mut table);
+                    continue;
                 }
+            }
+            // The timer half: deliver every `erlang:send_after/3` message whose deadline has
+            // passed (which may wake a blocked receiver, exactly like a port message).
+            match self.fire_due_timers(&mut table) {
                 Err(err) => break Err(err),
+                Ok(0) => {}
+                Ok(count) => {
+                    delivered += count;
+                    scheduler.resume_woken(&mut table);
+                    continue;
+                }
+            }
+            // Nothing ran, nothing was delivered and nothing was woken. With a pending
+            // deadline the pass may still have work: sleep until it and go round again to
+            // fire it (a bounded pass/clamped pump refuses, so a step stays a step).
+            if woke > 0 {
+                continue;
+            }
+            match self.timer_wait(wait, waits) {
+                Some(wait_for) => {
+                    waits += 1;
+                    if !wait_for.is_zero() {
+                        std::thread::sleep(wait_for);
+                    }
+                    continue;
+                }
+                None => break Ok(()),
             }
         };
         self.runner_state = state;
@@ -917,6 +1020,59 @@ impl Runtime {
         self.put_processes(table);
         outcome?;
         Ok((ran, delivered))
+    }
+
+    /// How long this pass may sleep waiting for the next timer deadline, or `None` when it
+    /// must not (or cannot) wait — see [`TimerWait`].
+    ///
+    /// The wait is clamped to the earliest *live* deadline (cancelled tombstones are pruned
+    /// on the way), so the pass never sleeps past the work it is waiting for.
+    fn timer_wait(&mut self, policy: TimerWait, waits: u32) -> Option<Duration> {
+        if !policy.allows(waits) {
+            return None;
+        }
+        let deadline = self.timers.next_deadline()?;
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        Some(match policy {
+            TimerWait::Never => return None,
+            TimerWait::Deadline => remaining,
+            TimerWait::AtMost(max) => remaining.min(max),
+        })
+    }
+
+    /// Fires every timer whose deadline has passed, delivering its message into the target's
+    /// mailbox, and returns how many messages were delivered.
+    ///
+    /// A **pid** target is used as scheduled; a **name** target is resolved in `table` at
+    /// fire time (as the oracle resolves a registered name). A target the table does not hold
+    /// — a pid that died, a name nobody holds — receives nothing and is not an error (the
+    /// oracle drops the message too); the timer is consumed either way, so it fires exactly
+    /// once. The delivery is `beam_process`'s own `deliver_simple`, so a blocked receiver is
+    /// woken on the table's wake list and the caller resumes it with
+    /// [`Scheduler::resume_woken`] — the very path a port message takes.
+    ///
+    /// # Errors
+    ///
+    /// The process table's delivery errors (an allocation failure while copying the message
+    /// onto the receiver's heap) — never a swallowed failure.
+    fn fire_due_timers(&mut self, table: &mut ProcessTable) -> Result<usize> {
+        let fired = self.timers.take_due(Instant::now());
+        let mut delivered = 0;
+        for timer in fired {
+            let target = match timer.target {
+                TimerTarget::Pid(pid) => Some(pid),
+                TimerTarget::Name(name) => table.whereis(name),
+            };
+            let Some(pid) = target else {
+                continue; // a name nobody holds: the message is dropped
+            };
+            if !table.contains(pid) {
+                continue; // a pid that has already terminated
+            }
+            table.deliver_simple(pid, timer.from, timer.message)?;
+            delivered += 1;
+        }
+        Ok(delivered)
     }
 
     /// Moves the process table out of the runtime for a scheduler pass.
@@ -1276,5 +1432,130 @@ mod tests {
         let config = RuntimeConfig::default().with_code_path(dir);
         let mut rt = Runtime::new(config).expect("runtime");
         assert_eq!(rt.find_module_file("slice"), Some(PathBuf::from(SLICE_BEAM)));
+    }
+
+    // -- erlang:send_after/3 on the scheduler path ----------------------------
+
+    /// The committed receive fixture (`../beam_engine/tests/fixtures/recv.beam`), reused by
+    /// relative path: `recv:wait/0` is the bare `receive X -> X end`.
+    const RECV_BEAM: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/../beam_engine/tests/fixtures/recv.beam"
+    );
+
+    /// Schedules `message` for `target` in `millis` through the runtime's own dispatch (the
+    /// `erlang:send_after/3` a running process would call).
+    fn send_after(rt: &mut Runtime, millis: i64, target: Eterm, message: Eterm) -> Eterm {
+        let mut ctx = RuntimeContext::new(rt);
+        ctx.call_bif("erlang", "send_after", 3, &[make_small(millis), target, message])
+            .expect("send_after/3")
+    }
+
+    /// A receiver blocks **before** the timer fires, and the timer's message is what wakes
+    /// it: the run queue is empty and the mailbox is empty when the deadline is scheduled,
+    /// so only the timer half of the scheduler pass can resume it.
+    ///
+    /// Oracle: `R = spawn(recv, wait, []), erlang:send_after(5, R, 42)` ⇒ `R` returns `42`.
+    #[test]
+    fn a_timer_wakes_a_receiver_that_blocked_before_it_fired() {
+        let mut rt = runtime();
+        rt.load_module(RECV_BEAM).expect("load recv.beam");
+        let receiver = rt
+            .spawn_process("recv", "wait", vec![])
+            .expect("spawn recv:wait/0");
+
+        // Slice 1: the receiver runs and blocks on an empty mailbox — *before* any timer
+        // exists, so nothing but the receiver can have been running.
+        assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+        let blocked = rt.processes().get(receiver).expect("it stays in the table");
+        assert_eq!(blocked.state(), ProcessState::Waiting);
+        assert!(blocked.mailbox().is_empty());
+        assert!(rt.process_result(receiver).is_none(), "it has not returned");
+        assert_eq!(rt.run_queue_len(), 0, "nothing is runnable");
+
+        let reference = send_after(&mut rt, 5, receiver.to_eterm(), make_small(42));
+        assert!(rt.timers.is_timer_ref(reference), "the handle is a timer reference");
+        assert_eq!(rt.timers.pending_count(), 1);
+
+        // The pass has nothing to run, so it waits for the deadline, delivers the message
+        // and resumes the receiver through the ordinary deliver+wake path.
+        assert!(
+            rt.run_scheduler().expect("the pass waits for the deadline") >= 1,
+            "the resumed receiver ran"
+        );
+        assert_eq!(
+            signed_value(rt.process_result(receiver).expect("the receiver returned")),
+            42,
+            "the timer's message became the receive's value"
+        );
+        assert!(rt.processes().get(receiver).is_none(), "it terminated normally");
+        assert_eq!(rt.timers.pending_count(), 0, "the timer fired exactly once");
+    }
+
+    /// A **bounded** step never sleeps on a pending deadline — `run_one_slice` is a step, not
+    /// a wait — while the unbounded pass does wait, and the message is then in the target's
+    /// mailbox without any process having run.
+    #[test]
+    fn a_bounded_step_does_not_wait_for_a_pending_deadline() {
+        let mut rt = runtime();
+        let me = rt.self_pid();
+        let reference = send_after(&mut rt, 200, me.to_eterm(), make_small(7));
+
+        let started = Instant::now();
+        assert_eq!(rt.run_one_slice().expect("nothing to run"), 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(200),
+            "a bounded step must not sleep on a deadline (took {:?})",
+            started.elapsed()
+        );
+        assert_eq!(rt.timers.pending_count(), 1, "the timer is still pending");
+
+        rt.run_scheduler().expect("the unbounded pass waits for the deadline");
+        assert_eq!(rt.timers.pending_count(), 0);
+        assert!(rt.timers.is_timer_ref(reference), "it stays a timer reference");
+        let mailbox = rt.processes().get(me).expect("the runtime's own process").mailbox();
+        assert_eq!(mailbox.len(), 1, "the message was delivered to its mailbox");
+        assert_eq!(signed_value(mailbox.iter().next().expect("the message").payload()), 7);
+    }
+
+    /// A timer whose target has died (or whose name nobody holds) is consumed without
+    /// delivering anything: the pass ends instead of hanging, and the message is dropped —
+    /// the oracle's behaviour for a dead receiver.
+    #[test]
+    fn a_timer_to_a_dead_receiver_is_dropped() {
+        let mut rt = runtime();
+        let dead = beam_process::ProcessId::new(999_999, 0);
+        let reference = send_after(&mut rt, 0, dead.to_eterm(), make_small(1));
+        assert!(rt.timers.is_timer_ref(reference));
+
+        assert_eq!(rt.run_scheduler().expect("the pass drains the deadline"), 0);
+        assert_eq!(rt.timers.pending_count(), 0, "the timer was consumed");
+        assert!(rt.processes().get(rt.self_pid()).expect("self").mailbox().is_empty());
+    }
+
+    /// Oracle: `erlang:send_after(5, self(), hello), receive X -> X end` ⇒ `hello` — the
+    /// `-eval` receive's pump waits for the deadline and rescans the mailbox.
+    #[test]
+    fn a_timer_message_reaches_a_blocking_eval_receive() {
+        let mut rt = runtime();
+        let value = rt
+            .eval("erlang:send_after(5, self(), hello), receive X -> X end")
+            .expect("the receive takes the timer's message");
+        assert_eq!(rt.atom_name_of(value).as_deref(), Some("hello"));
+        assert_eq!(rt.timers.pending_count(), 0);
+    }
+
+    /// Oracle: `erlang:send_after(5, self(), hello), receive hello -> got after 1000 ->
+    /// timeout end` ⇒ `got`.
+    #[test]
+    fn a_timer_message_is_taken_in_preference_to_a_timeout() {
+        let mut rt = runtime();
+        let value = rt
+            .eval(
+                "erlang:send_after(5, self(), hello), \
+                 receive hello -> got after 1000 -> timeout end",
+            )
+            .expect("the receive takes the timer's message");
+        assert_eq!(rt.atom_name_of(value).as_deref(), Some("got"));
     }
 }
