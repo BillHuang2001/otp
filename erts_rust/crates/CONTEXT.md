@@ -326,8 +326,9 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   oversized-flatmap writer and a private `ErlHeapBits` shim, and no process registers refc binaries.
 - `beam_bifs`'s `ets:info/1` now emits the full 15-field oracle order (hand-reproduced, `owner`=`undefined`);
   `records:get_definition/2` is now implemented via its `RecordSource` seam (no hook ⇒ the oracle's `badarg`).
-- `wire/new_fun_ext_encode` remains `unsupported` *in the gate* because `beam_rt` does not yet supply the
-  `Local`-fun identity; `beam_codec` itself encodes it byte-exactly given a `FunIdentity`.
+- `wire/new_fun_ext_encode` remains `unsupported` *in the gate*: its `-eval` lambda is an `erl_eval`
+  template closure whose identity/`num_free`/`env` are erl_eval internals no seam can derive faithfully.
+  `beam_rt` DOES now install `LocalFunIdentity`, so a **compiled module's** local fun encodes byte-exactly.
 - `beam_message` `src/layout.rs` sizes/walks fun blocks with the legacy C `ERL_FUN_SIZE` convention (2-word
   prefix, env at offset 2) instead of the frozen `beam_term::fun` layout (env at `1 + desc_words(kind)`), so
   `copy_struct` mis-sizes/mis-fixes a fun crossing a copy boundary (e.g. a `make_fun3` closure in a message);
