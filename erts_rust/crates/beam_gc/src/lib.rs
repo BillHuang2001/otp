@@ -42,9 +42,7 @@ pub use crate::any_collector::*;
 pub use crate::collector::*;
 pub use crate::config::*;
 pub use crate::copy::*;
-#[allow(unused_imports)] // populated by the heap-sizing / fragment work
 pub use crate::fragment::*;
-#[allow(unused_imports)] // populated by the heap-sizing work
 pub use crate::heap_info::*;
 pub use crate::immix::*;
 pub use crate::immix_collector::*;
@@ -59,9 +57,7 @@ pub mod prelude {
     pub use crate::collector::*;
     pub use crate::config::*;
     pub use crate::copy::*;
-    #[allow(unused_imports)] // populated by the heap-sizing / fragment work
     pub use crate::fragment::*;
-    #[allow(unused_imports)] // populated by the heap-sizing work
     pub use crate::heap_info::*;
     pub use crate::immix::*;
     pub use crate::immix_collector::*;
