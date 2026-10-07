@@ -609,7 +609,7 @@ lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
 - `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver, incl. the errno-atom failed-spawn raise and the duplex `{fd, N}` form), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
 - `src/drivers/inet/mod.rs` + `src/drivers/inet/wire.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState` (the driver state machine + socket syscalls) and the `INET_*`/`TCP_SHUT_*`/`INET_REP_*` codes + packed-address helpers + `errno_name` (the wire vocabulary)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
-- `src/abi/mod.rs` → the driver C-ABI host-layer module docs + wiring (`pub mod host/job/port/table` + re-exports) incl. the `beam_abi` wiring the four global `driver_*` slots still need
+- `src/abi/mod.rs` → the driver C-ABI host-layer module docs + wiring (`pub mod host/job/port/table` + re-exports) incl. where each of the four process-global `driver_*` slots reaches (`add_driver_entry`/`remove_driver_entry`/`lock_driver`) or refuses (`create_port`)
 - `src/abi/host.rs` → `PortHost` (the runtime atom-interning/pid/term-sink hook) + `LocalAtomPortHost` (test host) + `DriverState`/`SelectedFd` (persistent `driver_select`/timer/async state) + `AbiHost` (the `beam_abi::driver::host::DriverHost` impl over the poller/queues/timer)
 - `src/abi/job.rs` → `AsyncJobs` (the `driver_async` worker/bookkeeping) + `AsyncCompletion`/`AsyncData`
 - `src/abi/port.rs` → `DriverPort` (a loaded `ErlDrvEntry` as a `Driver`) + `DriverPort::load`/`from_library`/`poll_async` + `make_loaded` (built-in/`.so` unification) + `driver_flags`/`is_start_failure`/`load_failure`
