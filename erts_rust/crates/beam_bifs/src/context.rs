@@ -11,13 +11,15 @@
 //!   in the Rust core, so identity is injected here;
 //! * the calling module's name, when the runtime knows it ([`BifContext::current_module`])
 //!   — the oracle derives a BIF's call site from it (`erlang:load_nif/2`);
-//! * nine **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
+//! * ten **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
 //!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
 //!   `fun`-taking `lists`/`maps` BIFs), a [`PortHook`] (`open_port/2` and the
 //!   port BIFs), a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
-//!   process-dictionary BIFs) and a [`NifLoader`] (`erlang:load_nif/2`), plus a
-//!   [`RecordSource`] (`records:get_definition/2`) and a [`LocalNode`] (the
-//!   local node identity for encoding internal pid/port ids).
+//!   process-dictionary BIFs), a [`NifLoader`] (`erlang:load_nif/2`), a
+//!   [`RecordSource`] (`records:get_definition/2`), a [`LocalNode`] (the
+//!   local node identity for encoding internal pid/port ids) and a
+//!   [`LocalFunIdentity`] (the `NEW_FUN_EXT` identity of a local `make_fun3` fun,
+//!   for `term_to_binary`).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
 //!   and the `send`/`ets`/`call_fun`/port/dict/nif BIFs report `unsupported_bif`.
@@ -348,6 +350,32 @@ pub trait LocalNode {
     fn local_node(&mut self) -> Option<(Atom, u32)>;
 }
 
+/// The `NEW_FUN_EXT` (`112`) identity of a local (`make_fun3`) fun, for
+/// `term_to_binary`.
+///
+/// A `make_fun3` closure inlines only its engine-internal descriptor
+/// (`[uniq: u64][index: u32]`); its wire form additionally needs the owning
+/// module's atom and 16-byte MD5, the legacy `old_index`/`old_uniq` and a creator
+/// pid — none of which the term carries. Only the runtime that loaded the module
+/// knows them (they come from its lambda table), so they are injected through this
+/// hook; `beam_rt` supplies the concrete implementation. See
+/// [`beam_codec::FunIdentity`] for the field meanings.
+///
+/// The codec never invents those fields: answering `Ok(None)` for a fun whose
+/// identity the runtime cannot resolve preserves the codec's typed
+/// `unsupported_local_fun` rather than producing a wrong image. With no hook
+/// installed, [`BifContext::local_fun_identity`] likewise answers `Ok(None)`.
+pub trait LocalFunIdentity {
+    /// The `NEW_FUN_EXT` identity of `term` when it is a local (`make_fun3`) fun
+    /// this runtime can attribute to a loaded module, or `Ok(None)` when the
+    /// identity is unknown.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the hook's own failure.
+    fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -364,6 +392,7 @@ pub struct BifContext<'a> {
     nif_loader: Option<&'a mut dyn NifLoader>,
     record_source: Option<&'a mut dyn RecordSource>,
     local_node: Option<&'a mut dyn LocalNode>,
+    fun_identity: Option<&'a mut dyn LocalFunIdentity>,
 }
 
 impl<'a> BifContext<'a> {
@@ -385,6 +414,7 @@ impl<'a> BifContext<'a> {
             nif_loader: None,
             record_source: None,
             local_node: None,
+            fun_identity: None,
         }
     }
 
@@ -446,6 +476,13 @@ impl<'a> BifContext<'a> {
     /// Installs the local-node-identity hook used when encoding internal pid/port ids.
     pub fn with_local_node(mut self, node: &'a mut dyn LocalNode) -> Self {
         self.local_node = Some(node);
+        self
+    }
+
+    /// Installs the local-fun-identity hook used when encoding a local
+    /// (`make_fun3`) fun with `term_to_binary`.
+    pub fn with_local_fun_identity(mut self, hook: &'a mut dyn LocalFunIdentity) -> Self {
+        self.fun_identity = Some(hook);
         self
     }
 
@@ -543,6 +580,23 @@ impl<'a> BifContext<'a> {
             return hook.local_node();
         }
         self.atoms().lookup("nonode@nohost").map(|node| (node, 0))
+    }
+
+    /// The `NEW_FUN_EXT` identity of the local (`make_fun3`) fun `term`.
+    ///
+    /// With a [`LocalFunIdentity`] hook installed the hook answers; with none (or
+    /// when the hook cannot resolve the identity) this is `Ok(None)`, which leaves
+    /// the fun unencodable (`unsupported_local_fun`) rather than inventing the wire
+    /// fields.
+    ///
+    /// # Errors
+    ///
+    /// Propagates the hook's own failure.
+    pub fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+        match self.fun_identity.as_deref_mut() {
+            Some(hook) => hook.local_fun_identity(term),
+            None => Ok(None),
+        }
     }
 
     /// The installed table registry, if any.
@@ -1181,5 +1235,47 @@ mod tests {
             BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_local_node(&mut hook);
 
         assert_eq!(ctx.local_node(), Some((node, 7)));
+    }
+
+    /// A minimal `LocalFunIdentity` test double answering a fixed identity.
+    struct StubFunIdentity {
+        identity: beam_codec::FunIdentity,
+    }
+
+    impl LocalFunIdentity for StubFunIdentity {
+        fn local_fun_identity(&mut self, _term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+            Ok(Some(self.identity))
+        }
+    }
+
+    #[test]
+    fn local_fun_identity_without_a_hook_is_none() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+
+        assert_eq!(ctx.local_fun_identity(NIL).expect("no hook is Ok"), None);
+    }
+
+    #[test]
+    fn local_fun_identity_with_a_hook_delegates() {
+        let mut heap = Heap::new(16).expect("test heap");
+        let atoms = seeded_atoms();
+        let module = atoms.lookup("ok").expect("seeded");
+        let creator = beam_codec::FunPid {
+            node: module,
+            number: 10,
+            serial: 0,
+            creation: 0,
+        };
+        let expected = beam_codec::FunIdentity::new(module, [7u8; 16], 3, 9, creator);
+        let mut hook = StubFunIdentity { identity: expected };
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut hook);
+
+        assert_eq!(
+            ctx.local_fun_identity(NIL).expect("the hook answers"),
+            Some(expected)
+        );
     }
 }

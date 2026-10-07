@@ -1,6 +1,6 @@
-use beam_bifs::{AtomInterner, BifRegistry, BytesSink, LocalNode};
+use beam_bifs::{AtomInterner, BifRegistry, BytesSink, LocalFunIdentity, LocalNode};
 use beam_engine::RunOutcome;
-use beam_term::{atom_val, is_small, make_small, signed_value, Atom, AtomTable};
+use beam_term::{atom_val, is_small, make_small, signed_value, Atom, AtomTable, NIL};
 
 use super::*;
 use crate::config::RuntimeConfig;
@@ -611,4 +611,29 @@ fn term_to_binary_of_an_internal_pid_is_a_new_pid_ext() {
         .call_bif("binary", "at", 2, &[image, make_small(1)])
         .expect("binary:at/2");
     assert_eq!(signed_value(tag), 88);
+}
+
+#[test]
+fn the_local_fun_identity_hook_is_a_clean_miss_when_the_answer_is_unknown() {
+    let mut rt = runtime();
+    let node = rt.atoms().lookup("nonode@nohost");
+    // A boxed non-fun term: the runtime's own `term_to_binary(7)` image (a heap bitstring).
+    let image = {
+        let mut ctx = RuntimeContext::new(&mut rt);
+        ctx.call_bif("erlang", "term_to_binary", 1, &[make_small(7)])
+            .expect("term_to_binary(7)")
+    };
+    // `beam_bifs` consults this hook for **every** `term_to_binary` argument, so an
+    // immediate (`7`, `[]`) and a boxed non-fun (the image) must all be clean misses —
+    // never an error, never a fabricated identity. With no calling module (the `-eval`
+    // context) there is nothing to derive from at all.
+    let mut hook = FunIdentityBridge::new(rt.code_server(), None, node);
+    // `image` is a binary on the pooled, pointer-stable BIF heap, so it outlives `ctx`.
+    for term in [make_small(7), NIL, image] {
+        assert_eq!(
+            hook.local_fun_identity(term).expect("a miss is never an error"),
+            None,
+            "a non-local-fun term must be a clean no-op"
+        );
+    }
 }

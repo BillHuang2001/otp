@@ -55,6 +55,9 @@
 //! Stage 4 (`beam_gc`), which will run *here* and may move terms.
 
 mod bridges;
+mod fun_identity;
+#[cfg(test)]
+mod test_support;
 #[cfg(test)]
 mod tests;
 
@@ -81,6 +84,7 @@ use self::bridges::{
     descriptor_of, DictBridge, FunBridge, NifBridge, NodeIdentity, RecordBridge, SendBridge,
     SharedSink,
 };
+use self::fun_identity::FunIdentityBridge;
 
 /// The engine's host: the runtime, borrowed for the duration of one run, plus the
 /// output sink that run writes to.
@@ -483,6 +487,18 @@ impl<'a> RuntimeContext<'a> {
         // the `BifContext` borrow below (the context stores `&str`, but a local `String` is
         // the owner), and it is forwarded to both the NIF bridge and the nested fun bridge.
         let caller_module = self.current_module.clone();
+        // The local-fun identity: `term_to_binary/1` of a compiled module's `make_fun3`
+        // closure needs the `NEW_FUN_EXT` fields the term does not carry (module atom, module
+        // MD5, `old_index`/`old_uniq`, creator pid), which only the *loaded module* knows.
+        // Like `local_node` this hook needs **no** runtime borrow — it snapshots the caller
+        // module, its `.beam` path and the node atom — so every arm below installs it. With
+        // no calling module (the `-eval` evaluator) it answers `Ok(None)`, preserving the
+        // codec's typed `unsupported_local_fun` (see [`FunIdentityBridge`]).
+        let mut fun_identity = FunIdentityBridge::new(
+            &self.runtime.code_server,
+            caller_module.as_deref(),
+            local_node.node,
+        );
         let result = {
             let RuntimeContext {
                 runtime,
@@ -531,7 +547,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_dict_hook(&mut dict)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -556,7 +573,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_nif_loader(&mut bridge)
                     .with_current_module(caller_module.as_deref().unwrap_or(""))
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -576,7 +594,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_record_source(&mut source)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -602,7 +621,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_sender(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }
@@ -626,7 +646,8 @@ impl<'a> RuntimeContext<'a> {
                     .with_atom_interner(&mut pending)
                     .with_fun_caller(&mut bridge)
                     .with_port_hook(&mut ports)
-                    .with_local_node(&mut local_node);
+                    .with_local_node(&mut local_node)
+                    .with_local_fun_identity(&mut fun_identity);
                 if let Some(sink) = output.as_mut() {
                     context = context.with_output(sink);
                 }

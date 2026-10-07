@@ -770,3 +770,23 @@ fn an_unparseable_probe_is_unsupported_not_wrong() {
     assert!(stderr.starts_with("beam_rt: unsupported: "), "stderr: {stderr:?}");
     assert!(!stderr.contains("Usage:"), "stderr: {stderr:?}");
 }
+
+/// The corpus's `wire/new_fun_ext_encode` case stays the single honest **capability gap**.
+///
+/// `term_to_binary/1` of an `erl_eval` template closure (a `-eval` lambda) has no
+/// faithfully derivable `NEW_FUN_EXT` image — the oracle's is a closure over
+/// `erl_eval.erl`'s own arity-specialized `expr/6` lambda, which this runtime cannot
+/// reproduce — so the CLI exits 3 with exactly one `beam_rt: unsupported: … local_fun`
+/// line rather than emitting a *wrong* image. The `LocalFunIdentity` seam is scoped to a
+/// **compiled** module's local fun (see `src/context/fun_identity.rs`'s oracle test), and
+/// an `-eval` context has no calling module, so the hook is a clean miss here.
+#[test]
+fn an_eval_lambda_has_no_new_fun_ext_image_and_stays_unsupported() {
+    let (stdout, exit, stderr) = probe("term_to_binary(fun() -> ok end)", &[], Kind::Value);
+    assert!(stdout.is_empty(), "stdout: {stdout:?}");
+    assert_eq!(exit, 3, "stdout: {stdout:?} stderr: {stderr:?}");
+    assert_eq!(
+        stderr, "beam_rt: unsupported: local_fun\n",
+        "the -eval lambda must stay the typed local_fun gap, never an image"
+    );
+}

@@ -736,10 +736,12 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
 /// Because the flavour is threaded through the *encoder*, `compressed` (which deflates
 /// exactly these bytes) combines with any minor version.
 ///
-/// The context's local node identity is read **first** (it borrows `ctx` mutably) and
-/// installed on the encoder, so an internal pid/port id encodes as the oracle's
-/// `NEW_PID_EXT`/`V4_PORT_EXT`; with no resolvable local node the encoder leaves it
-/// unencodable (see [`BifContext::local_node`]).
+/// The context's local node identity and local-fun identity are read **first** (they
+/// borrow `ctx` mutably) and installed on the encoder, so an internal pid/port id
+/// encodes as the oracle's `NEW_PID_EXT`/`V4_PORT_EXT` and a local (`make_fun3`) fun
+/// as its `NEW_FUN_EXT` image; with no resolvable local node / fun identity the encoder
+/// leaves the term unencodable (see [`BifContext::local_node`] and
+/// [`BifContext::local_fun_identity`]).
 ///
 /// # Errors
 ///
@@ -748,10 +750,11 @@ fn encode_image(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> 
 /// `SystemLimit` for a value beyond a wire bound, and `error:unsupported_bif` for the
 /// local (`make_fun3`) fun that has no faithful wire image.
 fn encode_body(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> Result<Vec<u8>> {
-    // The local node identity borrows `ctx` mutably, and the encoder holds an
-    // immutable borrow of `ctx`'s atom table for its whole lifetime — so read the
-    // node first and install it afterwards.
+    // The local node identity and the local-fun identity both borrow `ctx` mutably,
+    // and the encoder holds an immutable borrow of `ctx`'s atom table for its whole
+    // lifetime — so read both first and install them afterwards.
     let local = ctx.local_node();
+    let identity = ctx.local_fun_identity(term)?;
     // The body carries no version byte; `Encoder::new_body` plus the selected
     // minor version reproduces `term_to_binary`'s tag set exactly.
     let minor_version = match options.minor_version {
@@ -762,6 +765,9 @@ fn encode_body(ctx: &mut BifContext<'_>, term: Eterm, options: &T2bOptions) -> R
     let mut encoder = Encoder::new_body(ctx.atoms()).with_minor_version(minor_version);
     if let Some((node, creation)) = local {
         encoder = encoder.with_local_node(node, creation);
+    }
+    if let Some(identity) = identity {
+        encoder = encoder.with_fun_identity(identity);
     }
     encoder.encode(term)?;
     Ok(encoder.finish())
@@ -1930,6 +1936,65 @@ mod tests {
                 vec![131, 107, 0, 3, 1, 2, 3]
             );
         });
+    }
+
+    /// A [`LocalFunIdentity`](crate::context::LocalFunIdentity) test double answering
+    /// one fixed identity, so the `term_to_binary` local-fun encode path can be
+    /// exercised end-to-end.
+    struct FixedFunIdentity {
+        identity: beam_codec::FunIdentity,
+    }
+
+    impl crate::context::LocalFunIdentity for FixedFunIdentity {
+        fn local_fun_identity(&mut self, _term: Eterm) -> Result<Option<beam_codec::FunIdentity>> {
+            Ok(Some(self.identity))
+        }
+    }
+
+    /// A local (`make_fun3`) fun term of `arity` with a zeroed 2-word descriptor
+    /// (`[uniq][index]`) — the frozen `[thing_word, uniq, index, env…]` layout
+    /// `beam_term::fun` writes. Returns the boxed storage (which must outlive the
+    /// term) alongside the term; `beam_codec`'s `make_fun_local` is test-gated and
+    /// this crate denies `unsafe_code`, so the words are built directly.
+    fn local_fun(arity: u32) -> (Box<[Eterm]>, Eterm) {
+        let words: Box<[Eterm]> = vec![
+            Eterm::from_raw(beam_term::FUN_SUBTAG | ((arity as usize) << 8)),
+            Eterm::from_raw(0), // uniq  — the engine-internal descriptor
+            Eterm::from_raw(0), // index
+        ]
+        .into_boxed_slice();
+        let term = beam_term::make_boxed(words.as_ptr());
+        (words, term)
+    }
+
+    #[test]
+    fn term_to_binary_of_a_local_fun_is_unsupported_without_an_identity_hook() {
+        with_ctx(|ctx| {
+            let (_storage, fun) = local_fun(1);
+            let err = term_to_binary_1(ctx, &[fun]).expect_err("no identity => unsupported");
+            assert!(
+                beam_codec::error::is_unsupported_local_fun(&err),
+                "a local fun without an identity must report the local-fun reason, got {err:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn term_to_binary_of_a_local_fun_uses_the_identity_hook() {
+        let mut heap = heap();
+        let atoms = table();
+        let module = atoms.lookup("hello").expect("seeded");
+        let creator = beam_codec::FunPid { node: module, number: 10, serial: 0, creation: 0 };
+        let identity = beam_codec::FunIdentity::new(module, [7u8; 16], 3, 9, creator);
+        let mut hook = FixedFunIdentity { identity };
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+            .with_local_fun_identity(&mut hook);
+        let (_storage, fun) = local_fun(1);
+
+        let image =
+            text(term_to_binary_1(&mut ctx, &[fun]).expect("the identity makes it encodable"));
+        assert_eq!(image[0], 131, "VERSION_MAGIC");
+        assert_eq!(image[1], 112, "NEW_FUN_EXT");
     }
 
     #[test]

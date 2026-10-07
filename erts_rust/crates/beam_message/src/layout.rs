@@ -18,14 +18,31 @@ use beam_alloc::Heap;
 use beam_common::Result;
 use beam_term::prelude::*;
 
-/// `FUN_HEADER_ENV_SIZE_OFFS` (`erl_fun.h`): the bit offset of a fun header's free-variable
-/// count (`fun_num_free`).
-const FUN_HEADER_ENV_SIZE_OFFS: u32 = 16;
-
-/// `fun_num_free(hdr)` — the number of free variables in a fun's environment.
+/// The word offset of `env[0]` in the fun block headed by `header`: `1 + desc_words(kind)`.
+///
+/// Derived from the **frozen** fun layout owned by `beam_term::fun` (the M1 inlined-descriptor
+/// substitution replaces the C `entry` pointer with `desc_words(kind)` descriptor words), and
+/// **not** from the legacy C `ERL_FUN_SIZE = 2`, which would land on the second descriptor word
+/// (a raw `index`/`uniq`/module word) instead of the environment.
+///
+/// Ground truth: `beam_term::fun::fun_env_offset_header` / `fun_desc_words_header`, mirroring
+/// `beam_gc::copy::scan_step`.
 #[inline]
-fn fun_num_free(header: Eterm) -> usize {
-    ((header.raw() >> FUN_HEADER_ENV_SIZE_OFFS) & 0xFF) as usize
+fn fun_env_offset(header: Eterm) -> usize {
+    // `fun_kind_of_header` is the infallible bit extraction and is valid because every caller
+    // tests `FUN_SUBTAG` first; no `Result` on a path that cannot fail.
+    1 + fun_desc_words(fun_kind_of_header(header))
+}
+
+/// The words the fun block headed by `header` occupies, header word included:
+/// `1 + desc_words(kind) + num_free`.
+///
+/// Ground truth: `beam_term::fun::fun_words` / `fun_block_words_header` (and
+/// `beam_gc::copy::move_size`); deliberately not `thing_arityval`-based, because a fun header
+/// carries the C `ERL_FUN_SIZE - 1` value in its arity field.
+#[inline]
+fn fun_block_words(header: Eterm) -> usize {
+    fun_words(fun_kind_of_header(header), fun_num_free(header))
 }
 
 /// The number of heap words the object headed by `header` occupies, header word included.
@@ -42,7 +59,7 @@ fn fun_num_free(header: Eterm) -> usize {
 pub(crate) fn object_words(header: Eterm, object: *const Eterm) -> usize {
     match header.raw() & TAG_HEADER_MASK {
         ARITYVAL_SUBTAG | RECORD_SUBTAG => header_arity(header) + 1,
-        FUN_SUBTAG => ERL_FUN_SIZE + fun_num_free(header),
+        FUN_SUBTAG => fun_block_words(header),
         MAP_SUBTAG if is_flatmap_header(header) => {
             // `flatmap_t = [thing_word, size, keys, V0..V(size-1)]` => `1 + 1 + 1 + size` words.
             // SAFETY: `object` points at a live flatmap head; word 1 is its untagged size word.
@@ -87,8 +104,10 @@ pub(crate) fn for_each_child_slot(
             }
         }
         FUN_SUBTAG => {
-            let num_free = fun_num_free(header);
-            for offset in ERL_FUN_SIZE..ERL_FUN_SIZE + num_free {
+            // `env[i]` lives at `1 + desc_words(kind) + i` (the frozen `beam_term::fun` layout),
+            // never at the legacy C `ERL_FUN_SIZE`.
+            let env = fun_env_offset(header);
+            for offset in env..env + fun_num_free(header) {
                 visit(offset);
             }
         }
@@ -216,9 +235,18 @@ mod tests {
         assert_eq!(object_words(HEADER_SUB_BITS, ptr), 5);
         // A tuple header of arity 3 => 4 words.
         assert_eq!(object_words(make_arityval(3), ptr), 4);
-        // A fun header: ERL_FUN_SIZE (2) + `num_free` (env-size bits at offset 16).
-        let fun_hdr = Eterm::from_raw(FUN_SUBTAG | (2usize << 8) | (3usize << 16));
-        assert_eq!(object_words(fun_hdr, ptr), ERL_FUN_SIZE + 3);
+        // A fun header: `1 + desc_words(kind) + num_free` from the frozen `beam_term::fun`
+        // layout — 6 words for a `Local` fun (2 descriptor words: uniq, index) with 3 free vars.
+        let fun_hdr = make_fun_header(2, 3, FunKind::Local).expect("a valid fun header");
+        assert_eq!(object_words(fun_hdr, ptr), 1 + 2 + 3);
+        assert_eq!(object_words(fun_hdr, ptr), fun_words(FunKind::Local, 3));
+        // An `EXPORT_EXT` fun carries 2 descriptor words and no environment.
+        let ext_hdr = make_fun_header(1, 0, FunKind::External).expect("a valid fun header");
+        assert_eq!(object_words(ext_hdr, ptr), 1 + 2);
+        // A `NEW_FUN_EXT` fun carries 10 descriptor words.
+        let imp_hdr = make_fun_header(1, 2, FunKind::Imported).expect("a valid fun header");
+        assert_eq!(object_words(imp_hdr, ptr), 1 + 10 + 2);
+        assert_eq!(object_words(imp_hdr, ptr), fun_words(FunKind::Imported, 2));
     }
 
     #[test]
@@ -244,10 +272,31 @@ mod tests {
         for_each_child_slot(make_arityval(3), ptr, |offset| tuple.push(offset));
         assert_eq!(tuple, vec![1, 2, 3]);
 
-        let fun_hdr = Eterm::from_raw(FUN_SUBTAG | (2usize << 8) | (1usize << 16));
+        let fun_hdr = make_fun_header(1, 1, FunKind::Local).expect("a valid fun header");
         let mut fun = Vec::new();
         for_each_child_slot(fun_hdr, ptr, |offset| fun.push(offset));
-        assert_eq!(fun, vec![ERL_FUN_SIZE]);
+        assert_eq!(
+            fun,
+            vec![1 + 2],
+            "`env[0]` is at `1 + desc_words(Local)`, not `ERL_FUN_SIZE`"
+        );
+
+        let imp_hdr = make_fun_header(1, 2, FunKind::Imported).expect("a valid fun header");
+        let mut imp_env = Vec::new();
+        for_each_child_slot(imp_hdr, ptr, |offset| imp_env.push(offset));
+        assert_eq!(
+            imp_env,
+            vec![1 + 10, 1 + 10 + 1],
+            "an imported fun's env follows 10 words"
+        );
+
+        let ext_hdr = make_fun_header(1, 0, FunKind::External).expect("a valid fun header");
+        let mut no_env = Vec::new();
+        for_each_child_slot(ext_hdr, ptr, |offset| no_env.push(offset));
+        assert!(
+            no_env.is_empty(),
+            "an `EXPORT_EXT` fun has no environment and no navigable child"
+        );
 
         let mut none = Vec::new();
         for_each_child_slot(HEADER_FLONUM, ptr, |offset| none.push(offset));

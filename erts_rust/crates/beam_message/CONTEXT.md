@@ -309,6 +309,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   roots back in order; a fragmented 256-byte `RefcBinary` moves the **handle** (same `data_ptr`, bytes
   unchanged, refcount 2 = source + receiver, the pair `ERL_REFC_BITS_SIZE` on the receiver heap); and
   fragment accounting (`used`/`capacity`/`total_used_words`, the receiver heap staying empty).
+- `tests/fun.rs` — a **closure crossing a copy boundary** is sized/walked from the frozen
+  `beam_term::fun` layout (`env[0]` at `1 + desc_words(kind)`, block `1 + desc_words(kind) + num_free`),
+  never the legacy C `ERL_FUN_SIZE`: a 0-free-variable (`make_fun`) closure and a 5-free-variable
+  (`make_fun3`) closure with boxed free variables copy to exactly their block + environment graphs
+  (`dst.used() == fun_words(Local, n) + size_object(env graphs)`, no trailing/duplicated word), compare
+  `=:=` to the original, encode to byte-identical `NEW_FUN_EXT`, still resolve to a callable lambda
+  (a test lambda table stands in for `beam_engine`'s, since the wave DAG forbids
+  `beam_message → beam_engine`), and `env[0]` is fixed up **into the destination heap** while the raw
+  `uniq`/`index` descriptor words are copied verbatim.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
@@ -354,24 +363,12 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   today nothing sweeps them, the `Message`'s own `Drop` releases them. A **fragmented** message instead
   leaves those lists empty: its payload's off-heap objects live in the fragment's `off_heap` table until
   `Fragments::move_into` hands them to the destination table.
-- **Fun blocks are mis-sized/mis-walked: the copier uses the C `ERL_FUN_SIZE` prefix, not the frozen
-  `beam_term::fun` inlined-descriptor layout.** `layout.rs` treats a fun as `[header][2 words][env]` —
-  `object_words` is `ERL_FUN_SIZE + num_free` (line 45) and `for_each_child_slot` visits env slots
-  `ERL_FUN_SIZE..ERL_FUN_SIZE + num_free` (lines 89-93) — i.e. the legacy C `ErlFunThing`
-  (`thing_word` + one `entry` pointer). The frozen layout `beam_term::fun` (and its consumer
-  `beam_gc::copy::{move_size,scan_step}`) instead places the env at `1 + desc_words(kind)` (3 for a
-  `Local`/`External` fun, 11 for an `Imported` one) with block `1 + desc_words(kind) + num_free`.
-  Consequence: `copy_struct` under-sizes a copied fun by `desc_words(kind) - 1` words and visits the
-  wrong slots (for `num_free == 1` it reads the descriptor's 2nd word as a term and never fixes up the
-  real env word, leaving the copied env pointing at the source heap). No test copies a fun, so this is
-  latent; fix by routing funs through `beam_term::fun::{fun_env_offset_header, fun_block_words_header}`.
-  (The `layout.rs` unit tests currently pin the wrong `ERL_FUN_SIZE` geometry.)
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`)
 - `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`); the `ErlHeapFragment` message-buffer model
-- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding
+- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding. A fun's block size (`1 + desc_words(kind) + num_free`) and its `env[0]` offset (`1 + desc_words(kind)`) come from `beam_term::fun` (`fun_kind_of_header`/`fun_desc_words`/`fun_num_free`), never the legacy C `ERL_FUN_SIZE`
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
 - `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO
@@ -382,6 +379,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `tests/binary.rs` → refc-binary payload sharing (refcount, `data_ptr`, `orig` fix-up, size) + on-heap small-binary copy-by-value
 - `tests/external.rs` → external pid/port/ref verbatim copy + node linkage/refcounting
 - `tests/queue.rs` → `send`/`receive` + FIFO queue integration + the `QueueCursor` scan/remove path
+- `tests/fun.rs` → closure copy correctness: `make_fun`/`make_fun3` blocks sized/walked from the frozen `beam_term::fun` layout, `=:=` equality, byte-identical `NEW_FUN_EXT`, callability, `env[0]` fix-up
 - `tests/fragments.rs` → the fragment-model evidence: `send` vs `send_fragmented`, `move_into` (payload onto the receiver heap + off-heap transfer), the multi-fragment chain, refc-binary handle move, accounting
 - `../../erts/emulator/beam/copy.c` → the authoritative copier (`copy_struct_x`/`size_object_x`/`copy_shared_*`/`erts_move_multi_frags`) (read-only)
 - `../../erts/emulator/beam/erl_message.h` / `erl_message.c` → the message envelope, `ErlHeapFragment`, queue layout (read-only)
