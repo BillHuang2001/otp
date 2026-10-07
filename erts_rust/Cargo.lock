@@ -138,6 +138,8 @@ dependencies = [
 name = "beam_io"
 version = "0.1.0"
 dependencies = [
+ "beam_abi",
+ "beam_alloc",
  "beam_common",
  "beam_process",
  "beam_term",
