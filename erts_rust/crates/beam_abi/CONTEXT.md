@@ -359,6 +359,12 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   tuple (excluding `thread_type/0`, the documented scheduler deviation); `nif_mapiter.rs`'s
   `the_oracle_agrees_on_the_flat_map_key_order` runs the real `erl` over a generated module
   (`maps:from_list/1` → `maps:keys/1`) and requires the fixture's C-side walk order to equal it.
+  `nif_resource.rs`'s expected tuples for `load_status`/`roundtrip`/`roundtrip_value`/`post_release`
+  are the **measured oracle values** (OTP 29.1.1 / erts-17.1) — including the post-release read
+  (`post_release/0` = `{1,42,0}`) that pins the resource-term retention rule. `dtor_probe/0` +
+  `dtor_state/0` are **Rust-only**: the oracle cannot run them (its C `enif_release_resource(NULL)`/
+  `enif_keep_resource(NULL)` dereference the operand and segfault), so they pin the synchronous-dtor
+  substitution on the Rust side alone.
 - **Loud `SKIP:`, never a silent pass.** `common::compile_so` prints a `SKIP:` banner and returns
   `None` when the C compiler or the OTP include directory is missing; every test then skips rather
   than failing or silently passing.
@@ -369,7 +375,9 @@ All C enum-with-values types (`ErlNifCharEncoding`, `ErlNifTimeUnit`, `ErlNifMap
   (boxed), the loaded library and the term, and reads the term only through the session.
 - In-module `#[cfg(test)]` unit tests cover the seam's unsafe surface and the new families:
   `src/nif/enif/tests.rs`, `src/nif/enif/process_tests.rs`, `src/nif/enif/mapiter_tests.rs`,
-  `src/driver/drv/port_tests.rs` (a path-included child of `port`), and `src/sync/tests.rs`.
+  `src/nif/enif/resources_tests.rs` (the resource-term retention rule and the unexported-object
+  destructor), `src/driver/drv/port_tests.rs` (a path-included child of `port`), and
+  `src/sync/tests.rs`.
 - Gate: `../scripts/cargo.sh test -p beam_abi` GREEN and `../scripts/cargo.sh build --workspace`
   GREEN (warning-free). Cross-checking behaviour against real ERTS is `../../tools/differential`'s job
   (sibling — read-only, escalate writes to `..`).
@@ -445,8 +453,16 @@ writers over the host's `beam_alloc::Heap`, atoms through `NifHost::intern_atom`
 - **`resources`** — the eleven resource slots over a crate-internal resource-type registry plus a
   real refcounted allocation (`enif_open_resource_type`/`_x`/`init_resource_type`/`alloc_resource`/
   `release_resource`/`keep_resource`/`make_resource`/`make_resource_binary`/`get_resource`/
-  `sizeof_resource`/`dynamic_resource_call`). A resource *term* is the host's `make_ref` term
-  (recorded term-word → object; the C's magic-ref has no `beam_term` analogue).
+  `sizeof_resource`/`dynamic_resource_call`). A resource *term* is an internal reference **minted by
+  this module** (not through the host's `make_ref` hook, whose default is `None` on the real runtime)
+  and recorded term-word → object; the C's magic-ref has no `beam_term` analogue. An exporting call
+  (`enif_make_resource`/`enif_make_resource_binary`) takes **its own reference** on the object —
+  exactly the reference the C magic ref holds — so a released-but-term-wrapped object stays alive and
+  `enif_get_resource` keeps resolving it (oracle-verified). **The one deviation:** there is no GC, so
+  that reference is never dropped — an object ever exported as a term is retained (block + payload)
+  for the process lifetime and its destructor never runs; an object never exported is destroyed on its
+  last release, with the destructor run **synchronously** (the C schedules it on a misc aux-work
+  thread). The count/ordering of destructor runs matches the oracle; only the timing differs.
 - **`select`** — `enif_select`/`enif_select_x` reproduce the C's argument handling and return codes
   and hand the request to `NifHost::select` (the poller is `beam_io`'s); a request no host can
   service answers `-1`.
@@ -616,7 +632,7 @@ Failure variants and their reason atoms (`erl_bif_ddll.c:1709-1720`): `NoDriverI
 - `src/nif/types.rs` → NIF `#[repr(C)]` structs/enums/flags/fn-type aliases (from `erl_nif.h`), incl. the opaque `ErlNifEnv`
 - `src/nif/api.rs` → `ErlNifApi` (176-entry `enif_*` function table + `ERL_NIF_API_FIELD_COUNT`; generated, header-ordered)
 - `src/nif/host.rs` → the host seam: `NifHost` (heap/atoms + the defaulted service hooks) + `NifEnv` (per-call env behind `*mut ErlNifEnv`, exception slot, `as_ptr`/`from_opaque`; `new` publishes the host on the thread-local current-host stack, `Drop` pops it) + the `pub(crate)` `with_current_host` reader behind `enif_alloc_env`
-- `src/nif/enif/` → **one file per `enif_*` family** (`mem`, `get`, `make`, `map`, `pred`, `proc`, `process`, `exception`, `threads`, `ioq`, `mapiter`, `time`, `resources`, `select`, `envs`, `variadic`), each owning its `pub(super) const fn populate`; `mod.rs` holds the shared helpers, the submodule wiring and the `ENIF_API` chain; `tests.rs`/`process_tests.rs`/`mapiter_tests.rs` are test-only children
+- `src/nif/enif/` → **one file per `enif_*` family** (`mem`, `get`, `make`, `map`, `pred`, `proc`, `process`, `exception`, `threads`, `ioq`, `mapiter`, `time`, `resources`, `select`, `envs`, `variadic`), each owning its `pub(super) const fn populate`; `mod.rs` holds the shared helpers, the submodule wiring and the `ENIF_API` chain; `tests.rs`/`process_tests.rs`/`mapiter_tests.rs`/`resources_tests.rs` are test-only children
 - `src/nif/loader.rs` → the dynamic NIF loader: `NifLibrary`, `NifLoadError`/`NifCallError`, `load()` (dlopen/dlsym + oracle-order validation), `NifLibrary::call`, `Drop` (unload + dlclose)
 - `src/driver/types.rs` → driver `#[repr(C)]` structs/enums/flags + `ErlDrvEntry` (from `erl_driver.h`) + `ERTS_INVALID_ERL_DRV_PORT` (the invalid-port sentinel, pointer `-1`)
 - `src/driver/api.rs` → `ErlDrvApi` (111-entry `driver_*`/`erl_drv_*` function table) + `ErlDrvApi::empty()`
