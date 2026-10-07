@@ -1,13 +1,24 @@
-//! Process-dictionary BIFs for `erlang`: `put/2`, `get/1`, `erase/1`,
-//! `get_keys/0` and `get_keys/1`.
+//! Process-dictionary BIFs for `erlang`: `put/2`, `get/0`, `get/1`, `erase/0`,
+//! `erase/1`, `get_keys/0` and `get_keys/1`.
 //!
-//! Ground truth (read-only): `bif erlang:put/2`, `erlang:get/1`, `erlang:erase/1`,
-//! `erlang:get_keys/0` and `erlang:get_keys/1` in
-//! `../../erts/emulator/beam/bif.tab` and `../../erts/emulator/beam/erl_bif_proc.c`,
-//! over the store in `../../erts/emulator/beam/erl_process_dict.c`. There is **no**
-//! `erlang:erase/2` in OTP — the dictionary offers only `erase/1` (one key). The
-//! `erlang:erase/0` and `erlang:get/0` BIFs are a separate concern and are not part
-//! of this set.
+//! Ground truth (read-only): `bif erlang:put/2`, `erlang:get/0`, `erlang:get/1`,
+//! `erlang:erase/0`, `erlang:erase/1`, `erlang:get_keys/0` and `erlang:get_keys/1`
+//! in `../../erts/emulator/beam/bif.tab` (lines 63–64, 75–77, 134, 653) and
+//! `../../erts/emulator/beam/erl_process_dict.c` (`get_0:315`, `get_1:324`,
+//! `get_keys_0:333`, `get_keys_1:343`, `put_2:353`, `erase_0:363`, `erase_1:373`).
+//! There is **no** `erlang:erase/2` in OTP — the dictionary offers only `erase/1`
+//! (one key) and `erase/0` (the whole store).
+//!
+//! # `get/0` and `erase/0` render the store's own order
+//!
+//! The C walks an internal hash table (`pd_hash_get_all`,
+//! `erl_process_dict.c:579`), prepending each pair, so the returned list's order
+//! is an artefact of the hash layout — **implementation-defined**, not insertion
+//! order. Oracle (erts-17.1): a fresh process gives `[]`, `put(a,1), put(b,2)`
+//! gives `[{a,1},{b,2}]`, but twelve keys come back in descending-key order.
+//! The [`DictHook`](crate::context::DictHook) therefore hands the pairs over in
+//! *its* order and this layer renders that order **verbatim**, never sorting or
+//! otherwise reordering (ordering is the store's concern).
 //!
 //! # The store is a runtime seam
 //!
@@ -63,6 +74,32 @@ fn erase(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     }
 }
 
+/// Renders `{Key, Value}` pairs as a list of 2-tuples, preserving the store's
+/// order verbatim (see the module docs).
+fn pairs_to_list(ctx: &mut BifContext<'_>, pairs: &[(Eterm, Eterm)]) -> Result<Eterm> {
+    let mut tuples = Vec::with_capacity(pairs.len());
+    for &(key, value) in pairs {
+        tuples.push(ctx.tuple(&[key, value])?);
+    }
+    ctx.list(&tuples)
+}
+
+/// `erlang:get/0` — the whole process dictionary as a list of `{Key, Value}`
+/// 2-tuples, in the store's own order (`get_0`, `erl_process_dict.c:315`). A
+/// fresh process gives `[]`.
+fn get_all(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let pairs = ctx.dict_get_all()?;
+    pairs_to_list(ctx, &pairs)
+}
+
+/// `erlang:erase/0` — empties the process dictionary and returns the pairs it
+/// held, in the store's own order (`erase_0`, `erl_process_dict.c:363`). An
+/// empty dictionary gives `[]` and leaves it empty.
+fn erase_all(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
+    let pairs = ctx.dict_erase_all()?;
+    pairs_to_list(ctx, &pairs)
+}
+
 /// `erlang:get_keys/0` — the list of keys in the process dictionary.
 fn get_keys0(ctx: &mut BifContext<'_>, _args: &[Eterm]) -> Result<Eterm> {
     let keys = ctx.dict_get_keys()?;
@@ -76,11 +113,13 @@ fn get_keys1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.list(&keys)
 }
 
-/// Registers `erlang:put/2`, `erlang:get/1`, `erlang:erase/1`,
-/// `erlang:get_keys/0` and `erlang:get_keys/1`.
+/// Registers `erlang:put/2`, `erlang:get/0`, `erlang:get/1`, `erlang:erase/0`,
+/// `erlang:erase/1`, `erlang:get_keys/0` and `erlang:get_keys/1`.
 pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("erlang", "put", 2, put);
+    reg.register("erlang", "get", 0, get_all);
     reg.register("erlang", "get", 1, get);
+    reg.register("erlang", "erase", 0, erase_all);
     reg.register("erlang", "erase", 1, erase);
     reg.register("erlang", "get_keys", 0, get_keys0);
     reg.register("erlang", "get_keys", 1, get_keys1);
@@ -96,12 +135,15 @@ mod tests {
     use beam_term::{atom_val, is_list, make_small, AtomTable, NIL};
 
     /// A `DictHook` that records the calls and stores pairs by raw `Eterm`
-    /// equality, mirroring [`beam_process::Dict`].
+    /// equality, mirroring [`beam_process::Dict`]. Its `get_all`/`erase_all`
+    /// return the pairs in stored order (the C's hash order is the store's
+    /// concern, see the module docs).
     #[derive(Default)]
     struct StubDict {
         entries: Vec<(Eterm, Eterm)>,
         puts: Vec<(Eterm, Eterm)>,
         erases: Vec<Eterm>,
+        erase_alls: usize,
     }
 
     impl DictHook for StubDict {
@@ -143,6 +185,15 @@ mod tests {
                 .filter(|&&(_, stored)| stored == value)
                 .map(|&(key, _)| key)
                 .collect())
+        }
+
+        fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+            Ok(self.entries.clone())
+        }
+
+        fn erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+            self.erase_alls += 1;
+            Ok(core::mem::take(&mut self.entries))
         }
     }
 
@@ -268,27 +319,84 @@ mod tests {
     }
 
     #[test]
+    fn get_0_renders_the_whole_dictionary() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = atoms();
+        let mut hook = StubDict::default();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_dict_hook(&mut hook);
+
+        // A fresh process gives `[]`.
+        assert_eq!(get_all(&mut ctx, &[]).expect("the hook answers"), NIL);
+
+        put(&mut ctx, &[make_small(1), make_small(10)]).expect("the hook stores");
+        put(&mut ctx, &[make_small(2), make_small(20)]).expect("the hook stores");
+
+        let listed = get_all(&mut ctx, &[]).expect("the hook answers");
+        assert!(is_list(listed));
+        let t1 = ctx.tuple(&[make_small(1), make_small(10)]).expect("fits");
+        let t2 = ctx.tuple(&[make_small(2), make_small(20)]).expect("fits");
+        let expected = ctx.list(&[t1, t2]).expect("fits");
+        assert!(beam_term::compare::eq(listed, expected, ctx.atoms()));
+        // `get/0` does not erase: the dictionary is still there.
+        assert!(ctx.dict_get(make_small(1)).expect("the hook answers").is_some());
+    }
+
+    #[test]
+    fn erase_0_empties_the_dictionary_and_returns_the_pairs() {
+        let mut heap = Heap::new(64).expect("test heap");
+        let atoms = atoms();
+        let mut hook = StubDict::default();
+
+        {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_dict_hook(&mut hook);
+
+            // An empty dictionary: `[]`, and still empty.
+            assert_eq!(erase_all(&mut ctx, &[]).expect("the hook answers"), NIL);
+
+            put(&mut ctx, &[make_small(1), make_small(10)]).expect("the hook stores");
+            put(&mut ctx, &[make_small(2), make_small(20)]).expect("the hook stores");
+
+            let erased = erase_all(&mut ctx, &[]).expect("the hook answers");
+            let t1 = ctx.tuple(&[make_small(1), make_small(10)]).expect("fits");
+            let t2 = ctx.tuple(&[make_small(2), make_small(20)]).expect("fits");
+            let expected = ctx.list(&[t1, t2]).expect("fits");
+            assert!(is_list(erased));
+            assert!(beam_term::compare::eq(erased, expected, ctx.atoms()));
+            // The store really is empty now.
+            assert_eq!(get_keys0(&mut ctx, &[]).expect("the hook answers"), NIL);
+        }
+
+        assert_eq!(hook.erase_alls, 2);
+    }
+
+    #[test]
     fn every_dict_bif_is_unsupported_without_a_hook() {
         let mut heap = Heap::new(32).expect("test heap");
         let atoms = atoms();
         let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
 
         assert_unsupported(put(&mut ctx, &[make_small(1), make_small(2)]));
+        assert_unsupported(get_all(&mut ctx, &[]));
         assert_unsupported(get(&mut ctx, &[make_small(1)]));
+        assert_unsupported(erase_all(&mut ctx, &[]));
         assert_unsupported(erase(&mut ctx, &[make_small(1)]));
         assert_unsupported(get_keys0(&mut ctx, &[]));
         assert_unsupported(get_keys1(&mut ctx, &[make_small(2)]));
     }
 
     #[test]
-    fn register_installs_the_five_dict_bifs() {
+    fn register_installs_the_seven_dict_bifs() {
         let mut reg = BifRegistry::new();
         register(&mut reg);
         assert!(reg.contains("erlang", "put", 2));
+        assert!(reg.contains("erlang", "get", 0));
         assert!(reg.contains("erlang", "get", 1));
+        assert!(reg.contains("erlang", "erase", 0));
         assert!(reg.contains("erlang", "erase", 1));
         assert!(reg.contains("erlang", "get_keys", 0));
         assert!(reg.contains("erlang", "get_keys", 1));
-        assert_eq!(reg.len(), 5);
+        assert_eq!(reg.len(), 7);
     }
 }

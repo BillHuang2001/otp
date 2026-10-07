@@ -11,18 +11,25 @@
 //!   in the Rust core, so identity is injected here;
 //! * the calling module's name, when the runtime knows it ([`BifContext::current_module`])
 //!   — the oracle derives a BIF's call site from it (`erlang:load_nif/2`);
-//! * ten **optional** seams: an [`OutputSink`] (`io:format`), a [`SendHook`]
-//!   (`send/2`), a [`TableRegistry`] (`ets:*`), a [`FunCaller`] (the
-//!   `fun`-taking `lists`/`maps` BIFs), a [`PortHook`] (`open_port/2` and the
+//! * an expanding set of **optional seams**: an [`OutputSink`] (`io:format`), a
+//!   [`SendHook`] (`send/2`), a [`TableRegistry`] (`ets:*`), an [`AtomInterner`]
+//!   (the atom-creating conversions), a [`FunCaller`] (the `fun`-taking
+//!   `lists`/`maps` BIFs), a [`PortHook`] (the
 //!   port BIFs), a [`DictHook`] (the `put/2`/`get/1`/`erase/1`/`get_keys/*`
 //!   process-dictionary BIFs), a [`NifLoader`] (`erlang:load_nif/2`), a
 //!   [`RecordSource`] (`records:get_definition/2`), a [`LocalNode`] (the
-//!   local node identity for encoding internal pid/port ids) and a
+//!   local node identity for encoding internal pid/port ids), a
 //!   [`LocalFunIdentity`] (the `NEW_FUN_EXT` identity of a local `make_fun3` fun,
-//!   for `term_to_binary`).
+//!   for `term_to_binary`), a [`ModuleInfo`] (`erlang:get_module_info/1,2`) and a
+//!   [`ProcessHook`] (the process/name/global-state queries — `whereis/1`,
+//!   `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
+//!   `processes/0`, `ports/0`, `process_info/1,2`, `process_flag/2` and
+//!   `group_leader/0`), a [`PersistentTerm`] (the node-global persistent-term store
+//!   behind the seven `persistent_term:*` BIFs).
 //!   `beam_engine` depends only on `beam_loader`, so `beam_rt` supplies the
 //!   concrete implementations; an unset seam means `io:format` writes to stdout
-//!   and the `send`/`ets`/`call_fun`/port/dict/nif BIFs report `unsupported_bif`.
+//!   and the `send`/`ets`/`call_fun`/port/dict/nif/process BIFs report
+//!   `unsupported_bif`.
 
 use beam_alloc::Heap;
 use beam_common::{BeamError, Result};
@@ -241,8 +248,103 @@ pub trait DictHook {
     ///
     /// Reports a store failure as a [`BeamError`].
     fn get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>>;
+
+    /// `get/0` — every `{Key, Value}` pair in the store, in the store's order.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to a typed `unsupported_bif` capability gap: a hook written
+    /// before this method existed must keep compiling, and the BIF reports the
+    /// gap rather than inventing an empty dictionary.
+    fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Err(crate::error::unsupported_bif())
+    }
+
+    /// `erase/0` — empties the store, returning every `{Key, Value}` pair it
+    /// held, in the store's order.
+    ///
+    /// # Errors
+    ///
+    /// Defaults to a typed `unsupported_bif` capability gap (see
+    /// [`DictHook::get_all`]).
+    fn erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        Err(crate::error::unsupported_bif())
+    }
 }
 
+/// Reads and writes the node-global **persistent-term** store.
+///
+/// Persistent terms are a *node-global* key/value store — unlike the process
+/// dictionary they are shared by every process — held outside every process heap in
+/// their own literal area (`the_hash_table`, `erl_bif_persistent.c:187`) and
+/// updated under a table-wide permission lock with thread-progress hand-off. That
+/// machinery belongs to the Stage-5 runtime (`beam_rt`), so the seven
+/// `persistent_term:get/0`, `get/1`, `get/2`, `put/2`, `put_new/2`, `erase/1` and
+/// `info/0` BIFs route every operation through this hook; `beam_rt` supplies the
+/// concrete implementation. With no hook installed **every** one of them reports a
+/// typed `unsupported_bif` capability gap — never `[]`, never `undefined`, never
+/// `ok` and never a made-up count (workspace `CONTEXT.md` §3).
+///
+/// The BIF layer owns the rendering (the `{Key, Value}` 2-tuples of `get/0`, the
+/// `#{count, memory}` map of `info/0`, the `true`/`false` of `erase/1`) and the
+/// oracle's two `badarg` cases, which are *store* outcomes reported here: an absent
+/// key for `get/1` ([`PersistentTerm::get`] answers `None`) and a `put_new/2` onto a
+/// key already holding a different value ([`PersistentTerm::put`] answers `false`).
+pub trait PersistentTerm {
+    /// `get(Key)` — the value stored under `key`, or `None` when the key is absent
+    /// (the BIF then raises `badarg` for `get/1`, or yields the default for
+    /// `get/2`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get(&mut self, key: Eterm) -> Result<Option<Eterm>>;
+
+    /// `put(Key, Value)` / `put_new(Key, Value)` — stores `value` under `key`.
+    ///
+    /// `only_if_new` is `false` for `persistent_term:put/2` and `true` for
+    /// `persistent_term:put_new/2` (the C's `new` flag,
+    /// `erl_bif_persistent.c:642,730`). Returns `true` on success — the store was
+    /// updated, **or** `key` already held a value raw-equal to `value` (a no-op
+    /// `ok`, `:726-729`) — and `false` for the one failure the oracle raises
+    /// `badarg` for: `put_new` of a key that already holds a *different* value
+    /// (`:730-733`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn put(&mut self, key: Eterm, value: Eterm, only_if_new: bool) -> Result<bool>;
+
+    /// `erase(Key)` — erases `key`, returning whether it was present
+    /// (`persistent_term_erase_1:417`; `true` at `:539`, `false` at `:548`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn erase(&mut self, key: Eterm) -> Result<bool>;
+
+    /// `get/0` — every stored `{Key, Value}` pair, in the store's own order.
+    ///
+    /// The order is a hash-table walk and is **not** observable; this layer
+    /// preserves whatever the hook supplies and never pins it (`do_get_all:830`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>>;
+
+    /// `info/0` — the runtime's bookkeeping `(count, memory)` in bytes: the number
+    /// of stored entries and the byte total of the table plus its literal areas
+    /// (`do_info:929-978`).
+    ///
+    /// These are pure runtime accounting figures with no BIF-visible derivation, so
+    /// they must come from the hook; this layer never invents them.
+    ///
+    /// # Errors
+    ///
+    /// Reports a store failure as a [`BeamError`].
+    fn info(&mut self) -> Result<(u64, u64)>;
+}
 /// The structured failure of a NIF-load attempt.
 ///
 /// The host ([`NifLoader`]) reports *why* a load failed; the `erlang:load_nif/2`
@@ -376,6 +478,235 @@ pub trait LocalFunIdentity {
     fn local_fun_identity(&mut self, term: Eterm) -> Result<Option<beam_codec::FunIdentity>>;
 }
 
+/// Supplies the loaded-module information `erlang:get_module_info/1,2` renders.
+///
+/// A module's introspection data (`exports`, `attributes`, `compile`, `md5`,
+/// `native`, …) lives with the *loaded* `beam_loader::Module` owned by the
+/// runtime's code server — Stage-5 state that no BIF can reach. The concrete
+/// provider there implements this hook and builds the requested item's term on
+/// the caller's heap; the BIF layer itself owns only the argument decoding and
+/// the oracle's `badarg` for an unknown module/item. With no hook installed,
+/// [`BifContext::module_info`] reports a typed `unsupported_bif` capability gap
+/// — never a fabricated or empty value (workspace `CONTEXT.md` §3).
+pub trait ModuleInfo {
+    /// The value of `item` for `module`, built on `heap`, or `Ok(None)` when the
+    /// module or item is unknown (the BIF then raises `badarg`, as the oracle
+    /// does).
+    ///
+    /// # Errors
+    ///
+    /// Reports a resolution/allocation failure as a [`BeamError`].
+    fn module_info(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        module: &str,
+        item: &str,
+    ) -> Result<Option<Eterm>>;
+}
+
+/// What one `erlang:process_info/2` item resolves to.
+///
+/// The three outcomes are exactly the ones the oracle distinguishes, and their
+/// *order* matters: the C validates every requested item (`pi_arg2ix`) **before** it
+/// inspects the process (`process_info_bif`, `erl_bif_info.c:1556-1564`), so an
+/// unknown item is `badarg` even for a dead pid (probed: `process_info(<dead>,
+/// [status, frobnicate])` ⇒ `badarg` while `process_info(<dead>, [status])` ⇒
+/// `undefined`). A hook therefore answers [`ProcessInfoItem::Unknown`] without
+/// consulting the process table, and only then reports [`ProcessInfoItem::Dead`].
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum ProcessInfoItem {
+    /// The item's value, built on the caller's heap.
+    Value(Eterm),
+    /// The item is not one this runtime reports — the oracle's `badarg`.
+    Unknown,
+    /// `pid` names no live process — the oracle's `undefined`.
+    Dead,
+}
+
+/// The runtime's process/name/global-state queries: the name registry, process
+/// liveness, the process and port inventories, per-process introspection and the
+/// per-process flags.
+///
+/// The eleven BIFs behind this seam — `erlang:whereis/1`, `register/2`,
+/// `unregister/1`, `registered/0`, `is_process_alive/1`, `processes/0`,
+/// `ports/0`, `process_info/1`, `process_info/2`, `process_flag/2` and
+/// `group_leader/0` — answer questions about the *running* node: the name registry
+/// (`beam_process`/`beam_rt`'s process table), the port table and the per-process
+/// state (flags, group leader, message queue, …). None of that is reachable from a
+/// BIF, so every operation routes through this hook, whose concrete implementation
+/// the runtime supplies. With no hook installed **every** one of those BIFs reports
+/// a typed `unsupported_bif` capability gap — never a fabricated empty list, never
+/// `undefined`, never `false` and never a made-up previous flag value
+/// (workspace `CONTEXT.md` §3).
+///
+/// The BIF layer still owns the `badarg` cases the arguments alone decide (a
+/// non-atom name, the atom `undefined` as a name, an `id` that is neither an
+/// internal pid nor an internal port, a non-pid, a non-atom flag, an item
+/// specification that is neither an atom nor a proper list of atoms) and checks
+/// them *before* the hook is consulted.
+///
+/// Ground truth (read-only): `../../erts/emulator/beam/bif.c`
+/// (`register_2:2310`, `unregister_1:2324`, `whereis_1:2342`, `process_flag_2:2028`,
+/// `process_flag_aux:1897`, `group_leader_0:4903`, `processes_0:4101`,
+/// `ports_0:4129`), `../../erts/emulator/beam/register.c`
+/// (`erts_register_name:175`, `erts_whereis_name_to_id:277`, `registered_0:576`),
+/// `../../erts/emulator/beam/erl_bif_info.c` (`process_info_1:1561`,
+/// `process_info_2:1556`, `process_info_aux:1567`, `pi_1_keys:1008`,
+/// `is_process_alive_1:4069`) and `../../erts/emulator/beam/bif.tab`
+/// (`group_leader/0:78`, `process_flag/2:129`, `process_info/1:131`,
+/// `process_info/2:132`).
+pub trait ProcessHook {
+    /// `whereis(Name)` — the id registered under `name`, or `None` when `name` is
+    /// not registered (the BIF renders the atom `undefined`;
+    /// `erts_whereis_name_to_id`, `register.c:277`).
+    ///
+    /// The id is a **pid or a port** term — the oracle's registry holds either
+    /// (`erts_register_name`, `register.c:190`) — so it is handed back as the
+    /// term it is.
+    ///
+    /// # Errors
+    ///
+    /// Reports a registry failure as a [`BeamError`].
+    fn whereis(&mut self, name: Atom) -> Result<Option<Eterm>>;
+
+    /// `register(Name, Id)` — registers the process/port `id` under `name`.
+    ///
+    /// Returns `true` on success; `false` for the failure the oracle renders as
+    /// `badarg` — the name is already taken (`erts_register_name:235`), `id` is
+    /// not alive (`:212`) or `id` already has a name (`:216`). The BIF layer has
+    /// already checked that `name` is an atom other than `undefined` and that `id`
+    /// is an internal pid or an internal port (`:184,190`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a registry failure as a [`BeamError`].
+    fn register(&mut self, name: Atom, id: Eterm) -> Result<bool>;
+
+    /// `unregister(Name)` — removes `name` from the registry.
+    ///
+    /// Returns `true` on success; `false` when the oracle raises `badarg` — the
+    /// name is not registered (`erts_unregister_name`, `bif.c:2330`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a registry failure as a [`BeamError`].
+    fn unregister(&mut self, name: Atom) -> Result<bool>;
+
+    /// `registered/0` — every registered name, in the registry's own order
+    /// (`registered_0`, `register.c:576`).
+    ///
+    /// The order is an artefact of the registry's hash layout and is **not**
+    /// observable; the runtime renders whatever order its table walks in and the
+    /// BIF layer preserves it verbatim.
+    ///
+    /// # Errors
+    ///
+    /// Reports a registry failure as a [`BeamError`].
+    fn registered(&mut self) -> Result<Vec<Atom>>;
+
+    /// `is_process_alive(Pid)` — whether the internal pid `pid` names a live
+    /// process (`is_process_alive_1`, `erl_bif_info.c:4069`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn is_process_alive(&mut self, pid: ProcessId) -> Result<bool>;
+
+    /// `processes/0` — every local process, in the table's own order
+    /// (`processes_0`, `bif.c:4101`).
+    ///
+    /// The order is not observable (the oracle gives no guarantee); the BIF layer
+    /// preserves whatever the hook supplies.
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn processes(&mut self) -> Result<Vec<ProcessId>>;
+
+    /// `ports/0` — every local port, in the table's own order (`ports_0`,
+    /// `bif.c:4129`).
+    ///
+    /// The order is not observable; the BIF layer preserves whatever the hook
+    /// supplies.
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn ports(&mut self) -> Result<Vec<PortId>>;
+
+    /// `process_info/1` — the item names this runtime reports for `pid`, in the
+    /// order the oracle reports them (the C's `pi_1_keys`, `erl_bif_info.c:1008`),
+    /// or `Ok(None)` when `pid` names no live process (the BIF renders the atom
+    /// `undefined`).
+    ///
+    /// The set is the runtime's own: the oracle's `pi_1_keys` **omits**
+    /// `registered_name` for a process that has no registered name
+    /// (`erl_bif_info.c:1606-1633` documents this inconsistency), so a fixed item
+    /// list built by the BIF layer would be wrong. Handing the list back from the
+    /// hook makes a fabricated item list impossible; the hook need not (and must
+    /// not) include an item it cannot resolve through
+    /// [`ProcessHook::process_info_item`].
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn process_info_keys(&mut self, pid: ProcessId) -> Result<Option<Vec<Atom>>>;
+
+    /// `process_info/2` — one item's value for `pid`, built on `heap`.
+    ///
+    /// `item` is validated **first** (`pi_arg2ix`): an item this runtime does not
+    /// report is [`ProcessInfoItem::Unknown`] — the oracle's `badarg`, which is
+    /// decided before the process is inspected (see [`ProcessInfoItem`]). Only when
+    /// `item` is known does the hook look the process up, answering
+    /// [`ProcessInfoItem::Dead`] for a pid that names no live process (the oracle's
+    /// `undefined`).
+    ///
+    /// # Errors
+    ///
+    /// Reports a table/rendering failure as a [`BeamError`].
+    fn process_info_item(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        pid: ProcessId,
+        item: Atom,
+    ) -> Result<ProcessInfoItem>;
+
+    /// `process_flag(Flag, Value)` — sets `flag` to `value` and returns the
+    /// **previous** value (`process_flag_2`, `bif.c:2028`), or `Ok(None)` for the
+    /// oracle's `badarg`.
+    ///
+    /// `Ok(None)` covers both failure classes the hook owns: a flag this runtime
+    /// does not implement (the C's dispatch chain falls through to
+    /// `process_flag_aux`, whose `am_badarg` becomes `BIF_ERROR(…, BADARG)`,
+    /// `bif.c:2024,2233`) and an illegal `value` for a known flag (e.g.
+    /// `trap_exit` with a non-boolean). The BIF layer has already checked that
+    /// `flag` is an atom; the undocumented `{monitor_nodes, N}` tuple form is a
+    /// distribution feature and stays the argument-only `badarg`.
+    ///
+    /// # Errors
+    ///
+    /// Reports a process-state failure as a [`BeamError`].
+    fn process_flag(
+        &mut self,
+        heap: &mut Heap,
+        atoms: &AtomTable,
+        flag: Atom,
+        value: Eterm,
+    ) -> Result<Option<Eterm>>;
+
+    /// `group_leader/0` — the calling process's group leader (`group_leader_0`,
+    /// `bif.c:4903`, which returns `BIF_P->group_leader`).
+    ///
+    /// The oracle renders it as a pid term; the BIF layer does the rendering.
+    ///
+    /// # Errors
+    ///
+    /// Reports a table failure as a [`BeamError`].
+    fn group_leader(&mut self) -> Result<ProcessId>;
+}
+
 /// What a BIF may read and write during one call.
 pub struct BifContext<'a> {
     heap: &'a mut Heap,
@@ -389,10 +720,13 @@ pub struct BifContext<'a> {
     fun_caller: Option<&'a mut dyn FunCaller>,
     port: Option<&'a mut dyn PortHook>,
     dict: Option<&'a mut dyn DictHook>,
+    persistent_term: Option<&'a mut dyn PersistentTerm>,
     nif_loader: Option<&'a mut dyn NifLoader>,
     record_source: Option<&'a mut dyn RecordSource>,
     local_node: Option<&'a mut dyn LocalNode>,
     fun_identity: Option<&'a mut dyn LocalFunIdentity>,
+    module_info: Option<&'a mut dyn ModuleInfo>,
+    process: Option<&'a mut dyn ProcessHook>,
 }
 
 impl<'a> BifContext<'a> {
@@ -411,10 +745,13 @@ impl<'a> BifContext<'a> {
             fun_caller: None,
             port: None,
             dict: None,
+            persistent_term: None,
             nif_loader: None,
             record_source: None,
             local_node: None,
             fun_identity: None,
+            module_info: None,
+            process: None,
         }
     }
 
@@ -461,6 +798,13 @@ impl<'a> BifContext<'a> {
         self
     }
 
+    /// Installs the node-global persistent-term store used by the
+    /// `persistent_term:get/0,1,2`/`put/2`/`put_new/2`/`erase/1`/`info/0` BIFs.
+    pub fn with_persistent_term(mut self, hook: &'a mut dyn PersistentTerm) -> Self {
+        self.persistent_term = Some(hook);
+        self
+    }
+
     /// Installs the NIF-loading hook used by `erlang:load_nif/2`.
     pub fn with_nif_loader(mut self, loader: &'a mut dyn NifLoader) -> Self {
         self.nif_loader = Some(loader);
@@ -486,6 +830,20 @@ impl<'a> BifContext<'a> {
         self
     }
 
+    /// Installs the loaded-module-information hook used by
+    /// `erlang:get_module_info/1,2`.
+    pub fn with_module_info(mut self, source: &'a mut dyn ModuleInfo) -> Self {
+        self.module_info = Some(source);
+        self
+    }
+
+    /// Installs the process/name/global-state hook used by `erlang:whereis/1`,
+    /// `register/2`, `unregister/1`, `registered/0`, `is_process_alive/1`,
+    /// `processes/0` and `ports/0`.
+    pub fn with_process_hook(mut self, hook: &'a mut dyn ProcessHook) -> Self {
+        self.process = Some(hook);
+        self
+    }
     /// Sets the name of the module whose code is executing — the call site of a BIF
     /// (the oracle derives `erlang:load_nif/2`'s module from its call instruction).
     pub fn with_current_module(mut self, module: &'a str) -> Self {
@@ -596,6 +954,186 @@ impl<'a> BifContext<'a> {
         match self.fun_identity.as_deref_mut() {
             Some(hook) => hook.local_fun_identity(term),
             None => Ok(None),
+        }
+    }
+
+    /// The loaded module `module`'s introspection item `item`, built on the
+    /// context heap — the seam behind `erlang:get_module_info/1,2`.
+    ///
+    /// `Ok(None)` means the module or the item is unknown (the BIF renders the
+    /// oracle's `badarg`).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no
+    /// [`ModuleInfo`] hook; otherwise propagates the hook's own failure.
+    pub fn module_info(&mut self, module: &str, item: &str) -> Result<Option<Eterm>> {
+        match self.module_info.as_deref_mut() {
+            Some(hook) => hook.module_info(self.heap, self.atoms, module, item),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The id registered under `name` through the installed [`ProcessHook`], or
+    /// `None` when the name is unregistered (the BIF renders `undefined`) — the
+    /// seam behind `erlang:whereis/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_whereis(&mut self, name: Atom) -> Result<Option<Eterm>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.whereis(name),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Registers `id` under `name` through the installed [`ProcessHook`],
+    /// returning whether the registration succeeded (`false` is the oracle's
+    /// `badarg`) — the seam behind `erlang:register/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_register(&mut self, name: Atom, id: Eterm) -> Result<bool> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.register(name, id),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Removes `name` through the installed [`ProcessHook`], returning whether it
+    /// was registered (`false` is the oracle's `badarg`) — the seam behind
+    /// `erlang:unregister/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_unregister(&mut self, name: Atom) -> Result<bool> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.unregister(name),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every registered name through the installed [`ProcessHook`], in the hook's
+    /// order — the seam behind `erlang:registered/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_registered(&mut self) -> Result<Vec<Atom>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.registered(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Whether `pid` names a live process, through the installed [`ProcessHook`]
+    /// — the seam behind `erlang:is_process_alive/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_is_alive(&mut self, pid: ProcessId) -> Result<bool> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.is_process_alive(pid),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every local process through the installed [`ProcessHook`], in the hook's
+    /// order — the seam behind `erlang:processes/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_processes(&mut self) -> Result<Vec<ProcessId>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.processes(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every local port through the installed [`ProcessHook`], in the hook's order
+    /// — the seam behind `erlang:ports/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_ports(&mut self) -> Result<Vec<PortId>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.ports(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The item names `erlang:process_info/1` reports for `pid`, in the hook's
+    /// order, or `None` when `pid` names no live process (the BIF renders
+    /// `undefined`) — the seam behind `erlang:process_info/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_info_keys(&mut self, pid: ProcessId) -> Result<Option<Vec<Atom>>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_info_keys(pid),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// One `erlang:process_info/2` item's outcome for `pid` — the seam behind
+    /// `erlang:process_info/2`.
+    ///
+    /// The item is validated before the process is inspected, so an unknown item is
+    /// [`ProcessInfoItem::Unknown`] even for a dead pid (see that type).
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_info_item(&mut self, pid: ProcessId, item: Atom) -> Result<ProcessInfoItem> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_info_item(self.heap, self.atoms, pid, item),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Sets the process flag `flag` to `value` through the installed
+    /// [`ProcessHook`], returning the **previous** value, or `None` for the
+    /// oracle's `badarg` (an unknown flag or an illegal value) — the seam behind
+    /// `erlang:process_flag/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_process_flag(&mut self, flag: Atom, value: Eterm) -> Result<Option<Eterm>> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.process_flag(self.heap, self.atoms, flag, value),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The calling process's group leader through the installed [`ProcessHook`] —
+    /// the seam behind `erlang:group_leader/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn proc_group_leader(&mut self) -> Result<ProcessId> {
+        match self.process.as_deref_mut() {
+            Some(hook) => hook.group_leader(),
+            None => Err(crate::error::unsupported_bif()),
         }
     }
 
@@ -731,6 +1269,120 @@ impl<'a> BifContext<'a> {
     pub fn dict_get_keys_for_value(&mut self, value: Eterm) -> Result<Vec<Eterm>> {
         match self.dict.as_deref_mut() {
             Some(hook) => hook.get_keys_for_value(value),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every `{Key, Value}` pair of the process dictionary through the installed
+    /// [`DictHook`] — the seam behind `erlang:get/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook (or its
+    /// hook leaves [`DictHook::get_all`] at its default); otherwise propagates
+    /// the hook's own failure.
+    pub fn dict_get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.get_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Empties the process dictionary through the installed [`DictHook`],
+    /// returning every `{Key, Value}` pair it held — the seam behind
+    /// `erlang:erase/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook (or its
+    /// hook leaves [`DictHook::erase_all`] at its default); otherwise propagates
+    /// the hook's own failure.
+    pub fn dict_erase_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.dict.as_deref_mut() {
+            Some(hook) => hook.erase_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The value stored under `key` in the node-global persistent-term store
+    /// through the installed [`PersistentTerm`] hook, or `None` when the key is
+    /// absent — the seam behind `persistent_term:get/1,2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_get(&mut self, key: Eterm) -> Result<Option<Eterm>> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.get(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Stores `value` under `key` in the node-global persistent-term store through
+    /// the installed [`PersistentTerm`] hook, returning whether the store accepted
+    /// the update (`false` is the oracle's `badarg` for a `put_new` collision) —
+    /// the seam behind `persistent_term:put/2` and `put_new/2`.
+    ///
+    /// `only_if_new` is `false` for `put/2` and `true` for `put_new/2`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_put(
+        &mut self,
+        key: Eterm,
+        value: Eterm,
+        only_if_new: bool,
+    ) -> Result<bool> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.put(key, value, only_if_new),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Erases `key` from the node-global persistent-term store through the
+    /// installed [`PersistentTerm`] hook, returning whether it was present — the
+    /// seam behind `persistent_term:erase/1`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_erase(&mut self, key: Eterm) -> Result<bool> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.erase(key),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// Every `{Key, Value}` pair of the node-global persistent-term store through
+    /// the installed [`PersistentTerm`] hook, in the hook's order — the seam behind
+    /// `persistent_term:get/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_get_all(&mut self) -> Result<Vec<(Eterm, Eterm)>> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.get_all(),
+            None => Err(crate::error::unsupported_bif()),
+        }
+    }
+
+    /// The node-global persistent-term store's `(count, memory)` bookkeeping
+    /// through the installed [`PersistentTerm`] hook — the seam behind
+    /// `persistent_term:info/0`.
+    ///
+    /// # Errors
+    ///
+    /// Raises `unsupported_bif` when the runtime has installed no hook; otherwise
+    /// propagates the hook's own failure.
+    pub fn persistent_term_info(&mut self) -> Result<(u64, u64)> {
+        match self.persistent_term.as_deref_mut() {
+            Some(hook) => hook.info(),
             None => Err(crate::error::unsupported_bif()),
         }
     }

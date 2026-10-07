@@ -14,16 +14,24 @@
 //!
 //! # Module identity, keys and liveness (documented substitutions)
 //!
-//! The resource-term representation is a `NifHost::make_ref` term recorded in a process-global
-//! registry (`src/nif/enif/resources.rs` docs). Consequences visible in this test — and asserted as
-//! such, with the oracle's value called out:
+//! The resource-term representation is an internal reference minted by this crate and recorded in a
+//! process-global registry (`src/nif/enif/resources.rs` docs). Consequences visible in this test —
+//! and asserted as such, with the oracle's value called out:
 //!
 //! * a created type is visible immediately, so re-opening an existing name reports
 //!   `ERL_NIF_RT_TAKEOVER` (the `*tried` value agrees with the oracle; the oracle additionally
 //!   refuses any open outside a `load` callback, returning `NULL`);
 //! * the type is keyed by *name* only, so `enif_dynamic_resource_call` ignores the module atom;
-//! * `enif_release_resource` to zero frees immediately, so a stale term stops resolving at that
-//!   point (the oracle keeps it alive until GC).
+//! * a resource TERM holds its own reference (exactly the C magic ref's reference), so a released
+//!   object stays alive while the term is observable and `enif_get_resource` keeps resolving it —
+//!   the oracle's behaviour (`post_release/0`). **The deviation:** this crate has no GC, so the
+//!   term's reference is never dropped — an object ever exported as a term is retained for the
+//!   process lifetime and its destructor never runs (the C reclaims it when the term is collected);
+//! * the destructor runs **synchronously** here; the C schedules it on a misc aux-work thread, so an
+//!   in-call destructor count is `1` here and `0` on the oracle. The count and ordering match; only
+//!   the timing differs. The count is pinned (Rust-side only) by `dtor_probe/0` + `dtor_state/0`,
+//!   which the oracle cannot run at all: the C dereferences the `NULL` keep/release in that probe
+//!   and segfaults.
 //!
 //! # Skip-vs-fail policy
 //!
@@ -253,6 +261,9 @@ fn resource_family_end_to_end() {
     assert_eq!(tuple_ints(created), vec![0, 1]);
 
     // --- allocate / size / term / inspect / keep / release / dtor -------------------------
+    // Oracle value (measured against OTP 29.1.1 / erts-17.1): {13,1,1,1,1,0,0,-1,1,1,0,0,0,1,9,0}.
+    // The final element is the one documented timing divergence: the oracle's `x_dtor_runs` is `0`
+    // because the C only *schedules* the destructor off-thread; this runtime runs it synchronously.
     let rt = lib.call(&mut env, "roundtrip", 0, &[]).expect("roundtrip/0");
     assert_eq!(
         tuple_ints(rt),
@@ -263,12 +274,35 @@ fn resource_family_end_to_end() {
             1,  /* the resource-binary term also resolves to the payload        */
             1,  /* ... and its bytes are the four given bytes                   */
             0,  /* keep/release balanced: the destructor has NOT run            */
-            1,  /* the last release ran the destructor exactly once             */
-            0x40, /* ... and it received the payload (first byte 0x40)         */
-            0,  /* the now-stale term no longer resolves (freed immediately)    */
+            0,  /* the final release does NOT reach zero (the terms hold refs)  */
+            -1, /* ... so no destructor ran: the recorded byte is untouched      */
+            1,  /* the term still resolves — it holds the object's reference     */
             1, 0, 0, 0, 1, /* r_same, r_wrongtype, r_int, r_binary, r_resbin    */
             9,  /* a type carrying a `down` callback also reports its payload    */
-            1,  /* res_x's destructor ran on its last release                    */
+            1,  /* res_x's (unexported) object ran its destructor synchronously */
+        ]
+    );
+
+    // `enif_make_resource` + `enif_get_resource` round-trip the payload a NIF wrote.
+    // Oracle: {1,42,0,1,0}.
+    let rtv = lib
+        .call(&mut env, "roundtrip_value", 0, &[])
+        .expect("roundtrip_value/0");
+    assert_eq!(tuple_ints(rtv), vec![1, 42, 0, 1, 0]);
+
+    // --- the A.3 divergence: a resource TERM keeps its object alive across a release -------
+    // alloc -> enif_make_resource -> enif_release_resource -> enif_get_resource
+    // Oracle: {1,42,0} — the term holds its own reference, so the release only drops the
+    // allocator's, the payload stays readable and no destructor runs.
+    let post = lib
+        .call(&mut env, "post_release", 0, &[])
+        .expect("post_release/0");
+    assert_eq!(
+        tuple_ints(post),
+        vec![
+            1,  /* enif_get_resource still resolves the released term        */
+            42, /* ... and the int the NIF wrote reads back intact            */
+            0,  /* ... with no destructor run (the term's reference remains)  */
         ]
     );
 
@@ -286,6 +320,24 @@ fn resource_family_end_to_end() {
             0,    /* the module atom is ignored (documented substitution); the
                    * oracle returns non-zero for a module mismatch             */
             2,    /* dyncall ran for the two matching calls                       */
+        ]
+    );
+
+    // --- the destructor for an UNEXPORTED object (Rust-only, documented) ------------------
+    // Each object here is released to zero without ever being made into a term, so the destructor
+    // runs on the last release. This runtime runs it synchronously, so by the time
+    // `dtor_state/0` runs the count is complete: two runs, in probe order (`0x11` then `0x22`),
+    // with the last payload byte `0x22`. (The oracle cannot run this probe: its C dereferences the
+    // `NULL` keep/release and segfaults — see the fixture comment.)
+    let probe = lib.call(&mut env, "dtor_probe", 0, &[]).expect("dtor_probe/0");
+    assert_eq!(tuple_ints(probe), vec![1, 2]);
+    let state = lib.call(&mut env, "dtor_state", 0, &[]).expect("dtor_state/0");
+    assert_eq!(
+        tuple_ints(state),
+        vec![
+            2,      /* both destructors ran                                       */
+            0x1122, /* in release order: the 0x11 object before the 0x22 one       */
+            0x22,   /* the most recent payload byte                                */
         ]
     );
 }

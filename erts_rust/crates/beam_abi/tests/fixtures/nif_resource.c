@@ -19,11 +19,16 @@
  *   - `enif_alloc_resource` + `enif_sizeof_resource` round-trip the payload size;
  *   - `enif_make_resource` yields a term that `enif_get_resource` resolves to the same payload
  *     **only** for the exact type (0 for another type, a plain int, a plain binary);
+ *   - **a resource TERM keeps its object alive across a release** (`post_release/0` runs the exact
+ *     measured sequence `alloc -> enif_make_resource -> enif_release_resource -> enif_get_resource`
+ *     and reads 42 back through the pointer; `roundtrip/0`'s `stale_get` slot reports the same after
+ *     the final release) — the oracle holds the same reference the magic ref does;
  *   - **the round trip hands back the payload a NIF wrote** (`roundtrip_value/0` writes 42 into the
  *     resource and reads it back through the pointer `enif_get_resource` returned — the oracle
- *     prints `42` there, so this is the pinned divergence), and
- *   - **the destructor's count and ordering** (`dtor_probe/0` releases two tagged objects and
- *     `dtor_state/0` reports how many destructors ran, in which order, with which payload byte); and
+ *     prints `42` there);
+ *   - **the destructor's count and ordering for an UNEXPORTED object** (`dtor_probe/0` releases two
+ *     tagged objects that were never made into terms, and `dtor_state/0` reports how many destructors
+ *     ran, in which order, with which payload byte); and
  *   - **process liveness** (`liveness/1` — `enif_is_process_alive` on the calling process, on an
  *     undefined pid, and on a caller-supplied "other" pid, plus `enif_is_current_process_alive`);
  *   - `enif_make_resource_binary` returns a binary whose bytes are the given bytes and which is
@@ -251,6 +256,14 @@ static ERL_NIF_TERM create_only_existing(ErlNifEnv *env, int argc, const ERL_NIF
  *                 dtor_after_balance, dtor_after_final, dtor_first_byte, stale_get,
  *                 r_same, r_wrongtype, r_int, r_binary, r_resbin,
  *                 sizeof_x, x_dtor_runs}
+ *
+ * `obj` is exported as a resource term (`enif_make_resource`) and as a resource binary
+ * (`enif_make_resource_binary`), so it holds three references (alloc + term + resbin) plus the
+ * explicit `keep`; neither release below reaches zero, so no destructor runs here
+ * (`dtor_after_final == 0`, `dtor_first_byte == -1`) and the term keeps resolving
+ * (`stale_get == 1`). Oracle values: `{13,1,1,1,1,0,0,-1,1,1,0,0,0,1,9,0}` — the last element
+ * differs (the oracle's `x_dtor_runs` is 0 there because the C schedules the destructor on an aux
+ * thread; this runtime runs it synchronously — see the fixture header and the module docs).
  */
 static ERL_NIF_TERM roundtrip(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM out[16];
@@ -327,12 +340,14 @@ static ERL_NIF_TERM roundtrip(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[
     enif_release_resource(obj);
     out[5] = small(env, main_dtor_runs - dtor_base); /* still alive: 0 */
 
-    /* --- the release that reaches zero runs the destructor ------------------------------ */
+    /* --- the final release: the term's reference keeps the object alive ----------------- */
     enif_release_resource(obj);
+    /* The term and the resource binary each hold a reference, so this release only takes the count
+     * to 2 — no destructor, exactly as on the oracle. */
     out[6] = small(env, main_dtor_runs - dtor_base);
-    out[7] = small(env, main_dtor_last_byte); /* 0x40 */
+    out[7] = small(env, main_dtor_last_byte); /* -1: no destructor has run */
 
-    /* --- the (now stale) term no longer resolves ---------------------------------------- */
+    /* --- the term still resolves: it holds the object's own reference ------------------- */
     got = sentinel;
     out[8] = small(env, enif_get_resource(env, term, res_main, &got));
 
@@ -425,9 +440,9 @@ static ERL_NIF_TERM dyn_call(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
 /*
  * roundtrip_value/0 -> {get_ok, value, wrongtype_get, wrongtype_untouched, int_get}
  *
- * The measured divergence this pins: `enif_make_resource` + `enif_get_resource` must round-trip, so
- * the `int` a NIF wrote into the resource is readable back through the pointer `enif_get_resource`
- * handed out. The oracle prints `{1,42,0,1,0}` there; the Rust runtime used to raise `badarg`.
+ * The value round trip this pins: `enif_make_resource` + `enif_get_resource` must round-trip, so the
+ * `int` a NIF wrote into the resource is readable back through the pointer `enif_get_resource` handed
+ * out. The oracle prints `{1,42,0,1,0}` there, and so does this runtime.
  */
 static ERL_NIF_TERM roundtrip_value(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM out[5];
@@ -463,9 +478,9 @@ static ERL_NIF_TERM roundtrip_value(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     got = sentinel;
     int_get = enif_get_resource(env, enif_make_int(env, 42), res_main, &got);
 
-    /* The single reference `enif_alloc_resource` took. (In the oracle the resource *term* holds a
-     * second reference, so its destructor only runs once the term is collected — see the module
-     * docs of `src/nif/enif/resources.rs`.) */
+    /* The single reference `enif_alloc_resource` took. The resource *term* holds its own reference,
+     * so the object stays alive after this release — see `post_release/0` below, which reads the
+     * payload back after a release. */
     enif_release_resource(obj);
 
     out[0] = small(env, ok);
@@ -474,6 +489,51 @@ static ERL_NIF_TERM roundtrip_value(ErlNifEnv *env, int argc, const ERL_NIF_TERM
     out[3] = small(env, wrong_untouched);
     out[4] = small(env, int_get);
     return enif_make_tuple_from_array(env, out, 5);
+}
+
+/*
+ * post_release/0 -> {get_ok, value, dtor_runs_since_alloc}
+ *
+ * The exact sequence of the measured A.3 divergence:
+ *
+ *   alloc -> enif_make_resource -> enif_release_resource -> enif_get_resource
+ *
+ * The resource TERM holds its own reference (the reference the C's magic ref holds), so the release
+ * only drops the allocator's reference and the object — and its payload — stays alive: the oracle
+ * reads `42` back. A runtime that freed the block at reference-count zero would hand this code a
+ * dangling pointer. Measured oracle value: `{1,42,0}` (no destructor ran, because the term still
+ * holds a reference that only GC would release).
+ */
+static ERL_NIF_TERM post_release(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
+    ERL_NIF_TERM out[3];
+    ERL_NIF_TERM term;
+    void *obj;
+    void *got;
+    void *sentinel = (void *)(uintptr_t)0xdeadbeef;
+    int ok;
+    int value = -1;
+    int base = main_dtor_runs;
+    (void)argc;
+    (void)argv;
+
+    obj = enif_alloc_resource(res_main, sizeof(int));
+    if (obj == NULL) {
+        return enif_make_badarg(env);
+    }
+    *(int *)obj = 42;
+    term = enif_make_resource(env, obj);
+    enif_release_resource(obj); /* drop the allocator's reference; the term keeps its own */
+
+    got = sentinel;
+    ok = enif_get_resource(env, term, res_main, &got);
+    if (ok && got != NULL && got != sentinel) {
+        value = *(int *)got;
+    }
+
+    out[0] = small(env, ok);
+    out[1] = small(env, value);
+    out[2] = small(env, main_dtor_runs - base);
+    return enif_make_tuple_from_array(env, out, 3);
 }
 
 /*
@@ -517,9 +577,16 @@ static ERL_NIF_TERM liveness(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]
  * dtor_probe/0 -> {allocs_ok, released_to_zero}
  *
  * Releases two tagged objects (`0x11`, `0x22`) to reference count zero: one of them only after a
- * `keep`, and with a `NULL` release and a `NULL` keep in between. Nothing about the destructor is
- * read here, because the oracle runs destructors on a *different* thread — the counts and the order
- * are read by `dtor_state/0` afterwards (the oracle test sleeps first).
+ * `keep`, and with a `NULL` release and a `NULL` keep in between. Neither object is exported as a
+ * term, so each really reaches zero and its destructor runs. Nothing about the destructor is read
+ * here, because the C runs destructors on a *different* (misc aux-work) thread — the counts and the
+ * order are read by `dtor_state/0` afterwards. This runtime runs them synchronously, so the counts
+ * are already complete when `dtor_state/0` runs.
+ *
+ * Rust-only, and deliberately so: the oracle **cannot** run this probe, because the C's
+ * `enif_release_resource(NULL)`/`enif_keep_resource(NULL)` dereference their operand (`erl_nif.c:3164`
+ * / `3177`) and segfault the VM (measured). This runtime treats a `NULL` keep/release as a no-op
+ * (documented in `src/nif/enif/resources.rs`) and continues.
  */
 static ERL_NIF_TERM dtor_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM out[2];
@@ -554,10 +621,10 @@ static ERL_NIF_TERM dtor_probe(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv
 /*
  * dtor_state/0 -> {runs_since_probe, order_code, last_byte}
  *
- * `runs_since_probe` is how many `res_main` destructors ran since `dtor_probe/0` started (the oracle
- * needs a moment for them; this runtime runs them synchronously). `order_code` is the tags of those
- * destructors, most recent last: `0x1122` = 4386 means the object tagged `0x11` was destroyed before
- * the one tagged `0x22`.
+ * `runs_since_probe` is how many `res_main` destructors ran since `dtor_probe/0` started (the C
+ * schedules these off-thread, so its count would lag; this runtime runs them synchronously).
+ * `order_code` is the tags of those destructors, most recent last: `0x1122` = 4386 means the object
+ * tagged `0x11` was destroyed before the one tagged `0x22`.
  */
 static ERL_NIF_TERM dtor_state(ErlNifEnv *env, int argc, const ERL_NIF_TERM argv[]) {
     ERL_NIF_TERM out[3];
@@ -580,6 +647,7 @@ static ErlNifFunc nif_funcs[] = {
     {"dtor_probe", 0, dtor_probe, 0},
     {"dtor_state", 0, dtor_state, 0},
     {"dyn_call", 0, dyn_call, 0},
+    {"post_release", 0, post_release, 0},
 };
 
 ERL_NIF_INIT(nif_resource, nif_funcs, load, NULL, NULL, unload)

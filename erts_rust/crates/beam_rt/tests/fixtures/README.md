@@ -228,3 +228,63 @@ to the same `wait_timeout` with a Y-register operand, which the runner cannot re
 reference created before the send, which needs `erlang:make_ref/0` — a `beam_bifs` BIF
 that Milestone 1 does not register. The marker seam is covered directly instead (the
 unit tests in `src/mailbox.rs` and `src/context.rs`).
+
+## Registry-hook fixtures (`reg.c` / `reg_recv.erl`, never committed — compiled at test time)
+
+`tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle` compiles a second
+driver fixture at test time (contract A.4):
+
+* `reg.c` is a real driver shared object whose `start` callback calls the four port-less registry
+  slots — `driver_lock_driver`, `add_driver_entry`, and `remove_driver_entry` twice (the helper entry
+  it just added, then the port's **own** entry) — and whose `output` prints the four codes as
+  `lock,add,remove,remove_own`. Its entry's `driver_name` is `reg`, so the compiled object's stem is
+  `reg` (the name `{spawn_driver, Path}` derives from the path — see `beam_rt::port::driver_lookup`).
+* `reg_recv.erl` (`probe/0`) opens that port with `{spawn_driver, "{path}"}`, `port_command`s it one
+  byte and returns the bytes its owner receives.
+
+Neither is committed: the C is compiled with `$CC` (or `cc`) against the host `erl_driver.h` and the
+Erlang with the system `erlc`, both at test time, and both are skipped **loudly** (the test returns)
+when a tool is missing.
+
+Oracle values (the same `.so`, verified against the real system `erl`):
+
+```sh
+INC=$(erl -noshell -eval 'io:format("~s",[code:lib_dir(erts,include)])' -s init stop)
+cc -shared -fPIC -I"$INC" -o "$TMPDIR/reg.so" reg.c
+erl -noshell -eval 'ok = erl_ddll:load_driver(os:getenv("TMPDIR"), "reg"),
+    P = open_port({spawn_driver, "reg"}, [binary]),
+    true = port_command(P, <<"go">>),
+    R = receive {P,{data,D}} -> D after 3000 -> <<"TIMEOUT">> end,
+    io:format("~s~n",[R]), halt(0).'
+# 0,1,0,-1
+```
+
+| hook | Oracle code | meaning |
+|---|---|---|
+| `driver_lock_driver` | `0` | the port's own driver was `dlopen`ed (`io.c:7337`) |
+| `add_driver_entry` + `remove_driver_entry` | `1` | the helper entry was recorded, then found and removed |
+| `remove_driver_entry` (again) | `0` | the entry is already gone (no such entry) |
+| `remove_driver_entry` (the port's own entry) | `-1` | dynamically loaded, refused (`io.c:7709-7713`) |
+
+## `enif_alloc_env` fixtures (`env_nif.c` / `env_nif.erl` / `env_caller.erl`, never committed)
+
+`tests/nif.rs::enif_alloc_env_returns_a_live_env` compiles a NIF fixture at test time (contract A.3)
+that is **separate** from the shared `beam_abi` fixture `test_nif.c` (which this crate may not edit),
+because the shared fixture does not exercise the `alloc_env`/`free_env` host hooks:
+
+* `env_nif.c` is a real NIF shared object whose `alloc_env_ok/0` calls `enif_alloc_env()`, frees the
+  environment again and returns the atom `live` (a non-NULL env) or `null` (a NULL env).
+* `env_nif.erl` (`init/1`, `alloc_env_ok/0`) is the module whose stub the library replaces;
+  `env_caller.erl` (`go/1`) reaches `alloc_env_ok/0` through an **external** call (a local call inside
+  the NIF's own module would never reach the runtime's dispatch).
+
+Neither is committed; both are compiled at test time and skipped **loudly** when `cc`/`erlc`/the
+header is missing. Oracle (the same artifacts under the real system `erl`):
+
+```sh
+erl -noshell -pa "$TMPDIR" -eval 'io:format("~w~n",[env_caller:go(os:getenv("TMPDIR") ++ "/env_nif")]), halt(0).'
+# live
+```
+
+the C's `enif_alloc_env` never returns `NULL` (an allocation failure aborts the emulator), so `live`
+is the reference answer.

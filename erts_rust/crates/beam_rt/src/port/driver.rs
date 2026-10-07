@@ -86,7 +86,9 @@ use std::time::{Duration, Instant};
 use libc::{c_int, c_ulong};
 
 use beam_abi::driver::loader::{self, DriverLibrary, DriverLoadError};
-use beam_abi::driver::types::{ErlDrvEvent, ErlDrvPort, ERL_DRV_READ, ERL_DRV_WRITE};
+use beam_abi::driver::types::{
+    ErlDrvEntry, ErlDrvEvent, ErlDrvPort, ERTS_INVALID_ERL_DRV_PORT, ERL_DRV_READ, ERL_DRV_WRITE,
+};
 use beam_abi::{DriverEnv, DriverHost};
 use beam_common::BeamError;
 use beam_alloc::Heap;
@@ -163,6 +165,13 @@ struct DriverControl {
     /// Whether the driver's entry declares a `timeout` callback — the C's precondition for
     /// `driver_set_timer` succeeding (`io.c:6918`: `-1` when `entry->timeout == NULL`).
     timer_capable: bool,
+    /// Whether the port's driver was `dlopen`ed — the C's `prt->drv_ptr->handle != NULL`
+    /// (`io.c:7337`), which is what decides `driver_lock_driver`.
+    ///
+    /// A bare host nobody claimed ([`DriverPort::new`]) and a host over a **statically linked**
+    /// entry both leave this `false`, so `driver_lock_driver` answers the C's `-1` for exactly the
+    /// statically linked case.
+    driver_loaded: bool,
     /// The deadline the port's timer is currently armed at (`None` = no timer pending).
     deadline: Option<Instant>,
     /// The `driver_select` requests recorded since the lifecycle last applied them.
@@ -334,6 +343,105 @@ impl DriverPort {
     }
 }
 
+/// One entry this runtime's driver-entry list knows about (the C's `erts_driver_t` node, reduced to
+/// what the two entry-list slots observe).
+#[derive(Clone, Copy)]
+struct DriverEntryRecord {
+    /// The `ErlDrvEntry` a C driver registered (compared by address only, exactly like the C's
+    /// `dp->entry == drv`).
+    entry: *mut ErlDrvEntry,
+    /// Whether the entry belongs to a `dlopen`ed object (the C's `dp->handle != NULL`): the C
+    /// refuses to remove such an entry (`io.c:7709-7713`).
+    dynamic: bool,
+}
+
+thread_local! {
+    /// This runtime's driver-entry list — the C's process-global `driver_list` as the two
+    /// port-less `driver_*` slots observe it (`add_driver_entry`/`remove_driver_entry`,
+    /// `io.c:7640`/`7698`).
+    ///
+    /// Thread-local rather than a process-global `static`: the records hold raw `*mut ErlDrvEntry`
+    /// (not `Send`), and this runtime drives every port on one thread, so a thread-local is the
+    /// correct scope — and it needs no `unsafe impl Send` (the crate is `#![deny(unsafe_code)]`),
+    /// matching the thread-local publication `beam_abi` already uses for the current driver host.
+    static DRIVER_ENTRIES: RefCell<Vec<DriverEntryRecord>> = const { RefCell::new(Vec::new()) };
+}
+
+/// Records `entry` as a **statically linked** driver entry, the C's `add_driver_entry` →
+/// `erts_add_driver_entry(de, NULL, …)` (`io.c:7640-7695`).
+///
+/// `0` = recorded, `1` = refused (a null entry, which the C would fault on reading `de->driver_name`
+/// — a refusal is the honest answer, never a crash). The C additionally runs the entry's `init`
+/// callback (`init_driver`, `io.c:7610-7620`) and drops the entry again when it returns non-zero.
+/// That callback is an `unsafe extern "C" fn` this crate cannot call under its `#![deny(unsafe_code)]`
+/// rule, so it is not run — and the C's own `void` wrapper discards the result anyway ("the init is
+/// not allowed to fail when drivers are added by drivers", `io.c:7642-7645`), so the only observable
+/// difference is an `init` that *vetoes* an entry a driver added.
+fn registry_add_entry(entry: *mut ErlDrvEntry) -> c_int {
+    if entry.is_null() {
+        return 1;
+    }
+    DRIVER_ENTRIES.with(|entries| {
+        entries.borrow_mut().push(DriverEntryRecord {
+            entry,
+            dynamic: false,
+        })
+    });
+    0
+}
+
+/// Records `entry` as belonging to a **dynamically loaded** object — the C's *load path*
+/// (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, where `dp->handle != NULL`).
+///
+/// This runtime `dlopen`s every driver it runs, so the port's own entry is recorded here at load
+/// ([`DriverPortAdapter::load`]); that is what makes `remove_driver_entry` answer the C's `-1` for a
+/// port's own driver instead of the misleading `0` ("no such entry").
+fn registry_note_loaded_entry(entry: *mut ErlDrvEntry) {
+    DRIVER_ENTRIES.with(|entries| {
+        entries.borrow_mut().push(DriverEntryRecord {
+            entry,
+            dynamic: true,
+        })
+    });
+}
+
+/// The C's `remove_driver_entry(de)` (`io.c:7698-7735`): `-1` for a dynamically loaded driver entry
+/// (`dp->handle != NULL`, "Not allowed for dynamic drivers"), `1` when a matching statically linked
+/// entry was found and removed, `0` when no listed entry matches.
+///
+/// The newest matching registration is removed first, mirroring the C's head-inserted list scan.
+/// `entry` is only ever compared by address, so every value (including null) is a safe operand.
+fn registry_remove_entry(entry: *mut ErlDrvEntry) -> c_int {
+    DRIVER_ENTRIES.with(|entries| {
+        let mut entries = entries.borrow_mut();
+        let Some(index) = entries.iter().rposition(|record| record.entry == entry) else {
+            return 0;
+        };
+        if entries[index].dynamic {
+            return -1;
+        }
+        entries.remove(index);
+        1
+    })
+}
+
+/// Runs a driver entry-point call with the driver's host **published** as this thread's current
+/// driver host ([`beam_abi::with_current_host`]).
+///
+/// Two of the frozen `driver_*` slots carry no port operand — `add_driver_entry`/`remove_driver_entry`
+/// (`io.c:7640`/`7698`) — because the C functions they back act on the emulator's process-global
+/// `driver_list`; their slot bodies read the published host back and delegate to it, and
+/// [`DriverPort`] is that host here. A C driver may call them from **any** of its callbacks, so every
+/// entry point that runs driver code is wrapped in this call.
+///
+/// The host is lent exclusively (`&mut dyn DriverHost`) for the dynamic extent of `f` only, so no
+/// second `&mut` into it can coexist; the loaded library is handed to `f` as the shared borrow the
+/// callbacks take (the two are disjoint fields of [`Driver`]).
+fn publishing<R>(driver: &mut Driver, f: impl FnOnce(&DriverLibrary) -> R) -> R {
+    let Driver { library, host } = driver;
+    beam_abi::with_current_host(&mut **host, || f(library))
+}
+
 impl DriverHost for DriverPort {
     /// The term arena the term-data decoder allocates on.
     fn heap(&mut self) -> &mut Heap {
@@ -443,6 +551,61 @@ impl DriverHost for DriverPort {
     /// one process, so this is the same pid [`DriverPort::connected_pid`] answers with.
     fn caller_pid(&mut self, _port: ErlDrvPort) -> Option<Eterm> {
         Some(self.owner.to_eterm())
+    }
+
+    // -----------------------------------------------------------------------------------------
+    // The driver-registry family (the four slots with no term services of their own)
+    // -----------------------------------------------------------------------------------------
+
+    /// `add_driver_entry`: record the statically linked entry `de` in this runtime's driver-entry
+    /// list (`io.c:7640`), answering `0` recorded / `1` refused.
+    ///
+    /// Reached through the thread-local publication [`publishing`] installs around every driver
+    /// callback, since the slot has no port operand to recover a host from.
+    fn add_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        registry_add_entry(de)
+    }
+
+    /// `remove_driver_entry`: remove `de` from this runtime's driver-entry list (`io.c:7698`),
+    /// answering the C's `1` removed / `0` no such entry / `-1` dynamically loaded.
+    fn remove_driver_entry(&mut self, de: *mut ErlDrvEntry) -> c_int {
+        registry_remove_entry(de)
+    }
+
+    /// `driver_lock_driver`: lock the driver behind `port`'s **own** loaded shared object
+    /// (`io.c:7324`).
+    ///
+    /// The C reads `prt->drv_ptr->handle` — the *port's own* driver, never a lookup by name — and
+    /// answers `-1` when that handle is null (`io.c:7337`, a statically linked driver) and `0`
+    /// otherwise. This runtime `dlopen`s every driver it runs, so a host a port lifecycle claimed
+    /// answers `0`; a bare host nobody claimed (a statically linked entry) answers `-1`, the C's own
+    /// value for exactly that case. The port operand names the port the code already answers for, so
+    /// it is not consulted.
+    fn lock_driver(&mut self, _port: ErlDrvPort) -> c_int {
+        match self.control.try_borrow() {
+            Ok(control) if control.driver_loaded => 0,
+            // A nested borrow cannot happen here (no borrow is held across a callback) and means a
+            // host whose load state cannot be read; the C's "no dlopen handle" value is the honest
+            // answer — never a fabricated lock.
+            _ => -1,
+        }
+    }
+
+    /// `driver_create_port`: the invalid-port sentinel [`ERTS_INVALID_ERL_DRV_PORT`] (`erl_port.h:67`).
+    ///
+    /// The C's single failure answer, kept for a genuinely unsupported state: creating a port needs
+    /// a live `&mut PortRegistry`/`&mut Poller` **and** a `Box<dyn PortHost>`, neither of which is
+    /// reachable from a per-port host hook (the port registry is owned elsewhere and a re-entrant
+    /// open would alias the borrow the running callback was dispatched through). A fabricated port
+    /// here would be a wrong handle, so the failure sentinel is the honest answer.
+    fn create_port(
+        &mut self,
+        _creator: ErlDrvPort,
+        _connected: beam_abi::driver::types::ErlDrvTermData,
+        _name: *mut std::os::raw::c_char,
+        _drv_data: beam_abi::driver::types::ErlDrvData,
+    ) -> ErlDrvPort {
+        ERTS_INVALID_ERL_DRV_PORT
     }
 }
 
@@ -564,10 +727,17 @@ impl DriverPortAdapter {
         command: String,
     ) -> std::result::Result<DriverPortAdapter, DriverLoadError> {
         let library = load_driver(candidates, name)?;
+        // The C's load path records the entry as a **dynamically loaded** driver
+        // (`erts_add_driver_entry(dp, dh, …)`, `io.c:7650`, `dp->handle != NULL`), which is why
+        // `remove_driver_entry` refuses it. Recording the same entry here lets the frozen
+        // `remove_driver_entry` slot answer the C's `-1` for a port's own driver.
+        registry_note_loaded_entry(library.entry() as *const ErlDrvEntry as *mut ErlDrvEntry);
         let control = host.control();
         {
             let mut state = control.borrow_mut();
             state.attached = true;
+            // The port's driver was `dlopen`ed, so `driver_lock_driver` answers the C's `0`.
+            state.driver_loaded = true;
             // The C's precondition for `driver_set_timer` succeeding: an entry without a `timeout`
             // callback has no timer at all (`io.c:6918`).
             state.timer_capable = library.entry().timeout.is_some();
@@ -728,11 +898,14 @@ impl DriverPortAdapter {
             return Err(BeamError::BadArg);
         };
         let event = fd as isize as ErlDrvEvent;
-        let called = if read {
-            driver.library().ready_input(self.state, event)
-        } else {
-            driver.library().ready_output(self.state, event)
-        };
+        let state = self.state;
+        let called = publishing(driver, |library| {
+            if read {
+                library.ready_input(state, event)
+            } else {
+                library.ready_output(state, event)
+            }
+        });
         match called {
             Ok(()) => {}
             // The entry has no callback for this direction: the C's `no_ready_*_callback`.
@@ -818,10 +991,10 @@ impl beam_io::Driver for DriverPortAdapter {
         let port = env.as_port();
         self.env = Some(env);
         let command = std::ffi::CString::new(self.command.as_str()).map_err(|_| BeamError::BadArg)?;
-        let data = driver
-            .library()
-            .start(port, command.as_ptr() as *mut std::os::raw::c_char)
-            .map_err(driver_call_error)?;
+        let data = publishing(driver, |library| {
+            library.start(port, command.as_ptr() as *mut std::os::raw::c_char)
+        })
+        .map_err(driver_call_error)?;
         if (data as isize) < 0 {
             // The C's failure codes are negative; a driver that refuses the port must not become a
             // port with a bogus state pointer.
@@ -857,11 +1030,10 @@ impl beam_io::Driver for DriverPortAdapter {
             let Some(driver) = self.driver.as_mut() else {
                 return Err(BeamError::BadArg);
             };
-            match driver.library().output(
-                self.state,
-                bytes.as_ptr() as *mut std::os::raw::c_char,
-                bytes.len(),
-            ) {
+            let state = self.state;
+            let buf = bytes.as_ptr() as *mut std::os::raw::c_char;
+            let len = bytes.len();
+            match publishing(driver, |library| library.output(state, buf, len)) {
                 Ok(()) => {}
                 Err(error) if error.is_absent() => {}
                 Err(error) => return Err(driver_call_error(error)),
@@ -911,8 +1083,9 @@ impl beam_io::Driver for DriverPortAdapter {
     /// `timeout` callback reports a failure.
     fn timeout(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
         self.clear_timeout();
+        let state = self.state;
         let result = match self.driver.as_mut() {
-            Some(driver) => match driver.library().timeout(self.state) {
+            Some(driver) => match publishing(driver, |library| library.timeout(state)) {
                 Ok(()) => Ok(()),
                 Err(error) if error.is_absent() => Ok(()),
                 Err(error) => Err(driver_call_error(error)),
@@ -949,10 +1122,11 @@ impl beam_io::Driver for DriverPortAdapter {
     /// [`BeamError::Io`] when the driver's `stop` callback reports a failure; the library is
     /// unloaded either way, and a failed deregistration is surfaced when `stop` succeeded.
     fn stop(&mut self, ctx: &mut beam_io::DriverContext<'_>) -> beam_common::Result<()> {
-        let Some(driver) = self.driver.take() else {
+        let Some(mut driver) = self.driver.take() else {
             return Ok(());
         };
-        let result = match driver.library().stop(self.state) {
+        let state = self.state;
+        let result = match publishing(&mut driver, |library| library.stop(state)) {
             Ok(()) => Ok(()),
             Err(error) if error.is_absent() => Ok(()),
             Err(error) => Err(driver_call_error(error)),
@@ -1041,6 +1215,56 @@ mod tests {
                 None
             ),
             -1
+        );
+    }
+
+    /// The four port-less `DriverHost` registry slots answer the C's own return codes, pinned
+    /// directly against `io.c`'s `add_driver_entry` (`:7640`), `remove_driver_entry` (`:7698`),
+    /// `driver_lock_driver` (`:7324`) and `driver_create_port` (`:787`).
+    ///
+    /// Oracle ground truth (OTP 29 / `erts-17.1`): a C fixture that calls all four hooks from a live
+    /// `{spawn_driver, …}` port prints `0,1,0,-1` (see
+    /// `tests/driver.rs::driver_lock_driver_and_the_entry_registry_agree_with_the_oracle`):
+    /// `driver_lock_driver` answers `0` (the port's driver was `dlopen`ed), `add` then `remove` of a
+    /// helper entry is `1` (recorded, then removed), a second `remove` is `0` (no such entry) and a
+    /// `remove` of the port's **own** dynamically loaded entry is `-1` (`io.c:7709-7713`,
+    /// "Not allowed for dynamic drivers").
+    #[test]
+    fn the_registry_hooks_answer_the_c_codes() {
+        let atoms = Rc::new(AtomTable::new());
+        let mut host = host(&atoms);
+
+        // A bare host no port lifecycle claimed = the C's statically linked driver:
+        // `driver_lock_driver` reads `prt->drv_ptr->handle == NULL` and answers `-1` (`io.c:7337`).
+        assert_eq!(host.lock_driver(std::ptr::null_mut()), -1);
+
+        // Two distinct entries, compared by address alone (the C's `dp->entry == drv`).
+        let mut a = ErlDrvEntry::default();
+        let mut b = ErlDrvEntry::default();
+
+        // `add_driver_entry` records a statically linked entry: the C's `0`.
+        assert_eq!(host.add_driver_entry(&mut a), 0);
+        // ...and `remove_driver_entry` finds and removes it: the C's `1`.
+        assert_eq!(host.remove_driver_entry(&mut a), 1);
+        // A second removal finds nothing: the C's `0` ("no such entry").
+        assert_eq!(host.remove_driver_entry(&mut a), 0);
+
+        // A null entry is refused (`1`), never a read of `de->driver_name` the C would fault on.
+        assert_eq!(host.add_driver_entry(std::ptr::null_mut()), 1);
+
+        // An entry that was never added is `0` — never a fabricated removal.
+        assert_eq!(host.remove_driver_entry(&mut b), 0);
+
+        // `driver_create_port` has no live port registry reachable here: the C's single failure
+        // sentinel (`erl_port.h:67`).
+        assert_eq!(
+            host.create_port(
+                std::ptr::null_mut(),
+                0,
+                std::ptr::null_mut(),
+                std::ptr::null_mut()
+            ),
+            ERTS_INVALID_ERL_DRV_PORT
         );
     }
 

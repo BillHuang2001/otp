@@ -6,8 +6,9 @@
 //! types** (`enif_open_resource_type` + `enif_alloc_resource` + `enif_sizeof_resource` +
 //! `enif_keep_resource`/`enif_release_resource`), the **IO queue** (`enif_ioq_create` /
 //! `enif_ioq_enq_binary` / `enif_ioq_size` / `enif_ioq_peek` / `enif_ioq_deq` /
-//! `enif_ioq_destroy`) and the **thread/mutex** synchronisation slots (`enif_mutex_create` /
-//! `enif_mutex_lock` / `enif_mutex_unlock` / `enif_mutex_destroy`, `enif_thread_self`).
+//! `enif_ioq_destroy`), the **thread/mutex** synchronisation slots (`enif_mutex_create` /
+//! `enif_mutex_lock` / `enif_mutex_unlock` / `enif_mutex_destroy`, `enif_thread_self`) and the
+//! **extra-environment** family (`enif_alloc_env` / `enif_make_copy` / `enif_free_env`).
 //!
 //! The C library is compiled in the case's own temp dir against the host `erl_nif.h` and
 //! `erlang:load_nif/2`ed by the embedded module exactly like `nif_so`, so both runtimes load
@@ -26,6 +27,13 @@
 //! **self-liveness** (`enif_is_process_alive` on `enif_self`) were divergences and are now
 //! pinned cases: the oracle and the Rust runtime both answer `42` for the round trip and `1`
 //! for self-liveness (re-verified against the live oracle, OTP 29.1.1 / erts-17.1).
+//!
+//! The **extra-environment** family is the one pinned *capability gap*: `beam_rt` exports
+//! `enif_alloc_env`/`enif_free_env`/`enif_make_copy` (so the Rust `dlopen(RTLD_NOW)` resolves
+//! them) but leaves the `NifHost::alloc_env` hook at its unimplemented default, so
+//! `enif_alloc_env` answers the C's `NULL` failure. `nif_res/alloc_env_roundtrip` turns that into
+//! the module's `unsupported_enif_alloc_env` raise (exit `3`, `Verdict::Unsupported`) instead of
+//! the false agreement a failed `dlopen` would have produced through the `load_failed` code.
 //!
 //! Two verified divergences are reported here rather than pinned (both are plain values, so
 //! they would be mismatches):
@@ -62,13 +70,15 @@ use crate::module_build::NifFixture;
 /// in the loading module, and the calls into the library must be **external** (the Rust
 /// runtime intercepts a NIF at external dispatch) — the same three rules `nif_so` pins.
 const NIF_RES_MODULE_SOURCE: &str = r#"-module(nif_res).
--export([classify/1, res_size/0, ioq_size/0, sync_roundtrip/0, res_roundtrip/0, self_alive/0]).
+-export([classify/1, res_size/0, ioq_size/0, sync_roundtrip/0, res_roundtrip/0, self_alive/0,
+         alloc_env_probe/0]).
 
 res_size() -> erlang:nif_error(not_loaded).
 ioq_size() -> erlang:nif_error(not_loaded).
 sync_roundtrip() -> erlang:nif_error(not_loaded).
 res_roundtrip() -> erlang:nif_error(not_loaded).
 self_alive() -> erlang:nif_error(not_loaded).
+alloc_env_probe() -> erlang:nif_error(not_loaded).
 
 classify(N) ->
     Dir = filename:dirname(code:which(?MODULE)),
@@ -79,7 +89,11 @@ classify(N) ->
                 2 -> nif_res:ioq_size();
                 3 -> nif_res:sync_roundtrip();
                 4 -> nif_res:res_roundtrip();
-                5 -> nif_res:self_alive()
+                5 -> nif_res:self_alive();
+                6 -> case nif_res:alloc_env_probe() of
+                         ok -> 1;
+                         _ -> erlang:error(unsupported_enif_alloc_env)
+                     end
             end;
         {error, {Reason, _Text}} ->
             reason_code(Reason)
@@ -97,8 +111,11 @@ reason_code(_) -> 9.
 /// The C library: the resource-type, IO-queue and sync families in three probe functions.
 ///
 /// Every `enif_*` here is a symbol the `beam_rt` release binary exports (verified with
-/// `nm -D`); nothing C-variadic is referenced, and `enif_alloc_env` — which the runtime does
-/// **not** define — is deliberately absent.
+/// `nm -D`); nothing C-variadic is referenced. The extra-environment family
+/// (`enif_alloc_env`/`enif_free_env`/`enif_make_copy`) is referenced by
+/// [`alloc_env_probe`] because the runtime *does* export those slots — it just answers
+/// `enif_alloc_env` with NULL (the hook is unimplemented), which the probe reports as its
+/// `unsupported_enif_alloc_env` capability-gap atom.
 const NIF_RES_C: &str = r#"/* A real NIF exercising the resource / ioq / sync families of the NIF C ABI. */
 #include <erl_nif.h>
 #include <string.h>
@@ -211,12 +228,30 @@ static ERL_NIF_TERM self_alive(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
     return enif_make_int(env, enif_is_process_alive(env, &pid) ? 1 : 0);
 }
 
+/* The extra-environment family: allocate a process-independent environment (enif_alloc_env),
+   build the atom `ok` on it, copy that term back into the call environment (enif_make_copy) and
+   free the message env again (enif_free_env). Returns the atom `ok` when the runtime can do all
+   of it, and the capability-gap atom `unsupported_enif_alloc_env` when enif_alloc_env answers
+   NULL (the C's "could not allocate" failure — here a runtime that does not implement the hook). */
+static ERL_NIF_TERM alloc_env_probe(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+    (void) argc; (void) argv;
+    ErlNifEnv* e = enif_alloc_env();
+    ERL_NIF_TERM t, c;
+    if (e == NULL)
+        return enif_make_atom(env, "unsupported_enif_alloc_env");
+    t = enif_make_atom(e, "ok");
+    c = enif_make_copy(env, t);
+    enif_free_env(e);
+    return c;
+}
+
 static ErlNifFunc nif_res_funcs[] = {
     {"res_size", 0, res_size, 0},
     {"ioq_size", 0, ioq_size, 0},
     {"sync_roundtrip", 0, sync_roundtrip, 0},
     {"res_roundtrip", 0, res_roundtrip, 0},
-    {"self_alive", 0, self_alive, 0}
+    {"self_alive", 0, self_alive, 0},
+    {"alloc_env_probe", 0, alloc_env_probe, 0}
 };
 
 /* `ERL_NIF_INIT` seeds ErlNifEntry.name with the stringified module name (`nif_res`), so this
@@ -292,6 +327,13 @@ pub(crate) fn group() -> Vec<Case> {
             &[5],
             "1",
         ),
+        case(
+            "nif_res/alloc_env_roundtrip",
+            "enif_alloc_env builds an atom copied back through enif_make_copy and freed with enif_free_env",
+            &[6],
+            // The module's `1`: the probe returned the atom `ok`, so the message env was live.
+            "1",
+        ),
     ]
 }
 
@@ -343,17 +385,25 @@ mod tests {
             );
             assert_eq!(case.golden.exit_code, 0, "case {}", case.id);
         }
-        assert_eq!(selectors.len(), 5, "the group covers five distinct selectors");
+        assert_eq!(selectors.len(), 6, "the group covers six distinct selectors");
     }
 
     #[test]
-    fn the_c_library_never_references_an_unimplemented_symbol() {
-        // `enif_alloc_env` is not defined by the Rust runtime, so a library that used it
-        // would fail the Rust `dlopen(RTLD_NOW)` while the oracle succeeded — a mismatch.
-        // Keep the guard so a future edit cannot reintroduce it silently.
+    fn the_c_library_references_the_extra_environment_probe() {
+        // The extra-environment family is exercised on purpose: `beam_rt` *exports*
+        // `enif_alloc_env`/`enif_free_env`/`enif_make_copy` (they resolve at `dlopen(RTLD_NOW)`),
+        // but the runtime's `NifHost` leaves the `alloc_env` hook at its "unsupported" default, so
+        // the probe reports `unsupported_enif_alloc_env` and the module raises the documented
+        // capability gap (exit 3) — never a mismatch, never a bogus load failure.
+        for symbol in ["enif_alloc_env", "enif_free_env", "enif_make_copy"] {
+            assert!(
+                super::NIF_RES_C.contains(symbol),
+                "the library must reference {symbol}"
+            );
+        }
         assert!(
-            !super::NIF_RES_C.contains("enif_alloc_env"),
-            "enif_alloc_env is not implemented by the Rust runtime"
+            super::NIF_RES_MODULE_SOURCE.contains("alloc_env_probe"),
+            "the module must export and call the probe"
         );
     }
 }

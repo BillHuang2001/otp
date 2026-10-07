@@ -66,6 +66,17 @@ impl BifRegistry {
         crate::port::register(&mut reg);
         crate::records::register(&mut reg);
         crate::nif::register(&mut reg);
+        crate::checksum::register(&mut reg);
+        crate::calendar::register(&mut reg);
+        crate::os_bif::register(&mut reg);
+        crate::fun_info::register(&mut reg);
+        crate::term_conv::register(&mut reg);
+        crate::erts_internal::register(&mut reg);
+        crate::modinfo::register(&mut reg);
+        crate::match_spec::register(&mut reg);
+        crate::packet::register(&mut reg);
+        crate::proc_reg::register(&mut reg);
+        crate::persistent_term::register(&mut reg);
         reg
     }
 
