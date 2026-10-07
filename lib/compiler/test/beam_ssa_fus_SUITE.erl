@@ -65,7 +65,10 @@
 -export([all/0,suite/0,groups/0,init_per_suite/1,end_per_suite/1,
          init_per_group/2,end_per_group/2]).
 -export([fuse_is_map_key/1,
+         fuse_multi_key_guard/1,
          no_is_map_guard_no_fusion/1,
+         no_fusion_multi_key_no_is_map/1,
+         no_fusion_key_mismatch/1,
          multi_key_match/1,
          no_fusion_different_key/1,
          no_fusion_not_sole_success_edge/1,
@@ -80,7 +83,10 @@ all() ->
 groups() ->
     [{p,[parallel],
       [fuse_is_map_key,
+       fuse_multi_key_guard,
        no_is_map_guard_no_fusion,
+       no_fusion_multi_key_no_is_map,
+       no_fusion_key_mismatch,
        multi_key_match,
        no_fusion_different_key,
        no_fusion_not_sole_success_edge,
@@ -140,6 +146,108 @@ fuse_is_map_key(Config) ->
     NoSsaOpt = code(no_ssa_opt, Builds),
     ?assert(has_instr(NoSsaOpt, is_map_key)),
     ?assertNot(has_instr(NoSsaOpt, has_map_fields)),
+    ok.
+
+%% Fusion 2, positive case: *several* `is_map_key/2' guards on the same map
+%% are redundant when the body re-extracts exactly those keys with a map
+%% pattern. With the pass enabled the whole `has_map_field' test chain is
+%% replaced by the extraction chain, so the map is probed once (one multi-key
+%% `get_map_elements') instead of once for the tests plus once for the
+%% extractions.
+fuse_multi_key_guard(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mk", multikey_guard_probe()),
+
+    Args2 = [{[#{a => 1, b => 2}], {ok,{1,2}}},
+             {[#{a => 1, b => 2, c => 3}], {ok,{1,2}}},
+             {[#{a => 1}], {ok,no}},
+             {[#{b => 1}], {ok,no}},
+             {[#{}], {ok,no}},
+             {[[]], {ok,no}},
+             {[42], {ok,no}}],
+    check_calls(Builds, m2, Args2),
+
+    Args3 = [{[#{a => 1, b => 2, c => 3}], {ok,{1,2,3}}},
+             {[#{a => 1, b => 2, c => 3, d => 4}], {ok,{1,2,3}}},
+             {[#{a => 1, b => 2}], {ok,no}},
+             {[#{a => 1, c => 3}], {ok,no}},
+             {[#{b => 1, c => 3}], {ok,no}},
+             {[#{}], {ok,no}},
+             {[[]], {ok,no}},
+             {[42], {ok,no}}],
+    check_calls(Builds, m3, Args3),
+
+    Fusion = code(fusion, Builds),
+    %% The test chain is gone, a single multi-key lookup remains, and the
+    %% `is_map_key/2' guards are gone as well.
+    ?assertNot(has_instr(Fusion, has_map_fields)),
+    ?assertNot(has_instr(Fusion, is_map_key)),
+    ?assertEqual([{atom,a},{atom,b}], get_map_keys(Fusion, m2)),
+    ?assertEqual([{atom,a},{atom,b},{atom,c}], get_map_keys(Fusion, m3)),
+
+    %% Without the pass - including with it explicitly turned off - the
+    %% redundant multi-key test is still in the code, next to the extraction.
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assert(has_instr(Code, has_map_fields)),
+                          ?assert(has_instr(Code, get_map_elements))
+                  end, [plain,no_fus_plain,no_fus]),
+
+    %% `no_ssa_opt' skips the SSA type analysis too, so the `is_map_key/2'
+    %% guards stay ordinary BIFs and there is no `has_map_field' to fuse.
+    NoSsaOpt = code(no_ssa_opt, Builds),
+    ?assert(has_instr(NoSsaOpt, is_map_key)),
+    ?assertNot(has_instr(NoSsaOpt, has_map_fields)),
+    ok.
+
+%% The same shape without the `is_map/1' guard does *not* fuse: the first
+%% `is_map_key/2' stays a plain BIF, and although the type analysis turns the
+%% second test into a `has_map_field' (a `has_map_field' that returned true
+%% implies the operand is a map), the operand of the *first* key test is not
+%% proven to be a map, so substituting the lookup would raise `badmap' for a
+%% non-map instead of simply taking the false edge. This is a strict no-op and
+%% only asserts behavioural identity.
+no_fusion_multi_key_no_is_map(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_mkng", multikey_noguard_probe()),
+
+    Args = [{[#{a => 1, b => 2}], {ok,{1,2}}},
+            {[#{a => 1, b => 2, c => 3}], {ok,{1,2}}},
+            {[#{a => 1}], {ok,no}},
+            {[#{b => 1}], {ok,no}},
+            {[#{}], {ok,no}},
+            {[[]], {ok,no}},
+            {[42], {ok,no}}],
+    check_calls(Builds, g, Args),
+
+    Fusion = code(fusion, Builds),
+    ?assertEqual(shape(code(plain, Builds)), shape(Fusion)),
+    ?assert(has_instr(Fusion, is_map_key)),
+    ?assert(has_instr(Fusion, has_map_fields)),
+    ok.
+
+%% The guards and the extraction must cover *exactly* the same keys. Here the
+%% body extracts `c', which was never tested, so the test chain is not
+%% redundant: the two lookups must both stay, and a missing `c' must still
+%% raise the `badmatch' from the pattern (not fall through to the `no' clause).
+no_fusion_key_mismatch(Config) ->
+    Builds = build_probe(Config, "beam_ssa_fus_km", keymismatch_probe()),
+
+    M1 = #{a => 1, b => 2},
+    Args = [{[#{a => 1, b => 2, c => 3}], {ok,{1,3}}},
+            {[M1], {error,{badmatch,M1}}},
+            {[#{a => 1, c => 3}], {ok,no}},
+            {[#{b => 1, c => 3}], {ok,no}},
+            {[#{}], {ok,no}},
+            {[[]], {ok,no}},
+            {[42], {ok,no}}],
+    check_calls(Builds, g, Args),
+
+    Fusion = code(fusion, Builds),
+    ?assertEqual(shape(code(plain, Builds)), shape(Fusion)),
+    lists:foreach(fun(Set) ->
+                          Code = code(Set, Builds),
+                          ?assert(has_instr(Code, has_map_fields)),
+                          ?assert(has_instr(Code, get_map_elements))
+                  end, [fusion,plain,no_fus]),
     ok.
 
 %% The same shape without the `is_map/1' guard does *not* fuse, and that is
@@ -320,6 +428,48 @@ indirect_probe() ->
     "indirect(_) ->\n"
     "    no.\n".
 
+%% Several `is_map_key/2' guards on the same map plus a body that re-extracts
+%% exactly those keys: the whole test chain is redundant (Fusion 2).
+multikey_guard_probe() ->
+    "-module(beam_ssa_fus_mk).\n"
+    "-export([m2/1,m3/1]).\n"
+    "\n"
+    "m2(M) when is_map(M), is_map_key(a, M), is_map_key(b, M) ->\n"
+    "    #{a := A, b := B} = M,\n"
+    "    {A, B};\n"
+    "m2(_) ->\n"
+    "    no.\n"
+    "\n"
+    "m3(M) when is_map(M), is_map_key(a, M), is_map_key(b, M), is_map_key(c, M) ->\n"
+    "    #{a := A, b := B, c := C} = M,\n"
+    "    {A, B, C};\n"
+    "m3(_) ->\n"
+    "    no.\n".
+
+%% The same multi-key guard idiom without the `is_map/1' guard: the operand is
+%% not proven to be a map at the first key test, so nothing may be fused.
+multikey_noguard_probe() ->
+    "-module(beam_ssa_fus_mkng).\n"
+    "-export([g/1]).\n"
+    "\n"
+    "g(M) when is_map_key(a, M), is_map_key(b, M) ->\n"
+    "    #{a := A, b := B} = M,\n"
+    "    {A, B};\n"
+    "g(_) ->\n"
+    "    no.\n".
+
+%% Guard keys {a,b} but the body extracts {a,c}: the test chain is not
+%% redundant, so neither lookup may be removed.
+keymismatch_probe() ->
+    "-module(beam_ssa_fus_km).\n"
+    "-export([g/1]).\n"
+    "\n"
+    "g(M) when is_map(M), is_map_key(a, M), is_map_key(b, M) ->\n"
+    "    #{a := A, c := C} = M,\n"
+    "    {A, C};\n"
+    "g(_) ->\n"
+    "    no.\n".
+
 %% `maps:get/2' on an operand of unknown type: the mismatch of the failure
 %% reasons (`{badmap,Term}' here, "false" for `is_map_key/2') is exactly why
 %% the pass only fuses when the operand is known to be a map.
@@ -468,3 +618,19 @@ instr_name(_) ->
 shape(Code) ->
     [{Name,Arity,[instr_name(I) || I <- Is]} ||
         {function,Name,Arity,_,Is} <- Code].
+
+%% The keys of the single `get_map_elements' instruction of `Fun', as a sorted
+%% list of operands. Fails if the function does not contain exactly one such
+%% instruction - which is what makes the fused form one *multi-key* lookup.
+get_map_keys(Code, Fun) ->
+    Is = case [Is0 || {function,Name,_,_,Is0} <- Code, Name =:= Fun] of
+             [Is1] -> Is1;
+             Other -> ct:fail({missing_function, Fun, Other})
+         end,
+    case [List || {get_map_elements,_,_,{list,List}} <- Is] of
+        [List] -> lists:sort(keys_of(List));
+        Lists -> ct:fail({unexpected_get_map_elements, Fun, Lists})
+    end.
+
+keys_of([Key,_Dst|T]) -> [Key|keys_of(T)];
+keys_of([]) -> [].
