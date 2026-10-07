@@ -120,6 +120,7 @@ use std::os::fd::RawFd;
 use std::rc::Rc;
 use std::time::{Duration, Instant};
 
+pub mod driver;
 use beam_alloc::Heap;
 use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
@@ -357,8 +358,14 @@ impl PortRegistry {
     ///
     /// Propagates the poll set's and the arena's allocation failures.
     pub fn new() -> Result<PortRegistry> {
-        Ok(PortRegistry {
-            poller: Poller::new()?,
+        // The driver C ABI (contract A.4) is a **link-time** seam, exactly like the NIF ABI: a
+        // loaded driver `.so` leaves its `driver_*`/`erl_drv_*` imports undefined and resolves them
+        // out of the loading process's dynamic symbol table. `-Wl,--export-dynamic` (see
+        // `build.rs`) publishes the symbols; this `black_box` reference is what anchors
+        // `beam_abi`'s driver codegen unit in the link so there *are* symbols to publish. Without
+        // it, a `dlopen(RTLD_NOW)` of a real driver would fail on an unresolved symbol.
+        let _ = std::hint::black_box(beam_abi::driver::drv::driver_api_table());
+        Ok(PortRegistry {            poller: Poller::new()?,
             registry: IoPortRegistry::new(),
             meta: HashMap::new(),
             heap: Heap::new(PORT_HEAP_WORDS)?,
