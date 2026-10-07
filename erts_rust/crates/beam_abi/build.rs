@@ -25,21 +25,22 @@
 //! `src/nif/enif/variadic.rs`). This script drives the C compiler with `std::process::Command` —
 //! deliberately **no new Cargo dependency** (no `cc` crate) — honouring `$CC` (default `cc`).
 //!
-//! The compiled object is published two ways, because the table slot is a **link-time** constant:
+//! The compiled object is published as a **static archive** in `$OUT_DIR` plus
+//! `cargo::rustc-link-search`/`cargo::rustc-link-lib=static=…`: those two **are** propagated through
+//! the dependency graph (the standard `*-sys` pattern), so this package's own targets *and* a
+//! *dependent* binary that pulls `enif_api_table()` (e.g. `beam_rt`) resolve the shim's `enif_*`
+//! symbols. Without it such a binary would fail to link: the `#[used] static ENIF_API` names
+//! `enif_make_tuple` and friends directly.
 //!
-//! * a static archive `libbeam_abi_variadic.a` in `$OUT_DIR` plus
-//!   `cargo::rustc-link-search`/`cargo::rustc-link-lib=static=…` — those two **are** propagated
-//!   through the dependency graph (the standard `*-sys` pattern), so this package's own targets
-//!   *and* a *dependent* binary that pulls `enif_api_table()` (e.g. `beam_rt`) resolve the shim's
-//!   `enif_*` symbols. Without it such a binary would fail to link: the `#[used] static ENIF_API`
-//!   names `enif_make_tuple` and friends directly.
-//! * `cargo::rustc-link-arg-tests=<obj>` — the raw object on this package's test link line, so a
-//!   test binary gets the shim even if the archive were to go missing.
+//! Deliberately **not** emitted, both learned the hard way:
 //!
-//! `cargo::rustc-link-arg-lib` is deliberately *not* emitted: Cargo rejects it outright ("Unknown
-//! key") — the `rustc-link-arg-*` family has no `-lib` member, and an rlib has no link step to
-//! attach it to anyway. `cargo::rustc-link-arg-bins` is not emitted either (no `[[bin]]` target in
-//! this package; Cargo hard-errors on that instruction then).
+//! * `cargo::rustc-link-arg-tests=<obj>` — the archive already reaches every test link line, and
+//!   passing the raw object *as well* makes the linker report "multiple definition of
+//!   `enif_make_tuple`". (Empirically: with both, every test target of this package fails to link.)
+//! * `cargo::rustc-link-arg-lib` — Cargo rejects it outright ("Unknown key"): the
+//!   `rustc-link-arg-*` family has no `-lib` member, and an rlib has no link step to attach it to.
+//! * `cargo::rustc-link-arg-bins` — no `[[bin]]` target exists in this package, and Cargo
+//!   hard-errors on that instruction then.
 //!
 //! If no C compiler is available — or the compile fails — the script emits only the
 //! `rustc-check-cfg` (so the `cfg` stays known) and a `cargo:warning=`. The build then **succeeds**
@@ -75,7 +76,6 @@ fn main() {
     match compile(&compiler, &source, &object) {
         Ok(()) => {
             println!("cargo::rustc-cfg={SHIM_CFG}");
-            println!("cargo::rustc-link-arg-tests={}", object.display());
             match archive(&object, &out_dir) {
                 Ok(()) => {
                     println!("cargo::rustc-link-search=native={}", out_dir.display());
