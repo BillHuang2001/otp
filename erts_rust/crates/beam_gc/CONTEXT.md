@@ -362,7 +362,8 @@ whole-region scan.)
   `../../../erts/` (read-only ground truth) or `../../tools/`.
 - **Never break the frozen term layout or the barrier-free invariant** (a minor must not leave a
   mature→young pointer).
-- Files target ~1000 lines; split by responsibility. (No file here is expected to exceed it.)
+- Files target ~1000 lines; split by responsibility. `src/fragment.rs` is marginally over (~1090 lines:
+  module-level contract docs plus the in-module fragment-bookkeeping tests; its logic is small).
 - Licensing Apache-2.0; deps `beam_common`, `beam_term`, `beam_alloc`, `libc` only.
 
 ## Test Strategy
