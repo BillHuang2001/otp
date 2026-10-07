@@ -184,7 +184,11 @@ mod tests {
     /// The linked exit's `mov rdi, [rsp + RUNTIME_SLOT_DISP]` — the reload that
     /// hands the successor's prologue its `rt` — as emitted.
     fn reload_bytes() -> Vec<u8> {
-        encoded(|buffer| buffer.mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP).unwrap())
+        encoded(|buffer| {
+            buffer
+                .mov_rm(Reg::Rdi, Reg::Rsp, RUNTIME_SLOT_DISP)
+                .unwrap()
+        })
     }
 
     /// `emit_frame_teardown`, as emitted.
@@ -230,14 +234,21 @@ mod tests {
         // reads out of `rdi`, the frame teardown and the jump — nothing else.
         let mut expected = spill_bytes(&allocation);
         expected.extend(reload_bytes());
-        assert!(!reload_bytes().is_empty(), "the reload is what the fix adds");
+        assert!(
+            !reload_bytes().is_empty(),
+            "the reload is what the fix adds"
+        );
         expected.extend(teardown_bytes());
         assert_eq!(
             &exit[..expected.len()],
             &expected[..],
             "the exit is spill + `mov rdi, [rsp+rt]` + frame teardown + `jmp rel32`"
         );
-        assert_eq!(exit.len(), expected.len() + 5, "plus the 5-byte `jmp rel32`");
+        assert_eq!(
+            exit.len(),
+            expected.len() + 5,
+            "plus the 5-byte `jmp rel32`"
+        );
 
         // And the return word is *not* materialised: no `movabs rax, imm64`.
         assert!(
@@ -270,7 +281,10 @@ mod tests {
 
         let exit = &emitted(&buffer)[..exit_len];
         // It reads the block's own slot: `[rsp + RUNTIME_SLOT_DISP]`.
-        assert_eq!(RUNTIME_SLOT_DISP, 0, "the prologue reserves the slot at rsp");
+        assert_eq!(
+            RUNTIME_SLOT_DISP, 0,
+            "the prologue reserves the slot at rsp"
+        );
         let reload = reload_bytes();
         let reload_at = exit
             .windows(reload.len())
@@ -286,7 +300,11 @@ mod tests {
             "the reload must precede the teardown (which drops the slot)"
         );
         // … and it is reloaded into `rdi`, where the successor's prologue looks for it.
-        assert_eq!(reload[2] & 0b0011_1000, 0b0011_1000, "the load targets `rdi`");
+        assert_eq!(
+            reload[2] & 0b0011_1000,
+            0b0011_1000,
+            "the load targets `rdi`"
+        );
     }
 
     #[test]
@@ -323,11 +341,7 @@ mod tests {
         );
         assert_eq!(exit.len(), expected.len() + 5);
         // The materialised word really is `encode_target(0, 7)`.
-        let word = i64::from_le_bytes(
-            exit[expected.len() - 8..expected.len()]
-                .try_into()
-                .unwrap(),
-        );
+        let word = i64::from_le_bytes(exit[expected.len() - 8..expected.len()].try_into().unwrap());
         assert_eq!(word, encode_target(0, 7));
 
         // An unlinkable exit never reloads `rdi`: no frame is entered by a jump.

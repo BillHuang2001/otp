@@ -113,18 +113,14 @@ fn agree<H>(
 where
     H: FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + Clone + 'static,
 {
-    let interpreted = run_on_tier(
-        module,
-        export,
-        arity,
-        args,
-        hook.clone(),
-        Tier::Interpreter,
-    );
+    let interpreted = run_on_tier(module, export, arity, args, hook.clone(), Tier::Interpreter);
     let jitted = run_on_tier(module, export, arity, args, hook, Tier::BaselineJit);
     match (&interpreted, &jitted) {
         (Ok(interpreted), Ok(jitted)) => {
-            assert_eq!(jitted, interpreted, "{export}/{arity} differs between tiers")
+            assert_eq!(
+                jitted, interpreted,
+                "{export}/{arity} differs between tiers"
+            )
         }
         (Err(interpreted), Err(jitted)) => assert_eq!(
             format!("{jitted:?}"),
@@ -269,10 +265,8 @@ fn linked_native_runs_match_the_interpreter_on_the_slice_fixture() {
     ];
     for (export, arity, args) in cases {
         let module = slice_module();
-        let got =
-            agree(&module, export, arity, &args, arith_hook).unwrap_or_else(|err| {
-                panic!("{export}/{arity} failed on both tiers: {err:?}")
-            });
+        let got = agree(&module, export, arity, &args, arith_hook)
+            .unwrap_or_else(|err| panic!("{export}/{arity} failed on both tiers: {err:?}"));
         // The shared value is the one the oracle produces (slice.beam is compiled from
         // a known source; `tests/slice.rs`/`tests/jit.rs` pin the same numbers).
         if export == "fib" {
@@ -358,7 +352,9 @@ fn clobbering_jump_module() -> Module {
 /// The identity keeps the observable result the argument, and the counter proves the
 /// successor block really reached the host through the helper seam rather than
 /// silently doing nothing.
-fn identity_hook(calls: Arc<AtomicUsize>) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + Clone + 'static {
+fn identity_hook(
+    calls: Arc<AtomicUsize>,
+) -> impl FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + Clone + 'static {
     move |module: &str, function: &str, arity: u32, args: &[Eterm]| {
         if module != "m" || function != "tag" || arity != 1 || args.len() != 1 {
             return Err(BeamError::BadArg);
@@ -379,8 +375,7 @@ fn a_cross_function_jump_is_linked_straight_to_the_successors_entry() {
     // table *is* this block-entry table).
     let from = compiled
         .entry(0, 0)
-        .expect("entry/1's block at (0, 0) must be compiled")
-        as usize;
+        .expect("entry/1's block at (0, 0) must be compiled") as usize;
     let to = compiled
         .entry(1, 0)
         .expect("tail/1's block at (1, 0) must be compiled") as usize;
@@ -446,7 +441,10 @@ fn a_linked_jump_into_a_helper_calling_successor_is_interpreter_identical() {
             "the value must survive the linked exit (the spill) and the successor's \
              prologue (the `rdi` reload)"
         );
-        assert_ne!(arg, NIL, "a non-NIL argument is what makes a missing spill visible");
+        assert_ne!(
+            arg, NIL,
+            "a non-NIL argument is what makes a missing spill visible"
+        );
         assert!(
             native_calls.load(Ordering::SeqCst) >= 1,
             "the successor block's `gc_bif` must reach the host"
@@ -484,7 +482,10 @@ fn linking_leaves_the_block_table_and_block_count_unchanged() {
                 continue;
             }
             let address = entry.unwrap_or_else(|| {
-                panic!("every non-empty block must have an entry: ({func}, {})", block.start)
+                panic!(
+                    "every non-empty block must have an entry: ({func}, {})",
+                    block.start
+                )
             }) as usize;
             assert!(
                 (lo..hi).contains(&address),
@@ -536,7 +537,10 @@ fn every_non_empty_block_of_a_linking_module_has_an_entry() {
     assert!(compiled.entry(0, 0).is_some());
     assert!(compiled.entry(1, 0).is_some());
     assert!(compiled.entry(0, 1).is_none(), "an address inside a block");
-    assert!(compiled.entry(2, 0).is_none(), "a function that does not exist");
+    assert!(
+        compiled.entry(2, 0).is_none(),
+        "a function that does not exist"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -639,11 +643,7 @@ fn a_shape_the_tier_may_not_lower_still_deopts_with_interpreter_semantics() {
     // A `NO_FAIL` arity switch on a non-tuple: the raise (with its reason term) is
     // identical on both tiers.
     let module = no_fail_arity_switch_module();
-    for arg in [
-        make_small(7),
-        NIL,
-        make_atom(atom(&module, "classify")),
-    ] {
+    for arg in [make_small(7), NIL, make_atom(atom(&module, "classify"))] {
         let jitted = agree(&module, "classify", 1, &[arg], arith_hook);
         assert!(
             matches!(jitted, Err(BeamError::Raise(_))),
