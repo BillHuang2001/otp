@@ -748,16 +748,8 @@ fn populated_table_has_the_expected_shape() {
     assert!(table.enif_clear_env.is_some());
     assert!(table.enif_compare.is_some());
     assert!(table.enif_is_identical.is_some());
-    // The variadic slots must stay `None` — stable Rust cannot define a C-variadic function.
-    assert!(table.enif_make_tuple.is_none());
-    assert!(table.enif_make_list.is_none());
-    assert!(table.enif_set_option.is_none());
-    assert!(table.enif_fprintf.is_none());
-    assert!(table.enif_snprintf.is_none());
-    // Out-of-scope subsystems (resources, ioq, threads) are still unwired.
-    assert!(table.enif_open_resource_type.is_none());
-    assert!(table.enif_ioq_create.is_none());
-    assert!(table.enif_mutex_create.is_none());
+    // Which slots are still `None` is deliberately NOT asserted here: it changes as families land,
+    // and each family's own test pins its own slots. See `CONTEXT.md` for the current status.
     // The frozen shape is untouched by populating it.
     assert_eq!(
         core::mem::size_of::<beam_abi::nif::api::ErlNifApi>(),

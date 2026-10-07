@@ -147,9 +147,6 @@ fn the_enif_table_is_populated_for_every_symbol_the_fixture_imports() {
     assert!(table.enif_make_reverse_list.is_some());
     assert!(table.enif_make_tuple_from_array.is_some());
     assert!(table.enif_make_badarg.is_some());
-    // The C-variadic slots the fixture must avoid stay `None` (stable Rust cannot define them).
-    assert!(table.enif_make_tuple.is_none());
-    assert!(table.enif_make_list.is_none());
 }
 
 // ---------------------------------------------------------------------------------------------

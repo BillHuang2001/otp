@@ -54,9 +54,4 @@ fn table_exposes_representative_slots_and_leaves_variadics_none() {
     assert!(table.enif_make_int.is_some());
     assert!(table.enif_get_tuple.is_some());
     assert!(table.enif_make_badarg.is_some());
-    // Variadic: stable Rust cannot define these.
-    assert!(table.enif_make_tuple.is_none());
-    assert!(table.enif_make_list.is_none());
-    assert!(table.enif_set_option.is_none());
-    assert!(table.enif_fprintf.is_none());
 }

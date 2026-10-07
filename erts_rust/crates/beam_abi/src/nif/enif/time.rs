@@ -93,7 +93,9 @@ const NSEC_PER_SEC: i64 = 1_000_000_000;
 /// `ERTS_MONOTONIC_OFFSET_NSEC` — see the module docs for the derivation.
 const MONOTONIC_OFFSET_NSEC: i64 = -576_460_753_000_000_000;
 
-/// `ERTS_MONOTONIC_BEGIN` — the internal monotonic range starts here (`= 1s`).
+/// `ERTS_MONOTONIC_BEGIN` — the internal monotonic range starts here (`= 1s`), the anchor of the
+/// `ERTS_MONOTONIC_OFFSET_*` derivation below.
+#[allow(dead_code)]
 const MONOTONIC_BEGIN_NSEC: i64 = NSEC_PER_SEC;
 
 /// The unit's tick frequency (`erts_napi_convert_time_unit`'s `ffreq`/`tfreq`).
@@ -106,17 +108,25 @@ const fn freq(unit: ErlNifTimeUnit) -> i64 {
     }
 }
 
+/// The nanosecond count in one `unit` tick — `ERTS_MONOTONIC_TIME_UNIT / <unit> frequency`. The
+/// native monotonic/offset values are nanosecond counts, so `ERTS_MONOTONIC_TO_<unit>(ns)` is
+/// `ns / ns_per_tick`.
+const fn ns_per_tick(unit: ErlNifTimeUnit) -> i64 {
+    NSEC_PER_SEC / freq(unit)
+}
+
 /// `ERTS_MONOTONIC_OFFSET_<unit>` — the ERTS nanosecond offset converted to `unit`
 /// (`ERTS_MONOTONIC_TO_<unit>(OFFSET_NATIVE)`; C truncates toward zero, and the value divides
 /// exactly for every unit).
 const fn offset_for(unit: ErlNifTimeUnit) -> i64 {
-    MONOTONIC_OFFSET_NSEC / freq(unit)
+    MONOTONIC_OFFSET_NSEC / ns_per_tick(unit)
 }
 
 /// `ERTS_MONOTONIC_TO_<unit>(ns)` — nanosecond count to `unit` (truncating division, as in the C
-/// macro family). Used only on non-negative values, so Rust's truncating `/` is the C's.
+/// macro family). The offset is negative and divides exactly; on the positive monotonic reading
+/// Rust's truncating `/` is the C's.
 fn to_unit(ns: i64, unit: ErlNifTimeUnit) -> i64 {
-    ns / freq(unit)
+    ns / ns_per_tick(unit)
 }
 
 /// Read `clock_id` as a nanosecond count; `None` when the clock read fails.
@@ -181,11 +191,15 @@ pub unsafe extern "C" fn enif_monotonic_time(unit: ErlNifTimeUnit) -> ErlNifTime
 /// No preconditions: no pointers are taken and the function never panics.
 #[no_mangle]
 pub unsafe extern "C" fn enif_time_offset(unit: ErlNifTimeUnit) -> ErlNifTime {
-    match clock_ns(libc::CLOCK_REALTIME) {
-        // The C's raw wall↔monotonic offset is `system_time - ERTS_MONOTONIC_BEGIN`.
-        Some(real) => to_unit(real.wrapping_sub(MONOTONIC_BEGIN_NSEC), unit)
+    match (
+        clock_ns(libc::CLOCK_REALTIME),
+        clock_ns(libc::CLOCK_MONOTONIC),
+    ) {
+        // The C's `get_time_offset()` is the native wall−monotonic difference, so that the
+        // monotonic reading plus this offset reproduces the wall-clock reading.
+        (Some(real), Some(mono)) => to_unit(real.wrapping_sub(mono), unit)
             .wrapping_sub(offset_for(unit)),
-        None => ERTS_NAPI_TIME_ERROR,
+        _ => ERTS_NAPI_TIME_ERROR,
     }
 }
 
@@ -717,14 +731,23 @@ mod tests {
         assert!(a != ERTS_NAPI_TIME_ERROR && b != ERTS_NAPI_TIME_ERROR);
         assert!(b >= a, "monotonic time must not go backwards: {a} -> {b}");
 
-        // The unit conversions agree with the ERTS formula: each unit's value is the nanosecond
-        // value divided by that unit's frequency.
+        // Three *separate* clock readings, each converted with the C's "convert, then add the
+        // per-unit offset" order. Because the offset is negative, `trunc((mN + OFFSET)/1e9)` and
+        // `trunc(mN/1e9) + OFFSET_SEC` differ by at most one tick; so the cross-call agreement is
+        // bounded by one unit rather than exact.
         let ns = unsafe { enif_monotonic_time(ErlNifTimeUnit::Nsec) };
         let msec = unsafe { enif_monotonic_time(ErlNifTimeUnit::Msec) };
         let sec = unsafe { enif_monotonic_time(ErlNifTimeUnit::Sec) };
-        assert_eq!(sec, ns / 1_000_000_000);
-        assert_eq!(msec, ns / 1_000_000);
-        // The offset is applied per unit, so the invariants below hold exactly.
+        assert!((sec - ns / 1_000_000_000).abs() <= 1, "sec={sec} ns={ns}");
+        assert!((msec - ns / 1_000_000).abs() <= 1, "msec={msec} ns={ns}");
+        // The pure conversion helpers ARE exact on a single native reading: `to_unit` then
+        // `offset_for` reproduces the C's per-unit value, and the offset divides exactly.
+        let native = 5 * NSEC_PER_SEC + 500_000_000;
+        assert_eq!(to_unit(native, ErlNifTimeUnit::Sec), 5);
+        assert_eq!(
+            to_unit(native, ErlNifTimeUnit::Sec) + offset_for(ErlNifTimeUnit::Sec),
+            -576_460_748
+        );
         assert_eq!(
             offset_for(ErlNifTimeUnit::Msec),
             offset_for(ErlNifTimeUnit::Nsec) / 1_000_000
@@ -754,7 +777,8 @@ mod tests {
         // SAFETY: `env` is live.
         let now = unsafe { enif_now_time(env.as_ptr()) };
         let term = t(now);
-        assert!(prelude::is_tuple(term), "enif_now_time returns a tuple");
+        // SAFETY: `term` is a live, well-formed term.
+        assert!(unsafe { prelude::is_tuple(term) }, "enif_now_time returns a tuple");
         // SAFETY: `term` is a live tuple; the arity word is at word 0.
         assert_eq!(unsafe { prelude::arityval(*prelude::boxed_val(term)) }, 3);
         // SAFETY: as above — word 1 is the megaseconds element.
@@ -762,7 +786,8 @@ mod tests {
 
         // SAFETY: `env` is live.
         let cpu = unsafe { enif_cpu_time(env.as_ptr()) };
-        assert!(prelude::is_tuple(t(cpu)));
+        // SAFETY: the term was produced by a live call above.
+        assert!(unsafe { prelude::is_tuple(t(cpu)) });
 
         // A null env is a typed badarg, never a crash.
         // SAFETY: a null env is explicitly allowed.

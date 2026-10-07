@@ -309,14 +309,12 @@ mod tests {
             "every implemented slot must be populated: {populated:?}"
         );
 
-        // The families that need runtime structure this seam does not expose stay `None`.
-        assert!(t.erl_drv_mutex_create.is_none());
+        // The families that need runtime structure this seam does not expose stay `None`
+        // (`driver_create_port` needs a real port registry; the binary-refcount trio has no
+        // refcount word in the frozen `ErlDrvBinary` layout). Which of the other slots are still
+        // `None` is deliberately NOT asserted here — it changes as families land, and each
+        // family's own test pins its own slots. See `CONTEXT.md` for the current status.
         assert!(t.driver_create_port.is_none());
-        assert!(t.driver_async_port_key.is_none());
-        assert!(t.erl_drv_init_ack.is_none());
-        assert!(t.set_busy_port.is_none());
-        assert!(t.driver_failure_eof.is_none());
-        // No refcount word exists in the frozen `ErlDrvBinary` layout.
         assert!(t.driver_binary_get_refc.is_none());
         assert!(t.driver_binary_inc_refc.is_none());
         assert!(t.driver_binary_dec_refc.is_none());
