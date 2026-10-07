@@ -50,7 +50,7 @@ use crate::mailbox::MailboxState;
 use crate::nif::NifRegistry;
 use crate::port::PortRegistry;
 use crate::runner::{ProcessEntry, RunnerState, RuntimeRunner};
-use crate::timers::{TimerTarget, Timers};
+use crate::timers::{TimerAction, TimerHandle, TimerTarget, Timers};
 /// The size in term words of the scratch heap `system_info`/`format_term` build on.
 ///
 /// It is `reset()` at the start of every such call, so it only has to hold one
@@ -235,6 +235,20 @@ pub struct Runtime {
     /// `beam_process::TimerService` (that wheel is driven by a thread, and the runtime is not
     /// `Send`).
     pub(crate) timers: Timers,
+    /// The **timed-out resume address** of every process whose finite `receive … after T`
+    /// deadline has fired, keyed by pid.
+    ///
+    /// A fired deadline must resume its process at the `timeout` instruction — *not* by
+    /// delivering a message — so the address travels here from the fire
+    /// ([`Runtime::fire_due_timers`]) to the runner ([`crate::runner`]), which consumes it
+    /// when it next runs the process. See [`crate::timers::TimerAction::Resume`].
+    timer_resumes: HashMap<ProcessId, (u32, u32)>,
+    /// The pids a fired receive deadline woke, waiting to be absorbed into the run queue.
+    ///
+    /// The receive-timeout counterpart of [`Runtime::fragment_wakes`]: the fire makes the
+    /// parked process runnable, and [`Runtime::absorb_timer_wakes`] turns it into a run-queue
+    /// entry at the same points the other wake sources are absorbed.
+    timer_wakes: Vec<ProcessId>,
 }
 
 impl Runtime {
@@ -301,6 +315,8 @@ impl Runtime {
             references: HashMap::new(),
             eval_closures: Vec::new(),
             timers: Timers::new(),
+            timer_resumes: HashMap::new(),
+            timer_wakes: Vec::new(),
         })
     }
 
@@ -409,6 +425,43 @@ impl Runtime {
     pub(crate) fn timers_mut(&mut self) -> &mut Timers {
         &mut self.timers
     }
+
+    /// Registers the **finite receive timeout** a process just parked on, returning the
+    /// handle that cancels it.
+    ///
+    /// Called by the runner when it parks a process at a `wait_timeout` whose operand is a
+    /// statically known positive delay (see [`crate::runner`]); on expiry the deadline
+    /// resumes the process at `(func, pc)` — the `timeout` instruction — instead of
+    /// delivering a message. The handle is what lets the runner cancel the deadline when a
+    /// real message wakes the receiver first.
+    pub(crate) fn schedule_receive_timeout(
+        &mut self,
+        pid: ProcessId,
+        delay: Duration,
+        func: u32,
+        pc: u32,
+    ) -> TimerHandle {
+        self.timers.schedule_resume(delay, pid, func, pc)
+    }
+
+    /// Cancels a receive deadline [scheduled](Runtime::schedule_receive_timeout) for a
+    /// receiver that a real message has already woken.
+    ///
+    /// Cancelling a deadline that has already fired is a no-op: the process then resumes on
+    /// its timed-out path, which is exactly the oracle's own timeout/message race.
+    pub(crate) fn cancel_receive_timeout(&mut self, handle: TimerHandle) {
+        self.timers.cancel_handle(handle);
+    }
+
+    /// The address a **fired** receive deadline wants `pid` resumed at, consuming it.
+    ///
+    /// The runner asks this when it resumes a parked process: `Some(address)` means the
+    /// deadline beat the message (resume at the timed-out path), `None` means the process was
+    /// woken by a message (resume the receive scan).
+    pub(crate) fn take_timer_resume(&mut self, pid: ProcessId) -> Option<(u32, u32)> {
+        self.timer_resumes.remove(&pid)
+    }
+
     /// Takes a heap for one BIF call out of the pool.
     ///
     /// The pool is a stack: a call takes a heap, runs, and puts it back
@@ -988,13 +1041,15 @@ impl Runtime {
                 }
             }
             // The timer half: deliver every `erlang:send_after/3` message whose deadline has
-            // passed (which may wake a blocked receiver, exactly like a port message).
+            // passed (which may wake a blocked receiver, exactly like a port message) and
+            // resume every process whose finite `receive … after T` deadline fired.
             match self.fire_due_timers(&mut table) {
                 Err(err) => break Err(err),
                 Ok(0) => {}
                 Ok(count) => {
                     delivered += count;
                     scheduler.resume_woken(&mut table);
+                    self.absorb_timer_wakes(&mut table, &mut scheduler);
                     continue;
                 }
             }
@@ -1041,7 +1096,8 @@ impl Runtime {
     }
 
     /// Fires every timer whose deadline has passed, delivering its message into the target's
-    /// mailbox, and returns how many messages were delivered.
+    /// mailbox — or, for a **receive deadline**, recording the address its process must
+    /// resume at — and returns how many deadlines took effect.
     ///
     /// A **pid** target is used as scheduled; a **name** target is resolved in `table` at
     /// fire time (as the oracle resolves a registered name). A target the table does not hold
@@ -1051,30 +1107,82 @@ impl Runtime {
     /// woken on the table's wake list and the caller resumes it with
     /// [`Scheduler::resume_woken`] — the very path a port message takes.
     ///
+    /// A [`TimerAction::Resume`] deadline (a finite `receive … after T`) instead records its
+    /// `(func, pc)` in [`Runtime::timer_resumes`] and queues the pid in
+    /// [`Runtime::timer_wakes`]; the caller makes the parked process runnable with
+    /// [`Runtime::absorb_timer_wakes`], and the runner resumes it at the **timed-out** path
+    /// with **no** message delivered.
+    ///
     /// # Errors
     ///
     /// The process table's delivery errors (an allocation failure while copying the message
     /// onto the receiver's heap) — never a swallowed failure.
     fn fire_due_timers(&mut self, table: &mut ProcessTable) -> Result<usize> {
         let fired = self.timers.take_due(Instant::now());
-        let mut delivered = 0;
+        let mut effects = 0;
         for timer in fired {
-            let target = match timer.target {
-                TimerTarget::Pid(pid) => Some(pid),
-                TimerTarget::Name(name) => table.whereis(name),
-            };
-            let Some(pid) = target else {
-                continue; // a name nobody holds: the message is dropped
-            };
-            if !table.contains(pid) {
-                continue; // a pid that has already terminated
+            match timer.action {
+                TimerAction::Deliver {
+                    target,
+                    from,
+                    message,
+                } => {
+                    let target = match target {
+                        TimerTarget::Pid(pid) => Some(pid),
+                        TimerTarget::Name(name) => table.whereis(name),
+                    };
+                    let Some(pid) = target else {
+                        continue; // a name nobody holds: the message is dropped
+                    };
+                    if !table.contains(pid) {
+                        continue; // a pid that has already terminated
+                    }
+                    table.deliver_simple(pid, from, message)?;
+                    effects += 1;
+                }
+                TimerAction::Resume { pid, func, pc } => {
+                    if !table.contains(pid) {
+                        continue; // a receiver that terminated before its deadline
+                    }
+                    self.timer_resumes.insert(pid, (func, pc));
+                    self.timer_wakes.push(pid);
+                    effects += 1;
+                }
             }
-            table.deliver_simple(pid, timer.from, timer.message)?;
-            delivered += 1;
         }
-        Ok(delivered)
+        Ok(effects)
     }
 
+    /// Turns the pids a fired receive deadline woke into run-queue entries, returning how
+    /// many were enqueued.
+    ///
+    /// The receive-timeout counterpart of [`Runtime::absorb_fragment_wakes`], with one extra
+    /// step: a parked receiver is [`ProcessState::Waiting`], so it is made `Runnable` as it is
+    /// enqueued. A pid that is no longer waiting — it terminated, or a message woke it and it
+    /// is already queued — is **skipped**, and its recorded resume address is dropped so the
+    /// message-woken resume cannot be hijacked by the stale timeout.
+    fn absorb_timer_wakes(&mut self, table: &mut ProcessTable, scheduler: &mut Scheduler) -> usize {
+        let wakes = std::mem::take(&mut self.timer_wakes);
+        let mut resumed = 0;
+        for pid in wakes {
+            let parked = matches!(table.get(pid), Some(process)
+                if process.state() == ProcessState::Waiting && !process.flags().in_run_queue());
+            if !parked {
+                self.timer_resumes.remove(&pid);
+                continue;
+            }
+            let Some(process) = table.get_mut(pid) else {
+                self.timer_resumes.remove(&pid);
+                continue;
+            };
+            process.set_state(ProcessState::Runnable);
+            process.flags_mut().set_in_run_queue(true);
+            let priority = process.priority();
+            scheduler.enqueue_with_priority(pid, priority);
+            resumed += 1;
+        }
+        resumed
+    }
     /// Moves the process table out of the runtime for a scheduler pass.
     ///
     /// The placeholder is an equivalent **empty** table sharing the runtime's atom table
@@ -1557,5 +1665,144 @@ mod tests {
             )
             .expect("the receive takes the timer's message");
         assert_eq!(rt.atom_name_of(value).as_deref(), Some("got"));
+    }
+
+    // -- receive … after T on the scheduler path ------------------------------
+
+    /// The committed `receive … after T` fixture, reused by relative path: every export
+    /// pins one literal-timeout opcode shape (see `tests/fixtures/recv_after.erl`).
+    const RECV_AFTER_BEAM: &str = concat!(
+        env!("CARGO_MANIFEST_DIR"),
+        "/tests/fixtures/recv_after.beam"
+    );
+
+    /// Spawns `recv_after:function/0` in `rt`.
+    fn spawn_recv_after(rt: &mut Runtime, function: &str) -> ProcessId {
+        rt.load_module(RECV_AFTER_BEAM).expect("load recv_after.beam");
+        rt.spawn_process("recv_after", function, vec![])
+            .expect("the fixture exports it")
+    }
+
+    /// Oracle: `recv_after:after20()` ⇒ `timeout` — the receive parks on an empty mailbox,
+    /// its 20 ms deadline fires, and the process resumes at the **timed-out** path (the
+    /// `timeout` instruction) with **no** message delivered.
+    #[test]
+    fn a_literal_receive_timeout_fires_on_the_scheduler_path() {
+        let mut rt = runtime();
+        let receiver = spawn_recv_after(&mut rt, "after20");
+
+        // Slice 1: the receiver finds an empty mailbox and parks, arming its deadline.
+        assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+        let parked = rt.processes().get(receiver).expect("it stays in the table");
+        assert_eq!(parked.state(), ProcessState::Waiting);
+        assert!(parked.mailbox().is_empty());
+        assert!(rt.process_result(receiver).is_none(), "it has not returned");
+        assert_eq!(rt.timers.pending_count(), 1, "the receive armed a deadline");
+
+        // Nothing can run, so the pass waits for the deadline and resumes the receiver on
+        // the timed-out path; had it delivered anything, the mailbox clause would have taken
+        // it instead of running the `after` body.
+        rt.run_scheduler().expect("the pass waits for the deadline");
+        assert_eq!(
+            rt.atom_name_of(rt.process_result(receiver).expect("the receiver returned"))
+                .as_deref(),
+            Some("timeout"),
+            "the after clause ran"
+        );
+        assert_eq!(rt.timers.pending_count(), 0, "the deadline fired exactly once");
+        assert!(rt.processes().get(receiver).is_none(), "it terminated normally");
+    }
+
+    /// Oracle: `recv_after:afterzero()` ⇒ `timeout` — an `after 0` literal is folded into a
+    /// direct `timeout` by the compiler, so the receive never suspends and arms no deadline.
+    #[test]
+    fn a_receive_after_zero_does_not_suspend() {
+        let mut rt = runtime();
+        let receiver = spawn_recv_after(&mut rt, "afterzero");
+
+        assert_eq!(rt.run_scheduler().expect("the pass drains the run queue"), 1);
+        assert_eq!(
+            rt.atom_name_of(rt.process_result(receiver).expect("the receiver returned"))
+                .as_deref(),
+            Some("timeout")
+        );
+        assert_eq!(rt.timers.pending_count(), 0, "after 0 arms no deadline");
+    }
+
+    /// Oracle: `recv_after:self_send()` ⇒ `hello` — the message is already in the mailbox
+    /// when the receive starts, so it is taken and the long `after` clause is never reached
+    /// (and no deadline is armed for the abandoned clause).
+    #[test]
+    fn a_message_already_in_the_mailbox_is_taken_before_the_timeout() {
+        let mut rt = runtime();
+        let receiver = spawn_recv_after(&mut rt, "self_send");
+
+        let started = Instant::now();
+        rt.run_scheduler().expect("the receiver takes its own message");
+        assert_eq!(
+            rt.atom_name_of(rt.process_result(receiver).expect("the receiver returned"))
+                .as_deref(),
+            Some("hello")
+        );
+        assert_eq!(rt.timers.pending_count(), 0, "no deadline was armed");
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "the receive did not wait for its 2000 ms timeout"
+        );
+    }
+
+    /// Oracle: a receiver parked in `receive X -> X after 2000 -> timeout end` that **is**
+    /// sent a message resumes normally with that message — and its receive deadline is
+    /// cancelled, so the pass does not also wait the full timeout out.
+    #[test]
+    fn a_message_wakes_a_receiver_before_its_deadline_and_cancels_it() {
+        let mut rt = runtime();
+        let receiver = spawn_recv_after(&mut rt, "after2000");
+
+        // Slice 1: the receiver parks with a 2000 ms deadline.
+        assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+        assert_eq!(
+            rt.processes().get(receiver).expect("in the table").state(),
+            ProcessState::Waiting
+        );
+        assert_eq!(rt.timers.pending_count(), 1, "the receive armed its deadline");
+
+        // `send_after` fires at 5 ms — long before the receive deadline — and the delivered
+        // message wakes the receiver through the ordinary deliver+wake path.
+        let _ = send_after(&mut rt, 5, receiver.to_eterm(), make_small(42));
+        let started = Instant::now();
+        rt.run_scheduler().expect("the pass delivers the message and resumes the receiver");
+        assert_eq!(signed_value(rt.process_result(receiver).expect("the receiver returned")), 42);
+        assert_eq!(rt.timers.pending_count(), 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "the receive deadline was cancelled, not waited out (took {:?})",
+            started.elapsed()
+        );
+    }
+
+    /// Oracle: `spawn(recv_after, wait_forever, [])` stays parked — `after infinity`
+    /// compiles to a bare `wait`, which arms **no** deadline and never times out.
+    #[test]
+    fn after_infinity_parks_forever() {
+        let mut rt = runtime();
+        let receiver = spawn_recv_after(&mut rt, "wait_forever");
+
+        assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+        assert_eq!(
+            rt.processes().get(receiver).expect("in the table").state(),
+            ProcessState::Waiting
+        );
+        assert!(rt.process_result(receiver).is_none(), "it never returned");
+        assert_eq!(rt.timers.pending_count(), 0, "after infinity arms no deadline");
+
+        let started = Instant::now();
+        assert_eq!(rt.run_scheduler().expect("nothing can run"), 0);
+        assert!(
+            started.elapsed() < Duration::from_millis(500),
+            "the pass did not wait on a deadline (took {:?})",
+            started.elapsed()
+        );
+        assert!(rt.processes().get(receiver).is_some(), "it is still parked");
     }
 }

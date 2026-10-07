@@ -49,15 +49,17 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
 use beam_common::{BeamError, Result};
 use beam_engine::{ExecutionContext, Machine, RunOutcome as EngineRunOutcome};
-use beam_loader::Module;
+use beam_loader::{Instr, Module, Operand};
 use beam_process::{ProcessId, ProcessRunner, ProcessState, ProcessTable, RunOutcome};
-use beam_term::{Atom, Eterm};
+use beam_term::{is_small, signed_value, Atom, Eterm};
 
 use crate::context::RuntimeContext;
 use crate::runtime::Runtime;
+use crate::timers::TimerHandle;
 
 /// The entry point of one runtime-scheduled process: what to run, with which arguments.
 ///
@@ -107,6 +109,15 @@ struct ProcessEngine {
     /// synchronously (the evaluator never returns a resume address), so `parked` stays
     /// `None` for it.
     parked: Option<(u32, u32)>,
+    /// The pending **finite receive timeout** of a parked process, if its `wait_timeout`
+    /// carried a statically known positive delay.
+    ///
+    /// While the process is parked the deadline lives in
+    /// [`Runtime::timers`](crate::Runtime); this is the handle that cancels it when a real
+    /// message wakes the receiver first (so the receive does not also fire its timeout). A
+    /// `wait` with no timeout — including the `after infinity` the compiler emits as a plain
+    /// `wait` — leaves it `None`, so the process parks indefinitely.
+    parked_timeout: Option<TimerHandle>,
 }
 
 /// The per-pid engine state and recorded outcomes of every process the runtime spawned.
@@ -134,6 +145,7 @@ impl RunnerState {
                 entry,
                 args,
                 parked: None,
+                parked_timeout: None,
             },
         );
     }
@@ -215,6 +227,89 @@ fn exit_reason(runtime: &mut Runtime, error: &BeamError) -> Eterm {
     runtime.intern(&error.to_string())
 }
 
+/// The finite timeout of the `receive` a process has just parked at `(func, pc)`.
+///
+/// The engine reports a suspension at the receive's **scan** address — the `loop_rec` label
+/// the `wait`/`wait_timeout` jumps back to once a message arrives — and
+/// [`EngineRunOutcome::Wait`] carries no timeout, so the *timed-out* continuation is
+/// recovered from the module, whose compiled shape is fixed:
+///
+/// ```text
+/// ScanLabel:  loop_rec Fail, Dst
+///             … match tests, loop_rec_end ScanLabel …
+/// Fail:       wait_timeout ScanLabel, Time
+///             timeout            ; <-- the timed-out continuation
+/// ```
+///
+/// `Fail` is exactly the jump target of the `loop_rec` at `pc`, and — per the C
+/// (`emu/msg_instrs.tab:356-363`: "In case of timeout, control will be transferred to the
+/// `timeout` instruction following the `wait_timeout` instruction", armed as
+/// `*pi = $NEXT_INSTRUCTION` in `i_wait.int`) — a timeout resumes at the instruction
+/// **right after** the `wait_timeout`, i.e. the `timeout` opcode.
+///
+/// Returns `None` when the process parked on a bare `wait` (the `after infinity` the compiler
+/// emits as `wait`), and for a timeout whose delay is not statically readable (see
+/// [`timeout_delay`]) — the process then parks indefinitely, exactly as before, rather than
+/// being given an invented deadline.
+fn parked_receive_timeout(
+    machine: &Machine,
+    module: &Module,
+    func: u32,
+    pc: u32,
+) -> Option<(Duration, (u32, u32))> {
+    let function = module.functions.get(func as usize)?;
+    for (index, instr) in function.code.iter().enumerate() {
+        let Instr::WaitTimeout { target, time } = instr else {
+            continue;
+        };
+        // The `wait_timeout` that owns this receive is the one whose jump-back target is the
+        // address the engine parked at (its `loop_rec`).
+        if function.labels.get(target) != Some(&(pc as usize)) {
+            continue;
+        }
+        let resume = (func, (index as u32) + 1);
+        return timeout_delay(machine, module, time).map(|delay| (delay, resume));
+    }
+    None
+}
+
+/// The positive delay of a `wait_timeout`'s `Time` operand, when it is statically readable.
+///
+/// The operand is a **decoded IR operand**, not a runtime term: a literal timeout (`after
+/// 20`) is [`Operand::Integer`] or (for a value the loader materialized) [`Operand::Literal`],
+/// and an X-register timeout is read from the machine — the registers are untouched by the
+/// suspension, so the value the `wait_timeout` tested is still there.
+///
+/// `None` for everything else — an `after infinity` atom, a **Y-register** timeout (a runtime
+/// variable, which `Machine` exposes no stack read for), and any non-positive or non-integer
+/// value. `None` means "no deadline": the process parks until a message arrives, which is the
+/// honest answer when the delay cannot be known rather than a guessed one.
+fn timeout_delay(machine: &Machine, module: &Module, time: &Operand) -> Option<Duration> {
+    match time {
+        Operand::Integer(millis) => positive_millis(*millis),
+        Operand::Literal(index) => module.literal(*index).and_then(millis_of),
+        Operand::X(register) => machine.x(*register).and_then(millis_of),
+        _ => None,
+    }
+}
+
+/// `millis` as a [`Duration`], or `None` when it is not a positive delay.
+fn positive_millis(millis: i64) -> Option<Duration> {
+    (millis > 0).then(|| Duration::from_millis(millis as u64))
+}
+
+/// The positive millisecond delay a timeout **term** denotes, or `None`.
+///
+/// A small integer greater than zero is a delay; the atom `infinity`, a zero/negative
+/// integer, and anything else are not (`infinity` means "never", which is the absence of a
+/// deadline — the same `None`).
+fn millis_of(term: Eterm) -> Option<Duration> {
+    if is_small(term) {
+        return positive_millis(signed_value(term));
+    }
+    None
+}
+
 impl ProcessRunner for RuntimeRunner<'_> {
     /// Runs one slice of process `pid`: its first entry, or the resume of the `receive`
     /// that suspended it.
@@ -241,6 +336,28 @@ impl ProcessRunner for RuntimeRunner<'_> {
         let Some(mut engine) = self.state.engines.remove(&pid) else {
             return Err(crate::error::unknown_process_entry(pid));
         };
+
+        // Settle a parked receive's deadline **before** the context borrows the runtime:
+        // a deadline that fired resumes the process at the timed-out path, while a
+        // message-wake cancels the deadline so the receive cannot also fire its timeout.
+        if engine.parked.is_some() {
+            match self.runtime.take_timer_resume(pid) {
+                Some(address) => {
+                    // The deadline won the race: resume at the `timeout` instruction with
+                    // no message delivered (the mailbox is untouched, so the `after` clause
+                    // runs).
+                    engine.parked = Some(address);
+                    engine.parked_timeout = None;
+                }
+                None => {
+                    // A message woke the receiver first: drop the deadline. Cancelling one
+                    // that already fired is a no-op, which is the honest read of the race.
+                    if let Some(handle) = engine.parked_timeout.take() {
+                        self.runtime.cancel_receive_timeout(handle);
+                    }
+                }
+            }
+        }
 
         let outcome = {
             let mut ctx = RuntimeContext::for_process(&mut *self.runtime, table, pid);
@@ -295,6 +412,23 @@ impl ProcessRunner for RuntimeRunner<'_> {
                 // process off the ready queue): a blocked process is `Waiting` until a
                 // delivery wakes it, which is exactly what makes a later send resume it.
                 engine.parked = Some((func, pc));
+                // A `wait_timeout` with a statically known positive delay arms a deadline
+                // now: when it fires the process resumes at the timed-out path instead of
+                // waiting for a message (see `parked_receive_timeout`).
+                engine.parked_timeout = None;
+                if let ProcessEntry::Export { module, .. } = &engine.entry {
+                    if let Some((delay, (resume_func, resume_pc))) =
+                        parked_receive_timeout(&engine.machine, module, func, pc)
+                    {
+                        let handle = self.runtime.schedule_receive_timeout(
+                            pid,
+                            delay,
+                            resume_func,
+                            resume_pc,
+                        );
+                        engine.parked_timeout = Some(handle);
+                    }
+                }
                 if let Some(process) = table.get_mut(pid) {
                     process.set_state(ProcessState::Waiting);
                 }
