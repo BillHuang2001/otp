@@ -82,6 +82,16 @@ pub struct Runtime {
     /// `crate::mailbox`). A pid with no entry has never scanned, which is the default
     /// state (cursor at the first message, no markers).
     pub(crate) mailboxes: HashMap<ProcessId, MailboxState>,
+    /// The pids a **heap-fragment** delivery woke, waiting to be absorbed into the run queue.
+    ///
+    /// A delivery into the receiver's own heap records its wake on the process table's wake
+    /// list (filled by `ProcessTable::deliver`), which the scheduler drains. A delivery
+    /// through the **heap-fragment** model
+    /// ([`RuntimeContext::send_message`](crate::context::RuntimeContext)) writes into the
+    /// receiver's mailbox directly instead, so its wake has no entry on that list and is
+    /// recorded here; [`Runtime::scheduler_pass`] absorbs it into the real run queue at the
+    /// same points it absorbs the table's own wake list.
+    fragment_wakes: Vec<ProcessId>,
     /// The preloaded-module registry skeleton (contract A.7).
     preloaded: PreloadedModules,
     /// The heaps BIF calls allocate on, used as a stack: a call takes one out, runs, and
@@ -219,6 +229,7 @@ impl Runtime {
             code_server,
             processes,
             mailboxes: HashMap::new(),
+            fragment_wakes: Vec::new(),
             preloaded: PreloadedModules::standard(),
             bif_heaps: vec![Heap::new(heap_words)?],
             bif_heap_words: heap_words,
@@ -749,6 +760,50 @@ impl Runtime {
         self.scheduler.run_queue().len()
     }
 
+    /// Records that a **heap-fragment** delivery woke `pid` (see
+    /// [`Runtime::fragment_wakes`](Runtime)).
+    ///
+    /// Called by the sender
+    /// ([`RuntimeContext::send_fragmented_message`](crate::context::RuntimeContext)) after
+    /// it has enqueued the payload and woken the receiver: this is the fragment path's
+    /// substitute for `ProcessTable`'s wake list, which it bypasses. The pid is enqueued by
+    /// the next [`Runtime::scheduler_pass`]; recording one for a pid that re-blocks or dies
+    /// first is harmless (the sweep skips it).
+    pub(crate) fn note_fragment_wake(&mut self, pid: ProcessId) {
+        self.fragment_wakes.push(pid);
+    }
+
+    /// Turns the pids a heap-fragment delivery woke into run-queue entries, returning how
+    /// many were enqueued.
+    ///
+    /// The fragment counterpart of `beam_process`'s own wake sweep
+    /// (`Scheduler::resume_woken`), with the same rule: a pid is enqueued only when it is
+    /// still a **live `Runnable`** process that is **not already queued** — it may have
+    /// terminated or re-blocked since the wake — and it resumes at its own priority.
+    fn absorb_fragment_wakes(
+        &mut self,
+        table: &mut ProcessTable,
+        scheduler: &mut Scheduler,
+    ) -> usize {
+        let wakes = std::mem::take(&mut self.fragment_wakes);
+        let mut resumed = 0;
+        for pid in wakes {
+            let Some(process) = table.get(pid) else {
+                continue;
+            };
+            if process.state() != ProcessState::Runnable || process.flags().in_run_queue() {
+                continue;
+            }
+            let priority = process.priority();
+            if let Some(process) = table.get_mut(pid) {
+                process.flags_mut().set_in_run_queue(true);
+            }
+            scheduler.enqueue_with_priority(pid, priority);
+            resumed += 1;
+        }
+        resumed
+    }
+
     /// Runs a scheduler pass: the shared dance every `run_*` entry performs.
     ///
     /// The **process table** and the **runner state** are moved out of the runtime, so the
@@ -816,6 +871,9 @@ impl Runtime {
         if resume_first {
             scheduler.resume_woken(&mut table);
         }
+        // A heap-fragment delivery is absorbed at the same points as the table's own wake
+        // list, so a wake it produced *outside* a slice is enqueued before the first one.
+        self.absorb_fragment_wakes(&mut table, &mut scheduler);
         let mut ran: u64 = 0;
         let mut delivered: usize = 0;
         let outcome: Result<()> = loop {
@@ -833,10 +891,18 @@ impl Runtime {
                 Ok(executed) => ran += executed,
                 Err(err) => break Err(err),
             }
+            // A heap-fragment delivery made *inside* the slices just run woke its receiver;
+            // `run_slice` absorbs the table's own wake list, and this is the fragment
+            // counterpart, so the receiver this pass just woke still runs in this pass.
+            let woke = self.absorb_fragment_wakes(&mut table, &mut scheduler);
             // The port half: with a live port, read what it produced and deliver it into
             // the owning process's mailbox (which may wake a blocked receiver).
             match self.deliver_port_messages(&mut table, crate::port::PORT_POLL_SLICE) {
-                Ok(0) => break Ok(()),
+                // Nothing left to do: no port produced a message and no fragment delivery
+                // woke anything.
+                Ok(0) if woke == 0 => break Ok(()),
+                // A fragment wake was absorbed above, so go round again and run it.
+                Ok(0) => {}
                 Ok(count) => {
                     delivered += count;
                     // The delivery may have woken a blocked receiver: absorb the wake list so

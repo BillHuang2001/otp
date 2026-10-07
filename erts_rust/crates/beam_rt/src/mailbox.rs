@@ -28,7 +28,7 @@
 //! `unsafe`-free: every queue access is a bounds-safe [`Queue`] method (a past-the-end
 //! cursor or an empty queue yields `None`, never a panic).
 
-use beam_message::{Message, Queue, QueueCursor};
+use beam_message::{Fragments, Message, Queue, QueueCursor};
 use beam_term::{is_small, make_small, Eterm};
 
 /// The small-integer base of the opaque marker terms [`MailboxState::reserve`] hands out.
@@ -55,7 +55,7 @@ struct Marker {
 /// See the module docs: it outlives any single context, because a suspended receive
 /// resumes against exactly this position. [`MailboxState::default`] is the state of a
 /// fresh process — cursor at the first message, no markers.
-#[derive(Debug, Default)]
+#[derive(Default)]
 pub(crate) struct MailboxState {
     /// The scan position `loop_rec` peeks at and `loop_rec_end` advances.
     cursor: QueueCursor,
@@ -63,10 +63,40 @@ pub(crate) struct MailboxState {
     markers: Vec<Marker>,
     /// Distinguishes consecutive reserved marker terms.
     next_marker: i64,
+    /// The fragments of every removed message whose payload lived in one.
+    ///
+    /// A message payload that did not fit the receiver's heap lives in a **heap fragment**
+    /// the message owns; the running code holds only the copied *term*. Dropping the
+    /// message on `remove_message` would therefore free the fragment under the code that
+    /// just bound it. The legacy C *moves* the fragment onto the process heap
+    /// (`erts_move_multi_frags`, `copy.c:2049-2111`); this runtime keeps the fragment alive
+    /// here instead, because the receiver's heap cannot be borrowed at the same time as its
+    /// mailbox from outside `beam_process` (see the crate `CONTEXT.md` handoff). The
+    /// fragments are released when the process's scan state is.
+    retained_fragments: Vec<Fragments>,
 }
 
 impl MailboxState {
-    /// `loop_rec`: the payload of the message at the scan position, `None` when the
+    /// The number of heap-fragment chains this scan is keeping alive (see
+    /// [`MailboxState::retained_fragments`]).
+    #[cfg(test)]
+    pub(crate) fn retained(&self) -> usize {
+        self.retained_fragments.len()
+    }
+
+    /// Removes the message at `cursor`, keeping a **fragment-resident** payload alive.
+    ///
+    /// The only difference from a bare [`Queue::remove_at`] is what happens to a message
+    /// that owns [`Fragments`]: they are taken off the message (which is then dropped) and
+    /// retained on this state, so the payload term the running code holds stays valid. A
+    /// message whose payload lives in the receiver's heap is dropped exactly as before.
+    pub(crate) fn remove_at(&mut self, queue: &mut Queue, cursor: QueueCursor) {
+        if let Some(mut message) = queue.remove_at(cursor) {
+            if let Some(fragments) = message.fragments_mut() {
+                self.retained_fragments.push(std::mem::take(fragments));
+            }
+        }
+    }    /// `loop_rec`: the payload of the message at the scan position, `None` when the
     /// scan is exhausted (an empty queue, or every candidate already scanned past).
     ///
     /// **Peeks** — the cursor does not move; only [`MailboxState::skip`] advances it.
@@ -84,9 +114,11 @@ impl MailboxState {
     /// `remove_message`: unlink the matched candidate and reposition the scan at the
     /// first message.
     ///
-    /// A cursor past the end (an empty queue) removes nothing but still repositions.
+    /// A cursor past the end (an empty queue) removes nothing but still repositions. A
+    /// removed message that owns heap [`Fragments`] hands them to this state so the payload
+    /// stays valid ([`MailboxState::remove_at`]).
     pub(crate) fn remove(&mut self, queue: &mut Queue) {
-        queue.remove_at(self.cursor);
+        self.remove_at(queue, self.cursor);
         self.cursor = queue.cursor();
     }
 
@@ -298,5 +330,126 @@ mod tests {
         let first = state.reserve(&queue, make_small(-1));
         let second = state.reserve(&queue, make_small(-1));
         assert_ne!(first, second);
+    }
+
+    /// The scan keeps only **fragment-resident** payloads alive: an ordinary message whose
+    /// payload lives in the receiver's own heap is dropped exactly as before, so the
+    /// fragment path adds no retention to the common case.
+    #[test]
+    fn removing_a_heap_resident_message_retains_nothing() {
+        let mut queue = queue_of(&[1, 2, 3]);
+        let mut state = MailboxState::default();
+        state.skip(&queue);
+        state.remove(&mut queue);
+        assert_eq!(payloads(&queue), vec![1, 3]);
+        assert_eq!(state.retained(), 0, "a heap-resident payload needs no keeping");
+    }
+
+    /// A payload **larger than the receiver's whole heap** is delivered intact — through the
+    /// heap-fragment model — and still wakes the blocked receiver.
+    ///
+    /// `recv:wait/0` is `receive X -> X end` (the committed oracle fixture
+    /// `../beam_engine/tests/fixtures/recv.beam`): it returns the message it took. The whole
+    /// delivery runs the way an `-eval` send does (from outside a scheduler slice), so the
+    /// wake has to survive to a later pass as well.
+    #[test]
+    fn an_oversized_payload_reaches_a_blocked_receiver_through_a_fragment() {
+        use beam_engine::{terms, ExecutionContext};
+        use beam_process::ProcessState;
+
+        use crate::context::RuntimeContext;
+        use crate::runtime::Runtime;
+
+        /// The committed receive fixture (reused by relative path — never copied).
+        const RECV_BEAM: &str = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../beam_engine/tests/fixtures/recv.beam"
+        );
+
+        let mut rt = Runtime::with_defaults().expect("the default runtime");
+        rt.load_module(RECV_BEAM).expect("recv.beam loads");
+        let receiver = rt
+            .spawn_process("recv", "wait", vec![])
+            .expect("spawn recv:wait/0");
+
+        // 1. The receiver blocks on its empty mailbox *before* anything is sent, so the
+        //    delivery must wake it as well as hand it the payload.
+        assert_eq!(rt.run_one_slice().expect("one slice"), 1);
+        assert_eq!(
+            rt.processes().get(receiver).expect("the receiver is alive").state(),
+            ProcessState::Waiting,
+            "the receiver is blocked before anything is sent"
+        );
+
+        // 2. A payload far larger than that receiver's heap. It is built on the runtime's
+        //    pointer-stable arena; the assertion is the precondition the fragment path
+        //    exists for — the payload genuinely cannot fit.
+        let elems: Vec<Eterm> = (1..=4_000i64).map(make_small).collect();
+        let payload = {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            terms::make_list(&mut ctx, &elems).expect("the payload")
+        };
+        let heap_available = rt
+            .processes()
+            .get(receiver)
+            .expect("the receiver is alive")
+            .heap()
+            .available();
+        let needed = beam_term::size_object(payload);
+        assert!(
+            needed > heap_available,
+            "the payload ({needed} words) must exceed the receiver's {heap_available}-word heap"
+        );
+
+        // 3. Deliver from outside a scheduler slice. The receiver is blocked (so this wakes
+        //    it) and its heap cannot hold the payload (so `deliver_simple` reports
+        //    `Alloc(Message)` and the send path must fall back to a heap fragment rather
+        //    than fail the `!`).
+        {
+            let mut ctx = RuntimeContext::new(&mut rt);
+            ctx.send_message(receiver.to_eterm(), payload)
+                .expect("the oversized delivery does not fail");
+        }
+
+        // 4. What is queued really is a fragment-resident payload.
+        {
+            let process = rt.processes().get(receiver).expect("the receiver is alive");
+            let message = process
+                .mailbox()
+                .iter()
+                .next()
+                .expect("one message is queued");
+            let fragments = message
+                .fragments()
+                .expect("an oversized payload lives in a heap fragment");
+            assert_eq!(fragments.len(), 1, "one fragment holds the whole payload");
+            assert!(
+                fragments
+                    .iter()
+                    .next()
+                    .expect("one fragment")
+                    .contains(message.payload()),
+                "the message payload points into the fragment"
+            );
+        }
+
+        // 5. The wake the fragment delivery produced is still pending (it is recorded for
+        //    the scheduler pass, not enqueued on the spot), and the pass absorbs it and runs
+        //    the receiver — which returns the payload intact.
+        assert_eq!(rt.run_queue_len(), 0, "a fragment wake is absorbed by a pass");
+        assert!(
+            rt.run_scheduler().expect("the pass runs the woken receiver") >= 1,
+            "the wake turned into a slice"
+        );
+        let result = rt.process_result(receiver).expect("recv:wait/0 returned");
+        assert!(
+            beam_term::compare::eq(payload, result, rt.atoms()),
+            "the oversized payload arrived intact"
+        );
+        assert_eq!(
+            rt.mailboxes.get(&receiver).expect("the scan state").retained(),
+            1,
+            "the receive kept the fragment (and so the bound payload) alive"
+        );
     }
 }
