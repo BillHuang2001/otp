@@ -2647,23 +2647,25 @@ fn non_inlinable_comparison_module() -> Module {
 
 /// The comparison-BIF counterpart of [`agree_arith`] (whose hook is a plain `fn`
 /// pointer, which cannot carry the cloned atom table): assert the interpreter, the
-/// baseline tier and the Cranelift tier all produce the same outcome for
-/// `export/arity` under the same comparison floor, and return that outcome.
-fn agree_comparison<H>(
+/// baseline tier and the Cranelift tier all produce the same outcome for `export/arity`
+/// under the same comparison floor, and return that outcome. `make_hook` builds one
+/// fresh floor per tier (the interpreter and the baseline tier both *own* the hook).
+fn agree_comparison<M, H>(
     backend: &CraneliftJit,
     compiled: &CompiledFunctions,
     module: &Module,
     export: &str,
     arity: u32,
     args: &[Eterm],
-    hook: H,
+    mut make_hook: M,
 ) -> Result<Eterm, BeamError>
 where
+    M: FnMut() -> H,
     H: FnMut(&str, &str, u32, &[Eterm]) -> Result<Eterm, BeamError> + 'static,
 {
-    let interpreted = run_hooked(Tier::Interpreter, module, export, arity, args, hook);
-    let baseline = run_hooked(Tier::BaselineJit, module, export, arity, args, hook);
-    let cranelift = run_compiled_hooked(backend, compiled, module, export, arity, args, hook);
+    let interpreted = run_hooked(Tier::Interpreter, module, export, arity, args, make_hook());
+    let baseline = run_hooked(Tier::BaselineJit, module, export, arity, args, make_hook());
+    let cranelift = run_compiled_hooked(backend, compiled, module, export, arity, args, make_hook());
     assert_same(&baseline, &interpreted, &format!("baseline {export}/{arity}"));
     assert_same(&cranelift, &interpreted, &format!("cranelift {export}/{arity}"));
     interpreted
@@ -2748,7 +2750,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
                     regs,
                     2,
                     &args,
-                    comparison_floor(atoms.clone()),
+                    || comparison_floor(atoms.clone()),
                 );
                 assert_eq!(
                     got.ok(),
@@ -2764,7 +2766,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
                 const_rhs,
                 1,
                 &arg,
-                comparison_floor(atoms.clone()),
+                || comparison_floor(atoms.clone()),
             );
             assert_eq!(
                 got.ok(),
@@ -2778,7 +2780,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
                 const_lhs,
                 1,
                 &arg,
-                comparison_floor(atoms.clone()),
+                || comparison_floor(atoms.clone()),
             );
             assert_eq!(
                 got.ok(),
@@ -2802,7 +2804,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
             export,
             arity,
             args,
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert_eq!(got.ok(), Some(boolean(&module, expected)), "{export}");
     }
@@ -2815,7 +2817,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
             "arith_eq_atom",
             1,
             &[arg],
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert_eq!(got.ok(), Some(boolean(&module, expected)), "arith_eq_atom");
     }
@@ -2827,7 +2829,7 @@ fn the_inlined_comparison_bifs_agree_over_a_wide_range() {
             "exact_eq_nil",
             1,
             &[arg],
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert_eq!(got.ok(), Some(boolean(&module, expected)), "exact_eq_nil");
     }
@@ -2874,7 +2876,7 @@ fn a_non_small_comparison_operand_deopts_to_the_helper_and_still_agrees() {
             export,
             arity,
             &args,
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert_eq!(got.ok(), Some(boolean(&module, expected)), "{export}(float)");
     }
@@ -2892,7 +2894,7 @@ fn a_non_small_comparison_operand_deopts_to_the_helper_and_still_agrees() {
                 regs,
                 2,
                 &args,
-                comparison_floor(atoms.clone()),
+                || comparison_floor(atoms.clone()),
             );
             assert!(got.is_ok(), "{op}(boxed, 5) must answer, not raise: {got:?}");
         }
@@ -3003,7 +3005,7 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
             export,
             arity,
             &args,
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert!(matches!(got, Err(BeamError::BadArg)), "{export}: got {got:?}");
     }
@@ -3018,7 +3020,7 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
         "eq_instr_arity3",
         2,
         &[make_small(6), make_small(6)],
-        comparison_floor(atoms.clone()),
+        || comparison_floor(atoms.clone()),
     );
     assert_eq!(got.ok(), Some(boolean(&module, true)), "eq_instr_arity3");
 
@@ -3027,7 +3029,6 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
     // exact semantics.
     for (export, arity, args) in [
         ("lt_floatreg", 1, vec![make_small(2)]),
-        ("lt_literal", 1, vec![make_small(2)]),
     ] {
         let got = agree_comparison(
             &backend,
@@ -3036,10 +3037,23 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
             export,
             arity,
             &args,
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert!(got.is_ok(), "{export} must be an answer, not a raise: {got:?}");
     }
+    // An unresolvable static literal: the helper's operand read is the engine's typed
+    // error, and both native tiers report it alike (never a panic, never a fabricated
+    // result).
+    let got = agree_comparison(
+        &backend,
+        &compiled,
+        &module,
+        "lt_literal",
+        1,
+        &[make_small(2)],
+        || comparison_floor(atoms.clone()),
+    );
+    assert!(got.is_err(), "an unresolvable literal must be a typed error: {got:?}");
     let got = agree_comparison(
         &backend,
         &compiled,
@@ -3047,7 +3061,7 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
         "lt_bigconst",
         1,
         &[make_small(2)],
-        comparison_floor(atoms.clone()),
+        || comparison_floor(atoms.clone()),
     );
     assert_eq!(
         got.ok(),
@@ -3070,7 +3084,7 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
             export,
             1,
             &[arg],
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert!(got.is_ok(), "{export} must be an answer, not a raise: {got:?}");
     }
@@ -3088,7 +3102,7 @@ fn non_inlinable_comparison_shapes_stay_on_the_helper() {
             export,
             arity,
             &args,
-            comparison_floor(atoms.clone()),
+            || comparison_floor(atoms.clone()),
         );
         assert!(got.is_err(), "{export} must be a typed error: {got:?}");
     }
