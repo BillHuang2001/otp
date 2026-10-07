@@ -102,18 +102,21 @@ impl AsyncJobs {
             return Ok(id);
         };
         let tx = self.tx.clone();
+        // Wrap the raw pointer *before* the closure so the closure captures the `Send`
+        // [`AsyncData`] wrapper, not the (non-`Send`) `*mut c_void` directly.
+        let job_data = AsyncData(data);
         let spawned = thread::Builder::new()
             .name(format!("beam_io-async-{id}"))
             .spawn(move || {
-                // SAFETY: `invoke` is the driver's own `void(void*)` async callback and `data` is
-                // the pointer the driver handed to `driver_async`; the driver contract is that both
-                // stay valid on the async thread until the callback returns.
-                unsafe { invoke(data) };
+                // SAFETY: `invoke` is the driver's own `void(void*)` async callback and `job_data`
+                // carries the pointer the driver handed to `driver_async`; the driver contract is
+                // that both stay valid on the async thread until the callback returns.
+                unsafe { invoke(job_data.0) };
                 // A send failure means the port is gone; the driver's data is then released by the
                 // caller path (documented in the module docs) — never silently dropped here.
                 let _ = tx.send(AsyncCompletion {
                     id,
-                    data: AsyncData(data),
+                    data: job_data,
                     free,
                 });
             });

@@ -6,7 +6,7 @@ one of the two clean, already-existing rewrite seams (Part II §A): it is the la
 reproduced with the *frozen* driver C ABI on top of it (workspace `../CONTEXT.md` §1 **A.4**), so a
 driver `.so` compiled against the unmodified `erl_driver.h` links and behaves identically.
 
-Four things live here:
+Five things live here:
 1. the **event poller/reactor** — a `mio`-backed readiness loop (epoll/kqueue/…) with a
    `Token`→registration map (stage 5's "I/O" row);
 2. the **`Port`** — a process-like I/O endpoint: a port id (bit-exact with `beam_term`'s internal-port
@@ -14,17 +14,25 @@ Four things live here:
    driver;
 3. **port-task scheduling** — real per-port `INPUT`/`OUTPUT`/`TIMEOUT` tasks with reduction accounting
    (`port_task.rs`), mirroring `erts_port_task_execute`;
-4. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
-   `ErlDrvEntry` bridge as documented future work, plus the built-in `fd` and `efile` byte-stream
-   drivers, the OS-child `spawn` driver, the TCP `tcp_inet` socket driver, line buffering, and the
-   text⇄binary phase-change protocol.
+4. the **driver interface + built-in drivers** — the Rust `Driver` trait, plus the built-in `fd` and
+   `efile` byte-stream drivers, the OS-child `spawn` driver, the TCP `tcp_inet` socket driver, line
+   buffering, and the text⇄binary phase-change protocol;
+5. the **driver C-ABI host layer** (`src/abi/`) — the frozen-ABI bridge: a driver `.so` loaded by
+   `beam_abi::driver::loader` is presented as a `Box<dyn Driver>` by
+   [`DriverPort`](src/abi/port.rs), the driver's own `driver_*`/`erl_drv_*` calls are served by
+   [`AbiHost`](src/abi/host.rs) (a `beam_abi::driver::host::DriverHost` impl over this crate's
+   poller/queues/timer), and the one runtime hook this crate cannot fill — atom interning — is the
+   [`PortHost`](src/abi/host.rs) trait. This is the "frozen C-ABI `ErlDrvEntry` bridge" the earlier
+   scaffold deferred; it is now implemented.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
 `beam_process` (ports are the peer of pids in `ptab`). `beam_rt` **drives its ports through this crate**:
 it holds one long-lived `Poller` + `PortRegistry`, constructs a [`SpawnDriver`](src/drivers/spawn.rs) from
 its decoded `open_port/2` terms, runs the port-task round (`execute_port_tasks`) from its main loop, and
 consumes the [`PortNotification`]s — delivering `{Port,{data,…}}`/`{Port,{exit_status,…}}` to the owning
-process and waking a receiver blocked on port data through the `beam_process` scheduler. This crate is the
+process and waking a receiver blocked on port data through the `beam_process` scheduler. A C driver `.so`
+reaches the same `Driver` trait through [`make_loaded`](src/abi/port.rs) → [`DriverPort`](src/abi/port.rs),
+which `beam_rt` opens with `PortRegistry::open` exactly like a built-in driver. This crate is the
 **library**; the scheduler *thread* wiring (driving a port-task round from the poll loop, port run queues)
 lives in `beam_rt` (single-threaded), not here.
 
@@ -255,6 +263,76 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `fdopen`/`sendfile`/`unrecv`/`getopts`/`setopts`/`getstats`/`getfd`/`ignorefd`, `recv`'s timeout/length,
   IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` delivery modes, and DNS (literal addresses only).
 
+### `src/abi/` (`mod.rs` + `host.rs` + `job.rs` + `port.rs`) — the driver C-ABI host layer (A.4)
+The bridge that presents a **loaded C driver** (`beam_abi::driver::loader::load`) as a
+[`Driver`](src/driver.rs). It is the only place in this crate that holds raw `ErlDrv*` pointers and calls
+foreign code; the three modules are a `pub` sub-tree (`pub use crate::abi::*`).
+- `mod.rs` — module docs (the derivation, the stable `ErlDrvPort` handle, the built-in/`.so` unification,
+  the `unsafe`-module marking) + `pub mod host; pub mod job; pub mod port;` + re-exports.
+- `host.rs`:
+  - `pub trait PortHost` — the runtime hook `beam_io` cannot fill. Required `fn intern_atom(&mut self,
+    name: &str) -> Option<Eterm>`; defaulted `fn connected_pid(&mut self) -> Option<Eterm>` (`None`),
+    `fn caller_pid(&mut self) -> Option<Eterm>` (`None`), `fn send_term(&mut self, to: Option<Eterm>, term:
+    Eterm) -> bool` (`false`; the term sink for `erl_drv_output_term`/`erl_drv_send_term`, `to == None` =
+    the port owner). **A locally-interned atom does NOT match the runtime's atom table** — `beam_rt` MUST
+    inject its own `PortHost` over the shared table (documented LOUDLY on the trait and on the type).
+  - `pub struct LocalAtomPortHost { atoms: beam_term::atom::AtomTable }` — `new()`, `with_names(&[&str])`
+    (seeds in order), `Default`; `intern_atom` returns `Some(make_atom(self.atoms.intern(name)))`. A
+    **test/standalone** host only (inherits the optional defaults).
+  - `pub(crate) struct SelectedFd { token: Token, interest: Interest }` and `pub struct DriverState` — the
+    port's persistent C-ABI state: `selected: BTreeMap<RawFd, SelectedFd>` (a `BTreeMap` so `ready_input`/
+    `ready_output` pick a **stable** fd — fd order), `deadline: Option<Instant>` (the `driver_set_timer`
+    deadline), `jobs: AsyncJobs`. `pub(crate) fn new()`, `pub fn deadline()`, `pub fn selected_len()`,
+    `pub fn in_flight()`, `pub(crate) fn fd_armed(want_read: bool) -> Option<RawFd>`.
+  - `pub struct AbiHost` — the `beam_abi::driver::host::DriverHost` impl, **owning** everything
+    (`port_host: Box<dyn PortHost>`, `heap: Heap`, `state: DriverState`, `ctx: Cell<*mut c_void>`) so it can
+    be `Box`ed behind a stable `ErlDrvPort`: `pub fn new(Box<dyn PortHost>) -> Result<AbiHost>` (a
+    `DRIVER_HEAP_WORDS = 1024`-word term heap), `pub(crate) fn install(&mut self, &mut DriverContext<'_>)` /
+    `clear()`, `pub(crate) fn state()/state_mut()`. When **no context is installed** every port-touching
+    method fails gracefully (`-1`/`None`/no-op) — never derefs null. `DriverHost` behaviors: `heap`;
+    `intern_atom` → `PortHost`; `output(_, data)` → pushes onto the port's **input** queue, `0`/`-1`;
+    `send_term` → `PortHost::send_term`, `0`/`-1`; `select(_, event, mode, on)` → `fd = event as usize as
+    RawFd` (the C's fd-cast), `on != 0` registers (or **re-registers in place**, updating the interest) and
+    `on == 0` de-registers (unknown fd ⇒ `0`), `interest_from_mode`: READ→READABLE, WRITE→WRITABLE,
+    both→BOTH, **neither→READABLE** (M1 does not distinguish `ERL_DRV_USE`; the fd must still be watched for
+    close/error); `set_timer(_, ms)` → arms `deadline`, `0` (M1 always succeeds — no `timeout == NULL` case);
+    `cancel_timer` → clears, `0`; `read_timer` → remaining ms (`Some(0)` when expired, `None` when none);
+    `r#async` → `AsyncJobs::schedule`, `id as c_long` or (on thread failure) runs the driver's `free(data)`
+    and returns `-1`; `connected_pid`/`caller_pid` → `PortHost`.
+- `job.rs` — `pub struct AsyncJobs` (`new`/`Default`, `pub fn in_flight()`): one `std::thread` per job, a
+  `mpsc` completion channel and the `driver_async` queue position. `pub(crate) fn schedule(invoke, data,
+  free) -> Result<u64, ()>` (`None` `invoke` = fire-and-forget: a valid position, no work, no completion)
+  and `pub(crate) fn drain() -> Vec<AsyncCompletion>`. `AsyncCompletion { id, data: AsyncData, free }`;
+  `AsyncData(*mut c_void)` is the one `unsafe impl Send`. **Documented deviation:** `async_free` runs on the
+  **port** thread (the C runs it on the worker).
+- `port.rs`:
+  - `pub struct DriverPort { lib: DriverLibrary, name: String, command: CString, abi: Box<AbiHost>, env:
+    Box<DriverEnv>, data: ErlDrvData }` — `impl Driver`. `pub fn load(path, name, command: impl
+    Into<String>, port_host: Box<dyn PortHost>) -> Result<DriverPort>`: `beam_abi::driver::loader::load`,
+    mapping `DriverLoadError` to `BeamError::Raise(Raise::error(ExitReason::atom(err.reason_atom())))`
+    (`unspecified_error` for an unopenable object; `no_driver_init`/`bad_driver_name`/
+    `driver_incorrect_version`/`driver_init_failed`); an interior NUL in `command` ⇒ `BadArg`. `env` + `abi`
+    are **both boxed** so the `ErlDrvPort` a driver sees is the **same pointer for the port's whole life**
+    (the C guarantees `&prt->drv_port` never moves).
+  - `pub fn poll_async(&mut self, &mut DriverContext<'_>) -> Result<usize>` — drains the async jobs, sorts
+    by queue position (deterministic, matching the C's queue order), runs `ready_async` when the entry has
+    one else the driver's `async_free`; returns the number processed. `beam_rt` calls this from the
+    port-task round.
+  - `pub fn make_loaded(path, name, command, host: Box<dyn PortHost>) -> Result<Box<dyn Driver>>` — the
+    built-in/`.so` unification helper (see *Design Decisions*).
+  - `Driver` mapping: `name` = the entry's name; `flags` = `DriverFlags::SOFT_BUSY` iff
+    `ERL_DRV_FLAG_SOFT_BUSY` (other `ERL_DRV_FLAG_*` bits have no counterpart); `start` (absent slot or any of
+    `ERL_DRV_ERROR_GENERAL`/`ERRNO`/`BADARG` ⇒ `BadArg`, else keeps the `ErlDrvData`); `output`/`ready_output`
+    (drain the port output queue, call `output`/`ready_output`; an absent `ready_output` falls back to
+    `output`; drained bytes are treated as written — the C callbacks are `void`); `ready_input` (call with
+    the fd armed for reading, else null; absent ⇒ no-op); `timeout` (call, then clear `deadline`);
+    `control` (the `&str` command is parsed as a **decimal `c_uint`** — a C driver's verbs are integer codes
+    like `INET_REQ_*`, not the built-in string verbs; absent slot or `cres < 0` ⇒ `BadArg`; reply copied from
+    `*rbuf`, `n` bytes, into a `CONTROL_REPLY_CAPACITY = 4096` buffer); `next_timeout` = `state.deadline`;
+    `port_exit` → `process_exit` (null `*mut ErlDrvMonitor`) if present, else `emergency_close` if present,
+    else a no-op; `take_exit_status` = the default `Ok(None)` (a child-reaping handoff); `stop` (absent ⇒
+    no-op).
+
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures ⇒ `BeamError::Io`,
   argument faults ⇒ `BeamError::BadArg`, id/registration exhaustion ⇒ `BeamError::SystemLimit`.
@@ -273,15 +351,26 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   signatures. New driver capabilities must be additive with defaults that keep the built-in drivers compiling
   unchanged.
 - Files target ~1000 lines, split by responsibility: poller / port / registry / port_task / driver / timer / queue / drivers.
-- Deps: `beam_common`, `beam_term`, `beam_process`, `libc`, `mio` only. No new deps.
+- Deps: `beam_common`, `beam_term`, `beam_process`, `beam_abi`, `beam_alloc`, `libc`, `mio` only. No new
+  deps (see *Design Decisions* for the `beam_io → beam_abi`/`beam_alloc` edge the C-ABI host layer adds).
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **189 tests, 0 failures** (1 ignored
-doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
-`drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` +
-`tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs` `3` + `tests/driver_seams.rs` `5` +
-`2` doctests (the `!Send`/`!Sync` compile-fail pins on `PortRegistry`).
+**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **207 tests, 0 failures** (1 ignored
+doc-test) — `163` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
+`drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`, and `abi/{host,port}`) + `tests/poller.rs` `8` +
+`tests/port.rs` `4` + `tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs` `3` +
+`tests/driver_seams.rs` `5` + `2` doctests (the `!Send`/`!Sync` compile-fail pins on `PortRegistry`).
+The `src/abi/` in-module suites are 18 tests (`host.rs` `10` + `port.rs` `8`): `AbiHost::output` landing in the
+port **input** queue and failing (`-1`) with no context installed; `driver_select` register/**re-register in
+place**/de-select (incl. de-selecting an unknown fd) against a real socketpair + the `Poller::is_empty` after;
+the timer arm/report(≤ request)/cancel and the immediate (`Some(0)`) case; `driver_async`'s invoke actually
+running + one drained completion + the null-invoke fire-and-forget recording nothing; the `PortHost` optional
+defaults; `LocalAtomPortHost` interning order; `interest_from_mode`; `DriverPort::load` on a missing `.so` ⇒ a
+typed `Raise` carrying `unspecified_error` and an interior-NUL command ⇒ `BadArg`; `load_failure`'s atom;
+`driver_flags`' SOFT_BUSY-only mapping and the three `start` sentinels; `beam_abi::driver::drv::driver_api_table()`
+reachability (what pulls the `#[no_mangle]` `driver_*` symbols into the `-Wl,--export-dynamic` test link); and
+that a built-in (`"fd"`) and a loaded (`.so`) driver are both a `Box<dyn Driver>` (`DriverPort: Driver`).
 - `tests/poller.rs` (integration, real OS fds): socketpair readability reports the right `key`; poll-with-no-events;
   blocking poll interrupted by `Waker::wake` (same + other thread); multiple shareable wakers; reregister flips
   direction; deregister stops events; double-register errors.
@@ -358,12 +447,61 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   Unlike `execute_port_tasks`, it does **not** harvest `PortNotification`s: input bytes stay in the port's queue
   (reachable via `Port::drain_input`), and closes are not reported. Only `execute_port_tasks` yields the
   `Data`/`Closed` notifications a runtime turns into `{Port, {data, Data}}`/port-exit messages.
-- **Driver = Rust trait now; C-ABI bridge layered later.** The frozen `ErlDrvEntry`/`ErlDrvApi`
-  (`beam_abi::driver`) is an ABI, not a Rust interface; a later `beam_abi`-backed adapter implements `Driver`
-  over an `ErlDrvEntry` + `ErlDrvApi` function table (`start→init/start`, `output→output/outputv`,
-  `ready_input→ready_input`, `control→control`, `timeout→timeout`, `stop→stop`, `driver_select` ⇒
-  `DriverContext::register`). Modeling the driver as a trait first keeps the poller/port core testable without
-  the frozen-ABI machinery. (Record in `../../CHANGE.md` when the bridge lands.)
+- **Driver = Rust trait; the C-ABI bridge is a `Driver` over a loaded `ErlDrvEntry`.** A built-in driver
+  implements `Driver` directly; the frozen `ErlDrvEntry`/`ErlDrvApi` (`beam_abi::driver`) is an *ABI*, not a
+  Rust interface, so `src/abi/` adapts it: `DriverPort` implements `Driver` over a `DriverLibrary`
+  (`start→init/start`, `output→output/outputv`, `ready_input→ready_input`, `ready_output→ready_output`,
+  `control→control`, `timeout→timeout`, `stop→stop`, `driver_select` ⇒ `DriverContext::register`). The trait
+  came first (so the poller/port core stayed testable); the adapter plugged in underneath without changing any
+  `Driver`/`Port`/`PortRegistry` signature.
+- **The host layer is one boxed `AbiHost` behind a stable pointer; the live port is reached through an installed
+  `DriverContext`.** `AbiHost` owns the persistent `driver_select` map, the `driver_set_timer` deadline and the
+  `driver_async` jobs, plus a `Cell<*mut c_void>` slot that `DriverPort` fills with the callback's `&mut
+  DriverContext` (`install`/`clear`, re-entered via `with_ctx`). A `DriverHost` method runs **inside** a driver
+  callback, at which point the port exists only as that borrowed context; with no context installed every
+  port-touching method fails gracefully (`-1`/`None`/no-op) rather than dereferencing null.
+- **The `ErlDrvPort` is `DriverEnv::as_port()`, stable for the port's whole life.** Both the `AbiHost` and the
+  `DriverEnv` in a `DriverPort` are **boxed**, so the pointer a driver receives never moves (the C's
+  `&prt->drv_port` is likewise stable); `DriverEnv` is lifetime-erased (a single `*mut dyn DriverHost`) and the
+  owned `AbiHost` keeps it valid as long as the `DriverPort` lives.
+- **`driver_output` is harvested by a non-empty input queue, not by an `INPUT` task.** `AbiHost::output` pushes
+  onto the port's *input* queue; `Port::take_input_notification` reports `Some(PortNotification::Data)` whenever
+  that queue is non-empty (and drains it). A driver may call `driver_output` from `start`/`control`/`timeout`/
+  `output`/`ready_input` — *outside* any `INPUT` task — so gating on `INPUT`-task completion would silently drop
+  those bytes. Reporting on the queue itself delivers every `driver_output` to the owner exactly once, on the
+  next port-task round. (This is why `Port::input_pending` no longer exists.)
+- **The port thread owns `async_free` in M1; jobs drain in queue-position order.** The C runs a completed job's
+  `async_free` on the **worker** thread; this floor records the completion and lets the port thread decide (it is
+  where the driver entry is reachable). Documented deviation, never a leak (the callback runs exactly once).
+  `poll_async` sorts by the `driver_async` queue position, reproducing the C's queue order under concurrency.
+- **Built-in and loaded drivers unify at `Box<dyn Driver>`; the `.so` path is a helper, not a registry method.**
+  `make_loaded(path, name, command, host) -> Result<Box<dyn Driver>>` presents a loaded `.so` as the same
+  `Box<dyn Driver>` `DriverRegistry::create` hands back for a built-in, so the poller, the byte queues, the port
+  tasks and the notifications are identical either way. It cannot be a `DriverFactory` (a `fn()` pointer) because
+  a loaded driver needs a path/name/command/`PortHost` — the same reason `SpawnDriver` is constructed directly.
+  `DriverRegistry`/`open_named` signatures are unchanged.
+- **`control` is numeric for a loaded driver.** The built-ins use string verbs (`"close"`, `"line"`, …), but a C
+  driver's verbs are the integer `INET_REQ_*`-style codes, so `DriverPort::control` parses the `&str` command as
+  a decimal `c_uint`. An absent `control` slot or `cres < 0` is `BadArg` (`io.c:4035`/`io.c:4074`); the reply is
+  `cres` bytes at `*rbuf` (our `CONTROL_REPLY_CAPACITY = 4096` buffer, or the driver's own memory valid until the
+  next `control` call) — a **trust boundary**, since a driver is native code the runtime loaded.
+- **`set_timer` always succeeds; `read_timer` reports `None` only when disarmed.** The C refuses
+  `driver_set_timer` when the port has no timer (`if (prt->timeout == NULL) return -1;`), but this port always has
+  one, so the check has nothing to reject (an expired deadline reports `Some(0)`, as the C writes `0`).
+  `beam_abi`'s own `driver_read_timer` maps our `None` to `-1` — its documented deviation from `io.c:6936`,
+  which answers `0` with `0` for "no timer".
+- **`ready_input`/`ready_output` name the fd from the driver's own `driver_select` bookkeeping.** The poller keys
+  a registration by **port number**, so a readiness event names the port but not which of its fds fired; the C
+  carries that per-`ErlDrvEvent`. `DriverState::selected` (a `BTreeMap`) restores it: M1 passes the stable first
+  fd in the wanted direction (fd order), one callback per port-task round — a documented floor for a port with
+  several fds selected in the same direction.
+- **`PortHost` is the only runtime service this crate cannot supply.** It is deliberately minimal (`intern_atom`
+  required; `connected_pid`/`caller_pid`/`send_term` defaulted), so a test host only has to intern atoms.
+  `beam_rt` injects a real one over its shared atom table; `LocalAtomPortHost` is for tests/standalone use and is
+  documented as *not* matching the runtime's table.
+- **The `beam_io → beam_abi`/`beam_alloc` dependency edge is added (directionally legal).** Wave 5 (`beam_io`)
+  depends downward on wave 0 (`beam_abi`, `beam_alloc`); `beam_abi` is the frozen ABI to adapt and `beam_alloc`'s
+  `Heap` is the term arena a driver builds terms on. No cycle, no `*_dev` edge.
 - **Port ids reuse `beam_process::PortTable`.** `PortRegistry` wraps it for allocation and adds the
   `HashMap<u64, Port>` keyed by port *number*; a failed driver `start` runs the driver's teardown (so any fd it
   registered is deregistered) and releases the number — the id space and the poller never leak.
@@ -415,6 +553,55 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
   are deferred (see the module docs).
 
 ## Known Issues
+- **The C-ABI host layer is a floor; a driver must not stash `ErlDrvPort` beyond the callback in M1.** The port
+  context is installed per callback (`install`/`clear` around each `DriverPort` call), so a driver that keeps the
+  `ErlDrvPort` handle and calls `driver_*` from outside a callback (e.g. its own worker thread) finds no context
+  and gets the C's failure code (`-1`). The handle *pointer* is stable and valid for the port's whole life; it is
+  the **installed context** that is callback-scoped. `ready_async` receives no port (matching `erl_driver.h`), so
+  a driver that needs its port there uses the handle it stashed in `start` — which works because `poll_async` runs
+  inside a `DriverPort` method with the context installed.
+- **`driver_async` has no `PortTaskKind::Async`; `beam_rt` must drive `poll_async` from the port-task round.** A
+  completed job is only handed to `ready_async`/`async_free` when the runtime calls
+  [`DriverPort::poll_async`](src/abi/port.rs); there is no readiness- or reduction-driven task that does it for
+  you (a `PortTaskKind::Async` is a documented follow-up). A port with pending jobs makes progress on the next
+  round `beam_rt` drives.
+- **`beam_rt` must inject a real `PortHost` (handoff).** A driver that builds a term with `erl_drv_output_term`/
+  `erl_drv_send_term`/`driver_mk_atom` gets its atom from `PortHost::intern_atom`; a locally-interned atom
+  (`LocalAtomPortHost`) does **not** match the runtime's atom table, so such a term would compare unequal to the
+  same atom built by running code — a silently wrong result. `beam_rt` owns the shared `beam_term::atom::AtomTable`
+  (`beam_engine`'s `ExecutionContext`/`beam_bifs`' `AtomInterner`), so it supplies `PortHost` (interning into it,
+  and `connected_pid`/`caller_pid`/`send_term` over the process/message path).
+- **Deferred `ErlDrvApi` slots (handoff to `beam_abi`).** These `erl_driver.h` slots are still `None` in
+  `beam_abi`'s `DRIVER_API` because `beam_abi`'s `DriverHost` seam has no method for them; each group lists the
+  `DriverHost` methods `beam_abi` must add before the slot can be implemented:
+  - **port queues** — `driver_vec_to_buf` + the `driver_enq`/`driver_pushq`/`driver_deq`/`driver_sizeq`/
+    `driver_peekq*`/`driver_enqv`/`driver_pushqv` family. Needs a `DriverHost` port-queue group: `enq`, `enq_bin`,
+    `pushq`, `pushq_bin`, `deq`, `sizeq`, `peekq`, `peekqv`, `enqv`, `pushqv`, `vec_to_buf`.
+  - **port lifecycle & attributes** — `driver_create_port`, `add_driver_entry`, `remove_driver_entry`,
+    `driver_lock_driver`, `erl_drv_init_ack`, `erl_drv_set_os_pid`, `erl_drv_busy_msgq_limits`, the
+    `driver_failure*`/`driver_exit` family, `set_busy_port`, `set_port_control_flags`, `get_port_flags`,
+    `driver_async_port_key`, `driver_get_now` (deprecated), `driver_binary_get_refc`/`inc_refc`/`dec_refc`. Needs
+    `create_port`, `add_driver_entry`, `remove_driver_entry`, `lock_driver`, `init_ack`, `set_os_pid`,
+    `busy_msgq_limits`, `failure_eof`/`failure_atom`/`failure_posix`/`failure`, `exit`, `set_busy_port`,
+    `set_port_control_flags`, `get_port_flags`, `async_port_key`, `get_now`, `binary_get_refc`/`binary_inc_refc`/
+    `binary_dec_refc`.
+  - **monitors & port data lock** — the `driver_monitor_*` family needs `monitor_process`/`demonitor_process`/
+    `get_monitored_process`/`compare_monitors`; the whole `driver_pdl_*` family needs a port-data-lock accessor
+    group.
+  - **async thread pool** — `driver_async_port_key` (the "fair" async key derives from the port's id term, which
+    the current seam has no representation for).
+  - **threads** — the whole `erl_drv_mutex_*`/`erl_drv_cond_*`/`erl_drv_rwlock_*`/`erl_drv_tsd_*`/
+    `erl_drv_thread_*`/`erl_drv_*_name` family. Needs `mutex_*`/`cond_*`/`rwlock_*`/`tsd_*`/`thread_*` plus the
+    `*_name` accessors.
+  - **deliberately `None`** — the binary-refcount trio (`driver_binary_get_refc`/`inc_refc`/`dec_refc`): the
+    frozen `ErlDrvBinary` is exactly `{ orig_size, orig_bytes }` (16 bytes) with no refcount word, so there is
+    nothing to report or adjust.
+- **The end-to-end real-`.so` test lives in a sibling task.** `src/abi/` is covered by in-module tests over a
+  real poller/socketpair (and a missing-`.so` load), but the end-to-end C-driver test — a `tests/fixtures/host_driver.c`
+  built with the system `cc`, loaded via `beam_abi::driver::loader::load` + `DriverPort::load`, opened through
+  `PortRegistry::open`, driven through `execute_port_tasks` with `poll_async` — is owned by a sibling task; the
+  `build.rs` `-Wl,--export-dynamic` link-arg and the `driver_api_table()` reachability test here are what let it
+  link the `#[no_mangle]` `driver_*` symbols.
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
   `ERTS_POLL_USE_WAKEUP` beyond `Waker`; the single-thread invariant is enforced on `Port`/`PortRegistry` (see
   Constraints) but **not** guarded on `Poller` itself — use it from one thread.
@@ -478,6 +665,10 @@ doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver,
 - `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver, incl. the errno-atom failed-spawn raise and the duplex `{fd, N}` form), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
 - `src/drivers/inet/mod.rs` + `src/drivers/inet/wire.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState` (the driver state machine + socket syscalls) and the `INET_*`/`TCP_SHUT_*`/`INET_REP_*` codes + packed-address helpers + `errno_name` (the wire vocabulary)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
+- `src/abi/mod.rs` → the driver C-ABI host-layer module docs + wiring (`pub mod host/job/port` + re-exports)
+- `src/abi/host.rs` → `PortHost` (the runtime atom-interning/pid/term-sink hook) + `LocalAtomPortHost` (test host) + `DriverState`/`SelectedFd` (persistent `driver_select`/timer/async state) + `AbiHost` (the `beam_abi::driver::host::DriverHost` impl over the poller/queues/timer)
+- `src/abi/job.rs` → `AsyncJobs` (the `driver_async` worker/bookkeeping) + `AsyncCompletion`/`AsyncData`
+- `src/abi/port.rs` → `DriverPort` (a loaded `ErlDrvEntry` as a `Driver`) + `DriverPort::load`/`poll_async` + `make_loaded` (built-in/`.so` unification) + `driver_flags`/`is_start_failure`/`load_failure`
 - `src/error.rs` → `pub(crate)` error constructors + the errno→BEAM-atom mapping (`errno_atom`) and `spawn_failure` (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
 - `tests/port.rs` → `open`→`output`→`poll`→`handle_events`→`read_input` byte round-trip
