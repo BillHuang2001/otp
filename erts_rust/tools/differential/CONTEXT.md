@@ -3,7 +3,7 @@
 ## Intent
 The in-repo **differential-test harness** (Stage 0; `../../../ERTS_RUST_REWRITE_DEEPDIVE.md` §H).
 For a given corpus case it runs the **real system ERTS** (the *oracle*) and the **Rust runtime** (`beam_rt`), then compares the **observable results**.
-There are two kinds of case (`CaseKind`): **expression cases** evaluate the same self-terminating probe under both runtimes, and **module-run cases** compile an embedded Erlang module with `erlc` (optionally building a NIF `.so` next to it) and run one exported function.
+There are three kinds of case (`CaseKind`): **expression cases** evaluate the same self-terminating probe under both runtimes; **environment-variable expression cases** (`EvalEnv`) do the same but spawn each runtime with an explicit environment, so the `ERL_*FLAGS` merge (contract A.6) is pinnable; and **module-run cases** compile an embedded Erlang module with `erlc` (optionally building a NIF `.so` next to it) and run one exported function.
 
 This is the *compatibility gate* of the rewrite (`../../../ERTS_RUST_REWRITE_EVALUATION.md` §G.7/§I): no behavior change ships without a differential case.
 It is a pure **driver/observer** — it never modifies the runtime and never inspects its internals.
