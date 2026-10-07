@@ -23,10 +23,11 @@
 //! # The frozen seam
 //!
 //! The cross-crate contract is [`allocator`], [`heap`], [`size_class`],
-//! [`registry`] and [`stats`]; [`block`], [`carrier`], [`free_list`] and
-//! [`strategy`] are implementation modules (public for testing and reuse, but not
-//! part of the contract). Errors are always `beam_common::{Result, BeamError}` —
-//! this crate adds no error type of its own.
+//! [`registry`], [`stats`] and [`types`] (the `erts_alloc` allocator/class/type
+//! inventory); [`block`], [`carrier`], [`free_list`], [`strategy`] and [`mseg`]
+//! are implementation modules (public for testing and reuse, but not part of the
+//! contract). Errors are always `beam_common::{Result, BeamError}` — this crate
+//! adds no error type of its own.
 //!
 //! [`Eterm`]: beam_term::prelude::Eterm
 
@@ -56,6 +57,10 @@ pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
 pub use crate::size_class::SizeClasses;
 pub use crate::stats::AllocStats;
 pub use crate::strategy::Strategy;
+pub use crate::types::{
+    type_by_name, types_for_allocator, AllocatorId, ClassId, TypeEntry, TypeFlags, TypeId,
+    ALLOC_TYPES, EXPECTED_TYPE_COUNT, TYPE_COUNT,
+};
 
 /// The conventional glob-import surface for downstream crates.
 pub mod prelude {
@@ -68,4 +73,8 @@ pub mod prelude {
     pub use crate::registry::{all_stats, allocator, default_allocator, AllocType};
     pub use crate::size_class::SizeClasses;
     pub use crate::stats::AllocStats;
+    pub use crate::types::{
+        type_by_name, types_for_allocator, AllocatorId, ClassId, TypeEntry, TypeFlags, TypeId,
+        ALLOC_TYPES, TYPE_COUNT,
+    };
 }
