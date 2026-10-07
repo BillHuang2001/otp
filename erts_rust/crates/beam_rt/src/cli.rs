@@ -22,6 +22,14 @@
 //! | `-name N` / `-sname N` | distribution node name |
 //! | `run File Mod:Func/Arity [Args…]` | load `File`, run the function and print the result |
 //!
+//! # `ERL_*FLAGS`
+//!
+//! The [`run`] driver first merges the `ERL_*FLAGS` environment variables into the
+//! command line, in real `erl`'s order (`initial_argv_massage`):
+//! `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]` — so a
+//! tokenized environment flag is indistinguishable from a command-line flag to
+//! `init:get_argument/1`. See [`parse_with_env`] and [`env`].
+//!
 //! # Unknown switches are init arguments, not errors
 //!
 //! A switch that is **not** in the table above is **not** a usage error: real `erl`
@@ -82,6 +90,9 @@ use crate::config::{
 use crate::error;
 use crate::runtime::Runtime;
 
+mod env;
+pub use env::{merge_argv, otp_flags_var, tokenize, Env, MapEnv, ProcessEnv};
+
 /// The usage text, printed on a usage (exit 2) error.
 pub const USAGE: &str = "\
 Usage: beam_rt [switch...] [action]
@@ -133,6 +144,24 @@ pub const EXIT_USAGE: i32 = 2;
 /// invocation) so the differential harness can tell "not implemented yet" apart from
 /// "broken" and "badly invoked".
 pub const EXIT_UNSUPPORTED: i32 = 3;
+
+/// Parses `args` merged with the `ERL_*FLAGS` environment variables.
+///
+/// Real `erl` merges four environment variables into the command line before `init`
+/// sees it (`erts/etc/common/erlexec.c`, `initial_argv_massage`):
+/// `[ERL_OTP<sysver>_FLAGS] [ERL_AFLAGS] [command line] [ERL_FLAGS] [ERL_ZFLAGS]`. The
+/// merge is [`env::merge_argv`] and the result is handed to the **pure** [`parse`], so an
+/// environment flag is indistinguishable from a command-line flag (contract A.6).
+///
+/// [`parse`] itself never reads the process environment: the differential harness and the
+/// unit tests call it directly, and [`run`] calls this function with [`ProcessEnv`].
+///
+/// # Errors
+///
+/// Exactly the errors [`parse`] reports for the merged command line.
+pub fn parse_with_env(args: &[String], env: &dyn Env) -> Result<RuntimeConfig> {
+    parse(&env::merge_argv(args, env))
+}
 
 /// Parses `args` (which **exclude** `argv[0]`) into a [`RuntimeConfig`].
 ///
@@ -685,7 +714,7 @@ fn split_top_level<'a>(token: &'a str, inner: &'a str) -> Result<Vec<&'a str>> {
 /// and no usage text. A **halt** the program requested wins over all of them: the
 /// runtime exits with that status, printing nothing.
 pub fn run(args: Vec<String>) -> i32 {
-    let config = match parse(&args) {
+    let config = match parse_with_env(&args, &ProcessEnv) {
         Ok(config) => config,
         Err(error) => {
             if let Some(reason) = error::unsupported_reason(&error) {
