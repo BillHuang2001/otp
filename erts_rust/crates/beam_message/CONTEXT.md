@@ -368,7 +368,7 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
 - `src/copy.rs` → the iterative `copy_struct` engine (the `unsafe` core) + `CopyContext` + `size_of_copy`
 - `src/share.rs` → the sharing-preserving `copy_struct_shared` (source-identity memo over `copy.rs`'s `shallow`)
 - `src/fragment.rs` → `HeapFragment` (bump region + off-heap table + roots) and `Fragments` (the chain + `move_into`); the `ErlHeapFragment` message-buffer model
-- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding
+- `src/layout.rs` → per-object word counts + child-slot enumeration (tuple/record/fun/flatmap/HAMT node/off-heap container) + refc-binary/external-thing identification + the off-heap container encoding. A fun's block size (`1 + desc_words(kind) + num_free`) and its `env[0]` offset (`1 + desc_words(kind)`) come from `beam_term::fun` (`fun_kind_of_header`/`fun_desc_words`/`fun_num_free`), never the legacy C `ERL_FUN_SIZE`
 - `src/off_heap.rs` → `OffHeapTable` (MSO-typed façade over slot-indexed `beam_gc::OffHeap`, plus the refc-binary and node lists); MSO handle re-export
 - `src/node.rs` → `NodeEntry`, the refcounted `(node, creation)` external-thing node identity
 - `src/message.rs` → `Message` envelope (payload/from/token + off-heap, binary and node lists + optional `Fragments`) + `Queue` FIFO
