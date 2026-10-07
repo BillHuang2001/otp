@@ -600,14 +600,16 @@ pub(super) fn descriptor_of(
 /// `(uniq, index)` descriptor — a typed "not this module's fun", never a fabricated
 /// identity.
 ///
-/// **Derivation ready, production wiring pending.** The only `beam_codec::Encoder`
-/// construction point in the running system is `beam_bifs`' `term_to_binary` encoder
-/// (`binconv.rs::encode_body`), which has no seam to receive this identity yet — see the
-/// crate report's `beam_bifs` handoff. Until that seam lands the function is exercised by
-/// the oracle test below (hence the `dead_code` allowance).
+/// # Wiring
+///
+/// This is the derivation half of the [`LocalFunIdentity`](beam_bifs::LocalFunIdentity)
+/// host seam: [`super::fun_identity::FunIdentityBridge`] supplies the module snapshot, the
+/// `.beam` path and the node atom, and calls this — and that bridge is installed in
+/// `call_registered`, so a compiled module's local fun really encodes through
+/// `term_to_binary/1`. It is exercised here at the derivation level *and* end to end by
+/// [`super::fun_identity`]'s oracle test.
 ///
 /// [`FunDescriptor::uniq`]: beam_loader::FunDescriptor::uniq
-#[allow(dead_code)]
 pub(super) fn local_fun_identity(
     module: &Module,
     module_atom: Atom,
@@ -661,9 +663,10 @@ pub(super) fn local_fun_identity(
 /// `BeamError::BadArg` for an image whose container does not parse, and for a `FunT` chunk
 /// that is not `4 + 24n` bytes (`BEAMFILE_READ_CORRUPT_LAMBDA_TABLE`).
 ///
-/// Unused in production until the `beam_bifs` fun-identity seam lands (see
-/// [`local_fun_identity`]); exercised today by the oracle test below.
-#[allow(dead_code)]
+/// Called by [`super::fun_identity::FunIdentityBridge`] (the [`LocalFunIdentity`] seam) and
+/// exercised at the derivation level by the oracle test below.
+///
+/// [`LocalFunIdentity`]: beam_bifs::LocalFunIdentity
 pub(super) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
     use beam_loader::container::{parse, ChunkId};
 
@@ -713,27 +716,34 @@ pub(super) fn module_md5(beam: &[u8]) -> Result<[u8; 16]> {
 ///
 /// [`local_fun_identity`] resolves the four fields a `make_fun3` closure's term does not
 /// carry (`module`/`old_index`/`old_uniq`/`creator`) and [`module_md5`] the fifth (`uniq`,
-/// the module checksum). This test drives the **real** path end to end: the system `erlc`
-/// compiles a fixture module, `beam_rt` loads its `.beam` and executes a fun-returning
-/// function (so the term is a genuine `make_fun3` `FunKind::Local`), the identity is
-/// derived from the loaded module, and the encoded image is asserted **byte-identical** to
-/// the system `erl` oracle's `term_to_binary/1`. It skips **loudly** when no `erl`/`erlc`
-/// is available — never a silent pass.
+/// the module checksum). This test drives the derivation against the **real** system `erl`:
+/// the system `erlc` compiles a fixture module, `beam_rt` loads its `.beam` and executes a
+/// fun-returning function (so the term is a genuine `make_fun3` `FunKind::Local`), the
+/// identity is derived from the loaded module, and the image an `Encoder` builds from it is
+/// asserted **byte-identical** to the oracle's `term_to_binary/1`. It skips **loudly** when
+/// no `erl`/`erlc` is available — never a silent pass.
+///
+/// The production path (the [`LocalFunIdentity`](beam_bifs::LocalFunIdentity) hook that
+/// `call_registered` installs, so a real `term_to_binary/1` call derives the identity) is
+/// proven separately by [`super::fun_identity`]'s test; this one pins the derivation itself.
 ///
 /// The test covers `num_free` 0/1/2 (and therefore `arity` 0/1) and three distinct `FunT`
 /// positions, so the `(uniq, index)` → `old_index` lookup is exercised where the three
 /// funs share one `old_uniq` and differ only by index.
 #[cfg(test)]
 mod tests {
-    use std::path::{Path, PathBuf};
-    use std::process::{Command, Stdio};
-    use std::sync::atomic::{AtomicUsize, Ordering};
-
     use beam_term::prelude::make_small;
     use beam_term::Eterm;
 
+    use super::super::test_support::{
+        compile_fixture, decode_hex, hex, resolve_erlc, resolve_oracle, run_oracle_probe,
+        skip_loudly,
+    };
     use super::{local_fun_identity, module_md5};
     use crate::runtime::Runtime;
+
+    /// The skip banner shared with [`super::super::fun_identity`]'s test.
+    const BANNER: &str = "local_fun_encode";
 
     /// The fixture module compiled by `erlc` for the oracle test — the same one
     /// `beam_codec/tests/local_fun_encode.rs` uses: `mk/1` captures one free variable,
@@ -768,11 +778,11 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
     #[test]
     fn compiled_module_local_fun_encodes_byte_exactly_like_the_oracle() {
         let (Some(oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
-            skip_loudly("no usable `erl` and/or `erlc`");
+            skip_loudly(BANNER, "no usable `erl` and/or `erlc`");
             return;
         };
-        let dir = compile_fixture(&erlc, "compiled_module_local_fun");
-        let lines = run_oracle(&oracle, dir.path());
+        let dir = compile_fixture(&erlc, "compiled_module_local_fun", "lfun", LFUN_SRC);
+        let lines = run_oracle_probe(&oracle, dir.path(), ORACLE_EVAL);
         assert_eq!(
             lines.len(),
             4,
@@ -835,10 +845,10 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
     #[test]
     fn a_fun_from_another_module_has_no_identity_here() {
         let (Some(_oracle), Some(erlc)) = (resolve_oracle(), resolve_erlc()) else {
-            skip_loudly("no usable `erl` and/or `erlc`");
+            skip_loudly(BANNER, "no usable `erl` and/or `erlc`");
             return;
         };
-        let dir = compile_fixture(&erlc, "a_fun_from_another_module");
+        let dir = compile_fixture(&erlc, "a_fun_from_another_module", "lfun", LFUN_SRC);
         let mut runtime = Runtime::with_defaults().expect("the default runtime");
         let term = runtime
             .run_function(dir.join("lfun.beam"), "mk0", 0, &[])
@@ -846,7 +856,7 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
         // A *different* module: `lists` is a real compiled module with its own lambda
         // table, so it is the honest counter-example.
         let Some(path) = runtime.find_module_file("lists") else {
-            skip_loudly("the system stdlib `lists.beam` is not resolvable");
+            skip_loudly(BANNER, "the system stdlib `lists.beam` is not resolvable");
             return;
         };
         runtime.load_module(path).expect("`lists` loads");
@@ -864,182 +874,4 @@ lists:foreach(fun(F) -> io:format(\"~s~n\", [binary:encode_hex(term_to_binary(F)
         );
     }
 
-    // ---------------------------------------------------------------------
-    // Oracle resolution, fixture compilation and process plumbing
-    // (mirrors tests/nif.rs / tests/records.rs)
-    // ---------------------------------------------------------------------
-
-    /// Whether `p` is an existing executable file.
-    fn is_executable(p: &Path) -> bool {
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            match std::fs::metadata(p) {
-                Ok(m) => m.is_file() && m.permissions().mode() & 0o111 != 0,
-                Err(_) => false,
-            }
-        }
-        #[cfg(not(unix))]
-        {
-            p.is_file()
-        }
-    }
-
-    /// The first `name` on `$PATH` that is an executable file.
-    fn find_on_path(name: &str) -> Option<PathBuf> {
-        let path = std::env::var_os("PATH")?;
-        std::env::split_paths(&path)
-            .filter(|dir| !dir.as_os_str().is_empty())
-            .map(|dir| dir.join(name))
-            .find(|candidate| is_executable(candidate))
-    }
-
-    /// Resolve the oracle the way `tools/differential` does: `$ERTS_ORACLE` if executable,
-    /// else `erl` on `$PATH`.
-    fn resolve_oracle() -> Option<PathBuf> {
-        if let Some(value) = std::env::var_os("ERTS_ORACLE") {
-            let program = PathBuf::from(&value);
-            return is_executable(&program).then_some(program);
-        }
-        find_on_path("erl")
-    }
-
-    /// The compiler: a sibling of the oracle first (the same installation), then `$PATH`.
-    fn resolve_erlc() -> Option<PathBuf> {
-        if let Some(oracle) = resolve_oracle() {
-            if let Some(dir) = oracle.parent() {
-                let candidate = dir.join("erlc");
-                if is_executable(&candidate) {
-                    return Some(candidate);
-                }
-            }
-        }
-        find_on_path("erlc")
-    }
-
-    /// Prints the loud skip banner — a missing toolchain is never a silent pass.
-    fn skip_loudly(why: &str) {
-        eprintln!();
-        eprintln!("=============== beam_rt local_fun_encode SKIPPED ===============");
-        eprintln!("{why}: the compiled-module NEW_FUN_EXT proof cannot run.");
-        eprintln!("Set $ERTS_ORACLE (or install Erlang/OTP) and re-run. NOT a pass.");
-        eprintln!("===============================================================");
-        eprintln!();
-    }
-
-    /// Monotonic per-call sequence number making each fixture scratch directory unique even
-    /// within one process (the two tests run in parallel threads of the same test binary).
-    static FIXTURE_SEQ: AtomicUsize = AtomicUsize::new(0);
-
-    /// A compiled-fixture scratch directory that removes itself on drop, so the per-call
-    /// unique directories never accumulate in the temp dir.
-    struct FixtureDir {
-        path: PathBuf,
-    }
-
-    impl FixtureDir {
-        /// The directory itself (e.g. for `erlc -o` / the oracle's `-pa`).
-        fn path(&self) -> &Path {
-            &self.path
-        }
-
-        /// A path inside the directory (e.g. the compiled `.beam`).
-        fn join(&self, name: &str) -> PathBuf {
-            self.path.join(name)
-        }
-    }
-
-    impl Drop for FixtureDir {
-        fn drop(&mut self) {
-            // Best effort, but never silent: a leftover scratch dir must not fail the test,
-            // yet a cleanup failure is reported rather than swallowed.
-            if let Err(e) = std::fs::remove_dir_all(&self.path) {
-                eprintln!(
-                    "warning: could not remove the fixture scratch dir {}: {e}",
-                    self.path.display()
-                );
-            }
-        }
-    }
-
-    /// Compiles the fixture into a scratch directory unique **per call** — keyed by the
-    /// fixture name, the process id and an atomic counter — and returns it. The previous
-    /// scheme keyed the directory by process id alone, so the two tests sharing `lfun.erl` /
-    /// `lfun.beam` raced when the lib tests ran in parallel.
-    fn compile_fixture(erlc: &Path, fixture: &str) -> FixtureDir {
-        let seq = FIXTURE_SEQ.fetch_add(1, Ordering::Relaxed);
-        let dir = std::env::temp_dir().join(format!(
-            "beam_rt_local_fun_{fixture}_{}_{seq}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("the test temp dir is writable");
-        let src = dir.join("lfun.erl");
-        std::fs::write(&src, LFUN_SRC).expect("the fixture source is writable");
-        let output = Command::new(erlc)
-            .arg("-o")
-            .arg(&dir)
-            .arg(&src)
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn erlc '{}': {e}", erlc.display()));
-        assert!(
-            output.status.success(),
-            "erlc '{}' failed with {:?}\n--- stderr ---\n{}",
-            erlc.display(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        FixtureDir { path: dir }
-    }
-
-    /// Runs the oracle probe against the compiled fixture and returns its stdout lines.
-    fn run_oracle(oracle: &Path, code_dir: &Path) -> Vec<String> {
-        let output = Command::new(oracle)
-            .arg("-noshell")
-            .arg("-pa")
-            .arg(code_dir)
-            .arg("-eval")
-            .arg(ORACLE_EVAL)
-            .arg("-s")
-            .arg("init")
-            .arg("stop")
-            .stdin(Stdio::null())
-            .output()
-            .unwrap_or_else(|e| panic!("failed to spawn the oracle '{}': {e}", oracle.display()));
-        assert!(
-            output.status.success(),
-            "the oracle '{}' exited with {:?}\n--- stderr ---\n{}\n--- eval ---\n{ORACLE_EVAL}",
-            oracle.display(),
-            output.status.code(),
-            String::from_utf8_lossy(&output.stderr)
-        );
-        let stdout = String::from_utf8(output.stdout)
-            .unwrap_or_else(|e| panic!("the oracle printed non-UTF-8 to stdout: {e}"));
-        stdout
-            .lines()
-            .map(|line| line.trim().to_lowercase())
-            .filter(|line| !line.is_empty())
-            .collect()
-    }
-
-    /// Decodes an even-length hex line into bytes.
-    fn decode_hex(line: &str) -> Vec<u8> {
-        assert!(
-            line.chars().all(|c| c.is_ascii_hexdigit()),
-            "not a hex line: {line:?}"
-        );
-        assert_eq!(line.len() % 2, 0, "odd-length hex line: {line:?}");
-        (0..line.len())
-            .step_by(2)
-            .map(|i| {
-                u8::from_str_radix(&line[i..i + 2], 16)
-                    .unwrap_or_else(|e| panic!("bad hex pair in {line:?}: {e}"))
-            })
-            .collect()
-    }
-
-    /// An uppercase hex rendering of `bytes` for diagnostics.
-    fn hex(bytes: &[u8]) -> String {
-        bytes.iter().map(|b| format!("{b:02X}")).collect()
-    }
 }

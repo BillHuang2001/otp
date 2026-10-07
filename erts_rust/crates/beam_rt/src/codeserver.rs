@@ -222,6 +222,18 @@ impl CodeServer {
         self.modules.get(name).map(Arc::as_ref)
     }
 
+    /// A cheap **owned** handle to a cached module, if it is loaded.
+    ///
+    /// Unlike [`CodeServer::module`] (which borrows the server for as long as the returned
+    /// reference lives), the cloned [`Arc`] can be held while the *runtime* is mutably
+    /// borrowed — which is what the host-seam bridges need (`../beam_rt/src/context`): a
+    /// bridge that runs during a BIF call holds no borrow of the runtime, so any module it
+    /// needs must be snapshotted before the call. This is a lookup only; it never loads a
+    /// module (compare [`CodeServer::load`], whose miss is an `error:undef`).
+    pub fn module_handle(&self, name: &str) -> Option<Arc<Module>> {
+        self.modules.get(name).cloned()
+    }
+
     /// Every loaded module (for fun resolution).
     pub fn modules(&self) -> impl Iterator<Item = &Arc<Module>> {
         self.modules.values()
