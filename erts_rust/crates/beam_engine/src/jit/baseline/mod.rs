@@ -47,30 +47,33 @@
 //!
 //! # Register allocation and spill-across-blocks
 //!
-//! A block caches up to [`CACHE_REGISTERS`]` .len()` x-registers in callee-saved
-//! machine registers (`r12`–`r15`); `rbx` is reserved for the machine base pointer
-//! (loaded once from `rt.machine`) and the `rt` argument itself lives in the 16-byte
-//! stack slot the prologue reserves. The prologue pushes every callee-saved register
-//! it touches (so the Rust caller's state is preserved), loads the cached
-//! x-registers out of `machine.x`, and the epilogue **spills them back at every
-//! block exit**. That is the whole liveness model: within a block the cached values
-//! live in registers, and at a block boundary they are always back in `machine.x`,
-//! so a helper call / GC / the next block sees the interpreter's exact root set
-//! (`x[0..live)` + the whole stack) with no per-frame liveness maps
+//! A block caches up to [`CACHE_REGISTERS`]` .len()` (five) x-registers in
+//! callee-saved machine registers (`rbp`, `r12`–`r15`); `rbx` is reserved for the
+//! machine base pointer (loaded once from `rt.x_regs`) and the `rt` argument itself
+//! lives in the 24-byte stack slot the prologue reserves (the byte count that keeps
+//! `rsp` 16-byte aligned after the six callee-saved pushes). The prologue pushes
+//! every callee-saved register it touches (so the Rust caller's state is preserved),
+//! loads the cached x-registers out of `machine.x`, and the epilogue **spills them
+//! back at every block exit**. That is the whole liveness model: within a block the
+//! cached values live in registers, and at a block boundary they are always back in
+//! `machine.x`, so a helper call / GC / the next block sees the interpreter's exact
+//! root set (`x[0..live)` + the whole stack) with no per-frame liveness maps
 //! (`../../CONTEXT.md` §4).
 //!
 //! The cache is **not** a coverage limit. An x-register the allocator could not
 //! cache is simply addressed **directly in `machine.x`** (`[rbx + x*8]`) — the same
-//! slot the exit spill writes — so a `move`/`swap`/fast-path `gc_bif` touching more
-//! registers than the budget runs natively instead of deopting. That is exact
-//! because the cache membership is fixed for the whole block: an x-register is
-//! either always in its machine register (and written back at every block exit) or
-//! never, so the two representations cannot disagree. The allocation is computed by
-//! [`allocate_registers`] from the block's *shape*-inlinable `move`s, in
-//! first-appearance order, so a block's inline prefix always has the registers it
-//! wants; the highest x-register index any block touches natively is recorded on the
-//! artifact so the driver can refuse native entry to a register file that does not
-//! cover it.
+//! slot the exit spill writes — so a `move`/`swap`/`test`/fast-path `gc_bif`/
+//! `select_val` touching more registers than the budget runs natively instead of
+//! deopting. That is exact because the cache membership is fixed for the whole
+//! block: an x-register is either always in its machine register (and written back
+//! at every block exit) or never, so the two representations cannot disagree. The
+//! allocation is computed by [`allocate_registers`] from the block's **native touch
+//! counts** — the registers its inlinable instructions would reference, weighted by
+//! how often they appear and ties broken by ascending index — so the most-used
+//! (longest-live-range) registers become resident; the direct `machine.x` accesses
+//! are the fill/spill for the rest. The highest x-register index any block touches
+//! natively is recorded on the artifact so the driver can refuse native entry to a
+//! register file that does not cover it.
 //!
 //! # What is inlined, what is helper-executed
 //!
@@ -108,10 +111,13 @@
 //! error surfaces rather than an invented one), and a `gc_bif` whose BIF is outside
 //! the fast path's two (or one with an un-addressable operand).
 //!
-//! A block's *inline prefix* runs natively and the **first** non-inlinable
-//! instruction is handed to the helper, after which the block returns: this is the
-//! documented per-instruction deopt, and it is what gives the tier full opcode
-//! coverage with interpreter-identical semantics on day one.
+//! A helper-executed instruction does **not** end the block: after the helper has
+//! run exactly that instruction (`Step::Next`) the block refills its cached
+//! x-registers and carries on natively at the next instruction, so native coverage
+//! is whole-block. Only an outcome other than "advanced by one" (`Goto`/`Halt`/
+//! `Wait`/`Err`) returns to the driver with that word. This per-instruction deopt is
+//! what gives the tier full opcode coverage with interpreter-identical semantics on
+//! day one; see `emit` for the emitted sequence.
 //!
 //! # `unsafe`
 //!
@@ -123,7 +129,7 @@
 //! `// SAFETY:` rationale.
 #![allow(unsafe_code)]
 
-use std::collections::{BTreeMap, HashMap};
+use std::collections::BTreeMap;
 use std::mem;
 
 use beam_common::Result;
@@ -241,8 +247,14 @@ impl JitBackend for BaselineJit {
 pub struct CompiledModule {
     /// The sealed code mapping every entry points into.
     buffer: CodeBuffer,
-    /// The start `(func, pc)` of each compiled block → its native entry point.
-    entries: HashMap<(u32, u32), *const u8>,
+    /// The native entry point of the block starting at `[func][pc]`, or `None` when
+    /// that address compiled no block. A flat index (not a `HashMap`) because the
+    /// driver probes it on every cross-block jump.
+    entries: Vec<Vec<Option<*const u8>>>,
+    /// The number of compiled blocks (`entries`' `Some` count).
+    block_count: usize,
+    /// Every x-register any block caches in a machine register (sorted, deduped).
+    cached_registers: Vec<u32>,
     /// The highest x-register index any block caches in a machine register.
     highest_cached_register: Option<u32>,
     /// The highest x-register index any block touches natively — a cached load,
@@ -259,12 +271,26 @@ impl CompiledModule {
     /// The native entry point of the block starting at `(func, pc)`, if one was
     /// compiled.
     pub fn entry(&self, func: u32, pc: u32) -> Option<*const u8> {
-        self.entries.get(&(func, pc)).copied()
+        self.entries
+            .get(func as usize)
+            .and_then(|row| row.get(pc as usize))
+            .copied()
+            .flatten()
     }
 
     /// The number of compiled blocks.
     pub fn block_count(&self) -> usize {
-        self.entries.len()
+        self.block_count
+    }
+
+    /// Every x-register any block holds in a machine register (sorted ascending,
+    /// deduped across blocks).
+    ///
+    /// The allocator is usage-weighted ([`allocate_registers`]), so this is the set
+    /// of the most-used registers rather than the first-appearing ones; a register
+    /// **not** in it is addressed directly in `machine.x`.
+    pub fn cached_registers(&self) -> &[u32] {
+        &self.cached_registers
     }
 
     /// The highest x-register index cached in a machine register by any block.

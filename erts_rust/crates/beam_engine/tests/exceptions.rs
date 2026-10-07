@@ -14,6 +14,10 @@
 //! arena backing `alloc_words`, so a heap term the engine builds (e.g. the
 //! unambiguous `{'EXIT',V}` tuple) is only valid while its context is alive — the
 //! tests below create the context explicitly and keep it in scope.
+//!
+//! This file proves the machinery on **one** committed fixture; `tests/exceptions_corpus.rs`
+//! (sibling) proves its **corpus reach** — the same raise opcodes executing on the real
+//! installed `stdlib`/`kernel`/`compiler` modules and producing the system `erl`'s reason.
 
 use std::collections::BTreeMap;
 
@@ -23,6 +27,10 @@ use beam_loader::{
     load_file, Export, Function, HeapNeed, Import, ImportRef, Instr, Label, Module, Operand, NO_FAIL,
 };
 use beam_term::{cmp, is_small, make_atom, make_small, signed_value, Atom, Eterm, NIL};
+
+mod support;
+
+use support::{assert_atom, ModuleHost, SEED_ATOMS};
 
 /// The committed oracle fixture (produced by `erlc exceptions.erl`).
 const EXCEPTIONS_BEAM: &str = concat!(
@@ -639,5 +647,298 @@ fn build_stacktrace_derives_the_live_call_chain_innermost_first() {
     assert!(
         cmp(actual, expected, &module.atom_table).is_eq(),
         "the cooked trace must be [{{m,f,0,[]}},{{m,g,0,[]}}]"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// The whole exception path on a real module that names NONE of the reason atoms
+// ---------------------------------------------------------------------------
+//
+// The real OTP compiler does **not** emit the runtime's well-known exception
+// atoms (`function_clause`/`case_clause`/`if_clause`/`try_clause`/`badmatch`/
+// `error`/`'EXIT'`/`file`/`line`/…) into a module's atom chunk: a real runtime
+// keeps them globally interned (`../../erts/emulator/beam/beam_common.c:382-406`,
+// `error_atom[NUMBER_EXIT_CODES]`). The engine resolves a reason atom **by name**
+// from the running module's atom table and refuses to substitute a *different*
+// atom, so on such a module every raise used to degrade to a typed
+// `unsupported`. `tests/support/mod.rs` now seeds the well-known atoms into every
+// module it loads — the host's analogue of the runtime's global interning, and
+// the test-side counterpart of `beam_rt::boot::CORE_ATOMS` (which this node does
+// not own).
+//
+// `tests/fixtures/excpaths.beam` (compiled with the system `erlc` from
+// `excpaths.erl`) is exactly such a module: its own atom chunk contains none of
+// those names (proved below with `beam_loader::load_file`). Every expected value
+// is the oracle's, with the exact command quoted at the assertion.
+//
+// The fixture makes no external calls, so the host needs no stdlib `ebin` (the
+// `"."` primary path is never consulted) and nothing here needs the OTP install
+// at test time — the `.beam` is committed.
+
+/// The committed fixture whose atom chunk carries none of the well-known atoms.
+const EXCPATHS_BEAM: &str = concat!(
+    env!("CARGO_MANIFEST_DIR"),
+    "/tests/fixtures/excpaths.beam"
+);
+
+/// A [`ModuleHost`] with `excpaths` registered (the shared-atom host seeds the
+/// well-known atoms on load).
+fn excpaths_host() -> ModuleHost {
+    let mut host = ModuleHost::new(".");
+    host.register("excpaths", EXCPATHS_BEAM);
+    host
+}
+
+/// `reason` for the `{Class, Reason}` tuple `catch_*(X)` returns.
+fn caught_reason(got: Eterm) -> Eterm {
+    terms::tuple_element(got, 1).expect("a {Class, Reason} 2-tuple")
+}
+
+#[test]
+fn the_fixture_carries_none_of_the_reason_atoms_and_the_host_seeds_them() {
+    // Loaded on its own, the module cannot name its own exception reasons: the
+    // compiler never emitted them (a real runtime has them globally interned).
+    let bare = load_file(EXCPATHS_BEAM).expect("load excpaths.beam on its own");
+    for name in SEED_ATOMS {
+        assert!(
+            bare.atom_table.lookup(name).is_none(),
+            "the fixture must NOT carry the well-known atom `{name}` (it would defeat the test)"
+        );
+    }
+
+    // Loaded through the shared-atom host, every well-known atom is resolvable
+    // from the module.
+    let mut host = excpaths_host();
+    let module = host.load("excpaths").expect("load excpaths through the host");
+    for name in SEED_ATOMS {
+        assert!(
+            module.atom_table.lookup(name).is_some(),
+            "the host must seed the well-known atom `{name}` into the module"
+        );
+    }
+
+    // The seeding preserves the index-consistency invariant the host documents:
+    // for every index in the module's table, the shared table names the same atom
+    // (which is what lets an atom term built by one module compare equal to the
+    // same-named atom interned elsewhere).
+    let shared = host.atom_table();
+    for index in 0..module.atom_table.len() {
+        let atom = Atom::from_raw(index as u32);
+        assert_eq!(
+            module.atom_table.name(atom),
+            shared.name(atom),
+            "index {index} must agree between the module and the shared atom table"
+        );
+    }
+}
+
+#[test]
+fn without_the_seed_a_real_module_cannot_name_its_own_exception_reason() {
+    // The gap the seeding closes, pinned on the SAME module: without a global
+    // atom universe the engine refuses to start the raise at all — a typed
+    // `unsupported` rather than a substituted reason, and `pending_exception`
+    // never fills in (the raise never began).
+    let mut module = load_file(EXCPATHS_BEAM).expect("load excpaths.beam on its own");
+    let b = make_atom(module.atom_table.intern("b"));
+    let mut ctx = MinimalContext::new();
+    let (result, machine) = run(&module, "cc", &[b], &mut ctx);
+    assert!(
+        matches!(result, Err(BeamError::Raise(_))),
+        "an unnameable reason must be a typed error, got {result:?}"
+    );
+    assert!(
+        machine.pending_exception().is_none(),
+        "the raise must not have started: the module cannot name `case_clause`"
+    );
+}
+
+#[test]
+fn a_failed_head_clause_raises_function_clause_on_a_real_module() {
+    // `fc(a) -> 1.` reached through its `func_info` label with `b`:
+    //   $ erl -noshell -eval 'try excpaths:fc(b) catch C:R:_ -> io:format("~p:~p~n",[C,R]) end, halt().'
+    //   error:function_clause
+    let mut host = excpaths_host();
+    let b = host.intern("b");
+
+    // Uncaught: a typed raise propagating out of the run (never a wrong value).
+    assert!(
+        matches!(host.call("excpaths", "fc", &[b]), Err(BeamError::Raise(_))),
+        "an uncaught `function_clause` must propagate as a typed raise"
+    );
+
+    // Caught in-module: the class atom `error` and the *bare* `function_clause`
+    // reason (the call arguments ride in the stacktrace, not the reason).
+    let got = host
+        .call("excpaths", "catch_fc", &[b])
+        .expect("catch_fc(b) must run");
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    assert_atom(&host, caught_reason(got), "function_clause");
+}
+
+#[test]
+fn a_failed_case_raises_case_clause_on_a_real_module() {
+    // `cc(X) -> case X of a -> 1 end.` with `b`:
+    //   $ erl -noshell -eval 'try excpaths:cc(b) catch C:R:_ -> io:format("~p:~p~n",[C,R]) end, halt().'
+    //   error:{case_clause,b}
+    let mut host = excpaths_host();
+    let b = host.intern("b");
+
+    assert!(matches!(
+        host.call("excpaths", "cc", &[b]),
+        Err(BeamError::Raise(_))
+    ));
+
+    let got = host
+        .call("excpaths", "catch_cc", &[b])
+        .expect("catch_cc(b) must run");
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    let reason = caught_reason(got);
+    assert_atom(&host, terms::tuple_element(reason, 0).unwrap(), "case_clause");
+    assert!(
+        cmp(
+            terms::tuple_element(reason, 1).unwrap(),
+            b,
+            host.atom_table()
+        )
+        .is_eq(),
+        "the reason's payload is the failing value `b`"
+    );
+}
+
+#[test]
+fn a_failed_if_raises_the_bare_atom_if_clause_on_a_real_module() {
+    // `ii(X) -> if X > 0 -> 1 end.` with `-1`:
+    //   $ erl -noshell -eval 'try excpaths:ii(-1) catch C:R:_ -> io:format("~p:~p~n",[C,R]) end, halt().'
+    //   error:if_clause
+    let mut host = excpaths_host();
+
+    assert!(matches!(
+        host.call("excpaths", "ii", &[make_small(-1)]),
+        Err(BeamError::Raise(_))
+    ));
+
+    let got = host
+        .call("excpaths", "catch_ii", &[make_small(-1)])
+        .expect("catch_ii(-1) must run");
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    assert_atom(&host, caught_reason(got), "if_clause");
+}
+
+#[test]
+fn a_failed_binary_match_raises_badmatch_on_a_real_module() {
+    // `bm(X) -> <<Y:16>> = X, Y.` with the atom `a` (a non-binary):
+    //   $ erl -noshell -eval 'try excpaths:bm(a) catch C:R:_ -> io:format("~p:~p~n",[C,R]) end, halt().'
+    //   error:{badmatch,a}
+    let mut host = excpaths_host();
+    let a = host.intern("a");
+
+    assert!(matches!(
+        host.call("excpaths", "bm", &[a]),
+        Err(BeamError::Raise(_))
+    ));
+
+    let got = host
+        .call("excpaths", "catch_bm", &[a])
+        .expect("catch_bm(a) must run");
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    let reason = caught_reason(got);
+    assert_atom(&host, terms::tuple_element(reason, 0).unwrap(), "badmatch");
+    assert!(
+        cmp(terms::tuple_element(reason, 1).unwrap(), a, host.atom_table()).is_eq(),
+        "the reason's payload is the failing value `a`"
+    );
+}
+
+#[test]
+fn a_failed_try_of_clause_raises_try_clause_on_a_real_module() {
+    // `tc(X) -> try X of a -> 1 catch _:_ -> nope end.` with `b` — the `of`
+    // clause failure is NOT caught by the same `try`'s catch part:
+    //   $ erl -noshell -eval 'try excpaths:tc(b) catch C:R:_ -> io:format("~p:~p~n",[C,R]) end, halt().'
+    //   error:{try_clause,b}
+    let mut host = excpaths_host();
+    let b = host.intern("b");
+
+    assert!(matches!(
+        host.call("excpaths", "tc", &[b]),
+        Err(BeamError::Raise(_))
+    ));
+
+    let got = host
+        .call("excpaths", "catch_tc", &[b])
+        .expect("catch_tc(b) must run");
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    let reason = caught_reason(got);
+    assert_atom(&host, terms::tuple_element(reason, 0).unwrap(), "try_clause");
+    assert!(
+        cmp(terms::tuple_element(reason, 1).unwrap(), b, host.atom_table()).is_eq(),
+        "the reason's payload is the failing value `b`"
+    );
+}
+
+#[test]
+fn the_caught_class_atom_is_the_error_class_on_a_real_module() {
+    // `catch_class(X) -> try cc(X) catch C:_ -> C end.` with `b`:
+    //   $ erl -noshell -eval 'io:format("~p~n",[excpaths:catch_class(b)]), halt().'
+    //   error
+    let mut host = excpaths_host();
+    let b = host.intern("b");
+    let got = host
+        .call("excpaths", "catch_class", &[b])
+        .expect("catch_class(b) must run");
+    assert_atom(&host, got, "error");
+}
+
+#[test]
+fn old_style_catch_builds_the_exit_tuple_without_a_stacktrace() {
+    // `oldcatch_bm(X) -> catch bm(X).`
+    // ORACLE: `excpaths:oldcatch_bm(a) = {'EXIT',{{badmatch,a},Stacktrace}}`.
+    // M1 captures no stacktrace, so `catch_end` builds the shorter
+    // `{'EXIT',{badmatch,a}}` (the documented `catch_end` limit — C's
+    // `add_stacktrace` is skipped); the REASON itself is oracle-exact.
+    let mut host = excpaths_host();
+    let a = host.intern("a");
+    let got = host
+        .call("excpaths", "oldcatch_bm", &[a])
+        .expect("oldcatch_bm(a) must yield the EXIT tuple");
+
+    let badmatch = host.intern("badmatch");
+    let exit = host.intern("EXIT");
+    let inner = terms::make_tuple(&mut host, &[badmatch, a]).unwrap();
+    let expected = terms::make_tuple(&mut host, &[exit, inner]).unwrap();
+    assert!(
+        cmp(got, expected, host.atom_table()).is_eq(),
+        "oldcatch_bm(a) must be {{'EXIT',{{badmatch,a}}}} (M1: no stacktrace)"
+    );
+}
+
+#[test]
+fn the_try_catch_class_reason_stacktrace_shape_runs_but_the_trace_is_empty() {
+    // `trace(X) -> try cc(X) catch C:R:S -> {C, R, S} end.`
+    // ORACLE: `excpaths:trace(b) =
+    //   {error,{case_clause,b},
+    //    [{excpaths,cc,1,[{file,"excpaths.erl"},{line,52}]},
+    //     {excpaths,trace,1,[{file,"excpaths.erl"},{line,71}]} | <host frames>]}`.
+    // M1 captures no stacktrace, so a landed exception has `x(2) = NIL`; C's
+    // `build_stacktrace` short-circuits a NIL raw trace to NIL
+    // (`beam_common.c:1219-1223`), so the engine reproduces the oracle's `[]`
+    // exactly on the *compiled* path and the `S` element is the only divergence
+    // (the class and the reason are oracle-exact). See the fixture report.
+    let mut host = excpaths_host();
+    let b = host.intern("b");
+    let got = host
+        .call("excpaths", "trace", &[b])
+        .expect("trace(b) must run");
+
+    assert_atom(&host, terms::tuple_element(got, 0).unwrap(), "error");
+    let reason = terms::tuple_element(got, 1).unwrap();
+    assert_atom(&host, terms::tuple_element(reason, 0).unwrap(), "case_clause");
+    assert!(
+        cmp(terms::tuple_element(reason, 1).unwrap(), b, host.atom_table()).is_eq(),
+        "the reason's payload is the failing value `b`"
+    );
+    assert_eq!(
+        terms::tuple_element(got, 2).unwrap(),
+        NIL,
+        "M1 keeps no raw stacktrace, so the cooked `S` is []"
     );
 }

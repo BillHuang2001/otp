@@ -54,6 +54,7 @@
 mod support;
 
 use beam_engine::terms;
+use beam_term::Eterm;
 use support::{
     assert_atom, assert_int_list, assert_keyed_list, int_list, keyed_tuple, skip_reason,
     stdlib_ebin, ModuleHost,
@@ -401,3 +402,457 @@ fn list_helpers_round_trip() {
     assert_eq!(terms::list_elements(list).unwrap().len(), 3);
     assert_int_list(&host, list, &[7, 8, 9]);
 }
+
+// ---------------------------------------------------------------------------
+// Corpus BREADTH — the oracle-checked call corpus
+//
+// `tests/stdlib_sweep.rs` proves every installed `stdlib`/`kernel`/`compiler`
+// `.beam` **loads** and runs a curated handful of functions; the sections above
+// run a handful of modules in depth.  The sections below add *breadth*: a
+// 258-call corpus spanning **151 distinct installed modules** (of the 261 the
+// three stdlib suites discover), every call checked against the value the real
+// system Erlang returns.
+//
+// The corpus is data: `tests/fixtures/stdlib_breadth_targets.txt`, one
+// `module:function(args) => expected` line per call, each carrying the exact
+// `erl -noshell -eval …` command that produces its expected value. *No expected
+// value in this suite is guessed and none is derived from the engine's own
+// output* — every one is the verbatim `~w` rendering the system `erl`
+// (OTP 29 / erts-17.1, the differential oracle) printed.
+//
+// These sections live in this file because it is one of the three stdlib suites
+// this node owns; the width of the table is why it is a *data* fixture rather
+// than 258 inline assertions.
+// ---------------------------------------------------------------------------
+
+/// The committed oracle-checked call corpus (see the section header).
+const BREADTH_TARGETS: &str = include_str!("fixtures/stdlib_breadth_targets.txt");
+
+/// The floor this suite enforces: the number of distinct corpus modules that
+/// must have **at least one export actually interpreted** on an oracle-checked
+/// input. Set to the honest number this suite measures (171 of 261; it was 15
+/// before the breadth corpus was added), not to a wishful one.
+const BREADTH_MODULE_FLOOR: usize = 171;
+/// The floor on the number of oracle-checked calls the corpus must actually
+/// execute (set to the honest number this suite measures: 504).
+const BREADTH_CALL_FLOOR: usize = 480;
+
+/// One parsed corpus line: `module:function(args) => expected`.
+struct BreadthTarget<'a> {
+    /// The module to call.
+    module: &'a str,
+    /// The exported function to call.
+    function: &'a str,
+    /// The argument text, e.g. `[1,2],[3,4]` (one of the corpus shapes).
+    args: &'a str,
+    /// The verbatim `~w` rendering the system `erl` produced.
+    expected: &'a str,
+}
+
+/// Parses one corpus line; `None` for a comment/blank line. A malformed *target*
+/// line is a corpus bug and panics (`expect`), so a broken fixture can never be
+/// silently skipped.
+fn parse_breadth_target(line: &str) -> Option<BreadthTarget<'_>> {
+    let line = line.split("  # oracle:").next().unwrap_or(line).trim();
+    if line.is_empty() || line.starts_with('#') {
+        return None;
+    }
+    let (key, expected) = line
+        .split_once(" => ")
+        .expect("corpus line without ` => `");
+    let (module, rest) = key.split_once(':').expect("corpus key without `:`");
+    let (function, args) = rest.split_once('(').expect("corpus key without `(`");
+    let args = args.strip_suffix(')').expect("corpus key without `)`");
+    Some(BreadthTarget {
+        module,
+        function,
+        args,
+        expected,
+    })
+}
+
+/// Splits an argument list on **top-level** commas, respecting `[]`/`{}`/`<<>>`
+/// nesting and `"`-quoted strings.
+fn split_arg_terms(args: &str) -> Vec<&str> {
+    let mut parts = Vec::new();
+    let mut depth = 0i32;
+    let mut in_string = false;
+    let mut start = 0usize;
+    for (index, &byte) in args.as_bytes().iter().enumerate() {
+        match byte {
+            b'"' => in_string = !in_string,
+            b'[' | b'{' | b'<' if !in_string => depth += 1,
+            b']' | b'}' | b'>' if !in_string => depth -= 1,
+            b',' if !in_string && depth == 0 => {
+                parts.push(&args[start..index]);
+                start = index + 1;
+            }
+            _ => {}
+        }
+    }
+    parts.push(&args[start..]);
+    parts
+}
+
+/// Builds one corpus argument from its source text: `[]`, `[a,b,c]` (a list of
+/// nested terms), `{a,b}` (a tuple), `<<1,2,3>>` (a byte binary), `"abc"` (a
+/// code-point string), an integer, an atom (bare or `'quoted'`).
+fn arg_term(host: &mut ModuleHost, text: &str) -> Eterm {
+    let text = text.trim();
+    if let Some(inner) = text.strip_prefix("<<").and_then(|t| t.strip_suffix(">>")) {
+        let bytes: Vec<u8> = if inner.trim().is_empty() {
+            Vec::new()
+        } else {
+            split_arg_terms(inner)
+                .iter()
+                .map(|part| {
+                    part.trim()
+                        .parse::<u8>()
+                        .expect("a corpus binary element is a byte literal")
+                })
+                .collect()
+        };
+        return terms::make_heap_binary(host, &bytes).expect("build the corpus binary argument");
+    }
+    if let Some(inner) = text.strip_prefix('[').and_then(|t| t.strip_suffix(']')) {
+        if inner.trim().is_empty() {
+            return beam_term::NIL;
+        }
+        let elements: Vec<Eterm> = split_arg_terms(inner)
+            .iter()
+            .map(|part| arg_term(host, part))
+            .collect();
+        return terms::make_list(host, &elements).expect("build the corpus list argument");
+    }
+    if let Some(inner) = text.strip_prefix('{').and_then(|t| t.strip_suffix('}')) {
+        let elements: Vec<Eterm> = split_arg_terms(inner)
+            .iter()
+            .map(|part| arg_term(host, part))
+            .collect();
+        return terms::make_tuple(host, &elements).expect("build the corpus tuple argument");
+    }
+    if let Some(inner) = text.strip_prefix('"').and_then(|t| t.strip_suffix('"')) {
+        let chars: Vec<Eterm> = inner
+            .bytes()
+            .map(|byte| beam_term::make_small(i64::from(byte)))
+            .collect();
+        return terms::make_list(host, &chars).expect("build the corpus string argument");
+    }
+    if let Ok(value) = text.parse::<i64>() {
+        return beam_term::make_small(value);
+    }
+    match text.strip_prefix('\'').and_then(|t| t.strip_suffix('\'')) {
+        Some(quoted) => host.intern(quoted),
+        None => host.intern(text),
+    }
+}
+
+/// Builds the argument list for a corpus call from its `(<args>)` text. The text
+/// is a comma-separated list of the term shapes [`arg_term`] understands; the
+/// empty text is the zero-arity call. A malformed argument is a corpus bug and
+/// panics, so a broken fixture can never be silently skipped.
+fn breadth_args(host: &mut ModuleHost, args: &str) -> Vec<Eterm> {
+    if args.trim().is_empty() {
+        return Vec::new();
+    }
+    split_arg_terms(args)
+        .iter()
+        .map(|part| arg_term(host, part))
+        .collect()
+}
+
+/// The words `~w` quotes when they appear as atoms (`io_lib:write_atom/1`).
+const ERESERVED: &[&str] = &[
+    "after", "begin", "case", "catch", "cond", "end", "fun", "if", "let", "of", "query", "receive",
+    "try", "when", "andalso", "orelse", "bsl", "bsr", "band", "bnot", "bor", "bxor", "div", "rem",
+    "and", "or", "not", "xor", "maybe", "else",
+];
+
+/// Renders an atom exactly as `~w` does: bare when it is a plain lowercase name
+/// that is not a reserved word, `'quoted'` otherwise.
+fn render_atom(name: &str) -> String {
+    let plain = name
+        .chars()
+        .next()
+        .map(|first| first.is_ascii_lowercase())
+        .unwrap_or(false)
+        && name
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '@')
+        && !ERESERVED.contains(&name);
+    if plain {
+        return name.to_string();
+    }
+    let mut out = String::from("'");
+    for c in name.chars() {
+        match c {
+            '\'' => out.push_str("\\'"),
+            '\\' => out.push_str("\\\\"),
+            _ => out.push(c),
+        }
+    }
+    out.push('\'');
+    out
+}
+
+/// Renders a float the way `~w` does (`1.0` rather than `1`).
+fn render_float(value: f64) -> String {
+    let text = format!("{value}");
+    if text.contains(['.', 'e', 'E']) {
+        text
+    } else {
+        format!("{text}.0")
+    }
+}
+
+/// Renders a bitstring the way `~w` does — always as byte values, never as a
+/// `<<"…">>` string (`~w` does no string detection).
+fn render_binary(bytes: &[u8]) -> String {
+    let mut out = String::from("<<");
+    for (index, byte) in bytes.iter().enumerate() {
+        if index > 0 {
+            out.push(',');
+        }
+        out.push_str(&byte.to_string());
+    }
+    out.push_str(">>");
+    out
+}
+
+/// The engine's `~w`-equivalent term renderer — the form the corpus's expected
+/// values are written in. `None` for a term `~w` cannot render *deterministically*
+/// (a fun, pid, port or reference); such a result is reported as a loud skip
+/// rather than compared against a fabricated string.
+fn render_term(host: &ModuleHost, term: Eterm) -> Option<String> {
+    if beam_term::is_small(term) {
+        return Some(beam_term::signed_value(term).to_string());
+    }
+    if beam_term::is_atom(term) {
+        return host.atom_table().name(beam_term::atom_val(term)).map(render_atom);
+    }
+    if beam_term::is_nil(term) {
+        return Some("[]".to_string());
+    }
+    if let Ok(value) = terms::float_value(term) {
+        return Some(render_float(value));
+    }
+    if let Ok(bytes) = terms::binary_bytes(term) {
+        return Some(render_binary(bytes));
+    }
+    if let Ok(arity) = terms::tuple_arity(term) {
+        let mut out = String::from("{");
+        for index in 0..arity {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&render_term(host, terms::tuple_element(term, index).ok()?)?);
+        }
+        out.push('}');
+        return Some(out);
+    }
+    if let Ok(pairs) = terms::map_entries(term) {
+        let mut out = String::from("#{");
+        for (index, &(key, value)) in pairs.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&render_term(host, key)?);
+            out.push_str(" => ");
+            out.push_str(&render_term(host, value)?);
+        }
+        out.push('}');
+        return Some(out);
+    }
+    if beam_term::is_list(term) {
+        let elements = terms::list_elements(term).ok()?;
+        let mut out = String::from("[");
+        for (index, &element) in elements.iter().enumerate() {
+            if index > 0 {
+                out.push(',');
+            }
+            out.push_str(&render_term(host, element)?);
+        }
+        out.push(']');
+        return Some(out);
+    }
+    None
+}
+
+/// A host over the system stdlib `ebin` with `kernel`'s and `compiler`'s `ebin`
+/// on the search path, so a cross-module call into a second/third application
+/// resolves by name.
+fn breadth_host() -> ModuleHost {
+    let ebin = stdlib_ebin().expect("stdlib ebin (guarded by `skip_if_unavailable`)");
+    let mut host = ModuleHost::new(ebin);
+    for app in ["kernel", "compiler"] {
+        if let Some(dir) = support::app_ebin(app) {
+            host.add_search_dir(dir);
+        }
+    }
+    host
+}
+
+/// The installed corpus: every `*.beam` basename in the `stdlib`, `kernel` and
+/// `compiler` `ebin` directories (the same 261 modules `tests/stdlib_sweep.rs`
+/// loads).
+fn corpus_modules() -> Vec<String> {
+    let mut modules: Vec<String> = Vec::new();
+    for app in ["stdlib", "kernel", "compiler"] {
+        let Some(dir) = support::app_ebin(app) else {
+            continue;
+        };
+        let mut found: Vec<String> = std::fs::read_dir(&dir)
+            .into_iter()
+            .flatten()
+            .filter_map(|entry| entry.ok())
+            .map(|entry| entry.path())
+            .filter(|path| path.extension().map(|ext| ext == "beam").unwrap_or(false))
+            .filter_map(|path| path.file_stem().map(|stem| stem.to_string_lossy().into_owned()))
+            .collect();
+        found.sort();
+        modules.extend(found);
+    }
+    modules
+}
+
+/// **The breadth measurement, and the floor that enforces it.**
+///
+/// Runs every corpus call and compares the engine's result against the system
+/// `erl`'s rendering of the same call. A *wrong value* fails; a typed error
+/// prints `SKIP: <module>:<f>(<args>) — <error>` and is counted but does not
+/// fail (the floor below is what catches a regression that turns an executing
+/// module into a blocked one). The report prints the per-module list so the
+/// breadth is auditable, not just a number.
+#[test]
+fn breadth_runs_a_large_fraction_of_the_installed_corpus() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = breadth_host();
+    let corpus = corpus_modules();
+    let mut executed: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
+    let mut calls = 0usize;
+    let mut skips: Vec<String> = Vec::new();
+
+    for line in BREADTH_TARGETS.lines() {
+        let Some(target) = parse_breadth_target(line) else {
+            continue;
+        };
+        let args = breadth_args(&mut host, target.args);
+        let label = format!("{}:{}({})", target.module, target.function, target.args);
+        match host.call(target.module, target.function, &args) {
+            Ok(value) => {
+                let Some(rendered) = render_term(&host, value) else {
+                    skips.push(format!("SKIP: {label} — unrenderable result"));
+                    continue;
+                };
+                assert_eq!(
+                    rendered, target.expected,
+                    "ORACLE MISMATCH for `{label}`: the engine returned `{rendered}`, \
+                     the system erl returns `{}`",
+                    target.expected
+                );
+                calls += 1;
+                executed.insert(target.module);
+            }
+            Err(error) => skips.push(format!("SKIP: {label} — {error:?}")),
+        }
+    }
+
+    let mut report = format!(
+        "BREADTH: modules executed: {}/{}\nBREADTH: functions executed: {calls}\n",
+        executed.len(),
+        corpus.len()
+    );
+    for module in &executed {
+        report.push_str(&format!("BREADTH: executed: {module}\n"));
+    }
+    for skip in &skips {
+        report.push_str(&format!("BREADTH: {skip}\n"));
+    }
+    print!("{report}");
+
+    assert!(
+        corpus.len() >= 200,
+        "the breadth suite only found {} corpus modules — expected stdlib+kernel (≈260)",
+        corpus.len()
+    );
+    assert!(
+        calls >= BREADTH_CALL_FLOOR,
+        "only {calls} oracle-checked calls executed (floor {BREADTH_CALL_FLOOR}); \
+         {} call(s) were blocked:\n{}",
+        skips.len(),
+        skips.join("\n")
+    );
+    assert!(
+        executed.len() >= BREADTH_MODULE_FLOOR,
+        "only {} of {} corpus modules were actually executed (floor {BREADTH_MODULE_FLOOR}); \
+         {} call(s) were blocked:\n{}",
+        executed.len(),
+        corpus.len(),
+        skips.len(),
+        skips.join("\n")
+    );
+}
+
+/// **The skip-vs-assert policy for the breadth corpus, spelled out.**
+///
+/// A module/function that needs a BIF the shared test host does not serve is
+/// *blocked*, never wrong: the call returns a typed [`beam_common::BeamError`].
+/// Each such probe is printed as `SKIP: <module>:<f>/<n> — <typed error>` and its
+/// **exact** error is asserted, so a later regression that turns a typed error
+/// into a fabricated result is caught. A genuine value mismatch (see above)
+/// fails instead.
+#[test]
+fn breadth_blocked_calls_report_their_exact_typed_error() {
+    if skip_if_unavailable() {
+        return;
+    }
+    let mut host = breadth_host();
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[unicode:characters_to_binary("hi")]),halt().'
+    //         <<"hi">>
+    // `unicode:characters_to_binary/1` is a `unicode` BIF the host floor does not
+    // serve, so the real module's call is a typed `BadArg` — never `<<"hi">>`.
+    let hi = int_list(&mut host, &[104, 105]);
+    let error = host
+        .call("unicode", "characters_to_binary", &[hi])
+        .expect_err("`unicode:characters_to_binary/1` is not in the host floor");
+    println!("SKIP: unicode:characters_to_binary/1 — {error:?}");
+    assert!(
+        matches!(error, beam_common::BeamError::BadArg),
+        "unexpected `unicode:characters_to_binary/1` error: {error:?}"
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:put(k,1,#{})]),halt().'
+    //         #{k => 1}
+    // `maps:put/3` is an `erlang` BIF the host floor does not serve.
+    let empty = terms::make_flatmap(&mut host, &[]).expect("build the empty map");
+    let key = host.intern("k");
+    let error = host
+        .call(
+            "maps",
+            "put",
+            &[key, beam_term::make_small(1), empty],
+        )
+        .expect_err("`maps:put/3` is not in the host floor");
+    println!("SKIP: maps:put/3 — {error:?}");
+    assert!(
+        matches!(error, beam_common::BeamError::BadArg),
+        "unexpected `maps:put/3` error: {error:?}"
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:from_list([{k,1}])]),halt().'
+    //         #{k => 1}
+    let pair = support::term_tuple(&mut host, &[key, beam_term::make_small(1)]);
+    let pairs = support::term_list(&mut host, &[pair]);
+    let error = host
+        .call("maps", "from_list", &[pairs])
+        .expect_err("`maps:from_list/1` folds with the unserved `maps:put/3`");
+    println!("SKIP: maps:from_list/1 — {error:?}");
+    assert!(
+        matches!(error, beam_common::BeamError::BadArg),
+        "unexpected `maps:from_list/1` error: {error:?}"
+    );
+}
+

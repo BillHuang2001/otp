@@ -30,6 +30,19 @@
 //!   a given runtime image but, because a map node's words are pointers, the
 //!   hash of such a term is not stable across processes/images.
 //!   It is only ever used as an *internal* hash, never compared against the C.
+//!
+//! # Layout
+//!
+//! This structural hash (and the shared low-level primitives) live here; the two
+//! *compatibility-pinned* ports — `make_hash2` and `make_hash` — live in the
+//! `make_hash2` and `make_hash` submodules (see the section comment below).
+
+mod common;
+mod make_hash;
+mod make_hash2;
+
+pub use make_hash::make_hash;
+pub use make_hash2::{compute_record_definition_hash, make_hash2};
 
 use crate::atom::AtomTable;
 use crate::bitstring::{bitstring_parts, float_bits};
@@ -72,7 +85,7 @@ const TAG_FUN_EXTERNAL: u64 = 0x10;
 
 /// Mix a word into a running FNV-1a style hash.
 #[inline]
-fn mix(h: u64, word: u64) -> u64 {
+fn mix64(h: u64, word: u64) -> u64 {
     (h ^ word).wrapping_mul(FNV_PRIME)
 }
 
@@ -89,25 +102,25 @@ pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64 {
 fn hash_term(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
     // SAFETY: `class` only dereferences the header word of a live boxed term.
     match unsafe { class(t) } {
-        TermClass::Small => mix(mix(h, TAG_SMALL), signed_value(t) as u64),
-        TermClass::Big => unsafe { hash_big(t, mix(h, TAG_BIG)) },
+        TermClass::Small => mix64(mix64(h, TAG_SMALL), signed_value(t) as u64),
+        TermClass::Big => unsafe { hash_big(t, mix64(h, TAG_BIG)) },
         // SAFETY: `t` is a boxed float.
-        TermClass::Float => mix(mix(h, TAG_FLOAT), unsafe { float_bits(t) }),
-        TermClass::Atom => hash_atom(t, atoms, mix(h, TAG_ATOM)),
-        TermClass::Nil => mix(h, TAG_NIL),
+        TermClass::Float => mix64(mix64(h, TAG_FLOAT), unsafe { float_bits(t) }),
+        TermClass::Atom => hash_atom(t, atoms, mix64(h, TAG_ATOM)),
+        TermClass::Nil => mix64(h, TAG_NIL),
         // SAFETY: `t` is a cons cell / tuple.
-        TermClass::List => unsafe { hash_list(t, atoms, mix(h, TAG_LIST)) },
-        TermClass::Tuple => unsafe { hash_tuple(t, atoms, mix(h, TAG_TUPLE)) },
+        TermClass::List => unsafe { hash_list(t, atoms, mix64(h, TAG_LIST)) },
+        TermClass::Tuple => unsafe { hash_tuple(t, atoms, mix64(h, TAG_TUPLE)) },
         // SAFETY: `t` is a bitstring.
-        TermClass::Bitstring => unsafe { hash_bits(t, mix(h, TAG_BITS)) },
-        TermClass::Pid => mix(mix(h, TAG_PID), internal_pid_data(t)),
-        TermClass::Port => mix(mix(h, TAG_PORT), internal_port_data(t)),
+        TermClass::Bitstring => unsafe { hash_bits(t, mix64(h, TAG_BITS)) },
+        TermClass::Pid => mix64(mix64(h, TAG_PID), internal_pid_data(t)),
+        TermClass::Port => mix64(mix64(h, TAG_PORT), internal_port_data(t)),
         // SAFETY: `t` is a live map.
-        TermClass::Map => hash_map(t, atoms, mix(h, TAG_MAP)),
+        TermClass::Map => hash_map(t, atoms, mix64(h, TAG_MAP)),
         // SAFETY: `t` is a live fun.
         TermClass::Fun => unsafe { hash_fun(t, atoms, h) },
         // Refs plus every opaque class.
-        _ => unsafe { hash_words(t, mix(h, TAG_OPAQUE)) },
+        _ => unsafe { hash_words(t, mix64(h, TAG_OPAQUE)) },
     }
 }
 
@@ -133,31 +146,31 @@ unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
     let hdr = unsafe { *p };
     match fun_kind_of_header(hdr) {
         FunKind::Local => {
-            let mut h = mix(h, TAG_FUN_LOCAL);
+            let mut h = mix64(h, TAG_FUN_LOCAL);
             // SAFETY: a local fun's descriptor words 1 and 2 hold `uniq` and `index`.
-            h = mix(h, unsafe { (*p.add(1)).raw() } as u64);
-            h = mix(h, unsafe { (*p.add(2)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(1)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(2)).raw() } as u64);
             // SAFETY: `p` is the header word of the live local fun `hdr`.
             unsafe { hash_fun_env(p, hdr, atoms, h) }
         }
         FunKind::Imported => {
-            let mut h = mix(h, TAG_FUN_IMPORTED);
+            let mut h = mix64(h, TAG_FUN_IMPORTED);
             // SAFETY: an imported fun's descriptor word 1 holds its module atom.
             h = hash_term(unsafe { *p.add(1) }, atoms, h);
             // SAFETY: an imported fun's descriptor words 4 and 6 hold `index` and
             // `old_uniq`.
-            h = mix(h, unsafe { (*p.add(4)).raw() } as u64);
-            h = mix(h, unsafe { (*p.add(6)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(4)).raw() } as u64);
+            h = mix64(h, unsafe { (*p.add(6)).raw() } as u64);
             // SAFETY: `p` is the header word of the live imported fun `hdr`.
             unsafe { hash_fun_env(p, hdr, atoms, h) }
         }
         FunKind::External => {
-            let mut h = mix(h, TAG_FUN_EXTERNAL);
+            let mut h = mix64(h, TAG_FUN_EXTERNAL);
             // SAFETY: an external fun's descriptor words 1 and 2 hold its module and
             // function atoms.
             h = hash_term(unsafe { *p.add(1) }, atoms, h);
             h = hash_term(unsafe { *p.add(2) }, atoms, h);
-            mix(h, fun_arity(hdr) as u64)
+            mix64(h, fun_arity(hdr) as u64)
         }
     }
 }
@@ -171,7 +184,7 @@ unsafe fn hash_fun(t: Eterm, atoms: &AtomTable, h: u64) -> u64 {
 /// block (header + descriptor + `num_free` environment words) must be live.
 unsafe fn hash_fun_env(p: *mut Eterm, hdr: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     let num_free = fun_num_free(hdr);
-    h = mix(h, num_free as u64);
+    h = mix64(h, num_free as u64);
     let offset = 1 + fun_desc_words(fun_kind_of_header(hdr));
     for i in 0..num_free {
         // SAFETY: environment word `i` is within the fun's payload.
@@ -192,7 +205,7 @@ fn hash_map(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
         Ok(pairs) => pairs,
         Err(_) => return unsafe { hash_words(t, h) },
     };
-    h = mix(h, pairs.len() as u64);
+    h = mix64(h, pairs.len() as u64);
     for (key, value) in pairs {
         h = hash_term(key, atoms, h);
         h = hash_term(value, atoms, h);
@@ -207,11 +220,11 @@ fn hash_atom(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     match atoms.name(index) {
         Some(name) => {
             for &byte in name.as_bytes() {
-                h = mix(h, byte as u64);
+                h = mix64(h, byte as u64);
             }
-            mix(h, name.len() as u64)
+            mix64(h, name.len() as u64)
         }
-        None => mix(h, index.raw() as u64),
+        None => mix64(h, index.raw() as u64),
     }
 }
 
@@ -224,12 +237,12 @@ unsafe fn hash_big(t: Eterm, mut h: u64) -> u64 {
     // SAFETY: `t` is a boxed bignum.
     let p = boxed_val(t);
     let hdr = unsafe { *p };
-    h = mix(h, u64::from(hdr.raw() & BIG_SIGN_BIT != 0));
+    h = mix64(h, u64::from(hdr.raw() & BIG_SIGN_BIT != 0));
     let arity = header_arity(hdr);
-    h = mix(h, arity as u64);
+    h = mix64(h, arity as u64);
     for i in 0..arity {
         // SAFETY: limb `i` is within the bignum payload.
-        h = mix(h, unsafe { (*p.add(1 + i)).raw() } as u64);
+        h = mix64(h, unsafe { (*p.add(1 + i)).raw() } as u64);
     }
     h
 }
@@ -242,7 +255,7 @@ unsafe fn hash_big(t: Eterm, mut h: u64) -> u64 {
 unsafe fn hash_tuple(t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
     // SAFETY: `t` is a tuple.
     let arity = unsafe { tuple_size(t) };
-    h = mix(h, arity as u64);
+    h = mix64(h, arity as u64);
     for i in 0..arity {
         // SAFETY: `i < arity`.
         let elem = unsafe { tuple_element(t, i) };
@@ -268,12 +281,12 @@ unsafe fn hash_list(mut t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
         if is_list(tail) {
             t = tail;
         } else {
-            h = mix(h, TAG_LIST_TAIL);
+            h = mix64(h, TAG_LIST_TAIL);
             h = hash_term(tail, atoms, h);
             break;
         }
     }
-    mix(h, cells)
+    mix64(h, cells)
 }
 
 /// Hash a bitstring by bit size and (byte-normalised) contents.
@@ -284,7 +297,7 @@ unsafe fn hash_list(mut t: Eterm, atoms: &AtomTable, mut h: u64) -> u64 {
 unsafe fn hash_bits(t: Eterm, mut h: u64) -> u64 {
     // SAFETY: `t` is a bitstring.
     let (base, offset, size) = unsafe { bitstring_parts(t) };
-    h = mix(h, size as u64);
+    h = mix64(h, size as u64);
     let bytes = size.div_ceil(8);
     for j in 0..bytes {
         let mut byte = 0u8;
@@ -297,7 +310,7 @@ unsafe fn hash_bits(t: Eterm, mut h: u64) -> u64 {
                 } << (7 - k);
             }
         }
-        h = mix(h, byte as u64);
+        h = mix64(h, byte as u64);
     }
     h
 }
@@ -315,10 +328,36 @@ unsafe fn hash_words(t: Eterm, mut h: u64) -> u64 {
     let arity = thing_arityval(hdr);
     for i in 0..=arity {
         // SAFETY: word `i` is within the object.
-        h = mix(h, unsafe { (*p.add(i)).raw() } as u64);
+        h = mix64(h, unsafe { (*p.add(i)).raw() } as u64);
     }
     h
 }
+
+// ===========================================================================
+// `make_hash2` (`erlang:phash2/1,2`) and `make_hash` (`erlang:phash/2`)
+//
+// Bit-exact u32-wrapping ports of `erts/emulator/beam/erl_term_hashing.c`:
+// `make_hash2`/`make_hash2_helper` (the non-trapping path only — there is no
+// process/reds machinery here) and `make_hash`. Unlike [`term_hash`] above,
+// **these values are a compatibility contract**: the system ERTS produces them,
+// so a Rust term must hash identically (Level-1 drop-in).
+//
+// Error handling: a well-formed term always hashes. The only *reachable* typed
+// failure is a [`FunKind::Local`] fun (a `make_fun3` closure), whose inlined
+// 2-word descriptor carries neither the module nor `old_uniq` that the C's
+// `ErlFunEntry` supplies — see [`crate::fun`]. That is reported as the dedicated
+// [`crate::error::TermError::FunIdentityUnavailable`] (the term is fine; the
+// identity is not carried), never as a substituted value. Every other `Err`
+// below is for a forged/unknown term layout (unreachable through the safe API)
+// and stays [`crate::error::TermError::BadFun`], whose meaning — "this is not a
+// well-formed fun" — is exactly right there.
+//
+// The shared low-level primitives live in the [`common`] submodule; the two
+// ports are the [`make_hash2`](self::make_hash2) and
+// [`make_hash`](self::make_hash) submodules, re-exported here so
+// `beam_term::hashing::{make_hash2, make_hash, compute_record_definition_hash}`
+// and `lib.rs`'s `pub use crate::hashing::*;` are unchanged.
+// ===========================================================================
 
 #[cfg(test)]
 mod tests {

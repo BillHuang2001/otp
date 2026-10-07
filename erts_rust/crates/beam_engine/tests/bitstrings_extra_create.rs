@@ -51,18 +51,44 @@ fn build_bytes(module: &Module, name: &str, arg: Eterm, ctx: &mut MinimalContext
 }
 
 /// Assert a unary export is rejected as a typed error (never a panic, never a
-/// wrong value). The oracle raises `badarg` here; the engine surfaces a typed
-/// [`BeamError`] (a documented Milestone-1 gap — see `CONTEXT.md`), which is what
-/// this crate-level test can observe.
+/// wrong value).
+///
+/// The oracle raises `error:badarg` for every input these tests feed in, derived
+/// from a **clean** directory (never with `-pa tests/fixtures/`, whose `lists.beam`
+/// would shadow OTP's `lists`):
+///
+/// ```text
+/// $ erl -noshell -eval 'io:format("~p~n",[try <<-1/utf8>> catch C:E -> {C,E} end]),halt().'
+/// {error,badarg}
+/// ```
+///
+/// and identically for `16#D800`, `16#DFFF` and `16#110000` under
+/// `utf8`/`utf16`/`utf16-little`/`utf32`, and for `bscreate:f8(1.0)` (⇒
+/// `{error,badarg}`).
+///
+/// This fixture's atom table pins **none** of those reason atoms — a clean
+/// `beam_lib:chunks("bscreate.beam",[atoms])` reports `[false,false,false]` for
+/// `[badarg,badmatch,system_limit]` — so, per the engine's "never substitute an atom
+/// it cannot name" policy, the exact typed outcome here is [`BeamError::BadArg`]
+/// (whose `as_atom()` is `"badarg"`, the atom the oracle raises). The term-level
+/// `{error,badarg}` fidelity for a module that *does* pin the atom is asserted in the
+/// separate `bsfailseg` fixture tests.
 fn assert_rejects(module: &Module, name: &str, arg: Eterm, ctx: &mut MinimalContext) {
     let mut machine = Machine::new();
     let result = machine.run_export(module, export_atom(module, name), 1, &[arg], ctx);
     let err: BeamError = result.expect_err(&format!("{name}: expected a typed rejection"));
-    // A typed rejection (the `Raise` family, or the engine's `BadMatch` sentinel
-    // when the module's atom table has no `badmatch` atom to name the reason).
     assert!(
-        matches!(err, BeamError::Raise(_) | BeamError::BadMatch),
-        "{name}: expected a typed rejection, got {err:?}"
+        matches!(err, BeamError::BadArg),
+        "{name}: expected the typed `badarg` rejection, got {err:?}"
+    );
+    // The reason is the *bare atom* `badarg` — this fixture's atom table does not
+    // pin it (`beam_lib:chunks("bscreate.beam",[atoms])` ⇒ `false` for `badarg`), so
+    // the engine's honest exact outcome is the typed error rather than a substituted
+    // term, and `as_atom()` is still the atom the oracle raises.
+    assert_eq!(
+        err.as_atom(),
+        Some("badarg"),
+        "{name}: the typed rejection must name the oracle's reason atom"
     );
 }
 
@@ -218,11 +244,45 @@ fn a_float_segment_accepts_a_small_integer_value() {
 
 #[test]
 fn an_invalid_float_segment_size_is_rejected() {
-    // f8(F) -> <<F:8/float>>. The oracle raises `badarg`; the engine rejects the
-    // segment size (only 16/32/64 are valid float widths) as a typed error.
+    // f8(F) -> <<F:8/float>>. Only 16/32/64 are valid float widths, so the oracle
+    // raises `badarg` — as it does for `f0` above:
+    //
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<1.0:8/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<0.0:8/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<2.5:8/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //
+    // (The engine rejects the segment size as a typed error for every value.)
     let module = load(BSCREATE_BEAM);
     let mut ctx = MinimalContext::new();
-    assert_rejects(&module, "f8", float(&mut ctx, 1.0), &mut ctx);
+    for value in [1.0, 0.0, 2.5] {
+        assert_rejects(&module, "f8", float(&mut ctx, value), &mut ctx);
+    }
+}
+
+#[test]
+fn a_zero_bit_float_segment_is_rejected() {
+    // f0(F) -> <<F:0/float>>. `erlc` compiles this (with only a "bad float bit
+    // size" warning) to the segment `{atom,float},1,1,nil,{x,0},{integer,0}` — unit
+    // 1, size 0 — and `erts_bs_put_float` (`erl_bits.c:1341`) accepts only 16/32/64
+    // bits, so the oracle raises the bare `badarg`:
+    //
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<1.0:0/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<0.0:0/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //   $ erl -noshell -eval 'io:format("~p~n",[try <<2.5:0/float>> catch C:E -> {C,E} end]),halt().'
+    //   {error,badarg}
+    //
+    // A `size*unit` fallback to the 64-bit default would instead have built
+    // `<<63,240,0,0,0,0,0,0>>` (for `f0(1.0)`) — a silently WRONG result.
+    let module = load(BSCREATE_BEAM);
+    let mut ctx = MinimalContext::new();
+    for value in [1.0, 0.0, 2.5] {
+        assert_rejects(&module, "f0", float(&mut ctx, value), &mut ctx);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -252,6 +312,9 @@ fn u8_encodes_utf8_scalars() {
 
 #[test]
 fn u8_rejects_non_scalars() {
+    // Every one of these is `{error,badarg}` in the oracle, e.g.
+    // `erl -noshell -eval 'io:format("~p~n",[try <<-1/utf8>> catch C:E -> {C,E} end]),halt().'`
+    // ⇒ `{error,badarg}` (the same for `16#D800`, `16#DFFF` and `16#110000`).
     let module = load(BSCREATE_BEAM);
     let mut ctx = MinimalContext::new();
     for value in [-1, 0xD800, 0xDFFF, 0x110000] {
@@ -300,6 +363,8 @@ fn u16le_encodes_utf16_little_endian() {
 
 #[test]
 fn u16_rejects_non_scalars() {
+    // `<<-1/utf16>>` etc. ⇒ `{error,badarg}` in the oracle, identically for
+    // `16#D800`, `16#DFFF` and `16#110000` (and the `utf16-little` form).
     let module = load(BSCREATE_BEAM);
     let mut ctx = MinimalContext::new();
     for value in [-1, 0xD800, 0xDFFF, 0x110000] {
@@ -331,6 +396,8 @@ fn u32_encodes_utf32_big_endian() {
 
 #[test]
 fn u32_rejects_non_scalars() {
+    // `<<-1/utf32>>` etc. ⇒ `{error,badarg}` in the oracle, identically for
+    // `16#D800`, `16#DFFF` and `16#110000`.
     let module = load(BSCREATE_BEAM);
     let mut ctx = MinimalContext::new();
     for value in [-1, 0xD800, 0xDFFF, 0x110000] {
@@ -348,7 +415,7 @@ fn every_construction_export_is_present() {
     // resolve to an atom in the module (a missing one fails the lookup).
     let module = load(BSCREATE_BEAM);
     for name in [
-        "f16", "f16le", "f32", "f32le", "f64", "f64le", "f8", "u8", "u16", "u16le", "u32",
+        "f0", "f16", "f16le", "f32", "f32le", "f64", "f64le", "f8", "u8", "u16", "u16le", "u32",
     ] {
         let _: Atom = export_atom(&module, name);
     }

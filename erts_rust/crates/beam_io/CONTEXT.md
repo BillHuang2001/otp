@@ -16,7 +16,8 @@ Four things live here:
    (`port_task.rs`), mirroring `erts_port_task_execute`;
 4. the **driver interface + built-in drivers** — a Rust `Driver` trait now, with the frozen C-ABI
    `ErlDrvEntry` bridge as documented future work, plus the built-in `fd` and `efile` byte-stream
-   drivers, the OS-child `spawn` driver, line buffering, and the text⇄binary phase-change protocol.
+   drivers, the OS-child `spawn` driver, the TCP `tcp_inet` socket driver, line buffering, and the
+   text⇄binary phase-change protocol.
 
 Consumed by `beam_rt` (boot/`system_info`/driver registration) and, through port ids, observed by
 `beam_process` (ports are the peer of pids in `ptab`). `beam_rt` **drives its ports through this crate**:
@@ -62,6 +63,14 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `pub fn wake(&self) -> Result<()>` (thread-safe, callable repeatedly and from any thread; the
   woken event carries `key() == WAKER_KEY`).
 - `pub const WAKER_KEY: u64` — the key of a waker event (`u64::MAX`).
+- **Regular-file fallback source (internal, no public signature change).** `mio`/epoll refuses regular
+  files (`EPOLL_CTL_ADD` ⇒ `EPERM`), so `Poller::register` keeps a `libc::poll(2)`-backed fallback set:
+  a descriptor `mio` rejects as unsupported (`EPERM`/`EINVAL`, i.e. a regular file) is watched with
+  `poll(2)` and its readiness is **merged** into `Poller::poll` in the same `Event`/`Ready` shape (a
+  regular file ⇒ readable on `POLLIN`, writable on `POLLOUT`). `reregister`/`deregister`/`registration`/
+  `len`/`is_empty` treat both sources uniformly; any other `mio` error (`EEXIST`/`ENOENT`/`EBADF`/…) is
+  still reported as `BeamError::Io`. `Poller::poll` never blocks indefinitely while the fallback set is
+  non-empty (private `FALLBACK_POLL_CAP`, 1 ms; zero wait when the fallback probe already fired).
 ### `timer.rs`
 - `pub struct Timeout` (`Copy`) — a single deadline: `infinite()`, `after(Duration)`, `at(Instant)`,
   `poll_timeout() -> Option<Duration>`, `is_expired() -> bool`.
@@ -80,8 +89,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `reductions()`, `is_ready_at(Instant) -> bool`.
 - `pub struct PortTaskQueue` — one pending task per kind (dedupe), ordered by kind priority then FIFO
   `seq`, with deadline gating for timeouts: `new()`, `enqueue(kind) -> bool`, `enqueue_timeout(deadline) -> bool`,
-  `len()`, `is_empty()`, `contains(kind)`, `next() -> Option<PortTaskKind>`, `pop_next(now) -> Option<PortTask>`,
-  `remove(kind) -> bool`, `clear()`.
+  `arm_timeout(deadline)` (re-points/replaces a pending `TIMEOUT` — distinct from the dedupe-by-kind
+  `enqueue_timeout`, which cannot re-point), `len()`, `is_empty()`, `contains(kind)`,
+  `next() -> Option<PortTaskKind>`, `pop_next(now) -> Option<PortTask>`, `remove(kind) -> bool`, `clear()`.
 - `pub struct Readiness { readable, writable, error, read_closed, write_closed }` (`Copy + Default + Eq + Debug`),
   with `read_ready()` (readable ‖ read_closed ‖ error), `write_ready()` (writable ‖ write_closed), `is_idle()`,
   and `impl From<Ready> for Readiness`.
@@ -101,10 +111,18 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   `id()`, `state()`, `driver_name()`, `input_len()`, `read_input(&mut [u8]) -> usize`, `drain_input() -> Vec<u8>`,
   `output_len()`, `open(&mut Poller)`, `output(&mut Poller, &[u8]) -> Result<usize>`, `ready_input(&mut Poller)`,
   `ready_output(&mut Poller) -> Result<usize>`, `control(&mut Poller, command, arg) -> Result<Vec<u8>>`,
-  `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver), and the
+  `close(&mut Poller)`, `take_exit_status() -> Result<Option<i32>>` (forwards to the driver),
+  `notify_exit(&mut Poller, PortExitReason) -> Result<()>` (the once-only port-exit notification), and the
   scheduling surface `queue_output(&[u8])`, `schedule_task(PortTaskKind) -> bool`,
-  `schedule_timeout(Instant) -> bool`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
+  `schedule_timeout(Instant) -> bool`, `arm_timeout(Instant)`, `cancel_timeout() -> bool`,
+  `next_timeout() -> Option<Instant>`, `pending_tasks() -> usize`, `next_task() -> Option<PortTaskKind>`,
   `has_pending_task(PortTaskKind) -> bool`, `timeout(&mut Poller) -> Result<()>`.
+  Each driver interaction (`start`/`output`/`ready_input`/`ready_output`/`control`/`timeout`) refreshes the
+  port timer from `Driver::next_timeout` through the internal `refresh_timeout`: `Some(d)` arms/**re-points** the
+  single `TIMEOUT` task at `d`, `None` clears it (a driver's declaration is authoritative until its next interaction).
+  `port.rs` also re-exports `PortRegistry` (`pub use crate::registry::PortRegistry`) so the existing
+  `crate::port::PortRegistry` paths keep resolving.
+### `registry.rs`
 - `pub struct PortRegistry` — id allocation (inner `beam_process::PortTable`) + `HashMap<u64, Port>` keyed by
   port number: `new()`, `open(poller, Box<dyn Driver>) -> Result<PortId>`,
   `open_named(poller, &DriverRegistry, name) -> Result<PortId>`, `get(id)`, `get_mut(id)`,
@@ -125,8 +143,16 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   - `take_exit_status(id) -> Result<Option<i32>>` — the exit-status seam: takes the reaped status of the OS
     child behind `id` **once** (`Ok(None)` for an unknown id's driver with no child, a child that has not
     exited, or a status already reported; `BeamError::BadArg` for an unknown id).
+  - `schedule_timeout(id, deadline) -> Result<()>` / `cancel_timeout(id) -> Result<bool>` /
+    `next_deadline() -> Option<Instant>` — the runtime's explicit port-timer entry points (`next_deadline` is the
+    minimum over live drivers' `Driver::next_timeout`, for clamping a poll timeout); `BadArg` for an unknown id.
+  - `notify_port_exit(poller, id, reason: PortExitReason) -> Result<()>` — the port-exit notification channel:
+    invokes the driver's `Driver::port_exit` **at most once** per port (a repeat is a no-op), leaves the port live
+    with its registrations armed, and is independent of the later `close`/`stop`; `BadArg` for an unknown/released id.
 ### `driver.rs`
 - `pub struct DriverFlags(u32)` — `Copy + Eq`; `empty()`; const `SOFT_BUSY`; `contains(DriverFlags)`.
+- `pub enum PortExitReason { Closed, OwnerExited, Normal }` (`Copy + Eq + Debug`) — the vocabulary of the
+  port-exit notification channel (see the defaulted `Driver::port_exit` and `PortRegistry::notify_port_exit`).
 - `pub struct DriverContext<'a>` — the driver's view of its port; **the only way a driver touches the poller
   or the queues**: `port() -> PortId`, `register(fd, interest) -> Result<Token>`,
   `reregister(fd, token, interest) -> Result<()>`, `deregister(fd, token) -> Result<()>`,
@@ -135,11 +161,14 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub trait Driver` — `name() -> &str` (+ `flags()` default `empty()`); required `start(ctx)`,
   `output(ctx) -> Result<usize>`, `ready_input(ctx)`, `stop(ctx)`; defaulted `ready_output(ctx)` (= `output`),
   `control(ctx, command: &str, arg: &[u8]) -> Result<Vec<u8>>` (= `Ok(vec![])`), `timeout(ctx)` (= `Ok(())`),
-  and `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by
-  `SpawnDriver`).
+  `next_timeout() -> Option<Instant>` (= `None`; the driver's **declaration** of the next deadline it wants
+  `Driver::timeout` at — mirrored into the port's `TIMEOUT` task after each interaction, deadline-gated so it
+  never fires early), `port_exit(ctx, PortExitReason) -> Result<()>` (= `Ok(())`; the once-only, advisory
+  port-exit notification, distinct from the teardown `stop`), and
+  `take_exit_status() -> Result<Option<i32>>` (= `Ok(None)`; the exit-status seam, overridden only by `SpawnDriver`).
 - `pub type DriverFactory = fn() -> Result<Box<dyn Driver>>`.
 - `pub struct DriverRegistry` — name→factory (the `driver_tab.c` seam): `new()`, `with_builtins()`
-  (**registers both `"fd"` and `"efile"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
+  (**registers `"fd"`, `"efile"` and `"tcp_inet"`**), `register(name, factory) -> bool`, `create(name) -> Result<Box<dyn Driver>>`,
   `contains(name)`, `names() -> Vec<&str>` (sorted).
 ### `drivers/fd.rs`
 - `pub struct FdDriver` — the built-in `"fd"` byte-stream driver, **owns** its fds (closed on `stop`/`Drop`):
@@ -150,7 +179,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   Implements `Driver`: registers the read fd `READABLE` on `start`; `output`/`ready_output` drain `ctx.output()`
   to the write fd (`libc::write`, `EAGAIN` ⇒ keep queued + arm `WRITABLE`); `ready_input` reads into
   `ctx.input()` (`libc::read`, loops to `EAGAIN`, latches `read_eof` on `read(2)==0`, flushes a pending
-  partial line at EOF). `control` verbs: `line [decimal(N) | "line,<N>"]`, `noline`, `binary`, `text`,
+  partial line at EOF, then **de-registers the read fd** (`disarm_input`) so an exhausted — level-triggered
+  fallback — regular file stops producing events; the fd stays attached/owned, so a post-EOF `ready_input`
+  is still `Ok`). `control` verbs: `line [decimal(N) | "line,<N>"]`, `noline`, `binary`, `text`,
   `getopts` (reply `b"line,<N>"` / `b"binary"`); unknown ⇒ `BeamError::BadArg`.
 ### `drivers/line_buffer.rs`
 - `pub const DEFAULT_MAX_LINE_LEN: usize = 1024`. `pub struct LineBuffer`: `new(max_len)`, `max_len()`,
@@ -167,6 +198,8 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub struct EfileDriver` (`name() == "efile"`) — delegates byte movement to a composed `FdDriver`:
   `unopened()`, `read_only(fd)`, `write_only(fd)`, `connected(read, write)`, `path() -> Option<&[u8]>`, `eof()`;
   `control` verbs `open <path>` / `close` / `path` / `eof` plus the delegated `line`/`noline`/`binary`/`text`/`getopts`.
+  `open` works on **regular files** (served by the poller's `poll(2)` fallback) as well as on the descriptors
+  epoll accepts (pipes/FIFOs/char devices/sockets); `write_only`/`connected` write regular files too.
   `pub fn make_efile() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered as the built-in `"efile"`).
 ### `drivers/spawn.rs` (the OS-child driver + its term-free spec)
 - `pub enum SpawnStream { Binary, List }` (`Default = List`) with `atom_name(&self) -> &'static str`
@@ -180,9 +213,9 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - `pub struct SpawnOptions { pub stream: SpawnStream, pub cd: Option<String>, pub env: Vec<(String, String)>,
   pub args: Vec<String>, pub exit_status: bool }` (`Default`: `list`, nothing else) — the honored options.
 - `pub fn build_command(spec: &SpawnSpec, options: &SpawnOptions) -> Result<Option<Command>>` — the single place
-  the argv vector, shell-vs-direct, `{cd, …}`/`{env, …}` and the three piped standard streams are set up;
-  `None` for `SpawnSpec::Fd` (nothing is started), `BadArg` for an empty argv. Starts nothing, so it is
-  unit-testable on its own.
+  the argv vector, shell-vs-direct, `{cd, …}`/`{env, …}` and the standard streams (`stdin`/`stdout` piped,
+  `stderr` discarded to `/dev/null`) are set up; `None` for `SpawnSpec::Fd` (nothing is started), `BadArg` for an
+  empty argv. Starts nothing, so it is unit-testable on its own.
 - `pub struct SpawnDriver` (`name() == "spawn"`) — constructed **directly** from a spec/options pair (a
   `DriverFactory` is a no-arg `fn` and cannot carry one, so it is *not* in `DriverRegistry`):
   `new(&SpawnSpec, &SpawnOptions) -> Result<SpawnDriver>` **really spawns** (or adopts the fd) so a failure
@@ -194,8 +227,33 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
   (set `O_NONBLOCK`, `EAGAIN` leaves the remainder queued and arms write readiness, a write failure is a typed
   `BeamError::Io`); `stop` and `Drop` kill + reap the child (an already-exited child is reaped via `try_wait`,
   no kill) and deregister/close every descriptor. Descriptors of a spawned child are owned and closed; an
-  adopted `{fd, N}` descriptor is deregistered but **never** closed (the Erlang side owns it), and stderr is
-  piped but never read.
+  adopted `{fd, N}` descriptor is **duplex** — the single descriptor is registered **once** with `Interest::BOTH`
+  and serves both the read stream and the stream `port_command` writes to — and is deregistered but **never**
+  closed (the Erlang side owns it). The child's **stderr is discarded** (`Stdio::null()`): it is not port data
+  and there is no pipe for it to fill. A failed **direct-exec** spawn (a missing program, `EACCES`, `ENOTDIR`, …)
+  is a `BeamError::Raise` carrying the errno atom (`enoent`/`eacces`/`enotdir`/…), matching the oracle; an
+  unmapped errno falls back to `BeamError::Io` (see `src/error.rs`).
+
+### `drivers/inet/` (`mod.rs` + `wire.rs`) — the TCP `tcp_inet` socket driver floor
+- `pub const DRIVER_NAME: &str = "tcp_inet"` — the name `port_info(Port, name)` reports and `prim_inet` opens;
+  `pub fn make_tcp_inet() -> Result<Box<dyn Driver>>` is its `DriverFactory` (registered by `with_builtins`).
+- `pub struct TcpInetDriver` (`name() == "tcp_inet"`) — a non-blocking TCP socket behind a port; `from_socket(fd)`
+  adopts a descriptor and probes its kernel state (`SO_ACCEPTCONN` ⇒ listening, `getpeername` ⇒ connected, else
+  open), like `inet_ctl_fdopen`; `connect_error() -> Option<i32>` exposes the late `SO_ERROR` outcome of a
+  non-blocking `connect`. `pub enum InetState` is the socket's state (unopened/open/listening/connected).
+- Control verbs (the C `INET_REQ_*`/`TCP_REQ_*` codes) and their reply bytes: `open` ⇒ `[1]`; `bind` ⇒
+  `[1] ++ port_be16`; `listen` ⇒ `[1]`; `accept` ⇒ `[1] ++ fd_be32` (bare `[1]` when nothing is pending,
+  `[0]einval` if not listening); `connect` ⇒ `[1]` (or `[0]exbadport`/`[0]eisconn`/`[0]einval`/`[0]++errno`);
+  `send`/`recv`/`shutdown` ⇒ `[1]` (or `[0]enotconn`); `close` ⇒ `[1]`. Operational failures are
+  `[0] ++ lowercase-errno-name` (`erl_errno_id`); malformed args and unknown verbs ⇒ `BeamError::BadArg`.
+  Packed addresses use `INET_AF_INET`/`ANY`/`LOOPBACK`.
+- Flow control mirrors `FdDriver`: `send(2)` with `MSG_NOSIGNAL`, `EAGAIN` leaves the remainder queued and arms
+  write readiness, a drained queue drops writability and applies a deferred `shutdown`; reads drain to `EAGAIN`
+  and latch EOF; `EINPROGRESS` arms write readiness.
+- **Deferred** (documented in the module): the second-port `accept` (this floor transfers the port and answers
+  `[1] ++ fd_be32` instead of the C's async id), the async-op queue, `driver_set_timer` timeouts,
+  `fdopen`/`sendfile`/`unrecv`/`getopts`/`setopts`/`getstats`/`getfd`/`ignorefd`, `recv`'s timeout/length,
+  IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` delivery modes, and DNS (literal addresses only).
 
 ## Constraints
 - Errors: **`beam_common::{Result, BeamError}` only**; I/O/syscall failures ⇒ `BeamError::Io`,
@@ -214,15 +272,16 @@ Re-exported at the crate root and via `beam_io::prelude::*`.
 - **The `Driver` trait and `DriverContext` public methods are the frozen driver seam** — do not change their
   signatures. New driver capabilities must be additive with defaults that keep the built-in drivers compiling
   unchanged.
-- Files target ~1000 lines, split by responsibility: poller / port / port_task / driver / timer / queue / drivers.
+- Files target ~1000 lines, split by responsibility: poller / port / registry / port_task / driver / timer / queue / drivers.
 - Deps: `beam_common`, `beam_term`, `beam_process`, `libc`, `mio` only. No new deps.
 
 ## Test Strategy
 Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_io`
-**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **148 tests, 0 failures** —
-`118` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
-`drivers/{fd,line_buffer,binary_io,efile,spawn}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` +
-`tests/port_task.rs` `4` + `tests/spawn.rs` `14`.
+**GREEN**, and `... build --workspace` **GREEN, warning-free**. Current: **189 tests, 0 failures** (1 ignored
+doc-test) — `145` lib (`#[cfg(test)]` in-module: poller, timer, queue, driver, port, port_task,
+`drivers/{fd,line_buffer,binary_io,efile,spawn,inet}`) + `tests/poller.rs` `8` + `tests/port.rs` `4` +
+`tests/port_task.rs` `4` + `tests/spawn.rs` `18` + `tests/inet.rs` `3` + `tests/driver_seams.rs` `5` +
+`2` doctests (the `!Send`/`!Sync` compile-fail pins on `PortRegistry`).
 - `tests/poller.rs` (integration, real OS fds): socketpair readability reports the right `key`; poll-with-no-events;
   blocking poll interrupted by `Waker::wake` (same + other thread); multiple shareable wakers; reregister flips
   direction; deregister stops events; double-register errors.
@@ -240,17 +299,35 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   readiness (observed through `Poller::len`); the reaped `exit_status` taken once through
   `PortRegistry::take_exit_status`; a port without the option never reporting one; an unknown id answering `BadArg`;
   `stop` killing **and** reaping a long-lived child (evidence via `/proc/<pid>` disappearing, guarded on procfs
-  being present); the `{fd, N}` form reading an adopted `pipe(2)` end with no child and leaving the descriptor open;
-  a failed spawn being a constructor error that registers nothing; `{cd, …}`/`{env, …}` reaching the child.
+  being present); the `{fd, N}` form reading an adopted `pipe(2)` end with no child and leaving the descriptor open
+  plus the **bidirectional** `{fd, N}` cases (write bytes into an adopted `pipe(2)` write end and read them from the
+  peer; one adopted `UnixStream::pair()` end carrying both directions); a child flooding 200 KiB to **stderr** still
+  delivering its stdout (stderr is discarded, so it can never block); a failed spawn being a constructor error that
+  registers nothing; an `erl` oracle cross-check of the failed-spawn reason atom (`enoent`/`eacces`/`enotdir`); and
+  `{cd, …}`/`{env, …}` reaching the child.
+- `tests/inet.rs` (integration, real loopback TCP): the `tcp_inet` port resolved through `DriverRegistry` round-trips
+  bytes both ways; a stalled write arms write readiness (a forged write-ready event schedules an OUTPUT task and
+  `execute_port_tasks` runs it); unknown verb ⇒ `BadArg`; and an `erl` (OTP 29.1.1 / erts-17.1) **oracle cross-check**
+  of the `INET_REQ_OPEN`/`BIND`/`LISTEN`/`TCP_REQ_SHUTDOWN`/`RECV`/`CLOSE` reply bytes (skips loudly without `erl`).
+- `tests/driver_seams.rs` (integration, real `PortRegistry`): a driver-declared deadline (`Driver::next_timeout`) is
+  armed and its `Driver::timeout` fires exactly once after it, never before; a `control` re-arms/clears the port
+  timer; `PortRegistry::{schedule_timeout,cancel_timeout}` (incl. re-pointing); `notify_port_exit` reaching the
+  driver once with the right `PortExitReason` and a later `close` still running `stop`.
 - In-module unit tests cover: `ByteQueue`; `Interest`/`Ready`/`Event`; `Poller` register/deregister + `WAKER_KEY` +
-  wakers; `Timeout`/`Timer`; `DriverRegistry` (both built-ins, dup rejection, missing-name `BadArg`); `PortState`
-  transitions; `PortRegistry` alloc/close/reuse + unknown-id `BadArg`; `FdDriver` (pipe round-trip, EOF, error
-  paths, `stop` deregistration, fd closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and
-  control; port-task ordering/reductions/dedupe; the failed-`start` teardown (`FailingStartDriver` double);
-  `SpawnDriver`/`build_command` (the four name forms, `{cd, …}`/`{env, …}` on the built `Command`, empty argv
-  `BadArg`, negative fd `BadArg`, the unknown-program constructor error, accessors, the real read path driven
-  through a hand-built `DriverContext` — bytes, latched EOF and the EOF deregistration — the once-only
-  `exit_status`, the `128 + signal` convention, and idempotent kill/reap).
+  wakers + the **regular-file fallback** (register/readiness + `poll(None)` promptness, the mio+fallback merge,
+  fallback `reregister`, independent fallback entries); `Timeout`/`Timer`; `DriverRegistry` (all three built-ins,
+  dup rejection, missing-name `BadArg`); `PortState` transitions; `PortRegistry` alloc/close/reuse + unknown-id
+  `BadArg`; `FdDriver` (pipe round-trip, EOF + the EOF de-registration, error paths, `stop` deregistration, fd
+  closing on `Drop`+`stop`); `LineBuffer`/`PhaseChange`/`EfileDriver` framing and control + a regular-file
+  open→read-to-EOF→close and a regular-file write; port-task ordering/reductions/dedupe + timer re-pointing
+  (`arm_timeout`); the two new driver-seam defaults (`Driver::next_timeout` → `None`, `Driver::port_exit` → `Ok`)
+  and the `PortExitReason` vocabulary; the errno→atom mapping (`error::errno_atom`/`spawn_failure`); the `tcp_inet`
+  verb/reply-shape helpers (packed-address decoding, `errno_name`, `from_socket` state, the full loopback round
+  trip); the failed-`start` teardown (`FailingStartDriver` double); `SpawnDriver`/`build_command` (the four name
+  forms, `{cd, …}`/`{env, …}` on the built `Command`, empty argv `BadArg`, negative fd `BadArg`, the
+  unknown-program constructor error, accessors, the real read path driven through a hand-built `DriverContext` —
+  bytes, latched EOF and the EOF deregistration — the once-only `exit_status`, the `128 + signal` convention, and
+  idempotent kill/reap).
 
 ## Design Decisions
 - **Backend: `mio` (lib) vs raw epoll.** `mio` gives a portable, safe `Poll`/`Registry`/`Waker` and a correct
@@ -308,10 +385,34 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
   no-arg `fn`, so it cannot carry the command/argv/options a spawn port needs; the driver is therefore built
   directly from a `SpawnSpec` (its `Driver::name()` stays `"spawn"` for `port_info` reporting). The child is
   started in the **constructor** so a failed spawn is a constructor error that leaves nothing registered and the
-  runtime can read `os_pid()` before `PortRegistry::open`. `{fd, N}` adopts the descriptor as the **read** fd and
-  never closes it (the Erlang side owns it, matching the reference runtime's `LivePort::close`), and writing to
-  such a port is a typed `BadArg`. `stop`/`Drop` kill **and** reap, and `Drop` reaps too because Rust's `Child`
-  does not: dropping it otherwise leaks a zombie.
+  runtime can read `os_pid()` before `PortRegistry::open`. `{fd, N}` adopts one descriptor as a **duplex** stream
+  (one `Interest::BOTH` registration; `arm_output`/`disarm_output`/`release_stdout` are no-ops for it) and never
+  closes it (the Erlang side owns it, matching the reference runtime's `LivePort::close`). `stop`/`Drop` kill
+  **and** reap, and `Drop` reaps too because Rust's `Child` does not: dropping it otherwise leaks a zombie.
+- **Regular files ride a `poll(2)` fallback inside the poller.** `epoll` cannot watch a regular file, so `Poller`
+  keeps a second, `libc::poll(2)`-based registration set for descriptors `mio` rejects and merges its readiness
+  into `Poller::poll` — reproducing the reference runtime's `poll(2)` readiness path ("a regular file is trivially
+  always ready", `erts/emulator/sys/common/erl_poll.c`) without changing the public `Poller`/`Port` API or adding a
+  dependency, and without giving up the edge-triggered `mio` model for the descriptors it serves. Because the
+  fallback is level-triggered, `FdDriver` de-registers a read fd at EOF.
+- **A failed spawn raises the errno atom.** The reference raises `erl_errno_id(errno)` from
+  `erts_internal_open_port_2` (`erts/emulator/beam/erl_bif_port.c`), so a direct-exec spawn failure is returned as a
+  `BeamError::Raise` carrying the errno's lowercase name (`enoent`/`eacces`/`enotdir`/…) rather than `BeamError::Io`,
+  which stays the fallback for an unmapped errno.
+- **The child's stderr is discarded, not piped.** A piped-but-undrained stderr deadlocks a child that writes more
+  than the pipe capacity; a child's stderr is not port data (the oracle does not deliver it either), so
+  `build_command` sends it to `/dev/null` (`Stdio::null()`). `SpawnSpec`/`SpawnOptions` are unchanged (the runtime
+  cannot pass a `stderr_to_stdout` option through them today).
+- **The timer seam is driver-declared and mirrored; the port-exit channel is advisory and once-only.** A driver
+  declares the next deadline it wants via `Driver::next_timeout`, which `Port` mirrors into its single `TIMEOUT` task
+  after each interaction (deadline-gated, so it never fires early); `PortRegistry::{schedule_timeout,cancel_timeout}`
+  are the runtime's explicit override. `Driver::port_exit` (via `PortRegistry::notify_port_exit`) is a once-only,
+  advisory notification distinct from the teardown `stop`, so a driver can react to its port exiting without owning
+  the lifecycle. Both are additive trait methods with defaults, so every existing driver compiles unchanged.
+- **The TCP driver is a floor, not a full `inet`.** `tcp_inet` covers the core
+  `open`/`bind`/`listen`/`accept`/`connect`/`send`/`recv`/`shutdown`/`close` verbs with the C's reply encodings; the
+  async-op queue, per-op timeouts, the second-port `accept`, IPv6/UDP/SCTP/Unix-domain, `{active,…}` modes and DNS
+  are deferred (see the module docs).
 
 ## Known Issues
 - **Single-OS-thread only.** No dedicated poll threads, no `ThreadProgress`/generation handoff, no
@@ -330,53 +431,60 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - **`SpawnDriver` is the OS-child floor, not the whole `spawn` driver.** Decoding the `open_port/2` terms into a
   [`SpawnSpec`](src/drivers/spawn.rs)/`SpawnOptions` (and synthesizing `{Port, {data, …}}`,
   `{Port, {exit_status, …}}` and a `{Port, eof}` message from them) stays the runtime's job — this crate only
-  moves the bytes and kills/reaps the child. The child's stderr is piped (so it never inherits the emulator's own
-  output) but **never read**; the driver signals EOF only by latching its own state (`eof()`), it does not report
-  an event. Writing to a child that closed its stdin fails with a typed `BeamError::Io` (the queued remainder is
-  kept, never silently discarded), and `{fd, N}` is a **read-only** adoption — writing to it is `BadArg`, so a
-  descriptor port is not yet a bidirectional stream. Adopting a descriptor also requires it to be switchable to
+  moves the bytes and kills/reaps the child. The child's stderr is discarded (`Stdio::null()`); the driver signals
+  EOF only by latching its own state (`eof()`), it does not report an event. Writing to a child that closed its
+  stdin fails with a typed `BeamError::Io` (the queued remainder is kept, never silently discarded), and `{fd, N}`
+  is a **duplex** adoption — one descriptor behind one `Interest::BOTH` registration, read and written by the port
+  (end-to-end `port_command` to a `{fd, N}` port is still intercepted as `unsupported` in `beam_rt`, a handoff).
+  Adopting a descriptor also requires it to be switchable to
   non-blocking (`F_SETFL` + `O_NONBLOCK`); a descriptor that refuses that (some inherited descriptors return
   `EPERM`) fails the open with `BeamError::Io`, because the reactor is edge-triggered and cannot serve a blocking
   descriptor. Input is not line-framed (there is no `line` control verb):
   the `binary`/`list` choice rides on `SpawnStream` for the runtime to apply.
-- **`EfileDriver` cannot open a regular file.** `mio`/epoll rejects `EPOLL_CTL_ADD` on regular files (`EPERM`), so
-  `control("open", path)` fails with `BeamError::Io` for them; it works for the descriptors epoll supports
-  (pipes/FIFOs/char devices/sockets). A real `efile`/`inet` needs a non-epoll readiness source (a dedicated
-  poll/thread pool, or `io_uring`) — this drops in behind `EfileDriver`'s interface.
-- **`DriverContext` seam gaps for future drivers.** An `efile`/`inet` driver needing timer deadlines or port-exit
-  notifications has no seam: `Driver::timeout` exists but nothing schedules it (`schedule_timeout` is only on
-  `Port`), and there is no port-exit notification channel to the driver.
 - **`port_control`/control atoms are not decoded here.** `port_control(op, &[u8])` takes a `&str` op + raw bytes;
   the C decodes Erlang tuples in `io.c` — atom/tuple decoding of `{command, …}`/`{connect, …}` is the runtime's job.
 - **`mio` fd registration is `os-ext`/Unix-only** (`mio::unix::SourceFd`); Windows/iocp is out of scope (as in
   `beam_abi`).
-- **`src/port.rs` is ~1430 lines, ~590 of which are its in-module test suite** (source ≈ 845 lines, under the
-  ~1000 baseline). A future split by responsibility (move `PortRegistry` + reactor glue to `registry.rs`, keeping
-  `Port` in `port.rs`) is reasonable; the file is long only because the tests are comprehensive in-place.
-- **`src/drivers/spawn.rs` is 996 lines, ~275 of which are its in-module test suite** (source ≈ 720 lines, still
-  under the ~1000 baseline). It holds the whole OS-child driver plus the term-free spec/`build_command`; if it
-  grows, split the spec (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/`build_command`) into a sibling module and keep
-  the driver in `spawn.rs`.
+- **Residual `open_port` divergences.** `open_port({spawn_executable, "/etc"}, [])` (a **directory**) opens a port
+  in the oracle (`ok`) but this crate's synchronous `Command::spawn` reports `eacces`; and
+  `open_port({spawn, ""}, [])` / `{spawn_executable, ""}` is `badarg` in the oracle (the runtime's name validation)
+  while the driver would map an empty name to `enoent`. Both are handoffs (an `access(X_OK)` precheck / `beam_rt`
+  name decoding), not yet closed.
+- **The `tcp_inet` driver is a floor.** The async-op queue, per-op `driver_set_timer` timeouts, the second-port
+  `accept`, IPv6/UDP/SCTP/Unix-domain sockets, `{active,…}` modes and DNS are absent; `recv` rejects a timeout/length
+  argument with `BadArg`. The verbs it does cover match the C's reply shapes (oracle-cross-checked).
+- **File sizes (source vs. in-module tests).** `src/port.rs` is 610 lines of source (the `Port` endpoint + its
+  `PortRegistry` re-export; no in-module tests) and `src/registry.rs` is 1080 (≈490 source + ≈590 tests) — both
+  sources are under the ~1000 baseline. `src/drivers/inet/mod.rs` is ≈991 source with its wire vocabulary in
+  `src/drivers/inet/wire.rs` (182). `src/drivers/spawn.rs` is 1071 (≈793 source + ≈278 tests) — over 1000 only
+  because of its in-module suite; if it grows, split the term-free spec (`SpawnSpec`/`SpawnOptions`/`SpawnStream`/
+  `build_command`) into a sibling module and keep the driver in `spawn.rs`. The `tcp_inet` raw socket-syscall helpers
+  (`socket_fd`/`accept_socket`/`has_peer`/`local_port`/`is_listening`/`socket_error`/`shutdown_socket`/`close_fd`)
+  could move to a third inet sibling if that file grows past baseline.
 
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/poller.rs` → `Poller`, `Token`, `Interest`, `Ready`, `Event`, `Waker` (the `mio`-backed reactor)
 - `src/timer.rs` → `Timeout`, `Timer` (poll-deadline primitives)
 - `src/queue.rs` → `ByteQueue` (the port input/output byte buffers)
-- `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue`, reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome` (the `erts_port_task_execute` model)
-- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `PortRegistry` (port id + queues + task scheduling + driver dispatch)
-- `src/driver.rs` → `Driver` trait (incl. the defaulted `take_exit_status` exit-status seam), `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms` (the driver seam)
-- `src/drivers/fd.rs` → `FdDriver` (the built-in fd/pipe byte-stream driver, incl. line/phase modes + `control`)
+- `src/port_task.rs` → `PortTaskKind`/`PortTask`/`PortTaskQueue` (incl. `arm_timeout`), reduction constants, `Readiness`, `PortNotification`, `PortTaskOutcome` (the `erts_port_task_execute` model)
+- `src/port.rs` → `Port`, `PortState`, `PortControl`, `PortCommandOptions`, `DEFAULT_READINESS_RED_BUDGET` (the port endpoint, its input/output queues, driver dispatch and the driver-timer mirror surface `Port::{arm_timeout,cancel_timeout,next_timeout,notify_exit}`); re-exports `PortRegistry`
+- `src/registry.rs` → `PortRegistry` (port-id allocation over `beam_process::PortTable` + the `HashMap<u64, Port>` of live ports + the reactor glue `handle_events`/`schedule_events`/`execute_port_tasks`/`port_command`/`port_control` + the timer/exit seams `schedule_timeout`/`cancel_timeout`/`next_deadline`/`notify_port_exit`)
+- `src/driver.rs` → `Driver` trait (incl. the defaulted `take_exit_status` exit-status seam, the `next_timeout` driver-declared timer seam and the `port_exit` port-exit notification seam), `PortExitReason`, `DriverContext`, `DriverFlags`, `DriverRegistry`, `pub(crate) PortArms` (the driver seam)
+- `src/drivers/fd.rs` → `FdDriver` (the built-in fd/pipe byte-stream driver, incl. line/phase modes + `control` + EOF de-registration)
 - `src/drivers/line_buffer.rs` → `LineBuffer`, `DEFAULT_MAX_LINE_LEN` (`{line, N}` framing)
 - `src/drivers/binary_io.rs` → `Phase`, `PhaseChange` (the text⇄binary phase-change protocol)
-- `src/drivers/efile.rs` → `EfileDriver`, `make_efile` (the built-in `efile` driver)
-- `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
+- `src/drivers/efile.rs` → `EfileDriver`, `make_efile` (the built-in `efile` driver; serves regular files via the poller fallback)
+- `src/drivers/spawn.rs` → `SpawnDriver` (the OS-child `spawn` driver, incl. the errno-atom failed-spawn raise and the duplex `{fd, N}` form), `SpawnSpec`/`SpawnOptions`/`SpawnStream` + `build_command` (the term-free `open_port/2` name/options model the runtime decodes into)
+- `src/drivers/inet/mod.rs` + `src/drivers/inet/wire.rs` → `TcpInetDriver`/`make_tcp_inet`/`DRIVER_NAME` (`"tcp_inet"`), `InetState` (the driver state machine + socket syscalls) and the `INET_*`/`TCP_SHUT_*`/`INET_REP_*` codes + packed-address helpers + `errno_name` (the wire vocabulary)
 - `src/drivers/mod.rs` → driver-module wiring + re-exports
-- `src/error.rs` → `pub(crate)` error constructors (no new error type)
+- `src/error.rs` → `pub(crate)` error constructors + the errno→BEAM-atom mapping (`errno_atom`) and `spawn_failure` (no new error type)
 - `tests/poller.rs` → registration + readiness on a real OS pipe/socketpair + timeout/waker
 - `tests/port.rs` → `open`→`output`→`poll`→`handle_events`→`read_input` byte round-trip
 - `tests/port_task.rs` → port-task scheduling end-to-end + the receive-wake path (`PortNotification` → `beam_process` scheduler)
-- `tests/spawn.rs` → real child processes end-to-end (stdout→input queue, stdin→output queue, notifications, EOF, a stalled write arming write readiness, once-only exit status, kill+reap, the `{fd, N}` adoption, a failed spawn)
+- `tests/spawn.rs` → real child processes end-to-end (stdout→input queue, stdin→output queue, notifications, EOF, a stalled write arming write readiness, once-only exit status, kill+reap, the duplex `{fd, N}` adoption, a stderr flood, a failed spawn with the errno-atom + an `erl`-oracle reason cross-check)
+- `tests/inet.rs` → the `tcp_inet` driver on real loopback TCP (round-trip, stalled write arming write readiness, unknown-verb `BadArg`, `erl`-oracle reply-byte cross-check)
+- `tests/driver_seams.rs` → the driver-declared timer (`Driver::next_timeout` → `Driver::timeout`) + the once-only `PortRegistry::notify_port_exit` seam
 - `../beam_process/src/ptab.rs`, `scheduler.rs`, `process.rs` → `PortTable`/`PortId`, `Scheduler::resume_woken`, `ProcessTable::deliver`/`drain_woken`, `DeliverOutcome` (sibling — read-only)
 - `../beam_rt/src/port.rs` → the reference `open_port/2` term decoding (`RuntimePorts::{name_spec, command_spec, port_options, env_list, arg_list, spawn}`) that `SpawnSpec`/`SpawnOptions`/`build_command` mirror term-free (sibling — read-only)
 - `../beam_abi/CONTEXT.md` → the frozen `ErlDrvEntry`/`ErlDrvApi` driver C ABI to bridge later (sibling — read-only)
@@ -405,6 +513,9 @@ Per the crate-layer gate: `erts_rust/scripts/cargo.sh test --manifest-path erts_
 - `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §A (the two clean seams) and §H (Stage 5).
 - `../beam_abi/CONTEXT.md` → the `ErlDrvEntry`/`ErlDrvApi` layouts the C-ABI bridge will target.
 - `../beam_process/CONTEXT.md` → `PortTable`/`PortId`, `Scheduler`/`ProcessTable` and the scheduler that will drive ports.
-- Owed upstream (repo-root owned, outside this node): a `../../CHANGE.md` entry for the port-task model +
-  `PortNotification` seam + `port_command`/`port_control` surface, the line/phase/`efile` driver additions, and the
-  `DriverRegistry` `"efile"` registration.
+- Owed upstream (repo-root owned, outside this node): `../../CHANGE.md` entries for the port-task model +
+  `PortNotification` seam + `port_command`/`port_control` surface; the line/phase/`efile` driver additions and the
+  `DriverRegistry` `"efile"` registration; the poller `libc::poll(2)` regular-file fallback + the `FdDriver` EOF
+  de-registration; the errno→atom failed-spawn raise (`error::errno_atom`/`spawn_failure`); the child-stderr discard
+  and the duplex `{fd, N}` adoption; the two new defaulted driver seams (`Driver::next_timeout` /
+  `Driver::port_exit` + `PortExitReason`); and the `"tcp_inet"` driver registration.

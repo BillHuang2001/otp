@@ -68,6 +68,10 @@ assume a different layout.**
 - `AtomTable::seed_from_atom_names(&mut self, src: &str) -> TermResult<()>` — parse the `atom.names`
   grammar (`atom` <name>+ ; names are bare, `'quoted'`, or `CName='printname'`; `#` comments) and
   intern in file order. `from_atom_names(src) -> TermResult<AtomTable>` convenience.
+- `AtomTable::hvalue(&self, a: Atom) -> u32` — the C `atom_tab(a)->slot.bucket.hvalue`: the
+  Dragon-Book `hashpjw` over the atom's UTF-8 name bytes with the latin1 clutch (`atom.c:82`
+  `atom_hash`). This is the value `make_hash`/`make_hash2` mix for an atom; an out-of-range index
+  falls back to `a.raw()` (documented, panic-free).
 - Note: generating the standard `am_*`-equivalent `Atom` constants from the full `atom.names` is a
   codegen/boot step (routed to `beam_rt`); this crate owns only the mechanism + parser.
 
@@ -87,6 +91,9 @@ assume a different layout.**
 - Sub-type predicates: `is_map`/`is_map_header`/`is_flatmap`/`is_hashmap`, `is_float`, `is_big`,
   `is_internal_ref`, `is_any_fun`, `is_record`, `is_bitstring`/`is_binary`,
   `is_external_pid`/`is_external_port`/`is_external_ref`.
+- `unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32]` — the internal reference's `num[]`
+  (`erl_term.h` `internal_ref_numbers`); consumed by `make_hash`/`make_hash2`. Caller invariant: `t`
+  is a live internal ref.
 - Map header field accessors: `MAP_HEADER_TYPE/ARITY/VAL(Hdr)` (per `erl_term.h`).
 
 ### `tuple.rs` — tuples
@@ -138,12 +145,59 @@ operators) and `<`/`>` between same-typed terms.
   former crate-private helper was removed).
 - The bit/float payload helpers live in [`bitstring.rs`](#bitstringrs--bit-level-payloads); this
   module forwards to them so each layout has a single definition.
-### `hashing.rs` — structural term hashing
-- `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash
-  reproducing the *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
-  **The exact hash values are internal and NOT part of any compatibility contract** (nothing
-  outside the Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+### `hashing/` — hashing: the compatibility-pinned `phash2`/`phash` + the internal structural hash
+Split by responsibility: `mod.rs` (module docs + the internal structural hash `term_hash` + its tests),
+`common.rs` (the low-level primitives shared by both ERTS ports: `HCONST*`/`FN*`, `mix32`/`mix3`,
+`uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`,
+the work-stack item types — all `pub(super)`), `make_hash2.rs` (the `make_hash2` port +
+`compute_record_definition_hash`), and `make_hash.rs` (the `make_hash` port + `hash_binary_bytes`).
+Two distinct surfaces live here:
 
+- **The pinned contract: `make_hash2`/`make_hash`.** Bit-exact u32-wrapping ports of
+  `../../erts/emulator/beam/erl_term_hashing.c` (`make_hash2_helper`, `make_hash`), i.e. the values
+  `erlang:phash2/1,2` and `erlang:phash/2` return — so, unlike `term_hash`, **these values ARE part of
+  the Level-1 drop-in contract** and are cross-checked against the live oracle.
+  - `pub fn make_hash2(t: Eterm, atoms: &AtomTable) -> TermResult<u32>` (`erl_term_hashing.c:1597-1601`).
+    The `hash == 0` entry fast paths are applied (`atom ⇒ hvalue`, `small ⇒ SINT32_HASH`/`NOT_SSMALL28_HASH`,
+    `nil ⇒ 3468870702`), then the body runs with an empty work stack. Covers smalls, atoms, nil, tuples,
+    byte-batched lists, flat maps and HAMT maps (xor pair protocol), bitstrings (byte-aligned ⇒
+    `block_hash(bytes, HCONST_13 + hash)`; non-byte-aligned ⇒ bit-copy into a flat buffer; a trailing
+    partial byte ⇒ `UINT32_HASH_2(bitsize, last >> (8-bitsize), HCONST_15)`), floats (`±0.0` normalized
+    to `+0.0`), ± bignums, internal/external refs, external pid/port, and funs.
+  - `pub fn make_hash(t: Eterm, atoms: &AtomTable) -> TermResult<u32>` (`erl_term_hashing.c:165-425`).
+    `erlang:phash(T, R)` is `1 + (make_hash(T) % R)` for `R < 2^32` and `make_hash(T) + 1` for `R = 2^32`
+    (`bif.c:5413-5452`).
+  - `pub fn compute_record_definition_hash(def: Eterm, atoms: &AtomTable) -> TermResult<u32>` — the
+    synthetic record-definition hash (see [`record.rs`](#recordrs) below); named `compute_*` so it does
+    not collide with `record::record_definition_hash` (the header *reader*) under `lib.rs`'s glob re-exports.
+  - **Fun-kind coverage:** `FunKind::External` (`EXPORT_EXT`) and `FunKind::Imported` (`NEW_FUN_EXT`,
+    which carries the same `module`/`index`/`old_uniq`/env fields as the C's `ErlFunEntry`) both compute
+    the oracle's value. `FunKind::Local` (a `make_fun3` closure) returns the typed
+    `TermError::FunIdentityUnavailable` — its inlined 2-word descriptor `[uniq:u64][index:u32]` carries
+    no module and no `old_uniq`, so the C's `UINT32_HASH_2(num_free, hvalue(module), HCONST)` is not
+    reproducible; a wrong value is never substituted.
+- **The internal structural hash: `term_hash`.**
+  `pub fn term_hash(a: Eterm, atoms: &AtomTable) -> u64` — a deterministic structural hash reproducing the
+  *properties* of `make_hash2` (`erl_term_hashing.c`): equal terms hash equal.
+  **The exact hash values are internal and NOT part of any compatibility contract** (nothing outside the
+  Rust runtime observes them); the only guarantee is `eq(a,b,atoms)` ⇒ equal hashes.
+- `tests/oracle.rs::oracle_agrees_on_make_hash2_and_make_hash` is the live cross-check: one `Spec`
+  description is materialized **both** as a `beam_term` term and as Erlang source text (~90 terms), and
+  the four contract identities above are asserted for every one of them. 25 of the resulting vectors are
+  pinned offline in `hashing::make_hash::tests::make_hash2_and_make_hash_pin_the_oracle_vectors`, so the
+  contract still has teeth without `erl` on `PATH`. `hashing::common::tests::block_hash_matches_the_jk_reference_shape`
+  pins `block_hash` (including the C's unconditional `ctx->c += full_length`); the atom fast path is
+  pinned by `make_hash2(atom) == AtomTable::hvalue(atom)`.
+
+### `ihash.rs` — the bit-exact `erts_map_hash`
+The **erlang map hash** (`erl_term_hashing.c:1955-2130`, `IHASH_*`/`make_internal_hash`):
+`erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers
+`swizzle_map_hash` (a nibble reversal of the 64-bit hash) and `hashmap_nibble` (the level-`L`
+least-significant nibble). This is what [`map.rs`](#maprs--flat-map--hamtchamp-builder-lookups-structural-size)
+places leaves with, so a `write_map`-built hash map's stored pair order equals the oracle's
+`maps:to_list/1` order (`tests/map_hash.rs`). Classes whose C hash is pointer-derived (external
+pid/port/ref, external/local fun, internal ref) use a documented deterministic substitute; the C hash is
+itself documented non-portable across VM instances.
 ### `size.rs` — object word size
 - `pub fn size_object(a: Eterm) -> usize` — the *flat* number of heap words the term graph
   occupies, reproducing `size_object_x(obj, NULL)` (`copy.c`): `0` for immediates, `2` per cons
@@ -230,15 +284,18 @@ for ≤ [`MAP_SMALL_MAP_LIMIT`] pairs, else a **hash map** — a 16-way (`4` has
 `beam_gc::copy::move_size` sizes): head-array `[hdr][size][16 slots]` (18 words), head-bitmap
 `[hdr(bmp)][size][n slots]` (`2+n`), inner bitmap `[hdr(bmp)][n slots]` (`1+n`), collision node = a
 `make_arityval(n)` tuple of `n` key/value cons cells. One **term per slot**: a leaf cons cell, a
-pointer to a sub-node, or a collision tuple. Level `L` selects `nibble(hash, L) = (hash >> (4*(15-L)))
-& 0xF` (MSB nibble indexes the root).
+pointer to a sub-node, or a collision tuple. Level `L` selects the **`L`-th least-significant**
+nibble of the key's [`ihash::erts_map_hash`] — `hashmap_nibble(hash, L)` (the C's `maskval` applied
+to the swizzled hash), so level `0` (the root) is the LSB nibble.
 - `pub const MAP_SMALL_MAP_LIMIT: usize = 32;` (`erl_map.h:96`); `pub const HAMT_MAX_LEVEL: usize = 16;`
 - `pub const fn make_map_header(map_type, arity, val) -> Eterm` (`MAKE_MAP_HEADER`);
   `pub const fn map_words_capacity(n_pairs) -> usize` (exact for a flat map, sound upper bound for a
   hash map).
 - `unsafe write_map(hp, pairs: &[(Eterm,Eterm)], atoms) -> TermResult<Eterm>` — dedups (last value
-  wins), canonical order, flat map when ≤ limit else a hash map; leaves + trie are laid out in
-  canonical (hash-then-`cmp`) order so the buffer is insertion-order free.
+  wins), flat map when ≤ limit else a hash map keyed by [`ihash::erts_map_hash`]; leaves are laid out
+  ascending by `swizzle_map_hash(hash)` (the C's `hxnodecmp` order, a nibble reversal of the hash)
+  with equal-hash runs broken by `cmp` on the key, so the trie stores its pairs in the oracle's
+  `maps:to_list/1` order and the buffer is insertion-order free.
 - `map_size(t, atoms) -> TermResult<usize>`, `map_get(t, key, atoms) -> TermResult<Option<Eterm>>`,
   `map_pairs(t, atoms) -> TermResult<Vec<(Eterm,Eterm)>>` (sorted by [`compare::cmp`]),
   `map_pairs_storage_order(t) -> TermResult<Vec<(Eterm,Eterm)>>` (the map's *stored* pair order —
@@ -278,8 +335,9 @@ bits 16..23 `num_free`, bit 24 `FUN_HEADER_KIND_OFFS` (C external), bit 25
 - `boxed.rs` provides header-word predicates `is_external_fun`/`is_imported_fun`/`is_local_fun`.
 - `size.rs` sizes a fun as `1 + desc_words + num_free`; `compare.rs` orders funs structurally
   (`Local` by `(uniq,index)` then `num_free` then env; `External` by `(module,function,arity)`;
-  `Imported` by `(module,index,old_uniq)` then `num_free` then env); `hashing.rs` hashes exactly the
-  fields `compare` compares — funs are hashed structurally, not an opaque fallback.
+  `Imported` by `(module,index,old_uniq)` then `num_free` then env); the `hashing/` module's
+  structural `term_hash` hashes exactly the fields `compare` compares — funs are hashed structurally,
+  not an opaque fallback.
 
 ### `record.rs` — native records (`ErtsRecordDefinition`/`ErtsRecordInstance`)
 The OTP 29 native-record term interior, owned here (the frozen-layout LCA) like [`fun.rs`]/[`refc.rs`].
@@ -323,6 +381,13 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `big_to_f64` or `±f64::INFINITY` when unrepresentable, non-number → `NaN`. Used by
   [`compare::cmp_arith`].
 
+### `error.rs` — crate error types
+- `pub enum TermError` / `pub type TermResult<T>` — this crate's error types, reconciled into
+  `beam_common::BeamError` by an owned `From` impl.
+- `TermError::FunIdentityUnavailable` — `make_hash`/`make_hash2` return this for a `make_fun3`
+  `Local` fun, whose inlined descriptor carries no `module`/`old_uniq` (a documented capability gap).
+  Maps to `BeamError::BadArg` (never a wrong hash value).
+
 ## Constraints
 - **Bit-exact layout (Level-1 drop-in).** Every constant, mask, shift and encoding must match
   `../../erts/emulator/beam/erl_term.h` exactly; a change here breaks the frozen ABI and every crate.
@@ -331,7 +396,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   impl in `error.rs` (owned here so every dependent gets `?`-interop for free); `TermError`/
   `TermResult` remain this crate's error types and must not be redefined per dependent.
 - **`unsafe` confinement:** confined to `heap`, `literal`, `list`, `boxed`, `tuple`, `thing`, `fun`, `map`,
-  `record`, `compare`, `hashing`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
+  `record`, `compare`, `hashing`, `ihash`, `bitstring`, `refc`, `number` (raw pointer deref). Every `unsafe fn` documents a
   `# Safety` section; every `unsafe` block carries a
   `// SAFETY:` rationale. `unsafe_op_in_unsafe_fn` stays clean (workspace lint).
 - **Pure tag math is `const fn`** where the body allows (`raw`, `from_raw`, `primary_tag`, tag tests,
@@ -386,8 +451,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   [`bitstring.rs`](#bitstringrs--bit-level-payloads) so the float-layout knowledge has a single
   definition.
 - **The bit/float payload readers live in `bitstring.rs`.** `bitstring_parts`, `bit_at`,
-  `float_bits` and `float_value` are defined once, publicly, in `bitstring.rs`; `compare.rs` and
-  `hashing.rs` forward to them (via `use`) and `thing.rs` re-exports `float_bits`/`float_value`.
+  `float_bits` and `float_value` are defined once, publicly, in `bitstring.rs`; `compare.rs` and the
+  `hashing/` module (`mod.rs`, `make_hash.rs`, `make_hash2.rs`, `common.rs`) forward to them (via `use`)
+  and `thing.rs` re-exports `float_bits`/`float_value`.
   Keeping one definition avoids the `ambiguous_glob_reexports` hazard of two modules exporting the
   same name, and removes the previous `pub(crate)`-only duplication between `compare.rs` and the
   deleted `beam_codec` bitstring shim.
@@ -403,7 +469,9 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - Behavioural tests: atom interning/lookup/name round-trip + `atom.names` parser on an embedded
   snippet (order + `CName='printname'` + quoted names), heap cons/tuple construction + car/cdr +
   exhaustion, literal-graph tagging walk (`set_literal_tag` on a nested tuple/list).
-- `src/compare.rs`, `src/hashing.rs`, `src/size.rs` carry their own in-module `#[cfg(test)]` suites:
+- `src/compare.rs`, `src/hashing/` (the structural-hash suite + the `make_hash2`/`make_hash`
+  oracle-vector suites + `common`'s `block_hash` pin), `src/size.rs` carry their own in-module
+  `#[cfg(test)]` suites:
   ordering across every class pair (number < atom < ref < port < pid < tuple < map < nil < list <
   binary), atom name ordering, tuple/list elementwise + size tie-break, numeric int/float ordering,
   structural-hash equality for equal terms (and inequality for different terms), and `size_object`
@@ -439,8 +507,16 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   binaries, and bignum *observables* (`eq`/`cmp`/`cmp_arith`/`size_object` on multi-limb
   `write_big` terms) vs the oracle's `=:=`/`<`/`>` and `erts_debug:flat_size/1` across the 2- and
   3-limb boundary. Skips loudly (never fails) when `erl` is absent/does not answer.
+- `tests/map_hash.rs` — the crate-local oracle cross-check for the **HAMT pair-storage order**:
+  it pins two verified literal vectors (60 small-int keys `#{K => K*2}`; 40 binary keys
+  `#{<<N>> => N}`) as expected lists, and compares `map_pairs_storage_order` against
+  `maps:to_list/1` under the system `erl` for 33/40/50/64/100-key maps mixing small-integer,
+  binary and atom keys (atom keys are index-parity-safe because the `AtomTable` is seeded from the
+  runtime's own `atom.names`, the source ERTS initializes its atom table from), plus a flat-map
+  observation. Skips loudly when `erl` is absent.
 - Exhaustive cross-checks against the real system ERTS belong to `tools/differential` (the
-  compatibility gate); `tests/oracle.rs` is only the crate-local map/bitstring/bignum smoke slice.
+  compatibility gate); `tests/oracle.rs` is the crate-local map/bitstring/bignum smoke slice and
+  `tests/map_hash.rs` the map-storage-order slice.
 - Iteration commands (read-only `$HOME`): `../../scripts/cargo.sh test -p beam_term` (GREEN),
   `../../scripts/cargo.sh build -p beam_term`. Never `cd`.
 
@@ -448,38 +524,46 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
 - `src/tag.rs` → raw tag constants/masks/shifts, `PrimaryTag`/`BoxedTag`, `primary_tag`, `is_header`
 - `src/eterm.rs` → the `Eterm` word newtype (`raw`/`from_raw`), ABI contract
 - `src/immediate.rs` → small ints, atom immediates, NIL, catch, pid/port immediates
-- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser)
+- `src/atom.rs` → `Atom` index type, `AtomTable` (interning, `atom.names` seeding/parser, `hvalue` = the C `slot.bucket.hvalue` hashpjw used by `make_hash`/`make_hash2`)
 - `src/list.rs` → cons-cell construction/access (`make_list`, `car`, `cdr`, `is_list`)
-- `src/boxed.rs` → boxed pointers, header words, arityval, boxed sub-type predicates, map headers
+- `src/boxed.rs` → boxed pointers, header words, arityval, boxed sub-type predicates, map headers, `internal_ref_numbers`
 - `src/tuple.rs` → tuple construction/size/element access
 - `src/heap.rs` → minimal bump term arena (the representation's allocation interface)
 - `src/literal.rs` → `TAG_LITERAL_PTR` tagging + literal-area graph walk + `LiteralArea`
 - `src/ops.rs` → `TermClass`/`class`, numeric predicates, `THE_NON_VALUE`
 - `src/compare.rs` → Erlang term ordering (`cmp`/`eq`/`cmp_arith`), the `erts_cmp` port + fallbacks
-- `src/hashing.rs` → structural term hashing (`term_hash`), the `make_hash2`-property port (internal)
+- `src/hashing/mod.rs` → module root: docs + the internal structural hash `term_hash` (+ tests); re-exports the public ERTS-hash API
+- `src/hashing/common.rs` → primitives shared by the two ERTS hash ports (`HCONST*`/`FN*`, `mix32`/`mix3`, `uint32_hash*`/`sint32_hash`/`uint32_hash_step`, `le32`, `block_hash`, `bitstring_parts_any`, `base_bits`, work-stack item types; `pub(super)`)
+- `src/hashing/make_hash2.rs` → the **bit-exact** ERTS `make_hash2` (`erlang:phash2/1,2`) + `compute_record_definition_hash` (fetch this value for a native record's `hash` word)
+- `src/hashing/make_hash.rs` → the **bit-exact** ERTS `make_hash` (`erlang:phash/2`) + `hash_binary_bytes`
+- `src/ihash.rs` → the **bit-exact** `erts_map_hash` / `make_internal_hash` port (`erl_term_hashing.c`): `erts_map_hash`/`erts_internal_hash`/`erts_internal_salted_hash`/`ihash_mix64`, plus the map-trie helpers `swizzle_map_hash` (nibble reversal) and `hashmap_nibble` (level-`L` LSB nibble)
 - `src/size.rs` → object word size (`size_object`), the `size_object_x` port
 - `src/thing.rs` → heap-agnostic writers + readers for float/bignum/flatmap/external-pid/port/ref blocks (frozen off-heap layout; the codec forwards here)
 - `src/fun.rs` → the on-heap fun/export layout: `FunKind`/`FunPid`, `make_fun_header`/`fun_kind`/`fun_arity`/`fun_num_free`/`fun_words`/`fun_block_words`, the `write_fun_{local,external,imported}` writers and the `fun_*` accessors (`erl_term.h`/`erl_fun.h`/`external.c` ground truth)
-- `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`/`map_pairs_storage_order`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
+- `src/map.rs` → the Erlang map: flat-map/HAMT (`CHAMP`) builder (`write_map`, keyed by `ihash::erts_map_hash`), `map_size`/`map_get`/`map_put`/`map_remove`/`map_pairs`/`map_pairs_storage_order`, `MAP_SMALL_MAP_LIMIT`, `make_map_header`/`map_words_capacity` (frozen map node layout)
 - `src/record.rs` → native records (`ErtsRecordDefinition`/`ErtsRecordInstance`): size fns, `write_record`, the `record_*` / `record_definition_*` readers (frozen record block; `erl_record.h`/`erl_record.c`)
 - `src/number.rs` → safe numeric → `f64`: `big_to_f64` (faithful `big_to_double`) + `number_as_f64`
 - `src/bitstring.rs` → bit-level payloads: `ErlHeapBits`/`ErlSubBits` writers + readers, `bit_count_to_bytes`/`heap_bits_size_words`, `bitstring_parts`/`bit_at`, the public `float_bits`/`float_value`
 - `src/refc.rs` → off-heap (`refc`) binaries: the `BinRef` + `ErlSubBits` on-heap pair writers/accessors, `ERL_REFC_BITS_SIZE`/`ERL_ONHEAP_*` limits, `is_refc_binary`/`refc_*`
-- `src/error.rs` → local `TermError`/`TermResult` + the `From<TermError> for beam_common::BeamError`
+- `src/error.rs` → local `TermError`/`TermResult` (incl. `FunIdentityUnavailable`, returned by `make_hash`/`make_hash2` for a `make_fun3` `Local` fun) + the `From<TermError> for beam_common::BeamError`
   interop impl (upstream reconciliation so dependents get `?`-interop)
-- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-check `oracle.rs`)
+- `tests/` → crate-level integration tests (bit-pattern pins `layout.rs`, ABI pins `abi.rs`, system-`erl` oracle cross-checks `oracle.rs` and `map_hash.rs`)
 
 ## Handoffs (owned by other nodes — escalate writes to the parent)
 - **`beam_codec` map serialization needs the stored pair order.** `beam_codec` returns a typed
   `unsupported` for >32-key (HAMT) maps because it cannot read the order the map stores its pairs in;
   `map::map_pairs_storage_order` supplies exactly that (flat map ⇒ keys-tuple order, hash map ⇒ HAMT
-  slot traversal order), so a serializer can emit an existing map's image without re-sorting it.
+  slot traversal order), and `write_map` now places those pairs in the oracle's `maps:to_list/1`
+  order (`erts_map_hash`, verified by `tests/map_hash.rs`), so a serializer can emit an existing
+  map's image without re-sorting it and with the oracle's key order.
   Owner: `beam_codec` (outside this node).
 - **Record / number follow-ups for sibling nodes.** `beam_bifs` (`is_record/2,3`, `records:*`),
   `beam_codec` (`RECORD_EXT`, tag 67) and `beam_engine` (`Fconv` bignum source) can now consume
-  `record::*` and `number::big_to_f64`. Known limitation: the record definition's stored `hash` is a
-  caller-supplied word (`write_record`'s `definition_hash`) because this crate's `hashing` is not
-  bit-exact to `make_hash2`, so `erlang:phash2/1` on a native record remains a hashing-module gap.
+  `record::*`, `number::big_to_f64` and `hashing::compute_record_definition_hash` — the last lets
+  `records:create/4`/`update/4` compute the definition's `hash` word (the C's
+  `make_hash2(TUPLE(module,name,is_exported,keys-in-declaration-order))`, `erl_record.c:1041-1046`)
+  instead of the `make_small(0)` placeholder they currently cache; `write_record` still takes that
+  word as a caller-supplied argument.
   `compare`/`hashing`/`size` still treat records with their generic fallbacks (class-rank / opaque /
   tuple-like); now that the interior is readable they can be made structural later.
 
@@ -499,7 +583,7 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   `num[]`); atoms whose name is absent from the passed `AtomTable` (fall back to the raw atom index).
   Hash-map comparison cannot be byte-matched to ERTS (ERTS's own HAMT order depends on its hash) — the
   flat-map-key-order rule is used for both shapes (see `src/map.rs` docs).
-- **Hashing is internal, not compatibility-pinned (`src/hashing.rs`).** `term_hash` guarantees only
+- **`term_hash` is internal, not compatibility-pinned (`src/hashing/mod.rs`).** It guarantees only
   the hash/equality consistency rule `eq(a,b,atoms) ⇒ term_hash(a,atoms) == term_hash(b,atoms)`; its
   exact bit values are not part of any contract. Maps hash structurally (their sorted pairs); funs hash
   over exactly the fields `compare` compares (so `eq ⇒ equal hash`, with the same `External`-last /
@@ -507,10 +591,16 @@ The crate's single, safe, documented numeric-to-`f64` conversion (ground truth
   refs) use an opaque raw-word fallback, so their hash is not stable across processes/images.
 - **Object-size approximation (`src/size.rs`).** Native records are treated like tuples (their
   field-table layout is not modelled).
-- **Hash choices are internal (`src/map.rs`).** The HAMT trie is driven by `hashing::term_hash`, not
-  `erts_map_hash`, so a node's *bitmap* for a given key set is not `erts_map_hash`-identical. The node
-  *encodings* (headers, sizes, slot semantics, collision/flat-map formats, key order) are bit-exact to
-  ERTS; nothing outside the Rust runtime observes those bitmaps.
+- **The HAMT is `erts_map_hash`-driven (`src/map.rs` + `src/ihash.rs`).** The map trie is placed by
+  the **bit-exact** `erts_map_hash` port in `src/ihash.rs` (`erl_term_hashing.c`), so a
+  `write_map`-built hash map's stored pair order equals the oracle's `maps:to_list/1` order (verified
+  by `tests/map_hash.rs`). `swizzle_map_hash` is a nibble reversal of the 64-bit hash, and level `L`
+  consumes the `L`-th **least-significant** nibble (`hashmap_nibble`). Atom keys are placed correctly
+  only when the `AtomTable` assigns the same indices as the oracle (`erts_map_hash` hashes an
+  immediate from its raw `Eterm` word); seeding from `atom.names` gives index parity. The C hash is
+  itself documented as non-portable across VM instances (its own "Limitation #1"), because it mixes
+  pointers — the classes whose C hash is pointer-derived (external pid/port/ref, external/local fun,
+  internal ref) use a documented deterministic substitute (see `src/ihash.rs` module docs).
 
 ## Notes for Agents
 - **Read `../../erts/emulator/beam/erl_term.h` before changing any constant** — it is the ground truth;

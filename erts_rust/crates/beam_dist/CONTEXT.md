@@ -7,11 +7,14 @@ capability (`DFLAG_*`) negotiation, control-message (`DOP_*`) framing + term pay
 fragmentation/reassembly, the distribution atom cache, the on-wire packet-length framing, the
 distribution-header envelope, and the `epmd` port-mapper client protocol.
 
-The crate is primarily **pure protocol/value code over the abstract [`transport`] seam** — the codecs
+The crate's core is **pure protocol/value code over the abstract [`transport`] seam** — the codecs
 never open a socket. The [`connection`] module adds a concrete `std::net::TcpStream` adapter
-([`connection::TcpTransport`]) and drives a **live distribution link end-to-end** (handshake → `DOP_*`
-exchange), which is what the runtime drives; a live test exercises it against a real `erl` node (see
-Test Strategy). The runtime's production transport remains `beam_io`'s job.
+([`connection::TcpTransport`] + [`connection::TcpListener`]) and drives a **live distribution link
+end-to-end** (epmd lookup → handshake → `DOP_*` exchange) through the blocking
+[`connection::Connection`]; the [`driver`] module adds a **non-blocking `ConnectionDriver`** (a
+poll/step state machine over a byte-fed internal buffer) so a runtime can multiplex many links on one
+thread. Both are live-tested against a real `erl` node (see Test Strategy). The runtime's production
+transport remains `beam_io`'s job.
 
 Term encoding/decoding is **never re-implemented here**: every term crosses the wire through
 `beam_codec` (ETF). This crate owns only the *distribution-specific* wire: the flag/opcode vocabulary,
@@ -41,21 +44,38 @@ Ground truth (read-only, never modified):
 All byte values, tag bytes and field orders are **wire-frozen** (A.5): reproduce them exactly.
 
 ## Status
-**Implemented.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte framing,
-handshake message codecs + MD5 authentication, the byte-exact distribution header, message
+**Implemented and live-verified.** `DFLAG_*`/`DOP_*` vocabulary, the abstract transport seam, 2-/4-byte
+framing, handshake message codecs + MD5 authentication, the byte-exact distribution header, message
 fragmentation/reassembly, the **outbound and inbound distribution atom cache**, the control-message
-codec, the `epmd` client, and a `Connection` API that drives a **live handshake + message exchange
-against a real `erl` node**. `cargo test -p beam_dist` is green (241 tests) and warning-free. The
-crate is safe Rust (`#![deny(unsafe_code)]`).
+codec, the `epmd` client (with real TCP lookup), a blocking `Connection` API, and a **non-blocking
+`ConnectionDriver`** (the poll/step state machine). `cargo test -p beam_dist` is green (266 tests + 1
+doc-test) and warning-free; the crate is safe Rust (`#![deny(unsafe_code)]`).
+
+**Live interop (blocking `Connection`, `tests/live_interop.rs`).** Against a real `erl -sname` node
+whose port is resolved through **`epmd`** (`epmd::lookup_port`, fallback to the pinned port): the OTP-23
+`'N'` handshake completes; a `DOP_REG_SEND` is delivered (the node prints `GOT {hello,42}`) and its
+reply is decoded back over the same connection; the node echoes its own pid; the client sends a
+`DOP_SEND`/`DOP_SEND_SENDER` to that pid (the node prints `GOT {direct,99}`); and a **monitor
+round-trip** completes — the node's `DOP_MONITOR_P` is decoded, the client answers
+`DOP_MONITOR_P_EXIT`, and the node prints `DOWN … noproc`.
+
+**Live interop (non-blocking `ConnectionDriver`, `tests/live_driver.rs`).** A genuine non-blocking
+`TcpStream` is driven manually (`feed`/`step`/`take_output`/`next_message`) against a real `erl` node:
+the handshake completes incrementally and a `DOP_REG_SEND` is delivered (the node prints
+`GOT {hello,7,…}`).
 
 The **outbound atom-cache path is wired end-to-end**: `OutboundAtomCache` implements
-`beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder`
-per control message, and `Connection::send_payload` emits the real `OutboundAtomCache::take_header()`
-header (no longer the empty header) — so an atom-bearing message writes `ATOM_CACHE_REF` (`82`) +
-index on the payload and teaches/re-uses the refs in the header. An atom-free message still emits the
-exact `131, 68, 0` header. A `Connection` client creation is now settable
-(`connect_client_with_creation` / `Connection::client_with_creation`; the default stays
-`CLIENT_CREATION = 0`).
+`beam_codec::AtomCacheWriter`, `encode_control_cached` threads the cache through a single `Encoder` per
+control message, and both `Connection::send_payload` and `ConnectionDriver::send_control` emit the real
+`OutboundAtomCache::take_header()` header — an atom-bearing message writes `ATOM_CACHE_REF` (`82`) +
+index on the payload and teaches/re-uses those refs in the header; an atom-free message emits the exact
+`131, 68, 0` header.
+
+**`epmd` over real TCP works** (an earlier "blocked in this sandbox" note was a misdiagnosis — see
+Design Decisions): `EpmdClient::connect` / `epmd::lookup_port` / `epmd::lookup` talk to a live `epmd`;
+a live test publishes a node (`ALIVE2_REQ`), looks its port up over a *second* connection, and observes
+de-registration. `connect_to_node(host, node, our_name, cookie)` chains epmd lookup → TCP connect →
+handshake.
 
 The `DOP_*` **flag vocabularies** are complete: `DIST_SPAWN_FLAG_LINK`/`_MONITOR` and
 `DOP_ALTACT_SIG_FLG_PRIO`/`_TOKEN`/`_ALIAS`/`_NAME`/`_EXIT` (plus the `DistSpawnFlags`/`AltactSigFlags`
@@ -66,7 +86,7 @@ scope (see Known Issues).
 Re-exported at the crate root and via `beam_dist::prelude::*` (see `src/lib.rs`/`src/prelude.rs`).
 
 ### `src/lib.rs`
-`pub mod {auth, atom_cache, connection, control, dist_header, epmd, flags, fragment, framing,
+`pub mod {auth, atom_cache, connection, control, dist_header, driver, epmd, flags, fragment, framing,
 handshake, prelude, transport}` + `pub mod prelude`, flat `pub use` of the principal items below.
 Crate lints: `#![deny(unsafe_code)]`, `#![warn(missing_docs)]`.
 Crate constants: `DIST_VERSION: u16 = 6`, `DIST_VERSION_5: u16 = 5`, `EPMD_PORT: u16 = 4369`,
@@ -166,25 +186,59 @@ distribution header carries it).
   `beam_codec`.
 
 ### `src/epmd.rs` — `epmd` port-mapper client (safe)
-2-byte-BE-framed `ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES` codecs +
-`struct EpmdClient<T: Transport>` (`publish`/`port_please`/`names`).
-`NamesResp::encode` is lossy on per-node ports (only `epmd_port` + names are retained).
+2-byte-BE-framed **requests** (`ALIVE2_REQ`/`RESP`/`X_RESP`, `PORT2_REQ`/`RESP`, `NAMES`) +
+`struct EpmdClient<T: Transport>` (`publish`/`port_please`/`names`). **Replies are NOT length-framed**
+(`epmd` writes the body straight to the socket) — the client reads them unframed/self-delimiting (see
+Design Decisions).
+- `EpmdClient<TcpTransport>::connect(addr) -> Result<EpmdClient<TcpTransport>>` and the free
+  `epmd::connect(addr)` — a real TCP client to `epmd` (sets `DEFAULT_READ_TIMEOUT` + `TCP_NODELAY`).
+- `epmd::lookup(name) -> Result<Port2Resp>` (raw) and `epmd::lookup_port(name) -> Result<u16>`
+  (`Port2Resp::Error` ⇒ `BeamError::Io(NotFound)`, never a silent `0`); both connect to
+  `EPMD_DEFAULT_ADDR` (`"127.0.0.1:4369"`, pinned to `EPMD_PORT`).
+- `NamesResp::encode` is lossy on per-node ports (only `epmd_port` + names are retained).
 
-### `src/connection.rs` — the connection-level API + `TcpStream` adapter (safe)
+### `src/connection.rs` — the blocking connection-level API + `TcpStream` adapter (safe)
 - `struct TcpTransport` (impls `Read`/`Write`); `connect(addr)` sets a read timeout + `TCP_NODELAY`;
   `from_stream`; `set_read_timeout`/`set_nodelay`/`stream`/`into_inner`; `DEFAULT_READ_TIMEOUT` (10 s).
+- `struct TcpListener` (wrapping `std::net::TcpListener`): `bind(addr)`/`local_addr`/`accept` (yields a
+  `TcpTransport` with the read timeout + `TCP_NODELAY`)/`set_nonblocking`/`into_inner` — the server side.
 - Handshake driver (2-byte framing): `connect_client(t, our_name, cookie) -> Result<Handshake>`,
   `connect_client_with_creation(t, our_name, cookie, creation) -> Result<Handshake>` and
   `accept_server(t, our_name, cookie, creation) -> Result<Handshake>`, where
   `struct Handshake { client_flags, server_flags, negotiated, peer_creation, peer_name, buffered }`.
   `pub const CLIENT_CREATION: u32 = 0` is the default client creation.
+- `connect_to_node(host, node_name, our_name, cookie) -> Result<Connection<TcpTransport>>` (+
+  `connect_to_node_with_creation`) — `epmd::lookup_port` → `TcpTransport::connect` → `Connection::client`.
 - Established link (4-byte framing): `struct Connection<T: Transport>` —
   `client(t, name, cookie)` / `client_with_creation(t, name, cookie, creation)` /
   `server(t, name, cookie, creation)`; `negotiated`/`client_flags`/`server_flags`/`peer_name`/
   `peer_creation`/`handshake`/`ticks_answered`/`into_inner`; `send_control(dop, terms, atoms)`,
   `send_message(from, to, msg, atoms)`, `send_tick()`, `recv(&mut Heap, &mut AtomTable) ->
-  Result<ControlMessage>`. `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an
-  `OutboundAtomCache` that `send_payload` drains via `take_header()`.
+  Result<ControlMessage>`; typed `DOP_*` helpers `send_reg_send(from, cookie, to_name, msg, atoms)` /
+  `send_link(from, to, atoms)` / `send_exit(from, to, reason, atoms)` /
+  `send_monitor_p(from, to, ref, atoms)` / `send_demonitor_p(from, to, ref, atoms)`.
+  `MAX_ESTABLISHED_PACKET_BODY`. The connection owns an `OutboundAtomCache` that `send_payload` drains
+  via `take_header()`.
+
+### `src/driver.rs` — the non-blocking poll/step state machine (safe)
+`struct ConnectionDriver` + `enum DriverState { Handshaking, Established, Closed, Failed }` +
+`enum StepOutcome { WouldBlock, Handshaking, Established, Progress, Closed, Failed }`. **Byte-fed**: the
+runtime owns the socket and does the syscalls; the driver only parses/serializes.
+- `client(our_name, cookie, creation)` / `server(our_name, cookie, creation)` (+ `*_with_challenge`),
+  `is_client`.
+- `feed(&[u8])` / `feed_eof()` — appends socket bytes / signals a clean EOF.
+- `step() -> Result<StepOutcome>` — makes all possible progress (incremental 2-byte handshake, then
+  4-byte-framed established frames, tick replies, `'E'`/`'F'` reassembly); returns `WouldBlock` when
+  nothing more can be done.
+- `take_output() -> Vec<u8>` / `has_output()` — bytes the runtime must write to the socket.
+- `next_message(&mut Heap, &mut AtomTable) -> Result<Option<ControlMessage>>` — decodes the next queued
+  payload (applying the receive atom cache).
+- `send_control(dop, terms, atoms)` / `send_message(from, to, msg, atoms)` / `send_tick()` — encode +
+  envelope into the output buffer.
+- `state()` / `negotiated()` / `client_flags()` / `server_flags()` / `peer_name()` / `peer_creation()` /
+  `handshake()` / `ticks_answered()` / `is_eof()`.
+- Runtime drive loop: `read → feed → loop{step until WouldBlock} → take_output → write → while
+  next_message{ handle }`; `Closed`/`Failed` mean drop the link.
 
 ## Constraints
 - **Safe Rust only** — `#![deny(unsafe_code)]`. `TcpTransport` uses only `std::net`.
@@ -220,13 +274,27 @@ distribution header carries it).
     thread): both handshake roles, a `DOP_*` round-trip, a >`DIST_FRAGMENT_SIZE` message, a tick, a
     wrong-cookie failure that is not a hang, and the **outbound atom cache over a real link** (one
     `New` ref per atom, `82 + index` payload, the peer resolves the names). A spy transport asserts
-    `'E'` frames really crossed.
-  - `tests/live_interop.rs` — **live interop with a real `erl` node.** Starts
-    `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P inet_dist_listen_max P` (P a free
-    loopback port; epmd is NOT used — raw TCP to epmd is blocked in this sandbox), connects with
-    `Connection::client`, completes the handshake, sends a `DOP_REG_SEND` that the node prints
-    (`GOT {hello,42}`), and receives the node's `DOP_SEND_SENDER` reply (`{echo,42}`). Skips honestly
-    (clear `eprintln`) only when `erl` is absent on `PATH`; never fakes a pass.
+    `'E'` frames really crossed; the new `TcpListener` path is exercised (`accept` on a thread, plus a
+    non-blocking `accept` → `WouldBlock`), and the typed `send_reg_send`/`send_link`/`send_exit`/
+    `send_monitor_p` helpers round-trip.
+  - `tests/epmd.rs` — the epmd codecs plus **live epmd**: `publish` an `ALIVE2_REQ` on one connection,
+    `port_please`/`lookup_port` it over a second, observe de-registration on close, and `connect_to_node`
+    end-to-end; the `PORT2_REQ` framing pin (frame length = `1 + name.len()`, the name is the packet
+    remainder). Skips loudly when epmd is unreachable.
+  - `tests/driver.rs` — the `ConnectionDriver`, hermetic: two drivers shuttling `take_output()` bytes
+    (whole-buffer **and** byte-at-a-time), negotiated flags/peer names, an atom-cache round trip
+    (`New` then `Cached`), the exact empty header `131,68,0`, a >`DIST_FRAGMENT_SIZE` message both ways
+    (`'E'` verified), a tick answered, and malformed/truncated/EOF/send-before-established errors.
+  - `tests/live_interop.rs` (blocking) + `tests/live_driver.rs` (non-blocking) — **live interop with a
+    real `erl` node.** Each starts `erl -sname <uniq> -setcookie <c> -kernel inet_dist_listen_min P
+    inet_dist_listen_max P` (P a free loopback port), resolves P through **`epmd::lookup_port`**
+    (falling back to P if epmd is unreachable), and completes the handshake. `live_interop.rs` then
+    sends a `DOP_REG_SEND` (the node prints `GOT {hello,42}`), receives the node's `DOP_SEND_SENDER`
+    reply, sends a `DOP_SEND` to the node pid the node echoed back (the node prints `GOT {direct,99}`),
+    and completes a monitor round-trip (`DOP_MONITOR_P` decoded → `DOP_MONITOR_P_EXIT` → the node prints
+    `DOWN … noproc`). `live_driver.rs` drives the `ConnectionDriver` over a genuine non-blocking
+    `TcpStream`. The shared spawn/harness lives in `tests/common/mod.rs`. Both skip honestly (clear
+    `eprintln`) only when `erl` is absent on `PATH`; never fake a pass.
 
 ## Design Decisions
 - **MD5 is implemented in-tree, not via a dependency.** The digest is one 16-byte hash; `md-5` would
@@ -268,6 +336,20 @@ distribution header carries it).
 - **Handshake framing is 2-byte; established framing is 4-byte.** The frame read after `ChallengeAck`
   is treated as the OTP-23 `Complement` only when its tag is `'c'`; otherwise it is buffered and
   delivered by the next `recv`.
+- **epmd frames its requests but not its replies.** A client *request* is 2-byte length-framed
+  (`epmd_port.c`), but `epmd` writes every *reply* body straight to the socket with no length prefix
+  (`epmd_srv.c` `reply()`); the client reads it unframed/self-delimiting — by tag for `'y'`/`'v'`/`'w'`,
+  and "read until the transport goes quiet" for the open-ended `NAMES_RESP` line list. An earlier note
+  here that "epmd over raw TCP is blocked in this sandbox" was a misdiagnosis: the old client wrongly
+  re-read the reply through `read_packet`, so the first two reply bytes were parsed as a bogus ~30 KB
+  length. Requests are unchanged; only the three response readers changed.
+- **`ConnectionDriver` is byte-fed and transport-agnostic; its header parse is deferred to
+  `next_message`.** The runtime owns the socket; the driver only parses/serializes, which keeps this
+  crate free of `mio` and lets `beam_rt` register the link with `beam_io`'s poller. `step` does a cheap
+  *structural* check of each packet's leading bytes so garbage is rejected immediately, but the
+  distribution header is decoded (and applied to the receive atom cache) in `next_message`, because a
+  `NewAtomCacheRef`'s interned atoms must land in the *same* `AtomTable` the payload decodes against
+  (otherwise a payload `ATOM_CACHE_REF` could collide with an inline atom's index).
 - **`NamesResp::encode` is lossy** (per-node ports are not retained) — decoding (the client direction)
   is exact.
 
@@ -278,9 +360,8 @@ distribution header carries it).
   spawn/altact/payload-exit handling here — that is `beam_process`/`beam_rt` work, and the
   `ERTS_DIST_SPAWN_FLAG_*` / `ERTS_DOP_ALTACT_SIG_FLG_*` semantics (`dist.c:2590-2698`,
   `dist.c:3090-3146`) are documented, not interpreted.
-- **epmd over raw TCP is blocked in this sandbox** — verified via CLI (`epmd -names` works) but raw
-  `NAMES_REQ`/`PORT2_REQ` over a socket return empty. The `EpmdClient` codecs are exercised against
-  `MemoryTransport`; live epmd use is untested here. Use a fixed `inet_dist_listen_*` port instead.
+- **`ConnectionDriver` advances the receive atom cache only in `next_message`**, not `step` (see Design
+  Decisions): a runtime that never calls `next_message` will not make header/atom progress.
 - **Not yet consumed by `beam_rt`**: node startup (`-name`/`-sname`) does not yet wire this crate into
   the runtime binary. This crate is the value/connection layer only.
 
@@ -311,13 +392,22 @@ distribution header carries it).
 - `src/atom_cache.rs` → `SegmentCache`/`ReceiveAtomCache`/`OutboundAtomCache`, `apply_header`, and the
   `beam_codec::AtomCacheWriter` impl on `OutboundAtomCache` (the outbound `intern` hook)
 - `src/control.rs` → the `DOP_*` control-message tuple codec (`encode_control`/`encode_control_cached`)
-- `src/connection.rs` → `TcpTransport`, the handshake driver (client/server + creation), `Connection`
-  (owning the outbound atom cache), `send_control`/`send_message`/`recv`
+- `src/connection.rs` → `TcpTransport`/`TcpListener`, the handshake driver (client/server + creation),
+  `connect_to_node` (epmd→TCP→handshake), `Connection` (owning the outbound atom cache) with
+  `send_control`/`send_message`/`send_tick`/`recv` + the typed `send_reg_send`/`send_link`/`send_exit`/
+  `send_monitor_p`/`send_demonitor_p` helpers
 - `src/connection_tests.rs` → the `connection` module's in-module unit tests (path-included via
   `#[cfg(test)] #[path] mod tests;` so `connection.rs` stays ~1000 lines)
-- `src/epmd.rs` → `epmd` request/response codecs + `EpmdClient` over `Transport`
-- `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection}.rs` → seams
-- `tests/live_interop.rs` → real-`erl` handshake + message exchange (the interop evidence)
+- `src/driver.rs` → the non-blocking `ConnectionDriver` poll/step state machine (`feed`/`step`/
+  `take_output`/`next_message`/`send_control`) + `DriverState`/`StepOutcome`
+- `src/epmd.rs` → `epmd` request/response codecs, `EpmdClient` over `Transport`, and the real TCP client
+  (`connect`/`lookup`/`lookup_port`, `EPMD_DEFAULT_ADDR`)
+- `tests/{constants,auth,handshake,framing,control,epmd,fragment,atom_cache,connection,driver}.rs` →
+  seams
+- `tests/common/mod.rs` → the shared real-`erl` spawn/harness (`ErlangNode`, `erl_hostname`, `free_port`,
+  `resolve_listen_port`) used by the live tests
+- `tests/live_interop.rs` → real-`erl` blocking handshake + `DOP_REG_SEND`/`DOP_SEND`/monitor exchange
+- `tests/live_driver.rs` → real-`erl` non-blocking `ConnectionDriver` handshake + send
 - `../../../erts/emulator/beam/dist.h` · `dist.c` · `external.c` · `external.h` · `packet_parser.c` →
   authoritative flags/opcodes/header/framing/fragmentation (read-only)
 - `../../../erts/doc/guides/erl_dist_protocol.md` + `erl_ext_dist.md` → the wire guides (read-only)
@@ -327,7 +417,7 @@ distribution header carries it).
 
 ## See Also
 - `../CONTEXT.md` → crate-layer contracts, seam types, dependency waves (this crate = wave 2;
-  consumes `beam_codec`; adds the `connection` TCP adapter).
+  consumes `beam_codec`; adds the `connection` TCP adapter/listener and the non-blocking `driver`).
 - `../../CONTEXT.md` → workspace contracts (§1 A.5 distribution wire, §2 frozen term layout, §3 error
   strategy, §6 test gate).
 - `../../ERTS_RUST_REWRITE_EVALUATION.md` §A.5 — the distribution/ETF wire contract.

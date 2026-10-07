@@ -17,8 +17,11 @@
 //! # The HAMT node layout (frozen)
 //!
 //! Level `L` of the trie (root `L = 0`) selects the slot
-//! `maskval(hash, L) = (hash >> (4*(15-L))) & 0xF` of the node reached so far, so
-//! the most-significant nibble indexes the root (see [`nibble`]). A node is one of
+//! `maskval(swizzle(erts_map_hash(key)), L) = (erts_map_hash(key) >> 4*L) & 0xF`
+//! of the node reached so far — i.e. the **`L`-th least-significant** nibble of the
+//! key's [`erts_map_hash`](crate::ihash::erts_map_hash) indexes level `L` (the C
+//! `maskval`, `erl_map.c:109`, applied to the swizzled hash; see
+//! [`crate::ihash::hashmap_nibble`]). A node is one of
 //!
 //! | node | header | words | layout |
 //! |---|---|---|---|
@@ -51,13 +54,18 @@
 //!
 //! # Hash function
 //!
-//! The trie is driven by [`crate::hashing::term_hash`] — the crate's structural
-//! hash, *not* `erts_map_hash`. The node *encodings* (headers, sizes, slot
-//! semantics, collision/flat-map formats, key order) are bit-exact to ERTS, but
-//! because the hash differs the specific bitmap of a node built from a given key
-//! set is not `erts_map_hash`-identical. Nothing outside the Rust runtime compares
-//! those bitmaps (the observable orders — flat-map key order, map comparison and
-//! map hashing — are all hash-independent; see the `Known Issues`).
+//! The trie is driven by the **bit-exact** [`erts_map_hash`](crate::ihash::erts_map_hash)
+//! port in [`crate::ihash`] (`erl_term_hashing.c`), so a `write_map`-built hash map
+//! places its keys in the same HAMT slots as the oracle and therefore *stores* its
+//! pairs in the same order (`maps:to_list/1` order). [`write_map`] lays the leaf
+//! cons cells out sorted **ascending by `swizzle_map_hash(hash)`** — the nibble
+//! reversal of the hash (`erl_map.c:1170` `hxnodecmp`) — with equal-hash runs
+//! broken by [`crate::compare::cmp`] on the key (the C's `hxnodecmpkey` collision
+//! order). Because the swizzle is a nibble reversal, "ascending swizzle" sorts by
+//! the *least*-significant nibble first, exactly the order in which
+//! [`build_trie`] consumes [`hashmap_nibble`], so equal-nibble runs stay contiguous
+//! at every level and one contiguous grouping pass reproduces the C's
+//! ascending-nibble slot order.
 
 use crate::atom::AtomTable;
 use crate::boxed::{
@@ -67,7 +75,7 @@ use crate::boxed::{
 use crate::compare::{cmp, cmp_flatmap_keys, eq};
 use crate::error::{TermError, TermResult};
 use crate::eterm::Eterm;
-use crate::hashing::term_hash;
+use crate::ihash::{erts_map_hash, hashmap_nibble, swizzle_map_hash};
 use crate::list::{car, cdr, is_list, make_list, CAR_OFFSET, CDR_OFFSET};
 use crate::tag::{
     MAP_HEADER_TAG_HAMT_HEAD_ARRAY, MAP_HEADER_TAG_HAMT_HEAD_BITMAP,
@@ -83,7 +91,7 @@ use crate::tuple::{tuple_element, tuple_size};
 pub const MAP_SMALL_MAP_LIMIT: usize = 32;
 
 /// `HAMT_MAX_LEVEL` (`erl_map.h:220`): `64 / 4` — the number of 4-bit levels in a
-/// 64-bit hash. A node at level `L` uses `nibble(hash, L)`.
+/// 64-bit hash. A node at level `L` uses [`hashmap_nibble`]`(hash, L)`.
 pub const HAMT_MAX_LEVEL: usize = 16;
 
 /// The (inclusive) deepest level a *node* may occupy; its children are leaves or
@@ -91,32 +99,12 @@ pub const HAMT_MAX_LEVEL: usize = 16;
 const HAMT_LAST_NODE_LEVEL: usize = HAMT_MAX_LEVEL - 1;
 
 /// A fully populated 16-slot bitmap (the head-array trigger).
-const HAMT_FULL_BITMAP: u16 = 0xffff;
-
-/// Bits of one hash consumed per trie level.
-const HAMT_BITS_PER_LEVEL: u32 = 4;
-
-/// `MAKE_MAP_HEADER(Type, Arity, Val)` (`erl_map.h:181`):
+const HAMT_FULL_BITMAP: u16 = 0xffff;/// `MAKE_MAP_HEADER(Type, Arity, Val)` (`erl_map.h:181`):
 /// `_make_header((((Uint16)Val << MAP_HEADER_ARITY_SZ) | Arity) << MAP_HEADER_TAG_SZ | Type,
 /// MAP_SUBTAG)`.
 pub const fn make_map_header(map_type: usize, arity: usize, val: usize) -> Eterm {
     let inner = (((val as u16) as usize) << MAP_HEADER_ARITY_SZ) | arity;
     crate::boxed::make_header((inner << MAP_HEADER_TAG_SZ) | map_type, MAP_SUBTAG)
-}
-
-/// `maskval(hash, level)` (`erl_map.c:109`) — the slot selector of a node at
-/// `level`.
-///
-/// Level `0` is the **most significant** nibble (`hash >> 60`), descending to the
-/// least significant nibble at level 15. This is required for the grouping loop in
-/// [`build_trie`] to see contiguous runs: with hashes sorted ascending, the level-0
-/// nibble is the primary key, so equal-nibble leaves are adjacent. (The C sorts
-/// hashes *descending* — `hxnodecmp`, `erl_map.c:1171` — with the same MSB-first
-/// `maskval`; both orders give contiguous runs. The specific bitmap values are not
-/// observable outside this runtime — see the module docs.)
-#[inline]
-const fn nibble(hash: u64, level: usize) -> u32 {
-    ((hash >> (HAMT_BITS_PER_LEVEL as usize * (HAMT_MAX_LEVEL - 1 - level))) & 0xF) as u32
 }
 
 /// The words a caller must reserve before [`write_map`] with `n_pairs` input
@@ -167,16 +155,16 @@ struct TrieNode {
     children: Vec<TrieChild>,
 }
 
-/// Builds the trie for `leaves` (sorted ascending by hash, all sharing nibbles
-/// `0..level-1`) at `level`.
+/// Builds the trie for `leaves` (sorted ascending by `swizzle_map_hash(hash)`, all
+/// sharing nibbles `0..level-1`) at `level`.
 fn build_trie(leaves: &[(u64, Eterm)], level: usize, atoms: &AtomTable) -> TrieNode {
     let mut bitmap = 0u16;
     let mut children: Vec<TrieChild> = Vec::new();
     let mut i = 0;
     while i < leaves.len() {
-        let nib = nibble(leaves[i].0, level);
+        let nib = hashmap_nibble(leaves[i].0, level);
         let mut j = i + 1;
-        while j < leaves.len() && nibble(leaves[j].0, level) == nib {
+        while j < leaves.len() && hashmap_nibble(leaves[j].0, level) == nib {
             j += 1;
         }
         bitmap |= 1u16 << nib;
@@ -297,7 +285,8 @@ fn serialize_node(
 /// (`erl_map.c:2165`): duplicate keys are collapsed **last value wins**, a map of
 /// at most [`MAP_SMALL_MAP_LIMIT`] distinct keys is a flat map (keys sorted in
 /// [`cmp_flatmap_keys`] order), a larger one is a hash map keyed by
-/// [`term_hash`]. The pair order of `pairs` is irrelevant.
+/// [`erts_map_hash`], so its stored pair order equals the oracle's
+/// `maps:to_list/1` order. The pair order of `pairs` is irrelevant.
 ///
 /// # Safety
 ///
@@ -313,7 +302,7 @@ pub unsafe fn write_map(
     // Collapse duplicates (last value wins) while hashing each key once.
     let mut entries: Vec<(u64, Eterm, Eterm)> = Vec::with_capacity(pairs.len());
     for &(key, value) in pairs {
-        let hash = term_hash(key, atoms);
+        let hash = erts_map_hash(key);
         match entries
             .iter_mut()
             .find(|(h, k, _)| *h == hash && eq(*k, key, atoms))
@@ -337,11 +326,18 @@ pub unsafe fn write_map(
     }
 
     // Hash map. Lay the key/value cons cells at the base of the block in
-    // *canonical* order — by hash (the trie's grouping key), ties broken by
-    // `CMP_TERM` (the collision-node order) — so the produced buffer is
-    // independent of the caller's pair order (matching the C, which lays out the
-    // hash-sorted `hxns`). The leaves are then already sorted for `build_trie`.
-    entries.sort_by(|a, b| a.0.cmp(&b.0).then_with(|| cmp(a.1, b.1, atoms)));
+    // *canonical* order — ascending by `swizzle_map_hash(hash)` (the C's
+    // `hxnodecmp` order, a nibble reversal of the hash so the trie's per-level
+    // nibbles are eaten least-significant first), equal-hash runs broken by
+    // `CMP_TERM` (the C's `hxnodecmpkey` collision-node order) — so the produced
+    // buffer is independent of the caller's pair order (matching the C, which lays
+    // out the swizzle-sorted `hxns`). The leaves are then already sorted for
+    // `build_trie`.
+    entries.sort_by(|a, b| {
+        swizzle_map_hash(a.0)
+            .cmp(&swizzle_map_hash(b.0))
+            .then_with(|| cmp(a.1, b.1, atoms))
+    });
     let mut cur = hp;
     let mut leaves: Vec<(u64, Eterm)> = Vec::with_capacity(n);
     for &(hash, key, value) in &entries {
@@ -497,8 +493,8 @@ pub fn map_size(t: Eterm, _atoms: &AtomTable) -> TermResult<usize> {
 /// `erts_maps_get` — the value bound to `key` in the map `t`, if any.
 ///
 /// Flat maps are scanned linearly (with `=:=` key comparison); hash maps follow
-/// `nibble(term_hash(key), L)` from the root, falling back to a linear scan of the
-/// collision node when the path ends in one.
+/// `hashmap_nibble(erts_map_hash(key), L)` from the root, falling back to a linear
+/// scan of the collision node when the path ends in one.
 pub fn map_get(t: Eterm, key: Eterm, atoms: &AtomTable) -> TermResult<Option<Eterm>> {
     // An immediate can never be a map; guard before dereferencing.
     if !is_boxed(t) {
@@ -521,7 +517,7 @@ pub fn map_get(t: Eterm, key: Eterm, atoms: &AtomTable) -> TermResult<Option<Ete
         return Err(TermError::BadMap);
     }
 
-    let hash = term_hash(key, atoms);
+    let hash = erts_map_hash(key);
     let mut node = p;
     let mut level = 0usize;
     loop {
@@ -533,7 +529,7 @@ pub fn map_get(t: Eterm, key: Eterm, atoms: &AtomTable) -> TermResult<Option<Ete
             MAP_HEADER_TAG_HAMT_NODE_BITMAP => (1, map_header_val(nheader) as u16),
             _ => return Err(TermError::BadMap),
         };
-        let nib = nibble(hash, level);
+        let nib = hashmap_nibble(hash, level);
         if bitmap & (1u16 << nib) == 0 {
             return Ok(None);
         }

@@ -639,3 +639,576 @@ fn bignum_hash_sees_the_top_limb() {
         "bignums differing only in the top limb must hash differently",
     );
 }
+
+// ---------------------------------------------------------------------------
+// `make_hash2` / `make_hash` cross-check (the `erlang:phash2` / `erlang:phash`
+// compatibility contract)
+// ---------------------------------------------------------------------------
+//
+// Unlike `term_hash` (whose values are internal), `make_hash2` and `make_hash`
+// **are** the observable `erlang:phash2/1,2` / `erlang:phash/2` results, so they
+// are a Level-1 drop-in contract: for every term `T`,
+//
+//   `make_hash2(T) & ((1 << 27) - 1) == erlang:phash2(T)`
+//   `make_hash2(T)                   == erlang:phash2(T, 1 bsl 32)`
+//   `make_hash(T)  % R               == erlang:phash(T, R) - 1`   (1 <= R < 2^32)
+//   `make_hash(T)                    == erlang:phash(T, 1 bsl 32) - 1`
+//
+// (the `2^32` range is special-cased in `bif.c:5413-5452` to return the raw
+// hash). Every term below is described **once** by a [`Spec`] and materialized
+// twice — as a `beam_term` term and as Erlang source text — so the comparison is
+// a genuine oracle agreement rather than a tautology.
+
+/// A term described once and materialized both as a `beam_term` term (the Rust
+/// side) and as Erlang source (the oracle side).
+#[derive(Clone, Debug)]
+enum Spec {
+    Small(i64),
+    /// An atom, named by its UTF-8 bytes (safe for non-ASCII / non-latin1 names).
+    Atom(&'static str),
+    /// The empty list `[]` (the `NIL` immediate).
+    Nil,
+    Tuple(Vec<Spec>),
+    /// A proper list.
+    List(Vec<Spec>),
+    /// An improper list `[head.. | tail]`.
+    Improper(Vec<Spec>, Box<Spec>),
+    /// A bitstring of `n_bits` bits. `bytes` holds `ceil(n_bits / 8)` MSB-first
+    /// bytes with the unused low bits of the last byte already zero (the
+    /// `ErlHeapBits` convention).
+    Bits(Vec<u8>, usize),
+    Float(f64),
+    /// A multi-limb bignum (`digits` least-significant-first, canonical: the top
+    /// limb is non-zero and the value does not fit a small integer).
+    Big { negative: bool, digits: Vec<u64> },
+    Map(Vec<(Spec, Spec)>),
+    /// An `EXPORT_EXT` external fun `fun Module:Function/Arity`.
+    ExternalFun {
+        module: &'static str,
+        function: &'static str,
+        arity: usize,
+    },
+}
+
+/// A bump arena over a fixed, sentinel-guarded word buffer. Every term built into
+/// it stays valid for the arena's lifetime because the backing `Vec` never
+/// reallocates (nothing ever pushes to it).
+struct Bump {
+    buf: Vec<Eterm>,
+    used: usize,
+}
+
+impl Bump {
+    fn new() -> Self {
+        Bump {
+            buf: vec![SENTINEL; 1 << 16],
+            used: 0,
+        }
+    }
+
+    /// Reserves `n` words and returns a pointer to the first (still `SENTINEL`).
+    fn alloc(&mut self, n: usize) -> *mut Eterm {
+        assert!(self.used + n <= self.buf.len(), "term arena exhausted");
+        // SAFETY: `used + n <= buf.len()`, so the range is in bounds, and `buf`
+        // is never pushed to, so its base pointer is stable for the arena's life.
+        let p = unsafe { self.buf.as_mut_ptr().add(self.used) };
+        self.used += n;
+        p
+    }
+}
+
+/// Materializes `spec` into the arena as a real `beam_term` term.
+fn build(spec: &Spec, bump: &mut Bump, atoms: &mut AtomTable) -> Eterm {
+    match spec {
+        Spec::Small(v) => make_small(*v),
+        Spec::Atom(name) => make_atom(atoms.intern(name)),
+        Spec::Nil => NIL,
+        Spec::Tuple(elems) => {
+            if elems.is_empty() {
+                // The shared, `TAG_LITERAL_PTR`-tagged empty tuple.
+                return tuple0();
+            }
+            let vals: Vec<Eterm> = elems.iter().map(|e| build(e, bump, atoms)).collect();
+            let p = bump.alloc(vals.len() + 1);
+            // SAFETY: `p` owns `vals.len() + 1` writable words — an arityval block
+            // is `[arityval(n), elements..]`.
+            unsafe {
+                *p = make_arityval(vals.len());
+                for (i, v) in vals.iter().enumerate() {
+                    *p.add(1 + i) = *v;
+                }
+            }
+            make_boxed(p)
+        }
+        Spec::List(head) => build_list(head, NIL, bump, atoms),
+        Spec::Improper(head, tail) => {
+            let tail = build(tail, bump, atoms);
+            build_list(head, tail, bump, atoms)
+        }
+        Spec::Bits(bytes, n_bits) => {
+            let p = bump.alloc(heap_bits_size_words(*n_bits));
+            // SAFETY: `p` owns exactly `heap_bits_size_words(n_bits)` words.
+            unsafe { write_heap_bits(p, bytes, *n_bits) }.expect("write_heap_bits")
+        }
+        Spec::Float(v) => {
+            let p = bump.alloc(FLOAT_SIZE_WORDS);
+            // SAFETY: `p` owns `FLOAT_SIZE_WORDS` words.
+            unsafe { write_float(p, *v) }
+        }
+        Spec::Big { negative, digits } => {
+            let p = bump.alloc(big_size_words(digits.len()));
+            // SAFETY: `p` owns `big_size_words(digits.len())` words.
+            unsafe { write_big(p, *negative, digits) }
+        }
+        Spec::Map(pairs) => {
+            let built: Vec<(Eterm, Eterm)> = pairs
+                .iter()
+                .map(|(k, v)| (build(k, bump, atoms), build(v, bump, atoms)))
+                .collect();
+            let p = bump.alloc(map_words_capacity(built.len()));
+            // SAFETY: `p` owns `map_words_capacity(built.len())` words.
+            unsafe { write_map(p, &built, atoms) }.expect("write_map")
+        }
+        Spec::ExternalFun {
+            module,
+            function,
+            arity,
+        } => {
+            let m = atoms.intern(module);
+            let f = atoms.intern(function);
+            let p = bump.alloc(fun_words(FunKind::External, 0));
+            // SAFETY: `p` owns `fun_words(FunKind::External, 0)` (3) words.
+            unsafe { write_fun_external(p, *arity, m, f) }.expect("write_fun_external")
+        }
+    }
+}
+
+/// Builds the cons-cell chain `head..` ending in `tail`.
+fn build_list(head: &[Spec], tail: Eterm, bump: &mut Bump, atoms: &mut AtomTable) -> Eterm {
+    let mut out = tail;
+    for e in head.iter().rev() {
+        let car = build(e, bump, atoms);
+        let p = bump.alloc(2);
+        // SAFETY: `p` owns two writable words — a header-less `[CAR, CDR]` cell.
+        unsafe {
+            *p = car;
+            *p.add(1) = out;
+        }
+        out = make_list(p);
+    }
+    out
+}
+
+/// The Erlang source for `spec` — the same description `build` materializes.
+fn erl_literal(spec: &Spec) -> String {
+    match spec {
+        Spec::Small(v) => v.to_string(),
+        Spec::Atom(name) => erl_atom(name),
+        Spec::Nil => "[]".to_string(),
+        Spec::Tuple(elems) => format!(
+            "{{{}}}",
+            elems.iter().map(erl_literal).collect::<Vec<_>>().join(",")
+        ),
+        Spec::List(elems) => format!(
+            "[{}]",
+            elems.iter().map(erl_literal).collect::<Vec<_>>().join(",")
+        ),
+        Spec::Improper(head, tail) => format!(
+            "[{}|{}]",
+            head.iter().map(erl_literal).collect::<Vec<_>>().join(","),
+            erl_literal(tail)
+        ),
+        Spec::Bits(bytes, n_bits) => erl_bits(bytes, *n_bits),
+        Spec::Float(v) => erl_float(*v),
+        Spec::Big { negative, digits } => erl_big(*negative, digits),
+        Spec::Map(pairs) => format!(
+            "#{{{}}}",
+            pairs
+                .iter()
+                .map(|(k, v)| format!("({}) => ({})", erl_literal(k), erl_literal(v)))
+                .collect::<Vec<_>>()
+                .join(",")
+        ),
+        Spec::ExternalFun {
+            module,
+            function,
+            arity,
+        } => format!("fun {module}:{function}/{arity}"),
+    }
+}
+
+/// The Erlang source for an atom of the given UTF-8 name, emitted as
+/// `binary_to_atom(<<bytes>>, utf8)` so quoting, escaping and non-ASCII names need
+/// no special cases.
+fn erl_atom(name: &str) -> String {
+    let bytes: Vec<String> = name.as_bytes().iter().map(u8::to_string).collect();
+    format!("binary_to_atom(<<{}>>, utf8)", bytes.join(","))
+}
+
+/// The Erlang source for a bitstring of `n_bits` bits from MSB-first `bytes`. The
+/// trailing `Rem:lastbits` segment takes the **high** bits of the last byte, which
+/// is exactly the `ErlHeapBits` MSB-first convention.
+fn erl_bits(bytes: &[u8], n_bits: usize) -> String {
+    let full = n_bits / 8;
+    let rem = n_bits % 8;
+    let mut parts: Vec<String> = bytes[..full].iter().map(u8::to_string).collect();
+    if rem > 0 {
+        parts.push(format!("{}:{}", bytes[full] >> (8 - rem), rem));
+    }
+    format!("<<{}>>", parts.join(","))
+}
+
+/// The Erlang source for an `f64`, built from its IEEE-754 bits — a decimal
+/// literal would risk a rounding mismatch. The anonymous fun gives the literal its
+/// own variable scope, so several floats in one expression cannot clash.
+fn erl_float(v: f64) -> String {
+    let bits = v.to_bits();
+    let bytes: Vec<String> = (0..8)
+        .map(|i| ((bits >> (56 - 8 * i)) & 0xff).to_string())
+        .collect();
+    format!("fun() -> <<V:64/float>> = <<{}>>, V end()", bytes.join(","))
+}
+
+/// The Erlang source for a bignum of least-significant-first `u64` limbs.
+fn erl_big(negative: bool, digits: &[u64]) -> String {
+    let sum = digits
+        .iter()
+        .enumerate()
+        .map(|(i, d)| {
+            if i == 0 {
+                d.to_string()
+            } else {
+                format!("({d} bsl {})", i * 64)
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(" + ");
+    if negative {
+        format!("(-({sum}))")
+    } else {
+        format!("({sum})")
+    }
+}
+
+/// The term corpus: every class `make_hash2` / `make_hash` support, with the
+/// boundary values that select their different code paths (the 28-bit small fast
+/// path, the byte-list batching, the block-hash 12-byte boundary, the
+/// flat-map/hash-map threshold, the 2-/3-limb bignum boundary).
+fn hash_specs() -> Vec<Spec> {
+    let mut s: Vec<Spec> = Vec::new();
+
+    // Small integers: the 28-bit fast-path boundary, powers of two, and the 60-bit
+    // small-integer limits.
+    for v in [
+        0i64,
+        1,
+        -1,
+        2,
+        127,
+        128,
+        255,
+        256,
+        -256,
+        (1 << 27) - 1,
+        1 << 27,
+        -(1 << 27),
+        -(1 << 27) - 1,
+        (1 << 28) - 1,
+        1 << 28,
+        -(1 << 28),
+        1 << 32,
+        -(1 << 32),
+        1 << 40,
+        -(1 << 40),
+        MAX_SMALL,
+        MIN_SMALL,
+        MAX_SMALL - 1,
+        MIN_SMALL + 1,
+    ] {
+        s.push(Spec::Small(v));
+    }
+
+    // Atoms: the empty atom, ASCII names, and non-ASCII / non-latin1 UTF-8 names
+    // (these exercise `AtomTable::hvalue`'s latin1 clutch and its raw-UTF-8 path).
+    for a in [
+        "", "a", "abc", "nil", "true", "false", "lists", "sort", "¶", "Ω", "Ωmega", "😀",
+    ] {
+        s.push(Spec::Atom(a));
+    }
+
+    // The empty list.
+    s.push(Spec::Nil);
+
+    // Tuples: arity 0..4, a nested/heterogeneous shape and a longer one.
+    s.push(Spec::Tuple(vec![]));
+    s.push(Spec::Tuple(vec![Spec::Small(1)]));
+    s.push(Spec::Tuple(vec![Spec::Small(1), Spec::Small(2)]));
+    s.push(Spec::Tuple(vec![
+        Spec::Small(1),
+        Spec::Small(2),
+        Spec::Small(3),
+    ]));
+    s.push(Spec::Tuple(vec![
+        Spec::Atom("a"),
+        Spec::Tuple(vec![Spec::Small(1), Spec::Small(2)]),
+        Spec::List(vec![Spec::Small(1), Spec::Small(2)]),
+        Spec::Bits(vec![0x20], 3),
+    ]));
+    s.push(Spec::Tuple((0..12).map(Spec::Small).collect()));
+
+    // Lists: byte batches of 1..4 elements per `UINT32_HASH` word, a non-byte
+    // element, atom elements, nested lists, and improper tails.
+    for n in [1usize, 2, 3, 4, 5, 6, 7, 8, 9, 12, 13] {
+        s.push(Spec::List(
+            (0..n as i64).map(|i| Spec::Small(255 - (i * 7) % 200)).collect(),
+        ));
+    }
+    s.push(Spec::List(vec![
+        Spec::Small(97),
+        Spec::Small(98),
+        Spec::Small(99),
+    ]));
+    s.push(Spec::List(vec![
+        Spec::Small(256),
+        Spec::Small(1),
+        Spec::Small(2),
+    ]));
+    s.push(Spec::List(vec![
+        Spec::Atom("a"),
+        Spec::Atom("b"),
+        Spec::Atom("c"),
+    ]));
+    s.push(Spec::List(vec![
+        Spec::List(vec![Spec::Small(1)]),
+        Spec::List(vec![Spec::Small(2), Spec::Small(3)]),
+    ]));
+    s.push(Spec::Improper(
+        vec![Spec::Small(1), Spec::Small(2)],
+        Box::new(Spec::Small(3)),
+    ));
+    s.push(Spec::Improper(vec![Spec::Small(1)], Box::new(Spec::Nil)));
+    s.push(Spec::Improper(
+        vec![Spec::Small(1), Spec::Small(2)],
+        Box::new(Spec::Atom("tail")),
+    ));
+
+    // Maps: empty, flat (`<= 32` pairs), atom-keyed, and hash maps (33 / 40 keys,
+    // straddling `MAP_SMALL_MAP_LIMIT`).
+    s.push(Spec::Map(vec![]));
+    s.push(Spec::Map(vec![(Spec::Small(1), Spec::Small(2))]));
+    s.push(Spec::Map(vec![
+        (Spec::Small(1), Spec::Atom("one")),
+        (Spec::Small(2), Spec::Atom("two")),
+        (
+            Spec::Small(3),
+            Spec::List(vec![Spec::Small(1), Spec::Small(2)]),
+        ),
+    ]));
+    s.push(Spec::Map(vec![
+        (Spec::Atom("a"), Spec::Small(1)),
+        (Spec::Atom("b"), Spec::Small(2)),
+    ]));
+    for n in [33usize, 40] {
+        s.push(Spec::Map(
+            (1..=n as i64)
+                .map(|i| (Spec::Small(i), Spec::Small(i * 10)))
+                .collect(),
+        ));
+    }
+
+    // Bitstrings: empty, non-byte-aligned, the block-hash 12-byte boundary, and a
+    // 100-bit string (multi-byte-block + trailing partial byte).
+    s.push(Spec::Bits(vec![], 0));
+    s.push(Spec::Bits(vec![0x20], 3)); // <<1:3>>
+    s.push(Spec::Bits(vec![0xF0], 4)); // <<15:4>>
+    s.push(Spec::Bits(vec![0xAB, 0xC0], 10)); // a 10-bit window
+    for n in [1usize, 4, 11, 12, 13, 24, 100] {
+        let bytes: Vec<u8> = (0..n).map(|i| (i % 251) as u8 + 1).collect();
+        s.push(Spec::Bits(bytes, n * 8));
+    }
+    s.push(Spec::Bits((0..13).map(|i| (i * 3) as u8).collect(), 100));
+
+    // Floats, including both zeros (`make_hash2` normalizes `-0.0` to `+0.0`).
+    for v in [
+        0.0f64,
+        -0.0,
+        1.0,
+        -1.0,
+        0.5,
+        1.5,
+        -2.5,
+        0.1,
+        3.141_592_653_589_793,
+        1.0e300,
+        -1.0e300,
+        1.0e-300,
+        4.9e-324,
+        f64::MAX,
+        f64::MIN,
+        -12345.6789,
+    ] {
+        s.push(Spec::Float(v));
+    }
+
+    // Bignums: multi-limb, positive and negative, across the 2-/3-limb boundary.
+    s.push(Spec::Big {
+        negative: false,
+        digits: vec![1 << 59], // 2^59, just above MAX_SMALL
+    });
+    s.push(Spec::Big {
+        negative: false,
+        digits: vec![0, 1], // 2^64
+    });
+    s.push(Spec::Big {
+        negative: false,
+        digits: vec![1, 1], // 2^64 + 1
+    });
+    s.push(Spec::Big {
+        negative: false,
+        digits: vec![0, 0, 1], // 2^128
+    });
+    s.push(Spec::Big {
+        negative: false,
+        digits: vec![u64::MAX, u64::MAX], // 2^128 - 1
+    });
+    s.push(Spec::Big {
+        negative: true,
+        digits: vec![1 << 59],
+    });
+    s.push(Spec::Big {
+        negative: true,
+        digits: vec![0, 1],
+    });
+    s.push(Spec::Big {
+        negative: true,
+        digits: vec![0, 0, 1],
+    });
+    s.push(Spec::Big {
+        negative: true,
+        digits: vec![0x1234_5678_9abc_def0, 0x0fed_cba9_8765_4321],
+    });
+
+    // External (`EXPORT_EXT`) funs — the only fun kind both sides can produce
+    // (a `make_fun3` local fun is not constructible from `-eval`, and an
+    // `ErlFunEntry`-backed import needs an MD5/serialize pair the oracle will not
+    // hand out; see the crate `CONTEXT.md`).
+    for (module, function, arity) in [
+        ("lists", "sort", 1usize),
+        ("lists", "reverse", 1),
+        ("erlang", "length", 1),
+    ] {
+        s.push(Spec::ExternalFun {
+            module,
+            function,
+            arity,
+        });
+    }
+
+    s
+}
+
+/// Parses an Erlang list of integers printed by `~w`, e.g. `[1,2,3]`.
+fn parse_ints(s: &str) -> Vec<i64> {
+    parse_int_list(s)
+        .into_iter()
+        .map(|v| v.expect("no `none` sentinel expected here"))
+        .collect()
+}
+
+/// The `erlang:phash2/1,2` / `erlang:phash/2` compatibility contract, pinned
+/// against the live oracle over a broad term corpus ([`hash_specs`]).
+#[test]
+fn oracle_agrees_on_make_hash2_and_make_hash() {
+    let specs = hash_specs();
+    let mut bump = Bump::new();
+    let mut atoms = AtomTable::new();
+    let terms: Vec<Eterm> = specs
+        .iter()
+        .map(|s| build(s, &mut bump, &mut atoms))
+        .collect();
+
+    let literals: Vec<String> = specs.iter().map(erl_literal).collect();
+    let expr = format!(
+        "Ts = [{}], io:format(\"~w|~w|~w|~w|~w|~w|~w|~w\", \
+         [[erlang:phash2(T) || T <- Ts], \
+          [erlang:phash2(T, 1 bsl 32) || T <- Ts], \
+          [erlang:phash(T, 1) - 1 || T <- Ts], \
+          [erlang:phash(T, 2) - 1 || T <- Ts], \
+          [erlang:phash(T, 3) - 1 || T <- Ts], \
+          [erlang:phash(T, 1000) - 1 || T <- Ts], \
+          [erlang:phash(T, 4294967295) - 1 || T <- Ts], \
+          [erlang:phash(T, 1 bsl 32) - 1 || T <- Ts]])",
+        literals.join(","),
+    );
+    let Some(out) = erl_stdout(&expr) else {
+        return;
+    };
+    let fields = split_fields(&out);
+    assert_eq!(fields.len(), 8, "unexpected oracle output: {out:?}");
+
+    let phash2_1 = parse_ints(fields[0]);
+    let phash2_2p32 = parse_ints(fields[1]);
+    let phash_r1 = parse_ints(fields[2]);
+    let phash_r2 = parse_ints(fields[3]);
+    let phash_r3 = parse_ints(fields[4]);
+    let phash_r1000 = parse_ints(fields[5]);
+    let phash_rmax = parse_ints(fields[6]);
+    let phash_2p32 = parse_ints(fields[7]);
+    for (name, v) in [
+        ("phash2/1", &phash2_1),
+        ("phash2/2", &phash2_2p32),
+        ("phash/2 r=1", &phash_r1),
+        ("phash/2 r=2", &phash_r2),
+        ("phash/2 r=3", &phash_r3),
+        ("phash/2 r=1000", &phash_r1000),
+        ("phash/2 r=2^32-1", &phash_rmax),
+        ("phash/2 r=2^32", &phash_2p32),
+    ] {
+        assert_eq!(v.len(), specs.len(), "oracle {name} list length");
+    }
+
+    for (i, spec) in specs.iter().enumerate() {
+        let t = terms[i];
+
+        let h2 = make_hash2(t, &atoms)
+            .unwrap_or_else(|e| panic!("make_hash2({spec:?}) failed: {e}"))
+            as i64;
+        assert_eq!(
+            h2, phash2_2p32[i],
+            "make_hash2({spec:?}) must equal erlang:phash2(T, 1 bsl 32)"
+        );
+        assert_eq!(
+            h2 & ((1 << 27) - 1),
+            phash2_1[i],
+            "make_hash2({spec:?}) & (2^27-1) must equal erlang:phash2(T)"
+        );
+
+        // A bare atom additionally pins `AtomTable::hvalue` directly: the
+        // `hash == 0` fast path returns `atom_tab(a)->slot.bucket.hvalue` as the
+        // whole hash.
+        if let Spec::Atom(name) = spec {
+            let atom = atoms.lookup(name).expect("interned above");
+            assert_eq!(
+                h2 as u32,
+                atoms.hvalue(atom),
+                "make_hash2(atom {name:?}) must be AtomTable::hvalue"
+            );
+        }
+
+        let h = make_hash(t, &atoms).unwrap_or_else(|e| panic!("make_hash({spec:?}) failed: {e}"))
+            as i64;
+        assert_eq!(
+            h, phash_2p32[i],
+            "make_hash({spec:?}) must equal erlang:phash(T, 1 bsl 32) - 1"
+        );
+        assert_eq!(h % 1, phash_r1[i], "make_hash({spec:?}) % 1");
+        assert_eq!(h % 2, phash_r2[i], "make_hash({spec:?}) % 2");
+        assert_eq!(h % 3, phash_r3[i], "make_hash({spec:?}) % 3");
+        assert_eq!(h % 1000, phash_r1000[i], "make_hash({spec:?}) % 1000");
+        assert_eq!(
+            h % 4_294_967_295,
+            phash_rmax[i],
+            "make_hash({spec:?}) % (2^32-1)"
+        );
+    }
+}

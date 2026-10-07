@@ -49,8 +49,8 @@ use beam_common::{BeamError, Result};
 use beam_engine::{terms, ExecutionContext, Machine, MinimalContext};
 use beam_loader::{Atom, FunDescriptor, Module};
 use beam_term::{
-    cmp, cmp_arith, is_atom, is_small, make_atom, make_small, signed_value, atom_val, AtomTable,
-    Eterm, MAX_SMALL, MIN_SMALL,
+    atom_val, cmp, cmp_arith, is_atom, is_small, make_atom, make_small, signed_value, AtomTable,
+    Eterm, ERL_ONHEAP_BINARY_LIMIT, MAX_ARITYVAL, MAX_SMALL, MIN_SMALL,
 };
 
 // ---------------------------------------------------------------------------
@@ -147,12 +147,92 @@ pub fn skip_reason() -> Option<String> {
 // Loading with one shared atom table
 // ---------------------------------------------------------------------------
 
+/// The runtime's **well-known atoms** — the C `error_atom[NUMBER_EXIT_CODES]`
+/// table (`../../erts/emulator/beam/beam_common.c:382-406`) plus the
+/// exception-*class* and auxiliary atoms the exceptions family resolves by name
+/// (`src/families/exceptions.rs`: `install_class_atom`, `catch_end`'s `'EXIT'`,
+/// `build_stacktrace`'s `file`/`line`).
+///
+/// A real runtime keeps these **globally interned**, so they are nameable from
+/// *every* module whether or not the module's own source ever mentions them. The
+/// real OTP compiler does **not** emit them into a module's atom chunk — e.g.
+/// `erlc p.erl` on a module whose functions raise `function_clause` /
+/// `{case_clause,_}` / `if_clause` / `{badmatch,_}` / `{try_clause,_}` still
+/// produces an atom list containing none of them — so a module loaded on its own
+/// cannot name its own exception reasons. Seeding them into every loaded module's
+/// atom table is this host's analogue of the runtime's global interning; the
+/// production counterpart is `beam_rt::boot::CORE_ATOMS`.
+///
+/// The engine's lookup policy is deliberately **unchanged**: it still resolves a
+/// reason atom by name from the running module's table and reports a typed
+/// `unsupported` when the name is absent, so a *different* atom is never silently
+/// substituted.
+///
+/// Exposed (`pub`) so a test can assert the exact seed set that the host interns.
+pub const SEED_ATOMS: &[&str] = &[
+    // The C `error_atom` table, in file order (`beam_common.c:382-406`).
+    "internal_error",
+    "normal",
+    "badarg",
+    "badarith",
+    "badmatch",
+    "function_clause",
+    "case_clause",
+    "if_clause",
+    "undef",
+    "badfun",
+    "badarity",
+    "timeout_value",
+    "noproc",
+    "notalive",
+    "system_limit",
+    "try_clause",
+    "notsup",
+    "badmap",
+    "badkey",
+    "badrecord",
+    "badfield",
+    "novalue",
+    // The exception *class* atoms a landing installs into `x(3)` (`error`/`exit`/
+    // `throw`), plus the auxiliaries the family looks up by name: `'EXIT'`
+    // (`catch_end`'s `{'EXIT',Reason}`), `file`/`line` (`build_stacktrace`'s
+    // source location).
+    "error",
+    "exit",
+    "throw",
+    "EXIT",
+    "file",
+    "line",
+];
+
 /// Loads a `.beam` image into the IR, interning its atoms (and its decoded
 /// literal atoms) into `atoms` — the host's one shared [`AtomTable`].
 ///
 /// This is [`beam_loader::load`]'s exact pipeline, re-run through the loader's
 /// public modules so the shared table (not a private per-module one) is the
 /// interning context. See the module docs for why that matters.
+///
+/// # The index-consistency invariant
+///
+/// After this returns, **for every index `i` in the module's atom table,
+/// `module.atom_table.name(i) == atoms.name(i)`** — the shared table and every
+/// loaded module agree on `Atom -> name` for all of the module's indices. That is
+/// what makes a term built by one module compare equal to the same-named atom
+/// interned by another (and lets the tests resolve names through
+/// `ModuleHost::atom_table`). The invariant is maintained by APPENDING to the
+/// shared table only:
+/// * the wire loop pre-interns the chunk atoms into `atoms`, so `build_module`'s
+///   clone already holds them at the same indices;
+/// * `build_module` can only *append* — a literal-only atom is new to the clone,
+///   so it lands at `atoms.len()..`, and re-interning it here in index order
+///   appends it to `atoms` at exactly the same index;
+/// * the [`SEED_ATOMS`] are then appended to both tables in lockstep (each name is
+///   interned into `atoms` first and into the module's own table second; both
+///   tables are equal-length and consistent before each iteration, so both return
+///   the same index whether the name is new or already present).
+///
+/// Existing indices are therefore never shifted, so atom-keyed structures built by
+/// earlier modules (e.g. flat-map storage order) are untouched.
 fn load_with_shared_atoms(bytes: &[u8], atoms: &mut AtomTable) -> Result<Module> {
     use beam_loader::{chunk, container, decode, lower};
 
@@ -179,12 +259,26 @@ fn load_with_shared_atoms(bytes: &[u8], atoms: &mut AtomTable) -> Result<Module>
     // decodes the `LitT` literals; any atom that appeared only in a literal is
     // appended after the clone's prefix at exactly `atoms.len()..`, so merging
     // them back in index order keeps the shared indices identical.
-    let module = lower::build_module(&chunks, &raw, atoms.clone())?;
+    let mut module = lower::build_module(&chunks, &raw, atoms.clone())?;
     let base = atoms.len();
     for index in base..module.atom_table.len() {
         if let Some(name) = module.atom_table.name(Atom::from_raw(index as u32)) {
             atoms.intern(name);
         }
+    }
+
+    // Append the runtime's well-known atoms to the module's own table, in lockstep
+    // with the shared table so the index-consistency invariant holds (see above).
+    // `atoms` is interned first; because the two tables are equal-length and
+    // consistent for all their indices, the module's table resolves the same name
+    // to the same index — whether it is already present or newly appended.
+    for &name in SEED_ATOMS {
+        let shared = atoms.intern(name);
+        let local = module.atom_table.intern(name);
+        debug_assert_eq!(
+            shared, local,
+            "seed atom `{name}` broke the module/shared atom-table index consistency"
+        );
     }
 
     Ok(module)
@@ -458,6 +552,14 @@ enum Compare {
     Ge,
 }
 
+/// A bitwise integer operator (the `erlang` `band`/`bor`/`bxor` BIFs).
+#[derive(Clone, Copy)]
+enum BitOp {
+    And,
+    Or,
+    Xor,
+}
+
 /// A number, as an arithmetic BIF sees it.
 #[derive(Clone, Copy)]
 enum Number {
@@ -531,6 +633,27 @@ impl ModuleHost {
             // Bit shifts: `gb_trees`/`gb_sets`/`array` size arithmetic uses them.
             ("erlang", "bsl", 2) => Some(self.bit_shift(args, true)),
             ("erlang", "bsr", 2) => Some(self.bit_shift(args, false)),
+            // The bitwise operators on small integers (`beam_asm` masks opcodes
+            // with `band`/`bor`).
+            ("erlang", "band", 2) => Some(self.bit_op(args, BitOp::And)),
+            ("erlang", "bor", 2) => Some(self.bit_op(args, BitOp::Or)),
+            ("erlang", "bxor", 2) => Some(self.bit_op(args, BitOp::Xor)),
+            ("erlang", "bnot", 1) => Some(self.bit_not(args)),
+            // `tuple_to_list/1` / `make_tuple/2` — the tuple<->list conversions a
+            // handful of modules (`file_sorter`, `erl_abstract_code`) use.
+            ("erlang", "tuple_to_list", 1) => Some(self.tuple_to_list(args)),
+            ("erlang", "make_tuple", 2) => Some(self.make_tuple(args)),
+            // Binary <-> text conversions: `atom_to_binary/1`,
+            // `iolist_to_binary/1`, `list_to_binary/1` and the mirror
+            // `binary_to_list/1` (`erl_posix_msg`/`re`/`shell_docs_markdown` build
+            // short binaries with them).
+            ("erlang", "atom_to_binary", 1) => Some(self.atom_to_binary(args)),
+            ("erlang", "iolist_to_binary", 1) => Some(self.iolist_to_binary(args)),
+            ("erlang", "list_to_binary", 1) => Some(self.list_to_binary(args)),
+            ("erlang", "binary_to_list", 1) => Some(self.binary_to_list(args)),
+            // `node/0` — `nonode@nohost` for a non-distributed node, the value
+            // `net` branches on.
+            ("erlang", "node", 0) => Some(self.node_name(args)),
             // Term-ordering `max`/`min`: `gb_trees` balancing picks the larger of
             // two heights with `max/2`.
             ("erlang", "max", 2) => Some(self.max_min(args, true)),
@@ -790,6 +913,164 @@ impl ModuleHost {
             .to_string();
         let chars: Vec<Eterm> = name.chars().map(|c| make_small(i64::from(c as u32))).collect();
         terms::make_list(self, &chars)
+    }
+
+    /// `tuple_to_list(Tuple)` — the tuple's elements as a list. A non-tuple is a
+    /// `badarg`.
+    fn tuple_to_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let tuple = args.first().copied().ok_or(BeamError::BadArg)?;
+        let arity = terms::tuple_arity(tuple)?;
+        let mut elements = Vec::with_capacity(arity);
+        for offset in 0..arity {
+            elements.push(terms::tuple_element(tuple, offset)?);
+        }
+        terms::make_list(self, &elements)
+    }
+
+    /// `make_tuple(Arity, Init)` — a tuple of `Arity` copies of `Init`. A
+    /// negative or non-integer arity, or one above [`MAX_ARITYVAL`], is a `badarg`.
+    fn make_tuple(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 2 || !is_small(args[0]) {
+            return Err(BeamError::BadArg);
+        }
+        let arity = signed_value(args[0]);
+        if arity < 0 || arity as u64 > MAX_ARITYVAL as u64 {
+            return Err(BeamError::BadArg);
+        }
+        let elements = vec![args[1]; arity as usize];
+        terms::make_tuple(self, &elements)
+    }
+
+    /// `atom_to_binary(Atom)` — the atom's name as a UTF-8 binary (the atom must
+    /// be a valid Latin-1/Unicode name and fit the host's on-heap binary limit).
+    fn atom_to_binary(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let atom = args.first().copied().ok_or(BeamError::BadArg)?;
+        if !is_atom(atom) {
+            return Err(BeamError::BadArg);
+        }
+        let name = self
+            .atoms
+            .name(atom_val(atom))
+            .ok_or(BeamError::BadArg)?
+            .to_string();
+        terms::make_heap_binary(self, name.as_bytes())
+    }
+
+    /// `iolist_to_binary(IoList)` — an iolist (nested lists of bytes and
+    /// binaries) as one binary. An out-of-range byte, an improper tail or a
+    /// non-iolist element is a `badarg`; a result wider than the host's on-heap
+    /// binary limit is the typed unsupported error.
+    fn iolist_to_binary(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let list = args.first().copied().ok_or(BeamError::BadArg)?;
+        let mut bytes = Vec::new();
+        self.collect_iolist(list, &mut bytes)?;
+        terms::make_heap_binary(self, &bytes)
+    }
+
+    /// `list_to_binary(List)` — a list of bytes as a binary. An out-of-range
+    /// element or an improper list is a `badarg`.
+    fn list_to_binary(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let list = args.first().copied().ok_or(BeamError::BadArg)?;
+        let elements = terms::list_elements(list)?;
+        let mut bytes = Vec::with_capacity(elements.len());
+        for element in elements {
+            if !is_small(element) {
+                return Err(BeamError::BadArg);
+            }
+            let byte = signed_value(element);
+            if !(0..=255).contains(&byte) {
+                return Err(BeamError::BadArg);
+            }
+            bytes.push(byte as u8);
+        }
+        terms::make_heap_binary(self, &bytes)
+    }
+
+    /// `binary_to_list(Bin)` — a binary's bytes as a list. A non-binary is a
+    /// `badarg`.
+    fn binary_to_list(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        let binary = args.first().copied().ok_or(BeamError::BadArg)?;
+        let bytes = terms::binary_bytes(binary)?;
+        let chars: Vec<Eterm> = bytes.iter().map(|&b| make_small(i64::from(b))).collect();
+        terms::make_list(self, &chars)
+    }
+
+    /// `node()` — the node's name, `nonode@nohost` for this host's
+    /// non-distributed setting (the value `net` branches on).
+    fn node_name(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if !args.is_empty() {
+            return Err(BeamError::BadArg);
+        }
+        Ok(self.intern("nonode@nohost"))
+    }
+
+    /// Appends the bytes of an iolist to `out`. Stops early (with the typed
+    /// unsupported error) once the total exceeds the host's on-heap binary limit,
+    /// since such a result could not be represented anyway.
+    fn collect_iolist(&mut self, term: Eterm, out: &mut Vec<u8>) -> Result<()> {
+        if out.len() > ERL_ONHEAP_BINARY_LIMIT {
+            return Err(beam_engine::unsupported("heap binary > 64 bytes"));
+        }
+        if is_small(term) {
+            let byte = signed_value(term);
+            if !(0..=255).contains(&byte) {
+                return Err(BeamError::BadArg);
+            }
+            out.push(byte as u8);
+            return Ok(());
+        }
+        if let Ok(bytes) = terms::binary_bytes(term) {
+            out.extend_from_slice(bytes);
+            return Ok(());
+        }
+        if beam_term::is_nil(term) {
+            return Ok(());
+        }
+        if beam_term::is_list(term) {
+            let mut current = term;
+            loop {
+                let head = terms::cons_head(current)?;
+                self.collect_iolist(head, out)?;
+                let tail = terms::cons_tail(current)?;
+                if beam_term::is_nil(tail) {
+                    return Ok(());
+                }
+                if !beam_term::is_list(tail) {
+                    return Err(BeamError::BadArg);
+                }
+                current = tail;
+            }
+        }
+        Err(BeamError::BadArg)
+    }
+
+    /// `X band Y` / `X bor Y` / `X bxor Y` on small integers. A non-integer
+    /// operand is a `badarith`.
+    fn bit_op(&mut self, args: &[Eterm], op: BitOp) -> Result<Eterm> {
+        if args.len() != 2 {
+            return Err(BeamError::BadArg);
+        }
+        let (x, y) = match (number(args[0]), number(args[1])) {
+            (Some(Number::Int(x)), Some(Number::Int(y))) => (x, y),
+            _ => return Err(BeamError::BadArith),
+        };
+        Ok(make_small(match op {
+            BitOp::And => x & y,
+            BitOp::Or => x | y,
+            BitOp::Xor => x ^ y,
+        }))
+    }
+
+    /// `bnot X` — the bitwise complement of a small integer. A non-integer
+    /// operand is a `badarith`.
+    fn bit_not(&mut self, args: &[Eterm]) -> Result<Eterm> {
+        if args.len() != 1 {
+            return Err(BeamError::BadArg);
+        }
+        match number(args[0]) {
+            Some(Number::Int(x)) => Ok(make_small(!x)),
+            _ => Err(BeamError::BadArith),
+        }
     }
 
     /// `phash(Term, Range)` — the portable hash `dict` buckets its keys with,

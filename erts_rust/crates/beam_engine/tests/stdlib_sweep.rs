@@ -36,7 +36,9 @@
 //!   an unimplemented BIF/mechanism, [`blocked_mechanisms_report_their_typed_error`]
 //!   prints `SKIP: <module>:<f>/<n> — <typed error>` **and asserts the exact typed
 //!   error**, so a later regression that turns a typed error into a *wrong result*
-//!   is caught. It is never a silent pass and never a fabricated expected value.
+//!   is caught. It is never a silent pass and never a fabricated expected value. Its
+//!   synthetic-module counterpart — the full opcode/seam capability-gap inventory —
+//!   lives in `tests/gaps.rs`.
 //!
 //! Ground truth is always the system `erl` (see `tests/fixtures/README.md`); the
 //! stdlib/kernel directories are located at **test time** and every test skips
@@ -580,7 +582,20 @@ fn sweep_base64_builds_an_off_heap_binary() {
 // 4. Blocked mechanisms (asserted loudly, never silently passed)
 // ---------------------------------------------------------------------------
 
-/// Real functions that a **documented, still-open** gap blocks.
+/// Asserts `err` is the exact typed BEAM `badarg` (`BeamError::BadArg`) and prints
+/// the probe's `SKIP:` line — the shared shape of the blocked-mechanism probes.
+fn assert_blocked_badarg(name: &str, err: BeamError) {
+    println!("SKIP: {name} — {err:?}");
+    assert!(
+        matches!(err, BeamError::BadArg),
+        "unexpected `{name}` error: {err:?}"
+    );
+    assert_eq!(
+        err.as_atom(),
+        Some("badarg"),
+        "`{name}` must be the typed BEAM `badarg`"
+    );
+}/// Real functions that a **documented, still-open** gap blocks.
 ///
 /// The property under test is: *the Rust runtime returns a typed [`BeamError`]
 /// where the oracle returns a correct value* — never a silently-wrong value. Each
@@ -593,6 +608,22 @@ fn sweep_base64_builds_an_off_heap_binary() {
 /// floor: the map-operation BIFs (`maps:put/3`, `maps:size/1`, `maps:get/2`, …)
 /// are `erlang` BIFs the harness does not serve, so any call that needs them is a
 /// typed `BadArg`.
+///
+/// Every probe is a *real installed module's export* and is verified empirically:
+/// the oracle value is quoted beside it and the exact typed error is asserted, so
+/// the invariant under test is "a typed error where the oracle returns a value" —
+/// never a wrong value and never a silent pass.
+///
+/// Candidates that were tried and **dropped** after measuring (kept here so the
+/// next pass does not re-try them):
+/// * `string:uppercase/1` — the host **serves** it: `sweep_string_module` runs it to
+///   the oracle's `"ABC"`, so it is evidence of the served floor, not a gap.
+/// * `erlang:process_info/1` / `erlang:spawn/1` — `erlang` is not a loadable module,
+///   so `host.call("erlang", …)` fails at **load** with `BeamError::Io`
+///   (no `erlang.beam`): a harness artifact, not a BIF-floor gap. The real exports
+///   that reach them (`c:i/0`, `rpc:async_call/4`) are blocked on the whole
+///   process/mailbox/distribution machinery, which the `code_server:call/1` probe
+///   below pins to its own exact typed error.
 #[test]
 fn blocked_mechanisms_report_their_typed_error() {
     if skip_if_unavailable() {
@@ -642,6 +673,133 @@ fn blocked_mechanisms_report_their_typed_error() {
         matches!(err, BeamError::BadArg),
         "unexpected `unicode:characters_to_binary/1` error: {err:?}"
     );
+
+    // `unicode:characters_to_list/1` — the mirror direction, a `unicode` NIF
+    // (`characters_to_list/1` → `call_ext characters_to_list/2` → `bif`) the host
+    // floor does not serve, so the real module's call is a typed `badarg`.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[unicode:characters_to_list("hi")]),halt().'
+    //         "hi"
+    let s = chars(&mut host, "hi");
+    assert_blocked_badarg(
+        "unicode:characters_to_list/1",
+        host.call("unicode", "characters_to_list", &[s])
+            .expect_err("`unicode:characters_to_list/1` is a NIF the host floor does not serve"),
+    );
+
+    // ---- real `maps` operations ------------------------------------------
+    // `maps:new/0` is pure compiled code (`new() -> #{}`), so it *runs*; every
+    // `maps` operation over an argument then stops at an unserved BIF. The map is
+    // built test-side (the runtime cannot build a non-empty one — `maps:put/3` is
+    // itself one of the unserved BIFs), so each probe is a real `maps` export over
+    // a real `#{k => 1}`.
+    //
+    // Installed-`maps.beam` evidence (`beam_disasm`): `maps:get/2`, `maps:keys/1`
+    // and `maps:put/3` are `erlang:nif_error(undef)` stubs — the harness's
+    // `nif_error/1` answers the typed `badarg` — and `maps:size/1` opens with a
+    // `gc_bif` for the map-size BIF, likewise unserved.
+    let map = terms::make_flatmap(&mut host, &[(k, make_small(1))]).expect("a flat map #{k=>1}");
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:size(#{k=>1})]),halt().'
+    //         1
+    assert_blocked_badarg(
+        "maps:size/1",
+        host.call("maps", "size", &[map])
+            .expect_err("`maps:size/1` needs an unserved map BIF"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:get(k,#{k=>1})]),halt().'
+    //         1
+    assert_blocked_badarg(
+        "maps:get/2",
+        host.call("maps", "get", &[k, map])
+            .expect_err("`maps:get/2` is an `erlang:nif_error/1` stub"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:keys(#{k=>1})]),halt().'
+    //         [k]
+    assert_blocked_badarg(
+        "maps:keys/1",
+        host.call("maps", "keys", &[map])
+            .expect_err("`maps:keys/1` is an `erlang:nif_error/1` stub"),
+    );
+
+    // oracle: erl -noshell -eval 'io:format("~p~n",[maps:put(k,1,#{k=>1})]),halt().'
+    //         #{k => 1}
+    assert_blocked_badarg(
+        "maps:put/3",
+        host.call("maps", "put", &[k, make_small(1), map])
+            .expect_err("`maps:put/3` is an `erlang:nif_error/1` stub"),
+    );
+
+    // ---- ets -------------------------------------------------------------
+    // `ets:new/2` is likewise an `erlang:nif_error(undef)` stub: the host has no
+    // table registry, so creating a table is a typed `badarg`, never a fake tid.
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[is_reference(ets:new(t,[]))]),halt().'
+    //         true
+    let table = host.intern("t");
+    let opts = support::term_list(&mut host, &[]);
+    assert_blocked_badarg(
+        "ets:new/2",
+        host.call("ets", "new", &[table, opts])
+            .expect_err("`ets:new/2` needs the ETS BIF the host does not serve"),
+    );
+
+    // ---- code loading ----------------------------------------------------
+    // `code:which/1` resolves a module's `.beam` through the code server and the
+    // loader BIFs; the host serves neither, so it is a typed `badarg` (in the
+    // oracle it is the `…/lists.beam` path).
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[is_list(code:which(lists))]),halt().'
+    //         true
+    let lists = host.intern("lists");
+    assert_blocked_badarg(
+        "code:which/1",
+        host.call("code", "which", &[lists])
+            .expect_err("`code:which/1` needs the code-loading BIFs"),
+    );
+
+    // ---- io --------------------------------------------------------------
+    // The host has no `io` device/port, so `io:format/2` cannot be served: it is a
+    // typed `badarg` rather than a silent no-op (the oracle prints and returns
+    // `ok`).
+    //
+    // oracle: erl -noshell -eval 'io:format("~p~n",[1]),halt().'
+    //         1
+    //         ok
+    let fmt = chars(&mut host, "~p~n");
+    let args = support::term_list(&mut host, &[make_small(1)]);
+    assert_blocked_badarg(
+        "io:format/2",
+        host.call("io", "format", &[fmt, args])
+            .expect_err("`io:format/2` needs the `io` device the host does not have"),
+    );
+
+    // ---- a live process / mailbox ----------------------------------------
+    // `code_server:call/1` (a real `kernel` export) drives the code server's
+    // request/reply protocol, which needs a **live process with a mailbox**. The
+    // host installs no mailbox, so the engine's receive family answers with its
+    // exact typed seam error at the first marker operation — the real-corpus
+    // confirmation of the `context/mailbox-*` inventory rows in `tests/gaps.rs`.
+    // (The oracle blocks here and returns the reply, e.g. `code_server:call/1`
+    // with a code-server request.)
+    let which = host.intern("which");
+    let err = host
+        .call("code_server", "call", &[which])
+        .expect_err("`code_server:call/1` needs a live process mailbox");
+    println!("SKIP: code_server:call/1 — {err:?}");
+    match &err {
+        BeamError::Raise(raise) => {
+            let got = raise.reason.as_atom();
+            assert_eq!(
+                got,
+                Some("unsupported_opcode: receive_marker_reserve"),
+                "unexpected `code_server:call/1` typed error: {err:?}"
+            );
+        }
+        other => panic!("`code_server:call/1` must be the typed mailbox error, got {other:?}"),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -712,3 +870,4 @@ fn chars(host: &mut ModuleHost, text: &str) -> Eterm {
 fn assert_str(host: &ModuleHost, got: Eterm, want: &str) {
     assert_int_list(host, got, &want.bytes().map(i64::from).collect::<Vec<_>>());
 }
+

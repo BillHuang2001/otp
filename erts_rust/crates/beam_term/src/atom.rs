@@ -151,6 +151,46 @@ impl AtomTable {
         table.seed_from_atom_names(src)?;
         Ok(table)
     }
+
+    /// The atom's cached hash value — the C's `atom_tab(a)->slot.bucket.hvalue`
+    /// (`erts/emulator/beam/atom.c:82` `atom_hash`): the Dragon-Book `hashpjw`
+    /// over the atom name's UTF-8 bytes, with the latin1 "clutch" that folds a
+    /// `0xC2 0x80..0xBF` pair back into one byte first.
+    ///
+    /// This is the value `make_hash2`/`make_hash` mix in for an atom, so it is
+    /// part of the `erlang:phash2/1,2` / `erlang:phash/2` compatibility contract.
+    ///
+    /// The C keeps the running accumulator in a `byte` (`byte v;` in `atom_hash`)
+    /// while the shift register `h` is a `Uint32`; both wrap — reproduced here.
+    ///
+    /// An `a` whose index is not in this table has no name and therefore no
+    /// `hvalue`; rather than panicking we fall back to the raw index (documented,
+    /// deterministic). Use [`AtomTable::name`] to distinguish that case.
+    pub fn hvalue(&self, a: Atom) -> u32 {
+        let Some(name) = self.name(a) else {
+            return a.raw();
+        };
+        let mut h: u32 = 0;
+        let bytes = name.as_bytes();
+        let mut i = 0usize;
+        while i < bytes.len() {
+            // `byte v;` — 8-bit accumulator, so the shift-out wraps.
+            let mut v: u8 = bytes[i];
+            i += 1;
+            if (v & 0xFE) == 0xC2 && i < bytes.len() && (bytes[i] & 0xC0) == 0x80 {
+                // latin1 clutch: 0xC2 0x80..0xBF is one latin1 code point.
+                v = (v << 6) | (bytes[i] & 0x3F);
+                i += 1;
+            }
+            h = h.wrapping_shl(4).wrapping_add(u32::from(v));
+            let g = h & 0xf000_0000;
+            if g != 0 {
+                h ^= g >> 24;
+                h ^= g;
+            }
+        }
+        h
+    }
 }
 
 /// Tokenise the names on one `atom ...` line, appending them to `out`.

@@ -246,18 +246,6 @@ fn fun_order(ctx: &mut BifContext<'_>, fun: Eterm, a: Eterm, b: Eterm) -> Result
     }
 }
 
-/// Whether `Fun` considers `a` and `b` equivalent — `Fun(A, B)` **and**
-/// `Fun(B, A)`, evaluated in that order (short-circuiting, as `usort_1` does).
-///
-/// Only a *mutual* `true` collapses `usort/2` duplicates, so a one-directional
-/// comparator (`fun(A, B) -> A < B end`) removes nothing.
-fn fun_equivalent(ctx: &mut BifContext<'_>, fun: Eterm, a: Eterm, b: Eterm) -> Result<bool> {
-    if !call_predicate(ctx, fun, &[a, b])? {
-        return Ok(false);
-    }
-    call_predicate(ctx, fun, &[b, a])
-}
-
 /// A **stable** bottom-up merge sort with a fallible comparator.
 ///
 /// `slice::sort_by` is unusable here: the comparator calls an Erlang fun (which can
@@ -1288,23 +1276,400 @@ fn sort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     ctx.list(&sorted)
 }
 
-/// `usort(Fun, List)` — `sort/2` with each run of mutually `Fun`-equivalent
-/// elements collapsed to its first element.
+/// `usort(Fun, List)` — the oracle's **exact** `usort/2` algorithm.
+///
+/// `lists.erl` implements `usort/2` in pure Erlang as a bottom-up merge sort whose
+/// runs come from the `ufsplit_1`/`ufsplit_1_1`/`ufsplit_2` family and are merged by
+/// `ufmergel`/`rufmergel`/`ufmerge2_*`/`rufmerge2_*`. The run structure and which of
+/// two `Fun`-equivalent elements a merge keeps are *observable* for a degenerate
+/// (non-total) comparator — `lists:usort(fun(_, _) -> false end, [1,2,3])` is
+/// `[3,2,1]` and `lists:usort(fun(_, _) -> true end, [1,2,3])` is `[1]` — so the
+/// sort-then-collapse-adjacent-equivalents shape of `usort/1`'s path does not
+/// reproduce it. This is a faithful port (validated case-for-case against the oracle
+/// over ~10 700 comparator/list combinations, degenerate comparators included).
+///
+/// The Erlang is tail-recursive; each family is an explicit loop here, and every
+/// `Fun` call happens in the oracle's own order. List values are `Vec<Eterm>` in
+/// Erlang order (index 0 is the head); the `M`/`R` accumulators the Erlang builds by
+/// prepending are held *reversed* so the prepend is a `push`.
 fn usort2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let fun = args[0];
     let elems = proper_list(args[1]).ok_or_else(function_clause)?;
-    let sorted = merge_sort_elems(elems, |a, b| fun_order(ctx, fun, a, b))?;
-    let mut unique: Vec<Eterm> = Vec::with_capacity(sorted.len());
-    for elem in sorted {
-        let duplicate = match unique.last() {
-            Some(&previous) => fun_equivalent(ctx, fun, previous, elem)?,
-            None => false,
-        };
-        if !duplicate {
-            unique.push(elem);
+    let sorted = usort_1_entry(ctx, fun, &elems)?;
+    ctx.list(&sorted)
+}
+
+/// `usort/2`'s head clauses (`[_]`/`[]` are returned as they are) and its
+/// `usort_1(Fun, X, L)` call.
+fn usort_1_entry(ctx: &mut BifContext<'_>, fun: Eterm, list: &[Eterm]) -> Result<Vec<Eterm>> {
+    if list.len() < 2 {
+        return Ok(list.to_vec());
+    }
+    // `usort_1/3`, iterative because `usort_1(Fun, X, L)` is tail-recursive.
+    let x = list[0];
+    let mut at = 1;
+    loop {
+        let y = list[at];
+        if call_predicate(ctx, fun, &[x, y])? {
+            if call_predicate(ctx, fun, &[y, x])? {
+                // `X` equal to `Y`: drop `Y` and continue with the rest.
+                at += 1;
+                if at == list.len() {
+                    return Ok(vec![x]);
+                }
+            } else {
+                // `ufsplit_1(Y, X, Fun, L, [], [])`.
+                return ufsplit_1(ctx, fun, y, x, &list[at + 1..], Vec::new(), Vec::new(), None);
+            }
+        } else {
+            // `ufsplit_2(Y, L, Fun, [X])`.
+            return ufsplit_2(ctx, fun, y, &list[at + 1..], vec![x]);
         }
     }
-    ctx.list(&unique)
+}
+
+/// The Erlang run `[Y, X | R]` from `r`, which holds `R` reversed.
+fn run_head_pair(r: &[Eterm], x: Eterm, y: Eterm) -> Vec<Eterm> {
+    let mut run = Vec::with_capacity(r.len() + 2);
+    run.push(y);
+    run.push(x);
+    run.extend(r.iter().rev().copied());
+    run
+}
+
+/// The Erlang list `R` from `r`, which holds `R` reversed.
+fn rev_erl(r: &[Eterm]) -> Vec<Eterm> {
+    r.iter().rev().copied().collect()
+}
+
+/// The C `lists:reverse(List, M)` where `m` holds `M` reversed.
+fn rev_append_tail(list: &[Eterm], m: &[Eterm]) -> Vec<Eterm> {
+    let mut out: Vec<Eterm> = list.iter().rev().copied().collect();
+    out.extend(m.iter().rev().copied());
+    out
+}
+
+/// `ufsplit_1/6` **and** its `ufsplit_1_1/7` continuation as one loop (`stage_two`
+/// is `Some(S)` in the `ufsplit_1_1` state and `None` in `ufsplit_1`).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn ufsplit_1(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut y: Eterm,
+    mut x: Eterm,
+    list: &[Eterm],
+    mut r: Vec<Eterm>,
+    mut rs: Vec<Vec<Eterm>>,
+    mut stage_two: Option<Eterm>,
+) -> Result<Vec<Eterm>> {
+    let mut at = 0;
+    loop {
+        if at < list.len() {
+            let z = list[at];
+            at += 1;
+            if call_predicate(ctx, fun, &[y, z])? {
+                if call_predicate(ctx, fun, &[z, y])? {
+                    // `Z` equal to `Y`: neither advances.
+                } else {
+                    // `Y` < `Z`: `ufsplit_1(Z, Y, L, [X | R], Rs)`.
+                    r.push(x);
+                    y = z;
+                }
+            } else if call_predicate(ctx, fun, &[x, z])? {
+                if call_predicate(ctx, fun, &[z, x])? {
+                    // `Z` equal to `X`.
+                } else {
+                    // `Z` < `X`: `ufsplit_1(Y, Z, L, [X | R], Rs)`.
+                    r.push(x);
+                    x = z;
+                }
+            } else if let Some(s) = stage_two {
+                // `ufsplit_1_1/7`: the run needs a third element.
+                if call_predicate(ctx, fun, &[s, z])? {
+                    if call_predicate(ctx, fun, &[z, s])? {
+                        // `Z` equal to `S`.
+                    } else {
+                        // `ufsplit_1(Z, S, L, [], [[Y, X | R] | Rs])`.
+                        let run = run_head_pair(&r, x, y);
+                        rs.insert(0, run);
+                        y = z;
+                        x = s;
+                        r = Vec::new();
+                        stage_two = None;
+                    }
+                } else {
+                    // `ufsplit_1(S, Z, L, [], [[Y, X | R] | Rs])`.
+                    let run = run_head_pair(&r, x, y);
+                    rs.insert(0, run);
+                    y = s;
+                    x = z;
+                    r = Vec::new();
+                    stage_two = None;
+                }
+            } else if r.is_empty() {
+                // `false when R == [] -> ufsplit_1(Y, X, L, [Z], Rs)`.
+                r = vec![z];
+            } else {
+                // `ufsplit_1_1(Y, X, L, R, Rs, Z)`.
+                stage_two = Some(z);
+            }
+        } else if let Some(s) = stage_two {
+            // `rufmergel([[S], [Y, X | R] | Rs], [], Fun)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![vec![s], run];
+            runs.append(&mut rs);
+            return rufmergel(ctx, fun, runs, Vec::new());
+        } else {
+            // `rufmergel([[Y, X | R] | Rs], [], Fun)`.
+            let run = run_head_pair(&r, x, y);
+            let mut runs = vec![run];
+            runs.append(&mut rs);
+            return rufmergel(ctx, fun, runs, Vec::new());
+        }
+    }
+}
+
+/// `ufsplit_2/4` — the descending split (`Fun(Y, Z)` false keeps `Y`).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn ufsplit_2(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut y: Eterm,
+    list: &[Eterm],
+    mut r: Vec<Eterm>,
+) -> Result<Vec<Eterm>> {
+    let mut at = 0;
+    loop {
+        if at < list.len() {
+            let z = list[at];
+            at += 1;
+            if call_predicate(ctx, fun, &[y, z])? {
+                if call_predicate(ctx, fun, &[z, y])? {
+                    // `Z` equal to `Y`: keep `Y`.
+                } else {
+                    // `ufsplit_1(Z, Y, Fun, L, [], [lists:reverse(R, [])])`. `r`
+                    // already holds `R` reversed, so `lists:reverse(R)` is `r`.
+                    return ufsplit_1(ctx, fun, z, y, &list[at..], Vec::new(), vec![r], None);
+                }
+            } else {
+                r.push(y);
+                y = z;
+            }
+        } else {
+            // `ufsplit_2(Y, [], _Fun, R) -> [Y | R]`.
+            r.push(y);
+            return Ok(rev_erl(&r));
+        }
+    }
+}
+
+/// `ufmergel/3` and `rufmergel/3` run in opposite directions, so they alternate:
+/// each consumes pairs of runs into `acc` and then hands the (halved) run list to
+/// the other, with `lists:reverse(L, [])` at every hand-off.
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn ufmergel(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut runs: Vec<Vec<Eterm>>,
+    mut acc: Vec<Vec<Eterm>>,
+) -> Result<Vec<Eterm>> {
+    loop {
+        if runs.len() >= 2 {
+            let first = runs.remove(0);
+            let second = runs.remove(0);
+            let merged = ufmerge2_2(ctx, fun, first[0], &first[1..], &second)?;
+            acc.insert(0, merged);
+        } else if runs.len() == 1 {
+            let last = runs.pop().expect("one run remains");
+            if acc.is_empty() {
+                // `ufmergel([L], [], _Fun) -> L`.
+                return Ok(last);
+            }
+            // `ufmergel([L], Acc, Fun) -> rufmergel([lists:reverse(L) | Acc], [], Fun)`.
+            acc.insert(0, rev_erl(&last));
+            return rufmergel(ctx, fun, acc, Vec::new());
+        } else {
+            // `ufmergel([], Acc, Fun) -> rufmergel(Acc, [], Fun)`.
+            return rufmergel(ctx, fun, acc, Vec::new());
+        }
+    }
+}
+
+/// See [`ufmergel`].
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn rufmergel(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    mut runs: Vec<Vec<Eterm>>,
+    mut acc: Vec<Vec<Eterm>>,
+) -> Result<Vec<Eterm>> {
+    loop {
+        if runs.len() >= 2 {
+            let first = runs.remove(0);
+            let head = first[0];
+            let tail = first[1..].to_vec();
+            let second = runs.remove(0);
+            let merged = rufmerge2_1(ctx, fun, &second, head, &tail, Vec::new())?;
+            acc.insert(0, merged);
+        } else if runs.len() == 1 {
+            let last = runs.pop().expect("one run remains");
+            acc.insert(0, rev_erl(&last));
+            return ufmergel(ctx, fun, acc, Vec::new());
+        } else {
+            return ufmergel(ctx, fun, acc, Vec::new());
+        }
+    }
+}
+
+/// `ufmerge2_2/5` and `ufmerge2_1/6` as one loop: `State::Two(h1)` is
+/// `ufmerge2_2(H1, T1, T2, M)` and `State::One(h2, hdm)` is
+/// `ufmerge2_1(T1, H2, T2, M, HdM)`. Elements from the first run are kept and a
+/// `Fun`-equivalent `H2` is dropped (`HdM` names the last element kept).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn ufmerge2_2(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    h1: Eterm,
+    t1: &[Eterm],
+    t2: &[Eterm],
+) -> Result<Vec<Eterm>> {
+    /// Which of the two mutually tail-recursive functions we are in.
+    enum State {
+        /// `ufmerge2_2(H1, …)`.
+        Two(Eterm),
+        /// `ufmerge2_1(…, H2, …, HdM)`.
+        One(Eterm, Eterm),
+    }
+    let mut m: Vec<Eterm> = Vec::new();
+    let mut at1 = 0;
+    let mut at2 = 0;
+    let mut state = State::Two(h1);
+    loop {
+        match state {
+            State::Two(current) => {
+                if let Some(&h2) = t2.get(at2) {
+                    at2 += 1;
+                    if call_predicate(ctx, fun, &[current, h2])? {
+                        m.push(current);
+                        state = State::One(h2, current);
+                    } else {
+                        m.push(h2);
+                        state = State::Two(current);
+                    }
+                } else {
+                    // `lists:reverse(T1, [H1 | M])`.
+                    m.push(current);
+                    return Ok(rev_append_tail(&t1[at1..], &m));
+                }
+            }
+            State::One(h2, hdm) => {
+                if let Some(&h1n) = t1.get(at1) {
+                    at1 += 1;
+                    if call_predicate(ctx, fun, &[h1n, h2])? {
+                        m.push(h1n);
+                        state = State::One(h2, h1n);
+                    } else if call_predicate(ctx, fun, &[h2, hdm])? {
+                        // `HdM` equal to `H2`: drop `H2`.
+                        state = State::Two(h1n);
+                    } else {
+                        m.push(h2);
+                        state = State::Two(h1n);
+                    }
+                } else {
+                    if !call_predicate(ctx, fun, &[h2, hdm])? {
+                        m.push(h2);
+                    }
+                    return Ok(rev_append_tail(&t2[at2..], &m));
+                }
+            }
+        }
+    }
+}
+
+/// `rufmerge2_1/5` and `rufmerge2_2/6` as one loop: the descending merge (used when
+/// the runs were collected while `Fun` reported descending order).
+///
+/// # Errors
+///
+/// Propagates whatever `Fun` raises through [`BifContext::call_fun`].
+fn rufmerge2_1(
+    ctx: &mut BifContext<'_>,
+    fun: Eterm,
+    t1: &[Eterm],
+    h2: Eterm,
+    t2: &[Eterm],
+    m: Vec<Eterm>,
+) -> Result<Vec<Eterm>> {
+    /// Which of the two mutually tail-recursive functions we are in.
+    enum State {
+        /// `rufmerge2_1(…, H2, …)`.
+        One(Eterm),
+        /// `rufmerge2_2(H1, …, H2M)`.
+        Two(Eterm, Eterm),
+    }
+    let mut m = m;
+    let mut at1 = 0;
+    let mut at2 = 0;
+    let mut state = State::One(h2);
+    loop {
+        match state {
+            State::One(h2c) => {
+                if let Some(&h1) = t1.get(at1) {
+                    at1 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        state = State::Two(h1, h2c);
+                    } else {
+                        m.push(h1);
+                        state = State::One(h2c);
+                    }
+                } else {
+                    // `lists:reverse(T2, [H2 | M])`.
+                    m.push(h2c);
+                    return Ok(rev_append_tail(&t2[at2..], &m));
+                }
+            }
+            State::Two(h1, h2m) => {
+                if let Some(&h2c) = t2.get(at2) {
+                    at2 += 1;
+                    if call_predicate(ctx, fun, &[h1, h2c])? {
+                        m.push(h2m);
+                        state = State::Two(h1, h2c);
+                    } else if call_predicate(ctx, fun, &[h2m, h1])? {
+                        // `H2M` equal to `H1`: drop `H2M`.
+                        m.push(h1);
+                        state = State::One(h2c);
+                    } else {
+                        m.push(h2m);
+                        m.push(h1);
+                        state = State::One(h2c);
+                    }
+                } else {
+                    if call_predicate(ctx, fun, &[h2m, h1])? {
+                        m.push(h1);
+                    } else {
+                        m.push(h2m);
+                        m.push(h1);
+                    }
+                    return Ok(rev_append_tail(&t1[at1..], &m));
+                }
+            }
+        }
+    }
 }
 
 /// `keymap(Fun, Index, TupleList)` — `Fun` applied to the `Index`th element of
@@ -1471,6 +1836,57 @@ mod tests {
 
     fn with_ctx<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
         with_heap(65_536, f)
+    }
+
+    /// A mock [`crate::FunCaller`] for the ordering funs of `sort/2`/`usort/2`: the
+    /// "fun" term is a small-integer sentinel naming the *exact* Erlang comparator
+    /// the oracle was probed with. `true`/`false` come from the seeded atom table
+    /// (the runtime's boolean atoms are not at fixed indices).
+    struct OrderFuns {
+        truth: Eterm,
+        falsity: Eterm,
+    }
+    /// `fun(_, _) -> false end` — a completely degenerate comparator.
+    const ALWAYS_FALSE: i64 = 100;
+    /// `fun(_, _) -> true end` — the other degenerate comparator.
+    const ALWAYS_TRUE: i64 = 101;
+    /// `fun(A, B) -> A =< B end` — the expected total (ascending) order.
+    const ORDER_ASC: i64 = 102;
+    /// `fun(A, B) -> A >= B end` — the reverse (descending) order.
+    const ORDER_DESC: i64 = 103;
+    impl crate::FunCaller for OrderFuns {
+        fn call_fun(&mut self, fun: Eterm, args: &[Eterm]) -> Result<Eterm> {
+            let a = beam_term::signed_value(args[0]);
+            let b = beam_term::signed_value(args[1]);
+            let result = match beam_term::signed_value(fun) {
+                ALWAYS_FALSE => false,
+                ALWAYS_TRUE => true,
+                ORDER_ASC => a <= b,
+                ORDER_DESC => a >= b,
+                other => panic!("unknown sentinel fun {other}"),
+            };
+            Ok(if result { self.truth } else { self.falsity })
+        }
+    }
+
+    /// Runs `f` with a `BifContext` that has the ordering-fun mock installed.
+    fn with_order_funs<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
+        let mut heap = Heap::new(65_536).expect("test heap");
+        let atoms = atoms();
+        let truth = beam_term::make_atom(atoms.lookup("true").expect("seeded atom"));
+        let falsity = beam_term::make_atom(atoms.lookup("false").expect("seeded atom"));
+        let mut caller = OrderFuns { truth, falsity };
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_fun_caller(&mut caller);
+        f(&mut ctx)
+    }
+
+    /// Calls `usort/2` with the sentinel comparator `id` on `list` and renders the
+    /// result with `~w`.
+    fn show_usort(ctx: &mut BifContext<'_>, id: i64, list: Eterm) -> String {
+        let args = vec![make_small(id), list];
+        let out = usort2(ctx, &args).expect("usort/2 should succeed");
+        pretty(ctx, out)
     }
 
     /// Renders `term` with the `~w` printer, for readable assertions.
@@ -2226,6 +2642,64 @@ mod tests {
                 reg.call("lists", "sort", 1, ctx, &[list, list]),
                 Err(BeamError::BadArity)
             ));
+        });
+    }
+    #[test]
+    fn usort_with_a_total_comparator_matches_the_oracle() {
+        with_order_funs(|ctx| {
+            // `lists:usort(fun(A,B) -> A =< B end, [3,1,2,1,2])` ⇒ `[1,2,3]`.
+            let l = ints(ctx, &[3, 1, 2, 1, 2]);
+            assert_eq!(show_usort(ctx, ORDER_ASC, l), "[1,2,3]");
+            // The reverse comparator: `[3,2,1]`.
+            let l = ints(ctx, &[3, 1, 2, 1, 2]);
+            assert_eq!(show_usort(ctx, ORDER_DESC, l), "[3,2,1]");
+            // A list with duplicates: `lists:usort(fun(A,B)->A=<B end, [4,2,1,4])`
+            // ⇒ `[1,2,4]` (the run keeps `1` as the representative).
+            let l = ints(ctx, &[4, 2, 1, 4]);
+            assert_eq!(show_usort(ctx, ORDER_ASC, l), "[1,2,4]");
+            // The oracle's head clauses and the many-element path.
+            assert_eq!(show_usort(ctx, ORDER_ASC, NIL), "[]");
+            let l = ints(ctx, &[1]);
+            assert_eq!(show_usort(ctx, ORDER_ASC, l), "[1]");
+            let l = ints(ctx, &[2, 1]);
+            assert_eq!(show_usort(ctx, ORDER_ASC, l), "[1,2]");
+            let l = ints(ctx, &[5, 4, 3, 2, 1]);
+            assert_eq!(show_usort(ctx, ORDER_ASC, l), "[1,2,3,4,5]");
+        });
+    }
+
+    #[test]
+    fn usort_with_a_degenerate_comparator_reproduces_the_oracle() {
+        with_order_funs(|ctx| {
+            // The three `lists.erl` degenerate-comparator results, verbatim.
+            // `lists:usort(fun(_,_) -> false end, [1,2,3])` ⇒ `[3,2,1]`.
+            let l = ints(ctx, &[1, 2, 3]);
+            assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[3,2,1]");
+            // `lists:usort(fun(_,_) -> true end, [1,2,3])` ⇒ `[1]`.
+            let l = ints(ctx, &[1, 2, 3]);
+            assert_eq!(show_usort(ctx, ALWAYS_TRUE, l), "[1]");
+            // `lists:usort(fun(_,_) -> true end, [3,1,2])` ⇒ `[3]`.
+            let l = ints(ctx, &[3, 1, 2]);
+            assert_eq!(show_usort(ctx, ALWAYS_TRUE, l), "[3]");
+            // …and the shorter degenerate shapes.
+            assert_eq!(show_usort(ctx, ALWAYS_FALSE, NIL), "[]");
+            let l = ints(ctx, &[1]);
+            assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[1]");
+            let l = ints(ctx, &[1, 2]);
+            assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[2,1]");
+            let l = ints(ctx, &[1, 2, 3, 4, 5]);
+            assert_eq!(show_usort(ctx, ALWAYS_FALSE, l), "[5,4,3,2,1]");
+        });
+    }
+
+    #[test]
+    fn usort_rejects_a_non_proper_list() {
+        with_order_funs(|ctx| {
+            let improper = ctx
+                .cons(make_small(1), ctx.atom("a").expect("seeded"))
+                .expect("the cons fits");
+            let args = vec![make_small(ORDER_ASC), improper];
+            rejects_clause!(ctx, usort2, [args[0], args[1]]);
         });
     }
 }

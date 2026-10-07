@@ -2,9 +2,11 @@
 //!
 //! Milestone-1 ships the built-in byte-stream driver [`FdDriver`] (registered under the
 //! name `"fd"`), which is enough to prove the poller→port→driver path end to end, plus
-//! the [`EfileDriver`] (`"efile"`) built on top of it and the OS-child [`SpawnDriver`]
-//! (`"spawn"`, the Rust counterpart of the C `spawn` driver). The legacy C's
-//! `tcp_inet`/`forker` drivers (`erts/emulator/drivers/common/*.c`) are documented
+//! the [`EfileDriver`] (`"efile"`) built on top of it, the OS-child [`SpawnDriver`]
+//! (`"spawn"`, the Rust counterpart of the C `spawn` driver) and the TCP socket
+//! [`TcpInetDriver`] (`"tcp_inet"`, the Rust counterpart of the C TCP driver
+//! `gen_tcp` sits on). The legacy C's `forker` driver and the `inet` driver's
+//! UDP/SCTP/IPv6 halves (`erts/emulator/drivers/common/*.c`) are documented
 //! follow-ups (see the crate `CONTEXT.md`, Known Issues).
 //!
 //! `SpawnDriver` is constructed **directly** from a [`SpawnSpec`] rather than through the
@@ -18,16 +20,25 @@
 //! * [`binary_io`] — the ERTS port *phase change* between list/text and raw binary
 //!   framing (`ERTS_PORT_SFLG_BINARY_IO`); and
 //! * [`efile`] — the `efile` driver: `FdDriver` in read-only/write-only form plus the
-//!   `efile` control family.
+//!   `efile` control family; and
+//! * [`inet`] — the `tcp_inet` socket driver: one TCP socket behind one port, with the
+//!   `gen_tcp` control vocabulary (`open`/`bind`/`listen`/`accept`/`connect`/`send`/
+//!   `recv`/`shutdown`/`close`).
 
 pub mod binary_io;
 pub mod efile;
 pub mod fd;
+pub mod inet;
 pub mod line_buffer;
 pub mod spawn;
 
 pub use crate::drivers::binary_io::{Phase, PhaseChange};
 pub use crate::drivers::efile::{make_efile, EfileDriver};
 pub use crate::drivers::fd::FdDriver;
+pub use crate::drivers::inet::{
+    make_tcp_inet, InetState, TcpInetDriver, DRIVER_NAME, INET_AF_ANY, INET_AF_INET,
+    INET_AF_LOOPBACK, INET_PROTO_DEFAULT, INET_PROTO_TCP, INET_REP_ERROR, INET_REP_OK,
+    INET_TYPE_STREAM, TCP_SHUT_RD, TCP_SHUT_RDWR, TCP_SHUT_WR,
+};
 pub use crate::drivers::line_buffer::{LineBuffer, DEFAULT_MAX_LINE_LEN};
 pub use crate::drivers::spawn::{build_command, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream};

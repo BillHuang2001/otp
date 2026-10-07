@@ -7,6 +7,7 @@
 //! `schedule_events` + `execute_port_tasks`) and the port's queues. Every wait is bounded, so
 //! a broken driver fails the test instead of hanging it.
 
+use std::os::unix::fs::PermissionsExt;
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -129,6 +130,17 @@ fn pump_until(
     done(registry, poller)
 }
 
+/// Puts `fd` in non-blocking mode, so a bounded read loop over it cannot hang the test.
+fn set_nonblocking(fd: std::os::unix::io::RawFd) {
+    // SAFETY: `F_GETFL` reads the status flags of the descriptor the caller owns and takes no
+    // pointer argument.
+    let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+    assert!(flags >= 0, "F_GETFL succeeds");
+    // SAFETY: the same owned descriptor; adding `O_NONBLOCK` to the current status flags is a
+    // valid `F_SETFL` update that neither closes nor replaces the fd.
+    let rc = unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) };
+    assert!(rc >= 0, "F_SETFL succeeds");
+}
 #[test]
 fn echo_stdout_is_read_back_through_the_port_queue() {
     let mut poller = poller();
@@ -159,6 +171,33 @@ fn echo_stdout_is_read_back_through_the_port_queue() {
     assert!(poller.is_empty(), "closing deregisters the port's descriptors");
 }
 
+#[test]
+fn a_child_that_floods_stderr_does_not_block_the_port() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    // The child writes far more than a pipe buffer (200 KiB ≫ the 64 KiB default) to
+    // **stderr** and only afterwards writes its stdout. A piped-but-undrained stderr would
+    // fill, block the child on its `write(2)`, and hang it before `echo done` ever runs —
+    // the port would then never deliver its stdout. Discarding stderr (`Stdio::null`) means
+    // there is no pipe to fill, so the flood cannot block the child.
+    let driver = SpawnDriver::new(
+        &shell("head -c 200000 /dev/zero 1>&2; echo done"),
+        &SpawnOptions::default(),
+    )
+    .expect("the shell starts");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    assert_eq!(
+        pump_input(&mut poller, &mut registry, id, 5),
+        b"done\n",
+        "a child that floods stderr still delivers its stdout"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+}
 #[test]
 fn the_argv_form_runs_the_program_directly() {
     let mut poller = poller();
@@ -474,7 +513,144 @@ fn an_adopted_fd_is_read_without_starting_a_child() {
 }
 
 #[test]
-fn a_failed_spawn_is_a_constructor_error_that_registers_nothing() {
+fn an_adopted_fd_writes_through_the_port_output_path() {
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    let mut fds = [0 as std::os::unix::io::RawFd; 2];
+    // SAFETY: `fds` is a valid, writable 2-element array; on success `pipe(2)` fills both
+    // slots with fresh descriptors owned by this test.
+    let rc = unsafe { libc::pipe(fds.as_mut_ptr()) };
+    assert_eq!(rc, 0, "pipe(2) succeeded");
+    // The peer end is read with a bounded loop below, so it must not block the test.
+    set_nonblocking(fds[0]);
+
+    // Adopt the **write** end: the single adopted descriptor is bidirectional, so the port
+    // writes `port_command` bytes *into* it (`an_adopted_fd_is_read_without_starting_a_child`
+    // adopts the read end of the very same construction).
+    let driver = SpawnDriver::new(&SpawnSpec::Fd { fd: fds[1] }, &SpawnOptions::default())
+        .expect("the descriptor is adopted");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    let payload = b"from-the-port";
+    // `port_command` only queues the bytes and schedules the OUTPUT task; running the port
+    // tasks is what actually writes them into the adopted descriptor.
+    registry
+        .port_command(&mut poller, id, payload, PortCommandOptions::EMPTY)
+        .expect("the command is queued");
+    let outcome = registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the write round");
+    assert!(
+        outcome.ran >= 1,
+        "the OUTPUT task the command scheduled ran"
+    );
+    assert_eq!(
+        registry.get(id).expect("live").output_len(),
+        0,
+        "every queued byte was written, none was dropped"
+    );
+
+    // The peer end of the pipe now holds exactly those bytes.
+    let mut buf = [0u8; 64];
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < payload.len() && Instant::now() < deadline {
+        // SAFETY: `fds[0]` is the read end of the pipe created above and `buf` is a valid
+        // writable array of `buf.len()` bytes.
+        let n = unsafe { libc::read(fds[0], buf.as_mut_ptr().cast(), buf.len()) };
+        if n > 0 {
+            got.extend_from_slice(&buf[..n as usize]);
+            continue;
+        }
+        assert_ne!(
+            n, 0,
+            "the peer pipe hit end-of-file before {payload:?} arrived (got {got:?})"
+        );
+        assert_eq!(
+            std::io::Error::last_os_error().kind(),
+            std::io::ErrorKind::WouldBlock,
+            "an empty peer pipe is the only reason the read makes no progress"
+        );
+        std::thread::sleep(Duration::from_millis(5));
+    }
+    assert_eq!(got, payload, "the peer reads what the port wrote");
+
+    // Closing the port deregisters the adopted descriptor but never closes it.
+    registry.close(&mut poller, id).expect("the port closes");
+    assert!(poller.is_empty(), "the adopted descriptor is deregistered");
+    // SAFETY: both descriptors were created by `pipe(2)` above, are still open and are closed
+    // exactly once here.
+    unsafe {
+        libc::close(fds[0]);
+        libc::close(fds[1]);
+    }
+}
+
+#[test]
+fn an_adopted_socket_is_bidirectional_on_one_descriptor() {
+    use std::io::{Read, Write};
+    use std::os::fd::AsRawFd;
+    use std::os::unix::net::UnixStream;
+
+    let mut poller = poller();
+    let mut registry = PortRegistry::new();
+
+    // One socketpair end is a single descriptor that is both readable and writable: the
+    // clearest evidence that a `{fd, N}` port serves both directions through one fd.
+    let (local, mut peer) = UnixStream::pair().expect("a socketpair");
+    peer.set_nonblocking(true)
+        .expect("the peer is non-blocking for the bounded reads below");
+    let fd = local.as_raw_fd();
+    let driver = SpawnDriver::new(&SpawnSpec::Fd { fd }, &SpawnOptions::default())
+        .expect("the descriptor is adopted");
+    let id = registry
+        .open(&mut poller, Box::new(driver))
+        .expect("the port opens");
+
+    // Write direction: the port's `port_command` bytes reach the peer.
+    registry
+        .port_command(&mut poller, id, b"out", PortCommandOptions::EMPTY)
+        .expect("the command is queued");
+    registry
+        .execute_port_tasks(&mut poller, DEFAULT_READINESS_RED_BUDGET)
+        .expect("the write round");
+    let mut got = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    while got.len() < 3 && Instant::now() < deadline {
+        let mut buf = [0u8; 8];
+        match peer.read(&mut buf) {
+            Ok(0) => panic!("the peer hit end-of-file before 3 bytes arrived"),
+            Ok(n) => got.extend_from_slice(&buf[..n]),
+            Err(err) if err.kind() == std::io::ErrorKind::WouldBlock => {
+                std::thread::sleep(Duration::from_millis(5));
+            }
+            Err(err) if err.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(err) => panic!("the peer read fails: {err:?}"),
+        }
+    }
+    assert_eq!(got, b"out", "the peer reads what the port wrote");
+
+    // Read direction: the peer's bytes reach the port input queue through the same fd.
+    peer.write_all(b"in").expect("the peer writes");
+    assert_eq!(
+        pump_input(&mut poller, &mut registry, id, 2),
+        b"in",
+        "the very same descriptor also delivers input to the port"
+    );
+
+    registry.close(&mut poller, id).expect("the port closes");
+    assert!(poller.is_empty(), "the adopted descriptor is deregistered");
+    // The adopted descriptor is the Erlang side's: the driver never closed it, so `local`
+    // remains a live socket until the test drops it (a closed fd would fail `EPERM`/`EBADF`).
+    local
+        .set_nonblocking(true)
+        .expect("the adopted descriptor is still open after port_close/1");
+}
+#[test]
+fn a_failed_spawn_is_an_errno_atom_constructor_error_that_registers_nothing() {
     let poller = poller();
     let result = SpawnDriver::new(
         &SpawnSpec::SpawnExecutable {
@@ -482,10 +658,12 @@ fn a_failed_spawn_is_a_constructor_error_that_registers_nothing() {
         },
         &SpawnOptions::default(),
     );
-    assert!(
-        matches!(result.map(|_| ()), Err(BeamError::Io(_))),
-        "a program that cannot be started is an I/O failure, not a panic"
-    );
+    // The oracle raises `error:enoent` for this path, so the constructor error carries that
+    // atom rather than a generic I/O failure (`test a_failed_spawn_matches_the_oracle_errno_atom`).
+    let error = result
+        .map(|_| ())
+        .expect_err("a program that cannot be started is a constructor error");
+    assert_eq!(error.as_atom(), Some("enoent"));
     assert!(
         poller.is_empty(),
         "a failed spawn leaves nothing registered with the poller"
@@ -514,4 +692,144 @@ fn cd_and_env_are_honored_by_the_child() {
         "the env option reaches the child"
     );
     registry.close(&mut poller, id).expect("the port closes");
+}
+
+// ---------------------------------------------------------------------------
+// Oracle cross-check: the failed-spawn reason atom
+// ---------------------------------------------------------------------------
+
+/// Wall-clock budget for a single `erl` invocation before the oracle is declared unusable
+/// and the check skips (mirrors `beam_term/tests/oracle.rs`).
+const ERL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The outcome of the oracle's `open_port({spawn_executable, Path}, [])`.
+enum OracleOutcome {
+    /// `erl` could not be run (absent from `PATH`, or silent past [`ERL_TIMEOUT`]).
+    Unavailable,
+    /// The oracle opened the port (it left the failed `exec` to the forked child).
+    Opened,
+    /// The oracle raised `error:Reason`.
+    Raised(String),
+}
+
+/// Runs `<expr>, halt(0).` under the system `erl` with `BEAM_IO_ORACLE_PATH=path` in the
+/// environment, returning its stdout.
+///
+/// Returns `None` — after a clear skip message — when `erl` cannot be spawned or does not
+/// answer within [`ERL_TIMEOUT`], so `cargo test -p beam_io` stays green on a host without a
+/// system Erlang. A *spawned* `erl` that exits non-zero is a bug in the embedded expression,
+/// so that is asserted rather than skipped.
+fn erl_stdout(expr: &str, path: &str) -> Option<String> {
+    let code = format!("{expr}, halt(0).");
+    let (tx, rx) = std::sync::mpsc::channel();
+    let path = path.to_string();
+    std::thread::spawn(move || {
+        let out = std::process::Command::new("erl")
+            .arg("-noshell")
+            .arg("-eval")
+            .arg(&code)
+            .env("BEAM_IO_ORACLE_PATH", &path)
+            .output();
+        // The receiver may have timed out and gone away; that is fine.
+        let _ = tx.send(out);
+    });
+    match rx.recv_timeout(ERL_TIMEOUT) {
+        Err(_) => {
+            eprintln!("skipping oracle check: `erl` did not answer within {ERL_TIMEOUT:?}");
+            None
+        }
+        Ok(Err(e)) => {
+            eprintln!("skipping oracle check: could not spawn `erl` ({e}); is Erlang on PATH?");
+            None
+        }
+        Ok(Ok(out)) => {
+            assert!(
+                out.status.success(),
+                "the oracle expression failed: {}",
+                String::from_utf8_lossy(&out.stderr)
+            );
+            Some(String::from_utf8_lossy(&out.stdout).into_owned())
+        }
+    }
+}
+
+/// Drives the real `erlang:open_port/2` on `path` and classifies the outcome.
+///
+/// The path travels through the environment (`BEAM_IO_ORACLE_PATH`), so it never has to be
+/// escaped into the `-eval` source.
+fn oracle_outcome(path: &str) -> OracleOutcome {
+    let expr = r#"P = case os:getenv("BEAM_IO_ORACLE_PATH") of false -> ""; V -> V end, try erlang:open_port({spawn_executable, P}, []) of _Port -> io:format("ok~n") catch error:Reason -> io:format("~p~n", [Reason]) end"#;
+    match erl_stdout(expr, path) {
+        None => OracleOutcome::Unavailable,
+        Some(out) => {
+            let line = out.trim();
+            if line == "ok" {
+                OracleOutcome::Opened
+            } else {
+                OracleOutcome::Raised(line.to_string())
+            }
+        }
+    }
+}
+
+/// The atom this crate's driver reports for a failed direct exec of `path`, or `None` when
+/// the driver started it.
+fn driver_spawn_reason(path: &str) -> Option<String> {
+    SpawnDriver::new(
+        &SpawnSpec::SpawnExecutable {
+            path: path.to_string(),
+        },
+        &SpawnOptions::default(),
+    )
+    .map(|_| ())
+    .err()
+    .and_then(|error| error.as_atom().map(str::to_string))
+}
+
+#[test]
+fn a_failed_spawn_matches_the_oracle_errno_atom() {
+    // The oracle answers `erl_errno_id(errno)` for a program the `exec` rejects; this crate
+    // must raise the same atom. The three cases live in a private scratch directory, so the
+    // outcome does not depend on the host's `/etc` — and the no-permission file carries
+    // **no** execute bit at all, so `access(X_OK)` fails for root and non-root alike.
+    let dir = std::env::temp_dir().join(format!("beam_io_spawn_oracle_{}", std::process::id()));
+    let _ = std::fs::remove_dir_all(&dir);
+    std::fs::create_dir_all(&dir).expect("the scratch directory is writable");
+
+    let missing = dir.join("this-path-does-not-exist");
+    let regular = dir.join("a-regular-file");
+    std::fs::write(&regular, b"x").expect("the regular file");
+    let no_perm = dir.join("no-execute-bit");
+    std::fs::write(&no_perm, b"#!/bin/sh\nexit 0\n").expect("the script");
+    std::fs::set_permissions(&no_perm, std::fs::Permissions::from_mode(0o000))
+        .expect("every permission bit is stripped");
+    // A path component that is a file, not a directory (`ENOTDIR`).
+    let not_dir = regular.join("below");
+
+    let cases = [
+        ("missing", &missing),
+        ("no-permission", &no_perm),
+        ("not-a-directory", &not_dir),
+    ];
+
+    for (label, path) in cases {
+        let path = path.to_string_lossy().into_owned();
+        let oracle = match oracle_outcome(&path) {
+            OracleOutcome::Unavailable => {
+                eprintln!("skipping failed-spawn oracle check: the system `erl` is unavailable");
+                break;
+            }
+            OracleOutcome::Opened => None,
+            OracleOutcome::Raised(reason) => Some(reason),
+        };
+        assert_eq!(
+            driver_spawn_reason(&path),
+            oracle,
+            "the {label} reason matches the oracle for {path}"
+        );
+    }
+
+    // The parent directory's write/search bits are enough to unlink the mode-0 file.
+    let _ = std::fs::set_permissions(&no_perm, std::fs::Permissions::from_mode(0o600));
+    let _ = std::fs::remove_dir_all(&dir);
 }

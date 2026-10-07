@@ -2,16 +2,31 @@
 //!
 //! Ground truth: `lib/erl_interface/src/epmd/epmd_publish.c` + `epmd_port.c` +
 //! `ei_epmd.h` (client wire) and `erts/epmd/src/epmd_srv.c` + `epmd_int.h`
-//! (server side). All messages are 2-byte big-endian length-framed
-//! ([`PacketHeaderSize::Two`](crate::framing::PacketHeaderSize::Two)); the client
-//! drives them over any [`Transport`], so the whole protocol is exercised against
-//! [`MemoryTransport`](crate::transport::MemoryTransport) with no sockets.
+//! (server side). The client drives the protocol over any [`Transport`], so the
+//! whole codec layer is exercised against
+//! [`MemoryTransport`](crate::transport::MemoryTransport) with no sockets;
+//! [`EpmdClient::connect`] adds the concrete `std::net::TcpStream` path (and
+//! [`lookup`]/[`lookup_port`] the one-shot `PORT2_REQ` lookup) against a real
+//! `epmd`.
+//!
+//! # The framing is asymmetric
+//!
+//! A **request** is 2-byte big-endian length-prefixed
+//! ([`PacketHeaderSize::Two`](crate::framing::PacketHeaderSize::Two) — the server
+//! reads exactly that many bytes, `epmd_srv.c:697`). A **response** is *not*
+//! length-prefixed: the server writes the reply body straight to the socket
+//! (`epmd_srv.c:1547` `reply()`), so the tag byte is the very first byte of the
+//! reply (the C client reads the tag and the result byte first, `epmd_port.c:139`;
+//! `erl_epmd.erl:546` matches `[$w, Result | Rest]`). A reply is therefore read
+//! self-delimiting — by its tag for [`Alive2Resp`]/[`Port2Resp`], and "until the
+//! transport runs out of bytes" for the open-ended [`NamesResp`] line list.
 
 use beam_common::{BeamError, Result};
 
+use crate::connection::TcpTransport;
 use crate::flags::{DIST_VER_HIGH, DIST_VER_LOW};
-use crate::framing::{read_packet, write_packet, PacketHeaderSize};
-use crate::transport::{Transport, Write};
+use crate::framing::{write_packet, PacketHeaderSize};
+use crate::transport::{Read, Transport, Write};
 
 pub use crate::flags::{
     EPMD_ALIVE2_REQ, EPMD_ALIVE2_RESP, EPMD_ALIVE2_X_RESP, EPMD_NAMES_REQ, EPMD_NODE_HIDDEN,
@@ -470,32 +485,198 @@ impl<T: Transport> EpmdClient<T> {
     }
 
     /// Sends an [`Alive2Req`] and reads the [`Alive2Resp`].
+    ///
+    /// The request is 2-byte framed; the reply is **unframed** (see the module
+    /// docs) and self-delimiting by its `'y'`/`'v'` tag.
     pub fn publish(&mut self, req: &Alive2Req) -> Result<Alive2Resp> {
         let mut buf = BodyBuf::new();
         req.encode(&mut buf)?;
         write_packet(&mut self.transport, PacketHeaderSize::Two, &buf.into_bytes())?;
-        let reply = read_packet(&mut self.transport, PacketHeaderSize::Two)?;
-        Alive2Resp::decode(&reply)
+        read_alive2_resp(&mut self.transport)
     }
 
     /// Looks up a node name (`PORT2_REQ`/`PORT2_RESP`).
+    ///
+    /// The request is `'z' + name` — the name is the *remainder* of the packet, with
+    /// no length field of its own (only the 2-byte frame length, which is
+    /// `1 + name.len()`) — and the reply is **unframed** (see the module docs).
     pub fn port_please(&mut self, name: &[u8]) -> Result<Port2Resp> {
         let req = Port2Req { name: name.to_vec() };
         let mut buf = BodyBuf::new();
         req.encode(&mut buf)?;
         write_packet(&mut self.transport, PacketHeaderSize::Two, &buf.into_bytes())?;
-        let reply = read_packet(&mut self.transport, PacketHeaderSize::Two)?;
-        Port2Resp::decode(&reply)
+        read_port2_resp(&mut self.transport)
     }
 
     /// Lists the registered node names (`NAMES_REQ`).
     ///
     /// The request is the single byte [`EPMD_NAMES_REQ`] (`'n'`), 2-byte framed;
-    /// the reply is decoded as a [`NamesResp`].
+    /// the reply is decoded as a [`NamesResp`]. The reply itself is **unframed** and
+    /// open-ended, so the body is read until the transport has no more bytes (see
+    /// [`read_names_resp`]).
     pub fn names(&mut self) -> Result<NamesResp> {
         let body = [EPMD_NAMES_REQ];
         write_packet(&mut self.transport, PacketHeaderSize::Two, &body)?;
-        let reply = read_packet(&mut self.transport, PacketHeaderSize::Two)?;
-        NamesResp::decode(&reply)
+        read_names_resp(&mut self.transport)
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Response framing: an `epmd` reply is NOT length-prefixed.
+// ---------------------------------------------------------------------------
+
+/// Reads `n` more bytes from `r` and appends them to `body`.
+fn read_more<R: Read>(r: &mut R, n: usize, body: &mut Vec<u8>) -> Result<()> {
+    for _ in 0..n {
+        body.push(r.read_u8()?);
+    }
+    Ok(())
+}
+
+/// Reads a big-endian `u16` and appends its two bytes to `body`.
+fn read_u16be<R: Read>(r: &mut R, body: &mut Vec<u8>) -> Result<u16> {
+    let value = r.read_be_u16()?;
+    body.extend_from_slice(&value.to_be_bytes());
+    Ok(value)
+}
+
+/// Reads one complete, **unframed** `ALIVE2_RESP`: `tag + result(1) + creation(2|4)`
+/// (`epmd_srv.c:849-859`). The tag is read first because it *is* the width
+/// selector: [`EPMD_ALIVE2_RESP`] (`'y'`) carries a 16-bit creation,
+/// [`EPMD_ALIVE2_X_RESP`] (`'v'`) — what a v6 requester always gets — a 32-bit one.
+fn read_alive2_resp<R: Read>(r: &mut R) -> Result<Alive2Resp> {
+    let mut body = Vec::with_capacity(6);
+    read_more(r, 2, &mut body)?; // tag + result
+    let creation_len = match body.first().copied() {
+        Some(EPMD_ALIVE2_RESP) => 2,
+        Some(EPMD_ALIVE2_X_RESP) => 4,
+        _ => return Err(BeamError::BadArg),
+    };
+    read_more(r, creation_len, &mut body)?;
+    Alive2Resp::decode(&body)
+}
+
+/// Reads one complete, **unframed** `PORT2_RESP`: `'w' + result(1)` and, on success,
+/// `port(2) node_type(1) protocol(1) high_vsn(2) low_vsn(2) namelen(2) name
+/// extralen(2) extra` (`epmd_srv.c:904-936`).
+///
+/// A non-zero result is the two-byte failure reply — there is no name block to
+/// read — while a zero result is followed by the self-delimiting node block (its
+/// `namelen`/`extralen` fields fix the two variable parts).
+fn read_port2_resp<R: Read>(r: &mut R) -> Result<Port2Resp> {
+    let mut body = Vec::with_capacity(32);
+    read_more(r, 2, &mut body)?; // 'w' + result
+    match (body.first().copied(), body.get(1).copied()) {
+        (Some(EPMD_PORT2_RESP), Some(RESULT_OK)) => {}
+        (Some(EPMD_PORT2_RESP), Some(_)) => return Port2Resp::decode(&body),
+        _ => return Err(BeamError::BadArg),
+    }
+    read_more(r, 4, &mut body)?; // port(2) node_type(1) protocol(1)
+    read_more(r, 4, &mut body)?; // high_vsn(2) low_vsn(2)
+    let namelen = usize::from(read_u16be(r, &mut body)?);
+    read_more(r, namelen, &mut body)?;
+    let extralen = usize::from(read_u16be(r, &mut body)?);
+    read_more(r, extralen, &mut body)?;
+    Port2Resp::decode(&body)
+}
+
+/// Whether an I/O failure just means "the peer has no more bytes *for now*" (as
+/// opposed to a real failure): a non-blocking read with nothing available, or a
+/// socket read timeout.
+fn is_quiet(kind: std::io::ErrorKind) -> bool {
+    matches!(
+        kind,
+        std::io::ErrorKind::WouldBlock
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof
+    )
+}
+
+/// Reads a complete, **unframed** `NAMES_RESP`: `epmd_port(4)` followed by one
+/// `"name <name> at port <port>\n"` line per registered node
+/// (`epmd_srv.c:941-978`).
+///
+/// The reply announces no length and `epmd` keeps the socket open afterwards (it
+/// loops back to `select()`), so the end of the body is the transport running out
+/// of bytes: a short read on an in-memory transport, or the socket read timeout on
+/// a live link ([`is_quiet`]).
+fn read_names_resp<R: Read>(r: &mut R) -> Result<NamesResp> {
+    let mut body = Vec::new();
+    loop {
+        match r.read_u8() {
+            Ok(byte) => body.push(byte),
+            Err(BeamError::BadArg) => break,
+            Err(BeamError::Io(err)) if is_quiet(err.kind()) => break,
+            Err(err) => return Err(err),
+        }
+    }
+    NamesResp::decode(&body)
+}
+
+// ---------------------------------------------------------------------------
+// The concrete `epmd` path: a `TcpStream` transport plus the one-shot lookups.
+// ---------------------------------------------------------------------------
+
+/// The default `epmd` TCP address: loopback and the well-known
+/// [`EPMD_PORT`](crate::EPMD_PORT) (`4369`).
+pub const EPMD_DEFAULT_ADDR: &str = "127.0.0.1:4369";
+
+impl EpmdClient<TcpTransport> {
+    /// Connects to `epmd` at `addr` (a `host:port` pair; the well-known address is
+    /// [`EPMD_DEFAULT_ADDR`]), returning a client usable for
+    /// [`publish`](EpmdClient::publish) / [`port_please`](EpmdClient::port_please) /
+    /// [`names`](EpmdClient::names).
+    ///
+    /// [`TcpTransport::connect`] sets a read timeout
+    /// ([`DEFAULT_READ_TIMEOUT`](crate::connection::DEFAULT_READ_TIMEOUT)) and
+    /// `TCP_NODELAY`, so a stalled or absent `epmd` can never hang a caller: the
+    /// failure surfaces as a typed [`BeamError::Io`].
+    ///
+    /// Keeping the returned client alive keeps the connection — and, for a
+    /// [`publish`](EpmdClient::publish)ed node, its `epmd` registration — alive:
+    /// `epmd` de-registers a node when its `ALIVE2` socket closes
+    /// (`epmd_srv.c:641-645`).
+    pub fn connect(addr: &str) -> Result<EpmdClient<TcpTransport>> {
+        Ok(EpmdClient::new(TcpTransport::connect(addr)?))
+    }
+}
+
+/// Connects to `epmd` at `addr` (a `host:port` pair; the well-known address is
+/// [`EPMD_DEFAULT_ADDR`]) and returns a client for the lookup protocol.
+///
+/// The free-function form of [`EpmdClient::connect`], mirroring the [`lookup`] and
+/// [`lookup_port`] helpers: callers that want the local `epmd` need not name the
+/// [`crate::connection::TcpTransport`] transport themselves. The returned client's
+/// lifetime is the connection's (and, for a [`publish`](EpmdClient::publish)ed
+/// node, its `epmd` registration's) lifetime — see [`EpmdClient::connect`].
+pub fn connect(addr: &str) -> Result<EpmdClient<TcpTransport>> {
+    EpmdClient::connect(addr)
+}
+
+/// Looks a node's registration up on the local `epmd` ([`EPMD_DEFAULT_ADDR`]),
+/// returning the raw [`Port2Resp`].
+///
+/// A fresh connection is opened for the lookup (and closed when it is dropped);
+/// a name that is not registered yields [`Port2Resp::Error`] — the reply `epmd`
+/// itself sends (`epmd_srv.c:930`) — rather than a transport error. Use
+/// [`lookup_port`] when only the port is wanted.
+pub fn lookup(name: &[u8]) -> Result<Port2Resp> {
+    EpmdClient::connect(EPMD_DEFAULT_ADDR)?.port_please(name)
+}
+
+/// The listen port of the node registered as `name` on the local `epmd`
+/// ([`EPMD_DEFAULT_ADDR`]).
+///
+/// This is [`lookup`] reduced to its port (`port_please`), i.e. the first step of
+/// connecting to a published node ([`crate::connection::connect_to_node`]). An
+/// unregistered name is a typed [`BeamError::Io`] with
+/// [`std::io::ErrorKind::NotFound`] — never a panic and never a silent `0`.
+pub fn lookup_port(name: &[u8]) -> Result<u16> {
+    match lookup(name)? {
+        Port2Resp::Ok { port, .. } => Ok(port),
+        Port2Resp::Error => Err(BeamError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("epmd: node \"{}\" is not registered", String::from_utf8_lossy(name)),
+        ))),
     }
 }

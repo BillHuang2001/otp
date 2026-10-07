@@ -26,17 +26,16 @@
 //!
 //! An unknown command is rejected with [`beam_common::BeamError::BadArg`].
 //!
-//! # Known limitation (the file-readiness seam)
+//! # Regular files
 //!
 //! [`EfileDriver::control`]'s `open` registers the fd with the `mio`-backed poller. Linux
-//! `epoll` refuses to register **regular files** (`EPOLL_CTL_ADD` ⇒ `EPERM`), so `open` on
-//! a regular file currently fails with [`beam_common::BeamError::Io`]; it works for the
-//! descriptors epoll *does* support — pipes, FIFOs, character devices and sockets — which
-//! is what makes [`EfileDriver::read_only`] over a caller-supplied fd (and the FIFO test in
-//! this module) usable today. A future backend that serves regular files (a dedicated
-//! `efile` readiness source, or an `io_uring`/thread-pool path) would drop this limitation
-//! without changing this driver's interface; the emulator solves the same problem with its
-//! poll-thread/`erts_poll` machinery (`erts/emulator/sys/common/erl_poll.c`).
+//! `epoll` refuses to register **regular files** (`EPOLL_CTL_ADD` ⇒ `EPERM`), so a plain
+//! file is served by the poller's `poll(2)`-based **fallback readiness source** instead
+//! (see [`crate::poller`]): `open`/`read`/`close` (and writing through
+//! [`EfileDriver::write_only`]/[`EfileDriver::connected`]) work on a regular file exactly
+//! as the reference runtime's `poll(2)`-based readiness path makes them, and never fail
+//! with `EPERM`. Once a read reaches end-of-file the composed [`FdDriver`] de-registers the
+//! fd (see its "Readiness model"), so the always-ready regular file stops producing events.
 
 use std::os::unix::io::RawFd;
 
@@ -100,12 +99,14 @@ impl EfileDriver {
 
     /// Opens `path` read-only, non-blocking and attaches it as the read fd.
     ///
+    /// The fd is registered with the poller; a regular file (which `epoll` refuses) is
+    /// served by the poller's fallback readiness source, so this works for plain files too.
+    ///
     /// # Errors
     ///
     /// Returns [`beam_common::BeamError::BadArg`] when no path is given or a read fd is
-    /// already attached, and [`beam_common::BeamError::Io`] when `open(2)` or the poller
-    /// registration fails (the latter includes the regular-file `EPERM` case described in
-    /// the module docs).
+    /// already attached, and [`beam_common::BeamError::Io`] when `open(2)` fails or the
+    /// poller registration is rejected.
     fn open_path(&mut self, ctx: &mut DriverContext<'_>, path: &[u8]) -> Result<()> {
         if path.is_empty() || path.contains(&0) {
             return Err(error::badarg());
@@ -227,6 +228,18 @@ mod tests {
 
     fn poller() -> Poller {
         Poller::new().expect("a poll set")
+    }
+
+    /// A unique temporary path under the OS temp directory.
+    fn temp_path(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "beam_io_efile_{tag}_{}_{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("a clock")
+                .as_nanos()
+        ))
     }
 
     /// Polls and dispatches until `id` has buffered at least `want` input bytes, returning
@@ -512,5 +525,141 @@ mod tests {
         registry.close(&mut poller, id).expect("closes the port");
         // SAFETY: `c_path` is the path this test created.
         let _ = unsafe { libc::unlink(c_path.as_ptr().cast()) };
+    }
+
+    #[test]
+    fn open_of_a_regular_file_reads_it_to_eof_through_the_fallback_source() {
+        // A regular file is not `epoll`-registerable (`EPOLL_CTL_ADD` ⇒ `EPERM`); the
+        // poller's `poll(2)` fallback readiness source serves it, so `open`/`read`/`close`
+        // work on a plain file exactly as the reference runtime's `poll(2)`-based path makes
+        // them.
+        let path = temp_path("regular_read");
+        let payload = b"the quick brown fox\njumps over the lazy dog\n";
+        std::fs::write(&path, payload).expect("the fixture file is written");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(&mut poller, Box::new(EfileDriver::unopened()))
+            .expect("the port starts");
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "open", path.as_os_str().as_encoded_bytes())
+            .expect("a regular file opens through the fallback readiness source");
+        assert_eq!(
+            poller.len(),
+            1,
+            "the regular file is registered with the poller"
+        );
+        assert_eq!(
+            registry
+                .get_mut(id)
+                .expect("live")
+                .control(&mut poller, "path", b"")
+                .expect("path"),
+            path.as_os_str().as_encoded_bytes(),
+            "the driver remembers the opened path"
+        );
+
+        // Pump the reactor until the whole file has arrived. The driver reads the regular
+        // file to EOF inside a single `ready_input` round and latches end-of-file.
+        let deadline = Instant::now() + Duration::from_secs(2);
+        let mut input = Vec::new();
+        loop {
+            assert!(Instant::now() < deadline, "the reactor never read the file");
+            let events = poller
+                .poll(Some(Duration::from_millis(200)))
+                .expect("poll succeeds");
+            registry
+                .handle_events(&mut poller, &events)
+                .expect("events dispatch");
+            input.extend(registry.get_mut(id).expect("live").drain_input());
+            let eof = registry
+                .get_mut(id)
+                .expect("live")
+                .control(&mut poller, "eof", b"")
+                .expect("eof");
+            if eof == b"true" {
+                break;
+            }
+        }
+        assert_eq!(input, payload.to_vec(), "the whole file content is delivered");
+        assert_eq!(
+            registry
+                .get_mut(id)
+                .expect("live")
+                .control(&mut poller, "eof", b"")
+                .expect("eof"),
+            b"true",
+            "end-of-file is latched"
+        );
+        assert!(
+            poller.is_empty(),
+            "reaching EOF de-registers the regular file, so it stops producing events"
+        );
+
+        // `close` releases the attached fd; the port is then closed normally.
+        registry
+            .get_mut(id)
+            .expect("live")
+            .control(&mut poller, "close", b"")
+            .expect("closes the file");
+        assert!(poller.is_empty());
+        registry.close(&mut poller, id).expect("closes the port");
+        assert!(!registry.contains(id));
+
+        std::fs::remove_file(&path).expect("the fixture file is removed");
+    }
+
+    #[test]
+    fn a_write_only_efile_writes_a_regular_file() {
+        let path = temp_path("regular_write");
+        let mut c_path = path.as_os_str().as_encoded_bytes().to_vec();
+        c_path.push(0);
+        // SAFETY: `c_path` is a NUL-terminated path owned by this call; `open(2)` only
+        // reads it and returns a fresh descriptor that `EfileDriver::write_only` then owns.
+        let fd = unsafe {
+            libc::open(
+                c_path.as_ptr().cast(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_TRUNC | libc::O_NONBLOCK | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        assert!(fd >= 0, "the output file opens");
+
+        let mut poller = poller();
+        let mut registry = PortRegistry::new();
+        let id = registry
+            .open(&mut poller, Box::new(EfileDriver::write_only(fd)))
+            .expect("the port starts");
+        assert!(
+            poller.is_empty(),
+            "a write-only port arms no readiness registration up front"
+        );
+
+        // Writing to a regular file never blocks or stalls, so the whole payload drains
+        // synchronously and nothing stays queued.
+        let payload = b"written to a regular file\n";
+        assert_eq!(
+            registry
+                .output(&mut poller, id, payload)
+                .expect("the driver writes to the regular file"),
+            payload.len(),
+            "the whole payload is written"
+        );
+        assert_eq!(
+            registry.get(id).expect("live").output_len(),
+            0,
+            "nothing stalls in the output queue"
+        );
+
+        registry.close(&mut poller, id).expect("closes the port");
+        assert_eq!(
+            std::fs::read(&path).expect("the written file is readable"),
+            payload.to_vec(),
+            "the bytes reached the regular file"
+        );
+        std::fs::remove_file(&path).expect("the fixture file is removed");
     }
 }

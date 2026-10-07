@@ -1,0 +1,338 @@
+//! The **compiled match-spec** family of the `ets` bridge:
+//! `ets:match_spec_compile/1` and `ets:match_spec_run/2`.
+//!
+//! `ets:match_spec_compile/1` compiles a raw match-spec clause list into an opaque
+//! term — the oracle returns a `#Ref<…>` (verified: `is_reference/1` is true for
+//! it) — and `ets:match_spec_run/2` runs that compiled spec against a list of
+//! terms, returning the body value of every matching element.
+//!
+//! # The compiled-spec term is not a select-family spec (verified)
+//!
+//! The two families are deliberately asymmetric, and the asymmetry was probed on
+//! the system `erl` (OTP 29 / erts-17.1):
+//!
+//! * the **select** family (`ets:select/1,2,3`, `ets:select_count/2`,
+//!   `ets:select_delete/2`, `ets:select_replace/2`) takes only a **raw** clause
+//!   list; a compiled term from `ets:match_spec_compile/1` is `badarg` there;
+//! * `ets:match_spec_run/2` takes only a **compiled** term; a raw clause list is
+//!   `badarg` there.
+//!
+//! Both halves fall out of the implementations without a special case: the select
+//! family runs its argument through [`beam_ets::compile`] (which rejects a ref
+//! thing because it is not a list), while [`match_spec_run_2`] resolves its second
+//! argument through [`TableRegistry::spec_raw`] (which rejects a list because
+//! `ref_thing_id` fails on it).
+//!
+//! # The compiled-spec handle (M1)
+//!
+//! ERTS compiles a spec into an internal `db_match_program` and returns a magic
+//! reference to it. Milestone-1 has no `make_ref` in `beam_term`, so
+//! [`match_spec_compile_1`] builds the same frozen 4-word ref thing the table
+//! handles use ([`crate::access::make_ref_thing`]) and keys a
+//! [`TableRegistry::insert_spec`] entry on its id — an id allocated from the
+//! disjoint [`super::SPEC_ID_BASE`] namespace, so a compiled-spec ref never
+//! compares `=:=` to a table handle or a continuation. A handle the registry does
+//! not know (a table handle, a continuation, a forged id) is `badarg`, as is a
+//! non-reference.
+//!
+//! # Why the *raw* spec term is what the registry stores
+//!
+//! [`beam_ets::match_spec_run`] takes the **raw** clause list and compiles it with
+//! [`beam_ets::compile`] internally — it exposes no entry point that consumes a
+//! pre-compiled [`beam_ets::MatchSpec`]. The registry therefore stores the raw spec
+//! term the caller passed to `match_spec_compile/1`; the compile in that BIF is
+//! what *validates* the spec (a malformed one is `badarg`, exactly as the oracle's
+//! `ets:match_spec_compile(bad)` and `ets:match_spec_compile([{bad}])` fail), and
+//! its compiled result is not retained because nothing in the crate can consume it
+//! (a stored but never-read field would be a silent lie about what the runtime
+//! holds, not a faithful compiled program).
+//!
+//! **Heap-lifetime caveat (M1).** The stored term is a live `Eterm` on the
+//! *compiling caller's* heap, not a GC-managed magic reference: `beam_term` has no
+//! reference-object machinery in M1 and this BIF cannot allocate it on any other
+//! process's behalf. That is sound for the M1 runtime because a process heap is a
+//! never-relocating bump arena that persists across the BIF calls of the same
+//! process — the same assumption the `ets` table handles and the `ets:select`
+//! continuations already rely on — so a **same-process** `match_spec_run/2` reads
+//! exactly the spec that was compiled. It is *not* sound across processes the way
+//! ERTS's owned program is: a compiled spec handed to another process would read
+//! the compiling process's heap. This is a documented, deliberate M1 substitution,
+//! not a silently wrong result for the same-process use the runtime makes.
+
+use beam_common::Result;
+use beam_ets::compile;
+use beam_term::Eterm;
+
+use crate::access::{make_ref_thing, ref_thing_id};
+use crate::context::BifContext;
+use crate::error::{badarg, unsupported_bif};
+use crate::registry::BifRegistry;
+
+/// Registers the compiled match-spec family.
+pub(super) fn register(reg: &mut BifRegistry) {
+    reg.register("ets", "match_spec_compile", 1, match_spec_compile_1);
+    reg.register("ets", "match_spec_run", 2, match_spec_run_2);
+}
+
+/// `ets:match_spec_compile(MatchSpec)` — compile a raw match-spec clause list into
+/// an opaque compiled-spec term (a `#Ref<…>`, as the oracle returns).
+///
+/// A malformed spec is `badarg` (verified: `ets:match_spec_compile(bad)` and
+/// `ets:match_spec_compile([{bad}])` both raise `badarg`).
+fn match_spec_compile_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let raw = args[0];
+    // Compiling validates the spec (a malformed one is `badarg`); the compiled form
+    // is not retained — `beam_ets::match_spec_run` recompiles the raw term, which
+    // is therefore what the registry stores (see the module docs).
+    compile(raw, ctx.atoms())?;
+    let handle = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.insert_spec(raw)
+    };
+    make_ref_thing(ctx.heap(), handle)
+}
+
+/// `ets:match_spec_run(List, CompiledSpec)` — run `CompiledSpec` (a term returned
+/// by `ets:match_spec_compile/1`) against each element of the proper list `List`,
+/// returning the body value of every element whose clause matches; non-matching
+/// elements are dropped, so the result is a list of at most `length(List)` terms.
+///
+/// `CompiledSpec` **must** be a compiled-spec handle: a raw clause list is `badarg`
+/// (verified — the direct opposite of the select family), as is any ref thing the
+/// registry does not know (a table handle, a continuation, a forged id) and any
+/// non-reference. `List` must be a proper list; anything else is `badarg` (raised
+/// by [`beam_ets::match_spec_run`]).
+fn match_spec_run_2(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let handle = ref_thing_id(args[1])?;
+    let raw = {
+        let tables = ctx.tables().ok_or_else(unsupported_bif)?;
+        tables.spec_raw(handle).ok_or_else(badarg)?
+    };
+    // `beam_ets::match_spec_run` needs the atom table and the caller heap at once;
+    // the context lends them through two conflicting borrows, so it is given a
+    // clone of the atom table (identical indices, read-only — the `select_2`
+    // pattern).
+    let atoms = ctx.atoms().clone();
+    let results = beam_ets::match_spec_run(args[0], raw, &atoms, ctx.heap())?;
+    // Every result aliases the caller's list, the stored spec or a term freshly
+    // built on the caller's heap, so they only need to be consed into a list (the
+    // oracle's `ets:match_spec_run/2` likewise shares structure with its input).
+    ctx.list(&results)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use beam_alloc::Heap;
+    use beam_common::BeamError;
+    use beam_process::ProcessId;
+    use beam_term::AtomTable;
+
+    use crate::ets::{TableRegistry, SPEC_ID_BASE};
+
+    /// The atom names the specs and the assertions below need.
+    fn seeded_atoms() -> AtomTable {
+        let mut atoms = AtomTable::new();
+        atoms.seed(["a", "b", "z", "foo", "$1", "$2", "set"]);
+        atoms
+    }
+
+    fn parts() -> (Heap, AtomTable, TableRegistry) {
+        (
+            Heap::new(65536).expect("test heap"),
+            seeded_atoms(),
+            TableRegistry::new(),
+        )
+    }
+
+    /// `[{{'$1','$2'}, [], [{{'$1',b}}]}]` — matches every 2-tuple and replaces it
+    /// with `{Key, b}`, keeping the key at position 1.
+    fn replace_spec(ctx: &mut BifContext<'_>) -> Eterm {
+        let v1 = ctx.atom("$1").expect("seeded");
+        let v2 = ctx.atom("$2").expect("seeded");
+        let b = ctx.atom("b").expect("seeded");
+        let head = ctx.tuple(&[v1, v2]).expect("fits");
+        let guards = ctx.list(&[]).expect("fits");
+        // The `{{ … }}` construction form: a 1-tuple holding the tuple to build.
+        let constructed = ctx.tuple(&[v1, b]).expect("fits");
+        let body_item = ctx.tuple(&[constructed]).expect("fits");
+        let body = ctx.list(&[body_item]).expect("fits");
+        let clause = ctx.tuple(&[head, guards, body]).expect("fits");
+        ctx.list(&[clause]).expect("fits")
+    }
+
+    /// The 2-tuple `{Key, Value}` built on `ctx`.
+    fn pair(ctx: &mut BifContext<'_>, key: &str, value: i64) -> Eterm {
+        let k = ctx.atom(key).expect("seeded");
+        let v = ctx.int(value).expect("fits");
+        ctx.tuple(&[k, v]).expect("fits")
+    }
+
+    fn is_raise_atom(err: &BeamError, reason: &'static str) -> bool {
+        matches!(err, BeamError::Raise(raise) if raise.reason == beam_common::ExitReason::atom(reason))
+    }
+
+    fn nil(ctx: &mut BifContext<'_>) -> Eterm {
+        ctx.list(&[]).expect("fits")
+    }
+
+    #[test]
+    fn match_spec_compile_returns_a_fresh_ref_in_the_spec_namespace() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+
+        let spec = replace_spec(&mut ctx);
+        let handle = match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+        let id = ref_thing_id(handle).expect("a compiled spec must be a ref thing");
+        assert!(
+            id >= SPEC_ID_BASE,
+            "compiled-spec id {id} is below the spec namespace base"
+        );
+
+        // Every compile gets a fresh handle.
+        let spec = replace_spec(&mut ctx);
+        let second = match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+        assert_ne!(ref_thing_id(second).expect("ref"), id);
+
+        // A non-list spec is `badarg` (the oracle's `ets:match_spec_compile(bad)`).
+        let one = ctx.int(1).expect("fits");
+        assert!(matches!(
+            match_spec_compile_1(&mut ctx, &[one]),
+            Err(BeamError::BadArg)
+        ));
+
+        // So is a list whose clause is not a 3-tuple (verified with `[{bad}]`).
+        let bad_clause = ctx.tuple(&[one]).expect("fits");
+        let bad_spec = ctx.list(&[bad_clause]).expect("fits");
+        assert!(matches!(
+            match_spec_compile_1(&mut ctx, &[bad_spec]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn match_spec_run_serves_a_compiled_handle_and_rejects_everything_else() {
+        let (mut heap, atoms, mut reg) = parts();
+        let mut ctx =
+            BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+
+        let spec = replace_spec(&mut ctx);
+        let handle = match_spec_compile_1(&mut ctx, &[spec]).expect("ets:match_spec_compile/1");
+
+        // The body values of the matching elements, in list order (`{a,1}` ⇒
+        // `{a,b}`, `{z,9}` ⇒ `{z,b}`) — verified against the oracle.
+        let a1 = pair(&mut ctx, "a", 1);
+        let z9 = pair(&mut ctx, "z", 9);
+        let input = ctx.list(&[a1, z9]).expect("fits");
+        let got = match_spec_run_2(&mut ctx, &[input, handle]).expect("ets:match_spec_run/2");
+        let a_b = ctx.tuple(&[ctx.atom("a").unwrap(), ctx.atom("b").unwrap()]).expect("fits");
+        let z_b = ctx.tuple(&[ctx.atom("z").unwrap(), ctx.atom("b").unwrap()]).expect("fits");
+        let expected = ctx.list(&[a_b, z_b]).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "ets:match_spec_run/2 projection mismatch"
+        );
+
+        // The handle stays live across calls — the oracle's compiled spec is
+        // reusable and the registry does not consume the entry.
+        let a2 = pair(&mut ctx, "a", 2);
+        let second_input = ctx.list(&[a2]).expect("fits");
+        let got = match_spec_run_2(&mut ctx, &[second_input, handle]).expect("reuse");
+        let a_b = ctx.tuple(&[ctx.atom("a").unwrap(), ctx.atom("b").unwrap()]).expect("fits");
+        let expected = ctx.list(&[a_b]).expect("fits");
+        assert!(
+            beam_term::compare::eq(got, expected, &atoms),
+            "a compiled-spec handle must be reusable"
+        );
+
+        // A non-matching element is dropped: an atom is not a 2-tuple, so the head
+        // never matches it.
+        let foo = ctx.atom("foo").expect("seeded");
+        let nonmatching = ctx.list(&[foo]).expect("fits");
+        let got = match_spec_run_2(&mut ctx, &[nonmatching, handle]).expect("run no match");
+        let empty = nil(&mut ctx);
+        assert!(beam_term::compare::eq(got, empty, &atoms), "no-match must be []");
+
+        // The empty list yields the empty list.
+        let empty_list = nil(&mut ctx);
+        let got = match_spec_run_2(&mut ctx, &[empty_list, handle]).expect("run empty");
+        let empty = nil(&mut ctx);
+        assert!(beam_term::compare::eq(got, empty, &atoms));
+
+        // A **raw** clause list as the spec is `badarg`: the oracle requires the
+        // compiled handle here, the opposite of the select family (verified).
+        let raw = replace_spec(&mut ctx);
+        assert!(matches!(
+            match_spec_run_2(&mut ctx, &[input, raw]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A ref thing the registry does not know (a forged handle) is `badarg`.
+        let forged = make_ref_thing(ctx.heap(), SPEC_ID_BASE + 4096).expect("forged ref");
+        assert!(matches!(
+            match_spec_run_2(&mut ctx, &[input, forged]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-reference spec is `badarg`.
+        let one = ctx.int(1).expect("fits");
+        assert!(matches!(
+            match_spec_run_2(&mut ctx, &[input, one]),
+            Err(BeamError::BadArg)
+        ));
+
+        // A non-list first argument is `badarg` (raised by `beam_ets::match_spec_run`).
+        assert!(matches!(
+            match_spec_run_2(&mut ctx, &[one, handle]),
+            Err(BeamError::BadArg)
+        ));
+        // An improper list is `badarg` too.
+        let improper = ctx.cons(a1, foo).expect("fits");
+        assert!(matches!(
+            match_spec_run_2(&mut ctx, &[improper, handle]),
+            Err(BeamError::BadArg)
+        ));
+    }
+
+    #[test]
+    fn both_bifs_report_a_typed_unsupported_bif_without_a_registry() {
+        let (mut heap, atoms, mut reg) = parts();
+        // A valid handle has to be built first: the compiled-spec BIFs decode their
+        // handle before consulting the registry, so the missing-registry path is
+        // only reached with a real ref-thing handle.
+        let handle = {
+            let mut ctx =
+                BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0)).with_tables(&mut reg);
+            let spec = replace_spec(&mut ctx);
+            match_spec_compile_1(&mut ctx, &[spec]).expect("compile")
+        };
+
+        // No `.with_tables(...)`: both BIFs report a typed `unsupported_bif` raise
+        // rather than a fabricated compiled spec.
+        let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let spec = replace_spec(&mut ctx);
+        let err = match_spec_compile_1(&mut ctx, &[spec]).expect_err("no registry installed");
+        assert!(
+            is_raise_atom(&err, "unsupported_bif"),
+            "ets:match_spec_compile/1 without a registry: {err:?}"
+        );
+        let list = nil(&mut ctx);
+        let err =
+            match_spec_run_2(&mut ctx, &[list, handle]).expect_err("no registry installed");
+        assert!(
+            is_raise_atom(&err, "unsupported_bif"),
+            "ets:match_spec_run/2 without a registry: {err:?}"
+        );
+    }
+
+    #[test]
+    fn this_module_registers_its_two_keys() {
+        let reg = BifRegistry::with_core_bifs();
+        assert!(reg.contains("ets", "match_spec_compile", 1));
+        assert!(reg.contains("ets", "match_spec_run", 2));
+        // The registry is the *composition* of this module's roster with the parent
+        // module's, so an `ets:new/2` key is present too.
+        assert!(reg.contains("ets", "new", 2));
+    }
+}

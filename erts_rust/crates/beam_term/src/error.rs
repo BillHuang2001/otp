@@ -42,6 +42,17 @@ pub enum TermError {
     /// fun at all, or to a fun of the wrong kind for that accessor (see
     /// [`crate::fun`]).
     BadFun,
+    /// The operation needs identity information the term does not carry: a
+    /// `make_fun3` [local fun](crate::fun::FunKind::Local) hashes through its
+    /// module and `old_uniq` fields in the C (`erl_term_hashing.c:1224-1246`), but
+    /// this tree's inlined 2-word descriptor (`[uniq: u64][index: u32]`) has
+    /// neither, so `make_hash2`/`make_hash` cannot reproduce the oracle's value.
+    ///
+    /// This is *not* a malformed term — it is a well-formed term the operation
+    /// cannot faithfully complete — so it is deliberately distinct from
+    /// [`TermError::BadFun`] (see [`crate::hashing`]). Never substituted with a
+    /// wrong value.
+    FunIdentityUnavailable,
     /// A native-record layout helper or accessor was applied to a term that is not
     /// a well-formed native record (an `ErtsRecordInstance` /
     /// `ErtsRecordDefinition`), or a record construction argument was invalid:
@@ -61,6 +72,7 @@ impl fmt::Display for TermError {
             TermError::BadMap => "not a map",
             TermError::BadBitstring => "invalid bitstring byte count",
             TermError::BadFun => "not a fun",
+            TermError::FunIdentityUnavailable => "fun identity unavailable",
             TermError::BadRecord => "not a record",
         };
         f.write_str(msg)
@@ -85,6 +97,7 @@ impl core::error::Error for TermError {}
 /// | `BadMap` | `BadArg` | `badarg` |
 /// | `BadBitstring` | `BadArg` | `badarg` |
 /// | `BadFun` | `BadArg` | `badarg` |
+/// | `FunIdentityUnavailable` | `BadArg` | `badarg` |
 /// | `BadRecord` | `BadArg` | `badarg` |
 impl From<TermError> for BeamError {
     fn from(error: TermError) -> Self {
@@ -107,6 +120,11 @@ impl From<TermError> for BeamError {
             // A non-fun (or wrong-kind fun) reached a fun layout helper: an argument
             // failure.
             TermError::BadFun => BeamError::BadArg,
+            // Missing fun identity is a capability gap, not a BEAM error; the engine
+            // raises the same `badarg` the C's `erts_exit`-free paths would (there is
+            // no oracle reason to reproduce — the oracle simply never takes this
+            // path, because its funs do carry the identity).
+            TermError::FunIdentityUnavailable => BeamError::BadArg,
             // A malformed native record reached a record layout helper, or a
             // record-construction argument was invalid: an argument failure.
             TermError::BadRecord => BeamError::BadArg,
@@ -134,6 +152,10 @@ mod tests {
             "invalid bitstring byte count"
         );
         assert_eq!(TermError::BadFun.to_string(), "not a fun");
+        assert_eq!(
+            TermError::FunIdentityUnavailable.to_string(),
+            "fun identity unavailable"
+        );
         assert_eq!(TermError::BadRecord.to_string(), "not a record");
     }
 
@@ -148,6 +170,13 @@ mod tests {
         let a = TermError::HeapExhausted;
         let b = a;
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn fun_identity_unavailable_is_not_bad_fun() {
+        // The whole point of the variant: a well-formed term the operation cannot
+        // complete must be distinguishable from a malformed one.
+        assert_ne!(TermError::FunIdentityUnavailable, TermError::BadFun);
     }
 
     #[test]
@@ -181,6 +210,10 @@ mod tests {
             BeamError::BadArg
         ));
         assert!(matches!(BeamError::from(TermError::BadFun), BeamError::BadArg));
+        assert!(matches!(
+            BeamError::from(TermError::FunIdentityUnavailable),
+            BeamError::BadArg
+        ));
         assert!(matches!(
             BeamError::from(TermError::BadRecord),
             BeamError::BadArg

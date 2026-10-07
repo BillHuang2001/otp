@@ -350,6 +350,30 @@ boxed_predicate!(
     is_ref_thing_header,
     "`is_internal_ref(x)`"
 );
+
+/// `internal_ref_numbers(x)` (`erl_node_container_utils.h:264`) — the reference's
+/// `num[]` ids as a `u32` slice.
+///
+/// On 64-bit little-endian the C block is
+/// `ErtsORefThing { Eterm header; Uint32 num[ERTS_REF_NUMBERS]; Uint32 marker; }`
+/// (`erl_term.h:795-802`), so the ids start at byte offset 8 — i.e. at word 1 of
+/// the `[header, w1, w2]` block this crate reads as `make_header(2, REF_SUBTAG)`
+/// followed by two payload words (`erl_term.h:873-877`). The `u32` view of those
+/// two payload words is the 3 ids followed by the marker word, hence a 4-element
+/// slice.
+///
+/// # Safety
+///
+/// `t` must be a live internal reference (see [`is_internal_ref`]) whose
+/// `[header, w1, w2]` block is valid and live for the returned `'a` (which cannot
+/// outlive the term's heap).
+pub unsafe fn internal_ref_numbers<'a>(t: Eterm) -> &'a [u32] {
+    let p = boxed_val(t);
+    // SAFETY: the caller guarantees a validated internal-reference block; its two
+    // payload words are exactly 4 `u32`s (3 ids + the marker word) and stay live
+    // for `'a` by the caller's contract.
+    unsafe { core::slice::from_raw_parts(p.add(1).cast::<u32>(), 4) }
+}
 boxed_predicate!(
     is_external_pid,
     is_external_pid_header,

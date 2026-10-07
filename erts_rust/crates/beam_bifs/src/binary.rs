@@ -1,6 +1,6 @@
 //! The `binary` module BIFs (`binary:at/2`, `part/2,3`, `copy/1,2`,
 //! `list_to_bin/1`, `bin_to_list/1,2,3`, `decode_unsigned/1,2`,
-//! `encode_unsigned/1,2`, `first/1`, `last/1`, `split/2,3`,
+//! `encode_unsigned/1,2`, `first/1`, `last/1`, `compile_pattern/1`, `split/2,3`,
 //! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
 //! `longest_common_suffix/1`) **and** the four `erlang` iolist/bitstring BIFs
 //! built on the same C machinery — `iolist_to_binary/1`, `iolist_size/1` and
@@ -19,11 +19,11 @@
 //! (`bif binary:at/2`, `bif binary:part/2 binary_binary_part_2`, `…`). Every
 //! value below is pinned against the OTP 29 / erts-17.1 oracle.
 //!
-//! The roster is exactly the `bif.tab` `binary` surface (minus the documented
-//! gaps): `compile_pattern/1`, `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
+//! The roster is the `bif.tab` `binary` surface: `compile_pattern/1`,
+//! `match/2,3`, `matches/2,3`, `longest_common_prefix/1`,
 //! `longest_common_suffix/1`, `first/1`, `last/1`, `at/2`, `part/2,3`,
 //! `list_to_bin/1`, `copy/1,2`, `referenced_byte_size/1`, `encode_unsigned/1,2`,
-//! `decode_unsigned/1,2`, `split/2,3`.
+//! `decode_unsigned/1,2`, `split/2,3` (minus the documented gaps).
 //!
 //! Registers its BIFs through [`register`]; the shared heap-bitstring helpers live
 //! in [`crate::bits`] and the "is this a proper list?" rule in [`crate::print`].
@@ -82,6 +82,17 @@
 //! * `matches(<<"abcabcab">>, <<"ab">>)` ⇒ `[{0,2},{3,2},{6,2}]` (every
 //!   non-overlapping match, leftmost-longest); no match ⇒ `[]` (not `nomatch`).
 //!   An empty pattern and a non-list option ⇒ `badarg`.
+//! * `compile_pattern(Pattern)`: `Pattern` is a **non-empty byte-aligned binary**
+//!   or a **non-empty list** of them (an integer or a list of integers is
+//!   `badarg` in erts-17.1, despite older docs). **One** search string ⇒
+//!   `{bm, Ref}`; **more than one** ⇒ `{ac, Ref}` — the C `words == 1` test
+//!   (`am_bm`/`am_ac`). An empty binary, a non-byte-aligned binary, an empty
+//!   list, a non-binary element, an improper list and any other argument are
+//!   `badarg`. `match/2,3`, `matches/2,3` and `split/2,3` accept a compiled
+//!   `{bm,Ref}`/`{ac,Ref}` in place of the raw pattern with identical results; a
+//!   forged/unknown `Ref`, a `{bm, Ref}` whose `Ref` was compiled as `ac` (and
+//!   vice versa), and any other 2-tuple are `badarg` (`maybe_binary_match_compile`
+//!   + the magic-ref destructor check).
 //! * `longest_common_prefix([<<"abc">>,<<"abd">>])` ⇒ `2`,
 //!   `longest_common_suffix([<<"abc">>,<<"abd">>])` ⇒ `0`; an empty list, a
 //!   non-binary element and a non-list argument ⇒ `badarg`.
@@ -91,11 +102,18 @@
 //! * **The endian atom is `big` or `little` only.** The C BIFs compare against
 //!   `am_big`/`am_little`, so `native` is `badarg` in real erts-17.1 (verified)
 //!   even though `binary.erl`'s doc lists it; this crate matches the oracle.
-//! * **Compiled patterns (`binary:compile_pattern/1`) are unsupported.** A
-//!   `{bm, Ref}`/`{am, Ref}` pattern would need a magic-ref binary, which
-//!   Milestone-1 does not build, so it is `badarg` (`maybe_binary_match_compile`
-//!   rejects anything that is not a valid compiled pattern the same way).
-//!   `referenced_byte_size/1` is likewise not registered.
+//! * **Compiled patterns live in a process-global registry, never collected.**
+//!   `compile_pattern/1` mints a fresh `Ref` thing ([`access::make_ref_thing`];
+//!   the M1 substitution for the C magic-ref binary) and stores the compiled
+//!   alternatives in a module-local registry keyed by the ref's numeric id.
+//!   Real ERTS frees a compiled pattern when its magic ref is garbage-collected;
+//!   Milestone-1 has no off-heap magic ref and no GC for this registry, so an
+//!   entry lives for the process's lifetime (a bounded, monotonic leak). The
+//!   registry is process-global because [`BifContext`] exposes no seam for it —
+//!   see the module's `compiled_patterns` section.
+//! * **`referenced_byte_size/1` is not registered** (it needs the off-heap
+//!   `BinRef` of a sub-binary, which Milestone-1 does not build; every result is
+//!   a fresh on-heap binary).
 //! * **`decode_unsigned`/`encode_unsigned` span the full integer range.**
 //!   `decode_unsigned` accepts any width and promotes a value past the 60-bit
 //!   small range to a bignum (the oracle's behaviour); `encode_unsigned` accepts a
@@ -112,6 +130,9 @@
 //!   BIFs so the runtime can resolve the documented call set, with the
 //!   `binary.erl` wrapper's observable behaviour (verified against the oracle for
 //!   every case below). They are *not* `bif.tab` entries.
+
+use std::collections::HashMap;
+use std::sync::{Mutex, MutexGuard, OnceLock, PoisonError};
 
 use beam_codec::term as codec_term;
 use beam_common::Result;
@@ -306,12 +327,26 @@ fn endian_of(ctx: &BifContext<'_>, term: Eterm) -> Result<Endian> {
     }
 }
 
-/// A search pattern: one or more alternative non-empty byte strings
-/// (`do_binary_match_compile`). Compiled `{bm, _}`/`{am, _}` patterns are
-/// unsupported (see the module docs).
-fn parse_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+/// The search alternatives of a `Pattern` argument, whether it is a raw pattern
+/// (a binary or a list of binaries) or a compiled `{bm, Ref}`/`{ac, Ref}` the
+/// oracle's `binary_match`/`binary_split` accept (C `maybe_binary_match_compile`).
+///
+/// The C dispatch is "a tuple is a compiled pattern, anything else goes through
+/// `do_binary_match_compile`", so a tuple that is not a valid compiled pattern is
+/// `badarg` — never re-interpreted as a raw pattern.
+fn parse_pattern(ctx: &BifContext<'_>, pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    if access::is_tuple(pattern) {
+        return lookup_compiled(ctx, pattern);
+    }
+    parse_raw_pattern(pattern)
+}
+
+/// A raw pattern: one or more alternative non-empty byte strings
+/// (`do_binary_match_compile`).
+fn parse_raw_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    // `bits::bytes` rejects a non-byte-aligned bitstring, matching the C
+    // `TAIL_BITS(size) != 0` check.
     if bits::is_bitstring(pattern) {
-        // A non-byte-aligned or empty pattern is `badarg`.
         let bytes = bits::bytes(pattern)?;
         if bytes.is_empty() {
             return Err(badarg());
@@ -331,6 +366,190 @@ fn parse_pattern(pattern: Eterm) -> Result<Vec<Vec<u8>>> {
         alternatives.push(bytes);
     }
     Ok(alternatives)
+}
+
+// ---------------------------------------------------------------------------
+// Compiled patterns (`binary:compile_pattern/1`, `do_binary_match_compile` +
+// `maybe_binary_match_compile`)
+// ---------------------------------------------------------------------------
+
+/// The two compiled-pattern flavours `do_binary_match_compile` produces: `bm`
+/// (a single search string — the Boyer-Moore fast path, C `am_bm`) and `ac`
+/// (two or more search strings — the Aho-Corasick trie, C `am_ac`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PatternTag {
+    Bm,
+    Ac,
+}
+
+impl PatternTag {
+    /// The tag atom of the compiled `{Tag, Ref}` tuple.
+    fn atom(self) -> &'static str {
+        match self {
+            PatternTag::Bm => "bm",
+            PatternTag::Ac => "ac",
+        }
+    }
+}
+
+/// A compiled search pattern: its tag and the alternative non-empty byte strings
+/// (exactly the inputs the search primitives take, so nothing else needs to know
+/// a pattern was compiled).
+#[derive(Debug, Clone)]
+struct CompiledPattern {
+    tag: PatternTag,
+    alternatives: Vec<Vec<u8>>,
+}
+
+/// The process-global compiled-pattern registry.
+///
+/// # Why a module-local static
+///
+/// [`BifContext`] exposes no seam for compiled patterns, and `binary:compile_pattern/1`
+/// must return an opaque handle that a *later* BIF call (with a fresh context, and
+/// possibly a different process) resolves — precisely the object the C keeps alive
+/// through a magic-ref binary's refcount. Where the C uses a refcounted off-heap
+/// object, Milestone-1 (which has no off-heap magic ref and no per-object GC for
+/// one) uses a process-global registry keyed by the ref's numeric id. The crate
+/// already carries process-global state the same way (`time.rs`'s monotonic
+/// origin and unique-integer counter, `beam_ets`' table-id counter), so this adds
+/// no new pattern.
+///
+/// Ids start at [`ID_BASE`] so they can never collide with the small ids the
+/// `ets` table registry hands out ([`crate::ets`]) — both handle families share
+/// the `Ref` thing's single id word, and a disjoint range keeps a forged
+/// `{bm, Tid}` from resolving against an unrelated table.
+fn compiled_patterns() -> &'static Mutex<CompiledPatterns> {
+    static REGISTRY: OnceLock<Mutex<CompiledPatterns>> = OnceLock::new();
+    REGISTRY.get_or_init(|| Mutex::new(CompiledPatterns::new()))
+}
+
+/// The first id a compiled pattern is assigned (see [`compiled_patterns`]).
+const ID_BASE: u64 = 1 << 32;
+
+/// The compiled patterns minted so far, keyed by the ref id that names them.
+#[derive(Debug)]
+struct CompiledPatterns {
+    next_id: u64,
+    entries: HashMap<u64, CompiledPattern>,
+}
+
+impl CompiledPatterns {
+    fn new() -> Self {
+        Self { next_id: ID_BASE, entries: HashMap::new() }
+    }
+}
+
+/// Locks the registry, recovering a poisoned mutex rather than panicking.
+///
+/// A panic in an unrelated BIF must not permanently disable compiled patterns:
+/// the registry holds no invariant a panic could break (ids are never reused and
+/// an entry is immutable once inserted), so the guard is recovered with
+/// [`PoisonError::into_inner`] — never a `unwrap`.
+fn lock_patterns() -> MutexGuard<'static, CompiledPatterns> {
+    compiled_patterns().lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// `compile_pattern/1`: builds the `{bm, Ref}`/`{ac, Ref}` handle
+/// (`binary_compile_pattern_1` over `do_binary_match_compile`).
+fn compile_pattern_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
+    let (tag, alternatives) = compile_pattern_arg(args[0])?;
+    intern_compiled(ctx, tag, alternatives)
+}
+
+/// Decodes `compile_pattern/1`'s argument into `(tag, alternatives)` — the C
+/// `do_binary_match_compile`, including its `words`/`characters` rules.
+///
+/// The tag is `bm` iff there is exactly **one** search string (`words == 1`);
+/// anything else that yields at least one string is `ac`. The cases the C sends
+/// to its `badarg` label are: a list element that is not a byte-aligned binary, a
+/// zero-length search string (`characters` never grows), an improper list, and an
+/// argument that is neither a list nor a bitstring (an integer, tuple, atom …,
+/// which leaves `characters == 0`).
+fn compile_pattern_arg(pattern: Eterm) -> Result<(PatternTag, Vec<Vec<u8>>)> {
+    if bits::is_bitstring(pattern) {
+        let bytes = bits::bytes(pattern)?;
+        if bytes.is_empty() {
+            return Err(badarg());
+        }
+        return Ok((PatternTag::Bm, vec![bytes]));
+    }
+    let items = proper_list(pattern).ok_or_else(badarg)?;
+    let mut alternatives = Vec::with_capacity(items.len());
+    for item in items {
+        let bytes = bits::bytes(item)?;
+        if bytes.is_empty() {
+            return Err(badarg());
+        }
+        alternatives.push(bytes);
+    }
+    match alternatives.len() {
+        0 => Err(badarg()),
+        1 => Ok((PatternTag::Bm, alternatives)),
+        _ => Ok((PatternTag::Ac, alternatives)),
+    }
+}
+
+/// Mints a fresh `Ref` thing and records `tag`/`alternatives` under its id,
+/// returning the `{Tag, Ref}` tuple the oracle returns.
+///
+/// The tag atom is resolved with [`BifContext::intern_atom`] rather than
+/// [`BifContext::atom`]: `bm`/`ac` are the C's pre-interned `am_bm`/`am_ac`, and a
+/// runtime that has not seeded them still gets them (through the `AtomInterner`
+/// seam) instead of a spurious `TermNotFound` — the same on-demand intern the
+/// `nif`/`error` modules already do for their reason atoms. An already-interned
+/// name never needs the seam, so the common path costs nothing.
+///
+/// The id is reserved (and the ref built) *before* the entry is inserted, so a
+/// pattern that fails to construct — an exhausted id space, a heap that cannot
+/// fit the ref, an uninternable tag — leaves no orphan entry, and a
+/// reserved-but-never-inserted id is simply skipped (ids are never reused).
+fn intern_compiled(
+    ctx: &mut BifContext<'_>,
+    tag: PatternTag,
+    alternatives: Vec<Vec<u8>>,
+) -> Result<Eterm> {
+    let id = {
+        let mut registry = lock_patterns();
+        let id = registry.next_id;
+        registry.next_id = id.checked_add(1).ok_or_else(system_limit)?;
+        id
+    };
+    let ref_term = access::make_ref_thing(ctx.heap(), id)?;
+    let tag_term = ctx.intern_atom(tag.atom())?;
+    let handle = ctx.tuple(&[tag_term, ref_term])?;
+    lock_patterns().entries.insert(id, CompiledPattern { tag, alternatives });
+    Ok(handle)
+}
+
+/// Resolves a compiled `{Tag, Ref}` handle to its alternatives
+/// (`maybe_binary_match_compile`): the argument must be a `{Tag, Ref}` tuple with
+/// an atom tag, and `Ref` a live handle of the *matching* kind.
+///
+/// A `Ref` the registry does not know (a forged handle), a handle compiled with
+/// the other tag, a `Ref` that is not a ref thing at all, and any tuple that is
+/// not a `{bm|ac, _}` pair are all `badarg` — the oracle's `is_internal_magic_ref`
+/// + magic-ref-destructor check.
+fn lookup_compiled(ctx: &BifContext<'_>, pattern: Eterm) -> Result<Vec<Vec<u8>>> {
+    if access::tuple_size(pattern) != 2 {
+        return Err(badarg());
+    }
+    let tag_term = access::tuple_element(pattern, 0);
+    if !access::is_atom(tag_term) {
+        return Err(badarg());
+    }
+    let tag = match ctx.atoms().name(atom_val(tag_term)) {
+        Some("bm") => PatternTag::Bm,
+        Some("ac") => PatternTag::Ac,
+        _ => return Err(badarg()),
+    };
+    let ref_id = access::ref_thing_id(access::tuple_element(pattern, 1))?;
+    let registry = lock_patterns();
+    let compiled = registry.entries.get(&ref_id).ok_or_else(badarg)?;
+    if compiled.tag != tag {
+        return Err(badarg());
+    }
+    Ok(compiled.alternatives.clone())
 }
 
 // ---------------------------------------------------------------------------
@@ -624,21 +843,33 @@ fn iolist_to_binary_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm>
 /// binary `iolist_to_binary/1` would build.
 ///
 /// Both the argument rules and the `badarg` cases are `iolist_to_binary/1`'s (a
-/// bare byte-aligned binary is accepted, a non-byte-aligned one is `badarg`).
-/// Milestone-1 computes the size by flattening, so a size that leaves the 60-bit
-/// small range cannot arise (the destination heap always bounds it).
+/// bare byte-aligned binary is accepted, a non-byte-aligned one is `badarg`). The
+/// result is a plain **integer**: a size past the 60-bit small range becomes the
+/// heap bignum the oracle's C `BUILD_INTEGER` produces, never a `system_limit`.
 fn iolist_size_1(ctx: &mut BifContext<'_>, args: &[Eterm]) -> Result<Eterm> {
     let root = args[0];
-    let size = if bits::is_bitstring(root) {
+    let size: u64 = if bits::is_bitstring(root) {
         let size_bits = bits::bit_size(root)?;
         if size_bits % 8 != 0 {
             return Err(badarg());
         }
-        size_bits / 8
+        size_bits as u64 / 8
     } else {
-        collect_byte_unit(root)?.len()
+        collect_byte_unit(root)?.len() as u64
     };
-    ctx.int(size as i64)
+    byte_count_term(ctx, size)
+}
+
+/// The integer term for a non-negative byte count: a small int while it fits,
+/// otherwise a heap bignum — both built by the shared `arith` promotion helpers
+/// ([`arith::int_from_i64`] folds, [`arith::int_from_mag`] takes the magnitude
+/// limbs little-endian), never by a local bignum construction.
+fn byte_count_term(ctx: &mut BifContext<'_>, size: u64) -> Result<Eterm> {
+    match i64::try_from(size) {
+        Ok(small) => arith::int_from_i64(ctx, small),
+        // A byte count above `i64::MAX`: one little-endian magnitude limb.
+        Err(_) => arith::int_from_mag(ctx, false, &[size]),
+    }
 }
 
 /// `list_to_bitstring(List)` (`erl_iolist.c:930`) — the `Unit = 1` variant of
@@ -891,7 +1122,7 @@ fn do_split(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let options = split_options(ctx, opts, bytes.len())?;
 
     if !options.global {
@@ -976,7 +1207,7 @@ fn do_match(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let (start, end) = match_options(ctx, opts, bytes.len())?;
     match find_first(&bytes, &alternatives, start, end) {
         Some((pos, len)) => {
@@ -1008,7 +1239,7 @@ fn do_matches(
     opts: Option<Eterm>,
 ) -> Result<Eterm> {
     let bytes = bits::bytes(subject)?;
-    let alternatives = parse_pattern(pattern)?;
+    let alternatives = parse_pattern(ctx, pattern)?;
     let (start, end) = match_options(ctx, opts, bytes.len())?;
     let matches = find_all(&bytes, &alternatives, start, end);
     let mut elems = Vec::with_capacity(matches.len());
@@ -1086,6 +1317,7 @@ pub(crate) fn register(reg: &mut BifRegistry) {
     reg.register("binary", "encode_unsigned", 2, encode_unsigned_2);
     reg.register("binary", "first", 1, first_1);
     reg.register("binary", "last", 1, last_1);
+    reg.register("binary", "compile_pattern", 1, compile_pattern_1);
     reg.register("binary", "split", 2, split_2);
     reg.register("binary", "split", 3, split_3);
     reg.register("binary", "match", 2, match_2);
@@ -1106,10 +1338,11 @@ mod tests {
 
     /// The atom names the tests build terms from (the runtime seeds the same set:
     /// `big`/`little`/`scope`/`global`/`trim`/`trim_all`/`nomatch` are standard
-    /// atoms a real ERTS node interns at boot).
-    const SEED: [&str; 15] = [
+    /// atoms a real ERTS node interns at boot, as are the compiled-pattern tags
+    /// `bm`/`ac`).
+    const SEED: [&str; 17] = [
         "true", "false", "ok", "big", "little", "native", "scope", "global", "trim", "trim_all",
-        "nomatch", "a", "abc", "b", "foo",
+        "nomatch", "a", "abc", "b", "foo", "bm", "ac",
     ];
 
     fn with_ctx<R>(f: impl FnOnce(&mut BifContext<'_>) -> R) -> R {
@@ -1949,6 +2182,302 @@ mod tests {
         });
     }
 
+    // -----------------------------------------------------------------------
+    // Compiled patterns (`binary:compile_pattern/1`) — pinned to the oracle
+    // (OTP 29.1.1 / erts-17.1)
+    // -----------------------------------------------------------------------
+
+    /// The tag atom of a compiled `{Tag, Ref}` handle.
+    fn compiled_tag(ctx: &BifContext<'_>, handle: Eterm) -> String {
+        assert!(access::is_tuple(handle) && access::tuple_size(handle) == 2);
+        let tag = access::tuple_element(handle, 0);
+        assert!(access::is_atom(tag), "the tag must be an atom");
+        ctx.atoms().name(atom_val(tag)).expect("a seeded tag atom").to_owned()
+    }
+
+    /// The rendered form of a BIF result. Rendering is the structural comparison:
+    /// a `{Pos, Len}` tuple or a result list is a *fresh* heap block, so term
+    /// identity would never compare two equal results.
+    fn render(ctx: &mut BifContext<'_>, term: Eterm) -> String {
+        crate::print::format_term(ctx, term, false).expect("the result renders")
+    }
+
+    /// The `{Tag, Ref}` tuple a forged compiled pattern would be.
+    fn handle(ctx: &mut BifContext<'_>, tag: &str, reference: Eterm) -> Eterm {
+        let tag = ctx.atom(tag).expect("a seeded tag atom");
+        ctx.tuple(&[tag, reference]).expect("the tuple fits")
+    }
+
+    /// The compiled `ac` handle for the alternative binaries `parts`.
+    fn compile_ac(ctx: &mut BifContext<'_>, parts: &[&[u8]]) -> Eterm {
+        let elems: Vec<Eterm> = parts.iter().map(|p| bin(ctx, p)).collect();
+        let list = ctx.list(&elems).expect("the list fits");
+        compile_pattern_1(ctx, &[list]).expect("a valid pattern")
+    }
+
+    #[test]
+    fn compile_pattern_tags_one_string_bm_and_several_ac() {
+        with_ctx(|ctx| {
+            // A binary, whatever its length, is a single search string ⇒ `bm`
+            // (the C `words == 1` ⇒ `am_bm`).
+            for pat in [&b"a"[..], &b"ab"[..], &b"abcdef"[..]] {
+                let search = bin(ctx, pat);
+                let compiled = compile_pattern_1(ctx, &[search]).unwrap();
+                assert_eq!(compiled_tag(ctx, compiled), "bm", "pattern {pat:?}");
+            }
+
+            // A **one-element list** is still a single search string ⇒ `bm`
+            // (regression: `binary:compile_pattern([<<"ab">>])` ⇒ `{bm, _}`).
+            let one = bin(ctx, b"ab");
+            let one_list = ctx.list(&[one]).unwrap();
+            let compiled = compile_pattern_1(ctx, &[one_list]).unwrap();
+            assert_eq!(compiled_tag(ctx, compiled), "bm");
+
+            // Two or more search strings ⇒ `ac` (the Aho-Corasick trie), even for
+            // duplicates or prefix-overlapping alternatives.
+            let cases: [&[&[u8]]; 4] =
+                [&[&b"a"[..], &b"b"[..]], &[&b"ab"[..], &b"cd"[..]], &[&b"a"[..], &b"a"[..]], &[&b"a"[..], &b"ab"[..]]];
+            for parts in cases {
+                let compiled = compile_ac(ctx, parts);
+                assert_eq!(compiled_tag(ctx, compiled), "ac", "alternatives {parts:?}");
+            }
+        });
+    }
+
+    #[test]
+    fn compile_pattern_rejects_every_bad_argument() {
+        with_ctx(|ctx| {
+            // An empty binary leaves the C's `characters == 0` ⇒ `badarg`.
+            let empty = bin(ctx, &[]);
+            assert!(matches!(compile_pattern_1(ctx, &[empty]), Err(BeamError::BadArg)));
+            // The empty list.
+            let nil = ctx.list(&[]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[nil]), Err(BeamError::BadArg)));
+            // A list holding an empty binary (a zero-length search string).
+            let with_empty = ctx.list(&[empty]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[with_empty]), Err(BeamError::BadArg)));
+
+            // A non-byte-aligned binary (`TAIL_BITS != 0`), alone and as an element.
+            let bits = bits::make_bitstring(ctx.heap(), &[0b1000_0000], 1).expect("fits");
+            assert!(matches!(compile_pattern_1(ctx, &[bits]), Err(BeamError::BadArg)));
+            let with_bits = ctx.list(&[bits]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[with_bits]), Err(BeamError::BadArg)));
+
+            // A non-binary element (an atom), and an improper tail.
+            let atom = ctx.atom("a").unwrap();
+            let with_atom = ctx.list(&[atom]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[with_atom]), Err(BeamError::BadArg)));
+            let a = bin(ctx, b"a");
+            let improper = ctx.cons(a, a).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[improper]), Err(BeamError::BadArg)));
+
+            // A non-list, non-binary argument (an atom, a tuple, a map …) never
+            // grows `characters`, so it is `badarg`.
+            assert!(matches!(compile_pattern_1(ctx, &[atom]), Err(BeamError::BadArg)));
+            let tuple = ctx.tuple(&[a, a]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[tuple]), Err(BeamError::BadArg)));
+            // … including a compiled handle itself (a tuple is not re-compilable).
+            let compiled = compile_pattern_1(ctx, &[a]).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[compiled]), Err(BeamError::BadArg)));
+        });
+    }
+
+    #[test]
+    fn compile_pattern_rejects_characters_like_the_oracle() {
+        with_ctx(|ctx| {
+            // erts-17.1 accepts neither a bare character nor a list of characters,
+            // despite what older OTP docs suggest: `binary:compile_pattern(65)` and
+            // `binary:compile_pattern([65, 66])` are both `error:badarg` (an
+            // element must be a *binary*, so a small integer — in `0..=255` or
+            // not — fails the `is_bitstring` check).
+            let byte = ctx.int(65).unwrap();
+            assert!(matches!(compile_pattern_1(ctx, &[byte]), Err(BeamError::BadArg)));
+            let chars = byte_list(ctx, &[65, 66]);
+            assert!(matches!(compile_pattern_1(ctx, &[chars]), Err(BeamError::BadArg)));
+            // An out-of-range element is rejected the same way, not differently.
+            let out_of_range = byte_list(ctx, &[256]);
+            assert!(matches!(compile_pattern_1(ctx, &[out_of_range]), Err(BeamError::BadArg)));
+        });
+    }
+
+    #[test]
+    fn compile_pattern_interns_its_tag_atom_on_demand() {
+        // The oracle's `bm`/`ac` are pre-interned from `atom.names`, but the Rust
+        // runtime's boot seed need not hold them: the BIF resolves the tag through
+        // `BifContext::intern_atom`, so an absent name is interned via the
+        // `AtomInterner` seam instead of failing with `TermNotFound`.
+        let mut heap = Heap::new(4096).expect("test heap");
+        let mut atoms = AtomTable::new();
+        atoms.seed(["ab", "cd"]); // deliberately without `bm`/`ac`
+
+        let mut interner = Interner { table: std::cell::RefCell::new(AtomTable::new()) };
+        let (bm_tag, ac_tag) = {
+            let mut ctx = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0))
+                .with_atom_interner(&mut interner);
+            let ab = bin(&mut ctx, b"ab");
+            let cd = bin(&mut ctx, b"cd");
+
+            // One search string ⇒ `bm`, interned on demand.
+            let bm = compile_pattern_1(&mut ctx, &[ab]).expect("interns `bm` on demand");
+            let bm_tag = access::tuple_element(bm, 0);
+            assert!(access::is_atom(bm_tag));
+            // Several search strings ⇒ `ac`, likewise.
+            let list = ctx.list(&[ab, cd]).unwrap();
+            let ac = compile_pattern_1(&mut ctx, &[list]).expect("interns `ac` on demand");
+            (bm_tag, access::tuple_element(ac, 0))
+        };
+
+        // `ctx` is gone, so the interner can be inspected: the tags landed under
+        // exactly the oracle's names.
+        let names = interner.table.borrow();
+        assert_eq!(names.name(atom_val(bm_tag)), Some("bm"));
+        assert_eq!(names.name(atom_val(ac_tag)), Some("ac"));
+        drop(names);
+
+        // Without an interner an unresolvable tag atom is the typed
+        // `TermNotFound`, never a fabricated index (the `atoms` table above has
+        // neither name and this context has no seam).
+        let mut bare = BifContext::new(&mut heap, &atoms, ProcessId::new(1, 0));
+        let ab = bin(&mut bare, b"ab");
+        assert!(matches!(
+            compile_pattern_1(&mut bare, &[ab]),
+            Err(BeamError::TermNotFound)
+        ));
+    }
+
+    /// An `AtomInterner` over its own table (the `convert.rs` mock): the table
+    /// *is* the shared atom table in a real runtime.
+    struct Interner {
+        table: std::cell::RefCell<AtomTable>,
+    }
+
+    impl crate::context::AtomInterner for Interner {
+        fn intern(&mut self, name: &str) -> beam_term::Atom {
+            self.table.borrow_mut().intern(name)
+        }
+    }
+
+    #[test]
+    fn compiled_pattern_searches_identically_to_the_raw_pattern() {
+        with_ctx(|ctx| {
+            let subject = bin(ctx, b"xabycdab");
+
+            // `bm` (a single search string).
+            let raw = bin(ctx, b"ab");
+            let bm = compile_pattern_1(ctx, &[raw]).unwrap();
+            let compiled_match = match_2(ctx, &[subject, bm]).unwrap();
+            assert_eq!(render(ctx, compiled_match), "{1,2}");
+            let raw_match = match_2(ctx, &[subject, raw]).unwrap();
+            assert_eq!(render(ctx, compiled_match), render(ctx, raw_match));
+            let compiled_matches = matches_2(ctx, &[subject, bm]).unwrap();
+            let raw_matches = matches_2(ctx, &[subject, raw]).unwrap();
+            assert_eq!(render(ctx, compiled_matches), render(ctx, raw_matches));
+            let compiled_split = split_2(ctx, &[subject, bm]).unwrap();
+            let raw_split = split_2(ctx, &[subject, raw]).unwrap();
+            assert_eq!(render(ctx, compiled_split), render(ctx, raw_split));
+
+            // `ac` (several search strings) takes the same leftmost-longest pick.
+            let ab = bin(ctx, b"ab");
+            let cd = bin(ctx, b"cd");
+            let raw_alts = ctx.list(&[ab, cd]).unwrap();
+            let ac = compile_pattern_1(ctx, &[raw_alts]).unwrap();
+            let compiled_ac_match = match_2(ctx, &[subject, ac]).unwrap();
+            let raw_ac_match = match_2(ctx, &[subject, raw_alts]).unwrap();
+            assert_eq!(render(ctx, compiled_ac_match), render(ctx, raw_ac_match));
+            let compiled_ac_matches = matches_2(ctx, &[subject, ac]).unwrap();
+            let raw_ac_matches = matches_2(ctx, &[subject, raw_alts]).unwrap();
+            assert_eq!(render(ctx, compiled_ac_matches), render(ctx, raw_ac_matches));
+
+            // `match/3` and `split/3` options are unchanged, and a compiled `bm`
+            // handle is accepted wherever a raw pattern is.
+            let sc = scope(ctx, 1, 6);
+            let scoped = ctx.list(&[sc]).unwrap();
+            let compiled_scoped = match_3(ctx, &[subject, bm, scoped]).unwrap();
+            let raw_scoped = match_3(ctx, &[subject, raw, scoped]).unwrap();
+            assert_eq!(render(ctx, compiled_scoped), render(ctx, raw_scoped));
+            let global_atom = ctx.atom("global").unwrap();
+            let global = ctx.list(&[global_atom]).unwrap();
+            let compiled_global = split_3(ctx, &[subject, bm, global]).unwrap();
+            let raw_global = split_3(ctx, &[subject, raw, global]).unwrap();
+            assert_eq!(render(ctx, compiled_global), render(ctx, raw_global));
+
+            // Oracle-pinned: `binary:split(<<"aba">>,
+            // binary:compile_pattern([<<"a">>]), [global, trim_all])` ⇒ `[<<"b">>]`.
+            let a = bin(ctx, b"a");
+            let aba = bin(ctx, b"aba");
+            let one = ctx.list(&[a]).unwrap();
+            let trim = compile_pattern_1(ctx, &[one]).unwrap();
+            assert_eq!(compiled_tag(ctx, trim), "bm");
+            let trim_all = ctx.atom("trim_all").unwrap();
+            let opts = ctx.list(&[global_atom, trim_all]).unwrap();
+            let trimmed = split_3(ctx, &[aba, trim, opts]).unwrap();
+            assert_eq!(render(ctx, trimmed), "[<<98>>]");
+
+            // A miss: `nomatch` for `match/2`, `[]` for `matches/2`.
+            let zz = bin(ctx, b"zz");
+            let miss = compile_pattern_1(ctx, &[zz]).unwrap();
+            let missed = match_2(ctx, &[subject, miss]).unwrap();
+            assert_eq!(render(ctx, missed), "nomatch");
+            let none = matches_2(ctx, &[subject, miss]).unwrap();
+            assert_eq!(render(ctx, none), "[]");
+        });
+    }
+
+    #[test]
+    fn forged_and_mistagged_compiled_patterns_are_badarg() {
+        with_ctx(|ctx| {
+            let subject = bin(ctx, b"xabx");
+            let raw = bin(ctx, b"ab");
+            let bm = compile_pattern_1(ctx, &[raw]).unwrap();
+            let bm_ref = access::tuple_element(bm, 1);
+            let valid = match_2(ctx, &[subject, bm]).unwrap();
+            assert_eq!(render(ctx, valid), "{1,2}");
+
+            // A `Ref` the registry has never handed out (a forged handle) is
+            // `badarg` — the oracle's magic-ref check rejects it too.
+            let fresh = access::make_ref_thing(ctx.heap(), 7).unwrap();
+            let forged = handle(ctx, "bm", fresh);
+            assert!(matches!(match_2(ctx, &[subject, forged]), Err(BeamError::BadArg)));
+            assert!(matches!(matches_2(ctx, &[subject, forged]), Err(BeamError::BadArg)));
+            assert!(matches!(split_2(ctx, &[subject, forged]), Err(BeamError::BadArg)));
+
+            // A `bm` handle under an `ac` tag — and vice versa — is `badarg` (the
+            // C magic-ref-destructor check).
+            let mistagged_bm = handle(ctx, "ac", bm_ref);
+            assert!(matches!(match_2(ctx, &[subject, mistagged_bm]), Err(BeamError::BadArg)));
+            let ac = compile_ac(ctx, &[&b"ab"[..], &b"cd"[..]]);
+            let ac_ref = access::tuple_element(ac, 1);
+            let mistagged_ac = handle(ctx, "bm", ac_ref);
+            assert!(matches!(match_2(ctx, &[subject, mistagged_ac]), Err(BeamError::BadArg)));
+
+            // Any other tuple is `badarg`: an unknown tag, a non-ref second
+            // element, the wrong arity, a non-atom tag.
+            let one = ctx.int(1).unwrap();
+            let bm_atom = ctx.atom("bm").unwrap();
+            let unknown_tag = handle(ctx, "foo", bm_ref);
+            let non_ref = handle(ctx, "bm", one);
+            let binary_ref = handle(ctx, "bm", raw);
+            let pid_ref = handle(ctx, "bm", subject);
+            let arity_one = ctx.tuple(&[bm_atom]).unwrap();
+            let arity_three = ctx.tuple(&[bm_atom, bm_ref, one]).unwrap();
+            let non_atom_tag = ctx.tuple(&[one, bm_ref]).unwrap();
+            for bad in [
+                unknown_tag,
+                non_ref,
+                binary_ref,
+                pid_ref,
+                arity_one,
+                arity_three,
+                non_atom_tag,
+            ] {
+                assert!(
+                    matches!(match_2(ctx, &[subject, bad]), Err(BeamError::BadArg)),
+                    "a malformed compiled handle must be badarg"
+                );
+            }
+        });
+    }
+
     #[test]
     fn register_installs_every_binary_bif() {
         let mut reg = BifRegistry::new();
@@ -1969,6 +2498,7 @@ mod tests {
             ("encode_unsigned", 2),
             ("first", 1),
             ("last", 1),
+            ("compile_pattern", 1),
             ("split", 2),
             ("split", 3),
             ("match", 2),
@@ -1991,6 +2521,37 @@ mod tests {
         ] {
             assert!(reg.contains("erlang", name, arity), "missing erlang:{name}/{arity}");
         }
-        assert_eq!(reg.len(), 27);
+        assert_eq!(reg.len(), 28);
+    }
+    #[test]
+    fn iolist_size_promotes_past_the_small_int_range() {
+        with_ctx(|ctx| {
+            // The oracle's ordinary results are unchanged small ints.
+            // `iolist_size([<<"ab">>,<<"cd">>])` ⇒ `4`, `iolist_size([1,2|<<3>>])` ⇒ `3`.
+            let ab = bin(ctx, b"ab");
+            let cd = bin(ctx, b"cd");
+            let nested = ctx.list(&[ab, cd]).expect("the list fits");
+            assert!(access::is_small(iolist_size_1(ctx, &[nested]).unwrap()));
+            assert_eq!(signed_value(iolist_size_1(ctx, &[nested]).unwrap()), 4);
+            let one_two = byte_list(ctx, &[1, 2]);
+            let three = bin(ctx, &[3]);
+            let improper = ctx.cons(one_two, three).expect("the cons fits");
+            assert_eq!(signed_value(iolist_size_1(ctx, &[improper]).unwrap()), 3);
+
+            // A size beyond the 60-bit small range is a heap **bignum**, not
+            // `system_limit` — the shared promotion path (`arith`). A >2^59-byte
+            // iolist is not constructible in a test, so the helper is exercised
+            // directly: the values are exact and oracle-verified as integers.
+            let big = byte_count_term(ctx, u64::MAX).unwrap();
+            assert!(!access::is_small(big), "a >60-bit size must be a bignum");
+            assert_eq!(crate::print::format_term(ctx, big, false).unwrap(), "18446744073709551615");
+            // One past the small-int maximum (`2^59 - 1`) stays representable.
+            let edge = byte_count_term(ctx, 1u64 << 59).unwrap();
+            assert_eq!(crate::print::format_term(ctx, edge, false).unwrap(), "576460752303423488");
+            // The small-range bound itself (`2^59 - 1`) is still a small int.
+            let last_small = byte_count_term(ctx, (1u64 << 59) - 1).unwrap();
+            assert!(access::is_small(last_small));
+            assert_eq!(signed_value(last_small), (1i64 << 59) - 1);
+        });
     }
 }
