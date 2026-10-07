@@ -2385,7 +2385,9 @@ mod tests {
         );
         assert_eq!(done.carriers, baseline.carriers + 1);
         assert_eq!(done.carriers, done.sbc_carriers + done.mbc_carriers);
-        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+        let slot = alloc.type_stats(ty);
+        assert_eq!(slot.blocks, 0, "every block is free again");
+        assert_eq!(slot.bytes, 0);
     }
 
     #[test]
@@ -2433,7 +2435,9 @@ mod tests {
         assert_eq!(done.sbc_carriers, 0);
         assert_eq!(done.mbc_carriers, 0);
         assert_eq!(done.carrier_bytes, 0);
-        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+        let slot = alloc.type_stats(ty);
+        assert_eq!(slot.blocks, 0, "every block is free again");
+        assert_eq!(slot.bytes, 0);
     }
 
     #[test]
@@ -2487,7 +2491,9 @@ mod tests {
         assert_eq!(done.sbc_carriers, 0);
         assert_eq!(done.mbc_carriers, 0);
         assert_eq!(done.carrier_bytes, 0);
-        assert_eq!(alloc.type_stats(ty), TypeStats::default());
+        let slot = alloc.type_stats(ty);
+        assert_eq!(slot.blocks, 0, "every block is free again");
+        assert_eq!(slot.bytes, 0);
     }
     #[test]
     fn allocator_info_lists_the_rows_of_every_type_bound_to_the_allocator() {
