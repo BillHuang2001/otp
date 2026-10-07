@@ -237,8 +237,8 @@ the caller reserves the words and passes `hp: *mut Eterm`):
   remaining `unsupported` is `wire/new_fun_ext_encode` (A.5, `beam_rt` not yet supplying the `Local`-fun
   identity); **no case disagrees** (`mismatch=0`, `skipped=0`).
 - **Term/heap foundation completed** (see the section above): HAMT/CHAMP map builder, public
-  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 164 tests, `beam_alloc` 105,
-  `beam_gc` 39 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
+  bitstring/heap-bits APIs, off-heap refc binaries. Green: `beam_term` 245 tests, `beam_alloc` 263,
+  `beam_gc` ~141 — incl. an `erl` oracle cross-check (`beam_term/tests/oracle.rs`) and GC
   copy-correctness evidence for HAMT maps + refc binaries (`beam_gc/tests/{map_copy,refc_binary_copy}.rs`).
 - **Additive `beam_term` foundation extensions** (the term-layout LCA; no frozen constant/ABI
   changed): `From<TermError> for BeamError` (error interop); `compare`/`hashing`/`size` utilities
