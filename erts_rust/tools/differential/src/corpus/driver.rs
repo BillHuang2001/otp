@@ -13,9 +13,8 @@
 //! start a real OS process, so the port can be opened in `binary`/`list` mode, written to with
 //! `port_command/2`/`3`, read back as a `{Port, {data, …}}` message, described by `port_info/1`
 //! (a proplist of `{Item, Value}` pairs), closed with `port_close/1` and observed through the
-//! `exit_status`/`eof`/`stream`/`{cd,_}` options. Where the Rust runtime has no
-//! wiring yet the capability gap signals its `unsupported` convention (exit `3`) and the case
-//! is reported **`unsupported`** — never a fabricated `agree`, and never a `mismatch`.
+//! `exit_status`/`eof`/`stream`/`{cd,_}` options. Every case here `agree`s; the port-*opening*
+//! error shapes the runtime must reject are pinned by the sibling [`super::driver_ports`] group.
 //!
 //! `port_info/2` agrees with erts exactly: both return the `{Item, Value}` pair (e.g.
 //! `{name, "true"}`) and expose the same `port_info/1` item set
@@ -27,18 +26,12 @@
 //!
 //! **Current divergences (deliberately NOT cases — each would be a `mismatch`), verified
 //! against the live oracle:**
-//! - `open_port({spawn_executable, "<missing path>"}, …)` — the oracle raises
-//!   `error:enoent`; `beam_rt` writes a `beam_rt: io error: No such file or directory`
-//!   line to *stderr* and no `exception …` line to stdout (empty stdout, exit 1).
 //! - the `eof` option — the oracle delivers `{Port, eof}` once the child closes its output
 //!   (`open_port({spawn,"true"},[binary,eof])` ⇒ `eof`); `beam_rt` never delivers it.
 //! - the `{line, N}` option — the oracle emits `{eol, Line}` messages, `beam_rt` raw bytes.
 //! - `port_command(P, 42)` (a non-iodata payload) — the oracle raises `badarg`; `beam_rt`
 //!   accepts it and answers `true`.
 //! - `port_info(P, registered_name)` — the oracle answers `[]`; `beam_rt` raises `badarg`.
-//! - the raw `connected`/`links`/`id` item *values* — a `{spawn, …}` port carries the
-//!   owner's pid (which `beam_rt` cannot yet encode, so it reports `unsupported:
-//!   external_term`) plus a runtime-specific `id`/`os_pid`, so only shapes/counts are pinned.
 //! - `{spawn, Cmd}` for a non-executable `Cmd` — both go through a shell and both report exit
 //!   `127`, but only the oracle's shell emits its `not found` diagnostic on stderr.
 //!

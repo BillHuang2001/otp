@@ -27,7 +27,7 @@
 //! | [`nif`] | A.3 — the observable `erlang:nif_error/1` NIF surface |
 //! | [`nif_so`] | A.3 — the NIF C ABI *end to end*: a real `.so`-backed NIF round trip |
 //! | [`driver`] | A.4 — the observable port/`spawn`-driver surface |
-//! | [`driver_ports`] | A.4 — the `open_port/2` grammar: error shapes + the `{fd,N}` form |
+//! | [`driver_ports`] | A.4 — the `open_port/2` port-open error shapes + the missing-`spawn_executable` `enoent` shape |
 //! | [`wire`] | A.5 — the distribution wire codec (ETF cross-encoding) |
 //! | [`wire_ids`] | A.2/A.5 — `term_to_binary` of a local pid / port id |
 //! | [`flags`] | A.6 — CLI / configuration |

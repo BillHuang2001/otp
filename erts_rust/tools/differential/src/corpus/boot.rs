@@ -21,9 +21,8 @@
 //! exact pid (pids vary per VM start): `spawn/1`, `spawn_link/1` and `spawn_opt/2` must return
 //! a pid, the mailbox carries a real `spawn` + `!` + `receive` round trip (including a
 //! non-zero `after` timeout), and `erlang:processes/0` is a list. The **process dictionary**
-//! (`put/2`, `get/1`, `erase/1`) is a genuine capability gap in the Rust runtime today; those
-//! cases are pinned against the **oracle's** golden, so each flips to `agree` automatically
-//! once the BIFs land — an honest `unsupported`, never a mismatch.
+//! (`put/2`, `get/1`, `erase/1`) and `init:get_status/0` are part of the booted system's
+//! observable surface; every case below `agree`s.
 use super::{Case, CaseKind, Contract, Golden, Probe};
 
 /// The A.9 cases: boot/version observability, asserted by shape.
@@ -690,14 +689,10 @@ pub(crate) fn group() -> Vec<Case> {
                 exit_code: 0,
             },
         },
-        // --- Capability gaps, recorded honestly as `unsupported` (never a mismatch) -----
-        // The process dictionary: the Rust runtime reports `erlang:put/2` etc. as
-        // "a known BIF that is not implemented" and exits `3`, so each case is a genuine
-        // `unsupported` — the golden is the *oracle's* own output, so it flips to `agree`
-        // by itself once the BIFs land.
+        // --- The process dictionary and the boot-status surface -------------------------
         Case {
             id: "boot/process_dictionary_put_get",
-            description: "put/2 stores a value that get/1 returns (the process dictionary; Rust: unsupported)",
+            description: "put/2 stores a value that get/1 returns (the process dictionary)",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
                 expr: "begin put(k, 1), get(k) end",
@@ -711,7 +706,7 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "boot/process_dictionary_get_missing",
-            description: "get/1 of an unset key yields the atom `undefined` (Rust: unsupported)",
+            description: "get/1 of an unset key yields the atom `undefined`",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
                 expr: "get(a_nonexistent_key_xyz)",
@@ -725,7 +720,7 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "boot/process_dictionary_erase",
-            description: "erase/1 removes a key so a later get/1 yields `undefined` (Rust: unsupported)",
+            description: "erase/1 removes a key so a later get/1 yields `undefined`",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
                 expr: "begin put(k, 1), erase(k), get(k) end",
@@ -739,7 +734,7 @@ pub(crate) fn group() -> Vec<Case> {
         },
         Case {
             id: "boot/init_get_status_is_tuple",
-            description: "init:get_status/0 is the {State,Started} boot-status tuple (Rust: unsupported)",
+            description: "init:get_status/0 is the {State,Started} boot-status tuple",
             contracts: &[Contract::Build],
             kind: CaseKind::Eval {
                 expr: "is_tuple(init:get_status())",
@@ -786,8 +781,8 @@ mod tests {
         "boot/processes_contains_self",
     ];
 
-    /// The process-dictionary cases: a genuine capability gap in the Rust runtime today, so
-    /// they are pinned against the oracle's golden as an honest `unsupported`.
+    /// The process-dictionary cases: pinned against the oracle's own golden, asserted by
+    /// value (a small integer or the atom `undefined`).
     const PROCESS_DICTIONARY_CASES: &[&str] = &[
         "boot/process_dictionary_put_get",
         "boot/process_dictionary_get_missing",

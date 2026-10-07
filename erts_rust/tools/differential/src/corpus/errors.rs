@@ -45,9 +45,10 @@
 //!   agree and is pinned below.)
 //! * `5(1)` (calling a non-fun) — the oracle raises `error:{badfun, 5}` while the Rust runtime
 //!   raises `error:badarg`.
-//! * `records:get_definition/2` of a record no loaded module defines — the Rust runtime has
-//!   no code-server record table and signals its documented `unsupported: bif` capability gap
-//!   (already covered, honestly, by the sibling `corpus::records` group).
+//!
+//! `records:get_definition/2` of a record no loaded module defines is *not* a divergence — the
+//! runtime serves the lookup through its `RecordSource` bridge and the case `agree`s (pinned in
+//! the sibling `corpus::records` group).
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun, Probe};
 
