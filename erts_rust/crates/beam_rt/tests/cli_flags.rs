@@ -24,6 +24,7 @@
 //!
 //! so they are pinned here and the suite runs without the oracle. One additional test
 //! cross-checks the two runtimes directly and **skips loudly** when `erl` is unavailable.
+use std::path::PathBuf;
 use std::process::{Command, Output};
 
 /// The self-terminating probe: print `init:get_argument(setcookie)` with `~w` and halt.
@@ -48,6 +49,16 @@ fn otp_flags_var() -> String {
 /// args (`extra`) sit between `-noshell` and `-eval`, mirroring the `[cmdline]` slot the
 /// merge wraps.
 fn invoke(program: &str, envs: &[(String, String)], extra: &[&str]) -> Output {
+    run_probe(program, envs, extra, PROBE)
+}
+
+/// Spawns `program` as `-noshell <extra> -eval <probe>`, stripping every inherited
+/// `ERL_*FLAGS` variable and then applying `envs`.
+///
+/// The same shape drives both the built `beam_rt` and the oracle `erl` (they share the
+/// `-noshell … -eval <expr>` command line and the `-eval` expression subset the probes
+/// use).
+fn run_probe(program: &str, envs: &[(String, String)], extra: &[&str], probe: &str) -> Output {
     let mut command = Command::new(program);
     // Strip any inherited variable so each case is exactly what the test sets.
     for name in ["ERL_AFLAGS", "ERL_FLAGS", "ERL_ZFLAGS"] {
@@ -56,13 +67,18 @@ fn invoke(program: &str, envs: &[(String, String)], extra: &[&str]) -> Output {
     command.env_remove(otp_flags_var());
     command.args(["-noshell"]);
     command.args(extra);
-    command.args(["-eval", PROBE]);
+    command.args(["-eval", probe]);
     for (name, value) in envs {
         command.env(name, value);
     }
     command
         .output()
         .unwrap_or_else(|error| panic!("spawning {program} failed: {error}"))
+}
+
+/// Whether `program` accepts `-noshell <args> -eval 'halt(0).'` (a clean exit 0).
+fn accepts(program: &str, args: &[&str]) -> bool {
+    run_probe(program, &[], args, "halt(0).").status.success()
 }
 
 /// Spawns the built `beam_rt` with `envs`.
@@ -369,4 +385,486 @@ fn every_env_flag_case_matches_the_oracle() {
         }
     }
     assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+// --- The A.6 emulator switches added with the environment-flag work ----------------------
+//
+// The new spellings (`-setcookie`/`-config`/`-boot`/`-emu_flavor`, `+Q`/`+P`/`+K`/`+sbt`,
+// the `-M*`/`+M*` allocator family) are unit-tested in `src/cli.rs` and
+// `src/cli/flags.rs`; this section pins their **external** behaviour: the value
+// `init:get_argument/1` answers, and whether the oracle accepts each spelling.
+//
+// Oracle values (OTP 29.1.1 / erts-17.1), observed with
+// `erl -noshell <flag> <value> -eval 'halt(0).'`:
+//
+// * `-setcookie`/`-config`/`-boot`/`-emu_flavor` are `-`-switches: accepted and recorded
+//   (`-emu_flavor` only for `smp`, its one accepted value).
+// * `+Q|+P 1024|134217727|legacy` → exit 0; `+Q|+P 1000|0|134217728|abc` → exit 1 (the
+//   `bad number of ports|processes …` usage error).
+// * `+K <anything>` → exit 0 (the emulator never validates the value).
+// * all nine `+sbt` types → exit 0, `+sbt bogus` → exit 1.
+// * the validated `+M*` spellings → exit 0, the bad ones → exit 1; `-M*` is never
+//   forwarded to the emulator, so it always exits 0.
+//
+// `beam_rt` keeps its uniform four-exit-code contract, so a value the oracle rejects with
+// exit 1 is a **usage** error here (exit 2) — `mismatch=0` at the differential gate. What
+// the table below compares is therefore **acceptance** (`exit 0` vs not), with
+// `beam_rt`'s own exact code pinned alongside.
+
+/// The self-terminating probe for `init:get_argument(FLAG)`.
+fn argument_probe(flag: &str) -> String {
+    format!(
+        "try (init:get_argument({flag})) of V -> io:format(\"ok ~w~n\", [V]), halt(0) \
+         catch C:R -> io:format(\"exception ~w ~w~n\", [C, R]), halt(1) end."
+    )
+}
+
+/// Writes an empty (`[]`) Erlang config file into a fresh temporary directory and returns
+/// its path **without** the `.config` suffix — the spelling `-config` itself takes.
+fn write_temp_config() -> Option<PathBuf> {
+    let dir = std::env::temp_dir().join(format!("beam_rt_cli_flags_{}", std::process::id()));
+    std::fs::create_dir_all(&dir).ok()?;
+    let path = dir.join("beam_rt_test_config");
+    std::fs::write(path.with_extension("config"), "[].\n").ok()?;
+    Some(path)
+}
+
+/// The oracle's own boot script, resolved through the oracle (`-boot` needs a file that
+/// really loads).
+fn oracle_boot_script() -> Option<PathBuf> {
+    let output = Command::new("erl")
+        .args([
+            "-noshell",
+            "-eval",
+            "io:format(\"~s\", [code:root_dir()]), halt(0).",
+        ])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let root = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    if root.is_empty() {
+        return None;
+    }
+    let script = PathBuf::from(root).join("bin").join("no_dot_erlang");
+    script.with_extension("boot").is_file().then_some(script)
+}
+
+/// The `-`-switches record their value in `init:get_argument/1`, identically in both
+/// runtimes. Skips loudly when `erl` (or the temporary files it needs) is unavailable.
+#[test]
+fn the_new_configuration_switches_reach_init_get_argument_like_the_oracle() {
+    if !erl_available() {
+        println!("SKIP cli_flags: `erl` is not runnable — the oracle cross-check is skipped");
+        return;
+    }
+    let Some(config) = write_temp_config() else {
+        println!("SKIP cli_flags: could not create a temporary config file");
+        return;
+    };
+    let Some(boot) = oracle_boot_script() else {
+        println!("SKIP cli_flags: could not resolve the oracle's boot script");
+        return;
+    };
+    let config = config.to_str().expect("a UTF-8 temp path").to_string();
+    let boot = boot.to_str().expect("a UTF-8 boot path").to_string();
+
+    let cases: &[(&str, &[&str])] = &[
+        ("setcookie", &["-setcookie", "abc"]),
+        ("config", &["-config", config.as_str()]),
+        ("boot", &["-boot", boot.as_str()]),
+        ("emu_flavor", &["-emu_flavor", "smp"]),
+    ];
+
+    let mut failures: Vec<String> = Vec::new();
+    for (flag, args) in cases {
+        let probe = argument_probe(flag);
+        let oracle = run_probe("erl", &[], args, &probe);
+        let rust = run_probe(env!("CARGO_BIN_EXE_beam_rt"), &[], args, &probe);
+        if oracle.status.code() != Some(0) {
+            failures.push(format!(
+                "{flag}: the oracle exited {:?} (stderr {})",
+                oracle.status.code(),
+                stderr(&oracle)
+            ));
+        }
+        if rust.status.code() != Some(0) {
+            failures.push(format!(
+                "{flag}: beam_rt exited {:?} (stderr {})",
+                rust.status.code(),
+                stderr(&rust)
+            ));
+        }
+        if stdout(&oracle) != stdout(&rust) {
+            failures.push(format!(
+                "{flag}: beam_rt {:?} != oracle {:?}",
+                stdout(&rust),
+                stdout(&oracle)
+            ));
+        }
+        // Sanity: the probe really answered `{ok,[…]}` (not a swallow-everything `error`).
+        if !stdout(&rust).starts_with("ok {ok,[[") {
+            failures.push(format!(
+                "{flag}: unexpected probe output {:?}",
+                stdout(&rust)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// One new-flag invocation whose **acceptance** must match the oracle; `rust_code` pins
+/// `beam_rt`'s exact exit code (0 accepted, 2 usage error).
+struct FlagCase {
+    description: &'static str,
+    args: &'static [&'static str],
+    rust_code: i32,
+}
+
+/// Every new-flag spelling where the two runtimes **agree** on acceptance (both accept, or
+/// both reject). `+Q|+P legacy` and the allocator long-forms are accepted; the
+/// out-of-range/unknown values are rejected.
+const AGREEING_CASES: &[FlagCase] = &[
+    FlagCase {
+        description: "+Q 1024 (the low end of the port range)",
+        args: &["+Q", "1024"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+Q 134217727 (the high end of the port range)",
+        args: &["+Q", "134217727"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+Q legacy",
+        args: &["+Q", "legacy"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+Q 1000 (below ERTS_MIN_PORTS)",
+        args: &["+Q", "1000"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+Q 0",
+        args: &["+Q", "0"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+Q 134217728 (above ERTS_MAX_PORTS)",
+        args: &["+Q", "134217728"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+Q abc",
+        args: &["+Q", "abc"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+P 1024 (the low end of the process range)",
+        args: &["+P", "1024"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+P 134217727 (the high end of the process range)",
+        args: &["+P", "134217727"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+P legacy",
+        args: &["+P", "legacy"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+P 1000 (below ERTS_MIN_PROCESSES)",
+        args: &["+P", "1000"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+P 0",
+        args: &["+P", "0"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+P 134217728 (above ERTS_MAX_PROCESSES)",
+        args: &["+P", "134217728"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+K true",
+        args: &["+K", "true"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+K false",
+        args: &["+K", "false"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt u",
+        args: &["+sbt", "u"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt db",
+        args: &["+sbt", "db"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt s",
+        args: &["+sbt", "s"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt ps",
+        args: &["+sbt", "ps"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt ts",
+        args: &["+sbt", "ts"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt tnnps",
+        args: &["+sbt", "tnnps"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt nnps",
+        args: &["+sbt", "nnps"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt nnts",
+        args: &["+sbt", "nnts"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt ns",
+        args: &["+sbt", "ns"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+sbt bogus",
+        args: &["+sbt", "bogus"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MMscs 1024 (the mseg carrier size)",
+        args: &["+MMscs", "1024"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MBas aobf (an alloc-util allocation strategy)",
+        args: &["+MBas", "aobf"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MBasbf (the same strategy, spelled in-token)",
+        args: &["+MBasbf"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+Mlpm no",
+        args: &["+Mlpm", "no"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MYe true (the system allocator)",
+        args: &["+MYe", "true"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MIscs 100 (the literal allocator's carrier size)",
+        args: &["+MIscs", "100"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MMamcbf 100",
+        args: &["+MMamcbf", "100"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+MZas chaosff (test_alloc's own strategy)",
+        args: &["+MZas", "chaosff"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "+Mfoo (an unknown allocator letter)",
+        args: &["+Mfoo"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+M (no allocator letter at all)",
+        args: &["+M"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MMscs bogus (a non-numeric carrier size)",
+        args: &["+MMscs", "bogus"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MBas chaosff (chaosff is test_alloc-only)",
+        args: &["+MBas", "chaosff"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MYe false (the system allocator only accepts true)",
+        args: &["+MYe", "false"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+Mea 1024 (an unknown -Mea value)",
+        args: &["+Mea", "1024"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MIe false (literal_alloc cannot be disabled)",
+        args: &["+MIe", "false"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MTe false (temp_alloc cannot be disabled)",
+        args: &["+MTe", "false"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MIt true (literal_alloc has no thread-specific instance)",
+        args: &["+MIt", "true"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MIcp B (literal_alloc cannot migrate carriers)",
+        args: &["+MIcp", "B"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "+MTacul 50 (temp_alloc cannot migrate carriers)",
+        args: &["+MTacul", "50"],
+        rust_code: 2,
+    },
+    FlagCase {
+        description: "-Mfoo (a -M* flag is never forwarded to the emulator)",
+        args: &["-Mfoo"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "-M (the bare -M* prefix)",
+        args: &["-M"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "-emu_flavor smp (the oracle's only accepted flavor)",
+        args: &["-emu_flavor", "smp"],
+        rust_code: 0,
+    },
+    FlagCase {
+        description: "-setcookie abc",
+        args: &["-setcookie", "abc"],
+        rust_code: 0,
+    },
+];
+
+/// The two runtimes agree on which of the new flag spellings are accepted — and
+/// `beam_rt`'s exact exit code is the one pinned in the table. Skips loudly without `erl`.
+#[test]
+fn every_new_emulator_flag_agrees_with_the_oracle_on_acceptance() {
+    if !erl_available() {
+        println!("SKIP cli_flags: `erl` is not runnable — the oracle cross-check is skipped");
+        return;
+    }
+    let beam = env!("CARGO_BIN_EXE_beam_rt");
+    let mut failures: Vec<String> = Vec::new();
+    for case in AGREEING_CASES {
+        let oracle_ok = accepts("erl", case.args);
+        let rust = run_probe(beam, &[], case.args, "halt(0).");
+        let rust_ok = rust.status.success();
+        if oracle_ok != rust_ok {
+            failures.push(format!(
+                "{}: the oracle accepts={oracle_ok} but beam_rt accepts={rust_ok} \
+                 (stderr {})",
+                case.description,
+                stderr(&rust)
+            ));
+        }
+        if rust.status.code() != Some(case.rust_code) {
+            failures.push(format!(
+                "{}: beam_rt exit {:?} != {} (stderr {})",
+                case.description,
+                rust.status.code(),
+                case.rust_code,
+                stderr(&rust)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+}
+
+/// The **documented divergences** from the oracle, pinned so a future change cannot
+/// silently move them. Each entry is `(description, args, oracle_accepts, beam_rt_code)`.
+const DIVERGENT_CASES: &[(&str, &[&str], bool, i32)] = &[
+    (
+        "-emu_flavor emu (the oracle's `erlexec` accepts only `smp`)",
+        &["-emu_flavor", "emu"],
+        false,
+        0,
+    ),
+    (
+        "+K bogus (the emulator never validates the +K value)",
+        &["+K", "bogus"],
+        true,
+        2,
+    ),
+    (
+        "+Mea min (the validator's -Mea arm is incomplete — a reported bug)",
+        &["+Mea", "min"],
+        true,
+        2,
+    ),
+    (
+        "-Mea 1024 (a -M* value is not consumed, so `1024` is a stray argument)",
+        &["-Mea", "1024"],
+        true,
+        2,
+    ),
+];
+
+/// `beam_rt`'s side of each divergence is pinned always; the oracle's own value is
+/// checked when `erl` is available (the `beam_rt` half still runs without it).
+#[test]
+fn the_documented_oracle_divergences_are_pinned() {
+    let beam = env!("CARGO_BIN_EXE_beam_rt");
+    let oracle_available = erl_available();
+    if !oracle_available {
+        println!("SKIP cli_flags: `erl` is not runnable — only the beam_rt half is pinned");
+    }
+    let mut failures: Vec<String> = Vec::new();
+    for (description, args, oracle_accepts, rust_code) in DIVERGENT_CASES {
+        let rust = run_probe(beam, &[], args, "halt(0).");
+        if rust.status.code() != Some(*rust_code) {
+            failures.push(format!(
+                "{description}: beam_rt exit {:?} != {rust_code} (stderr {})",
+                rust.status.code(),
+                stderr(&rust)
+            ));
+        }
+        if oracle_available && accepts("erl", args) != *oracle_accepts {
+            failures.push(format!(
+                "{description}: the oracle accepts={} (expected {oracle_accepts})",
+                accepts("erl", args)
+            ));
+        }
+    }
+    assert!(failures.is_empty(), "{}", failures.join("\n"));
+    // The divergences must stay **disjoint** from the agreeing table: none of them may be
+    // silently promoted into it.
+    for (description, args, _, _) in DIVERGENT_CASES {
+        assert!(
+            !AGREEING_CASES.iter().any(|case| case.args == *args),
+            "{description} must not also be listed as agreeing"
+        );
+    }
 }
