@@ -435,7 +435,7 @@ passes(Ps, Opts0, Kind) ->
          false ->
              {NoName,Name} = keyfind(Name, 2, Negations),
              {NoName,fun(S) -> S end}
-         end || {Name,Fun}=P <- Ps].
+         end || {Name,Fun} <- Ps].
 
 wrap_fun(module, _Name, Fun) ->
     Fun;

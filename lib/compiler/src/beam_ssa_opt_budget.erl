@@ -286,7 +286,7 @@ run_child(Fun, State, Ms) ->
             %% it.
             erlang:error({ssa_opt_watchdog_child_died, Reason})
     after Ms ->
-        exit(Pid, kill),
+        erlang:exit_signal(Pid, kill),
         receive
             {'DOWN', Mon, process, Pid, _} -> ok
         after 0 ->
