@@ -21,11 +21,10 @@
 //! * external things — `NEW_PID_EXT` (88), `NEWER_REFERENCE_EXT` (90), `NEW_PORT_EXT` (89)
 //!   and `NEWER_PORT_EXT` (120), plus the *legacy* `PID_EXT` (103), `REFERENCE_EXT` (101)
 //!   and `NEW_REFERENCE_EXT` (114) forms — all encoded through the *decode → re-encode*
-//!   round-trip, which is deterministic inside one node's encoder (`term_to_binary(self())`
-//!   and `term_to_binary(make_ref())` are **not** usable: the runtime BIFs `make_ref/0` /
-//!   `ports/0` raise a plain Erlang reason that would be an observation, i.e. a mismatch,
-//!   while the encoder path that *is* reachable — `term_to_binary(self())` — is a clean
-//!   capability gap; see the crate report);
+//!   round-trip, which is deterministic inside one node's encoder. The terms whose bytes
+//!   depend on the runtime's **own** node identity — a local `self()` pid and an internal port
+//!   — carry per-VM-start values and are pinned (by their stable leading shape) in the
+//!   [`super::wire_ids`] group instead;
 //! * funs/records — `EXPORT_EXT` (113) (encode and decode → re-encode round-trip),
 //!   `NEW_FUN_EXT` (112), and the nominal-record `RECORD_EXT` (67) (decode → re-encode);
 //! * framing — `VERSION_MAGIC` (131) as the first byte, the `compressed` (80) option (both
@@ -43,12 +42,12 @@
 //! * The free-standing encode of a `NEW_FUN_EXT` (112) fun is the Rust runtime's remaining
 //!   A.5 *encode*-side gap; `wire/new_fun_ext_encode` pins it as `unsupported` (`beam_rt:
 //!   unsupported: local_fun`), never a mismatch.
-//! * `term_to_binary/2` with `{minor_version, 0|1}` still needs the *legacy* `ATOM_EXT`
-//!   (100) / `FLOAT_EXT` (99) forms the Rust runtime's encoder does not produce, so the
-//!   `wire/minor_version_*_legacy_encode` cases that reach those tags report `unsupported`
-//!   (their goldens are the oracle's own bytes, so each flips to `agree` once the legacy
-//!   form lands). Decoding a `compressed` (80) blob **is** covered — by the
-//!   `wire/compressed_decode_*` cases.
+//! * `term_to_binary/2` with `{minor_version, 0|1}` reproduces the *legacy* `ATOM_EXT` (100) /
+//!   `FLOAT_EXT` (99) forms, so the `wire/minor_version_*_legacy_encode` cases `agree`.
+//!   Decoding a `compressed` (80) blob is covered by the `wire/compressed_decode_*` cases.
+//! * The `[local]` option image (`term_to_binary(Term, [local])`) is a plain `error:badarg`
+//!   under the Rust runtime, and `term_to_binary(make_ref())` is the runtime's
+//!   `unsupported: external_term` — neither is pinned.
 //! * `FUN_EXT` (115) is deliberately not a case: the reference decoder does not validate it
 //!   (even a truncated blob decodes to the empty atom `''`), so any golden would pin an
 //!   unspecified artifact rather than the wire semantics. The modern `NEW_FUN_EXT` (112) is
@@ -863,9 +862,8 @@ pub(crate) fn group() -> Vec<Case> {
             },
         },
         // -- `{minor_version, _}`: the wire dialect of the encode ---------------------
-        // `N < 2` needs the *legacy* `ATOM_EXT` (100) / `FLOAT_EXT` (99) forms the Rust
-        // encoder does not emit, so those cases are honest `unsupported` capability gaps (their
-        // goldens are the oracle's own bytes, so each flips to `agree` once the form lands).
+        // `N < 2` selects the *legacy* `ATOM_EXT` (100) / `FLOAT_EXT` (99) forms; both
+        // runtimes encode them identically, so these cases `agree`.
         Case {
             id: "wire/minor_version_0_atom_legacy_encode",
             description: "term_to_binary/2 with {minor_version,0} encodes an atom as the legacy ATOM_EXT (100)",

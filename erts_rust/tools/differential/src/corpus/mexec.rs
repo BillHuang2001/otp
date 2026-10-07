@@ -18,10 +18,11 @@
 //! compiled `.beam` executes) and [`Contract::OtpApps`] (a real OTP application module
 //! is loaded and run).
 //!
-//! Modules deliberately **absent** here — `sets`, `math`, `dict` — are a *genuine*
-//! runtime gap today: the Rust runtime raises `undef` / `erlang:phash/2 is not a BIF`
-//! where the oracle returns a value, so they are a `mismatch`, not a capability gap,
-//! and must not be claimed as agreement. They are reported, not added.
+//! The module `dict` is deliberately **absent** here: the runtime does not reproduce it
+//! exactly — `dict:store/3` raises a `function_clause` where the oracle returns a value, a
+//! plain Erlang reason, i.e. a `mismatch`, not a capability gap — so it must not be claimed as
+//! agreement; it is reported, not added. (`sets` agrees; the `math` and `phash`/`phash2`
+//! kernels have their own groups, [`super::math_bifs`] and [`super::phash`].)
 
 use super::{Case, CaseKind, Contract, Golden, ModuleRun};
 

@@ -24,38 +24,20 @@
 //! maps are never rendered and no volatile value (a table id, a pid, a memory figure) is
 //! asserted exactly — only its shape.
 //!
-//! # The match-spec family is unimplemented in the Rust runtime — NOT pinned here
+//! # The match-spec / `select` family lives in the [`super::ets_spec`] group
 //!
-//! This is a deliberate, honest gap, not an oversight. `crates/beam_bifs` registers only the
-//! *whole-table*, *mutation*, *lookup* and *navigation* `ets:*` BIFs (see `crates/beam_bifs`
-//! `src/ets.rs` and its `CONTEXT.md`: "The `ets` bridge is partial. The match-spec family is
-//! unimplemented"). The match-spec surface — `select/1,2,3`, `match/2,3`, `match_object/*`,
-//! `select_count/2`, `select_replace/2`, `match_spec_run/2` — therefore raises a **plain
-//! `error:undef`** on the Rust side, which is an *observation* (not one of the two documented
-//! capability-gap signals the harness classifies as `unsupported`). A corpus case for it would
-//! be a **`mismatch`**, so it is **not pinned by the gate**.
+//! The *query* surface — `select/1,2,3`, `match/2,3`, `match_object/2,3`, `select_count/2`,
+//! `select_delete/2`, `select_replace/2`, `match_delete/2`,
+//! `match_spec_compile/1` + `match_spec_run/2`, and the `info/1,2` field set — is served by the
+//! Rust runtime and pinned (all `agree`) by the sibling [`super::ets_spec`] group, which was
+//! split out of this file by responsibility (see that module's docs for the query surface and
+//! the two continuation/match-spec subtleties it pins).
 //!
-//! Verified with the release `differential compare` on an (empty) `set` table `t` (the probe
-//! wraps each expression in `try … catch`, so the observations are the probe's single stdout
-//! line):
-//!
-//! | expression | oracle | Rust runtime |
-//! |---|---|---|
-//! | `ets:select(ets:new(t,[set]), [{'$1',[],['$1']}])` | `ok []` | `exception error undef` |
-//! | `ets:match(ets:new(t,[set]), {'$1','_'})` | `ok []` | `exception error undef` |
-//! | `ets:match_object(ets:new(t,[set]), '_')` | `ok []` | `exception error undef` |
-//! | `ets:select_count(ets:new(t,[set]), [{'$1',[],['$1']}])` | `ok 0` | `exception error undef` |
-//! | `ets:select(ets:new(t,[set]), [{'$1',[],['$1']}], 1)` | `ok '$end_of_table'` | `exception error undef` |
-//! | `ets:select_replace(ets:new(t,[set]), [{'$1',[],['$1']}])` | `exception error badarg` | `exception error undef` |
-//! | `ets:match_spec_run([{a,1}], [{'_','$1',[],['$1']}])` | `exception error badarg` | `exception error undef` |
-//!
-//! The `select/3` row is the limit-based continuation on an empty table (`'$end_of_table'`);
-//! the two `badarg` rows are the oracle rejecting the spec — `select_replace/2` demands an
-//! `ordered_set`, and `match_spec_run/2` requires an *already-compiled* spec — not a missing
-//! BIF. The universal Rust-side result is the plain `error:undef` of an unregistered BIF: it
-//! is an observation, so a case would be a `mismatch` and none may be added. Each row flips to
-//! `agree` the day the match-spec compiler lands in the runtime; this group should then gain
-//! the corresponding cases. **Handoff to the runtime nodes** (`beam_bifs` / `beam_ets`).
+//! The `ets:*` BIFs still outside the runtime's served surface — `slot/2`,
+//! `select_reverse/1,2,3`, `is_compiled_ms/1`, `internal_delete_all/2` — raise a plain
+//! `error:undef`, an *observation* rather than a capability-gap signal, so a case for them
+//! would be a `mismatch` and none is pinned. **Handoff to the runtime nodes** (`beam_bifs` /
+//! `beam_ets`).
 //!
 //! # Other verified divergences found while authoring — deliberately NOT pinned
 //!

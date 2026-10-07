@@ -12,10 +12,10 @@
 //! * a pid ⇒ `NEW_PID_EXT` (88),
 //! * an internal port ⇒ `V4_PORT_EXT` (120).
 //!
-//! The Rust runtime currently signals `beam_rt: unsupported: external_term` for an external
-//! (pid/port/ref) encode, so both cases classify `unsupported` (a capability gap, never a
-//! mismatch); their goldens are the oracle's own answers, so each flips to `agree`
-//! automatically once the gap closes.
+//! The Rust runtime encodes a local pid (`NEW_PID_EXT`, 88) and an internal port
+//! (`V4_PORT_EXT`, 120), so both cases `agree` on their stable leading tag byte. Encoding an
+//! external **reference** is the runtime's `beam_rt: unsupported: external_term` capability
+//! gap, so no ref case is registered here.
 //!
 //! ## Known divergence (handoff — deliberately no case registered)
 //! A map with **more than 32 keys** (the large-map / hashmap image) cannot be pinned today:
