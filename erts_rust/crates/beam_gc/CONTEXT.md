@@ -479,6 +479,24 @@ whole-region scan.)
   WHICH on-heap reference (a `BinRef` word, a fun magic ref, a sub-binary pointer) makes a registered
   off-heap object live is `beam_process`'s concern (Stage 5), not the collector's.
 
+## Handoffs (owned by other nodes — NOT yet adopted)
+- **`beam_message` / `beam_process` should adopt the fragment API** (`src/fragment.rs`). Building a
+  multi-fragment message: `FragmentChain::push(HeapFragment::with_allocator(alloc, cap)?)`, write terms via
+  `fragment.heap_mut()`, register off-heap objects with `fragment.register_off_heap(x) -> slot` (the slot the
+  on-heap `BinRef.val` stores); on arrival in a process heap call
+  `chain.copy_roots_into(&mut roots, &mut dst_space, &mut dst_off_heap)?` (copies the graph in and transfers
+  off-heap ownership), or `copy_term` when the fragment must keep owning its payloads. At a safepoint:
+  `FragmentRoots::materialize(&mut chain, &mut young, &mut off_heap)?`, then `gather_roots` alongside
+  `x[0..live)`/the stack, `collect`, `scatter_roots`; `FragmentCounters` gives the no-leak check
+  (`live() == 0`, `off_heap_bytes() == 0` once every fragment is dropped/transferred). Note `beam_message`
+  is adding its own `HeapFragment` concurrently — reconcile with that type rather than duplicating it.
+- **The runtime should surface `HeapInfo`** (`beam_rt`): `HeapInfo::of(&collector)` (or
+  `AnyCollector::heap_info()`) backs `erlang:process_info(Pid, garbage_collection)` and
+  `system_info(garbage_collection)`; `GARBAGE_COLLECTION_KEYS` is the oracle's key order.
+- **Repo-root owned** (`../../CHANGE.md`): owed entries for the heap-sizing policy (the C-faithful
+  per-collection growth/shrink, the `min_bin_vheap_words`/`fullsweep_after` fields and `HeapInfo`), the
+  fragment support, and the measured GenImmix decision.
+
 ## Routing Table
 - `src/lib.rs` → crate docs, module wiring, root re-exports, `prelude`
 - `src/space.rs` → `HeapSpace` (copying semi-space over `beam_alloc::Heap`) + `FromSet`
