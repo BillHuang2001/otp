@@ -59,7 +59,7 @@ use beam_engine::terms;
 use beam_process::ProcessId;
 use beam_term::{
     is_atom, is_catch, is_internal_pid, is_internal_port, is_list, is_nil, is_small, make_small,
-    signed_value, Eterm, NIL,
+    signed_value, Eterm,
 };
 
 use super::RuntimeContext;
