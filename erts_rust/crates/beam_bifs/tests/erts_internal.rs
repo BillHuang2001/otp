@@ -255,14 +255,22 @@ fn the_registry_registers_all_ten_keys() {
         );
     }
 
-    // The whole `erts_internal`/`erts_debug` surface of this crate is exactly these
-    // ten keys (a duplicate registration would otherwise hide behind `register`).
+    // The whole `erts_internal`/`erts_debug` namespace this crate's registry exposes
+    // is exactly **eleven** keys: the ten registered by `src/erts_internal.rs` above
+    // plus `erts_internal:cmp_term/2`, which the sibling `src/compare.rs` owns and
+    // registers (the term-order primitive the `<`/`=<` family and `cmp_term/2` route
+    // through). Pinning the namespace count — rather than only checking each key with
+    // `contains` — catches a stray duplicate registration.
     let erts_keys: Vec<_> = reg
         .names()
         .into_iter()
         .filter(|(m, _, _)| m == "erts_internal" || m == "erts_debug")
         .collect();
-    assert_eq!(erts_keys.len(), 10, "got {erts_keys:?}");
+    assert_eq!(erts_keys.len(), 11, "got {erts_keys:?}");
+    assert!(
+        erts_keys.contains(&("erts_internal".to_string(), "cmp_term".to_string(), 2)),
+        "erts_internal:cmp_term/2 (owned by compare.rs) must be the eleventh key"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -592,16 +600,19 @@ fn map_next_folds_a_flat_map_in_list_mode() {
         let p1 = pair(ctx, a, make_small(1));
         let p2 = pair(ctx, b, make_small(2));
         let two_pairs = ctx.list(&[p1, p2]).expect("fits");
+        // The caller's accumulator is the *mode* argument itself; the fold prepends the
+        // map's pairs onto it verbatim. `single_acc` is `[acc]`, so folding the two
+        // pairs onto it yields `[{a,1},{b,2},acc]` (= `with_acc`). Oracle-pinned:
+        // `erts_internal:map_next(0, #{a=>1,b=>2}, [acc])` and the `1` variant both
+        // return `[{a,1},{b,2},acc]` (the position only bounds-checks `n >= Path`).
+        let single_acc = ctx.list(&[acc]).expect("fits");
         let with_acc = ctx.list(&[p1, p2, acc]).expect("fits");
 
-        // `(0, M, [])` and `(2, M, [])` fold every pair onto the (empty) accumulator;
-        // `(0, M, [acc])` / `(1, M, [acc])` fold onto the caller's accumulator
-        // verbatim. The position only bounds-checks (`n >= Path`).
         for (what, path, mode, expected) in [
             ("(0, M, [])", make_small(0), NIL, two_pairs),
-            ("(1, M, [acc])", make_small(1), with_acc, with_acc),
             ("(2, M, [])", make_small(2), NIL, two_pairs),
-            ("(0, M, [acc])", make_small(0), with_acc, with_acc),
+            ("(0, M, [acc])", make_small(0), single_acc, with_acc),
+            ("(1, M, [acc])", make_small(1), single_acc, with_acc),
         ] {
             let got = call(reg, ctx, "erts_internal", "map_next", 3, &[path, map, mode]);
             assert_eq_term(ctx.atoms(), got, expected, what);
@@ -802,18 +813,14 @@ fn binary_to_integer_parses_and_returns_its_failure_atoms() {
             assert_eq!(got, make_small(expected), "binary_to_integer({input}, {base:?})");
         }
 
-        // The failure *atoms* (`binary_to_integer/2` never raises).
+        // The failure *atoms* (`binary_to_integer/2` never raises). Note that a
+        // well-formed but over-long input is the `big` atom, not `badarg` — those are
+        // asserted separately below.
         for (what, arg, base) in [
             ("<<>>", binary(ctx, b""), ten),
             ("\"1a\"", binary(ctx, b"1a"), ten),
             ("\"-\"", binary(ctx, b"-"), ten),
             ("\" 12\" (leading space)", binary(ctx, b" 12"), ten),
-            (FORTY_DIGITS, binary(ctx, FORTY_DIGITS.as_bytes()), ten),
-            (
-                "\"FFFFFFFFFFFFFFFFFFFF\" base 16",
-                binary(ctx, b"FFFFFFFFFFFFFFFFFFFF"),
-                sixteen,
-            ),
         ] {
             let got = call(reg, ctx, "erts_internal", "binary_to_integer", 2, &[arg, base]);
             assert_eq!(got, badarg, "binary_to_integer({what})");
@@ -863,6 +870,57 @@ fn binary_to_integer_parses_and_returns_its_failure_atoms() {
 }
 
 // ---------------------------------------------------------------------------
+// The letter-digit bound of the shared digit predicate
+// ---------------------------------------------------------------------------
+
+/// The letter-digit arms of `c2int_is_valid_char` (`big.c:4065-4072`): the highest
+/// valid letter *digit* is `'A' + (base - 11)`, so the C's exclusive upper bound is
+/// `'A' + base - 10`. `"ff"` parses in base 16 only because that bound is inclusive
+/// of `'F'`; a `- 11` typo silently rejects the last digit of every base (`F`/`f` in
+/// base 16, `Z`/`z` in base 36, …). Both parsers route through this predicate, so the
+/// boundary is pinned here (oracle-probed on erts-17.1).
+#[test]
+fn letter_digits_parse_up_to_the_oracle_base_bound() {
+    with_ctx(|reg, ctx| {
+        let badarg = ctx.atom("badarg").expect("seeded");
+        let sixteen = make_small(16);
+
+        // Base 16: `F`/`f` are the last valid digits (15); `G`/`g` are not.
+        for (input, expected) in [("F", 15), ("f", 15), ("ff", 255)] {
+            let arg = binary(ctx, input.as_bytes());
+            let got = call(reg, ctx, "erts_internal", "binary_to_integer", 2, &[arg, sixteen]);
+            assert_eq!(got, make_small(expected), "binary_to_integer({input:?}, 16)");
+        }
+        for input in ["G", "g", "1g"] {
+            let arg = binary(ctx, input.as_bytes());
+            let got = call(reg, ctx, "erts_internal", "binary_to_integer", 2, &[arg, sixteen]);
+            assert_eq!(got, badarg, "binary_to_integer({input:?}, 16)");
+        }
+
+        // Base 36: `Z`/`z` are the last valid digits (35).
+        for input in ["Z", "z"] {
+            let arg = binary(ctx, input.as_bytes());
+            let got = call(reg, ctx, "erts_internal", "binary_to_integer", 2, &[arg, make_small(36)]);
+            assert_eq!(got, make_small(35), "binary_to_integer({input:?}, 36)");
+        }
+
+        // The list parser shares the predicate: `"ff"` base 16 ⇒ `{255, []}` and the
+        // leading `'g'` of `"1g"` stays unconsumed (⇒ `{1, "g"}`).
+        let ff = chars(ctx, "ff");
+        let got = call(reg, ctx, "erts_internal", "list_to_integer", 2, &[ff, sixteen]);
+        let empty = chars(ctx, "");
+        let expected = ctx.tuple(&[make_small(255), empty]).expect("fits");
+        assert_eq_term(ctx.atoms(), got, expected, "list_to_integer(\"ff\", 16)");
+
+        let one_g = chars(ctx, "1g");
+        let got = call(reg, ctx, "erts_internal", "list_to_integer", 2, &[one_g, sixteen]);
+        let g = chars(ctx, "g");
+        let expected = ctx.tuple(&[make_small(1), g]).expect("fits");
+        assert_eq_term(ctx.atoms(), got, expected, "list_to_integer(\"1g\", 16)");
+    });
+}
+
+// ---------------------------------------------------------------------------
 // erts_internal:list_to_integer/2 — returns its failure atoms / {Integer, Rest}
 // ---------------------------------------------------------------------------
 
@@ -873,7 +931,7 @@ fn list_to_integer_returns_the_integer_and_the_rest_of_the_list() {
         let sixteen = make_small(16);
 
         // `{Integer, Rest}` — the parse stops at the first invalid digit.
-        for (input, base, value, rest) in [
+        for (input, base_num, value, rest) in [
             ("123", 10, 123, ""),
             ("123abc", 10, 123, "abc"),
             ("00", 10, 0, ""),
@@ -886,12 +944,17 @@ fn list_to_integer_returns_the_integer_and_the_rest_of_the_list() {
             ("1z", 16, 1, "z"),
         ] {
             let list = chars(ctx, input);
-            let base = if base == 10 { ten } else { sixteen };
+            let base = if base_num == 10 { ten } else { sixteen };
             let got = call(reg, ctx, "erts_internal", "list_to_integer", 2, &[list, base]);
             let expected_int = ctx.int(value).expect("fits");
             let rest = chars(ctx, rest);
             let expected = ctx.tuple(&[expected_int, rest]).expect("fits");
-            assert_eq_term(ctx.atoms(), got, expected, &format!("list_to_integer({input:?}, 10)"));
+            assert_eq_term(
+                ctx.atoms(),
+                got,
+                expected,
+                &format!("list_to_integer({input:?}, {base_num})"),
+            );
         }
 
         // The failure atoms.

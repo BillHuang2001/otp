@@ -132,16 +132,20 @@ fn atom(ctx: &mut BifContext<'_>, name: &str) -> Result<Eterm> {
     ctx.intern_atom(name)
 }
 
-/// `c2int_is_invalid_char(c, base)` (`big.c`): `false` when `c` is a digit of
-/// `base`.
+/// `c2int_is_invalid_char(c, base)` (`big.c:4065-4076`): `false` when `c` is a digit
+/// of `base`.
+///
+/// The letter arms are the C's `ch < 'A' + base - 10` / `ch < 'a' + base - 10`: the
+/// highest valid letter digit is `'A' + (base - 11)` (e.g. `'F'` for base 16), so the
+/// exclusive upper bound is `'A' + base - 10` (e.g. `'G'`).
 fn c2int_is_invalid_char(c: u8, base: u32) -> bool {
     let c = c as u32;
     if base <= 10 {
         !(c >= '0' as u32 && c < '0' as u32 + base)
     } else {
         !((c >= '0' as u32 && c <= '9' as u32)
-            || (c >= 'A' as u32 && c < 'A' as u32 + base - 11)
-            || (c >= 'a' as u32 && c < 'a' as u32 + base - 11))
+            || (c >= 'A' as u32 && c < 'A' as u32 + base - 10)
+            || (c >= 'a' as u32 && c < 'a' as u32 + base - 10))
     }
 }
 
