@@ -52,6 +52,7 @@
 
 mod application;
 mod code;
+mod erts_internal;
 mod init;
 mod memory;
 mod port;
@@ -150,6 +151,11 @@ impl RuntimeContext<'_> {
             ("erlang", "register", 2) => Some(self.register_2(args)),
             ("erlang", "unregister", 1) => Some(self.unregister_1(args)),
             ("erlang", "module_loaded", 1) => Some(self.module_loaded_1(args)),
+            // The `erts_internal` internal-BIF floor (contract A.7). One arm; the
+            // per-function dispatch lives in [`erts_internal`], which answers `None`
+            // for anything it does not serve — so `erts_internal:cmp_term/2`, owned
+            // by `beam_bifs`, still falls through to the registry.
+            ("erts_internal", _, _) => self.erts_internal_call(function, arity, args),
             _ => None,
         }
     }
