@@ -9,15 +9,18 @@
 //!
 //! | Call | Why it is runtime-native |
 //! |---|---|
-//! | `erlang:port_command/2,3` | writing to the child is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the child's stdin handle |
+//! | `erlang:port_command/2,3` | writing to the port's write stream is the port's *input* direction, which the `PortHook` seam has no method for — the runtime owns the write handle |
 //! | `erlang:port_info/1,2` on a port the runtime does not hold | the answer is the atom `undefined` (see below), which a `PortHook` returning `{Item, Value}` pairs cannot express |
 //!
 //! # `port_command/2,3`
 //!
 //! `Data` is Erlang **iodata**: a binary, a char list, or a nested iolist of
 //! integers/binaries (`io_lib:format/2` output is the common case). It is written to the
-//! child's stdin, which is what makes `open_port({spawn,"cat"},[])` echo its input back —
-//! the read side is [`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext).
+//! port's write stream — the child's stdin for a `spawn`/`spawn_executable` port, and the
+//! **adopted, duplex descriptor** for a `{fd, N}` port (the oracle writes to the descriptor
+//! for a `{fd, N}` port too) — which is what makes `open_port({spawn,"cat"},[])` echo its
+//! input back. The read side is
+//! [`RuntimeContext::poll_port_messages`](crate::context::RuntimeContext).
 //!
 //! `/3` `Options` are validated **and honored**: `nosuspend` changes nothing here (the write
 //! is always asynchronous and buffered), while `force` is rejected with the oracle's
@@ -26,9 +29,8 @@
 //! container — is `error:badarg`, and the port liveness check precedes the `force` check, so
 //! a dead port with `[force]` is `badarg` rather than `notsup`. The result is the atom
 //! `true` (the oracle's own value). A non-port argument, a port the runtime does not hold
-//! (closed, or never opened), and non-iodata are [`BeamError::BadArg`] — the oracle's
-//! reason; a port with no child stdin of ours (a `{fd, N}` port) is a typed *capability
-//! gap*, never a silent write elsewhere.
+//! (closed, or never opened), and non-iodata are [`BeamError::BadArg`] — the oracle's own
+//! reason.
 //!
 //! # `port_info/1,2` on a closed port
 //!
@@ -70,8 +72,8 @@ impl RuntimeContext<'_> {
         }
     }
 
-    /// `erlang:port_command(Port, Data[, Options])`: write `Data`'s bytes to the port's
-    /// child and answer the atom `true`.
+    /// `erlang:port_command(Port, Data[, Options])`: write `Data`'s bytes to the port's write
+    /// stream and answer the atom `true`.
     ///
     /// The steps follow the oracle's own order (`erts_internal_port_command_3`, with the
     /// `badopt` → `badarg` mapping `erlang.erl`'s `port_command/3` wrapper applies):
@@ -83,14 +85,14 @@ impl RuntimeContext<'_> {
     ///    rather than `notsup`;
     /// 4. `force` — a request to bypass the driver's busy state — is `error:notsup`, because
     ///    the spawn driver does not carry `ERL_DRV_FLAG_SOFT_BUSY`;
-    /// 5. otherwise collect `Data` as iodata and write it.
+    /// 5. otherwise collect `Data` as iodata and write it — to the child's stdin, or to the
+    ///    adopted duplex descriptor of a `{fd, N}` port.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a non-port, a port the runtime does not hold, a malformed
-    /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force`; a
-    /// capability gap for a port that owns no child stdin; [`BeamError::Io`] when the write
-    /// fails.
+    /// or unrecognized option list, or non-iodata `Data`; the `notsup` raise for `force`;
+    /// [`BeamError::Io`] when the write fails.
     fn port_command(&mut self, args: &[Eterm], with_options: bool) -> Result<Eterm> {
         let port = PortId::from_eterm(*args.first().ok_or(BeamError::BadArg)?)?;
         let data = *args.get(1).ok_or(BeamError::BadArg)?;

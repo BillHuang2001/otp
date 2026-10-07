@@ -63,15 +63,17 @@
 //! `port_command/2,3` writes to the child's **stdin** (an iolist, a binary or a char list),
 //! which is what makes `open_port({spawn,"cat"},[])` echo its input back: the bytes are
 //! queued through [`beam_io::PortRegistry::port_command`] and the scheduled `OUTPUT` task is
-//! run immediately so they reach the child before the call returns.
+//! run immediately so they reach the child before the call returns. A `{fd, N}` port owns no
+//! child pipe, but its adopted descriptor is **duplex** (`beam_io`'s `SpawnDriver` registers
+//! it once with `Interest::BOTH`), so the same call writes out through that descriptor —
+//! exactly the oracle's behaviour.
 //!
-//! **Not yet:** the child's stderr *is* a pipe but is never read, only **stdout** is polled;
+//! **Not yet:** only **stdout** is polled (the child's stderr is discarded by the driver);
 //! `connected` only flips to `false` at `port_close/1` rather than when the child exits by
 //! itself; a stream read of more than `ERL_ONHEAP_BINARY_LIMIT` (64) bytes on a `binary`
 //! port is a typed *unsupported* gap (there is no off-heap ref-counted binary build path
-//! here yet); the `eof` option is accepted but inert (its `{Port, eof}` message is not
-//! synthesized); and a `port_command/2,3` write to a `{fd, N}` port (which owns no child
-//! pipe) is a typed *unsupported* gap.
+//! here yet); and the `eof` option is accepted but inert (its `{Port, eof}` message is not
+//! synthesized).
 //!
 //! # `port_info` items
 //!
@@ -123,8 +125,9 @@ use beam_bifs::PortHook;
 use beam_common::{BeamError, Result};
 use beam_engine::terms;
 use beam_io::{
-    Driver, Poller, PortCommandOptions, PortNotification, PortRegistry as IoPortRegistry,
-    SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream, PORT_REDS_EXECUTE,
+    Driver, Poller, PortCommandOptions, PortExitReason, PortNotification,
+    PortRegistry as IoPortRegistry, SpawnDriver, SpawnOptions, SpawnSpec, SpawnStream,
+    PORT_REDS_EXECUTE,
 };
 use beam_process::{PortId, ProcessId, ProcessTable};
 use beam_term::{
@@ -153,7 +156,10 @@ const PORT_HEAP_WORDS: usize = 4_096;
 ///
 /// The scheduler path uses the very same slice as its per-round port-poll budget: one round
 /// of [`Runtime::deliver_port_messages`] blocks for at most this long, so a runtime whose
-/// run queue is drained and whose ports are quiet returns promptly instead of spinning.
+/// run queue is drained and whose ports are quiet returns promptly instead of spinning. A
+/// slice is an **upper bound only** — [`PortRegistry::pump`] shortens it further when a live
+/// driver declares an earlier deadline (see [`beam_io::Driver::next_timeout`]), so a
+/// driver-declared timer fires at its deadline rather than up to a slice late.
 pub(crate) const PORT_POLL_SLICE: Duration = Duration::from_millis(25);
 
 /// The atom vocabulary `port_info/1,2` can emit.
@@ -255,17 +261,16 @@ impl From<StreamType> for SpawnStream {
 /// expose.
 ///
 /// `beam_io`'s port owns the child, the descriptors and the lifecycle; these are the Erlang
-/// side's facts: the `Name` the port was opened with, the OS pid the driver reported, the
+/// side's facts: the command the port was opened with, the OS pid the driver reported, the
 /// stream option, the `exit_status` flag and the process the port belongs to (which is where
 /// its stream/exit messages are delivered, and which `port_info(Port, connected)`/`links`
 /// report).
 #[derive(Debug)]
 struct PortMeta {
-    /// Which `Name` form opened the port.
-    name: PortName,
-    /// The raw command line (a flattened shell command, or a path) — the
+    /// The raw command line (a flattened shell command, a path, or `fd:<N>`) — the
     /// `port_info(Port, name)` value. The `exec` prefix the shell form runs with is **not**
-    /// part of it.
+    /// part of it. A `{fd, N}` port's adopted descriptor is duplex, so the write path does
+    /// not need the `Name` form either (see [`PortRegistry::write_command`]).
     command: String,
     /// The OS process id the driver reported **before** the port was registered; absent for
     /// a `{fd, N}` port.
@@ -393,30 +398,24 @@ impl PortRegistry {
         self.meta.contains_key(&id.number())
     }
 
-    /// Writes `bytes` to the port's child — `erlang:port_command/2,3`.
+    /// Writes `bytes` to the port's stream — `erlang:port_command/2,3`.
     ///
     /// The bytes are queued through [`beam_io::PortRegistry::port_command`] and the
-    /// `OUTPUT` task it scheduled is run immediately, so the child has been handed the data
-    /// before this call returns (the BIF's `true` answer means exactly that).
+    /// `OUTPUT` task it scheduled is run immediately, so the stream has been handed the data
+    /// before this call returns (the BIF's `true` answer means exactly that). For a child port
+    /// that stream is the child's stdin; for a `{fd, N}` port it is the **adopted, duplex**
+    /// descriptor — writing is the oracle's own behaviour for a descriptor port, so the write
+    /// takes the same path rather than being a capability gap.
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a port this registry does not hold (closed, or never
-    /// opened) — the oracle's own reason for `port_command` on a dead port; a capability
-    /// gap for a port that owns no child pipe of ours (a `{fd, N}` port); [`BeamError::Io`]
-    /// when the write itself fails (a child that closed its stdin yields `EPIPE`).
+    /// opened) — the oracle's own reason for `port_command` on a dead port;
+    /// [`BeamError::Io`] when the write itself fails (a child that closed its stdin yields
+    /// `EPIPE`).
     pub fn write_command(&mut self, id: PortId, bytes: &[u8]) -> Result<()> {
-        let Some(meta) = self.meta.get(&id.number()) else {
+        if !self.meta.contains_key(&id.number()) {
             return Err(BeamError::BadArg);
-        };
-        // A `{fd, N}` port adopts a descriptor the Erlang side owns: there is no child
-        // stdin of ours to write to, so the call is a typed capability gap — never a write
-        // to some other descriptor and never a fabricated success (the `beam_io` registry
-        // would otherwise answer its own `badarg`, losing the distinction).
-        if meta.name == PortName::Fd {
-            return Err(error::unsupported(
-                "port_command/2 on a port with no child stdin ({fd, N} port)",
-            ));
         }
         self.registry
             .port_command(&mut self.poller, id, bytes, PortCommandOptions::EMPTY)?;
@@ -451,17 +450,38 @@ impl PortRegistry {
         numbers.into_iter().map(PortId::new).collect()
     }
 
-    /// Closes the port `id`: kills and reaps its child, releases its id and drops its
-    /// metadata.
+    /// Closes the port `id`: notifies its driver of the exit, kills and reaps its child,
+    /// releases its id and drops its metadata.
+    ///
+    /// The driver is told the port is exiting ([`PortExitReason::Closed`]) **before** the
+    /// teardown runs — `beam_io`'s [`beam_io::PortRegistry::notify_port_exit`] invokes
+    /// [`Driver::port_exit`] at most once per port and leaves the port live, so a driver can
+    /// react to its port exiting without owning the lifecycle; the teardown `stop` then
+    /// follows (see [`beam_io::Driver::port_exit`]).
     ///
     /// # Errors
     ///
     /// [`BeamError::BadArg`] for a port the runtime does not hold — never a silently
-    /// accepted close of a port that does not exist; otherwise whatever the driver's
-    /// teardown reports (the port is gone from the registry either way).
+    /// accepted close of a port that does not exist. The port is removed from this registry
+    /// either way, and both outcomes are reported: the teardown's failure is returned first,
+    /// and a failed exit notification is surfaced when the teardown succeeded — neither is
+    /// silently swallowed.
     pub fn close(&mut self, id: PortId) -> Result<()> {
-        self.meta.remove(&id.number()).ok_or(BeamError::BadArg)?;
-        self.registry.close(&mut self.poller, id)
+        if !self.meta.contains_key(&id.number()) {
+            return Err(BeamError::BadArg);
+        }
+        // The port-exit notification first: the driver sees `port_exit` before the teardown
+        // `stop`, and the port is still live for it.
+        let notified = self
+            .registry
+            .notify_port_exit(&mut self.poller, id, PortExitReason::Closed);
+        // The port is leaving this registry either way: a close the runtime has begun is
+        // never abandoned halfway, so a failed notification cannot leave the table stale.
+        self.meta.remove(&id.number());
+        let closed = self.registry.close(&mut self.poller, id);
+        // `and` returns the teardown's error when it failed, and the notification's
+        // otherwise — so a failure on either path reaches the caller.
+        closed.and(notified)
     }
 
     /// Polls the live ports for up to `timeout`, runs the port tasks the readiness implies,
@@ -473,6 +493,14 @@ impl PortRegistry {
     /// readiness. A due exit status is checked **before** the wait too, so a child reaped
     /// before this call is reported without any polling. The method returns as soon as any
     /// event is available, and with an empty report once `timeout` elapses.
+    ///
+    /// Each slice is further clamped by the earliest deadline a live driver declares
+    /// ([`beam_io::PortRegistry::next_deadline`], the minimum over the drivers'
+    /// [`beam_io::Driver::next_timeout`]): a driver-declared timer must fire **at** its
+    /// deadline, so the poll may never block past it. The clamp is never negative (a due
+    /// deadline waits `0`), and because the very next thing the loop does is run the port
+    /// tasks, a due `TIMEOUT` task is serviced immediately — no busy loop, and the slice's
+    /// other work is unchanged.
     ///
     /// Nothing at all is polled when no port is live, so a runtime that never opened a port
     /// never sleeps here.
@@ -488,8 +516,17 @@ impl PortRegistry {
         }
         let deadline = Instant::now() + timeout;
         loop {
-            let remaining = deadline.saturating_duration_since(Instant::now());
-            let polled = self.poller.poll(Some(remaining.min(PORT_POLL_SLICE)))?;
+            let now = Instant::now();
+            let remaining = deadline.saturating_duration_since(now);
+            let mut wait = remaining.min(PORT_POLL_SLICE);
+            // A driver-declared deadline (a `Driver::next_timeout` mirrored into the port's
+            // `TIMEOUT` task) bounds the wait too: without the clamp a timer that is due in a
+            // few milliseconds would sit unserviced until the whole slice elapsed. A deadline
+            // already past yields a zero wait, and the task round below then runs it.
+            if let Some(next) = self.registry.next_deadline() {
+                wait = wait.min(next.saturating_duration_since(now));
+            }
+            let polled = self.poller.poll(Some(wait))?;
             if !polled.is_empty() {
                 // Readiness becomes *scheduled tasks* (the ERTS port-task model) — the
                 // driver is called when the task runs, never from the event loop.
@@ -797,31 +834,41 @@ impl RuntimePorts {
     /// (optionally with an inline option list) or `{fd, N}`.
     ///
     /// Anything else — a bare atom, a tuple with another tag or arity, a `Cmd` that is not
-    /// a string/atom/argv list, a negative or non-integer descriptor — is
-    /// [`BeamError::BadArg`].
+    /// a string/atom/argv list, an **empty** command/path (the oracle's own name validation
+    /// rejects it with `badarg`; see [`checked_name`]), a negative or non-integer descriptor
+    /// — is [`BeamError::BadArg`].
     fn name_spec(&self, name: Eterm) -> Result<NameSpec> {
         let arity = terms::tuple_arity(name)?;
         let tag = terms::tuple_element(name, 0)?;
         let tag = self.atom_name(tag).ok_or(BeamError::BadArg)?;
         match (tag, arity) {
-            ("spawn", 2) => Ok(NameSpec {
-                kind: PortName::Spawn,
-                command: self.command_spec(terms::tuple_element(name, 1)?)?,
-                fd: None,
-                inline_options: None,
-            }),
-            ("spawn_executable", 2) => Ok(NameSpec {
-                kind: PortName::SpawnExecutable,
-                command: self.string_value(terms::tuple_element(name, 1)?)?,
-                fd: None,
-                inline_options: None,
-            }),
-            ("spawn_executable", 3) => Ok(NameSpec {
-                kind: PortName::SpawnExecutable,
-                command: self.string_value(terms::tuple_element(name, 1)?)?,
-                fd: None,
-                inline_options: Some(terms::tuple_element(name, 2)?),
-            }),
+            ("spawn", 2) => {
+                let command = self.command_spec(terms::tuple_element(name, 1)?)?;
+                Ok(NameSpec {
+                    kind: PortName::Spawn,
+                    command: checked_name(command)?,
+                    fd: None,
+                    inline_options: None,
+                })
+            }
+            ("spawn_executable", 2) => {
+                let command = self.string_value(terms::tuple_element(name, 1)?)?;
+                Ok(NameSpec {
+                    kind: PortName::SpawnExecutable,
+                    command: checked_name(command)?,
+                    fd: None,
+                    inline_options: None,
+                })
+            }
+            ("spawn_executable", 3) => {
+                let command = self.string_value(terms::tuple_element(name, 1)?)?;
+                Ok(NameSpec {
+                    kind: PortName::SpawnExecutable,
+                    command: checked_name(command)?,
+                    fd: None,
+                    inline_options: Some(terms::tuple_element(name, 2)?),
+                })
+            }
             ("fd", 2) => {
                 let descriptor = terms::tuple_element(name, 1)?;
                 // A descriptor is a non-negative integer; anything else the driver cannot
@@ -991,7 +1038,6 @@ impl PortHook for RuntimePorts {
         let driver = SpawnDriver::new(&spec.spawn_spec()?, &spawn_options)?;
         let os_pid = driver.os_pid();
         let meta = PortMeta {
-            name: spec.kind,
             command: spec.command,
             os_pid,
             stream,
@@ -1011,6 +1057,9 @@ impl PortHook for RuntimePorts {
         if !registry.is_live(port) {
             return Err(BeamError::BadArg);
         }
+        // [`PortRegistry::close`] is also the port-exit path: it notifies the driver
+        // ([`PortExitReason::Closed`], at most once) before the teardown, so this hook needs
+        // no notification of its own.
         registry.close(port)
     }
 
@@ -1191,6 +1240,28 @@ impl RuntimeContext<'_> {
     }
 }
 
+/// The validated **non-empty** command/path a `{spawn, Cmd}`/`{spawn_executable, Path}` name
+/// must carry.
+///
+/// The oracle rejects an empty name with `error:badarg` in its own validation of the
+/// `open_port/2` `Name` (`erts_internal_open_port_2`), *before* any driver is reached:
+/// `open_port({spawn,""},[])` and `open_port({spawn_executable,""},[])` are both
+/// `error:badarg` (verified against erts-17.1), while `{spawn," "}` is accepted. Letting an
+/// empty name through would reach `beam_io`'s spawn driver, whose `exec` of an empty program
+/// maps to `enoent` — the wrong reason for the same call. Any non-empty name is passed
+/// through unchanged.
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for an empty name.
+fn checked_name(command: String) -> Result<String> {
+    if command.is_empty() {
+        Err(BeamError::BadArg)
+    } else {
+        Ok(command)
+    }
+}
+
 /// `text` as an Erlang string (a char list of bytes), built on `heap`.
 ///
 /// # Errors
@@ -1241,6 +1312,7 @@ fn monitor_list(heap: &mut Heap, atoms: &AtomTable, pids: &[ProcessId]) -> Resul
 mod tests {
     use super::*;
     use crate::boot;
+    use beam_io::DriverContext;
 
     /// The process every port the fixture's hook opens claims as its owner.
     const OWNER: ProcessId = ProcessId::new(7, 0);
@@ -1405,6 +1477,103 @@ mod tests {
             }
         }
         panic!("no stream data for {port:?}");
+    }
+
+    /// The `port_info/1,2` metadata of a port a test registers **directly** (bypassing
+    /// `open_port/2`), so a recorder driver can be driven without a real child.
+    fn test_meta(command: &str) -> PortMeta {
+        PortMeta {
+            command: command.to_string(),
+            os_pid: None,
+            stream: StreamType::List,
+            notify_exit: false,
+            monitors: Vec::new(),
+            owner: OWNER,
+        }
+    }
+
+    /// A driver that records its lifecycle callbacks and can declare a timer.
+    ///
+    /// The built-in drivers (`fd`/`efile`/`spawn`) give no observation point for the two
+    /// `beam_rt`-driven seams — the port-exit notification ([`Driver::port_exit`]) and the
+    /// poll deadline ([`Driver::next_timeout`] + [`Driver::timeout`]) — so they are pinned
+    /// against this recorder instead.
+    struct RecorderDriver {
+        /// The registered name (required by the trait; unused by the tests).
+        name: &'static str,
+        /// The lifecycle callbacks in call order: `"exit:<Reason>"` from `port_exit` and
+        /// `"stop"` from the teardown.
+        log: Rc<RefCell<Vec<String>>>,
+        /// The deadline `next_timeout` declares, when this recorder carries a timer.
+        deadline: Option<Instant>,
+        /// Where the timer records the instant it actually fired (absent without a timer).
+        fired_at: Option<Rc<RefCell<Option<Instant>>>>,
+    }
+
+    impl RecorderDriver {
+        /// A recorder with no timer, appending its callbacks to `log`.
+        fn new(name: &'static str, log: Rc<RefCell<Vec<String>>>) -> RecorderDriver {
+            RecorderDriver {
+                name,
+                log,
+                deadline: None,
+                fired_at: None,
+            }
+        }
+
+        /// A recorder declaring a timer at `deadline`, recording when it fires.
+        fn with_timer(deadline: Instant, fired_at: Rc<RefCell<Option<Instant>>>) -> RecorderDriver {
+            RecorderDriver {
+                name: "recorder",
+                log: Rc::new(RefCell::new(Vec::new())),
+                deadline: Some(deadline),
+                fired_at: Some(fired_at),
+            }
+        }
+    }
+
+    impl Driver for RecorderDriver {
+        fn name(&self) -> &str {
+            self.name
+        }
+
+        fn start(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn output(&mut self, _ctx: &mut DriverContext<'_>) -> Result<usize> {
+            Ok(0)
+        }
+
+        fn ready_input(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            Ok(())
+        }
+
+        fn stop(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            self.log.borrow_mut().push("stop".to_string());
+            Ok(())
+        }
+
+        fn port_exit(&mut self, _ctx: &mut DriverContext<'_>, reason: PortExitReason) -> Result<()> {
+            self.log.borrow_mut().push(format!("exit:{reason:?}"));
+            Ok(())
+        }
+
+        fn next_timeout(&self) -> Option<Instant> {
+            // Declared until it has fired: the port re-arms its `TIMEOUT` task from this
+            // after every interaction, so a still-declared deadline would fire every round.
+            match &self.fired_at {
+                Some(fired) if fired.borrow().is_some() => None,
+                _ => self.deadline,
+            }
+        }
+
+        fn timeout(&mut self, _ctx: &mut DriverContext<'_>) -> Result<()> {
+            if let Some(fired) = &self.fired_at {
+                *fired.borrow_mut() = Some(Instant::now());
+            }
+            Ok(())
+        }
     }
 
     #[test]
@@ -1741,32 +1910,178 @@ mod tests {
     }
 
     #[test]
-    fn a_fd_port_has_no_child_stdin_to_write_to() {
+    fn a_fd_port_write_reaches_the_adopted_descriptor() {
+        use std::io::Read;
+        use std::os::fd::AsRawFd;
+        use std::os::unix::net::UnixStream;
+
         let mut fx = fixture();
         // A descriptor the **test** owns and keeps open: `beam_io`'s driver adopts a
         // `{fd, N}` by putting it in non-blocking mode (`fcntl(F_SETFL, O_NONBLOCK)`), which
         // the sandbox refuses for an inherited descriptor (`EPERM`); a socketpair end always
-        // accepts it, so the gap is exercised independently of the test harness's fds.
-        use std::os::fd::AsRawFd;
-        use std::os::unix::net::UnixStream;
-        let (local, _peer) = UnixStream::pair().expect("a socketpair");
+        // accepts it. The adoption is **duplex** — the one descriptor is registered with
+        // `Interest::BOTH` — so `port_command` writes out through it (the oracle's own
+        // behaviour for a `{fd, N}` port).
+        let (local, mut peer) = UnixStream::pair().expect("a socketpair");
         let fd = local.as_raw_fd();
         let name = fx.name("fd", make_small(i64::from(fd)));
         let port = fx.hook.open_port(name, NIL).expect("{fd, N}");
-        // A `{fd, N}` port owns no pipe of ours: writing to it is a typed capability gap,
-        // never a write to some other descriptor and never a fabricated success. (The
-        // `beam_io` registry would answer its own `badarg`; the gap is preserved here.)
-        let error = fx
-            .registry
+
+        // The write takes the normal driver write path and the bytes come out of the peer.
+        fx.registry
             .borrow_mut()
-            .write_command(port, b"x")
-            .expect_err("no child stdin");
-        assert!(matches!(
-            error::unsupported_reason(&error).as_deref(),
-            Some(reason) if reason.contains("port_command")
-        ));
+            .write_command(port, b"ping")
+            .expect("the write reaches the adopted descriptor");
+        let mut buf = [0u8; 4];
+        peer.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("a read timeout");
+        peer.read_exact(&mut buf)
+            .expect("the peer reads what the port wrote");
+        assert_eq!(&buf, b"ping");
+
+        // A write never closes the port.
+        assert!(fx.registry.borrow().is_live(port));
+        fx.hook.close_port(port).expect("port_close/1");
     }
 
+    #[test]
+    fn an_empty_port_name_is_badarg() {
+        let mut fx = fixture();
+        // The oracle rejects an empty command/path in its own validation of the `Name`
+        // (`open_port({spawn,""},[])` and `open_port({spawn_executable,""},[])` are both
+        // `error:badarg` against erts-17.1) — before any driver is reached, whose `exec` of
+        // an empty program would report `enoent` instead.
+        let empty = fx.string("");
+        let name = fx.name("spawn", empty);
+        assert_badarg(fx.hook.open_port(name, NIL));
+        let empty = fx.string("");
+        let name = fx.name("spawn_executable", empty);
+        assert_badarg(fx.hook.open_port(name, NIL));
+        // The 3-tuple form carries the same name.
+        let empty = fx.string("");
+        let options = fx.list(&[]);
+        let tag = fx.atom("spawn_executable");
+        let name = fx.heap.tuple(&[tag, empty, options]).expect("a name tuple");
+        assert_badarg(fx.hook.open_port(name, NIL));
+
+        // Validation precedes allocation: none of the rejected calls consumed a port number.
+        let name = fx.spawn("true");
+        let port = fx.hook.open_port(name, NIL).expect("a valid port");
+        assert_eq!(port, PortId::new(0));
+    }
+
+    #[test]
+    fn closing_a_port_notifies_the_driver_of_the_exit_before_the_teardown() {
+        let fx = fixture();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let driver = RecorderDriver::new("recorder", Rc::clone(&log));
+        let port = fx
+            .registry
+            .borrow_mut()
+            .register(Box::new(driver), test_meta("recorder"))
+            .expect("a registered port");
+
+        // The driver is told the port is exiting (`Closed`) **before** its teardown `stop`:
+        // the two are distinct callbacks, and the order is what makes `port_exit` an
+        // advisory notification rather than part of the teardown.
+        fx.registry.borrow_mut().close(port).expect("close");
+        assert_eq!(
+            *log.borrow(),
+            vec!["exit:Closed".to_string(), "stop".to_string()],
+            "the port-exit notification precedes the teardown"
+        );
+        assert!(!fx.registry.borrow().contains(port));
+        // A close the runtime has already performed is never silently accepted again.
+        assert_badarg(fx.registry.borrow_mut().close(port));
+    }
+
+    #[test]
+    fn a_port_exit_notification_is_delivered_once_and_leaves_the_port_live() {
+        let fx = fixture();
+        let log = Rc::new(RefCell::new(Vec::new()));
+        let driver = RecorderDriver::new("recorder", Rc::clone(&log));
+        let port = fx
+            .registry
+            .borrow_mut()
+            .register(Box::new(driver), test_meta("recorder"))
+            .expect("a registered port");
+
+        // An isolated notification reaches the driver **once** and does not tear the port
+        // down: a repeat never calls `port_exit` again, and the port is still live for the
+        // later `stop`.
+        let mut borrowed = fx.registry.borrow_mut();
+        let ports = &mut *borrowed;
+        ports
+            .registry
+            .notify_port_exit(&mut ports.poller, port, PortExitReason::Closed)
+            .expect("the first notification reaches the driver");
+        assert_eq!(*log.borrow(), vec!["exit:Closed".to_string()]);
+        ports
+            .registry
+            .notify_port_exit(&mut ports.poller, port, PortExitReason::OwnerExited)
+            .expect("a repeat is a no-op");
+        assert_eq!(
+            *log.borrow(),
+            vec!["exit:Closed".to_string()],
+            "the port-exit notification is delivered at most once"
+        );
+        assert!(
+            ports.contains(port),
+            "the notification leaves the port live"
+        );
+        ports.close(port).expect("the teardown still runs");
+        assert_eq!(
+            *log.borrow(),
+            vec!["exit:Closed".to_string(), "stop".to_string()]
+        );
+    }
+
+    #[test]
+    fn the_pump_clamps_its_wait_to_a_driver_declared_deadline() {
+        let fx = fixture();
+        let fired_at = Rc::new(RefCell::new(None::<Instant>));
+        // A deadline inside `PORT_POLL_SLICE`: without the clamp the first poll would spend
+        // the whole slice before the port's `TIMEOUT` task could run at all.
+        let declared = Instant::now() + Duration::from_millis(10);
+        let driver = RecorderDriver::with_timer(declared, Rc::clone(&fired_at));
+        fx.registry
+            .borrow_mut()
+            .register(Box::new(driver), test_meta("timer"))
+            .expect("a registered port");
+
+        // The declaration reaches the clamp: `beam_io`'s `next_deadline` is exactly the
+        // driver's `next_timeout`, which the port's `TIMEOUT` task mirrors.
+        assert_eq!(
+            fx.registry.borrow().registry.next_deadline(),
+            Some(declared),
+            "the driver's declaration is the clamp's upper bound"
+        );
+
+        // A pump whose own timeout (60 ms) is far past the deadline still services the timer
+        // **at** its deadline: the poll may not block past it, so the task round right after
+        // the poll runs it. Unclamped, the first poll would block a whole `PORT_POLL_SLICE`.
+        let started = Instant::now();
+        let events = fx
+            .registry
+            .borrow_mut()
+            .pump(Duration::from_millis(60))
+            .expect("pump");
+        assert!(events.is_empty(), "a timer is not a port message: {events:?}");
+
+        let fired = fired_at.borrow().expect("the declared timer fired");
+        let delay = fired.duration_since(started);
+        assert!(
+            delay >= Duration::from_millis(5),
+            "the deadline is a lower bound — the timer must not fire early, fired after {delay:?}"
+        );
+        assert!(
+            delay < PORT_POLL_SLICE,
+            "the wait was clamped below the {PORT_POLL_SLICE:?} slice, fired after {delay:?}"
+        );
+        // The timer fired once and cleared its own declaration, so nothing is left armed.
+        assert_eq!(*fired_at.borrow(), Some(fired), "the timer fired exactly once");
+        assert_eq!(fx.registry.borrow().registry.next_deadline(), None);
+    }
     #[test]
     fn a_fd_port_adopts_a_caller_owned_descriptor() {
         use std::io::Write;
