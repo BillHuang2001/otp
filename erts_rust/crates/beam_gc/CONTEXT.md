@@ -161,7 +161,7 @@ A fragment is a bump-allocated `beam_alloc::Heap` region **outside** every proce
   `copy.rs`'s `pub(crate)` `move_size`/`for_each_ref` (the frozen layout rules stay in one place); there is
   no `ERTS_HOLE_MARKER` support and no in-place offset rewrite (see Known Gaps).
 
-### `stats.rs` — `GcStats`
+### `mso.rs` — off-heap refcounted large objects & refc binaries
 - `RefCount` — **re-exported** from `beam_alloc` (`pub use beam_alloc::RefCount;`); the workspace's single
   `erts_refc_*` primitive (`new`, `count`, `inc`, `dec`, `dec_and_test(min)`). This crate defines no count
   of its own; both `beam_gc::RefCount` and `beam_gc::mso::RefCount` resolve.
