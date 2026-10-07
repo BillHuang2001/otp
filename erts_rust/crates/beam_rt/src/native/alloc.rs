@@ -17,7 +17,7 @@
 //! [`beam_alloc::registry::alloc_util_allocators`] order (`temp_alloc`, `sl_alloc`,
 //! `std_alloc`, …, `driver_alloc` — the same ten names
 //! `erlang:system_info(alloc_util_allocators)` reports and `system_info({allocator, A})`
-//! accepts). `system_alloc` and `test_alloc` are excluded: they are not alloc-util
+//! accepts). `sys_alloc` and `test_alloc` are excluded: they are not alloc-util
 //! allocators (the C's `erts_alloc_util_allocators` hides exactly those two) and the
 //! oracle reports `sys_alloc` in a completely different shape (`{e, true}, {m, libc}`).
 //!
