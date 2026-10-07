@@ -223,9 +223,14 @@ impl Fixture {
     }
 }
 
-/// Compiles the C fixture, or `None` when a host facility is missing (the caller returns
+/// Compiles the committed C fixture, or `None` when a host facility is missing (the caller returns
 /// early — **loudly**).
 fn build_fixture(label: &str) -> Option<Fixture> {
+    compile_c(label, "t", DRIVER_C)
+}
+
+/// Compiles `source` into `<scratch>/<stem_name>.so`, or `None` when the toolchain is missing.
+fn compile_c(label: &str, stem_name: &str, source: &str) -> Option<Fixture> {
     let Some(include) = erl_include_dir() else {
         skip(&format!("driver/{label}: no erl_driver.h include directory found"));
         return None;
@@ -240,20 +245,20 @@ fn build_fixture(label: &str) -> Option<Fixture> {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dir = std::env::temp_dir().join(format!("beam_rt_driver_{label}_{}_{n}", std::process::id()));
-    let stem = dir.join("t");
-    let c_src = dir.join("test_driver.c");
-    let write = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&c_src, DRIVER_C));
+    let stem = dir.join(stem_name);
+    let c_src = dir.join(format!("{stem_name}.c"));
+    let write = std::fs::create_dir_all(&dir).and_then(|()| std::fs::write(&c_src, source));
     if let Err(error) = write {
         skip(&format!("driver/{label}: cannot prepare {}: {error}", dir.display()));
         return None;
     }
-    // The shared object: `cc -shared -fPIC -I<include> -o <dir>/t.so <dir>/test_driver.c`.
+    // The shared object: `cc -shared -fPIC -I<include> -o <dir>/<stem>.so <dir>/<stem>.c`.
     let output = Command::new(cc())
         .arg("-shared")
         .arg("-fPIC")
         .arg(format!("-I{}", include.display()))
         .arg("-o")
-        .arg(dir.join("t.so"))
+        .arg(dir.join(format!("{stem_name}.so")))
         .arg(&c_src)
         .output();
     match output {
@@ -271,13 +276,14 @@ fn build_fixture(label: &str) -> Option<Fixture> {
             return None;
         }
     }
-    if !dir.join("t.so").is_file() {
-        skip(&format!("driver/{label}: the C compiler produced no t.so"));
+    if !dir.join(format!("{stem_name}.so")).is_file() {
+        skip(&format!(
+            "driver/{label}: the C compiler produced no {stem_name}.so"
+        ));
         return None;
     }
     Some(Fixture { dir, stem })
 }
-
 // ---------------------------------------------------------------------------------------------
 // Symbol-table inspection
 // ---------------------------------------------------------------------------------------------
@@ -302,6 +308,22 @@ fn all_symbols_are_exported(path: &Path, names: &[&str]) -> Option<bool> {
         return Some(names.iter().all(|name| {
             out.lines()
                 .any(|line| line.contains(name) && !line.contains(" UND "))
+        }));
+    }
+    None
+}
+
+/// Whether every name in `names` is an **undefined** import of `path`, or `None` when neither `nm`
+/// nor `readelf` is usable.
+fn all_symbols_are_undefined_imports(path: &Path, names: &[&str]) -> Option<bool> {
+    let p = path.display().to_string();
+    if let Some(out) = run_tool("nm", &["-D", "--undefined-only", &p]) {
+        return Some(names.iter().all(|name| out.contains(name)));
+    }
+    if let Some(out) = run_tool("readelf", &["--dyn-syms", "-W", &p]) {
+        return Some(names.iter().all(|name| {
+            out.lines()
+                .any(|line| line.contains(name) && line.contains(" UND "))
         }));
     }
     None
@@ -374,7 +396,16 @@ fn loads_and_drives_a_real_c_driver() {
         return;
     };
 
-    // --- dlopen(RTLD_NOW) + the `ErlDrvEntry` validation ----------------------------------------
+    // --- the `.so` really imports `driver_*` (bound at load time, not at link time) -------------
+    match all_symbols_are_undefined_imports(&fixture.stem.with_extension("so"), DRIVER_IMPORTS) {
+        Some(true) => {}
+        Some(false) => panic!(
+            "the fixture must reference {} as undefined dynamic symbols; inspect its `.so` with \
+             `nm -D`",
+            DRIVER_IMPORTS.join("/")
+        ),
+        None => skip("driver/drive: no nm/readelf to inspect the `.so`'s dynamic symbols"),
+    }    // --- dlopen(RTLD_NOW) + the `ErlDrvEntry` validation ----------------------------------------
     // The name is the entry's own `driver_name`; a mismatch would be `bad_driver_name`.
     let library = load_driver(&fixture.candidates(), "t")
         .expect("a real driver must load: its driver_* imports resolve from the test binary");
@@ -499,8 +530,43 @@ fn the_unimplemented_host_services_report_the_c_failure_codes() {
     fixture.cleanup();
 }
 
-/// The built binary **exports** every `driver_*` symbol the fixture imports, as a dynamic symbol.
+/// The load path really invokes the entry's `init` callback.
 ///
+/// `beam_abi::driver::loader::load` runs the entry's `init` exactly where the C's `init_driver`
+/// does (`io.c`: at load, after the version/name validation), and a non-zero result vetoes the
+/// load with `driver_init_failed`. A driver whose `init` always vetoes therefore proves the
+/// callback ran — the load cannot succeed without calling it.
+#[test]
+fn the_load_path_runs_the_entries_init_callback() {
+    const VETOING_INIT_C: &str = r#"
+#include <erl_driver.h>
+
+static int t_init(void) { return 1; }
+
+static ErlDrvEntry t_driver_entry = {
+    .init = t_init,
+    .driver_name = "t",
+    .extended_marker = ERL_DRV_EXTENDED_MARKER,
+    .major_version = ERL_DRV_EXTENDED_MAJOR_VERSION,
+    .minor_version = ERL_DRV_EXTENDED_MINOR_VERSION,
+};
+
+DRIVER_INIT(t) { return &t_driver_entry; }
+"#;
+    let Some(fixture) = compile_c("init", "t", VETOING_INIT_C) else {
+        return;
+    };
+    let error = load_driver(&fixture.candidates(), "t")
+        .expect_err("an `init` that returns non-zero must veto the load");
+    assert_eq!(
+        error.reason_atom(),
+        "driver_init_failed",
+        "the veto must be reported as the oracle's driver_init_failed: {error:?}"
+    );
+    fixture.cleanup();
+}
+
+/// The built binary **exports** every `driver_*` symbol the fixture imports, as a dynamic symbol.///
 /// This is the other half of the link-time seam (contract A.4): `build.rs` passes
 /// `-Wl,--export-dynamic` for the binary and test targets, and `PortRegistry::new` anchors
 /// `beam_abi`'s driver codegen unit — without either, `dlopen(RTLD_NOW)` of a real driver would
