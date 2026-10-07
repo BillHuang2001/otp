@@ -309,6 +309,15 @@ Re-exported at the crate root and via `beam_message::prelude::*`.
   roots back in order; a fragmented 256-byte `RefcBinary` moves the **handle** (same `data_ptr`, bytes
   unchanged, refcount 2 = source + receiver, the pair `ERL_REFC_BITS_SIZE` on the receiver heap); and
   fragment accounting (`used`/`capacity`/`total_used_words`, the receiver heap staying empty).
+- `tests/fun.rs` — a **closure crossing a copy boundary** is sized/walked from the frozen
+  `beam_term::fun` layout (`env[0]` at `1 + desc_words(kind)`, block `1 + desc_words(kind) + num_free`),
+  never the legacy C `ERL_FUN_SIZE`: a 0-free-variable (`make_fun`) closure and a 5-free-variable
+  (`make_fun3`) closure with boxed free variables copy to exactly their block + environment graphs
+  (`dst.used() == fun_words(Local, n) + size_object(env graphs)`, no trailing/duplicated word), compare
+  `=:=` to the original, encode to byte-identical `NEW_FUN_EXT`, still resolve to a callable lambda
+  (a test lambda table stands in for `beam_engine`'s, since the wave DAG forbids
+  `beam_message → beam_engine`), and `env[0]` is fixed up **into the destination heap** while the raw
+  `uniq`/`index` descriptor words are copied verbatim.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p beam_message`
   and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
   Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch `../../tools/`.
