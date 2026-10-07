@@ -68,6 +68,18 @@ fn ints(ctx: &mut BifContext<'_>, values: &[i64]) -> Eterm {
     ctx.list(&elems).expect("the list fits")
 }
 
+/// The number of elements of a proper list (a binary element is not a small
+/// integer, so `int_elements` cannot count an iovec).
+fn len_of(list: Eterm) -> usize {
+    let mut n = 0;
+    let mut cur = list;
+    while codec_term::cons_head(cur).is_ok() {
+        n += 1;
+        cur = codec_term::cons_tail(cur).expect("a cons");
+    }
+    n
+}
+
 /// The small-integer elements of a proper list result, stopping at the first
 /// non-integer element (so a list ending in a trailing bitstring still reads).
 fn int_elements(list: Eterm) -> Vec<i64> {
@@ -478,7 +490,7 @@ fn iolist_to_iovec_merges_the_copied_components() {
     let iovec =
         call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[iolist]).expect("an iolist");
     assert_eq!(
-        int_elements(iovec).len(),
+        len_of(iovec),
         1,
         "the copied run merges into one binary"
     );
@@ -517,7 +529,7 @@ fn iolist_to_iovec_accepts_a_bare_binary_and_a_bitstring_tail() {
     let abc = bin(&mut ctx, b"abc");
     let iovec =
         call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[abc]).expect("a binary");
-    assert_eq!(int_elements(iovec).len(), 1);
+    assert_eq!(len_of(iovec), 1);
     let only = codec_term::cons_head(iovec).expect("one element");
     assert_eq!(bits_of(only), (b"abc".to_vec(), 24));
 
@@ -526,7 +538,7 @@ fn iolist_to_iovec_accepts_a_bare_binary_and_a_bitstring_tail() {
     let improper = ctx.cons(one, two).expect("fits");
     let iovec = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[improper])
         .expect("a bitstring tail");
-    assert_eq!(int_elements(iovec).len(), 1);
+    assert_eq!(len_of(iovec), 1);
     let merged = codec_term::cons_head(iovec).expect("one element");
     assert_eq!(bits_of(merged), (vec![1, 2], 16));
 }
@@ -550,7 +562,7 @@ fn iolist_to_iovec_borrows_a_component_over_the_copy_threshold() {
     let at_limit = ctx.list(&[a512, b512]).expect("fits");
     let iovec =
         call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[at_limit]).expect("an iolist");
-    assert_eq!(int_elements(iovec).len(), 1);
+    assert_eq!(len_of(iovec), 1);
     let merged = codec_term::cons_head(iovec).expect("one element");
     assert_eq!(bits_of(merged).1, 1024 * 8);
 
@@ -559,7 +571,7 @@ fn iolist_to_iovec_borrows_a_component_over_the_copy_threshold() {
     let over = ctx.list(&[b513, b513_again]).expect("fits");
     let iovec = call(&reg, &mut ctx, "erlang", "iolist_to_iovec", 1, &[over]).expect("an iolist");
     assert_eq!(
-        int_elements(iovec).len(),
+        len_of(iovec),
         2,
         "a borrowed component keeps its slot"
     );
