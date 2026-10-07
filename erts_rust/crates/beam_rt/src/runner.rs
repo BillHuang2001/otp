@@ -578,4 +578,117 @@ mod tests {
             "/../beam_loader/tests/fixtures/slice.beam"
         )
     }
+
+    // -- finite `receive … after T` deadline recovery -------------------------
+
+    /// The committed finite-receive fixture, reused by relative path.
+    fn recv_after_fixture() -> &'static str {
+        concat!(env!("CARGO_MANIFEST_DIR"), "/tests/fixtures/recv_after.beam")
+    }
+
+    /// `(function index, code index of the `wait_timeout`, scan code index)` for the finite
+    /// receive of `module`'s `name/0`.
+    ///
+    /// The scan index is the code index of the `wait_timeout`'s jump-back label — the
+    /// `loop_rec` the engine parks at (what it reports as the [`EngineRunOutcome::Wait`]
+    /// address).
+    fn finite_receive(module: &Module, name: &str) -> (u32, usize, u32) {
+        let atom = module.atom_table.lookup(name).expect("the export is interned");
+        let index = module
+            .functions
+            .iter()
+            .position(|f| f.name == atom && f.arity == 0)
+            .expect("the fixture defines it");
+        let function = &module.functions[index];
+        let (code_index, target) = function
+            .code
+            .iter()
+            .enumerate()
+            .find_map(|(i, instr)| match instr {
+                Instr::WaitTimeout { target, .. } => Some((i, *target)),
+                _ => None,
+            })
+            .expect("the export has a finite receive");
+        let scan = function.labels.get(&target).copied().expect("the jump-back label");
+        (index as u32, code_index, scan as u32)
+    }
+
+    #[test]
+    fn a_finite_receive_recovers_its_timed_out_continuation() {
+        // The compiled shape the runner reads, straight from `beam_disasm`:
+        //   Scan: loop_rec Fail,Dst | … | Fail: wait_timeout Scan,{integer,T} | timeout | …
+        // The engine parks at `Scan` (the `wait_timeout` jump-back target), and — per the C
+        // (`emu/msg_instrs.tab:356-379`: on timeout control goes to the instruction
+        // *following* `wait_timeout`) — the timed-out continuation is the `timeout` opcode.
+        let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
+        let machine = Machine::new();
+        let (func, wait_index, scan) = finite_receive(&module, "after20");
+
+        let (delay, resume) = parked_receive_timeout(&machine, &module, func, scan)
+            .expect("after20 arms a 20 ms deadline");
+        assert_eq!(delay, Duration::from_millis(20));
+        assert_eq!(
+            resume,
+            (func, wait_index as u32 + 1),
+            "resume at the instruction after wait_timeout"
+        );
+        assert!(
+            matches!(module.functions[func as usize].code.get(wait_index + 1), Some(Instr::Timeout)),
+            "the timed-out path is the `timeout` instruction"
+        );
+    }
+
+    #[test]
+    fn an_infinite_receive_arms_no_deadline() {
+        // `after infinity` compiles to a bare `wait`: there is no `wait_timeout` to recover
+        // a delay from, so the process parks indefinitely (never a fabricated deadline).
+        let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
+        let machine = Machine::new();
+        let atom = module.atom_table.lookup("wait_forever").expect("wait_forever");
+        let function = module.function(atom, 0).expect("wait_forever/0");
+        assert!(
+            !function.code.iter().any(|i| matches!(i, Instr::WaitTimeout { .. })),
+            "a bare wait has no wait_timeout at all"
+        );
+        let scan = function
+            .code
+            .iter()
+            .find_map(|instr| match instr {
+                Instr::Wait { target } => Some(function.labels[target] as u32),
+                _ => None,
+            })
+            .expect("the bare wait's resume label");
+        let func = module.functions.iter().position(|f| f.name == atom).unwrap() as u32;
+        assert_eq!(
+            parked_receive_timeout(&machine, &module, func, scan),
+            None,
+            "an infinite receive never times out"
+        );
+    }
+
+    #[test]
+    fn a_timeout_delay_must_be_a_statically_known_positive_millisecond_count() {
+        let module = beam_loader::load_file(recv_after_fixture()).expect("recv_after.beam");
+        let machine = Machine::new();
+        // A literal positive delay is a deadline.
+        assert_eq!(
+            timeout_delay(&machine, &module, &Operand::Integer(20)),
+            Some(Duration::from_millis(20))
+        );
+        // Zero and negative are not delays (the engine handles a bad/`0` time itself), and
+        // neither is a register the machine cannot resolve — an honest "no deadline" rather
+        // than a guessed one.
+        assert_eq!(timeout_delay(&machine, &module, &Operand::Integer(0)), None);
+        assert_eq!(timeout_delay(&machine, &module, &Operand::Integer(-1)), None);
+        assert_eq!(
+            timeout_delay(&machine, &module, &Operand::X(0)),
+            None,
+            "an unset x register is no delay"
+        );
+        assert_eq!(
+            timeout_delay(&machine, &module, &Operand::Y(0)),
+            None,
+            "a y (stack) register is not readable by the machine"
+        );
+    }
 }
