@@ -73,3 +73,4 @@ All three are wired *inside* `src/beam_ssa_opt.erl` (NOT in `compile.erl`'s pass
 ## See Also
 - `../CONTEXT.md` — OTP application layout conventions; `../Makefile` — build order (`ERTS_APPLICATIONS`).
 - `../dialyzer/`, `../syntax_tools/`, `../eunit/` — primary consumers of the `compile`/`cerl` APIs.
+- `../../ERTS_RUST_REWRITE_DEEPDIVE.md` §E/§H — source of the Stage 2 compiler mandate (loop opts → fusion → FBIP, opt-in flags, per-pass budget, bootstrap benchmark); `../../erts_rust/CONTEXT.md` §"Stage 2" routes here.
