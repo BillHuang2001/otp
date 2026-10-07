@@ -427,7 +427,7 @@ re-export keeps `beam_process::PortTable` resolving here.
   after it are exact). A wedged pool fails with a clear timeout instead of hanging.
 - Gate (GREEN required): `erts_rust/scripts/cargo.sh test --manifest-path erts_rust/Cargo.toml -p
   beam_process` and `erts_rust/scripts/cargo.sh build --manifest-path erts_rust/Cargo.toml --workspace`.
-  Current total: **220 tests, 0 failures** (131 in-module unit + 88 across the 15 `tests/` files + 1
+  Current total: **220 tests, 0 failures** (131 in-module unit + 88 across the 14 `tests/` files + 1
   doctest). Always go through `../../scripts/cargo.sh` (`$HOME` is read-only), never `cd`, never touch
   `../../tools/`.
 - Cross-checks against the real system ERTS belong to the sibling `../../tools/differential/` harness,
