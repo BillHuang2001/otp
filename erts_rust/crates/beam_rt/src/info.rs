@@ -68,9 +68,9 @@ mod unsupported;
 /// in the oracle's exact shape. Some are constants of this build/host, others are
 /// **self-derived** from this runtime's own tables (see the module docs).
 ///
-/// The list holds **atom** keys only; the one tuple key the oracle accepts that this
-/// runtime answers, `{allocator, A}`, is handled by the tuple path in
-/// [`crate::native`]'s `system_info/1` (it is dispatched to [`allocator_report`]).
+/// The list holds **atom** keys only; the two tuple keys the oracle accepts that this
+/// runtime answers, `{allocator, A}` and `{wordsize, internal|external}`, go through
+/// [`tuple_key_value`] (reached from [`crate::native`]'s `system_info/1` tuple path).
 pub const SUPPORTED_KEYS: &[&str] = &[
     // -- `system`: build/host identity (see [`system`]) --
     "version",
@@ -127,6 +127,7 @@ pub const SUPPORTED_KEYS: &[&str] = &[
     "multi_scheduling_blockers",
     "normal_multi_scheduling_blockers",
     "thread_pool_size",
+    "context_reductions",
     // -- `memory`: GC/heap + allocator keys (see [`memory`]) --
     "min_heap_size",
     "min_bin_vheap_size",
@@ -411,6 +412,29 @@ pub fn system_info_value(key: &str, rt: &Runtime) -> Result<InfoValue> {
     Err(error::unknown_info_key(key))
 }
 
+/// The value of a **tuple** `system_info/1` key, or the oracle's `badarg` when neither
+/// the tag nor the argument is one this runtime answers.
+///
+/// The oracle dispatches tuple keys on the tag *and* the argument
+/// (`erl_bif_info.c:2521-2527` for `{wordsize, W}`, `erl_bif_info.c:2529-2546` for
+/// `{allocator, A}`); everything else is `badarg`. The two answered here are:
+///
+/// * `{allocator, A}` → [`allocator_report`] (the measured `beam_alloc` counters);
+/// * `{wordsize, W}` → this machine's word size in bytes, `internal` being one term word
+///   and `external` one `UWord` ([`system::wordsize_pair`]).
+///
+/// # Errors
+///
+/// [`BeamError::BadArg`] for an unknown tag or an unknown argument — never an invented
+/// answer.
+pub fn tuple_key_value(tag: &str, arg: &str) -> Result<InfoValue> {
+    match tag {
+        "allocator" => allocator_report(arg),
+        "wordsize" => system::wordsize_pair(arg),
+        _ => Err(BeamError::BadArg),
+    }
+}
+
 // -- shared helpers used by the family modules ----------------------------------------
 
 /// A `{Key, Value}` row of an `InfoValue` proplist.
@@ -646,7 +670,7 @@ mod tests {
         }
         // The surface is the union of the family modules; keep the count pinned so a key
         // dropped from a family is caught.
-        assert_eq!(SUPPORTED_KEYS.len(), 62);
+        assert_eq!(SUPPORTED_KEYS.len(), 63);
         let mut sorted: Vec<&str> = SUPPORTED_KEYS.to_vec();
         sorted.sort_unstable();
         sorted.dedup();

@@ -17,7 +17,7 @@ erlang:system_info(KEY)]), halt(0).'`.
 | `info.rs` (parent) | docs · `InfoValue` + `to_eterm` · `SUPPORTED_KEYS` / `UNSUPPORTED_KEYS` · `INFO_ATOMS` · `system_info_value` dispatcher · `allocator_report` · shared helpers · `#[cfg(test)] test_support` |
 | `info/system.rs` | build/host identity: `version`, `otp_release`, `system_architecture`, `system_version`, `nif_version`, `driver_version`, `wordsize`, `emu_flavor`, `emu_type`, `machine`, `threads`, `smp_support`, `async_dist`, `os_type`, `os_version`, `break_ignored`, `debug_compiled`, `dynamic_trace`, `dynamic_trace_probes`, `modified_timing_level`, `update_cpu_info`, `trace_control_word`, `port_parallelism`, `kernel_poll`, `halt_flush_timeout`, `creation` |
 | `info/limits.rs` | `atom_count`, `atom_limit`, `process_count`, `process_limit`, `port_count`, `port_limit`, `ets_count`, `ets_limit`, `outstanding_system_requests_limit`, `dist_buf_busy_limit`, `delayed_node_table_gc` |
-| `info/schedulers.rs` | `logical_processors` / `_available` / `_online`, `schedulers`, `schedulers_online`, `scheduler_id`, `dirty_cpu_schedulers` / `_online`, `dirty_io_schedulers`, `scheduler_bind_type`, `scheduler_bindings`, `multi_scheduling`, `multi_scheduling_blockers`, `normal_multi_scheduling_blockers`, `thread_pool_size` |
+| `info/schedulers.rs` | `logical_processors` / `_available` / `_online`, `schedulers`, `schedulers_online`, `scheduler_id`, `dirty_cpu_schedulers` / `_online`, `dirty_io_schedulers`, `scheduler_bind_type`, `scheduler_bindings`, `multi_scheduling`, `multi_scheduling_blockers`, `normal_multi_scheduling_blockers`, `thread_pool_size`, `context_reductions` |
 | `info/memory.rs` | `min_heap_size`, `min_bin_vheap_size`, `max_heap_size`, `fullsweep_after`, `heap_sizes`, `heap_type`, `message_queue_data`, `garbage_collection`, `alloc_util_allocators`, `allocated_areas` |
 | `info/unsupported.rs` | the 19 oracle-accepted keys this runtime honestly refuses |
 
@@ -29,42 +29,56 @@ families (`system → limits → schedulers → memory → unsupported`) and fal
 ## The three disjoint key sets (the honesty rule)
 | set | count | meaning |
 |---|---|---|
-| `SUPPORTED_KEYS` | 62 | answered with the oracle's exact value **shape** |
+| `SUPPORTED_KEYS` | 63 | answered with the oracle's exact value **shape** (`{allocator, A}` and `{wordsize, W}` are the two **tuple** keys, dispatched by `tuple_key_value`) |
 | `UNSUPPORTED_KEYS` | 19 | the oracle accepts the key, but it describes a facility this runtime does not have → a **capability gap** raise whose reason atom starts with `unsupported` (exit 3 for a `-eval` caller), **never** a fabricated value or a hardcoded oracle number |
 | everything else | — | `BeamError::BadArg`, exactly the oracle's reason for a key it does not accept |
 
 ### `SUPPORTED_KEYS`, by source of the value
 **Genuine build/host constants** (oracle-equal on this host): `version` (our
 `beam_common::ERTS_VERSION`), `otp_release` (our OTP major), `system_architecture`,
-`system_version`, `nif_version` (`2.18`), `driver_version` (`3.3`), `wordsize` (8),
-`emu_flavor`, `emu_type`, `machine` (`"BEAM"`), `threads`, `smp_support`, `async_dist`,
-`os_type`, `os_version`, `break_ignored`, `debug_compiled`, `dynamic_trace`,
-`dynamic_trace_probes`, `modified_timing_level`, `update_cpu_info`, `trace_control_word`,
-`port_parallelism`, `kernel_poll`, `halt_flush_timeout`, `creation`, `atom_limit`
-(1048576), `process_limit` (1048576 or `+P N`), `port_limit` (65536), `ets_limit` (8192),
-`outstanding_system_requests_limit` (32), `dist_buf_busy_limit` (1048576),
-`delayed_node_table_gc` (60), `heap_type`, `message_queue_data`, `scheduler_bind_type`,
-`thread_pool_size`, `min_heap_size`, `min_bin_vheap_size`, `fullsweep_after`,
-`garbage_collection`, `alloc_util_allocators`, `multi_scheduling_blockers`,
-`normal_multi_scheduling_blockers`.
+`nif_version` (`2.18`), `driver_version` (`3.3`), `wordsize` (8), `emu_flavor`, `emu_type`,
+`machine` (`"BEAM"`), `threads`, `smp_support`, `async_dist`, `os_type`, `os_version`,
+`break_ignored`, `debug_compiled`, `dynamic_trace`, `dynamic_trace_probes`,
+`modified_timing_level`, `update_cpu_info`, `trace_control_word`, `port_parallelism`,
+`kernel_poll`, `halt_flush_timeout`, `creation`, `atom_limit` (1048576), `process_limit`
+(1048576 or `+P N`), `ets_limit` (8192), `outstanding_system_requests_limit` (32),
+`dist_buf_busy_limit` (1048576), `delayed_node_table_gc` (60), `context_reductions`
+(`CONTEXT_REDS`, `erl_vm.h:47` — the ERTS reduction quantum, an interface constant),
+`heap_type`, `message_queue_data`, `scheduler_bind_type`, `thread_pool_size`,
+`min_heap_size`, `min_bin_vheap_size`, `fullsweep_after`, `garbage_collection`,
+`alloc_util_allocators`, `multi_scheduling_blockers`,
+`normal_multi_scheduling_blockers`, and the `{wordsize, internal|external}` tuple key
+(`size_of::<Eterm>()` / `size_of::<usize>()`, `erl_bif_info.c:2521-2527`).
 
-**Self-derived from *this* runtime's own live tables** (correct-but-smaller than the
-oracle's run-time figure — the same rule `erlang:processes/0` / `ports/0` already
-follow; these must **never** be "fixed" to a hardcoded oracle number):
+**Derived from this runtime's own configuration** — a real emulator rule reproduced from
+the build's constant tables rather than a literal: `port_limit`
+(`min(next_power_of_two(request), 134217727)`, or the default table `65536`; the request is
+`+Q N` or the clamped `ERL_MAX_PORTS` — `erts_ptab_init_table`/`erts_ptab_max`,
+`erl_ptab.c:383-388`/`erl_ptab.h:266-270`), `{allocator, A}` (`allocator_report`).
+
+**Self-derived from *this* runtime's own state** (correct-but-smaller — or simply
+different — from the oracle's run-time figure; the same rule `erlang:processes/0` /
+`ports/0` already follows; these must **never** be "fixed" to a hardcoded oracle number):
 `atom_count` (atom-table length), `process_count` (process-table length), `port_count`
-(live `PortRegistry` length), `ets_count` (live table-registry length),
-`allocated_areas` (every value derived from this runtime's own counters; items with no
-counterpart are an honest `0`), `heap_sizes` (`beam_gc::heap_sizes`), `logical_processors`
-/ `_available` / `_online` (`available_parallelism`), `schedulers` / `schedulers_online`
-(`+S N` or the processor count), `scheduler_id` (1), `dirty_cpu_schedulers` / `_online`
-and `dirty_io_schedulers` (`+SDcpu`/`+SDio`, else 0), `scheduler_bindings` (`unbound`
-per scheduler), `multi_scheduling` (derived from the scheduler count), `max_heap_size`
-(the emulator's heap options), `{allocator, A}` (`allocator_report`).
+(live `PortRegistry` length), `ets_count` (live table-registry length), `allocated_areas`
+(every value derived from this runtime's own counters; items with no counterpart are an
+honest `0`), `heap_sizes` (`beam_gc::heap_sizes`), `logical_processors` / `_available` /
+`_online` (`available_parallelism`), `schedulers` / `schedulers_online` (`+S N` or the
+processor count), `scheduler_id` (1), `dirty_cpu_schedulers` / `_online` and
+`dirty_io_schedulers` (`+SDcpu`/`+SDio`, else 0), `scheduler_bindings` (`unbound` per
+scheduler), `multi_scheduling` (derived from the scheduler count), `max_heap_size` (the
+emulator's heap options), and **`system_version`** — this runtime's own one-line
+self-description, deliberately its own string with the oracle's bracket-group shape
+(`Erlang/OTP <major> [erts-<vsn>] [source] [<bits>-bit]`). The oracle appends further
+groups derived from emulator state this runtime does **not** model (the `smp:`/`ds:`
+scheduler and dirty-scheduler counts, the async-thread pool size, the JIT flavor); they are
+**omitted**, never copied or guessed — so `system_version` is compared **shape-only**.
 
-`{allocator, A}` is the one **tuple** key answered (dispatched by `src/native.rs` to
-`allocator_report`); it reports the flat, real `beam_alloc` rows — the oracle wraps them
-in one `{instance, N, …}` entry per allocator instance, which this runtime does not model
-(documented divergence).
+The two **tuple** keys are answered by `info.rs::tuple_key_value(tag, arg)` (dispatched by
+`src/native.rs`): `{allocator, A}` → the flat, real `beam_alloc` rows (the oracle wraps them
+in one `{instance, N, …}` entry per allocator instance, which this runtime does not model —
+a documented divergence) and `{wordsize, internal|external}` → the host word size. Any other
+tuple tag/argument is `badarg`, exactly as in the oracle (`{wordsize,foo}`, `{nonsense,x}`).
 
 ### `UNSUPPORTED_KEYS` (all 19 are oracle-**accepted**)
 `allocator` (host C-allocator identification), `dist` / `dist_ctrl` (live dist wire
@@ -97,15 +111,17 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
 - No invented values: a facility this runtime does not have ⇒ the `unsupported` gap.
 - Every key's value is derived from this runtime's own configuration/tables or from a
   genuine build/host constant. `Runtime` accessors used: `config()` (emulator features /
-  schedulers / dirty schedulers / `max_processes`), `heap.policy()`/`heap.max_heap_flags()`,
-  `code_server.atoms()`, `processes()`, `loaded_modules()`, `ports`, `tables`,
-  `dist_node()`. **No new `Runtime` getter was needed.**
+  schedulers / dirty schedulers / `max_processes` / `max_ports`),
+  `heap.policy()`/`heap.max_heap_flags()`, `code_server.atoms()`, `processes()`,
+  `loaded_modules()`, `ports`, `tables`, `dist_node()`. **No new `Runtime` getter was
+  needed.**
 
 ## Test Strategy
 - Per-key unit tests colocated in each family module: the value **shape** (and the exact
   value for the constants), plus `try_value(other_key) == None` and the unknown-key
-  `badarg`.
-- `src/info.rs` tests: `SUPPORTED_KEYS.len() == 62`, `UNSUPPORTED_KEYS.len() == 19`, the
+  `badarg`. `info/limits.rs` additionally pins the whole `+Q`/`ERL_MAX_PORTS` sizing matrix
+  (`1024→1024 … 134217727→134217727`, `legacy`/none→65536) and the default table.
+- `src/info.rs` tests: `SUPPORTED_KEYS.len() == 63`, `UNSUPPORTED_KEYS.len() == 19`, the
   two sets duplicate-free and disjoint, every supported key answers and **materializes**
   once `INFO_ATOMS` is seeded, every unsupported key classifies as `unsupported`, the
   oracle-rejected list stays `BadArg`, each `InfoValue` variant materializes (incl. the
@@ -115,8 +131,11 @@ stable. A test seeds exactly `INFO_ATOMS` and materializes every `SUPPORTED_KEYS
   every `badarg` key, (b) **value + shape** equality for the interface/host constants,
   (c) **shape** equality (never the number) for the self-derived keys and this runtime's
   own version strings, and (d) that the key sets here partition `SUPPORTED_KEYS` exactly
-  (a key added without classification fails). It **skips loudly** when no system `erl` is
-  executable.
+  (a key added without classification fails). Two further tests cross-check the **oracle's
+  own printed value** for the whole `+Q`/`ERL_MAX_PORTS` `port_limit` matrix (`+Q N` on the
+  command line and `ERL_MAX_PORTS` through `parse_with_env`) and for the
+  `{wordsize, internal|external}` tuple key (including the oracle's `badarg` for
+  `{wordsize,foo}`). It **skips loudly** when no system `erl` is executable.
 
 ## See Also
 - `../CONTEXT.md` → the crate façade (`system_info_value`/`InfoValue` re-exports, the

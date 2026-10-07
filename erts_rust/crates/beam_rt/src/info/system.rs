@@ -17,6 +17,8 @@
 //! | `nif_version` | string, `"2.18"` |
 //! | `driver_version` | string, `"3.3"` |
 //! | `wordsize` | int, `8` |
+//! | `{wordsize, internal}` | tuple key → int (`size_of::<Eterm>()`) |
+//! | `{wordsize, external}` | tuple key → int (`size_of::<usize>()`) |
 //! | `emu_flavor` | atom, `jit`/`emu` |
 //! | `emu_type` | atom, `opt`/`debug` |
 //! | `machine` | string, `"BEAM"` |
@@ -41,7 +43,8 @@ use beam_abi::{
     ERL_DRV_EXTENDED_MAJOR_VERSION, ERL_DRV_EXTENDED_MINOR_VERSION, ERL_NIF_MAJOR_VERSION,
     ERL_NIF_MINOR_VERSION,
 };
-use beam_common::{Result, ERTS_VERSION};
+use beam_common::{BeamError, Result, ERTS_VERSION};
+use beam_term::Eterm;
 
 use super::{os_type, system_architecture, InfoValue};
 use crate::error;
@@ -53,6 +56,13 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "version" => Some(Ok(InfoValue::Str(ERTS_VERSION.to_string()))),
         "otp_release" => Some(Ok(InfoValue::Str(beam_common::otp_version().major.to_string()))),
         "system_architecture" => Some(Ok(InfoValue::Str(system_architecture()))),
+        // **Self-derived**: this is *this* runtime's own one-line self-description, with
+        // the same shape as the oracle's (version + erts version + build source + word
+        // size, each in its own bracket group). The oracle appends further groups derived
+        // from emulator state this runtime does not model (the `smp:`/`ds:` scheduler and
+        // dirty-scheduler counts, the async-thread pool, the JIT flavor); they are
+        // deliberately **omitted** rather than copied or guessed — never a fabricated
+        // host/CPU figure. See `src/info/CONTEXT.md`.
         "system_version" => Some(Ok(InfoValue::Str(format!(
             "Erlang/OTP {} [erts-{ERTS_VERSION}] [source] [{}-bit]",
             beam_common::otp_version().major,
@@ -85,6 +95,20 @@ pub(crate) fn try_value(key: &str, rt: &Runtime) -> Option<Result<InfoValue>> {
         "halt_flush_timeout" => Some(Ok(InfoValue::Atom("infinity"))),
         "creation" => Some(Ok(InfoValue::Int(creation(rt)))),
         _ => None,
+    }
+}
+
+/// `system_info({wordsize, W})` — the word size of one `W` word, in bytes.
+///
+/// `erl_bif_info.c:2521-2529`: `internal` is `sizeof(Eterm)` (the term word this runtime's
+/// frozen layout pins to one machine word, `../CONTEXT.md` §2) and `external` is
+/// `sizeof(UWord)`; any other `W` is the oracle's `badarg`
+/// (`erlang:system_info({wordsize,foo})` ⇒ `error:badarg`).
+pub(crate) fn wordsize_pair(arg: &str) -> Result<InfoValue> {
+    match arg {
+        "internal" => Ok(InfoValue::Int(std::mem::size_of::<Eterm>() as i64)),
+        "external" => Ok(InfoValue::Int(std::mem::size_of::<usize>() as i64)),
+        _ => Err(BeamError::BadArg),
     }
 }
 

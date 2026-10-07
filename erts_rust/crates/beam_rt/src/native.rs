@@ -368,9 +368,10 @@ impl RuntimeContext<'_> {
     /// [`BeamError::BadArg`] — the bare `badarg` the oracle raises — so `-eval`'s
     /// `catch`/`try` sees exactly what loaded code would.
     ///
-    /// The one **tuple** key the oracle accepts and this runtime answers,
-    /// `{allocator, A}`, is routed to [`crate::info::allocator_report`] (the
-    /// `beam_alloc` adoption; `A` outside the alloc-util names is the oracle's `badarg`).
+    /// The **tuple** keys the oracle accepts and this runtime answers,
+    /// `{allocator, A}` and `{wordsize, internal|external}`, are routed to
+    /// [`crate::info::tuple_key_value`] (the `beam_alloc` adoption; anything outside those
+    /// two is the oracle's `badarg`).
     /// The report is materialized on the same info heap `Runtime::system_info` uses, so
     /// the returned term has the identical lifetime contract as an atom-key answer.
     fn system_info_1(&mut self, args: &[Eterm]) -> Result<Eterm> {
@@ -384,12 +385,14 @@ impl RuntimeContext<'_> {
         self.runtime.system_info(&key)
     }
 
-    /// The `{allocator, A}` form of `erlang:system_info/1`.
+    /// The `{allocator, A}` / `{wordsize, W}` form of `erlang:system_info/1`.
     ///
     /// Any other 2-tuple tag (or a tuple of another arity) is `badarg` — the oracle
-    /// answers no other tuple key this runtime models. `A` is read as an atom name; a
-    /// name outside the alloc-util set is `badarg`, exactly as
-    /// `system_info({allocator, foo_alloc})` is in the oracle.
+    /// answers no other tuple key this runtime models. Both elements are read as atom
+    /// names and handed to [`crate::info::tuple_key_value`], which answers the allocator
+    /// report or the word size and raises `badarg` for anything outside them, exactly as
+    /// `system_info({allocator, foo_alloc})` and `system_info({wordsize, foo})` do in the
+    /// oracle.
     fn system_info_tuple(&mut self, key_term: Eterm) -> Result<Eterm> {
         if terms::tuple_arity(key_term)? != 2 {
             return Err(BeamError::BadArg);
@@ -397,13 +400,10 @@ impl RuntimeContext<'_> {
         let tag = self
             .atom_name(terms::tuple_element(key_term, 0)?)
             .ok_or(BeamError::BadArg)?;
-        if tag != "allocator" {
-            return Err(BeamError::BadArg);
-        }
-        let name = self
+        let argument = self
             .atom_name(terms::tuple_element(key_term, 1)?)
             .ok_or(BeamError::BadArg)?;
-        let value = crate::info::allocator_report(&name)?;
+        let value = crate::info::tuple_key_value(&tag, &argument)?;
         // Materialize on the runtime's own info heap — the same snippet
         // `Runtime::system_info` uses (the tuple path cannot call it, which takes a
         // `&str` key).
